@@ -4,7 +4,7 @@ use std::io::{self, Read, Write};
 use std::os::fd::{AsRawFd, FromRawFd};
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
-use std::sync::Mutex;
+use std::sync::{Mutex, MutexGuard};
 
 use cats_api::runtime_reconciliation::{
     checkpoint_content_digest, decode_runtime_checkpoint, encode_runtime_checkpoint, Id,
@@ -202,6 +202,7 @@ impl FileCheckpointStore {
         Ok(true)
     }
 
+    #[cfg(test)]
     pub(super) fn endpoint_effect_edge_status(
         &self,
         candidate: &EndpointEffectEdge,
@@ -223,50 +224,95 @@ impl FileCheckpointStore {
         }
     }
 
-    /// Consumes the process-local edge whose exact replacement was observed
-    /// and optionally installs the next exact Endpoint edge atomically. A
-    /// missing current edge is accepted because an exact live postcondition
-    /// is independently sufficient after restart. A conflicting current or
-    /// next edge leaves the set unchanged.
-    pub(super) fn transition_confirmed_endpoint_effect(
-        &self,
+    /// Locks and validates the complete in-memory edge transition before the
+    /// local Endpoint effect. The returned transaction performs no mutation
+    /// until the caller confirms the exact postcondition. It then consumes
+    /// the current edge permanently and keeps a newly armed next edge only if
+    /// the matching checkpoint is subsequently confirmed durable.
+    pub(super) fn prepare_endpoint_effect_transition<'a>(
+        &'a self,
+        current: Option<&EndpointEffectEdge>,
         replacement: &AdmissionSnapshot,
         endpoint_id: &Id,
         next: Option<&EndpointEffectEdge>,
-    ) -> Result<bool, CheckpointStoreError> {
-        let mut edges = self.endpoint_effect_edges.lock().map_err(|_| {
+    ) -> Result<EndpointEffectTransitionPreparation<'a>, CheckpointStoreError> {
+        let edges = self.endpoint_effect_edges.lock().map_err(|_| {
             CheckpointStoreError::SessionContinuityPoisoned {
                 path: self.target_path.clone(),
             }
         })?;
-        let mut updated = edges.clone();
-        match updated
-            .iter()
-            .position(|present| present.endpoint_id == *endpoint_id)
-        {
-            Some(index) if updated[index].replacement == *replacement => {
-                updated.remove(index);
+
+        let current_index = match current {
+            Some(candidate)
+                if candidate.endpoint_id == *endpoint_id
+                    && candidate.replacement == *replacement =>
+            {
+                match edges.iter().position(|present| present == candidate) {
+                    Some(index) => Some(index),
+                    None if edges
+                        .iter()
+                        .any(|present| present.endpoint_id == *endpoint_id) =>
+                    {
+                        return Ok(EndpointEffectTransitionPreparation::Mismatch)
+                    }
+                    None => return Ok(EndpointEffectTransitionPreparation::Missing),
+                }
             }
-            Some(_) => return Ok(false),
-            None => {}
-        }
+            Some(_) => return Ok(EndpointEffectTransitionPreparation::Mismatch),
+            None => match edges
+                .iter()
+                .position(|present| present.endpoint_id == *endpoint_id)
+            {
+                Some(index) if edges[index].replacement == *replacement => Some(index),
+                Some(_) => return Ok(EndpointEffectTransitionPreparation::Mismatch),
+                None => None,
+            },
+        };
+
+        let mut next_already_present = false;
         if let Some(next) = next {
             if next.predecessor != *replacement {
-                return Ok(false);
+                return Ok(EndpointEffectTransitionPreparation::Mismatch);
             }
-            if !updated.iter().any(|present| present == next) {
-                if updated
-                    .iter()
-                    .any(|present| present.endpoint_id == next.endpoint_id)
-                    || updated.len() >= 256
-                {
-                    return Ok(false);
+            for (index, present) in edges.iter().enumerate() {
+                if Some(index) == current_index || present.endpoint_id != next.endpoint_id {
+                    continue;
                 }
-                updated.push(next.clone());
+                if present == next {
+                    next_already_present = true;
+                    break;
+                }
+                return Ok(EndpointEffectTransitionPreparation::Mismatch);
+            }
+            if !next_already_present && edges.len() - usize::from(current_index.is_some()) >= 256 {
+                return Ok(EndpointEffectTransitionPreparation::Mismatch);
             }
         }
-        *edges = updated;
-        Ok(true)
+
+        Ok(EndpointEffectTransitionPreparation::Ready(
+            EndpointEffectTransition {
+                edges,
+                current_index,
+                next: next.cloned().map(Box::new),
+                next_already_present,
+                confirmed: false,
+                retain_next: false,
+            },
+        ))
+    }
+
+    /// Locks all process-local Endpoint edges across one global gate result.
+    /// Busy drops the guard unchanged; actual or ambiguous global close calls
+    /// `confirm` and clears the set without another fallible lock acquisition.
+    pub(super) fn prepare_endpoint_effect_revocation(
+        &self,
+    ) -> Result<EndpointEffectRevocation<'_>, CheckpointStoreError> {
+        let edges = self.endpoint_effect_edges.lock().map_err(|_| {
+            CheckpointStoreError::SessionContinuityPoisoned {
+                path: self.target_path.clone(),
+            }
+        })?;
+        Ok(EndpointEffectRevocation { edges })
     }
 
     pub(super) fn clear_endpoint_effect_edge(
@@ -606,11 +652,80 @@ impl EndpointEffectEdge {
     }
 }
 
+#[cfg(test)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum EndpointEffectEdgeStatus {
     Exact,
     Missing,
     Mismatch,
+}
+
+pub(super) enum EndpointEffectTransitionPreparation<'a> {
+    Ready(EndpointEffectTransition<'a>),
+    Missing,
+    Mismatch,
+}
+
+/// A prevalidated, process-local Endpoint effect transition. The mutex guard
+/// stays held across the short AdmissionCell effect and final checkpoint
+/// publication, so no second in-process planner can invalidate the edge set
+/// between validation and confirmation.
+pub(super) struct EndpointEffectTransition<'a> {
+    edges: MutexGuard<'a, Vec<EndpointEffectEdge>>,
+    current_index: Option<usize>,
+    next: Option<Box<EndpointEffectEdge>>,
+    next_already_present: bool,
+    confirmed: bool,
+    retain_next: bool,
+}
+
+impl EndpointEffectTransition<'_> {
+    /// Called only after the complete live AdmissionSnapshot equals the
+    /// precomputed replacement. This is infallible because every edge and
+    /// capacity check happened while the same mutex guard was held.
+    pub(super) fn confirm(&mut self) {
+        if self.confirmed {
+            return;
+        }
+        if let Some(index) = self.current_index {
+            self.edges.remove(index);
+        }
+        if !self.next_already_present {
+            if let Some(next) = &self.next {
+                self.edges.push((**next).clone());
+            }
+        }
+        self.confirmed = true;
+    }
+
+    /// Retains the next edge after the exact matching checkpoint has crossed
+    /// the directory durability barrier. The consumed current edge is never
+    /// restored, regardless of this flag.
+    pub(super) fn checkpoint_is_durable(&mut self) {
+        debug_assert!(self.confirmed);
+        self.retain_next = true;
+    }
+}
+
+impl Drop for EndpointEffectTransition<'_> {
+    fn drop(&mut self) {
+        if !self.confirmed || self.retain_next {
+            return;
+        }
+        if let Some(next) = &self.next {
+            self.edges.retain(|present| present != next.as_ref());
+        }
+    }
+}
+
+pub(super) struct EndpointEffectRevocation<'a> {
+    edges: MutexGuard<'a, Vec<EndpointEffectEdge>>,
+}
+
+impl EndpointEffectRevocation<'_> {
+    pub(super) fn confirm(mut self) {
+        self.edges.clear();
+    }
 }
 
 struct TemporaryCheckpoint<'a> {

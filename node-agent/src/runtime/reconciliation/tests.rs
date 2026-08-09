@@ -20,7 +20,8 @@ use tempfile::TempDir;
 
 use super::admission_port::{AdmissionGatePort, AdmissionSnapshot, GatePortError, IdleCloseResult};
 use super::checkpoint::{
-    CheckpointStoreError, FileCheckpointStore, WriteStage, TEST_PROCESS_EXIT_CODE,
+    CheckpointStoreError, EndpointEffectEdge, EndpointEffectEdgeStatus, FileCheckpointStore,
+    StoredCheckpoint, WriteStage, TEST_PROCESS_EXIT_CODE,
 };
 use super::gate_planner::{
     applied_desired_evidence, AppliedDesiredError, GateReconcileError, GateSequencer,
@@ -3102,6 +3103,313 @@ fn failed_final_publish_does_not_leave_an_unpublished_next_edge() {
     );
 }
 
+#[test]
+fn invalid_next_endpoint_is_rejected_before_install_effect_or_edge_leak() {
+    let root = TempDir::new().expect("tempdir");
+    let source_desired = running_desired_with_endpoints(
+        1,
+        vec![
+            endpoint("ep_a", "a.example.test", 1, 8080),
+            endpoint("ep_b", "b.example.test", 7, 8081),
+        ],
+    );
+    let mut checkpoint = running_checkpoint(&source_desired, 10);
+    checkpoint.lifecycle_admission = LifecycleAdmission::Closed;
+    checkpoint.stable_state = None;
+    checkpoint.step = ReconcileStep::CloseAdmission {
+        require_idle_attempt_id: None,
+    };
+    for route in &mut checkpoint.route_gates {
+        route.gate = RouteGateState::Closed;
+    }
+    let store = store(&root, &source_desired.cat_id);
+    let source = store.create(&checkpoint).expect("source checkpoint");
+    let mut port = FakePort::new(
+        AdmissionSnapshot::from_checkpoint(&checkpoint).expect("source snapshot"),
+        store.path(),
+    );
+
+    let stale_b = running_desired_with_endpoints(
+        2,
+        vec![
+            endpoint("ep_a", "a.example.test", 2, 9090),
+            endpoint("ep_b", "b.example.test", 6, 9091),
+        ],
+    );
+    port.expected_disk.push_back(DiskMarker::Installed {
+        revision: revision(2),
+        endpoint_id: id("ep_a"),
+        route_epoch: epoch(2),
+    });
+    assert!(matches!(
+        GateSequencer::new(&store, &mut port)
+            .install_gate(&source, &stale_b, &id("ep_a"), times(20, 21))
+            .expect_err("B's regressed epoch must invalidate the plan before A changes"),
+        GateReconcileError::RouteEpochNotAdvanced(endpoint_id)
+            if endpoint_id == id("ep_b")
+    ));
+    assert!(port.calls.is_empty(), "invalid completion plan reached A");
+    port.expected_disk.clear();
+    assert_eq!(
+        store
+            .load()
+            .expect("load after rejected plan")
+            .expect("source remains")
+            .checkpoint(),
+        &checkpoint
+    );
+
+    let corrected = running_desired_with_endpoints(
+        3,
+        vec![
+            endpoint("ep_a", "a.example.test", 3, 10000),
+            endpoint("ep_b", "b.example.test", 8, 10001),
+        ],
+    );
+    port.expected_disk.push_back(DiskMarker::Installed {
+        revision: revision(3),
+        endpoint_id: id("ep_a"),
+        route_epoch: epoch(3),
+    });
+    let installed = GateSequencer::new(&store, &mut port)
+        .install_gate(&source, &corrected, &id("ep_a"), times(22, 23))
+        .expect("corrected higher A epoch is not blocked by the rejected plan");
+    assert_eq!(
+        route(installed.checkpoint().checkpoint(), "ep_a").gate,
+        RouteGateState::Active
+    );
+    assert_eq!(
+        route(installed.checkpoint().checkpoint(), "ep_a")
+            .binding
+            .route_epoch,
+        epoch(3)
+    );
+}
+
+#[test]
+fn ordinary_global_close_revokes_every_pending_endpoint_edge() {
+    let (_root, stop, store, source, mut port, pending_a) = pending_edge_global_fixture();
+    port.expected_disk.push_back(DiskMarker::Closed {
+        revision: revision(2),
+    });
+    let closed = GateSequencer::new(&store, &mut port)
+        .close_all(&source, &stop, times(20, 21))
+        .expect("ordinary global close");
+    assert_eq!(
+        store
+            .endpoint_effect_edge_status(&pending_a)
+            .expect("edge status"),
+        EndpointEffectEdgeStatus::Missing
+    );
+    install_fresh_two_endpoint_epochs(&store, &mut port, closed.checkpoint());
+}
+
+#[test]
+fn ambiguous_global_close_revokes_every_pending_endpoint_edge() {
+    let (_root, stop, store, source, mut port, pending_a) = pending_edge_global_fixture();
+    port.global_results
+        .push_back(EndpointPortResult::ErrorAfter(GatePortError::Unavailable));
+    port.expected_disk.push_back(DiskMarker::Closed {
+        revision: revision(2),
+    });
+    assert!(matches!(
+        GateSequencer::new(&store, &mut port)
+            .close_all(&source, &stop, times(20, 21))
+            .expect_err("ambiguous global close remains diagnostic"),
+        GateReconcileError::Port(GatePortError::Unavailable)
+    ));
+    assert_eq!(
+        store
+            .endpoint_effect_edge_status(&pending_a)
+            .expect("edge status"),
+        EndpointEffectEdgeStatus::Missing
+    );
+    let closed = store
+        .load()
+        .expect("load durable close token")
+        .expect("global close token");
+    install_fresh_two_endpoint_epochs(&store, &mut port, &closed);
+}
+
+#[test]
+fn late_global_completion_error_cannot_leave_endpoint_edges() {
+    let (_root, stop, store, source, mut port, pending_a) = pending_edge_global_fixture();
+    port.expected_disk.push_back(DiskMarker::Closed {
+        revision: revision(2),
+    });
+    store.inject_crash_on_nth(WriteStage::DirectorySynced, 2);
+    assert!(matches!(
+        GateSequencer::new(&store, &mut port)
+            .close_all(&source, &stop, times(20, 21))
+            .expect_err("lose the final global-close acknowledgement"),
+        GateReconcileError::Checkpoint(CheckpointStoreError::InjectedCrash)
+    ));
+    assert_eq!(
+        store
+            .endpoint_effect_edge_status(&pending_a)
+            .expect("edge status"),
+        EndpointEffectEdgeStatus::Missing
+    );
+    let closed = store
+        .load()
+        .expect("load durable global close")
+        .expect("global close checkpoint");
+    install_fresh_two_endpoint_epochs(&store, &mut port, &closed);
+}
+
+#[test]
+fn require_idle_revokes_edges_only_after_an_actual_or_ambiguous_close() {
+    for outcome in ["busy", "closed", "ambiguous", "late_closed"] {
+        let root = TempDir::new().expect("tempdir");
+        let source_desired = desired(
+            1,
+            RuntimeTarget::Running,
+            7,
+            RuntimeTransition::CancelAndDrain,
+        );
+        let checkpoint = running_checkpoint(&source_desired, 10);
+        let store = store(&root, &source_desired.cat_id);
+        let source = store.create(&checkpoint).expect("source checkpoint");
+        let pending = arm_pending_close_edge(&store, &checkpoint, "ep_01");
+        let desired = require_idle_desired(2, 1, 7, 'a');
+        let mut port = FakePort::new(
+            AdmissionSnapshot::from_checkpoint(&checkpoint).expect("source snapshot"),
+            store.path(),
+        );
+        port.expected_disk.push_back(DiskMarker::Armed);
+        match outcome {
+            "busy" => port.idle_results.push_back(Ok(IdleCloseResult::Busy {
+                platform_guards: 0,
+                endpoint_guards: vec![EndpointGuardCount {
+                    endpoint_id: id("ep_01"),
+                    active_guards: 1,
+                }],
+            })),
+            "closed" | "late_closed" => {
+                port.idle_results.push_back(Ok(IdleCloseResult::Closed));
+            }
+            "ambiguous" => {
+                port.idle_results.push_back(Err(GatePortError::Unavailable));
+                port.expected_disk.push_back(DiskMarker::BusyClosed);
+            }
+            _ => unreachable!("closed outcome set"),
+        }
+        if outcome == "late_closed" {
+            store.inject_crash_on_nth(WriteStage::DirectorySynced, 2);
+        }
+
+        let result = GateSequencer::new(&store, &mut port).begin_require_idle(
+            &source,
+            &desired,
+            times(20, 21),
+        );
+        if outcome == "late_closed" {
+            assert!(matches!(
+                result.expect_err("late closed checkpoint acknowledgement"),
+                GateReconcileError::Checkpoint(CheckpointStoreError::InjectedCrash)
+            ));
+        } else {
+            result.expect("RequireIdle outcome");
+        }
+        let expected = if outcome == "busy" {
+            EndpointEffectEdgeStatus::Exact
+        } else {
+            EndpointEffectEdgeStatus::Missing
+        };
+        assert_eq!(
+            store
+                .endpoint_effect_edge_status(&pending)
+                .expect("edge status"),
+            expected,
+            "wrong edge result for {outcome}"
+        );
+    }
+}
+
+#[test]
+fn final_endpoint_publication_keeps_only_a_confirmed_durable_next_edge() {
+    for stage in [
+        WriteStage::TempWritten,
+        WriteStage::FileSynced,
+        WriteStage::Renamed,
+        WriteStage::DirectorySynced,
+    ] {
+        let root = TempDir::new().expect("tempdir");
+        let source_desired = running_desired_with_endpoints(
+            1,
+            vec![
+                endpoint("ep_a", "a.example.test", 1, 8080),
+                endpoint("ep_b", "b.example.test", 1, 8081),
+            ],
+        );
+        let desired = running_desired_with_endpoints(
+            2,
+            vec![
+                endpoint("ep_a", "a.example.test", 2, 9090),
+                endpoint("ep_b", "b.example.test", 2, 9091),
+            ],
+        );
+        let checkpoint = running_checkpoint(&source_desired, 10);
+        let store = store(&root, &source_desired.cat_id);
+        let source = store.create(&checkpoint).expect("source checkpoint");
+        let mut port = FakePort::new(
+            AdmissionSnapshot::from_checkpoint(&checkpoint).expect("source snapshot"),
+            store.path(),
+        );
+        port.expected_disk.push_back(DiskMarker::EndpointClosing {
+            revision: revision(2),
+            endpoint_id: id("ep_a"),
+            route_epoch: epoch(1),
+        });
+        let closed = GateSequencer::new(&store, &mut port)
+            .close_gate(&source, &desired, &id("ep_a"), times(20, 21))
+            .expect("close A");
+        let prepared = GateSequencer::new(&store, &mut port)
+            .prepare_changed_gate(closed.checkpoint(), &desired, &id("ep_a"), unix_ms(22))
+            .expect("prepare A");
+        let predecessor = port.current.clone();
+        port.expected_disk.push_back(DiskMarker::Installed {
+            revision: revision(2),
+            endpoint_id: id("ep_a"),
+            route_epoch: epoch(2),
+        });
+        store.inject_crash_on_nth(stage, 2);
+        assert!(matches!(
+            GateSequencer::new(&store, &mut port)
+                .install_gate(prepared.checkpoint(), &desired, &id("ep_a"), times(23, 24))
+                .expect_err("final publication fault"),
+            GateReconcileError::Checkpoint(CheckpointStoreError::InjectedCrash)
+        ));
+
+        let active = port.current.clone();
+        let current = EndpointEffectEdge::new(predecessor, active.clone(), id("ep_a"));
+        assert_eq!(
+            store
+                .endpoint_effect_edge_status(&current)
+                .expect("current edge status"),
+            EndpointEffectEdgeStatus::Missing,
+            "confirmed A edge was restored after {stage:?}"
+        );
+        let next = EndpointEffectEdge::new(
+            active.clone(),
+            snapshot_with_closed_endpoint(&active, "ep_b"),
+            id("ep_b"),
+        );
+        let expected_next = if matches!(stage, WriteStage::Renamed | WriteStage::DirectorySynced) {
+            EndpointEffectEdgeStatus::Exact
+        } else {
+            EndpointEffectEdgeStatus::Missing
+        };
+        assert_eq!(
+            store
+                .endpoint_effect_edge_status(&next)
+                .expect("next edge status"),
+            expected_next,
+            "wrong next edge result after {stage:?}"
+        );
+    }
+}
+
 fn endpoint_change_desireds() -> (DesiredRuntimeSpec, DesiredRuntimeSpec) {
     (
         running_desired_with_endpoints(
@@ -3151,6 +3459,114 @@ fn snapshot_route<'a>(
         .iter()
         .find(|route| route.binding.endpoint_id == id(endpoint_id))
         .expect("snapshot route")
+}
+
+fn snapshot_with_closed_endpoint(
+    snapshot: &AdmissionSnapshot,
+    endpoint_id: &str,
+) -> AdmissionSnapshot {
+    let mut endpoints = snapshot.endpoints().to_vec();
+    endpoints
+        .iter_mut()
+        .find(|route| route.binding.endpoint_id == id(endpoint_id))
+        .expect("snapshot route")
+        .gate = RouteGateState::Closed;
+    AdmissionSnapshot::new(
+        snapshot.applied_desired_revision(),
+        snapshot.spec_digest().clone(),
+        snapshot.placement().clone(),
+        snapshot.runtime_incarnation().cloned(),
+        snapshot.lifecycle_admission(),
+        endpoints,
+    )
+}
+
+fn arm_pending_close_edge(
+    store: &FileCheckpointStore,
+    checkpoint: &RuntimeCheckpoint,
+    endpoint_id: &str,
+) -> EndpointEffectEdge {
+    let predecessor = AdmissionSnapshot::from_checkpoint(checkpoint).expect("edge predecessor");
+    let edge = EndpointEffectEdge::new(
+        predecessor.clone(),
+        snapshot_with_closed_endpoint(&predecessor, endpoint_id),
+        id(endpoint_id),
+    );
+    assert!(
+        store
+            .arm_endpoint_effect_edge(&edge)
+            .expect("arm test endpoint edge"),
+        "test edge must be unique"
+    );
+    edge
+}
+
+fn pending_edge_global_fixture() -> (
+    TempDir,
+    DesiredRuntimeSpec,
+    FileCheckpointStore,
+    StoredCheckpoint,
+    FakePort,
+    EndpointEffectEdge,
+) {
+    let root = TempDir::new().expect("tempdir");
+    let source_desired = running_desired_with_endpoints(
+        1,
+        vec![
+            endpoint("ep_a", "a.example.test", 1, 8080),
+            endpoint("ep_b", "b.example.test", 1, 8081),
+        ],
+    );
+    let checkpoint = running_checkpoint(&source_desired, 10);
+    let store = store(&root, &source_desired.cat_id);
+    let source = store.create(&checkpoint).expect("source checkpoint");
+    let pending = arm_pending_close_edge(&store, &checkpoint, "ep_a");
+    let port = FakePort::new(
+        AdmissionSnapshot::from_checkpoint(&checkpoint).expect("source snapshot"),
+        store.path(),
+    );
+    let mut stop = source_desired;
+    stop.desired_revision = revision(2);
+    stop.target = RuntimeTarget::Suspended;
+    stop.transition = RuntimeTransition::CancelAndDrain;
+    refresh_spec_digest(&mut stop);
+    (root, stop, store, source, port, pending)
+}
+
+fn install_fresh_two_endpoint_epochs(
+    store: &FileCheckpointStore,
+    port: &mut FakePort,
+    closed: &StoredCheckpoint,
+) {
+    let fresh = running_desired_with_endpoints(
+        3,
+        vec![
+            endpoint("ep_a", "a.example.test", 2, 9090),
+            endpoint("ep_b", "b.example.test", 2, 9091),
+        ],
+    );
+    port.expected_disk.push_back(DiskMarker::Installed {
+        revision: revision(3),
+        endpoint_id: id("ep_a"),
+        route_epoch: epoch(2),
+    });
+    let a = GateSequencer::new(store, port)
+        .install_gate(closed, &fresh, &id("ep_a"), times(30, 31))
+        .expect("install fresh A after global close");
+    port.expected_disk.push_back(DiskMarker::Installed {
+        revision: revision(3),
+        endpoint_id: id("ep_b"),
+        route_epoch: epoch(2),
+    });
+    let complete = GateSequencer::new(store, port)
+        .install_gate(a.checkpoint(), &fresh, &id("ep_b"), times(32, 33))
+        .expect("install fresh B after global close");
+    assert!(complete
+        .checkpoint()
+        .checkpoint()
+        .route_gates
+        .iter()
+        .all(|route| route.gate == RouteGateState::Active));
 }
 
 fn store(root: &TempDir, cat_id: &Id) -> FileCheckpointStore {
@@ -3387,6 +3803,7 @@ struct FakePort {
     expected_disk: VecDeque<DiskMarker>,
     idle_results: VecDeque<Result<IdleCloseResult, GatePortError>>,
     endpoint_results: VecDeque<EndpointPortResult>,
+    global_results: VecDeque<EndpointPortResult>,
     calls: Vec<PortCall>,
 }
 
@@ -3398,6 +3815,7 @@ impl FakePort {
             expected_disk: VecDeque::new(),
             idle_results: VecDeque::new(),
             endpoint_results: VecDeque::new(),
+            global_results: VecDeque::new(),
             calls: Vec::new(),
         }
     }
@@ -3594,7 +4012,14 @@ impl AdmissionGatePort for FakePort {
     ) -> Result<(), GatePortError> {
         self.calls.push(PortCall::Close);
         self.assert_checkpoint_first();
-        self.apply(expected, replacement, replacement.clone())
+        match self.global_results.pop_front() {
+            Some(EndpointPortResult::ErrorBefore(error)) => Err(error),
+            Some(EndpointPortResult::ErrorAfter(error)) => {
+                self.apply(expected, replacement, replacement.clone())?;
+                Err(error)
+            }
+            None => self.apply(expected, replacement, replacement.clone()),
+        }
     }
 
     fn try_close_all_if_idle(

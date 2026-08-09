@@ -11,8 +11,8 @@ use super::admission_port::{
     AdmissionGatePort, AdmissionSnapshot, GatePortError, IdleCloseResult, SnapshotError,
 };
 use super::checkpoint::{
-    CheckpointStoreError, EndpointEffectEdge, EndpointEffectEdgeStatus, FileCheckpointStore,
-    StoredCheckpoint,
+    CheckpointStoreError, EndpointEffectEdge, EndpointEffectTransition,
+    EndpointEffectTransitionPreparation, FileCheckpointStore, StoredCheckpoint,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -321,9 +321,8 @@ impl<'a, P: AdmissionGatePort> GateSequencer<'a, P> {
             .any(|route| route.binding == binding && route.gate == RouteGateState::Active)
             && desired.desired_revision > current.checkpoint().desired_revision;
 
-        let prepared_storage: StoredCheckpoint;
-        let prepared = if already_prepared {
-            current
+        let (prepared_checkpoint, edge_to_arm) = if already_prepared {
+            (current.checkpoint().clone(), None)
         } else {
             if !open_busy_reuse {
                 let action = first_endpoint_action(current.checkpoint(), desired)?
@@ -356,12 +355,10 @@ impl<'a, P: AdmissionGatePort> GateSequencer<'a, P> {
             };
             let replacement = active_install_snapshot(&prepared, endpoint_id)?;
             let edge = EndpointEffectEdge::new(expected.clone(), replacement, endpoint_id.clone());
-            prepared_storage =
-                self.publish_endpoint_checkpoint(current, &prepared, None, Some(&edge))?;
-            &prepared_storage
+            (prepared, Some(edge))
         };
 
-        let mut active_checkpoint = prepared.checkpoint().clone();
+        let mut active_checkpoint = prepared_checkpoint.clone();
         activate_install_entry(&mut active_checkpoint, &binding)?;
         active_checkpoint.lifecycle_admission = LifecycleAdmission::Open;
         active_checkpoint.stable_state = None;
@@ -370,26 +367,46 @@ impl<'a, P: AdmissionGatePort> GateSequencer<'a, P> {
             route_epoch: endpoint.route_epoch,
         };
         let replacement = AdmissionSnapshot::from_checkpoint(&active_checkpoint)?;
+        let mut completed = active_checkpoint.clone();
+        completed.updated_at_unix_ms = times.after_effect;
+        advance_endpoint_checkpoint(&mut completed, desired)?;
+        encode_runtime_checkpoint(&completed).map_err(|error| {
+            GateReconcileError::AppliedDesired(AppliedDesiredError::CheckpointContract { error })
+        })?;
+        let next = self.endpoint_effect_for_step(&replacement, &completed)?;
+
+        // The complete post-effect checkpoint and its exact next edge are now
+        // known-valid. Only after that pure planning succeeds may the durable
+        // active token or the local AdmissionCell change.
+        let prepared = if let Some(edge) = edge_to_arm.as_ref() {
+            self.publish_endpoint_checkpoint(current, &prepared_checkpoint, Some(edge))?
+        } else {
+            current.clone()
+        };
         let live = self.port.snapshot();
-        if live != replacement {
-            let edge =
-                EndpointEffectEdge::new(live.clone(), replacement.clone(), endpoint_id.clone());
-            match self.store.endpoint_effect_edge_status(&edge)? {
-                EndpointEffectEdgeStatus::Exact => {}
-                EndpointEffectEdgeStatus::Missing => {
-                    return Err(GateReconcileError::FreshRouteEpochRequired(
-                        endpoint_id.clone(),
-                    ))
-                }
-                EndpointEffectEdgeStatus::Mismatch => {
-                    return Err(GateReconcileError::EndpointCellMismatch)
-                }
+        let current_edge = (live != replacement).then(|| {
+            EndpointEffectEdge::new(live.clone(), replacement.clone(), endpoint_id.clone())
+        });
+        let transition = match self.store.prepare_endpoint_effect_transition(
+            current_edge.as_ref(),
+            &replacement,
+            endpoint_id,
+            next.as_ref(),
+        )? {
+            EndpointEffectTransitionPreparation::Ready(transition) => transition,
+            EndpointEffectTransitionPreparation::Missing => {
+                return Err(GateReconcileError::FreshRouteEpochRequired(
+                    endpoint_id.clone(),
+                ))
             }
-        }
+            EndpointEffectTransitionPreparation::Mismatch => {
+                return Err(GateReconcileError::EndpointCellMismatch)
+            }
+        };
         let active_storage = if active_checkpoint == *prepared.checkpoint() {
             prepared.clone()
         } else {
-            self.store.replace(prepared, &active_checkpoint)?
+            self.store.replace(&prepared, &active_checkpoint)?
         };
         if live != replacement {
             let result = self.port.install_gate(&live, &replacement, endpoint_id);
@@ -405,16 +422,8 @@ impl<'a, P: AdmissionGatePort> GateSequencer<'a, P> {
             }
         }
 
-        let mut completed = active_storage.checkpoint().clone();
-        completed.updated_at_unix_ms = times.after_effect;
-        advance_endpoint_checkpoint(&mut completed, desired)?;
-        let next = self.endpoint_effect_for_step(&replacement, &completed)?;
-        let completed = self.publish_endpoint_checkpoint(
-            &active_storage,
-            &completed,
-            Some((endpoint_id, &replacement)),
-            next.as_ref(),
-        )?;
+        let completed =
+            self.publish_confirmed_endpoint_checkpoint(&active_storage, &completed, transition)?;
         Ok(GateTransitionResult::Installed {
             checkpoint: completed,
         })
@@ -469,8 +478,7 @@ impl<'a, P: AdmissionGatePort> GateSequencer<'a, P> {
             let edge = self
                 .endpoint_effect_for_step(&predecessor, &staged)?
                 .ok_or_else(|| GateReconcileError::WrongEndpointAction(endpoint_id.clone()))?;
-            staged_storage =
-                self.publish_endpoint_checkpoint(current, &staged, None, Some(&edge))?;
+            staged_storage = self.publish_endpoint_checkpoint(current, &staged, Some(&edge))?;
             &staged_storage
         };
 
@@ -524,7 +532,7 @@ impl<'a, P: AdmissionGatePort> GateSequencer<'a, P> {
         prepared.updated_at_unix_ms = updated_at;
         let replacement = active_install_snapshot(&prepared, endpoint_id)?;
         let edge = EndpointEffectEdge::new(predecessor, replacement, endpoint_id.clone());
-        let prepared = self.publish_endpoint_checkpoint(closed, &prepared, None, Some(&edge))?;
+        let prepared = self.publish_endpoint_checkpoint(closed, &prepared, Some(&edge))?;
         Ok(GateTransitionResult::EndpointPrepared {
             checkpoint: prepared,
         })
@@ -560,6 +568,24 @@ impl<'a, P: AdmissionGatePort> GateSequencer<'a, P> {
         let mut absent_checkpoint = closed.checkpoint().clone();
         absent_checkpoint.route_gates.remove(route_index);
         let absent = AdmissionSnapshot::from_checkpoint(&absent_checkpoint)?;
+        absent_checkpoint.updated_at_unix_ms = updated_at;
+        advance_endpoint_checkpoint(&mut absent_checkpoint, desired)?;
+        encode_runtime_checkpoint(&absent_checkpoint).map_err(|error| {
+            GateReconcileError::AppliedDesired(AppliedDesiredError::CheckpointContract { error })
+        })?;
+        let next = self.endpoint_effect_for_step(&absent, &absent_checkpoint)?;
+        let transition = match self.store.prepare_endpoint_effect_transition(
+            None,
+            &absent,
+            endpoint_id,
+            next.as_ref(),
+        )? {
+            EndpointEffectTransitionPreparation::Ready(transition) => transition,
+            EndpointEffectTransitionPreparation::Missing
+            | EndpointEffectTransitionPreparation::Mismatch => {
+                return Err(GateReconcileError::EndpointCellMismatch)
+            }
+        };
         let live = self.port.snapshot();
         let mut port_error = None;
         if live != absent {
@@ -579,11 +605,8 @@ impl<'a, P: AdmissionGatePort> GateSequencer<'a, P> {
             }
         }
 
-        absent_checkpoint.updated_at_unix_ms = updated_at;
-        advance_endpoint_checkpoint(&mut absent_checkpoint, desired)?;
-        let next = self.endpoint_effect_for_step(&absent, &absent_checkpoint)?;
         let completed =
-            self.publish_endpoint_checkpoint(closed, &absent_checkpoint, None, next.as_ref())?;
+            self.publish_confirmed_endpoint_checkpoint(closed, &absent_checkpoint, transition)?;
         Ok(GateTransitionResult::EndpointRemoved {
             checkpoint: completed,
             port_error,
@@ -603,17 +626,27 @@ impl<'a, P: AdmissionGatePort> GateSequencer<'a, P> {
         closed_checkpoint.route_gates[route_index].gate = RouteGateState::Closed;
         closed_checkpoint.updated_at_unix_ms = updated_at;
         let replacement = closed_gate_snapshot(close_checkpoint.checkpoint(), endpoint_id)?;
+        encode_runtime_checkpoint(&closed_checkpoint).map_err(|error| {
+            GateReconcileError::AppliedDesired(AppliedDesiredError::CheckpointContract { error })
+        })?;
         let live = self.port.snapshot();
+        let current_edge = (live != replacement).then(|| {
+            EndpointEffectEdge::new(live.clone(), replacement.clone(), endpoint_id.clone())
+        });
+        let mut transition = match self.store.prepare_endpoint_effect_transition(
+            current_edge.as_ref(),
+            &replacement,
+            endpoint_id,
+            None,
+        )? {
+            EndpointEffectTransitionPreparation::Ready(transition) => transition,
+            EndpointEffectTransitionPreparation::Missing
+            | EndpointEffectTransitionPreparation::Mismatch => {
+                return Err(GateReconcileError::EndpointCellMismatch)
+            }
+        };
         let mut port_error = None;
         if live != replacement {
-            let edge =
-                EndpointEffectEdge::new(live.clone(), replacement.clone(), endpoint_id.clone());
-            match self.store.endpoint_effect_edge_status(&edge)? {
-                EndpointEffectEdgeStatus::Exact => {}
-                EndpointEffectEdgeStatus::Missing | EndpointEffectEdgeStatus::Mismatch => {
-                    return Err(GateReconcileError::EndpointCellMismatch)
-                }
-            }
             let result = self.port.close_gate(&live, &replacement, endpoint_id);
             let after = self.port.snapshot();
             match result {
@@ -630,21 +663,14 @@ impl<'a, P: AdmissionGatePort> GateSequencer<'a, P> {
         let checkpoint = if close_checkpoint.checkpoint().route_gates[route_index].gate
             == RouteGateState::Closed
         {
-            if !self
-                .store
-                .transition_confirmed_endpoint_effect(&replacement, endpoint_id, None)?
-            {
-                return Err(GateReconcileError::EndpointEffectEdgeConflict(
-                    endpoint_id.clone(),
-                ));
-            }
+            transition.confirm();
+            transition.checkpoint_is_durable();
             close_checkpoint.clone()
         } else {
-            self.publish_endpoint_checkpoint(
+            self.publish_confirmed_endpoint_checkpoint(
                 close_checkpoint,
                 &closed_checkpoint,
-                Some((endpoint_id, &replacement)),
-                None,
+                transition,
             )?
         };
         Ok(GateTransitionResult::EndpointClosed {
@@ -673,12 +699,22 @@ impl<'a, P: AdmissionGatePort> GateSequencer<'a, P> {
         };
         staged.require_idle = RequireIdleCheckpoint::NotApplicable;
         let replacement_snapshot = AdmissionSnapshot::from_checkpoint(&staged)?;
-        let staged = self.store.replace(current, &staged)?;
-        self.port
-            .close_all(&expected_snapshot, &replacement_snapshot)?;
-
-        let mut completed = staged.checkpoint().clone();
+        let mut completed = staged.clone();
         completed.updated_at_unix_ms = times.after_effect;
+        encode_runtime_checkpoint(&completed).map_err(|error| {
+            GateReconcileError::AppliedDesired(AppliedDesiredError::CheckpointContract { error })
+        })?;
+        let staged = self.store.replace(current, &staged)?;
+        let revocation = self.store.prepare_endpoint_effect_revocation()?;
+        let close_result = self
+            .port
+            .close_all(&expected_snapshot, &replacement_snapshot);
+        // Every global port error is ambiguous and fail-closed by contract.
+        // Clear endpoint capabilities while the pre-acquired guard is held,
+        // before returning diagnostics or attempting the final fsync.
+        revocation.confirm();
+        close_result?;
+
         let completed = self.store.replace(&staged, &completed)?;
         Ok(GateTransitionResult::Closed {
             checkpoint: completed,
@@ -725,7 +761,11 @@ impl<'a, P: AdmissionGatePort> GateSequencer<'a, P> {
         };
         closed.updated_at_unix_ms = times.after_effect;
         let replacement_snapshot = AdmissionSnapshot::from_checkpoint(&closed)?;
+        encode_runtime_checkpoint(&closed).map_err(|error| {
+            GateReconcileError::AppliedDesired(AppliedDesiredError::CheckpointContract { error })
+        })?;
         let armed = self.store.replace(source, &armed)?;
+        let revocation = self.store.prepare_endpoint_effect_revocation()?;
 
         match self
             .port
@@ -735,6 +775,7 @@ impl<'a, P: AdmissionGatePort> GateSequencer<'a, P> {
                 platform_guards,
                 endpoint_guards,
             }) if valid_guard_counts(platform_guards, &endpoint_guards, source.checkpoint()) => {
+                drop(revocation);
                 let mut busy = armed.checkpoint().clone();
                 busy.require_idle = RequireIdleCheckpoint::Busy {
                     attempt_id: attempt_id.clone(),
@@ -753,27 +794,37 @@ impl<'a, P: AdmissionGatePort> GateSequencer<'a, P> {
                 })
             }
             Ok(IdleCloseResult::Closed) => {
+                revocation.confirm();
                 let closed = self.store.replace(&armed, &closed)?;
                 Ok(GateTransitionResult::RequireIdleClosed { checkpoint: closed })
             }
-            Ok(IdleCloseResult::Busy { .. }) => self.settle_armed_fail_closed(
-                &armed,
-                desired,
-                PersistTimes {
-                    before_effect: times.after_effect,
-                    after_effect: times.after_effect,
-                },
-                Some(GatePortError::InvalidBusyEvidence),
-            ),
-            Err(error) => self.settle_armed_fail_closed(
-                &armed,
-                desired,
-                PersistTimes {
-                    before_effect: times.after_effect,
-                    after_effect: times.after_effect,
-                },
-                Some(error),
-            ),
+            Ok(IdleCloseResult::Busy { .. }) => {
+                drop(revocation);
+                self.settle_armed_fail_closed(
+                    &armed,
+                    desired,
+                    PersistTimes {
+                        before_effect: times.after_effect,
+                        after_effect: times.after_effect,
+                    },
+                    Some(GatePortError::InvalidBusyEvidence),
+                )
+            }
+            Err(error) => {
+                // The port contract makes an error an ambiguous global close.
+                // Revoke every Endpoint edge before any later persistence can
+                // fail and strand an old effect capability.
+                revocation.confirm();
+                self.settle_armed_fail_closed(
+                    &armed,
+                    desired,
+                    PersistTimes {
+                        before_effect: times.after_effect,
+                        after_effect: times.after_effect,
+                    },
+                    Some(error),
+                )
+            }
         }
     }
 
@@ -871,13 +922,18 @@ impl<'a, P: AdmissionGatePort> GateSequencer<'a, P> {
         };
         busy.updated_at_unix_ms = times.before_effect;
         let replacement_snapshot = AdmissionSnapshot::from_checkpoint(&busy)?;
+        let mut completed = busy.clone();
+        completed.updated_at_unix_ms = times.after_effect;
+        encode_runtime_checkpoint(&completed).map_err(|error| {
+            GateReconcileError::AppliedDesired(AppliedDesiredError::CheckpointContract { error })
+        })?;
         let busy = self.store.replace(armed, &busy)?;
+        let revocation = self.store.prepare_endpoint_effect_revocation()?;
         let close_error = self
             .port
             .close_all(&expected_snapshot, &replacement_snapshot)
             .err();
-        let mut completed = busy.checkpoint().clone();
-        completed.updated_at_unix_ms = times.after_effect;
+        revocation.confirm();
         let completed = self.store.replace(&busy, &completed)?;
         Ok(GateTransitionResult::RequireIdleBusy {
             checkpoint: completed,
@@ -890,13 +946,9 @@ impl<'a, P: AdmissionGatePort> GateSequencer<'a, P> {
         &self,
         expected: &StoredCheckpoint,
         checkpoint: &RuntimeCheckpoint,
-        confirmed: Option<(&Id, &AdmissionSnapshot)>,
         next: Option<&EndpointEffectEdge>,
     ) -> Result<StoredCheckpoint, GateReconcileError> {
-        let updated = if let Some((endpoint_id, replacement)) = confirmed {
-            self.store
-                .transition_confirmed_endpoint_effect(replacement, endpoint_id, next)?
-        } else if let Some(next) = next {
+        let updated = if let Some(next) = next {
             self.store.arm_endpoint_effect_edge(next)?
         } else {
             true
@@ -904,7 +956,6 @@ impl<'a, P: AdmissionGatePort> GateSequencer<'a, P> {
         if !updated {
             let endpoint_id = next
                 .map(EndpointEffectEdge::endpoint_id)
-                .or_else(|| confirmed.map(|(endpoint_id, _)| endpoint_id))
                 .ok_or(GateReconcileError::EndpointCellMismatch)?;
             return Err(GateReconcileError::EndpointEffectEdgeConflict(
                 endpoint_id.clone(),
@@ -922,6 +973,34 @@ impl<'a, P: AdmissionGatePort> GateSequencer<'a, P> {
                     if let Some(next) = next {
                         self.store.clear_endpoint_effect_edge(next)?;
                     }
+                }
+                Err(error.into())
+            }
+        }
+    }
+
+    fn publish_confirmed_endpoint_checkpoint(
+        &self,
+        expected: &StoredCheckpoint,
+        checkpoint: &RuntimeCheckpoint,
+        mut transition: EndpointEffectTransition<'_>,
+    ) -> Result<StoredCheckpoint, GateReconcileError> {
+        // This is infallible: the current and next edges were validated under
+        // this same held mutex before the AdmissionCell effect. From here the
+        // old edge stays consumed on every return path.
+        transition.confirm();
+        match self.store.replace(expected, checkpoint) {
+            Ok(stored) => {
+                transition.checkpoint_is_durable();
+                Ok(stored)
+            }
+            Err(error) => {
+                if self
+                    .store
+                    .confirm_durable_checkpoint(checkpoint)
+                    .unwrap_or(false)
+                {
+                    transition.checkpoint_is_durable();
                 }
                 Err(error.into())
             }
