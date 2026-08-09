@@ -734,9 +734,23 @@ fn pre_commit_deadline_waits_for_rollback_and_leaves_no_cached_result() {
         .block_on(service.create(ingress(&workspace, "app", "deadline-key")))
         .unwrap();
     assert_eq!(retry.http_status, 202);
-    assert!(std::str::from_utf8(&retry.response_body)
-        .unwrap()
-        .contains("cat_0000000000000000000000000000000a"));
+    let replay = runtime
+        .block_on(service.create(ingress(&workspace, "app", "deadline-key")))
+        .unwrap();
+    assert_eq!(replay, retry);
+    let committed_counts: (i64, i64) = store
+        .with(|client| {
+            client
+                .query_one(
+                    "SELECT
+                        (SELECT count(*) FROM cat_records),
+                        (SELECT count(*) FROM api_idempotency_results)",
+                    &[],
+                )
+                .map(|row| (row.get(0), row.get(1)))
+        })
+        .unwrap();
+    assert_eq!(committed_counts, (1, 1));
 }
 
 #[test]
