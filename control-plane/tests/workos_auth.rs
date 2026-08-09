@@ -16,7 +16,9 @@ use axum::{Json, Router};
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use base64::Engine;
 use cats_control_plane::auth::{WorkOsConfig, WorkOsConfigParams};
-use cats_control_plane::server::{spawn, Config, Handle};
+use cats_control_plane::server::{
+    spawn_with_legacy_node_runtime_for_tests as spawn, Config, Handle,
+};
 use cats_metadata_store_sqlite::SqliteMetadataStore;
 use cats_metering::SqliteUsageStore;
 use cats_storage::MetadataStore;
