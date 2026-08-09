@@ -332,6 +332,7 @@ pub struct AgentRegistrationAttempt {
     pub node_boot_id: NodeBootId,
     pub agent_instance_id: RandomId128,
     pub registration_attempt_id: RandomId128,
+    pub guest_config_digest: Sha256Digest,
     pub expected_agent_session_epoch: Option<Epoch>,
 }
 
@@ -345,7 +346,18 @@ pub struct AgentSession {
     pub agent_instance_id: RandomId128,
     pub agent_session_epoch: Epoch,
     pub registration_attempt_id: RandomId128,
+    pub guest_config_digest: Sha256Digest,
     pub lease_deadline_unix_ms: UnixMillis,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct GuestRuntimeProfileReceipt {
+    pub version: ContractVersion,
+    pub kernel_digest: Sha256Digest,
+    pub initramfs_digest: Option<Sha256Digest>,
+    pub kernel_cmdline: AsciiText,
+    pub guest_agent_protocol_version: ContractVersion,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -1727,6 +1739,11 @@ pub enum ContractErrorDetail {
         expected: RegistrationAttemptBinding,
         presented: RegistrationAttemptBinding,
     },
+    GuestConfigMismatch {
+        node_id: Id,
+        expected_guest_config_digest: Sha256Digest,
+        presented_guest_config_digest: Sha256Digest,
+    },
     StaleObservationSequence {
         node_id: Id,
         agent_session_epoch: Epoch,
@@ -1794,6 +1811,7 @@ pub struct RegistrationAttemptBinding {
     pub immutable_host_id: Id,
     pub node_boot_id: NodeBootId,
     pub agent_instance_id: RandomId128,
+    pub guest_config_digest: Sha256Digest,
     pub expected_agent_session_epoch: Option<Epoch>,
 }
 
@@ -1803,6 +1821,7 @@ pub enum ContractName {
     NodeIdentity,
     AgentRegistrationAttempt,
     AgentSession,
+    GuestRuntimeProfileReceipt,
     AdmissionInventoryAttestation,
     DesiredRuntimeSpec,
     RuntimeCheckpoint,

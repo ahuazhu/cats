@@ -4,13 +4,23 @@ use sha2::{Digest, Sha256};
 
 use super::types::{
     ContractError, ContractErrorDetail, ContractName, ContractVersion, DesiredRuntimeSpec, Epoch,
-    JsonPointer, KeyId, MalformedProblem, NodeObservation, RuntimeCheckpoint, Sha256Digest,
+    GuestRuntimeProfileReceipt, JsonPointer, KeyId, MalformedProblem, NodeObservation,
+    RuntimeCheckpoint, Sha256Digest,
 };
 
 const SPEC_DOMAIN: &[u8] = b"cats.runtime.desired-spec.v1";
 const CHECKPOINT_DOMAIN: &[u8] = b"cats.runtime.checkpoint-content.v1";
 const INVENTORY_DOMAIN: &[u8] = b"cats.runtime.inventory.v1";
 const KEY_RING_DOMAIN: &[u8] = b"cats.runtime.key-ring.v1";
+const GUEST_RUNTIME_PROFILE_DOMAIN: &[u8] = b"cats.runtime.guest-runtime-profile.v1";
+
+/// Computes the digest of one validated canonical GuestRuntimeProfileReceipt artifact.
+pub fn guest_config_digest(
+    receipt: &GuestRuntimeProfileReceipt,
+) -> Result<Sha256Digest, ContractError> {
+    let canonical = super::wire::encode_guest_runtime_profile_receipt(receipt)?;
+    Ok(digest_bytes(GUEST_RUNTIME_PROFILE_DOMAIN, &canonical))
+}
 
 /// Computes the DesiredRuntimeSpec digest after context-free intrinsic validation.
 pub fn spec_digest(spec: &DesiredRuntimeSpec) -> Result<Sha256Digest, ContractError> {
@@ -200,6 +210,10 @@ fn invalid(contract: ContractName, pointer: &str) -> ContractError {
 
 fn digest_value(domain: &[u8], value: &Value) -> Sha256Digest {
     let canonical = value_bytes(value);
+    digest_bytes(domain, &canonical)
+}
+
+fn digest_bytes(domain: &[u8], canonical: &[u8]) -> Sha256Digest {
     let mut hasher = Sha256::new();
     hasher.update(domain);
     hasher.update([0]);

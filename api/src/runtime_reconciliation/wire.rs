@@ -12,6 +12,7 @@ use super::types::*;
 pub const NODE_IDENTITY_MAX_WIRE_BYTES: usize = 16_384;
 pub const AGENT_REGISTRATION_ATTEMPT_MAX_WIRE_BYTES: usize = 16_384;
 pub const AGENT_SESSION_MAX_WIRE_BYTES: usize = 16_384;
+pub const GUEST_RUNTIME_PROFILE_RECEIPT_MAX_WIRE_BYTES: usize = 4_096;
 pub const ADMISSION_INVENTORY_ATTESTATION_MAX_WIRE_BYTES: usize = 16_384;
 pub const DESIRED_RUNTIME_SPEC_MAX_WIRE_BYTES: usize = 1_048_576;
 pub const RUNTIME_CHECKPOINT_MAX_WIRE_BYTES: usize = 4_194_304;
@@ -3279,6 +3280,7 @@ fn contract_name_schema() -> Schema {
         "node_identity",
         "agent_registration_attempt",
         "agent_session",
+        "guest_runtime_profile_receipt",
         "admission_inventory_attestation",
         "desired_runtime_spec",
         "runtime_checkpoint",
@@ -3294,6 +3296,7 @@ fn registration_binding_schema() -> Schema {
         field("immutable_host_id", id()),
         field("node_boot_id", random_id()),
         field("agent_instance_id", random_id()),
+        field("guest_config_digest", digest()),
         field("expected_agent_session_epoch", nullable(epoch())),
     ])
 }
@@ -3324,6 +3327,14 @@ fn contract_error_detail_schema() -> Schema {
                     field("registration_attempt_id", random_id()),
                     field("expected", registration_binding_schema()),
                     field("presented", registration_binding_schema()),
+                ],
+            ),
+            variant(
+                "guest_config_mismatch",
+                vec![
+                    field("node_id", id()),
+                    field("expected_guest_config_digest", digest()),
+                    field("presented_guest_config_digest", digest()),
                 ],
             ),
             variant(
@@ -3460,6 +3471,7 @@ fn agent_registration_attempt_schema() -> Schema {
         field("node_boot_id", random_id()),
         field("agent_instance_id", random_id()),
         field("registration_attempt_id", random_id()),
+        field("guest_config_digest", digest()),
         field("expected_agent_session_epoch", nullable(epoch())),
     ])
 }
@@ -3473,7 +3485,18 @@ fn agent_session_schema() -> Schema {
         field("agent_instance_id", random_id()),
         field("agent_session_epoch", epoch()),
         field("registration_attempt_id", random_id()),
+        field("guest_config_digest", digest()),
         field("lease_deadline_unix_ms", wire_u64()),
+    ])
+}
+
+fn guest_runtime_profile_receipt_schema() -> Schema {
+    object(vec![
+        field("version", version()),
+        field("kernel_digest", digest()),
+        field("initramfs_digest", nullable(digest())),
+        field("kernel_cmdline", string(StringRule::AsciiText)),
+        field("guest_agent_protocol_version", literal_number(1)),
     ])
 }
 
@@ -3504,6 +3527,8 @@ static NODE_IDENTITY_SCHEMA: LazyLock<Schema> = LazyLock::new(node_identity_sche
 static AGENT_REGISTRATION_ATTEMPT_SCHEMA: LazyLock<Schema> =
     LazyLock::new(agent_registration_attempt_schema);
 static AGENT_SESSION_SCHEMA: LazyLock<Schema> = LazyLock::new(agent_session_schema);
+static GUEST_RUNTIME_PROFILE_RECEIPT_SCHEMA: LazyLock<Schema> =
+    LazyLock::new(guest_runtime_profile_receipt_schema);
 static ADMISSION_ATTESTATION_SCHEMA: LazyLock<Schema> = LazyLock::new(admission_attestation_schema);
 static DESIRED_RUNTIME_SPEC_SCHEMA: LazyLock<Schema> = LazyLock::new(desired_runtime_spec_schema);
 static RUNTIME_CHECKPOINT_SCHEMA: LazyLock<Schema> = LazyLock::new(runtime_checkpoint_schema);
@@ -3700,6 +3725,27 @@ pub fn decode_agent_session(bytes: &[u8]) -> Result<AgentSession, ContractError>
     )
 }
 
+pub fn decode_guest_runtime_profile_receipt(
+    bytes: &[u8],
+) -> Result<GuestRuntimeProfileReceipt, ContractError> {
+    let contract = ContractName::GuestRuntimeProfileReceipt;
+    let input = validate_payload(
+        bytes,
+        GUEST_RUNTIME_PROFILE_RECEIPT_MAX_WIRE_BYTES,
+        &GUEST_RUNTIME_PROFILE_RECEIPT_SCHEMA,
+        true,
+    )
+    .map_err(|error| contract_payload_error(contract, error))?;
+    let decoded: GuestRuntimeProfileReceipt = serde_json::from_str(input)
+        .map_err(|_| malformed_root(contract, MalformedProblem::InvalidValue))?;
+    let value = serde_json::to_value(&decoded)
+        .map_err(|_| malformed_root(contract, MalformedProblem::InvalidValue))?;
+    if value_bytes(&value) != bytes {
+        return Err(malformed_root(contract, MalformedProblem::InvalidValue));
+    }
+    Ok(decoded)
+}
+
 pub fn decode_admission_inventory_attestation(
     bytes: &[u8],
 ) -> Result<AdmissionInventoryAttestation, ContractError> {
@@ -3790,6 +3836,16 @@ pub fn encode_agent_registration_attempt(
 
 pub fn encode_agent_session(value: &AgentSession) -> Result<Vec<u8>, ContractError> {
     encode(value, ContractName::AgentSession, decode_agent_session)
+}
+
+pub fn encode_guest_runtime_profile_receipt(
+    value: &GuestRuntimeProfileReceipt,
+) -> Result<Vec<u8>, ContractError> {
+    encode(
+        value,
+        ContractName::GuestRuntimeProfileReceipt,
+        decode_guest_runtime_profile_receipt,
+    )
 }
 
 pub fn encode_admission_inventory_attestation(
@@ -4377,6 +4433,11 @@ fn validate_contract_error(error: &ContractError) -> Result<(), ContractError> {
             presented,
             ..
         } => expected != presented,
+        ContractErrorDetail::GuestConfigMismatch {
+            expected_guest_config_digest,
+            presented_guest_config_digest,
+            ..
+        } => expected_guest_config_digest != presented_guest_config_digest,
         ContractErrorDetail::StaleObservationSequence {
             presented_heartbeat_sequence,
             last_accepted_heartbeat_sequence,

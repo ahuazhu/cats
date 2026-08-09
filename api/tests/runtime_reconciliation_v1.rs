@@ -3,6 +3,11 @@ use std::fmt::Write as _;
 use cats_api::runtime_reconciliation::*;
 
 const ZERO_DIGEST: &str = "sha256:0000000000000000000000000000000000000000000000000000000000000000";
+const GUEST_CONFIG_DIGEST: &str =
+    "sha256:78215611e8c3bd683eb542b5696a6316156365a94624c7521446ab5660d067e2";
+const GUEST_RUNTIME_PROFILE_RECEIPT_WIRE: &str = r#"{"guest_agent_protocol_version":1,"initramfs_digest":"sha256:1111111111111111111111111111111111111111111111111111111111111111","kernel_cmdline":"console=ttyS0 root=/dev/vda rw clocksource=kvm-clock","kernel_digest":"sha256:0000000000000000000000000000000000000000000000000000000000000000","version":1}"#;
+const AGENT_REGISTRATION_ATTEMPT_WIRE: &str = r#"{"agent_instance_id":"44444444444444444444444444444444","expected_agent_session_epoch":null,"guest_config_digest":"sha256:78215611e8c3bd683eb542b5696a6316156365a94624c7521446ab5660d067e2","immutable_host_id":"host_a","node_boot_id":"33333333333333333333333333333333","node_id":"node_a","registration_attempt_id":"55555555555555555555555555555555","version":1}"#;
+const AGENT_SESSION_WIRE: &str = r#"{"agent_instance_id":"44444444444444444444444444444444","agent_session_epoch":2,"guest_config_digest":"sha256:78215611e8c3bd683eb542b5696a6316156365a94624c7521446ab5660d067e2","immutable_host_id":"host_a","lease_deadline_unix_ms":1720000060000,"node_boot_id":"33333333333333333333333333333333","node_id":"node_a","registration_attempt_id":"55555555555555555555555555555555","version":1}"#;
 const SPEC_DIGEST: &str = "sha256:529c32e8600910283f99bf949af5c31fdadcf3757463eb6c4811c61673ed9409";
 const CHECKPOINT_DIGEST: &str =
     "sha256:602bd0f3a0f1a29f269fa2946fa1a52ea154ba1623b5ca2de18e657cad3753fb";
@@ -207,6 +212,10 @@ fn reject_registration(bytes: &[u8]) -> ContractError {
 
 fn reject_session(bytes: &[u8]) -> ContractError {
     decode_agent_session(bytes).unwrap_err()
+}
+
+fn reject_guest_profile(bytes: &[u8]) -> ContractError {
+    decode_guest_runtime_profile_receipt(bytes).unwrap_err()
 }
 
 fn reject_attestation(bytes: &[u8]) -> ContractError {
@@ -489,6 +498,220 @@ fn fixed_desired_and_checkpoint_digests_match() {
 }
 
 #[test]
+fn fixed_guest_runtime_profile_receipt_and_digest_match() {
+    let receipt =
+        decode_guest_runtime_profile_receipt(GUEST_RUNTIME_PROFILE_RECEIPT_WIRE.as_bytes())
+            .unwrap();
+    assert_eq!(
+        encode_guest_runtime_profile_receipt(&receipt).unwrap(),
+        GUEST_RUNTIME_PROFILE_RECEIPT_WIRE.as_bytes()
+    );
+    let digest = guest_config_digest(&receipt).unwrap();
+    assert_eq!(digest.as_str(), GUEST_CONFIG_DIGEST);
+    assert_eq!(
+        digest.as_bytes(),
+        Sha256Digest::new(GUEST_CONFIG_DIGEST).unwrap().as_bytes()
+    );
+
+    let mut changed_kernel = receipt.clone();
+    changed_kernel.kernel_digest =
+        Sha256Digest::new(format!("sha256:{}1", "0".repeat(63))).unwrap();
+    assert_ne!(
+        guest_config_digest(&changed_kernel).unwrap(),
+        guest_config_digest(&receipt).unwrap()
+    );
+
+    let mut changed_initramfs = receipt.clone();
+    changed_initramfs.initramfs_digest = None;
+    assert_ne!(
+        guest_config_digest(&changed_initramfs).unwrap(),
+        guest_config_digest(&receipt).unwrap()
+    );
+
+    let mut changed_cmdline = receipt.clone();
+    changed_cmdline.kernel_cmdline =
+        AsciiText::new("console=ttyS0 root=/dev/vda ro clocksource=kvm-clock").unwrap();
+    assert_ne!(
+        guest_config_digest(&changed_cmdline).unwrap(),
+        guest_config_digest(&receipt).unwrap()
+    );
+
+    let mut unsupported_protocol = receipt;
+    unsupported_protocol.guest_agent_protocol_version = ContractVersion::new(2).unwrap();
+    let error = guest_config_digest(&unsupported_protocol).unwrap_err();
+    assert_eq!(
+        malformed(&error).0.as_str(),
+        "/guest_agent_protocol_version"
+    );
+    assert_eq!(malformed(&error).1, MalformedProblem::InvalidValue);
+}
+
+#[test]
+fn guest_runtime_profile_receipt_requires_exact_canonical_artifact_bytes() {
+    let receipt: serde_json::Value =
+        serde_json::from_str(GUEST_RUNTIME_PROFILE_RECEIPT_WIRE).unwrap();
+    let reordered = format!(
+        r#"{{"version":1,"kernel_digest":"{}","kernel_cmdline":"{}","initramfs_digest":"{}","guest_agent_protocol_version":1}}"#,
+        receipt["kernel_digest"].as_str().unwrap(),
+        receipt["kernel_cmdline"].as_str().unwrap(),
+        receipt["initramfs_digest"].as_str().unwrap(),
+    );
+    let escaped = GUEST_RUNTIME_PROFILE_RECEIPT_WIRE.replacen("console", r"c\u006fnsole", 1);
+    for wire in [
+        format!(" {GUEST_RUNTIME_PROFILE_RECEIPT_WIRE}"),
+        format!("{GUEST_RUNTIME_PROFILE_RECEIPT_WIRE} "),
+        format!("{GUEST_RUNTIME_PROFILE_RECEIPT_WIRE}\n"),
+        reordered,
+        escaped,
+    ] {
+        let error = decode_guest_runtime_profile_receipt(wire.as_bytes()).unwrap_err();
+        match error.error.as_ref() {
+            ContractErrorDetail::MalformedPayload {
+                contract,
+                json_pointer,
+                problem,
+            } => {
+                assert_eq!(*contract, ContractName::GuestRuntimeProfileReceipt);
+                assert_eq!(json_pointer.as_str(), "");
+                assert_eq!(*problem, MalformedProblem::InvalidValue);
+            }
+            detail => panic!("expected canonical artifact rejection, got {detail:?}"),
+        }
+    }
+}
+
+#[test]
+fn guest_runtime_profile_receipt_transport_schema_and_limits_are_closed() {
+    let duplicate = GUEST_RUNTIME_PROFILE_RECEIPT_WIRE.replacen(
+        r#""kernel_digest":"#,
+        &format!(r#""kernel_digest":"{ZERO_DIGEST}","kernel_digest":"#),
+        1,
+    );
+    let cases: Vec<(Vec<u8>, &str, MalformedProblem)> = vec![
+        (vec![0xef, 0xbb, 0xbf, b'{', b'}'], "", MalformedProblem::InvalidJson),
+        (b"{".to_vec(), "", MalformedProblem::InvalidJson),
+        (duplicate.into_bytes(), "/kernel_digest", MalformedProblem::DuplicateField),
+        (
+            GUEST_RUNTIME_PROFILE_RECEIPT_WIRE
+                .replacen(r#""version":1}"#, r#""unknown":1,"version":1}"#, 1)
+                .into_bytes(),
+            "/unknown",
+            MalformedProblem::UnknownField,
+        ),
+        (
+            GUEST_RUNTIME_PROFILE_RECEIPT_WIRE
+                .replacen(
+                    &format!(r#""kernel_digest":"{ZERO_DIGEST}""#),
+                    r#""kernel_digest":1"#,
+                    1,
+                )
+                .into_bytes(),
+            "/kernel_digest",
+            MalformedProblem::InvalidType,
+        ),
+        (
+            GUEST_RUNTIME_PROFILE_RECEIPT_WIRE
+                .replacen(
+                    &format!(r#""kernel_digest":"{ZERO_DIGEST}""#),
+                    r#""kernel_digest":null"#,
+                    1,
+                )
+                .into_bytes(),
+            "/kernel_digest",
+            MalformedProblem::InvalidType,
+        ),
+        (
+            GUEST_RUNTIME_PROFILE_RECEIPT_WIRE
+                .replacen(r#","initramfs_digest":"sha256:1111111111111111111111111111111111111111111111111111111111111111""#, "", 1)
+                .into_bytes(),
+            "/initramfs_digest",
+            MalformedProblem::MissingField,
+        ),
+        (
+            GUEST_RUNTIME_PROFILE_RECEIPT_WIRE
+                .replacen(
+                    r#""kernel_cmdline":"console=ttyS0 root=/dev/vda rw clocksource=kvm-clock""#,
+                    r#""kernel_cmdline":null"#,
+                    1,
+                )
+                .into_bytes(),
+            "/kernel_cmdline",
+            MalformedProblem::InvalidType,
+        ),
+    ];
+    for (wire, pointer, problem) in cases {
+        let error = decode_guest_runtime_profile_receipt(&wire).unwrap_err();
+        match error.error.as_ref() {
+            ContractErrorDetail::MalformedPayload { contract, .. } => {
+                assert_eq!(*contract, ContractName::GuestRuntimeProfileReceipt)
+            }
+            detail => panic!("expected malformed receipt, got {detail:?}"),
+        }
+        assert_eq!(malformed(&error).0.as_str(), pointer);
+        assert_eq!(malformed(&error).1, problem);
+    }
+
+    let mut at_limit = GUEST_RUNTIME_PROFILE_RECEIPT_WIRE.as_bytes().to_vec();
+    at_limit.resize(GUEST_RUNTIME_PROFILE_RECEIPT_MAX_WIRE_BYTES, b' ');
+    let error = decode_guest_runtime_profile_receipt(&at_limit).unwrap_err();
+    assert_eq!(malformed(&error).0.as_str(), "");
+    assert_eq!(malformed(&error).1, MalformedProblem::InvalidValue);
+
+    at_limit.push(b' ');
+    let error = decode_guest_runtime_profile_receipt(&at_limit).unwrap_err();
+    match error.error.as_ref() {
+        ContractErrorDetail::LimitExceeded {
+            contract,
+            json_pointer,
+            limit,
+            maximum,
+            observed_at_least,
+        } => {
+            assert_eq!(*contract, ContractName::GuestRuntimeProfileReceipt);
+            assert_eq!(json_pointer.as_str(), "");
+            assert_eq!(*limit, LimitKind::WireBytes);
+            assert_eq!(maximum.get(), 4096);
+            assert_eq!(observed_at_least.get(), 4097);
+        }
+        detail => panic!("expected receipt wire limit, got {detail:?}"),
+    }
+}
+
+#[test]
+fn guest_runtime_profile_receipt_scalar_boundaries_are_exact() {
+    let mut receipt: serde_json::Value =
+        serde_json::from_str(GUEST_RUNTIME_PROFILE_RECEIPT_WIRE).unwrap();
+    receipt["kernel_cmdline"] = "x".repeat(512).into();
+    let canonical = canonical_json(&receipt);
+    decode_guest_runtime_profile_receipt(&canonical).unwrap();
+
+    for cmdline in [String::new(), "x".repeat(513), "line\nbreak".to_owned()] {
+        receipt["kernel_cmdline"] = cmdline.into();
+        let error = decode_guest_runtime_profile_receipt(&canonical_json(&receipt)).unwrap_err();
+        assert_eq!(malformed(&error).0.as_str(), "/kernel_cmdline");
+        assert_eq!(malformed(&error).1, MalformedProblem::InvalidValue);
+    }
+
+    let noncanonical_protocol = GUEST_RUNTIME_PROFILE_RECEIPT_WIRE.replacen(
+        r#""guest_agent_protocol_version":1"#,
+        r#""guest_agent_protocol_version":1.0"#,
+        1,
+    );
+    let error = decode_guest_runtime_profile_receipt(noncanonical_protocol.as_bytes()).unwrap_err();
+    assert_eq!(
+        malformed(&error).0.as_str(),
+        "/guest_agent_protocol_version"
+    );
+    assert_eq!(malformed(&error).1, MalformedProblem::InvalidValue);
+
+    let noncanonical_version =
+        GUEST_RUNTIME_PROFILE_RECEIPT_WIRE.replacen(r#""version":1}"#, r#""version":1e0}"#, 1);
+    let error = decode_guest_runtime_profile_receipt(noncanonical_version.as_bytes()).unwrap_err();
+    assert_eq!(malformed(&error).0.as_str(), "/version");
+    assert_eq!(malformed(&error).1, MalformedProblem::InvalidValue);
+}
+
+#[test]
 fn fixed_key_ring_digests_match() {
     let empty = key_ring_digest(Epoch::new(1).unwrap(), &[]).unwrap();
     assert_eq!(
@@ -589,6 +812,27 @@ fn fixed_nonempty_inventory_digest_matches() {
 
 #[test]
 fn fixed_non_digest_vectors_decode_exactly() {
+    let registration =
+        decode_agent_registration_attempt(AGENT_REGISTRATION_ATTEMPT_WIRE.as_bytes()).unwrap();
+    assert_eq!(
+        registration.guest_config_digest.as_str(),
+        GUEST_CONFIG_DIGEST
+    );
+    assert_eq!(
+        encode_agent_registration_attempt(&registration).unwrap(),
+        AGENT_REGISTRATION_ATTEMPT_WIRE.as_bytes()
+    );
+
+    let session = decode_agent_session(AGENT_SESSION_WIRE.as_bytes()).unwrap();
+    assert_eq!(
+        session.guest_config_digest,
+        registration.guest_config_digest
+    );
+    assert_eq!(
+        encode_agent_session(&session).unwrap(),
+        AGENT_SESSION_WIRE.as_bytes()
+    );
+
     let volume_cleanup: CleanupRelease = serde_json::from_str(VOLUME_CLEANUP_WIRE).unwrap();
     assert_eq!(
         canonical_json(&volume_cleanup),
@@ -648,6 +892,94 @@ fn contract_error_variants_reject_self_contradictory_payloads() {
         "message": "stale",
     });
     decode_contract_error(&serde_json::to_vec(&valid_stale).unwrap()).unwrap();
+
+    let registration_binding = |digest: &str| {
+        serde_json::json!({
+            "immutable_host_id": "host_a",
+            "node_boot_id": "33333333333333333333333333333333",
+            "agent_instance_id": "44444444444444444444444444444444",
+            "guest_config_digest": digest,
+            "expected_agent_session_epoch": null,
+        })
+    };
+    let valid_attempt_conflict = serde_json::json!({
+        "version": 1,
+        "error": {
+            "code": "registration_attempt_conflict",
+            "node_id": "node_a",
+            "registration_attempt_id": "55555555555555555555555555555555",
+            "expected": registration_binding(GUEST_CONFIG_DIGEST),
+            "presented": registration_binding(ZERO_DIGEST),
+        },
+        "message": "same registration attempt carried a different binding",
+    });
+    let attempt_conflict =
+        decode_contract_error(&serde_json::to_vec(&valid_attempt_conflict).unwrap()).unwrap();
+    match attempt_conflict.error.as_ref() {
+        ContractErrorDetail::RegistrationAttemptConflict {
+            expected,
+            presented,
+            ..
+        } => {
+            assert_eq!(expected.guest_config_digest.as_str(), GUEST_CONFIG_DIGEST);
+            assert_eq!(presented.guest_config_digest.as_str(), ZERO_DIGEST);
+        }
+        detail => panic!("expected registration attempt conflict, got {detail:?}"),
+    }
+
+    let mut equal_attempt = valid_attempt_conflict;
+    equal_attempt["error"]["presented"]["guest_config_digest"] = GUEST_CONFIG_DIGEST.into();
+    let error = decode_contract_error(&serde_json::to_vec(&equal_attempt).unwrap()).unwrap_err();
+    assert_eq!(malformed(&error).0.as_str(), "/error");
+    assert_eq!(malformed(&error).1, MalformedProblem::InvalidValue);
+
+    let valid_guest_mismatch = serde_json::json!({
+        "version": 1,
+        "error": {
+            "code": "guest_config_mismatch",
+            "node_id": "node_a",
+            "expected_guest_config_digest": GUEST_CONFIG_DIGEST,
+            "presented_guest_config_digest": ZERO_DIGEST,
+        },
+        "message": "node does not carry the active release guest runtime profile",
+    });
+    decode_contract_error(&serde_json::to_vec(&valid_guest_mismatch).unwrap()).unwrap();
+
+    let mut equal_guest = valid_guest_mismatch;
+    equal_guest["error"]["presented_guest_config_digest"] = GUEST_CONFIG_DIGEST.into();
+    let error = decode_contract_error(&serde_json::to_vec(&equal_guest).unwrap()).unwrap_err();
+    assert_eq!(malformed(&error).0.as_str(), "/error");
+    assert_eq!(malformed(&error).1, MalformedProblem::InvalidValue);
+}
+
+#[test]
+fn registration_and_session_require_the_release_guest_digest() {
+    for (wire, reject) in [
+        (
+            AGENT_REGISTRATION_ATTEMPT_WIRE,
+            reject_registration as fn(&[u8]) -> ContractError,
+        ),
+        (
+            AGENT_SESSION_WIRE,
+            reject_session as fn(&[u8]) -> ContractError,
+        ),
+    ] {
+        let mut value: serde_json::Value = serde_json::from_str(wire).unwrap();
+        value.as_object_mut().unwrap().remove("guest_config_digest");
+        let error = reject(&serde_json::to_vec(&value).unwrap());
+        assert_eq!(malformed(&error).0.as_str(), "/guest_config_digest");
+        assert_eq!(malformed(&error).1, MalformedProblem::MissingField);
+
+        value["guest_config_digest"] = serde_json::Value::Null;
+        let error = reject(&serde_json::to_vec(&value).unwrap());
+        assert_eq!(malformed(&error).0.as_str(), "/guest_config_digest");
+        assert_eq!(malformed(&error).1, MalformedProblem::InvalidType);
+
+        value["guest_config_digest"] = "sha256:ABC".into();
+        let error = reject(&serde_json::to_vec(&value).unwrap());
+        assert_eq!(malformed(&error).0.as_str(), "/guest_config_digest");
+        assert_eq!(malformed(&error).1, MalformedProblem::InvalidValue);
+    }
 }
 
 #[test]
@@ -660,7 +992,7 @@ fn all_explicit_encoders_validate_and_emit_canonical_wire() {
     );
 
     let registration = decode_agent_registration_attempt(
-        br#"{"version":1,"node_id":"node_a","immutable_host_id":"host_a","node_boot_id":"11111111111111111111111111111111","agent_instance_id":"22222222222222222222222222222222","registration_attempt_id":"33333333333333333333333333333333","expected_agent_session_epoch":null}"#,
+        format!(r#"{{"version":1,"node_id":"node_a","immutable_host_id":"host_a","node_boot_id":"11111111111111111111111111111111","agent_instance_id":"22222222222222222222222222222222","registration_attempt_id":"33333333333333333333333333333333","guest_config_digest":"{GUEST_CONFIG_DIGEST}","expected_agent_session_epoch":null}}"#).as_bytes(),
     )
     .unwrap();
     assert_eq!(
@@ -669,7 +1001,7 @@ fn all_explicit_encoders_validate_and_emit_canonical_wire() {
     );
 
     let session = decode_agent_session(
-        br#"{"version":1,"node_id":"node_a","immutable_host_id":"host_a","node_boot_id":"11111111111111111111111111111111","agent_instance_id":"22222222222222222222222222222222","agent_session_epoch":1,"registration_attempt_id":"33333333333333333333333333333333","lease_deadline_unix_ms":1}"#,
+        format!(r#"{{"version":1,"node_id":"node_a","immutable_host_id":"host_a","node_boot_id":"11111111111111111111111111111111","agent_instance_id":"22222222222222222222222222222222","agent_session_epoch":1,"registration_attempt_id":"33333333333333333333333333333333","guest_config_digest":"{GUEST_CONFIG_DIGEST}","lease_deadline_unix_ms":1}}"#).as_bytes(),
     )
     .unwrap();
     assert_eq!(
@@ -817,7 +1149,7 @@ fn transport_schema_and_number_errors_are_typed() {
     assert_eq!(malformed(&duplicate).0.as_str(), "/node_id");
 
     let non_integer = decode_agent_session(
-        br#"{"version":1,"node_id":"node","immutable_host_id":"host","node_boot_id":"11111111111111111111111111111111","agent_instance_id":"22222222222222222222222222222222","agent_session_epoch":1e0,"registration_attempt_id":"33333333333333333333333333333333","lease_deadline_unix_ms":0}"#,
+        format!(r#"{{"version":1,"node_id":"node","immutable_host_id":"host","node_boot_id":"11111111111111111111111111111111","agent_instance_id":"22222222222222222222222222222222","agent_session_epoch":1e0,"registration_attempt_id":"33333333333333333333333333333333","guest_config_digest":"{GUEST_CONFIG_DIGEST}","lease_deadline_unix_ms":0}}"#).as_bytes(),
     )
     .unwrap_err();
     assert_eq!(malformed(&non_integer).1, MalformedProblem::InvalidValue);
@@ -850,16 +1182,18 @@ fn malformed_json_table_fails_at_the_transport_boundary() {
 
 #[test]
 fn unsigned_numbers_preserve_lexemes_and_enforce_domain_boundaries() {
-    let base = r#"{"version":1,"node_id":"node","immutable_host_id":"host","node_boot_id":"11111111111111111111111111111111","agent_instance_id":"22222222222222222222222222222222","agent_session_epoch":1,"registration_attempt_id":"33333333333333333333333333333333","lease_deadline_unix_ms":0}"#;
+    let base = format!(
+        r#"{{"version":1,"node_id":"node","immutable_host_id":"host","node_boot_id":"11111111111111111111111111111111","agent_instance_id":"22222222222222222222222222222222","agent_session_epoch":1,"registration_attempt_id":"33333333333333333333333333333333","guest_config_digest":"{GUEST_CONFIG_DIGEST}","lease_deadline_unix_ms":0}}"#
+    );
     let epoch = r#""agent_session_epoch":1"#;
 
-    let wrong_type = replace_once(base, epoch, r#""agent_session_epoch":"1""#);
+    let wrong_type = replace_once(&base, epoch, r#""agent_session_epoch":"1""#);
     let error = decode_agent_session(&wrong_type).unwrap_err();
     assert_eq!(malformed(&error).0.as_str(), "/agent_session_epoch");
     assert_eq!(malformed(&error).1, MalformedProblem::InvalidType);
 
     for token in ["0", "1.0", "1e0", "-0", "-1", "9223372036854775808"] {
-        let bytes = replace_once(base, epoch, &format!(r#""agent_session_epoch":{token}"#));
+        let bytes = replace_once(&base, epoch, &format!(r#""agent_session_epoch":{token}"#));
         let error = decode_agent_session(&bytes).unwrap_err();
         assert_eq!(
             malformed(&error).0.as_str(),
@@ -873,10 +1207,10 @@ fn unsigned_numbers_preserve_lexemes_and_enforce_domain_boundaries() {
         );
     }
 
-    let maximum = replace_once(base, epoch, r#""agent_session_epoch":9223372036854775807"#);
+    let maximum = replace_once(&base, epoch, r#""agent_session_epoch":9223372036854775807"#);
     decode_agent_session(&maximum).unwrap();
     let maximum_millis = replace_once(
-        base,
+        &base,
         r#""lease_deadline_unix_ms":0"#,
         r#""lease_deadline_unix_ms":9223372036854775807"#,
     );
@@ -1102,8 +1436,8 @@ fn all_wire_byte_boundaries_and_shared_schema_initialization_are_safe() {
     type Decode = fn(&[u8]) -> Result<(), ContractError>;
 
     let node = serde_json::to_vec(&node_identity_value()).unwrap();
-    let registration = br#"{"version":1,"node_id":"node_a","immutable_host_id":"host_a","node_boot_id":"11111111111111111111111111111111","agent_instance_id":"22222222222222222222222222222222","registration_attempt_id":"33333333333333333333333333333333","expected_agent_session_epoch":null}"#.to_vec();
-    let session = br#"{"version":1,"node_id":"node_a","immutable_host_id":"host_a","node_boot_id":"11111111111111111111111111111111","agent_instance_id":"22222222222222222222222222222222","agent_session_epoch":1,"registration_attempt_id":"33333333333333333333333333333333","lease_deadline_unix_ms":1}"#.to_vec();
+    let registration = format!(r#"{{"version":1,"node_id":"node_a","immutable_host_id":"host_a","node_boot_id":"11111111111111111111111111111111","agent_instance_id":"22222222222222222222222222222222","registration_attempt_id":"33333333333333333333333333333333","guest_config_digest":"{GUEST_CONFIG_DIGEST}","expected_agent_session_epoch":null}}"#).into_bytes();
+    let session = format!(r#"{{"version":1,"node_id":"node_a","immutable_host_id":"host_a","node_boot_id":"11111111111111111111111111111111","agent_instance_id":"22222222222222222222222222222222","agent_session_epoch":1,"registration_attempt_id":"33333333333333333333333333333333","guest_config_digest":"{GUEST_CONFIG_DIGEST}","lease_deadline_unix_ms":1}}"#).into_bytes();
     let attestation = format!(
         r#"{{"version":1,"node_id":"node_a","agent_session_epoch":1,"inventory_epoch":1,"inventory_digest":"{ZERO_DIGEST}","inventory_read_position":1,"accepted_at_unix_ms":1}}"#
     )
@@ -2765,6 +3099,7 @@ fn every_top_level_contract_uses_the_same_version_rules() {
                 "node_boot_id": "11111111111111111111111111111111",
                 "agent_instance_id": "22222222222222222222222222222222",
                 "registration_attempt_id": "33333333333333333333333333333333",
+                "guest_config_digest": GUEST_CONFIG_DIGEST,
                 "expected_agent_session_epoch": null,
             }),
             reject_registration,
@@ -2779,9 +3114,15 @@ fn every_top_level_contract_uses_the_same_version_rules() {
                 "agent_instance_id": "22222222222222222222222222222222",
                 "agent_session_epoch": 1,
                 "registration_attempt_id": "33333333333333333333333333333333",
+                "guest_config_digest": GUEST_CONFIG_DIGEST,
                 "lease_deadline_unix_ms": 1,
             }),
             reject_session,
+        ),
+        (
+            ContractName::GuestRuntimeProfileReceipt,
+            serde_json::from_str(GUEST_RUNTIME_PROFILE_RECEIPT_WIRE).unwrap(),
+            reject_guest_profile,
         ),
         (
             ContractName::AdmissionInventoryAttestation,
