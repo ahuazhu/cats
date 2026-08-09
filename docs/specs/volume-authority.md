@@ -771,7 +771,8 @@ resource的fast lookup。exact hit逐byte重放且不得读取image、release re
 
 1. `boot_image_digest`直接寻址ADR-0017的
    `images/<boot_image_digest去掉sha256:后的64位hex>/manifest.json`。service按
-   [blockd §6.3.1](blockd-protocol.md#631-root-provision-control-effect)完整验证immutable manifest；不解析image
+   [Immutable Image Manifest Read v1](immutable-image-manifest-read-v1.md)通过与blockd共用的唯一
+   provider-neutral DTO/reader完整验证immutable manifest；不解析image
    alias/tag，也不查询catalog。Root实际`size_bytes = ceil(root_size_bytes / CHUNK_SIZE) * CHUNK_SIZE`，其中
    `CHUNK_SIZE=4194304`；结果必须不小于manifest `size_bytes`且不大于`MAX_VOLUME_BYTES=1099511627776`。
    manifest缺失/暂不可读、非法或size不满足时不生成可提交candidate，不以fixture manifest继续。

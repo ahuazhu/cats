@@ -61,6 +61,7 @@ AdmissionCell。它们由同一个vertical cutover合同和故障矩阵收敛。
 | [Agent Registration and Internal Transport v1](specs/agent-registration-transport-v1.md) | Frozen target，未实现 | per-Node签名、注册wire、lease与Guest receipt部署路径 |
 | [Runtime Inventory and Observation Spine v1](specs/runtime-inventory-observation-v1.md) | Frozen target，未实现 | Desired read-position、inventory/observation接受与freshness |
 | [Runtime Composition Artifacts v1](specs/runtime-composition-artifacts-v1.md) | Frozen target，未实现 | local NodeIdentity artifact与单一Guest release payload |
+| [Immutable Image Manifest Read v1](specs/immutable-image-manifest-read-v1.md) | Frozen target，未实现 | golden manifest唯一DTO、canonical bytes、有界读取与Control只读组合 |
 | [Route Grant v2](specs/route-grant-v2.md) | Target，未实现 | ADR-0041切换合同；固定向量待实现时重建 |
 | [Volume Authority](specs/volume-authority.md) | Target，未实现 | ADR-0042卷、attachment、ext4、snapshot和delete合同 |
 

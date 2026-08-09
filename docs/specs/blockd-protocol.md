@@ -469,6 +469,9 @@ target由请求以外的既有immutable事实纯确定计算，步骤固定如�
    `size_bytes`为正CHUNK_SIZE整数倍且不大于request size；non-hole chunks按`chunk_idx`严格升序且唯一，
    index在manifest范围内，每项`len=CHUNK_SIZE`、`object_id`为该chunk的64位小写SHA-256。manifest-last
    语义保证这些immutable image objects在manifest可见前已durable。
+   exact canonical manifest bytes、32 MiB cap、唯一shared DTO/reader与closed read error以
+   [Immutable Image Manifest Read v1](immutable-image-manifest-read-v1.md)为准；blockd不保留第二个JSON
+   decoder/validator，也不接受旧member-order/whitespace兼容artifact。
 2. 建立`request.size_bytes / CHUNK_SIZE`项的Map，默认Hole；每个manifest chunk变为§3的image Base：
    `object_id`和decoded SHA-256取该chunk object ID，`len=CHUNK_SIZE`，`image_id`取上述image-id。
 3. 每256个ChunkRef按§3.1编码Leaf；全Hole leaf使用EmptyLeaf，其余只在内存中编码、hash并派生本卷

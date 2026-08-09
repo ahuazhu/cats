@@ -44,6 +44,10 @@ cross-tenant deduplication behavior.
    RuntimeCheckpoint先fsync完整request和唯一transition ID；blockd以该ID固定commit object key并做
    exact blank->target head CAS。响应丢失只比较权威head，不保存第二份provision receipt。
    Cat runtime不得再用`--seed-image-id`在blockd启动时隐式provision，也不保留双路径兼容层。
+9. manifest 的唯一 provider-neutral DTO、canonical artifact bytes、有界 reader、closed error与
+   Control Plane只读composition由
+   [Immutable Image Manifest Read v1](../specs/immutable-image-manifest-read-v1.md)冻结；blockd与Control
+   不得各自保留第二套JSON parser/validator或catalog fallback。
 
 ## Invariants
 
