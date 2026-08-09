@@ -625,7 +625,7 @@ async fn established_endpoint_websocket_survives_control_plane_outage() {
         vec![0, 1, 2, 255]
     );
 
-    cluster.cp.shutdown().await;
+    cluster.cp.shutdown().await.unwrap();
     // The removed control-plane work lease renewed every 30 seconds. Cross
     // that exact old failure boundary as well as the two-second test Grant.
     tokio::time::sleep(Duration::from_secs(31)).await;
@@ -661,7 +661,7 @@ async fn running_endpoint_survives_control_plane_outage_with_cached_route_grant(
     let (status, first) = cluster.gateway_get(&hostname, "/before-outage").await;
     assert_eq!(status, 200, "failed to prime route cache: {first}");
 
-    cluster.cp.shutdown().await;
+    cluster.cp.shutdown().await.unwrap();
     let deadline = Instant::now() + Duration::from_secs(4);
     let mut successful_requests = 0;
     loop {

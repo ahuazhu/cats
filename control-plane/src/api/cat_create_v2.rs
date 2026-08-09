@@ -1,5 +1,6 @@
 //! Strict public Cat-create HTTP adapter.
 
+use std::future::Future;
 use std::time::Instant;
 
 use axum::body::{to_bytes, Body, Bytes};
@@ -12,8 +13,8 @@ use cats_api::error::ApiError;
 use super::{check_workspace_auth, require_funded, ApiResult, Failure};
 use crate::server::AppState;
 use crate::store::runtime_authority::cat_create_service::{
-    parse_authorized_cat_create, AuthorizedCatCreateIngress, CatCreateHttpFields,
-    CatCreateHttpResult, CatCreateServiceError, CAT_CREATE_MAX_BODY_BYTES,
+    cat_create_absolute_deadline, parse_authorized_cat_create, AuthorizedCatCreateIngress,
+    CatCreateHttpFields, CatCreateHttpResult, CatCreateServiceError, CAT_CREATE_MAX_BODY_BYTES,
 };
 
 const CAT_CREATE_BODY_READ_LIMIT: usize = CAT_CREATE_MAX_BODY_BYTES + 1;
@@ -31,8 +32,25 @@ pub(crate) async fn create_cat_v2(
     // The total public deadline starts when Axum hands the parsed headers to
     // the handler, before authentication or any external read.
     let headers_received_at = Instant::now();
-    let ingress =
-        authorized_cat_create_ingress(&state, &workspace, headers_received_at, request).await?;
+    create_cat_v2_from_headers_at(state, workspace, request, headers_received_at).await
+}
+
+async fn create_cat_v2_from_headers_at(
+    state: AppState,
+    workspace: String,
+    request: Request<Body>,
+    headers_received_at: Instant,
+) -> ApiResult<Response> {
+    let absolute_deadline = cat_create_absolute_deadline(headers_received_at)?;
+    let ingress = await_ingress_before_deadline(
+        absolute_deadline,
+        authorized_cat_create_ingress(&state, &workspace, headers_received_at, request),
+    )
+    .await?;
+    // CatCreateService owns the same absolute deadline. Do not wrap this call
+    // in a handler timeout: before COMMIT_SENT it cancels safely, while after
+    // COMMIT_SENT its registered non-cancellable owner must resolve the exact
+    // durable result even if the deadline or client connection is gone.
     match state.cat_create.create(ingress).await {
         Ok(result) => cat_create_http_response(result),
         Err(CatCreateServiceError::Request(error)) => Err(Failure(error)),
@@ -56,6 +74,15 @@ pub(crate) async fn create_cat_v2(
             ))
         }
     }
+}
+
+async fn await_ingress_before_deadline<T>(
+    absolute_deadline: Instant,
+    operation: impl Future<Output = ApiResult<T>>,
+) -> ApiResult<T> {
+    tokio::time::timeout_at(tokio::time::Instant::from_std(absolute_deadline), operation)
+        .await
+        .map_err(|_| Failure(ApiError::unavailable("Cat create deadline elapsed")))?
 }
 
 /// Authenticate and fund the public request before parsing any byte of its
@@ -156,11 +183,15 @@ fn closed_response(status: StatusCode, body: &'static [u8], retry_after: bool) -
 mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Arc;
+    use std::time::Duration;
 
     use axum::http::HeaderValue;
     use cats_api::error::ErrorCode;
     use cats_metering::SqliteUsageStore;
     use cats_storage::{BlobError, BlobStore, MetadataStore};
+    use futures_util::StreamExt;
+
+    use crate::store::runtime_authority::cat_create_service::CAT_CREATE_TOTAL_DEADLINE;
 
     use super::*;
 
@@ -385,6 +416,52 @@ mod tests {
                 .body(body.to_vec())
                 .send()
         };
+
+        let body_reads = Arc::new(AtomicUsize::new(0));
+        let first_body_byte = [body[0]];
+        let first_chunk = futures_util::stream::once({
+            let body_reads = Arc::clone(&body_reads);
+            async move {
+                body_reads.fetch_add(1, Ordering::SeqCst);
+                Ok::<Bytes, std::io::Error>(Bytes::copy_from_slice(&first_body_byte))
+            }
+        });
+        let trickle =
+            first_chunk.chain(futures_util::stream::pending::<Result<Bytes, std::io::Error>>());
+        let trickle_request = Request::builder()
+            .method("POST")
+            .uri(format!("/v1/workspaces/{workspace_id}/cats"))
+            .header(header::AUTHORIZATION, "Bearer admin-token")
+            .header(header::CONTENT_TYPE, "application/json")
+            .header("Idempotency-Key", "trickle-timeout")
+            .body(Body::from_stream(trickle))
+            .unwrap();
+        let headers_received_at = Instant::now()
+            .checked_sub(CAT_CREATE_TOTAL_DEADLINE - Duration::from_secs(2))
+            .unwrap();
+        let started = Instant::now();
+        let timeout = create_cat_v2_from_headers_at(
+            handle.state.clone(),
+            workspace_id.clone(),
+            trickle_request,
+            headers_received_at,
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(timeout.0.code, ErrorCode::Unavailable);
+        assert_eq!(timeout.0.message, "Cat create deadline elapsed");
+        assert!(started.elapsed() < Duration::from_secs(4));
+        assert_eq!(body_reads.load(Ordering::SeqCst), 1);
+        // The immutable manifest read necessarily precedes the planner, so no
+        // manifest read plus no durable rows proves the stalled body reached
+        // neither planner nor Store create/result ownership.
+        assert_eq!(image_blob.reads.load(Ordering::SeqCst), 0);
+        assert_eq!(handle.state.cat_create.active_commit_resolutions(), 0);
+        let timeout_rows = tokio::task::block_in_place(|| {
+            handle.state.cat_create.durable_create_row_counts_for_test()
+        })
+        .unwrap();
+        assert_eq!(timeout_rows, (0, 0));
 
         let unavailable = send().await.unwrap();
         assert_eq!(unavailable.status(), StatusCode::SERVICE_UNAVAILABLE);

@@ -47,6 +47,12 @@ const CAT_CREATE_RESOLUTION_SHUTDOWN_DEADLINE: Duration = Duration::from_secs(30
 
 pub(crate) type ServiceFuture<'a, T> = Pin<Box<dyn Future<Output = Result<T>> + Send + 'a>>;
 
+pub(crate) fn cat_create_absolute_deadline(headers_received_at: Instant) -> Result<Instant> {
+    headers_received_at
+        .checked_add(CAT_CREATE_TOTAL_DEADLINE)
+        .ok_or_else(|| ApiError::unavailable("Cat create deadline overflow"))
+}
+
 /// Exact field occurrences after the HTTP parser has removed field-line OWS.
 /// Keeping occurrences separate lets the eventual Axum adapter reject a
 /// duplicate before comma folding.
@@ -92,9 +98,7 @@ pub(crate) fn parse_authorized_cat_create(
     fields: &CatCreateHttpFields,
     raw_body: &[u8],
 ) -> Result<AuthorizedCatCreateIngress> {
-    let absolute_deadline = headers_received_at
-        .checked_add(CAT_CREATE_TOTAL_DEADLINE)
-        .ok_or_else(|| ApiError::unavailable("Cat create deadline overflow"))?;
+    let absolute_deadline = cat_create_absolute_deadline(headers_received_at)?;
     if Instant::now() >= absolute_deadline {
         return Err(ApiError::unavailable("Cat create deadline elapsed"));
     }
@@ -278,6 +282,10 @@ pub(crate) struct CatCreatePlan {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[allow(
+    clippy::large_enum_variant,
+    reason = "the one bounded successful plan is consumed immediately across this internal async planner boundary"
+)]
 pub(crate) enum CatCreatePlacementOutcome {
     Planned(CatCreatePlan),
     Unavailable,
@@ -665,10 +673,24 @@ impl CatCreateService {
     }
 
     #[cfg(test)]
-    pub(super) fn active_commit_resolutions(&self) -> usize {
+    pub(crate) fn active_commit_resolutions(&self) -> usize {
         self.commit_resolutions
             .active
             .load(std::sync::atomic::Ordering::Acquire)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn durable_create_row_counts_for_test(&self) -> Result<(i64, i64)> {
+        self.store.with(|client| {
+            client
+                .query_one(
+                    "SELECT
+                        (SELECT count(*) FROM cat_records),
+                        (SELECT count(*) FROM api_idempotency_results)",
+                    &[],
+                )
+                .map(|row| (row.get(0), row.get(1)))
+        })
     }
 }
 
