@@ -14,6 +14,7 @@ Environment=CATS_GUEST_NETWORK_CIDR=10.240.0.0/16
 # override this after the proxy exists and has passed its connectivity check.
 Environment=CATS_POSTGRES_SESSION_SETUP=client
 EnvironmentFile=/etc/cats/worker.env
+ExecStartPre=/opt/cats/bin/install-guest-runtime-release startup-recover
 ExecStartPre=/usr/sbin/modprobe nbd nbds_max=64
 ExecStartPre=/opt/cats/bin/setup-guest-network
 # Every start renders the DSN afresh from its authority. A restart is the one

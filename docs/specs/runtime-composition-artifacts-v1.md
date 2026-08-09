@@ -25,7 +25,7 @@ Guest boot bytes。它不增加第二个identity、session、release catalog或r
 | rotation old recovery set | `/etc/cats/identity/.node-identity-rotation-old.v1/` |
 | protected state root | `/var/lib/cats/node` |
 | identity-selected state path | `/var/lib/cats/node/<state_path_id>` |
-| Host lock | `/var/lib/cats/node/<state_path_id>/host.lock` |
+| Host lock | `/var/lib/cats/node/host.lock` |
 | shared release payload root | `guest-runtime-release.v1/` |
 | release manifest member | `guest-runtime-release.v1/manifest.v1.json` |
 | receipt member | `guest-runtime-release.v1/guest-runtime-profile.v1.json` |
@@ -117,10 +117,18 @@ rotation old copy在marker前只能在active仍完整匹配Control old authority
 generation在marker前只能在old complete marker已durable且Control仍精确是old authority时删除partial后重生。
 complete marker durable之后才固定该set的exact same bytes，不得清理或重生其中private half。
 
-`/var/lib/cats/node`及选中的state path必须root:root且不可由group/other写。Node从固定root以no-symlink、
-beneath-only方式打开`<state_path_id>`；CLI更换state directory不能切换lineage。Host lock是该目录内
-root:root mode `0600`的regular file，Node对打开的descriptor取得non-blocking kernel exclusive lock并保持到
-进程退出。相同Host的第二个Agent取得失败即启动失败；删除或换名path不能使已打开lock失效。
+`/var/lib/cats/node`及选中的state path必须root:root且不可由group/other写。Node先从filesystem root逐component
+no-follow打开固定`/var/lib/cats/node`，再从这个已经打开的parent取得`host.lock`的non-blocking kernel exclusive
+lock；只有持锁后才能以descriptor-relative、beneath-only方式打开`<state_path_id>`。Host lock是固定parent内
+root:root mode `0600`、regular、single-link文件，parent descriptor、lock descriptor和selected state directory
+descriptor全部保持到进程退出。相同Host的第二个Agent取得失败即启动失败；换名或重建selected child不能产生
+第二把Host lock，也不能把旧进程的state写入replacement inode。
+
+Linux Node把selected state directory复制到一个明确保留、non-`CLOEXEC`且启动时必须空闲的固定descriptor，并把
+`/proc/self/fd/<reserved-fd>`作为Node runtime、blockd、Guest helper和Cloud Hypervisor所有state-derived path的
+唯一root；owner对象在NodeAgent整个生命周期保持存活。每次runtime构造先重验descriptor仍可继承，所有child
+process按同一fd number继承；主进程和child都不能重新canonicalize或按artifact pathname重开state root。非Linux
+只保留同一owner/descriptor边界供测试，production Node deployment仍由Linux gate负责。
 
 ### 2.3 Initial provision与exact replay
 
@@ -311,13 +319,23 @@ Node deploy只在已经cordon、drain且`cats=0/orphans=0`后激活新payload：
    时只有closed bytes和metadata全部exact才视为幂等完成，否则fail closed；
 5. 对manifest、receipt、kernel和可选initramfs分别使用same-filesystem temporary file + atomic rename +
    parent fsync；null initramfs必须原子移走旧active initramfs；
-6. 从active exact paths重新读取并验证整个集合与staged release ID一致；随后用A23 expected policy revision
+6. 一个固定`/run/lock/cats/worker-deployment.lock` open-file-description lock必须覆盖stop、prepare、全部outer
+   binary/config/unit/seed mutation、candidate start、实际Agent registration-backed readiness、commit或rollback；
+   installer和任何长期安装的seed updater都验证继承的exact lock descriptor。不能chmod共享`/run/lock`；
+7. 从active exact paths重新读取并验证整个集合与staged release ID一致；随后用A23 expected policy revision
    CAS更新仍cordoned policy的exact `guest_config_digest`及本次同时部署的其他capability，response不明只重放
    same apply。此时assigned set仍为空；
-7. policy与active set逐字段相同后才start Node；Node startup再独立执行A19 §8.2，成功注册前所有gate仍Closed；
-8. 任一install/start验证失败时保持Node停止，用保存的完整previous set执行同一原子逐文件安装和整体验证，
+8. 全部outer mutation和policy CAS完成后，在仍停止的Node下durably写start-authorization marker并fsync parent。systemd
+   `ExecStartPre`只有在同一deployment lock正被占有、activation journal完整、authorization精确绑定incoming ID且
+   active bytes重验一致时才允许candidate start；“lock busy”本身不授权启动；
+9. policy与active set逐字段相同后才start Node；Node startup再独立执行A19 §8.2，成功注册前所有gate仍Closed；
+10. candidate成功建立AgentSession并开放本地readiness后才commit：先durably清activation journal，再清
+   authorization marker。journal在此前所有outer crash window都保留；任一失败或进程/Host kill后，独立service
+   restart必须恢复previous exact set但保持Node停止和journal retained，直到完整outer transaction重放并commit；
+11. 任一install/start验证失败时保持Node停止，用保存的完整previous set执行同一原子逐文件安装和整体验证，
    并以fresh apply ID/expected current policy revision把capability反向CAS到previous exact值；只在previous
-   set/policy完整自洽时restart。rollback失败则保持停止、cordoned并告警，不能混搭新旧member。
+   set/policy完整自洽时restart。rollback失败则保持停止、cordoned并告警，不能混搭新旧member。首次安装没有
+   previous时继续保留journal和exact incoming bytes，完整部署重放前不得start。
 
 多文件切换不是一个filesystem rename事务，因此安全线性化点是“service停止后，active完整集合重新验证
 成功，再允许start”。crash可留下mixed files，但systemd不能在未先运行同一validator的情况下启动Node；
@@ -372,10 +390,10 @@ Node startup。
 | provision replay | marker前可清未提交partial；marker/key set在Control前durable；每个write/fsync/rename/commit kill |
 | rotation | old/new recovery set在CAS前durable；apply/每个rename/fsync/start kill；pre-commit失败保持old；commit后只从new set forward-complete，old ID/SPKI跨Node/release永不可重用；new half永久丢失只能retire/new lineage，无reverse CAS |
 | retire/replace | retired exact attempt replay仍按A19；新attempt拒绝；新Host不能复用旧node/lineage |
-| state path | artifact精确选择path和Host lock；第二Agent、symlink component和CLI path replacement失败 |
+| state path | parent Host lock先于child；第二Agent失败；rename/recreate后主进程/child只访问retained DirFd旧inode |
 | release build | generator只运行一次；Control/worker extract manifest/receipt逐byte相等且ID相同 |
 | release layout | pre-materialize traversal/link/duplicate header拒绝且零外部写；closed entries、size/hash/nullability |
-| install crash | incoming/previous marker先durable；每个copy/fsync/marker/active rename/start kill；exact complete/rollback |
+| install crash | incoming/previous marker先durable；prepare/outer mutation/authorization/start/readiness/commit每窗kill；exact rollback且保持停止，完整重放后commit |
 | launch bytes | 每次launch descriptor-stable rehash；validate后path replacement不能改变VMM实际kernel/initramfs |
 | production config | Control K8s/Metal和Node units传exact receipt CLI；manifest fixed path；无fallback/catalog |
 | legacy negative | Host-derived kernel/initramfs、worker现场重建、独立等价JSON和fixture receipt不合格 |

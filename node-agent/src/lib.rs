@@ -11,4 +11,5 @@ pub mod route_grant;
 pub mod runtime;
 pub mod runtime_spine;
 pub mod server;
+pub mod state_directory;
 pub mod usage_spool;

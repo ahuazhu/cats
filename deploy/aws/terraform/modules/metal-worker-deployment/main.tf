@@ -71,7 +71,7 @@ locals {
     # jq was already being used below without ever being checked for. It is
     # also what render-postgres-url uses to read the managed secret.
     # curl talks to IMDS when a fresh host derives its advertise address.
-    for required in aws jq zstd tar sha256sum findmnt curl base64 openssl; do
+    for required in aws jq zstd tar sha256sum findmnt curl base64 openssl flock stat; do
       command -v "$required" >/dev/null 2>&1 || {
         echo "worker deployment needs $required on the host" >&2
         exit 1
@@ -87,7 +87,15 @@ locals {
     route_grant_key_temp=""
     route_grant_key_fingerprint=""
     archive_entries=""
+    release_transaction_active=0
+    release_installer=""
     cleanup() {
+      status=$?
+      trap - EXIT INT TERM
+      if [ "$release_transaction_active" -eq 1 ]; then
+        cats_stop_node_service cats-worker >/dev/null 2>&1 || true
+        "$release_installer" rollback >/dev/null 2>&1 || true
+      fi
       rm -rf -- "$stage_path"
       rm -f -- "$artifact_path"
       for temporary_path in "$runtime_secret" "$runtime_overlay" "$environment_temp" "$seed_temp" "$route_grant_key_temp" "$archive_entries"; do
@@ -95,8 +103,11 @@ locals {
           rm -f -- "$temporary_path"
         fi
       done
+      exit "$status"
     }
     trap cleanup EXIT
+    trap 'exit 130' INT
+    trap 'exit 143' TERM
 
     aws s3 cp --no-progress "s3://${aws_s3_bucket.artifacts.id}/${aws_s3_object.worker_bundle.key}" "$artifact_path"
     echo "${var.worker_bundle_sha256}  $artifact_path" | sha256sum --check --strict -
@@ -108,6 +119,7 @@ locals {
     ' "$archive_entries"
     tar --zstd -tvf "$artifact_path" | awk 'substr($1,1,1) !~ /^[-d]$/ { exit 1 }'
     tar --zstd -xf "$artifact_path" -C "$stage_path"
+    . "$stage_path/worker-deployment-transaction.sh"
     "$stage_path/install-guest-runtime-release.sh" verify \
       "$stage_path/guest-runtime-release.v1"
     # The validator is itself part of the digest-checked, preflighted bundle.
@@ -159,34 +171,49 @@ locals {
     )"
     printf '%s' "$route_grant_key_fingerprint" | grep -Eq '^[0-9a-f]{64}$'
 
-    # Stop only after every staged artifact and verification input has passed
-    # its read-only checks, immediately before the first installed byte changes.
-    systemctl stop cats-worker
+    # One Host-global open-file-description lock spans the entire mutation,
+    # candidate start/readiness proof, and commit/rollback boundary.
+    cats_acquire_worker_deployment_lock
+    release_installer="$stage_path/install-guest-runtime-release.sh"
+    release_transaction_active=1
+    cats_stop_node_service cats-worker
+    "$release_installer" prepare "$stage_path/guest-runtime-release.v1"
+    cats_worker_deployment_crash_probe after-installer-return
 
     # -D creates the parent directory. Without it a host that has never been
     # touched by install.sh fails here: /opt/cats/bin does not exist yet, and
     # the association only ever ran against hosts that had been set up by hand.
     install -D -m 0755 "$stage_path/cats-noded" "${var.install_root}/bin/cats-noded"
+    cats_worker_deployment_crash_probe after-install-cats-noded
     install -D -m 0755 "$stage_path/cats-blockd" "${var.install_root}/bin/cats-blockd"
+    cats_worker_deployment_crash_probe after-install-cats-blockd
     install -D -m 0755 "$stage_path/cats-guest-agent" "${var.install_root}/bin/cats-guest-agent"
+    cats_worker_deployment_crash_probe after-install-cats-guest-agent
     install -D -m 0755 "$stage_path/update-guest-seed.sh" "${var.install_root}/bin/update-guest-seed"
+    cats_worker_deployment_crash_probe after-install-guest-seed-updater
     install -D -m 0755 "$stage_path/require-idle-worker.sh" "${var.install_root}/bin/require-idle-worker"
+    cats_worker_deployment_crash_probe after-install-idle-guard
     install -D -m 0755 "$stage_path/render-postgres-url.sh" "${var.install_root}/bin/render-postgres-url"
+    cats_worker_deployment_crash_probe after-install-postgres-renderer
     install -D -m 0755 "$stage_path/install-guest-runtime-release.sh" "${var.install_root}/bin/install-guest-runtime-release"
+    cats_worker_deployment_crash_probe after-install-release-installer
+    install -D -m 0755 "$stage_path/worker-deployment-transaction.sh" "${var.install_root}/bin/worker-deployment-transaction"
+    cats_worker_deployment_crash_probe after-install-deployment-transaction
     install -m 0644 "$stage_path/cats-worker.service" /etc/systemd/system/cats-worker.service
+    cats_worker_deployment_crash_probe after-install-worker-unit
     install -m 0644 "$stage_path/cats-postgres-url.service" /etc/systemd/system/cats-postgres-url.service
+    cats_worker_deployment_crash_probe after-install-postgres-unit
     install -m 0644 "$stage_path/cats-postgres-url.timer" /etc/systemd/system/cats-postgres-url.timer
+    cats_worker_deployment_crash_probe after-install-postgres-timer
 
     install -D -o root -g root -m 0644 "$route_grant_key_temp" /etc/cats/route-grant-public.pem
+    cats_worker_deployment_crash_probe after-install-route-key
     installed_route_grant_key_fingerprint="$(
       openssl pkey -pubin -in /etc/cats/route-grant-public.pem -outform DER \
         | sha256sum \
         | awk '{print $1}'
     )"
     test "$installed_route_grant_key_fingerprint" = "$route_grant_key_fingerprint"
-    "${var.install_root}/bin/install-guest-runtime-release" install \
-      "$stage_path/guest-runtime-release.v1"
-
     runtime_secret="$(mktemp /var/tmp/cats-worker-runtime.XXXXXX)"
     runtime_overlay="$(mktemp /var/tmp/cats-worker-overlay.XXXXXX)"
     aws secretsmanager get-secret-value \
@@ -230,6 +257,7 @@ CATS_BASE_ENVIRONMENT
 
       mkdir -p "$(dirname "${var.worker_environment_file}")"
       install -o root -g root -m 0600 "$seed_temp" "${var.worker_environment_file}"
+      cats_worker_deployment_crash_probe after-install-worker-environment-seed
     fi
 
     environment_temp="$(mktemp /var/tmp/cats-worker-env.XXXXXX)"
@@ -267,6 +295,7 @@ CATS_BASE_ENVIRONMENT
       }
     ' "$runtime_overlay" "${var.worker_environment_file}" > "$environment_temp"
     install -o root -g root -m 0600 "$environment_temp" "${var.worker_environment_file}"
+    cats_worker_deployment_crash_probe after-install-worker-environment
 
     # Replace the golden RootDisk while the worker remains stopped. No create
     # can observe a new seed under an in-memory ID computed from the old bytes.
@@ -274,18 +303,29 @@ CATS_BASE_ENVIRONMENT
       "${var.install_root}/guest/rootfs.ext4" \
       "$stage_path/cats-guest-agent" \
       "$stage_path/guest-systemd"
+    cats_worker_deployment_crash_probe after-update-guest-seed
 
     systemctl daemon-reload
+    cats_worker_deployment_crash_probe after-daemon-reload
 
     # The timer covers a rotation that happens while the worker keeps running.
     # cats-worker renders the DSN itself before every start, so this is not on
     # the startup path; `--now` also proves the renderer works on this host
     # before the worker is stopped, rather than after it fails to come back.
     systemctl enable --now cats-postgres-url.timer
+    cats_worker_deployment_crash_probe after-enable-postgres-timer
     systemctl start cats-postgres-url.service
+    cats_worker_deployment_crash_probe after-start-postgres-renderer
 
+    "$release_installer" authorize-start
+    cats_worker_deployment_crash_probe after-authorize-worker-start
     systemctl start cats-worker
-    systemctl is-active --quiet cats-worker
+    cats_worker_deployment_crash_probe after-start-worker
+    cats_wait_for_registered_node cats-worker
+    cats_worker_deployment_crash_probe after-registration-readiness
+    "$release_installer" commit
+    release_transaction_active=0
+    cats_worker_deployment_crash_probe after-release-commit
     echo "Route Grant verifier key: $installed_route_grant_key_fingerprint"
     "${var.install_root}/bin/cats-noded" --help | grep -q -- "--metering-cgroup-root"
     # Secret version ${aws_secretsmanager_secret_version.worker_runtime.version_id}

@@ -127,7 +127,7 @@ macro_rules! fake_node_config {
         let parts = $builder.into_parts();
         cats_node_agent::runtime::NodeConfig {
             node_id: parts.node_id,
-            state_dir: parts.state_dir,
+            state_dir: parts.state_dir.into(),
             blockd_bin: parts.blockd_bin,
             guest_agent_bin: parts.guest_agent_bin,
             metadata_store: parts.metadata_store,

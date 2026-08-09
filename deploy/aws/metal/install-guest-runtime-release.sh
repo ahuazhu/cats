@@ -8,16 +8,71 @@ node_service=${CATS_NODE_SERVICE_NAME:-cats-worker}
 cats_root=/opt/cats
 required_uid=0
 required_gid=0
+deployment_lock_path=/run/lock/cats/worker-deployment.lock
 
 # Production deliberately has no crash-injection environment variable. Linux
 # regression tests replace this no-op in a private copy and kill the process
 # at each labeled durability boundary.
 crash_probe() { :; }
-[[ $mode == verify || $mode == install ]] || {
-  echo "usage: $0 verify|install <guest-runtime-release.v1>" >&2
+[[ $mode == verify || $mode == prepare || $mode == commit \
+    || $mode == authorize-start || $mode == rollback || $mode == recover \
+    || $mode == startup-recover ]] || {
+  echo "usage: $0 verify|prepare <guest-runtime-release.v1> | authorize-start|commit|rollback|recover|startup-recover" >&2
   exit 2
 }
 [[ $EUID -eq 0 ]] || { echo "run as root" >&2; exit 1; }
+
+require_deployment_lock() {
+  local descriptor=${CATS_WORKER_DEPLOYMENT_LOCK_FD:-} lock_identity fd_identity metadata
+  [[ $descriptor =~ ^[0-9]+$ ]] || {
+    echo "mutating Guest release commands require the Host deployment lock descriptor" >&2
+    return 1
+  }
+  [[ -e /proc/self/fd/$descriptor ]] || return 1
+  lock_identity=$(stat -Lc '%d:%i' "$deployment_lock_path") || return 1
+  fd_identity=$(stat -Lc '%d:%i' "/proc/self/fd/$descriptor") || return 1
+  test "$lock_identity" = "$fd_identity" || return 1
+  metadata=$(stat -Lc '%u:%g:%a:%h' "$deployment_lock_path") || return 1
+  test "$metadata" = "$required_uid:$required_gid:600:1" || return 1
+  # Acquiring on the inherited open-file description either proves the outer
+  # deployment already holds the lock or makes that lock persist in the outer
+  # shell after this child exits. A separate deployment cannot overlap it.
+  flock -n "$descriptor" || return 1
+}
+
+systemd_property() {
+  local property=$1 value
+  value=$(systemctl show "$node_service" "--property=$property" --value) || {
+    echo "cannot query $node_service $property" >&2
+    return 1
+  }
+  [[ -n $value ]] || {
+    echo "$node_service returned an empty $property" >&2
+    return 1
+  }
+  printf '%s\n' "$value"
+}
+
+require_service_stopped() {
+  local load_state active_state
+  load_state=$(systemd_property LoadState) || return 1
+  active_state=$(systemd_property ActiveState) || return 1
+  case "$load_state:$active_state" in
+    loaded:inactive|loaded:failed|not-found:inactive) return 0 ;;
+  esac
+  echo "$node_service is not provably stopped ($load_state/$active_state)" >&2
+  return 1
+}
+
+require_service_active() {
+  local load_state active_state
+  load_state=$(systemd_property LoadState) || return 1
+  active_state=$(systemd_property ActiveState) || return 1
+  [[ $load_state:$active_state == loaded:active ]] || {
+    echo "$node_service is not active ($load_state/$active_state)" >&2
+    return 1
+  }
+}
 
 verify_release() {
   local root=$1
@@ -126,16 +181,24 @@ print("sha256:" + release_digest.hexdigest())
 PY
 }
 
-release_id=$(verify_release "$source_root")
+release_id=""
+if [[ $mode == verify || $mode == prepare ]]; then
+  [[ -n $source_root ]] || { echo "$mode requires a release source" >&2; exit 2; }
+  release_id=$(verify_release "$source_root")
+fi
 [[ $mode == verify ]] && { printf '%s\n' "$release_id"; exit 0; }
-systemctl is-active --quiet "$node_service" && {
-  echo "$node_service must be stopped before Guest release activation" >&2
-  exit 1
-}
+if [[ $mode != startup-recover ]]; then
+  require_deployment_lock
+fi
+case "$mode" in
+  prepare|authorize-start|rollback|recover) require_service_stopped ;;
+  commit) require_service_active ;;
+esac
 
 releases_root="$cats_root/releases"
 sets_root="$releases_root/sets"
 activation_path="$releases_root/activation.v1"
+start_authorization_path="$releases_root/start-authorized.v1"
 active_release_root="$cats_root/release"
 active_guest_root="$cats_root/guest"
 install -d -o "$required_uid" -g "$required_gid" -m 0700 "$sets_root" "$releases_root"
@@ -287,6 +350,7 @@ write_activation() {
   local incoming_id=$1 previous_id=$2 temp="$activation_path.incoming"
   valid_release_id "$incoming_id" || return 1
   [[ $previous_id == none ]] || valid_release_id "$previous_id" || return 1
+  clear_start_authorization || return 1
   rm -f -- "$temp" || return 1
   (umask 077; printf 'version=1\nincoming=%s\nprevious=%s\n' \
     "$incoming_id" "$previous_id" > "$temp") || return 1
@@ -319,6 +383,41 @@ load_activation() {
   fi
 }
 
+write_start_authorization() {
+  local incoming_id=$1 temp="$start_authorization_path.incoming"
+  valid_release_id "$incoming_id" || return 1
+  rm -f -- "$temp" || return 1
+  (umask 077; printf 'version=1\nincoming=%s\n' "$incoming_id" > "$temp") || return 1
+  chown "$required_uid:$required_gid" "$temp" || return 1
+  chmod 0600 "$temp" || return 1
+  sync -f "$temp" || return 1
+  crash_probe "start-authorization-file-fsync" || return 1
+  mv -fT -- "$temp" "$start_authorization_path" || return 1
+  crash_probe "start-authorization-rename" || return 1
+  sync -f "$releases_root" || return 1
+  crash_probe "start-authorization-parent-fsync" || return 1
+}
+
+load_start_authorization() {
+  local expected_id=$1 metadata
+  [[ -f $start_authorization_path && ! -L $start_authorization_path ]] || return 1
+  metadata=$(stat -c '%u:%g:%a:%h:%F' "$start_authorization_path") || return 1
+  test "$metadata" = "$required_uid:$required_gid:600:1:regular file" || return 1
+  mapfile -t start_authorization_lines < "$start_authorization_path" || return 1
+  [[ ${#start_authorization_lines[@]} -eq 2 \
+      && ${start_authorization_lines[0]} == version=1 \
+      && ${start_authorization_lines[1]} == "incoming=$expected_id" ]] || return 1
+}
+
+clear_start_authorization() {
+  if [[ -e $start_authorization_path || -L $start_authorization_path ]]; then
+    rm -f -- "$start_authorization_path" || return 1
+    crash_probe "start-authorization-remove" || return 1
+    sync -f "$releases_root" || return 1
+    crash_probe "start-authorization-remove-parent-fsync" || return 1
+  fi
+}
+
 clear_activation() {
   rm -f -- "$activation_path" || return 1
   crash_probe "activation-remove" || return 1
@@ -326,56 +425,134 @@ clear_activation() {
   crash_probe "activation-remove-parent-fsync" || return 1
 }
 
+finish_incoming_activation() {
+  load_activation || return 1
+  install_set "$sets_root/$activation_incoming" || return 1
+  verify_active "$activation_incoming" || return 1
+}
+
+rollback_activation() {
+  if [[ ! -e $activation_path && ! -L $activation_path ]]; then
+    return 0
+  fi
+  load_activation || return 1
+  clear_start_authorization || return 1
+  if [[ $activation_previous == none ]]; then
+    finish_incoming_activation || return 1
+    echo "initial Guest release has no rollback set; activation remains uncommitted" >&2
+    return 1
+  fi
+  install_set "$sets_root/$activation_previous" || return 1
+  verify_active "$activation_previous" || return 1
+}
+
 recover_activation() {
   if [[ ! -e $activation_path && ! -L $activation_path ]]; then
     return 0
   fi
   load_activation || return 1
-  if install_set "$sets_root/$activation_incoming" \
-      && verify_active "$activation_incoming"; then
-    clear_activation || return 1
+  if [[ $activation_previous == none ]]; then
+    # A first install has no honest rollback target. Finish its exact incoming
+    # bytes but retain the journal and keep the Node stopped until the outer
+    # deployment repeats readiness and explicitly commits.
+    finish_incoming_activation || return 1
     return 0
   fi
-  if [[ $activation_previous != none ]] \
-      && install_set "$sets_root/$activation_previous" \
-      && verify_active "$activation_previous"; then
-    clear_activation || return 1
-    return 0
+  rollback_activation
+}
+
+startup_recover() {
+  [[ -e $activation_path || -L $activation_path ]] || return 0
+  install -d -o "$required_uid" -g "$required_gid" -m 0700 "$(dirname "$deployment_lock_path")"
+  if [[ ! -e $deployment_lock_path && ! -L $deployment_lock_path ]]; then
+    (umask 077; set -o noclobber; : > "$deployment_lock_path") 2>/dev/null || true
   fi
-  echo "cannot recover the durable Guest release activation" >&2
-  return 1
+  [[ -f $deployment_lock_path && ! -L $deployment_lock_path ]] || return 1
+  test "$(stat -Lc '%u:%g:%a:%h' "$deployment_lock_path")" = \
+    "$required_uid:$required_gid:600:1" || return 1
+  exec 8>>"$deployment_lock_path"
+  if flock -n 8; then
+    export CATS_WORKER_DEPLOYMENT_LOCK_FD=8
+    recover_activation || return 1
+    # Recovery always retains the journal, even after restoring a previous
+    # release. Outer worker artifacts may be only partially replaced, so a
+    # standalone service restart remains blocked until the whole deployment
+    # transaction replays and commits.
+    [[ ! -e $activation_path && ! -L $activation_path ]]
+  else
+    # A live outer deployment owns the lock and is intentionally starting the
+    # candidate for its registration/readiness proof. Only exact incoming bytes
+    # with the durable post-mutation authorization may cross this gate; the
+    # outer owner remains responsible for readiness and commit.
+    load_activation || return 1
+    load_start_authorization "$activation_incoming" || return 1
+    verify_active "$activation_incoming"
+  fi
 }
 
-# Complete or roll back any earlier interrupted activation before deriving the
-# current active set. Never snapshot a potentially mixed active directory.
-recover_activation
-
-target_set=$(persist_source_set "$source_root" "$release_id" incoming)
-previous_id=none
-active_manifest="$active_release_root/guest-runtime-release-manifest.v1.json"
-if [[ -e $active_manifest || -L $active_manifest ]]; then
-  previous_id=$(persist_active_set)
-elif [[ -e $active_release_root/guest-runtime-profile.v1.json \
-    || -e $active_guest_root/vmlinuz \
-    || -e $active_guest_root/initramfs.img ]]; then
-  echo "partial active Guest release exists without its manifest" >&2
-  exit 1
-fi
-
-# Both referenced set-directory markers and their parent fsyncs completed
-# before this journal can become durable. The first active rename is forbidden
-# until the journal parent fsync returns.
-write_activation "$release_id" "$previous_id"
-
-rollback() {
-  local status=$?
-  trap - ERR
-  recover_activation || true
-  exit "$status"
-}
-trap rollback ERR
-install_set "$target_set"
-verify_active "$release_id"
-clear_activation
-trap - ERR
-printf '%s\n' "$release_id"
+case "$mode" in
+  prepare)
+    recover_activation
+    if [[ -e $activation_path || -L $activation_path ]]; then
+      load_activation
+      if [[ $activation_previous == none ]]; then
+        [[ $activation_incoming == "$release_id" ]] || {
+          echo "uncommitted initial release differs from the requested release" >&2
+          exit 1
+        }
+        finish_incoming_activation
+        printf '%s\n' "$release_id"
+        exit 0
+      fi
+      # A previous failed deployment has now restored its exact prior release.
+      # Clear only while this new outer transaction holds the Host lock, then
+      # immediately build its fresh journal before any candidate start.
+      clear_activation
+    fi
+    target_set=$(persist_source_set "$source_root" "$release_id" incoming)
+    previous_id=none
+    active_manifest="$active_release_root/guest-runtime-release-manifest.v1.json"
+    if [[ -e $active_manifest || -L $active_manifest ]]; then
+      previous_id=$(persist_active_set)
+    elif [[ -e $active_release_root/guest-runtime-profile.v1.json \
+        || -e $active_guest_root/vmlinuz \
+        || -e $active_guest_root/initramfs.img ]]; then
+      echo "partial active Guest release exists without its manifest" >&2
+      exit 1
+    fi
+    write_activation "$release_id" "$previous_id"
+    prepare_rollback() {
+      local status=$?
+      trap - ERR
+      rollback_activation || true
+      exit "$status"
+    }
+    trap prepare_rollback ERR
+    install_set "$target_set"
+    verify_active "$release_id"
+    trap - ERR
+    printf '%s\n' "$release_id"
+    ;;
+  authorize-start)
+    load_activation
+    verify_active "$activation_incoming"
+    write_start_authorization "$activation_incoming"
+    ;;
+  commit)
+    load_activation
+    load_start_authorization "$activation_incoming"
+    verify_active "$activation_incoming"
+    crash_probe "commit-verified-readiness"
+    clear_activation
+    clear_start_authorization
+    ;;
+  rollback)
+    rollback_activation
+    ;;
+  recover)
+    recover_activation
+    ;;
+  startup-recover)
+    startup_recover
+    ;;
+esac

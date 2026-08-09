@@ -372,7 +372,7 @@ impl Soak {
         .context("open isolated S3 namespace")?;
         let runtime = Arc::new(NodeRuntime::new(NodeConfig {
             node_id: format!("soak-{}", cfg.run_id),
-            state_dir: cfg.state_dir.clone(),
+            state_dir: cfg.state_dir.clone().into(),
             blockd_bin: cfg.blockd_bin.clone(),
             guest_agent_bin: cfg.guest_agent_bin.clone(),
             metadata_store: metadata_selection,

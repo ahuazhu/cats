@@ -191,7 +191,7 @@ async fn main() -> anyhow::Result<()> {
         heartbeat_ms: args.heartbeat_ms,
         node: NodeConfig {
             node_id: agent_registration.identity().node_id.to_string(),
-            state_dir: agent_registration.state_path().to_path_buf(),
+            state_dir: agent_registration.runtime_state_directory(),
             blockd_bin: args.blockd_bin,
             guest_agent_bin: args.guest_agent_bin,
             metadata_store,

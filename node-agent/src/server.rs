@@ -1886,8 +1886,8 @@ pub async fn spawn(cfg: ServerConfig) -> anyhow::Result<Handle> {
         "Node runtime identity does not match the installed NodeIdentity"
     );
     anyhow::ensure!(
-        cfg.node.state_dir == cfg.agent_registration.state_path(),
-        "Node runtime state path does not match the installed NodeIdentity"
+        cfg.node.state_dir.path() == cfg.agent_registration.runtime_state_directory().path(),
+        "Node runtime state descriptor does not match the installed NodeIdentity"
     );
     let agent_session = Arc::new(
         cfg.agent_registration
@@ -1898,7 +1898,7 @@ pub async fn spawn(cfg: ServerConfig) -> anyhow::Result<Handle> {
     crate::runtime::initialize_metering_cgroup(&cfg.node)?;
     let usage_pipeline = Arc::new(UsageMeteringPipeline::open(
         cfg.node.node_id.clone(),
-        cfg.node.state_dir.clone(),
+        cfg.node.state_dir.path().to_path_buf(),
     )?);
     let client = reqwest::Client::builder()
         .timeout(Duration::from_secs(10))

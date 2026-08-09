@@ -39,12 +39,26 @@ for unit in "${units[@]}"; do
   }
 done
 
-for required in cp debugfs e2fsck mv sync; do
+for required in cp debugfs e2fsck flock mv stat sync systemctl; do
   command -v "$required" >/dev/null 2>&1 || {
     echo "guest seed update needs $required on the worker" >&2
     exit 1
   }
 done
+
+# This script is installed for the Terraform worker transaction, but it is not
+# an independent mutation authority. A manual or overlapping invocation must
+# prove both the inherited Host deployment lock and a stopped worker before it
+# creates staging bytes beside the live seed.
+transaction_helper=/opt/cats/bin/worker-deployment-transaction.sh
+[[ -f $transaction_helper && ! -L $transaction_helper ]] || {
+  echo "installed worker deployment transaction helper is missing" >&2
+  exit 1
+}
+# shellcheck source=/dev/null
+. "$transaction_helper"
+cats_require_worker_deployment_lock
+cats_require_node_service_stopped cats-worker
 
 seed_dir=$(dirname "$seed_image")
 stage_dir=$(mktemp -d "$seed_dir/.guest-seed-update.XXXXXX")

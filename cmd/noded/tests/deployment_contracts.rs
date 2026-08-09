@@ -57,6 +57,16 @@ fn deployment_units_take_the_pinned_guest_cmdline_only_from_the_shared_receipt()
         assert!(text.contains(
             "--guest-runtime-profile-receipt-file /opt/cats/release/guest-runtime-profile.v1.json"
         ));
+        let recovery = text
+            .find("ExecStartPre=/opt/cats/bin/install-guest-runtime-release startup-recover")
+            .expect("service restart recovery gate");
+        let start = text
+            .find("ExecStart=/opt/cats/bin/cats-noded")
+            .expect("Node start");
+        assert!(
+            recovery < start,
+            "{unit} must recover or block before Node exec"
+        );
         assert!(!text.contains("--ch-cmdline"));
     }
 }
@@ -427,6 +437,8 @@ fn production_worker_bundle_updates_an_idle_guest_seed_before_restart() {
     for executable_copy in [
         "COPY --chmod=0755 deploy/aws/metal/install-guest-runtime-release.sh /out/install-guest-runtime-release.sh",
         "COPY --from=builder --chmod=0755 /out/install-guest-runtime-release.sh /install-guest-runtime-release.sh",
+        "COPY --chmod=0755 deploy/aws/metal/worker-deployment-transaction.sh /out/worker-deployment-transaction.sh",
+        "COPY --from=builder --chmod=0755 /out/worker-deployment-transaction.sh /worker-deployment-transaction.sh",
     ] {
         assert!(
             dockerfile.contains(executable_copy),
@@ -463,21 +475,44 @@ fn production_worker_bundle_updates_an_idle_guest_seed_before_restart() {
     let update = deployment
         .find("# Replace the golden RootDisk while the worker remains stopped.")
         .expect("worker deployment has the guest-seed update phase");
-    let stop = deployment
-        .find("systemctl stop cats-worker")
+    let deployment_lock = deployment
+        .find("cats_acquire_worker_deployment_lock")
+        .expect("worker deployment acquires its Host-global lock");
+    let stop = deployment[deployment_lock..]
+        .find("cats_stop_node_service cats-worker")
+        .map(|offset| deployment_lock + offset)
         .expect("worker deployment stops the idle worker");
+    let prepare = deployment[stop..]
+        .find("\"$release_installer\" prepare")
+        .map(|offset| stop + offset)
+        .expect("worker deployment retains the release journal");
     let start = deployment
         .find("systemctl start cats-worker")
         .expect("worker deployment starts the replacement worker");
+    let authorize = deployment
+        .find("\"$release_installer\" authorize-start")
+        .expect("post-mutation worker start authorization");
     assert!(
         release_verify < idle_guard
-            && idle_guard < stop
-            && stop < first_install
+            && idle_guard < deployment_lock
+            && deployment_lock < stop
+            && stop < prepare
+            && prepare < first_install
             && first_install < update
             && deployment[update..start].contains("\"${var.install_root}/bin/update-guest-seed\""),
         "worker must verify and guard the drain, stop, then replace release bytes before start"
     );
-    assert!(stop < start, "worker must stop cleanly before starting");
+    assert!(
+        stop < authorize && authorize < start,
+        "worker must authorize only after stopping and mutating"
+    );
+    let readiness = deployment
+        .find("cats_wait_for_registered_node cats-worker")
+        .expect("registration-backed Node readiness");
+    let commit = deployment
+        .find("\"$release_installer\" commit")
+        .expect("release commit after readiness");
+    assert!(start < readiness && readiness < commit);
     assert!(
         !deployment.contains("systemctl restart cats-worker"),
         "worker deployment must not abruptly restart active delegated cgroups"
@@ -560,6 +595,12 @@ fn fault_injected_release_installer(
 
     let injected_probe = r#"crash_probe() {
   printf '%s\n' "$1" >> "${CATS_RELEASE_TRACE:?}"
+  if [[ ${CATS_RELEASE_PAUSE_AT:-} == "$1" && ! -e ${CATS_RELEASE_PAUSED:-/dev/null} ]]; then
+    printf '%s\n' "$1" > "${CATS_RELEASE_PAUSED:?}"
+    while [[ ! -e ${CATS_RELEASE_CONTINUE:?} ]]; do
+      sleep 0.01
+    done
+  fi
   probe_count=$(wc -l < "${CATS_RELEASE_TRACE:?}")
   if [[ $probe_count -eq ${CATS_RELEASE_KILL_AT:-0} ]]; then
     kill -KILL $$
@@ -572,6 +613,13 @@ fn fault_injected_release_installer(
         )
         .replace("required_uid=0", &format!("required_uid={uid}"))
         .replace("required_gid=0", &format!("required_gid={gid}"))
+        .replace(
+            "deployment_lock_path=/run/lock/cats/worker-deployment.lock",
+            &format!(
+                "deployment_lock_path={}",
+                cats_root.join("deployment.lock").display()
+            ),
+        )
         .replace("[[ $EUID -eq 0 ]]", "[[ $EUID -eq $required_uid ]]")
         .replace("crash_probe() { :; }", injected_probe);
     assert_ne!(
@@ -583,25 +631,185 @@ fn fault_injected_release_installer(
 }
 
 #[cfg(target_os = "linux")]
+#[derive(Clone, Copy)]
+struct ReleaseInstallerContext<'a> {
+    installer: &'a Path,
+    fake_bin: &'a Path,
+    trace: &'a Path,
+    active: &'a Path,
+    deployment_lock: &'a Path,
+}
+
+#[cfg(target_os = "linux")]
 fn run_release_installer(
-    installer: &Path,
+    context: ReleaseInstallerContext<'_>,
+    mode: &str,
     source: &Path,
-    fake_bin: &Path,
-    trace: &Path,
     kill_at: Option<usize>,
 ) -> std::process::Output {
-    let mut path = fake_bin.as_os_str().to_os_string();
+    let mut path = context.fake_bin.as_os_str().to_os_string();
     path.push(":");
     path.push(std::env::var_os("PATH").unwrap_or_default());
-    let mut command = Command::new(installer);
+    let mut command = Command::new("/bin/bash");
     command
-        .args(["install", source.to_str().unwrap()])
+        .args([
+            "-c",
+            "umask 077; exec 9>>\"$1\"; flock 9; export CATS_WORKER_DEPLOYMENT_LOCK_FD=9; exec /bin/bash \"$2\" \"$3\" \"$4\"",
+            "bash",
+        ])
+        .arg(context.deployment_lock)
+        .arg(context.installer)
+        .arg(mode)
+        .arg(source)
         .env("PATH", path)
-        .env("CATS_RELEASE_TRACE", trace);
+        .env("CATS_RELEASE_TRACE", context.trace)
+        .env("CATS_FAKE_SERVICE_ACTIVE", context.active);
     if let Some(kill_at) = kill_at {
         command.env("CATS_RELEASE_KILL_AT", kill_at.to_string());
     }
     command.output().expect("run release installer")
+}
+
+#[cfg(target_os = "linux")]
+fn run_startup_recover(
+    installer: &Path,
+    fake_bin: &Path,
+    trace: &Path,
+    active: &Path,
+) -> std::process::Output {
+    let mut path = fake_bin.as_os_str().to_os_string();
+    path.push(":");
+    path.push(std::env::var_os("PATH").unwrap_or_default());
+    Command::new(installer)
+        .arg("startup-recover")
+        .env("PATH", path)
+        .env("CATS_RELEASE_TRACE", trace)
+        .env("CATS_FAKE_SERVICE_ACTIVE", active)
+        .output()
+        .expect("run systemd startup recovery")
+}
+
+#[cfg(target_os = "linux")]
+fn spawn_release_transaction(
+    context: ReleaseInstallerContext<'_>,
+    release: &Path,
+    pause: (&str, &Path, &Path),
+) -> DeploymentChild {
+    let (pause_at, paused, continue_path) = pause;
+    let mut path = context.fake_bin.as_os_str().to_os_string();
+    path.push(":");
+    path.push(std::env::var_os("PATH").unwrap_or_default());
+    let child = Command::new("/bin/bash")
+        .args([
+            "-c",
+            "set -euo pipefail; umask 077; exec 9>>\"$1\"; if ! flock -n 9; then : > \"$5\"; flock 9; fi; export CATS_WORKER_DEPLOYMENT_LOCK_FD=9; rm -f -- \"$4\"; \"$2\" prepare \"$3\"; \"$2\" authorize-start; : > \"$4\"; \"$2\" commit",
+            "bash",
+        ])
+        .arg(context.deployment_lock)
+        .arg(context.installer)
+        .arg(release)
+        .arg(context.active)
+        .arg(paused.with_extension("lock-blocked"))
+        .env("PATH", path)
+        .env("CATS_RELEASE_TRACE", context.trace)
+        .env("CATS_FAKE_SERVICE_ACTIVE", context.active)
+        .env("CATS_RELEASE_PAUSE_AT", pause_at)
+        .env("CATS_RELEASE_PAUSED", paused)
+        .env("CATS_RELEASE_CONTINUE", continue_path)
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .expect("spawn release transaction");
+    DeploymentChild(child)
+}
+
+#[cfg(target_os = "linux")]
+struct DeploymentChild(std::process::Child);
+
+#[cfg(target_os = "linux")]
+impl std::ops::Deref for DeploymentChild {
+    type Target = std::process::Child;
+
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+
+#[cfg(target_os = "linux")]
+impl std::ops::DerefMut for DeploymentChild {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.0
+    }
+}
+
+#[cfg(target_os = "linux")]
+impl Drop for DeploymentChild {
+    fn drop(&mut self) {
+        if self.0.try_wait().is_ok_and(|status| status.is_none()) {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn wait_for_file(path: &Path, purpose: &str) {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    while !path.exists() {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "timed out waiting for {purpose}: {}",
+            path.display()
+        );
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn wait_for_success(child: &mut std::process::Child, purpose: &str) {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+    loop {
+        if let Some(status) = child.try_wait().expect("poll deployment child") {
+            assert!(status.success(), "{purpose} failed with {status}");
+            return;
+        }
+        if std::time::Instant::now() >= deadline {
+            let _ = child.kill();
+            let _ = child.wait();
+            panic!("timed out waiting for {purpose}");
+        }
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn assert_active_release(cats_root: &Path, expected: &Path) {
+    for (active, source) in [
+        ("guest/vmlinuz", "guest/vmlinuz"),
+        (
+            "release/guest-runtime-profile.v1.json",
+            "guest-runtime-profile.v1.json",
+        ),
+        (
+            "release/guest-runtime-release-manifest.v1.json",
+            "manifest.v1.json",
+        ),
+    ] {
+        assert_eq!(
+            std::fs::read(cats_root.join(active)).unwrap(),
+            std::fs::read(expected.join(source)).unwrap(),
+            "active release member {active} is not from the expected complete set"
+        );
+    }
+    let expected_initramfs = expected.join("guest/initramfs.img");
+    let active_initramfs = cats_root.join("guest/initramfs.img");
+    assert_eq!(active_initramfs.exists(), expected_initramfs.exists());
+    if expected_initramfs.exists() {
+        assert_eq!(
+            std::fs::read(active_initramfs).unwrap(),
+            std::fs::read(expected_initramfs).unwrap()
+        );
+    }
 }
 
 #[cfg(target_os = "linux")]
@@ -617,7 +825,11 @@ fn every_guest_release_durability_boundary_recovers_to_one_complete_set() {
     let fake_bin = fixture.path().join("bin");
     std::fs::create_dir(&fake_bin).unwrap();
     let systemctl = fake_bin.join("systemctl");
-    std::fs::write(&systemctl, "#!/bin/sh\nexit 1\n").unwrap();
+    std::fs::write(
+        &systemctl,
+        "#!/bin/sh\ncase \"$1:$3\" in\n  show:--property=LoadState) echo loaded ;;\n  show:--property=ActiveState) if [ -f \"$CATS_FAKE_SERVICE_ACTIVE\" ]; then echo active; else echo inactive; fi ;;\n  is-active:*) [ -f \"$CATS_FAKE_SERVICE_ACTIVE\" ] ;;\n  *) exit 1 ;;\nesac\n",
+    )
+    .unwrap();
     std::fs::set_permissions(&systemctl, std::fs::Permissions::from_mode(0o755)).unwrap();
     let uid = String::from_utf8(Command::new("id").arg("-u").output().unwrap().stdout)
         .unwrap()
@@ -633,22 +845,63 @@ fn every_guest_release_durability_boundary_recovers_to_one_complete_set() {
     std::fs::create_dir(&baseline).unwrap();
     let baseline_installer = baseline.join("installer");
     let baseline_root = baseline.join("cats");
+    std::fs::create_dir(&baseline_root).unwrap();
     let baseline_trace = baseline.join("trace");
+    let baseline_active = baseline.join("active");
+    let baseline_lock = baseline_root.join("deployment.lock");
     fault_injected_release_installer(&template, &baseline_installer, &baseline_root, &uid, &gid);
-    let baseline_old =
-        run_release_installer(&baseline_installer, &old, &fake_bin, &baseline_trace, None);
+    let baseline_context = ReleaseInstallerContext {
+        installer: &baseline_installer,
+        fake_bin: &fake_bin,
+        trace: &baseline_trace,
+        active: &baseline_active,
+        deployment_lock: &baseline_lock,
+    };
+    let baseline_old = run_release_installer(baseline_context, "prepare", &old, None);
     assert!(
         baseline_old.status.success(),
-        "known-positive old release install failed: {}",
+        "known-positive old release install failed ({}): stdout={} stderr={}",
+        baseline_old.status,
+        String::from_utf8_lossy(&baseline_old.stdout),
         String::from_utf8_lossy(&baseline_old.stderr)
     );
+    assert!(run_release_installer(
+        baseline_context,
+        "authorize-start",
+        Path::new("unused"),
+        None,
+    )
+    .status
+    .success());
+    std::fs::write(&baseline_active, "active").unwrap();
+    assert!(
+        run_release_installer(baseline_context, "commit", Path::new("unused"), None,)
+            .status
+            .success()
+    );
+    std::fs::remove_file(&baseline_active).unwrap();
     std::fs::write(&baseline_trace, "").unwrap();
-    let baseline_new =
-        run_release_installer(&baseline_installer, &new, &fake_bin, &baseline_trace, None);
+    let baseline_new = run_release_installer(baseline_context, "prepare", &new, None);
     assert!(
         baseline_new.status.success(),
         "baseline activation failed: {}",
         String::from_utf8_lossy(&baseline_new.stderr)
+    );
+    assert!(run_release_installer(
+        baseline_context,
+        "authorize-start",
+        Path::new("unused"),
+        None,
+    )
+    .status
+    .success());
+    std::fs::write(&baseline_active, "active").unwrap();
+    let baseline_commit =
+        run_release_installer(baseline_context, "commit", Path::new("unused"), None);
+    assert!(
+        baseline_commit.status.success(),
+        "known-positive commit failed: {}",
+        String::from_utf8_lossy(&baseline_commit.stderr)
     );
     let boundary_count = std::fs::read_to_string(&baseline_trace)
         .unwrap()
@@ -664,22 +917,73 @@ fn every_guest_release_durability_boundary_recovers_to_one_complete_set() {
         std::fs::create_dir(&case).unwrap();
         let installer = case.join("installer");
         let cats_root = case.join("cats");
+        std::fs::create_dir(&cats_root).unwrap();
         let trace = case.join("trace");
+        let active = case.join("active");
+        let deployment_lock = cats_root.join("deployment.lock");
         fault_injected_release_installer(&template, &installer, &cats_root, &uid, &gid);
-        let old_install = run_release_installer(&installer, &old, &fake_bin, &trace, None);
+        let context = ReleaseInstallerContext {
+            installer: &installer,
+            fake_bin: &fake_bin,
+            trace: &trace,
+            active: &active,
+            deployment_lock: &deployment_lock,
+        };
+        let old_install = run_release_installer(context, "prepare", &old, None);
         assert!(old_install.status.success());
+        assert!(
+            run_release_installer(context, "authorize-start", Path::new("unused"), None,)
+                .status
+                .success()
+        );
+        std::fs::write(&active, "active").unwrap();
+        assert!(
+            run_release_installer(context, "commit", Path::new("unused"), None,)
+                .status
+                .success()
+        );
+        std::fs::remove_file(&active).unwrap();
         std::fs::write(&trace, "").unwrap();
 
-        let interrupted = run_release_installer(&installer, &new, &fake_bin, &trace, Some(kill_at));
+        let mut interrupted = run_release_installer(context, "prepare", &new, Some(kill_at));
+        if interrupted.status.success() {
+            interrupted = run_release_installer(
+                context,
+                "authorize-start",
+                Path::new("unused"),
+                Some(kill_at),
+            );
+        }
+        if interrupted.status.success() {
+            std::fs::write(&active, "active").unwrap();
+            interrupted =
+                run_release_installer(context, "commit", Path::new("unused"), Some(kill_at));
+        }
         assert!(
             !interrupted.status.success(),
             "boundary {kill_at} did not interrupt activation"
         );
-        let recovered = run_release_installer(&installer, &new, &fake_bin, &trace, None);
+        // This is the observable outer restart boundary: the deployment first
+        // stops the candidate, then prepare deterministically rolls back any
+        // retained journal before replaying the same incoming release.
+        let _ = std::fs::remove_file(&active);
+        let recovered = run_release_installer(context, "prepare", &new, None);
         assert!(
             recovered.status.success(),
             "boundary {kill_at} did not recover: {}",
             String::from_utf8_lossy(&recovered.stderr)
+        );
+        assert!(cats_root.join("releases/activation.v1").exists());
+        assert!(
+            run_release_installer(context, "authorize-start", Path::new("unused"), None,)
+                .status
+                .success()
+        );
+        std::fs::write(&active, "active").unwrap();
+        assert!(
+            run_release_installer(context, "commit", Path::new("unused"), None,)
+                .status
+                .success()
         );
         assert_eq!(
             std::fs::read(cats_root.join("guest/vmlinuz")).unwrap(),
@@ -698,6 +1002,322 @@ fn every_guest_release_durability_boundary_recovers_to_one_complete_set() {
             "boundary {kill_at} left a mixed manifest"
         );
         assert!(!cats_root.join("guest/initramfs.img").exists());
+        assert!(!cats_root.join("releases/activation.v1").exists());
+    }
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn systemd_restart_rolls_back_uncommitted_candidate_and_stays_stopped() {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    let fixture = tempfile::tempdir().expect("startup recovery fixture");
+    let old = fixture.path().join("old");
+    let new = fixture.path().join("new");
+    make_guest_release(&old, "old", true);
+    make_guest_release(&new, "new", false);
+    let fake_bin = fixture.path().join("bin");
+    std::fs::create_dir(&fake_bin).unwrap();
+    let systemctl = fake_bin.join("systemctl");
+    std::fs::write(
+        &systemctl,
+        "#!/bin/sh\ncase \"$1:$3\" in\n  show:--property=LoadState) echo loaded ;;\n  show:--property=ActiveState) if [ -f \"$CATS_FAKE_SERVICE_ACTIVE\" ]; then echo active; else echo inactive; fi ;;\n  *) exit 1 ;;\nesac\n",
+    )
+    .unwrap();
+    std::fs::set_permissions(&systemctl, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let uid = String::from_utf8(Command::new("id").arg("-u").output().unwrap().stdout)
+        .unwrap()
+        .trim()
+        .to_owned();
+    let gid = String::from_utf8(Command::new("id").arg("-g").output().unwrap().stdout)
+        .unwrap()
+        .trim()
+        .to_owned();
+    let cats_root = fixture.path().join("cats");
+    std::fs::create_dir(&cats_root).unwrap();
+    let installer = fixture.path().join("installer");
+    let trace = fixture.path().join("trace");
+    let active = fixture.path().join("service-active");
+    let lock = cats_root.join("deployment.lock");
+    fault_injected_release_installer(
+        &read_workspace_file("deploy/aws/metal/install-guest-runtime-release.sh"),
+        &installer,
+        &cats_root,
+        &uid,
+        &gid,
+    );
+    let context = ReleaseInstallerContext {
+        installer: &installer,
+        fake_bin: &fake_bin,
+        trace: &trace,
+        active: &active,
+        deployment_lock: &lock,
+    };
+
+    for (mode, source) in [
+        ("prepare", old.as_path()),
+        ("authorize-start", Path::new("unused")),
+    ] {
+        assert!(run_release_installer(context, mode, source, None)
+            .status
+            .success());
+    }
+    std::fs::write(&active, "active").unwrap();
+    assert!(
+        run_release_installer(context, "commit", Path::new("unused"), None,)
+            .status
+            .success()
+    );
+
+    std::fs::remove_file(&active).unwrap();
+    for (mode, source) in [
+        ("prepare", new.as_path()),
+        ("authorize-start", Path::new("unused")),
+    ] {
+        assert!(run_release_installer(context, mode, source, None)
+            .status
+            .success());
+    }
+    // The outer deployer has started and observed the candidate, then is
+    // killed before commit. A reboot presents an inactive service and no live
+    // outer lock to ExecStartPre.
+    std::fs::write(&active, "active").unwrap();
+    std::fs::remove_file(&active).unwrap();
+    let recovery = run_startup_recover(&installer, &fake_bin, &trace, &active);
+    assert!(
+        !recovery.status.success(),
+        "systemd must not start partial outer worker artifacts after rollback"
+    );
+    assert_active_release(&cats_root, &old);
+    assert!(cats_root.join("releases/activation.v1").exists());
+    assert!(!cats_root.join("releases/start-authorized.v1").exists());
+
+    // A full outer transaction can now replay every worker artifact under the
+    // same lock, replace the retained journal, prove readiness, and commit.
+    for (mode, source) in [
+        ("prepare", new.as_path()),
+        ("authorize-start", Path::new("unused")),
+    ] {
+        assert!(run_release_installer(context, mode, source, None)
+            .status
+            .success());
+    }
+    std::fs::write(&active, "active").unwrap();
+    assert!(
+        run_release_installer(context, "commit", Path::new("unused"), None,)
+            .status
+            .success()
+    );
+    assert_active_release(&cats_root, &new);
+    assert!(!cats_root.join("releases/activation.v1").exists());
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn guest_release_refuses_an_ambiguous_systemd_state_before_mutation() {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    let fixture = tempfile::tempdir().expect("systemd query failure fixture");
+    let release = fixture.path().join("release-source");
+    make_guest_release(&release, "candidate", false);
+    let fake_bin = fixture.path().join("bin");
+    std::fs::create_dir(&fake_bin).unwrap();
+    let systemctl = fake_bin.join("systemctl");
+    std::fs::write(&systemctl, "#!/bin/sh\nexit 1\n").unwrap();
+    std::fs::set_permissions(&systemctl, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let uid = String::from_utf8(Command::new("id").arg("-u").output().unwrap().stdout)
+        .unwrap()
+        .trim()
+        .to_owned();
+    let gid = String::from_utf8(Command::new("id").arg("-g").output().unwrap().stdout)
+        .unwrap()
+        .trim()
+        .to_owned();
+    let cats_root = fixture.path().join("cats");
+    std::fs::create_dir(&cats_root).unwrap();
+    let installer = fixture.path().join("installer");
+    fault_injected_release_installer(
+        &read_workspace_file("deploy/aws/metal/install-guest-runtime-release.sh"),
+        &installer,
+        &cats_root,
+        &uid,
+        &gid,
+    );
+    let trace = fixture.path().join("trace");
+    let active = fixture.path().join("active");
+    let lock = cats_root.join("deployment.lock");
+    let context = ReleaseInstallerContext {
+        installer: &installer,
+        fake_bin: &fake_bin,
+        trace: &trace,
+        active: &active,
+        deployment_lock: &lock,
+    };
+    let verified = run_release_installer(context, "verify", &release, None);
+    assert!(
+        verified.status.success(),
+        "known-positive manifest probe failed: {}",
+        String::from_utf8_lossy(&verified.stderr)
+    );
+    let refused = run_release_installer(context, "prepare", &release, None);
+    assert!(
+        !refused.status.success(),
+        "a systemd/D-Bus error must not be interpreted as an inactive worker"
+    );
+    assert!(!cats_root.join("releases").exists());
+    assert!(!cats_root.join("release").exists());
+    assert!(!cats_root.join("guest").exists());
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn overlapping_guest_release_transactions_serialize_journal_active_and_commit() {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    let fixture = tempfile::tempdir().expect("overlapping release fixture");
+    let old = fixture.path().join("old");
+    let new = fixture.path().join("new");
+    make_guest_release(&old, "old", true);
+    make_guest_release(&new, "new", false);
+    let fake_bin = fixture.path().join("bin");
+    std::fs::create_dir(&fake_bin).unwrap();
+    let systemctl = fake_bin.join("systemctl");
+    std::fs::write(
+        &systemctl,
+        "#!/bin/sh\ncase \"$1:$3\" in\n  show:--property=LoadState) echo loaded ;;\n  show:--property=ActiveState) if [ -f \"$CATS_FAKE_SERVICE_ACTIVE\" ]; then echo active; else echo inactive; fi ;;\n  is-active:*) [ -f \"$CATS_FAKE_SERVICE_ACTIVE\" ] ;;\n  *) exit 1 ;;\nesac\n",
+    )
+    .unwrap();
+    std::fs::set_permissions(&systemctl, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let uid = String::from_utf8(Command::new("id").arg("-u").output().unwrap().stdout)
+        .unwrap()
+        .trim()
+        .to_owned();
+    let gid = String::from_utf8(Command::new("id").arg("-g").output().unwrap().stdout)
+        .unwrap()
+        .trim()
+        .to_owned();
+    let template = read_workspace_file("deploy/aws/metal/install-guest-runtime-release.sh");
+
+    // These are the three distinct outer-transaction hazards: publishing the
+    // durable journal, switching the final active completion marker, and
+    // clearing the journal after readiness. Each case starts from a committed
+    // old release and converges through two serialized deployments.
+    for pause_at in [
+        "activation-rename",
+        "active-rename:manifest",
+        "activation-remove",
+    ] {
+        let case = fixture.path().join(pause_at.replace(':', "-"));
+        std::fs::create_dir(&case).unwrap();
+        let installer = case.join("installer");
+        let cats_root = case.join("cats");
+        std::fs::create_dir(&cats_root).unwrap();
+        let active = case.join("service-active");
+        let lock = cats_root.join("deployment.lock");
+        let bootstrap_trace = case.join("bootstrap-trace");
+        fault_injected_release_installer(&template, &installer, &cats_root, &uid, &gid);
+        let bootstrap_context = ReleaseInstallerContext {
+            installer: &installer,
+            fake_bin: &fake_bin,
+            trace: &bootstrap_trace,
+            active: &active,
+            deployment_lock: &lock,
+        };
+        assert!(
+            run_release_installer(bootstrap_context, "prepare", &old, None,)
+                .status
+                .success()
+        );
+        assert!(run_release_installer(
+            bootstrap_context,
+            "authorize-start",
+            Path::new("unused"),
+            None,
+        )
+        .status
+        .success());
+        std::fs::write(&active, "active").unwrap();
+        assert!(
+            run_release_installer(bootstrap_context, "commit", Path::new("unused"), None,)
+                .status
+                .success()
+        );
+
+        let first_trace = case.join("first-trace");
+        let first_paused = case.join("first-paused");
+        let first_continue = case.join("first-continue");
+        let first_context = ReleaseInstallerContext {
+            installer: &installer,
+            fake_bin: &fake_bin,
+            trace: &first_trace,
+            active: &active,
+            deployment_lock: &lock,
+        };
+        let mut first = spawn_release_transaction(
+            first_context,
+            &new,
+            (pause_at, &first_paused, &first_continue),
+        );
+        wait_for_file(&first_paused, pause_at);
+        assert_eq!(
+            std::fs::read_to_string(&first_paused).unwrap().trim(),
+            pause_at,
+            "the positive control must reach the intended durability probe"
+        );
+        assert!(
+            !Command::new("flock")
+                .arg("-n")
+                .arg(&lock)
+                .args(["-c", "true"])
+                .status()
+                .unwrap()
+                .success(),
+            "the calibrated first transaction must hold the deployment lock"
+        );
+
+        let second_trace = case.join("second-trace");
+        let second_paused = case.join("second-paused");
+        let second_continue = case.join("second-continue");
+        std::fs::write(&second_continue, "continue").unwrap();
+        let second_context = ReleaseInstallerContext {
+            installer: &installer,
+            fake_bin: &fake_bin,
+            trace: &second_trace,
+            active: &active,
+            deployment_lock: &lock,
+        };
+        let mut second = spawn_release_transaction(
+            second_context,
+            &old,
+            ("never", &second_paused, &second_continue),
+        );
+        wait_for_file(
+            &second_paused.with_extension("lock-blocked"),
+            "second deployment to observe the occupied lock",
+        );
+        assert!(
+            second.try_wait().unwrap().is_none(),
+            "the overlapping deployment escaped the Host lock at {pause_at}"
+        );
+        assert!(
+            !second_trace.exists() || std::fs::read(&second_trace).unwrap_or_default().is_empty(),
+            "the overlapping deployment reached installer mutation at {pause_at}"
+        );
+
+        std::fs::write(&first_continue, "continue").unwrap();
+        wait_for_success(&mut first, "first serialized deployment");
+        wait_for_success(&mut second, "second serialized deployment");
+        assert!(
+            Command::new("flock")
+                .arg("-n")
+                .arg(&lock)
+                .args(["-c", "true"])
+                .status()
+                .unwrap()
+                .success(),
+            "deployment lock probe must become positive after both transactions"
+        );
+        assert_active_release(&cats_root, &old);
         assert!(!cats_root.join("releases/activation.v1").exists());
     }
 }
@@ -919,13 +1539,72 @@ fn worker_release_atomically_updates_the_cloud_hypervisor_guest_seed() {
     permissions.set_mode(0o755);
     std::fs::set_permissions(&new_agent, permissions).expect("make guest agent executable");
 
-    let updater = workspace_root().join("deploy/aws/metal/update-guest-seed.sh");
+    let updater_template = read_workspace_file("deploy/aws/metal/update-guest-seed.sh");
+    let helper_template = read_workspace_file("deploy/aws/metal/worker-deployment-transaction.sh");
+    let updater = temp.path().join("update-guest-seed");
+    let helper = temp.path().join("worker-deployment-transaction");
+    let lock = temp.path().join("deployment.lock");
+    let uid = String::from_utf8(Command::new("id").arg("-u").output().unwrap().stdout)
+        .unwrap()
+        .trim()
+        .to_owned();
+    let gid = String::from_utf8(Command::new("id").arg("-g").output().unwrap().stdout)
+        .unwrap()
+        .trim()
+        .to_owned();
+    let helper_source = helper_template
+        .replace(
+            "/run/lock/cats/worker-deployment.lock",
+            &lock.display().to_string(),
+        )
+        .replace("'0:0:600:1'", &format!("'{uid}:{gid}:600:1'"));
+    std::fs::write(&helper, helper_source).unwrap();
+    std::fs::write(
+        &updater,
+        updater_template.replace(
+            "/opt/cats/bin/worker-deployment-transaction.sh",
+            &helper.display().to_string(),
+        ),
+    )
+    .unwrap();
+    std::fs::set_permissions(&updater, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let fake_bin = temp.path().join("bin");
+    std::fs::create_dir(&fake_bin).unwrap();
+    let systemctl = fake_bin.join("systemctl");
+    std::fs::write(
+        &systemctl,
+        "#!/bin/sh\ncase \"$1:$3\" in\n  show:--property=LoadState) echo loaded ;;\n  show:--property=ActiveState) echo inactive ;;\n  *) exit 1 ;;\nesac\n",
+    )
+    .unwrap();
+    std::fs::set_permissions(&systemctl, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let mut command_path = fake_bin.as_os_str().to_os_string();
+    command_path.push(":");
+    command_path.push(std::env::var_os("PATH").unwrap_or_default());
     let units = workspace_root().join("deploy/metal/guest-systemd");
+    let unlocked = Command::new(&updater)
+        .arg(&seed)
+        .arg(&new_agent)
+        .arg(&units)
+        .env("PATH", &command_path)
+        .output()
+        .expect("run updater without transaction lock");
+    assert!(
+        !unlocked.status.success(),
+        "the installed seed updater must not be an independent mutation authority"
+    );
     for pass in 0..2 {
-        let output = Command::new(&updater)
+        let output = Command::new("/bin/bash")
+            .args([
+                "-c",
+                "umask 077; exec 9>>\"$1\"; flock 9; export CATS_WORKER_DEPLOYMENT_LOCK_FD=9; exec \"$2\" \"$3\" \"$4\" \"$5\"",
+                "bash",
+            ])
+            .arg(&lock)
+            .arg(&updater)
             .arg(&seed)
             .arg(&new_agent)
             .arg(&units)
+            .env("PATH", &command_path)
             .output()
             .unwrap_or_else(|error| panic!("run seed updater pass {pass}: {error}"));
         assert!(

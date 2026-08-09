@@ -55,6 +55,7 @@ use crate::admission::{resume_commitment_bytes, WakeAdmission, WakeBudget, WakeL
 use crate::ch::{self, BlockPath, ChConfig, ChRuntime, GUEST_VSOCK_PORT};
 use crate::guest_client::{GuestClient, GuestShell};
 use crate::proc::ProcHandle;
+use crate::state_directory::StateDirectory;
 
 use blockd_control::{blockd_log_path, BlockdProc};
 use ledger::Ledger;
@@ -87,7 +88,7 @@ pub enum VmmMode {
 #[derive(Debug, Clone)]
 pub struct NodeConfig {
     pub node_id: String,
-    pub state_dir: PathBuf,
+    pub state_dir: StateDirectory,
     pub blockd_bin: PathBuf,
     pub guest_agent_bin: PathBuf,
     /// Opaque selections passed to blockd without interpreting provider data.
@@ -119,7 +120,7 @@ pub(crate) fn real_child_node_config(root: &Path, node_id: &str) -> NodeConfig {
     let parts = cats_test_support::NodeConfigBuilder::new(root, node_id).into_parts();
     NodeConfig {
         node_id: parts.node_id,
-        state_dir: parts.state_dir,
+        state_dir: parts.state_dir.into(),
         blockd_bin: parts.blockd_bin,
         guest_agent_bin: parts.guest_agent_bin,
         metadata_store: parts.metadata_store,
@@ -141,7 +142,7 @@ pub(crate) fn stub_node_config(state_dir: &Path, vmm: VmmMode) -> NodeConfig {
     let adapter = AdapterSelection::new("unused", cats_storage::AdapterConfig::default());
     NodeConfig {
         node_id: "node-a".to_string(),
-        state_dir: state_dir.to_path_buf(),
+        state_dir: state_dir.to_path_buf().into(),
         blockd_bin: PathBuf::from("unused-blockd"),
         guest_agent_bin: PathBuf::from("unused-guest-agent"),
         metadata_store: adapter.clone(),
@@ -538,6 +539,7 @@ impl Drop for StopPermit<'_> {
 
 impl NodeRuntime {
     pub fn new(cfg: NodeConfig) -> Result<Self> {
+        cfg.state_dir.ensure_child_inheritance()?;
         let cfg_wake_budget = cfg.wake_budget;
         let ledger = Ledger::open(&cfg.state_dir.join("runtime-ledger"))?;
         Ok(Self {

@@ -14,6 +14,7 @@ EnvironmentFile=/etc/cats/cats.env
 # privilege separation is a hardening milestone). The nbd module is loaded
 # unconditionally so switching CATS_BLOCK_PATH_ARGS back to kernel-nbd needs no
 # reprovisioning; the vhost-user path simply never uses it.
+ExecStartPre=/opt/cats/bin/install-guest-runtime-release startup-recover
 ExecStartPre=/usr/sbin/modprobe nbd nbds_max=64
 ExecStartPre=/opt/cats/bin/setup-guest-network
 ExecStart=/opt/cats/bin/cats-noded \

@@ -19,6 +19,7 @@ GUEST_RUNTIME_RELEASE_SOURCE=${CATS_GUEST_RUNTIME_RELEASE_DIR:-}
   exit 1
 }
 "$REPO/deploy/aws/metal/validate-node-identity-installation.sh"
+. "$REPO/deploy/aws/metal/worker-deployment-transaction.sh"
 
 echo "==> apt dependencies"
 export DEBIAN_FRONTEND=noninteractive
@@ -49,18 +50,47 @@ if [[ -n ${SUDO_USER:-} ]]; then
   done
 fi
 
+export CATS_NODE_SERVICE_NAME=cats-noded
+release_installer="$REPO/deploy/aws/metal/install-guest-runtime-release.sh"
+"$release_installer" verify "$GUEST_RUNTIME_RELEASE_SOURCE"
+cats_acquire_worker_deployment_lock
+release_transaction_active=1
+route_key_temp=""
+route_public_temp=""
+deployment_cleanup() {
+  status=$?
+  trap - EXIT INT TERM
+  if [[ $release_transaction_active -eq 1 ]]; then
+    cats_stop_node_service cats-noded >/dev/null 2>&1 || true
+    "$release_installer" rollback >/dev/null 2>&1 || true
+  fi
+  [[ -z $route_key_temp ]] || rm -f -- "$route_key_temp"
+  [[ -z $route_public_temp ]] || rm -f -- "$route_public_temp"
+  exit "$status"
+}
+trap deployment_cleanup EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM
+cats_stop_node_service cats-noded
+"$release_installer" prepare "$GUEST_RUNTIME_RELEASE_SOURCE"
+cats_worker_deployment_crash_probe after-installer-return
+
 echo "==> install binaries to $PREFIX/bin"
 install -d "$PREFIX/bin"
+cats_worker_deployment_crash_probe after-install-bin-directory
 for bin in cats cats-controld cats-noded cats-gatewayd cats-blockd cats-guest-agent; do
   install -m 0755 "$REPO/target/release/$bin" "$PREFIX/bin/$bin"
+  cats_worker_deployment_crash_probe "after-install-$bin"
 done
 ln -sf "$PREFIX/bin/cats" /usr/local/bin/cats
+cats_worker_deployment_crash_probe after-install-cli-link
 
 echo "==> cloud-hypervisor $CH_VERSION"
 if [[ ! -x /usr/local/bin/cloud-hypervisor ]]; then
   curl -fsSL -o /usr/local/bin/cloud-hypervisor \
     "https://github.com/cloud-hypervisor/cloud-hypervisor/releases/download/${CH_VERSION}/cloud-hypervisor-static"
   chmod +x /usr/local/bin/cloud-hypervisor
+  cats_worker_deployment_crash_probe after-install-cloud-hypervisor
 fi
 /usr/local/bin/cloud-hypervisor --version
 
@@ -68,24 +98,24 @@ echo "==> kernel NBD module (nbds_max=64)"
 modprobe nbd nbds_max=64 || true
 echo nbd > /etc/modules-load.d/cats.conf
 echo "options nbd nbds_max=64" > /etc/modprobe.d/cats-nbd.conf
+cats_worker_deployment_crash_probe after-install-nbd-configuration
 
 echo "==> guest outbound network"
 install -m 0755 "$REPO/deploy/metal/setup-guest-network.sh" \
   "$PREFIX/bin/setup-guest-network"
 install -m 0755 "$REPO/deploy/aws/metal/install-guest-runtime-release.sh" \
   "$PREFIX/bin/install-guest-runtime-release"
+install -m 0755 "$REPO/deploy/aws/metal/worker-deployment-transaction.sh" \
+  "$PREFIX/bin/worker-deployment-transaction"
+cats_worker_deployment_crash_probe after-install-deployment-transaction
 printf 'net.ipv4.ip_forward=1\nnet.ipv4.conf.all.rp_filter=1\nnet.ipv4.conf.default.rp_filter=1\n' \
   > /etc/sysctl.d/90-cats-guest-network.conf
+cats_worker_deployment_crash_probe after-install-network-configuration
 CATS_GUEST_NETWORK_CIDR=${CATS_GUEST_NETWORK_CIDR:-10.240.0.0/16} \
   "$PREFIX/bin/setup-guest-network"
+cats_worker_deployment_crash_probe after-setup-guest-network
 
 echo "==> shared Guest runtime release"
-CATS_NODE_SERVICE_NAME=cats-noded \
-  "$PREFIX/bin/install-guest-runtime-release" verify "$GUEST_RUNTIME_RELEASE_SOURCE"
-systemctl stop cats-noded 2>/dev/null || true
-CATS_NODE_SERVICE_NAME=cats-noded \
-  "$PREFIX/bin/install-guest-runtime-release" install "$GUEST_RUNTIME_RELEASE_SOURCE"
-
 # --------------------------------------------------------------------------
 # Local NVMe for the ChunkStore cache and the file object store.
 #
@@ -142,6 +172,7 @@ if [[ $DATA_DEVICE != none ]]; then
     blkid "$DATA_DEVICE" >/dev/null 2>&1 || mkfs.ext4 -q -F "$DATA_DEVICE"
     install -d /var/lib/cats
     mount "$DATA_DEVICE" /var/lib/cats
+    cats_worker_deployment_crash_probe after-mount-state-filesystem
     # Instance storage does not survive a stop/start, so this is deliberately not
     # written to /etc/fstab: a reboot should come up with an empty cache, not fail
     # to boot on a device that no longer has a filesystem.
@@ -153,8 +184,10 @@ fi
 
 echo "==> state dirs + config"
 install -d /var/lib/cats/{node,blob} /etc/cats
+cats_worker_deployment_crash_probe after-install-state-directories
 if [[ ! -f /etc/cats/cats.env ]]; then
   install -m 0600 "$REPO/deploy/metal/cats.env.example" /etc/cats/cats.env
+  cats_worker_deployment_crash_probe after-install-cats-environment
   echo "    wrote /etc/cats/cats.env (edit for S3; defaults to local file blobstore)"
 fi
 
@@ -164,23 +197,35 @@ fi
 # separate control-plane and worker deployment states.
 if [[ ! -f /etc/cats/route-grant-private.pem ]]; then
   route_key_temp=$(mktemp /var/tmp/cats-route-grant-private.XXXXXX)
-  trap 'rm -f -- "$route_key_temp"' EXIT
   openssl genpkey -algorithm ED25519 -out "$route_key_temp"
   install -o root -g root -m 0600 "$route_key_temp" /etc/cats/route-grant-private.pem
+  cats_worker_deployment_crash_probe after-install-route-private-key
   rm -f -- "$route_key_temp"
-  trap - EXIT
+  route_key_temp=""
 fi
 route_public_temp=$(mktemp /var/tmp/cats-route-grant-public.XXXXXX)
-trap 'rm -f -- "$route_public_temp"' EXIT
 openssl pkey -in /etc/cats/route-grant-private.pem -pubout -out "$route_public_temp"
 install -o root -g root -m 0644 "$route_public_temp" /etc/cats/route-grant-public.pem
+cats_worker_deployment_crash_probe after-install-route-public-key
 rm -f -- "$route_public_temp"
-trap - EXIT
+route_public_temp=""
 
 echo "==> systemd units"
 install -m 0644 "$REPO"/deploy/metal/systemd/*.service /etc/systemd/system/
+cats_worker_deployment_crash_probe after-install-systemd-units
 systemctl daemon-reload
-systemctl enable --now cats-controld cats-gatewayd cats-noded
+cats_worker_deployment_crash_probe after-daemon-reload
+systemctl enable --now cats-controld cats-gatewayd
+cats_worker_deployment_crash_probe after-start-control-services
+"$release_installer" authorize-start
+cats_worker_deployment_crash_probe after-authorize-worker-start
+systemctl enable --now cats-noded
+cats_worker_deployment_crash_probe after-start-worker
+cats_wait_for_registered_node cats-noded
+cats_worker_deployment_crash_probe after-registration-readiness
+"$release_installer" commit
+release_transaction_active=0
+cats_worker_deployment_crash_probe after-release-commit
 
 sleep 1
 systemctl --no-pager --lines 0 status cats-controld cats-gatewayd cats-noded | grep -E "●|Active"

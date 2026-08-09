@@ -111,6 +111,13 @@ worker name, advertise address and IMDS are not registration identity. The share
 closed layout and manifest defined by the composition contract; Control and worker artifacts must report one
 matching immutable release ID before either can be deployed.
 
+Every Host-side worker mutation runs under the single
+`/run/lock/cats/worker-deployment.lock` descriptor. The Guest activation journal remains durable across binary,
+configuration, unit and seed replacement, candidate start and registration-backed readiness; only then is it
+committed. A crash before commit restores the exact previous Guest set but keeps the worker stopped and the
+journal retained until the complete worker transaction is replayed. Direct `systemctl start` and standalone
+`update-guest-seed` cannot bypass this boundary.
+
 ### Runtime-cutover composition gate
 
 The Agent-registration slice is not a standalone deployable release. It may be

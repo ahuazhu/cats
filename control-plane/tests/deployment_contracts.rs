@@ -1785,9 +1785,13 @@ fn worker_release_install_is_closed_durable_and_identity_fail_closed() {
         "previous_id=$(persist_active_set)",
         "write_activation \"$release_id\" \"$previous_id\"",
         "recover_activation",
+        "write_start_authorization \"$activation_incoming\"",
+        "load_start_authorization \"$activation_incoming\"",
+        "require_service_stopped",
+        "require_service_active",
         "activation-parent-fsync",
         "active-layout-parent-fsync:cats-root",
-        "trap rollback ERR",
+        "trap prepare_rollback ERR",
         "active-rename:$label",
     ] {
         assert!(
@@ -1815,13 +1819,44 @@ fn worker_release_install_is_closed_durable_and_identity_fail_closed() {
             .find("CATS_GUEST_RUNTIME_RELEASE_DIR must name the qualified guest-runtime-release.v1 payload")
             .expect("required shared release input");
         let verify = source
-            .find("install-guest-runtime-release\" verify")
+            .find("\"$release_installer\" verify")
             .expect("release verification");
-        let install = source
-            .find("install-guest-runtime-release\" install")
-            .expect("release activation");
-        assert!(required < verify && verify < install);
+        let prepare = source
+            .find("\"$release_installer\" prepare")
+            .expect("release preparation");
+        let readiness = source
+            .find("cats_wait_for_registered_node")
+            .expect("registration-backed readiness");
+        let authorize = source
+            .find("\"$release_installer\" authorize-start")
+            .expect("post-mutation start authorization");
+        let commit = source
+            .find("\"$release_installer\" commit")
+            .expect("release commit");
+        assert!(
+            required < verify
+                && verify < prepare
+                && prepare < authorize
+                && authorize < readiness
+                && readiness < commit
+        );
+        assert!(source.contains("cats_acquire_worker_deployment_lock"));
         assert!(source.contains("validate-node-identity-installation.sh"));
+        for boundary in [
+            "after-installer-return",
+            "after-daemon-reload",
+            "after-authorize-worker-start",
+            "after-start-worker",
+            "after-registration-readiness",
+            "after-release-commit",
+        ] {
+            assert!(
+                source.contains(&format!("cats_worker_deployment_crash_probe {boundary}")),
+                "{bootstrap} lost outer transaction crash boundary {boundary}"
+            );
+        }
+        assert!(source.contains("cats_stop_node_service"));
+        assert!(source.contains("\"$release_installer\" rollback"));
         for forbidden in ["169.254.169.254", "CATS_NODE_ID=", "build-guest-image.sh"] {
             assert!(
                 !source.contains(forbidden),
@@ -1856,9 +1891,17 @@ fn worker_release_install_is_closed_durable_and_identity_fail_closed() {
     let idle_guard = terraform
         .find("require-idle-worker.sh\"")
         .expect("drained worker guard");
-    let stop = terraform
-        .find("systemctl stop cats-worker")
+    let deployment_lock = terraform
+        .find("cats_acquire_worker_deployment_lock")
+        .expect("Host deployment lock");
+    let stop = terraform[deployment_lock..]
+        .find("cats_stop_node_service cats-worker")
+        .map(|offset| deployment_lock + offset)
         .expect("worker stop");
+    let prepare = terraform[stop..]
+        .find("\"$release_installer\" prepare")
+        .map(|offset| stop + offset)
+        .expect("durable release prepare");
     let first_install = terraform
         .find("install -D -m 0755 \"$stage_path/cats-noded\"")
         .expect("first installed byte");
@@ -1868,11 +1911,45 @@ fn worker_release_install_is_closed_durable_and_identity_fail_closed() {
             && release_verify < identity_validate,
         "nothing from the empty stage may execute before verified extraction"
     );
-    assert!(identity_validate < idle_guard && idle_guard < stop && stop < first_install);
+    let authorize = terraform
+        .find("\"$release_installer\" authorize-start")
+        .expect("durable post-mutation start authorization");
+    let start = terraform
+        .find("systemctl start cats-worker")
+        .expect("candidate worker start");
+    let readiness = terraform
+        .find("cats_wait_for_registered_node cats-worker")
+        .expect("registration-backed readiness");
+    let commit = terraform
+        .find("\"$release_installer\" commit")
+        .expect("release commit");
+    assert!(
+        first_install < authorize && authorize < start && start < readiness && readiness < commit
+    );
+    assert!(
+        identity_validate < idle_guard
+            && idle_guard < deployment_lock
+            && deployment_lock < stop
+            && stop < prepare
+            && prepare < first_install
+    );
     for forbidden in ["169.254.169.254", "CATS_NODE_ID=", "--node-id"] {
         assert!(
             !terraform.contains(forbidden),
             "Terraform regained derived Node identity {forbidden:?}"
+        );
+    }
+    for boundary in [
+        "after-installer-return",
+        "after-update-guest-seed",
+        "after-authorize-worker-start",
+        "after-start-worker",
+        "after-registration-readiness",
+        "after-release-commit",
+    ] {
+        assert!(
+            terraform.contains(&format!("cats_worker_deployment_crash_probe {boundary}")),
+            "Terraform lost outer transaction crash boundary {boundary}"
         );
     }
 }
@@ -1883,6 +1960,7 @@ fn guest_release_shell_entrypoints_parse() {
     for script in [
         "deploy/aws/metal/install-guest-runtime-release.sh",
         "deploy/aws/metal/install-worker.sh",
+        "deploy/aws/metal/worker-deployment-transaction.sh",
         "deploy/aws/metal/validate-node-identity-installation.sh",
         "deploy/metal/build-guest-image.sh",
         "deploy/metal/install.sh",

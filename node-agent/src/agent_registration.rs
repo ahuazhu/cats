@@ -26,6 +26,8 @@ use cats_api::runtime_reconciliation::{
     NodeIdentityState, RandomId128,
 };
 
+use crate::state_directory::StateDirectory;
+
 pub const NODE_IDENTITY_PATH: &str = "/etc/cats/identity/node-identity.v1.json";
 pub const NODE_REGISTRATION_KEY_PATH: &str = "/etc/cats/identity/node-registration-key.pem";
 pub const NODE_REGISTRATION_CREDENTIAL_ID_PATH: &str =
@@ -50,10 +52,10 @@ pub struct AgentRegistrationConfig {
     identity: Arc<NodeIdentity>,
     signer: Ed25519RequestSigner,
     state_path: PathBuf,
-    state_parent_directory: Arc<File>,
+    _state_parent_directory: Arc<File>,
     state_directory: Arc<File>,
-    state_directory_name: Arc<CString>,
     state_directory_identity: StableDirectoryIdentity,
+    runtime_state_directory: StateDirectory,
     node_boot_id: NodeBootId,
     guest_config_digest: cats_api::runtime_reconciliation::Sha256Digest,
     _host_lock: Arc<File>,
@@ -106,6 +108,10 @@ impl AgentRegistrationConfig {
             validate_identity_material(&identity_bytes, &key_bytes, &credential_bytes)?;
         let state_path = Path::new(NODE_STATE_ROOT).join(identity.state_path_id.as_str());
         let state_parent_directory = open_installed_state_root()?;
+        let host_lock = open_and_lock_host_file(
+            &state_parent_directory,
+            RegistrationTransport::ProductionHttps,
+        )?;
         let state_directory_name = CString::new(identity.state_path_id.as_str())?;
         let state_directory = open_directory_at(
             &state_parent_directory,
@@ -114,16 +120,16 @@ impl AgentRegistrationConfig {
         )?;
         validate_state_directory(&state_directory, RegistrationTransport::ProductionHttps)?;
         let state_directory_identity = StableDirectoryIdentity::new(&state_directory.metadata()?);
-        let host_lock =
-            open_and_lock_host_file(&state_directory, RegistrationTransport::ProductionHttps)?;
+        let runtime_state_directory =
+            StateDirectory::from_installed_directory(&state_directory, &state_path)?;
         Ok(Self {
             identity: Arc::new(identity),
             signer,
             state_path,
-            state_parent_directory: Arc::new(state_parent_directory),
+            _state_parent_directory: Arc::new(state_parent_directory),
             state_directory: Arc::new(state_directory),
-            state_directory_name: Arc::new(state_directory_name),
             state_directory_identity,
+            runtime_state_directory,
             node_boot_id: installed_node_boot_id()?,
             guest_config_digest: guest_config_digest(receipt)
                 .map_err(|_| anyhow::anyhow!("installed Guest runtime receipt is invalid"))?,
@@ -167,6 +173,7 @@ impl AgentRegistrationConfig {
                 .as_bytes(),
         )?;
         let state_parent_directory = File::open(state_parent_path)?;
+        let host_lock = create_and_lock_test_host_file(&state_parent_directory)?;
         let state_directory = open_directory_at(
             &state_parent_directory,
             state_directory_name.as_c_str(),
@@ -174,15 +181,16 @@ impl AgentRegistrationConfig {
         )?;
         validate_state_directory(&state_directory, RegistrationTransport::LoopbackTest)?;
         let state_directory_identity = StableDirectoryIdentity::new(&state_directory.metadata()?);
-        let host_lock = create_and_lock_test_host_file(&state_directory)?;
+        let runtime_state_directory =
+            StateDirectory::from_test_directory(&state_directory, &state_path)?;
         Ok(Self {
             identity: Arc::new(identity),
             signer,
             state_path,
-            state_parent_directory: Arc::new(state_parent_directory),
+            _state_parent_directory: Arc::new(state_parent_directory),
             state_directory: Arc::new(state_directory),
-            state_directory_name: Arc::new(state_directory_name),
             state_directory_identity,
+            runtime_state_directory,
             node_boot_id,
             guest_config_digest: guest_config_digest(receipt)
                 .map_err(|_| anyhow::anyhow!("test Guest runtime receipt is invalid"))?,
@@ -197,6 +205,10 @@ impl AgentRegistrationConfig {
 
     pub fn state_path(&self) -> &Path {
         &self.state_path
+    }
+
+    pub fn runtime_state_directory(&self) -> StateDirectory {
+        self.runtime_state_directory.clone()
     }
 
     /// Keeps one exact pending attempt durable across every ambiguous result.
@@ -371,17 +383,15 @@ impl AgentRegistrationConfig {
     }
 
     fn ensure_state_directory_identity(&self) -> anyhow::Result<()> {
-        let current = open_directory_at(
-            &self.state_parent_directory,
-            self.state_directory_name.as_c_str(),
-            &self.state_path,
-        )?;
-        validate_state_directory(&current, self.transport)?;
+        // The identity-selected directory is a process-lifetime resource. Do
+        // not resolve its former pathname again: a privileged rename must not
+        // redirect registration state away from the descriptor that was
+        // selected while the Host-global parent lock was acquired.
+        validate_state_directory(&self.state_directory, self.transport)?;
         anyhow::ensure!(
-            StableDirectoryIdentity::new(&current.metadata()?) == self.state_directory_identity
-                && StableDirectoryIdentity::new(&self.state_directory.metadata()?)
-                    == self.state_directory_identity,
-            "Node state directory identity changed while the Host lock was held"
+            StableDirectoryIdentity::new(&self.state_directory.metadata()?)
+                == self.state_directory_identity,
+            "retained Node state directory descriptor changed identity"
         );
         Ok(())
     }
@@ -1308,6 +1318,13 @@ mod tests {
         let temp = tempfile::tempdir().unwrap();
         let state_path = temp.path().join("state");
         let registration = loopback_registration(state_path.clone());
+        #[cfg(target_os = "linux")]
+        let _runtime = {
+            let mut config =
+                crate::runtime::stub_node_config(temp.path(), crate::runtime::VmmMode::Fake);
+            config.state_dir = registration.runtime_state_directory();
+            crate::runtime::NodeRuntime::new(config).unwrap()
+        };
         let old_registration_directory = ensure_registration_directory(
             &registration.state_directory,
             RegistrationTransport::LoopbackTest,
@@ -1325,9 +1342,10 @@ mod tests {
         let worker_barrier = barrier.clone();
         let worker_state = state_path.clone();
         let displaced = temp.path().join("state-displaced");
+        let worker_displaced = displaced.clone();
         let replacer = std::thread::spawn(move || {
             worker_barrier.wait();
-            std::fs::rename(&worker_state, &displaced).unwrap();
+            std::fs::rename(&worker_state, &worker_displaced).unwrap();
             std::fs::create_dir(&worker_state).unwrap();
             let replacement_registration = worker_state.join("agent-registration");
             std::fs::create_dir(&replacement_registration).unwrap();
@@ -1345,7 +1363,13 @@ mod tests {
         barrier.wait();
         replacer.join().unwrap();
 
-        assert!(registration.ensure_state_directory_identity().is_err());
+        registration.ensure_state_directory_identity().unwrap();
+        atomic_replace_at(
+            &old_registration_directory,
+            OsStr::new("pending-attempt.json"),
+            b"retained-directory",
+        )
+        .unwrap();
         let retained = read_optional_bounded_at(
             &old_registration_directory,
             OsStr::new("pending-attempt.json"),
@@ -1355,16 +1379,57 @@ mod tests {
         )
         .unwrap()
         .unwrap();
-        assert_eq!(retained, b"old-directory");
+        assert_eq!(retained, b"retained-directory");
+        assert_eq!(
+            std::fs::read(displaced.join(PENDING_ATTEMPT_RELATIVE_PATH)).unwrap(),
+            b"retained-directory"
+        );
         assert_eq!(
             std::fs::read(state_path.join(PENDING_ATTEMPT_RELATIVE_PATH)).unwrap(),
             b"replacement-directory"
         );
-        // A replacement process can lock the replacement inode, but the old
-        // process has already failed its canonical-directory identity check
-        // and can neither send nor persist another attempt there.
-        let replacement = loopback_registration(state_path);
-        replacement.ensure_state_directory_identity().unwrap();
+        #[cfg(target_os = "linux")]
+        {
+            let anchored = registration.runtime_state_directory();
+            anchored.ensure_child_inheritance().unwrap();
+            assert!(anchored.inherited_fd().is_some());
+            std::fs::write(anchored.join("runtime-after-replacement"), b"old-inode").unwrap();
+            let child = std::process::Command::new("/bin/sh")
+                .args(["-c", "printf child > \"$1/child-write\"", "sh"])
+                .arg(anchored.path())
+                .status()
+                .unwrap();
+            assert!(child.success());
+            assert_eq!(
+                std::fs::read(displaced.join("runtime-after-replacement")).unwrap(),
+                b"old-inode"
+            );
+            assert_eq!(
+                std::fs::read(displaced.join("child-write")).unwrap(),
+                b"child"
+            );
+            assert!(!state_path.join("runtime-after-replacement").exists());
+            assert!(!state_path.join("child-write").exists());
+        }
+        // The Host-global lock lives in the retained state root, so replacing
+        // the identity-selected child cannot let a second Agent start.
+        let (identity, key, credential) = vector_material();
+        let (identity, signer) = validate_identity_material(&identity, &key, &credential).unwrap();
+        let receipt = GuestRuntimeProfileReceipt {
+            version: ContractVersion::V1,
+            kernel_digest: Sha256Digest::new(format!("sha256:{}", "1".repeat(64))).unwrap(),
+            initramfs_digest: None,
+            kernel_cmdline: AsciiText::new("console=hvc0 root=/dev/vda").unwrap(),
+            guest_agent_protocol_version: ContractVersion::V1,
+        };
+        assert!(AgentRegistrationConfig::for_loopback_test(
+            identity,
+            signer,
+            state_path,
+            NodeBootId::new("11111111111111111111111111111111").unwrap(),
+            &receipt,
+        )
+        .is_err());
     }
 
     #[test]

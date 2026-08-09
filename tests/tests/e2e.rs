@@ -156,7 +156,10 @@ impl Cluster {
         };
         cats_control_plane::testsupport::provision_node_identity(&cp.state.store, identity.clone())
             .await;
-        let state_dir = dir.path().join(format!("node-{id}"));
+        // Each fixture Node represents a distinct physical Host. Give each
+        // one its own fixed state parent so the production Host-global parent
+        // lock does not incorrectly model both simulated Hosts as one.
+        let state_dir = dir.path().join(format!("h{id}")).join("s");
         let registration = AgentRegistrationConfig::for_loopback_test(
             identity,
             signer,
@@ -365,7 +368,8 @@ impl Cluster {
     fn guest_ctl(&self, node: &str, cat_id: &str) -> PathBuf {
         self.dir
             .path()
-            .join(format!("node-{node}"))
+            .join(format!("h{node}"))
+            .join("s")
             .join("cats")
             .join(cat_id)
             .join("ctl.sock")

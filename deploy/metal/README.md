@@ -59,6 +59,12 @@ single-build payload/manifest plus root-provisioned local Node identity are froz
 [Runtime Composition Artifacts v1](../../docs/specs/runtime-composition-artifacts-v1.md). `cats-noded` does
 not derive registration identity from the development `CATS_NODE_ID`, hostname, address or Host kernel.
 
+The installer holds one `/run/lock/cats/worker-deployment.lock` descriptor from Node stop through every installed
+mutation, candidate registration-backed readiness and Guest release commit. An interrupted transaction restores
+the exact previous Guest set but deliberately leaves the Node stopped and its journal retained; rerun the full
+installer to replace every outer artifact and commit. The systemd startup gate does not treat a merely busy lock as
+authorization.
+
 This Agent-registration slice is not a standalone deployable release. The exact release
 commit must also contain the A20 signed Desired/observation HTTP routes, renew
 the current `AgentSession` only when a new observation is accepted, drive
