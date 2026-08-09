@@ -97,9 +97,6 @@ struct Args {
     ch_nbd_client: PathBuf,
     #[arg(long, default_value_t = 64)]
     ch_nbd_devices: u32,
-    /// Optional private /16 split into per-Cat /30 tap networks.
-    #[arg(long)]
-    ch_network_cidr: Option<String>,
     #[arg(long, default_value = "/usr/sbin/ip")]
     ch_ip_bin: PathBuf,
 }

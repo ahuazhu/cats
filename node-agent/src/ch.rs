@@ -34,6 +34,7 @@ use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
 
 use anyhow::{bail, Context, Result};
+use cats_api::runtime_reconciliation::{IsolatedIpv4Kind, NetworkConfig, RandomId128};
 
 use crate::proc::ProcHandle;
 
@@ -102,18 +103,17 @@ pub struct ChConfig {
     pub nbd_client_bin: PathBuf,
     /// How many /dev/nbdN devices exist (modprobe nbd nbds_max=...).
     pub nbd_devices: u32,
-    /// Optional private /16 used for per-Cat tap networks (for example
-    /// `10.240.0.0/16`). Host NAT is installed by the deployment scripts.
-    pub network_cidr: Option<String>,
     pub ip_bin: PathBuf,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct ChNetwork {
     pub tap: String,
-    pub mac: String,
-    pub host_ip: String,
-    pub guest_ip: String,
+    /// Host-physical fencing token. It is fresh and deliberately has no input
+    /// relationship to Cat or Network identity.
+    pub ownership_token: RandomId128,
+    /// Exact Desired authority consumed by this tap and VMM launch.
+    pub config: NetworkConfig,
 }
 
 /// Per-cat runtime state that only exists in CH mode.
@@ -131,48 +131,61 @@ pub struct ChRuntime {
     pub network: Option<ChNetwork>,
 }
 
-fn stable_hash(value: &str) -> u64 {
-    // FNV-1a: deterministic across processes and Rust releases, unlike
-    // DefaultHasher. The slot only controls local addressing, never identity.
-    let mut hash = 0xcbf29ce484222325_u64;
-    for byte in value.as_bytes() {
-        hash ^= u64::from(*byte);
-        hash = hash.wrapping_mul(0x100000001b3);
-    }
-    hash
+fn validate_desired_network(desired: &NetworkConfig) -> Result<()> {
+    anyhow::ensure!(
+        desired.kind == IsolatedIpv4Kind::IsolatedIpv4,
+        "Desired network kind is not isolated_ipv4"
+    );
+    anyhow::ensure!(
+        desired.prefix_length == 30,
+        "Desired isolated IPv4 prefix must be /30"
+    );
+    let guest: std::net::Ipv4Addr = desired
+        .guest_ipv4
+        .as_str()
+        .parse()
+        .context("Desired guest IPv4 is invalid")?;
+    let gateway: std::net::Ipv4Addr = desired
+        .gateway_ipv4
+        .as_str()
+        .parse()
+        .context("Desired gateway IPv4 is invalid")?;
+    let guest_bits = u32::from(guest);
+    let gateway_bits = u32::from(gateway);
+    anyhow::ensure!(
+        guest_bits & !3 == gateway_bits & !3 && guest_bits & 3 == 2 && gateway_bits & 3 == 1,
+        "Desired guest and gateway IPv4 do not name the host/guest pair of one /30"
+    );
+    let octets = guest.octets();
+    let expected_mac = format!(
+        "02:ca:{:02x}:{:02x}:{:02x}:{:02x}",
+        octets[0], octets[1], octets[2], octets[3]
+    );
+    anyhow::ensure!(
+        desired.guest_mac.as_str() == expected_mac,
+        "Desired guest MAC does not encode its exact guest IPv4"
+    );
+    Ok(())
 }
 
-fn network_for(cidr: &str, cat_id: &str) -> Result<ChNetwork> {
-    let (base, prefix) = cidr
-        .split_once('/')
-        .context("--ch-network-cidr must include /16")?;
-    anyhow::ensure!(prefix == "16", "--ch-network-cidr must be a /16");
-    let base: std::net::Ipv4Addr = base.parse().context("invalid --ch-network-cidr")?;
-    let octets = base.octets();
+fn bind_desired_network(
+    desired: &NetworkConfig,
+    tap: String,
+    ownership_token: RandomId128,
+) -> Result<ChNetwork> {
+    validate_desired_network(desired)?;
     anyhow::ensure!(
-        octets[2] == 0 && octets[3] == 0,
-        "--ch-network-cidr must be aligned to a /16"
+        (4..=15).contains(&tap.len())
+            && tap.starts_with("cat")
+            && tap
+                .bytes()
+                .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit()),
+        "Host tap name must be cat-prefixed lowercase ASCII within 15 bytes"
     );
-
-    let hash = stable_hash(cat_id);
-    // 16,383 non-overlapping /30s. Slot zero is intentionally unused.
-    let offset = ((hash % 16_383) + 1) as u16 * 4;
-    let third = (offset >> 8) as u8;
-    let fourth = (offset & 0xff) as u8;
-    let host_ip = format!("{}.{}.{}.{}/30", octets[0], octets[1], third, fourth + 1);
-    let guest_ip = format!("{}.{}.{}.{}/30", octets[0], octets[1], third, fourth + 2);
     Ok(ChNetwork {
-        tap: format!("cat{:011x}", hash & 0x7ff_ffff_ffff),
-        // The Guest's early cats-network service derives its address from
-        // these final two octets before Guest Agent readiness.
-        mac: format!(
-            "02:ca:{:02x}:{:02x}:{third:02x}:{:02x}",
-            octets[0],
-            octets[1],
-            fourth + 2
-        ),
-        host_ip,
-        guest_ip,
+        tap,
+        ownership_token,
+        config: desired.clone(),
     })
 }
 
@@ -191,14 +204,67 @@ fn ip_status(ip_bin: &Path, args: &[&str]) -> Result<()> {
     Ok(())
 }
 
-pub fn prepare_network(cfg: &ChConfig, cat_id: &str) -> Result<Option<ChNetwork>> {
-    let Some(cidr) = cfg.network_cidr.as_deref() else {
-        return Ok(None);
-    };
-    let network = network_for(cidr, cat_id)?;
-    let _ = Command::new(&cfg.ip_bin)
-        .args(["link", "delete", "dev", &network.tap])
-        .output();
+/// Produce the complete Host-physical tuple without touching Host state.
+/// The caller must durably checkpoint the return value before calling
+/// [`prepare_network`]. A checkpoint replay must reuse this exact value.
+pub fn plan_network(desired: &NetworkConfig) -> Result<ChNetwork> {
+    validate_desired_network(desired)?;
+    let random = uuid::Uuid::new_v4().simple().to_string();
+    bind_desired_network(
+        desired,
+        format!("cat{}", &random[..11]),
+        RandomId128::new(random).expect("UUID v4 is a nonzero RandomId128"),
+    )
+}
+
+fn network_alias(network: &ChNetwork) -> String {
+    format!(
+        "cats-network:{}:{}",
+        network.config.network_id, network.ownership_token
+    )
+}
+
+fn host_cidr(network: &ChNetwork) -> String {
+    format!(
+        "{}/{}",
+        network.config.gateway_ipv4.as_str(),
+        network.config.prefix_length
+    )
+}
+
+fn ipv4_cidrs(output: &[u8]) -> Vec<String> {
+    String::from_utf8_lossy(output)
+        .lines()
+        .filter_map(|line| {
+            let mut fields = line.split_ascii_whitespace();
+            fields.find(|field| *field == "inet")?;
+            fields.next().map(str::to_owned)
+        })
+        .collect()
+}
+
+/// Return false only when the exact tap name is absent. A present tap with a
+/// different/missing token is foreign residue and must fail closed.
+fn exact_network_exists(cfg: &ChConfig, network: &ChNetwork) -> Result<bool> {
+    let output = Command::new(&cfg.ip_bin)
+        .args(["-d", "link", "show", "dev", &network.tap])
+        .output()
+        .with_context(|| format!("inspect Host tap {}", network.tap))?;
+    if !output.status.success() {
+        return Ok(false);
+    }
+    let expected = network_alias(network);
+    anyhow::ensure!(
+        String::from_utf8_lossy(&output.stdout)
+            .split_ascii_whitespace()
+            .any(|field| field == expected),
+        "Host tap {} exists with a different or missing ownership token",
+        network.tap
+    );
+    Ok(true)
+}
+
+fn ensure_host_cidr_available(cfg: &ChConfig, host_cidr: &str) -> Result<()> {
     let addresses = Command::new(&cfg.ip_bin)
         .args(["-o", "-4", "addr", "show"])
         .output()
@@ -209,12 +275,59 @@ pub fn prepare_network(cfg: &ChConfig, cat_id: &str) -> Result<Option<ChNetwork>
         cfg.ip_bin.display(),
         String::from_utf8_lossy(&addresses.stderr).trim()
     );
-    let assigned = String::from_utf8_lossy(&addresses.stdout);
     anyhow::ensure!(
-        !assigned.contains(&format!("inet {}", network.host_ip)),
-        "Cat network address collision for {}",
-        network.host_ip
+        !ipv4_cidrs(&addresses.stdout)
+            .iter()
+            .any(|address| address == host_cidr),
+        "Cat network address collision for {host_cidr}"
     );
+    Ok(())
+}
+
+/// Create or adopt only the exact tuple that the caller already checkpointed.
+/// An existing same-token tap is completed idempotently; a same-name tap with
+/// any other token or address is rejected without mutation.
+pub fn prepare_network(cfg: &ChConfig, network: &ChNetwork) -> Result<()> {
+    let checked = bind_desired_network(
+        &network.config,
+        network.tap.clone(),
+        network.ownership_token.clone(),
+    )?;
+    anyhow::ensure!(
+        checked == *network,
+        "checkpointed Host network tuple is invalid"
+    );
+    let host_cidr = host_cidr(network);
+
+    if exact_network_exists(cfg, network)? {
+        let addresses = Command::new(&cfg.ip_bin)
+            .args(["-o", "-4", "addr", "show", "dev", &network.tap])
+            .output()
+            .with_context(|| format!("inspect IPv4 addresses on Host tap {}", network.tap))?;
+        anyhow::ensure!(
+            addresses.status.success(),
+            "inspect IPv4 addresses on Host tap {}: {}",
+            network.tap,
+            String::from_utf8_lossy(&addresses.stderr).trim()
+        );
+        let assigned = ipv4_cidrs(&addresses.stdout);
+        if assigned.is_empty() {
+            ensure_host_cidr_available(cfg, &host_cidr)?;
+            ip_status(
+                &cfg.ip_bin,
+                &["addr", "add", &host_cidr, "dev", &network.tap],
+            )?;
+        } else {
+            anyhow::ensure!(
+                assigned.len() == 1 && assigned[0] == host_cidr,
+                "Host tap {} has an address other than exact checkpointed {host_cidr}",
+                network.tap
+            );
+        }
+        return ip_status(&cfg.ip_bin, &["link", "set", "dev", &network.tap, "up"]);
+    }
+
+    ensure_host_cidr_available(cfg, &host_cidr)?;
     ip_status(
         &cfg.ip_bin,
         &["tuntap", "add", "dev", &network.tap, "mode", "tap"],
@@ -222,20 +335,36 @@ pub fn prepare_network(cfg: &ChConfig, cat_id: &str) -> Result<Option<ChNetwork>
     if let Err(error) = (|| {
         ip_status(
             &cfg.ip_bin,
-            &["addr", "add", &network.host_ip, "dev", &network.tap],
+            &[
+                "link",
+                "set",
+                "dev",
+                &network.tap,
+                "alias",
+                &network_alias(network),
+            ],
+        )?;
+        ip_status(
+            &cfg.ip_bin,
+            &["addr", "add", &host_cidr, "dev", &network.tap],
         )?;
         ip_status(&cfg.ip_bin, &["link", "set", "dev", &network.tap, "up"])
     })() {
-        remove_network(cfg, &network);
+        // This invocation just created the name, so deleting it is not an
+        // adoption decision and cannot remove a pre-existing foreign tap.
+        let _ = Command::new(&cfg.ip_bin)
+            .args(["link", "delete", "dev", &network.tap])
+            .output();
         return Err(error);
     }
-    Ok(Some(network))
+    Ok(())
 }
 
-pub fn remove_network(cfg: &ChConfig, network: &ChNetwork) {
-    let _ = Command::new(&cfg.ip_bin)
-        .args(["link", "delete", "dev", &network.tap])
-        .output();
+pub fn remove_network(cfg: &ChConfig, network: &ChNetwork) -> Result<()> {
+    if exact_network_exists(cfg, network)? {
+        ip_status(&cfg.ip_bin, &["link", "delete", "dev", &network.tap])?;
+    }
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------
@@ -854,8 +983,11 @@ pub fn spawn_vmm(s: &ChSpawn<'_>) -> Result<Child> {
             cmd.arg("--vsock")
                 .arg(format!("cid=3,socket={}", s.vsock_sock.display()));
             if let Some(network) = s.network {
-                cmd.arg("--net")
-                    .arg(format!("tap={},mac={}", network.tap, network.mac));
+                cmd.arg("--net").arg(format!(
+                    "tap={},mac={}",
+                    network.tap,
+                    network.config.guest_mac.as_str()
+                ));
             }
             cmd.arg("--disk").args(s.disks);
             cmd.arg("--serial")
@@ -1202,7 +1334,6 @@ mod tests {
             vhost_user_queue_size: 256,
             nbd_client_bin,
             nbd_devices,
-            network_cidr: None,
             ip_bin: PathBuf::from("ip"),
         }
     }
@@ -1374,7 +1505,6 @@ mod tests {
             vhost_user_queue_size: 256,
             nbd_client_bin: PathBuf::from("nbd-client"),
             nbd_devices: 8,
-            network_cidr: None,
             ip_bin: PathBuf::from("ip"),
         };
         // Cloud Hypervisor rejects num_queues > boot vCPUs, so a 1-vCPU Cat on a
@@ -1410,24 +1540,130 @@ mod tests {
         assert!(vhost_user_disk_arg(Path::new("/tmp/a,b.sock"), 1, 256).is_err());
     }
 
-    #[test]
-    fn cat_network_is_stable_and_encodes_guest_address_in_mac() {
-        let first = network_for("10.240.0.0/16", "cat_60e825c8c6cd").unwrap();
-        let second = network_for("10.240.0.0/16", "cat_60e825c8c6cd").unwrap();
-        assert_eq!(first, second);
-        assert!(first.tap.len() <= 15);
-        let ip = first.guest_ip.trim_end_matches("/30");
-        let octets: Vec<u8> = ip.split('.').map(|part| part.parse().unwrap()).collect();
-        assert!(first.mac.ends_with(&format!(
-            "{:02x}:{:02x}:{:02x}:{:02x}",
-            octets[0], octets[1], octets[2], octets[3]
-        )));
+    fn desired_network() -> NetworkConfig {
+        use cats_api::runtime_reconciliation::{Id, Ipv4Address, MacAddress};
+
+        NetworkConfig {
+            kind: IsolatedIpv4Kind::IsolatedIpv4,
+            network_id: Id::new("net_77777777777777777777777777777777").unwrap(),
+            guest_mac: MacAddress::new("02:ca:0a:f0:00:06").unwrap(),
+            guest_ipv4: Ipv4Address::new("10.240.0.6").unwrap(),
+            prefix_length: 30,
+            gateway_ipv4: Ipv4Address::new("10.240.0.5").unwrap(),
+        }
     }
 
     #[test]
-    fn cat_network_rejects_non_16_or_unaligned_cidr() {
-        assert!(network_for("10.240.0.0/24", "cat").is_err());
-        assert!(network_for("10.240.1.0/16", "cat").is_err());
+    fn exact_desired_network_is_retained_without_cat_or_cidr_derivation() {
+        use cats_api::runtime_reconciliation::{Ipv4Address, MacAddress};
+
+        let desired = desired_network();
+        let ownership = RandomId128::new("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa").unwrap();
+        let network =
+            bind_desired_network(&desired, "catphysical01".into(), ownership.clone()).unwrap();
+        assert_eq!(network.config, desired);
+        assert_eq!(network.ownership_token, ownership);
+        assert_eq!(network.tap, "catphysical01");
+
+        for changed in [
+            NetworkConfig {
+                prefix_length: 29,
+                ..desired.clone()
+            },
+            NetworkConfig {
+                gateway_ipv4: Ipv4Address::new("10.240.0.4").unwrap(),
+                ..desired.clone()
+            },
+            NetworkConfig {
+                guest_mac: MacAddress::new("02:ca:0a:f0:00:07").unwrap(),
+                ..desired.clone()
+            },
+        ] {
+            assert!(
+                bind_desired_network(&changed, "catphysical01".into(), ownership.clone()).is_err()
+            );
+        }
+
+        let first = plan_network(&desired).unwrap();
+        let second = plan_network(&desired).unwrap();
+        assert_eq!(first.config, desired);
+        assert_eq!(second.config, desired);
+        assert_ne!(first.ownership_token, second.ownership_token);
+        assert_ne!(first.tap, second.tap);
+    }
+
+    #[test]
+    fn checkpointed_network_plan_precedes_effect_and_replays_exact_token() {
+        let dir = tempfile::tempdir().unwrap();
+        let log = dir.path().join("ip.log");
+        let link = dir.path().join("link");
+        let alias = dir.path().join("alias");
+        let address = dir.path().join("address");
+        let fake_ip = dir.path().join("ip");
+        std::fs::write(
+            &fake_ip,
+            format!(
+                "#!/bin/sh\n\
+printf '%s\\n' \"$*\" >> '{log}'\n\
+if [ \"$1\" = '-d' ]; then\n\
+  if [ -f '{link}' ]; then printf '1: tap0 alias %s\\n' \"$(cat '{alias}' 2>/dev/null)\"; exit 0; fi\n\
+  exit 1\n\
+fi\n\
+if [ \"$1\" = '-o' ] && [ \"$5\" = 'dev' ]; then\n\
+  if [ -f '{address}' ]; then printf '1: tap0 inet %s scope global\\n' \"$(cat '{address}')\"; fi\n\
+  exit 0\n\
+fi\n\
+if [ \"$1\" = '-o' ]; then exit 0; fi\n\
+if [ \"$1\" = 'tuntap' ]; then : > '{link}'; exit 0; fi\n\
+if [ \"$1\" = 'link' ] && [ \"$2\" = 'set' ] && [ \"$5\" = 'alias' ]; then printf '%s' \"$6\" > '{alias}'; exit 0; fi\n\
+if [ \"$1\" = 'addr' ]; then printf '%s' \"$3\" > '{address}'; exit 0; fi\n\
+if [ \"$1\" = 'link' ] && [ \"$2\" = 'set' ]; then exit 0; fi\n\
+if [ \"$1\" = 'link' ] && [ \"$2\" = 'delete' ]; then rm -f '{link}' '{alias}' '{address}'; exit 0; fi\n\
+exit 97\n",
+                log = log.display(),
+                link = link.display(),
+                alias = alias.display(),
+                address = address.display(),
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&fake_ip, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        let planned = plan_network(&desired_network()).unwrap();
+        assert!(!log.exists(), "zero-effect plan unexpectedly executed ip");
+        let checkpoint = dir.path().join("network.json");
+        let mut file = File::create(&checkpoint).unwrap();
+        file.write_all(&serde_json::to_vec(&planned).unwrap())
+            .unwrap();
+        file.sync_all().unwrap();
+        assert!(!log.exists(), "durable checkpoint unexpectedly executed ip");
+        let replayed: ChNetwork =
+            serde_json::from_slice(&std::fs::read(checkpoint).unwrap()).unwrap();
+
+        let mut cfg = probe_config(dir.path().join("nbd-client"), 8);
+        cfg.ip_bin = fake_ip;
+        prepare_network(&cfg, &replayed).unwrap();
+        assert_eq!(std::fs::read_to_string(&address).unwrap(), "10.240.0.5/30");
+        assert_eq!(
+            std::fs::read_to_string(&alias).unwrap(),
+            network_alias(&replayed)
+        );
+
+        // Crash after the token-bearing tap exists but before its address is
+        // complete: the durable tuple is adopted and completed, not replanned.
+        std::fs::remove_file(&address).unwrap();
+        prepare_network(&cfg, &replayed).unwrap();
+        assert_eq!(std::fs::read_to_string(&address).unwrap(), "10.240.0.5/30");
+
+        let foreign = ChNetwork {
+            ownership_token: RandomId128::new("bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb").unwrap(),
+            ..replayed.clone()
+        };
+        assert!(prepare_network(&cfg, &foreign).is_err());
+        assert!(remove_network(&cfg, &foreign).is_err());
+        assert!(link.exists(), "foreign-token cleanup deleted the owned tap");
+        remove_network(&cfg, &replayed).unwrap();
+        assert!(!link.exists());
     }
 
     #[test]
@@ -1484,10 +1720,10 @@ mod tests {
             vhost_user_queue_size: 256,
             nbd_client_bin: PathBuf::from("nbd-client"),
             nbd_devices: 8,
-            network_cidr: None,
             ip_bin: PathBuf::from("ip"),
         };
         let serial = dir.path().join("serial.log");
+        let network = plan_network(&desired_network()).unwrap();
         let mut child = spawn_vmm(&ChSpawn {
             cfg: &cfg,
             api_sock: &dir.path().join("api.sock"),
@@ -1498,7 +1734,7 @@ mod tests {
             memory_file: Some(&memory_file),
             disks: &[],
             restore_from: None,
-            network: None,
+            network: Some(&network),
         })
         .unwrap();
         assert!(child.wait().unwrap().success());
@@ -1507,6 +1743,11 @@ mod tests {
         assert!(args.contains(&format!(
             "--memory-zone\nid=cat-ram,size=256M,file={},shared=on\n",
             memory_file.display()
+        )));
+        assert!(args.contains(&format!(
+            "--net\ntap={},mac={}\n",
+            network.tap,
+            network.config.guest_mac.as_str()
         )));
     }
 

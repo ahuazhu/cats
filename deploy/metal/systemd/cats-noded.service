@@ -27,7 +27,6 @@ ExecStart=/opt/cats/bin/cats-noded \
   --guest-agent-bin /opt/cats/bin/cats-guest-agent \
   --vmm ch \
   --ch-bin /usr/local/bin/cloud-hypervisor \
-  --ch-network-cidr $CATS_GUEST_NETWORK_CIDR \
   --ch-seed-image /opt/cats/guest/rootfs.ext4 \
   $CATS_BLOCK_PATH_ARGS \
   $CATS_METADATA_STORE_ARGS \

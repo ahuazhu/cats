@@ -38,7 +38,6 @@ ExecStart=/opt/cats/bin/cats-noded \
   --object-store-option prefix=cats \
   --vmm ch \
   --ch-bin /opt/cats/bin/cloud-hypervisor \
-  --ch-network-cidr $CATS_GUEST_NETWORK_CIDR \
   --ch-seed-image /opt/cats/guest/rootfs.ext4
 Restart=always
 RestartSec=2

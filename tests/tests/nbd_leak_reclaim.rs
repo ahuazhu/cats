@@ -61,7 +61,6 @@ fn config() -> Result<ChConfig> {
         nbd_devices: std::env::var("CATS_NBD_TEST_DEVICES")
             .unwrap_or_else(|_| "8".to_string())
             .parse()?,
-        network_cidr: None,
         ip_bin: PathBuf::from("/usr/sbin/ip"),
     })
 }

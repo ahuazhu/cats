@@ -468,9 +468,28 @@ mod tests {
                 ),
                 network: Some(ChNetwork {
                     tap: "cat00000000abc".into(),
-                    mac: "02:ca:0a:f0:00:06".into(),
-                    host_ip: "10.240.0.5/30".into(),
-                    guest_ip: "10.240.0.6/30".into(),
+                    ownership_token: cats_api::runtime_reconciliation::RandomId128::new(
+                        "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                    )
+                    .unwrap(),
+                    config: cats_api::runtime_reconciliation::NetworkConfig {
+                        kind: cats_api::runtime_reconciliation::IsolatedIpv4Kind::IsolatedIpv4,
+                        network_id: cats_api::runtime_reconciliation::Id::new("net_round_trip")
+                            .unwrap(),
+                        guest_mac: cats_api::runtime_reconciliation::MacAddress::new(
+                            "02:ca:0a:f0:00:06",
+                        )
+                        .unwrap(),
+                        guest_ipv4: cats_api::runtime_reconciliation::Ipv4Address::new(
+                            "10.240.0.6",
+                        )
+                        .unwrap(),
+                        prefix_length: 30,
+                        gateway_ipv4: cats_api::runtime_reconciliation::Ipv4Address::new(
+                            "10.240.0.5",
+                        )
+                        .unwrap(),
+                    },
                 }),
             }),
             metering: Some(MeteringRecord {

@@ -402,7 +402,6 @@ impl Soak {
                 nbd_devices: 64,
                 // No tap: storage/lifecycle control uses hybrid vsock. This
                 // prevents an experiment from sharing production NAT/routing.
-                network_cidr: None,
                 ip_bin: PathBuf::from("/usr/sbin/ip"),
             }),
         })?);

@@ -456,10 +456,14 @@ impl NodeRuntime {
             }
             let block_attach_us = block_attach_started.elapsed().as_micros();
             rt.ch = Some(chrt.clone());
-            if !warm_restore {
-                chrt.network = ch::prepare_network(chc, cat_id)?;
-                rt.ch = Some(chrt.clone());
-            }
+            // The signed Desired runner is the only production owner allowed
+            // to install `chrt.network`. Legacy NodeJob carries no
+            // NetworkConfig, so it must never manufacture one from Cat ID or
+            // local configuration at this point.
+            anyhow::ensure!(
+                chrt.network.is_some(),
+                "Cloud Hypervisor launch has no exact Desired NetworkConfig binding"
+            );
             // 3. VMM. Store the child in `rt` immediately so a failure in
             //    readiness/health still lets `teardown` kill it (no orphan
             //    holding the api socket).
@@ -710,7 +714,9 @@ impl NodeRuntime {
                 ch::nbd_detach(chc, dev);
             }
             if let Some(network) = &chrt.network {
-                ch::remove_network(chc, network);
+                if let Err(error) = ch::remove_network(chc, network) {
+                    tracing::warn!(tap = %network.tap, %error, "refused to remove a non-owned Host tap");
+                }
             }
         }
         let cat_dir = rt.dir.clone();
@@ -894,7 +900,6 @@ mod teardown_tests {
                 vhost_user_queue_size: 256,
                 nbd_client_bin: nbd_client,
                 nbd_devices: 8,
-                network_cidr: None,
                 ip_bin: PathBuf::from("unused-ip"),
             }),
         ))
