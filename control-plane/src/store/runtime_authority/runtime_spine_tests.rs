@@ -447,6 +447,545 @@ fn accepted<T>(outcome: RuntimeSpineOutcome<T>) -> T {
     }
 }
 
+pub(super) fn establish_empty_admission(
+    store: &Store,
+    release: &GuestRuntimeProfileReceipt,
+) -> super::runtime_spine::PlacementAdmissionSnapshot {
+    let identity = NodeIdentity {
+        version: ContractVersion::V1,
+        node_id: id("node_a"),
+        immutable_host_id: id("host_a"),
+        credential_id: id("credential_a"),
+        credential_binding: CredentialBinding::PublicKey {
+            public_key_spki_sha256: digest(9),
+        },
+        state_path_id: id("state_path_a"),
+        state: NodeIdentityState::Provisioned,
+    };
+    let authenticated = AuthenticatedNodeCredential::new(
+        identity.credential_id.clone(),
+        identity.credential_binding.clone(),
+    );
+    let policy =
+        AgentSessionRegistrationPolicy::from_release_receipt(release, Duration::from_secs(120))
+            .unwrap();
+    store.provision_node_identity(&identity).unwrap();
+    let attempt = registration_attempt(&identity, 1, None, policy.approved_guest_config_digest());
+    let session = registered(
+        store
+            .register_agent_session(&authenticated, &attempt, &policy)
+            .unwrap(),
+    );
+    accept_empty_admission(store, &identity, &authenticated, &policy, &session)
+}
+
+fn accept_empty_admission(
+    store: &Store,
+    identity: &NodeIdentity,
+    authenticated: &AuthenticatedNodeCredential,
+    policy: &AgentSessionRegistrationPolicy,
+    session: &AgentSession,
+) -> super::runtime_spine::PlacementAdmissionSnapshot {
+    let request = cats_api::runtime_reconciliation::DesiredReadRequest {
+        version: ContractVersion::V1,
+        session: binding(&session),
+        request_sequence: Sequence::new(1).unwrap(),
+    };
+    let snapshot = accepted(store.runtime_desired_read(authenticated, &request).unwrap());
+    let full = observation(
+        store,
+        session,
+        1,
+        1,
+        true,
+        Some(snapshot.read_position),
+        Vec::new(),
+    );
+    accepted(
+        store
+            .runtime_accept_observation(authenticated, &full)
+            .unwrap(),
+    );
+    match store
+        .load_placement_admission_snapshot(&identity.node_id, policy.approved_guest_config_digest())
+        .unwrap()
+    {
+        PlacementAdmissionLoad::Accepted(snapshot) => *snapshot,
+        PlacementAdmissionLoad::Rejected(rejection) => {
+            panic!("empty admission unexpectedly rejected: {rejection:?}")
+        }
+    }
+}
+
+fn bind_create_to_admission(
+    request: &mut super::product::CoveredCatCreateRequest,
+    admission: &super::runtime_spine::PlacementAdmissionSnapshot,
+    active_guest_digest: &Sha256Digest,
+) {
+    request.candidate.desired.placement.node_id = admission.node_identity.node_id.clone();
+    request.candidate.desired.runtime.guest_config_digest = active_guest_digest.clone();
+    super::product_tests::refresh_candidate_contract(request);
+}
+
+fn covered_error_code(error: super::product::CoveredCatCreateError) -> cats_api::error::ErrorCode {
+    match error {
+        super::product::CoveredCatCreateError::Store(error) => error.code,
+        super::product::CoveredCatCreateError::CandidateCollision(_) => {
+            cats_api::error::ErrorCode::Internal
+        }
+    }
+}
+
+#[test]
+fn stale_plan_is_ignored_only_for_a_closed_existing_name_conflict() {
+    let url = crate::testsupport::isolated_control_store_url();
+    let (store, identity, authenticated, policy, session) = fixture_at(&url);
+    let admission = accept_empty_admission(&store, &identity, &authenticated, &policy, &session);
+    let active_guest_digest = policy.approved_guest_config_digest().clone();
+    let workspace = super::product_tests::bootstrap_workspace(&store, "stale-plan-conflict");
+    let mut occupied = super::product_tests::request(&workspace, "occupied", 1, "occupy");
+    bind_create_to_admission(&mut occupied, &admission, &active_guest_digest);
+    assert_eq!(
+        store
+            .create_cat_covered_with_admission(&occupied, &admission, &active_guest_digest,)
+            .unwrap()
+            .http_status,
+        202
+    );
+
+    let replacement = registration_attempt(
+        &identity,
+        2,
+        Some(session.agent_session_epoch),
+        &active_guest_digest,
+    );
+    registered(
+        store
+            .register_agent_session(&authenticated, &replacement, &policy)
+            .unwrap(),
+    );
+
+    let mut conflict = super::product_tests::request(&workspace, "occupied", 2, "conflict");
+    bind_create_to_admission(&mut conflict, &admission, &active_guest_digest);
+    let result = store
+        .create_cat_covered_with_admission(&conflict, &admission, &active_guest_digest)
+        .unwrap();
+    assert_eq!(result.http_status, 409);
+    assert_eq!(
+        result.response_body,
+        br#"{"code":"already_exists","message":"cat name already exists"}"#
+    );
+    assert_eq!(
+        super::product_tests::counts(&store),
+        [1, 1, 1, 1, 1, 1, 1, 2]
+    );
+}
+
+#[test]
+fn free_name_revalidates_after_a_concurrent_session_replacement() {
+    const CREATE_APPLICATION: &str = "cats-f2d-create-admission-race";
+    let url = crate::testsupport::isolated_control_store_url();
+    let (store, identity, authenticated, policy, session) = fixture_at(&url);
+    let admission = accept_empty_admission(&store, &identity, &authenticated, &policy, &session);
+    let active_guest_digest = policy.approved_guest_config_digest().clone();
+    let workspace = super::product_tests::bootstrap_workspace(&store, "admission-race");
+    let mut create = super::product_tests::request(&workspace, "free", 1, "create");
+    bind_create_to_admission(&mut create, &admission, &active_guest_digest);
+
+    let mut blocker_client = postgres::Client::connect(&url, postgres::NoTls).unwrap();
+    let mut blocker = blocker_client.transaction().unwrap();
+    blocker
+        .query_one(
+            "SELECT node_id FROM current_agent_sessions WHERE node_id=$1 FOR UPDATE",
+            &[&identity.node_id.as_str()],
+        )
+        .unwrap();
+
+    // Calibrate the NOWAIT probe while only the session row is blocked: the
+    // independent NodeIdentity row must still be immediately lockable.
+    let mut probe = postgres::Client::connect(&url, postgres::NoTls).unwrap();
+    let mut calibration = probe.transaction().unwrap();
+    calibration
+        .query_one(
+            "SELECT node_id FROM node_identities WHERE node_id=$1 FOR UPDATE NOWAIT",
+            &[&identity.node_id.as_str()],
+        )
+        .unwrap();
+    calibration.rollback().unwrap();
+
+    let replacement_store = Store::connect(&url, None).unwrap();
+    let replacement_authenticated = authenticated.clone();
+    let replacement_policy = policy.clone();
+    let replacement = registration_attempt(
+        &identity,
+        2,
+        Some(session.agent_session_epoch),
+        &active_guest_digest,
+    );
+    let replacement_worker = std::thread::spawn(move || {
+        replacement_store.register_agent_session(
+            &replacement_authenticated,
+            &replacement,
+            &replacement_policy,
+        )
+    });
+
+    let mut identity_locked = false;
+    for _ in 0..200 {
+        let mut transaction = probe.transaction().unwrap();
+        match transaction.query_one(
+            "SELECT node_id FROM node_identities WHERE node_id=$1 FOR UPDATE NOWAIT",
+            &[&identity.node_id.as_str()],
+        ) {
+            Ok(_) => transaction.rollback().unwrap(),
+            Err(error) if error.code() == Some(&postgres::error::SqlState::LOCK_NOT_AVAILABLE) => {
+                identity_locked = true;
+                transaction.rollback().unwrap();
+                break;
+            }
+            Err(error) => panic!("NodeIdentity lock probe failed: {error}"),
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    assert!(
+        identity_locked,
+        "session replacement never acquired the NodeIdentity coordination lock"
+    );
+
+    let create_store = Store::connect(
+        &super::product_tests::with_application_name(&url, CREATE_APPLICATION),
+        None,
+    )
+    .unwrap();
+    let create_admission = admission.clone();
+    let create_digest = active_guest_digest.clone();
+    let create_worker = std::thread::spawn(move || {
+        create_store.create_cat_covered_with_admission(&create, &create_admission, &create_digest)
+    });
+
+    let observer = Store::connect(&url, None).unwrap();
+    let mut create_waiting = false;
+    for _ in 0..200 {
+        create_waiting = observer
+            .with(|client| {
+                client
+                    .query_one(
+                        "SELECT EXISTS (
+                            SELECT 1 FROM pg_stat_activity
+                             WHERE application_name=$1 AND wait_event_type='Lock'
+                        )",
+                        &[&CREATE_APPLICATION],
+                    )
+                    .map(|row| row.get(0))
+            })
+            .unwrap();
+        if create_waiting {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    assert!(create_waiting, "Cat create never waited on NodeIdentity");
+
+    blocker.commit().unwrap();
+    registered(replacement_worker.join().unwrap().unwrap());
+    let error = create_worker.join().unwrap().unwrap_err();
+    assert_eq!(
+        covered_error_code(error),
+        cats_api::error::ErrorCode::Unavailable
+    );
+    assert_eq!(
+        super::product_tests::counts(&observer),
+        [0, 0, 0, 0, 0, 0, 0, 0]
+    );
+}
+
+#[test]
+fn full_observation_committing_first_invalidates_an_empty_create_plan() {
+    const CREATE_APPLICATION: &str = "cats-f2d-create-after-observation";
+    let url = crate::testsupport::isolated_control_store_url();
+    let (store, identity, authenticated, policy, session) = fixture_at(&url);
+    let admission = accept_empty_admission(&store, &identity, &authenticated, &policy, &session);
+    let active_guest_digest = policy.approved_guest_config_digest().clone();
+    let next_read = cats_api::runtime_reconciliation::DesiredReadRequest {
+        version: ContractVersion::V1,
+        session: binding(&session),
+        request_sequence: Sequence::new(2).unwrap(),
+    };
+    let next_snapshot = accepted(
+        store
+            .runtime_desired_read(&authenticated, &next_read)
+            .unwrap(),
+    );
+    assert!(next_snapshot.desired_specs.is_empty());
+    let next_full = observation(
+        &store,
+        &session,
+        2,
+        2,
+        true,
+        Some(next_snapshot.read_position),
+        Vec::new(),
+    );
+    let workspace = super::product_tests::bootstrap_workspace(&store, "observation-first");
+    let mut create = super::product_tests::request(&workspace, "free", 1, "create");
+    bind_create_to_admission(&mut create, &admission, &active_guest_digest);
+
+    let mut blocker_client = postgres::Client::connect(&url, postgres::NoTls).unwrap();
+    let mut blocker = blocker_client.transaction().unwrap();
+    blocker
+        .query_one(
+            "SELECT node_id FROM current_agent_sessions WHERE node_id=$1 FOR UPDATE",
+            &[&identity.node_id.as_str()],
+        )
+        .unwrap();
+
+    let observation_store = Store::connect(&url, None).unwrap();
+    let observation_authenticated = authenticated.clone();
+    let observation_worker = std::thread::spawn(move || {
+        observation_store.runtime_accept_observation(&observation_authenticated, &next_full)
+    });
+
+    let mut probe = postgres::Client::connect(&url, postgres::NoTls).unwrap();
+    let mut identity_locked = false;
+    for _ in 0..200 {
+        let mut transaction = probe.transaction().unwrap();
+        match transaction.query_one(
+            "SELECT node_id FROM node_identities WHERE node_id=$1 FOR UPDATE NOWAIT",
+            &[&identity.node_id.as_str()],
+        ) {
+            Ok(_) => transaction.rollback().unwrap(),
+            Err(error) if error.code() == Some(&postgres::error::SqlState::LOCK_NOT_AVAILABLE) => {
+                identity_locked = true;
+                transaction.rollback().unwrap();
+                break;
+            }
+            Err(error) => panic!("NodeIdentity lock probe failed: {error}"),
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    assert!(
+        identity_locked,
+        "full observation never locked NodeIdentity"
+    );
+
+    let create_store = Store::connect(
+        &super::product_tests::with_application_name(&url, CREATE_APPLICATION),
+        None,
+    )
+    .unwrap();
+    let create_admission = admission.clone();
+    let create_digest = active_guest_digest.clone();
+    let create_worker = std::thread::spawn(move || {
+        create_store.create_cat_covered_with_admission(&create, &create_admission, &create_digest)
+    });
+    let observer = Store::connect(&url, None).unwrap();
+    let mut create_waiting = false;
+    for _ in 0..200 {
+        create_waiting = observer
+            .with(|client| {
+                client
+                    .query_one(
+                        "SELECT EXISTS (
+                            SELECT 1 FROM pg_stat_activity
+                             WHERE application_name=$1 AND wait_event_type='Lock'
+                        )",
+                        &[&CREATE_APPLICATION],
+                    )
+                    .map(|row| row.get(0))
+            })
+            .unwrap();
+        if create_waiting {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    assert!(create_waiting, "Cat create never waited on NodeIdentity");
+
+    blocker.commit().unwrap();
+    accepted(observation_worker.join().unwrap().unwrap());
+    let error = create_worker.join().unwrap().unwrap_err();
+    assert_eq!(
+        covered_error_code(error),
+        cats_api::error::ErrorCode::Unavailable
+    );
+    assert_eq!(
+        super::product_tests::counts(&observer),
+        [0, 0, 0, 0, 0, 0, 0, 0]
+    );
+}
+
+#[test]
+fn create_committing_first_makes_the_old_empty_cursor_fail_closed() {
+    const OBSERVATION_APPLICATION: &str = "cats-f2d-observation-after-create";
+    let url = crate::testsupport::isolated_control_store_url();
+    let (store, identity, authenticated, policy, session) = fixture_at(&url);
+    let admission = accept_empty_admission(&store, &identity, &authenticated, &policy, &session);
+    let active_guest_digest = policy.approved_guest_config_digest().clone();
+    let next_read = cats_api::runtime_reconciliation::DesiredReadRequest {
+        version: ContractVersion::V1,
+        session: binding(&session),
+        request_sequence: Sequence::new(2).unwrap(),
+    };
+    let empty_snapshot = accepted(
+        store
+            .runtime_desired_read(&authenticated, &next_read)
+            .unwrap(),
+    );
+    assert!(empty_snapshot.desired_specs.is_empty());
+    let old_empty_full = observation(
+        &store,
+        &session,
+        2,
+        2,
+        true,
+        Some(empty_snapshot.read_position),
+        Vec::new(),
+    );
+    let workspace = super::product_tests::bootstrap_workspace(&store, "create-first");
+    let mut create = super::product_tests::request(&workspace, "free", 1, "create");
+    bind_create_to_admission(&mut create, &admission, &active_guest_digest);
+
+    let mut blocker_client = postgres::Client::connect(&url, postgres::NoTls).unwrap();
+    let mut blocker = blocker_client.transaction().unwrap();
+    blocker
+        .query_one(
+            "SELECT pg_advisory_xact_lock(hashtextextended(
+                current_schema() || ':runtime-authority:' || 'volume' || ':' || $1,
+                0::BIGINT
+             ))",
+            &[&create.candidate.volume.volume_id.as_str()],
+        )
+        .unwrap();
+
+    let create_store = Store::connect(&url, None).unwrap();
+    let create_admission = admission.clone();
+    let create_digest = active_guest_digest.clone();
+    let create_worker = std::thread::spawn(move || {
+        create_store.create_cat_covered_with_admission(&create, &create_admission, &create_digest)
+    });
+
+    let mut probe = postgres::Client::connect(&url, postgres::NoTls).unwrap();
+    let mut identity_locked = false;
+    for _ in 0..200 {
+        let mut transaction = probe.transaction().unwrap();
+        match transaction.query_one(
+            "SELECT node_id FROM node_identities WHERE node_id=$1 FOR UPDATE NOWAIT",
+            &[&identity.node_id.as_str()],
+        ) {
+            Ok(_) => transaction.rollback().unwrap(),
+            Err(error) if error.code() == Some(&postgres::error::SqlState::LOCK_NOT_AVAILABLE) => {
+                identity_locked = true;
+                transaction.rollback().unwrap();
+                break;
+            }
+            Err(error) => panic!("NodeIdentity lock probe failed: {error}"),
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    assert!(identity_locked, "Cat create never locked NodeIdentity");
+
+    let observation_store = Store::connect(
+        &super::product_tests::with_application_name(&url, OBSERVATION_APPLICATION),
+        None,
+    )
+    .unwrap();
+    let observation_authenticated = authenticated.clone();
+    let observation_worker = std::thread::spawn(move || {
+        observation_store.runtime_accept_observation(&observation_authenticated, &old_empty_full)
+    });
+    let observer = Store::connect(&url, None).unwrap();
+    let mut observation_waiting = false;
+    for _ in 0..200 {
+        observation_waiting = observer
+            .with(|client| {
+                client
+                    .query_one(
+                        "SELECT EXISTS (
+                            SELECT 1 FROM pg_stat_activity
+                             WHERE application_name=$1 AND wait_event_type='Lock'
+                        )",
+                        &[&OBSERVATION_APPLICATION],
+                    )
+                    .map(|row| row.get(0))
+            })
+            .unwrap();
+        if observation_waiting {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    assert!(
+        observation_waiting,
+        "full observation never waited on NodeIdentity"
+    );
+
+    blocker.commit().unwrap();
+    assert_eq!(create_worker.join().unwrap().unwrap().http_status, 202);
+    let assigned_nodes: Vec<String> = observer
+        .with(|client| {
+            client
+                .query(
+                    "SELECT node_id FROM desired_runtime_specs ORDER BY cat_id",
+                    &[],
+                )
+                .map(|rows| rows.into_iter().map(|row| row.get(0)).collect())
+        })
+        .unwrap();
+    assert_eq!(assigned_nodes, vec![identity.node_id.to_string()]);
+    let observation_outcome = observation_worker.join().unwrap().unwrap();
+    assert!(
+        matches!(
+            &observation_outcome,
+            RuntimeSpineOutcome::Rejected(RuntimeSpineRejection::Contract(
+                cats_api::runtime_reconciliation::ContractError { error, .. }
+            )) if matches!(error.as_ref(), ContractErrorDetail::AssignedSetChanged { .. })
+        ),
+        "unexpected observation outcome: {observation_outcome:?}"
+    );
+    assert_eq!(
+        super::product_tests::counts(&observer),
+        [1, 1, 1, 1, 1, 1, 1, 1]
+    );
+}
+
+#[test]
+fn free_name_rejects_candidate_plan_binding_drift_without_writes() {
+    let url = crate::testsupport::isolated_control_store_url();
+    let (store, identity, authenticated, policy, session) = fixture_at(&url);
+    let admission = accept_empty_admission(&store, &identity, &authenticated, &policy, &session);
+    let active_guest_digest = policy.approved_guest_config_digest().clone();
+    let workspace = super::product_tests::bootstrap_workspace(&store, "candidate-binding");
+
+    let mut wrong_node = super::product_tests::request(&workspace, "wrong-node", 1, "wrong-node");
+    bind_create_to_admission(&mut wrong_node, &admission, &active_guest_digest);
+    wrong_node.candidate.desired.placement.node_id = id("different_node");
+    super::product_tests::refresh_candidate_contract(&mut wrong_node);
+    let error = store
+        .create_cat_covered_with_admission(&wrong_node, &admission, &active_guest_digest)
+        .unwrap_err();
+    assert_eq!(
+        covered_error_code(error),
+        cats_api::error::ErrorCode::Internal
+    );
+
+    let mut wrong_digest =
+        super::product_tests::request(&workspace, "wrong-digest", 2, "wrong-digest");
+    bind_create_to_admission(&mut wrong_digest, &admission, &active_guest_digest);
+    wrong_digest.candidate.desired.runtime.guest_config_digest = digest(77);
+    super::product_tests::refresh_candidate_contract(&mut wrong_digest);
+    let error = store
+        .create_cat_covered_with_admission(&wrong_digest, &admission, &active_guest_digest)
+        .unwrap_err();
+    assert_eq!(
+        covered_error_code(error),
+        cats_api::error::ErrorCode::Internal
+    );
+    assert_eq!(
+        super::product_tests::counts(&store),
+        [0, 0, 0, 0, 0, 0, 0, 0]
+    );
+}
+
 #[test]
 fn provisioned_node_id_pages_are_bounded_and_tolerate_a_concurrent_retire() {
     let url = crate::testsupport::isolated_control_store_url();

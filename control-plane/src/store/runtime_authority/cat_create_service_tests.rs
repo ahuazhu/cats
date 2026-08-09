@@ -3,12 +3,10 @@ use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
 use cats_api::runtime_reconciliation::{
-    decode_desired_runtime_spec, guest_config_digest, inventory_digest,
-    AdmissionInventoryAttestation, AgentSession, AsciiText, AssignedKind, ContractVersion,
-    CredentialBinding, DiskKind, Durability, Epoch, GuestRuntimeProfileReceipt, Id, Ipv4Address,
-    MacAddress, NetworkConfig, NodeBootId, NodeIdentity, NodeIdentityState, NodeObservation,
-    RandomId128, RuntimeTarget, RuntimeTransition, Sequence, Sha256Digest, UnixMillis,
-    VolumeAccess, VolumeAcquire, VolumeDisposition,
+    decode_desired_runtime_spec, guest_config_digest, AsciiText, AssignedKind, ContractVersion,
+    DiskKind, Durability, GuestRuntimeProfileReceipt, Id, Ipv4Address, MacAddress, NetworkConfig,
+    NodeIdentityState, RandomId128, RuntimeTarget, RuntimeTransition, Sha256Digest, VolumeAccess,
+    VolumeAcquire, VolumeDisposition,
 };
 
 use super::cat_create_service::{
@@ -247,6 +245,7 @@ struct FakePlanner {
     last_request: Mutex<Option<CatCreatePlanRequest>>,
     replace_network_id: bool,
     retire_node: bool,
+    admission: Mutex<PlacementAdmissionSnapshot>,
 }
 
 impl CatCreatePlacementPlanner for FakePlanner {
@@ -258,73 +257,16 @@ impl CatCreatePlacementPlanner for FakePlanner {
         } else {
             request.network_id.clone()
         };
-        let guest_config_digest = request.guest_config_digest.clone();
         let node_state = if self.retire_node {
             NodeIdentityState::Retired
         } else {
             NodeIdentityState::Provisioned
         };
+        let mut admission = self.admission.lock().unwrap().clone();
+        admission.node_identity.state = node_state;
         Box::pin(async move {
-            let session = AgentSession {
-                version: ContractVersion::V1,
-                node_id: id("node_a"),
-                immutable_host_id: id("host_a"),
-                node_boot_id: NodeBootId::new("11111111111111111111111111111111").unwrap(),
-                agent_instance_id: RandomId128::new("22222222222222222222222222222222").unwrap(),
-                agent_session_epoch: Epoch::new(1).unwrap(),
-                registration_attempt_id: RandomId128::new("33333333333333333333333333333333")
-                    .unwrap(),
-                guest_config_digest,
-                lease_deadline_unix_ms: UnixMillis::new(10_000).unwrap(),
-            };
-            let mut full = NodeObservation {
-                version: ContractVersion::V1,
-                observation_id: RandomId128::new("44444444444444444444444444444444").unwrap(),
-                node_id: session.node_id.clone(),
-                node_boot_id: session.node_boot_id.clone(),
-                agent_instance_id: session.agent_instance_id.clone(),
-                agent_session_epoch: session.agent_session_epoch,
-                heartbeat_sequence: Sequence::new(1).unwrap(),
-                observed_at_unix_ms: UnixMillis::new(1).unwrap(),
-                complete_inventory: true,
-                inventory_epoch: Epoch::new(1).unwrap(),
-                inventory_digest: Some(Sha256Digest::from_bytes([0; 32])),
-                inventory_read_position: Some(Sequence::new(1).unwrap()),
-                key_ring_version: None,
-                key_ring_digest: None,
-                loaded_kids: Vec::new(),
-                runtimes: Vec::new(),
-                residue: Vec::new(),
-            };
-            full.inventory_digest = Some(inventory_digest(&full).unwrap());
-            let attestation = AdmissionInventoryAttestation {
-                version: ContractVersion::V1,
-                node_id: id("node_a"),
-                agent_session_epoch: Epoch::new(1).unwrap(),
-                inventory_epoch: Epoch::new(1).unwrap(),
-                inventory_digest: full.inventory_digest.clone().unwrap(),
-                inventory_read_position: Sequence::new(1).unwrap(),
-                accepted_at_unix_ms: UnixMillis::new(1).unwrap(),
-            };
             Ok(CatCreatePlan {
-                admission: PlacementAdmissionSnapshot {
-                    evaluated_at_unix_ms: UnixMillis::new(2).unwrap(),
-                    node_identity: NodeIdentity {
-                        version: ContractVersion::V1,
-                        node_id: id("node_a"),
-                        immutable_host_id: id("host_a"),
-                        credential_id: id("credential_a"),
-                        credential_binding: CredentialBinding::PublicKey {
-                            public_key_spki_sha256: Sha256Digest::from_bytes([5; 32]),
-                        },
-                        state_path_id: id("state_path_a"),
-                        state: node_state,
-                    },
-                    agent_session: session,
-                    inventory_attestation: attestation,
-                    full_inventory_observation: full,
-                    assigned_desired_specs: Vec::new(),
-                },
+                admission,
                 network_config: NetworkConfig {
                     kind: cats_api::runtime_reconciliation::IsolatedIpv4Kind::IsolatedIpv4,
                     network_id,
@@ -389,6 +331,8 @@ fn service_fixture(
     let url = crate::testsupport::isolated_control_store_url();
     let store = Arc::new(Store::connect(&url, None).unwrap());
     let workspace = bootstrap_workspace(&store, slug);
+    let release = release_receipt();
+    let admission = super::runtime_spine_tests::establish_empty_admission(store.as_ref(), &release);
     let manifests = Arc::new(FakeManifestResolver {
         calls: AtomicUsize::new(0),
         size_bytes: 1,
@@ -398,6 +342,7 @@ fn service_fixture(
         last_request: Mutex::new(None),
         replace_network_id: false,
         retire_node: false,
+        admission: Mutex::new(admission),
     });
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
@@ -408,7 +353,7 @@ fn service_fixture(
         manifests.clone(),
         planner.clone(),
         Arc::new(SequentialIdentities::default()),
-        &release_receipt(),
+        &release,
     )
     .unwrap();
     (runtime, store, workspace, manifests, planner, service)
@@ -609,8 +554,9 @@ fn service_rounds_root_size_to_the_chunk_boundary() {
 
 #[test]
 fn invalid_manifest_or_planner_binding_has_no_store_side_effect() {
-    let (runtime, store, workspace, _manifests, _planner, _service) =
+    let (runtime, store, workspace, _manifests, base_planner, _service) =
         service_fixture("f2c-invalid");
+    let admission = base_planner.admission.lock().unwrap().clone();
     let oversized = Arc::new(FakeManifestResolver {
         calls: AtomicUsize::new(0),
         size_bytes: 8_388_608,
@@ -620,6 +566,7 @@ fn invalid_manifest_or_planner_binding_has_no_store_side_effect() {
         last_request: Mutex::new(None),
         replace_network_id: false,
         retire_node: false,
+        admission: Mutex::new(admission.clone()),
     });
     let service = CatCreateService::new(
         store.clone(),
@@ -639,6 +586,7 @@ fn invalid_manifest_or_planner_binding_has_no_store_side_effect() {
         last_request: Mutex::new(None),
         replace_network_id: true,
         retire_node: false,
+        admission: Mutex::new(admission.clone()),
     });
     let service = CatCreateService::new(
         store.clone(),
@@ -660,6 +608,7 @@ fn invalid_manifest_or_planner_binding_has_no_store_side_effect() {
         last_request: Mutex::new(None),
         replace_network_id: false,
         retire_node: true,
+        admission: Mutex::new(admission),
     });
     let service = CatCreateService::new(
         store.clone(),

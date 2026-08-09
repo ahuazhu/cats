@@ -104,7 +104,7 @@ fn persistent_disk(
     }
 }
 
-fn bootstrap_workspace(store: &Store, slug: &str) -> Id {
+pub(super) fn bootstrap_workspace(store: &Store, slug: &str) -> Id {
     store
         .ensure_configured_accounts(&BTreeMap::from([(slug.to_owned(), format!("org_{slug}"))]))
         .unwrap();
@@ -130,12 +130,12 @@ fn stores() -> (String, Store, Store, Id) {
     (url, first, second, workspace)
 }
 
-fn with_application_name(url: &str, application_name: &str) -> String {
+pub(super) fn with_application_name(url: &str, application_name: &str) -> String {
     let separator = if url.contains('?') { '&' } else { '?' };
     format!("{url}{separator}application_name={application_name}")
 }
 
-fn request(
+pub(super) fn request(
     workspace: &Id,
     name: &str,
     sequence: u64,
@@ -286,7 +286,7 @@ fn request(
     }
 }
 
-fn counts(store: &Store) -> [i64; 8] {
+pub(super) fn counts(store: &Store) -> [i64; 8] {
     store
         .with(|client| {
             client
@@ -318,7 +318,7 @@ fn counts(store: &Store) -> [i64; 8] {
         .unwrap()
 }
 
-fn refresh_candidate_contract(request: &mut CoveredCatCreateRequest) {
+pub(super) fn refresh_candidate_contract(request: &mut CoveredCatCreateRequest) {
     request.candidate.desired.spec_digest = spec_digest(&request.candidate.desired).unwrap();
     let accepted = ExactHttpResponse::new(
         202,
@@ -586,7 +586,9 @@ fn assert_invalid_bundle_writes_nothing(
     request: &CoveredCatCreateRequest,
     label: &str,
 ) {
-    let error = store.create_cat_covered(request).unwrap_err();
+    let error = store
+        .create_cat_covered_without_admission_for_product_test(request)
+        .unwrap_err();
     assert_eq!(error_code(error), ErrorCode::Internal, "{label}");
     assert_eq!(candidate_row_count(store, request), 0, "{label}");
     assert_eq!(failed_request_artifact_count(store, request), 0, "{label}");
@@ -829,7 +831,9 @@ fn first_create_and_lost_response_replay_are_exact_and_atomic() {
         .cat_create_result_fast_lookup(&request.idempotency)
         .unwrap()
         .is_none());
-    let first = store.create_cat_covered(&request).unwrap();
+    let first = store
+        .create_cat_covered_without_admission_for_product_test(&request)
+        .unwrap();
     assert_eq!(first.http_status, 202);
     assert_eq!(counts(&store), [1, 1, 1, 1, 1, 1, 1, 1]);
     assert_eq!(
@@ -846,7 +850,9 @@ fn first_create_and_lost_response_replay_are_exact_and_atomic() {
         .locate_hostname_desired(&Hostname::new("absent.cats.run").unwrap())
         .unwrap()
         .is_none());
-    let replay = store.create_cat_covered(&request).unwrap();
+    let replay = store
+        .create_cat_covered_without_admission_for_product_test(&request)
+        .unwrap();
     assert_eq!(replay, first);
     assert_eq!(
         store
@@ -905,7 +911,12 @@ fn first_create_and_lost_response_replay_are_exact_and_atomic() {
 
     delete_created_bundle(&store, &request);
     assert_eq!(counts(&store), [0, 0, 0, 0, 0, 0, 0, 1]);
-    assert_eq!(store.create_cat_covered(&request).unwrap(), first);
+    assert_eq!(
+        store
+            .create_cat_covered_without_admission_for_product_test(&request)
+            .unwrap(),
+        first
+    );
     assert_eq!(counts(&store), [0, 0, 0, 0, 0, 0, 0, 1]);
 }
 
@@ -913,10 +924,14 @@ fn first_create_and_lost_response_replay_are_exact_and_atomic() {
 fn same_key_different_fingerprint_conflicts_before_candidate_reads() {
     let (_url, store, _second, workspace) = stores();
     let first = request(&workspace, "demo", 1, "same-key");
-    store.create_cat_covered(&first).unwrap();
+    store
+        .create_cat_covered_without_admission_for_product_test(&first)
+        .unwrap();
     let mut changed = request(&workspace, "different", 2, "same-key");
     changed.idempotency.request_fingerprint = Sha256Digest::from_bytes([9; 32]);
-    let error = store.create_cat_covered(&changed).unwrap_err();
+    let error = store
+        .create_cat_covered_without_admission_for_product_test(&changed)
+        .unwrap_err();
     assert_eq!(error_code(error), ErrorCode::Conflict);
     assert_eq!(counts(&store), [1, 1, 1, 1, 1, 1, 1, 1]);
 }
@@ -939,9 +954,27 @@ fn idempotency_scope_isolated_by_workspace_and_canonical_route() {
     )
     .unwrap();
 
-    assert_eq!(store.create_cat_covered(&first).unwrap().http_status, 202);
-    assert_eq!(store.create_cat_covered(&second).unwrap().http_status, 202);
-    assert_eq!(store.create_cat_covered(&third).unwrap().http_status, 202);
+    assert_eq!(
+        store
+            .create_cat_covered_without_admission_for_product_test(&first)
+            .unwrap()
+            .http_status,
+        202
+    );
+    assert_eq!(
+        store
+            .create_cat_covered_without_admission_for_product_test(&second)
+            .unwrap()
+            .http_status,
+        202
+    );
+    assert_eq!(
+        store
+            .create_cat_covered_without_admission_for_product_test(&third)
+            .unwrap()
+            .http_status,
+        202
+    );
     assert_eq!(counts(&store), [3, 3, 3, 3, 3, 3, 3, 3]);
 }
 
@@ -967,11 +1000,11 @@ fn fast_miss_same_key_race_commits_only_one_candidate_bundle() {
     let second_barrier = Arc::clone(&barrier);
     let first_worker = std::thread::spawn(move || {
         first_barrier.wait();
-        first.create_cat_covered(&first_request)
+        first.create_cat_covered_without_admission_for_product_test(&first_request)
     });
     let second_worker = std::thread::spawn(move || {
         second_barrier.wait();
-        second.create_cat_covered(&second_request)
+        second.create_cat_covered_without_admission_for_product_test(&second_request)
     });
     barrier.wait();
     let first_result = first_worker.join().unwrap().unwrap();
@@ -998,7 +1031,9 @@ fn fast_miss_same_key_race_commits_only_one_candidate_bundle() {
 fn every_persisted_candidate_identity_collision_is_typed_and_rolls_back() {
     let (_url, store, _second, workspace) = stores();
     let original = request(&workspace, "original", 1, "original-key");
-    store.create_cat_covered(&original).unwrap();
+    store
+        .create_cat_covered_without_admission_for_product_test(&original)
+        .unwrap();
 
     let mut cat_collision = request(&workspace, "new-cat-name", 2, "cat-collision");
     cat_collision.candidate.cat_id = original.candidate.cat_id.clone();
@@ -1055,7 +1090,9 @@ fn every_persisted_candidate_identity_collision_is_typed_and_rolls_back() {
         (&endpoint_collision, CandidateCollision::EndpointIdOrName),
         (&operation_collision, CandidateCollision::OperationId),
     ] {
-        let error = store.create_cat_covered(request).unwrap_err();
+        let error = store
+            .create_cat_covered_without_admission_for_product_test(request)
+            .unwrap_err();
         assert!(matches!(
             error,
             CoveredCatCreateError::CandidateCollision(kind) if kind == expected
@@ -1070,7 +1107,9 @@ fn hostname_is_globally_unique_within_and_across_workspaces() {
     let (_url, store, _second, workspace) = stores();
     let other_workspace = bootstrap_workspace(&store, "hostname-other");
     let original = request(&workspace, "original", 1, "original-key");
-    store.create_cat_covered(&original).unwrap();
+    store
+        .create_cat_covered_without_admission_for_product_test(&original)
+        .unwrap();
 
     let same_workspace = request(&workspace, "same-workspace", 2, "same-workspace-key");
     let occupied_hostname = same_workspace.candidate.hostname_lookup.hostname.clone();
@@ -1093,7 +1132,9 @@ fn hostname_is_globally_unique_within_and_across_workspaces() {
 
     for candidate in [&same_workspace, &cross_workspace] {
         assert!(matches!(
-            store.create_cat_covered(candidate).unwrap_err(),
+            store
+                .create_cat_covered_without_admission_for_product_test(candidate)
+                .unwrap_err(),
             CoveredCatCreateError::CandidateCollision(CandidateCollision::Hostname)
         ));
         assert_eq!(failed_request_artifact_count(&store, candidate), 0);
@@ -1124,7 +1165,9 @@ fn root_disk_generated_name_collision_with_persistent_disk_is_typed_and_rolls_ba
         })
         .unwrap();
 
-    let error = store.create_cat_covered(&create).unwrap_err();
+    let error = store
+        .create_cat_covered_without_admission_for_product_test(&create)
+        .unwrap_err();
     assert!(matches!(
         error,
         CoveredCatCreateError::CandidateCollision(CandidateCollision::DiskIdOrName)
@@ -1138,7 +1181,9 @@ fn root_disk_generated_name_collision_with_persistent_disk_is_typed_and_rolls_ba
 fn corrupt_collision_row_is_not_reported_as_retryable_candidate_collision() {
     let (_url, store, _second, workspace) = stores();
     let original = request(&workspace, "original", 1, "original-key");
-    store.create_cat_covered(&original).unwrap();
+    store
+        .create_cat_covered_without_admission_for_product_test(&original)
+        .unwrap();
     store
         .with(|client| {
             client
@@ -1161,7 +1206,9 @@ fn corrupt_collision_row_is_not_reported_as_retryable_candidate_collision() {
     };
     refresh_candidate_contract(&mut collision);
 
-    let error = store.create_cat_covered(&collision).unwrap_err();
+    let error = store
+        .create_cat_covered_without_admission_for_product_test(&collision)
+        .unwrap_err();
     assert!(matches!(error, CoveredCatCreateError::Store(_)));
     assert_eq!(failed_request_artifact_count(&store, &collision), 0);
     assert_eq!(counts(&store), [1, 1, 1, 1, 1, 1, 1, 1]);
@@ -1179,11 +1226,11 @@ fn two_keys_same_name_commit_one_bundle_and_one_durable_409() {
     let second_barrier = Arc::clone(&barrier);
     let first_worker = std::thread::spawn(move || {
         first_barrier.wait();
-        first.create_cat_covered(&first_request)
+        first.create_cat_covered_without_admission_for_product_test(&first_request)
     });
     let second_worker = std::thread::spawn(move || {
         second_barrier.wait();
-        second.create_cat_covered(&second_request)
+        second.create_cat_covered_without_admission_for_product_test(&second_request)
     });
     barrier.wait();
     let first_result = first_worker.join().unwrap().unwrap();
@@ -1200,7 +1247,12 @@ fn two_keys_same_name_commit_one_bundle_and_one_durable_409() {
         (&saved_second, &saved_first, first_result)
     };
     delete_created_bundle(&observer, winner);
-    assert_eq!(observer.create_cat_covered(loser).unwrap(), loser_result);
+    assert_eq!(
+        observer
+            .create_cat_covered_without_admission_for_product_test(loser)
+            .unwrap(),
+        loser_result
+    );
     assert_eq!(counts(&observer), [0, 0, 0, 0, 0, 0, 0, 2]);
 }
 
@@ -1208,7 +1260,9 @@ fn two_keys_same_name_commit_one_bundle_and_one_durable_409() {
 fn removed_default_endpoint_with_no_lookup_remains_a_durable_name_conflict() {
     let (_url, store, _second, workspace) = stores();
     let original = request(&workspace, "demo", 1, "original");
-    store.create_cat_covered(&original).unwrap();
+    store
+        .create_cat_covered_without_admission_for_product_test(&original)
+        .unwrap();
     advance_current_endpoints(&store, &original, None, id("op_without_endpoints"));
 
     assert!(store
@@ -1216,9 +1270,16 @@ fn removed_default_endpoint_with_no_lookup_remains_a_durable_name_conflict() {
         .unwrap()
         .is_none());
     let conflict = request(&workspace, "demo", 2, "after-endpoint-removal");
-    let first = store.create_cat_covered(&conflict).unwrap();
+    let first = store
+        .create_cat_covered_without_admission_for_product_test(&conflict)
+        .unwrap();
     assert_eq!(first.http_status, 409);
-    assert_eq!(store.create_cat_covered(&conflict).unwrap(), first);
+    assert_eq!(
+        store
+            .create_cat_covered_without_admission_for_product_test(&conflict)
+            .unwrap(),
+        first
+    );
     assert_eq!(counts(&store), [1, 1, 1, 1, 1, 0, 2, 2]);
 }
 
@@ -1226,7 +1287,9 @@ fn removed_default_endpoint_with_no_lookup_remains_a_durable_name_conflict() {
 fn non_default_current_binding_is_closed_and_corruption_is_not_cached_as_409() {
     let (_url, store, _second, workspace) = stores();
     let original = request(&workspace, "demo", 1, "original");
-    store.create_cat_covered(&original).unwrap();
+    store
+        .create_cat_covered_without_admission_for_product_test(&original)
+        .unwrap();
     let replacement_hostname =
         Hostname::new("api-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa.cats.run").unwrap();
     let mut current = advance_current_endpoints(
@@ -1243,7 +1306,7 @@ fn non_default_current_binding_is_closed_and_corruption_is_not_cached_as_409() {
     let valid_conflict = request(&workspace, "demo", 2, "valid-non-default");
     assert_eq!(
         store
-            .create_cat_covered(&valid_conflict)
+            .create_cat_covered_without_admission_for_product_test(&valid_conflict)
             .unwrap()
             .http_status,
         409
@@ -1260,7 +1323,9 @@ fn non_default_current_binding_is_closed_and_corruption_is_not_cached_as_409() {
     assert_eq!(lookup_error.code, ErrorCode::Internal);
 
     let corrupt_conflict = request(&workspace, "demo", 3, "corrupt-non-default");
-    let error = store.create_cat_covered(&corrupt_conflict).unwrap_err();
+    let error = store
+        .create_cat_covered_without_admission_for_product_test(&corrupt_conflict)
+        .unwrap_err();
     assert_eq!(error_code(error), ErrorCode::Internal);
     assert_eq!(counts(&store), [1, 1, 1, 1, 2, 1, 2, 2]);
 }
@@ -1269,7 +1334,9 @@ fn non_default_current_binding_is_closed_and_corruption_is_not_cached_as_409() {
 fn residual_lookup_outside_current_desired_fails_closed_without_a_409() {
     let (_url, store, _second, workspace) = stores();
     let original = request(&workspace, "demo", 1, "original");
-    store.create_cat_covered(&original).unwrap();
+    store
+        .create_cat_covered_without_admission_for_product_test(&original)
+        .unwrap();
     let mut corrupt = original.candidate.desired.clone();
     corrupt.endpoints.clear();
     corrupt.spec_digest = Sha256Digest::from_bytes([0; 32]);
@@ -1277,7 +1344,9 @@ fn residual_lookup_outside_current_desired_fails_closed_without_a_409() {
     rewrite_current_desired_and_operation(&store, &corrupt, None);
 
     let conflict = request(&workspace, "demo", 2, "residual-lookup");
-    let error = store.create_cat_covered(&conflict).unwrap_err();
+    let error = store
+        .create_cat_covered_without_admission_for_product_test(&conflict)
+        .unwrap_err();
     assert_eq!(error_code(error), ErrorCode::Internal);
     assert_eq!(counts(&store), [1, 1, 1, 1, 1, 1, 1, 1]);
 }
@@ -1325,7 +1394,9 @@ fn invalid_response_bytes_and_cross_workspace_bundle_write_nothing() {
     let other_workspace = bootstrap_workspace(&store, "other");
     let mut cross_workspace = request(&other_workspace, "demo", 1, "cross-workspace");
     cross_workspace.idempotency.authenticated_workspace_id = workspace;
-    let error = store.create_cat_covered(&cross_workspace).unwrap_err();
+    let error = store
+        .create_cat_covered_without_admission_for_product_test(&cross_workspace)
+        .unwrap_err();
     assert_eq!(error_code(error), ErrorCode::Internal);
     assert_eq!(counts(&store), [0, 0, 0, 0, 0, 0, 0, 0]);
 }
@@ -1559,11 +1630,15 @@ fn every_query_projection_drift_fails_closed_without_a_409_result() {
     ] {
         let (_url, store, _second, workspace) = stores();
         let original = request(&workspace, "demo", 1, "original");
-        store.create_cat_covered(&original).unwrap();
+        store
+            .create_cat_covered_without_admission_for_product_test(&original)
+            .unwrap();
         store.with(|client| client.batch_execute(mutation)).unwrap();
 
         let conflict = request(&workspace, "demo", 2, "would-conflict");
-        let error = store.create_cat_covered(&conflict).unwrap_err();
+        let error = store
+            .create_cat_covered_without_admission_for_product_test(&conflict)
+            .unwrap_err();
         assert_eq!(error_code(error), ErrorCode::Internal, "table {table}");
         assert_eq!(counts(&store), [1, 1, 1, 1, 1, 1, 1, 1], "table {table}");
     }
@@ -1574,7 +1649,9 @@ fn self_consistent_illegal_root_identity_or_timestamp_never_becomes_a_409() {
     for drift in ["Root name", "created timestamp"] {
         let (url, store, _second, workspace) = stores();
         let original = request(&workspace, "demo", 1, "original");
-        store.create_cat_covered(&original).unwrap();
+        store
+            .create_cat_covered_without_admission_for_product_test(&original)
+            .unwrap();
         let mut raw_client = postgres::Client::connect(&url, postgres::NoTls).unwrap();
         let changed = if drift == "Root name" {
             let ddl_error = raw_client
@@ -1637,7 +1714,9 @@ fn self_consistent_illegal_root_identity_or_timestamp_never_becomes_a_409() {
         assert_eq!(changed, 1, "{drift}");
 
         let conflict = request(&workspace, "demo", 2, "would-conflict");
-        let error = store.create_cat_covered(&conflict).unwrap_err();
+        let error = store
+            .create_cat_covered_without_admission_for_product_test(&conflict)
+            .unwrap_err();
         assert_eq!(error_code(error), ErrorCode::Internal, "{drift}");
         assert_eq!(counts(&store), [1, 1, 1, 1, 1, 1, 1, 1], "{drift}");
     }
@@ -1647,7 +1726,9 @@ fn self_consistent_illegal_root_identity_or_timestamp_never_becomes_a_409() {
 fn self_valid_rows_with_a_missing_operation_are_not_a_name_conflict() {
     let (_url, store, _second, workspace) = stores();
     let original = request(&workspace, "demo", 1, "original");
-    store.create_cat_covered(&original).unwrap();
+    store
+        .create_cat_covered_without_admission_for_product_test(&original)
+        .unwrap();
     store
         .with(|client| {
             client
@@ -1660,7 +1741,9 @@ fn self_valid_rows_with_a_missing_operation_are_not_a_name_conflict() {
         .unwrap();
 
     let conflict = request(&workspace, "demo", 2, "would-conflict");
-    let error = store.create_cat_covered(&conflict).unwrap_err();
+    let error = store
+        .create_cat_covered_without_admission_for_product_test(&conflict)
+        .unwrap_err();
     assert_eq!(error_code(error), ErrorCode::Internal);
     assert_eq!(counts(&store), [1, 1, 1, 1, 1, 1, 0, 1]);
 }
@@ -1677,12 +1760,16 @@ fn every_closed_json_row_corruption_fails_closed_without_a_409_result() {
     ] {
         let (_url, store, _second, workspace) = stores();
         let original = request(&workspace, "demo", 1, "original");
-        store.create_cat_covered(&original).unwrap();
+        store
+            .create_cat_covered_without_admission_for_product_test(&original)
+            .unwrap();
         let sql = format!("UPDATE {table} SET record=record || '{{\"unexpected\":true}}'::jsonb");
         store.with(|client| client.batch_execute(&sql)).unwrap();
 
         let conflict = request(&workspace, "demo", 2, "would-conflict");
-        let error = store.create_cat_covered(&conflict).unwrap_err();
+        let error = store
+            .create_cat_covered_without_admission_for_product_test(&conflict)
+            .unwrap_err();
         assert_eq!(error_code(error), ErrorCode::Internal, "table {table}");
         assert_eq!(counts(&store), [1, 1, 1, 1, 1, 1, 1, 1], "table {table}");
     }
@@ -1692,7 +1779,9 @@ fn every_closed_json_row_corruption_fails_closed_without_a_409_result() {
 fn hostname_lookup_fails_closed_when_current_desired_revision_drifts() {
     let (url, store, _second, workspace) = stores();
     let original = request(&workspace, "demo", 1, "original");
-    store.create_cat_covered(&original).unwrap();
+    store
+        .create_cat_covered_without_admission_for_product_test(&original)
+        .unwrap();
 
     let mut drifted = original.candidate.desired.clone();
     drifted.desired_revision = revision(2);
@@ -1743,7 +1832,9 @@ fn hostname_lookup_fails_closed_when_current_desired_revision_drifts() {
     assert_eq!(lookup_error.code, ErrorCode::Internal);
 
     let conflict = request(&workspace, "demo", 2, "would-conflict");
-    let conflict_error = store.create_cat_covered(&conflict).unwrap_err();
+    let conflict_error = store
+        .create_cat_covered_without_admission_for_product_test(&conflict)
+        .unwrap_err();
     assert_eq!(error_code(conflict_error), ErrorCode::Internal);
     assert_eq!(counts(&store), [1, 1, 1, 1, 1, 1, 1, 1]);
 }
@@ -1752,7 +1843,9 @@ fn hostname_lookup_fails_closed_when_current_desired_revision_drifts() {
 fn corrupt_api_result_fails_both_fast_and_transactional_reads_closed() {
     let (_url, store, _second, workspace) = stores();
     let original = request(&workspace, "demo", 1, "original");
-    store.create_cat_covered(&original).unwrap();
+    store
+        .create_cat_covered_without_admission_for_product_test(&original)
+        .unwrap();
     store
         .with(|client| {
             client.batch_execute(
@@ -1767,7 +1860,9 @@ fn corrupt_api_result_fails_both_fast_and_transactional_reads_closed() {
         .cat_create_result_fast_lookup(&original.idempotency)
         .unwrap_err();
     assert_eq!(fast.code, ErrorCode::Internal);
-    let transactional = store.create_cat_covered(&original).unwrap_err();
+    let transactional = store
+        .create_cat_covered_without_admission_for_product_test(&original)
+        .unwrap_err();
     assert_eq!(error_code(transactional), ErrorCode::Internal);
     assert_eq!(counts(&store), [1, 1, 1, 1, 1, 1, 1, 1]);
 }
@@ -1794,7 +1889,9 @@ fn serialization_retry_replays_the_whole_create_without_half_rows() {
         })
         .unwrap();
     let create = request(&workspace, "demo", 1, "retry");
-    let result = store.create_cat_covered(&create).unwrap();
+    let result = store
+        .create_cat_covered_without_admission_for_product_test(&create)
+        .unwrap();
     assert_eq!(result.http_status, 202);
     assert_eq!(counts(&store), [1, 1, 1, 1, 1, 1, 1, 1]);
     let attempts: i64 = store
@@ -1825,7 +1922,9 @@ fn failure_after_endpoint_and_lookup_inserts_rolls_everything_back() {
         })
         .unwrap();
     let create = request(&workspace, "demo", 1, "rollback");
-    let error = store.create_cat_covered(&create).unwrap_err();
+    let error = store
+        .create_cat_covered_without_admission_for_product_test(&create)
+        .unwrap_err();
     assert_eq!(error_code(error), ErrorCode::Internal);
     assert_eq!(counts(&store), [0, 0, 0, 0, 0, 0, 0, 0]);
 }
@@ -1871,7 +1970,13 @@ fn cat_create_does_not_read_or_write_legacy_endpoint_and_route_rows() {
         .unwrap();
 
     let create = request(&workspace, "demo", 1, "legacy-sentinel");
-    assert_eq!(store.create_cat_covered(&create).unwrap().http_status, 202);
+    assert_eq!(
+        store
+            .create_cat_covered_without_admission_for_product_test(&create)
+            .unwrap()
+            .http_status,
+        202
+    );
 
     let after: (String, String) = store
         .with(|client| {
@@ -1903,7 +2008,13 @@ fn cat_create_remains_independent_when_legacy_endpoint_tables_are_absent() {
         .unwrap();
 
     let create = request(&workspace, "demo", 1, "legacy-absent");
-    assert_eq!(store.create_cat_covered(&create).unwrap().http_status, 202);
+    assert_eq!(
+        store
+            .create_cat_covered_without_admission_for_product_test(&create)
+            .unwrap()
+            .http_status,
+        202
+    );
     assert_eq!(counts(&store), [1, 1, 1, 1, 1, 1, 1, 1]);
 }
 
@@ -1912,7 +2023,8 @@ fn concurrent_destroy_after_name_peek_cannot_be_cached_as_409() {
     const APPLICATION_NAME: &str = "cats-f2a-destroy-race";
     let (url, seed, _second, workspace) = stores();
     let original = request(&workspace, "demo", 1, "original");
-    seed.create_cat_covered(&original).unwrap();
+    seed.create_cat_covered_without_admission_for_product_test(&original)
+        .unwrap();
     let conflict = request(&workspace, "demo", 2, "would-conflict");
     let conflict_store =
         Store::connect(&with_application_name(&url, APPLICATION_NAME), None).unwrap();
@@ -1926,7 +2038,9 @@ fn concurrent_destroy_after_name_peek_cannot_be_cached_as_409() {
         )
         .unwrap();
 
-    let worker = std::thread::spawn(move || conflict_store.create_cat_covered(&conflict));
+    let worker = std::thread::spawn(move || {
+        conflict_store.create_cat_covered_without_admission_for_product_test(&conflict)
+    });
     let mut observed_wait = false;
     for _ in 0..200 {
         observed_wait = seed
@@ -2044,7 +2158,7 @@ async fn cancelling_started_create_finishes_physical_transaction_and_replays() {
         worker_store
             .execute(move |store| {
                 store
-                    .create_cat_covered(&worker_request)
+                    .create_cat_covered_without_admission_for_product_test(&worker_request)
                     .map_err(into_api_error)
             })
             .await
@@ -2079,7 +2193,7 @@ async fn cancelling_started_create_finishes_physical_transaction_and_replays() {
     let replay = second
         .execute(move |store| {
             store
-                .create_cat_covered(&replay_request)
+                .create_cat_covered_without_admission_for_product_test(&replay_request)
                 .map_err(into_api_error)
         })
         .await

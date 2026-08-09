@@ -384,21 +384,29 @@ impl CatCreateService {
                 "placement planner changed the candidate network identity",
             ));
         }
+        let planned_admission = plan.admission.clone();
+        let guest_config_digest = self.guest_config_digest.clone();
         let covered = build_covered_request(
             ingress,
             identities,
             plan,
-            self.guest_config_digest.clone(),
+            guest_config_digest.clone(),
             root_size_bytes,
         )?;
         let result = self
             .store
-            .execute(move |store| match store.create_cat_covered(&covered) {
-                Ok(result) => Ok(result),
-                Err(CoveredCatCreateError::CandidateCollision(_)) => Err(ApiError::internal(
-                    "Cat create candidate identity collided; discard the whole candidate batch",
-                )),
-                Err(CoveredCatCreateError::Store(error)) => Err(error),
+            .execute(move |store| {
+                match store.create_cat_covered_with_admission(
+                    &covered,
+                    &planned_admission,
+                    &guest_config_digest,
+                ) {
+                    Ok(result) => Ok(result),
+                    Err(CoveredCatCreateError::CandidateCollision(_)) => Err(ApiError::internal(
+                        "Cat create candidate identity collided; discard the whole candidate batch",
+                    )),
+                    Err(CoveredCatCreateError::Store(error)) => Err(error),
+                }
             })
             .await?;
         Ok(http_result(result))

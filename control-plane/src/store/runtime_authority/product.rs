@@ -28,6 +28,10 @@ use super::product_rows::{
     load_operation_for_update, load_root_disk_by_cat_unlocked,
 };
 use super::rows::{database_now, insert_volume, load_volume_for_update};
+use super::runtime_spine::{
+    lock_placement_admission_for_desired_mutation, PlacementAdmissionLoad,
+    PlacementAdmissionSnapshot,
+};
 use crate::store::transaction::{
     AuthorityExecutionError, AuthorityTransactionError, AuthorityTxResult,
 };
@@ -425,13 +429,31 @@ impl Store {
     }
 
     #[allow(dead_code, reason = "consumed by the later HTTP/service cutover")]
-    pub(crate) fn create_cat_covered(
+    pub(crate) fn create_cat_covered_with_admission(
+        &self,
+        request: &CoveredCatCreateRequest,
+        planned_admission: &PlacementAdmissionSnapshot,
+        active_guest_digest: &Sha256Digest,
+    ) -> CoveredCatCreateResult<ApiIdempotencyResult> {
+        self.create_cat_covered_inner(request, Some((planned_admission, active_guest_digest)))
+    }
+
+    #[cfg(test)]
+    pub(super) fn create_cat_covered_without_admission_for_product_test(
         &self,
         request: &CoveredCatCreateRequest,
     ) -> CoveredCatCreateResult<ApiIdempotencyResult> {
+        self.create_cat_covered_inner(request, None)
+    }
+
+    fn create_cat_covered_inner(
+        &self,
+        request: &CoveredCatCreateRequest,
+        admission: Option<(&PlacementAdmissionSnapshot, &Sha256Digest)>,
+    ) -> CoveredCatCreateResult<ApiIdempotencyResult> {
         let mut collision = None;
         let result = self.authority_transaction_outcome(|transaction| {
-            match create_cat_in(transaction, request) {
+            match create_cat_in(transaction, request, admission) {
                 Ok(result) => Ok(result),
                 Err(CreateCatTransactionError::Authority(error)) => Err(error),
                 Err(CreateCatTransactionError::CandidateCollision(kind)) => {
@@ -456,6 +478,7 @@ impl Store {
 fn create_cat_in(
     transaction: &mut Transaction<'_>,
     request: &CoveredCatCreateRequest,
+    admission: Option<(&PlacementAdmissionSnapshot, &Sha256Digest)>,
 ) -> std::result::Result<ApiIdempotencyResult, CreateCatTransactionError> {
     reserve_api_key(transaction, &request.idempotency)?;
     if let Some(result) = load_api_result_for_update(transaction, &request.idempotency)? {
@@ -484,6 +507,30 @@ fn create_cat_in(
             result_from_envelope(&request.idempotency, &request.envelopes.name_conflict, now);
         insert_api_result(transaction, &result)?;
         return Ok(result);
+    }
+
+    if let Some((planned, active_guest_digest)) = admission {
+        if request.candidate.desired.placement.node_id != planned.node_identity.node_id
+            || request.candidate.desired.runtime.guest_config_digest != *active_guest_digest
+        {
+            return Err(AuthorityTransactionError::from(ApiError::internal(
+                "Cat create candidate is not bound to its placement admission",
+            ))
+            .into());
+        }
+        if !matches!(
+            lock_placement_admission_for_desired_mutation(
+                transaction,
+                planned,
+                active_guest_digest,
+            )?,
+            PlacementAdmissionLoad::Accepted(_)
+        ) {
+            return Err(AuthorityTransactionError::from(ApiError::unavailable(
+                "placement admission changed before Cat create commit",
+            ))
+            .into());
+        }
     }
 
     lock_candidate_id(transaction, "volume", &request.candidate.volume.volume_id)?;
