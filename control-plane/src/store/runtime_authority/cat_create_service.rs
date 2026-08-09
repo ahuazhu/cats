@@ -11,13 +11,13 @@ use std::sync::Arc;
 
 use cats_api::error::ApiError;
 use cats_api::runtime_reconciliation::{
-    encode_admission_inventory_attestation, encode_agent_session, encode_node_identity,
-    guest_config_digest, spec_digest, AdmissionInventoryAttestation, AgentSession, AsciiText,
-    AssignedKind, AssignedPlacement, ContractVersion, DesiredRuntimeSpec, DiskKind, Durability,
-    EndpointIntent, Epoch, FenceEpoch, Generation, GuestDeviceIdentity, GuestRuntimeProfileReceipt,
-    Hostname, HttpProtocol, Id, NetworkConfig, NodeIdentity, NodeIdentityState, RandomId128,
-    Revision, RuntimeConfig, RuntimeTarget, RuntimeTransition, Sha256Digest, VolumeAccess,
-    VolumeAcquire, VolumeDisposition, VolumeIntent,
+    encode_admission_inventory_attestation, encode_agent_session, encode_desired_runtime_spec,
+    encode_node_identity, encode_node_observation, guest_config_digest, spec_digest,
+    AppliedDesiredEvidence, AsciiText, AssignedKind, AssignedPlacement, ContractVersion,
+    DesiredRuntimeSpec, DiskKind, Durability, EndpointIntent, Epoch, FenceEpoch, Generation,
+    GuestDeviceIdentity, GuestRuntimeProfileReceipt, Hostname, HttpProtocol, Id, NetworkConfig,
+    NodeIdentityState, RandomId128, Revision, RuntimeConfig, RuntimeTarget, RuntimeTransition,
+    Sha256Digest, VolumeAccess, VolumeAcquire, VolumeDisposition, VolumeIntent,
 };
 use cats_storage::authority::{RemoteHead, VolumeAdminState, VolumeDurability, VolumeRecord};
 use serde::Deserialize;
@@ -29,6 +29,7 @@ use super::product::{
     DiskAdminState, DiskRecordCandidate, DiskRole, EndpointRecordCandidate, ExactContentType,
     ExactHttpResponse, HostnameDesiredLookup, IfMatchFingerprint,
 };
+use super::runtime_spine::{PlacementAdmissionSnapshot, PLACEMENT_INVENTORY_MAX_AGE_MS};
 use crate::store::{Result, Store};
 
 pub(crate) const CAT_CREATE_MAX_BODY_BYTES: usize = 4096;
@@ -246,9 +247,7 @@ pub(crate) struct CatCreatePlanRequest {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct CatCreatePlan {
-    pub(crate) node_identity: NodeIdentity,
-    pub(crate) agent_session: AgentSession,
-    pub(crate) admission_inventory: AdmissionInventoryAttestation,
+    pub(crate) admission: PlacementAdmissionSnapshot,
     pub(crate) network_config: NetworkConfig,
 }
 
@@ -420,23 +419,74 @@ fn rounded_root_size(requested: u64) -> Result<u64> {
 }
 
 fn validate_plan_evidence(plan: &CatCreatePlan, active_guest_digest: &Sha256Digest) -> Result<()> {
-    encode_node_identity(&plan.node_identity)
+    let admission = &plan.admission;
+    encode_node_identity(&admission.node_identity)
         .map_err(|_| ApiError::internal("placement planner returned an invalid NodeIdentity"))?;
-    encode_agent_session(&plan.agent_session)
+    encode_agent_session(&admission.agent_session)
         .map_err(|_| ApiError::internal("placement planner returned an invalid AgentSession"))?;
-    encode_admission_inventory_attestation(&plan.admission_inventory).map_err(|_| {
+    encode_admission_inventory_attestation(&admission.inventory_attestation).map_err(|_| {
         ApiError::internal("placement planner returned an invalid admission inventory attestation")
     })?;
-    if plan.node_identity.state != NodeIdentityState::Provisioned
-        || plan.node_identity.node_id != plan.agent_session.node_id
-        || plan.node_identity.immutable_host_id != plan.agent_session.immutable_host_id
-        || plan.agent_session.node_id != plan.admission_inventory.node_id
-        || plan.agent_session.agent_session_epoch != plan.admission_inventory.agent_session_epoch
-        || plan.agent_session.guest_config_digest != *active_guest_digest
+    encode_node_observation(&admission.full_inventory_observation).map_err(|_| {
+        ApiError::internal("placement planner returned an invalid full inventory observation")
+    })?;
+    for desired in &admission.assigned_desired_specs {
+        encode_desired_runtime_spec(desired).map_err(|_| {
+            ApiError::internal("placement planner returned an invalid assigned Desired spec")
+        })?;
+    }
+    let observation = &admission.full_inventory_observation;
+    let attestation = &admission.inventory_attestation;
+    if admission.node_identity.state != NodeIdentityState::Provisioned
+        || admission.node_identity.node_id != admission.agent_session.node_id
+        || admission.node_identity.immutable_host_id != admission.agent_session.immutable_host_id
+        || admission.agent_session.node_id != attestation.node_id
+        || admission.agent_session.agent_session_epoch != attestation.agent_session_epoch
+        || admission.agent_session.guest_config_digest != *active_guest_digest
+        || admission.evaluated_at_unix_ms >= admission.agent_session.lease_deadline_unix_ms
+        || !observation.complete_inventory
+        || observation.node_id != admission.agent_session.node_id
+        || observation.node_boot_id != admission.agent_session.node_boot_id
+        || observation.agent_instance_id != admission.agent_session.agent_instance_id
+        || observation.agent_session_epoch != admission.agent_session.agent_session_epoch
+        || observation.inventory_epoch != attestation.inventory_epoch
+        || observation.inventory_digest.as_ref() != Some(&attestation.inventory_digest)
+        || observation.inventory_read_position != Some(attestation.inventory_read_position)
+        || attestation.accepted_at_unix_ms > admission.evaluated_at_unix_ms
     {
         return Err(ApiError::internal(
             "placement planner evidence is not bound to one current compatible Node session",
         ));
+    }
+    let stale_at = attestation
+        .accepted_at_unix_ms
+        .get()
+        .checked_add(PLACEMENT_INVENTORY_MAX_AGE_MS)
+        .ok_or_else(|| ApiError::internal("placement inventory freshness overflow"))?;
+    if admission.evaluated_at_unix_ms.get() >= stale_at {
+        return Err(ApiError::internal(
+            "placement planner returned stale admission inventory",
+        ));
+    }
+    for desired in &admission.assigned_desired_specs {
+        if desired.placement.node_id != admission.node_identity.node_id {
+            return Err(ApiError::internal(
+                "placement planner assigned set contains another Node",
+            ));
+        }
+        let expected = AppliedDesiredEvidence {
+            desired_revision: desired.desired_revision,
+            spec_digest: desired.spec_digest.clone(),
+            placement: desired.placement.clone(),
+            target: desired.target,
+        };
+        if !observation.runtimes.iter().any(|runtime| {
+            runtime.cat_id == desired.cat_id && runtime.applied_desired.as_ref() == Some(&expected)
+        }) {
+            return Err(ApiError::internal(
+                "placement planner full inventory omitted an assigned Cat binding",
+            ));
+        }
     }
     Ok(())
 }
@@ -493,7 +543,7 @@ fn build_covered_request(
         target: RuntimeTarget::Running,
         placement: AssignedPlacement {
             kind: AssignedKind::Assigned,
-            node_id: plan.node_identity.node_id,
+            node_id: plan.admission.node_identity.node_id,
             placement_epoch: Epoch::new(1).expect("one is a valid Epoch"),
         },
         runtime: RuntimeConfig {

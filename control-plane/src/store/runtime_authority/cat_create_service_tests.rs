@@ -3,11 +3,12 @@ use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
 use cats_api::runtime_reconciliation::{
-    decode_desired_runtime_spec, guest_config_digest, AdmissionInventoryAttestation, AgentSession,
-    AsciiText, AssignedKind, ContractVersion, CredentialBinding, DiskKind, Durability, Epoch,
-    GuestRuntimeProfileReceipt, Id, Ipv4Address, MacAddress, NetworkConfig, NodeBootId,
-    NodeIdentity, NodeIdentityState, RandomId128, RuntimeTarget, RuntimeTransition, Sequence,
-    Sha256Digest, UnixMillis, VolumeAccess, VolumeAcquire, VolumeDisposition,
+    decode_desired_runtime_spec, guest_config_digest, inventory_digest,
+    AdmissionInventoryAttestation, AgentSession, AsciiText, AssignedKind, ContractVersion,
+    CredentialBinding, DiskKind, Durability, Epoch, GuestRuntimeProfileReceipt, Id, Ipv4Address,
+    MacAddress, NetworkConfig, NodeBootId, NodeIdentity, NodeIdentityState, NodeObservation,
+    RandomId128, RuntimeTarget, RuntimeTransition, Sequence, Sha256Digest, UnixMillis,
+    VolumeAccess, VolumeAcquire, VolumeDisposition,
 };
 
 use super::cat_create_service::{
@@ -15,6 +16,7 @@ use super::cat_create_service::{
     CatCreateManifestResolver, CatCreatePlacementPlanner, CatCreatePlan, CatCreatePlanRequest,
     CatCreateService, ServiceFuture, ValidatedImageManifest, CAT_CREATE_MAX_BODY_BYTES,
 };
+use super::runtime_spine::PlacementAdmissionSnapshot;
 use crate::store::{Result, Store};
 
 const BOOT_DIGEST: &str = "sha256:2222222222222222222222222222222222222222222222222222222222222222";
@@ -263,39 +265,65 @@ impl CatCreatePlacementPlanner for FakePlanner {
             NodeIdentityState::Provisioned
         };
         Box::pin(async move {
+            let session = AgentSession {
+                version: ContractVersion::V1,
+                node_id: id("node_a"),
+                immutable_host_id: id("host_a"),
+                node_boot_id: NodeBootId::new("11111111111111111111111111111111").unwrap(),
+                agent_instance_id: RandomId128::new("22222222222222222222222222222222").unwrap(),
+                agent_session_epoch: Epoch::new(1).unwrap(),
+                registration_attempt_id: RandomId128::new("33333333333333333333333333333333")
+                    .unwrap(),
+                guest_config_digest,
+                lease_deadline_unix_ms: UnixMillis::new(10_000).unwrap(),
+            };
+            let mut full = NodeObservation {
+                version: ContractVersion::V1,
+                observation_id: RandomId128::new("44444444444444444444444444444444").unwrap(),
+                node_id: session.node_id.clone(),
+                node_boot_id: session.node_boot_id.clone(),
+                agent_instance_id: session.agent_instance_id.clone(),
+                agent_session_epoch: session.agent_session_epoch,
+                heartbeat_sequence: Sequence::new(1).unwrap(),
+                observed_at_unix_ms: UnixMillis::new(1).unwrap(),
+                complete_inventory: true,
+                inventory_epoch: Epoch::new(1).unwrap(),
+                inventory_digest: Some(Sha256Digest::from_bytes([0; 32])),
+                inventory_read_position: Some(Sequence::new(1).unwrap()),
+                key_ring_version: None,
+                key_ring_digest: None,
+                loaded_kids: Vec::new(),
+                runtimes: Vec::new(),
+                residue: Vec::new(),
+            };
+            full.inventory_digest = Some(inventory_digest(&full).unwrap());
+            let attestation = AdmissionInventoryAttestation {
+                version: ContractVersion::V1,
+                node_id: id("node_a"),
+                agent_session_epoch: Epoch::new(1).unwrap(),
+                inventory_epoch: Epoch::new(1).unwrap(),
+                inventory_digest: full.inventory_digest.clone().unwrap(),
+                inventory_read_position: Sequence::new(1).unwrap(),
+                accepted_at_unix_ms: UnixMillis::new(1).unwrap(),
+            };
             Ok(CatCreatePlan {
-                node_identity: NodeIdentity {
-                    version: ContractVersion::V1,
-                    node_id: id("node_a"),
-                    immutable_host_id: id("host_a"),
-                    credential_id: id("credential_a"),
-                    credential_binding: CredentialBinding::PublicKey {
-                        public_key_spki_sha256: Sha256Digest::from_bytes([5; 32]),
+                admission: PlacementAdmissionSnapshot {
+                    evaluated_at_unix_ms: UnixMillis::new(2).unwrap(),
+                    node_identity: NodeIdentity {
+                        version: ContractVersion::V1,
+                        node_id: id("node_a"),
+                        immutable_host_id: id("host_a"),
+                        credential_id: id("credential_a"),
+                        credential_binding: CredentialBinding::PublicKey {
+                            public_key_spki_sha256: Sha256Digest::from_bytes([5; 32]),
+                        },
+                        state_path_id: id("state_path_a"),
+                        state: node_state,
                     },
-                    state_path_id: id("state_path_a"),
-                    state: node_state,
-                },
-                agent_session: AgentSession {
-                    version: ContractVersion::V1,
-                    node_id: id("node_a"),
-                    immutable_host_id: id("host_a"),
-                    node_boot_id: NodeBootId::new("11111111111111111111111111111111").unwrap(),
-                    agent_instance_id: RandomId128::new("22222222222222222222222222222222")
-                        .unwrap(),
-                    agent_session_epoch: Epoch::new(1).unwrap(),
-                    registration_attempt_id: RandomId128::new("33333333333333333333333333333333")
-                        .unwrap(),
-                    guest_config_digest,
-                    lease_deadline_unix_ms: UnixMillis::new(10_000).unwrap(),
-                },
-                admission_inventory: AdmissionInventoryAttestation {
-                    version: ContractVersion::V1,
-                    node_id: id("node_a"),
-                    agent_session_epoch: Epoch::new(1).unwrap(),
-                    inventory_epoch: Epoch::new(1).unwrap(),
-                    inventory_digest: Sha256Digest::from_bytes([6; 32]),
-                    inventory_read_position: Sequence::new(1).unwrap(),
-                    accepted_at_unix_ms: UnixMillis::new(1).unwrap(),
+                    agent_session: session,
+                    inventory_attestation: attestation,
+                    full_inventory_observation: full,
+                    assigned_desired_specs: Vec::new(),
                 },
                 network_config: NetworkConfig {
                     kind: cats_api::runtime_reconciliation::IsolatedIpv4Kind::IsolatedIpv4,
