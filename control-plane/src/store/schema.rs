@@ -3,6 +3,7 @@ use super::*;
 use cats_storage::authority::AUTHORITY_RELEASE_SCHEMA_VERSION;
 use native_tls::{Certificate, TlsConnector};
 use postgres_native_tls::MakeTlsConnector;
+use sha2::{Digest as _, Sha256};
 use std::time::Duration;
 
 impl Store {
@@ -25,6 +26,10 @@ impl Store {
             client: Mutex::new(Some(client)),
             dsn: dsn.clone(),
             ca_file: ca_file.map(str::to_string),
+            #[cfg(test)]
+            commit_response_loss_once: std::sync::atomic::AtomicBool::new(false),
+            #[cfg(test)]
+            commit_response_loss_delay_ms: std::sync::atomic::AtomicU64::new(0),
         })
     }
 }
@@ -54,7 +59,7 @@ pub(super) fn connect_client(dsn: &DsnSource, ca_file: Option<&str>) -> Result<C
     config.connect_timeout(Duration::from_secs(5));
     let client = config
         .connect(MakeTlsConnector::new(connector))
-        .map_err(|error| internal(connect_failure(error)))?;
+        .map_err(|error| ApiError::unavailable(connect_failure(error)))?;
     Ok(client)
 }
 
@@ -129,7 +134,7 @@ fn ensure_schema(client: &mut Client) -> Result<()> {
                 "SELECT version FROM control_schema_version WHERE singleton",
                 &[],
             )
-            .map_err(internal)?
+            .map_err(|error| internal(format!("verify authority foreign key catalog: {error:?}")))?
             .ok_or_else(|| {
                 ApiError::failed_precondition(
                     "control-plane schema stamp is missing its singleton row; recreate it",
@@ -198,7 +203,136 @@ fn verify_current_schema(transaction: &mut postgres::Transaction<'_>) -> Result<
             ))
         })?;
     }
+    verify_authority_catalog(transaction)?;
     Ok(())
+}
+
+/// Column probes cannot detect a stamped schema whose database-enforced
+/// lineage/immutability barriers were dropped. Verify the A23 catalog objects
+/// structurally at every startup; a current stamp is never permission to
+/// recreate or repair one of them.
+fn verify_authority_catalog(transaction: &mut postgres::Transaction<'_>) -> Result<()> {
+    for (table, constraint, target, source_columns, target_columns, update_action, delete_action) in
+        REQUIRED_DEFERRED_FOREIGN_KEYS
+    {
+        let present: bool = transaction
+            .query_one(
+                "SELECT EXISTS (
+                    SELECT 1
+                      FROM pg_constraint c
+                      JOIN pg_class source ON source.oid=c.conrelid
+                      JOIN pg_namespace n ON n.oid=source.relnamespace
+                      JOIN pg_class target ON target.oid=c.confrelid
+                      JOIN pg_namespace target_namespace
+                        ON target_namespace.oid=target.relnamespace
+                     WHERE n.nspname=current_schema()
+                       AND source.relname=$1 AND c.conname=$2
+                       AND target_namespace.nspname=current_schema()
+                       AND target.relname=$3 AND c.contype='f'
+                       AND c.condeferrable AND c.condeferred AND c.convalidated
+                       AND ARRAY(
+                           SELECT attribute.attname::TEXT
+                             FROM unnest(c.conkey) WITH ORDINALITY AS key(attnum, ordinal)
+                             JOIN pg_attribute attribute
+                               ON attribute.attrelid=c.conrelid
+                              AND attribute.attnum=key.attnum
+                            ORDER BY key.ordinal
+                       ) = string_to_array($4, ',')
+                       AND ARRAY(
+                           SELECT attribute.attname::TEXT
+                             FROM unnest(c.confkey) WITH ORDINALITY AS key(attnum, ordinal)
+                             JOIN pg_attribute attribute
+                               ON attribute.attrelid=c.confrelid
+                              AND attribute.attnum=key.attnum
+                            ORDER BY key.ordinal
+                       ) = string_to_array($5, ',')
+                       AND c.confupdtype::TEXT=$6 AND c.confdeltype::TEXT=$7
+                 )",
+                &[
+                    table,
+                    constraint,
+                    target,
+                    source_columns,
+                    target_columns,
+                    update_action,
+                    delete_action,
+                ],
+            )
+            .map_err(|error| internal(format!("verify authority index catalog: {error:?}")))?
+            .get(0);
+        if !present {
+            return Err(partial_catalog_object(constraint));
+        }
+    }
+    for (table, index, columns, predicate) in REQUIRED_UNIQUE_INDEXES {
+        let present: bool = transaction
+            .query_one(
+                "SELECT EXISTS (
+                    SELECT 1
+                      FROM pg_index i
+                      JOIN pg_class source ON source.oid=i.indrelid
+                      JOIN pg_namespace n ON n.oid=source.relnamespace
+                      JOIN pg_class index_relation ON index_relation.oid=i.indexrelid
+                     WHERE n.nspname=current_schema()
+                       AND source.relname=$1 AND index_relation.relname=$2
+                       AND i.indisunique AND i.indisvalid AND i.indisready
+                       AND ARRAY(
+                           SELECT attribute.attname::TEXT
+                             FROM unnest(i.indkey) WITH ORDINALITY AS key(attnum, ordinal)
+                             JOIN pg_attribute attribute
+                               ON attribute.attrelid=i.indrelid
+                              AND attribute.attnum=key.attnum
+                            WHERE key.ordinal <= i.indnkeyatts
+                            ORDER BY key.ordinal
+                       ) = string_to_array($3, ',')
+                       AND (($4::TEXT IS NULL AND i.indpred IS NULL)
+                            OR pg_get_expr(i.indpred, i.indrelid)=$4)
+                 )",
+                &[table, index, columns, predicate],
+            )
+            .map_err(|error| internal(format!("verify authority trigger catalog: {error:?}")))?
+            .get(0);
+        if !present {
+            return Err(partial_catalog_object(index));
+        }
+    }
+    for (table, trigger, function, trigger_type, body_sha256) in REQUIRED_IMMUTABILITY_TRIGGERS {
+        let body = transaction
+            .query_opt(
+                "SELECT function.prosrc
+                   FROM pg_trigger trigger
+                   JOIN pg_class source ON source.oid=trigger.tgrelid
+                   JOIN pg_namespace source_namespace
+                     ON source_namespace.oid=source.relnamespace
+                   JOIN pg_proc function ON function.oid=trigger.tgfoid
+                   JOIN pg_namespace function_namespace
+                     ON function_namespace.oid=function.pronamespace
+                   JOIN pg_language language ON language.oid=function.prolang
+                  WHERE source_namespace.nspname=current_schema()
+                    AND function_namespace.nspname=current_schema()
+                    AND source.relname=$1 AND trigger.tgname=$2
+                    AND function.proname=$3 AND NOT trigger.tgisinternal
+                    AND trigger.tgenabled='O' AND trigger.tgtype=$4
+                    AND trigger.tgattr::TEXT='' AND trigger.tgqual IS NULL
+                    AND trigger.tgnargs=0 AND function.pronargs=0
+                    AND function.prorettype='trigger'::regtype
+                    AND language.lanname='plpgsql'",
+                &[table, trigger, function, trigger_type],
+            )
+            .map_err(internal)?
+            .map(|row| row.get::<_, String>(0));
+        let actual_body_sha256 = body.map(|body| hex::encode(Sha256::digest(body.as_bytes())));
+        if actual_body_sha256.as_deref() != Some(*body_sha256) {
+            return Err(partial_catalog_object(trigger));
+        }
+    }
+    Ok(())
+}
+
+fn partial_catalog_object(name: &str) -> ApiError {
+    ApiError::failed_precondition(format!(
+        "control-plane schema version {SCHEMA_VERSION} is missing or changed authority catalog object {name}; recreate it"
+    ))
 }
 
 /// The Control Store owns the full release stamp. Its authority tables share
@@ -251,6 +385,193 @@ const CONTROL_TABLES: &[&str] = &[
     "runtime_provisioner_deployment_identity",
     "runtime_provisioner_trust_revisions",
     "runtime_provisioner_credential_lineage",
+];
+
+type RequiredDeferredForeignKey = (
+    &'static str,
+    &'static str,
+    &'static str,
+    &'static str,
+    &'static str,
+    &'static str,
+    &'static str,
+);
+
+const REQUIRED_DEFERRED_FOREIGN_KEYS: &[RequiredDeferredForeignKey] = &[
+    (
+        "node_identities",
+        "node_identity_current_public_key_lineage",
+        "runtime_node_credential_lineage",
+        "node_id,credential_id,credential_public_key_spki_sha256,credential_lineage_state",
+        "node_id,credential_id,public_key_spki_sha256,state",
+        "a",
+        "a",
+    ),
+    (
+        "runtime_node_credential_lineage",
+        "runtime_node_credential_lineage_node_id_fkey",
+        "node_identities",
+        "node_id",
+        "node_id",
+        "r",
+        "r",
+    ),
+    (
+        "runtime_provisioner_deployment_identity",
+        "runtime_provisioner_current_trust_revision",
+        "runtime_provisioner_trust_revisions",
+        "deployment_id,current_trust_revision,current_active_set_sha256",
+        "deployment_id,trust_revision,active_set_sha256",
+        "r",
+        "r",
+    ),
+    (
+        "runtime_provisioner_trust_revisions",
+        "runtime_provisioner_trust_revisions_deployment_id_fkey",
+        "runtime_provisioner_deployment_identity",
+        "deployment_id",
+        "deployment_id",
+        "r",
+        "r",
+    ),
+];
+
+const REQUIRED_UNIQUE_INDEXES: &[(&str, &str, &str, Option<&str>)] = &[
+    (
+        "host_fence_events",
+        "runtime_node_one_active_host_fence_event",
+        "node_id",
+        Some("(state = 'active'::text)"),
+    ),
+    (
+        "runtime_node_credential_lineage",
+        "runtime_node_one_active_credential",
+        "node_id",
+        Some("(state = 'active'::text)"),
+    ),
+    (
+        "runtime_node_credential_lineage",
+        "runtime_node_credential_lineage_public_key_spki_sha256_key",
+        "public_key_spki_sha256",
+        None,
+    ),
+    (
+        "runtime_node_authority_apply_records",
+        "runtime_node_authority_apply_records_pkey",
+        "apply_id",
+        None,
+    ),
+    (
+        "runtime_provisioner_credential_lineage",
+        "runtime_provisioner_credential_lineage_public_key_spki_key",
+        "public_key_spki",
+        None,
+    ),
+    (
+        "runtime_provisioner_credential_lineage",
+        "runtime_provisioner_credential_linea_public_key_spki_sha256_key",
+        "public_key_spki_sha256",
+        None,
+    ),
+    (
+        "runtime_provisioner_trust_revisions",
+        "runtime_provisioner_trust_revisions_pkey",
+        "deployment_id,trust_revision",
+        None,
+    ),
+];
+
+// PostgreSQL `pg_trigger.tgtype` bits: ROW=1, BEFORE=2, DELETE=8,
+// UPDATE=16. Exact masks reject statement-level, AFTER, extra-event and
+// `UPDATE OF`/WHEN weakened variants even when their names/functions match.
+const BEFORE_ROW_DELETE: i16 = 1 | 2 | 8;
+const BEFORE_ROW_UPDATE: i16 = 1 | 2 | 16;
+const BEFORE_ROW_UPDATE_DELETE: i16 = 1 | 2 | 8 | 16;
+const REQUIRED_IMMUTABILITY_TRIGGERS: &[(&str, &str, &str, i16, &str)] = &[
+    (
+        "runtime_node_credential_lineage",
+        "runtime_node_credential_lineage_update",
+        "control_runtime_node_credential_lineage_update",
+        BEFORE_ROW_UPDATE,
+        "b59ca8cd4bb9bd032340d29c9c230f4ba5f1957089bcc0be7d3b16d1530a9fbf",
+    ),
+    (
+        "runtime_node_credential_lineage",
+        "runtime_node_credential_lineage_cannot_delete",
+        "control_runtime_node_credential_lineage_cannot_delete",
+        BEFORE_ROW_DELETE,
+        "47aadab1d6b9584e1a8313d38655be3eaee3ec5865e64938f5ebf20c3c02f205",
+    ),
+    (
+        "runtime_node_placement_policies",
+        "runtime_node_policy_update",
+        "control_runtime_node_policy_update",
+        BEFORE_ROW_UPDATE,
+        "e5aecb0d77f3125308bf95f772cfab57b03ddce8d8c9859a69f88003ac7b30a7",
+    ),
+    (
+        "runtime_node_placement_policies",
+        "runtime_node_policy_cannot_delete",
+        "control_runtime_node_policy_cannot_delete",
+        BEFORE_ROW_DELETE,
+        "8eeafd5c331ab500bda261e135b6c061f13987386898edde3f74c3c4dc009a2c",
+    ),
+    (
+        "runtime_node_authority_apply_records",
+        "runtime_node_apply_is_immutable",
+        "control_runtime_node_apply_is_immutable",
+        BEFORE_ROW_UPDATE_DELETE,
+        "31366c6d9612212b3e9fae15ec31c217c3708c5fb166431980e3f60fd28f80d8",
+    ),
+    (
+        "runtime_provisioner_trust_revisions",
+        "runtime_provisioner_revision_is_immutable",
+        "control_runtime_provisioner_revision_is_immutable",
+        BEFORE_ROW_UPDATE_DELETE,
+        "28c3a0a59fed38ccb79d2ce366bde142919d64eaa4164e2ffc6e2a5250313431",
+    ),
+    (
+        "runtime_provisioner_credential_lineage",
+        "runtime_provisioner_credential_update",
+        "control_runtime_provisioner_credential_update",
+        BEFORE_ROW_UPDATE,
+        "297646e468dd86f20c46c4212f47b5bbe94c99288ee34c87a301e06308367a9a",
+    ),
+    (
+        "runtime_provisioner_credential_lineage",
+        "runtime_provisioner_credential_cannot_delete",
+        "control_runtime_provisioner_credential_cannot_delete",
+        BEFORE_ROW_DELETE,
+        "4f3a0c1a80e7678486cad830a1be9427fb8e546c47ff21f4c387e9817f0bf4b6",
+    ),
+    (
+        "runtime_provisioner_deployment_identity",
+        "runtime_provisioner_pointer_update",
+        "control_runtime_provisioner_pointer_update",
+        BEFORE_ROW_UPDATE,
+        "883fd6c3ff7394370a112afc7292e2e64503f37c05ec452c382f0e97ae45b24c",
+    ),
+    (
+        "runtime_provisioner_deployment_identity",
+        "runtime_provisioner_pointer_cannot_delete",
+        "control_runtime_provisioner_pointer_cannot_delete",
+        BEFORE_ROW_DELETE,
+        "3ba58cdd898c1ded0023c8732a3ca155cc17caf6bba93d8346dcc43c2dbd9e76",
+    ),
+    (
+        "node_identities",
+        "node_identity_lineage_is_immutable",
+        "control_node_identity_lineage_is_immutable",
+        BEFORE_ROW_UPDATE,
+        "474f612481baad907dbb4697502dcf7e187ed2ae06594e361be6bedf2ba9e43a",
+    ),
+    (
+        "node_identities",
+        "node_identity_cannot_be_deleted",
+        "control_node_identity_cannot_be_deleted",
+        BEFORE_ROW_DELETE,
+        "3930793dad74a3088892fdf5b2391255f8ebd1b2b675e21369cbda0543bef264",
+    ),
 ];
 
 const AUTHORITY_SCHEMA_PROBES: &[&str] = &[
@@ -657,6 +978,8 @@ CREATE TABLE IF NOT EXISTS host_fence_events (
     ),
     CHECK (isolation_state <> 'host_destroyed' OR state = 'active')
 );
+CREATE UNIQUE INDEX IF NOT EXISTS runtime_node_one_active_host_fence_event
+    ON host_fence_events(node_id) WHERE state = 'active';
 CREATE TABLE IF NOT EXISTS volume_authorizations (
     authorization_id TEXT PRIMARY KEY,
     record JSONB NOT NULL CHECK (jsonb_typeof(record) = 'object'),

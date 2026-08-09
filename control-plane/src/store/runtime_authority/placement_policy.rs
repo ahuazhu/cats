@@ -273,7 +273,7 @@ fn install_trust_bundle_in(
                     state, first_committed_at_unix_ms, retired_at_unix_ms
                FROM runtime_provisioner_credential_lineage
               WHERE credential_id=$1 OR public_key_spki=$2 OR public_key_spki_sha256=$3
-              ORDER BY credential_id FOR UPDATE",
+              ORDER BY credential_id COLLATE \"C\" FOR UPDATE",
             &[
                 &candidate.credential_id.as_str(),
                 &candidate.public_key_spki.as_str(),
@@ -494,7 +494,7 @@ fn load_active_provisioner_credentials(
         "SELECT credential_id, public_key_spki, public_key_spki_sha256,
                 state, first_committed_at_unix_ms, retired_at_unix_ms
            FROM runtime_provisioner_credential_lineage
-          WHERE state='active' ORDER BY credential_id {lock}"
+          WHERE state='active' ORDER BY credential_id COLLATE \"C\" {lock}"
     );
     transaction
         .query(&sql, &[])?
@@ -526,8 +526,8 @@ fn apply_runtime_node_authority_in(
     }
     let credential_fresh = lock_and_check_fresh_node_credential(transaction, apply)?;
 
-    let (identity, policy, node_absent) = match &apply.mutation {
-        RuntimeNodeAuthorityMutation::Provision { .. } => {
+    let (identity, policy, node_absent, host_state_fresh) = match &apply.mutation {
+        RuntimeNodeAuthorityMutation::Provision { node_identity, .. } => {
             transaction.query_one(
                 "SELECT pg_advisory_xact_lock(hashtextextended(
                     current_schema() || ':runtime-node-authority:' || $1, 0::BIGINT))",
@@ -536,12 +536,13 @@ fn apply_runtime_node_authority_in(
             let identity = load_identity_by_node_for_update(transaction, &apply.node_id)?;
             let policy = load_policy_for_update(transaction, &apply.node_id)?;
             let absent = identity.is_none() && policy.is_none();
-            (identity, policy, absent)
+            let host_state_fresh = lock_and_check_fresh_host_state(transaction, node_identity)?;
+            (identity, policy, absent, host_state_fresh)
         }
         _ => {
             let identity = load_identity_by_node_for_update(transaction, &apply.node_id)?;
             let policy = load_policy_for_update(transaction, &apply.node_id)?;
-            (identity, policy, false)
+            (identity, policy, false, true)
         }
     };
     if identity.is_some() != policy.is_some() {
@@ -554,7 +555,12 @@ fn apply_runtime_node_authority_in(
         RuntimeNodeAuthorityMutation::Provision {
             node_identity,
             placement_policy,
-        } if node_absent && credential_fresh => {
+        } if node_absent
+            && credential_fresh
+            && host_state_fresh
+            && identity_public_key(node_identity).is_some()
+            && valid_state_path_component(&node_identity.state_path_id) =>
+        {
             if insert_node_identity_in(transaction, node_identity, committed_at)? != 1 {
                 return Err(corrupt(
                     "locked absent NodeIdentity insert did not change one row",
@@ -664,6 +670,45 @@ fn apply_runtime_node_authority_in(
     Ok(RuntimeNodeAuthorityApplyStoreOutcome::Stored(
         stored_outcome,
     ))
+}
+
+fn lock_and_check_fresh_host_state(
+    transaction: &mut Transaction<'_>,
+    identity: &NodeIdentity,
+) -> AuthorityTxResult<bool> {
+    transaction.query_one(
+        "SELECT pg_advisory_xact_lock(hashtextextended(
+            current_schema() || ':runtime-node-host-state:' || $1 || ':' || $2,
+            0::BIGINT))",
+        &[
+            &identity.immutable_host_id.as_str(),
+            &identity.state_path_id.as_str(),
+        ],
+    )?;
+    let row = transaction.query_opt(
+        "SELECT node_id FROM node_identities
+          WHERE immutable_host_id=$1 AND state_path_id=$2 FOR UPDATE",
+        &[
+            &identity.immutable_host_id.as_str(),
+            &identity.state_path_id.as_str(),
+        ],
+    )?;
+    let Some(row) = row else {
+        return Ok(true);
+    };
+    let node_id = parse_id(row.try_get("node_id")?)?;
+    let existing = load_identity_by_node_for_update(transaction, &node_id)?
+        .ok_or_else(|| corrupt("Host/state-path uniqueness row disappeared"))?;
+    if existing.immutable_host_id != identity.immutable_host_id
+        || existing.state_path_id != identity.state_path_id
+    {
+        return Err(corrupt("Host/state-path uniqueness projection diverged"));
+    }
+    Ok(false)
+}
+
+fn valid_state_path_component(state_path_id: &Id) -> bool {
+    !matches!(state_path_id.as_str(), "." | "..")
 }
 
 fn valid_policy_update(
@@ -808,6 +853,23 @@ fn insert_policy(
             &projection.guest_ipv4_network_address,
         ],
     )?)
+}
+
+#[cfg(test)]
+pub(super) fn insert_policy_for_test(
+    transaction: &mut Transaction<'_>,
+    policy: &NodePlacementPolicy,
+) -> AuthorityTxResult<()> {
+    insert_policy(transaction, policy)
+}
+
+#[cfg(test)]
+pub(super) fn update_policy_for_test(
+    transaction: &mut Transaction<'_>,
+    current: &NodePlacementPolicy,
+    next: &NodePlacementPolicy,
+) -> AuthorityTxResult<()> {
+    update_policy(transaction, current, next)
 }
 
 fn update_policy(

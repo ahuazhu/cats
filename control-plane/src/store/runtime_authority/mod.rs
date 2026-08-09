@@ -12,6 +12,7 @@ mod events;
 )]
 pub(crate) mod image_manifest_resolver;
 pub(super) mod pg_codec;
+pub(crate) mod placement_planner;
 pub(crate) mod placement_policy;
 mod product;
 mod product_rows;
@@ -31,6 +32,9 @@ mod product_tests;
 
 #[cfg(test)]
 mod placement_policy_tests;
+
+#[cfg(test)]
+mod placement_planner_tests;
 
 #[cfg(test)]
 mod runtime_spine_tests;

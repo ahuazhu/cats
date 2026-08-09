@@ -305,6 +305,28 @@ pub(super) fn load_event_for_update(
         .transpose()
 }
 
+/// Loads the at-most-one active fence for a Node after the caller has taken
+/// the NodeIdentity serialization lock (mutation) or inside one repeatable-
+/// read authority snapshot (planner). The partial unique index is a physical
+/// backstop; checking the cardinality here also fails closed on a schema or
+/// projection drift instead of choosing an arbitrary event.
+pub(super) fn load_active_event_by_node_unlocked(
+    transaction: &mut Transaction<'_>,
+    node_id: &Id,
+) -> AuthorityTxResult<Option<HostFenceEvent>> {
+    let sql = format!(
+        "SELECT {EVENT_COLUMNS} FROM host_fence_events
+          WHERE (node_id=$1 OR record->>'node_id'=$1)
+            AND (state='active' OR record->>'state'='active')
+          ORDER BY event_id COLLATE \"C\" LIMIT 2"
+    );
+    let rows = transaction.query(&sql, &[&node_id.as_str()])?;
+    if rows.len() > 1 {
+        return Err(corrupt("multiple active HostFenceEvents for one Node"));
+    }
+    rows.first().map(decode_event).transpose()
+}
+
 // Event creation must compose with its caller's transaction; it must never
 // grow a convenience Store method that commits independently.
 #[allow(dead_code)]

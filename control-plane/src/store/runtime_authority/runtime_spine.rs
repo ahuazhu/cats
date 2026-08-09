@@ -37,7 +37,8 @@ use crate::store::agent_sessions::{
     load_current_session_for_update, load_current_session_unlocked,
     load_identity_by_credential_for_update, load_identity_by_node_for_update,
     load_identity_by_node_unlocked, load_provisioned_identities_after,
-    renew_current_session_deadline, AuthenticatedNodeCredential, PROVISIONED_NODE_ID_PAGE_SIZE,
+    lock_exact_credential_lineage, renew_current_session_deadline, AuthenticatedNodeCredential,
+    CredentialLineageState, PROVISIONED_NODE_ID_PAGE_SIZE,
 };
 use crate::store::transaction::{AuthorityTransactionError, AuthorityTxResult};
 use crate::store::{Result, Store};
@@ -158,11 +159,8 @@ impl Store {
         after: Option<&Id>,
     ) -> Result<ProvisionedNodeIdPage> {
         self.authority_read_snapshot(|transaction| {
-            let mut identities = load_provisioned_identities_after(transaction, after)?;
-            let has_more = identities.len() > PROVISIONED_NODE_ID_PAGE_SIZE;
-            if has_more {
-                identities.truncate(PROVISIONED_NODE_ID_PAGE_SIZE);
-            }
+            let identities = load_provisioned_identities_after(transaction, after)?;
+            let has_more = identities.len() == PROVISIONED_NODE_ID_PAGE_SIZE;
             let next_after = has_more
                 .then(|| identities.last().map(|identity| identity.node_id.clone()))
                 .flatten();
@@ -208,7 +206,8 @@ impl Store {
         active_guest_digest: &cats_api::runtime_reconciliation::Sha256Digest,
     ) -> Result<PlacementAdmissionLoad> {
         self.authority_read_snapshot(|transaction| {
-            load_placement_admission_in(transaction, node_id, active_guest_digest)
+            let now = database_now(transaction)?;
+            load_placement_admission_at_in(transaction, node_id, active_guest_digest, now)
         })
     }
 
@@ -236,6 +235,25 @@ pub(super) fn lock_placement_admission_for_desired_mutation(
     planned: &PlacementAdmissionSnapshot,
     active_guest_digest: &cats_api::runtime_reconciliation::Sha256Digest,
 ) -> AuthorityTxResult<PlacementAdmissionLoad> {
+    let mut checkpoint = |_: &mut Transaction<'_>| Ok(());
+    lock_placement_admission_for_desired_mutation_checked(
+        transaction,
+        planned,
+        active_guest_digest,
+        &mut checkpoint,
+    )
+}
+
+pub(super) fn lock_placement_admission_for_desired_mutation_checked<F>(
+    transaction: &mut Transaction<'_>,
+    planned: &PlacementAdmissionSnapshot,
+    active_guest_digest: &cats_api::runtime_reconciliation::Sha256Digest,
+    checkpoint: &mut F,
+) -> AuthorityTxResult<PlacementAdmissionLoad>
+where
+    F: FnMut(&mut Transaction<'_>) -> AuthorityTxResult<()>,
+{
+    checkpoint(transaction)?;
     let Some(identity) =
         load_identity_by_node_for_update(transaction, &planned.node_identity.node_id)?
     else {
@@ -253,10 +271,15 @@ pub(super) fn lock_placement_admission_for_desired_mutation(
             PlacementAdmissionRejection::AdmissionChanged,
         ));
     }
-    let current = match load_placement_admission_in(
+    checkpoint(transaction)?;
+    let now = database_now(transaction)?;
+    checkpoint(transaction)?;
+    let current = match load_placement_admission_at_in_checked(
         transaction,
         &planned.node_identity.node_id,
         active_guest_digest,
+        now,
+        checkpoint,
     )? {
         PlacementAdmissionLoad::Accepted(snapshot) => *snapshot,
         rejection @ PlacementAdmissionLoad::Rejected(_) => return Ok(rejection),
@@ -307,14 +330,16 @@ fn load_route_runtime_in(
     cat_id: &Id,
     active_guest_digest: &cats_api::runtime_reconciliation::Sha256Digest,
 ) -> AuthorityTxResult<RouteRuntimeLoad> {
-    let admission = match load_placement_admission_in(transaction, node_id, active_guest_digest)? {
-        PlacementAdmissionLoad::Accepted(snapshot) => *snapshot,
-        PlacementAdmissionLoad::Rejected(reason) => {
-            return Ok(RouteRuntimeLoad::Rejected(
-                RouteRuntimeRejection::Admission(reason),
-            ));
-        }
-    };
+    let now = database_now(transaction)?;
+    let admission =
+        match load_placement_admission_at_in(transaction, node_id, active_guest_digest, now)? {
+            PlacementAdmissionLoad::Accepted(snapshot) => *snapshot,
+            PlacementAdmissionLoad::Rejected(reason) => {
+                return Ok(RouteRuntimeLoad::Rejected(
+                    RouteRuntimeRejection::Admission(reason),
+                ));
+            }
+        };
     let Some(current) = load_current_cat_observation(transaction, node_id, cat_id)? else {
         return Ok(RouteRuntimeLoad::Rejected(
             RouteRuntimeRejection::RuntimeMissing,
@@ -398,11 +423,33 @@ fn load_route_runtime_in(
     })))
 }
 
-fn load_placement_admission_in(
+pub(super) fn load_placement_admission_at_in(
     transaction: &mut Transaction<'_>,
     node_id: &Id,
     active_guest_digest: &cats_api::runtime_reconciliation::Sha256Digest,
+    now: UnixMillis,
 ) -> AuthorityTxResult<PlacementAdmissionLoad> {
+    let mut checkpoint = |_: &mut Transaction<'_>| Ok(());
+    load_placement_admission_at_in_checked(
+        transaction,
+        node_id,
+        active_guest_digest,
+        now,
+        &mut checkpoint,
+    )
+}
+
+pub(super) fn load_placement_admission_at_in_checked<F>(
+    transaction: &mut Transaction<'_>,
+    node_id: &Id,
+    active_guest_digest: &cats_api::runtime_reconciliation::Sha256Digest,
+    now: UnixMillis,
+    checkpoint: &mut F,
+) -> AuthorityTxResult<PlacementAdmissionLoad>
+where
+    F: FnMut(&mut Transaction<'_>) -> AuthorityTxResult<()>,
+{
+    checkpoint(transaction)?;
     let Some(identity) = load_identity_by_node_unlocked(transaction, node_id)? else {
         return Ok(PlacementAdmissionLoad::Rejected(
             PlacementAdmissionRejection::IdentityNotProvisioned,
@@ -413,6 +460,16 @@ fn load_placement_admission_in(
             PlacementAdmissionRejection::IdentityNotProvisioned,
         ));
     }
+    // Stored assigned-set overflow/corruption is fatal even when the session
+    // or inventory would otherwise produce an ordinary eligibility rejection.
+    // LIMIT 1025 preserves the hard memory/read bound while proving overflow.
+    checkpoint(transaction)?;
+    let current_desired =
+        load_assigned_desired_unlocked(transaction, node_id, MAX_ASSIGNED_SPECS.saturating_add(1))?;
+    if current_desired.len() > MAX_ASSIGNED_SPECS {
+        return Err(corrupt("current assigned Desired set exceeds its hard cap"));
+    }
+    checkpoint(transaction)?;
     let Some(session) = load_current_session_unlocked(transaction, node_id)? else {
         return Ok(PlacementAdmissionLoad::Rejected(
             PlacementAdmissionRejection::SessionMissing,
@@ -425,7 +482,6 @@ fn load_placement_admission_in(
             "NodeIdentity/current AgentSession binding mismatch",
         ));
     }
-    let now = database_now(transaction)?;
     if now >= session.lease_deadline_unix_ms {
         return Ok(PlacementAdmissionLoad::Rejected(
             PlacementAdmissionRejection::SessionExpired,
@@ -436,6 +492,7 @@ fn load_placement_admission_in(
             PlacementAdmissionRejection::GuestConfigMismatch,
         ));
     }
+    checkpoint(transaction)?;
     let Some(inventory) = load_admission_inventory_state_unlocked(transaction, node_id)? else {
         return Ok(PlacementAdmissionLoad::Rejected(
             PlacementAdmissionRejection::InventoryMissing,
@@ -463,7 +520,6 @@ fn load_placement_admission_in(
             PlacementAdmissionRejection::InventoryStale,
         ));
     }
-    let current_desired = load_assigned_desired_unlocked(transaction, node_id)?;
     if current_desired != cursor.desired_specs {
         return Ok(PlacementAdmissionLoad::Rejected(
             PlacementAdmissionRejection::AssignedSetChanged,
@@ -664,6 +720,11 @@ fn authenticate_identity(
             identity.credential_binding,
             CredentialBinding::PublicKey { .. }
         )
+    {
+        return Ok(None);
+    }
+    if lock_exact_credential_lineage(transaction, &identity)?
+        != Some(CredentialLineageState::Active)
     {
         return Ok(None);
     }

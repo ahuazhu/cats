@@ -67,6 +67,21 @@ enum AuthorityTransactionMode {
 }
 
 impl Store {
+    #[cfg(test)]
+    pub(super) fn inject_committed_response_loss_once(&self) {
+        self.commit_response_loss_once
+            .store(true, Ordering::Release);
+    }
+
+    #[cfg(test)]
+    pub(super) fn inject_committed_response_loss_once_after(&self, delay: Duration) {
+        self.commit_response_loss_delay_ms.store(
+            u64::try_from(delay.as_millis()).unwrap_or(u64::MAX),
+            Ordering::Release,
+        );
+        self.inject_committed_response_loss_once();
+    }
+
     /// Runs one complete authority closure in one fresh PostgreSQL
     /// transaction. Retriable database failures replay the whole closure;
     /// domain conflicts are rolled back and returned exactly once.
@@ -111,10 +126,36 @@ impl Store {
         self.authority_transaction_outcome_with(operation, AuthorityTransactionMode::ReadWrite)
     }
 
+    /// Cat-create exposes its commit-send phase to an async cancellation
+    /// owner. A serialization/deadlock failure is a definite non-commit and
+    /// therefore permits that owner to reset its per-attempt phase before the
+    /// closed transaction is replayed. Connection failures stay ambiguous and
+    /// deliberately do not invoke this hook.
+    pub(super) fn authority_transaction_outcome_with_definite_retry<T: Send>(
+        &self,
+        operation: impl FnMut(&mut postgres::Transaction<'_>) -> AuthorityTxResult<T> + Send,
+        on_definite_retry: impl FnMut() + Send,
+    ) -> std::result::Result<T, AuthorityExecutionError> {
+        self.authority_transaction_outcome_with_hook(
+            operation,
+            AuthorityTransactionMode::ReadWrite,
+            on_definite_retry,
+        )
+    }
+
     fn authority_transaction_outcome_with<T: Send>(
+        &self,
+        operation: impl FnMut(&mut postgres::Transaction<'_>) -> AuthorityTxResult<T> + Send,
+        mode: AuthorityTransactionMode,
+    ) -> std::result::Result<T, AuthorityExecutionError> {
+        self.authority_transaction_outcome_with_hook(operation, mode, || {})
+    }
+
+    fn authority_transaction_outcome_with_hook<T: Send>(
         &self,
         mut operation: impl FnMut(&mut postgres::Transaction<'_>) -> AuthorityTxResult<T> + Send,
         mode: AuthorityTransactionMode,
+        mut on_definite_retry: impl FnMut() + Send,
     ) -> std::result::Result<T, AuthorityExecutionError> {
         for attempt in 0..AUTHORITY_TRANSACTION_ATTEMPTS {
             let outcome = self.enter(|client| {
@@ -129,10 +170,23 @@ impl Store {
                 }
                 .map_err(AttemptFailure::Postgres)?;
                 match operation(&mut transaction) {
-                    Ok(value) => transaction
-                        .commit()
-                        .map(|()| value)
-                        .map_err(AttemptFailure::Postgres),
+                    Ok(value) => match transaction.commit() {
+                        Ok(()) => {
+                            #[cfg(test)]
+                            if self.commit_response_loss_once.swap(false, Ordering::AcqRel) {
+                                let delay_ms =
+                                    self.commit_response_loss_delay_ms.swap(0, Ordering::AcqRel);
+                                if delay_ms != 0 {
+                                    std::thread::sleep(Duration::from_millis(delay_ms));
+                                }
+                                return Err(AttemptFailure::Infrastructure(ApiError::unavailable(
+                                    "injected loss of a successful PostgreSQL commit response",
+                                )));
+                            }
+                            Ok(value)
+                        }
+                        Err(error) => Err(AttemptFailure::Postgres(error)),
+                    },
                     Err(AuthorityTransactionError::Domain(error)) => {
                         // A domain rejection is never replayed. If its explicit
                         // rollback fails, the transaction outcome is unknown
@@ -202,6 +256,9 @@ impl Store {
                     let retry_reason = authority_retry_reason(&error);
                     if attempt + 1 < AUTHORITY_TRANSACTION_ATTEMPTS {
                         if let Some(reason) = retry_reason {
+                            if authority_retry_is_definite(&error) {
+                                on_definite_retry();
+                            }
                             metrics::record_authority_retry(reason);
                             std::thread::sleep(retry_delay(attempt));
                             continue;
@@ -213,6 +270,17 @@ impl Store {
                         Some(_) => ApiError::unavailable(format!(
                             "runtime authority transaction did not commit after {AUTHORITY_TRANSACTION_ATTEMPTS} attempts"
                         )),
+                        None
+                            if matches!(
+                                error.code(),
+                                Some(&SqlState::QUERY_CANCELED)
+                                    | Some(&SqlState::LOCK_NOT_AVAILABLE)
+                            ) =>
+                        {
+                            ApiError::unavailable(
+                                "runtime authority PostgreSQL statement or lock deadline elapsed",
+                            )
+                        }
                         None => internal(format!(
                             "runtime authority PostgreSQL transaction failed: {error}"
                         )),
@@ -222,6 +290,13 @@ impl Store {
         }
         unreachable!("the bounded authority transaction loop always returns")
     }
+}
+
+fn authority_retry_is_definite(error: &postgres::Error) -> bool {
+    matches!(
+        error.code(),
+        Some(&SqlState::T_R_SERIALIZATION_FAILURE | &SqlState::T_R_DEADLOCK_DETECTED)
+    )
 }
 
 fn authority_rejection(error: AuthorityError) -> ApiError {

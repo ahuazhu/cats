@@ -657,6 +657,32 @@ pub(super) fn load_desired_unlocked(
         .transpose()
 }
 
+/// Looks up the globally unique Guest network identity without introducing a
+/// second scheduler/lease table. Callers use one repeatable-read planner
+/// snapshot or hold the matching candidate advisory lock in a mutation.
+pub(super) fn load_desired_by_network_id_unlocked(
+    transaction: &mut Transaction<'_>,
+    network_id: &Id,
+) -> AuthorityTxResult<Option<DesiredRuntimeSpec>> {
+    let sql = format!(
+        "SELECT {DESIRED_COLUMNS} FROM desired_runtime_specs
+          WHERE record->'runtime'->'network_config'->>'network_id'=$1
+          ORDER BY cat_id COLLATE \"C\" LIMIT 2"
+    );
+    let rows = transaction.query(&sql, &[&network_id.as_str()])?;
+    if rows.len() > 1 {
+        return Err(corrupt(()));
+    }
+    let desired = rows.first().map(decode_desired).transpose()?;
+    if desired
+        .as_ref()
+        .is_some_and(|desired| desired.runtime.network_config.network_id != *network_id)
+    {
+        return Err(corrupt(()));
+    }
+    Ok(desired)
+}
+
 pub(super) fn decode_desired(row: &Row) -> AuthorityTxResult<DesiredRuntimeSpec> {
     let stored = DesiredProjection::from_row(row)?;
     let json: String = row.try_get("record_json")?;
@@ -674,7 +700,8 @@ pub(super) fn load_assigned_desired_for_update(
 ) -> AuthorityTxResult<Vec<DesiredRuntimeSpec>> {
     let sql = format!(
         "SELECT {DESIRED_COLUMNS} FROM desired_runtime_specs
-          WHERE node_id=$1 ORDER BY cat_id FOR UPDATE"
+          WHERE node_id=$1 OR record->'placement'->>'node_id'=$1
+          ORDER BY cat_id COLLATE \"C\" FOR UPDATE"
     );
     transaction
         .query(&sql, &[&node_id.as_str()])?
@@ -687,13 +714,16 @@ pub(super) fn load_assigned_desired_for_update(
 pub(super) fn load_assigned_desired_unlocked(
     transaction: &mut Transaction<'_>,
     node_id: &Id,
+    limit: usize,
 ) -> AuthorityTxResult<Vec<DesiredRuntimeSpec>> {
+    let limit = i64::try_from(limit).map_err(corrupt)?;
     let sql = format!(
         "SELECT {DESIRED_COLUMNS} FROM desired_runtime_specs
-          WHERE node_id=$1 ORDER BY cat_id"
+          WHERE node_id=$1 OR record->'placement'->>'node_id'=$1
+          ORDER BY cat_id COLLATE \"C\" LIMIT $2"
     );
     transaction
-        .query(&sql, &[&node_id.as_str()])?
+        .query(&sql, &[&node_id.as_str(), &limit])?
         .iter()
         .map(decode_desired)
         .collect()

@@ -19,13 +19,15 @@ use cats_storage::authority::{
 use postgres::error::SqlState;
 use sha2::{Digest, Sha256};
 
+use super::cat_create_service::CatCreatePlacementMutation;
 use super::product::{
-    api_request_fingerprint, encode_cat_create_accepted_response,
-    encode_cat_name_conflict_response, ApiIdempotencyRequest, CandidateCollision,
-    CatCreateCandidate, CatCreateEnvelopes, CoveredCatCreateError, CoveredCatCreateRequest,
-    DiskAdminState, DiskRecord, DiskRecordCandidate, DiskRole, EndpointRecord,
-    EndpointRecordCandidate, ExactContentType, ExactHttpResponse, HostnameDesiredLocation,
-    HostnameDesiredLookup, IfMatchFingerprint, PersistentDiskInitialization,
+    api_request_fingerprint, candidate_matches_placement_mutation,
+    encode_cat_create_accepted_response, encode_cat_name_conflict_response, ApiIdempotencyRequest,
+    CandidateCollision, CatCreateCandidate, CatCreateEnvelopes, CoveredCatCreateError,
+    CoveredCatCreateRequest, DiskAdminState, DiskRecord, DiskRecordCandidate, DiskRole,
+    EndpointRecord, EndpointRecordCandidate, ExactContentType, ExactHttpResponse,
+    HostnameDesiredLocation, HostnameDesiredLookup, IfMatchFingerprint,
+    PersistentDiskInitialization,
 };
 use super::product_rows::{
     insert_disk, insert_endpoint, insert_hostname_lookup, insert_operation,
@@ -284,6 +286,40 @@ pub(super) fn request(
         },
         envelopes: CatCreateEnvelopes::new(accepted, cat_id, operation_id, conflict).unwrap(),
     }
+}
+
+#[test]
+fn placement_mutation_binding_rejects_every_candidate_drift() {
+    let covered = request(&id("ws_mutation"), "app", 1, "mutation-key");
+    let candidate = &covered.candidate;
+    let exact = CatCreatePlacementMutation {
+        cat_id: candidate.cat_id.clone(),
+        desired_revision: candidate.desired.desired_revision,
+        placement_epoch: candidate.desired.placement.placement_epoch,
+        vcpus: candidate.desired.runtime.vcpus,
+        memory_bytes: candidate.desired.runtime.memory_bytes,
+        network_config: candidate.desired.runtime.network_config.clone(),
+    };
+    assert!(candidate_matches_placement_mutation(candidate, &exact));
+
+    let mut drift = exact.clone();
+    drift.cat_id = id("cat_other");
+    assert!(!candidate_matches_placement_mutation(candidate, &drift));
+    let mut drift = exact.clone();
+    drift.desired_revision = revision(2);
+    assert!(!candidate_matches_placement_mutation(candidate, &drift));
+    let mut drift = exact.clone();
+    drift.placement_epoch = epoch(2);
+    assert!(!candidate_matches_placement_mutation(candidate, &drift));
+    let mut drift = exact.clone();
+    drift.vcpus = drift.vcpus.saturating_add(1);
+    assert!(!candidate_matches_placement_mutation(candidate, &drift));
+    let mut drift = exact.clone();
+    drift.memory_bytes = drift.memory_bytes.saturating_add(1);
+    assert!(!candidate_matches_placement_mutation(candidate, &drift));
+    let mut drift = exact;
+    drift.network_config.network_id = id("network_other");
+    assert!(!candidate_matches_placement_mutation(candidate, &drift));
 }
 
 pub(super) fn counts(store: &Store) -> [i64; 8] {
@@ -1063,6 +1099,21 @@ fn every_persisted_candidate_identity_collision_is_typed_and_rolls_back() {
     operation_collision.candidate.operation_id = original.candidate.operation_id.clone();
     refresh_candidate_contract(&mut operation_collision);
 
+    let mut network_collision = request(&workspace, "new-network-name", 7, "network-collision");
+    network_collision
+        .candidate
+        .desired
+        .runtime
+        .network_config
+        .network_id = original
+        .candidate
+        .desired
+        .runtime
+        .network_config
+        .network_id
+        .clone();
+    refresh_candidate_contract(&mut network_collision);
+
     let mut endpoint_collision = request(&workspace, "new-endpoint-name", 6, "endpoint-collision");
     endpoint_collision.candidate.endpoint.endpoint_id =
         original.candidate.endpoint.endpoint_id.clone();
@@ -1089,6 +1140,7 @@ fn every_persisted_candidate_identity_collision_is_typed_and_rolls_back() {
         (&volume_collision, CandidateCollision::VolumeId),
         (&endpoint_collision, CandidateCollision::EndpointIdOrName),
         (&operation_collision, CandidateCollision::OperationId),
+        (&network_collision, CandidateCollision::NetworkId),
     ] {
         let error = store
             .create_cat_covered_without_admission_for_product_test(request)
@@ -1100,6 +1152,63 @@ fn every_persisted_candidate_identity_collision_is_typed_and_rolls_back() {
         assert_eq!(failed_request_artifact_count(&store, request), 0);
         assert_eq!(counts(&store), [1, 1, 1, 1, 1, 1, 1, 1]);
     }
+}
+
+#[test]
+fn concurrent_cross_node_network_identity_commits_have_exactly_one_winner() {
+    let (_url, first, second, workspace) = stores();
+    let first_request = request(&workspace, "network-a", 101, "network-key-a");
+    let mut second_request = request(&workspace, "network-b", 102, "network-key-b");
+    second_request
+        .candidate
+        .desired
+        .runtime
+        .network_config
+        .network_id = first_request
+        .candidate
+        .desired
+        .runtime
+        .network_config
+        .network_id
+        .clone();
+    refresh_candidate_contract(&mut second_request);
+
+    let saved_first = first_request.clone();
+    let saved_second = second_request.clone();
+    let barrier = Arc::new(Barrier::new(3));
+    let first_barrier = Arc::clone(&barrier);
+    let second_barrier = Arc::clone(&barrier);
+    let first_worker = std::thread::spawn(move || {
+        first_barrier.wait();
+        first.create_cat_covered_without_admission_for_product_test(&first_request)
+    });
+    let second_worker = std::thread::spawn(move || {
+        second_barrier.wait();
+        second.create_cat_covered_without_admission_for_product_test(&second_request)
+    });
+    barrier.wait();
+    let first_result = first_worker.join().unwrap();
+    let second_result = second_worker.join().unwrap();
+
+    let observer = Store::connect(&_url, None).unwrap();
+    let (winner, loser, loser_error) = match (first_result, second_result) {
+        (Ok(result), Err(error)) => {
+            assert_eq!(result.http_status, 202);
+            (&saved_first, &saved_second, error)
+        }
+        (Err(error), Ok(result)) => {
+            assert_eq!(result.http_status, 202);
+            (&saved_second, &saved_first, error)
+        }
+        results => panic!("expected one network winner and one collision: {results:?}"),
+    };
+    assert!(matches!(
+        loser_error,
+        CoveredCatCreateError::CandidateCollision(CandidateCollision::NetworkId)
+    ));
+    assert_eq!(candidate_row_count(&observer, winner), 7);
+    assert_eq!(candidate_row_count(&observer, loser), 0);
+    assert_eq!(counts(&observer), [1, 1, 1, 1, 1, 1, 1, 1]);
 }
 
 #[test]

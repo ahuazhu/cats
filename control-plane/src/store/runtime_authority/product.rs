@@ -5,6 +5,10 @@
 //! the atomic PostgreSQL contract land without a second authority or dual
 //! write to the legacy product tables.
 
+use std::sync::atomic::{AtomicU8, Ordering};
+use std::sync::Arc;
+use std::time::Instant;
+
 use cats_api::error::ApiError;
 use cats_api::runtime_reconciliation::{
     encode_desired_runtime_spec, AsciiText, ContractVersion, DesiredRuntimeSpec, DiskKind,
@@ -17,15 +21,20 @@ use postgres::Transaction;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
+use super::cat_create_service::CatCreatePlacementMutation;
+use super::placement_planner::{
+    lock_cat_create_placement_for_desired_mutation, PlacementCommitLoad, PlacementTargetSnapshot,
+};
 use super::product_rows::{
     insert_api_result, insert_cat, insert_desired, insert_disk, insert_endpoint,
     insert_hostname_lookup, insert_operation, load_api_result_for_update,
-    load_cat_by_id_for_update, load_cat_by_name_unlocked, load_desired_for_update,
-    load_desired_unlocked, load_disk_by_id_for_update, load_disk_by_name_for_update,
-    load_endpoint_by_cat_name_unlocked, load_endpoint_by_id_for_update,
-    load_endpoint_by_id_unlocked, load_hostname_lookup_for_update, load_hostname_lookup_unlocked,
-    load_hostname_lookups_by_cat_unlocked, load_operation_by_cat_revision_unlocked,
-    load_operation_for_update, load_root_disk_by_cat_unlocked,
+    load_cat_by_id_for_update, load_cat_by_name_unlocked, load_desired_by_network_id_unlocked,
+    load_desired_for_update, load_desired_unlocked, load_disk_by_id_for_update,
+    load_disk_by_name_for_update, load_endpoint_by_cat_name_unlocked,
+    load_endpoint_by_id_for_update, load_endpoint_by_id_unlocked, load_hostname_lookup_for_update,
+    load_hostname_lookup_unlocked, load_hostname_lookups_by_cat_unlocked,
+    load_operation_by_cat_revision_unlocked, load_operation_for_update,
+    load_root_disk_by_cat_unlocked,
 };
 use super::rows::{database_now, insert_volume, load_volume_for_update};
 use super::runtime_spine::{
@@ -283,6 +292,7 @@ pub(crate) enum CandidateCollision {
     EndpointIdOrName,
     Hostname,
     OperationId,
+    NetworkId,
 }
 
 #[derive(Debug)]
@@ -294,6 +304,183 @@ pub(crate) enum CoveredCatCreateError {
 }
 
 type CoveredCatCreateResult<T> = std::result::Result<T, CoveredCatCreateError>;
+
+const CAT_CREATE_PRE_COMMIT: u8 = 0;
+const CAT_CREATE_COMMIT_SENT: u8 = 1;
+const CAT_CREATE_CANCELLED: u8 = 2;
+
+struct CatCreateCommitShared {
+    phase: AtomicU8,
+    cancel_requested: std::sync::atomic::AtomicBool,
+    cancelled: tokio::sync::Notify,
+}
+
+impl CatCreateCommitShared {
+    fn mark_cancelled(&self) {
+        let _ = self.phase.compare_exchange(
+            CAT_CREATE_PRE_COMMIT,
+            CAT_CREATE_CANCELLED,
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        );
+        if self.phase.load(Ordering::Acquire) == CAT_CREATE_CANCELLED {
+            self.cancelled.notify_waiters();
+        }
+    }
+}
+
+/// Request-lifetime cancellation half of the Cat-create commit boundary.
+/// Dropping it only cancels work which has not crossed into PostgreSQL commit;
+/// after that point the blocking Store job owns result resolution.
+pub(crate) struct CatCreateCommitCancellation(Arc<CatCreateCommitShared>);
+
+#[derive(Clone)]
+pub(crate) struct CatCreateCommitState {
+    shared: Arc<CatCreateCommitShared>,
+    absolute_deadline: Instant,
+}
+
+impl CatCreateCommitCancellation {
+    pub(crate) fn new(absolute_deadline: Instant) -> (Self, CatCreateCommitState) {
+        let state = Arc::new(CatCreateCommitShared {
+            phase: AtomicU8::new(CAT_CREATE_PRE_COMMIT),
+            cancel_requested: std::sync::atomic::AtomicBool::new(false),
+            cancelled: tokio::sync::Notify::new(),
+        });
+        (
+            Self(Arc::clone(&state)),
+            CatCreateCommitState {
+                shared: state,
+                absolute_deadline,
+            },
+        )
+    }
+
+    /// Atomically cancel only work which has not crossed the commit-send
+    /// boundary. `false` means the Store job owns non-cancellable resolution.
+    pub(crate) fn cancel_before_commit(&self) -> bool {
+        self.0.cancel_requested.store(true, Ordering::Release);
+        self.0.mark_cancelled();
+        match self.0.phase.load(Ordering::Acquire) {
+            CAT_CREATE_CANCELLED => true,
+            CAT_CREATE_COMMIT_SENT => false,
+            _ => true,
+        }
+    }
+}
+
+impl Drop for CatCreateCommitCancellation {
+    fn drop(&mut self) {
+        self.0.cancel_requested.store(true, Ordering::Release);
+        self.0.mark_cancelled();
+    }
+}
+
+impl CatCreateCommitState {
+    pub(crate) fn commit_was_sent(&self) -> bool {
+        self.shared.phase.load(Ordering::Acquire) == CAT_CREATE_COMMIT_SENT
+    }
+
+    pub(crate) async fn cancelled_before_commit(&self) {
+        loop {
+            let cancelled = self.shared.cancelled.notified();
+            if self.shared.phase.load(Ordering::Acquire) == CAT_CREATE_CANCELLED {
+                return;
+            }
+            cancelled.await;
+        }
+    }
+
+    fn checkpoint(&self, transaction: &mut Transaction<'_>) -> AuthorityTxResult<()> {
+        if self.shared.cancel_requested.load(Ordering::Acquire) {
+            self.shared.mark_cancelled();
+        }
+        let phase = self.shared.phase.load(Ordering::Acquire);
+        if phase == CAT_CREATE_CANCELLED {
+            return Err(
+                ApiError::unavailable("Cat create was cancelled before PostgreSQL commit").into(),
+            );
+        }
+        if phase == CAT_CREATE_COMMIT_SENT {
+            return Ok(());
+        }
+        let Some(remaining) = self
+            .absolute_deadline
+            .checked_duration_since(Instant::now())
+            .filter(|remaining| !remaining.is_zero())
+        else {
+            self.shared.mark_cancelled();
+            return Err(ApiError::unavailable("Cat create deadline elapsed").into());
+        };
+        let statement_ms = remaining.as_millis().clamp(1, 5_000);
+        let lock_ms = remaining.as_millis().clamp(1, 2_000);
+        transaction.query_one(
+            "SELECT set_config('statement_timeout', $1, true),
+                    set_config('lock_timeout', $2, true)",
+            &[&format!("{statement_ms}ms"), &format!("{lock_ms}ms")],
+        )?;
+        Ok(())
+    }
+
+    fn begin_commit(&self, transaction: &mut Transaction<'_>) -> AuthorityTxResult<()> {
+        self.checkpoint(transaction)?;
+        match self.shared.phase.compare_exchange(
+            CAT_CREATE_PRE_COMMIT,
+            CAT_CREATE_COMMIT_SENT,
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        ) {
+            Ok(_) => {
+                // `checkpoint` performs SQL and its response can cross the
+                // wall-clock deadline. The CAS is only a provisional local
+                // commit-send linearization until this post-CAS clock/cancel
+                // check succeeds; no PostgreSQL COMMIT has been issued yet.
+                if self.shared.cancel_requested.load(Ordering::Acquire)
+                    || Instant::now() >= self.absolute_deadline
+                {
+                    if self
+                        .shared
+                        .phase
+                        .compare_exchange(
+                            CAT_CREATE_COMMIT_SENT,
+                            CAT_CREATE_CANCELLED,
+                            Ordering::AcqRel,
+                            Ordering::Acquire,
+                        )
+                        .is_ok()
+                    {
+                        self.shared.cancelled.notify_waiters();
+                    }
+                    return Err(ApiError::unavailable(
+                        "Cat create deadline elapsed before PostgreSQL commit",
+                    )
+                    .into());
+                }
+                Ok(())
+            }
+            Err(CAT_CREATE_COMMIT_SENT) => Ok(()),
+            Err(CAT_CREATE_CANCELLED) => Err(ApiError::unavailable(
+                "Cat create was cancelled before PostgreSQL commit",
+            )
+            .into()),
+            Err(_) => Err(ApiError::internal("invalid Cat create commit state").into()),
+        }
+    }
+
+    fn reset_after_definite_retry(&self) {
+        let _ = self.shared.phase.compare_exchange(
+            CAT_CREATE_COMMIT_SENT,
+            CAT_CREATE_PRE_COMMIT,
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        );
+        if self.shared.cancel_requested.load(Ordering::Acquire)
+            || Instant::now() >= self.absolute_deadline
+        {
+            self.shared.mark_cancelled();
+        }
+    }
+}
 
 enum CreateCatTransactionError {
     Authority(AuthorityTransactionError),
@@ -400,6 +587,23 @@ impl Store {
         })
     }
 
+    /// Resolves a result after the original transaction crossed commit-send.
+    /// The same API-key advisory reservation is the visibility barrier: a
+    /// missing row is definitive only after the original transaction has
+    /// committed or rolled back and released this lock.
+    pub(crate) fn cat_create_result_after_commit(
+        &self,
+        request: &ApiIdempotencyRequest,
+    ) -> Result<Option<ApiIdempotencyResult>> {
+        self.authority_transaction(|transaction| {
+            reserve_api_key(transaction, request)?;
+            load_api_result_for_update(transaction, request)?
+                .map(|result| check_replay(result, &request.request_fingerprint))
+                .transpose()
+                .map_err(AuthorityTransactionError::from)
+        })
+    }
+
     /// Locate the current Desired revision for a hostname without returning a
     /// copied route binding. Every hit is closed against the immutable
     /// Endpoint product record and the current complete Desired in one
@@ -435,7 +639,28 @@ impl Store {
         planned_admission: &PlacementAdmissionSnapshot,
         active_guest_digest: &Sha256Digest,
     ) -> CoveredCatCreateResult<ApiIdempotencyResult> {
-        self.create_cat_covered_inner(request, Some((planned_admission, active_guest_digest)))
+        self.create_cat_covered_inner(
+            request,
+            Some((planned_admission, active_guest_digest)),
+            None,
+            None,
+        )
+    }
+
+    pub(crate) fn create_cat_covered_with_placement(
+        &self,
+        request: &CoveredCatCreateRequest,
+        planned_target: &PlacementTargetSnapshot,
+        planned_mutation: &CatCreatePlacementMutation,
+        active_guest_digest: &Sha256Digest,
+        commit_state: &CatCreateCommitState,
+    ) -> CoveredCatCreateResult<ApiIdempotencyResult> {
+        self.create_cat_covered_inner(
+            request,
+            None,
+            Some((planned_target, planned_mutation, active_guest_digest)),
+            Some(commit_state),
+        )
     }
 
     #[cfg(test)]
@@ -443,25 +668,46 @@ impl Store {
         &self,
         request: &CoveredCatCreateRequest,
     ) -> CoveredCatCreateResult<ApiIdempotencyResult> {
-        self.create_cat_covered_inner(request, None)
+        self.create_cat_covered_inner(request, None, None, None)
     }
 
     fn create_cat_covered_inner(
         &self,
         request: &CoveredCatCreateRequest,
         admission: Option<(&PlacementAdmissionSnapshot, &Sha256Digest)>,
+        placement: Option<(
+            &PlacementTargetSnapshot,
+            &CatCreatePlacementMutation,
+            &Sha256Digest,
+        )>,
+        commit_state: Option<&CatCreateCommitState>,
     ) -> CoveredCatCreateResult<ApiIdempotencyResult> {
         let mut collision = None;
-        let result = self.authority_transaction_outcome(|transaction| {
-            match create_cat_in(transaction, request, admission) {
-                Ok(result) => Ok(result),
-                Err(CreateCatTransactionError::Authority(error)) => Err(error),
-                Err(CreateCatTransactionError::CandidateCollision(kind)) => {
-                    collision = Some(kind);
-                    Err(AuthorityTransactionError::CandidateCollision)
+        let result = self.authority_transaction_outcome_with_definite_retry(
+            |transaction| {
+                if let Some(commit_state) = commit_state {
+                    commit_state.checkpoint(transaction)?;
                 }
-            }
-        });
+                match create_cat_in(transaction, request, admission, placement, commit_state) {
+                    Ok(result) => {
+                        if let Some(commit_state) = commit_state {
+                            commit_state.begin_commit(transaction)?;
+                        }
+                        Ok(result)
+                    }
+                    Err(CreateCatTransactionError::Authority(error)) => Err(error),
+                    Err(CreateCatTransactionError::CandidateCollision(kind)) => {
+                        collision = Some(kind);
+                        Err(AuthorityTransactionError::CandidateCollision)
+                    }
+                }
+            },
+            || {
+                if let Some(commit_state) = commit_state {
+                    commit_state.reset_after_definite_retry();
+                }
+            },
+        );
         match result {
             Ok(result) => Ok(result),
             Err(AuthorityExecutionError::CandidateCollision) => match collision.take() {
@@ -479,8 +725,16 @@ fn create_cat_in(
     transaction: &mut Transaction<'_>,
     request: &CoveredCatCreateRequest,
     admission: Option<(&PlacementAdmissionSnapshot, &Sha256Digest)>,
+    placement: Option<(
+        &PlacementTargetSnapshot,
+        &CatCreatePlacementMutation,
+        &Sha256Digest,
+    )>,
+    commit_state: Option<&CatCreateCommitState>,
 ) -> std::result::Result<ApiIdempotencyResult, CreateCatTransactionError> {
+    checkpoint_cat_create(transaction, commit_state)?;
     reserve_api_key(transaction, &request.idempotency)?;
+    checkpoint_cat_create(transaction, commit_state)?;
     if let Some(result) = load_api_result_for_update(transaction, &request.idempotency)? {
         return check_replay(result, &request.idempotency.request_fingerprint)
             .map_err(AuthorityTransactionError::from)
@@ -488,11 +742,13 @@ fn create_cat_in(
     }
 
     validate_candidate(request).map_err(AuthorityTransactionError::from)?;
+    checkpoint_cat_create(transaction, commit_state)?;
     lock_cat_name(
         transaction,
         &request.candidate.workspace_id,
         &request.candidate.name,
     )?;
+    checkpoint_cat_create(transaction, commit_state)?;
     if let Some(existing) = load_cat_by_name_unlocked(
         transaction,
         &request.candidate.workspace_id,
@@ -501,15 +757,44 @@ fn create_cat_in(
         if existing.cat_id == request.candidate.cat_id {
             return Err(candidate_collision(CandidateCollision::CatId));
         }
-        validate_existing_cat_for_name_conflict(transaction, &existing)?;
+        checkpoint_cat_create(transaction, commit_state)?;
+        validate_existing_cat_for_name_conflict(transaction, &existing, commit_state)?;
+        checkpoint_cat_create(transaction, commit_state)?;
         let now = database_now(transaction)?;
         let result =
             result_from_envelope(&request.idempotency, &request.envelopes.name_conflict, now);
+        checkpoint_cat_create(transaction, commit_state)?;
         insert_api_result(transaction, &result)?;
         return Ok(result);
     }
 
-    if let Some((planned, active_guest_digest)) = admission {
+    checkpoint_cat_create(transaction, commit_state)?;
+    if let Some((planned, planned_mutation, active_guest_digest)) = placement {
+        if request.candidate.desired.placement.node_id != planned.admission.node_identity.node_id
+            || request.candidate.desired.runtime.guest_config_digest != *active_guest_digest
+            || !candidate_matches_placement_mutation(&request.candidate, planned_mutation)
+        {
+            return Err(AuthorityTransactionError::from(ApiError::internal(
+                "Cat create candidate is not bound to its placement target",
+            ))
+            .into());
+        }
+        let mut checkpoint =
+            |transaction: &mut Transaction<'_>| checkpoint_cat_create(transaction, commit_state);
+        if lock_cat_create_placement_for_desired_mutation(
+            transaction,
+            planned,
+            planned_mutation,
+            active_guest_digest,
+            &mut checkpoint,
+        )? != PlacementCommitLoad::Accepted
+        {
+            return Err(AuthorityTransactionError::from(ApiError::unavailable(
+                "placement plan changed before Cat create commit",
+            ))
+            .into());
+        }
+    } else if let Some((planned, active_guest_digest)) = admission {
         if request.candidate.desired.placement.node_id != planned.node_identity.node_id
             || request.candidate.desired.runtime.guest_config_digest != *active_guest_digest
         {
@@ -532,68 +817,101 @@ fn create_cat_in(
             .into());
         }
     }
+    checkpoint_cat_create(transaction, commit_state)?;
 
+    // Network identities are globally non-reusable, including across target
+    // Nodes. The advisory lock serializes concurrent commits for the same
+    // candidate without introducing a second persisted identity authority.
+    // It is deliberately after the selected NodeIdentity coordination lock
+    // and before Volume, matching the frozen Desired-mutation lock order.
+    let network_id = &request.candidate.desired.runtime.network_config.network_id;
+    lock_candidate_id(transaction, "network", network_id)?;
+    checkpoint_cat_create(transaction, commit_state)?;
+    if load_desired_by_network_id_unlocked(transaction, network_id)?.is_some() {
+        return Err(candidate_collision(CandidateCollision::NetworkId));
+    }
+
+    checkpoint_cat_create(transaction, commit_state)?;
     lock_candidate_id(transaction, "volume", &request.candidate.volume.volume_id)?;
+    checkpoint_cat_create(transaction, commit_state)?;
     if load_volume_for_update(transaction, &request.candidate.volume.volume_id)?.is_some() {
         return Err(candidate_collision(CandidateCollision::VolumeId));
     }
 
+    checkpoint_cat_create(transaction, commit_state)?;
     lock_candidate_id(transaction, "cat", &request.candidate.cat_id)?;
+    checkpoint_cat_create(transaction, commit_state)?;
     if load_cat_by_id_for_update(transaction, &request.candidate.cat_id)?.is_some() {
         return Err(candidate_collision(CandidateCollision::CatId));
     }
 
+    checkpoint_cat_create(transaction, commit_state)?;
     lock_candidate_id(transaction, "disk", &request.candidate.root_disk.disk_id)?;
-    if load_disk_by_id_for_update(transaction, &request.candidate.root_disk.disk_id)?.is_some()
-        || load_disk_by_name_for_update(
-            transaction,
-            &request.candidate.root_disk.workspace_id,
-            &request.candidate.root_disk.name,
-        )?
-        .is_some()
-    {
+    checkpoint_cat_create(transaction, commit_state)?;
+    let disk_id_collision =
+        load_disk_by_id_for_update(transaction, &request.candidate.root_disk.disk_id)?.is_some();
+    checkpoint_cat_create(transaction, commit_state)?;
+    let disk_name_collision = load_disk_by_name_for_update(
+        transaction,
+        &request.candidate.root_disk.workspace_id,
+        &request.candidate.root_disk.name,
+    )?
+    .is_some();
+    if disk_id_collision || disk_name_collision {
         return Err(candidate_collision(CandidateCollision::DiskIdOrName));
     }
 
+    checkpoint_cat_create(transaction, commit_state)?;
     lock_candidate_id(transaction, "desired", &request.candidate.cat_id)?;
+    checkpoint_cat_create(transaction, commit_state)?;
     if load_desired_for_update(transaction, &request.candidate.cat_id)?.is_some() {
         return Err(stored_corruption("current Desired exists without its foreign-key Cat").into());
     }
 
+    checkpoint_cat_create(transaction, commit_state)?;
     lock_candidate_id(
         transaction,
         "endpoint",
         &request.candidate.endpoint.endpoint_id,
     )?;
+    checkpoint_cat_create(transaction, commit_state)?;
     lock_candidate_endpoint_name(
         transaction,
         &request.candidate.endpoint.cat_id,
         &request.candidate.endpoint.name,
     )?;
-    if load_endpoint_by_id_for_update(transaction, &request.candidate.endpoint.endpoint_id)?
-        .is_some()
-        || load_endpoint_by_cat_name_unlocked(
-            transaction,
-            &request.candidate.endpoint.cat_id,
-            &request.candidate.endpoint.name,
-        )?
-        .is_some()
-    {
+    checkpoint_cat_create(transaction, commit_state)?;
+    let endpoint_id_collision =
+        load_endpoint_by_id_for_update(transaction, &request.candidate.endpoint.endpoint_id)?
+            .is_some();
+    checkpoint_cat_create(transaction, commit_state)?;
+    let endpoint_name_collision = load_endpoint_by_cat_name_unlocked(
+        transaction,
+        &request.candidate.endpoint.cat_id,
+        &request.candidate.endpoint.name,
+    )?
+    .is_some();
+    if endpoint_id_collision || endpoint_name_collision {
         return Err(candidate_collision(CandidateCollision::EndpointIdOrName));
     }
 
+    checkpoint_cat_create(transaction, commit_state)?;
     lock_candidate_hostname(transaction, &request.candidate.hostname_lookup.hostname)?;
+    checkpoint_cat_create(transaction, commit_state)?;
     if load_hostname_lookup_for_update(transaction, &request.candidate.hostname_lookup.hostname)?
         .is_some()
     {
         return Err(candidate_collision(CandidateCollision::Hostname));
     }
 
+    checkpoint_cat_create(transaction, commit_state)?;
     lock_candidate_id(transaction, "operation", &request.candidate.operation_id)?;
+    checkpoint_cat_create(transaction, commit_state)?;
     if load_operation_for_update(transaction, &request.candidate.operation_id)?.is_some() {
         return Err(candidate_collision(CandidateCollision::OperationId));
     }
 
+    checkpoint_cat_create(transaction, commit_state)?;
     let now = database_now(transaction)?;
     let cat = CatRecord {
         cat_id: request.candidate.cat_id.clone(),
@@ -639,36 +957,74 @@ fn create_cat_in(
         now,
     );
 
+    checkpoint_cat_create(transaction, commit_state)?;
     insert_volume(transaction, &request.candidate.volume)?;
+    checkpoint_cat_create(transaction, commit_state)?;
     insert_cat(transaction, &cat)?;
+    checkpoint_cat_create(transaction, commit_state)?;
     insert_disk(transaction, &disk)?;
+    checkpoint_cat_create(transaction, commit_state)?;
     insert_desired(transaction, &request.candidate.desired)?;
+    checkpoint_cat_create(transaction, commit_state)?;
     insert_endpoint(transaction, &endpoint)?;
+    checkpoint_cat_create(transaction, commit_state)?;
     insert_hostname_lookup(transaction, &request.candidate.hostname_lookup)?;
+    checkpoint_cat_create(transaction, commit_state)?;
     insert_operation(transaction, &operation)?;
+    checkpoint_cat_create(transaction, commit_state)?;
     insert_api_result(transaction, &result)?;
     Ok(result)
+}
+
+pub(super) fn candidate_matches_placement_mutation(
+    candidate: &CatCreateCandidate,
+    planned: &CatCreatePlacementMutation,
+) -> bool {
+    candidate.cat_id == planned.cat_id
+        && candidate.desired.desired_revision == planned.desired_revision
+        && candidate.desired.placement.placement_epoch == planned.placement_epoch
+        && candidate.desired.runtime.vcpus == planned.vcpus
+        && candidate.desired.runtime.memory_bytes == planned.memory_bytes
+        && candidate.desired.runtime.network_config == planned.network_config
+}
+
+fn checkpoint_cat_create(
+    transaction: &mut Transaction<'_>,
+    commit_state: Option<&CatCreateCommitState>,
+) -> AuthorityTxResult<()> {
+    match commit_state {
+        Some(commit_state) => commit_state.checkpoint(transaction),
+        None => Ok(()),
+    }
 }
 
 fn validate_existing_cat_for_name_conflict(
     transaction: &mut Transaction<'_>,
     peeked_cat: &CatRecord,
+    commit_state: Option<&CatCreateCommitState>,
 ) -> AuthorityTxResult<()> {
+    checkpoint_cat_create(transaction, commit_state)?;
     let peeked_disk = load_root_disk_by_cat_unlocked(transaction, &peeked_cat.cat_id)?
         .ok_or_else(|| stored_corruption("existing Cat has no Root Disk"))?;
 
+    checkpoint_cat_create(transaction, commit_state)?;
     lock_candidate_id(transaction, "volume", &peeked_disk.volume_id)?;
+    checkpoint_cat_create(transaction, commit_state)?;
     let volume = load_volume_for_update(transaction, &peeked_disk.volume_id)?
         .ok_or_else(|| stored_corruption("existing Cat Root Volume disappeared"))?;
 
+    checkpoint_cat_create(transaction, commit_state)?;
     lock_candidate_id(transaction, "cat", &peeked_cat.cat_id)?;
+    checkpoint_cat_create(transaction, commit_state)?;
     let cat = load_cat_by_id_for_update(transaction, &peeked_cat.cat_id)?
         .ok_or_else(|| stored_corruption("existing Cat disappeared"))?;
     if cat != *peeked_cat {
         return Err(stored_corruption("existing Cat identity changed"));
     }
 
+    checkpoint_cat_create(transaction, commit_state)?;
     lock_candidate_id(transaction, "disk", &peeked_disk.disk_id)?;
+    checkpoint_cat_create(transaction, commit_state)?;
     let disk = load_disk_by_id_for_update(transaction, &peeked_disk.disk_id)?
         .ok_or_else(|| stored_corruption("existing Cat Root Disk disappeared"))?;
     if disk != peeked_disk
@@ -684,20 +1040,26 @@ fn validate_existing_cat_for_name_conflict(
         ));
     }
 
+    checkpoint_cat_create(transaction, commit_state)?;
     lock_candidate_id(transaction, "desired", &cat.cat_id)?;
+    checkpoint_cat_create(transaction, commit_state)?;
     let desired = load_desired_for_update(transaction, &cat.cat_id)?
         .ok_or_else(|| stored_corruption("existing Cat has no current Desired"))?;
     validate_existing_desired(&cat, &disk, &volume, &desired)?;
 
-    validate_existing_endpoints(transaction, &cat, &desired)?;
+    checkpoint_cat_create(transaction, commit_state)?;
+    validate_existing_endpoints(transaction, &cat, &desired, commit_state)?;
 
+    checkpoint_cat_create(transaction, commit_state)?;
     let peeked_operation = load_operation_by_cat_revision_unlocked(
         transaction,
         &cat.cat_id,
         desired.desired_revision,
     )?
     .ok_or_else(|| stored_corruption("existing Cat has no revision Operation"))?;
+    checkpoint_cat_create(transaction, commit_state)?;
     lock_candidate_id(transaction, "operation", &peeked_operation.operation_id)?;
+    checkpoint_cat_create(transaction, commit_state)?;
     let operation = load_operation_for_update(transaction, &peeked_operation.operation_id)?
         .ok_or_else(|| stored_corruption("existing Cat Operation disappeared"))?;
     if operation != peeked_operation
@@ -756,7 +1118,9 @@ fn validate_existing_endpoints(
     transaction: &mut Transaction<'_>,
     cat: &CatRecord,
     desired: &DesiredRuntimeSpec,
+    commit_state: Option<&CatCreateCommitState>,
 ) -> AuthorityTxResult<()> {
+    checkpoint_cat_create(transaction, commit_state)?;
     let lookups = load_hostname_lookups_by_cat_unlocked(transaction, &cat.cat_id)?;
     if lookups.len() != desired.endpoints.len() {
         return Err(stored_corruption(
@@ -770,7 +1134,9 @@ fn validate_existing_endpoints(
                 "existing Cat hostname lookup identities do not match current Desired",
             ));
         }
+        checkpoint_cat_create(transaction, commit_state)?;
         lock_candidate_id(transaction, "endpoint", &binding.endpoint_id)?;
+        checkpoint_cat_create(transaction, commit_state)?;
         let endpoint = load_endpoint_by_id_for_update(transaction, &binding.endpoint_id)?
             .ok_or_else(|| stored_corruption("current Desired Endpoint has no product record"))?;
         if endpoint.workspace_id != cat.workspace_id || endpoint.cat_id != cat.cat_id {
@@ -779,7 +1145,9 @@ fn validate_existing_endpoints(
             ));
         }
 
+        checkpoint_cat_create(transaction, commit_state)?;
         lock_candidate_hostname(transaction, &peeked_lookup.hostname)?;
+        checkpoint_cat_create(transaction, commit_state)?;
         let lookup = load_hostname_lookup_for_update(transaction, &peeked_lookup.hostname)?
             .ok_or_else(|| stored_corruption("current Desired hostname lookup disappeared"))?;
         if lookup != *peeked_lookup {

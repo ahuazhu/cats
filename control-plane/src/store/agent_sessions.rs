@@ -35,7 +35,7 @@ const CURRENT_SESSION_COLUMNS: &str = "
     agent_instance_id, agent_session_epoch, registration_attempt_id,
     guest_config_digest, lease_deadline_unix_ms";
 pub(super) const PROVISIONED_NODE_ID_PAGE_SIZE: usize = 64;
-const PROVISIONED_NODE_ID_QUERY_LIMIT: i64 = PROVISIONED_NODE_ID_PAGE_SIZE as i64 + 1;
+const PROVISIONED_NODE_ID_QUERY_LIMIT: i64 = PROVISIONED_NODE_ID_PAGE_SIZE as i64;
 
 /// The exact identity produced by a successful per-Node authentication check.
 ///
@@ -323,7 +323,7 @@ struct StoredRegistrationAttempt {
 impl Store {
     /// Idempotently inserts a new provisioned identity. It never rewrites an
     /// existing identity, so a retired lineage cannot be revived.
-    #[allow(dead_code, reason = "consumed by the Node provisioning service slice")]
+    #[cfg(test)]
     pub(crate) fn provision_node_identity(&self, identity: &NodeIdentity) -> Result<()> {
         if identity.state != NodeIdentityState::Provisioned {
             return Err(super::ApiError::invalid(
@@ -348,7 +348,7 @@ impl Store {
     }
 
     /// Permanently retires one exact identity while preserving its lineage.
-    #[allow(dead_code, reason = "consumed by the Node provisioning service slice")]
+    #[cfg(test)]
     pub(crate) fn retire_node_identity(&self, node_id: &Id) -> Result<()> {
         self.authority_transaction(|transaction| {
             let Some(identity) = load_identity_by_node_for_update(transaction, node_id)? else {
@@ -562,6 +562,9 @@ fn register_agent_session_in(
     {
         return Ok(identity_rejected());
     }
+    let Some(lineage_state) = lock_exact_credential_lineage(transaction, &identity)? else {
+        return Ok(identity_rejected());
+    };
 
     if let Some(stored) = load_attempt_for_update(
         transaction,
@@ -580,6 +583,9 @@ fn register_agent_session_in(
     }
 
     if identity.state != NodeIdentityState::Provisioned {
+        return Ok(identity_rejected());
+    }
+    if lineage_state != CredentialLineageState::Active {
         return Ok(identity_rejected());
     }
     if identity.immutable_host_id != attempt.immutable_host_id {
@@ -652,6 +658,70 @@ pub(super) fn load_identity_by_credential_for_update(
         .transpose()
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum CredentialLineageState {
+    Active,
+    Retired,
+}
+
+/// Locks and closes the exact all-history public-key lineage referenced by a
+/// locked NodeIdentity. A retired row remains readable only so registration
+/// can exact-replay an immutable committed attempt before applying its new-
+/// attempt eligibility gate; every other authenticated runtime path requires
+/// `Active`.
+pub(super) fn lock_exact_credential_lineage(
+    transaction: &mut Transaction<'_>,
+    identity: &NodeIdentity,
+) -> AuthorityTxResult<Option<CredentialLineageState>> {
+    let CredentialBinding::PublicKey {
+        public_key_spki_sha256,
+    } = &identity.credential_binding
+    else {
+        return Ok(None);
+    };
+    let row = transaction.query_opt(
+        "SELECT credential_id, node_id, public_key_spki_sha256, state,
+                first_committed_at_unix_ms, retired_at_unix_ms
+           FROM runtime_node_credential_lineage
+          WHERE credential_id=$1 AND node_id=$2
+            AND public_key_spki_sha256=$3 FOR SHARE",
+        &[
+            &identity.credential_id.as_str(),
+            &identity.node_id.as_str(),
+            &public_key_spki_sha256.as_str(),
+        ],
+    )?;
+    let Some(row) = row else {
+        return Err(corrupt(
+            "NodeIdentity has no exact persisted credential lineage",
+        ));
+    };
+    if row.try_get::<_, String>("credential_id")? != identity.credential_id.as_str()
+        || row.try_get::<_, String>("node_id")? != identity.node_id.as_str()
+        || row.try_get::<_, String>("public_key_spki_sha256")? != public_key_spki_sha256.as_str()
+    {
+        return Err(corrupt("credential lineage projection mismatch"));
+    }
+    let first: UnixMillis = from_pg(row.try_get("first_committed_at_unix_ms")?)?;
+    let retired: Option<UnixMillis> = row
+        .try_get::<_, Option<i64>>("retired_at_unix_ms")?
+        .map(from_pg)
+        .transpose()?;
+    let state = match row.try_get::<_, String>("state")?.as_str() {
+        "active" if retired.is_none() && identity.state == NodeIdentityState::Provisioned => {
+            CredentialLineageState::Active
+        }
+        "retired"
+            if retired.is_some_and(|retired_at| retired_at >= first)
+                && identity.state == NodeIdentityState::Retired =>
+        {
+            CredentialLineageState::Retired
+        }
+        _ => return Err(corrupt("credential lineage state/time mismatch")),
+    };
+    Ok(Some(state))
+}
+
 pub(super) fn load_identity_by_node_for_update(
     transaction: &mut Transaction<'_>,
     node_id: &Id,
@@ -678,8 +748,10 @@ pub(super) fn load_identity_by_node_unlocked(
         .transpose()
 }
 
-/// Returns at most one bounded keyset page plus one look-ahead row from the
-/// NodeIdentity authority. `state` is used only to bound the candidate scan;
+/// Returns at most one bounded keyset page from the NodeIdentity authority.
+/// A full page requires one further keyset query to prove EOF; the loader must
+/// never fetch or decode a larger Node than the frozen 64-row page. `state` is
+/// used only to bound the candidate scan;
 /// every returned row is still decoded and cross-checked against its complete
 /// JSON record before it can become a planner candidate.
 pub(super) fn load_provisioned_identities_after(
@@ -689,8 +761,8 @@ pub(super) fn load_provisioned_identities_after(
     let sql = format!(
         "SELECT {NODE_IDENTITY_COLUMNS} FROM node_identities
           WHERE state='provisioned'
-            AND ($1::TEXT IS NULL OR node_id > $1)
-          ORDER BY node_id
+            AND ($1::TEXT IS NULL OR node_id COLLATE \"C\" > $1 COLLATE \"C\")
+          ORDER BY node_id COLLATE \"C\"
           LIMIT $2"
     );
     let after = after.map(Id::as_str);
@@ -706,6 +778,32 @@ pub(super) fn load_provisioned_identities_after(
                 ));
             }
             Ok(identity)
+        })
+        .collect()
+}
+
+/// Returns only the ordered scalar keys for one planner page. The planner
+/// deliberately decodes each complete NodeIdentity only when it reaches that
+/// candidate, so selecting an earlier eligible Node cannot be poisoned by a
+/// malformed larger identity from the same SQL page.
+pub(super) fn load_provisioned_node_keys_after(
+    transaction: &mut Transaction<'_>,
+    after: Option<&Id>,
+) -> AuthorityTxResult<Vec<String>> {
+    let after = after.map(Id::as_str);
+    transaction
+        .query(
+            "SELECT node_id FROM node_identities
+              WHERE state='provisioned'
+                AND ($1::TEXT IS NULL OR node_id COLLATE \"C\" > $1 COLLATE \"C\")
+              ORDER BY node_id COLLATE \"C\"
+              LIMIT $2",
+            &[&after, &PROVISIONED_NODE_ID_QUERY_LIMIT],
+        )?
+        .iter()
+        .map(|row| {
+            row.try_get("node_id")
+                .map_err(AuthorityTransactionError::from)
         })
         .collect()
 }

@@ -6,17 +6,17 @@ use std::time::Duration;
 
 use cats_api::runtime_reconciliation::{
     decode_operation, encode_admission_inventory_attestation, encode_agent_session,
-    encode_desired_read_snapshot, encode_node_observation, inventory_digest, spec_digest,
-    AgentRegistrationAttempt, AgentSession, AppliedDesiredEvidence, AsciiText, AssignedKind,
-    AssignedPlacement, BlockedReason, CheckpointEvidence, Condition, ContractErrorDetail,
-    ContractVersion, CredentialBinding, DesiredRuntimeSpec, Epoch, GuestRuntimeProfileReceipt,
-    GuestTransportEvidence, Id, InventorySource, Ipv4Address, IsolatedIpv4Kind, LifecycleAdmission,
-    MacAddress, NetworkConfig, NodeBootId, NodeIdentity, NodeIdentityState, NodeObservation,
-    ObservationInventoryAcceptance, ObservedRuntimeStatus, Operation, OperationFailure,
-    OperationPhase, OperationTerminal, PlacementRejectionReason, PreconditionFailureReason,
-    QuarantineReason, RandomId128, ReadyReason, ReconcileStep, Revision, RuntimeConfig,
-    RuntimeTarget, RuntimeTransition, Sequence, SessionBinding, Sha256Digest, StableState,
-    UnixMillis, WarmSnapshotEvidence,
+    encode_desired_read_snapshot, encode_node_observation, guest_config_digest, inventory_digest,
+    spec_digest, AgentRegistrationAttempt, AgentSession, AppliedDesiredEvidence, AsciiText,
+    AssignedKind, AssignedPlacement, BlockedReason, CheckpointEvidence, Condition,
+    ContractErrorDetail, ContractVersion, CredentialBinding, DesiredRuntimeSpec, Epoch,
+    GuestRuntimeProfileReceipt, GuestTransportEvidence, Id, InventorySource, Ipv4Address,
+    IsolatedIpv4Kind, LifecycleAdmission, MacAddress, NetworkConfig, NodeBootId, NodeIdentity,
+    NodeIdentityState, NodeObservation, ObservationInventoryAcceptance, ObservedRuntimeStatus,
+    Operation, OperationFailure, OperationPhase, OperationTerminal, PlacementRejectionReason,
+    PreconditionFailureReason, QuarantineReason, RandomId128, ReadyReason, ReconcileStep, Revision,
+    RuntimeConfig, RuntimeTarget, RuntimeTransition, Sequence, SessionBinding, Sha256Digest,
+    StableState, UnixMillis, WarmSnapshotEvidence,
 };
 
 use super::product::CatRecord;
@@ -114,7 +114,7 @@ fn numbered_identity(index: usize) -> NodeIdentity {
         immutable_host_id: id(format!("host_{index:03}")),
         credential_id: id(format!("credential_{index:03}")),
         credential_binding: CredentialBinding::PublicKey {
-            public_key_spki_sha256: digest(u8::try_from(index).unwrap()),
+            public_key_spki_sha256: digest(u8::try_from(index + 100).unwrap()),
         },
         state_path_id: id(format!("state_path_{index:03}")),
         state: NodeIdentityState::Provisioned,
@@ -451,15 +451,24 @@ pub(super) fn establish_empty_admission(
     store: &Store,
     release: &GuestRuntimeProfileReceipt,
 ) -> super::runtime_spine::PlacementAdmissionSnapshot {
+    establish_empty_admission_for(store, release, "a", 1)
+}
+
+pub(super) fn establish_empty_admission_for(
+    store: &Store,
+    release: &GuestRuntimeProfileReceipt,
+    suffix: &str,
+    number: u128,
+) -> super::runtime_spine::PlacementAdmissionSnapshot {
     let identity = NodeIdentity {
         version: ContractVersion::V1,
-        node_id: id("node_a"),
-        immutable_host_id: id("host_a"),
-        credential_id: id("credential_a"),
+        node_id: id(format!("node_{suffix}")),
+        immutable_host_id: id(format!("host_{suffix}")),
+        credential_id: id(format!("credential_{suffix}")),
         credential_binding: CredentialBinding::PublicKey {
-            public_key_spki_sha256: digest(9),
+            public_key_spki_sha256: digest(u8::try_from(number).unwrap()),
         },
-        state_path_id: id("state_path_a"),
+        state_path_id: id(format!("state_path_{suffix}")),
         state: NodeIdentityState::Provisioned,
     };
     let authenticated = AuthenticatedNodeCredential::new(
@@ -470,7 +479,12 @@ pub(super) fn establish_empty_admission(
         AgentSessionRegistrationPolicy::from_release_receipt(release, Duration::from_secs(120))
             .unwrap();
     store.provision_node_identity(&identity).unwrap();
-    let attempt = registration_attempt(&identity, 1, None, policy.approved_guest_config_digest());
+    let attempt = registration_attempt(
+        &identity,
+        number,
+        None,
+        policy.approved_guest_config_digest(),
+    );
     let session = registered(
         store
             .register_agent_session(&authenticated, &attempt, &policy)
@@ -1007,7 +1021,12 @@ fn provisioned_node_id_pages_are_bounded_and_tolerate_a_concurrent_retire() {
     assert_eq!(exact.node_ids.len(), 64);
     assert_eq!(exact.node_ids.first(), Some(&id("node_002")));
     assert_eq!(exact.node_ids.last(), Some(&existing.node_id));
-    assert_eq!(exact.next_after, None);
+    assert_eq!(exact.next_after, Some(existing.node_id.clone()));
+    let eof = first_store
+        .list_provisioned_node_ids_after(exact.next_after.as_ref())
+        .unwrap();
+    assert!(eof.node_ids.is_empty());
+    assert_eq!(eof.next_after, None);
 
     // Each page is an intentionally invalidatable read plan. A second Store
     // retiring the look-ahead identity between snapshots removes it from the
@@ -2092,6 +2111,58 @@ fn desired_mutation_coordination_helper_revalidates_exact_admission_facts() {
             .unwrap(),
         PlacementAdmissionLoad::Rejected(PlacementAdmissionRejection::AdmissionChanged)
     );
+}
+
+#[test]
+fn admission_overflow_is_fatal_before_missing_session_or_stale_plan_rejection() {
+    let store = Store::connect(&crate::testsupport::isolated_control_store_url(), None).unwrap();
+    let release = release();
+    let planned = establish_empty_admission(&store, &release);
+    let identity = planned.node_identity.clone();
+    let active_guest_digest = guest_config_digest(&release).unwrap();
+    let workspace = bootstrap_workspace(&store, "admission-overflow");
+    store
+        .authority_transaction(|transaction| {
+            let now = database_now(transaction)?;
+            for index in 0..=super::runtime_spine::MAX_ASSIGNED_SPECS {
+                let mut desired = current_desired(&workspace, &identity.node_id);
+                desired.cat_id = id(format!("cat_overflow_{index:04}"));
+                desired.runtime.network_config.network_id = id(format!("net_overflow_{index:04}"));
+                desired.spec_digest = spec_digest(&desired).unwrap();
+                insert_cat(
+                    transaction,
+                    &CatRecord {
+                        cat_id: desired.cat_id.clone(),
+                        workspace_id: workspace.clone(),
+                        name: id(format!("overflow-{index:04}")),
+                        created_at: now,
+                    },
+                )?;
+                insert_desired(transaction, &desired)?;
+            }
+            transaction.execute(
+                "DELETE FROM current_agent_sessions WHERE node_id=$1",
+                &[&identity.node_id.as_str()],
+            )?;
+            Ok(())
+        })
+        .unwrap();
+
+    let error = store
+        .load_placement_admission_snapshot(&identity.node_id, &active_guest_digest)
+        .unwrap_err();
+    assert_eq!(error.code, cats_api::error::ErrorCode::Internal);
+
+    let error = store
+        .authority_transaction(|transaction| {
+            lock_placement_admission_for_desired_mutation(
+                transaction,
+                &planned,
+                &active_guest_digest,
+            )
+        })
+        .unwrap_err();
+    assert_eq!(error.code, cats_api::error::ErrorCode::Internal);
 }
 
 #[test]

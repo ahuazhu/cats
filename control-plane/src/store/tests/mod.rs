@@ -929,6 +929,99 @@ fn refuses_current_stamp_with_a_partial_shape_without_repairing_it() {
 }
 
 #[test]
+fn refuses_current_stamp_with_missing_authority_catalog_barriers() {
+    for ddl in [
+        "ALTER TABLE node_identities
+             DROP CONSTRAINT node_identity_current_public_key_lineage",
+        "DROP INDEX runtime_node_one_active_credential",
+        "DROP TRIGGER runtime_node_apply_is_immutable
+             ON runtime_node_authority_apply_records",
+        "ALTER TABLE node_identities
+             DROP CONSTRAINT node_identity_current_public_key_lineage;
+         ALTER TABLE node_identities
+             ADD CONSTRAINT node_identity_current_public_key_lineage
+             FOREIGN KEY (
+                 credential_id, node_id, credential_public_key_spki_sha256,
+                 credential_lineage_state)
+             REFERENCES runtime_node_credential_lineage(
+                 node_id, credential_id, public_key_spki_sha256, state)
+             DEFERRABLE INITIALLY DEFERRED",
+        "ALTER TABLE runtime_node_credential_lineage
+             DROP CONSTRAINT runtime_node_credential_lineage_node_id_fkey;
+         ALTER TABLE runtime_node_credential_lineage
+             ADD CONSTRAINT runtime_node_credential_lineage_node_id_fkey
+             FOREIGN KEY (node_id) REFERENCES node_identities(node_id)
+             ON UPDATE CASCADE ON DELETE CASCADE
+             DEFERRABLE INITIALLY DEFERRED",
+        "CREATE SCHEMA shadow_authority;
+         CREATE TABLE shadow_authority.runtime_node_credential_lineage (
+             node_id TEXT NOT NULL,
+             credential_id TEXT NOT NULL,
+             public_key_spki_sha256 TEXT NOT NULL,
+             state TEXT NOT NULL,
+             UNIQUE (node_id, credential_id, public_key_spki_sha256, state)
+         );
+         INSERT INTO shadow_authority.runtime_node_credential_lineage
+             (node_id, credential_id, public_key_spki_sha256, state)
+         SELECT node_id, credential_id, public_key_spki_sha256, state
+           FROM runtime_node_credential_lineage;
+         ALTER TABLE node_identities
+             DROP CONSTRAINT node_identity_current_public_key_lineage;
+         ALTER TABLE node_identities
+             ADD CONSTRAINT node_identity_current_public_key_lineage
+             FOREIGN KEY (
+                 node_id, credential_id, credential_public_key_spki_sha256,
+                 credential_lineage_state)
+             REFERENCES shadow_authority.runtime_node_credential_lineage(
+                 node_id, credential_id, public_key_spki_sha256, state)
+             DEFERRABLE INITIALLY DEFERRED",
+        "CREATE OR REPLACE FUNCTION control_runtime_node_apply_is_immutable()
+             RETURNS TRIGGER LANGUAGE plpgsql AS $$
+             BEGIN
+                 RETURN OLD;
+             END;
+             $$",
+        "DROP TRIGGER runtime_node_apply_is_immutable
+             ON runtime_node_authority_apply_records;
+         CREATE TRIGGER runtime_node_apply_is_immutable
+             BEFORE UPDATE OR DELETE ON runtime_node_authority_apply_records
+             FOR EACH STATEMENT
+             EXECUTE FUNCTION control_runtime_node_apply_is_immutable()",
+        "DROP TRIGGER runtime_node_apply_is_immutable
+             ON runtime_node_authority_apply_records;
+         CREATE TRIGGER runtime_node_apply_is_immutable
+             BEFORE UPDATE OR DELETE ON runtime_node_authority_apply_records
+             FOR EACH ROW WHEN (false)
+             EXECUTE FUNCTION control_runtime_node_apply_is_immutable()",
+        "DROP TRIGGER runtime_node_policy_update
+             ON runtime_node_placement_policies;
+         CREATE TRIGGER runtime_node_policy_update
+             BEFORE UPDATE OF record ON runtime_node_placement_policies
+             FOR EACH ROW
+             EXECUTE FUNCTION control_runtime_node_policy_update()",
+    ] {
+        let url = crate::testsupport::isolated_control_store_url();
+        drop(Store::connect(&url, None).unwrap());
+        let mut admin = postgres::Client::connect(&url, postgres::NoTls).unwrap();
+        let current_schema: String = admin
+            .query_one("SELECT current_schema()", &[])
+            .unwrap()
+            .get(0);
+        let ddl = ddl.replace("shadow_authority", &format!("{current_schema}_shadow"));
+        admin.batch_execute(&ddl).unwrap();
+
+        let Err(error) = Store::connect(&url, None) else {
+            panic!("a stamped schema missing {ddl:?} must fail closed");
+        };
+        assert_eq!(error.code, ErrorCode::FailedPrecondition);
+        assert!(
+            error.to_string().contains("authority catalog object"),
+            "operator must see the catalog mismatch, got: {error}"
+        );
+    }
+}
+
+#[test]
 fn concurrent_first_connections_create_one_exact_schema() {
     let url = crate::testsupport::isolated_control_store_url();
     let barrier = Arc::new(std::sync::Barrier::new(3));

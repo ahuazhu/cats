@@ -8,28 +8,32 @@
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use cats_api::error::ApiError;
 use cats_api::runtime_reconciliation::{
     encode_admission_inventory_attestation, encode_agent_session, encode_desired_runtime_spec,
-    encode_node_identity, encode_node_observation, guest_config_digest, spec_digest,
-    AppliedDesiredEvidence, AsciiText, AssignedKind, AssignedPlacement, ContractVersion,
-    DesiredRuntimeSpec, DiskKind, Durability, EndpointIntent, Epoch, FenceEpoch, Generation,
-    GuestDeviceIdentity, GuestRuntimeProfileReceipt, Hostname, HttpProtocol, Id, NetworkConfig,
-    NodeIdentityState, RandomId128, Revision, RuntimeConfig, RuntimeTarget, RuntimeTransition,
-    Sha256Digest, VolumeAccess, VolumeAcquire, VolumeDisposition, VolumeIntent,
+    encode_node_identity, encode_node_observation, encode_node_placement_policy,
+    guest_config_digest, spec_digest, AppliedDesiredEvidence, AsciiText, AssignedKind,
+    AssignedPlacement, ContractVersion, DesiredRuntimeSpec, DiskKind, Durability, EndpointIntent,
+    Epoch, FenceEpoch, Generation, GuestDeviceIdentity, GuestRuntimeProfileReceipt, Hostname,
+    HttpProtocol, Id, NetworkConfig, NodeIdentityState, RandomId128, Revision, RuntimeConfig,
+    RuntimeSchedulingState, RuntimeTarget, RuntimeTransition, Sha256Digest, VolumeAccess,
+    VolumeAcquire, VolumeDisposition, VolumeIntent,
 };
 use cats_storage::authority::{RemoteHead, VolumeAdminState, VolumeDurability, VolumeRecord};
 use serde::Deserialize;
 
+use super::placement_planner::PlacementTargetSnapshot;
 use super::product::{
     api_request_fingerprint, encode_cat_create_accepted_response,
     encode_cat_name_conflict_response, ApiIdempotencyRequest, ApiIdempotencyResult,
-    CatCreateCandidate, CatCreateEnvelopes, CoveredCatCreateError, CoveredCatCreateRequest,
-    DiskAdminState, DiskRecordCandidate, DiskRole, EndpointRecordCandidate, ExactContentType,
-    ExactHttpResponse, HostnameDesiredLookup, IfMatchFingerprint,
+    CatCreateCandidate, CatCreateCommitCancellation, CatCreateEnvelopes, CoveredCatCreateError,
+    CoveredCatCreateRequest, DiskAdminState, DiskRecordCandidate, DiskRole,
+    EndpointRecordCandidate, ExactContentType, ExactHttpResponse, HostnameDesiredLookup,
+    IfMatchFingerprint,
 };
-use super::runtime_spine::{PlacementAdmissionSnapshot, PLACEMENT_INVENTORY_MAX_AGE_MS};
+use super::runtime_spine::PLACEMENT_INVENTORY_MAX_AGE_MS;
 use crate::store::{Result, Store};
 
 pub(crate) const CAT_CREATE_MAX_BODY_BYTES: usize = 4096;
@@ -38,6 +42,8 @@ const CAT_CREATE_CONTENT_TYPE: &[u8] = b"application/json";
 const IDENTITY_CONTENT_ENCODING: &[u8] = b"identity";
 const CHUNK_SIZE_BYTES: u64 = 4_194_304;
 const MAX_VOLUME_BYTES: u64 = 1_099_511_627_776;
+pub(crate) const CAT_CREATE_TOTAL_DEADLINE: Duration = Duration::from_secs(10);
+const CAT_CREATE_RESOLUTION_SHUTDOWN_DEADLINE: Duration = Duration::from_secs(30);
 
 pub(crate) type ServiceFuture<'a, T> = Pin<Box<dyn Future<Output = Result<T>> + Send + 'a>>;
 
@@ -67,6 +73,7 @@ pub(crate) struct CatCreateRequestBody {
 pub(crate) struct AuthorizedCatCreateIngress {
     request: CatCreateRequestBody,
     idempotency: ApiIdempotencyRequest,
+    absolute_deadline: Instant,
 }
 
 impl AuthorizedCatCreateIngress {
@@ -80,10 +87,17 @@ impl AuthorizedCatCreateIngress {
 /// permission have produced `authenticated_workspace_id`.
 pub(crate) fn parse_authorized_cat_create(
     authenticated_workspace_id: &Id,
+    headers_received_at: Instant,
     raw_path_and_query: &[u8],
     fields: &CatCreateHttpFields,
     raw_body: &[u8],
 ) -> Result<AuthorizedCatCreateIngress> {
+    let absolute_deadline = headers_received_at
+        .checked_add(CAT_CREATE_TOTAL_DEADLINE)
+        .ok_or_else(|| ApiError::unavailable("Cat create deadline overflow"))?;
+    if Instant::now() >= absolute_deadline {
+        return Err(ApiError::unavailable("Cat create deadline elapsed"));
+    }
     if raw_body.len() > CAT_CREATE_MAX_BODY_BYTES {
         return Err(ApiError::invalid("Cat create body exceeds 4096 bytes"));
     }
@@ -155,6 +169,7 @@ pub(crate) fn parse_authorized_cat_create(
             idempotency_key,
             request_fingerprint,
         },
+        absolute_deadline,
     })
 }
 
@@ -236,6 +251,7 @@ pub(crate) trait CatCreateManifestResolver: Send + Sync {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct CatCreatePlanRequest {
+    pub(crate) cat_id: Id,
     pub(crate) vcpus: u32,
     pub(crate) memory_bytes: u64,
     pub(crate) root_size_bytes: u64,
@@ -246,16 +262,30 @@ pub(crate) struct CatCreatePlanRequest {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct CatCreatePlan {
-    pub(crate) admission: PlacementAdmissionSnapshot,
+pub(crate) struct CatCreatePlacementMutation {
+    pub(crate) cat_id: Id,
+    pub(crate) desired_revision: Revision,
+    pub(crate) placement_epoch: Epoch,
+    pub(crate) vcpus: u32,
+    pub(crate) memory_bytes: u64,
     pub(crate) network_config: NetworkConfig,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct CatCreatePlan {
+    pub(crate) target: PlacementTargetSnapshot,
+    pub(crate) mutation: CatCreatePlacementMutation,
 }
 
 /// The implementation must select only from current AgentSessions plus fresh
 /// full admission inventory. The plan is deliberately a complete typed
 /// binding, not `capacity_ok` or `network_ok` booleans.
 pub(crate) trait CatCreatePlacementPlanner: Send + Sync {
-    fn plan<'a>(&'a self, request: &'a CatCreatePlanRequest) -> ServiceFuture<'a, CatCreatePlan>;
+    fn plan<'a>(
+        &'a self,
+        request: &'a CatCreatePlanRequest,
+        absolute_deadline: Instant,
+    ) -> ServiceFuture<'a, CatCreatePlan>;
 }
 
 pub(crate) trait CatCreateIdentitySource: Send + Sync {
@@ -316,6 +346,42 @@ pub(crate) struct CatCreateService {
     planner: Arc<dyn CatCreatePlacementPlanner>,
     identities: Arc<dyn CatCreateIdentitySource>,
     guest_config_digest: Sha256Digest,
+    commit_resolutions: Arc<CommitResolutionRegistry>,
+}
+
+#[derive(Default)]
+struct CommitResolutionRegistry {
+    active: std::sync::atomic::AtomicUsize,
+    changed: tokio::sync::Notify,
+}
+
+struct ActiveCommitResolution(Arc<CommitResolutionRegistry>);
+
+impl CommitResolutionRegistry {
+    fn begin(self: &Arc<Self>) -> ActiveCommitResolution {
+        self.active
+            .fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+        ActiveCommitResolution(Arc::clone(self))
+    }
+
+    async fn wait_empty(&self) {
+        loop {
+            let changed = self.changed.notified();
+            if self.active.load(std::sync::atomic::Ordering::Acquire) == 0 {
+                return;
+            }
+            changed.await;
+        }
+    }
+}
+
+impl Drop for ActiveCommitResolution {
+    fn drop(&mut self) {
+        self.0
+            .active
+            .fetch_sub(1, std::sync::atomic::Ordering::AcqRel);
+        self.0.changed.notify_waiters();
+    }
 }
 
 impl CatCreateService {
@@ -334,6 +400,7 @@ impl CatCreateService {
             planner,
             identities,
             guest_config_digest,
+            commit_resolutions: Arc::new(CommitResolutionRegistry::default()),
         })
     }
 
@@ -341,19 +408,32 @@ impl CatCreateService {
         &self,
         ingress: AuthorizedCatCreateIngress,
     ) -> Result<CatCreateHttpResult> {
+        let absolute_deadline = ingress.absolute_deadline;
+        self.create_before_deadline(ingress, absolute_deadline)
+            .await
+    }
+
+    async fn create_before_deadline(
+        &self,
+        ingress: AuthorizedCatCreateIngress,
+        absolute_deadline: Instant,
+    ) -> Result<CatCreateHttpResult> {
         let fast_request = ingress.idempotency.clone();
-        if let Some(result) = self
-            .store
-            .execute(move |store| store.cat_create_result_fast_lookup(&fast_request))
-            .await?
+        if let Some(result) = await_cat_create_before_deadline(
+            absolute_deadline,
+            self.store
+                .execute(move |store| store.cat_create_result_fast_lookup(&fast_request)),
+        )
+        .await?
         {
             return Ok(http_result(result));
         }
 
-        let manifest = self
-            .manifests
-            .resolve(&ingress.request.boot_image_digest)
-            .await?;
+        let manifest = await_cat_create_before_deadline(
+            absolute_deadline,
+            self.manifests.resolve(&ingress.request.boot_image_digest),
+        )
+        .await?;
         if manifest.boot_image_digest != ingress.request.boot_image_digest {
             return Err(ApiError::internal(
                 "image manifest resolver returned a different digest",
@@ -367,8 +447,10 @@ impl CatCreateService {
         }
 
         let identities = CatCreateIdentities::generate(self.identities.as_ref())?;
+        let cat_id = prefixed_id("cat_", &identities.cat)?;
         let network_id = prefixed_id("net_", &identities.network)?;
         let plan_request = CatCreatePlanRequest {
+            cat_id,
             vcpus: ingress.request.vcpus,
             memory_bytes: ingress.request.memory_bytes,
             root_size_bytes,
@@ -377,14 +459,14 @@ impl CatCreateService {
             guest_config_digest: self.guest_config_digest.clone(),
             network_id: network_id.clone(),
         };
-        let plan = self.planner.plan(&plan_request).await?;
-        validate_plan_evidence(&plan, &self.guest_config_digest)?;
-        if plan.network_config.network_id != network_id {
-            return Err(ApiError::internal(
-                "placement planner changed the candidate network identity",
-            ));
-        }
-        let planned_admission = plan.admission.clone();
+        let plan = await_cat_create_before_deadline(
+            absolute_deadline,
+            self.planner.plan(&plan_request, absolute_deadline),
+        )
+        .await?;
+        validate_plan_evidence(&plan, &plan_request, &self.guest_config_digest)?;
+        let planned_target = plan.target.clone();
+        let planned_mutation = plan.mutation.clone();
         let guest_config_digest = self.guest_config_digest.clone();
         let covered = build_covered_request(
             ingress,
@@ -393,24 +475,130 @@ impl CatCreateService {
             guest_config_digest.clone(),
             root_size_bytes,
         )?;
-        let result = self
-            .store
-            .execute(move |store| {
-                match store.create_cat_covered_with_admission(
+        let resolution_request = covered.idempotency.clone();
+        let (commit_cancellation, commit_state) =
+            CatCreateCommitCancellation::new(absolute_deadline);
+        let commit_observer = commit_state.clone();
+        let cancellation_observer = commit_state.clone();
+        // Register an owner before the Store job starts. The request handler
+        // owns only the receiver and the PRE_COMMIT cancellation token. If the
+        // handler disappears after COMMIT_SENT, this task still consumes the
+        // worker outcome and resolves any ambiguous commit while shutdown can
+        // account for it.
+        let store = Arc::clone(&self.store);
+        let active = self.commit_resolutions.begin();
+        let (result_tx, mut result_rx) = tokio::sync::oneshot::channel();
+        tokio::spawn(async move {
+            let execution_store = Arc::clone(&store);
+            let execution = execution_store.execute(move |store| {
+                match store.create_cat_covered_with_placement(
                     &covered,
-                    &planned_admission,
+                    &planned_target,
+                    &planned_mutation,
                     &guest_config_digest,
+                    &commit_state,
                 ) {
                     Ok(result) => Ok(result),
-                    Err(CoveredCatCreateError::CandidateCollision(_)) => Err(ApiError::internal(
-                        "Cat create candidate identity collided; discard the whole candidate batch",
-                    )),
+                    Err(CoveredCatCreateError::CandidateCollision(_)) => {
+                        Err(ApiError::unavailable(
+                            "Cat create candidate identity collided; retry with a fresh whole batch",
+                        ))
+                    }
                     Err(CoveredCatCreateError::Store(error)) => Err(error),
                 }
-            })
-            .await?;
+            });
+            tokio::pin!(execution);
+            let execution_outcome = tokio::select! {
+                outcome = &mut execution => outcome,
+                () = cancellation_observer.cancelled_before_commit() => {
+                    // Dropping a queued Store execution removes it from the
+                    // bounded queue. An active worker will observe the same
+                    // cancellation at its next transaction checkpoint.
+                    Err(ApiError::unavailable(
+                        "Cat create was cancelled before PostgreSQL commit",
+                    ))
+                }
+            };
+            let outcome = match execution_outcome {
+                Err(error) if commit_observer.commit_was_sent() => {
+                    resolve_cat_create_commit_loop(store, resolution_request, error).await
+                }
+                outcome => outcome,
+            };
+            let _ = result_tx.send(outcome);
+            drop(active);
+        });
+        let deadline = tokio::time::sleep_until(tokio::time::Instant::from_std(absolute_deadline));
+        tokio::pin!(deadline);
+        let outcome = tokio::select! {
+            result = &mut result_rx => result.map_err(|_| {
+                ApiError::internal("Cat create commit owner stopped without a result")
+            })?,
+            () = &mut deadline => {
+                if commit_cancellation.cancel_before_commit() {
+                    // The atomic cancellation won against begin_commit. The
+                    // worker may still be unwinding a bounded SQL call, but it
+                    // can no longer publish any result or business row.
+                    return Err(ApiError::unavailable("Cat create deadline elapsed"));
+                }
+                // PostgreSQL commit has started. The result is no longer an
+                // ordinary timeout: await the registered owner, which retains
+                // the worker and resolves the exact durable outcome.
+                result_rx.await.map_err(|_| {
+                    ApiError::internal("Cat create commit owner stopped without a result")
+                })?
+            }
+        };
+        let result = outcome?;
         Ok(http_result(result))
     }
+
+    #[allow(dead_code, reason = "used by the Cat-create HTTP composition shutdown")]
+    pub(crate) async fn shutdown_commit_resolutions(&self) -> Result<()> {
+        tokio::time::timeout(
+            CAT_CREATE_RESOLUTION_SHUTDOWN_DEADLINE,
+            self.commit_resolutions.wait_empty(),
+        )
+        .await
+        .map_err(|_| {
+            ApiError::unavailable(format!(
+                "{} Cat create commit resolutions remain after shutdown deadline",
+                self.commit_resolutions
+                    .active
+                    .load(std::sync::atomic::Ordering::Acquire)
+            ))
+        })
+    }
+}
+
+async fn resolve_cat_create_commit_loop(
+    store: Arc<Store>,
+    request: ApiIdempotencyRequest,
+    original_error: ApiError,
+) -> Result<ApiIdempotencyResult> {
+    loop {
+        let lookup = request.clone();
+        match store
+            .execute(move |store| store.cat_create_result_after_commit(&lookup))
+            .await
+        {
+            Ok(Some(result)) => return Ok(result),
+            Ok(None) => return Err(original_error),
+            Err(error) if error.code == cats_api::error::ErrorCode::Unavailable => {
+                tokio::time::sleep(Duration::from_millis(25)).await;
+            }
+            Err(error) => return Err(error),
+        }
+    }
+}
+
+async fn await_cat_create_before_deadline<T>(
+    absolute_deadline: Instant,
+    operation: impl Future<Output = Result<T>>,
+) -> Result<T> {
+    tokio::time::timeout_at(tokio::time::Instant::from_std(absolute_deadline), operation)
+        .await
+        .map_err(|_| ApiError::unavailable("Cat create deadline elapsed"))?
 }
 
 fn rounded_root_size(requested: u64) -> Result<u64> {
@@ -426,8 +614,14 @@ fn rounded_root_size(requested: u64) -> Result<u64> {
     Ok(rounded)
 }
 
-fn validate_plan_evidence(plan: &CatCreatePlan, active_guest_digest: &Sha256Digest) -> Result<()> {
-    let admission = &plan.admission;
+fn validate_plan_evidence(
+    plan: &CatCreatePlan,
+    request: &CatCreatePlanRequest,
+    active_guest_digest: &Sha256Digest,
+) -> Result<()> {
+    let admission = &plan.target.admission;
+    encode_node_placement_policy(&plan.target.policy)
+        .map_err(|_| ApiError::internal("placement planner returned an invalid policy"))?;
     encode_node_identity(&admission.node_identity)
         .map_err(|_| ApiError::internal("placement planner returned an invalid NodeIdentity"))?;
     encode_agent_session(&admission.agent_session)
@@ -445,7 +639,17 @@ fn validate_plan_evidence(plan: &CatCreatePlan, active_guest_digest: &Sha256Dige
     }
     let observation = &admission.full_inventory_observation;
     let attestation = &admission.inventory_attestation;
-    if admission.node_identity.state != NodeIdentityState::Provisioned
+    if plan.mutation.cat_id != request.cat_id
+        || plan.mutation.desired_revision != Revision::new(1).expect("one is a valid Revision")
+        || plan.mutation.placement_epoch != Epoch::new(1).expect("one is a valid Epoch")
+        || plan.mutation.vcpus != request.vcpus
+        || plan.mutation.memory_bytes != request.memory_bytes
+        || plan.mutation.network_config.network_id != request.network_id
+        || admission.node_identity.state != NodeIdentityState::Provisioned
+        || plan.target.policy.node_id != admission.node_identity.node_id
+        || plan.target.policy.scheduling_state != RuntimeSchedulingState::Schedulable
+        || plan.target.policy.capabilities.guest_config_digest != *active_guest_digest
+        || plan.target.active_host_fence_event.is_some()
         || admission.node_identity.node_id != admission.agent_session.node_id
         || admission.node_identity.immutable_host_id != admission.agent_session.immutable_host_id
         || admission.agent_session.node_id != attestation.node_id
@@ -551,7 +755,7 @@ fn build_covered_request(
         target: RuntimeTarget::Running,
         placement: AssignedPlacement {
             kind: AssignedKind::Assigned,
-            node_id: plan.admission.node_identity.node_id,
+            node_id: plan.target.admission.node_identity.node_id,
             placement_epoch: Epoch::new(1).expect("one is a valid Epoch"),
         },
         runtime: RuntimeConfig {
@@ -559,7 +763,7 @@ fn build_covered_request(
             memory_bytes: ingress.request.memory_bytes,
             boot_image_digest: ingress.request.boot_image_digest,
             guest_config_digest,
-            network_config: plan.network_config,
+            network_config: plan.mutation.network_config,
         },
         volumes: vec![VolumeIntent {
             volume_intent_id,

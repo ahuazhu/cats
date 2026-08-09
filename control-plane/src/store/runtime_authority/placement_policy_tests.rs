@@ -1,5 +1,7 @@
 //! Real PostgreSQL acceptance tests for the A23 authority core.
 
+use std::sync::{Arc, Barrier};
+
 use cats_api::runtime_reconciliation::{
     canonical_ed25519_spki_sha256, runtime_provisioner_active_set_digest, AllocatableMemoryBytes,
     AllocatableVcpus, Base64UrlNoPad, ContractVersion, CredentialBinding, Epoch,
@@ -515,4 +517,197 @@ fn policy_projection_and_trust_active_set_corruption_fail_closed() {
     assert!(store
         .install_runtime_provisioner_trust_bundle(&initial)
         .is_err());
+}
+
+#[test]
+fn provision_rejects_dot_state_path_components_and_exactly_replays_rejection() {
+    for (index, component) in [".", ".."].into_iter().enumerate() {
+        let store =
+            Store::connect(&crate::testsupport::isolated_control_store_url(), None).unwrap();
+        let a = credential("provisioner_a", SPKI_A);
+        store
+            .install_runtime_provisioner_trust_bundle(&trust(1, vec![a.clone()], None))
+            .unwrap();
+        let mut request = provision(40 + u128::try_from(index).unwrap());
+        let RuntimeNodeAuthorityMutation::Provision { node_identity, .. } = &mut request.mutation
+        else {
+            unreachable!();
+        };
+        node_identity.state_path_id = id(component);
+
+        let first = store
+            .apply_runtime_node_authority(&principal(&a), &request)
+            .unwrap();
+        assert_eq!(
+            stored(first.clone()),
+            RuntimeNodeAuthorityStoredOutcome::AuthorityPreconditionFailed
+        );
+        assert_eq!(
+            store
+                .apply_runtime_node_authority(&principal(&a), &request)
+                .unwrap(),
+            first
+        );
+        store
+            .with(|client| {
+                for table in [
+                    "node_identities",
+                    "runtime_node_placement_policies",
+                    "runtime_node_credential_lineage",
+                ] {
+                    let count = client
+                        .query_one(&format!("SELECT count(*) FROM {table}"), &[])?
+                        .get::<_, i64>(0);
+                    assert_eq!(count, 0, "{table} was written for {component:?}");
+                }
+                assert_eq!(
+                    client
+                        .query_one(
+                            "SELECT count(*) FROM runtime_node_authority_apply_records",
+                            &[],
+                        )?
+                        .get::<_, i64>(0),
+                    1
+                );
+                Ok(())
+            })
+            .unwrap();
+    }
+}
+
+#[test]
+fn provider_principal_provision_is_a_persisted_precondition_not_malformed_or_applied() {
+    let store = Store::connect(&crate::testsupport::isolated_control_store_url(), None).unwrap();
+    let a = credential("provisioner_a", SPKI_A);
+    store
+        .install_runtime_provisioner_trust_bundle(&trust(1, vec![a.clone()], None))
+        .unwrap();
+    let mut request = provision(50);
+    let RuntimeNodeAuthorityMutation::Provision { node_identity, .. } = &mut request.mutation
+    else {
+        unreachable!();
+    };
+    node_identity.credential_binding = CredentialBinding::ProviderPrincipal {
+        provider: id("provider_a"),
+        principal: cats_api::runtime_reconciliation::AsciiText::new("principal-a").unwrap(),
+    };
+    cats_api::runtime_reconciliation::encode_runtime_node_authority_apply(&request).unwrap();
+
+    let first = store
+        .apply_runtime_node_authority(&principal(&a), &request)
+        .unwrap();
+    assert_eq!(
+        stored(first.clone()),
+        RuntimeNodeAuthorityStoredOutcome::AuthorityPreconditionFailed
+    );
+    assert_eq!(
+        store
+            .apply_runtime_node_authority(&principal(&a), &request)
+            .unwrap(),
+        first
+    );
+    store
+        .with(|client| {
+            assert_eq!(
+                client
+                    .query_one("SELECT count(*) FROM node_identities", &[])?
+                    .get::<_, i64>(0),
+                0
+            );
+            assert_eq!(
+                client
+                    .query_one(
+                        "SELECT count(*) FROM runtime_node_authority_apply_records",
+                        &[],
+                    )?
+                    .get::<_, i64>(0),
+                1
+            );
+            Ok(())
+        })
+        .unwrap();
+}
+
+#[test]
+fn concurrent_host_state_reuse_has_one_applied_winner_and_one_durable_rejection() {
+    let url = crate::testsupport::isolated_control_store_url();
+    let seed = Store::connect(&url, None).unwrap();
+    let a = credential("provisioner_a", SPKI_A);
+    seed.install_runtime_provisioner_trust_bundle(&trust(1, vec![a.clone()], None))
+        .unwrap();
+    let actor = principal(&a);
+    let mut first = provision(60);
+    let mut second = provision(61);
+    second.node_id = id("node_b");
+    let RuntimeNodeAuthorityMutation::Provision {
+        node_identity,
+        placement_policy,
+    } = &mut second.mutation
+    else {
+        unreachable!();
+    };
+    node_identity.node_id = id("node_b");
+    node_identity.credential_id = id("credential_b");
+    node_identity.credential_binding = CredentialBinding::PublicKey {
+        public_key_spki_sha256: digest(8),
+    };
+    // The exact Host/state-path pair deliberately remains node_a's pair.
+    placement_policy.node_id = id("node_b");
+    // Keep both requests otherwise independent so the Host/state-path
+    // uniqueness barrier is the only deciding fact.
+    if let RuntimeNodeAuthorityMutation::Provision { node_identity, .. } = &mut first.mutation {
+        node_identity.credential_binding = CredentialBinding::PublicKey {
+            public_key_spki_sha256: digest(6),
+        };
+    }
+
+    let barrier = Arc::new(Barrier::new(2));
+    let handles = [first, second].map(|request| {
+        let url = url.clone();
+        let actor = actor.clone();
+        let barrier = Arc::clone(&barrier);
+        std::thread::spawn(move || {
+            let store = Store::connect(&url, None).unwrap();
+            barrier.wait();
+            store
+                .apply_runtime_node_authority(&actor, &request)
+                .unwrap()
+        })
+    });
+    let outcomes = handles.map(|handle| stored(handle.join().unwrap()));
+    assert_eq!(
+        outcomes
+            .iter()
+            .filter(|outcome| matches!(outcome, RuntimeNodeAuthorityStoredOutcome::Applied { .. }))
+            .count(),
+        1
+    );
+    assert_eq!(
+        outcomes
+            .iter()
+            .filter(|outcome| {
+                **outcome == RuntimeNodeAuthorityStoredOutcome::AuthorityPreconditionFailed
+            })
+            .count(),
+        1
+    );
+    seed.with(|client| {
+        assert_eq!(
+            client
+                .query_one("SELECT count(*) FROM node_identities", &[])?
+                .get::<_, i64>(0),
+            1
+        );
+        assert_eq!(
+            client
+                .query_one(
+                    "SELECT count(*) FROM runtime_node_authority_apply_records",
+                    &[],
+                )?
+                .get::<_, i64>(0),
+            2
+        );
+        Ok(())
+    })
+    .unwrap();
 }

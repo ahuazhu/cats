@@ -12,8 +12,8 @@ use cats_storage::authority::{
 
 use super::rows::{
     insert_authorization, insert_delete_completion, insert_event, insert_volume,
-    load_authorization_for_update, load_delete_completion_for_update, load_event_for_update,
-    load_volume_for_update, update_event,
+    load_active_event_by_node_unlocked, load_authorization_for_update,
+    load_delete_completion_for_update, load_event_for_update, load_volume_for_update, update_event,
 };
 use crate::store::transaction::{authority_transaction_attempts, AuthorityTransactionError};
 use crate::store::{metrics_snapshot, Store};
@@ -162,6 +162,30 @@ fn stored_event(store: &Store, event_id: &Id) -> HostFenceEvent {
             Ok(load_event_for_update(transaction, event_id)?.unwrap())
         })
         .unwrap()
+}
+
+#[test]
+fn canonical_active_fence_cannot_be_hidden_by_projection_drift() {
+    let store = Store::connect(&crate::testsupport::isolated_control_store_url(), None).unwrap();
+    let event = host_fence_event(HostFenceEventState::Active);
+    store
+        .authority_transaction(|transaction| insert_event(transaction, &event))
+        .unwrap();
+    store
+        .with(|client| {
+            client.execute(
+                "UPDATE host_fence_events SET state='rejoined' WHERE event_id=$1",
+                &[&event.event_id.as_str()],
+            )
+        })
+        .unwrap();
+
+    let error = store
+        .authority_transaction(|transaction| {
+            load_active_event_by_node_unlocked(transaction, &event.node_id)
+        })
+        .unwrap_err();
+    assert_eq!(error.code, ErrorCode::Internal);
 }
 
 fn stored_authorization_row(store: &Store, authorization_id: &Id) -> String {

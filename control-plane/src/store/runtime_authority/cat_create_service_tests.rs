@@ -1,19 +1,28 @@
 use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{mpsc, Arc, Mutex};
+use std::time::{Duration, Instant};
 
 use cats_api::runtime_reconciliation::{
-    decode_desired_runtime_spec, guest_config_digest, AsciiText, AssignedKind, ContractVersion,
-    DiskKind, Durability, GuestRuntimeProfileReceipt, Id, Ipv4Address, MacAddress, NetworkConfig,
-    NodeIdentityState, RandomId128, RuntimeTarget, RuntimeTransition, Sha256Digest, VolumeAccess,
-    VolumeAcquire, VolumeDisposition,
+    decode_desired_runtime_spec, guest_config_digest, AllocatableMemoryBytes, AllocatableVcpus,
+    AsciiText, AssignedKind, ContractVersion, DiskKind, Durability, Epoch, GuestIpv4Pool,
+    GuestIpv4PoolKind, GuestRuntimeProfileReceipt, Id, Ipv4Address, NodeIdentityState,
+    NodePlacementPolicy, RandomId128, Revision, RuntimePlacementBlockFrontend,
+    RuntimePlacementCapabilities, RuntimePlacementGuestNetwork, RuntimePlacementGuestTransport,
+    RuntimePlacementVmm, RuntimeSchedulingState, RuntimeTarget, RuntimeTransition, Sha256Digest,
+    VolumeAccess, VolumeAcquire, VolumeDisposition,
 };
 
 use super::cat_create_service::{
     parse_authorized_cat_create, CatCreateHttpFields, CatCreateIdentitySource,
-    CatCreateManifestResolver, CatCreatePlacementPlanner, CatCreatePlan, CatCreatePlanRequest,
-    CatCreateService, ServiceFuture, ValidatedImageManifest, CAT_CREATE_MAX_BODY_BYTES,
+    CatCreateManifestResolver, CatCreatePlacementMutation, CatCreatePlacementPlanner,
+    CatCreatePlan, CatCreatePlanRequest, CatCreateService, ServiceFuture, ValidatedImageManifest,
+    CAT_CREATE_MAX_BODY_BYTES, CAT_CREATE_TOTAL_DEADLINE,
 };
+use super::placement_planner::PlacementTargetSnapshot;
+use super::product::CatRecord;
+use super::product_rows::insert_cat;
+use super::rows::database_now;
 use super::runtime_spine::PlacementAdmissionSnapshot;
 use crate::store::{Result, Store};
 
@@ -53,8 +62,19 @@ fn ingress_with_size(
     key: &str,
     root_size_bytes: u64,
 ) -> super::cat_create_service::AuthorizedCatCreateIngress {
+    ingress_with_size_at(workspace, name, key, root_size_bytes, Instant::now())
+}
+
+fn ingress_with_size_at(
+    workspace: &Id,
+    name: &str,
+    key: &str,
+    root_size_bytes: u64,
+    headers_received_at: Instant,
+) -> super::cat_create_service::AuthorizedCatCreateIngress {
     parse_authorized_cat_create(
         workspace,
+        headers_received_at,
         format!("/v1/workspaces/{workspace}/cats").as_bytes(),
         &fields(key),
         &body(name, root_size_bytes),
@@ -67,6 +87,7 @@ fn strict_ingress_matches_the_frozen_fingerprint_vector() {
     let workspace = id("ws_01");
     let parsed = parse_authorized_cat_create(
         &workspace,
+        Instant::now(),
         b"/v1/workspaces/ws_01/cats",
         &fields("  retry-key  "),
         &body("app", 4_294_967_296),
@@ -123,7 +144,14 @@ fn ingress_rejects_envelope_path_and_closed_dto_drift() {
     cases.push((path.as_slice(), non_printable_key, valid_body.clone()));
 
     for (raw_path, headers, raw_body) in cases {
-        assert!(parse_authorized_cat_create(&workspace, raw_path, &headers, &raw_body).is_err());
+        assert!(parse_authorized_cat_create(
+            &workspace,
+            Instant::now(),
+            raw_path,
+            &headers,
+            &raw_body,
+        )
+        .is_err());
     }
     for raw_path in [
         b"/v1/workspaces/ws_01/cats?x=1".as_slice(),
@@ -131,9 +159,14 @@ fn ingress_rejects_envelope_path_and_closed_dto_drift() {
         b"/v1/workspaces/%77s_01/cats".as_slice(),
         b"/v1/workspaces/ws_other/cats".as_slice(),
     ] {
-        assert!(
-            parse_authorized_cat_create(&workspace, raw_path, &fields("key"), &valid_body).is_err()
-        );
+        assert!(parse_authorized_cat_create(
+            &workspace,
+            Instant::now(),
+            raw_path,
+            &fields("key"),
+            &valid_body,
+        )
+        .is_err());
     }
 
     let valid_text = String::from_utf8(valid_body.clone()).unwrap();
@@ -199,7 +232,14 @@ fn ingress_rejects_envelope_path_and_closed_dto_drift() {
         invalid_bodies.push(body(invalid_name, 4_194_304));
     }
     for invalid in invalid_bodies {
-        assert!(parse_authorized_cat_create(&workspace, path, &fields("key"), &invalid).is_err());
+        assert!(parse_authorized_cat_create(
+            &workspace,
+            Instant::now(),
+            path,
+            &fields("key"),
+            &invalid,
+        )
+        .is_err());
     }
 }
 
@@ -210,15 +250,18 @@ fn ingress_enforces_the_body_cap_before_decode() {
     let mut below = body("app", 4_194_304);
     below.resize(CAT_CREATE_MAX_BODY_BYTES - 1, b' ');
     assert_eq!(below.len(), CAT_CREATE_MAX_BODY_BYTES - 1);
-    parse_authorized_cat_create(&workspace, path, &fields("key"), &below).unwrap();
+    parse_authorized_cat_create(&workspace, Instant::now(), path, &fields("key"), &below).unwrap();
 
     let mut exact = body("app", 4_194_304);
     exact.resize(CAT_CREATE_MAX_BODY_BYTES, b' ');
     assert_eq!(exact.len(), CAT_CREATE_MAX_BODY_BYTES);
-    parse_authorized_cat_create(&workspace, path, &fields("key"), &exact).unwrap();
+    parse_authorized_cat_create(&workspace, Instant::now(), path, &fields("key"), &exact).unwrap();
 
     exact.push(b' ');
-    assert!(parse_authorized_cat_create(&workspace, path, &fields("key"), &exact).is_err());
+    assert!(
+        parse_authorized_cat_create(&workspace, Instant::now(), path, &fields("key"), &exact,)
+            .is_err()
+    );
 }
 
 struct FakeManifestResolver {
@@ -248,8 +291,36 @@ struct FakePlanner {
     admission: Mutex<PlacementAdmissionSnapshot>,
 }
 
+fn placement_policy(admission: &PlacementAdmissionSnapshot) -> NodePlacementPolicy {
+    NodePlacementPolicy {
+        version: ContractVersion::V1,
+        node_id: admission.node_identity.node_id.clone(),
+        policy_revision: Epoch::new(1).unwrap(),
+        scheduling_state: RuntimeSchedulingState::Schedulable,
+        allocatable_vcpus: AllocatableVcpus::new(8).unwrap(),
+        allocatable_memory_bytes: AllocatableMemoryBytes::new(16 << 30).unwrap(),
+        capabilities: RuntimePlacementCapabilities {
+            vmm: RuntimePlacementVmm::CloudHypervisor,
+            block_frontend: RuntimePlacementBlockFrontend::KernelNbd,
+            guest_network: RuntimePlacementGuestNetwork::IsolatedIpv4,
+            guest_transport: RuntimePlacementGuestTransport::Vsock,
+            guest_agent_protocol_version: ContractVersion::V1,
+            guest_config_digest: admission.agent_session.guest_config_digest.clone(),
+        },
+        guest_ipv4_pool: GuestIpv4Pool {
+            kind: GuestIpv4PoolKind::PrivateIpv4_16,
+            network_address: Ipv4Address::new("10.0.0.0").unwrap(),
+            prefix_length: 16,
+        },
+    }
+}
+
 impl CatCreatePlacementPlanner for FakePlanner {
-    fn plan<'a>(&'a self, request: &'a CatCreatePlanRequest) -> ServiceFuture<'a, CatCreatePlan> {
+    fn plan<'a>(
+        &'a self,
+        request: &'a CatCreatePlanRequest,
+        _absolute_deadline: Instant,
+    ) -> ServiceFuture<'a, CatCreatePlan> {
         self.calls.fetch_add(1, Ordering::SeqCst);
         *self.last_request.lock().unwrap() = Some(request.clone());
         let network_id = if self.replace_network_id {
@@ -264,16 +335,23 @@ impl CatCreatePlacementPlanner for FakePlanner {
         };
         let mut admission = self.admission.lock().unwrap().clone();
         admission.node_identity.state = node_state;
+        let policy = placement_policy(&admission);
+        let network_config =
+            super::placement_planner::allocate_network_for_test(&policy, &network_id);
         Box::pin(async move {
             Ok(CatCreatePlan {
-                admission,
-                network_config: NetworkConfig {
-                    kind: cats_api::runtime_reconciliation::IsolatedIpv4Kind::IsolatedIpv4,
-                    network_id,
-                    guest_mac: MacAddress::new("02:00:00:00:00:01").unwrap(),
-                    guest_ipv4: Ipv4Address::new("10.0.0.1").unwrap(),
-                    prefix_length: 30,
-                    gateway_ipv4: Ipv4Address::new("10.0.0.2").unwrap(),
+                target: PlacementTargetSnapshot {
+                    policy,
+                    admission,
+                    active_host_fence_event: None,
+                },
+                mutation: CatCreatePlacementMutation {
+                    cat_id: request.cat_id.clone(),
+                    desired_revision: Revision::new(1).unwrap(),
+                    placement_epoch: Epoch::new(1).unwrap(),
+                    vcpus: request.vcpus,
+                    memory_bytes: request.memory_bytes,
+                    network_config,
                 },
             })
         })
@@ -329,10 +407,32 @@ fn service_fixture(
     CatCreateService,
 ) {
     let url = crate::testsupport::isolated_control_store_url();
-    let store = Arc::new(Store::connect(&url, None).unwrap());
+    service_fixture_at(&url, slug)
+}
+
+fn service_fixture_at(
+    url: &str,
+    slug: &str,
+) -> (
+    tokio::runtime::Runtime,
+    Arc<Store>,
+    Id,
+    Arc<FakeManifestResolver>,
+    Arc<FakePlanner>,
+    CatCreateService,
+) {
+    let store = Arc::new(Store::connect(url, None).unwrap());
     let workspace = bootstrap_workspace(&store, slug);
     let release = release_receipt();
     let admission = super::runtime_spine_tests::establish_empty_admission(store.as_ref(), &release);
+    store
+        .authority_transaction(|transaction| {
+            super::placement_policy::insert_policy_for_test(
+                transaction,
+                &placement_policy(&admission),
+            )
+        })
+        .unwrap();
     let manifests = Arc::new(FakeManifestResolver {
         calls: AtomicUsize::new(0),
         size_bytes: 1,
@@ -374,6 +474,10 @@ fn service_builds_the_complete_candidate_and_replays_before_external_reads() {
     assert_eq!(manifests.calls.load(Ordering::SeqCst), 1);
     assert_eq!(planner.calls.load(Ordering::SeqCst), 1);
     let plan_request = planner.last_request.lock().unwrap().clone().unwrap();
+    assert_eq!(
+        plan_request.cat_id.as_str(),
+        "cat_00000000000000000000000000000001"
+    );
     assert_eq!(plan_request.vcpus, 2);
     assert_eq!(plan_request.memory_bytes, 2_147_483_648);
     assert_eq!(plan_request.root_size_bytes, 4_194_304);
@@ -453,16 +557,16 @@ fn service_builds_the_complete_candidate_and_replays_before_external_reads() {
     );
     assert_eq!(
         desired.runtime.network_config.guest_mac.as_str(),
-        "02:00:00:00:00:01"
+        "02:ca:0a:00:28:aa"
     );
     assert_eq!(
         desired.runtime.network_config.guest_ipv4.as_str(),
-        "10.0.0.1"
+        "10.0.40.170"
     );
     assert_eq!(desired.runtime.network_config.prefix_length, 30);
     assert_eq!(
         desired.runtime.network_config.gateway_ipv4.as_str(),
-        "10.0.0.2"
+        "10.0.40.169"
     );
     let [root] = desired.volumes.as_slice() else {
         panic!("initial Desired must contain exactly one Root volume")
@@ -534,6 +638,340 @@ fn service_persists_only_the_fixed_name_conflict_result() {
     assert_eq!(replay, conflict);
     assert_eq!(manifests.calls.load(Ordering::SeqCst), 2);
     assert_eq!(planner.calls.load(Ordering::SeqCst), 2);
+}
+
+#[test]
+fn candidate_collision_is_retryable_and_the_same_key_uses_a_fresh_whole_batch() {
+    let (runtime, store, workspace, manifests, planner, service) =
+        service_fixture("f2c-candidate-retry");
+    store
+        .authority_transaction(|transaction| {
+            let created_at = database_now(transaction)?;
+            insert_cat(
+                transaction,
+                &CatRecord {
+                    cat_id: id("cat_00000000000000000000000000000001"),
+                    workspace_id: workspace.clone(),
+                    name: id("seed-collision"),
+                    created_at,
+                },
+            )
+        })
+        .unwrap();
+
+    let first = runtime
+        .block_on(service.create(ingress(&workspace, "app", "same-key")))
+        .unwrap_err();
+    assert_eq!(first.code, cats_api::error::ErrorCode::Unavailable);
+    let result_rows: i64 = store
+        .with(|client| {
+            client
+                .query_one("SELECT count(*) FROM api_idempotency_results", &[])
+                .map(|row| row.get(0))
+        })
+        .unwrap();
+    assert_eq!(result_rows, 0);
+
+    let retry = runtime
+        .block_on(service.create(ingress(&workspace, "app", "same-key")))
+        .unwrap();
+    assert_eq!(retry.http_status, 202);
+    assert_eq!(
+        retry.response_body,
+        br#"{"cat_id":"cat_0000000000000000000000000000000a","operation_id":"op_0000000000000000000000000000000f"}"#
+    );
+    assert_eq!(manifests.calls.load(Ordering::SeqCst), 2);
+    assert_eq!(planner.calls.load(Ordering::SeqCst), 2);
+}
+
+#[test]
+fn pre_commit_deadline_waits_for_rollback_and_leaves_no_cached_result() {
+    let url = crate::testsupport::isolated_control_store_url();
+    let (runtime, store, workspace, _manifests, _planner, service) =
+        service_fixture_at(&url, "a23-precommit-deadline");
+    let mut blocker = postgres::Client::connect(&url, postgres::NoTls).unwrap();
+    let mut blocker_tx = blocker.transaction().unwrap();
+    blocker_tx
+        .query_one(
+            "SELECT pg_advisory_xact_lock(hashtextextended(
+                current_schema() || ':cat-name:' || $1 || ':' || $2,
+                0::BIGINT
+             ))",
+            &[&workspace.as_str(), &"app"],
+        )
+        .unwrap();
+
+    let headers_received_at = Instant::now()
+        .checked_sub(CAT_CREATE_TOTAL_DEADLINE - Duration::from_millis(500))
+        .unwrap();
+    let error = runtime
+        .block_on(service.create(ingress_with_size_at(
+            &workspace,
+            "app",
+            "deadline-key",
+            4_194_304,
+            headers_received_at,
+        )))
+        .unwrap_err();
+    assert_eq!(error.code, cats_api::error::ErrorCode::Unavailable);
+    drop(blocker_tx);
+
+    let counts: (i64, i64) = store
+        .with(|client| {
+            client
+                .query_one(
+                    "SELECT
+                        (SELECT count(*) FROM cat_records),
+                        (SELECT count(*) FROM api_idempotency_results)",
+                    &[],
+                )
+                .map(|row| (row.get(0), row.get(1)))
+        })
+        .unwrap();
+    assert_eq!(counts, (0, 0));
+
+    let retry = runtime
+        .block_on(service.create(ingress(&workspace, "app", "deadline-key")))
+        .unwrap();
+    assert_eq!(retry.http_status, 202);
+    assert!(std::str::from_utf8(&retry.response_body)
+        .unwrap()
+        .contains("cat_0000000000000000000000000000000a"));
+}
+
+#[test]
+fn definite_commit_retry_reenters_the_absolute_deadline() {
+    let url = crate::testsupport::isolated_control_store_url();
+    let (runtime, store, workspace, _manifests, _planner, service) =
+        service_fixture_at(&url, "a23-commit-retry-deadline");
+    store
+        .with(|client| {
+            client.batch_execute(
+                "CREATE SEQUENCE a23_commit_retry_attempt;
+                 CREATE FUNCTION a23_block_retry_before_commit() RETURNS trigger AS $$
+                 DECLARE attempted BOOLEAN;
+                 BEGIN
+                   SELECT is_called INTO attempted
+                     FROM a23_commit_retry_attempt;
+                   IF attempted THEN
+                     PERFORM pg_sleep(5);
+                   END IF;
+                   RETURN NEW;
+                 END;
+                 $$ LANGUAGE plpgsql;
+                 CREATE TRIGGER a23_block_retry_before_commit
+                   BEFORE INSERT ON runtime_operations
+                   FOR EACH ROW EXECUTE FUNCTION a23_block_retry_before_commit();
+                 CREATE FUNCTION a23_fail_first_commit() RETURNS trigger AS $$
+                 BEGIN
+                   IF nextval('a23_commit_retry_attempt') = 1 THEN
+                     RAISE EXCEPTION 'retry exact create' USING ERRCODE='40001';
+                   END IF;
+                   RETURN NEW;
+                 END;
+                 $$ LANGUAGE plpgsql;
+                 CREATE CONSTRAINT TRIGGER a23_fail_first_commit
+                   AFTER INSERT ON runtime_operations
+                   DEFERRABLE INITIALLY DEFERRED
+                   FOR EACH ROW EXECUTE FUNCTION a23_fail_first_commit();",
+            )
+        })
+        .unwrap();
+    let headers_received_at = Instant::now()
+        .checked_sub(CAT_CREATE_TOTAL_DEADLINE - Duration::from_millis(1_500))
+        .unwrap();
+    let started = Instant::now();
+    let error = runtime
+        .block_on(service.create(ingress_with_size_at(
+            &workspace,
+            "app",
+            "retry-deadline",
+            4_194_304,
+            headers_received_at,
+        )))
+        .unwrap_err();
+    assert_eq!(error.code, cats_api::error::ErrorCode::Unavailable);
+    assert!(
+        started.elapsed() < Duration::from_secs(3),
+        "a definite commit retry ignored the original absolute deadline"
+    );
+    let counts: (i64, i64) = store
+        .with(|client| {
+            client
+                .query_one(
+                    "SELECT
+                        (SELECT count(*) FROM cat_records),
+                        (SELECT count(*) FROM api_idempotency_results)",
+                    &[],
+                )
+                .map(|row| (row.get(0), row.get(1)))
+        })
+        .unwrap();
+    assert_eq!(counts, (0, 0));
+}
+
+#[test]
+fn committed_response_loss_resolves_the_exact_durable_result() {
+    let (runtime, store, workspace, manifests, planner, service) =
+        service_fixture("a23-commit-response-loss");
+    store.inject_committed_response_loss_once();
+
+    let first = runtime
+        .block_on(service.create(ingress(&workspace, "app", "lost-response")))
+        .unwrap();
+    assert_eq!(first.http_status, 202);
+    assert_eq!(manifests.calls.load(Ordering::SeqCst), 1);
+    assert_eq!(planner.calls.load(Ordering::SeqCst), 1);
+    let replay = runtime
+        .block_on(service.create(ingress(&workspace, "app", "lost-response")))
+        .unwrap();
+    assert_eq!(replay, first);
+    assert_eq!(manifests.calls.load(Ordering::SeqCst), 1);
+    assert_eq!(planner.calls.load(Ordering::SeqCst), 1);
+}
+
+#[test]
+fn committed_owner_survives_handler_abort_and_shutdown_waits_for_resolution() {
+    let url = crate::testsupport::isolated_control_store_url();
+    let (runtime, store, workspace, manifests, planner, service) =
+        service_fixture_at(&url, "a23-commit-owner-abort");
+    store.inject_committed_response_loss_once_after(Duration::from_millis(1_500));
+    let observer = Store::connect(&url, None).unwrap();
+    let service = Arc::new(service);
+    let request = ingress(&workspace, "app", "owner-abort");
+    let handler = runtime.spawn({
+        let service = Arc::clone(&service);
+        async move { service.create(request).await }
+    });
+
+    runtime.block_on(async {
+        tokio::time::timeout(Duration::from_secs(3), async {
+            loop {
+                let count: i64 = observer
+                    .with(|client| {
+                        client
+                            .query_one("SELECT count(*) FROM api_idempotency_results", &[])
+                            .map(|row| row.get(0))
+                    })
+                    .unwrap();
+                if count == 1 {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("the real PostgreSQL commit must become visible");
+        assert!(
+            !handler.is_finished(),
+            "the injected response-loss delay must retain the request"
+        );
+        handler.abort();
+        assert!(handler.await.unwrap_err().is_cancelled());
+
+        let shutdown = tokio::spawn({
+            let service = Arc::clone(&service);
+            async move { service.shutdown_commit_resolutions().await }
+        });
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert!(
+            !shutdown.is_finished(),
+            "shutdown returned while the detached commit owner was unresolved"
+        );
+        tokio::time::timeout(Duration::from_secs(3), shutdown)
+            .await
+            .expect("commit resolution must converge")
+            .unwrap()
+            .unwrap();
+
+        let replay = service
+            .create(ingress(&workspace, "app", "owner-abort"))
+            .await
+            .unwrap();
+        assert_eq!(replay.http_status, 202);
+    });
+    assert_eq!(manifests.calls.load(Ordering::SeqCst), 1);
+    assert_eq!(planner.calls.load(Ordering::SeqCst), 1);
+}
+
+#[test]
+fn fast_replay_lookup_lock_timeout_is_unavailable_and_has_no_side_effect() {
+    let url = crate::testsupport::isolated_control_store_url();
+    let (runtime, store, workspace, _manifests, _planner, service) =
+        service_fixture_at(&url, "a23-fast-lookup-timeout");
+    let mut blocker = postgres::Client::connect(&url, postgres::NoTls).unwrap();
+    let mut blocker_tx = blocker.transaction().unwrap();
+    blocker_tx
+        .batch_execute("LOCK TABLE api_idempotency_results IN ACCESS EXCLUSIVE MODE")
+        .unwrap();
+
+    let started = Instant::now();
+    let error = runtime
+        .block_on(service.create(ingress(&workspace, "app", "locked-fast-lookup")))
+        .unwrap_err();
+    assert_eq!(error.code, cats_api::error::ErrorCode::Unavailable);
+    assert!(
+        started.elapsed() < Duration::from_secs(4),
+        "the configured PostgreSQL lock timeout did not bound fast replay lookup"
+    );
+    blocker_tx.rollback().unwrap();
+
+    let counts: (i64, i64) = store
+        .with(|client| {
+            client
+                .query_one(
+                    "SELECT
+                        (SELECT count(*) FROM cat_records),
+                        (SELECT count(*) FROM api_idempotency_results)",
+                    &[],
+                )
+                .map(|row| (row.get(0), row.get(1)))
+        })
+        .unwrap();
+    assert_eq!(counts, (0, 0));
+}
+
+#[test]
+fn post_commit_resolver_waits_for_the_original_api_key_owner() {
+    let url = crate::testsupport::isolated_control_store_url();
+    let (_runtime, _store, workspace, _manifests, _planner, _service) =
+        service_fixture_at(&url, "a23-commit-resolution-lock");
+    let ingress = ingress(&workspace, "app", "resolution-lock");
+    let request = ingress.idempotency().clone();
+    let mut blocker = postgres::Client::connect(&url, postgres::NoTls).unwrap();
+    let mut blocker_tx = blocker.transaction().unwrap();
+    blocker_tx
+        .query_one(
+            "SELECT pg_advisory_xact_lock(hashtextextended(
+                current_schema() || ':api-result:' || $1 || ':' || $2 || ':' || $3,
+                0::BIGINT
+             ))",
+            &[
+                &request.authenticated_workspace_id.as_str(),
+                &request.canonical_route.as_str(),
+                &request.idempotency_key.as_str(),
+            ],
+        )
+        .unwrap();
+
+    let (done_tx, done_rx) = mpsc::channel();
+    let resolver = std::thread::spawn(move || {
+        let store = Store::connect(&url, None).unwrap();
+        done_tx
+            .send(store.cat_create_result_after_commit(&request))
+            .unwrap();
+    });
+    assert!(
+        done_rx.recv_timeout(Duration::from_millis(200)).is_err(),
+        "a resolver must not treat a pre-visibility miss as definite rollback"
+    );
+    blocker_tx.commit().unwrap();
+    assert!(done_rx
+        .recv_timeout(Duration::from_secs(3))
+        .unwrap()
+        .unwrap()
+        .is_none());
+    resolver.join().unwrap();
 }
 
 #[test]

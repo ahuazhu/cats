@@ -4561,10 +4561,6 @@ fn validate_runtime_node_authority_apply(
             if node_identity.version != ContractVersion::V1
                 || node_identity.node_id != apply.node_id
                 || node_identity.state != NodeIdentityState::Provisioned
-                || !matches!(
-                    node_identity.credential_binding,
-                    CredentialBinding::PublicKey { .. }
-                )
             {
                 candidates.push(Candidate::at(
                     &child(&mutation_path, "node_identity"),

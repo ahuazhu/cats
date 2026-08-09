@@ -66,18 +66,16 @@ fn identity(number: u64) -> NodeIdentity {
         node_id: id(&format!("node_{number}")),
         immutable_host_id: id(&format!("host_{number}")),
         credential_id: id(&format!("credential_{number}")),
-        credential_binding: credential_binding(&format!("principal-{number}")),
+        credential_binding: CredentialBinding::PublicKey {
+            public_key_spki_sha256: Sha256Digest::new(format!("sha256:{number:064x}")).unwrap(),
+        },
         state_path_id: id(&format!("state_path_{number}")),
         state: NodeIdentityState::Provisioned,
     }
 }
 
 fn public_key_identity(number: u64) -> NodeIdentity {
-    let mut identity = identity(number);
-    identity.credential_binding = CredentialBinding::PublicKey {
-        public_key_spki_sha256: digest('9'),
-    };
-    identity
+    identity(number)
 }
 
 fn authenticated(identity: &NodeIdentity) -> AuthenticatedNodeCredential {

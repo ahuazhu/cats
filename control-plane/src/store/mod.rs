@@ -182,6 +182,10 @@ pub struct Store {
     pub(super) client: Mutex<Option<Client>>,
     dsn: DsnSource,
     ca_file: Option<String>,
+    #[cfg(test)]
+    commit_response_loss_once: std::sync::atomic::AtomicBool,
+    #[cfg(test)]
+    commit_response_loss_delay_ms: std::sync::atomic::AtomicU64,
 }
 
 /// Each Store retains the V1 single-connection ordering. Four fixed workers
@@ -759,11 +763,22 @@ impl Store {
         f: impl FnOnce(&mut Client) -> std::result::Result<T, postgres::Error> + Send,
     ) -> Result<T> {
         self.enter(|client| {
-            f(client?).map_err(|e| {
-                if is_constraint(&e) {
-                    ApiError::conflict(format!("constraint violation: {e}"))
+            let client = client?;
+            f(client).map_err(|error| {
+                if is_constraint(&error) {
+                    ApiError::conflict(format!("constraint violation: {error}"))
+                } else if client.is_closed()
+                    || matches!(
+                        error.code(),
+                        Some(&postgres::error::SqlState::QUERY_CANCELED)
+                            | Some(&postgres::error::SqlState::LOCK_NOT_AVAILABLE)
+                    )
+                {
+                    ApiError::unavailable(format!(
+                        "control-store PostgreSQL operation was unavailable: {error}"
+                    ))
                 } else {
-                    internal(e)
+                    internal(error)
                 }
             })
         })
@@ -837,7 +852,11 @@ fn configure_session(client: &mut Client) -> Result<()> {
             "SET statement_timeout = '5s'; \
              SET lock_timeout = '2s'",
         )
-        .map_err(internal)
+        .map_err(|error| {
+            ApiError::unavailable(format!(
+                "configure control-store PostgreSQL session: {error}"
+            ))
+        })
 }
 
 pub fn now_ms() -> i64 {
