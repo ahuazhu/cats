@@ -263,12 +263,20 @@ impl ChunkEngine {
         )?;
         crashpoint::maybe_crash(crashpoint::BEFORE_CAS);
 
-        let requested = self.meta.cas_head(
-            vol,
+        let expected_head = remote_head(
             base_generation,
+            prepared.base_root_hash,
+            prepared.base_root_object_id.as_deref(),
+        )?;
+        let target_head = remote_head(
             new_generation,
-            prepared.root_hash,
-            &prepared.root_object_id,
+            Some(prepared.root_hash),
+            Some(&prepared.root_object_id),
+        )?;
+        let requested = self.authority.compare_and_swap_head(
+            vol,
+            &expected_head,
+            &target_head,
             &self.cfg.attachment_id,
             self.epoch,
         );
@@ -354,7 +362,7 @@ impl ChunkEngine {
     /// owner and epoch proves success. Every other authoritative change is an
     /// unrelated lineage and fails closed.
     fn reconcile_ambiguous_cas(&self, error: MetaError, evidence: CasEvidence<'_>) -> Result<i64> {
-        let head = match self.meta.load_head(&self.cfg.volume_id) {
+        let head = match self.authority.load_head(&self.cfg.volume_id) {
             Ok(head) => head,
             Err(_) => return Err(EngineError::Meta(error)),
         };
@@ -731,4 +739,26 @@ impl ChunkEngine {
             .expect("spawn pack committer thread");
         *self.committer_thread.lock().unwrap() = Some(handle);
     }
+}
+
+fn remote_head(
+    generation: i64,
+    root_hash: Option<[u8; 32]>,
+    root_object_id: Option<&str>,
+) -> Result<RemoteHead> {
+    let generation = u64::try_from(generation)
+        .ok()
+        .and_then(Generation::new)
+        .ok_or_else(|| EngineError::Corrupt("head generation is outside the wire range".into()))?;
+    let root_object_id = root_object_id
+        .map(|value| {
+            AsciiText::new(value.to_string())
+                .ok_or_else(|| EngineError::Corrupt("root object id is not valid ASCII".into()))
+        })
+        .transpose()?;
+    Ok(RemoteHead {
+        generation,
+        root_hash: root_hash.map(Sha256Digest::from_bytes),
+        root_object_id,
+    })
 }

@@ -1,6 +1,10 @@
 use super::*;
 use cats_metadata_store_sqlite::SqliteMetadataStore;
 use cats_object_store_file::FileBlobStore;
+use cats_storage::authority::{
+    LastVolumeTransition, RenewLeaseResult, UnixMillis, VolumeAdminState, VolumeDurability,
+    VolumeHeadCasResult, VolumeRecord,
+};
 use cats_test_support::blob_doubles::{
     ConcurrencyProbe, CountingBlob, SizingBlob, SlowBlob, SwitchableFailureBlob,
 };
@@ -27,6 +31,124 @@ fn env() -> Env {
         blob,
         meta,
         data_dir,
+    }
+}
+
+/// Keeps legacy-engine unit doubles useful while production control-only
+/// composition is constrained to the target authority port. Exact PostgreSQL
+/// row/transaction behavior is covered in the adapter integration tests.
+struct TestVolumeDataAuthority {
+    metadata: Arc<dyn MetadataStore>,
+}
+
+fn target_authority(metadata: Arc<dyn MetadataStore>) -> Arc<dyn VolumeDataAuthority> {
+    Arc::new(TestVolumeDataAuthority { metadata })
+}
+
+impl VolumeDataAuthority for TestVolumeDataAuthority {
+    fn load_volume(&self, volume_id: &Id) -> cats_storage::authority::Result<VolumeRecord> {
+        let head = self
+            .metadata
+            .load_head(volume_id.as_str())
+            .map_err(test_authority_error)?;
+        let lease_owner = head.lease_owner.map(|owner| {
+            Id::new(owner).expect("legacy test attachment ids are valid target authority ids")
+        });
+        let lease_epoch = FenceEpoch::new(u64::try_from(head.lease_epoch).unwrap_or(0))
+            .expect("zero is a valid fence epoch");
+        Ok(VolumeRecord {
+            volume_id: Id::new(head.volume_id)
+                .expect("legacy test volume ids are valid target authority ids"),
+            size_bytes: head.size_bytes,
+            durability: VolumeDurability::Strict,
+            admin_state: VolumeAdminState::Active,
+            head: RemoteHead {
+                generation: Generation::new(u64::try_from(head.generation).unwrap_or(u64::MAX))
+                    .expect("legacy test generations fit the target wire range"),
+                root_hash: head.root_hash.map(Sha256Digest::from_bytes),
+                root_object_id: head.root_object_id.map(|object_id| {
+                    AsciiText::new(object_id)
+                        .expect("legacy test object ids are valid target ASCII text")
+                }),
+            },
+            lease_owner: lease_owner.clone(),
+            lease_epoch,
+            lease_expires_at: lease_owner
+                .as_ref()
+                .map(|_| UnixMillis::new(1).expect("one is a valid timestamp")),
+            last_transition: lease_owner.map(|_| LastVolumeTransition::Takeover {
+                authorization_id: Id::new("test-authority").expect("constant is a valid id"),
+            }),
+        })
+    }
+
+    fn renew_lease(
+        &self,
+        request: &RenewLeaseRequest,
+    ) -> cats_storage::authority::Result<RenewLeaseResult> {
+        self.metadata
+            .renew_lease(
+                request.volume_id.as_str(),
+                request.attachment_id.as_str(),
+                i64::try_from(request.expected_epoch.get())
+                    .map_err(|_| AuthorityError::BackendUnknown)?,
+                i64::try_from(request.lease_duration_ms)
+                    .map_err(|_| AuthorityError::InvalidLeaseDuration)?,
+            )
+            .map_err(test_authority_error)?;
+        Ok(RenewLeaseResult {
+            volume_id: request.volume_id.clone(),
+            attachment_id: request.attachment_id.clone(),
+            epoch: request.expected_epoch,
+            lease_expires_at: UnixMillis::new(1).expect("one is a valid timestamp"),
+        })
+    }
+
+    fn compare_and_swap_head(
+        &self,
+        request: &VolumeHeadCasRequest,
+    ) -> cats_storage::authority::Result<VolumeHeadCasResult> {
+        let hash = request
+            .new_head
+            .root_hash
+            .as_ref()
+            .ok_or(AuthorityError::HeadConflict)?;
+        let object_id = request
+            .new_head
+            .root_object_id
+            .as_ref()
+            .ok_or(AuthorityError::HeadConflict)?;
+        self.metadata
+            .cas_head(
+                request.volume_id.as_str(),
+                i64::try_from(request.expected_head.generation.get())
+                    .map_err(|_| AuthorityError::BackendUnknown)?,
+                i64::try_from(request.new_head.generation.get())
+                    .map_err(|_| AuthorityError::BackendUnknown)?,
+                *hash.as_bytes(),
+                object_id.as_str(),
+                request.attachment_id.as_str(),
+                i64::try_from(request.expected_epoch.get())
+                    .map_err(|_| AuthorityError::BackendUnknown)?,
+            )
+            .map_err(test_authority_error)?;
+        Ok(VolumeHeadCasResult {
+            volume_id: request.volume_id.clone(),
+            attachment_id: request.attachment_id.clone(),
+            epoch: request.expected_epoch,
+            resulting_head: request.new_head.clone(),
+        })
+    }
+}
+
+fn test_authority_error(error: MetaError) -> AuthorityError {
+    match error {
+        MetaError::NotFound(_) => AuthorityError::NotFound,
+        MetaError::LeaseHeld => AuthorityError::OtherWriter,
+        MetaError::Fenced => AuthorityError::Fenced,
+        MetaError::CasConflict { .. } => AuthorityError::HeadConflict,
+        MetaError::InvalidArgument(_) => AuthorityError::InvalidLeaseDuration,
+        MetaError::AlreadyExists(_) | MetaError::Backend(_) => AuthorityError::BackendUnknown,
     }
 }
 
@@ -2283,7 +2405,7 @@ fn root_provision_fixture() -> RootProvisionFixture {
         EngineConfig::new(VOL, &data_dir, "attA"),
         epoch,
         blob.clone(),
-        meta.clone(),
+        target_authority(meta.clone()),
     )
     .unwrap();
     let request = root_provision_request(
@@ -2597,7 +2719,7 @@ fn control_only_attach_preserves_and_refuses_legacy_pending_state() {
         EngineConfig::new(VOL, &env.data_dir, "attA"),
         epoch,
         env.blob.clone(),
-        env.meta.clone(),
+        target_authority(env.meta.clone()),
     )
     .unwrap();
     assert!(
@@ -2638,7 +2760,7 @@ fn control_only_attach_rejects_an_owned_zero_epoch_authority_row() {
         EngineConfig::new(VOL, &data_dir, "attA"),
         granted_epoch,
         blob.clone(),
-        corrupt.clone(),
+        target_authority(corrupt.clone()),
     );
     assert!(matches!(result, Err(EngineError::Corrupt(_))));
     assert!(
@@ -2650,7 +2772,7 @@ fn control_only_attach_rejects_an_owned_zero_epoch_authority_row() {
         EngineConfig::new(VOL, &data_dir, "attA"),
         0,
         blob,
-        corrupt,
+        target_authority(corrupt),
     );
     assert!(matches!(result, Err(EngineError::InvalidConfig(_))));
     assert!(!data_dir.exists());
@@ -2718,7 +2840,7 @@ fn control_only_local_initialization_replays_every_crash_window_without_overwrit
             EngineConfig::new(VOL, &data_dir, "attA"),
             epoch,
             blob,
-            meta,
+            target_authority(meta),
         )
         .unwrap();
         assert_eq!(
@@ -2884,7 +3006,7 @@ fn a_lost_generation_one_cas_response_is_adopted_from_exact_authority() {
         EngineConfig::new(VOL, dir.path().join("data"), "attA"),
         epoch,
         blob,
-        meta.clone(),
+        target_authority(meta.clone()),
     )
     .unwrap();
     let map = manifest.base_map(SIZE).unwrap();
@@ -2957,7 +3079,7 @@ fn lost_leaf_root_and_commit_put_responses_reconcile_by_exact_bytes() {
             EngineConfig::new(VOL, dir.path().join("data"), "attA"),
             epoch,
             blob.clone(),
-            meta.clone(),
+            target_authority(meta.clone()),
         )
         .unwrap();
         let request = root_provision_request(

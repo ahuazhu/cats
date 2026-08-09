@@ -1027,6 +1027,7 @@ dependencies = [
  "cats-api",
  "cats-block-client",
  "cats-blockd",
+ "cats-control-plane",
  "cats-metadata-store-postgres",
  "cats-metadata-store-sqlite",
  "cats-object-store-aws-s3",
@@ -1034,6 +1035,7 @@ dependencies = [
  "cats-storage",
  "cats-test-support",
  "clap",
+ "postgres",
  "serde_json",
  "tempfile",
  "tracing",
@@ -1168,11 +1170,13 @@ dependencies = [
 name = "cats-metadata-store-postgres"
 version = "0.1.0"
 dependencies = [
+ "cats-control-plane",
  "cats-storage",
  "cats-test-support",
  "native-tls",
  "postgres",
  "postgres-native-tls",
+ "serde_json",
  "tempfile",
 ]
 

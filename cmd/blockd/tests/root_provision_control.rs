@@ -14,9 +14,15 @@ use cats_api::runtime_reconciliation::{
     PROVISION_ROOT_IMAGE_REQUEST_MAX_WIRE_BYTES,
 };
 use cats_blockd::format::{self, LeafRef};
-use cats_metadata_store_sqlite::SqliteMetadataStore;
+use cats_control_plane::store::Store;
+use cats_metadata_store_postgres::PostgresVolumeDataAuthority;
 use cats_object_store_file::FileBlobStore;
-use cats_storage::{BlobStore, MetadataStore};
+use cats_storage::authority::{
+    project_volume_record, LastVolumeTransition, UnixMillis, VolumeAdminState, VolumeDataAuthority,
+    VolumeDurability, VolumeRecord,
+};
+use cats_storage::BlobStore;
+use postgres::{Client, NoTls};
 
 const VOLUME_ID: &str = "vol_root_provision";
 const ATTACHMENT_ID: &str = "att_root_provision";
@@ -25,6 +31,7 @@ const TRANSITION: &str = "13579bdf2468ace013579bdf2468ace0";
 
 struct Env {
     dir: tempfile::TempDir,
+    postgres_url: String,
     epoch: i64,
     request: ProvisionRootImageRequest,
 }
@@ -33,8 +40,12 @@ impl Env {
     fn new() -> Self {
         let dir = tempfile::tempdir().unwrap();
         let blob = Arc::new(FileBlobStore::open(dir.path().join("blob")).unwrap());
-        let meta = SqliteMetadataStore::open(&dir.path().join("meta.db")).unwrap();
-        meta.create_volume(VOLUME_ID, VOLUME_SIZE).unwrap();
+        let postgres_url = cats_control_plane::testsupport::isolated_control_store_url();
+        drop(Store::connect(&postgres_url, None).unwrap());
+        let mut postgres = Client::connect(&postgres_url, NoTls).unwrap();
+        let epoch = 7;
+        insert_volume(&mut postgres, &owned_volume(epoch));
+        assert_legacy_metadata_absent(&mut postgres);
 
         let image = dir.path().join("root.img");
         let bytes: Vec<u8> = (0..CHUNK_SIZE as usize)
@@ -44,19 +55,13 @@ impl Env {
         let manifest = cats_blockd::image::publish(blob.as_ref(), &image)
             .unwrap()
             .manifest;
-        let epoch = meta
-            .acquire_lease(VOLUME_ID, ATTACHMENT_ID, 60_000)
-            .unwrap();
         let request = request_from_manifest(&manifest, epoch);
         Self {
             dir,
+            postgres_url,
             epoch,
             request,
         }
-    }
-
-    fn meta_path(&self) -> PathBuf {
-        self.dir.path().join("meta.db")
     }
 
     fn blob_root(&self) -> PathBuf {
@@ -71,8 +76,13 @@ impl Env {
         self.dir.path().join("provision.sock")
     }
 
-    fn meta(&self) -> SqliteMetadataStore {
-        SqliteMetadataStore::open(&self.meta_path()).unwrap()
+    fn authority(&self) -> PostgresVolumeDataAuthority {
+        PostgresVolumeDataAuthority::connect(&self.postgres_url, None).unwrap()
+    }
+
+    fn assert_legacy_metadata_absent(&self) {
+        let mut postgres = Client::connect(&self.postgres_url, NoTls).unwrap();
+        assert_legacy_metadata_absent(&mut postgres);
     }
 
     fn spawn(&self, crash_point: Option<&str>) -> Server {
@@ -88,9 +98,9 @@ impl Env {
             .arg("--data-dir")
             .arg(self.data_dir())
             .arg("--metadata-store-adapter")
-            .arg("sqlite")
+            .arg("postgres")
             .arg("--metadata-store-option")
-            .arg(format!("path={}", self.meta_path().display()))
+            .arg("url-env=CATS_BLOCKD_TARGET_TEST_POSTGRES_URL")
             .arg("--object-store-adapter")
             .arg("file")
             .arg("--object-store-option")
@@ -101,6 +111,7 @@ impl Env {
             .arg("60000")
             .stdout(Stdio::piped())
             .stderr(Stdio::null())
+            .env("CATS_BLOCKD_TARGET_TEST_POSTGRES_URL", &self.postgres_url)
             .env_remove("CATS_CRASH_POINT");
         if let Some(point) = crash_point {
             command.env("CATS_CRASH_POINT", point);
@@ -116,6 +127,91 @@ impl Env {
             std::fs::remove_file(self.control_socket()).unwrap();
         }
     }
+}
+
+fn owned_volume(epoch: i64) -> VolumeRecord {
+    VolumeRecord {
+        volume_id: Id::new(VOLUME_ID).unwrap(),
+        size_bytes: VOLUME_SIZE,
+        durability: VolumeDurability::Strict,
+        admin_state: VolumeAdminState::Active,
+        head: RemoteHead {
+            generation: Generation::new(0).unwrap(),
+            root_hash: None,
+            root_object_id: None,
+        },
+        lease_owner: Some(Id::new(ATTACHMENT_ID).unwrap()),
+        lease_epoch: FenceEpoch::new(u64::try_from(epoch).unwrap()).unwrap(),
+        lease_expires_at: Some(UnixMillis::new(1).unwrap()),
+        last_transition: Some(LastVolumeTransition::Takeover {
+            authorization_id: Id::new("takeover-root-provision").unwrap(),
+        }),
+    }
+}
+
+fn insert_volume(client: &mut Client, record: &VolumeRecord) {
+    let projection = project_volume_record(record).unwrap();
+    let record_json = serde_json::to_string(record).unwrap();
+    let size_bytes = i64::try_from(projection.size_bytes).unwrap();
+    let head_generation = i64::try_from(projection.head_generation.get()).unwrap();
+    let lease_epoch = i64::try_from(projection.lease_epoch.get()).unwrap();
+    let lease_expires_at = projection
+        .lease_expires_at
+        .map(|value| i64::try_from(value.get()).unwrap());
+    let transition_revision = projection
+        .transition_desired_revision
+        .map(|value| i64::try_from(value.get()).unwrap());
+    let transition_placement = projection
+        .transition_placement_epoch
+        .map(|value| i64::try_from(value.get()).unwrap());
+    let transition_duration = projection
+        .transition_lease_duration_ms
+        .map(|value| i64::try_from(value).unwrap());
+    client
+        .execute(
+            "INSERT INTO volume_records (
+                volume_id, record, size_bytes, durability, admin_state, delete_id,
+                head_generation, head_root_hash, head_root_object_id,
+                lease_owner, lease_epoch, lease_expires_at,
+                last_transition_kind, last_transition_id,
+                transition_desired_revision, transition_placement_epoch,
+                transition_lease_duration_ms
+             ) VALUES (
+                $1, $2::TEXT::jsonb, $3, $4, $5, $6, $7, $8, $9,
+                $10, $11, $12, $13, $14, $15, $16, $17
+             )",
+            &[
+                &projection.volume_id,
+                &record_json,
+                &size_bytes,
+                &projection.durability,
+                &projection.admin_state,
+                &projection.delete_id,
+                &head_generation,
+                &projection.head_root_hash,
+                &projection.head_root_object_id,
+                &projection.lease_owner,
+                &lease_epoch,
+                &lease_expires_at,
+                &projection.last_transition_kind,
+                &projection.last_transition_id,
+                &transition_revision,
+                &transition_placement,
+                &transition_duration,
+            ],
+        )
+        .unwrap();
+}
+
+fn assert_legacy_metadata_absent(client: &mut Client) {
+    let table: Option<String> = client
+        .query_one("SELECT to_regclass('cats_storage_volumes')::text", &[])
+        .unwrap()
+        .get(0);
+    assert_eq!(
+        table, None,
+        "target control-only mode must never create or probe the legacy metadata schema"
+    );
 }
 
 struct Server {
@@ -254,13 +350,33 @@ fn control_only_rejects_frontends_and_serves_only_the_typed_effect() {
     assert!(!rejected.status.success());
     assert!(String::from_utf8_lossy(&rejected.stderr).contains("forbids every NBD"));
 
+    let rejected_legacy_authority = Command::new(env!("CARGO_BIN_EXE_cats-blockd"))
+        .arg("--control-only")
+        .arg("--attachment-epoch")
+        .arg(env.epoch.to_string())
+        .arg("--listen-control")
+        .arg(env.control_socket())
+        .arg("--metadata-store-adapter")
+        .arg("sqlite")
+        .arg("--object-store-adapter")
+        .arg("file")
+        .output()
+        .unwrap();
+    assert!(!rejected_legacy_authority.status.success());
+    assert!(String::from_utf8_lossy(&rejected_legacy_authority.stderr)
+        .contains("requires --metadata-store-adapter postgres"));
+
     let _server = env.spawn(None);
     assert!(env.control_socket().exists());
     assert!(!env.dir.path().join("forbidden-nbd.sock").exists());
     let response = exchange(&env.control_socket(), &wire_request(&env.request));
     assert_ok(&response, &env.request);
-    let head = env.meta().load_head(VOLUME_ID).unwrap();
-    assert_eq!(head.generation, 1);
+    let head = env
+        .authority()
+        .load_volume(&Id::new(VOLUME_ID).unwrap())
+        .unwrap();
+    assert_eq!(head.head.generation.get(), 1);
+    env.assert_legacy_metadata_absent();
 }
 
 #[test]
@@ -282,7 +398,15 @@ fn first_lf_framing_enforces_prefix_crlf_and_payload_cap_before_effect() {
     too_large.extend(vec![b' '; PROVISION_ROOT_IMAGE_REQUEST_MAX_WIRE_BYTES + 1]);
     too_large.push(b'\n');
     assert!(exchange(&env.control_socket(), &too_large).is_empty());
-    assert_eq!(env.meta().load_head(VOLUME_ID).unwrap().generation, 0);
+    assert_eq!(
+        env.authority()
+            .load_volume(&Id::new(VOLUME_ID).unwrap())
+            .unwrap()
+            .head
+            .generation
+            .get(),
+        0
+    );
 
     let mut exact = b"provision_root_image ".to_vec();
     exact.extend(&canonical);
@@ -315,7 +439,15 @@ fn receiver_responds_at_first_lf_without_waiting_for_half_close_or_running_tail(
     // the already-closed peer or discarded; it can never execute as command 2.
     std::thread::sleep(Duration::from_millis(20));
     let _ = stream.write_all(&wire_request(&env.request));
-    assert_eq!(env.meta().load_head(VOLUME_ID).unwrap().generation, 1);
+    assert_eq!(
+        env.authority()
+            .load_volume(&Id::new(VOLUME_ID).unwrap())
+            .unwrap()
+            .head
+            .generation
+            .get(),
+        1
+    );
 }
 
 #[test]
@@ -339,7 +471,15 @@ fn stalled_connection_times_out_without_starving_the_next_request() {
         started.elapsed() < Duration::from_secs(5),
         "the serial control loop remained blocked by an idle peer"
     );
-    assert_eq!(env.meta().load_head(VOLUME_ID).unwrap().generation, 1);
+    assert_eq!(
+        env.authority()
+            .load_volume(&Id::new(VOLUME_ID).unwrap())
+            .unwrap()
+            .head
+            .generation
+            .get(),
+        1
+    );
 
     // The timeout is absolute for the frame: receiving one byte every 300 ms
     // cannot reset it and become a delayed second effect source.
@@ -381,8 +521,12 @@ fn every_provision_publication_crash_window_replays_the_same_transition() {
         let _restarted = env.spawn(None);
         let response = exchange(&env.control_socket(), &wire_request(&env.request));
         assert_ok(&response, &env.request);
-        let head = env.meta().load_head(VOLUME_ID).unwrap();
-        assert_eq!(head.generation, 1, "{point}");
+        let head = env
+            .authority()
+            .load_volume(&Id::new(VOLUME_ID).unwrap())
+            .unwrap();
+        assert_eq!(head.head.generation.get(), 1, "{point}");
+        env.assert_legacy_metadata_absent();
         let blob = FileBlobStore::open(env.blob_root()).unwrap();
         let commits = blob.list(&format!("volumes/{VOLUME_ID}/commits/")).unwrap();
         assert_eq!(commits.len(), 1, "{point}: replay made a second commit key");

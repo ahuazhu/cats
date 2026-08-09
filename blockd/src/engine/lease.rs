@@ -29,7 +29,7 @@ impl ChunkEngine {
                     if engine.is_fenced() {
                         return;
                     }
-                    match engine.meta.renew_lease(
+                    match engine.authority.renew_lease(
                         &engine.cfg.volume_id,
                         &engine.cfg.attachment_id,
                         engine.epoch,
@@ -65,13 +65,15 @@ impl ChunkEngine {
     /// local journal files alive so the caller can retry; silently releasing
     /// them would turn a transient remote outage into acknowledged data loss.
     pub fn detach(&self) -> Result<()> {
+        let AuthorityBackend::Legacy(metadata) = &self.authority else {
+            return Err(EngineError::GuestIoDisabled);
+        };
         if self.is_fenced() {
             return Err(EngineError::Fenced);
         }
         self.drain_staged()?;
         self.stop_renewal();
-        self.meta
-            .release_lease(&self.cfg.volume_id, &self.cfg.attachment_id, self.epoch)?;
+        metadata.release_lease(&self.cfg.volume_id, &self.cfg.attachment_id, self.epoch)?;
         Ok(())
     }
 

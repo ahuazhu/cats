@@ -102,6 +102,28 @@ pub struct RenewLeaseResult {
     pub lease_expires_at: UnixMillis,
 }
 
+/// Exact data-plane publication request.
+///
+/// The complete predecessor head is part of the compare. Comparing only its
+/// generation would make two different roots at the same generation
+/// indistinguishable after an ambiguous response.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct VolumeHeadCasRequest {
+    pub volume_id: Id,
+    pub attachment_id: Id,
+    pub expected_epoch: FenceEpoch,
+    pub expected_head: RemoteHead,
+    pub new_head: RemoteHead,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct VolumeHeadCasResult {
+    pub volume_id: Id,
+    pub attachment_id: Id,
+    pub epoch: FenceEpoch,
+    pub resulting_head: RemoteHead,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ReleaseRequest {
@@ -353,6 +375,116 @@ pub enum AuthorityError {
 
 pub type Result<T> = std::result::Result<T, AuthorityError>;
 
+/// The one provider-neutral boundary used by a block data plane after the
+/// Node has already obtained an exact attachment grant.
+///
+/// Ownership transitions deliberately do not appear here. They remain owned
+/// by the Runtime/Volume Authority transaction path; blockd may only inspect,
+/// renew and publish under the grant it was given.
+pub trait VolumeDataAuthority: Send + Sync {
+    /// Reads one fully validated canonical record, including its exact grant
+    /// and complete remote-head tuple.
+    fn load_volume(&self, volume_id: &Id) -> Result<VolumeRecord>;
+    /// Extends only the named owner/epoch, using the authority database clock.
+    fn renew_lease(&self, request: &RenewLeaseRequest) -> Result<RenewLeaseResult>;
+    /// Replaces only the complete predecessor head under the named grant.
+    fn compare_and_swap_head(&self, request: &VolumeHeadCasRequest) -> Result<VolumeHeadCasResult>;
+}
+
+/// Exact scalar projection stored beside the canonical JSON VolumeRecord.
+///
+/// PostgreSQL extraction remains adapter-specific, but both the Control Store
+/// writer and the data-plane adapter derive their expected columns here. This
+/// keeps one projection/validation rule without putting a database driver in
+/// the provider-neutral crate.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct VolumeRecordProjection {
+    pub volume_id: String,
+    pub size_bytes: u64,
+    pub durability: &'static str,
+    pub admin_state: &'static str,
+    pub delete_id: Option<String>,
+    pub head_generation: Generation,
+    pub head_root_hash: Option<String>,
+    pub head_root_object_id: Option<String>,
+    pub lease_owner: Option<String>,
+    pub lease_epoch: FenceEpoch,
+    pub lease_expires_at: Option<UnixMillis>,
+    pub last_transition_kind: Option<&'static str>,
+    pub last_transition_id: Option<String>,
+    pub transition_desired_revision: Option<Revision>,
+    pub transition_placement_epoch: Option<Epoch>,
+    pub transition_lease_duration_ms: Option<u64>,
+}
+
+pub fn project_volume_record(record: &VolumeRecord) -> Result<VolumeRecordProjection> {
+    validate_volume_record(record)?;
+    let (admin_state, delete_id) = match &record.admin_state {
+        VolumeAdminState::Active => ("active", None),
+        VolumeAdminState::Deleting { delete_id } => ("deleting", Some(delete_id.to_string())),
+    };
+    let durability = match record.durability {
+        VolumeDurability::Strict => "strict",
+        VolumeDurability::Relaxed => "relaxed",
+    };
+    let (kind, transition_id, revision, placement, duration) = match &record.last_transition {
+        None => (None, None, None, None, None),
+        Some(LastVolumeTransition::NormalAcquire { request, .. }) => (
+            Some("normal_acquire"),
+            Some(request.transition_id.to_string()),
+            Some(request.desired_revision),
+            Some(request.placement_epoch),
+            Some(request.lease_duration_ms),
+        ),
+        Some(LastVolumeTransition::Release { request, .. }) => (
+            Some("release"),
+            Some(request.transition_id.to_string()),
+            None,
+            None,
+            None,
+        ),
+        Some(LastVolumeTransition::Takeover { authorization_id }) => (
+            Some("takeover"),
+            Some(authorization_id.to_string()),
+            None,
+            None,
+            None,
+        ),
+        Some(LastVolumeTransition::BeginDelete { request, .. }) => (
+            Some("begin_delete"),
+            Some(request.delete_id.to_string()),
+            None,
+            None,
+            None,
+        ),
+        Some(LastVolumeTransition::BeginDisposableDelete { authorization_id }) => (
+            Some("begin_disposable_delete"),
+            Some(authorization_id.to_string()),
+            None,
+            None,
+            None,
+        ),
+    };
+    Ok(VolumeRecordProjection {
+        volume_id: record.volume_id.to_string(),
+        size_bytes: record.size_bytes,
+        durability,
+        admin_state,
+        delete_id,
+        head_generation: record.head.generation,
+        head_root_hash: record.head.root_hash.as_ref().map(ToString::to_string),
+        head_root_object_id: record.head.root_object_id.as_ref().map(ToString::to_string),
+        lease_owner: record.lease_owner.as_ref().map(ToString::to_string),
+        lease_epoch: record.lease_epoch,
+        lease_expires_at: record.lease_expires_at,
+        last_transition_kind: kind,
+        last_transition_id: transition_id,
+        transition_desired_revision: revision,
+        transition_placement_epoch: placement,
+        transition_lease_duration_ms: duration,
+    })
+}
+
 /// `RemoteHead` is either the exact empty tuple or a complete non-empty tuple.
 pub fn remote_head_is_valid(head: &RemoteHead) -> bool {
     match head.generation.get() {
@@ -596,6 +728,48 @@ pub fn renew_lease(
         epoch: request.expected_epoch,
         lease_expires_at,
     };
+    Ok((updated, result))
+}
+
+/// Publish one exact successor head under the current attachment grant.
+///
+/// This pure transition intentionally has no retry ledger. A caller that
+/// loses the response rereads the VolumeRecord and accepts only the exact
+/// requested target; otherwise it retries the same predecessor CAS or fails
+/// closed.
+pub fn compare_and_swap_head(
+    record: &VolumeRecord,
+    request: &VolumeHeadCasRequest,
+) -> Result<(VolumeRecord, VolumeHeadCasResult)> {
+    validate_volume_record(record)?;
+    if !remote_head_is_valid(&request.expected_head)
+        || !remote_head_is_valid(&request.new_head)
+        || request.new_head.generation <= request.expected_head.generation
+    {
+        return Err(AuthorityError::HeadConflict);
+    }
+    if !matches!(record.admin_state, VolumeAdminState::Active) {
+        return Err(AuthorityError::AdminBusy);
+    }
+    if record.volume_id != request.volume_id
+        || record.lease_owner.as_ref() != Some(&request.attachment_id)
+        || record.lease_epoch != request.expected_epoch
+    {
+        return Err(AuthorityError::Fenced);
+    }
+    if record.head != request.expected_head {
+        return Err(AuthorityError::HeadConflict);
+    }
+
+    let result = VolumeHeadCasResult {
+        volume_id: request.volume_id.clone(),
+        attachment_id: request.attachment_id.clone(),
+        epoch: request.expected_epoch,
+        resulting_head: request.new_head.clone(),
+    };
+    let mut updated = record.clone();
+    updated.head = request.new_head.clone();
+    validate_volume_record(&updated)?;
     Ok((updated, result))
 }
 

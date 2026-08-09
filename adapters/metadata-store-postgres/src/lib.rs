@@ -21,6 +21,10 @@ use native_tls::{Certificate, TlsConnector};
 use postgres::{Client, Row};
 use postgres_native_tls::MakeTlsConnector;
 
+mod target_authority;
+
+pub use target_authority::PostgresVolumeDataAuthority;
+
 pub const ADAPTER_NAME: &str = "postgres";
 pub const DEFAULT_URL_ENV: &str = "CATS_POSTGRES_URL";
 
@@ -110,6 +114,12 @@ enum SessionSetup {
     ServerVerified,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SchemaAccess {
+    LegacyMetadata,
+    VolumeAuthority,
+}
+
 /// Where a worker obtains its DSN, consulted afresh for every connect.
 ///
 /// The password is part of the DSN, and RDS rotates the managed master
@@ -173,8 +183,15 @@ impl PostgresMetadataStore {
             dsn.clone(),
             ca_file,
             session_setup,
+            SchemaAccess::LegacyMetadata,
         )?;
-        let lease_jobs = spawn_worker("cats-postgres-lease", dsn.clone(), ca_file, session_setup)?;
+        let lease_jobs = spawn_worker(
+            "cats-postgres-lease",
+            dsn.clone(),
+            ca_file,
+            session_setup,
+            SchemaAccess::LegacyMetadata,
+        )?;
         Ok(Self { jobs, lease_jobs })
     }
 
@@ -205,6 +222,7 @@ fn spawn_worker(
     dsn: DsnSource,
     ca_file: Option<&str>,
     session_setup: SessionSetup,
+    schema_access: SchemaAccess,
 ) -> Result<mpsc::SyncSender<Job>> {
     let ca_file = ca_file.map(str::to_string);
     let (jobs, receiver) = mpsc::sync_channel::<Job>(WORK_QUEUE_DEPTH);
@@ -212,22 +230,23 @@ fn spawn_worker(
     std::thread::Builder::new()
         .name(name.to_string())
         .spawn(move || {
-            let mut client = match connect_resolved(&dsn, ca_file.as_deref(), session_setup) {
-                Ok(client) => {
-                    let _ = ready_tx.send(Ok(()));
-                    client
-                }
-                Err(error) => {
-                    let _ = ready_tx.send(Err(error));
-                    return;
-                }
-            };
+            let mut client =
+                match connect_resolved(&dsn, ca_file.as_deref(), session_setup, schema_access) {
+                    Ok(client) => {
+                        let _ = ready_tx.send(Ok(()));
+                        client
+                    }
+                    Err(error) => {
+                        let _ = ready_tx.send(Err(error));
+                        return;
+                    }
+                };
             for job in receiver {
                 if client.is_closed() {
                     // Resolve again rather than reuse the DSN this worker
                     // started with: the credential in it may have been rotated
                     // since, and reconnecting with the old one fails forever.
-                    match connect_resolved(&dsn, ca_file.as_deref(), session_setup) {
+                    match connect_resolved(&dsn, ca_file.as_deref(), session_setup, schema_access) {
                         Ok(reconnected) => client = reconnected,
                         Err(error) => {
                             job.run(Err(error));
@@ -253,8 +272,9 @@ fn connect_resolved(
     dsn: &DsnSource,
     ca_file: Option<&str>,
     session_setup: SessionSetup,
+    schema_access: SchemaAccess,
 ) -> Result<Client> {
-    connect_client(&dsn.resolve()?, ca_file, session_setup)
+    connect_client(&dsn.resolve()?, ca_file, session_setup, schema_access)
 }
 
 fn dispatch_on<T>(
@@ -333,7 +353,12 @@ where
     }
 }
 
-fn connect_client(url: &str, ca_file: Option<&str>, session_setup: SessionSetup) -> Result<Client> {
+fn connect_client(
+    url: &str,
+    ca_file: Option<&str>,
+    session_setup: SessionSetup,
+    schema_access: SchemaAccess,
+) -> Result<Client> {
     let mut builder = TlsConnector::builder();
     if let Some(path) = ca_file {
         let pem = fs::read(path)
@@ -359,7 +384,10 @@ fn connect_client(url: &str, ca_file: Option<&str>, session_setup: SessionSetup)
         .connect(MakeTlsConnector::new(connector))
         .map_err(|error| MetaError::Backend(connect_failure(error)))?;
     configure_session(&mut client, session_setup)?;
-    client.batch_execute(SCHEMA).map_err(pg_err)?;
+    match schema_access {
+        SchemaAccess::LegacyMetadata => client.batch_execute(SCHEMA).map_err(pg_err)?,
+        SchemaAccess::VolumeAuthority => target_authority::verify_schema(&mut client)?,
+    }
     Ok(client)
 }
 

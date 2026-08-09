@@ -37,7 +37,7 @@ impl ChunkEngine {
             if header.volume_id != self.cfg.volume_id {
                 return Err(EngineError::Corrupt("pack volume id mismatch".into()));
             }
-            let head = self.meta.load_head(&self.cfg.volume_id)?;
+            let head = self.authority.load_head(&self.cfg.volume_id)?;
             let record_key = chunk::keys::commit_record(
                 &self.cfg.volume_id,
                 header.base_generation + 1,

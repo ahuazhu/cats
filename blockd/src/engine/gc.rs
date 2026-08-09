@@ -66,7 +66,7 @@ impl ChunkEngine {
                     nodes.insert(object_id_hex(object_id).to_string());
                 }
             }
-            let head = self.meta.load_head(vol)?;
+            let head = self.authority.load_head(vol)?;
             if let Some(root) = &head.root_object_id {
                 nodes.insert(root_object_hex(root).to_string());
             }

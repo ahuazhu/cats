@@ -2,11 +2,11 @@
 
 use cats_api::runtime_reconciliation::{Epoch, FenceEpoch, Generation, Id, Revision, UnixMillis};
 use cats_storage::authority::{
-    validate_authorization_record, validate_delete_completion_receipt, validate_host_fence_event,
-    validate_volume_record, AuthorizationConsumedReceipt, AuthorizationRecord, AuthorizationState,
-    DeleteCompletionReceipt, DisposableDeleteIsolationBasis, HostFenceEvent, HostFenceEventState,
-    HostIsolationState, LastVolumeTransition, RemoteHead, VolumeAdminState, VolumeAuthorization,
-    VolumeDurability, VolumeRecord,
+    project_volume_record, validate_authorization_record, validate_delete_completion_receipt,
+    validate_host_fence_event, AuthorizationConsumedReceipt, AuthorizationRecord,
+    AuthorizationState, DeleteCompletionReceipt, DisposableDeleteIsolationBasis, HostFenceEvent,
+    HostFenceEventState, HostIsolationState, RemoteHead, VolumeAuthorization, VolumeRecord,
+    VolumeRecordProjection,
 };
 use postgres::{Row, Transaction};
 use serde::{de::DeserializeOwned, Serialize};
@@ -61,130 +61,43 @@ impl HeadProjection {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct VolumeProjection {
-    volume_id: String,
-    size_bytes: SizeBytes,
-    durability: &'static str,
-    admin_state: &'static str,
-    delete_id: Option<String>,
-    head: HeadProjection,
-    lease_owner: Option<String>,
-    lease_epoch: FenceEpoch,
-    lease_expires_at: Option<UnixMillis>,
-    last_transition_kind: Option<&'static str>,
-    last_transition_id: Option<String>,
-    transition_desired_revision: Option<Revision>,
-    transition_placement_epoch: Option<Epoch>,
-    transition_lease_duration_ms: Option<LeaseDurationMs>,
-}
-
-impl VolumeProjection {
-    fn from_record(record: &VolumeRecord) -> AuthorityTxResult<Self> {
-        validate_volume_record(record)?;
-        let (admin_state, delete_id) = match &record.admin_state {
-            VolumeAdminState::Active => ("active", None),
-            VolumeAdminState::Deleting { delete_id } => ("deleting", Some(delete_id.to_string())),
-        };
-        let durability = match record.durability {
-            VolumeDurability::Strict => "strict",
-            VolumeDurability::Relaxed => "relaxed",
-        };
-        let (kind, transition_id, revision, placement, duration) = match &record.last_transition {
-            None => (None, None, None, None, None),
-            Some(LastVolumeTransition::NormalAcquire { request, .. }) => (
-                Some("normal_acquire"),
-                Some(request.transition_id.to_string()),
-                Some(request.desired_revision),
-                Some(request.placement_epoch),
-                Some(LeaseDurationMs::new(request.lease_duration_ms).map_err(corrupt)?),
-            ),
-            Some(LastVolumeTransition::Release { request, .. }) => (
-                Some("release"),
-                Some(request.transition_id.to_string()),
-                None,
-                None,
-                None,
-            ),
-            Some(LastVolumeTransition::Takeover { authorization_id }) => (
-                Some("takeover"),
-                Some(authorization_id.to_string()),
-                None,
-                None,
-                None,
-            ),
-            Some(LastVolumeTransition::BeginDelete { request, .. }) => (
-                Some("begin_delete"),
-                Some(request.delete_id.to_string()),
-                None,
-                None,
-                None,
-            ),
-            Some(LastVolumeTransition::BeginDisposableDelete { authorization_id }) => (
-                Some("begin_disposable_delete"),
-                Some(authorization_id.to_string()),
-                None,
-                None,
-                None,
-            ),
-        };
-        Ok(Self {
-            volume_id: record.volume_id.to_string(),
-            size_bytes: SizeBytes::new(record.size_bytes).map_err(corrupt)?,
-            durability,
-            admin_state,
-            delete_id,
-            head: HeadProjection::from_head(&record.head),
-            lease_owner: record.lease_owner.as_ref().map(ToString::to_string),
-            lease_epoch: record.lease_epoch,
-            lease_expires_at: record.lease_expires_at,
-            last_transition_kind: kind,
-            last_transition_id: transition_id,
-            transition_desired_revision: revision,
-            transition_placement_epoch: placement,
-            transition_lease_duration_ms: duration,
-        })
-    }
-
-    fn from_row(row: &Row) -> AuthorityTxResult<Self> {
-        let durability = static_value(row.try_get("durability")?, &["strict", "relaxed"])?;
-        let admin_state = static_value(row.try_get("admin_state")?, &["active", "deleting"])?;
-        let last_transition_kind = match row.try_get::<_, Option<String>>("last_transition_kind")? {
-            None => None,
-            Some(value) => Some(static_value(
-                value,
-                &[
-                    "normal_acquire",
-                    "release",
-                    "takeover",
-                    "begin_delete",
-                    "begin_disposable_delete",
-                ],
-            )?),
-        };
-        Ok(Self {
-            volume_id: row.try_get("volume_id")?,
-            size_bytes: from_pg(row.try_get("size_bytes")?)?,
-            durability,
-            admin_state,
-            delete_id: row.try_get("delete_id")?,
-            head: HeadProjection::from_row(row)?,
-            lease_owner: row.try_get("lease_owner")?,
-            lease_epoch: from_pg(row.try_get("lease_epoch")?)?,
-            lease_expires_at: optional_from_pg(row.try_get("lease_expires_at")?)?,
-            last_transition_kind,
-            last_transition_id: row.try_get("last_transition_id")?,
-            transition_desired_revision: optional_from_pg(
-                row.try_get("transition_desired_revision")?,
-            )?,
-            transition_placement_epoch: optional_from_pg(
-                row.try_get("transition_placement_epoch")?,
-            )?,
-            transition_lease_duration_ms: optional_from_pg(
-                row.try_get("transition_lease_duration_ms")?,
-            )?,
-        })
-    }
+fn volume_projection_from_row(row: &Row) -> AuthorityTxResult<VolumeRecordProjection> {
+    let durability = static_value(row.try_get("durability")?, &["strict", "relaxed"])?;
+    let admin_state = static_value(row.try_get("admin_state")?, &["active", "deleting"])?;
+    let last_transition_kind = match row.try_get::<_, Option<String>>("last_transition_kind")? {
+        None => None,
+        Some(value) => Some(static_value(
+            value,
+            &[
+                "normal_acquire",
+                "release",
+                "takeover",
+                "begin_delete",
+                "begin_disposable_delete",
+            ],
+        )?),
+    };
+    let size_bytes: SizeBytes = from_pg(row.try_get("size_bytes")?)?;
+    let transition_duration: Option<LeaseDurationMs> =
+        optional_from_pg(row.try_get("transition_lease_duration_ms")?)?;
+    Ok(VolumeRecordProjection {
+        volume_id: row.try_get("volume_id")?,
+        size_bytes: size_bytes.get(),
+        durability,
+        admin_state,
+        delete_id: row.try_get("delete_id")?,
+        head_generation: from_pg(row.try_get("head_generation")?)?,
+        head_root_hash: row.try_get("head_root_hash")?,
+        head_root_object_id: row.try_get("head_root_object_id")?,
+        lease_owner: row.try_get("lease_owner")?,
+        lease_epoch: from_pg(row.try_get("lease_epoch")?)?,
+        lease_expires_at: optional_from_pg(row.try_get("lease_expires_at")?)?,
+        last_transition_kind,
+        last_transition_id: row.try_get("last_transition_id")?,
+        transition_desired_revision: optional_from_pg(row.try_get("transition_desired_revision")?)?,
+        transition_placement_epoch: optional_from_pg(row.try_get("transition_placement_epoch")?)?,
+        transition_lease_duration_ms: transition_duration.map(PgBigInt::get),
+    })
 }
 
 pub(super) fn load_volume_for_update(
@@ -205,15 +118,23 @@ pub(super) fn insert_volume(
     transaction: &mut Transaction<'_>,
     record: &VolumeRecord,
 ) -> AuthorityTxResult<()> {
-    let projection = VolumeProjection::from_record(record)?;
+    let projection = project_volume_record(record)?;
     let record_json = encode(record)?;
-    let size_bytes = projection.size_bytes.to_pg().map_err(corrupt)?;
-    let head_generation = projection.head.generation.to_pg().map_err(corrupt)?;
+    let size_bytes = SizeBytes::new(projection.size_bytes)
+        .map_err(corrupt)?
+        .to_pg()
+        .map_err(corrupt)?;
+    let head_generation = projection.head_generation.to_pg().map_err(corrupt)?;
     let lease_epoch = projection.lease_epoch.to_pg().map_err(corrupt)?;
     let lease_expires_at = optional_to_pg(projection.lease_expires_at)?;
     let transition_revision = optional_to_pg(projection.transition_desired_revision)?;
     let transition_placement = optional_to_pg(projection.transition_placement_epoch)?;
-    let transition_duration = optional_to_pg(projection.transition_lease_duration_ms)?;
+    let transition_duration = projection
+        .transition_lease_duration_ms
+        .map(LeaseDurationMs::new)
+        .transpose()
+        .map_err(corrupt)?;
+    let transition_duration = optional_to_pg(transition_duration)?;
     transaction.execute(
         "INSERT INTO volume_records (
             volume_id, record, size_bytes, durability, admin_state, delete_id,
@@ -233,8 +154,8 @@ pub(super) fn insert_volume(
             &projection.admin_state,
             &projection.delete_id,
             &head_generation,
-            &projection.head.root_hash,
-            &projection.head.root_object_id,
+            &projection.head_root_hash,
+            &projection.head_root_object_id,
             &projection.lease_owner,
             &lease_epoch,
             &lease_expires_at,
@@ -252,15 +173,23 @@ pub(super) fn update_volume(
     transaction: &mut Transaction<'_>,
     record: &VolumeRecord,
 ) -> AuthorityTxResult<()> {
-    let projection = VolumeProjection::from_record(record)?;
+    let projection = project_volume_record(record)?;
     let record_json = encode(record)?;
-    let size_bytes = projection.size_bytes.to_pg().map_err(corrupt)?;
-    let head_generation = projection.head.generation.to_pg().map_err(corrupt)?;
+    let size_bytes = SizeBytes::new(projection.size_bytes)
+        .map_err(corrupt)?
+        .to_pg()
+        .map_err(corrupt)?;
+    let head_generation = projection.head_generation.to_pg().map_err(corrupt)?;
     let lease_epoch = projection.lease_epoch.to_pg().map_err(corrupt)?;
     let lease_expires_at = optional_to_pg(projection.lease_expires_at)?;
     let transition_revision = optional_to_pg(projection.transition_desired_revision)?;
     let transition_placement = optional_to_pg(projection.transition_placement_epoch)?;
-    let transition_duration = optional_to_pg(projection.transition_lease_duration_ms)?;
+    let transition_duration = projection
+        .transition_lease_duration_ms
+        .map(LeaseDurationMs::new)
+        .transpose()
+        .map_err(corrupt)?;
+    let transition_duration = optional_to_pg(transition_duration)?;
     let changed = transaction.execute(
         "UPDATE volume_records SET
             record=$2::TEXT::jsonb, size_bytes=$3, durability=$4, admin_state=$5,
@@ -278,8 +207,8 @@ pub(super) fn update_volume(
             &projection.admin_state,
             &projection.delete_id,
             &head_generation,
-            &projection.head.root_hash,
-            &projection.head.root_object_id,
+            &projection.head_root_hash,
+            &projection.head_root_object_id,
             &projection.lease_owner,
             &lease_epoch,
             &lease_expires_at,
@@ -294,9 +223,9 @@ pub(super) fn update_volume(
 }
 
 fn decode_volume(row: &Row) -> AuthorityTxResult<VolumeRecord> {
-    let stored = VolumeProjection::from_row(row)?;
+    let stored = volume_projection_from_row(row)?;
     let record: VolumeRecord = decode(row.try_get("record_json")?)?;
-    let derived = VolumeProjection::from_record(&record)?;
+    let derived = project_volume_record(&record)?;
     if stored != derived {
         return Err(corrupt(()));
     }

@@ -98,12 +98,10 @@ impl ChunkEngine {
         crashpoint::maybe_crash(crashpoint::AFTER_PROVISION_COMMIT_PUT);
         crashpoint::maybe_crash(crashpoint::BEFORE_CAS);
 
-        let cas = self.meta.cas_head(
+        let cas = self.authority.compare_and_swap_head(
             volume_id,
-            0,
-            1,
-            prepared.root_hash,
-            &prepared.root_object_id,
+            &request.expected_blank_head,
+            &request.expected_provisioned_head,
             request.attachment_id.as_str(),
             self.epoch,
         );
@@ -379,7 +377,7 @@ impl ChunkEngine {
 
     fn load_authority(&self, request: &ProvisionRootImageRequest) -> EffectResult<VolumeHead> {
         let head = self
-            .meta
+            .authority
             .load_head(request.volume_id.as_str())
             .map_err(|error| {
                 if matches!(error, MetaError::Backend(_)) {

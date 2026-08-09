@@ -10,7 +10,7 @@ use anyhow::{bail, Context, Result};
 use cats_api::blockd::{BlockdControlCommand, BlockdControlResponse};
 use cats_blockd::engine::{ChunkEngine, EngineConfig, ProvisionRootImageEffectError};
 use cats_blockd::nbd;
-use cats_metadata_store_postgres::PostgresMetadataStoreFactory;
+use cats_metadata_store_postgres::{PostgresMetadataStoreFactory, PostgresVolumeDataAuthority};
 use cats_metadata_store_sqlite::SqliteMetadataStoreFactory;
 use cats_object_store_aws_s3::AwsS3BlobStoreFactory;
 use cats_object_store_file::FileBlobStoreFactory;
@@ -301,23 +301,6 @@ fn main() -> Result<()> {
 
     let metadata_config =
         AdapterConfig::from_cli(args.metadata_store_options).context("metadata adapter options")?;
-    let metadata_factories: [&dyn MetadataStoreFactory; 2] =
-        [&SqliteMetadataStoreFactory, &PostgresMetadataStoreFactory];
-    let meta = open_metadata_store(
-        &metadata_store_adapter,
-        &metadata_config,
-        &metadata_factories,
-    )
-    .context("open metadata store")?;
-
-    if let Some(size) = args.create_volume_size {
-        let size = cats_api::chunk::round_up_to_chunk(size);
-        match meta.create_volume(&volume_id, size) {
-            Ok(()) | Err(MetaError::AlreadyExists(_)) => {}
-            Err(error) => return Err(error).context("create volume"),
-        }
-    }
-
     let durability = match args.durability.as_str() {
         "strict" => cats_blockd::engine::DurabilityMode::Strict,
         "relaxed" => cats_blockd::engine::DurabilityMode::Relaxed {
@@ -338,15 +321,32 @@ fn main() -> Result<()> {
     let deadline =
         std::time::Instant::now() + std::time::Duration::from_millis(args.acquire_wait_ms);
     let engine = if args.control_only {
+        let authority = PostgresVolumeDataAuthority::open(&metadata_config)
+            .context("open target volume authority")?;
         ChunkEngine::attach_control_only(
             config,
             args.attachment_epoch
                 .expect("process-mode validation requires an attachment epoch"),
             blob.clone(),
-            meta.clone(),
+            authority,
         )
         .context("adopt control-only chunk engine")?
     } else {
+        let metadata_factories: [&dyn MetadataStoreFactory; 2] =
+            [&SqliteMetadataStoreFactory, &PostgresMetadataStoreFactory];
+        let meta = open_metadata_store(
+            &metadata_store_adapter,
+            &metadata_config,
+            &metadata_factories,
+        )
+        .context("open metadata store")?;
+        if let Some(size) = args.create_volume_size {
+            let size = cats_api::chunk::round_up_to_chunk(size);
+            match meta.create_volume(&volume_id, size) {
+                Ok(()) | Err(MetaError::AlreadyExists(_)) => {}
+                Err(error) => return Err(error).context("create volume"),
+            }
+        }
         loop {
             match ChunkEngine::attach(config.clone(), blob.clone(), meta.clone()) {
                 Ok(engine) => break engine,
@@ -674,6 +674,9 @@ fn validate_process_mode(args: &Args) -> Result<()> {
             bail!(
                 "--control-only forbids legacy seed, image publish, GC, and volume creation modes"
             );
+        }
+        if args.metadata_store_adapter.as_deref() != Some("postgres") {
+            bail!("--control-only requires --metadata-store-adapter postgres");
         }
     } else if args.attachment_epoch.is_some() {
         bail!("--attachment-epoch is only valid with --control-only");

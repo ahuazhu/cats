@@ -1018,3 +1018,64 @@ fn wrong_owner_attachment_epoch_and_transition_are_zero_side_effect() {
         assert_eq!(owned, before);
     }
 }
+
+#[test]
+fn data_plane_head_cas_compares_owner_epoch_and_complete_head() {
+    let owned = acquired_volume();
+    let request = VolumeHeadCasRequest {
+        volume_id: owned.volume_id.clone(),
+        attachment_id: owned.lease_owner.clone().unwrap(),
+        expected_epoch: owned.lease_epoch,
+        expected_head: owned.head.clone(),
+        new_head: head(5),
+    };
+    let (published, result) = compare_and_swap_head(&owned, &request).unwrap();
+    assert_eq!(published.head, head(5));
+    assert_eq!(published.lease_owner, owned.lease_owner);
+    assert_eq!(published.lease_epoch, owned.lease_epoch);
+    assert_eq!(published.lease_expires_at, owned.lease_expires_at);
+    assert_eq!(published.last_transition, owned.last_transition);
+    assert_eq!(result.resulting_head, head(5));
+
+    let mut wrong_owner = request.clone();
+    wrong_owner.attachment_id = id("attachment-other");
+    assert_eq!(
+        compare_and_swap_head(&owned, &wrong_owner),
+        Err(AuthorityError::Fenced)
+    );
+
+    let mut wrong_epoch = request.clone();
+    wrong_epoch.expected_epoch = fence_epoch(request.expected_epoch.get() - 1);
+    assert_eq!(
+        compare_and_swap_head(&owned, &wrong_epoch),
+        Err(AuthorityError::Fenced)
+    );
+
+    let mut same_generation_different_root = request;
+    same_generation_different_root.expected_head = RemoteHead {
+        generation: owned.head.generation,
+        root_hash: Some(Sha256Digest::new(format!("sha256:{:064x}", 99)).unwrap()),
+        root_object_id: Some(AsciiText::new("roots/99").unwrap()),
+    };
+    assert_eq!(
+        compare_and_swap_head(&owned, &same_generation_different_root),
+        Err(AuthorityError::HeadConflict)
+    );
+}
+
+#[test]
+fn volume_projection_is_derived_from_the_validated_authority_record() {
+    let owned = acquired_volume();
+    let projection = project_volume_record(&owned).unwrap();
+    assert_eq!(projection.volume_id, owned.volume_id.as_str());
+    assert_eq!(projection.size_bytes, owned.size_bytes);
+    assert_eq!(projection.durability, "strict");
+    assert_eq!(projection.admin_state, "active");
+    assert_eq!(projection.head_generation, owned.head.generation);
+    assert_eq!(projection.lease_owner.as_deref(), Some("attachment-old"));
+    assert_eq!(projection.lease_epoch, owned.lease_epoch);
+    assert_eq!(projection.last_transition_kind, Some("normal_acquire"));
+    assert_eq!(projection.transition_desired_revision, Some(revision(11)));
+    assert_eq!(projection.transition_placement_epoch, Some(epoch(3)));
+    assert_eq!(projection.transition_lease_duration_ms, Some(5_000));
+}

@@ -26,7 +26,11 @@ use crate::crashpoint;
 use crate::format::{
     self, ChunkRef, LeafRef, PackByteRange, PackEntry, PackHeader, BITMAP_HEADER_LEN,
 };
-use cats_storage::{BlobError, BlobStore, MetaError, MetadataStore};
+use cats_storage::authority::{
+    AsciiText, AuthorityError, FenceEpoch, Generation, Id, RemoteHead, RenewLeaseRequest,
+    Sha256Digest, VolumeDataAuthority, VolumeHeadCasRequest,
+};
+use cats_storage::{BlobError, BlobStore, MetaError, MetadataStore, VolumeHead};
 
 mod gc;
 mod hydrate;
@@ -161,7 +165,7 @@ pub struct ChunkEngine {
     size: u64,
     chunk_count: u64,
     blob: Arc<dyn BlobStore>,
-    meta: Arc<dyn MetadataStore>,
+    authority: AuthorityBackend,
     cache: File,
     bitmap: Mutex<File>,
     state: Mutex<EngineState>,
@@ -215,6 +219,190 @@ enum AttachmentMode {
     AdoptControlOnly { expected_epoch: i64 },
 }
 
+enum AuthorityBackend {
+    Legacy(Arc<dyn MetadataStore>),
+    Target(Arc<dyn VolumeDataAuthority>),
+}
+
+impl AuthorityBackend {
+    fn load_head(&self, volume_id: &str) -> cats_storage::metadata::Result<VolumeHead> {
+        match self {
+            Self::Legacy(metadata) => metadata.load_head(volume_id),
+            Self::Target(authority) => {
+                let volume_id = Id::new(volume_id.to_string()).ok_or_else(|| {
+                    MetaError::InvalidArgument("volume_id is not a target authority Id".into())
+                })?;
+                let record = authority
+                    .load_volume(&volume_id)
+                    .map_err(|error| map_target_error(error, volume_id.as_str(), 0))?;
+                if record.volume_id != volume_id {
+                    return Err(MetaError::Backend(
+                        "target authority returned a different volume".into(),
+                    ));
+                }
+                Ok(VolumeHead {
+                    volume_id: record.volume_id.to_string(),
+                    size_bytes: record.size_bytes,
+                    generation: i64::try_from(record.head.generation.get()).map_err(|_| {
+                        MetaError::Backend("target authority generation exceeds i64".into())
+                    })?,
+                    root_hash: record
+                        .head
+                        .root_hash
+                        .as_ref()
+                        .map(|digest| *digest.as_bytes()),
+                    root_object_id: record.head.root_object_id.as_ref().map(ToString::to_string),
+                    lease_owner: record.lease_owner.as_ref().map(ToString::to_string),
+                    lease_epoch: i64::try_from(record.lease_epoch.get()).map_err(|_| {
+                        MetaError::Backend("target authority epoch exceeds i64".into())
+                    })?,
+                })
+            }
+        }
+    }
+
+    fn renew_lease(
+        &self,
+        volume_id: &str,
+        attachment_id: &str,
+        epoch: i64,
+        ttl_ms: i64,
+    ) -> cats_storage::metadata::Result<()> {
+        match self {
+            Self::Legacy(metadata) => metadata.renew_lease(volume_id, attachment_id, epoch, ttl_ms),
+            Self::Target(authority) => {
+                let volume_id = target_id(volume_id, "volume_id")?;
+                let attachment_id = target_id(attachment_id, "attachment_id")?;
+                let expected_epoch = target_epoch(epoch)?;
+                let lease_duration_ms = u64::try_from(ttl_ms)
+                    .ok()
+                    .filter(|duration| *duration > 0)
+                    .ok_or_else(|| {
+                        MetaError::InvalidArgument("lease duration must be positive".into())
+                    })?;
+                let result = authority
+                    .renew_lease(&RenewLeaseRequest {
+                        volume_id: volume_id.clone(),
+                        attachment_id: attachment_id.clone(),
+                        expected_epoch,
+                        lease_duration_ms,
+                    })
+                    .map_err(|error| map_target_error(error, volume_id.as_str(), 0))?;
+                if result.volume_id != volume_id
+                    || result.attachment_id != attachment_id
+                    || result.epoch != expected_epoch
+                {
+                    return Err(MetaError::Backend(
+                        "target authority returned a mismatched renew result".into(),
+                    ));
+                }
+                Ok(())
+            }
+        }
+    }
+
+    fn compare_and_swap_head(
+        &self,
+        volume_id: &str,
+        expected_head: &RemoteHead,
+        new_head: &RemoteHead,
+        attachment_id: &str,
+        epoch: i64,
+    ) -> cats_storage::metadata::Result<i64> {
+        match self {
+            Self::Legacy(metadata) => {
+                let root_hash = new_head
+                    .root_hash
+                    .as_ref()
+                    .ok_or_else(|| MetaError::InvalidArgument("new root hash is absent".into()))?;
+                let root_object_id = new_head.root_object_id.as_ref().ok_or_else(|| {
+                    MetaError::InvalidArgument("new root object id is absent".into())
+                })?;
+                metadata.cas_head(
+                    volume_id,
+                    i64::try_from(expected_head.generation.get()).map_err(|_| {
+                        MetaError::InvalidArgument("expected generation exceeds i64".into())
+                    })?,
+                    i64::try_from(new_head.generation.get()).map_err(|_| {
+                        MetaError::InvalidArgument("new generation exceeds i64".into())
+                    })?,
+                    *root_hash.as_bytes(),
+                    root_object_id.as_str(),
+                    attachment_id,
+                    epoch,
+                )
+            }
+            Self::Target(authority) => {
+                let volume_id = target_id(volume_id, "volume_id")?;
+                let attachment_id = target_id(attachment_id, "attachment_id")?;
+                let expected_epoch = target_epoch(epoch)?;
+                let result = authority
+                    .compare_and_swap_head(&VolumeHeadCasRequest {
+                        volume_id: volume_id.clone(),
+                        attachment_id: attachment_id.clone(),
+                        expected_epoch,
+                        expected_head: expected_head.clone(),
+                        new_head: new_head.clone(),
+                    })
+                    .map_err(|error| {
+                        map_target_error(
+                            error,
+                            volume_id.as_str(),
+                            i64::try_from(expected_head.generation.get()).unwrap_or(i64::MAX),
+                        )
+                    })?;
+                if result.volume_id != volume_id
+                    || result.attachment_id != attachment_id
+                    || result.epoch != expected_epoch
+                    || result.resulting_head != *new_head
+                {
+                    return Err(MetaError::Backend(
+                        "target authority returned a mismatched head CAS result".into(),
+                    ));
+                }
+                i64::try_from(result.resulting_head.generation.get()).map_err(|_| {
+                    MetaError::Backend("target authority generation exceeds i64".into())
+                })
+            }
+        }
+    }
+}
+
+fn target_id(value: &str, field: &str) -> cats_storage::metadata::Result<Id> {
+    Id::new(value.to_string())
+        .ok_or_else(|| MetaError::InvalidArgument(format!("{field} is not a target authority Id")))
+}
+
+fn target_epoch(value: i64) -> cats_storage::metadata::Result<FenceEpoch> {
+    u64::try_from(value)
+        .ok()
+        .and_then(FenceEpoch::new)
+        .filter(|epoch| epoch.get() > 0)
+        .ok_or_else(|| MetaError::InvalidArgument("attachment epoch must be positive".into()))
+}
+
+fn map_target_error(error: AuthorityError, volume_id: &str, expected: i64) -> MetaError {
+    match error {
+        AuthorityError::NotFound => MetaError::NotFound(volume_id.to_string()),
+        AuthorityError::OtherWriter | AuthorityError::Fenced | AuthorityError::AdminBusy => {
+            MetaError::Fenced
+        }
+        AuthorityError::HeadConflict => MetaError::CasConflict { expected },
+        AuthorityError::InvalidLeaseDuration => {
+            MetaError::InvalidArgument("lease duration is invalid".into())
+        }
+        AuthorityError::BackendUnknown => {
+            MetaError::Backend("target volume authority outcome is unknown".into())
+        }
+        AuthorityError::StaleTransition
+        | AuthorityError::EpochExhausted
+        | AuthorityError::SnapshotInUse
+        | AuthorityError::InvalidAuthorization => MetaError::Backend(
+            "target volume authority rejected an operation outside the data-plane port".into(),
+        ),
+    }
+}
+
 impl ChunkEngine {
     /// Attach to a volume: acquire the lease (bumping the fencing epoch),
     /// start lease renewal, then load the committed map and recover pending
@@ -224,7 +412,12 @@ impl ChunkEngine {
         blob: Arc<dyn BlobStore>,
         meta: Arc<dyn MetadataStore>,
     ) -> Result<Arc<Self>> {
-        Self::open(cfg, blob, meta, AttachmentMode::Acquire)
+        Self::open(
+            cfg,
+            blob,
+            AuthorityBackend::Legacy(meta),
+            AttachmentMode::Acquire,
+        )
     }
 
     /// Adopt an already-authorized attachment for the root-provision effect.
@@ -237,7 +430,7 @@ impl ChunkEngine {
         cfg: EngineConfig,
         expected_epoch: i64,
         blob: Arc<dyn BlobStore>,
-        meta: Arc<dyn MetadataStore>,
+        authority: Arc<dyn VolumeDataAuthority>,
     ) -> Result<Arc<Self>> {
         if expected_epoch <= 0 {
             return Err(EngineError::InvalidConfig(
@@ -247,7 +440,7 @@ impl ChunkEngine {
         Self::open(
             cfg,
             blob,
-            meta,
+            AuthorityBackend::Target(authority),
             AttachmentMode::AdoptControlOnly { expected_epoch },
         )
     }
@@ -255,7 +448,7 @@ impl ChunkEngine {
     fn open(
         cfg: EngineConfig,
         blob: Arc<dyn BlobStore>,
-        meta: Arc<dyn MetadataStore>,
+        authority: AuthorityBackend,
         mode: AttachmentMode,
     ) -> Result<Arc<Self>> {
         if cfg.volume_id.is_empty() || cfg.attachment_id.is_empty() {
@@ -278,7 +471,7 @@ impl ChunkEngine {
                 "max_local_bytes must be at least one chunk ({CHUNK_SIZE} bytes)"
             )));
         }
-        let head = meta.load_head(&cfg.volume_id)?;
+        let head = authority.load_head(&cfg.volume_id)?;
         let size = head.size_bytes;
         if size == 0 || size % CHUNK_SIZE as u64 != 0 {
             return Err(EngineError::Corrupt(format!(
@@ -292,11 +485,11 @@ impl ChunkEngine {
         }
         let chunk_count = chunk::chunk_count(size);
 
-        let epoch = match mode {
-            AttachmentMode::Acquire => {
-                meta.acquire_lease(&cfg.volume_id, &cfg.attachment_id, cfg.lease_ttl_ms)?
+        let epoch = match (mode, &authority) {
+            (AttachmentMode::Acquire, AuthorityBackend::Legacy(metadata)) => {
+                metadata.acquire_lease(&cfg.volume_id, &cfg.attachment_id, cfg.lease_ttl_ms)?
             }
-            AttachmentMode::AdoptControlOnly { expected_epoch } => {
+            (AttachmentMode::AdoptControlOnly { expected_epoch }, AuthorityBackend::Target(_)) => {
                 if head.lease_owner.is_some() && head.lease_epoch <= 0 {
                     return Err(EngineError::Corrupt(
                         "an owned volume cannot have lease epoch zero".into(),
@@ -308,6 +501,12 @@ impl ChunkEngine {
                     return Err(EngineError::Meta(MetaError::Fenced));
                 }
                 expected_epoch
+            }
+            (AttachmentMode::Acquire, AuthorityBackend::Target(_))
+            | (AttachmentMode::AdoptControlOnly { .. }, AuthorityBackend::Legacy(_)) => {
+                return Err(EngineError::InvalidConfig(
+                    "attachment mode and authority backend do not match".into(),
+                ));
             }
         };
         let control_only = matches!(mode, AttachmentMode::AdoptControlOnly { .. });
@@ -349,7 +548,7 @@ impl ChunkEngine {
             size,
             chunk_count,
             blob,
-            meta,
+            authority,
             cache,
             bitmap: Mutex::new(bitmap_file),
             state: Mutex::new(EngineState {
@@ -577,7 +776,7 @@ impl ChunkEngine {
     }
 
     fn load_committed_map(&self) -> Result<()> {
-        let head = self.meta.load_head(&self.cfg.volume_id)?;
+        let head = self.authority.load_head(&self.cfg.volume_id)?;
         let mut refs = vec![ChunkRef::Hole; self.chunk_count as usize];
         let mut leaf_refs = vec![LeafRef::Empty; chunk::leaf_count(self.size) as usize];
 
