@@ -1,8 +1,10 @@
 //! One-step orchestration for the durable signed Node spine.
 
+use std::collections::BTreeSet;
 use std::io;
-use std::sync::{mpsc, Arc};
-use std::time::Instant;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{mpsc, Arc, Mutex, MutexGuard};
+use std::time::{Duration, Instant};
 
 use cats_api::runtime_reconciliation::{
     inventory_digest, AgentSession, ContractError, ContractErrorDetail, ContractVersion,
@@ -19,12 +21,30 @@ use super::{
     RuntimeSpineHttpClient, RuntimeSpineJournal, RuntimeSpineJournalError, RuntimeSpineRetryReason,
 };
 
+const REQUIRED_INVENTORY_SOURCES: [InventorySource; 11] = [
+    InventorySource::Checkpoint,
+    InventorySource::Systemd,
+    InventorySource::Process,
+    InventorySource::ControlSocket,
+    InventorySource::BlockFrontend,
+    InventorySource::Network,
+    InventorySource::DataDirectory,
+    InventorySource::PendingPack,
+    InventorySource::WarmSnapshot,
+    InventorySource::MetadataStore,
+    InventorySource::GuestMount,
+];
+
 /// Performs one bounded scan of every physical source required by Runtime §6.
 ///
-/// The runner, not the scanner, owns protocol identities and the inventory
-/// digest. Scanner implementations are read-only and must report every source
-/// outage as `Incomplete`; an unavailable source is never an empty success.
-pub trait RuntimeInventoryScanner: Send + Sync + 'static {
+/// This capability is sealed to the crate until a production composition root
+/// can supply concrete, cooperatively cancellable probes. Implementations must
+/// pass `context.deadline()` to every blocking I/O boundary and return promptly
+/// after `context.check_active()` reports cancellation. The runner, not the
+/// scanner, owns protocol identities and the inventory digest.
+pub trait RuntimeInventoryScanner:
+    super::inventory_scanner_sealed::Sealed + Send + Sync + 'static
+{
     fn scan_complete(
         &self,
         context: RuntimeInventoryScanContext,
@@ -33,13 +53,93 @@ pub trait RuntimeInventoryScanner: Send + Sync + 'static {
 
 #[derive(Debug, Clone)]
 pub struct RuntimeInventoryScanContext {
-    pub coordinates: RuntimeSpineFullScan,
-    pub deadline: Instant,
+    coordinates: RuntimeSpineFullScan,
+    deadline: Instant,
+    cancellation: RuntimeInventoryScanCancellation,
+}
+
+impl RuntimeInventoryScanContext {
+    fn new(
+        coordinates: RuntimeSpineFullScan,
+        deadline: Instant,
+        cancellation: RuntimeInventoryScanCancellation,
+    ) -> Self {
+        Self {
+            coordinates,
+            deadline,
+            cancellation,
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn for_test(coordinates: RuntimeSpineFullScan, deadline: Instant) -> Self {
+        Self::new(
+            coordinates,
+            deadline,
+            RuntimeInventoryScanCancellation::new(),
+        )
+    }
+
+    #[cfg(test)]
+    pub(crate) fn coordinates_mut(&mut self) -> &mut RuntimeSpineFullScan {
+        &mut self.coordinates
+    }
+
+    pub fn coordinates(&self) -> &RuntimeSpineFullScan {
+        &self.coordinates
+    }
+
+    /// The one absolute deadline shared by the scan and every underlying I/O.
+    pub fn deadline(&self) -> Instant {
+        self.deadline
+    }
+
+    pub fn remaining(&self) -> anyhow::Result<Duration> {
+        self.check_active()?;
+        self.deadline()
+            .checked_duration_since(Instant::now())
+            .filter(|remaining| !remaining.is_zero())
+            .ok_or_else(|| anyhow::anyhow!("runtime inventory scan deadline expired"))
+    }
+
+    pub fn check_active(&self) -> anyhow::Result<()> {
+        anyhow::ensure!(
+            !self.cancellation.is_cancelled(),
+            "runtime inventory scan was cancelled"
+        );
+        anyhow::ensure!(
+            Instant::now() < self.deadline,
+            "runtime inventory scan deadline expired"
+        );
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone)]
+struct RuntimeInventoryScanCancellation {
+    cancelled: Arc<AtomicBool>,
+}
+
+impl RuntimeInventoryScanCancellation {
+    fn new() -> Self {
+        Self {
+            cancelled: Arc::new(AtomicBool::new(false)),
+        }
+    }
+
+    fn cancel(&self) {
+        self.cancelled.store(true, Ordering::Release);
+    }
+
+    fn is_cancelled(&self) -> bool {
+        self.cancelled.load(Ordering::Acquire)
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub enum RuntimeInventoryKeyRing {
+pub(crate) enum RuntimeInventoryKeyRing {
     Unavailable,
+    #[allow(dead_code)] // Reserved for the non-empty scanner; not forgeable outside this crate.
     Loaded {
         version: Epoch,
         digest: Sha256Digest,
@@ -49,10 +149,101 @@ pub enum RuntimeInventoryKeyRing {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CompleteRuntimeInventory {
-    pub observed_at_unix_ms: UnixMillis,
-    pub key_ring: RuntimeInventoryKeyRing,
-    pub runtimes: Vec<ObservedRuntimeStatus>,
-    pub residue: Vec<NodeResidue>,
+    observed_at_unix_ms: UnixMillis,
+    key_ring: RuntimeInventoryKeyRing,
+    runtimes: Vec<ObservedRuntimeStatus>,
+    residue: Vec<NodeResidue>,
+}
+
+impl CompleteRuntimeInventory {
+    pub(crate) fn from_validated_coverage(
+        _coverage: CompleteInventoryCoverage,
+        observed_at_unix_ms: UnixMillis,
+        key_ring: RuntimeInventoryKeyRing,
+        runtimes: Vec<ObservedRuntimeStatus>,
+        residue: Vec<NodeResidue>,
+    ) -> Self {
+        Self {
+            observed_at_unix_ms,
+            key_ring,
+            runtimes,
+            residue,
+        }
+    }
+
+    #[cfg(test)]
+    fn for_test(
+        observed_at_unix_ms: UnixMillis,
+        key_ring: RuntimeInventoryKeyRing,
+        runtimes: Vec<ObservedRuntimeStatus>,
+        residue: Vec<NodeResidue>,
+    ) -> Self {
+        Self {
+            observed_at_unix_ms,
+            key_ring,
+            runtimes,
+            residue,
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn observed_at_unix_ms(&self) -> UnixMillis {
+        self.observed_at_unix_ms
+    }
+
+    #[cfg(test)]
+    pub(crate) fn runtimes(&self) -> &[ObservedRuntimeStatus] {
+        &self.runtimes
+    }
+
+    #[cfg(test)]
+    pub(crate) fn residue(&self) -> &[NodeResidue] {
+        &self.residue
+    }
+}
+
+/// Opaque proof that each member of Runtime's closed inventory-source set was
+/// visited exactly once. Only the validated aggregator can create it.
+pub(crate) struct CompleteInventoryCoverage {
+    _private: (),
+}
+
+pub(crate) struct InventoryCoverageAggregator {
+    covered: BTreeSet<InventorySource>,
+}
+
+impl InventoryCoverageAggregator {
+    pub(crate) fn new() -> Self {
+        Self {
+            covered: BTreeSet::new(),
+        }
+    }
+
+    pub(crate) fn record(&mut self, source: InventorySource) -> anyhow::Result<()> {
+        anyhow::ensure!(
+            REQUIRED_INVENTORY_SOURCES.contains(&source),
+            "unknown runtime inventory source {source:?}"
+        );
+        anyhow::ensure!(
+            self.covered.insert(source),
+            "runtime inventory source {source:?} was scanned more than once"
+        );
+        Ok(())
+    }
+
+    pub(crate) fn finish(self) -> anyhow::Result<CompleteInventoryCoverage> {
+        for source in REQUIRED_INVENTORY_SOURCES {
+            anyhow::ensure!(
+                self.covered.contains(&source),
+                "runtime inventory source {source:?} was not scanned"
+            );
+        }
+        anyhow::ensure!(
+            self.covered.len() == REQUIRED_INVENTORY_SOURCES.len(),
+            "runtime inventory coverage contains an unknown source"
+        );
+        Ok(CompleteInventoryCoverage { _private: () })
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -112,6 +303,14 @@ pub enum RuntimeSpineRunError {
     },
     #[error("runtime-spine blocking worker stopped: {0}")]
     WorkerStopped(String),
+    #[error("runtime-spine inventory scan lane is poisoned after cancellation or timeout")]
+    ScanLanePoisoned,
+    #[error("runtime-spine inventory scan queue is full")]
+    ScanQueueFull,
+    #[error("runtime-spine journal queue is full")]
+    JournalQueueFull,
+    #[error("runtime-spine worker shutdown failed: {0}")]
+    WorkerShutdown(String),
     #[error("runtime-spine scanner returned an invalid outcome: {0}")]
     InvalidScan(&'static str),
 }
@@ -144,7 +343,7 @@ enum JournalCommand {
 }
 
 struct JournalLane {
-    sender: Option<mpsc::Sender<JournalCommand>>,
+    sender: Option<mpsc::SyncSender<JournalCommand>>,
     thread: Option<std::thread::JoinHandle<()>>,
 }
 
@@ -153,7 +352,7 @@ impl JournalLane {
         state_directory: StateDirectory,
         registered_session: AgentSession,
     ) -> Result<Self, RuntimeSpineRunError> {
-        let (sender, receiver) = mpsc::channel();
+        let (sender, receiver) = mpsc::sync_channel(1);
         let (ready_sender, ready_receiver) = mpsc::sync_channel(1);
         let guard_state = state_directory.clone();
         let guard_session = registered_session.clone();
@@ -229,13 +428,25 @@ impl JournalLane {
                 worker: "journal",
                 source,
             })?;
-        ready_receiver
-            .recv()
-            .map_err(|_| RuntimeSpineRunError::WorkerStopped("journal startup".to_owned()))??;
-        Ok(Self {
+        let mut lane = Self {
             sender: Some(sender),
             thread: Some(thread),
-        })
+        };
+        let ready = ready_receiver
+            .recv()
+            .map_err(|_| RuntimeSpineRunError::WorkerStopped("journal startup".to_owned()))
+            .and_then(|result| result.map_err(RuntimeSpineRunError::from));
+        match ready {
+            Ok(()) => Ok(lane),
+            Err(primary) => {
+                if let Err(cleanup) = lane.shutdown_blocking() {
+                    return Err(RuntimeSpineRunError::WorkerShutdown(format!(
+                        "journal startup failed ({primary}); cleanup also failed ({cleanup})"
+                    )));
+                }
+                Err(primary)
+            }
+        }
     }
 
     async fn next(&self) -> Result<PendingWork, RuntimeSpineRunError> {
@@ -288,16 +499,29 @@ impl JournalLane {
     }
 
     fn send(&self, command: JournalCommand) -> Result<(), RuntimeSpineRunError> {
-        self.sender
+        match self
+            .sender
             .as_ref()
             .ok_or_else(|| RuntimeSpineRunError::WorkerStopped("journal".to_owned()))?
-            .send(command)
-            .map_err(|_| RuntimeSpineRunError::WorkerStopped("journal".to_owned()))
+            .try_send(command)
+        {
+            Ok(()) => Ok(()),
+            Err(mpsc::TrySendError::Full(_)) => Err(RuntimeSpineRunError::JournalQueueFull),
+            Err(mpsc::TrySendError::Disconnected(_)) => {
+                Err(RuntimeSpineRunError::WorkerStopped("journal".to_owned()))
+            }
+        }
     }
 
-    async fn shutdown(mut self) -> Result<(), RuntimeSpineRunError> {
+    fn shutdown_blocking(&mut self) -> Result<(), RuntimeSpineRunError> {
         self.sender.take();
-        join_worker("journal", self.thread.take()).await
+        join_worker_blocking("journal", self.thread.take())
+    }
+}
+
+impl Drop for JournalLane {
+    fn drop(&mut self) {
+        let _ = self.shutdown_blocking();
     }
 }
 
@@ -305,7 +529,7 @@ fn open_journal(
     state_directory: &StateDirectory,
     registered_session: &AgentSession,
 ) -> Result<RuntimeSpineJournal, RuntimeSpineJournalError> {
-    RuntimeSpineJournal::open(state_directory, registered_session.clone())
+    RuntimeSpineJournal::open_under_lane_lock(state_directory, registered_session.clone())
 }
 
 enum ScanCommand {
@@ -315,19 +539,42 @@ enum ScanCommand {
     },
 }
 
+#[derive(Default)]
+struct ScanLaneState {
+    poisoned: AtomicBool,
+    active: Mutex<Option<RuntimeInventoryScanCancellation>>,
+}
+
 struct ScanLane {
-    sender: Option<mpsc::Sender<ScanCommand>>,
+    sender: Option<mpsc::SyncSender<ScanCommand>>,
     thread: Option<std::thread::JoinHandle<()>>,
+    state: Arc<ScanLaneState>,
 }
 
 impl ScanLane {
     fn start(scanner: Arc<dyn RuntimeInventoryScanner>) -> Result<Self, RuntimeSpineRunError> {
-        let (sender, receiver) = mpsc::channel();
+        // One queued request is the complete non-authoritative buffer. A
+        // cancelled in-flight request poisons the lane instead of permitting a
+        // second scan to overlap it.
+        let (sender, receiver) = mpsc::sync_channel(1);
+        let state = Arc::new(ScanLaneState::default());
+        let worker_state = Arc::clone(&state);
         let thread = std::thread::Builder::new()
             .name("cats-runtime-spine-scan".to_owned())
             .spawn(move || {
                 while let Ok(ScanCommand::Complete { context, reply }) = receiver.recv() {
-                    let _ = reply.send(scanner.scan_complete(context));
+                    let result = if context.check_active().is_ok() {
+                        scanner.scan_complete(context)
+                    } else {
+                        Err(anyhow::anyhow!(
+                            "runtime inventory scan was cancelled before execution"
+                        ))
+                    };
+                    active_scan(&worker_state.active).take();
+                    // If the async deadline or caller cancellation already
+                    // won, the receiver is gone and the late result is
+                    // deliberately discarded.
+                    let _ = reply.send(result);
                 }
             })
             .map_err(|source| RuntimeSpineRunError::WorkerStart {
@@ -337,40 +584,147 @@ impl ScanLane {
         Ok(Self {
             sender: Some(sender),
             thread: Some(thread),
+            state,
         })
     }
 
     async fn scan_complete(
         &self,
-        context: RuntimeInventoryScanContext,
-    ) -> Result<anyhow::Result<RuntimeInventoryScanOutcome>, RuntimeSpineRunError> {
+        coordinates: RuntimeSpineFullScan,
+        deadline: Instant,
+    ) -> Result<ScanWait, RuntimeSpineRunError> {
+        if self.state.poisoned.load(Ordering::Acquire) {
+            return Err(RuntimeSpineRunError::ScanLanePoisoned);
+        }
+        if Instant::now() >= deadline {
+            return Ok(ScanWait::DeadlineExceeded);
+        }
+        let cancellation = RuntimeInventoryScanCancellation::new();
+        let context = RuntimeInventoryScanContext::new(coordinates, deadline, cancellation.clone());
+        {
+            let mut active = active_scan(&self.state.active);
+            if active.is_some() {
+                return Err(RuntimeSpineRunError::ScanQueueFull);
+            }
+            *active = Some(cancellation.clone());
+        }
         let (reply, received) = tokio::sync::oneshot::channel();
-        self.sender
+        let command = ScanCommand::Complete { context, reply };
+        let send_result = self
+            .sender
             .as_ref()
             .ok_or_else(|| RuntimeSpineRunError::WorkerStopped("inventory scan".to_owned()))?
-            .send(ScanCommand::Complete { context, reply })
-            .map_err(|_| RuntimeSpineRunError::WorkerStopped("inventory scan".to_owned()))?;
-        received
-            .await
-            .map_err(|_| RuntimeSpineRunError::WorkerStopped("inventory scan".to_owned()))
+            .try_send(command);
+        if let Err(error) = send_result {
+            active_scan(&self.state.active).take();
+            return match error {
+                mpsc::TrySendError::Full(_) => Err(RuntimeSpineRunError::ScanQueueFull),
+                mpsc::TrySendError::Disconnected(_) => Err(RuntimeSpineRunError::WorkerStopped(
+                    "inventory scan".to_owned(),
+                )),
+            };
+        }
+
+        let mut guard = ActiveScanGuard {
+            cancellation,
+            state: Arc::clone(&self.state),
+            armed: true,
+        };
+        let timed =
+            tokio::time::timeout_at(tokio::time::Instant::from_std(deadline), received).await;
+        match timed {
+            Ok(Ok(result)) => {
+                guard.disarm();
+                if Instant::now() >= deadline {
+                    Ok(ScanWait::DeadlineExceeded)
+                } else {
+                    Ok(ScanWait::Finished(result))
+                }
+            }
+            Ok(Err(_)) => {
+                guard.poison();
+                Err(RuntimeSpineRunError::WorkerStopped(
+                    "inventory scan".to_owned(),
+                ))
+            }
+            Err(_) => {
+                guard.poison();
+                Ok(ScanWait::DeadlineExceeded)
+            }
+        }
     }
 
-    async fn shutdown(mut self) -> Result<(), RuntimeSpineRunError> {
+    fn cancel_and_poison(&self) {
+        self.state.poisoned.store(true, Ordering::Release);
+        if let Some(cancellation) = active_scan(&self.state.active).as_ref() {
+            cancellation.cancel();
+        }
+    }
+
+    fn shutdown_blocking(&mut self) -> Result<(), RuntimeSpineRunError> {
+        self.cancel_and_poison();
         self.sender.take();
-        join_worker("inventory scan", self.thread.take()).await
+        join_worker_blocking("inventory scan", self.thread.take())
     }
 }
 
-async fn join_worker(
+impl Drop for ScanLane {
+    fn drop(&mut self) {
+        let _ = self.shutdown_blocking();
+    }
+}
+
+fn active_scan(
+    mutex: &Mutex<Option<RuntimeInventoryScanCancellation>>,
+) -> MutexGuard<'_, Option<RuntimeInventoryScanCancellation>> {
+    match mutex.lock() {
+        Ok(guard) => guard,
+        // The token has no multi-field invariant. Recovering it lets shutdown
+        // still cancel and join a scanner after a worker panic.
+        Err(poisoned) => poisoned.into_inner(),
+    }
+}
+
+enum ScanWait {
+    Finished(anyhow::Result<RuntimeInventoryScanOutcome>),
+    DeadlineExceeded,
+}
+
+struct ActiveScanGuard {
+    cancellation: RuntimeInventoryScanCancellation,
+    state: Arc<ScanLaneState>,
+    armed: bool,
+}
+
+impl ActiveScanGuard {
+    fn disarm(&mut self) {
+        self.armed = false;
+    }
+
+    fn poison(&mut self) {
+        if self.armed {
+            self.cancellation.cancel();
+            self.state.poisoned.store(true, Ordering::Release);
+            self.armed = false;
+        }
+    }
+}
+
+impl Drop for ActiveScanGuard {
+    fn drop(&mut self) {
+        self.poison();
+    }
+}
+
+fn join_worker_blocking(
     worker: &'static str,
     thread: Option<std::thread::JoinHandle<()>>,
 ) -> Result<(), RuntimeSpineRunError> {
     let Some(thread) = thread else {
         return Ok(());
     };
-    tokio::task::spawn_blocking(move || thread.join())
-        .await
-        .map_err(|error| RuntimeSpineRunError::WorkerStopped(format!("{worker}: {error}")))?
+    thread
+        .join()
         .map_err(|_| RuntimeSpineRunError::WorkerStopped(format!("{worker} panicked")))
 }
 
@@ -391,8 +745,8 @@ pub struct RuntimeSpineRunner {
     state_directory: StateDirectory,
     registered_session: AgentSession,
     client: RuntimeSpineHttpClient,
-    journal_lane: JournalLane,
-    scan_lane: ScanLane,
+    journal_lane: Option<JournalLane>,
+    scan_lane: Option<ScanLane>,
 }
 
 impl std::fmt::Debug for RuntimeSpineRunner {
@@ -413,14 +767,17 @@ impl RuntimeSpineRunner {
         client: RuntimeSpineHttpClient,
         scanner: Arc<dyn RuntimeInventoryScanner>,
     ) -> Result<Self, RuntimeSpineRunError> {
-        let journal_lane = JournalLane::start(state_directory.clone(), registered_session.clone())?;
+        // Start the non-authoritative scanner first. If acquiring the journal
+        // flock then fails, ScanLane's Drop closes and joins the already
+        // started thread before this constructor returns.
         let scan_lane = ScanLane::start(scanner)?;
+        let journal_lane = JournalLane::start(state_directory.clone(), registered_session.clone())?;
         Ok(Self {
             state_directory,
             registered_session,
             client,
-            journal_lane,
-            scan_lane,
+            journal_lane: Some(journal_lane),
+            scan_lane: Some(scan_lane),
         })
     }
 
@@ -428,19 +785,21 @@ impl RuntimeSpineRunner {
         &mut self,
         scan_deadline: Instant,
     ) -> Result<RuntimeSpineRunStep, RuntimeSpineRunError> {
-        let work = self.journal_lane.next().await?;
+        let work = self.journal_lane()?.next().await?;
 
         match work {
             PendingWork::Desired(request) => self.send_desired(request).await,
             PendingWork::Observation(request) => self.send_observation(request).await,
             PendingWork::Scan(scan) => {
-                let context = RuntimeInventoryScanContext {
-                    coordinates: scan,
-                    deadline: scan_deadline,
-                };
-                let outcome = match self.scan_lane.scan_complete(context.clone()).await? {
-                    Ok(outcome) => outcome,
-                    Err(error) => return Ok(RuntimeSpineRunStep::ScanUnavailable(error)),
+                let coordinates = scan.clone();
+                let outcome = match self.scan_lane()?.scan_complete(scan, scan_deadline).await? {
+                    ScanWait::Finished(Ok(outcome)) => outcome,
+                    ScanWait::Finished(Err(error)) => {
+                        return Ok(RuntimeSpineRunStep::ScanUnavailable(error));
+                    }
+                    ScanWait::DeadlineExceeded => {
+                        return Ok(RuntimeSpineRunStep::ScanDeadlineExceeded);
+                    }
                 };
                 if Instant::now() >= scan_deadline {
                     return Ok(RuntimeSpineRunStep::ScanDeadlineExceeded);
@@ -460,8 +819,8 @@ impl RuntimeSpineRunner {
                         });
                     }
                 };
-                let candidate = build_full_observation(context.coordinates, inventory)?;
-                let request = self.journal_lane.prepare_observation(candidate).await?;
+                let candidate = build_full_observation(coordinates, inventory)?;
+                let request = self.journal_lane()?.prepare_observation(candidate).await?;
                 self.send_observation(request).await
             }
         }
@@ -470,14 +829,35 @@ impl RuntimeSpineRunner {
     /// Stops both ordered workers and waits until no late filesystem or scan
     /// action can outlive this runner. Production session replacement and
     /// process shutdown must use this boundary before constructing a successor.
-    pub async fn shutdown(self) -> Result<(), RuntimeSpineRunError> {
-        let Self {
-            journal_lane,
-            scan_lane,
-            ..
-        } = self;
-        journal_lane.shutdown().await?;
-        scan_lane.shutdown().await
+    pub async fn shutdown(mut self) -> Result<(), RuntimeSpineRunError> {
+        let workers = self.take_workers();
+        // `spawn_blocking` keeps running when this future is cancelled. It owns
+        // both lanes, so cancellation cannot detach either Rust thread or drop
+        // the journal flock before the scanner has actually exited.
+        tokio::task::spawn_blocking(move || workers.shutdown_blocking())
+            .await
+            .map_err(|error| {
+                RuntimeSpineRunError::WorkerShutdown(format!("shutdown join task failed: {error}"))
+            })?
+    }
+
+    fn journal_lane(&self) -> Result<&JournalLane, RuntimeSpineRunError> {
+        self.journal_lane
+            .as_ref()
+            .ok_or_else(|| RuntimeSpineRunError::WorkerStopped("journal".to_owned()))
+    }
+
+    fn scan_lane(&self) -> Result<&ScanLane, RuntimeSpineRunError> {
+        self.scan_lane
+            .as_ref()
+            .ok_or_else(|| RuntimeSpineRunError::WorkerStopped("inventory scan".to_owned()))
+    }
+
+    fn take_workers(&mut self) -> RunnerWorkers {
+        RunnerWorkers {
+            scan_lane: self.scan_lane.take(),
+            journal_lane: self.journal_lane.take(),
+        }
     }
 
     async fn send_desired(
@@ -486,7 +866,7 @@ impl RuntimeSpineRunner {
     ) -> Result<RuntimeSpineRunStep, RuntimeSpineRunError> {
         match self.client.desired_read(request.bytes()).await? {
             RuntimeSpineAttempt::Accepted(accepted) => {
-                self.journal_lane
+                self.journal_lane()?
                     .accept_desired(accepted.value, accepted.bytes)
                     .await?;
                 Ok(RuntimeSpineRunStep::DesiredAccepted)
@@ -515,7 +895,7 @@ impl RuntimeSpineRunner {
     ) -> Result<RuntimeSpineRunStep, RuntimeSpineRunError> {
         match self.client.observation(request.bytes()).await? {
             RuntimeSpineAttempt::Accepted(accepted) => {
-                self.journal_lane
+                self.journal_lane()?
                     .accept_observation(accepted.value, accepted.bytes)
                     .await?;
                 Ok(RuntimeSpineRunStep::ObservationAccepted)
@@ -525,14 +905,64 @@ impl RuntimeSpineRunner {
             )),
             RuntimeSpineAttempt::RouteUnavailable => Ok(RuntimeSpineRunStep::RouteUnavailable),
             RuntimeSpineAttempt::Rejected { status, error } => {
-                if invalidates_desired(&error) {
-                    self.journal_lane.invalidate_desired().await?;
-                    Ok(RuntimeSpineRunStep::DesiredInvalidated { status, error })
-                } else if invalid_session(&error) {
-                    Ok(RuntimeSpineRunStep::SessionInvalid { status, error })
-                } else {
-                    Ok(RuntimeSpineRunStep::Rejected { status, error })
+                match desired_invalidation_binding(&error, request.value()) {
+                    DesiredInvalidationBinding::Exact => {
+                        self.journal_lane()?.invalidate_desired().await?;
+                        Ok(RuntimeSpineRunStep::DesiredInvalidated { status, error })
+                    }
+                    DesiredInvalidationBinding::Mismatch => Ok(RuntimeSpineRunStep::RetryExact(
+                        RuntimeSpineRunRetry::Transport(RuntimeSpineRetryReason::InvalidResponse),
+                    )),
+                    DesiredInvalidationBinding::NotApplicable if invalid_session(&error) => {
+                        Ok(RuntimeSpineRunStep::SessionInvalid { status, error })
+                    }
+                    DesiredInvalidationBinding::NotApplicable => {
+                        Ok(RuntimeSpineRunStep::Rejected { status, error })
+                    }
                 }
+            }
+        }
+    }
+}
+
+impl Drop for RuntimeSpineRunner {
+    fn drop(&mut self) {
+        // This fallback is intentionally synchronous: dropping a runner may
+        // not detach either owned thread. Production callers use `shutdown`,
+        // which moves the same ordered join onto Tokio's blocking pool.
+        let _ = self.take_workers().shutdown_blocking();
+    }
+}
+
+struct RunnerWorkers {
+    scan_lane: Option<ScanLane>,
+    journal_lane: Option<JournalLane>,
+}
+
+impl RunnerWorkers {
+    fn shutdown_blocking(mut self) -> Result<(), RuntimeSpineRunError> {
+        let scan_result = self
+            .scan_lane
+            .as_mut()
+            .map_or(Ok(()), ScanLane::shutdown_blocking);
+        // The journal lane, and therefore its flock, remains alive until the
+        // scan has been cancelled and joined. Always attempt this second join
+        // even if the scanner panicked.
+        let journal_result = self
+            .journal_lane
+            .as_mut()
+            .map_or(Ok(()), JournalLane::shutdown_blocking);
+        match (scan_result, journal_result) {
+            (Ok(()), Ok(())) => Ok(()),
+            (scan, journal) => {
+                let mut failures = Vec::new();
+                if let Err(error) = scan {
+                    failures.push(format!("inventory scan: {error}"));
+                }
+                if let Err(error) = journal {
+                    failures.push(format!("journal: {error}"));
+                }
+                Err(RuntimeSpineRunError::WorkerShutdown(failures.join("; ")))
             }
         }
     }
@@ -585,16 +1015,42 @@ fn desired_in_progress(error: &RuntimeSpineError) -> bool {
     )
 }
 
-fn invalidates_desired(error: &RuntimeSpineError) -> bool {
-    matches!(
-        error.error.as_ref(),
-        RuntimeSpineErrorDetail::ContractError { contract_error }
-            if matches!(
-                contract_error.error.as_ref(),
-                ContractErrorDetail::InventoryReadPositionExpired { .. }
-                    | ContractErrorDetail::AssignedSetChanged { .. }
-            )
-    )
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DesiredInvalidationBinding {
+    Exact,
+    Mismatch,
+    NotApplicable,
+}
+
+fn desired_invalidation_binding(
+    error: &RuntimeSpineError,
+    pending: &NodeObservation,
+) -> DesiredInvalidationBinding {
+    let RuntimeSpineErrorDetail::ContractError { contract_error } = error.error.as_ref() else {
+        return DesiredInvalidationBinding::NotApplicable;
+    };
+    let (node_id, agent_session_epoch, read_position) = match contract_error.error.as_ref() {
+        ContractErrorDetail::InventoryReadPositionExpired {
+            node_id,
+            agent_session_epoch,
+            read_position,
+            ..
+        }
+        | ContractErrorDetail::AssignedSetChanged {
+            node_id,
+            agent_session_epoch,
+            read_position,
+        } => (node_id, agent_session_epoch, read_position),
+        _ => return DesiredInvalidationBinding::NotApplicable,
+    };
+    if node_id == &pending.node_id
+        && agent_session_epoch == &pending.agent_session_epoch
+        && Some(*read_position) == pending.inventory_read_position
+    {
+        DesiredInvalidationBinding::Exact
+    } else {
+        DesiredInvalidationBinding::Mismatch
+    }
 }
 
 fn invalid_session(error: &RuntimeSpineError) -> bool {
@@ -615,7 +1071,7 @@ fn invalid_session(error: &RuntimeSpineError) -> bool {
 #[cfg(test)]
 mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
-    use std::sync::Mutex;
+    use std::sync::{mpsc as test_mpsc, Mutex};
 
     use axum::body::{to_bytes, Body};
     use axum::http::{header, Request, Response, StatusCode};
@@ -638,21 +1094,81 @@ mod tests {
         calls: AtomicUsize,
     }
 
+    impl crate::runtime_spine::inventory_scanner_sealed::Sealed for EmptyScanner {}
+
     impl RuntimeInventoryScanner for EmptyScanner {
         fn scan_complete(
             &self,
             context: RuntimeInventoryScanContext,
         ) -> anyhow::Result<RuntimeInventoryScanOutcome> {
             self.calls.fetch_add(1, Ordering::SeqCst);
-            assert!(Instant::now() < context.deadline);
+            context.check_active()?;
             Ok(RuntimeInventoryScanOutcome::Complete(
-                CompleteRuntimeInventory {
-                    observed_at_unix_ms: UnixMillis::new(1_720_000_004_000).unwrap(),
-                    key_ring: RuntimeInventoryKeyRing::Unavailable,
-                    runtimes: Vec::new(),
-                    residue: Vec::new(),
-                },
+                CompleteRuntimeInventory::for_test(
+                    UnixMillis::new(1_720_000_004_000).unwrap(),
+                    RuntimeInventoryKeyRing::Unavailable,
+                    Vec::new(),
+                    Vec::new(),
+                ),
             ))
+        }
+    }
+
+    struct ControlledScanner {
+        calls: AtomicUsize,
+        started: test_mpsc::SyncSender<()>,
+        release: Mutex<test_mpsc::Receiver<()>>,
+        exited: test_mpsc::SyncSender<()>,
+    }
+
+    impl crate::runtime_spine::inventory_scanner_sealed::Sealed for ControlledScanner {}
+
+    impl RuntimeInventoryScanner for ControlledScanner {
+        fn scan_complete(
+            &self,
+            context: RuntimeInventoryScanContext,
+        ) -> anyhow::Result<RuntimeInventoryScanOutcome> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            self.started.send(()).unwrap();
+            self.release.lock().unwrap().recv().unwrap();
+            let result = context.check_active();
+            self.exited.send(()).unwrap();
+            result?;
+            anyhow::bail!("controlled scanner was released before cancellation")
+        }
+    }
+
+    struct DropWitnessScanner {
+        dropped: test_mpsc::SyncSender<()>,
+    }
+
+    impl Drop for DropWitnessScanner {
+        fn drop(&mut self) {
+            let _ = self.dropped.send(());
+        }
+    }
+
+    impl crate::runtime_spine::inventory_scanner_sealed::Sealed for DropWitnessScanner {}
+
+    impl RuntimeInventoryScanner for DropWitnessScanner {
+        fn scan_complete(
+            &self,
+            _context: RuntimeInventoryScanContext,
+        ) -> anyhow::Result<RuntimeInventoryScanOutcome> {
+            unreachable!("construction-failure scanner must never receive work")
+        }
+    }
+
+    struct PanicScanner;
+
+    impl crate::runtime_spine::inventory_scanner_sealed::Sealed for PanicScanner {}
+
+    impl RuntimeInventoryScanner for PanicScanner {
+        fn scan_complete(
+            &self,
+            _context: RuntimeInventoryScanContext,
+        ) -> anyhow::Result<RuntimeInventoryScanOutcome> {
+            panic!("injected scanner panic")
         }
     }
 
@@ -682,7 +1198,350 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn response_loss_replays_the_durable_observation_without_rescanning() {
+    async fn expired_deadline_never_enqueues_or_calls_a_probe() {
+        let app = Router::new().route(
+            cats_api::runtime_reconciliation::DESIRED_READ_PATH,
+            post(|| async { wire_response(StatusCode::OK, SNAPSHOT.to_vec()) }),
+        );
+        let (origin, server) = spawn(app).await;
+        let scanner = Arc::new(EmptyScanner {
+            calls: AtomicUsize::new(0),
+        });
+        let root = tempfile::tempdir().unwrap();
+        let mut runner = RuntimeSpineRunner::new(
+            StateDirectory::unanchored(root.path().to_path_buf()),
+            decode_agent_session(SESSION).unwrap(),
+            RuntimeSpineHttpClient::for_loopback_test(&origin, signer()).unwrap(),
+            scanner.clone(),
+        )
+        .unwrap();
+
+        assert!(matches!(
+            runner
+                .run_once_until(Instant::now() + Duration::from_secs(5))
+                .await
+                .unwrap(),
+            RuntimeSpineRunStep::DesiredAccepted
+        ));
+        assert!(matches!(
+            runner.run_once_until(Instant::now()).await.unwrap(),
+            RuntimeSpineRunStep::ScanDeadlineExceeded
+        ));
+        assert_eq!(scanner.calls.load(Ordering::SeqCst), 0);
+
+        runner.shutdown().await.unwrap();
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn timed_out_scan_poison_and_cancelled_shutdown_keep_the_flock_until_join() {
+        let app = Router::new().route(
+            cats_api::runtime_reconciliation::DESIRED_READ_PATH,
+            post(|| async { wire_response(StatusCode::OK, SNAPSHOT.to_vec()) }),
+        );
+        let (origin, server) = spawn(app).await;
+        let (started_sender, started_receiver) = test_mpsc::sync_channel(1);
+        let (release_sender, release_receiver) = test_mpsc::sync_channel(1);
+        let (exited_sender, exited_receiver) = test_mpsc::sync_channel(1);
+        let scanner = Arc::new(ControlledScanner {
+            calls: AtomicUsize::new(0),
+            started: started_sender,
+            release: Mutex::new(release_receiver),
+            exited: exited_sender,
+        });
+        let root = tempfile::tempdir().unwrap();
+        let state = StateDirectory::unanchored(root.path().to_path_buf());
+        let registered = decode_agent_session(SESSION).unwrap();
+        let client = RuntimeSpineHttpClient::for_loopback_test(&origin, signer()).unwrap();
+        let mut runner = RuntimeSpineRunner::new(
+            state.clone(),
+            registered.clone(),
+            client.clone(),
+            scanner.clone(),
+        )
+        .unwrap();
+        assert!(matches!(
+            runner
+                .run_once_until(Instant::now() + Duration::from_secs(5))
+                .await
+                .unwrap(),
+            RuntimeSpineRunStep::DesiredAccepted
+        ));
+
+        assert!(matches!(
+            runner
+                .run_once_until(Instant::now() + Duration::from_millis(50))
+                .await
+                .unwrap(),
+            RuntimeSpineRunStep::ScanDeadlineExceeded
+        ));
+        started_receiver.try_recv().unwrap();
+        assert_eq!(scanner.calls.load(Ordering::SeqCst), 1);
+        assert!(matches!(
+            runner
+                .run_once_until(Instant::now() + Duration::from_secs(5))
+                .await,
+            Err(RuntimeSpineRunError::ScanLanePoisoned)
+        ));
+
+        let mut shutdown = Box::pin(runner.shutdown());
+        assert!(matches!(
+            futures_util::poll!(shutdown.as_mut()),
+            std::task::Poll::Pending
+        ));
+        drop(shutdown);
+
+        let blocked_scanner: Arc<dyn RuntimeInventoryScanner> = Arc::new(EmptyScanner {
+            calls: AtomicUsize::new(0),
+        });
+        assert!(matches!(
+            RuntimeSpineRunner::new(
+                state.clone(),
+                registered.clone(),
+                client.clone(),
+                blocked_scanner,
+            ),
+            Err(RuntimeSpineRunError::Journal(
+                RuntimeSpineJournalError::Io { .. }
+            ))
+        ));
+
+        release_sender.send(()).unwrap();
+        tokio::task::spawn_blocking(move || {
+            exited_receiver
+                .recv_timeout(Duration::from_secs(2))
+                .expect("cancelled scanner did not exit")
+        })
+        .await
+        .unwrap();
+
+        let successor = tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                let scanner: Arc<dyn RuntimeInventoryScanner> = Arc::new(EmptyScanner {
+                    calls: AtomicUsize::new(0),
+                });
+                match RuntimeSpineRunner::new(
+                    state.clone(),
+                    registered.clone(),
+                    client.clone(),
+                    scanner,
+                ) {
+                    Ok(runner) => break runner,
+                    Err(RuntimeSpineRunError::Journal(RuntimeSpineJournalError::Io { .. })) => {
+                        tokio::task::yield_now().await
+                    }
+                    Err(error) => panic!("unexpected successor error: {error}"),
+                }
+            }
+        })
+        .await
+        .expect("shutdown cleanup did not release the journal flock");
+        successor.shutdown().await.unwrap();
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn constructor_joins_the_scan_lane_when_the_journal_flock_is_busy() {
+        let app = Router::new().route(
+            cats_api::runtime_reconciliation::DESIRED_READ_PATH,
+            post(|| async { wire_response(StatusCode::OK, SNAPSHOT.to_vec()) }),
+        );
+        let (origin, server) = spawn(app).await;
+        let root = tempfile::tempdir().unwrap();
+        let state = StateDirectory::unanchored(root.path().to_path_buf());
+        let registered = decode_agent_session(SESSION).unwrap();
+        let client = RuntimeSpineHttpClient::for_loopback_test(&origin, signer()).unwrap();
+        let owner = RuntimeSpineRunner::new(
+            state.clone(),
+            registered.clone(),
+            client.clone(),
+            Arc::new(EmptyScanner {
+                calls: AtomicUsize::new(0),
+            }),
+        )
+        .unwrap();
+        let (dropped_sender, dropped_receiver) = test_mpsc::sync_channel(1);
+        let candidate: Arc<dyn RuntimeInventoryScanner> = Arc::new(DropWitnessScanner {
+            dropped: dropped_sender,
+        });
+        assert!(RuntimeSpineRunner::new(state, registered, client, candidate).is_err());
+        dropped_receiver
+            .try_recv()
+            .expect("constructor returned before joining the started scan lane");
+
+        owner.shutdown().await.unwrap();
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn scan_join_failure_still_closes_and_joins_the_journal_lane() {
+        let app = Router::new().route(
+            cats_api::runtime_reconciliation::DESIRED_READ_PATH,
+            post(|| async { wire_response(StatusCode::OK, SNAPSHOT.to_vec()) }),
+        );
+        let (origin, server) = spawn(app).await;
+        let root = tempfile::tempdir().unwrap();
+        let state = StateDirectory::unanchored(root.path().to_path_buf());
+        let registered = decode_agent_session(SESSION).unwrap();
+        let client = RuntimeSpineHttpClient::for_loopback_test(&origin, signer()).unwrap();
+        let mut runner = RuntimeSpineRunner::new(
+            state.clone(),
+            registered.clone(),
+            client.clone(),
+            Arc::new(PanicScanner),
+        )
+        .unwrap();
+        assert!(matches!(
+            runner
+                .run_once_until(Instant::now() + Duration::from_secs(5))
+                .await
+                .unwrap(),
+            RuntimeSpineRunStep::DesiredAccepted
+        ));
+        assert!(matches!(
+            runner
+                .run_once_until(Instant::now() + Duration::from_secs(5))
+                .await,
+            Err(RuntimeSpineRunError::WorkerStopped(_))
+        ));
+        assert!(matches!(
+            runner.shutdown().await,
+            Err(RuntimeSpineRunError::WorkerShutdown(ref message))
+                if message.contains("inventory scan")
+        ));
+
+        let successor = RuntimeSpineRunner::new(
+            state,
+            registered,
+            client,
+            Arc::new(EmptyScanner {
+                calls: AtomicUsize::new(0),
+            }),
+        )
+        .expect("journal flock was not released after the scanner join failed");
+        successor.shutdown().await.unwrap();
+        server.abort();
+    }
+
+    fn invalidation_error(
+        expired: bool,
+        node_id: Id,
+        agent_session_epoch: Epoch,
+        read_position: cats_api::runtime_reconciliation::Sequence,
+    ) -> RuntimeSpineError {
+        let detail = if expired {
+            ContractErrorDetail::InventoryReadPositionExpired {
+                node_id,
+                agent_session_epoch,
+                read_position,
+                expires_at_unix_ms: UnixMillis::new(1_720_000_030_000).unwrap(),
+                server_time_unix_ms: UnixMillis::new(1_720_000_030_000).unwrap(),
+            }
+        } else {
+            ContractErrorDetail::AssignedSetChanged {
+                node_id,
+                agent_session_epoch,
+                read_position,
+            }
+        };
+        RuntimeSpineError {
+            version: ContractVersion::V1,
+            error: Box::new(RuntimeSpineErrorDetail::ContractError {
+                contract_error: ContractError {
+                    version: ContractVersion::V1,
+                    error: Box::new(detail),
+                    message: "cursor rejected".to_owned(),
+                },
+            }),
+            message: "cursor rejected".to_owned(),
+        }
+    }
+
+    fn pending_full_observation() -> NodeObservation {
+        let registered = decode_agent_session(SESSION).unwrap();
+        let desired =
+            cats_api::runtime_reconciliation::decode_desired_read_snapshot(SNAPSHOT).unwrap();
+        build_full_observation(
+            RuntimeSpineFullScan {
+                session: SessionBinding {
+                    node_id: registered.node_id,
+                    node_boot_id: registered.node_boot_id,
+                    agent_instance_id: registered.agent_instance_id,
+                    agent_session_epoch: registered.agent_session_epoch,
+                },
+                heartbeat_sequence: cats_api::runtime_reconciliation::Sequence::new(1).unwrap(),
+                inventory_epoch: Epoch::new(1).unwrap(),
+                desired,
+            },
+            CompleteRuntimeInventory::for_test(
+                UnixMillis::new(1_720_000_004_000).unwrap(),
+                RuntimeInventoryKeyRing::Unavailable,
+                Vec::new(),
+                Vec::new(),
+            ),
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn cursor_invalidation_errors_bind_every_pending_observation_coordinate() {
+        let pending = pending_full_observation();
+        let read_position = pending.inventory_read_position.unwrap();
+        for expired in [true, false] {
+            assert_eq!(
+                desired_invalidation_binding(
+                    &invalidation_error(
+                        expired,
+                        pending.node_id.clone(),
+                        pending.agent_session_epoch,
+                        read_position,
+                    ),
+                    &pending,
+                ),
+                DesiredInvalidationBinding::Exact
+            );
+            assert_eq!(
+                desired_invalidation_binding(
+                    &invalidation_error(
+                        expired,
+                        Id::new("node_b").unwrap(),
+                        pending.agent_session_epoch,
+                        read_position,
+                    ),
+                    &pending,
+                ),
+                DesiredInvalidationBinding::Mismatch
+            );
+            assert_eq!(
+                desired_invalidation_binding(
+                    &invalidation_error(
+                        expired,
+                        pending.node_id.clone(),
+                        Epoch::new(pending.agent_session_epoch.get() + 1).unwrap(),
+                        read_position,
+                    ),
+                    &pending,
+                ),
+                DesiredInvalidationBinding::Mismatch
+            );
+            assert_eq!(
+                desired_invalidation_binding(
+                    &invalidation_error(
+                        expired,
+                        pending.node_id.clone(),
+                        pending.agent_session_epoch,
+                        cats_api::runtime_reconciliation::Sequence::new(read_position.get() + 1)
+                            .unwrap(),
+                    ),
+                    &pending,
+                ),
+                DesiredInvalidationBinding::Mismatch
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn mismatched_cursor_rejection_replays_exact_bytes_until_a_bound_rejection_arrives() {
         let observation_calls = Arc::new(AtomicUsize::new(0));
         let observed_bodies = Arc::new(Mutex::new(Vec::<Vec<u8>>::new()));
         let serving_calls = Arc::clone(&observation_calls);
@@ -703,21 +1562,97 @@ mod tests {
                             .unwrap()
                             .to_vec();
                         bodies.lock().unwrap().push(body.clone());
-                        if calls.fetch_add(1, Ordering::SeqCst) == 0 {
-                            let error = RuntimeSpineError {
-                                version: ContractVersion::V1,
-                                error: Box::new(RuntimeSpineErrorDetail::TemporarilyUnavailable),
-                                message: "retry".to_owned(),
-                            };
-                            let mut response = wire_response(
-                                StatusCode::SERVICE_UNAVAILABLE,
-                                encode_runtime_spine_error(&error).unwrap(),
-                            );
-                            response
-                                .headers_mut()
-                                .insert(header::RETRY_AFTER, "1".parse().unwrap());
-                            return response;
-                        }
+                        let observation = decode_node_observation(&body).unwrap();
+                        let call = calls.fetch_add(1, Ordering::SeqCst);
+                        let node_id = if call == 0 {
+                            Id::new("node_b").unwrap()
+                        } else {
+                            observation.node_id.clone()
+                        };
+                        let error = invalidation_error(
+                            false,
+                            node_id,
+                            observation.agent_session_epoch,
+                            observation.inventory_read_position.unwrap(),
+                        );
+                        wire_response(
+                            StatusCode::CONFLICT,
+                            encode_runtime_spine_error(&error).unwrap(),
+                        )
+                    }
+                }),
+            );
+        let (origin, server) = spawn(app).await;
+        let scanner = Arc::new(EmptyScanner {
+            calls: AtomicUsize::new(0),
+        });
+        let root = tempfile::tempdir().unwrap();
+        let mut runner = RuntimeSpineRunner::new(
+            StateDirectory::unanchored(root.path().to_path_buf()),
+            decode_agent_session(SESSION).unwrap(),
+            RuntimeSpineHttpClient::for_loopback_test(&origin, signer()).unwrap(),
+            scanner.clone(),
+        )
+        .unwrap();
+        assert!(matches!(
+            runner
+                .run_once_until(Instant::now() + Duration::from_secs(5))
+                .await
+                .unwrap(),
+            RuntimeSpineRunStep::DesiredAccepted
+        ));
+        assert!(matches!(
+            runner
+                .run_once_until(Instant::now() + Duration::from_secs(5))
+                .await
+                .unwrap(),
+            RuntimeSpineRunStep::RetryExact(RuntimeSpineRunRetry::Transport(
+                RuntimeSpineRetryReason::InvalidResponse
+            ))
+        ));
+        assert!(matches!(
+            runner
+                .run_once_until(Instant::now() + Duration::from_secs(5))
+                .await
+                .unwrap(),
+            RuntimeSpineRunStep::DesiredInvalidated { .. }
+        ));
+        assert_eq!(scanner.calls.load(Ordering::SeqCst), 1);
+        {
+            let bodies = observed_bodies.lock().unwrap();
+            assert_eq!(bodies.len(), 2);
+            assert_eq!(bodies[0], bodies[1]);
+        }
+
+        runner.shutdown().await.unwrap();
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn response_loss_replays_the_durable_observation_without_rescanning() {
+        let observation_calls = Arc::new(AtomicUsize::new(0));
+        let observed_bodies = Arc::new(Mutex::new(Vec::<Vec<u8>>::new()));
+        let committed_acceptance = Arc::new(Mutex::new(None::<Vec<u8>>));
+        let serving_calls = Arc::clone(&observation_calls);
+        let serving_bodies = Arc::clone(&observed_bodies);
+        let serving_acceptance = Arc::clone(&committed_acceptance);
+        let app = Router::new()
+            .route(
+                cats_api::runtime_reconciliation::DESIRED_READ_PATH,
+                post(|| async { wire_response(StatusCode::OK, SNAPSHOT.to_vec()) }),
+            )
+            .route(
+                cats_api::runtime_reconciliation::OBSERVATION_PATH,
+                post(move |request: Request<Body>| {
+                    let calls = Arc::clone(&serving_calls);
+                    let bodies = Arc::clone(&serving_bodies);
+                    let committed = Arc::clone(&serving_acceptance);
+                    async move {
+                        let body = to_bytes(request.into_body(), NODE_OBSERVATION_MAX_WIRE_BYTES)
+                            .await
+                            .unwrap()
+                            .to_vec();
+                        bodies.lock().unwrap().push(body.clone());
                         let observation = decode_node_observation(&body).unwrap();
                         let accepted_at = UnixMillis::new(1_720_000_005_000).unwrap();
                         let acceptance = ObservationAcceptance {
@@ -746,10 +1681,32 @@ mod tests {
                                 },
                             },
                         };
-                        wire_response(
-                            StatusCode::OK,
-                            encode_observation_acceptance(&acceptance).unwrap(),
-                        )
+                        let acceptance_bytes = encode_observation_acceptance(&acceptance).unwrap();
+                        let committed_bytes = {
+                            let mut stored = committed.lock().unwrap();
+                            stored
+                                .get_or_insert_with(|| acceptance_bytes.clone())
+                                .clone()
+                        };
+                        if calls.fetch_add(1, Ordering::SeqCst) == 0 {
+                            // The server-side acceptance is already committed.
+                            // Lose the response body afterwards so the client
+                            // must replay the exact observation to discover it.
+                            let failed = futures_util::stream::once(async {
+                                Err::<String, std::io::Error>(std::io::Error::new(
+                                    std::io::ErrorKind::ConnectionReset,
+                                    "injected response loss after acceptance commit",
+                                ))
+                            });
+                            return Response::builder()
+                                .status(StatusCode::OK)
+                                .header(header::CONTENT_TYPE, JSON_CONTENT_TYPE)
+                                .header(header::CACHE_CONTROL, "no-store")
+                                .body(Body::from_stream(failed))
+                                .unwrap();
+                        }
+                        assert_eq!(acceptance_bytes, committed_bytes);
+                        wire_response(StatusCode::OK, committed_bytes)
                     }
                 }),
             );
@@ -795,9 +1752,10 @@ mod tests {
                 .await
                 .unwrap(),
             RuntimeSpineRunStep::RetryExact(RuntimeSpineRunRetry::Transport(
-                RuntimeSpineRetryReason::Backpressure
+                RuntimeSpineRetryReason::Transport
             ))
         ));
+        let committed_acceptance = committed_acceptance.lock().unwrap().clone().unwrap();
         assert!(matches!(
             runner
                 .run_once_until(Instant::now() + std::time::Duration::from_secs(5))
@@ -812,10 +1770,18 @@ mod tests {
             assert_eq!(bodies.len(), 2);
             assert_eq!(bodies[0], bodies[1]);
         }
-        let recovered = RuntimeSpineJournal::open(&state, registered).unwrap();
-        assert!(recovered.full_observation().is_some());
-        drop(recovered);
         runner.shutdown().await.unwrap();
+        let recovered = RuntimeSpineJournal::open_for_test(&state, registered).unwrap();
+        let (_, acceptance) = recovered.full_observation().unwrap();
+        assert_eq!(
+            encode_observation_acceptance(acceptance).unwrap(),
+            committed_acceptance
+        );
+        assert_eq!(
+            recovered.session().lease_deadline_unix_ms,
+            acceptance.lease_deadline_unix_ms
+        );
+        drop(recovered);
         let successor_scanner: Arc<dyn RuntimeInventoryScanner> = scanner;
         let successor = RuntimeSpineRunner::new(
             state,

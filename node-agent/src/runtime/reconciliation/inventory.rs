@@ -8,7 +8,7 @@
 use std::collections::BTreeSet;
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::time::{Instant, SystemTime, UNIX_EPOCH};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::Context as _;
 use cats_api::runtime_reconciliation::{
@@ -19,8 +19,8 @@ use cats_api::runtime_reconciliation::{
 use thiserror::Error;
 
 use crate::runtime_spine::{
-    CompleteRuntimeInventory, RuntimeInventoryKeyRing, RuntimeInventoryScanContext,
-    RuntimeInventoryScanOutcome, RuntimeInventoryScanner,
+    CompleteRuntimeInventory, InventoryCoverageAggregator, RuntimeInventoryKeyRing,
+    RuntimeInventoryScanContext, RuntimeInventoryScanOutcome, RuntimeInventoryScanner,
 };
 
 use super::runtime_checkpoint_path;
@@ -47,8 +47,12 @@ pub enum InventoryAbsence {
 
 /// One read-only proof for exactly one member of the Runtime inventory-source
 /// closed set. `Err` means detected residue/collision/corruption, not ordinary
-/// source downtime; implementations use `Unavailable` for the latter.
-pub trait InventoryAbsenceProbe: Send + Sync + 'static {
+/// source downtime; implementations use `Unavailable` for the latter. Every
+/// concrete probe must pass `context.deadline()` to its filesystem, socket,
+/// process or metadata I/O and return promptly after cancellation.
+pub trait InventoryAbsenceProbe:
+    super::inventory_probe_sealed::Sealed + Send + Sync + 'static
+{
     fn source(&self) -> InventorySource;
     fn prove_absent(
         &self,
@@ -68,6 +72,8 @@ pub struct CleanSlateInventoryScanner {
     checkpoint_directory: PathBuf,
     probes: Vec<Arc<dyn InventoryAbsenceProbe>>,
 }
+
+impl crate::runtime_spine::inventory_scanner_sealed::Sealed for CleanSlateInventoryScanner {}
 
 impl std::fmt::Debug for CleanSlateInventoryScanner {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -116,12 +122,11 @@ impl RuntimeInventoryScanner for CleanSlateInventoryScanner {
         context: RuntimeInventoryScanContext,
     ) -> anyhow::Result<RuntimeInventoryScanOutcome> {
         let mut unavailable_sources = Vec::new();
+        let mut coverage = InventoryCoverageAggregator::new();
         for probe in &self.probes {
-            anyhow::ensure!(
-                Instant::now() < context.deadline,
-                "clean-slate inventory deadline expired before {:?}",
-                probe.source()
-            );
+            context.remaining().with_context(|| {
+                format!("clean-slate inventory stopped before {:?}", probe.source())
+            })?;
             match probe
                 .prove_absent(&context)
                 .with_context(|| format!("prove {:?} inventory is absent", probe.source()))?
@@ -129,6 +134,12 @@ impl RuntimeInventoryScanner for CleanSlateInventoryScanner {
                 InventoryAbsence::Empty => {}
                 InventoryAbsence::Unavailable => unavailable_sources.push(probe.source()),
             }
+            // A probe may return only after its underlying I/O consumed the
+            // deadline. Never count that late result as complete coverage.
+            context.remaining().with_context(|| {
+                format!("clean-slate inventory stopped after {:?}", probe.source())
+            })?;
+            coverage.record(probe.source())?;
         }
         if !unavailable_sources.is_empty() {
             return Ok(RuntimeInventoryScanOutcome::Incomplete {
@@ -144,9 +155,10 @@ impl RuntimeInventoryScanner for CleanSlateInventoryScanner {
             .ok()
             .and_then(UnixMillis::new)
             .context("system time does not fit UnixMillis")?;
-        let inventory_epoch = context.coordinates.inventory_epoch;
+        let coverage = coverage.finish()?;
+        let inventory_epoch = context.coordinates().inventory_epoch;
         let runtimes = context
-            .coordinates
+            .coordinates()
             .desired
             .desired_specs
             .iter()
@@ -190,12 +202,13 @@ impl RuntimeInventoryScanner for CleanSlateInventoryScanner {
             .collect::<anyhow::Result<Vec<_>>>()?;
 
         Ok(RuntimeInventoryScanOutcome::Complete(
-            CompleteRuntimeInventory {
+            CompleteRuntimeInventory::from_validated_coverage(
+                coverage,
                 observed_at_unix_ms,
-                key_ring: RuntimeInventoryKeyRing::Unavailable,
+                RuntimeInventoryKeyRing::Unavailable,
                 runtimes,
-                residue: Vec::new(),
-            },
+                Vec::new(),
+            ),
         ))
     }
 }
@@ -203,6 +216,7 @@ impl RuntimeInventoryScanner for CleanSlateInventoryScanner {
 #[cfg(test)]
 mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::time::Instant;
 
     use cats_api::runtime_reconciliation::{
         decode_desired_read_snapshot, encode_node_observation, inventory_digest, spec_digest,
@@ -222,6 +236,8 @@ mod tests {
         calls: Arc<AtomicUsize>,
     }
 
+    impl super::super::inventory_probe_sealed::Sealed for Probe {}
+
     impl InventoryAbsenceProbe for Probe {
         fn source(&self) -> InventorySource {
             self.source
@@ -238,8 +254,8 @@ mod tests {
 
     fn context() -> RuntimeInventoryScanContext {
         let desired = decode_desired_read_snapshot(SNAPSHOT).unwrap();
-        RuntimeInventoryScanContext {
-            coordinates: crate::runtime_spine::RuntimeSpineFullScan {
+        RuntimeInventoryScanContext::for_test(
+            crate::runtime_spine::RuntimeSpineFullScan {
                 session: SessionBinding {
                     node_id: desired.session.node_id.clone(),
                     node_boot_id: desired.session.node_boot_id.clone(),
@@ -250,8 +266,8 @@ mod tests {
                 inventory_epoch: Epoch::new(1).unwrap(),
                 desired,
             },
-            deadline: Instant::now() + std::time::Duration::from_secs(5),
-        }
+            Instant::now() + std::time::Duration::from_secs(5),
+        )
     }
 
     fn assigned_context() -> RuntimeInventoryScanContext {
@@ -287,7 +303,11 @@ mod tests {
             spec_digest: Sha256Digest::from_bytes([0; 32]),
         };
         desired.spec_digest = spec_digest(&desired).unwrap();
-        context.coordinates.desired.desired_specs.push(desired);
+        context
+            .coordinates_mut()
+            .desired
+            .desired_specs
+            .push(desired);
         context
     }
 
@@ -320,6 +340,16 @@ mod tests {
             CleanSlateInventoryScanner::new(PathBuf::from("/checkpoints"), missing).unwrap_err(),
             InventoryProbeSetError::Missing(InventorySource::GuestMount)
         );
+        let mut duplicate = probes(None, &calls);
+        duplicate.push(Arc::new(Probe {
+            source: InventorySource::Checkpoint,
+            result: InventoryAbsence::Empty,
+            calls: Arc::clone(&calls),
+        }));
+        assert_eq!(
+            CleanSlateInventoryScanner::new(PathBuf::from("/checkpoints"), duplicate).unwrap_err(),
+            InventoryProbeSetError::Duplicate(InventorySource::Checkpoint)
+        );
 
         let scanner =
             CleanSlateInventoryScanner::new(PathBuf::from("/checkpoints"), probes(None, &calls))
@@ -329,8 +359,8 @@ mod tests {
         else {
             panic!("all empty sources must produce a complete scan")
         };
-        assert!(inventory.runtimes.is_empty());
-        assert!(inventory.residue.is_empty());
+        assert!(inventory.runtimes().is_empty());
+        assert!(inventory.residue().is_empty());
         assert_eq!(calls.load(Ordering::SeqCst), REQUIRED_SOURCES.len());
     }
 
@@ -356,14 +386,14 @@ mod tests {
             CleanSlateInventoryScanner::new(PathBuf::from("/checkpoints"), probes(None, &calls))
                 .unwrap();
         let context = assigned_context();
-        let coordinates = context.coordinates.clone();
+        let coordinates = context.coordinates().clone();
         let RuntimeInventoryScanOutcome::Complete(inventory) =
             scanner.scan_complete(context).unwrap()
         else {
             panic!("all empty sources must produce a complete assigned scan")
         };
-        assert_eq!(inventory.runtimes.len(), 1);
-        let runtime = &inventory.runtimes[0];
+        assert_eq!(inventory.runtimes().len(), 1);
+        let runtime = &inventory.runtimes()[0];
         assert_eq!(runtime.cat_id.as_str(), "cat_01");
         assert!(runtime.applied_desired.is_some());
         assert!(matches!(
@@ -388,7 +418,7 @@ mod tests {
             agent_instance_id: coordinates.session.agent_instance_id,
             agent_session_epoch: coordinates.session.agent_session_epoch,
             heartbeat_sequence: coordinates.heartbeat_sequence,
-            observed_at_unix_ms: inventory.observed_at_unix_ms,
+            observed_at_unix_ms: inventory.observed_at_unix_ms(),
             complete_inventory: true,
             inventory_epoch: coordinates.inventory_epoch,
             inventory_digest: Some(Sha256Digest::from_bytes([0; 32])),
@@ -396,8 +426,8 @@ mod tests {
             key_ring_version: None,
             key_ring_digest: None,
             loaded_kids: Vec::new(),
-            runtimes: inventory.runtimes,
-            residue: inventory.residue,
+            runtimes: inventory.runtimes().to_vec(),
+            residue: inventory.residue().to_vec(),
         };
         observation.inventory_digest = Some(inventory_digest(&observation).unwrap());
         encode_node_observation(&observation).unwrap();

@@ -8,13 +8,19 @@
 mod runner;
 mod state;
 
+pub(crate) mod inventory_scanner_sealed {
+    pub trait Sealed {}
+}
+
 pub use runner::{
-    CompleteRuntimeInventory, RuntimeInventoryKeyRing, RuntimeInventoryScanContext,
-    RuntimeInventoryScanOutcome, RuntimeInventoryScanner, RuntimeSpineRunError,
-    RuntimeSpineRunRetry, RuntimeSpineRunStep, RuntimeSpineRunner,
+    CompleteRuntimeInventory, RuntimeInventoryScanContext, RuntimeInventoryScanOutcome,
+    RuntimeInventoryScanner, RuntimeSpineRunError, RuntimeSpineRunRetry, RuntimeSpineRunStep,
+    RuntimeSpineRunner,
 };
+pub(crate) use runner::{InventoryCoverageAggregator, RuntimeInventoryKeyRing};
+pub(crate) use state::RuntimeSpineJournal;
 pub use state::{
-    DurableRuntimeSpineRequest, RuntimeSpineDesiredWork, RuntimeSpineFullScan, RuntimeSpineJournal,
+    DurableRuntimeSpineRequest, RuntimeSpineDesiredWork, RuntimeSpineFullScan,
     RuntimeSpineJournalError,
 };
 

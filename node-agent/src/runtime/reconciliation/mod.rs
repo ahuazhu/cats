@@ -19,6 +19,10 @@ mod gate_planner;
 mod inventory;
 mod root_provision;
 
+pub(crate) mod inventory_probe_sealed {
+    pub trait Sealed {}
+}
+
 pub use admission_port::{
     AdmissionGatePort, AdmissionSnapshot, GatePortError, IdleCloseResult, SnapshotError,
 };

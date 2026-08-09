@@ -113,7 +113,7 @@ struct AcceptedObservationRecord {
 }
 
 /// The bounded current A20 protocol state for one exact AgentSession.
-pub struct RuntimeSpineJournal {
+pub(crate) struct RuntimeSpineJournal {
     directory: File,
     path: PathBuf,
     registered_lease_deadline_unix_ms: cats_api::runtime_reconciliation::UnixMillis,
@@ -143,7 +143,19 @@ impl std::fmt::Debug for RuntimeSpineJournal {
 }
 
 impl RuntimeSpineJournal {
-    pub fn open(
+    #[cfg(test)]
+    pub(super) fn open_for_test(
+        state_directory: &StateDirectory,
+        registered_session: AgentSession,
+    ) -> Result<Self, RuntimeSpineJournalError> {
+        Self::open_inner(state_directory, registered_session, false)
+    }
+
+    /// Opens a command-scoped view while the journal lane's separate
+    /// exclusive guard descriptor is held. This is intentionally unavailable
+    /// outside the runtime-spine module so production callers cannot mutate
+    /// the journal without owning its flock.
+    pub(super) fn open_under_lane_lock(
         state_directory: &StateDirectory,
         registered_session: AgentSession,
     ) -> Result<Self, RuntimeSpineJournalError> {
@@ -188,25 +200,30 @@ impl RuntimeSpineJournal {
         Ok(journal)
     }
 
-    pub fn session(&self) -> &AgentSession {
+    #[cfg(test)]
+    pub(super) fn session(&self) -> &AgentSession {
         &self.session
     }
 
-    pub fn desired_snapshot(&self) -> Option<&DesiredReadSnapshot> {
+    #[cfg(test)]
+    pub(super) fn desired_snapshot(&self) -> Option<&DesiredReadSnapshot> {
         self.desired_snapshot.as_ref()
     }
 
-    pub fn full_observation(&self) -> Option<(&NodeObservation, &ObservationAcceptance)> {
+    #[cfg(test)]
+    pub(super) fn full_observation(&self) -> Option<(&NodeObservation, &ObservationAcceptance)> {
         self.full_observation
             .as_ref()
             .map(|record| (&record.observation, &record.acceptance))
     }
 
-    pub fn pending_observation(&self) -> Option<DurableRuntimeSpineRequest<NodeObservation>> {
+    pub(crate) fn pending_observation(
+        &self,
+    ) -> Option<DurableRuntimeSpineRequest<NodeObservation>> {
         self.pending_observation.clone()
     }
 
-    pub fn full_scan(&self) -> Result<RuntimeSpineFullScan, RuntimeSpineJournalError> {
+    pub(crate) fn full_scan(&self) -> Result<RuntimeSpineFullScan, RuntimeSpineJournalError> {
         if self.pending_observation.is_some() {
             return Err(RuntimeSpineJournalError::Transition(
                 "a physical scan cannot replace a pending observation",
@@ -241,7 +258,9 @@ impl RuntimeSpineJournal {
 
     /// Returns the exact pending request, the unconsumed snapshot to scan, or
     /// durably creates the next request before exposing its bytes.
-    pub fn desired_work(&mut self) -> Result<RuntimeSpineDesiredWork, RuntimeSpineJournalError> {
+    pub(crate) fn desired_work(
+        &mut self,
+    ) -> Result<RuntimeSpineDesiredWork, RuntimeSpineJournalError> {
         if let Some(pending) = &self.pending_desired {
             return Ok(RuntimeSpineDesiredWork::Request(pending.clone()));
         }
@@ -274,7 +293,7 @@ impl RuntimeSpineJournal {
         Ok(RuntimeSpineDesiredWork::Request(pending))
     }
 
-    pub fn accept_desired(
+    pub(crate) fn accept_desired(
         &mut self,
         snapshot: DesiredReadSnapshot,
         exact_bytes: &[u8],
@@ -318,7 +337,7 @@ impl RuntimeSpineJournal {
     /// cursor unusable, then forgets the rejected observation. The marker is
     /// durable before the exact pending body is removed, so a crash cannot
     /// strand the Node replaying a request the server has already rejected.
-    pub fn invalidate_desired_after_observation_rejection(
+    pub(crate) fn invalidate_desired_after_observation_rejection(
         &mut self,
     ) -> Result<(), RuntimeSpineJournalError> {
         if self.pending_observation.is_none() {
@@ -353,7 +372,7 @@ impl RuntimeSpineJournal {
     /// Durably stores a complete, already-physically-scanned candidate before
     /// any network send. A retained pending request always wins over a newly
     /// supplied candidate.
-    pub fn prepare_observation(
+    pub(crate) fn prepare_observation(
         &mut self,
         candidate: NodeObservation,
     ) -> Result<DurableRuntimeSpineRequest<NodeObservation>, RuntimeSpineJournalError> {
@@ -381,7 +400,7 @@ impl RuntimeSpineJournal {
         Ok(pending)
     }
 
-    pub fn accept_observation(
+    pub(crate) fn accept_observation(
         &mut self,
         acceptance: ObservationAcceptance,
         exact_bytes: &[u8],
@@ -1310,13 +1329,13 @@ mod tests {
         let state = state_directory(&root);
         let registered = session();
 
-        let mut journal = RuntimeSpineJournal::open(&state, registered.clone()).unwrap();
+        let mut journal = RuntimeSpineJournal::open_for_test(&state, registered.clone()).unwrap();
         let RuntimeSpineDesiredWork::Request(first) = journal.desired_work().unwrap() else {
             panic!("first work must be a request")
         };
         drop(journal);
 
-        let mut journal = RuntimeSpineJournal::open(&state, registered.clone()).unwrap();
+        let mut journal = RuntimeSpineJournal::open_for_test(&state, registered.clone()).unwrap();
         let RuntimeSpineDesiredWork::Request(replayed) = journal.desired_work().unwrap() else {
             panic!("pending work must replay")
         };
@@ -1333,7 +1352,7 @@ mod tests {
         .unwrap();
         drop(journal);
 
-        let mut recovered = RuntimeSpineJournal::open(&state, registered).unwrap();
+        let mut recovered = RuntimeSpineJournal::open_for_test(&state, registered).unwrap();
         assert_eq!(recovered.desired_snapshot(), Some(&snapshot));
         assert!(matches!(
             recovered.desired_work().unwrap(),
@@ -1343,53 +1362,94 @@ mod tests {
 
     #[test]
     fn accepted_full_crash_windows_repair_receipt_deadline_and_pending_request() {
-        let root = tempfile::tempdir().unwrap();
-        let state = state_directory(&root);
-        let registered = session();
-        let mut journal = RuntimeSpineJournal::open(&state, registered.clone()).unwrap();
-        assert!(matches!(
-            journal.desired_work().unwrap(),
-            RuntimeSpineDesiredWork::Request(_)
-        ));
-        let desired = snapshot();
-        journal.accept_desired(desired.clone(), SNAPSHOT).unwrap();
-        let observation = full_observation(&registered, &desired);
-        journal.prepare_observation(observation.clone()).unwrap();
-        let accepted = acceptance(&registered, &observation);
-        let record = AcceptedObservationRecord {
-            version: ContractVersion::V1,
-            observation: observation.clone(),
-            acceptance: accepted.clone(),
-        };
-        replace_file(
-            &journal.directory,
-            &journal.path,
-            OBSERVATION_LAST_FILE,
-            &encode_observation_record(&record).unwrap(),
-        )
-        .unwrap();
-        drop(journal);
+        for completed_writes in 1..=4 {
+            let root = tempfile::tempdir().unwrap();
+            let state = state_directory(&root);
+            let registered = session();
+            let mut journal =
+                RuntimeSpineJournal::open_for_test(&state, registered.clone()).unwrap();
+            assert!(matches!(
+                journal.desired_work().unwrap(),
+                RuntimeSpineDesiredWork::Request(_)
+            ));
+            let desired = snapshot();
+            journal.accept_desired(desired.clone(), SNAPSHOT).unwrap();
+            let observation = full_observation(&registered, &desired);
+            journal.prepare_observation(observation.clone()).unwrap();
+            let accepted = acceptance(&registered, &observation);
+            let record = AcceptedObservationRecord {
+                version: ContractVersion::V1,
+                observation: observation.clone(),
+                acceptance: accepted.clone(),
+            };
+            let record_bytes = encode_observation_record(&record).unwrap();
 
-        let mut recovered = RuntimeSpineJournal::open(&state, registered).unwrap();
-        assert_eq!(
-            recovered.session().lease_deadline_unix_ms,
-            accepted.lease_deadline_unix_ms
-        );
-        assert_eq!(
-            recovered.full_observation(),
-            Some((&observation, &accepted))
-        );
-        let RuntimeSpineDesiredWork::Request(next) = recovered.desired_work().unwrap() else {
-            panic!("the accepted full inventory must consume the Desired snapshot")
-        };
-        assert_eq!(next.value().request_sequence.get(), 2);
+            // Mirror accept_observation's durable write order and crash after
+            // each boundary: latest receipt, full receipt, renewed session,
+            // then pending-request removal.
+            replace_file(
+                &journal.directory,
+                &journal.path,
+                OBSERVATION_LAST_FILE,
+                &record_bytes,
+            )
+            .unwrap();
+            if completed_writes >= 2 {
+                replace_file(
+                    &journal.directory,
+                    &journal.path,
+                    OBSERVATION_FULL_FILE,
+                    &record_bytes,
+                )
+                .unwrap();
+            }
+            if completed_writes >= 3 {
+                let mut renewed = registered.clone();
+                renewed.lease_deadline_unix_ms = accepted.lease_deadline_unix_ms;
+                replace_file(
+                    &journal.directory,
+                    &journal.path,
+                    SESSION_FILE,
+                    &encode_agent_session(&renewed).unwrap(),
+                )
+                .unwrap();
+            }
+            if completed_writes >= 4 {
+                remove_file(&journal.directory, &journal.path, OBSERVATION_PENDING_FILE).unwrap();
+            }
+            drop(journal);
 
-        drop(recovered);
-        let mut replayed = RuntimeSpineJournal::open(&state, session()).unwrap();
-        let RuntimeSpineDesiredWork::Request(exact) = replayed.desired_work().unwrap() else {
-            panic!("the next Desired request must remain pending")
-        };
-        assert_eq!(exact.bytes(), next.bytes());
+            let mut recovered = RuntimeSpineJournal::open_for_test(&state, registered).unwrap();
+            assert_eq!(
+                recovered.session().lease_deadline_unix_ms,
+                accepted.lease_deadline_unix_ms,
+                "crash after write {completed_writes} did not repair the session deadline"
+            );
+            assert_eq!(
+                recovered.full_observation(),
+                Some((&observation, &accepted)),
+                "crash after write {completed_writes} did not repair the full receipt"
+            );
+            assert!(
+                !root
+                    .path()
+                    .join(DIRECTORY_NAME)
+                    .join(OBSERVATION_PENDING_FILE)
+                    .exists(),
+                "crash after write {completed_writes} left the accepted request pending"
+            );
+            let RuntimeSpineDesiredWork::Request(next) = recovered.desired_work().unwrap() else {
+                panic!("the accepted full inventory must consume the Desired snapshot")
+            };
+            assert_eq!(next.value().request_sequence.get(), 2);
+
+            drop(recovered);
+            let mut replayed = RuntimeSpineJournal::open_for_test(&state, session()).unwrap();
+            let RuntimeSpineDesiredWork::Request(exact) = replayed.desired_work().unwrap() else {
+                panic!("the next Desired request must remain pending")
+            };
+            assert_eq!(exact.bytes(), next.bytes());
+        }
     }
 
     #[test]
@@ -1397,7 +1457,7 @@ mod tests {
         let root = tempfile::tempdir().unwrap();
         let state = state_directory(&root);
         let registered = session();
-        let mut journal = RuntimeSpineJournal::open(&state, registered.clone()).unwrap();
+        let mut journal = RuntimeSpineJournal::open_for_test(&state, registered.clone()).unwrap();
         assert!(matches!(
             journal.desired_work().unwrap(),
             RuntimeSpineDesiredWork::Request(_)
@@ -1418,7 +1478,7 @@ mod tests {
             RandomId128::new("77777777777777777777777777777777").unwrap();
         replacement.agent_session_epoch = Epoch::new(3).unwrap();
         replacement.lease_deadline_unix_ms = UnixMillis::new(1_720_000_070_000).unwrap();
-        let mut replaced = RuntimeSpineJournal::open(&state, replacement.clone()).unwrap();
+        let mut replaced = RuntimeSpineJournal::open_for_test(&state, replacement.clone()).unwrap();
         assert!(replaced.desired_snapshot().is_none());
         assert!(replaced.full_observation().is_none());
         let RuntimeSpineDesiredWork::Request(first) = replaced.desired_work().unwrap() else {
@@ -1434,22 +1494,22 @@ mod tests {
 
         let root = tempfile::tempdir().unwrap();
         let state = state_directory(&root);
-        let journal = RuntimeSpineJournal::open(&state, session()).unwrap();
+        let journal = RuntimeSpineJournal::open_for_test(&state, session()).unwrap();
         drop(journal);
         let directory = root.path().join(DIRECTORY_NAME);
         symlink(SESSION_FILE, directory.join(DESIRED_PENDING_FILE)).unwrap();
-        assert!(RuntimeSpineJournal::open(&state, session()).is_err());
+        assert!(RuntimeSpineJournal::open_for_test(&state, session()).is_err());
 
         std::fs::remove_file(directory.join(DESIRED_PENDING_FILE)).unwrap();
         std::fs::write(directory.join(DESIRED_PENDING_FILE), b"{}\n").unwrap();
-        assert!(RuntimeSpineJournal::open(&state, session()).is_err());
+        assert!(RuntimeSpineJournal::open_for_test(&state, session()).is_err());
     }
 
     #[test]
     fn accepted_desired_uses_the_exact_canonical_response() {
         let root = tempfile::tempdir().unwrap();
         let state = state_directory(&root);
-        let mut journal = RuntimeSpineJournal::open(&state, session()).unwrap();
+        let mut journal = RuntimeSpineJournal::open_for_test(&state, session()).unwrap();
         journal.desired_work().unwrap();
         let desired = snapshot();
         let canonical = encode_desired_read_snapshot(&desired).unwrap();
@@ -1462,7 +1522,7 @@ mod tests {
         let root = tempfile::tempdir().unwrap();
         let state = state_directory(&root);
         let registered = session();
-        let mut journal = RuntimeSpineJournal::open(&state, registered.clone()).unwrap();
+        let mut journal = RuntimeSpineJournal::open_for_test(&state, registered.clone()).unwrap();
         journal.desired_work().unwrap();
         let first_desired = snapshot();
         journal
@@ -1515,7 +1575,7 @@ mod tests {
         let root = tempfile::tempdir().unwrap();
         let state = state_directory(&root);
         let registered = session();
-        let mut journal = RuntimeSpineJournal::open(&state, registered.clone()).unwrap();
+        let mut journal = RuntimeSpineJournal::open_for_test(&state, registered.clone()).unwrap();
         journal.desired_work().unwrap();
         let first_snapshot = snapshot();
         journal
@@ -1534,7 +1594,7 @@ mod tests {
         .unwrap();
         drop(journal);
 
-        let mut recovered = RuntimeSpineJournal::open(&state, registered).unwrap();
+        let mut recovered = RuntimeSpineJournal::open_for_test(&state, registered).unwrap();
         let RuntimeSpineDesiredWork::Request(next) = recovered.desired_work().unwrap() else {
             panic!("the rejected observation must make the next Desired request eligible")
         };
@@ -1542,7 +1602,7 @@ mod tests {
         assert_ne!(next.bytes(), pending.bytes());
         drop(recovered);
 
-        let mut replayed = RuntimeSpineJournal::open(&state, session()).unwrap();
+        let mut replayed = RuntimeSpineJournal::open_for_test(&state, session()).unwrap();
         let RuntimeSpineDesiredWork::Request(exact) = replayed.desired_work().unwrap() else {
             panic!("the replacement Desired request must replay exactly")
         };
@@ -1559,7 +1619,7 @@ mod tests {
             .unwrap();
         drop(replayed);
 
-        let reopened = RuntimeSpineJournal::open(&state, session()).unwrap();
+        let reopened = RuntimeSpineJournal::open_for_test(&state, session()).unwrap();
         assert_eq!(reopened.desired_snapshot(), Some(&second));
         assert!(reopened.invalidated_desired.is_none());
     }
