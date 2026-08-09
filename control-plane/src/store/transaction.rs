@@ -146,7 +146,7 @@ impl Store {
                     metrics::record_postgres_error(&error);
                     metrics::record_authority_outcome(metrics::AuthorityOutcome::BackendFailed);
                     return Err(AuthorityExecutionError::Store(internal(format!(
-                        "volume authority PostgreSQL rollback failed: {error}"
+                        "runtime authority PostgreSQL rollback failed: {error}"
                     ))));
                 }
                 Err(AttemptFailure::Postgres(error)) => {
@@ -163,10 +163,10 @@ impl Store {
                     metrics::record_authority_outcome(metrics::AuthorityOutcome::BackendFailed);
                     return Err(AuthorityExecutionError::Store(match retry_reason {
                         Some(_) => ApiError::unavailable(format!(
-                            "volume authority transaction did not commit after {AUTHORITY_TRANSACTION_ATTEMPTS} attempts"
+                            "runtime authority transaction did not commit after {AUTHORITY_TRANSACTION_ATTEMPTS} attempts"
                         )),
                         None => internal(format!(
-                            "volume authority PostgreSQL transaction failed: {error}"
+                            "runtime authority PostgreSQL transaction failed: {error}"
                         )),
                     }));
                 }

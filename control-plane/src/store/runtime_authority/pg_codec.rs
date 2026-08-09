@@ -14,7 +14,7 @@ use cats_api::runtime_reconciliation::{
 const POSTGRES_BIGINT_MAX: u64 = i64::MAX.unsigned_abs();
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(super) enum PgIntegerError {
+pub(in crate::store) enum PgIntegerError {
     Negative {
         semantic_type: &'static str,
         value: i64,
@@ -51,7 +51,7 @@ impl fmt::Display for PgIntegerError {
 
 impl std::error::Error for PgIntegerError {}
 
-pub(super) trait PgBigInt: Copy + Sized {
+pub(in crate::store) trait PgBigInt: Copy + Sized {
     const SEMANTIC_TYPE: &'static str;
     const MINIMUM: u64;
 

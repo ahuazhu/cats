@@ -881,7 +881,9 @@ fn decode_delete_completion(row: &Row) -> AuthorityTxResult<DeleteCompletionRece
     Ok(receipt)
 }
 
-pub(super) fn database_now(transaction: &mut Transaction<'_>) -> AuthorityTxResult<UnixMillis> {
+pub(in crate::store) fn database_now(
+    transaction: &mut Transaction<'_>,
+) -> AuthorityTxResult<UnixMillis> {
     let value = transaction
         .query_one(
             "SELECT floor(extract(epoch FROM clock_timestamp()) * 1000)::BIGINT",

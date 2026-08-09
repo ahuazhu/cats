@@ -11,6 +11,7 @@
 //! `options=-csearch_path=...` parameter.
 
 mod accounts;
+mod agent_sessions;
 mod cats;
 mod disks;
 mod endpoints;
@@ -31,6 +32,9 @@ mod tests;
 
 #[cfg(test)]
 mod responsiveness_tests;
+
+#[cfg(test)]
+mod agent_session_tests;
 
 pub(crate) use leadership::SingletonSession;
 pub use leadership::{OciDeploymentLease, SingletonRole};

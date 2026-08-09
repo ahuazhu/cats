@@ -202,7 +202,7 @@ fn verify_current_schema(transaction: &mut postgres::Transaction<'_>) -> Result<
 
 /// This clean-slate runtime-cutover schema is not migrated or repaired; it
 /// must ship only as part of the complete vertical cutover release.
-pub(super) const SCHEMA_VERSION: i64 = 3;
+pub(super) const SCHEMA_VERSION: i64 = 4;
 
 const CONTROL_TABLES: &[&str] = &[
     "control_schema_version",
@@ -237,6 +237,9 @@ const CONTROL_TABLES: &[&str] = &[
     "hostname_desired_lookups",
     "runtime_operations",
     "api_idempotency_results",
+    "node_identities",
+    "agent_registration_attempts",
+    "current_agent_sessions",
 ];
 
 const AUTHORITY_SCHEMA_PROBES: &[&str] = &[
@@ -285,6 +288,19 @@ const AUTHORITY_SCHEMA_PROBES: &[&str] = &[
             request_fingerprint, http_status, content_type, response_body,
             created_at
        FROM api_idempotency_results WHERE FALSE",
+    "SELECT node_id, record, immutable_host_id, credential_id,
+            credential_kind, credential_public_key_spki_sha256,
+            credential_provider, credential_principal, state_path_id, state
+       FROM node_identities WHERE FALSE",
+    "SELECT node_id, registration_attempt_id, attempt_record,
+            immutable_host_id, node_boot_id, agent_instance_id,
+            guest_config_digest, expected_agent_session_epoch,
+            session_record, agent_session_epoch, lease_deadline_unix_ms
+       FROM agent_registration_attempts WHERE FALSE",
+    "SELECT node_id, record, immutable_host_id, node_boot_id,
+            agent_instance_id, agent_session_epoch, registration_attempt_id,
+            guest_config_digest, lease_deadline_unix_ms
+       FROM current_agent_sessions WHERE FALSE",
 ];
 
 const SCHEMA: &str = "
@@ -794,6 +810,99 @@ CREATE TABLE IF NOT EXISTS api_idempotency_results (
     created_at BIGINT NOT NULL CHECK (created_at >= 0),
     PRIMARY KEY (authenticated_workspace_id, canonical_route, idempotency_key)
 );
+CREATE TABLE IF NOT EXISTS node_identities (
+    node_id TEXT PRIMARY KEY,
+    record JSONB NOT NULL CHECK (jsonb_typeof(record) = 'object'),
+    immutable_host_id TEXT NOT NULL,
+    credential_id TEXT NOT NULL UNIQUE,
+    credential_kind TEXT NOT NULL
+        CHECK (credential_kind IN ('public_key', 'provider_principal')),
+    credential_public_key_spki_sha256 TEXT,
+    credential_provider TEXT,
+    credential_principal TEXT,
+    state_path_id TEXT NOT NULL,
+    state TEXT NOT NULL CHECK (state IN ('provisioned', 'retired')),
+    UNIQUE (immutable_host_id, state_path_id),
+    CHECK ((
+        (credential_kind = 'public_key'
+            AND credential_public_key_spki_sha256 IS NOT NULL
+            AND credential_public_key_spki_sha256 ~ '^sha256:[0-9a-f]{64}$'
+            AND credential_provider IS NULL
+            AND credential_principal IS NULL) OR
+        (credential_kind = 'provider_principal'
+            AND credential_public_key_spki_sha256 IS NULL
+            AND credential_provider IS NOT NULL
+            AND credential_principal IS NOT NULL)
+    ) IS TRUE)
+);
+CREATE TABLE IF NOT EXISTS agent_registration_attempts (
+    node_id TEXT NOT NULL REFERENCES node_identities(node_id),
+    registration_attempt_id TEXT NOT NULL,
+    attempt_record JSONB NOT NULL CHECK (jsonb_typeof(attempt_record) = 'object'),
+    immutable_host_id TEXT NOT NULL,
+    node_boot_id TEXT NOT NULL,
+    agent_instance_id TEXT NOT NULL,
+    guest_config_digest TEXT NOT NULL
+        CHECK (guest_config_digest ~ '^sha256:[0-9a-f]{64}$'),
+    expected_agent_session_epoch BIGINT CHECK (expected_agent_session_epoch > 0),
+    session_record JSONB NOT NULL CHECK (jsonb_typeof(session_record) = 'object'),
+    agent_session_epoch BIGINT NOT NULL CHECK (agent_session_epoch > 0),
+    lease_deadline_unix_ms BIGINT NOT NULL CHECK (lease_deadline_unix_ms >= 0),
+    PRIMARY KEY (node_id, registration_attempt_id),
+    UNIQUE (node_id, agent_session_epoch),
+    UNIQUE (node_id, registration_attempt_id, agent_session_epoch)
+);
+CREATE TABLE IF NOT EXISTS current_agent_sessions (
+    node_id TEXT PRIMARY KEY REFERENCES node_identities(node_id),
+    record JSONB NOT NULL CHECK (jsonb_typeof(record) = 'object'),
+    immutable_host_id TEXT NOT NULL,
+    node_boot_id TEXT NOT NULL,
+    agent_instance_id TEXT NOT NULL,
+    agent_session_epoch BIGINT NOT NULL CHECK (agent_session_epoch > 0),
+    registration_attempt_id TEXT NOT NULL,
+    guest_config_digest TEXT NOT NULL
+        CHECK (guest_config_digest ~ '^sha256:[0-9a-f]{64}$'),
+    lease_deadline_unix_ms BIGINT NOT NULL CHECK (lease_deadline_unix_ms >= 0),
+    FOREIGN KEY (node_id, registration_attempt_id, agent_session_epoch)
+        REFERENCES agent_registration_attempts(
+            node_id, registration_attempt_id, agent_session_epoch
+        )
+);
+CREATE OR REPLACE FUNCTION control_node_identity_lineage_is_immutable()
+RETURNS trigger AS $$
+BEGIN
+    IF NEW.node_id IS DISTINCT FROM OLD.node_id
+       OR NEW.immutable_host_id IS DISTINCT FROM OLD.immutable_host_id
+       OR NEW.state_path_id IS DISTINCT FROM OLD.state_path_id THEN
+        RAISE EXCEPTION 'NodeIdentity lineage is immutable';
+    END IF;
+    IF OLD.state = 'retired' AND NEW.state <> 'retired' THEN
+        RAISE EXCEPTION 'retired NodeIdentity cannot be reprovisioned';
+    END IF;
+    RETURN NEW;
+END;
+$$ LANGUAGE plpgsql;
+CREATE OR REPLACE FUNCTION control_node_identity_cannot_be_deleted()
+RETURNS trigger AS $$
+BEGIN
+    RAISE EXCEPTION 'NodeIdentity lineage cannot be deleted';
+END;
+$$ LANGUAGE plpgsql;
+CREATE TRIGGER node_identity_lineage_is_immutable
+    BEFORE UPDATE ON node_identities
+    FOR EACH ROW EXECUTE FUNCTION control_node_identity_lineage_is_immutable();
+CREATE TRIGGER node_identity_cannot_be_deleted
+    BEFORE DELETE ON node_identities
+    FOR EACH ROW EXECUTE FUNCTION control_node_identity_cannot_be_deleted();
+CREATE OR REPLACE FUNCTION control_agent_registration_attempt_is_immutable()
+RETURNS trigger AS $$
+BEGIN
+    RAISE EXCEPTION 'AgentRegistrationAttempt and its first result are immutable';
+END;
+$$ LANGUAGE plpgsql;
+CREATE TRIGGER agent_registration_attempt_is_immutable
+    BEFORE UPDATE OR DELETE ON agent_registration_attempts
+    FOR EACH ROW EXECUTE FUNCTION control_agent_registration_attempt_is_immutable();
 -- Workspace ownership is immutable, enforced in the database exactly as the
 -- SQLite triggers did. Raised as an ordinary exception; the store maps it to
 -- a conflict.
