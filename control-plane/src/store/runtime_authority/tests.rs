@@ -2,6 +2,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{mpsc, Arc, Barrier};
 use std::time::Duration;
 
+use cats_api::agent_registration::AuthenticatedNodeCredential;
 use cats_api::error::ErrorCode;
 use cats_api::runtime_reconciliation::{
     encode_desired_runtime_spec, guest_config_digest, inventory_digest, spec_digest,
@@ -45,7 +46,7 @@ use super::volume_transition_evidence::{
 };
 use crate::store::agent_sessions::{
     load_identity_by_node_for_update, rotate_public_key_identity_in, AgentRegistrationOutcome,
-    AgentSessionRegistrationPolicy, AuthenticatedNodeCredential,
+    AgentSessionRegistrationPolicy,
 };
 use crate::store::transaction::{authority_transaction_attempts, AuthorityTransactionError};
 use crate::store::{metrics_snapshot, Store};
@@ -117,9 +118,7 @@ fn transition_node(store: &Store, node_id: &str) -> TransitionNode {
         identity.credential_binding.clone(),
     );
     let release = runtime_release();
-    let policy =
-        AgentSessionRegistrationPolicy::from_release_receipt(&release, Duration::from_secs(120))
-            .unwrap();
+    let policy = AgentSessionRegistrationPolicy::from_release_receipt(&release).unwrap();
     store.provision_node_identity(&identity).unwrap();
     let attempt = AgentRegistrationAttempt {
         version: ContractVersion::V1,

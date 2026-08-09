@@ -213,9 +213,11 @@ impl Store {
         &self,
         operation: impl FnMut(&mut postgres::Transaction<'_>) -> AuthorityTxResult<T> + Send,
     ) -> Result<T> {
-        match self
-            .authority_transaction_outcome_with(operation, AuthorityTransactionMode::RepeatableRead)
-        {
+        match self.authority_transaction_outcome_with(
+            operation,
+            AuthorityTransactionMode::RepeatableRead,
+            None,
+        ) {
             Ok(value) => Ok(value),
             Err(AuthorityExecutionError::Store(error)) => Err(error),
             Err(AuthorityExecutionError::CandidateCollision) => Err(internal(

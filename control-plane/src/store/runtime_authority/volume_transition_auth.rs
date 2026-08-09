@@ -6,6 +6,7 @@
 //! the exact NodeIdentity, active credential lineage and current AgentSession
 //! locks before they can reach an authorization or Volume row.
 
+use cats_api::agent_registration::AuthenticatedNodeCredential;
 use cats_api::runtime_reconciliation::{
     encode_runtime_volume_transition_evidence_request, AgentSession, AssignedPlacement,
     ContractError, ContractErrorDetail, ContractVersion, CredentialBinding, DesiredRuntimeSpec,
@@ -34,7 +35,7 @@ use super::volume_transition_evidence::{
 use crate::store::agent_sessions::{
     load_current_session_for_share, load_current_session_for_update,
     load_identity_by_credential_for_share, load_identity_by_credential_for_update,
-    lock_exact_credential_lineage, AuthenticatedNodeCredential, CredentialLineageState,
+    lock_exact_credential_lineage, CredentialLineageState,
 };
 use crate::store::transaction::AuthorityTxResult;
 use crate::store::{Result, Store};
