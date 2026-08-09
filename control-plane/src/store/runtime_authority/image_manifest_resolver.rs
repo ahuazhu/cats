@@ -20,6 +20,15 @@ pub(crate) struct ImmutableImageManifestResolver {
     queued: Arc<tokio::sync::Semaphore>,
     inflight: Arc<InflightReads>,
     read_deadline: Duration,
+    #[cfg(test)]
+    after_active_acquired: Option<Arc<TestReadHook>>,
+}
+
+#[cfg(test)]
+#[derive(Default)]
+struct TestReadHook {
+    reached: tokio::sync::Notify,
+    release: tokio::sync::Notify,
 }
 
 #[derive(Default)]
@@ -64,6 +73,8 @@ impl ImmutableImageManifestResolver {
             queued: Arc::new(tokio::sync::Semaphore::new(MAX_QUEUED_READS)),
             inflight: Arc::new(InflightReads::default()),
             read_deadline: READ_DEADLINE,
+            #[cfg(test)]
+            after_active_acquired: None,
         }
     }
 
@@ -93,6 +104,17 @@ impl ImmutableImageManifestResolver {
         resolver.read_deadline = read_deadline;
         resolver
     }
+
+    #[cfg(test)]
+    fn with_active_hook(
+        blob: Arc<dyn BlobStore>,
+        read_deadline: Duration,
+        hook: Arc<TestReadHook>,
+    ) -> Self {
+        let mut resolver = Self::with_deadline(blob, read_deadline);
+        resolver.after_active_acquired = Some(hook);
+        resolver
+    }
 }
 
 impl CatCreateManifestResolver for ImmutableImageManifestResolver {
@@ -101,6 +123,11 @@ impl CatCreateManifestResolver for ImmutableImageManifestResolver {
         boot_image_digest: &'a Sha256Digest,
     ) -> ServiceFuture<'a, ValidatedImageManifest> {
         Box::pin(async move {
+            // Register before any queue/active admission. Otherwise shutdown
+            // could close both semaphores after an old request acquired its
+            // active permit but before it registered provider I/O, observe
+            // zero, and return while that request starts a blocking read.
+            let inflight = self.inflight.start();
             let deadline = Instant::now() + self.read_deadline;
             // This permit is owned by the waiting future, so cancellation or a
             // timeout removes it from the queue immediately. No manifest body
@@ -126,9 +153,14 @@ impl CatCreateManifestResolver for ImmutableImageManifestResolver {
             .map_err(|_| ApiError::unavailable("image manifest reader is shutting down"))?;
             drop(queued);
 
+            #[cfg(test)]
+            if let Some(hook) = &self.after_active_acquired {
+                hook.reached.notify_one();
+                hook.release.notified().await;
+            }
+
             let blob = self.blob.clone();
             let digest = boot_image_digest.clone();
-            let inflight = self.inflight.start();
             let task = tokio::task::spawn_blocking(move || {
                 // The active permit lives until synchronous provider I/O
                 // actually returns. Timing out the HTTP future therefore
@@ -514,6 +546,40 @@ mod tests {
         }
         assert!(shutdown.await.unwrap());
         assert_eq!(blob.active.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn shutdown_cannot_pass_a_request_paused_after_active_admission() {
+        let blob = Arc::new(CountingBlob {
+            reads: AtomicUsize::new(0),
+        });
+        let hook = Arc::new(TestReadHook::default());
+        let resolver = Arc::new(ImmutableImageManifestResolver::with_active_hook(
+            blob.clone(),
+            Duration::from_secs(1),
+            hook.clone(),
+        ));
+        let read_resolver = resolver.clone();
+        let read = tokio::spawn(async move {
+            let digest = Sha256Digest::new(DIGEST).unwrap();
+            read_resolver.resolve(&digest).await
+        });
+        hook.reached.notified().await;
+
+        let shutdown_resolver = resolver.clone();
+        let mut shutdown = tokio::spawn(async move { shutdown_resolver.shutdown().await });
+        assert!(
+            tokio::time::timeout(Duration::from_millis(20), &mut shutdown)
+                .await
+                .is_err(),
+            "shutdown returned while an admitted request had not started provider I/O"
+        );
+        assert_eq!(blob.reads.load(Ordering::SeqCst), 0);
+
+        hook.release.notify_one();
+        read.await.unwrap().unwrap();
+        assert!(shutdown.await.unwrap());
+        assert_eq!(blob.reads.load(Ordering::SeqCst), 1);
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

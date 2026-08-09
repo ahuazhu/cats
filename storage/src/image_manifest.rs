@@ -1,11 +1,12 @@
 //! Canonical, provider-neutral golden-image manifest boundary.
 
+use std::cell::Cell;
 use std::fmt;
 use std::time::Instant;
 
 use cats_api::chunk::{CHUNK_SIZE, MAX_VOLUME_BYTES};
 use cats_api::runtime_reconciliation::Sha256Digest;
-use serde::de::{SeqAccess, Visitor};
+use serde::de::{DeserializeSeed, SeqAccess, Visitor};
 use serde::{Deserialize, Deserializer, Serialize};
 
 use crate::{BlobError, BlobStore};
@@ -203,6 +204,7 @@ pub fn decode_image_manifest(
     bytes: &[u8],
     boot_image_digest: &Sha256Digest,
 ) -> Result<ImageManifestV1, ImageManifestProblem> {
+    reject_canonical_chunk_overflow(bytes)?;
     let wire: WireManifest =
         serde_json::from_slice(bytes).map_err(|_| ImageManifestProblem::InvalidUtf8OrJson)?;
     let canonical =
@@ -254,6 +256,72 @@ pub fn decode_image_manifest(
         size_bytes: wire.size_bytes,
         chunks,
     })
+}
+
+fn reject_canonical_chunk_overflow(bytes: &[u8]) -> Result<(), ImageManifestProblem> {
+    const CANONICAL_CHUNKS_PREFIX: &[u8] = b"{\"chunks\":";
+    let Some(chunks) = bytes.strip_prefix(CANONICAL_CHUNKS_PREFIX) else {
+        return Ok(());
+    };
+    let overflowed = Cell::new(false);
+    let mut deserializer = serde_json::Deserializer::from_slice(chunks);
+    let _ = ChunkCountSeed {
+        overflowed: &overflowed,
+    }
+    .deserialize(&mut deserializer);
+    if overflowed.get() {
+        Err(ImageManifestProblem::InvalidChunks)
+    } else {
+        Ok(())
+    }
+}
+
+struct ChunkCountSeed<'a> {
+    overflowed: &'a Cell<bool>,
+}
+
+impl<'de> DeserializeSeed<'de> for ChunkCountSeed<'_> {
+    type Value = ();
+
+    fn deserialize<D>(self, deserializer: D) -> Result<Self::Value, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        deserializer.deserialize_seq(ChunkCountVisitor {
+            overflowed: self.overflowed,
+        })
+    }
+}
+
+struct ChunkCountVisitor<'a> {
+    overflowed: &'a Cell<bool>,
+}
+
+impl<'de> Visitor<'de> for ChunkCountVisitor<'_> {
+    type Value = ();
+
+    fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("the canonical image manifest chunks array")
+    }
+
+    fn visit_seq<A>(self, mut sequence: A) -> Result<Self::Value, A::Error>
+    where
+        A: SeqAccess<'de>,
+    {
+        for _ in 0..IMAGE_MANIFEST_MAX_CHUNKS {
+            if sequence.next_element::<WireChunk>()?.is_none() {
+                return Ok(());
+            }
+        }
+        if sequence.next_element::<WireChunk>()?.is_some() {
+            self.overflowed.set(true);
+            return Err(serde::de::Error::invalid_length(
+                IMAGE_MANIFEST_MAX_CHUNKS + 1,
+                &self,
+            ));
+        }
+        Ok(())
+    }
 }
 
 pub fn read_image_manifest(
@@ -581,7 +649,7 @@ mod tests {
         assert!(bytes.len() < IMAGE_MANIFEST_MAX_BYTES);
         assert_eq!(
             decode_image_manifest(bytes.as_bytes(), &digest()),
-            Err(ImageManifestProblem::InvalidUtf8OrJson)
+            Err(ImageManifestProblem::InvalidChunks)
         );
     }
 
