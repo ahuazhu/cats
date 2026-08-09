@@ -351,8 +351,9 @@ immutable attempt result与current session除`lease_deadline_unix_ms`外的全�
 deadline。任一非deadline字段不等或current deadline小于initial是fatal Store corruption，当前session
 unready且事务零写入。实现不得要求两个deadline永远相等。
 
-expired session不能新读取Desired、首次接受新observation/attestation、参与placement/admission或打开route
-gate；这些新授权边界必须用同一PG-now重验current exact session和deadline。唯一例外是current session对highest
+expired session不能签发或exact replay `DesiredReadSnapshot`、首次接受新observation/attestation、参与
+placement/admission或打开route gate；这些边界必须用同一PG-now重验current exact session和deadline。唯一例外
+是current session对highest
 accepted `heartbeat_sequence`及其exact observation的重放：deadline后仍返回首次success，零写入且不续期，只用于
 解析此前commit的response loss。expiry是Control liveness gate，不替代HostFence、attachment epoch或route
 epoch，不能仅凭expiry宣称旧Host/volume writer已经被fence。
