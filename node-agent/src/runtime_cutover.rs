@@ -3,7 +3,9 @@
 //! The legacy [`crate::server`] remains available to the pre-cutover test
 //! suite, but the shipped Node binary starts here. The first production
 //! scanner can attest only a physically empty Host; any non-empty fact remains
-//! fail-closed for the later identity-aware scanner. This path does not
+//! fail-closed for the later identity-aware scanner. The typed network effect
+//! is composed after that accepted full inventory, but its launch port remains
+//! fail-closed until the signed VMM/volume reconciler lands. This path does not
 //! construct `NodeRuntime`, adopt a legacy ledger, or run a destructive
 //! residue/device sweep.
 
@@ -18,30 +20,33 @@ use axum::routing::get;
 use axum::Router;
 
 use crate::agent_registration::AgentRegistrationConfig;
+use crate::ch::{ChConfig, ChNetwork};
 use crate::runtime::reconciliation::{
     installed_clean_slate_scanner, InstalledCleanSlateProbeConfig,
 };
 use crate::runtime_spine::{
-    RuntimeDesiredEffect, RuntimeDesiredEffectContext, RuntimeSpineHttpClient, RuntimeSpineRunStep,
+    ProductionRuntimeDesiredEffect, RuntimeLaunchPort, RuntimeSpineHttpClient, RuntimeSpineRunStep,
     RuntimeSpineRunner,
 };
 
 const SCAN_DEADLINE: Duration = Duration::from_secs(5);
 const RETRY_DELAY: Duration = Duration::from_secs(1);
 
-/// Fail-closed placeholder until the typed Runtime §7 planner/effect adapter
-/// is composed. The clean-slate scanner can attest physical absence, but it
-/// cannot authorize a later assigned-spec mutation; retaining this error keeps
-/// that post-attestation seam non-mutating.
-struct UnavailableDesiredEffect;
+/// Fail-closed endpoint for the next signed reconciliation slice. The
+/// production effect plans, checkpoints, and prepares only after a
+/// current-process full inventory is accepted. VMM/volume launch remains
+/// unavailable until the identity-aware non-empty reconciler is composed.
+struct UnavailableRuntimeLaunch;
 
-impl RuntimeDesiredEffect for UnavailableDesiredEffect {
-    fn apply(
+impl crate::runtime_spine::runtime_launch_port_sealed::Sealed for UnavailableRuntimeLaunch {}
+
+impl RuntimeLaunchPort for UnavailableRuntimeLaunch {
+    fn launch(
         &self,
-        _context: RuntimeDesiredEffectContext,
         _desired: &cats_api::runtime_reconciliation::DesiredRuntimeSpec,
+        _network: &ChNetwork,
     ) -> anyhow::Result<()> {
-        anyhow::bail!("typed Runtime Desired effect adapter is not composed")
+        anyhow::bail!("signed Runtime VMM/volume launch port is not composed")
     }
 }
 
@@ -49,7 +54,7 @@ pub struct SignedRuntimeCutoverConfig {
     pub listen: String,
     pub control_plane_url: String,
     pub agent_registration: AgentRegistrationConfig,
-    pub cloud_hypervisor_binary: std::path::PathBuf,
+    pub ch_config: ChConfig,
     pub blockd_binary: std::path::PathBuf,
     pub guest_agent_binary: std::path::PathBuf,
     pub metering_cgroup_root: Option<std::path::PathBuf>,
@@ -213,18 +218,20 @@ pub async fn spawn_signed_runtime_cutover(
     };
     let scanner = installed_clean_slate_scanner(InstalledCleanSlateProbeConfig {
         state_directory: config.agent_registration.runtime_state_directory(),
-        cloud_hypervisor_binary: config.cloud_hypervisor_binary,
+        cloud_hypervisor_binary: config.ch_config.ch_bin.clone(),
         blockd_binary: config.blockd_binary,
         guest_agent_binary: config.guest_agent_binary,
         metering_cgroup_root: config.metering_cgroup_root,
     })
     .context("compose installed clean-slate inventory probes")?;
+    let effect =
+        ProductionRuntimeDesiredEffect::new(config.ch_config, Arc::new(UnavailableRuntimeLaunch));
     let runner = RuntimeSpineRunner::new_with_desired_effects(
         config.agent_registration.runtime_state_directory(),
         session,
         client,
         scanner,
-        Arc::new(UnavailableDesiredEffect),
+        Arc::new(effect),
     )?;
     // Bind before spawning either owned task. If binding fails, `runner` drops
     // synchronously and no detached worker can outlive this failed startup.
@@ -419,6 +426,38 @@ mod tests {
         )
     }
 
+    fn test_ch_config() -> ChConfig {
+        ChConfig {
+            block_direct: false,
+            ch_bin: "/opt/cats/bin/cloud-hypervisor".into(),
+            kernel: "/opt/cats/release/guest/vmlinuz".into(),
+            initramfs: None,
+            boot_contract: None,
+            cmdline: "console=hvc0 root=/dev/vda".into(),
+            seed_image: None,
+            block_path: crate::ch::BlockPath::KernelNbd,
+            vhost_user_queues: 1,
+            vhost_user_queue_size: 256,
+            nbd_client_bin: "/usr/sbin/nbd-client".into(),
+            nbd_devices: 64,
+            ip_bin: "/usr/sbin/ip".into(),
+        }
+    }
+
+    #[test]
+    fn production_composition_uses_the_typed_network_adapter_only() {
+        let source = include_str!("runtime_cutover.rs");
+        assert!(source.contains("ProductionRuntimeDesiredEffect::new"));
+        assert!(source.contains("installed_clean_slate_scanner"));
+        assert!(source.contains("UnavailableRuntimeLaunch"));
+        let placeholder_effect = ["Unavailable", "Desired", "Effect"].concat();
+        let legacy_job = ["Node", "Job"].concat();
+        let legacy_runtime = ["Node", "Runtime", "::", "new"].concat();
+        assert!(!source.contains(&placeholder_effect));
+        assert!(!source.contains(&legacy_job));
+        assert!(!source.contains(&legacy_runtime));
+    }
+
     #[tokio::test]
     async fn health_stays_closed_without_an_accepted_full_observation() {
         let readiness = Readiness::closed();
@@ -482,7 +521,7 @@ mod tests {
             listen: "127.0.0.1:0".into(),
             control_plane_url: origin.clone(),
             agent_registration: registration,
-            cloud_hypervisor_binary: "/opt/cats/bin/cloud-hypervisor".into(),
+            ch_config: test_ch_config(),
             blockd_binary: "/opt/cats/bin/cats-blockd".into(),
             guest_agent_binary: "/opt/cats/bin/cats-guest-agent".into(),
             metering_cgroup_root: None,

@@ -1,6 +1,7 @@
 use std::path::PathBuf;
 
 use anyhow::Context;
+use cats_node_agent::ch::{BlockPath, ChConfig};
 use cats_node_agent::runtime_cutover::{spawn_signed_runtime_cutover, SignedRuntimeCutoverConfig};
 use clap::Parser;
 
@@ -70,7 +71,7 @@ struct Args {
     wake_queue_timeout_secs: u64,
 
     /// VMM mode: fake (host processes) or ch (Cloud Hypervisor, Linux+KVM).
-    #[arg(long, default_value = "fake")]
+    #[arg(long, default_value = "ch")]
     vmm: String,
     #[arg(long, default_value = "/usr/local/bin/cloud-hypervisor")]
     ch_bin: PathBuf,
@@ -116,6 +117,7 @@ async fn main() -> anyhow::Result<()> {
     let installed_receipt =
         cats_api::runtime_artifacts::load_installed_guest_runtime_profile_receipt(receipt_path)?;
     cats_api::runtime_artifacts::validate_installed_node_guest_runtime(&installed_receipt)?;
+    let ch_config = installed_ch_config(&args, &installed_receipt)?;
     let agent_registration =
         cats_node_agent::agent_registration::AgentRegistrationConfig::load_installed(
             installed_receipt.receipt(),
@@ -124,7 +126,7 @@ async fn main() -> anyhow::Result<()> {
         listen: args.listen,
         control_plane_url: args.control_plane_url,
         agent_registration,
-        cloud_hypervisor_binary: args.ch_bin,
+        ch_config,
         blockd_binary: args.blockd_bin,
         guest_agent_binary: args.guest_agent_bin,
         metering_cgroup_root: args.metering_cgroup_root,
@@ -135,6 +137,35 @@ async fn main() -> anyhow::Result<()> {
         handle.addr
     );
     handle.run_until_signal().await
+}
+
+fn installed_ch_config(
+    args: &Args,
+    installed: &cats_api::runtime_artifacts::InstalledGuestRuntimeProfileReceipt,
+) -> anyhow::Result<ChConfig> {
+    anyhow::ensure!(
+        args.vmm == "ch",
+        "the signed production Runtime supports only --vmm ch"
+    );
+    let boot_contract = installed.boot_contract();
+    let initramfs = boot_contract
+        .initramfs()
+        .map(|_| cats_api::runtime_artifacts::GUEST_INITRAMFS_PATH.into());
+    Ok(ChConfig {
+        block_direct: args.ch_block_direct,
+        ch_bin: args.ch_bin.clone(),
+        kernel: cats_api::runtime_artifacts::GUEST_KERNEL_PATH.into(),
+        initramfs,
+        boot_contract: Some(boot_contract),
+        cmdline: installed.receipt().kernel_cmdline.as_str().to_owned(),
+        seed_image: args.ch_seed_image.clone(),
+        block_path: BlockPath::parse(&args.ch_block_path)?,
+        vhost_user_queues: args.ch_vhost_user_queues,
+        vhost_user_queue_size: args.ch_vhost_user_queue_size,
+        nbd_client_bin: args.ch_nbd_client.clone(),
+        nbd_devices: args.ch_nbd_devices,
+        ip_bin: args.ch_ip_bin.clone(),
+    })
 }
 
 #[cfg(test)]
@@ -154,6 +185,7 @@ mod tests {
             "ch_kernel",
             "ch_initramfs",
             "ch_cmdline",
+            "ch_network_cidr",
         ] {
             assert!(
                 !ids.contains(&forbidden),

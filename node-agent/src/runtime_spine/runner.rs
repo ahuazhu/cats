@@ -109,6 +109,20 @@ impl RuntimeDesiredEffectContext {
         );
         Ok(())
     }
+
+    #[cfg(test)]
+    pub(crate) fn for_test(state_directory: StateDirectory, deadline: Instant) -> Self {
+        Self::new(
+            state_directory,
+            deadline,
+            RuntimeInventoryScanCancellation::new(),
+        )
+    }
+
+    #[cfg(test)]
+    pub(crate) fn cancel_for_test(&self) {
+        self.cancellation.cancel();
+    }
 }
 
 #[derive(Debug, Clone)]

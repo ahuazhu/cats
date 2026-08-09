@@ -189,6 +189,23 @@ fn bind_desired_network(
     })
 }
 
+/// Revalidates a checkpointed Host-physical tuple without touching Host
+/// state. The signed Desired adapter calls this immediately after every
+/// descriptor-relative checkpoint read, before the tuple can reach `ip` or a
+/// VMM launch.
+pub(crate) fn validate_network_plan(network: &ChNetwork) -> Result<()> {
+    let checked = bind_desired_network(
+        &network.config,
+        network.tap.clone(),
+        network.ownership_token.clone(),
+    )?;
+    anyhow::ensure!(
+        checked == *network,
+        "checkpointed Host network tuple is invalid"
+    );
+    Ok(())
+}
+
 fn ip_status(ip_bin: &Path, args: &[&str]) -> Result<()> {
     let output = Command::new(ip_bin)
         .args(args)
@@ -288,15 +305,7 @@ fn ensure_host_cidr_available(cfg: &ChConfig, host_cidr: &str) -> Result<()> {
 /// An existing same-token tap is completed idempotently; a same-name tap with
 /// any other token or address is rejected without mutation.
 pub fn prepare_network(cfg: &ChConfig, network: &ChNetwork) -> Result<()> {
-    let checked = bind_desired_network(
-        &network.config,
-        network.tap.clone(),
-        network.ownership_token.clone(),
-    )?;
-    anyhow::ensure!(
-        checked == *network,
-        "checkpointed Host network tuple is invalid"
-    );
+    validate_network_plan(network)?;
     let host_cidr = host_cidr(network);
 
     if exact_network_exists(cfg, network)? {
