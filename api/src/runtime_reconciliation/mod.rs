@@ -19,6 +19,13 @@ mod canonical;
 mod types;
 mod wire;
 
+/// Exact A20 internal HTTP method used by both runtime-spine routes.
+pub const RUNTIME_SPINE_METHOD: &str = "POST";
+/// Exact A20 Desired read route signed by the per-Node A19 credential.
+pub const DESIRED_READ_PATH: &str = "/v1/internal/runtime/desired-reads";
+/// Exact A20 observation route signed by the per-Node A19 credential.
+pub const OBSERVATION_PATH: &str = "/v1/internal/runtime/observations";
+
 pub(crate) use canonical::value_bytes as canonical_json_value_bytes;
 
 pub use canonical::{

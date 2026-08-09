@@ -22,16 +22,14 @@ use cats_api::runtime_reconciliation::{
     encode_observation_acceptance, encode_runtime_spine_error, ContractError, ContractErrorDetail,
     ContractName, ContractVersion, DesiredReadRequest, JsonPointer, LimitKind, NodeObservation,
     RuntimeSpineError, RuntimeSpineErrorDetail, RuntimeSpineHttpProblem, WireU64,
-    DESIRED_READ_REQUEST_MAX_WIRE_BYTES, NODE_OBSERVATION_MAX_WIRE_BYTES,
+    DESIRED_READ_PATH, DESIRED_READ_REQUEST_MAX_WIRE_BYTES, NODE_OBSERVATION_MAX_WIRE_BYTES,
+    OBSERVATION_PATH, RUNTIME_SPINE_METHOD,
 };
 
 use crate::server::AppState;
 use crate::store::runtime_authority::runtime_spine::{RuntimeSpineOutcome, RuntimeSpineRejection};
 use crate::store::AuthorityRequestContext;
 
-const DESIRED_READ_PATH: &str = "/v1/internal/runtime/desired-reads";
-const OBSERVATION_PATH: &str = "/v1/internal/runtime/observations";
-const METHOD: &str = "POST";
 const HANDLER_DEADLINE: Duration = Duration::from_secs(10);
 const NODE_AUTHENTICATE_CHALLENGE: &str = "CatsNodeSignature realm=\"runtime-internal\"";
 
@@ -93,14 +91,17 @@ async fn handle(state: AppState, request: Request<Body>, route: Route) -> Respon
     let request_context = AuthorityRequestContext::new(deadline);
     let _cancel_on_drop = CancelRequestOnDrop(request_context.clone());
 
-    if request.method().as_str() != METHOD {
+    if request.method().as_str() != RUNTIME_SPINE_METHOD {
         return error_response(
             StatusCode::METHOD_NOT_ALLOWED,
             RuntimeSpineErrorDetail::HttpRequestRejected {
                 problem: RuntimeSpineHttpProblem::MethodNotAllowed,
             },
             "runtime request requires POST",
-            &[(header::ALLOW, HeaderValue::from_static(METHOD))],
+            &[(
+                header::ALLOW,
+                HeaderValue::from_static(RUNTIME_SPINE_METHOD),
+            )],
         );
     }
     if request.uri().query().is_some() {
@@ -193,7 +194,7 @@ async fn handle(state: AppState, request: Request<Body>, route: Route) -> Respon
     );
     let authenticated = match proof {
         (Some(credential_id), Some(public_key_spki), Some(signature)) => verify_request_proof(
-            METHOD,
+            RUNTIME_SPINE_METHOD,
             route.path(),
             &body,
             credential_id,
