@@ -200,10 +200,9 @@ fn verify_current_schema(transaction: &mut postgres::Transaction<'_>) -> Result<
     Ok(())
 }
 
-/// This is the first clean-slate runtime-cutover schema. Version 1 is not
-/// migrated or repaired; it must ship only as part of the complete vertical
-/// cutover release.
-pub(super) const SCHEMA_VERSION: i64 = 2;
+/// This clean-slate runtime-cutover schema is not migrated or repaired; it
+/// must ship only as part of the complete vertical cutover release.
+pub(super) const SCHEMA_VERSION: i64 = 3;
 
 const CONTROL_TABLES: &[&str] = &[
     "control_schema_version",
@@ -232,8 +231,10 @@ const CONTROL_TABLES: &[&str] = &[
     "volume_authorizations",
     "delete_completion_receipts",
     "cat_records",
+    "endpoint_records",
     "disk_records",
     "desired_runtime_specs",
+    "hostname_desired_lookups",
     "runtime_operations",
     "api_idempotency_results",
 ];
@@ -260,6 +261,8 @@ const AUTHORITY_SCHEMA_PROBES: &[&str] = &[
        FROM delete_completion_receipts WHERE FALSE",
     "SELECT cat_id, record, workspace_id, name, created_at
        FROM cat_records WHERE FALSE",
+    "SELECT endpoint_id, record, workspace_id, cat_id, name, created_at
+       FROM endpoint_records WHERE FALSE",
     "SELECT disk_id, record, workspace_id, name, volume_id, size_bytes,
             durability, created_at, admin_state, delete_id, role_kind,
             root_cat_id, initialization_kind, initialization_token,
@@ -271,6 +274,9 @@ const AUTHORITY_SCHEMA_PROBES: &[&str] = &[
     "SELECT cat_id, record, workspace_id, desired_revision, spec_digest,
             target, node_id, placement_epoch
        FROM desired_runtime_specs WHERE FALSE",
+    "SELECT hostname, record, workspace_id, cat_id, endpoint_id,
+            desired_revision
+       FROM hostname_desired_lookups WHERE FALSE",
     "SELECT operation_id, record, workspace_id, cat_id, desired_revision,
             desired_spec_digest, node_id, placement_epoch, target, phase,
             terminal_kind, created_at, updated_at
@@ -635,6 +641,18 @@ CREATE TABLE IF NOT EXISTS cat_records (
     UNIQUE (workspace_id, name),
     UNIQUE (workspace_id, cat_id)
 );
+CREATE TABLE IF NOT EXISTS endpoint_records (
+    endpoint_id TEXT PRIMARY KEY,
+    record JSONB NOT NULL CHECK (jsonb_typeof(record) = 'object'),
+    workspace_id TEXT NOT NULL,
+    cat_id TEXT NOT NULL,
+    name TEXT NOT NULL,
+    created_at BIGINT NOT NULL CHECK (created_at >= 0),
+    UNIQUE (cat_id, name),
+    UNIQUE (workspace_id, cat_id, endpoint_id),
+    FOREIGN KEY (workspace_id, cat_id)
+        REFERENCES cat_records(workspace_id, cat_id)
+);
 CREATE TABLE IF NOT EXISTS disk_records (
     disk_id TEXT PRIMARY KEY,
     record JSONB NOT NULL CHECK (jsonb_typeof(record) = 'object'),
@@ -716,8 +734,23 @@ CREATE TABLE IF NOT EXISTS desired_runtime_specs (
     target TEXT NOT NULL CHECK (target IN ('running', 'suspended', 'warm', 'cold', 'deleted')),
     node_id TEXT NOT NULL,
     placement_epoch BIGINT NOT NULL CHECK (placement_epoch > 0),
+    UNIQUE (workspace_id, cat_id, desired_revision),
     FOREIGN KEY (workspace_id, cat_id)
         REFERENCES cat_records(workspace_id, cat_id)
+);
+CREATE TABLE IF NOT EXISTS hostname_desired_lookups (
+    hostname TEXT PRIMARY KEY,
+    record JSONB NOT NULL CHECK (jsonb_typeof(record) = 'object'),
+    workspace_id TEXT NOT NULL,
+    cat_id TEXT NOT NULL,
+    endpoint_id TEXT NOT NULL UNIQUE,
+    desired_revision BIGINT NOT NULL CHECK (desired_revision > 0),
+    FOREIGN KEY (workspace_id, cat_id, endpoint_id)
+        REFERENCES endpoint_records(workspace_id, cat_id, endpoint_id)
+        DEFERRABLE INITIALLY DEFERRED,
+    FOREIGN KEY (workspace_id, cat_id, desired_revision)
+        REFERENCES desired_runtime_specs(workspace_id, cat_id, desired_revision)
+        DEFERRABLE INITIALLY DEFERRED
 );
 CREATE TABLE IF NOT EXISTS runtime_operations (
     operation_id TEXT PRIMARY KEY,

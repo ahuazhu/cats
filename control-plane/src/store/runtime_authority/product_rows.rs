@@ -2,8 +2,8 @@
 
 use cats_api::runtime_reconciliation::{
     decode_desired_runtime_spec, decode_operation, encode_desired_runtime_spec, encode_operation,
-    DesiredRuntimeSpec, Epoch, Generation, Id, Operation, OperationPhase, OperationTerminal,
-    Revision, RuntimeTarget, Sha256Digest, UnixMillis,
+    DesiredRuntimeSpec, Epoch, Generation, Hostname, Id, Operation, OperationPhase,
+    OperationTerminal, Revision, RuntimeTarget, Sha256Digest, UnixMillis,
 };
 use cats_storage::authority::{remote_head_is_valid, AuthorityError, VolumeDurability};
 use postgres::{Row, Transaction};
@@ -12,12 +12,15 @@ use serde::{de::DeserializeOwned, Serialize};
 use super::pg_codec::{PgBigInt, SizeBytes};
 use super::product::{
     ApiIdempotencyRequest, ApiIdempotencyResult, CatRecord, DiskAdminState, DiskRecord, DiskRole,
-    ExactContentType, PersistentDiskInitialization,
+    EndpointRecord, ExactContentType, HostnameDesiredLookup, PersistentDiskInitialization,
 };
 use crate::store::transaction::{AuthorityTransactionError, AuthorityTxResult};
 use crate::store::{internal, Result, Store};
 
 const CAT_COLUMNS: &str = "cat_id, record::text AS record_json, workspace_id, name, created_at";
+const ENDPOINT_COLUMNS: &str = "
+    endpoint_id, record::text AS record_json, workspace_id, cat_id, name,
+    created_at";
 const DISK_COLUMNS: &str = "
     disk_id, record::text AS record_json, workspace_id, name, volume_id,
     size_bytes, durability, created_at, admin_state, delete_id, role_kind,
@@ -28,6 +31,9 @@ const DISK_COLUMNS: &str = "
 const DESIRED_COLUMNS: &str = "
     cat_id, record::text AS record_json, workspace_id, desired_revision,
     spec_digest, target, node_id, placement_epoch";
+const HOSTNAME_LOOKUP_COLUMNS: &str = "
+    hostname, record::text AS record_json, workspace_id, cat_id, endpoint_id,
+    desired_revision";
 const OPERATION_COLUMNS: &str = "
     operation_id, record::text AS record_json, workspace_id, cat_id,
     desired_revision, desired_spec_digest, node_id, placement_epoch, target,
@@ -60,6 +66,68 @@ impl CatProjection {
             workspace_id: row.try_get("workspace_id")?,
             name: row.try_get("name")?,
             created_at: from_pg(row.try_get("created_at")?)?,
+        })
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct EndpointProjection {
+    endpoint_id: String,
+    workspace_id: String,
+    cat_id: String,
+    name: String,
+    created_at: UnixMillis,
+}
+
+impl EndpointProjection {
+    fn from_record(record: &EndpointRecord) -> Self {
+        Self {
+            endpoint_id: record.endpoint_id.to_string(),
+            workspace_id: record.workspace_id.to_string(),
+            cat_id: record.cat_id.to_string(),
+            name: record.name.to_string(),
+            created_at: record.created_at,
+        }
+    }
+
+    fn from_row(row: &Row) -> AuthorityTxResult<Self> {
+        Ok(Self {
+            endpoint_id: row.try_get("endpoint_id")?,
+            workspace_id: row.try_get("workspace_id")?,
+            cat_id: row.try_get("cat_id")?,
+            name: row.try_get("name")?,
+            created_at: from_pg(row.try_get("created_at")?)?,
+        })
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct HostnameLookupProjection {
+    hostname: String,
+    workspace_id: String,
+    cat_id: String,
+    endpoint_id: String,
+    desired_revision: Revision,
+}
+
+impl HostnameLookupProjection {
+    fn from_record(record: &HostnameDesiredLookup) -> Self {
+        Self {
+            hostname: record.hostname.to_string(),
+            workspace_id: record.workspace_id.to_string(),
+            cat_id: record.cat_id.to_string(),
+            endpoint_id: record.endpoint_id.to_string(),
+            desired_revision: record.desired_revision,
+        }
+    }
+
+    fn from_row(row: &Row) -> AuthorityTxResult<Self> {
+        Ok(Self {
+            hostname: row.try_get("hostname")?,
+            workspace_id: row.try_get("workspace_id")?,
+            cat_id: row.try_get("cat_id")?,
+            endpoint_id: row.try_get("endpoint_id")?,
+            desired_revision: from_pg(row.try_get("desired_revision")?)?,
         })
     }
 }
@@ -387,6 +455,73 @@ fn decode_cat(row: &Row) -> AuthorityTxResult<CatRecord> {
     Ok(record)
 }
 
+pub(super) fn insert_endpoint(
+    transaction: &mut Transaction<'_>,
+    record: &EndpointRecord,
+) -> AuthorityTxResult<()> {
+    let projection = EndpointProjection::from_record(record);
+    let json = encode_json(record)?;
+    let created_at = projection.created_at.to_pg().map_err(corrupt)?;
+    exactly_one(transaction.execute(
+        "INSERT INTO endpoint_records (
+            endpoint_id, record, workspace_id, cat_id, name, created_at
+         ) VALUES ($1, $2::TEXT::jsonb, $3, $4, $5, $6)",
+        &[
+            &projection.endpoint_id,
+            &json,
+            &projection.workspace_id,
+            &projection.cat_id,
+            &projection.name,
+            &created_at,
+        ],
+    )?)
+}
+
+pub(super) fn load_endpoint_by_id_for_update(
+    transaction: &mut Transaction<'_>,
+    endpoint_id: &Id,
+) -> AuthorityTxResult<Option<EndpointRecord>> {
+    let sql =
+        format!("SELECT {ENDPOINT_COLUMNS} FROM endpoint_records WHERE endpoint_id=$1 FOR UPDATE");
+    transaction
+        .query_opt(&sql, &[&endpoint_id.as_str()])?
+        .map(|row| decode_endpoint(&row))
+        .transpose()
+}
+
+pub(super) fn load_endpoint_by_id_unlocked(
+    transaction: &mut Transaction<'_>,
+    endpoint_id: &Id,
+) -> AuthorityTxResult<Option<EndpointRecord>> {
+    let sql = format!("SELECT {ENDPOINT_COLUMNS} FROM endpoint_records WHERE endpoint_id=$1");
+    transaction
+        .query_opt(&sql, &[&endpoint_id.as_str()])?
+        .map(|row| decode_endpoint(&row))
+        .transpose()
+}
+
+pub(super) fn load_endpoint_by_cat_name_unlocked(
+    transaction: &mut Transaction<'_>,
+    cat_id: &Id,
+    name: &Id,
+) -> AuthorityTxResult<Option<EndpointRecord>> {
+    let sql =
+        format!("SELECT {ENDPOINT_COLUMNS} FROM endpoint_records WHERE cat_id=$1 AND name=$2");
+    transaction
+        .query_opt(&sql, &[&cat_id.as_str(), &name.as_str()])?
+        .map(|row| decode_endpoint(&row))
+        .transpose()
+}
+
+fn decode_endpoint(row: &Row) -> AuthorityTxResult<EndpointRecord> {
+    let stored = EndpointProjection::from_row(row)?;
+    let record: EndpointRecord = decode_json(row.try_get("record_json")?)?;
+    if stored != EndpointProjection::from_record(&record) {
+        return Err(corrupt(()));
+    }
+    Ok(record)
+}
+
 pub(super) fn insert_disk(
     transaction: &mut Transaction<'_>,
     record: &DiskRecord,
@@ -511,11 +646,93 @@ pub(super) fn load_desired_for_update(
         .transpose()
 }
 
+pub(super) fn load_desired_unlocked(
+    transaction: &mut Transaction<'_>,
+    cat_id: &Id,
+) -> AuthorityTxResult<Option<DesiredRuntimeSpec>> {
+    let sql = format!("SELECT {DESIRED_COLUMNS} FROM desired_runtime_specs WHERE cat_id=$1");
+    transaction
+        .query_opt(&sql, &[&cat_id.as_str()])?
+        .map(|row| decode_desired(&row))
+        .transpose()
+}
+
 fn decode_desired(row: &Row) -> AuthorityTxResult<DesiredRuntimeSpec> {
     let stored = DesiredProjection::from_row(row)?;
     let json: String = row.try_get("record_json")?;
     let record = decode_desired_runtime_spec(json.as_bytes()).map_err(corrupt)?;
     if stored != DesiredProjection::from_record(&record)? {
+        return Err(corrupt(()));
+    }
+    Ok(record)
+}
+
+pub(super) fn insert_hostname_lookup(
+    transaction: &mut Transaction<'_>,
+    record: &HostnameDesiredLookup,
+) -> AuthorityTxResult<()> {
+    let projection = HostnameLookupProjection::from_record(record);
+    let json = encode_json(record)?;
+    let desired_revision = projection.desired_revision.to_pg().map_err(corrupt)?;
+    exactly_one(transaction.execute(
+        "INSERT INTO hostname_desired_lookups (
+            hostname, record, workspace_id, cat_id, endpoint_id,
+            desired_revision
+         ) VALUES ($1, $2::TEXT::jsonb, $3, $4, $5, $6)",
+        &[
+            &projection.hostname,
+            &json,
+            &projection.workspace_id,
+            &projection.cat_id,
+            &projection.endpoint_id,
+            &desired_revision,
+        ],
+    )?)
+}
+
+pub(super) fn load_hostname_lookup_for_update(
+    transaction: &mut Transaction<'_>,
+    hostname: &Hostname,
+) -> AuthorityTxResult<Option<HostnameDesiredLookup>> {
+    let sql = format!(
+        "SELECT {HOSTNAME_LOOKUP_COLUMNS} FROM hostname_desired_lookups
+          WHERE hostname=$1 FOR UPDATE"
+    );
+    transaction
+        .query_opt(&sql, &[&hostname.as_str()])?
+        .map(|row| decode_hostname_lookup(&row))
+        .transpose()
+}
+
+pub(super) fn load_hostname_lookup_unlocked(
+    transaction: &mut Transaction<'_>,
+    hostname: &Hostname,
+) -> AuthorityTxResult<Option<HostnameDesiredLookup>> {
+    let sql =
+        format!("SELECT {HOSTNAME_LOOKUP_COLUMNS} FROM hostname_desired_lookups WHERE hostname=$1");
+    transaction
+        .query_opt(&sql, &[&hostname.as_str()])?
+        .map(|row| decode_hostname_lookup(&row))
+        .transpose()
+}
+
+pub(super) fn load_hostname_lookup_by_endpoint_unlocked(
+    transaction: &mut Transaction<'_>,
+    endpoint_id: &Id,
+) -> AuthorityTxResult<Option<HostnameDesiredLookup>> {
+    let sql = format!(
+        "SELECT {HOSTNAME_LOOKUP_COLUMNS} FROM hostname_desired_lookups WHERE endpoint_id=$1"
+    );
+    transaction
+        .query_opt(&sql, &[&endpoint_id.as_str()])?
+        .map(|row| decode_hostname_lookup(&row))
+        .transpose()
+}
+
+fn decode_hostname_lookup(row: &Row) -> AuthorityTxResult<HostnameDesiredLookup> {
+    let stored = HostnameLookupProjection::from_row(row)?;
+    let record: HostnameDesiredLookup = decode_json(row.try_get("record_json")?)?;
+    if stored != HostnameLookupProjection::from_record(&record) {
         return Err(corrupt(()));
     }
     Ok(record)

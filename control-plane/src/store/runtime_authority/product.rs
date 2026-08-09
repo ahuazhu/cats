@@ -8,8 +8,8 @@
 use cats_api::error::ApiError;
 use cats_api::runtime_reconciliation::{
     encode_desired_runtime_spec, AsciiText, ContractVersion, DesiredRuntimeSpec, DiskKind,
-    Durability, Generation, Id, Operation, OperationPhase, Sha256Digest, UnixMillis, VolumeAccess,
-    VolumeAcquire, VolumeDisposition,
+    Durability, Generation, Hostname, HttpProtocol, Id, Operation, OperationPhase, Revision,
+    Sha256Digest, UnixMillis, VolumeAccess, VolumeAcquire, VolumeDisposition,
 };
 use cats_storage::authority::{RemoteHead, VolumeAdminState, VolumeDurability, VolumeRecord};
 use postgres::Transaction;
@@ -17,9 +17,13 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 use super::product_rows::{
-    insert_api_result, insert_cat, insert_desired, insert_disk, insert_operation,
-    load_api_result_for_update, load_cat_by_id_for_update, load_cat_by_name_unlocked,
-    load_desired_for_update, load_disk_by_id_for_update, load_disk_by_name_for_update,
+    insert_api_result, insert_cat, insert_desired, insert_disk, insert_endpoint,
+    insert_hostname_lookup, insert_operation, load_api_result_for_update,
+    load_cat_by_id_for_update, load_cat_by_name_unlocked, load_desired_for_update,
+    load_desired_unlocked, load_disk_by_id_for_update, load_disk_by_name_for_update,
+    load_endpoint_by_cat_name_unlocked, load_endpoint_by_id_for_update,
+    load_endpoint_by_id_unlocked, load_hostname_lookup_by_endpoint_unlocked,
+    load_hostname_lookup_for_update, load_hostname_lookup_unlocked,
     load_operation_by_cat_revision_unlocked, load_operation_for_update,
     load_root_disk_by_cat_unlocked,
 };
@@ -40,6 +44,33 @@ pub(crate) struct CatRecord {
     pub(crate) workspace_id: Id,
     pub(crate) name: Id,
     pub(crate) created_at: UnixMillis,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct EndpointRecord {
+    pub(crate) endpoint_id: Id,
+    pub(crate) workspace_id: Id,
+    pub(crate) cat_id: Id,
+    pub(crate) name: Id,
+    pub(crate) created_at: UnixMillis,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct HostnameDesiredLookup {
+    pub(crate) hostname: Hostname,
+    pub(crate) workspace_id: Id,
+    pub(crate) cat_id: Id,
+    pub(crate) endpoint_id: Id,
+    pub(crate) desired_revision: Revision,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct HostnameDesiredLocation {
+    pub(crate) cat_id: Id,
+    pub(crate) endpoint_id: Id,
+    pub(crate) desired_revision: Revision,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -104,6 +135,14 @@ pub(crate) struct DiskRecordCandidate {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct EndpointRecordCandidate {
+    pub(crate) endpoint_id: Id,
+    pub(crate) workspace_id: Id,
+    pub(crate) cat_id: Id,
+    pub(crate) name: Id,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct CatCreateCandidate {
     pub(crate) cat_id: Id,
     pub(crate) workspace_id: Id,
@@ -111,6 +150,8 @@ pub(crate) struct CatCreateCandidate {
     pub(crate) root_disk: DiskRecordCandidate,
     pub(crate) volume: VolumeRecord,
     pub(crate) desired: DesiredRuntimeSpec,
+    pub(crate) endpoint: EndpointRecordCandidate,
+    pub(crate) hostname_lookup: HostnameDesiredLookup,
     pub(crate) operation_id: Id,
 }
 
@@ -235,6 +276,8 @@ pub(crate) enum CandidateCollision {
     CatId,
     DiskIdOrName,
     VolumeId,
+    EndpointIdOrName,
+    Hostname,
     OperationId,
 }
 
@@ -353,6 +396,34 @@ impl Store {
         })
     }
 
+    /// Locate the current Desired revision for a hostname without returning a
+    /// copied route binding. Every hit is closed against the immutable
+    /// Endpoint product record and the current complete Desired in one
+    /// repeatable-read snapshot.
+    #[allow(dead_code, reason = "consumed by the later route-signer cutover")]
+    pub(crate) fn locate_hostname_desired(
+        &self,
+        hostname: &Hostname,
+    ) -> Result<Option<HostnameDesiredLocation>> {
+        self.authority_transaction(|transaction| {
+            transaction
+                .batch_execute("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ, READ ONLY")?;
+            let Some(lookup) = load_hostname_lookup_unlocked(transaction, hostname)? else {
+                return Ok(None);
+            };
+            let endpoint = load_endpoint_by_id_unlocked(transaction, &lookup.endpoint_id)?
+                .ok_or_else(|| stored_corruption("hostname lookup has no EndpointRecord"))?;
+            let desired = load_desired_unlocked(transaction, &lookup.cat_id)?
+                .ok_or_else(|| stored_corruption("hostname lookup has no current Desired"))?;
+            validate_endpoint_lookup(&endpoint, &lookup, &desired)?;
+            Ok(Some(HostnameDesiredLocation {
+                cat_id: lookup.cat_id,
+                endpoint_id: lookup.endpoint_id,
+                desired_revision: lookup.desired_revision,
+            }))
+        })
+    }
+
     #[allow(dead_code, reason = "consumed by the later HTTP/service cutover")]
     pub(crate) fn create_cat_covered(
         &self,
@@ -442,6 +513,35 @@ fn create_cat_in(
         return Err(stored_corruption("current Desired exists without its foreign-key Cat").into());
     }
 
+    lock_candidate_id(
+        transaction,
+        "endpoint",
+        &request.candidate.endpoint.endpoint_id,
+    )?;
+    lock_candidate_endpoint_name(
+        transaction,
+        &request.candidate.endpoint.cat_id,
+        &request.candidate.endpoint.name,
+    )?;
+    if load_endpoint_by_id_for_update(transaction, &request.candidate.endpoint.endpoint_id)?
+        .is_some()
+        || load_endpoint_by_cat_name_unlocked(
+            transaction,
+            &request.candidate.endpoint.cat_id,
+            &request.candidate.endpoint.name,
+        )?
+        .is_some()
+    {
+        return Err(candidate_collision(CandidateCollision::EndpointIdOrName));
+    }
+
+    lock_candidate_hostname(transaction, &request.candidate.hostname_lookup.hostname)?;
+    if load_hostname_lookup_for_update(transaction, &request.candidate.hostname_lookup.hostname)?
+        .is_some()
+    {
+        return Err(candidate_collision(CandidateCollision::Hostname));
+    }
+
     lock_candidate_id(transaction, "operation", &request.candidate.operation_id)?;
     if load_operation_for_update(transaction, &request.candidate.operation_id)?.is_some() {
         return Err(candidate_collision(CandidateCollision::OperationId));
@@ -464,6 +564,13 @@ fn create_cat_in(
         created_at: now,
         admin_state: request.candidate.root_disk.admin_state.clone(),
         role: request.candidate.root_disk.role.clone(),
+    };
+    let endpoint = EndpointRecord {
+        endpoint_id: request.candidate.endpoint.endpoint_id.clone(),
+        workspace_id: request.candidate.endpoint.workspace_id.clone(),
+        cat_id: request.candidate.endpoint.cat_id.clone(),
+        name: request.candidate.endpoint.name.clone(),
+        created_at: now,
     };
     let operation = Operation {
         version: ContractVersion::V1,
@@ -489,6 +596,8 @@ fn create_cat_in(
     insert_cat(transaction, &cat)?;
     insert_disk(transaction, &disk)?;
     insert_desired(transaction, &request.candidate.desired)?;
+    insert_endpoint(transaction, &endpoint)?;
+    insert_hostname_lookup(transaction, &request.candidate.hostname_lookup)?;
     insert_operation(transaction, &operation)?;
     insert_api_result(transaction, &result)?;
     Ok(result)
@@ -532,6 +641,33 @@ fn validate_existing_cat_for_name_conflict(
     let desired = load_desired_for_update(transaction, &cat.cat_id)?
         .ok_or_else(|| stored_corruption("existing Cat has no current Desired"))?;
     validate_existing_desired(&cat, &disk, &volume, &desired)?;
+
+    let peeked_endpoint = load_endpoint_by_cat_name_unlocked(transaction, &cat.cat_id, &id_web())?
+        .ok_or_else(|| stored_corruption("existing Cat has no default web Endpoint"))?;
+    lock_candidate_id(transaction, "endpoint", &peeked_endpoint.endpoint_id)?;
+    let endpoint = load_endpoint_by_id_for_update(transaction, &peeked_endpoint.endpoint_id)?
+        .ok_or_else(|| stored_corruption("existing Cat default Endpoint disappeared"))?;
+    if endpoint != peeked_endpoint
+        || endpoint.workspace_id != cat.workspace_id
+        || endpoint.cat_id != cat.cat_id
+        || endpoint.name.as_str() != "web"
+        || endpoint.created_at != cat.created_at
+    {
+        return Err(stored_corruption(
+            "existing Cat default Endpoint identity is invalid",
+        ));
+    }
+    let peeked_lookup =
+        load_hostname_lookup_by_endpoint_unlocked(transaction, &endpoint.endpoint_id)?.ok_or_else(
+            || stored_corruption("existing Cat default Endpoint has no hostname lookup"),
+        )?;
+    lock_candidate_hostname(transaction, &peeked_lookup.hostname)?;
+    let lookup = load_hostname_lookup_for_update(transaction, &peeked_lookup.hostname)?
+        .ok_or_else(|| stored_corruption("existing Cat hostname lookup disappeared"))?;
+    if lookup != peeked_lookup {
+        return Err(stored_corruption("existing Cat hostname lookup changed"));
+    }
+    validate_endpoint_lookup(&endpoint, &lookup, &desired)?;
 
     let peeked_operation = load_operation_by_cat_revision_unlocked(
         transaction,
@@ -600,6 +736,10 @@ fn validate_candidate(request: &CoveredCatCreateRequest) -> Result<()> {
         || candidate.root_disk.workspace_id != candidate.workspace_id
         || candidate.desired.workspace_id != candidate.workspace_id
         || candidate.desired.cat_id != candidate.cat_id
+        || candidate.endpoint.workspace_id != candidate.workspace_id
+        || candidate.endpoint.cat_id != candidate.cat_id
+        || candidate.hostname_lookup.workspace_id != candidate.workspace_id
+        || candidate.hostname_lookup.cat_id != candidate.cat_id
     {
         return Err(invalid_bundle("workspace/cat binding mismatch"));
     }
@@ -660,6 +800,55 @@ fn validate_candidate(request: &CoveredCatCreateRequest) -> Result<()> {
     {
         return Err(invalid_bundle(
             "Desired Root intent does not match Disk/Volume",
+        ));
+    }
+    let [endpoint_intent] = candidate.desired.endpoints.as_slice() else {
+        return Err(invalid_bundle(
+            "initial Desired must contain exactly one default Endpoint",
+        ));
+    };
+    if candidate.endpoint.name.as_str() != "web"
+        || candidate.endpoint.endpoint_id != endpoint_intent.endpoint_id
+        || candidate.hostname_lookup.endpoint_id != endpoint_intent.endpoint_id
+        || candidate.hostname_lookup.hostname != endpoint_intent.hostname
+        || candidate.hostname_lookup.desired_revision != candidate.desired.desired_revision
+        || endpoint_intent.route_epoch.get() != 1
+        || endpoint_intent.protocol != HttpProtocol::Http
+        || endpoint_intent.target_port != 8080
+    {
+        return Err(invalid_bundle(
+            "default Endpoint/hostname/Desired binding is invalid",
+        ));
+    }
+    Ok(())
+}
+
+fn validate_endpoint_lookup(
+    endpoint: &EndpointRecord,
+    lookup: &HostnameDesiredLookup,
+    desired: &DesiredRuntimeSpec,
+) -> AuthorityTxResult<()> {
+    if endpoint.workspace_id != lookup.workspace_id
+        || endpoint.cat_id != lookup.cat_id
+        || endpoint.endpoint_id != lookup.endpoint_id
+        || desired.workspace_id != lookup.workspace_id
+        || desired.cat_id != lookup.cat_id
+        || desired.desired_revision != lookup.desired_revision
+    {
+        return Err(stored_corruption(
+            "Endpoint/hostname lookup/current Desired identity is invalid",
+        ));
+    }
+    let mut bindings = desired
+        .endpoints
+        .iter()
+        .filter(|binding| binding.endpoint_id == endpoint.endpoint_id);
+    let binding = bindings
+        .next()
+        .ok_or_else(|| stored_corruption("current Desired has no lookup Endpoint binding"))?;
+    if bindings.next().is_some() || binding.hostname != lookup.hostname {
+        return Err(stored_corruption(
+            "hostname lookup does not match the current Desired binding",
         ));
     }
     Ok(())
@@ -723,6 +912,39 @@ fn lock_candidate_id(
         &[&kind, &id.as_str()],
     )?;
     Ok(())
+}
+
+fn lock_candidate_endpoint_name(
+    transaction: &mut Transaction<'_>,
+    cat_id: &Id,
+    name: &Id,
+) -> AuthorityTxResult<()> {
+    transaction.query_one(
+        "SELECT pg_advisory_xact_lock(hashtextextended(
+            current_schema() || ':runtime-authority:endpoint-name:' || $1 || ':' || $2,
+            0::BIGINT
+         ))",
+        &[&cat_id.as_str(), &name.as_str()],
+    )?;
+    Ok(())
+}
+
+fn lock_candidate_hostname(
+    transaction: &mut Transaction<'_>,
+    hostname: &Hostname,
+) -> AuthorityTxResult<()> {
+    transaction.query_one(
+        "SELECT pg_advisory_xact_lock(hashtextextended(
+            current_schema() || ':runtime-authority:hostname:' || $1,
+            0::BIGINT
+         ))",
+        &[&hostname.as_str()],
+    )?;
+    Ok(())
+}
+
+fn id_web() -> Id {
+    Id::new("web").expect("web is a fixed valid Id")
 }
 
 fn result_from_envelope(

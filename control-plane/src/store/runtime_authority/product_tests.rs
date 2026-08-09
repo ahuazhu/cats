@@ -6,11 +6,12 @@ use std::time::Duration;
 
 use cats_api::error::ErrorCode;
 use cats_api::runtime_reconciliation::{
-    spec_digest, AsciiText, AssignedKind, AssignedPlacement, ContractVersion, DesiredRuntimeSpec,
-    DiskKind, Durability, Epoch, FenceEpoch, Generation, GuestDeviceIdentity, Id, Ipv4Address,
-    IsolatedIpv4Kind, MacAddress, NetworkConfig, RandomId128, Revision, RuntimeConfig,
-    RuntimeTarget, RuntimeTransition, Sha256Digest, UnixMillis, VolumeAccess, VolumeAcquire,
-    VolumeDisposition, VolumeIntent,
+    encode_desired_runtime_spec, spec_digest, AsciiText, AssignedKind, AssignedPlacement,
+    ContractVersion, DesiredRuntimeSpec, DiskKind, Durability, EndpointIntent, Epoch, FenceEpoch,
+    Generation, GuestDeviceIdentity, Hostname, HttpProtocol, Id, Ipv4Address, IsolatedIpv4Kind,
+    MacAddress, NetworkConfig, RandomId128, Revision, RuntimeConfig, RuntimeTarget,
+    RuntimeTransition, Sha256Digest, UnixMillis, VolumeAccess, VolumeAcquire, VolumeDisposition,
+    VolumeIntent,
 };
 use cats_storage::authority::{
     LastVolumeTransition, RemoteHead, VolumeAdminState, VolumeDurability, VolumeRecord,
@@ -22,7 +23,8 @@ use super::product::{
     api_request_fingerprint, encode_cat_create_accepted_response,
     encode_cat_name_conflict_response, ApiIdempotencyRequest, CandidateCollision,
     CatCreateCandidate, CatCreateEnvelopes, CoveredCatCreateError, CoveredCatCreateRequest,
-    DiskAdminState, DiskRecord, DiskRecordCandidate, DiskRole, ExactContentType, ExactHttpResponse,
+    DiskAdminState, DiskRecord, DiskRecordCandidate, DiskRole, EndpointRecordCandidate,
+    ExactContentType, ExactHttpResponse, HostnameDesiredLocation, HostnameDesiredLookup,
     IfMatchFingerprint, PersistentDiskInitialization,
 };
 use super::product_rows::{insert_disk, load_disk_by_id_for_update};
@@ -140,6 +142,9 @@ fn request(
     let disk_id = id(format!("disk_{sequence}"));
     let volume_id = id(format!("volume_{sequence}"));
     let operation_id = id(format!("op_{sequence}"));
+    let endpoint_suffix = format!("{sequence:032x}");
+    let endpoint_id = id(format!("ep_{endpoint_suffix}"));
+    let hostname = Hostname::new(format!("{name}-{endpoint_suffix}.cats.run")).unwrap();
     let size_bytes = 4 * 1024 * 1024;
     let volume = VolumeRecord {
         volume_id: volume_id.clone(),
@@ -191,7 +196,7 @@ fn request(
             access: VolumeAccess::ReadWriteOnce,
             durability: Durability::Strict,
             guest_device: GuestDeviceIdentity {
-                serial: id(format!("root-device_{sequence}")),
+                serial: id("cats-root"),
                 slot: 0,
             },
             acquire: VolumeAcquire::Normal {
@@ -201,7 +206,13 @@ fn request(
             disposition: VolumeDisposition::Retain,
             mount: None,
         }],
-        endpoints: Vec::new(),
+        endpoints: vec![EndpointIntent {
+            endpoint_id: endpoint_id.clone(),
+            hostname: hostname.clone(),
+            route_epoch: epoch(1),
+            protocol: HttpProtocol::Http,
+            target_port: 8080,
+        }],
         transition: RuntimeTransition::CancelAndDrain,
         spec_digest: Sha256Digest::from_bytes([0; 32]),
     };
@@ -253,13 +264,26 @@ fn request(
             },
             volume,
             desired,
+            endpoint: EndpointRecordCandidate {
+                endpoint_id: endpoint_id.clone(),
+                workspace_id: workspace.clone(),
+                cat_id: cat_id.clone(),
+                name: id("web"),
+            },
+            hostname_lookup: HostnameDesiredLookup {
+                hostname,
+                workspace_id: workspace.clone(),
+                cat_id: cat_id.clone(),
+                endpoint_id,
+                desired_revision: revision(1),
+            },
             operation_id: operation_id.clone(),
         },
         envelopes: CatCreateEnvelopes::new(accepted, cat_id, operation_id, conflict).unwrap(),
     }
 }
 
-fn counts(store: &Store) -> [i64; 6] {
+fn counts(store: &Store) -> [i64; 8] {
     store
         .with(|client| {
             client
@@ -269,6 +293,8 @@ fn counts(store: &Store) -> [i64; 6] {
                         (SELECT count(*) FROM disk_records),
                         (SELECT count(*) FROM volume_records),
                         (SELECT count(*) FROM desired_runtime_specs),
+                        (SELECT count(*) FROM endpoint_records),
+                        (SELECT count(*) FROM hostname_desired_lookups),
                         (SELECT count(*) FROM runtime_operations),
                         (SELECT count(*) FROM api_idempotency_results)",
                     &[],
@@ -281,6 +307,8 @@ fn counts(store: &Store) -> [i64; 6] {
                         row.get(3),
                         row.get(4),
                         row.get(5),
+                        row.get(6),
+                        row.get(7),
                     ]
                 })
         })
@@ -324,11 +352,15 @@ fn candidate_row_count(store: &Store, request: &CoveredCatCreateRequest) -> i64 
                         (SELECT count(*) FROM disk_records WHERE disk_id=$2) +
                         (SELECT count(*) FROM volume_records WHERE volume_id=$3) +
                         (SELECT count(*) FROM desired_runtime_specs WHERE cat_id=$1) +
-                        (SELECT count(*) FROM runtime_operations WHERE operation_id=$4)",
+                        (SELECT count(*) FROM endpoint_records WHERE endpoint_id=$4) +
+                        (SELECT count(*) FROM hostname_desired_lookups WHERE hostname=$5) +
+                        (SELECT count(*) FROM runtime_operations WHERE operation_id=$6)",
                     &[
                         &request.candidate.cat_id.as_str(),
                         &request.candidate.root_disk.disk_id.as_str(),
                         &request.candidate.volume.volume_id.as_str(),
+                        &request.candidate.endpoint.endpoint_id.as_str(),
+                        &request.candidate.hostname_lookup.hostname.as_str(),
                         &request.candidate.operation_id.as_str(),
                     ],
                 )
@@ -394,12 +426,20 @@ fn delete_created_bundle(store: &Store, request: &CoveredCatCreateRequest) {
         .with(|client| {
             let mut transaction = client.transaction()?;
             transaction.execute(
+                "DELETE FROM hostname_desired_lookups WHERE hostname=$1",
+                &[&request.candidate.hostname_lookup.hostname.as_str()],
+            )?;
+            transaction.execute(
                 "DELETE FROM runtime_operations WHERE operation_id=$1",
                 &[&request.candidate.operation_id.as_str()],
             )?;
             transaction.execute(
                 "DELETE FROM desired_runtime_specs WHERE cat_id=$1",
                 &[&request.candidate.cat_id.as_str()],
+            )?;
+            transaction.execute(
+                "DELETE FROM endpoint_records WHERE endpoint_id=$1",
+                &[&request.candidate.endpoint.endpoint_id.as_str()],
             )?;
             transaction.execute(
                 "DELETE FROM disk_records WHERE disk_id=$1",
@@ -602,7 +642,21 @@ fn first_create_and_lost_response_replay_are_exact_and_atomic() {
         .is_none());
     let first = store.create_cat_covered(&request).unwrap();
     assert_eq!(first.http_status, 202);
-    assert_eq!(counts(&store), [1, 1, 1, 1, 1, 1]);
+    assert_eq!(counts(&store), [1, 1, 1, 1, 1, 1, 1, 1]);
+    assert_eq!(
+        store
+            .locate_hostname_desired(&request.candidate.hostname_lookup.hostname)
+            .unwrap(),
+        Some(HostnameDesiredLocation {
+            cat_id: request.candidate.cat_id.clone(),
+            endpoint_id: request.candidate.endpoint.endpoint_id.clone(),
+            desired_revision: revision(1),
+        })
+    );
+    assert!(store
+        .locate_hostname_desired(&Hostname::new("absent.cats.run").unwrap())
+        .unwrap()
+        .is_none());
     let replay = store.create_cat_covered(&request).unwrap();
     assert_eq!(replay, first);
     assert_eq!(
@@ -611,22 +665,36 @@ fn first_create_and_lost_response_replay_are_exact_and_atomic() {
             .unwrap(),
         Some(first.clone())
     );
-    let times: (i64, i64, i64, i64, i64) = store
+    let times: (i64, i64, i64, i64, i64, i64) = store
         .with(|client| {
             client
                 .query_one(
-                    "SELECT c.created_at, d.created_at, o.created_at, o.updated_at, r.created_at
+                    "SELECT c.created_at, d.created_at, e.created_at,
+                            o.created_at, o.updated_at, r.created_at
                        FROM cat_records c
                        JOIN disk_records d ON d.root_cat_id=c.cat_id
+                       JOIN endpoint_records e ON e.cat_id=c.cat_id AND e.name='web'
                        JOIN runtime_operations o ON o.cat_id=c.cat_id
                        JOIN api_idempotency_results r
                          ON r.authenticated_workspace_id=c.workspace_id",
                     &[],
                 )
-                .map(|row| (row.get(0), row.get(1), row.get(2), row.get(3), row.get(4)))
+                .map(|row| {
+                    (
+                        row.get(0),
+                        row.get(1),
+                        row.get(2),
+                        row.get(3),
+                        row.get(4),
+                        row.get(5),
+                    )
+                })
         })
         .unwrap();
-    assert_eq!(times, (times.0, times.0, times.0, times.0, times.0));
+    assert_eq!(
+        times,
+        (times.0, times.0, times.0, times.0, times.0, times.0)
+    );
 
     let mut raw_client = postgres::Client::connect(&url, postgres::NoTls).unwrap();
     let error = raw_client
@@ -647,9 +715,9 @@ fn first_create_and_lost_response_replay_are_exact_and_atomic() {
     assert_eq!(phase, "pending");
 
     delete_created_bundle(&store, &request);
-    assert_eq!(counts(&store), [0, 0, 0, 0, 0, 1]);
+    assert_eq!(counts(&store), [0, 0, 0, 0, 0, 0, 0, 1]);
     assert_eq!(store.create_cat_covered(&request).unwrap(), first);
-    assert_eq!(counts(&store), [0, 0, 0, 0, 0, 1]);
+    assert_eq!(counts(&store), [0, 0, 0, 0, 0, 0, 0, 1]);
 }
 
 #[test]
@@ -661,7 +729,7 @@ fn same_key_different_fingerprint_conflicts_before_candidate_reads() {
     changed.idempotency.request_fingerprint = Sha256Digest::from_bytes([9; 32]);
     let error = store.create_cat_covered(&changed).unwrap_err();
     assert_eq!(error_code(error), ErrorCode::Conflict);
-    assert_eq!(counts(&store), [1, 1, 1, 1, 1, 1]);
+    assert_eq!(counts(&store), [1, 1, 1, 1, 1, 1, 1, 1]);
 }
 
 #[test]
@@ -685,7 +753,7 @@ fn idempotency_scope_isolated_by_workspace_and_canonical_route() {
     assert_eq!(store.create_cat_covered(&first).unwrap().http_status, 202);
     assert_eq!(store.create_cat_covered(&second).unwrap().http_status, 202);
     assert_eq!(store.create_cat_covered(&third).unwrap().http_status, 202);
-    assert_eq!(counts(&store), [3, 3, 3, 3, 3, 3]);
+    assert_eq!(counts(&store), [3, 3, 3, 3, 3, 3, 3, 3]);
 }
 
 #[test]
@@ -722,7 +790,7 @@ fn fast_miss_same_key_race_commits_only_one_candidate_bundle() {
     assert_eq!(first_result, second_result);
 
     let observer = Store::connect(&_url, None).unwrap();
-    assert_eq!(counts(&observer), [1, 1, 1, 1, 1, 1]);
+    assert_eq!(counts(&observer), [1, 1, 1, 1, 1, 1, 1, 1]);
     let loser = if first_result.response_body
         == encode_cat_create_accepted_response(
             &saved_first.candidate.cat_id,
@@ -746,6 +814,8 @@ fn every_persisted_candidate_identity_collision_is_typed_and_rolls_back() {
     let mut cat_collision = request(&workspace, "new-cat-name", 2, "cat-collision");
     cat_collision.candidate.cat_id = original.candidate.cat_id.clone();
     cat_collision.candidate.desired.cat_id = original.candidate.cat_id.clone();
+    cat_collision.candidate.endpoint.cat_id = original.candidate.cat_id.clone();
+    cat_collision.candidate.hostname_lookup.cat_id = original.candidate.cat_id.clone();
     cat_collision.candidate.root_disk.role = DiskRole::Root {
         cat_id: original.candidate.cat_id.clone(),
     };
@@ -769,10 +839,28 @@ fn every_persisted_candidate_identity_collision_is_typed_and_rolls_back() {
     operation_collision.candidate.operation_id = original.candidate.operation_id.clone();
     refresh_candidate_contract(&mut operation_collision);
 
+    let mut endpoint_collision = request(&workspace, "new-endpoint-name", 6, "endpoint-collision");
+    endpoint_collision.candidate.endpoint.endpoint_id =
+        original.candidate.endpoint.endpoint_id.clone();
+    endpoint_collision.candidate.hostname_lookup.endpoint_id =
+        original.candidate.endpoint.endpoint_id.clone();
+    endpoint_collision.candidate.desired.endpoints[0].endpoint_id =
+        original.candidate.endpoint.endpoint_id.clone();
+    refresh_candidate_contract(&mut endpoint_collision);
+
+    let mut hostname_collision = request(&workspace, "new-hostname-name", 7, "hostname-collision");
+    hostname_collision.candidate.hostname_lookup.hostname =
+        original.candidate.hostname_lookup.hostname.clone();
+    hostname_collision.candidate.desired.endpoints[0].hostname =
+        original.candidate.hostname_lookup.hostname.clone();
+    refresh_candidate_contract(&mut hostname_collision);
+
     for (request, expected) in [
         (&cat_collision, CandidateCollision::CatId),
         (&disk_collision, CandidateCollision::DiskIdOrName),
         (&volume_collision, CandidateCollision::VolumeId),
+        (&endpoint_collision, CandidateCollision::EndpointIdOrName),
+        (&hostname_collision, CandidateCollision::Hostname),
         (&operation_collision, CandidateCollision::OperationId),
     ] {
         let error = store.create_cat_covered(request).unwrap_err();
@@ -781,8 +869,44 @@ fn every_persisted_candidate_identity_collision_is_typed_and_rolls_back() {
             CoveredCatCreateError::CandidateCollision(kind) if kind == expected
         ));
         assert_eq!(failed_request_artifact_count(&store, request), 0);
-        assert_eq!(counts(&store), [1, 1, 1, 1, 1, 1]);
+        assert_eq!(counts(&store), [1, 1, 1, 1, 1, 1, 1, 1]);
     }
+}
+
+#[test]
+fn hostname_is_globally_unique_within_and_across_workspaces() {
+    let (_url, store, _second, workspace) = stores();
+    let other_workspace = bootstrap_workspace(&store, "hostname-other");
+    let original = request(&workspace, "original", 1, "original-key");
+    store.create_cat_covered(&original).unwrap();
+
+    let mut same_workspace = request(&workspace, "same-workspace", 2, "same-workspace-key");
+    same_workspace.candidate.hostname_lookup.hostname =
+        original.candidate.hostname_lookup.hostname.clone();
+    same_workspace.candidate.desired.endpoints[0].hostname =
+        original.candidate.hostname_lookup.hostname.clone();
+    refresh_candidate_contract(&mut same_workspace);
+
+    let mut cross_workspace = request(
+        &other_workspace,
+        "cross-workspace",
+        3,
+        "cross-workspace-key",
+    );
+    cross_workspace.candidate.hostname_lookup.hostname =
+        original.candidate.hostname_lookup.hostname.clone();
+    cross_workspace.candidate.desired.endpoints[0].hostname =
+        original.candidate.hostname_lookup.hostname.clone();
+    refresh_candidate_contract(&mut cross_workspace);
+
+    for candidate in [&same_workspace, &cross_workspace] {
+        assert!(matches!(
+            store.create_cat_covered(candidate).unwrap_err(),
+            CoveredCatCreateError::CandidateCollision(CandidateCollision::Hostname)
+        ));
+        assert_eq!(failed_request_artifact_count(&store, candidate), 0);
+    }
+    assert_eq!(counts(&store), [1, 1, 1, 1, 1, 1, 1, 1]);
 }
 
 #[test]
@@ -815,7 +939,7 @@ fn root_disk_generated_name_collision_with_persistent_disk_is_typed_and_rolls_ba
     ));
     assert_eq!(candidate_row_count(&store, &create), 0);
     assert_eq!(failed_request_artifact_count(&store, &create), 0);
-    assert_eq!(counts(&store), [0, 1, 1, 0, 0, 0]);
+    assert_eq!(counts(&store), [0, 1, 1, 0, 0, 0, 0, 0]);
 }
 
 #[test]
@@ -838,6 +962,8 @@ fn corrupt_collision_row_is_not_reported_as_retryable_candidate_collision() {
     let mut collision = request(&workspace, "different-name", 2, "collision-key");
     collision.candidate.cat_id = original.candidate.cat_id.clone();
     collision.candidate.desired.cat_id = original.candidate.cat_id.clone();
+    collision.candidate.endpoint.cat_id = original.candidate.cat_id.clone();
+    collision.candidate.hostname_lookup.cat_id = original.candidate.cat_id.clone();
     collision.candidate.root_disk.role = DiskRole::Root {
         cat_id: original.candidate.cat_id.clone(),
     };
@@ -846,7 +972,7 @@ fn corrupt_collision_row_is_not_reported_as_retryable_candidate_collision() {
     let error = store.create_cat_covered(&collision).unwrap_err();
     assert!(matches!(error, CoveredCatCreateError::Store(_)));
     assert_eq!(failed_request_artifact_count(&store, &collision), 0);
-    assert_eq!(counts(&store), [1, 1, 1, 1, 1, 1]);
+    assert_eq!(counts(&store), [1, 1, 1, 1, 1, 1, 1, 1]);
 }
 
 #[test]
@@ -875,7 +1001,7 @@ fn two_keys_same_name_commit_one_bundle_and_one_durable_409() {
     assert!(statuses.contains(&409));
 
     let observer = Store::connect(&_url, None).unwrap();
-    assert_eq!(counts(&observer), [1, 1, 1, 1, 1, 2]);
+    assert_eq!(counts(&observer), [1, 1, 1, 1, 1, 1, 1, 2]);
     let (winner, loser, loser_result) = if first_result.http_status == 202 {
         (&saved_first, &saved_second, second_result)
     } else {
@@ -883,7 +1009,7 @@ fn two_keys_same_name_commit_one_bundle_and_one_durable_409() {
     };
     delete_created_bundle(&observer, winner);
     assert_eq!(observer.create_cat_covered(loser).unwrap(), loser_result);
-    assert_eq!(counts(&observer), [0, 0, 0, 0, 0, 2]);
+    assert_eq!(counts(&observer), [0, 0, 0, 0, 0, 0, 0, 2]);
 }
 
 #[test]
@@ -904,7 +1030,7 @@ fn invalid_response_bytes_and_cross_workspace_bundle_write_nothing() {
             .code,
         ErrorCode::InvalidArgument
     );
-    assert_eq!(counts(&store), [0, 0, 0, 0, 0, 0]);
+    assert_eq!(counts(&store), [0, 0, 0, 0, 0, 0, 0, 0]);
 
     let accepted = ExactHttpResponse::new(
         202,
@@ -924,14 +1050,14 @@ fn invalid_response_bytes_and_cross_workspace_bundle_write_nothing() {
             .code,
         ErrorCode::InvalidArgument
     );
-    assert_eq!(counts(&store), [0, 0, 0, 0, 0, 0]);
+    assert_eq!(counts(&store), [0, 0, 0, 0, 0, 0, 0, 0]);
 
     let other_workspace = bootstrap_workspace(&store, "other");
     let mut cross_workspace = request(&other_workspace, "demo", 1, "cross-workspace");
     cross_workspace.idempotency.authenticated_workspace_id = workspace;
     let error = store.create_cat_covered(&cross_workspace).unwrap_err();
     assert_eq!(error_code(error), ErrorCode::Internal);
-    assert_eq!(counts(&store), [0, 0, 0, 0, 0, 0]);
+    assert_eq!(counts(&store), [0, 0, 0, 0, 0, 0, 0, 0]);
 }
 
 #[test]
@@ -996,7 +1122,68 @@ fn every_invalid_initial_root_shape_rolls_back_without_a_result() {
     ] {
         assert_invalid_bundle_writes_nothing(&store, request, label);
     }
-    assert_eq!(counts(&store), [0, 0, 0, 0, 0, 0]);
+    assert_eq!(counts(&store), [0, 0, 0, 0, 0, 0, 0, 0]);
+}
+
+#[test]
+fn every_invalid_default_endpoint_binding_rolls_back_without_a_result() {
+    let (_url, store, _second, workspace) = stores();
+
+    let mut wrong_owner = request(&workspace, "wrong-owner", 30, "endpoint-owner");
+    wrong_owner.candidate.endpoint.workspace_id = id("ws_wrong");
+
+    let mut wrong_name = request(&workspace, "wrong-name", 31, "endpoint-name");
+    wrong_name.candidate.endpoint.name = id("not-web");
+
+    let mut wrong_lookup_endpoint = request(&workspace, "wrong-lookup", 32, "endpoint-lookup");
+    wrong_lookup_endpoint.candidate.hostname_lookup.endpoint_id = id("ep_wrong");
+
+    let mut wrong_lookup_revision = request(&workspace, "wrong-revision", 33, "endpoint-revision");
+    wrong_lookup_revision
+        .candidate
+        .hostname_lookup
+        .desired_revision = revision(2);
+
+    let mut missing = request(&workspace, "missing", 34, "endpoint-missing");
+    missing.candidate.desired.endpoints.clear();
+    refresh_candidate_contract(&mut missing);
+
+    let mut duplicate = request(&workspace, "duplicate", 35, "endpoint-duplicate");
+    duplicate.candidate.desired.endpoints.push(EndpointIntent {
+        endpoint_id: id("ep_ffffffffffffffffffffffffffffffff"),
+        hostname: Hostname::new("duplicate-ffffffffffffffffffffffffffffffff.cats.run").unwrap(),
+        route_epoch: epoch(1),
+        protocol: HttpProtocol::Http,
+        target_port: 8080,
+    });
+    refresh_candidate_contract(&mut duplicate);
+
+    let mut wrong_hostname = request(&workspace, "wrong-hostname", 36, "endpoint-hostname");
+    wrong_hostname.candidate.hostname_lookup.hostname =
+        Hostname::new("different-00000000000000000000000000000000.cats.run").unwrap();
+
+    let mut wrong_epoch = request(&workspace, "wrong-epoch", 37, "endpoint-epoch");
+    wrong_epoch.candidate.desired.endpoints[0].route_epoch = epoch(2);
+    refresh_candidate_contract(&mut wrong_epoch);
+
+    let mut wrong_port = request(&workspace, "wrong-port", 38, "endpoint-port");
+    wrong_port.candidate.desired.endpoints[0].target_port = 8081;
+    refresh_candidate_contract(&mut wrong_port);
+
+    for (label, candidate) in [
+        ("Endpoint owner", &wrong_owner),
+        ("Endpoint management name", &wrong_name),
+        ("lookup Endpoint", &wrong_lookup_endpoint),
+        ("lookup revision", &wrong_lookup_revision),
+        ("missing default Endpoint", &missing),
+        ("multiple initial Endpoints", &duplicate),
+        ("lookup hostname", &wrong_hostname),
+        ("initial route epoch", &wrong_epoch),
+        ("initial target port", &wrong_port),
+    ] {
+        assert_invalid_bundle_writes_nothing(&store, candidate, label);
+    }
+    assert_eq!(counts(&store), [0, 0, 0, 0, 0, 0, 0, 0]);
 }
 
 #[test]
@@ -1015,6 +1202,15 @@ fn every_query_projection_drift_fails_closed_without_a_409_result() {
             "UPDATE desired_runtime_specs SET node_id='wrong-node'",
         ),
         (
+            "endpoint_records",
+            "UPDATE endpoint_records SET created_at=created_at+1",
+        ),
+        (
+            "hostname_desired_lookups",
+            "UPDATE hostname_desired_lookups
+                SET hostname='projection-drift-00000000000000000000000000000000.cats.run'",
+        ),
+        (
             "runtime_operations",
             "UPDATE runtime_operations SET node_id='wrong-node'",
         ),
@@ -1027,7 +1223,7 @@ fn every_query_projection_drift_fails_closed_without_a_409_result() {
         let conflict = request(&workspace, "demo", 2, "would-conflict");
         let error = store.create_cat_covered(&conflict).unwrap_err();
         assert_eq!(error_code(error), ErrorCode::Internal, "table {table}");
-        assert_eq!(counts(&store), [1, 1, 1, 1, 1, 1], "table {table}");
+        assert_eq!(counts(&store), [1, 1, 1, 1, 1, 1, 1, 1], "table {table}");
     }
 }
 
@@ -1101,7 +1297,7 @@ fn self_consistent_illegal_root_identity_or_timestamp_never_becomes_a_409() {
         let conflict = request(&workspace, "demo", 2, "would-conflict");
         let error = store.create_cat_covered(&conflict).unwrap_err();
         assert_eq!(error_code(error), ErrorCode::Internal, "{drift}");
-        assert_eq!(counts(&store), [1, 1, 1, 1, 1, 1], "{drift}");
+        assert_eq!(counts(&store), [1, 1, 1, 1, 1, 1, 1, 1], "{drift}");
     }
 }
 
@@ -1124,7 +1320,7 @@ fn self_valid_rows_with_a_missing_operation_are_not_a_name_conflict() {
     let conflict = request(&workspace, "demo", 2, "would-conflict");
     let error = store.create_cat_covered(&conflict).unwrap_err();
     assert_eq!(error_code(error), ErrorCode::Internal);
-    assert_eq!(counts(&store), [1, 1, 1, 1, 0, 1]);
+    assert_eq!(counts(&store), [1, 1, 1, 1, 1, 1, 0, 1]);
 }
 
 #[test]
@@ -1133,6 +1329,8 @@ fn every_closed_json_row_corruption_fails_closed_without_a_409_result() {
         "cat_records",
         "disk_records",
         "desired_runtime_specs",
+        "endpoint_records",
+        "hostname_desired_lookups",
         "runtime_operations",
     ] {
         let (_url, store, _second, workspace) = stores();
@@ -1144,8 +1342,68 @@ fn every_closed_json_row_corruption_fails_closed_without_a_409_result() {
         let conflict = request(&workspace, "demo", 2, "would-conflict");
         let error = store.create_cat_covered(&conflict).unwrap_err();
         assert_eq!(error_code(error), ErrorCode::Internal, "table {table}");
-        assert_eq!(counts(&store), [1, 1, 1, 1, 1, 1], "table {table}");
+        assert_eq!(counts(&store), [1, 1, 1, 1, 1, 1, 1, 1], "table {table}");
     }
+}
+
+#[test]
+fn hostname_lookup_fails_closed_when_current_desired_revision_drifts() {
+    let (url, store, _second, workspace) = stores();
+    let original = request(&workspace, "demo", 1, "original");
+    store.create_cat_covered(&original).unwrap();
+
+    let mut drifted = original.candidate.desired.clone();
+    drifted.desired_revision = revision(2);
+    drifted.spec_digest = Sha256Digest::from_bytes([0; 32]);
+    drifted.spec_digest = spec_digest(&drifted).unwrap();
+    let encoded = String::from_utf8(encode_desired_runtime_spec(&drifted).unwrap()).unwrap();
+
+    let mut raw_client = postgres::Client::connect(&url, postgres::NoTls).unwrap();
+    // Simulate a row written while the cross-revision DDL backstop was absent.
+    // The Desired JSON and projections remain internally self-consistent, so
+    // only the lookup/current-Desired cross-check can reject it.
+    raw_client
+        .batch_execute(
+            "DO $$
+             DECLARE target_constraint TEXT;
+             BEGIN
+               SELECT conname INTO STRICT target_constraint
+                 FROM pg_constraint
+                WHERE conrelid='hostname_desired_lookups'::regclass
+                  AND confrelid='desired_runtime_specs'::regclass
+                  AND contype='f';
+               EXECUTE format(
+                 'ALTER TABLE hostname_desired_lookups DROP CONSTRAINT %I',
+                 target_constraint
+               );
+             END $$;",
+        )
+        .unwrap();
+    raw_client
+        .execute(
+            "UPDATE desired_runtime_specs
+                SET record=$1::TEXT::jsonb,
+                    desired_revision=$2,
+                    spec_digest=$3
+              WHERE cat_id=$4",
+            &[
+                &encoded,
+                &2_i64,
+                &drifted.spec_digest.as_str(),
+                &drifted.cat_id.as_str(),
+            ],
+        )
+        .unwrap();
+
+    let lookup_error = store
+        .locate_hostname_desired(&original.candidate.hostname_lookup.hostname)
+        .unwrap_err();
+    assert_eq!(lookup_error.code, ErrorCode::Internal);
+
+    let conflict = request(&workspace, "demo", 2, "would-conflict");
+    let conflict_error = store.create_cat_covered(&conflict).unwrap_err();
+    assert_eq!(error_code(conflict_error), ErrorCode::Internal);
+    assert_eq!(counts(&store), [1, 1, 1, 1, 1, 1, 1, 1]);
 }
 
 #[test]
@@ -1169,7 +1427,7 @@ fn corrupt_api_result_fails_both_fast_and_transactional_reads_closed() {
     assert_eq!(fast.code, ErrorCode::Internal);
     let transactional = store.create_cat_covered(&original).unwrap_err();
     assert_eq!(error_code(transactional), ErrorCode::Internal);
-    assert_eq!(counts(&store), [1, 1, 1, 1, 1, 1]);
+    assert_eq!(counts(&store), [1, 1, 1, 1, 1, 1, 1, 1]);
 }
 
 #[test]
@@ -1196,7 +1454,7 @@ fn serialization_retry_replays_the_whole_create_without_half_rows() {
     let create = request(&workspace, "demo", 1, "retry");
     let result = store.create_cat_covered(&create).unwrap();
     assert_eq!(result.http_status, 202);
-    assert_eq!(counts(&store), [1, 1, 1, 1, 1, 1]);
+    assert_eq!(counts(&store), [1, 1, 1, 1, 1, 1, 1, 1]);
     let attempts: i64 = store
         .with(|client| {
             client
@@ -1208,7 +1466,7 @@ fn serialization_retry_replays_the_whole_create_without_half_rows() {
 }
 
 #[test]
-fn failure_after_four_business_inserts_rolls_everything_back() {
+fn failure_after_endpoint_and_lookup_inserts_rolls_everything_back() {
     let (_url, store, _second, workspace) = stores();
     store
         .with(|client| {
@@ -1227,7 +1485,84 @@ fn failure_after_four_business_inserts_rolls_everything_back() {
     let create = request(&workspace, "demo", 1, "rollback");
     let error = store.create_cat_covered(&create).unwrap_err();
     assert_eq!(error_code(error), ErrorCode::Internal);
-    assert_eq!(counts(&store), [0, 0, 0, 0, 0, 0]);
+    assert_eq!(counts(&store), [0, 0, 0, 0, 0, 0, 0, 0]);
+}
+
+#[test]
+fn cat_create_does_not_read_or_write_legacy_endpoint_and_route_rows() {
+    let (_url, store, _second, workspace) = stores();
+    store
+        .with(|client| {
+            client.batch_execute(
+                "INSERT INTO endpoints (
+                    id, cat_id, name, hostname, target_port, protocol, wake_policy
+                 ) VALUES (
+                    'legacy_endpoint', 'legacy_cat', 'legacy_name',
+                    'legacy.example.invalid', 4321, 'legacy_protocol', 'legacy_wake'
+                 );
+                 INSERT INTO routes (
+                    hostname, cat_id, node_id, gateway_url, target_port, epoch, state
+                 ) VALUES (
+                    'legacy.example.invalid', 'legacy_cat', 'legacy_node',
+                    'https://legacy.example.invalid', 4321, 77, 'legacy_state'
+                 );",
+            )
+        })
+        .unwrap();
+    let before: (String, String) = store
+        .with(|client| {
+            let endpoint = client
+                .query_one(
+                    "SELECT to_jsonb(e)::TEXT FROM endpoints e WHERE id='legacy_endpoint'",
+                    &[],
+                )?
+                .get(0);
+            let route = client
+                .query_one(
+                    "SELECT to_jsonb(r)::TEXT FROM routes r
+                      WHERE hostname='legacy.example.invalid'",
+                    &[],
+                )?
+                .get(0);
+            Ok((endpoint, route))
+        })
+        .unwrap();
+
+    let create = request(&workspace, "demo", 1, "legacy-sentinel");
+    assert_eq!(store.create_cat_covered(&create).unwrap().http_status, 202);
+
+    let after: (String, String) = store
+        .with(|client| {
+            let endpoint = client
+                .query_one(
+                    "SELECT to_jsonb(e)::TEXT FROM endpoints e WHERE id='legacy_endpoint'",
+                    &[],
+                )?
+                .get(0);
+            let route = client
+                .query_one(
+                    "SELECT to_jsonb(r)::TEXT FROM routes r
+                      WHERE hostname='legacy.example.invalid'",
+                    &[],
+                )?
+                .get(0);
+            Ok((endpoint, route))
+        })
+        .unwrap();
+    assert_eq!(after, before);
+    assert_eq!(counts(&store), [1, 1, 1, 1, 1, 1, 1, 1]);
+}
+
+#[test]
+fn cat_create_remains_independent_when_legacy_endpoint_tables_are_absent() {
+    let (_url, store, _second, workspace) = stores();
+    store
+        .with(|client| client.batch_execute("DROP TABLE routes; DROP TABLE endpoints;"))
+        .unwrap();
+
+    let create = request(&workspace, "demo", 1, "legacy-absent");
+    assert_eq!(store.create_cat_covered(&create).unwrap().http_status, 202);
+    assert_eq!(counts(&store), [1, 1, 1, 1, 1, 1, 1, 1]);
 }
 
 #[test]
@@ -1278,6 +1613,12 @@ fn concurrent_destroy_after_name_peek_cannot_be_cached_as_409() {
 
     destroy
         .execute(
+            "DELETE FROM hostname_desired_lookups WHERE hostname=$1",
+            &[&original.candidate.hostname_lookup.hostname.as_str()],
+        )
+        .unwrap();
+    destroy
+        .execute(
             "DELETE FROM runtime_operations WHERE operation_id=$1",
             &[&original.candidate.operation_id.as_str()],
         )
@@ -1286,6 +1627,12 @@ fn concurrent_destroy_after_name_peek_cannot_be_cached_as_409() {
         .execute(
             "DELETE FROM desired_runtime_specs WHERE cat_id=$1",
             &[&original.candidate.cat_id.as_str()],
+        )
+        .unwrap();
+    destroy
+        .execute(
+            "DELETE FROM endpoint_records WHERE endpoint_id=$1",
+            &[&original.candidate.endpoint.endpoint_id.as_str()],
         )
         .unwrap();
     destroy
@@ -1310,7 +1657,7 @@ fn concurrent_destroy_after_name_peek_cannot_be_cached_as_409() {
 
     let error = worker.join().unwrap().unwrap_err();
     assert_eq!(error_code(error), ErrorCode::Internal);
-    assert_eq!(counts(&seed), [0, 0, 0, 0, 0, 1]);
+    assert_eq!(counts(&seed), [0, 0, 0, 0, 0, 0, 0, 1]);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -1397,7 +1744,7 @@ async fn cancelling_started_create_finishes_physical_transaction_and_replays() {
         .unwrap();
     blocker.join().unwrap();
     assert_eq!(replay.http_status, 202);
-    assert_eq!(counts(&second), [1, 1, 1, 1, 1, 1]);
+    assert_eq!(counts(&second), [1, 1, 1, 1, 1, 1, 1, 1]);
 
     let mut settled = false;
     for _ in 0..200 {
