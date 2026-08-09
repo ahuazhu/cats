@@ -127,23 +127,73 @@ impl RuntimeNodeAuthorityAdmission {
     }
 }
 
-#[derive(Default)]
 struct CommitResolutionRegistry {
-    active: std::sync::atomic::AtomicUsize,
+    state: Mutex<CommitResolutionState>,
     changed: tokio::sync::Notify,
 }
 
+struct CommitResolutionState {
+    accepting: bool,
+    active: usize,
+}
+
+impl Default for CommitResolutionRegistry {
+    fn default() -> Self {
+        Self {
+            state: Mutex::new(CommitResolutionState {
+                accepting: true,
+                active: 0,
+            }),
+            changed: tokio::sync::Notify::new(),
+        }
+    }
+}
+
 impl CommitResolutionRegistry {
-    fn begin(self: &Arc<Self>) -> ActiveCommitResolution {
-        self.active
-            .fetch_add(1, std::sync::atomic::Ordering::AcqRel);
-        ActiveCommitResolution(Arc::clone(self))
+    fn try_begin(self: &Arc<Self>) -> Option<ActiveCommitResolution> {
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if !state.accepting {
+            return None;
+        }
+        state.active += 1;
+        Some(ActiveCommitResolution(Arc::clone(self)))
+    }
+
+    fn begin_shutdown(&self) {
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        state.accepting = false;
+        self.changed.notify_waiters();
+    }
+
+    fn active_count(&self) -> usize {
+        self.state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .active
+    }
+
+    fn finish(&self) {
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        debug_assert!(state.active > 0, "only an active commit owner can finish");
+        state.active -= 1;
+        if state.active == 0 {
+            self.changed.notify_waiters();
+        }
     }
 
     async fn wait_empty(&self) {
         loop {
             let changed = self.changed.notified();
-            if self.active.load(std::sync::atomic::Ordering::Acquire) == 0 {
+            if self.active_count() == 0 {
                 return;
             }
             changed.await;
@@ -155,10 +205,7 @@ struct ActiveCommitResolution(Arc<CommitResolutionRegistry>);
 
 impl Drop for ActiveCommitResolution {
     fn drop(&mut self) {
-        self.0
-            .active
-            .fetch_sub(1, std::sync::atomic::Ordering::AcqRel);
-        self.0.changed.notify_waiters();
+        self.0.finish();
     }
 }
 
@@ -182,6 +229,12 @@ pub(crate) struct RuntimeNodeAuthorityService {
     admission: RuntimeNodeAuthorityAdmission,
     accepting: tokio::sync::watch::Sender<bool>,
     resolutions: Arc<CommitResolutionRegistry>,
+    #[cfg(test)]
+    pause_before_registration: std::sync::atomic::AtomicBool,
+    #[cfg(test)]
+    registration_pause_entered: std::sync::atomic::AtomicBool,
+    #[cfg(test)]
+    registration_pause_changed: tokio::sync::Notify,
 }
 
 impl RuntimeNodeAuthorityService {
@@ -198,6 +251,12 @@ impl RuntimeNodeAuthorityService {
             admission: RuntimeNodeAuthorityAdmission::new(),
             accepting,
             resolutions: Arc::new(CommitResolutionRegistry::default()),
+            #[cfg(test)]
+            pause_before_registration: std::sync::atomic::AtomicBool::new(false),
+            #[cfg(test)]
+            registration_pause_entered: std::sync::atomic::AtomicBool::new(false),
+            #[cfg(test)]
+            registration_pause_changed: tokio::sync::Notify::new(),
         }
     }
 
@@ -206,6 +265,7 @@ impl RuntimeNodeAuthorityService {
     }
 
     pub(crate) fn begin_shutdown(&self) {
+        self.resolutions.begin_shutdown();
         self.accepting.send_replace(false);
     }
 
@@ -216,9 +276,7 @@ impl RuntimeNodeAuthorityService {
             .map_err(|_| {
                 ApiError::unavailable(format!(
                     "{} runtime Node authority commit resolutions remain after shutdown deadline",
-                    self.resolutions
-                        .active
-                        .load(std::sync::atomic::Ordering::Acquire)
+                    self.resolutions.active_count()
                 ))
             })
     }
@@ -226,9 +284,59 @@ impl RuntimeNodeAuthorityService {
     #[cfg(test)]
     #[allow(dead_code, reason = "used by focused shutdown fault-injection tests")]
     pub(crate) fn active_commit_resolutions(&self) -> usize {
-        self.resolutions
-            .active
+        self.resolutions.active_count()
+    }
+
+    #[cfg(test)]
+    fn arm_pause_before_registration_for_test(&self) {
+        self.registration_pause_entered
+            .store(false, std::sync::atomic::Ordering::Release);
+        self.pause_before_registration
+            .store(true, std::sync::atomic::Ordering::Release);
+    }
+
+    #[cfg(test)]
+    async fn pause_before_registration_for_test(&self) {
+        if !self
+            .pause_before_registration
             .load(std::sync::atomic::Ordering::Acquire)
+        {
+            return;
+        }
+        self.registration_pause_entered
+            .store(true, std::sync::atomic::Ordering::Release);
+        self.registration_pause_changed.notify_waiters();
+        loop {
+            let changed = self.registration_pause_changed.notified();
+            if !self
+                .pause_before_registration
+                .load(std::sync::atomic::Ordering::Acquire)
+            {
+                break;
+            }
+            changed.await;
+        }
+    }
+
+    #[cfg(test)]
+    async fn wait_for_registration_pause_for_test(&self) {
+        loop {
+            let changed = self.registration_pause_changed.notified();
+            if self
+                .registration_pause_entered
+                .load(std::sync::atomic::Ordering::Acquire)
+            {
+                break;
+            }
+            changed.await;
+        }
+    }
+
+    #[cfg(test)]
+    fn release_registration_pause_for_test(&self) {
+        self.pause_before_registration
+            .store(false, std::sync::atomic::Ordering::Release);
+        self.registration_pause_changed.notify_waiters();
     }
 
     async fn apply(
@@ -246,13 +354,17 @@ impl RuntimeNodeAuthorityService {
                 "runtime Node authority request exceeded its deadline",
             ));
         }
+        #[cfg(test)]
+        self.pause_before_registration_for_test().await;
+        let active = self.resolutions.try_begin().ok_or_else(|| {
+            ApiError::unavailable("runtime Node authority service is shutting down")
+        })?;
         let worker_request = request.clone();
         let worker_observer = request.clone();
         let store = Arc::clone(&self.store);
         let resolution_store = Arc::clone(&self.store);
         let resolution_apply = apply.clone();
         let readiness = Arc::clone(&self.readiness);
-        let active = self.resolutions.begin();
         let (result_tx, mut result_rx) = tokio::sync::oneshot::channel();
         tokio::spawn(async move {
             let _permits = permits;
@@ -1130,6 +1242,46 @@ mod tests {
                     .get::<_, i64>(0)
             }),
             0
+        );
+        server.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn shutdown_closes_commit_owner_registration_before_waiting_for_empty() {
+        let (_dir, server, dsn) = test_server_with_dsn().await;
+        let service = Arc::clone(&server.state.runtime_node_authority);
+        service.arm_pause_before_registration_for_test();
+        let response = tokio::spawn({
+            let request = signed_request(&server);
+            async move { request.send().await }
+        });
+        tokio::time::timeout(
+            Duration::from_secs(2),
+            service.wait_for_registration_pause_for_test(),
+        )
+        .await
+        .expect("request did not pause before commit-owner registration");
+
+        service.shutdown_commit_resolutions().await.unwrap();
+        assert_eq!(service.active_commit_resolutions(), 0);
+        service.release_registration_pause_for_test();
+
+        let response = response.await.unwrap().unwrap();
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(service.active_commit_resolutions(), 0);
+        let mut observer = TestPgClient::connect(&dsn);
+        assert_eq!(
+            observer.with(|observer| {
+                observer
+                    .query_one(
+                        "SELECT count(*) FROM runtime_node_authority_apply_records",
+                        &[],
+                    )
+                    .unwrap()
+                    .get::<_, i64>(0)
+            }),
+            0,
+            "shutdown must reject the late request before any Store apply"
         );
         server.shutdown().await.unwrap();
     }

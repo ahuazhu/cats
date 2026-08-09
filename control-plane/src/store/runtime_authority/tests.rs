@@ -914,6 +914,58 @@ fn a22_release_target_disk_kind_and_disposition_matrix_is_closed() {
     }
 }
 
+fn normal_acquire_fixture(
+    store: &Store,
+    workspace_suffix: &str,
+) -> (VolumeRecord, TransitionNode, RuntimeVolumeTransitionRequest) {
+    let volume = unowned_volume();
+    seed_volume(store, &volume);
+    let node = transition_node(store, "node-new");
+    let workspace = super::product_tests::bootstrap_workspace(store, workspace_suffix);
+    let desired = transition_desired(
+        &workspace,
+        &node,
+        &volume,
+        RuntimeTarget::Running,
+        revision(11),
+        epoch(3),
+        id("attachment-normal"),
+        VolumeAcquire::Normal {
+            transition_id: random_id(2),
+            expected_unowned_epoch: fence_epoch(7),
+        },
+        VolumeDisposition::Retain,
+    );
+    prepare_a22_runtime(
+        store,
+        &node,
+        &desired,
+        &volume,
+        observed_runtime_with_volumes(
+            &desired,
+            None,
+            vec![observed_unowned_volume(&desired, &volume)],
+        ),
+        false,
+    );
+    let request = transition_request(
+        &node,
+        &desired,
+        RuntimeVolumeTransition::Acquire {
+            request: VolumeAcquireRequest::Normal {
+                volume_id: volume.volume_id.clone(),
+                transition_id: random_id(2),
+                attachment_id: id("attachment-normal"),
+                expected_unowned_epoch: fence_epoch(7),
+                desired_revision: desired.desired_revision,
+                placement_epoch: desired.placement.placement_epoch,
+                lease_duration_ms: 30_000,
+            },
+        },
+    );
+    (volume, node, request)
+}
+
 pub(crate) fn prepare_a22_http_normal_fixture(
     store: &Store,
     authenticated: AuthenticatedNodeCredential,
@@ -1611,53 +1663,87 @@ fn two_store_sessions_cannot_both_acquire_one_volume() {
 }
 
 #[test]
+fn a22_cancellation_between_final_check_and_commit_claim_rolls_back_every_write() {
+    let url = crate::testsupport::isolated_control_store_url();
+    let store = Store::connect(&url, None).unwrap();
+    let (volume, node, request) = normal_acquire_fixture(&store, "a22-cancel-before-commit");
+    let before = stored_volume_row(&store, &volume.volume_id);
+    let observer = Store::connect(&url, None).unwrap();
+    let context = AuthorityRequestContext::new(Instant::now() + Duration::from_secs(5));
+    let entered = Arc::new(Barrier::new(2));
+    let release = Arc::new(Barrier::new(2));
+    context.pause_before_commit_claim_for_test(Arc::clone(&entered), Arc::clone(&release));
+    let worker_context = context.clone();
+    let worker = std::thread::spawn(move || {
+        store.runtime_volume_transition(
+            &node.authenticated,
+            &request,
+            &node.active_guest_config_digest,
+            &worker_context,
+        )
+    });
+
+    entered.wait();
+    context.cancel();
+    release.wait();
+    let error = worker.join().unwrap().unwrap_err();
+
+    assert_eq!(error.code, ErrorCode::Unavailable);
+    assert!(!context.commit_was_attempted());
+    assert_eq!(stored_volume_row(&observer, &volume.volume_id), before);
+}
+
+#[test]
+fn a22_commit_claim_wins_cancellation_and_response_loss_replays_exactly() {
+    let url = crate::testsupport::isolated_control_store_url();
+    let store = Store::connect(&url, None).unwrap();
+    let (volume, node, request) = normal_acquire_fixture(&store, "a22-commit-wins");
+    let observer = Store::connect(&url, None).unwrap();
+    let context = AuthorityRequestContext::new(Instant::now() + Duration::from_secs(5));
+    let entered = Arc::new(Barrier::new(2));
+    let release = Arc::new(Barrier::new(2));
+    context.pause_after_commit_claim_for_test(Arc::clone(&entered), Arc::clone(&release));
+    store.inject_request_committed_response_loss_once_after(Duration::ZERO);
+    let worker_context = context.clone();
+    let worker_node = node.clone();
+    let worker_request = request.clone();
+    let worker = std::thread::spawn(move || {
+        store.runtime_volume_transition(
+            &worker_node.authenticated,
+            &worker_request,
+            &worker_node.active_guest_config_digest,
+            &worker_context,
+        )
+    });
+
+    entered.wait();
+    assert!(context.commit_was_attempted());
+    context.cancel();
+    release.wait();
+    let lost = worker.join().unwrap().unwrap_err();
+
+    assert_eq!(lost.code, ErrorCode::Unavailable);
+    let committed = stored_volume(&observer, &volume.volume_id);
+    assert_eq!(committed.lease_owner, Some(id("attachment-normal")));
+    assert_eq!(committed.lease_epoch, fence_epoch(8));
+    let first = execute_transition(&observer, &node, &request).unwrap();
+    let second = execute_transition(&observer, &node, &request).unwrap();
+    assert_eq!(first, second);
+    let VolumeTransitionStoreOutcome::Accepted(success) = first else {
+        panic!("normal acquire replay was rejected")
+    };
+    let RuntimeVolumeTransitionOutcome::LeaseGranted { grant } = success.outcome else {
+        panic!("normal acquire returned the wrong outcome")
+    };
+    assert_eq!(grant.attachment_id, id("attachment-normal"));
+    assert_eq!(grant.attachment_epoch, fence_epoch(8));
+    assert_eq!(stored_volume(&observer, &volume.volume_id), committed);
+}
+
+#[test]
 fn a22_normal_acquire_commits_once_and_replays_after_response_loss() {
     let store = Store::connect(&crate::testsupport::isolated_control_store_url(), None).unwrap();
-    let volume = unowned_volume();
-    seed_volume(&store, &volume);
-    let node = transition_node(&store, "node-new");
-    let workspace = super::product_tests::bootstrap_workspace(&store, "a22-normal");
-    let desired = transition_desired(
-        &workspace,
-        &node,
-        &volume,
-        RuntimeTarget::Running,
-        revision(11),
-        epoch(3),
-        id("attachment-normal"),
-        VolumeAcquire::Normal {
-            transition_id: random_id(2),
-            expected_unowned_epoch: fence_epoch(7),
-        },
-        VolumeDisposition::Retain,
-    );
-    prepare_a22_runtime(
-        &store,
-        &node,
-        &desired,
-        &volume,
-        observed_runtime_with_volumes(
-            &desired,
-            None,
-            vec![observed_unowned_volume(&desired, &volume)],
-        ),
-        false,
-    );
-    let request = transition_request(
-        &node,
-        &desired,
-        RuntimeVolumeTransition::Acquire {
-            request: VolumeAcquireRequest::Normal {
-                volume_id: volume.volume_id.clone(),
-                transition_id: random_id(2),
-                attachment_id: id("attachment-normal"),
-                expected_unowned_epoch: fence_epoch(7),
-                desired_revision: desired.desired_revision,
-                placement_epoch: desired.placement.placement_epoch,
-                lease_duration_ms: 30_000,
-            },
-        },
-    );
+    let (volume, node, request) = normal_acquire_fixture(&store, "a22-normal");
 
     store.inject_request_committed_response_loss_once_after(Duration::ZERO);
     let lost = execute_transition(&store, &node, &request).unwrap_err();

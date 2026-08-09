@@ -2,7 +2,7 @@
 
 use std::error::Error as _;
 use std::io::ErrorKind;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -27,21 +27,44 @@ static RETRY_JITTER_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 #[derive(Clone)]
 pub(crate) struct AuthorityRequestContext {
     deadline: Instant,
-    cancelled: Arc<AtomicBool>,
-    commit_attempted: Arc<AtomicBool>,
+    cancel_requested: Arc<AtomicBool>,
+    phase: Arc<AtomicU8>,
+    #[cfg(test)]
+    before_commit_claim: Arc<std::sync::Mutex<Option<CommitClaimBarrier>>>,
+    #[cfg(test)]
+    after_commit_claim: Arc<std::sync::Mutex<Option<CommitClaimBarrier>>>,
+}
+
+#[cfg(test)]
+#[derive(Clone)]
+struct CommitClaimBarrier {
+    entered: Arc<std::sync::Barrier>,
+    release: Arc<std::sync::Barrier>,
+}
+
+#[repr(u8)]
+enum AuthorityRequestPhase {
+    Open = 0,
+    Cancelled = 1,
+    CommitAttempted = 2,
 }
 
 impl AuthorityRequestContext {
     pub(crate) fn new(deadline: Instant) -> Self {
         Self {
             deadline,
-            cancelled: Arc::new(AtomicBool::new(false)),
-            commit_attempted: Arc::new(AtomicBool::new(false)),
+            cancel_requested: Arc::new(AtomicBool::new(false)),
+            phase: Arc::new(AtomicU8::new(AuthorityRequestPhase::Open as u8)),
+            #[cfg(test)]
+            before_commit_claim: Arc::new(std::sync::Mutex::new(None)),
+            #[cfg(test)]
+            after_commit_claim: Arc::new(std::sync::Mutex::new(None)),
         }
     }
 
     pub(crate) fn cancel(&self) {
-        self.cancelled.store(true, Ordering::Release);
+        self.cancel_requested.store(true, Ordering::Release);
+        self.cancel_open_request();
     }
 
     pub(crate) fn is_cancelled_or_expired(&self) -> bool {
@@ -49,11 +72,15 @@ impl AuthorityRequestContext {
     }
 
     fn must_rollback(&self) -> bool {
-        self.cancelled.load(Ordering::Acquire) || Instant::now() >= self.deadline
+        if self.cancel_requested.load(Ordering::Acquire) || Instant::now() >= self.deadline {
+            self.cancel_open_request();
+            return true;
+        }
+        self.phase.load(Ordering::Acquire) == AuthorityRequestPhase::Cancelled as u8
     }
 
     fn remaining_timeout_millis(&self) -> Option<u64> {
-        if self.cancelled.load(Ordering::Acquire) {
+        if self.must_rollback() {
             return None;
         }
         let remaining = self.deadline.checked_duration_since(Instant::now())?;
@@ -61,8 +88,40 @@ impl AuthorityRequestContext {
         (millis > 0).then_some(millis)
     }
 
-    fn begin_commit(&self) {
-        self.commit_attempted.store(true, Ordering::Release);
+    /// Atomically choose the pre-COMMIT winner. Cancellation observed before
+    /// the post-CAS check rolls the transaction back; after that check the
+    /// commit owner has won and any cancellation is resolved as ambiguous.
+    fn try_begin_commit(&self) -> bool {
+        if self.must_rollback() {
+            return false;
+        }
+        #[cfg(test)]
+        self.wait_at_commit_barrier(&self.before_commit_claim);
+        if self
+            .phase
+            .compare_exchange(
+                AuthorityRequestPhase::Open as u8,
+                AuthorityRequestPhase::CommitAttempted as u8,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            )
+            .is_err()
+        {
+            return false;
+        }
+        if self.cancel_requested.load(Ordering::Acquire) || Instant::now() >= self.deadline {
+            let changed = self.phase.compare_exchange(
+                AuthorityRequestPhase::CommitAttempted as u8,
+                AuthorityRequestPhase::Cancelled as u8,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            );
+            debug_assert!(changed.is_ok(), "request commit claim changed unexpectedly");
+            return false;
+        }
+        #[cfg(test)]
+        self.wait_at_commit_barrier(&self.after_commit_claim);
+        true
     }
 
     /// A serialization or deadlock error returned by PostgreSQL from COMMIT
@@ -70,7 +129,16 @@ impl AuthorityRequestContext {
     /// the closed transaction is replayed so an exhausted definite retry is
     /// not mislabeled as an unknown commit result by the HTTP owner.
     fn reset_after_definite_commit_failure(&self) {
-        self.commit_attempted.store(false, Ordering::Release);
+        let reset = self.phase.compare_exchange(
+            AuthorityRequestPhase::CommitAttempted as u8,
+            AuthorityRequestPhase::Open as u8,
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        );
+        debug_assert!(reset.is_ok(), "only a claimed COMMIT attempt can reset");
+        if self.cancel_requested.load(Ordering::Acquire) || Instant::now() >= self.deadline {
+            self.cancel_open_request();
+        }
     }
 
     /// True after COMMIT may have reached PostgreSQL. Even when the blocking
@@ -78,7 +146,54 @@ impl AuthorityRequestContext {
     /// before that result crosses the executor channel; such a response must
     /// still close and let exact replay resolve what the client observed.
     pub(crate) fn commit_was_attempted(&self) -> bool {
-        self.commit_attempted.load(Ordering::Acquire)
+        self.phase.load(Ordering::Acquire) == AuthorityRequestPhase::CommitAttempted as u8
+    }
+
+    fn cancel_open_request(&self) {
+        let _ = self.phase.compare_exchange(
+            AuthorityRequestPhase::Open as u8,
+            AuthorityRequestPhase::Cancelled as u8,
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        );
+    }
+
+    #[cfg(test)]
+    pub(crate) fn pause_before_commit_claim_for_test(
+        &self,
+        entered: Arc<std::sync::Barrier>,
+        release: Arc<std::sync::Barrier>,
+    ) {
+        *self
+            .before_commit_claim
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) =
+            Some(CommitClaimBarrier { entered, release });
+    }
+
+    #[cfg(test)]
+    pub(crate) fn pause_after_commit_claim_for_test(
+        &self,
+        entered: Arc<std::sync::Barrier>,
+        release: Arc<std::sync::Barrier>,
+    ) {
+        *self
+            .after_commit_claim
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) =
+            Some(CommitClaimBarrier { entered, release });
+    }
+
+    #[cfg(test)]
+    fn wait_at_commit_barrier(&self, barrier: &std::sync::Mutex<Option<CommitClaimBarrier>>) {
+        let barrier = barrier
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone();
+        if let Some(barrier) = barrier {
+            barrier.entered.wait();
+            barrier.release.wait();
+        }
     }
 }
 
@@ -404,17 +519,12 @@ impl Store {
                         transaction.rollback().map_err(AttemptFailure::Rollback)?;
                         Ok(AuthorityRequestDisposition::Reject(value))
                     }
-                    Ok(AuthorityRequestDisposition::Commit(_value))
-                        if request.is_some_and(AuthorityRequestContext::must_rollback) =>
-                    {
-                        transaction.rollback().map_err(AttemptFailure::Rollback)?;
-                        Err(AttemptFailure::Application(ApiError::unavailable(
-                            "runtime authority request was cancelled or exceeded its deadline",
-                        )))
-                    }
                     Ok(AuthorityRequestDisposition::Commit(value)) => {
-                        if let Some(request) = request {
-                            request.begin_commit();
+                        if request.is_some_and(|request| !request.try_begin_commit()) {
+                            transaction.rollback().map_err(AttemptFailure::Rollback)?;
+                            return Err(AttemptFailure::Application(ApiError::unavailable(
+                                "runtime authority request was cancelled or exceeded its deadline",
+                            )));
                         }
                         match transaction.commit() {
                             Ok(()) => {
@@ -740,17 +850,29 @@ mod request_context_tests {
     fn commit_attempt_stays_visible_to_a_racing_http_deadline() {
         let context = AuthorityRequestContext::new(Instant::now() + Duration::from_secs(1));
         assert!(!context.commit_was_attempted());
-        context.begin_commit();
+        assert!(context.try_begin_commit());
         assert!(context.commit_was_attempted());
     }
 
     #[test]
     fn definite_commit_failure_resets_only_the_failed_attempt() {
         let context = AuthorityRequestContext::new(Instant::now() + Duration::from_secs(1));
-        context.begin_commit();
+        assert!(context.try_begin_commit());
         context.reset_after_definite_commit_failure();
         assert!(!context.commit_was_attempted());
-        context.begin_commit();
+        assert!(context.try_begin_commit());
         assert!(context.commit_was_attempted());
+    }
+
+    #[test]
+    fn definite_commit_failure_does_not_erase_a_racing_cancellation() {
+        let context = AuthorityRequestContext::new(Instant::now() + Duration::from_secs(1));
+        assert!(context.try_begin_commit());
+        context.cancel();
+        assert!(context.commit_was_attempted());
+        context.reset_after_definite_commit_failure();
+        assert!(!context.commit_was_attempted());
+        assert!(context.must_rollback());
+        assert!(!context.try_begin_commit());
     }
 }
