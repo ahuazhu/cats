@@ -1812,22 +1812,26 @@ mod tests {
 
     #[test]
     fn authority_timeout_and_cancellation_cannot_become_empty() {
-        for (behavior, deadline) in [
-            (
-                MetadataReaderBehavior::ReturnAfterDeadline,
-                Instant::now() + Duration::from_millis(100),
-            ),
-            (
-                MetadataReaderBehavior::CancelDuringRead,
-                Instant::now() + Duration::from_secs(5),
-            ),
+        for behavior in [
+            MetadataReaderBehavior::ReturnAfterDeadline,
+            MetadataReaderBehavior::CancelDuringRead,
         ] {
             let environment = TestEnvironment::new();
             let (reader, calls) = recording_metadata_reader(behavior);
+            let probe = metadata_probe(&environment, reader);
+            // Start the absolute deadline only after all fixture and probe
+            // construction. Under the full parallel suite those operations
+            // may be descheduled long enough to consume a deadline created in
+            // the loop initializer, which would legitimately stop before the
+            // reader and weaken this late-authority-result oracle.
+            let deadline = Instant::now()
+                + match behavior {
+                    MetadataReaderBehavior::ReturnAfterDeadline => Duration::from_secs(2),
+                    MetadataReaderBehavior::CancelDuringRead => Duration::from_secs(5),
+                    _ => unreachable!("the test iterates only cancellation behaviors"),
+                };
             let scan_context = context_until(deadline);
-            let error = metadata_probe(&environment, reader)
-                .prove_absent(&scan_context)
-                .unwrap_err();
+            let error = probe.prove_absent(&scan_context).unwrap_err();
             let error = format!("{error:#}");
             assert!(
                 error.contains("deadline") || error.contains("cancelled"),
