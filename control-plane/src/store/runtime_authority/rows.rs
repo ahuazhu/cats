@@ -572,6 +572,29 @@ pub(super) fn takeover_authorization_route_for_intent(
     Ok(Some(Id::new(event_id).ok_or_else(|| corrupt(()))?))
 }
 
+/// Distinguishes the only ordinary miss after the exact routing predicate:
+/// an authorization that is immutably owned by another Node. This query does
+/// not decode or lock the protected authority payload. Absence, or any other
+/// projection mismatch for the authenticated Node, remains stored corruption.
+pub(super) fn takeover_authorization_is_owned_by_other_node(
+    transaction: &mut Transaction<'_>,
+    authorization_id: &Id,
+    authenticated_node_id: &Id,
+) -> AuthorityTxResult<bool> {
+    transaction
+        .query_one(
+            "SELECT EXISTS(
+                 SELECT 1
+                   FROM volume_authorizations
+                  WHERE authorization_id=$1
+                    AND authorized_node_id<>$2
+             )",
+            &[&authorization_id.as_str(), &authenticated_node_id.as_str()],
+        )?
+        .try_get(0)
+        .map_err(Into::into)
+}
+
 /// Locks and decodes the same bounded takeover row after its HostFenceEvent
 /// serialization point has been acquired.  Repeating the access predicate at
 /// the authority read prevents a routing hint from becoming an authorization

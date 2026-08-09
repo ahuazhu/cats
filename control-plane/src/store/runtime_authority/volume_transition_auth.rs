@@ -24,8 +24,8 @@ use super::product::{DiskAdminState, DiskRecord, DiskRole};
 use super::product_rows::{load_desired_for_update, load_disk_by_id_for_update};
 use super::rows::{
     database_now, load_event_for_update, load_takeover_authorization_for_intent_update,
-    load_volume_for_update, takeover_authorization_route_for_intent, update_authorization,
-    update_volume,
+    load_volume_for_update, takeover_authorization_is_owned_by_other_node,
+    takeover_authorization_route_for_intent, update_authorization, update_volume,
 };
 use super::runtime_spine::{lock_volume_mutation_admission_in, VolumeMutationAdmissionRejection};
 use super::volume_transition_evidence::{
@@ -286,10 +286,17 @@ fn lock_takeover_mutation_context<'transaction, 'connection>(
         desired.placement.placement_epoch,
     )?
     else {
-        return Ok(authorization_rejected(
-            request.authorization_id.clone(),
-            RuntimeVolumeAuthorizationRejection::InvalidAuthorization,
-        ));
+        if takeover_authorization_is_owned_by_other_node(
+            transaction,
+            &request.authorization_id,
+            &node_id,
+        )? {
+            return Ok(authorization_rejected(
+                request.authorization_id.clone(),
+                RuntimeVolumeAuthorizationRejection::InvalidAuthorization,
+            ));
+        }
+        return Err(AuthorityError::BackendUnknown.into());
     };
 
     // Canonical protected suffix: HostFenceEvent -> AuthorizationRecord ->
@@ -298,7 +305,7 @@ fn lock_takeover_mutation_context<'transaction, 'connection>(
     // here after Volume as required by the global DAG.
     let event =
         load_event_for_update(transaction, &event_id)?.ok_or(AuthorityError::BackendUnknown)?;
-    let Some(authorization) = load_takeover_authorization_for_intent_update(
+    let authorization = load_takeover_authorization_for_intent_update(
         transaction,
         &request.authorization_id,
         &node_id,
@@ -306,12 +313,7 @@ fn lock_takeover_mutation_context<'transaction, 'connection>(
         desired.desired_revision,
         desired.placement.placement_epoch,
     )?
-    else {
-        return Ok(authorization_rejected(
-            request.authorization_id.clone(),
-            RuntimeVolumeAuthorizationRejection::InvalidAuthorization,
-        ));
-    };
+    .ok_or(AuthorityError::BackendUnknown)?;
     let VolumeAuthorization::Takeover(payload) = &authorization.authorization else {
         return Err(AuthorityError::BackendUnknown.into());
     };
@@ -319,7 +321,7 @@ fn lock_takeover_mutation_context<'transaction, 'connection>(
         return Err(AuthorityError::BackendUnknown.into());
     }
     if !takeover_payload_matches_current_intent(payload, &node_id, &desired, &intent, request) {
-        return Ok(volume_intent_rejected(request));
+        return Err(AuthorityError::BackendUnknown.into());
     }
 
     let volume = load_volume_for_update(transaction, &intent.volume_id)?
@@ -327,17 +329,17 @@ fn lock_takeover_mutation_context<'transaction, 'connection>(
     let disk = load_disk_by_id_for_update(transaction, &intent.disk_id)?;
     let locked_desired = load_desired_for_update(transaction, &request.cat_id)?;
     let (Some(disk), Some(locked_desired)) = (disk, locked_desired) else {
-        return Ok(volume_intent_rejected(request));
+        return Err(AuthorityError::BackendUnknown.into());
     };
     if locked_desired != desired {
         return Err(AuthorityError::BackendUnknown.into());
     }
     let Some(locked_intent) = takeover_intent(&locked_desired, &request.authorization_id)?.cloned()
     else {
-        return Ok(volume_intent_rejected(request));
+        return Err(AuthorityError::BackendUnknown.into());
     };
     if locked_intent != intent || !disk_and_volume_match_intent(&disk, &volume, &desired, &intent) {
-        return Ok(volume_intent_rejected(request));
+        return Err(AuthorityError::BackendUnknown.into());
     }
 
     Ok(VolumeTransitionStoreOutcome::Accepted(

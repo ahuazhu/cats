@@ -595,6 +595,30 @@ fn stored_volume_row(store: &Store, volume_id: &Id) -> String {
         .unwrap()
 }
 
+fn stored_takeover_graph(store: &Store) -> String {
+    store
+        .with(|client| {
+            client
+                .query_one(
+                    "SELECT jsonb_build_object(
+                         'event', (SELECT to_jsonb(row) FROM host_fence_events row
+                                    WHERE event_id='fence-event-1'),
+                         'authorization', (SELECT to_jsonb(row) FROM volume_authorizations row
+                                            WHERE authorization_id='takeover-auth-1'),
+                         'volume', (SELECT to_jsonb(row) FROM volume_records row
+                                    WHERE volume_id='volume-1'),
+                         'disk', (SELECT to_jsonb(row) FROM disk_records row
+                                  WHERE disk_id='disk-1'),
+                         'desired', (SELECT to_jsonb(row) FROM desired_runtime_specs row
+                                     WHERE cat_id='cat-1')
+                     )::text",
+                    &[],
+                )
+                .map(|row| row.get(0))
+        })
+        .unwrap()
+}
+
 fn rewrite_desired_in(
     transaction: &mut postgres::Transaction<'_>,
     desired: &DesiredRuntimeSpec,
@@ -1367,7 +1391,7 @@ fn stale_takeover_inventory_is_a_closed_zero_write_precondition() {
 }
 
 #[test]
-fn mismatched_disk_and_intent_each_reject_before_authority_writes() {
+fn request_intent_mismatch_is_409_but_stored_disk_cross_binding_is_fatal() {
     let store = Store::connect(&crate::testsupport::isolated_control_store_url(), None).unwrap();
     let owned = acquire_owned_volume(&store);
     let event = host_fence_event(HostFenceEventState::Active);
@@ -1415,26 +1439,90 @@ fn mismatched_disk_and_intent_each_reject_before_authority_writes() {
                 .map(|_| ())
         })
         .unwrap();
-    assert_eq!(
-        store
-            .runtime_consume_volume_takeover(
-                &node.authenticated,
-                &request,
-                &node.active_guest_config_digest,
-            )
-            .unwrap(),
-        VolumeTransitionStoreOutcome::Rejected(
-            VolumeTransitionStoreRejection::TransitionPreconditionFailed {
-                cat_id: desired.cat_id,
-                problem: RuntimeVolumeTransitionPreconditionProblem::VolumeIntentMismatch,
-            }
+    let error = store
+        .runtime_consume_volume_takeover(
+            &node.authenticated,
+            &request,
+            &node.active_guest_config_digest,
         )
-    );
+        .unwrap_err();
+    assert_eq!(error.code, ErrorCode::Internal);
     assert_eq!(stored_volume_row(&store, &owned.volume_id), before_volume);
     assert_eq!(
         stored_authorization_row(&store, &id("takeover-auth-1")),
         before_authorization
     );
+}
+
+#[test]
+fn referenced_takeover_graph_corruption_is_fatal_and_never_mutates_authority() {
+    #[derive(Debug, Clone, Copy)]
+    enum Corruption {
+        MissingAuthorization,
+        HiddenAuthorizationIntentProjection,
+        AuthorizationIntentCrossBinding,
+        MissingDisk,
+    }
+
+    for corruption in [
+        Corruption::MissingAuthorization,
+        Corruption::HiddenAuthorizationIntentProjection,
+        Corruption::AuthorizationIntentCrossBinding,
+        Corruption::MissingDisk,
+    ] {
+        let store =
+            Store::connect(&crate::testsupport::isolated_control_store_url(), None).unwrap();
+        let owned = acquire_owned_volume(&store);
+        let event = host_fence_event(HostFenceEventState::Active);
+        let authorization = takeover_authorization(&owned);
+        seed_takeover(&store, &event, &authorization);
+        let node = transition_node(&store, "node-new");
+        let desired = prepare_takeover_runtime(&store, &node, &id("takeover-auth-1"));
+        let request = takeover_consume_request(&node, &desired, &id("takeover-auth-1"));
+
+        store
+            .with(|client| {
+                let changed = match corruption {
+                    Corruption::MissingAuthorization => client.execute(
+                        "DELETE FROM volume_authorizations WHERE authorization_id=$1",
+                        &[&"takeover-auth-1"],
+                    )?,
+                    Corruption::HiddenAuthorizationIntentProjection => client.execute(
+                        "UPDATE volume_authorizations
+                            SET volume_id='volume-other'
+                          WHERE authorization_id=$1",
+                        &[&"takeover-auth-1"],
+                    )?,
+                    Corruption::AuthorizationIntentCrossBinding => client.execute(
+                        "UPDATE volume_authorizations
+                            SET record=jsonb_set(
+                                record,
+                                '{authorization,new_attachment_id}',
+                                to_jsonb('attachment-other'::text)
+                            )
+                          WHERE authorization_id=$1",
+                        &[&"takeover-auth-1"],
+                    )?,
+                    Corruption::MissingDisk => {
+                        client.execute("DELETE FROM disk_records WHERE disk_id=$1", &[&"disk-1"])?
+                    }
+                };
+                assert_eq!(changed, 1, "corruption probe did not match: {corruption:?}");
+                Ok(())
+            })
+            .unwrap();
+        let before = stored_takeover_graph(&store);
+
+        let error = store
+            .runtime_consume_volume_takeover(
+                &node.authenticated,
+                &request,
+                &node.active_guest_config_digest,
+            )
+            .unwrap_err();
+        assert_eq!(error.code, ErrorCode::Internal, "{corruption:?}");
+        assert_eq!(stored_takeover_graph(&store), before, "{corruption:?}");
+    }
 }
 
 #[test]
