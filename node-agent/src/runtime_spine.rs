@@ -5,10 +5,16 @@
 //! [`RuntimeSpineAttempt::RetryExact`]; the adapter never manufactures a new
 //! domain sequence after an ambiguous outcome.
 
+mod runner;
 mod state;
 
+pub use runner::{
+    CompleteRuntimeInventory, RuntimeInventoryKeyRing, RuntimeInventoryScanContext,
+    RuntimeInventoryScanOutcome, RuntimeInventoryScanner, RuntimeSpineRunError,
+    RuntimeSpineRunRetry, RuntimeSpineRunStep, RuntimeSpineRunner,
+};
 pub use state::{
-    DurableRuntimeSpineRequest, RuntimeSpineDesiredWork, RuntimeSpineJournal,
+    DurableRuntimeSpineRequest, RuntimeSpineDesiredWork, RuntimeSpineFullScan, RuntimeSpineJournal,
     RuntimeSpineJournalError,
 };
 

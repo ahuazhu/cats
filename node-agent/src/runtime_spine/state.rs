@@ -94,6 +94,16 @@ pub enum RuntimeSpineDesiredWork {
     Scan(DesiredReadSnapshot),
 }
 
+/// Exact local coordinates a complete physical scan must bind before it can
+/// become a durable `NodeObservation` request.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RuntimeSpineFullScan {
+    pub session: SessionBinding,
+    pub heartbeat_sequence: Sequence,
+    pub inventory_epoch: Epoch,
+    pub desired: DesiredReadSnapshot,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct AcceptedObservationRecord {
@@ -137,12 +147,30 @@ impl RuntimeSpineJournal {
         state_directory: &StateDirectory,
         registered_session: AgentSession,
     ) -> Result<Self, RuntimeSpineJournalError> {
+        Self::open_inner(state_directory, registered_session, false)
+    }
+
+    pub(super) fn open_exclusive(
+        state_directory: &StateDirectory,
+        registered_session: AgentSession,
+    ) -> Result<Self, RuntimeSpineJournalError> {
+        Self::open_inner(state_directory, registered_session, true)
+    }
+
+    fn open_inner(
+        state_directory: &StateDirectory,
+        registered_session: AgentSession,
+        exclusive: bool,
+    ) -> Result<Self, RuntimeSpineJournalError> {
         validate_session(&registered_session, "registered session")?;
         let parent = state_directory.try_clone_directory().map_err(|source| {
             io_error("clone Node state directory", state_directory.path(), source)
         })?;
         let path = state_directory.path().join(DIRECTORY_NAME);
         let directory = ensure_directory(&parent, &path)?;
+        if exclusive {
+            lock_directory(&directory, &path)?;
+        }
         let mut journal = Self {
             directory,
             path,
@@ -172,6 +200,43 @@ impl RuntimeSpineJournal {
         self.full_observation
             .as_ref()
             .map(|record| (&record.observation, &record.acceptance))
+    }
+
+    pub fn pending_observation(&self) -> Option<DurableRuntimeSpineRequest<NodeObservation>> {
+        self.pending_observation.clone()
+    }
+
+    pub fn full_scan(&self) -> Result<RuntimeSpineFullScan, RuntimeSpineJournalError> {
+        if self.pending_observation.is_some() {
+            return Err(RuntimeSpineJournalError::Transition(
+                "a physical scan cannot replace a pending observation",
+            ));
+        }
+        let desired =
+            self.desired_snapshot
+                .as_ref()
+                .ok_or(RuntimeSpineJournalError::Transition(
+                    "a physical scan has no Desired snapshot",
+                ))?;
+        if self.desired_is_consumed(desired) || self.desired_is_invalidated(desired) {
+            return Err(RuntimeSpineJournalError::Transition(
+                "a physical scan cannot reuse a consumed or invalidated Desired snapshot",
+            ));
+        }
+        let heartbeat_sequence = match &self.last_observation {
+            Some(last) => checked_next(last.acceptance.heartbeat_sequence)?,
+            None => Sequence::new(1).expect("one is a valid Sequence"),
+        };
+        let inventory_epoch = match &self.full_observation {
+            Some(full) => checked_next_epoch(full.observation.inventory_epoch)?,
+            None => Epoch::new(1).expect("one is a valid Epoch"),
+        };
+        Ok(RuntimeSpineFullScan {
+            session: session_binding(&self.session),
+            heartbeat_sequence,
+            inventory_epoch,
+            desired: desired.clone(),
+        })
     }
 
     /// Returns the exact pending request, the unconsumed snapshot to scan, or
@@ -801,6 +866,22 @@ impl RuntimeSpineJournal {
     }
 }
 
+fn lock_directory(directory: &File, path: &Path) -> Result<(), RuntimeSpineJournalError> {
+    // SAFETY: the directory owns a live descriptor and `flock` neither keeps
+    // a pointer nor transfers descriptor ownership. The lock follows this
+    // open file description and is released when the lane guard is dropped.
+    let result = unsafe { libc::flock(directory.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
+    if result == 0 {
+        Ok(())
+    } else {
+        Err(io_error(
+            "lock runtime-spine journal",
+            path,
+            io::Error::last_os_error(),
+        ))
+    }
+}
+
 fn validate_assigned_coverage(
     snapshot: &DesiredReadSnapshot,
     observation: &NodeObservation,
@@ -1374,6 +1455,59 @@ mod tests {
         let canonical = encode_desired_read_snapshot(&desired).unwrap();
         assert_eq!(canonical, SNAPSHOT);
         journal.accept_desired(desired, &canonical).unwrap();
+    }
+
+    #[test]
+    fn full_scan_coordinates_are_successors_and_pending_observation_wins() {
+        let root = tempfile::tempdir().unwrap();
+        let state = state_directory(&root);
+        let registered = session();
+        let mut journal = RuntimeSpineJournal::open(&state, registered.clone()).unwrap();
+        journal.desired_work().unwrap();
+        let first_desired = snapshot();
+        journal
+            .accept_desired(first_desired.clone(), SNAPSHOT)
+            .unwrap();
+
+        let first_scan = journal.full_scan().unwrap();
+        assert_eq!(first_scan.session, session_binding(&registered));
+        assert_eq!(first_scan.heartbeat_sequence.get(), 1);
+        assert_eq!(first_scan.inventory_epoch.get(), 1);
+        assert_eq!(first_scan.desired, first_desired);
+
+        let first_observation = full_observation(&registered, &first_scan.desired);
+        journal
+            .prepare_observation(first_observation.clone())
+            .unwrap();
+        assert!(matches!(
+            journal.full_scan(),
+            Err(RuntimeSpineJournalError::Transition(
+                "a physical scan cannot replace a pending observation"
+            ))
+        ));
+        let first_acceptance = acceptance(&registered, &first_observation);
+        let first_response = encode_observation_acceptance(&first_acceptance).unwrap();
+        journal
+            .accept_observation(first_acceptance, &first_response)
+            .unwrap();
+
+        let RuntimeSpineDesiredWork::Request(request) = journal.desired_work().unwrap() else {
+            panic!("an accepted full scan must consume its Desired snapshot")
+        };
+        let mut next_desired = first_scan.desired;
+        next_desired.request_sequence = request.value().request_sequence;
+        next_desired.read_position = Sequence::new(13).unwrap();
+        next_desired.issued_at_unix_ms = UnixMillis::new(1_720_000_010_000).unwrap();
+        next_desired.expires_at_unix_ms = UnixMillis::new(1_720_000_040_000).unwrap();
+        let next_bytes = encode_desired_read_snapshot(&next_desired).unwrap();
+        journal
+            .accept_desired(next_desired.clone(), &next_bytes)
+            .unwrap();
+
+        let next_scan = journal.full_scan().unwrap();
+        assert_eq!(next_scan.heartbeat_sequence.get(), 2);
+        assert_eq!(next_scan.inventory_epoch.get(), 2);
+        assert_eq!(next_scan.desired, next_desired);
     }
 
     #[test]
