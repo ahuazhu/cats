@@ -71,10 +71,6 @@ fn identity(number: u64) -> NodeIdentity {
     }
 }
 
-fn public_key_identity(number: u64) -> NodeIdentity {
-    identity(number)
-}
-
 fn authenticated(identity: &NodeIdentity) -> AuthenticatedNodeCredential {
     AuthenticatedNodeCredential::new(
         identity.credential_id.clone(),

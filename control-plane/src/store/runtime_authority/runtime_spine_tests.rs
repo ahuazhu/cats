@@ -1175,6 +1175,79 @@ fn provisioned_node_id_page_strictly_decodes_every_returned_projection() {
 }
 
 #[test]
+fn signed_liveness_uses_the_renewed_session_and_exact_replay_does_not_renew_again() {
+    let (store, identity, authenticated, _policy, session) = fixture();
+    let initial = store.list_runtime_node_liveness_after(None).unwrap();
+    assert_eq!(initial.nodes.len(), 1);
+    assert_eq!(initial.nodes[0].node_id, identity.node_id);
+    assert!(initial.nodes[0].live);
+    assert_eq!(
+        initial.nodes[0].lease_deadline_unix_ms,
+        Some(session.lease_deadline_unix_ms)
+    );
+    assert_eq!(initial.nodes[0].last_accepted_observation_at_unix_ms, None);
+
+    // Ensure the fixed 60-second candidate is observably later than the
+    // registration transaction's initial deadline.
+    std::thread::sleep(Duration::from_millis(10));
+    let request = cats_api::runtime_reconciliation::DesiredReadRequest {
+        version: ContractVersion::V1,
+        session: binding(&session),
+        request_sequence: Sequence::new(1).unwrap(),
+    };
+    let snapshot = accepted(
+        store
+            .runtime_desired_read(&authenticated, &request)
+            .unwrap(),
+    );
+    let full = observation(
+        &store,
+        &session,
+        1,
+        1,
+        true,
+        Some(snapshot.read_position),
+        Vec::new(),
+    );
+    let acceptance = accepted(
+        store
+            .runtime_accept_observation(&authenticated, &full)
+            .unwrap(),
+    );
+    assert!(acceptance.lease_deadline_unix_ms > session.lease_deadline_unix_ms);
+
+    let renewed = store.list_runtime_node_liveness_after(None).unwrap();
+    assert_eq!(renewed.nodes.len(), 1);
+    assert!(renewed.nodes[0].live);
+    assert_eq!(
+        renewed.nodes[0].lease_deadline_unix_ms,
+        Some(acceptance.lease_deadline_unix_ms)
+    );
+    assert_eq!(
+        renewed.nodes[0].last_accepted_observation_at_unix_ms,
+        Some(acceptance.accepted_at_unix_ms)
+    );
+
+    assert_eq!(
+        accepted(
+            store
+                .runtime_accept_observation(&authenticated, &full)
+                .unwrap()
+        ),
+        acceptance
+    );
+    let after_replay = store.list_runtime_node_liveness_after(None).unwrap();
+    assert_eq!(
+        after_replay.nodes[0].lease_deadline_unix_ms,
+        renewed.nodes[0].lease_deadline_unix_ms
+    );
+    assert_eq!(
+        after_replay.nodes[0].last_accepted_observation_at_unix_ms,
+        renewed.nodes[0].last_accepted_observation_at_unix_ms
+    );
+}
+
+#[test]
 fn desired_inventory_replay_partial_replacement_and_read_snapshots_are_closed() {
     let (store, identity, authenticated, policy, session1) = fixture();
     let request1 = cats_api::runtime_reconciliation::DesiredReadRequest {

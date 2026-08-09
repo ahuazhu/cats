@@ -12,7 +12,7 @@ use cats_api::runtime_reconciliation::GuestRuntimeProfileReceipt;
 use cats_metering::{CreditStore, UsageStore};
 use cats_storage::{BlobStore, MetadataStore};
 
-use crate::controller::{AutoTierPolicy, Controller};
+use crate::controller::{AutoTierPolicy, Controller, NodeLivenessAuthority};
 use crate::store::{DsnSource, ObservationStoreLane, SingletonRole, Store};
 
 const SINGLETON_ELECTION_RETRY: Duration = Duration::from_millis(500);
@@ -390,6 +390,17 @@ async fn run_reconciler_role(controller: Arc<Controller>, store: Arc<Store>, int
 
 /// Start the control plane inside the current tokio runtime.
 pub async fn spawn(cfg: Config) -> anyhow::Result<Handle> {
+    spawn_inner(cfg, false).await
+}
+
+/// Pre-cutover integration harness. The shipped daemon calls [`spawn`], whose
+/// production route map has no legacy heartbeat.
+#[doc(hidden)]
+pub async fn spawn_with_legacy_heartbeat_for_tests(cfg: Config) -> anyhow::Result<Handle> {
+    spawn_inner(cfg, true).await
+}
+
+async fn spawn_inner(cfg: Config, legacy_heartbeat_for_tests: bool) -> anyhow::Result<Handle> {
     anyhow::ensure!(
         !cfg.auth_token.is_empty(),
         "service token must not be empty"
@@ -475,13 +486,18 @@ pub async fn spawn(cfg: Config) -> anyhow::Result<Handle> {
         ),
     );
     let notify = Arc::new(tokio::sync::Notify::new());
-    let controller = Controller::new(
+    let controller = Controller::new_with_liveness_authority(
         store.clone(),
         storage_meta.clone(),
         notify.clone(),
         cfg.node_lease_timeout_ms,
         cfg.auth_token.clone(),
         cfg.auto_tier_policy,
+        if legacy_heartbeat_for_tests {
+            NodeLivenessAuthority::LegacyHeartbeatForTests
+        } else {
+            NodeLivenessAuthority::SignedSession
+        },
     );
     let state = AppState {
         store,
@@ -501,7 +517,11 @@ pub async fn spawn(cfg: Config) -> anyhow::Result<Handle> {
         .await
         .with_context(|| format!("bind {}", cfg.listen))?;
     let addr = listener.local_addr()?;
-    let app = crate::api::router(state.clone());
+    let app = if legacy_heartbeat_for_tests {
+        crate::api::router_with_legacy_heartbeat_for_tests(state.clone())
+    } else {
+        crate::api::router(state.clone())
+    };
     let server_task = tokio::spawn(async move {
         if let Err(e) = axum::serve(listener, app).await {
             tracing::error!("control plane server exited: {e}");

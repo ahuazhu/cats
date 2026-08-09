@@ -1,7 +1,9 @@
 use super::*;
 use std::sync::Arc;
 
-pub(super) async fn heartbeat(
+/// Pre-cutover heartbeat behavior retained only for the explicit legacy test
+/// router. The production router never installs this handler.
+pub(super) async fn legacy_heartbeat_for_tests(
     State(state): State<AppState>,
     headers: HeaderMap,
     Json(req): Json<HeartbeatRequest>,

@@ -24,6 +24,12 @@ use futures_util::StreamExt;
 
 use crate::store::{now_ms, Store};
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum NodeLivenessAuthority {
+    SignedSession,
+    LegacyHeartbeatForTests,
+}
+
 /// How many Cats one reconcile tick drives at once.
 ///
 /// Bounded because each one holds a node-agent request open for the length of a
@@ -48,6 +54,7 @@ pub struct Controller {
     pub node_lease_timeout_ms: i64,
     pub auth_token: String,
     pub auto_tier_policy: AutoTierPolicy,
+    node_liveness_authority: NodeLivenessAuthority,
     /// A freshly started control plane gives persisted Nodes two lease
     /// intervals to reconnect. The second interval covers the worker's
     /// in-flight request timeout during a Recreate deployment gap.
@@ -84,6 +91,26 @@ impl Controller {
         auth_token: String,
         auto_tier_policy: AutoTierPolicy,
     ) -> Arc<Self> {
+        Self::new_with_liveness_authority(
+            store,
+            storage_meta,
+            notify,
+            node_lease_timeout_ms,
+            auth_token,
+            auto_tier_policy,
+            NodeLivenessAuthority::SignedSession,
+        )
+    }
+
+    pub(crate) fn new_with_liveness_authority(
+        store: Arc<Store>,
+        storage_meta: Arc<dyn MetadataStore>,
+        notify: Arc<tokio::sync::Notify>,
+        node_lease_timeout_ms: i64,
+        auth_token: String,
+        auto_tier_policy: AutoTierPolicy,
+        node_liveness_authority: NodeLivenessAuthority,
+    ) -> Arc<Self> {
         Arc::new(Self {
             store,
             storage_meta,
@@ -95,6 +122,7 @@ impl Controller {
             node_lease_timeout_ms,
             auth_token,
             auto_tier_policy,
+            node_liveness_authority,
             node_fencing_starts_at_ms: now_ms()
                 .saturating_add(node_lease_timeout_ms.max(0).saturating_mul(2)),
             attempts: Mutex::new(HashMap::new()),
@@ -224,6 +252,47 @@ impl Controller {
     // ------------------------------------------------------------------
 
     async fn detect_lost_nodes(&self) -> anyhow::Result<()> {
+        if self.node_liveness_authority == NodeLivenessAuthority::SignedSession {
+            return self.observe_signed_node_liveness().await;
+        }
+        self.detect_legacy_lost_nodes_for_tests().await
+    }
+
+    /// Production liveness is the current signed AgentSession deadline,
+    /// evaluated against the PostgreSQL clock. Expiry closes admission but is
+    /// not Host fencing, so this observer never rewrites legacy Node/Cat rows
+    /// or revokes storage claims.
+    async fn observe_signed_node_liveness(&self) -> anyhow::Result<()> {
+        let mut after = None;
+        loop {
+            let page_after = after.clone();
+            let page = self
+                .store
+                .execute(move |store| store.list_runtime_node_liveness_after(page_after.as_ref()))
+                .await?;
+            for node in page.nodes {
+                if node.live {
+                    continue;
+                }
+                tracing::warn!(
+                    node = %node.node_id,
+                    session = ?node.session,
+                    lease_deadline_unix_ms = ?node.lease_deadline_unix_ms.map(|value| value.get()),
+                    evaluated_at_unix_ms = node.evaluated_at_unix_ms.get(),
+                    last_accepted_observation_at_unix_ms = ?node.last_accepted_observation_at_unix_ms.map(|value| value.get()),
+                    "signed Node session is absent or expired; admission remains closed until a current session accepts a new observation"
+                );
+            }
+            let Some(next_after) = page.next_after else {
+                return Ok(());
+            };
+            after = Some(next_after);
+        }
+    }
+
+    /// Explicit compatibility harness for pre-cutover integration tests. The
+    /// production server never selects this legacy heartbeat authority.
+    async fn detect_legacy_lost_nodes_for_tests(&self) -> anyhow::Result<()> {
         let now = now_ms();
         if now < self.node_fencing_starts_at_ms {
             return Ok(());

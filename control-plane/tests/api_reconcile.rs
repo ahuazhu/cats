@@ -21,7 +21,7 @@ use cats_api::nodejob::{NodeJob, NodeJobAction, NodeJobResult, StopCatDispositio
 use cats_api::requests::*;
 use cats_api::resources::*;
 use cats_control_plane::controller::AutoTierPolicy;
-use cats_control_plane::server::{spawn, Config, Handle};
+use cats_control_plane::server::{spawn_with_legacy_heartbeat_for_tests as spawn, Config, Handle};
 use cats_control_plane::store::{DsnSource, Store};
 use cats_metadata_store_sqlite::SqliteMetadataStore;
 use cats_metering::{

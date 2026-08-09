@@ -545,7 +545,6 @@ pub fn router(state: AppState) -> Router {
             "/v1/internal/runtime/observations",
             post(runtime_spine::observation).fallback(runtime_spine::observation),
         )
-        .route("/v1/nodes/heartbeat", post(heartbeat))
         .route("/v1/nodes/work-status", post(node_work_status))
         .route("/v1/internal/work/acquire", post(acquire_work))
         .route("/v1/internal/work/release", post(release_work))
@@ -586,6 +585,20 @@ pub fn router(state: AppState) -> Router {
         .route("/v1/routes/wake", post(wake_route_handler))
         .fallback(crate::ui::not_found)
         .with_state(state)
+}
+
+/// Adds the retired shared-bearer heartbeat only for pre-cutover integration
+/// suites. No production composition root calls this function.
+#[doc(hidden)]
+pub fn router_with_legacy_heartbeat_for_tests(state: AppState) -> Router {
+    router(state.clone()).merge(
+        Router::new()
+            .route(
+                "/v1/nodes/heartbeat",
+                post(nodes::legacy_heartbeat_for_tests),
+            )
+            .with_state(state),
+    )
 }
 
 #[cfg(test)]
@@ -742,7 +755,6 @@ POST /v1/internal/runtime/observations
 POST /v1/internal/usage/checkpoints
 POST /v1/internal/work/acquire
 POST /v1/internal/work/release
-POST /v1/nodes/heartbeat
 POST /v1/nodes/work-status
 POST /v1/nodes/{id}/actions/cordon
 POST /v1/routes/wake

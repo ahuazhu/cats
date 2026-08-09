@@ -280,7 +280,6 @@ struct StoredRegistrationAttempt {
 impl Store {
     /// Idempotently inserts a new provisioned identity. It never rewrites an
     /// existing identity, so a retired lineage cannot be revived.
-    #[cfg(test)]
     pub(crate) fn provision_node_identity(&self, identity: &NodeIdentity) -> Result<()> {
         if identity.state != NodeIdentityState::Provisioned {
             return Err(super::ApiError::invalid(

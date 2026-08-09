@@ -385,4 +385,14 @@ async fn admission_order_and_proof_mutations_are_closed() {
             .status(),
         StatusCode::NOT_FOUND
     );
+    assert_eq!(
+        context
+            .client
+            .post(context.url("/v1/nodes/heartbeat"))
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        StatusCode::NOT_FOUND
+    );
 }

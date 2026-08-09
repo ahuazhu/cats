@@ -58,6 +58,28 @@ pub(crate) struct ProvisionedNodeIdPage {
     pub(crate) next_after: Option<Id>,
 }
 
+/// One bounded, PostgreSQL-clock evaluation of signed Node liveness.
+///
+/// This is deliberately separate from the legacy `nodes.last_heartbeat_unix`
+/// projection. A current AgentSession is the only liveness lease, and the
+/// accepted observation timestamp is diagnostic evidence rather than a
+/// second timeout or renewal source.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct RuntimeNodeLiveness {
+    pub(crate) node_id: Id,
+    pub(crate) evaluated_at_unix_ms: UnixMillis,
+    pub(crate) session: Option<SessionBinding>,
+    pub(crate) lease_deadline_unix_ms: Option<UnixMillis>,
+    pub(crate) last_accepted_observation_at_unix_ms: Option<UnixMillis>,
+    pub(crate) live: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct RuntimeNodeLivenessPage {
+    pub(crate) nodes: Vec<RuntimeNodeLiveness>,
+    pub(crate) next_after: Option<Id>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum RuntimeSpineOutcome<T> {
     Accepted(T),
@@ -203,6 +225,51 @@ impl Store {
                     .collect(),
                 next_after,
             })
+        })
+    }
+
+    /// Lists one bounded page evaluated from current signed session and
+    /// observation authority in a single repeatable-read snapshot.
+    ///
+    /// No legacy heartbeat/capacity row is read here. In particular, updating
+    /// `/v1/nodes/heartbeat` state cannot keep an expired signed session live.
+    pub(crate) fn list_runtime_node_liveness_after(
+        &self,
+        after: Option<&Id>,
+    ) -> Result<RuntimeNodeLivenessPage> {
+        self.authority_read_snapshot(|transaction| {
+            let evaluated_at_unix_ms = database_now(transaction)?;
+            let identities = load_provisioned_identities_after(transaction, after)?;
+            let has_more = identities.len() == PROVISIONED_NODE_ID_PAGE_SIZE;
+            let next_after = has_more
+                .then(|| identities.last().map(|identity| identity.node_id.clone()))
+                .flatten();
+            let mut nodes = Vec::with_capacity(identities.len());
+            for identity in identities {
+                let session = load_current_session_unlocked(transaction, &identity.node_id)?;
+                let receive_state =
+                    load_observation_receive_state_unlocked(transaction, &identity.node_id)?;
+                let last_accepted_observation_at_unix_ms = session.as_ref().and_then(|session| {
+                    receive_state.as_ref().and_then(|state| {
+                        (observation_binding(&state.observation) == session_binding(session))
+                            .then_some(state.acceptance.accepted_at_unix_ms)
+                    })
+                });
+                let live = session
+                    .as_ref()
+                    .is_some_and(|session| evaluated_at_unix_ms < session.lease_deadline_unix_ms);
+                nodes.push(RuntimeNodeLiveness {
+                    node_id: identity.node_id,
+                    evaluated_at_unix_ms,
+                    session: session.as_ref().map(session_binding),
+                    lease_deadline_unix_ms: session
+                        .as_ref()
+                        .map(|session| session.lease_deadline_unix_ms),
+                    last_accepted_observation_at_unix_ms,
+                    live,
+                });
+            }
+            Ok(RuntimeNodeLivenessPage { nodes, next_after })
         })
     }
 
@@ -2515,6 +2582,24 @@ fn load_observation_receive_state_for_update(
                     observation_id, accepted_at_unix_ms
                FROM runtime_observation_receive_states
               WHERE node_id=$1 FOR UPDATE",
+            &[&node_id.as_str()],
+        )?
+        .map(|row| decode_observation_receive_state(&row))
+        .transpose()
+}
+
+fn load_observation_receive_state_unlocked(
+    transaction: &mut Transaction<'_>,
+    node_id: &Id,
+) -> AuthorityTxResult<Option<ObservationReceiveState>> {
+    transaction
+        .query_opt(
+            "SELECT observation::text AS observation_json,
+                    acceptance::text AS acceptance_json, node_id, node_boot_id,
+                    agent_instance_id, agent_session_epoch, heartbeat_sequence,
+                    observation_id, accepted_at_unix_ms
+               FROM runtime_observation_receive_states
+              WHERE node_id=$1",
             &[&node_id.as_str()],
         )?
         .map(|row| decode_observation_receive_state(&row))

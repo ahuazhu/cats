@@ -50,36 +50,42 @@ impl Cluster {
         let storage_meta_path = dir.path().join("storage-meta.db");
         let storage_meta: Arc<dyn MetadataStore> =
             Arc::new(SqliteMetadataStore::open(&storage_meta_path).unwrap());
-        let cp = cats_control_plane::server::spawn(cats_control_plane::server::Config {
-            listen: "127.0.0.1:0".into(),
-            control_store_dsn: cats_control_plane::store::DsnSource::Literal(
-                cats_control_plane::testsupport::isolated_control_store_url(),
-            ),
-            control_store_ca_file: None,
-            usage_store: Arc::new(SqliteUsageStore::open(&dir.path().join("control.db")).unwrap()),
-            credit_store: Arc::new(SqliteUsageStore::open(&dir.path().join("control.db")).unwrap()),
-            storage_meta,
-            image_blob: Arc::new(FileBlobStore::open(dir.path().join("image-blob")).unwrap()),
-            auth_token: SERVICE_TOKEN.into(),
-            guest_runtime_profile_receipt:
-                cats_control_plane::testsupport::test_guest_runtime_profile_receipt(),
-            route_grant_signer: Arc::new(
-                cats_control_plane::route_grant::RouteGrantSigner::from_ed25519_pem(
-                    ROUTE_GRANT_PRIVATE_KEY,
-                    ROUTE_GRANT_PUBLIC_KEY,
-                    2,
-                )
-                .unwrap(),
-            ),
-            admin_token: ADMIN_TOKEN.into(),
-            workos: None,
-            stripe: None,
-            billing_enforcement_enabled: false,
-            node_lease_timeout_ms: 3_000,
-            reconcile_interval_ms: 150,
-            oci_deploy_sync_wait_ms: 5_000,
-            auto_tier_policy: Default::default(),
-        })
+        let cp = cats_control_plane::server::spawn_with_legacy_heartbeat_for_tests(
+            cats_control_plane::server::Config {
+                listen: "127.0.0.1:0".into(),
+                control_store_dsn: cats_control_plane::store::DsnSource::Literal(
+                    cats_control_plane::testsupport::isolated_control_store_url(),
+                ),
+                control_store_ca_file: None,
+                usage_store: Arc::new(
+                    SqliteUsageStore::open(&dir.path().join("control.db")).unwrap(),
+                ),
+                credit_store: Arc::new(
+                    SqliteUsageStore::open(&dir.path().join("control.db")).unwrap(),
+                ),
+                storage_meta,
+                image_blob: Arc::new(FileBlobStore::open(dir.path().join("image-blob")).unwrap()),
+                auth_token: SERVICE_TOKEN.into(),
+                guest_runtime_profile_receipt:
+                    cats_control_plane::testsupport::test_guest_runtime_profile_receipt(),
+                route_grant_signer: Arc::new(
+                    cats_control_plane::route_grant::RouteGrantSigner::from_ed25519_pem(
+                        ROUTE_GRANT_PRIVATE_KEY,
+                        ROUTE_GRANT_PUBLIC_KEY,
+                        2,
+                    )
+                    .unwrap(),
+                ),
+                admin_token: ADMIN_TOKEN.into(),
+                workos: None,
+                stripe: None,
+                billing_enforcement_enabled: false,
+                node_lease_timeout_ms: 3_000,
+                reconcile_interval_ms: 150,
+                oci_deploy_sync_wait_ms: 5_000,
+                auto_tier_policy: Default::default(),
+            },
+        )
         .await
         .unwrap();
 

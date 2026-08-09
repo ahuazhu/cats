@@ -282,6 +282,27 @@ async fn admission_order_and_signature_path_binding_fail_closed() {
         RuntimeSpineErrorDetail::AuthenticationFailed
     ));
 
+    let shared_bearer = context
+        .client
+        .post(context.url(DESIRED_PATH))
+        .header(reqwest::header::CONTENT_TYPE, JSON_CONTENT_TYPE)
+        .header(reqwest::header::ACCEPT, JSON_CONTENT_TYPE)
+        .header(
+            reqwest::header::AUTHORIZATION,
+            format!("Bearer {SERVICE_TOKEN}"),
+        )
+        .body("not-json")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(shared_bearer.status(), StatusCode::BAD_REQUEST);
+    assert!(matches!(
+        spine_error(shared_bearer).await.error.as_ref(),
+        RuntimeSpineErrorDetail::HttpRequestRejected {
+            problem: RuntimeSpineHttpProblem::AuthorizationNotAllowed
+        }
+    ));
+
     let request = DesiredReadRequest {
         version: ContractVersion::V1,
         session: context.binding(),
