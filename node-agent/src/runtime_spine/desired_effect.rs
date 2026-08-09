@@ -13,6 +13,7 @@ use std::os::fd::{AsRawFd as _, FromRawFd as _};
 use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use anyhow::Context as _;
 use cats_api::runtime_reconciliation::{
@@ -42,7 +43,11 @@ pub(crate) trait RuntimeLaunchPort:
 
 trait RuntimeNetworkPort: Send + Sync + 'static {
     fn plan(&self, desired: &NetworkConfig) -> anyhow::Result<ChNetwork>;
-    fn prepare(&self, network: &ChNetwork) -> anyhow::Result<()>;
+    fn prepare(
+        &self,
+        context: &RuntimeDesiredEffectContext,
+        network: &ChNetwork,
+    ) -> anyhow::Result<()>;
 }
 
 struct CloudHypervisorNetworkPort {
@@ -54,8 +59,12 @@ impl RuntimeNetworkPort for CloudHypervisorNetworkPort {
         plan_network(desired)
     }
 
-    fn prepare(&self, network: &ChNetwork) -> anyhow::Result<()> {
-        prepare_network(&self.config, network)
+    fn prepare(
+        &self,
+        context: &RuntimeDesiredEffectContext,
+        network: &ChNetwork,
+    ) -> anyhow::Result<()> {
+        prepare_network(&self.config, network, context)
     }
 }
 
@@ -113,7 +122,7 @@ impl RuntimeDesiredEffect for ProductionRuntimeDesiredEffect {
         encode_desired_runtime_spec(desired)
             .context("validate signed Desired before planning a Host effect")?;
 
-        let store = NetworkCheckpointStore::open(context.state_directory())?;
+        let store = NetworkCheckpointStore::open(context.state_directory(), &context)?;
         let network = match store.load(desired)? {
             Some(network) => network,
             None => {
@@ -145,7 +154,7 @@ impl RuntimeDesiredEffect for ProductionRuntimeDesiredEffect {
         }
         context.check_active()?;
         self.network
-            .prepare(&network)
+            .prepare(&context, &network)
             .context("prepare exact checkpointed Host network")?;
         // `prepare_network` is idempotent. If cancellation arrived while `ip`
         // was running, retain the tuple and let the next admitted unit adopt
@@ -226,13 +235,16 @@ struct NetworkCheckpointStore {
 }
 
 impl NetworkCheckpointStore {
-    fn open(state_directory: &StateDirectory) -> anyhow::Result<Self> {
+    fn open(
+        state_directory: &StateDirectory,
+        context: &RuntimeDesiredEffectContext,
+    ) -> anyhow::Result<Self> {
         let parent = state_directory
             .try_clone_directory()
             .context("clone retained Node state directory")?;
         let path = state_directory.path().join(DIRECTORY_NAME);
         let directory = ensure_directory(&parent, &path)?;
-        lock_directory(&directory)
+        lock_directory(&directory, context)
             .with_context(|| format!("lock signed Runtime effect directory {}", path.display()))?;
         Ok(Self { directory, path })
     }
@@ -379,14 +391,22 @@ fn ensure_directory(parent: &File, path: &Path) -> anyhow::Result<File> {
     Ok(directory)
 }
 
-fn lock_directory(directory: &File) -> io::Result<()> {
-    // SAFETY: `directory` owns a live descriptor and `flock` retains no Rust
-    // memory. The lock is released with the store after launch handoff.
-    let result = unsafe { libc::flock(directory.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
-    if result == 0 {
-        Ok(())
-    } else {
-        Err(io::Error::last_os_error())
+fn lock_directory(directory: &File, context: &RuntimeDesiredEffectContext) -> anyhow::Result<()> {
+    loop {
+        context.check_active()?;
+        // SAFETY: `directory` owns a live descriptor and `flock` retains no
+        // Rust memory. The lock is released with the store after launch
+        // handoff.
+        let result = unsafe { libc::flock(directory.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
+        if result == 0 {
+            return Ok(());
+        }
+        let error = io::Error::last_os_error();
+        if error.kind() != io::ErrorKind::WouldBlock {
+            return Err(error.into());
+        }
+        let remaining = context.deadline().saturating_duration_since(Instant::now());
+        std::thread::sleep(Duration::from_millis(5).min(remaining));
     }
 }
 
@@ -515,7 +535,11 @@ mod tests {
             Ok(self.planned.clone())
         }
 
-        fn prepare(&self, network: &ChNetwork) -> anyhow::Result<()> {
+        fn prepare(
+            &self,
+            _context: &RuntimeDesiredEffectContext,
+            network: &ChNetwork,
+        ) -> anyhow::Result<()> {
             self.calls.lock().unwrap().prepares.push(network.clone());
             if let Some(on_prepare) = &self.on_prepare {
                 on_prepare();
@@ -1039,5 +1063,121 @@ if [ \"$1\" = '-o' ]; then exit 0; fi\n\
             assert!(!mutation.exists());
             assert!(launch_calls.lock().unwrap().is_empty());
         }
+    }
+
+    #[test]
+    fn production_adapter_rejects_overlapping_malformed_or_duplicate_host_addresses() {
+        for (name, inventory, expected_error) in [
+            (
+                "same /30 slot",
+                "2: foreign0 inet 10.240.0.6/30 scope global\n",
+                "address collision",
+            ),
+            (
+                "covering prefix",
+                "2: foreign0 inet 10.240.0.1/24 scope global\n",
+                "address collision",
+            ),
+            (
+                "malformed inventory",
+                "this is not ip -o output\n",
+                "interface index",
+            ),
+            (
+                "duplicate address",
+                "2: foreign0 inet 10.240.0.9/30 scope global\n\
+3: foreign1 inet 10.240.0.9/32 scope global\n",
+                "repeats IPv4 address",
+            ),
+        ] {
+            let root = tempfile::tempdir().unwrap();
+            let desired = desired();
+            let mutation = root.path().join("mutation");
+            let fake_ip = root.path().join("ip");
+            std::fs::write(
+                &fake_ip,
+                format!(
+                    "#!/bin/sh\n\
+if [ \"$1\" = '-d' ]; then exit 1; fi\n\
+if [ \"$1\" = '-o' ]; then printf '%s' '{inventory}'; exit 0; fi\n\
+: > '{mutation}'\n\
+exit 0\n",
+                    mutation = mutation.display(),
+                ),
+            )
+            .unwrap();
+            std::fs::set_permissions(&fake_ip, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+            let (launch, launch_calls) = RecordingLaunch::new(false);
+            let error = ProductionRuntimeDesiredEffect::new(ch_config(fake_ip), Arc::new(launch))
+                .apply(effect_context(root.path()), &desired)
+                .unwrap_err();
+            assert!(
+                format!("{error:#}").contains(expected_error),
+                "{name} returned unexpected error: {error:#}"
+            );
+            assert!(
+                !mutation.exists(),
+                "{name} reached a tuntap/address/link mutation"
+            );
+            assert!(
+                launch_calls.lock().unwrap().is_empty(),
+                "{name} reached the launch seam"
+            );
+        }
+    }
+
+    #[test]
+    fn production_adapter_kills_and_reaps_ip_at_the_absolute_deadline() {
+        let root = tempfile::tempdir().unwrap();
+        let desired = desired();
+        let pid_file = root.path().join("ip.pid");
+        let fake_ip = root.path().join("ip");
+        std::fs::write(
+            &fake_ip,
+            format!(
+                "#!/bin/sh\nprintf '%s' \"$$\" > '{}'\nexec /bin/sleep 60\n",
+                pid_file.display()
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&fake_ip, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let state = StateDirectory::unanchored(root.path().to_path_buf());
+        let network = planned_network(&desired);
+        let setup_context = RuntimeDesiredEffectContext::for_test(
+            state.clone(),
+            Instant::now() + Duration::from_secs(10),
+        );
+        NetworkCheckpointStore::open(&state, &setup_context)
+            .unwrap()
+            .publish(&desired, &network)
+            .unwrap();
+        let context = RuntimeDesiredEffectContext::for_test(
+            state,
+            Instant::now() + Duration::from_millis(500),
+        );
+        let (launch, launch_calls) = RecordingLaunch::new(false);
+        let started = Instant::now();
+        let error = ProductionRuntimeDesiredEffect::new(ch_config(fake_ip), Arc::new(launch))
+            .apply(context, &desired)
+            .unwrap_err();
+        assert!(format!("{error:#}").contains("deadline expired"));
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "hung ip outlived its absolute effect deadline"
+        );
+        assert!(launch_calls.lock().unwrap().is_empty());
+
+        let pid: libc::pid_t = std::fs::read_to_string(pid_file).unwrap().parse().unwrap();
+        let mut status = 0;
+        // SAFETY: pid was written by the exact child spawned above and the
+        // status pointer is valid for this nonblocking waitpid probe.
+        let wait = unsafe { libc::waitpid(pid, &mut status, libc::WNOHANG) };
+        assert_eq!(wait, -1, "Host ip remained waitable after adapter return");
+        assert_eq!(
+            std::io::Error::last_os_error().raw_os_error(),
+            Some(libc::ECHILD),
+            "Host ip was not reaped by the deadline path"
+        );
     }
 }

@@ -23,26 +23,31 @@
 //! per-Cat, file-backed memory zone and process_madvise(MADV_PAGEOUT), so it
 //! reclaims Guest RAM without depending on host swap.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fs::{File, OpenOptions};
-use std::io::{BufRead, BufReader, Read, Write};
+use std::io::{self, BufRead, BufReader, Read, Write};
+use std::net::Ipv4Addr;
 use std::os::fd::AsRawFd as _;
 use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
-use std::process::{Child, Command, Stdio};
+use std::process::{Child, Command, ExitStatus, Stdio};
 use std::time::{Duration, Instant};
 
 use anyhow::{bail, Context, Result};
 use cats_api::runtime_reconciliation::{IsolatedIpv4Kind, NetworkConfig, RandomId128};
 
 use crate::proc::ProcHandle;
+use crate::runtime_spine::RuntimeDesiredEffectContext;
 
 /// Guest-agent vsock port (must match the guest image's init script).
 pub const GUEST_VSOCK_PORT: u32 = 5000;
 /// Named, per-Cat RAM backing kept under the Cat's host-local runtime.
 pub const GUEST_MEMORY_FILE: &str = "guest-memory.bin";
 const MIB: u64 = 1024 * 1024;
+const IP_COMMAND_POLL_INTERVAL: Duration = Duration::from_millis(5);
+const IP_COMMAND_OUTPUT_MAX_BYTES: usize = 1024 * 1024;
+const STANDALONE_IP_COMMAND_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// Which frontend of `cats-blockd` the Guest's virtio-blk devices are served by.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -206,11 +211,180 @@ pub(crate) fn validate_network_plan(network: &ChNetwork) -> Result<()> {
     Ok(())
 }
 
-fn ip_status(ip_bin: &Path, args: &[&str]) -> Result<()> {
-    let output = Command::new(ip_bin)
+enum IpCommandContext<'a> {
+    Desired(&'a RuntimeDesiredEffectContext),
+    Standalone { deadline: Instant },
+}
+
+impl IpCommandContext<'_> {
+    fn deadline(&self) -> Instant {
+        match self {
+            Self::Desired(context) => context.deadline(),
+            Self::Standalone { deadline } => *deadline,
+        }
+    }
+
+    fn check_active(&self) -> Result<()> {
+        match self {
+            Self::Desired(context) => context.check_active(),
+            Self::Standalone { deadline } => {
+                anyhow::ensure!(
+                    Instant::now() < *deadline,
+                    "Host ip command deadline expired"
+                );
+                Ok(())
+            }
+        }
+    }
+}
+
+struct IpCommandOutput {
+    status: ExitStatus,
+    stdout: Vec<u8>,
+    stderr: Vec<u8>,
+}
+
+fn set_nonblocking(fd: i32) -> io::Result<()> {
+    // SAFETY: `fd` is owned by a live Child pipe for the duration of both
+    // fcntl calls. F_GETFL does not modify memory and F_SETFL receives the
+    // flags returned for that same descriptor.
+    let flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
+    if flags < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    // SAFETY: see above; adding O_NONBLOCK preserves every existing flag.
+    if unsafe { libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK) } < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(())
+}
+
+fn drain_ip_stream(
+    stream: &mut impl Read,
+    bytes: &mut Vec<u8>,
+    eof: &mut bool,
+    stream_name: &str,
+) -> Result<()> {
+    let mut buffer = [0_u8; 8 * 1024];
+    loop {
+        match stream.read(&mut buffer) {
+            Ok(0) => {
+                *eof = true;
+                return Ok(());
+            }
+            Ok(read) => {
+                anyhow::ensure!(
+                    bytes.len().saturating_add(read) <= IP_COMMAND_OUTPUT_MAX_BYTES,
+                    "Host ip {stream_name} exceeded {IP_COMMAND_OUTPUT_MAX_BYTES} bytes"
+                );
+                bytes.extend_from_slice(&buffer[..read]);
+            }
+            Err(error) if error.kind() == io::ErrorKind::WouldBlock => return Ok(()),
+            Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
+            Err(error) => return Err(error).context(format!("read Host ip {stream_name}")),
+        }
+    }
+}
+
+fn kill_and_reap_ip(child: &mut Child) -> Result<()> {
+    if child
+        .try_wait()
+        .context("poll Host ip before termination")?
+        .is_none()
+    {
+        child
+            .kill()
+            .context("kill Host ip after cancellation or deadline")?;
+    }
+    child
+        .wait()
+        .context("reap Host ip after cancellation or deadline")?;
+    Ok(())
+}
+
+fn run_ip_command(
+    context: &IpCommandContext<'_>,
+    ip_bin: &Path,
+    args: &[&str],
+) -> Result<IpCommandOutput> {
+    context.check_active()?;
+    let command = format!("{} {}", ip_bin.display(), args.join(" "));
+    let mut child = Command::new(ip_bin)
         .args(args)
-        .output()
-        .with_context(|| format!("run {} {}", ip_bin.display(), args.join(" ")))?;
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .with_context(|| format!("run {command}"))?;
+    let pipes = (|| {
+        let stdout = child
+            .stdout
+            .take()
+            .context("Host ip stdout pipe was not created")?;
+        let stderr = child
+            .stderr
+            .take()
+            .context("Host ip stderr pipe was not created")?;
+        set_nonblocking(stdout.as_raw_fd()).context("make Host ip stdout nonblocking")?;
+        set_nonblocking(stderr.as_raw_fd()).context("make Host ip stderr nonblocking")?;
+        Ok::<_, anyhow::Error>((stdout, stderr))
+    })();
+    let (mut stdout, mut stderr) = match pipes {
+        Ok(pipes) => pipes,
+        Err(error) => {
+            return match kill_and_reap_ip(&mut child) {
+                Ok(()) => Err(error).with_context(|| format!("set up {command}")),
+                Err(cleanup) => Err(error).with_context(|| {
+                    format!("set up {command}; additionally failed to terminate child: {cleanup:#}")
+                }),
+            };
+        }
+    };
+
+    let mut stdout_bytes = Vec::new();
+    let mut stderr_bytes = Vec::new();
+    let mut stdout_eof = false;
+    let mut stderr_eof = false;
+    let result = (|| -> Result<IpCommandOutput> {
+        let mut status = None;
+        loop {
+            drain_ip_stream(&mut stdout, &mut stdout_bytes, &mut stdout_eof, "stdout")?;
+            drain_ip_stream(&mut stderr, &mut stderr_bytes, &mut stderr_eof, "stderr")?;
+            if status.is_none() {
+                status = child
+                    .try_wait()
+                    .with_context(|| format!("poll {command}"))?;
+            }
+            if let Some(status) = status {
+                if stdout_eof && stderr_eof {
+                    context.check_active()?;
+                    return Ok(IpCommandOutput {
+                        status,
+                        stdout: stdout_bytes,
+                        stderr: stderr_bytes,
+                    });
+                }
+            }
+
+            context.check_active()?;
+            let remaining = context.deadline().saturating_duration_since(Instant::now());
+            std::thread::sleep(IP_COMMAND_POLL_INTERVAL.min(remaining));
+        }
+    })();
+
+    match result {
+        Ok(output) => Ok(output),
+        Err(error) => match kill_and_reap_ip(&mut child) {
+            Ok(()) => Err(error).with_context(|| format!("run {command}")),
+            Err(cleanup) => Err(error).with_context(|| {
+                format!("run {command}; additionally failed to terminate child: {cleanup:#}")
+            }),
+        },
+    }
+}
+
+fn ip_status(context: &IpCommandContext<'_>, ip_bin: &Path, args: &[&str]) -> Result<()> {
+    let output = run_ip_command(context, ip_bin, args)?;
     anyhow::ensure!(
         output.status.success(),
         "{} {} failed: {}",
@@ -249,24 +423,117 @@ fn host_cidr(network: &ChNetwork) -> String {
     )
 }
 
-fn ipv4_cidrs(output: &[u8]) -> Vec<String> {
-    String::from_utf8_lossy(output)
-        .lines()
-        .filter_map(|line| {
-            let mut fields = line.split_ascii_whitespace();
-            fields.find(|field| *field == "inet")?;
-            fields.next().map(str::to_owned)
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Ipv4Cidr {
+    address: Ipv4Addr,
+    prefix_length: u8,
+}
+
+impl Ipv4Cidr {
+    fn parse(value: &str) -> Result<Self> {
+        let (address, prefix) = value
+            .split_once('/')
+            .context("IPv4 address is missing its prefix length")?;
+        anyhow::ensure!(!prefix.contains('/'), "IPv4 address has multiple prefixes");
+        let address = address.parse().context("IPv4 address is invalid")?;
+        let prefix_length: u8 = prefix.parse().context("IPv4 prefix length is invalid")?;
+        anyhow::ensure!(prefix_length <= 32, "IPv4 prefix length exceeds 32");
+        Ok(Self {
+            address,
+            prefix_length,
         })
-        .collect()
+    }
+
+    fn display(self) -> String {
+        format!("{}/{}", self.address, self.prefix_length)
+    }
+
+    fn overlaps(self, other: Self) -> bool {
+        let (self_start, self_end) = self.range();
+        let (other_start, other_end) = other.range();
+        self_start <= other_end && other_start <= self_end
+    }
+
+    fn range(self) -> (u32, u32) {
+        let mask = if self.prefix_length == 0 {
+            0
+        } else {
+            u32::MAX << (32 - u32::from(self.prefix_length))
+        };
+        let start = u32::from(self.address) & mask;
+        (start, start | !mask)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct HostIpv4Address {
+    interface: String,
+    cidr: Ipv4Cidr,
+}
+
+fn ipv4_addresses(output: &[u8]) -> Result<Vec<HostIpv4Address>> {
+    let text = std::str::from_utf8(output).context("Host ip address output is not UTF-8")?;
+    let mut seen = HashSet::new();
+    let mut addresses = Vec::new();
+    for (index, line) in text.lines().enumerate() {
+        anyhow::ensure!(!line.trim().is_empty(), "Host ip output has an empty line");
+        let mut fields = line.split_ascii_whitespace();
+        let ordinal = fields
+            .next()
+            .and_then(|field| field.strip_suffix(':'))
+            .with_context(|| format!("Host ip line {} has no interface index", index + 1))?;
+        ordinal.parse::<u32>().with_context(|| {
+            format!("Host ip line {} has an invalid interface index", index + 1)
+        })?;
+        let interface = fields
+            .next()
+            .with_context(|| format!("Host ip line {} has no interface name", index + 1))?;
+        anyhow::ensure!(
+            !interface.is_empty(),
+            "Host ip line {} has an empty interface name",
+            index + 1
+        );
+        anyhow::ensure!(
+            fields.next() == Some("inet"),
+            "Host ip line {} has no IPv4 address marker",
+            index + 1
+        );
+        let cidr_text = fields
+            .next()
+            .with_context(|| format!("Host ip line {} has no IPv4 CIDR", index + 1))?;
+        anyhow::ensure!(
+            !fields.any(|field| field == "inet"),
+            "Host ip line {} has multiple IPv4 address markers",
+            index + 1
+        );
+        let cidr = Ipv4Cidr::parse(cidr_text)
+            .with_context(|| format!("parse Host ip line {} IPv4 CIDR", index + 1))?;
+        anyhow::ensure!(
+            seen.insert(cidr.address),
+            "Host ip output repeats IPv4 address {}",
+            cidr.address
+        );
+        addresses.push(HostIpv4Address {
+            interface: interface.to_owned(),
+            cidr,
+        });
+    }
+    Ok(addresses)
 }
 
 /// Return false only when the exact tap name is absent. A present tap with a
 /// different/missing token is foreign residue and must fail closed.
-fn exact_network_exists(cfg: &ChConfig, network: &ChNetwork) -> Result<bool> {
-    let output = Command::new(&cfg.ip_bin)
-        .args(["-d", "link", "show", "dev", &network.tap])
-        .output()
-        .with_context(|| format!("inspect Host tap {}", network.tap))?;
+fn exact_network_exists(
+    cfg: &ChConfig,
+    network: &ChNetwork,
+    context: &IpCommandContext<'_>,
+) -> Result<bool> {
+    let output = run_ip_command(
+        context,
+        &cfg.ip_bin,
+        &["-d", "link", "show", "dev", &network.tap],
+    )
+    .with_context(|| format!("inspect Host tap {}", network.tap))?;
     if !output.status.success() {
         return Ok(false);
     }
@@ -281,10 +548,13 @@ fn exact_network_exists(cfg: &ChConfig, network: &ChNetwork) -> Result<bool> {
     Ok(true)
 }
 
-fn ensure_host_cidr_available(cfg: &ChConfig, host_cidr: &str) -> Result<()> {
-    let addresses = Command::new(&cfg.ip_bin)
-        .args(["-o", "-4", "addr", "show"])
-        .output()
+fn ensure_host_cidr_available(
+    cfg: &ChConfig,
+    desired: Ipv4Cidr,
+    adopted_tap: Option<&str>,
+    context: &IpCommandContext<'_>,
+) -> Result<()> {
+    let addresses = run_ip_command(context, &cfg.ip_bin, &["-o", "-4", "addr", "show"])
         .with_context(|| format!("run {} -o -4 addr show", cfg.ip_bin.display()))?;
     anyhow::ensure!(
         addresses.status.success(),
@@ -292,57 +562,95 @@ fn ensure_host_cidr_available(cfg: &ChConfig, host_cidr: &str) -> Result<()> {
         cfg.ip_bin.display(),
         String::from_utf8_lossy(&addresses.stderr).trim()
     );
-    anyhow::ensure!(
-        !ipv4_cidrs(&addresses.stdout)
-            .iter()
-            .any(|address| address == host_cidr),
-        "Cat network address collision for {host_cidr}"
-    );
+    let addresses = ipv4_addresses(&addresses.stdout)?;
+    let mut adopted_seen = false;
+    for address in addresses {
+        if !address.cidr.overlaps(desired) {
+            continue;
+        }
+        if adopted_tap == Some(address.interface.as_str()) && address.cidr == desired {
+            anyhow::ensure!(
+                !adopted_seen,
+                "Host ip output repeats adopted tap {0}",
+                address.interface
+            );
+            adopted_seen = true;
+            continue;
+        }
+        anyhow::bail!(
+            "Cat network address collision: desired {} overlaps {} on {}",
+            desired.display(),
+            address.cidr.display(),
+            address.interface
+        );
+    }
+    if let Some(tap) = adopted_tap {
+        anyhow::ensure!(
+            adopted_seen,
+            "adopted Host tap {tap} disappeared from the global IPv4 inventory"
+        );
+    }
     Ok(())
 }
 
 /// Create or adopt only the exact tuple that the caller already checkpointed.
 /// An existing same-token tap is completed idempotently; a same-name tap with
 /// any other token or address is rejected without mutation.
-pub fn prepare_network(cfg: &ChConfig, network: &ChNetwork) -> Result<()> {
+pub fn prepare_network(
+    cfg: &ChConfig,
+    network: &ChNetwork,
+    effect_context: &RuntimeDesiredEffectContext,
+) -> Result<()> {
     validate_network_plan(network)?;
     let host_cidr = host_cidr(network);
+    let desired_cidr = Ipv4Cidr::parse(&host_cidr).context("parse checkpointed Host IPv4 CIDR")?;
+    let context = IpCommandContext::Desired(effect_context);
 
-    if exact_network_exists(cfg, network)? {
-        let addresses = Command::new(&cfg.ip_bin)
-            .args(["-o", "-4", "addr", "show", "dev", &network.tap])
-            .output()
-            .with_context(|| format!("inspect IPv4 addresses on Host tap {}", network.tap))?;
+    if exact_network_exists(cfg, network, &context)? {
+        let addresses = run_ip_command(
+            &context,
+            &cfg.ip_bin,
+            &["-o", "-4", "addr", "show", "dev", &network.tap],
+        )
+        .with_context(|| format!("inspect IPv4 addresses on Host tap {}", network.tap))?;
         anyhow::ensure!(
             addresses.status.success(),
             "inspect IPv4 addresses on Host tap {}: {}",
             network.tap,
             String::from_utf8_lossy(&addresses.stderr).trim()
         );
-        let assigned = ipv4_cidrs(&addresses.stdout);
+        let assigned = ipv4_addresses(&addresses.stdout)?;
         if assigned.is_empty() {
-            ensure_host_cidr_available(cfg, &host_cidr)?;
+            ensure_host_cidr_available(cfg, desired_cidr, None, &context)?;
             ip_status(
+                &context,
                 &cfg.ip_bin,
                 &["addr", "add", &host_cidr, "dev", &network.tap],
             )?;
         } else {
             anyhow::ensure!(
-                assigned.len() == 1 && assigned[0] == host_cidr,
+                assigned.len() == 1 && assigned[0].cidr == desired_cidr,
                 "Host tap {} has an address other than exact checkpointed {host_cidr}",
                 network.tap
             );
+            ensure_host_cidr_available(cfg, desired_cidr, Some(&network.tap), &context)?;
         }
-        return ip_status(&cfg.ip_bin, &["link", "set", "dev", &network.tap, "up"]);
+        return ip_status(
+            &context,
+            &cfg.ip_bin,
+            &["link", "set", "dev", &network.tap, "up"],
+        );
     }
 
-    ensure_host_cidr_available(cfg, &host_cidr)?;
+    ensure_host_cidr_available(cfg, desired_cidr, None, &context)?;
     ip_status(
+        &context,
         &cfg.ip_bin,
         &["tuntap", "add", "dev", &network.tap, "mode", "tap"],
     )?;
     if let Err(error) = (|| {
         ip_status(
+            &context,
             &cfg.ip_bin,
             &[
                 "link",
@@ -354,24 +662,42 @@ pub fn prepare_network(cfg: &ChConfig, network: &ChNetwork) -> Result<()> {
             ],
         )?;
         ip_status(
+            &context,
             &cfg.ip_bin,
             &["addr", "add", &host_cidr, "dev", &network.tap],
         )?;
-        ip_status(&cfg.ip_bin, &["link", "set", "dev", &network.tap, "up"])
+        ip_status(
+            &context,
+            &cfg.ip_bin,
+            &["link", "set", "dev", &network.tap, "up"],
+        )
     })() {
         // This invocation just created the name, so deleting it is not an
-        // adoption decision and cannot remove a pre-existing foreign tap.
-        let _ = Command::new(&cfg.ip_bin)
-            .args(["link", "delete", "dev", &network.tap])
-            .output();
+        // adoption decision and cannot remove a pre-existing foreign tap. A
+        // cancelled/deadline-expired effect issues no later command; the
+        // durable tuple lets the next admitted run adopt the partial tap.
+        if context.check_active().is_ok() {
+            let _ = ip_status(
+                &context,
+                &cfg.ip_bin,
+                &["link", "delete", "dev", &network.tap],
+            );
+        }
         return Err(error);
     }
     Ok(())
 }
 
 pub fn remove_network(cfg: &ChConfig, network: &ChNetwork) -> Result<()> {
-    if exact_network_exists(cfg, network)? {
-        ip_status(&cfg.ip_bin, &["link", "delete", "dev", &network.tap])?;
+    let context = IpCommandContext::Standalone {
+        deadline: Instant::now() + STANDALONE_IP_COMMAND_TIMEOUT,
+    };
+    if exact_network_exists(cfg, network, &context)? {
+        ip_status(
+            &context,
+            &cfg.ip_bin,
+            &["link", "delete", "dev", &network.tap],
+        )?;
     }
     Ok(())
 }
@@ -1562,6 +1888,13 @@ mod tests {
         }
     }
 
+    fn desired_effect_context(path: &Path) -> RuntimeDesiredEffectContext {
+        RuntimeDesiredEffectContext::for_test(
+            crate::state_directory::StateDirectory::unanchored(path.to_path_buf()),
+            Instant::now() + Duration::from_secs(10),
+        )
+    }
+
     #[test]
     fn exact_desired_network_is_retained_without_cat_or_cidr_derivation() {
         use cats_api::runtime_reconciliation::{Ipv4Address, MacAddress};
@@ -1609,6 +1942,7 @@ mod tests {
         let alias = dir.path().join("alias");
         let address = dir.path().join("address");
         let fake_ip = dir.path().join("ip");
+        let planned = plan_network(&desired_network()).unwrap();
         std::fs::write(
             &fake_ip,
             format!(
@@ -1619,10 +1953,13 @@ if [ \"$1\" = '-d' ]; then\n\
   exit 1\n\
 fi\n\
 if [ \"$1\" = '-o' ] && [ \"$5\" = 'dev' ]; then\n\
-  if [ -f '{address}' ]; then printf '1: tap0 inet %s scope global\\n' \"$(cat '{address}')\"; fi\n\
+  if [ -f '{address}' ]; then printf '1: {tap} inet %s scope global\\n' \"$(cat '{address}')\"; fi\n\
   exit 0\n\
 fi\n\
-if [ \"$1\" = '-o' ]; then exit 0; fi\n\
+if [ \"$1\" = '-o' ]; then\n\
+  if [ -f '{link}' ] && [ -f '{address}' ]; then printf '1: {tap} inet %s scope global\\n' \"$(cat '{address}')\"; fi\n\
+  exit 0\n\
+fi\n\
 if [ \"$1\" = 'tuntap' ]; then : > '{link}'; exit 0; fi\n\
 if [ \"$1\" = 'link' ] && [ \"$2\" = 'set' ] && [ \"$5\" = 'alias' ]; then printf '%s' \"$6\" > '{alias}'; exit 0; fi\n\
 if [ \"$1\" = 'addr' ]; then printf '%s' \"$3\" > '{address}'; exit 0; fi\n\
@@ -1633,12 +1970,12 @@ exit 97\n",
                 link = link.display(),
                 alias = alias.display(),
                 address = address.display(),
+                tap = planned.tap.as_str(),
             ),
         )
         .unwrap();
         std::fs::set_permissions(&fake_ip, std::fs::Permissions::from_mode(0o755)).unwrap();
 
-        let planned = plan_network(&desired_network()).unwrap();
         assert!(!log.exists(), "zero-effect plan unexpectedly executed ip");
         let checkpoint = dir.path().join("network.json");
         let mut file = File::create(&checkpoint).unwrap();
@@ -1651,7 +1988,8 @@ exit 97\n",
 
         let mut cfg = probe_config(dir.path().join("nbd-client"), 8);
         cfg.ip_bin = fake_ip;
-        prepare_network(&cfg, &replayed).unwrap();
+        let context = desired_effect_context(dir.path());
+        prepare_network(&cfg, &replayed, &context).unwrap();
         assert_eq!(std::fs::read_to_string(&address).unwrap(), "10.240.0.5/30");
         assert_eq!(
             std::fs::read_to_string(&alias).unwrap(),
@@ -1661,14 +1999,14 @@ exit 97\n",
         // Crash after the token-bearing tap exists but before its address is
         // complete: the durable tuple is adopted and completed, not replanned.
         std::fs::remove_file(&address).unwrap();
-        prepare_network(&cfg, &replayed).unwrap();
+        prepare_network(&cfg, &replayed, &context).unwrap();
         assert_eq!(std::fs::read_to_string(&address).unwrap(), "10.240.0.5/30");
 
         let foreign = ChNetwork {
             ownership_token: RandomId128::new("bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb").unwrap(),
             ..replayed.clone()
         };
-        assert!(prepare_network(&cfg, &foreign).is_err());
+        assert!(prepare_network(&cfg, &foreign, &context).is_err());
         assert!(remove_network(&cfg, &foreign).is_err());
         assert!(link.exists(), "foreign-token cleanup deleted the owned tap");
         remove_network(&cfg, &replayed).unwrap();

@@ -1494,6 +1494,10 @@ mod tests {
         RuntimeSpineErrorDetail, RuntimeTarget, RuntimeTransition, SessionBinding, UnixMillis,
         WarmSnapshotEvidence, DESIRED_READ_REQUEST_MAX_WIRE_BYTES, NODE_OBSERVATION_MAX_WIRE_BYTES,
     };
+    use std::os::unix::fs::PermissionsExt as _;
+
+    use crate::ch::{BlockPath, ChConfig, ChNetwork};
+    use crate::runtime_spine::{ProductionRuntimeDesiredEffect, RuntimeLaunchPort};
 
     use super::*;
 
@@ -1585,6 +1589,41 @@ mod tests {
 
     struct CountingEffect {
         calls: AtomicUsize,
+    }
+
+    struct NeverLaunch {
+        calls: AtomicUsize,
+    }
+
+    impl crate::runtime_spine::runtime_launch_port_sealed::Sealed for NeverLaunch {}
+
+    impl RuntimeLaunchPort for NeverLaunch {
+        fn launch(
+            &self,
+            _desired: &DesiredRuntimeSpec,
+            _network: &ChNetwork,
+        ) -> anyhow::Result<()> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        }
+    }
+
+    fn production_network_config(ip_bin: std::path::PathBuf) -> ChConfig {
+        ChConfig {
+            block_direct: false,
+            ch_bin: "unused-ch".into(),
+            kernel: "unused-kernel".into(),
+            initramfs: None,
+            boot_contract: None,
+            cmdline: String::new(),
+            seed_image: None,
+            block_path: BlockPath::KernelNbd,
+            vhost_user_queues: 1,
+            vhost_user_queue_size: 256,
+            nbd_client_bin: "unused-nbd-client".into(),
+            nbd_devices: 8,
+            ip_bin,
+        }
     }
 
     impl RuntimeDesiredEffect for CountingEffect {
@@ -1951,6 +1990,89 @@ mod tests {
 
         runner.shutdown().await.unwrap();
         server.abort();
+    }
+
+    #[tokio::test]
+    async fn hanging_production_ip_is_reaped_before_shutdown_releases_the_journal_flock() {
+        let root = tempfile::tempdir().unwrap();
+        let pid_file = root.path().join("ip.pid");
+        let fake_ip = root.path().join("ip");
+        std::fs::write(
+            &fake_ip,
+            format!(
+                "#!/bin/sh\nprintf '%s' \"$$\" > '{}'\nexec /bin/sleep 60\n",
+                pid_file.display()
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&fake_ip, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        let launch = Arc::new(NeverLaunch {
+            calls: AtomicUsize::new(0),
+        });
+        let effect = Arc::new(ProductionRuntimeDesiredEffect::new(
+            production_network_config(fake_ip),
+            launch.clone(),
+        ));
+        let state = StateDirectory::unanchored(root.path().to_path_buf());
+        let registered = decode_agent_session(SESSION).unwrap();
+        let client =
+            RuntimeSpineHttpClient::for_loopback_test("http://127.0.0.1:1/", signer()).unwrap();
+        let mut runner = RuntimeSpineRunner::new_with_desired_effects(
+            state.clone(),
+            registered.clone(),
+            client.clone(),
+            Arc::new(EmptyScanner {
+                calls: AtomicUsize::new(0),
+            }),
+            effect,
+        )
+        .unwrap();
+        runner.pending_effects.push_back(desired_with_network());
+
+        assert!(matches!(
+            runner
+                .run_once_until(Instant::now() + Duration::from_secs(2))
+                .await
+                .unwrap(),
+            RuntimeSpineRunStep::EffectDeadlineExceeded { .. }
+        ));
+        assert!(
+            pid_file.exists(),
+            "fake ip never entered its hanging command"
+        );
+        assert_eq!(launch.calls.load(Ordering::SeqCst), 0);
+
+        let blocked_scanner: Arc<dyn RuntimeInventoryScanner> = Arc::new(EmptyScanner {
+            calls: AtomicUsize::new(0),
+        });
+        assert!(matches!(
+            RuntimeSpineRunner::new(
+                state.clone(),
+                registered.clone(),
+                client.clone(),
+                blocked_scanner,
+            ),
+            Err(RuntimeSpineRunError::Journal(
+                RuntimeSpineJournalError::Io { .. }
+            ))
+        ));
+
+        tokio::time::timeout(Duration::from_secs(3), runner.shutdown())
+            .await
+            .expect("hanging ip prevented runner shutdown from joining")
+            .unwrap();
+
+        let successor = RuntimeSpineRunner::new(
+            state,
+            registered,
+            client,
+            Arc::new(EmptyScanner {
+                calls: AtomicUsize::new(0),
+            }),
+        )
+        .expect("runner shutdown did not release the journal flock");
+        successor.shutdown().await.unwrap();
     }
 
     #[tokio::test]
