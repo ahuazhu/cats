@@ -170,25 +170,27 @@ impl From<PathBuf> for StateDirectory {
 
 #[cfg(target_os = "linux")]
 fn duplicate_to_reserved_fd(directory: &File, reserved: RawFd) -> anyhow::Result<File> {
-    // SAFETY: `F_GETFD` only examines the numeric descriptor.
-    let occupied = unsafe { libc::fcntl(reserved, libc::F_GETFD) };
-    if occupied >= 0 {
-        anyhow::bail!("reserved Node state descriptor {reserved} is already occupied");
-    }
-    let error = std::io::Error::last_os_error();
-    anyhow::ensure!(
-        error.raw_os_error() == Some(libc::EBADF),
-        "cannot inspect reserved Node state descriptor {reserved}: {error}"
-    );
-    // SAFETY: both descriptor numbers are valid inputs; `reserved` was just
-    // proven unused, and a successful descriptor is transferred to `File`.
-    let duplicated = unsafe { libc::dup3(directory.as_raw_fd(), reserved, 0) };
+    // `F_DUPFD` atomically claims the lowest unused descriptor at or above the
+    // requested number and deliberately clears `FD_CLOEXEC`. Accepting only
+    // the exact number fails closed when another thread owns the reservation.
+    // SAFETY: the source descriptor is live, and `fcntl(F_DUPFD)` neither
+    // consumes it nor retains any Rust memory.
+    let duplicated = unsafe { libc::fcntl(directory.as_raw_fd(), libc::F_DUPFD, reserved) };
     if duplicated < 0 {
         return Err(std::io::Error::last_os_error())
             .context("reserve inherited Node state descriptor");
     }
-    // SAFETY: `dup3` returned a new descriptor owned by this call.
-    Ok(unsafe { File::from_raw_fd(duplicated) })
+    // SAFETY: successful `fcntl(F_DUPFD)` created one new descriptor owned
+    // solely by this call; wrapping it transfers that ownership to `File`.
+    let duplicated = unsafe { File::from_raw_fd(duplicated) };
+    if duplicated.as_raw_fd() != reserved {
+        let allocated = duplicated.as_raw_fd();
+        drop(duplicated);
+        anyhow::bail!(
+            "reserved Node state descriptor {reserved} is already occupied (lowest available descriptor was {allocated})"
+        );
+    }
+    Ok(duplicated)
 }
 
 #[cfg(target_os = "linux")]
@@ -203,4 +205,99 @@ fn duplicate_inheritable(directory: &File, minimum: RawFd) -> anyhow::Result<Fil
     }
     // SAFETY: `fcntl(F_DUPFD)` returned a new descriptor owned by this call.
     Ok(unsafe { File::from_raw_fd(duplicated) })
+}
+
+#[cfg(all(test, target_os = "linux"))]
+mod tests {
+    use std::os::fd::AsRawFd as _;
+    use std::os::unix::fs::MetadataExt as _;
+    use std::sync::{Arc, Barrier, Mutex};
+
+    use super::{duplicate_to_reserved_fd, PRODUCTION_STATE_DIRECTORY_FD};
+
+    static RESERVED_DESCRIPTOR_TEST: Mutex<()> = Mutex::new(());
+
+    fn same_file(left: &std::fs::File, right: &std::fs::File) -> bool {
+        let left = left.metadata().expect("read left descriptor metadata");
+        let right = right.metadata().expect("read right descriptor metadata");
+        left.dev() == right.dev() && left.ino() == right.ino()
+    }
+
+    #[test]
+    fn occupied_production_descriptor_fails_without_closing_or_replacing_sentinel() {
+        let _serial = RESERVED_DESCRIPTOR_TEST
+            .lock()
+            .expect("serialize reserved descriptor tests");
+        let temp = tempfile::tempdir().expect("create descriptor fixture");
+        let sentinel_source = std::fs::File::open(temp.path()).expect("open sentinel source");
+        let sentinel = duplicate_to_reserved_fd(&sentinel_source, PRODUCTION_STATE_DIRECTORY_FD)
+            .expect("reserve sentinel descriptor");
+        assert_eq!(sentinel.as_raw_fd(), PRODUCTION_STATE_DIRECTORY_FD);
+
+        let candidate_path = temp.path().join("candidate");
+        std::fs::create_dir(&candidate_path).expect("create candidate directory");
+        let candidate = std::fs::File::open(candidate_path).expect("open candidate source");
+        let error = duplicate_to_reserved_fd(&candidate, PRODUCTION_STATE_DIRECTORY_FD)
+            .expect_err("occupied production descriptor must fail closed");
+
+        assert!(error.to_string().contains("already occupied"));
+        assert_eq!(sentinel.as_raw_fd(), PRODUCTION_STATE_DIRECTORY_FD);
+        assert!(same_file(&sentinel, &sentinel_source));
+        // SAFETY: the sentinel owns this live descriptor; `F_GETFD` only
+        // inspects descriptor flags and retains no memory.
+        let flags = unsafe { libc::fcntl(PRODUCTION_STATE_DIRECTORY_FD, libc::F_GETFD) };
+        assert!(flags >= 0);
+        assert_eq!(flags & libc::FD_CLOEXEC, 0);
+    }
+
+    #[test]
+    fn concurrent_production_reservations_cannot_steal_or_replace_the_winner() {
+        let _serial = RESERVED_DESCRIPTOR_TEST
+            .lock()
+            .expect("serialize reserved descriptor tests");
+        let temp = tempfile::tempdir().expect("create descriptor fixture");
+        let first_path = temp.path().join("first");
+        let second_path = temp.path().join("second");
+        std::fs::create_dir(&first_path).expect("create first directory");
+        std::fs::create_dir(&second_path).expect("create second directory");
+        let first = std::fs::File::open(first_path).expect("open first source");
+        let second = std::fs::File::open(second_path).expect("open second source");
+        let first_identity = first.try_clone().expect("clone first source");
+        let second_identity = second.try_clone().expect("clone second source");
+        let barrier = Arc::new(Barrier::new(3));
+
+        let first_barrier = Arc::clone(&barrier);
+        let first_worker = std::thread::spawn(move || {
+            first_barrier.wait();
+            duplicate_to_reserved_fd(&first, PRODUCTION_STATE_DIRECTORY_FD)
+        });
+        let second_barrier = Arc::clone(&barrier);
+        let second_worker = std::thread::spawn(move || {
+            second_barrier.wait();
+            duplicate_to_reserved_fd(&second, PRODUCTION_STATE_DIRECTORY_FD)
+        });
+        barrier.wait();
+
+        let first_result = first_worker.join().expect("first reservation panicked");
+        let second_result = second_worker.join().expect("second reservation panicked");
+        let (winner, winner_source, loser_error) = match (first_result, second_result) {
+            (Ok(winner), Err(error)) => (winner, first_identity, error),
+            (Err(error), Ok(winner)) => (winner, second_identity, error),
+            (Ok(_), Ok(_)) => panic!("both concurrent reservations claimed descriptor 198"),
+            (Err(first), Err(second)) => {
+                panic!("both concurrent reservations failed: {first:#}; {second:#}")
+            }
+        };
+
+        assert_eq!(winner.as_raw_fd(), PRODUCTION_STATE_DIRECTORY_FD);
+        assert!(same_file(&winner, &winner_source));
+        assert!(loser_error.to_string().contains("already occupied"));
+        // The losing allocation must not overwrite or close the winner.
+        assert!(same_file(&winner, &winner_source));
+        // SAFETY: `winner` still owns this live descriptor; `F_GETFD` only
+        // inspects descriptor flags and retains no memory.
+        let flags = unsafe { libc::fcntl(PRODUCTION_STATE_DIRECTORY_FD, libc::F_GETFD) };
+        assert!(flags >= 0);
+        assert_eq!(flags & libc::FD_CLOEXEC, 0);
+    }
 }
