@@ -11,7 +11,7 @@ use cats_api::runtime_reconciliation::{
 use cats_storage::{BlobError, MetaError, VolumeHead};
 
 use crate::crashpoint;
-use crate::format::{self, ImageManifest, LeafRef};
+use crate::format::{self, ImageManifest};
 use crate::image::ImageError;
 
 use super::publish::{encode_commit_record, PreparedMapPublication};
@@ -329,7 +329,7 @@ impl ChunkEngine {
         request: &ProvisionRootImageRequest,
         manifest: &ImageManifest,
     ) -> EffectResult<(Vec<format::ChunkRef>, PreparedMapPublication, Vec<u64>)> {
-        let new_map = format::image_base_map(manifest, request.size_bytes).map_err(|_| {
+        let plan = format::prepare_image_root(manifest, request.size_bytes).map_err(|_| {
             definite(
                 request,
                 ProvisionRootImageDefiniteConflictProblem::ImageManifest,
@@ -340,8 +340,15 @@ impl ChunkEngine {
             .iter()
             .map(|entry| entry.chunk_idx)
             .collect();
-        let leaves = vec![LeafRef::Empty; chunk::leaf_count(request.size_bytes) as usize];
-        let prepared = self.prepare_map_publication(0, &new_map, &leaves, &chunks);
+        let prepared = PreparedMapPublication {
+            base_root_hash: None,
+            base_root_object_id: None,
+            leaf_nodes: plan.leaf_nodes,
+            root_bytes: plan.root_bytes,
+            root_hash: plan.identity.root_hash,
+            root_object_id: plan.identity.root_object_id,
+            leaves: plan.leaves,
+        };
         let computed = RemoteHead {
             generation: Generation::new(1).expect("one is a valid generation"),
             root_hash: Some(Sha256Digest::from_bytes(prepared.root_hash)),
@@ -356,7 +363,7 @@ impl ChunkEngine {
                 ProvisionRootImageDefiniteConflictProblem::TargetMismatch,
             ));
         }
-        Ok((new_map, prepared, chunks))
+        Ok((plan.map, prepared, chunks))
     }
 
     fn load_authority(&self, request: &ProvisionRootImageRequest) -> EffectResult<VolumeHead> {
@@ -533,6 +540,9 @@ mod tests {
             root_hash,
             "a3a4782016a5ec8ef71c9efd06c5e899beeab070982397c294b578fc4e341753"
         );
+        let identity = format::image_root_identity(&manifest, manifest.size_bytes).unwrap();
+        assert_eq!(hex::encode(identity.root_hash), root_hash);
+        assert_eq!(identity.root_object_id, format!("{root_hash}.node"));
 
         let transition = "13579bdf2468ace013579bdf2468ace0";
         let record = encode_commit_record(transition, 1, 7, &root_hash, &[0, 256]);

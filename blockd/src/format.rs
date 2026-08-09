@@ -5,7 +5,7 @@
 
 use sha2::{Digest, Sha256};
 
-use cats_api::chunk::{CHUNK_SIZE, PAGES_PER_CHUNK};
+use cats_api::chunk::{self, CHUNKS_PER_LEAF, CHUNK_SIZE, PAGES_PER_CHUNK};
 use cats_api::runtime_reconciliation::AcquireOrigin;
 
 pub const LEAF_MAGIC: &[u8; 8] = b"CATSLEAF";
@@ -654,6 +654,25 @@ pub use cats_storage::{
     ImageManifestChunkV1 as ImageChunk, ImageManifestV1 as ImageManifest, LowerHexSha256,
 };
 
+/// The deterministic generation-one map identity for a shared image.
+///
+/// This is the same typed value that root provisioning validates and publishes;
+/// callers can therefore checkpoint the exact target before starting blockd
+/// without reimplementing the frozen map encoding.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ImageRootIdentity {
+    pub root_hash: [u8; 32],
+    pub root_object_id: String,
+}
+
+pub(crate) struct PreparedImageRoot {
+    pub(crate) map: Vec<ChunkRef>,
+    pub(crate) leaf_nodes: Vec<([u8; 32], Vec<u8>)>,
+    pub(crate) root_bytes: Vec<u8>,
+    pub(crate) identity: ImageRootIdentity,
+    pub(crate) leaves: Vec<LeafRef>,
+}
+
 /// Build the block-map view of an already validated shared manifest DTO.
 pub fn image_base_map(
     manifest: &ImageManifest,
@@ -678,6 +697,58 @@ pub fn image_base_map(
         });
     }
     Ok(map)
+}
+
+/// Compute the exact root-map identity that provisioning a validated image
+/// manifest into a blank volume will publish.
+pub fn image_root_identity(
+    manifest: &ImageManifest,
+    volume_bytes: u64,
+) -> Result<ImageRootIdentity, FormatError> {
+    Ok(prepare_image_root(manifest, volume_bytes)?.identity)
+}
+
+pub(crate) fn prepare_image_root(
+    manifest: &ImageManifest,
+    volume_bytes: u64,
+) -> Result<PreparedImageRoot, FormatError> {
+    let map = image_base_map(manifest, volume_bytes)?;
+    let mut leaves = vec![LeafRef::Empty; chunk::leaf_count(volume_bytes) as usize];
+    let mut touched: Vec<u64> = manifest
+        .chunks
+        .iter()
+        .map(|entry| entry.chunk_idx / u64::from(CHUNKS_PER_LEAF))
+        .collect();
+    touched.sort_unstable();
+    touched.dedup();
+
+    let mut leaf_nodes = Vec::with_capacity(touched.len());
+    for leaf_idx in touched {
+        let first = leaf_idx * u64::from(CHUNKS_PER_LEAF);
+        let end = (first + u64::from(CHUNKS_PER_LEAF)).min(map.len() as u64);
+        let encoded = encode_leaf(first, &map[first as usize..end as usize]);
+        let hash = sha256(&encoded);
+        let object_id = format!("{}.node", hex::encode(hash));
+        leaves[leaf_idx as usize] = LeafRef::Present {
+            hash,
+            object_id: object_id.clone(),
+        };
+        leaf_nodes.push((hash, encoded));
+    }
+
+    let root_bytes = encode_root(volume_bytes, &leaves);
+    let root_hash = sha256(&root_bytes);
+    let identity = ImageRootIdentity {
+        root_hash,
+        root_object_id: format!("{}.node", hex::encode(root_hash)),
+    };
+    Ok(PreparedImageRoot {
+        map,
+        leaf_nodes,
+        root_bytes,
+        identity,
+        leaves,
+    })
 }
 
 /// Image object ids are their own sha256, so a reference into an image carries no
