@@ -1,9 +1,11 @@
 //! Crash-safe Node registration over the one runtime-internal transport.
 
-use std::fs::{File, OpenOptions};
+use std::ffi::{CString, OsStr};
+use std::fs::File;
 use std::io::{Read as _, Write as _};
-use std::os::fd::AsRawFd as _;
-use std::os::unix::fs::{MetadataExt as _, OpenOptionsExt as _};
+use std::os::fd::{AsRawFd as _, FromRawFd as _};
+use std::os::unix::ffi::OsStrExt as _;
+use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
@@ -48,6 +50,10 @@ pub struct AgentRegistrationConfig {
     identity: Arc<NodeIdentity>,
     signer: Ed25519RequestSigner,
     state_path: PathBuf,
+    state_parent_directory: Arc<File>,
+    state_directory: Arc<File>,
+    state_directory_name: Arc<CString>,
+    state_directory_identity: StableDirectoryIdentity,
     node_boot_id: NodeBootId,
     guest_config_digest: cats_api::runtime_reconciliation::Sha256Digest,
     _host_lock: Arc<File>,
@@ -74,15 +80,24 @@ impl std::fmt::Debug for AgentRegistrationConfig {
 impl AgentRegistrationConfig {
     /// Loads only the fixed production identity/key/state paths.
     pub fn load_installed(receipt: &GuestRuntimeProfileReceipt) -> anyhow::Result<Self> {
-        validate_identity_ancestors()?;
-        let identity_bytes =
-            read_exact_root_file(Path::new(NODE_IDENTITY_PATH), 0o600, IDENTITY_MAX_BYTES)?;
-        let key_bytes = read_exact_root_file(
+        let identity_directory = open_installed_identity_directory()?;
+        let identity_bytes = read_exact_root_file_at(
+            &identity_directory,
+            OsStr::new("node-identity.v1.json"),
+            Path::new(NODE_IDENTITY_PATH),
+            0o600,
+            IDENTITY_MAX_BYTES,
+        )?;
+        let key_bytes = read_exact_root_file_at(
+            &identity_directory,
+            OsStr::new("node-registration-key.pem"),
             Path::new(NODE_REGISTRATION_KEY_PATH),
             0o600,
             PRIVATE_KEY_MAX_BYTES,
         )?;
-        let credential_bytes = read_exact_root_file(
+        let credential_bytes = read_exact_root_file_at(
+            &identity_directory,
+            OsStr::new("node-registration-credential-id"),
             Path::new(NODE_REGISTRATION_CREDENTIAL_ID_PATH),
             0o600,
             CREDENTIAL_ID_MAX_BYTES,
@@ -90,11 +105,25 @@ impl AgentRegistrationConfig {
         let (identity, signer) =
             validate_identity_material(&identity_bytes, &key_bytes, &credential_bytes)?;
         let state_path = Path::new(NODE_STATE_ROOT).join(identity.state_path_id.as_str());
-        let host_lock = open_and_lock_state_path(&state_path)?;
+        let state_parent_directory = open_installed_state_root()?;
+        let state_directory_name = CString::new(identity.state_path_id.as_str())?;
+        let state_directory = open_directory_at(
+            &state_parent_directory,
+            state_directory_name.as_c_str(),
+            &state_path,
+        )?;
+        validate_state_directory(&state_directory, RegistrationTransport::ProductionHttps)?;
+        let state_directory_identity = StableDirectoryIdentity::new(&state_directory.metadata()?);
+        let host_lock =
+            open_and_lock_host_file(&state_directory, RegistrationTransport::ProductionHttps)?;
         Ok(Self {
             identity: Arc::new(identity),
             signer,
             state_path,
+            state_parent_directory: Arc::new(state_parent_directory),
+            state_directory: Arc::new(state_directory),
+            state_directory_name: Arc::new(state_directory_name),
+            state_directory_identity,
             node_boot_id: installed_node_boot_id()?,
             guest_config_digest: guest_config_digest(receipt)
                 .map_err(|_| anyhow::anyhow!("installed Guest runtime receipt is invalid"))?,
@@ -128,18 +157,32 @@ impl AgentRegistrationConfig {
             "test credential binding does not match signer"
         );
         std::fs::create_dir_all(&state_path)?;
-        let lock_path = state_path.join(HOST_LOCK_BASENAME);
-        let host_lock = OpenOptions::new()
-            .read(true)
-            .write(true)
-            .create(true)
-            .truncate(false)
-            .open(&lock_path)?;
-        lock_exclusive_nonblocking(&host_lock)?;
+        let state_parent_path = state_path
+            .parent()
+            .context("test state path has no parent")?;
+        let state_directory_name = CString::new(
+            state_path
+                .file_name()
+                .context("test state path has no final component")?
+                .as_bytes(),
+        )?;
+        let state_parent_directory = File::open(state_parent_path)?;
+        let state_directory = open_directory_at(
+            &state_parent_directory,
+            state_directory_name.as_c_str(),
+            &state_path,
+        )?;
+        validate_state_directory(&state_directory, RegistrationTransport::LoopbackTest)?;
+        let state_directory_identity = StableDirectoryIdentity::new(&state_directory.metadata()?);
+        let host_lock = create_and_lock_test_host_file(&state_directory)?;
         Ok(Self {
             identity: Arc::new(identity),
             signer,
             state_path,
+            state_parent_directory: Arc::new(state_parent_directory),
+            state_directory: Arc::new(state_directory),
+            state_directory_name: Arc::new(state_directory_name),
+            state_directory_identity,
             node_boot_id,
             guest_config_digest: guest_config_digest(receipt)
                 .map_err(|_| anyhow::anyhow!("test Guest runtime receipt is invalid"))?,
@@ -164,13 +207,17 @@ impl AgentRegistrationConfig {
         control_plane_origin: &str,
     ) -> anyhow::Result<AgentSession> {
         let origin = validate_control_plane_origin(control_plane_origin, self.transport)?;
-        let registration_dir = self.state_path.join("agent-registration");
-        ensure_registration_directory(&registration_dir, self.transport)?;
-        let pending_path = self.state_path.join(PENDING_ATTEMPT_RELATIVE_PATH);
-        let session_path = self.state_path.join(SESSION_RELATIVE_PATH);
+        self.ensure_state_directory_identity()?;
+        let registration_directory =
+            ensure_registration_directory(&self.state_directory, self.transport, durability_noop)?;
         let agent_instance_id = random_id();
-        let existing_pending =
-            read_optional_bounded(&pending_path, IDENTITY_MAX_BYTES, self.transport)?;
+        let existing_pending = read_optional_bounded_at(
+            &registration_directory,
+            OsStr::new("pending-attempt.json"),
+            &self.state_path.join(PENDING_ATTEMPT_RELATIVE_PATH),
+            IDENTITY_MAX_BYTES,
+            self.transport,
+        )?;
         let mut pending = match existing_pending {
             Some(bytes) => {
                 let attempt = decode_agent_registration_attempt(&bytes).map_err(|_| {
@@ -180,8 +227,8 @@ impl AgentRegistrationConfig {
                 DurableAttempt { attempt, bytes }
             }
             None => {
-                let expected = self.load_previous_epoch(&session_path)?;
-                self.create_pending(&pending_path, agent_instance_id.clone(), expected)?
+                let expected = self.load_previous_epoch(&registration_directory)?;
+                self.create_pending(&registration_directory, agent_instance_id.clone(), expected)?
             }
         };
         let client = reqwest::Client::builder()
@@ -194,6 +241,7 @@ impl AgentRegistrationConfig {
             .expect("validated origin accepts the fixed registration path");
         let mut backoff = INITIAL_RETRY;
         loop {
+            self.ensure_state_directory_identity()?;
             let proof = self
                 .signer
                 .sign(REGISTRATION_METHOD, REGISTRATION_PATH, &pending.bytes);
@@ -208,13 +256,15 @@ impl AgentRegistrationConfig {
                 .await;
             match classify_response(response, &pending.attempt).await {
                 RegistrationResult::Accepted(session) => {
-                    atomic_replace(
-                        &session_path,
+                    self.ensure_state_directory_identity()?;
+                    atomic_replace_at(
+                        &registration_directory,
+                        OsStr::new("session.json"),
                         &encode_agent_session(&session).map_err(|_| {
                             anyhow::anyhow!("accepted Agent session cannot be canonically encoded")
                         })?,
                     )?;
-                    remove_durable(&pending_path)?;
+                    remove_durable_at(&registration_directory, OsStr::new("pending-attempt.json"))?;
                     // A pending file loaded at process startup belongs to the
                     // process that durably created it. Resolve its ambiguous
                     // result first, then replace that old process/boot binding
@@ -223,7 +273,7 @@ impl AgentRegistrationConfig {
                         || session.agent_instance_id != agent_instance_id
                     {
                         pending = self.create_pending(
-                            &pending_path,
+                            &registration_directory,
                             agent_instance_id.clone(),
                             Some(session.agent_session_epoch),
                         )?;
@@ -233,8 +283,9 @@ impl AgentRegistrationConfig {
                     return Ok(session);
                 }
                 RegistrationResult::ReplaceExpected(current_epoch) => {
+                    self.ensure_state_directory_identity()?;
                     pending = self.create_pending(
-                        &pending_path,
+                        &registration_directory,
                         agent_instance_id.clone(),
                         current_epoch,
                     )?;
@@ -256,9 +307,11 @@ impl AgentRegistrationConfig {
         }
     }
 
-    fn load_previous_epoch(&self, session_path: &Path) -> anyhow::Result<Option<Epoch>> {
-        let Some(bytes) = read_optional_bounded(
-            session_path,
+    fn load_previous_epoch(&self, registration_directory: &File) -> anyhow::Result<Option<Epoch>> {
+        let Some(bytes) = read_optional_bounded_at(
+            registration_directory,
+            OsStr::new("session.json"),
+            &self.state_path.join(SESSION_RELATIVE_PATH),
             REGISTRATION_SUCCESS_MAX_WIRE_BYTES,
             self.transport,
         )?
@@ -273,7 +326,7 @@ impl AgentRegistrationConfig {
 
     fn create_pending(
         &self,
-        path: &Path,
+        registration_directory: &File,
         agent_instance_id: RandomId128,
         expected_agent_session_epoch: Option<Epoch>,
     ) -> anyhow::Result<DurableAttempt> {
@@ -289,7 +342,11 @@ impl AgentRegistrationConfig {
         };
         let bytes = encode_agent_registration_attempt(&attempt)
             .map_err(|_| anyhow::anyhow!("new Agent registration attempt is invalid"))?;
-        atomic_replace(path, &bytes)?;
+        atomic_replace_at(
+            registration_directory,
+            OsStr::new("pending-attempt.json"),
+            &bytes,
+        )?;
         Ok(DurableAttempt { attempt, bytes })
     }
 
@@ -309,6 +366,22 @@ impl AgentRegistrationConfig {
                 && session.immutable_host_id == self.identity.immutable_host_id
                 && session.guest_config_digest == self.guest_config_digest,
             "durable Agent session does not match installed identity and release"
+        );
+        Ok(())
+    }
+
+    fn ensure_state_directory_identity(&self) -> anyhow::Result<()> {
+        let current = open_directory_at(
+            &self.state_parent_directory,
+            self.state_directory_name.as_c_str(),
+            &self.state_path,
+        )?;
+        validate_state_directory(&current, self.transport)?;
+        anyhow::ensure!(
+            StableDirectoryIdentity::new(&current.metadata()?) == self.state_directory_identity
+                && StableDirectoryIdentity::new(&self.state_directory.metadata()?)
+                    == self.state_directory_identity,
+            "Node state directory identity changed while the Host lock was held"
         );
         Ok(())
     }
@@ -634,35 +707,112 @@ fn validate_identity_material(
     Ok((identity, signer))
 }
 
-fn validate_identity_ancestors() -> anyhow::Result<()> {
-    for (path, exact_mode) in [
-        ("/", None),
-        ("/etc", None),
-        ("/etc/cats", None),
-        ("/etc/cats/identity", Some(0o700)),
-    ] {
-        let metadata = std::fs::symlink_metadata(path)
-            .with_context(|| format!("inspect identity ancestor {path}"))?;
-        anyhow::ensure!(
-            metadata.file_type().is_dir()
-                && !metadata.file_type().is_symlink()
-                && metadata.uid() == 0
-                && metadata.gid() == 0
-                && exact_mode
-                    .map(|mode| metadata.mode() & 0o777 == mode)
-                    .unwrap_or_else(|| metadata.mode() & 0o022 == 0),
-            "identity ancestor {path} violates owner/mode/type contract"
-        );
+fn open_installed_identity_directory() -> anyhow::Result<File> {
+    open_rooted_directory(&["etc", "cats", "identity"], Some(0o700))
+}
+
+fn open_installed_state_root() -> anyhow::Result<File> {
+    open_rooted_directory(&["var", "lib", "cats", "node"], None)
+}
+
+fn open_rooted_directory(components: &[&str], final_mode: Option<u32>) -> anyhow::Result<File> {
+    let mut directory = File::open("/").context("open filesystem root")?;
+    validate_root_owned_directory(&directory, Path::new("/"), None)?;
+    let mut display = PathBuf::from("/");
+    for (index, component) in components.iter().enumerate() {
+        display.push(component);
+        let name = CString::new(*component)?;
+        directory = open_directory_at(&directory, name.as_c_str(), &display)?;
+        validate_root_owned_directory(
+            &directory,
+            &display,
+            (index + 1 == components.len())
+                .then_some(final_mode)
+                .flatten(),
+        )?;
     }
+    Ok(directory)
+}
+
+fn validate_root_owned_directory(
+    directory: &File,
+    display: &Path,
+    exact_mode: Option<u32>,
+) -> anyhow::Result<()> {
+    let metadata = directory.metadata()?;
+    anyhow::ensure!(
+        metadata.file_type().is_dir()
+            && metadata.uid() == 0
+            && metadata.gid() == 0
+            && exact_mode
+                .map(|mode| metadata.mode() & 0o777 == mode)
+                .unwrap_or_else(|| metadata.mode() & 0o022 == 0),
+        "directory {} violates owner/mode/type contract",
+        display.display()
+    );
     Ok(())
 }
 
-fn read_exact_root_file(path: &Path, mode: u32, cap: usize) -> anyhow::Result<Vec<u8>> {
-    let mut file = OpenOptions::new()
-        .read(true)
-        .custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW)
-        .open(path)
-        .with_context(|| format!("open {}", path.display()))?;
+fn open_directory_at(parent: &File, name: &std::ffi::CStr, display: &Path) -> anyhow::Result<File> {
+    // SAFETY: `parent` is live for the call, `name` is NUL-terminated, and a
+    // successful new descriptor is immediately transferred to `File`.
+    let descriptor = unsafe {
+        libc::openat(
+            parent.as_raw_fd(),
+            name.as_ptr(),
+            libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+        )
+    };
+    if descriptor < 0 {
+        return Err(std::io::Error::last_os_error())
+            .with_context(|| format!("open directory {}", display.display()));
+    }
+    // SAFETY: `openat` returned a new owned descriptor.
+    Ok(unsafe { File::from_raw_fd(descriptor) })
+}
+
+fn open_file_at(
+    directory: &File,
+    name: &OsStr,
+    flags: i32,
+    create_mode: libc::c_uint,
+    display: &Path,
+) -> anyhow::Result<File> {
+    anyhow::ensure!(
+        !name.is_empty()
+            && name != OsStr::new(".")
+            && name != OsStr::new("..")
+            && !name.as_bytes().contains(&b'/'),
+        "descriptor-relative file name is not one component"
+    );
+    let name = CString::new(name.as_bytes())?;
+    // SAFETY: the parent descriptor and C string are live for this call; the
+    // mode argument is supplied for the optional O_CREAT case; ownership of a
+    // successful descriptor is immediately transferred to `File`.
+    let descriptor = unsafe {
+        libc::openat(
+            directory.as_raw_fd(),
+            name.as_ptr(),
+            flags | libc::O_CLOEXEC | libc::O_NOFOLLOW,
+            create_mode,
+        )
+    };
+    if descriptor < 0 {
+        return Err(std::io::Error::last_os_error())
+            .with_context(|| format!("open {}", display.display()));
+    }
+    // SAFETY: `openat` returned a new owned descriptor.
+    Ok(unsafe { File::from_raw_fd(descriptor) })
+}
+
+fn read_exact_root_file_at(
+    directory: &File,
+    name: &OsStr,
+    path: &Path,
+    mode: u32,
+    cap: usize,
+) -> anyhow::Result<Vec<u8>> {
+    let mut file = open_file_at(directory, name, libc::O_RDONLY, 0, path)?;
     let before = StableMetadata::new(&file.metadata()?);
     anyhow::ensure!(
         before.is_exact_file(mode),
@@ -692,38 +842,56 @@ fn read_exact_root_file(path: &Path, mode: u32, cap: usize) -> anyhow::Result<Ve
     Ok(bytes)
 }
 
-fn open_and_lock_state_path(state_path: &Path) -> anyhow::Result<File> {
-    for path in [
-        Path::new("/"),
-        Path::new("/var"),
-        Path::new("/var/lib"),
-        Path::new("/var/lib/cats"),
-        Path::new(NODE_STATE_ROOT),
-        state_path,
-    ] {
-        let metadata = std::fs::symlink_metadata(path)
-            .with_context(|| format!("inspect state path {}", path.display()))?;
-        anyhow::ensure!(
-            metadata.file_type().is_dir()
-                && !metadata.file_type().is_symlink()
-                && metadata.uid() == 0
-                && metadata.gid() == 0
-                && metadata.mode() & 0o022 == 0,
-            "state path {} violates owner/mode/type contract",
-            path.display()
-        );
-    }
-    let lock_path = state_path.join(HOST_LOCK_BASENAME);
-    let lock = OpenOptions::new()
-        .read(true)
-        .write(true)
-        .custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW)
-        .open(&lock_path)
-        .with_context(|| format!("open Host lock {}", lock_path.display()))?;
-    let metadata = StableMetadata::new(&lock.metadata()?);
+fn validate_state_directory(
+    directory: &File,
+    transport: RegistrationTransport,
+) -> anyhow::Result<()> {
+    let metadata = directory.metadata()?;
+    let (uid, gid) = expected_state_owner(transport);
     anyhow::ensure!(
-        metadata.is_exact_file(0o600),
+        metadata.file_type().is_dir()
+            && metadata.uid() == uid
+            && metadata.gid() == gid
+            && metadata.mode() & 0o022 == 0,
+        "Node state directory violates owner/mode/type contract"
+    );
+    Ok(())
+}
+
+fn open_and_lock_host_file(
+    state_directory: &File,
+    transport: RegistrationTransport,
+) -> anyhow::Result<File> {
+    let lock = open_file_at(
+        state_directory,
+        OsStr::new(HOST_LOCK_BASENAME),
+        libc::O_RDWR,
+        0,
+        Path::new(HOST_LOCK_BASENAME),
+    )?;
+    let metadata = StableMetadata::new(&lock.metadata()?);
+    let (uid, gid) = expected_state_owner(transport);
+    anyhow::ensure!(
+        metadata.is_exact_file_for(0o600, uid, gid),
         "Host lock violates owner/mode/type contract"
+    );
+    lock_exclusive_nonblocking(&lock)?;
+    Ok(lock)
+}
+
+fn create_and_lock_test_host_file(state_directory: &File) -> anyhow::Result<File> {
+    let lock = open_file_at(
+        state_directory,
+        OsStr::new(HOST_LOCK_BASENAME),
+        libc::O_RDWR | libc::O_CREAT,
+        0o600,
+        Path::new(HOST_LOCK_BASENAME),
+    )?;
+    lock.set_permissions(std::fs::Permissions::from_mode(0o600))?;
+    let (uid, gid) = expected_state_owner(RegistrationTransport::LoopbackTest);
+    anyhow::ensure!(
+        StableMetadata::new(&lock.metadata()?).is_exact_file_for(0o600, uid, gid),
+        "test Host lock violates owner/mode/type contract"
     );
     lock_exclusive_nonblocking(&lock)?;
     Ok(lock)
@@ -735,6 +903,21 @@ fn lock_exclusive_nonblocking(file: &File) -> anyhow::Result<()> {
     let result = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
     anyhow::ensure!(result == 0, "another Node process holds the Host lock");
     Ok(())
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+struct StableDirectoryIdentity {
+    dev: u64,
+    ino: u64,
+}
+
+impl StableDirectoryIdentity {
+    fn new(metadata: &std::fs::Metadata) -> Self {
+        Self {
+            dev: metadata.dev(),
+            ino: metadata.ino(),
+        }
+    }
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -768,10 +951,14 @@ impl StableMetadata {
     }
 
     fn is_exact_file(self, mode: u32) -> bool {
+        self.is_exact_file_for(mode, 0, 0)
+    }
+
+    fn is_exact_file_for(self, mode: u32, uid: u32, gid: u32) -> bool {
         self.is_file
             && self.mode & 0o777 == mode
-            && self.uid == 0
-            && self.gid == 0
+            && self.uid == uid
+            && self.gid == gid
             && self.nlink == 1
     }
 }
@@ -794,26 +981,58 @@ fn jittered(base: Duration, attempt_id: &RandomId128) -> Duration {
     base.saturating_mul(percent as u32) / 100
 }
 
-fn ensure_registration_directory(
-    path: &Path,
-    transport: RegistrationTransport,
-) -> anyhow::Result<()> {
-    use std::os::unix::fs::DirBuilderExt as _;
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DurableStatePoint {
+    RegistrationDirectoryCreated,
+    RegistrationDirectoryParentSynced,
+    TemporaryFileSynced,
+    StateRenamed,
+    StateParentSynced,
+    StateRemoved,
+    StateRemovalParentSynced,
+}
 
-    let mut builder = std::fs::DirBuilder::new();
-    builder.recursive(true).mode(0o700);
-    builder.create(path)?;
-    let metadata = std::fs::symlink_metadata(path)?;
+fn durability_noop(_point: DurableStatePoint) -> anyhow::Result<()> {
+    Ok(())
+}
+
+fn ensure_registration_directory(
+    state_directory: &File,
+    transport: RegistrationTransport,
+    mut probe: impl FnMut(DurableStatePoint) -> anyhow::Result<()>,
+) -> anyhow::Result<File> {
+    let name = CString::new("agent-registration").expect("fixed directory has no NUL");
+    // SAFETY: the state directory descriptor and fixed C string remain live
+    // for the call. mkdirat has no retained Rust-memory references.
+    let created = match unsafe { libc::mkdirat(state_directory.as_raw_fd(), name.as_ptr(), 0o700) }
+    {
+        0 => true,
+        _ if std::io::Error::last_os_error().kind() == std::io::ErrorKind::AlreadyExists => false,
+        _ => return Err(std::io::Error::last_os_error()).context("create Agent registration dir"),
+    };
+    if created {
+        probe(DurableStatePoint::RegistrationDirectoryCreated)?;
+    }
+    let directory = open_directory_at(
+        state_directory,
+        name.as_c_str(),
+        Path::new("agent-registration"),
+    )?;
+    let metadata = directory.metadata()?;
     let (uid, gid) = expected_state_owner(transport);
     anyhow::ensure!(
         metadata.file_type().is_dir()
-            && !metadata.file_type().is_symlink()
             && metadata.uid() == uid
             && metadata.gid() == gid
             && metadata.mode() & 0o777 == 0o700,
         "Agent registration state directory violates owner/mode/type contract"
     );
-    Ok(())
+    // Always sync the state directory, not only when mkdirat reported
+    // creation. After a power loss the directory entry may be visible again
+    // even though the previous parent fsync never became durable.
+    state_directory.sync_all()?;
+    probe(DurableStatePoint::RegistrationDirectoryParentSynced)?;
+    Ok(directory)
 }
 
 fn expected_state_owner(transport: RegistrationTransport) -> (u32, u32) {
@@ -825,19 +1044,24 @@ fn expected_state_owner(transport: RegistrationTransport) -> (u32, u32) {
     }
 }
 
-fn read_optional_bounded(
+fn read_optional_bounded_at(
+    directory: &File,
+    name: &OsStr,
     path: &Path,
     cap: usize,
     transport: RegistrationTransport,
 ) -> anyhow::Result<Option<Vec<u8>>> {
-    let mut file = match OpenOptions::new()
-        .read(true)
-        .custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW)
-        .open(path)
-    {
+    let mut file = match open_file_at(directory, name, libc::O_RDONLY, 0, path) {
         Ok(file) => file,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-        Err(error) => return Err(error).with_context(|| format!("open {}", path.display())),
+        Err(error)
+            if error
+                .root_cause()
+                .downcast_ref::<std::io::Error>()
+                .is_some_and(|error| error.kind() == std::io::ErrorKind::NotFound) =>
+        {
+            return Ok(None);
+        }
+        Err(error) => return Err(error),
     };
     let metadata = file.metadata()?;
     let before = StableMetadata::new(&metadata);
@@ -870,41 +1094,100 @@ fn read_optional_bounded(
     Ok(Some(bytes))
 }
 
-fn atomic_replace(path: &Path, bytes: &[u8]) -> anyhow::Result<()> {
-    let parent = path.parent().context("durable state path has no parent")?;
-    std::fs::create_dir_all(parent)?;
-    let temporary = parent.join(format!(
-        ".registration-{}.tmp",
-        uuid::Uuid::new_v4().simple()
-    ));
-    let mut file = OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .mode(0o600)
-        .custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW)
-        .open(&temporary)?;
-    file.write_all(bytes)?;
-    file.sync_all()?;
-    std::fs::rename(&temporary, path)?;
-    File::open(parent)?.sync_all()?;
-    Ok(())
+fn atomic_replace_at(directory: &File, name: &OsStr, bytes: &[u8]) -> anyhow::Result<()> {
+    atomic_replace_at_with_probe(directory, name, bytes, durability_noop)
 }
 
-fn remove_durable(path: &Path) -> anyhow::Result<()> {
-    match std::fs::remove_file(path) {
-        Ok(()) => {}
+fn atomic_replace_at_with_probe(
+    directory: &File,
+    name: &OsStr,
+    bytes: &[u8],
+    mut probe: impl FnMut(DurableStatePoint) -> anyhow::Result<()>,
+) -> anyhow::Result<()> {
+    let temporary = format!(".registration-{}.tmp", uuid::Uuid::new_v4().simple());
+    let temporary = OsStr::new(&temporary);
+    let display = Path::new(temporary);
+    let mut file = open_file_at(
+        directory,
+        temporary,
+        libc::O_WRONLY | libc::O_CREAT | libc::O_EXCL,
+        0o600,
+        display,
+    )?;
+    let result = (|| {
+        file.write_all(bytes)?;
+        file.sync_all()?;
+        probe(DurableStatePoint::TemporaryFileSynced)?;
+        rename_at(directory, temporary, name)?;
+        probe(DurableStatePoint::StateRenamed)?;
+        directory.sync_all()?;
+        probe(DurableStatePoint::StateParentSynced)?;
+        Ok(())
+    })();
+    if result.is_err() {
+        let _ = unlink_at(directory, temporary);
+    }
+    result
+}
+
+fn remove_durable_at(directory: &File, name: &OsStr) -> anyhow::Result<()> {
+    remove_durable_at_with_probe(directory, name, durability_noop)
+}
+
+fn remove_durable_at_with_probe(
+    directory: &File,
+    name: &OsStr,
+    mut probe: impl FnMut(DurableStatePoint) -> anyhow::Result<()>,
+) -> anyhow::Result<()> {
+    match unlink_at(directory, name) {
+        Ok(()) => probe(DurableStatePoint::StateRemoved)?,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
         Err(error) => return Err(error.into()),
     }
-    File::open(path.parent().context("durable state path has no parent")?)?.sync_all()?;
+    directory.sync_all()?;
+    probe(DurableStatePoint::StateRemovalParentSynced)?;
     Ok(())
+}
+
+fn rename_at(directory: &File, from: &OsStr, to: &OsStr) -> anyhow::Result<()> {
+    let from = CString::new(from.as_bytes())?;
+    let to = CString::new(to.as_bytes())?;
+    // SAFETY: both names are one-component C strings and the live directory
+    // descriptor is used for both sides, so the rename cannot escape it.
+    let result = unsafe {
+        libc::renameat(
+            directory.as_raw_fd(),
+            from.as_ptr(),
+            directory.as_raw_fd(),
+            to.as_ptr(),
+        )
+    };
+    if result == 0 {
+        Ok(())
+    } else {
+        Err(std::io::Error::last_os_error()).context("rename durable Agent state")
+    }
+}
+
+fn unlink_at(directory: &File, name: &OsStr) -> std::io::Result<()> {
+    let name = CString::new(name.as_bytes())
+        .map_err(|_| std::io::Error::new(std::io::ErrorKind::InvalidInput, "NUL in file name"))?;
+    // SAFETY: `directory` and `name` are live for the call. No Rust memory is
+    // retained and flags=0 only removes a non-directory entry.
+    let result = unsafe { libc::unlinkat(directory.as_raw_fd(), name.as_ptr(), 0) };
+    if result == 0 {
+        Ok(())
+    } else {
+        Err(std::io::Error::last_os_error())
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use base64::Engine as _;
-    use cats_api::runtime_reconciliation::{Id, Sha256Digest};
+    use cats_api::runtime_reconciliation::{AsciiText, Id, Sha256Digest};
+    use std::sync::{Arc, Barrier};
 
     fn vector_material() -> (Vec<u8>, Vec<u8>, Vec<u8>) {
         let mut der = hex::decode("302e020100300506032b657004220420").unwrap();
@@ -936,6 +1219,26 @@ mod tests {
             pem,
             b"credential_a\n".to_vec(),
         )
+    }
+
+    fn loopback_registration(state_path: PathBuf) -> AgentRegistrationConfig {
+        let (identity, key, credential) = vector_material();
+        let (identity, signer) = validate_identity_material(&identity, &key, &credential).unwrap();
+        let receipt = GuestRuntimeProfileReceipt {
+            version: ContractVersion::V1,
+            kernel_digest: Sha256Digest::new(format!("sha256:{}", "1".repeat(64))).unwrap(),
+            initramfs_digest: None,
+            kernel_cmdline: AsciiText::new("console=hvc0 root=/dev/vda").unwrap(),
+            guest_agent_protocol_version: ContractVersion::V1,
+        };
+        AgentRegistrationConfig::for_loopback_test(
+            identity,
+            signer,
+            state_path,
+            NodeBootId::new("11111111111111111111111111111111").unwrap(),
+            &receipt,
+        )
+        .unwrap()
     }
 
     #[test]
@@ -998,5 +1301,171 @@ mod tests {
             RegistrationTransport::LoopbackTest
         )
         .is_err());
+    }
+
+    #[test]
+    fn renamed_state_directory_never_redirects_the_locked_process_to_replacement_state() {
+        let temp = tempfile::tempdir().unwrap();
+        let state_path = temp.path().join("state");
+        let registration = loopback_registration(state_path.clone());
+        let old_registration_directory = ensure_registration_directory(
+            &registration.state_directory,
+            RegistrationTransport::LoopbackTest,
+            durability_noop,
+        )
+        .unwrap();
+        atomic_replace_at(
+            &old_registration_directory,
+            OsStr::new("pending-attempt.json"),
+            b"old-directory",
+        )
+        .unwrap();
+
+        let barrier = Arc::new(Barrier::new(2));
+        let worker_barrier = barrier.clone();
+        let worker_state = state_path.clone();
+        let displaced = temp.path().join("state-displaced");
+        let replacer = std::thread::spawn(move || {
+            worker_barrier.wait();
+            std::fs::rename(&worker_state, &displaced).unwrap();
+            std::fs::create_dir(&worker_state).unwrap();
+            let replacement_registration = worker_state.join("agent-registration");
+            std::fs::create_dir(&replacement_registration).unwrap();
+            std::fs::set_permissions(
+                &replacement_registration,
+                std::fs::Permissions::from_mode(0o700),
+            )
+            .unwrap();
+            std::fs::write(
+                replacement_registration.join("pending-attempt.json"),
+                b"replacement-directory",
+            )
+            .unwrap();
+        });
+        barrier.wait();
+        replacer.join().unwrap();
+
+        assert!(registration.ensure_state_directory_identity().is_err());
+        let retained = read_optional_bounded_at(
+            &old_registration_directory,
+            OsStr::new("pending-attempt.json"),
+            Path::new("pending-attempt.json"),
+            64,
+            RegistrationTransport::LoopbackTest,
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(retained, b"old-directory");
+        assert_eq!(
+            std::fs::read(state_path.join(PENDING_ATTEMPT_RELATIVE_PATH)).unwrap(),
+            b"replacement-directory"
+        );
+        // A replacement process can lock the replacement inode, but the old
+        // process has already failed its canonical-directory identity check
+        // and can neither send nor persist another attempt there.
+        let replacement = loopback_registration(state_path);
+        replacement.ensure_state_directory_identity().unwrap();
+    }
+
+    #[test]
+    fn every_registration_state_durability_window_replays_to_exact_bytes() {
+        let temp = tempfile::tempdir().unwrap();
+        let state_path = temp.path().join("state");
+        std::fs::create_dir(&state_path).unwrap();
+        let state_directory = File::open(&state_path).unwrap();
+        let mut failed_creation = false;
+        assert!(ensure_registration_directory(
+            &state_directory,
+            RegistrationTransport::LoopbackTest,
+            |point| {
+                if point == DurableStatePoint::RegistrationDirectoryCreated {
+                    failed_creation = true;
+                    anyhow::bail!("injected power loss after mkdir")
+                }
+                Ok(())
+            }
+        )
+        .is_err());
+        assert!(failed_creation);
+        let registration_directory = ensure_registration_directory(
+            &state_directory,
+            RegistrationTransport::LoopbackTest,
+            durability_noop,
+        )
+        .unwrap();
+
+        for name in ["pending-attempt.json", "session.json"] {
+            for failure_point in [
+                DurableStatePoint::TemporaryFileSynced,
+                DurableStatePoint::StateRenamed,
+                DurableStatePoint::StateParentSynced,
+            ] {
+                let mut injected = false;
+                assert!(atomic_replace_at_with_probe(
+                    &registration_directory,
+                    OsStr::new(name),
+                    name.as_bytes(),
+                    |point| {
+                        if !injected && point == failure_point {
+                            injected = true;
+                            anyhow::bail!("injected state-write power loss")
+                        }
+                        Ok(())
+                    }
+                )
+                .is_err());
+                assert!(injected);
+                atomic_replace_at(&registration_directory, OsStr::new(name), name.as_bytes())
+                    .unwrap();
+                assert_eq!(
+                    read_optional_bounded_at(
+                        &registration_directory,
+                        OsStr::new(name),
+                        Path::new(name),
+                        64,
+                        RegistrationTransport::LoopbackTest,
+                    )
+                    .unwrap()
+                    .unwrap(),
+                    name.as_bytes()
+                );
+            }
+        }
+
+        for failure_point in [
+            DurableStatePoint::StateRemoved,
+            DurableStatePoint::StateRemovalParentSynced,
+        ] {
+            atomic_replace_at(
+                &registration_directory,
+                OsStr::new("pending-attempt.json"),
+                b"pending",
+            )
+            .unwrap();
+            let mut injected = false;
+            assert!(remove_durable_at_with_probe(
+                &registration_directory,
+                OsStr::new("pending-attempt.json"),
+                |point| {
+                    if !injected && point == failure_point {
+                        injected = true;
+                        anyhow::bail!("injected state-remove power loss")
+                    }
+                    Ok(())
+                }
+            )
+            .is_err());
+            assert!(injected);
+            remove_durable_at(&registration_directory, OsStr::new("pending-attempt.json")).unwrap();
+            assert!(read_optional_bounded_at(
+                &registration_directory,
+                OsStr::new("pending-attempt.json"),
+                Path::new("pending-attempt.json"),
+                64,
+                RegistrationTransport::LoopbackTest,
+            )
+            .unwrap()
+            .is_none());
+        }
     }
 }

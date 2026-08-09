@@ -76,14 +76,10 @@ required, not cosmetic:
 node process, so an updated image is otherwise ignored. Existing Cats keep
 their current root until they are recreated.
 
-The bundle does **not** carry the Host kernel, initramfs or a freshly
-debootstrapped Ubuntu filesystem. Changes to those parts of
-`metal/build-guest-image.sh` (including the base package set,
-`cats-init` or `cats-network-setup`) still require rebuilding on the Host with
-`OUT=/opt/cats/guest metal/build-guest-image.sh`, followed by a worker restart;
-the Guest kernel is the Host's own, which is why the complete boot artifact is
-not built in CI. `metal/install-worker.sh` remains a bootstrap/development
-helper. It requires `CATS_ROUTE_GRANT_PUBLIC_KEY_FILE` to point at the reviewed
+The bundle carries the one CI-built, manifest-bound Guest kernel, optional
+initramfs and runtime receipt; a Host-local rebuild is not release input and
+does not qualify as rollback. `metal/install-worker.sh` remains a
+bootstrap/development helper. It requires `CATS_ROUTE_GRANT_PUBLIC_KEY_FILE` to point at the reviewed
 Ed25519 public key before it changes packages, installed files or services; for
 example, run `sudo CATS_ROUTE_GRANT_PUBLIC_KEY_FILE=/secure/path/public.pem
 deploy/aws/metal/install-worker.sh`. The helper validates and stages that key,
@@ -114,6 +110,19 @@ derives `node_id`, immutable Host identity and `/var/lib/cats/node/<state_path_i
 worker name, advertise address and IMDS are not registration identity. The shared Guest payload has the exact
 closed layout and manifest defined by the composition contract; Control and worker artifacts must report one
 matching immutable release ID before either can be deployed.
+
+### Runtime-cutover composition gate
+
+The Agent-registration slice is not a standalone deployable release. It may be
+cherry-picked into production only together with the A20 signed Desired and
+observation routes: a newly accepted observation must renew the exact current
+`AgentSession`, the Node-loss detector must derive liveness from that signed
+session/observation state, and `/v1/nodes/heartbeat` must be absent (a service
+or admin bearer request receives plain 404 and writes nothing). Until all three
+conditions are present in one tested commit, deploying this worker/Control
+pair would expire every new 60-second session while the legacy loss detector
+independently marks the Node lost. Restoring the shared-bearer heartbeat is not
+a rollout or compatibility option.
 
 The worker builds an optimized Ubuntu 24.04 Guest: direct kernel, a minimal
 BusyBox initramfs used only for `switch_root`, and an Ubuntu minbase golden root

@@ -1755,6 +1755,20 @@ fn agent_registration_deployments_share_one_canonical_release_receipt() {
         workflow.contains("tar --owner=0 --group=0 --numeric-owner -C worker-out"),
         "the worker archive must preserve the root-owned release member contract"
     );
+    for guide in ["deploy/aws/README.md", "deploy/metal/README.md"] {
+        let guide = read_workspace_file(guide);
+        for composition_gate in [
+            "not a standalone deployable release",
+            "A20 signed Desired",
+            "/v1/nodes/heartbeat",
+            "shared-bearer heartbeat",
+        ] {
+            assert!(
+                guide.contains(composition_gate),
+                "runtime cutover guide lost composition blocker {composition_gate:?}"
+            );
+        }
+    }
 }
 
 #[test]
@@ -1764,14 +1778,17 @@ fn worker_release_install_is_closed_durable_and_identity_fail_closed() {
         "actual != expected",
         "actual_directories != {\"guest\"}",
         "metadata.st_nlink != 1",
-        "metadata.st_uid != 0",
+        "metadata.st_uid != required_uid",
         "stat.S_IMODE(metadata.st_mode) != 0o644",
-        "find \"$incomplete\" -type f -exec sync -f {} +",
+        "sync_release_tree \"$destination\"",
         "mv -T -- \"$incomplete\" \"$target_set\"",
-        "materialize_active \"$previous_incomplete\"",
-        "find \"$previous_incomplete\" -type f -exec sync -f {} +",
+        "previous_id=$(persist_active_set)",
+        "write_activation \"$release_id\" \"$previous_id\"",
+        "recover_activation",
+        "activation-parent-fsync",
+        "active-layout-parent-fsync:cats-root",
         "trap rollback ERR",
-        "guest-runtime-release-manifest.v1.json.incoming",
+        "active-rename:$label",
     ] {
         assert!(
             installer.contains(invariant),
@@ -1779,10 +1796,10 @@ fn worker_release_install_is_closed_durable_and_identity_fail_closed() {
         );
     }
     let kernel_activation = installer
-        .find("guest/vmlinuz|/opt/cats/guest/vmlinuz")
+        .find("\"$set/guest/vmlinuz\" \"$active_guest_root/vmlinuz\" kernel")
         .expect("kernel activation");
     let manifest_activation = installer
-        .find("mv -fT -- \"$temp\" /opt/cats/release/guest-runtime-release-manifest.v1.json")
+        .find("\"$set/manifest.v1.json\" \\")
         .expect("manifest activation");
     assert!(
         kernel_activation < manifest_activation,
@@ -1833,14 +1850,25 @@ fn worker_release_install_is_closed_durable_and_identity_fail_closed() {
     let release_verify = terraform
         .find("install-guest-runtime-release.sh\" verify")
         .expect("staged release verification");
+    let identity_validate = terraform
+        .find("validate-node-identity-installation.sh\"")
+        .expect("staged identity validation");
+    let idle_guard = terraform
+        .find("require-idle-worker.sh\"")
+        .expect("drained worker guard");
     let stop = terraform
         .find("systemctl stop cats-worker")
         .expect("worker stop");
     let first_install = terraform
         .find("install -D -m 0755 \"$stage_path/cats-noded\"")
         .expect("first installed byte");
-    assert!(archive_listing < archive_extract && archive_extract < release_verify);
-    assert!(release_verify < stop && stop < first_install);
+    assert!(
+        archive_listing < archive_extract
+            && archive_extract < release_verify
+            && release_verify < identity_validate,
+        "nothing from the empty stage may execute before verified extraction"
+    );
+    assert!(identity_validate < idle_guard && idle_guard < stop && stop < first_install);
     for forbidden in ["169.254.169.254", "CATS_NODE_ID=", "--node-id"] {
         assert!(
             !terraform.contains(forbidden),

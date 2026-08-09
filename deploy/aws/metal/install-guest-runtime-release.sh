@@ -5,6 +5,14 @@ set -euo pipefail
 mode=${1:-}
 source_root=${2:-}
 node_service=${CATS_NODE_SERVICE_NAME:-cats-worker}
+cats_root=/opt/cats
+required_uid=0
+required_gid=0
+
+# Production deliberately has no crash-injection environment variable. Linux
+# regression tests replace this no-op in a private copy and kill the process
+# at each labeled durability boundary.
+crash_probe() { :; }
 [[ $mode == verify || $mode == install ]] || {
   echo "usage: $0 verify|install <guest-runtime-release.v1>" >&2
   exit 2
@@ -13,12 +21,15 @@ node_service=${CATS_NODE_SERVICE_NAME:-cats-worker}
 
 verify_release() {
   local root=$1
-  python3 - "$root" <<'PY'
+  python3 - "$root" "$required_uid" "$required_gid" <<'PY'
 import hashlib, json, os, stat, sys
 
 root = os.path.abspath(sys.argv[1])
+required_uid = int(sys.argv[2])
+required_gid = int(sys.argv[3])
 root_metadata = os.lstat(root)
-if not stat.S_ISDIR(root_metadata.st_mode) or stat.S_ISLNK(root_metadata.st_mode):
+if (not stat.S_ISDIR(root_metadata.st_mode) or stat.S_ISLNK(root_metadata.st_mode)
+        or root_metadata.st_uid != required_uid or root_metadata.st_gid != required_gid):
     raise SystemExit("release root is not a real directory")
 manifest_path = os.path.join(root, "manifest.v1.json")
 with open(manifest_path, "rb", buffering=0) as source:
@@ -59,7 +70,7 @@ for directory, names, filenames in os.walk(root, followlinks=False):
             actual_directories.add(relative)
         if name in filenames:
             if (not stat.S_ISREG(metadata.st_mode) or metadata.st_nlink != 1
-                    or metadata.st_uid != 0 or metadata.st_gid != 0
+                    or metadata.st_uid != required_uid or metadata.st_gid != required_gid
                     or stat.S_IMODE(metadata.st_mode) != 0o644):
                 raise SystemExit(f"release member is not a single-link regular file: {relative}")
             actual.add(relative)
@@ -122,106 +133,249 @@ systemctl is-active --quiet "$node_service" && {
   exit 1
 }
 
-sets_root=/opt/cats/releases/sets
-incomplete=/opt/cats/releases/.incomplete
-install -d -o root -g root -m 0700 "$sets_root" /opt/cats/releases
-rm -rf -- "$incomplete"
-install -d -o root -g root -m 0700 "$incomplete"
-cp -a -- "$source_root/." "$incomplete/"
-find "$incomplete" -type d -exec chmod 0700 {} +
-find "$incomplete" -type f -exec chown root:root {} + -exec chmod 0644 {} +
-test "$(verify_release "$incomplete")" = "$release_id"
-find "$incomplete" -type f -exec sync -f {} +
-find "$incomplete" -depth -type d -exec sync -f {} +
-target_set="$sets_root/$release_id"
-if [[ -e $target_set ]]; then
-  test "$(verify_release "$target_set")" = "$release_id"
-  rm -rf -- "$incomplete"
-else
-  mv -T -- "$incomplete" "$target_set"
-  sync -f "$sets_root"
-fi
+releases_root="$cats_root/releases"
+sets_root="$releases_root/sets"
+activation_path="$releases_root/activation.v1"
+active_release_root="$cats_root/release"
+active_guest_root="$cats_root/guest"
+install -d -o "$required_uid" -g "$required_gid" -m 0700 "$sets_root" "$releases_root"
+sync -f "$sets_root"
+crash_probe "layout-directory-fsync:sets"
+sync -f "$releases_root"
+crash_probe "layout-directory-fsync:releases"
+sync -f "$cats_root"
+crash_probe "layout-parent-fsync:cats-root"
 
-install_set() {
-  local set=$1 active_path source_path temp
-  install -d -o root -g root -m 0755 /opt/cats/release /opt/cats/guest
-  while IFS='|' read -r source_path active_path; do
-    temp="${active_path}.incoming.$$"
-    install -o root -g root -m 0644 "$set/$source_path" "$temp"
-    sync -f "$temp"
-    mv -fT -- "$temp" "$active_path"
-    sync -f "$active_path"
-    sync -f "$(dirname "$active_path")"
-  done <<'EOF'
-guest-runtime-profile.v1.json|/opt/cats/release/guest-runtime-profile.v1.json
-guest/vmlinuz|/opt/cats/guest/vmlinuz
-EOF
-  if [[ -f $set/guest/initramfs.img ]]; then
-    temp="/opt/cats/guest/initramfs.img.incoming.$$"
-    install -o root -g root -m 0644 "$set/guest/initramfs.img" "$temp"
-    sync -f "$temp"
-    mv -fT -- "$temp" /opt/cats/guest/initramfs.img
-    sync -f /opt/cats/guest/initramfs.img /opt/cats/guest
-  else
-    rm -f -- /opt/cats/guest/initramfs.img
-    sync -f /opt/cats/guest
+valid_release_id() {
+  [[ $1 =~ ^sha256:[0-9a-f]{64}$ ]]
+}
+
+sync_release_tree() {
+  local tree=$1 relative
+  while IFS= read -r relative; do
+    sync -f "$tree/$relative" || return 1
+    crash_probe "set-file-fsync:$relative" || return 1
+  done < <(find "$tree" -type f -printf '%P\n' | LC_ALL=C sort)
+  sync -f "$tree/guest" || return 1
+  crash_probe "set-directory-fsync:guest" || return 1
+  sync -f "$tree" || return 1
+  crash_probe "set-directory-fsync:root" || return 1
+}
+
+copy_source_tree() {
+  local source=$1 destination=$2 relative
+  rm -rf -- "$destination" || return 1
+  install -d -o "$required_uid" -g "$required_gid" -m 0700 "$destination/guest" || return 1
+  for relative in manifest.v1.json guest-runtime-profile.v1.json guest/vmlinuz; do
+    install -o "$required_uid" -g "$required_gid" -m 0644 \
+      "$source/$relative" "$destination/$relative" || return 1
+    crash_probe "set-copy:$relative" || return 1
+  done
+  if [[ -f $source/guest/initramfs.img ]]; then
+    install -o "$required_uid" -g "$required_gid" -m 0644 \
+      "$source/guest/initramfs.img" "$destination/guest/initramfs.img" || return 1
+    crash_probe "set-copy:guest/initramfs.img" || return 1
   fi
-  temp="/opt/cats/release/guest-runtime-release-manifest.v1.json.incoming.$$"
-  install -o root -g root -m 0644 "$set/manifest.v1.json" "$temp"
-  sync -f "$temp"
-  mv -fT -- "$temp" /opt/cats/release/guest-runtime-release-manifest.v1.json
-  sync -f /opt/cats/release/guest-runtime-release-manifest.v1.json /opt/cats/release
+  sync_release_tree "$destination" || return 1
+}
+
+complete_set() {
+  local incomplete=$1 expected_id=$2 target_set
+  target_set="$sets_root/$expected_id"
+  test "$(verify_release "$incomplete")" = "$expected_id" || return 1
+  if [[ -e $target_set || -L $target_set ]]; then
+    test "$(verify_release "$target_set")" = "$expected_id" || return 1
+    rm -rf -- "$incomplete" || return 1
+  else
+    mv -T -- "$incomplete" "$target_set" || return 1
+    crash_probe "set-marker-rename:$expected_id" || return 1
+  fi
+  # Sync even on exact replay: a process may have died after rename but before
+  # the parent-directory durability boundary.
+  sync -f "$sets_root" || return 1
+  crash_probe "set-marker-parent-fsync:$expected_id" || return 1
+  printf '%s\n' "$target_set"
+}
+
+persist_source_set() {
+  local source=$1 expected_id=$2 role=$3 incomplete
+  incomplete="$releases_root/.$role.incomplete"
+  copy_source_tree "$source" "$incomplete" || return 1
+  complete_set "$incomplete" "$expected_id" || return 1
 }
 
 materialize_active() {
   local destination=$1
-  install -d -o root -g root -m 0700 "$destination/guest"
-  install -o root -g root -m 0644 \
-    /opt/cats/release/guest-runtime-release-manifest.v1.json \
-    "$destination/manifest.v1.json"
-  install -o root -g root -m 0644 \
-    /opt/cats/release/guest-runtime-profile.v1.json \
-    "$destination/guest-runtime-profile.v1.json"
-  install -o root -g root -m 0644 /opt/cats/guest/vmlinuz "$destination/guest/vmlinuz"
-  if [[ -e /opt/cats/guest/initramfs.img ]]; then
-    install -o root -g root -m 0644 \
-      /opt/cats/guest/initramfs.img "$destination/guest/initramfs.img"
+  rm -rf -- "$destination" || return 1
+  install -d -o "$required_uid" -g "$required_gid" -m 0700 "$destination/guest" || return 1
+  install -o "$required_uid" -g "$required_gid" -m 0644 \
+    "$active_release_root/guest-runtime-release-manifest.v1.json" \
+    "$destination/manifest.v1.json" || return 1
+  install -o "$required_uid" -g "$required_gid" -m 0644 \
+    "$active_release_root/guest-runtime-profile.v1.json" \
+    "$destination/guest-runtime-profile.v1.json" || return 1
+  install -o "$required_uid" -g "$required_gid" -m 0644 \
+    "$active_guest_root/vmlinuz" "$destination/guest/vmlinuz" || return 1
+  if [[ -e $active_guest_root/initramfs.img || -L $active_guest_root/initramfs.img ]]; then
+    install -o "$required_uid" -g "$required_gid" -m 0644 \
+      "$active_guest_root/initramfs.img" "$destination/guest/initramfs.img" || return 1
   fi
 }
 
-previous_set=""
-if [[ -e /opt/cats/release/guest-runtime-release-manifest.v1.json ]]; then
-  previous_incomplete=/opt/cats/releases/.previous.incomplete
-  rm -rf -- "$previous_incomplete"
-  materialize_active "$previous_incomplete"
-  previous_id=$(verify_release "$previous_incomplete")
-  previous_set="$sets_root/$previous_id"
-  find "$previous_incomplete" -type f -exec sync -f {} +
-  find "$previous_incomplete" -depth -type d -exec sync -f {} +
-  if [[ -e $previous_set ]]; then
-    test "$(verify_release "$previous_set")" = "$previous_id"
-    rm -rf -- "$previous_incomplete"
+verify_active() {
+  local expected_id=$1 verification="$releases_root/.active-verification"
+  rm -rf -- "$verification" || return 1
+  materialize_active "$verification" || return 1
+  test "$(verify_release "$verification")" = "$expected_id" || return 1
+  rm -rf -- "$verification" || return 1
+  sync -f "$releases_root" || return 1
+}
+
+persist_active_set() {
+  local incomplete="$releases_root/.previous.incomplete" previous_id
+  materialize_active "$incomplete" || return 1
+  previous_id=$(verify_release "$incomplete") || return 1
+  sync_release_tree "$incomplete" || return 1
+  complete_set "$incomplete" "$previous_id" >/dev/null || return 1
+  printf '%s\n' "$previous_id"
+}
+
+install_active_member() {
+  local source=$1 active=$2 label=$3 temp
+  temp="${active}.incoming"
+  rm -f -- "$temp"
+  install -o "$required_uid" -g "$required_gid" -m 0644 "$source" "$temp" || return 1
+  crash_probe "active-copy:$label" || return 1
+  sync -f "$temp" || return 1
+  crash_probe "active-temp-fsync:$label" || return 1
+  mv -fT -- "$temp" "$active" || return 1
+  crash_probe "active-rename:$label" || return 1
+  sync -f "$active" || return 1
+  crash_probe "active-file-fsync:$label" || return 1
+  sync -f "$(dirname "$active")" || return 1
+  crash_probe "active-parent-fsync:$label" || return 1
+}
+
+install_set() {
+  local set=$1
+  install -d -o "$required_uid" -g "$required_gid" -m 0755 \
+    "$active_release_root" "$active_guest_root" || return 1
+  sync -f "$active_release_root" || return 1
+  crash_probe "active-layout-directory-fsync:release" || return 1
+  sync -f "$active_guest_root" || return 1
+  crash_probe "active-layout-directory-fsync:guest" || return 1
+  sync -f "$cats_root" || return 1
+  crash_probe "active-layout-parent-fsync:cats-root" || return 1
+  install_active_member "$set/guest-runtime-profile.v1.json" \
+    "$active_release_root/guest-runtime-profile.v1.json" receipt || return 1
+  install_active_member "$set/guest/vmlinuz" "$active_guest_root/vmlinuz" kernel || return 1
+  if [[ -f $set/guest/initramfs.img ]]; then
+    install_active_member "$set/guest/initramfs.img" \
+      "$active_guest_root/initramfs.img" initramfs || return 1
   else
-    mv -T -- "$previous_incomplete" "$previous_set"
-    sync -f "$sets_root"
+    rm -f -- "$active_guest_root/initramfs.img" || return 1
+    crash_probe "active-remove:initramfs" || return 1
+    sync -f "$active_guest_root" || return 1
+    crash_probe "active-parent-fsync:initramfs-absent" || return 1
   fi
+  # Manifest is the active local completion marker and is always renamed last.
+  install_active_member "$set/manifest.v1.json" \
+    "$active_release_root/guest-runtime-release-manifest.v1.json" manifest || return 1
+}
+
+write_activation() {
+  local incoming_id=$1 previous_id=$2 temp="$activation_path.incoming"
+  valid_release_id "$incoming_id" || return 1
+  [[ $previous_id == none ]] || valid_release_id "$previous_id" || return 1
+  rm -f -- "$temp" || return 1
+  (umask 077; printf 'version=1\nincoming=%s\nprevious=%s\n' \
+    "$incoming_id" "$previous_id" > "$temp") || return 1
+  chown "$required_uid:$required_gid" "$temp" || return 1
+  chmod 0600 "$temp" || return 1
+  sync -f "$temp" || return 1
+  crash_probe "activation-file-fsync" || return 1
+  mv -fT -- "$temp" "$activation_path" || return 1
+  crash_probe "activation-rename" || return 1
+  sync -f "$releases_root" || return 1
+  crash_probe "activation-parent-fsync" || return 1
+}
+
+load_activation() {
+  local metadata
+  [[ -f $activation_path && ! -L $activation_path ]] || return 1
+  metadata=$(stat -c '%u:%g:%a:%h:%F' "$activation_path") || return 1
+  test "$metadata" = "$required_uid:$required_gid:600:1:regular file" || return 1
+  mapfile -t activation_lines < "$activation_path" || return 1
+  [[ ${#activation_lines[@]} -eq 3 && ${activation_lines[0]} == version=1 ]] || return 1
+  activation_incoming=${activation_lines[1]#incoming=}
+  activation_previous=${activation_lines[2]#previous=}
+  [[ ${activation_lines[1]} == "incoming=$activation_incoming" \
+      && ${activation_lines[2]} == "previous=$activation_previous" ]] || return 1
+  valid_release_id "$activation_incoming" || return 1
+  [[ $activation_previous == none ]] || valid_release_id "$activation_previous" || return 1
+  test "$(verify_release "$sets_root/$activation_incoming")" = "$activation_incoming" || return 1
+  if [[ $activation_previous != none ]]; then
+    test "$(verify_release "$sets_root/$activation_previous")" = "$activation_previous" || return 1
+  fi
+}
+
+clear_activation() {
+  rm -f -- "$activation_path" || return 1
+  crash_probe "activation-remove" || return 1
+  sync -f "$releases_root" || return 1
+  crash_probe "activation-remove-parent-fsync" || return 1
+}
+
+recover_activation() {
+  if [[ ! -e $activation_path && ! -L $activation_path ]]; then
+    return 0
+  fi
+  load_activation || return 1
+  if install_set "$sets_root/$activation_incoming" \
+      && verify_active "$activation_incoming"; then
+    clear_activation || return 1
+    return 0
+  fi
+  if [[ $activation_previous != none ]] \
+      && install_set "$sets_root/$activation_previous" \
+      && verify_active "$activation_previous"; then
+    clear_activation || return 1
+    return 0
+  fi
+  echo "cannot recover the durable Guest release activation" >&2
+  return 1
+}
+
+# Complete or roll back any earlier interrupted activation before deriving the
+# current active set. Never snapshot a potentially mixed active directory.
+recover_activation
+
+target_set=$(persist_source_set "$source_root" "$release_id" incoming)
+previous_id=none
+active_manifest="$active_release_root/guest-runtime-release-manifest.v1.json"
+if [[ -e $active_manifest || -L $active_manifest ]]; then
+  previous_id=$(persist_active_set)
+elif [[ -e $active_release_root/guest-runtime-profile.v1.json \
+    || -e $active_guest_root/vmlinuz \
+    || -e $active_guest_root/initramfs.img ]]; then
+  echo "partial active Guest release exists without its manifest" >&2
+  exit 1
 fi
+
+# Both referenced set-directory markers and their parent fsyncs completed
+# before this journal can become durable. The first active rename is forbidden
+# until the journal parent fsync returns.
+write_activation "$release_id" "$previous_id"
 
 rollback() {
   local status=$?
   trap - ERR
-  if [[ -n $previous_set ]]; then
-    install_set "$previous_set" || true
-  fi
+  recover_activation || true
   exit "$status"
 }
 trap rollback ERR
 install_set "$target_set"
-active_verification=/opt/cats/releases/.active-verification
-rm -rf -- "$active_verification"
-materialize_active "$active_verification"
-test "$(verify_release "$active_verification")" = "$release_id"
-rm -rf -- "$active_verification"
-sync -f /opt/cats/releases
+verify_active "$release_id"
+clear_activation
 trap - ERR
 printf '%s\n' "$release_id"

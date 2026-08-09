@@ -3,6 +3,8 @@
 use std::fs::File;
 use std::io::{Read as _, Seek as _};
 use std::path::{Path, PathBuf};
+#[cfg(unix)]
+use std::{ffi::CString, os::fd::AsRawFd as _, os::fd::FromRawFd as _};
 
 use serde::{Deserialize, Serialize};
 use sha2::{Digest as _, Sha256};
@@ -141,16 +143,21 @@ pub fn load_installed_guest_runtime_profile_receipt(
 fn load_installed_guest_runtime_profile_receipt_platform(
     receipt_path: &Path,
 ) -> Result<InstalledGuestRuntimeProfileReceipt, RuntimeArtifactError> {
-    validate_directory_chain(
-        &["/", "/opt", "/opt/cats"],
-        Some((Path::new("/opt/cats/release"), 0o755)),
-    )?;
+    let release_directory = open_installed_directory(&["opt", "cats", "release"], 0o755)?;
     let manifest_path = Path::new(GUEST_RUNTIME_RELEASE_MANIFEST_PATH);
-    let exact_manifest_bytes =
-        read_exact_installed_file(manifest_path, GUEST_RUNTIME_RELEASE_MANIFEST_MAX_BYTES)?;
+    let exact_manifest_bytes = read_exact_installed_file_at(
+        &release_directory,
+        "guest-runtime-release-manifest.v1.json",
+        manifest_path,
+        GUEST_RUNTIME_RELEASE_MANIFEST_MAX_BYTES,
+    )?;
     let manifest = decode_release_manifest(&exact_manifest_bytes)?;
-    let exact_bytes =
-        read_exact_installed_file(receipt_path, GUEST_RUNTIME_PROFILE_RECEIPT_MAX_WIRE_BYTES)?;
+    let exact_bytes = read_exact_installed_file_at(
+        &release_directory,
+        "guest-runtime-profile.v1.json",
+        receipt_path,
+        GUEST_RUNTIME_PROFILE_RECEIPT_MAX_WIRE_BYTES,
+    )?;
     validate_member_bytes(
         &manifest.guest_runtime_profile,
         "guest-runtime-profile.v1.json",
@@ -187,12 +194,13 @@ fn load_installed_guest_runtime_profile_receipt_platform(
 pub fn validate_installed_node_guest_runtime(
     installed: &InstalledGuestRuntimeProfileReceipt,
 ) -> Result<(), RuntimeArtifactError> {
-    validate_directory_chain(
-        &["/", "/opt", "/opt/cats"],
-        Some((Path::new("/opt/cats/guest"), 0o755)),
+    let guest_directory = open_installed_directory(&["opt", "cats", "guest"], 0o755)?;
+    let kernel = read_exact_installed_file_at(
+        &guest_directory,
+        "vmlinuz",
+        Path::new(GUEST_KERNEL_PATH),
+        GUEST_BOOT_MEMBER_MAX_BYTES,
     )?;
-    let kernel =
-        read_exact_installed_file(Path::new(GUEST_KERNEL_PATH), GUEST_BOOT_MEMBER_MAX_BYTES)?;
     validate_member_bytes(
         &installed.manifest.kernel,
         "guest/vmlinuz",
@@ -201,7 +209,9 @@ pub fn validate_installed_node_guest_runtime(
     )?;
     match &installed.manifest.initramfs {
         Some(member) => {
-            let initramfs = read_exact_installed_file(
+            let initramfs = read_exact_installed_file_at(
+                &guest_directory,
+                "initramfs.img",
                 Path::new(GUEST_INITRAMFS_PATH),
                 GUEST_BOOT_MEMBER_MAX_BYTES,
             )?;
@@ -212,10 +222,11 @@ pub fn validate_installed_node_guest_runtime(
                 GUEST_BOOT_MEMBER_MAX_BYTES,
             )?;
         }
-        None => match std::fs::symlink_metadata(GUEST_INITRAMFS_PATH) {
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-            _ => return Err(filesystem_error(Path::new(GUEST_INITRAMFS_PATH))),
-        },
+        None => ensure_entry_absent_at(
+            &guest_directory,
+            "initramfs.img",
+            Path::new(GUEST_INITRAMFS_PATH),
+        )?,
     }
     Ok(())
 }
@@ -235,14 +246,19 @@ pub fn open_verified_guest_runtime_launch(
     {
         return Err(RuntimeArtifactError::InvalidReceipt);
     }
-    let kernel = open_verified_installed_member(
+    let guest_directory = open_installed_directory(&["opt", "cats", "guest"], 0o755)?;
+    let kernel = open_verified_installed_member_at(
+        &guest_directory,
+        "vmlinuz",
         kernel_path,
         &contract.kernel,
         "guest/vmlinuz",
         GUEST_BOOT_MEMBER_MAX_BYTES,
     )?;
     let initramfs = match (&contract.initramfs, initramfs_path) {
-        (Some(member), Some(path)) => Some(open_verified_installed_member(
+        (Some(member), Some(path)) => Some(open_verified_installed_member_at(
+            &guest_directory,
+            "initramfs.img",
             path,
             member,
             "guest/initramfs.img",
@@ -334,47 +350,127 @@ fn release_id(exact_manifest: &[u8]) -> Sha256Digest {
 }
 
 #[cfg(unix)]
-fn validate_directory_chain(
-    ancestors: &[&str],
-    exact: Option<(&Path, u32)>,
-) -> Result<(), RuntimeArtifactError> {
+fn open_installed_directory(
+    components: &[&str],
+    final_mode: u32,
+) -> Result<File, RuntimeArtifactError> {
     use std::os::unix::fs::MetadataExt as _;
 
-    for path in ancestors.iter().map(Path::new) {
-        let metadata = std::fs::symlink_metadata(path).map_err(|_| filesystem_error(path))?;
+    let mut directory = File::open("/").map_err(|_| filesystem_error(Path::new("/")))?;
+    let root_metadata = directory
+        .metadata()
+        .map_err(|_| filesystem_error(Path::new("/")))?;
+    if !root_metadata.file_type().is_dir()
+        || root_metadata.uid() != 0
+        || root_metadata.gid() != 0
+        || root_metadata.mode() & 0o022 != 0
+    {
+        return Err(filesystem_error(Path::new("/")));
+    }
+    let mut display = PathBuf::from("/");
+    for (index, component) in components.iter().enumerate() {
+        display.push(component);
+        directory = open_directory_at(&directory, component, &display)?;
+        let metadata = directory
+            .metadata()
+            .map_err(|_| filesystem_error(&display))?;
+        let mode_is_valid = if index + 1 == components.len() {
+            metadata.mode() & 0o777 == final_mode
+        } else {
+            metadata.mode() & 0o022 == 0
+        };
         if !metadata.file_type().is_dir()
-            || metadata.file_type().is_symlink()
             || metadata.uid() != 0
             || metadata.gid() != 0
-            || metadata.mode() & 0o022 != 0
+            || !mode_is_valid
         {
-            return Err(filesystem_error(path));
+            return Err(filesystem_error(&display));
         }
     }
-    if let Some((path, mode)) = exact {
-        let metadata = std::fs::symlink_metadata(path).map_err(|_| filesystem_error(path))?;
-        if !metadata.file_type().is_dir()
-            || metadata.file_type().is_symlink()
-            || metadata.uid() != 0
-            || metadata.gid() != 0
-            || metadata.mode() & 0o777 != mode
-        {
-            return Err(filesystem_error(path));
-        }
-    }
-    Ok(())
+    Ok(directory)
 }
 
 #[cfg(unix)]
-fn read_exact_installed_file(path: &Path, cap: usize) -> Result<Vec<u8>, RuntimeArtifactError> {
-    use std::fs::OpenOptions;
-    use std::os::unix::fs::OpenOptionsExt as _;
+fn open_directory_at(
+    parent: &File,
+    name: &str,
+    display: &Path,
+) -> Result<File, RuntimeArtifactError> {
+    let name = CString::new(name).map_err(|_| filesystem_error(display))?;
+    // SAFETY: `parent` remains open for the call, `name` is NUL-terminated,
+    // and a successful descriptor is immediately owned by `File`.
+    let descriptor = unsafe {
+        libc::openat(
+            parent.as_raw_fd(),
+            name.as_ptr(),
+            libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+        )
+    };
+    if descriptor < 0 {
+        return Err(filesystem_error(display));
+    }
+    // SAFETY: `openat` returned a new owned descriptor.
+    Ok(unsafe { File::from_raw_fd(descriptor) })
+}
 
-    let mut file = OpenOptions::new()
-        .read(true)
-        .custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW)
-        .open(path)
-        .map_err(|_| filesystem_error(path))?;
+#[cfg(unix)]
+fn open_file_at(
+    directory: &File,
+    name: &str,
+    display: &Path,
+) -> Result<File, RuntimeArtifactError> {
+    let name = CString::new(name).map_err(|_| filesystem_error(display))?;
+    // SAFETY: `directory` remains open for the call, `name` is
+    // NUL-terminated, and a successful descriptor is immediately owned.
+    let descriptor = unsafe {
+        libc::openat(
+            directory.as_raw_fd(),
+            name.as_ptr(),
+            libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+        )
+    };
+    if descriptor < 0 {
+        return Err(filesystem_error(display));
+    }
+    // SAFETY: `openat` returned a new owned descriptor.
+    Ok(unsafe { File::from_raw_fd(descriptor) })
+}
+
+#[cfg(unix)]
+fn ensure_entry_absent_at(
+    directory: &File,
+    name: &str,
+    display: &Path,
+) -> Result<(), RuntimeArtifactError> {
+    let name = CString::new(name).map_err(|_| filesystem_error(display))?;
+    // SAFETY: arguments satisfy `openat`; no descriptor is retained on error.
+    let descriptor = unsafe {
+        libc::openat(
+            directory.as_raw_fd(),
+            name.as_ptr(),
+            libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+        )
+    };
+    if descriptor >= 0 {
+        // SAFETY: this branch owns the descriptor returned by `openat`.
+        drop(unsafe { File::from_raw_fd(descriptor) });
+        return Err(filesystem_error(display));
+    }
+    if std::io::Error::last_os_error().kind() == std::io::ErrorKind::NotFound {
+        Ok(())
+    } else {
+        Err(filesystem_error(display))
+    }
+}
+
+#[cfg(unix)]
+fn read_exact_installed_file_at(
+    directory: &File,
+    name: &str,
+    path: &Path,
+    cap: usize,
+) -> Result<Vec<u8>, RuntimeArtifactError> {
+    let mut file = open_file_at(directory, name, path)?;
     let before = StableFileMetadata::new(&file.metadata().map_err(|_| filesystem_error(path))?);
     if !before.is_exact_installed_file() {
         return Err(filesystem_error(path));
@@ -398,20 +494,15 @@ fn read_exact_installed_file(path: &Path, cap: usize) -> Result<Vec<u8>, Runtime
 }
 
 #[cfg(unix)]
-fn open_verified_installed_member(
+fn open_verified_installed_member_at(
+    directory: &File,
+    name: &str,
     path: &Path,
     member: &GuestRuntimeReleaseMember,
     expected_path: &str,
     cap: usize,
 ) -> Result<File, RuntimeArtifactError> {
-    use std::fs::OpenOptions;
-    use std::os::unix::fs::OpenOptionsExt as _;
-
-    let mut file = OpenOptions::new()
-        .read(true)
-        .custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW)
-        .open(path)
-        .map_err(|_| filesystem_error(path))?;
+    let mut file = open_file_at(directory, name, path)?;
     let before = StableFileMetadata::new(&file.metadata().map_err(|_| filesystem_error(path))?);
     if !before.is_exact_installed_file()
         || before.len == 0
@@ -547,5 +638,30 @@ mod tests {
             ),
             Err(RuntimeArtifactError::InvalidReceipt)
         ));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn retained_directory_descriptor_cannot_be_redirected_by_path_replacement() {
+        use std::io::Read as _;
+
+        let temp = tempfile::tempdir().unwrap();
+        let release_path = temp.path().join("release");
+        std::fs::create_dir(&release_path).unwrap();
+        std::fs::write(release_path.join("member"), b"old-directory").unwrap();
+        let parent = File::open(temp.path()).unwrap();
+        let retained = open_directory_at(&parent, "release", &release_path).unwrap();
+        std::fs::rename(&release_path, temp.path().join("release-displaced")).unwrap();
+        std::fs::create_dir(&release_path).unwrap();
+        std::fs::write(release_path.join("member"), b"replacement-directory").unwrap();
+
+        let mut member = open_file_at(&retained, "member", Path::new("member")).unwrap();
+        let mut bytes = Vec::new();
+        member.read_to_end(&mut bytes).unwrap();
+        assert_eq!(bytes, b"old-directory");
+        assert_eq!(
+            std::fs::read(release_path.join("member")).unwrap(),
+            b"replacement-directory"
+        );
     }
 }

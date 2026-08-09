@@ -165,6 +165,8 @@ jobs:
           ls -l worker-out
           tar --owner=0 --group=0 --numeric-owner -C worker-out -cf - . \
             | zstd -19 -T0 -o cats-worker.tar.zst
+          tar --zstd -tvf cats-worker.tar.zst \
+            | awk '$NF == "./install-guest-runtime-release.sh" && substr($1,1,4) == "-rwx" { found=1 } END { exit !found }'
           sha256=$(sha256sum cats-worker.tar.zst | cut -d' ' -f1)
           echo "sha256=$sha256" >> "$GITHUB_OUTPUT"
           {

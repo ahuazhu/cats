@@ -98,8 +98,6 @@ locals {
     }
     trap cleanup EXIT
 
-    "$stage_path/validate-node-identity-installation.sh"
-
     aws s3 cp --no-progress "s3://${aws_s3_bucket.artifacts.id}/${aws_s3_object.worker_bundle.key}" "$artifact_path"
     echo "${var.worker_bundle_sha256}  $artifact_path" | sha256sum --check --strict -
     archive_entries="$(mktemp /var/tmp/cats-worker-entries.XXXXXX)"
@@ -112,6 +110,11 @@ locals {
     tar --zstd -xf "$artifact_path" -C "$stage_path"
     "$stage_path/install-guest-runtime-release.sh" verify \
       "$stage_path/guest-runtime-release.v1"
+    # The validator is itself part of the digest-checked, preflighted bundle.
+    # Do not execute anything from the empty mktemp stage before extraction.
+    # Identity validation still precedes the idle check, service stop, or any
+    # installed-file mutation.
+    "$stage_path/validate-node-identity-installation.sh"
 
     cgroup_mount="$(findmnt --noheadings --first-only --types cgroup2 --output TARGET)"
 

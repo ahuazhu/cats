@@ -424,6 +424,15 @@ fn production_worker_bundle_updates_an_idle_guest_seed_before_restart() {
     }
 
     let dockerfile = read_workspace_file("deploy/aws/Dockerfile.worker-artifact");
+    for executable_copy in [
+        "COPY --chmod=0755 deploy/aws/metal/install-guest-runtime-release.sh /out/install-guest-runtime-release.sh",
+        "COPY --from=builder --chmod=0755 /out/install-guest-runtime-release.sh /install-guest-runtime-release.sh",
+    ] {
+        assert!(
+            dockerfile.contains(executable_copy),
+            "worker artifact lost executable installer mode {executable_copy:?}"
+        );
+    }
     for required in [
         "COPY deploy/aws/metal/update-guest-seed.sh /out/update-guest-seed.sh",
         "COPY deploy/aws/metal/require-idle-worker.sh /out/require-idle-worker.sh",
@@ -473,6 +482,224 @@ fn production_worker_bundle_updates_an_idle_guest_seed_before_restart() {
         !deployment.contains("systemctl restart cats-worker"),
         "worker deployment must not abruptly restart active delegated cgroups"
     );
+}
+
+#[cfg(target_os = "linux")]
+fn sha256_file(path: &Path) -> String {
+    let output = Command::new("sha256sum")
+        .arg(path)
+        .output()
+        .expect("run sha256sum");
+    assert!(output.status.success());
+    let hex = String::from_utf8(output.stdout)
+        .expect("sha256sum output is UTF-8")
+        .split_whitespace()
+        .next()
+        .expect("sha256sum digest")
+        .to_owned();
+    format!("sha256:{hex}")
+}
+
+#[cfg(target_os = "linux")]
+fn make_guest_release(root: &Path, marker: &str, with_initramfs: bool) {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    let guest = root.join("guest");
+    std::fs::create_dir_all(&guest).expect("create release fixture");
+    let kernel = guest.join("vmlinuz");
+    std::fs::write(&kernel, format!("kernel-{marker}")).expect("write release kernel fixture");
+    std::fs::set_permissions(&kernel, std::fs::Permissions::from_mode(0o644)).unwrap();
+    let kernel_digest = sha256_file(&kernel);
+    let initramfs = if with_initramfs {
+        let path = guest.join("initramfs.img");
+        std::fs::write(&path, format!("initramfs-{marker}"))
+            .expect("write release initramfs fixture");
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+        Some((sha256_file(&path), std::fs::metadata(path).unwrap().len()))
+    } else {
+        None
+    };
+    let initramfs_digest = initramfs
+        .as_ref()
+        .map(|(digest, _)| format!("\"{digest}\""))
+        .unwrap_or_else(|| "null".to_owned());
+    let receipt = format!(
+        "{{\"guest_agent_protocol_version\":1,\"initramfs_digest\":{initramfs_digest},\"kernel_cmdline\":\"console=ttyS0\",\"kernel_digest\":\"{kernel_digest}\",\"version\":1}}"
+    );
+    let receipt_path = root.join("guest-runtime-profile.v1.json");
+    std::fs::write(&receipt_path, receipt).expect("write release receipt fixture");
+    std::fs::set_permissions(&receipt_path, std::fs::Permissions::from_mode(0o644)).unwrap();
+    let receipt_digest = sha256_file(&receipt_path);
+    let initramfs_entry = initramfs
+        .as_ref()
+        .map(|(digest, size)| {
+            format!(
+                "{{\"path\":\"guest/initramfs.img\",\"sha256\":\"{digest}\",\"size_bytes\":{size}}}"
+            )
+        })
+        .unwrap_or_else(|| "null".to_owned());
+    let manifest = format!(
+        "{{\"guest_runtime_profile\":{{\"path\":\"guest-runtime-profile.v1.json\",\"sha256\":\"{receipt_digest}\",\"size_bytes\":{receipt_size}}},\"initramfs\":{initramfs_entry},\"kernel\":{{\"path\":\"guest/vmlinuz\",\"sha256\":\"{kernel_digest}\",\"size_bytes\":{kernel_size}}},\"version\":1}}",
+        receipt_size = std::fs::metadata(&receipt_path).unwrap().len(),
+        kernel_size = std::fs::metadata(&kernel).unwrap().len(),
+    );
+    let manifest_path = root.join("manifest.v1.json");
+    std::fs::write(&manifest_path, manifest).expect("write release manifest fixture");
+    std::fs::set_permissions(&manifest_path, std::fs::Permissions::from_mode(0o644)).unwrap();
+}
+
+#[cfg(target_os = "linux")]
+fn fault_injected_release_installer(
+    template: &str,
+    path: &Path,
+    cats_root: &Path,
+    uid: &str,
+    gid: &str,
+) {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    let injected_probe = r#"crash_probe() {
+  printf '%s\n' "$1" >> "${CATS_RELEASE_TRACE:?}"
+  probe_count=$(wc -l < "${CATS_RELEASE_TRACE:?}")
+  if [[ $probe_count -eq ${CATS_RELEASE_KILL_AT:-0} ]]; then
+    kill -KILL $$
+  fi
+}"#;
+    let transformed = template
+        .replace(
+            "cats_root=/opt/cats",
+            &format!("cats_root={}", cats_root.display()),
+        )
+        .replace("required_uid=0", &format!("required_uid={uid}"))
+        .replace("required_gid=0", &format!("required_gid={gid}"))
+        .replace("[[ $EUID -eq 0 ]]", "[[ $EUID -eq $required_uid ]]")
+        .replace("crash_probe() { :; }", injected_probe);
+    assert_ne!(
+        transformed, template,
+        "fault-injection transform did nothing"
+    );
+    std::fs::write(path, transformed).expect("write private installer copy");
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755)).unwrap();
+}
+
+#[cfg(target_os = "linux")]
+fn run_release_installer(
+    installer: &Path,
+    source: &Path,
+    fake_bin: &Path,
+    trace: &Path,
+    kill_at: Option<usize>,
+) -> std::process::Output {
+    let mut path = fake_bin.as_os_str().to_os_string();
+    path.push(":");
+    path.push(std::env::var_os("PATH").unwrap_or_default());
+    let mut command = Command::new(installer);
+    command
+        .args(["install", source.to_str().unwrap()])
+        .env("PATH", path)
+        .env("CATS_RELEASE_TRACE", trace);
+    if let Some(kill_at) = kill_at {
+        command.env("CATS_RELEASE_KILL_AT", kill_at.to_string());
+    }
+    command.output().expect("run release installer")
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn every_guest_release_durability_boundary_recovers_to_one_complete_set() {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    let fixture = tempfile::tempdir().expect("release crash fixture");
+    let old = fixture.path().join("old");
+    let new = fixture.path().join("new");
+    make_guest_release(&old, "old", true);
+    make_guest_release(&new, "new", false);
+    let fake_bin = fixture.path().join("bin");
+    std::fs::create_dir(&fake_bin).unwrap();
+    let systemctl = fake_bin.join("systemctl");
+    std::fs::write(&systemctl, "#!/bin/sh\nexit 1\n").unwrap();
+    std::fs::set_permissions(&systemctl, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let uid = String::from_utf8(Command::new("id").arg("-u").output().unwrap().stdout)
+        .unwrap()
+        .trim()
+        .to_owned();
+    let gid = String::from_utf8(Command::new("id").arg("-g").output().unwrap().stdout)
+        .unwrap()
+        .trim()
+        .to_owned();
+    let template = read_workspace_file("deploy/aws/metal/install-guest-runtime-release.sh");
+
+    let baseline = fixture.path().join("baseline");
+    std::fs::create_dir(&baseline).unwrap();
+    let baseline_installer = baseline.join("installer");
+    let baseline_root = baseline.join("cats");
+    let baseline_trace = baseline.join("trace");
+    fault_injected_release_installer(&template, &baseline_installer, &baseline_root, &uid, &gid);
+    let baseline_old =
+        run_release_installer(&baseline_installer, &old, &fake_bin, &baseline_trace, None);
+    assert!(
+        baseline_old.status.success(),
+        "known-positive old release install failed: {}",
+        String::from_utf8_lossy(&baseline_old.stderr)
+    );
+    std::fs::write(&baseline_trace, "").unwrap();
+    let baseline_new =
+        run_release_installer(&baseline_installer, &new, &fake_bin, &baseline_trace, None);
+    assert!(
+        baseline_new.status.success(),
+        "baseline activation failed: {}",
+        String::from_utf8_lossy(&baseline_new.stderr)
+    );
+    let boundary_count = std::fs::read_to_string(&baseline_trace)
+        .unwrap()
+        .lines()
+        .count();
+    assert!(
+        boundary_count >= 25,
+        "too few durability probes: {boundary_count}"
+    );
+
+    for kill_at in 1..=boundary_count {
+        let case = fixture.path().join(format!("case-{kill_at}"));
+        std::fs::create_dir(&case).unwrap();
+        let installer = case.join("installer");
+        let cats_root = case.join("cats");
+        let trace = case.join("trace");
+        fault_injected_release_installer(&template, &installer, &cats_root, &uid, &gid);
+        let old_install = run_release_installer(&installer, &old, &fake_bin, &trace, None);
+        assert!(old_install.status.success());
+        std::fs::write(&trace, "").unwrap();
+
+        let interrupted = run_release_installer(&installer, &new, &fake_bin, &trace, Some(kill_at));
+        assert!(
+            !interrupted.status.success(),
+            "boundary {kill_at} did not interrupt activation"
+        );
+        let recovered = run_release_installer(&installer, &new, &fake_bin, &trace, None);
+        assert!(
+            recovered.status.success(),
+            "boundary {kill_at} did not recover: {}",
+            String::from_utf8_lossy(&recovered.stderr)
+        );
+        assert_eq!(
+            std::fs::read(cats_root.join("guest/vmlinuz")).unwrap(),
+            std::fs::read(new.join("guest/vmlinuz")).unwrap(),
+            "boundary {kill_at} left a mixed kernel"
+        );
+        assert_eq!(
+            std::fs::read(cats_root.join("release/guest-runtime-profile.v1.json")).unwrap(),
+            std::fs::read(new.join("guest-runtime-profile.v1.json")).unwrap(),
+            "boundary {kill_at} left a mixed receipt"
+        );
+        assert_eq!(
+            std::fs::read(cats_root.join("release/guest-runtime-release-manifest.v1.json"))
+                .unwrap(),
+            std::fs::read(new.join("manifest.v1.json")).unwrap(),
+            "boundary {kill_at} left a mixed manifest"
+        );
+        assert!(!cats_root.join("guest/initramfs.img").exists());
+        assert!(!cats_root.join("releases/activation.v1").exists());
+    }
 }
 
 #[cfg(unix)]

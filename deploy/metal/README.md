@@ -59,6 +59,15 @@ single-build payload/manifest plus root-provisioned local Node identity are froz
 [Runtime Composition Artifacts v1](../../docs/specs/runtime-composition-artifacts-v1.md). `cats-noded` does
 not derive registration identity from the development `CATS_NODE_ID`, hostname, address or Host kernel.
 
+This Agent-registration slice is not a standalone deployable release. The exact release
+commit must also contain the A20 signed Desired/observation HTTP routes, renew
+the current `AgentSession` only when a new observation is accepted, drive
+Node-loss liveness from that signed state, and remove `/v1/nodes/heartbeat`
+such that service/admin bearer calls get 404 with zero writes. Without that
+single-commit composition, every 60-second session expires and the old loss
+detector still marks the Node lost. Do not restore the shared-bearer heartbeat
+as a transition mechanism.
+
 仅限首次安装、尚未创建任何 Cat 的空节点，配置后可以直接启动或重启服务。
 
 ```bash
