@@ -13,11 +13,13 @@ use std::os::fd::{AsRawFd as _, FromRawFd as _};
 use std::os::unix::ffi::{OsStrExt as _, OsStringExt as _};
 use std::os::unix::fs::{MetadataExt as _, OpenOptionsExt as _};
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
-use std::time::Instant;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{mpsc, Arc};
+use std::time::{Duration, Instant};
 
 use anyhow::{bail, Context as _};
 use cats_api::runtime_reconciliation::{Id, InventorySource};
+use cats_storage::authority::VolumeDataAuthority;
 
 use crate::runtime_spine::{RuntimeInventoryScanContext, RuntimeInventoryScanner};
 use crate::state_directory::StateDirectory;
@@ -47,10 +49,9 @@ mod metadata_authority_reader_sealed {
 }
 
 /// A bounded read-only proof over the complete set of volume candidates seen
-/// by the scan. Implementations are kept sealed until the production
-/// `VolumeDataAuthority` composition exists. They must use the supplied
-/// absolute deadline and consult `context.check_active()` around every
-/// potentially blocking operation.
+/// by the scan. Implementations must use the supplied absolute deadline and
+/// consult `context.check_active()` around every potentially blocking
+/// operation.
 trait MetadataAuthorityAbsenceReader:
     metadata_authority_reader_sealed::Sealed + std::fmt::Debug + Send + Sync + 'static
 {
@@ -63,25 +64,143 @@ trait MetadataAuthorityAbsenceReader:
     ) -> anyhow::Result<InventoryAbsence>;
 }
 
-#[derive(Debug)]
-struct UnavailableMetadataAuthorityReader;
+enum MetadataAuthorityRead {
+    Empty,
+    Complete { first_present: Id },
+    Incomplete,
+}
 
-impl metadata_authority_reader_sealed::Sealed for UnavailableMetadataAuthorityReader {}
+struct MetadataAuthorityReadRequest {
+    candidate_volume_ids: BTreeSet<Id>,
+    reply: mpsc::SyncSender<MetadataAuthorityRead>,
+}
 
-impl MetadataAuthorityAbsenceReader for UnavailableMetadataAuthorityReader {
+/// Adapts the provider-neutral strict authority reader to the scanner's one
+/// absolute deadline. `VolumeDataAuthority` is synchronous and has no
+/// cancellation argument, so a single rendezvous worker owns possibly slow
+/// reads. The scan lane can stop waiting at its deadline without starting a
+/// second overlapping metadata read; while the worker is occupied, later
+/// scans report the source unavailable.
+struct VolumeDataAuthorityMetadataReader {
+    requests: mpsc::SyncSender<MetadataAuthorityReadRequest>,
+    in_flight: Arc<AtomicBool>,
+}
+
+impl std::fmt::Debug for VolumeDataAuthorityMetadataReader {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("VolumeDataAuthorityMetadataReader")
+            .finish_non_exhaustive()
+    }
+}
+
+impl VolumeDataAuthorityMetadataReader {
+    fn start(authority: Arc<dyn VolumeDataAuthority>) -> anyhow::Result<Self> {
+        // `in_flight` admits work only while the single reader is idle. The
+        // one-slot channel is solely the handoff to that worker; it can never
+        // become a backlog behind an uncooperative backend.
+        let (requests, receiver) = mpsc::sync_channel::<MetadataAuthorityReadRequest>(1);
+        let in_flight = Arc::new(AtomicBool::new(false));
+        let worker_in_flight = Arc::clone(&in_flight);
+        std::thread::Builder::new()
+            .name("cats-runtime-metadata-authority".to_owned())
+            .spawn(move || {
+                while let Ok(request) = receiver.recv() {
+                    let was_empty = request.candidate_volume_ids.is_empty();
+                    let mut first_present = None;
+                    let mut incomplete = false;
+                    for volume_id in request.candidate_volume_ids {
+                        match authority.load_volume(&volume_id) {
+                            Ok(_record) => {
+                                first_present.get_or_insert(volume_id);
+                            }
+                            Err(_error) => incomplete = true,
+                        }
+                    }
+                    let result = if was_empty {
+                        MetadataAuthorityRead::Empty
+                    } else if incomplete {
+                        MetadataAuthorityRead::Incomplete
+                    } else if let Some(first_present) = first_present {
+                        MetadataAuthorityRead::Complete { first_present }
+                    } else {
+                        // Defensive future-proofing: a nonempty input that
+                        // produced neither a record nor an error is not a
+                        // complete authority read.
+                        MetadataAuthorityRead::Incomplete
+                    };
+                    worker_in_flight.store(false, Ordering::Release);
+                    let _ = request.reply.send(result);
+                }
+            })
+            .context("start Runtime metadata-authority reader")?;
+        Ok(Self {
+            requests,
+            in_flight,
+        })
+    }
+}
+
+impl metadata_authority_reader_sealed::Sealed for VolumeDataAuthorityMetadataReader {}
+
+impl MetadataAuthorityAbsenceReader for VolumeDataAuthorityMetadataReader {
     fn prove_absent(
         &self,
         _node_id: &Id,
-        _candidate_volume_ids: &BTreeSet<Id>,
+        candidate_volume_ids: &BTreeSet<Id>,
         deadline: Instant,
         context: &RuntimeInventoryScanContext,
     ) -> anyhow::Result<InventoryAbsence> {
         debug_assert_eq!(deadline, context.deadline());
         context.check_active()?;
-        // The production Node does not yet compose `VolumeDataAuthority`.
-        // Local filesystem absence is never substituted for its health and
-        // authoritative-empty proof.
-        Ok(InventoryAbsence::Unavailable)
+        if candidate_volume_ids.is_empty() {
+            // The candidate set is the union of complete Desired and local
+            // namespaces. No unbounded global metadata listing is required to
+            // prove absence when that closed set is empty.
+            return Ok(InventoryAbsence::Empty);
+        }
+
+        if self
+            .in_flight
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .is_err()
+        {
+            return Ok(InventoryAbsence::Unavailable);
+        }
+
+        let (reply, received) = mpsc::sync_channel(1);
+        match self.requests.try_send(MetadataAuthorityReadRequest {
+            candidate_volume_ids: candidate_volume_ids.clone(),
+            reply,
+        }) {
+            Ok(()) => {}
+            Err(mpsc::TrySendError::Full(_)) | Err(mpsc::TrySendError::Disconnected(_)) => {
+                self.in_flight.store(false, Ordering::Release);
+                return Ok(InventoryAbsence::Unavailable);
+            }
+        }
+
+        // Preserve a small interval for the enclosing probe and coverage
+        // aggregator to observe the result before the shared scan deadline.
+        const DEADLINE_RESERVE: Duration = Duration::from_millis(10);
+        let wait = context.remaining()?.saturating_sub(DEADLINE_RESERVE);
+        if wait.is_zero() {
+            return Ok(InventoryAbsence::Unavailable);
+        }
+        let result = match received.recv_timeout(wait) {
+            Ok(result) => result,
+            Err(mpsc::RecvTimeoutError::Timeout) | Err(mpsc::RecvTimeoutError::Disconnected) => {
+                return Ok(InventoryAbsence::Unavailable);
+            }
+        };
+        context.check_active()?;
+        match result {
+            MetadataAuthorityRead::Empty => Ok(InventoryAbsence::Empty),
+            MetadataAuthorityRead::Incomplete => Ok(InventoryAbsence::Unavailable),
+            MetadataAuthorityRead::Complete { first_present } => {
+                bail!("clean-slate metadata authority retains volume {first_present}")
+            }
+        }
     }
 }
 
@@ -107,6 +226,28 @@ impl MetadataAuthorityAbsenceReader for TestAuthoritativeEmptyMetadataReader {
     }
 }
 
+#[cfg(test)]
+#[derive(Debug)]
+struct TestUnavailableMetadataReader;
+
+#[cfg(test)]
+impl metadata_authority_reader_sealed::Sealed for TestUnavailableMetadataReader {}
+
+#[cfg(test)]
+impl MetadataAuthorityAbsenceReader for TestUnavailableMetadataReader {
+    fn prove_absent(
+        &self,
+        _node_id: &Id,
+        _candidate_volume_ids: &BTreeSet<Id>,
+        deadline: Instant,
+        context: &RuntimeInventoryScanContext,
+    ) -> anyhow::Result<InventoryAbsence> {
+        debug_assert_eq!(deadline, context.deadline());
+        context.check_active()?;
+        Ok(InventoryAbsence::Unavailable)
+    }
+}
+
 #[derive(Debug, Clone, Copy)]
 struct ProbeLimits {
     state_entries: usize,
@@ -126,13 +267,28 @@ impl Default for ProbeLimits {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub(crate) struct InstalledCleanSlateProbeConfig {
     pub state_directory: StateDirectory,
     pub cloud_hypervisor_binary: PathBuf,
     pub blockd_binary: PathBuf,
     pub guest_agent_binary: PathBuf,
     pub metering_cgroup_root: Option<PathBuf>,
+    pub volume_data_authority: Arc<dyn VolumeDataAuthority>,
+}
+
+impl std::fmt::Debug for InstalledCleanSlateProbeConfig {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("InstalledCleanSlateProbeConfig")
+            .field("state_directory", &self.state_directory)
+            .field("cloud_hypervisor_binary", &self.cloud_hypervisor_binary)
+            .field("blockd_binary", &self.blockd_binary)
+            .field("guest_agent_binary", &self.guest_agent_binary)
+            .field("metering_cgroup_root", &self.metering_cgroup_root)
+            .field("volume_data_authority", &"<provider-neutral authority>")
+            .finish()
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -187,8 +343,11 @@ impl ProbeConfig {
 pub(crate) fn installed_clean_slate_scanner(
     config: InstalledCleanSlateProbeConfig,
 ) -> anyhow::Result<Arc<dyn RuntimeInventoryScanner>> {
+    let metadata_authority = Arc::new(VolumeDataAuthorityMetadataReader::start(Arc::clone(
+        &config.volume_data_authority,
+    ))?);
     let config = ProbeConfig::installed(config)?;
-    let scanner = scanner(config)?;
+    let scanner = scanner_with_metadata_authority(config, metadata_authority)?;
     Ok(Arc::new(scanner))
 }
 
@@ -230,8 +389,9 @@ pub(crate) fn clean_slate_scanner_for_test(
     )?))
 }
 
+#[cfg(test)]
 fn scanner(config: ProbeConfig) -> anyhow::Result<CleanSlateInventoryScanner> {
-    scanner_with_metadata_authority(config, Arc::new(UnavailableMetadataAuthorityReader))
+    scanner_with_metadata_authority(config, Arc::new(TestAuthoritativeEmptyMetadataReader))
 }
 
 fn scanner_with_metadata_authority(
@@ -637,9 +797,10 @@ impl InventoryAbsenceProbe for MetadataStoreProbe {
             local_candidates_complete = false;
         }
 
-        // Even an empty candidate set must perform this read: it is also the
-        // health and global-empty proof for the metadata authority. The exact
-        // scan deadline is passed through rather than recomputed per source.
+        // The reader can prove an empty complete candidate set without a
+        // global authority listing. Every nonempty candidate is instead read
+        // through the strict authority port. The exact scan deadline is
+        // passed through rather than recomputed per source.
         let authority_absence = self.authority.prove_absent(
             &context.coordinates().session.node_id,
             &candidate_volume_ids,
@@ -1468,6 +1629,83 @@ mod tests {
 
     const SNAPSHOT: &[u8] = br#"{"desired_specs":[],"expires_at_unix_ms":1720000030000,"issued_at_unix_ms":1720000000000,"read_position":12,"request_sequence":1,"session":{"agent_instance_id":"44444444444444444444444444444444","agent_session_epoch":2,"node_boot_id":"33333333333333333333333333333333","node_id":"node_a"},"version":1}"#;
 
+    struct TestVolumeDataAuthority {
+        present: bool,
+        delay: Duration,
+        calls: Arc<Mutex<Vec<Id>>>,
+    }
+
+    impl TestVolumeDataAuthority {
+        fn missing() -> (Arc<dyn VolumeDataAuthority>, Arc<Mutex<Vec<Id>>>) {
+            Self::with_behavior(false, Duration::ZERO)
+        }
+
+        fn present() -> (Arc<dyn VolumeDataAuthority>, Arc<Mutex<Vec<Id>>>) {
+            Self::with_behavior(true, Duration::ZERO)
+        }
+
+        fn delayed(delay: Duration) -> (Arc<dyn VolumeDataAuthority>, Arc<Mutex<Vec<Id>>>) {
+            Self::with_behavior(false, delay)
+        }
+
+        fn with_behavior(
+            present: bool,
+            delay: Duration,
+        ) -> (Arc<dyn VolumeDataAuthority>, Arc<Mutex<Vec<Id>>>) {
+            let calls = Arc::new(Mutex::new(Vec::new()));
+            (
+                Arc::new(Self {
+                    present,
+                    delay,
+                    calls: Arc::clone(&calls),
+                }),
+                calls,
+            )
+        }
+    }
+
+    impl VolumeDataAuthority for TestVolumeDataAuthority {
+        fn load_volume(
+            &self,
+            volume_id: &Id,
+        ) -> cats_storage::authority::Result<cats_storage::authority::VolumeRecord> {
+            self.calls.lock().unwrap().push(volume_id.clone());
+            std::thread::sleep(self.delay);
+            if !self.present {
+                return Err(cats_storage::authority::AuthorityError::NotFound);
+            }
+            Ok(cats_storage::authority::VolumeRecord {
+                volume_id: volume_id.clone(),
+                size_bytes: 4096,
+                durability: cats_storage::authority::VolumeDurability::Strict,
+                admin_state: cats_storage::authority::VolumeAdminState::Active,
+                head: cats_storage::authority::RemoteHead {
+                    generation: cats_storage::authority::Generation::new(0).unwrap(),
+                    root_hash: None,
+                    root_object_id: None,
+                },
+                lease_owner: None,
+                lease_epoch: FenceEpoch::new(0).unwrap(),
+                lease_expires_at: None,
+                last_transition: None,
+            })
+        }
+
+        fn renew_lease(
+            &self,
+            _request: &cats_storage::authority::RenewLeaseRequest,
+        ) -> cats_storage::authority::Result<cats_storage::authority::RenewLeaseResult> {
+            Err(cats_storage::authority::AuthorityError::BackendUnknown)
+        }
+
+        fn compare_and_swap_head(
+            &self,
+            _request: &cats_storage::authority::VolumeHeadCasRequest,
+        ) -> cats_storage::authority::Result<cats_storage::authority::VolumeHeadCasResult> {
+            Err(cats_storage::authority::AuthorityError::BackendUnknown)
+        }
+    }
+
     #[derive(Debug, Clone, Copy)]
     enum MetadataReaderBehavior {
         AuthoritativeEmpty,
@@ -1709,14 +1947,16 @@ mod tests {
     }
 
     #[test]
-    fn production_clean_host_is_incomplete_without_metadata_authority() {
+    fn production_clean_host_is_complete_without_metadata_authority_io() {
         let environment = TestEnvironment::new();
-        let scanner = scanner(environment.config()).unwrap();
+        let (authority, calls) = TestVolumeDataAuthority::missing();
+        let reader = Arc::new(VolumeDataAuthorityMetadataReader::start(authority).unwrap());
+        let scanner = scanner_with_metadata_authority(environment.config(), reader).unwrap();
         assert!(matches!(
             scanner.scan_complete(context()).unwrap(),
-            RuntimeInventoryScanOutcome::Incomplete { unavailable_sources }
-                if unavailable_sources == [InventorySource::MetadataStore]
+            RuntimeInventoryScanOutcome::Complete(_)
         ));
+        assert!(calls.lock().unwrap().is_empty());
         assert!(!environment.state.join(LEGACY_LEDGER).exists());
         assert!(environment.state.is_dir());
         assert!(environment.socket_root.is_dir());
@@ -1745,16 +1985,20 @@ mod tests {
     }
 
     #[test]
-    fn production_metadata_authority_is_unavailable_for_every_candidate_set() {
+    fn production_candidate_read_failure_makes_metadata_incomplete() {
         let environment = TestEnvironment::new();
-        let scanner = scanner(environment.config()).unwrap();
-        for scan_context in [assigned_context(false), assigned_context(true)] {
-            assert!(matches!(
-                scanner.scan_complete(scan_context).unwrap(),
-                RuntimeInventoryScanOutcome::Incomplete { unavailable_sources }
-                    if unavailable_sources == [InventorySource::MetadataStore]
-            ));
-        }
+        let (authority, calls) = TestVolumeDataAuthority::missing();
+        let reader = Arc::new(VolumeDataAuthorityMetadataReader::start(authority).unwrap());
+        let scanner = scanner_with_metadata_authority(environment.config(), reader).unwrap();
+        assert!(matches!(
+            scanner.scan_complete(assigned_context(true)).unwrap(),
+            RuntimeInventoryScanOutcome::Incomplete { unavailable_sources }
+                if unavailable_sources == [InventorySource::MetadataStore]
+        ));
+        assert_eq!(
+            calls.lock().unwrap().as_slice(),
+            [Id::new("vol_root").unwrap()]
+        );
     }
 
     #[test]
@@ -1787,6 +2031,98 @@ mod tests {
                 .map(|volume_id| Id::new(volume_id).unwrap())
                 .collect()
         );
+    }
+
+    #[test]
+    fn typed_volume_authority_reader_proves_an_empty_candidate_set_without_io() {
+        let (authority, calls) = TestVolumeDataAuthority::missing();
+        let reader = VolumeDataAuthorityMetadataReader::start(authority).unwrap();
+        let scan_context = context();
+        assert_eq!(
+            reader
+                .prove_absent(
+                    &scan_context.coordinates().session.node_id,
+                    &BTreeSet::new(),
+                    scan_context.deadline(),
+                    &scan_context,
+                )
+                .unwrap(),
+            InventoryAbsence::Empty
+        );
+        assert!(calls.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn typed_volume_authority_reader_strictly_reads_every_candidate() {
+        let (authority, calls) = TestVolumeDataAuthority::missing();
+        let reader = VolumeDataAuthorityMetadataReader::start(authority).unwrap();
+        let scan_context = context();
+        let candidates = ["vol_a", "vol_b", "vol_c"]
+            .into_iter()
+            .map(|value| Id::new(value).unwrap())
+            .collect::<BTreeSet<_>>();
+        assert_eq!(
+            reader
+                .prove_absent(
+                    &scan_context.coordinates().session.node_id,
+                    &candidates,
+                    scan_context.deadline(),
+                    &scan_context,
+                )
+                .unwrap(),
+            InventoryAbsence::Unavailable
+        );
+        assert_eq!(
+            calls
+                .lock()
+                .unwrap()
+                .iter()
+                .cloned()
+                .collect::<BTreeSet<_>>(),
+            candidates
+        );
+    }
+
+    #[test]
+    fn typed_volume_authority_reader_rejects_complete_nonempty_authority() {
+        let (authority, calls) = TestVolumeDataAuthority::present();
+        let reader = VolumeDataAuthorityMetadataReader::start(authority).unwrap();
+        let scan_context = context();
+        let candidates = ["vol_a", "vol_b"]
+            .into_iter()
+            .map(|value| Id::new(value).unwrap())
+            .collect::<BTreeSet<_>>();
+        let error = reader
+            .prove_absent(
+                &scan_context.coordinates().session.node_id,
+                &candidates,
+                scan_context.deadline(),
+                &scan_context,
+            )
+            .unwrap_err();
+        assert!(format!("{error:#}").contains("retains volume"));
+        assert_eq!(calls.lock().unwrap().len(), candidates.len());
+    }
+
+    #[test]
+    fn typed_volume_authority_reader_returns_before_an_uncooperative_read() {
+        let (authority, _calls) = TestVolumeDataAuthority::delayed(Duration::from_millis(250));
+        let reader = VolumeDataAuthorityMetadataReader::start(authority).unwrap();
+        let scan_context = context_until(Instant::now() + Duration::from_millis(80));
+        let candidates = [Id::new("vol_slow").unwrap()].into_iter().collect();
+        let started = Instant::now();
+        assert_eq!(
+            reader
+                .prove_absent(
+                    &scan_context.coordinates().session.node_id,
+                    &candidates,
+                    scan_context.deadline(),
+                    &scan_context,
+                )
+                .unwrap(),
+            InventoryAbsence::Unavailable
+        );
+        assert!(started.elapsed() < Duration::from_millis(180));
     }
 
     #[test]
@@ -1930,7 +2266,7 @@ mod tests {
             }),
             Box::new(MetadataStoreProbe {
                 state_directory: missing_state.clone(),
-                authority: Arc::new(UnavailableMetadataAuthorityReader),
+                authority: Arc::new(TestUnavailableMetadataReader),
                 limits,
             }),
             Box::new(GuestMountProbe {
@@ -2121,12 +2457,14 @@ mod tests {
     fn installed_factory_derives_checkpoint_evidence_from_the_scanned_dirfd_child() {
         let environment = TestEnvironment::new();
         let state = StateDirectory::unanchored(environment.state.clone());
+        let (volume_data_authority, _calls) = TestVolumeDataAuthority::missing();
         let config = ProbeConfig::installed(InstalledCleanSlateProbeConfig {
             state_directory: state.clone(),
             cloud_hypervisor_binary: environment.ch_binary.clone(),
             blockd_binary: environment.blockd_binary.clone(),
             guest_agent_binary: environment.guest_binary.clone(),
             metering_cgroup_root: None,
+            volume_data_authority,
         })
         .unwrap();
         assert_eq!(

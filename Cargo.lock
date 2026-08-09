@@ -1268,7 +1268,9 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "cats-api",
+ "cats-metadata-store-postgres",
  "cats-node-agent",
+ "cats-storage",
  "clap",
  "tempfile",
  "tokio",

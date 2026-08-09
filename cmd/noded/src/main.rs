@@ -3,6 +3,7 @@ use std::path::PathBuf;
 use anyhow::Context;
 use cats_node_agent::ch::{BlockPath, ChConfig};
 use cats_node_agent::runtime_cutover::{spawn_signed_runtime_cutover, SignedRuntimeCutoverConfig};
+use cats_storage::AdapterConfig;
 use clap::Parser;
 
 #[derive(Parser, Debug)]
@@ -118,6 +119,16 @@ async fn main() -> anyhow::Result<()> {
         cats_api::runtime_artifacts::load_installed_guest_runtime_profile_receipt(receipt_path)?;
     cats_api::runtime_artifacts::validate_installed_node_guest_runtime(&installed_receipt)?;
     let ch_config = installed_ch_config(&args, &installed_receipt)?;
+    anyhow::ensure!(
+        args.metadata_store_adapter == cats_metadata_store_postgres::ADAPTER_NAME,
+        "the signed production Runtime supports only --metadata-store-adapter {}",
+        cats_metadata_store_postgres::ADAPTER_NAME,
+    );
+    let metadata_config =
+        AdapterConfig::from_cli(args.metadata_store_options).context("metadata adapter options")?;
+    let volume_data_authority =
+        cats_metadata_store_postgres::PostgresVolumeDataAuthority::open(&metadata_config)
+            .context("open PostgreSQL VolumeDataAuthority")?;
     let agent_registration =
         cats_node_agent::agent_registration::AgentRegistrationConfig::load_installed(
             installed_receipt.receipt(),
@@ -130,6 +141,7 @@ async fn main() -> anyhow::Result<()> {
         blockd_binary: args.blockd_bin,
         guest_agent_binary: args.guest_agent_bin,
         metering_cgroup_root: args.metering_cgroup_root,
+        volume_data_authority,
     })
     .await?;
     eprintln!(
@@ -200,6 +212,7 @@ mod tests {
     fn production_entrypoint_cannot_start_the_legacy_node_runtime() {
         let source = include_str!("main.rs");
         assert!(source.contains("spawn_signed_runtime_cutover"));
+        assert!(source.contains("PostgresVolumeDataAuthority::open"));
         let legacy_spawn = ["server", "::{", "spawn"].concat();
         let legacy_runtime = ["Node", "Runtime", "::", "new"].concat();
         assert!(!source.contains(&legacy_spawn));

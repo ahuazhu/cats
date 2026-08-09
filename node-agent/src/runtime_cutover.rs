@@ -18,6 +18,7 @@ use axum::extract::State;
 use axum::http::StatusCode;
 use axum::routing::get;
 use axum::Router;
+use cats_storage::authority::VolumeDataAuthority;
 
 use crate::agent_registration::AgentRegistrationConfig;
 use crate::ch::{ChConfig, ChNetwork};
@@ -58,6 +59,7 @@ pub struct SignedRuntimeCutoverConfig {
     pub blockd_binary: std::path::PathBuf,
     pub guest_agent_binary: std::path::PathBuf,
     pub metering_cgroup_root: Option<std::path::PathBuf>,
+    pub volume_data_authority: Arc<dyn VolumeDataAuthority>,
 }
 
 pub struct SignedRuntimeCutoverHandle {
@@ -222,6 +224,7 @@ pub async fn spawn_signed_runtime_cutover(
         blockd_binary: config.blockd_binary,
         guest_agent_binary: config.guest_agent_binary,
         metering_cgroup_root: config.metering_cgroup_root,
+        volume_data_authority: config.volume_data_authority,
     })
     .context("compose installed clean-slate inventory probes")?;
     let effect =
@@ -357,6 +360,32 @@ mod tests {
         ContractVersion, CredentialBinding, Epoch, GuestRuntimeProfileReceipt, Id, NodeBootId,
         NodeIdentity, NodeIdentityState, Sha256Digest, UnixMillis, DESIRED_READ_PATH,
     };
+    use cats_storage::authority::{
+        AuthorityError, RenewLeaseRequest, RenewLeaseResult, VolumeHeadCasRequest,
+        VolumeHeadCasResult, VolumeRecord,
+    };
+
+    struct TestUnavailableVolumeDataAuthority;
+
+    impl VolumeDataAuthority for TestUnavailableVolumeDataAuthority {
+        fn load_volume(&self, _volume_id: &Id) -> Result<VolumeRecord, AuthorityError> {
+            Err(AuthorityError::BackendUnknown)
+        }
+
+        fn renew_lease(
+            &self,
+            _request: &RenewLeaseRequest,
+        ) -> Result<RenewLeaseResult, AuthorityError> {
+            Err(AuthorityError::BackendUnknown)
+        }
+
+        fn compare_and_swap_head(
+            &self,
+            _request: &VolumeHeadCasRequest,
+        ) -> Result<VolumeHeadCasResult, AuthorityError> {
+            Err(AuthorityError::BackendUnknown)
+        }
+    }
 
     #[derive(Clone)]
     struct RegistrationStub {
@@ -525,6 +554,7 @@ mod tests {
             blockd_binary: "/opt/cats/bin/cats-blockd".into(),
             guest_agent_binary: "/opt/cats/bin/cats-guest-agent".into(),
             metering_cgroup_root: None,
+            volume_data_authority: Arc::new(TestUnavailableVolumeDataAuthority),
         })
         .await
         .unwrap();
