@@ -415,7 +415,111 @@ fn metering_failure(error: cats_metering::MeteringError) -> Failure {
     }
 }
 
+async fn reject_legacy_authority(
+    _request: axum::extract::Request,
+    _next: axum::middleware::Next,
+) -> Response {
+    Failure(ApiError::unavailable(
+        "legacy product authority is unavailable during the signed runtime cutover",
+    ))
+    .into_response()
+}
+
 pub fn router(state: AppState) -> Router {
+    // These handlers read or mutate the retired Cat/Operation/Node authority.
+    // Keep them reachable only from the explicit pre-cutover test composition.
+    // The production middleware runs before authentication, body extraction,
+    // PostgreSQL access, idempotency writes, and outbound Node calls.
+    let legacy_authority = Router::new()
+        .route(
+            "/v1/workspaces/{workspace}/cats",
+            post(create_cat).get(list_cats),
+        )
+        .route(
+            "/v1/workspaces/{workspace}/cats/{cat}",
+            get(get_cat).delete(delete_cat),
+        )
+        .route(
+            "/v1/workspaces/{workspace}/cats/{cat}/actions/{verb}",
+            post(cat_action),
+        )
+        .route("/v1/workspaces/{workspace}/cats/{cat}/exec", post(exec_cat))
+        .route(
+            "/v1/workspaces/{workspace}/cats/{cat}/oci-deployments",
+            post(deploy_oci).get(list_oci_deployments),
+        )
+        .route(
+            "/v1/workspaces/{workspace}/cats/{cat}/shell",
+            get(shell_cat),
+        )
+        .route(
+            "/v1/workspaces/{workspace}/cats/{cat}/auto-suspend",
+            get(get_auto_suspend).put(update_auto_suspend),
+        )
+        .route(
+            "/v1/workspaces/{workspace}/cats/{cat}/expiry",
+            get(get_expiry).put(update_expiry),
+        )
+        .route(
+            "/v1/workspaces/{workspace}/cats/{cat}/work",
+            get(get_cat_work),
+        )
+        .route(
+            "/v1/workspaces/{workspace}/cats/{cat}/endpoints",
+            post(create_endpoint).get(list_endpoints),
+        )
+        .route(
+            "/v1/workspaces/{workspace}/disks",
+            post(create_disk).get(list_disks),
+        )
+        .route(
+            "/v1/workspaces/{workspace}/disks/{disk}",
+            get(get_disk).delete(delete_disk),
+        )
+        .route(
+            "/v1/workspaces/{workspace}/disks/{disk}/actions/{verb}",
+            post(disk_action),
+        )
+        .route(
+            "/v1/workspaces/{workspace}/disks/{disk}/snapshots",
+            post(create_snapshot).get(list_snapshots),
+        )
+        .route("/v1/operations/{id}", get(get_operation))
+        .route(
+            "/v1/workspaces/{workspace}/operations",
+            get(list_operations),
+        )
+        .route(
+            "/v1/internal/usage/checkpoints",
+            post(ingest_usage_checkpoints)
+                .layer(DefaultBodyLimit::max(MAX_USAGE_INGEST_BODY_BYTES)),
+        )
+        .route(
+            "/v1/workspaces/{workspace}/billing/usage",
+            get(workspace_usage),
+        )
+        .route("/v1/nodes/{id}/actions/cordon", post(cordon_node))
+        .route("/v1/nodes", get(list_nodes))
+        .route("/v1/admin/nodes", get(admin_list_nodes))
+        .route(
+            "/v1/admin/nodes/{id}",
+            get(admin_get_node).delete(admin_delete_node),
+        )
+        .route("/v1/admin/nodes/{id}/cats", get(admin_node_cats))
+        .route(
+            "/v1/admin/nodes/{id}/actions/{verb}",
+            post(admin_node_action),
+        )
+        .route("/v1/admin/monitoring", get(admin_monitoring))
+        .route("/metrics", get(prometheus_metrics))
+        .route("/v1/routes/resolve", get(resolve_route))
+        .route("/v1/routes/wake", post(wake_route_handler));
+    let legacy_authority = if state.legacy_node_runtime_for_tests {
+        legacy_authority
+    } else {
+        legacy_authority.route_layer(axum::middleware::from_fn(reject_legacy_authority))
+    };
+
     Router::new()
         .route("/", get(crate::ui::portal))
         .route("/zh-CN", get(crate::ui::zh_home_redirect))
@@ -482,70 +586,12 @@ pub fn router(state: AppState) -> Router {
             axum::routing::patch(update_account_member).delete(deactivate_account_member),
         )
         .route(
-            "/v1/workspaces/{workspace}/cats",
-            post(create_cat).get(list_cats),
-        )
-        .route(
-            "/v1/workspaces/{workspace}/cats/{cat}",
-            get(get_cat).delete(delete_cat),
-        )
-        .route(
-            "/v1/workspaces/{workspace}/cats/{cat}/actions/{verb}",
-            post(cat_action),
-        )
-        .route("/v1/workspaces/{workspace}/cats/{cat}/exec", post(exec_cat))
-        .route(
-            "/v1/workspaces/{workspace}/cats/{cat}/oci-deployments",
-            post(deploy_oci).get(list_oci_deployments),
-        )
-        .route(
-            "/v1/workspaces/{workspace}/cats/{cat}/shell",
-            get(shell_cat),
-        )
-        .route(
-            "/v1/workspaces/{workspace}/cats/{cat}/auto-suspend",
-            get(get_auto_suspend).put(update_auto_suspend),
-        )
-        .route(
-            "/v1/workspaces/{workspace}/cats/{cat}/expiry",
-            get(get_expiry).put(update_expiry),
-        )
-        .route(
-            "/v1/workspaces/{workspace}/cats/{cat}/work",
-            get(get_cat_work),
-        )
-        .route(
-            "/v1/workspaces/{workspace}/cats/{cat}/endpoints",
-            post(create_endpoint).get(list_endpoints),
-        )
-        .route(
             "/v1/workspaces/{workspace}/tokens",
             post(create_workspace_token).get(list_workspace_tokens),
         )
         .route(
             "/v1/workspaces/{workspace}/tokens/{token}",
             axum::routing::delete(revoke_workspace_token),
-        )
-        .route(
-            "/v1/workspaces/{workspace}/disks",
-            post(create_disk).get(list_disks),
-        )
-        .route(
-            "/v1/workspaces/{workspace}/disks/{disk}",
-            get(get_disk).delete(delete_disk),
-        )
-        .route(
-            "/v1/workspaces/{workspace}/disks/{disk}/actions/{verb}",
-            post(disk_action),
-        )
-        .route(
-            "/v1/workspaces/{workspace}/disks/{disk}/snapshots",
-            post(create_snapshot).get(list_snapshots),
-        )
-        .route("/v1/operations/{id}", get(get_operation))
-        .route(
-            "/v1/workspaces/{workspace}/operations",
-            get(list_operations),
         )
         .route(
             "/v1/internal/runtime/agent-sessions",
@@ -561,15 +607,6 @@ pub fn router(state: AppState) -> Router {
             post(runtime_spine::observation).fallback(runtime_spine::observation),
         )
         .route(
-            "/v1/internal/usage/checkpoints",
-            post(ingest_usage_checkpoints)
-                .layer(DefaultBodyLimit::max(MAX_USAGE_INGEST_BODY_BYTES)),
-        )
-        .route(
-            "/v1/workspaces/{workspace}/billing/usage",
-            get(workspace_usage),
-        )
-        .route(
             "/v1/workspaces/{workspace}/billing/balance",
             get(workspace_billing_balance),
         )
@@ -578,23 +615,8 @@ pub fn router(state: AppState) -> Router {
             post(create_billing_checkout),
         )
         .route("/v1/billing/stripe/webhook", post(stripe_webhook))
-        .route("/v1/nodes/{id}/actions/cordon", post(cordon_node))
-        .route("/v1/nodes", get(list_nodes))
-        .route("/v1/admin/nodes", get(admin_list_nodes))
         .route("/v1/admin/workspaces", get(admin_list_workspaces))
-        .route(
-            "/v1/admin/nodes/{id}",
-            get(admin_get_node).delete(admin_delete_node),
-        )
-        .route("/v1/admin/nodes/{id}/cats", get(admin_node_cats))
-        .route(
-            "/v1/admin/nodes/{id}/actions/{verb}",
-            post(admin_node_action),
-        )
-        .route("/v1/admin/monitoring", get(admin_monitoring))
-        .route("/metrics", get(prometheus_metrics))
-        .route("/v1/routes/resolve", get(resolve_route))
-        .route("/v1/routes/wake", post(wake_route_handler))
+        .merge(legacy_authority)
         .fallback(crate::ui::not_found)
         .with_state(state)
 }

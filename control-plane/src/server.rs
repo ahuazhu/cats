@@ -419,6 +419,10 @@ async fn spawn_inner(cfg: Config, legacy_node_runtime_for_tests: bool) -> anyhow
         "service and admin tokens must be different"
     );
     anyhow::ensure!(
+        legacy_node_runtime_for_tests || !cfg.billing_enforcement_enabled,
+        "legacy Cat billing enforcement is unavailable during the signed runtime cutover"
+    );
+    anyhow::ensure!(
         cfg.auto_tier_policy
             .warm_after_ms
             .is_none_or(|value| value > 0),
@@ -544,7 +548,8 @@ async fn spawn_inner(cfg: Config, legacy_node_runtime_for_tests: bool) -> anyhow
             run_reconciler_role(reconciler.clone(), reconciler_store.clone(), interval)
         })
     });
-    let billing_enforcer_task = cfg.billing_enforcement_enabled.then(|| {
+    let billing_enforcer_task =
+        (legacy_node_runtime_for_tests && cfg.billing_enforcement_enabled).then(|| {
         let enforcement_state = state.clone();
         spawn_singleton_task(
             state.store.clone(),

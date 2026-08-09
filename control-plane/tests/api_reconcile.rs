@@ -3168,6 +3168,21 @@ async fn production_signed_cutover_never_runs_or_enters_the_legacy_node_runtime(
         oci_deploy_sync_wait_ms: 5_000,
         auto_tier_policy: AutoTierPolicy::default(),
     };
+    let mut legacy_billing = config.clone();
+    legacy_billing.billing_enforcement_enabled = true;
+    let billing_error = match spawn_production(legacy_billing).await {
+        Ok(handle) => {
+            handle.shutdown().await;
+            panic!("production started the legacy Cat billing enforcer")
+        }
+        Err(error) => error,
+    };
+    assert!(
+        billing_error
+            .to_string()
+            .contains("legacy Cat billing enforcement is unavailable"),
+        "unexpected startup error: {billing_error:#}",
+    );
     let production = spawn_production(config.clone()).await.unwrap();
     let workspace_id = default_workspace_id(&production);
 
@@ -3201,26 +3216,32 @@ async fn production_signed_cutover_never_runs_or_enters_the_legacy_node_runtime(
     )
     .await;
 
-    let client = reqwest::Client::new();
-    let created = client
-        .post(format!(
-            "{}/v1/workspaces/{workspace_id}/cats",
-            production.base_url()
-        ))
-        .bearer_auth("dev-admin-token")
-        .json(&serde_json::json!({
-            "name": "signed-cutover",
-            "image": "ubuntu-24.04",
-            "cpus": 1,
-            "memory_mib": 512,
-            "root_size_bytes": 8 << 20,
-            "disk": null
-        }))
-        .send()
-        .await
+    // Seed a pre-cutover row directly. Production HTTP must not create or
+    // inspect this authority; the explicit legacy test composition retains
+    // those handlers for the older lifecycle suites.
+    let workspace = production
+        .state
+        .store
+        .workspace_by_id(&workspace_id)
         .unwrap();
-    assert_eq!(created.status(), StatusCode::ACCEPTED);
-    let created: CatOperationResponse = created.json().await.unwrap();
+    let (legacy_cat, legacy_disks, legacy_operation) = production
+        .state
+        .store
+        .create_cat(
+            &workspace,
+            "signed-cutover",
+            "ubuntu-24.04",
+            1,
+            512,
+            8 << 20,
+            false,
+            None,
+            None,
+            DiskDurability::Strict,
+        )
+        .unwrap();
+    let legacy_disk_id = legacy_disks[0].id.clone();
+    let client = reqwest::Client::new();
 
     // A 10 ms legacy reconcile interval would place and dispatch this row
     // almost immediately. Production owns no such background role.
@@ -3229,7 +3250,7 @@ async fn production_signed_cutover_never_runs_or_enters_the_legacy_node_runtime(
     let cat_before = production
         .state
         .store
-        .must_get_cat_by_id(&created.cat.id)
+        .must_get_cat_by_id(&legacy_cat.id)
         .unwrap();
     assert_eq!(cat_before.node_id, None);
     assert_eq!(cat_before.observed_state, ObservedState::Creating);
@@ -3253,6 +3274,36 @@ async fn production_signed_cutover_never_runs_or_enters_the_legacy_node_runtime(
     let closed = vec![
         (
             reqwest::Method::POST,
+            format!("{workspace_base}/cats"),
+            Some(serde_json::json!({"name": "must-not-create"})),
+            "invalid-before-cutover-gate",
+        ),
+        (
+            reqwest::Method::GET,
+            format!("{workspace_base}/cats"),
+            None,
+            "invalid-before-cutover-gate",
+        ),
+        (
+            reqwest::Method::GET,
+            format!("{workspace_base}/cats/signed-cutover"),
+            None,
+            "invalid-before-cutover-gate",
+        ),
+        (
+            reqwest::Method::DELETE,
+            format!("{workspace_base}/cats/signed-cutover"),
+            None,
+            "invalid-before-cutover-gate",
+        ),
+        (
+            reqwest::Method::POST,
+            format!("{workspace_base}/cats/signed-cutover/actions/stop"),
+            Some(serde_json::json!({})),
+            "invalid-before-cutover-gate",
+        ),
+        (
+            reqwest::Method::POST,
             format!("{workspace_base}/cats/signed-cutover/exec"),
             Some(serde_json::json!({"command": ["true"]})),
             "dev-admin-token",
@@ -3265,6 +3316,12 @@ async fn production_signed_cutover_never_runs_or_enters_the_legacy_node_runtime(
                 "image": format!("registry.test/app@sha256:{}", "a".repeat(64))
             })),
             "dev-admin-token",
+        ),
+        (
+            reqwest::Method::GET,
+            format!("{workspace_base}/cats/signed-cutover/oci-deployments"),
+            None,
+            "invalid-before-cutover-gate",
         ),
         (
             reqwest::Method::POST,
@@ -3286,9 +3343,63 @@ async fn production_signed_cutover_never_runs_or_enters_the_legacy_node_runtime(
         ),
         (
             reqwest::Method::GET,
+            format!("{workspace_base}/cats/signed-cutover/expiry"),
+            None,
+            "invalid-before-cutover-gate",
+        ),
+        (
+            reqwest::Method::PUT,
+            format!("{workspace_base}/cats/signed-cutover/expiry"),
+            Some(serde_json::json!({"expires_at_unix": 4_102_444_800_i64})),
+            "invalid-before-cutover-gate",
+        ),
+        (
+            reqwest::Method::GET,
             format!("{workspace_base}/cats/signed-cutover/work"),
             None,
             "dev-admin-token",
+        ),
+        (
+            reqwest::Method::POST,
+            format!("{workspace_base}/cats/signed-cutover/endpoints"),
+            Some(serde_json::json!({"name": "web"})),
+            "invalid-before-cutover-gate",
+        ),
+        (
+            reqwest::Method::GET,
+            format!("{workspace_base}/cats/signed-cutover/endpoints"),
+            None,
+            "invalid-before-cutover-gate",
+        ),
+        (
+            reqwest::Method::POST,
+            format!("{workspace_base}/disks"),
+            Some(serde_json::json!({"name": "must-not-create"})),
+            "invalid-before-cutover-gate",
+        ),
+        (
+            reqwest::Method::GET,
+            format!("{workspace_base}/disks"),
+            None,
+            "invalid-before-cutover-gate",
+        ),
+        (
+            reqwest::Method::GET,
+            format!("{workspace_base}/disks/{legacy_disk_id}"),
+            None,
+            "invalid-before-cutover-gate",
+        ),
+        (
+            reqwest::Method::DELETE,
+            format!("{workspace_base}/disks/{legacy_disk_id}"),
+            None,
+            "invalid-before-cutover-gate",
+        ),
+        (
+            reqwest::Method::POST,
+            format!("{workspace_base}/disks/{legacy_disk_id}/actions/resize"),
+            Some(serde_json::json!({"size_bytes": 16 << 20})),
+            "invalid-before-cutover-gate",
         ),
         (
             reqwest::Method::POST,
@@ -3310,6 +3421,112 @@ async fn production_signed_cutover_never_runs_or_enters_the_legacy_node_runtime(
             format!("{workspace_base}/disks/old/snapshots"),
             None,
             "dev-admin-token",
+        ),
+        (
+            reqwest::Method::GET,
+            format!("{workspace_base}/disks/{legacy_disk_id}/snapshots"),
+            None,
+            "invalid-before-cutover-gate",
+        ),
+        (
+            reqwest::Method::GET,
+            format!(
+                "{}/v1/operations/{}",
+                production.base_url(),
+                legacy_operation.id
+            ),
+            None,
+            "invalid-before-cutover-gate",
+        ),
+        (
+            reqwest::Method::GET,
+            format!("{workspace_base}/operations"),
+            None,
+            "invalid-before-cutover-gate",
+        ),
+        (
+            reqwest::Method::POST,
+            format!("{}/v1/internal/usage/checkpoints", production.base_url()),
+            Some(serde_json::json!({"checkpoints": []})),
+            "invalid-before-cutover-gate",
+        ),
+        (
+            reqwest::Method::GET,
+            format!("{workspace_base}/billing/usage"),
+            None,
+            "invalid-before-cutover-gate",
+        ),
+        (
+            reqwest::Method::POST,
+            format!(
+                "{}/v1/nodes/node_cutover_old/actions/cordon",
+                production.base_url()
+            ),
+            None,
+            "invalid-before-cutover-gate",
+        ),
+        (
+            reqwest::Method::GET,
+            format!("{}/v1/nodes", production.base_url()),
+            None,
+            "invalid-before-cutover-gate",
+        ),
+        (
+            reqwest::Method::GET,
+            format!("{}/v1/admin/nodes", production.base_url()),
+            None,
+            "invalid-before-cutover-gate",
+        ),
+        (
+            reqwest::Method::GET,
+            format!("{}/v1/admin/nodes/node_cutover_old", production.base_url()),
+            None,
+            "invalid-before-cutover-gate",
+        ),
+        (
+            reqwest::Method::DELETE,
+            format!("{}/v1/admin/nodes/node_cutover_old", production.base_url()),
+            None,
+            "invalid-before-cutover-gate",
+        ),
+        (
+            reqwest::Method::GET,
+            format!(
+                "{}/v1/admin/nodes/node_cutover_old/cats",
+                production.base_url()
+            ),
+            None,
+            "invalid-before-cutover-gate",
+        ),
+        (
+            reqwest::Method::POST,
+            format!(
+                "{}/v1/admin/nodes/node_cutover_old/actions/fence",
+                production.base_url()
+            ),
+            Some(serde_json::json!({"confirm_host_stopped_or_isolated": true})),
+            "invalid-before-cutover-gate",
+        ),
+        (
+            reqwest::Method::GET,
+            format!("{}/v1/admin/monitoring", production.base_url()),
+            None,
+            "invalid-before-cutover-gate",
+        ),
+        (
+            reqwest::Method::GET,
+            format!("{}/metrics", production.base_url()),
+            None,
+            "invalid-before-cutover-gate",
+        ),
+        (
+            reqwest::Method::GET,
+            format!(
+                "{}/v1/routes/resolve?hostname=cutover.test",
+                production.base_url()
+            ),
+            None,
+            "invalid-before-cutover-gate",
         ),
         (
             reqwest::Method::POST,
@@ -3378,7 +3595,7 @@ async fn production_signed_cutover_never_runs_or_enters_the_legacy_node_runtime(
             production
                 .state
                 .store
-                .must_get_cat_by_id(&created.cat.id)
+                .must_get_cat_by_id(&legacy_cat.id)
                 .unwrap()
         )
         .unwrap(),
@@ -3398,7 +3615,7 @@ async fn production_signed_cutover_never_runs_or_enters_the_legacy_node_runtime(
     let work_after = production
         .state
         .store
-        .work_status(&created.cat.id, 30_000)
+        .work_status(&legacy_cat.id, 30_000)
         .unwrap();
     assert_eq!(work_after.work_version, work_before.work_version);
     assert_eq!(work_after.active_work_count, work_before.active_work_count);
