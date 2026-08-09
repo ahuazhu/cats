@@ -5,17 +5,18 @@ use std::sync::{mpsc, Arc, Barrier};
 use std::time::Duration;
 
 use cats_api::runtime_reconciliation::{
-    decode_operation, encode_admission_inventory_attestation, encode_desired_read_snapshot,
-    encode_node_observation, inventory_digest, spec_digest, AgentRegistrationAttempt, AgentSession,
-    AppliedDesiredEvidence, AsciiText, AssignedKind, AssignedPlacement, BlockedReason,
-    CheckpointEvidence, Condition, ContractErrorDetail, ContractVersion, CredentialBinding,
-    DesiredRuntimeSpec, Epoch, GuestRuntimeProfileReceipt, GuestTransportEvidence, Id,
-    InventorySource, Ipv4Address, IsolatedIpv4Kind, LifecycleAdmission, MacAddress, NetworkConfig,
-    NodeBootId, NodeIdentity, NodeIdentityState, NodeObservation, ObservationInventoryAcceptance,
-    ObservedRuntimeStatus, Operation, OperationFailure, OperationPhase, OperationTerminal,
-    PlacementRejectionReason, PreconditionFailureReason, QuarantineReason, RandomId128,
-    ReadyReason, ReconcileStep, Revision, RuntimeConfig, RuntimeTarget, RuntimeTransition,
-    Sequence, SessionBinding, Sha256Digest, StableState, UnixMillis, WarmSnapshotEvidence,
+    decode_operation, encode_admission_inventory_attestation, encode_agent_session,
+    encode_desired_read_snapshot, encode_node_observation, inventory_digest, spec_digest,
+    AgentRegistrationAttempt, AgentSession, AppliedDesiredEvidence, AsciiText, AssignedKind,
+    AssignedPlacement, BlockedReason, CheckpointEvidence, Condition, ContractErrorDetail,
+    ContractVersion, CredentialBinding, DesiredRuntimeSpec, Epoch, GuestRuntimeProfileReceipt,
+    GuestTransportEvidence, Id, InventorySource, Ipv4Address, IsolatedIpv4Kind, LifecycleAdmission,
+    MacAddress, NetworkConfig, NodeBootId, NodeIdentity, NodeIdentityState, NodeObservation,
+    ObservationInventoryAcceptance, ObservedRuntimeStatus, Operation, OperationFailure,
+    OperationPhase, OperationTerminal, PlacementRejectionReason, PreconditionFailureReason,
+    QuarantineReason, RandomId128, ReadyReason, ReconcileStep, Revision, RuntimeConfig,
+    RuntimeTarget, RuntimeTransition, Sequence, SessionBinding, Sha256Digest, StableState,
+    UnixMillis, WarmSnapshotEvidence,
 };
 
 use super::product::CatRecord;
@@ -145,6 +146,34 @@ fn registered(outcome: AgentRegistrationOutcome) -> AgentSession {
             panic!("registration rejected: {rejection:?}")
         }
     }
+}
+
+fn overwrite_current_session(
+    client: &mut impl postgres::GenericClient,
+    session: &AgentSession,
+) -> std::result::Result<u64, postgres::Error> {
+    let record = String::from_utf8(encode_agent_session(session).unwrap()).unwrap();
+    let epoch = i64::try_from(session.agent_session_epoch.get()).unwrap();
+    let deadline = i64::try_from(session.lease_deadline_unix_ms.get()).unwrap();
+    client.execute(
+        "UPDATE current_agent_sessions SET
+            record=$2::TEXT::jsonb, immutable_host_id=$3, node_boot_id=$4,
+            agent_instance_id=$5, agent_session_epoch=$6,
+            registration_attempt_id=$7, guest_config_digest=$8,
+            lease_deadline_unix_ms=$9
+          WHERE node_id=$1",
+        &[
+            &session.node_id.as_str(),
+            &record,
+            &session.immutable_host_id.as_str(),
+            &session.node_boot_id.as_str(),
+            &session.agent_instance_id.as_str(),
+            &epoch,
+            &session.registration_attempt_id.as_str(),
+            &session.guest_config_digest.as_str(),
+            &deadline,
+        ],
+    )
 }
 
 fn binding(session: &AgentSession) -> SessionBinding {
@@ -1524,6 +1553,109 @@ fn desired_mutation_coordination_helper_revalidates_exact_admission_facts() {
             .unwrap(),
         PlacementAdmissionLoad::Rejected(PlacementAdmissionRejection::AdmissionChanged)
     );
+}
+
+#[test]
+fn session_replacement_committed_while_identity_is_locked_is_never_read_from_an_old_snapshot() {
+    let url = crate::testsupport::isolated_control_store_url();
+    let (store, identity, authenticated, policy, session1) = fixture_at(&url);
+    let attempt2 = registration_attempt(
+        &identity,
+        2,
+        Some(session1.agent_session_epoch),
+        policy.approved_guest_config_digest(),
+    );
+    let session2 = registered(
+        store
+            .register_agent_session(&authenticated, &attempt2, &policy)
+            .unwrap(),
+    );
+    // Both immutable attempt rows now exist. Put session 1 back so the
+    // waiting request's first statement can establish the stale state that a
+    // REPEATABLE READ mutation would incorrectly retain after the lock wait.
+    store
+        .with(|client| overwrite_current_session(client, &session1))
+        .unwrap();
+
+    let replacer = Store::connect(&url, None).unwrap();
+    let replacement_identity = identity.node_id.clone();
+    let replacement_session = session2.clone();
+    let (locked_tx, locked_rx) = mpsc::channel();
+    let (release_tx, release_rx) = mpsc::channel();
+    let replacer_thread = std::thread::spawn(move || {
+        replacer
+            .with(move |client| {
+                let mut transaction = client.transaction()?;
+                transaction.query_one(
+                    "SELECT node_id FROM node_identities WHERE node_id=$1 FOR UPDATE",
+                    &[&replacement_identity.as_str()],
+                )?;
+                locked_tx.send(()).unwrap();
+                release_rx.recv().unwrap();
+                overwrite_current_session(&mut transaction, &replacement_session)?;
+                transaction.commit()
+            })
+            .unwrap();
+    });
+    locked_rx.recv().unwrap();
+
+    let requester = Store::connect(&url, None).unwrap();
+    let requester_pid: i32 = requester
+        .with(|client| {
+            client
+                .query_one("SELECT pg_backend_pid()", &[])
+                .map(|row| row.get(0))
+        })
+        .unwrap();
+    let requester_authenticated = authenticated.clone();
+    let request = cats_api::runtime_reconciliation::DesiredReadRequest {
+        version: ContractVersion::V1,
+        session: binding(&session1),
+        request_sequence: Sequence::new(1).unwrap(),
+    };
+    let requester_thread = std::thread::spawn(move || {
+        requester.runtime_desired_read(&requester_authenticated, &request)
+    });
+    let observer = Store::connect(&url, None).unwrap();
+    let mut waiting_on_identity = false;
+    for _ in 0..200 {
+        let wait_event: Option<String> = observer
+            .with(|client| {
+                client
+                    .query_opt(
+                        "SELECT wait_event_type FROM pg_stat_activity WHERE pid=$1",
+                        &[&requester_pid],
+                    )
+                    .map(|row| row.and_then(|row| row.get(0)))
+            })
+            .unwrap();
+        if wait_event.as_deref() == Some("Lock") {
+            waiting_on_identity = true;
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    assert!(waiting_on_identity, "request never waited on NodeIdentity");
+    release_tx.send(()).unwrap();
+    replacer_thread.join().unwrap();
+
+    assert!(matches!(
+        requester_thread.join().unwrap().unwrap(),
+        RuntimeSpineOutcome::Rejected(RuntimeSpineRejection::Contract(
+            cats_api::runtime_reconciliation::ContractError { error, .. }
+        )) if matches!(*error, ContractErrorDetail::StaleSession { .. })
+    ));
+    let desired_rows: i64 = store
+        .with(|client| {
+            client
+                .query_one(
+                    "SELECT count(*) FROM runtime_desired_read_states WHERE node_id=$1",
+                    &[&identity.node_id.as_str()],
+                )
+                .map(|row| row.get(0))
+        })
+        .unwrap();
+    assert_eq!(desired_rows, 0);
 }
 
 #[test]

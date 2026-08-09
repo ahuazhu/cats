@@ -184,7 +184,7 @@ impl Store {
         if let Err(error) = encode_desired_read_request(request) {
             return Ok(rejected(error));
         }
-        self.authority_repeatable_transaction(|transaction| {
+        self.authority_transaction(|transaction| {
             desired_read_in(transaction, authenticated, request)
         })
     }
@@ -197,7 +197,7 @@ impl Store {
         if let Err(error) = encode_node_observation(observation) {
             return Ok(rejected(error));
         }
-        self.authority_repeatable_transaction(|transaction| {
+        self.authority_transaction(|transaction| {
             accept_observation_in(transaction, authenticated, observation)
         })
     }

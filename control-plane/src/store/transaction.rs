@@ -63,7 +63,6 @@ enum AttemptFailure {
 )]
 enum AuthorityTransactionMode {
     ReadWrite,
-    RepeatableReadWrite,
     RepeatableReadOnly,
 }
 
@@ -80,23 +79,6 @@ impl Store {
             Err(AuthorityExecutionError::Store(error)) => Err(error),
             Err(AuthorityExecutionError::CandidateCollision) => Err(internal(
                 "unexpected candidate-collision marker outside a covered create",
-            )),
-        }
-    }
-
-    #[allow(dead_code, reason = "consumed by the F3c runtime spine")]
-    pub(super) fn authority_repeatable_transaction<T: Send>(
-        &self,
-        operation: impl FnMut(&mut postgres::Transaction<'_>) -> AuthorityTxResult<T> + Send,
-    ) -> Result<T> {
-        match self.authority_transaction_outcome_with(
-            operation,
-            AuthorityTransactionMode::RepeatableReadWrite,
-        ) {
-            Ok(value) => Ok(value),
-            Err(AuthorityExecutionError::Store(error)) => Err(error),
-            Err(AuthorityExecutionError::CandidateCollision) => Err(internal(
-                "unexpected candidate-collision marker in a runtime spine transaction",
             )),
         }
     }
@@ -139,10 +121,6 @@ impl Store {
                 let client = client.map_err(AttemptFailure::Infrastructure)?;
                 let mut transaction = match mode {
                     AuthorityTransactionMode::ReadWrite => client.transaction(),
-                    AuthorityTransactionMode::RepeatableReadWrite => client
-                        .build_transaction()
-                        .isolation_level(IsolationLevel::RepeatableRead)
-                        .start(),
                     AuthorityTransactionMode::RepeatableReadOnly => client
                         .build_transaction()
                         .isolation_level(IsolationLevel::RepeatableRead)
