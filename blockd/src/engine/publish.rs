@@ -74,6 +74,139 @@ fn upload_workers(objects: usize) -> usize {
     objects.clamp(1, MAX_UPLOAD_CONCURRENCY)
 }
 
+fn entry_payload<'a>(entry: &PackEntry, payload: &'a [u8]) -> Result<&'a [u8]> {
+    let start = usize::try_from(entry.payload_offset)
+        .map_err(|_| EngineError::Corrupt("pack payload offset exceeds usize".into()))?;
+    let len = usize::try_from(entry.len)
+        .map_err(|_| EngineError::Corrupt("pack payload length exceeds usize".into()))?;
+    let end = start
+        .checked_add(len)
+        .ok_or_else(|| EngineError::Corrupt("pack payload range overflow".into()))?;
+    payload
+        .get(start..end)
+        .ok_or_else(|| EngineError::Corrupt("pack payload range is out of bounds".into()))
+}
+
+/// Validate the complete persisted entry projection before materialization can
+/// issue a GET and before publication can index or PUT anything. Pending packs
+/// are crash residue and therefore untrusted input even when their outer header
+/// decoded successfully.
+fn validate_pack_entries(header: &PackHeader, payload: &[u8], chunk_count: u64) -> Result<()> {
+    if header.entries.is_empty() {
+        return Err(EngineError::Corrupt(
+            "pack must contain at least one entry".into(),
+        ));
+    }
+    let mut chunks = HashSet::with_capacity(header.entries.len());
+    let mut payload_cursor = 0usize;
+    for entry in &header.entries {
+        if entry.chunk_idx >= chunk_count {
+            return Err(EngineError::Corrupt("pack chunk is out of bounds".into()));
+        }
+        if !chunks.insert(entry.chunk_idx) {
+            return Err(EngineError::Corrupt(
+                "pack contains duplicate chunk entries".into(),
+            ));
+        }
+
+        let start = usize::try_from(entry.payload_offset)
+            .map_err(|_| EngineError::Corrupt("pack payload offset exceeds usize".into()))?;
+        if start != payload_cursor {
+            return Err(EngineError::Corrupt(
+                "pack entries do not cover their payload canonically".into(),
+            ));
+        }
+        let source = entry_payload(entry, payload)?;
+        payload_cursor = start
+            .checked_add(source.len())
+            .ok_or_else(|| EngineError::Corrupt("pack payload range overflow".into()))?;
+        if hex::encode(format::sha256(source)) != entry.sha256_hex {
+            return Err(EngineError::Corrupt("pack entry hash mismatch".into()));
+        }
+
+        if entry.is_discard() {
+            if !source.is_empty() || entry.is_byte_overlay() {
+                return Err(EngineError::Corrupt(
+                    "pack discard carries data or byte ranges".into(),
+                ));
+            }
+            continue;
+        }
+
+        if !entry.is_byte_overlay() {
+            let expected = materialized_entry_bytes(entry)
+                .ok_or_else(|| EngineError::Corrupt("pack entry length overflow".into()))?;
+            if source.len() != expected {
+                return Err(EngineError::Corrupt(format!(
+                    "pack entry carries {} bytes for {} pages",
+                    source.len(),
+                    entry.page_mask.count_ones()
+                )));
+            }
+            continue;
+        }
+
+        let entry_end = payload_cursor;
+        let mut range_payload_cursor = start;
+        let mut previous_chunk_end = None;
+        let mut range_page_mask = 0u64;
+        for range in &entry.byte_ranges {
+            if range.len == 0 {
+                return Err(EngineError::Corrupt(
+                    "pack byte range must not be empty".into(),
+                ));
+            }
+            let chunk_end = range
+                .chunk_offset
+                .checked_add(range.len)
+                .filter(|end| *end <= CHUNK_SIZE)
+                .ok_or_else(|| EngineError::Corrupt("pack byte range exceeds its chunk".into()))?;
+            if previous_chunk_end.is_some_and(|end| range.chunk_offset < end) {
+                return Err(EngineError::Corrupt(
+                    "pack byte ranges are not in canonical chunk order".into(),
+                ));
+            }
+            previous_chunk_end = Some(chunk_end);
+
+            let range_start = usize::try_from(range.payload_offset).map_err(|_| {
+                EngineError::Corrupt("pack byte range payload offset exceeds usize".into())
+            })?;
+            if range_start != range_payload_cursor {
+                return Err(EngineError::Corrupt(
+                    "pack byte ranges do not cover their entry canonically".into(),
+                ));
+            }
+            let range_len = usize::try_from(range.len)
+                .map_err(|_| EngineError::Corrupt("pack byte range length exceeds usize".into()))?;
+            range_payload_cursor = range_start
+                .checked_add(range_len)
+                .ok_or_else(|| EngineError::Corrupt("pack byte range payload overflow".into()))?;
+            if range_payload_cursor > entry_end || range_payload_cursor > payload.len() {
+                return Err(EngineError::Corrupt(
+                    "pack byte range payload is out of bounds".into(),
+                ));
+            }
+            range_page_mask |= format::page_mask(range.chunk_offset, range.len);
+        }
+        if range_payload_cursor != entry_end {
+            return Err(EngineError::Corrupt(
+                "pack byte ranges do not cover the complete entry".into(),
+            ));
+        }
+        if !entry.is_base() && range_page_mask != entry.page_mask {
+            return Err(EngineError::Corrupt(
+                "pack byte ranges disagree with their page mask".into(),
+            ));
+        }
+    }
+    if payload_cursor != payload.len() {
+        return Err(EngineError::Corrupt(
+            "pack entries do not cover the complete payload".into(),
+        ));
+    }
+    Ok(())
+}
+
 pub(super) struct PreparedMapPublication {
     pub(super) base_root_hash: Option<[u8; 32]>,
     pub(super) base_root_object_id: Option<String>,
@@ -502,17 +635,14 @@ impl ChunkEngine {
     /// 2.9x (see experiments/vhost-user-blk-frontend-20260726).
     pub(super) fn upload_batch(&self, packs: &[(&PackHeader, &[u8])]) -> Result<()> {
         let vol = &self.cfg.volume_id;
-        let items: Vec<(String, &[u8])> = packs
-            .iter()
-            .flat_map(|(header, payload)| {
-                header.entries.iter().filter(|e| !e.is_discard()).map(|e| {
-                    let at = e.payload_offset as usize;
-                    let bytes = &payload[at..at + e.len as usize];
-                    let object_id = Self::object_id(&header.txn, e);
-                    (chunk::keys::data(vol, &object_id), bytes)
-                })
-            })
-            .collect();
+        let mut items: Vec<(String, &[u8])> = Vec::new();
+        for (header, payload) in packs {
+            for entry in header.entries.iter().filter(|entry| !entry.is_discard()) {
+                let bytes = entry_payload(entry, payload)?;
+                let object_id = Self::object_id(&header.txn, entry);
+                items.push((chunk::keys::data(vol, &object_id), bytes));
+            }
+        }
 
         let put = |item: &(String, &[u8])| -> Result<()> {
             self.blob.put_immutable(&item.0, item.1)?;
@@ -608,7 +738,7 @@ impl ChunkEngine {
         let batch_epoch = first.lease_epoch;
         let mut expected_generation = base_generation;
         let mut txns = HashSet::with_capacity(packs.len());
-        for (header, _) in packs {
+        for (header, payload) in packs {
             if header.volume_id != self.cfg.volume_id {
                 return Err(EngineError::Corrupt("commit batch volume mismatch".into()));
             }
@@ -628,6 +758,7 @@ impl ChunkEngine {
                     "commit batch reuses a transaction id".into(),
                 ));
             }
+            validate_pack_entries(header, payload, self.chunk_count)?;
             expected_generation = expected_generation
                 .checked_add(1)
                 .ok_or_else(|| EngineError::Corrupt("commit generation overflow".into()))?;
@@ -825,7 +956,11 @@ impl ChunkEngine {
     /// objects, and a cold read of the chunk then costs nothing at all).
     pub(super) fn apply_pack_entries(map: &mut [ChunkRef], header: &PackHeader) -> Result<()> {
         for e in &header.entries {
-            let slot = &mut map[e.chunk_idx as usize];
+            let index = usize::try_from(e.chunk_idx)
+                .map_err(|_| EngineError::Corrupt("pack chunk index exceeds usize".into()))?;
+            let slot = map
+                .get_mut(index)
+                .ok_or_else(|| EngineError::Corrupt("pack chunk is out of bounds".into()))?;
             if e.is_discard() {
                 *slot = ChunkRef::Hole;
                 continue;

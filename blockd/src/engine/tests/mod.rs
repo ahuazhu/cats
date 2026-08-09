@@ -1578,6 +1578,154 @@ fn malformed_batch_lineage_is_rejected_before_any_remote_write() {
 }
 
 #[test]
+fn malformed_pack_entries_fail_before_any_remote_write_or_indexing() {
+    use cats_storage::blob::FaultyBlobStore;
+
+    let dir = tempfile::tempdir().unwrap();
+    let healthy: Arc<dyn BlobStore> =
+        Arc::new(FileBlobStore::open(dir.path().join("blob")).unwrap());
+    let blob = Arc::new(FaultyBlobStore::new(healthy));
+    let meta = Arc::new(CountingMeta {
+        inner: Arc::new(SqliteMetadataStore::open(&dir.path().join("meta.db")).unwrap()),
+        cas_calls: AtomicU64::new(0),
+        forced_head_epoch: None,
+    });
+    meta.create_volume(VOL, SIZE).unwrap();
+    let e = ChunkEngine::attach(
+        EngineConfig::new(VOL, dir.path().join("data"), "attA"),
+        blob.clone(),
+        meta.clone(),
+    )
+    .unwrap();
+    let page = vec![0x5a; cats_api::chunk::DIRTY_PAGE_SIZE as usize];
+    let valid_entry = PackEntry {
+        chunk_idx: 0,
+        payload_offset: 0,
+        len: page.len() as u32,
+        sha256_hex: hex::encode(format::sha256(&page)),
+        page_mask: 1,
+        byte_ranges: Vec::new(),
+    };
+
+    let mut cases: Vec<(&str, PackEntry, Vec<u8>)> = vec![
+        (
+            "payload offset overflow",
+            PackEntry {
+                payload_offset: u64::MAX,
+                len: 1,
+                ..valid_entry.clone()
+            },
+            vec![0x5a],
+        ),
+        (
+            "payload length out of bounds",
+            PackEntry {
+                len: valid_entry.len + 1,
+                ..valid_entry.clone()
+            },
+            page.clone(),
+        ),
+        (
+            "chunk out of bounds",
+            PackEntry {
+                chunk_idx: e.chunk_count,
+                ..valid_entry.clone()
+            },
+            page.clone(),
+        ),
+        (
+            "payload hash mismatch",
+            PackEntry {
+                sha256_hex: "00".repeat(32),
+                ..valid_entry.clone()
+            },
+            page.clone(),
+        ),
+        (
+            "page mask length mismatch",
+            PackEntry {
+                page_mask: 0b11,
+                ..valid_entry
+            },
+            page,
+        ),
+    ];
+    let overlay = vec![0x7b; 16];
+    cases.push((
+        "byte range exceeds chunk",
+        PackEntry {
+            chunk_idx: 0,
+            payload_offset: 0,
+            len: overlay.len() as u32,
+            sha256_hex: hex::encode(format::sha256(&overlay)),
+            page_mask: 1,
+            byte_ranges: vec![PackByteRange {
+                chunk_offset: CHUNK_SIZE - 8,
+                payload_offset: 0,
+                len: overlay.len() as u32,
+            }],
+        },
+        overlay.clone(),
+    ));
+    cases.push((
+        "byte range payload overflow",
+        PackEntry {
+            chunk_idx: 0,
+            payload_offset: 0,
+            len: overlay.len() as u32,
+            sha256_hex: hex::encode(format::sha256(&overlay)),
+            page_mask: 1,
+            byte_ranges: vec![PackByteRange {
+                chunk_offset: 0,
+                payload_offset: u64::MAX,
+                len: overlay.len() as u32,
+            }],
+        },
+        overlay,
+    ));
+
+    let (base_map, base_leaves) = {
+        let state = e.state.lock().unwrap();
+        (state.map.clone(), state.leaf_refs.clone())
+    };
+    for (case, entry, payload) in cases {
+        let header = PackHeader {
+            txn: format!("malformed-{}", case.replace(' ', "-")),
+            volume_id: VOL.into(),
+            base_generation: 0,
+            lease_epoch: e.epoch,
+            entries: vec![entry],
+        };
+        blob.fail_puts.store(1, Ordering::SeqCst);
+        let cas_before = meta.cas_calls.load(Ordering::SeqCst);
+        let error = e
+            .commit_pack_batch(
+                &[(&header, payload.as_slice())],
+                base_map.clone(),
+                base_leaves.clone(),
+            )
+            .unwrap_err();
+        assert!(
+            matches!(error, EngineError::Corrupt(_)),
+            "{case} returned {error}"
+        );
+        assert_eq!(
+            blob.fail_puts.load(Ordering::SeqCst),
+            1,
+            "{case} reached an immutable PUT"
+        );
+        assert_eq!(
+            meta.cas_calls.load(Ordering::SeqCst),
+            cas_before,
+            "{case} reached the authority CAS"
+        );
+    }
+
+    blob.fail_puts.store(0, Ordering::SeqCst);
+    e.detach().unwrap();
+}
+
+#[test]
 fn committed_cas_with_a_lost_response_is_reconciled_without_fencing() {
     let dir = tempfile::tempdir().unwrap();
     let blob: Arc<dyn BlobStore> = Arc::new(FileBlobStore::open(dir.path().join("blob")).unwrap());
