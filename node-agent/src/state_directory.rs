@@ -1,10 +1,11 @@
 //! Process-lifetime ownership of the identity-selected Node state directory.
 
-use std::fs::File;
+use std::fs::{File, OpenOptions};
 use std::ops::Deref;
 use std::os::fd::AsRawFd as _;
 #[cfg(target_os = "linux")]
 use std::os::fd::{FromRawFd as _, RawFd};
+use std::os::unix::fs::OpenOptionsExt as _;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -103,6 +104,22 @@ impl StateDirectory {
 
     pub fn path(&self) -> &Path {
         &self.path
+    }
+
+    /// Clones the already-retained identity-selected directory. Explicit
+    /// development configurations still open their path with `O_NOFOLLOW` so
+    /// a sibling subsystem can use the same descriptor-relative discipline.
+    pub(crate) fn try_clone_directory(&self) -> std::io::Result<File> {
+        match &self.inherited_directory {
+            Some(directory) => directory.try_clone(),
+            None => {
+                let mut options = OpenOptions::new();
+                options.read(true).custom_flags(
+                    libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC | libc::O_NONBLOCK,
+                );
+                options.open(&self.path)
+            }
+        }
     }
 
     /// Revalidates the contract immediately before runtime construction. The

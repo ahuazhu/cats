@@ -5,6 +5,13 @@
 //! [`RuntimeSpineAttempt::RetryExact`]; the adapter never manufactures a new
 //! domain sequence after an ambiguous outcome.
 
+mod state;
+
+pub use state::{
+    DurableRuntimeSpineRequest, RuntimeSpineDesiredWork, RuntimeSpineJournal,
+    RuntimeSpineJournalError,
+};
+
 use std::time::Duration;
 
 use anyhow::Context as _;
@@ -80,9 +87,13 @@ impl std::fmt::Debug for RuntimeSpineHttpClient {
 impl RuntimeSpineHttpClient {
     pub fn for_production(
         control_plane_origin: &str,
-        signer: Ed25519RequestSigner,
+        registration: &crate::agent_registration::AgentRegistrationConfig,
     ) -> anyhow::Result<Self> {
-        Self::new(control_plane_origin, signer, TransportMode::ProductionHttps)
+        Self::new(
+            control_plane_origin,
+            registration.runtime_request_signer(),
+            TransportMode::ProductionHttps,
+        )
     }
 
     #[doc(hidden)]
@@ -671,13 +682,29 @@ mod tests {
 
     #[test]
     fn production_origin_is_https_only_and_has_no_path_or_userinfo() {
-        assert!(RuntimeSpineHttpClient::for_production("http://cats.test/", signer()).is_err());
-        assert!(
-            RuntimeSpineHttpClient::for_production("https://cats.test/path", signer()).is_err()
-        );
-        assert!(
-            RuntimeSpineHttpClient::for_production("https://user@cats.test/", signer()).is_err()
-        );
-        RuntimeSpineHttpClient::for_production("https://cats.test/", signer()).unwrap();
+        assert!(RuntimeSpineHttpClient::new(
+            "http://cats.test/",
+            signer(),
+            TransportMode::ProductionHttps
+        )
+        .is_err());
+        assert!(RuntimeSpineHttpClient::new(
+            "https://cats.test/path",
+            signer(),
+            TransportMode::ProductionHttps
+        )
+        .is_err());
+        assert!(RuntimeSpineHttpClient::new(
+            "https://user@cats.test/",
+            signer(),
+            TransportMode::ProductionHttps
+        )
+        .is_err());
+        RuntimeSpineHttpClient::new(
+            "https://cats.test/",
+            signer(),
+            TransportMode::ProductionHttps,
+        )
+        .unwrap();
     }
 }

@@ -211,6 +211,12 @@ impl AgentRegistrationConfig {
         self.runtime_state_directory.clone()
     }
 
+    /// Reuses the exact installed A19 credential for all runtime-internal
+    /// Node requests. The private key remains encapsulated by the signer.
+    pub(crate) fn runtime_request_signer(&self) -> Ed25519RequestSigner {
+        self.signer.clone()
+    }
+
     /// Keeps one exact pending attempt durable across every ambiguous result.
     /// A returned session has already been validated, fsynced, and made the
     /// sole durable current session before the pending file was removed.
