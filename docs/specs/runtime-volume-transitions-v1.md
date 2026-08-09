@@ -409,8 +409,9 @@ accepted full inventory/session/epoch/read position、current Desired/tombstone 
 identity、完整acquire origin、attachment/epoch、disposition和generation都匹配；blockd/VMM/Guest writer已停，
 保留数据路径精确`R == L == volume_release.generation`。对Root disposable `R == L` normal分支，current
 Desired必须是同delete ID的Deleted revision；取得Volume锁后fresh检查该delete lineage不存在任何已经派生的
-disposable authorization。对Persistent detach/retain按Volume Authority current-only规则验证不再有冲突
-binding/residue。
+disposable authorization。该检查对projection scope与canonical JSON scope双向选取候选、完整decode并交叉
+验证，canonical分支由schema v9的`jsonb_path_ops` GIN表达式索引有界执行，不能用`LIMIT`掩盖历史全表扫描。
+对Persistent detach/retain按Volume Authority current-only规则验证不再有冲突binding/residue。
 
 任一授权已先commit则release零副作用返回`authorization_branch_conflict`；release先commit时后续derive因
 Unowned整笔回滚。全部通过后调用pure `release`并同commit写Unowned结果。release响应确认后Node才能删除不再

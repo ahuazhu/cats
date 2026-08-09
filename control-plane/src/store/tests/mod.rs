@@ -1022,6 +1022,58 @@ fn refuses_current_stamp_with_missing_authority_catalog_barriers() {
 }
 
 #[test]
+fn refuses_missing_or_replaced_authorization_json_index_without_repair() {
+    for (ddl, expected_fragment) in [
+        (
+            "DROP INDEX volume_authorizations_record_authorization",
+            None,
+        ),
+        (
+            "DROP INDEX volume_authorizations_record_authorization;
+             CREATE INDEX volume_authorizations_record_authorization
+                 ON volume_authorizations(volume_id)",
+            Some("USING btree (volume_id)"),
+        ),
+    ] {
+        let url = crate::testsupport::isolated_control_store_url();
+        drop(Store::connect(&url, None).unwrap());
+        let mut admin = postgres::Client::connect(&url, postgres::NoTls).unwrap();
+        admin.batch_execute(ddl).unwrap();
+
+        let Err(error) = Store::connect(&url, None) else {
+            panic!("a stamped schema with a changed authorization index must fail closed");
+        };
+        assert_eq!(error.code, ErrorCode::FailedPrecondition);
+        assert!(
+            error
+                .to_string()
+                .contains("volume_authorizations_record_authorization"),
+            "operator must see the changed index name, got: {error}"
+        );
+        let definition: Option<String> = admin
+            .query_one(
+                "SELECT pg_get_indexdef(
+                    to_regclass('volume_authorizations_record_authorization'))",
+                &[],
+            )
+            .unwrap()
+            .get(0);
+        match expected_fragment {
+            Some(fragment) => assert!(
+                definition
+                    .as_deref()
+                    .is_some_and(|value| value.contains(fragment)),
+                "startup repaired or replaced the deliberately wrong index: {definition:?}"
+            ),
+            None => assert!(
+                definition.is_none(),
+                "startup recreated a deliberately dropped index: {definition:?}"
+            ),
+        }
+    }
+}
+
+#[test]
 fn concurrent_first_connections_create_one_exact_schema() {
     let url = crate::testsupport::isolated_control_store_url();
     let barrier = Arc::new(std::sync::Barrier::new(3));

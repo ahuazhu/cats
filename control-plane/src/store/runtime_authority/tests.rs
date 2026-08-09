@@ -41,6 +41,7 @@ use super::rows::{
     load_active_event_by_node_unlocked, load_authorization_for_update,
     load_delete_completion_for_update, load_event_for_update, load_volume_for_update,
     update_authorization, update_event, update_volume,
+    volume_has_disposable_root_authorization_for_delete, AUTHORIZATION_COLUMNS,
 };
 use super::runtime_spine::{
     age_volume_mutation_admission_for_test, PlacementAdmissionLoad, PlacementAdmissionRejection,
@@ -2226,6 +2227,125 @@ fn a22_root_release_fails_closed_when_current_authorization_projection_drifts() 
             "authorization changed for {drift:?}"
         );
     }
+}
+
+#[test]
+fn a22_disposable_authorization_scope_stays_indexed_with_large_history() {
+    let store = Store::connect(&crate::testsupport::isolated_control_store_url(), None).unwrap();
+    let owned = acquire_owned_volume(&store);
+    let (_node, _desired, _admission, _request) =
+        prepare_root_delete_release_fixture(&store, &owned);
+    store
+        .authority_transaction(|transaction| {
+            transaction.execute(
+                "INSERT INTO volume_authorizations (
+                    authorization_id, record, kind, authorized_node_id,
+                    host_fence_event_id, volume_id, state, desired_revision,
+                    placement_epoch, lease_duration_ms, not_after, consumed_at
+                 )
+                 SELECT 'history-auth-' || lpad(entry::text, 8, '0'),
+                        jsonb_build_object('unrelated_history', entry),
+                        'disposable_root_delete', 'history-node', NULL,
+                        'history-volume-' || entry::text, 'unconsumed',
+                        1, 1, NULL, 9223372036854775807, NULL
+                   FROM generate_series(1, 50000) AS entry",
+                &[],
+            )?;
+            transaction.batch_execute("ANALYZE volume_authorizations")?;
+            Ok(())
+        })
+        .unwrap();
+
+    let explain_scope = || {
+        store
+            .authority_transaction(|transaction| {
+                let rows = transaction.query(
+                    &format!(
+                        "EXPLAIN (COSTS OFF)
+                 SELECT {AUTHORIZATION_COLUMNS}
+                   FROM volume_authorizations
+                  WHERE (
+                        volume_id=$1
+                    AND kind='disposable_root_delete'
+                    AND desired_revision=$2
+                    AND placement_epoch=$3
+                  ) OR (
+                        record->'authorization' @> jsonb_build_object(
+                            'kind', 'disposable_root_delete'::text,
+                            'volume_id', $1::text,
+                            'desired_revision', $2::bigint,
+                            'placement_epoch', $3::bigint,
+                            'delete_id', $4::text
+                        )
+                  )
+                  ORDER BY authorization_id COLLATE \"C\"
+                  LIMIT 2"
+                    ),
+                    &[&owned.volume_id.as_str(), &12_i64, &4_i64, &"delete-1"],
+                )?;
+                Ok(rows
+                    .into_iter()
+                    .map(|row| row.get::<_, String>(0))
+                    .collect::<Vec<_>>()
+                    .join("\n"))
+            })
+            .unwrap()
+    };
+    let assert_indexed = |phase: &str, plan: &str| {
+        assert!(
+            plan.contains("volume_authorizations_record_authorization"),
+            "{phase} canonical selector did not plan through its GIN index:\n{plan}"
+        );
+        assert!(
+            !plan.contains("Seq Scan on volume_authorizations"),
+            "{phase} canonical selector planned a sequential scan:\n{plan}"
+        );
+    };
+    let missing_plan = explain_scope();
+    assert_indexed("missing", &missing_plan);
+
+    let missing = store
+        .authority_transaction(|transaction| {
+            transaction.batch_execute("SET LOCAL statement_timeout='250ms'")?;
+            volume_has_disposable_root_authorization_for_delete(
+                transaction,
+                &owned.volume_id,
+                &id("delete-1"),
+                revision(12),
+                epoch(4),
+            )
+        })
+        .unwrap();
+    assert!(!missing);
+
+    let authorization = disposable_authorization(&owned);
+    store
+        .authority_transaction(|transaction| {
+            insert_authorization(transaction, &authorization)?;
+            transaction.execute(
+                "UPDATE volume_authorizations
+                    SET desired_revision=11
+                  WHERE authorization_id=$1",
+                &[&"delete-auth-1"],
+            )?;
+            Ok(())
+        })
+        .unwrap();
+    let drifted_plan = explain_scope();
+    assert_indexed("drifted current", &drifted_plan);
+    let error = store
+        .authority_transaction(|transaction| {
+            transaction.batch_execute("SET LOCAL statement_timeout='250ms'")?;
+            volume_has_disposable_root_authorization_for_delete(
+                transaction,
+                &owned.volume_id,
+                &id("delete-1"),
+                revision(12),
+                epoch(4),
+            )
+        })
+        .unwrap_err();
+    assert_eq!(error.code, ErrorCode::Internal);
 }
 
 #[test]

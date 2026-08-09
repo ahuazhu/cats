@@ -1163,7 +1163,11 @@ Root cleanup/release与authorization derive以现有`VolumeRecord`作为分支ga
 authorization后必须取得Volume锁并fresh重验current Deleted exact lineage及Active + Owned才能commit；
 release取得Volume锁后必须fresh读取同一delete ID/revision的authorization，任一已commit就拒绝，并重验
 current Deleted。release先commit时derive随后看到Unowned并整笔回滚；derive先commit时release看到auth并
-零副作用拒绝。不能在锁前缓存“无authorization”后越过这个重验。
+零副作用拒绝。这个fresh probe必须以projection current scope **或** canonical authorization中的同一
+volume/delete/revision/placement scope选出至多两个候选，再完整closed decode并交叉验证projection；任一方向
+drift都属于corruption，而旧lineage不进入候选。canonical分支必须由schema v9要求并在启动时精确校验的
+`GIN ((record->'authorization') jsonb_path_ops)`表达式索引承载；`LIMIT 2`本身不能作为全历史扫描的bound。
+不能在锁前缓存“无authorization”后越过这个重验。
 - Persistent不读取或保存“历史上属于哪个Cat”。它要求全部current完整Desired都不引用该Disk，且current
   accepted complete inventory按
   [Inventory Spine §5.4](runtime-inventory-observation-v1.md#54-服务端-attestation-与-current-read-model)在同一

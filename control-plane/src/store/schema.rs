@@ -298,6 +298,46 @@ fn verify_authority_catalog(transaction: &mut postgres::Transaction<'_>) -> Resu
             return Err(partial_catalog_object(index));
         }
     }
+    for (table, index, access_method, operator_class, expression) in REQUIRED_EXPRESSION_INDEXES {
+        let present: bool = transaction
+            .query_one(
+                "SELECT EXISTS (
+                    SELECT 1
+                      FROM pg_index i
+                      JOIN pg_class source ON source.oid=i.indrelid
+                      JOIN pg_namespace source_namespace
+                        ON source_namespace.oid=source.relnamespace
+                      JOIN pg_class index_relation
+                        ON index_relation.oid=i.indexrelid
+                      JOIN pg_am access_method
+                        ON access_method.oid=index_relation.relam
+                      JOIN pg_opclass operator_class
+                        ON operator_class.oid=i.indclass[0]
+                      JOIN pg_namespace operator_namespace
+                        ON operator_namespace.oid=operator_class.opcnamespace
+                     WHERE source_namespace.nspname=current_schema()
+                       AND source.relname=$1 AND index_relation.relname=$2
+                       AND NOT i.indisunique AND i.indisvalid AND i.indisready
+                       AND i.indnkeyatts=1 AND i.indnatts=1
+                       AND i.indkey::TEXT='0' AND i.indoption::TEXT='0'
+                       AND i.indpred IS NULL AND i.indexprs IS NOT NULL
+                       AND access_method.amname=$3
+                       AND operator_namespace.nspname='pg_catalog'
+                       AND operator_class.opcname=$4
+                       AND pg_get_expr(i.indexprs, i.indrelid)=$5
+                 )",
+                &[table, index, access_method, operator_class, expression],
+            )
+            .map_err(|error| {
+                internal(format!(
+                    "verify authority expression-index catalog: {error:?}"
+                ))
+            })?
+            .get(0);
+        if !present {
+            return Err(partial_catalog_object(index));
+        }
+    }
     for (table, trigger, function, trigger_type, body_sha256) in REQUIRED_IMMUTABILITY_TRIGGERS {
         let body = transaction
             .query_opt(
@@ -483,6 +523,14 @@ const REQUIRED_UNIQUE_INDEXES: &[(&str, &str, &str, Option<&str>)] = &[
         None,
     ),
 ];
+
+const REQUIRED_EXPRESSION_INDEXES: &[(&str, &str, &str, &str, &str)] = &[(
+    "volume_authorizations",
+    "volume_authorizations_record_authorization",
+    "gin",
+    "jsonb_path_ops",
+    "(record -> 'authorization'::text)",
+)];
 
 // PostgreSQL `pg_trigger.tgtype` bits: ROW=1, BEFORE=2, DELETE=8,
 // UPDATE=16. Exact masks reject statement-level, AFTER, extra-event and
@@ -1010,6 +1058,8 @@ CREATE INDEX IF NOT EXISTS volume_authorizations_event
 ON volume_authorizations(host_fence_event_id) WHERE host_fence_event_id IS NOT NULL;
 CREATE INDEX IF NOT EXISTS volume_authorizations_volume
 ON volume_authorizations(volume_id);
+CREATE INDEX IF NOT EXISTS volume_authorizations_record_authorization
+ON volume_authorizations USING GIN ((record->'authorization') jsonb_path_ops);
 CREATE TABLE IF NOT EXISTS delete_completion_receipts (
     delete_id TEXT PRIMARY KEY,
     record JSONB NOT NULL CHECK (jsonb_typeof(record) = 'object'),
