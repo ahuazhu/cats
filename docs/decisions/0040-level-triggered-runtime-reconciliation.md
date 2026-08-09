@@ -98,8 +98,10 @@ Pending Operation。已选 Node 若明确拒绝不可满足的容量/能力，�
 
 Node的静态schedulable/capacity/capability和Guest private network来源只由
 [ADR-0043](0043-provisioner-owned-runtime-placement-policy.md)的provisioner policy声明。Control按稳定
-Node ID分页选择，并在NodeIdentity锁内重验；heartbeat、legacy Node row、Node自报数字、本地CIDR推导和
-scheduler reservation都不是authority。
+Node ID分页选择，Active HostFenceEvent的Node不能成为target，并在NodeIdentity锁内按
+AgentSession/observation receive-cursor/event统一顺序重验。每Node post-mutation assigned set最多
+1024，same-node shape change、migration/takeover/retry都以exact current Desired CAS和server-derived source
+exclusion重算。heartbeat、legacy Node row、Node自报数字、本地CIDR推导和scheduler reservation都不是authority。
 
 Cat create把Cat、current完整Desired、runtime Operation、generation-zero且Unowned的唯一Root
 Disk/Volume和exact API result放在同一PG commit；不留下半套identity。Root没有Persistent

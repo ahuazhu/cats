@@ -120,7 +120,7 @@ Metadata fencing只阻止旧写者发布Root，不能证明旧VMM已停止。跨
 - RootDisk与Cat同生命周期；PersistentDisk独立存在。PersistentDisk创建时预定ext4 UUID和一次性
   initialization token。Disk与Volume全局一对一，Root与同Workspace Cat一对一，PersistentDisk同时
   最多被一个current完整Desired引用；product path只用immutable disk ID。Guest Agent格式化后必须再次
-  probe exact UUID并让blockd达到`R == L`；Control Store先锁current AgentSession/highest accepted head，
+  probe exact UUID并让blockd达到`R == L`；Control Store先锁current NodeIdentity、AgentSession/highest accepted head，
   再逐字段匹配observation/checkpoint/owner/epoch/head后才写`Initialized`。正确UUID和mount path都Ready后，
   Cat才可Running；session replacement或新observation与初始化竞争同一锁前缀。
 - Cat create在一个PG commit写Cat、current完整Desired、runtime Operation、唯一Root Disk、generation-zero/

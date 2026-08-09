@@ -93,7 +93,7 @@ product path中的`{disk}`只接受不可变disk ID；name只用于展示或显�
 Persistent create在一个PG事务原子写empty exact Volume、Uninitialized Disk和201
 `ApiIdempotencyResult`，同步完成且不创建Operation。Guest Agent执行唯一一次mkfs并probe结果；Node在
 Control Store写Initialized前必须再次probe exact UUID并使blockd达到`R == L`。初始化事务不接收bool/
-proof；它先锁current AgentSession及highest accepted-observation receive-state，再按Volume→Disk→current
+proof；它先锁current NodeIdentity，再锁AgentSession及highest accepted-observation receive-state，再按Volume→Disk→current
 Desired→immutable observation锁序复用已接受的完整`NodeObservation` row，逐字段绑定observation ID、revision/placement、valid checkpoint的
 `commit_initialized`、ObservedVolume owner/epoch/non-empty head与`R == L`lineage，再只更新Disk的closed
 initialization variant；session replacement/observation advance竞争同一前缀，完整tuple重试幂等，冲突

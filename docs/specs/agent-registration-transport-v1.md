@@ -320,6 +320,12 @@ provisioner为每个Node生成独立Ed25519 key。private key以PKCS#8 PEM安装
 Terraform state/output、environment、argv或日志。credential ID文件owner `root:root`、mode `0600`，内容是一个
 合法`Id` ASCII后恰好一个LF；parser只移除这一个LF，拒绝其他前后空白、多行或额外bytes。provisioner把
 credential ID和canonical SPKI DER digest预先写入唯一NodeIdentity。
+初始provision和rotation只允许`CredentialBinding::PublicKey`；credential ID和SPKI digest的Control
+Store all-history唯一、active/retired lineage DDL与不可reverse-CAS规则由
+[Runtime Placement Policy §3.4](runtime-placement-policy-v1.md#34-apply-replay事务与取消)冻结。A19
+proof adapter不会为`ProviderPrincipal`或已rotation移出current NodeIdentity的历史key建立fallback。
+最终retire仍保留exact current binding时，只保留本规格已冻结的retired identity exact-attempt replay；
+这不是new attempt、eligibility、rotation回滚或credential重用。
 
 Node不得从`--node-id`、hostname/IP或provider metadata补出该NodeIdentity。production local artifact、
 filesystem校验、initial no-replace provision、credential rotation和retire/Host replacement规则以

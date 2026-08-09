@@ -22,19 +22,27 @@ Node自报或本地配置，无法阻止Node给自己扩容/uncordon，多Contro
    production capabilities和Host-local aligned private `/16`。policy与provisioned NodeIdentity一对一绑定；
    Node credential、heartbeat、observation、legacy row和环境/fixture不能写它。
 2. 自动化provisioner使用deployment-scoped Ed25519签名，private key只在central IaC；人类变更另可使用
-   ADR-0006 admin Organization中含exact `cats:fleet:admin` permission的WorkOS身份。两者进入同一个typed
-   principal和apply transaction；static bearer、Workspace token及A19 Node proof拒绝。
+   ADR-0006 admin Organization中current active membership且含exact `cats:fleet:admin` permission的WorkOS身份；
+   每次apply都online验证，不信任sealed stale session。两者进入同一个typed principal和apply
+   transaction；static bearer、Workspace token及A19 Node proof拒绝。provisioner trust ID/SPKI在Control
+   Store保留all-history active/retired tombstone，跨release不可重用。
 3. NodeIdentity初始provision与revision-1 cordoned policy同一transaction。policy update用expected revision；
    capacity/capability/CIDR只在cordoned且current assigned set为空时改变。credential rotation和retire复用A19a
-   lineage并与policy/Create在NodeIdentity row串行。
+   lineage并与policy/Create在NodeIdentity row串行。V1 Node provision/rotation只接受public key，
+   credential ID和SPKI分别全历史唯一，rotation/retire后也不可重用或reverse CAS。
 4. Cat-create planner在一个`REPEATABLE READ READ ONLY` snapshot中按`node_id` keyset page 64遍历全部
-   provisioned identity，读取policy+A20完整facts，按stable node ID first-fit。capacity只对全部current assigned
-   Desired shape做checked sum；没有fleet total cap、utilization ratio、reservation或heartbeat数字。
+   provisioned identity，读取policy+A20完整facts和Active HostFenceEvent，按stable node ID first-fit。
+   source exclusion只由server从current placement派生，Active-fenced Node不能做target。capacity只对全部
+   current assigned Desired shape做checked post-mutation sum，每Node post-set最多1024；没有fleet total cap、
+   utilization ratio、reservation或heartbeat数字。same-node shape change、migration、takeover和retry共用一个
+   exact-current-CAS plan。
 5. 每Node private `/16`的slot 0保留，其余16383个`/30`以domain-separated SHA-256取得start并对current
    assigned Desired做deterministic linear probe。slot是唯一collision unit；gateway/guest/MAC由slot单射得到。
    slot释放还要求new full inventory证明旧tap/residue消失。
-6. Cat-create commit继续遵守ADR-0032/0042：先锁NodeIdentity并重验policy、A20 facts、capacity和exact slot，
-   再锁Volume。所有会改变assigned set的Desired mutation同样序列化；不增加scheduler table/lease/boolean。
+6. Cat-create commit继续遵守ADR-0032/0042：先锁NodeIdentity，再按AgentSession/observation
+   receive-cursor/HostFenceEvent顺序重验policy、A20 facts、post-set、capacity和exact slot，最后进入
+   Volume。所有session/observation和会改assigned set/shape的Desired mutation使用同一NodeIdentity-first
+   DAG；不增加scheduler table/lease/boolean。
 7. Node只消费Desired中的exact NetworkConfig。旧FNV/cat-ID推导和`--ch-network-cidr`在A23上线前删除；mixed
    authority部署保持cordoned。
 

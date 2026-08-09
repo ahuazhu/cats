@@ -138,7 +138,8 @@ fingerprint：domain separator后依次length-frame workspace、matched method/r
 If-Match presence/Generation和raw body，不做JSON/path/query语义归一化。调用者身份、当前Workspace
 membership和route permission先通过；事务随后取得
 该key reservation并优先读取result，再沿
-`HostFenceEvent -> authorization -> VolumeRecord -> Disk/Desired -> DiskSnapshotRecord`的全局DAG锁定
+`NodeIdentity -> AgentSession -> observation receive/cursor -> HostFenceEvent -> authorization ->
+VolumeRecord -> Disk/Desired -> DiskSnapshotRecord`的全局DAG锁定
 自己涉及的行；首次业务变化与保存status/content-type/exact response bytes的result同一commit，不落持久
 Pending。同key重放只读
 result，即使目标资源已删除也不先查资源；同key异payload在资源锁前失败。只有result miss才检查资源
@@ -332,7 +333,7 @@ identity找到设备、验证期望UUID并报告目标path已mount后才算Ready
 以一个PG事务原子写empty Volume、closed Uninitialized Disk和201 result，不建Operation；同时预定UUID和
 一次性initialization token。匹配UUID可幂等adopt，其他UUID或部分格式化痕迹进入quarantine，不再格式化。
 初始化必须在exact UUID probe、device flush并把卷推进到`R == L`后，只复用current AgentSession已接受的
-完整observation row；事务先锁current AgentSession/highest accepted head，再按Volume→Disk→current
+完整observation row；事务先锁current NodeIdentity、AgentSession/highest accepted head，再按Volume→Disk→current
 Desired→immutable observation锁序逐字段匹配observation ID、revision/
 placement、valid checkpoint `commit_initialized`、Owned attachment/epoch/non-empty head与`R == L`
 lineage，再CAS成Initialized；session replacement/observation advance竞争同一前缀。随后mount和Mounted

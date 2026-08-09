@@ -21,7 +21,8 @@ current assigned `DesiredRuntimeSpec` 与 Desired 中的 exact `NetworkConfig`�
 
 除本节显式收窄外，`Id`、`RandomId128`、`Epoch`、`Sha256Digest`、`Ipv4Address`、
 `MacAddress`、closed object、integer token及 Cats Canonical JSON 使用
-[Runtime Reconciliation §1/§16](runtime-reconciliation-v1.md#1-范围与标量)。所有加法、乘法、epoch
+[Runtime Reconciliation §1.1](runtime-reconciliation-v1.md#11-v1-wire-基础类型)和
+[§16.1](runtime-reconciliation-v1.md#161-cats-canonical-json-v1)。所有加法、乘法、epoch
 递增、地址转换和计数都使用 checked arithmetic；overflow 是 stored invariant failure，不 wrap、截断或
 把该 Node 当作普通不可选。
 
@@ -34,6 +35,9 @@ current assigned `DesiredRuntimeSpec` 与 Desired 中的 exact `NetworkConfig`�
 | route request cap | `65536` octets |
 | route success cap | `16384` octets |
 | route error cap | `20480` octets |
+| 每 replica admin apply global in-flight cap | `32` |
+| 每 replica、每 authenticated principal in-flight cap | `4` |
+| shutdown commit-resolution join deadline | `30000 ms` |
 | provisioner trust bundle cap | `16384` octets |
 | provisioner trust path | `/etc/cats/identity/runtime-provisioner-trust.v1.json` |
 | provisioner trust config | `--runtime-provisioner-trust-file`，value必须是上述exact path |
@@ -42,6 +46,9 @@ current assigned `DesiredRuntimeSpec` 与 Desired 中的 exact `NetworkConfig`�
 | reserved slot | `0` |
 | allocatable slots | `1..=16383` |
 | placement-unavailable retry hint | `Retry-After: 1` |
+
+两个in-flight cap是每个Control replica进程内的non-blocking admission，不是持久队列、
+leader或分布式配额。所有时间上限都从收到完整headers起算并包含认证与Store时间。
 
 `NodePlacementPolicy`是 provider-neutral Control Store record：
 
@@ -150,17 +157,23 @@ RuntimeNodeAuthorityMutation =
   }
 | {
     kind: "rotate_credential",
+    expected_policy_revision: Epoch,
     expected_credential_id: Id,
-    expected_credential_binding: CredentialBinding,
+    expected_credential_binding: PublicKeyCredentialBinding,
     new_credential_id: Id,
-    new_credential_binding: CredentialBinding
+    new_credential_binding: PublicKeyCredentialBinding
   }
 | {
     kind: "retire",
     expected_policy_revision: Epoch,
     expected_credential_id: Id,
-    expected_credential_binding: CredentialBinding
+    expected_credential_binding: PublicKeyCredentialBinding
   }
+
+PublicKeyCredentialBinding = {
+  kind: "public_key",
+  public_key_spki_sha256: Sha256Digest
+}
 
 RuntimeNodeAuthorityApplyResult {
   version: 1,
@@ -177,11 +190,15 @@ RuntimeNodeAuthorityStoredOutcome =
 ```
 
 所有重复出现的`node_id`必须逐字段相同。`provision`只接受A19a canonical `NodeIdentity`，其state必须是
-`provisioned`；policy必须revision 1且cordoned。identity或policy已存在时只有§3.4 exact apply replay可
-成功，不能adopt等价row。`rotate_credential`按A19a exact old ID+binding CAS；new ID/binding必须不同且合法，
-policy必须cordoned、assigned set为空、current AgentSession不存在或以本次同一DB now判断已过期。它不建立
-第二把同时有效的Node key。`retire`要求exact credential、exact policy revision、policy cordoned、assigned
-set为空和session absent/expired，再把identity置为retired；retired identity不能update/rotate/unretire。
+`provisioned`，且`credential_binding`必须是上述exact `PublicKeyCredentialBinding`；V1对
+`CredentialBinding::ProviderPrincipal`和其他variant固定返回并持久
+`authority_precondition_failed`，不建立provider-principal lineage。policy必须revision 1且cordoned。
+identity或policy已存在时只有§3.4 exact apply replay可成功，不能adopt等价row。
+`rotate_credential`按exact policy revision与old ID+public-key binding CAS；new ID/binding必须不同且是
+从未出现过的fresh value，policy必须cordoned、assigned set为空、current AgentSession不存在或
+以本次同一DB now判断已过期。它不建立第二把同时有效的Node key。`retire`要求
+exact public-key credential、exact policy revision、policy cordoned、assigned set为空和session
+absent/expired，再把identity置为retired；retired identity不能update/rotate/unretire。
 
 route envelope固定为：exact path、method `POST`、query完全缺席（含裸`?`）、恰好一个无parameter
 `Content-Type: application/json`、`Content-Encoding`缺席、body为无BOM的UTF-8 closed JSON且最大65536
@@ -202,6 +219,36 @@ old/new Node private halves和identity descriptors，central IaC/provisioning st
 `apply_id`与canonical request。A19a closed Host recovery directory不增加policy/request/provisioner-key文件；
 ambiguous recovery组合这两份既有durable source，只重放same request。Node/Guest上不安装CLI的provisioner
 private key。
+
+#### 官方 CLI 的 closed response state machine
+
+CLI在首次发送前，必须持有一把该pending item的exclusive local lock，用temporary file + file
+fsync + atomic no-replace rename + parent-directory fsync保存下列不可变事实：exact HTTPS origin（含
+authority/port）、`POST`、exact request target、`application/json`、exact canonical body octets、
+`apply_id`和body SHA-256。pending item不保存private key。重试可以用任一当前合法的provisioner
+credential重签，但不得改origin、path、body、apply ID或mutation，也不得创建第二个pending item。
+
+HTTP client关闭redirect following和automatic decompression；任何301/302/303/307/308都不跟随。只有下列
+两个terminal response可以结算pending item：
+
+1. exact origin返回`200`，恰好一个无parameter `Content-Type: application/json`，无
+   `Content-Encoding`，body不超过16384 octets，并且是canonical closed
+   `RuntimeNodeAuthorityApplyResult`。`apply_id`/`node_id`必须等于pending request；`provision`必须
+   `provisioned/provisioned/revision=1`，`update_policy`必须
+   `policy_updated/provisioned/revision=placement_policy.policy_revision`，`rotate_credential`必须
+   `credential_rotated/provisioned/revision=expected_policy_revision`，`retire`必须
+   `retired/retired/revision=expected_policy_revision`。
+2. exact origin返回§3.3持久的`409 authority_precondition_failed`，并且status、media/
+   encoding headers、exact 95-octet body和20480-octet cap全部匹配；response还必须恰好含一个
+   `Cats-Node-Authority-Apply-Id` header，其值逐octet等于pending `apply_id`。
+
+结算时CLI先用同样的temp/fsync/rename/parent-fsync流程写入绑定`apply_id`、request digest和
+exact terminal response的不可变resolution receipt，然后才durably删除pending item并fsync parent。
+EOF、reset、timeout、TLS错误、redirect、任意`1xx/3xx/5xx`、`401/403/429/503`、
+`409 apply_id_conflict`、其他status、超限/压缩/非canonical body或字段不绑定的`200`都保留exact
+pending item，且之后只能重发该item。`apply_id_conflict`还必须停止automatic retry并警报人工
+调查，但不得把未结算item标成失败或换ID。CLI crash在任意窗口恢复时，resolution receipt优先于
+pending deletion判定已结算；只有pending则继续same-request replay。
 
 ### 3.2 两种且仅两种 authenticated principal
 
@@ -247,9 +294,41 @@ RuntimeProvisionerCredential {
 startup fail closed。private half只在central IaC/provisioning environment，绝不进入Control config、Node、Guest、
 日志或request body。
 
-同一Control schema/cell的`deployment_id`不可变。跨release，已有credential ID只能保留exact SPKI；new key使用
-fresh ID，已移除ID不得重新引入或绑定另一SPKI。release qualification必须把candidate bundle与上一accepted
-bundle逐字段比较并保存receipt；这不是Node heartbeat或数据库policy写入口。
+同一Control schema/cell的`deployment_id`不可变。不能只把candidate bundle与“上一个release”比较；
+每次production startup必须在打开admin listener前把完整bundle下述持久all-history lineage
+进行同步。一个schema只允许一个deployment identity，credential ID和SPKI digest各自在该
+schema全历史唯一；它们在移除、retire、多个release和多次rotation后也永不可重用。
+
+最小PostgreSQL DDL固定为（`Id`、digest和time的closed decoder/check仍必须在Store边界执行）：
+
+```sql
+CREATE TABLE runtime_provisioner_deployment_identity (
+  singleton BOOLEAN PRIMARY KEY DEFAULT TRUE CHECK (singleton),
+  deployment_id TEXT NOT NULL UNIQUE,
+  first_committed_at_unix_ms BIGINT NOT NULL CHECK (first_committed_at_unix_ms >= 0)
+);
+
+CREATE TABLE runtime_provisioner_credential_lineage (
+  credential_id TEXT PRIMARY KEY,
+  deployment_id TEXT NOT NULL REFERENCES runtime_provisioner_deployment_identity(deployment_id)
+    ON UPDATE RESTRICT ON DELETE RESTRICT,
+  public_key_spki TEXT NOT NULL UNIQUE,
+  public_key_spki_sha256 TEXT NOT NULL UNIQUE,
+  state TEXT NOT NULL CHECK (state IN ('active', 'retired')),
+  first_committed_at_unix_ms BIGINT NOT NULL CHECK (first_committed_at_unix_ms >= 0),
+  retired_at_unix_ms BIGINT NULL CHECK (
+    retired_at_unix_ms IS NULL OR retired_at_unix_ms >= first_committed_at_unix_ms),
+  CHECK ((state = 'active' AND retired_at_unix_ms IS NULL) OR
+         (state = 'retired' AND retired_at_unix_ms IS NOT NULL))
+);
+```
+
+首次启动在一个transaction内插入immutable deployment row和bundle的全部active key。后续
+启动同样锁singleton row并逐字段同步：实现从canonical SPKI DER独立重算digest；已见ID只能匹配
+原exact SPKI与digest；已见SPKI或digest只能匹配原ID；新ID+SPKI+digest插入active；本次bundle中缺席的active row单调转retired并写该次
+DB now。retired row、ID或SPKI永不返回active，lineage/tombstone永不GC；对ID、SPKI、
+deployment或时间的任何不等都fail startup。除`active -> retired`与retired time外，表内所有
+字段不可更改或删除。这不是Node heartbeat或policy写入口。
 
 machine request必须恰有一个`Cats-Provisioner-Credential-Id`和一个
 `Cats-Provisioner-Signature` header；不得有`Authorization`、Cookie或A19的三个
@@ -272,23 +351,44 @@ signed_request =
 ```
 
 没有timestamp是有意的：TLS防窃取，method/path/deployment/key/body binding防搬用，Store的`apply_id`提供exact
-replay/conflict。proof格式/签名失败统一401，不查询NodeIdentity或apply row。trust key rotation使用overlap：先
-部署含old+new且提高release identity的bundle，切换IaC signer并用new key完成或重放同一apply，最后部署移除old
-的bundle。apply identity不包含credential ID，所以合法new key可重放old key response-loss；审计仍保留首次
-principal。
+replay/conflict。proof格式/签名失败统一401，不查询NodeIdentity或apply row。签名通过后，
+每次request（包括exact apply replay）还必须读取§3.2持久trust lineage，要求该
+`deployment_id`、credential ID和SPKI digest逐字段等于current `active` row。数据库不可用返回503；
+retired/mismatch返回401，不得因为本地旧bundle还有key而接受。
+
+trust key rotation使用overlap：先让每个replica部署含old+new的bundle并把new row同步为active，
+再切换IaC signer并用new key完成或重放同一apply，确认没有old-key pending后才部署移除old
+的bundle；首个新replica将old持久retire后，仍在运行的旧replica也因per-request lineage检查立即
+拒绝old。retired tombstone跨后续release永不重用。apply identity不包含credential ID，所以合法
+new key可重放old key response-loss；审计仍保留首次principal。
 
 **Human fleet administrator。** 只接受ADR-0006 sealed admin Cookie，或通过WorkOS签名/issuer/audience/expiry
-验证的短期access JWT；其`organization_id`必须等于部署配置的管理员Organization，且token/session的
-`permissions`集合必须包含exact `cats:fleet:admin`。不得用role slug、display name、普通Organization
-membership或workspace permission推断。WorkOS未配置/不可用时该adapter fail closed，deployment provisioner
-仍独立工作。static `admin_token`、service bearer、Workspace automation token、普通user/admin混用Cookie和
-A19 Node proof一律拒绝。两种成功principal拥有同一mutation语义，差异只进入immutable audit actor。
+验证的短期access JWT，二者只产生candidate subject，不是当前authorization的持久证明。
+每个request（包括exact apply replay）都必须在Store apply前通过WorkOS authoritative User
+Management API在线重读该subject对部署配置admin Organization的current membership，要求
+membership当前active、`organization_id`逐字段等于配置值，并检查该current membership解析出的
+`permissions`集合含exact `cats:fleet:admin`。不得用role slug、display name、普通Organization
+membership、workspace permission或sealed session/JWT里的stale permission推断。
+
+Cookie与JWT是两个互斥envelope：Cookie形态必须恰好一个Cats admin-session Cookie、无
+`Authorization`、无provisioner/Node headers且不得混入user-session Cookie；JWT形态必须恰好
+一个`Authorization: Bearer <token>`、无任何Cookie、无provisioner/Node headers。重复、其他auth
+scheme或三种形态任意混合统一401，不选择“更强”的一个。无效/过期session/token返回401；
+online lookup证明非active、错org或缺exact permission返回403；WorkOS/JWKS/membership API未配置、
+outage、timeout或rate limit统一503 + `Retry-After: 1`，且不调用Store、不创建apply row。
+deployment provisioner在WorkOS outage下仍独立工作。static `admin_token`、service bearer、
+Workspace automation token和A19 Node proof一律拒绝。两种成功principal拥有同一mutation语义，
+差异只进入immutable audit actor。
 
 ### 3.3 处理顺序与HTTP mapping
 
-唯一处理顺序是：route/method/query -> media/forbidden-auth-header分类 -> bounded body -> 选择并验证一个auth
-adapter -> closed decoder -> Store apply。machine proof通过前不parse JSON或查Store；WorkOS principal通过前
-也不查Node/apply事实。
+唯一处理顺序是：route/method/query -> media/forbidden-auth-header分类 -> non-blocking global
+in-flight admission -> bounded body -> 选择并完整验证一个auth adapter（含machine persisted
+trust active check或WorkOS online membership/permission check）-> non-blocking authenticated-principal
+admission -> closed decoder -> Store apply。machine proof通过前不parse JSON或查Node/apply；WorkOS
+principal通过前也不查Node/apply事实。两个admission都只尝试一次、不排队不等待；
+machine principal key是`(deployment_id, credential_id)`，WorkOS principal key是
+`(subject, organization_id)`。
 
 | outcome | HTTP |
 |---|---|
@@ -301,6 +401,9 @@ adapter -> closed decoder -> Store apply。machine proof通过前不parse JSON�
 | malformed JSON、duplicate/unknown/missing field或typed constraint | `400 invalid_request` |
 | missing、mixed或invalid credential | `401 authentication_failed` |
 | valid WorkOS identity但org/permission不足 | `403 permission_denied` |
+| 本replica global in-flight cap已满 | `503 temporarily_unavailable`，`Retry-After: 1` |
+| 该authenticated principal in-flight cap已满 | `429 principal_request_in_flight`，`Retry-After: 1` |
+| WorkOS/JWKS/current membership lookup不可用 | `503 temporarily_unavailable`，`Retry-After: 1` |
 | same apply ID不同request | `409 apply_id_conflict` |
 | expected revision/credential不等或mutation precondition不满足 | `409 authority_precondition_failed` |
 | deadline、DB unavailable、serialization retries exhausted | `503 temporarily_unavailable`，`Retry-After: 1` |
@@ -313,6 +416,21 @@ pool、other node ID或stored request。
 `{"code":"authority_precondition_failed","message":"runtime node authority precondition failed"}`；该确定性
 409按§3.4持久并exact replay。authentication/envelope error、`apply_id_conflict`、infrastructure failure和stored
 corruption不创建新apply record。
+`principal_request_in_flight`的exact body是
+`{"code":"principal_request_in_flight","message":"runtime node authority request already in flight for this principal"}`。
+本route的global cap、WorkOS/DB outage、deadline和retry exhaustion全部使用exact
+`{"code":"temporarily_unavailable","message":"runtime node authority is temporarily unavailable"}`；不得把上游
+WorkOS/SQL错误body透传给client。
+
+只有Store已经同一commit持久化的`authority_precondition_failed`首次响应或exact replay才返回
+恰好一个`Cats-Node-Authority-Apply-Id: <apply_id>` response header；value必须是请求中的32 lowercase
+hex ID。其他4xx/5xx、`apply_id_conflict`和未进Store的失败不得返回该header。header缺失、重复或值不等时，
+官方CLI不能把普通409猜成已持久结果。
+
+global permit从admission成功持有到response完整编码交给transport，或commit已可能发送后
+把解析工作交给预留的commit-resolution lane；principal permit从认证后admission持有到同一
+边界。permit不得在发送PG commit后因handler cancel提前释放，也不得让cleanup job重新取一个
+permit而死锁。cap满、WorkOS不可用和未进Store的任何认证错误都零apply/domain/audit写入。
 
 ### 3.4 Apply replay、事务与取消
 
@@ -330,15 +448,46 @@ RuntimeNodeAuthorityApplyRecord {
 }
 ```
 
+Node credential不只保存在current `NodeIdentity`中。下列all-history lineage是clean-slate schema的
+必需表；`runtime_node_identities`是实现`NodeIdentity`的主表，不得用无外键的日志代替：
+
+```sql
+CREATE TABLE runtime_node_credential_lineage (
+  credential_id TEXT PRIMARY KEY,
+  node_id TEXT NOT NULL REFERENCES runtime_node_identities(node_id)
+    ON UPDATE RESTRICT ON DELETE RESTRICT,
+  public_key_spki_sha256 TEXT NOT NULL UNIQUE,
+  state TEXT NOT NULL CHECK (state IN ('active', 'retired')),
+  first_committed_at_unix_ms BIGINT NOT NULL CHECK (first_committed_at_unix_ms >= 0),
+  retired_at_unix_ms BIGINT NULL CHECK (
+    retired_at_unix_ms IS NULL OR retired_at_unix_ms >= first_committed_at_unix_ms),
+  CHECK ((state = 'active' AND retired_at_unix_ms IS NULL) OR
+         (state = 'retired' AND retired_at_unix_ms IS NOT NULL)),
+  UNIQUE (node_id, credential_id)
+);
+
+CREATE UNIQUE INDEX runtime_node_one_active_credential
+  ON runtime_node_credential_lineage(node_id) WHERE state = 'active';
+```
+
+`credential_id`和`public_key_spki_sha256`各自在整个Control schema的全历史中唯一，不仅在
+一个Node或active set中唯一。只有`active -> retired`和首次retired timestamp可变；ID、Node、SPKI、
+first time都immutable，row永不删除/重激活，NodeIdentity也因外键不能在lineage仍存在时GC。
+`provision`在identity/policy同一commit插入active row；rotation在同一commit把exact old row转为
+retired、插入fresh active row并替换NodeIdentity current binding；retire在同一commit把exact active
+row转retired并retire identity。任何历史ID或SPKI命中，即使来自另一Node或已retire row，也是
+持久`authority_precondition_failed`；V1不存在可重用的provider principal投影。
+
 主键是global `apply_id`；`request_sha256`是Runtime canonical request bytes的普通SHA-256，但exact replay仍比较
 完整typed request，不能只信digest。row不更新、不因retire或trust-key rotation删除。
 它是fleet/admin domain identity，不是ADR-0040的Workspace `ApiIdempotencyResult`，不伪造system workspace。
 
 每次请求在一个PG transaction中先对`apply_id`取得transaction reservation并读取record：exact typed request
 命中立即返回原stored 200或409，即使Node已retire或policy后来提高revision；同ID不同request立即409，二者都不读current
-Node/policy。miss才按`node_id`锁NodeIdentity coordination row（initial absent使用node-scoped advisory lock），
+Node/policy。miss且mutation带new credential时，先对new credential ID和SPKI digest取得下述全局
+lineage locks；随后才按`node_id`锁NodeIdentity coordination row（initial absent使用node-scoped advisory lock），
 再按mutation读取exact最小facts：provision只读identity/policy absence；policy update读current policy和按cat ID
-排序的current assigned Desired；rotation/retire另读current AgentSession deadline。cordon不因session/
+排序的current assigned Desired；rotation/retire在§6统一顺序下另读current AgentSession deadline。cordon不因session/
 observation缺失而被阻断。precondition通过时把domain mutation、applied record、audit principal/response同一
 commit；确定性precondition失败则零domain mutation并提交rejected record。两种都使用同一次DB now，均可在
 response loss后exact replay。没有半个identity/policy或无record mutation。
@@ -353,6 +502,19 @@ apply reservation固定为
 其中`$1`是32 lowercase hex `apply_id`；随后读取record。primary key只作invariant backstop，不能在unique
 violation abort后补写result。
 
+new-credential lineage locks固定对`("credential_id", new_credential_id)`和
+`("public_key_spki_sha256", new_spki_digest)`按整个tuple的ASCII octet order排序后逐个执行：
+
+```text
+pg_advisory_xact_lock(hashtextextended(
+  current_schema() || ':runtime-node-credential-lineage:' || kind || ':' || value,
+  0::BIGINT))
+```
+
+取得后查询ID和SPKI两个历史索引；任一row存在即走持久409。hash collision只使无关
+credential额外串行，不破坏安全。DDL unique constraints只是invariant backstop，不允许依赖transaction-aborting
+unique violation后猜测返回，所有provision/rotation writer都必须使用这个顺序。
+
 initial absent lock固定为
 `pg_advisory_xact_lock(hashtextextended(current_schema() || ':runtime-node-authority:' || $1, 0::BIGINT))`，
 其中`$1=node_id`。Id内冒号或64-bit hash collision最多让不同Node额外串行，不会让相同Node绕过lock；row存在后
@@ -364,34 +526,112 @@ record/domain写；commit一旦可能已发送给PostgreSQL，server不得用连
 identity/key/policy revision。exact replay先做current auth，所以已移除的old provisioner key不能继续调用，
 但任一current合法principal可解析原结果。
 
+shutdown先关闭listener并拒绝新admission，再取消所有确定未进入commit-send边界的job；
+每个已可能发送commit的job都必须留在reserved resolution lane并join到确认commit/rollback、写完
+stored response且释放in-flight permits。进程的固定join deadline是30000 ms，production supervisor的
+termination grace必须不小于该值；deadline到仍有未解析job时必须以非零shutdown failure退出，
+不能报告clean shutdown、detach task或猜测结果。客户端pending item仍用same apply ID闭合response-loss。
+
 ## 4. Multi-replica placement planner
 
 ### 4.1 完整same-snapshot facts
 
-planner输入是已经完成Cat-create idempotency fast miss、image manifest验证和active release receipt验证后的
-request shape、整批candidate `network_id`与active `guest_config_digest`。它不接收`capacity_ok`、
-`schedulable` boolean或调用方Node hint。
+Cat-create的planner输入是已经完成idempotency fast miss、image manifest验证和active release receipt
+验证后的request shape、整批candidate `network_id`与active `guest_config_digest`。其他会改变placement/
+shape的Desired mutation使用同一planner和下列post-mutation model。它不接收`capacity_ok`、
+`schedulable` boolean、调用方Node hint、调用方自报source exclusion或Host-fenced boolean。
+这个planner不取代Runtime/Volume的Cold-only、RWO fence、idle/transition或authorization前置；service必须
+先通过它们才可规划shape/move，commit仍在同一事务按各authority重验。
 
 ```text
 PlacementPolicySnapshot {
   evaluated_at_unix_ms: UnixMillis,
   node_placement_policy: NodePlacementPolicy,
-  admission: PlacementAdmissionSnapshot
+  admission: PlacementAdmissionSnapshot,
+  active_host_fence_event: HostFenceEvent | null
 }
 
-CatCreatePlacementPlan {
-  version: 1,
-  request_vcpus: integer 1..=4294967295,
-  request_memory_bytes: integer 1..=9223372036854775807,
-  network_id: Id,
-  snapshot: PlacementPolicySnapshot,
+PlacementCurrentCas {
+  cat_id: Id,
+  desired_revision: Revision,
+  spec_digest: Sha256Digest,
+  placement: AssignedPlacement,
+  vcpus: integer 1..=4294967295,
+  memory_bytes: integer 1..=9223372036854775807,
   network_config: NetworkConfig
 }
+
+PlacementMutation =
+  {
+    kind: "cat_create",
+    cat_id: Id,
+    target_desired_revision: 1,
+    target_placement_epoch: 1,
+    target_vcpus: integer 1..=4294967295,
+    target_memory_bytes: integer 1..=9223372036854775807,
+    candidate_network_id: Id
+  }
+| {
+    kind: "same_node_reconfigure",
+    current: PlacementCurrentCas,
+    target_desired_revision: Revision,
+    target_placement_epoch: Epoch,
+    target_vcpus: integer 1..=4294967295,
+    target_memory_bytes: integer 1..=9223372036854775807
+  }
+| {
+    kind: "move",
+    reason: "planned_migration" | "host_takeover" | "placement_retry",
+    current: PlacementCurrentCas,
+    target_desired_revision: Revision,
+    target_placement_epoch: Epoch,
+    target_vcpus: integer 1..=4294967295,
+    target_memory_bytes: integer 1..=9223372036854775807,
+    candidate_network_id: Id,
+    required_source_host_fence_event_id: Id | null
+  }
+
+SourceAssignmentSnapshot {
+  node_identity: NodeIdentity,
+  assigned_desired_specs: [DesiredRuntimeSpec],
+  active_host_fence_event: HostFenceEvent | null
+}
+
+PostMutationPlacementPlan {
+  version: 1,
+  mutation: PlacementMutation,
+  server_derived_excluded_source_node_ids: [Id],
+  target_snapshot: PlacementPolicySnapshot,
+  source_snapshot: SourceAssignmentSnapshot | null,
+  network_config: NetworkConfig
+}
+
+CatCreatePlacementPlan = PostMutationPlacementPlan where mutation.kind = "cat_create"
 ```
 
-`snapshot.admission.node_identity.node_id`、policy node、selected placement node和NetworkConfig必须逐字段绑定；
-plan的request shape/network ID必须逐字段等于同批candidate Desired，Store不能用plan字段覆盖或default Desired。
-这是service/Store内部typed plan，不是persisted scheduler authority或HTTP wire。
+`target_snapshot.admission.node_identity.node_id`、policy node、selected placement node和NetworkConfig必须
+逐字段绑定；plan的target revision/placement epoch/shape/network ID必须逐字段等于同批candidate Desired，Store不能
+用plan字段覆盖或default Desired。`PlacementCurrentCas`是从current full Desired服务端投影的
+exact CAS；它不是调用方提供的old shape。这是service/Store内部typed plan，不是persisted
+scheduler authority或HTTP wire。
+
+`server_derived_excluded_source_node_ids`由Store在同一planner snapshot从current Desired/placement和trusted
+HostFenceEvent派生，按`node_id` ASCII octet order严格升序且无重复：Cat create和
+same-node reconfigure必须为空；任何`move`必须恰好包含`current.placement.node_id`。
+public/service request没有这个字段，不得删除source、添加任意Node或把同Node move伪装成
+same-node reconfigure。`planned_migration|placement_retry`必须
+`required_source_host_fence_event_id=null`；`host_takeover`必须绑定trusted controller已为current source
+建立的exact Active event ID。反向组合或event与current placement/immutable Host/session lineage不等是
+stored/service invariant failure，不允许用null/fallback降级。
+
+target candidate domain同样是closed的：Cat create扫描全部NodeIdentity；same-node reconfigure只读取并
+评估`current.placement.node_id`这一Node，target必须与它相等，不参与fleet first-fit；move才扫描全部
+NodeIdentity并跳过exact source。create/move在各自domain内都使用§4.2的`node_id` first-fit，调用方不能
+通过candidate list或hint收窄/重排。
+
+Cat create的`source_snapshot=null`；same-node reconfigure的source就是exact target snapshot，也编码null；
+`move`必须携带source的full `SourceAssignmentSnapshot`。该snapshot与全fleet target pages使用同一
+`REPEATABLE READ` transaction和DB now；source assigned set最多1024项且逐字段closed decode。
 
 一次planner call只开一个`REPEATABLE READ READ ONLY` transaction，并只取一次PostgreSQL `db_now`；A20
 `evaluated_at_unix_ms`和本snapshot time都是它。NodeIdentity用exact keyset page：
@@ -404,7 +644,10 @@ LIMIT 64
 ```
 
 第一页没有cursor；下一页使用上一页最后一个`node_id`，禁止OFFSET。每页在同一transaction/snapshot批量加载
-64个identity各自的current policy与A20 §7.1完整facts；不能为每页/每Node另开snapshot或取新clock。实现每次只
+64个identity各自的current policy、A20 §7.1完整facts和该Node的current Active
+`HostFenceEvent`（无则null）；不能为每页/每Node另开snapshot或取新clock。一个NodeIdentity
+同时最多一个Active event；Runtime rejoin/Host replacement状态机保证这个约束，Store读到多个是
+fatal corruption而不是选最小ID。实现每次只
 保留当前page和当前候选，内存O(64)，一直翻页到EOF；没有1024/4096等fleet cap，也不把“页数过多”当capacity
 不足。10000 ms deadline到期是infrastructure unavailable，不是no capacity。
 
@@ -417,30 +660,36 @@ LIMIT 64
 
 每个Node依次检查：
 
-1. identity/projection自洽且provisioned；current policy必须存在且closed/canonical/self-consistent；缺失或
+1. `node_id`不在server-derived source exclusion中；命中是ordinary `source_node_excluded`，不得用它的
+   剩余capacity原地“调度”一次move；
+2. identity/projection自洽且provisioned；current policy必须存在且closed/canonical/self-consistent；缺失或
    非法是fatal，合法`cordoned`才是ordinary rejection；
-2. policy capability由§1 closed decoder证明是production值；policy、current AgentSession和Control active release三处
+3. 同snapshot查到任何current `HostFenceEvent.state=Active`都是ordinary
+   `active_host_fence_event`，该Node不能成为new placement target；任何event/projection无法closed decode是
+   fatal，不得把它当作“没有Active event”；
+4. policy capability由§1 closed decoder证明是production值；policy、current AgentSession和Control active release三处
    `guest_config_digest`相等；
-3. A20 §7.1同一个session、fresh full attestation、full observation和current assigned snapshot全部通过；
-4. full observation中的每个`ObservedNetwork`都逐字段对应current assigned Desired的exact
+5. A20 §7.1同一个session、fresh full attestation、full observation和current assigned snapshot全部通过；
+6. full observation中的每个`ObservedNetwork`都逐字段对应current assigned Desired的exact
    `NetworkConfig`；任何`NodeResidue.network_tap`、unassigned/changed/duplicate network是普通
    `network_cleanup_pending`，必须等Node完成cleanup并提交new full inventory；
-5. capacity与§5 network slot均可分配。
+7. §4.3 post-mutation assigned set/capacity与§5 network slot均可分配。
 
-capacity只由snapshot内**所有**current assigned Desired的`runtime.vcpus`和`memory_bytes`求和；Running、
-Suspended、Warm、Cold、Deleted全部按完整shape计费，不能因观测到sleep/stop、Host物理free或Operation terminal
-而折扣。两个和分别用checked `u128`累加；再checked加本次request。结果小于等于policy allocatable才fit；
-equality成功，超过1即拒绝。字段为零、decode/projection不自洽、duplicate current Cat、累加overflow都是fatal
-Store corruption，不是ordinary capacity failure。
+任何current assigned set已超过1024项都fatal stored corruption并使replica unready，不能裁剪、分页或将
+第1025项当作ordinary capacity miss。合法current set的具体post-mutation计算见§4.3；结果集合
+必须在任何业务/result写入前证明每个受影响Node都`assigned_count <= 1024`。
 
 closed ordinary rejection是：
 
 ```text
 PlacementCandidateRejection =
-  "policy_cordoned"
+  "source_node_excluded"
+| "active_host_fence_event"
+| "policy_cordoned"
 | "policy_guest_config_mismatch"
 | PlacementAdmissionRejection
 | "network_cleanup_pending"
+| "assigned_set_limit"
 | "insufficient_vcpus"
 | "insufficient_memory"
 | "network_exhausted"
@@ -452,6 +701,51 @@ PlacementCandidateRejection =
 Runtime既有`unsupported_block_path|unsupported_network|unsupported_guest_capability`继续是Node在commit后
 发现实际deployment不再满足policy/Desired时的closed `PlacementRejected`，不是允许policy保存未知enum或
 planner把malformed policy降级为ordinary rejection的理由。
+
+### 4.3 通用 post-mutation assigned set 与 capacity
+
+对每个受影响Node，Store先把current assigned full Desired strict decode为以`cat_id`为key的map
+`C(node)`。所有lifecycle state（Running/Suspended/Warm/Cold/Deleted）都以完整
+`runtime.vcpus/memory_bytes`计费，不因observation sleep/stop、Host physical free或Operation terminal折扣。
+字段为0、duplicate Cat、decode/projection不自洽或`|C(node)| > 1024`都fatal/unready。
+
+post-mutation map只有下列closed构造：
+
+- `cat_create`：target `C' = C + (new cat, target shape, fresh network)`；current map已有该cat是
+  stale/service invariant failure；target revision和placement epoch必须都精确为1。
+- `same_node_reconfigure`：`current.placement.node_id` 必须等于target Node，current map必须
+  包含与`PlacementCurrentCas`的revision/digest/placement/old shape/network逐字段相同的唯一Cat；
+  `C'`只用new Desired的target shape替换该项，并保留exact old `NetworkConfig`。这不分配
+  new network ID/slot，不允许借shape change改Guest network或placement epoch；target revision必须是
+  checked `current.desired_revision + 1`，target placement epoch必须等于current值。
+- `move`：source map必须含exact `PlacementCurrentCas`，source
+  `C' = C - current cat`；target map必须不含该cat，target
+  `C' = C + (same cat, target shape, fresh network)`。target必须与source不同，使用fresh whole-batch
+  network ID/config；target revision必须是checked `current.desired_revision + 1`，target placement epoch必须是
+  checked `current.placement.placement_epoch + 1`。CIDR或选中slot恰好相同也不例外。
+
+纯assignment removal（例如已闭合tombstone的最终清理）不跑fleet target planner，但仍必须在锁定
+source NodeIdentity后用同一exact-CAS规则构造`C' = C - current cat`。除上述四种外，
+不得直接更改placement/shape或按SQL delta更改capacity counter。
+
+每个`C'`的count用checked integer重算并必须`<= 1024`。因此target 1023 -> 1024可以
+继续；1024 -> 1025固定ordinary `assigned_set_limit`，planner不返回plan，commit重验时则
+零Desired/Volume/Operation/API result写入。same-node replace的count不变，move对source减1、target加1；
+不得先写后由A20 encoder拒绝超限集合。
+
+vCPU和memory分别用checked `u128`。先对`C(node)`每项求`total`，再按mutation求target
+post-total：create/move target是`checked_add(total, new)`；same-node reconfigure精确是
+`checked_add(checked_sub(total, exact_old), new)`。不能只加shape delta，不能对shrink做wrap，
+也不能从调用方old shape做subtract。target两个post-total均小于等于current policy
+allocatable才fit；equality成功，超过1即分别拒绝`insufficient_vcpus|insufficient_memory`。
+source removal也做checked subtract以证明map自洽，但不要求source schedulable/fresh，也不会因减少
+使用量而被source capacity阻断。任何sum/add/sub/count overflow都fatal，不是ordinary capacity miss。
+
+same-node reconfigure与target新assignment要求target通过§4.2全部eligibility，含schedulable、fresh A20和
+无Active HostFenceEvent。`planned_migration|placement_retry`的source snapshot必须无Active event；
+`host_takeover`必须由`required_source_host_fence_event_id`命中一个仍Active、完整lineage相等的event。
+二者的target都要求无任何Active event。event在plan后变化使plan stale，不得自动在
+migration/takeover/retry reason间转换。
 
 ## 5. Isolated IPv4 `/30` allocation
 
@@ -535,27 +829,51 @@ name仍free并准备写revision 1时，事务顺序固定为：
 ```text
 ApiIdempotency key reservation/result reread
 -> CatNameLock
--> NodeIdentity FOR UPDATE
--> current NodePlacementPolicy + A20 admission/assigned facts
+-> 全部受影响NodeIdentity FOR UPDATE，按node_id
+-> current NodePlacementPolicy，按node_id
+-> current AgentSession，按node_id（target admission适用时）
+-> Node observation receive-state / DesiredReadState / AdmissionInventoryState，按node_id（适用时）
+-> HostFenceEvent，按event_id（存在性/状态重验适用时）
 -> VolumeRecord
 -> Cat/Disk/Desired/Endpoint/Operation
 ```
 
-在NodeIdentity锁内，Store用一次transaction DB now重载policy、identity、session、freshness、full inventory和
-current assigned Desired；要求plan中所有非时间facts仍逐字段相同、policy revision仍相同，并以current time
-重新证明lease/freshness。随后从current assigned set重算§4 capacity和§5对same candidate network ID的完整probe；
-selected slot/config必须仍逐字段等于plan。任一ordinary变化返回`placement_plan_stale`，零business row、零API
-result；stored corruption使replica unready。只有全部通过才按ADR-0032/0042继续在Volume之后写完整candidate。
+多Node mutation必须先按`node_id` ASCII顺序取得**全部**NodeIdentity lock，才能取任何
+policy/session/receive/event lock；不得按“source全部rows -> target全部rows”交错。在这些锁内，
+Store用一次transaction DB now重载target policy、A20 session/freshness/full inventory、所有受影响
+current assigned Desired、server-derived exclusion和HostFenceEvent facts。assigned Desired在Volume前只做受
+NodeIdentity serialization保护的读取/比较，不提前取`Desired FOR UPDATE`；写锁仍在Volume之后。
+
+事务要求plan的全部非时间facts、policy revision、`PlacementCurrentCas`、source snapshot和exclusion
+仍逐字段相同，并以current DB time重新证明target lease/freshness。它按§4.3从current maps重建post-
+mutation maps/count/capacity，对create/move按§5用same candidate network ID重做完整probe，对same-node
+reconfigure则要求exact old NetworkConfig不变。target必须仍无Active HostFenceEvent；
+non-takeover source必须仍无Active event，host takeover必须锁定并重验exact required event仍Active且
+lineage匹配。selected slot/config必须仍逐字段等于plan。
+
+任一ordinary变化返回`placement_plan_stale`，零Desired/Volume/Operation/business row、零API/
+mutation result；stored corruption使replica unready。特别地，plan后target从1023变成1024使本次
+post-count=1025时，必须在Volume前拒绝且零result写入。只有全部通过才按ADR-0032/0042继续
+在Volume之后锁定current Desired/Operation、再以exact current revision/digest/placement CAS写新完整
+Desired。两个replica同时same-node resize、move或create时，只有先取得NodeIdentity且CAS仍成立的
+一方可提交；后一方必须fresh replan，不能应用old-shape delta。
 commit不重扫更小Node：first-fit只定义plan snapshot的确定结果，更小Node后来变得eligible不影响selected Node的
 safety，也不允许为“更优”placement中止一个仍完全有效的plan。
 
 合法same-name 409分支不改变Desired，按Volume Authority现有graph锁序持久exact 409 result，并且不读取或
 消费已失效placement plan。事务内idempotency hit也直接丢弃candidate。
 
-policy apply、observation assigned-set acceptance和每个会增加/删除/换Node的Desired mutation都以
-NodeIdentity作为唯一per-Node serialization row。涉及多个Node时先按`node_id`严格升序锁全部NodeIdentity，
-重验每个Node的policy/A20/assigned facts，再进入Volume；不能`Desired -> NodeIdentity`逆序。迁移/Host takeover
-向target增加assignment时使用本planner和fresh NetworkConfig；从source移除assignment也在同一事务锁source。
+policy apply、Agent registration/session replacement、Desired read cursor、observation acceptance和每个会增加/
+删除/换Node/改shape的Desired mutation都以NodeIdentity作为唯一per-Node serialization row，并共用
+`NodeIdentity -> AgentSession -> observation receive/cursor -> HostFenceEvent -> Volume`前缀。不能
+`AgentSession|receive-state|Desired|HostFenceEvent -> NodeIdentity`逆序。一个HostFenceEvent的新建、
+`Active -> Rejoined`或任何会改变placement eligibility的state/lineage mutation也必须先锁该
+NodeIdentity，再锁event；这使target NodeIdentity锁下的“无Active event”重验不会被并发插入或
+rejoin越过。只消费已有event且不改event eligibility state的Volume authorization继续可按
+`HostFenceEvent -> Authorization -> Volume`走，因为它不会再反向取NodeIdentity。
+
+迁移/Host takeover/placement retry向target增加assignment时使用本planner和fresh NetworkConfig；
+从source移除assignment在同一事务锁source并完成exact old Desired CAS。
 没有scheduler reservation table、capacity counter、network lease、advisory boolean或fleet total cap。
 
 若commit前request取消/timeout，事务rollback且不写result。PostgreSQL commit可能已发送后，Control使用现有
@@ -583,8 +901,8 @@ Cat-create placement错误的public mapping固定为：
 
 | internal outcome | HTTP/public body |
 |---|---|
-| EOF无candidate，含capacity、cordon、admission、cleanup或network exhaustion | `503 application/json` + `Retry-After: 1`，`placement_unavailable` |
-| commit policy/admission/capacity/slot变化，`placement_plan_stale` | 同一个`placement_unavailable` response |
+| EOF无candidate，含source exclusion、Active fence、assigned-set cap、capacity、cordon、admission、cleanup或network exhaustion | `503 application/json` + `Retry-After: 1`，`placement_unavailable` |
+| commit current CAS、policy/admission/event/post-set/capacity/slot变化，`placement_plan_stale` | 同一个`placement_unavailable` response |
 | planner/commit deadline、DB unavailable、serialization exhausted | `503 temporarily_unavailable` + `Retry-After: 1` |
 | stored policy/assigned config/projection corruption | replica unready；public `503 temporarily_unavailable` |
 
@@ -599,6 +917,10 @@ Cat-create placement错误的public mapping固定为：
 仍按Runtime现有`PlacementRejected -> new system revision`，不是把已提交202重写成同步错误。
 上述placement/infrastructure 503都不写`ApiIdempotencyResult`；同key以后先fast miss并可在facts恢复后用全新
 whole-batch candidate重试。只有既有name 409和成功202按Volume Authority保存exact result。
+对不直接绑定public HTTP的migration/takeover/placement-retry worker，相同ordinary no-candidate/stale不写
+新Desired/Operation terminal/result，保留触发intent并从fresh snapshot重规划；它不能把内部reason持久为
+scheduler lease或更改已结算HTTP response。若以后绑定新public mutation route，该route必须显式冻结自己的
+idempotency envelope；不得默认复用Cat-create key。
 
 ## 8. Fixed vectors
 
@@ -653,6 +975,40 @@ authority_precondition_error_octets = 95
 authority_precondition_error_sha256 = sha256:0c7d1b09d9bb4e70e65e1b105833a49d00caa7062ac4a9bedb7a0be289c35a83
 ```
 
+**Rotate-credential apply/result：**
+
+```json
+{"apply_id":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb","mutation":{"expected_credential_binding":{"kind":"public_key","public_key_spki_sha256":"sha256:06e3fd8fda29bb60ab59557de61edb0aecdb231134be30e75b455f8e1b792fa9"},"expected_credential_id":"credential_a","expected_policy_revision":2,"kind":"rotate_credential","new_credential_binding":{"kind":"public_key","public_key_spki_sha256":"sha256:1111111111111111111111111111111111111111111111111111111111111111"},"new_credential_id":"credential_b"},"node_id":"node_a","version":1}
+```
+
+```text
+rotate_apply_octets = 519
+rotate_apply_sha256 = sha256:d3cfcb8571a784a0dbca3bf8d8925a2559d2797cf5213080433baafba6642e7f
+```
+
+```json
+{"apply_id":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb","identity_state":"provisioned","node_id":"node_a","outcome":"credential_rotated","policy_revision":2,"version":1}
+```
+
+**Admin admission errors：**
+
+```json
+{"code":"principal_request_in_flight","message":"runtime node authority request already in flight for this principal"}
+```
+
+```json
+{"code":"temporarily_unavailable","message":"runtime node authority is temporarily unavailable"}
+```
+
+```text
+rotate_result_octets = 160
+rotate_result_sha256 = sha256:aad4b26cb05aa5e180af128f60c312dfbb511395447762a3640d3ef8ddccd657
+principal_request_in_flight_error_octets = 118
+principal_request_in_flight_error_sha256 = sha256:eac5b2096359dfe57f9fe0a5ada932225eea73d6b6bf73e45c5a8211b8a1576a
+temporarily_unavailable_error_octets = 96
+temporarily_unavailable_error_sha256 = sha256:97cb00c37ff5a12fb38e8142d3497f6b3707f0cea88bbae1b2ccfaa322fd8b25
+```
+
 **Network allocation：** exact input uses policy pool `10.240.0.0`, node `node_a` and
 `network_id=net_77777777777777777777777777777777`.
 
@@ -678,17 +1034,25 @@ body_sha256 = sha256:a4636d17031808e21932b2f54dc3b0d104243a1e9e56e33962f678cd4d8
 
 | boundary | required oracle |
 |---|---|
-| authority/auth | provisioner signature fixed vector；wrong deployment/key/path/body拒绝；WorkOS只按admin org + exact permission；role slug、static admin/service bearer、workspace token和A19 Node proof均拒绝 |
-| route/trust bounds | query、encoded/trailing path、wrong method/media mapping；chunked/Content-Length实际65536进decoder、65537为413；success/error cap；trust bundle 16384边界、metadata/path/read-change fail startup |
+| machine authority | provisioner signature fixed vector；wrong deployment/key/path/body拒绝；local bundle key在persisted lineage已retire时每个replica立即拒绝；DB outage下503且不读apply；static admin/service bearer、workspace token和A19 Node proof均拒绝 |
+| WorkOS authority | Cookie/JWT/provisioner三形态互斥，duplicate/mixed统一401；每次apply/replay都online验current active admin-org membership + exact `cats:fleet:admin`；role slug、token/session stale permission不算；current deny为403，JWKS/WorkOS/API outage/timeout/rate-limit为503且零Store写 |
+| route/trust bounds | query、encoded/trailing path、wrong method/media mapping；chunked/Content-Length实际65536进decoder、65537为413；success/error cap叉rotate/admin-error fixed vectors；trust bundle 16384边界、metadata/path/read-change fail startup；persisted deployment singleton与DDL check/unique/FK/projection corruption fail closed |
+| trust all-history | 跨三个release做old -> overlap old+new -> new-only；两replica不同版本仍以持久active/retired为准；已移除ID、已retire SPKI、same ID/different SPKI、different ID/same SPKI和deployment改名均fail startup；tombstone不GC/不重激活 |
 | apply replay | response loss exact replay原200或persisted precondition 409；same apply ID异payload 409；new trust key可重放old-key apply；revision/credential CAS conflict零domain写入且保存rejected outcome |
-| A19a lifecycle | atomic identity+cordoned policy；cordoned/drained/expired-session rotation；retire保留policy/apply；retired永不unretire；crash windows只重放same request/private half |
+| official CLI | pending在首send前fsync；canonical bound 200和带exact单一apply-ID header的persisted precondition 409才先durably写resolution再清pending；409 header缺失/重复/错值、EOF/reset/timeout/redirect/401/403/429/5xx/apply conflict/超限或mismatched 200都保留same body/apply ID；apply conflict报警不换ID；crash每个fsync窗口都不重新结算 |
+| admission/shutdown | global 32、每principal 4恰好边界；无等待，global满503/per-principal满429且Retry-After 1、零apply；cancel在commit-send前回滚，之后permit留到resolution；shutdown拒绝新请求、join可能commit的job，30000 ms未解析只能非零退出 |
+| Node credential lineage | clean DDL/unique/FK；provision/rotation只接受PublicKey，ProviderPrincipal持久409；same/different Node下的历史ID复用、same SPKI换ID、old rotation/retire ID或SPKI重用都持久409且零identity/policy写；constraint直接注入使transaction fail而不伪造result |
+| A19a lifecycle | atomic identity+cordoned policy；cordoned/drained/expired-session rotation；pre-commit可保留old，commit后只能forward-complete new；old永久retired无reverse CAS；new half丢失只能retire/new lineage；crash windows只重放same apply/private half |
 | policy mutation | cordon与create两种lock先后各自线性；有assigned set时不能改capacity/capability/CIDR；uncordon不能夹带静态变化 |
+| lock DAG | registration/Desired read/observation/policy/create都是NodeIdentity -> AgentSession -> receive/cursor；observation与create、observation与policy各跑两种先提交顺序，后者只看new facts/retry且无deadlock；连续serialization retry都从fresh DB now开始 |
 | pages/replicas | 0、1、64、65和超过1024 Node；keyset无漏重；一个snapshot/DB now；两个Control replica稳定选同一最小eligible node；无fleet cap |
-| capacity | lifecycle各态都计完整shape；equality fit、超1拒绝；vCPU/memory分别边界；checked sum/add overflow fatal；不读heartbeat/legacy node capacity |
-| simultaneous create | 同Node剩余恰好一份capacity时只有一个commit；不同idempotency key不超卖；同key只一组identity/result；无reservation row |
+| capacity/count | lifecycle各态都计完整shape；equality fit、超1拒绝；vCPU/memory分别边界；checked sum/add/sub/count overflow fatal；count 1023->1024成功、1024->1025在plan和commit均零business/result；stored 1025使replica unready；不读heartbeat/legacy node capacity |
+| post-mutation plan | same-node resize只评估current node、精确`total-old+new`且保留network；planned migration/takeover/retry从source删、target加并fresh network/revision/epoch；current revision/digest/placement/old shape/network任一变化就stale；两replica resize/move只一个CAS胜出；纯remove也锁source NodeIdentity |
+| source/fence | exclusion只由server从current source派生且source不能当move target；任何Active event target都拒绝；plan后event create/rejoin在NodeIdentity锁下重验；non-takeover要求source无Active，takeover要求exact Active event/lineage；错/null event零Desired/result |
+| simultaneous create | 同Node剩余恰好一份capacity或一个assigned-set slot时只有一个commit；不同idempotency key不超卖；同key只一组identity/result；无reservation row |
 | network hash/probe | fixed vector；slot0永不用；首slot collision、连续collision、16383->1 wrap；full 16383 exhaustion；duplicate/malformed assigned config fatal |
 | reuse/migration | Desired移除但旧full inventory/tap residue仍拒绝；new full absence后可复用；跨Node或CIDR变化fresh network ID/config/revision；MAC只由selected slot导出 |
-| stale plan | plan后cordon、policy revision、session replacement、freshness、assigned set、capacity或slot任一变化都零business/result并503；unchanged plan commit |
+| stale plan | plan后cordon、policy revision、session replacement、freshness、assigned set/count、current CAS、event、capacity或slot任一变化都零business/result并503；unchanged plan commit |
 | order/cancel | idempotency hit在image/policy前；name 409不消费plan；commit前cancel零写；commit/response不明只同key replay |
 | Node rollout | exact Desired network进入tap/CH；任一字段不等拒绝；删除FNV/cat-ID derivation、`--ch-network-cidr`和fallback；mixed release保持cordoned |
 | calibrated negative | 对legacy `nodes` capacity、heartbeat CPU/RAM、env/fixture schedulable、FNV和`ch-network-cidr`的negative grep先以当前legacy positive校准，再在A23 production path证明零read |

@@ -163,13 +163,16 @@ Control-side CAS transport、provisioner signature、apply replay和policy/assig
    AgentSession absent/expired；
 2. provisioner从active descriptors复制完整old三件套到fixed incomplete recovery directory，逐byte/cross-binding
    验证，并按§2.2逐file/directory fsync、atomic rename为fixed old complete recovery directory并fsync parent；
-   这是reverse CAS后的唯一old private-half恢复源；
+   这只是Control rotation commit前放弃操作时的old private-half恢复源；commit后old ID/SPKI已进入
+   A23永久retired lineage，该directory不得再安装为active；
 3. 在fixed incomplete recovery directory生成新的key、credential ID和只改变credential字段的canonical
    artifact，按§2.2逐file/directory fsync、atomic rename为fixed new complete recovery directory并fsync parent；
    Control CAS之前old/new两套都已在同一filesystem durable；marker前crash且authority仍是old时可清理partial
    incomplete set并重新生成new key；
-4. Control Store用expected old credential ID/binding做一次exact CAS，替换为new ID/binding；response不明时
-   查询并只按old或new exact binding继续，其他值fail closed；
+4. Control Store用expected policy revision与old credential ID/binding做一次exact A23 apply，原子地把old lineage
+   转retired、插入fresh new active lineage并替换NodeIdentity binding；response不明时只重放同一
+   pending apply ID/body。只有canonical applied response才进入第5步；持久precondition 409表示Control未改
+   credential，必须保留old active set并丢弃这次new set，不得换apply ID猜测；
 5. service保持停止，只从durable new recovery descriptors复制到active parent内exclusive temporary files，逐个
    fsync temp并atomic rename新key和credential ID，artifact最后安装；每个active file及parent fsync后重新验证
    完整new set，不能rename或删除new recovery source；
@@ -177,12 +180,14 @@ Control-side CAS transport、provisioner signature、apply replay和policy/assig
    没有ambiguous pending attempt；之后才durably清理两套recovery files/directories。
 
 crash可以留下Control已接受new credential而Host仍是old或local三个文件暂时不匹配；这两种状态都必须拒绝
-启动/注册。恢复持有同一provision lock并从durable old/new sets按Control当前exact binding完成对应active set，
-不按单文件mtime猜测。回滚不是Agent自动接受两把key：只有new credential没有ambiguous pending attempt时，才在
-cordoned/drained/stopped下用expected new credential做显式反向Control CAS，再只从durable old recovery
-descriptors复制/atomic安装完整old三件套、artifact最后、逐步fsync并重新验证；old startup成功前两套继续保留。若new registration结果不明，
-必须先用new recovery set恢复并按A19重放同一pending attempt，不能丢弃它后反向CAS。任何窗口都只有一把Control
-认可的key。
+启动/注册。恢复持有同一provision lock并先闭合官方CLI的pending A23 apply：若结果是
+precondition 409且Control仍为exact old binding，可从durable old set恢复完整active set；若结果是
+applied/new binding，只能从durable new set向前完成安装。不按单文件mtime猜测。
+
+A23 rotation commit后没有reverse CAS：old credential ID/SPKI已永久retired，不能被同Node、另一Node或
+后续release重新激活。new registration结果不明时，必须先用new recovery set恢复并按A19重放
+同一pending attempt。若new private half永久丢失无法forward-complete，只能retire该NodeIdentity并以
+全新Node/credential lineage重建，不得安装old set。任何窗口都只有一把Control认可的key。
 
 retire只通过A23 same node-authority apply在Control Store把同一NodeIdentity变为`retired`，并永久保留lineage、
 最后policy和apply result；local artifact可以留作诊断，
@@ -365,7 +370,7 @@ Node startup。
 | identity files | owner/mode/type/link count/no-follow；credential LF；key/SPKI/artifact exact cross-check |
 | identity source | Node/Host/state path只来自artifact；CLI/env/hostname/IP/IMDS mutation零影响且无请求 |
 | provision replay | marker前可清未提交partial；marker/key set在Control前durable；每个write/fsync/rename/commit kill |
-| rotation | old/new recovery set在CAS前durable；CAS/每个rename/fsync/start kill；显式reverse CAS exact rollback |
+| rotation | old/new recovery set在CAS前durable；apply/每个rename/fsync/start kill；pre-commit失败保持old；commit后只从new set forward-complete，old ID/SPKI跨Node/release永不可重用；new half永久丢失只能retire/new lineage，无reverse CAS |
 | retire/replace | retired exact attempt replay仍按A19；新attempt拒绝；新Host不能复用旧node/lineage |
 | state path | artifact精确选择path和Host lock；第二Agent、symlink component和CLI path replacement失败 |
 | release build | generator只运行一次；Control/worker extract manifest/receipt逐byte相等且ID相同 |

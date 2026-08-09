@@ -267,7 +267,10 @@ unready且零写入，不得返回exact replay或签发新snapshot。然后才�
 `cat_id`排序、strict decode、重算 `spec_digest`并核对全部 projection；分配新 read position，令
 `issued_at_unix_ms=db_now`、`expires_at_unix_ms=checked_add(db_now,30000)`，最后原子保存完整 response。
 任何 invalid row、overflow、超过 1024 specs 或 canonical response 大于 16777216 bytes 都整笔回滚；
-前两者是 store invariant/unready，集合上限返回 `assigned_set_limit_exceeded`。
+前三者是 store invariant/unready。route可在进入unready前对超限count编码
+`assigned_set_limit_exceeded {limit:"desired_specs"}`，但不签发/持久snapshot；A23 planner loader必须
+将同一事实视为fatal，不是ordinary candidate rejection。response byte cap仍返回该error的
+`limit:"wire_bytes"` variant。
 
 snapshot 是 signed request 对应的 immutable read receipt，不是 Desired authority。签发后 current Desired
 可继续变化；因此 full observation 接受时必须按 §5 重读并比较 current set，不能只相信 cursor 尚未过期。
@@ -433,7 +436,7 @@ transaction，禁止在 commit 前后分拆 attestation、read model、session l
 跨副本的 logical lock/read顺序固定为：
 
 ```text
-authenticated NodeIdentity FOR UPDATE
+authenticated current NodeIdentity FOR UPDATE
 -> current AgentSession
 -> Node observation receive-state
 -> DesiredReadState / AdmissionInventoryState（适用时）
@@ -459,6 +462,19 @@ transaction都必须先锁同一`NodeIdentity FOR UPDATE`，再按本规格/全�
 error stage：为遵守DAG可先仅按主键取得Volume/Disk锁，但在revision/digest/placement全部通过前不得decode、
 比较、按row存在性分支或渲染任何volume/postcondition error；完整authority facts只在最后postcondition
 stage读取使用。
+
+`NodeIdentity` lock是A23后每Node assigned-set/placement的唯一serialization前缀，不是新的
+observation authority。Desired read、full/partial observation、AgentSession registration/replacement、policy apply和
+placement commit都必须先锁定并重验authenticated Node的current `NodeIdentity`，再按上述顺序
+取AgentSession/receive/cursor rows；任何事务都不得先锁AgentSession、receive-state、cursor或Desired后
+反向取NodeIdentity。identity在auth与transaction之间retire/rotate时，锁后重验拒绝旧事实，
+不得用auth时的cached row。
+
+因此observation与Cat-create/policy apply的两个并发方向只能由先取得NodeIdentity的一方前进：
+observation先提交时create/apply在锁后看到new receive/admission facts；create/apply先提交时
+observation在锁后看到new assigned set/policy并按同一个current contract重新判定。后一方可返回
+stale/changed并fresh retry，但不存在`AgentSession -> NodeIdentity`与`NodeIdentity -> AgentSession`
+同时等待的环。
 
 事务只做同一Control PostgreSQL中的Control Store/Volume Authority I/O，不访问filesystem、Node、object
 store、provider或Gateway。
@@ -545,6 +561,8 @@ PlacementAdmissionSnapshot {
 loader返回 closed `PlacementAdmissionRejection` reason；同session state内部任一binding不等、full缺失其
 accepted assigned Cat、stored JSON/projection/digest不自洽、server time倒退或overflow是fatal Store error并
 使本replica unready。两者都不返回半份snapshot，也不能把stored corruption降级成“换个Node”。
+本loader读到的current `assigned_desired_specs`若超过1024项同样是fatal/unready；只有未超限、
+逐字段完整的集合才能返回给planner。
 
 ```text
 PlacementAdmissionRejection =
@@ -566,14 +584,16 @@ specs/full observation计算占用和network residue，不能回退legacy Node h
 第二authority。A20 snapshot只是可失效的pre-transaction plan；Cat create commit后事实变化按Runtime既有
 `PlacementRejected -> new revision`闭合。
 
-当前 `CatCreatePlan`必须携带A23的完整`PlacementPolicySnapshot`（其中包含上述
-`PlacementAdmissionSnapshot`）、policy revision和exact `NetworkConfig`，而不是只摘出
+当前`PostMutationPlacementPlan`（Cat create是其closed subtype）必须携带A23的完整
+`PlacementPolicySnapshot`（其中包含上述`PlacementAdmissionSnapshot`）、source/current CAS、
+server-derived exclusion、HostFence facts和exact `NetworkConfig`，而不是只摘出
 NodeIdentity/AgentSession/attestation三项让service误以为已检查freshness。service仍逐字段验证完整binding；
-它不接受planner自报boolean。
+它不接受planner自报boolean或source exclusion。
 Cat create事务在name free且将写新Desired的分支，必须先以candidate NodeIdentity作为每Node assigned-set唯一
-coordination row取得`FOR UPDATE`，再在同一事务重载并逐字段比较完整policy/admission snapshot、重算capacity
-与network probe，随后才可锁Volume/Disk/Desired/Operation；合法same-name 409分支不改变Desired，只保存exact
-result，因此不读取或锁定这份可失效plan。
+coordination row取得`FOR UPDATE`，再按§6的NodeIdentity-first顺序重载并逐字段比较完整
+policy/admission/HostFence snapshot、重算post-mutation count/capacity与network probe，随后才可锁
+Volume/Disk/Desired/Operation；合法same-name 409分支不改变Desired，只保存exact result，因此不读取或
+锁定这份可失效plan。
 该409分支仍按Volume Authority既有顺序锁定并验证existing Cat graph；“不消费plan”不允许把existing graph
 降成unlocked snapshot，也不允许在并发Destroy赢得Volume锁后缓存一个假的name conflict。
 
@@ -781,6 +801,12 @@ inventory还必须覆盖没有Pending Operation（包括已有Succeeded/Failed O
   closed；
 - 两个Control Plane副本各自都已取得本地cap并并发同一Node request，最多一个首次commit，另一方只能exact
   replay或closed conflict；不得增加fleet-wide semaphore/lease row；
+- Node当前assigned set为1024时仍可签发/接受完整snapshot，A23同Node新增第1025项必须
+  在plan与commit两层零Desired/Operation/API-result拒绝；任何故障注入已存在1025项时loader
+  fatal/unready而不裁剪或返回ordinary candidate miss；
+- observation与Cat-create、observation与policy apply各以两种先取得NodeIdentity的顺序做并发barrier
+  test；后一方只能在锁后看到前一方新facts并commit或closed retry，不允许
+  AgentSession/receive-state -> NodeIdentity逆序、deadlock或用锁前cache判定；
 - full接受事务的每一个write point做crash injection，恢复后只能看到全旧或全新；
 - 一个合法credential用连续partial轮换新cat ID全部按最小ID closed error拒绝，row数始终不超过最近full
   的runtime集合；下一次full才可改变membership；

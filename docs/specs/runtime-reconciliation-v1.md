@@ -414,7 +414,7 @@ Node到Control的exact request、current session/inventory/Desired binding、HTT
 `detach_retained`或`delete_disposable_root`。后一种只允许
 Control Store权威分类的RootDisk，且其中`delete_id`是该Deleted revision两条删除路径共用的唯一ID：
 
-- covered Cat Destroy若在同一PG事务锁定current AgentSession/highest accepted state与完整stable-Cold
+- covered Cat Destroy若在同一PG事务锁定current NodeIdentity/AgentSession/highest accepted state与完整stable-Cold
   observation，并证明Root已经`R == L`、Active + Unowned，可原子写Deleted Desired/Pending Operation、
   normal BeginDelete和API result；不创建authorization。
 - 其他Destroy先只提交Deleted Desired/Operation。Node停止runtime/blockd后，Root仍Owned但`R == L`时可用
@@ -444,7 +444,7 @@ format/probe 成功后先做 device flush，并要求 blockd 把初始化写 dra
 到exact UUID后才能把valid checkpoint推进到`commit_initialized`。Control Store不接受调用方bool/proof；
 它只复用current AgentSession已接受的完整`NodeObservation` row，逐字段重验observation ID、revision/
 placement、valid checkpoint step、同一ObservedVolume的owner/epoch/non-empty head与`R == L`lineage，
-以及当前Volume Active+Owned和Desired initialize tuple。该事务先锁current AgentSession及其highest
+以及当前Volume Active+Owned和Desired initialize tuple。该事务先锁current NodeIdentity，再锁AgentSession及其highest
 accepted-observation receive-state，再锁Volume/Disk/Desired和immutable observation payload；session
 replacement与observation acceptance竞争同一前缀。全部通过才以 token、blank predecessor、UUID 和新 remote
 head做CAS，转为Initialized并消费token。旧session/attachment/epoch、错UUID/head或`R != L`均零副作用。
@@ -1020,7 +1020,10 @@ HostDestroyedReceipt {
 可见，失败者以后也不可能成功。单独的BMC power/network状态、异步IAM revoke请求或本地进程消失都不是
 该barrier。不支持这个线性化边界的平台保持Blocked；已经进入Deleting的删除保持Deleting，不能提交receipt。
 
-同一 fence attempt 只保留一个 event。Active event 是 Host 级隔离事实，不是卷权限。Control
+同一 fence attempt 只保留一个 event，同一`NodeIdentity`同时最多一个Active event。创建时在
+NodeIdentity lock下发现已有Active event，只有同fence attempt和完整tuple的exact replay可读原结果；
+任何另一attempt都必须等旧event Rejoined，`host_destroyed`则必须使用new NodeIdentity。
+Active event 是 Host 级隔离事实，不是卷权限。Control
 Plane 对旧 placement 中每个需要恢复的卷分别创建：
 
 ```text
@@ -1049,8 +1052,9 @@ boot/session必须逐字段等于event，receipt的immutable Host、node和state
 锁定的`NodeIdentity` immutable lineage（该row此后可以retired）。adapter必须证明承载该state path的
 provider storage已
 永久销毁，不能仅把实例状态、网络隔离或断电翻译为该variant。Active event可以直接以
-`host_destroyed`建立，或把`isolated`单调更新为`host_destroyed`。后一种更新先锁该
-`HostFenceEvent`行，并用`state=Active`、`isolation_state={kind:"isolated"}`及未改变的完整event tuple
+`host_destroyed`建立，或把`isolated`单调更新为`host_destroyed`。event创建和后一种更新都先锁
+其`NodeIdentity`并重验immutable lineage，再锁`HostFenceEvent`行，并用`state=Active`、
+`isolation_state={kind:"isolated"}`及未改变的完整event tuple
 （`event_id`、provider、immutable host、node、expected boot/session、fence attempt和`observed_at`）做
 exact CAS；receipt一经提交不可变，相同receipt重放只读原结果，任何字段不同的重放都拒绝。
 `host_destroyed`不会转为Rejoined；替换Host必须使用新的provisioned identity。两种receipt都不直接授予
@@ -1061,10 +1065,15 @@ MetadataStore CAS后才能Ready，不存在另一种writer-proof fallback。
 
 session失效或提高attachment epoch不是解除旧Host隔离的条件。旧Host重用前必须在隔离网络内以
 新boot/session完成完整inventory，保持gates Closed，停止旧runtime/transport/socket/tap/guards，
-并把旧epoch的`R < L` lineage移入quarantine而非删除。`isolated -> host_destroyed`、授权派生、首次消费、
-`Active -> Rejoined`和使用HostDestroyed proof的tombstone GC都先锁同一event行并持有到事务提交，再重验
-各自要求的state、isolation variant和完整event tuple；竞争事务只能按锁取得顺序提交，后一方必须基于
-前一方已提交的状态重新判定，不能用旧读取继续。rejoin再按稳定顺序锁定该event的全部授权，所以不会漏掉
+并把旧epoch的`R < L` lineage移入quarantine而非删除。所有改变placement eligibility或
+需要重读Node lineage的event事务（event创建、`isolated -> host_destroyed`、
+`Active -> Rejoined`和HostDestroyed tombstone GC）都固定按
+`NodeIdentity -> HostFenceEvent`锁序并持有到commit。会创建新Desired/placement的授权派生也先按
+目标/源`node_id`锁全部NodeIdentity，再锁event。只消费已有authorization、不改event
+state且不再读NodeIdentity的事务仍按`HostFenceEvent -> authorization -> VolumeRecord`。各路径
+都在锁后重验自己要求的state、isolation variant和完整event tuple；竞争事务只能按
+锁取得顺序提交，后一方必须基于前一方已提交状态重新判定。rejoin再按稳定顺序锁定该event的
+全部授权，所以不会漏掉
 in-flight首次消费。Control Plane核对每个Unconsumed授权都已过`not_after`，每个Consumed授权都有
 匹配payload的不可变receipt；当前VolumeRecord必须是receipt直接结果或更大epoch的合法状态机后继，
 receipt含Disk postcondition时Control Disk也必须匹配同一Deleting；两边记录已删除时必须有精确
@@ -2247,8 +2256,8 @@ lineage时拒绝该observation，不能覆盖。retire后只要仍有index、tom
    `(cat_id, node_id, placement_epoch, desired_revision, spec_digest)`及物理identity
    `(checkpoint_path, content_digest)`没有出现在全部checkpoint inventory。同path的different-valid、
    corrupt或other-Cat文件是冲突，不是absence，必须保留文件并拒绝GC。
-2. **HostDestroyed**：负责旧placement的Host无法再提供inventory。Control Plane锁定现有
-   `HostFenceEvent`，验证其中§9 `HostDestroyedReceipt`的provider、immutable host、node、expected boot、
+2. **HostDestroyed**：负责旧placement的Host无法再提供inventory。Control Plane先锁该event绑定的
+   `NodeIdentity`，再锁定现有`HostFenceEvent`，验证其中§9 `HostDestroyedReceipt`的provider、immutable host、node、expected boot、
    expected session epoch逐字段等于event；event/receipt的`node_id`和`immutable_host_id`、以及receipt的
    `state_path_id`还必须逐字段等于该event创建时锁定、现为provisioned或retired的同一NodeIdentity
    immutable lineage。GC事务还必须重读该Cat现有Deleted tombstone和保留index：tombstone完整
