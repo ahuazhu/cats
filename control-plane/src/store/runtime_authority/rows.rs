@@ -723,7 +723,11 @@ pub(super) fn update_authorization(
 fn decode_authorization(row: &Row) -> AuthorityTxResult<AuthorizationRecord> {
     let stored = AuthorizationProjection::from_row(row)?;
     let record: AuthorizationRecord = decode(row.try_get("record_json")?)?;
-    let derived = AuthorizationProjection::from_record(&record)?;
+    // A domain-looking validation failure here describes persisted state, not
+    // the caller's request. Collapse it to corruption so an invalid stored
+    // authorization can never be reported as a retryable/request-side
+    // rejection.
+    let derived = AuthorizationProjection::from_record(&record).map_err(|_| corrupt(()))?;
     if stored != derived {
         return Err(corrupt(()));
     }

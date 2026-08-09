@@ -156,6 +156,29 @@ fn stored_authorization(store: &Store, authorization_id: &Id) -> AuthorizationRe
         .unwrap()
 }
 
+fn stored_event(store: &Store, event_id: &Id) -> HostFenceEvent {
+    store
+        .authority_transaction(|transaction| {
+            Ok(load_event_for_update(transaction, event_id)?.unwrap())
+        })
+        .unwrap()
+}
+
+fn stored_authorization_row(store: &Store, authorization_id: &Id) -> String {
+    store
+        .with(|client| {
+            client
+                .query_one(
+                    "SELECT to_jsonb(volume_authorizations)::text
+                       FROM volume_authorizations
+                      WHERE authorization_id=$1",
+                    &[&authorization_id.as_str()],
+                )
+                .map(|row| row.get(0))
+        })
+        .unwrap()
+}
+
 fn acquire_owned_volume(store: &Store) -> VolumeRecord {
     seed_volume(store, &unowned_volume());
     store
@@ -370,6 +393,51 @@ fn takeover_wrong_tuple_has_zero_side_effect_and_consumed_row_replays() {
             .consume_volume_takeover(&id("takeover-auth-1"))
             .unwrap(),
         first
+    );
+}
+
+#[test]
+fn corrupted_authorization_payload_fails_closed_without_writes() {
+    let store = Store::connect(&crate::testsupport::isolated_control_store_url(), None).unwrap();
+    let owned = acquire_owned_volume(&store);
+    let event = host_fence_event(HostFenceEventState::Active);
+    let authorization = takeover_authorization(&owned);
+    let authorization_id = id("takeover-auth-1");
+    seed_takeover(&store, &event, &authorization);
+
+    // Attachment identities are intentionally not duplicated as projections.
+    // Make the closed JSONB payload internally invalid while every projection
+    // remains valid and unchanged.
+    store
+        .with(|client| {
+            client
+                .execute(
+                    "UPDATE volume_authorizations
+                        SET record=jsonb_set(
+                            record,
+                            '{authorization,new_attachment_id}',
+                            record #> '{authorization,expected_attachment_id}'
+                        )
+                      WHERE authorization_id=$1",
+                    &[&authorization_id.as_str()],
+                )
+                .map(|_| ())
+        })
+        .unwrap();
+
+    let before_volume = stored_volume(&store, &owned.volume_id);
+    let before_event = stored_event(&store, &event.event_id);
+    let before_authorization = stored_authorization_row(&store, &authorization_id);
+
+    let error = store
+        .consume_volume_takeover(&authorization_id)
+        .unwrap_err();
+    assert_eq!(error.code, ErrorCode::Internal);
+    assert_eq!(stored_volume(&store, &owned.volume_id), before_volume);
+    assert_eq!(stored_event(&store, &event.event_id), before_event);
+    assert_eq!(
+        stored_authorization_row(&store, &authorization_id),
+        before_authorization
     );
 }
 
