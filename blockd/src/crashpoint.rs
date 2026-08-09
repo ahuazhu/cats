@@ -8,6 +8,9 @@
 
 pub const AFTER_PACK: &str = "after_pack";
 pub const AFTER_DATA_UPLOAD: &str = "after_data_upload";
+pub const AFTER_PROVISION_LEAF_PUT: &str = "after_provision_leaf_put";
+pub const AFTER_PROVISION_ROOT_PUT: &str = "after_provision_root_put";
+pub const AFTER_PROVISION_COMMIT_PUT: &str = "after_provision_commit_put";
 pub const BEFORE_CAS: &str = "before_cas";
 pub const AFTER_CAS: &str = "after_cas";
 

@@ -502,6 +502,7 @@ pub fn decode_pack(mut buf: &[u8]) -> Result<(PackHeader, Vec<u8>), FormatError>
 /// JSON, like the commit record: an image is published once and read once per
 /// provisioning, so the encoding costs nothing and stays inspectable.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ImageManifest {
     pub version: u16,
     /// sha256 of the raw image file. Also the namespace it was published under,
@@ -516,6 +517,7 @@ pub struct ImageManifest {
 }
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ImageChunk {
     pub chunk_idx: u64,
     /// Content-addressed: the sha256 of the chunk's bytes. Identical chunks

@@ -592,6 +592,7 @@ fn failed_detach_keeps_the_journal_and_lease_for_retry() {
 struct CountingMeta {
     inner: Arc<dyn MetadataStore>,
     cas_calls: AtomicU64,
+    forced_head_epoch: Option<i64>,
 }
 
 /// Commits the first CAS but drops its response, reproducing a database
@@ -733,7 +734,11 @@ impl MetadataStore for CountingMeta {
         &self,
         v: &str,
     ) -> cats_storage::metadata::Result<cats_storage::metadata::VolumeHead> {
-        self.inner.load_head(v)
+        let mut head = self.inner.load_head(v)?;
+        if let Some(epoch) = self.forced_head_epoch {
+            head.lease_epoch = epoch;
+        }
+        Ok(head)
     }
     fn delete_volume(&self, v: &str) -> cats_storage::metadata::Result<()> {
         self.inner.delete_volume(v)
@@ -796,6 +801,7 @@ fn batched_drain_publishes_the_whole_queue_in_one_cas() {
     let meta = Arc::new(CountingMeta {
         inner: Arc::new(SqliteMetadataStore::open(&dir.path().join("meta.db")).unwrap()),
         cas_calls: AtomicU64::new(0),
+        forced_head_epoch: None,
     });
     meta.create_volume(VOL, SIZE).unwrap();
     let mut cfg = EngineConfig::new(VOL, dir.path().join("data"), "attA");
@@ -2194,4 +2200,848 @@ fn snapshot_captures_generation() {
     let snap = env.meta.create_snapshot("snap_1", VOL).unwrap();
     assert_eq!(snap.generation, 1);
     e.detach().unwrap();
+}
+
+struct RootProvisionFixture {
+    engine: Arc<ChunkEngine>,
+    blob: Arc<FileBlobStore>,
+    meta: Arc<CountingMeta>,
+    manifest: format::ImageManifest,
+    request: cats_api::runtime_reconciliation::ProvisionRootImageRequest,
+    data_dir: PathBuf,
+    _dir: tempfile::TempDir,
+}
+
+fn root_provision_request(
+    engine: &ChunkEngine,
+    manifest: &format::ImageManifest,
+    epoch: i64,
+    transition: &str,
+) -> cats_api::runtime_reconciliation::ProvisionRootImageRequest {
+    let map = manifest.base_map(SIZE).unwrap();
+    let chunks: Vec<u64> = manifest
+        .chunks
+        .iter()
+        .map(|chunk| chunk.chunk_idx)
+        .collect();
+    let leaves = vec![LeafRef::Empty; chunk::leaf_count(SIZE) as usize];
+    let prepared = engine.prepare_map_publication(0, &map, &leaves, &chunks);
+    cats_api::runtime_reconciliation::ProvisionRootImageRequest {
+        provision_transition_id: cats_api::runtime_reconciliation::RandomId128::new(transition)
+            .unwrap(),
+        volume_id: cats_api::runtime_reconciliation::Id::new(VOL).unwrap(),
+        attachment_id: cats_api::runtime_reconciliation::Id::new("attA").unwrap(),
+        attachment_epoch: cats_api::runtime_reconciliation::FenceEpoch::new(epoch as u64).unwrap(),
+        size_bytes: SIZE,
+        boot_image_digest: cats_api::runtime_reconciliation::Sha256Digest::new(format!(
+            "sha256:{}",
+            manifest.image_id
+        ))
+        .unwrap(),
+        expected_blank_head: cats_api::runtime_reconciliation::RemoteHead {
+            generation: cats_api::runtime_reconciliation::Generation::new(0).unwrap(),
+            root_hash: None,
+            root_object_id: None,
+        },
+        expected_provisioned_head: cats_api::runtime_reconciliation::RemoteHead {
+            generation: cats_api::runtime_reconciliation::Generation::new(1).unwrap(),
+            root_hash: Some(cats_api::runtime_reconciliation::Sha256Digest::from_bytes(
+                prepared.root_hash,
+            )),
+            root_object_id: Some(
+                cats_api::runtime_reconciliation::AsciiText::new(prepared.root_object_id).unwrap(),
+            ),
+        },
+    }
+}
+
+fn root_provision_fixture() -> RootProvisionFixture {
+    let dir = tempfile::tempdir().unwrap();
+    let blob = Arc::new(FileBlobStore::open(dir.path().join("blob")).unwrap());
+    let inner: Arc<dyn MetadataStore> =
+        Arc::new(SqliteMetadataStore::open(&dir.path().join("meta.db")).unwrap());
+    let meta = Arc::new(CountingMeta {
+        inner,
+        cas_calls: AtomicU64::new(0),
+        forced_head_epoch: None,
+    });
+    meta.create_volume(VOL, SIZE).unwrap();
+
+    let image_path = dir.path().join("root.img");
+    let mut image_file = File::create(&image_path).unwrap();
+    image_file
+        .write_all(&pattern(CHUNK_SIZE as usize, 211))
+        .unwrap();
+    image_file.sync_all().unwrap();
+    let manifest = crate::image::publish(blob.as_ref(), &image_path)
+        .unwrap()
+        .manifest;
+
+    let epoch = meta.acquire_lease(VOL, "attA", 60_000).unwrap();
+    let data_dir = dir.path().join("control-data");
+    let engine = ChunkEngine::attach_control_only(
+        EngineConfig::new(VOL, &data_dir, "attA"),
+        epoch,
+        blob.clone(),
+        meta.clone(),
+    )
+    .unwrap();
+    let request = root_provision_request(
+        &engine,
+        &manifest,
+        epoch,
+        "13579bdf2468ace013579bdf2468ace0",
+    );
+    RootProvisionFixture {
+        engine,
+        blob,
+        meta,
+        manifest,
+        request,
+        data_dir,
+        _dir: dir,
+    }
+}
+
+fn assert_definite_problem(
+    error: ProvisionRootImageEffectError,
+    expected: cats_api::runtime_reconciliation::ProvisionRootImageDefiniteConflictProblem,
+) {
+    assert!(
+        matches!(
+            &error,
+            ProvisionRootImageEffectError::Closed(
+                cats_api::runtime_reconciliation::ProvisionRootImageError::DefiniteConflict {
+                    problem,
+                    ..
+                }
+            ) if *problem == expected
+        ),
+        "expected definite conflict {expected:?}, got {error:?}"
+    );
+}
+
+fn assert_retryable_problem(
+    error: ProvisionRootImageEffectError,
+    expected: cats_api::runtime_reconciliation::ProvisionRootImageRetryableProblem,
+) {
+    assert!(
+        matches!(
+            &error,
+            ProvisionRootImageEffectError::Closed(
+                cats_api::runtime_reconciliation::ProvisionRootImageError::Retryable {
+                    problem,
+                    ..
+                }
+            ) if *problem == expected
+        ),
+        "expected retryable {expected:?}, got {error:?}"
+    );
+}
+
+fn volume_objects(blob: &dyn BlobStore) -> Vec<String> {
+    blob.list(&format!("volumes/{VOL}/")).unwrap()
+}
+
+struct LostPutResponseBlob {
+    inner: Arc<dyn BlobStore>,
+    fail_key: Mutex<Option<String>>,
+    lost_responses: AtomicU64,
+}
+
+impl BlobStore for LostPutResponseBlob {
+    fn put_immutable(&self, key: &str, data: &[u8]) -> cats_storage::blob::Result<()> {
+        self.inner.put_immutable(key, data)?;
+        let mut fail_key = self.fail_key.lock().unwrap();
+        if fail_key.as_deref() == Some(key) {
+            fail_key.take();
+            self.lost_responses.fetch_add(1, Ordering::SeqCst);
+            return Err(BlobError::Backend {
+                key: key.into(),
+                message: "injected lost immutable PUT response".into(),
+            });
+        }
+        Ok(())
+    }
+
+    fn get(&self, key: &str) -> cats_storage::blob::Result<Vec<u8>> {
+        self.inner.get(key)
+    }
+
+    fn exists(&self, key: &str) -> cats_storage::blob::Result<bool> {
+        self.inner.exists(key)
+    }
+
+    fn delete(&self, key: &str) -> cats_storage::blob::Result<()> {
+        self.inner.delete(key)
+    }
+
+    fn list(&self, prefix: &str) -> cats_storage::blob::Result<Vec<String>> {
+        self.inner.list(prefix)
+    }
+}
+
+#[test]
+fn typed_root_provision_is_exact_idempotent_and_never_enables_guest_io() {
+    let fixture = root_provision_fixture();
+    assert!(matches!(
+        fixture.engine.read(0, &mut [0_u8; 1]),
+        Err(EngineError::GuestIoDisabled)
+    ));
+    assert!(matches!(
+        fixture.engine.write(0, &[1]),
+        Err(EngineError::GuestIoDisabled)
+    ));
+    assert!(matches!(
+        fixture.engine.flush(),
+        Err(EngineError::GuestIoDisabled)
+    ));
+    assert!(matches!(
+        fixture.engine.provision_from_image(&fixture.manifest),
+        Err(EngineError::GuestIoDisabled)
+    ));
+
+    let result = fixture
+        .engine
+        .provision_root_image(&fixture.request)
+        .unwrap();
+    assert_eq!(
+        result.resulting_head,
+        fixture.request.expected_provisioned_head
+    );
+    assert_eq!(fixture.meta.cas_calls.load(Ordering::SeqCst), 1);
+    let head = fixture.meta.load_head(VOL).unwrap();
+    assert_eq!(head.generation, 1);
+    assert_eq!(
+        head.root_hash,
+        fixture
+            .request
+            .expected_provisioned_head
+            .root_hash
+            .as_ref()
+            .map(|digest| *digest.as_bytes())
+    );
+
+    let record_key =
+        chunk::keys::commit_record(VOL, 1, fixture.request.provision_transition_id.as_str());
+    let record = fixture.blob.get(&record_key).unwrap();
+    let expected_record = super::publish::encode_commit_record(
+        fixture.request.provision_transition_id.as_str(),
+        1,
+        fixture.engine.epoch(),
+        &hex::encode(head.root_hash.unwrap()),
+        &[0],
+    );
+    assert_eq!(record, expected_record);
+
+    let replay = fixture
+        .engine
+        .provision_root_image(&fixture.request)
+        .unwrap();
+    assert_eq!(replay, result);
+    assert_eq!(
+        fixture.meta.cas_calls.load(Ordering::SeqCst),
+        1,
+        "an exact target replay must not issue a second CAS"
+    );
+}
+
+#[test]
+fn request_binding_and_target_conflicts_have_zero_remote_side_effects() {
+    let fixture = root_provision_fixture();
+    let before_objects = volume_objects(fixture.blob.as_ref());
+    let before_cas = fixture.meta.cas_calls.load(Ordering::SeqCst);
+
+    let mut cases = Vec::new();
+    let mut wrong = fixture.request.clone();
+    wrong.volume_id = cats_api::runtime_reconciliation::Id::new("other-volume").unwrap();
+    cases.push((
+        wrong,
+        cats_api::runtime_reconciliation::ProvisionRootImageDefiniteConflictProblem::RequestBinding,
+    ));
+    let mut wrong = fixture.request.clone();
+    wrong.attachment_id = cats_api::runtime_reconciliation::Id::new("other-owner").unwrap();
+    cases.push((
+        wrong,
+        cats_api::runtime_reconciliation::ProvisionRootImageDefiniteConflictProblem::RequestBinding,
+    ));
+    let mut wrong = fixture.request.clone();
+    wrong.attachment_epoch = cats_api::runtime_reconciliation::FenceEpoch::new(
+        fixture.request.attachment_epoch.get() + 1,
+    )
+    .unwrap();
+    cases.push((
+        wrong,
+        cats_api::runtime_reconciliation::ProvisionRootImageDefiniteConflictProblem::RequestBinding,
+    ));
+    let mut wrong = fixture.request.clone();
+    wrong.size_bytes += CHUNK_SIZE as u64;
+    cases.push((
+        wrong,
+        cats_api::runtime_reconciliation::ProvisionRootImageDefiniteConflictProblem::RequestBinding,
+    ));
+    let mut wrong = fixture.request.clone();
+    wrong.expected_blank_head.generation =
+        cats_api::runtime_reconciliation::Generation::new(1).unwrap();
+    wrong.expected_blank_head.root_hash = Some(
+        cats_api::runtime_reconciliation::Sha256Digest::from_bytes([3; 32]),
+    );
+    wrong.expected_blank_head.root_object_id =
+        Some(cats_api::runtime_reconciliation::AsciiText::new("bad.node").unwrap());
+    cases.push((
+        wrong,
+        cats_api::runtime_reconciliation::ProvisionRootImageDefiniteConflictProblem::TargetMismatch,
+    ));
+    let mut wrong = fixture.request.clone();
+    wrong.expected_provisioned_head.root_hash = Some(
+        cats_api::runtime_reconciliation::Sha256Digest::from_bytes([4; 32]),
+    );
+    cases.push((
+        wrong,
+        cats_api::runtime_reconciliation::ProvisionRootImageDefiniteConflictProblem::TargetMismatch,
+    ));
+
+    for (request, expected) in cases {
+        assert_definite_problem(
+            fixture.engine.provision_root_image(&request).unwrap_err(),
+            expected,
+        );
+    }
+    assert_eq!(volume_objects(fixture.blob.as_ref()), before_objects);
+    assert_eq!(fixture.meta.cas_calls.load(Ordering::SeqCst), before_cas);
+}
+
+#[test]
+fn dirty_pending_and_staged_local_state_fail_before_remote_writes() {
+    let fixture = root_provision_fixture();
+    let before_objects = volume_objects(fixture.blob.as_ref());
+    let before_cas = fixture.meta.cas_calls.load(Ordering::SeqCst);
+
+    fixture.engine.state.lock().unwrap().dirty[0] = 1;
+    assert_definite_problem(
+        fixture
+            .engine
+            .provision_root_image(&fixture.request)
+            .unwrap_err(),
+        cats_api::runtime_reconciliation::ProvisionRootImageDefiniteConflictProblem::LocalState,
+    );
+    fixture.engine.state.lock().unwrap().dirty[0] = 0;
+
+    fs::write(
+        fixture.data_dir.join(PENDING_PACK_DIR).join("residue.pack"),
+        b"x",
+    )
+    .unwrap();
+    assert_definite_problem(
+        fixture
+            .engine
+            .provision_root_image(&fixture.request)
+            .unwrap_err(),
+        cats_api::runtime_reconciliation::ProvisionRootImageDefiniteConflictProblem::LocalState,
+    );
+    fs::remove_file(fixture.data_dir.join(PENDING_PACK_DIR).join("residue.pack")).unwrap();
+
+    fixture.engine.staged.lock().unwrap().bytes = 1;
+    assert_definite_problem(
+        fixture
+            .engine
+            .provision_root_image(&fixture.request)
+            .unwrap_err(),
+        cats_api::runtime_reconciliation::ProvisionRootImageDefiniteConflictProblem::LocalState,
+    );
+    fixture.engine.staged.lock().unwrap().bytes = 0;
+    fixture
+        .engine
+        .inflight_staging_bytes
+        .store(1, Ordering::SeqCst);
+    assert_definite_problem(
+        fixture
+            .engine
+            .provision_root_image(&fixture.request)
+            .unwrap_err(),
+        cats_api::runtime_reconciliation::ProvisionRootImageDefiniteConflictProblem::LocalState,
+    );
+    fixture
+        .engine
+        .inflight_staging_bytes
+        .store(0, Ordering::SeqCst);
+
+    assert_eq!(volume_objects(fixture.blob.as_ref()), before_objects);
+    assert_eq!(fixture.meta.cas_calls.load(Ordering::SeqCst), before_cas);
+}
+
+#[test]
+fn control_only_attach_preserves_and_refuses_legacy_pending_state() {
+    let env = env();
+    let image_path = env.data_dir.parent().unwrap().join("pending-root.img");
+    fs::write(&image_path, pattern(CHUNK_SIZE as usize, 81)).unwrap();
+    let manifest = crate::image::publish(env.blob.as_ref(), &image_path)
+        .unwrap()
+        .manifest;
+    let epoch;
+    {
+        let legacy = attach_relaxed(&env, "attA");
+        epoch = legacy.epoch();
+        legacy.write(0, b"legacy unpublished bytes").unwrap();
+        assert_eq!(legacy.flush().unwrap(), 1);
+        assert_eq!(legacy.generation(), 0);
+    }
+    assert_eq!(
+        fs::read_dir(env.data_dir.join(PENDING_PACK_DIR))
+            .unwrap()
+            .count(),
+        1
+    );
+
+    let control = ChunkEngine::attach_control_only(
+        EngineConfig::new(VOL, &env.data_dir, "attA"),
+        epoch,
+        env.blob.clone(),
+        env.meta.clone(),
+    )
+    .unwrap();
+    assert!(
+        control.staged.lock().unwrap().packs.is_empty(),
+        "control-only attach must not recover the legacy journal into a publisher queue"
+    );
+    let request = root_provision_request(
+        &control,
+        &manifest,
+        epoch,
+        "fedcba9876543210fedcba9876543210",
+    );
+    assert_definite_problem(
+        control.provision_root_image(&request).unwrap_err(),
+        cats_api::runtime_reconciliation::ProvisionRootImageDefiniteConflictProblem::LocalState,
+    );
+    assert_eq!(env.meta.load_head(VOL).unwrap().generation, 0);
+    assert!(volume_objects(env.blob.as_ref()).is_empty());
+}
+
+#[test]
+fn control_only_attach_rejects_an_owned_zero_epoch_authority_row() {
+    let dir = tempfile::tempdir().unwrap();
+    let blob: Arc<dyn BlobStore> = Arc::new(FileBlobStore::open(dir.path().join("blob")).unwrap());
+    let inner: Arc<dyn MetadataStore> =
+        Arc::new(SqliteMetadataStore::open(&dir.path().join("meta.db")).unwrap());
+    inner.create_volume(VOL, SIZE).unwrap();
+    let granted_epoch = inner.acquire_lease(VOL, "attA", 60_000).unwrap();
+    assert!(granted_epoch > 0);
+    let corrupt: Arc<dyn MetadataStore> = Arc::new(CountingMeta {
+        inner,
+        cas_calls: AtomicU64::new(0),
+        forced_head_epoch: Some(0),
+    });
+    let data_dir = dir.path().join("control-data");
+
+    let result = ChunkEngine::attach_control_only(
+        EngineConfig::new(VOL, &data_dir, "attA"),
+        granted_epoch,
+        blob.clone(),
+        corrupt.clone(),
+    );
+    assert!(matches!(result, Err(EngineError::Corrupt(_))));
+    assert!(
+        !data_dir.exists(),
+        "a corrupt authority row must fail before local state is created"
+    );
+
+    let result = ChunkEngine::attach_control_only(
+        EngineConfig::new(VOL, &data_dir, "attA"),
+        0,
+        blob,
+        corrupt,
+    );
+    assert!(matches!(result, Err(EngineError::InvalidConfig(_))));
+    assert!(!data_dir.exists());
+}
+
+#[test]
+fn control_only_local_initialization_replays_every_crash_window_without_overwrite() {
+    for crash_window in [
+        "cache_before_sync",
+        "cache_after_sync",
+        "bitmap_before_sync",
+        "bitmap_after_link",
+    ] {
+        let dir = tempfile::tempdir().unwrap();
+        let blob: Arc<dyn BlobStore> =
+            Arc::new(FileBlobStore::open(dir.path().join("blob")).unwrap());
+        let meta: Arc<dyn MetadataStore> =
+            Arc::new(SqliteMetadataStore::open(&dir.path().join("meta.db")).unwrap());
+        meta.create_volume(VOL, SIZE).unwrap();
+        let epoch = meta.acquire_lease(VOL, "attA", 60_000).unwrap();
+        let data_dir = dir.path().join("control-data");
+        fs::create_dir_all(&data_dir).unwrap();
+
+        match crash_window {
+            "cache_before_sync" => {
+                // Crash after creating the initialization file but before the
+                // sparse cache reached its immutable volume length.
+                fs::write(data_dir.join(".cache.data.init"), b"partial").unwrap();
+            }
+            "cache_after_sync" => {
+                let cache = File::create(data_dir.join(".cache.data.init")).unwrap();
+                cache.set_len(SIZE).unwrap();
+                cache.sync_all().unwrap();
+            }
+            "bitmap_before_sync" | "bitmap_after_link" => {
+                // The cache was fully installed, then bitmap initialization
+                // started. Its marker proves replay never replaces a valid
+                // final file while repairing the other item.
+                let cache = File::create(data_dir.join("cache.data")).unwrap();
+                cache.set_len(SIZE).unwrap();
+                cache.write_all_at(b"keep", 0).unwrap();
+                cache.sync_all().unwrap();
+                let bitmap_temp = data_dir.join(".dirty.bitmap.init");
+                if crash_window == "bitmap_before_sync" {
+                    fs::write(bitmap_temp, b"partial").unwrap();
+                } else {
+                    let bitmap = File::create(&bitmap_temp).unwrap();
+                    bitmap
+                        .write_all_at(&format::encode_bitmap_header(chunk::chunk_count(SIZE)), 0)
+                        .unwrap();
+                    bitmap
+                        .set_len(BITMAP_HEADER_LEN + chunk::chunk_count(SIZE) * 8)
+                        .unwrap();
+                    bitmap
+                        .write_all_at(&0x55aa_u64.to_le_bytes(), BITMAP_HEADER_LEN)
+                        .unwrap();
+                    bitmap.sync_all().unwrap();
+                    fs::hard_link(bitmap_temp, data_dir.join("dirty.bitmap")).unwrap();
+                }
+            }
+            _ => unreachable!(),
+        }
+
+        let engine = ChunkEngine::attach_control_only(
+            EngineConfig::new(VOL, &data_dir, "attA"),
+            epoch,
+            blob,
+            meta,
+        )
+        .unwrap();
+        assert_eq!(
+            fs::metadata(data_dir.join("cache.data")).unwrap().len(),
+            SIZE
+        );
+        assert_eq!(
+            fs::metadata(data_dir.join("dirty.bitmap")).unwrap().len(),
+            BITMAP_HEADER_LEN + chunk::chunk_count(SIZE) * 8
+        );
+        assert!(!data_dir.join(".cache.data.init").exists());
+        assert!(!data_dir.join(".dirty.bitmap.init").exists());
+        if crash_window.starts_with("bitmap_") {
+            let cache = File::open(data_dir.join("cache.data")).unwrap();
+            let mut marker = [0_u8; 4];
+            cache.read_exact_at(&mut marker, 0).unwrap();
+            assert_eq!(&marker, b"keep", "a valid final cache was overwritten");
+        }
+        if crash_window == "bitmap_after_link" {
+            assert_eq!(engine.state.lock().unwrap().dirty[0], 0x55aa);
+            let bitmap = File::open(data_dir.join("dirty.bitmap")).unwrap();
+            let mut word = [0_u8; 8];
+            bitmap.read_exact_at(&mut word, BITMAP_HEADER_LEN).unwrap();
+            assert_eq!(u64::from_le_bytes(word), 0x55aa);
+        }
+        drop(engine);
+    }
+}
+
+#[test]
+fn invalid_manifest_corpus_is_rejected_before_any_volume_object_or_cas() {
+    let fixture = root_provision_fixture();
+    let before_objects = volume_objects(fixture.blob.as_ref());
+    let before_cas = fixture.meta.cas_calls.load(Ordering::SeqCst);
+    let valid_object = &fixture.manifest.chunks[0].object_id;
+    let invalid_manifests = vec![
+        serde_json::json!({"version":2,"image_id":"","size_bytes":CHUNK_SIZE,"chunks":[]}),
+        serde_json::json!({"version":1,"image_id":"","size_bytes":0,"chunks":[]}),
+        serde_json::json!({"version":1,"image_id":"","size_bytes":CHUNK_SIZE,"chunks":[
+            {"chunk_idx":0,"object_id":valid_object,"len":CHUNK_SIZE},
+            {"chunk_idx":0,"object_id":valid_object,"len":CHUNK_SIZE}
+        ]}),
+        serde_json::json!({"version":1,"image_id":"","size_bytes":2*CHUNK_SIZE as u64,"chunks":[
+            {"chunk_idx":1,"object_id":valid_object,"len":CHUNK_SIZE},
+            {"chunk_idx":0,"object_id":valid_object,"len":CHUNK_SIZE}
+        ]}),
+        serde_json::json!({"version":1,"image_id":"","size_bytes":CHUNK_SIZE,"chunks":[
+            {"chunk_idx":1,"object_id":valid_object,"len":CHUNK_SIZE}
+        ]}),
+        serde_json::json!({"version":1,"image_id":"","size_bytes":CHUNK_SIZE,"chunks":[
+            {"chunk_idx":0,"object_id":valid_object,"len":1}
+        ]}),
+        serde_json::json!({"version":1,"image_id":"","size_bytes":CHUNK_SIZE,"chunks":[
+            {"chunk_idx":0,"object_id":"ABCDEF","len":CHUNK_SIZE}
+        ]}),
+    ];
+
+    for (index, mut manifest) in invalid_manifests.into_iter().enumerate() {
+        let image_id = format!("{index:064x}");
+        manifest["image_id"] = serde_json::Value::String(image_id.clone());
+        fixture
+            .blob
+            .put_immutable(
+                &chunk::keys::image_manifest(&image_id),
+                &serde_json::to_vec(&manifest).unwrap(),
+            )
+            .unwrap();
+        let mut request = fixture.request.clone();
+        request.boot_image_digest =
+            cats_api::runtime_reconciliation::Sha256Digest::new(format!("sha256:{image_id}"))
+                .unwrap();
+        let error = fixture.engine.provision_root_image(&request).unwrap_err();
+        assert!(
+            matches!(
+                &error,
+                ProvisionRootImageEffectError::Closed(
+                    cats_api::runtime_reconciliation::ProvisionRootImageError::DefiniteConflict {
+                        problem: cats_api::runtime_reconciliation::ProvisionRootImageDefiniteConflictProblem::ImageManifest,
+                        ..
+                    }
+                )
+            ),
+            "invalid manifest case {index} produced {error:?}"
+        );
+    }
+
+    let mismatch_id = format!("{:064x}", 99);
+    let mismatch_object = "1111111111111111111111111111111111111111111111111111111111111111";
+    fixture
+        .blob
+        .put_immutable(
+            &chunk::keys::image_data(&mismatch_id, mismatch_object),
+            &vec![7; CHUNK_SIZE as usize],
+        )
+        .unwrap();
+    let mismatch = serde_json::json!({
+        "version":1,"image_id":mismatch_id,"size_bytes":CHUNK_SIZE,
+        "chunks":[{"chunk_idx":0,"object_id":mismatch_object,"len":CHUNK_SIZE}]
+    });
+    fixture
+        .blob
+        .put_immutable(
+            &chunk::keys::image_manifest(&mismatch_id),
+            &serde_json::to_vec(&mismatch).unwrap(),
+        )
+        .unwrap();
+    let mut request = fixture.request.clone();
+    request.boot_image_digest =
+        cats_api::runtime_reconciliation::Sha256Digest::new(format!("sha256:{mismatch_id}"))
+            .unwrap();
+    assert_definite_problem(
+        fixture.engine.provision_root_image(&request).unwrap_err(),
+        cats_api::runtime_reconciliation::ProvisionRootImageDefiniteConflictProblem::ImageManifest,
+    );
+
+    assert_eq!(volume_objects(fixture.blob.as_ref()), before_objects);
+    assert_eq!(fixture.meta.cas_calls.load(Ordering::SeqCst), before_cas);
+}
+
+#[test]
+fn missing_image_and_changed_owner_never_publish_volume_objects() {
+    let fixture = root_provision_fixture();
+    let before_objects = volume_objects(fixture.blob.as_ref());
+    let before_cas = fixture.meta.cas_calls.load(Ordering::SeqCst);
+    let mut missing = fixture.request.clone();
+    missing.boot_image_digest =
+        cats_api::runtime_reconciliation::Sha256Digest::from_bytes([0xee; 32]);
+    assert_retryable_problem(
+        fixture.engine.provision_root_image(&missing).unwrap_err(),
+        cats_api::runtime_reconciliation::ProvisionRootImageRetryableProblem::ImageUnavailable,
+    );
+    assert_eq!(volume_objects(fixture.blob.as_ref()), before_objects);
+    assert_eq!(fixture.meta.cas_calls.load(Ordering::SeqCst), before_cas);
+
+    fixture.meta.revoke_lease(VOL).unwrap();
+    assert!(matches!(
+        fixture.engine.provision_root_image(&fixture.request),
+        Err(ProvisionRootImageEffectError::ResultUnknown(_))
+    ));
+    assert_eq!(volume_objects(fixture.blob.as_ref()), before_objects);
+    assert_eq!(fixture.meta.cas_calls.load(Ordering::SeqCst), before_cas);
+}
+
+#[test]
+fn a_lost_generation_one_cas_response_is_adopted_from_exact_authority() {
+    let dir = tempfile::tempdir().unwrap();
+    let blob = Arc::new(FileBlobStore::open(dir.path().join("blob")).unwrap());
+    let inner: Arc<dyn MetadataStore> =
+        Arc::new(SqliteMetadataStore::open(&dir.path().join("meta.db")).unwrap());
+    inner.create_volume(VOL, SIZE).unwrap();
+    let image_path = dir.path().join("root.img");
+    fs::write(&image_path, pattern(CHUNK_SIZE as usize, 57)).unwrap();
+    let manifest = crate::image::publish(blob.as_ref(), &image_path)
+        .unwrap()
+        .manifest;
+    let epoch = inner.acquire_lease(VOL, "attA", 60_000).unwrap();
+    let meta = Arc::new(LostCasResponseMeta {
+        inner,
+        fault: Mutex::new(Some(CasFault::ResponseLost)),
+        fail_next_load: AtomicBool::new(false),
+    });
+    let engine = ChunkEngine::attach_control_only(
+        EngineConfig::new(VOL, dir.path().join("data"), "attA"),
+        epoch,
+        blob,
+        meta.clone(),
+    )
+    .unwrap();
+    let map = manifest.base_map(SIZE).unwrap();
+    let chunks: Vec<u64> = manifest
+        .chunks
+        .iter()
+        .map(|chunk| chunk.chunk_idx)
+        .collect();
+    let prepared = engine.prepare_map_publication(
+        0,
+        &map,
+        &vec![LeafRef::Empty; chunk::leaf_count(SIZE) as usize],
+        &chunks,
+    );
+    let request = cats_api::runtime_reconciliation::ProvisionRootImageRequest {
+        provision_transition_id: cats_api::runtime_reconciliation::RandomId128::new(
+            "2468ace013579bdf2468ace013579bdf",
+        )
+        .unwrap(),
+        volume_id: cats_api::runtime_reconciliation::Id::new(VOL).unwrap(),
+        attachment_id: cats_api::runtime_reconciliation::Id::new("attA").unwrap(),
+        attachment_epoch: cats_api::runtime_reconciliation::FenceEpoch::new(epoch as u64).unwrap(),
+        size_bytes: SIZE,
+        boot_image_digest: cats_api::runtime_reconciliation::Sha256Digest::new(format!(
+            "sha256:{}",
+            manifest.image_id
+        ))
+        .unwrap(),
+        expected_blank_head: cats_api::runtime_reconciliation::RemoteHead {
+            generation: cats_api::runtime_reconciliation::Generation::new(0).unwrap(),
+            root_hash: None,
+            root_object_id: None,
+        },
+        expected_provisioned_head: cats_api::runtime_reconciliation::RemoteHead {
+            generation: cats_api::runtime_reconciliation::Generation::new(1).unwrap(),
+            root_hash: Some(cats_api::runtime_reconciliation::Sha256Digest::from_bytes(
+                prepared.root_hash,
+            )),
+            root_object_id: Some(
+                cats_api::runtime_reconciliation::AsciiText::new(prepared.root_object_id).unwrap(),
+            ),
+        },
+    };
+    let result = engine.provision_root_image(&request).unwrap();
+    assert_eq!(result.resulting_head, request.expected_provisioned_head);
+    assert_eq!(meta.load_head(VOL).unwrap().generation, 1);
+}
+
+#[test]
+fn lost_leaf_root_and_commit_put_responses_reconcile_by_exact_bytes() {
+    for stage in 0..3 {
+        let dir = tempfile::tempdir().unwrap();
+        let inner_blob: Arc<dyn BlobStore> =
+            Arc::new(FileBlobStore::open(dir.path().join("blob")).unwrap());
+        let image_path = dir.path().join("root.img");
+        fs::write(&image_path, pattern(CHUNK_SIZE as usize, stage + 31)).unwrap();
+        let manifest = crate::image::publish(inner_blob.as_ref(), &image_path)
+            .unwrap()
+            .manifest;
+        let blob = Arc::new(LostPutResponseBlob {
+            inner: inner_blob,
+            fail_key: Mutex::new(None),
+            lost_responses: AtomicU64::new(0),
+        });
+        let meta: Arc<dyn MetadataStore> =
+            Arc::new(SqliteMetadataStore::open(&dir.path().join("meta.db")).unwrap());
+        meta.create_volume(VOL, SIZE).unwrap();
+        let epoch = meta.acquire_lease(VOL, "attA", 60_000).unwrap();
+        let engine = ChunkEngine::attach_control_only(
+            EngineConfig::new(VOL, dir.path().join("data"), "attA"),
+            epoch,
+            blob.clone(),
+            meta.clone(),
+        )
+        .unwrap();
+        let request = root_provision_request(
+            &engine,
+            &manifest,
+            epoch,
+            "abcdef0123456789abcdef0123456789",
+        );
+        let map = manifest.base_map(SIZE).unwrap();
+        let chunks: Vec<u64> = manifest
+            .chunks
+            .iter()
+            .map(|chunk| chunk.chunk_idx)
+            .collect();
+        let prepared = engine.prepare_map_publication(
+            0,
+            &map,
+            &vec![LeafRef::Empty; chunk::leaf_count(SIZE) as usize],
+            &chunks,
+        );
+        let fail_key = match stage {
+            0 => chunk::keys::map_node(VOL, &hex::encode(prepared.leaf_nodes[0].0)),
+            1 => chunk::keys::map_node(VOL, &hex::encode(prepared.root_hash)),
+            _ => chunk::keys::commit_record(VOL, 1, request.provision_transition_id.as_str()),
+        };
+        *blob.fail_key.lock().unwrap() = Some(fail_key);
+
+        let result = engine.provision_root_image(&request).unwrap();
+        assert_eq!(result.resulting_head, request.expected_provisioned_head);
+        assert_eq!(blob.lost_responses.load(Ordering::SeqCst), 1);
+        assert_eq!(meta.load_head(VOL).unwrap().generation, 1);
+    }
+}
+
+#[test]
+fn immutable_key_conflict_and_unrelated_head_fail_closed_without_cas() {
+    let fixture = root_provision_fixture();
+    let map = fixture.manifest.base_map(SIZE).unwrap();
+    let chunks: Vec<u64> = fixture
+        .manifest
+        .chunks
+        .iter()
+        .map(|chunk| chunk.chunk_idx)
+        .collect();
+    let prepared = fixture.engine.prepare_map_publication(
+        0,
+        &map,
+        &vec![LeafRef::Empty; chunk::leaf_count(SIZE) as usize],
+        &chunks,
+    );
+    let leaf_key = chunk::keys::map_node(VOL, &hex::encode(prepared.leaf_nodes[0].0));
+    fixture
+        .blob
+        .put_immutable(&leaf_key, b"wrong bytes")
+        .unwrap();
+    let before_cas = fixture.meta.cas_calls.load(Ordering::SeqCst);
+    assert_definite_problem(
+        fixture
+            .engine
+            .provision_root_image(&fixture.request)
+            .unwrap_err(),
+        cats_api::runtime_reconciliation::ProvisionRootImageDefiniteConflictProblem::ImmutableObject,
+    );
+    assert_eq!(fixture.meta.cas_calls.load(Ordering::SeqCst), before_cas);
+
+    let other = root_provision_fixture();
+    other
+        .meta
+        .cas_head(
+            VOL,
+            0,
+            1,
+            [0xa5; 32],
+            "unrelated.node",
+            "attA",
+            other.engine.epoch(),
+        )
+        .unwrap();
+    let before_objects = volume_objects(other.blob.as_ref());
+    let before_cas = other.meta.cas_calls.load(Ordering::SeqCst);
+    assert!(matches!(
+        other.engine.provision_root_image(&other.request),
+        Err(ProvisionRootImageEffectError::ResultUnknown(_))
+    ));
+    assert_eq!(volume_objects(other.blob.as_ref()), before_objects);
+    assert_eq!(other.meta.cas_calls.load(Ordering::SeqCst), before_cas);
 }

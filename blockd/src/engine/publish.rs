@@ -79,6 +79,42 @@ fn upload_workers(objects: usize) -> usize {
     objects.clamp(1, MAX_UPLOAD_CONCURRENCY)
 }
 
+pub(super) struct PreparedMapPublication {
+    pub(super) base_root_hash: Option<[u8; 32]>,
+    pub(super) base_root_object_id: Option<String>,
+    pub(super) leaf_nodes: Vec<([u8; 32], Vec<u8>)>,
+    pub(super) root_bytes: Vec<u8>,
+    pub(super) root_hash: [u8; 32],
+    pub(super) root_object_id: String,
+    pub(super) leaves: Vec<LeafRef>,
+}
+
+#[derive(serde::Serialize)]
+struct CommitRecord<'a> {
+    chunks: &'a [u64],
+    generation: i64,
+    lease_epoch: i64,
+    root_hash: &'a str,
+    txn: &'a str,
+}
+
+pub(super) fn encode_commit_record(
+    txn: &str,
+    generation: i64,
+    lease_epoch: i64,
+    root_hash: &str,
+    chunks: &[u64],
+) -> Vec<u8> {
+    serde_json::to_vec(&CommitRecord {
+        chunks,
+        generation,
+        lease_epoch,
+        root_hash,
+        txn,
+    })
+    .expect("commit record fields always serialize")
+}
+
 impl ChunkEngine {
     /// Publish every staged pack, oldest first; returns the committed
     /// generation once the queue is empty.
@@ -212,16 +248,70 @@ impl ChunkEngine {
         chunks: &[u64],
     ) -> Result<i64> {
         let vol = &self.cfg.volume_id;
-        // `leaves` still describes the base root here. Capture that evidence
-        // before the touched entries below mutate it in place into the target
-        // root used by the CAS.
+        let prepared = self.prepare_map_publication(base_generation, new_map, leaves, chunks);
+        for (hash, encoded) in &prepared.leaf_nodes {
+            self.blob
+                .put_immutable(&chunk::keys::map_node(vol, &hex::encode(hash)), encoded)?;
+        }
+        let root_hex = hex::encode(prepared.root_hash);
+        self.blob
+            .put_immutable(&chunk::keys::map_node(vol, &root_hex), &prepared.root_bytes)?;
+        let record = encode_commit_record(txn, new_generation, lease_epoch, &root_hex, chunks);
+        self.blob.put_immutable(
+            &chunk::keys::commit_record(vol, new_generation, txn),
+            &record,
+        )?;
+        crashpoint::maybe_crash(crashpoint::BEFORE_CAS);
+
+        let requested = self.meta.cas_head(
+            vol,
+            base_generation,
+            new_generation,
+            prepared.root_hash,
+            &prepared.root_object_id,
+            &self.cfg.attachment_id,
+            self.epoch,
+        );
+        let new_gen = match requested {
+            Ok(generation) => generation,
+            Err(error @ (MetaError::Backend(_) | MetaError::CasConflict { .. })) => self
+                .reconcile_ambiguous_cas(
+                    error,
+                    CasEvidence {
+                        base_generation,
+                        base_root_hash: prepared.base_root_hash,
+                        base_root_object_id: prepared.base_root_object_id.as_deref(),
+                        target_generation: new_generation,
+                        target_root_hash: prepared.root_hash,
+                        target_root_object_id: &prepared.root_object_id,
+                    },
+                )?,
+            Err(error) => return Err(EngineError::Meta(error)),
+        };
+        crashpoint::maybe_crash(crashpoint::AFTER_CAS);
+        leaves.clone_from_slice(&prepared.leaves);
+        Ok(new_gen)
+    }
+
+    pub(super) fn prepare_map_publication(
+        &self,
+        base_generation: i64,
+        new_map: &[ChunkRef],
+        base_leaves: &[LeafRef],
+        chunks: &[u64],
+    ) -> PreparedMapPublication {
+        // Capture the predecessor before replacing touched leaves. A CAS
+        // response can be reconciled only against the complete before/after
+        // heads, never generation alone.
         let (base_root_hash, base_root_object_id) = if base_generation == 0 {
             (None, None)
         } else {
-            let encoded = format::encode_root(self.size, leaves);
+            let encoded = format::encode_root(self.size, base_leaves);
             let hash = format::sha256(&encoded);
             (Some(hash), Some(format!("{}.node", hex::encode(hash))))
         };
+        let mut leaves = base_leaves.to_vec();
+        let mut leaf_nodes = Vec::new();
         let mut touched: Vec<u64> = chunks.iter().map(|c| c / CHUNKS_PER_LEAF as u64).collect();
         touched.sort_unstable();
         touched.dedup();
@@ -236,57 +326,23 @@ impl ChunkEngine {
             let encoded = format::encode_leaf(first, slice);
             let hash = format::sha256(&encoded);
             let object_id = format!("{}.node", hex::encode(hash));
-            self.blob
-                .put_immutable(&chunk::keys::map_node(vol, &hex::encode(hash)), &encoded)?;
             leaves[leaf_idx as usize] = LeafRef::Present { hash, object_id };
+            leaf_nodes.push((hash, encoded));
         }
 
-        let root_encoded = format::encode_root(self.size, leaves);
-        let root_hash = format::sha256(&root_encoded);
+        let root_bytes = format::encode_root(self.size, &leaves);
+        let root_hash = format::sha256(&root_bytes);
         let root_hex = hex::encode(root_hash);
         let root_object_id = format!("{root_hex}.node");
-        self.blob
-            .put_immutable(&chunk::keys::map_node(vol, &root_hex), &root_encoded)?;
-        let record = serde_json::json!({
-            "txn": txn,
-            "generation": new_generation,
-            "root_hash": root_hex,
-            "lease_epoch": lease_epoch,
-            "chunks": chunks,
-        });
-        self.blob.put_immutable(
-            &chunk::keys::commit_record(vol, new_generation, txn),
-            record.to_string().as_bytes(),
-        )?;
-        crashpoint::maybe_crash(crashpoint::BEFORE_CAS);
-
-        let requested = self.meta.cas_head(
-            vol,
-            base_generation,
-            new_generation,
+        PreparedMapPublication {
+            base_root_hash,
+            base_root_object_id,
+            leaf_nodes,
+            root_bytes,
             root_hash,
-            &root_object_id,
-            &self.cfg.attachment_id,
-            self.epoch,
-        );
-        let new_gen = match requested {
-            Ok(generation) => generation,
-            Err(error @ (MetaError::Backend(_) | MetaError::CasConflict { .. })) => self
-                .reconcile_ambiguous_cas(
-                    error,
-                    CasEvidence {
-                        base_generation,
-                        base_root_hash,
-                        base_root_object_id: base_root_object_id.as_deref(),
-                        target_generation: new_generation,
-                        target_root_hash: root_hash,
-                        target_root_object_id: &root_object_id,
-                    },
-                )?,
-            Err(error) => return Err(EngineError::Meta(error)),
-        };
-        crashpoint::maybe_crash(crashpoint::AFTER_CAS);
-        Ok(new_gen)
+            root_object_id,
+            leaves,
+        }
     }
 
     /// Resolve a CAS whose response did not prove whether the new root became

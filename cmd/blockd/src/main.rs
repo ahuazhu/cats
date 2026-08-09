@@ -1,12 +1,14 @@
 //! cats-blockd composition root: selects storage adapters and serves one
 //! volume under one attachment lease.
 
-use std::os::unix::net::UnixListener;
+use std::io::{Read, Write};
+use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
+use std::time::{Duration, Instant};
 
 use anyhow::{bail, Context, Result};
 use cats_api::blockd::{BlockdControlCommand, BlockdControlResponse};
-use cats_blockd::engine::{ChunkEngine, EngineConfig};
+use cats_blockd::engine::{ChunkEngine, EngineConfig, ProvisionRootImageEffectError};
 use cats_blockd::nbd;
 use cats_metadata_store_postgres::PostgresMetadataStoreFactory;
 use cats_metadata_store_sqlite::SqliteMetadataStoreFactory;
@@ -28,6 +30,15 @@ struct Args {
     data_dir: Option<PathBuf>,
     #[arg(long)]
     attachment_id: Option<String>,
+
+    /// Adopt an already-granted owner/epoch and expose only the A14 root-image
+    /// provision control command. This mode never binds a Guest data frontend.
+    #[arg(long)]
+    control_only: bool,
+
+    /// Exact grant epoch to adopt in `--control-only` mode.
+    #[arg(long, requires = "control_only")]
+    attachment_epoch: Option<i64>,
 
     /// Provider-neutral metadata-store adapter name. Not needed to publish an
     /// image, which touches no volume metadata.
@@ -92,14 +103,17 @@ struct Args {
     /// This is the per-launch path: it costs one manifest GET plus a map write,
     /// no data bytes. A volume that already has a generation is left alone, so it
     /// is safe to pass on a resume too.
-    #[arg(long, conflicts_with = "seed_image")]
+    // Temporary V1-only baseline. The runtime vertical cutover deletes both
+    // seed flags; the new reconciler never invokes or parses this implicit
+    // effect and control-only mode rejects it.
+    #[arg(long, conflicts_with = "seed_image", hide = true)]
     seed_image_id: Option<String>,
 
     /// Provision an empty volume from this raw image, publishing it first if
     /// needed. Convenient for standalone and dev use; a node agent should
     /// `--publish-image` once and then pass `--seed-image-id`, because this path
     /// re-hashes the image on every launch to learn its id.
-    #[arg(long)]
+    #[arg(long, hide = true)]
     seed_image: Option<PathBuf>,
 
     /// Sweep unreachable objects every N ms while serving (0 disables it).
@@ -215,6 +229,7 @@ fn main() -> Result<()> {
         .with_writer(std::io::stderr)
         .init();
     let args = Args::parse();
+    validate_process_mode(&args)?;
     // Copied out before the adapter option vectors are consumed below.
     let vhost_user_args = VhostUserArgs {
         socket: args.listen_vhost_user.clone(),
@@ -244,7 +259,8 @@ fn main() -> Result<()> {
         bail!("--listen-unix and --listen-tcp are mutually exclusive");
     }
     // A GC pass attaches to the volume but serves no Guest, so it needs no socket.
-    if !args.collect_garbage
+    if !args.control_only
+        && !args.collect_garbage
         && args.listen_unix.is_none()
         && args.listen_tcp.is_none()
         && args.listen_vhost_user.is_none()
@@ -321,16 +337,27 @@ fn main() -> Result<()> {
     };
     let deadline =
         std::time::Instant::now() + std::time::Duration::from_millis(args.acquire_wait_ms);
-    let engine = loop {
-        match ChunkEngine::attach(config.clone(), blob.clone(), meta.clone()) {
-            Ok(engine) => break engine,
-            Err(cats_blockd::engine::EngineError::Meta(MetaError::LeaseHeld))
-                if std::time::Instant::now() < deadline =>
-            {
-                tracing::info!("lease held by another attachment; waiting for expiry");
-                std::thread::sleep(std::time::Duration::from_millis(200));
+    let engine = if args.control_only {
+        ChunkEngine::attach_control_only(
+            config,
+            args.attachment_epoch
+                .expect("process-mode validation requires an attachment epoch"),
+            blob.clone(),
+            meta.clone(),
+        )
+        .context("adopt control-only chunk engine")?
+    } else {
+        loop {
+            match ChunkEngine::attach(config.clone(), blob.clone(), meta.clone()) {
+                Ok(engine) => break engine,
+                Err(cats_blockd::engine::EngineError::Meta(MetaError::LeaseHeld))
+                    if std::time::Instant::now() < deadline =>
+                {
+                    tracing::info!("lease held by another attachment; waiting for expiry");
+                    std::thread::sleep(std::time::Duration::from_millis(200));
+                }
+                Err(error) => return Err(error).context("attach chunk engine"),
             }
-            Err(error) => return Err(error).context("attach chunk engine"),
         }
     };
 
@@ -340,6 +367,27 @@ fn main() -> Result<()> {
         generation = engine.generation(),
         "attached"
     );
+
+    if args.control_only {
+        let path = args
+            .listen_control
+            .as_ref()
+            .expect("process-mode validation requires a control socket");
+        if path.exists() {
+            bail!(
+                "control socket {} already exists; refusing to replace an unverified owner",
+                path.display()
+            );
+        }
+        let listener = UnixListener::bind(path)
+            .with_context(|| format!("bind control socket {}", path.display()))?;
+        println!("READY {}", path.display());
+        // Deliberately no detach/release: this process adopted, rather than
+        // created, the grant. The runtime owns release and the later serving
+        // process must be able to restart under the same exact owner/epoch.
+        serve_root_provision_control(listener, engine);
+        return Ok(());
+    }
 
     if let Some(manifest) = &seed {
         seed_from_image(&engine, manifest)
@@ -389,7 +437,7 @@ fn main() -> Result<()> {
         let listener = UnixListener::bind(path)
             .with_context(|| format!("bind control socket {}", path.display()))?;
         let engine = engine.clone();
-        std::thread::spawn(move || serve_control(listener, engine));
+        std::thread::spawn(move || serve_legacy_control(listener, engine));
     }
 
     let ready = args
@@ -432,7 +480,10 @@ fn main() -> Result<()> {
 
 /// The host-side control plane of one blockd: line-oriented, one command per
 /// connection. Failure to serve one connection never takes the loop down.
-fn serve_control(listener: UnixListener, engine: std::sync::Arc<cats_blockd::engine::ChunkEngine>) {
+fn serve_legacy_control(
+    listener: UnixListener,
+    engine: std::sync::Arc<cats_blockd::engine::ChunkEngine>,
+) {
     use std::io::{BufRead, BufReader, Write};
     for connection in listener.incoming() {
         let Ok(connection) = connection else { return };
@@ -463,6 +514,171 @@ fn serve_control(listener: UnixListener, engine: std::sync::Arc<cats_blockd::eng
             let _ = (&connection).write_all(reply.to_wire().as_bytes());
         });
     }
+}
+
+const PROVISION_COMMAND_PREFIX: &[u8] = b"provision_root_image ";
+const PROVISION_CONTROL_IO_TIMEOUT: Duration = Duration::from_secs(2);
+
+/// Serve only the A14 provision effect. Connections are handled serially: a
+/// single transition is the only useful work and this keeps admission memory
+/// bounded without adding a second concurrency policy to the daemon.
+fn serve_root_provision_control(
+    listener: UnixListener,
+    engine: std::sync::Arc<cats_blockd::engine::ChunkEngine>,
+) {
+    for connection in listener.incoming() {
+        let Ok(mut connection) = connection else {
+            return;
+        };
+        if connection.set_nonblocking(true).is_err() {
+            continue;
+        }
+        let Some(payload) = read_first_lf_payload(
+            &mut connection,
+            PROVISION_COMMAND_PREFIX,
+            cats_api::runtime_reconciliation::PROVISION_ROOT_IMAGE_REQUEST_MAX_WIRE_BYTES,
+            PROVISION_CONTROL_IO_TIMEOUT,
+        ) else {
+            continue;
+        };
+        let Ok(request) =
+            cats_api::runtime_reconciliation::decode_provision_root_image_request(&payload)
+        else {
+            continue;
+        };
+        let response = match engine.provision_root_image(&request) {
+            Ok(result) => {
+                cats_api::runtime_reconciliation::encode_provision_root_image_result(&result)
+                    .ok()
+                    .map(|json| (b"OK ".as_slice(), json))
+            }
+            Err(ProvisionRootImageEffectError::Closed(error)) => {
+                cats_api::runtime_reconciliation::encode_provision_root_image_error(&error)
+                    .ok()
+                    .map(|json| (b"ERR ".as_slice(), json))
+            }
+            Err(ProvisionRootImageEffectError::ResultUnknown(_)) => None,
+        };
+        if let Some((prefix, payload)) = response {
+            let mut frame = Vec::with_capacity(prefix.len() + payload.len() + 1);
+            frame.extend_from_slice(prefix);
+            frame.extend_from_slice(&payload);
+            frame.push(b'\n');
+            let _ = write_all_before(&mut connection, &frame, PROVISION_CONTROL_IO_TIMEOUT);
+        }
+    }
+}
+
+/// Read one first-LF frame without ever retaining byte `maximum + 1` of the
+/// JSON payload. Bytes after the first LF belong to neither this request nor a
+/// second command; the caller responds and closes the connection immediately.
+fn read_first_lf_payload(
+    stream: &mut UnixStream,
+    prefix: &[u8],
+    maximum: usize,
+    timeout: Duration,
+) -> Option<Vec<u8>> {
+    let deadline = Instant::now().checked_add(timeout)?;
+    let mut matched = 0usize;
+    let mut payload = Vec::with_capacity(maximum.min(4096));
+    let mut buffer = [0_u8; 512];
+    loop {
+        ensure_before(deadline)?;
+        let read = match stream.read(&mut buffer) {
+            Ok(read) => read,
+            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                wait_for_io(deadline)?;
+                continue;
+            }
+            Err(_) => return None,
+        };
+        if read == 0 {
+            return None;
+        }
+        for &byte in &buffer[..read] {
+            if matched < prefix.len() {
+                if byte != prefix[matched] {
+                    return None;
+                }
+                matched += 1;
+                continue;
+            }
+            if byte == b'\n' {
+                if payload.last() == Some(&b'\r') {
+                    return None;
+                }
+                return Some(payload);
+            }
+            if payload.len() == maximum {
+                return None;
+            }
+            payload.push(byte);
+        }
+    }
+}
+
+fn write_all_before(stream: &mut UnixStream, mut bytes: &[u8], timeout: Duration) -> Option<()> {
+    let deadline = Instant::now().checked_add(timeout)?;
+    while !bytes.is_empty() {
+        ensure_before(deadline)?;
+        match stream.write(bytes) {
+            Ok(0) => return None,
+            Ok(written) => bytes = &bytes[written..],
+            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {}
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                wait_for_io(deadline)?;
+            }
+            Err(_) => return None,
+        }
+    }
+    Some(())
+}
+
+fn wait_for_io(deadline: Instant) -> Option<()> {
+    let remaining = deadline.checked_duration_since(Instant::now())?;
+    if remaining.is_zero() {
+        return None;
+    }
+    std::thread::sleep(remaining.min(Duration::from_millis(1)));
+    Some(())
+}
+
+fn ensure_before(deadline: Instant) -> Option<()> {
+    deadline
+        .checked_duration_since(Instant::now())
+        .filter(|remaining| !remaining.is_zero())
+        .map(|_| ())
+}
+
+fn validate_process_mode(args: &Args) -> Result<()> {
+    if args.control_only {
+        if args.attachment_epoch.is_none() {
+            bail!("--control-only requires --attachment-epoch");
+        }
+        if args.listen_control.is_none() {
+            bail!("--control-only requires --listen-control");
+        }
+        if args.listen_unix.is_some()
+            || args.listen_tcp.is_some()
+            || args.listen_vhost_user.is_some()
+        {
+            bail!("--control-only forbids every NBD and vhost-user listener");
+        }
+        if args.seed_image_id.is_some()
+            || args.seed_image.is_some()
+            || args.publish_image.is_some()
+            || args.collect_garbage
+            || args.create_volume_size.is_some()
+        {
+            bail!(
+                "--control-only forbids legacy seed, image publish, GC, and volume creation modes"
+            );
+        }
+    } else if args.attachment_epoch.is_some() {
+        bail!("--attachment-epoch is only valid with --control-only");
+    }
+    Ok(())
 }
 
 /// NBD-only mode: the listener threads own the work, so the process lives as

@@ -16,6 +16,7 @@
 mod admission_port;
 mod checkpoint;
 mod gate_planner;
+mod root_provision;
 
 pub use admission_port::{
     AdmissionGatePort, AdmissionSnapshot, GatePortError, IdleCloseResult, SnapshotError,
@@ -24,6 +25,10 @@ pub use checkpoint::{CheckpointStoreError, FileCheckpointStore, StoredCheckpoint
 pub use gate_planner::{
     applied_desired_evidence, AppliedDesiredError, GateReconcileError, GateSequencer,
     GateTransitionResult, PersistTimes,
+};
+pub use root_provision::{
+    AuthorityRereadRequired, RootProvisionClientError, RootProvisionControlPort,
+    RootProvisionResponseHint, RootProvisionUnknownReason, UnixRootProvisionClient,
 };
 
 #[cfg(test)]
