@@ -11,11 +11,12 @@ use cats_api::runtime_reconciliation::{
     ContractErrorDetail, ContractVersion, ControlHandshakeEvidence, CredentialBinding,
     DesiredReadRequest, DesiredRuntimeSpec, DiskKind, GuestDeviceIdentity,
     GuestRuntimeProfileReceipt, GuestTransportEvidence, Ipv4Address, IsolatedIpv4Kind,
-    LifecycleAdmission, LocalLineageState, LocalVolumeLineage, MacAddress, NetworkConfig,
-    NodeBootId, NodeIdentity, NodeIdentityState, NodeObservation, NodeResidue, ObservedDiskKind,
-    ObservedRuntimeStatus, ObservedVolume, Operation, OperationPhase, OwnershipTokenEvidence,
-    ProcessEvidence, ProcessRole, ProcessState, ReconcileStep, RuntimeConfig, RuntimeTarget,
-    RuntimeTransition, RuntimeVolumeAuthorizationRejection, RuntimeVolumeTransition,
+    LifecycleAdmission, LocalLineageState, LocalVolumeLineage, MacAddress, MountAccess,
+    NetworkConfig, NodeBootId, NodeIdentity, NodeIdentityState, NodeObservation, NodeResidue,
+    ObservedDiskKind, ObservedMount, ObservedRuntimeStatus, ObservedVolume, Operation,
+    OperationPhase, OwnershipTokenEvidence, ProcessEvidence, ProcessRole, ProcessState,
+    ReconcileStep, RuntimeConfig, RuntimeTarget, RuntimeTransition,
+    RuntimeVolumeAuthorizationRejection, RuntimeVolumeTransition,
     RuntimeVolumeTransitionEvidenceRequest, RuntimeVolumeTransitionOutcome,
     RuntimeVolumeTransitionPreconditionProblem, RuntimeVolumeTransitionRequest, Sequence,
     SessionBinding, VolumeAccess, VolumeAcquire, VolumeAcquireRequest, VolumeAuthorityEvidence,
@@ -37,11 +38,11 @@ use super::product_rows::{
     load_desired_for_update, load_disk_by_id_for_update,
 };
 use super::rows::{
-    database_now, insert_authorization, insert_delete_completion, insert_event, insert_volume,
-    load_active_event_by_node_unlocked, load_authorization_for_update,
-    load_delete_completion_for_update, load_event_for_update, load_volume_for_update,
-    update_authorization, update_event, update_volume,
-    volume_has_disposable_root_authorization_for_delete, AUTHORIZATION_COLUMNS,
+    database_now, disposable_root_authorization_candidates_sql, insert_authorization,
+    insert_delete_completion, insert_event, insert_volume, load_active_event_by_node_unlocked,
+    load_authorization_for_update, load_delete_completion_for_update, load_event_for_update,
+    load_volume_for_update, update_authorization, update_event, update_volume,
+    volume_has_disposable_root_authorization_for_delete,
 };
 use super::runtime_spine::{
     age_volume_mutation_admission_for_test, PlacementAdmissionLoad, PlacementAdmissionRejection,
@@ -420,6 +421,22 @@ fn observed_blockd_process(
         },
         control_handshake: ControlHandshakeEvidence::Verified,
         observed_vm_shape: None,
+    }
+}
+
+fn observed_mount(volume_id: &Id) -> ObservedMount {
+    ObservedMount {
+        volume_id: volume_id.clone(),
+        guest_device: GuestDeviceIdentity {
+            serial: id("foreign-root-device"),
+            slot: 0,
+        },
+        source_path: cats_api::runtime_reconciliation::HostPath::new("/dev/foreign-volume")
+            .unwrap(),
+        filesystem_uuid: random_id(7_001),
+        mount_path: cats_api::runtime_reconciliation::HostPath::new("/mnt/foreign-volume").unwrap(),
+        access: MountAccess::ReadWrite,
+        instance_count: 1,
     }
 }
 
@@ -1222,6 +1239,28 @@ fn stored_takeover_graph(store: &Store) -> String {
                                   WHERE disk_id='disk-1'),
                          'desired', (SELECT to_jsonb(row) FROM desired_runtime_specs row
                                      WHERE cat_id='cat-1')
+                     )::text",
+                    &[],
+                )
+                .map(|row| row.get(0))
+        })
+        .unwrap()
+}
+
+fn stored_disposable_graph(store: &Store) -> String {
+    store
+        .with(|client| {
+            client
+                .query_one(
+                    "SELECT jsonb_build_object(
+                         'event', (SELECT to_jsonb(row) FROM host_fence_events row
+                                    WHERE event_id='fence-event-1'),
+                         'authorization', (SELECT to_jsonb(row) FROM volume_authorizations row
+                                            WHERE authorization_id='delete-auth-1'),
+                         'volume', (SELECT to_jsonb(row) FROM volume_records row
+                                    WHERE volume_id='volume-1'),
+                         'disk', (SELECT to_jsonb(row) FROM disk_records row
+                                  WHERE disk_id='disk-1')
                      )::text",
                     &[],
                 )
@@ -2235,8 +2274,10 @@ fn a22_disposable_authorization_scope_stays_indexed_with_large_history() {
     let owned = acquire_owned_volume(&store);
     let (_node, _desired, _admission, _request) =
         prepare_root_delete_release_fixture(&store, &owned);
+    let history_event = host_fence_event(HostFenceEventState::Active);
     store
         .authority_transaction(|transaction| {
+            insert_event(transaction, &history_event)?;
             transaction.execute(
                 "INSERT INTO volume_authorizations (
                     authorization_id, record, kind, authorized_node_id,
@@ -2245,11 +2286,18 @@ fn a22_disposable_authorization_scope_stays_indexed_with_large_history() {
                  )
                  SELECT 'history-auth-' || lpad(entry::text, 8, '0'),
                         jsonb_build_object('unrelated_history', entry),
-                        'disposable_root_delete', 'history-node', NULL,
-                        'history-volume-' || entry::text, 'unconsumed',
-                        1, 1, NULL, 9223372036854775807, NULL
-                   FROM generate_series(1, 50000) AS entry",
-                &[],
+                        CASE WHEN entry % 2 = 0
+                             THEN 'takeover'
+                             ELSE 'disposable_root_delete'
+                         END,
+                        'history-node',
+                        CASE WHEN entry % 2 = 0 THEN $2::text ELSE NULL END,
+                        $1, 'unconsumed',
+                        100 + entry % 97, 100 + entry % 89,
+                        CASE WHEN entry % 2 = 0 THEN 30000 ELSE NULL END,
+                        9223372036854775807, NULL
+                   FROM generate_series(1, 100000) AS entry",
+                &[&owned.volume_id.as_str(), &history_event.event_id.as_str()],
             )?;
             transaction.batch_execute("ANALYZE volume_authorizations")?;
             Ok(())
@@ -2261,25 +2309,8 @@ fn a22_disposable_authorization_scope_stays_indexed_with_large_history() {
             .authority_transaction(|transaction| {
                 let rows = transaction.query(
                     &format!(
-                        "EXPLAIN (COSTS OFF)
-                 SELECT {AUTHORIZATION_COLUMNS}
-                   FROM volume_authorizations
-                  WHERE (
-                        volume_id=$1
-                    AND kind='disposable_root_delete'
-                    AND desired_revision=$2
-                    AND placement_epoch=$3
-                  ) OR (
-                        record->'authorization' @> jsonb_build_object(
-                            'kind', 'disposable_root_delete'::text,
-                            'volume_id', $1::text,
-                            'desired_revision', $2::bigint,
-                            'placement_epoch', $3::bigint,
-                            'delete_id', $4::text
-                        )
-                  )
-                  ORDER BY authorization_id COLLATE \"C\"
-                  LIMIT 2"
+                        "EXPLAIN (COSTS OFF) {}",
+                        disposable_root_authorization_candidates_sql()
                     ),
                     &[&owned.volume_id.as_str(), &12_i64, &4_i64, &"delete-1"],
                 )?;
@@ -2297,8 +2328,12 @@ fn a22_disposable_authorization_scope_stays_indexed_with_large_history() {
             "{phase} canonical selector did not plan through its GIN index:\n{plan}"
         );
         assert!(
+            plan.contains("volume_authorizations_disposable_scope"),
+            "{phase} scalar selector did not plan through its ordered partial index:\n{plan}"
+        );
+        assert!(
             !plan.contains("Seq Scan on volume_authorizations"),
-            "{phase} canonical selector planned a sequential scan:\n{plan}"
+            "{phase} selector planned a sequential scan:\n{plan}"
         );
     };
     let missing_plan = explain_scope();
@@ -2320,8 +2355,26 @@ fn a22_disposable_authorization_scope_stays_indexed_with_large_history() {
 
     let authorization = disposable_authorization(&owned);
     store
+        .authority_transaction(|transaction| insert_authorization(transaction, &authorization))
+        .unwrap();
+    let healthy = store
         .authority_transaction(|transaction| {
-            insert_authorization(transaction, &authorization)?;
+            transaction.batch_execute("SET LOCAL statement_timeout='250ms'")?;
+            volume_has_disposable_root_authorization_for_delete(
+                transaction,
+                &owned.volume_id,
+                &id("delete-1"),
+                revision(12),
+                epoch(4),
+            )
+        })
+        .unwrap();
+    assert!(
+        healthy,
+        "a row found by both candidate arms was not deduplicated"
+    );
+    store
+        .authority_transaction(|transaction| {
             transaction.execute(
                 "UPDATE volume_authorizations
                     SET desired_revision=11
@@ -2381,6 +2434,196 @@ fn a22_release_accepts_a_persisted_cleanup_cursor_behind_the_latest_desired_read
             }
         )
     ));
+}
+
+#[test]
+fn a22_disposable_consume_uses_node_wide_physical_authority_for_both_isolation_bases() {
+    #[derive(Debug, Clone, Copy)]
+    enum IsolationBasis {
+        RuntimeStopped,
+        HostFenceEvent,
+    }
+
+    #[derive(Debug, Clone, Copy)]
+    enum PhysicalConflict {
+        None,
+        ForeignRuntimeVolume,
+        ForeignRuntimeBlockd,
+        ForeignRuntimeMount,
+        Residue,
+    }
+
+    for basis in [
+        IsolationBasis::RuntimeStopped,
+        IsolationBasis::HostFenceEvent,
+    ] {
+        for conflict in [
+            PhysicalConflict::None,
+            PhysicalConflict::ForeignRuntimeVolume,
+            PhysicalConflict::ForeignRuntimeBlockd,
+            PhysicalConflict::ForeignRuntimeMount,
+            PhysicalConflict::Residue,
+        ] {
+            let store =
+                Store::connect(&crate::testsupport::isolated_control_store_url(), None).unwrap();
+            let owned = acquire_owned_volume(&store);
+            let node = transition_node(&store, "node-new");
+            let workspace =
+                super::product_tests::bootstrap_workspace(&store, "a22-disposable-physical");
+            let desired = transition_desired(
+                &workspace,
+                &node,
+                &owned,
+                RuntimeTarget::Deleted,
+                revision(12),
+                epoch(4),
+                id("attachment-old"),
+                VolumeAcquire::Normal {
+                    transition_id: random_id(1),
+                    expected_unowned_epoch: fence_epoch(7),
+                },
+                VolumeDisposition::DeleteDisposableRoot {
+                    delete_id: id("delete-1"),
+                },
+            );
+            let mut observed = observed_owned_volume(
+                &desired,
+                &owned,
+                cats_api::runtime_reconciliation::AcquireOrigin::Normal {
+                    transition_id: random_id(1),
+                },
+                generation(5),
+                owned.head.generation,
+            );
+            if matches!(basis, IsolationBasis::HostFenceEvent) {
+                observed.local_lineages.clear();
+            }
+            let runtime_incarnation =
+                matches!(basis, IsolationBasis::RuntimeStopped).then(|| random_id(51));
+            let target = observed_runtime_with_volumes(
+                &desired,
+                runtime_incarnation,
+                vec![observed.clone()],
+            );
+            let mut runtimes = vec![target.clone()];
+            let mut residue = Vec::new();
+            match conflict {
+                PhysicalConflict::None => {}
+                PhysicalConflict::ForeignRuntimeVolume => {
+                    let mut foreign = observed;
+                    foreign.local_lineages.clear();
+                    runtimes.push(orphan_runtime_with_volume_evidence(
+                        &target,
+                        vec![foreign],
+                        Vec::new(),
+                    ));
+                }
+                PhysicalConflict::ForeignRuntimeBlockd => {
+                    runtimes.push(orphan_runtime_with_volume_evidence(
+                        &target,
+                        Vec::new(),
+                        vec![observed_blockd_process(
+                            &owned.volume_id,
+                            &id("attachment-foreign"),
+                            owned.lease_epoch,
+                            71,
+                        )],
+                    ));
+                }
+                PhysicalConflict::ForeignRuntimeMount => {
+                    let mut orphan =
+                        orphan_runtime_with_volume_evidence(&target, Vec::new(), Vec::new());
+                    orphan.mounts.push(observed_mount(&owned.volume_id));
+                    runtimes.push(orphan);
+                }
+                PhysicalConflict::Residue => {
+                    residue.push(NodeResidue::ControlSocket {
+                        socket_path: cats_api::runtime_reconciliation::HostPath::new(
+                            "/run/cats/foreign-volume.sock",
+                        )
+                        .unwrap(),
+                        role_hint: Some(ProcessRole::Blockd {
+                            volume_id: owned.volume_id.clone(),
+                            attachment_id: id("attachment-foreign"),
+                            attachment_epoch: owned.lease_epoch,
+                        }),
+                        ownership_token: OwnershipTokenEvidence::Missing,
+                    });
+                }
+            }
+            prepare_a22_runtime_with_inventory(
+                &store, &node, &desired, &owned, runtimes, residue, true,
+            );
+
+            let mut authorization = disposable_authorization(&owned);
+            let VolumeAuthorization::DisposableRootDelete(payload) =
+                &mut authorization.authorization
+            else {
+                unreachable!()
+            };
+            payload.authorized_node_id = node.session.node_id.clone();
+            payload.cat_id = desired.cat_id.clone();
+            payload.desired_revision = desired.desired_revision;
+            payload.placement_epoch = desired.placement.placement_epoch;
+            payload.isolation_basis = match basis {
+                IsolationBasis::RuntimeStopped => DisposableDeleteIsolationBasis::RuntimeStopped {
+                    node_id: node.session.node_id.clone(),
+                    agent_session_epoch: node.session.agent_session_epoch,
+                    runtime_incarnation: random_id(51),
+                    observation_id: random_id(91),
+                },
+                IsolationBasis::HostFenceEvent => DisposableDeleteIsolationBasis::HostFenceEvent {
+                    event_id: id("fence-event-1"),
+                },
+            };
+            payload.not_after = unix_millis(i64::MAX.unsigned_abs());
+            let event = matches!(basis, IsolationBasis::HostFenceEvent)
+                .then(|| host_fence_event(HostFenceEventState::Active));
+            store
+                .authority_transaction(|transaction| {
+                    if let Some(event) = event.as_ref() {
+                        insert_event(transaction, event)?;
+                    }
+                    insert_authorization(transaction, &authorization)
+                })
+                .unwrap();
+            let request = transition_request(
+                &node,
+                &desired,
+                RuntimeVolumeTransition::DeleteDisposableRoot {
+                    authorization_id: id("delete-auth-1"),
+                },
+            );
+
+            if matches!(conflict, PhysicalConflict::None) {
+                assert!(
+                    matches!(
+                        execute_transition(&store, &node, &request).unwrap(),
+                        VolumeTransitionStoreOutcome::Accepted(_)
+                    ),
+                    "valid {basis:?} fixture was rejected"
+                );
+                continue;
+            }
+
+            let before = stored_disposable_graph(&store);
+            assert_eq!(
+                execute_transition(&store, &node, &request).unwrap(),
+                VolumeTransitionStoreOutcome::Rejected(
+                    VolumeTransitionStoreRejection::VolumeAuthorizationRejected {
+                        authorization_id: id("delete-auth-1"),
+                        reason: RuntimeVolumeAuthorizationRejection::InvalidAuthorization,
+                    }
+                ),
+                "wrong result for {basis:?}/{conflict:?}"
+            );
+            assert_eq!(
+                stored_disposable_graph(&store),
+                before,
+                "authority graph changed for {basis:?}/{conflict:?}"
+            );
+        }
+    }
 }
 
 #[test]

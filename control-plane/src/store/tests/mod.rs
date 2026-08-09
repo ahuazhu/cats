@@ -1022,17 +1022,34 @@ fn refuses_current_stamp_with_missing_authority_catalog_barriers() {
 }
 
 #[test]
-fn refuses_missing_or_replaced_authorization_json_index_without_repair() {
-    for (ddl, expected_fragment) in [
+fn refuses_missing_or_replaced_authorization_indexes_without_repair() {
+    for (index, ddl, expected_fragment) in [
         (
+            "volume_authorizations_record_authorization",
             "DROP INDEX volume_authorizations_record_authorization",
             None,
         ),
         (
+            "volume_authorizations_record_authorization",
             "DROP INDEX volume_authorizations_record_authorization;
              CREATE INDEX volume_authorizations_record_authorization
                  ON volume_authorizations(volume_id)",
             Some("USING btree (volume_id)"),
+        ),
+        (
+            "volume_authorizations_disposable_scope",
+            "DROP INDEX volume_authorizations_disposable_scope",
+            None,
+        ),
+        (
+            "volume_authorizations_disposable_scope",
+            "DROP INDEX volume_authorizations_disposable_scope;
+             CREATE INDEX volume_authorizations_disposable_scope
+                 ON volume_authorizations(
+                     volume_id, placement_epoch, desired_revision,
+                     authorization_id COLLATE \"C\"
+                 ) WHERE kind='disposable_root_delete'",
+            Some("volume_id, placement_epoch, desired_revision"),
         ),
     ] {
         let url = crate::testsupport::isolated_control_store_url();
@@ -1045,17 +1062,11 @@ fn refuses_missing_or_replaced_authorization_json_index_without_repair() {
         };
         assert_eq!(error.code, ErrorCode::FailedPrecondition);
         assert!(
-            error
-                .to_string()
-                .contains("volume_authorizations_record_authorization"),
+            error.to_string().contains(index),
             "operator must see the changed index name, got: {error}"
         );
         let definition: Option<String> = admin
-            .query_one(
-                "SELECT pg_get_indexdef(
-                    to_regclass('volume_authorizations_record_authorization'))",
-                &[],
-            )
+            .query_one("SELECT pg_get_indexdef(to_regclass($1))", &[&index])
             .unwrap()
             .get(0);
         match expected_fragment {

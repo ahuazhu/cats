@@ -1168,11 +1168,47 @@ fn disposable_isolation_evidence_matches(
     volume: &VolumeRecord,
     event: Option<&HostFenceEvent>,
 ) -> bool {
+    let physical = PhysicalVolumeAuthorityIndex::build(
+        &context.admission.full_inventory_observation,
+        &intent.volume_id,
+    );
+    if physical.has_residue
+        || !physical.blockd_processes.is_empty()
+        || !physical.mounts.is_empty()
+        || physical.volumes.len() != 1
+    {
+        return false;
+    }
+    let Some(expected_runtime) = runtime_for_desired(&context.admission, &context.desired) else {
+        return false;
+    };
+    let (runtime, observed) = physical.volumes[0];
+    if !std::ptr::eq(runtime, expected_runtime)
+        || !observed_volume_identity_matches(observed, intent)
+        || !observed.devices.is_empty()
+    {
+        return false;
+    }
+    let VolumeAuthorityEvidence::Owned {
+        attachment_id,
+        attachment_epoch,
+        head,
+    } = &observed.authority
+    else {
+        return false;
+    };
+    if attachment_id != &authorization.expected_attachment_id
+        || *attachment_epoch != authorization.expected_epoch
+        || *head != authorization.expected_head
+        || *head != volume.head
+    {
+        return false;
+    }
     match (&authorization.isolation_basis, event) {
         (
             cats_storage::authority::DisposableDeleteIsolationBasis::HostFenceEvent { event_id },
             Some(event),
-        ) => event.event_id == *event_id,
+        ) => event.event_id == *event_id && observed.local_lineages.is_empty(),
         (
             cats_storage::authority::DisposableDeleteIsolationBasis::RuntimeStopped {
                 node_id,
@@ -1188,9 +1224,6 @@ fn disposable_isolation_evidence_matches(
             {
                 return false;
             }
-            let Some(runtime) = runtime_for_desired(&context.admission, &context.desired) else {
-                return false;
-            };
             let checkpoint_incarnation = match &runtime.checkpoint {
                 cats_api::runtime_reconciliation::CheckpointEvidence::Valid {
                     runtime_incarnation,
@@ -1198,10 +1231,7 @@ fn disposable_isolation_evidence_matches(
                 } => runtime_incarnation.as_ref(),
                 _ => None,
             };
-            if runtime
-                .runtime_incarnation
-                .as_ref()
-                .is_some_and(|current| current != runtime_incarnation)
+            if runtime.runtime_incarnation.as_ref() != Some(runtime_incarnation)
                 || checkpoint_incarnation.is_some_and(|current| current != runtime_incarnation)
                 || !runtime.processes.is_empty()
                 || !runtime.mounts.is_empty()
@@ -1212,32 +1242,7 @@ fn disposable_isolation_evidence_matches(
             {
                 return false;
             }
-            let mut observed_matches = runtime
-                .volumes
-                .iter()
-                .filter(|observed| observed.volume_id == intent.volume_id);
-            let Some(observed) = observed_matches.next() else {
-                return false;
-            };
-            if observed_matches.next().is_some()
-                || !observed_volume_identity_matches(observed, intent)
-                || !observed.devices.is_empty()
-            {
-                return false;
-            }
-            let VolumeAuthorityEvidence::Owned {
-                attachment_id,
-                attachment_epoch,
-                head,
-            } = &observed.authority
-            else {
-                return false;
-            };
-            attachment_id == &authorization.expected_attachment_id
-                && *attachment_epoch == authorization.expected_epoch
-                && *head == authorization.expected_head
-                && *head == volume.head
-                && observed.local_lineages.len() == 1
+            observed.local_lineages.len() == 1
                 && observed.local_lineages.first().is_some_and(|lineage| {
                     lineage.attachment_id == authorization.expected_attachment_id
                         && lineage.attachment_epoch == authorization.expected_epoch
@@ -1246,7 +1251,8 @@ fn disposable_isolation_evidence_matches(
                         && lineage.placement_epoch == context.desired.placement.placement_epoch
                         && lineage.remote_durable_generation == volume.head.generation
                         && lineage.local_durable_generation > lineage.remote_durable_generation
-                        && lineage.state != LocalLineageState::Quarantined
+                        && !lineage.fenced
+                        && lineage.state == LocalLineageState::Active
                 })
         }
         _ => false,

@@ -410,7 +410,10 @@ identity、完整acquire origin、attachment/epoch、disposition和generation都
 保留数据路径精确`R == L == volume_release.generation`。对Root disposable `R == L` normal分支，current
 Desired必须是同delete ID的Deleted revision；取得Volume锁后fresh检查该delete lineage不存在任何已经派生的
 disposable authorization。该检查对projection scope与canonical JSON scope双向选取候选、完整decode并交叉
-验证，canonical分支由schema v9的`jsonb_path_ops` GIN表达式索引有界执行，不能用`LIMIT`掩盖历史全表扫描。
+验证。schema v10要求projection arm使用partial ordered B-tree
+`(volume_id, desired_revision, placement_epoch, authorization_id COLLATE "C") WHERE kind='disposable_root_delete'`，
+canonical arm使用`jsonb_path_ops` GIN表达式索引；两臂各自`LIMIT 2`后按authorization ID去重，再读取至多两条
+完整row。健康row同时命中两臂仍只算一个候选，不能用外层`LIMIT`掩盖任一臂的历史全表扫描。
 对Persistent detach/retain按Volume Authority current-only规则验证不再有冲突binding/residue。
 
 任一授权已先commit则release零副作用返回`authorization_branch_conflict`；release先commit时后续derive因
@@ -424,10 +427,14 @@ authorized Node/old attachment/epoch/head/isolation/not-after，要求`authorize
 其余全部与request current context、current Deleted Root
 disposition和Control Disk逐字段相同，并证明没有live DiskSnapshotRecord。
 
-`runtime_stopped` basis还必须引用current session下已经接受的exact stop observation：same Cat/revision/
-placement/runtime incarnation，Guest/VMM/blockd stopped，授权首次建立时的`R < L`事实仍与exact lineage一致。
-`host_fence_event` basis按event cutoff/barrier和Volume Authority规则验证；调用者仍必须是current Desired
-placement的current Node，授权ID本身不允许任意authenticated Node消费。Host完全失联且没有replacement Node
+两种basis都必须从current session的accepted full observation构建全Node、按volume ID的physical authority
+index：同一volume只能在expected runtime出现一个逐字段匹配intent及old owner/epoch/head的ObservedVolume，
+全Node不能有另一个该volume、blockd、mount或residue，expected volume也不能有device。
+`runtime_stopped`还必须引用该exact observation并匹配same Cat/revision/placement/runtime incarnation；expected
+runtime的Guest/VMM/process/mount全部stopped，且唯一lineage为Active、unfenced并精确保留授权建立时的`R < L`。
+`host_fence_event`要求expected ObservedVolume的local lineage为空；event只隔离旧Host，不能被当作current accepted
+session所在Host的writer fence或替代上述Node-wide检查。调用者仍必须是current Desired placement的current Node，
+授权ID本身不允许任意authenticated Node消费。Host完全失联且没有replacement Node
 时，Control内部worker可以调用同一transaction函数但不经过HTTP；它必须携带服务器内部typed context并执行
 相同Desired/Disk/event checks，不能伪装Node proof或建立第二条conversion。
 
@@ -617,7 +624,7 @@ cross-binding。
 | grant | size/durability/head/owner/epoch/expiry/origin来自同一updated VolumeRecord；Node落checkpoint后才spawn/adopt；success字段替换或late old-session response不能开Guest I/O |
 | release | CleanupRelease唯一导出ReleaseRequest；current full evidence、origin、stop、R==L==generation、Desired/tombstone和disposition；same ID replay、异payload、response loss、epoch max |
 | release/auth race | 两session按Volume锁后fresh重验；release先则derive全rollback，derive先则release exact 409零写；无auth+Unowned |
-| disposable | runtime-stopped与host-fence两basis；immutable `authorized_node_id`与HTTP caller绑定，internal fence worker不借Node route；current Deleted Root/delete ID、Disk、snapshot、stop/event、old owner/epoch/head全绑定；receipt/Volume/Disk同commit且receipt不重复Node ID；成功前不删tail |
+| disposable | runtime-stopped与host-fence两basis；immutable `authorized_node_id`与HTTP caller绑定，internal fence worker不借Node route；current Deleted Root/delete ID、Disk、snapshot、stop/event、old owner/epoch/head全绑定；两basis都从current accepted full建立Node-wide volume index并拒绝foreign/duplicate volume、blockd、mount、residue，runtime-stopped只接受exact Active/unfenced R<L lineage，host-fence只接受expected metadata volume且零lineage/device；receipt/Volume/Disk同commit且receipt不重复Node ID；成功前不删tail |
 | corruption | 每张JSONB/projection、receipt/direct state、missing referenced row和future time逐项破坏均500/零写；evidence snapshot还覆盖错primary ID/authorized-node/variant/volume、current Volume与completion并存、同volume重复completion、marker引用缺失或direct row错volume/variant；只有access-control已命中caller可观察500，绝不返回partial或接受半postcondition |
 | authorization evidence read | 唯一业务input是authorization ID；A19 proof + current provisioned identity/session；同一RR snapshot在NodeIdentity/credential share lock下返回exact primary、derived Volume/null、derived completion/null和current marker/completion直接引用的最多一个direct authorization；transaction为取得row lock不声明SQL READ ONLY，但无domain write/续期；无Desired lookup、volume/delete/successor key输入、全volume枚举/分页、bool或chain ledger；新session同Node成功、wrong/retired Node fail closed；已知无关authorization正例校准后证明不能读/返回其他volume/receipt/auth；Node无raw SQL credential，Control read无write且blockd composition不能取得client |
 | ambiguity | commit前/后断连接；同domain ID重放；current context变化后fresh rebind；normal用direct `load_volume`，authorization只用signed evidence；takeover commit丢response后允许current Volume已合法renew/head-CAS/release/更大epoch后继，仍必须由原authorization receipt + current marker/最多一direct authorization + epoch/head单调闭合；Unconsumed + exact predecessor只重放原ID，Consumed + null marker缺same-disk restore API result时必须Blocked；disposable commit丢response后sweeper已删Volume/Disk row时只凭exact completion receipt闭合；evidence EOF/invalid/oversize重读fresh snapshot，typed unavailable保持Blocked且不猜mutation未发生；plain unmatched-route 404停止自动重试；redirect、HTML、status/detail/header不匹配和malformed body全部保留checkpoint；不建HTTP result row或second grant ledger |

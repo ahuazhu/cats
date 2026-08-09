@@ -488,6 +488,10 @@ create先提交时revision在同一NodeIdentity后看到new assigned set，二�
 
 事务只做同一Control PostgreSQL中的Control Store/Volume Authority I/O，不访问filesystem、Node、object
 store、provider或Gateway。
+消费本attestation的A22 volume transition不得只查看expected Cat的runtime：它必须从保留的完整
+`NodeObservation`按volume ID索引全部runtime中的ObservedVolume、blockd process和mount，并同时检查顶层
+Node residue。expected runtime中的metadata authority映射不等于本地物理writer；duplicate/foreign volume、
+blockd、mount或可能命名该volume的residue都必须显式进入调用方的closed判定。
 Runtime §16.4.3 的完整 error selection必须在任何 write前完成。full/partial validation、per-Cat
 replace/upsert、full complete replacement、server attestation、cursor consume、Operation settlement、highest
 sequence、exact success response、accepted time和lease renewal全有或全无。

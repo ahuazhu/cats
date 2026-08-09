@@ -657,8 +657,44 @@ pub(super) fn runtime_authorization_route_for_context(
 /// exact disposable-delete lineage, so release and derive cannot both commit.
 /// Historical takeover records and authorizations for an older delete
 /// lineage are immutable evidence, not a branch conflict for the current
-/// normal Root delete. Current scalar-scope candidates are bounded and fully
-/// decoded so projection-preserving corruption cannot masquerade as absence.
+/// normal Root delete. The independently indexed scalar and canonical arms
+/// each bound candidate IDs before their union removes the healthy row's
+/// double match; callers then fully decode at most two distinct rows.
+pub(super) fn disposable_root_authorization_candidates_sql() -> String {
+    format!(
+        "WITH candidate_ids AS MATERIALIZED (
+            (
+                SELECT authorization_id
+                  FROM volume_authorizations
+                 WHERE volume_id=$1
+                   AND kind='disposable_root_delete'
+                   AND desired_revision=$2
+                   AND placement_epoch=$3
+                 ORDER BY authorization_id COLLATE \"C\"
+                 LIMIT 2
+            )
+            UNION
+            (
+                SELECT authorization_id
+                  FROM volume_authorizations
+                 WHERE record->'authorization' @> jsonb_build_object(
+                           'kind', 'disposable_root_delete'::text,
+                           'volume_id', $1::text,
+                           'desired_revision', $2::bigint,
+                           'placement_epoch', $3::bigint,
+                           'delete_id', $4::text
+                       )
+                 LIMIT 2
+            )
+        )
+        SELECT {AUTHORIZATION_COLUMNS}
+          FROM volume_authorizations
+         WHERE authorization_id IN (SELECT authorization_id FROM candidate_ids)
+         ORDER BY authorization_id COLLATE \"C\"
+         LIMIT 2"
+    )
+}
+
 pub(super) fn volume_has_disposable_root_authorization_for_delete(
     transaction: &mut Transaction<'_>,
     volume_id: &Id,
@@ -668,26 +704,7 @@ pub(super) fn volume_has_disposable_root_authorization_for_delete(
 ) -> AuthorityTxResult<bool> {
     let desired_revision = desired_revision.to_pg().map_err(corrupt)?;
     let placement_epoch = placement_epoch.to_pg().map_err(corrupt)?;
-    let sql = format!(
-        "SELECT {AUTHORIZATION_COLUMNS}
-           FROM volume_authorizations
-          WHERE (
-                volume_id=$1
-            AND kind='disposable_root_delete'
-            AND desired_revision=$2
-            AND placement_epoch=$3
-          ) OR (
-                record->'authorization' @> jsonb_build_object(
-                    'kind', 'disposable_root_delete'::text,
-                    'volume_id', $1::text,
-                    'desired_revision', $2::bigint,
-                    'placement_epoch', $3::bigint,
-                    'delete_id', $4::text
-                )
-          )
-          ORDER BY authorization_id COLLATE \"C\"
-          LIMIT 2"
-    );
+    let sql = disposable_root_authorization_candidates_sql();
     let rows = transaction.query(
         &sql,
         &[

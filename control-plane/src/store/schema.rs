@@ -298,6 +298,53 @@ fn verify_authority_catalog(transaction: &mut postgres::Transaction<'_>) -> Resu
             return Err(partial_catalog_object(index));
         }
     }
+    for (table, index, first, second, third, fourth, predicate) in REQUIRED_ORDERED_PARTIAL_INDEXES
+    {
+        let present: bool = transaction
+            .query_one(
+                "SELECT EXISTS (
+                    SELECT 1
+                      FROM pg_index i
+                      JOIN pg_class source ON source.oid=i.indrelid
+                      JOIN pg_namespace source_namespace
+                        ON source_namespace.oid=source.relnamespace
+                      JOIN pg_class index_relation
+                        ON index_relation.oid=i.indexrelid
+                      JOIN pg_am access_method
+                        ON access_method.oid=index_relation.relam
+                     WHERE source_namespace.nspname=current_schema()
+                       AND source.relname=$1 AND index_relation.relname=$2
+                       AND NOT i.indisunique AND i.indisvalid AND i.indisready
+                       AND i.indnkeyatts=4 AND i.indnatts=4
+                       AND i.indoption::TEXT='0 0 0 0'
+                       AND i.indexprs IS NULL AND i.indpred IS NOT NULL
+                       AND access_method.amname='btree'
+                       AND i.indcollation[0]=(
+                           SELECT attribute.attcollation
+                             FROM pg_attribute attribute
+                            WHERE attribute.attrelid=i.indrelid
+                              AND attribute.attname='volume_id'
+                       )
+                       AND i.indcollation[1]=0 AND i.indcollation[2]=0
+                       AND i.indcollation[3]='pg_catalog.\"C\"'::regcollation
+                       AND pg_get_indexdef(i.indexrelid, 1, FALSE)=$3
+                       AND pg_get_indexdef(i.indexrelid, 2, FALSE)=$4
+                       AND pg_get_indexdef(i.indexrelid, 3, FALSE)=$5
+                       AND pg_get_indexdef(i.indexrelid, 4, FALSE)=$6
+                       AND pg_get_expr(i.indpred, i.indrelid)=$7
+                 )",
+                &[table, index, first, second, third, fourth, predicate],
+            )
+            .map_err(|error| {
+                internal(format!(
+                    "verify authority ordered partial-index catalog: {error:?}"
+                ))
+            })?
+            .get(0);
+        if !present {
+            return Err(partial_catalog_object(index));
+        }
+    }
     for (table, index, access_method, operator_class, expression) in REQUIRED_EXPRESSION_INDEXES {
         let present: bool = transaction
             .query_one(
@@ -530,6 +577,26 @@ const REQUIRED_EXPRESSION_INDEXES: &[(&str, &str, &str, &str, &str)] = &[(
     "gin",
     "jsonb_path_ops",
     "(record -> 'authorization'::text)",
+)];
+
+type RequiredOrderedPartialIndex = (
+    &'static str,
+    &'static str,
+    &'static str,
+    &'static str,
+    &'static str,
+    &'static str,
+    &'static str,
+);
+
+const REQUIRED_ORDERED_PARTIAL_INDEXES: &[RequiredOrderedPartialIndex] = &[(
+    "volume_authorizations",
+    "volume_authorizations_disposable_scope",
+    "volume_id",
+    "desired_revision",
+    "placement_epoch",
+    "authorization_id",
+    "(kind = 'disposable_root_delete'::text)",
 )];
 
 // PostgreSQL `pg_trigger.tgtype` bits: ROW=1, BEFORE=2, DELETE=8,
@@ -1058,6 +1125,10 @@ CREATE INDEX IF NOT EXISTS volume_authorizations_event
 ON volume_authorizations(host_fence_event_id) WHERE host_fence_event_id IS NOT NULL;
 CREATE INDEX IF NOT EXISTS volume_authorizations_volume
 ON volume_authorizations(volume_id);
+CREATE INDEX IF NOT EXISTS volume_authorizations_disposable_scope
+ON volume_authorizations(
+    volume_id, desired_revision, placement_epoch, authorization_id COLLATE \"C\"
+) WHERE kind='disposable_root_delete';
 CREATE INDEX IF NOT EXISTS volume_authorizations_record_authorization
 ON volume_authorizations USING GIN ((record->'authorization') jsonb_path_ops);
 CREATE TABLE IF NOT EXISTS delete_completion_receipts (

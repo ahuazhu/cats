@@ -1165,8 +1165,11 @@ release取得Volume锁后必须fresh读取同一delete ID/revision的authorizati
 current Deleted。release先commit时derive随后看到Unowned并整笔回滚；derive先commit时release看到auth并
 零副作用拒绝。这个fresh probe必须以projection current scope **或** canonical authorization中的同一
 volume/delete/revision/placement scope选出至多两个候选，再完整closed decode并交叉验证projection；任一方向
-drift都属于corruption，而旧lineage不进入候选。canonical分支必须由schema v9要求并在启动时精确校验的
-`GIN ((record->'authorization') jsonb_path_ops)`表达式索引承载；`LIMIT 2`本身不能作为全历史扫描的bound。
+drift都属于corruption，而旧lineage不进入候选。schema v10必须在启动时精确校验两个独立index：canonical
+arm由`GIN ((record->'authorization') jsonb_path_ops)`承载，projection arm由partial ordered B-tree
+`(volume_id, desired_revision, placement_epoch, authorization_id COLLATE "C") WHERE kind='disposable_root_delete'`
+承载。两臂各自至多取两个ID、`UNION`去重后才读取完整row；同一健康row命中两臂不能误报重复，外层
+`LIMIT 2`本身不能作为任一臂全历史扫描的bound。
 不能在锁前缓存“无authorization”后越过这个重验。
 - Persistent不读取或保存“历史上属于哪个Cat”。它要求全部current完整Desired都不引用该Disk，且current
   accepted complete inventory按
@@ -1272,7 +1275,12 @@ HostFenceEvent来源的首次消费使用固定锁序
 `HostFenceEvent -> AuthorizationRecord -> VolumeRecord -> Control Disk/Desired/DiskSnapshotRecord rows`；
 RuntimeStopped来源使用相同后缀而没有event行。一个PostgreSQL事务读取服务器端authorization row，重验
 event或stop observation、authorization完整tuple、Control Disk仍为Active、当前Deleted Desired仍把该Root标为disposable，
-并确认没有live `DiskSnapshotRecord`，然后原子执行：
+并确认没有live `DiskSnapshotRecord`。两种basis都必须从current accepted full observation按volume ID扫描
+全部runtime和Node residue：恰有一个expected runtime中的ObservedVolume与intent及old owner/epoch/head逐字段
+相同，且全Node没有该volume的duplicate/foreign volume、blockd、mount或residue，expected volume没有device。
+RuntimeStopped还要求exact observation/session/runtime incarnation、Guest/VMM/process/mount stopped以及唯一
+Active、unfenced、`R < L` lineage；HostFenceEvent则要求expected metadata volume的lineage为空。event只fence
+旧Host，不能替代current Host的这次physical检查。全部通过后才原子执行：
 
 - `VolumeRecord Active + Owned(expected owner/epoch) -> Deleting(delete_id, owner cleared, epoch + 1)`；
 - `Control Disk Active -> Deleting(delete_id)`；
