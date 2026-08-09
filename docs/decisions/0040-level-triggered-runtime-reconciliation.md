@@ -7,6 +7,7 @@
 - Internal delivery/acceptance：[Runtime Inventory and Observation Spine v1](../specs/runtime-inventory-observation-v1.md)
 - Volume transition transport：[Runtime Volume Transitions v1](../specs/runtime-volume-transitions-v1.md)
 - composition：[Runtime Composition Artifacts v1](../specs/runtime-composition-artifacts-v1.md)
+- placement policy：[ADR-0043](0043-provisioner-owned-runtime-placement-policy.md)
 
 ## 背景
 
@@ -94,6 +95,11 @@ incarnation、attachment epoch 和 route epoch 各自防止对应 ABA。
 改变也是一个新 revision 和 Operation，没有旁路调度权威。新 revision 原子 Supersede 旧的
 Pending Operation。已选 Node 若明确拒绝不可满足的容量/能力，当前 Operation Failed；重新调度
 只能创建提高 placement epoch 的新系统 revision。
+
+Node的静态schedulable/capacity/capability和Guest private network来源只由
+[ADR-0043](0043-provisioner-owned-runtime-placement-policy.md)的provisioner policy声明。Control按稳定
+Node ID分页选择，并在NodeIdentity锁内重验；heartbeat、legacy Node row、Node自报数字、本地CIDR推导和
+scheduler reservation都不是authority。
 
 Cat create把Cat、current完整Desired、runtime Operation、generation-zero且Unowned的唯一Root
 Disk/Volume和exact API result放在同一PG commit；不留下半套identity。Root没有Persistent

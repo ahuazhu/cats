@@ -102,7 +102,8 @@ lookup：hit直接重放；miss不保留reservation/Pending，准备完成后的
 `CatNameLock(workspace_id,name)`只是不落row的PostgreSQL transaction advisory coordination：Cat create
 在API key之后取得它；持锁查询到existing Cat后按既有Volume→Cat→Disk→Desired→Endpoint/lookup→Operation
 锁序闭合existing graph，合法时只保存fixed 409且不锁candidate plan/NodeIdentity；name free的202分支才先锁
-并重验candidate NodeIdentity/admission，再取得任何candidate Volume/Cat/Disk锁。
+并重验candidate NodeIdentity、A23 policy/admission/capacity/network probe，再取得任何candidate
+Volume/Cat/Disk锁。
 数据库unique constraint仍保留，但不能依赖一个已abort的unique violation事务再补写409 result。
 
 router build/startup gate枚举全部mutation：每条恰好归入上述PG result或已有domain协议；Account/WorkOS、
@@ -286,8 +287,10 @@ runbook；禁止以“重启看看”跳过fence或durability proof。
    NodeJob、heartbeat overwrite、旧Route parser/mirror、旧IAM/Terraform inputs或transitional
    writes；随后轮换service、per-Node、database、object-store与route-signing credentials。此步不
    重建或修改artifact。
-5. 创建空目标 schema，启动同一个 exact release 的 Control Plane，并 provision
-   `NodeIdentity`/per-Node credential binding。
+5. 创建空目标 schema，安装并验证A23 deployment provisioner Ed25519 trust bundle，启动同一个exact release
+   的Control Plane；central IaC通过single signed node-authority route原子provision
+   `NodeIdentity`/per-Node credential binding与revision-1 cordoned `NodePlacementPolicy`。不得direct SQL或
+   使用Node/static admin bearer补row。
 6. Node 以所有 gate Closed 注册新 `AgentSession`，提交 complete empty inventory attestation 和
    key-ring ACK；随后启动 Gateway。
 7. 在 cordoned 状态运行第 6 节全部 qualification 和故障 oracle。全绿后才开放 ingress、
@@ -301,7 +304,8 @@ key overlap、Node drain 和不可变 artifact digest；该路径不能用于首
 
 步骤4–6还必须遵守
 [Agent Registration and Internal Transport v1](specs/agent-registration-transport-v1.md)和
-[Runtime Composition Artifacts v1](specs/runtime-composition-artifacts-v1.md)：provisioner安装并封闭验证唯一的
+[Runtime Composition Artifacts v1](specs/runtime-composition-artifacts-v1.md)，policy/auth/planner另外遵守
+[Runtime Placement Policy v1](specs/runtime-placement-policy-v1.md)：provisioner安装并封闭验证唯一的
 local `NodeIdentity` artifact；Control/Node artifact extract出的manifest和
 `guest-runtime-profile.v1.json`逐byte一致；Node/Metal Control systemd及AWS Control Kubernetes container都
 显式传入installed exact receipt path；每Node Ed25519 key只在该Host以root-only文件存在。缺失identity、

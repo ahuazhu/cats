@@ -519,8 +519,9 @@ PlacementAdmissionSnapshot {
 `assigned_desired_specs`是 planner transaction snapshot中的完整 current set，而不是从 attested response
 反序列化后直接返回；loader必须同时比较它与 `AdmissionInventoryState`保存的 cursor snapshot逐字段相同。
 
-一次候选读取使用一个 PostgreSQL `REPEATABLE READ READ ONLY` transaction snapshot和一次数据库
-`db_now`，在同一snapshot完成：
+一次standalone候选读取使用一个 PostgreSQL `REPEATABLE READ READ ONLY` transaction snapshot和一次数据库
+`db_now`；A23 whole-fleet planner则把所有keyset page/candidate放在同一个这样的outer transaction。A20 loader
+必须接受调用方transaction与该次`db_now`，不能为每个Node自行begin/commit。在同一snapshot完成：
 
 1. `NodeIdentity.state=provisioned`，identity/credential projection完整自洽；
 2. `AgentSession`是该Node current row，identity/Host绑定自洽，且
@@ -557,19 +558,22 @@ PlacementAdmissionRejection =
 | "assigned_set_changed"
 ```
 
-具体Node排序、静态schedulable/capability来源、capacity估算和NetworkConfig地址选择仍按
-[Volume Authority §8.1](volume-authority.md#81-disk-create)属于 planner policy，不由A20建立scheduler
-row或reservation。planner必须用上面的完整 assigned specs/full observation计算其策略所需占用事实；静态
-Host capacity若由provisioner提供，只能读既有provisioner authority，不能回退legacy Node heartbeat或把
-Node自报数字变成第二authority。A20 snapshot只是可失效的pre-transaction plan；Cat create commit后事实
-变化按Runtime既有 `PlacementRejected -> new revision`闭合。
+具体Node排序、静态schedulable/capability来源、capacity估算和NetworkConfig地址选择由
+[Runtime Placement Policy v1](runtime-placement-policy-v1.md)唯一冻结，不由A20建立scheduler row或
+reservation。A23在同一个`REPEATABLE READ READ ONLY`transaction和同一个DB now中，以keyset page 64把
+current policy与上面的完整snapshot组合；不能先读policy、随后为A20另开snapshot。planner必须用完整assigned
+specs/full observation计算占用和network residue，不能回退legacy Node heartbeat或把Node自报数字变成
+第二authority。A20 snapshot只是可失效的pre-transaction plan；Cat create commit后事实变化按Runtime既有
+`PlacementRejected -> new revision`闭合。
 
-当前 `CatCreatePlan`必须携带上述完整 `PlacementAdmissionSnapshot`加 exact `NetworkConfig`，而不是只摘出
-NodeIdentity/AgentSession/attestation三项让service误以为已检查 freshness。service仍逐字段验证完整binding；
-它不接受 planner 自报 boolean。
+当前 `CatCreatePlan`必须携带A23的完整`PlacementPolicySnapshot`（其中包含上述
+`PlacementAdmissionSnapshot`）、policy revision和exact `NetworkConfig`，而不是只摘出
+NodeIdentity/AgentSession/attestation三项让service误以为已检查freshness。service仍逐字段验证完整binding；
+它不接受planner自报boolean。
 Cat create事务在name free且将写新Desired的分支，必须先以candidate NodeIdentity作为每Node assigned-set唯一
-coordination row取得`FOR UPDATE`，再在同一事务重载并逐字段比较完整snapshot，随后才可锁Volume/Disk/Desired/
-Operation；合法same-name 409分支不改变Desired，只保存exact result，因此不读取或锁定这份可失效plan。
+coordination row取得`FOR UPDATE`，再在同一事务重载并逐字段比较完整policy/admission snapshot、重算capacity
+与network probe，随后才可锁Volume/Disk/Desired/Operation；合法same-name 409分支不改变Desired，只保存exact
+result，因此不读取或锁定这份可失效plan。
 该409分支仍按Volume Authority既有顺序锁定并验证existing Cat graph；“不消费plan”不允许把existing graph
 降成unlocked snapshot，也不允许在并发Destroy赢得Volume锁后缓存一个假的name conflict。
 

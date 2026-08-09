@@ -80,7 +80,7 @@ PostgreSQL DesiredRuntimeSpec(revision)
 | Node restart | 测试能重新打开部分子进程，但生产 unit 仍会随 Agent cgroup 杀进程，且无 Host 排他锁 | per-Cat scope、union enumeration、Host lock 后才宣称可接管 |
 | HA | 多副本/RDS/RDS Proxy结构已存在；双节点Cold迁移有真机证据；当前Store会同步串行慢DB调用 | 异步有界DB执行；真实control-plane takeover、RDS failover和自动Host fence验收 |
 | PersistentDisk | 当前只把raw virtio设备和`mount_path`送到Node，没有filesystem identity或Guest mount结果 | ext4 UUID、一次性format authority和mounted observation |
-| Guest network | per-Cat tap、owning-node HTTP/WebSocket bridge与dev E2E已存在 | 真实CH/生产WebSocket资格证据与跨Node overlay仍缺失 |
+| Placement/Guest network | legacy `nodes` capacity与Node本地CIDR/FNV仍存在；per-Cat tap和dev E2E已存在 | A23 policy/planner/exact Desired network尚未实现；真实CH资格证据与跨Node overlay仍缺失 |
 
 ### 3.2 组件职责
 
@@ -107,7 +107,8 @@ PostgreSQL DesiredRuntimeSpec(revision)
   边界是本地`L`和远端`R`，与lifecycle消息无关。
 - **Usage**：Node从Cat专属cgroup读取单调累计量，经durable spool/delivery进入projection；
   支付提供商和展示缓存都不是ledger authority。
-- **Admin/fleet**：cordon/drain只产生受版本保护的desired变化；跨Node恢复仍受route drain、
+- **Admin/fleet**：provisioner用[ADR-0043](decisions/0043-provisioner-owned-runtime-placement-policy.md)
+  的signed/revisioned policy声明capacity/capability/CIDR；cordon/drain只产生受版本保护的变化；跨Node恢复仍受route drain、
   `R == L`、lease release或HostFenceEvent约束。
 
 ## 4. 简单的权威边界
@@ -117,6 +118,7 @@ PostgreSQL DesiredRuntimeSpec(revision)
 | 事实 | 唯一权威 | 其他副本的地位 |
 |---|---|---|
 | 用户意图、完整 runtime spec、目标状态、placement | PostgreSQL `DesiredRuntimeSpec` | Node 只缓存当前 revision |
+| Node schedulable、allocatable capacity、production capability、Guest IPv4 pool | PostgreSQL `NodePlacementPolicy`，只由provisioner/admin CAS | heartbeat、legacy node row和Node自报数字无权修改 |
 | covered Workspace product API请求重放与不可变结果、Operation 与审计 | PostgreSQL `ApiIdempotencyResult` / Control rows | 日志不是恢复依据；其他domain沿用自己的identity |
 | VMM/blockd/Guest/snapshot 是否真实存在 | Node 新鲜物理枚举和协议握手 | PostgreSQL 只保存 observation |
 | 当前恢复步骤 | 每 Cat 一个原子替换的 `RuntimeCheckpoint` | 只是一条有界恢复线索，不覆盖物理事实 |
@@ -184,7 +186,8 @@ Endpoint mutation与新的完整desired revision、`route_epoch`和hostname look
 PostgreSQL事务提交。`route_epoch`是per-Endpoint serving lineage：binding变化递增；任何gate实际
 close后重开也必须由fresh Desired递增。未变Endpoint不因其他Endpoint mutation重绑或中断。
 lookup只定位current revision，不成为另一份Endpoint authority。Running请求
-只有先选定placement才能提交；无容量时API直接返回容量不足，不留下半个desired。
+只有按[Runtime Placement Policy v1](specs/runtime-placement-policy-v1.md)在同一snapshot选定placement、capacity
+和exact NetworkConfig才能提交；无可选Node时API返回`placement_unavailable`，不留下半个desired。
 
 相同workspace/route/key和request fingerprint返回原不可变HTTP response；异步response只引用原
 `operation_id`，Operation的当前phase/status仍只由Operation row权威持有。异payload fail closed。
@@ -213,8 +216,8 @@ Desired image、immutable size、attachment/epoch、blank和由manifest/Map编�
 blockd只可先开放Host control socket；exact target确认前没有Guest device或VMM。RPC不明时只读Volume head，
 exact target成功、exact blank重试同transition，其他head/owner/epoch fail closed；没有第二个receipt。
 
-tap/subnet、kernel-NBD slot和vhost-user socket按Host inventory在Host resource lock下分配，
-exact identity先写checkpoint。容量耗尽是明确placement failure；cleanup只删除ownership token与
+tap name/ownership token、kernel-NBD slot和vhost-user socket按Host inventory在Host resource lock下分配，
+Guest subnet/MAC/gateway只消费Desired exact NetworkConfig。exact identity先写checkpoint。容量耗尽是明确placement failure；cleanup只删除ownership token与
 物理identity同时匹配的资源，不按Cat hash重算名字后先删。
 
 新 VMM 进程创建前生成 `runtime_incarnation`。Warm restore 创建新 VMM，因此也产生新
@@ -424,7 +427,7 @@ HostRejoinProof把event持久转为Rejoined后才恢复网络，此后未消费�
 
 | 模块 | 负责 | 核心模型或算法 | 依赖 |
 |---|---|---|---|
-| A. Control truth | DesiredSpec、ApiIdempotencyResult、Operation、Endpoint revision、NodeIdentity、AgentSession、observation | PostgreSQL事务、revision CAS、周期扫描 | 共享身份/错误闭集 |
+| A. Control truth | DesiredSpec、ApiIdempotencyResult、Operation、Endpoint revision、NodeIdentity、NodePlacementPolicy、AgentSession、observation | PostgreSQL事务、revision CAS、keyset placement、周期扫描 | 共享身份/错误闭集 |
 | B. Node convergence | Host lock、per-Cat reconciler、checkpoint、scope、inventory、Host资源分配 | inspect -> plan one step -> persist -> act -> verify | A的revision/session |
 | C. Volume and disk | RWO lease、逐卷takeover、pack lineage、ext4、snapshot、delete | transition-id CAS、`R/L`屏障、Cold-only磁盘变化 | A的disk intent、B的checkpoint |
 | D. Route and work admission | Endpoint lookup、Grant、Gateway cache、Node gate/guard、RequireIdle | signer一致快照、pre-admission verify、AdmissionCell线性化 | A、B，且C mount Ready |

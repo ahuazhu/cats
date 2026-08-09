@@ -859,8 +859,9 @@ resource的fast lookup。exact hit逐byte重放且不得读取image、release re
    用该node构造`AssignedPlacement {kind:"assigned", node_id:planner node_id, placement_epoch:1}`，
    NetworkConfig的`network_id`逐字段
    等于本批candidate network ID，地址/MAC满足Runtime §3。
-   具体Node排序、capacity估算和地址选择算法不属于共享合同；planner结果只是可失效的pre-transaction plan，
-   不创建capacity reservation、network lease、scheduler row或第二authority。无可选Node/config时不创建
+   具体Node排序、capacity估算、provisioner authority和地址选择算法只由
+   [Runtime Placement Policy v1](runtime-placement-policy-v1.md)冻结；planner结果只是可失效的
+   pre-transaction plan，不创建capacity reservation、network lease、scheduler row或第二authority。无可选Node/config时不创建
    Desired/Operation。commit后Node/capacity/address事实变化由既有
    `PlacementRejected(insufficient_vcpus|insufficient_memory|unsupported_block_path|unsupported_network|
    unsupported_guest_capability)`
@@ -944,7 +945,7 @@ candidate资源锁前，Store直接丢弃本次bundle/envelope并逐字节返回
 0::BIGINT))`，其中`$1=workspace_id`、`$2=name`。
 `Id`中的冒号或64-bit hash碰撞最多让不同名称额外串行，不会让相同tuple得到不同lock。持锁后读取并验证
 `CatRecord`：合法existing row按上述existing graph锁序闭合后选择409，并且不消费可失效的placement plan；absent才按
-NodeIdentity（锁内重验完整`PlacementAdmissionSnapshot`）→Volume→Cat→Disk→Desired→EndpointRecord/
+NodeIdentity（锁内重验A23完整policy/admission、capacity与network probe）→Volume→Cat→Disk→Desired→EndpointRecord/
 hostname lookup→Operation锁/插入；corrupt row
 返回BackendUnknown。唯一约束只作invariant backstop，意外constraint error整体回滚，不能事后翻译成409。
 首次持久化的Operation固定为`phase=Pending, terminal=null`，其workspace/cat/revision/spec digest/placement/

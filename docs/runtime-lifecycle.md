@@ -173,6 +173,10 @@ V1 只有 Cold migration，同样使用两个普通 revision：
 2. A 成功后，revision B 提高 placement epoch、指向目标 Node，并恢复迁移前目标（通常
    Running）。目标使用新 attachment identity 做 normal acquire，从 remote roots 启动。
 
+revision B的target policy/capacity与fresh `NetworkConfig`按
+[Runtime Placement Policy v1](specs/runtime-placement-policy-v1.md)重新计划；即使两端CIDR或地址碰巧相同，
+也不能复用source `network_id`或原地修改旧revision。
+
 源未证明 Cold 时不创建 B；整个过程始终只有当前 Desired revision 是 authority。
 
 ### 5.3 Node 网络分区

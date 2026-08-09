@@ -18,7 +18,7 @@ artifact与单一Guest release payload见
 
 ## 当前实现与目标
 
-决策状态和实现状态是两回事。2026-08-08 的准确边界：
+决策状态和实现状态是两回事。2026-08-09 的准确边界：
 
 | 范围 | 当前 Rust/部署 | 已接受目标 |
 |---|---|---|
@@ -28,7 +28,7 @@ artifact与单一Guest release payload见
 | Agent restart | full JSON ledger/adoption局部存在；无 Host lock，生产 unit仍可能连带终止 runtime | per-Cat scopes、union inventory、crash-safe checkpoint后才具备接管 |
 | 控制面 HA | PostgreSQL、多副本、RDS Proxy/leadership已实现；当前Store同步串行慢DB调用 | AgentSession、异步有界DB执行、真实Pod takeover、RDS failover和Host fence |
 | PersistentDisk | raw virtio attach和`mount_path`存在，没有fs UUID/format/mounted result | ext4-only mount readiness闭环 |
-| 网络 | per-Cat tap与owning-node HTTP/WebSocket dev路径 | 跨Node overlay和真实CH/生产WebSocket资格证据 |
+| placement/网络 | legacy Node capacity与本地CIDR/FNV仍存在；per-Cat tap与owning-node dev路径 | ADR-0043 provisioner policy、同snapshot planner与exact Desired network；跨Node overlay仍deferred |
 | privilege | 进程权限仍较集中 | privilege separation尚未实现 |
 
 协调面按 [Operations and HA §8](operations-ha.md#8-首次终态部署)一次 clean-slate 切换：离线验证
@@ -61,6 +61,7 @@ AdmissionCell。它们由同一个vertical cutover合同和故障矩阵收敛。
 | [Agent Registration and Internal Transport v1](specs/agent-registration-transport-v1.md) | Frozen target，未实现 | per-Node签名、注册wire、lease与Guest receipt部署路径 |
 | [Runtime Inventory and Observation Spine v1](specs/runtime-inventory-observation-v1.md) | Frozen target，未实现 | Desired read-position、inventory/observation接受与freshness |
 | [Runtime Composition Artifacts v1](specs/runtime-composition-artifacts-v1.md) | Frozen target，未实现 | local NodeIdentity artifact与单一Guest release payload |
+| [Runtime Placement Policy v1](specs/runtime-placement-policy-v1.md) | Frozen target，未实现 | provisioner-owned capacity/capability/CIDR、keyset planner与exact `/30` allocation |
 | [Immutable Image Manifest Read v1](specs/immutable-image-manifest-read-v1.md) | Frozen target，未实现 | golden manifest唯一DTO、canonical bytes、有界读取与Control只读组合 |
 | [Runtime Volume Transitions v1](specs/runtime-volume-transitions-v1.md) | Frozen target，未实现 | Node签名mutation、Control单事务卷转换与authorization evidence read |
 | [Route Grant v2](specs/route-grant-v2.md) | Target，未实现 | ADR-0041切换合同；固定向量待实现时重建 |
@@ -115,6 +116,7 @@ AdmissionCell。它们由同一个vertical cutover合同和故障矩阵收敛。
 - [0038 production cell qualification](decisions/0038-production-account-qualification-cell-boundary.md)
 - [0040 level-triggered runtime reconciliation](decisions/0040-level-triggered-runtime-reconciliation.md)
 - [0041 Node-verified route admission](decisions/0041-node-verified-route-admission.md)
+- [0043 Provisioner-owned runtime placement policy](decisions/0043-provisioner-owned-runtime-placement-policy.md)
 
 ### Deferred
 

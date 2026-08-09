@@ -133,14 +133,18 @@ provisioner是唯一创建者，顺序固定为：
 3. 完整验证incomplete set的closed files、bytes、cross-binding和metadata，fsync每个file descriptor和directory，
    再按§2.2 atomic directory rename为fixed initial complete recovery set并fsync parent。三件套在任何Control
    write前已经是same-filesystem durable exact recovery source；
-4. 在Control Store用同一NodeIdentity执行幂等provision；response不明时只查询或重放同一个对象，不能生成key；
+4. 通过[Runtime Placement Policy §3](runtime-placement-policy-v1.md#3-provisioner-apply)的
+   signed node-authority route，把同一NodeIdentity与revision-1 cordoned policy原子provision；response不明时
+   只重放same apply ID/request/private key，不能生成identity、key或policy；
 5. 从durable recovery descriptors复制private key和credential ID到active parent内exclusive temporary files，
    fsync temp后以no-replace atomic rename激活，再fsync active file和parent；不能rename或删除recovery source；
 6. 最后用相同步骤复制并激活`node-identity.v1.json`作为local complete marker，再fsync file和parent；
-7. 从active paths重新执行§2.1/§2.2全部验证，创建并保护identity-selected state path。Control row、active
-   三件套和state path全部exact后才durably删除recovery directory并允许启动Node service。
+7. 从active paths重新执行§2.1/§2.2全部验证，创建并保护identity-selected state path。Control identity +
+   cordoned policy rows、active三件套和state path全部exact后才durably删除recovery directory并允许启动Node
+   service。
 
-complete marker之后任一步response/crash不明时只能exact replay同一个NodeIdentity和同一key/credential bytes。
+complete marker之后任一步response/crash不明时只能把同一个NodeIdentity和同一key/credential bytes与central
+IaC已durable保存的same A23 apply ID/policy request组合做exact replay。
 marker之前且Control未写的partial generation按§2.2安全清理并重新开始。目标active path缺失时只从已经durable的
 fixed complete recovery set继续安装；已存在且bytes、派生SPKI和metadata全部exact时视为已完成；任一不等都
 fail closed，不覆盖、删除、重新生成key或创建第二个Control identity。Control write之后的每个crash window都
@@ -151,7 +155,12 @@ Control已有row当作从网络重建旧private key的理由。
 
 credential rotation不改变`node_id`、`immutable_host_id`或`state_path_id`：
 
-1. Node先cordon、drain、停止，确认没有pending registration attempt；
+Control-side CAS transport、provisioner signature、apply replay和policy/assigned-set前置条件由
+[Runtime Placement Policy §3](runtime-placement-policy-v1.md#3-provisioner-apply)冻结；本节只
+冻结old/new local private-half的crash-safe安装顺序。
+
+1. Node先cordon、drain、停止，确认没有pending registration attempt，并等到A23 Store以DB now证明current
+   AgentSession absent/expired；
 2. provisioner从active descriptors复制完整old三件套到fixed incomplete recovery directory，逐byte/cross-binding
    验证，并按§2.2逐file/directory fsync、atomic rename为fixed old complete recovery directory并fsync parent；
    这是reverse CAS后的唯一old private-half恢复源；
@@ -175,7 +184,8 @@ descriptors复制/atomic安装完整old三件套、artifact最后、逐步fsync�
 必须先用new recovery set恢复并按A19重放同一pending attempt，不能丢弃它后反向CAS。任何窗口都只有一把Control
 认可的key。
 
-retire只在Control Store把同一NodeIdentity变为`retired`并永久保留lineage；local artifact可以留作诊断，
+retire只通过A23 same node-authority apply在Control Store把同一NodeIdentity变为`retired`，并永久保留lineage、
+最后policy和apply result；local artifact可以留作诊断，
 但不能恢复eligibility。换Host、换state path、重装为新lineage或重新provision必须使用全新的`node_id`、
 `immutable_host_id`/`state_path_id`组合和新的credential。只有旧identity已retire且provider证明旧Host/state
 storage不能再运行后，provisioner才可安全清理旧Host文件；不得把新lineage覆盖到旧artifact后复用旧Node。
@@ -296,10 +306,13 @@ Node deploy只在已经cordon、drain且`cats=0/orphans=0`后激活新payload：
    时只有closed bytes和metadata全部exact才视为幂等完成，否则fail closed；
 5. 对manifest、receipt、kernel和可选initramfs分别使用same-filesystem temporary file + atomic rename +
    parent fsync；null initramfs必须原子移走旧active initramfs；
-6. 从active exact paths重新读取并验证整个集合与staged release ID一致后才start Node；Node startup再独立
-   执行A19 §8.2，成功注册前所有gate仍Closed；
-7. 任一install/start验证失败时保持Node停止，用保存的完整previous set执行同一原子逐文件安装和整体验证，
-   只在previous set完整自洽时restart。rollback失败则保持停止、cordoned并告警，不能混搭新旧member。
+6. 从active exact paths重新读取并验证整个集合与staged release ID一致；随后用A23 expected policy revision
+   CAS更新仍cordoned policy的exact `guest_config_digest`及本次同时部署的其他capability，response不明只重放
+   same apply。此时assigned set仍为空；
+7. policy与active set逐字段相同后才start Node；Node startup再独立执行A19 §8.2，成功注册前所有gate仍Closed；
+8. 任一install/start验证失败时保持Node停止，用保存的完整previous set执行同一原子逐文件安装和整体验证，
+   并以fresh apply ID/expected current policy revision把capability反向CAS到previous exact值；只在previous
+   set/policy完整自洽时restart。rollback失败则保持停止、cordoned并告警，不能混搭新旧member。
 
 多文件切换不是一个filesystem rename事务，因此安全线性化点是“service停止后，active完整集合重新验证
 成功，再允许start”。crash可留下mixed files，但systemd不能在未先运行同一validator的情况下启动Node；

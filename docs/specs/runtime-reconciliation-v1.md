@@ -338,6 +338,9 @@ V1每Cat使用一个`/30`，`guest_ipv4`与`gateway_ipv4`必须属于同一子�
 broadcast address。`guest_mac`必须是locally administered unicast MAC。Host tap名字和ownership token
 是物理inventory事实，不进入Desired；它们由Node分配并通过§10.2 observation闭合。`network_id`是
 该Guest-facing配置的稳定identity，创建后不复用；地址/MAC变化必须使用新`network_id`和新revision。
+production `/30`来源、slot/MAC算法与安全复用只由
+[Runtime Placement Policy v1](runtime-placement-policy-v1.md)定义。Node必须消费上述exact字段，不得从
+cat ID、FNV或本地CIDR重新推导；跨Node placement总是fresh network ID/config和更高revision。
 
 一个 revision 是完整快照，不读取旧 revision 也能解释。数组按稳定 identity 排序且不能重复；
 `volumes`按`volume_intent_id`、`endpoints`按`endpoint_id`严格升序。`spec_digest`覆盖除自身外的
@@ -569,7 +572,8 @@ status/content-type/body，同key异fingerprint返回`IdempotencyConflict`。只
 tuple；跨Workspace miss回滚reservation且零持久副作用。首次执行的业务变化和最终result同一commit，
 不保留持久Pending；无法提交事务时二者都不存在。V1已提交result不因resource或Operation删除而GC。
 
-1. API 在创建 revision 前完成合法性、Cold-only 和 placement/capacity 检查。无法选择 Node
+1. API 在创建 revision 前按[Runtime Placement Policy v1](runtime-placement-policy-v1.md)完成合法性、
+   Cold-only、placement/capacity和network检查。无法选择 Node
    时不创建 Desired 或 Operation；选中的 placement 与完整 spec/Operation 在同一事务提交。
 2. 完整 spec、精确绑定它的 Operation与API result在同一 PostgreSQL 事务写入。同key重放返回
    同一不可变HTTP response；异步response包含原`operation_id`，但不复制Operation的可变phase或status。
@@ -620,7 +624,7 @@ candidate，不能产生第二种持久409。
 业务事务先固定为`API key -> CatNameLock(workspace_id,name)`并闭合分支：锁后existing合法Cat按既有
 Volume→Cat→Disk→Desired→Endpoint/lookup→Operation锁序闭合existing graph后只写fixed 409 result，不读取或
 锁定candidate plan/NodeIdentity；absent且会插入Desired的success分支才继续
-`NodeIdentity + 锁内完整admission重验 -> Volume -> Cat -> Disk -> Desired -> Endpoint/hostname lookup ->
+`NodeIdentity + 锁内完整policy/admission/capacity/network重验 -> Volume -> Cat -> Disk -> Desired -> Endpoint/hostname lookup ->
 Operation`。name lock是transaction-scoped advisory coordination，不是持久row；不能依赖unique-violation后的
 已回滚事务补写result。旧plan后发生合法占名仍选409，name free时的session/identity/inventory/assigned-set变化
 则必须零业务row、零result fail closed。
