@@ -969,10 +969,52 @@ pub async fn sitemap() -> Response {
 mod tests {
     use std::collections::BTreeSet;
 
-    use super::{
-        ADMIN_GUIDE, ADMIN_HTML, ADMIN_JS, COMMON_JS, DOCS, I18N_JS, LANDING_EN, LANDING_ZH,
-        USER_HTML, USER_JS,
+    use axum::body::to_bytes;
+    use axum::extract::OriginalUri;
+    use cats_api::runtime_reconciliation::{
+        RUNTIME_INTERNAL_ROUTE_NOT_FOUND_BODY, RUNTIME_INTERNAL_ROUTE_NOT_FOUND_ROBOTS,
+        RUNTIME_VOLUME_TRANSITION_PATH,
     };
+
+    use super::{
+        not_found, ADMIN_GUIDE, ADMIN_HTML, ADMIN_JS, COMMON_JS, DOCS, I18N_JS, LANDING_EN,
+        LANDING_ZH, USER_HTML, USER_JS,
+    };
+
+    #[tokio::test]
+    async fn runtime_unmatched_route_fallback_has_the_shared_exact_shape() {
+        let response =
+            not_found(OriginalUri(RUNTIME_VOLUME_TRANSITION_PATH.parse().unwrap())).await;
+        assert_eq!(response.status(), axum::http::StatusCode::NOT_FOUND);
+        assert_eq!(
+            response
+                .headers()
+                .get(axum::http::header::CONTENT_TYPE)
+                .unwrap(),
+            "application/json"
+        );
+        assert_eq!(
+            response
+                .headers()
+                .get(axum::http::header::CACHE_CONTROL)
+                .unwrap(),
+            "no-store"
+        );
+        assert_eq!(
+            response.headers().get("x-robots-tag").unwrap(),
+            RUNTIME_INTERNAL_ROUTE_NOT_FOUND_ROBOTS
+        );
+        assert_eq!(
+            to_bytes(
+                response.into_body(),
+                RUNTIME_INTERNAL_ROUTE_NOT_FOUND_BODY.len()
+            )
+            .await
+            .unwrap()
+            .as_ref(),
+            RUNTIME_INTERNAL_ROUTE_NOT_FOUND_BODY
+        );
+    }
 
     fn quoted_keys(source: &str, prefix: &str) -> BTreeSet<String> {
         let mut keys = BTreeSet::new();

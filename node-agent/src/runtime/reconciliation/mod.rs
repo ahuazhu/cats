@@ -64,9 +64,9 @@ pub use inventory::{
 };
 pub use normal_acquire::{
     recover_normal_acquire_from_authority, A19SignedVolumeTransitionTransport,
-    ControlSignedNormalAcquireClient, NormalAcquireAttempt, NormalAcquireAuthorityRecovery,
-    NormalAcquireClientError, RuntimeVolumeTransitionHttpClient, SignedVolumeTransitionResponse,
-    VolumeTransitionTransportFailure,
+    ControlSignedNormalAcquireClient, NormalAcquireAcceptedContext, NormalAcquireAttempt,
+    NormalAcquireAuthorityRecovery, NormalAcquireClientError, RuntimeVolumeTransitionHttpClient,
+    SignedVolumeTransitionResponse, VolumeTransitionTransportFailure,
 };
 pub use root_provision::{
     AuthorityRereadRequired, RootProvisionClientError, RootProvisionControlPort,

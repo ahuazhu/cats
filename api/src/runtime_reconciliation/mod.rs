@@ -29,6 +29,12 @@ pub const OBSERVATION_PATH: &str = "/v1/internal/runtime/observations";
 pub const RUNTIME_VOLUME_TRANSITION_PATH: &str = "/v1/internal/runtime/volume-transitions";
 pub const RUNTIME_VOLUME_TRANSITION_EVIDENCE_PATH: &str =
     "/v1/internal/runtime/volume-transition-evidence";
+/// Exact product-router fallback body for an unmatched `/v1/...` route.
+/// Runtime clients use the whole shape (status, headers and these bytes) to
+/// distinguish a deployment mismatch from an HTML/plain proxy response.
+pub const RUNTIME_INTERNAL_ROUTE_NOT_FOUND_BODY: &[u8] =
+    br#"{"code":"not_found","message":"route not found"}"#;
+pub const RUNTIME_INTERNAL_ROUTE_NOT_FOUND_ROBOTS: &str = "noindex, nofollow, noarchive";
 
 pub(crate) use canonical::value_bytes as canonical_json_value_bytes;
 

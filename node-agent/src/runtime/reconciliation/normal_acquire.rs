@@ -15,14 +15,16 @@ use cats_api::agent_registration::{
 };
 use cats_api::runtime_reconciliation::{
     decode_runtime_volume_transition_error, decode_runtime_volume_transition_success,
-    encode_runtime_volume_transition_request, AcquireOrigin, ContractErrorDetail, ContractName,
-    DiskKind, NormalAcquireRequest, NormalAcquireResult, RuntimeSpineHttpProblem,
-    RuntimeVolumeAuthorityRejection, RuntimeVolumeTransition, RuntimeVolumeTransitionError,
-    RuntimeVolumeTransitionErrorDetail, RuntimeVolumeTransitionOutcome,
-    RuntimeVolumeTransitionRequest, VolumeAccess, VolumeAcquire, VolumeAcquireRequest,
-    VolumeAdminState, VolumeDisposition, VolumeIntent, VolumeRecord, RUNTIME_SPINE_METHOD,
-    RUNTIME_VOLUME_TRANSITION_ERROR_MAX_WIRE_BYTES, RUNTIME_VOLUME_TRANSITION_PATH,
-    RUNTIME_VOLUME_TRANSITION_SUCCESS_MAX_WIRE_BYTES,
+    encode_runtime_volume_transition_request, AcquireOrigin, AdmissionInventoryAttestation,
+    AgentSession, ContractErrorDetail, ContractName, DiskKind, NormalAcquireRequest,
+    NormalAcquireResult, RuntimeSpineHttpProblem, RuntimeVolumeAuthorityRejection,
+    RuntimeVolumeTransition, RuntimeVolumeTransitionError, RuntimeVolumeTransitionErrorDetail,
+    RuntimeVolumeTransitionOutcome, RuntimeVolumeTransitionPreconditionProblem,
+    RuntimeVolumeTransitionRequest, SessionBinding, VolumeAccess, VolumeAcquire,
+    VolumeAcquireRequest, VolumeAdminState, VolumeDisposition, VolumeIntent, VolumeRecord,
+    RUNTIME_INTERNAL_ROUTE_NOT_FOUND_BODY, RUNTIME_INTERNAL_ROUTE_NOT_FOUND_ROBOTS,
+    RUNTIME_SPINE_METHOD, RUNTIME_VOLUME_TRANSITION_ERROR_MAX_WIRE_BYTES,
+    RUNTIME_VOLUME_TRANSITION_PATH, RUNTIME_VOLUME_TRANSITION_SUCCESS_MAX_WIRE_BYTES,
 };
 use cats_storage::authority::{
     validate_authorized_serving_attachment, validate_authorized_serving_record,
@@ -64,11 +66,23 @@ pub enum NormalAcquireAttempt {
     Granted(Box<AuthorizedServingAttachment>),
     RetryExact,
     RefreshInventory,
+    ReplanDesired,
     SessionReplacementRequired,
+    IdentityRepairRequired,
     AuthorityRejected(RuntimeVolumeAuthorityRejection),
     StopForLocalContract,
     StopForDeploymentMismatch,
     Ambiguous,
+}
+
+/// The exact accepted A20 context against which a closed A22 rejection can be
+/// interpreted. The mutation body intentionally does not duplicate these
+/// session/attestation fields, so accepting a 409 without this context would
+/// let a syntactically valid error for another full inventory drive this Cat.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NormalAcquireAcceptedContext {
+    pub session: AgentSession,
+    pub inventory_attestation: AdmissionInventoryAttestation,
 }
 
 /// Direct strict-authority resolution after an ambiguous normal acquire.
@@ -85,6 +99,8 @@ pub enum NormalAcquireClientError {
     InvalidRequest(cats_api::runtime_reconciliation::ContractError),
     #[error("normal-acquire request is not exactly bound to the supplied root VolumeIntent")]
     InvalidVolumeBinding,
+    #[error("normal-acquire request is not exactly bound to one accepted full A20 context")]
+    InvalidAcceptedContext,
 }
 
 #[derive(Debug, Clone)]
@@ -110,11 +126,13 @@ where
         &self,
         request: &RuntimeVolumeTransitionRequest,
         volume: &VolumeIntent,
+        accepted: &NormalAcquireAcceptedContext,
         deadline: Instant,
     ) -> Result<NormalAcquireAttempt, NormalAcquireClientError> {
         let body = encode_runtime_volume_transition_request(request)
             .map_err(NormalAcquireClientError::InvalidRequest)?;
         let normal = validate_local_normal_request(request, volume)?;
+        validate_accepted_context(request, accepted)?;
         let response = match self.transport.post_a19_signed_json(
             RUNTIME_VOLUME_TRANSITION_PATH,
             &body,
@@ -139,7 +157,7 @@ where
                 let Ok(error) = decode_runtime_volume_transition_error(&body) else {
                     return Ok(NormalAcquireAttempt::Ambiguous);
                 };
-                Ok(map_closed_error(status, &error, request, volume))
+                Ok(map_closed_error(status, &error, request, volume, accepted))
             }
             SignedVolumeTransitionResponse::PlainRouteNotFound => {
                 Ok(NormalAcquireAttempt::StopForDeploymentMismatch)
@@ -284,6 +302,30 @@ fn validate_local_normal_request<'a>(
     Ok(acquire)
 }
 
+fn validate_accepted_context(
+    request: &RuntimeVolumeTransitionRequest,
+    accepted: &NormalAcquireAcceptedContext,
+) -> Result<(), NormalAcquireClientError> {
+    let session = &accepted.session;
+    let session_binding = SessionBinding {
+        node_id: session.node_id.clone(),
+        node_boot_id: session.node_boot_id.clone(),
+        agent_instance_id: session.agent_instance_id.clone(),
+        agent_session_epoch: session.agent_session_epoch,
+    };
+    let attestation = &accepted.inventory_attestation;
+    if session.version != request.version
+        || session_binding != request.session
+        || attestation.version != request.version
+        || attestation.node_id != session.node_id
+        || attestation.agent_session_epoch != session.agent_session_epoch
+        || attestation.accepted_at_unix_ms >= session.lease_deadline_unix_ms
+    {
+        return Err(NormalAcquireClientError::InvalidAcceptedContext);
+    }
+    Ok(())
+}
+
 fn exact_success_attachment(
     request: &RuntimeVolumeTransitionRequest,
     volume: &VolumeIntent,
@@ -370,25 +412,56 @@ fn map_closed_error(
     error: &RuntimeVolumeTransitionError,
     request: &RuntimeVolumeTransitionRequest,
     volume: &VolumeIntent,
+    accepted: &NormalAcquireAcceptedContext,
 ) -> NormalAcquireAttempt {
     match (status, error.error.as_ref()) {
         (401, RuntimeVolumeTransitionErrorDetail::AuthenticationFailed)
         | (403, RuntimeVolumeTransitionErrorDetail::IdentityNotEligible) => {
-            NormalAcquireAttempt::SessionReplacementRequired
+            NormalAcquireAttempt::IdentityRepairRequired
         }
-        (409, RuntimeVolumeTransitionErrorDetail::TransitionPreconditionFailed { cat_id, .. })
-            if cat_id == &request.cat_id =>
-        {
-            NormalAcquireAttempt::RefreshInventory
-        }
+        (
+            409,
+            RuntimeVolumeTransitionErrorDetail::TransitionPreconditionFailed { cat_id, problem },
+        ) if cat_id == &request.cat_id => match problem {
+            RuntimeVolumeTransitionPreconditionProblem::InventorySessionReplaced
+            | RuntimeVolumeTransitionPreconditionProblem::InventoryStale => {
+                NormalAcquireAttempt::RefreshInventory
+            }
+            RuntimeVolumeTransitionPreconditionProblem::VolumeIntentMismatch => {
+                NormalAcquireAttempt::ReplanDesired
+            }
+            RuntimeVolumeTransitionPreconditionProblem::CleanupEvidenceMismatch
+            | RuntimeVolumeTransitionPreconditionProblem::AuthorizationBranchConflict => {
+                NormalAcquireAttempt::Ambiguous
+            }
+        },
         (
             409,
             RuntimeVolumeTransitionErrorDetail::VolumeAuthorityRejected { volume_id, reason },
         ) if volume_id == &volume.volume_id => NormalAcquireAttempt::AuthorityRejected(*reason),
         (409, RuntimeVolumeTransitionErrorDetail::ContractError { contract_error })
-            if session_error_binds_request(contract_error.error.as_ref(), request) =>
+            if guest_config_error_binds_request(
+                contract_error.error.as_ref(),
+                request,
+                accepted,
+            ) =>
+        {
+            NormalAcquireAttempt::IdentityRepairRequired
+        }
+        (409, RuntimeVolumeTransitionErrorDetail::ContractError { contract_error })
+            if session_error_binds_request(contract_error.error.as_ref(), request, accepted) =>
         {
             NormalAcquireAttempt::SessionReplacementRequired
+        }
+        (409, RuntimeVolumeTransitionErrorDetail::ContractError { contract_error })
+            if inventory_error_binds_request(contract_error.error.as_ref(), request, accepted) =>
+        {
+            NormalAcquireAttempt::RefreshInventory
+        }
+        (409, RuntimeVolumeTransitionErrorDetail::ContractError { contract_error })
+            if desired_error_binds_request(contract_error.error.as_ref(), request) =>
+        {
+            NormalAcquireAttempt::ReplanDesired
         }
         (429, RuntimeVolumeTransitionErrorDetail::NodeRequestInFlight)
         | (500, RuntimeVolumeTransitionErrorDetail::Internal)
@@ -401,8 +474,8 @@ fn map_closed_error(
             NormalAcquireAttempt::StopForLocalContract
         }
         (status, RuntimeVolumeTransitionErrorDetail::ContractError { contract_error })
-            if request_contract_error_binds(contract_error.error.as_ref())
-                && matches!(status, 400 | 409 | 413) =>
+            if contract_error_status(contract_error.error.as_ref()) == status
+                && request_contract_error_binds(contract_error.error.as_ref(), request) =>
         {
             NormalAcquireAttempt::StopForLocalContract
         }
@@ -410,10 +483,20 @@ fn map_closed_error(
     }
 }
 
-fn request_contract_error_binds(detail: &ContractErrorDetail) -> bool {
+fn request_contract_error_binds(
+    detail: &ContractErrorDetail,
+    request: &RuntimeVolumeTransitionRequest,
+) -> bool {
     match detail {
-        ContractErrorDetail::UnsupportedVersion { contract, .. }
-        | ContractErrorDetail::MalformedPayload { contract, .. }
+        ContractErrorDetail::UnsupportedVersion {
+            contract,
+            presented_version,
+            ..
+        } => {
+            *contract == ContractName::RuntimeVolumeTransitionRequest
+                && *presented_version == request.version
+        }
+        ContractErrorDetail::MalformedPayload { contract, .. }
         | ContractErrorDetail::LimitExceeded { contract, .. } => {
             *contract == ContractName::RuntimeVolumeTransitionRequest
         }
@@ -424,30 +507,142 @@ fn request_contract_error_binds(detail: &ContractErrorDetail) -> bool {
 fn session_error_binds_request(
     detail: &ContractErrorDetail,
     request: &RuntimeVolumeTransitionRequest,
+    accepted: &NormalAcquireAcceptedContext,
 ) -> bool {
     match detail {
-        ContractErrorDetail::MissingAgentSession { node_id }
-        | ContractErrorDetail::GuestConfigMismatch { node_id, .. } => {
-            node_id == &request.session.node_id
-        }
+        ContractErrorDetail::MissingAgentSession { node_id } => node_id == &request.session.node_id,
         ContractErrorDetail::StaleSession {
             node_id,
             presented_agent_session_epoch,
-            ..
-        }
-        | ContractErrorDetail::SessionExpired {
-            node_id,
-            agent_session_epoch: presented_agent_session_epoch,
-            ..
+            current_agent_session_epoch,
         } => {
             node_id == &request.session.node_id
                 && presented_agent_session_epoch == &request.session.agent_session_epoch
+                && current_agent_session_epoch > presented_agent_session_epoch
+        }
+        ContractErrorDetail::SessionExpired {
+            node_id,
+            agent_session_epoch: presented_agent_session_epoch,
+            lease_deadline_unix_ms,
+            server_time_unix_ms,
+        } => {
+            node_id == &request.session.node_id
+                && presented_agent_session_epoch == &request.session.agent_session_epoch
+                && lease_deadline_unix_ms == &accepted.session.lease_deadline_unix_ms
+                && server_time_unix_ms >= lease_deadline_unix_ms
         }
         ContractErrorDetail::WrongSession {
             expected,
             presented,
-        } => presented == &request.session && expected.node_id == request.session.node_id,
+        } => {
+            presented == &request.session
+                && expected.node_id == request.session.node_id
+                && expected != presented
+        }
         _ => false,
+    }
+}
+
+fn guest_config_error_binds_request(
+    detail: &ContractErrorDetail,
+    request: &RuntimeVolumeTransitionRequest,
+    accepted: &NormalAcquireAcceptedContext,
+) -> bool {
+    match detail {
+        ContractErrorDetail::GuestConfigMismatch {
+            node_id,
+            expected_guest_config_digest,
+            presented_guest_config_digest,
+        } => {
+            node_id == &request.session.node_id
+                && presented_guest_config_digest == &accepted.session.guest_config_digest
+                && expected_guest_config_digest != presented_guest_config_digest
+        }
+        _ => false,
+    }
+}
+
+fn inventory_error_binds_request(
+    detail: &ContractErrorDetail,
+    request: &RuntimeVolumeTransitionRequest,
+    accepted: &NormalAcquireAcceptedContext,
+) -> bool {
+    match detail {
+        ContractErrorDetail::MissingInventoryAttestation {
+            node_id,
+            agent_session_epoch,
+        } => {
+            node_id == &request.session.node_id
+                && agent_session_epoch == &request.session.agent_session_epoch
+        }
+        ContractErrorDetail::AssignedSetChanged {
+            node_id,
+            agent_session_epoch,
+            read_position,
+        } => {
+            node_id == &request.session.node_id
+                && agent_session_epoch == &request.session.agent_session_epoch
+                && read_position == &accepted.inventory_attestation.inventory_read_position
+        }
+        _ => false,
+    }
+}
+
+fn desired_error_binds_request(
+    detail: &ContractErrorDetail,
+    request: &RuntimeVolumeTransitionRequest,
+) -> bool {
+    match detail {
+        ContractErrorDetail::StaleRevision {
+            cat_id,
+            presented_revision,
+            current_revision,
+        } => {
+            cat_id == &request.cat_id
+                && presented_revision == &request.desired_revision
+                && current_revision > presented_revision
+        }
+        ContractErrorDetail::WrongRevision {
+            cat_id,
+            expected_revision,
+            presented_revision,
+        } => {
+            cat_id == &request.cat_id
+                && presented_revision == &request.desired_revision
+                && expected_revision != presented_revision
+        }
+        ContractErrorDetail::RevisionDigestConflict {
+            cat_id,
+            desired_revision,
+            expected_digest,
+            presented_digest,
+        } => {
+            cat_id == &request.cat_id
+                && desired_revision == &request.desired_revision
+                && presented_digest == &request.spec_digest
+                && expected_digest != presented_digest
+        }
+        ContractErrorDetail::WrongPlacement {
+            cat_id,
+            desired_revision,
+            expected,
+            presented,
+        } => {
+            cat_id == &request.cat_id
+                && desired_revision == &request.desired_revision
+                && presented == &request.placement
+                && expected != presented
+        }
+        _ => false,
+    }
+}
+
+fn contract_error_status(detail: &ContractErrorDetail) -> u16 {
+    match detail {
+        ContractErrorDetail::MalformedPayload { .. }
+        | ContractErrorDetail::UnsupportedVersion { .. } => 400,
+        ContractErrorDetail::LimitExceeded { .. } => 413,
+        _ => 409,
     }
 }
 
@@ -509,6 +704,10 @@ impl RuntimeVolumeTransitionHttpClient {
         let client = reqwest::blocking::Client::builder()
             .redirect(reqwest::redirect::Policy::none())
             .timeout(RESPONSE_TIMEOUT)
+            .no_gzip()
+            .no_brotli()
+            .no_deflate()
+            .no_zstd()
             .build()?;
         Ok(Self {
             origin,
@@ -548,6 +747,7 @@ impl A19SignedVolumeTransitionTransport for RuntimeVolumeTransitionHttpClient {
             .timeout(remaining)
             .header(reqwest::header::CONTENT_TYPE, JSON_CONTENT_TYPE)
             .header(reqwest::header::ACCEPT, JSON_CONTENT_TYPE)
+            .header(reqwest::header::ACCEPT_ENCODING, "identity")
             .header(NODE_CREDENTIAL_ID_HEADER, proof.credential_id)
             .header(NODE_PUBLIC_KEY_SPKI_HEADER, proof.public_key_spki)
             .header(NODE_SIGNATURE_HEADER, proof.signature)
@@ -576,7 +776,7 @@ fn classify_http_response(
 ) -> Result<SignedVolumeTransitionResponse, VolumeTransitionTransportFailure> {
     let status = response.status();
     if status == reqwest::StatusCode::NOT_FOUND {
-        return Ok(SignedVolumeTransitionResponse::PlainRouteNotFound);
+        return Ok(classify_plain_route_not_found(&mut response));
     }
     let cap = if status == reqwest::StatusCode::OK {
         success_cap
@@ -615,6 +815,43 @@ fn classify_http_response(
     })
 }
 
+fn classify_plain_route_not_found(
+    response: &mut reqwest::blocking::Response,
+) -> SignedVolumeTransitionResponse {
+    let headers = response.headers();
+    let forbidden_proxy_headers = ["via", "forwarded", "x-cache", "x-proxy-cache"];
+    if headers.contains_key(reqwest::header::CONTENT_ENCODING)
+        || !has_one_header_ows_case_insensitive(
+            headers,
+            reqwest::header::CONTENT_TYPE,
+            JSON_CONTENT_TYPE,
+        )
+        || !has_one_exact_header(headers, reqwest::header::CACHE_CONTROL, "no-store")
+        || !has_one_exact_header(
+            headers,
+            reqwest::header::HeaderName::from_static("x-robots-tag"),
+            RUNTIME_INTERNAL_ROUTE_NOT_FOUND_ROBOTS,
+        )
+        || declared_response_exceeds(headers, RUNTIME_INTERNAL_ROUTE_NOT_FOUND_BODY.len())
+        || forbidden_proxy_headers
+            .iter()
+            .any(|name| headers.contains_key(*name))
+    {
+        return SignedVolumeTransitionResponse::Ambiguous;
+    }
+    let mut body = Vec::new();
+    if response
+        .by_ref()
+        .take(RUNTIME_INTERNAL_ROUTE_NOT_FOUND_BODY.len() as u64 + 1)
+        .read_to_end(&mut body)
+        .is_err()
+        || body != RUNTIME_INTERNAL_ROUTE_NOT_FOUND_BODY
+    {
+        return SignedVolumeTransitionResponse::Ambiguous;
+    }
+    SignedVolumeTransitionResponse::PlainRouteNotFound
+}
+
 fn valid_common_headers(headers: &reqwest::header::HeaderMap) -> bool {
     !headers.contains_key(reqwest::header::CONTENT_ENCODING)
         && has_one_header_ows_case_insensitive(
@@ -647,16 +884,13 @@ fn status_matches_error(
                 && (!matches!(problem, RuntimeSpineHttpProblem::MethodNotAllowed)
                     || has_one_exact_header(headers, reqwest::header::ALLOW, RUNTIME_SPINE_METHOD))
         }
-        RuntimeVolumeTransitionErrorDetail::ContractError { .. }
-        | RuntimeVolumeTransitionErrorDetail::TransitionPreconditionFailed { .. }
+        RuntimeVolumeTransitionErrorDetail::ContractError { contract_error } => {
+            status.as_u16() == contract_error_status(contract_error.error.as_ref())
+        }
+        RuntimeVolumeTransitionErrorDetail::TransitionPreconditionFailed { .. }
         | RuntimeVolumeTransitionErrorDetail::VolumeAuthorityRejected { .. }
         | RuntimeVolumeTransitionErrorDetail::VolumeAuthorizationRejected { .. } => {
             status == reqwest::StatusCode::CONFLICT
-                || matches!(status.as_u16(), 400 | 413)
-                    && matches!(
-                        error.error.as_ref(),
-                        RuntimeVolumeTransitionErrorDetail::ContractError { .. }
-                    )
         }
         RuntimeVolumeTransitionErrorDetail::AuthorizationEvidenceUnavailable { .. } => false,
         RuntimeVolumeTransitionErrorDetail::NodeRequestInFlight => {
@@ -753,8 +987,9 @@ mod tests {
     use cats_api::agent_registration::{verify_request_proof, Ed25519RequestSigner};
     use cats_api::runtime_reconciliation::{
         decode_runtime_volume_transition_request, encode_runtime_volume_transition_error,
-        Durability, Generation, GuestDeviceIdentity, Id, LastVolumeTransition, RemoteHead,
-        RuntimeVolumeTransitionPreconditionProblem, Sha256Digest, UnixMillis,
+        ContractError, ContractVersion, Durability, Generation, GuestDeviceIdentity, Id,
+        LastVolumeTransition, RemoteHead, Revision, RuntimeVolumeTransitionPreconditionProblem,
+        Sha256Digest, UnixMillis,
     };
 
     use super::*;
@@ -797,6 +1032,69 @@ mod tests {
         decode_runtime_volume_transition_request(REQUEST).unwrap()
     }
 
+    fn accepted_context() -> NormalAcquireAcceptedContext {
+        let request = request();
+        NormalAcquireAcceptedContext {
+            session: AgentSession {
+                version: request.version,
+                node_id: request.session.node_id.clone(),
+                immutable_host_id: Id::new("host_a").unwrap(),
+                node_boot_id: request.session.node_boot_id.clone(),
+                agent_instance_id: request.session.agent_instance_id.clone(),
+                agent_session_epoch: request.session.agent_session_epoch,
+                registration_attempt_id: cats_api::runtime_reconciliation::RandomId128::new(
+                    "55555555555555555555555555555555",
+                )
+                .unwrap(),
+                guest_config_digest: Sha256Digest::from_bytes([9; 32]),
+                lease_deadline_unix_ms: UnixMillis::new(1_720_000_120_000).unwrap(),
+            },
+            inventory_attestation: AdmissionInventoryAttestation {
+                version: request.version,
+                node_id: request.session.node_id,
+                agent_session_epoch: request.session.agent_session_epoch,
+                inventory_epoch: cats_api::runtime_reconciliation::Epoch::new(4).unwrap(),
+                inventory_digest: Sha256Digest::from_bytes([8; 32]),
+                inventory_read_position: cats_api::runtime_reconciliation::Sequence::new(12)
+                    .unwrap(),
+                accepted_at_unix_ms: UnixMillis::new(1_720_000_000_000).unwrap(),
+            },
+        }
+    }
+
+    fn attempt_for_error(
+        status: u16,
+        detail: RuntimeVolumeTransitionErrorDetail,
+    ) -> NormalAcquireAttempt {
+        let diagnostic = format!("{detail:?}");
+        let body = encode_runtime_volume_transition_error(&RuntimeVolumeTransitionError {
+            version: ContractVersion::V1,
+            error: Box::new(detail),
+            message: "typed test error".to_owned(),
+        })
+        .unwrap_or_else(|error| panic!("invalid test error {diagnostic}: {error:?}"));
+        ControlSignedNormalAcquireClient::new(FakeTransport::new(
+            SignedVolumeTransitionResponse::ClosedError { status, body },
+        ))
+        .acquire(
+            &request(),
+            &volume(),
+            &accepted_context(),
+            Instant::now() + Duration::from_secs(1),
+        )
+        .unwrap()
+    }
+
+    fn contract_error(detail: ContractErrorDetail) -> RuntimeVolumeTransitionErrorDetail {
+        RuntimeVolumeTransitionErrorDetail::ContractError {
+            contract_error: ContractError {
+                version: ContractVersion::V1,
+                error: Box::new(detail),
+                message: "nested contract error".to_owned(),
+            },
+        }
+    }
+
     fn volume() -> VolumeIntent {
         VolumeIntent {
             volume_intent_id: Id::new("root-intent").unwrap(),
@@ -833,6 +1131,7 @@ mod tests {
             .acquire(
                 &request(),
                 &volume(),
+                &accepted_context(),
                 Instant::now() + Duration::from_secs(1),
             )
             .unwrap();
@@ -875,6 +1174,7 @@ mod tests {
                 .acquire(
                     &request(),
                     &volume(),
+                    &accepted_context(),
                     Instant::now() + Duration::from_secs(1),
                 )
                 .unwrap();
@@ -922,6 +1222,7 @@ mod tests {
             .acquire(
                 &request(),
                 &volume(),
+                &accepted_context(),
                 Instant::now() + Duration::from_secs(1),
             )
             .unwrap();
@@ -945,10 +1246,336 @@ mod tests {
         .acquire(
             &request(),
             &volume(),
+            &accepted_context(),
             Instant::now() + Duration::from_secs(1),
         )
         .unwrap();
         assert_eq!(attempt, NormalAcquireAttempt::Ambiguous);
+    }
+
+    #[test]
+    fn accepted_full_context_is_required_before_any_mutation_transport() {
+        let transport =
+            FakeTransport::new(SignedVolumeTransitionResponse::Success(SUCCESS.to_vec()));
+        let client = ControlSignedNormalAcquireClient::new(transport);
+        let mut accepted = accepted_context();
+        accepted.inventory_attestation.node_id = Id::new("other-node").unwrap();
+        assert!(matches!(
+            client.acquire(
+                &request(),
+                &volume(),
+                &accepted,
+                Instant::now() + Duration::from_secs(1),
+            ),
+            Err(NormalAcquireClientError::InvalidAcceptedContext)
+        ));
+        assert!(client.transport().seen.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn authentication_and_identity_rejections_require_operator_identity_repair() {
+        for (status, detail) in [
+            (
+                401,
+                RuntimeVolumeTransitionErrorDetail::AuthenticationFailed,
+            ),
+            (403, RuntimeVolumeTransitionErrorDetail::IdentityNotEligible),
+        ] {
+            assert_eq!(
+                attempt_for_error(status, detail),
+                NormalAcquireAttempt::IdentityRepairRequired
+            );
+        }
+    }
+
+    #[test]
+    fn session_errors_bind_every_presented_identity_field() {
+        let accepted = accepted_context();
+        let request = request();
+        let exact_guest_mismatch = ContractErrorDetail::GuestConfigMismatch {
+            node_id: request.session.node_id.clone(),
+            expected_guest_config_digest: Sha256Digest::from_bytes([10; 32]),
+            presented_guest_config_digest: accepted.session.guest_config_digest.clone(),
+        };
+        let mut expected_session = request.session.clone();
+        expected_session.agent_session_epoch =
+            cats_api::runtime_reconciliation::Epoch::new(1).unwrap();
+        for detail in [
+            ContractErrorDetail::MissingAgentSession {
+                node_id: request.session.node_id.clone(),
+            },
+            ContractErrorDetail::StaleSession {
+                node_id: request.session.node_id.clone(),
+                presented_agent_session_epoch: request.session.agent_session_epoch,
+                current_agent_session_epoch: cats_api::runtime_reconciliation::Epoch::new(3)
+                    .unwrap(),
+            },
+            ContractErrorDetail::WrongSession {
+                expected: expected_session,
+                presented: request.session.clone(),
+            },
+            ContractErrorDetail::SessionExpired {
+                node_id: request.session.node_id.clone(),
+                agent_session_epoch: request.session.agent_session_epoch,
+                lease_deadline_unix_ms: accepted.session.lease_deadline_unix_ms,
+                server_time_unix_ms: accepted.session.lease_deadline_unix_ms,
+            },
+        ] {
+            assert_eq!(
+                attempt_for_error(409, contract_error(detail)),
+                NormalAcquireAttempt::SessionReplacementRequired
+            );
+        }
+        assert_eq!(
+            attempt_for_error(409, contract_error(exact_guest_mismatch.clone())),
+            NormalAcquireAttempt::IdentityRepairRequired
+        );
+
+        let wrong_guest_digest = ContractErrorDetail::GuestConfigMismatch {
+            node_id: request.session.node_id,
+            expected_guest_config_digest: Sha256Digest::from_bytes([10; 32]),
+            presented_guest_config_digest: Sha256Digest::from_bytes([11; 32]),
+        };
+        assert_eq!(
+            attempt_for_error(409, contract_error(wrong_guest_digest)),
+            NormalAcquireAttempt::Ambiguous
+        );
+    }
+
+    #[test]
+    fn inventory_and_desired_409s_bind_the_current_request_and_attestation() {
+        let request = request();
+        let accepted = accepted_context();
+        for detail in [
+            ContractErrorDetail::MissingInventoryAttestation {
+                node_id: request.session.node_id.clone(),
+                agent_session_epoch: request.session.agent_session_epoch,
+            },
+            ContractErrorDetail::AssignedSetChanged {
+                node_id: request.session.node_id.clone(),
+                agent_session_epoch: request.session.agent_session_epoch,
+                read_position: accepted.inventory_attestation.inventory_read_position,
+            },
+        ] {
+            assert_eq!(
+                attempt_for_error(409, contract_error(detail)),
+                NormalAcquireAttempt::RefreshInventory
+            );
+        }
+
+        let mut expected_placement = request.placement.clone();
+        expected_placement.placement_epoch =
+            cats_api::runtime_reconciliation::Epoch::new(4).unwrap();
+        for detail in [
+            ContractErrorDetail::StaleRevision {
+                cat_id: request.cat_id.clone(),
+                presented_revision: request.desired_revision,
+                current_revision: Revision::new(8).unwrap(),
+            },
+            ContractErrorDetail::WrongRevision {
+                cat_id: request.cat_id.clone(),
+                expected_revision: Revision::new(6).unwrap(),
+                presented_revision: request.desired_revision,
+            },
+            ContractErrorDetail::RevisionDigestConflict {
+                cat_id: request.cat_id.clone(),
+                desired_revision: request.desired_revision,
+                expected_digest: Sha256Digest::from_bytes([12; 32]),
+                presented_digest: request.spec_digest.clone(),
+            },
+            ContractErrorDetail::WrongPlacement {
+                cat_id: request.cat_id.clone(),
+                desired_revision: request.desired_revision,
+                expected: expected_placement,
+                presented: request.placement.clone(),
+            },
+        ] {
+            assert_eq!(
+                attempt_for_error(409, contract_error(detail)),
+                NormalAcquireAttempt::ReplanDesired
+            );
+        }
+
+        assert_eq!(
+            attempt_for_error(
+                409,
+                contract_error(ContractErrorDetail::AssignedSetChanged {
+                    node_id: request.session.node_id.clone(),
+                    agent_session_epoch: request.session.agent_session_epoch,
+                    read_position: cats_api::runtime_reconciliation::Sequence::new(13).unwrap(),
+                })
+            ),
+            NormalAcquireAttempt::Ambiguous
+        );
+        assert_eq!(
+            attempt_for_error(
+                409,
+                contract_error(ContractErrorDetail::RevisionDigestConflict {
+                    cat_id: request.cat_id,
+                    desired_revision: request.desired_revision,
+                    expected_digest: Sha256Digest::from_bytes([12; 32]),
+                    presented_digest: Sha256Digest::from_bytes([13; 32]),
+                })
+            ),
+            NormalAcquireAttempt::Ambiguous
+        );
+    }
+
+    #[test]
+    fn every_store_emittable_context_409_rejects_a_wrong_presented_identity() {
+        let request = request();
+        let accepted = accepted_context();
+        let mut wrong_presented_session = request.session.clone();
+        wrong_presented_session.agent_instance_id =
+            cats_api::runtime_reconciliation::RandomId128::new("66666666666666666666666666666666")
+                .unwrap();
+        let mut earlier_expected_session = request.session.clone();
+        earlier_expected_session.agent_session_epoch =
+            cats_api::runtime_reconciliation::Epoch::new(1).unwrap();
+        let mut wrong_presented_placement = request.placement.clone();
+        wrong_presented_placement.placement_epoch =
+            cats_api::runtime_reconciliation::Epoch::new(5).unwrap();
+        let mut expected_placement = request.placement.clone();
+        expected_placement.placement_epoch =
+            cats_api::runtime_reconciliation::Epoch::new(4).unwrap();
+
+        let wrong_details = [
+            ContractErrorDetail::MissingAgentSession {
+                node_id: Id::new("other-node").unwrap(),
+            },
+            ContractErrorDetail::StaleSession {
+                node_id: request.session.node_id.clone(),
+                presented_agent_session_epoch: cats_api::runtime_reconciliation::Epoch::new(1)
+                    .unwrap(),
+                current_agent_session_epoch: cats_api::runtime_reconciliation::Epoch::new(3)
+                    .unwrap(),
+            },
+            ContractErrorDetail::WrongSession {
+                expected: earlier_expected_session,
+                presented: wrong_presented_session,
+            },
+            ContractErrorDetail::SessionExpired {
+                node_id: request.session.node_id.clone(),
+                agent_session_epoch: request.session.agent_session_epoch,
+                lease_deadline_unix_ms: UnixMillis::new(1_720_000_119_999).unwrap(),
+                server_time_unix_ms: UnixMillis::new(1_720_000_120_000).unwrap(),
+            },
+            ContractErrorDetail::MissingInventoryAttestation {
+                node_id: Id::new("other-node").unwrap(),
+                agent_session_epoch: request.session.agent_session_epoch,
+            },
+            ContractErrorDetail::AssignedSetChanged {
+                node_id: request.session.node_id.clone(),
+                agent_session_epoch: request.session.agent_session_epoch,
+                read_position: cats_api::runtime_reconciliation::Sequence::new(13).unwrap(),
+            },
+            ContractErrorDetail::StaleRevision {
+                cat_id: request.cat_id.clone(),
+                presented_revision: Revision::new(6).unwrap(),
+                current_revision: Revision::new(8).unwrap(),
+            },
+            ContractErrorDetail::WrongRevision {
+                cat_id: request.cat_id.clone(),
+                expected_revision: Revision::new(5).unwrap(),
+                presented_revision: Revision::new(6).unwrap(),
+            },
+            ContractErrorDetail::RevisionDigestConflict {
+                cat_id: request.cat_id.clone(),
+                desired_revision: request.desired_revision,
+                expected_digest: Sha256Digest::from_bytes([12; 32]),
+                presented_digest: Sha256Digest::from_bytes([13; 32]),
+            },
+            ContractErrorDetail::WrongPlacement {
+                cat_id: request.cat_id,
+                desired_revision: request.desired_revision,
+                expected: expected_placement,
+                presented: wrong_presented_placement,
+            },
+        ];
+        for detail in wrong_details {
+            assert_eq!(
+                attempt_for_error(409, contract_error(detail)),
+                NormalAcquireAttempt::Ambiguous
+            );
+        }
+
+        assert_eq!(
+            accepted.inventory_attestation.inventory_read_position.get(),
+            12
+        );
+    }
+
+    #[test]
+    fn acquire_preconditions_have_variant_specific_closed_actions() {
+        for (problem, expected) in [
+            (
+                RuntimeVolumeTransitionPreconditionProblem::InventorySessionReplaced,
+                NormalAcquireAttempt::RefreshInventory,
+            ),
+            (
+                RuntimeVolumeTransitionPreconditionProblem::InventoryStale,
+                NormalAcquireAttempt::RefreshInventory,
+            ),
+            (
+                RuntimeVolumeTransitionPreconditionProblem::VolumeIntentMismatch,
+                NormalAcquireAttempt::ReplanDesired,
+            ),
+            (
+                RuntimeVolumeTransitionPreconditionProblem::CleanupEvidenceMismatch,
+                NormalAcquireAttempt::Ambiguous,
+            ),
+            (
+                RuntimeVolumeTransitionPreconditionProblem::AuthorizationBranchConflict,
+                NormalAcquireAttempt::Ambiguous,
+            ),
+        ] {
+            assert_eq!(
+                attempt_for_error(
+                    409,
+                    RuntimeVolumeTransitionErrorDetail::TransitionPreconditionFailed {
+                        cat_id: Id::new("cat_01").unwrap(),
+                        problem,
+                    }
+                ),
+                expected
+            );
+        }
+    }
+
+    #[test]
+    fn status_and_error_detail_must_match_exactly() {
+        let malformed = ContractErrorDetail::MalformedPayload {
+            contract: ContractName::RuntimeVolumeTransitionRequest,
+            json_pointer: cats_api::runtime_reconciliation::JsonPointer::new(String::new())
+                .unwrap(),
+            problem: cats_api::runtime_reconciliation::MalformedProblem::InvalidJson,
+        };
+        assert_eq!(
+            attempt_for_error(400, contract_error(malformed.clone())),
+            NormalAcquireAttempt::StopForLocalContract
+        );
+        for (status, detail) in [
+            (409, contract_error(malformed)),
+            (
+                400,
+                RuntimeVolumeTransitionErrorDetail::TransitionPreconditionFailed {
+                    cat_id: Id::new("cat_01").unwrap(),
+                    problem: RuntimeVolumeTransitionPreconditionProblem::InventoryStale,
+                },
+            ),
+            (
+                413,
+                RuntimeVolumeTransitionErrorDetail::VolumeAuthorityRejected {
+                    volume_id: Id::new("vol_root").unwrap(),
+                    reason: RuntimeVolumeAuthorityRejection::OtherWriter,
+                },
+            ),
+        ] {
+            assert_eq!(
+                attempt_for_error(status, detail),
+                NormalAcquireAttempt::Ambiguous
+            );
+        }
     }
 
     #[test]
@@ -958,7 +1585,12 @@ mod tests {
         let granted = ControlSignedNormalAcquireClient::new(FakeTransport::new(
             SignedVolumeTransitionResponse::Success(SUCCESS.to_vec()),
         ))
-        .acquire(&request, &volume, Instant::now() + Duration::from_secs(1))
+        .acquire(
+            &request,
+            &volume,
+            &accepted_context(),
+            Instant::now() + Duration::from_secs(1),
+        )
         .unwrap();
         let NormalAcquireAttempt::Granted(attachment) = granted else {
             unreachable!()
@@ -1034,6 +1666,126 @@ mod tests {
         Ed25519RequestSigner::from_pkcs8_der(Id::new("credential_a").unwrap(), &der).unwrap()
     }
 
+    fn raw_transport_response(
+        raw_response: Vec<u8>,
+    ) -> Result<SignedVolumeTransitionResponse, VolumeTransitionTransportFailure> {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = std::thread::spawn(move || {
+            let (stream, _) = listener.accept().unwrap();
+            let mut reader = BufReader::new(stream);
+            let mut request_line = String::new();
+            reader.read_line(&mut request_line).unwrap();
+            let mut content_length = 0;
+            let mut accept_encoding = None;
+            loop {
+                let mut line = String::new();
+                reader.read_line(&mut line).unwrap();
+                if line == "\r\n" {
+                    break;
+                }
+                let (name, value) = line.trim_end().split_once(':').unwrap();
+                if name.eq_ignore_ascii_case("content-length") {
+                    content_length = value.trim().parse().unwrap();
+                }
+                if name.eq_ignore_ascii_case("accept-encoding") {
+                    accept_encoding = Some(value.trim().to_owned());
+                }
+            }
+            assert_eq!(accept_encoding.as_deref(), Some("identity"));
+            let mut body = vec![0; content_length];
+            reader.read_exact(&mut body).unwrap();
+            let mut stream = reader.into_inner();
+            stream.write_all(&raw_response).unwrap();
+        });
+        let client = RuntimeVolumeTransitionHttpClient::for_loopback_test(
+            &format!("http://{address}/"),
+            signer(),
+        )
+        .unwrap();
+        let result = client.post_a19_signed_json(
+            RUNTIME_VOLUME_TRANSITION_PATH,
+            REQUEST,
+            RUNTIME_VOLUME_TRANSITION_SUCCESS_MAX_WIRE_BYTES,
+            Instant::now() + Duration::from_secs(2),
+        );
+        server.join().unwrap();
+        result
+    }
+
+    #[test]
+    fn only_the_exact_product_router_404_is_a_deployment_mismatch() {
+        let exact = format!(
+            "HTTP/1.1 404 Not Found\r\nContent-Type: application/json\r\nCache-Control: no-store\r\nX-Robots-Tag: {RUNTIME_INTERNAL_ROUTE_NOT_FOUND_ROBOTS}\r\nServer: cats-test\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+            RUNTIME_INTERNAL_ROUTE_NOT_FOUND_BODY.len()
+        )
+        .into_bytes();
+        let mut exact = exact;
+        exact.extend_from_slice(RUNTIME_INTERNAL_ROUTE_NOT_FOUND_BODY);
+        assert_eq!(
+            raw_transport_response(exact).unwrap(),
+            SignedVolumeTransitionResponse::PlainRouteNotFound
+        );
+
+        let proxy_bodies = [
+            ("text/html", b"<h1>not found</h1>".as_slice()),
+            ("text/plain", b"route missing".as_slice()),
+            (
+                "application/json",
+                b"{\"message\":\"upstream route missing\"}".as_slice(),
+            ),
+        ];
+        for (content_type, body) in proxy_bodies {
+            let mut response = format!(
+                "HTTP/1.1 404 Not Found\r\nContent-Type: {content_type}\r\nCache-Control: no-store\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                body.len()
+            )
+            .into_bytes();
+            response.extend_from_slice(body);
+            assert_eq!(
+                raw_transport_response(response).unwrap(),
+                SignedVolumeTransitionResponse::Ambiguous
+            );
+        }
+
+        let truncated = format!(
+            "HTTP/1.1 404 Not Found\r\nContent-Type: application/json\r\nCache-Control: no-store\r\nX-Robots-Tag: {RUNTIME_INTERNAL_ROUTE_NOT_FOUND_ROBOTS}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{{\"code\":",
+            RUNTIME_INTERNAL_ROUTE_NOT_FOUND_BODY.len()
+        )
+        .into_bytes();
+        assert_eq!(
+            raw_transport_response(truncated).unwrap(),
+            SignedVolumeTransitionResponse::Ambiguous
+        );
+    }
+
+    #[test]
+    fn compressed_or_proxy_marked_responses_are_always_ambiguous() {
+        let gzip = format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Encoding: gzip\r\nCache-Control: no-store\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+            SUCCESS.len()
+        )
+        .into_bytes();
+        let mut gzip = gzip;
+        gzip.extend_from_slice(SUCCESS);
+        assert_eq!(
+            raw_transport_response(gzip).unwrap(),
+            SignedVolumeTransitionResponse::Ambiguous
+        );
+
+        let proxy = format!(
+            "HTTP/1.1 404 Not Found\r\nContent-Type: application/json\r\nCache-Control: no-store\r\nX-Robots-Tag: {RUNTIME_INTERNAL_ROUTE_NOT_FOUND_ROBOTS}\r\nVia: 1.1 proxy\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+            RUNTIME_INTERNAL_ROUTE_NOT_FOUND_BODY.len()
+        )
+        .into_bytes();
+        let mut proxy = proxy;
+        proxy.extend_from_slice(RUNTIME_INTERNAL_ROUTE_NOT_FOUND_BODY);
+        assert_eq!(
+            raw_transport_response(proxy).unwrap(),
+            SignedVolumeTransitionResponse::Ambiguous
+        );
+    }
+
     #[test]
     fn production_transport_signs_only_the_exact_route_and_validates_response_headers() {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
@@ -1073,6 +1825,7 @@ mod tests {
                 &proof_headers[NODE_SIGNATURE_HEADER],
             )
             .unwrap();
+            assert_eq!(proof_headers["accept-encoding"], "identity");
             let mut stream = reader.into_inner();
             write!(
                 stream,
