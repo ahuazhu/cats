@@ -4,6 +4,7 @@
 //! [`AuthenticatedNodeCredential`] and decoded runtime contract value.
 
 use std::error::Error as _;
+use std::time::{Duration, Instant};
 
 use axum::body::{to_bytes, Body};
 use axum::extract::State;
@@ -26,10 +27,16 @@ use cats_api::runtime_reconciliation::{
 use crate::server::AppState;
 use crate::store::{AgentRegistrationOutcome, AgentRegistrationRejection};
 
+const REGISTRATION_BODY_DEADLINE: Duration = Duration::from_secs(10);
+
 pub(super) async fn register_agent_session(
     State(state): State<AppState>,
     request: Request<Body>,
 ) -> Response {
+    // Starts when Axum has parsed the headers. The protocol does not freeze a
+    // transport timeout, but production must not let a trickled body retain a
+    // server admission slot indefinitely.
+    let deadline = Instant::now() + REGISTRATION_BODY_DEADLINE;
     if request.method().as_str() != REGISTRATION_METHOD {
         return registration_error_response(
             StatusCode::METHOD_NOT_ALLOWED,
@@ -74,19 +81,30 @@ pub(super) async fn register_agent_session(
         );
     }
 
+    let _global_permit = match state.runtime_spine_admission.try_global() {
+        Ok(permit) => permit,
+        Err(_) => return temporarily_unavailable(),
+    };
+
     if declared_body_exceeds_limit(&headers) {
         return contract_error_response(StatusCode::PAYLOAD_TOO_LARGE, body_limit_error());
     }
-    let body = match to_bytes(request.into_body(), REGISTRATION_REQUEST_MAX_WIRE_BYTES).await {
-        Ok(body) => body,
-        Err(error)
+    let body = match tokio::time::timeout_at(
+        tokio::time::Instant::from_std(deadline),
+        to_bytes(request.into_body(), REGISTRATION_REQUEST_MAX_WIRE_BYTES),
+    )
+    .await
+    {
+        Ok(Ok(body)) => body,
+        Ok(Err(error))
             if error
                 .source()
                 .is_some_and(|source| source.is::<http_body_util::LengthLimitError>()) =>
         {
             return contract_error_response(StatusCode::PAYLOAD_TOO_LARGE, body_limit_error());
         }
-        Err(_) => return internal_response(),
+        Ok(Err(_)) => return internal_response(),
+        Err(_) => return temporarily_unavailable(),
     };
 
     let proof = (
@@ -141,15 +159,19 @@ pub(super) async fn register_agent_session(
                 ErrorCode::Unavailable | ErrorCode::DeadlineExceeded
             ) =>
         {
-            registration_error_response(
-                StatusCode::SERVICE_UNAVAILABLE,
-                AgentRegistrationErrorDetail::TemporarilyUnavailable,
-                "Agent registration is temporarily unavailable",
-                &[(header::RETRY_AFTER, HeaderValue::from_static("1"))],
-            )
+            temporarily_unavailable()
         }
         Err(_) => internal_response(),
     }
+}
+
+fn temporarily_unavailable() -> Response {
+    registration_error_response(
+        StatusCode::SERVICE_UNAVAILABLE,
+        AgentRegistrationErrorDetail::TemporarilyUnavailable,
+        "Agent registration is temporarily unavailable",
+        &[(header::RETRY_AFTER, HeaderValue::from_static("1"))],
+    )
 }
 
 fn single_header_text<'a>(headers: &'a HeaderMap, name: &str) -> Option<&'a str> {

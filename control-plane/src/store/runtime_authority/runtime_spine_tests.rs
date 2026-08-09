@@ -107,6 +107,35 @@ fn fixture_at(
 }
 
 #[test]
+fn request_commit_response_loss_stops_internal_replay_and_exact_retry_recovers() {
+    let (store, _identity, authenticated, _policy, session) = fixture();
+    let request = cats_api::runtime_reconciliation::DesiredReadRequest {
+        version: ContractVersion::V1,
+        session: binding(&session),
+        request_sequence: Sequence::new(1).unwrap(),
+    };
+    store.inject_committed_response_loss_once();
+    let first_context = AuthorityRequestContext::new(Instant::now() + Duration::from_secs(5));
+    let error = store
+        .runtime_desired_read_for_request(&authenticated, &request, &first_context)
+        .unwrap_err();
+    assert_eq!(error.code, ErrorCode::Unavailable);
+    assert!(
+        first_context.commit_was_attempted(),
+        "the HTTP owner must close an unknown COMMIT response"
+    );
+
+    let retry_context = AuthorityRequestContext::new(Instant::now() + Duration::from_secs(5));
+    let replay = accepted(
+        store
+            .runtime_desired_read_for_request(&authenticated, &request, &retry_context)
+            .unwrap(),
+    );
+    assert_eq!(replay.request_sequence, request.request_sequence);
+    assert!(replay.desired_specs.is_empty());
+}
+
+#[test]
 fn cancelling_a_started_http_authority_request_rolls_back_before_commit() {
     let url = crate::testsupport::isolated_control_store_url();
     let (store, _identity, authenticated, _policy, session) = fixture_at(&url);

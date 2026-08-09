@@ -122,6 +122,234 @@ pub async fn provision_node_identity(
         .expect("provision test NodeIdentity");
 }
 
+/// Canonical database fingerprint for proving that a rejected signed runtime
+/// request neither advances a sequence nor renews the current session.
+pub async fn runtime_spine_state_fingerprint(
+    store: &Arc<crate::store::Store>,
+    node_id: cats_api::runtime_reconciliation::Id,
+) -> String {
+    store
+        .execute(move |store| {
+            store.with(|client| {
+                client
+                    .query_one(
+                        "SELECT jsonb_build_object(
+                            'session', (SELECT to_jsonb(s) FROM current_agent_sessions s
+                                         WHERE s.node_id=$1),
+                            'desired', (SELECT to_jsonb(d) FROM runtime_desired_read_states d
+                                         WHERE d.node_id=$1),
+                            'receive', (SELECT to_jsonb(r) FROM runtime_observation_receive_states r
+                                         WHERE r.node_id=$1),
+                            'inventory', (SELECT to_jsonb(i) FROM runtime_admission_inventory_states i
+                                           WHERE i.node_id=$1),
+                            'cat_observations', (SELECT count(*)
+                                                   FROM runtime_current_cat_observations c
+                                                  WHERE c.node_id=$1)
+                         )::text",
+                        &[&node_id.as_str()],
+                    )
+                    .map(|row| row.get(0))
+            })
+        })
+        .await
+        .expect("fingerprint runtime spine state")
+}
+
+/// Expire one isolated test session while preserving every JSON/projection
+/// invariant. The immutable-attempt trigger is disabled only inside this
+/// disposable-schema transaction and is restored before commit.
+pub async fn expire_agent_session_for_test(
+    store: &Arc<crate::store::Store>,
+    node_id: cats_api::runtime_reconciliation::Id,
+) {
+    store
+        .execute(move |store| {
+            store.with(|client| {
+                let mut transaction = client.transaction()?;
+                transaction.batch_execute(
+                    "ALTER TABLE agent_registration_attempts DISABLE TRIGGER USER",
+                )?;
+                let attempts = transaction.execute(
+                    "UPDATE agent_registration_attempts
+                        SET session_record=jsonb_set(
+                                session_record, '{lease_deadline_unix_ms}', '1'::jsonb, FALSE),
+                            lease_deadline_unix_ms=1
+                      WHERE node_id=$1",
+                    &[&node_id.as_str()],
+                )?;
+                let current = transaction.execute(
+                    "UPDATE current_agent_sessions
+                        SET record=jsonb_set(
+                                record, '{lease_deadline_unix_ms}', '1'::jsonb, FALSE),
+                            lease_deadline_unix_ms=1
+                      WHERE node_id=$1",
+                    &[&node_id.as_str()],
+                )?;
+                transaction
+                    .batch_execute("ALTER TABLE agent_registration_attempts ENABLE TRIGGER USER")?;
+                assert_eq!((attempts, current), (1, 1));
+                transaction.commit()
+            })
+        })
+        .await
+        .expect("expire isolated test AgentSession");
+}
+
+/// Move the current Desired cursor just into the past without changing its
+/// sequence/read position, retaining a valid issued-before-expires interval.
+pub async fn expire_runtime_cursor_for_test(
+    store: &Arc<crate::store::Store>,
+    node_id: cats_api::runtime_reconciliation::Id,
+) {
+    use cats_api::runtime_reconciliation::{
+        decode_desired_read_snapshot, encode_desired_read_snapshot, UnixMillis,
+    };
+
+    store
+        .execute(move |store| {
+            store.with(|client| {
+                let row = client.query_one(
+                    "SELECT response::text,
+                            (extract(epoch FROM clock_timestamp()) * 1000)::BIGINT
+                       FROM runtime_desired_read_states WHERE node_id=$1",
+                    &[&node_id.as_str()],
+                )?;
+                let response: String = row.get(0);
+                let now: i64 = row.get(1);
+                let mut snapshot = decode_desired_read_snapshot(response.as_bytes())
+                    .expect("stored Desired snapshot is valid");
+                let expires = u64::try_from(now).expect("database clock is nonnegative");
+                snapshot.issued_at_unix_ms =
+                    UnixMillis::new(expires.saturating_sub(1)).expect("issued time is valid");
+                snapshot.expires_at_unix_ms =
+                    UnixMillis::new(expires).expect("expiry time is valid");
+                let encoded = String::from_utf8(
+                    encode_desired_read_snapshot(&snapshot).expect("expired cursor still encodes"),
+                )
+                .expect("runtime wire JSON is UTF-8");
+                client.execute(
+                    "UPDATE runtime_desired_read_states
+                        SET response=$2::TEXT::jsonb, issued_at_unix_ms=$3,
+                            expires_at_unix_ms=$4
+                      WHERE node_id=$1",
+                    &[
+                        &node_id.as_str(),
+                        &encoded,
+                        &i64::try_from(snapshot.issued_at_unix_ms.get())
+                            .expect("issued time fits PostgreSQL"),
+                        &i64::try_from(snapshot.expires_at_unix_ms.get())
+                            .expect("expiry time fits PostgreSQL"),
+                    ],
+                )?;
+                Ok(())
+            })
+        })
+        .await
+        .expect("expire isolated test Desired cursor");
+}
+
+/// Insert one valid assignment after a cursor was issued. This is a transport
+/// regression fixture: the observation must reject the changed assigned set
+/// before trying to infer a missing runtime.
+pub async fn insert_assigned_desired_after_cursor_for_test(
+    store: &Arc<crate::store::Store>,
+    node_id: cats_api::runtime_reconciliation::Id,
+) {
+    use cats_api::runtime_reconciliation::{
+        encode_desired_runtime_spec, spec_digest, AssignedKind, AssignedPlacement, ContractVersion,
+        DesiredRuntimeSpec, Epoch, Id, Ipv4Address, IsolatedIpv4Kind, MacAddress, NetworkConfig,
+        Revision, RuntimeConfig, RuntimeTarget, RuntimeTransition, Sha256Digest,
+    };
+
+    let digest = |byte: char| {
+        Sha256Digest::new(format!("sha256:{}", byte.to_string().repeat(64)))
+            .expect("test digest is valid")
+    };
+    store
+        .execute(move |store| {
+            store.with(|client| {
+                let mut transaction = client.transaction()?;
+                let row = transaction.query_one(
+                    "SELECT id, (extract(epoch FROM clock_timestamp()) * 1000)::BIGINT
+                       FROM workspaces WHERE is_default ORDER BY id LIMIT 1",
+                    &[],
+                )?;
+                let workspace_id =
+                    Id::new(row.get::<_, String>(0)).expect("bootstrap workspace id is valid");
+                let now: i64 = row.get(1);
+                let cat_id = Id::new("cat_http_assigned").expect("test Cat id is valid");
+                let mut desired = DesiredRuntimeSpec {
+                    version: ContractVersion::V1,
+                    workspace_id: workspace_id.clone(),
+                    cat_id: cat_id.clone(),
+                    desired_revision: Revision::new(1).expect("one is valid"),
+                    target: RuntimeTarget::Running,
+                    placement: AssignedPlacement {
+                        kind: AssignedKind::Assigned,
+                        node_id,
+                        placement_epoch: Epoch::new(1).expect("one is valid"),
+                    },
+                    runtime: RuntimeConfig {
+                        vcpus: 1,
+                        memory_bytes: 512 * 1024 * 1024,
+                        boot_image_digest: digest('3'),
+                        guest_config_digest: digest('4'),
+                        network_config: NetworkConfig {
+                            kind: IsolatedIpv4Kind::IsolatedIpv4,
+                            network_id: Id::new("net_http_assigned")
+                                .expect("test Network id is valid"),
+                            guest_mac: MacAddress::new("02:00:00:00:00:01")
+                                .expect("test MAC is valid"),
+                            guest_ipv4: Ipv4Address::new("10.0.0.1")
+                                .expect("test guest IPv4 is valid"),
+                            prefix_length: 30,
+                            gateway_ipv4: Ipv4Address::new("10.0.0.2")
+                                .expect("test gateway IPv4 is valid"),
+                        },
+                    },
+                    volumes: Vec::new(),
+                    endpoints: Vec::new(),
+                    transition: RuntimeTransition::CancelAndDrain,
+                    spec_digest: digest('0'),
+                };
+                desired.spec_digest = spec_digest(&desired).expect("test Desired is valid");
+                let desired_json = String::from_utf8(
+                    encode_desired_runtime_spec(&desired).expect("test Desired encodes"),
+                )
+                .expect("runtime wire JSON is UTF-8");
+                let cat_json = serde_json::json!({
+                    "cat_id": cat_id.as_str(),
+                    "workspace_id": workspace_id.as_str(),
+                    "name": "assigned_after_cursor",
+                    "created_at": u64::try_from(now).expect("database clock is nonnegative"),
+                })
+                .to_string();
+                transaction.execute(
+                    "INSERT INTO cat_records
+                        (cat_id, record, workspace_id, name, created_at)
+                     VALUES ($1, $2::TEXT::jsonb, $3, 'assigned_after_cursor', $4)",
+                    &[&cat_id.as_str(), &cat_json, &workspace_id.as_str(), &now],
+                )?;
+                transaction.execute(
+                    "INSERT INTO desired_runtime_specs
+                        (cat_id, record, workspace_id, desired_revision, spec_digest,
+                         target, node_id, placement_epoch)
+                     VALUES ($1, $2::TEXT::jsonb, $3, 1, $4, 'running', $5, 1)",
+                    &[
+                        &cat_id.as_str(),
+                        &desired_json,
+                        &workspace_id.as_str(),
+                        &desired.spec_digest.as_str(),
+                        &desired.placement.node_id.as_str(),
+                    ],
+                )?;
+                transaction.commit()
+            })
+        })
+        .await
+        .expect("insert assigned Desired after cursor");
+}
+
 /// Transitional V1 lifecycle fixture. Runtime-session production code never
 /// calls this; the broad pre-cutover E2E suite still schedules through the old
 /// `nodes` table while F3c replaces that consumer.

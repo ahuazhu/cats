@@ -18,9 +18,46 @@ use cats_metadata_store_sqlite::SqliteMetadataStore;
 use cats_metering::SqliteUsageStore;
 use cats_storage::MetadataStore;
 use reqwest::{Method, StatusCode};
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::net::TcpStream;
 
 const SERVICE_TOKEN: &str = "registration-http-service-token";
 const ADMIN_TOKEN: &str = "registration-http-admin-token";
+
+async fn pending_chunked_request(addr: std::net::SocketAddr) -> TcpStream {
+    let mut stream = TcpStream::connect(addr).await.unwrap();
+    let request = format!(
+        "POST {REGISTRATION_PATH} HTTP/1.1\r\nHost: {addr}\r\n\
+         Content-Type: {JSON_CONTENT_TYPE}\r\nTransfer-Encoding: chunked\r\n\
+         Connection: close\r\n\r\n1\r\n{{\r\n"
+    );
+    stream.write_all(request.as_bytes()).await.unwrap();
+    stream
+}
+
+async fn raw_status(mut stream: TcpStream) -> StatusCode {
+    let mut response = Vec::new();
+    tokio::time::timeout(
+        std::time::Duration::from_secs(12),
+        stream.read_to_end(&mut response),
+    )
+    .await
+    .expect("registration ingress did not enforce its body deadline")
+    .unwrap();
+    let line = std::str::from_utf8(&response)
+        .unwrap()
+        .lines()
+        .next()
+        .unwrap();
+    StatusCode::from_u16(
+        line.split_ascii_whitespace()
+            .nth(1)
+            .unwrap()
+            .parse()
+            .unwrap(),
+    )
+    .unwrap()
+}
 
 struct Context {
     _dir: tempfile::TempDir,
@@ -397,4 +434,43 @@ async fn admission_order_and_proof_mutations_are_closed() {
             );
         }
     }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn pending_bodies_hit_deadline_release_global_admission_and_cannot_register() {
+    let context = Context::new().await;
+    let before = cats_control_plane::testsupport::runtime_spine_state_fingerprint(
+        &context.server.state.store,
+        context.attempt.node_id.clone(),
+    )
+    .await;
+    let mut pending = Vec::new();
+    for _ in 0..65 {
+        pending.push(pending_chunked_request(context.server.addr).await);
+    }
+
+    let body = encode_agent_registration_attempt(&context.attempt).unwrap();
+    let saturated = tokio::time::timeout(
+        std::time::Duration::from_secs(2),
+        context.signed_request(body.clone()).send(),
+    )
+    .await
+    .expect("the nonblocking registration admission waited")
+    .unwrap();
+    assert_eq!(saturated.status(), StatusCode::SERVICE_UNAVAILABLE);
+
+    for stream in pending {
+        assert_eq!(raw_status(stream).await, StatusCode::SERVICE_UNAVAILABLE);
+    }
+    assert_eq!(
+        cats_control_plane::testsupport::runtime_spine_state_fingerprint(
+            &context.server.state.store,
+            context.attempt.node_id.clone(),
+        )
+        .await,
+        before,
+    );
+
+    let registered = context.signed_request(body).send().await.unwrap();
+    assert_eq!(registered.status(), StatusCode::OK);
 }

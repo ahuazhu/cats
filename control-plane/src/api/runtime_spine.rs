@@ -176,16 +176,22 @@ async fn handle(state: AppState, request: Request<Body>, route: Route) -> Respon
     if declared_body_exceeds_limit(&headers, route.body_limit()) {
         return contract_error_response(StatusCode::PAYLOAD_TOO_LARGE, body_limit_error(route));
     }
-    let body = match to_bytes(request.into_body(), route.body_limit()).await {
-        Ok(body) => body,
-        Err(error)
+    let body = match tokio::time::timeout_at(
+        tokio::time::Instant::from_std(deadline),
+        to_bytes(request.into_body(), route.body_limit()),
+    )
+    .await
+    {
+        Ok(Ok(body)) => body,
+        Ok(Err(error))
             if error
                 .source()
                 .is_some_and(|source| source.is::<http_body_util::LengthLimitError>()) =>
         {
             return contract_error_response(StatusCode::PAYLOAD_TOO_LARGE, body_limit_error(route));
         }
-        Err(_) => return internal_response(),
+        Ok(Err(_)) => return internal_response(),
+        Err(_) => return temporarily_unavailable(),
     };
 
     let proof = (
@@ -301,8 +307,8 @@ async fn handle(state: AppState, request: Request<Body>, route: Route) -> Respon
 
     match tokio::time::timeout_at(tokio::time::Instant::from_std(deadline), operation).await {
         Ok(Ok(Ok(EncodedOutcome::Accepted(body)))) => success_response(body),
-        Ok(_) if response_context.commit_was_attempted() => ambiguous_commit_response(),
         Ok(Ok(Ok(EncodedOutcome::Rejected(rejection)))) => rejection_response(rejection),
+        Ok(_) if response_context.commit_was_attempted() => ambiguous_commit_response(),
         Ok(Ok(Err(()))) => internal_response(),
         Ok(Err(error)) if transient(&error) => temporarily_unavailable(),
         Ok(Err(_)) => internal_response(),

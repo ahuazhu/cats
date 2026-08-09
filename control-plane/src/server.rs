@@ -19,9 +19,10 @@ const SINGLETON_ELECTION_RETRY: Duration = Duration::from_millis(500);
 const SINGLETON_HEALTH_INTERVAL: Duration = Duration::from_secs(1);
 const RUNTIME_SPINE_GLOBAL_IN_FLIGHT: usize = 64;
 
-/// Non-authoritative, per-replica admission for the two A20 Node routes.
+/// Non-authoritative, per-replica admission for signed A19/A20 Node ingress.
 /// PostgreSQL remains the concurrency authority; these permits only bound
-/// memory and handler work before a request reaches it.
+/// memory and handler work before a request reaches it. Registration uses the
+/// global lane; the two session-bound A20 routes also take a per-Node permit.
 pub(crate) struct RuntimeSpineAdmission {
     global: Arc<tokio::sync::Semaphore>,
     per_node: Mutex<BTreeMap<String, Weak<tokio::sync::Semaphore>>>,

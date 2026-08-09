@@ -61,6 +61,14 @@ impl AuthorityRequestContext {
         self.commit_attempted.store(true, Ordering::Release);
     }
 
+    /// A serialization or deadlock error returned by PostgreSQL from COMMIT
+    /// proves that attempt did not commit. Clear the per-attempt phase before
+    /// the closed transaction is replayed so an exhausted definite retry is
+    /// not mislabeled as an unknown commit result by the HTTP owner.
+    fn reset_after_definite_commit_failure(&self) {
+        self.commit_attempted.store(false, Ordering::Release);
+    }
+
     /// True after COMMIT may have reached PostgreSQL. Even when the blocking
     /// worker already knows it committed, a concurrent HTTP deadline can fire
     /// before that result crosses the executor channel; such a response must
@@ -107,6 +115,7 @@ enum AttemptFailure {
     Application(ApiError),
     CandidateCollision,
     Postgres(postgres::Error),
+    Commit(postgres::Error),
     Rollback(postgres::Error),
     Infrastructure(ApiError),
 }
@@ -305,7 +314,7 @@ impl Store {
                                 }
                                 Ok(value)
                             }
-                            Err(error) => Err(AttemptFailure::Postgres(error)),
+                            Err(error) => Err(AttemptFailure::Commit(error)),
                         }
                     }
                     Err(AuthorityTransactionError::Domain(error)) => {
@@ -413,6 +422,79 @@ impl Store {
                         )),
                     }));
                 }
+                Err(AttemptFailure::Commit(error)) => {
+                    metrics::record_postgres_error(&error);
+
+                    // A request owner must never replay a transaction after a
+                    // connection-class COMMIT failure: PostgreSQL may have
+                    // durably committed it even though this process lost the
+                    // response. Leave the phase marked attempted so HTTP
+                    // closes the response and the Node performs exact replay.
+                    // Serialization and deadlock failures are the opposite:
+                    // PostgreSQL guarantees non-commit, so reset that attempt
+                    // before the bounded transaction replay.
+                    if let Some(request) = request {
+                        if authority_retry_is_definite(&error) {
+                            request.reset_after_definite_commit_failure();
+                            on_definite_retry();
+                            if attempt + 1 < AUTHORITY_TRANSACTION_ATTEMPTS {
+                                let reason = authority_retry_reason(&error)
+                                    .expect("definite COMMIT failures are retriable");
+                                metrics::record_authority_retry(reason);
+                                std::thread::sleep(retry_delay(attempt));
+                                continue;
+                            }
+                            metrics::record_authority_outcome(
+                                metrics::AuthorityOutcome::BackendFailed,
+                            );
+                            return Err(AuthorityExecutionError::Store(ApiError::unavailable(
+                                format!(
+                                    "runtime authority transaction did not commit after \
+                                     {AUTHORITY_TRANSACTION_ATTEMPTS} attempts"
+                                ),
+                            )));
+                        }
+
+                        metrics::record_authority_outcome(metrics::AuthorityOutcome::BackendFailed);
+                        return Err(AuthorityExecutionError::Store(ApiError::unavailable(
+                            "runtime authority PostgreSQL COMMIT result is unknown",
+                        )));
+                    }
+
+                    // Non-request authority callers retain the historical
+                    // bounded replay policy. Their higher-level contracts own
+                    // any required exact-replay key.
+                    let retry_reason = authority_retry_reason(&error);
+                    if attempt + 1 < AUTHORITY_TRANSACTION_ATTEMPTS {
+                        if let Some(reason) = retry_reason {
+                            if authority_retry_is_definite(&error) {
+                                on_definite_retry();
+                            }
+                            metrics::record_authority_retry(reason);
+                            std::thread::sleep(retry_delay(attempt));
+                            continue;
+                        }
+                    }
+                    metrics::record_authority_outcome(metrics::AuthorityOutcome::BackendFailed);
+                    return Err(AuthorityExecutionError::Store(match retry_reason {
+                        Some(_) => ApiError::unavailable(format!(
+                            "runtime authority transaction did not commit after \
+                             {AUTHORITY_TRANSACTION_ATTEMPTS} attempts"
+                        )),
+                        None if matches!(
+                            error.code(),
+                            Some(&SqlState::QUERY_CANCELED) | Some(&SqlState::LOCK_NOT_AVAILABLE)
+                        ) =>
+                        {
+                            ApiError::unavailable(
+                                "runtime authority PostgreSQL statement or lock deadline elapsed",
+                            )
+                        }
+                        None => internal(format!(
+                            "runtime authority PostgreSQL COMMIT failed: {error}"
+                        )),
+                    }));
+                }
             }
         }
         unreachable!("the bounded authority transaction loop always returns")
@@ -516,6 +598,16 @@ mod request_context_tests {
     #[test]
     fn commit_attempt_stays_visible_to_a_racing_http_deadline() {
         let context = AuthorityRequestContext::new(Instant::now() + Duration::from_secs(1));
+        assert!(!context.commit_was_attempted());
+        context.begin_commit();
+        assert!(context.commit_was_attempted());
+    }
+
+    #[test]
+    fn definite_commit_failure_resets_only_the_failed_attempt() {
+        let context = AuthorityRequestContext::new(Instant::now() + Duration::from_secs(1));
+        context.begin_commit();
+        context.reset_after_definite_commit_failure();
         assert!(!context.commit_was_attempted());
         context.begin_commit();
         assert!(context.commit_was_attempted());

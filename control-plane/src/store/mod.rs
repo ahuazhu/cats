@@ -787,7 +787,7 @@ impl Store {
         })
     }
 
-    fn with<T: Send>(
+    pub(crate) fn with<T: Send>(
         &self,
         f: impl FnOnce(&mut Client) -> std::result::Result<T, postgres::Error> + Send,
     ) -> Result<T> {

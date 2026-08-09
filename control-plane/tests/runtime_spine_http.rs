@@ -10,9 +10,9 @@ use cats_api::runtime_reconciliation::{
     decode_agent_session, decode_desired_read_snapshot, decode_observation_acceptance,
     decode_runtime_spine_error, encode_agent_registration_attempt, encode_desired_read_request,
     encode_node_observation, guest_config_digest, inventory_digest, AgentRegistrationAttempt,
-    ContractVersion, CredentialBinding, DesiredReadRequest, Epoch, Id, NodeBootId, NodeIdentity,
-    NodeIdentityState, NodeObservation, RandomId128, RuntimeSpineErrorDetail,
-    RuntimeSpineHttpProblem, Sequence, SessionBinding, UnixMillis,
+    ContractErrorDetail, ContractVersion, CredentialBinding, DesiredReadRequest, Epoch, Id,
+    NodeBootId, NodeIdentity, NodeIdentityState, NodeObservation, RandomId128,
+    RuntimeSpineErrorDetail, RuntimeSpineHttpProblem, Sequence, SessionBinding, UnixMillis,
 };
 use cats_control_plane::controller::AutoTierPolicy;
 use cats_control_plane::server::{spawn, Config, Handle};
@@ -21,11 +21,45 @@ use cats_metadata_store_sqlite::SqliteMetadataStore;
 use cats_metering::SqliteUsageStore;
 use cats_storage::MetadataStore;
 use reqwest::{Method, StatusCode};
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::net::TcpStream;
 
 const DESIRED_PATH: &str = "/v1/internal/runtime/desired-reads";
 const OBSERVATION_PATH: &str = "/v1/internal/runtime/observations";
 const SERVICE_TOKEN: &str = "runtime-spine-http-service-token";
 const ADMIN_TOKEN: &str = "runtime-spine-http-admin-token";
+
+async fn pending_chunked_request(addr: std::net::SocketAddr, path: &str) -> TcpStream {
+    let mut stream = TcpStream::connect(addr).await.unwrap();
+    let request = format!(
+        "POST {path} HTTP/1.1\r\nHost: {addr}\r\nContent-Type: {JSON_CONTENT_TYPE}\r\n\
+         Accept: {JSON_CONTENT_TYPE}\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n\
+         1\r\n{{\r\n"
+    );
+    stream.write_all(request.as_bytes()).await.unwrap();
+    stream
+}
+
+async fn raw_status(mut stream: TcpStream) -> StatusCode {
+    let mut response = Vec::new();
+    tokio::time::timeout(Duration::from_secs(12), stream.read_to_end(&mut response))
+        .await
+        .expect("signed ingress did not enforce its body deadline")
+        .unwrap();
+    let line = std::str::from_utf8(&response)
+        .unwrap()
+        .lines()
+        .next()
+        .unwrap();
+    StatusCode::from_u16(
+        line.split_ascii_whitespace()
+            .nth(1)
+            .unwrap()
+            .parse()
+            .unwrap(),
+    )
+    .unwrap()
+}
 
 struct Context {
     _dir: tempfile::TempDir,
@@ -147,6 +181,38 @@ impl Context {
             agent_session_epoch: self.session.agent_session_epoch,
         }
     }
+
+    fn full_observation(&self, read_position: Sequence, observation_id: &str) -> NodeObservation {
+        let mut observation = NodeObservation {
+            version: ContractVersion::V1,
+            observation_id: RandomId128::new(observation_id).unwrap(),
+            node_id: self.session.node_id.clone(),
+            node_boot_id: self.session.node_boot_id.clone(),
+            agent_instance_id: self.session.agent_instance_id.clone(),
+            agent_session_epoch: self.session.agent_session_epoch,
+            heartbeat_sequence: Sequence::new(1).unwrap(),
+            observed_at_unix_ms: UnixMillis::new(1).unwrap(),
+            complete_inventory: true,
+            inventory_epoch: Epoch::new(1).unwrap(),
+            inventory_digest: None,
+            inventory_read_position: Some(read_position),
+            key_ring_version: None,
+            key_ring_digest: None,
+            loaded_kids: Vec::new(),
+            runtimes: Vec::new(),
+            residue: Vec::new(),
+        };
+        observation.inventory_digest = Some(inventory_digest(&observation).unwrap());
+        observation
+    }
+
+    async fn fingerprint(&self) -> String {
+        cats_control_plane::testsupport::runtime_spine_state_fingerprint(
+            &self.server.state.store,
+            self.session.node_id.clone(),
+        )
+        .await
+    }
 }
 
 async fn spine_error(
@@ -234,6 +300,152 @@ async fn signed_desired_and_full_observation_commit_and_replay_exact_bytes() {
         .unwrap();
     assert_eq!(replay.status(), StatusCode::OK);
     assert_eq!(replay.bytes().await.unwrap(), accepted_bytes);
+}
+
+#[tokio::test]
+async fn definite_session_rejections_are_exact_409_and_zero_write() {
+    let context = Context::new().await;
+    let mut wrong = context.binding();
+    wrong.agent_instance_id = RandomId128::new("99999999999999999999999999999999").unwrap();
+    let request = DesiredReadRequest {
+        version: ContractVersion::V1,
+        session: wrong,
+        request_sequence: Sequence::new(1).unwrap(),
+    };
+    let before = context.fingerprint().await;
+    let response = context
+        .signed(DESIRED_PATH, encode_desired_read_request(&request).unwrap())
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::CONFLICT);
+    assert!(matches!(
+        spine_error(response).await.error.as_ref(),
+        RuntimeSpineErrorDetail::ContractError { contract_error }
+            if matches!(contract_error.error.as_ref(), ContractErrorDetail::WrongSession { .. })
+    ));
+    assert_eq!(context.fingerprint().await, before);
+
+    // The rejected sequence was not consumed.
+    let correct = DesiredReadRequest {
+        version: ContractVersion::V1,
+        session: context.binding(),
+        request_sequence: Sequence::new(1).unwrap(),
+    };
+    assert_eq!(
+        context
+            .signed(DESIRED_PATH, encode_desired_read_request(&correct).unwrap(),)
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        StatusCode::OK
+    );
+
+    let expired = Context::new().await;
+    cats_control_plane::testsupport::expire_agent_session_for_test(
+        &expired.server.state.store,
+        expired.session.node_id.clone(),
+    )
+    .await;
+    let before = expired.fingerprint().await;
+    let request = DesiredReadRequest {
+        version: ContractVersion::V1,
+        session: expired.binding(),
+        request_sequence: Sequence::new(1).unwrap(),
+    };
+    let response = expired
+        .signed(DESIRED_PATH, encode_desired_read_request(&request).unwrap())
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::CONFLICT);
+    assert!(matches!(
+        spine_error(response).await.error.as_ref(),
+        RuntimeSpineErrorDetail::ContractError { contract_error }
+            if matches!(contract_error.error.as_ref(), ContractErrorDetail::SessionExpired { .. })
+    ));
+    assert_eq!(expired.fingerprint().await, before);
+}
+
+#[tokio::test]
+async fn definite_cursor_rejections_are_exact_409_and_zero_write() {
+    let expired = Context::new().await;
+    let desired = DesiredReadRequest {
+        version: ContractVersion::V1,
+        session: expired.binding(),
+        request_sequence: Sequence::new(1).unwrap(),
+    };
+    let response = expired
+        .signed(DESIRED_PATH, encode_desired_read_request(&desired).unwrap())
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let snapshot = decode_desired_read_snapshot(&response.bytes().await.unwrap()).unwrap();
+    cats_control_plane::testsupport::expire_runtime_cursor_for_test(
+        &expired.server.state.store,
+        expired.session.node_id.clone(),
+    )
+    .await;
+    let before = expired.fingerprint().await;
+    let observation =
+        expired.full_observation(snapshot.read_position, "cccccccccccccccccccccccccccccccc");
+    let response = expired
+        .signed(
+            OBSERVATION_PATH,
+            encode_node_observation(&observation).unwrap(),
+        )
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::CONFLICT);
+    assert!(matches!(
+        spine_error(response).await.error.as_ref(),
+        RuntimeSpineErrorDetail::ContractError { contract_error }
+            if matches!(
+                contract_error.error.as_ref(),
+                ContractErrorDetail::InventoryReadPositionExpired { .. }
+            )
+    ));
+    assert_eq!(expired.fingerprint().await, before);
+
+    let changed = Context::new().await;
+    let desired = DesiredReadRequest {
+        version: ContractVersion::V1,
+        session: changed.binding(),
+        request_sequence: Sequence::new(1).unwrap(),
+    };
+    let response = changed
+        .signed(DESIRED_PATH, encode_desired_read_request(&desired).unwrap())
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let snapshot = decode_desired_read_snapshot(&response.bytes().await.unwrap()).unwrap();
+    cats_control_plane::testsupport::insert_assigned_desired_after_cursor_for_test(
+        &changed.server.state.store,
+        changed.session.node_id.clone(),
+    )
+    .await;
+    let before = changed.fingerprint().await;
+    let observation =
+        changed.full_observation(snapshot.read_position, "dddddddddddddddddddddddddddddddd");
+    let response = changed
+        .signed(
+            OBSERVATION_PATH,
+            encode_node_observation(&observation).unwrap(),
+        )
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::CONFLICT);
+    assert!(matches!(
+        spine_error(response).await.error.as_ref(),
+        RuntimeSpineErrorDetail::ContractError { contract_error }
+            if matches!(contract_error.error.as_ref(), ContractErrorDetail::AssignedSetChanged { .. })
+    ));
+    assert_eq!(changed.fingerprint().await, before);
 }
 
 #[tokio::test]
@@ -403,4 +615,37 @@ async fn observation_renews_while_the_ordinary_store_connection_is_saturated() {
 
     release_tx.send(()).unwrap();
     ordinary.await.unwrap().unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn pending_bodies_hit_the_absolute_deadline_release_admission_and_never_touch_store() {
+    let context = Context::new().await;
+    let before = context.fingerprint().await;
+    let mut pending = Vec::new();
+    for _ in 0..65 {
+        pending.push(pending_chunked_request(context.server.addr, DESIRED_PATH).await);
+    }
+
+    let desired = DesiredReadRequest {
+        version: ContractVersion::V1,
+        session: context.binding(),
+        request_sequence: Sequence::new(1).unwrap(),
+    };
+    let body = encode_desired_read_request(&desired).unwrap();
+    let saturated = tokio::time::timeout(
+        Duration::from_secs(2),
+        context.signed(DESIRED_PATH, body.clone()).send(),
+    )
+    .await
+    .expect("the nonblocking global admission waited")
+    .unwrap();
+    assert_eq!(saturated.status(), StatusCode::SERVICE_UNAVAILABLE);
+
+    for stream in pending {
+        assert_eq!(raw_status(stream).await, StatusCode::SERVICE_UNAVAILABLE);
+    }
+    assert_eq!(context.fingerprint().await, before);
+
+    let accepted = context.signed(DESIRED_PATH, body).send().await.unwrap();
+    assert_eq!(accepted.status(), StatusCode::OK);
 }
