@@ -8,13 +8,14 @@ use cats_api::runtime_reconciliation::{
     encode_desired_runtime_spec, guest_config_digest, inventory_digest, spec_digest,
     AgentRegistrationAttempt, AgentSession, AppliedDesiredEvidence, AsciiText as RuntimeAsciiText,
     AssignedKind, AssignedPlacement, CheckpointEvidence, CleanupRelease, CleanupTarget,
-    ContractErrorDetail, ContractVersion, CredentialBinding, DesiredReadRequest,
-    DesiredRuntimeSpec, DiskKind, GuestDeviceIdentity, GuestRuntimeProfileReceipt,
-    GuestTransportEvidence, Ipv4Address, IsolatedIpv4Kind, LifecycleAdmission, LocalLineageState,
-    LocalVolumeLineage, MacAddress, NetworkConfig, NodeBootId, NodeIdentity, NodeIdentityState,
-    NodeObservation, ObservedDiskKind, ObservedRuntimeStatus, ObservedVolume, Operation,
-    OperationPhase, ReconcileStep, RuntimeConfig, RuntimeTarget, RuntimeTransition,
-    RuntimeVolumeAuthorizationRejection, RuntimeVolumeTransition,
+    ContractErrorDetail, ContractVersion, ControlHandshakeEvidence, CredentialBinding,
+    DesiredReadRequest, DesiredRuntimeSpec, DiskKind, GuestDeviceIdentity,
+    GuestRuntimeProfileReceipt, GuestTransportEvidence, Ipv4Address, IsolatedIpv4Kind,
+    LifecycleAdmission, LocalLineageState, LocalVolumeLineage, MacAddress, NetworkConfig,
+    NodeBootId, NodeIdentity, NodeIdentityState, NodeObservation, NodeResidue, ObservedDiskKind,
+    ObservedRuntimeStatus, ObservedVolume, Operation, OperationPhase, OwnershipTokenEvidence,
+    ProcessEvidence, ProcessRole, ProcessState, ReconcileStep, RuntimeConfig, RuntimeTarget,
+    RuntimeTransition, RuntimeVolumeAuthorizationRejection, RuntimeVolumeTransition,
     RuntimeVolumeTransitionEvidenceRequest, RuntimeVolumeTransitionOutcome,
     RuntimeVolumeTransitionPreconditionProblem, RuntimeVolumeTransitionRequest, Sequence,
     SessionBinding, VolumeAccess, VolumeAcquire, VolumeAcquireRequest, VolumeAuthorityEvidence,
@@ -22,11 +23,12 @@ use cats_api::runtime_reconciliation::{
 };
 use cats_storage::authority::{
     complete_disposable_root_delete, consume_disposable_root_delete, AsciiText, AuthorityError,
-    AuthorizationRecord, AuthorizationState, DeleteCompletionReceipt,
+    AuthorizationConsumedReceipt, AuthorizationRecord, AuthorizationState, DeleteCompletionReceipt,
     DisposableDeleteIsolationBasis, DisposableRootDeleteAuthorization, Epoch, FenceEpoch,
     Generation, HostFenceEvent, HostFenceEventState, HostIsolationState, Id, NormalAcquireRequest,
-    RandomId128, ReleaseRequest, RemoteHead, Revision, Sha256Digest, UnixMillis, VolumeAdminState,
-    VolumeAuthorization, VolumeDurability, VolumeRecord, VolumeTakeoverAuthorization,
+    RandomId128, ReleaseRequest, RemoteHead, Revision, Sha256Digest, TakeoverConsumedReceipt,
+    UnixMillis, VolumeAdminState, VolumeAuthorization, VolumeDurability, VolumeRecord,
+    VolumeTakeoverAuthorization,
 };
 
 use super::product::{CatRecord, DiskAdminState, DiskRecord, DiskRole, DiskSnapshotRecord};
@@ -45,8 +47,8 @@ use super::runtime_spine::{
     RuntimeSpineOutcome,
 };
 use super::volume_transition_auth::{
-    authenticate_evidence_context_in, RuntimeTakeoverConsumeRequest, VolumeTransitionStoreOutcome,
-    VolumeTransitionStoreRejection,
+    authenticate_evidence_context_in, release_disposition_matches_current,
+    RuntimeTakeoverConsumeRequest, VolumeTransitionStoreOutcome, VolumeTransitionStoreRejection,
 };
 use super::volume_transition_evidence::{
     load_volume_transition_evidence_in, VolumeTransitionEvidenceLoad,
@@ -369,12 +371,111 @@ fn observed_owned_volume(
     }
 }
 
+fn observed_unowned_volume(desired: &DesiredRuntimeSpec, volume: &VolumeRecord) -> ObservedVolume {
+    let intent = desired.volumes.first().unwrap();
+    ObservedVolume {
+        volume_intent_id: Some(intent.volume_intent_id.clone()),
+        disk_id: Some(intent.disk_id.clone()),
+        volume_id: intent.volume_id.clone(),
+        disk_kind: match intent.disk_kind {
+            DiskKind::Root => ObservedDiskKind::Root,
+            DiskKind::Persistent => ObservedDiskKind::Persistent,
+        },
+        size_bytes: Some(intent.size_bytes),
+        durability: Some(intent.durability),
+        authority: VolumeAuthorityEvidence::Unowned {
+            attachment_epoch: volume.lease_epoch,
+            head: volume.head.clone(),
+        },
+        local_lineages: Vec::new(),
+        devices: Vec::new(),
+    }
+}
+
+fn observed_blockd_process(
+    volume_id: &Id,
+    attachment_id: &Id,
+    attachment_epoch: FenceEpoch,
+    suffix: u32,
+) -> ProcessEvidence {
+    ProcessEvidence {
+        role: ProcessRole::Blockd {
+            volume_id: volume_id.clone(),
+            attachment_id: attachment_id.clone(),
+            attachment_epoch,
+        },
+        process_id: 4_000 + suffix,
+        process_start_time_ticks: WireU64::new(u64::from(9_000 + suffix)).unwrap(),
+        executable_path: cats_api::runtime_reconciliation::HostPath::new("/usr/bin/cats-blockd")
+            .unwrap(),
+        scope_id: id(&format!("cats-blockd-{suffix}")),
+        control_socket_path: cats_api::runtime_reconciliation::HostPath::new(format!(
+            "/run/cats/blockd-{suffix}.sock"
+        ))
+        .unwrap(),
+        state: ProcessState::Running,
+        ownership_token: OwnershipTokenEvidence::Valid {
+            ownership_token: random_id(u128::from(4_000 + suffix)),
+        },
+        control_handshake: ControlHandshakeEvidence::Verified,
+        observed_vm_shape: None,
+    }
+}
+
+fn orphan_runtime_with_volume_evidence(
+    template: &ObservedRuntimeStatus,
+    volumes: Vec<ObservedVolume>,
+    processes: Vec<ProcessEvidence>,
+) -> ObservedRuntimeStatus {
+    let mut orphan = template.clone();
+    orphan.cat_id = id("cat-orphan");
+    orphan.applied_desired = None;
+    orphan.runtime_incarnation = None;
+    orphan.stable_state = None;
+    orphan.checkpoint = CheckpointEvidence::Missing {
+        checkpoint_path: cats_api::runtime_reconciliation::HostPath::new(
+            "/var/lib/cats/runtime/cat-orphan.json",
+        )
+        .unwrap(),
+    };
+    orphan.processes = processes;
+    orphan.volumes = volumes;
+    orphan.mounts.clear();
+    orphan.networks.clear();
+    orphan.routes.clear();
+    orphan
+}
+
 fn prepare_a22_runtime(
     store: &Store,
     node: &TransitionNode,
     desired: &DesiredRuntimeSpec,
     volume: &VolumeRecord,
     runtime: ObservedRuntimeStatus,
+    operation_required: bool,
+) -> super::runtime_spine::PlacementAdmissionSnapshot {
+    prepare_a22_runtime_with_inventory(
+        store,
+        node,
+        desired,
+        volume,
+        vec![runtime],
+        Vec::new(),
+        operation_required,
+    )
+}
+
+#[allow(
+    clippy::too_many_arguments,
+    reason = "the full-inventory fixture keeps every accepted authority source explicit"
+)]
+fn prepare_a22_runtime_with_inventory(
+    store: &Store,
+    node: &TransitionNode,
+    desired: &DesiredRuntimeSpec,
+    volume: &VolumeRecord,
+    runtimes: Vec<ObservedRuntimeStatus>,
+    residue: Vec<NodeResidue>,
     operation_required: bool,
 ) -> super::runtime_spine::PlacementAdmissionSnapshot {
     store
@@ -461,8 +562,8 @@ fn prepare_a22_runtime(
         key_ring_version: None,
         key_ring_digest: None,
         loaded_kids: Vec::new(),
-        runtimes: vec![runtime],
-        residue: Vec::new(),
+        runtimes,
+        residue,
     };
     observation.inventory_digest = Some(inventory_digest(&observation).unwrap());
     match store
@@ -628,6 +729,93 @@ fn transition_request(
     }
 }
 
+fn release_transition_request(
+    node: &TransitionNode,
+    desired: &DesiredRuntimeSpec,
+    admission: &super::runtime_spine::PlacementAdmissionSnapshot,
+    volume: &VolumeRecord,
+    disposition: VolumeDisposition,
+) -> RuntimeVolumeTransitionRequest {
+    transition_request(
+        node,
+        desired,
+        RuntimeVolumeTransition::Release {
+            cleanup: CleanupRelease {
+                target: CleanupTarget::Volume {
+                    volume_id: volume.volume_id.clone(),
+                    attachment_id: volume.lease_owner.clone().unwrap(),
+                    attachment_epoch: volume.lease_epoch,
+                },
+                inventory_session: node.session.clone(),
+                inventory_epoch: admission.inventory_attestation.inventory_epoch,
+                inventory_read_position: admission.inventory_attestation.inventory_read_position,
+                desired_read_position: admission.desired_read_position,
+                volume_release: Some(VolumeReleaseReplay {
+                    release_transition_id: random_id(2),
+                    generation: volume.head.generation,
+                    disposition,
+                }),
+            },
+        },
+    )
+}
+
+fn prepare_root_delete_release_fixture(
+    store: &Store,
+    volume: &VolumeRecord,
+) -> (
+    TransitionNode,
+    DesiredRuntimeSpec,
+    super::runtime_spine::PlacementAdmissionSnapshot,
+    RuntimeVolumeTransitionRequest,
+) {
+    let node = transition_node(store, "node-new");
+    let workspace = super::product_tests::bootstrap_workspace(store, "a22-root-release");
+    let desired = transition_desired(
+        &workspace,
+        &node,
+        volume,
+        RuntimeTarget::Deleted,
+        revision(12),
+        epoch(4),
+        id("attachment-old"),
+        VolumeAcquire::Normal {
+            transition_id: random_id(1),
+            expected_unowned_epoch: fence_epoch(7),
+        },
+        VolumeDisposition::DeleteDisposableRoot {
+            delete_id: id("delete-1"),
+        },
+    );
+    let observed = observed_owned_volume(
+        &desired,
+        volume,
+        cats_api::runtime_reconciliation::AcquireOrigin::Normal {
+            transition_id: random_id(1),
+        },
+        volume.head.generation,
+        volume.head.generation,
+    );
+    let admission = prepare_a22_runtime(
+        store,
+        &node,
+        &desired,
+        volume,
+        observed_runtime_with_volumes(&desired, None, vec![observed]),
+        true,
+    );
+    let request = release_transition_request(
+        &node,
+        &desired,
+        &admission,
+        volume,
+        VolumeDisposition::DeleteDisposableRoot {
+            delete_id: id("delete-1"),
+        },
+    );
+    (node, desired, admission, request)
+}
+
 fn execute_transition(
     store: &Store,
     node: &TransitionNode,
@@ -641,6 +829,71 @@ fn execute_transition(
         &node.active_guest_config_digest,
         &AuthorityRequestContext::new(Instant::now() + Duration::from_secs(5)),
     )
+}
+
+#[test]
+fn a22_release_target_disk_kind_and_disposition_matrix_is_closed() {
+    let store = Store::connect(&crate::testsupport::isolated_control_store_url(), None).unwrap();
+    let node = transition_node(&store, "node-new");
+    let volume = unowned_volume();
+    let workspace = id("workspace-matrix");
+    let base = transition_desired(
+        &workspace,
+        &node,
+        &volume,
+        RuntimeTarget::Cold,
+        revision(1),
+        epoch(1),
+        id("attachment-matrix"),
+        VolumeAcquire::Normal {
+            transition_id: random_id(1),
+            expected_unowned_epoch: volume.lease_epoch,
+        },
+        VolumeDisposition::Retain,
+    );
+    for target in [
+        RuntimeTarget::Running,
+        RuntimeTarget::Suspended,
+        RuntimeTarget::Warm,
+        RuntimeTarget::Cold,
+        RuntimeTarget::Deleted,
+    ] {
+        for disk_kind in [DiskKind::Root, DiskKind::Persistent] {
+            for disposition in [
+                VolumeDisposition::Retain,
+                VolumeDisposition::DetachRetained,
+                VolumeDisposition::DeleteDisposableRoot {
+                    delete_id: id("delete-matrix"),
+                },
+            ] {
+                let mut desired = base.clone();
+                desired.target = target;
+                desired.volumes[0].disk_kind = disk_kind;
+                desired.volumes[0].disposition = disposition.clone();
+                let expected = matches!(
+                    (target, disk_kind, &disposition),
+                    (
+                        RuntimeTarget::Cold,
+                        DiskKind::Root | DiskKind::Persistent,
+                        VolumeDisposition::Retain,
+                    ) | (
+                        RuntimeTarget::Deleted,
+                        DiskKind::Persistent,
+                        VolumeDisposition::DetachRetained,
+                    ) | (
+                        RuntimeTarget::Deleted,
+                        DiskKind::Root,
+                        VolumeDisposition::DeleteDisposableRoot { .. },
+                    )
+                );
+                assert_eq!(
+                    release_disposition_matches_current(&desired, &desired.volumes[0]),
+                    expected,
+                    "unexpected release matrix decision for {target:?}/{disk_kind:?}/{disposition:?}"
+                );
+            }
+        }
+    }
 }
 
 pub(crate) fn prepare_a22_http_normal_fixture(
@@ -676,7 +929,11 @@ pub(crate) fn prepare_a22_http_normal_fixture(
         &node,
         &desired,
         &volume,
-        takeover_runtime_status(&desired),
+        observed_runtime_with_volumes(
+            &desired,
+            None,
+            vec![observed_unowned_volume(&desired, &volume)],
+        ),
         false,
     );
     transition_request(
@@ -1294,7 +1551,11 @@ fn a22_normal_acquire_commits_once_and_replays_after_response_loss() {
         &node,
         &desired,
         &volume,
-        takeover_runtime_status(&desired),
+        observed_runtime_with_volumes(
+            &desired,
+            None,
+            vec![observed_unowned_volume(&desired, &volume)],
+        ),
         false,
     );
     let request = transition_request(
@@ -1332,6 +1593,122 @@ fn a22_normal_acquire_commits_once_and_replays_after_response_loss() {
     assert_eq!(grant.attachment_id, id("attachment-normal"));
     assert_eq!(grant.attachment_epoch, fence_epoch(8));
     assert_eq!(stored_volume(&store, &volume.volume_id), committed);
+}
+
+#[test]
+fn a22_normal_acquire_rejects_incomplete_or_cross_runtime_volume_authority() {
+    #[derive(Clone, Copy)]
+    enum PhysicalConflict {
+        OwnedWithoutLineage,
+        OtherRuntimeVolume,
+        OtherRuntimeBlockd,
+        ResidueControlSocket,
+    }
+
+    for conflict in [
+        PhysicalConflict::OwnedWithoutLineage,
+        PhysicalConflict::OtherRuntimeVolume,
+        PhysicalConflict::OtherRuntimeBlockd,
+        PhysicalConflict::ResidueControlSocket,
+    ] {
+        let store =
+            Store::connect(&crate::testsupport::isolated_control_store_url(), None).unwrap();
+        let volume = unowned_volume();
+        seed_volume(&store, &volume);
+        let node = transition_node(&store, "node-new");
+        let workspace = super::product_tests::bootstrap_workspace(&store, "a22-normal-index");
+        let desired = transition_desired(
+            &workspace,
+            &node,
+            &volume,
+            RuntimeTarget::Running,
+            revision(11),
+            epoch(3),
+            id("attachment-normal"),
+            VolumeAcquire::Normal {
+                transition_id: random_id(2),
+                expected_unowned_epoch: fence_epoch(7),
+            },
+            VolumeDisposition::Retain,
+        );
+        let mut observed = observed_unowned_volume(&desired, &volume);
+        let mut target = observed_runtime_with_volumes(&desired, None, vec![observed.clone()]);
+        let mut runtimes = vec![target.clone()];
+        let mut residue = Vec::new();
+        match conflict {
+            PhysicalConflict::OwnedWithoutLineage => {
+                observed.authority = VolumeAuthorityEvidence::Owned {
+                    attachment_id: id("attachment-normal"),
+                    attachment_epoch: fence_epoch(8),
+                    head: volume.head.clone(),
+                };
+                target.volumes = vec![observed];
+                runtimes = vec![target];
+            }
+            PhysicalConflict::OtherRuntimeVolume => {
+                runtimes.push(orphan_runtime_with_volume_evidence(
+                    &target,
+                    vec![observed],
+                    Vec::new(),
+                ));
+            }
+            PhysicalConflict::OtherRuntimeBlockd => {
+                runtimes.push(orphan_runtime_with_volume_evidence(
+                    &target,
+                    Vec::new(),
+                    vec![observed_blockd_process(
+                        &volume.volume_id,
+                        &id("attachment-other"),
+                        fence_epoch(8),
+                        1,
+                    )],
+                ));
+            }
+            PhysicalConflict::ResidueControlSocket => {
+                residue.push(NodeResidue::ControlSocket {
+                    socket_path: cats_api::runtime_reconciliation::HostPath::new(
+                        "/run/cats/orphan-volume.sock",
+                    )
+                    .unwrap(),
+                    role_hint: Some(ProcessRole::Blockd {
+                        volume_id: volume.volume_id.clone(),
+                        attachment_id: id("attachment-other"),
+                        attachment_epoch: fence_epoch(8),
+                    }),
+                    ownership_token: OwnershipTokenEvidence::Missing,
+                });
+            }
+        }
+        prepare_a22_runtime_with_inventory(
+            &store, &node, &desired, &volume, runtimes, residue, false,
+        );
+        let request = transition_request(
+            &node,
+            &desired,
+            RuntimeVolumeTransition::Acquire {
+                request: VolumeAcquireRequest::Normal {
+                    volume_id: volume.volume_id.clone(),
+                    transition_id: random_id(2),
+                    attachment_id: id("attachment-normal"),
+                    expected_unowned_epoch: fence_epoch(7),
+                    desired_revision: desired.desired_revision,
+                    placement_epoch: desired.placement.placement_epoch,
+                    lease_duration_ms: 30_000,
+                },
+            },
+        );
+        let before = stored_volume(&store, &volume.volume_id);
+        assert_eq!(
+            execute_transition(&store, &node, &request).unwrap(),
+            VolumeTransitionStoreOutcome::Rejected(
+                VolumeTransitionStoreRejection::TransitionPreconditionFailed {
+                    cat_id: desired.cat_id,
+                    problem: RuntimeVolumeTransitionPreconditionProblem::VolumeIntentMismatch,
+                }
+            )
+        );
+        assert_eq!(stored_volume(&store, &volume.volume_id), before);
+    }
 }
 
 #[test]
@@ -1444,6 +1821,276 @@ fn a22_release_uses_full_physical_evidence_and_exactly_replays() {
     let released = stored_volume(&store, &owned.volume_id);
     assert_eq!(released.lease_owner, None);
     assert_eq!(released.lease_epoch, fence_epoch(9));
+}
+
+#[test]
+fn a22_release_rejects_duplicate_or_other_runtime_writers() {
+    #[derive(Clone, Copy)]
+    enum PhysicalConflict {
+        OtherRuntimeVolume,
+        OtherRuntimeBlockd,
+    }
+
+    for conflict in [
+        PhysicalConflict::OtherRuntimeVolume,
+        PhysicalConflict::OtherRuntimeBlockd,
+    ] {
+        let store =
+            Store::connect(&crate::testsupport::isolated_control_store_url(), None).unwrap();
+        let owned = acquire_owned_volume(&store);
+        let node = transition_node(&store, "node-new");
+        let workspace = super::product_tests::bootstrap_workspace(&store, "a22-release-index");
+        let desired = transition_desired(
+            &workspace,
+            &node,
+            &owned,
+            RuntimeTarget::Cold,
+            revision(11),
+            epoch(3),
+            id("attachment-old"),
+            VolumeAcquire::Normal {
+                transition_id: random_id(1),
+                expected_unowned_epoch: fence_epoch(7),
+            },
+            VolumeDisposition::Retain,
+        );
+        let observed = observed_owned_volume(
+            &desired,
+            &owned,
+            cats_api::runtime_reconciliation::AcquireOrigin::Normal {
+                transition_id: random_id(1),
+            },
+            owned.head.generation,
+            owned.head.generation,
+        );
+        let target = observed_runtime_with_volumes(&desired, None, vec![observed.clone()]);
+        let orphan = match conflict {
+            PhysicalConflict::OtherRuntimeVolume => {
+                let mut duplicate = observed;
+                duplicate.local_lineages[0].data_directory =
+                    cats_api::runtime_reconciliation::HostPath::new(
+                        "/var/lib/cats/volumes/volume-1-duplicate",
+                    )
+                    .unwrap();
+                orphan_runtime_with_volume_evidence(&target, vec![duplicate], Vec::new())
+            }
+            PhysicalConflict::OtherRuntimeBlockd => orphan_runtime_with_volume_evidence(
+                &target,
+                Vec::new(),
+                vec![observed_blockd_process(
+                    &owned.volume_id,
+                    &id("attachment-old"),
+                    owned.lease_epoch,
+                    2,
+                )],
+            ),
+        };
+        let admission = prepare_a22_runtime_with_inventory(
+            &store,
+            &node,
+            &desired,
+            &owned,
+            vec![target, orphan],
+            Vec::new(),
+            false,
+        );
+        let request = transition_request(
+            &node,
+            &desired,
+            RuntimeVolumeTransition::Release {
+                cleanup: CleanupRelease {
+                    target: CleanupTarget::Volume {
+                        volume_id: owned.volume_id.clone(),
+                        attachment_id: id("attachment-old"),
+                        attachment_epoch: owned.lease_epoch,
+                    },
+                    inventory_session: node.session.clone(),
+                    inventory_epoch: admission.inventory_attestation.inventory_epoch,
+                    inventory_read_position: admission
+                        .inventory_attestation
+                        .inventory_read_position,
+                    desired_read_position: admission.desired_read_position,
+                    volume_release: Some(VolumeReleaseReplay {
+                        release_transition_id: random_id(2),
+                        generation: owned.head.generation,
+                        disposition: VolumeDisposition::Retain,
+                    }),
+                },
+            },
+        );
+        let before = stored_volume(&store, &owned.volume_id);
+        assert_eq!(
+            execute_transition(&store, &node, &request).unwrap(),
+            VolumeTransitionStoreOutcome::Rejected(
+                VolumeTransitionStoreRejection::TransitionPreconditionFailed {
+                    cat_id: desired.cat_id,
+                    problem: RuntimeVolumeTransitionPreconditionProblem::CleanupEvidenceMismatch,
+                }
+            )
+        );
+        assert_eq!(stored_volume(&store, &owned.volume_id), before);
+    }
+}
+
+#[test]
+fn a22_root_release_ignores_a_historical_consumed_takeover() {
+    let store = Store::connect(&crate::testsupport::isolated_control_store_url(), None).unwrap();
+    let owned = acquire_owned_volume(&store);
+    let (node, _desired, _admission, request) = prepare_root_delete_release_fixture(&store, &owned);
+
+    let mut event = host_fence_event(HostFenceEventState::Active);
+    event.event_id = id("historical-fence-event");
+    let original = AuthorizationRecord {
+        authorization: VolumeAuthorization::Takeover(VolumeTakeoverAuthorization {
+            authorization_id: id("historical-takeover"),
+            authorized_node_id: node.session.node_id.clone(),
+            host_fence_event_id: event.event_id.clone(),
+            volume_id: owned.volume_id.clone(),
+            expected_attachment_id: id("historical-attachment-old"),
+            expected_epoch: fence_epoch(5),
+            new_attachment_id: id("historical-attachment-new"),
+            desired_revision: revision(9),
+            new_placement_epoch: epoch(2),
+            lease_duration_ms: 30_000,
+            not_after: unix_millis(100_000),
+        }),
+        state: AuthorizationState::Unconsumed,
+    };
+    let consumed = AuthorizationRecord {
+        authorization: original.authorization.clone(),
+        state: AuthorizationState::Consumed(Box::new(AuthorizationConsumedReceipt::Takeover(
+            TakeoverConsumedReceipt {
+                authorization_id: id("historical-takeover"),
+                host_fence_event_id: event.event_id.clone(),
+                volume_id: owned.volume_id.clone(),
+                new_attachment_id: id("historical-attachment-new"),
+                resulting_epoch: fence_epoch(6),
+                resulting_head: owned.head.clone(),
+                consumed_at: unix_millis(1_000),
+            },
+        ))),
+    };
+    store
+        .authority_transaction(|transaction| {
+            insert_event(transaction, &event)?;
+            insert_authorization(transaction, &original)?;
+            update_authorization(transaction, &original, &consumed)
+        })
+        .unwrap();
+
+    let outcome = execute_transition(&store, &node, &request).unwrap();
+    assert!(matches!(
+        outcome,
+        VolumeTransitionStoreOutcome::Accepted(
+            cats_api::runtime_reconciliation::RuntimeVolumeTransitionSuccess {
+                outcome: RuntimeVolumeTransitionOutcome::Released { .. },
+                ..
+            }
+        )
+    ));
+}
+
+#[test]
+fn a22_root_release_validates_product_and_cleanup_before_fresh_branch_conflict() {
+    #[derive(Clone, Copy)]
+    enum EarlierFailure {
+        ProductCorruption,
+        CleanupMismatch,
+    }
+
+    for failure in [
+        EarlierFailure::ProductCorruption,
+        EarlierFailure::CleanupMismatch,
+    ] {
+        let store =
+            Store::connect(&crate::testsupport::isolated_control_store_url(), None).unwrap();
+        let owned = acquire_owned_volume(&store);
+        let (node, desired, _admission, mut request) =
+            prepare_root_delete_release_fixture(&store, &owned);
+        let authorization = disposable_authorization(&owned);
+        store
+            .authority_transaction(|transaction| insert_authorization(transaction, &authorization))
+            .unwrap();
+        let before = stored_volume(&store, &owned.volume_id);
+
+        match failure {
+            EarlierFailure::ProductCorruption => {
+                store
+                    .authority_transaction(|transaction| {
+                        transaction.execute(
+                            "UPDATE disk_records
+                                SET record=jsonb_set(
+                                    record,
+                                    '{volume_id}',
+                                    '\"corrupt-volume\"'::jsonb
+                                )
+                              WHERE disk_id=$1",
+                            &[&"disk-1"],
+                        )?;
+                        Ok(())
+                    })
+                    .unwrap();
+                let error = execute_transition(&store, &node, &request).unwrap_err();
+                assert_eq!(error.code, ErrorCode::Internal);
+            }
+            EarlierFailure::CleanupMismatch => {
+                let RuntimeVolumeTransition::Release { cleanup } = &mut request.transition else {
+                    unreachable!()
+                };
+                cleanup.inventory_epoch = epoch(2);
+                assert_eq!(
+                    execute_transition(&store, &node, &request).unwrap(),
+                    VolumeTransitionStoreOutcome::Rejected(
+                        VolumeTransitionStoreRejection::TransitionPreconditionFailed {
+                            cat_id: desired.cat_id,
+                            problem:
+                                RuntimeVolumeTransitionPreconditionProblem::CleanupEvidenceMismatch,
+                        }
+                    )
+                );
+            }
+        }
+        assert_eq!(stored_volume(&store, &owned.volume_id), before);
+        assert_eq!(
+            stored_authorization(&store, &id("delete-auth-1")),
+            authorization
+        );
+    }
+}
+
+#[test]
+fn a22_release_accepts_a_persisted_cleanup_cursor_behind_the_latest_desired_read() {
+    let store = Store::connect(&crate::testsupport::isolated_control_store_url(), None).unwrap();
+    let owned = acquire_owned_volume(&store);
+    let (node, _desired, admission, request) = prepare_root_delete_release_fixture(&store, &owned);
+    let latest = match store
+        .runtime_desired_read(
+            &node.authenticated,
+            &DesiredReadRequest {
+                version: ContractVersion::V1,
+                session: node.session.clone(),
+                request_sequence: Sequence::new(2).unwrap(),
+            },
+        )
+        .unwrap()
+    {
+        RuntimeSpineOutcome::Accepted(snapshot) => snapshot,
+        RuntimeSpineOutcome::Rejected(rejection) => {
+            panic!("second Desired read rejected: {rejection:?}")
+        }
+    };
+    assert!(latest.read_position > admission.desired_read_position);
+
+    let outcome = execute_transition(&store, &node, &request).unwrap();
+    assert!(matches!(
+        outcome,
+        VolumeTransitionStoreOutcome::Accepted(
+            cats_api::runtime_reconciliation::RuntimeVolumeTransitionSuccess {
+                outcome: RuntimeVolumeTransitionOutcome::Released { .. },
+                ..
+            }
+        )
+    ));
 }
 
 #[test]

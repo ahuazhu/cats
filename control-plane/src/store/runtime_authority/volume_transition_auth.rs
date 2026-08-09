@@ -38,7 +38,7 @@ use super::rows::{
     load_takeover_authorization_for_intent_update, load_volume_for_update,
     runtime_authorization_route_for_context, takeover_authorization_is_owned_by_other_node,
     takeover_authorization_route_for_intent, update_authorization, update_volume,
-    volume_has_authorization,
+    volume_has_disposable_root_authorization_for_delete,
 };
 use super::runtime_spine::{
     lock_volume_mutation_admission_in, PlacementAdmissionSnapshot, VolumeMutationAdmissionRejection,
@@ -650,16 +650,6 @@ fn execute_release(
     };
     let volume = load_volume_for_update(context.transaction, volume_id)?
         .ok_or(AuthorityError::BackendUnknown)?;
-    if matches!(
-        intent.disposition,
-        VolumeDisposition::DeleteDisposableRoot { .. }
-    ) && volume_has_authorization(context.transaction, volume_id)?
-    {
-        return Ok(precondition_rejected(
-            context.desired.cat_id.clone(),
-            RuntimeVolumeTransitionPreconditionProblem::AuthorizationBranchConflict,
-        ));
-    }
     let (disk, locked_desired) = lock_product_context(
         context.transaction,
         &context.desired,
@@ -678,6 +668,20 @@ fn execute_release(
             context.desired.cat_id.clone(),
             RuntimeVolumeTransitionPreconditionProblem::CleanupEvidenceMismatch,
         ));
+    }
+    if let VolumeDisposition::DeleteDisposableRoot { delete_id } = &intent.disposition {
+        if volume_has_disposable_root_authorization_for_delete(
+            context.transaction,
+            volume_id,
+            delete_id,
+            context.desired.desired_revision,
+            context.desired.placement.placement_epoch,
+        )? {
+            return Ok(precondition_rejected(
+                context.desired.cat_id.clone(),
+                RuntimeVolumeTransitionPreconditionProblem::AuthorizationBranchConflict,
+            ));
+        }
     }
     let (updated, result) = match release(&volume, &release_request) {
         Ok(value) => value,
@@ -872,72 +876,85 @@ fn normal_physical_evidence_is_safe(
     volume: &VolumeRecord,
     request: &NormalAcquireRequest,
 ) -> bool {
-    if context
-        .admission
-        .full_inventory_observation
-        .residue
-        .iter()
-        .any(|residue| residue_may_name_volume(residue, &intent.volume_id))
+    let physical = PhysicalVolumeAuthorityIndex::build(
+        &context.admission.full_inventory_observation,
+        &intent.volume_id,
+    );
+    if physical.has_residue || physical.volumes.len() != 1 {
+        return false;
+    }
+    let Some(expected_runtime) = runtime_for_desired(&context.admission, &context.desired) else {
+        return false;
+    };
+    let (runtime, observed) = physical.volumes[0];
+    if !std::ptr::eq(runtime, expected_runtime)
+        || !observed_volume_identity_matches(observed, intent)
     {
         return false;
     }
-    let Some(runtime) = runtime_for_desired(&context.admission, &context.desired) else {
-        return false;
-    };
-    let observed: Vec<_> = runtime
-        .volumes
-        .iter()
-        .filter(|observed| observed.volume_id == intent.volume_id)
-        .collect();
-    if observed.is_empty() {
-        return !runtime.processes.iter().any(|process| {
-            matches!(
-                &process.role,
-                ProcessRole::Blockd { volume_id, .. } if volume_id == &intent.volume_id
-            )
-        });
-    }
-    if observed.len() != 1 {
-        return false;
-    }
-    let observed = observed[0];
-    if !observed_volume_identity_matches(observed, intent) {
-        return false;
-    }
-    let authority_matches = match &observed.authority {
+    match &observed.authority {
         VolumeAuthorityEvidence::Unowned {
             attachment_epoch,
             head,
-        } => *attachment_epoch == request.expected_unowned_epoch && *head == volume.head,
+        } => {
+            *attachment_epoch == request.expected_unowned_epoch
+                && *head == volume.head
+                && observed.local_lineages.is_empty()
+                && physical.blockd_processes.is_empty()
+                && physical.mounts.is_empty()
+        }
         VolumeAuthorityEvidence::Owned {
             attachment_id,
             attachment_epoch,
             head,
         } => {
+            let Some(resulting_epoch) = request
+                .expected_unowned_epoch
+                .get()
+                .checked_add(1)
+                .and_then(cats_storage::authority::FenceEpoch::new)
+            else {
+                return false;
+            };
             attachment_id == &request.attachment_id
-                && request
-                    .expected_unowned_epoch
-                    .get()
-                    .checked_add(1)
-                    .is_some_and(|expected| attachment_epoch.get() == expected)
+                && *attachment_epoch == resulting_epoch
                 && head == &volume.head
+                && observed.local_lineages.len() == 1
+                && observed.local_lineages.first().is_some_and(|lineage| {
+                    lineage.attachment_id == request.attachment_id
+                        && lineage.attachment_epoch == resulting_epoch
+                        && matches!(
+                            &lineage.acquire_origin,
+                            AcquireOrigin::Normal { transition_id }
+                                if transition_id == &request.transition_id
+                        )
+                        && lineage.node_id == context.node_id
+                        && lineage.placement_epoch == context.desired.placement.placement_epoch
+                        && !lineage.fenced
+                        && lineage.state == LocalLineageState::Active
+                })
+                && physical.blockd_processes.len() == 1
+                && physical
+                    .blockd_processes
+                    .first()
+                    .is_some_and(|(runtime, process)| {
+                        std::ptr::eq(*runtime, expected_runtime)
+                            && blockd_process_matches(
+                                process,
+                                &intent.volume_id,
+                                &request.attachment_id,
+                                resulting_epoch,
+                            )
+                    })
+                && physical
+                    .mounts
+                    .iter()
+                    .all(|(runtime, _)| std::ptr::eq(*runtime, expected_runtime))
         }
-        _ => false,
-    };
-    if !authority_matches {
-        return false;
+        VolumeAuthorityEvidence::Unavailable
+        | VolumeAuthorityEvidence::Absent
+        | VolumeAuthorityEvidence::Deleting { .. } => false,
     }
-    observed.local_lineages.iter().all(|lineage| {
-        lineage.attachment_id == request.attachment_id
-            && matches!(
-                &lineage.acquire_origin,
-                AcquireOrigin::Normal { transition_id }
-                    if transition_id == &request.transition_id
-            )
-            && lineage.node_id == context.node_id
-            && lineage.placement_epoch == context.desired.placement.placement_epoch
-            && lineage.state != LocalLineageState::Quarantined
-    })
 }
 
 fn release_evidence_matches(
@@ -946,12 +963,11 @@ fn release_evidence_matches(
     intent: &VolumeIntent,
     volume: &VolumeRecord,
 ) -> bool {
-    if context
-        .admission
-        .full_inventory_observation
-        .residue
-        .iter()
-        .any(|residue| residue_may_name_volume(residue, &intent.volume_id))
+    let physical = PhysicalVolumeAuthorityIndex::build(
+        &context.admission.full_inventory_observation,
+        &intent.volume_id,
+    );
+    if physical.has_residue
         || cleanup.inventory_session != session_binding_from_agent(&context.admission.agent_session)
         || cleanup.inventory_epoch != context.admission.inventory_attestation.inventory_epoch
         || cleanup.inventory_read_position
@@ -959,7 +975,8 @@ fn release_evidence_matches(
                 .admission
                 .inventory_attestation
                 .inventory_read_position
-        || cleanup.desired_read_position != context.admission.desired_read_position
+        || cleanup.desired_read_position < cleanup.inventory_read_position
+        || cleanup.desired_read_position > context.admission.desired_read_position
     {
         return false;
     }
@@ -976,20 +993,15 @@ fn release_evidence_matches(
             runtime.guest_transport,
             cats_api::runtime_reconciliation::GuestTransportEvidence::Unavailable
         )
+        || !physical.blockd_processes.is_empty()
+        || !physical.mounts.is_empty()
+        || physical.volumes.len() != 1
+        || !std::ptr::eq(physical.volumes[0].0, runtime)
     {
         return false;
     }
-    let mut observed_matches = runtime
-        .volumes
-        .iter()
-        .filter(|observed| observed.volume_id == intent.volume_id);
-    let Some(observed) = observed_matches.next() else {
-        return false;
-    };
-    if observed_matches.next().is_some()
-        || !observed_volume_identity_matches(observed, intent)
-        || !observed.devices.is_empty()
-    {
+    let observed = physical.volumes[0].1;
+    if !observed_volume_identity_matches(observed, intent) || !observed.devices.is_empty() {
         return false;
     }
     let VolumeAuthorityEvidence::Owned {
@@ -1024,8 +1036,102 @@ fn release_evidence_matches(
                 && lineage.local_durable_generation == release.generation
                 && lineage.remote_durable_generation == release.generation
                 && lineage.pending_pack_count.get() == 0
-                && lineage.state != LocalLineageState::Quarantined
+                && !lineage.fenced
+                && lineage.state == LocalLineageState::Active
         })
+}
+
+struct PhysicalVolumeAuthorityIndex<'a> {
+    volumes: Vec<(
+        &'a ObservedRuntimeStatus,
+        &'a cats_api::runtime_reconciliation::ObservedVolume,
+    )>,
+    blockd_processes: Vec<(
+        &'a ObservedRuntimeStatus,
+        &'a cats_api::runtime_reconciliation::ProcessEvidence,
+    )>,
+    mounts: Vec<(
+        &'a ObservedRuntimeStatus,
+        &'a cats_api::runtime_reconciliation::ObservedMount,
+    )>,
+    has_residue: bool,
+}
+
+impl<'a> PhysicalVolumeAuthorityIndex<'a> {
+    fn build(
+        observation: &'a cats_api::runtime_reconciliation::NodeObservation,
+        volume_id: &Id,
+    ) -> Self {
+        let mut volumes = Vec::new();
+        let mut blockd_processes = Vec::new();
+        let mut mounts = Vec::new();
+        for runtime in &observation.runtimes {
+            volumes.extend(
+                runtime
+                    .volumes
+                    .iter()
+                    .filter(|volume| volume.volume_id == *volume_id)
+                    .map(|volume| (runtime, volume)),
+            );
+            blockd_processes.extend(
+                runtime
+                    .processes
+                    .iter()
+                    .filter(|process| {
+                        matches!(
+                            &process.role,
+                            ProcessRole::Blockd {
+                                volume_id: current,
+                                ..
+                            } if current == volume_id
+                        )
+                    })
+                    .map(|process| (runtime, process)),
+            );
+            mounts.extend(
+                runtime
+                    .mounts
+                    .iter()
+                    .filter(|mount| mount.volume_id == *volume_id)
+                    .map(|mount| (runtime, mount)),
+            );
+        }
+        Self {
+            volumes,
+            blockd_processes,
+            mounts,
+            has_residue: observation
+                .residue
+                .iter()
+                .any(|residue| residue_may_name_volume(residue, volume_id)),
+        }
+    }
+}
+
+fn blockd_process_matches(
+    process: &cats_api::runtime_reconciliation::ProcessEvidence,
+    volume_id: &Id,
+    attachment_id: &Id,
+    attachment_epoch: cats_storage::authority::FenceEpoch,
+) -> bool {
+    matches!(
+        &process.role,
+        ProcessRole::Blockd {
+            volume_id: current_volume,
+            attachment_id: current_attachment,
+            attachment_epoch: current_epoch,
+        } if current_volume == volume_id
+            && current_attachment == attachment_id
+            && *current_epoch == attachment_epoch
+    ) && process.state == cats_api::runtime_reconciliation::ProcessState::Running
+        && matches!(
+            &process.ownership_token,
+            cats_api::runtime_reconciliation::OwnershipTokenEvidence::Valid { .. }
+        )
+        && matches!(
+            &process.control_handshake,
+            cats_api::runtime_reconciliation::ControlHandshakeEvidence::Verified
+        )
 }
 
 fn disposable_isolation_evidence_matches(
@@ -1177,6 +1283,13 @@ fn residue_may_name_volume(residue: &NodeResidue, volume_id: &Id) -> bool {
                     volume_id: current, ..
                 }),
             ..
+        }
+        | NodeResidue::ControlSocket {
+            role_hint:
+                Some(ProcessRole::Blockd {
+                    volume_id: current, ..
+                }),
+            ..
         } => current == volume_id,
         NodeResidue::KernelNbd { volume_id_hint, .. }
         | NodeResidue::VhostUserBlk { volume_id_hint, .. }
@@ -1213,7 +1326,7 @@ fn acquire_origin_matches_intent(origin: &AcquireOrigin, acquire: &VolumeAcquire
     )
 }
 
-fn release_disposition_matches_current(
+pub(super) fn release_disposition_matches_current(
     desired: &DesiredRuntimeSpec,
     intent: &VolumeIntent,
 ) -> bool {
@@ -1225,8 +1338,12 @@ fn release_disposition_matches_current(
             RuntimeTarget::Deleted,
         ) | (
             DiskKind::Persistent,
-            VolumeDisposition::Retain | VolumeDisposition::DetachRetained,
-            _,
+            VolumeDisposition::Retain,
+            RuntimeTarget::Cold,
+        ) | (
+            DiskKind::Persistent,
+            VolumeDisposition::DetachRetained,
+            RuntimeTarget::Deleted,
         ) | (
             DiskKind::Root,
             VolumeDisposition::Retain,

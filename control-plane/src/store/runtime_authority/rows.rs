@@ -651,19 +651,39 @@ pub(super) fn runtime_authorization_route_for_context(
     }))
 }
 
-/// Fresh branch check performed only after the matching Volume row is locked.
-/// Authorization derivation is required to take that same Volume lock before
-/// insert, so release and derive cannot both commit.
-pub(super) fn volume_has_authorization(
+/// Fresh branch check performed only after the matching Volume and product
+/// rows have been locked and the cleanup evidence has been validated.
+/// Authorization derivation takes the same Volume lock before inserting this
+/// exact disposable-delete lineage, so release and derive cannot both commit.
+/// Historical takeover records and authorizations for an older delete
+/// lineage are immutable evidence, not a branch conflict for the current
+/// normal Root delete.
+pub(super) fn volume_has_disposable_root_authorization_for_delete(
     transaction: &mut Transaction<'_>,
     volume_id: &Id,
+    delete_id: &Id,
+    desired_revision: Revision,
+    placement_epoch: Epoch,
 ) -> AuthorityTxResult<bool> {
+    let desired_revision = desired_revision.to_pg().map_err(corrupt)?;
+    let placement_epoch = placement_epoch.to_pg().map_err(corrupt)?;
     transaction
         .query_one(
             "SELECT EXISTS(
-                 SELECT 1 FROM volume_authorizations WHERE volume_id=$1
+                 SELECT 1
+                   FROM volume_authorizations
+                  WHERE volume_id=$1
+                    AND kind='disposable_root_delete'
+                    AND desired_revision=$3
+                    AND placement_epoch=$4
+                    AND record->'authorization'->>'delete_id'=$2
              )",
-            &[&volume_id.as_str()],
+            &[
+                &volume_id.as_str(),
+                &delete_id.as_str(),
+                &desired_revision,
+                &placement_epoch,
+            ],
         )?
         .try_get(0)
         .map_err(Into::into)
