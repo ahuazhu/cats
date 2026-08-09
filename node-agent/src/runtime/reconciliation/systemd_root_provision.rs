@@ -444,6 +444,14 @@ fn validate_credentialless_blockd_config(
         );
     }
     anyhow::ensure!(
+        config
+            .metadata_store
+            .config
+            .optional("session-setup")
+            .is_none_or(|value| matches!(value, "client" | "server-verified")),
+        "root-provision postgres session-setup is outside the closed adapter contract"
+    );
+    anyhow::ensure!(
         config.object_store.name == "aws-s3",
         "root-provision blockd requires the selected Direct-S3 object adapter"
     );
@@ -457,6 +465,25 @@ fn validate_credentialless_blockd_config(
         .config
         .required("aws-s3", "bucket")
         .context("root-provision S3 adapter requires a bucket")?;
+    if let Some(endpoint) = config.object_store.config.optional("endpoint") {
+        validate_s3_endpoint(endpoint)?;
+    }
+    Ok(())
+}
+
+fn validate_s3_endpoint(endpoint: &str) -> anyhow::Result<()> {
+    let endpoint =
+        reqwest::Url::parse(endpoint).context("root-provision S3 endpoint is invalid")?;
+    anyhow::ensure!(
+        matches!(endpoint.scheme(), "http" | "https")
+            && endpoint.has_host()
+            && endpoint.path() == "/"
+            && endpoint.query().is_none()
+            && endpoint.fragment().is_none()
+            && endpoint.username().is_empty()
+            && endpoint.password().is_none(),
+        "root-provision S3 endpoint must be an HTTP(S) origin without credentials, path, query, or fragment"
+    );
     Ok(())
 }
 
@@ -1399,6 +1426,13 @@ mod tests {
             .arguments
             .iter()
             .any(|argument| argument.to_string_lossy().contains("url-env=")));
+        assert!(!launch.arguments.iter().any(|argument| {
+            let argument = argument.to_string_lossy();
+            argument.contains("--setenv")
+                || argument.contains("secret")
+                || argument.contains('@')
+                || argument.contains('?')
+        }));
         assert_eq!(SYSTEMD_RUN, "/usr/bin/systemd-run");
         assert_eq!(SYSTEMCTL, "/usr/bin/systemctl");
     }
@@ -1502,8 +1536,56 @@ mod tests {
                     AdapterConfig::from_pairs([("root", "/srv/cats/objects")]).unwrap(),
                 ),
             ),
+            blockd_config(
+                AdapterSelection::new(
+                    "postgres",
+                    AdapterConfig::from_pairs([
+                        ("url-file", "/run/cats/postgres-url"),
+                        ("session-setup", "postgres://secret"),
+                    ])
+                    .unwrap(),
+                ),
+                s3_object_store(),
+            ),
+            blockd_config(
+                postgres_file_authority(),
+                AdapterSelection::new(
+                    "aws-s3",
+                    AdapterConfig::from_pairs([
+                        ("bucket", "cats-runtime-test"),
+                        ("endpoint", "https://access:secret@s3.example.test/"),
+                    ])
+                    .unwrap(),
+                ),
+            ),
+            blockd_config(
+                postgres_file_authority(),
+                AdapterSelection::new(
+                    "aws-s3",
+                    AdapterConfig::from_pairs([
+                        ("bucket", "cats-runtime-test"),
+                        ("endpoint", "https://s3.example.test/?credential=secret"),
+                    ])
+                    .unwrap(),
+                ),
+            ),
         ] {
             assert!(RootProvisionSystemdConfig::new(blockd).is_err());
+        }
+
+        for session_setup in ["client", "server-verified"] {
+            let metadata = AdapterSelection::new(
+                "postgres",
+                AdapterConfig::from_pairs([
+                    ("url-file", "/run/cats/postgres-url"),
+                    ("session-setup", session_setup),
+                ])
+                .unwrap(),
+            );
+            assert!(
+                RootProvisionSystemdConfig::new(blockd_config(metadata, s3_object_store(),))
+                    .is_ok()
+            );
         }
     }
 
