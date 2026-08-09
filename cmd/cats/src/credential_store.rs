@@ -1,3 +1,5 @@
+#[cfg(test)]
+use anyhow::Context as _;
 use anyhow::Result;
 
 #[cfg(target_os = "macos")]
@@ -250,13 +252,46 @@ mod platform {
 }
 
 pub(crate) fn get(service: &str, account: &str) -> Result<Option<String>> {
+    #[cfg(test)]
+    if let Some(path) = test_credential_store_path()? {
+        return match std::fs::read_to_string(&path) {
+            Ok(value) => Ok(Some(value)),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+            Err(error) => Err(error).context("read test credential store"),
+        };
+    }
     platform::get(service, account)
 }
 
 pub(crate) fn set(service: &str, account: &str, secret: &str) -> Result<()> {
+    #[cfg(test)]
+    if let Some(path) = test_credential_store_path()? {
+        return std::fs::write(path, secret).context("write test credential store");
+    }
     platform::set(service, account, secret)
 }
 
 pub(crate) fn delete(service: &str, account: &str) -> Result<()> {
+    #[cfg(test)]
+    if let Some(path) = test_credential_store_path()? {
+        return match std::fs::remove_file(path) {
+            Ok(()) => Ok(()),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(error) => Err(error).context("delete test credential store"),
+        };
+    }
     platform::delete(service, account)
+}
+
+#[cfg(test)]
+fn test_credential_store_path() -> Result<Option<std::path::PathBuf>> {
+    let Some(path) = std::env::var_os("CATS_TEST_CREDENTIAL_STORE_FILE") else {
+        return Ok(None);
+    };
+    let path = std::path::PathBuf::from(path);
+    anyhow::ensure!(
+        path.is_absolute(),
+        "test credential-store path must be absolute"
+    );
+    Ok(Some(path))
 }

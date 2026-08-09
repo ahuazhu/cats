@@ -6,7 +6,17 @@
 mod auth;
 mod config;
 mod credential_store;
+#[cfg(unix)]
 mod runtime_node_admin;
+#[cfg(not(unix))]
+#[path = "runtime_node_admin_unsupported.rs"]
+mod runtime_node_admin;
+// Compile and execute the non-Unix boundary on Unix test hosts too. This is a
+// portable compile-shape oracle when a Windows standard-library target is not
+// installed locally; the actual non-Unix module above uses this exact file.
+#[cfg(all(test, unix))]
+#[path = "runtime_node_admin_unsupported.rs"]
+mod runtime_node_admin_unsupported_compile_shape;
 mod shell;
 
 use std::time::{Duration, Instant};

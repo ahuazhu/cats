@@ -166,7 +166,12 @@ pub(crate) fn fleet_admin_login(provided_api_url: Option<&str>) -> Result<FleetA
     };
     let credentials =
         scope_fleet_admin_credentials(&runtime, &workos, initial, &public.organization_id)?;
-    let _lock = FleetAdminStateLock::acquire()?;
+    let _lock = FleetAdminStateLock::acquire(&api_url)?;
+    // Login intentionally replaces any prior administrator identity, but it
+    // still rereads the globally shared credential while holding the same
+    // origin lock as refresh/logout. This detects corrupt current state and
+    // prevents a concurrent rotating refresh from being silently overwritten.
+    let _previous = FleetAdminCredentials::load(&api_url)?;
     credentials.save(&api_url)?;
     Ok(FleetAdminIdentity {
         email: credentials.email,
@@ -176,7 +181,7 @@ pub(crate) fn fleet_admin_login(provided_api_url: Option<&str>) -> Result<FleetA
 pub(crate) fn fleet_admin_session(provided_api_url: Option<&str>) -> Result<FleetAdminSession> {
     let api_url = configured_api_url(provided_api_url)?;
     let public = fleet_admin_public_config(&api_url)?;
-    let _lock = FleetAdminStateLock::acquire()?;
+    let _lock = FleetAdminStateLock::acquire(&api_url)?;
     let mut credentials = FleetAdminCredentials::load(&api_url)?
         .context("not signed in as a fleet administrator; run `cats admin login`")?;
     if credentials.organization_id != public.organization_id
@@ -201,7 +206,7 @@ pub(crate) fn fleet_admin_session(provided_api_url: Option<&str>) -> Result<Flee
 
 pub(crate) fn fleet_admin_logout(provided_api_url: Option<&str>) -> Result<()> {
     let api_url = configured_api_url(provided_api_url)?;
-    let _lock = FleetAdminStateLock::acquire()?;
+    let _lock = FleetAdminStateLock::acquire(&api_url)?;
     if let Some(credentials) = FleetAdminCredentials::load(&api_url)? {
         let http = http_client()?;
         if let Err(error) = post_empty(
@@ -585,9 +590,16 @@ fn normalize_api_url(value: &str) -> String {
 mod tests {
     use std::io::{Read as _, Write as _};
     use std::net::TcpListener;
+    use std::path::{Path, PathBuf};
+    use std::process::{Child, Command};
     use std::thread;
+    use std::time::Instant;
 
     use super::*;
+
+    const ADMIN_REFRESH_CHILD_ROLE: &str = "CATS_TEST_ADMIN_REFRESH_CHILD_ROLE";
+    const ADMIN_REFRESH_ROOT: &str = "CATS_TEST_ADMIN_REFRESH_ROOT";
+    const ADMIN_REFRESH_API_URL: &str = "CATS_TEST_ADMIN_REFRESH_API_URL";
 
     fn admin_credentials(organization_id: &str) -> FleetAdminCredentials {
         FleetAdminCredentials {
@@ -619,11 +631,89 @@ mod tests {
                         .then(|| value.trim().parse::<usize>().ok())
                         .flatten()
                 })
-                .unwrap();
+                .unwrap_or(0);
             if request.len() >= header_end + content_length {
                 return request;
             }
         }
+    }
+
+    fn write_json_response(mut stream: &std::net::TcpStream, body: &str) {
+        write!(
+            stream,
+            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+            body.len(),
+            body
+        )
+        .unwrap();
+    }
+
+    fn marker(root: &Path, name: &str) -> PathBuf {
+        root.join(name)
+    }
+
+    fn wait_for_child_marker(path: &Path) {
+        let deadline = Instant::now() + Duration::from_secs(20);
+        while !path.exists() {
+            assert!(
+                Instant::now() < deadline,
+                "timed out waiting for child marker {}",
+                path.display()
+            );
+            thread::sleep(Duration::from_millis(10));
+        }
+    }
+
+    fn wait_for_marker(path: &Path, child: &mut Child) {
+        let deadline = Instant::now() + Duration::from_secs(20);
+        loop {
+            if path.exists() {
+                return;
+            }
+            if let Some(status) = child.try_wait().unwrap() {
+                panic!(
+                    "admin-refresh child exited before publishing {}: {status}",
+                    path.display()
+                );
+            }
+            assert!(
+                Instant::now() < deadline,
+                "timed out waiting for admin-refresh marker {}",
+                path.display()
+            );
+            thread::sleep(Duration::from_millis(10));
+        }
+    }
+
+    fn unexpired_access_token() -> String {
+        let payload = URL_SAFE_NO_PAD
+            .encode(serde_json::to_vec(&serde_json::json!({ "exp": u64::MAX - 1 })).unwrap());
+        format!("header.{payload}.signature")
+    }
+
+    fn spawn_admin_refresh_child(
+        root: &Path,
+        lock_root: &Path,
+        credential_file: &Path,
+        config_dir: &Path,
+        api_url: &str,
+        role: &str,
+    ) -> Child {
+        Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "auth::tests::fleet_admin_refresh_process_child",
+                "--ignored",
+                "--nocapture",
+            ])
+            .env(ADMIN_REFRESH_CHILD_ROLE, role)
+            .env(ADMIN_REFRESH_ROOT, root)
+            .env(ADMIN_REFRESH_API_URL, api_url)
+            .env("CATS_TEST_FLEET_ADMIN_LOCK_ROOT", lock_root)
+            .env("CATS_TEST_CREDENTIAL_STORE_FILE", credential_file)
+            .env("CATS_CONFIG_DIR", config_dir)
+            .spawn()
+            .unwrap()
     }
 
     #[test]
@@ -753,5 +843,150 @@ mod tests {
         assert_eq!(scoped.organization_id, "org_admin");
         assert_eq!(scoped.access_token, "access-admin");
         server.join().unwrap();
+    }
+
+    #[test]
+    fn fleet_admin_refresh_is_serial_across_distinct_config_dirs() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path();
+        let lock_root = root.join("global-lock-root");
+        let credential_file = root.join("credential-store");
+        let config_a = root.join("config-a");
+        let config_b = root.join("config-b");
+        std::fs::create_dir(&config_a).unwrap();
+        std::fs::create_dir(&config_b).unwrap();
+        std::fs::write(
+            &credential_file,
+            serde_json::to_vec(&admin_credentials("org_admin")).unwrap(),
+        )
+        .unwrap();
+
+        let control_listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let control_address = control_listener.local_addr().unwrap();
+        let workos_listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let workos_address = workos_listener.local_addr().unwrap();
+        let api_url = format!("http://{control_address}");
+        let workos_url = format!("http://{workos_address}");
+
+        let control_server = thread::spawn(move || {
+            let response = serde_json::json!({
+                "workos_enabled": true,
+                "workos_client_id": "client_test",
+                "workos_api_base_url": workos_url,
+                "workos_admin_organization_id": "org_admin"
+            })
+            .to_string();
+            for _ in 0..2 {
+                let (stream, _) = control_listener.accept().unwrap();
+                let request = String::from_utf8(read_http_request(&stream)).unwrap();
+                assert!(request.starts_with("GET /auth/config HTTP/1.1\r\n"));
+                write_json_response(&stream, &response);
+            }
+        });
+
+        let refresh_seen = marker(root, "refresh-seen");
+        let release_refresh = marker(root, "release-refresh");
+        let refresh_seen_for_server = refresh_seen.clone();
+        let release_for_server = release_refresh.clone();
+        let refreshed_access_token = unexpired_access_token();
+        let access_for_server = refreshed_access_token.clone();
+        let workos_server = thread::spawn(move || {
+            let (stream, _) = workos_listener.accept().unwrap();
+            let request = String::from_utf8(read_http_request(&stream)).unwrap();
+            assert!(request.contains(r#""refresh_token":"refresh-before""#));
+            assert!(request.contains(r#""organization_id":"org_admin""#));
+            std::fs::write(refresh_seen_for_server, b"seen").unwrap();
+            wait_for_child_marker(&release_for_server);
+            let response = serde_json::json!({
+                "user": {
+                    "object": "user",
+                    "id": "user_admin",
+                    "email": "admin@example.com",
+                    "email_verified": true,
+                    "created_at": "2026-08-10T00:00:00.000Z",
+                    "updated_at": "2026-08-10T00:00:00.000Z"
+                },
+                "organization_id": "org_admin",
+                "access_token": access_for_server,
+                "refresh_token": "refresh-after"
+            })
+            .to_string();
+            write_json_response(&stream, &response);
+        });
+
+        let mut first = spawn_admin_refresh_child(
+            root,
+            &lock_root,
+            &credential_file,
+            &config_a,
+            &api_url,
+            "first",
+        );
+        wait_for_marker(&refresh_seen, &mut first);
+        let mut second = spawn_admin_refresh_child(
+            root,
+            &lock_root,
+            &credential_file,
+            &config_b,
+            &api_url,
+            "second",
+        );
+        wait_for_marker(&marker(root, "second-saw-contention"), &mut second);
+
+        std::fs::write(release_refresh, b"release").unwrap();
+        let first_status = first.wait().unwrap();
+        let second_status = second.wait().unwrap();
+        assert!(first_status.success(), "first child failed: {first_status}");
+        assert!(
+            second_status.success(),
+            "second child failed: {second_status}"
+        );
+        control_server.join().unwrap();
+        workos_server.join().unwrap();
+
+        assert_eq!(
+            std::fs::read_to_string(marker(root, "first-observed-access")).unwrap(),
+            refreshed_access_token
+        );
+        assert_eq!(
+            std::fs::read_to_string(marker(root, "second-observed-access")).unwrap(),
+            refreshed_access_token
+        );
+        let persisted: FleetAdminCredentials =
+            serde_json::from_slice(&std::fs::read(&credential_file).unwrap()).unwrap();
+        assert_eq!(persisted.refresh_token, "refresh-after");
+        assert_eq!(persisted.access_token, refreshed_access_token);
+    }
+
+    #[test]
+    #[ignore = "spawned by fleet_admin_refresh_is_serial_across_distinct_config_dirs"]
+    fn fleet_admin_refresh_process_child() {
+        let Some(role) = std::env::var_os(ADMIN_REFRESH_CHILD_ROLE) else {
+            return;
+        };
+        let role = role.to_str().unwrap();
+        let root = PathBuf::from(std::env::var_os(ADMIN_REFRESH_ROOT).unwrap());
+        let api_url = std::env::var(ADMIN_REFRESH_API_URL).unwrap();
+        let configured_directory = PathBuf::from(std::env::var_os("CATS_CONFIG_DIR").unwrap());
+        assert_eq!(
+            crate::config::config_path(),
+            configured_directory.join("config.json")
+        );
+
+        if role == "second" {
+            assert!(
+                FleetAdminStateLock::try_acquire(&api_url)
+                    .unwrap()
+                    .is_none(),
+                "different CATS_CONFIG_DIR values must contend on one API credential"
+            );
+            std::fs::write(marker(&root, "second-saw-contention"), b"contended").unwrap();
+        }
+        let session = fleet_admin_session(Some(&api_url)).unwrap();
+        std::fs::write(
+            marker(&root, &format!("{role}-observed-access")),
+            session.access_token,
+        )
+        .unwrap();
     }
 }
