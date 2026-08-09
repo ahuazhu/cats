@@ -337,9 +337,13 @@ impl ChunkEngine {
                 )));
             }
             drop(header_bytes);
+            self.validate_pack_lineage(&header)?;
+            let header_epoch = header
+                .attachment_epoch_value()
+                .map_err(|error| EngineError::Corrupt(error.to_string()))?;
             match batch_epoch {
-                Some(epoch) if header.lease_epoch != epoch => break,
-                None => batch_epoch = Some(header.lease_epoch),
+                Some(epoch) if header_epoch != epoch => break,
+                None => batch_epoch = Some(header_epoch),
                 Some(_) => {}
             }
             let candidate_materialized = materialized_bytes
@@ -735,10 +739,13 @@ impl ChunkEngine {
             .checked_add(pack_count)
             .ok_or_else(|| EngineError::Corrupt("commit generation overflow".into()))?;
 
-        let batch_epoch = first.lease_epoch;
+        let batch_epoch = first
+            .attachment_epoch_value()
+            .map_err(|error| EngineError::Corrupt(error.to_string()))?;
         let mut expected_generation = base_generation;
         let mut txns = HashSet::with_capacity(packs.len());
         for (header, payload) in packs {
+            self.validate_pack_lineage(header)?;
             if header.volume_id != self.cfg.volume_id {
                 return Err(EngineError::Corrupt("commit batch volume mismatch".into()));
             }
@@ -748,7 +755,11 @@ impl ChunkEngine {
                     header.base_generation
                 )));
             }
-            if header.lease_epoch != batch_epoch {
+            if header
+                .attachment_epoch_value()
+                .map_err(|error| EngineError::Corrupt(error.to_string()))?
+                != batch_epoch
+            {
                 return Err(EngineError::Corrupt(
                     "commit batch crosses lease epochs".into(),
                 ));
@@ -814,7 +825,8 @@ impl ChunkEngine {
             &last.txn,
             base_generation,
             new_generation,
-            last.lease_epoch,
+            last.attachment_epoch_value()
+                .map_err(|error| EngineError::Corrupt(error.to_string()))?,
             &new_map,
             &mut new_leaves,
             &map_chunks,
@@ -942,6 +954,9 @@ impl ChunkEngine {
                         volume_id: header.volume_id.clone(),
                         base_generation: header.base_generation,
                         lease_epoch: header.lease_epoch,
+                        attachment_id: header.attachment_id.clone(),
+                        attachment_epoch: header.attachment_epoch,
+                        acquire_origin: header.acquire_origin.clone(),
                         entries,
                     },
                     output,

@@ -2,6 +2,8 @@
 //! volume under one attachment lease.
 
 use std::io::{Read, Write};
+use std::os::unix::fs::MetadataExt as _;
+use std::os::unix::fs::OpenOptionsExt as _;
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
@@ -14,6 +16,7 @@ use cats_metadata_store_postgres::{PostgresMetadataStoreFactory, PostgresVolumeD
 use cats_metadata_store_sqlite::SqliteMetadataStoreFactory;
 use cats_object_store_aws_s3::AwsS3BlobStoreFactory;
 use cats_object_store_file::FileBlobStoreFactory;
+use cats_storage::authority::AuthorizedServingAttachment;
 use cats_storage::{
     open_blob_store, open_metadata_store, AdapterConfig, BlobStoreFactory, MetaError,
     MetadataStoreFactory,
@@ -35,6 +38,12 @@ struct Args {
     /// provision control command. This mode never binds a Guest data frontend.
     #[arg(long)]
     control_only: bool,
+
+    /// Adopt the exact target-authority grant in this bounded canonical JSON
+    /// file and expose a serving Guest frontend. This mode never acquires,
+    /// increments, releases, or otherwise changes attachment ownership.
+    #[arg(long, value_name = "PATH")]
+    authorized_serving_spec: Option<PathBuf>,
 
     /// Exact grant epoch to adopt in `--control-only` mode.
     #[arg(long, requires = "control_only")]
@@ -221,6 +230,39 @@ fn seed_from_image(
     Ok(())
 }
 
+fn read_authorized_serving_attachment(path: &Path) -> Result<AuthorizedServingAttachment> {
+    const MAX_BYTES: u64 = 32 * 1024;
+    let mut file = std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW)
+        .open(path)
+        .with_context(|| format!("open authorized serving spec {}", path.display()))?;
+    let metadata = file
+        .metadata()
+        .with_context(|| format!("inspect authorized serving spec {}", path.display()))?;
+    if !metadata.file_type().is_file() || metadata.nlink() != 1 || metadata.len() > MAX_BYTES {
+        bail!(
+            "authorized serving spec {} is not one bounded regular file",
+            path.display()
+        );
+    }
+    let mut bytes = Vec::with_capacity(metadata.len() as usize);
+    std::io::Read::by_ref(&mut file)
+        .take(MAX_BYTES + 1)
+        .read_to_end(&mut bytes)
+        .with_context(|| format!("read authorized serving spec {}", path.display()))?;
+    if bytes.len() as u64 > MAX_BYTES {
+        bail!("authorized serving spec exceeds {MAX_BYTES} bytes");
+    }
+    let attachment: AuthorizedServingAttachment =
+        serde_json::from_slice(&bytes).context("decode authorized serving spec")?;
+    let canonical = serde_json::to_vec(&attachment).context("encode authorized serving spec")?;
+    if canonical != bytes {
+        bail!("authorized serving spec is not canonical JSON");
+    }
+    Ok(attachment)
+}
+
 fn main() -> Result<()> {
     tracing_subscriber::fmt()
         .with_env_filter(
@@ -318,8 +360,11 @@ fn main() -> Result<()> {
         max_staged_packs: args.max_staged_packs,
         max_local_bytes: args.max_local_bytes,
     };
-    let deadline =
-        std::time::Instant::now() + std::time::Duration::from_millis(args.acquire_wait_ms);
+    let authorized_serving = args
+        .authorized_serving_spec
+        .as_deref()
+        .map(read_authorized_serving_attachment)
+        .transpose()?;
     let engine = if args.control_only {
         let authority = PostgresVolumeDataAuthority::open(&metadata_config)
             .context("open target volume authority")?;
@@ -331,7 +376,14 @@ fn main() -> Result<()> {
             authority,
         )
         .context("adopt control-only chunk engine")?
+    } else if let Some(attachment) = authorized_serving.as_ref() {
+        let authority = PostgresVolumeDataAuthority::open(&metadata_config)
+            .context("open target volume authority")?;
+        ChunkEngine::attach_authorized_serving(config, attachment.clone(), blob.clone(), authority)
+            .context("adopt authorized serving chunk engine")?
     } else {
+        let deadline =
+            std::time::Instant::now() + std::time::Duration::from_millis(args.acquire_wait_ms);
         let metadata_factories: [&dyn MetadataStoreFactory; 2] =
             [&SqliteMetadataStoreFactory, &PostgresMetadataStoreFactory];
         let meta = open_metadata_store(
@@ -407,13 +459,24 @@ fn main() -> Result<()> {
         return Ok(());
     }
 
-    engine.start_gc_thread(std::time::Duration::from_millis(args.gc_interval_ms));
+    // The signed Runtime slice does not invoke the legacy attachment-owned GC
+    // loop. Object reclamation remains fail-closed until it has its own typed
+    // target authority/evidence boundary.
+    if authorized_serving.is_none() {
+        engine.start_gc_thread(std::time::Duration::from_millis(args.gc_interval_ms));
+    }
 
     // Bind every requested socket before printing READY: a VMM told to start on
     // readiness must never race a socket that does not exist yet.
     let nbd_unix = match &args.listen_unix {
         Some(path) => {
             if path.exists() {
+                if authorized_serving.is_some() {
+                    bail!(
+                        "authorized serving socket {} already exists; refusing to replace an unverified owner",
+                        path.display()
+                    );
+                }
                 std::fs::remove_file(path).ok();
             }
             Some(
@@ -429,9 +492,15 @@ fn main() -> Result<()> {
         ),
         None => None,
     };
-    let vhost_user = bind_vhost_user(&vhost_user_args)?;
+    let vhost_user = bind_vhost_user(&vhost_user_args, authorized_serving.is_none())?;
     if let Some(path) = &args.listen_control {
         if path.exists() {
+            if authorized_serving.is_some() {
+                bail!(
+                    "authorized control socket {} already exists; refusing to replace an unverified owner",
+                    path.display()
+                );
+            }
             std::fs::remove_file(path).ok();
         }
         let listener = UnixListener::bind(path)
@@ -473,7 +542,13 @@ fn main() -> Result<()> {
         }));
     }
     let serving = serve_vhost_user(vhost_user, &vhost_user_args, engine.clone(), nbd_threads);
-    let detached = engine.detach().context("final blockd drain and detach");
+    let detached = if authorized_serving.is_some() {
+        engine
+            .stop_authorized_serving()
+            .context("final authorized blockd drain and stop")
+    } else {
+        engine.detach().context("final blockd drain and detach")
+    };
     serving?;
     detached
 }
@@ -653,6 +728,9 @@ fn ensure_before(deadline: Instant) -> Option<()> {
 
 fn validate_process_mode(args: &Args) -> Result<()> {
     if args.control_only {
+        if args.authorized_serving_spec.is_some() {
+            bail!("--control-only conflicts with --authorized-serving-spec");
+        }
         if args.attachment_epoch.is_none() {
             bail!("--control-only requires --attachment-epoch");
         }
@@ -677,6 +755,39 @@ fn validate_process_mode(args: &Args) -> Result<()> {
         }
         if args.metadata_store_adapter.as_deref() != Some("postgres") {
             bail!("--control-only requires --metadata-store-adapter postgres");
+        }
+    } else if args.authorized_serving_spec.is_some() {
+        if args.attachment_epoch.is_some() {
+            bail!("--authorized-serving-spec carries its own exact attachment epoch");
+        }
+        if args.seed_image_id.is_some()
+            || args.seed_image.is_some()
+            || args.publish_image.is_some()
+            || args.collect_garbage
+            || args.create_volume_size.is_some()
+        {
+            bail!(
+                "--authorized-serving-spec forbids legacy seed, image publish, GC, and volume creation modes"
+            );
+        }
+        if args.metadata_store_adapter.as_deref() != Some("postgres") {
+            bail!("--authorized-serving-spec requires --metadata-store-adapter postgres");
+        }
+        if args.listen_tcp.is_some() {
+            bail!("--authorized-serving-spec forbids the unscoped TCP frontend");
+        }
+        let control = args
+            .listen_control
+            .as_ref()
+            .context("--authorized-serving-spec requires --listen-control for exact handshake")?;
+        if args.listen_unix.as_ref() == Some(control)
+            || args.listen_vhost_user.as_ref() == Some(control)
+            || matches!(
+                (&args.listen_unix, &args.listen_vhost_user),
+                (Some(nbd), Some(vhost)) if nbd == vhost
+            )
+        {
+            bail!("authorized serving listener paths must be pairwise distinct");
         }
     } else if args.attachment_epoch.is_some() {
         bail!("--attachment-epoch is only valid with --control-only");
@@ -714,18 +825,27 @@ fn vhost_user_options(args: &VhostUserArgs) -> cats_blockd::vhost_user::VhostUse
 }
 
 #[cfg(target_os = "linux")]
-fn bind_vhost_user(args: &VhostUserArgs) -> Result<Option<vhost::vhost_user::Listener>> {
+fn bind_vhost_user(
+    args: &VhostUserArgs,
+    replace_existing: bool,
+) -> Result<Option<vhost::vhost_user::Listener>> {
     match &args.socket {
-        Some(path) => Ok(Some(
-            cats_blockd::vhost_user::bind(path, vhost_user_options(args))
-                .with_context(|| format!("bind vhost-user socket {}", path.display()))?,
-        )),
+        Some(path) => {
+            let listener = if replace_existing {
+                cats_blockd::vhost_user::bind(path, vhost_user_options(args))
+            } else {
+                cats_blockd::vhost_user::bind_new(path, vhost_user_options(args))
+            };
+            Ok(Some(listener.with_context(|| {
+                format!("bind vhost-user socket {}", path.display())
+            })?))
+        }
         None => Ok(None),
     }
 }
 
 #[cfg(not(target_os = "linux"))]
-fn bind_vhost_user(args: &VhostUserArgs) -> Result<Option<()>> {
+fn bind_vhost_user(args: &VhostUserArgs, _replace_existing: bool) -> Result<Option<()>> {
     if args.socket.is_some() {
         bail!(
             "--listen-vhost-user requires Linux (vhost-user needs eventfd and shared Guest memory)"
@@ -764,4 +884,64 @@ fn serve_vhost_user(
     nbd_threads: Vec<std::thread::JoinHandle<()>>,
 ) -> Result<()> {
     serve_nbd_only(nbd_threads)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn parse_target(extra: &[&str]) -> Args {
+        let mut arguments = vec![
+            "cats-blockd",
+            "--object-store-adapter",
+            "file",
+            "--metadata-store-adapter",
+            "postgres",
+            "--authorized-serving-spec",
+            "/runtime/attachment.json",
+            "--listen-control",
+            "/runtime/control.sock",
+        ];
+        arguments.extend_from_slice(extra);
+        Args::try_parse_from(arguments).unwrap()
+    }
+
+    #[test]
+    fn authorized_serving_process_mode_is_a_closed_nonlegacy_surface() {
+        assert!(
+            validate_process_mode(&parse_target(&["--listen-unix", "/runtime/block.sock"])).is_ok()
+        );
+
+        for forbidden in [
+            vec!["--listen-tcp", "127.0.0.1:10809"],
+            vec!["--collect-garbage"],
+            vec!["--create-volume-size", "4194304"],
+            vec!["--seed-image-id", "legacy-image"],
+        ] {
+            assert!(
+                validate_process_mode(&parse_target(&forbidden)).is_err(),
+                "authorized serving unexpectedly accepted {forbidden:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn authorized_serving_requires_distinct_local_handshake_and_frontend_names() {
+        let missing_control = Args::try_parse_from([
+            "cats-blockd",
+            "--object-store-adapter",
+            "file",
+            "--metadata-store-adapter",
+            "postgres",
+            "--authorized-serving-spec",
+            "/runtime/attachment.json",
+            "--listen-unix",
+            "/runtime/block.sock",
+        ])
+        .unwrap();
+        assert!(validate_process_mode(&missing_control).is_err());
+
+        let same_name = parse_target(&["--listen-unix", "/runtime/control.sock"]);
+        assert!(validate_process_mode(&same_name).is_err());
+    }
 }

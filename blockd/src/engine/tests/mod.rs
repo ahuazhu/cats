@@ -2,7 +2,8 @@ use super::*;
 use cats_metadata_store_sqlite::SqliteMetadataStore;
 use cats_object_store_file::FileBlobStore;
 use cats_storage::authority::{
-    LastVolumeTransition, RenewLeaseResult, UnixMillis, VolumeAdminState, VolumeDurability,
+    AcquireOrigin, AttachmentLineageIdentity, AuthorizedServingAttachment, LastVolumeTransition,
+    NormalAcquireRequest, RenewLeaseResult, UnixMillis, VolumeAdminState, VolumeDurability,
     VolumeHeadCasResult, VolumeRecord,
 };
 use cats_test_support::blob_doubles::{
@@ -39,6 +40,60 @@ fn env() -> Env {
 /// row/transaction behavior is covered in the adapter integration tests.
 struct TestVolumeDataAuthority {
     metadata: Arc<dyn MetadataStore>,
+}
+
+struct ExactServingAuthority {
+    record: Mutex<VolumeRecord>,
+    load_calls: AtomicU64,
+    renew_calls: AtomicU64,
+    fail_load_call: AtomicU64,
+}
+
+impl ExactServingAuthority {
+    fn new(record: VolumeRecord) -> Self {
+        Self {
+            record: Mutex::new(record),
+            load_calls: AtomicU64::new(0),
+            renew_calls: AtomicU64::new(0),
+            fail_load_call: AtomicU64::new(0),
+        }
+    }
+}
+
+impl VolumeDataAuthority for ExactServingAuthority {
+    fn load_volume(&self, volume_id: &Id) -> cats_storage::authority::Result<VolumeRecord> {
+        let call = self.load_calls.fetch_add(1, Ordering::SeqCst) + 1;
+        if self.fail_load_call.load(Ordering::SeqCst) == call {
+            return Err(AuthorityError::BackendUnknown);
+        }
+        let record = self.record.lock().unwrap();
+        if record.volume_id != *volume_id {
+            return Err(AuthorityError::NotFound);
+        }
+        Ok(record.clone())
+    }
+
+    fn renew_lease(
+        &self,
+        request: &RenewLeaseRequest,
+    ) -> cats_storage::authority::Result<RenewLeaseResult> {
+        let call = self.renew_calls.fetch_add(1, Ordering::SeqCst) + 1;
+        let now = UnixMillis::new(100_000 + call).unwrap();
+        let (updated, result) =
+            cats_storage::authority::renew_lease(&self.record.lock().unwrap(), request, now)?;
+        *self.record.lock().unwrap() = updated;
+        Ok(result)
+    }
+
+    fn compare_and_swap_head(
+        &self,
+        request: &VolumeHeadCasRequest,
+    ) -> cats_storage::authority::Result<VolumeHeadCasResult> {
+        let (updated, result) =
+            cats_storage::authority::compare_and_swap_head(&self.record.lock().unwrap(), request)?;
+        *self.record.lock().unwrap() = updated;
+        Ok(result)
+    }
 }
 
 fn target_authority(metadata: Arc<dyn MetadataStore>) -> Arc<dyn VolumeDataAuthority> {
@@ -152,6 +207,97 @@ fn test_authority_error(error: MetaError) -> AuthorityError {
     }
 }
 
+struct ServingFixture {
+    _dir: tempfile::TempDir,
+    blob: Arc<FileBlobStore>,
+    authority: Arc<ExactServingAuthority>,
+    attachment: AuthorizedServingAttachment,
+    config: EngineConfig,
+    data_dir: PathBuf,
+}
+
+fn serving_fixture(durability: VolumeDurability) -> ServingFixture {
+    let dir = tempfile::tempdir().unwrap();
+    let blob = Arc::new(FileBlobStore::open(dir.path().join("blob")).unwrap());
+    let request = NormalAcquireRequest {
+        volume_id: Id::new(VOL).unwrap(),
+        transition_id: cats_api::runtime_reconciliation::RandomId128::new(
+            "1234567890abcdef1234567890abcdef",
+        )
+        .unwrap(),
+        attachment_id: Id::new("attA").unwrap(),
+        expected_unowned_epoch: FenceEpoch::new(0).unwrap(),
+        desired_revision: cats_api::runtime_reconciliation::Revision::new(7).unwrap(),
+        placement_epoch: cats_api::runtime_reconciliation::Epoch::new(3).unwrap(),
+        lease_duration_ms: 60_000,
+    };
+    let unowned = VolumeRecord {
+        volume_id: request.volume_id.clone(),
+        size_bytes: SIZE,
+        durability,
+        admin_state: VolumeAdminState::Active,
+        head: RemoteHead {
+            generation: Generation::new(0).unwrap(),
+            root_hash: None,
+            root_object_id: None,
+        },
+        lease_owner: None,
+        lease_epoch: request.expected_unowned_epoch,
+        lease_expires_at: None,
+        last_transition: None,
+    };
+    let (record, result) = cats_storage::authority::normal_acquire(
+        &unowned,
+        &request,
+        UnixMillis::new(10_000).unwrap(),
+    )
+    .unwrap();
+    let identity = AttachmentLineageIdentity {
+        volume_id: request.volume_id.clone(),
+        attachment_id: request.attachment_id.clone(),
+        attachment_epoch: result.resulting_epoch,
+        acquire_origin: AcquireOrigin::Normal {
+            transition_id: request.transition_id.clone(),
+        },
+        node_id: Id::new("node_a").unwrap(),
+        placement_epoch: request.placement_epoch,
+    };
+    let attachment = AuthorizedServingAttachment {
+        identity,
+        size_bytes: record.size_bytes,
+        durability: record.durability,
+        head: record.head.clone(),
+        lease_expires_at: result.lease_expires_at,
+        acquire_request: request,
+        acquire_result: result,
+    };
+    let data_dir = dir.path().join("serving-data");
+    let mut config = EngineConfig::new(VOL, &data_dir, "attA");
+    config.lease_ttl_ms = 60_000;
+    config.durability = match durability {
+        VolumeDurability::Strict => DurabilityMode::Strict,
+        VolumeDurability::Relaxed => DurabilityMode::Relaxed {
+            drain_interval_ms: 0,
+        },
+    };
+    ServingFixture {
+        _dir: dir,
+        blob,
+        authority: Arc::new(ExactServingAuthority::new(record)),
+        attachment,
+        config,
+        data_dir,
+    }
+}
+
+fn write_serving_identity(fixture: &ServingFixture) {
+    fs::create_dir_all(&fixture.data_dir).unwrap();
+    let file = File::create(fixture.data_dir.join("identity.json")).unwrap();
+    serde_json::to_writer(&file, &fixture.attachment.identity).unwrap();
+    file.sync_all().unwrap();
+    File::open(&fixture.data_dir).unwrap().sync_all().unwrap();
+}
+
 fn attach(env: &Env, attachment: &str) -> Arc<ChunkEngine> {
     ChunkEngine::attach(
         EngineConfig::new(VOL, &env.data_dir, attachment),
@@ -217,6 +363,181 @@ fn status_reports_the_configured_volume_and_attachment() {
     assert_eq!(status.volume_id, VOL);
     assert_eq!(status.attachment_id, "attB");
     next.detach().unwrap();
+}
+
+#[test]
+fn authorized_serving_requires_identity_before_authority_or_local_state() {
+    let fixture = serving_fixture(VolumeDurability::Strict);
+    let authority: Arc<dyn VolumeDataAuthority> = fixture.authority.clone();
+    let result = ChunkEngine::attach_authorized_serving(
+        fixture.config.clone(),
+        fixture.attachment.clone(),
+        fixture.blob.clone(),
+        authority,
+    );
+    assert!(matches!(result, Err(EngineError::Io(_))));
+    assert_eq!(fixture.authority.load_calls.load(Ordering::SeqCst), 0);
+    assert_eq!(fixture.authority.renew_calls.load(Ordering::SeqCst), 0);
+    assert!(!fixture.data_dir.join(PENDING_PACK_DIR).exists());
+}
+
+#[test]
+fn authorized_serving_renews_before_guest_io_and_writes_target_v2_lineage() {
+    let fixture = serving_fixture(VolumeDurability::Relaxed);
+    write_serving_identity(&fixture);
+    let authority: Arc<dyn VolumeDataAuthority> = fixture.authority.clone();
+    let engine = ChunkEngine::attach_authorized_serving(
+        fixture.config.clone(),
+        fixture.attachment.clone(),
+        fixture.blob.clone(),
+        authority,
+    )
+    .unwrap();
+    assert_eq!(fixture.authority.renew_calls.load(Ordering::SeqCst), 1);
+
+    let status = engine.durability_status();
+    assert_eq!(
+        status.attachment_epoch,
+        Some(fixture.attachment.identity.attachment_epoch)
+    );
+    assert_eq!(
+        status.acquire_origin.as_ref(),
+        Some(&fixture.attachment.identity.acquire_origin)
+    );
+    assert_eq!(
+        status.node_id.as_ref(),
+        Some(&fixture.attachment.identity.node_id)
+    );
+    assert_eq!(
+        status.placement_epoch,
+        Some(fixture.attachment.identity.placement_epoch)
+    );
+    assert_eq!(status.guest_io_enabled, Some(true));
+
+    engine.write(0, b"authorized target bytes").unwrap();
+    assert_eq!(engine.flush().unwrap(), 1);
+    let packs = fs::read_dir(fixture.data_dir.join(PENDING_PACK_DIR))
+        .unwrap()
+        .map(|entry| entry.unwrap().path())
+        .collect::<Vec<_>>();
+    assert_eq!(packs.len(), 1);
+    let bytes = fs::read(&packs[0]).unwrap();
+    assert_eq!(u16::from_le_bytes(bytes[8..10].try_into().unwrap()), 2);
+    let (header, _) = format::decode_pack(&bytes).unwrap();
+    assert_eq!(header.lease_epoch, None);
+    assert_eq!(
+        header.attachment_id.as_deref(),
+        Some(fixture.attachment.identity.attachment_id.as_str())
+    );
+    assert_eq!(
+        header.attachment_epoch,
+        Some(i64::try_from(fixture.attachment.identity.attachment_epoch.get()).unwrap())
+    );
+    assert_eq!(
+        header.acquire_origin.as_ref(),
+        Some(&fixture.attachment.identity.acquire_origin)
+    );
+
+    engine.stop_authorized_serving().unwrap();
+    assert_eq!(
+        fixture.authority.record.lock().unwrap().head.generation,
+        Generation::new(1).unwrap()
+    );
+    assert!(fixture
+        .authority
+        .record
+        .lock()
+        .unwrap()
+        .lease_owner
+        .is_some());
+}
+
+#[test]
+fn authorized_serving_retry_after_lost_startup_result_reuses_the_exact_grant() {
+    let fixture = serving_fixture(VolumeDurability::Strict);
+    write_serving_identity(&fixture);
+    fixture.authority.fail_load_call.store(3, Ordering::SeqCst);
+    let first_authority: Arc<dyn VolumeDataAuthority> = fixture.authority.clone();
+    let first = ChunkEngine::attach_authorized_serving(
+        fixture.config.clone(),
+        fixture.attachment.clone(),
+        fixture.blob.clone(),
+        first_authority,
+    );
+    assert!(first.is_err());
+    assert_eq!(fixture.authority.renew_calls.load(Ordering::SeqCst), 1);
+    assert!(!fixture.data_dir.join(PENDING_PACK_DIR).exists());
+
+    fixture.authority.fail_load_call.store(0, Ordering::SeqCst);
+    let retry_authority: Arc<dyn VolumeDataAuthority> = fixture.authority.clone();
+    let engine = ChunkEngine::attach_authorized_serving(
+        fixture.config.clone(),
+        fixture.attachment.clone(),
+        fixture.blob.clone(),
+        retry_authority,
+    )
+    .unwrap();
+    assert_eq!(fixture.authority.renew_calls.load(Ordering::SeqCst), 2);
+    assert_eq!(engine.epoch(), 1);
+    engine.stop_authorized_serving().unwrap();
+}
+
+#[test]
+fn authorized_serving_never_adopts_or_discards_legacy_and_malformed_packs() {
+    let legacy = serving_fixture(VolumeDurability::Strict);
+    write_serving_identity(&legacy);
+    let pending = legacy.data_dir.join(PENDING_PACK_DIR);
+    fs::create_dir_all(&pending).unwrap();
+    let legacy_path = pending.join("00000000000000000000-legacy.pack");
+    fs::write(
+        &legacy_path,
+        format::encode_pack(
+            &PackHeader {
+                txn: "legacy".into(),
+                volume_id: VOL.into(),
+                base_generation: 0,
+                lease_epoch: Some(1),
+                attachment_id: None,
+                attachment_epoch: None,
+                acquire_origin: None,
+                entries: Vec::new(),
+            },
+            &[],
+        ),
+    )
+    .unwrap();
+    let authority: Arc<dyn VolumeDataAuthority> = legacy.authority.clone();
+    let result = ChunkEngine::attach_authorized_serving(
+        legacy.config.clone(),
+        legacy.attachment.clone(),
+        legacy.blob.clone(),
+        authority,
+    );
+    assert!(matches!(result, Err(EngineError::Corrupt(_))));
+    assert!(legacy_path.exists(), "legacy evidence must remain intact");
+    assert_eq!(
+        legacy.authority.record.lock().unwrap().head.generation,
+        Generation::new(0).unwrap()
+    );
+
+    let malformed = serving_fixture(VolumeDurability::Strict);
+    write_serving_identity(&malformed);
+    let pending = malformed.data_dir.join(PENDING_PACK_DIR);
+    fs::create_dir_all(&pending).unwrap();
+    let malformed_path = pending.join("00000000000000000000-malformed.pack");
+    fs::write(&malformed_path, b"not a pack").unwrap();
+    let authority: Arc<dyn VolumeDataAuthority> = malformed.authority.clone();
+    let result = ChunkEngine::attach_authorized_serving(
+        malformed.config.clone(),
+        malformed.attachment.clone(),
+        malformed.blob.clone(),
+        authority,
+    );
+    assert!(matches!(result, Err(EngineError::Corrupt(_))));
+    assert!(
+        malformed_path.exists(),
+        "malformed target evidence must remain intact"
+    );
 }
 
 #[test]
@@ -1454,14 +1775,20 @@ fn generation_exhaustion_rejects_a_batch_before_any_remote_write() {
         txn: "generation-exhaustion-a".into(),
         volume_id: VOL.into(),
         base_generation: i64::MAX - 1,
-        lease_epoch: e.epoch,
+        lease_epoch: Some(e.epoch),
+        attachment_id: None,
+        attachment_epoch: None,
+        acquire_origin: None,
         entries: Vec::new(),
     };
     let second = PackHeader {
         txn: "generation-exhaustion-b".into(),
         volume_id: VOL.into(),
         base_generation: i64::MAX,
-        lease_epoch: e.epoch,
+        lease_epoch: Some(e.epoch),
+        attachment_id: None,
+        attachment_epoch: None,
+        acquire_origin: None,
         entries: Vec::new(),
     };
     let (base_map, base_leaves) = {
@@ -1520,14 +1847,20 @@ fn malformed_batch_lineage_is_rejected_before_any_remote_write() {
         txn: "lineage-a".into(),
         volume_id: VOL.into(),
         base_generation: 0,
-        lease_epoch: e.epoch,
+        lease_epoch: Some(e.epoch),
+        attachment_id: None,
+        attachment_epoch: None,
+        acquire_origin: None,
         entries: Vec::new(),
     };
     let second = PackHeader {
         txn: "lineage-b".into(),
         volume_id: VOL.into(),
         base_generation: 1,
-        lease_epoch: e.epoch,
+        lease_epoch: Some(e.epoch),
+        attachment_id: None,
+        attachment_epoch: None,
+        acquire_origin: None,
         entries: Vec::new(),
     };
     let (base_map, base_leaves) = {
@@ -1548,7 +1881,7 @@ fn malformed_batch_lineage_is_rejected_before_any_remote_write() {
         },
         {
             let mut value = second.clone();
-            value.lease_epoch += 1;
+            value.lease_epoch = value.lease_epoch.map(|epoch| epoch + 1);
             (first.clone(), value)
         },
         {
@@ -1693,7 +2026,10 @@ fn malformed_pack_entries_fail_before_any_remote_write_or_indexing() {
             txn: format!("malformed-{}", case.replace(' ', "-")),
             volume_id: VOL.into(),
             base_generation: 0,
-            lease_epoch: e.epoch,
+            lease_epoch: Some(e.epoch),
+            attachment_id: None,
+            attachment_epoch: None,
+            acquire_origin: None,
             entries: vec![entry],
         };
         blob.fail_puts.store(1, Ordering::SeqCst);

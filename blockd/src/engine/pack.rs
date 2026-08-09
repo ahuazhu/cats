@@ -2,7 +2,6 @@ use super::*;
 
 const PACK_PREFIX_BYTES: usize = 8 + 2 + 4;
 const EMPTY_SHA256_HEX: &str = "0000000000000000000000000000000000000000000000000000000000000000";
-const BYTE_RANGES_JSON_PREFIX: &str = ",\"byte_ranges\":[";
 
 #[cfg(test)]
 std::thread_local! {
@@ -74,6 +73,7 @@ struct PreparedBarrierPack {
 struct BarrierPackInput<'a> {
     volume_id: &'a str,
     lease_epoch: i64,
+    lineage: Option<&'a AttachmentLineageIdentity>,
     base_generation: i64,
     plans: &'a [ChunkPlan],
     frozen_ranges: &'a [Vec<DirtyByteRange>],
@@ -109,11 +109,12 @@ fn overlay_entry_json_bytes(
         page_mask: fragment.page_mask,
         byte_ranges: Vec::new(),
     };
+    // The empty target spelling already contains `"byte_ranges":[]`.
+    // Inserting descriptors between those brackets adds only the descriptor
+    // bytes and separators.
     json_len(&entry)
-        .checked_add(BYTE_RANGES_JSON_PREFIX.len())?
         .checked_add(fragment.range_json_bytes)?
-        .checked_add(range_count.saturating_sub(1))?
-        .checked_add(1)
+        .checked_add(range_count.saturating_sub(1))
 }
 
 fn atomic_entry_json_bytes(plan: &ChunkPlan, payload_offset: usize) -> Option<usize> {
@@ -129,13 +130,23 @@ fn atomic_entry_json_bytes(plan: &ChunkPlan, payload_offset: usize) -> Option<us
 }
 
 impl DraftPack {
-    fn new(volume_id: &str, lease_epoch: i64, base_generation: i64) -> Self {
+    fn new(
+        volume_id: &str,
+        lease_epoch: i64,
+        lineage: Option<&AttachmentLineageIdentity>,
+        base_generation: i64,
+    ) -> Self {
         let txn = uuid::Uuid::new_v4().simple().to_string();
+        let (legacy_epoch, attachment_id, attachment_epoch, acquire_origin) =
+            pack_lineage_fields(lease_epoch, lineage);
         let empty_header_json_bytes = json_len(&PackHeader {
             txn: txn.clone(),
             volume_id: volume_id.to_string(),
             base_generation,
-            lease_epoch,
+            lease_epoch: legacy_epoch,
+            attachment_id,
+            attachment_epoch,
+            acquire_origin,
             entries: Vec::new(),
         });
         Self {
@@ -343,6 +354,7 @@ impl DraftPack {
 fn draft_pack(
     volume_id: &str,
     lease_epoch: i64,
+    lineage: Option<&AttachmentLineageIdentity>,
     first_base_generation: i64,
     pack_index: usize,
 ) -> Result<DraftPack> {
@@ -351,7 +363,32 @@ fn draft_pack(
     let base_generation = first_base_generation
         .checked_add(offset)
         .ok_or_else(|| EngineError::Corrupt("barrier generation overflow".into()))?;
-    Ok(DraftPack::new(volume_id, lease_epoch, base_generation))
+    Ok(DraftPack::new(
+        volume_id,
+        lease_epoch,
+        lineage,
+        base_generation,
+    ))
+}
+
+fn pack_lineage_fields(
+    lease_epoch: i64,
+    lineage: Option<&AttachmentLineageIdentity>,
+) -> (
+    Option<i64>,
+    Option<String>,
+    Option<i64>,
+    Option<cats_api::runtime_reconciliation::AcquireOrigin>,
+) {
+    match lineage {
+        Some(identity) => (
+            None,
+            Some(identity.attachment_id.to_string()),
+            Some(lease_epoch),
+            Some(identity.acquire_origin.clone()),
+        ),
+        None => (Some(lease_epoch), None, None, None),
+    }
 }
 
 fn finish_draft_pack(
@@ -415,11 +452,16 @@ fn finish_draft_pack(
             byte_ranges,
         });
     }
+    let (legacy_epoch, attachment_id, attachment_epoch, acquire_origin) =
+        pack_lineage_fields(input.lease_epoch, input.lineage);
     let header = PackHeader {
         txn: draft.txn.clone(),
         volume_id: input.volume_id.to_string(),
         base_generation: draft.base_generation,
-        lease_epoch: input.lease_epoch,
+        lease_epoch: legacy_epoch,
+        attachment_id,
+        attachment_epoch,
+        acquire_origin,
         entries,
     };
     let encoded_bytes = format::encoded_pack_len(&header, pack_payload.len())
@@ -464,7 +506,13 @@ fn prepare_barrier_packs_once(
     force_full_base: &[bool],
 ) -> Result<Vec<PreparedBarrierPack>> {
     let mut drafts = Vec::new();
-    let mut draft = draft_pack(input.volume_id, input.lease_epoch, input.base_generation, 0)?;
+    let mut draft = draft_pack(
+        input.volume_id,
+        input.lease_epoch,
+        input.lineage,
+        input.base_generation,
+        0,
+    )?;
     let mut global_payload_offset = 0usize;
 
     for (plan_index, plan) in input.plans.iter().enumerate() {
@@ -493,6 +541,7 @@ fn prepare_barrier_packs_once(
                 draft = draft_pack(
                     input.volume_id,
                     input.lease_epoch,
+                    input.lineage,
                     input.base_generation,
                     drafts.len(),
                 )?;
@@ -526,6 +575,7 @@ fn prepare_barrier_packs_once(
                 draft = draft_pack(
                     input.volume_id,
                     input.lease_epoch,
+                    input.lineage,
                     input.base_generation,
                     drafts.len(),
                 )?;
@@ -662,6 +712,10 @@ impl ChunkEngine {
         let pack_input = BarrierPackInput {
             volume_id: &self.cfg.volume_id,
             lease_epoch: self.epoch,
+            lineage: self
+                .authorized_attachment
+                .as_ref()
+                .map(|attachment| &attachment.identity),
             base_generation,
             plans: &plans,
             frozen_ranges: &frozen_ranges,

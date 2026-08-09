@@ -5,17 +5,112 @@
 //! returned replacement rows in the same transaction.
 
 pub use cats_api::runtime_reconciliation::{
-    AsciiText, AuthorizationConsumedReceipt, AuthorizationRecord, AuthorizationState,
-    BeginDeleteRequest, BeginDeleteResult, BeginDisposableDeleteConsumedReceipt,
-    DeleteCompletionReceipt, DisposableDeleteIsolationBasis, DisposableRootDeleteAuthorization,
-    Epoch, FenceEpoch, Generation, Id, LastVolumeTransition, NodeBootId, NormalAcquireRequest,
-    NormalAcquireResult, RandomId128, ReleaseRequest, ReleaseResult, RemoteHead, Revision,
-    Sha256Digest, TakeoverConsumedReceipt, UnixMillis, VolumeAdminState, VolumeAuthorization,
-    VolumeDurability, VolumeRecord, VolumeTakeoverAuthorization,
+    AcquireOrigin, AsciiText, AuthorizationConsumedReceipt, AuthorizationRecord,
+    AuthorizationState, BeginDeleteRequest, BeginDeleteResult,
+    BeginDisposableDeleteConsumedReceipt, DeleteCompletionReceipt, DisposableDeleteIsolationBasis,
+    DisposableRootDeleteAuthorization, Epoch, FenceEpoch, Generation, Id, LastVolumeTransition,
+    NodeBootId, NormalAcquireRequest, NormalAcquireResult, RandomId128, ReleaseRequest,
+    ReleaseResult, RemoteHead, Revision, Sha256Digest, TakeoverConsumedReceipt, UnixMillis,
+    VolumeAdminState, VolumeAuthorization, VolumeDurability, VolumeRecord,
+    VolumeTakeoverAuthorization,
 };
 use serde::{Deserialize, Serialize};
 
 const MAX_INTEGER: u64 = i64::MAX as u64;
+
+/// Exact local attachment lineage written before any blockd data files.
+///
+/// This is evidence, never ownership authority. A serving process must bind it
+/// to a current [`VolumeRecord`] and successfully renew the exact owner/epoch
+/// before it may expose Guest I/O.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AttachmentLineageIdentity {
+    pub volume_id: Id,
+    pub attachment_id: Id,
+    pub attachment_epoch: FenceEpoch,
+    pub acquire_origin: AcquireOrigin,
+    pub node_id: Id,
+    pub placement_epoch: Epoch,
+}
+
+/// Node-supplied, closed input for adopting a normal-acquire grant as a
+/// serving block data plane. It contains the current immutable Volume tuple
+/// plus the exact server-side acquire marker that created the attachment.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AuthorizedServingAttachment {
+    pub identity: AttachmentLineageIdentity,
+    pub size_bytes: u64,
+    pub durability: VolumeDurability,
+    pub head: RemoteHead,
+    pub lease_expires_at: UnixMillis,
+    pub acquire_request: NormalAcquireRequest,
+    pub acquire_result: NormalAcquireResult,
+}
+
+/// Validate the internally closed serving input before any authority or local
+/// I/O. The current head may be later than the acquire result because root
+/// provisioning runs under the same owner/epoch before the serving process.
+pub fn validate_authorized_serving_attachment(
+    attachment: &AuthorizedServingAttachment,
+) -> Result<()> {
+    let identity = &attachment.identity;
+    let AcquireOrigin::Normal { transition_id } = &identity.acquire_origin else {
+        return Err(AuthorityError::BackendUnknown);
+    };
+    validate_normal_acquire_pair(&attachment.acquire_request, &attachment.acquire_result)?;
+    if !(1..=MAX_INTEGER).contains(&attachment.size_bytes)
+        || !remote_head_is_valid(&attachment.head)
+        || attachment.lease_expires_at.get() == 0
+        || attachment.acquire_request.volume_id != identity.volume_id
+        || attachment.acquire_request.transition_id != *transition_id
+        || attachment.acquire_request.attachment_id != identity.attachment_id
+        || attachment.acquire_request.placement_epoch != identity.placement_epoch
+        || attachment.acquire_result.volume_id != identity.volume_id
+        || attachment.acquire_result.transition_id != *transition_id
+        || attachment.acquire_result.attachment_id != identity.attachment_id
+        || attachment.acquire_result.resulting_epoch != identity.attachment_epoch
+        || attachment.acquire_result.lease_expires_at != attachment.lease_expires_at
+        || !remote_head_is_same_or_later(
+            &attachment.head,
+            &attachment.acquire_result.resulting_head,
+        )
+    {
+        return Err(AuthorityError::BackendUnknown);
+    }
+    Ok(())
+}
+
+/// Prove that a strict authority reread is exactly the Node-supplied serving
+/// attachment. When supplied, `expected_expiry` binds the second reread to the
+/// mandatory startup renewal result. The initial read deliberately ignores the
+/// old grant expiry so an exact retry remains valid after a lost renewal reply.
+pub fn validate_authorized_serving_record(
+    record: &VolumeRecord,
+    attachment: &AuthorizedServingAttachment,
+    expected_expiry: Option<UnixMillis>,
+) -> Result<()> {
+    validate_authorized_serving_attachment(attachment)?;
+    validate_volume_record(record)?;
+    if record.volume_id != attachment.identity.volume_id
+        || record.size_bytes != attachment.size_bytes
+        || record.durability != attachment.durability
+        || !matches!(record.admin_state, VolumeAdminState::Active)
+        || record.head != attachment.head
+        || record.lease_owner.as_ref() != Some(&attachment.identity.attachment_id)
+        || record.lease_epoch != attachment.identity.attachment_epoch
+        || expected_expiry.is_some_and(|expiry| record.lease_expires_at != Some(expiry))
+        || record.last_transition
+            != Some(LastVolumeTransition::NormalAcquire {
+                request: attachment.acquire_request.clone(),
+                result: attachment.acquire_result.clone(),
+            })
+    {
+        return Err(AuthorityError::BackendUnknown);
+    }
+    Ok(())
+}
 
 /// Exact clean-slate authority schema release understood by the Volume
 /// Authority writer and its data-plane adapter. Earlier versions are neither

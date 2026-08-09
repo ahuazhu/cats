@@ -153,9 +153,23 @@ pub fn serve_unix(
 /// Bind the vhost-user socket without accepting yet. Callers that must publish
 /// readiness before a VMM starts (the node agent) bind first, then serve.
 pub fn bind(socket: &Path, options: VhostUserOptions) -> Result<Listener, VhostUserBlkError> {
+    bind_with_replacement(socket, options, true)
+}
+
+/// Bind only if the exact socket name is absent. Signed Runtime reconciliation
+/// uses this after a full inventory proved absence; it must never unlink an
+/// unverified process merely because the path collides.
+pub fn bind_new(socket: &Path, options: VhostUserOptions) -> Result<Listener, VhostUserBlkError> {
+    bind_with_replacement(socket, options, false)
+}
+
+fn bind_with_replacement(
+    socket: &Path,
+    options: VhostUserOptions,
+    replace_existing: bool,
+) -> Result<Listener, VhostUserBlkError> {
     options.validate()?;
-    // `Listener::new(.., true)` unlinks a stale socket left by a killed backend.
-    Listener::new(socket, true).map_err(|e| VhostUserBlkError::Bind {
+    Listener::new(socket, replace_existing).map_err(|e| VhostUserBlkError::Bind {
         path: socket.display().to_string(),
         message: e.to_string(),
     })

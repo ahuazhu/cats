@@ -6,6 +6,7 @@
 use sha2::{Digest, Sha256};
 
 use cats_api::chunk::{CHUNK_SIZE, PAGES_PER_CHUNK};
+use cats_api::runtime_reconciliation::AcquireOrigin;
 
 pub const LEAF_MAGIC: &[u8; 8] = b"CATSLEAF";
 pub const ROOT_MAGIC: &[u8; 8] = b"CATSROOT";
@@ -13,6 +14,7 @@ pub const PACK_MAGIC: &[u8; 8] = b"CATSPACK";
 pub(crate) const ENCODED_PACK_PREFIX_LEN: usize = 8 + 2 + 4;
 pub const BITMAP_MAGIC: &[u8; 8] = b"CATSDRTY";
 pub const FORMAT_VERSION: u16 = 1;
+pub const TARGET_PACK_FORMAT_VERSION: u16 = 2;
 /// Leaf encoding version that can carry layered (base + delta) chunk refs.
 ///
 /// A leaf is encoded at version 1 unless it actually contains a layered ref, so
@@ -408,12 +410,49 @@ pub fn decode_root(mut buf: &[u8]) -> Result<(u64, Vec<LeafRef>), FormatError> {
 // ---------------------------------------------------------------------------
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct PackHeader {
     pub txn: String,
     pub volume_id: String,
     pub base_generation: i64,
-    pub lease_epoch: i64,
+    /// Legacy-only epoch spelling. Target-v2 packs omit it and carry the
+    /// complete closed lineage below.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub lease_epoch: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub attachment_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub attachment_epoch: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub acquire_origin: Option<AcquireOrigin>,
     pub entries: Vec<PackEntry>,
+}
+
+impl PackHeader {
+    pub fn attachment_epoch_value(&self) -> Result<i64, FormatError> {
+        match (
+            self.lease_epoch,
+            &self.attachment_id,
+            self.attachment_epoch,
+            &self.acquire_origin,
+        ) {
+            (Some(epoch), None, None, None) | (None, Some(_), Some(epoch), Some(_)) => Ok(epoch),
+            _ => Err(FormatError::Malformed("pack lineage")),
+        }
+    }
+
+    fn wire_version(&self) -> Result<u16, FormatError> {
+        match (
+            self.lease_epoch,
+            &self.attachment_id,
+            self.attachment_epoch,
+            &self.acquire_origin,
+        ) {
+            (Some(_), None, None, None) => Ok(FORMAT_VERSION),
+            (None, Some(_), Some(_), Some(_)) => Ok(TARGET_PACK_FORMAT_VERSION),
+            _ => Err(FormatError::Malformed("pack lineage")),
+        }
+    }
 }
 
 /// `page_mask` of a full-chunk base image. Deltas always carry fewer pages, so
@@ -436,7 +475,10 @@ pub struct PackEntry {
     /// by the Guest. The background publisher materializes those ranges into
     /// the complete 64 KiB pages named by `page_mask` before uploading. Empty
     /// means the payload is already a publishable base/delta (the V1 format).
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    // Target-v2 makes this field explicit even when the payload is already a
+    // publishable base/delta. Legacy readers already accept the empty array;
+    // `default` keeps old v1 packs without the field readable.
+    #[serde(default)]
     pub byte_ranges: Vec<PackByteRange>,
 }
 
@@ -468,10 +510,13 @@ impl PackEntry {
 }
 
 pub fn encode_pack(header: &PackHeader, payload: &[u8]) -> Vec<u8> {
+    let version = header
+        .wire_version()
+        .expect("pack header has one complete lineage shape");
     let hdr = serde_json::to_vec(header).expect("pack header serializes");
     let mut out = Vec::with_capacity(16 + hdr.len() + payload.len());
     out.extend_from_slice(PACK_MAGIC);
-    out.extend_from_slice(&FORMAT_VERSION.to_le_bytes());
+    out.extend_from_slice(&version.to_le_bytes());
     out.extend_from_slice(&(hdr.len() as u32).to_le_bytes());
     out.extend_from_slice(&hdr);
     out.extend_from_slice(payload);
@@ -495,7 +540,7 @@ pub(crate) fn encoded_pack_header_len(prefix: &[u8]) -> Result<usize, FormatErro
         return Err(FormatError::Malformed("pack"));
     }
     let ver = take_u16(&mut remaining, "pack")?;
-    if ver != FORMAT_VERSION {
+    if ver != FORMAT_VERSION && ver != TARGET_PACK_FORMAT_VERSION {
         return Err(FormatError::Version("pack", ver));
     }
     let header_len = take_u32(&mut remaining, "pack")? as usize;
@@ -512,11 +557,79 @@ pub(crate) fn decode_pack_header(buf: &[u8]) -> Result<(PackHeader, usize), Form
     let hdr = take(&mut remaining, hdr_len, "pack")?;
     let header: PackHeader =
         serde_json::from_slice(hdr).map_err(|_| FormatError::Malformed("pack"))?;
+    let encoded_version = u16::from_le_bytes(
+        buf.get(8..10)
+            .ok_or(FormatError::Malformed("pack"))?
+            .try_into()
+            .map_err(|_| FormatError::Malformed("pack"))?,
+    );
+    if encoded_version == TARGET_PACK_FORMAT_VERSION {
+        validate_target_pack_json_shape(hdr)?;
+    }
+    if header.wire_version()? != encoded_version {
+        return Err(FormatError::Malformed("pack lineage"));
+    }
     let payload_offset = buf
         .len()
         .checked_sub(remaining.len())
         .ok_or(FormatError::Malformed("pack"))?;
     Ok((header, payload_offset))
+}
+
+fn validate_target_pack_json_shape(bytes: &[u8]) -> Result<(), FormatError> {
+    let value: serde_json::Value =
+        serde_json::from_slice(bytes).map_err(|_| FormatError::Malformed("pack"))?;
+    let object = value.as_object().ok_or(FormatError::Malformed("pack"))?;
+    const HEADER_FIELDS: [&str; 7] = [
+        "txn",
+        "volume_id",
+        "base_generation",
+        "attachment_id",
+        "attachment_epoch",
+        "acquire_origin",
+        "entries",
+    ];
+    if object.len() != HEADER_FIELDS.len()
+        || HEADER_FIELDS
+            .iter()
+            .any(|field| !object.contains_key(*field))
+    {
+        return Err(FormatError::Malformed("pack"));
+    }
+    let entries = object
+        .get("entries")
+        .and_then(serde_json::Value::as_array)
+        .ok_or(FormatError::Malformed("pack"))?;
+    const ENTRY_FIELDS: [&str; 6] = [
+        "chunk_idx",
+        "payload_offset",
+        "len",
+        "sha256_hex",
+        "page_mask",
+        "byte_ranges",
+    ];
+    const RANGE_FIELDS: [&str; 3] = ["chunk_offset", "payload_offset", "len"];
+    for entry in entries {
+        let entry = entry.as_object().ok_or(FormatError::Malformed("pack"))?;
+        if entry.len() != ENTRY_FIELDS.len()
+            || ENTRY_FIELDS.iter().any(|field| !entry.contains_key(*field))
+        {
+            return Err(FormatError::Malformed("pack"));
+        }
+        let ranges = entry
+            .get("byte_ranges")
+            .and_then(serde_json::Value::as_array)
+            .ok_or(FormatError::Malformed("pack"))?;
+        for range in ranges {
+            let range = range.as_object().ok_or(FormatError::Malformed("pack"))?;
+            if range.len() != RANGE_FIELDS.len()
+                || RANGE_FIELDS.iter().any(|field| !range.contains_key(*field))
+            {
+                return Err(FormatError::Malformed("pack"));
+            }
+        }
+    }
+    Ok(())
 }
 
 pub fn decode_pack(buf: &[u8]) -> Result<(PackHeader, Vec<u8>), FormatError> {
@@ -663,7 +776,10 @@ mod tests {
             txn: "t1".into(),
             volume_id: "vol_x".into(),
             base_generation: 3,
-            lease_epoch: 5,
+            lease_epoch: Some(5),
+            attachment_id: None,
+            attachment_epoch: None,
+            acquire_origin: None,
             entries: vec![PackEntry {
                 chunk_idx: 2,
                 payload_offset: 0,
@@ -686,6 +802,68 @@ mod tests {
         let (owned_header, owned_payload) = decode_pack_owned(enc).unwrap();
         assert_eq!(owned_header.txn, "t1");
         assert_eq!(owned_payload, b"data");
+    }
+
+    #[test]
+    fn target_pack_requires_version_two_and_complete_closed_lineage() {
+        let header = PackHeader {
+            txn: "target-txn".into(),
+            volume_id: "vol_x".into(),
+            base_generation: 4,
+            lease_epoch: None,
+            attachment_id: Some("att_x".into()),
+            attachment_epoch: Some(7),
+            acquire_origin: Some(AcquireOrigin::Normal {
+                transition_id: cats_api::runtime_reconciliation::RandomId128::new(
+                    "1234567890abcdef1234567890abcdef",
+                )
+                .unwrap(),
+            }),
+            entries: vec![PackEntry {
+                chunk_idx: 0,
+                payload_offset: 0,
+                len: 0,
+                sha256_hex: hex::encode(sha256(&[])),
+                page_mask: 0,
+                byte_ranges: Vec::new(),
+            }],
+        };
+        let encoded = encode_pack(&header, &[]);
+        assert_eq!(
+            u16::from_le_bytes(encoded[8..10].try_into().unwrap()),
+            TARGET_PACK_FORMAT_VERSION
+        );
+        let (decoded, payload) = decode_pack(&encoded).unwrap();
+        assert_eq!(decoded.attachment_epoch_value().unwrap(), 7);
+        assert_eq!(decoded.acquire_origin, header.acquire_origin);
+        assert!(decoded.entries[0].byte_ranges.is_empty());
+        assert!(payload.is_empty());
+
+        let mut falsely_legacy = encoded.clone();
+        falsely_legacy[8..10].copy_from_slice(&FORMAT_VERSION.to_le_bytes());
+        assert!(matches!(
+            decode_pack(&falsely_legacy),
+            Err(FormatError::Malformed("pack lineage"))
+        ));
+
+        let header_length = u32::from_le_bytes(encoded[10..14].try_into().unwrap()) as usize;
+        let mut value: serde_json::Value =
+            serde_json::from_slice(&encoded[14..14 + header_length]).unwrap();
+        value["entries"][0]
+            .as_object_mut()
+            .unwrap()
+            .remove("byte_ranges");
+        let malformed_header = serde_json::to_vec(&value).unwrap();
+        let mut missing_required_entry_field = Vec::new();
+        missing_required_entry_field.extend_from_slice(PACK_MAGIC);
+        missing_required_entry_field.extend_from_slice(&TARGET_PACK_FORMAT_VERSION.to_le_bytes());
+        missing_required_entry_field
+            .extend_from_slice(&(malformed_header.len() as u32).to_le_bytes());
+        missing_required_entry_field.extend_from_slice(&malformed_header);
+        assert!(matches!(
+            decode_pack(&missing_required_entry_field),
+            Err(FormatError::Malformed("pack"))
+        ));
     }
 
     #[test]

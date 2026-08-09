@@ -82,6 +82,71 @@ fn acquired_volume() -> VolumeRecord {
         .0
 }
 
+fn authorized_serving_attachment() -> (AuthorizedServingAttachment, VolumeRecord) {
+    let record = acquired_volume();
+    let LastVolumeTransition::NormalAcquire { request, result } =
+        record.last_transition.clone().unwrap()
+    else {
+        unreachable!("fixture is a normal acquire")
+    };
+    (
+        AuthorizedServingAttachment {
+            identity: AttachmentLineageIdentity {
+                volume_id: record.volume_id.clone(),
+                attachment_id: result.attachment_id.clone(),
+                attachment_epoch: result.resulting_epoch,
+                acquire_origin: AcquireOrigin::Normal {
+                    transition_id: result.transition_id.clone(),
+                },
+                node_id: id("node-1"),
+                placement_epoch: request.placement_epoch,
+            },
+            size_bytes: record.size_bytes,
+            durability: record.durability,
+            head: record.head.clone(),
+            lease_expires_at: record.lease_expires_at.unwrap(),
+            acquire_request: request,
+            acquire_result: result,
+        },
+        record,
+    )
+}
+
+#[test]
+fn authorized_serving_input_binds_identity_receipt_and_exact_authority_record() {
+    let (attachment, record) = authorized_serving_attachment();
+    validate_authorized_serving_attachment(&attachment).unwrap();
+    validate_authorized_serving_record(&record, &attachment, Some(attachment.lease_expires_at))
+        .unwrap();
+
+    let mut wrong_origin = attachment.clone();
+    wrong_origin.identity.acquire_origin = AcquireOrigin::Normal {
+        transition_id: random_id(99),
+    };
+    assert_eq!(
+        validate_authorized_serving_attachment(&wrong_origin),
+        Err(AuthorityError::BackendUnknown)
+    );
+
+    let mut wrong_grant_expiry = attachment.clone();
+    wrong_grant_expiry.lease_expires_at = UnixMillis::new(1).unwrap();
+    assert_eq!(
+        validate_authorized_serving_attachment(&wrong_grant_expiry),
+        Err(AuthorityError::BackendUnknown)
+    );
+
+    let mut wrong_head = record.clone();
+    wrong_head.head = head(9);
+    assert_eq!(
+        validate_authorized_serving_record(
+            &wrong_head,
+            &attachment,
+            Some(attachment.lease_expires_at)
+        ),
+        Err(AuthorityError::BackendUnknown)
+    );
+}
+
 fn host_fence_event(state: HostFenceEventState) -> HostFenceEvent {
     HostFenceEvent {
         event_id: id("fence-event-1"),

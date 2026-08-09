@@ -28,6 +28,12 @@ impl ChunkEngine {
             let bytes = fs::read(&path)?;
             let (header, payload) = match format::decode_pack(&bytes) {
                 Ok(v) => v,
+                Err(error) if self.authorized_attachment.is_some() => {
+                    return Err(EngineError::Corrupt(format!(
+                        "authorized staged pack {}: {error}",
+                        path.display()
+                    )));
+                }
                 Err(e) => {
                     tracing::warn!("discarding undecodable pack {}: {e}", path.display());
                     let _ = fs::remove_file(&path);
@@ -37,6 +43,7 @@ impl ChunkEngine {
             if header.volume_id != self.cfg.volume_id {
                 return Err(EngineError::Corrupt("pack volume id mismatch".into()));
             }
+            self.validate_pack_lineage(&header)?;
             let head = self.authority.load_head(&self.cfg.volume_id)?;
             if head.generation > header.base_generation {
                 // A sole serialized publisher can advance past this exact
@@ -95,6 +102,7 @@ impl ChunkEngine {
             if header.volume_id != self.cfg.volume_id {
                 return Err(EngineError::Corrupt("pack volume id mismatch".into()));
             }
+            self.validate_pack_lineage(&header)?;
             if header.base_generation < committed {
                 // A prior batch CAS included this generation. It is safe to
                 // remove the stale local file; the committed map is the truth.

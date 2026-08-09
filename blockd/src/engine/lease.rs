@@ -77,6 +77,25 @@ impl ChunkEngine {
         Ok(())
     }
 
+    /// Stop a target-authority serving process without releasing or otherwise
+    /// mutating attachment ownership. The Runtime reconciler owns the later
+    /// exact release transition.
+    pub fn stop_authorized_serving(&self) -> Result<()> {
+        if !matches!(&self.authority, AuthorityBackend::Target(_))
+            || self.authorized_attachment.is_none()
+        {
+            return Err(EngineError::InvalidConfig(
+                "engine is not an authorized target serving attachment".into(),
+            ));
+        }
+        if self.is_fenced() {
+            return Err(EngineError::Fenced);
+        }
+        self.drain_staged()?;
+        self.stop_renewal();
+        Ok(())
+    }
+
     pub(super) fn stop_renewal(&self) {
         let (lock, cv) = &*self.stop_renew;
         *lock.lock().unwrap() = true;

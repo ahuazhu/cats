@@ -27,8 +27,10 @@ use crate::format::{
     self, ChunkRef, LeafRef, PackByteRange, PackEntry, PackHeader, BITMAP_HEADER_LEN,
 };
 use cats_storage::authority::{
-    AsciiText, AuthorityError, FenceEpoch, Generation, Id, RemoteHead, RenewLeaseRequest,
-    Sha256Digest, VolumeDataAuthority, VolumeHeadCasRequest,
+    validate_authorized_serving_attachment, validate_authorized_serving_record, AsciiText,
+    AttachmentLineageIdentity, AuthorityError, AuthorizedServingAttachment, FenceEpoch, Generation,
+    Id, RemoteHead, RenewLeaseRequest, Sha256Digest, VolumeDataAuthority, VolumeDurability,
+    VolumeHeadCasRequest,
 };
 use cats_storage::{BlobError, BlobStore, MetaError, MetadataStore, VolumeHead};
 
@@ -262,6 +264,9 @@ pub struct ChunkEngine {
     /// disabled. It is intentionally unable to turn into a serving engine;
     /// the reconciler must stop it and start the later frontend phase.
     guest_io_enabled: bool,
+    /// Present only for the target-authority serving path. It is the exact
+    /// startup grant/lineage echoed by status and bound into every new pack.
+    authorized_attachment: Option<AuthorizedServingAttachment>,
     /// Signals the lease-renewal thread to stop, and wakes it so a detach does not
     /// have to wait out its sleep interval.
     stop_renew: Arc<(Mutex<bool>, Condvar)>,
@@ -286,6 +291,7 @@ pub struct ChunkEngine {
 enum AttachmentMode {
     Acquire,
     AdoptControlOnly { expected_epoch: i64 },
+    AdoptAuthorizedServing { expected_epoch: i64 },
 }
 
 enum AuthorityBackend {
@@ -474,7 +480,230 @@ fn map_target_error(error: AuthorityError, volume_id: &str, expected: i64) -> Me
     }
 }
 
+fn validate_authorized_serving_config(
+    cfg: &EngineConfig,
+    attachment: &AuthorizedServingAttachment,
+) -> Result<()> {
+    validate_authorized_serving_attachment(attachment).map_err(|_| {
+        EngineError::InvalidConfig("authorized serving attachment is not internally closed".into())
+    })?;
+    if cfg.volume_id != attachment.identity.volume_id.as_str()
+        || cfg.attachment_id != attachment.identity.attachment_id.as_str()
+    {
+        return Err(EngineError::InvalidConfig(
+            "engine IDs do not match the authorized serving attachment".into(),
+        ));
+    }
+    let lease_ttl_ms = u64::try_from(cfg.lease_ttl_ms).map_err(|_| {
+        EngineError::InvalidConfig("lease_ttl_ms must fit the target authority range".into())
+    })?;
+    if lease_ttl_ms != attachment.acquire_request.lease_duration_ms {
+        return Err(EngineError::InvalidConfig(
+            "lease_ttl_ms does not match the exact acquire receipt".into(),
+        ));
+    }
+    let durability_matches = matches!(
+        (&cfg.durability, attachment.durability),
+        (DurabilityMode::Strict, VolumeDurability::Strict)
+            | (DurabilityMode::Relaxed { .. }, VolumeDurability::Relaxed)
+    );
+    if !durability_matches {
+        return Err(EngineError::InvalidConfig(
+            "durability mode does not match the immutable Volume".into(),
+        ));
+    }
+    Ok(())
+}
+
+fn preflight_authorized_serving(
+    cfg: &EngineConfig,
+    attachment: &AuthorizedServingAttachment,
+    authority: &dyn VolumeDataAuthority,
+) -> Result<()> {
+    validate_attachment_identity_file(&cfg.data_dir, &attachment.identity)?;
+    let initial = authority
+        .load_volume(&attachment.identity.volume_id)
+        .map_err(|error| {
+            EngineError::Meta(map_target_error(
+                error,
+                attachment.identity.volume_id.as_str(),
+                0,
+            ))
+        })?;
+    validate_authorized_serving_record(&initial, attachment, None).map_err(|_| {
+        EngineError::Meta(MetaError::Backend(
+            "target authority does not match the authorized serving grant".into(),
+        ))
+    })?;
+
+    let renewed = authority
+        .renew_lease(&RenewLeaseRequest {
+            volume_id: attachment.identity.volume_id.clone(),
+            attachment_id: attachment.identity.attachment_id.clone(),
+            expected_epoch: attachment.identity.attachment_epoch,
+            lease_duration_ms: attachment.acquire_request.lease_duration_ms,
+        })
+        .map_err(|error| {
+            EngineError::Meta(map_target_error(
+                error,
+                attachment.identity.volume_id.as_str(),
+                0,
+            ))
+        })?;
+    if renewed.volume_id != attachment.identity.volume_id
+        || renewed.attachment_id != attachment.identity.attachment_id
+        || renewed.epoch != attachment.identity.attachment_epoch
+    {
+        return Err(EngineError::Meta(MetaError::Backend(
+            "target authority returned a mismatched startup renewal".into(),
+        )));
+    }
+    let after_renew = authority
+        .load_volume(&attachment.identity.volume_id)
+        .map_err(|error| {
+            EngineError::Meta(map_target_error(
+                error,
+                attachment.identity.volume_id.as_str(),
+                0,
+            ))
+        })?;
+    validate_authorized_serving_record(&after_renew, attachment, Some(renewed.lease_expires_at))
+        .map_err(|_| {
+            EngineError::Meta(MetaError::Backend(
+                "target authority changed outside the exact startup renewal".into(),
+            ))
+        })
+}
+
+fn validate_attachment_identity_file(
+    data_dir: &Path,
+    expected: &AttachmentLineageIdentity,
+) -> Result<()> {
+    use std::ffi::CString;
+    use std::os::fd::{AsRawFd as _, FromRawFd as _};
+    use std::os::unix::ffi::OsStrExt as _;
+    use std::os::unix::fs::MetadataExt as _;
+
+    const MAX_IDENTITY_BYTES: u64 = 4_096;
+    let path = CString::new(data_dir.as_os_str().as_bytes()).map_err(|_| {
+        EngineError::InvalidConfig("data directory contains an interior NUL".into())
+    })?;
+    // SAFETY: `path` is NUL-terminated and the returned descriptor, when
+    // nonnegative, is uniquely adopted by `File` below.
+    let directory_fd = unsafe {
+        libc::open(
+            path.as_ptr(),
+            libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC | libc::O_NOFOLLOW,
+        )
+    };
+    if directory_fd < 0 {
+        return Err(EngineError::Io(std::io::Error::last_os_error()));
+    }
+    // SAFETY: `directory_fd` is a newly opened, owned descriptor.
+    let directory = unsafe { File::from_raw_fd(directory_fd) };
+    let name = c"identity.json";
+    // SAFETY: `directory` remains live, `name` is NUL-terminated, and the
+    // returned descriptor is uniquely adopted below.
+    let identity_fd = unsafe {
+        libc::openat(
+            directory.as_raw_fd(),
+            name.as_ptr(),
+            libc::O_RDONLY | libc::O_CLOEXEC | libc::O_NOFOLLOW,
+        )
+    };
+    if identity_fd < 0 {
+        return Err(EngineError::Io(std::io::Error::last_os_error()));
+    }
+    // SAFETY: `identity_fd` is a newly opened, owned descriptor.
+    let mut file = unsafe { File::from_raw_fd(identity_fd) };
+    let metadata = file.metadata()?;
+    if !metadata.file_type().is_file()
+        || metadata.nlink() != 1
+        || metadata.len() > MAX_IDENTITY_BYTES
+    {
+        return Err(EngineError::Corrupt(
+            "attachment identity is not one bounded regular file".into(),
+        ));
+    }
+    let mut bytes = Vec::with_capacity(metadata.len() as usize);
+    std::io::Read::by_ref(&mut file)
+        .take(MAX_IDENTITY_BYTES + 1)
+        .read_to_end(&mut bytes)?;
+    if bytes.len() as u64 > MAX_IDENTITY_BYTES {
+        return Err(EngineError::Corrupt(
+            "attachment identity exceeds its byte limit".into(),
+        ));
+    }
+    let identity: AttachmentLineageIdentity = serde_json::from_slice(&bytes)
+        .map_err(|_| EngineError::Corrupt("attachment identity is malformed".into()))?;
+    let canonical = serde_json::to_vec(&identity)
+        .map_err(|_| EngineError::Corrupt("attachment identity cannot serialize".into()))?;
+    if canonical != bytes || identity != *expected {
+        return Err(EngineError::Corrupt(
+            "attachment identity is noncanonical or does not match the grant".into(),
+        ));
+    }
+    Ok(())
+}
+
+fn remote_head_from_legacy_projection(head: &VolumeHead) -> Result<RemoteHead> {
+    let generation = u64::try_from(head.generation)
+        .ok()
+        .and_then(Generation::new)
+        .ok_or_else(|| EngineError::Corrupt("authority generation is outside V1".into()))?;
+    let root_object_id = head
+        .root_object_id
+        .as_ref()
+        .map(|value| {
+            AsciiText::new(value.clone())
+                .ok_or_else(|| EngineError::Corrupt("authority root object ID is invalid".into()))
+        })
+        .transpose()?;
+    Ok(RemoteHead {
+        generation,
+        root_hash: head.root_hash.map(Sha256Digest::from_bytes),
+        root_object_id,
+    })
+}
+
 impl ChunkEngine {
+    fn validate_pack_lineage(&self, header: &PackHeader) -> Result<()> {
+        let epoch = header
+            .attachment_epoch_value()
+            .map_err(|error| EngineError::Corrupt(error.to_string()))?;
+        match &self.authorized_attachment {
+            Some(attachment)
+                if epoch == self.epoch
+                    && header.lease_epoch.is_none()
+                    && header.attachment_id.as_deref()
+                        == Some(attachment.identity.attachment_id.as_str())
+                    && header.attachment_epoch == Some(self.epoch)
+                    && header.acquire_origin.as_ref()
+                        == Some(&attachment.identity.acquire_origin) =>
+            {
+                Ok(())
+            }
+            Some(_) => Err(EngineError::Corrupt(
+                "pack lineage does not match identity.json and the current grant".into(),
+            )),
+            // Preserve the existing legacy restart semantics for the
+            // compatibility-only caller: it historically replays its v1
+            // journal after reacquiring a later epoch. The signed target path
+            // above has no such exception and binds every pack to the exact
+            // immutable grant.
+            None if header.lease_epoch.is_some()
+                && header.attachment_id.is_none()
+                && header.attachment_epoch.is_none()
+                && header.acquire_origin.is_none() =>
+            {
+                Ok(())
+            }
+            None => Err(EngineError::Corrupt(
+                "target-v2 pack cannot be adopted without a complete authorized lineage".into(),
+            )),
+        }
+    }
+
     /// Attach to a volume: acquire the lease (bumping the fencing epoch),
     /// start lease renewal, then load the committed map and recover pending
     /// packs under the live lease.
@@ -488,6 +717,7 @@ impl ChunkEngine {
             blob,
             AuthorityBackend::Legacy(meta),
             AttachmentMode::Acquire,
+            None,
         )
     }
 
@@ -513,6 +743,34 @@ impl ChunkEngine {
             blob,
             AuthorityBackend::Target(authority),
             AttachmentMode::AdoptControlOnly { expected_epoch },
+            None,
+        )
+    }
+
+    /// Adopt an exact target-authority grant as a serving block data plane.
+    ///
+    /// This path has no acquire capability and never increments an epoch. It
+    /// validates the complete Node-supplied grant against a strict authority
+    /// read, renews that same owner/epoch, and validates a second strict read
+    /// before creating or opening any local block state. Guest frontends are
+    /// usable only after recovery completes and this function returns.
+    pub fn attach_authorized_serving(
+        cfg: EngineConfig,
+        attachment: AuthorizedServingAttachment,
+        blob: Arc<dyn BlobStore>,
+        authority: Arc<dyn VolumeDataAuthority>,
+    ) -> Result<Arc<Self>> {
+        validate_authorized_serving_config(&cfg, &attachment)?;
+        let expected_epoch =
+            i64::try_from(attachment.identity.attachment_epoch.get()).map_err(|_| {
+                EngineError::InvalidConfig("attachment epoch exceeds the engine range".into())
+            })?;
+        Self::open(
+            cfg,
+            blob,
+            AuthorityBackend::Target(authority),
+            AttachmentMode::AdoptAuthorizedServing { expected_epoch },
+            Some(attachment),
         )
     }
 
@@ -521,6 +779,7 @@ impl ChunkEngine {
         blob: Arc<dyn BlobStore>,
         authority: AuthorityBackend,
         mode: AttachmentMode,
+        authorized_attachment: Option<AuthorizedServingAttachment>,
     ) -> Result<Arc<Self>> {
         if cfg.volume_id.is_empty() || cfg.attachment_id.is_empty() {
             return Err(EngineError::InvalidConfig(
@@ -541,6 +800,24 @@ impl ChunkEngine {
             return Err(EngineError::InvalidConfig(format!(
                 "max_local_bytes must be at least one chunk ({CHUNK_SIZE} bytes)"
             )));
+        }
+        match (&mode, &authority, &authorized_attachment) {
+            (
+                AttachmentMode::AdoptAuthorizedServing { .. },
+                AuthorityBackend::Target(target),
+                Some(attachment),
+            ) => preflight_authorized_serving(&cfg, attachment, target.as_ref())?,
+            (AttachmentMode::AdoptAuthorizedServing { .. }, _, _) => {
+                return Err(EngineError::InvalidConfig(
+                    "authorized serving requires one target-authority attachment".into(),
+                ));
+            }
+            (_, _, Some(_)) => {
+                return Err(EngineError::InvalidConfig(
+                    "an authorized serving attachment was supplied to another mode".into(),
+                ));
+            }
+            _ => {}
         }
         let head = authority.load_head(&cfg.volume_id)?;
         let size = head.size_bytes;
@@ -573,8 +850,27 @@ impl ChunkEngine {
                 }
                 expected_epoch
             }
+            (
+                AttachmentMode::AdoptAuthorizedServing { expected_epoch },
+                AuthorityBackend::Target(_),
+            ) => {
+                let attachment = authorized_attachment.as_ref().ok_or_else(|| {
+                    EngineError::InvalidConfig(
+                        "authorized serving attachment disappeared before open".into(),
+                    )
+                })?;
+                if head.lease_owner.as_deref() != Some(cfg.attachment_id.as_str())
+                    || head.lease_epoch != expected_epoch
+                    || head.size_bytes != attachment.size_bytes
+                    || remote_head_from_legacy_projection(&head)? != attachment.head
+                {
+                    return Err(EngineError::Meta(MetaError::Fenced));
+                }
+                expected_epoch
+            }
             (AttachmentMode::Acquire, AuthorityBackend::Target(_))
-            | (AttachmentMode::AdoptControlOnly { .. }, AuthorityBackend::Legacy(_)) => {
+            | (AttachmentMode::AdoptControlOnly { .. }, AuthorityBackend::Legacy(_))
+            | (AttachmentMode::AdoptAuthorizedServing { .. }, AuthorityBackend::Legacy(_)) => {
                 return Err(EngineError::InvalidConfig(
                     "attachment mode and authority backend do not match".into(),
                 ));
@@ -655,6 +951,7 @@ impl ChunkEngine {
             fenced: AtomicBool::new(false),
             epoch,
             guest_io_enabled: !control_only,
+            authorized_attachment,
             stop_renew: Arc::new((Mutex::new(false), Condvar::new())),
             committer_signal: Arc::new((
                 Mutex::new(CommitterSignal {

@@ -17,6 +17,8 @@ use std::str::FromStr;
 
 use serde::{Deserialize, Serialize};
 
+use crate::runtime_reconciliation::{AcquireOrigin, Epoch, FenceEpoch, Id};
+
 /// Directory under a blockd `--data-dir` holding locally durable, remotely
 /// unpublished packs.
 pub const PENDING_PACK_DIR: &str = "pending";
@@ -166,6 +168,21 @@ pub struct DurabilityStatus {
     /// same "identity unproven, do not adopt" meaning as [`Self::volume_id`].
     #[serde(default)]
     pub attachment_id: String,
+    /// Complete target-authority lineage is present only for a blockd that
+    /// adopted a Node-supplied exact grant. Missing means unproven legacy
+    /// status and must never be inferred from the process arguments.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub attachment_epoch: Option<FenceEpoch>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub acquire_origin: Option<AcquireOrigin>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub node_id: Option<Id>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub placement_epoch: Option<Epoch>,
+    /// Exact Guest-I/O gate state for the target path. Missing is legacy and
+    /// therefore not proof that a frontend is either open or closed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub guest_io_enabled: Option<bool>,
     pub mode: String,
     pub local_durable_generation: i64,
     pub remote_durable_generation: i64,
@@ -218,6 +235,11 @@ mod tests {
         let status = DurabilityStatus {
             volume_id: "vol_x".to_string(),
             attachment_id: "att_x".to_string(),
+            attachment_epoch: None,
+            acquire_origin: None,
+            node_id: None,
+            placement_epoch: None,
+            guest_io_enabled: None,
             mode: "relaxed".to_string(),
             local_durable_generation: 7,
             remote_durable_generation: 5,
