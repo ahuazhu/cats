@@ -486,12 +486,27 @@ pub(super) async fn prometheus_metrics(
             body.push_str(&format!("{} {}\n", $name, $value));
         };
     }
+    if !state.legacy_node_runtime_for_tests {
+        // Production has no authoritative projection for the retired fleet
+        // rows. Preserve the DB-independent executor and signed observation
+        // diagnostics above, but never query or expose the legacy Cat/Node
+        // snapshot from the cutover composition.
+        metric!("cats_control_plane_metrics_database_snapshot_available", 0);
+        return Ok((
+            [(
+                header::CONTENT_TYPE,
+                "text/plain; version=0.0.4; charset=utf-8",
+            )],
+            body,
+        )
+            .into_response());
+    }
     // The executor gauges above are captured before touching PostgreSQL and
-    // are the primary diagnostic when it is unhealthy. Retain the existing
-    // fleet metrics when the lane is healthy, but make them optional behind a
-    // short scrape-only deadline. Cancelling a queued Store future removes
-    // its closure; a call already started keeps its lane until the configured
-    // physical/statement deadline closes it.
+    // are the primary diagnostic when it is unhealthy. The explicit legacy
+    // test composition retains the old fleet metrics, but makes them optional
+    // behind a short scrape-only deadline. Cancelling a queued Store future
+    // removes its closure; a call already started keeps its lane until the
+    // configured physical/statement deadline closes it.
     let database_snapshot = tokio::time::timeout(Duration::from_millis(250), {
         let store = Arc::clone(&state.store);
         async move {

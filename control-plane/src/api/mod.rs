@@ -524,7 +524,6 @@ pub fn router(state: AppState) -> Router {
             post(admin_node_action),
         )
         .route("/v1/admin/monitoring", get(admin_monitoring))
-        .route("/metrics", get(prometheus_metrics))
         .route("/v1/routes/resolve", get(resolve_route))
         .route("/v1/routes/wake", post(wake_route_handler));
     let legacy_authority = if state.legacy_node_runtime_for_tests {
@@ -574,6 +573,7 @@ pub fn router(state: AppState) -> Router {
         .route("/auth/workspace", post(crate::auth::switch_workspace))
         .route("/auth/logout", get(crate::auth::logout))
         .route("/healthz", get(readiness))
+        .route("/metrics", get(prometheus_metrics))
         .route("/v1/me", get(cli_me))
         .route("/v1/workspaces", get(list_workspaces))
         .route(

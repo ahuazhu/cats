@@ -3483,12 +3483,6 @@ async fn production_signed_cutover_never_runs_or_enters_the_legacy_node_runtime(
         ),
         (
             reqwest::Method::GET,
-            format!("{}/metrics", production.base_url()),
-            None,
-            "invalid-before-cutover-gate",
-        ),
-        (
-            reqwest::Method::GET,
             format!(
                 "{}/v1/routes/resolve?hostname=cutover.test",
                 production.base_url()
@@ -3518,6 +3512,20 @@ async fn production_signed_cutover_never_runs_or_enters_the_legacy_node_runtime(
             "legacy runtime entry point stayed reachable: {url}",
         );
     }
+
+    let metrics = client
+        .get(format!("{}/metrics", production.base_url()))
+        .bearer_auth("dev-admin-token")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(metrics.status(), StatusCode::OK);
+    let metrics = metrics.text().await.unwrap();
+    assert!(metrics.contains("cats_control_store_blocking_jobs_active"));
+    assert!(metrics.contains("cats_control_observation_store_active"));
+    assert!(metrics.contains("cats_control_plane_metrics_database_snapshot_available 0"));
+    assert!(!metrics.contains("cats_control_plane_cats_total"));
+    assert!(!metrics.contains("cats_node_load_average_1m"));
 
     // Exercise the WebSocket extractor so this proves the handler itself is
     // closed, rather than merely observing a missing Upgrade header.
