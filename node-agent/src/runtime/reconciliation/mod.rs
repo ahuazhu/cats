@@ -14,6 +14,7 @@
 //! duplicate enough Desired fields to make that classification here.
 
 mod admission_port;
+mod authorized_blockd;
 mod checkpoint;
 mod clean_slate_probes;
 mod gate_planner;
@@ -27,6 +28,10 @@ pub(crate) mod inventory_probe_sealed {
 
 pub use admission_port::{
     AdmissionGatePort, AdmissionSnapshot, GatePortError, IdleCloseResult, SnapshotError,
+};
+pub use authorized_blockd::{
+    authorized_blockd_command, AuthorizedBlockFrontend, AuthorizedBlockdCheckpoint,
+    AuthorizedBlockdLaunchConfig, AuthorizedBlockdStore, PreparedAuthorizedBlockd,
 };
 pub use checkpoint::{
     runtime_checkpoint_path, CheckpointStoreError, FileCheckpointStore, StoredCheckpoint,
