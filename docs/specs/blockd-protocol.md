@@ -332,6 +332,45 @@ closed scalar、canonical unsigned integer和RemoteHead nullability；duplicate�
 逐字段等于request；不匹配、EOF、timeout、非closed ERR或无法解析的响应只算结果不明。Node对全部OK、ERR和
 结果不明都必须按Runtime §7.1读取权威head；响应本身不是receipt。
 
+三种JSON payload各自的公开硬上限都固定为4096 bytes，对应共享常量
+`PROVISION_ROOT_IMAGE_REQUEST_MAX_WIRE_BYTES`、`PROVISION_ROOT_IMAGE_RESULT_MAX_WIRE_BYTES`和
+`PROVISION_ROOT_IMAGE_ERROR_MAX_WIRE_BYTES`。byte数只计算prefix之后、唯一结尾LF之前的完整UTF-8 JSON
+octets；`provision_root_image `、`OK `、`ERR `和结尾LF都不计入payload上限。恰好4096 bytes合法；line
+reader在完整分配或解析JSON前读到第4097个payload byte即可停止。frame只接受对应ASCII prefix、一个JSON
+payload和一个LF（`0x0a`）；CRLF、BOM和payload内newline都拒绝。control socket保持既有one-command-per-
+connection合同：接收方只处理到第一个LF，随后response并关闭连接，LF后的bytes不属于payload且绝不解释为第二
+个command/response；无需等待peer half-close来证明其未来不再发送。共享encoder只产生Runtime §16.1 CJ定义的
+无BOM、无额外空白、无结尾newline的canonical JSON payload，line framer只负责添加prefix和单个LF。
+
+三个named payload decoder只接收已经移除prefix和LF的JSON bytes，并统一返回一个窄的、非序列化逻辑错误：
+
+```text
+ProvisionRootImageWireDecodeError =
+  Malformed {
+    json_pointer: JsonPointer,
+    problem: MalformedProblem
+  }
+| WireBytesLimitExceeded {
+    maximum: U64,
+    observed_at_least: U64
+  }
+```
+
+`MalformedProblem`精确复用Runtime §16.4的closed problem集合；decoder也复用其Transport、Schema和Intrinsic
+scalar的stage、logical-path tie-break及pointer回退规则，但这里没有`ContractName`、`version`、array limit、
+self-digest或context-bound验证。wire超限固定返回`maximum=4096, observed_at_least=4097`；invalid UTF-8/JSON
+固定root pointer。该错误只区分本地decoder失败，不编码到control wire、不映射成Runtime `ContractError`、
+不进入任何digest，也不是blockd effect response。wrong prefix或frame错误在调用payload decoder之前拒绝；Node
+仍把任何response decode/frame错误只当结果不明并读取权威head。
+
+三个decoder先复用Runtime §16.4.1 Intrinsic substage 1的全部scalar验证，再只对嵌套`RemoteHead`复用
+substage 3的`0/null/null`或`>0/non-null/non-null`闭合；同一payload同时失败时scalar error先于nullability。
+nullability组合错误返回`invalid_value`并指向该`RemoteHead` object（request固定为
+`/expected_blank_head`或`/expected_provisioned_head`，result固定为`/resulting_head`）。request中的
+`expected_blank_head`必须是exact blank、`expected_provisioned_head`必须是manifest/size纯计算的exact target，
+以及result head/response identity必须等于request，均需要Desired、manifest、grant或原request上下文，所以只在
+effect/context validator执行，不由standalone payload decoder猜测或读取外部事实。
+
 `retryable.image_unavailable/object_store_unavailable`表示当前image manifest或其immutable objects暂时不可
 读取/写入，映射到step image的`Blocked(root_image_unavailable)`；`authority_unavailable`复用既有
 `Blocked(volume_authority_unavailable)`，`local_io_unavailable`保留step并按同一token有界重试。`definite_conflict`
@@ -496,6 +535,12 @@ socket，两者服务同一个 engine 与同一个 attachment lease。
    restart；同一持久step只产生同一generation-1 target与commit key。wrong image/size/grant/head、
    非blank predecessor、pending/dirty/staged write均在CAS前拒绝；exact target可重放，exact blank
    可重试，任何其他generation绝不覆盖。测试还必须断言provision确认前Guest frontend没有listen且VMM未启动。
+10. 三个Root provision payload decoder分别覆盖4096/4097-byte边界、invalid UTF-8/JSON、duplicate/missing/
+    unknown/type/value和member-order置换的固定error选择；encoder roundtrip必须逐字节canonical。line framer另测
+    exact prefix+4096-byte payload+LF可达decoder，CRLF、错prefix、payload内额外LF和第4097个payload byte在
+    bounded read内拒绝；LF后即使peer继续发送也不得执行第二个command。每个`RemoteHead` nullability错误还要断言
+    object pointer，而exact blank/target/response identity只在context tests验证。Node把所有response framing/decode
+    失败只作为结果不明后读取权威head。
 
 ### 8.1 控制命令与可观测性
 
