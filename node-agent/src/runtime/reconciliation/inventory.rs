@@ -1,20 +1,20 @@
-//! Clean-slate full inventory boundary.
+//! First-slice full inventory boundary.
 //!
-//! This is deliberately stricter than the future non-empty scanner. It can
-//! establish the first A20 attestation only after every Runtime §6 physical
-//! source independently proves that its managed namespace is empty. It never
-//! adopts or translates the legacy runtime ledger.
+//! This can establish the first A20 attestation only after every Runtime §6
+//! physical source proves that its managed namespace is empty, while the
+//! metadata source may return exact authority facts for Desired-bound root
+//! Volumes. It never adopts or translates the legacy runtime ledger.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::Context as _;
 use cats_api::runtime_reconciliation::{
-    AppliedDesiredEvidence, CheckpointEvidence, Condition, GuestTransportEvidence, InventorySource,
-    LifecycleAdmission, ObservedRuntimeStatus, ProgressingReason, ReconcileStep, UnixMillis,
-    WarmSnapshotEvidence,
+    AppliedDesiredEvidence, CheckpointEvidence, Condition, GuestTransportEvidence, Id,
+    InventorySource, LifecycleAdmission, ObservedRuntimeStatus, ObservedVolume, ProgressingReason,
+    ReconcileStep, UnixMillis, WarmSnapshotEvidence,
 };
 use thiserror::Error;
 
@@ -39,9 +39,14 @@ const REQUIRED_SOURCES: [InventorySource; 11] = [
     InventorySource::GuestMount,
 ];
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum InventoryAbsence {
     Empty,
+    /// The metadata source contains exactly the Desired-bound volume facts
+    /// supplied here and no discovered local-only candidate. These are not
+    /// physical residue: a newly assigned Cat must be able to report its
+    /// authoritative root before its first local effect exists.
+    DesiredVolumes(BTreeMap<Id, Vec<ObservedVolume>>),
     Unavailable,
 }
 
@@ -122,6 +127,7 @@ impl RuntimeInventoryScanner for CleanSlateInventoryScanner {
         context: RuntimeInventoryScanContext,
     ) -> anyhow::Result<RuntimeInventoryScanOutcome> {
         let mut unavailable_sources = Vec::new();
+        let mut volumes_by_cat = BTreeMap::new();
         let mut coverage = InventoryCoverageAggregator::new();
         for probe in &self.probes {
             context.remaining().with_context(|| {
@@ -132,6 +138,18 @@ impl RuntimeInventoryScanner for CleanSlateInventoryScanner {
                 .with_context(|| format!("prove {:?} inventory is absent", probe.source()))?
             {
                 InventoryAbsence::Empty => {}
+                InventoryAbsence::DesiredVolumes(observed) => {
+                    anyhow::ensure!(
+                        probe.source() == InventorySource::MetadataStore,
+                        "only the metadata source may report Desired volume facts"
+                    );
+                    for (cat_id, volumes) in observed {
+                        anyhow::ensure!(
+                            volumes_by_cat.insert(cat_id, volumes).is_none(),
+                            "metadata inventory duplicated one Cat"
+                        );
+                    }
+                }
                 InventoryAbsence::Unavailable => unavailable_sources.push(probe.source()),
             }
             // A probe may return only after its underlying I/O consumed the
@@ -164,6 +182,7 @@ impl RuntimeInventoryScanner for CleanSlateInventoryScanner {
             .iter()
             .map(|desired| {
                 let step = ReconcileStep::InspectInventory { inventory_epoch };
+                let volumes = volumes_by_cat.remove(&desired.cat_id).unwrap_or_default();
                 Ok(ObservedRuntimeStatus {
                     cat_id: desired.cat_id.clone(),
                     applied_desired: Some(AppliedDesiredEvidence {
@@ -186,7 +205,7 @@ impl RuntimeInventoryScanner for CleanSlateInventoryScanner {
                         })?,
                     },
                     processes: Vec::new(),
-                    volumes: Vec::new(),
+                    volumes,
                     mounts: Vec::new(),
                     networks: Vec::new(),
                     guest_transport: GuestTransportEvidence::Unavailable,
@@ -200,6 +219,10 @@ impl RuntimeInventoryScanner for CleanSlateInventoryScanner {
                 })
             })
             .collect::<anyhow::Result<Vec<_>>>()?;
+        anyhow::ensure!(
+            volumes_by_cat.is_empty(),
+            "metadata inventory named a Cat outside Desired"
+        );
 
         Ok(RuntimeInventoryScanOutcome::Complete(
             CompleteRuntimeInventory::from_validated_coverage(
@@ -248,7 +271,7 @@ mod tests {
             _context: &RuntimeInventoryScanContext,
         ) -> anyhow::Result<InventoryAbsence> {
             self.calls.fetch_add(1, Ordering::SeqCst);
-            Ok(self.result)
+            Ok(self.result.clone())
         }
     }
 
