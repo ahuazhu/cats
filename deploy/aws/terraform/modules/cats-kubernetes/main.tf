@@ -289,6 +289,14 @@ resource "kubernetes_deployment_v1" "control_plane" {
             "url-file=/etc/cats/runtime/CATS_POSTGRES_URL",
             "--metadata-store-option",
             "session-setup=${var.storage_postgres_session_setup}",
+            "--object-store-adapter",
+            "aws-s3",
+            "--object-store-option",
+            "bucket=${var.chunkstore_bucket_name}",
+            "--object-store-option",
+            "region=${var.chunkstore_region}",
+            "--object-store-option",
+            "prefix=${var.chunkstore_prefix}",
           ]
 
           env {

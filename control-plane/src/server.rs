@@ -8,7 +8,7 @@ use std::time::Duration;
 
 use anyhow::Context;
 use cats_metering::{CreditStore, UsageStore};
-use cats_storage::MetadataStore;
+use cats_storage::{BlobStore, MetadataStore};
 
 use crate::controller::{AutoTierPolicy, Controller};
 use crate::store::{DsnSource, SingletonRole, Store};
@@ -48,6 +48,9 @@ pub struct Config {
     pub credit_store: Arc<dyn CreditStore>,
     /// Open authoritative volume-root/lease port, shared with blockd.
     pub storage_meta: Arc<dyn MetadataStore>,
+    /// Read-only access to the immutable golden-image namespace. The A21
+    /// resolver applies its own exact key, byte cap and concurrency boundary.
+    pub image_blob: Arc<dyn BlobStore>,
     /// Service credential used by node agents, gateways and controller jobs.
     pub auth_token: String,
     /// Private-key authority for short-lived V1 Endpoint Route Grants. It is
@@ -93,6 +96,12 @@ pub struct AppState {
     pub usage: Arc<dyn UsageStore>,
     pub credits: Arc<dyn CreditStore>,
     pub storage_meta: Arc<dyn MetadataStore>,
+    #[allow(
+        dead_code,
+        reason = "F2d consumes the staged A21 resolver when the Cat-create route switches"
+    )]
+    pub(crate) image_manifests:
+        Arc<dyn crate::store::runtime_authority::cat_create_service::CatCreateManifestResolver>,
     pub notify: Arc<tokio::sync::Notify>,
     pub controller: Arc<Controller>,
     pub cfg: Arc<Config>,
@@ -105,6 +114,9 @@ pub struct Handle {
     server_task: tokio::task::JoinHandle<()>,
     reconciler_task: tokio::task::JoinHandle<()>,
     billing_enforcer_task: Option<tokio::task::JoinHandle<()>>,
+    image_manifest_resolver: Arc<
+        crate::store::runtime_authority::image_manifest_resolver::ImmutableImageManifestResolver,
+    >,
 }
 
 impl Handle {
@@ -112,6 +124,7 @@ impl Handle {
         format!("http://{}", self.addr)
     }
     pub fn shutdown(&self) {
+        self.image_manifest_resolver.shutdown();
         self.server_task.abort();
         self.reconciler_task.abort();
         if let Some(task) = &self.billing_enforcer_task {
@@ -375,6 +388,11 @@ pub async fn spawn(cfg: Config) -> anyhow::Result<Handle> {
     let usage = cfg.usage_store.clone();
     let credits = cfg.credit_store.clone();
     let storage_meta = cfg.storage_meta.clone();
+    let image_manifests = Arc::new(
+        crate::store::runtime_authority::image_manifest_resolver::ImmutableImageManifestResolver::new(
+            cfg.image_blob.clone(),
+        ),
+    );
     let notify = Arc::new(tokio::sync::Notify::new());
     let controller = Controller::new(
         store.clone(),
@@ -389,6 +407,7 @@ pub async fn spawn(cfg: Config) -> anyhow::Result<Handle> {
         usage,
         credits,
         storage_meta,
+        image_manifests: image_manifests.clone(),
         notify,
         controller: controller.clone(),
         cfg: cfg.clone(),
@@ -441,5 +460,6 @@ pub async fn spawn(cfg: Config) -> anyhow::Result<Handle> {
         server_task,
         reconciler_task,
         billing_enforcer_task,
+        image_manifest_resolver: image_manifests,
     })
 }

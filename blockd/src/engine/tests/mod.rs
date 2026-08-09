@@ -2285,7 +2285,10 @@ fn provisioning_refuses_staged_commits() {
     e.flush().unwrap();
     let manifest = format::ImageManifest {
         version: 1,
-        image_id: "0123456789abcdef0123456789abcdef".into(),
+        image_id: format::LowerHexSha256::new(
+            "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+        )
+        .unwrap(),
         size_bytes: SIZE,
         chunks: vec![],
     };
@@ -3140,7 +3143,7 @@ fn root_provision_request(
     epoch: i64,
     transition: &str,
 ) -> cats_api::runtime_reconciliation::ProvisionRootImageRequest {
-    let map = manifest.base_map(SIZE).unwrap();
+    let map = format::image_base_map(manifest, SIZE).unwrap();
     let chunks: Vec<u64> = manifest
         .chunks
         .iter()
@@ -3675,7 +3678,7 @@ fn invalid_manifest_corpus_is_rejected_before_any_volume_object_or_cas() {
     let fixture = root_provision_fixture();
     let before_objects = volume_objects(fixture.blob.as_ref());
     let before_cas = fixture.meta.cas_calls.load(Ordering::SeqCst);
-    let valid_object = &fixture.manifest.chunks[0].object_id;
+    let valid_object = fixture.manifest.chunks[0].object_id.as_str();
     let invalid_manifests = vec![
         serde_json::json!({"version":2,"image_id":"","size_bytes":CHUNK_SIZE,"chunks":[]}),
         serde_json::json!({"version":1,"image_id":"","size_bytes":0,"chunks":[]}),
@@ -3811,7 +3814,7 @@ fn a_lost_generation_one_cas_response_is_adopted_from_exact_authority() {
         target_authority(meta.clone()),
     )
     .unwrap();
-    let map = manifest.base_map(SIZE).unwrap();
+    let map = format::image_base_map(&manifest, SIZE).unwrap();
     let chunks: Vec<u64> = manifest
         .chunks
         .iter()
@@ -3890,7 +3893,7 @@ fn lost_leaf_root_and_commit_put_responses_reconcile_by_exact_bytes() {
             epoch,
             "abcdef0123456789abcdef0123456789",
         );
-        let map = manifest.base_map(SIZE).unwrap();
+        let map = format::image_base_map(&manifest, SIZE).unwrap();
         let chunks: Vec<u64> = manifest
             .chunks
             .iter()
@@ -3919,7 +3922,7 @@ fn lost_leaf_root_and_commit_put_responses_reconcile_by_exact_bytes() {
 #[test]
 fn immutable_key_conflict_and_unrelated_head_fail_closed_without_cas() {
     let fixture = root_provision_fixture();
-    let map = fixture.manifest.base_map(SIZE).unwrap();
+    let map = format::image_base_map(&fixture.manifest, SIZE).unwrap();
     let chunks: Vec<u64> = fixture
         .manifest
         .chunks

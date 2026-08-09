@@ -2,6 +2,8 @@ aws_region               = "us-east-1"
 environment              = "production"
 eks_cluster_name         = "REPLACE_WITH_PRODUCTION_EKS_CLUSTER"
 usage_archive_bucket_name = "REPLACE_WITH_GLOBALLY_UNIQUE_CATS_USAGE_BUCKET"
+chunkstore_bucket_name     = "REPLACE_WITH_PLATFORM_CHUNKSTORE_BUCKET_OUTPUT"
+chunkstore_prefix          = "cats"
 
 # Start with one provisioned shard. Scale only from CloudWatch throughput and
 # throttling measurements.

@@ -973,7 +973,7 @@ impl ChunkEngine {
                     self.cfg.volume_id
                 )));
             }
-            manifest.base_map(self.size).map_err(|_| {
+            format::image_base_map(manifest, self.size).map_err(|_| {
                 EngineError::Corrupt(format!(
                     "image {} does not fit volume {} of {} bytes",
                     manifest.image_id, self.cfg.volume_id, self.size
@@ -982,7 +982,7 @@ impl ChunkEngine {
         };
 
         let chunks: Vec<u64> = manifest.chunks.iter().map(|c| c.chunk_idx).collect();
-        let txn = format!("img-{}", &manifest.image_id[..16]);
+        let txn = format!("img-{}", &manifest.image_id.as_str()[..16]);
         let mut new_leaves = vec![LeafRef::Empty; chunk::leaf_count(self.size) as usize];
         let new_gen = self.publish_map(
             &txn,

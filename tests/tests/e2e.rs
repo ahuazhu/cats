@@ -15,6 +15,7 @@ use cats_metadata_store_sqlite::SqliteMetadataStore;
 use cats_metering::SqliteUsageStore;
 use cats_node_agent::guest_client::GuestClient;
 use cats_node_agent::server::{spawn as spawn_node, Handle as NodeHandle, ServerConfig};
+use cats_object_store_file::FileBlobStore;
 use cats_storage::{AdapterConfig, AdapterSelection, MetadataStore};
 use cats_test_support::{fake_node_config, workspace_bin, NodeConfigBuilder};
 use futures_util::{SinkExt, StreamExt};
@@ -52,6 +53,7 @@ impl Cluster {
             usage_store: Arc::new(SqliteUsageStore::open(&dir.path().join("control.db")).unwrap()),
             credit_store: Arc::new(SqliteUsageStore::open(&dir.path().join("control.db")).unwrap()),
             storage_meta,
+            image_blob: Arc::new(FileBlobStore::open(dir.path().join("image-blob")).unwrap()),
             auth_token: SERVICE_TOKEN.into(),
             route_grant_signer: Arc::new(
                 cats_control_plane::route_grant::RouteGrantSigner::from_ed25519_pem(

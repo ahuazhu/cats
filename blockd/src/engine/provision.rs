@@ -11,7 +11,7 @@ use cats_api::runtime_reconciliation::{
 use cats_storage::{BlobError, MetaError, VolumeHead};
 
 use crate::crashpoint;
-use crate::format::{self, ImageManifest, LeafRef, FORMAT_VERSION};
+use crate::format::{self, ImageManifest, LeafRef};
 use crate::image::ImageError;
 
 use super::publish::{encode_commit_record, PreparedMapPublication};
@@ -283,42 +283,24 @@ impl ChunkEngine {
                 ),
             })?;
 
-        if manifest.version != FORMAT_VERSION
-            || manifest.image_id != image_id
-            || manifest.size_bytes == 0
-            || manifest.size_bytes % CHUNK_SIZE as u64 != 0
-            || manifest.size_bytes > request.size_bytes
-        {
+        // The cats-storage reader has already completed the shared canonical
+        // and structural pass. This request-local fit check is the only
+        // manifest shape condition owned by blockd.
+        if manifest.size_bytes > request.size_bytes {
             return Err(definite(
                 request,
                 ProvisionRootImageDefiniteConflictProblem::ImageManifest,
             ));
         }
-        let manifest_chunks = manifest.size_bytes / CHUNK_SIZE as u64;
-        let mut previous = None;
-        for entry in &manifest.chunks {
-            if previous.is_some_and(|value| entry.chunk_idx <= value)
-                || entry.chunk_idx >= manifest_chunks
-                || entry.len != CHUNK_SIZE
-                || !lower_hex_64(&entry.object_id)
-            {
-                return Err(definite(
-                    request,
-                    ProvisionRootImageDefiniteConflictProblem::ImageManifest,
-                ));
-            }
-            previous = Some(entry.chunk_idx);
-        }
 
-        // Only after the complete structural pass succeeds may availability of
-        // an individual object affect the outcome. Otherwise a missing first
-        // object could hide a later duplicate/out-of-order manifest identity.
+        // Only after the shared structural pass succeeds may availability of an
+        // individual object affect the outcome.
         let mut verified_objects = HashSet::new();
         for entry in &manifest.chunks {
             if !verified_objects.insert(entry.object_id.as_str()) {
                 continue;
             }
-            let key = chunk::keys::image_data(image_id, &entry.object_id);
+            let key = chunk::keys::image_data(image_id, entry.object_id.as_str());
             let bytes = self.blob.get(&key).map_err(|error| match error {
                 BlobError::NotFound(_) => retryable(
                     request,
@@ -329,8 +311,9 @@ impl ChunkEngine {
                     ProvisionRootImageRetryableProblem::ObjectStoreUnavailable,
                 ),
             })?;
+            let expected_digest = format::decode_sha256_hex(entry.object_id.as_str());
             if bytes.len() != CHUNK_SIZE as usize
-                || format::sha256(&bytes) != format::decode_sha256_hex(&entry.object_id).unwrap()
+                || expected_digest.is_none_or(|digest| format::sha256(&bytes) != digest)
             {
                 return Err(definite(
                     request,
@@ -346,7 +329,7 @@ impl ChunkEngine {
         request: &ProvisionRootImageRequest,
         manifest: &ImageManifest,
     ) -> EffectResult<(Vec<format::ChunkRef>, PreparedMapPublication, Vec<u64>)> {
-        let new_map = manifest.base_map(request.size_bytes).map_err(|_| {
+        let new_map = format::image_base_map(manifest, request.size_bytes).map_err(|_| {
             definite(
                 request,
                 ProvisionRootImageDefiniteConflictProblem::ImageManifest,
@@ -490,13 +473,6 @@ fn same_target(head: &VolumeHead, expected: &RemoteHead) -> bool {
         && head.root_object_id.as_deref() == expected.root_object_id.as_ref().map(AsciiText::as_str)
 }
 
-fn lower_hex_64(value: &str) -> bool {
-    value.len() == 64
-        && value
-            .bytes()
-            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -506,17 +482,22 @@ mod tests {
 
     #[test]
     fn root_provision_fixed_vector_crosses_the_leaf_boundary() {
-        let manifest: ImageManifest = serde_json::from_str(FIXED_MANIFEST).unwrap();
+        let digest = Sha256Digest::new(
+            "sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+        )
+        .unwrap();
+        let manifest =
+            cats_storage::decode_image_manifest(FIXED_MANIFEST.as_bytes(), &digest).unwrap();
         let chunk_count = manifest.size_bytes / CHUNK_SIZE as u64;
         assert_eq!(chunk_count, 257);
         let mut map = vec![ChunkRef::Hole; chunk_count as usize];
         for entry in &manifest.chunks {
-            let sha256 = format::decode_sha256_hex(&entry.object_id).unwrap();
+            let sha256 = format::decode_sha256_hex(entry.object_id.as_str()).unwrap();
             map[entry.chunk_idx as usize] = ChunkRef::Base(BaseRef {
-                object_id: entry.object_id.clone(),
+                object_id: entry.object_id.as_str().to_string(),
                 len: entry.len,
                 sha256,
-                image: Some(manifest.image_id.clone()),
+                image: Some(manifest.image_id.as_str().to_string()),
             });
         }
 

@@ -214,6 +214,55 @@ fn gateway_replicas_share_only_already_signed_route_grants_outside_postgres() {
 }
 
 #[test]
+fn control_plane_image_manifest_access_is_exact_and_read_only() {
+    let identity = read_workspace_file("deploy/aws/terraform/modules/usage-infrastructure/main.tf");
+    let manifest_policy = identity
+        .split_once("data \"aws_iam_policy_document\" \"image_manifest_reader\"")
+        .and_then(|(_, rest)| {
+            rest.split_once("resource \"aws_iam_role_policy\" \"image_manifest_reader\"")
+        })
+        .map(|(section, _)| section)
+        .expect("image manifest IAM policy");
+    assert!(manifest_policy.contains("actions = [\"s3:GetObject\"]"));
+    assert!(manifest_policy.contains("${var.chunkstore_prefix}/images/*/manifest.json"));
+    for forbidden in [
+        "s3:ListBucket",
+        "s3:PutObject",
+        "s3:DeleteObject",
+        "/data/",
+        "/volumes/",
+    ] {
+        assert!(
+            !manifest_policy.contains(forbidden),
+            "manifest reader gained forbidden scope {forbidden}"
+        );
+    }
+
+    let kubernetes = read_workspace_file("deploy/aws/terraform/modules/cats-kubernetes/main.tf");
+    let control = kubernetes
+        .split_once("resource \"kubernetes_deployment_v1\" \"control_plane\"")
+        .and_then(|(_, rest)| rest.split_once("resource \"kubernetes_pod_disruption_budget_v1\""))
+        .map(|(section, _)| section)
+        .expect("control-plane Deployment section");
+    for expected in [
+        "\"--object-store-adapter\"",
+        "\"aws-s3\"",
+        "bucket=${var.chunkstore_bucket_name}",
+        "region=${var.chunkstore_region}",
+        "prefix=${var.chunkstore_prefix}",
+    ] {
+        assert!(
+            control.contains(expected),
+            "control-plane manifest adapter lost {expected:?}"
+        );
+    }
+
+    let workflow = read_workspace_file(".github/workflows/deploy-production.yml");
+    assert!(workflow.contains("CHUNKSTORE_BUCKET_NAME: ${{ vars.CHUNKSTORE_BUCKET_NAME }}"));
+    assert!(workflow.contains("-var=\"chunkstore_bucket_name=$CHUNKSTORE_BUCKET_NAME\""));
+}
+
+#[test]
 fn route_grant_rotation_checks_schedulable_and_serving_nodes_before_a_rollout() {
     let workflow = read_workspace_file(".github/workflows/deploy-production.yml");
     let verifier = read_workspace_file("deploy/aws/check-route-grant-nodes.sh");

@@ -4,6 +4,8 @@ kubeconfig_context = "REPLACE_WITH_PRODUCTION_EKS_CONTEXT"
 control_plane_image = "123456789012.dkr.ecr.us-east-1.amazonaws.com/cats-control-plane@sha256:REPLACE_WITH_64_HEX_CHARACTERS"
 gateway_image       = "123456789012.dkr.ecr.us-east-1.amazonaws.com/cats-control-plane@sha256:REPLACE_WITH_64_HEX_CHARACTERS"
 shared_route_cache_table = "cats-production-route-grants"
+chunkstore_bucket_name   = "REPLACE_WITH_PLATFORM_CHUNKSTORE_BUCKET_OUTPUT"
+chunkstore_prefix        = "cats"
 
 usage_delivery_adapter = "aws-kinesis"
 usage_aws_region        = "us-east-1"

@@ -130,6 +130,32 @@ variable "usage_service_account_name" {
   default     = "cats-controld"
 }
 
+variable "chunkstore_manifest_bucket_name" {
+  description = "Existing ChunkStore bucket whose canonical image manifests cats-controld may read."
+  type        = string
+
+  validation {
+    condition     = trimspace(var.chunkstore_manifest_bucket_name) != ""
+    error_message = "chunkstore_manifest_bucket_name must not be empty."
+  }
+}
+
+variable "chunkstore_prefix" {
+  description = "Exact object-key prefix shared by blockd and cats-controld."
+  type        = string
+  default     = "cats"
+
+  validation {
+    condition = (
+      var.chunkstore_prefix != "" &&
+      !startswith(var.chunkstore_prefix, "/") &&
+      !endswith(var.chunkstore_prefix, "/") &&
+      !strcontains(var.chunkstore_prefix, "..")
+    )
+    error_message = "chunkstore_prefix must be a non-empty relative prefix without trailing slash or '..'."
+  }
+}
+
 variable "tags" {
   description = "Additional tags applied to AWS resources."
   type        = map(string)

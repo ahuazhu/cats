@@ -1105,6 +1105,8 @@ dependencies = [
  "cats-metadata-store-postgres",
  "cats-metadata-store-sqlite",
  "cats-metering",
+ "cats-object-store-aws-s3",
+ "cats-object-store-file",
  "cats-storage",
  "cats-usage-store-aws-stream",
  "cats-usage-store-postgres",
@@ -1129,6 +1131,7 @@ dependencies = [
  "cats-network",
  "cats-node-agent",
  "cats-object-store-aws-s3",
+ "cats-object-store-file",
  "cats-storage",
  "cats-test-support",
  "futures-util",
@@ -1302,6 +1305,8 @@ version = "0.1.0"
 dependencies = [
  "cats-api",
  "serde",
+ "serde_json",
+ "sha2 0.10.9",
  "thiserror 2.0.19",
 ]
 

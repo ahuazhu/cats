@@ -5,6 +5,8 @@ module "usage_infrastructure" {
   environment                     = var.environment
   eks_cluster_name                = var.eks_cluster_name
   archive_bucket_name             = var.usage_archive_bucket_name
+  chunkstore_manifest_bucket_name = var.chunkstore_bucket_name
+  chunkstore_prefix               = var.chunkstore_prefix
   archive_object_lock_days        = var.usage_archive_object_lock_days
   kinesis_shard_count             = var.usage_kinesis_shard_count
   kinesis_retention_hours         = var.usage_kinesis_retention_hours

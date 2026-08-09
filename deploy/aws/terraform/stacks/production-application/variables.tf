@@ -73,6 +73,17 @@ variable "storage_postgres_session_setup" {
   }
 }
 
+variable "chunkstore_bucket_name" {
+  description = "Platform stack chunkstore_bucket_name output."
+  type        = string
+}
+
+variable "chunkstore_prefix" {
+  description = "Exact object-key prefix shared by blockd and cats-controld."
+  type        = string
+  default     = "cats"
+}
+
 variable "usage_postgres_url" {
   description = "Usage-ledger PostgreSQL URL; may initially point to the same RDS instance as storage_postgres_url."
   type        = string

@@ -6,7 +6,11 @@ use cats_control_plane::store::DsnSource as ControlStoreDsnSource;
 use cats_metadata_store_postgres::PostgresMetadataStoreFactory;
 use cats_metadata_store_sqlite::SqliteMetadataStoreFactory;
 use cats_metering::{CreditStore, SqliteUsageStore, UsageStore};
-use cats_storage::{open_metadata_store, AdapterConfig, MetadataStoreFactory};
+use cats_object_store_aws_s3::AwsS3BlobStoreFactory;
+use cats_object_store_file::FileBlobStoreFactory;
+use cats_storage::{
+    open_blob_store, open_metadata_store, AdapterConfig, BlobStoreFactory, MetadataStoreFactory,
+};
 use cats_usage_store_aws_stream::{AwsUsageStreamConfig, AwsUsageStreamStore};
 use cats_usage_store_postgres::{DsnSource, PostgresUsageStore, DEFAULT_SCHEMA, DEFAULT_WORKERS};
 use clap::Parser;
@@ -99,6 +103,19 @@ struct Args {
         default_value = "path=cats-storage-meta.db"
     )]
     metadata_store_options: Vec<String>,
+    /// Provider-neutral immutable-object adapter used only to read exact
+    /// golden-image manifest keys.
+    #[arg(long, env = "CATS_OBJECT_STORE_ADAPTER", default_value = "file")]
+    object_store_adapter: String,
+    /// Opaque object adapter option (`key=value`); may be repeated.
+    #[arg(
+        long = "object-store-option",
+        env = "CATS_OBJECT_STORE_OPTIONS",
+        value_delimiter = ',',
+        value_name = "KEY=VALUE",
+        default_value = "root=cats-storage-blob"
+    )]
+    object_store_options: Vec<String>,
     #[arg(long, env = "CATS_AUTH_TOKEN", default_value = "dev-service-token")]
     auth_token: String,
     /// PKCS#8 Ed25519 private key used only by the control plane to issue
@@ -264,6 +281,14 @@ async fn main() -> anyhow::Result<()> {
         &args.metadata_store_adapter,
         &metadata_config,
         &metadata_factories,
+    )?;
+    let object_config = AdapterConfig::from_cli(args.object_store_options)?;
+    let object_factories: [&dyn BlobStoreFactory; 2] =
+        [&FileBlobStoreFactory, &AwsS3BlobStoreFactory];
+    let image_blob = open_blob_store(
+        &args.object_store_adapter,
+        &object_config,
+        &object_factories,
     )?;
     let (usage_projection, credit_store): (Arc<dyn UsageStore>, Arc<dyn CreditStore>) =
         match args.usage_store_adapter.as_str() {
@@ -501,6 +526,7 @@ async fn main() -> anyhow::Result<()> {
         usage_store,
         credit_store,
         storage_meta,
+        image_blob,
         auth_token: args.auth_token,
         route_grant_signer,
         admin_token: args.admin_token,

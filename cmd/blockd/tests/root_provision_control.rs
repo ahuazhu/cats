@@ -249,7 +249,7 @@ fn request_from_manifest(
     manifest: &format::ImageManifest,
     epoch: i64,
 ) -> ProvisionRootImageRequest {
-    let map = manifest.base_map(VOLUME_SIZE).unwrap();
+    let map = format::image_base_map(manifest, VOLUME_SIZE).unwrap();
     let mut leaves = Vec::new();
     for (leaf_index, entries) in map.chunks(CHUNKS_PER_LEAF as usize).enumerate() {
         if entries.iter().all(format::ChunkRef::is_hole) {

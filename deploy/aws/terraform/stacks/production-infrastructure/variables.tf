@@ -20,6 +20,17 @@ variable "usage_archive_bucket_name" {
   type        = string
 }
 
+variable "chunkstore_bucket_name" {
+  description = "Platform stack chunkstore_bucket_name output."
+  type        = string
+}
+
+variable "chunkstore_prefix" {
+  description = "Exact object-key prefix used by blockd and cats-controld."
+  type        = string
+  default     = "cats"
+}
+
 variable "usage_archive_object_lock_days" {
   description = "Default governance retention for archived raw usage objects."
   type        = number

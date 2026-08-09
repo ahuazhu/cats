@@ -9,6 +9,41 @@ use std::sync::Arc;
 
 use postgres::NoTls;
 
+struct UnavailableImageBlob;
+
+impl cats_storage::BlobStore for UnavailableImageBlob {
+    fn put_immutable(&self, key: &str, _data: &[u8]) -> cats_storage::blob::Result<()> {
+        Err(unavailable_blob_error(key))
+    }
+
+    fn get(&self, key: &str) -> cats_storage::blob::Result<Vec<u8>> {
+        Err(unavailable_blob_error(key))
+    }
+
+    fn exists(&self, key: &str) -> cats_storage::blob::Result<bool> {
+        Err(unavailable_blob_error(key))
+    }
+
+    fn delete(&self, key: &str) -> cats_storage::blob::Result<()> {
+        Err(unavailable_blob_error(key))
+    }
+
+    fn list(&self, prefix: &str) -> cats_storage::blob::Result<Vec<String>> {
+        Err(unavailable_blob_error(prefix))
+    }
+}
+
+fn unavailable_blob_error(key: &str) -> cats_storage::BlobError {
+    cats_storage::BlobError::Backend {
+        key: key.to_string(),
+        message: "test image blob is intentionally unavailable".into(),
+    }
+}
+
+pub fn unavailable_image_blob() -> Arc<dyn cats_storage::BlobStore> {
+    Arc::new(UnavailableImageBlob)
+}
+
 pub fn route_grant_signer() -> Arc<crate::route_grant::RouteGrantSigner> {
     Arc::new(
         crate::route_grant::RouteGrantSigner::from_ed25519_pem(

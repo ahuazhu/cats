@@ -6,6 +6,11 @@
 )]
 pub(crate) mod cat_create_service;
 mod events;
+#[allow(
+    dead_code,
+    reason = "A21 production resolver is composed when the F2d Cat-create route is switched"
+)]
+pub(crate) mod image_manifest_resolver;
 pub(super) mod pg_codec;
 mod product;
 mod product_rows;

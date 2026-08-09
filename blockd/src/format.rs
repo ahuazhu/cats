@@ -537,61 +537,34 @@ pub fn decode_pack_owned(mut buf: Vec<u8>) -> Result<(PackHeader, Vec<u8>), Form
 // Shared base image manifest (spec §6.3, ADR-0017)
 // ---------------------------------------------------------------------------
 
-/// What a volume needs to reference an image's chunks without reading them.
-///
-/// JSON, like the commit record: an image is published once and read once per
-/// provisioning, so the encoding costs nothing and stays inspectable.
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct ImageManifest {
-    pub version: u16,
-    /// sha256 of the raw image file. Also the namespace it was published under,
-    /// which is what makes publishing idempotent across nodes.
-    pub image_id: String,
-    /// Logical length of the image. A volume may be larger — the chunks past the
-    /// image are holes — but never smaller.
-    pub size_bytes: u64,
-    /// Non-hole chunks only, ascending by `chunk_idx`. An all-zero chunk is left
-    /// out rather than stored, so a sparse image publishes only what it uses.
-    pub chunks: Vec<ImageChunk>,
-}
+pub use cats_storage::{
+    ImageManifestChunkV1 as ImageChunk, ImageManifestV1 as ImageManifest, LowerHexSha256,
+};
 
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct ImageChunk {
-    pub chunk_idx: u64,
-    /// Content-addressed: the sha256 of the chunk's bytes. Identical chunks
-    /// within an image therefore share one object.
-    pub object_id: String,
-    pub len: u32,
-}
-
-impl ImageManifest {
-    /// The map a freshly provisioned volume of `volume_bytes` starts from.
-    ///
-    /// Every entry is a base ref into the image namespace, so building this
-    /// uploads nothing: provisioning becomes a metadata operation.
-    pub fn base_map(&self, volume_bytes: u64) -> Result<Vec<ChunkRef>, FormatError> {
-        if volume_bytes < self.size_bytes {
-            return Err(FormatError::Malformed("image manifest"));
-        }
-        let count = volume_bytes.div_ceil(CHUNK_SIZE as u64) as usize;
-        let mut map = vec![ChunkRef::Hole; count];
-        for chunk in &self.chunks {
-            let slot = map
-                .get_mut(chunk.chunk_idx as usize)
-                .ok_or(FormatError::Malformed("image manifest"))?;
-            let sha256 = decode_sha256_hex(&chunk.object_id)
-                .ok_or(FormatError::Malformed("image manifest"))?;
-            *slot = ChunkRef::Base(BaseRef {
-                object_id: chunk.object_id.clone(),
-                len: chunk.len,
-                sha256,
-                image: Some(self.image_id.clone()),
-            });
-        }
-        Ok(map)
+/// Build the block-map view of an already validated shared manifest DTO.
+pub fn image_base_map(
+    manifest: &ImageManifest,
+    volume_bytes: u64,
+) -> Result<Vec<ChunkRef>, FormatError> {
+    if volume_bytes < manifest.size_bytes {
+        return Err(FormatError::Malformed("image manifest"));
     }
+    let count = volume_bytes.div_ceil(CHUNK_SIZE as u64) as usize;
+    let mut map = vec![ChunkRef::Hole; count];
+    for chunk in &manifest.chunks {
+        let slot = map
+            .get_mut(chunk.chunk_idx as usize)
+            .ok_or(FormatError::Malformed("image manifest"))?;
+        let sha256 = decode_sha256_hex(chunk.object_id.as_str())
+            .ok_or(FormatError::Malformed("image manifest"))?;
+        *slot = ChunkRef::Base(BaseRef {
+            object_id: chunk.object_id.as_str().to_string(),
+            len: chunk.len,
+            sha256,
+            image: Some(manifest.image_id.as_str().to_string()),
+        });
+    }
+    Ok(map)
 }
 
 /// Image object ids are their own sha256, so a reference into an image carries no
@@ -893,18 +866,18 @@ mod tests {
         let object = "c".repeat(64);
         let manifest = ImageManifest {
             version: FORMAT_VERSION,
-            image_id: "d".repeat(64),
+            image_id: LowerHexSha256::new("d".repeat(64)).unwrap(),
             size_bytes: 2 * CHUNK_SIZE as u64,
             // Chunk 1 is all zeros, so the image never stored it.
             chunks: vec![ImageChunk {
                 chunk_idx: 0,
-                object_id: object.clone(),
+                object_id: LowerHexSha256::new(object.clone()).unwrap(),
                 len: CHUNK_SIZE,
             }],
         };
 
         // A volume bigger than the image: the tail is holes, not an error.
-        let map = manifest.base_map(4 * CHUNK_SIZE as u64).unwrap();
+        let map = image_base_map(&manifest, 4 * CHUNK_SIZE as u64).unwrap();
         assert_eq!(map.len(), 4);
         assert_eq!(map[0].image(), Some(manifest.image_id.as_str()));
         assert_eq!(map[0].base().unwrap().object_id, object);
@@ -916,17 +889,12 @@ mod tests {
         assert!(matches!(map[3], ChunkRef::Hole));
 
         // A volume smaller than the image would silently truncate the rootfs.
-        assert!(manifest.base_map(CHUNK_SIZE as u64).is_err());
+        assert!(image_base_map(&manifest, CHUNK_SIZE as u64).is_err());
 
         // A chunk index past the volume is a corrupt manifest, not a hole.
         let mut bad = manifest.clone();
         bad.chunks[0].chunk_idx = 99;
-        assert!(bad.base_map(2 * CHUNK_SIZE as u64).is_err());
-
-        // Object ids are content hashes; anything else cannot be verified on read.
-        let mut unhashed = manifest.clone();
-        unhashed.chunks[0].object_id = "not-a-digest".into();
-        assert!(unhashed.base_map(2 * CHUNK_SIZE as u64).is_err());
+        assert!(image_base_map(&bad, 2 * CHUNK_SIZE as u64).is_err());
     }
 
     #[test]

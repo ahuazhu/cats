@@ -67,6 +67,8 @@ variable "runtime_secret_data" {
         "CATS_STRIPE_CHECKOUT_CANCEL_URL",
         "CATS_STRIPE_LIVEMODE",
         "CATS_BILLING_ENFORCEMENT_ENABLED",
+        "CATS_OBJECT_STORE_ADAPTER",
+        "CATS_OBJECT_STORE_OPTIONS",
       ])
     )) == 0
     error_message = "runtime_secret_data cannot override Terraform-managed storage or usage database settings."
@@ -134,6 +136,37 @@ variable "storage_postgres_session_setup" {
   validation {
     condition     = contains(["client", "server-verified"], var.storage_postgres_session_setup)
     error_message = "storage_postgres_session_setup must be client or server-verified."
+  }
+}
+
+variable "chunkstore_bucket_name" {
+  description = "Existing ChunkStore S3 bucket; cats-controld reads only canonical image manifests."
+  type        = string
+
+  validation {
+    condition     = trimspace(var.chunkstore_bucket_name) != ""
+    error_message = "chunkstore_bucket_name must not be empty."
+  }
+}
+
+variable "chunkstore_region" {
+  description = "AWS region containing the ChunkStore bucket."
+  type        = string
+}
+
+variable "chunkstore_prefix" {
+  description = "Exact object-key prefix shared with blockd."
+  type        = string
+  default     = "cats"
+
+  validation {
+    condition = (
+      var.chunkstore_prefix != "" &&
+      !startswith(var.chunkstore_prefix, "/") &&
+      !endswith(var.chunkstore_prefix, "/") &&
+      !strcontains(var.chunkstore_prefix, "..")
+    )
+    error_message = "chunkstore_prefix must be a non-empty relative prefix without trailing slash or '..'."
   }
 }
 

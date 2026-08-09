@@ -10,6 +10,9 @@ module "cats_kubernetes" {
   route_grant_public_key_pem     = var.route_grant_public_key_pem
   storage_postgres_url           = var.storage_postgres_url
   storage_postgres_session_setup = var.storage_postgres_session_setup
+  chunkstore_bucket_name         = var.chunkstore_bucket_name
+  chunkstore_region              = var.aws_region
+  chunkstore_prefix              = var.chunkstore_prefix
   usage_postgres_url             = var.usage_postgres_url
   usage_postgres_schema          = var.usage_postgres_schema
   usage_postgres_workers         = var.usage_postgres_workers
