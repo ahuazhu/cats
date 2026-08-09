@@ -894,6 +894,7 @@ async fn spawn_inner(cfg: Config, legacy_node_runtime_for_tests: bool) -> anyhow
             crate::api::runtime_node_authority::RuntimeNodeAuthorityService::new(
                 store.clone(),
                 cfg.runtime_provisioner_trust_bundle.clone(),
+                Arc::clone(&readiness),
             ),
         ),
         store,

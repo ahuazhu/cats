@@ -167,9 +167,18 @@ struct ApplyPermits {
     _principal: tokio::sync::OwnedSemaphorePermit,
 }
 
+struct CancelRequestOnDrop(AuthorityRequestContext);
+
+impl Drop for CancelRequestOnDrop {
+    fn drop(&mut self) {
+        self.0.cancel();
+    }
+}
+
 pub(crate) struct RuntimeNodeAuthorityService {
     store: Arc<crate::store::Store>,
     trust_bundle: RuntimeProvisionerTrustBundle,
+    readiness: Arc<crate::server::ReadinessLatch>,
     admission: RuntimeNodeAuthorityAdmission,
     accepting: tokio::sync::watch::Sender<bool>,
     resolutions: Arc<CommitResolutionRegistry>,
@@ -179,11 +188,13 @@ impl RuntimeNodeAuthorityService {
     pub(crate) fn new(
         store: Arc<crate::store::Store>,
         trust_bundle: RuntimeProvisionerTrustBundle,
+        readiness: Arc<crate::server::ReadinessLatch>,
     ) -> Self {
         let (accepting, _) = tokio::sync::watch::channel(true);
         Self {
             store,
             trust_bundle,
+            readiness,
             admission: RuntimeNodeAuthorityAdmission::new(),
             accepting,
             resolutions: Arc::new(CommitResolutionRegistry::default()),
@@ -229,11 +240,18 @@ impl RuntimeNodeAuthorityService {
         mut shutdown: tokio::sync::watch::Receiver<bool>,
     ) -> Result<RuntimeNodeAuthorityApplyStoreOutcome, ApiError> {
         let request = AuthorityRequestContext::new(deadline);
+        let _cancel_on_drop = CancelRequestOnDrop(request.clone());
+        if Instant::now() >= deadline {
+            return Err(ApiError::unavailable(
+                "runtime Node authority request exceeded its deadline",
+            ));
+        }
         let worker_request = request.clone();
         let worker_observer = request.clone();
         let store = Arc::clone(&self.store);
         let resolution_store = Arc::clone(&self.store);
         let resolution_apply = apply.clone();
+        let readiness = Arc::clone(&self.readiness);
         let active = self.resolutions.begin();
         let (result_tx, mut result_rx) = tokio::sync::oneshot::channel();
         tokio::spawn(async move {
@@ -252,7 +270,8 @@ impl RuntimeNodeAuthorityService {
             let outcome = match outcome {
                 Ok(outcome) => Ok(outcome),
                 Err(error) if worker_observer.commit_was_attempted() => {
-                    resolve_ambiguous_apply(resolution_store, resolution_apply, error).await
+                    resolve_ambiguous_apply(resolution_store, resolution_apply, error, readiness)
+                        .await
                 }
                 Err(error) => Err(error),
             };
@@ -276,9 +295,18 @@ impl RuntimeNodeAuthorityService {
                     "runtime Node authority service is shutting down",
                 ))
             }
-            result = &mut result_rx => result.map_err(|_| {
-                ApiError::internal("runtime Node authority commit owner stopped without a result")
-            })?,
+            result = &mut result_rx => {
+                if Instant::now() >= deadline {
+                    request.cancel();
+                    Err(ApiError::unavailable(
+                        "runtime Node authority request exceeded its deadline",
+                    ))
+                } else {
+                    result.map_err(|_| {
+                        ApiError::internal("runtime Node authority commit owner stopped without a result")
+                    })?
+                }
+            },
         }
     }
 }
@@ -287,6 +315,7 @@ async fn resolve_ambiguous_apply(
     store: Arc<crate::store::Store>,
     apply: RuntimeNodeAuthorityApply,
     original_error: ApiError,
+    readiness: Arc<crate::server::ReadinessLatch>,
 ) -> Result<RuntimeNodeAuthorityApplyStoreOutcome, ApiError> {
     loop {
         let lookup_apply = apply.clone();
@@ -297,6 +326,12 @@ async fn resolve_ambiguous_apply(
             Ok(Some(outcome)) => return Ok(outcome),
             Ok(None) => return Err(original_error),
             Err(error) => {
+                if !matches!(
+                    error.code,
+                    ErrorCode::Unavailable | ErrorCode::DeadlineExceeded
+                ) {
+                    readiness.poison();
+                }
                 tracing::warn!(
                     error = %error,
                     apply_id = apply.apply_id.as_str(),
@@ -685,6 +720,9 @@ async fn await_before_deadline_or_shutdown<T>(
     shutdown: &mut tokio::sync::watch::Receiver<bool>,
     future: impl Future<Output = T>,
 ) -> AwaitOutcome<T> {
+    if Instant::now() >= deadline {
+        return AwaitOutcome::Deadline;
+    }
     let timeout = tokio::time::sleep_until(tokio::time::Instant::from_std(deadline));
     tokio::pin!(timeout);
     tokio::pin!(future);
@@ -692,7 +730,13 @@ async fn await_before_deadline_or_shutdown<T>(
         biased;
         () = &mut timeout => AwaitOutcome::Deadline,
         () = wait_for_shutdown(shutdown) => AwaitOutcome::Shutdown,
-        result = &mut future => AwaitOutcome::Completed(result),
+        result = &mut future => {
+            if Instant::now() >= deadline {
+                AwaitOutcome::Deadline
+            } else {
+                AwaitOutcome::Completed(result)
+            }
+        },
     }
 }
 
@@ -790,16 +834,44 @@ mod tests {
         0x7f, 0x60,
     ];
 
-    async fn test_server() -> (tempfile::TempDir, crate::server::Handle) {
+    struct TestPgClient(Option<postgres::Client>);
+
+    impl TestPgClient {
+        fn connect(dsn: &str) -> Self {
+            Self(Some(std::thread::scope(|scope| {
+                scope
+                    .spawn(|| postgres::Client::connect(dsn, postgres::NoTls).unwrap())
+                    .join()
+                    .unwrap()
+            })))
+        }
+
+        fn with<T: Send>(
+            &mut self,
+            operation: impl FnOnce(&mut postgres::Client) -> T + Send,
+        ) -> T {
+            let client = self.0.as_mut().expect("test PostgreSQL client is open");
+            std::thread::scope(|scope| scope.spawn(|| operation(client)).join().unwrap())
+        }
+    }
+
+    impl Drop for TestPgClient {
+        fn drop(&mut self) {
+            if let Some(client) = self.0.take() {
+                std::thread::scope(|scope| scope.spawn(move || drop(client)).join().unwrap());
+            }
+        }
+    }
+
+    async fn test_server_with_dsn() -> (tempfile::TempDir, crate::server::Handle, String) {
         let dir = tempfile::tempdir().unwrap();
         let usage = Arc::new(SqliteUsageStore::open(&dir.path().join("usage.db")).unwrap());
         let storage_meta: Arc<dyn MetadataStore> =
             Arc::new(SqliteMetadataStore::open(&dir.path().join("storage.db")).unwrap());
+        let dsn = crate::testsupport::isolated_control_store_url();
         let server = crate::server::spawn(crate::server::Config {
             listen: "127.0.0.1:0".into(),
-            control_store_dsn: crate::store::DsnSource::Literal(
-                crate::testsupport::isolated_control_store_url(),
-            ),
+            control_store_dsn: crate::store::DsnSource::Literal(dsn.clone()),
             control_store_ca_file: None,
             usage_store: usage.clone(),
             credit_store: usage,
@@ -821,6 +893,11 @@ mod tests {
         })
         .await
         .unwrap();
+        (dir, server, dsn)
+    }
+
+    async fn test_server() -> (tempfile::TempDir, crate::server::Handle) {
+        let (dir, server, _) = test_server_with_dsn().await;
         (dir, server)
     }
 
@@ -841,6 +918,50 @@ mod tests {
             .header(PROVISIONER_CREDENTIAL_ID_HEADER, "provisioner_a")
             .header(PROVISIONER_SIGNATURE_HEADER, signature)
             .body(UPDATE)
+    }
+
+    fn signed_axum_request() -> Request<Body> {
+        let signer = Ed25519KeyPair::from_seed_unchecked(&TEST_SEED).unwrap();
+        let signed = cats_api::runtime_node_authority::runtime_node_authority_signed_request(
+            "deployment_a",
+            "provisioner_a",
+            UPDATE,
+        );
+        let signature = URL_SAFE_NO_PAD.encode(signer.sign(&signed).as_ref());
+        Request::builder()
+            .method(RUNTIME_NODE_AUTHORITY_METHOD)
+            .uri(RUNTIME_NODE_AUTHORITY_PATH)
+            .header(header::CONTENT_TYPE, JSON_CONTENT_TYPE)
+            .header(PROVISIONER_CREDENTIAL_ID_HEADER, "provisioner_a")
+            .header(PROVISIONER_SIGNATURE_HEADER, signature)
+            .body(Body::from(UPDATE))
+            .unwrap()
+    }
+
+    async fn wait_for_store_advisory_lock_wait(dsn: &str, backend_pid: i32) {
+        let mut monitor = TestPgClient::connect(dsn);
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                let waiting = monitor.with(|monitor| {
+                    monitor
+                        .query_one(
+                            "SELECT EXISTS (
+                               SELECT 1 FROM pg_locks
+                                WHERE pid=$1 AND locktype='advisory' AND NOT granted
+                             )",
+                            &[&backend_pid],
+                        )
+                        .unwrap()
+                        .get::<_, bool>(0)
+                });
+                if waiting {
+                    return;
+                }
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("runtime Node authority worker did not reach its pre-COMMIT barrier");
     }
 
     #[test]
@@ -924,6 +1045,96 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn completion_that_becomes_ready_after_the_absolute_deadline_is_rejected() {
+        let (_accepting, mut shutdown) = tokio::sync::watch::channel(true);
+        let deadline = Instant::now() + Duration::from_millis(100);
+        let result = await_before_deadline_or_shutdown(deadline, &mut shutdown, async {
+            // This deliberately becomes Ready in the same poll that crosses
+            // the deadline. A select ordering preference alone cannot reject
+            // it; the Completed edge needs an explicit absolute-clock check.
+            std::thread::sleep(Duration::from_millis(200));
+            42_u8
+        })
+        .await;
+        assert!(matches!(result, AwaitOutcome::Deadline));
+    }
+
+    #[tokio::test]
+    async fn aborting_the_handler_before_commit_rolls_back_every_write() {
+        const PRECOMMIT_BARRIER: i64 = 8_023_004_023_773;
+        let (_dir, server, dsn) = test_server_with_dsn().await;
+        let backend_pid = server
+            .state
+            .store
+            .with(|client| Ok(client.query_one("SELECT pg_backend_pid()", &[])?.get(0)))
+            .unwrap();
+        let mut setup = TestPgClient::connect(&dsn);
+        setup.with(|setup| {
+            setup
+                .batch_execute(&format!(
+                    "CREATE FUNCTION runtime_node_authority_pause_before_insert_for_test()
+                   RETURNS trigger LANGUAGE plpgsql AS $$
+                   BEGIN
+                     PERFORM pg_advisory_lock({PRECOMMIT_BARRIER});
+                     PERFORM pg_advisory_unlock({PRECOMMIT_BARRIER});
+                     RETURN NEW;
+                   END
+                   $$;
+                 CREATE TRIGGER runtime_node_authority_pause_before_insert_for_test
+                   BEFORE INSERT ON runtime_node_authority_apply_records
+                   FOR EACH ROW EXECUTE FUNCTION
+                     runtime_node_authority_pause_before_insert_for_test()"
+                ))
+                .unwrap()
+        });
+        setup.with(|setup| {
+            setup
+                .query_one("SELECT pg_advisory_lock($1)", &[&PRECOMMIT_BARRIER])
+                .unwrap()
+        });
+
+        let state = server.state.clone();
+        let handler = tokio::spawn(async move {
+            apply_runtime_node_authority(State(state), signed_axum_request()).await
+        });
+        wait_for_store_advisory_lock_wait(&dsn, backend_pid).await;
+        handler.abort();
+        assert!(handler.await.unwrap_err().is_cancelled());
+        assert!(setup.with(|setup| {
+            setup
+                .query_one("SELECT pg_advisory_unlock($1)", &[&PRECOMMIT_BARRIER])
+                .unwrap()
+                .get::<_, bool>(0)
+        }));
+
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while server
+                .state
+                .runtime_node_authority
+                .active_commit_resolutions()
+                != 0
+            {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("cancelled pre-COMMIT worker did not roll back");
+        assert_eq!(
+            setup.with(|setup| {
+                setup
+                    .query_one(
+                        "SELECT count(*) FROM runtime_node_authority_apply_records",
+                        &[],
+                    )
+                    .unwrap()
+                    .get::<_, i64>(0)
+            }),
+            0
+        );
+        server.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
     async fn committed_response_loss_is_resolved_to_the_persisted_http_result() {
         let (_dir, server) = test_server().await;
         server
@@ -993,5 +1204,137 @@ mod tests {
         );
         let response = response.await.unwrap().unwrap();
         assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+    }
+
+    #[tokio::test]
+    async fn corrupt_ambiguous_result_poisons_readiness_and_keeps_resolution_ownership() {
+        let (_dir, server, dsn) = test_server_with_dsn().await;
+        server
+            .state
+            .store
+            .inject_request_committed_response_loss_once_after(Duration::from_millis(300));
+        let response = tokio::spawn({
+            let request = signed_request(&server);
+            async move { request.send().await }
+        });
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while server
+                .state
+                .store
+                .request_committed_response_loss_is_armed()
+            {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("request did not cross COMMIT");
+
+        let corrupt_digest = format!("sha256:{}", "0".repeat(64));
+        assert_eq!(
+            std::thread::scope(|scope| {
+                scope
+                    .spawn(|| {
+                        let mut corruptor =
+                            postgres::Client::connect(&dsn, postgres::NoTls).unwrap();
+                        corruptor
+                            .batch_execute(
+                                "ALTER TABLE runtime_node_authority_apply_records
+                                   DISABLE TRIGGER runtime_node_apply_is_immutable",
+                            )
+                            .unwrap();
+                        let updated = corruptor
+                            .execute(
+                                "UPDATE runtime_node_authority_apply_records
+                        SET request_sha256=$2
+                      WHERE apply_id=$1",
+                                &[&"eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee", &corrupt_digest],
+                            )
+                            .unwrap();
+                        corruptor
+                            .batch_execute(
+                                "ALTER TABLE runtime_node_authority_apply_records
+                                   ENABLE TRIGGER runtime_node_apply_is_immutable",
+                            )
+                            .unwrap();
+                        updated
+                    })
+                    .join()
+                    .unwrap()
+            }),
+            1
+        );
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while server.state.readiness.is_ready() {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("fatal stored apply corruption did not poison readiness");
+        assert_eq!(
+            server
+                .state
+                .runtime_node_authority
+                .active_commit_resolutions(),
+            1
+        );
+
+        let credential = &server
+            .state
+            .cfg
+            .runtime_provisioner_trust_bundle
+            .credentials[0];
+        let signer = Ed25519KeyPair::from_seed_unchecked(&TEST_SEED).unwrap();
+        let signed = cats_api::runtime_node_authority::runtime_node_authority_signed_request(
+            "deployment_a",
+            "provisioner_a",
+            UPDATE,
+        );
+        let principal = verify_runtime_node_authority_request(
+            &server
+                .state
+                .cfg
+                .runtime_provisioner_trust_bundle
+                .deployment_id,
+            credential,
+            UPDATE,
+            &URL_SAFE_NO_PAD.encode(signer.sign(&signed).as_ref()),
+        )
+        .unwrap();
+        let remaining_principal_permits = (0..PRINCIPAL_IN_FLIGHT - 1)
+            .map(|_| {
+                server
+                    .state
+                    .runtime_node_authority
+                    .admission
+                    .try_principal(&principal)
+                    .unwrap()
+            })
+            .collect::<Vec<_>>();
+        assert!(server
+            .state
+            .runtime_node_authority
+            .admission
+            .try_principal(&principal)
+            .is_err());
+        drop(remaining_principal_permits);
+
+        let health = reqwest::get(format!("{}/healthz", server.base_url()))
+            .await
+            .unwrap();
+        assert_eq!(health.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(RESOLUTION_SHUTDOWN_DEADLINE, Duration::from_secs(30));
+        assert!(
+            tokio::time::timeout(
+                Duration::from_millis(100),
+                server
+                    .state
+                    .runtime_node_authority
+                    .shutdown_commit_resolutions(),
+            )
+            .await
+            .is_err(),
+            "fatal unresolved COMMIT was incorrectly reported as a clean shutdown"
+        );
+        response.abort();
     }
 }
