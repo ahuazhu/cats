@@ -517,6 +517,7 @@ fn validate_existing_cat_for_name_conflict(
         .ok_or_else(|| stored_corruption("existing Cat Root Disk disappeared"))?;
     if disk != peeked_disk
         || disk.workspace_id != cat.workspace_id
+        || disk.created_at != cat.created_at
         || disk.volume_id != volume.volume_id
         || disk.size_bytes != volume.size_bytes
         || disk.durability != volume.durability

@@ -665,8 +665,9 @@ CREATE TABLE IF NOT EXISTS disk_records (
         (admin_state = 'active' AND delete_id IS NULL) OR
         (admin_state = 'deleting' AND delete_id IS NOT NULL)
     ),
-    CHECK (
+    CHECK ((
         (role_kind = 'root'
+            AND name = disk_id
             AND root_cat_id IS NOT NULL
             AND initialization_kind IS NULL
             AND initialization_token IS NULL
@@ -702,7 +703,7 @@ CREATE TABLE IF NOT EXISTS disk_records (
             AND initialized_root_hash IS NOT NULL
             AND initialized_root_object_id IS NOT NULL
             AND initialized_at >= 0)
-    )
+    ) IS TRUE)
 );
 CREATE UNIQUE INDEX IF NOT EXISTS disk_records_one_root_per_cat
 ON disk_records(root_cat_id) WHERE role_kind = 'root';
@@ -735,10 +736,10 @@ CREATE TABLE IF NOT EXISTS runtime_operations (
     UNIQUE (cat_id, desired_revision),
     FOREIGN KEY (workspace_id, cat_id)
         REFERENCES cat_records(workspace_id, cat_id),
-    CHECK (
+    CHECK ((
         (phase = 'pending' AND terminal_kind IS NULL) OR
         (phase <> 'pending' AND terminal_kind = phase)
-    )
+    ) IS TRUE)
 );
 CREATE UNIQUE INDEX IF NOT EXISTS runtime_operations_one_pending_per_cat
 ON runtime_operations(cat_id) WHERE phase = 'pending';

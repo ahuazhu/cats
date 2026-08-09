@@ -709,7 +709,11 @@ fn decode_api_result(row: &Row) -> AuthorityTxResult<ApiIdempotencyResult> {
 fn validate_disk(record: &DiskRecord) -> AuthorityTxResult<()> {
     SizeBytes::new(record.size_bytes).map_err(corrupt)?;
     match &record.role {
-        DiskRole::Root { .. } => {}
+        DiskRole::Root { .. } => {
+            if record.name != record.disk_id {
+                return Err(corrupt(()));
+            }
+        }
         DiskRole::Persistent { initialization } => match initialization.as_ref() {
             PersistentDiskInitialization::Uninitialized {
                 expected_blank_head,

@@ -15,6 +15,7 @@ use cats_api::runtime_reconciliation::{
 use cats_storage::authority::{
     LastVolumeTransition, RemoteHead, VolumeAdminState, VolumeDurability, VolumeRecord,
 };
+use postgres::error::SqlState;
 use sha2::{Digest, Sha256};
 
 use super::product::{
@@ -464,7 +465,7 @@ fn fingerprint_and_response_fixed_vectors_match_byte_for_byte() {
 
 #[test]
 fn persistent_disk_closed_codec_round_trips_both_states_and_detects_projection_drift() {
-    let (_url, store, _second, workspace) = stores();
+    let (url, store, _second, workspace) = stores();
     let uninitialized_volume = blank_volume("volume_persistent_blank");
     let initialized_volume = blank_volume("volume_persistent_initialized");
     let token = random_id(7001);
@@ -533,6 +534,46 @@ fn persistent_disk_closed_codec_round_trips_both_states_and_detects_projection_d
         ["uninitialized".to_owned(), "initialized".to_owned()]
     );
 
+    let mut raw_client = postgres::Client::connect(&url, postgres::NoTls).unwrap();
+    for (label, sql, disk_id) in [
+        (
+            "missing initialization kind",
+            "UPDATE disk_records SET initialization_kind=NULL WHERE disk_id=$1",
+            uninitialized.disk_id.as_str(),
+        ),
+        (
+            "missing blank generation",
+            "UPDATE disk_records SET expected_blank_generation=NULL WHERE disk_id=$1",
+            uninitialized.disk_id.as_str(),
+        ),
+        (
+            "missing initialized generation",
+            "UPDATE disk_records SET initialized_generation=NULL WHERE disk_id=$1",
+            initialized.disk_id.as_str(),
+        ),
+        (
+            "missing initialized timestamp",
+            "UPDATE disk_records SET initialized_at=NULL WHERE disk_id=$1",
+            initialized.disk_id.as_str(),
+        ),
+    ] {
+        let error = raw_client.execute(sql, &[&disk_id]).unwrap_err();
+        assert_eq!(error.code(), Some(&SqlState::CHECK_VIOLATION), "{label}");
+    }
+    let unchanged: (Option<String>, Option<i64>, Option<i64>, Option<i64>) = raw_client
+        .query_one(
+            "SELECT initialization_kind, expected_blank_generation,
+                    initialized_generation, initialized_at
+               FROM disk_records WHERE disk_id=$1",
+            &[&initialized.disk_id.as_str()],
+        )
+        .map(|row| (row.get(0), row.get(1), row.get(2), row.get(3)))
+        .unwrap();
+    assert_eq!(
+        unchanged,
+        (Some("initialized".to_owned()), Some(0), Some(1), Some(456))
+    );
+
     store
         .with(|client| {
             client
@@ -553,7 +594,7 @@ fn persistent_disk_closed_codec_round_trips_both_states_and_detects_projection_d
 
 #[test]
 fn first_create_and_lost_response_replay_are_exact_and_atomic() {
-    let (_url, store, _second, workspace) = stores();
+    let (url, store, _second, workspace) = stores();
     let request = request(&workspace, "demo", 1, "key-1");
     assert!(store
         .cat_create_result_fast_lookup(&request.idempotency)
@@ -586,6 +627,24 @@ fn first_create_and_lost_response_replay_are_exact_and_atomic() {
         })
         .unwrap();
     assert_eq!(times, (times.0, times.0, times.0, times.0, times.0));
+
+    let mut raw_client = postgres::Client::connect(&url, postgres::NoTls).unwrap();
+    let error = raw_client
+        .execute(
+            "UPDATE runtime_operations SET phase='succeeded', terminal_kind=NULL
+              WHERE operation_id=$1",
+            &[&request.candidate.operation_id.as_str()],
+        )
+        .unwrap_err();
+    assert_eq!(error.code(), Some(&SqlState::CHECK_VIOLATION));
+    let phase: String = raw_client
+        .query_one(
+            "SELECT phase FROM runtime_operations WHERE operation_id=$1",
+            &[&request.candidate.operation_id.as_str()],
+        )
+        .map(|row| row.get(0))
+        .unwrap();
+    assert_eq!(phase, "pending");
 
     delete_created_bundle(&store, &request);
     assert_eq!(counts(&store), [0, 0, 0, 0, 0, 1]);
@@ -969,6 +1028,80 @@ fn every_query_projection_drift_fails_closed_without_a_409_result() {
         let error = store.create_cat_covered(&conflict).unwrap_err();
         assert_eq!(error_code(error), ErrorCode::Internal, "table {table}");
         assert_eq!(counts(&store), [1, 1, 1, 1, 1, 1], "table {table}");
+    }
+}
+
+#[test]
+fn self_consistent_illegal_root_identity_or_timestamp_never_becomes_a_409() {
+    for drift in ["Root name", "created timestamp"] {
+        let (url, store, _second, workspace) = stores();
+        let original = request(&workspace, "demo", 1, "original");
+        store.create_cat_covered(&original).unwrap();
+        let mut raw_client = postgres::Client::connect(&url, postgres::NoTls).unwrap();
+        let changed = if drift == "Root name" {
+            let ddl_error = raw_client
+                .execute(
+                    "UPDATE disk_records
+                        SET name=$1,
+                            record=jsonb_set(record, '{name}', to_jsonb($1::TEXT), FALSE)
+                      WHERE disk_id=$2",
+                    &[
+                        &"corrupt_root_name",
+                        &original.candidate.root_disk.disk_id.as_str(),
+                    ],
+                )
+                .unwrap_err();
+            assert_eq!(ddl_error.code(), Some(&SqlState::CHECK_VIOLATION));
+            // Simulate a stored row written while the DDL backstop was absent;
+            // both JSONB and its projection remain internally consistent.
+            raw_client
+                .batch_execute(
+                    "DO $$
+                     DECLARE target_constraint TEXT;
+                     BEGIN
+                       SELECT conname INTO STRICT target_constraint
+                         FROM pg_constraint
+                        WHERE conrelid='disk_records'::regclass
+                          AND contype='c'
+                          AND pg_get_constraintdef(oid) LIKE '%root_cat_id%';
+                       EXECUTE format(
+                         'ALTER TABLE disk_records DROP CONSTRAINT %I',
+                         target_constraint
+                       );
+                     END $$;",
+                )
+                .unwrap();
+            raw_client
+                .execute(
+                    "UPDATE disk_records
+                        SET name=$1,
+                            record=jsonb_set(record, '{name}', to_jsonb($1::TEXT), FALSE)
+                      WHERE disk_id=$2",
+                    &[
+                        &"corrupt_root_name",
+                        &original.candidate.root_disk.disk_id.as_str(),
+                    ],
+                )
+                .unwrap()
+        } else {
+            raw_client
+                .execute(
+                    "UPDATE disk_records
+                        SET created_at=created_at+1,
+                            record=jsonb_set(
+                              record, '{created_at}', to_jsonb(created_at+1), FALSE
+                            )
+                      WHERE disk_id=$1",
+                    &[&original.candidate.root_disk.disk_id.as_str()],
+                )
+                .unwrap()
+        };
+        assert_eq!(changed, 1, "{drift}");
+
+        let conflict = request(&workspace, "demo", 2, "would-conflict");
+        let error = store.create_cat_covered(&conflict).unwrap_err();
+        assert_eq!(error_code(error), ErrorCode::Internal, "{drift}");
+        assert_eq!(counts(&store), [1, 1, 1, 1, 1, 1], "{drift}");
     }
 }
 
