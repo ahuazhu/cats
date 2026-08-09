@@ -657,7 +657,7 @@ pub(super) fn load_desired_unlocked(
         .transpose()
 }
 
-fn decode_desired(row: &Row) -> AuthorityTxResult<DesiredRuntimeSpec> {
+pub(super) fn decode_desired(row: &Row) -> AuthorityTxResult<DesiredRuntimeSpec> {
     let stored = DesiredProjection::from_row(row)?;
     let json: String = row.try_get("record_json")?;
     let record = decode_desired_runtime_spec(json.as_bytes()).map_err(corrupt)?;
@@ -665,6 +665,38 @@ fn decode_desired(row: &Row) -> AuthorityTxResult<DesiredRuntimeSpec> {
         return Err(corrupt(()));
     }
     Ok(record)
+}
+
+#[allow(dead_code, reason = "consumed by the F3c Desired/inventory spine")]
+pub(super) fn load_assigned_desired_for_update(
+    transaction: &mut Transaction<'_>,
+    node_id: &Id,
+) -> AuthorityTxResult<Vec<DesiredRuntimeSpec>> {
+    let sql = format!(
+        "SELECT {DESIRED_COLUMNS} FROM desired_runtime_specs
+          WHERE node_id=$1 ORDER BY cat_id FOR UPDATE"
+    );
+    transaction
+        .query(&sql, &[&node_id.as_str()])?
+        .iter()
+        .map(decode_desired)
+        .collect()
+}
+
+#[allow(dead_code, reason = "consumed by the F3c admission snapshot loader")]
+pub(super) fn load_assigned_desired_unlocked(
+    transaction: &mut Transaction<'_>,
+    node_id: &Id,
+) -> AuthorityTxResult<Vec<DesiredRuntimeSpec>> {
+    let sql = format!(
+        "SELECT {DESIRED_COLUMNS} FROM desired_runtime_specs
+          WHERE node_id=$1 ORDER BY cat_id"
+    );
+    transaction
+        .query(&sql, &[&node_id.as_str()])?
+        .iter()
+        .map(decode_desired)
+        .collect()
 }
 
 pub(super) fn insert_hostname_lookup(
@@ -804,6 +836,49 @@ pub(super) fn load_operation_by_cat_revision_unlocked(
         .query_opt(&sql, &[&cat_id.as_str(), &revision])?
         .map(|row| decode_operation_row(&row))
         .transpose()
+}
+
+#[allow(dead_code, reason = "consumed by the F3c observation transaction")]
+pub(super) fn load_pending_operation_by_cat_for_update(
+    transaction: &mut Transaction<'_>,
+    cat_id: &Id,
+) -> AuthorityTxResult<Option<Operation>> {
+    let sql = format!(
+        "SELECT {OPERATION_COLUMNS} FROM runtime_operations
+          WHERE cat_id=$1 AND phase='pending' FOR UPDATE"
+    );
+    transaction
+        .query_opt(&sql, &[&cat_id.as_str()])?
+        .map(|row| decode_operation_row(&row))
+        .transpose()
+}
+
+#[allow(dead_code, reason = "consumed by the F3c observation transaction")]
+pub(super) fn update_operation(
+    transaction: &mut Transaction<'_>,
+    record: &Operation,
+) -> AuthorityTxResult<()> {
+    let projection = OperationProjection::from_record(record)?;
+    let json = String::from_utf8(encode_operation(record).map_err(corrupt)?).map_err(corrupt)?;
+    let updated_at = projection.updated_at.to_pg().map_err(corrupt)?;
+    let changed = transaction.execute(
+        "UPDATE runtime_operations SET
+            record=$2::TEXT::jsonb, phase=$3, terminal_kind=$4, updated_at=$5
+          WHERE operation_id=$1",
+        &[
+            &projection.operation_id,
+            &json,
+            &projection.phase,
+            &projection.terminal_kind,
+            &updated_at,
+        ],
+    )?;
+    if changed != 1 {
+        return Err(corrupt(
+            "runtime Operation update affected an unexpected row count",
+        ));
+    }
+    Ok(())
 }
 
 fn decode_operation_row(row: &Row) -> AuthorityTxResult<Operation> {

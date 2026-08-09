@@ -241,6 +241,10 @@ const CONTROL_TABLES: &[&str] = &[
     "node_identities",
     "agent_registration_attempts",
     "current_agent_sessions",
+    "runtime_desired_read_states",
+    "runtime_observation_receive_states",
+    "runtime_admission_inventory_states",
+    "runtime_current_cat_observations",
 ];
 
 const AUTHORITY_SCHEMA_PROBES: &[&str] = &[
@@ -302,6 +306,26 @@ const AUTHORITY_SCHEMA_PROBES: &[&str] = &[
             agent_instance_id, agent_session_epoch, registration_attempt_id,
             guest_config_digest, lease_deadline_unix_ms
        FROM current_agent_sessions WHERE FALSE",
+    "SELECT node_id, response, node_boot_id, agent_instance_id,
+            agent_session_epoch, last_request_sequence,
+            read_position_high_water, issued_at_unix_ms,
+            expires_at_unix_ms, consumed_observation_id,
+            consumed_heartbeat_sequence
+       FROM runtime_desired_read_states WHERE FALSE",
+    "SELECT node_id, observation, acceptance, node_boot_id,
+            agent_instance_id, agent_session_epoch, heartbeat_sequence,
+            observation_id, accepted_at_unix_ms
+       FROM runtime_observation_receive_states WHERE FALSE",
+    "SELECT node_id, attestation, full_observation, assigned_snapshot,
+            node_boot_id, agent_instance_id, agent_session_epoch,
+            inventory_epoch, inventory_digest, inventory_read_position,
+            accepted_at_unix_ms
+       FROM runtime_admission_inventory_states WHERE FALSE",
+    "SELECT node_id, cat_id, runtime_record, node_boot_id,
+            agent_instance_id, agent_session_epoch, inventory_epoch,
+            source_observation_id, heartbeat_sequence, accepted_at_unix_ms,
+            source_kind
+       FROM runtime_current_cat_observations WHERE FALSE",
 ];
 
 const SCHEMA: &str = "
@@ -868,6 +892,58 @@ CREATE TABLE IF NOT EXISTS current_agent_sessions (
         REFERENCES agent_registration_attempts(
             node_id, registration_attempt_id, agent_session_epoch
         )
+);
+CREATE TABLE IF NOT EXISTS runtime_desired_read_states (
+    node_id TEXT PRIMARY KEY REFERENCES node_identities(node_id),
+    response JSONB NOT NULL CHECK (jsonb_typeof(response) = 'object'),
+    node_boot_id TEXT NOT NULL,
+    agent_instance_id TEXT NOT NULL,
+    agent_session_epoch BIGINT NOT NULL CHECK (agent_session_epoch > 0),
+    last_request_sequence BIGINT NOT NULL CHECK (last_request_sequence > 0),
+    read_position_high_water BIGINT NOT NULL CHECK (read_position_high_water > 0),
+    issued_at_unix_ms BIGINT NOT NULL CHECK (issued_at_unix_ms >= 0),
+    expires_at_unix_ms BIGINT NOT NULL CHECK (expires_at_unix_ms > issued_at_unix_ms),
+    consumed_observation_id TEXT,
+    consumed_heartbeat_sequence BIGINT CHECK (consumed_heartbeat_sequence > 0),
+    CHECK ((consumed_observation_id IS NULL) = (consumed_heartbeat_sequence IS NULL))
+);
+CREATE TABLE IF NOT EXISTS runtime_observation_receive_states (
+    node_id TEXT PRIMARY KEY REFERENCES node_identities(node_id),
+    observation JSONB NOT NULL CHECK (jsonb_typeof(observation) = 'object'),
+    acceptance JSONB NOT NULL CHECK (jsonb_typeof(acceptance) = 'object'),
+    node_boot_id TEXT NOT NULL,
+    agent_instance_id TEXT NOT NULL,
+    agent_session_epoch BIGINT NOT NULL CHECK (agent_session_epoch > 0),
+    heartbeat_sequence BIGINT NOT NULL CHECK (heartbeat_sequence > 0),
+    observation_id TEXT NOT NULL,
+    accepted_at_unix_ms BIGINT NOT NULL CHECK (accepted_at_unix_ms >= 0)
+);
+CREATE TABLE IF NOT EXISTS runtime_admission_inventory_states (
+    node_id TEXT PRIMARY KEY REFERENCES node_identities(node_id),
+    attestation JSONB NOT NULL CHECK (jsonb_typeof(attestation) = 'object'),
+    full_observation JSONB NOT NULL CHECK (jsonb_typeof(full_observation) = 'object'),
+    assigned_snapshot JSONB NOT NULL CHECK (jsonb_typeof(assigned_snapshot) = 'object'),
+    node_boot_id TEXT NOT NULL,
+    agent_instance_id TEXT NOT NULL,
+    agent_session_epoch BIGINT NOT NULL CHECK (agent_session_epoch > 0),
+    inventory_epoch BIGINT NOT NULL CHECK (inventory_epoch > 0),
+    inventory_digest TEXT NOT NULL CHECK (inventory_digest ~ '^sha256:[0-9a-f]{64}$'),
+    inventory_read_position BIGINT NOT NULL CHECK (inventory_read_position > 0),
+    accepted_at_unix_ms BIGINT NOT NULL CHECK (accepted_at_unix_ms >= 0)
+);
+CREATE TABLE IF NOT EXISTS runtime_current_cat_observations (
+    node_id TEXT NOT NULL REFERENCES node_identities(node_id),
+    cat_id TEXT NOT NULL,
+    runtime_record JSONB NOT NULL CHECK (jsonb_typeof(runtime_record) = 'object'),
+    node_boot_id TEXT NOT NULL,
+    agent_instance_id TEXT NOT NULL,
+    agent_session_epoch BIGINT NOT NULL CHECK (agent_session_epoch > 0),
+    inventory_epoch BIGINT NOT NULL CHECK (inventory_epoch > 0),
+    source_observation_id TEXT NOT NULL,
+    heartbeat_sequence BIGINT NOT NULL CHECK (heartbeat_sequence > 0),
+    accepted_at_unix_ms BIGINT NOT NULL CHECK (accepted_at_unix_ms >= 0),
+    source_kind TEXT NOT NULL CHECK (source_kind IN ('full', 'partial')),
+    PRIMARY KEY (node_id, cat_id)
 );
 CREATE OR REPLACE FUNCTION control_node_identity_lineage_is_immutable()
 RETURNS trigger AS $$

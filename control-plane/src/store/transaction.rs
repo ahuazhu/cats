@@ -8,6 +8,7 @@ use std::time::Duration;
 use cats_api::error::{ApiError, ErrorCode};
 use cats_storage::authority::AuthorityError;
 use postgres::error::SqlState;
+use postgres::IsolationLevel;
 
 use super::*;
 
@@ -55,6 +56,17 @@ enum AttemptFailure {
     Infrastructure(ApiError),
 }
 
+#[derive(Clone, Copy)]
+#[allow(
+    dead_code,
+    reason = "read-only variant is consumed by the F3c composition"
+)]
+enum AuthorityTransactionMode {
+    ReadWrite,
+    RepeatableReadWrite,
+    RepeatableReadOnly,
+}
+
 impl Store {
     /// Runs one complete authority closure in one fresh PostgreSQL
     /// transaction. Retriable database failures replay the whole closure;
@@ -72,14 +84,72 @@ impl Store {
         }
     }
 
+    #[allow(dead_code, reason = "consumed by the F3c runtime spine")]
+    pub(super) fn authority_repeatable_transaction<T: Send>(
+        &self,
+        operation: impl FnMut(&mut postgres::Transaction<'_>) -> AuthorityTxResult<T> + Send,
+    ) -> Result<T> {
+        match self.authority_transaction_outcome_with(
+            operation,
+            AuthorityTransactionMode::RepeatableReadWrite,
+        ) {
+            Ok(value) => Ok(value),
+            Err(AuthorityExecutionError::Store(error)) => Err(error),
+            Err(AuthorityExecutionError::CandidateCollision) => Err(internal(
+                "unexpected candidate-collision marker in a runtime spine transaction",
+            )),
+        }
+    }
+
+    /// Runs a complete authority facts loader in one PostgreSQL snapshot.
+    /// Consumers must receive either the complete mutually-consistent fact set
+    /// or no fact set at all, so this deliberately shares the retry and
+    /// fail-closed error policy of mutation transactions.
+    #[allow(dead_code, reason = "consumed by F3c planner/signer facts loaders")]
+    pub(super) fn authority_read_snapshot<T: Send>(
+        &self,
+        operation: impl FnMut(&mut postgres::Transaction<'_>) -> AuthorityTxResult<T> + Send,
+    ) -> Result<T> {
+        match self.authority_transaction_outcome_with(
+            operation,
+            AuthorityTransactionMode::RepeatableReadOnly,
+        ) {
+            Ok(value) => Ok(value),
+            Err(AuthorityExecutionError::Store(error)) => Err(error),
+            Err(AuthorityExecutionError::CandidateCollision) => Err(internal(
+                "unexpected candidate-collision marker in an authority read snapshot",
+            )),
+        }
+    }
+
     pub(super) fn authority_transaction_outcome<T: Send>(
         &self,
+        operation: impl FnMut(&mut postgres::Transaction<'_>) -> AuthorityTxResult<T> + Send,
+    ) -> std::result::Result<T, AuthorityExecutionError> {
+        self.authority_transaction_outcome_with(operation, AuthorityTransactionMode::ReadWrite)
+    }
+
+    fn authority_transaction_outcome_with<T: Send>(
+        &self,
         mut operation: impl FnMut(&mut postgres::Transaction<'_>) -> AuthorityTxResult<T> + Send,
+        mode: AuthorityTransactionMode,
     ) -> std::result::Result<T, AuthorityExecutionError> {
         for attempt in 0..AUTHORITY_TRANSACTION_ATTEMPTS {
             let outcome = self.enter(|client| {
                 let client = client.map_err(AttemptFailure::Infrastructure)?;
-                let mut transaction = client.transaction().map_err(AttemptFailure::Postgres)?;
+                let mut transaction = match mode {
+                    AuthorityTransactionMode::ReadWrite => client.transaction(),
+                    AuthorityTransactionMode::RepeatableReadWrite => client
+                        .build_transaction()
+                        .isolation_level(IsolationLevel::RepeatableRead)
+                        .start(),
+                    AuthorityTransactionMode::RepeatableReadOnly => client
+                        .build_transaction()
+                        .isolation_level(IsolationLevel::RepeatableRead)
+                        .read_only(true)
+                        .start(),
+                }
+                .map_err(AttemptFailure::Postgres)?;
                 match operation(&mut transaction) {
                     Ok(value) => transaction
                         .commit()

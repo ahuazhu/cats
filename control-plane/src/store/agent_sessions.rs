@@ -54,6 +54,14 @@ impl AuthenticatedNodeCredential {
             binding,
         }
     }
+
+    pub(super) fn credential_id(&self) -> &Id {
+        &self.credential_id
+    }
+
+    pub(super) fn binding(&self) -> &CredentialBinding {
+        &self.binding
+    }
 }
 
 /// Process-lifetime registration policy derived from one validated release
@@ -90,6 +98,10 @@ impl AgentSessionRegistrationPolicy {
             approved_guest_config_digest,
             lease_duration_ms,
         })
+    }
+
+    pub(crate) fn approved_guest_config_digest(&self) -> &Sha256Digest {
+        &self.approved_guest_config_digest
     }
 }
 
@@ -483,7 +495,7 @@ fn register_agent_session_in(
     Ok(AgentRegistrationOutcome::Registered(session))
 }
 
-fn load_identity_by_credential_for_update(
+pub(super) fn load_identity_by_credential_for_update(
     transaction: &mut Transaction<'_>,
     credential_id: &Id,
 ) -> AuthorityTxResult<Option<NodeIdentity>> {
@@ -497,7 +509,7 @@ fn load_identity_by_credential_for_update(
         .transpose()
 }
 
-fn load_identity_by_node_for_update(
+pub(super) fn load_identity_by_node_for_update(
     transaction: &mut Transaction<'_>,
     node_id: &Id,
 ) -> AuthorityTxResult<Option<NodeIdentity>> {
@@ -505,6 +517,18 @@ fn load_identity_by_node_for_update(
         "SELECT {NODE_IDENTITY_COLUMNS} FROM node_identities
           WHERE node_id=$1 FOR UPDATE"
     );
+    transaction
+        .query_opt(&sql, &[&node_id.as_str()])?
+        .map(|row| decode_identity(&row))
+        .transpose()
+}
+
+#[allow(dead_code, reason = "consumed by the F3c admission snapshot loader")]
+pub(super) fn load_identity_by_node_unlocked(
+    transaction: &mut Transaction<'_>,
+    node_id: &Id,
+) -> AuthorityTxResult<Option<NodeIdentity>> {
+    let sql = format!("SELECT {NODE_IDENTITY_COLUMNS} FROM node_identities WHERE node_id=$1");
     transaction
         .query_opt(&sql, &[&node_id.as_str()])?
         .map(|row| decode_identity(&row))
@@ -551,7 +575,7 @@ fn decode_attempt(row: &Row) -> AuthorityTxResult<StoredRegistrationAttempt> {
     Ok(StoredRegistrationAttempt { attempt, session })
 }
 
-fn load_current_session_for_update(
+pub(super) fn load_current_session_for_update(
     transaction: &mut Transaction<'_>,
     node_id: &Id,
 ) -> AuthorityTxResult<Option<AgentSession>> {
@@ -575,12 +599,56 @@ fn load_current_session_for_update(
             "current AgentSession has no immutable attempt result",
         ));
     };
-    if stored_attempt.session != session {
+    if !same_session_except_deadline(&stored_attempt.session, &session)
+        || session.lease_deadline_unix_ms < stored_attempt.session.lease_deadline_unix_ms
+    {
         return Err(corrupt(
-            "current AgentSession differs from its immutable attempt result",
+            "current AgentSession is not a monotonic renewal of its immutable attempt result",
         ));
     }
     Ok(Some(session))
+}
+
+#[allow(dead_code, reason = "consumed by the F3c admission snapshot loader")]
+pub(super) fn load_current_session_unlocked(
+    transaction: &mut Transaction<'_>,
+    node_id: &Id,
+) -> AuthorityTxResult<Option<AgentSession>> {
+    let sql =
+        format!("SELECT {CURRENT_SESSION_COLUMNS} FROM current_agent_sessions WHERE node_id=$1");
+    let Some(row) = transaction.query_opt(&sql, &[&node_id.as_str()])? else {
+        return Ok(None);
+    };
+    let session = decode_current_session(&row)?;
+    let Some(stored_attempt) = load_attempt(
+        transaction,
+        &session.node_id,
+        &session.registration_attempt_id,
+    )?
+    else {
+        return Err(corrupt(
+            "current AgentSession has no immutable attempt result",
+        ));
+    };
+    if !same_session_except_deadline(&stored_attempt.session, &session)
+        || session.lease_deadline_unix_ms < stored_attempt.session.lease_deadline_unix_ms
+    {
+        return Err(corrupt(
+            "current AgentSession is not a monotonic renewal of its immutable attempt result",
+        ));
+    }
+    Ok(Some(session))
+}
+
+fn same_session_except_deadline(left: &AgentSession, right: &AgentSession) -> bool {
+    left.version == right.version
+        && left.node_id == right.node_id
+        && left.immutable_host_id == right.immutable_host_id
+        && left.node_boot_id == right.node_boot_id
+        && left.agent_instance_id == right.agent_instance_id
+        && left.agent_session_epoch == right.agent_session_epoch
+        && left.registration_attempt_id == right.registration_attempt_id
+        && left.guest_config_digest == right.guest_config_digest
 }
 
 fn load_attempt(
@@ -706,6 +774,40 @@ fn replace_current_session(
         ],
     )?;
     exactly_one(changed)
+}
+
+#[allow(dead_code, reason = "consumed by the F3c observation transaction")]
+pub(super) fn renew_current_session_deadline(
+    transaction: &mut Transaction<'_>,
+    current: &AgentSession,
+    deadline: UnixMillis,
+) -> AuthorityTxResult<AgentSession> {
+    if deadline < current.lease_deadline_unix_ms {
+        return Err(corrupt("Agent session lease renewal moved backward"));
+    }
+    let mut renewed = current.clone();
+    renewed.lease_deadline_unix_ms = deadline;
+    let record = encode_session(&renewed)?;
+    let deadline = deadline.to_pg().map_err(corrupt)?;
+    let current_deadline = current.lease_deadline_unix_ms.to_pg().map_err(corrupt)?;
+    let epoch = current.agent_session_epoch.to_pg().map_err(corrupt)?;
+    let changed = transaction.execute(
+        "UPDATE current_agent_sessions
+            SET record=$4::TEXT::jsonb, lease_deadline_unix_ms=$5
+          WHERE node_id=$1 AND node_boot_id=$2 AND agent_instance_id=$3
+            AND agent_session_epoch=$6 AND lease_deadline_unix_ms=$7",
+        &[
+            &current.node_id.as_str(),
+            &current.node_boot_id.as_str(),
+            &current.agent_instance_id.as_str(),
+            &record,
+            &deadline,
+            &epoch,
+            &current_deadline,
+        ],
+    )?;
+    exactly_one(changed)?;
+    Ok(renewed)
 }
 
 fn encode_identity(identity: &NodeIdentity) -> AuthorityTxResult<String> {

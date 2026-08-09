@@ -15,6 +15,11 @@ pub(super) mod pg_codec;
 mod product;
 mod product_rows;
 pub(super) mod rows;
+#[allow(
+    dead_code,
+    reason = "F3c is consumed by the F3b authenticated routes and F2d planner composition"
+)]
+pub(crate) mod runtime_spine;
 mod volume;
 
 #[cfg(test)]
@@ -22,6 +27,9 @@ mod cat_create_service_tests;
 
 #[cfg(test)]
 mod product_tests;
+
+#[cfg(test)]
+mod runtime_spine_tests;
 
 #[cfg(test)]
 mod tests;
