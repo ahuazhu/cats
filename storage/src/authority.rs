@@ -5,8 +5,13 @@
 //! returned replacement rows in the same transaction.
 
 pub use cats_api::runtime_reconciliation::{
-    AsciiText, Epoch, FenceEpoch, Generation, Id, NodeBootId, RandomId128, RemoteHead, Revision,
-    Sha256Digest, UnixMillis,
+    AsciiText, AuthorizationConsumedReceipt, AuthorizationRecord, AuthorizationState,
+    BeginDeleteRequest, BeginDeleteResult, BeginDisposableDeleteConsumedReceipt,
+    DeleteCompletionReceipt, DisposableDeleteIsolationBasis, DisposableRootDeleteAuthorization,
+    Epoch, FenceEpoch, Generation, Id, LastVolumeTransition, NodeBootId, NormalAcquireRequest,
+    NormalAcquireResult, RandomId128, ReleaseRequest, ReleaseResult, RemoteHead, Revision,
+    Sha256Digest, TakeoverConsumedReceipt, UnixMillis, VolumeAdminState, VolumeAuthorization,
+    VolumeDurability, VolumeRecord, VolumeTakeoverAuthorization,
 };
 use serde::{Deserialize, Serialize};
 
@@ -21,80 +26,6 @@ const MAX_INTEGER: u64 = i64::MAX as u64;
 /// incompatible authority shape without importing the product store or
 /// duplicating its schema.
 pub const AUTHORITY_RELEASE_SCHEMA_VERSION: i64 = 6;
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum VolumeDurability {
-    Strict,
-    Relaxed,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
-pub enum VolumeAdminState {
-    Active,
-    Deleting { delete_id: Id },
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct VolumeRecord {
-    pub volume_id: Id,
-    pub size_bytes: u64,
-    pub durability: VolumeDurability,
-    pub admin_state: VolumeAdminState,
-    pub head: RemoteHead,
-    pub lease_owner: Option<Id>,
-    pub lease_epoch: FenceEpoch,
-    pub lease_expires_at: Option<UnixMillis>,
-    pub last_transition: Option<LastVolumeTransition>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
-pub enum LastVolumeTransition {
-    NormalAcquire {
-        request: NormalAcquireRequest,
-        result: NormalAcquireResult,
-    },
-    Release {
-        request: ReleaseRequest,
-        result: ReleaseResult,
-    },
-    Takeover {
-        authorization_id: Id,
-    },
-    BeginDelete {
-        request: BeginDeleteRequest,
-        result: BeginDeleteResult,
-    },
-    BeginDisposableDelete {
-        authorization_id: Id,
-    },
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct NormalAcquireRequest {
-    pub volume_id: Id,
-    pub transition_id: RandomId128,
-    pub attachment_id: Id,
-    pub expected_unowned_epoch: FenceEpoch,
-    pub desired_revision: Revision,
-    pub placement_epoch: Epoch,
-    pub lease_duration_ms: u64,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct NormalAcquireResult {
-    pub volume_id: Id,
-    pub transition_id: RandomId128,
-    pub attachment_id: Id,
-    pub resulting_epoch: FenceEpoch,
-    pub resulting_head: RemoteHead,
-    pub lease_expires_at: UnixMillis,
-}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RenewLeaseRequest {
@@ -135,52 +66,6 @@ pub struct VolumeHeadCasResult {
     pub resulting_head: RemoteHead,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct ReleaseRequest {
-    pub volume_id: Id,
-    pub transition_id: RandomId128,
-    pub attachment_id: Id,
-    pub expected_epoch: FenceEpoch,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct ReleaseResult {
-    pub volume_id: Id,
-    pub transition_id: RandomId128,
-    pub released_attachment_id: Id,
-    pub resulting_epoch: FenceEpoch,
-    pub resulting_head: RemoteHead,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct VolumeTakeoverAuthorization {
-    pub authorization_id: Id,
-    pub host_fence_event_id: Id,
-    pub volume_id: Id,
-    pub expected_attachment_id: Id,
-    pub expected_epoch: FenceEpoch,
-    pub new_attachment_id: Id,
-    pub desired_revision: Revision,
-    pub new_placement_epoch: Epoch,
-    pub lease_duration_ms: u64,
-    pub not_after: UnixMillis,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct TakeoverConsumedReceipt {
-    pub authorization_id: Id,
-    pub host_fence_event_id: Id,
-    pub volume_id: Id,
-    pub new_attachment_id: Id,
-    pub resulting_epoch: FenceEpoch,
-    pub resulting_head: RemoteHead,
-    pub consumed_at: UnixMillis,
-}
-
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TakeoverResult {
     pub authorization_id: Id,
@@ -189,104 +74,6 @@ pub struct TakeoverResult {
     pub resulting_epoch: FenceEpoch,
     pub resulting_head: RemoteHead,
     pub lease_expires_at: UnixMillis,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct BeginDeleteRequest {
-    pub delete_id: Id,
-    pub disk_id: Id,
-    pub volume_id: Id,
-    pub expected_unowned_epoch: FenceEpoch,
-    pub expected_head: RemoteHead,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct BeginDeleteResult {
-    pub delete_id: Id,
-    pub disk_id: Id,
-    pub volume_id: Id,
-    pub resulting_epoch: FenceEpoch,
-    pub resulting_head: RemoteHead,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct DisposableRootDeleteAuthorization {
-    pub authorization_id: Id,
-    pub delete_id: Id,
-    pub disk_id: Id,
-    pub volume_id: Id,
-    pub cat_id: Id,
-    pub desired_revision: Revision,
-    pub placement_epoch: Epoch,
-    pub expected_attachment_id: Id,
-    pub expected_epoch: FenceEpoch,
-    pub expected_head: RemoteHead,
-    pub isolation_basis: DisposableDeleteIsolationBasis,
-    pub not_after: UnixMillis,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
-pub enum DisposableDeleteIsolationBasis {
-    RuntimeStopped {
-        node_id: Id,
-        agent_session_epoch: Epoch,
-        runtime_incarnation: RandomId128,
-        observation_id: RandomId128,
-    },
-    HostFenceEvent {
-        event_id: Id,
-    },
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct BeginDisposableDeleteConsumedReceipt {
-    pub authorization_id: Id,
-    pub volume_id: Id,
-    pub disk_id: Id,
-    pub cat_id: Id,
-    pub delete_id: Id,
-    pub prior_attachment_id: Id,
-    pub resulting_epoch: FenceEpoch,
-    pub resulting_head: RemoteHead,
-    pub consumed_at: UnixMillis,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
-pub enum VolumeAuthorization {
-    Takeover(VolumeTakeoverAuthorization),
-    DisposableRootDelete(DisposableRootDeleteAuthorization),
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
-pub enum AuthorizationConsumedReceipt {
-    Takeover(TakeoverConsumedReceipt),
-    BeginDisposableDelete(BeginDisposableDeleteConsumedReceipt),
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(
-    tag = "kind",
-    content = "receipt",
-    rename_all = "snake_case",
-    deny_unknown_fields
-)]
-pub enum AuthorizationState {
-    Unconsumed,
-    Consumed(Box<AuthorizationConsumedReceipt>),
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct AuthorizationRecord {
-    pub authorization: VolumeAuthorization,
-    pub state: AuthorizationState,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -335,27 +122,6 @@ pub struct HostDestroyedReceipt {
 #[serde(rename_all = "snake_case")]
 pub enum StateStorageDisposition {
     PermanentlyDestroyed,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
-pub enum DeleteCompletionReceipt {
-    Normal {
-        request: BeginDeleteRequest,
-        deleting_epoch: FenceEpoch,
-        deleting_head: RemoteHead,
-        completed_at: UnixMillis,
-    },
-    DisposableRoot {
-        disk_id: Id,
-        volume_id: Id,
-        delete_id: Id,
-        authorization_id: Id,
-        prior_attachment_id: Id,
-        deleting_epoch: FenceEpoch,
-        deleting_head: RemoteHead,
-        completed_at: UnixMillis,
-    },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
@@ -612,6 +378,291 @@ pub fn validate_authorization_record(record: &AuthorizationRecord) -> Result<()>
             _ => Err(AuthorityError::BackendUnknown),
         },
     }
+}
+
+/// Validates the exact, bounded authorization-evidence bundle returned by
+/// Control.  This checks stored-state closure only; it deliberately does not
+/// turn an incomplete but internally valid proof into a success decision.
+/// The Node recovery state machine remains responsible for choosing retry,
+/// adopt, blocked, or quarantine from the validated bundle.
+pub fn validate_volume_transition_evidence_bundle(
+    primary: &AuthorizationRecord,
+    current_volume: Option<&VolumeRecord>,
+    delete_completion: Option<&DeleteCompletionReceipt>,
+    direct_successor: Option<&AuthorizationRecord>,
+) -> Result<()> {
+    validate_authorization_record(primary)?;
+    if let Some(record) = current_volume {
+        validate_volume_record(record)?;
+    }
+    if let Some(receipt) = delete_completion {
+        validate_delete_completion_receipt(receipt)?;
+    }
+    if let Some(record) = direct_successor {
+        validate_authorization_record(record)?;
+    }
+    if current_volume.is_some() && delete_completion.is_some() {
+        return Err(AuthorityError::BackendUnknown);
+    }
+
+    let primary_id = authorization_id(primary);
+    let volume_id = authorization_volume_id(primary);
+    if current_volume.is_some_and(|record| &record.volume_id != volume_id)
+        || delete_completion.is_some_and(|receipt| completion_volume_id(receipt) != volume_id)
+    {
+        return Err(AuthorityError::BackendUnknown);
+    }
+    if let VolumeAuthorization::DisposableRootDelete(authorization) = &primary.authorization {
+        if delete_completion
+            .is_some_and(|completion| completion_delete_id(completion) != &authorization.delete_id)
+        {
+            return Err(AuthorityError::BackendUnknown);
+        }
+    }
+
+    let marker = current_volume
+        .and_then(volume_authorization_marker)
+        .or_else(|| delete_completion.and_then(completion_authorization_marker));
+    match marker.filter(|marker| *marker != primary_id) {
+        None if direct_successor.is_none() => {}
+        Some(marker)
+            if direct_successor.is_some_and(|record| authorization_id(record) == marker) => {}
+        _ => return Err(AuthorityError::BackendUnknown),
+    }
+
+    if let Some(record) = direct_successor {
+        if authorization_id(record) == primary_id || authorization_volume_id(record) != volume_id {
+            return Err(AuthorityError::BackendUnknown);
+        }
+        validate_direct_successor_postcondition(record, current_volume, delete_completion)?;
+        validate_direct_successor_monotonicity(primary, record)?;
+    } else if marker == Some(primary_id) {
+        validate_direct_successor_postcondition(primary, current_volume, delete_completion)?;
+    }
+
+    validate_primary_monotonicity(primary, current_volume, delete_completion)
+}
+
+fn validate_direct_successor_monotonicity(
+    primary: &AuthorizationRecord,
+    direct: &AuthorizationRecord,
+) -> Result<()> {
+    let (VolumeAuthorization::Takeover(_), AuthorizationState::Consumed(primary_receipt)) =
+        (&primary.authorization, &primary.state)
+    else {
+        return Ok(());
+    };
+    let AuthorizationConsumedReceipt::Takeover(primary_receipt) = primary_receipt.as_ref() else {
+        return Err(AuthorityError::BackendUnknown);
+    };
+    match (&direct.authorization, &direct.state) {
+        (VolumeAuthorization::Takeover(authorization), AuthorizationState::Consumed(receipt)) => {
+            let AuthorizationConsumedReceipt::Takeover(receipt) = receipt.as_ref() else {
+                return Err(AuthorityError::BackendUnknown);
+            };
+            if authorization.expected_attachment_id != primary_receipt.new_attachment_id
+                || authorization.expected_epoch != primary_receipt.resulting_epoch
+                || !remote_head_is_same_or_later(
+                    &receipt.resulting_head,
+                    &primary_receipt.resulting_head,
+                )
+            {
+                return Err(AuthorityError::BackendUnknown);
+            }
+        }
+        (
+            VolumeAuthorization::DisposableRootDelete(authorization),
+            AuthorizationState::Consumed(_),
+        ) => {
+            if authorization.expected_attachment_id != primary_receipt.new_attachment_id
+                || authorization.expected_epoch != primary_receipt.resulting_epoch
+                || !remote_head_is_same_or_later(
+                    &authorization.expected_head,
+                    &primary_receipt.resulting_head,
+                )
+            {
+                return Err(AuthorityError::BackendUnknown);
+            }
+        }
+        _ => return Err(AuthorityError::BackendUnknown),
+    }
+    Ok(())
+}
+
+fn authorization_id(record: &AuthorizationRecord) -> &Id {
+    match &record.authorization {
+        VolumeAuthorization::Takeover(authorization) => &authorization.authorization_id,
+        VolumeAuthorization::DisposableRootDelete(authorization) => &authorization.authorization_id,
+    }
+}
+
+fn authorization_volume_id(record: &AuthorizationRecord) -> &Id {
+    match &record.authorization {
+        VolumeAuthorization::Takeover(authorization) => &authorization.volume_id,
+        VolumeAuthorization::DisposableRootDelete(authorization) => &authorization.volume_id,
+    }
+}
+
+fn completion_volume_id(receipt: &DeleteCompletionReceipt) -> &Id {
+    match receipt {
+        DeleteCompletionReceipt::Normal { request, .. } => &request.volume_id,
+        DeleteCompletionReceipt::DisposableRoot { volume_id, .. } => volume_id,
+    }
+}
+
+fn completion_delete_id(receipt: &DeleteCompletionReceipt) -> &Id {
+    match receipt {
+        DeleteCompletionReceipt::Normal { request, .. } => &request.delete_id,
+        DeleteCompletionReceipt::DisposableRoot { delete_id, .. } => delete_id,
+    }
+}
+
+fn volume_authorization_marker(record: &VolumeRecord) -> Option<&Id> {
+    match &record.last_transition {
+        Some(LastVolumeTransition::Takeover { authorization_id })
+        | Some(LastVolumeTransition::BeginDisposableDelete { authorization_id }) => {
+            Some(authorization_id)
+        }
+        _ => None,
+    }
+}
+
+fn completion_authorization_marker(receipt: &DeleteCompletionReceipt) -> Option<&Id> {
+    match receipt {
+        DeleteCompletionReceipt::Normal { .. } => None,
+        DeleteCompletionReceipt::DisposableRoot {
+            authorization_id, ..
+        } => Some(authorization_id),
+    }
+}
+
+fn validate_direct_successor_postcondition(
+    record: &AuthorizationRecord,
+    current_volume: Option<&VolumeRecord>,
+    delete_completion: Option<&DeleteCompletionReceipt>,
+) -> Result<()> {
+    let AuthorizationState::Consumed(receipt) = &record.state else {
+        return Err(AuthorityError::BackendUnknown);
+    };
+    match (&record.authorization, receipt.as_ref()) {
+        (
+            VolumeAuthorization::Takeover(authorization),
+            AuthorizationConsumedReceipt::Takeover(receipt),
+        ) => {
+            let Some(current) = current_volume else {
+                // A completion never directly names a takeover authorization:
+                // normal completion has no authorization marker and
+                // disposable completion must name its disposable authorization.
+                return Err(AuthorityError::BackendUnknown);
+            };
+            if !matches!(
+                &current.last_transition,
+                Some(LastVolumeTransition::Takeover { authorization_id })
+                    if authorization_id == &authorization.authorization_id
+            ) || !matches!(current.admin_state, VolumeAdminState::Active)
+                || current.lease_owner.as_ref() != Some(&receipt.new_attachment_id)
+                || current.lease_epoch != receipt.resulting_epoch
+                || !remote_head_is_same_or_later(&current.head, &receipt.resulting_head)
+            {
+                return Err(AuthorityError::BackendUnknown);
+            }
+        }
+        (
+            VolumeAuthorization::DisposableRootDelete(authorization),
+            AuthorizationConsumedReceipt::BeginDisposableDelete(receipt),
+        ) => match (current_volume, delete_completion) {
+            (Some(current), None)
+                if disposable_direct_postcondition(current, authorization, receipt) => {}
+            (None, Some(completion))
+                if disposable_completion_matches(completion, authorization, receipt) => {}
+            _ => return Err(AuthorityError::BackendUnknown),
+        },
+        _ => return Err(AuthorityError::BackendUnknown),
+    }
+    Ok(())
+}
+
+fn disposable_completion_matches(
+    completion: &DeleteCompletionReceipt,
+    authorization: &DisposableRootDeleteAuthorization,
+    receipt: &BeginDisposableDeleteConsumedReceipt,
+) -> bool {
+    matches!(
+        completion,
+        DeleteCompletionReceipt::DisposableRoot {
+            disk_id,
+            volume_id,
+            delete_id,
+            authorization_id,
+            prior_attachment_id,
+            deleting_epoch,
+            deleting_head,
+            completed_at,
+            ..
+        } if disk_id == &authorization.disk_id
+            && volume_id == &authorization.volume_id
+            && delete_id == &authorization.delete_id
+            && authorization_id == &authorization.authorization_id
+            && prior_attachment_id == &authorization.expected_attachment_id
+            && deleting_epoch == &receipt.resulting_epoch
+            && deleting_head == &receipt.resulting_head
+            && completed_at >= &receipt.consumed_at
+    )
+}
+
+fn validate_primary_monotonicity(
+    primary: &AuthorizationRecord,
+    current_volume: Option<&VolumeRecord>,
+    delete_completion: Option<&DeleteCompletionReceipt>,
+) -> Result<()> {
+    let AuthorizationState::Consumed(receipt) = &primary.state else {
+        return Ok(());
+    };
+    match (&primary.authorization, receipt.as_ref()) {
+        (VolumeAuthorization::Takeover(_), AuthorizationConsumedReceipt::Takeover(receipt)) => {
+            let (epoch, head) = match (current_volume, delete_completion) {
+                (Some(current), None) => (current.lease_epoch, &current.head),
+                (
+                    None,
+                    Some(DeleteCompletionReceipt::Normal {
+                        deleting_epoch,
+                        deleting_head,
+                        ..
+                    }),
+                ) => (*deleting_epoch, deleting_head),
+                (
+                    None,
+                    Some(DeleteCompletionReceipt::DisposableRoot {
+                        deleting_epoch,
+                        deleting_head,
+                        ..
+                    }),
+                ) => (*deleting_epoch, deleting_head),
+                (None, None) => return Ok(()),
+                _ => return Err(AuthorityError::BackendUnknown),
+            };
+            if epoch < receipt.resulting_epoch
+                || !remote_head_is_same_or_later(head, &receipt.resulting_head)
+            {
+                return Err(AuthorityError::BackendUnknown);
+            }
+        }
+        (
+            VolumeAuthorization::DisposableRootDelete(authorization),
+            AuthorizationConsumedReceipt::BeginDisposableDelete(receipt),
+        ) => match (current_volume, delete_completion) {
+            (Some(current), None)
+                if disposable_direct_postcondition(current, authorization, receipt) => {}
+            (None, Some(completion))
+                if disposable_completion_matches(completion, authorization, receipt) => {}
+            // A sweeper crash between row deletion and completion insertion is
+            // incomplete recovery evidence, not permission to infer success.
+            (None, None) => {}
+            _ => return Err(AuthorityError::BackendUnknown),
+        },
+        _ => return Err(AuthorityError::BackendUnknown),
+    }
+    Ok(())
 }
 
 pub fn validate_host_fence_event(event: &HostFenceEvent) -> Result<()> {
@@ -1260,7 +1311,15 @@ fn validate_takeover_receipt(
 fn validate_disposable_authorization(
     authorization: &DisposableRootDeleteAuthorization,
 ) -> Result<()> {
-    validate_stored_head(&authorization.expected_head)
+    validate_stored_head(&authorization.expected_head)?;
+    if matches!(
+        &authorization.isolation_basis,
+        DisposableDeleteIsolationBasis::RuntimeStopped { node_id, .. }
+            if node_id != &authorization.authorized_node_id
+    ) {
+        return Err(AuthorityError::BackendUnknown);
+    }
+    Ok(())
 }
 
 fn validate_disposable_receipt(

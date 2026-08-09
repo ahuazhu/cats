@@ -30,6 +30,9 @@ const CONTRACT_ERROR_WIRE: &str = r#"{"error":{"accepted_observation_id":"101010
 const DESIRED_READ_REQUEST_WIRE: &str = r#"{"request_sequence":1,"session":{"agent_instance_id":"44444444444444444444444444444444","agent_session_epoch":2,"node_boot_id":"33333333333333333333333333333333","node_id":"node_a"},"version":1}"#;
 const EMPTY_DESIRED_READ_SNAPSHOT_WIRE: &str = r#"{"desired_specs":[],"expires_at_unix_ms":1720000030000,"issued_at_unix_ms":1720000000000,"read_position":12,"request_sequence":1,"session":{"agent_instance_id":"44444444444444444444444444444444","agent_session_epoch":2,"node_boot_id":"33333333333333333333333333333333","node_id":"node_a"},"version":1}"#;
 const OBSERVATION_ACCEPTANCE_WIRE: &str = r#"{"accepted_at_unix_ms":1720000005000,"heartbeat_sequence":9,"inventory":{"attestation":{"accepted_at_unix_ms":1720000005000,"agent_session_epoch":2,"inventory_digest":"sha256:12c19ac927b853c8f66f6dac52d448d6f2e797925527a0c606c7692b6f714e05","inventory_epoch":4,"inventory_read_position":12,"node_id":"node_a","version":1},"kind":"full"},"lease_deadline_unix_ms":1720000065000,"observation_id":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","session":{"agent_instance_id":"44444444444444444444444444444444","agent_session_epoch":2,"node_boot_id":"33333333333333333333333333333333","node_id":"node_a"},"version":1}"#;
+const VOLUME_TRANSITION_EVIDENCE_REQUEST_WIRE: &str = r#"{"authorization_id":"auth_01","session":{"agent_instance_id":"44444444444444444444444444444444","agent_session_epoch":2,"node_boot_id":"33333333333333333333333333333333","node_id":"node_a"},"version":1}"#;
+const CONSUMED_TAKEOVER_EVIDENCE_SUCCESS_WIRE: &str = r#"{"authorization":{"authorization":{"authorization_id":"auth_01","authorized_node_id":"node_a","desired_revision":8,"expected_attachment_id":"att_old","expected_epoch":3,"host_fence_event_id":"fence_01","kind":"takeover","lease_duration_ms":60000,"new_attachment_id":"att_new","new_placement_epoch":4,"not_after":1720000030000,"volume_id":"vol_root"},"state":{"kind":"consumed","receipt":{"authorization_id":"auth_01","consumed_at":1720000000000,"host_fence_event_id":"fence_01","kind":"takeover","new_attachment_id":"att_new","resulting_epoch":4,"resulting_head":{"generation":0,"root_hash":null,"root_object_id":null},"volume_id":"vol_root"}}},"authorization_id":"auth_01","current_volume":{"admin_state":{"kind":"active"},"durability":"strict","head":{"generation":0,"root_hash":null,"root_object_id":null},"last_transition":{"authorization_id":"auth_01","kind":"takeover"},"lease_epoch":4,"lease_expires_at":1720000060000,"lease_owner":"att_new","size_bytes":4294967296,"volume_id":"vol_root"},"delete_completion":null,"direct_successor_authorization":null,"session":{"agent_instance_id":"44444444444444444444444444444444","agent_session_epoch":2,"node_boot_id":"33333333333333333333333333333333","node_id":"node_a"},"version":1}"#;
+const AUTHORIZATION_EVIDENCE_UNAVAILABLE_WIRE: &str = r#"{"error":{"authorization_id":"auth_01","code":"authorization_evidence_unavailable"},"message":"authorization evidence is unavailable","version":1}"#;
 const MULTI_TERMINAL_CONDITIONS_WIRE: &str = r#"[{"kind":"ready","reason":{"kind":"postcondition_satisfied","target":"running"}},{"kind":"precondition_failed","reason":{"kind":"must_be_cold","observed_state":"running"}},{"kind":"precondition_failed","reason":{"kind":"placement_rejected","node_id":"node_a","placement_epoch":3,"reason":"insufficient_memory"}},{"kind":"quarantined","reason":{"kind":"checkpoint_corrupt","raw_content_digest":"sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}}]"#;
 const SELECTED_TERMINAL_FAILURE_WIRE: &str =
     r#"{"kind":"precondition_failed","reason":{"kind":"must_be_cold","observed_state":"running"}}"#;
@@ -858,6 +861,101 @@ fn fixed_non_digest_vectors_decode_exactly() {
 }
 
 #[test]
+fn a22_authorization_evidence_fixed_vectors_round_trip_exactly() {
+    use sha2::{Digest, Sha256};
+
+    assert_eq!(VOLUME_TRANSITION_EVIDENCE_REQUEST_WIRE.len(), 202);
+    assert_eq!(
+        hex::encode(Sha256::digest(
+            VOLUME_TRANSITION_EVIDENCE_REQUEST_WIRE.as_bytes()
+        )),
+        "8545bb0b2c92ebaa9d93ec246c2aa0f77e6d7bbdcfd882a09645e6301c16adaf"
+    );
+    let request = decode_runtime_volume_transition_evidence_request(
+        VOLUME_TRANSITION_EVIDENCE_REQUEST_WIRE.as_bytes(),
+    )
+    .unwrap();
+    assert_eq!(
+        encode_runtime_volume_transition_evidence_request(&request).unwrap(),
+        VOLUME_TRANSITION_EVIDENCE_REQUEST_WIRE.as_bytes()
+    );
+
+    assert_eq!(CONSUMED_TAKEOVER_EVIDENCE_SUCCESS_WIRE.len(), 1232);
+    assert_eq!(
+        hex::encode(Sha256::digest(
+            CONSUMED_TAKEOVER_EVIDENCE_SUCCESS_WIRE.as_bytes()
+        )),
+        "2ba047bca62bc579dac06494a3eee7ff16798faeb3aae3f1764121a591bca344"
+    );
+    let success = decode_runtime_volume_transition_evidence_success(
+        CONSUMED_TAKEOVER_EVIDENCE_SUCCESS_WIRE.as_bytes(),
+    )
+    .unwrap();
+    assert_eq!(
+        encode_runtime_volume_transition_evidence_success(&success).unwrap(),
+        CONSUMED_TAKEOVER_EVIDENCE_SUCCESS_WIRE.as_bytes()
+    );
+
+    assert_eq!(AUTHORIZATION_EVIDENCE_UNAVAILABLE_WIRE.len(), 146);
+    assert_eq!(
+        hex::encode(Sha256::digest(
+            AUTHORIZATION_EVIDENCE_UNAVAILABLE_WIRE.as_bytes()
+        )),
+        "1d18489671d773ce0ab9643cb393e9bae86b90b4dc7e7894011fd7065de99bd9"
+    );
+    let error =
+        decode_runtime_volume_transition_error(AUTHORIZATION_EVIDENCE_UNAVAILABLE_WIRE.as_bytes())
+            .unwrap();
+    assert_eq!(
+        encode_runtime_volume_transition_error(&error).unwrap(),
+        AUTHORIZATION_EVIDENCE_UNAVAILABLE_WIRE.as_bytes()
+    );
+}
+
+#[test]
+fn a22_authorization_evidence_codecs_reject_open_or_cross_mismatched_payloads() {
+    let unknown = VOLUME_TRANSITION_EVIDENCE_REQUEST_WIRE.replacen(
+        r#"{"authorization_id":"auth_01""#,
+        r#"{"authorization_id":"auth_01","volume_id":"vol_root""#,
+        1,
+    );
+    let error = decode_runtime_volume_transition_evidence_request(unknown.as_bytes()).unwrap_err();
+    assert_eq!(malformed(&error).0.as_str(), "/volume_id");
+    assert_eq!(malformed(&error).1, MalformedProblem::UnknownField);
+
+    let duplicate = VOLUME_TRANSITION_EVIDENCE_REQUEST_WIRE.replacen(
+        r#"{"authorization_id":"auth_01""#,
+        r#"{"authorization_id":"auth_01","authorization_id":"auth_01""#,
+        1,
+    );
+    let error =
+        decode_runtime_volume_transition_evidence_request(duplicate.as_bytes()).unwrap_err();
+    assert_eq!(malformed(&error).0.as_str(), "/authorization_id");
+    assert_eq!(malformed(&error).1, MalformedProblem::DuplicateField);
+
+    let mut success: serde_json::Value =
+        serde_json::from_str(CONSUMED_TAKEOVER_EVIDENCE_SUCCESS_WIRE).unwrap();
+    success["authorization_id"] = "auth_other".into();
+    let error =
+        decode_runtime_volume_transition_evidence_success(&serde_json::to_vec(&success).unwrap())
+            .unwrap_err();
+    assert_eq!(malformed(&error).1, MalformedProblem::InvalidValue);
+
+    let mut success: serde_json::Value =
+        serde_json::from_str(CONSUMED_TAKEOVER_EVIDENCE_SUCCESS_WIRE).unwrap();
+    let primary = success["authorization"].clone();
+    success["direct_successor_authorization"] = primary;
+    let error =
+        decode_runtime_volume_transition_evidence_success(&serde_json::to_vec(&success).unwrap())
+            .unwrap_err();
+    assert_eq!(
+        malformed(&error).0.as_str(),
+        "/direct_successor_authorization"
+    );
+    assert_eq!(malformed(&error).1, MalformedProblem::InvalidValue);
+}
+
+#[test]
 fn a20_fixed_wire_vectors_round_trip_exactly() {
     use sha2::{Digest, Sha256};
 
@@ -1615,6 +1713,24 @@ fn all_wire_byte_boundaries_and_shared_schema_initialization_are_safe() {
             CONTRACT_ERROR_MAX_WIRE_BYTES,
             CONTRACT_ERROR_WIRE.as_bytes().to_vec(),
             |bytes| decode_contract_error(bytes).map(|_| ()),
+        ),
+        (
+            ContractName::RuntimeVolumeTransitionEvidenceRequest,
+            RUNTIME_VOLUME_TRANSITION_EVIDENCE_REQUEST_MAX_WIRE_BYTES,
+            VOLUME_TRANSITION_EVIDENCE_REQUEST_WIRE.as_bytes().to_vec(),
+            |bytes| decode_runtime_volume_transition_evidence_request(bytes).map(|_| ()),
+        ),
+        (
+            ContractName::RuntimeVolumeTransitionEvidenceSuccess,
+            RUNTIME_VOLUME_TRANSITION_EVIDENCE_SUCCESS_MAX_WIRE_BYTES,
+            CONSUMED_TAKEOVER_EVIDENCE_SUCCESS_WIRE.as_bytes().to_vec(),
+            |bytes| decode_runtime_volume_transition_evidence_success(bytes).map(|_| ()),
+        ),
+        (
+            ContractName::RuntimeVolumeTransitionError,
+            RUNTIME_VOLUME_TRANSITION_ERROR_MAX_WIRE_BYTES,
+            AUTHORIZATION_EVIDENCE_UNAVAILABLE_WIRE.as_bytes().to_vec(),
+            |bytes| decode_runtime_volume_transition_error(bytes).map(|_| ()),
         ),
     ];
 

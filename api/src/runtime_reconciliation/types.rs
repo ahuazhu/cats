@@ -1156,6 +1156,336 @@ pub struct RemoteHead {
     pub root_object_id: Option<AsciiText>,
 }
 
+/// The Volume Authority uses the same closed durability literals as runtime
+/// intent and physical observation.  Keeping one wire type prevents the A22
+/// transport from inventing a second spelling of the storage contract.
+pub type VolumeDurability = Durability;
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+pub enum VolumeAdminState {
+    Active,
+    Deleting { delete_id: Id },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct VolumeRecord {
+    pub volume_id: Id,
+    pub size_bytes: u64,
+    pub durability: VolumeDurability,
+    pub admin_state: VolumeAdminState,
+    pub head: RemoteHead,
+    pub lease_owner: Option<Id>,
+    pub lease_epoch: FenceEpoch,
+    pub lease_expires_at: Option<UnixMillis>,
+    pub last_transition: Option<LastVolumeTransition>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+pub enum LastVolumeTransition {
+    NormalAcquire {
+        request: NormalAcquireRequest,
+        result: NormalAcquireResult,
+    },
+    Release {
+        request: ReleaseRequest,
+        result: ReleaseResult,
+    },
+    Takeover {
+        authorization_id: Id,
+    },
+    BeginDelete {
+        request: BeginDeleteRequest,
+        result: BeginDeleteResult,
+    },
+    BeginDisposableDelete {
+        authorization_id: Id,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct NormalAcquireRequest {
+    pub volume_id: Id,
+    pub transition_id: RandomId128,
+    pub attachment_id: Id,
+    pub expected_unowned_epoch: FenceEpoch,
+    pub desired_revision: Revision,
+    pub placement_epoch: Epoch,
+    pub lease_duration_ms: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct NormalAcquireResult {
+    pub volume_id: Id,
+    pub transition_id: RandomId128,
+    pub attachment_id: Id,
+    pub resulting_epoch: FenceEpoch,
+    pub resulting_head: RemoteHead,
+    pub lease_expires_at: UnixMillis,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ReleaseRequest {
+    pub volume_id: Id,
+    pub transition_id: RandomId128,
+    pub attachment_id: Id,
+    pub expected_epoch: FenceEpoch,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ReleaseResult {
+    pub volume_id: Id,
+    pub transition_id: RandomId128,
+    pub released_attachment_id: Id,
+    pub resulting_epoch: FenceEpoch,
+    pub resulting_head: RemoteHead,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct VolumeTakeoverAuthorization {
+    pub authorization_id: Id,
+    pub authorized_node_id: Id,
+    pub host_fence_event_id: Id,
+    pub volume_id: Id,
+    pub expected_attachment_id: Id,
+    pub expected_epoch: FenceEpoch,
+    pub new_attachment_id: Id,
+    pub desired_revision: Revision,
+    pub new_placement_epoch: Epoch,
+    pub lease_duration_ms: u64,
+    pub not_after: UnixMillis,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct TakeoverConsumedReceipt {
+    pub authorization_id: Id,
+    pub host_fence_event_id: Id,
+    pub volume_id: Id,
+    pub new_attachment_id: Id,
+    pub resulting_epoch: FenceEpoch,
+    pub resulting_head: RemoteHead,
+    pub consumed_at: UnixMillis,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct BeginDeleteRequest {
+    pub delete_id: Id,
+    pub disk_id: Id,
+    pub volume_id: Id,
+    pub expected_unowned_epoch: FenceEpoch,
+    pub expected_head: RemoteHead,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct BeginDeleteResult {
+    pub delete_id: Id,
+    pub disk_id: Id,
+    pub volume_id: Id,
+    pub resulting_epoch: FenceEpoch,
+    pub resulting_head: RemoteHead,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct DisposableRootDeleteAuthorization {
+    pub authorization_id: Id,
+    pub authorized_node_id: Id,
+    pub delete_id: Id,
+    pub disk_id: Id,
+    pub volume_id: Id,
+    pub cat_id: Id,
+    pub desired_revision: Revision,
+    pub placement_epoch: Epoch,
+    pub expected_attachment_id: Id,
+    pub expected_epoch: FenceEpoch,
+    pub expected_head: RemoteHead,
+    pub isolation_basis: DisposableDeleteIsolationBasis,
+    pub not_after: UnixMillis,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+pub enum DisposableDeleteIsolationBasis {
+    RuntimeStopped {
+        node_id: Id,
+        agent_session_epoch: Epoch,
+        runtime_incarnation: RandomId128,
+        observation_id: RandomId128,
+    },
+    HostFenceEvent {
+        event_id: Id,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct BeginDisposableDeleteConsumedReceipt {
+    pub authorization_id: Id,
+    pub volume_id: Id,
+    pub disk_id: Id,
+    pub cat_id: Id,
+    pub delete_id: Id,
+    pub prior_attachment_id: Id,
+    pub resulting_epoch: FenceEpoch,
+    pub resulting_head: RemoteHead,
+    pub consumed_at: UnixMillis,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+pub enum VolumeAuthorization {
+    Takeover(VolumeTakeoverAuthorization),
+    DisposableRootDelete(DisposableRootDeleteAuthorization),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+pub enum AuthorizationConsumedReceipt {
+    Takeover(TakeoverConsumedReceipt),
+    BeginDisposableDelete(BeginDisposableDeleteConsumedReceipt),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(
+    tag = "kind",
+    content = "receipt",
+    rename_all = "snake_case",
+    deny_unknown_fields
+)]
+pub enum AuthorizationState {
+    Unconsumed,
+    Consumed(Box<AuthorizationConsumedReceipt>),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AuthorizationRecord {
+    pub authorization: VolumeAuthorization,
+    pub state: AuthorizationState,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+pub enum DeleteCompletionReceipt {
+    Normal {
+        request: BeginDeleteRequest,
+        deleting_epoch: FenceEpoch,
+        deleting_head: RemoteHead,
+        completed_at: UnixMillis,
+    },
+    DisposableRoot {
+        disk_id: Id,
+        volume_id: Id,
+        delete_id: Id,
+        authorization_id: Id,
+        prior_attachment_id: Id,
+        deleting_epoch: FenceEpoch,
+        deleting_head: RemoteHead,
+        completed_at: UnixMillis,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RuntimeVolumeTransitionEvidenceRequest {
+    pub version: ContractVersion,
+    pub session: SessionBinding,
+    pub authorization_id: Id,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RuntimeVolumeTransitionEvidenceSuccess {
+    pub version: ContractVersion,
+    pub session: SessionBinding,
+    pub authorization_id: Id,
+    pub authorization: AuthorizationRecord,
+    pub current_volume: Option<VolumeRecord>,
+    pub delete_completion: Option<DeleteCompletionReceipt>,
+    pub direct_successor_authorization: Option<AuthorizationRecord>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RuntimeVolumeTransitionError {
+    pub version: ContractVersion,
+    pub error: Box<RuntimeVolumeTransitionErrorDetail>,
+    pub message: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "code", rename_all = "snake_case", deny_unknown_fields)]
+pub enum RuntimeVolumeTransitionErrorDetail {
+    AuthenticationFailed,
+    IdentityNotEligible,
+    HttpRequestRejected {
+        problem: RuntimeVolumeTransitionHttpProblem,
+    },
+    ContractError {
+        contract_error: ContractError,
+    },
+    TransitionPreconditionFailed {
+        cat_id: Id,
+        problem: RuntimeVolumeTransitionPreconditionProblem,
+    },
+    VolumeAuthorityRejected {
+        volume_id: Id,
+        reason: RuntimeVolumeAuthorityRejection,
+    },
+    VolumeAuthorizationRejected {
+        authorization_id: Id,
+        reason: RuntimeVolumeAuthorizationRejection,
+    },
+    AuthorizationEvidenceUnavailable {
+        authorization_id: Id,
+    },
+    NodeRequestInFlight,
+    TemporarilyUnavailable,
+    Internal,
+}
+
+pub type RuntimeVolumeTransitionHttpProblem = RuntimeSpineHttpProblem;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RuntimeVolumeTransitionPreconditionProblem {
+    InventorySessionReplaced,
+    InventoryStale,
+    VolumeIntentMismatch,
+    CleanupEvidenceMismatch,
+    AuthorizationBranchConflict,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RuntimeVolumeAuthorityRejection {
+    OtherWriter,
+    Fenced,
+    StaleTransition,
+    InvalidLeaseDuration,
+    EpochExhausted,
+    AdminBusy,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RuntimeVolumeAuthorizationRejection {
+    InvalidAuthorization,
+    InvalidLeaseDuration,
+    SnapshotInUse,
+    EpochExhausted,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ProvisionRootImageRequest {
@@ -2260,6 +2590,11 @@ pub enum ContractName {
     NodeObservation,
     ObservationAcceptance,
     RuntimeSpineError,
+    RuntimeVolumeTransitionRequest,
+    RuntimeVolumeTransitionSuccess,
+    RuntimeVolumeTransitionEvidenceRequest,
+    RuntimeVolumeTransitionEvidenceSuccess,
+    RuntimeVolumeTransitionError,
     Operation,
     ContractError,
 }

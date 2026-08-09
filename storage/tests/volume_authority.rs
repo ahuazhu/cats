@@ -101,6 +101,7 @@ fn takeover_authorization(volume: &VolumeRecord) -> AuthorizationRecord {
     AuthorizationRecord {
         authorization: VolumeAuthorization::Takeover(VolumeTakeoverAuthorization {
             authorization_id: id("takeover-auth-1"),
+            authorized_node_id: id("node-new"),
             host_fence_event_id: id("fence-event-1"),
             volume_id: volume.volume_id.clone(),
             expected_attachment_id: volume.lease_owner.clone().unwrap(),
@@ -119,10 +120,15 @@ fn disposable_authorization(
     volume: &VolumeRecord,
     basis: DisposableDeleteIsolationBasis,
 ) -> AuthorizationRecord {
+    let authorized_node_id = match &basis {
+        DisposableDeleteIsolationBasis::RuntimeStopped { node_id, .. } => node_id.clone(),
+        DisposableDeleteIsolationBasis::HostFenceEvent { .. } => id("node-old"),
+    };
     AuthorizationRecord {
         authorization: VolumeAuthorization::DisposableRootDelete(
             DisposableRootDeleteAuthorization {
                 authorization_id: id("delete-auth-1"),
+                authorized_node_id,
                 delete_id: id("delete-1"),
                 disk_id: id("disk-1"),
                 volume_id: volume.volume_id.clone(),
@@ -1088,4 +1094,190 @@ fn volume_projection_is_derived_from_the_validated_authority_record() {
     assert_eq!(projection.transition_desired_revision, Some(revision(11)));
     assert_eq!(projection.transition_placement_epoch, Some(epoch(3)));
     assert_eq!(projection.transition_lease_duration_ms, Some(5_000));
+}
+
+#[test]
+fn evidence_bundle_accepts_takeover_response_loss_and_closed_later_states() {
+    let owned = acquired_volume();
+    let event = host_fence_event(HostFenceEventState::Active);
+    let authorization = takeover_authorization(&owned);
+    let (taken_over, consumed, _) = consume_takeover(
+        &owned,
+        &event,
+        &authorization,
+        &id("takeover-auth-1"),
+        time(20_000),
+    )
+    .unwrap();
+    validate_volume_transition_evidence_bundle(&consumed, Some(&taken_over), None, None).unwrap();
+
+    let (renewed, _) = renew_lease(
+        &taken_over,
+        &RenewLeaseRequest {
+            volume_id: taken_over.volume_id.clone(),
+            attachment_id: id("attachment-new"),
+            expected_epoch: taken_over.lease_epoch,
+            lease_duration_ms: 5_000,
+        },
+        time(25_000),
+    )
+    .unwrap();
+    let (published, _) = compare_and_swap_head(
+        &renewed,
+        &VolumeHeadCasRequest {
+            volume_id: renewed.volume_id.clone(),
+            attachment_id: id("attachment-new"),
+            expected_epoch: renewed.lease_epoch,
+            expected_size_bytes: renewed.size_bytes,
+            expected_head: renewed.head.clone(),
+            new_head: head(5),
+        },
+    )
+    .unwrap();
+    validate_volume_transition_evidence_bundle(&consumed, Some(&published), None, None).unwrap();
+
+    let (released, _) = release(
+        &published,
+        &ReleaseRequest {
+            volume_id: published.volume_id.clone(),
+            transition_id: random_id(91),
+            attachment_id: id("attachment-new"),
+            expected_epoch: published.lease_epoch,
+        },
+    )
+    .unwrap();
+    validate_volume_transition_evidence_bundle(&consumed, Some(&released), None, None).unwrap();
+}
+
+#[test]
+fn evidence_bundle_requires_the_exact_direct_successor_authorization() {
+    let owned = acquired_volume();
+    let event = host_fence_event(HostFenceEventState::Active);
+    let primary = takeover_authorization(&owned);
+    let (first_volume, consumed_primary, _) = consume_takeover(
+        &owned,
+        &event,
+        &primary,
+        &id("takeover-auth-1"),
+        time(20_000),
+    )
+    .unwrap();
+
+    let mut successor = takeover_authorization(&first_volume);
+    let VolumeAuthorization::Takeover(payload) = &mut successor.authorization else {
+        unreachable!()
+    };
+    payload.authorization_id = id("takeover-auth-2");
+    payload.expected_attachment_id = id("attachment-new");
+    payload.new_attachment_id = id("attachment-newer");
+    payload.authorized_node_id = id("node-newer");
+    let (second_volume, consumed_successor, _) = consume_takeover(
+        &first_volume,
+        &event,
+        &successor,
+        &id("takeover-auth-2"),
+        time(21_000),
+    )
+    .unwrap();
+
+    validate_volume_transition_evidence_bundle(
+        &consumed_primary,
+        Some(&second_volume),
+        None,
+        Some(&consumed_successor),
+    )
+    .unwrap();
+    assert_eq!(
+        validate_volume_transition_evidence_bundle(
+            &consumed_primary,
+            Some(&second_volume),
+            None,
+            None,
+        ),
+        Err(AuthorityError::BackendUnknown)
+    );
+
+    let mut regressed = consumed_successor.clone();
+    let AuthorizationState::Consumed(receipt) = &mut regressed.state else {
+        unreachable!()
+    };
+    let AuthorizationConsumedReceipt::Takeover(receipt) = receipt.as_mut() else {
+        unreachable!()
+    };
+    receipt.resulting_head = empty_head();
+    assert_eq!(
+        validate_volume_transition_evidence_bundle(
+            &consumed_primary,
+            Some(&second_volume),
+            None,
+            Some(&regressed),
+        ),
+        Err(AuthorityError::BackendUnknown)
+    );
+
+    let mut wrong_volume = consumed_successor;
+    let VolumeAuthorization::Takeover(payload) = &mut wrong_volume.authorization else {
+        unreachable!()
+    };
+    payload.volume_id = id("volume-other");
+    assert_eq!(
+        validate_volume_transition_evidence_bundle(
+            &consumed_primary,
+            Some(&second_volume),
+            None,
+            Some(&wrong_volume),
+        ),
+        Err(AuthorityError::BackendUnknown)
+    );
+}
+
+#[test]
+fn evidence_bundle_closes_disposable_delete_completion_and_rejects_split_state() {
+    let owned = acquired_volume();
+    let event = host_fence_event(HostFenceEventState::Active);
+    let authorization = disposable_authorization(
+        &owned,
+        DisposableDeleteIsolationBasis::HostFenceEvent {
+            event_id: event.event_id.clone(),
+        },
+    );
+    let (deleting, consumed, _) = consume_disposable_root_delete(
+        &owned,
+        Some(&event),
+        &authorization,
+        &id("delete-auth-1"),
+        time(20_000),
+    )
+    .unwrap();
+    let completion = complete_disposable_root_delete(&deleting, &consumed, time(40_000)).unwrap();
+    validate_volume_transition_evidence_bundle(&consumed, None, Some(&completion), None).unwrap();
+    assert_eq!(
+        validate_volume_transition_evidence_bundle(
+            &consumed,
+            Some(&deleting),
+            Some(&completion),
+            None,
+        ),
+        Err(AuthorityError::BackendUnknown)
+    );
+
+    let mut time_regressed = completion.clone();
+    let DeleteCompletionReceipt::DisposableRoot { completed_at, .. } = &mut time_regressed else {
+        unreachable!()
+    };
+    *completed_at = time(19_999);
+    assert_eq!(
+        validate_volume_transition_evidence_bundle(&consumed, None, Some(&time_regressed), None,),
+        Err(AuthorityError::BackendUnknown)
+    );
+
+    let mut corrupt = completion;
+    let DeleteCompletionReceipt::DisposableRoot { deleting_epoch, .. } = &mut corrupt else {
+        unreachable!()
+    };
+    *deleting_epoch = fence_epoch(deleting_epoch.get() + 1);
+    assert_eq!(
+        validate_volume_transition_evidence_bundle(&consumed, None, Some(&corrupt), None),
+        Err(AuthorityError::BackendUnknown)
+    );
 }

@@ -1,55 +1,66 @@
-//! Host-fence-backed takeover transaction.
+//! Transaction-local Host-fence-backed takeover authority.
+//!
+//! The authenticated A22 composition owns the transaction and must first lock
+//! and validate `NodeIdentity -> active credential lineage -> AgentSession ->
+//! current runtime context`. Keeping takeover transaction-local prevents an
+//! unauthenticated Store convenience method from bypassing that prefix.
 
 use cats_storage::authority::{
-    consume_takeover, replay_consumed_takeover, AuthorityError, TakeoverResult, VolumeAuthorization,
+    consume_takeover, replay_consumed_takeover, AuthorityError, Id, TakeoverResult,
+    VolumeAuthorization,
 };
+use postgres::Transaction;
 
 use super::rows::{
     authorization_hint, database_now, load_authorization_for_update, load_event_for_update,
     load_volume_for_update, update_authorization, update_volume,
 };
-use crate::store::Store;
+use crate::store::transaction::AuthorityTxResult;
 
-impl Store {
-    /// Consumes one server-side takeover authorization.
-    ///
-    /// The transaction locks `HostFenceEvent -> AuthorizationRecord ->
-    /// VolumeRecord`. A consumed authorization replays its immutable receipt
-    /// without requiring the volume to remain in the direct takeover state.
-    pub fn consume_volume_takeover(
-        &self,
-        authorization_id: &cats_storage::authority::Id,
-    ) -> crate::store::Result<TakeoverResult> {
-        self.authority_transaction(|transaction| {
-            // This is a non-locking routing hint. The closed row is decoded and
-            // rechecked after the event lock and before any mutation.
-            let (event_hint, volume_hint) = authorization_hint(transaction, authorization_id)?
-                .ok_or(AuthorityError::InvalidAuthorization)?;
-            let event_id = event_hint.ok_or(AuthorityError::InvalidAuthorization)?;
+/// Consumes one server-side takeover authorization after the caller has
+/// completed the authenticated runtime-context prefix in this same
+/// transaction.
+///
+/// The remaining lock order is `HostFenceEvent -> AuthorizationRecord ->
+/// VolumeRecord`. A consumed authorization replays its immutable receipt
+/// without requiring the Volume to remain in the direct takeover state.
+#[allow(dead_code, reason = "consumed by the authenticated A22 mutation route")]
+pub(super) fn consume_volume_takeover_in(
+    transaction: &mut Transaction<'_>,
+    authorization_id: &Id,
+    authorized_node_id: &Id,
+) -> AuthorityTxResult<TakeoverResult> {
+    // This is a non-locking routing hint read only after the authenticated
+    // NodeIdentity coordination lock. The closed row is decoded and rechecked
+    // after the event lock and before any mutation.
+    let (event_hint, volume_hint) = authorization_hint(transaction, authorization_id)?
+        .ok_or(AuthorityError::InvalidAuthorization)?;
+    let event_id = event_hint.ok_or(AuthorityError::InvalidAuthorization)?;
 
-            let event = load_event_for_update(transaction, &event_id)?
-                .ok_or(AuthorityError::BackendUnknown)?;
-            let authorization = load_authorization_for_update(transaction, authorization_id)?
-                .ok_or(AuthorityError::InvalidAuthorization)?;
-            let VolumeAuthorization::Takeover(payload) = &authorization.authorization else {
-                return Err(AuthorityError::InvalidAuthorization.into());
-            };
-            if payload.host_fence_event_id != event.event_id || payload.volume_id != volume_hint {
-                return Err(AuthorityError::BackendUnknown.into());
-            }
-
-            if let Some(result) = replay_consumed_takeover(&authorization, authorization_id)? {
-                return Ok(result);
-            }
-
-            let volume = load_volume_for_update(transaction, &payload.volume_id)?
-                .ok_or(AuthorityError::InvalidAuthorization)?;
-            let db_now = database_now(transaction)?;
-            let (updated_volume, updated_authorization, result) =
-                consume_takeover(&volume, &event, &authorization, authorization_id, db_now)?;
-            update_volume(transaction, &updated_volume)?;
-            update_authorization(transaction, &authorization, &updated_authorization)?;
-            Ok(result)
-        })
+    let event =
+        load_event_for_update(transaction, &event_id)?.ok_or(AuthorityError::BackendUnknown)?;
+    let authorization = load_authorization_for_update(transaction, authorization_id)?
+        .ok_or(AuthorityError::InvalidAuthorization)?;
+    let VolumeAuthorization::Takeover(payload) = &authorization.authorization else {
+        return Err(AuthorityError::InvalidAuthorization.into());
+    };
+    if payload.host_fence_event_id != event.event_id || payload.volume_id != volume_hint {
+        return Err(AuthorityError::BackendUnknown.into());
     }
+    if &payload.authorized_node_id != authorized_node_id {
+        return Err(AuthorityError::InvalidAuthorization.into());
+    }
+
+    if let Some(result) = replay_consumed_takeover(&authorization, authorization_id)? {
+        return Ok(result);
+    }
+
+    let volume = load_volume_for_update(transaction, &payload.volume_id)?
+        .ok_or(AuthorityError::InvalidAuthorization)?;
+    let db_now = database_now(transaction)?;
+    let (updated_volume, updated_authorization, result) =
+        consume_takeover(&volume, &event, &authorization, authorization_id, db_now)?;
+    update_volume(transaction, &updated_volume)?;
+    update_authorization(transaction, &authorization, &updated_authorization)?;
+    Ok(result)
 }

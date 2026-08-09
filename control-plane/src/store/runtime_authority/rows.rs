@@ -27,7 +27,7 @@ pub(super) const EVENT_COLUMNS: &str = "
     fence_attempt_id, isolation_state, observed_at, state, destroyed_at";
 
 pub(super) const AUTHORIZATION_COLUMNS: &str = "
-    authorization_id, record::text AS record_json, kind,
+    authorization_id, record::text AS record_json, kind, authorized_node_id,
     host_fence_event_id, volume_id, state, desired_revision,
     placement_epoch, lease_duration_ms, not_after, consumed_at";
 
@@ -105,6 +105,18 @@ pub(super) fn load_volume_for_update(
     volume_id: &Id,
 ) -> AuthorityTxResult<Option<VolumeRecord>> {
     let sql = format!("SELECT {VOLUME_COLUMNS} FROM volume_records WHERE volume_id=$1 FOR UPDATE");
+    transaction
+        .query_opt(&sql, &[&volume_id.as_str()])?
+        .map(|row| decode_volume(&row))
+        .transpose()
+}
+
+#[allow(dead_code, reason = "consumed by the A22 authenticated evidence route")]
+pub(super) fn load_volume_unlocked(
+    transaction: &mut Transaction<'_>,
+    volume_id: &Id,
+) -> AuthorityTxResult<Option<VolumeRecord>> {
+    let sql = format!("SELECT {VOLUME_COLUMNS} FROM volume_records WHERE volume_id=$1");
     transaction
         .query_opt(&sql, &[&volume_id.as_str()])?
         .map(|row| decode_volume(&row))
@@ -420,6 +432,7 @@ fn decode_event(row: &Row) -> AuthorityTxResult<HostFenceEvent> {
 struct AuthorizationProjection {
     authorization_id: String,
     kind: &'static str,
+    authorized_node_id: String,
     host_fence_event_id: Option<String>,
     volume_id: String,
     state: &'static str,
@@ -448,6 +461,7 @@ impl AuthorizationProjection {
         let (
             authorization_id,
             kind,
+            authorized_node_id,
             host_fence_event_id,
             volume_id,
             desired_revision,
@@ -458,6 +472,7 @@ impl AuthorizationProjection {
             VolumeAuthorization::Takeover(authorization) => (
                 authorization.authorization_id.to_string(),
                 "takeover",
+                authorization.authorized_node_id.to_string(),
                 Some(authorization.host_fence_event_id.to_string()),
                 authorization.volume_id.to_string(),
                 authorization.desired_revision,
@@ -468,6 +483,7 @@ impl AuthorizationProjection {
             VolumeAuthorization::DisposableRootDelete(authorization) => (
                 authorization.authorization_id.to_string(),
                 "disposable_root_delete",
+                authorization.authorized_node_id.to_string(),
                 match &authorization.isolation_basis {
                     DisposableDeleteIsolationBasis::RuntimeStopped { .. } => None,
                     DisposableDeleteIsolationBasis::HostFenceEvent { event_id } => {
@@ -484,6 +500,7 @@ impl AuthorizationProjection {
         Ok(Self {
             authorization_id,
             kind,
+            authorized_node_id,
             host_fence_event_id,
             volume_id,
             state,
@@ -502,6 +519,7 @@ impl AuthorizationProjection {
                 row.try_get("kind")?,
                 &["takeover", "disposable_root_delete"],
             )?,
+            authorized_node_id: row.try_get("authorized_node_id")?,
             host_fence_event_id: row.try_get("host_fence_event_id")?,
             volume_id: row.try_get("volume_id")?,
             state: static_value(row.try_get("state")?, &["unconsumed", "consumed"])?,
@@ -542,6 +560,42 @@ pub(super) fn load_authorization_for_update(
     let sql = format!(
         "SELECT {AUTHORIZATION_COLUMNS} FROM volume_authorizations
           WHERE authorization_id=$1 FOR UPDATE"
+    );
+    transaction
+        .query_opt(&sql, &[&authorization_id.as_str()])?
+        .map(|row| decode_authorization(&row))
+        .transpose()
+}
+
+/// Loads the primary evidence row through the one non-enumerating access
+/// predicate. A missing id and an id owned by another Node are intentionally
+/// indistinguishable, and neither path decodes the protected JSON payload.
+#[allow(dead_code, reason = "consumed by the A22 authenticated evidence route")]
+pub(super) fn load_authorization_for_evidence(
+    transaction: &mut Transaction<'_>,
+    authorization_id: &Id,
+    authorized_node_id: &Id,
+) -> AuthorityTxResult<Option<AuthorizationRecord>> {
+    let sql = format!(
+        "SELECT {AUTHORIZATION_COLUMNS} FROM volume_authorizations
+          WHERE authorization_id=$1 AND authorized_node_id=$2"
+    );
+    transaction
+        .query_opt(
+            &sql,
+            &[&authorization_id.as_str(), &authorized_node_id.as_str()],
+        )?
+        .map(|row| decode_authorization(&row))
+        .transpose()
+}
+
+#[allow(dead_code, reason = "consumed by the A22 authenticated evidence route")]
+pub(super) fn load_authorization_unlocked(
+    transaction: &mut Transaction<'_>,
+    authorization_id: &Id,
+) -> AuthorityTxResult<Option<AuthorizationRecord>> {
+    let sql = format!(
+        "SELECT {AUTHORIZATION_COLUMNS} FROM volume_authorizations WHERE authorization_id=$1"
     );
     transaction
         .query_opt(&sql, &[&authorization_id.as_str()])?
@@ -594,15 +648,17 @@ pub(super) fn insert_authorization(
     let consumed_at = optional_to_pg(projection.consumed_at)?;
     let inserted = transaction.execute(
         "INSERT INTO volume_authorizations (
-            authorization_id, record, kind, host_fence_event_id, volume_id,
+            authorization_id, record, kind, authorized_node_id,
+            host_fence_event_id, volume_id,
             state, desired_revision, placement_epoch, lease_duration_ms,
             not_after, consumed_at
-         ) VALUES ($1, $2::TEXT::jsonb, $3, $4, $5, $6, $7, $8, $9, $10, $11)
+         ) VALUES ($1, $2::TEXT::jsonb, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
          ON CONFLICT (authorization_id) DO NOTHING",
         &[
             &projection.authorization_id,
             &record_json,
             &projection.kind,
+            &projection.authorized_node_id,
             &projection.host_fence_event_id,
             &projection.volume_id,
             &projection.state,
@@ -649,14 +705,16 @@ pub(super) fn update_authorization(
     let consumed_at = optional_to_pg(projection.consumed_at)?;
     let changed = transaction.execute(
         "UPDATE volume_authorizations SET
-            record=$2::TEXT::jsonb, kind=$3, host_fence_event_id=$4, volume_id=$5,
-            state=$6, desired_revision=$7, placement_epoch=$8,
-            lease_duration_ms=$9, not_after=$10, consumed_at=$11
-          WHERE authorization_id=$1 AND record=$12::TEXT::jsonb",
+            record=$2::TEXT::jsonb, kind=$3, authorized_node_id=$4,
+            host_fence_event_id=$5, volume_id=$6, state=$7,
+            desired_revision=$8, placement_epoch=$9,
+            lease_duration_ms=$10, not_after=$11, consumed_at=$12
+          WHERE authorization_id=$1 AND record=$13::TEXT::jsonb",
         &[
             &projection.authorization_id,
             &record_json,
             &projection.kind,
+            &projection.authorized_node_id,
             &projection.host_fence_event_id,
             &projection.volume_id,
             &projection.state,
@@ -768,6 +826,22 @@ pub(super) fn load_delete_completion_for_update(
         .query_opt(&sql, &[&delete_id.as_str()])?
         .map(|row| decode_delete_completion(&row))
         .transpose()
+}
+
+#[allow(dead_code, reason = "consumed by the A22 authenticated evidence route")]
+pub(super) fn load_delete_completions_by_volume(
+    transaction: &mut Transaction<'_>,
+    volume_id: &Id,
+) -> AuthorityTxResult<Vec<DeleteCompletionReceipt>> {
+    let sql = format!(
+        "SELECT {DELETE_COMPLETION_COLUMNS} FROM delete_completion_receipts
+          WHERE volume_id=$1 ORDER BY delete_id LIMIT 2"
+    );
+    transaction
+        .query(&sql, &[&volume_id.as_str()])?
+        .iter()
+        .map(decode_delete_completion)
+        .collect()
 }
 
 // The A12 sweeper is out of scope; F1 owns only this exact row codec and

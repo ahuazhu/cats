@@ -23,6 +23,9 @@ pub const NODE_CLEANUP_CHECKPOINT_MAX_WIRE_BYTES: usize = 65_536;
 pub const NODE_OBSERVATION_MAX_WIRE_BYTES: usize = 8_388_608;
 pub const OBSERVATION_ACCEPTANCE_MAX_WIRE_BYTES: usize = 16_384;
 pub const RUNTIME_SPINE_ERROR_MAX_WIRE_BYTES: usize = 20_480;
+pub const RUNTIME_VOLUME_TRANSITION_EVIDENCE_REQUEST_MAX_WIRE_BYTES: usize = 4_096;
+pub const RUNTIME_VOLUME_TRANSITION_EVIDENCE_SUCCESS_MAX_WIRE_BYTES: usize = 32_768;
+pub const RUNTIME_VOLUME_TRANSITION_ERROR_MAX_WIRE_BYTES: usize = 20_480;
 pub const OPERATION_MAX_WIRE_BYTES: usize = 65_536;
 pub const CONTRACT_ERROR_MAX_WIRE_BYTES: usize = 16_384;
 pub const PROVISION_ROOT_IMAGE_REQUEST_MAX_WIRE_BYTES: usize = 4_096;
@@ -2031,6 +2034,401 @@ fn remote_head_schema() -> Schema {
     ])
 }
 
+fn normal_acquire_request_schema() -> Schema {
+    object(vec![
+        field("volume_id", id()),
+        field("transition_id", random_id()),
+        field("attachment_id", id()),
+        field("expected_unowned_epoch", wire_u64()),
+        field("desired_revision", revision()),
+        field("placement_epoch", epoch()),
+        field("lease_duration_ms", number(1, MAX_WIRE_INTEGER)),
+    ])
+}
+
+fn normal_acquire_result_schema() -> Schema {
+    object(vec![
+        field("volume_id", id()),
+        field("transition_id", random_id()),
+        field("attachment_id", id()),
+        field("resulting_epoch", wire_u64()),
+        field("resulting_head", remote_head_schema()),
+        field("lease_expires_at", wire_u64()),
+    ])
+}
+
+fn release_request_schema() -> Schema {
+    object(vec![
+        field("volume_id", id()),
+        field("transition_id", random_id()),
+        field("attachment_id", id()),
+        field("expected_epoch", wire_u64()),
+    ])
+}
+
+fn release_result_schema() -> Schema {
+    object(vec![
+        field("volume_id", id()),
+        field("transition_id", random_id()),
+        field("released_attachment_id", id()),
+        field("resulting_epoch", wire_u64()),
+        field("resulting_head", remote_head_schema()),
+    ])
+}
+
+fn begin_delete_request_schema() -> Schema {
+    object(vec![
+        field("delete_id", id()),
+        field("disk_id", id()),
+        field("volume_id", id()),
+        field("expected_unowned_epoch", wire_u64()),
+        field("expected_head", remote_head_schema()),
+    ])
+}
+
+fn begin_delete_result_schema() -> Schema {
+    object(vec![
+        field("delete_id", id()),
+        field("disk_id", id()),
+        field("volume_id", id()),
+        field("resulting_epoch", wire_u64()),
+        field("resulting_head", remote_head_schema()),
+    ])
+}
+
+fn volume_admin_state_schema() -> Schema {
+    union(
+        "kind",
+        vec![
+            variant("active", vec![]),
+            variant("deleting", vec![field("delete_id", id())]),
+        ],
+    )
+}
+
+fn last_volume_transition_schema() -> Schema {
+    union(
+        "kind",
+        vec![
+            variant(
+                "normal_acquire",
+                vec![
+                    field("request", normal_acquire_request_schema()),
+                    field("result", normal_acquire_result_schema()),
+                ],
+            ),
+            variant(
+                "release",
+                vec![
+                    field("request", release_request_schema()),
+                    field("result", release_result_schema()),
+                ],
+            ),
+            variant("takeover", vec![field("authorization_id", id())]),
+            variant(
+                "begin_delete",
+                vec![
+                    field("request", begin_delete_request_schema()),
+                    field("result", begin_delete_result_schema()),
+                ],
+            ),
+            variant(
+                "begin_disposable_delete",
+                vec![field("authorization_id", id())],
+            ),
+        ],
+    )
+}
+
+fn volume_record_schema() -> Schema {
+    object(vec![
+        field("volume_id", id()),
+        field("size_bytes", number(1, MAX_WIRE_INTEGER)),
+        field("durability", closed(&["strict", "relaxed"])),
+        field("admin_state", volume_admin_state_schema()),
+        field("head", remote_head_schema()),
+        field("lease_owner", nullable(id())),
+        field("lease_epoch", wire_u64()),
+        field("lease_expires_at", nullable(wire_u64())),
+        field("last_transition", nullable(last_volume_transition_schema())),
+    ])
+}
+
+fn takeover_authorization_fields() -> Vec<Field> {
+    vec![
+        field("authorization_id", id()),
+        field("authorized_node_id", id()),
+        field("host_fence_event_id", id()),
+        field("volume_id", id()),
+        field("expected_attachment_id", id()),
+        field("expected_epoch", wire_u64()),
+        field("new_attachment_id", id()),
+        field("desired_revision", revision()),
+        field("new_placement_epoch", epoch()),
+        field("lease_duration_ms", number(1, MAX_WIRE_INTEGER)),
+        field("not_after", wire_u64()),
+    ]
+}
+
+fn disposable_delete_isolation_basis_schema() -> Schema {
+    union(
+        "kind",
+        vec![
+            variant(
+                "runtime_stopped",
+                vec![
+                    field("node_id", id()),
+                    field("agent_session_epoch", epoch()),
+                    field("runtime_incarnation", random_id()),
+                    field("observation_id", random_id()),
+                ],
+            ),
+            variant("host_fence_event", vec![field("event_id", id())]),
+        ],
+    )
+}
+
+fn disposable_delete_authorization_fields() -> Vec<Field> {
+    vec![
+        field("authorization_id", id()),
+        field("authorized_node_id", id()),
+        field("delete_id", id()),
+        field("disk_id", id()),
+        field("volume_id", id()),
+        field("cat_id", id()),
+        field("desired_revision", revision()),
+        field("placement_epoch", epoch()),
+        field("expected_attachment_id", id()),
+        field("expected_epoch", wire_u64()),
+        field("expected_head", remote_head_schema()),
+        field(
+            "isolation_basis",
+            disposable_delete_isolation_basis_schema(),
+        ),
+        field("not_after", wire_u64()),
+    ]
+}
+
+fn takeover_consumed_receipt_fields() -> Vec<Field> {
+    vec![
+        field("authorization_id", id()),
+        field("host_fence_event_id", id()),
+        field("volume_id", id()),
+        field("new_attachment_id", id()),
+        field("resulting_epoch", wire_u64()),
+        field("resulting_head", remote_head_schema()),
+        field("consumed_at", wire_u64()),
+    ]
+}
+
+fn disposable_delete_consumed_receipt_fields() -> Vec<Field> {
+    vec![
+        field("authorization_id", id()),
+        field("volume_id", id()),
+        field("disk_id", id()),
+        field("cat_id", id()),
+        field("delete_id", id()),
+        field("prior_attachment_id", id()),
+        field("resulting_epoch", wire_u64()),
+        field("resulting_head", remote_head_schema()),
+        field("consumed_at", wire_u64()),
+    ]
+}
+
+fn volume_authorization_schema() -> Schema {
+    union(
+        "kind",
+        vec![
+            variant("takeover", takeover_authorization_fields()),
+            variant(
+                "disposable_root_delete",
+                disposable_delete_authorization_fields(),
+            ),
+        ],
+    )
+}
+
+fn authorization_consumed_receipt_schema() -> Schema {
+    union(
+        "kind",
+        vec![
+            variant("takeover", takeover_consumed_receipt_fields()),
+            variant(
+                "begin_disposable_delete",
+                disposable_delete_consumed_receipt_fields(),
+            ),
+        ],
+    )
+}
+
+fn authorization_state_schema() -> Schema {
+    union(
+        "kind",
+        vec![
+            variant("unconsumed", vec![]),
+            variant(
+                "consumed",
+                vec![field("receipt", authorization_consumed_receipt_schema())],
+            ),
+        ],
+    )
+}
+
+fn authorization_record_schema() -> Schema {
+    object(vec![
+        field("authorization", volume_authorization_schema()),
+        field("state", authorization_state_schema()),
+    ])
+}
+
+fn delete_completion_receipt_schema() -> Schema {
+    union(
+        "kind",
+        vec![
+            variant(
+                "normal",
+                vec![
+                    field("request", begin_delete_request_schema()),
+                    field("deleting_epoch", wire_u64()),
+                    field("deleting_head", remote_head_schema()),
+                    field("completed_at", wire_u64()),
+                ],
+            ),
+            variant(
+                "disposable_root",
+                vec![
+                    field("disk_id", id()),
+                    field("volume_id", id()),
+                    field("delete_id", id()),
+                    field("authorization_id", id()),
+                    field("prior_attachment_id", id()),
+                    field("deleting_epoch", wire_u64()),
+                    field("deleting_head", remote_head_schema()),
+                    field("completed_at", wire_u64()),
+                ],
+            ),
+        ],
+    )
+}
+
+fn runtime_volume_transition_evidence_request_schema() -> Schema {
+    object(vec![
+        field("version", version()),
+        field("session", session_binding_schema()),
+        field("authorization_id", id()),
+    ])
+}
+
+fn runtime_volume_transition_evidence_success_schema() -> Schema {
+    object(vec![
+        field("version", version()),
+        field("session", session_binding_schema()),
+        field("authorization_id", id()),
+        field("authorization", authorization_record_schema()),
+        field("current_volume", nullable(volume_record_schema())),
+        field(
+            "delete_completion",
+            nullable(delete_completion_receipt_schema()),
+        ),
+        field(
+            "direct_successor_authorization",
+            nullable(authorization_record_schema()),
+        ),
+    ])
+}
+
+fn runtime_volume_transition_error_detail_schema() -> Schema {
+    union(
+        "code",
+        vec![
+            variant("authentication_failed", vec![]),
+            variant("identity_not_eligible", vec![]),
+            variant(
+                "http_request_rejected",
+                vec![field(
+                    "problem",
+                    closed(&[
+                        "method_not_allowed",
+                        "query_not_allowed",
+                        "content_type_not_allowed",
+                        "content_encoding_not_allowed",
+                        "authorization_not_allowed",
+                        "accept_not_allowed",
+                        "semantic_header_not_allowed",
+                    ]),
+                )],
+            ),
+            variant(
+                "contract_error",
+                vec![field("contract_error", contract_error_schema())],
+            ),
+            variant(
+                "transition_precondition_failed",
+                vec![
+                    field("cat_id", id()),
+                    field(
+                        "problem",
+                        closed(&[
+                            "inventory_session_replaced",
+                            "inventory_stale",
+                            "volume_intent_mismatch",
+                            "cleanup_evidence_mismatch",
+                            "authorization_branch_conflict",
+                        ]),
+                    ),
+                ],
+            ),
+            variant(
+                "volume_authority_rejected",
+                vec![
+                    field("volume_id", id()),
+                    field(
+                        "reason",
+                        closed(&[
+                            "other_writer",
+                            "fenced",
+                            "stale_transition",
+                            "invalid_lease_duration",
+                            "epoch_exhausted",
+                            "admin_busy",
+                        ]),
+                    ),
+                ],
+            ),
+            variant(
+                "volume_authorization_rejected",
+                vec![
+                    field("authorization_id", id()),
+                    field(
+                        "reason",
+                        closed(&[
+                            "invalid_authorization",
+                            "invalid_lease_duration",
+                            "snapshot_in_use",
+                            "epoch_exhausted",
+                        ]),
+                    ),
+                ],
+            ),
+            variant(
+                "authorization_evidence_unavailable",
+                vec![field("authorization_id", id())],
+            ),
+            variant("node_request_in_flight", vec![]),
+            variant("temporarily_unavailable", vec![]),
+            variant("internal", vec![]),
+        ],
+    )
+}
+
+fn runtime_volume_transition_error_schema() -> Schema {
+    object(vec![
+        field("version", version()),
+        field("error", runtime_volume_transition_error_detail_schema()),
+        field("message", string(StringRule::Message)),
+    ])
+}
+
 fn provision_root_image_request_schema() -> Schema {
     object(vec![
         field("provision_transition_id", random_id()),
@@ -3312,6 +3710,11 @@ fn contract_name_schema() -> Schema {
         "node_observation",
         "observation_acceptance",
         "runtime_spine_error",
+        "runtime_volume_transition_request",
+        "runtime_volume_transition_success",
+        "runtime_volume_transition_evidence_request",
+        "runtime_volume_transition_evidence_success",
+        "runtime_volume_transition_error",
         "operation",
         "contract_error",
     ])
@@ -3974,6 +4377,12 @@ static NODE_OBSERVATION_SCHEMA: LazyLock<Schema> = LazyLock::new(node_observatio
 static OBSERVATION_ACCEPTANCE_SCHEMA: LazyLock<Schema> =
     LazyLock::new(observation_acceptance_schema);
 static RUNTIME_SPINE_ERROR_SCHEMA: LazyLock<Schema> = LazyLock::new(runtime_spine_error_schema);
+static RUNTIME_VOLUME_TRANSITION_EVIDENCE_REQUEST_SCHEMA: LazyLock<Schema> =
+    LazyLock::new(runtime_volume_transition_evidence_request_schema);
+static RUNTIME_VOLUME_TRANSITION_EVIDENCE_SUCCESS_SCHEMA: LazyLock<Schema> =
+    LazyLock::new(runtime_volume_transition_evidence_success_schema);
+static RUNTIME_VOLUME_TRANSITION_ERROR_SCHEMA: LazyLock<Schema> =
+    LazyLock::new(runtime_volume_transition_error_schema);
 static OPERATION_SCHEMA: LazyLock<Schema> = LazyLock::new(operation_schema);
 static CONTRACT_ERROR_SCHEMA: LazyLock<Schema> = LazyLock::new(contract_error_schema);
 static PROVISION_ROOT_IMAGE_REQUEST_SCHEMA: LazyLock<Schema> =
@@ -4337,6 +4746,42 @@ pub fn decode_runtime_spine_error(bytes: &[u8]) -> Result<RuntimeSpineError, Con
     )
 }
 
+pub fn decode_runtime_volume_transition_evidence_request(
+    bytes: &[u8],
+) -> Result<RuntimeVolumeTransitionEvidenceRequest, ContractError> {
+    decode(
+        bytes,
+        ContractName::RuntimeVolumeTransitionEvidenceRequest,
+        RUNTIME_VOLUME_TRANSITION_EVIDENCE_REQUEST_MAX_WIRE_BYTES,
+        &RUNTIME_VOLUME_TRANSITION_EVIDENCE_REQUEST_SCHEMA,
+        |_| Ok(()),
+    )
+}
+
+pub fn decode_runtime_volume_transition_evidence_success(
+    bytes: &[u8],
+) -> Result<RuntimeVolumeTransitionEvidenceSuccess, ContractError> {
+    decode(
+        bytes,
+        ContractName::RuntimeVolumeTransitionEvidenceSuccess,
+        RUNTIME_VOLUME_TRANSITION_EVIDENCE_SUCCESS_MAX_WIRE_BYTES,
+        &RUNTIME_VOLUME_TRANSITION_EVIDENCE_SUCCESS_SCHEMA,
+        validate_runtime_volume_transition_evidence_success,
+    )
+}
+
+pub fn decode_runtime_volume_transition_error(
+    bytes: &[u8],
+) -> Result<RuntimeVolumeTransitionError, ContractError> {
+    decode(
+        bytes,
+        ContractName::RuntimeVolumeTransitionError,
+        RUNTIME_VOLUME_TRANSITION_ERROR_MAX_WIRE_BYTES,
+        &RUNTIME_VOLUME_TRANSITION_ERROR_SCHEMA,
+        |_| Ok(()),
+    )
+}
+
 pub fn decode_operation(bytes: &[u8]) -> Result<Operation, ContractError> {
     decode(
         bytes,
@@ -4508,6 +4953,36 @@ pub fn encode_runtime_spine_error(value: &RuntimeSpineError) -> Result<Vec<u8>, 
         value,
         ContractName::RuntimeSpineError,
         decode_runtime_spine_error,
+    )
+}
+
+pub fn encode_runtime_volume_transition_evidence_request(
+    value: &RuntimeVolumeTransitionEvidenceRequest,
+) -> Result<Vec<u8>, ContractError> {
+    encode(
+        value,
+        ContractName::RuntimeVolumeTransitionEvidenceRequest,
+        decode_runtime_volume_transition_evidence_request,
+    )
+}
+
+pub fn encode_runtime_volume_transition_evidence_success(
+    value: &RuntimeVolumeTransitionEvidenceSuccess,
+) -> Result<Vec<u8>, ContractError> {
+    encode(
+        value,
+        ContractName::RuntimeVolumeTransitionEvidenceSuccess,
+        decode_runtime_volume_transition_evidence_success,
+    )
+}
+
+pub fn encode_runtime_volume_transition_error(
+    value: &RuntimeVolumeTransitionError,
+) -> Result<Vec<u8>, ContractError> {
+    encode(
+        value,
+        ContractName::RuntimeVolumeTransitionError,
+        decode_runtime_volume_transition_error,
     )
 }
 
@@ -4777,6 +5252,297 @@ pub(crate) fn validate_key_ring(loaded_kids: &[KeyId]) -> Result<(), ContractErr
         ContractName::NodeObservation,
         &[PathSegment::Key("loaded_kids".to_owned())],
     )
+}
+
+fn authorization_id(record: &AuthorizationRecord) -> &Id {
+    match &record.authorization {
+        VolumeAuthorization::Takeover(authorization) => &authorization.authorization_id,
+        VolumeAuthorization::DisposableRootDelete(authorization) => &authorization.authorization_id,
+    }
+}
+
+fn authorization_volume_id(record: &AuthorizationRecord) -> &Id {
+    match &record.authorization {
+        VolumeAuthorization::Takeover(authorization) => &authorization.volume_id,
+        VolumeAuthorization::DisposableRootDelete(authorization) => &authorization.volume_id,
+    }
+}
+
+fn valid_next_epoch(previous: FenceEpoch, next: FenceEpoch) -> bool {
+    previous
+        .get()
+        .checked_add(1)
+        .is_some_and(|value| value <= MAX_WIRE_INTEGER && value == next.get())
+}
+
+fn remote_head_valid(head: &RemoteHead) -> bool {
+    if head.generation.get() == 0 {
+        head.root_hash.is_none() && head.root_object_id.is_none()
+    } else {
+        head.root_hash.is_some() && head.root_object_id.is_some()
+    }
+}
+
+fn remote_head_same_or_later(current: &RemoteHead, previous: &RemoteHead) -> bool {
+    remote_head_valid(current)
+        && remote_head_valid(previous)
+        && (current.generation > previous.generation
+            || (current.generation == previous.generation && current == previous))
+}
+
+fn authorization_record_valid(record: &AuthorizationRecord) -> bool {
+    match (&record.authorization, &record.state) {
+        (VolumeAuthorization::Takeover(authorization), AuthorizationState::Unconsumed) => {
+            authorization.new_attachment_id != authorization.expected_attachment_id
+        }
+        (VolumeAuthorization::Takeover(authorization), AuthorizationState::Consumed(receipt)) => {
+            match receipt.as_ref() {
+                AuthorizationConsumedReceipt::Takeover(receipt) => {
+                    authorization.new_attachment_id != authorization.expected_attachment_id
+                        && receipt.authorization_id == authorization.authorization_id
+                        && receipt.host_fence_event_id == authorization.host_fence_event_id
+                        && receipt.volume_id == authorization.volume_id
+                        && receipt.new_attachment_id == authorization.new_attachment_id
+                        && valid_next_epoch(authorization.expected_epoch, receipt.resulting_epoch)
+                        && remote_head_valid(&receipt.resulting_head)
+                        && receipt.consumed_at <= authorization.not_after
+                        && receipt
+                            .consumed_at
+                            .get()
+                            .checked_add(authorization.lease_duration_ms)
+                            .is_some_and(|value| value <= MAX_WIRE_INTEGER)
+                }
+                AuthorizationConsumedReceipt::BeginDisposableDelete(_) => false,
+            }
+        }
+        (
+            VolumeAuthorization::DisposableRootDelete(authorization),
+            AuthorizationState::Unconsumed,
+        ) => {
+            remote_head_valid(&authorization.expected_head)
+                && match &authorization.isolation_basis {
+                    DisposableDeleteIsolationBasis::RuntimeStopped { node_id, .. } => {
+                        node_id == &authorization.authorized_node_id
+                    }
+                    DisposableDeleteIsolationBasis::HostFenceEvent { .. } => true,
+                }
+        }
+        (
+            VolumeAuthorization::DisposableRootDelete(authorization),
+            AuthorizationState::Consumed(receipt),
+        ) => match receipt.as_ref() {
+            AuthorizationConsumedReceipt::BeginDisposableDelete(receipt) => {
+                remote_head_valid(&authorization.expected_head)
+                    && match &authorization.isolation_basis {
+                        DisposableDeleteIsolationBasis::RuntimeStopped { node_id, .. } => {
+                            node_id == &authorization.authorized_node_id
+                        }
+                        DisposableDeleteIsolationBasis::HostFenceEvent { .. } => true,
+                    }
+                    && receipt.authorization_id == authorization.authorization_id
+                    && receipt.volume_id == authorization.volume_id
+                    && receipt.disk_id == authorization.disk_id
+                    && receipt.cat_id == authorization.cat_id
+                    && receipt.delete_id == authorization.delete_id
+                    && receipt.prior_attachment_id == authorization.expected_attachment_id
+                    && valid_next_epoch(authorization.expected_epoch, receipt.resulting_epoch)
+                    && receipt.resulting_head == authorization.expected_head
+                    && receipt.consumed_at <= authorization.not_after
+            }
+            AuthorizationConsumedReceipt::Takeover(_) => false,
+        },
+    }
+}
+
+fn volume_record_valid(record: &VolumeRecord) -> bool {
+    if record.size_bytes == 0
+        || record.size_bytes > MAX_WIRE_INTEGER
+        || !remote_head_valid(&record.head)
+    {
+        return false;
+    }
+    match (
+        &record.admin_state,
+        &record.lease_owner,
+        &record.lease_expires_at,
+    ) {
+        (VolumeAdminState::Active, None, None) => {}
+        (VolumeAdminState::Active, Some(_), Some(expires_at))
+            if record.lease_epoch.get() > 0 && expires_at.get() > 0 => {}
+        (VolumeAdminState::Deleting { .. }, None, None) if record.lease_epoch.get() > 0 => {}
+        _ => return false,
+    }
+    let Some(last) = &record.last_transition else {
+        return matches!(record.admin_state, VolumeAdminState::Active)
+            && record.lease_owner.is_none();
+    };
+    match last {
+        LastVolumeTransition::NormalAcquire { request, result } => {
+            request.volume_id == record.volume_id
+                && result.volume_id == request.volume_id
+                && result.transition_id == request.transition_id
+                && result.attachment_id == request.attachment_id
+                && valid_next_epoch(request.expected_unowned_epoch, result.resulting_epoch)
+                && result.lease_expires_at.get() >= request.lease_duration_ms
+                && matches!(record.admin_state, VolumeAdminState::Active)
+                && record.lease_owner.as_ref() == Some(&result.attachment_id)
+                && record.lease_epoch == result.resulting_epoch
+                && remote_head_same_or_later(&record.head, &result.resulting_head)
+        }
+        LastVolumeTransition::Release { request, result } => {
+            request.volume_id == record.volume_id
+                && result.volume_id == request.volume_id
+                && result.transition_id == request.transition_id
+                && result.released_attachment_id == request.attachment_id
+                && valid_next_epoch(request.expected_epoch, result.resulting_epoch)
+                && matches!(record.admin_state, VolumeAdminState::Active)
+                && record.lease_owner.is_none()
+                && record.lease_epoch == result.resulting_epoch
+                && record.head == result.resulting_head
+                && remote_head_valid(&result.resulting_head)
+        }
+        LastVolumeTransition::Takeover { .. } => {
+            matches!(record.admin_state, VolumeAdminState::Active) && record.lease_owner.is_some()
+        }
+        LastVolumeTransition::BeginDelete { request, result } => {
+            request.volume_id == record.volume_id
+                && result.delete_id == request.delete_id
+                && result.disk_id == request.disk_id
+                && result.volume_id == request.volume_id
+                && valid_next_epoch(request.expected_unowned_epoch, result.resulting_epoch)
+                && result.resulting_head == request.expected_head
+                && record.lease_epoch == result.resulting_epoch
+                && record.head == result.resulting_head
+                && matches!(
+                    &record.admin_state,
+                    VolumeAdminState::Deleting { delete_id } if delete_id == &result.delete_id
+                )
+        }
+        LastVolumeTransition::BeginDisposableDelete { .. } => {
+            matches!(record.admin_state, VolumeAdminState::Deleting { .. })
+        }
+    }
+}
+
+fn delete_completion_valid(receipt: &DeleteCompletionReceipt) -> bool {
+    match receipt {
+        DeleteCompletionReceipt::Normal {
+            request,
+            deleting_epoch,
+            deleting_head,
+            ..
+        } => {
+            remote_head_valid(&request.expected_head)
+                && request.expected_head == *deleting_head
+                && valid_next_epoch(request.expected_unowned_epoch, *deleting_epoch)
+        }
+        DeleteCompletionReceipt::DisposableRoot { deleting_head, .. } => {
+            remote_head_valid(deleting_head)
+        }
+    }
+}
+
+fn validate_runtime_volume_transition_evidence_success(
+    success: &RuntimeVolumeTransitionEvidenceSuccess,
+) -> Result<(), ContractError> {
+    let contract = ContractName::RuntimeVolumeTransitionEvidenceSuccess;
+    let mut candidates = Vec::new();
+    if authorization_id(&success.authorization) != &success.authorization_id
+        || !authorization_record_valid(&success.authorization)
+    {
+        candidates.push(Candidate::at(
+            &path(&["authorization"]),
+            MalformedProblem::InvalidValue,
+        ));
+    }
+    if success
+        .current_volume
+        .as_ref()
+        .is_some_and(|record| !volume_record_valid(record))
+    {
+        candidates.push(Candidate::at(
+            &path(&["current_volume"]),
+            MalformedProblem::InvalidValue,
+        ));
+    }
+    if success
+        .delete_completion
+        .as_ref()
+        .is_some_and(|receipt| !delete_completion_valid(receipt))
+    {
+        candidates.push(Candidate::at(
+            &path(&["delete_completion"]),
+            MalformedProblem::InvalidValue,
+        ));
+    }
+    if success.current_volume.is_some() && success.delete_completion.is_some() {
+        candidates.push(Candidate::at(&[], MalformedProblem::InvalidValue));
+    }
+    if success
+        .direct_successor_authorization
+        .as_ref()
+        .is_some_and(|record| !authorization_record_valid(record))
+    {
+        candidates.push(Candidate::at(
+            &path(&["direct_successor_authorization"]),
+            MalformedProblem::InvalidValue,
+        ));
+    }
+
+    let volume_id = authorization_volume_id(&success.authorization);
+    if success
+        .current_volume
+        .as_ref()
+        .is_some_and(|record| &record.volume_id != volume_id)
+        || success.delete_completion.as_ref().is_some_and(|receipt| {
+            let receipt_volume_id = match receipt {
+                DeleteCompletionReceipt::Normal { request, .. } => &request.volume_id,
+                DeleteCompletionReceipt::DisposableRoot { volume_id, .. } => volume_id,
+            };
+            receipt_volume_id != volume_id
+        })
+    {
+        candidates.push(Candidate::at(&[], MalformedProblem::InvalidValue));
+    }
+
+    let direct_marker = success
+        .current_volume
+        .as_ref()
+        .and_then(|record| match &record.last_transition {
+            Some(LastVolumeTransition::Takeover { authorization_id })
+            | Some(LastVolumeTransition::BeginDisposableDelete { authorization_id }) => {
+                Some(authorization_id)
+            }
+            _ => None,
+        })
+        .or_else(|| {
+            success
+                .delete_completion
+                .as_ref()
+                .and_then(|receipt| match receipt {
+                    DeleteCompletionReceipt::DisposableRoot {
+                        authorization_id, ..
+                    } => Some(authorization_id),
+                    DeleteCompletionReceipt::Normal { .. } => None,
+                })
+        })
+        .filter(|id| *id != &success.authorization_id);
+    match (
+        direct_marker,
+        success.direct_successor_authorization.as_ref(),
+    ) {
+        (None, None) => {}
+        (Some(expected), Some(record)) if authorization_id(record) == expected => {}
+        _ => candidates.push(Candidate::at(
+            &path(&["direct_successor_authorization"]),
+            MalformedProblem::InvalidValue,
+        )),
+    }
+
+    if let Some(candidate) = choose(candidates) {
+        return Err(malformed(contract, candidate));
+    }
+    Ok(())
 }
 
 fn validate_desired_read_snapshot(snapshot: &DesiredReadSnapshot) -> Result<(), ContractError> {

@@ -127,6 +127,7 @@ enum AttemptFailure {
 )]
 enum AuthorityTransactionMode {
     ReadWrite,
+    RepeatableRead,
     RepeatableReadOnly,
 }
 
@@ -202,6 +203,27 @@ impl Store {
         }
     }
 
+    /// Runs a logically read-only authority closure in one repeatable-read
+    /// snapshot that may acquire `FOR SHARE` locks. PostgreSQL forbids row
+    /// locks in a transaction declared `READ ONLY`, so A22 uses this mode for
+    /// the A23 NodeIdentity/credential-lineage retirement barrier while still
+    /// performing no domain write or session renewal.
+    #[allow(dead_code, reason = "consumed by the A22 authenticated evidence route")]
+    pub(super) fn authority_locking_read_snapshot<T: Send>(
+        &self,
+        operation: impl FnMut(&mut postgres::Transaction<'_>) -> AuthorityTxResult<T> + Send,
+    ) -> Result<T> {
+        match self
+            .authority_transaction_outcome_with(operation, AuthorityTransactionMode::RepeatableRead)
+        {
+            Ok(value) => Ok(value),
+            Err(AuthorityExecutionError::Store(error)) => Err(error),
+            Err(AuthorityExecutionError::CandidateCollision) => Err(internal(
+                "unexpected candidate-collision marker in a locking authority snapshot",
+            )),
+        }
+    }
+
     pub(super) fn authority_transaction_outcome<T: Send>(
         &self,
         operation: impl FnMut(&mut postgres::Transaction<'_>) -> AuthorityTxResult<T> + Send,
@@ -257,6 +279,10 @@ impl Store {
                 let client = client.map_err(AttemptFailure::Infrastructure)?;
                 let mut transaction = match mode {
                     AuthorityTransactionMode::ReadWrite => client.transaction(),
+                    AuthorityTransactionMode::RepeatableRead => client
+                        .build_transaction()
+                        .isolation_level(IsolationLevel::RepeatableRead)
+                        .start(),
                     AuthorityTransactionMode::RepeatableReadOnly => client
                         .build_transaction()
                         .isolation_level(IsolationLevel::RepeatableRead)

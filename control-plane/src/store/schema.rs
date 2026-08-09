@@ -586,7 +586,8 @@ const AUTHORITY_SCHEMA_PROBES: &[&str] = &[
             fence_attempt_id, isolation_state, observed_at, state,
             destroyed_at
        FROM host_fence_events WHERE FALSE",
-    "SELECT authorization_id, record, kind, host_fence_event_id, volume_id,
+    "SELECT authorization_id, record, kind, authorized_node_id,
+            host_fence_event_id, volume_id,
             state, desired_revision, placement_epoch, lease_duration_ms,
             not_after, consumed_at
        FROM volume_authorizations WHERE FALSE",
@@ -984,6 +985,7 @@ CREATE TABLE IF NOT EXISTS volume_authorizations (
     authorization_id TEXT PRIMARY KEY,
     record JSONB NOT NULL CHECK (jsonb_typeof(record) = 'object'),
     kind TEXT NOT NULL CHECK (kind IN ('takeover', 'disposable_root_delete')),
+    authorized_node_id TEXT NOT NULL,
     host_fence_event_id TEXT REFERENCES host_fence_events(event_id),
     volume_id TEXT NOT NULL,
     state TEXT NOT NULL CHECK (state IN ('unconsumed', 'consumed')),

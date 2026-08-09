@@ -19,6 +19,7 @@ mod clean_slate_probes;
 mod gate_planner;
 mod inventory;
 mod root_provision;
+mod volume_transitions;
 
 pub(crate) mod inventory_probe_sealed {
     pub trait Sealed {}
@@ -45,6 +46,11 @@ pub use inventory::{
 pub use root_provision::{
     AuthorityRereadRequired, RootProvisionClientError, RootProvisionControlPort,
     RootProvisionResponseHint, RootProvisionUnknownReason, UnixRootProvisionClient,
+};
+pub use volume_transitions::{
+    A19SignedVolumeEvidenceTransport, ControlSignedVolumeEvidenceClient,
+    SignedVolumeEvidenceResponse, VolumeEvidenceClientError, VolumeEvidenceRecovery,
+    VolumeEvidenceRecoveryDecision, VolumeEvidenceTransportFailure, VolumeTransitionEvidencePort,
 };
 
 #[cfg(test)]

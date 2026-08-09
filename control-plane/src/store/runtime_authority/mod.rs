@@ -23,6 +23,11 @@ pub(super) mod rows;
 )]
 pub(crate) mod runtime_spine;
 mod volume;
+#[allow(
+    dead_code,
+    reason = "A22 transaction-local evidence loader is composed by the authenticated A23 route"
+)]
+pub(crate) mod volume_transition_evidence;
 
 #[cfg(test)]
 mod cat_create_service_tests;
