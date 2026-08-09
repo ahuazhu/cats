@@ -1000,7 +1000,20 @@ fn a22_mutation_request_is_closed_and_intrinsically_bound() {
     value["transition"]["request"]["desired_revision"] = 8.into();
     let error =
         decode_runtime_volume_transition_request(&serde_json::to_vec(&value).unwrap()).unwrap_err();
-    assert_eq!(malformed(&error).0.as_str(), "/transition/desired_revision");
+    assert_eq!(
+        malformed(&error).0.as_str(),
+        "/transition/request/desired_revision"
+    );
+
+    let mut value: serde_json::Value =
+        serde_json::from_str(VOLUME_TRANSITION_NORMAL_REQUEST_WIRE).unwrap();
+    value["transition"]["request"]["placement_epoch"] = 4.into();
+    let error =
+        decode_runtime_volume_transition_request(&serde_json::to_vec(&value).unwrap()).unwrap_err();
+    assert_eq!(
+        malformed(&error).0.as_str(),
+        "/transition/request/placement_epoch"
+    );
 
     let mut value: serde_json::Value =
         serde_json::from_str(VOLUME_TRANSITION_NORMAL_REQUEST_WIRE).unwrap();

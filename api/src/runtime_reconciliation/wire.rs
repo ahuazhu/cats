@@ -5939,13 +5939,13 @@ fn validate_runtime_volume_transition_request(
         } => {
             if *desired_revision != request.desired_revision {
                 candidates.push(Candidate::at(
-                    &path(&["transition", "desired_revision"]),
+                    &path(&["transition", "request", "desired_revision"]),
                     MalformedProblem::InvalidValue,
                 ));
             }
             if *placement_epoch != request.placement.placement_epoch {
                 candidates.push(Candidate::at(
-                    &path(&["transition", "placement_epoch"]),
+                    &path(&["transition", "request", "placement_epoch"]),
                     MalformedProblem::InvalidValue,
                 ));
             }
