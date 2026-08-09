@@ -11,12 +11,13 @@ use std::path::{Path, PathBuf};
 use cats_api::runtime_reconciliation::{
     decode_agent_session, decode_desired_read_request, decode_desired_read_snapshot,
     decode_node_observation, decode_observation_acceptance, encode_agent_session,
-    encode_desired_read_request, encode_node_observation, encode_observation_acceptance,
-    AgentSession, AppliedDesiredEvidence, ContractError, ContractVersion, DesiredReadRequest,
-    DesiredReadSnapshot, Epoch, NodeObservation, ObservationAcceptance,
-    ObservationInventoryAcceptance, Sequence, SessionBinding, AGENT_SESSION_MAX_WIRE_BYTES,
-    DESIRED_READ_REQUEST_MAX_WIRE_BYTES, DESIRED_READ_SNAPSHOT_MAX_WIRE_BYTES,
-    NODE_OBSERVATION_MAX_WIRE_BYTES, OBSERVATION_ACCEPTANCE_MAX_WIRE_BYTES,
+    encode_desired_read_request, encode_desired_read_snapshot, encode_node_observation,
+    encode_observation_acceptance, AgentSession, AppliedDesiredEvidence, ContractError,
+    ContractVersion, DesiredReadRequest, DesiredReadSnapshot, Epoch, NodeObservation,
+    ObservationAcceptance, ObservationInventoryAcceptance, Sequence, SessionBinding,
+    AGENT_SESSION_MAX_WIRE_BYTES, DESIRED_READ_REQUEST_MAX_WIRE_BYTES,
+    DESIRED_READ_SNAPSHOT_MAX_WIRE_BYTES, NODE_OBSERVATION_MAX_WIRE_BYTES,
+    OBSERVATION_ACCEPTANCE_MAX_WIRE_BYTES,
 };
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
@@ -30,6 +31,7 @@ const SESSION_FILE: &str = "session.json";
 const RESET_FILE: &str = "session-reset.json";
 const DESIRED_PENDING_FILE: &str = "desired-pending.json";
 const DESIRED_ACCEPTED_FILE: &str = "desired-accepted.json";
+const DESIRED_INVALIDATED_FILE: &str = "desired-invalidated.json";
 const OBSERVATION_PENDING_FILE: &str = "observation-pending.json";
 const OBSERVATION_LAST_FILE: &str = "observation-last.json";
 const OBSERVATION_FULL_FILE: &str = "observation-full.json";
@@ -41,6 +43,7 @@ const OBSERVATION_RECORD_MAX_BYTES: usize = NODE_OBSERVATION_MAX_WIRE_BYTES
 const SESSION_FILES: &[&str] = &[
     DESIRED_PENDING_FILE,
     DESIRED_ACCEPTED_FILE,
+    DESIRED_INVALIDATED_FILE,
     OBSERVATION_PENDING_FILE,
     OBSERVATION_LAST_FILE,
     OBSERVATION_FULL_FILE,
@@ -107,6 +110,7 @@ pub struct RuntimeSpineJournal {
     session: AgentSession,
     pending_desired: Option<DurableRuntimeSpineRequest<DesiredReadRequest>>,
     desired_snapshot: Option<DesiredReadSnapshot>,
+    invalidated_desired: Option<DesiredReadSnapshot>,
     pending_observation: Option<DurableRuntimeSpineRequest<NodeObservation>>,
     last_observation: Option<AcceptedObservationRecord>,
     full_observation: Option<AcceptedObservationRecord>,
@@ -120,6 +124,7 @@ impl std::fmt::Debug for RuntimeSpineJournal {
             .field("session", &session_binding(&self.session))
             .field("pending_desired", &self.pending_desired.is_some())
             .field("desired_snapshot", &self.desired_snapshot.is_some())
+            .field("invalidated_desired", &self.invalidated_desired.is_some())
             .field("pending_observation", &self.pending_observation.is_some())
             .field("last_observation", &self.last_observation.is_some())
             .field("full_observation", &self.full_observation.is_some())
@@ -145,6 +150,7 @@ impl RuntimeSpineJournal {
             session: registered_session,
             pending_desired: None,
             desired_snapshot: None,
+            invalidated_desired: None,
             pending_observation: None,
             last_observation: None,
             full_observation: None,
@@ -175,7 +181,7 @@ impl RuntimeSpineJournal {
             return Ok(RuntimeSpineDesiredWork::Request(pending.clone()));
         }
         if let Some(snapshot) = &self.desired_snapshot {
-            if !self.desired_is_consumed(snapshot) {
+            if !self.desired_is_consumed(snapshot) && !self.desired_is_invalidated(snapshot) {
                 return Ok(RuntimeSpineDesiredWork::Scan(snapshot.clone()));
             }
         }
@@ -236,8 +242,46 @@ impl RuntimeSpineJournal {
             exact_bytes,
         )?;
         remove_file(&self.directory, &self.path, DESIRED_PENDING_FILE)?;
+        remove_file(&self.directory, &self.path, DESIRED_INVALIDATED_FILE)?;
         self.desired_snapshot = Some(snapshot);
+        self.invalidated_desired = None;
         self.pending_desired = None;
+        Ok(())
+    }
+
+    /// Records a definite Control rejection that makes the current Desired
+    /// cursor unusable, then forgets the rejected observation. The marker is
+    /// durable before the exact pending body is removed, so a crash cannot
+    /// strand the Node replaying a request the server has already rejected.
+    pub fn invalidate_desired_after_observation_rejection(
+        &mut self,
+    ) -> Result<(), RuntimeSpineJournalError> {
+        if self.pending_observation.is_none() {
+            return Err(RuntimeSpineJournalError::Transition(
+                "Desired invalidation has no definitely rejected observation",
+            ));
+        }
+        let snapshot =
+            self.desired_snapshot
+                .as_ref()
+                .ok_or(RuntimeSpineJournalError::Transition(
+                    "Desired invalidation has no accepted snapshot",
+                ))?;
+        let bytes = encode_desired_read_snapshot(snapshot).map_err(|source| {
+            RuntimeSpineJournalError::Contract {
+                record: "DesiredReadSnapshot invalidation marker",
+                source,
+            }
+        })?;
+        replace_file(
+            &self.directory,
+            &self.path,
+            DESIRED_INVALIDATED_FILE,
+            &bytes,
+        )?;
+        remove_file(&self.directory, &self.path, OBSERVATION_PENDING_FILE)?;
+        self.invalidated_desired = Some(snapshot.clone());
+        self.pending_observation = None;
         Ok(())
     }
 
@@ -443,6 +487,21 @@ impl RuntimeSpineJournal {
             })
         })
         .transpose()?;
+        self.invalidated_desired = read_file(
+            &self.directory,
+            &self.path,
+            DESIRED_INVALIDATED_FILE,
+            DESIRED_READ_SNAPSHOT_MAX_WIRE_BYTES,
+        )?
+        .map(|bytes| {
+            decode_desired_read_snapshot(&bytes).map_err(|source| {
+                RuntimeSpineJournalError::Contract {
+                    record: "DesiredReadSnapshot invalidation marker",
+                    source,
+                }
+            })
+        })
+        .transpose()?;
         self.pending_observation = read_file(
             &self.directory,
             &self.path,
@@ -478,6 +537,10 @@ impl RuntimeSpineJournal {
                 .as_ref()
                 .is_some_and(|snapshot| snapshot.session != binding)
             || self
+                .invalidated_desired
+                .as_ref()
+                .is_some_and(|snapshot| snapshot.session != binding)
+            || self
                 .pending_observation
                 .as_ref()
                 .is_some_and(|pending| observation_binding(&pending.value) != binding)
@@ -493,6 +556,21 @@ impl RuntimeSpineJournal {
             return Err(RuntimeSpineJournalError::Corrupt(
                 "a retained record belongs to another AgentSession",
             ));
+        }
+        match (&self.invalidated_desired, &self.desired_snapshot) {
+            (Some(invalidated), Some(current))
+                if invalidated.request_sequence > current.request_sequence =>
+            {
+                return Err(RuntimeSpineJournalError::Corrupt(
+                    "Desired invalidation marker is newer than the accepted snapshot",
+                ));
+            }
+            (Some(_), None) => {
+                return Err(RuntimeSpineJournalError::Corrupt(
+                    "Desired invalidation marker has no accepted snapshot",
+                ));
+            }
+            _ => {}
         }
         if let Some(record) = &self.last_observation {
             validate_observation_record(record)?;
@@ -557,6 +635,22 @@ impl RuntimeSpineJournal {
                 self.pending_desired = None;
             }
         }
+        if let (Some(invalidated), Some(snapshot)) =
+            (&self.invalidated_desired, &self.desired_snapshot)
+        {
+            if invalidated.request_sequence < snapshot.request_sequence {
+                remove_file(&self.directory, &self.path, DESIRED_INVALIDATED_FILE)?;
+                self.invalidated_desired = None;
+            } else if invalidated != snapshot {
+                return Err(RuntimeSpineJournalError::Corrupt(
+                    "Desired invalidation marker differs from its accepted snapshot",
+                ));
+            }
+        }
+        if self.invalidated_desired.is_some() && self.pending_observation.is_some() {
+            remove_file(&self.directory, &self.path, OBSERVATION_PENDING_FILE)?;
+            self.pending_observation = None;
+        }
         if let (Some(pending), Some(last)) = (&self.pending_observation, &self.last_observation) {
             if pending.value == last.observation {
                 remove_file(&self.directory, &self.path, OBSERVATION_PENDING_FILE)?;
@@ -583,7 +677,10 @@ impl RuntimeSpineJournal {
         }
         if let Some(pending) = &self.pending_desired {
             let expected = match &self.desired_snapshot {
-                Some(snapshot) if self.desired_is_consumed(snapshot) => {
+                Some(snapshot)
+                    if self.desired_is_consumed(snapshot)
+                        || self.desired_is_invalidated(snapshot) =>
+                {
                     checked_next(snapshot.request_sequence)?
                 }
                 None => Sequence::new(1).expect("one is a valid Sequence"),
@@ -631,6 +728,11 @@ impl RuntimeSpineJournal {
                 .ok_or(RuntimeSpineJournalError::Transition(
                     "observation has no Desired snapshot",
                 ))?;
+        if self.desired_is_invalidated(snapshot) {
+            return Err(RuntimeSpineJournalError::Transition(
+                "observation uses a definitely invalidated Desired snapshot",
+            ));
+        }
         if candidate.complete_inventory {
             if self.desired_is_consumed(snapshot) {
                 return Err(RuntimeSpineJournalError::Transition(
@@ -692,6 +794,10 @@ impl RuntimeSpineJournal {
                     if attestation.inventory_read_position == snapshot.read_position
             )
         })
+    }
+
+    fn desired_is_invalidated(&self, snapshot: &DesiredReadSnapshot) -> bool {
+        self.invalidated_desired.as_ref() == Some(snapshot)
     }
 }
 
@@ -1268,5 +1374,59 @@ mod tests {
         let canonical = encode_desired_read_snapshot(&desired).unwrap();
         assert_eq!(canonical, SNAPSHOT);
         journal.accept_desired(desired, &canonical).unwrap();
+    }
+
+    #[test]
+    fn definite_observation_rejection_durably_advances_to_a_new_desired_cursor() {
+        let root = tempfile::tempdir().unwrap();
+        let state = state_directory(&root);
+        let registered = session();
+        let mut journal = RuntimeSpineJournal::open(&state, registered.clone()).unwrap();
+        journal.desired_work().unwrap();
+        let first_snapshot = snapshot();
+        journal
+            .accept_desired(first_snapshot.clone(), SNAPSHOT)
+            .unwrap();
+        let observation = full_observation(&registered, &first_snapshot);
+        let pending = journal.prepare_observation(observation).unwrap();
+
+        let marker = encode_desired_read_snapshot(&first_snapshot).unwrap();
+        replace_file(
+            &journal.directory,
+            &journal.path,
+            DESIRED_INVALIDATED_FILE,
+            &marker,
+        )
+        .unwrap();
+        drop(journal);
+
+        let mut recovered = RuntimeSpineJournal::open(&state, registered).unwrap();
+        let RuntimeSpineDesiredWork::Request(next) = recovered.desired_work().unwrap() else {
+            panic!("the rejected observation must make the next Desired request eligible")
+        };
+        assert_eq!(next.value().request_sequence.get(), 2);
+        assert_ne!(next.bytes(), pending.bytes());
+        drop(recovered);
+
+        let mut replayed = RuntimeSpineJournal::open(&state, session()).unwrap();
+        let RuntimeSpineDesiredWork::Request(exact) = replayed.desired_work().unwrap() else {
+            panic!("the replacement Desired request must replay exactly")
+        };
+        assert_eq!(exact.bytes(), next.bytes());
+
+        let mut second = first_snapshot;
+        second.request_sequence = Sequence::new(2).unwrap();
+        second.read_position = Sequence::new(13).unwrap();
+        second.issued_at_unix_ms = UnixMillis::new(1_720_000_010_000).unwrap();
+        second.expires_at_unix_ms = UnixMillis::new(1_720_000_040_000).unwrap();
+        let second_bytes = encode_desired_read_snapshot(&second).unwrap();
+        replayed
+            .accept_desired(second.clone(), &second_bytes)
+            .unwrap();
+        drop(replayed);
+
+        let reopened = RuntimeSpineJournal::open(&state, session()).unwrap();
+        assert_eq!(reopened.desired_snapshot(), Some(&second));
+        assert!(reopened.invalidated_desired.is_none());
     }
 }
