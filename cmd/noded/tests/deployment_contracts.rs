@@ -461,7 +461,7 @@ fn production_worker_bundle_updates_an_idle_guest_seed_before_restart() {
 
     let deployment =
         read_workspace_file("deploy/aws/terraform/modules/metal-worker-deployment/main.tf");
-    let idle_guard = deployment
+    let early_idle_guard = deployment
         .find(
             "\"$stage_path/require-idle-worker.sh\" \"$metering_root\" \"${var.install_root}/bin\"",
         )
@@ -478,9 +478,19 @@ fn production_worker_bundle_updates_an_idle_guest_seed_before_restart() {
     let deployment_lock = deployment
         .find("cats_acquire_worker_deployment_lock")
         .expect("worker deployment acquires its Host-global lock");
-    let stop = deployment[deployment_lock..]
-        .find("cats_gate_node_service cats-worker")
+    let locked_metering = deployment[deployment_lock..]
+        .find("metering_root=\"$(cats_worker_metering_root cats-worker)\"")
         .map(|offset| deployment_lock + offset)
+        .expect("worker deployment recomputes its metering cgroup under the lock");
+    let locked_idle_guard = deployment[locked_metering..]
+        .find(
+            "\"$stage_path/require-idle-worker.sh\" \"$metering_root\" \"${var.install_root}/bin\"",
+        )
+        .map(|offset| locked_metering + offset)
+        .expect("worker deployment rechecks physical idle under the lock");
+    let stop = deployment[locked_idle_guard..]
+        .find("cats_gate_node_service cats-worker")
+        .map(|offset| locked_idle_guard + offset)
         .expect("worker deployment masks and stops the idle worker");
     let prepare = deployment[stop..]
         .find("\"$release_installer\" prepare")
@@ -493,9 +503,11 @@ fn production_worker_bundle_updates_an_idle_guest_seed_before_restart() {
         .find("cats_begin_candidate_lifetime cats-worker \"$release_installer\"")
         .expect("post-mutation worker start authorization and watchdog");
     assert!(
-        release_verify < idle_guard
-            && idle_guard < deployment_lock
-            && deployment_lock < stop
+        release_verify < early_idle_guard
+            && early_idle_guard < deployment_lock
+            && deployment_lock < locked_metering
+            && locked_metering < locked_idle_guard
+            && locked_idle_guard < stop
             && stop < prepare
             && prepare < first_install
             && first_install < update
@@ -670,6 +682,9 @@ fn fault_injected_release_installer(
     done
   fi
   probe_count=$(wc -l < "${CATS_RELEASE_TRACE:?}")
+  if [[ ${CATS_RELEASE_KILL_AT_LABEL:-} == "$1" ]]; then
+    kill -KILL $$
+  fi
   if [[ $probe_count -eq ${CATS_RELEASE_KILL_AT:-0} ]]; then
     kill -KILL $$
   fi
@@ -728,12 +743,11 @@ struct ReleaseInstallerContext<'a> {
 }
 
 #[cfg(target_os = "linux")]
-fn run_release_installer(
+fn release_installer_command(
     context: ReleaseInstallerContext<'_>,
     mode: &str,
     source: &Path,
-    kill_at: Option<usize>,
-) -> std::process::Output {
+) -> Command {
     let mut path = context.fake_bin.as_os_str().to_os_string();
     path.push(":");
     path.push(std::env::var_os("PATH").unwrap_or_default());
@@ -758,10 +772,34 @@ fn run_release_installer(
             "CATS_TEST_TOKEN",
             "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
         );
+    command
+}
+
+#[cfg(target_os = "linux")]
+fn run_release_installer(
+    context: ReleaseInstallerContext<'_>,
+    mode: &str,
+    source: &Path,
+    kill_at: Option<usize>,
+) -> std::process::Output {
+    let mut command = release_installer_command(context, mode, source);
     if let Some(kill_at) = kill_at {
         command.env("CATS_RELEASE_KILL_AT", kill_at.to_string());
     }
     command.output().expect("run release installer")
+}
+
+#[cfg(target_os = "linux")]
+fn run_release_installer_at_label(
+    context: ReleaseInstallerContext<'_>,
+    mode: &str,
+    source: &Path,
+    kill_at_label: &str,
+) -> std::process::Output {
+    release_installer_command(context, mode, source)
+        .env("CATS_RELEASE_KILL_AT_LABEL", kill_at_label)
+        .output()
+        .expect("run release installer with a named fault")
 }
 
 #[cfg(target_os = "linux")]
@@ -1126,6 +1164,82 @@ fn every_guest_release_durability_boundary_recovers_to_one_complete_set() {
         assert!(!cats_root.join("guest/initramfs.img").exists());
         assert!(!cats_root.join("releases/activation.v1").exists());
     }
+
+    // Exercise the exact retry window that matters for journal replacement.
+    // The first interruption leaves a durable new->old activation journal.
+    // The retry recovers the old release, persists the complete candidate, and
+    // then dies at the named boundary immediately before replacing that
+    // journal. The retained authority must remain byte-for-byte unchanged.
+    let case = fixture.path().join("case-before-journal-replace");
+    std::fs::create_dir(&case).unwrap();
+    let installer = case.join("installer");
+    let cats_root = case.join("cats");
+    std::fs::create_dir(&cats_root).unwrap();
+    let trace = case.join("trace");
+    let active = case.join("active");
+    let deployment_lock = cats_root.join("deployment.lock");
+    fault_injected_release_installer(&template, &installer, &cats_root, &uid, &gid);
+    let context = ReleaseInstallerContext {
+        installer: &installer,
+        fake_bin: &fake_bin,
+        trace: &trace,
+        active: &active,
+        deployment_lock: &deployment_lock,
+    };
+    assert!(run_release_installer(context, "prepare", &old, None)
+        .status
+        .success());
+    assert!(
+        run_release_installer(context, "authorize-start", Path::new("unused"), None)
+            .status
+            .success()
+    );
+    std::fs::write(&active, "active").unwrap();
+    assert!(
+        run_release_installer(context, "commit", Path::new("unused"), None)
+            .status
+            .success()
+    );
+    std::fs::remove_file(&active).unwrap();
+    std::fs::write(&trace, "").unwrap();
+
+    let first_interruption =
+        run_release_installer_at_label(context, "prepare", &new, "active-copy:receipt");
+    assert!(
+        !first_interruption.status.success(),
+        "first retry setup did not retain an uncommitted activation journal"
+    );
+    let journal_path = cats_root.join("releases/activation.v1");
+    let retained_journal = std::fs::read(&journal_path)
+        .expect("first interruption must leave its durable recovery journal");
+
+    std::fs::write(&trace, "").unwrap();
+    let second_interruption = run_release_installer_at_label(
+        context,
+        "prepare",
+        &new,
+        "activation-before-journal-replace",
+    );
+    assert!(
+        !second_interruption.status.success(),
+        "second retry did not die at the pre-replace journal boundary"
+    );
+    assert_eq!(
+        std::fs::read(&journal_path).unwrap(),
+        retained_journal,
+        "a crash before journal replacement lost or rewrote the old recovery authority"
+    );
+    assert_eq!(
+        std::fs::read_to_string(&trace).unwrap().lines().next_back(),
+        Some("activation-before-journal-replace"),
+        "the second SIGKILL must hit the exact named pre-replace boundary"
+    );
+    assert_active_release(&cats_root, &old);
+
+    assert!(run_release_installer(context, "prepare", &new, None)
+        .status
+        .success());
+    assert_active_release(&cats_root, &new);
 }
 
 #[cfg(target_os = "linux")]
@@ -1817,18 +1931,37 @@ fn worker_release_refuses_live_runtime_binaries_outside_metering_cgroups() {
         "deploy/metal/install.sh",
     ] {
         let installer = read_workspace_file(installer_path);
-        let guard_call = installer
+        let early_guard = installer
             .find("require-idle-worker.sh\"")
             .unwrap_or_else(|| panic!("{installer_path} lost its physical idle guard"));
         let lock = installer
             .find("cats_acquire_worker_deployment_lock")
             .unwrap_or_else(|| panic!("{installer_path} lost its deployment lock"));
-        let stop = installer
+        let service = if installer_path == "deploy/metal/install.sh" {
+            "cats-noded"
+        } else {
+            "cats-worker"
+        };
+        let locked_metering = installer[lock..]
+            .find(&format!(
+                "metering_root=$(cats_worker_metering_root {service})"
+            ))
+            .map(|offset| lock + offset)
+            .unwrap_or_else(|| panic!("{installer_path} lost its locked metering recomputation"));
+        let locked_guard = installer[locked_metering..]
+            .find("require-idle-worker.sh\"")
+            .map(|offset| locked_metering + offset)
+            .unwrap_or_else(|| panic!("{installer_path} lost its locked physical idle guard"));
+        let stop = installer[locked_guard..]
             .find("cats_gate_node_service")
+            .map(|offset| locked_guard + offset)
             .unwrap_or_else(|| panic!("{installer_path} lost its masked stop boundary"));
         assert!(
-            guard_call < lock && lock < stop,
-            "{installer_path} must prove physical idle before acquiring the lock and stopping"
+            early_guard < lock
+                && lock < locked_metering
+                && locked_metering < locked_guard
+                && locked_guard < stop,
+            "{installer_path} must re-prove physical idle under the lock immediately before stopping"
         );
     }
 
@@ -1875,6 +2008,199 @@ fn worker_release_refuses_live_runtime_binaries_outside_metering_cgroups() {
         "a node with no runtime processes must be releasable: {}",
         String::from_utf8_lossy(&idle.stderr)
     );
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn deployment_rechecks_physical_idle_after_waiting_for_the_host_lock() {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    struct RuntimePidCleanup(PathBuf);
+
+    impl Drop for RuntimePidCleanup {
+        fn drop(&mut self) {
+            if let Ok(pids) = std::fs::read_to_string(&self.0) {
+                for pid in pids.split_whitespace() {
+                    let _ = Command::new("kill")
+                        .args(["-TERM", pid])
+                        .stdout(std::process::Stdio::null())
+                        .stderr(std::process::Stdio::null())
+                        .status();
+                }
+            }
+        }
+    }
+
+    let fixture = tempfile::tempdir().expect("deployment idle race fixture");
+    let lock = fixture.path().join("worker-deployment.lock");
+    let helper = fixture.path().join("worker-deployment-transaction");
+    let uid = String::from_utf8(Command::new("id").arg("-u").output().unwrap().stdout)
+        .unwrap()
+        .trim()
+        .to_owned();
+    let gid = String::from_utf8(Command::new("id").arg("-g").output().unwrap().stdout)
+        .unwrap()
+        .trim()
+        .to_owned();
+    private_deployment_helper(
+        &read_workspace_file("deploy/aws/metal/worker-deployment-transaction.sh"),
+        &helper,
+        &lock,
+        &uid,
+        &gid,
+    );
+
+    let runtime_bin = fixture.path().join("runtime-bin");
+    std::fs::create_dir(&runtime_bin).unwrap();
+    let blockd = runtime_bin.join("cats-blockd");
+    let vmm = runtime_bin.join("cloud-hypervisor");
+    std::os::unix::fs::symlink("/bin/sleep", &blockd).unwrap();
+    std::os::unix::fs::symlink("/bin/sleep", &vmm).unwrap();
+
+    let cgroup_root = fixture.path().join("cgroup");
+    std::fs::create_dir_all(cgroup_root.join("system.slice/cats-worker.service/metering")).unwrap();
+    let fake_bin = fixture.path().join("fake-bin");
+    std::fs::create_dir(&fake_bin).unwrap();
+    let findmnt = fake_bin.join("findmnt");
+    std::fs::write(
+        &findmnt,
+        "#!/bin/sh\nprintf '%s\\n' \"$CATS_CGROUP_ROOT\"\n",
+    )
+    .unwrap();
+    std::fs::set_permissions(&findmnt, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let systemctl = fake_bin.join("systemctl");
+    std::fs::write(
+        &systemctl,
+        "#!/bin/sh\ncase \"$1\" in\n  show) printf '%s\\n' /system.slice/cats-worker.service ;;\n  stop) : > \"$CATS_STOP_MARKER\" ;;\n  *) exit 1 ;;\nesac\n",
+    )
+    .unwrap();
+    std::fs::set_permissions(&systemctl, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let mut command_path = fake_bin.as_os_str().to_os_string();
+    command_path.push(":");
+    command_path.push(std::env::var_os("PATH").unwrap_or_default());
+
+    let a_locked = fixture.path().join("a-locked");
+    let b_early = fixture.path().join("b-early-idle");
+    let runtime_ready = fixture.path().join("a-runtime-ready");
+    let release_a = fixture.path().join("release-a");
+    let b_done = fixture.path().join("b-done");
+    let runtime_pids = fixture.path().join("runtime-pids");
+    let stop_marker = fixture.path().join("systemctl-stop-called");
+    let b_stderr = fixture.path().join("b-stderr");
+
+    let mut deployment_a = DeploymentChild(
+        Command::new("/bin/bash")
+            .args([
+                "-c",
+                r#"set -euo pipefail
+. "$1"
+cats_acquire_worker_deployment_lock
+: > "$2"
+while [[ ! -e "$3" ]]; do sleep 0.01; done
+"$4" 300 & blockd_pid=$!
+"$5" 300 & vmm_pid=$!
+printf '%s\n%s\n' "$blockd_pid" "$vmm_pid" > "$6"
+cleanup() {
+  kill "$blockd_pid" "$vmm_pid" >/dev/null 2>&1 || true
+  wait "$blockd_pid" "$vmm_pid" >/dev/null 2>&1 || true
+}
+trap cleanup EXIT
+while ! ps -A -o args= | awk -v blockd="$4" -v vmm="$5" '
+  $1 == blockd { blockd_seen = 1 }
+  $1 == vmm { vmm_seen = 1 }
+  END { exit !(blockd_seen && vmm_seen) }
+'; do sleep 0.01; done
+: > "$7"
+while [[ ! -e "$8" ]]; do sleep 0.01; done
+flock -u "$CATS_WORKER_DEPLOYMENT_LOCK_FD"
+while [[ ! -e "$9" ]]; do sleep 0.01; done
+"#,
+                "bash",
+            ])
+            .arg(&helper)
+            .arg(&a_locked)
+            .arg(&b_early)
+            .arg(&blockd)
+            .arg(&vmm)
+            .arg(&runtime_pids)
+            .arg(&runtime_ready)
+            .arg(&release_a)
+            .arg(&b_done)
+            .env("PATH", &command_path)
+            .spawn()
+            .expect("spawn deployment A"),
+    );
+    let _runtime_cleanup = RuntimePidCleanup(runtime_pids.clone());
+    wait_for_file(&a_locked, "deployment A to hold the Host lock");
+
+    let b_stderr_file = std::fs::File::create(&b_stderr).unwrap();
+    let mut deployment_b = DeploymentChild(
+        Command::new("/bin/bash")
+            .args([
+                "-c",
+                r#"set -euo pipefail
+trap ': > "$5"' EXIT
+. "$1"
+metering_root=$(cats_worker_metering_root cats-worker)
+"$2" "$metering_root" "$3"
+: > "$4"
+cats_acquire_worker_deployment_lock
+metering_root=$(cats_worker_metering_root cats-worker)
+"$2" "$metering_root" "$3"
+systemctl stop cats-worker
+"#,
+                "bash",
+            ])
+            .arg(&helper)
+            .arg(workspace_root().join("deploy/aws/metal/require-idle-worker.sh"))
+            .arg(&runtime_bin)
+            .arg(&b_early)
+            .arg(&b_done)
+            .env("PATH", &command_path)
+            .env("CATS_CGROUP_ROOT", &cgroup_root)
+            .env("CATS_STOP_MARKER", &stop_marker)
+            .stderr(b_stderr_file)
+            .spawn()
+            .expect("spawn deployment B"),
+    );
+
+    wait_for_file(&b_early, "deployment B to pass its unlocked idle preflight");
+    wait_for_file(
+        &runtime_ready,
+        "deployment A runtime children to become process-table visible",
+    );
+    assert!(
+        deployment_b.try_wait().unwrap().is_none(),
+        "deployment B must still be waiting for deployment A's Host lock"
+    );
+    std::fs::write(&release_a, "release").unwrap();
+    wait_for_file(&b_done, "deployment B to reject the locked idle recheck");
+
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    let b_status = loop {
+        if let Some(status) = deployment_b.try_wait().unwrap() {
+            break status;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "deployment B did not exit after its locked idle rejection"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    };
+    assert!(
+        !b_status.success(),
+        "deployment B must fail when runtimes appear while it waits for the lock"
+    );
+    assert!(
+        !stop_marker.exists(),
+        "locked physical-idle rejection must leave systemctl stop observably uncalled"
+    );
+    let stderr = std::fs::read_to_string(&b_stderr).unwrap();
+    assert!(
+        stderr.contains("cats-blockd") && stderr.contains("cloud-hypervisor"),
+        "locked recheck must name both new runtime processes: {stderr}"
+    );
+    wait_for_success(&mut deployment_a, "deployment A runtime owner");
 }
 
 #[cfg(target_os = "linux")]

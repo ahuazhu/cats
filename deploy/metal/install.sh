@@ -61,7 +61,6 @@ release_installer="$REPO/deploy/aws/metal/install-guest-runtime-release.sh"
 "$release_installer" verify "$GUEST_RUNTIME_RELEASE_SOURCE"
 metering_root=$(cats_worker_metering_root cats-noded)
 "$REPO/deploy/aws/metal/require-idle-worker.sh" "$metering_root" "$PREFIX/bin"
-cats_acquire_worker_deployment_lock
 release_transaction_active=0
 route_key_temp=""
 route_public_temp=""
@@ -80,6 +79,13 @@ deployment_cleanup() {
 trap deployment_cleanup EXIT
 trap 'exit 130' INT
 trap 'exit 143' TERM
+cats_acquire_worker_deployment_lock
+# The unlocked check above is only an early, non-mutating preflight. Recompute
+# the cgroup path after serialization and prove physical idle again immediately
+# before masking/stopping the service, because another deployment may have
+# started runtime children while this process waited for the Host lock.
+metering_root=$(cats_worker_metering_root cats-noded)
+"$REPO/deploy/aws/metal/require-idle-worker.sh" "$metering_root" "$PREFIX/bin"
 cats_gate_node_service cats-noded
 cats_worker_deployment_crash_probe after-mask-worker
 

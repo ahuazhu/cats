@@ -174,14 +174,18 @@ locals {
 
     # One Host-global open-file-description lock spans the entire mutation,
     # candidate start/readiness proof, and commit/rollback boundary.
-    cats_acquire_worker_deployment_lock
     test "${var.install_root}" = /opt/cats
     release_installer="${var.install_root}/bin/install-guest-runtime-release"
+    cats_acquire_worker_deployment_lock
 
     # Before publishing an activation journal, close both ways the cached old
     # unit could start: a runtime mask covers this boot, while the fsynced new
     # unit/recovery helper covers a reboot. Only then may prepare expose a
-    # candidate release identity.
+    # candidate release identity. The unlocked idle check above is only an
+    # early preflight: recompute the cgroup path after serialization and prove
+    # physical idle again immediately before the masked stop.
+    metering_root="$(cats_worker_metering_root cats-worker)"
+    "$stage_path/require-idle-worker.sh" "$metering_root" "${var.install_root}/bin"
     cats_gate_node_service cats-worker
     cats_worker_deployment_crash_probe after-mask-worker
     install -D -m 0755 "$stage_path/install-guest-runtime-release.sh" "$release_installer"

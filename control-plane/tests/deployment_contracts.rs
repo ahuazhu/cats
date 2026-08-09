@@ -1790,6 +1790,7 @@ fn worker_release_install_is_closed_durable_and_identity_fail_closed() {
         "require_service_stopped",
         "require_service_active",
         "activation-parent-fsync",
+        "activation-before-journal-replace",
         "active-layout-parent-fsync:cats-root",
         "trap prepare_rollback ERR",
         "active-rename:$label",
@@ -1888,15 +1889,23 @@ fn worker_release_install_is_closed_durable_and_identity_fail_closed() {
     let identity_validate = terraform
         .find("validate-node-identity-installation.sh\"")
         .expect("staged identity validation");
-    let idle_guard = terraform
+    let early_idle_guard = terraform
         .find("require-idle-worker.sh\"")
         .expect("drained worker guard");
     let deployment_lock = terraform
         .find("cats_acquire_worker_deployment_lock")
         .expect("Host deployment lock");
-    let stop = terraform[deployment_lock..]
-        .find("cats_gate_node_service cats-worker")
+    let locked_metering = terraform[deployment_lock..]
+        .find("metering_root=\"$(cats_worker_metering_root cats-worker)\"")
         .map(|offset| deployment_lock + offset)
+        .expect("metering cgroup recomputation under the Host lock");
+    let locked_idle_guard = terraform[locked_metering..]
+        .find("require-idle-worker.sh\"")
+        .map(|offset| locked_metering + offset)
+        .expect("physical idle recheck under the Host lock");
+    let stop = terraform[locked_idle_guard..]
+        .find("cats_gate_node_service cats-worker")
+        .map(|offset| locked_idle_guard + offset)
         .expect("masked worker stop");
     let prepare = terraform[stop..]
         .find("\"$release_installer\" prepare")
@@ -1927,9 +1936,11 @@ fn worker_release_install_is_closed_durable_and_identity_fail_closed() {
         first_install < authorize && authorize < start && start < readiness && readiness < commit
     );
     assert!(
-        identity_validate < idle_guard
-            && idle_guard < deployment_lock
-            && deployment_lock < stop
+        identity_validate < early_idle_guard
+            && early_idle_guard < deployment_lock
+            && deployment_lock < locked_metering
+            && locked_metering < locked_idle_guard
+            && locked_idle_guard < stop
             && stop < prepare
             && prepare < first_install
     );

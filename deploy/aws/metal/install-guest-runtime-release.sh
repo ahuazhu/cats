@@ -403,6 +403,10 @@ write_activation() {
   chmod 0600 "$temp" || return 1
   sync -f "$temp" || return 1
   crash_probe "activation-file-fsync" || return 1
+  # Replacing the retained journal is the retry linearization point. This
+  # named pre-replace boundary proves that a crash after recovery and complete
+  # candidate persistence still leaves the old recovery authority intact.
+  crash_probe "activation-before-journal-replace" || return 1
   mv -fT -- "$temp" "$activation_path" || return 1
   crash_probe "activation-rename" || return 1
   sync -f "$releases_root" || return 1
