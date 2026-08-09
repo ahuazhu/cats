@@ -467,7 +467,28 @@ mod tests {
         assert_eq!(resolver.active.available_permits(), MAX_ACTIVE_READS);
     }
 
-    struct SlowBlob;
+    struct SlowBlob {
+        entered_provider_read: tokio::sync::Notify,
+        released: AtomicBool,
+        changed: Condvar,
+        lock: std::sync::Mutex<()>,
+    }
+
+    impl SlowBlob {
+        fn new() -> Self {
+            Self {
+                entered_provider_read: tokio::sync::Notify::new(),
+                released: AtomicBool::new(false),
+                changed: Condvar::new(),
+                lock: std::sync::Mutex::new(()),
+            }
+        }
+
+        fn release(&self) {
+            self.released.store(true, Ordering::SeqCst);
+            self.changed.notify_all();
+        }
+    }
 
     impl BlobStore for SlowBlob {
         fn put_immutable(&self, _key: &str, _data: &[u8]) -> cats_storage::blob::Result<()> {
@@ -484,7 +505,13 @@ mod tests {
             _maximum: usize,
             _deadline: Instant,
         ) -> cats_storage::blob::Result<Vec<u8>> {
-            std::thread::sleep(Duration::from_millis(100));
+            self.entered_provider_read.notify_one();
+            // Deliberately outlive the supplied deadline so the tests cover
+            // a provider that violates the transport bound.
+            let mut guard = self.lock.lock().unwrap();
+            while !self.released.load(Ordering::SeqCst) {
+                guard = self.changed.wait(guard).unwrap();
+            }
             Ok(FIXED.to_vec())
         }
 
@@ -503,14 +530,14 @@ mod tests {
 
     #[tokio::test]
     async fn timeout_discards_late_result_but_holds_active_permit_until_io_returns() {
-        let resolver = ImmutableImageManifestResolver::with_deadline(
-            Arc::new(SlowBlob),
-            Duration::from_millis(20),
-        );
+        let blob = Arc::new(SlowBlob::new());
+        let resolver =
+            ImmutableImageManifestResolver::with_deadline(blob.clone(), Duration::from_millis(20));
         let digest = Sha256Digest::new(DIGEST).unwrap();
         let error = resolver.resolve(&digest).await.unwrap_err();
         assert_eq!(error.code, cats_api::error::ErrorCode::Unavailable);
         assert_eq!(resolver.active.available_permits(), MAX_ACTIVE_READS - 1);
+        blob.release();
         wait_until(|| resolver.active.available_permits() == MAX_ACTIVE_READS).await;
     }
 
@@ -584,8 +611,9 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn shutdown_wait_is_bounded_and_late_provider_results_are_discarded() {
+        let blob = Arc::new(SlowBlob::new());
         let resolver = Arc::new(ImmutableImageManifestResolver::with_deadline(
-            Arc::new(SlowBlob),
+            blob.clone(),
             Duration::from_millis(20),
         ));
         let read_resolver = resolver.clone();
@@ -593,7 +621,12 @@ mod tests {
             let digest = Sha256Digest::new(DIGEST).unwrap();
             read_resolver.resolve(&digest).await
         });
-        wait_until(|| resolver.inflight.count.load(Ordering::SeqCst) == 1).await;
+        tokio::time::timeout(
+            Duration::from_secs(1),
+            blob.entered_provider_read.notified(),
+        )
+        .await
+        .unwrap();
 
         let started = Instant::now();
         assert!(!resolver.shutdown().await);
@@ -604,6 +637,7 @@ mod tests {
         );
         assert_eq!(resolver.inflight.count.load(Ordering::SeqCst), 1);
 
+        blob.release();
         wait_until(|| resolver.inflight.count.load(Ordering::SeqCst) == 0).await;
         let digest = Sha256Digest::new(DIGEST).unwrap();
         assert_eq!(
