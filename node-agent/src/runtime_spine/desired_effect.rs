@@ -22,7 +22,10 @@ use cats_api::runtime_reconciliation::{
 };
 use serde::{Deserialize, Serialize};
 
-use crate::ch::{plan_network, prepare_network, validate_network_plan, ChConfig, ChNetwork};
+use crate::ch::{
+    plan_network, prepare_network_with_tap_port, validate_network_plan, ChConfig, ChNetwork,
+    PlatformTapCreatePort, TapCreatePort,
+};
 use crate::state_directory::StateDirectory;
 
 use super::{RuntimeDesiredEffect, RuntimeDesiredEffectContext};
@@ -52,6 +55,7 @@ trait RuntimeNetworkPort: Send + Sync + 'static {
 
 struct CloudHypervisorNetworkPort {
     config: ChConfig,
+    tap_create: Arc<dyn TapCreatePort>,
 }
 
 impl RuntimeNetworkPort for CloudHypervisorNetworkPort {
@@ -64,7 +68,7 @@ impl RuntimeNetworkPort for CloudHypervisorNetworkPort {
         context: &RuntimeDesiredEffectContext,
         network: &ChNetwork,
     ) -> anyhow::Result<()> {
-        prepare_network(&self.config, network, context)
+        prepare_network_with_tap_port(&self.config, network, context, self.tap_create.as_ref())
     }
 }
 
@@ -79,7 +83,10 @@ pub(crate) struct ProductionRuntimeDesiredEffect {
 impl ProductionRuntimeDesiredEffect {
     pub(crate) fn new(config: ChConfig, launch: Arc<dyn RuntimeLaunchPort>) -> Self {
         Self {
-            network: Arc::new(CloudHypervisorNetworkPort { config }),
+            network: Arc::new(CloudHypervisorNetworkPort {
+                config,
+                tap_create: Arc::new(PlatformTapCreatePort),
+            }),
             launch,
             #[cfg(test)]
             after_checkpoint: None,
@@ -93,6 +100,19 @@ impl ProductionRuntimeDesiredEffect {
     ) -> Self {
         Self {
             network,
+            launch,
+            after_checkpoint: None,
+        }
+    }
+
+    #[cfg(test)]
+    fn with_tap_create_port(
+        config: ChConfig,
+        tap_create: Arc<dyn TapCreatePort>,
+        launch: Arc<dyn RuntimeLaunchPort>,
+    ) -> Self {
+        Self {
+            network: Arc::new(CloudHypervisorNetworkPort { config, tap_create }),
             launch,
             after_checkpoint: None,
         }
@@ -481,6 +501,9 @@ fn unlink_if_exists(directory: &File, name: &CStr) -> io::Result<bool> {
 
 #[cfg(test)]
 mod tests {
+    use std::ffi::CString;
+    use std::fs::OpenOptions;
+    use std::io::Read as _;
     use std::os::unix::fs::PermissionsExt as _;
     use std::sync::Mutex;
     use std::time::{Duration, Instant};
@@ -489,6 +512,8 @@ mod tests {
         spec_digest, AssignedKind, AssignedPlacement, Epoch, Ipv4Address, IsolatedIpv4Kind,
         MacAddress, Revision, RuntimeConfig, RuntimeTransition, Sha256Digest,
     };
+
+    use crate::ch::PendingTap;
 
     use super::*;
 
@@ -505,6 +530,43 @@ mod tests {
         fail_prepare: bool,
         on_plan: Option<Arc<dyn Fn() + Send + Sync>>,
         on_prepare: Option<Arc<dyn Fn() + Send + Sync>>,
+    }
+
+    #[derive(Default)]
+    struct TapCalls {
+        created: Vec<String>,
+        published: Vec<String>,
+    }
+
+    #[derive(Default)]
+    struct FakeTapCreatePort {
+        calls: Arc<Mutex<TapCalls>>,
+    }
+
+    struct FakePendingTap {
+        tap_name: String,
+        calls: Arc<Mutex<TapCalls>>,
+    }
+
+    impl PendingTap for FakePendingTap {
+        fn publish(self: Box<Self>) -> anyhow::Result<()> {
+            self.calls
+                .lock()
+                .unwrap()
+                .published
+                .push(self.tap_name.clone());
+            Ok(())
+        }
+    }
+
+    impl TapCreatePort for FakeTapCreatePort {
+        fn create_nonpersistent(&self, tap_name: &str) -> anyhow::Result<Box<dyn PendingTap>> {
+            self.calls.lock().unwrap().created.push(tap_name.to_owned());
+            Ok(Box::new(FakePendingTap {
+                tap_name: tap_name.to_owned(),
+                calls: Arc::clone(&self.calls),
+            }))
+        }
     }
 
     impl FakeNetworkPort {
@@ -963,9 +1025,15 @@ mod tests {
         .unwrap();
         std::fs::set_permissions(&fake_ip, std::fs::Permissions::from_mode(0o755)).unwrap();
         let (launch, launch_calls) = RecordingLaunch::new(false);
-        ProductionRuntimeDesiredEffect::new(ch_config(fake_ip), Arc::new(launch))
-            .apply(effect_context(root.path()), &desired)
-            .unwrap();
+        let tap_create = Arc::new(FakeTapCreatePort::default());
+        let tap_calls = Arc::clone(&tap_create.calls);
+        ProductionRuntimeDesiredEffect::with_tap_create_port(
+            ch_config(fake_ip),
+            tap_create,
+            Arc::new(launch),
+        )
+        .apply(effect_context(root.path()), &desired)
+        .unwrap();
 
         let launch_calls = launch_calls.lock().unwrap();
         assert_eq!(launch_calls.len(), 1);
@@ -976,8 +1044,14 @@ mod tests {
             checkpoint(root.path(), &desired),
             DurableNetworkCheckpoint::from_network(&desired, network)
         );
+        let tap_calls = tap_calls.lock().unwrap();
+        assert_eq!(tap_calls.created, vec![network.tap.clone()]);
+        assert_eq!(tap_calls.published, vec![network.tap.clone()]);
         let ip_calls = std::fs::read_to_string(ip_log).unwrap();
-        assert!(ip_calls.contains(&format!("tuntap add dev {} mode tap", network.tap)));
+        assert!(
+            !ip_calls.contains("tuntap"),
+            "production adapter fell back to command-line TAP creation"
+        );
         assert!(ip_calls.contains(&format!(
             "addr add {}/{} dev {}",
             network.config.gateway_ipv4.as_str(),
@@ -1128,16 +1202,31 @@ exit 0\n",
     }
 
     #[test]
-    fn production_adapter_kills_and_reaps_ip_at_the_absolute_deadline() {
+    fn production_adapter_kills_and_reaps_ip_after_started_child_is_cancelled() {
         let root = tempfile::tempdir().unwrap();
         let desired = desired();
         let pid_file = root.path().join("ip.pid");
+        let started_fifo_path = root.path().join("ip.started");
+        let started_fifo_c =
+            CString::new(started_fifo_path.as_os_str().as_encoded_bytes()).unwrap();
+        // SAFETY: the path is a live NUL-terminated string and mode contains
+        // only permission bits. The test owns the previously absent path.
+        assert_eq!(unsafe { libc::mkfifo(started_fifo_c.as_ptr(), 0o600) }, 0);
+        // O_RDWR prevents either endpoint's open from becoming a second
+        // timing condition; the single byte remains the exact child-started
+        // barrier.
+        let mut started_fifo = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&started_fifo_path)
+            .unwrap();
         let fake_ip = root.path().join("ip");
         std::fs::write(
             &fake_ip,
             format!(
-                "#!/bin/sh\nprintf '%s' \"$$\" > '{}'\nexec /bin/sleep 60\n",
-                pid_file.display()
+                "#!/bin/sh\nprintf '%s' \"$$\" > '{pid}'\nprintf x > '{started}'\nexec /bin/sleep 60\n",
+                pid = pid_file.display(),
+                started = started_fifo_path.display(),
             ),
         )
         .unwrap();
@@ -1152,19 +1241,25 @@ exit 0\n",
             .unwrap()
             .publish(&desired, &network)
             .unwrap();
-        let context = RuntimeDesiredEffectContext::for_test(
-            state,
-            Instant::now() + Duration::from_millis(500),
-        );
+        let context =
+            RuntimeDesiredEffectContext::for_test(state, Instant::now() + Duration::from_secs(10));
+        let cancellation = context.clone();
         let (launch, launch_calls) = RecordingLaunch::new(false);
-        let started = Instant::now();
-        let error = ProductionRuntimeDesiredEffect::new(ch_config(fake_ip), Arc::new(launch))
-            .apply(context, &desired)
-            .unwrap_err();
-        assert!(format!("{error:#}").contains("deadline expired"));
+        let worker = std::thread::spawn(move || {
+            ProductionRuntimeDesiredEffect::new(ch_config(fake_ip), Arc::new(launch))
+                .apply(context, &desired)
+                .unwrap_err()
+        });
+        let mut started = [0_u8; 1];
+        started_fifo.read_exact(&mut started).unwrap();
+        assert_eq!(started, [b'x']);
+        let cancel_started = Instant::now();
+        cancellation.cancel_for_test();
+        let error = worker.join().unwrap();
+        assert!(format!("{error:#}").contains("cancelled"));
         assert!(
-            started.elapsed() < Duration::from_secs(2),
-            "hung ip outlived its absolute effect deadline"
+            cancel_started.elapsed() < Duration::from_secs(2),
+            "hung ip outlived explicit effect cancellation"
         );
         assert!(launch_calls.lock().unwrap().is_empty());
 

@@ -211,6 +211,111 @@ pub(crate) fn validate_network_plan(network: &ChNetwork) -> Result<()> {
     Ok(())
 }
 
+/// A newly-created TAP that is still tied to its clone descriptor.
+///
+/// Until `publish` succeeds, dropping this value is the only cleanup action:
+/// Linux removes the non-persistent interface when the descriptor closes, so
+/// an error path never has to guess ownership from a reusable name or ifindex.
+pub(crate) trait PendingTap: Send {
+    fn publish(self: Box<Self>) -> Result<()>;
+}
+
+/// The narrow physical TAP creation seam used by the network state machine.
+/// Tests inject a descriptor-lifetime fake; production has no command-line
+/// fallback for this security-sensitive create/publish transition.
+pub(crate) trait TapCreatePort: Send + Sync + 'static {
+    fn create_nonpersistent(&self, tap_name: &str) -> Result<Box<dyn PendingTap>>;
+}
+
+pub(crate) struct PlatformTapCreatePort;
+
+#[cfg(target_os = "linux")]
+struct LinuxPendingTap {
+    descriptor: File,
+}
+
+#[cfg(target_os = "linux")]
+impl PendingTap for LinuxPendingTap {
+    fn publish(self: Box<Self>) -> Result<()> {
+        // TUNSETPERSIST consumes an integer value, despite its `_IOW<int>`
+        // encoding. On failure `self` still drops and closes the clone fd, so
+        // the unpublished TAP is removed by the kernel.
+        // SAFETY: `descriptor` is a live `/dev/net/tun` clone descriptor and
+        // this ioctl retains neither the fd nor any Rust memory.
+        let result = unsafe {
+            libc::ioctl(
+                self.descriptor.as_raw_fd(),
+                libc::TUNSETPERSIST,
+                1 as libc::c_int,
+            )
+        };
+        if result < 0 {
+            Err(io::Error::last_os_error()).context("publish Linux TAP with TUNSETPERSIST")
+        } else {
+            Ok(())
+        }
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn linux_tap_request(tap_name: &str) -> Result<libc::ifreq> {
+    let name = tap_name.as_bytes();
+    anyhow::ensure!(
+        name.len() < libc::IFNAMSIZ,
+        "Linux TAP name exceeds IFNAMSIZ"
+    );
+    // SAFETY: `ifreq` is a C plain-data request whose all-zero representation
+    // is the required starting state before setting its name and flag union.
+    let mut request: libc::ifreq = unsafe { std::mem::zeroed() };
+    for (target, source) in request.ifr_name.iter_mut().zip(name.iter().copied()) {
+        *target = source as libc::c_char;
+    }
+    request.ifr_ifru.ifru_flags =
+        (libc::IFF_TAP | libc::IFF_NO_PI | libc::IFF_TUN_EXCL) as libc::c_short;
+    Ok(request)
+}
+
+#[cfg(target_os = "linux")]
+impl TapCreatePort for PlatformTapCreatePort {
+    fn create_nonpersistent(&self, tap_name: &str) -> Result<Box<dyn PendingTap>> {
+        let descriptor = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .custom_flags(libc::O_CLOEXEC)
+            .open("/dev/net/tun")
+            .context("open Linux /dev/net/tun clone device")?;
+        let mut request = linux_tap_request(tap_name)?;
+        // SAFETY: the fd is a live TUN clone descriptor and `request` is a
+        // correctly-sized writable ifreq that remains live for this call.
+        let result = unsafe { libc::ioctl(descriptor.as_raw_fd(), libc::TUNSETIFF, &mut request) };
+        if result < 0 {
+            return Err(io::Error::last_os_error())
+                .with_context(|| format!("create exclusive non-persistent Linux TAP {tap_name}"));
+        }
+        let actual_name_end = request
+            .ifr_name
+            .iter()
+            .position(|byte| *byte == 0)
+            .context("Linux TUNSETIFF returned a non-terminated interface name")?;
+        let actual_name = request.ifr_name[..actual_name_end]
+            .iter()
+            .map(|byte| byte.to_ne_bytes()[0])
+            .collect::<Vec<_>>();
+        anyhow::ensure!(
+            actual_name == tap_name.as_bytes(),
+            "Linux TUNSETIFF returned a different TAP name"
+        );
+        Ok(Box::new(LinuxPendingTap { descriptor }))
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+impl TapCreatePort for PlatformTapCreatePort {
+    fn create_nonpersistent(&self, _tap_name: &str) -> Result<Box<dyn PendingTap>> {
+        anyhow::bail!("exclusive non-persistent TAP creation requires Linux /dev/net/tun")
+    }
+}
+
 enum IpCommandContext<'a> {
     Desired(&'a RuntimeDesiredEffectContext),
     Standalone { deadline: Instant },
@@ -601,6 +706,15 @@ pub fn prepare_network(
     network: &ChNetwork,
     effect_context: &RuntimeDesiredEffectContext,
 ) -> Result<()> {
+    prepare_network_with_tap_port(cfg, network, effect_context, &PlatformTapCreatePort)
+}
+
+pub(crate) fn prepare_network_with_tap_port(
+    cfg: &ChConfig,
+    network: &ChNetwork,
+    effect_context: &RuntimeDesiredEffectContext,
+    tap_create: &dyn TapCreatePort,
+) -> Result<()> {
     validate_network_plan(network)?;
     let host_cidr = host_cidr(network);
     let desired_cidr = Ipv4Cidr::parse(&host_cidr).context("parse checkpointed Host IPv4 CIDR")?;
@@ -643,12 +757,10 @@ pub fn prepare_network(
     }
 
     ensure_host_cidr_available(cfg, desired_cidr, None, &context)?;
-    ip_status(
-        &context,
-        &cfg.ip_bin,
-        &["tuntap", "add", "dev", &network.tap, "mode", "tap"],
-    )?;
-    if let Err(error) = (|| {
+    let pending_tap = tap_create
+        .create_nonpersistent(&network.tap)
+        .with_context(|| format!("create unpublished Host tap {}", network.tap))?;
+    (|| {
         ip_status(
             &context,
             &cfg.ip_bin,
@@ -670,22 +782,15 @@ pub fn prepare_network(
             &context,
             &cfg.ip_bin,
             &["link", "set", "dev", &network.tap, "up"],
-        )
-    })() {
-        // This invocation just created the name, so deleting it is not an
-        // adoption decision and cannot remove a pre-existing foreign tap. A
-        // cancelled/deadline-expired effect issues no later command; the
-        // durable tuple lets the next admitted run adopt the partial tap.
-        if context.check_active().is_ok() {
-            let _ = ip_status(
-                &context,
-                &cfg.ip_bin,
-                &["link", "delete", "dev", &network.tap],
-            );
-        }
-        return Err(error);
-    }
-    Ok(())
+        )?;
+        // This is the publication boundary. Every earlier failure,
+        // cancellation or process exit closes `pending_tap`, so Linux removes
+        // the exact unpublished interface without a name-based delete.
+        context.check_active()?;
+        pending_tap
+            .publish()
+            .with_context(|| format!("publish configured Host tap {}", network.tap))
+    })()
 }
 
 pub fn remove_network(cfg: &ChConfig, network: &ChNetwork) -> Result<()> {
@@ -1596,7 +1701,82 @@ mod tests {
     use super::*;
     use std::os::unix::fs::PermissionsExt;
     use std::os::unix::net::UnixListener;
-    use std::sync::mpsc;
+    use std::sync::{mpsc, Arc, Mutex};
+
+    #[derive(Debug, Clone, Copy)]
+    enum FakePublishBehavior {
+        Succeed,
+        PanicBeforePublish,
+    }
+
+    #[derive(Default)]
+    struct FakeTapEvents {
+        creates: usize,
+        publishes: usize,
+        unpublished_drops: usize,
+    }
+
+    struct MarkerTapCreatePort {
+        link: PathBuf,
+        behavior: FakePublishBehavior,
+        cancel_after_create: Option<RuntimeDesiredEffectContext>,
+        events: Arc<Mutex<FakeTapEvents>>,
+    }
+
+    impl MarkerTapCreatePort {
+        fn new(link: PathBuf) -> Self {
+            Self {
+                link,
+                behavior: FakePublishBehavior::Succeed,
+                cancel_after_create: None,
+                events: Arc::new(Mutex::new(FakeTapEvents::default())),
+            }
+        }
+    }
+
+    struct MarkerPendingTap {
+        link: PathBuf,
+        behavior: FakePublishBehavior,
+        events: Arc<Mutex<FakeTapEvents>>,
+        published: bool,
+    }
+
+    impl PendingTap for MarkerPendingTap {
+        fn publish(mut self: Box<Self>) -> Result<()> {
+            if matches!(self.behavior, FakePublishBehavior::PanicBeforePublish) {
+                panic!("injected process crash before TAP publish");
+            }
+            self.events.lock().unwrap().publishes += 1;
+            self.published = true;
+            Ok(())
+        }
+    }
+
+    impl Drop for MarkerPendingTap {
+        fn drop(&mut self) {
+            if !self.published {
+                let _ = std::fs::remove_file(&self.link);
+                self.events.lock().unwrap().unpublished_drops += 1;
+            }
+        }
+    }
+
+    impl TapCreatePort for MarkerTapCreatePort {
+        fn create_nonpersistent(&self, _tap_name: &str) -> Result<Box<dyn PendingTap>> {
+            anyhow::ensure!(!self.link.exists(), "fake exclusive TAP already exists");
+            std::fs::write(&self.link, [])?;
+            self.events.lock().unwrap().creates += 1;
+            if let Some(context) = &self.cancel_after_create {
+                context.cancel_for_test();
+            }
+            Ok(Box::new(MarkerPendingTap {
+                link: self.link.clone(),
+                behavior: self.behavior,
+                events: Arc::clone(&self.events),
+                published: false,
+            }))
+        }
+    }
 
     #[test]
     fn block_path_round_trips_and_rejects_unknown_values() {
@@ -1989,7 +2169,9 @@ exit 97\n",
         let mut cfg = probe_config(dir.path().join("nbd-client"), 8);
         cfg.ip_bin = fake_ip;
         let context = desired_effect_context(dir.path());
-        prepare_network(&cfg, &replayed, &context).unwrap();
+        let tap_create = MarkerTapCreatePort::new(link.clone());
+        let tap_events = Arc::clone(&tap_create.events);
+        prepare_network_with_tap_port(&cfg, &replayed, &context, &tap_create).unwrap();
         assert_eq!(std::fs::read_to_string(&address).unwrap(), "10.240.0.5/30");
         assert_eq!(
             std::fs::read_to_string(&alias).unwrap(),
@@ -1999,18 +2181,135 @@ exit 97\n",
         // Crash after the token-bearing tap exists but before its address is
         // complete: the durable tuple is adopted and completed, not replanned.
         std::fs::remove_file(&address).unwrap();
-        prepare_network(&cfg, &replayed, &context).unwrap();
+        prepare_network_with_tap_port(&cfg, &replayed, &context, &tap_create).unwrap();
         assert_eq!(std::fs::read_to_string(&address).unwrap(), "10.240.0.5/30");
 
         let foreign = ChNetwork {
             ownership_token: RandomId128::new("bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb").unwrap(),
             ..replayed.clone()
         };
-        assert!(prepare_network(&cfg, &foreign, &context).is_err());
+        assert!(prepare_network_with_tap_port(&cfg, &foreign, &context, &tap_create).is_err());
         assert!(remove_network(&cfg, &foreign).is_err());
         assert!(link.exists(), "foreign-token cleanup deleted the owned tap");
+        let events = tap_events.lock().unwrap();
+        assert_eq!(events.creates, 1);
+        assert_eq!(events.publishes, 1);
+        assert_eq!(events.unpublished_drops, 0);
+        drop(events);
         remove_network(&cfg, &replayed).unwrap();
         assert!(!link.exists());
+    }
+
+    #[test]
+    fn cancellation_after_nonpersistent_tap_create_drops_it_without_name_cleanup() {
+        let dir = tempfile::tempdir().unwrap();
+        let link = dir.path().join("tap-live");
+        let mutation = dir.path().join("mutation");
+        let log = dir.path().join("ip.log");
+        let fake_ip = dir.path().join("ip");
+        std::fs::write(
+            &fake_ip,
+            format!(
+                "#!/bin/sh\nprintf '%s\\n' \"$*\" >> '{log}'\n\
+if [ \"$1\" = '-d' ]; then exit 1; fi\n\
+if [ \"$1\" = '-o' ]; then exit 0; fi\n\
+: > '{mutation}'\n\
+exit 0\n",
+                log = log.display(),
+                mutation = mutation.display(),
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&fake_ip, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let mut cfg = probe_config(dir.path().join("nbd-client"), 8);
+        cfg.ip_bin = fake_ip;
+        let network = plan_network(&desired_network()).unwrap();
+        let context = desired_effect_context(dir.path());
+        let mut tap_create = MarkerTapCreatePort::new(link.clone());
+        tap_create.cancel_after_create = Some(context.clone());
+        let events = Arc::clone(&tap_create.events);
+
+        let error = prepare_network_with_tap_port(&cfg, &network, &context, &tap_create)
+            .expect_err("cancelled unpublished TAP was accepted");
+        assert!(format!("{error:#}").contains("cancelled"));
+        assert!(!link.exists(), "cancelled pending TAP remained visible");
+        assert!(
+            !mutation.exists(),
+            "cancelled state machine mutated the TAP"
+        );
+        assert!(
+            !std::fs::read_to_string(log)
+                .unwrap()
+                .contains("link delete"),
+            "cancellation guessed cleanup from the TAP name"
+        );
+        let events = events.lock().unwrap();
+        assert_eq!(events.creates, 1);
+        assert_eq!(events.publishes, 0);
+        assert_eq!(events.unpublished_drops, 1);
+    }
+
+    #[test]
+    fn crash_before_publish_drops_nonpersistent_tap_without_name_cleanup() {
+        let dir = tempfile::tempdir().unwrap();
+        let link = dir.path().join("tap-live");
+        let log = dir.path().join("ip.log");
+        let fake_ip = dir.path().join("ip");
+        std::fs::write(
+            &fake_ip,
+            format!(
+                "#!/bin/sh\nprintf '%s\\n' \"$*\" >> '{log}'\n\
+if [ \"$1\" = '-d' ]; then exit 1; fi\n\
+if [ \"$1\" = '-o' ]; then exit 0; fi\n\
+exit 0\n",
+                log = log.display(),
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&fake_ip, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let mut cfg = probe_config(dir.path().join("nbd-client"), 8);
+        cfg.ip_bin = fake_ip;
+        let network = plan_network(&desired_network()).unwrap();
+        let context = desired_effect_context(dir.path());
+        let mut tap_create = MarkerTapCreatePort::new(link.clone());
+        tap_create.behavior = FakePublishBehavior::PanicBeforePublish;
+        let events = Arc::clone(&tap_create.events);
+
+        let crashed = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            prepare_network_with_tap_port(&cfg, &network, &context, &tap_create)
+        }));
+        assert!(
+            crashed.is_err(),
+            "injected pre-publish crash did not unwind"
+        );
+        assert!(!link.exists(), "crashed pending TAP remained visible");
+        assert!(
+            !std::fs::read_to_string(log)
+                .unwrap()
+                .contains("link delete"),
+            "crash recovery guessed cleanup from the TAP name"
+        );
+        let events = events.lock().unwrap();
+        assert_eq!(events.creates, 1);
+        assert_eq!(events.publishes, 0);
+        assert_eq!(events.unpublished_drops, 1);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn linux_tun_request_is_exclusive_nonpersistent_tap_without_packet_info() {
+        let request = linux_tap_request("catphysical01").unwrap();
+        let name_end = request.ifr_name.iter().position(|byte| *byte == 0).unwrap();
+        let name = request.ifr_name[..name_end]
+            .iter()
+            .map(|byte| byte.to_ne_bytes()[0])
+            .collect::<Vec<_>>();
+        assert_eq!(name, b"catphysical01");
+        // SAFETY: linux_tap_request initialized this union variant and no
+        // other variant has been written since.
+        let flags = unsafe { request.ifr_ifru.ifru_flags } as libc::c_int & 0xffff;
+        assert_eq!(flags, libc::IFF_TAP | libc::IFF_NO_PI | libc::IFF_TUN_EXCL);
+        assert_eq!(flags & libc::IFF_PERSIST, 0);
     }
 
     #[test]
