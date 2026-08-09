@@ -488,7 +488,7 @@ fn accept_empty_admission(
 ) -> super::runtime_spine::PlacementAdmissionSnapshot {
     let request = cats_api::runtime_reconciliation::DesiredReadRequest {
         version: ContractVersion::V1,
-        session: binding(&session),
+        session: binding(session),
         request_sequence: Sequence::new(1).unwrap(),
     };
     let snapshot = accepted(store.runtime_desired_read(authenticated, &request).unwrap());
