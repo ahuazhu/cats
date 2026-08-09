@@ -38,15 +38,28 @@ const AUTHORIZED_CONTROL_SPEC: &str = "authorized-serving.json";
 const STATUS_MAX_BYTES: usize = 64 * 1024;
 const COMMAND_OUTPUT_MAX_BYTES: usize = 32 * 1024;
 const POLL_INTERVAL: Duration = Duration::from_millis(5);
-const TOKEN_ENVIRONMENT_KEY: &str = "CATS_RUNTIME_PROCESS_IDENTITY_TOKEN";
+const UNSET_CREDENTIAL_ENVIRONMENT: [&str; 6] = [
+    "AWS_ACCESS_KEY_ID",
+    "AWS_SECRET_ACCESS_KEY",
+    "AWS_SESSION_TOKEN",
+    "AWS_CONTAINER_CREDENTIALS_FULL_URI",
+    "AWS_CONTAINER_AUTHORIZATION_TOKEN_FILE",
+    "CATS_POSTGRES_URL",
+];
 
-/// Explicit process inputs. `environment` contains only the credentials and
-/// adapter inputs deliberately added to blockd. The systemd CLI helper itself
-/// never inherits ambient process state.
+/// Credentialless process inputs. PostgreSQL must use its rotating `url-file`
+/// source and S3 must use instance-role credentials; this type has no field by
+/// which a future caller can place a secret in `systemd-run` argv.
 #[derive(Debug, Clone)]
 pub(crate) struct RootProvisionSystemdConfig {
-    pub blockd: AuthorizedBlockdLaunchConfig,
-    pub environment: Vec<(OsString, OsString)>,
+    blockd: AuthorizedBlockdLaunchConfig,
+}
+
+impl RootProvisionSystemdConfig {
+    pub(crate) fn new(blockd: AuthorizedBlockdLaunchConfig) -> anyhow::Result<Self> {
+        validate_credentialless_blockd_config(&blockd)?;
+        Ok(Self { blockd })
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -55,7 +68,6 @@ struct TransientServiceLaunch {
     cgroup_path: HostPath,
     executable: PathBuf,
     arguments: Vec<OsString>,
-    environment: Vec<(OsString, OsString)>,
     process_identity_token: RandomId128,
 }
 
@@ -327,6 +339,7 @@ fn build_launch(
     config: &RootProvisionSystemdConfig,
     expected: &RootProvisionProcessExpectation,
 ) -> anyhow::Result<TransientServiceLaunch> {
+    validate_credentialless_blockd_config(&config.blockd)?;
     anyhow::ensure!(
         config.blockd.blockd_binary.is_absolute()
             && config.blockd.blockd_binary == Path::new(expected.executable_path.as_str()),
@@ -342,7 +355,6 @@ fn build_launch(
             && config.blockd.max_local_bytes > 0,
         "root-provision blockd resource limits must be positive"
     );
-    validate_environment(&config.environment)?;
     let data_directory = Path::new(expected.data_directory.as_str());
     let authorized_control_spec = data_directory.join(AUTHORIZED_CONTROL_SPEC);
     let mut arguments = vec![
@@ -400,40 +412,51 @@ fn build_launch(
         cgroup_path: expected.cgroup_path.clone(),
         executable: config.blockd.blockd_binary.clone(),
         arguments,
-        environment: config.environment.clone(),
         process_identity_token: expected.process_identity_token.clone(),
     })
 }
 
-fn validate_environment(environment: &[(OsString, OsString)]) -> anyhow::Result<()> {
-    let mut keys = BTreeMap::new();
-    for (key, value) in environment {
-        let key = key
-            .to_str()
-            .context("root-provision environment key is not UTF-8")?;
-        let value = value
-            .to_str()
-            .context("root-provision environment value is not UTF-8")?;
+fn validate_credentialless_blockd_config(
+    config: &AuthorizedBlockdLaunchConfig,
+) -> anyhow::Result<()> {
+    anyhow::ensure!(
+        config.metadata_store.name == "postgres",
+        "root-provision blockd requires the frozen postgres authority adapter"
+    );
+    config
+        .metadata_store
+        .config
+        .ensure_only("postgres", &["url-file", "ca-file", "session-setup"])
+        .context("root-provision metadata adapter contains an unsafe option")?;
+    let url_file = config
+        .metadata_store
+        .config
+        .optional("url-file")
+        .context("root-provision postgres authority requires url-file credentials")?;
+    anyhow::ensure!(
+        Path::new(url_file).is_absolute(),
+        "root-provision postgres url-file must be absolute"
+    );
+    if let Some(ca_file) = config.metadata_store.config.optional("ca-file") {
         anyhow::ensure!(
-            !key.is_empty()
-                && key
-                    .bytes()
-                    .all(|byte| byte.is_ascii_uppercase() || byte.is_ascii_digit() || byte == b'_')
-                && key != TOKEN_ENVIRONMENT_KEY,
-            "root-provision environment contains an unsafe or reserved key"
-        );
-        anyhow::ensure!(
-            !value.is_empty()
-                && value.bytes().all(|byte| {
-                    byte.is_ascii_graphic() && !matches!(byte, b'\\' | b'\'' | b'"')
-                }),
-            "root-provision environment value is not one unquoted printable token"
-        );
-        anyhow::ensure!(
-            keys.insert(key, ()).is_none(),
-            "root-provision environment contains a duplicate key"
+            Path::new(ca_file).is_absolute(),
+            "root-provision postgres ca-file must be absolute"
         );
     }
+    anyhow::ensure!(
+        config.object_store.name == "aws-s3",
+        "root-provision blockd requires the selected Direct-S3 object adapter"
+    );
+    config
+        .object_store
+        .config
+        .ensure_only("aws-s3", &["endpoint", "bucket", "region", "prefix"])
+        .context("root-provision S3 adapter contains an unsafe option")?;
+    config
+        .object_store
+        .config
+        .required("aws-s3", "bucket")
+        .context("root-provision S3 adapter requires a bucket")?;
     Ok(())
 }
 
@@ -525,17 +548,13 @@ fn platform_submit_systemd(
         .arg("--property=KillMode=control-group")
         .arg("--property=Restart=no")
         .arg("--property=TimeoutStopSec=2s")
+        .arg("--property=Environment=")
+        .arg("--property=EnvironmentFile=")
+        .arg("--property=PassEnvironment=")
         .arg(format!(
-            "--setenv={TOKEN_ENVIRONMENT_KEY}={}",
-            launch.process_identity_token
+            "--property=UnsetEnvironment={}",
+            UNSET_CREDENTIAL_ENVIRONMENT.join(" ")
         ));
-    for (key, value) in &launch.environment {
-        command.arg(format!(
-            "--setenv={}={}",
-            key.to_string_lossy(),
-            value.to_string_lossy()
-        ));
-    }
     command
         .arg("--")
         .arg(&launch.executable)
@@ -638,7 +657,7 @@ fn validate_launch(launch: &TransientServiceLaunch) -> anyhow::Result<()> {
                 == format!("{CGROUP_ROOT}/{SYSTEM_SLICE}/{}", launch.unit_id.as_str()),
         "invalid transient root-provision service identity"
     );
-    validate_environment(&launch.environment)
+    Ok(())
 }
 
 fn sanitized_systemd_command(command: &mut Command) {
@@ -739,6 +758,9 @@ struct SystemdUnitProperties {
     control_group: String,
     exec_start: String,
     environment: String,
+    environment_files: String,
+    pass_environment: String,
+    unset_environment: String,
 }
 
 impl SystemdUnitProperties {
@@ -751,6 +773,9 @@ impl SystemdUnitProperties {
             && self.control_group.is_empty()
             && self.exec_start.is_empty()
             && self.environment.is_empty()
+            && self.environment_files.is_empty()
+            && self.pass_environment.is_empty()
+            && self.unset_environment.is_empty()
     }
 
     fn is_starting(&self, expected: &Id) -> bool {
@@ -760,7 +785,6 @@ impl SystemdUnitProperties {
     }
 
     fn is_running(&self, launch: &TransientServiceLaunch) -> bool {
-        let expected_token = format!("{TOKEN_ENVIRONMENT_KEY}={}", launch.process_identity_token);
         self.id == launch.unit_id.as_str()
             && self.load_state == "loaded"
             && self.active_state == "active"
@@ -774,10 +798,10 @@ impl SystemdUnitProperties {
             && self
                 .exec_start
                 .contains(launch.process_identity_token.as_str())
-            && self
-                .environment
-                .split_ascii_whitespace()
-                .any(|entry| entry.trim_matches('"') == expected_token)
+            && self.environment.is_empty()
+            && self.environment_files.is_empty()
+            && self.pass_environment.is_empty()
+            && exact_unset_environment(&self.unset_environment)
     }
 }
 
@@ -803,6 +827,9 @@ fn systemd_unit_properties(
         "ControlGroup",
         "ExecStart",
         "Environment",
+        "EnvironmentFiles",
+        "PassEnvironment",
+        "UnsetEnvironment",
     ] {
         command.arg(format!("--property={property}"));
     }
@@ -827,7 +854,10 @@ fn parse_systemd_properties(bytes: &[u8]) -> anyhow::Result<SystemdUnitPropertie
             "systemctl show emitted a duplicate property"
         );
     }
-    anyhow::ensure!(values.len() == 8, "systemctl show omitted a fixed property");
+    anyhow::ensure!(
+        values.len() == 11,
+        "systemctl show omitted a fixed property"
+    );
     let take = |values: &mut BTreeMap<&str, String>, key| {
         values
             .remove(key)
@@ -845,7 +875,21 @@ fn parse_systemd_properties(bytes: &[u8]) -> anyhow::Result<SystemdUnitPropertie
         control_group: take(&mut values, "ControlGroup")?,
         exec_start: take(&mut values, "ExecStart")?,
         environment: take(&mut values, "Environment")?,
+        environment_files: take(&mut values, "EnvironmentFiles")?,
+        pass_environment: take(&mut values, "PassEnvironment")?,
+        unset_environment: take(&mut values, "UnsetEnvironment")?,
     })
+}
+
+fn exact_unset_environment(value: &str) -> bool {
+    let mut actual = value
+        .split_ascii_whitespace()
+        .map(|entry| entry.trim_matches('"'))
+        .collect::<Vec<_>>();
+    actual.sort_unstable();
+    let mut expected = UNSET_CREDENTIAL_ENVIRONMENT.to_vec();
+    expected.sort_unstable();
+    actual == expected
 }
 
 #[cfg(target_os = "linux")]
@@ -855,6 +899,7 @@ struct LinuxProcessSample {
     executable_path: PathBuf,
     command_line: Vec<OsString>,
     control_group: String,
+    environment_keys: Vec<Vec<u8>>,
 }
 
 #[cfg(target_os = "linux")]
@@ -880,11 +925,43 @@ fn sample_linux_process(process_id: u32) -> Option<LinuxProcessSample> {
     if unified.next().is_some() || !control_group.starts_with('/') {
         return None;
     }
+    let environment = std::fs::read(format!("/proc/{process_id}/environ")).ok()?;
+    let environment_keys = parse_process_environment_keys(&environment)?;
+    if !credential_environment_is_absent(&environment_keys) {
+        return None;
+    }
     Some(LinuxProcessSample {
         start_time_ticks,
         executable_path,
         command_line,
         control_group,
+        environment_keys,
+    })
+}
+
+fn parse_process_environment_keys(bytes: &[u8]) -> Option<Vec<Vec<u8>>> {
+    if bytes.len() > STATUS_MAX_BYTES || bytes.last().is_some_and(|byte| *byte != 0) {
+        return None;
+    }
+    let mut keys = bytes
+        .split(|byte| *byte == 0)
+        .filter(|entry| !entry.is_empty())
+        .map(|entry| {
+            let separator = entry.iter().position(|byte| *byte == b'=')?;
+            (separator > 0).then(|| entry[..separator].to_vec())
+        })
+        .collect::<Option<Vec<_>>>()?;
+    keys.sort();
+    let before = keys.len();
+    keys.dedup();
+    (keys.len() == before).then_some(keys)
+}
+
+fn credential_environment_is_absent(keys: &[Vec<u8>]) -> bool {
+    UNSET_CREDENTIAL_ENVIRONMENT.iter().all(|forbidden| {
+        !keys
+            .iter()
+            .any(|key| key.as_slice() == forbidden.as_bytes())
     })
 }
 
@@ -1288,7 +1365,7 @@ mod tests {
     }
 
     #[test]
-    fn command_is_control_only_target_surface_with_sanitized_explicit_environment() {
+    fn command_is_control_only_target_surface_without_secret_environment() {
         let launch = build_launch(&config(), &expectation()).unwrap();
         assert_eq!(launch.unit_id, id("cats-root.service"));
         assert_eq!(launch.executable, Path::new("/usr/bin/cats-blockd"));
@@ -1311,13 +1388,17 @@ mod tests {
         ] {
             assert!(!launch.arguments.contains(&OsString::from(forbidden)));
         }
-        assert_eq!(
-            launch.environment,
-            vec![(
-                OsString::from("CATS_TEST_POSTGRES_URL"),
-                OsString::from("postgres://runtime.test/cats")
-            )]
-        );
+        assert!(launch
+            .arguments
+            .contains(&OsString::from("url-file=/run/cats/postgres-url")));
+        assert!(!launch
+            .arguments
+            .iter()
+            .any(|argument| argument.to_string_lossy().contains("postgres://")));
+        assert!(!launch
+            .arguments
+            .iter()
+            .any(|argument| argument.to_string_lossy().contains("url-env=")));
         assert_eq!(SYSTEMD_RUN, "/usr/bin/systemd-run");
         assert_eq!(SYSTEMCTL, "/usr/bin/systemctl");
     }
@@ -1325,57 +1406,138 @@ mod tests {
     #[test]
     fn fixed_systemctl_properties_distinguish_absent_and_exact_running_unit() {
         let absent = parse_systemd_properties(
-            b"Id=cats-root.service\nLoadState=not-found\nActiveState=inactive\nSubState=dead\nMainPID=0\nControlGroup=\nExecStart=\nEnvironment=\n",
+            b"Id=cats-root.service\nLoadState=not-found\nActiveState=inactive\nSubState=dead\nMainPID=0\nControlGroup=\nExecStart=\nEnvironment=\nEnvironmentFiles=\nPassEnvironment=\nUnsetEnvironment=\n",
         )
         .unwrap();
         assert!(absent.proves_absent(&id("cats-root.service")));
 
         let launch = build_launch(&config(), &expectation()).unwrap();
         let running = parse_systemd_properties(
-            b"Id=cats-root.service\nLoadState=loaded\nActiveState=active\nSubState=running\nMainPID=4242\nControlGroup=/system.slice/cats-root.service\nExecStart={ path=/usr/bin/cats-blockd ; argv[]=/usr/bin/cats-blockd --process-identity-token 44444444444444444444444444444444 ; }\nEnvironment=CATS_RUNTIME_PROCESS_IDENTITY_TOKEN=44444444444444444444444444444444\n",
+            b"Id=cats-root.service\nLoadState=loaded\nActiveState=active\nSubState=running\nMainPID=4242\nControlGroup=/system.slice/cats-root.service\nExecStart={ path=/usr/bin/cats-blockd ; argv[]=/usr/bin/cats-blockd --process-identity-token 44444444444444444444444444444444 ; }\nEnvironment=\nEnvironmentFiles=\nPassEnvironment=\nUnsetEnvironment=AWS_ACCESS_KEY_ID AWS_SECRET_ACCESS_KEY AWS_SESSION_TOKEN AWS_CONTAINER_CREDENTIALS_FULL_URI AWS_CONTAINER_AUTHORIZATION_TOKEN_FILE CATS_POSTGRES_URL\n",
         )
         .unwrap();
         assert!(running.is_running(&launch));
 
         let wrong_token = parse_systemd_properties(
-            b"Id=cats-root.service\nLoadState=loaded\nActiveState=active\nSubState=running\nMainPID=4242\nControlGroup=/system.slice/cats-root.service\nExecStart={ path=/usr/bin/cats-blockd ; argv[]=/usr/bin/cats-blockd --process-identity-token 55555555555555555555555555555555 ; }\nEnvironment=CATS_RUNTIME_PROCESS_IDENTITY_TOKEN=55555555555555555555555555555555\n",
+            b"Id=cats-root.service\nLoadState=loaded\nActiveState=active\nSubState=running\nMainPID=4242\nControlGroup=/system.slice/cats-root.service\nExecStart={ path=/usr/bin/cats-blockd ; argv[]=/usr/bin/cats-blockd --process-identity-token 55555555555555555555555555555555 ; }\nEnvironment=\nEnvironmentFiles=\nPassEnvironment=\nUnsetEnvironment=AWS_ACCESS_KEY_ID AWS_SECRET_ACCESS_KEY AWS_SESSION_TOKEN AWS_CONTAINER_CREDENTIALS_FULL_URI AWS_CONTAINER_AUTHORIZATION_TOKEN_FILE CATS_POSTGRES_URL\n",
         )
         .unwrap();
         assert!(!wrong_token.is_running(&launch));
     }
 
     #[test]
+    fn running_unit_requires_exactly_empty_explicit_environment_sources() {
+        let launch = build_launch(&config(), &expectation()).unwrap();
+        for bytes in [
+            &b"Id=cats-root.service\nLoadState=loaded\nActiveState=active\nSubState=running\nMainPID=4242\nControlGroup=/system.slice/cats-root.service\nExecStart=/usr/bin/cats-blockd --process-identity-token 44444444444444444444444444444444\nEnvironment=EXTRA=value\nEnvironmentFiles=\nPassEnvironment=\nUnsetEnvironment=AWS_ACCESS_KEY_ID AWS_SECRET_ACCESS_KEY AWS_SESSION_TOKEN AWS_CONTAINER_CREDENTIALS_FULL_URI AWS_CONTAINER_AUTHORIZATION_TOKEN_FILE CATS_POSTGRES_URL\n"[..],
+            &b"Id=cats-root.service\nLoadState=loaded\nActiveState=active\nSubState=running\nMainPID=4242\nControlGroup=/system.slice/cats-root.service\nExecStart=/usr/bin/cats-blockd --process-identity-token 44444444444444444444444444444444\nEnvironment=\nEnvironmentFiles=/run/foreign-environment (ignore_errors=no)\nPassEnvironment=\nUnsetEnvironment=AWS_ACCESS_KEY_ID AWS_SECRET_ACCESS_KEY AWS_SESSION_TOKEN AWS_CONTAINER_CREDENTIALS_FULL_URI AWS_CONTAINER_AUTHORIZATION_TOKEN_FILE CATS_POSTGRES_URL\n"[..],
+            &b"Id=cats-root.service\nLoadState=loaded\nActiveState=active\nSubState=running\nMainPID=4242\nControlGroup=/system.slice/cats-root.service\nExecStart=/usr/bin/cats-blockd --process-identity-token 44444444444444444444444444444444\nEnvironment=\nEnvironmentFiles=\nPassEnvironment=AWS_ACCESS_KEY_ID\nUnsetEnvironment=AWS_ACCESS_KEY_ID AWS_SECRET_ACCESS_KEY AWS_SESSION_TOKEN AWS_CONTAINER_CREDENTIALS_FULL_URI AWS_CONTAINER_AUTHORIZATION_TOKEN_FILE CATS_POSTGRES_URL\n"[..],
+            &b"Id=cats-root.service\nLoadState=loaded\nActiveState=active\nSubState=running\nMainPID=4242\nControlGroup=/system.slice/cats-root.service\nExecStart=/usr/bin/cats-blockd --process-identity-token 44444444444444444444444444444444\nEnvironment=\nEnvironmentFiles=\nPassEnvironment=\nUnsetEnvironment=AWS_ACCESS_KEY_ID AWS_SECRET_ACCESS_KEY AWS_SESSION_TOKEN AWS_CONTAINER_CREDENTIALS_FULL_URI CATS_POSTGRES_URL\n"[..],
+            &b"Id=cats-root.service\nLoadState=loaded\nActiveState=active\nSubState=running\nMainPID=4242\nControlGroup=/system.slice/cats-root.service\nExecStart=/usr/bin/cats-blockd --process-identity-token 44444444444444444444444444444444\nEnvironment=\nEnvironmentFiles=\nPassEnvironment=\nUnsetEnvironment=AWS_ACCESS_KEY_ID AWS_SECRET_ACCESS_KEY AWS_SESSION_TOKEN AWS_CONTAINER_CREDENTIALS_FULL_URI AWS_CONTAINER_AUTHORIZATION_TOKEN_FILE CATS_POSTGRES_URL EXTRA\n"[..],
+        ] {
+            assert!(!parse_systemd_properties(bytes).unwrap().is_running(&launch));
+        }
+    }
+
+    #[test]
     fn malformed_or_incomplete_systemctl_properties_are_not_evidence() {
         for bytes in [
             &b"Id=cats-root.service\n"[..],
-            &b"Id=cats-root.service\nId=cats-root.service\nLoadState=not-found\nActiveState=inactive\nSubState=dead\nMainPID=0\nControlGroup=\nExecStart=\nEnvironment=\n"[..],
-            &b"Id=cats-root.service\nLoadState=not-found\nActiveState=inactive\nSubState=dead\nMainPID=invalid\nControlGroup=\nExecStart=\nEnvironment=\n"[..],
+            &b"Id=cats-root.service\nId=cats-root.service\nLoadState=not-found\nActiveState=inactive\nSubState=dead\nMainPID=0\nControlGroup=\nExecStart=\nEnvironment=\nEnvironmentFiles=\nPassEnvironment=\nUnsetEnvironment=\n"[..],
+            &b"Id=cats-root.service\nLoadState=not-found\nActiveState=inactive\nSubState=dead\nMainPID=invalid\nControlGroup=\nExecStart=\nEnvironment=\nEnvironmentFiles=\nPassEnvironment=\nUnsetEnvironment=\n"[..],
         ] {
             assert!(parse_systemd_properties(bytes).is_err());
         }
     }
 
-    fn config() -> RootProvisionSystemdConfig {
-        RootProvisionSystemdConfig {
-            blockd: AuthorizedBlockdLaunchConfig {
-                blockd_binary: "/usr/bin/cats-blockd".into(),
-                metadata_store: AdapterSelection::new(
+    #[test]
+    fn process_environment_parser_rejects_credentials_and_ambiguous_samples() {
+        let ordinary = parse_process_environment_keys(b"LANG=C\0PATH=/usr/bin\0").unwrap();
+        assert_eq!(ordinary, [b"LANG".to_vec(), b"PATH".to_vec()]);
+        assert!(credential_environment_is_absent(&ordinary));
+
+        for forbidden in UNSET_CREDENTIAL_ENVIRONMENT {
+            let sample = format!("LANG=C\0{forbidden}=secret\0");
+            let keys = parse_process_environment_keys(sample.as_bytes()).unwrap();
+            assert!(!credential_environment_is_absent(&keys));
+        }
+        for malformed in [
+            &b"LANG=C"[..],
+            &b"=value\0"[..],
+            &b"LANG\0"[..],
+            &b"LANG=C\0LANG=D\0"[..],
+        ] {
+            assert!(parse_process_environment_keys(malformed).is_none());
+        }
+    }
+
+    #[test]
+    fn config_constructor_rejects_environment_credentials_and_unbounded_adapters() {
+        for blockd in [
+            blockd_config(
+                AdapterSelection::new(
                     "postgres",
-                    AdapterConfig::from_pairs([("url-env", "CATS_TEST_POSTGRES_URL")]).unwrap(),
+                    AdapterConfig::from_pairs([("url-env", "CATS_POSTGRES_URL")]).unwrap(),
                 ),
-                object_store: AdapterSelection::new(
+                s3_object_store(),
+            ),
+            blockd_config(
+                AdapterSelection::new(
+                    "postgres",
+                    AdapterConfig::from_pairs([("url-file", "relative/postgres-url")]).unwrap(),
+                ),
+                s3_object_store(),
+            ),
+            blockd_config(
+                postgres_file_authority(),
+                AdapterSelection::new(
                     "file",
                     AdapterConfig::from_pairs([("root", "/srv/cats/objects")]).unwrap(),
                 ),
-                max_staged_bytes: 1,
-                max_staged_packs: 1,
-                max_local_bytes: 4_194_304,
-            },
-            environment: vec![(
-                "CATS_TEST_POSTGRES_URL".into(),
-                "postgres://runtime.test/cats".into(),
-            )],
+            ),
+            blockd_config(
+                postgres_file_authority(),
+                AdapterSelection::new(
+                    "invented",
+                    AdapterConfig::from_pairs([("root", "/srv/cats/objects")]).unwrap(),
+                ),
+            ),
+        ] {
+            assert!(RootProvisionSystemdConfig::new(blockd).is_err());
         }
+    }
+
+    fn config() -> RootProvisionSystemdConfig {
+        RootProvisionSystemdConfig::new(blockd_config(postgres_file_authority(), s3_object_store()))
+            .unwrap()
+    }
+
+    fn blockd_config(
+        metadata_store: AdapterSelection,
+        object_store: AdapterSelection,
+    ) -> AuthorizedBlockdLaunchConfig {
+        AuthorizedBlockdLaunchConfig {
+            blockd_binary: "/usr/bin/cats-blockd".into(),
+            metadata_store,
+            object_store,
+            max_staged_bytes: 1,
+            max_staged_packs: 1,
+            max_local_bytes: 4_194_304,
+        }
+    }
+
+    fn postgres_file_authority() -> AdapterSelection {
+        AdapterSelection::new(
+            "postgres",
+            AdapterConfig::from_pairs([("url-file", "/run/cats/postgres-url")]).unwrap(),
+        )
+    }
+
+    fn s3_object_store() -> AdapterSelection {
+        AdapterSelection::new(
+            "aws-s3",
+            AdapterConfig::from_pairs([("bucket", "cats-runtime-test")]).unwrap(),
+        )
     }
 
     fn expectation() -> RootProvisionProcessExpectation {
