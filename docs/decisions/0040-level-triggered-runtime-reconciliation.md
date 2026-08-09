@@ -50,8 +50,9 @@ DesiredRuntimeSpec(revision, placement)
 
 Volume 的精确状态机由 [Volume Authority](../specs/volume-authority.md) 定义；Runtime 只编排
 它的窄acquire/publish/release/takeover/delete接口。Node到Control的acquire/release/disposable consume
-只使用[Runtime Volume Transitions v1](../specs/runtime-volume-transitions-v1.md)冻结的签名HTTP边界和单一
-PostgreSQL transaction；blockd不获得ownership mutation能力。
+只使用[Runtime Volume Transitions v1](../specs/runtime-volume-transitions-v1.md)冻结的签名mutation边界和
+单一PostgreSQL transaction；authorization response-loss只使用同一规格的Control-signed exact evidence
+read。Node没有Control表的raw SQL权限，blockd不获得ownership mutation或authorization read能力。
 
 只有能把业务rows与结果在唯一Control PostgreSQL事务中原子提交的Workspace product mutation使用
 `ApiIdempotencyResult`；精确scope、request envelope、fingerprint和重放合同以
@@ -220,7 +221,9 @@ HostDestroyed永不Rejoined。没有tombstone/recovery引用且全部authorizati
 Control Plane先把旧Pending Operation置为HostLost，再在一个事务中创建新完整Desired/Operation、
 placement、全部新attachments，并从该event和旧attachment facts为每个卷创建独立
 `VolumeTakeoverAuthorization`，精确绑定 volume、旧 owner/epoch、新 attachment、Desired
-revision 和新 placement。MetadataStore 按 tuple CAS、提高 epoch；同一 authorization 幂等，
+revision、新 placement及目标`authorized_node_id`。该Node ID随authorization payload不可变，不随之后的
+session/revision改变；receipt仍嵌在同一AuthorizationRecord且不重复它。MetadataStore 按 tuple CAS、提高
+epoch；同一 authorization 幂等，
 任何绑定变化都需新授权。DesiredRuntimeSpec 只引用授权 id。
 
 逐卷授权的 schema、CAS 和状态机由 [Volume Authority](../specs/volume-authority.md) 定义。它与

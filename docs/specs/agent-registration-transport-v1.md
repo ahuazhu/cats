@@ -44,7 +44,7 @@ token或另一个service bearer。生产请求使用server-authenticated HTTPS�
 test adapter绑定loopback listener，不能由production配置降级。
 注册之外，Desired/observation两条session-bound delivery route只由
 [Runtime Inventory and Observation Spine §2](runtime-inventory-observation-v1.md#2-http-与-authentication-envelope)冻结；
-卷状态转换的一条session-bound mutation route只由
+卷状态转换的一条session-bound mutation route和一条authorization evidence read route只由
 [Runtime Volume Transitions v1](runtime-volume-transitions-v1.md)冻结。本文的共用prefix/proof adapter不会自动
 创建GET、long-poll、legacy heartbeat或任何未被这两个下位合同逐条冻结的可路由入口。
 

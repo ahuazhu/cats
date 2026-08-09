@@ -25,7 +25,8 @@ Cat Destroy 的 RootDisk 不同：控制面随后删除该卷的metadata row并�
    当前revision重试。VMM与RootDisk blockd停止后，Node报告精确stop observation。
 3. 对可达Host，Control Plane根据当前Deleted revision和stop observation签发
    `DisposableRootDeleteAuthorization`；失联Host必须已有Active `HostFenceEvent`。授权精确绑定
-   delete ID、volume、attachment、owner/epoch、remote head和placement。
+   delete ID、volume、attachment、owner/epoch、remote head、placement和派生时不可变的
+   `authorized_node_id`；内部HostFence worker不借用Node HTTP身份。
 4. MetadataStore消费授权时把精确`Active + Owned`卷原子置为`Deleting(delete_id)`、清owner并
    提高epoch。相同授权幂等；错tuple全部失败。CAS成功前不能删除pending tail，成功后才可删除
    授权所指lineage。这里不先release，因此不存在可被normal acquire的Unowned窗口。

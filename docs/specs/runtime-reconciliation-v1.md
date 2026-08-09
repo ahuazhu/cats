@@ -16,8 +16,9 @@ observation acceptance的两条唯一HTTP route、endpoint-local error、原子�
 消息只到达一次当作正确性前提。
 
 Node把已经fsync进checkpoint的normal/takeover acquire、exact release与disposable Root authorization
-consume交给Control时，只使用[Runtime Volume Transitions v1](runtime-volume-transitions-v1.md)；该route不
-扩展本文件的共享类型，不建立effect job/receipt，也不把blockd提升为ownership mutation owner。
+consume交给Control、或读取authorization response-loss evidence时，只使用
+[Runtime Volume Transitions v1](runtime-volume-transitions-v1.md)冻结的两条signed route；它们不扩展本文件的
+共享类型，不建立effect job/重复receipt，也不把blockd提升为ownership mutation或authorization-read owner。
 
 文中的 MUST/MUST NOT 是上线条件。
 
@@ -839,7 +840,7 @@ unit。Inspect、Verify 和 Quarantine 本身不产生外部 effect。
 |---|---|---|
 | CloseAdmission | desired/cell revision、原gate集合、RequireIdle attempt state | 只用于全局lifecycle/placement/runtime/volume/mount/network/platform变化或RequireIdle；cell内compare-and-close全部gate，Armed模糊结果按Busy且Closed结算，fresh Running只以更高route epochs重开；Endpoint-only禁止使用 |
 | CloseGate | `close_gate {endpoint_id, old route_epoch}`及checkpoint top-level、所选old `route_gates`完整entry | 只compare-and-close该Endpoint；revision或完整binding不匹配零副作用，exact same binding Closed是close postcondition；成功/结果不明后确认Closed才fsync且旧epoch不重开。changed以更高epoch另走InstallGate；removed drain后以old Closed binding compare-remove cell entry，确认absent才删除checkpoint entry/推进step，不install |
-| AcquireVolume | normal时完整`VolumeAcquireRequest`（含positive lease duration），takeover时只有authorization id | 只通过Runtime Volume Transitions签名route交给Control的单一PostgreSQL事务；authorization首次消费还要求Active event并原子写`AuthorizationConsumedReceipt`；只有完整typed request或同authorization可adopt，或在 `R == L` 后精确release |
+| AcquireVolume | normal时完整`VolumeAcquireRequest`（含positive lease duration），takeover时只有authorization id | 只通过Runtime Volume Transitions签名mutation route交给Control的单一PostgreSQL事务；authorization首次消费还要求Active event并原子写`AuthorizationConsumedReceipt`，结果不明只经同规格signed evidence read闭合；只有完整typed request或同authorization可adopt，或在 `R == L` 后精确release |
 | ProvisionRootImage | 完整`provision_root_image` step（包含不与provision transition混用的control-only blockd物理身份）、checkpoint top-level revision/spec/placement和该attachment的现有process/volume evidence | 只允许current non-Deleted Desired的唯一Root；step必须先fsync再spawn/adopt精确blockd实例，并以已持久transition ID发送显式typed request，把exact blank head CAS为纯确定计算的generation-1 target。响应不明只读权威head；closed retryable/conflict按§7.1处理。成功前不得创建Guest device或VMM |
 | PrepareDevices | NBD/tap/socket slot、ownership token | 完整 inventory 后 create-if-absent；晚到资源只按 token adopt 或删除 |
 | FormatFilesystem | attachment、device、filesystem UUID、initialization token、blank predecessor | Guest Agent 只按精确 predecessor 格式化；晚到结果按 UUID probe/adopt，冲突立即 quarantine |
@@ -852,7 +853,7 @@ unit。Inspect、Verify 和 Quarantine 本身不产生外部 effect。
 | SnapshotWarmRuntime | runtime incarnation、snapshot temp id、source root/epoch | 验证VMM postcondition与durable rename；晚到文件不覆盖其他WarmRuntimeSnapshot |
 | StopRuntime | runtime incarnation、process start time、scope id | 只 stop 该 incarnation；晚到 stop 可发生，当前 revision 负责重建 |
 | CleanupRelease | 完整`CleanupRelease`：物理target、inventory session/epoch/read position、Desired/tombstone read position，volume还有release transition/generation/disposition | 只删匹配资源、只 release 精确 owner/epoch；`orphan_scope`重读token/cgroup并证明无live PID/process，`control_socket`重读token并证明无live owner，`checkpoint_file`只由Node单槽重读并重算digest/完整identity且由当前Deleted tombstone证明不再需要；重建或身份变化后的stale cleanup必须拒绝 |
-| DeleteDisposableRoot | authorization ID；payload与direct result只读服务器端AuthorizationRecord | 只用于仍Owned的authorization分支；可达Host要求精确stop且`R < L`，Active HostFenceEvent允许最后`R == L`或L未知。无live DiskSnapshotRecord且Guest/VMM/blockd已停/隔离后，按event/auth/volume/control锁序原子写Consumed receipt及两边Deleting；Node从closed receipt取得精确lineage，成功后才删该lineage及可能存在的tail。可达R==L normal分支不生成该step |
+| DeleteDisposableRoot | authorization ID；payload与direct result只读服务器端AuthorizationRecord | 只用于仍Owned的authorization分支；可达Host要求精确stop且`R < L`，Active HostFenceEvent允许最后`R == L`或L未知。无live DiskSnapshotRecord且Guest/VMM/blockd已停/隔离后，按event/auth/volume/control锁序原子写Consumed receipt及两边Deleting；结果不明只经signed evidence read闭合，Node从closed receipt取得精确lineage，成功后才删该lineage及可能存在的tail。可达R==L normal分支不生成该step |
 | InstallGate | desired checkpoint、spec digest、placement、runtime incarnation、endpoint/route epoch | cell只接受一个serving epoch；任何已close gate必须由更大epoch重开 |
 
 每步都可被 kill。重启后只能确认 postcondition、重试同一 token、继续或 quarantine，不能先
@@ -1020,14 +1021,16 @@ Plane 对旧 placement 中每个需要恢复的卷分别创建：
 
 ```text
 VolumeTakeoverAuthorization {
-  authorization_id, host_fence_event_id,
+  authorization_id, authorized_node_id, host_fence_event_id,
   volume_id, expected_attachment_id, expected_epoch,
   new_attachment_id, desired_revision, new_placement_epoch,
   lease_duration_ms, not_after
 }
 ```
 
-该row由唯一Control Store writer在同一PostgreSQL trust/transaction域写入；Node只携
+`authorized_node_id`在派生时复制目标new placement Node且随后不可变；receipt不重复该字段，仍由同一
+AuthorizationRecord的payload/receipt exact cross-binding。该row由唯一Control Store writer在同一PostgreSQL
+trust/transaction域写入；Node只携
 `authorization_id`，不提交payload或第二套签名。首次消费按固定锁序
 `HostFenceEvent -> authorization -> VolumeRecord`，要求event仍为Active和数据库
 时间未超过`not_after`，在同一PostgreSQL事务完成精确逐卷CAS并写不可变
@@ -2932,6 +2935,8 @@ ContractName = "node_identity" | "agent_registration_attempt" | "agent_session"
              | "runtime_checkpoint" | "node_cleanup_checkpoint" | "node_observation"
              | "observation_acceptance" | "runtime_spine_error"
              | "runtime_volume_transition_request" | "runtime_volume_transition_success"
+             | "runtime_volume_transition_evidence_request"
+             | "runtime_volume_transition_evidence_success"
              | "runtime_volume_transition_error" | "operation" | "contract_error"
 ```
 

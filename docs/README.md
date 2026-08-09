@@ -62,7 +62,7 @@ AdmissionCell。它们由同一个vertical cutover合同和故障矩阵收敛。
 | [Runtime Inventory and Observation Spine v1](specs/runtime-inventory-observation-v1.md) | Frozen target，未实现 | Desired read-position、inventory/observation接受与freshness |
 | [Runtime Composition Artifacts v1](specs/runtime-composition-artifacts-v1.md) | Frozen target，未实现 | local NodeIdentity artifact与单一Guest release payload |
 | [Immutable Image Manifest Read v1](specs/immutable-image-manifest-read-v1.md) | Frozen target，未实现 | golden manifest唯一DTO、canonical bytes、有界读取与Control只读组合 |
-| [Runtime Volume Transitions v1](specs/runtime-volume-transitions-v1.md) | Frozen target，未实现 | Node签名请求、current context校验与Control单事务卷转换 |
+| [Runtime Volume Transitions v1](specs/runtime-volume-transitions-v1.md) | Frozen target，未实现 | Node签名mutation、Control单事务卷转换与authorization evidence read |
 | [Route Grant v2](specs/route-grant-v2.md) | Target，未实现 | ADR-0041切换合同；固定向量待实现时重建 |
 | [Volume Authority](specs/volume-authority.md) | Target，未实现 | ADR-0042卷、attachment、ext4、snapshot和delete合同 |
 

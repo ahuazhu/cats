@@ -129,7 +129,8 @@ heartbeat缺失、AgentSession过期、EC2状态查询或Gateway不可达都只�
    `HostFenceEvent`。receipt本身不创建placement，也不是逐卷writer permission。
 3. Control Plane先把当前Pending Operation置为`Failed(HostLost)`，再在一个事务中创建新完整
    Desired/Operation、placement、全部新attachments与每卷`VolumeTakeoverAuthorization`；Desired
-   逐卷引用授权。任何一项无法建立就保持Blocked，不留下旁路placement。
+   逐卷引用授权，授权把目标`authorized_node_id`不可变写入payload。任何一项无法建立就保持Blocked，
+   不留下旁路placement。
 4. replacement只从remote durable`R` Cold启动。每卷首次消费必须按
    `HostFenceEvent -> authorization -> VolumeRecord`锁序，在同一PostgreSQL事务确认event仍Active、
    完成epoch CAS并写不可变`AuthorizationConsumedReceipt`；不存在另一种writer-proof fallback。
@@ -211,9 +212,11 @@ runbook；禁止以“重启看看”跳过fence或durability proof。
    首次consume与Rejoined竞争以及合法后继receipt校验；用真实PG pause双向覆盖
    Desired INSERT/full observation的`NodeIdentity -> AgentSession -> receive/cursor`锁序；饱和A22/
    ordinary Store时保留observation lane仍续期，并在queue/running/commit三个取消点证明无
-   detached late mutation。Node-only authorization recovery read还必须覆盖consume commit丢response后的
+   detached late mutation。Control-signed authorization evidence read还必须覆盖consume commit丢response后的
    direct/合法current successor、sweep删row后的exact completion，以及错projection/重复receipt/跨volume
-   associated authorization的fail-closed和三表read-only SQL权限。
+   direct authorization的fail-closed；验证A19 proof、current provisioned identity/session、immutable
+   `authorized_node_id` isolation、combined cap/deadline/cancel，并以negative probe证明Node没有相关表的raw
+   SQL credential或权限。
 2. **独立native x86_64 Linux build host**：使用现有
    [qualification build host](../deploy/aws/terraform/qualification/build-host/README.md)；controller发布
    exact 40-hex commit后，在Host运行：

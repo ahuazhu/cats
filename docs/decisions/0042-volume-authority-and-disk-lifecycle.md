@@ -3,7 +3,7 @@
 - 状态：Accepted
 - 日期：2026-08-08
 - 规格：[Volume Authority 与磁盘生命周期](../specs/volume-authority.md)
-- Runtime mutation transport：[Runtime Volume Transitions v1](../specs/runtime-volume-transitions-v1.md)
+- Runtime transition transport：[Runtime Volume Transitions v1](../specs/runtime-volume-transitions-v1.md)
 
 ## 背景
 
@@ -49,8 +49,11 @@ lease请求只接受positive `lease_duration_ms`。唯一PostgreSQL事务owner�
 null，非0时后两者都non-null。
 
 HostFenceEvent的授权派生、首次消费与Rejoined转换都先锁同一个PostgreSQL event行。authorization由唯一
-Control Store writer在同一PG trust/transaction域写完整immutable payload；Node只携ID，不再增加第二套
-签名。首次消费还锁authorization和VolumeRecord，在同一事务完成卷CAS并写closed、不可变
+Control Store writer在同一PG trust/transaction域写完整immutable payload；takeover与disposable payload都把
+派生时的takeover目标new placement Node或disposable Deleted placement Node写为`authorized_node_id`，不因
+后续session/revision改变。Node只携ID，不再增加第二套
+签名。receipt留在同一AuthorizationRecord且不重复该字段。首次消费还锁authorization和VolumeRecord，
+在同一事务完成卷CAS并写closed、不可变
 `AuthorizationConsumedReceipt`；
 Rejoined先提交后，未消费授权不能首次生效。rejoin校验receipt以及当前卷是其直接结果或合法的
 单调后继；卷已删除时改验精确`DeleteCompletionReceipt`。这些安全回执保留到相关event Rejoined，
@@ -58,8 +61,11 @@ Rejoined先提交后，未消费授权不能首次生效。rejoin校验receipt�
 
 ### 3. Node取得grant，blockd只采用grant
 
-Node在RuntimeCheckpoint记录normal acquire/release的typed request或takeover authorization ID，调用MetadataStore并解析
-模糊结果，然后把精确attachment/epoch交给blockd。release checkpoint还绑定完整物理
+Node在RuntimeCheckpoint记录normal acquire/release的typed request、takeover或disposable authorization ID，
+只经Runtime
+Volume Transitions signed mutation提交；authorization模糊结果只经绑定current Node/session与
+`authorized_node_id`的Control-signed exact evidence read解析，Node没有authorization/completion表SQL权限。
+然后Node把精确attachment/epoch交给blockd。release checkpoint还绑定完整物理
 target、full-inventory/Desired读取位置、唯一transition ID、generation和disposition；响应丢失
 只能重放同一request或采用精确的last-transition postcondition，不得从“当前是Unowned”
 猜测成功。blockd验证、renew和publish，但不自行acquire、takeover或增加epoch。
@@ -149,7 +155,9 @@ attachment的closed begin variant、deleting epoch和exact head。owner已清、
 ADR-0025的disposable Root例外使用唯一的第二个入口：Control Plane根据当前Deleted Desired与
 精确stop observation或Active HostFenceEvent签发
 `DisposableRootDeleteAuthorization`，绑定delete ID、revision/placement、volume、attachment、
-owner/epoch和remote head。HostFenceEvent来源按
+owner/epoch、remote head和派生时的immutable `authorized_node_id`。runtime-stopped路径是执行Node；
+HostFence内部worker保留隔离placement Node但不借用Node HTTP。receipt仍嵌在同一AuthorizationRecord且不
+重复该字段。HostFenceEvent来源按
 `event -> authorization -> VolumeRecord -> Control rows`固定锁序，在一个事务写Consumed receipt、
 把精确Owned卷CAS到Deleting、清owner并提高epoch，同时把Control Disk改为相同Deleting；CAS成功后
 才允许删除该lineage的`R < L`tail。它不经过Active+Unowned窗口，不能用于PersistentDisk。

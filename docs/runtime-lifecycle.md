@@ -106,7 +106,8 @@ Running 先关闭 admission、quiesce Guest 并 drain。Suspended 若有 `R < L`
 
 Destroy先关闭admission并停止Guest/VMM。PersistentDisk必须完整drain/release，不能随Cat删除；
 只有当前Deleted Desired明确disposable的RootDisk可以按ADR-0025放弃local tail。它必须先消费
-绑定delete ID、revision/placement、attachment、owner/epoch、head和stop/fence证据的精确授权，
+绑定delete ID、revision/placement、immutable `authorized_node_id`、attachment、owner/epoch、head和
+stop/fence证据的精确授权，
 HostFenceEvent来源按`event -> authorization -> VolumeRecord -> Control rows`锁序，在同一事务写
 Consumed receipt、把Volume从Owned转为Deleting并提高epoch、把Control Disk转为相同Deleting；提交后
 才删除该lineage。未知卷、冲突identity或未完成fence/rejoin都阻止Deleted Operation成功。
@@ -186,7 +187,8 @@ heartbeat timeout 只产生 `NodeSuspected`。源可能仍运行且持有 Relaxe
 一个事务中把旧Pending Operation置为HostLost、创建新完整Desired/Operation/placement与全部逐卷
 授权。Host event只是Host级隔离事实；每个volume还必须取得独立
 `VolumeTakeoverAuthorization`，精确绑定旧 owner/epoch、新 attachment、Desired revision 和
-目标 placement。首次消费先锁同一PostgreSQL event行，再锁authorization与VolumeRecord，在一个
+目标 placement，并把目标`authorized_node_id`不可变写入payload。首次消费先锁同一PostgreSQL event行，
+再锁authorization与VolumeRecord，在一个
 事务中提高epoch并写不可变`AuthorizationConsumedReceipt`。对应 schema/CAS 由
 [Volume Authority](specs/volume-authority.md) 定义。
 
