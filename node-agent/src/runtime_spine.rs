@@ -13,11 +13,12 @@ use cats_api::agent_registration::{
     NODE_CREDENTIAL_ID_HEADER, NODE_PUBLIC_KEY_SPKI_HEADER, NODE_SIGNATURE_HEADER,
 };
 use cats_api::runtime_reconciliation::{
-    decode_desired_read_snapshot, decode_observation_acceptance, decode_runtime_spine_error,
-    ContractErrorDetail, DesiredReadSnapshot, ObservationAcceptance, RuntimeSpineError,
-    RuntimeSpineErrorDetail, RuntimeSpineHttpProblem, DESIRED_READ_PATH,
-    DESIRED_READ_SNAPSHOT_MAX_WIRE_BYTES, OBSERVATION_ACCEPTANCE_MAX_WIRE_BYTES, OBSERVATION_PATH,
-    RUNTIME_SPINE_ERROR_MAX_WIRE_BYTES, RUNTIME_SPINE_METHOD,
+    decode_desired_read_request, decode_desired_read_snapshot, decode_node_observation,
+    decode_observation_acceptance, decode_runtime_spine_error, ContractError, ContractErrorDetail,
+    DesiredReadSnapshot, NodeObservation, ObservationAcceptance, ObservationInventoryAcceptance,
+    RuntimeSpineError, RuntimeSpineErrorDetail, RuntimeSpineHttpProblem, SessionBinding,
+    DESIRED_READ_PATH, DESIRED_READ_SNAPSHOT_MAX_WIRE_BYTES, OBSERVATION_ACCEPTANCE_MAX_WIRE_BYTES,
+    OBSERVATION_PATH, RUNTIME_SPINE_ERROR_MAX_WIRE_BYTES, RUNTIME_SPINE_METHOD,
 };
 
 const RESPONSE_TIMEOUT: Duration = Duration::from_secs(15);
@@ -114,28 +115,60 @@ impl RuntimeSpineHttpClient {
     pub async fn desired_read(
         &self,
         durable_body: &[u8],
-    ) -> RuntimeSpineAttempt<DesiredReadSnapshot> {
-        self.post(
-            DESIRED_READ_PATH,
-            durable_body,
-            DESIRED_READ_SNAPSHOT_MAX_WIRE_BYTES,
-            decode_desired_read_snapshot,
+    ) -> Result<RuntimeSpineAttempt<DesiredReadSnapshot>, ContractError> {
+        let request = decode_desired_read_request(durable_body)?;
+        Ok(
+            match self
+                .post(
+                    DESIRED_READ_PATH,
+                    durable_body,
+                    DESIRED_READ_SNAPSHOT_MAX_WIRE_BYTES,
+                    decode_desired_read_snapshot,
+                )
+                .await
+            {
+                RuntimeSpineAttempt::Accepted(accepted)
+                    if accepted.value.version == request.version
+                        && accepted.value.session == request.session
+                        && accepted.value.request_sequence == request.request_sequence =>
+                {
+                    RuntimeSpineAttempt::Accepted(accepted)
+                }
+                RuntimeSpineAttempt::Accepted(_) => {
+                    RuntimeSpineAttempt::RetryExact(RuntimeSpineRetryReason::InvalidResponse)
+                }
+                other => other,
+            },
         )
-        .await
     }
 
     /// Sends one exact canonical `NodeObservation` body.
     pub async fn observation(
         &self,
         durable_body: &[u8],
-    ) -> RuntimeSpineAttempt<ObservationAcceptance> {
-        self.post(
-            OBSERVATION_PATH,
-            durable_body,
-            OBSERVATION_ACCEPTANCE_MAX_WIRE_BYTES,
-            decode_observation_acceptance,
+    ) -> Result<RuntimeSpineAttempt<ObservationAcceptance>, ContractError> {
+        let request = decode_node_observation(durable_body)?;
+        Ok(
+            match self
+                .post(
+                    OBSERVATION_PATH,
+                    durable_body,
+                    OBSERVATION_ACCEPTANCE_MAX_WIRE_BYTES,
+                    decode_observation_acceptance,
+                )
+                .await
+            {
+                RuntimeSpineAttempt::Accepted(accepted)
+                    if acceptance_matches_observation(&accepted.value, &request) =>
+                {
+                    RuntimeSpineAttempt::Accepted(accepted)
+                }
+                RuntimeSpineAttempt::Accepted(_) => {
+                    RuntimeSpineAttempt::RetryExact(RuntimeSpineRetryReason::InvalidResponse)
+                }
+                other => other,
+            },
         )
-        .await
     }
 
     async fn post<T>(
@@ -163,6 +196,37 @@ impl RuntimeSpineHttpClient {
             .await;
         classify_response(response, success_cap, decode_success).await
     }
+}
+
+fn acceptance_matches_observation(
+    acceptance: &ObservationAcceptance,
+    observation: &NodeObservation,
+) -> bool {
+    acceptance.version == observation.version
+        && acceptance.session
+            == (SessionBinding {
+                node_id: observation.node_id.clone(),
+                node_boot_id: observation.node_boot_id.clone(),
+                agent_instance_id: observation.agent_instance_id.clone(),
+                agent_session_epoch: observation.agent_session_epoch,
+            })
+        && acceptance.observation_id == observation.observation_id
+        && acceptance.heartbeat_sequence == observation.heartbeat_sequence
+        && match (&acceptance.inventory, observation.complete_inventory) {
+            (ObservationInventoryAcceptance::Full { attestation }, true) => {
+                attestation.version == observation.version
+                    && attestation.node_id == observation.node_id
+                    && attestation.agent_session_epoch == observation.agent_session_epoch
+                    && attestation.inventory_epoch == observation.inventory_epoch
+                    && Some(&attestation.inventory_digest) == observation.inventory_digest.as_ref()
+                    && Some(attestation.inventory_read_position)
+                        == observation.inventory_read_position
+            }
+            (ObservationInventoryAcceptance::Partial { inventory_epoch }, false) => {
+                *inventory_epoch == observation.inventory_epoch
+            }
+            _ => false,
+        }
 }
 
 async fn classify_response<T>(
@@ -386,7 +450,8 @@ mod tests {
     use axum::Router;
     use cats_api::agent_registration::{verify_request_proof, NODE_SIGNATURE_HEADER};
     use cats_api::runtime_reconciliation::{
-        encode_runtime_spine_error, ContractVersion, Id, RuntimeSpineError, RuntimeSpineErrorDetail,
+        decode_desired_read_snapshot, encode_desired_read_snapshot, encode_runtime_spine_error,
+        ContractVersion, Id, RuntimeSpineError, RuntimeSpineErrorDetail, Sequence,
     };
 
     use super::*;
@@ -456,7 +521,8 @@ mod tests {
         let (origin, task) = spawn(app).await;
         let client = RuntimeSpineHttpClient::for_loopback_test(&origin, signer()).unwrap();
 
-        let RuntimeSpineAttempt::Accepted(accepted) = client.desired_read(REQUEST).await else {
+        let RuntimeSpineAttempt::Accepted(accepted) = client.desired_read(REQUEST).await.unwrap()
+        else {
             panic!("expected an accepted canonical snapshot")
         };
         assert_eq!(accepted.bytes, SNAPSHOT);
@@ -505,11 +571,11 @@ mod tests {
         let client = RuntimeSpineHttpClient::for_loopback_test(&origin, signer()).unwrap();
 
         assert!(matches!(
-            client.desired_read(REQUEST).await,
+            client.desired_read(REQUEST).await.unwrap(),
             RuntimeSpineAttempt::RetryExact(RuntimeSpineRetryReason::Backpressure)
         ));
         assert!(matches!(
-            client.desired_read(REQUEST).await,
+            client.desired_read(REQUEST).await.unwrap(),
             RuntimeSpineAttempt::Rejected {
                 status: 403,
                 error: RuntimeSpineError {
@@ -552,10 +618,54 @@ mod tests {
         let client = RuntimeSpineHttpClient::for_loopback_test(&origin, signer()).unwrap();
 
         assert!(matches!(
-            client.desired_read(REQUEST).await,
+            client.desired_read(REQUEST).await.unwrap(),
             RuntimeSpineAttempt::RetryExact(RuntimeSpineRetryReason::InvalidResponse)
         ));
         assert_eq!(redirected.load(Ordering::SeqCst), 0);
+        task.abort();
+    }
+
+    #[tokio::test]
+    async fn canonical_success_for_another_sequence_is_never_adopted() {
+        let mut mismatched = decode_desired_read_snapshot(SNAPSHOT).unwrap();
+        mismatched.request_sequence = Sequence::new(2).unwrap();
+        let body = encode_desired_read_snapshot(&mismatched).unwrap();
+        let app = Router::new().route(
+            DESIRED_READ_PATH,
+            post(move || {
+                let body = body.clone();
+                async move { wire_response(StatusCode::OK, body) }
+            }),
+        );
+        let (origin, task) = spawn(app).await;
+        let client = RuntimeSpineHttpClient::for_loopback_test(&origin, signer()).unwrap();
+
+        assert!(matches!(
+            client.desired_read(REQUEST).await.unwrap(),
+            RuntimeSpineAttempt::RetryExact(RuntimeSpineRetryReason::InvalidResponse)
+        ));
+        task.abort();
+    }
+
+    #[tokio::test]
+    async fn a_noncanonical_local_request_is_not_signed_or_sent() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let serving_calls = calls.clone();
+        let app = Router::new().route(
+            DESIRED_READ_PATH,
+            post(move || {
+                let calls = serving_calls.clone();
+                async move {
+                    calls.fetch_add(1, Ordering::SeqCst);
+                    wire_response(StatusCode::OK, SNAPSHOT.to_vec())
+                }
+            }),
+        );
+        let (origin, task) = spawn(app).await;
+        let client = RuntimeSpineHttpClient::for_loopback_test(&origin, signer()).unwrap();
+
+        assert!(client.desired_read(b"{}").await.is_err());
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
         task.abort();
     }
 
