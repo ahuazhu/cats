@@ -35,14 +35,17 @@ Control Store 与 MetadataStore 是逻辑边界，不是两套提交authority。
 pure-domain/data-row fixture，不提供Control cross-row authority。首次消费授权与`Active -> Rejoined`
 都通过唯一PG事务域的固定锁序完成。
 
-全局锁DAG是`ApiIdempotencyResult key reservation -> CatNameLock -> HostFenceEvent -> AuthorizationRecord ->
-VolumeRecord -> Control Cat/Disk/Desired/Endpoint rows -> DiskSnapshotRecord`；事务跳过自己不涉及的节点，同类
+全局锁DAG是`ApiIdempotencyResult key reservation -> CatNameLock -> NodeIdentity（会改变assigned Desired时）
+-> HostFenceEvent -> AuthorizationRecord -> VolumeRecord -> Control Cat/Disk/Desired/Endpoint rows ->
+DiskSnapshotRecord`；事务跳过自己不涉及的节点，同类
 多行按稳定ID排序。§3.3覆盖的Workspace product mutation先取得由认证Workspace、canonical route和`Idempotency-Key`导出的
 PostgreSQL transaction-scoped reservation，再读结果；它不能先锁资源，也不落持久Pending。这样同一
 key即使携带不同资源也不会分别先锁不同Volume。normal acquire只锁`VolumeRecord`，因此它与snapshot
 mutation或begin-delete仍只能有一方先提交。HostFenceEvent来源的内部恢复没有API前缀，从event开始。
-`CatNameLock`不是row或authority；只有会插入新Cat identity的create事务使用它，并固定在API key之后、
-任何Volume/Cat/Disk row或candidate-ID lock之前取得。删除已有Cat由被锁定的existing Cat row与唯一索引
+`CatNameLock`不是row或authority；Cat create固定在API key之后取得它并先闭合名称分支：合法existing Cat
+按既有Volume→Cat→Disk→Desired→Endpoint/lookup→Operation锁序闭合existing graph后只写exact 409 result，
+不读取或锁定candidate plan/NodeIdentity；name free且将插入新Desired时，才在任何candidate Volume/Cat/Disk
+row或candidate-ID lock之前锁定并重验candidate `NodeIdentity`。删除已有Cat由被锁定的existing Cat row与唯一索引
 线性化，不取得name lock，因此§1的Cat Destroy锁序没有反向边。
 
 Persistent initialization CAS没有API/event前缀，固定锁序是`current AgentSession row -> 该session的
@@ -875,8 +878,9 @@ candidate资源锁前，Store直接丢弃本次bundle/envelope并逐字节返回
 `pg_advisory_xact_lock(hashtextextended(current_schema() || ':cat-name:' || $1 || ':' || $2,
 0::BIGINT))`，其中`$1=workspace_id`、`$2=name`。
 `Id`中的冒号或64-bit hash碰撞最多让不同名称额外串行，不会让相同tuple得到不同lock。持锁后读取并验证
-`CatRecord`：合法existing row选择409；absent才继续
-Volume→Cat→Disk→Desired→EndpointRecord/hostname lookup→Operation锁/插入；corrupt row
+`CatRecord`：合法existing row按上述existing graph锁序闭合后选择409，并且不消费可失效的placement plan；absent才按
+NodeIdentity（锁内重验完整`PlacementAdmissionSnapshot`）→Volume→Cat→Disk→Desired→EndpointRecord/
+hostname lookup→Operation锁/插入；corrupt row
 返回BackendUnknown。唯一约束只作invariant backstop，意外constraint error整体回滚，不能事后翻译成409。
 首次持久化的Operation固定为`phase=Pending, terminal=null`，其workspace/cat/revision/spec digest/placement/
 target从同一完整Desired和candidate operation ID构造；`created_at_unix_ms=updated_at_unix_ms`都由上述单次
@@ -889,6 +893,8 @@ backstop；候选endpoint/hostname与不属于同一candidate的现有row碰撞�
 采用existing Endpoint或写Cat name 409。
 server生成的cat/endpoint/network/disk/volume/operation ID/name碰撞、stored row损坏和数据库/serialization失败不是name conflict，
 不得写409 result；事务回滚后按其既有infrastructure/invariant规则处理。
+因此旧plan形成后若另一个key已经合法占名，即使其间session replacement或assigned set变化，本请求仍按名称
+事实durable写入exact 409；反之name仍free时，任何admission变化都必须在零业务row/零result下回滚，不能用409掩盖。
 
 两个route response使用UTF-8、无BOM/空白/newline且按下列字段序编码；这是public API encoder fixed vector，
 不属于Runtime §16的wire或digest：

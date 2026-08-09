@@ -66,8 +66,8 @@ acquire deadline、connect/query/lock/transaction timeout、单批rows/bytes和c
 只有能与业务rows在唯一Control PostgreSQL事务原子提交的Workspace product mutation使用以下result；
 它先完成调用者认证、当前Workspace membership和route permission检查，再取得
 `(authenticated workspace, canonical route, Idempotency-Key)`的transaction-scoped reservation。
-全局锁DAG是`API key -> CatNameLock -> HostFenceEvent -> authorization -> VolumeRecord -> Disk/Desired ->
-DiskSnapshotRecord`，不涉及的节点直接跳过，同类多行按稳定ID排序。fingerprint唯一使用
+全局锁DAG是`API key -> CatNameLock -> NodeIdentity（会改变assigned Desired时）-> HostFenceEvent ->
+authorization -> VolumeRecord -> Disk/Desired -> DiskSnapshotRecord`，不涉及的节点直接跳过，同类多行按稳定ID排序。fingerprint唯一使用
 [Volume Authority §3.3](specs/volume-authority.md#33-workspace-product-api-idempotency)的domain-separated、
 u64-BE length-framed workspace/route/raw path-query/If-Match/raw body bytes；不允许route-local JSON或参数
 归一化。相同fingerprint只读status/content-type/exact response bytes，即使目标资源后来已删除也不先查询它；
@@ -89,8 +89,10 @@ lookup：hit直接重放；miss不保留reservation/Pending，准备完成后的
 重读result。两次读取之间的竞态以事务内结果为准，届时丢弃candidate bundle。该优化不新增authority，也不能
 把resource/capacity检查放到fast hit之前。
 
-`CatNameLock(workspace_id,name)`只是不落row的PostgreSQL transaction advisory coordination：只有Cat create
-在API key之后、任何Volume/Cat/Disk锁之前取得它；持锁查询existing Cat后才选择fixed 202或409 envelope。
+`CatNameLock(workspace_id,name)`只是不落row的PostgreSQL transaction advisory coordination：Cat create
+在API key之后取得它；持锁查询到existing Cat后按既有Volume→Cat→Disk→Desired→Endpoint/lookup→Operation
+锁序闭合existing graph，合法时只保存fixed 409且不锁candidate plan/NodeIdentity；name free的202分支才先锁
+并重验candidate NodeIdentity/admission，再取得任何candidate Volume/Cat/Disk锁。
 数据库unique constraint仍保留，但不能依赖一个已abort的unique violation事务再补写409 result。
 
 router build/startup gate枚举全部mutation：每条恰好归入上述PG result或已有domain协议；Account/WorkOS、

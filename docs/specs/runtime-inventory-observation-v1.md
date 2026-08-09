@@ -529,6 +529,11 @@ Node自报数字变成第二authority。A20 snapshot只是可失效的pre-transa
 当前 `CatCreatePlan`必须携带上述完整 `PlacementAdmissionSnapshot`加 exact `NetworkConfig`，而不是只摘出
 NodeIdentity/AgentSession/attestation三项让service误以为已检查 freshness。service仍逐字段验证完整binding；
 它不接受 planner 自报 boolean。
+Cat create事务在name free且将写新Desired的分支，必须先以candidate NodeIdentity作为每Node assigned-set唯一
+coordination row取得`FOR UPDATE`，再在同一事务重载并逐字段比较完整snapshot，随后才可锁Volume/Disk/Desired/
+Operation；合法same-name 409分支不改变Desired，只保存exact result，因此不读取或锁定这份可失效plan。
+该409分支仍按Volume Authority既有顺序锁定并验证existing Cat graph；“不消费plan”不允许把existing graph
+降成unlocked snapshot，也不允许在并发Destroy赢得Volume锁后缓存一个假的name conflict。
 
 ### 7.2 Route signer freshness
 

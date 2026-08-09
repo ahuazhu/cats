@@ -609,9 +609,13 @@ Root Disk的name固定等于candidate `disk_id`；它不从用户Cat name派生�
 candidate，不能产生第二种持久409。
 名称冲突事务不写Cat/Endpoint/hostname lookup/Desired/Operation/Disk/Volume，只写该409 result；随机identity碰撞、持久row损坏或
 数据库失败不得伪装成名称冲突result。
-业务事务的锁序固定为`API key -> CatNameLock(workspace_id,name) -> Volume -> Cat -> Disk -> Desired ->
-Endpoint/hostname lookup -> Operation`；name lock是transaction-scoped advisory coordination，不是持久row。锁后existing合法Cat才可选择
-固定409，absent才继续；不能依赖unique-violation后的已回滚事务补写result。
+业务事务先固定为`API key -> CatNameLock(workspace_id,name)`并闭合分支：锁后existing合法Cat按既有
+Volume→Cat→Disk→Desired→Endpoint/lookup→Operation锁序闭合existing graph后只写fixed 409 result，不读取或
+锁定candidate plan/NodeIdentity；absent且会插入Desired的success分支才继续
+`NodeIdentity + 锁内完整admission重验 -> Volume -> Cat -> Disk -> Desired -> Endpoint/hostname lookup ->
+Operation`。name lock是transaction-scoped advisory coordination，不是持久row；不能依赖unique-violation后的
+已回滚事务补写result。旧plan后发生合法占名仍选409，name free时的session/identity/inventory/assigned-set变化
+则必须零业务row、零result fail closed。
 
 ## 4. Desired delivery 与 AdmissionCell
 
