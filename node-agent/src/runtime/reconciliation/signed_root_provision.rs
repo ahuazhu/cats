@@ -43,8 +43,8 @@ use super::serving_handoff::{
     TargetControlAuthorizationReady,
 };
 use super::serving_handoff_effect::{
-    ServingHandoffEffect, ServingHandoffEffectProgress, ServingPrepareDeviceEffect,
-    ServingPrepareFrontend,
+    checkpoint_is_current_exact, ServingHandoffEffect, ServingHandoffEffectProgress,
+    ServingPrepareDeviceEffect, ServingPrepareFrontend,
 };
 use super::signed_running::{
     expected_provision_heads, provision_checkpoint_is_bound, ProvisionHeadRead,
@@ -204,8 +204,29 @@ impl RuntimeDesiredEffect for SignedRunningEffect {
         if let Some(outcome) = self.provision.try_apply(&context, desired)? {
             return Ok(outcome);
         }
+        if current_prepare_device_waits_for_later_effect(&context, desired)? {
+            // `PrepareDevice` is owned by the serving/device suffix.  Until
+            // the next bounded serving effect is composed here, preserve its
+            // current checkpoint and demand a fresh full inventory instead
+            // of falling back into the pre-acquire planner (which correctly
+            // rejects later steps with StopLocal).
+            return Ok(RuntimeDesiredEffectOutcome::RefreshInventory);
+        }
         self.acquire.apply(context, desired)
     }
+}
+
+fn current_prepare_device_waits_for_later_effect(
+    context: &RuntimeDesiredEffectContext,
+    desired: &DesiredRuntimeSpec,
+) -> anyhow::Result<bool> {
+    let accepted = context.accepted_full()?;
+    let Some(runtime) = unique_runtime(&accepted.observation().runtimes, desired) else {
+        return Ok(false);
+    };
+    Ok(matches!(runtime.step, ReconcileStep::PrepareDevice { .. })
+        && signed_inventory_admission_is_exact(accepted, desired, runtime)
+        && checkpoint_is_current_exact(desired, runtime))
 }
 
 impl SignedRootProvisionEffect {
@@ -1935,6 +1956,9 @@ mod tests {
                     &self.authority.record().head,
                     match &self.checkpoint.step {
                         ReconcileStep::ProvisionRootImage { data_directory, .. } => data_directory,
+                        ReconcileStep::PrepareDevice {
+                            serving_process, ..
+                        } => &serving_process.data_directory,
                         _ => unreachable!(),
                     },
                 )],
@@ -2335,7 +2359,7 @@ mod tests {
 
     #[test]
     fn production_dispatcher_handoffs_target_then_cas_without_reentering_provision() {
-        let fixture = Fixture::new();
+        let mut fixture = Fixture::new();
         let ReconcileStep::ProvisionRootImage {
             provision_transition_id,
             expected_provisioned_head,
@@ -2451,6 +2475,23 @@ mod tests {
         assert_eq!(process.starts.load(Ordering::SeqCst), 0);
         assert_eq!(mutations.calls.load(Ordering::SeqCst), 0);
         assert_eq!(retirement.calls.load(Ordering::SeqCst), 2);
+
+        // A later fresh scan that proves the old target-control process absent
+        // leaves this checkpoint with the serving/device suffix.  Until that
+        // suffix is composed, it must refresh rather than fall back into the
+        // pre-acquire planner and StopLocal.
+        let prepared_checkpoint = prepared.checkpoint().clone();
+        drop(prepared);
+        fixture.checkpoint = prepared_checkpoint;
+        assert_eq!(
+            dispatcher
+                .apply(fixture.context_at(Vec::new(), 7, 15), &fixture.desired)
+                .unwrap(),
+            RuntimeDesiredEffectOutcome::RefreshInventory
+        );
+        assert_eq!(request.calls.load(Ordering::SeqCst), 0);
+        assert_eq!(process.starts.load(Ordering::SeqCst), 0);
+        assert_eq!(mutations.calls.load(Ordering::SeqCst), 0);
     }
 
     #[test]

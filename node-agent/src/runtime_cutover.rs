@@ -30,8 +30,7 @@ use crate::runtime::reconciliation::{
     installed_clean_slate_scanner, installed_root_process_effect_ports,
     AuthorizedBlockdLaunchConfig, ControlSignedNormalAcquireClient, InstalledCleanSlateProbeConfig,
     RootProvisionSystemdConfig, RuntimeVolumeTransitionHttpClient, ServingPrepareFrontend,
-    SignedRunningAcquireEffect,
-    SignedRunningEffect, SignedRunningPublicationRecovery,
+    SignedRunningAcquireEffect, SignedRunningEffect, SignedRunningPublicationRecovery,
 };
 use crate::runtime_spine::{
     RuntimeInventoryScanner, RuntimeSpineDeadlinePolicy, RuntimeSpineHttpClient,

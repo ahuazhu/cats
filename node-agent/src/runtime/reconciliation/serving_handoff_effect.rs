@@ -246,7 +246,7 @@ impl ServingPrepareDeviceEffect {
     }
 }
 
-fn checkpoint_is_current_exact(
+pub(super) fn checkpoint_is_current_exact(
     desired: &DesiredRuntimeSpec,
     runtime: &ObservedRuntimeStatus,
 ) -> bool {
