@@ -1085,6 +1085,73 @@ fn refuses_missing_or_replaced_authorization_indexes_without_repair() {
 }
 
 #[test]
+fn refuses_missing_or_weakened_volume_owner_constraints_without_repair() {
+    for (constraint, ddl, expected_definition) in [
+        (
+            "volume_records_owner_present_check",
+            "ALTER TABLE volume_records
+                 DROP CONSTRAINT volume_records_owner_present_check",
+            None,
+        ),
+        (
+            "volume_records_owner_node_present_check",
+            "ALTER TABLE volume_records
+                 DROP CONSTRAINT volume_records_owner_node_present_check;
+             ALTER TABLE volume_records
+                 ADD CONSTRAINT volume_records_owner_node_present_check
+                 CHECK (owner_binding IS NULL OR owner_node_id IS NOT NULL)",
+            Some("owner_binding IS NULL"),
+        ),
+        (
+            "volume_records_owner_binding_check",
+            "ALTER TABLE volume_records
+                 DROP CONSTRAINT volume_records_owner_binding_check;
+             ALTER TABLE volume_records
+                 ADD CONSTRAINT volume_records_owner_binding_check
+                 CHECK (owner_binding IS NULL OR jsonb_typeof(owner_binding)='object')",
+            Some("jsonb_typeof(owner_binding)"),
+        ),
+    ] {
+        let url = crate::testsupport::isolated_control_store_url();
+        drop(Store::connect(&url, None).unwrap());
+        let mut admin = postgres::Client::connect(&url, postgres::NoTls).unwrap();
+        admin.batch_execute(ddl).unwrap();
+
+        let Err(error) = Store::connect(&url, None) else {
+            panic!("a stamped schema with a changed Volume owner constraint must fail closed");
+        };
+        assert_eq!(error.code, ErrorCode::FailedPrecondition);
+        assert!(error.to_string().contains(constraint), "{error}");
+        let definition: Option<String> = admin
+            .query_opt(
+                "SELECT pg_get_constraintdef(catalog_constraint.oid, FALSE)
+                   FROM pg_constraint catalog_constraint
+                   JOIN pg_class source ON source.oid=catalog_constraint.conrelid
+                   JOIN pg_namespace source_namespace
+                     ON source_namespace.oid=source.relnamespace
+                  WHERE source_namespace.nspname=current_schema()
+                    AND source.relname='volume_records'
+                    AND catalog_constraint.conname=$1",
+                &[&constraint],
+            )
+            .unwrap()
+            .map(|row| row.get(0));
+        match expected_definition {
+            Some(fragment) => assert!(
+                definition
+                    .as_deref()
+                    .is_some_and(|value| value.contains(fragment)),
+                "startup repaired or replaced the deliberately weak constraint: {definition:?}"
+            ),
+            None => assert!(
+                definition.is_none(),
+                "startup recreated a deliberately dropped constraint: {definition:?}"
+            ),
+        }
+    }
+}
+
+#[test]
 fn refuses_missing_or_replaced_volume_owner_indexes_without_repair() {
     for (index, ddl, expected_fragment) in [
         (

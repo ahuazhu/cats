@@ -214,6 +214,33 @@ fn verify_current_schema(transaction: &mut postgres::Transaction<'_>) -> Result<
 /// structurally at every startup; a current stamp is never permission to
 /// recreate or repair one of them.
 fn verify_authority_catalog(transaction: &mut postgres::Transaction<'_>) -> Result<()> {
+    for (table, constraint, definition) in REQUIRED_CHECK_CONSTRAINTS {
+        let present: bool = transaction
+            .query_one(
+                "SELECT EXISTS (
+                    SELECT 1
+                      FROM pg_constraint c
+                      JOIN pg_class source ON source.oid=c.conrelid
+                      JOIN pg_namespace source_namespace
+                        ON source_namespace.oid=source.relnamespace
+                     WHERE source_namespace.nspname=current_schema()
+                       AND source.relname=$1 AND c.conname=$2
+                       AND c.contype='c' AND c.convalidated
+                       AND NOT c.connoinherit
+                       AND pg_get_constraintdef(c.oid, FALSE)=$3
+                 )",
+                &[table, constraint, definition],
+            )
+            .map_err(|error| {
+                internal(format!(
+                    "verify authority check-constraint catalog: {error:?}"
+                ))
+            })?
+            .get(0);
+        if !present {
+            return Err(partial_catalog_object(constraint));
+        }
+    }
     for (table, constraint, target, source_columns, target_columns, update_action, delete_action) in
         REQUIRED_DEFERRED_FOREIGN_KEYS
     {
@@ -526,6 +553,24 @@ type RequiredDeferredForeignKey = (
     &'static str,
     &'static str,
 );
+
+const REQUIRED_CHECK_CONSTRAINTS: &[(&str, &str, &str)] = &[
+    (
+        "volume_records",
+        "volume_records_owner_present_check",
+        "CHECK (((lease_owner IS NULL) = (owner_binding IS NULL)))",
+    ),
+    (
+        "volume_records",
+        "volume_records_owner_node_present_check",
+        "CHECK (((owner_binding IS NULL) = (owner_node_id IS NULL)))",
+    ),
+    (
+        "volume_records",
+        "volume_records_owner_binding_check",
+        "CHECK (((owner_binding IS NULL) OR (owner_binding = jsonb_build_object('volume_id', volume_id, 'owner_node_id', owner_node_id, 'attachment_id', lease_owner, 'attachment_epoch', lease_epoch))))",
+    ),
+];
 
 const REQUIRED_DEFERRED_FOREIGN_KEYS: &[RequiredDeferredForeignKey] = &[
     (
