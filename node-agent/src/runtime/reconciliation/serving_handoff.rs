@@ -29,9 +29,9 @@ use std::sync::Mutex;
 use anyhow::{Context as _, Result};
 use cats_api::runtime_reconciliation::{
     checkpoint_content_digest, encode_runtime_checkpoint, AcquireOrigin, ContractVersion,
-    Durability, Epoch, FenceEpoch, HostPath, Id, NodeBootId, RandomId128, ReconcileStep,
-    RemoteHead, Revision, RootServingHandoff, RootServingHandoffRecordIdentity, RuntimeCheckpoint,
-    Sequence, ServingAuthorityProvenance, Sha256Digest, VolumeRecord, WireU64,
+    DesiredRuntimeSpec, Durability, Epoch, FenceEpoch, HostPath, Id, NodeBootId, RandomId128,
+    ReconcileStep, RemoteHead, Revision, RootServingHandoff, RootServingHandoffRecordIdentity,
+    RuntimeCheckpoint, Sequence, ServingAuthorityProvenance, Sha256Digest, VolumeRecord, WireU64,
 };
 use cats_blockd::target_control::{
     decode_target_control_authorization, encode_target_control_authorization,
@@ -313,6 +313,59 @@ pub(crate) struct ServingHandoffReady {
     retained_record: RetainedFile,
     record_identity: ServingHandoffRecordIdentity,
     record: ServingHandoffRecord,
+}
+
+/// Descriptor-retained reconstruction of the old target-control process after
+/// the Runtime checkpoint has atomically advanced to `PrepareDevice`.
+///
+/// This value is deliberately read-only.  It pins the acquire-time inputs,
+/// target-head authorization, sealed handoff record and optional predecessor
+/// retirement receipt under the attachment flock.  Only an exact process
+/// expectation can be projected from it; it cannot start a serving process or
+/// create a frontend/device.
+pub(crate) struct PrepareDeviceHandoffReady {
+    retained_authorized: RetainedAuthorizedBlockd,
+    retained_target: RetainedFile,
+    retained_record: RetainedFile,
+    retained_retirement: Option<RetainedFile>,
+    attempt: RetainedRootProvisionProcessAttempt,
+}
+
+impl PrepareDeviceHandoffReady {
+    pub(crate) fn attempt(&self) -> &RetainedRootProvisionProcessAttempt {
+        &self.attempt
+    }
+
+    pub(crate) fn assert_current(
+        &self,
+        checkpoint: &RuntimeCheckpoint,
+        desired: &DesiredRuntimeSpec,
+        authority: &VolumeRecord,
+    ) -> Result<()> {
+        self.retained_authorized.assert_current()?;
+        let directory = self.retained_authorized.retained_directory();
+        self.retained_target
+            .assert_current(directory, &self.retained_target.identity.path)?;
+        self.retained_record
+            .assert_current(directory, &self.retained_record.identity.path)?;
+        if let Some(retirement) = &self.retained_retirement {
+            retirement.assert_current(directory, &retirement.identity.path)?;
+        }
+        let current = validate_retained_prepare_device_handoff(
+            checkpoint,
+            desired,
+            authority,
+            &self.retained_authorized,
+            &self.retained_target,
+            &self.retained_record,
+            self.retained_retirement.as_ref(),
+        )?;
+        anyhow::ensure!(
+            current == self.attempt,
+            "retained PrepareDevice handoff changed its old process identity"
+        );
+        Ok(())
+    }
 }
 
 impl ServingHandoffReady {
@@ -700,6 +753,99 @@ impl ServingHandoffStore {
         };
         ready.assert_current(stored_checkpoint)?;
         Ok(ReopenedServingHandoff::Exact(Box::new(ready)))
+    }
+
+    /// Reopen the Root handoff after its atomic `PrepareDevice` checkpoint
+    /// replacement.  The current checkpoint no longer contains the old
+    /// process fields, so the immutable record/target pair and acquire-time
+    /// files are rejoined under retained descriptors and the attachment
+    /// flock.  This is the only effect-time path that can reconstruct the old
+    /// target-control process expectation.
+    pub(crate) fn reopen_prepare_device_handoff(
+        &self,
+        checkpoint: &RuntimeCheckpoint,
+        desired: &DesiredRuntimeSpec,
+        authority: &VolumeRecord,
+        retained_authorized: RetainedAuthorizedBlockd,
+    ) -> Result<PrepareDeviceHandoffReady> {
+        anyhow::ensure!(
+            self.state_directory.path() == retained_authorized.state_directory_path(),
+            "PrepareDevice handoff reopen uses another Node state directory"
+        );
+        let ReconcileStep::PrepareDevice {
+            serving_authority,
+            serving_process,
+            ..
+        } = &checkpoint.step
+        else {
+            anyhow::bail!("PrepareDevice handoff reopen requires prepare_device")
+        };
+        let ServingAuthorityProvenance::AfterRootProvision { handoff } = serving_authority.as_ref()
+        else {
+            anyhow::bail!("PrepareDevice handoff reopen requires Root serving provenance")
+        };
+        let data_directory = retained_authorized.data_directory();
+        anyhow::ensure!(
+            Path::new(serving_process.data_directory.as_str()) == data_directory
+                && Path::new(handoff.record.path.as_str())
+                    == data_directory.join(SERVING_HANDOFF_RECORD_FILE),
+            "PrepareDevice handoff paths leave the retained attachment directory"
+        );
+        let directory = retained_authorized.retained_directory();
+        let retained_record = RetainedFile::open_required(
+            directory,
+            SERVING_HANDOFF_RECORD_FILE,
+            handoff.record.path.clone(),
+            SERVING_HANDOFF_RECORD_MAX_BYTES,
+        )?;
+        let record = decode_serving_handoff_record(&retained_record.bytes)?;
+        let target_name = target_control_file_name(&record.provision_transition_id);
+        let target_temp = target_control_temp_name(&record.provision_transition_id);
+        validate_handoff_namespace(directory, &target_name, &target_temp)?;
+        let retained_target = RetainedFile::open_required(
+            directory,
+            &target_name,
+            record.target_control_authorization.path.clone(),
+            TARGET_AUTHORIZED_SERVING_MAX_BYTES,
+        )?;
+        let retirement_name = c_string(SERVING_HANDOFF_RETIREMENT_FILE)?;
+        let retained_retirement = if read_optional_bounded(
+            directory,
+            &retirement_name,
+            SERVING_HANDOFF_RETIREMENT_MAX_BYTES,
+        )?
+        .is_some()
+        {
+            Some(RetainedFile::open_required(
+                directory,
+                SERVING_HANDOFF_RETIREMENT_FILE,
+                host_path(
+                    &data_directory.join(SERVING_HANDOFF_RETIREMENT_FILE),
+                    "PrepareDevice handoff retirement path",
+                )?,
+                SERVING_HANDOFF_RETIREMENT_MAX_BYTES,
+            )?)
+        } else {
+            None
+        };
+        let attempt = validate_retained_prepare_device_handoff(
+            checkpoint,
+            desired,
+            authority,
+            &retained_authorized,
+            &retained_target,
+            &retained_record,
+            retained_retirement.as_ref(),
+        )?;
+        let ready = PrepareDeviceHandoffReady {
+            retained_authorized,
+            retained_target,
+            retained_record,
+            retained_retirement,
+            attempt,
+        };
+        ready.assert_current(checkpoint, desired, authority)?;
+        Ok(ready)
     }
 
     /// Classify the durable retirement receipt under the same retained
@@ -2514,6 +2660,44 @@ fn validate_record_checkpoint_value(
         "serving handoff record is stale for the current stored checkpoint"
     );
     Ok(())
+}
+
+fn validate_retained_prepare_device_handoff(
+    checkpoint: &RuntimeCheckpoint,
+    desired: &DesiredRuntimeSpec,
+    authority: &VolumeRecord,
+    retained_authorized: &RetainedAuthorizedBlockd,
+    retained_target: &RetainedFile,
+    retained_record: &RetainedFile,
+    retained_retirement: Option<&RetainedFile>,
+) -> Result<RetainedRootProvisionProcessAttempt> {
+    let target = retained_scanned_artifact(retained_target);
+    let record = retained_scanned_artifact(retained_record);
+    let retirement = retained_retirement.map(retained_scanned_artifact);
+    let attempt = validate_scanned_serving_handoff_artifacts(
+        checkpoint,
+        retained_authorized.checkpoint(),
+        &target,
+        Some(&record),
+        retirement.as_ref(),
+    )?
+    .context("PrepareDevice Root handoff did not retain one old process attempt")?;
+    RootProvisionProcessExpectation::from_retained_prepare_device(checkpoint, desired, &attempt)
+        .context("PrepareDevice Root handoff is not bound to current Desired")?;
+    validate_authorized_serving_record(authority, &attempt.attachment, None)
+        .map_err(|error| anyhow::anyhow!("PrepareDevice Root authority is not exact: {error}"))?;
+    Ok(attempt)
+}
+
+fn retained_scanned_artifact(file: &RetainedFile) -> ScannedServingHandoffArtifact<'_> {
+    ScannedServingHandoffArtifact {
+        path: file.identity.path.clone(),
+        device: file.identity.device,
+        inode: file.identity.inode,
+        length: file.identity.length,
+        content_sha256: file.identity.content_sha256.clone(),
+        bytes: &file.bytes,
+    }
 }
 
 /// Provider-private classifier used by the full inventory scanner. It does

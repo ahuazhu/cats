@@ -481,6 +481,18 @@ impl FileCheckpointStore {
         Ok(CurrentCheckpointGuard { _writer: writer })
     }
 
+    /// Revalidate the lexical target while the caller still holds the exact
+    /// guard returned by [`Self::assert_current`].  This closes a hostile
+    /// rename/recreate window without dropping either the in-process writer
+    /// serialization or the per-Cat flock before a bounded physical effect.
+    pub(super) fn revalidate_current(
+        &self,
+        expected: &StoredCheckpoint,
+        _guard: &CurrentCheckpointGuard<'_>,
+    ) -> Result<(), CheckpointStoreError> {
+        self.verify_expected(ExpectedTarget::Exact(expected))
+    }
+
     /// Re-establishes the directory durability barrier after a caller lost a
     /// publication acknowledgement, then confirms the exact visible value.
     /// This never adopts a temp file or treats visibility alone as durable.

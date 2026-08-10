@@ -548,6 +548,160 @@ impl AuthorizedBlockdStore {
         Ok(retained)
     }
 
+    /// Reopen, without repairing, the acquire-time attachment inputs retained
+    /// by an `after_root_provision` `PrepareDevice` checkpoint.  The returned
+    /// value holds the attachment-directory flock and every input descriptor;
+    /// callers may therefore keep the original Root handoff lineage pinned
+    /// through one later exact process effect.
+    pub(crate) fn retain_prepare_device_handoff(
+        &self,
+        runtime: &RuntimeCheckpoint,
+        desired: &DesiredRuntimeSpec,
+    ) -> Result<RetainedAuthorizedBlockd> {
+        let ReconcileStep::PrepareDevice {
+            volume_id,
+            attachment_id,
+            attachment_epoch,
+            acquire_origin,
+            expected_head,
+            size_bytes,
+            durability,
+            serving_authority,
+            serving_process,
+            ..
+        } = &runtime.step
+        else {
+            anyhow::bail!("exact authorized blockd handoff reopen requires prepare_device")
+        };
+        anyhow::ensure!(
+            matches!(
+                serving_authority.as_ref(),
+                cats_api::runtime_reconciliation::ServingAuthorityProvenance::AfterRootProvision { .. }
+            ),
+            "exact authorized blockd handoff reopen requires Root serving provenance"
+        );
+        let components = [
+            DATA_DIRECTORY.to_owned(),
+            format!("cat-{}", runtime.cat_id),
+            format!("volume-{volume_id}"),
+            format!("attachment-{attachment_id}"),
+            format!("epoch-{}", attachment_epoch.get()),
+        ];
+        let expected_directory = components.iter().fold(
+            self.state_directory.path().to_path_buf(),
+            |path, component| path.join(component),
+        );
+        anyhow::ensure!(
+            Path::new(serving_process.data_directory.as_str()) == expected_directory,
+            "PrepareDevice data directory is not its exact retained Node path"
+        );
+
+        let root_directory = self
+            .state_directory
+            .try_clone_directory()
+            .context("clone retained Node state directory")?;
+        let root_identity =
+            verify_retained_state_root(&root_directory, self.state_directory.path())?;
+        let mut relative = PathBuf::new();
+        let mut directory = root_directory
+            .try_clone()
+            .context("clone retained Node state directory descriptor")?;
+        let mut component_identities = Vec::with_capacity(components.len());
+        for component in &components {
+            relative.push(component);
+            directory =
+                open_existing_directory_at(&directory, component, &relative, &root_identity)?;
+            component_identities.push(stable_identity(&directory, &relative)?);
+        }
+        lock_directory(&directory).with_context(|| {
+            format!(
+                "lock exact authorized blockd handoff directory {}",
+                relative.display()
+            )
+        })?;
+        for temporary in [
+            IDENTITY_TEMP,
+            AUTHORIZED_SERVING_TEMP,
+            LAUNCH_CHECKPOINT_TEMP,
+        ] {
+            let path = relative.join(temporary);
+            let name = c_string(temporary, &path)?;
+            anyhow::ensure!(
+                read_optional_bounded(&directory, &name, &path, MAX_LAUNCH_CHECKPOINT_BYTES)?
+                    .is_none(),
+                "exact authorized blockd handoff reopen found unpublished input {}",
+                path.display()
+            );
+        }
+
+        let (identity, identity_file): (AttachmentLineageIdentity, _) = read_required_canonical(
+            &directory,
+            &relative,
+            IDENTITY_FILE,
+            MAX_IDENTITY_BYTES,
+            "attachment identity",
+            &root_identity,
+        )?;
+        let (attachment, attachment_file): (AuthorizedServingAttachment, _) =
+            read_required_canonical(
+                &directory,
+                &relative,
+                AUTHORIZED_SERVING_FILE,
+                MAX_AUTHORIZED_SERVING_BYTES,
+                "authorized serving attachment",
+                &root_identity,
+            )?;
+        let (checkpoint, checkpoint_file): (AuthorizedBlockdCheckpoint, _) =
+            read_required_canonical(
+                &directory,
+                &relative,
+                LAUNCH_CHECKPOINT_FILE,
+                MAX_LAUNCH_CHECKPOINT_BYTES,
+                "authorized blockd launch checkpoint",
+                &root_identity,
+            )?;
+        validate_authorized_blockd_checkpoint(&checkpoint)?;
+        let [desired_volume] = desired.volumes.as_slice() else {
+            anyhow::bail!("Root PrepareDevice handoff requires one Desired volume")
+        };
+        anyhow::ensure!(
+            identity == attachment.identity
+                && attachment == checkpoint.attachment
+                && checkpoint.desired == *desired
+                && checkpoint.volume == *desired_volume
+                && runtime.cat_id == desired.cat_id
+                && runtime.node_id == desired.placement.node_id
+                && runtime.placement_epoch == desired.placement.placement_epoch
+                && runtime.desired_revision == desired.desired_revision
+                && runtime.spec_digest == desired.spec_digest
+                && *volume_id == desired_volume.volume_id
+                && *volume_id == identity.volume_id
+                && *attachment_id == identity.attachment_id
+                && *attachment_epoch == identity.attachment_epoch
+                && *acquire_origin == identity.acquire_origin
+                && *size_bytes == attachment.size_bytes
+                && *durability == attachment.durability
+                && expected_head.generation.get() > 0
+                && expected_head.root_hash.is_some()
+                && expected_head.root_object_id.is_some(),
+            "PrepareDevice checkpoint and immutable authorized blockd inputs conflict"
+        );
+
+        let retained = RetainedAuthorizedBlockd {
+            state_directory: self.state_directory.clone(),
+            root_directory,
+            root_identity,
+            components,
+            component_identities,
+            data_directory: expected_directory,
+            checkpoint,
+            directory,
+            files: [identity_file, attachment_file, checkpoint_file],
+        };
+        retained.assert_current()?;
+        Ok(retained)
+    }
+
     fn prepare_validated(
         &self,
         desired: &DesiredRuntimeSpec,
@@ -739,6 +893,18 @@ impl RetainedAuthorizedBlockd {
         self.directory
             .try_clone()
             .context("duplicate retained authorized blockd attachment descriptor")
+    }
+
+    pub(crate) fn data_directory(&self) -> &Path {
+        &self.data_directory
+    }
+
+    pub(crate) fn retained_directory(&self) -> &File {
+        &self.directory
+    }
+
+    pub(crate) fn state_directory_path(&self) -> &Path {
+        self.state_directory.path()
     }
 
     pub(crate) fn assert_current(&self) -> Result<()> {
