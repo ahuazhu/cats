@@ -2,203 +2,119 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
-use cats_api::route_grant_v2::{
-    RouteGrantV2Claims, RouteGrantV2ProtectedHeader, RouteGrantV2PublicKey,
-    RouteGrantV2SigningInput, ROUTE_GRANT_V2_AUDIENCE, ROUTE_GRANT_V2_ISSUER,
-    ROUTE_GRANT_V2_VERSION,
-};
-use cats_api::runtime_reconciliation::{Epoch, Hostname, HttpProtocol, Id, RandomId128};
+use cats_api::route_grant_v2::MAX_ROUTE_GRANT_V2_COMPACT_BYTES;
+use cats_api::runtime_reconciliation::{Hostname, Id, NodeTransportTarget};
 use cats_network::route_v2::{
     read_bounded_response_body, AuthenticatedResolveEnvelope, CacheLookup, CacheRefreshStatus,
-    CurrentRequestDisposition, NegativeRoute, RefreshableRejection, RequestKind, ResolveFailure,
-    ResolveFuture, ResponseBodyBounds, ResponseReadError, RouteCache, RouteCacheConfig,
-    RouteCacheError, RouteGrantKeyRing, RouteGrantVerificationError, RouteResolution,
-    RouteResolver, VerifiedRoute,
+    CurrentRequestDisposition, GrantDigest, NegativeRoute, RefreshableRejection, RequestKind,
+    ResolveEnvelopeError, ResolveFailure, ResolveFuture, ResolvedRoute, ResponseBodyBounds,
+    ResponseReadError, RouteCache, RouteCacheConfig, RouteCacheError, RouteResolution,
+    RouteResolver,
 };
-use ring::rand::SystemRandom;
-use ring::signature::{Ed25519KeyPair, KeyPair as _};
+use sha2::{Digest as _, Sha256};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
 use tokio::sync::{oneshot, Notify};
 use tokio::time::Instant;
 
-const ED25519_SPKI_PREFIX: [u8; 12] = [
-    0x30, 0x2a, 0x30, 0x05, 0x06, 0x03, 0x2b, 0x65, 0x70, 0x03, 0x21, 0x00,
-];
-
-struct SigningKey {
-    pair: Ed25519KeyPair,
-    public: RouteGrantV2PublicKey,
+fn hostname() -> Hostname {
+    Hostname::new("app.cats.run").unwrap()
 }
 
-fn signing_key() -> SigningKey {
-    let pkcs8 = Ed25519KeyPair::generate_pkcs8(&SystemRandom::new()).unwrap();
-    let pair = Ed25519KeyPair::from_pkcs8(pkcs8.as_ref()).unwrap();
-    let mut spki = ED25519_SPKI_PREFIX.to_vec();
-    spki.extend_from_slice(pair.public_key().as_ref());
-    let public = RouteGrantV2PublicKey::from_spki_der(&spki).unwrap();
-    SigningKey { pair, public }
+fn grant_digest(grant: &[u8]) -> GrantDigest {
+    GrantDigest::from_bytes(Sha256::digest(grant).into())
 }
 
-fn claims(now: u64, route_epoch: u64) -> RouteGrantV2Claims {
-    RouteGrantV2Claims {
-        version: ROUTE_GRANT_V2_VERSION,
-        iss: ROUTE_GRANT_V2_ISSUER.to_owned(),
-        aud: ROUTE_GRANT_V2_AUDIENCE.to_owned(),
-        workspace_id: Id::new("ws_01").unwrap(),
-        endpoint_id: Id::new("ep_01").unwrap(),
-        hostname: Hostname::new("app.cats.run").unwrap(),
-        cat_id: Id::new("cat_01").unwrap(),
-        node_id: Id::new("node_a").unwrap(),
-        runtime_incarnation: RandomId128::new("11111111111111111111111111111111").unwrap(),
-        route_epoch: Epoch::new(route_epoch).unwrap(),
-        protocol: HttpProtocol::Http,
-        target_port: 8080,
-        iat: now,
-        nbf: now,
-        exp: now + 120,
-    }
-}
-
-fn sign(key: &SigningKey, claims: &RouteGrantV2Claims) -> String {
-    let input = RouteGrantV2SigningInput::new(
-        &RouteGrantV2ProtectedHeader::new(key.public.kid().clone()),
-        claims,
-    )
-    .unwrap();
-    let signature: [u8; 64] = key.pair.sign(input.as_bytes()).as_ref().try_into().unwrap();
-    input.finish(&signature).unwrap()
-}
-
-fn envelope(token: String, claims: &RouteGrantV2Claims) -> AuthenticatedResolveEnvelope {
-    let response_bytes = token.len() + 256;
+fn envelope(opaque_grant: Vec<u8>, expires_at_unix_seconds: u64) -> AuthenticatedResolveEnvelope {
+    let response_bytes = opaque_grant.len() + 256;
+    let digest = grant_digest(&opaque_grant);
     AuthenticatedResolveEnvelope::from_authenticated_transport(
-        claims.endpoint_id.as_str(),
-        claims.node_id.as_str(),
-        "https://node-a.internal:7301",
-        token,
-        claims.exp,
+        Id::new("ep_01").unwrap(),
+        NodeTransportTarget::new("https://node-a.internal:7301").unwrap(),
+        expires_at_unix_seconds,
+        opaque_grant,
+        digest,
         response_bytes,
     )
 }
 
-fn verify_route(key: &SigningKey, claims: &RouteGrantV2Claims, now: u64) -> VerifiedRoute {
-    let ring =
-        RouteGrantKeyRing::from_public_keys(Epoch::new(1).unwrap(), [key.public.clone()]).unwrap();
-    ring.verify(
-        &claims.hostname,
-        envelope(sign(key, claims), claims),
-        now,
-        Instant::now(),
-    )
-    .unwrap()
+fn resolved_route(opaque_grant: &[u8], now_unix_seconds: u64) -> ResolvedRoute {
+    envelope(opaque_grant.to_vec(), now_unix_seconds + 120)
+        .validate_for_hostname(&hostname(), now_unix_seconds, Instant::now())
+        .unwrap()
 }
 
 #[test]
-fn verifier_first_rotation_accepts_overlap_then_retires_the_old_key() {
+fn authenticated_envelope_validates_metadata_without_parsing_the_opaque_grant() {
     let now = 1_786_156_800;
-    let old = signing_key();
-    let new = signing_key();
-    let old_claims = claims(now, 7);
-    let new_claims = claims(now, 8);
-    let old_envelope = envelope(sign(&old, &old_claims), &old_claims);
-    let new_envelope = envelope(sign(&new, &new_claims), &new_claims);
-
-    let old_only =
-        RouteGrantKeyRing::from_public_keys(Epoch::new(1).unwrap(), [old.public.clone()]).unwrap();
-    assert!(old_only
-        .verify(
-            &old_claims.hostname,
-            old_envelope.clone(),
-            now,
-            Instant::now()
-        )
-        .is_ok());
-
-    let overlap = RouteGrantKeyRing::from_public_keys(
-        Epoch::new(2).unwrap(),
-        [old.public.clone(), new.public.clone()],
-    )
-    .unwrap();
-    assert!(overlap
-        .verify(
-            &old_claims.hostname,
-            old_envelope.clone(),
-            now,
-            Instant::now()
-        )
-        .is_ok());
-    assert!(overlap
-        .verify(
-            &new_claims.hostname,
-            new_envelope.clone(),
-            now,
-            Instant::now()
-        )
-        .is_ok());
-
-    let new_only =
-        RouteGrantKeyRing::from_public_keys(Epoch::new(3).unwrap(), [new.public.clone()]).unwrap();
+    let deliberately_non_jws_bytes =
+        vec![0xff, 0x00, b'.', b'n', b'o', b't', b'-', b'j', b'w', b's'];
+    let route = envelope(deliberately_non_jws_bytes.clone(), now + 120)
+        .validate_for_hostname(&hostname(), now, Instant::now())
+        .unwrap();
+    assert_eq!(route.opaque_grant(), deliberately_non_jws_bytes);
+    assert_eq!(route.endpoint_id().as_str(), "ep_01");
     assert_eq!(
-        new_only
-            .verify(&old_claims.hostname, old_envelope, now, Instant::now())
+        route.node_transport_target().as_str(),
+        "https://node-a.internal:7301"
+    );
+    assert_eq!(route.expires_at_unix_seconds(), now + 120);
+
+    assert_eq!(
+        envelope(b"opaque".to_vec(), now)
+            .validate_for_hostname(&hostname(), now, Instant::now())
             .unwrap_err(),
-        RouteGrantVerificationError::UnknownKey
-    );
-    assert!(new_only
-        .verify(&new_claims.hostname, new_envelope, now, Instant::now())
-        .is_ok());
-}
-
-#[test]
-fn expired_grant_invalid_https_target_and_wrong_placement_fail_before_caching() {
-    let now = 1_786_156_800;
-    let key = signing_key();
-    let ring =
-        RouteGrantKeyRing::from_public_keys(Epoch::new(1).unwrap(), [key.public.clone()]).unwrap();
-
-    let mut expired = claims(now - 121, 7);
-    expired.exp = now - 1;
-    assert_eq!(
-        ring.verify(
-            &expired.hostname,
-            envelope(sign(&key, &expired), &expired),
-            now,
-            Instant::now()
-        )
-        .unwrap_err(),
-        RouteGrantVerificationError::Expired
-    );
-
-    let valid = claims(now, 7);
-    let wrong_target = AuthenticatedResolveEnvelope::from_authenticated_transport(
-        valid.endpoint_id.as_str(),
-        valid.node_id.as_str(),
-        "https://127.0.0.1:7301",
-        sign(&key, &valid),
-        valid.exp,
-        1024,
+        ResolveEnvelopeError::Expired
     );
     assert_eq!(
-        ring.verify(&valid.hostname, wrong_target, now, Instant::now())
+        envelope(b"opaque".to_vec(), now + 306)
+            .validate_for_hostname(&hostname(), now, Instant::now())
             .unwrap_err(),
-        RouteGrantVerificationError::InvalidNodeTransportTarget
+        ResolveEnvelopeError::ExpiryTooFar
     );
-
-    let token = sign(&key, &valid);
-    let wrong_placement = AuthenticatedResolveEnvelope::from_authenticated_transport(
-        valid.endpoint_id.as_str(),
-        "node_b",
-        "https://node-b.internal:7301",
-        token.clone(),
-        valid.exp,
-        token.len() + 256,
+    let wrong_digest = AuthenticatedResolveEnvelope::from_authenticated_transport(
+        Id::new("ep_01").unwrap(),
+        NodeTransportTarget::new("https://node-a.internal:7301").unwrap(),
+        now + 120,
+        b"opaque".to_vec(),
+        GrantDigest::from_bytes([0x55; 32]),
+        512,
     );
     assert_eq!(
-        ring.verify(&valid.hostname, wrong_placement, now, Instant::now())
+        wrong_digest
+            .validate_for_hostname(&hostname(), now, Instant::now())
             .unwrap_err(),
-        RouteGrantVerificationError::BindingMismatch
+        ResolveEnvelopeError::GrantDigestMismatch
     );
+    assert_eq!(
+        envelope(Vec::new(), now + 120)
+            .validate_for_hostname(&hostname(), now, Instant::now())
+            .unwrap_err(),
+        ResolveEnvelopeError::EmptyOpaqueGrant
+    );
+    let invalid_size = AuthenticatedResolveEnvelope::from_authenticated_transport(
+        Id::new("ep_01").unwrap(),
+        NodeTransportTarget::new("https://node-a.internal:7301").unwrap(),
+        now + 120,
+        b"opaque".to_vec(),
+        grant_digest(b"opaque"),
+        b"opaque".len() - 1,
+    );
+    assert_eq!(
+        invalid_size
+            .validate_for_hostname(&hostname(), now, Instant::now())
+            .unwrap_err(),
+        ResolveEnvelopeError::InvalidResponseSize
+    );
+    let oversized = vec![b'x'; MAX_ROUTE_GRANT_V2_COMPACT_BYTES + 1];
+    assert_eq!(
+        envelope(oversized, now + 120)
+            .validate_for_hostname(&hostname(), now, Instant::now())
+            .unwrap_err(),
+        ResolveEnvelopeError::OpaqueGrantTooLarge
+    );
+    assert!(NodeTransportTarget::new("https://127.0.0.1:7301").is_none());
+    assert!(NodeTransportTarget::new("https://node-a.internal:7301/path").is_none());
 }
 
 fn cache_config() -> RouteCacheConfig {
@@ -216,11 +132,38 @@ fn cache_config() -> RouteCacheConfig {
     }
 }
 
+#[test]
+fn cache_constructor_accepts_semaphore_max_and_rejects_max_plus_one() {
+    let resolver: RouteResolver =
+        Arc::new(|_| Box::pin(async { Err(ResolveFailure::Unavailable) }) as ResolveFuture);
+    let mut at_limit = cache_config();
+    at_limit.max_concurrent_resolves = tokio::sync::Semaphore::MAX_PERMITS;
+    let cache = RouteCache::new(at_limit, resolver.clone()).unwrap();
+    assert_eq!(
+        cache.stats().available_resolve_slots,
+        tokio::sync::Semaphore::MAX_PERMITS
+    );
+
+    let mut above_limit = cache_config();
+    above_limit.max_concurrent_resolves = tokio::sync::Semaphore::MAX_PERMITS
+        .checked_add(1)
+        .expect("Tokio semaphore maximum leaves room for the invalid boundary");
+    let error = match RouteCache::new(above_limit, resolver) {
+        Ok(_) => panic!("constructor accepted more than Semaphore::MAX_PERMITS"),
+        Err(error) => error,
+    };
+    assert_eq!(
+        error,
+        RouteCacheError::InvalidConfig(
+            "max_concurrent_resolves exceeds the resolve semaphore capacity"
+        )
+    );
+}
+
 #[tokio::test]
 async fn cancelled_lookup_leader_does_not_cancel_the_singleflight() {
     let now = 1_786_156_800;
-    let key = signing_key();
-    let route = verify_route(&key, &claims(now, 7), now);
+    let route = resolved_route(b"opaque-grant", now);
     let calls = Arc::new(AtomicUsize::new(0));
     let started = Arc::new(Notify::new());
     let release = Arc::new(Notify::new());
@@ -329,10 +272,9 @@ async fn authoritative_negative_is_cached_without_shared_state() {
 }
 
 #[tokio::test]
-async fn resolver_cannot_install_a_verified_route_under_a_different_hostname() {
+async fn resolver_cannot_install_a_resolved_route_under_a_different_hostname() {
     let now = 1_786_156_800;
-    let key = signing_key();
-    let route = verify_route(&key, &claims(now, 7), now);
+    let route = resolved_route(b"opaque-grant", now);
     let resolver: RouteResolver = Arc::new(move |_| {
         let route = route.clone();
         Box::pin(async move { Ok(RouteResolution::Positive(route)) })
@@ -391,8 +333,7 @@ async fn cache_entry_waiter_and_response_limits_apply_before_more_work_is_admitt
     );
 
     let now = 1_786_156_800;
-    let key = signing_key();
-    let route = verify_route(&key, &claims(now, 7), now);
+    let route = resolved_route(b"opaque-grant", now);
     let resolver: RouteResolver = Arc::new(move |_| {
         let route = route.clone();
         Box::pin(async move { Ok(RouteResolution::Positive(route)) })
@@ -460,11 +401,14 @@ async fn resolver_panic_wakes_waiters_and_removes_the_in_flight_entry() {
 }
 
 #[tokio::test]
-async fn refresh_updates_only_later_requests_and_old_rejection_cannot_delete_new_grant() {
+async fn signer_switch_to_node_acked_kid_needs_no_gateway_ring_update() {
     let now = 1_786_156_800;
-    let key = signing_key();
-    let old_route = verify_route(&key, &claims(now, 7), now);
-    let new_route = verify_route(&key, &claims(now, 8), now);
+    // These are exact opaque bytes from authenticated Control responses. The
+    // new signer kid is already ACKed by Node; Gateway has no key-ring update.
+    let old_grant = b"protected-kid-old.payload.signature";
+    let new_grant = b"protected-kid-new.payload.signature";
+    let old_route = resolved_route(old_grant, now);
+    let new_route = resolved_route(new_grant, now);
     let old_digest = old_route.grant_digest();
     let new_digest = new_route.grant_digest();
     let calls = Arc::new(AtomicUsize::new(0));
@@ -480,10 +424,10 @@ async fn refresh_updates_only_later_requests_and_old_rejection_cannot_delete_new
         })
     };
     let cache = RouteCache::new(cache_config(), resolver).unwrap();
-    assert!(matches!(
-        cache.lookup("app.cats.run").await.unwrap(),
-        CacheLookup::Positive(_)
-    ));
+    let CacheLookup::Positive(cached_old) = cache.lookup("app.cats.run").await.unwrap() else {
+        panic!("expected old positive route")
+    };
+    assert_eq!(cached_old.opaque_grant(), old_grant);
 
     let refreshed = cache
         .refresh_for_later(
@@ -499,6 +443,10 @@ async fn refresh_updates_only_later_requests_and_old_rejection_cannot_delete_new
     );
     assert_eq!(refreshed.cache, CacheRefreshStatus::RefreshedPositive);
     assert_eq!(cache.cached_digest("app.cats.run"), Some(new_digest));
+    let CacheLookup::Positive(cached_new) = cache.lookup("app.cats.run").await.unwrap() else {
+        panic!("expected new positive route")
+    };
+    assert_eq!(cached_new.opaque_grant(), new_grant);
     assert_eq!(calls.load(Ordering::SeqCst), 2);
 
     let delayed_old_rejection = cache

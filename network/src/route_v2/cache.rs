@@ -8,12 +8,19 @@ use cats_api::runtime_reconciliation::Hostname;
 use tokio::sync::{watch, Semaphore};
 use tokio::time::Instant;
 
-use super::{GrantDigest, VerifiedRoute};
+use super::{GrantDigest, ResolvedRoute};
 
 const RECORD_OVERHEAD_BYTES: usize = 96;
 
+/// Future returned by the provider-neutral trusted Control resolve port.
 pub type ResolveFuture =
     Pin<Box<dyn Future<Output = Result<RouteResolution, ResolveFailure>> + Send + 'static>>;
+/// Provider-neutral trusted Control resolve port.
+///
+/// A production adapter must machine-authenticate Control, bound the response,
+/// construct [`super::AuthenticatedResolveEnvelope`], and validate it into a
+/// positive [`ResolvedRoute`] before returning from this port. Its HTTP wire is
+/// intentionally not declared here.
 pub type RouteResolver = Arc<dyn Fn(Hostname) -> ResolveFuture + Send + Sync + 'static>;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -77,6 +84,11 @@ impl RouteCacheConfig {
         if self.max_concurrent_resolves == 0 {
             return Err(RouteCacheError::InvalidConfig(
                 "max_concurrent_resolves must be positive",
+            ));
+        }
+        if self.max_concurrent_resolves > Semaphore::MAX_PERMITS {
+            return Err(RouteCacheError::InvalidConfig(
+                "max_concurrent_resolves exceeds the resolve semaphore capacity",
             ));
         }
         if self.resolve_timeout.is_zero()
@@ -158,7 +170,8 @@ pub enum NegativeRoute {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RouteResolution {
-    Positive(VerifiedRoute),
+    /// Authenticated Control metadata plus an opaque, unverified Grant.
+    Positive(ResolvedRoute),
     Negative(NegativeRoute),
 }
 
@@ -170,7 +183,7 @@ pub enum ResolveFailure {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum CacheLookup {
-    Positive(Arc<VerifiedRoute>),
+    Positive(Arc<ResolvedRoute>),
     Negative(NegativeRoute),
 }
 
@@ -229,7 +242,7 @@ struct InFlight {
 
 #[derive(Debug)]
 enum CacheValue {
-    Positive(Arc<VerifiedRoute>),
+    Positive(Arc<ResolvedRoute>),
     Negative {
         reason: NegativeRoute,
         expires_at: Instant,
@@ -518,7 +531,7 @@ impl RouteCache {
         &self,
         state: &mut State,
         hostname: &str,
-        route: VerifiedRoute,
+        route: ResolvedRoute,
         now: Instant,
     ) -> LookupResult {
         if route.hostname().as_str() != hostname || route.expires_at() <= now {

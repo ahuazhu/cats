@@ -1,11 +1,11 @@
-//! Production-side Route Grant v2 primitives.
+//! Production-side opaque Route Grant v2 transport primitives.
 //!
-//! The bounded cache and verification boundary are usable now. The shipped
-//! Gateway remains closed because two wire contracts are still absent from the
-//! frozen specifications: the machine-authenticated Control resolve transport
-//! and the Node's machine-authenticated HTTPS Route Grant v2 admission ingress.
-//! This module deliberately does not infer either contract from the retired V1
-//! paths.
+//! The bounded cache and authenticated-envelope validation boundary are usable
+//! now. Gateway never parses Grant claims or owns a public-key ring; Node is the
+//! sole Grant verifier and final admission authority. The shipped Gateway stays
+//! closed until the machine-authenticated Control resolve wire, Node admission
+//! wire, and public proxy/listener composition are frozen and implemented. This
+//! module deliberately does not infer them from the retired V1 paths.
 
 mod cache;
 mod grant;
@@ -16,10 +16,7 @@ pub use cache::{
     RefreshForLaterOutcome, RefreshableRejection, RequestKind, ResolveFailure, ResolveFuture,
     RouteCache, RouteCacheConfig, RouteCacheError, RouteCacheStats, RouteResolution, RouteResolver,
 };
-pub use grant::{
-    AuthenticatedResolveEnvelope, GrantDigest, RouteGrantKeyRing, RouteGrantKeyRingError,
-    RouteGrantVerificationError, VerifiedRoute,
-};
+pub use grant::{AuthenticatedResolveEnvelope, GrantDigest, ResolveEnvelopeError, ResolvedRoute};
 pub use http_body::{
     read_bounded_response_body, strict_https_client, ResponseBodyBounds, ResponseReadError,
 };
@@ -27,18 +24,22 @@ pub use http_body::{
 /// A missing contract that prevents the public Gateway from opening a socket.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ProductionIngressSeam {
-    ControlMachineResolveTransport,
-    NodeV2HttpsAdmissionIngress,
+    ControlMachineResolveWire,
+    NodeV2HttpsAdmissionWire,
+    PublicProxyListenerComposition,
 }
 
 impl std::fmt::Display for ProductionIngressSeam {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::ControlMachineResolveTransport => {
-                formatter.write_str("Control machine-authenticated v2 resolve transport")
+            Self::ControlMachineResolveWire => {
+                formatter.write_str("Control machine-authenticated v2 resolve wire")
             }
-            Self::NodeV2HttpsAdmissionIngress => {
-                formatter.write_str("Node machine-authenticated v2 HTTPS admission ingress")
+            Self::NodeV2HttpsAdmissionWire => {
+                formatter.write_str("Node machine-authenticated v2 HTTPS admission wire")
+            }
+            Self::PublicProxyListenerComposition => {
+                formatter.write_str("public ingress proxy/listener composition")
             }
         }
     }
@@ -52,8 +53,9 @@ pub struct ProductionIngressBlocker {
 
 impl ProductionIngressBlocker {
     const MISSING: &'static [ProductionIngressSeam] = &[
-        ProductionIngressSeam::ControlMachineResolveTransport,
-        ProductionIngressSeam::NodeV2HttpsAdmissionIngress,
+        ProductionIngressSeam::ControlMachineResolveWire,
+        ProductionIngressSeam::NodeV2HttpsAdmissionWire,
+        ProductionIngressSeam::PublicProxyListenerComposition,
     ];
 
     pub const fn current() -> Self {
@@ -87,17 +89,19 @@ mod tests {
     use super::*;
 
     #[test]
-    fn production_blocker_names_both_unfrozen_transports() {
+    fn production_blocker_names_all_unimplemented_wires_and_composition() {
         let blocker = ProductionIngressBlocker::current();
         assert_eq!(
             blocker.missing(),
             &[
-                ProductionIngressSeam::ControlMachineResolveTransport,
-                ProductionIngressSeam::NodeV2HttpsAdmissionIngress,
+                ProductionIngressSeam::ControlMachineResolveWire,
+                ProductionIngressSeam::NodeV2HttpsAdmissionWire,
+                ProductionIngressSeam::PublicProxyListenerComposition,
             ]
         );
-        let message = blocker.to_string();
-        assert!(message.contains("Control machine-authenticated v2 resolve transport"));
-        assert!(message.contains("Node machine-authenticated v2 HTTPS admission ingress"));
+        assert_eq!(
+            blocker.to_string(),
+            "missing Control machine-authenticated v2 resolve wire and Node machine-authenticated v2 HTTPS admission wire and public ingress proxy/listener composition"
+        );
     }
 }

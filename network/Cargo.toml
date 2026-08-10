@@ -39,8 +39,5 @@ tokio-tungstenite = { workspace = true, optional = true }
 base64 = { workspace = true, optional = true }
 sha2 = { workspace = true }
 
-[dev-dependencies]
-ring = { workspace = true }
-
 [lints]
 workspace = true
