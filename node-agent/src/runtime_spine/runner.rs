@@ -1098,28 +1098,30 @@ impl EffectLane {
             state: Arc::clone(&self.state),
             armed: true,
         };
-        let timed =
-            tokio::time::timeout_at(tokio::time::Instant::from_std(deadline), received).await;
-        match timed {
-            Ok(Ok(result)) => {
+        match receive_effect_result_until(received, deadline).await {
+            EffectReceive::Delivered(result) => {
                 guard.disarm();
-                if Instant::now() >= deadline {
-                    Ok(EffectWait::DeadlineExceeded)
-                } else {
-                    Ok(EffectWait::Finished(result))
-                }
+                // A completed typed outcome is the authoritative phase
+                // boundary even when it became ready together with the outer
+                // deadline. Discarding it could replay a physical step from
+                // the old full-inventory admission.
+                Ok(EffectWait::Finished(result))
             }
-            Ok(Err(_)) => {
+            EffectReceive::Closed => {
                 guard.poison();
                 Err(RuntimeSpineRunError::WorkerStopped(
                     "Desired effect".to_owned(),
                 ))
             }
-            Err(_) => {
+            EffectReceive::DeadlineExceeded => {
                 guard.poison();
                 Ok(EffectWait::DeadlineExceeded)
             }
         }
+    }
+
+    fn is_poisoned(&self) -> bool {
+        self.state.poisoned.load(Ordering::Acquire)
     }
 
     fn cancel_and_poison(&self) {
@@ -1154,6 +1156,38 @@ fn active_effect(
 enum EffectWait {
     Finished(anyhow::Result<RuntimeDesiredEffectOutcome>),
     DeadlineExceeded,
+}
+
+enum EffectReceive {
+    Delivered(anyhow::Result<RuntimeDesiredEffectOutcome>),
+    Closed,
+    DeadlineExceeded,
+}
+
+/// Resolve the effect result/deadline race with the typed result as the
+/// explicit winner when both are ready. The final `try_recv` closes the small
+/// scheduler window between the deadline branch becoming ready and it being
+/// selected; a result not yet delivered at that point remains unknown.
+async fn receive_effect_result_until(
+    mut received: tokio::sync::oneshot::Receiver<anyhow::Result<RuntimeDesiredEffectOutcome>>,
+    deadline: Instant,
+) -> EffectReceive {
+    let timer = tokio::time::sleep_until(tokio::time::Instant::from_std(deadline));
+    tokio::pin!(timer);
+    tokio::select! {
+        biased;
+        result = &mut received => match result {
+            Ok(result) => EffectReceive::Delivered(result),
+            Err(_) => EffectReceive::Closed,
+        },
+        () = &mut timer => match received.try_recv() {
+            Ok(result) => EffectReceive::Delivered(result),
+            Err(tokio::sync::oneshot::error::TryRecvError::Closed) => EffectReceive::Closed,
+            Err(tokio::sync::oneshot::error::TryRecvError::Empty) => {
+                EffectReceive::DeadlineExceeded
+            }
+        },
+    }
 }
 
 struct ActiveEffectGuard {
@@ -1333,6 +1367,17 @@ impl RuntimeSpineRunner {
         &mut self,
         deadlines: RuntimeSpineRunDeadlines,
     ) -> Result<RuntimeSpineRunStep, RuntimeSpineRunError> {
+        // A timed-out blocking effect may still be returning from its provider
+        // call. Do not start a fresh scan beside that unknown physical phase;
+        // shutdown joins it before a successor runner establishes new
+        // full-inventory admission.
+        if self
+            .effect_lane
+            .as_ref()
+            .is_some_and(EffectLane::is_poisoned)
+        {
+            return Err(RuntimeSpineRunError::EffectLanePoisoned);
+        }
         if !self.pending_effects.is_empty() {
             return self.run_next_effect(deadlines.effect_step).await;
         }
@@ -1447,7 +1492,7 @@ impl RuntimeSpineRunner {
             .cloned()
             .ok_or_else(|| RuntimeSpineRunError::WorkerStopped("Desired effect".to_owned()))?;
         let cat_id = desired.cat_id.clone();
-        match self
+        let wait = match self
             .effect_lane()?
             .apply(
                 self.state_directory.clone(),
@@ -1455,8 +1500,17 @@ impl RuntimeSpineRunner {
                 self.effect_admission.clone(),
                 deadline,
             )
-            .await?
+            .await
         {
+            Ok(wait) => wait,
+            Err(error) => {
+                // A closed or poisoned worker cannot prove whether the queued
+                // effect linearized. Never preserve the old admission batch.
+                self.clear_effect_batch();
+                return Err(error);
+            }
+        };
+        match wait {
             EffectWait::Finished(Ok(RuntimeDesiredEffectOutcome::Applied)) => {
                 self.pending_effects.pop_front();
                 if self.pending_effects.is_empty() {
@@ -1474,10 +1528,13 @@ impl RuntimeSpineRunner {
                 Ok(RuntimeSpineRunStep::EffectRefreshInventory { cat_id })
             }
             EffectWait::Finished(Ok(RuntimeDesiredEffectOutcome::ReplanDesired)) => {
+                // Clear the in-memory admission before the fallible durable
+                // invalidation. If persistence itself fails, the runner stops
+                // without making the old batch runnable again.
+                self.clear_effect_batch();
                 self.journal_lane()?
                     .invalidate_desired_after_effect_replan()
                     .await?;
-                self.clear_effect_batch();
                 Ok(RuntimeSpineRunStep::EffectReplanDesired { cat_id })
             }
             EffectWait::Finished(Ok(RuntimeDesiredEffectOutcome::IdentityRepairRequired)) => {
@@ -1493,9 +1550,19 @@ impl RuntimeSpineRunner {
                 Ok(RuntimeSpineRunStep::EffectStopped { cat_id, reason })
             }
             EffectWait::Finished(Err(error)) => {
+                // `anyhow::Error` carries no proof that the effect remained
+                // pre-linearization. Conservatively discard the entire old
+                // admission batch; the durable Desired journal now leads the
+                // next iteration through a fresh physical scan.
+                self.clear_effect_batch();
                 Ok(RuntimeSpineRunStep::EffectUnavailable { cat_id, error })
             }
             EffectWait::DeadlineExceeded => {
+                // The worker is cancelled and poisoned because its phase is
+                // unknown. Never replay this Cat or another Cat from the old
+                // accepted inventory. Shutdown/restart joins the late worker;
+                // the successor can establish a new full-scan admission.
+                self.clear_effect_batch();
                 Ok(RuntimeSpineRunStep::EffectDeadlineExceeded { cat_id })
             }
         }
@@ -1897,6 +1964,15 @@ mod tests {
         calls: AtomicUsize,
     }
 
+    struct FailingEffect {
+        calls: AtomicUsize,
+    }
+
+    struct NonCooperativeEffect {
+        calls: AtomicUsize,
+        delay: Duration,
+    }
+
     struct NeverLaunch {
         calls: AtomicUsize,
     }
@@ -1964,6 +2040,32 @@ mod tests {
             context.check_active()?;
             self.calls.fetch_add(1, Ordering::SeqCst);
             Ok(self.outcome.clone())
+        }
+    }
+
+    impl RuntimeDesiredEffect for FailingEffect {
+        fn apply(
+            &self,
+            context: RuntimeDesiredEffectContext,
+            _desired: &DesiredRuntimeSpec,
+        ) -> anyhow::Result<RuntimeDesiredEffectOutcome> {
+            context.check_active()?;
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            anyhow::bail!("effect outcome became unknown after its durable step")
+        }
+    }
+
+    impl RuntimeDesiredEffect for NonCooperativeEffect {
+        fn apply(
+            &self,
+            _context: RuntimeDesiredEffectContext,
+            _desired: &DesiredRuntimeSpec,
+        ) -> anyhow::Result<RuntimeDesiredEffectOutcome> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            // Models a provider call that cannot observe cancellation until it
+            // returns. The runner must not scan beside this late phase.
+            std::thread::sleep(self.delay);
+            Ok(RuntimeDesiredEffectOutcome::RefreshInventory)
         }
     }
 
@@ -2256,6 +2358,18 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn delivered_typed_effect_result_wins_an_already_ready_deadline() {
+        let (send, receive) = tokio::sync::oneshot::channel();
+        send.send(Ok(RuntimeDesiredEffectOutcome::RefreshInventory))
+            .unwrap();
+
+        assert!(matches!(
+            receive_effect_result_until(receive, Instant::now()).await,
+            EffectReceive::Delivered(Ok(RuntimeDesiredEffectOutcome::RefreshInventory))
+        ));
+    }
+
+    #[tokio::test]
     async fn pending_effect_uses_only_its_precomputed_absolute_deadline() {
         let root = tempfile::tempdir().unwrap();
         let state = StateDirectory::unanchored(root.path().to_path_buf());
@@ -2299,7 +2413,126 @@ mod tests {
             RuntimeSpineRunStep::EffectDeadlineExceeded { .. }
         ));
         assert_eq!(effect.calls.load(Ordering::SeqCst), 1);
+        assert!(runner.pending_effects.is_empty());
 
+        runner.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn unknown_effect_error_discards_old_admission_and_returns_to_full_scan() {
+        let root = tempfile::tempdir().unwrap();
+        let state = StateDirectory::unanchored(root.path().to_path_buf());
+        let registered = decode_agent_session(SESSION).unwrap();
+        let desired = prepare_unconsumed_effect_desired(&state, &registered);
+        let effect = Arc::new(FailingEffect {
+            calls: AtomicUsize::new(0),
+        });
+        let mut runner = RuntimeSpineRunner::new_with_desired_effects(
+            state.clone(),
+            registered.clone(),
+            RuntimeSpineHttpClient::for_loopback_test("http://127.0.0.1:1/", signer()).unwrap(),
+            Arc::new(EmptyScanner {
+                calls: AtomicUsize::new(0),
+            }),
+            effect.clone(),
+        )
+        .unwrap();
+        runner.pending_effects.push_back(desired.clone());
+        runner.effect_admission_open = true;
+
+        assert!(matches!(
+            runner
+                .run_once_until(Instant::now() + Duration::from_secs(5))
+                .await
+                .unwrap(),
+            RuntimeSpineRunStep::EffectUnavailable { .. }
+        ));
+        assert!(runner.pending_effects.is_empty());
+        assert!(runner.effect_admission.is_none());
+        assert!(!runner.effect_admission_open);
+        assert_eq!(effect.calls.load(Ordering::SeqCst), 1);
+        runner.shutdown().await.unwrap();
+
+        let mut recovered = RuntimeSpineJournal::open_for_test(&state, registered).unwrap();
+        let RuntimeSpineDesiredWork::Scan(snapshot) = recovered.desired_work().unwrap() else {
+            panic!("an unknown effect outcome must require a fresh full inventory")
+        };
+        assert_eq!(snapshot.desired_specs, vec![desired]);
+    }
+
+    #[tokio::test]
+    async fn timed_out_noncooperative_effect_blocks_a_successor_scan_until_shutdown() {
+        let root = tempfile::tempdir().unwrap();
+        let scanner = Arc::new(EmptyScanner {
+            calls: AtomicUsize::new(0),
+        });
+        let effect = Arc::new(NonCooperativeEffect {
+            calls: AtomicUsize::new(0),
+            delay: Duration::from_millis(100),
+        });
+        let mut runner = RuntimeSpineRunner::new_with_desired_effects(
+            StateDirectory::unanchored(root.path().to_path_buf()),
+            decode_agent_session(SESSION).unwrap(),
+            RuntimeSpineHttpClient::for_loopback_test("http://127.0.0.1:1/", signer()).unwrap(),
+            scanner.clone(),
+            effect.clone(),
+        )
+        .unwrap();
+        runner.pending_effects.push_back(desired_with_network());
+
+        assert!(matches!(
+            runner
+                .run_once_until(Instant::now() + Duration::from_millis(20))
+                .await
+                .unwrap(),
+            RuntimeSpineRunStep::EffectDeadlineExceeded { .. }
+        ));
+        assert!(runner.pending_effects.is_empty());
+        assert_eq!(effect.calls.load(Ordering::SeqCst), 1);
+
+        assert!(matches!(
+            runner
+                .run_once_until(Instant::now() + Duration::from_secs(1))
+                .await,
+            Err(RuntimeSpineRunError::EffectLanePoisoned)
+        ));
+        assert_eq!(scanner.calls.load(Ordering::SeqCst), 0);
+
+        tokio::time::timeout(Duration::from_secs(1), runner.shutdown())
+            .await
+            .expect("shutdown must join the late effect")
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn only_explicit_retry_exact_retains_the_same_effect_unit() {
+        let root = tempfile::tempdir().unwrap();
+        let desired = desired_with_network();
+        let effect = Arc::new(DecisionEffect {
+            outcome: RuntimeDesiredEffectOutcome::RetryExact,
+            calls: AtomicUsize::new(0),
+        });
+        let mut runner = RuntimeSpineRunner::new_with_desired_effects(
+            StateDirectory::unanchored(root.path().to_path_buf()),
+            decode_agent_session(SESSION).unwrap(),
+            RuntimeSpineHttpClient::for_loopback_test("http://127.0.0.1:1/", signer()).unwrap(),
+            Arc::new(EmptyScanner {
+                calls: AtomicUsize::new(0),
+            }),
+            effect.clone(),
+        )
+        .unwrap();
+        runner.pending_effects.push_back(desired.clone());
+
+        assert!(matches!(
+            runner
+                .run_once_until(Instant::now() + Duration::from_secs(5))
+                .await
+                .unwrap(),
+            RuntimeSpineRunStep::EffectRetryExact { .. }
+        ));
+        assert_eq!(runner.pending_effects.front(), Some(&desired));
+        assert_eq!(effect.calls.load(Ordering::SeqCst), 1);
         runner.shutdown().await.unwrap();
     }
 
@@ -2626,8 +2859,9 @@ mod tests {
                 .run_once_until(Instant::now() + Duration::from_secs(2))
                 .await
                 .unwrap(),
-            RuntimeSpineRunStep::EffectDeadlineExceeded { .. }
+            RuntimeSpineRunStep::EffectUnavailable { .. }
         ));
+        assert!(runner.pending_effects.is_empty());
         assert!(
             pid_file.exists(),
             "fake ip never entered its hanging command"
