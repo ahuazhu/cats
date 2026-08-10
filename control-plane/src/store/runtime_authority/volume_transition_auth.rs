@@ -24,7 +24,7 @@ use cats_storage::authority::{
     consume_disposable_root_delete, consume_takeover, normal_acquire, release,
     replay_consumed_takeover, AuthorityError, AuthorizationRecord, AuthorizationState,
     HostFenceEvent, LastVolumeTransition, NormalAcquireRequest, ReleaseRequest, TakeoverResult,
-    VolumeAuthorization, VolumeRecord,
+    VolumeAuthorization, VolumeOwnerBinding, VolumeRecord,
 };
 use postgres::Transaction;
 
@@ -35,9 +35,9 @@ use super::product_rows::{
 };
 use super::rows::{
     database_now, load_authorization_for_update, load_event_for_update,
-    load_takeover_authorization_for_intent_update, load_volume_for_update,
+    load_stored_volume_for_update, load_takeover_authorization_for_intent_update,
     runtime_authorization_route_for_context, takeover_authorization_is_owned_by_other_node,
-    takeover_authorization_route_for_intent, update_authorization, update_volume,
+    takeover_authorization_route_for_intent, update_authorization, update_volume_owner,
     volume_has_disposable_root_authorization_for_delete,
 };
 use super::runtime_spine::{
@@ -122,6 +122,7 @@ struct LockedTakeoverMutation<'transaction, 'connection> {
     event: HostFenceEvent,
     authorization: AuthorizationRecord,
     volume: VolumeRecord,
+    owner_binding: VolumeOwnerBinding,
 }
 
 struct AuthenticatedNodeTransaction {
@@ -479,8 +480,9 @@ fn execute_normal_acquire(
         lease_duration_ms: *lease_duration_ms,
     };
 
-    let volume = load_volume_for_update(context.transaction, volume_id)?
+    let stored_volume = load_stored_volume_for_update(context.transaction, volume_id)?
         .ok_or(AuthorityError::BackendUnknown)?;
+    let volume = stored_volume.record;
     let (disk, locked_desired) = lock_product_context(
         context.transaction,
         &context.desired,
@@ -505,7 +507,19 @@ fn execute_normal_acquire(
         Err(error) => return volume_authority_error(volume_id, error),
     };
     if updated != volume {
-        update_volume(context.transaction, &updated)?;
+        let owner_binding = VolumeOwnerBinding {
+            volume_id: updated.volume_id.clone(),
+            owner_node_id: context.node_id.clone(),
+            attachment_id: result.attachment_id.clone(),
+            attachment_epoch: result.resulting_epoch,
+        };
+        update_volume_owner(context.transaction, &updated, Some(&owner_binding))?;
+    } else if stored_volume
+        .owner_binding
+        .as_ref()
+        .is_none_or(|binding| binding.owner_node_id != context.node_id)
+    {
+        return Err(AuthorityError::BackendUnknown.into());
     }
     Ok(VolumeTransitionStoreOutcome::Accepted(
         RuntimeVolumeTransitionOutcome::LeaseGranted {
@@ -575,8 +589,20 @@ fn execute_takeover(
     {
         return Err(AuthorityError::BackendUnknown.into());
     }
-    let volume = load_volume_for_update(context.transaction, &intent.volume_id)?
+    let stored_volume = load_stored_volume_for_update(context.transaction, &intent.volume_id)?
         .ok_or(AuthorityError::BackendUnknown)?;
+    let volume = stored_volume.record;
+    let owner_binding = stored_volume
+        .owner_binding
+        .ok_or(AuthorityError::BackendUnknown)?;
+    if matches!(authorization.state, AuthorizationState::Unconsumed)
+        && owner_binding.owner_node_id != event.node_id
+    {
+        return Ok(authorization_rejected(
+            authorization_id.clone(),
+            RuntimeVolumeAuthorizationRejection::InvalidAuthorization,
+        ));
+    }
     let (disk, locked_desired) =
         lock_product_context(context.transaction, &context.desired, &intent, false)?;
     let Some(locked_intent) = takeover_intent(&locked_desired, authorization_id)?.cloned() else {
@@ -588,7 +614,12 @@ fn execute_takeover(
         return Err(AuthorityError::BackendUnknown.into());
     }
     let result = match replay_consumed_takeover(&authorization, authorization_id) {
-        Ok(Some(result)) => result,
+        Ok(Some(result)) => {
+            if owner_binding.owner_node_id != context.node_id {
+                return Err(AuthorityError::BackendUnknown.into());
+            }
+            result
+        }
         Ok(None) => {
             let (updated_volume, updated_authorization, result) = match consume_takeover(
                 &volume,
@@ -600,7 +631,13 @@ fn execute_takeover(
                 Ok(value) => value,
                 Err(error) => return takeover_authority_error(authorization_id, error),
             };
-            update_volume(context.transaction, &updated_volume)?;
+            let owner_binding = VolumeOwnerBinding {
+                volume_id: updated_volume.volume_id.clone(),
+                owner_node_id: context.node_id.clone(),
+                attachment_id: result.attachment_id.clone(),
+                attachment_epoch: result.resulting_epoch,
+            };
+            update_volume_owner(context.transaction, &updated_volume, Some(&owner_binding))?;
             update_authorization(context.transaction, &authorization, &updated_authorization)?;
             result
         }
@@ -648,8 +685,9 @@ fn execute_release(
         attachment_id: attachment_id.clone(),
         expected_epoch: *attachment_epoch,
     };
-    let volume = load_volume_for_update(context.transaction, volume_id)?
+    let stored_volume = load_stored_volume_for_update(context.transaction, volume_id)?
         .ok_or(AuthorityError::BackendUnknown)?;
+    let volume = stored_volume.record;
     let (disk, locked_desired) = lock_product_context(
         context.transaction,
         &context.desired,
@@ -688,7 +726,14 @@ fn execute_release(
         Err(error) => return volume_authority_error(volume_id, error),
     };
     if updated != volume {
-        update_volume(context.transaction, &updated)?;
+        if stored_volume
+            .owner_binding
+            .as_ref()
+            .is_none_or(|binding| binding.owner_node_id != context.node_id)
+        {
+            return Err(AuthorityError::BackendUnknown.into());
+        }
+        update_volume_owner(context.transaction, &updated, None)?;
     }
     Ok(VolumeTransitionStoreOutcome::Accepted(
         RuntimeVolumeTransitionOutcome::Released { release: result },
@@ -755,8 +800,29 @@ fn execute_disposable_delete(
     {
         return Err(AuthorityError::BackendUnknown.into());
     }
-    let volume = load_volume_for_update(context.transaction, &intent.volume_id)?
+    let stored_volume = load_stored_volume_for_update(context.transaction, &intent.volume_id)?
         .ok_or(AuthorityError::BackendUnknown)?;
+    let volume = stored_volume.record;
+    let expected_owner_node_id = match &payload.isolation_basis {
+        cats_storage::authority::DisposableDeleteIsolationBasis::HostFenceEvent { .. } => event
+            .as_ref()
+            .map(|event| &event.node_id)
+            .ok_or(AuthorityError::BackendUnknown)?,
+        cats_storage::authority::DisposableDeleteIsolationBasis::RuntimeStopped {
+            node_id, ..
+        } => node_id,
+    };
+    match (&authorization.state, stored_volume.owner_binding.as_ref()) {
+        (AuthorizationState::Unconsumed, Some(binding))
+            if binding.owner_node_id == *expected_owner_node_id => {}
+        (AuthorizationState::Consumed(_), None) => {}
+        _ => {
+            return Ok(authorization_rejected(
+                authorization_id.clone(),
+                RuntimeVolumeAuthorizationRejection::InvalidAuthorization,
+            ));
+        }
+    }
     let (mut disk, locked_desired) =
         lock_product_context(context.transaction, &context.desired, &intent, true)?;
     let Some(locked_intent) = unique_intent(&locked_desired, |candidate| candidate == &intent)?
@@ -811,7 +877,7 @@ fn execute_disposable_delete(
     match (&authorization.state, &disk.admin_state) {
         (AuthorizationState::Unconsumed, DiskAdminState::Active) => {
             disk.admin_state = expected_disk_state;
-            update_volume(context.transaction, &updated_volume)?;
+            update_volume_owner(context.transaction, &updated_volume, None)?;
             update_authorization(context.transaction, &authorization, &updated_authorization)?;
             update_disk(context.transaction, &disk)?;
         }
@@ -1562,8 +1628,20 @@ fn lock_takeover_mutation_context<'transaction, 'connection>(
         return Err(AuthorityError::BackendUnknown.into());
     }
 
-    let volume = load_volume_for_update(transaction, &intent.volume_id)?
+    let stored_volume = load_stored_volume_for_update(transaction, &intent.volume_id)?
         .ok_or(AuthorityError::BackendUnknown)?;
+    let volume = stored_volume.record;
+    let owner_binding = stored_volume
+        .owner_binding
+        .ok_or(AuthorityError::BackendUnknown)?;
+    if matches!(authorization.state, AuthorizationState::Unconsumed)
+        && owner_binding.owner_node_id != event.node_id
+    {
+        return Ok(authorization_rejected(
+            request.authorization_id.clone(),
+            RuntimeVolumeAuthorizationRejection::InvalidAuthorization,
+        ));
+    }
     let disk = load_disk_by_id_for_update(transaction, &intent.disk_id)?;
     let locked_desired = load_desired_for_update(transaction, &request.cat_id)?;
     let (Some(disk), Some(locked_desired)) = (disk, locked_desired) else {
@@ -1587,6 +1665,7 @@ fn lock_takeover_mutation_context<'transaction, 'connection>(
             event,
             authorization,
             volume,
+            owner_binding,
         },
     ))
 }
@@ -1601,18 +1680,37 @@ fn consume_locked_takeover(
         event,
         authorization,
         volume,
+        owner_binding,
     } = locked;
     match replay_consumed_takeover(&authorization, authorization_id) {
-        Ok(Some(result)) => return Ok(VolumeTransitionStoreOutcome::Accepted(result)),
+        Ok(Some(result)) => {
+            let VolumeAuthorization::Takeover(payload) = &authorization.authorization else {
+                return Err(AuthorityError::BackendUnknown.into());
+            };
+            if owner_binding.owner_node_id != payload.authorized_node_id {
+                return Err(AuthorityError::BackendUnknown.into());
+            }
+            return Ok(VolumeTransitionStoreOutcome::Accepted(result));
+        }
         Ok(None) => {}
         Err(error) => return takeover_authority_error(authorization_id, error),
     }
+    let VolumeAuthorization::Takeover(payload) = &authorization.authorization else {
+        return Err(AuthorityError::BackendUnknown.into());
+    };
+    let owner_node_id = payload.authorized_node_id.clone();
     let (updated_volume, updated_authorization, result) =
         match consume_takeover(&volume, &event, &authorization, authorization_id, db_now) {
             Ok(result) => result,
             Err(error) => return takeover_authority_error(authorization_id, error),
         };
-    update_volume(transaction, &updated_volume)?;
+    let owner_binding = VolumeOwnerBinding {
+        volume_id: updated_volume.volume_id.clone(),
+        owner_node_id,
+        attachment_id: result.attachment_id.clone(),
+        attachment_epoch: result.resulting_epoch,
+    };
+    update_volume_owner(transaction, &updated_volume, Some(&owner_binding))?;
     update_authorization(transaction, &authorization, &updated_authorization)?;
     Ok(VolumeTransitionStoreOutcome::Accepted(result))
 }

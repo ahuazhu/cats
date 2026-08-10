@@ -410,7 +410,7 @@ identity、完整acquire origin、attachment/epoch、disposition和generation都
 保留数据路径精确`R == L == volume_release.generation`。对Root disposable `R == L` normal分支，current
 Desired必须是同delete ID的Deleted revision；取得Volume锁后fresh检查该delete lineage不存在任何已经派生的
 disposable authorization。该检查对projection scope与canonical JSON scope双向选取候选、完整decode并交叉
-验证。schema v10要求projection arm使用partial ordered B-tree
+验证。schema v11要求projection arm使用partial ordered B-tree
 `(volume_id, desired_revision, placement_epoch, authorization_id COLLATE "C") WHERE kind='disposable_root_delete'`，
 canonical arm使用`jsonb_path_ops` GIN表达式索引；两臂各自`LIMIT 2`后按authorization ID去重，再读取至多两条
 完整row。健康row同时命中两臂仍只算一个候选，不能用外层`LIMIT`掩盖任一臂的历史全表扫描。

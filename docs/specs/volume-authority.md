@@ -121,6 +121,13 @@ VolumeRecord {
   last_transition: LastVolumeTransition | null
 }
 
+VolumeOwnerBinding {
+  volume_id: Id,
+  owner_node_id: Id,
+  attachment_id: Id,
+  attachment_epoch: FenceEpoch
+}
+
 VolumeAdminState =
   { kind: "active" }
 | { kind: "deleting", delete_id: Id }
@@ -285,6 +292,21 @@ DeleteCompletionReceipt =
     completed_at: UnixMillis
   }
 ```
+
+`VolumeOwnerBinding`是与`VolumeRecord`同表、同事务提交的Runtime inventory内部authority，不扩展
+blockd可见的`VolumeRecord` wire。Active + Owned时它必须且只能存在，并逐字段等于
+`VolumeRecord(volume_id, lease_owner, lease_epoch)`；Unowned或Deleting时必须为null。normal acquire和
+takeover在owner/epoch线性化点同时写入当前Node；release和两种begin-delete同时清除。takeover首次消费还要求
+旧binding的Node等于已锁HostFenceEvent的Node，host-fence disposable consume同理；runtime-stopped release/
+delete要求当前authenticated Node。binding/projection/Volume任一漂移都按stored corruption fail closed。
+
+schema v11提供两个partial ordered B-tree：projection arm
+`(owner_node_id, volume_id COLLATE "C") WHERE owner_node_id IS NOT NULL`与canonical arm
+`((owner_binding->>'owner_node_id'), volume_id COLLATE "C") WHERE owner_binding IS NOT NULL`。Runtime
+inventory在一个read-only Repeatable Read事务中以两臂各自bounded查询并严格解码，最多返回`65536`
+条；第`65537`条、双向漂移、重复或backend不确定都拒绝，不能截断成complete。这个provider-neutral
+enumeration port只供signed Runtime scanner；blockd的`VolumeDataAuthority`仍只能读取自己的exact grant，
+不得枚举Node或fleet ownership。
 
 `RemoteHead`只有两种合法形态：`generation == 0`当且仅当`root_hash`和`root_object_id`都为`null`；
 `generation > 0`当且仅当两者都非`null`。Root hash、object ID和generation始终作为一个不可拆分tuple
@@ -1165,7 +1187,7 @@ release取得Volume锁后必须fresh读取同一delete ID/revision的authorizati
 current Deleted。release先commit时derive随后看到Unowned并整笔回滚；derive先commit时release看到auth并
 零副作用拒绝。这个fresh probe必须以projection current scope **或** canonical authorization中的同一
 volume/delete/revision/placement scope选出至多两个候选，再完整closed decode并交叉验证projection；任一方向
-drift都属于corruption，而旧lineage不进入候选。schema v10必须在启动时精确校验两个独立index：canonical
+drift都属于corruption，而旧lineage不进入候选。schema v11必须在启动时精确校验两个独立index：canonical
 arm由`GIN ((record->'authorization') jsonb_path_ops)`承载，projection arm由partial ordered B-tree
 `(volume_id, desired_revision, placement_epoch, authorization_id COLLATE "C") WHERE kind='disposable_root_delete'`
 承载。两臂各自至多取两个ID、`UNION`去重后才读取完整row；同一健康row命中两臂不能误报重复，外层

@@ -7,13 +7,14 @@
 use std::sync::{mpsc, Arc};
 
 use cats_storage::authority::{
-    compare_and_swap_head, project_volume_record, renew_lease, AuthorityError, Epoch, FenceEpoch,
-    Generation, Id, RenewLeaseRequest, RenewLeaseResult, Revision, UnixMillis, VolumeDataAuthority,
-    VolumeHeadCasRequest, VolumeHeadCasResult, VolumeRecord, VolumeRecordProjection,
-    AUTHORITY_RELEASE_SCHEMA_VERSION,
+    compare_and_swap_head, project_volume_record, renew_lease, validate_volume_owner_binding,
+    AuthorityError, Epoch, FenceEpoch, Generation, Id, NodeOwnedVolume, NodeOwnedVolumeSnapshot,
+    RenewLeaseRequest, RenewLeaseResult, Revision, RuntimeVolumeInventoryAuthority, UnixMillis,
+    VolumeDataAuthority, VolumeHeadCasRequest, VolumeHeadCasResult, VolumeOwnerBinding,
+    VolumeRecord, VolumeRecordProjection, AUTHORITY_RELEASE_SCHEMA_VERSION, MAX_NODE_OWNED_VOLUMES,
 };
 use cats_storage::{AdapterConfig, AdapterError, MetaError};
-use postgres::{Client, Row, Transaction};
+use postgres::{Client, IsolationLevel, Row, Transaction};
 
 use super::{
     dispatch_on, dsn_source, session_setup, spawn_worker, DsnSource, Job, SchemaAccess,
@@ -25,7 +26,8 @@ const VOLUME_COLUMNS: &str = "
     admin_state, delete_id, head_generation, head_root_hash,
     head_root_object_id, lease_owner, lease_epoch, lease_expires_at,
     last_transition_kind, last_transition_id, transition_desired_revision,
-    transition_placement_epoch, transition_lease_duration_ms";
+    transition_placement_epoch, transition_lease_duration_ms,
+    owner_binding::text AS owner_binding_json, owner_node_id";
 
 const DB_NOW_MS: &str = "floor(extract(epoch FROM clock_timestamp()) * 1000)::bigint";
 
@@ -80,6 +82,23 @@ impl PostgresVolumeDataAuthority {
         let dsn = dsn_source(config)?;
         Self::connect_from_with_session_setup(&dsn, config.optional("ca-file"), session_setup)
             .map(|store| Arc::new(store) as Arc<dyn VolumeDataAuthority>)
+            .map_err(|error| AdapterError::Open {
+                adapter: ADAPTER_NAME,
+                message: error.to_string(),
+            })
+    }
+
+    pub fn open_runtime_inventory(
+        config: &AdapterConfig,
+    ) -> std::result::Result<Arc<dyn RuntimeVolumeInventoryAuthority>, AdapterError> {
+        config.ensure_only(
+            ADAPTER_NAME,
+            &["url-env", "url-file", "ca-file", "session-setup"],
+        )?;
+        let session_setup = session_setup(config)?;
+        let dsn = dsn_source(config)?;
+        Self::connect_from_with_session_setup(&dsn, config.optional("ca-file"), session_setup)
+            .map(|store| Arc::new(store) as Arc<dyn RuntimeVolumeInventoryAuthority>)
             .map_err(|error| AdapterError::Open {
                 adapter: ADAPTER_NAME,
                 message: error.to_string(),
@@ -163,6 +182,16 @@ impl VolumeDataAuthority for PostgresVolumeDataAuthority {
     }
 }
 
+impl RuntimeVolumeInventoryAuthority for PostgresVolumeDataAuthority {
+    fn load_node_owned_volumes(
+        &self,
+        node_id: &Id,
+    ) -> Result<NodeOwnedVolumeSnapshot, AuthorityError> {
+        let node_id = node_id.clone();
+        self.dispatch(move |client| load_node_owned_volumes(client, &node_id))
+    }
+}
+
 pub(super) fn verify_schema(client: &mut Client) -> cats_storage::metadata::Result<()> {
     let stamp = client
         .query_opt(
@@ -190,11 +219,67 @@ pub(super) fn verify_schema(client: &mut Client) -> cats_storage::metadata::Resu
         )));
     }
     let sql = format!("SELECT {VOLUME_COLUMNS} FROM volume_records WHERE FALSE");
-    client.query(&sql, &[]).map(|_| ()).map_err(|error| {
+    client.query(&sql, &[]).map_err(|error| {
         MetaError::Backend(format!(
             "target volume authority schema is unavailable or incompatible: {error}"
         ))
-    })
+    })?;
+    for (index, first_key, expression_key, predicate) in [
+        (
+            "volume_records_owner_node",
+            "owner_node_id",
+            false,
+            "(owner_node_id IS NOT NULL)",
+        ),
+        (
+            "volume_records_owner_binding_node",
+            "((owner_binding ->> 'owner_node_id'::text))",
+            true,
+            "(owner_binding IS NOT NULL)",
+        ),
+    ] {
+        let present: bool = client
+            .query_one(
+                "SELECT EXISTS (
+                    SELECT 1
+                      FROM pg_index i
+                      JOIN pg_class source ON source.oid=i.indrelid
+                      JOIN pg_namespace source_namespace
+                        ON source_namespace.oid=source.relnamespace
+                      JOIN pg_class index_relation
+                        ON index_relation.oid=i.indexrelid
+                      JOIN pg_am access_method
+                        ON access_method.oid=index_relation.relam
+                     WHERE source_namespace.nspname=current_schema()
+                       AND source.relname='volume_records'
+                       AND index_relation.relname=$1
+                       AND NOT i.indisunique AND i.indisvalid AND i.indisready
+                       AND i.indnkeyatts=2 AND i.indnatts=2
+                       AND i.indoption::TEXT='0 0'
+                       AND access_method.amname='btree'
+                       AND (($3 AND i.indexprs IS NOT NULL)
+                            OR (NOT $3 AND i.indexprs IS NULL))
+                       AND i.indpred IS NOT NULL
+                       AND pg_get_indexdef(i.indexrelid, 1, FALSE)=$2
+                       AND pg_get_indexdef(i.indexrelid, 2, FALSE)='volume_id'
+                       AND i.indcollation[1]='pg_catalog.\"C\"'::regcollation
+                       AND pg_get_expr(i.indpred, i.indrelid)=$4
+                 )",
+                &[&index, &first_key, &expression_key, &predicate],
+            )
+            .map_err(|error| {
+                MetaError::Backend(format!(
+                    "target volume authority owner index is unavailable: {error}"
+                ))
+            })?
+            .get(0);
+        if !present {
+            return Err(MetaError::Backend(format!(
+                "target volume authority owner index {index} is missing or incompatible"
+            )));
+        }
+    }
+    Ok(())
 }
 
 fn load_volume(client: &mut Client, volume_id: &Id) -> Result<VolumeRecord, AuthorityError> {
@@ -218,6 +303,72 @@ fn load_volume_for_update(
         .map(|row| decode_volume(&row))
         .transpose()?
         .ok_or(AuthorityError::NotFound)
+}
+
+fn load_node_owned_volumes(
+    client: &mut Client,
+    node_id: &Id,
+) -> Result<NodeOwnedVolumeSnapshot, AuthorityError> {
+    let mut transaction = client
+        .build_transaction()
+        .isolation_level(IsolationLevel::RepeatableRead)
+        .read_only(true)
+        .start()
+        .map_err(|_| AuthorityError::BackendUnknown)?;
+    let read_at_unix_ms = database_now(&mut transaction)?;
+    let limit =
+        i64::try_from(MAX_NODE_OWNED_VOLUMES + 1).map_err(|_| AuthorityError::BackendUnknown)?;
+    let sql = node_owned_volumes_sql();
+    let rows = transaction
+        .query(&sql, &[&node_id.as_str(), &limit])
+        .map_err(|_| AuthorityError::BackendUnknown)?;
+    if rows.len() > MAX_NODE_OWNED_VOLUMES {
+        return Err(AuthorityError::BackendUnknown);
+    }
+    let mut volumes = Vec::with_capacity(rows.len());
+    for row in rows {
+        let (volume, binding) = decode_stored_volume(&row)?;
+        let binding = binding.ok_or(AuthorityError::BackendUnknown)?;
+        if binding.owner_node_id != *node_id {
+            return Err(AuthorityError::BackendUnknown);
+        }
+        volumes.push(NodeOwnedVolume { binding, volume });
+    }
+    transaction
+        .commit()
+        .map_err(|_| AuthorityError::BackendUnknown)?;
+    Ok(NodeOwnedVolumeSnapshot {
+        node_id: node_id.clone(),
+        read_at_unix_ms,
+        volumes,
+    })
+}
+
+fn node_owned_volumes_sql() -> String {
+    format!(
+        "WITH candidate_ids AS MATERIALIZED (
+            (
+                SELECT volume_id
+                  FROM volume_records
+                 WHERE owner_node_id=$1
+                 ORDER BY volume_id COLLATE \"C\"
+                 LIMIT $2
+            )
+            UNION
+            (
+                SELECT volume_id
+                  FROM volume_records
+                 WHERE owner_binding->>'owner_node_id'=$1
+                 ORDER BY volume_id COLLATE \"C\"
+                 LIMIT $2
+            )
+        )
+        SELECT {VOLUME_COLUMNS}
+          FROM volume_records
+         WHERE volume_id IN (SELECT volume_id FROM candidate_ids)
+         ORDER BY volume_id COLLATE \"C\"
+         LIMIT $2"
+    )
 }
 
 fn database_now(transaction: &mut Transaction<'_>) -> Result<UnixMillis, AuthorityError> {
@@ -293,6 +444,12 @@ fn update_volume(
 }
 
 fn decode_volume(row: &Row) -> Result<VolumeRecord, AuthorityError> {
+    Ok(decode_stored_volume(row)?.0)
+}
+
+fn decode_stored_volume(
+    row: &Row,
+) -> Result<(VolumeRecord, Option<VolumeOwnerBinding>), AuthorityError> {
     let stored = projection_from_row(row)?;
     let record_json: String = row
         .try_get("record_json")
@@ -300,11 +457,29 @@ fn decode_volume(row: &Row) -> Result<VolumeRecord, AuthorityError> {
     let record: VolumeRecord =
         serde_json::from_str(&record_json).map_err(|_| AuthorityError::BackendUnknown)?;
     let derived = project_volume_record(&record)?;
-    if stored == derived {
-        Ok(record)
-    } else {
-        Err(AuthorityError::BackendUnknown)
+    if stored != derived {
+        return Err(AuthorityError::BackendUnknown);
     }
+    let owner_binding_json: Option<String> = row
+        .try_get("owner_binding_json")
+        .map_err(|_| AuthorityError::BackendUnknown)?;
+    let owner_node_id: Option<String> = row
+        .try_get("owner_node_id")
+        .map_err(|_| AuthorityError::BackendUnknown)?;
+    let owner_binding = owner_binding_json
+        .map(|json| serde_json::from_str::<VolumeOwnerBinding>(&json))
+        .transpose()
+        .map_err(|_| AuthorityError::BackendUnknown)?;
+    match (&owner_binding, owner_node_id.as_deref()) {
+        (None, None) if record.lease_owner.is_none() => {}
+        (Some(binding), Some(projected_node_id))
+            if binding.owner_node_id.as_str() == projected_node_id =>
+        {
+            validate_volume_owner_binding(binding, &record)?;
+        }
+        _ => return Err(AuthorityError::BackendUnknown),
+    }
+    Ok((record, owner_binding))
 }
 
 fn projection_from_row(row: &Row) -> Result<VolumeRecordProjection, AuthorityError> {
@@ -444,6 +619,7 @@ mod tests {
 
     const VOLUME_ID: &str = "volume-target-authority";
     const ATTACHMENT_ID: &str = "attachment-target-authority";
+    const NODE_ID: &str = "node-target-authority";
     const VOLUME_SIZE: u64 = 8 * 1024 * 1024;
 
     struct Fixture {
@@ -541,6 +717,14 @@ mod tests {
         let transition_duration = projection
             .transition_lease_duration_ms
             .map(|value| to_pg(value).unwrap());
+        let owner_binding = VolumeOwnerBinding {
+            volume_id: record.volume_id.clone(),
+            owner_node_id: id(NODE_ID),
+            attachment_id: record.lease_owner.clone().expect("test Volume is owned"),
+            attachment_epoch: record.lease_epoch,
+        };
+        let owner_binding_json =
+            serde_json::to_string(&owner_binding).expect("serialize test owner binding");
         client
             .execute(
                 "INSERT INTO volume_records (
@@ -549,10 +733,11 @@ mod tests {
                     lease_owner, lease_epoch, lease_expires_at,
                     last_transition_kind, last_transition_id,
                     transition_desired_revision, transition_placement_epoch,
-                    transition_lease_duration_ms
+                    transition_lease_duration_ms, owner_binding, owner_node_id
                  ) VALUES (
                     $1, $2::TEXT::jsonb, $3, $4, $5, $6, $7, $8, $9,
-                    $10, $11, $12, $13, $14, $15, $16, $17
+                    $10, $11, $12, $13, $14, $15, $16, $17,
+                    $18::TEXT::jsonb, $19
                  )",
                 &[
                     &projection.volume_id,
@@ -572,9 +757,61 @@ mod tests {
                     &transition_revision,
                     &transition_placement,
                     &transition_duration,
+                    &owner_binding_json,
+                    &NODE_ID,
                 ],
             )
             .expect("insert target authority test row");
+    }
+
+    fn insert_generated_owned_volumes(
+        client: &mut Client,
+        owner_node_id: &str,
+        first: i64,
+        last: i64,
+    ) {
+        client
+            .execute(
+                "INSERT INTO volume_records (
+                    volume_id, record, size_bytes, durability, admin_state,
+                    head_generation, lease_owner, lease_epoch, lease_expires_at,
+                    last_transition_kind, last_transition_id, owner_binding,
+                    owner_node_id
+                 )
+                 SELECT
+                    'generated-volume-' || value,
+                    jsonb_build_object(
+                        'volume_id', 'generated-volume-' || value,
+                        'size_bytes', 4096,
+                        'durability', 'strict',
+                        'admin_state', jsonb_build_object('kind', 'active'),
+                        'head', jsonb_build_object(
+                            'generation', 0,
+                            'root_hash', NULL,
+                            'root_object_id', NULL
+                        ),
+                        'lease_owner', 'generated-attachment-' || value,
+                        'lease_epoch', 1,
+                        'lease_expires_at', 9999999999999,
+                        'last_transition', jsonb_build_object(
+                            'kind', 'takeover',
+                            'authorization_id', 'generated-auth-' || value
+                        )
+                    ),
+                    4096, 'strict', 'active', 0,
+                    'generated-attachment-' || value, 1, 9999999999999,
+                    'takeover', 'generated-auth-' || value,
+                    jsonb_build_object(
+                        'volume_id', 'generated-volume-' || value,
+                        'owner_node_id', $1::text,
+                        'attachment_id', 'generated-attachment-' || value,
+                        'attachment_epoch', 1
+                    ),
+                    $1::text
+                   FROM generate_series($2::bigint, $3::bigint) value",
+                &[&owner_node_id, &first, &last],
+            )
+            .expect("insert generated owned Volume rows");
     }
 
     fn renew_request(owner: &str, epoch_value: u64, duration_ms: u64) -> RenewLeaseRequest {
@@ -680,6 +917,47 @@ mod tests {
     }
 
     #[test]
+    fn target_rejects_missing_or_replaced_owner_indexes_without_repair() {
+        for (index, ddl) in [
+            (
+                "volume_records_owner_node",
+                "DROP INDEX volume_records_owner_node",
+            ),
+            (
+                "volume_records_owner_binding_node",
+                "DROP INDEX volume_records_owner_binding_node;
+                 CREATE INDEX volume_records_owner_binding_node
+                     ON volume_records(owner_node_id, volume_id)
+                     WHERE owner_node_id IS NOT NULL",
+            ),
+        ] {
+            let url = cats_control_plane::testsupport::isolated_control_store_url();
+            drop(Store::connect(&url, None).unwrap());
+            let mut client = Client::connect(&url, NoTls).unwrap();
+            insert_volume(&mut client, &owned_volume());
+            client.batch_execute(ddl).unwrap();
+            let before = raw_volume_row_json(&mut client);
+
+            let error = PostgresVolumeDataAuthority::connect(&url, None)
+                .err()
+                .expect("changed owner index must reject target startup");
+            assert!(error.to_string().contains(index), "{error}");
+            assert_eq!(raw_volume_row_json(&mut client), before);
+            let definition: Option<String> = client
+                .query_one("SELECT pg_get_indexdef(to_regclass($1))", &[&index])
+                .unwrap()
+                .get(0);
+            if ddl.starts_with("DROP INDEX volume_records_owner_node") {
+                assert!(definition.is_none());
+            } else {
+                assert!(definition
+                    .as_deref()
+                    .is_some_and(|value| value.contains("owner_node_id, volume_id")));
+            }
+        }
+    }
+
+    #[test]
     fn target_uses_only_the_final_authority_row_and_preserves_a_legacy_sentinel() {
         let mut fixture = Fixture::new();
         assert_eq!(legacy_table(&mut fixture.client), None);
@@ -711,6 +989,98 @@ mod tests {
             .collect();
         assert_eq!(markers, ["do-not-touch"]);
         assert_eq!(fixture.stored().head, head(5, 5));
+    }
+
+    #[test]
+    fn runtime_inventory_returns_the_complete_node_index_and_rejects_binding_drift() {
+        let mut fixture = Fixture::new();
+        let snapshot = fixture
+            .authority
+            .load_node_owned_volumes(&id(NODE_ID))
+            .unwrap();
+        assert_eq!(snapshot.node_id, id(NODE_ID));
+        assert_eq!(snapshot.volumes.len(), 1);
+        assert_eq!(snapshot.volumes[0].volume, fixture.record);
+        assert_eq!(snapshot.volumes[0].binding.owner_node_id, id(NODE_ID));
+        assert!(fixture
+            .authority
+            .load_node_owned_volumes(&id("node-with-no-volumes"))
+            .unwrap()
+            .volumes
+            .is_empty());
+
+        // Model a storage-corruption shape that bypassed the database guard.
+        // The bidirectional selector and strict decoder must still expose the
+        // row to both projected owners and fail closed.
+        fixture
+            .client
+            .batch_execute(
+                "ALTER TABLE volume_records
+                    DROP CONSTRAINT volume_records_owner_binding_check",
+            )
+            .unwrap();
+        fixture
+            .client
+            .execute(
+                "UPDATE volume_records SET owner_node_id='drifted-node' WHERE volume_id=$1",
+                &[&VOLUME_ID],
+            )
+            .unwrap();
+        assert_eq!(
+            fixture.authority.load_node_owned_volumes(&id(NODE_ID)),
+            Err(AuthorityError::BackendUnknown)
+        );
+        assert_eq!(
+            fixture
+                .authority
+                .load_node_owned_volumes(&id("drifted-node")),
+            Err(AuthorityError::BackendUnknown)
+        );
+    }
+
+    #[test]
+    fn runtime_inventory_query_uses_both_owner_indexes_with_large_foreign_history() {
+        let mut fixture = Fixture::new();
+        insert_generated_owned_volumes(&mut fixture.client, "foreign-node", 1, 50_000);
+        fixture
+            .client
+            .batch_execute("ANALYZE volume_records")
+            .unwrap();
+        let explain = format!("EXPLAIN (COSTS OFF) {}", node_owned_volumes_sql());
+        let plan = fixture
+            .client
+            .query(&explain, &[&"node-absent-from-large-history", &257_i64])
+            .unwrap()
+            .into_iter()
+            .map(|row| row.get::<_, String>(0))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(plan.contains("volume_records_owner_node"), "{plan}");
+        assert!(plan.contains("volume_records_owner_binding_node"), "{plan}");
+        assert!(!plan.contains("Seq Scan on volume_records"), "{plan}");
+    }
+
+    #[test]
+    fn runtime_inventory_accepts_the_exact_bound_and_rejects_one_more_row() {
+        let mut fixture = Fixture::new();
+        insert_generated_owned_volumes(
+            &mut fixture.client,
+            NODE_ID,
+            2,
+            i64::try_from(MAX_NODE_OWNED_VOLUMES).unwrap(),
+        );
+        let snapshot = fixture
+            .authority
+            .load_node_owned_volumes(&id(NODE_ID))
+            .unwrap();
+        assert_eq!(snapshot.volumes.len(), MAX_NODE_OWNED_VOLUMES);
+
+        let overflow = i64::try_from(MAX_NODE_OWNED_VOLUMES + 1).unwrap();
+        insert_generated_owned_volumes(&mut fixture.client, NODE_ID, overflow, overflow);
+        assert_eq!(
+            fixture.authority.load_node_owned_volumes(&id(NODE_ID)),
+            Err(AuthorityError::BackendUnknown)
+        );
     }
 
     #[test]

@@ -3,10 +3,10 @@
 use cats_api::runtime_reconciliation::{Epoch, FenceEpoch, Generation, Id, Revision, UnixMillis};
 use cats_storage::authority::{
     project_volume_record, validate_authorization_record, validate_delete_completion_receipt,
-    validate_host_fence_event, AuthorizationConsumedReceipt, AuthorizationRecord,
-    AuthorizationState, DeleteCompletionReceipt, DisposableDeleteIsolationBasis, HostFenceEvent,
-    HostFenceEventState, HostIsolationState, RemoteHead, VolumeAuthorization, VolumeRecord,
-    VolumeRecordProjection,
+    validate_host_fence_event, validate_volume_owner_binding, AuthorizationConsumedReceipt,
+    AuthorizationRecord, AuthorizationState, DeleteCompletionReceipt,
+    DisposableDeleteIsolationBasis, HostFenceEvent, HostFenceEventState, HostIsolationState,
+    RemoteHead, VolumeAuthorization, VolumeOwnerBinding, VolumeRecord, VolumeRecordProjection,
 };
 use postgres::{Row, Transaction};
 use serde::{de::DeserializeOwned, Serialize};
@@ -19,7 +19,8 @@ pub(super) const VOLUME_COLUMNS: &str = "
     admin_state, delete_id, head_generation, head_root_hash,
     head_root_object_id, lease_owner, lease_epoch, lease_expires_at,
     last_transition_kind, last_transition_id, transition_desired_revision,
-    transition_placement_epoch, transition_lease_duration_ms";
+    transition_placement_epoch, transition_lease_duration_ms,
+    owner_binding::text AS owner_binding_json, owner_node_id";
 
 pub(super) const EVENT_COLUMNS: &str = "
     event_id, record::text AS record_json, provider, immutable_host_id,
@@ -111,6 +112,23 @@ pub(super) fn load_volume_for_update(
         .transpose()
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) struct StoredVolume {
+    pub(super) record: VolumeRecord,
+    pub(super) owner_binding: Option<VolumeOwnerBinding>,
+}
+
+pub(super) fn load_stored_volume_for_update(
+    transaction: &mut Transaction<'_>,
+    volume_id: &Id,
+) -> AuthorityTxResult<Option<StoredVolume>> {
+    let sql = format!("SELECT {VOLUME_COLUMNS} FROM volume_records WHERE volume_id=$1 FOR UPDATE");
+    transaction
+        .query_opt(&sql, &[&volume_id.as_str()])?
+        .map(|row| decode_stored_volume(&row))
+        .transpose()
+}
+
 #[allow(dead_code, reason = "consumed by the A22 authenticated evidence route")]
 pub(super) fn load_volume_unlocked(
     transaction: &mut Transaction<'_>,
@@ -130,6 +148,11 @@ pub(super) fn insert_volume(
     transaction: &mut Transaction<'_>,
     record: &VolumeRecord,
 ) -> AuthorityTxResult<()> {
+    if record.lease_owner.is_some() {
+        return Err(corrupt(
+            "an inserted Volume owner requires an exact Node binding",
+        ));
+    }
     let projection = project_volume_record(record)?;
     let record_json = encode(record)?;
     let size_bytes = SizeBytes::new(projection.size_bytes)
@@ -210,7 +233,13 @@ pub(super) fn update_volume(
             lease_expires_at=$12, last_transition_kind=$13,
             last_transition_id=$14, transition_desired_revision=$15,
             transition_placement_epoch=$16, transition_lease_duration_ms=$17
-          WHERE volume_id=$1",
+          WHERE volume_id=$1
+            AND (
+                ($10::TEXT IS NULL AND owner_binding IS NULL) OR
+                ($10::TEXT IS NOT NULL
+                    AND owner_binding->>'attachment_id'=$10::TEXT
+                    AND (owner_binding->>'attachment_epoch')::BIGINT=$11)
+            )",
         &[
             &projection.volume_id,
             &record_json,
@@ -234,14 +263,99 @@ pub(super) fn update_volume(
     exactly_one(changed)
 }
 
+pub(super) fn update_volume_owner(
+    transaction: &mut Transaction<'_>,
+    record: &VolumeRecord,
+    owner_binding: Option<&VolumeOwnerBinding>,
+) -> AuthorityTxResult<()> {
+    match owner_binding {
+        Some(binding) => validate_volume_owner_binding(binding, record)?,
+        None if record.lease_owner.is_none() => {}
+        None => return Err(corrupt("an owned Volume is missing its Node binding")),
+    }
+    let projection = project_volume_record(record)?;
+    let record_json = encode(record)?;
+    let owner_binding_json = owner_binding.map(encode).transpose()?;
+    let owner_node_id = owner_binding.map(|binding| binding.owner_node_id.as_str());
+    let size_bytes = SizeBytes::new(projection.size_bytes)
+        .map_err(corrupt)?
+        .to_pg()
+        .map_err(corrupt)?;
+    let head_generation = projection.head_generation.to_pg().map_err(corrupt)?;
+    let lease_epoch = projection.lease_epoch.to_pg().map_err(corrupt)?;
+    let lease_expires_at = optional_to_pg(projection.lease_expires_at)?;
+    let transition_revision = optional_to_pg(projection.transition_desired_revision)?;
+    let transition_placement = optional_to_pg(projection.transition_placement_epoch)?;
+    let transition_duration = projection
+        .transition_lease_duration_ms
+        .map(LeaseDurationMs::new)
+        .transpose()
+        .map_err(corrupt)?;
+    let transition_duration = optional_to_pg(transition_duration)?;
+    let changed = transaction.execute(
+        "UPDATE volume_records SET
+            record=$2::TEXT::jsonb, size_bytes=$3, durability=$4, admin_state=$5,
+            delete_id=$6, head_generation=$7, head_root_hash=$8,
+            head_root_object_id=$9, lease_owner=$10, lease_epoch=$11,
+            lease_expires_at=$12, last_transition_kind=$13,
+            last_transition_id=$14, transition_desired_revision=$15,
+            transition_placement_epoch=$16, transition_lease_duration_ms=$17,
+            owner_binding=$18::TEXT::jsonb, owner_node_id=$19
+          WHERE volume_id=$1",
+        &[
+            &projection.volume_id,
+            &record_json,
+            &size_bytes,
+            &projection.durability,
+            &projection.admin_state,
+            &projection.delete_id,
+            &head_generation,
+            &projection.head_root_hash,
+            &projection.head_root_object_id,
+            &projection.lease_owner,
+            &lease_epoch,
+            &lease_expires_at,
+            &projection.last_transition_kind,
+            &projection.last_transition_id,
+            &transition_revision,
+            &transition_placement,
+            &transition_duration,
+            &owner_binding_json,
+            &owner_node_id,
+        ],
+    )?;
+    exactly_one(changed)
+}
+
 fn decode_volume(row: &Row) -> AuthorityTxResult<VolumeRecord> {
+    Ok(decode_stored_volume(row)?.record)
+}
+
+fn decode_stored_volume(row: &Row) -> AuthorityTxResult<StoredVolume> {
     let stored = volume_projection_from_row(row)?;
     let record: VolumeRecord = decode(row.try_get("record_json")?)?;
     let derived = project_volume_record(&record)?;
     if stored != derived {
         return Err(corrupt(()));
     }
-    Ok(record)
+    let owner_binding_json: Option<String> = row.try_get("owner_binding_json")?;
+    let owner_node_id: Option<String> = row.try_get("owner_node_id")?;
+    let owner_binding = owner_binding_json
+        .map(decode::<VolumeOwnerBinding>)
+        .transpose()?;
+    match (&owner_binding, owner_node_id.as_deref()) {
+        (None, None) if record.lease_owner.is_none() => {}
+        (Some(binding), Some(projected_node_id))
+            if binding.owner_node_id.as_str() == projected_node_id =>
+        {
+            validate_volume_owner_binding(binding, &record)?;
+        }
+        _ => return Err(corrupt("Volume owner binding projection is inconsistent")),
+    }
+    Ok(StoredVolume {
+        record,
+        owner_binding,
+    })
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

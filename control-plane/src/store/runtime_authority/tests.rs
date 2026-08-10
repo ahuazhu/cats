@@ -28,8 +28,8 @@ use cats_storage::authority::{
     DisposableDeleteIsolationBasis, DisposableRootDeleteAuthorization, Epoch, FenceEpoch,
     Generation, HostFenceEvent, HostFenceEventState, HostIsolationState, Id, NormalAcquireRequest,
     RandomId128, ReleaseRequest, RemoteHead, Revision, Sha256Digest, TakeoverConsumedReceipt,
-    UnixMillis, VolumeAdminState, VolumeAuthorization, VolumeDurability, VolumeRecord,
-    VolumeTakeoverAuthorization,
+    UnixMillis, VolumeAdminState, VolumeAuthorization, VolumeDurability, VolumeOwnerBinding,
+    VolumeRecord, VolumeTakeoverAuthorization,
 };
 
 use super::product::{CatRecord, DiskAdminState, DiskRecord, DiskRole, DiskSnapshotRecord};
@@ -41,8 +41,8 @@ use super::rows::{
     database_now, disposable_root_authorization_candidates_sql, insert_authorization,
     insert_delete_completion, insert_event, insert_volume, load_active_event_by_node_unlocked,
     load_authorization_for_update, load_delete_completion_for_update, load_event_for_update,
-    load_volume_for_update, update_authorization, update_event, update_volume,
-    volume_has_disposable_root_authorization_for_delete,
+    load_stored_volume_for_update, load_volume_for_update, update_authorization, update_event,
+    update_volume_owner, volume_has_disposable_root_authorization_for_delete,
 };
 use super::runtime_spine::{
     age_volume_mutation_admission_for_test, PlacementAdmissionLoad, PlacementAdmissionRejection,
@@ -1140,7 +1140,18 @@ fn seed_takeover(store: &Store, event: &HostFenceEvent, authorization: &Authoriz
     store
         .authority_transaction(|transaction| {
             insert_event(transaction, event)?;
-            insert_authorization(transaction, authorization)
+            insert_authorization(transaction, authorization)?;
+            let VolumeAuthorization::Takeover(payload) = &authorization.authorization else {
+                panic!("takeover fixture requires a takeover authorization")
+            };
+            let stored = load_stored_volume_for_update(transaction, &payload.volume_id)?.unwrap();
+            let owner_binding = VolumeOwnerBinding {
+                volume_id: stored.record.volume_id.clone(),
+                owner_node_id: event.node_id.clone(),
+                attachment_id: stored.record.lease_owner.clone().unwrap(),
+                attachment_epoch: stored.record.lease_epoch,
+            };
+            update_volume_owner(transaction, &stored.record, Some(&owner_binding))
         })
         .unwrap();
 }
@@ -1149,6 +1160,16 @@ fn stored_volume(store: &Store, volume_id: &Id) -> VolumeRecord {
     store
         .authority_transaction(|transaction| {
             Ok(load_volume_for_update(transaction, volume_id)?.unwrap())
+        })
+        .unwrap()
+}
+
+fn stored_volume_owner(store: &Store, volume_id: &Id) -> Option<VolumeOwnerBinding> {
+    store
+        .authority_transaction(|transaction| {
+            Ok(load_stored_volume_for_update(transaction, volume_id)?
+                .unwrap()
+                .owner_binding)
         })
         .unwrap()
 }
@@ -1191,6 +1212,24 @@ fn canonical_active_fence_cannot_be_hidden_by_projection_drift() {
         })
         .unwrap_err();
     assert_eq!(error.code, ErrorCode::Internal);
+}
+
+#[test]
+fn database_rejects_a_partial_or_extra_volume_owner_binding() {
+    let store = Store::connect(&crate::testsupport::isolated_control_store_url(), None).unwrap();
+    let owned = acquire_owned_volume(&store);
+    let before = stored_volume_row(&store, &owned.volume_id);
+    for replacement in [
+        "owner_binding - 'attachment_id'",
+        "owner_binding || '{\"unexpected\":true}'::jsonb",
+    ] {
+        let sql =
+            format!("UPDATE volume_records SET owner_binding={replacement} WHERE volume_id=$1");
+        assert!(store
+            .with(|client| client.execute(&sql, &[&owned.volume_id.as_str()]))
+            .is_err());
+        assert_eq!(stored_volume_row(&store, &owned.volume_id), before);
+    }
 }
 
 fn stored_authorization_row(store: &Store, authorization_id: &Id) -> String {
@@ -1341,7 +1380,7 @@ fn lock_node_identities_in_order(
 fn acquire_owned_volume(store: &Store) -> VolumeRecord {
     seed_volume(store, &unowned_volume());
     store
-        .acquire_volume_authority(&acquire_request(1, "attachment-old", 7))
+        .acquire_volume_authority(&id("node-new"), &acquire_request(1, "attachment-old", 7))
         .unwrap();
     stored_volume(store, &id("volume-1"))
 }
@@ -1424,8 +1463,12 @@ fn persisted_volume_replays_lost_result_and_rejects_reused_id() {
     let request = acquire_request(1, "attachment-old", 7);
 
     // Simulate a commit response that the caller lost by discarding it.
-    let first = store.acquire_volume_authority(&request).unwrap();
-    let replay = store.acquire_volume_authority(&request).unwrap();
+    let first = store
+        .acquire_volume_authority(&id("node-a"), &request)
+        .unwrap();
+    let replay = store
+        .acquire_volume_authority(&id("node-a"), &request)
+        .unwrap();
     assert_eq!(replay, first);
 
     let before = stored_volume(&store, &request.volume_id);
@@ -1433,7 +1476,9 @@ fn persisted_volume_replays_lost_result_and_rejects_reused_id() {
         attachment_id: id("attachment-other"),
         ..request
     };
-    let error = store.acquire_volume_authority(&changed).unwrap_err();
+    let error = store
+        .acquire_volume_authority(&id("node-a"), &changed)
+        .unwrap_err();
     assert_eq!(error.code, ErrorCode::Conflict);
     assert_eq!(stored_volume(&store, &changed.volume_id), before);
 }
@@ -1454,7 +1499,7 @@ fn malformed_json_and_projection_mismatch_fail_closed() {
         })
         .unwrap();
     let error = store
-        .acquire_volume_authority(&acquire_request(1, "attachment-old", 7))
+        .acquire_volume_authority(&id("node-a"), &acquire_request(1, "attachment-old", 7))
         .unwrap_err();
     assert_eq!(error.code, ErrorCode::Internal);
 
@@ -1475,7 +1520,7 @@ fn malformed_json_and_projection_mismatch_fail_closed() {
         })
         .unwrap();
     let error = store
-        .acquire_volume_authority(&acquire_request(2, "attachment-old", 7))
+        .acquire_volume_authority(&id("node-a"), &acquire_request(2, "attachment-old", 7))
         .unwrap_err();
     assert_eq!(error.code, ErrorCode::Internal);
 }
@@ -1499,7 +1544,7 @@ fn expired_foreign_owner_stays_owned_but_exact_owner_can_renew() {
         .unwrap();
 
     let error = store
-        .acquire_volume_authority(&acquire_request(2, "attachment-new", 8))
+        .acquire_volume_authority(&id("node-b"), &acquire_request(2, "attachment-new", 8))
         .unwrap_err();
     assert_eq!(error.code, ErrorCode::Conflict);
 
@@ -1528,7 +1573,7 @@ fn release_reacquire_fences_a_late_release() {
     let released = store.release_volume_authority(&old_release).unwrap();
     assert_eq!(released.resulting_epoch, fence_epoch(9));
     store
-        .acquire_volume_authority(&acquire_request(3, "attachment-new", 9))
+        .acquire_volume_authority(&id("node-b"), &acquire_request(3, "attachment-new", 9))
         .unwrap();
     let before = stored_volume(&store, &owned.volume_id);
 
@@ -1546,11 +1591,11 @@ fn two_store_sessions_cannot_both_acquire_one_volume() {
     let second_barrier = Arc::clone(&barrier);
     let first_worker = std::thread::spawn(move || {
         first_barrier.wait();
-        first.acquire_volume_authority(&acquire_request(1, "attachment-a", 7))
+        first.acquire_volume_authority(&id("node-a"), &acquire_request(1, "attachment-a", 7))
     });
     let second_worker = std::thread::spawn(move || {
         second_barrier.wait();
-        second.acquire_volume_authority(&acquire_request(2, "attachment-b", 7))
+        second.acquire_volume_authority(&id("node-b"), &acquire_request(2, "attachment-b", 7))
     });
     barrier.wait();
     let outcomes = [first_worker.join().unwrap(), second_worker.join().unwrap()];
@@ -1620,6 +1665,15 @@ fn a22_normal_acquire_commits_once_and_replays_after_response_loss() {
     let committed = stored_volume(&store, &volume.volume_id);
     assert_eq!(committed.lease_owner, Some(id("attachment-normal")));
     assert_eq!(committed.lease_epoch, fence_epoch(8));
+    assert_eq!(
+        stored_volume_owner(&store, &volume.volume_id),
+        Some(VolumeOwnerBinding {
+            volume_id: volume.volume_id.clone(),
+            owner_node_id: node.session.node_id.clone(),
+            attachment_id: id("attachment-normal"),
+            attachment_epoch: fence_epoch(8),
+        })
+    );
 
     let desired_read = match store
         .runtime_desired_read(
@@ -1843,10 +1897,63 @@ fn a22_takeover_union_consumes_and_replays_the_exact_authorization() {
     };
     assert_eq!(grant.attachment_id, id("attachment-new"));
     assert_eq!(grant.attachment_epoch, fence_epoch(9));
+    assert_eq!(
+        stored_volume_owner(&store, &owned.volume_id),
+        Some(VolumeOwnerBinding {
+            volume_id: owned.volume_id.clone(),
+            owner_node_id: node.session.node_id.clone(),
+            attachment_id: id("attachment-new"),
+            attachment_epoch: fence_epoch(9),
+        })
+    );
     assert!(matches!(
         stored_authorization(&store, &id("takeover-auth-1")).state,
         AuthorizationState::Consumed(_)
     ));
+}
+
+#[test]
+fn a22_takeover_rejects_an_authorization_for_a_different_current_owner() {
+    let store = Store::connect(&crate::testsupport::isolated_control_store_url(), None).unwrap();
+    let owned = acquire_owned_volume(&store);
+    let event = host_fence_event(HostFenceEventState::Active);
+    let authorization = takeover_authorization(&owned);
+    seed_takeover(&store, &event, &authorization);
+    store
+        .authority_transaction(|transaction| {
+            let stored = load_stored_volume_for_update(transaction, &owned.volume_id)?.unwrap();
+            let binding = VolumeOwnerBinding {
+                volume_id: stored.record.volume_id.clone(),
+                owner_node_id: id("other-unfenced-node"),
+                attachment_id: id("attachment-old"),
+                attachment_epoch: owned.lease_epoch,
+            };
+            update_volume_owner(transaction, &stored.record, Some(&binding))
+        })
+        .unwrap();
+    let node = transition_node(&store, "node-new");
+    let desired = prepare_takeover_runtime(&store, &node, &id("takeover-auth-1"));
+    let request = transition_request(
+        &node,
+        &desired,
+        RuntimeVolumeTransition::Acquire {
+            request: VolumeAcquireRequest::Takeover {
+                authorization_id: id("takeover-auth-1"),
+            },
+        },
+    );
+    let before = stored_takeover_graph(&store);
+
+    assert_eq!(
+        execute_transition(&store, &node, &request).unwrap(),
+        VolumeTransitionStoreOutcome::Rejected(
+            VolumeTransitionStoreRejection::VolumeAuthorizationRejected {
+                authorization_id: id("takeover-auth-1"),
+                reason: RuntimeVolumeAuthorizationRejection::InvalidAuthorization,
+            }
+        )
+    );
+    assert_eq!(stored_takeover_graph(&store), before);
 }
 
 #[test]
@@ -1923,6 +2030,7 @@ fn a22_release_uses_full_physical_evidence_and_exactly_replays() {
     let released = stored_volume(&store, &owned.volume_id);
     assert_eq!(released.lease_owner, None);
     assert_eq!(released.lease_epoch, fence_epoch(9));
+    assert_eq!(stored_volume_owner(&store, &owned.volume_id), None);
 }
 
 #[test]
@@ -2447,6 +2555,7 @@ fn a22_disposable_consume_uses_node_wide_physical_authority_for_both_isolation_b
     #[derive(Debug, Clone, Copy)]
     enum PhysicalConflict {
         None,
+        ForeignAuthorityOwner,
         ForeignRuntimeVolume,
         ForeignRuntimeBlockd,
         ForeignRuntimeMount,
@@ -2459,6 +2568,7 @@ fn a22_disposable_consume_uses_node_wide_physical_authority_for_both_isolation_b
     ] {
         for conflict in [
             PhysicalConflict::None,
+            PhysicalConflict::ForeignAuthorityOwner,
             PhysicalConflict::ForeignRuntimeVolume,
             PhysicalConflict::ForeignRuntimeBlockd,
             PhysicalConflict::ForeignRuntimeMount,
@@ -2508,7 +2618,7 @@ fn a22_disposable_consume_uses_node_wide_physical_authority_for_both_isolation_b
             let mut runtimes = vec![target.clone()];
             let mut residue = Vec::new();
             match conflict {
-                PhysicalConflict::None => {}
+                PhysicalConflict::None | PhysicalConflict::ForeignAuthorityOwner => {}
                 PhysicalConflict::ForeignRuntimeVolume => {
                     let mut foreign = observed;
                     foreign.local_lineages.clear();
@@ -2583,10 +2693,34 @@ fn a22_disposable_consume_uses_node_wide_physical_authority_for_both_isolation_b
                 .authority_transaction(|transaction| {
                     if let Some(event) = event.as_ref() {
                         insert_event(transaction, event)?;
+                        let stored =
+                            load_stored_volume_for_update(transaction, &owned.volume_id)?.unwrap();
+                        let binding = VolumeOwnerBinding {
+                            volume_id: stored.record.volume_id.clone(),
+                            owner_node_id: event.node_id.clone(),
+                            attachment_id: id("attachment-old"),
+                            attachment_epoch: owned.lease_epoch,
+                        };
+                        update_volume_owner(transaction, &stored.record, Some(&binding))?;
                     }
                     insert_authorization(transaction, &authorization)
                 })
                 .unwrap();
+            if matches!(conflict, PhysicalConflict::ForeignAuthorityOwner) {
+                store
+                    .authority_transaction(|transaction| {
+                        let stored =
+                            load_stored_volume_for_update(transaction, &owned.volume_id)?.unwrap();
+                        let binding = VolumeOwnerBinding {
+                            volume_id: stored.record.volume_id.clone(),
+                            owner_node_id: id("foreign-owner-node"),
+                            attachment_id: id("attachment-old"),
+                            attachment_epoch: owned.lease_epoch,
+                        };
+                        update_volume_owner(transaction, &stored.record, Some(&binding))
+                    })
+                    .unwrap();
+            }
             let request = transition_request(
                 &node,
                 &desired,
@@ -2808,6 +2942,7 @@ fn a22_disposable_consume_updates_volume_disk_and_receipt_atomically() {
         stored_volume(&store, &owned.volume_id).admin_state,
         VolumeAdminState::Deleting { ref delete_id } if delete_id == &id("delete-1")
     ));
+    assert_eq!(stored_volume_owner(&store, &owned.volume_id), None);
     let disk = store
         .authority_transaction(|transaction| {
             Ok(load_disk_by_id_for_update(transaction, &id("disk-1"))?.unwrap())
@@ -3832,7 +3967,7 @@ fn evidence_snapshot_returns_disposable_completion_after_rows_are_gone() {
     .unwrap();
     store
         .authority_transaction(|transaction| {
-            update_volume(transaction, &deleting)?;
+            update_volume_owner(transaction, &deleting, None)?;
             update_authorization(transaction, &original, &consumed)
         })
         .unwrap();

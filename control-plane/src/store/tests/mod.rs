@@ -1085,6 +1085,65 @@ fn refuses_missing_or_replaced_authorization_indexes_without_repair() {
 }
 
 #[test]
+fn refuses_missing_or_replaced_volume_owner_indexes_without_repair() {
+    for (index, ddl, expected_fragment) in [
+        (
+            "volume_records_owner_node",
+            "DROP INDEX volume_records_owner_node",
+            None,
+        ),
+        (
+            "volume_records_owner_node",
+            "DROP INDEX volume_records_owner_node;
+             CREATE INDEX volume_records_owner_node
+                 ON volume_records(volume_id, owner_node_id)
+                 WHERE owner_node_id IS NOT NULL",
+            Some("volume_id, owner_node_id"),
+        ),
+        (
+            "volume_records_owner_binding_node",
+            "DROP INDEX volume_records_owner_binding_node",
+            None,
+        ),
+        (
+            "volume_records_owner_binding_node",
+            "DROP INDEX volume_records_owner_binding_node;
+             CREATE INDEX volume_records_owner_binding_node
+                 ON volume_records(owner_node_id, volume_id)
+                 WHERE owner_node_id IS NOT NULL",
+            Some("owner_node_id, volume_id"),
+        ),
+    ] {
+        let url = crate::testsupport::isolated_control_store_url();
+        drop(Store::connect(&url, None).unwrap());
+        let mut admin = postgres::Client::connect(&url, postgres::NoTls).unwrap();
+        admin.batch_execute(ddl).unwrap();
+
+        let Err(error) = Store::connect(&url, None) else {
+            panic!("a stamped schema with a changed Volume owner index must fail closed");
+        };
+        assert_eq!(error.code, ErrorCode::FailedPrecondition);
+        assert!(error.to_string().contains(index), "{error}");
+        let definition: Option<String> = admin
+            .query_one("SELECT pg_get_indexdef(to_regclass($1))", &[&index])
+            .unwrap()
+            .get(0);
+        match expected_fragment {
+            Some(fragment) => assert!(
+                definition
+                    .as_deref()
+                    .is_some_and(|value| value.contains(fragment)),
+                "startup repaired or replaced the deliberately wrong index: {definition:?}"
+            ),
+            None => assert!(
+                definition.is_none(),
+                "startup recreated a deliberately dropped index: {definition:?}"
+            ),
+        }
+    }
+}
+
+#[test]
 fn concurrent_first_connections_create_one_exact_schema() {
     let url = crate::testsupport::isolated_control_store_url();
     let barrier = Arc::new(std::sync::Barrier::new(3));

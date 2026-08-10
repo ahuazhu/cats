@@ -19,13 +19,14 @@ use cats_metadata_store_postgres::PostgresVolumeDataAuthority;
 use cats_object_store_file::FileBlobStore;
 use cats_storage::authority::{
     project_volume_record, LastVolumeTransition, UnixMillis, VolumeAdminState, VolumeDataAuthority,
-    VolumeDurability, VolumeRecord,
+    VolumeDurability, VolumeOwnerBinding, VolumeRecord,
 };
 use cats_storage::BlobStore;
 use postgres::{Client, NoTls};
 
 const VOLUME_ID: &str = "vol_root_provision";
 const ATTACHMENT_ID: &str = "att_root_provision";
+const NODE_ID: &str = "node-root-provision";
 const VOLUME_SIZE: u64 = 2 * CHUNK_SIZE as u64;
 const TRANSITION: &str = "13579bdf2468ace013579bdf2468ace0";
 
@@ -167,6 +168,13 @@ fn insert_volume(client: &mut Client, record: &VolumeRecord) {
     let transition_duration = projection
         .transition_lease_duration_ms
         .map(|value| i64::try_from(value).unwrap());
+    let owner_binding = VolumeOwnerBinding {
+        volume_id: record.volume_id.clone(),
+        owner_node_id: Id::new(NODE_ID).unwrap(),
+        attachment_id: record.lease_owner.clone().unwrap(),
+        attachment_epoch: record.lease_epoch,
+    };
+    let owner_binding_json = serde_json::to_string(&owner_binding).unwrap();
     client
         .execute(
             "INSERT INTO volume_records (
@@ -175,10 +183,11 @@ fn insert_volume(client: &mut Client, record: &VolumeRecord) {
                 lease_owner, lease_epoch, lease_expires_at,
                 last_transition_kind, last_transition_id,
                 transition_desired_revision, transition_placement_epoch,
-                transition_lease_duration_ms
+                transition_lease_duration_ms, owner_binding, owner_node_id
              ) VALUES (
                 $1, $2::TEXT::jsonb, $3, $4, $5, $6, $7, $8, $9,
-                $10, $11, $12, $13, $14, $15, $16, $17
+                $10, $11, $12, $13, $14, $15, $16, $17,
+                $18::TEXT::jsonb, $19
              )",
             &[
                 &projection.volume_id,
@@ -198,6 +207,8 @@ fn insert_volume(client: &mut Client, record: &VolumeRecord) {
                 &transition_revision,
                 &transition_placement,
                 &transition_duration,
+                &owner_binding_json,
+                &NODE_ID,
             ],
         )
         .unwrap();

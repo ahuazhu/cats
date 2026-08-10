@@ -345,6 +345,46 @@ fn verify_authority_catalog(transaction: &mut postgres::Transaction<'_>) -> Resu
             return Err(partial_catalog_object(index));
         }
     }
+    for (index, first_key, expression_key, predicate) in REQUIRED_VOLUME_OWNER_INDEXES {
+        let present: bool = transaction
+            .query_one(
+                "SELECT EXISTS (
+                    SELECT 1
+                      FROM pg_index i
+                      JOIN pg_class source ON source.oid=i.indrelid
+                      JOIN pg_namespace source_namespace
+                        ON source_namespace.oid=source.relnamespace
+                      JOIN pg_class index_relation
+                        ON index_relation.oid=i.indexrelid
+                      JOIN pg_am access_method
+                        ON access_method.oid=index_relation.relam
+                     WHERE source_namespace.nspname=current_schema()
+                       AND source.relname='volume_records'
+                       AND index_relation.relname=$1
+                       AND NOT i.indisunique AND i.indisvalid AND i.indisready
+                       AND i.indnkeyatts=2 AND i.indnatts=2
+                       AND i.indoption::TEXT='0 0'
+                       AND access_method.amname='btree'
+                       AND (($3 AND i.indexprs IS NOT NULL)
+                            OR (NOT $3 AND i.indexprs IS NULL))
+                       AND i.indpred IS NOT NULL
+                       AND pg_get_indexdef(i.indexrelid, 1, FALSE)=$2
+                       AND pg_get_indexdef(i.indexrelid, 2, FALSE)='volume_id'
+                       AND i.indcollation[1]='pg_catalog.\"C\"'::regcollation
+                       AND pg_get_expr(i.indpred, i.indrelid)=$4
+                 )",
+                &[index, first_key, expression_key, predicate],
+            )
+            .map_err(|error| {
+                internal(format!(
+                    "verify authority Volume owner-index catalog: {error:?}"
+                ))
+            })?
+            .get(0);
+        if !present {
+            return Err(partial_catalog_object(index));
+        }
+    }
     for (table, index, access_method, operator_class, expression) in REQUIRED_EXPRESSION_INDEXES {
         let present: bool = transaction
             .query_one(
@@ -599,6 +639,21 @@ const REQUIRED_ORDERED_PARTIAL_INDEXES: &[RequiredOrderedPartialIndex] = &[(
     "(kind = 'disposable_root_delete'::text)",
 )];
 
+const REQUIRED_VOLUME_OWNER_INDEXES: &[(&str, &str, bool, &str)] = &[
+    (
+        "volume_records_owner_node",
+        "owner_node_id",
+        false,
+        "(owner_node_id IS NOT NULL)",
+    ),
+    (
+        "volume_records_owner_binding_node",
+        "((owner_binding ->> 'owner_node_id'::text))",
+        true,
+        "(owner_binding IS NOT NULL)",
+    ),
+];
+
 // PostgreSQL `pg_trigger.tgtype` bits: ROW=1, BEFORE=2, DELETE=8,
 // UPDATE=16. Exact masks reject statement-level, AFTER, extra-event and
 // `UPDATE OF`/WHEN weakened variants even when their names/functions match.
@@ -697,7 +752,8 @@ const AUTHORITY_SCHEMA_PROBES: &[&str] = &[
             head_generation, head_root_hash, head_root_object_id, lease_owner,
             lease_epoch, lease_expires_at, last_transition_kind,
             last_transition_id, transition_desired_revision,
-            transition_placement_epoch, transition_lease_duration_ms
+            transition_placement_epoch, transition_lease_duration_ms,
+            owner_binding, owner_node_id
        FROM volume_records WHERE FALSE",
     "SELECT event_id, record, provider, immutable_host_id, node_id,
             expected_node_boot_id, expected_agent_session_epoch,
@@ -1052,6 +1108,8 @@ CREATE TABLE IF NOT EXISTS volume_records (
     transition_desired_revision BIGINT,
     transition_placement_epoch BIGINT,
     transition_lease_duration_ms BIGINT,
+    owner_binding JSONB,
+    owner_node_id TEXT,
     CHECK (
         (admin_state = 'active' AND delete_id IS NULL) OR
         (admin_state = 'deleting' AND delete_id IS NOT NULL)
@@ -1059,6 +1117,18 @@ CREATE TABLE IF NOT EXISTS volume_records (
     CHECK ((lease_owner IS NULL) = (lease_expires_at IS NULL)),
     CHECK (lease_owner IS NULL OR admin_state = 'active'),
     CHECK (lease_owner IS NULL OR (lease_epoch > 0 AND lease_expires_at > 0)),
+    CONSTRAINT volume_records_owner_present_check
+        CHECK ((lease_owner IS NULL) = (owner_binding IS NULL)),
+    CONSTRAINT volume_records_owner_node_present_check
+        CHECK ((owner_binding IS NULL) = (owner_node_id IS NULL)),
+    CONSTRAINT volume_records_owner_binding_check CHECK (
+        owner_binding IS NULL OR owner_binding = jsonb_build_object(
+            'volume_id', volume_id,
+            'owner_node_id', owner_node_id,
+            'attachment_id', lease_owner,
+            'attachment_epoch', lease_epoch
+        )
+    ),
     CHECK (admin_state <> 'deleting' OR (lease_owner IS NULL AND lease_epoch > 0)),
     CHECK (
         (head_generation = 0 AND head_root_hash IS NULL AND head_root_object_id IS NULL) OR
@@ -1081,6 +1151,12 @@ CREATE TABLE IF NOT EXISTS volume_records (
             AND transition_lease_duration_ms IS NULL)
     )
 );
+CREATE INDEX IF NOT EXISTS volume_records_owner_node
+ON volume_records(owner_node_id, volume_id COLLATE \"C\")
+WHERE owner_node_id IS NOT NULL;
+CREATE INDEX IF NOT EXISTS volume_records_owner_binding_node
+ON volume_records((owner_binding->>'owner_node_id'), volume_id COLLATE \"C\")
+WHERE owner_binding IS NOT NULL;
 CREATE TABLE IF NOT EXISTS host_fence_events (
     event_id TEXT PRIMARY KEY,
     record JSONB NOT NULL CHECK (jsonb_typeof(record) = 'object'),

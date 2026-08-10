@@ -25,7 +25,41 @@ const MAX_INTEGER: u64 = i64::MAX as u64;
 /// Sharing this release number lets the adapter reject an unstamped or
 /// incompatible authority shape without importing the product store or
 /// duplicating its schema.
-pub const AUTHORITY_RELEASE_SCHEMA_VERSION: i64 = 10;
+pub const AUTHORITY_RELEASE_SCHEMA_VERSION: i64 = 11;
+
+/// Maximum number of currently-owned Volume authority rows one Node snapshot
+/// may return. Runtime Reconciliation admits at most 1,024 Cats with at most
+/// 64 Volume intents each; one extra row is queried by the PostgreSQL adapter
+/// to make overflow a closed error instead of a truncated inventory.
+pub const MAX_NODE_OWNED_VOLUMES: usize = 65_536;
+
+/// Canonical Node attribution for one currently-owned Volume.
+///
+/// This is deliberately separate from the block-data-plane `VolumeRecord`
+/// wire contract. Control writes it in the same transaction as the owner and
+/// epoch transition, while Runtime inventory uses it to find authority rows
+/// left behind after a Desired row is superseded or removed.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct VolumeOwnerBinding {
+    pub volume_id: Id,
+    pub owner_node_id: Id,
+    pub attachment_id: Id,
+    pub attachment_epoch: FenceEpoch,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NodeOwnedVolume {
+    pub binding: VolumeOwnerBinding,
+    pub volume: VolumeRecord,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NodeOwnedVolumeSnapshot {
+    pub node_id: Id,
+    pub read_at_unix_ms: UnixMillis,
+    pub volumes: Vec<NodeOwnedVolume>,
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RenewLeaseRequest {
@@ -166,6 +200,33 @@ pub trait VolumeDataAuthority: Send + Sync {
     fn renew_lease(&self, request: &RenewLeaseRequest) -> Result<RenewLeaseResult>;
     /// Replaces only the complete predecessor head under the named grant.
     fn compare_and_swap_head(&self, request: &VolumeHeadCasRequest) -> Result<VolumeHeadCasResult>;
+}
+
+/// Provider-neutral, read-only authority snapshot used only by the signed
+/// Runtime inventory scanner. It is intentionally not part of blockd's
+/// `VolumeDataAuthority`: a data plane can inspect only its exact grant and
+/// must never enumerate fleet ownership.
+pub trait RuntimeVolumeInventoryAuthority: Send + Sync {
+    /// Returns one repeatable-read, bounded, complete set of Volume rows whose
+    /// canonical owner binding names `node_id`. Projection/canonical drift,
+    /// duplicate rows, overflow, or backend uncertainty are closed errors.
+    fn load_node_owned_volumes(&self, node_id: &Id) -> Result<NodeOwnedVolumeSnapshot>;
+}
+
+pub fn validate_volume_owner_binding(
+    binding: &VolumeOwnerBinding,
+    volume: &VolumeRecord,
+) -> Result<()> {
+    validate_volume_record(volume)?;
+    if binding.volume_id != volume.volume_id
+        || volume.lease_owner.as_ref() != Some(&binding.attachment_id)
+        || volume.lease_epoch != binding.attachment_epoch
+        || volume.lease_expires_at.is_none()
+        || !matches!(volume.admin_state, VolumeAdminState::Active)
+    {
+        return Err(AuthorityError::BackendUnknown);
+    }
+    Ok(())
 }
 
 /// Exact scalar projection stored beside the canonical JSON VolumeRecord.
