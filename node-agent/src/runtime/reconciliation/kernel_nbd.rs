@@ -1879,14 +1879,9 @@ impl KernelNbdAttachEffect {
         &self,
         context: &RuntimeDesiredEffectContext,
         desired: &cats_api::runtime_reconciliation::DesiredRuntimeSpec,
-        admission: &KernelNbdPoolAdmission,
     ) -> Result<Option<RuntimeDesiredEffectOutcome>> {
         context.check_active()?;
         let accepted = context.accepted_full()?;
-        anyhow::ensure!(
-            admission.matches_observation(accepted.observation()),
-            "kernel-NBD pool admission is not bound to the accepted full observation"
-        );
         let mut runtimes = accepted
             .observation()
             .runtimes
@@ -1906,6 +1901,11 @@ impl KernelNbdAttachEffect {
         else {
             return Ok(None);
         };
+        let admission = context.kernel_nbd_pool()?;
+        anyhow::ensure!(
+            admission.matches_observation(accepted.observation()),
+            "kernel-NBD pool admission is not bound to the accepted full observation"
+        );
         if !prepare_device_base_admission_is_exact(accepted, desired, runtime) {
             return Ok(Some(RuntimeDesiredEffectOutcome::Stop(
                 RuntimeDesiredEffectStopReason::LocalContract,

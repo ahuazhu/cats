@@ -280,9 +280,7 @@ impl RuntimeDesiredEffect for SignedRunningEffect {
             }
         }
         if let Some(kernel_nbd_attach) = &self.kernel_nbd_attach {
-            if let Some(outcome) =
-                kernel_nbd_attach.try_apply(&context, desired, context.kernel_nbd_pool()?)?
-            {
+            if let Some(outcome) = kernel_nbd_attach.try_apply(&context, desired)? {
                 return Ok(outcome);
             }
         }

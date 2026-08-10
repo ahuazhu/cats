@@ -6412,11 +6412,7 @@ mod tests {
 
             assert_eq!(
                 effect
-                    .try_apply(
-                        &context,
-                        &fixture.acquired.desired,
-                        context.kernel_nbd_pool().unwrap(),
-                    )
+                    .try_apply(&context, &fixture.acquired.desired)
                     .unwrap(),
                 Some(RuntimeDesiredEffectOutcome::RefreshInventory)
             );
