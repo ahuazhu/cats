@@ -28,6 +28,7 @@ mod inventory;
 )]
 mod kernel_nbd;
 mod normal_acquire;
+mod prepare_device_retirement;
 mod root_provision;
 mod serving_handoff;
 mod serving_handoff_effect;
@@ -73,8 +74,8 @@ pub(crate) use clean_slate_probes::{
     clean_slate_scanner_with_volume_authority_for_test, TestCleanSlateProbeConfig,
 };
 pub(crate) use clean_slate_probes::{
-    installed_clean_slate_scanner, installed_root_process_global_port,
-    installed_root_process_retirement_port, InstalledCleanSlateProbeConfig,
+    installed_clean_slate_scanner, installed_root_process_effect_ports,
+    InstalledCleanSlateProbeConfig,
 };
 pub use gate_planner::{
     applied_desired_evidence, AppliedDesiredError, GateReconcileError, GateSequencer,

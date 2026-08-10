@@ -33,6 +33,7 @@ use super::authorized_blockd::{
     RootProvisionStopReceipt, StopReceiptPublication, StopReceiptSettlement,
 };
 use super::clean_slate_probes::CHECKPOINT_NAMESPACE;
+use super::prepare_device_retirement::PrepareDeviceTargetRetirementEffect;
 use super::root_provision_process::{
     inspect_exact_root_provision_process, prove_exact_root_provision_process_absence,
     RootProvisionProcessGlobalPort, RootProvisionRetirementAdmission,
@@ -121,15 +122,17 @@ pub(crate) struct SignedRootProvisionEffect {
     before_stop_receipt_publish: Option<BeforeStopReceiptPublishHook>,
 }
 
-/// Production dispatcher for the currently implemented Running prefix. A
-/// current provision checkpoint is exclusively owned by `provision`; every
-/// other state stays with the acquire/stale planner. The two effects are never
-/// invoked for the same accepted step.
+/// Production dispatcher for the currently implemented Running prefix.  The
+/// old target-control retirement stage runs first so an already-complete
+/// absence can fall through, while a submitted stop consumes this full scan.
+/// A current provision checkpoint remains exclusively owned by `provision`;
+/// every earlier state stays with the acquire/stale planner.
 pub(crate) struct SignedRunningEffect {
     acquire: SignedRunningAcquireEffect,
     provision: SignedRootProvisionEffect,
     handoff: ServingHandoffEffect,
     prepare_device: ServingPrepareDeviceEffect,
+    prepare_device_retirement: Option<PrepareDeviceTargetRetirementEffect>,
 }
 
 impl SignedRunningEffect {
@@ -151,6 +154,11 @@ impl SignedRunningEffect {
         let target_process = Arc::new(PlatformSystemdRootProvisionProcessPort::platform(
             systemd.clone(),
         ));
+        let prepare_device_retirement = PrepareDeviceTargetRetirementEffect::platform(
+            Arc::clone(&authority),
+            Arc::clone(&global_process),
+            systemd.clone(),
+        );
         Ok(Self {
             acquire,
             provision: SignedRootProvisionEffect::platform(
@@ -167,6 +175,7 @@ impl SignedRunningEffect {
                 executable_path.clone(),
             )?,
             prepare_device: ServingPrepareDeviceEffect::new(prepare_frontend, executable_path)?,
+            prepare_device_retirement: Some(prepare_device_retirement),
         })
     }
 }
@@ -177,6 +186,11 @@ impl RuntimeDesiredEffect for SignedRunningEffect {
         context: RuntimeDesiredEffectContext,
         desired: &DesiredRuntimeSpec,
     ) -> anyhow::Result<RuntimeDesiredEffectOutcome> {
+        if let Some(prepare_device_retirement) = &self.prepare_device_retirement {
+            if let Some(outcome) = prepare_device_retirement.try_apply(&context, desired)? {
+                return Ok(outcome);
+            }
+        }
         match self.handoff.try_apply(&context, desired)? {
             ServingHandoffEffectProgress::NotApplicable => {}
             ServingHandoffEffectProgress::RefreshInventory => {
@@ -2120,6 +2134,7 @@ mod tests {
                 provision: self.effect_with_ports(process, retirement, request),
                 handoff,
                 prepare_device,
+                prepare_device_retirement: None,
             }
         }
     }

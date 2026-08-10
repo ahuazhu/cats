@@ -27,10 +27,10 @@ use cats_storage::BlobStore;
 use crate::agent_registration::AgentRegistrationConfig;
 use crate::ch::{BlockPath, ChConfig};
 use crate::runtime::reconciliation::{
-    installed_clean_slate_scanner, installed_root_process_global_port,
-    installed_root_process_retirement_port, AuthorizedBlockdLaunchConfig,
-    ControlSignedNormalAcquireClient, InstalledCleanSlateProbeConfig, RootProvisionSystemdConfig,
-    RuntimeVolumeTransitionHttpClient, ServingPrepareFrontend, SignedRunningAcquireEffect,
+    installed_clean_slate_scanner, installed_root_process_effect_ports,
+    AuthorizedBlockdLaunchConfig, ControlSignedNormalAcquireClient, InstalledCleanSlateProbeConfig,
+    RootProvisionSystemdConfig, RuntimeVolumeTransitionHttpClient, ServingPrepareFrontend,
+    SignedRunningAcquireEffect,
     SignedRunningEffect, SignedRunningPublicationRecovery,
 };
 use crate::runtime_spine::{
@@ -225,12 +225,9 @@ async fn spawn_signed_runtime_cutover_with_scanner(
         blob_store: Arc::clone(&config.blob_store),
         root_provision_systemd,
     };
-    let effect_root_process_retirement =
-        installed_root_process_retirement_port(installed_probe_config.clone())
-            .context("compose sealed root-process retirement inventory")?;
-    let effect_root_process_global =
-        installed_root_process_global_port(installed_probe_config.clone())
-            .context("compose sealed Node-global root-process inventory")?;
+    let effect_root_process_ports =
+        installed_root_process_effect_ports(installed_probe_config.clone())
+            .context("compose sealed root-process effect inventory")?;
     let effect_prepare_frontend = match config.ch_config.block_path {
         BlockPath::KernelNbd => ServingPrepareFrontend::kernel_nbd(
             config.agent_registration.runtime_state_directory(),
@@ -310,14 +307,14 @@ async fn spawn_signed_runtime_cutover_with_scanner(
             Arc::clone(&effect_volume_authority),
             effect_blob_store,
             effect_root_provision_systemd,
-            Arc::clone(&effect_root_process_retirement),
-            effect_root_process_global,
+            Arc::clone(&effect_root_process_ports.retirement),
+            Arc::clone(&effect_root_process_ports.global),
             effect_prepare_frontend,
         )
         .context("compose signed Running root provision prefix")?;
         let recovery = SignedRunningPublicationRecovery::with_root_process_retirement(
             Arc::clone(&effect_volume_authority),
-            effect_root_process_retirement,
+            effect_root_process_ports.retirement,
         );
         RuntimeSpineRunner::new_with_recovery_and_desired_effects(
             effect_state_directory,

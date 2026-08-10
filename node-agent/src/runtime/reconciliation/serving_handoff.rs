@@ -3961,11 +3961,11 @@ mod tests {
         AsciiText, AssignedKind, AssignedPlacement, CheckpointEvidence, Condition, DiskKind,
         Generation, GuestDeviceIdentity, GuestTransportEvidence, Ipv4Address, IsolatedIpv4Kind,
         LifecycleAdmission, MacAddress, NetworkConfig, NodeBootId, NodeObservation,
-        NormalAcquireRequest, NormalAcquireResult, ObservedRuntimeStatus, PrepareDeviceFrontend,
-        ProgressingReason, RequireIdleCheckpoint, RuntimeCheckpoint, RuntimeConfig, RuntimeTarget,
-        RuntimeTransition, Sequence, ServingAuthorityProvenance, ServingBlockdIdentity, UnixMillis,
-        VolumeAccess, VolumeAcquire, VolumeAdminState, VolumeAuthorityEvidence, VolumeDisposition,
-        VolumeIntent, WarmSnapshotEvidence,
+        NormalAcquireRequest, NormalAcquireResult, ObservedRuntimeStatus, OwnershipTokenEvidence,
+        PrepareDeviceFrontend, ProgressingReason, RequireIdleCheckpoint, RuntimeCheckpoint,
+        RuntimeConfig, RuntimeTarget, RuntimeTransition, Sequence, ServingAuthorityProvenance,
+        ServingBlockdIdentity, UnixMillis, VolumeAccess, VolumeAcquire, VolumeAdminState,
+        VolumeAuthorityEvidence, VolumeDisposition, VolumeIntent, WarmSnapshotEvidence,
     };
     use cats_storage::authority::{
         AuthorityError, LastVolumeTransition, RenewLeaseRequest, RenewLeaseResult,
@@ -3976,12 +3976,14 @@ mod tests {
     };
 
     use super::*;
+    use crate::runtime::reconciliation::prepare_device_retirement::PrepareDeviceTargetRetirementEffect;
     use crate::runtime::reconciliation::root_provision_process::{
         global_sealed as root_process_global_sealed,
-        retirement_sealed as root_process_retirement_sealed,
-        target_start_sealed as target_process_start_sealed, CheckpointedTargetControlProcess,
-        RootProvisionProcessGlobalPort, RootProvisionProcessRetirementPort,
-        RootProvisionProcessStart, TargetControlProcessPort,
+        retirement_sealed as root_process_retirement_sealed, sealed as root_process_sealed,
+        target_start_sealed as target_process_start_sealed, CheckpointedRootProvisionProcess,
+        CheckpointedTargetControlProcess, RootProvisionProcessGlobalPort, RootProvisionProcessPort,
+        RootProvisionProcessRetirementPort, RootProvisionProcessStart, RootProvisionProcessStop,
+        TargetControlProcessPort,
     };
     use crate::runtime::reconciliation::serving_handoff_effect::{
         ServingHandoffEffect, ServingHandoffEffectProgress, ServingPrepareDeviceEffect,
@@ -3993,7 +3995,8 @@ mod tests {
         RootProvisionProcessInspection,
     };
     use crate::runtime_spine::{
-        RuntimeDesiredEffectAdmission, RuntimeDesiredEffectContext, RuntimePhysicalReadContext,
+        RuntimeDesiredEffectAdmission, RuntimeDesiredEffectContext, RuntimeDesiredEffectOutcome,
+        RuntimeDesiredEffectStopReason, RuntimePhysicalReadContext,
     };
 
     #[derive(Default)]
@@ -4138,6 +4141,120 @@ mod tests {
             context: &dyn RuntimePhysicalReadContext,
         ) -> Result<RootProvisionProcessInspection> {
             self.inspect_one(context)
+        }
+    }
+
+    struct RetirementEffectGlobalPort {
+        inspections: Mutex<VecDeque<RootProvisionProcessInspection>>,
+        calls: AtomicUsize,
+        after_sweep: Mutex<Option<TestMutation>>,
+    }
+
+    impl RetirementEffectGlobalPort {
+        fn new(inspections: impl IntoIterator<Item = RootProvisionProcessInspection>) -> Self {
+            Self {
+                inspections: Mutex::new(inspections.into_iter().collect()),
+                calls: AtomicUsize::new(0),
+                after_sweep: Mutex::new(None),
+            }
+        }
+
+        fn with_after_sweep(
+            inspection: RootProvisionProcessInspection,
+            after_sweep: impl FnOnce() + Send + 'static,
+        ) -> Self {
+            Self {
+                inspections: Mutex::new([inspection].into()),
+                calls: AtomicUsize::new(0),
+                after_sweep: Mutex::new(Some(Box::new(after_sweep))),
+            }
+        }
+    }
+
+    impl root_process_global_sealed::Sealed for RetirementEffectGlobalPort {}
+    impl root_process_retirement_sealed::Sealed for RetirementEffectGlobalPort {}
+
+    impl RootProvisionProcessRetirementPort for RetirementEffectGlobalPort {
+        fn inspect_after_node_global_sweep(
+            &self,
+            expected: &RootProvisionProcessExpectation,
+            context: &dyn RuntimePhysicalReadContext,
+        ) -> Result<RootProvisionProcessInspection> {
+            self.inspect_exact_or_absent_after_node_global_sweep(expected, context)
+        }
+    }
+
+    impl RootProvisionProcessGlobalPort for RetirementEffectGlobalPort {
+        fn inspect_exact_or_absent_after_node_global_sweep(
+            &self,
+            _expected: &RootProvisionProcessExpectation,
+            context: &dyn RuntimePhysicalReadContext,
+        ) -> Result<RootProvisionProcessInspection> {
+            context.check_active()?;
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            let inspection = self
+                .inspections
+                .lock()
+                .unwrap()
+                .pop_front()
+                .unwrap_or(RootProvisionProcessInspection::Unavailable);
+            if let Some(after_sweep) = self.after_sweep.lock().unwrap().take() {
+                after_sweep();
+            }
+            Ok(inspection)
+        }
+    }
+
+    struct RetirementEffectStopPort {
+        outcomes: Mutex<VecDeque<RootProvisionProcessStop>>,
+        stopped: Mutex<Vec<RootProvisionProcessEvidence>>,
+    }
+
+    impl RetirementEffectStopPort {
+        fn new(outcomes: impl IntoIterator<Item = RootProvisionProcessStop>) -> Self {
+            Self {
+                outcomes: Mutex::new(outcomes.into_iter().collect()),
+                stopped: Mutex::new(Vec::new()),
+            }
+        }
+
+        fn stopped(&self) -> Vec<RootProvisionProcessEvidence> {
+            self.stopped.lock().unwrap().clone()
+        }
+    }
+
+    impl root_process_sealed::Sealed for RetirementEffectStopPort {}
+
+    impl RootProvisionProcessPort for RetirementEffectStopPort {
+        fn inspect(
+            &self,
+            _expected: &RootProvisionProcessExpectation,
+            _context: &dyn RuntimePhysicalReadContext,
+        ) -> Result<RootProvisionProcessInspection> {
+            unreachable!("PrepareDevice retirement uses the Node-global sweep")
+        }
+
+        fn start_checkpointed(
+            &self,
+            _checkpointed: CheckpointedRootProvisionProcess<'_>,
+            _context: &RuntimeDesiredEffectContext,
+        ) -> Result<RootProvisionProcessStart> {
+            unreachable!("PrepareDevice retirement never starts a process")
+        }
+
+        fn stop_exact(
+            &self,
+            exact: ExactRootProvisionProcessProof,
+            context: &RuntimeDesiredEffectContext,
+        ) -> Result<RootProvisionProcessStop> {
+            context.check_active()?;
+            self.stopped.lock().unwrap().push(exact.evidence().clone());
+            Ok(self
+                .outcomes
+                .lock()
+                .unwrap()
+                .pop_front()
+                .unwrap_or(RootProvisionProcessStop::Unavailable))
         }
     }
 
@@ -4547,6 +4664,49 @@ mod tests {
         .unwrap();
         encode_runtime_checkpoint(&checkpoint).expect("PrepareDevice successor is canonical V1");
         checkpoint
+    }
+
+    fn advance_fixture_to_prepare_device(
+        fixture: &mut Fixture,
+    ) -> cats_api::runtime_reconciliation::ProcessEvidence {
+        let old_process = fixture
+            .exact_process_proof()
+            .unwrap()
+            .into_process_evidence();
+        let ready = fixture
+            .store()
+            .seal_serving_ready(
+                &fixture.stored_checkpoint,
+                &fixture.acquired,
+                &fixture.authority,
+                &fixture.exact_process_proof().unwrap(),
+            )
+            .unwrap();
+        let checkpoint_store = FileCheckpointStore::open(
+            &fixture.checkpoint_directory,
+            &fixture.acquired.desired.cat_id,
+        )
+        .unwrap();
+        let replaced = ready
+            .consume_for_prepare_device(&fixture.stored_checkpoint, |handoff| {
+                let successor = prepare_device_successor(fixture, handoff);
+                Ok(checkpoint_store.replace(&fixture.stored_checkpoint, &successor)?)
+            })
+            .unwrap();
+        fixture.stored_checkpoint = replaced;
+        old_process
+    }
+
+    fn prepare_device_retirement_effect(
+        fixture: &Fixture,
+        global: Arc<dyn RootProvisionProcessGlobalPort>,
+        process: Arc<dyn RootProvisionProcessPort>,
+    ) -> PrepareDeviceTargetRetirementEffect {
+        PrepareDeviceTargetRetirementEffect::for_test(
+            Arc::new(FixedEffectAuthority::new(fixture.authority.volume.clone())),
+            global,
+            process,
+        )
     }
 
     fn fixture() -> Fixture {
@@ -4971,6 +5131,335 @@ mod tests {
             current.checkpoint().step,
             ReconcileStep::PrepareDevice { .. }
         ));
+    }
+
+    #[test]
+    fn prepare_device_retirement_stops_only_the_current_exact_physical_incarnation() {
+        let mut fixture = fixture();
+        let accepted_process = advance_fixture_to_prepare_device(&mut fixture);
+        let checkpoint_digest = fixture.stored_checkpoint.content_digest().clone();
+        let target_inode = std::fs::metadata(fixture.target_path()).unwrap().ino();
+        let record_inode = std::fs::metadata(fixture.record_path()).unwrap().ino();
+        let global = Arc::new(RetirementEffectGlobalPort::new([
+            RootProvisionProcessInspection::Exact(Box::new(fixture.process.clone())),
+        ]));
+        let process = Arc::new(RetirementEffectStopPort::new([
+            RootProvisionProcessStop::Submitted,
+        ]));
+        let effect = prepare_device_retirement_effect(&fixture, global.clone(), process.clone());
+
+        assert_eq!(
+            effect
+                .try_apply(
+                    &effect_context_with_processes(&fixture, vec![accepted_process]),
+                    &fixture.acquired.desired,
+                )
+                .unwrap(),
+            Some(RuntimeDesiredEffectOutcome::RefreshInventory)
+        );
+        assert_eq!(global.calls.load(Ordering::SeqCst), 1);
+        assert_eq!(process.stopped(), vec![fixture.process.clone()]);
+        assert_eq!(
+            FileCheckpointStore::open(
+                &fixture.checkpoint_directory,
+                &fixture.acquired.desired.cat_id,
+            )
+            .unwrap()
+            .load()
+            .unwrap()
+            .unwrap()
+            .content_digest(),
+            &checkpoint_digest
+        );
+        assert_eq!(
+            std::fs::metadata(fixture.target_path()).unwrap().ino(),
+            target_inode
+        );
+        assert_eq!(
+            std::fs::metadata(fixture.record_path()).unwrap().ino(),
+            record_inode
+        );
+    }
+
+    #[test]
+    fn prepare_device_retirement_absent_falls_through_dispatcher_exactly_once() {
+        let mut fixture = fixture();
+        advance_fixture_to_prepare_device(&mut fixture);
+        let global = Arc::new(RetirementEffectGlobalPort::new([
+            RootProvisionProcessInspection::Absent,
+        ]));
+        let process = Arc::new(RetirementEffectStopPort::new([]));
+        let effect = prepare_device_retirement_effect(&fixture, global.clone(), process.clone());
+        let mut downstream_dispatches = 0;
+
+        match effect
+            .try_apply(&absent_effect_context(&fixture), &fixture.acquired.desired)
+            .unwrap()
+        {
+            None => downstream_dispatches += 1,
+            Some(outcome) => panic!("completed retirement intercepted dispatcher: {outcome:?}"),
+        }
+
+        assert_eq!(downstream_dispatches, 1);
+        assert_eq!(global.calls.load(Ordering::SeqCst), 1);
+        assert!(process.stopped().is_empty());
+    }
+
+    #[test]
+    fn prepare_device_retirement_fails_closed_for_foreign_and_duplicate_processes() {
+        for inspection in [
+            {
+                let mut foreign = fixture().process;
+                foreign.ownership_token = random('9');
+                foreign.handshake.process_identity_token = random('9');
+                RootProvisionProcessInspection::Exact(Box::new(foreign))
+            },
+            RootProvisionProcessInspection::Conflict(
+                RootProvisionProcessConflict::DuplicateIdentity,
+            ),
+        ] {
+            let mut fixture = fixture();
+            let accepted_process = advance_fixture_to_prepare_device(&mut fixture);
+            let global = Arc::new(RetirementEffectGlobalPort::new([inspection]));
+            let process = Arc::new(RetirementEffectStopPort::new([]));
+            let effect =
+                prepare_device_retirement_effect(&fixture, global.clone(), process.clone());
+
+            assert_eq!(
+                effect
+                    .try_apply(
+                        &effect_context_with_processes(&fixture, vec![accepted_process]),
+                        &fixture.acquired.desired,
+                    )
+                    .unwrap(),
+                Some(RuntimeDesiredEffectOutcome::Stop(
+                    RuntimeDesiredEffectStopReason::LocalContract,
+                ))
+            );
+            assert_eq!(global.calls.load(Ordering::SeqCst), 1);
+            assert!(process.stopped().is_empty());
+        }
+    }
+
+    #[test]
+    fn prepare_device_retirement_requires_exact_accepted_physical_projection() {
+        for field in ["pid", "start", "unit", "socket", "token"] {
+            let mut fixture = fixture();
+            let mut accepted_process = advance_fixture_to_prepare_device(&mut fixture);
+            match field {
+                "pid" => accepted_process.process_id += 1,
+                "start" => {
+                    accepted_process.process_start_time_ticks =
+                        WireU64::new(accepted_process.process_start_time_ticks.get() + 1).unwrap();
+                }
+                "unit" => accepted_process.scope_id = id("cats-root-foreign.service"),
+                "socket" => {
+                    accepted_process.control_socket_path = host("/run/cats/foreign.sock");
+                }
+                "token" => {
+                    accepted_process.ownership_token = OwnershipTokenEvidence::Valid {
+                        ownership_token: random('9'),
+                    };
+                }
+                _ => unreachable!(),
+            }
+            let global = Arc::new(RetirementEffectGlobalPort::new([
+                RootProvisionProcessInspection::Exact(Box::new(fixture.process.clone())),
+            ]));
+            let process = Arc::new(RetirementEffectStopPort::new([]));
+            let effect =
+                prepare_device_retirement_effect(&fixture, global.clone(), process.clone());
+
+            assert_eq!(
+                effect
+                    .try_apply(
+                        &effect_context_with_processes(&fixture, vec![accepted_process]),
+                        &fixture.acquired.desired,
+                    )
+                    .unwrap(),
+                Some(RuntimeDesiredEffectOutcome::Stop(
+                    RuntimeDesiredEffectStopReason::LocalContract,
+                )),
+                "accepted {field} mismatch was not rejected",
+            );
+            assert_eq!(
+                global.calls.load(Ordering::SeqCst),
+                usize::from(matches!(field, "pid" | "start")),
+            );
+            assert!(process.stopped().is_empty());
+        }
+    }
+
+    #[test]
+    fn prepare_device_retirement_rechecks_fresh_authority_before_stop() {
+        let mut fixture = fixture();
+        let accepted_process = advance_fixture_to_prepare_device(&mut fixture);
+        let authority = Arc::new(FixedEffectAuthority::new(fixture.authority.volume.clone()));
+        let drifted_authority = Arc::clone(&authority);
+        let global = Arc::new(RetirementEffectGlobalPort::with_after_sweep(
+            RootProvisionProcessInspection::Exact(Box::new(fixture.process.clone())),
+            move || {
+                drifted_authority.record.lock().unwrap().lease_owner = Some(id("att_foreign"));
+            },
+        ));
+        let process = Arc::new(RetirementEffectStopPort::new([]));
+        let effect =
+            PrepareDeviceTargetRetirementEffect::for_test(authority, global, process.clone());
+
+        assert_eq!(
+            effect
+                .try_apply(
+                    &effect_context_with_processes(&fixture, vec![accepted_process]),
+                    &fixture.acquired.desired,
+                )
+                .unwrap(),
+            Some(RuntimeDesiredEffectOutcome::Stop(
+                RuntimeDesiredEffectStopReason::LocalContract,
+            ))
+        );
+        assert!(process.stopped().is_empty());
+    }
+
+    #[test]
+    fn prepare_device_retirement_rejects_late_process_after_accepted_absence() {
+        let mut fixture = fixture();
+        advance_fixture_to_prepare_device(&mut fixture);
+        let global = Arc::new(RetirementEffectGlobalPort::new([
+            RootProvisionProcessInspection::Exact(Box::new(fixture.process.clone())),
+        ]));
+        let process = Arc::new(RetirementEffectStopPort::new([]));
+        let effect = prepare_device_retirement_effect(&fixture, global.clone(), process.clone());
+
+        assert_eq!(
+            effect
+                .try_apply(&absent_effect_context(&fixture), &fixture.acquired.desired)
+                .unwrap(),
+            Some(RuntimeDesiredEffectOutcome::Stop(
+                RuntimeDesiredEffectStopReason::LocalContract,
+            ))
+        );
+        assert_eq!(global.calls.load(Ordering::SeqCst), 1);
+        assert!(process.stopped().is_empty());
+    }
+
+    #[test]
+    fn prepare_device_retirement_rejects_record_and_target_aba_before_stop() {
+        for mutate_record in [true, false] {
+            let mut fixture = fixture();
+            let accepted_process = advance_fixture_to_prepare_device(&mut fixture);
+            let artifact_path = if mutate_record {
+                fixture.record_path()
+            } else {
+                fixture.target_path()
+            };
+            let replaced_path = artifact_path.with_file_name(format!(
+                "{}.aba-old",
+                artifact_path.file_name().unwrap().to_str().unwrap()
+            ));
+            let artifact_bytes = std::fs::read(&artifact_path).unwrap();
+            let global = Arc::new(RetirementEffectGlobalPort::with_after_sweep(
+                RootProvisionProcessInspection::Exact(Box::new(fixture.process.clone())),
+                move || {
+                    std::fs::rename(&artifact_path, &replaced_path).unwrap();
+                    std::fs::write(&artifact_path, artifact_bytes).unwrap();
+                },
+            ));
+            let process = Arc::new(RetirementEffectStopPort::new([]));
+            let effect = prepare_device_retirement_effect(&fixture, global, process.clone());
+
+            assert_eq!(
+                effect
+                    .try_apply(
+                        &effect_context_with_processes(&fixture, vec![accepted_process]),
+                        &fixture.acquired.desired,
+                    )
+                    .unwrap(),
+                Some(RuntimeDesiredEffectOutcome::Stop(
+                    RuntimeDesiredEffectStopReason::LocalContract,
+                ))
+            );
+            assert!(process.stopped().is_empty());
+        }
+    }
+
+    #[test]
+    fn prepare_device_retirement_cancellation_before_submit_never_stops() {
+        let mut fixture = fixture();
+        let accepted_process = advance_fixture_to_prepare_device(&mut fixture);
+        let context = effect_context_with_processes(&fixture, vec![accepted_process]);
+        let canceller = context.clone();
+        let global = Arc::new(RetirementEffectGlobalPort::with_after_sweep(
+            RootProvisionProcessInspection::Exact(Box::new(fixture.process.clone())),
+            move || canceller.cancel_for_test(),
+        ));
+        let process = Arc::new(RetirementEffectStopPort::new([]));
+        let effect = prepare_device_retirement_effect(&fixture, global, process.clone());
+
+        assert!(effect
+            .try_apply(&context, &fixture.acquired.desired)
+            .is_err());
+        assert!(process.stopped().is_empty());
+    }
+
+    #[test]
+    fn prepare_device_retirement_response_loss_converges_to_absent_without_second_stop() {
+        let mut fixture = fixture();
+        let accepted_process = advance_fixture_to_prepare_device(&mut fixture);
+        let global = Arc::new(RetirementEffectGlobalPort::new([
+            RootProvisionProcessInspection::Exact(Box::new(fixture.process.clone())),
+            RootProvisionProcessInspection::Absent,
+        ]));
+        let process = Arc::new(RetirementEffectStopPort::new([
+            RootProvisionProcessStop::Unavailable,
+        ]));
+        let effect = prepare_device_retirement_effect(&fixture, global.clone(), process.clone());
+
+        assert_eq!(
+            effect
+                .try_apply(
+                    &effect_context_with_processes(&fixture, vec![accepted_process]),
+                    &fixture.acquired.desired,
+                )
+                .unwrap(),
+            Some(RuntimeDesiredEffectOutcome::RefreshInventory)
+        );
+        assert_eq!(process.stopped().len(), 1);
+        assert_eq!(
+            effect
+                .try_apply(
+                    &successor_absent_effect_context(&fixture),
+                    &fixture.acquired.desired,
+                )
+                .unwrap(),
+            None
+        );
+        assert_eq!(process.stopped().len(), 1);
+        assert_eq!(global.calls.load(Ordering::SeqCst), 2);
+    }
+
+    #[test]
+    fn prepare_device_retirement_one_effect_refreshes_when_stop_reports_already_absent() {
+        let mut fixture = fixture();
+        let accepted_process = advance_fixture_to_prepare_device(&mut fixture);
+        let global = Arc::new(RetirementEffectGlobalPort::new([
+            RootProvisionProcessInspection::Exact(Box::new(fixture.process.clone())),
+        ]));
+        let process = Arc::new(RetirementEffectStopPort::new([
+            RootProvisionProcessStop::AlreadyAbsent,
+        ]));
+        let effect = prepare_device_retirement_effect(&fixture, global.clone(), process.clone());
+
+        assert_eq!(
+            effect
+                .try_apply(
+                    &effect_context_with_processes(&fixture, vec![accepted_process]),
+                    &fixture.acquired.desired,
+                )
+                .unwrap(),
+            Some(RuntimeDesiredEffectOutcome::RefreshInventory)
+        );
+        assert_eq!(global.calls.load(Ordering::SeqCst), 1);
+        assert_eq!(process.stopped(), vec![fixture.process.clone()]);
     }
 
     #[test]
