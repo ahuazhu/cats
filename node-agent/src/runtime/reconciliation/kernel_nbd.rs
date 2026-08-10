@@ -205,6 +205,7 @@ impl KernelNbdAttachRequest {
                 PrepareDeviceFrontend::KernelNbd {
                     listener_socket_path,
                     device_path,
+                    ..
                 },
             ..
         } = &checkpoint.step

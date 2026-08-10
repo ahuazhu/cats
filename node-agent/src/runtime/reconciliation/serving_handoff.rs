@@ -5725,6 +5725,7 @@ mod tests {
                         fixture.data_directory.display()
                     )),
                     device_path: host("/dev/nbd7"),
+                    direct: false,
                 };
                 fixture.stored_checkpoint = FileCheckpointStore::open(
                     &fixture.checkpoint_directory,
