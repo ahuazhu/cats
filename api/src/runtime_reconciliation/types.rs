@@ -1020,6 +1020,40 @@ pub struct RootServingHandoff {
     pub record: RootServingHandoffRecordIdentity,
 }
 
+/// Descriptor-stable identity of the exact authorized-serving artifact used
+/// when no root-provision process participates in this attachment.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct DirectAuthorizedAttachmentIdentity {
+    pub path: HostPath,
+    pub device: WireU64,
+    pub inode: WireU64,
+    pub length: WireU64,
+    pub content_sha256: Sha256Digest,
+}
+
+/// Closed reason why a direct authorized attachment may enter PrepareDevice.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DirectAuthorizedAttachmentPurpose {
+    ExistingRoot,
+    PersistentInitialized,
+    PersistentUninitialized,
+}
+
+/// Exact provenance for the serving authorization consumed by PrepareDevice.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+pub enum ServingAuthorityProvenance {
+    AfterRootProvision {
+        handoff: RootServingHandoff,
+    },
+    DirectAuthorizedAttachment {
+        authorization: DirectAuthorizedAttachmentIdentity,
+        purpose: DirectAuthorizedAttachmentPurpose,
+    },
+}
+
 /// Exact identity to checkpoint before starting the serving blockd process.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -1092,8 +1126,8 @@ pub enum ReconcileStep {
         /// be reused as the serving process identity token.
         ownership_token: RandomId128,
         /// Boxed only to keep the closed ReconcileStep/Condition enums bounded;
-        /// serde still emits the exact object field defined by the wire spec.
-        serving_handoff: Box<RootServingHandoff>,
+        /// serde still emits the exact tagged union defined by the wire spec.
+        serving_authority: Box<ServingAuthorityProvenance>,
         serving_process: ServingBlockdIdentity,
         frontend: PrepareDeviceFrontend,
     },

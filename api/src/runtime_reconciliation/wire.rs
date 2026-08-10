@@ -2592,6 +2592,45 @@ fn root_serving_handoff_schema() -> Schema {
     ])
 }
 
+fn direct_authorized_attachment_identity_schema() -> Schema {
+    object(vec![
+        field("path", string(StringRule::HostPath)),
+        field("device", wire_u64()),
+        field("inode", number(1, MAX_WIRE_INTEGER)),
+        field("length", number(1, MAX_WIRE_INTEGER)),
+        field("content_sha256", digest()),
+    ])
+}
+
+fn serving_authority_provenance_schema() -> Schema {
+    union(
+        "kind",
+        vec![
+            variant(
+                "after_root_provision",
+                vec![field("handoff", root_serving_handoff_schema())],
+            ),
+            variant(
+                "direct_authorized_attachment",
+                vec![
+                    field(
+                        "authorization",
+                        direct_authorized_attachment_identity_schema(),
+                    ),
+                    field(
+                        "purpose",
+                        closed(&[
+                            "existing_root",
+                            "persistent_initialized",
+                            "persistent_uninitialized",
+                        ]),
+                    ),
+                ],
+            ),
+        ],
+    )
+}
+
 fn serving_blockd_identity_schema() -> Schema {
     object(vec![
         field("scope_id", id()),
@@ -2672,7 +2711,7 @@ fn reconcile_step_schema() -> Schema {
                     field("durability", closed(&["strict", "relaxed"])),
                     field("guest_device", guest_device_schema()),
                     field("ownership_token", random_id()),
-                    field("serving_handoff", root_serving_handoff_schema()),
+                    field("serving_authority", serving_authority_provenance_schema()),
                     field("serving_process", serving_blockd_identity_schema()),
                     field("frontend", prepare_device_frontend_schema()),
                 ],
@@ -7602,14 +7641,29 @@ fn collect_reconcile_step_cross(
         ReconcileStep::PrepareDevice {
             expected_head,
             ownership_token,
-            serving_handoff,
+            serving_authority,
             serving_process,
             frontend,
             ..
         } => {
             let expected_head_path = child(path, "expected_head");
             collect_remote_head_cross(expected_head, &expected_head_path, output);
-            if expected_head.generation.get() == 0 {
+            let (authorization_path, requires_blank_head) = match serving_authority.as_ref() {
+                ServingAuthorityProvenance::AfterRootProvision { handoff } => {
+                    (&handoff.record.path, false)
+                }
+                ServingAuthorityProvenance::DirectAuthorizedAttachment {
+                    authorization,
+                    purpose,
+                } => (
+                    &authorization.path,
+                    matches!(
+                        purpose,
+                        DirectAuthorizedAttachmentPurpose::PersistentUninitialized
+                    ),
+                ),
+            };
+            if (expected_head.generation.get() == 0) != requires_blank_head {
                 output.push(Candidate::at(
                     &expected_head_path,
                     MalformedProblem::InvalidValue,
@@ -7644,12 +7698,12 @@ fn collect_reconcile_step_cross(
                 || frontend_socket_path == &serving_process.control_socket_path
                 || frontend_socket_path == &serving_process.data_directory
                 || frontend_socket_path == &serving_process.executable_path
-                || frontend_socket_path == &serving_handoff.record.path
+                || frontend_socket_path == authorization_path
                 || device_path.is_some_and(|device_path| {
                     device_path == &serving_process.control_socket_path
                         || device_path == &serving_process.data_directory
                         || device_path == &serving_process.executable_path
-                        || device_path == &serving_handoff.record.path
+                        || device_path == authorization_path
                 })
             {
                 output.push(Candidate::at(
@@ -7664,12 +7718,12 @@ fn collect_reconcile_step_cross(
                     MalformedProblem::InvalidValue,
                 ));
             }
-            if serving_handoff.record.path == serving_process.control_socket_path
-                || serving_handoff.record.path == serving_process.data_directory
-                || serving_handoff.record.path == serving_process.executable_path
+            if authorization_path == &serving_process.control_socket_path
+                || authorization_path == &serving_process.data_directory
+                || authorization_path == &serving_process.executable_path
             {
                 output.push(Candidate::at(
-                    &child(path, "serving_handoff"),
+                    &child(path, "serving_authority"),
                     MalformedProblem::InvalidValue,
                 ));
             }

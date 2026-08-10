@@ -867,7 +867,7 @@ unit。Inspect、Verify 和 Quarantine 本身不产生外部 effect。
 | CloseGate | `close_gate {endpoint_id, old route_epoch}`及checkpoint top-level、所选old `route_gates`完整entry | 只compare-and-close该Endpoint；revision或完整binding不匹配零副作用，exact same binding Closed是close postcondition；成功/结果不明后确认Closed才fsync且旧epoch不重开。changed以更高epoch另走InstallGate；removed drain后以old Closed binding compare-remove cell entry，确认absent才删除checkpoint entry/推进step，不install |
 | AcquireVolume | normal时完整`VolumeAcquireRequest`（含positive lease duration），takeover时只有authorization id | 只通过Runtime Volume Transitions签名mutation route交给Control的单一PostgreSQL事务；authorization首次消费还要求Active event并原子写`AuthorizationConsumedReceipt`，结果不明只经同规格signed evidence read闭合；只有完整typed request或同authorization可adopt，或在 `R == L` 后精确release |
 | ProvisionRootImage | 完整`provision_root_image` step（包含不与provision transition混用的control-only blockd物理身份）、checkpoint top-level revision/spec/placement和该attachment的现有process/volume evidence | 只允许current non-Deleted Desired的唯一Root；step必须先fsync再spawn/adopt精确blockd实例，并以已持久transition ID发送显式typed request，把exact blank head CAS为纯确定计算的generation-1 target。响应不明只读权威head；closed retryable/conflict按§7.1处理。成功前不得创建Guest device或VMM |
-| PrepareDevice | 完整attachment lineage/origin/nonblank head/size/durability、sealed handoff record的descriptor-stable identity及predecessor checkpoint full digest、serving blockd scope/socket/data/executable/process token、closed frontend plan、Guest device及device-only ownership token | 仍在ProvisionRootImage内完成target-control restart及exact handoff后才checkpoint该step；每轮fresh full inventory后至多stop旧control、start serving blockd或create device之一。晚到资源只按各自独立token和完整物理证据adopt；`ObservedDevice`的path/socket本身不足以证明serving CLI/handshake或vhost queue参数 |
+| PrepareDevice | 完整attachment lineage/origin/head/size/durability、closed serving-authority provenance、serving blockd scope/socket/data/executable/process token、closed frontend plan、Guest device及device-only ownership token | 首次Root使用ProvisionRootImage完成的sealed handoff；已有Root及Persistent使用descriptor-stable exact direct authorization，绝不伪造Root handoff。每轮fresh full inventory后只执行该frontend定义的一个bounded effect；晚到资源只按各自独立token和完整物理证据adopt |
 | FormatFilesystem | attachment、device、filesystem UUID、initialization token、blank predecessor | Guest Agent 只按精确 predecessor 格式化；晚到结果按 UUID probe/adopt，冲突立即 quarantine |
 | DrainInitialization | attachment epoch、local/remote root generation | device flush 后只向精确 owner/epoch publish，直到 `R == L` |
 | CommitInitialized | token、blank predecessor exact RemoteHead、UUID、新exact RemoteHead | Control Store 精确 CAS；相同结果幂等，冲突 quarantine |
@@ -962,12 +962,19 @@ canonical content SHA-256；record内容绑定最后一个target-control `Runtim
 确认record及target-control实例仍逐字段匹配后，planner一次atomic checkpoint replace进入扩展后的
 `prepare_device`；同一轮不停止旧进程、不启动serving进程也不创建设备，下一轮必须重新full scan。
 
-`prepare_device`完整绑定attachment id/epoch、typed `AcquireOrigin`、nonblank exact head、immutable size及
-durability；还绑定上述record的descriptor-stable identity及predecessor full digest、预期serving blockd的
-scope/control socket/data directory/executable/process token、closed frontend plan、Guest device和device-only
-`ownership_token`。device token与serving process token必须不同，不能从一个token推导或复用另一个。kernel-NBD
-plan固定listener socket和device path；vhost-user-blk固定socket、`queues` 1..=64及`queue_size` 2..=32768的
-二次幂。control/frontend socket、kernel listener/device及record/process role path不得alias。
+`prepare_device`完整绑定attachment id/epoch、typed `AcquireOrigin`、exact head、immutable size及durability；
+`serving_authority`是closed provenance。`after_root_provision`只用于上述首次Root handoff，携record的
+descriptor-stable identity及predecessor full digest，并要求nonblank head。`direct_authorized_attachment`
+携exact authorized-serving artifact的absolute path、descriptor device/inode/length、canonical content SHA-256
+和closed purpose：`existing_root`、`persistent_initialized`或`persistent_uninitialized`。前两者要求nonblank
+head；只有`persistent_uninitialized`要求exact blank head，且planner还必须把purpose与current Desired中
+Control Store的初始化状态逐字段绑定。已有Root或Persistent不得制造、复制或消费Root handoff。
+
+step还绑定预期serving blockd的scope/control socket/data directory/executable/process token、closed frontend
+plan、Guest device和device-only `ownership_token`。device token与serving process token必须不同，不能从一个
+token推导或复用另一个。kernel-NBD plan固定listener socket和device path；vhost-user-blk固定socket、`queues`
+1..=64及`queue_size` 2..=32768的二次幂。control/frontend socket、kernel listener/device及authorization/
+process role path不得alias。
 
 每轮仍只执行一个physical effect：exact stop旧target-control、start serving blockd、或create/adopt Guest device。
 任一effect或响应不明后先发布/接受新full inventory，再由持久step判断exact present/absent；不同PID/start、
@@ -1275,7 +1282,7 @@ ReconcileStep =
     durability: "strict" | "relaxed",
     guest_device: GuestDeviceIdentity,
     ownership_token: RandomId128,
-    serving_handoff: RootServingHandoff,
+    serving_authority: ServingAuthorityProvenance,
     serving_process: ServingBlockdIdentity,
     frontend: PrepareDeviceFrontend
   }
@@ -1420,6 +1427,25 @@ RootServingHandoff {
   record: RootServingHandoffRecordIdentity
 }
 
+DirectAuthorizedAttachmentIdentity {
+  path: HostPath,
+  device: U64,
+  inode: integer 1..=9223372036854775807,
+  length: integer 1..=9223372036854775807,
+  content_sha256: Sha256Digest
+}
+
+ServingAuthorityProvenance =
+  {
+    kind: "after_root_provision",
+    handoff: RootServingHandoff
+  }
+| {
+    kind: "direct_authorized_attachment",
+    authorization: DirectAuthorizedAttachmentIdentity,
+    purpose: "existing_root" | "persistent_initialized" | "persistent_uninitialized"
+  }
+
 ServingBlockdIdentity {
   scope_id: Id,
   control_socket_path: HostPath,
@@ -1453,11 +1479,12 @@ PrepareDeviceFrontend =
 missing/corrupt或同token出现在多个实例上都不得自动cleanup。
 
 `prepare_device.ownership_token`只属于最终Guest device；它不得等于
-`serving_process.process_identity_token`。`expected_head`必须是完整nonblank `RemoteHead`；blank head、零
-attachment epoch、零inode、零size、空/仅path handoff proof、record/process/frontend path alias、kernel listener/device
-alias、vhost queue越界或非二次幂都在wire intrinsic validation阶段拒绝。handoff record内容与predecessor
-checkpoint、current Desired/placement及authority的逐字段关联仍是planner/scanner context validation，不能由
-wire decoder凭digest字符串猜测。
+`serving_process.process_identity_token`。`after_root_provision`、`existing_root`和`persistent_initialized`的
+`expected_head`必须是完整nonblank `RemoteHead`；只有`persistent_uninitialized`必须是exact blank head。零
+attachment epoch、零inode、零size、空/仅path authorization、authorization/process/frontend path alias、
+kernel listener/device alias、vhost queue越界或非二次幂都在wire intrinsic validation阶段拒绝。handoff record或
+direct authorization内容与checkpoint、current Desired/placement及authority的逐字段关联仍是planner/scanner
+context validation，不能由wire decoder凭digest字符串猜测。
 
 `CleanupRelease`持久化的`inventory_session`/epoch/read position必须逐字段等于用于
 规划该step的已接受`AdmissionInventoryAttestation`及其当前`SessionBinding`；
@@ -2413,7 +2440,7 @@ Rejoined；`host_destroyed`永不Rejoined，因此在没有tombstone、其他Hos
 | Root provision后checkpoint未推进或Agent restart | 新session full inventory后从持久step重算同一target；exact target推进，blank重试，其他结果fail closed，不依赖进程内bool或第二receipt |
 | Root provision与Desired变化 | effect前revision/spec/placement或Root image/size/attachment改变则零副作用replan；in-flight旧effect不能结算新revision。同volume/image/size且exact target可由新planner采用，attachment/placement另走Volume Authority；Deleted/移除走disposition，仍用同volume却改image/size才Quarantine |
 | Root provision顺序 | acquire后可有control-only blockd，但exact target确认前NBD/vhost-user device与VMM均不得出现；Persistent initialization不得产生或消费该step |
-| Root serving handoff/PrepareDevice wire | target-control exact handshake及sealed descriptor-stable record仍在ProvisionRootImage完成，下一atomic checkpoint才进入PrepareDevice；fixed vector逐byte绑定record identity、predecessor full digest、attachment/origin/head/size/durability、独立process/device token及closed frontend。旧三字段、path-only/opaque proof、token/path alias、blank head及非法vhost queue全部拒绝 |
+| PrepareDevice serving provenance wire | 首次Root的target-control exact handshake及sealed record仍在ProvisionRootImage完成；已有Root/Persistent只使用descriptor-stable direct authorized attachment及closed purpose。只有persistent_uninitialized接受exact blank；其他分支必须nonblank。fixed vectors逐byte绑定provenance、attachment/origin/head/size/durability、独立process/device token及closed frontend；旧三字段、path-only/opaque proof、token/path alias、错误head state及非法vhost queue全部拒绝 |
 | PrepareDevice inventory projection | `ObservedDevice`仅凭path/socket+device token不能证明serving CLI、handshake或vhost queue参数；scanner必须从provider-private exact process/CLI/socket evidence闭合，任何缺失/冲突保持fail closed |
 | 新物理实例遇到旧token | 每个新create attempt使用新token；名称/path已有不同token时Quarantine，不覆写/adopt/删除 |
 | Running 改盘/shape | 请求先 PreconditionFailed(MustBeCold)；Cold 成功后的新请求才改完整 spec |
@@ -2600,15 +2627,15 @@ checkpoint bytes；它使用同一个checkpoint-content domain：
 checkpoint_content_digest = sha256:ed788516e920c57a6700eef477a9e8af48bee99ee0ded541965a6fda96aa9a4c
 ```
 
-**PrepareDevice checkpoint vector**使用同一个checkpoint-content domain，冻结handoff stable file identity、
+**PrepareDevice checkpoint vector**使用同一个checkpoint-content domain，冻结closed serving provenance、
 完整attachment lineage、彼此不同的process/device token及vhost frontend参数：
 
 ```json
-{"cat_id":"cat_01","desired_revision":7,"guest_transport":{"kind":"unavailable"},"lifecycle_admission":"closed","mounts":[],"networks":[],"node_id":"node_a","placement_epoch":3,"processes":[],"require_idle":{"kind":"not_applicable"},"route_gates":[],"runtime_incarnation":null,"spec_digest":"sha256:529c32e8600910283f99bf949af5c31fdadcf3757463eb6c4811c61673ed9409","stable_state":null,"step":{"acquire_origin":{"kind":"normal","transition_id":"22222222222222222222222222222222"},"attachment_epoch":8,"attachment_id":"att_01","durability":"strict","expected_head":{"generation":1,"root_hash":"sha256:0000000000000000000000000000000000000000000000000000000000000000","root_object_id":"volumes/vol_root/roots/1"},"frontend":{"kind":"vhost_user_blk","queue_size":256,"queues":2,"socket_path":"/run/cats/cat_01/root-vhost.sock"},"guest_device":{"serial":"cats-root","slot":0},"kind":"prepare_device","ownership_token":"88888888888888888888888888888888","serving_handoff":{"predecessor_checkpoint_content_digest":"sha256:ed788516e920c57a6700eef477a9e8af48bee99ee0ded541965a6fda96aa9a4c","record":{"content_sha256":"sha256:3333333333333333333333333333333333333333333333333333333333333333","device":16777217,"inode":42,"length":1024,"path":"/var/lib/cats/handoffs/cat_01/root-serving.json"}},"serving_process":{"control_socket_path":"/run/cats/cat_01/blockd-serving-control.sock","data_directory":"/var/lib/cats/vol_root","executable_path":"/usr/bin/cats-blockd","process_identity_token":"77777777777777777777777777777777","scope_id":"cats-cat_01-root-serving"},"size_bytes":4294967296,"volume_id":"vol_root"},"updated_at_unix_ms":1720000000000,"version":1,"volumes":[],"warm_snapshot":{"kind":"absent"}}
+{"cat_id":"cat_01","desired_revision":7,"guest_transport":{"kind":"unavailable"},"lifecycle_admission":"closed","mounts":[],"networks":[],"node_id":"node_a","placement_epoch":3,"processes":[],"require_idle":{"kind":"not_applicable"},"route_gates":[],"runtime_incarnation":null,"spec_digest":"sha256:529c32e8600910283f99bf949af5c31fdadcf3757463eb6c4811c61673ed9409","stable_state":null,"step":{"acquire_origin":{"kind":"normal","transition_id":"22222222222222222222222222222222"},"attachment_epoch":8,"attachment_id":"att_01","durability":"strict","expected_head":{"generation":1,"root_hash":"sha256:0000000000000000000000000000000000000000000000000000000000000000","root_object_id":"volumes/vol_root/roots/1"},"frontend":{"kind":"vhost_user_blk","queue_size":256,"queues":2,"socket_path":"/run/cats/cat_01/root-vhost.sock"},"guest_device":{"serial":"cats-root","slot":0},"kind":"prepare_device","ownership_token":"88888888888888888888888888888888","serving_authority":{"handoff":{"predecessor_checkpoint_content_digest":"sha256:ed788516e920c57a6700eef477a9e8af48bee99ee0ded541965a6fda96aa9a4c","record":{"content_sha256":"sha256:3333333333333333333333333333333333333333333333333333333333333333","device":16777217,"inode":42,"length":1024,"path":"/var/lib/cats/handoffs/cat_01/root-serving.json"}},"kind":"after_root_provision"},"serving_process":{"control_socket_path":"/run/cats/cat_01/blockd-serving-control.sock","data_directory":"/var/lib/cats/vol_root","executable_path":"/usr/bin/cats-blockd","process_identity_token":"77777777777777777777777777777777","scope_id":"cats-cat_01-root-serving"},"size_bytes":4294967296,"volume_id":"vol_root"},"updated_at_unix_ms":1720000000000,"version":1,"volumes":[],"warm_snapshot":{"kind":"absent"}}
 ```
 
 ```text
-checkpoint_content_digest = sha256:1bf547ac68b813152cef539ad6760d70b193e702b268e1df37362380c3dfe28c
+checkpoint_content_digest = sha256:98a44252c94fe4c8bbec172cc87effee14b8df6af581122c32b2e0770ebe7d7e
 ```
 
 **Non-empty full inventory vector**使用同一个inventory domain。它刻意包含两个frontend、两个tap、
