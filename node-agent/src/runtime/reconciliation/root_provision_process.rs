@@ -9,9 +9,9 @@
 
 use anyhow::Context as _;
 use cats_api::runtime_reconciliation::{
-    ControlHandshakeEvidence, Durability, Epoch, FenceEpoch, HostPath, Id, OwnershipTokenEvidence,
-    ProcessEvidence, ProcessRole, ProcessState, RandomId128, ReconcileStep, RemoteHead, Revision,
-    RuntimeCheckpoint, Sha256Digest, WireU64,
+    CheckpointEvidence, ControlHandshakeEvidence, Durability, Epoch, FenceEpoch, HostPath, Id,
+    OwnershipTokenEvidence, ProcessEvidence, ProcessRole, ProcessState, RandomId128, ReconcileStep,
+    RemoteHead, Revision, RuntimeCheckpoint, Sha256Digest, WireU64,
 };
 use cats_storage::authority::{
     validate_authorized_serving_attachment, validate_volume_record, AttachmentLineageIdentity,
@@ -290,6 +290,16 @@ pub(crate) struct ExactRootProvisionProcessProof {
     evidence: RootProvisionProcessEvidence,
 }
 
+/// One current-process proof that the accepted complete inventory and the
+/// sealed physical owner both observed no process for the exact persisted
+/// attempt. Private fields prevent a naked empty vector or a naked systemd
+/// lookup from authorizing retirement of a durable handoff record.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ExactRootProvisionProcessAbsenceProof {
+    checkpoint_content_digest: Sha256Digest,
+    expectation: RootProvisionProcessExpectation,
+}
+
 impl RootProvisionProcessExpectation {
     pub(crate) fn prove_exact_process(
         self,
@@ -338,6 +348,16 @@ impl ExactRootProvisionProcessProof {
             control_handshake: ControlHandshakeEvidence::Verified,
             observed_vm_shape: None,
         }
+    }
+}
+
+impl ExactRootProvisionProcessAbsenceProof {
+    pub(crate) fn checkpoint_content_digest(&self) -> &Sha256Digest {
+        &self.checkpoint_content_digest
+    }
+
+    pub(crate) fn expectation(&self) -> &RootProvisionProcessExpectation {
+        &self.expectation
     }
 }
 
@@ -404,6 +424,130 @@ where
         }
         other => other,
     })
+}
+
+/// Construct exact absence only from the accepted full observation that
+/// opened this effect batch and a second sealed physical inspection. The
+/// caller must retain its checkpoint/artifact locks while consuming the
+/// result; this value is deliberately not durable authority by itself.
+pub(crate) fn prove_exact_root_provision_process_absence<P>(
+    checkpoint_store: &FileCheckpointStore,
+    stored_checkpoint: &StoredCheckpoint,
+    authority: RootProvisionAuthoritySnapshot<'_>,
+    executable_path: HostPath,
+    port: &P,
+    context: &RuntimeDesiredEffectContext,
+) -> anyhow::Result<ExactRootProvisionProcessAbsenceProof>
+where
+    P: RootProvisionProcessPort + ?Sized,
+{
+    context.check_active()?;
+    accepted_full_proves_exact_process_absence(context, checkpoint_store, stored_checkpoint)?;
+    let expectation = RootProvisionProcessExpectation::from_checkpoint(
+        stored_checkpoint.checkpoint(),
+        authority,
+        executable_path,
+    )?;
+    match inspect_exact_root_provision_process(port, &expectation, context)
+        .context("reinspect exact root-provision identity before record retirement")?
+    {
+        RootProvisionProcessInspection::Absent => Ok(ExactRootProvisionProcessAbsenceProof {
+            checkpoint_content_digest: stored_checkpoint.content_digest().clone(),
+            expectation,
+        }),
+        RootProvisionProcessInspection::Exact(_) => {
+            anyhow::bail!("root-provision process is present; handoff record must remain sealed")
+        }
+        RootProvisionProcessInspection::Conflict(problem) => anyhow::bail!(
+            "root-provision process identity conflicts ({problem:?}); handoff record must remain sealed"
+        ),
+        RootProvisionProcessInspection::Unavailable => anyhow::bail!(
+            "root-provision process identity is unavailable; handoff record must remain sealed"
+        ),
+    }
+}
+
+fn accepted_full_proves_exact_process_absence(
+    context: &RuntimeDesiredEffectContext,
+    checkpoint_store: &FileCheckpointStore,
+    stored_checkpoint: &StoredCheckpoint,
+) -> anyhow::Result<()> {
+    let accepted = context.accepted_full()?;
+    let observation = accepted.observation();
+    let attestation = accepted.attestation();
+    let session = accepted.session();
+    let checkpoint = stored_checkpoint.checkpoint();
+    anyhow::ensure!(
+        observation.version == cats_api::runtime_reconciliation::ContractVersion::V1
+            && session.version == cats_api::runtime_reconciliation::ContractVersion::V1
+            && attestation.version == cats_api::runtime_reconciliation::ContractVersion::V1
+            && observation.complete_inventory
+            && observation.node_id == checkpoint.node_id
+            && session.node_id == checkpoint.node_id
+            && observation.node_id == session.node_id
+            && observation.node_boot_id == session.node_boot_id
+            && observation.agent_instance_id == session.agent_instance_id
+            && observation.agent_session_epoch == session.agent_session_epoch
+            && attestation.node_id == observation.node_id
+            && attestation.agent_session_epoch == observation.agent_session_epoch
+            && attestation.inventory_epoch == observation.inventory_epoch
+            && observation.inventory_digest.as_ref() == Some(&attestation.inventory_digest)
+            && observation.inventory_read_position == Some(attestation.inventory_read_position),
+        "root-process absence lacks an exact accepted full-inventory admission"
+    );
+    let mut runtimes = observation
+        .runtimes
+        .iter()
+        .filter(|runtime| runtime.cat_id == checkpoint.cat_id);
+    let runtime = runtimes
+        .next()
+        .context("accepted full inventory omitted the checkpointed Cat")?;
+    anyhow::ensure!(
+        runtimes.next().is_none(),
+        "accepted full inventory contains duplicate checkpointed Cat entries"
+    );
+    let CheckpointEvidence::Valid {
+        checkpoint_path,
+        content_digest,
+        version,
+        cat_id,
+        node_id,
+        desired_revision,
+        spec_digest,
+        placement_epoch,
+        runtime_incarnation,
+        stable_state,
+        step,
+        require_idle,
+        updated_at_unix_ms,
+        ..
+    } = &runtime.checkpoint
+    else {
+        anyhow::bail!("accepted full inventory lacks the exact valid checkpoint evidence")
+    };
+    anyhow::ensure!(
+        std::path::Path::new(checkpoint_path.as_str()) == checkpoint_store.path()
+            && content_digest == stored_checkpoint.content_digest()
+            && *version == checkpoint.version
+            && cat_id == &checkpoint.cat_id
+            && node_id == &checkpoint.node_id
+            && *desired_revision == checkpoint.desired_revision
+            && spec_digest == &checkpoint.spec_digest
+            && *placement_epoch == checkpoint.placement_epoch
+            && runtime_incarnation == &checkpoint.runtime_incarnation
+            && stable_state == &checkpoint.stable_state
+            && step.as_ref() == &checkpoint.step
+            && require_idle.as_ref() == &checkpoint.require_idle
+            && *updated_at_unix_ms == checkpoint.updated_at_unix_ms
+            && runtime.step == checkpoint.step
+            && runtime.processes.is_empty(),
+        "accepted full inventory does not prove the exact checkpointed process set empty"
+    );
+    // `complete_inventory` makes the empty public projection meaningful for
+    // this Cat. It is intentionally still insufficient by itself: the sealed
+    // port inspection below owns the Node-global service/process/socket sweep
+    // and rejects a late, foreign, or duplicate identity as non-absence.
+    Ok(())
 }
 
 /// Unforgeable proof, within this module, that the complete process identity

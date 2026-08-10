@@ -962,6 +962,20 @@ canonical content SHA-256；record内容绑定最后一个target-control `Runtim
 确认record及target-control实例仍逐字段匹配后，planner一次atomic checkpoint replace进入扩展后的
 `prepare_device`；同一轮不停止旧进程、不启动serving进程也不创建设备，下一轮必须重新full scan。
 
+若sealed record完成目录fsync后、`prepare_device` checkpoint replace前旧target-control进程消失，旧record
+不能被新process attempt覆盖或复用。当前进程已accepted的complete inventory必须先对该Cat投影
+`processes=[]`，随后sealed systemd/process/socket port在相同effect admission内再次对完整旧attempt identity
+返回exact `Absent`；present、duplicate、foreign、unavailable或任一不完整scan都不产生retirement authority。
+Node持有attachment directory descriptor/flock、record及target-control descriptor identity和exact current
+checkpoint writer guard/digest时，只执行一次descriptor-relative record unlink并fsync父目录，然后立即
+`RefreshInventory`。unlink前crash保留旧record；unlink后至directory fsync acknowledgement之间crash由相同
+exact absence和checkpoint重验只补同一目录fsync。malformed/foreign/temp/rename-recreate ABA record绝不删除。
+下一轮新的accepted full scan再次确认旧attempt exact absent后，才可只replace checkpoint中的
+`process_identity_token`及timestamp；scope、control socket、data directory、provision transition、request及
+stable target-control authorization context全部不变。target artifact按原inode/bytes重放，新token进程完成
+exact target handshake后发布新的no-replace record。旧进程晚归只能在后续global scan成为typed conflict/显式
+stop候选，不能按unit名称清理，也不能在retirement或token rotation轮顺带停止。
+
 `prepare_device`完整绑定attachment id/epoch、typed `AcquireOrigin`、exact head、immutable size及durability；
 `serving_authority`是closed provenance。`after_root_provision`只用于上述首次Root handoff，携record的
 descriptor-stable identity及predecessor full digest，并要求nonblank head。`direct_authorized_attachment`
@@ -2443,6 +2457,7 @@ Rejoined；`host_destroyed`永不Rejoined，因此在没有tombstone、其他Hos
 | release N / reacquire N+1 / 旧release N重放 | attachment/expected epoch/transition不匹配，旧N不能释放N+1 writer，不能以当前Unowned猜测成功 |
 | Root provision step fsync后crash | checkpoint保留完整request；full inventory/current Desired/exact grant重验后只重试同一transition，Guest device与VMM仍不存在 |
 | Root provision control process crash | spawn前kill只留下含完整scope/socket/data-dir/token的step；spawn后任一点kill都以full inventory精确adopt同token实例。wrong/missing/corrupt token或错误role/path/handshake进入typed conflict；只有旧PID/cgroup/socket精确absence后才只轮换process token，provision transition/target不变 |
+| Root handoff record seal后旧process消失 | accepted complete inventory `processes=[]`与sealed port exact `Absent`共同生成一次性retirement proof；retained record/target/attachment descriptors及current checkpoint guard下只unlink record+fsync目录并Refresh。各unlink/fsync crash窗口重放同一retirement；下一轮full scan后才token-only replace。late/foreign/duplicate/ABA不删、不覆盖、不按名clean |
 | Root provision PUT/CAS crash矩阵 | manifest读取、leaf/root/commit PUT前后及CAS前crash都保持blank或最终exact target；同一step只写相同immutable keys，不产生第二target，orphan不被当作成功 |
 | Root provision control response | OK、retryable、definite-conflict、EOF/timeout/malformed都先读authority；exact target才adopt。blank+ambiguous重试，blank+retryable保留step并Blocked/Progressing，blank+definite-conflict写exact typed quarantine；任一其他head或target hash/object ID错配都Fenced/Quarantined，绝不覆盖generation>0 |
 | Root provision后checkpoint未推进或Agent restart | 新session full inventory后从持久step重算同一target；exact target推进，blank重试，其他结果fail closed，不依赖进程内bool或第二receipt |

@@ -56,13 +56,12 @@ use super::authorized_blockd::{
     AuthorizedBlockdCheckpoint, AUTHORIZED_SERVING_FILE, IDENTITY_FILE, LAUNCH_CHECKPOINT_FILE,
     MAX_AUTHORIZED_SERVING_BYTES, MAX_IDENTITY_BYTES, MAX_LAUNCH_CHECKPOINT_BYTES,
 };
-#[cfg(test)]
-use super::root_provision_process::RootProvisionAuthoritySnapshot;
 use super::root_provision_process::{
-    ExactRootProvisionProcessProof, RootProvisionBlockdHandshake, RootProvisionProcessEvidence,
-    RootProvisionProcessExpectation,
+    prove_exact_root_provision_process_absence, ExactRootProvisionProcessAbsenceProof,
+    ExactRootProvisionProcessProof, RootProvisionAuthoritySnapshot, RootProvisionBlockdHandshake,
+    RootProvisionProcessEvidence, RootProvisionProcessExpectation, RootProvisionProcessPort,
 };
-use super::StoredCheckpoint;
+use super::{FileCheckpointStore, StoredCheckpoint};
 
 pub(crate) const SERVING_HANDOFF_RECORD_FILE: &str = "serving-handoff.json";
 const SERVING_HANDOFF_RECORD_TEMP: &str = ".serving-handoff.json.tmp";
@@ -394,6 +393,12 @@ pub(crate) struct ServingHandoffStore {
     mutation_once: Mutex<PendingTestMutation>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ServingHandoffRetirement {
+    Retired,
+    RecoveredAlreadyAbsent,
+}
+
 impl ServingHandoffStore {
     pub(crate) fn new(state_directory: StateDirectory) -> Self {
         Self {
@@ -666,6 +671,358 @@ impl ServingHandoffStore {
         };
         ready.assert_current(stored_checkpoint)?;
         Ok(ready)
+    }
+
+    /// Retire only the exact sealed record for a target-control attempt whose
+    /// absence was proven twice by the current accepted full scan and the
+    /// sealed physical owner. This is one bounded effect: it never rotates a
+    /// token, replaces a checkpoint, starts/stops a process, or removes the
+    /// stable target-control authorization.
+    ///
+    /// A crash after unlink but before the directory fsync is recovered by
+    /// re-establishing the same fsync barrier while every authority and
+    /// checkpoint binding remains exact. Callers must return
+    /// `RefreshInventory`; token-only checkpoint replacement belongs to the
+    /// next accepted-full effect batch.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn retire_record_after_exact_process_absence<P>(
+        &self,
+        checkpoint_store: &FileCheckpointStore,
+        stored_checkpoint: &StoredCheckpoint,
+        acquired: &AuthorizedBlockdCheckpoint,
+        authority: &ServingAuthorityTargetEvidence,
+        executable_path: HostPath,
+        process_port: &P,
+        context: &crate::runtime_spine::RuntimeDesiredEffectContext,
+    ) -> Result<ServingHandoffRetirement>
+    where
+        P: RootProvisionProcessPort + ?Sized,
+    {
+        context.check_active()?;
+        let candidate = build_target_candidate(
+            &self.state_directory,
+            stored_checkpoint,
+            acquired,
+            authority,
+        )?;
+        let target_name = target_control_file_name(&candidate.provision_transition_id);
+        let target_temp_name = target_control_temp_name(&candidate.provision_transition_id);
+        let retained = RetainedAttachmentContext::open_and_lock(
+            self.state_directory.clone(),
+            &candidate.data_directory,
+            acquired,
+            &target_name,
+            &target_temp_name,
+        )?;
+        // Lock order is attachment-directory flock, then checkpoint writer
+        // mutex. This matches handoff consume and AuthorizedBlockd
+        // prepare->replace. Both filesystem flocks are nonblocking, and no
+        // CurrentCheckpointGuard path acquires an attachment lock, so there
+        // is no reverse waiting edge.
+        //
+        // Hold the checkpoint writer serialization and per-Cat flock across
+        // the second physical inspection, unlink, and durability barrier.
+        let _current_checkpoint = checkpoint_store
+            .assert_current(stored_checkpoint)
+            .context("retain exact checkpoint during serving handoff retirement")?;
+        retained.assert_current()?;
+        let absence = prove_exact_root_provision_process_absence(
+            checkpoint_store,
+            stored_checkpoint,
+            RootProvisionAuthoritySnapshot {
+                attachment: acquired.attachment.clone(),
+                volume: &authority.volume,
+            },
+            executable_path,
+            process_port,
+            context,
+        )?;
+        validate_absence_for_retirement(&absence, stored_checkpoint, acquired, &candidate)?;
+
+        let target_path = host_path(
+            &candidate.data_directory.join(&target_name),
+            "retained retirement target-control path",
+        )?;
+        anyhow::ensure!(
+            read_optional_bounded(
+                &retained.attachment_directory,
+                &c_string(&target_temp_name)?,
+                TARGET_AUTHORIZED_SERVING_MAX_BYTES,
+            )?
+            .is_none(),
+            "retirement target-control authorization retained an unpublished temp"
+        );
+        let retained_target = RetainedFile::open_required(
+            &retained.attachment_directory,
+            &target_name,
+            target_path,
+            TARGET_AUTHORIZED_SERVING_MAX_BYTES,
+        )?;
+        let target_artifact = decode_target_control_authorization(&retained_target.bytes)?;
+        validate_target_checkpoint_context(&target_artifact, stored_checkpoint)?;
+        anyhow::ensure!(
+            target_artifact.attachment == candidate.target_attachment,
+            "retirement target-control authorization is not the exact authority target"
+        );
+
+        let record_path = host_path(
+            &candidate.data_directory.join(SERVING_HANDOFF_RECORD_FILE),
+            "retired serving handoff record path",
+        )?;
+        let record_name = c_string(SERVING_HANDOFF_RECORD_FILE)?;
+        let record_temp_name = c_string(SERVING_HANDOFF_RECORD_TEMP)?;
+        let Some(record_bytes) = read_optional_bounded(
+            &retained.attachment_directory,
+            &record_name,
+            SERVING_HANDOFF_RECORD_MAX_BYTES,
+        )?
+        else {
+            // Visibility may be the result of a previously completed unlink
+            // whose fsync acknowledgement was lost. No other artifact is
+            // touched; the exact absence proof and retained checkpoint make
+            // this a safe durability recovery, not path-only adoption.
+            anyhow::ensure!(
+                read_optional_bounded(
+                    &retained.attachment_directory,
+                    &record_temp_name,
+                    SERVING_HANDOFF_RECORD_MAX_BYTES,
+                )?
+                .is_none(),
+                "absent serving handoff record retained an unpublished temp"
+            );
+            self.maybe_crash(PublicationStage::new(
+                PublicationArtifact::HandoffRetirement,
+                PublicationPoint::BeforeDirectorySync,
+            ))?;
+            context.check_active()?;
+            retained.attachment_directory.sync_all().with_context(|| {
+                format!(
+                    "sync retired handoff in {}",
+                    candidate.data_directory.display()
+                )
+            })?;
+            self.maybe_crash(PublicationStage::new(
+                PublicationArtifact::HandoffRetirement,
+                PublicationPoint::DirectorySynced,
+            ))?;
+            retained.assert_current()?;
+            retained_target.assert_current(
+                &retained.attachment_directory,
+                &retained_target.identity.path,
+            )?;
+            return Ok(ServingHandoffRetirement::RecoveredAlreadyAbsent);
+        };
+        anyhow::ensure!(
+            read_optional_bounded(
+                &retained.attachment_directory,
+                &record_temp_name,
+                SERVING_HANDOFF_RECORD_MAX_BYTES,
+            )?
+            .is_none(),
+            "sealed serving handoff record retained an unpublished temp"
+        );
+        let record = decode_serving_handoff_record(&record_bytes)?;
+        validate_record_checkpoint_context(&record, stored_checkpoint)?;
+        validate_record_absence_binding(&record, &absence)?;
+        anyhow::ensure!(
+            record.target_control_authorization.artifact == target_artifact
+                && record.target_control_authorization.device == retained_target.identity.device
+                && record.target_control_authorization.inode == retained_target.identity.inode
+                && record.target_control_authorization.length == retained_target.identity.length
+                && record.target_control_authorization.content_sha256
+                    == retained_target.identity.content_sha256,
+            "retired record is not bound to the retained target-control authorization"
+        );
+        let retained_record = RetainedFile::open_required(
+            &retained.attachment_directory,
+            SERVING_HANDOFF_RECORD_FILE,
+            record_path.clone(),
+            SERVING_HANDOFF_RECORD_MAX_BYTES,
+        )?;
+        anyhow::ensure!(
+            retained_record.bytes == record_bytes,
+            "serving handoff record changed between classification and retirement"
+        );
+        retained_record.assert_current(&retained.attachment_directory, &record_path)?;
+        self.maybe_crash(PublicationStage::new(
+            PublicationArtifact::HandoffRetirement,
+            PublicationPoint::BeforeUnlink,
+        ))?;
+        // The protected directory and held flock exclude legitimate writers;
+        // the final retained-path check rejects rename/recreate ABA before the
+        // descriptor-relative unlink.
+        retained_target.assert_current(
+            &retained.attachment_directory,
+            &retained_target.identity.path,
+        )?;
+        retained_record.assert_current(&retained.attachment_directory, &record_path)?;
+        context.check_active()?;
+        unlink_at(&retained.attachment_directory, &record_name)
+            .context("unlink exact sealed serving handoff record")?;
+        self.maybe_crash(PublicationStage::new(
+            PublicationArtifact::HandoffRetirement,
+            PublicationPoint::Unlinked,
+        ))?;
+        retained.attachment_directory.sync_all().with_context(|| {
+            format!(
+                "sync retired handoff in {}",
+                candidate.data_directory.display()
+            )
+        })?;
+        self.maybe_crash(PublicationStage::new(
+            PublicationArtifact::HandoffRetirement,
+            PublicationPoint::DirectorySynced,
+        ))?;
+        retained.assert_current()?;
+        retained_target.assert_current(
+            &retained.attachment_directory,
+            &retained_target.identity.path,
+        )?;
+        anyhow::ensure!(
+            read_optional_bounded(
+                &retained.attachment_directory,
+                &record_name,
+                SERVING_HANDOFF_RECORD_MAX_BYTES,
+            )?
+            .is_none(),
+            "serving handoff record reappeared after retirement"
+        );
+        Ok(ServingHandoffRetirement::Retired)
+    }
+
+    /// In a later accepted-full batch, rotate only the process-attempt token
+    /// after exact retirement is durable. Scope, sockets, data lineage,
+    /// provision transition, target authorization context, and every other
+    /// checkpoint field remain stable (apart from the timestamp).
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn rotate_process_token_after_retirement<P>(
+        &self,
+        checkpoint_store: &FileCheckpointStore,
+        stored_checkpoint: &StoredCheckpoint,
+        acquired: &AuthorizedBlockdCheckpoint,
+        authority: &ServingAuthorityTargetEvidence,
+        executable_path: HostPath,
+        new_process_identity_token: RandomId128,
+        updated_at_unix_ms: cats_api::runtime_reconciliation::UnixMillis,
+        process_port: &P,
+        context: &crate::runtime_spine::RuntimeDesiredEffectContext,
+    ) -> Result<StoredCheckpoint>
+    where
+        P: RootProvisionProcessPort + ?Sized,
+    {
+        context.check_active()?;
+        let candidate = build_target_candidate(
+            &self.state_directory,
+            stored_checkpoint,
+            acquired,
+            authority,
+        )?;
+        let target_name = target_control_file_name(&candidate.provision_transition_id);
+        let target_temp_name = target_control_temp_name(&candidate.provision_transition_id);
+        let retained = RetainedAttachmentContext::open_and_lock(
+            self.state_directory.clone(),
+            &candidate.data_directory,
+            acquired,
+            &target_name,
+            &target_temp_name,
+        )?;
+        retained.assert_current()?;
+        let absence = prove_exact_root_provision_process_absence(
+            checkpoint_store,
+            stored_checkpoint,
+            RootProvisionAuthoritySnapshot {
+                attachment: acquired.attachment.clone(),
+                volume: &authority.volume,
+            },
+            executable_path,
+            process_port,
+            context,
+        )?;
+        validate_absence_for_retirement(&absence, stored_checkpoint, acquired, &candidate)?;
+        for (name, label, maximum) in [
+            (
+                SERVING_HANDOFF_RECORD_FILE,
+                "sealed serving handoff record",
+                SERVING_HANDOFF_RECORD_MAX_BYTES,
+            ),
+            (
+                SERVING_HANDOFF_RECORD_TEMP,
+                "serving handoff record temp",
+                SERVING_HANDOFF_RECORD_MAX_BYTES,
+            ),
+        ] {
+            anyhow::ensure!(
+                read_optional_bounded(&retained.attachment_directory, &c_string(name)?, maximum,)?
+                    .is_none(),
+                "cannot rotate process token while {label} remains"
+            );
+        }
+        let target_path = host_path(
+            &candidate.data_directory.join(&target_name),
+            "rotation target-control authorization path",
+        )?;
+        anyhow::ensure!(
+            read_optional_bounded(
+                &retained.attachment_directory,
+                &c_string(&target_temp_name)?,
+                TARGET_AUTHORIZED_SERVING_MAX_BYTES,
+            )?
+            .is_none(),
+            "token rotation target-control authorization retained an unpublished temp"
+        );
+        let retained_target = RetainedFile::open_required(
+            &retained.attachment_directory,
+            &target_name,
+            target_path,
+            TARGET_AUTHORIZED_SERVING_MAX_BYTES,
+        )?;
+        let target_artifact = decode_target_control_authorization(&retained_target.bytes)?;
+        validate_target_checkpoint_context(&target_artifact, stored_checkpoint)?;
+        anyhow::ensure!(
+            target_artifact.attachment == candidate.target_attachment,
+            "token rotation target-control authorization is not the exact authority target"
+        );
+
+        let mut successor = stored_checkpoint.checkpoint().clone();
+        let ReconcileStep::ProvisionRootImage {
+            process_identity_token,
+            ..
+        } = &mut successor.step
+        else {
+            unreachable!("target candidate accepted only provision_root_image")
+        };
+        anyhow::ensure!(
+            *process_identity_token != new_process_identity_token,
+            "root-process token rotation requires a fresh token"
+        );
+        anyhow::ensure!(
+            updated_at_unix_ms > successor.updated_at_unix_ms,
+            "root-process token rotation timestamp must advance"
+        );
+        *process_identity_token = new_process_identity_token;
+        successor.updated_at_unix_ms = updated_at_unix_ms;
+        encode_runtime_checkpoint(&successor)
+            .context("validate token-only successor checkpoint")?;
+        anyhow::ensure!(
+            provision_root_authorization_context_digest(&successor)?
+                == target_artifact.provision_context_digest
+                && provision_root_image_request(&successor)? == target_artifact.request,
+            "process token rotation changed the stable target-control authorization context"
+        );
+        retained_target.assert_current(
+            &retained.attachment_directory,
+            &retained_target.identity.path,
+        )?;
+        context.check_active()?;
+        let replaced = checkpoint_store
+            .replace(stored_checkpoint, &successor)
+            .context("persist token-only root-process attempt rotation")?;
+        retained.assert_current()?;
+        retained_target.assert_current(
+            &retained.attachment_directory,
+            &retained_target.identity.path,
+        )?;
+        Ok(replaced)
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -994,6 +1351,60 @@ fn validate_exact_process_proof(
             && expected.expected_remote_head() == expected_provisioned_head
             && expected.expected_remote_head() == &candidate.target_attachment.head,
         "exact process proof is not bound to the current stored provision checkpoint"
+    );
+    Ok(())
+}
+
+fn validate_absence_for_retirement(
+    absence: &ExactRootProvisionProcessAbsenceProof,
+    stored_checkpoint: &StoredCheckpoint,
+    acquired: &AuthorizedBlockdCheckpoint,
+    candidate: &TargetControlCandidate,
+) -> Result<()> {
+    anyhow::ensure!(
+        absence.checkpoint_content_digest() == stored_checkpoint.content_digest(),
+        "root-process absence proof belongs to another checkpoint content"
+    );
+    validate_exact_process_proof(
+        stored_checkpoint,
+        acquired,
+        candidate,
+        absence.expectation(),
+    )
+}
+
+fn validate_record_absence_binding(
+    record: &ServingHandoffRecord,
+    absence: &ExactRootProvisionProcessAbsenceProof,
+) -> Result<()> {
+    let expected = absence.expectation();
+    let process = &record.old_control_process;
+    anyhow::ensure!(
+        record.checkpoint_content_digest == *absence.checkpoint_content_digest()
+            && record.cat_id == expected.cat_id
+            && record.node_id == expected.node_id
+            && record.placement_epoch == expected.placement_epoch
+            && record.desired_revision == expected.desired_revision
+            && record.spec_digest == expected.spec_digest
+            && record.provision_transition_id == expected.provision_transition_id
+            && record.volume_id == expected.volume_id
+            && record.attachment_id == expected.attachment_id
+            && record.attachment_epoch == expected.attachment_epoch
+            && record.expected_provisioned_head == *expected.expected_remote_head()
+            && record.expected_control_executable_path == expected.executable_path
+            && process.scope_id == expected.scope_id
+            && process.cgroup_path == expected.cgroup_path
+            && process.control_socket_path == expected.control_socket_path
+            && process.data_directory == expected.data_directory
+            && process.ownership_token == expected.process_identity_token
+            && process.handshake.identity == expected.attachment.identity
+            && process.handshake.size_bytes == expected.size_bytes
+            && process.handshake.durability == expected.attachment.durability
+            && process.handshake.remote_head == *expected.expected_remote_head()
+            && process.handshake.process_identity_token == expected.process_identity_token
+            && process.handshake.control_only
+            && !process.handshake.guest_io_enabled,
+        "serving handoff record does not describe the exactly absent process attempt"
     );
     Ok(())
 }
@@ -2021,6 +2432,7 @@ fn rename_no_replace(
 enum PublicationArtifact {
     TargetAuthorization,
     HandoffRecord,
+    HandoffRetirement,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -2030,6 +2442,9 @@ enum PublicationPoint {
     FullWritten,
     TempSynced,
     Published,
+    BeforeUnlink,
+    Unlinked,
+    BeforeDirectorySync,
     DirectorySynced,
 }
 
@@ -2048,22 +2463,83 @@ impl PublicationStage {
 #[cfg(test)]
 mod tests {
     use std::cell::Cell;
+    use std::collections::VecDeque;
     use std::os::unix::fs::{symlink, MetadataExt as _, PermissionsExt as _};
+    use std::sync::Arc;
+    use std::time::{Duration, Instant};
 
     use cats_api::runtime_reconciliation::{
-        spec_digest, AsciiText, AssignedKind, AssignedPlacement, DiskKind, Generation,
+        spec_digest, AdmissionInventoryAttestation, AgentSession, AppliedDesiredEvidence,
+        AsciiText, AssignedKind, AssignedPlacement, CheckpointEvidence, DiskKind, Generation,
         GuestDeviceIdentity, GuestTransportEvidence, Ipv4Address, IsolatedIpv4Kind,
-        LifecycleAdmission, MacAddress, NetworkConfig, NormalAcquireRequest, NormalAcquireResult,
-        PrepareDeviceFrontend, RequireIdleCheckpoint, RuntimeCheckpoint, RuntimeConfig,
-        RuntimeTarget, RuntimeTransition, ServingAuthorityProvenance, ServingBlockdIdentity,
-        UnixMillis, VolumeAccess, VolumeAcquire, VolumeAdminState, VolumeAuthorityEvidence,
-        VolumeDisposition, VolumeIntent, WarmSnapshotEvidence,
+        LifecycleAdmission, MacAddress, NetworkConfig, NodeBootId, NodeObservation,
+        NormalAcquireRequest, NormalAcquireResult, ObservedRuntimeStatus, PrepareDeviceFrontend,
+        RequireIdleCheckpoint, RuntimeCheckpoint, RuntimeConfig, RuntimeTarget, RuntimeTransition,
+        Sequence, ServingAuthorityProvenance, ServingBlockdIdentity, UnixMillis, VolumeAccess,
+        VolumeAcquire, VolumeAdminState, VolumeAuthorityEvidence, VolumeDisposition, VolumeIntent,
+        WarmSnapshotEvidence,
     };
     use cats_storage::authority::LastVolumeTransition;
 
     use super::*;
+    use crate::runtime::reconciliation::root_provision_process::{
+        sealed as root_process_sealed, CheckpointedRootProvisionProcess, RootProvisionProcessStart,
+    };
     use crate::runtime::reconciliation::signed_running::prepared_owned_observed_volume;
-    use crate::runtime::reconciliation::{AuthorizedBlockdStore, FileCheckpointStore};
+    use crate::runtime::reconciliation::{
+        AuthorizedBlockdStore, FileCheckpointStore, RootProvisionProcessConflict,
+        RootProvisionProcessInspection,
+    };
+    use crate::runtime_spine::{
+        RuntimeDesiredEffectAdmission, RuntimeDesiredEffectContext, RuntimePhysicalReadContext,
+    };
+
+    #[derive(Default)]
+    struct RetirementProcessPort {
+        inspections: Mutex<VecDeque<RootProvisionProcessInspection>>,
+        inspect_calls: Mutex<usize>,
+    }
+
+    impl RetirementProcessPort {
+        fn with_inspections(
+            inspections: impl IntoIterator<Item = RootProvisionProcessInspection>,
+        ) -> Self {
+            Self {
+                inspections: Mutex::new(inspections.into_iter().collect()),
+                inspect_calls: Mutex::new(0),
+            }
+        }
+
+        fn inspect_calls(&self) -> usize {
+            *self.inspect_calls.lock().unwrap()
+        }
+    }
+
+    impl root_process_sealed::Sealed for RetirementProcessPort {}
+
+    impl RootProvisionProcessPort for RetirementProcessPort {
+        fn inspect(
+            &self,
+            _expected: &RootProvisionProcessExpectation,
+            _context: &dyn RuntimePhysicalReadContext,
+        ) -> Result<RootProvisionProcessInspection> {
+            *self.inspect_calls.lock().unwrap() += 1;
+            Ok(self
+                .inspections
+                .lock()
+                .unwrap()
+                .pop_front()
+                .unwrap_or(RootProvisionProcessInspection::Unavailable))
+        }
+
+        fn start_checkpointed(
+            &self,
+            _checkpointed: CheckpointedRootProvisionProcess<'_>,
+            _context: &RuntimeDesiredEffectContext,
+        ) -> Result<RootProvisionProcessStart> {
+            panic!("record retirement must never start a process")
+        }
+    }
 
     struct Fixture {
         _root: tempfile::TempDir,
@@ -2133,6 +2609,124 @@ mod tests {
         }
     }
 
+    fn effect_context_with_processes(
+        fixture: &Fixture,
+        processes: Vec<cats_api::runtime_reconciliation::ProcessEvidence>,
+    ) -> RuntimeDesiredEffectContext {
+        let checkpoint = fixture.stored_checkpoint.checkpoint();
+        let desired = &fixture.acquired.desired;
+        let session = AgentSession {
+            version: ContractVersion::V1,
+            node_id: checkpoint.node_id.clone(),
+            immutable_host_id: id("host_01"),
+            node_boot_id: NodeBootId::new("11111111111111111111111111111111").unwrap(),
+            agent_instance_id: random('2'),
+            agent_session_epoch: Epoch::new(2).unwrap(),
+            registration_attempt_id: random('3'),
+            guest_config_digest: desired.runtime.guest_config_digest.clone(),
+            lease_deadline_unix_ms: UnixMillis::new(1_900_000_120_000).unwrap(),
+        };
+        let inventory_digest = digest('7');
+        let attestation = AdmissionInventoryAttestation {
+            version: ContractVersion::V1,
+            node_id: session.node_id.clone(),
+            agent_session_epoch: session.agent_session_epoch,
+            inventory_epoch: Epoch::new(4).unwrap(),
+            inventory_digest: inventory_digest.clone(),
+            inventory_read_position: Sequence::new(12).unwrap(),
+            accepted_at_unix_ms: UnixMillis::new(1_900_000_000_000).unwrap(),
+        };
+        let runtime = ObservedRuntimeStatus {
+            cat_id: checkpoint.cat_id.clone(),
+            applied_desired: Some(AppliedDesiredEvidence {
+                desired_revision: desired.desired_revision,
+                spec_digest: desired.spec_digest.clone(),
+                placement: desired.placement.clone(),
+                target: desired.target,
+            }),
+            runtime_incarnation: checkpoint.runtime_incarnation.clone(),
+            stable_state: checkpoint.stable_state,
+            step: checkpoint.step.clone(),
+            checkpoint: CheckpointEvidence::Valid {
+                checkpoint_path: host(
+                    super::super::runtime_checkpoint_path(
+                        &fixture.checkpoint_directory,
+                        &checkpoint.cat_id,
+                    )
+                    .to_str()
+                    .unwrap(),
+                ),
+                content_digest: fixture.stored_checkpoint.content_digest().clone(),
+                version: checkpoint.version,
+                cat_id: checkpoint.cat_id.clone(),
+                node_id: checkpoint.node_id.clone(),
+                desired_revision: checkpoint.desired_revision,
+                spec_digest: checkpoint.spec_digest.clone(),
+                placement_epoch: checkpoint.placement_epoch,
+                runtime_incarnation: checkpoint.runtime_incarnation.clone(),
+                stable_state: checkpoint.stable_state,
+                step: Box::new(checkpoint.step.clone()),
+                require_idle: Box::new(checkpoint.require_idle.clone()),
+                updated_at_unix_ms: checkpoint.updated_at_unix_ms,
+            },
+            processes,
+            volumes: checkpoint.volumes.clone(),
+            mounts: checkpoint.mounts.clone(),
+            networks: checkpoint.networks.clone(),
+            guest_transport: checkpoint.guest_transport.clone(),
+            warm_snapshot: checkpoint.warm_snapshot.clone(),
+            lifecycle_admission: checkpoint.lifecycle_admission,
+            routes: Vec::new(),
+            platform_guards: 0,
+            conditions: Vec::new(),
+        };
+        let observation = NodeObservation {
+            version: ContractVersion::V1,
+            observation_id: random('4'),
+            node_id: session.node_id.clone(),
+            node_boot_id: session.node_boot_id.clone(),
+            agent_instance_id: session.agent_instance_id.clone(),
+            agent_session_epoch: session.agent_session_epoch,
+            heartbeat_sequence: Sequence::new(9).unwrap(),
+            observed_at_unix_ms: UnixMillis::new(1_899_999_999_000).unwrap(),
+            complete_inventory: true,
+            inventory_epoch: attestation.inventory_epoch,
+            inventory_digest: Some(inventory_digest),
+            inventory_read_position: Some(attestation.inventory_read_position),
+            key_ring_version: None,
+            key_ring_digest: None,
+            loaded_kids: Vec::new(),
+            runtimes: vec![runtime],
+            residue: Vec::new(),
+        };
+        RuntimeDesiredEffectContext::for_test_with_admission(
+            fixture.state_directory.clone(),
+            Instant::now() + Duration::from_secs(10),
+            RuntimeDesiredEffectAdmission::for_test(session, observation, attestation),
+        )
+    }
+
+    fn absent_effect_context(fixture: &Fixture) -> RuntimeDesiredEffectContext {
+        effect_context_with_processes(fixture, Vec::new())
+    }
+
+    fn mutate_absent_effect_context(
+        fixture: &Fixture,
+        mutate: impl FnOnce(&mut AgentSession, &mut NodeObservation, &mut AdmissionInventoryAttestation),
+    ) -> RuntimeDesiredEffectContext {
+        let base = absent_effect_context(fixture);
+        let accepted = base.accepted_full().unwrap();
+        let mut session = accepted.session().clone();
+        let mut observation = accepted.observation().clone();
+        let mut attestation = accepted.attestation().clone();
+        mutate(&mut session, &mut observation, &mut attestation);
+        RuntimeDesiredEffectContext::for_test_with_admission(
+            fixture.state_directory.clone(),
+            Instant::now() + Duration::from_secs(10),
+            RuntimeDesiredEffectAdmission::for_test(session, observation, attestation),
+        )
+    }
+
     fn prepare_device_successor(
         fixture: &Fixture,
         handoff: RootServingHandoff,
@@ -2189,7 +2783,16 @@ mod tests {
             lineage.local_durable_generation = fixture.authority.volume.head.generation;
             lineage.remote_durable_generation = fixture.authority.volume.head.generation;
         }
-        checkpoint.updated_at_unix_ms = UnixMillis::new(1_720_000_000_001).unwrap();
+        checkpoint.updated_at_unix_ms = UnixMillis::new(
+            fixture
+                .stored_checkpoint
+                .checkpoint()
+                .updated_at_unix_ms
+                .get()
+                .checked_add(1)
+                .unwrap(),
+        )
+        .unwrap();
         encode_runtime_checkpoint(&checkpoint).expect("PrepareDevice successor is canonical V1");
         checkpoint
     }
@@ -2581,6 +3184,583 @@ mod tests {
     }
 
     #[test]
+    fn sealed_record_can_retire_then_rotate_and_reseal_without_overwrite() {
+        let mut fixture = fixture();
+        let handoff_store = fixture.store();
+        let first_ready = handoff_store
+            .seal_serving_ready(
+                &fixture.stored_checkpoint,
+                &fixture.acquired,
+                &fixture.authority,
+                &fixture.exact_process_proof().unwrap(),
+            )
+            .unwrap();
+        let first_record_inode = first_ready.record_identity().inode();
+        let target_inode = std::fs::metadata(fixture.target_path()).unwrap().ino();
+        drop(first_ready); // crash after the record durability barrier
+
+        let checkpoint_store = FileCheckpointStore::open(
+            &fixture.checkpoint_directory,
+            &fixture.acquired.desired.cat_id,
+        )
+        .unwrap();
+        let process_port = RetirementProcessPort::with_inspections([
+            RootProvisionProcessInspection::Absent,
+            RootProvisionProcessInspection::Absent,
+        ]);
+        assert_eq!(
+            handoff_store
+                .retire_record_after_exact_process_absence(
+                    &checkpoint_store,
+                    &fixture.stored_checkpoint,
+                    &fixture.acquired,
+                    &fixture.authority,
+                    fixture.expected_executable_path.clone(),
+                    &process_port,
+                    &absent_effect_context(&fixture),
+                )
+                .unwrap(),
+            ServingHandoffRetirement::Retired
+        );
+        assert!(!fixture.record_path().exists());
+        assert!(fixture.target_path().exists());
+        assert_eq!(
+            std::fs::metadata(fixture.target_path()).unwrap().ino(),
+            target_inode
+        );
+
+        let old_checkpoint = fixture.stored_checkpoint.checkpoint().clone();
+        let old_context = provision_root_authorization_context_digest(&old_checkpoint).unwrap();
+        let new_token = random('5');
+        fixture.stored_checkpoint = handoff_store
+            .rotate_process_token_after_retirement(
+                &checkpoint_store,
+                &fixture.stored_checkpoint,
+                &fixture.acquired,
+                &fixture.authority,
+                fixture.expected_executable_path.clone(),
+                new_token.clone(),
+                UnixMillis::new(
+                    old_checkpoint
+                        .updated_at_unix_ms
+                        .get()
+                        .checked_add(1)
+                        .unwrap(),
+                )
+                .unwrap(),
+                &process_port,
+                &absent_effect_context(&fixture),
+            )
+            .unwrap();
+        let ReconcileStep::ProvisionRootImage {
+            scope_id: rotated_scope,
+            control_socket_path: rotated_control,
+            data_directory: rotated_data,
+            process_identity_token: rotated_token,
+            ..
+        } = &fixture.stored_checkpoint.checkpoint().step
+        else {
+            unreachable!()
+        };
+        let ReconcileStep::ProvisionRootImage {
+            scope_id: old_scope,
+            control_socket_path: old_control,
+            data_directory: old_data,
+            ..
+        } = &old_checkpoint.step
+        else {
+            unreachable!()
+        };
+        assert_eq!(rotated_token, &new_token);
+        assert_eq!(
+            (rotated_scope, rotated_control, rotated_data),
+            (old_scope, old_control, old_data)
+        );
+        assert_eq!(
+            provision_root_authorization_context_digest(fixture.stored_checkpoint.checkpoint())
+                .unwrap(),
+            old_context
+        );
+
+        let replayed_target = handoff_store
+            .seal_target_control_authorization(
+                &fixture.stored_checkpoint,
+                &fixture.acquired,
+                &fixture.authority,
+            )
+            .unwrap();
+        assert_eq!(
+            std::fs::metadata(fixture.target_path()).unwrap().ino(),
+            target_inode
+        );
+        drop(replayed_target);
+
+        fixture.process.ownership_token = new_token.clone();
+        fixture.process.handshake.process_identity_token = new_token;
+        let second_ready = handoff_store
+            .seal_serving_ready(
+                &fixture.stored_checkpoint,
+                &fixture.acquired,
+                &fixture.authority,
+                &fixture.exact_process_proof().unwrap(),
+            )
+            .unwrap();
+        assert_ne!(second_ready.record_identity().inode(), first_record_inode);
+        let successor = second_ready
+            .consume_for_prepare_device(&fixture.stored_checkpoint, |handoff| {
+                let successor = prepare_device_successor(&fixture, handoff);
+                checkpoint_store
+                    .replace(&fixture.stored_checkpoint, &successor)
+                    .context("real PrepareDevice CAS after resealed handoff")?;
+                Ok(successor)
+            })
+            .unwrap();
+        let current = checkpoint_store.load().unwrap().unwrap();
+        assert_eq!(current.checkpoint(), &successor);
+        assert!(matches!(
+            current.checkpoint().step,
+            ReconcileStep::PrepareDevice { .. }
+        ));
+        assert_eq!(process_port.inspect_calls(), 2);
+    }
+
+    #[test]
+    fn handoff_retirement_recovers_every_unlink_and_fsync_crash_window() {
+        for stage in [
+            PublicationPoint::BeforeUnlink,
+            PublicationPoint::Unlinked,
+            PublicationPoint::DirectorySynced,
+        ] {
+            let fixture = fixture();
+            let handoff_store = fixture.store();
+            drop(
+                handoff_store
+                    .seal_serving_ready(
+                        &fixture.stored_checkpoint,
+                        &fixture.acquired,
+                        &fixture.authority,
+                        &fixture.exact_process_proof().unwrap(),
+                    )
+                    .unwrap(),
+            );
+            let checkpoint_store = FileCheckpointStore::open(
+                &fixture.checkpoint_directory,
+                &fixture.acquired.desired.cat_id,
+            )
+            .unwrap();
+            let process_port = RetirementProcessPort::with_inspections([
+                RootProvisionProcessInspection::Absent,
+                RootProvisionProcessInspection::Absent,
+                RootProvisionProcessInspection::Absent,
+            ]);
+            handoff_store.inject_crash_once(PublicationStage::new(
+                PublicationArtifact::HandoffRetirement,
+                stage,
+            ));
+            assert!(handoff_store
+                .retire_record_after_exact_process_absence(
+                    &checkpoint_store,
+                    &fixture.stored_checkpoint,
+                    &fixture.acquired,
+                    &fixture.authority,
+                    fixture.expected_executable_path.clone(),
+                    &process_port,
+                    &absent_effect_context(&fixture),
+                )
+                .is_err());
+            if stage == PublicationPoint::BeforeUnlink {
+                assert!(fixture.record_path().exists());
+            } else {
+                assert!(!fixture.record_path().exists());
+            }
+
+            if stage == PublicationPoint::Unlinked {
+                handoff_store.inject_crash_once(PublicationStage::new(
+                    PublicationArtifact::HandoffRetirement,
+                    PublicationPoint::BeforeDirectorySync,
+                ));
+                assert!(handoff_store
+                    .retire_record_after_exact_process_absence(
+                        &checkpoint_store,
+                        &fixture.stored_checkpoint,
+                        &fixture.acquired,
+                        &fixture.authority,
+                        fixture.expected_executable_path.clone(),
+                        &process_port,
+                        &absent_effect_context(&fixture),
+                    )
+                    .is_err());
+            }
+            let recovered = handoff_store
+                .retire_record_after_exact_process_absence(
+                    &checkpoint_store,
+                    &fixture.stored_checkpoint,
+                    &fixture.acquired,
+                    &fixture.authority,
+                    fixture.expected_executable_path.clone(),
+                    &process_port,
+                    &absent_effect_context(&fixture),
+                )
+                .unwrap();
+            assert!(matches!(
+                recovered,
+                ServingHandoffRetirement::Retired
+                    | ServingHandoffRetirement::RecoveredAlreadyAbsent
+            ));
+            assert!(!fixture.record_path().exists());
+            assert!(fixture.target_path().exists());
+        }
+    }
+
+    #[test]
+    fn retirement_never_deletes_on_projected_present_physical_conflict_or_path_aba() {
+        let fixture = fixture();
+        let handoff_store = fixture.store();
+        drop(
+            handoff_store
+                .seal_serving_ready(
+                    &fixture.stored_checkpoint,
+                    &fixture.acquired,
+                    &fixture.authority,
+                    &fixture.exact_process_proof().unwrap(),
+                )
+                .unwrap(),
+        );
+        let checkpoint_store = FileCheckpointStore::open(
+            &fixture.checkpoint_directory,
+            &fixture.acquired.desired.cat_id,
+        )
+        .unwrap();
+        let record_bytes = std::fs::read(fixture.record_path()).unwrap();
+        let projected_process = fixture
+            .exact_process_proof()
+            .unwrap()
+            .into_process_evidence();
+        let not_inspected =
+            RetirementProcessPort::with_inspections([RootProvisionProcessInspection::Absent]);
+        assert!(handoff_store
+            .retire_record_after_exact_process_absence(
+                &checkpoint_store,
+                &fixture.stored_checkpoint,
+                &fixture.acquired,
+                &fixture.authority,
+                fixture.expected_executable_path.clone(),
+                &not_inspected,
+                &effect_context_with_processes(&fixture, vec![projected_process]),
+            )
+            .is_err());
+        assert_eq!(not_inspected.inspect_calls(), 0);
+        assert_eq!(std::fs::read(fixture.record_path()).unwrap(), record_bytes);
+
+        for inspection in [
+            RootProvisionProcessInspection::Exact(Box::new(fixture.process.clone())),
+            RootProvisionProcessInspection::Conflict(
+                RootProvisionProcessConflict::DuplicateIdentity,
+            ),
+            RootProvisionProcessInspection::Unavailable,
+        ] {
+            let port = RetirementProcessPort::with_inspections([inspection]);
+            assert!(handoff_store
+                .retire_record_after_exact_process_absence(
+                    &checkpoint_store,
+                    &fixture.stored_checkpoint,
+                    &fixture.acquired,
+                    &fixture.authority,
+                    fixture.expected_executable_path.clone(),
+                    &port,
+                    &absent_effect_context(&fixture),
+                )
+                .is_err());
+            assert_eq!(std::fs::read(fixture.record_path()).unwrap(), record_bytes);
+        }
+
+        let swap_path = fixture.record_path();
+        handoff_store.inject_mutation_once(
+            PublicationStage::new(
+                PublicationArtifact::HandoffRetirement,
+                PublicationPoint::BeforeUnlink,
+            ),
+            move || swap_same_bytes(&swap_path, "retirement-aba"),
+        );
+        let absent =
+            RetirementProcessPort::with_inspections([RootProvisionProcessInspection::Absent]);
+        assert!(handoff_store
+            .retire_record_after_exact_process_absence(
+                &checkpoint_store,
+                &fixture.stored_checkpoint,
+                &fixture.acquired,
+                &fixture.authority,
+                fixture.expected_executable_path.clone(),
+                &absent,
+                &absent_effect_context(&fixture),
+            )
+            .is_err());
+        assert_eq!(std::fs::read(fixture.record_path()).unwrap(), record_bytes);
+    }
+
+    #[test]
+    fn incomplete_or_nonidentical_accepted_inventory_cannot_authorize_retirement() {
+        let fixture = fixture();
+        let handoff_store = fixture.store();
+        drop(
+            handoff_store
+                .seal_serving_ready(
+                    &fixture.stored_checkpoint,
+                    &fixture.acquired,
+                    &fixture.authority,
+                    &fixture.exact_process_proof().unwrap(),
+                )
+                .unwrap(),
+        );
+        let checkpoint_store = FileCheckpointStore::open(
+            &fixture.checkpoint_directory,
+            &fixture.acquired.desired.cat_id,
+        )
+        .unwrap();
+        let record_bytes = std::fs::read(fixture.record_path()).unwrap();
+        let contexts = [
+            mutate_absent_effect_context(&fixture, |_session, observation, _attestation| {
+                observation.complete_inventory = false;
+            }),
+            mutate_absent_effect_context(&fixture, |_session, observation, _attestation| {
+                let runtime = observation.runtimes.first_mut().unwrap();
+                let CheckpointEvidence::Valid { content_digest, .. } = &mut runtime.checkpoint
+                else {
+                    unreachable!()
+                };
+                *content_digest = digest('9');
+            }),
+            mutate_absent_effect_context(&fixture, |_session, observation, _attestation| {
+                let runtime = observation.runtimes.first_mut().unwrap();
+                let CheckpointEvidence::Valid {
+                    checkpoint_path, ..
+                } = &mut runtime.checkpoint
+                else {
+                    unreachable!()
+                };
+                *checkpoint_path = host("/var/lib/cats/foreign.runtime.json");
+            }),
+            mutate_absent_effect_context(&fixture, |_session, observation, _attestation| {
+                observation.runtimes.push(observation.runtimes[0].clone());
+            }),
+        ];
+        let port = RetirementProcessPort::with_inspections(std::iter::repeat_n(
+            RootProvisionProcessInspection::Absent,
+            contexts.len(),
+        ));
+        for context in contexts {
+            assert!(handoff_store
+                .retire_record_after_exact_process_absence(
+                    &checkpoint_store,
+                    &fixture.stored_checkpoint,
+                    &fixture.acquired,
+                    &fixture.authority,
+                    fixture.expected_executable_path.clone(),
+                    &port,
+                    &context,
+                )
+                .is_err());
+            assert_eq!(std::fs::read(fixture.record_path()).unwrap(), record_bytes);
+        }
+        assert_eq!(port.inspect_calls(), 0);
+    }
+
+    #[test]
+    fn retirement_preserves_foreign_duplicate_and_unpublished_artifacts() {
+        for residue in [
+            "malformed_record",
+            "duplicate_record",
+            "record_temp",
+            "target_temp",
+        ] {
+            let fixture = fixture();
+            let handoff_store = fixture.store();
+            drop(
+                handoff_store
+                    .seal_serving_ready(
+                        &fixture.stored_checkpoint,
+                        &fixture.acquired,
+                        &fixture.authority,
+                        &fixture.exact_process_proof().unwrap(),
+                    )
+                    .unwrap(),
+            );
+            let exact_record = std::fs::read(fixture.record_path()).unwrap();
+            let residue_path = match residue {
+                "malformed_record" => {
+                    std::fs::write(fixture.record_path(), b"{}").unwrap();
+                    fixture.record_path()
+                }
+                "duplicate_record" => {
+                    let path = fixture.data_directory.join("serving-handoff-foreign.json");
+                    std::fs::write(&path, b"foreign").unwrap();
+                    path
+                }
+                "record_temp" => {
+                    std::fs::write(fixture.record_temp_path(), b"partial").unwrap();
+                    fixture.record_temp_path()
+                }
+                "target_temp" => {
+                    std::fs::write(fixture.target_temp_path(), b"partial").unwrap();
+                    fixture.target_temp_path()
+                }
+                _ => unreachable!(),
+            };
+            std::fs::set_permissions(&residue_path, std::fs::Permissions::from_mode(0o600))
+                .unwrap();
+            let residue_bytes = std::fs::read(&residue_path).unwrap();
+            let checkpoint_store = FileCheckpointStore::open(
+                &fixture.checkpoint_directory,
+                &fixture.acquired.desired.cat_id,
+            )
+            .unwrap();
+            let port =
+                RetirementProcessPort::with_inspections([RootProvisionProcessInspection::Absent]);
+            assert!(handoff_store
+                .retire_record_after_exact_process_absence(
+                    &checkpoint_store,
+                    &fixture.stored_checkpoint,
+                    &fixture.acquired,
+                    &fixture.authority,
+                    fixture.expected_executable_path.clone(),
+                    &port,
+                    &absent_effect_context(&fixture),
+                )
+                .is_err());
+            assert_eq!(std::fs::read(&residue_path).unwrap(), residue_bytes);
+            if residue != "malformed_record" {
+                assert_eq!(std::fs::read(fixture.record_path()).unwrap(), exact_record);
+            }
+        }
+    }
+
+    #[test]
+    fn retirement_holds_checkpoint_writer_barrier_through_directory_fsync() {
+        let fixture = fixture();
+        let handoff_store = fixture.store();
+        drop(
+            handoff_store
+                .seal_serving_ready(
+                    &fixture.stored_checkpoint,
+                    &fixture.acquired,
+                    &fixture.authority,
+                    &fixture.exact_process_proof().unwrap(),
+                )
+                .unwrap(),
+        );
+        let checkpoint_store = Arc::new(
+            FileCheckpointStore::open(
+                &fixture.checkpoint_directory,
+                &fixture.acquired.desired.cat_id,
+            )
+            .unwrap(),
+        );
+        let mut successor = fixture.stored_checkpoint.checkpoint().clone();
+        successor.updated_at_unix_ms =
+            UnixMillis::new(successor.updated_at_unix_ms.get().checked_add(1).unwrap()).unwrap();
+        let expected = fixture.stored_checkpoint.clone();
+        let writer_store = checkpoint_store.clone();
+        let (begin_tx, begin_rx) = std::sync::mpsc::channel();
+        let (attempted_tx, attempted_rx) = std::sync::mpsc::channel();
+        let completed = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let writer_completed = completed.clone();
+        let writer = std::thread::spawn(move || {
+            begin_rx.recv().unwrap();
+            attempted_tx.send(()).unwrap();
+            writer_store.replace(&expected, &successor).unwrap();
+            writer_completed.store(true, std::sync::atomic::Ordering::SeqCst);
+        });
+        let hook_completed = completed.clone();
+        handoff_store.inject_mutation_once(
+            PublicationStage::new(
+                PublicationArtifact::HandoffRetirement,
+                PublicationPoint::BeforeUnlink,
+            ),
+            move || {
+                begin_tx.send(()).unwrap();
+                attempted_rx.recv().unwrap();
+                assert!(
+                    !hook_completed.load(std::sync::atomic::Ordering::SeqCst),
+                    "checkpoint writer crossed the retained retirement barrier"
+                );
+            },
+        );
+        let port =
+            RetirementProcessPort::with_inspections([RootProvisionProcessInspection::Absent]);
+        assert_eq!(
+            handoff_store
+                .retire_record_after_exact_process_absence(
+                    checkpoint_store.as_ref(),
+                    &fixture.stored_checkpoint,
+                    &fixture.acquired,
+                    &fixture.authority,
+                    fixture.expected_executable_path.clone(),
+                    &port,
+                    &absent_effect_context(&fixture),
+                )
+                .unwrap(),
+            ServingHandoffRetirement::Retired
+        );
+        writer.join().unwrap();
+        assert!(completed.load(std::sync::atomic::Ordering::SeqCst));
+        let current = checkpoint_store.load().unwrap().unwrap();
+        assert_eq!(
+            current.checkpoint().updated_at_unix_ms.get(),
+            fixture
+                .stored_checkpoint
+                .checkpoint()
+                .updated_at_unix_ms
+                .get()
+                + 1
+        );
+    }
+
+    #[test]
+    fn cancellation_at_the_last_pre_unlink_edge_preserves_the_record() {
+        let fixture = fixture();
+        let handoff_store = fixture.store();
+        drop(
+            handoff_store
+                .seal_serving_ready(
+                    &fixture.stored_checkpoint,
+                    &fixture.acquired,
+                    &fixture.authority,
+                    &fixture.exact_process_proof().unwrap(),
+                )
+                .unwrap(),
+        );
+        let record_bytes = std::fs::read(fixture.record_path()).unwrap();
+        let checkpoint_store = FileCheckpointStore::open(
+            &fixture.checkpoint_directory,
+            &fixture.acquired.desired.cat_id,
+        )
+        .unwrap();
+        let context = absent_effect_context(&fixture);
+        let cancel = context.clone();
+        handoff_store.inject_mutation_once(
+            PublicationStage::new(
+                PublicationArtifact::HandoffRetirement,
+                PublicationPoint::BeforeUnlink,
+            ),
+            move || cancel.cancel_for_test(),
+        );
+        let port =
+            RetirementProcessPort::with_inspections([RootProvisionProcessInspection::Absent]);
+        assert!(handoff_store
+            .retire_record_after_exact_process_absence(
+                &checkpoint_store,
+                &fixture.stored_checkpoint,
+                &fixture.acquired,
+                &fixture.authority,
+                fixture.expected_executable_path.clone(),
+                &port,
+                &context,
+            )
+            .is_err());
+        assert_eq!(std::fs::read(fixture.record_path()).unwrap(), record_bytes);
+    }
+
+    #[test]
     fn failed_consume_closure_leaves_the_exact_predecessor_current() {
         let fixture = fixture();
         let ready = fixture
@@ -2868,6 +4048,9 @@ mod tests {
             let swap_path = match artifact {
                 PublicationArtifact::TargetAuthorization => fixture.target_path(),
                 PublicationArtifact::HandoffRecord => fixture.record_path(),
+                PublicationArtifact::HandoffRetirement => {
+                    unreachable!("publication matrix excludes retirement")
+                }
             };
             store.inject_mutation_once(
                 PublicationStage::new(artifact, PublicationPoint::DirectorySynced),
