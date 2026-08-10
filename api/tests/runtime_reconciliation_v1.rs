@@ -11,10 +11,16 @@ const AGENT_SESSION_WIRE: &str = r#"{"agent_instance_id":"4444444444444444444444
 const SPEC_DIGEST: &str = "sha256:529c32e8600910283f99bf949af5c31fdadcf3757463eb6c4811c61673ed9409";
 const CHECKPOINT_DIGEST: &str =
     "sha256:602bd0f3a0f1a29f269fa2946fa1a52ea154ba1623b5ca2de18e657cad3753fb";
+const PROVISION_ROOT_CHECKPOINT_DIGEST: &str =
+    "sha256:ed788516e920c57a6700eef477a9e8af48bee99ee0ded541965a6fda96aa9a4c";
+const PREPARE_DEVICE_CHECKPOINT_DIGEST: &str =
+    "sha256:1bf547ac68b813152cef539ad6760d70b193e702b268e1df37362380c3dfe28c";
 
 const DESIRED_DIGEST_INPUT: &str = r#"{"cat_id":"cat_01","desired_revision":7,"endpoints":[{"endpoint_id":"ep_01","hostname":"app.example.test","protocol":"http","route_epoch":9,"target_port":8080}],"placement":{"kind":"assigned","node_id":"node_a","placement_epoch":3},"runtime":{"boot_image_digest":"sha256:0000000000000000000000000000000000000000000000000000000000000000","guest_config_digest":"sha256:1111111111111111111111111111111111111111111111111111111111111111","memory_bytes":2147483648,"network_config":{"gateway_ipv4":"10.240.0.5","guest_ipv4":"10.240.0.6","guest_mac":"02:ca:0a:f0:00:06","kind":"isolated_ipv4","network_id":"net_01","prefix_length":30},"vcpus":2},"target":"cold","transition":{"kind":"cancel_and_drain"},"version":1,"volumes":[{"access":"read_write_once","acquire":{"expected_unowned_epoch":0,"kind":"normal","transition_id":"22222222222222222222222222222222"},"attachment_id":"att_01","disk_id":"disk_root","disk_kind":"root","disposition":{"kind":"retain"},"durability":"strict","guest_device":{"serial":"cats-root","slot":0},"mount":null,"size_bytes":4294967296,"volume_id":"vol_root","volume_intent_id":"vint_root"}],"workspace_id":"ws_01"}"#;
 
 const CHECKPOINT_WIRE: &str = r#"{"cat_id":"cat_01","desired_revision":7,"guest_transport":{"kind":"unavailable"},"lifecycle_admission":"closed","mounts":[],"networks":[],"node_id":"node_a","placement_epoch":3,"processes":[],"require_idle":{"kind":"not_applicable"},"route_gates":[],"runtime_incarnation":null,"spec_digest":"sha256:529c32e8600910283f99bf949af5c31fdadcf3757463eb6c4811c61673ed9409","stable_state":null,"step":{"inventory_epoch":4,"kind":"inspect_inventory"},"updated_at_unix_ms":1720000000000,"version":1,"volumes":[],"warm_snapshot":{"kind":"absent"}}"#;
+const PROVISION_ROOT_CHECKPOINT_WIRE: &str = r#"{"cat_id":"cat_01","desired_revision":7,"guest_transport":{"kind":"unavailable"},"lifecycle_admission":"closed","mounts":[],"networks":[],"node_id":"node_a","placement_epoch":3,"processes":[],"require_idle":{"kind":"not_applicable"},"route_gates":[],"runtime_incarnation":null,"spec_digest":"sha256:529c32e8600910283f99bf949af5c31fdadcf3757463eb6c4811c61673ed9409","stable_state":null,"step":{"attachment_epoch":8,"attachment_id":"att_01","boot_image_digest":"sha256:0000000000000000000000000000000000000000000000000000000000000000","control_socket_path":"/run/cats/cat_01/blockd-root.sock","data_directory":"/var/lib/cats/vol_root","expected_blank_head":{"generation":0,"root_hash":null,"root_object_id":null},"expected_provisioned_head":{"generation":1,"root_hash":"sha256:0000000000000000000000000000000000000000000000000000000000000000","root_object_id":"volumes/vol_root/roots/1"},"kind":"provision_root_image","process_identity_token":"fedcba0987654321fedcba0987654321","provision_transition_id":"1234567890abcdef1234567890abcdef","scope_id":"cats-cat_01-root-provision","size_bytes":4294967296,"volume_id":"vol_root"},"updated_at_unix_ms":1720000000000,"version":1,"volumes":[],"warm_snapshot":{"kind":"absent"}}"#;
+const PREPARE_DEVICE_CHECKPOINT_WIRE: &str = r#"{"cat_id":"cat_01","desired_revision":7,"guest_transport":{"kind":"unavailable"},"lifecycle_admission":"closed","mounts":[],"networks":[],"node_id":"node_a","placement_epoch":3,"processes":[],"require_idle":{"kind":"not_applicable"},"route_gates":[],"runtime_incarnation":null,"spec_digest":"sha256:529c32e8600910283f99bf949af5c31fdadcf3757463eb6c4811c61673ed9409","stable_state":null,"step":{"acquire_origin":{"kind":"normal","transition_id":"22222222222222222222222222222222"},"attachment_epoch":8,"attachment_id":"att_01","durability":"strict","expected_head":{"generation":1,"root_hash":"sha256:0000000000000000000000000000000000000000000000000000000000000000","root_object_id":"volumes/vol_root/roots/1"},"frontend":{"kind":"vhost_user_blk","queue_size":256,"queues":2,"socket_path":"/run/cats/cat_01/root-vhost.sock"},"guest_device":{"serial":"cats-root","slot":0},"kind":"prepare_device","ownership_token":"88888888888888888888888888888888","serving_handoff":{"predecessor_checkpoint_content_digest":"sha256:ed788516e920c57a6700eef477a9e8af48bee99ee0ded541965a6fda96aa9a4c","record":{"content_sha256":"sha256:3333333333333333333333333333333333333333333333333333333333333333","device":16777217,"inode":42,"length":1024,"path":"/var/lib/cats/handoffs/cat_01/root-serving.json"}},"serving_process":{"control_socket_path":"/run/cats/cat_01/blockd-serving-control.sock","data_directory":"/var/lib/cats/vol_root","executable_path":"/usr/bin/cats-blockd","process_identity_token":"77777777777777777777777777777777","scope_id":"cats-cat_01-root-serving"},"size_bytes":4294967296,"volume_id":"vol_root"},"updated_at_unix_ms":1720000000000,"version":1,"volumes":[],"warm_snapshot":{"kind":"absent"}}"#;
 
 const EMPTY_INVENTORY_INPUT: &str = r#"{"agent_instance_id":"44444444444444444444444444444444","agent_session_epoch":2,"inventory_epoch":4,"inventory_read_position":12,"node_boot_id":"33333333333333333333333333333333","node_id":"node_a","residue":[],"runtimes":[],"version":1}"#;
 
@@ -139,6 +145,50 @@ fn provision_root_image_step(size_bytes: u64) -> serde_json::Value {
         "boot_image_digest": ZERO_DIGEST,
         "expected_blank_head": zero_remote_head(),
         "expected_provisioned_head": nonzero_remote_head(),
+    })
+}
+
+fn prepare_device_step() -> serde_json::Value {
+    serde_json::json!({
+        "kind": "prepare_device",
+        "volume_id": "vol_root",
+        "attachment_id": "att_01",
+        "attachment_epoch": 8,
+        "acquire_origin": {
+            "kind": "normal",
+            "transition_id": "22222222222222222222222222222222",
+        },
+        "expected_head": nonzero_remote_head(),
+        "size_bytes": 4_294_967_296_u64,
+        "durability": "strict",
+        "guest_device": {
+            "serial": "cats-root",
+            "slot": 0,
+        },
+        "ownership_token": "88888888888888888888888888888888",
+        "serving_handoff": {
+            "predecessor_checkpoint_content_digest": PROVISION_ROOT_CHECKPOINT_DIGEST,
+            "record": {
+                "path": "/var/lib/cats/handoffs/cat_01/root-serving.json",
+                "device": 16_777_217,
+                "inode": 42,
+                "length": 1_024,
+                "content_sha256": "sha256:3333333333333333333333333333333333333333333333333333333333333333",
+            },
+        },
+        "serving_process": {
+            "scope_id": "cats-cat_01-root-serving",
+            "control_socket_path": "/run/cats/cat_01/blockd-serving-control.sock",
+            "data_directory": "/var/lib/cats/vol_root",
+            "executable_path": "/usr/bin/cats-blockd",
+            "process_identity_token": "77777777777777777777777777777777",
+        },
+        "frontend": {
+            "kind": "vhost_user_blk",
+            "socket_path": "/run/cats/cat_01/root-vhost.sock",
+            "queues": 2,
+            "queue_size": 256,
+        },
     })
 }
 
@@ -545,6 +595,34 @@ fn fixed_desired_and_checkpoint_digests_match() {
     assert_eq!(
         checkpoint_content_digest(&checkpoint).unwrap().as_str(),
         CHECKPOINT_DIGEST
+    );
+
+    let provision = decode_runtime_checkpoint(PROVISION_ROOT_CHECKPOINT_WIRE.as_bytes()).unwrap();
+    assert_eq!(
+        canonical_json(&provision),
+        PROVISION_ROOT_CHECKPOINT_WIRE.as_bytes()
+    );
+    assert_eq!(
+        encode_runtime_checkpoint(&provision).unwrap(),
+        PROVISION_ROOT_CHECKPOINT_WIRE.as_bytes()
+    );
+    assert_eq!(
+        checkpoint_content_digest(&provision).unwrap().as_str(),
+        PROVISION_ROOT_CHECKPOINT_DIGEST
+    );
+
+    let prepare = decode_runtime_checkpoint(PREPARE_DEVICE_CHECKPOINT_WIRE.as_bytes()).unwrap();
+    assert_eq!(
+        canonical_json(&prepare),
+        PREPARE_DEVICE_CHECKPOINT_WIRE.as_bytes()
+    );
+    assert_eq!(
+        encode_runtime_checkpoint(&prepare).unwrap(),
+        PREPARE_DEVICE_CHECKPOINT_WIRE.as_bytes()
+    );
+    assert_eq!(
+        checkpoint_content_digest(&prepare).unwrap().as_str(),
+        PREPARE_DEVICE_CHECKPOINT_DIGEST
     );
 }
 
@@ -2216,6 +2294,7 @@ fn volume_and_gate_reconcile_steps_round_trip_without_copied_authority_payloads(
             "provision_root_image",
             provision_root_image_step(4_294_967_296),
         ),
+        ("prepare_device", prepare_device_step()),
         (
             "takeover_acquire",
             serde_json::json!({
@@ -2460,6 +2539,374 @@ fn provision_root_image_size_and_shape_are_strict() {
             alias,
             "/step/kind",
             MalformedProblem::InvalidValue,
+        ),
+    ];
+    for (name, step, pointer, problem) in cases {
+        let mut checkpoint: serde_json::Value = serde_json::from_str(CHECKPOINT_WIRE).unwrap();
+        checkpoint["step"] = step;
+        let error = reject_checkpoint(&serde_json::to_vec(&checkpoint).unwrap());
+        assert_eq!(malformed(&error).0.as_str(), pointer, "{name}");
+        assert_eq!(malformed(&error).1, problem, "{name}");
+    }
+}
+
+#[test]
+fn prepare_device_step_is_shared_by_every_wire_host() {
+    let step = prepare_device_step();
+
+    let mut checkpoint: serde_json::Value = serde_json::from_str(CHECKPOINT_WIRE).unwrap();
+    checkpoint["step"] = step.clone();
+    let decoded = decode_runtime_checkpoint(&serde_json::to_vec(&checkpoint).unwrap()).unwrap();
+    assert!(matches!(
+        decoded.step,
+        ReconcileStep::PrepareDevice {
+            attachment_epoch,
+            size_bytes: 4_294_967_296,
+            ref ownership_token,
+            ref serving_process,
+            ..
+        } if attachment_epoch.get() == 8
+            && ownership_token.as_str() == "88888888888888888888888888888888"
+            && serving_process.process_identity_token.as_str()
+                == "77777777777777777777777777777777"
+    ));
+    assert_eq!(
+        serde_json::from_slice::<serde_json::Value>(&encode_runtime_checkpoint(&decoded).unwrap())
+            .unwrap(),
+        checkpoint,
+    );
+
+    let mut observation = nonempty_observation_value();
+    observation["runtimes"][0]["step"] = step.clone();
+    observation["runtimes"][0]["checkpoint"]["step"] = step.clone();
+    refresh_inventory_digest(&mut observation);
+    decode_node_observation(&serde_json::to_vec(&observation).unwrap()).unwrap();
+
+    let mut condition_host = nonempty_observation_value();
+    condition_host["runtimes"][0]["conditions"] = serde_json::json!([{
+        "kind": "progressing",
+        "reason": {"kind": "reconcile_step", "step": step},
+    }]);
+    decode_node_observation(&serde_json::to_vec(&condition_host).unwrap()).unwrap();
+}
+
+#[test]
+fn prepare_device_requires_nonblank_head_in_every_wire_host() {
+    type Reject = fn(&[u8]) -> ContractError;
+
+    let mut invalid_step = prepare_device_step();
+    invalid_step["expected_head"] = zero_remote_head();
+
+    let mut checkpoint: serde_json::Value = serde_json::from_str(CHECKPOINT_WIRE).unwrap();
+    checkpoint["step"] = invalid_step.clone();
+
+    let mut observation = nonempty_observation_value();
+    observation["runtimes"][0]["step"] = invalid_step.clone();
+    observation["runtimes"][0]["checkpoint"]["step"] = invalid_step.clone();
+
+    let mut condition_host = nonempty_observation_value();
+    condition_host["runtimes"][0]["conditions"] = serde_json::json!([{
+        "kind": "progressing",
+        "reason": {"kind": "reconcile_step", "step": invalid_step},
+    }]);
+
+    let cases: Vec<(&str, serde_json::Value, Reject, &str)> = vec![
+        (
+            "runtime_checkpoint",
+            checkpoint,
+            reject_checkpoint,
+            "/step/expected_head",
+        ),
+        (
+            "observation_runtime_and_checkpoint",
+            observation,
+            reject_observation,
+            "/runtimes/0/checkpoint/step/expected_head",
+        ),
+        (
+            "progressing_condition",
+            condition_host,
+            reject_observation,
+            "/runtimes/0/conditions/0/reason/step/expected_head",
+        ),
+    ];
+
+    for (host, value, reject, pointer) in cases {
+        let error = reject(&serde_json::to_vec(&value).unwrap());
+        assert_eq!(malformed(&error).0.as_str(), pointer, "{host}");
+        assert_eq!(
+            malformed(&error).1,
+            MalformedProblem::InvalidValue,
+            "{host}"
+        );
+    }
+}
+
+#[test]
+fn prepare_device_numeric_boundaries_and_frontends_are_closed() {
+    for value in [1_u64, i64::MAX as u64] {
+        let mut checkpoint: serde_json::Value = serde_json::from_str(CHECKPOINT_WIRE).unwrap();
+        checkpoint["step"] = prepare_device_step();
+        checkpoint["step"]["attachment_epoch"] = value.into();
+        checkpoint["step"]["size_bytes"] = value.into();
+        checkpoint["step"]["serving_handoff"]["record"]["length"] = value.into();
+        decode_runtime_checkpoint(&serde_json::to_vec(&checkpoint).unwrap()).unwrap();
+    }
+    for value in [0_u64, i64::MAX as u64] {
+        let mut checkpoint: serde_json::Value = serde_json::from_str(CHECKPOINT_WIRE).unwrap();
+        checkpoint["step"] = prepare_device_step();
+        checkpoint["step"]["serving_handoff"]["record"]["device"] = value.into();
+        decode_runtime_checkpoint(&serde_json::to_vec(&checkpoint).unwrap()).unwrap();
+    }
+    for value in [1_u64, i64::MAX as u64] {
+        let mut checkpoint: serde_json::Value = serde_json::from_str(CHECKPOINT_WIRE).unwrap();
+        checkpoint["step"] = prepare_device_step();
+        checkpoint["step"]["serving_handoff"]["record"]["inode"] = value.into();
+        decode_runtime_checkpoint(&serde_json::to_vec(&checkpoint).unwrap()).unwrap();
+    }
+
+    let valid_vhost = [(1, 2), (64, 32_768)];
+    for (queues, queue_size) in valid_vhost {
+        let mut checkpoint: serde_json::Value = serde_json::from_str(CHECKPOINT_WIRE).unwrap();
+        checkpoint["step"] = prepare_device_step();
+        checkpoint["step"]["frontend"]["queues"] = queues.into();
+        checkpoint["step"]["frontend"]["queue_size"] = queue_size.into();
+        decode_runtime_checkpoint(&serde_json::to_vec(&checkpoint).unwrap()).unwrap();
+    }
+
+    for (pointer, value) in [
+        ("/step/attachment_epoch", 0_u64),
+        ("/step/attachment_epoch", i64::MAX as u64 + 1),
+        ("/step/size_bytes", 0),
+        ("/step/size_bytes", i64::MAX as u64 + 1),
+        ("/step/serving_handoff/record/length", 0),
+        ("/step/serving_handoff/record/length", i64::MAX as u64 + 1),
+        ("/step/serving_handoff/record/device", i64::MAX as u64 + 1),
+        ("/step/serving_handoff/record/inode", 0),
+        ("/step/serving_handoff/record/inode", i64::MAX as u64 + 1),
+    ] {
+        let mut checkpoint: serde_json::Value = serde_json::from_str(CHECKPOINT_WIRE).unwrap();
+        checkpoint["step"] = prepare_device_step();
+        match pointer {
+            "/step/attachment_epoch" => checkpoint["step"]["attachment_epoch"] = value.into(),
+            "/step/size_bytes" => checkpoint["step"]["size_bytes"] = value.into(),
+            "/step/serving_handoff/record/length" => {
+                checkpoint["step"]["serving_handoff"]["record"]["length"] = value.into();
+            }
+            "/step/serving_handoff/record/device" => {
+                checkpoint["step"]["serving_handoff"]["record"]["device"] = value.into();
+            }
+            "/step/serving_handoff/record/inode" => {
+                checkpoint["step"]["serving_handoff"]["record"]["inode"] = value.into();
+            }
+            _ => unreachable!(),
+        }
+        let error = reject_checkpoint(&serde_json::to_vec(&checkpoint).unwrap());
+        assert_eq!(malformed(&error).0.as_str(), pointer);
+        assert_eq!(malformed(&error).1, MalformedProblem::InvalidValue);
+    }
+
+    for (field, value, pointer) in [
+        ("queues", 0_u64, "/step/frontend/queues"),
+        ("queues", 65, "/step/frontend/queues"),
+        ("queue_size", 1, "/step/frontend/queue_size"),
+        ("queue_size", 3, "/step/frontend/queue_size"),
+        ("queue_size", 32_769, "/step/frontend/queue_size"),
+    ] {
+        let mut checkpoint: serde_json::Value = serde_json::from_str(CHECKPOINT_WIRE).unwrap();
+        checkpoint["step"] = prepare_device_step();
+        checkpoint["step"]["frontend"][field] = value.into();
+        let error = reject_checkpoint(&serde_json::to_vec(&checkpoint).unwrap());
+        assert_eq!(malformed(&error).0.as_str(), pointer);
+        assert_eq!(malformed(&error).1, MalformedProblem::InvalidValue);
+    }
+
+    let mut kernel = prepare_device_step();
+    kernel["frontend"] = serde_json::json!({
+        "kind": "kernel_nbd",
+        "listener_socket_path": "/run/cats/cat_01/root-nbd.sock",
+        "device_path": "/dev/nbd0",
+    });
+    let mut checkpoint: serde_json::Value = serde_json::from_str(CHECKPOINT_WIRE).unwrap();
+    checkpoint["step"] = kernel;
+    decode_runtime_checkpoint(&serde_json::to_vec(&checkpoint).unwrap()).unwrap();
+
+    let mut takeover = prepare_device_step();
+    takeover["acquire_origin"] = serde_json::json!({
+        "kind": "takeover",
+        "authorization_id": "auth_01",
+    });
+    checkpoint["step"] = takeover;
+    decode_runtime_checkpoint(&serde_json::to_vec(&checkpoint).unwrap()).unwrap();
+
+    let mut unknown = prepare_device_step();
+    unknown["frontend"] = serde_json::json!({
+        "kind": "io_uring",
+    });
+    checkpoint["step"] = unknown;
+    let error = reject_checkpoint(&serde_json::to_vec(&checkpoint).unwrap());
+    assert_eq!(malformed(&error).0.as_str(), "/step/frontend/kind");
+    assert_eq!(malformed(&error).1, MalformedProblem::InvalidValue);
+}
+
+#[test]
+fn prepare_device_rejects_token_and_path_aliases() {
+    let cases = [
+        ("device_process_token", "/step/ownership_token", "token"),
+        ("control_frontend_socket", "/step/frontend", "control"),
+        ("kernel_listener_device", "/step/frontend", "kernel"),
+        ("record_control_path", "/step/serving_handoff", "record"),
+        ("process_path_alias", "/step/serving_process", "process"),
+        ("frontend_data_path", "/step/frontend", "frontend_data"),
+        ("device_record_path", "/step/frontend", "device_record"),
+    ];
+    for (name, pointer, mutation) in cases {
+        let mut step = prepare_device_step();
+        match mutation {
+            "token" => {
+                step["ownership_token"] = step["serving_process"]["process_identity_token"].clone()
+            }
+            "control" => {
+                step["frontend"]["socket_path"] =
+                    step["serving_process"]["control_socket_path"].clone()
+            }
+            "kernel" => {
+                step["frontend"] = serde_json::json!({
+                    "kind": "kernel_nbd",
+                    "listener_socket_path": "/dev/nbd0",
+                    "device_path": "/dev/nbd0",
+                })
+            }
+            "record" => {
+                step["serving_handoff"]["record"]["path"] =
+                    step["serving_process"]["control_socket_path"].clone()
+            }
+            "process" => {
+                step["serving_process"]["data_directory"] =
+                    step["serving_process"]["control_socket_path"].clone()
+            }
+            "frontend_data" => {
+                step["frontend"]["socket_path"] = step["serving_process"]["data_directory"].clone()
+            }
+            "device_record" => {
+                step["frontend"] = serde_json::json!({
+                    "kind": "kernel_nbd",
+                    "listener_socket_path": "/run/cats/cat_01/root-nbd.sock",
+                    "device_path": step["serving_handoff"]["record"]["path"].clone(),
+                })
+            }
+            _ => unreachable!(),
+        }
+        let mut checkpoint: serde_json::Value = serde_json::from_str(CHECKPOINT_WIRE).unwrap();
+        checkpoint["step"] = step;
+        let error = reject_checkpoint(&serde_json::to_vec(&checkpoint).unwrap());
+        assert_eq!(malformed(&error).0.as_str(), pointer, "{name}");
+        assert_eq!(
+            malformed(&error).1,
+            MalformedProblem::InvalidValue,
+            "{name}"
+        );
+    }
+}
+
+#[test]
+fn prepare_device_rejects_missing_unknown_and_path_only_handoff_proof() {
+    let old_three_field = serde_json::json!({
+        "kind": "prepare_device",
+        "volume_id": "vol_root",
+        "guest_device": {"serial": "cats-root", "slot": 0},
+        "ownership_token": "88888888888888888888888888888888",
+    });
+    let mut missing = prepare_device_step();
+    missing.as_object_mut().unwrap().remove("serving_handoff");
+    let mut expanded = prepare_device_step();
+    expanded
+        .as_object_mut()
+        .unwrap()
+        .insert("opaque_handoff".to_owned(), serde_json::json!({}));
+    let mut path_only = prepare_device_step();
+    path_only["serving_handoff"]["record"] = serde_json::json!({
+        "path": "/var/lib/cats/handoffs/cat_01/root-serving.json",
+    });
+    let mut missing_predecessor = prepare_device_step();
+    missing_predecessor["serving_handoff"]
+        .as_object_mut()
+        .unwrap()
+        .remove("predecessor_checkpoint_content_digest");
+    let mut missing_process_token = prepare_device_step();
+    missing_process_token["serving_process"]
+        .as_object_mut()
+        .unwrap()
+        .remove("process_identity_token");
+    let mut unknown_record = prepare_device_step();
+    unknown_record["serving_handoff"]["record"]
+        .as_object_mut()
+        .unwrap()
+        .insert("path_digest".to_owned(), ZERO_DIGEST.into());
+    let mut unknown_process = prepare_device_step();
+    unknown_process["serving_process"]
+        .as_object_mut()
+        .unwrap()
+        .insert("process_id".to_owned(), 1.into());
+    let mut unknown_frontend = prepare_device_step();
+    unknown_frontend["frontend"]
+        .as_object_mut()
+        .unwrap()
+        .insert("device_path".to_owned(), "/dev/vhost-root".into());
+    let cases = [
+        (
+            "old_three_field_shape",
+            old_three_field,
+            "/step/acquire_origin",
+            MalformedProblem::MissingField,
+        ),
+        (
+            "missing_handoff",
+            missing,
+            "/step/serving_handoff",
+            MalformedProblem::MissingField,
+        ),
+        (
+            "opaque_handoff",
+            expanded,
+            "/step/opaque_handoff",
+            MalformedProblem::UnknownField,
+        ),
+        (
+            "path_only_handoff",
+            path_only,
+            "/step/serving_handoff/record/content_sha256",
+            MalformedProblem::MissingField,
+        ),
+        (
+            "missing_predecessor_digest",
+            missing_predecessor,
+            "/step/serving_handoff/predecessor_checkpoint_content_digest",
+            MalformedProblem::MissingField,
+        ),
+        (
+            "missing_process_token",
+            missing_process_token,
+            "/step/serving_process/process_identity_token",
+            MalformedProblem::MissingField,
+        ),
+        (
+            "unknown_record_field",
+            unknown_record,
+            "/step/serving_handoff/record/path_digest",
+            MalformedProblem::UnknownField,
+        ),
+        (
+            "unknown_process_field",
+            unknown_process,
+            "/step/serving_process/process_id",
+            MalformedProblem::UnknownField,
+        ),
+        (
+            "unknown_frontend_field",
+            unknown_frontend,
+            "/step/frontend/device_path",
+            MalformedProblem::UnknownField,
         ),
     ];
     for (name, step, pointer, problem) in cases {

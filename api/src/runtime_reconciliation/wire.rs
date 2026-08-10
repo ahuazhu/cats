@@ -2575,6 +2575,56 @@ fn provision_root_image_error_schema() -> Schema {
     )
 }
 
+fn root_serving_handoff_record_identity_schema() -> Schema {
+    object(vec![
+        field("path", string(StringRule::HostPath)),
+        field("device", wire_u64()),
+        field("inode", number(1, MAX_WIRE_INTEGER)),
+        field("length", number(1, MAX_WIRE_INTEGER)),
+        field("content_sha256", digest()),
+    ])
+}
+
+fn root_serving_handoff_schema() -> Schema {
+    object(vec![
+        field("predecessor_checkpoint_content_digest", digest()),
+        field("record", root_serving_handoff_record_identity_schema()),
+    ])
+}
+
+fn serving_blockd_identity_schema() -> Schema {
+    object(vec![
+        field("scope_id", id()),
+        field("control_socket_path", string(StringRule::HostPath)),
+        field("data_directory", string(StringRule::HostPath)),
+        field("executable_path", string(StringRule::HostPath)),
+        field("process_identity_token", random_id()),
+    ])
+}
+
+fn prepare_device_frontend_schema() -> Schema {
+    union(
+        "kind",
+        vec![
+            variant(
+                "kernel_nbd",
+                vec![
+                    field("listener_socket_path", string(StringRule::HostPath)),
+                    field("device_path", string(StringRule::HostPath)),
+                ],
+            ),
+            variant(
+                "vhost_user_blk",
+                vec![
+                    field("socket_path", string(StringRule::HostPath)),
+                    field("queues", number(1, 64)),
+                    field("queue_size", number(2, 32_768)),
+                ],
+            ),
+        ],
+    )
+}
+
 fn reconcile_step_schema() -> Schema {
     union(
         "kind",
@@ -2614,8 +2664,17 @@ fn reconcile_step_schema() -> Schema {
                 "prepare_device",
                 vec![
                     field("volume_id", id()),
+                    field("attachment_id", id()),
+                    field("attachment_epoch", number(1, MAX_WIRE_INTEGER)),
+                    field("acquire_origin", acquire_origin_schema()),
+                    field("expected_head", remote_head_schema()),
+                    field("size_bytes", number(1, MAX_WIRE_INTEGER)),
+                    field("durability", closed(&["strict", "relaxed"])),
                     field("guest_device", guest_device_schema()),
                     field("ownership_token", random_id()),
+                    field("serving_handoff", root_serving_handoff_schema()),
+                    field("serving_process", serving_blockd_identity_schema()),
+                    field("frontend", prepare_device_frontend_schema()),
                 ],
             ),
             variant(
@@ -7540,6 +7599,90 @@ fn collect_reconcile_step_cross(
     output: &mut Vec<Candidate>,
 ) {
     match step {
+        ReconcileStep::PrepareDevice {
+            expected_head,
+            ownership_token,
+            serving_handoff,
+            serving_process,
+            frontend,
+            ..
+        } => {
+            let expected_head_path = child(path, "expected_head");
+            collect_remote_head_cross(expected_head, &expected_head_path, output);
+            if expected_head.generation.get() == 0 {
+                output.push(Candidate::at(
+                    &expected_head_path,
+                    MalformedProblem::InvalidValue,
+                ));
+            }
+            if ownership_token == &serving_process.process_identity_token {
+                output.push(Candidate::field(
+                    path,
+                    "ownership_token",
+                    MalformedProblem::InvalidValue,
+                ));
+            }
+            let frontend_path = child(path, "frontend");
+            let (frontend_socket_path, device_path, duplicate_frontend_path, queue_size) =
+                match frontend {
+                    PrepareDeviceFrontend::KernelNbd {
+                        listener_socket_path,
+                        device_path,
+                    } => (
+                        listener_socket_path,
+                        Some(device_path),
+                        listener_socket_path == device_path,
+                        None,
+                    ),
+                    PrepareDeviceFrontend::VhostUserBlk {
+                        socket_path,
+                        queue_size,
+                        ..
+                    } => (socket_path, None, false, Some(*queue_size)),
+                };
+            if duplicate_frontend_path
+                || frontend_socket_path == &serving_process.control_socket_path
+                || frontend_socket_path == &serving_process.data_directory
+                || frontend_socket_path == &serving_process.executable_path
+                || frontend_socket_path == &serving_handoff.record.path
+                || device_path.is_some_and(|device_path| {
+                    device_path == &serving_process.control_socket_path
+                        || device_path == &serving_process.data_directory
+                        || device_path == &serving_process.executable_path
+                        || device_path == &serving_handoff.record.path
+                })
+            {
+                output.push(Candidate::at(
+                    &frontend_path,
+                    MalformedProblem::InvalidValue,
+                ));
+            }
+            if queue_size.is_some_and(|queue_size| !queue_size.is_power_of_two()) {
+                output.push(Candidate::field(
+                    &frontend_path,
+                    "queue_size",
+                    MalformedProblem::InvalidValue,
+                ));
+            }
+            if serving_handoff.record.path == serving_process.control_socket_path
+                || serving_handoff.record.path == serving_process.data_directory
+                || serving_handoff.record.path == serving_process.executable_path
+            {
+                output.push(Candidate::at(
+                    &child(path, "serving_handoff"),
+                    MalformedProblem::InvalidValue,
+                ));
+            }
+            if serving_process.control_socket_path == serving_process.data_directory
+                || serving_process.control_socket_path == serving_process.executable_path
+                || serving_process.data_directory == serving_process.executable_path
+            {
+                output.push(Candidate::at(
+                    &child(path, "serving_process"),
+                    MalformedProblem::InvalidValue,
+                ));
+            }
+        }
         ReconcileStep::FormatFilesystem {
             expected_blank_head,
             ..

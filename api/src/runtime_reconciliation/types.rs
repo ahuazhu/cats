@@ -997,6 +997,55 @@ pub struct NodeCleanupCheckpoint {
     pub cleanup: CleanupRelease,
 }
 
+/// Descriptor-stable identity of the sealed record bridging root provisioning
+/// to serving blockd startup.
+///
+/// The content digest alone is insufficient: device/inode/length bind the
+/// exact no-replace publication and reject rename/recreate ABA.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RootServingHandoffRecordIdentity {
+    pub path: HostPath,
+    pub device: WireU64,
+    pub inode: WireU64,
+    pub length: WireU64,
+    pub content_sha256: Sha256Digest,
+}
+
+/// Durable bridge from the final target-control checkpoint to PrepareDevice.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RootServingHandoff {
+    pub predecessor_checkpoint_content_digest: Sha256Digest,
+    pub record: RootServingHandoffRecordIdentity,
+}
+
+/// Exact identity to checkpoint before starting the serving blockd process.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ServingBlockdIdentity {
+    pub scope_id: Id,
+    pub control_socket_path: HostPath,
+    pub data_directory: HostPath,
+    pub executable_path: HostPath,
+    pub process_identity_token: RandomId128,
+}
+
+/// Closed physical frontend plan owned by one PrepareDevice checkpoint.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+pub enum PrepareDeviceFrontend {
+    KernelNbd {
+        listener_socket_path: HostPath,
+        device_path: HostPath,
+    },
+    VhostUserBlk {
+        socket_path: HostPath,
+        queues: u16,
+        queue_size: u16,
+    },
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 pub enum ReconcileStep {
@@ -1032,8 +1081,21 @@ pub enum ReconcileStep {
     },
     PrepareDevice {
         volume_id: Id,
+        attachment_id: Id,
+        attachment_epoch: FenceEpoch,
+        acquire_origin: AcquireOrigin,
+        expected_head: RemoteHead,
+        size_bytes: u64,
+        durability: Durability,
         guest_device: GuestDeviceIdentity,
+        /// This token belongs only to the Guest-visible device. It must never
+        /// be reused as the serving process identity token.
         ownership_token: RandomId128,
+        /// Boxed only to keep the closed ReconcileStep/Condition enums bounded;
+        /// serde still emits the exact object field defined by the wire spec.
+        serving_handoff: Box<RootServingHandoff>,
+        serving_process: ServingBlockdIdentity,
+        frontend: PrepareDeviceFrontend,
     },
     FormatFilesystem {
         volume_id: Id,
