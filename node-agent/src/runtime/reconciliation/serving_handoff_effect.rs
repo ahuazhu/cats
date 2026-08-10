@@ -42,9 +42,9 @@ use super::root_provision_process::{
     TargetControlProcessPort,
 };
 use super::serving_handoff::{
-    ReopenedServingHandoff, ReopenedTargetControlAuthorization, ServingAuthorityTargetEvidence,
-    ServingHandoffReady, ServingHandoffRetirementState, ServingHandoffStore,
-    TargetControlAuthorizationReady,
+    target_control_process_launch_identity, ReopenedServingHandoff,
+    ReopenedTargetControlAuthorization, ServingAuthorityTargetEvidence, ServingHandoffReady,
+    ServingHandoffRetirementState, ServingHandoffStore, TargetControlAuthorizationReady,
 };
 use super::signed_running::{
     expected_provision_heads, provision_checkpoint_is_bound, ProvisionHeadRead,
@@ -635,8 +635,9 @@ impl ServingHandoffEffect {
                 }
                 ReopenedTargetControlAuthorization::Exact(ready) => ready,
             };
-        let expectation = base_expectation
-            .with_target_control_launch(target_ready.identity().process_launch_identity())?;
+        let expectation = base_expectation.with_target_control_launch(
+            target_control_process_launch_identity(target_ready.identity()),
+        )?;
         let retirement =
             handoff.classify_retirement_state(&stored, &acquired, &authority, &target_ready)?;
 

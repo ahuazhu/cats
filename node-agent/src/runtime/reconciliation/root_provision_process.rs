@@ -27,7 +27,9 @@ use cats_storage::authority::{
 use crate::runtime_spine::{RuntimeDesiredEffectContext, RuntimePhysicalReadContext};
 
 use super::checkpoint::CurrentCheckpointGuard;
-use super::serving_handoff::TargetControlAuthorizationReady;
+use super::serving_handoff::{
+    target_control_process_launch_identity, TargetControlAuthorizationReady,
+};
 use super::{FileCheckpointStore, StoredCheckpoint};
 
 pub(crate) mod sealed {
@@ -942,7 +944,9 @@ pub(crate) fn retain_target_control_process_start<'a>(
     authorization.assert_current(stored)?;
     anyhow::ensure!(
         expected.target_control_launch()
-            == Some(&authorization.identity().process_launch_identity()),
+            == Some(&target_control_process_launch_identity(
+                authorization.identity(),
+            )),
         "target-control start authorization changed launch identity"
     );
     let current = store

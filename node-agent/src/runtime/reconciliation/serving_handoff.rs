@@ -28,17 +28,28 @@ use std::sync::Mutex;
 
 use anyhow::{Context as _, Result};
 use cats_api::runtime_reconciliation::{
-    checkpoint_content_digest, encode_runtime_checkpoint, AcquireOrigin, ContractVersion,
-    DesiredRuntimeSpec, Durability, Epoch, FenceEpoch, HostPath, Id, NodeBootId, RandomId128,
-    ReconcileStep, RemoteHead, Revision, RootServingHandoff, RootServingHandoffRecordIdentity,
-    RuntimeCheckpoint, Sequence, ServingAuthorityProvenance, Sha256Digest, VolumeRecord, WireU64,
+    checkpoint_content_digest, encode_runtime_checkpoint, ContractVersion, DesiredRuntimeSpec,
+    Epoch, HostPath, Id, NodeBootId, RandomId128, ReconcileStep, RemoteHead, RootServingHandoff,
+    RootServingHandoffRecordIdentity, RuntimeCheckpoint, Sequence, ServingAuthorityProvenance,
+    Sha256Digest, VolumeRecord, WireU64,
 };
+#[cfg(test)]
+use cats_api::runtime_reconciliation::{AcquireOrigin, Durability, FenceEpoch, Revision};
+pub(crate) use cats_blockd::serving_handoff::{
+    decode_serving_handoff_record, SERVING_HANDOFF_RECORD_FILE, SERVING_HANDOFF_RECORD_MAX_BYTES,
+};
+use cats_blockd::serving_handoff::{
+    encode_serving_handoff_record, validate_serving_handoff_record, ServingControlProcessIdentity,
+    ServingControlReloadHandshake, ServingHandoffCodecError, ServingHandoffRecord,
+    ServingHandoffRecordIdentity, TargetControlAuthorizationIdentity,
+};
+#[cfg(test)]
+use cats_blockd::target_control::TargetControlAuthorizationCodecError;
 use cats_blockd::target_control::{
     decode_target_control_authorization, encode_target_control_authorization,
     provision_root_authorization_context_digest, provision_root_image_request,
     target_control_authorization_file_name, validate_target_control_attachment,
-    validate_target_control_authorization, StableDirectoryIdentity, StableFileIdentity,
-    TargetControlAuthorizationArtifact, TargetControlAuthorizationCodecError,
+    StableDirectoryIdentity, StableFileIdentity, TargetControlAuthorizationArtifact,
     TargetControlLocalStateIdentity as ServingHandoffLocalStateIdentity,
     TARGET_CONTROL_AUTHORIZATION_MAX_BYTES as TARGET_AUTHORIZED_SERVING_MAX_BYTES,
 };
@@ -48,7 +59,6 @@ use cats_storage::authority::{
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use serde_json::Value;
 use sha2::{Digest as _, Sha256};
-use thiserror::Error;
 
 use crate::state_directory::StateDirectory;
 
@@ -67,9 +77,7 @@ use super::root_provision_process::{
 };
 use super::{FileCheckpointStore, StoredCheckpoint};
 
-pub(crate) const SERVING_HANDOFF_RECORD_FILE: &str = "serving-handoff.json";
 const SERVING_HANDOFF_RECORD_TEMP: &str = ".serving-handoff.json.tmp";
-pub(crate) const SERVING_HANDOFF_RECORD_MAX_BYTES: usize = 64 * 1024;
 pub(crate) const SERVING_HANDOFF_RETIREMENT_FILE: &str = "serving-handoff-retirement.json";
 const SERVING_HANDOFF_RETIREMENT_TEMP: &str = ".serving-handoff-retirement.json.tmp";
 pub(crate) const SERVING_HANDOFF_RETIREMENT_MAX_BYTES: usize = 128 * 1024;
@@ -79,43 +87,6 @@ pub(crate) enum ServingHandoffTempKind {
     TargetAuthorization,
     Record,
     RetirementReceipt,
-}
-
-#[derive(Debug, Error, Clone, PartialEq, Eq)]
-pub(crate) enum ServingHandoffCodecError {
-    #[error("serving handoff {artifact} exceeds {maximum} bytes")]
-    WireBytesLimitExceeded {
-        artifact: &'static str,
-        maximum: usize,
-    },
-    #[error("serving handoff {artifact} is malformed")]
-    Malformed { artifact: &'static str },
-    #[error("serving handoff {artifact} is not in canonical JSON form")]
-    NonCanonical { artifact: &'static str },
-    #[error("serving handoff {artifact} violates its closed contract: {reason}")]
-    Invalid {
-        artifact: &'static str,
-        reason: &'static str,
-    },
-}
-
-impl From<TargetControlAuthorizationCodecError> for ServingHandoffCodecError {
-    fn from(error: TargetControlAuthorizationCodecError) -> Self {
-        match error {
-            TargetControlAuthorizationCodecError::WireBytesLimitExceeded { artifact, maximum } => {
-                Self::WireBytesLimitExceeded { artifact, maximum }
-            }
-            TargetControlAuthorizationCodecError::Malformed { artifact } => {
-                Self::Malformed { artifact }
-            }
-            TargetControlAuthorizationCodecError::NonCanonical { artifact } => {
-                Self::NonCanonical { artifact }
-            }
-            TargetControlAuthorizationCodecError::Invalid { artifact, reason } => {
-                Self::Invalid { artifact, reason }
-            }
-        }
-    }
 }
 
 /// The exact raw-authority reread associated with the current provision step.
@@ -135,115 +106,6 @@ impl ServingAuthorityTargetEvidence {
             volume,
         }
     }
-}
-
-/// Durable identity of the no-replace target-head grant.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub(crate) struct TargetControlAuthorizationIdentity {
-    pub path: HostPath,
-    pub device: WireU64,
-    pub inode: WireU64,
-    pub length: WireU64,
-    pub content_sha256: Sha256Digest,
-    pub artifact: TargetControlAuthorizationArtifact,
-}
-
-impl TargetControlAuthorizationIdentity {
-    pub(crate) fn path(&self) -> &HostPath {
-        &self.path
-    }
-
-    pub(crate) fn device(&self) -> WireU64 {
-        self.device
-    }
-
-    pub(crate) fn inode(&self) -> WireU64 {
-        self.inode
-    }
-
-    pub(crate) fn length(&self) -> WireU64 {
-        self.length
-    }
-
-    pub(crate) fn content_sha256(&self) -> &Sha256Digest {
-        &self.content_sha256
-    }
-
-    pub(crate) fn process_launch_identity(&self) -> TargetControlProcessLaunchIdentity {
-        TargetControlProcessLaunchIdentity::new(
-            self.path.clone(),
-            self.artifact.provision_transition_id.clone(),
-            self.artifact.provision_context_digest.clone(),
-        )
-    }
-}
-
-/// The exact target reload observed on the old control-only process.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub(crate) struct ServingControlReloadHandshake {
-    pub peer_process_id: WireU64,
-    pub identity: AttachmentLineageIdentity,
-    pub size_bytes: u64,
-    pub durability: Durability,
-    pub remote_head: RemoteHead,
-    pub process_identity_token: RandomId128,
-    pub control_only: bool,
-    pub guest_io_enabled: bool,
-}
-
-/// Complete physical identity of the old control process proven at handoff.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub(crate) struct ServingControlProcessIdentity {
-    pub process_id: WireU64,
-    pub unit_main_process_id: WireU64,
-    pub process_start_time_ticks: WireU64,
-    pub executable_path: HostPath,
-    pub scope_id: Id,
-    pub cgroup_path: HostPath,
-    pub cgroup_process_ids: Vec<WireU64>,
-    pub control_socket_path: HostPath,
-    pub data_directory: HostPath,
-    pub ownership_token: RandomId128,
-    pub handshake: ServingControlReloadHandshake,
-}
-
-/// Immutable subsidiary proof bound to one persisted `ProvisionRootImage`.
-///
-/// This is not a second planner journal. It can be consumed only together
-/// with the matching RuntimeCheckpoint and a future handoff-aware next step.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub(crate) struct ServingHandoffRecord {
-    pub version: ContractVersion,
-    pub checkpoint_content_digest: Sha256Digest,
-    pub cat_id: Id,
-    pub desired_revision: Revision,
-    pub spec_digest: Sha256Digest,
-    pub provision_transition_id: RandomId128,
-    pub volume_id: Id,
-    pub attachment_id: Id,
-    pub attachment_epoch: FenceEpoch,
-    pub acquire_origin: AcquireOrigin,
-    pub node_id: Id,
-    pub placement_epoch: Epoch,
-    pub expected_provisioned_head: RemoteHead,
-    pub expected_control_executable_path: HostPath,
-    pub target_control_authorization: TargetControlAuthorizationIdentity,
-    pub old_control_process: ServingControlProcessIdentity,
-}
-
-/// Content-addressed identity of the durable handoff record.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub(crate) struct ServingHandoffRecordIdentity {
-    path: HostPath,
-    device: WireU64,
-    inode: WireU64,
-    length: WireU64,
-    content_sha256: Sha256Digest,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -280,28 +142,6 @@ pub(crate) struct ScannedServingHandoffArtifact<'a> {
     pub length: WireU64,
     pub content_sha256: Sha256Digest,
     pub bytes: &'a [u8],
-}
-
-impl ServingHandoffRecordIdentity {
-    pub(crate) fn path(&self) -> &HostPath {
-        &self.path
-    }
-
-    pub(crate) fn device(&self) -> WireU64 {
-        self.device
-    }
-
-    pub(crate) fn inode(&self) -> WireU64 {
-        self.inode
-    }
-
-    pub(crate) fn length(&self) -> WireU64 {
-        self.length
-    }
-
-    pub(crate) fn content_sha256(&self) -> &Sha256Digest {
-        &self.content_sha256
-    }
 }
 
 /// In-memory proof returned only after both immutable files and their parent
@@ -518,21 +358,13 @@ impl TargetControlAuthorizationReady {
     }
 }
 
-fn encode_serving_handoff_record(
-    record: &ServingHandoffRecord,
-) -> std::result::Result<Vec<u8>, ServingHandoffCodecError> {
-    validate_handoff_record(record)?;
-    canonical_encode(record, SERVING_HANDOFF_RECORD_MAX_BYTES, "record")
-}
-
-pub(crate) fn decode_serving_handoff_record(
-    bytes: &[u8],
-) -> std::result::Result<ServingHandoffRecord, ServingHandoffCodecError> {
-    canonical_decode(
-        bytes,
-        SERVING_HANDOFF_RECORD_MAX_BYTES,
-        "record",
-        validate_handoff_record,
+pub(crate) fn target_control_process_launch_identity(
+    identity: &TargetControlAuthorizationIdentity,
+) -> TargetControlProcessLaunchIdentity {
+    TargetControlProcessLaunchIdentity::new(
+        identity.path.clone(),
+        identity.artifact.provision_transition_id.clone(),
+        identity.artifact.provision_context_digest.clone(),
     )
 }
 
@@ -2433,88 +2265,10 @@ fn wire_pid(process_id: u32) -> Result<WireU64> {
     WireU64::new(u64::from(process_id)).context("serving handoff process ID exceeds wire range")
 }
 
-fn validate_handoff_record(
-    record: &ServingHandoffRecord,
-) -> std::result::Result<(), ServingHandoffCodecError> {
-    let target_artifact = &record.target_control_authorization.artifact;
-    validate_target_control_authorization(target_artifact)?;
-    let attachment = &target_artifact.attachment;
-    let target_bytes = encode_target_control_authorization(target_artifact)
-        .map_err(ServingHandoffCodecError::from)?;
-    let target_digest = Sha256Digest::from_bytes(Sha256::digest(&target_bytes).into());
-    let identity = &attachment.identity;
-    let acquire_request = &attachment.acquire_request;
-    let process = &record.old_control_process;
-    let handshake = &process.handshake;
-    let expected_cgroup = format!("/sys/fs/cgroup/system.slice/{}", process.scope_id.as_str());
-    let artifact_path = Path::new(record.target_control_authorization.path.as_str());
-    let process_directory = Path::new(process.data_directory.as_str());
-    let expected_directory_suffix = PathBuf::from("data")
-        .join(format!("cat-{}", record.cat_id.as_str()))
-        .join(format!("volume-{}", record.volume_id.as_str()))
-        .join(format!("attachment-{}", record.attachment_id.as_str()))
-        .join(format!("epoch-{}", record.attachment_epoch.get()));
-    let expected_control_socket = process_directory.join("root-provision.sock");
-    let expected_artifact_name = target_control_file_name(&record.provision_transition_id);
-    if record.version != ContractVersion::V1
-        || target_artifact.version != record.version
-        || target_artifact.provision_transition_id != record.provision_transition_id
-        || record.volume_id != identity.volume_id
-        || record.attachment_id != identity.attachment_id
-        || record.attachment_epoch != identity.attachment_epoch
-        || record.acquire_origin != identity.acquire_origin
-        || record.node_id != identity.node_id
-        || record.placement_epoch != identity.placement_epoch
-        || record.desired_revision != acquire_request.desired_revision
-        || record.placement_epoch != acquire_request.placement_epoch
-        || record.expected_provisioned_head != attachment.head
-        || record.expected_control_executable_path != process.executable_path
-        || target_artifact.runtime_scope_id != process.scope_id
-        || target_artifact.control_socket_path != process.control_socket_path
-        || record.target_control_authorization.device
-            != target_artifact.local_state.attachment_directory.device
-        || record.target_control_authorization.inode.get() == 0
-        || record.target_control_authorization.length.get() != target_bytes.len() as u64
-        || record.target_control_authorization.content_sha256 != target_digest
-        || process.process_id.get() == 0
-        || process.unit_main_process_id != process.process_id
-        || process.process_start_time_ticks.get() == 0
-        || process.cgroup_process_ids != [process.process_id]
-        || process.cgroup_path.as_str() != expected_cgroup
-        || !process_directory.ends_with(&expected_directory_suffix)
-        || Path::new(process.control_socket_path.as_str()) != expected_control_socket
-        || process.ownership_token != handshake.process_identity_token
-        || process.process_id != handshake.peer_process_id
-        || handshake.identity != *identity
-        || handshake.size_bytes != attachment.size_bytes
-        || handshake.durability != attachment.durability
-        || handshake.remote_head != attachment.head
-        || !handshake.control_only
-        || handshake.guest_io_enabled
-        || artifact_path.file_name().and_then(|name| name.to_str())
-            != Some(expected_artifact_name.as_str())
-        || artifact_path.parent() != Some(process_directory)
-        || process_directory
-            != Path::new(
-                target_artifact
-                    .local_state
-                    .attachment_directory
-                    .path
-                    .as_str(),
-            )
-    {
-        return Err(ServingHandoffCodecError::Invalid {
-            artifact: "record",
-            reason: "record fields do not form one exact serving handoff",
-        });
-    }
-    Ok(())
-}
-
 fn validate_retirement_receipt(
     receipt: &ServingHandoffRetirementReceipt,
 ) -> std::result::Result<(), ServingHandoffCodecError> {
-    validate_handoff_record(&receipt.record)?;
+    validate_serving_handoff_record(&receipt.record)?;
     let record_bytes = encode_serving_handoff_record(&receipt.record)?;
     let record_digest = Sha256Digest::from_bytes(Sha256::digest(&record_bytes).into());
     let checkpoint_digest = checkpoint_content_digest(&receipt.old_checkpoint).map_err(|_| {
@@ -6241,7 +5995,7 @@ mod tests {
                 fixture.expected_executable_path.clone(),
             )
             .unwrap()
-            .with_target_control_launch(target.identity().process_launch_identity())
+            .with_target_control_launch(target_control_process_launch_identity(target.identity()))
             .unwrap();
             let checkpoint_store = FileCheckpointStore::open(
                 &fixture.checkpoint_directory,
@@ -6289,7 +6043,9 @@ mod tests {
             root_fixture.expected_executable_path.clone(),
         )
         .unwrap()
-        .with_target_control_launch(root_target.identity().process_launch_identity())
+        .with_target_control_launch(target_control_process_launch_identity(
+            root_target.identity(),
+        ))
         .unwrap();
         let root_checkpoint_store = FileCheckpointStore::open(
             &root_fixture.checkpoint_directory,
