@@ -917,7 +917,12 @@ fn a22_release_target_disk_kind_and_disposition_matrix_is_closed() {
 fn normal_acquire_fixture(
     store: &Store,
     workspace_suffix: &str,
-) -> (VolumeRecord, TransitionNode, RuntimeVolumeTransitionRequest) {
+) -> (
+    VolumeRecord,
+    TransitionNode,
+    DesiredRuntimeSpec,
+    RuntimeVolumeTransitionRequest,
+) {
     let volume = unowned_volume();
     seed_volume(store, &volume);
     let node = transition_node(store, "node-new");
@@ -963,7 +968,7 @@ fn normal_acquire_fixture(
             },
         },
     );
-    (volume, node, request)
+    (volume, node, desired, request)
 }
 
 pub(crate) fn prepare_a22_http_normal_fixture(
@@ -1666,7 +1671,8 @@ fn two_store_sessions_cannot_both_acquire_one_volume() {
 fn a22_cancellation_between_final_check_and_commit_claim_rolls_back_every_write() {
     let url = crate::testsupport::isolated_control_store_url();
     let store = Store::connect(&url, None).unwrap();
-    let (volume, node, request) = normal_acquire_fixture(&store, "a22-cancel-before-commit");
+    let (volume, node, _desired, request) =
+        normal_acquire_fixture(&store, "a22-cancel-before-commit");
     let before = stored_volume_row(&store, &volume.volume_id);
     let observer = Store::connect(&url, None).unwrap();
     let context = AuthorityRequestContext::new(Instant::now() + Duration::from_secs(5));
@@ -1697,7 +1703,7 @@ fn a22_cancellation_between_final_check_and_commit_claim_rolls_back_every_write(
 fn a22_commit_claim_wins_cancellation_and_response_loss_replays_exactly() {
     let url = crate::testsupport::isolated_control_store_url();
     let store = Store::connect(&url, None).unwrap();
-    let (volume, node, request) = normal_acquire_fixture(&store, "a22-commit-wins");
+    let (volume, node, _desired, request) = normal_acquire_fixture(&store, "a22-commit-wins");
     let observer = Store::connect(&url, None).unwrap();
     let context = AuthorityRequestContext::new(Instant::now() + Duration::from_secs(5));
     let entered = Arc::new(Barrier::new(2));
@@ -1743,7 +1749,7 @@ fn a22_commit_claim_wins_cancellation_and_response_loss_replays_exactly() {
 #[test]
 fn a22_normal_acquire_commits_once_and_replays_after_response_loss() {
     let store = Store::connect(&crate::testsupport::isolated_control_store_url(), None).unwrap();
-    let (volume, node, request) = normal_acquire_fixture(&store, "a22-normal");
+    let (volume, node, desired, request) = normal_acquire_fixture(&store, "a22-normal");
 
     store.inject_request_committed_response_loss_once_after(Duration::ZERO);
     let lost = execute_transition(&store, &node, &request).unwrap_err();
