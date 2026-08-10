@@ -2,7 +2,7 @@ use std::io::ErrorKind;
 use std::net::TcpListener;
 use std::process::Command;
 
-const CUTOVER_BLOCKER: &str = "cats-gatewayd is intentionally unavailable: Route Grant v2 is not composed: missing Control machine-authenticated v2 resolve wire and Node machine-authenticated v2 HTTPS admission wire and public ingress proxy/listener composition; production ingress remains fail-closed";
+const CUTOVER_BLOCKER: &str = "cats-gatewayd is intentionally unavailable: Route Grant v2 is not composed: missing Gateway workload credential and policy authority and Route v2 signer and Node key-ring distribution and Control machine-authenticated resolve transport and Node machine-authenticated v2 HTTPS admission transport and public ingress proxy/listener composition; production ingress remains fail-closed";
 
 fn contains_bytes(haystack: &[u8], needle: &[u8]) -> bool {
     haystack
