@@ -1,25 +1,26 @@
 //! One-step signed Running acquisition.
 //!
 //! This is deliberately only the `AcquireVolume` planner step. A current-
-//! process accepted full inventory proves the fresh root is physically empty,
-//! the exact request is fsynced before A22 is called, and an exact grant is
-//! durably bound to the complete Desired before the checkpoint advances to
-//! `ProvisionRootImage`. No process, frontend, device, network or VMM port is
-//! reachable from this module.
+//! process accepted full inventory proves either that the fresh root is
+//! physically empty or that one no-write local lineage is the exact durable
+//! output of this checkpointed acquire. The exact request is fsynced before
+//! A22 is called, and the grant is durably bound to the complete Desired before
+//! the checkpoint advances to `ProvisionRootImage`. No process, frontend,
+//! device, network or VMM port is reachable from this module.
 
 use std::sync::Arc;
 use std::time::Instant;
 
 use anyhow::Context as _;
 use cats_api::runtime_reconciliation::{
-    encode_desired_runtime_spec, AgentSession, AppliedDesiredEvidence, AsciiText,
+    encode_desired_runtime_spec, AcquireOrigin, AgentSession, AppliedDesiredEvidence, AsciiText,
     CheckpointEvidence, Condition, ContractVersion, DesiredRuntimeSpec, DiskKind, FenceEpoch,
-    Generation, GuestTransportEvidence, HostPath, Id, LifecycleAdmission, ObservedDiskKind,
-    ObservedRuntimeStatus, ObservedVolume, ProgressingReason, RandomId128, ReconcileStep,
-    RemoteHead, RequireIdleCheckpoint, RuntimeCheckpoint, RuntimeTarget, RuntimeTransition,
-    RuntimeVolumeTransition, RuntimeVolumeTransitionRequest, SessionBinding, Sha256Digest,
-    UnixMillis, VolumeAccess, VolumeAcquire, VolumeAcquireRequest, VolumeAuthorityEvidence,
-    VolumeDisposition, VolumeIntent, WarmSnapshotEvidence,
+    Generation, GuestTransportEvidence, HostPath, Id, LifecycleAdmission, LocalLineageState,
+    LocalVolumeLineage, ObservedDiskKind, ObservedRuntimeStatus, ObservedVolume, ProgressingReason,
+    RandomId128, ReconcileStep, RemoteHead, RequireIdleCheckpoint, RuntimeCheckpoint,
+    RuntimeTarget, RuntimeTransition, RuntimeVolumeTransition, RuntimeVolumeTransitionRequest,
+    SessionBinding, Sha256Digest, UnixMillis, VolumeAccess, VolumeAcquire, VolumeAcquireRequest,
+    VolumeAuthorityEvidence, VolumeDisposition, VolumeIntent, WarmSnapshotEvidence, WireU64,
 };
 use cats_storage::authority::{AuthorityError, AuthorizedServingAttachment, VolumeDataAuthority};
 use cats_storage::{read_image_manifest_until, BlobStore, ImageManifestReadError};
@@ -31,13 +32,17 @@ use crate::runtime_spine::{
 
 use super::clean_slate_probes::CHECKPOINT_NAMESPACE;
 use super::{
-    recover_normal_acquire_from_authority, runtime_checkpoint_path, AuthorizedBlockdStore,
-    ControlSignedNormalAcquireClient, FileCheckpointStore, NormalAcquireAcceptedContext,
-    NormalAcquireAttempt, NormalAcquireAuthorityRecovery, NormalAcquireClientError,
+    authorized_blockd::authorized_blockd_data_directory, recover_normal_acquire_from_authority,
+    runtime_checkpoint_path, AuthorizedBlockdStore, ControlSignedNormalAcquireClient,
+    FileCheckpointStore, NormalAcquireAcceptedContext, NormalAcquireAttempt,
+    NormalAcquireAuthorityRecovery, NormalAcquireClientError,
 };
 
 const MAX_LEASE_DURATION_MS: u64 = i64::MAX as u64;
 const ROOT_PROVISION_SOCKET: &str = "root-provision.sock";
+
+#[cfg(test)]
+type AfterPrepareHook = Arc<dyn Fn(&RuntimeDesiredEffectContext) + Send + Sync>;
 
 /// Narrow injectable boundary around the exact A19-signed A22 request.
 pub(crate) trait SignedNormalAcquirePort: Send + Sync + 'static {
@@ -72,6 +77,8 @@ pub(crate) struct SignedRunningAcquireEffect {
     authority: Arc<dyn VolumeDataAuthority>,
     blob: Arc<dyn BlobStore>,
     lease_duration_ms: u64,
+    #[cfg(test)]
+    after_prepare: Option<AfterPrepareHook>,
 }
 
 impl SignedRunningAcquireEffect {
@@ -90,7 +97,15 @@ impl SignedRunningAcquireEffect {
             authority,
             blob,
             lease_duration_ms,
+            #[cfg(test)]
+            after_prepare: None,
         })
+    }
+
+    #[cfg(test)]
+    fn with_after_prepare(mut self, hook: AfterPrepareHook) -> Self {
+        self.after_prepare = Some(hook);
+        self
     }
 
     fn apply_acquire(
@@ -167,6 +182,7 @@ impl SignedRunningAcquireEffect {
                     stored.checkpoint(),
                     desired,
                     volume,
+                    context.state_directory().path(),
                     &expected_blank_head,
                     &expected_provisioned_head,
                 ) =>
@@ -283,6 +299,10 @@ impl SignedRunningAcquireEffect {
         let prepared = AuthorizedBlockdStore::new(context.state_directory().clone())
             .prepare(desired, volume, &attachment)
             .context("persist exact authorized blockd grant after normal acquire")?;
+        #[cfg(test)]
+        if let Some(after_prepare) = &self.after_prepare {
+            after_prepare(context);
+        }
         context.check_active()?;
 
         let data_directory = host_path(
@@ -315,7 +335,7 @@ impl SignedRunningAcquireEffect {
                 attachment_epoch: attachment.identity.attachment_epoch,
                 scope_id,
                 control_socket_path,
-                data_directory,
+                data_directory: data_directory.clone(),
                 process_identity_token,
                 size_bytes: volume.size_bytes,
                 boot_image_digest: desired.runtime.boot_image_digest.clone(),
@@ -323,7 +343,11 @@ impl SignedRunningAcquireEffect {
                 expected_provisioned_head,
             },
             processes: Vec::new(),
-            volumes: vec![owned_observed_volume(volume, &attachment)],
+            volumes: vec![prepared_owned_observed_volume(
+                volume,
+                &attachment,
+                data_directory.clone(),
+            )],
             mounts: Vec::new(),
             networks: Vec::new(),
             guest_transport: GuestTransportEvidence::Unavailable,
@@ -426,26 +450,45 @@ fn validate_slice_and_admission<'a>(
     }
     let expected_checkpoint_path =
         runtime_checkpoint_path(&state_directory.join(CHECKPOINT_NAMESPACE), &desired.cat_id);
-    if !runtime_is_acquire_only(
-        runtime,
-        desired,
-        volume,
-        *expected_unowned_epoch,
-        observation.inventory_epoch,
-        &expected_checkpoint_path,
-    ) {
+    let Some(expected_identity) =
+        expected_attachment_identity(desired, volume, *expected_unowned_epoch)
+    else {
+        return AdmissionDecision::StopLocal;
+    };
+    let expected_data_directory_path =
+        authorized_blockd_data_directory(state_directory, desired, &expected_identity);
+    let Ok(expected_data_directory) = host_path(
+        &expected_data_directory_path,
+        "authorized blockd data directory",
+    ) else {
+        return AdmissionDecision::StopLocal;
+    };
+    let expectation = AcquireAdmissionExpectation {
+        unowned_epoch: *expected_unowned_epoch,
+        inventory_epoch: observation.inventory_epoch,
+        checkpoint_path: &expected_checkpoint_path,
+        data_directory: &expected_data_directory,
+        identity: &expected_identity,
+    };
+    if !runtime_is_acquire_only(runtime, desired, volume, &expectation) {
         return AdmissionDecision::StopLocal;
     }
     AdmissionDecision::Exact(volume)
+}
+
+struct AcquireAdmissionExpectation<'a> {
+    unowned_epoch: FenceEpoch,
+    inventory_epoch: cats_api::runtime_reconciliation::Epoch,
+    checkpoint_path: &'a std::path::Path,
+    data_directory: &'a HostPath,
+    identity: &'a cats_storage::authority::AttachmentLineageIdentity,
 }
 
 fn runtime_is_acquire_only(
     runtime: &ObservedRuntimeStatus,
     desired: &DesiredRuntimeSpec,
     volume: &VolumeIntent,
-    expected_unowned_epoch: FenceEpoch,
-    inventory_epoch: cats_api::runtime_reconciliation::Epoch,
-    expected_checkpoint_path: &std::path::Path,
+    expectation: &AcquireAdmissionExpectation<'_>,
 ) -> bool {
     if runtime.runtime_incarnation.is_some()
         || runtime.stable_state.is_some()
@@ -474,7 +517,6 @@ fn runtime_is_acquire_only(
         || observed.disk_kind != ObservedDiskKind::Root
         || observed.size_bytes != Some(volume.size_bytes)
         || observed.durability != Some(volume.durability)
-        || !observed.local_lineages.is_empty()
         || !observed.devices.is_empty()
     {
         return false;
@@ -483,7 +525,7 @@ fn runtime_is_acquire_only(
         VolumeAuthorityEvidence::Unowned {
             attachment_epoch,
             head,
-        } => *attachment_epoch == expected_unowned_epoch && *head == blank_head(),
+        } => *attachment_epoch == expectation.unowned_epoch && *head == blank_head(),
         _ => false,
     };
     let authority_is_owned = match &observed.authority {
@@ -492,9 +534,8 @@ fn runtime_is_acquire_only(
             attachment_epoch,
             head,
         } => {
-            attachment_id == &volume.attachment_id
-                && attachment_epoch.get()
-                    == expected_unowned_epoch.get().checked_add(1).unwrap_or(0)
+            attachment_id == &expectation.identity.attachment_id
+                && *attachment_epoch == expectation.identity.attachment_epoch
                 && *head == blank_head()
         }
         _ => false,
@@ -506,9 +547,10 @@ fn runtime_is_acquire_only(
             },
             CheckpointEvidence::Missing { checkpoint_path },
         ) => {
-            *observed_inventory_epoch == inventory_epoch
+            *observed_inventory_epoch == expectation.inventory_epoch
                 && authority_is_unowned
-                && path_matches(checkpoint_path, expected_checkpoint_path)
+                && observed.local_lineages.is_empty()
+                && path_matches(checkpoint_path, expectation.checkpoint_path)
         }
         (
             ReconcileStep::AcquireVolume { request },
@@ -536,10 +578,62 @@ fn runtime_is_acquire_only(
                 && step.as_ref() == &runtime.step
                 && matches!(require_idle.as_ref(), RequireIdleCheckpoint::NotApplicable)
                 && request_matches_volume(request, desired, volume)
-                && path_matches(checkpoint_path, expected_checkpoint_path)
-                && (authority_is_unowned || authority_is_owned)
+                && path_matches(checkpoint_path, expectation.checkpoint_path)
+                && ((authority_is_unowned && observed.local_lineages.is_empty())
+                    || (authority_is_owned
+                        // Authority may have committed before the response, or
+                        // grant persistence may have committed before the
+                        // checkpoint replace. Only the latter's one exact,
+                        // blank, no-write lineage is adoptable after a new full
+                        // inventory; every other local directory stays foreign.
+                        && (observed.local_lineages.is_empty()
+                            || observed.local_lineages
+                                == [expected_local_lineage(
+                                    expectation.identity,
+                                    expectation.data_directory,
+                                )])))
         }
         _ => false,
+    }
+}
+
+fn expected_attachment_identity(
+    desired: &DesiredRuntimeSpec,
+    volume: &VolumeIntent,
+    expected_unowned_epoch: FenceEpoch,
+) -> Option<cats_storage::authority::AttachmentLineageIdentity> {
+    let VolumeAcquire::Normal { transition_id, .. } = &volume.acquire else {
+        unreachable!("slice validation accepted only Normal")
+    };
+    let attachment_epoch = expected_unowned_epoch.get().checked_add(1)?;
+    Some(cats_storage::authority::AttachmentLineageIdentity {
+        volume_id: volume.volume_id.clone(),
+        attachment_id: volume.attachment_id.clone(),
+        attachment_epoch: FenceEpoch::new(attachment_epoch)?,
+        acquire_origin: AcquireOrigin::Normal {
+            transition_id: transition_id.clone(),
+        },
+        node_id: desired.placement.node_id.clone(),
+        placement_epoch: desired.placement.placement_epoch,
+    })
+}
+
+fn expected_local_lineage(
+    identity: &cats_storage::authority::AttachmentLineageIdentity,
+    data_directory: &HostPath,
+) -> LocalVolumeLineage {
+    LocalVolumeLineage {
+        attachment_id: identity.attachment_id.clone(),
+        attachment_epoch: identity.attachment_epoch,
+        acquire_origin: identity.acquire_origin.clone(),
+        node_id: identity.node_id.clone(),
+        placement_epoch: identity.placement_epoch,
+        local_durable_generation: blank_head().generation,
+        remote_durable_generation: blank_head().generation,
+        data_directory: data_directory.clone(),
+        pending_pack_count: WireU64::new(0).expect("zero fits WireU64"),
+        fenced: false,
+        state: LocalLineageState::Active,
     }
 }
 
@@ -692,10 +786,24 @@ fn owned_observed_volume(
     }
 }
 
+fn prepared_owned_observed_volume(
+    volume: &VolumeIntent,
+    attachment: &AuthorizedServingAttachment,
+    data_directory: HostPath,
+) -> ObservedVolume {
+    let mut observed = owned_observed_volume(volume, attachment);
+    observed.local_lineages.push(expected_local_lineage(
+        &attachment.identity,
+        &data_directory,
+    ));
+    observed
+}
+
 fn provision_checkpoint_is_bound(
     checkpoint: &RuntimeCheckpoint,
     desired: &DesiredRuntimeSpec,
     volume: &VolumeIntent,
+    state_directory: &std::path::Path,
     expected_blank_head: &RemoteHead,
     expected_provisioned_head: &RemoteHead,
 ) -> bool {
@@ -723,6 +831,37 @@ fn provision_checkpoint_is_bound(
     else {
         return false;
     };
+    let Some(expected_identity) =
+        expected_attachment_identity(desired, volume, expected_unowned_epoch)
+    else {
+        return false;
+    };
+    let expected_data_directory =
+        authorized_blockd_data_directory(state_directory, desired, &expected_identity);
+    let [observed_volume] = checkpoint.volumes.as_slice() else {
+        return false;
+    };
+    let authority_matches = matches!(
+        &observed_volume.authority,
+        VolumeAuthorityEvidence::Owned {
+            attachment_id: observed_attachment_id,
+            attachment_epoch: observed_attachment_epoch,
+            head,
+        } if observed_attachment_id == attachment_id
+            && observed_attachment_epoch == attachment_epoch
+            && head == expected_blank_head
+    );
+    let observed_volume_matches = observed_volume.volume_intent_id.as_ref()
+        == Some(&volume.volume_intent_id)
+        && observed_volume.disk_id.as_ref() == Some(&volume.disk_id)
+        && observed_volume.volume_id == volume.volume_id
+        && observed_volume.disk_kind == ObservedDiskKind::Root
+        && observed_volume.size_bytes == Some(volume.size_bytes)
+        && observed_volume.durability == Some(volume.durability)
+        && authority_matches
+        && observed_volume.local_lineages
+            == [expected_local_lineage(&expected_identity, data_directory)]
+        && observed_volume.devices.is_empty();
     checkpoint.version == ContractVersion::V1
         && checkpoint.cat_id == desired.cat_id
         && checkpoint.node_id == desired.placement.node_id
@@ -732,6 +871,7 @@ fn provision_checkpoint_is_bound(
         && checkpoint.runtime_incarnation.is_none()
         && checkpoint.stable_state.is_none()
         && checkpoint.processes.is_empty()
+        && observed_volume_matches
         && checkpoint.mounts.is_empty()
         && checkpoint.networks.is_empty()
         && matches!(
@@ -746,12 +886,13 @@ fn provision_checkpoint_is_bound(
             RequireIdleCheckpoint::NotApplicable
         )
         && volume_id == &volume.volume_id
-        && attachment_id == &volume.attachment_id
-        && attachment_epoch.get() == expected_unowned_epoch.get().checked_add(1).unwrap_or(0)
+        && attachment_id == &expected_identity.attachment_id
+        && *attachment_epoch == expected_identity.attachment_epoch
         && *size_bytes == volume.size_bytes
         && boot_image_digest == &desired.runtime.boot_image_digest
         && checkpoint_blank == expected_blank_head
         && checkpoint_target == expected_provisioned_head
+        && path_matches(data_directory, &expected_data_directory)
         && scope_id.as_str() == format!("cats-root-{}.service", process_identity_token.as_str())
         && control_socket_path.as_str()
             == format!("{}/{}", data_directory.as_str(), ROOT_PROVISION_SOCKET)
@@ -1060,6 +1201,10 @@ mod tests {
             checkpoint.volumes[0].authority,
             VolumeAuthorityEvidence::Owned { .. }
         ));
+        assert_eq!(
+            checkpoint.volumes[0].local_lineages,
+            [expected_local_lineage(&attachment.identity, data_directory)]
+        );
 
         let persisted: AuthorizedServingAttachment = serde_json::from_slice(
             &std::fs::read(
@@ -1076,6 +1221,201 @@ mod tests {
             .join("launch-checkpoint.json")
             .is_file());
         assert!(!root.path().join("runtime-effects").exists());
+    }
+
+    #[test]
+    fn cancellation_after_grant_persist_adopts_exact_lineage_after_fresh_full_restart() {
+        let root = tempfile::tempdir().unwrap();
+        let desired = desired();
+        let attachment = attachment(&desired);
+        let authority = Arc::new(FakeAuthority::new(Err(AuthorityError::BackendUnknown)));
+        let blob = Arc::new(RecordingBlob::present(&desired));
+        let checkpoint_path = checkpoint_path(root.path(), &desired.cat_id);
+        let (base_effect, first_calls) = effect(
+            &desired,
+            vec![NormalAcquireAttempt::Granted(Box::new(attachment.clone()))],
+            Arc::clone(&authority),
+            Arc::clone(&blob),
+            checkpoint_path.clone(),
+        );
+        let interrupted_effect =
+            base_effect.with_after_prepare(Arc::new(|context| context.cancel_for_test()));
+        let (context, _) = context(root.path(), &desired, None);
+
+        let error = interrupted_effect
+            .apply(context, &desired)
+            .expect_err("cancellation must stop before checkpoint replace");
+        assert!(error
+            .to_string()
+            .contains("runtime Desired effect was cancelled"));
+        assert_eq!(first_calls.lock().unwrap().requests.len(), 1);
+        let acquire = read_checkpoint(&checkpoint_path);
+        assert!(matches!(acquire.step, ReconcileStep::AcquireVolume { .. }));
+
+        let data_directory =
+            authorized_blockd_data_directory(root.path(), &desired, &attachment.identity);
+        let before = prepared_file_snapshot(&data_directory);
+        let recovered_volume = prepared_owned_observed_volume(
+            &desired.volumes[0],
+            &attachment,
+            host(data_directory.clone()),
+        );
+        let fresh_runtime =
+            observed_runtime(root.path(), &desired, Some((&acquire, recovered_volume)));
+        let (restart_effect, restart_calls) = effect(
+            &desired,
+            vec![NormalAcquireAttempt::Granted(Box::new(attachment.clone()))],
+            authority,
+            blob,
+            checkpoint_path.clone(),
+        );
+        let (restart_context, _) =
+            context_with_session(root.path(), &desired, Some(fresh_runtime), '8', 3);
+
+        assert_eq!(
+            restart_effect.apply(restart_context, &desired).unwrap(),
+            RuntimeDesiredEffectOutcome::RefreshInventory
+        );
+        assert_eq!(restart_calls.lock().unwrap().requests.len(), 1);
+        assert_eq!(prepared_file_snapshot(&data_directory), before);
+        assert_prepared_provision_checkpoint(
+            &read_checkpoint(&checkpoint_path),
+            &attachment,
+            &data_directory,
+        );
+    }
+
+    #[test]
+    fn checkpoint_replace_conflict_after_grant_persist_restarts_without_overwrite() {
+        let root = tempfile::tempdir().unwrap();
+        let desired = desired();
+        let attachment = attachment(&desired);
+        let authority = Arc::new(FakeAuthority::new(Err(AuthorityError::BackendUnknown)));
+        let blob = Arc::new(RecordingBlob::present(&desired));
+        let checkpoint_path = checkpoint_path(root.path(), &desired.cat_id);
+        let (base_effect, first_calls) = effect(
+            &desired,
+            vec![NormalAcquireAttempt::Granted(Box::new(attachment.clone()))],
+            Arc::clone(&authority),
+            Arc::clone(&blob),
+            checkpoint_path.clone(),
+        );
+        let replaced_path = checkpoint_path.clone();
+        let interrupted_effect = base_effect.with_after_prepare(Arc::new(move |_| {
+            replace_with_exact_checkpoint_bytes(&replaced_path);
+        }));
+        let (context, _) = context(root.path(), &desired, None);
+
+        let error = interrupted_effect
+            .apply(context, &desired)
+            .expect_err("changed checkpoint identity must reject replace");
+        assert!(error
+            .to_string()
+            .contains("advance exact acquired root to provision_root_image"));
+        assert!(format!("{error:#}").contains("checkpoint target changed after it was read"));
+        assert_eq!(first_calls.lock().unwrap().requests.len(), 1);
+        let acquire = read_checkpoint(&checkpoint_path);
+        assert!(matches!(acquire.step, ReconcileStep::AcquireVolume { .. }));
+
+        let data_directory =
+            authorized_blockd_data_directory(root.path(), &desired, &attachment.identity);
+        let before = prepared_file_snapshot(&data_directory);
+        let fresh_runtime = observed_runtime(
+            root.path(),
+            &desired,
+            Some((
+                &acquire,
+                prepared_owned_observed_volume(
+                    &desired.volumes[0],
+                    &attachment,
+                    host(data_directory.clone()),
+                ),
+            )),
+        );
+        let (restart_effect, _) = effect(
+            &desired,
+            vec![NormalAcquireAttempt::Granted(Box::new(attachment.clone()))],
+            authority,
+            blob,
+            checkpoint_path.clone(),
+        );
+        let (restart_context, _) =
+            context_with_session(root.path(), &desired, Some(fresh_runtime), '8', 3);
+
+        assert_eq!(
+            restart_effect.apply(restart_context, &desired).unwrap(),
+            RuntimeDesiredEffectOutcome::RefreshInventory
+        );
+        assert_eq!(prepared_file_snapshot(&data_directory), before);
+        assert_prepared_provision_checkpoint(
+            &read_checkpoint(&checkpoint_path),
+            &attachment,
+            &data_directory,
+        );
+    }
+
+    #[test]
+    fn foreign_persisted_lineage_is_preserved_and_never_replayed() {
+        let root = tempfile::tempdir().unwrap();
+        let desired = desired();
+        let attachment = attachment(&desired);
+        let authority = Arc::new(FakeAuthority::new(Err(AuthorityError::BackendUnknown)));
+        let blob = Arc::new(RecordingBlob::present(&desired));
+        let checkpoint_path = checkpoint_path(root.path(), &desired.cat_id);
+        let (base_effect, _) = effect(
+            &desired,
+            vec![NormalAcquireAttempt::Granted(Box::new(attachment.clone()))],
+            Arc::clone(&authority),
+            Arc::clone(&blob),
+            checkpoint_path.clone(),
+        );
+        let interrupted_effect =
+            base_effect.with_after_prepare(Arc::new(|context| context.cancel_for_test()));
+        let (context, _) = context(root.path(), &desired, None);
+        interrupted_effect
+            .apply(context, &desired)
+            .expect_err("fixture cancellation");
+
+        let acquire = read_checkpoint(&checkpoint_path);
+        let data_directory =
+            authorized_blockd_data_directory(root.path(), &desired, &attachment.identity);
+        let identity_path = data_directory.join("identity.json");
+        let mut foreign_identity = attachment.identity.clone();
+        foreign_identity.acquire_origin = AcquireOrigin::Normal {
+            transition_id: random('9'),
+        };
+        std::fs::write(
+            &identity_path,
+            serde_json::to_vec(&foreign_identity).unwrap(),
+        )
+        .unwrap();
+        let foreign_bytes = std::fs::read(&identity_path).unwrap();
+
+        let mut foreign_volume =
+            prepared_owned_observed_volume(&desired.volumes[0], &attachment, host(data_directory));
+        foreign_volume.local_lineages[0].acquire_origin = foreign_identity.acquire_origin;
+        let fresh_runtime =
+            observed_runtime(root.path(), &desired, Some((&acquire, foreign_volume)));
+        let (restart_effect, calls) = effect(
+            &desired,
+            vec![NormalAcquireAttempt::Granted(Box::new(attachment))],
+            authority,
+            blob,
+            checkpoint_path.clone(),
+        );
+        let (restart_context, _) =
+            context_with_session(root.path(), &desired, Some(fresh_runtime), '8', 3);
+
+        assert_eq!(
+            restart_effect.apply(restart_context, &desired).unwrap(),
+            stop_local()
+        );
+        assert!(calls.lock().unwrap().requests.is_empty());
+        assert_eq!(std::fs::read(identity_path).unwrap(), foreign_bytes);
+        assert!(matches!(
+            read_checkpoint(&checkpoint_path).step,
+            ReconcileStep::AcquireVolume { .. }
+        ));
     }
 
     #[test]
@@ -1292,13 +1632,23 @@ mod tests {
         desired: &DesiredRuntimeSpec,
         runtime: Option<ObservedRuntimeStatus>,
     ) -> (RuntimeDesiredEffectContext, Instant) {
+        context_with_session(root, desired, runtime, '4', 2)
+    }
+
+    fn context_with_session(
+        root: &std::path::Path,
+        desired: &DesiredRuntimeSpec,
+        runtime: Option<ObservedRuntimeStatus>,
+        agent_instance: char,
+        session_epoch: u64,
+    ) -> (RuntimeDesiredEffectContext, Instant) {
         let session = AgentSession {
             version: ContractVersion::V1,
             node_id: desired.placement.node_id.clone(),
             immutable_host_id: id("host_a"),
             node_boot_id: NodeBootId::new("33333333333333333333333333333333").unwrap(),
-            agent_instance_id: random('4'),
-            agent_session_epoch: epoch(2),
+            agent_instance_id: random(agent_instance),
+            agent_session_epoch: epoch(session_epoch),
             registration_attempt_id: random('5'),
             guest_config_digest: desired.runtime.guest_config_digest.clone(),
             lease_deadline_unix_ms: unix_ms(1_900_000_120_000),
@@ -1527,6 +1877,62 @@ mod tests {
 
     fn read_checkpoint(path: &std::path::Path) -> RuntimeCheckpoint {
         decode_runtime_checkpoint(&std::fs::read(path).unwrap()).unwrap()
+    }
+
+    fn prepared_file_snapshot(data_directory: &std::path::Path) -> Vec<(String, Vec<u8>)> {
+        [
+            "identity.json",
+            "authorized-serving.json",
+            "launch-checkpoint.json",
+        ]
+        .into_iter()
+        .map(|name| {
+            (
+                name.to_owned(),
+                std::fs::read(data_directory.join(name)).unwrap(),
+            )
+        })
+        .collect()
+    }
+
+    fn replace_with_exact_checkpoint_bytes(path: &std::path::Path) {
+        let bytes = std::fs::read(path).unwrap();
+        let replacement = path.with_file_name(".signed-running-concurrent-replace.tmp");
+        let file = std::fs::File::create(&replacement).unwrap();
+        std::fs::set_permissions(
+            &replacement,
+            <std::fs::Permissions as std::os::unix::fs::PermissionsExt>::from_mode(0o600),
+        )
+        .unwrap();
+        use std::io::Write as _;
+        (&file).write_all(&bytes).unwrap();
+        file.sync_all().unwrap();
+        std::fs::rename(&replacement, path).unwrap();
+        std::fs::File::open(path.parent().unwrap())
+            .unwrap()
+            .sync_all()
+            .unwrap();
+    }
+
+    fn assert_prepared_provision_checkpoint(
+        checkpoint: &RuntimeCheckpoint,
+        attachment: &AuthorizedServingAttachment,
+        data_directory: &std::path::Path,
+    ) {
+        assert!(matches!(
+            checkpoint.step,
+            ReconcileStep::ProvisionRootImage { .. }
+        ));
+        let [volume] = checkpoint.volumes.as_slice() else {
+            panic!("prepared checkpoint must contain one root")
+        };
+        assert_eq!(
+            volume.local_lineages,
+            [expected_local_lineage(
+                &attachment.identity,
+                &host(data_directory.to_path_buf())
+            )]
+        );
     }
 
     fn checkpoint_path(root: &std::path::Path, cat_id: &Id) -> std::path::PathBuf {

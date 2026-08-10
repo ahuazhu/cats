@@ -23,7 +23,7 @@ use cats_api::runtime_reconciliation::{
     RuntimeTarget, VolumeAccess, VolumeAcquire, VolumeDisposition, VolumeIntent,
 };
 use cats_storage::authority::{
-    validate_authorized_serving_attachment, AuthorizedServingAttachment,
+    validate_authorized_serving_attachment, AttachmentLineageIdentity, AuthorizedServingAttachment,
 };
 use cats_storage::AdapterSelection;
 use serde::{Deserialize, Serialize};
@@ -106,7 +106,7 @@ impl AuthorizedBlockdStore {
             .context("clone retained Node state directory")?;
         let mut relative = PathBuf::new();
         let mut directory = root;
-        for component in directory_components(desired, attachment) {
+        for component in directory_components(desired, &attachment.identity) {
             relative.push(&component);
             directory = ensure_directory_at(&directory, &component, &relative)?;
         }
@@ -381,15 +381,31 @@ fn validate_checkpoint_inputs(
 
 fn directory_components(
     desired: &DesiredRuntimeSpec,
-    attachment: &AuthorizedServingAttachment,
+    identity: &AttachmentLineageIdentity,
 ) -> [String; 5] {
     [
         DATA_DIRECTORY.to_owned(),
         format!("cat-{}", desired.cat_id),
-        format!("volume-{}", attachment.identity.volume_id),
-        format!("attachment-{}", attachment.identity.attachment_id),
-        format!("epoch-{}", attachment.identity.attachment_epoch.get()),
+        format!("volume-{}", identity.volume_id),
+        format!("attachment-{}", identity.attachment_id),
+        format!("epoch-{}", identity.attachment_epoch.get()),
     ]
+}
+
+/// Deterministic physical path selected by the complete attachment lineage.
+/// Inventory admission uses this same function when deciding whether a
+/// durable directory left by an interrupted prepare is the exact effect it is
+/// allowed to adopt.
+pub(crate) fn authorized_blockd_data_directory(
+    state_directory: &Path,
+    desired: &DesiredRuntimeSpec,
+    identity: &AttachmentLineageIdentity,
+) -> PathBuf {
+    directory_components(desired, identity)
+        .into_iter()
+        .fold(state_directory.to_path_buf(), |path, component| {
+            path.join(component)
+        })
 }
 
 fn bounded_json<T: Serialize>(value: &T, maximum: usize, label: &str) -> Result<Vec<u8>> {
