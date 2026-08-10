@@ -9,6 +9,8 @@ use std::sync::{Arc, Mutex, Weak};
 use std::time::Duration;
 
 use anyhow::Context;
+use cats_api::gateway_workload_identity::GatewayWorkloadIdentityAuthority;
+use cats_api::runtime_artifacts::{InstalledGatewayMachineArtifacts, InstalledRouteGrantV2Signer};
 use cats_api::runtime_reconciliation::{GuestRuntimeProfileReceipt, RuntimeProvisionerTrustBundle};
 use cats_metering::{CreditStore, UsageStore};
 use cats_storage::{BlobStore, MetadataStore};
@@ -22,6 +24,7 @@ const SINGLETON_ELECTION_RETRY: Duration = Duration::from_millis(500);
 const SINGLETON_HEALTH_INTERVAL: Duration = Duration::from_secs(1);
 const RUNTIME_SPINE_GLOBAL_IN_FLIGHT: usize = 64;
 const ROUTE_RESOLVE_V2_GLOBAL_IN_FLIGHT: usize = 32;
+const GATEWAY_AUTHENTICATION_GLOBAL_IN_FLIGHT: usize = 32;
 const RUNTIME_VOLUME_TRANSITION_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// Non-authoritative, per-replica admission for signed A19/A20 Node ingress.
@@ -441,6 +444,49 @@ pub struct Config {
     pub oci_deploy_sync_wait_ms: u64,
 }
 
+/// Fully validated composition for the independent Gateway machine listener.
+/// Fixed PEM/private bytes are parsed and dropped by `new`; this value retains
+/// only the TLS provider objects, canonical Gateway install candidate and
+/// validated Route v2 signer/binding.
+pub struct GatewayMachineConfig {
+    listen: String,
+    gateway_authority: GatewayWorkloadIdentityAuthority,
+    tls_config: crate::gateway_machine::GatewayMachineTlsConfig,
+    signing_authority: Arc<crate::route_grant_v2::InstalledRouteGrantV2SigningAuthority>,
+}
+
+impl GatewayMachineConfig {
+    pub fn new(
+        listen: impl Into<String>,
+        gateway_artifacts: InstalledGatewayMachineArtifacts,
+        signer_artifacts: InstalledRouteGrantV2Signer,
+        route_grant_ttl_seconds: u64,
+    ) -> anyhow::Result<Self> {
+        let listen = listen.into();
+        anyhow::ensure!(
+            !listen.is_empty(),
+            "Gateway machine listen address is empty"
+        );
+        // Complete TLS/key-pair validation before PostgreSQL installation or
+        // either network bind. Raw fixed private bytes drop on return.
+        let tls_config = crate::gateway_machine::GatewayMachineTlsConfig::from_installed_artifacts(
+            &gateway_artifacts,
+        )?;
+        let signing_authority = Arc::new(
+            crate::route_grant_v2::InstalledRouteGrantV2SigningAuthority::from_installed_artifacts(
+                &signer_artifacts,
+                route_grant_ttl_seconds,
+            )?,
+        );
+        Ok(Self {
+            listen,
+            gateway_authority: gateway_artifacts.authority().clone(),
+            tls_config,
+            signing_authority,
+        })
+    }
+}
+
 /// Default synchronous wait for an OCI deploy.
 ///
 /// Covers a first-pull deploy of a multi-hundred-megabyte image, which is the
@@ -480,6 +526,9 @@ pub struct AppState {
 pub struct Handle {
     /// Bound address, e.g. `127.0.0.1:53412`.
     pub addr: std::net::SocketAddr,
+    /// Bound only when `spawn_with_gateway_machine` receives a complete fixed
+    /// machine composition.
+    pub gateway_machine_addr: Option<std::net::SocketAddr>,
     pub state: AppState,
     server_task: tokio::task::JoinHandle<()>,
     reconciler_task: Option<tokio::task::JoinHandle<()>>,
@@ -488,12 +537,13 @@ pub struct Handle {
         crate::store::runtime_authority::image_manifest_resolver::ImmutableImageManifestResolver,
     >,
     server_shutdown: std::sync::Mutex<Option<tokio::sync::oneshot::Sender<()>>>,
+    gateway_machine_listener: Option<crate::gateway_machine::GatewayMachineListener>,
 }
 
 pub(crate) struct ReadinessLatch(std::sync::atomic::AtomicBool);
 
 impl ReadinessLatch {
-    fn new() -> Self {
+    pub(crate) fn new() -> Self {
         Self(std::sync::atomic::AtomicBool::new(true))
     }
 
@@ -511,6 +561,9 @@ impl Handle {
         format!("http://{}", self.addr)
     }
     fn begin_shutdown(&self) {
+        if let Some(listener) = &self.gateway_machine_listener {
+            listener.begin_shutdown();
+        }
         self.state.cat_create.begin_shutdown();
         self.state
             .runtime_volume_transition_service
@@ -549,6 +602,13 @@ impl Handle {
             .runtime_node_authority
             .shutdown_commit_resolutions();
         let manifest_reads = self.image_manifest_resolver.shutdown();
+        let gateway_machine = async {
+            if let Some(listener) = &self.gateway_machine_listener {
+                listener.shutdown().await
+            } else {
+                Ok(())
+            }
+        };
         let (
             _,
             transition_result,
@@ -556,13 +616,15 @@ impl Handle {
             commit_result,
             node_authority_result,
             manifest_result,
+            gateway_machine_result,
         ) = tokio::join!(
             observation_store,
             volume_transitions,
             route_resolutions,
             commit_resolutions,
             node_authority_resolutions,
-            manifest_reads
+            manifest_reads,
+            gateway_machine
         );
         if !manifest_result {
             tracing::warn!("image manifest reads exceeded the shutdown deadline");
@@ -572,6 +634,7 @@ impl Handle {
         self.server_task.abort();
         transition_result?;
         route_result?;
+        gateway_machine_result?;
         commit_result.map_err(anyhow::Error::from)?;
         node_authority_result.map_err(anyhow::Error::from)
     }
@@ -769,7 +832,17 @@ async fn run_reconciler_role(controller: Arc<Controller>, store: Arc<Store>, int
 
 /// Start the control plane inside the current tokio runtime.
 pub async fn spawn(cfg: Config) -> anyhow::Result<Handle> {
-    spawn_inner(cfg, false).await
+    spawn_inner(cfg, false, None).await
+}
+
+/// Start the public control plane plus the isolated mTLS Gateway machine
+/// listener. The machine authority is installed/exact-replayed before either
+/// listener binds; failure has no bearer/plain/public-router fallback.
+pub async fn spawn_with_gateway_machine(
+    cfg: Config,
+    gateway_machine: GatewayMachineConfig,
+) -> anyhow::Result<Handle> {
+    spawn_inner(cfg, false, Some(gateway_machine)).await
 }
 
 /// Retired product/controller harness. It uses the exact production Node
@@ -777,12 +850,13 @@ pub async fn spawn(cfg: Config) -> anyhow::Result<Handle> {
 /// registration, or work-status compatibility routes.
 #[doc(hidden)]
 pub async fn spawn_for_retired_product_tests(cfg: Config) -> anyhow::Result<Handle> {
-    spawn_inner(cfg, true).await
+    spawn_inner(cfg, true, None).await
 }
 
 async fn spawn_inner(
     cfg: Config,
     retired_product_authority_for_tests: bool,
+    gateway_machine: Option<GatewayMachineConfig>,
 ) -> anyhow::Result<Handle> {
     anyhow::ensure!(
         !cfg.auth_token.is_empty(),
@@ -826,6 +900,20 @@ async fn spawn_inner(
         .execute(move |store| store.install_runtime_provisioner_trust_bundle(&trust_bundle))
         .await
         .context("install runtime provisioner trust bundle")?;
+    if let Some(machine) = &gateway_machine {
+        let signing_authority = Arc::clone(&machine.signing_authority);
+        store
+            .execute(move |store| store.install_route_grant_v2_signer_authority(&signing_authority))
+            .await
+            .context("install Route Grant v2 signing authority")?;
+        let gateway_authority = machine.gateway_authority.clone();
+        store
+            .execute(move |store| {
+                store.install_gateway_workload_identity_authority(&gateway_authority)
+            })
+            .await
+            .context("install Gateway workload identity authority")?;
+    }
     let observation_store = ObservationStoreLane::connect_from_async(
         cfg.control_store_dsn.clone(),
         cfg.control_store_ca_file
@@ -937,6 +1025,35 @@ async fn spawn_inner(
         retired_product_authority_for_tests,
     };
 
+    let gateway_machine_listener = if let Some(machine) = gateway_machine {
+        let signer = machine.signing_authority.signer().cloned().map(Arc::new);
+        let binding = Arc::new(machine.signing_authority.binding().clone());
+        let service = Arc::new(
+            crate::api::route_resolve_v2::RouteResolveV2Service::for_gateway_machine(
+                Arc::clone(&state.store),
+                signer,
+                binding,
+                state
+                    .agent_session_registration_policy
+                    .approved_guest_config_digest()
+                    .clone(),
+                GATEWAY_AUTHENTICATION_GLOBAL_IN_FLIGHT,
+                ROUTE_RESOLVE_V2_GLOBAL_IN_FLIGHT,
+            ),
+        );
+        Some(
+            crate::gateway_machine::GatewayMachineListener::spawn(
+                &machine.listen,
+                machine.tls_config,
+                service,
+                Arc::clone(&state.readiness),
+            )
+            .await?,
+        )
+    } else {
+        None
+    };
+
     let listener = tokio::net::TcpListener::bind(&cfg.listen)
         .await
         .with_context(|| format!("bind {}", cfg.listen))?;
@@ -985,14 +1102,19 @@ async fn spawn_inner(
         )
     });
 
-    tracing::info!(%addr, "control plane ready");
+    let gateway_machine_addr = gateway_machine_listener
+        .as_ref()
+        .map(crate::gateway_machine::GatewayMachineListener::addr);
+    tracing::info!(%addr, ?gateway_machine_addr, "control plane ready");
     Ok(Handle {
         addr,
+        gateway_machine_addr,
         state,
         server_task,
         reconciler_task,
         billing_enforcer_task,
         image_manifest_resolver: image_manifests,
         server_shutdown: std::sync::Mutex::new(Some(server_shutdown)),
+        gateway_machine_listener,
     })
 }

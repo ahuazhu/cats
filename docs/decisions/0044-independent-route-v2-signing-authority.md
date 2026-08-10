@@ -45,9 +45,10 @@ production full-inventory 对已安装 public ring 的只读 exact observation�
 不接受该轮 full inventory。PostgreSQL现已保存revision-one immutable exact descriptor、current exact
 projection和permanent key/secret-reference lineage；startup只允许initial install或exact replay，不把合法本地
 successor自动当作rotation authority，且resolve可在共享lock内比较进程内binding与PG current。它仍不实现
-public-ring installer、successor/rotation writer、schedulable全量ACK rollout、Control/Node TLS listener或proxy。
-Gateway PG principal虽已落库，但machine listener组合完成前仍保持关闭，不能用测试constructor或旧authority
-补齐。
+public-ring installer、successor/rotation writer、schedulable全量ACK rollout、Node TLS listener或proxy。
+Control现已用固定CA/server artifact组成独立TLS 1.3/HTTP/1.1 machine listener；每次签发在同一shared-lock
+snapshot内同时重验Gateway principal、hostname-derived Workspace、Route/Desired/ring ACK与本进程signer的PG
+current binding。disabled或stale signer保持503，不能用测试constructor或旧authority补齐。
 
 上述Gateway与signer表共同属于尚未合流部署的exact clean-slate schema 13最终形态；此前Gateway-only提交不是
 可独立部署的version 13迁移，也不允许当前stamp启动时补表或repair catalog。

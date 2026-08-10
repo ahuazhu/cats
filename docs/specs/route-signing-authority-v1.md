@@ -1,14 +1,15 @@
 # Route v2 Signing Authority v1
 
-- 状态：Frozen target contract；artifact codecs/readers 与 Node installed-ring observation 已实现，installer 和持久 rotation rollout 尚未实现
+- 状态：Frozen target contract；artifact codecs/readers、PG initial/current binding、Control machine
+  resolve current compare与Node installed-ring observation已实现，installer和持久rotation rollout尚未实现
 - 决策：[ADR-0044](../decisions/0044-independent-route-v2-signing-authority.md)
 - Grant 与 admission：[Route Grant v2](route-grant-v2.md)
 - Node observation：[Runtime Inventory and Observation Spine v1](runtime-inventory-observation-v1.md)
 
 本文只冻结 Route v2 private signer、public-key ring、rotation/revocation、部署 artifact，以及 Runtime
 scanner 对 fixed installed ring 的 exact observation。它不定义其他 physical inventory source、Gateway
-workload principal、Control/Node TLS transport、public listener或Node proxy。这些边界未闭合时 production
-Route v2 必须继续关闭。
+workload principal、Node TLS transport、public listener或Node proxy；Control的独立Gateway machine listener
+由ADR-0045另行闭合。Gateway到Node边界未闭合时production proxy必须继续关闭。
 
 ## 1. Authority separation
 
@@ -140,8 +141,7 @@ secret-reference/kid lineage；same exact revision replay零写，same revision�
 每次resolve的单一PG signer snapshot最终还必须比较进程内`deployment_id/signer_revision/reference digest/
 active kid/secret reference`与current persisted state。旧replica即使仍能访问旧private file也只能返回503。
 这项compare与rotation writer共享singleton lock；snapshot的DB now产生Grant `iat`，writer切key时同一DB now
-作为`last_old_issue_at`上界。PG current compare与共享lock已实现；machine listener内的最终同snapshot组合在
-Gateway slice完成前仍保持关闭。
+作为`last_old_issue_at`上界。PG current compare、共享lock及machine listener内的最终同snapshot组合均已实现。
 
 ## 5. Rotation, retirement and revocation
 

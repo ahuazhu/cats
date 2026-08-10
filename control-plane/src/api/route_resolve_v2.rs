@@ -1,12 +1,9 @@
 //! Strict Route Grant v2 resolve handler.
 //!
-//! The HTTP frame and authenticated-envelope work are production code. The
-//! accepted architecture does not yet define a Gateway credential artifact,
-//! current-credential Store, trust rotation, or TLS principal mapping. For
-//! that reason the production router installs no value of
-//! [`AuthenticatedGatewayPrincipal`], and every request fails before its body
-//! is read or PostgreSQL is touched. Test support can insert the unforgeable
-//! in-process proof to exercise the remainder of this route over loopback.
+//! The public router deliberately installs no verified TLS peer and therefore
+//! remains closed before body/Store access. The independent machine listener
+//! injects [`VerifiedGatewayTlsPeer`] only after mTLS chain validation; this
+//! handler then reauthenticates the leaf against PostgreSQL on every request.
 
 use std::error::Error as _;
 use std::sync::{Arc, Mutex};
@@ -17,59 +14,79 @@ use axum::extract::Extension;
 use axum::http::{header, HeaderMap, HeaderValue, Request, StatusCode};
 use axum::response::{IntoResponse, Response};
 
-use cats_api::error::ErrorCode;
+use cats_api::error::{ApiError, ErrorCode};
 use cats_api::route_grant_v2::{
     decode_route_resolve_v2_request, encode_route_resolve_v2_rejection,
     encode_route_resolve_v2_success, RouteResolveV2Rejection, RouteResolveV2RejectionCode,
     RouteResolveV2Success, RouteV2EnvelopeError, ROUTE_RESOLVE_V2_DEADLINE_MILLIS,
-    ROUTE_RESOLVE_V2_METHOD, ROUTE_RESOLVE_V2_REQUEST_MAX_WIRE_BYTES, ROUTE_V2_JSON_CONTENT_TYPE,
+    ROUTE_RESOLVE_V2_METHOD, ROUTE_RESOLVE_V2_PATH, ROUTE_RESOLVE_V2_REQUEST_MAX_WIRE_BYTES,
+    ROUTE_V2_JSON_CONTENT_TYPE,
 };
+use cats_api::runtime_reconciliation::Sha256Digest;
 
 use crate::server::AppState;
 use crate::store::runtime_authority::route_signer::{
-    RouteGrantV2AuthorityLoad, RouteGrantV2AuthorityRejection,
+    RouteGrantV2AuthorityLoad, RouteGrantV2AuthorityRejection, RouteGrantV2MachineAuthorityLoad,
 };
-use crate::store::Store;
+use crate::store::runtime_authority::route_signing_authority::RouteGrantV2SignerBinding;
+use crate::store::{AuthorityRequestContext, Store};
 
 const ROUTE_RESOLVE_V2_SHUTDOWN_DEADLINE: Duration = Duration::from_secs(30);
 
-/// Proof constructed only by a trusted in-process machine transport adapter.
-///
-/// There is intentionally no public constructor. An HTTP header cannot create
-/// this value, so the current public/shared-bearer router cannot accidentally
-/// authorize a Gateway while the credential authority remains undefined.
+/// Proof constructed from the CA-verified leaf by the independent TLS
+/// transport. It is never deserialized from HTTP fields.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct VerifiedGatewayTlsPeer {
+    public_key_spki_sha256: Sha256Digest,
+}
+
+impl VerifiedGatewayTlsPeer {
+    pub(crate) fn from_verified_spki_sha256(public_key_spki_sha256: Sha256Digest) -> Self {
+        Self {
+            public_key_spki_sha256,
+        }
+    }
+
+    fn public_key_spki_sha256(&self) -> &Sha256Digest {
+        &self.public_key_spki_sha256
+    }
+}
+
+/// Explicit test-router proof retained only for the pre-existing route
+/// authority tests. Production builds cannot construct or inspect it.
+#[cfg(test)]
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct AuthenticatedGatewayPrincipal {
     _private: (),
 }
 
+#[cfg(test)]
 impl AuthenticatedGatewayPrincipal {
-    /// This constructor is an in-process trust boundary, not an authentication
-    /// mechanism. It exists only in crate unit tests until a machine transport
-    /// validates the future Gateway credential authority.
-    #[cfg(test)]
     pub(crate) const fn for_test() -> Self {
         Self { _private: () }
     }
 }
 
 /// Post-transport dependencies for one resolve lane. Keeping these separate
-/// from [`AppState`] lets the future machine-authenticated listener compose
-/// exactly this route without inheriting the public API's bearer/session
-/// middleware.
+/// from [`AppState`] lets the machine-authenticated listener compose exactly
+/// this route without inheriting the public API's bearer/session middleware.
 pub(crate) struct RouteResolveV2Service {
     store: Arc<Store>,
     route_grant_signer: Option<Arc<crate::route_grant_v2::RouteGrantV2Signer>>,
+    route_grant_signer_binding: Option<Arc<RouteGrantV2SignerBinding>>,
     active_guest_digest: cats_api::runtime_reconciliation::Sha256Digest,
+    authentication_admission: Arc<RouteResolveV2Admission>,
     admission: Arc<RouteResolveV2Admission>,
+    #[cfg(test)]
+    test_authentication_bypass: bool,
     #[cfg(test)]
     store_pause: Mutex<Option<RouteResolveV2StorePause>>,
 }
 
 /// Owns admitted Route v2 reads until both the handler and any Store closure
 /// it started have settled. This is deliberately separate from the public API
-/// admission lanes: a future machine listener must be able to stop and join
-/// exactly its own work during shutdown.
+/// admission lanes so the machine listener can stop and join exactly its own
+/// work during shutdown.
 pub(crate) struct RouteResolveV2Admission {
     permits: Arc<tokio::sync::Semaphore>,
     state: Mutex<RouteResolveV2AdmissionState>,
@@ -187,11 +204,37 @@ impl RouteResolveV2Service {
             // Route v2 must never borrow the legacy V1 key/config. A future
             // accepted secret-reference composition supplies this separately.
             route_grant_signer: None,
+            route_grant_signer_binding: None,
             active_guest_digest: state
                 .agent_session_registration_policy
                 .approved_guest_config_digest()
                 .clone(),
+            authentication_admission: Arc::new(RouteResolveV2Admission::new(32)),
             admission: Arc::clone(&state.route_resolve_admission),
+            #[cfg(test)]
+            test_authentication_bypass: false,
+            #[cfg(test)]
+            store_pause: Mutex::new(None),
+        }
+    }
+
+    pub(crate) fn for_gateway_machine(
+        store: Arc<Store>,
+        route_grant_signer: Option<Arc<crate::route_grant_v2::RouteGrantV2Signer>>,
+        route_grant_signer_binding: Arc<RouteGrantV2SignerBinding>,
+        active_guest_digest: cats_api::runtime_reconciliation::Sha256Digest,
+        authentication_limit: usize,
+        resolve_limit: usize,
+    ) -> Self {
+        Self {
+            store,
+            route_grant_signer,
+            route_grant_signer_binding: Some(route_grant_signer_binding),
+            active_guest_digest,
+            authentication_admission: Arc::new(RouteResolveV2Admission::new(authentication_limit)),
+            admission: Arc::new(RouteResolveV2Admission::new(resolve_limit)),
+            #[cfg(test)]
+            test_authentication_bypass: false,
             #[cfg(test)]
             store_pause: Mutex::new(None),
         }
@@ -206,8 +249,11 @@ impl RouteResolveV2Service {
         Self {
             store,
             route_grant_signer: Some(route_grant_signer),
+            route_grant_signer_binding: None,
             active_guest_digest,
+            authentication_admission: Arc::new(RouteResolveV2Admission::new(32)),
             admission: Arc::new(RouteResolveV2Admission::new(32)),
+            test_authentication_bypass: true,
             store_pause: Mutex::new(None),
         }
     }
@@ -220,8 +266,11 @@ impl RouteResolveV2Service {
         Self {
             store,
             route_grant_signer: None,
+            route_grant_signer_binding: None,
             active_guest_digest,
+            authentication_admission: Arc::new(RouteResolveV2Admission::new(32)),
             admission: Arc::new(RouteResolveV2Admission::new(32)),
+            test_authentication_bypass: true,
             store_pause: Mutex::new(None),
         }
     }
@@ -251,7 +300,30 @@ impl RouteResolveV2Service {
 
     #[cfg(test)]
     pub(crate) async fn shutdown_for_test(&self) -> anyhow::Result<()> {
-        self.admission.shutdown().await
+        self.shutdown().await
+    }
+
+    pub(crate) fn begin_shutdown(&self) {
+        self.authentication_admission.begin_shutdown();
+        self.admission.begin_shutdown();
+    }
+
+    pub(crate) async fn shutdown(&self) -> anyhow::Result<()> {
+        self.begin_shutdown();
+        let (authentication, resolve) = tokio::join!(
+            self.authentication_admission.shutdown(),
+            self.admission.shutdown()
+        );
+        authentication?;
+        resolve
+    }
+}
+
+struct CancelRequestOnDrop(AuthorityRequestContext);
+
+impl Drop for CancelRequestOnDrop {
+    fn drop(&mut self) {
+        self.0.cancel();
     }
 }
 
@@ -260,6 +332,8 @@ pub(crate) async fn resolve(
     request: Request<Body>,
 ) -> Response {
     let deadline = Instant::now() + Duration::from_millis(ROUTE_RESOLVE_V2_DEADLINE_MILLIS);
+    let request_context = AuthorityRequestContext::new(deadline);
+    let _cancel_on_drop = CancelRequestOnDrop(request_context.clone());
     if request.method().as_str() != ROUTE_RESOLVE_V2_METHOD {
         return rejection_response(
             StatusCode::METHOD_NOT_ALLOWED,
@@ -270,6 +344,13 @@ pub(crate) async fn resolve(
             )],
         );
     }
+    if request.uri().path() != ROUTE_RESOLVE_V2_PATH {
+        return rejection_response(
+            StatusCode::BAD_REQUEST,
+            RouteResolveV2RejectionCode::InvalidRequest,
+            &[],
+        );
+    }
     if request.uri().query().is_some() {
         return rejection_response(
             StatusCode::BAD_REQUEST,
@@ -278,24 +359,79 @@ pub(crate) async fn resolve(
         );
     }
 
-    // Authentication precedes body read/decode, admission and Store access.
-    // The proof can only come from the future machine transport middleware.
-    if request
+    let verified_peer = request
         .extensions()
-        .get::<AuthenticatedGatewayPrincipal>()
-        .is_none()
-    {
+        .get::<VerifiedGatewayTlsPeer>()
+        .cloned();
+    #[cfg(test)]
+    let test_authenticated = service.test_authentication_bypass
+        && request
+            .extensions()
+            .get::<AuthenticatedGatewayPrincipal>()
+            .is_some();
+    #[cfg(not(test))]
+    let test_authenticated = false;
+    if verified_peer.is_none() && !test_authenticated {
         return rejection_response(
             StatusCode::UNAUTHORIZED,
             RouteResolveV2RejectionCode::AuthenticationFailed,
             &[],
         );
     }
+
+    // Authentication owns a separate bounded lane and PostgreSQL read. Its
+    // Store-closure clone survives handler timeout/cancellation until the
+    // blocking worker has actually settled.
+    let authentication_lease = match service.authentication_admission.try_begin() {
+        Some(lease) => lease,
+        None => return unavailable_response(),
+    };
+    let authenticated_principal = if let Some(verified_peer) = verified_peer {
+        let store = Arc::clone(&service.store);
+        let store_lease = Arc::clone(&authentication_lease);
+        let store_context = request_context.clone();
+        let public_key_spki_sha256 = verified_peer.public_key_spki_sha256().clone();
+        let authenticated = tokio::time::timeout_at(
+            tokio::time::Instant::from_std(deadline),
+            store.execute(move |store| {
+                let _store_lease = store_lease;
+                store.authenticate_gateway_tls_peer(&public_key_spki_sha256, &store_context)
+            }),
+        )
+        .await;
+        match authenticated {
+            Ok(Ok(Some(principal))) => Some(principal),
+            Ok(Ok(None)) => {
+                return rejection_response(
+                    StatusCode::UNAUTHORIZED,
+                    RouteResolveV2RejectionCode::AuthenticationFailed,
+                    &[],
+                );
+            }
+            Ok(Err(error))
+                if matches!(
+                    error.code,
+                    ErrorCode::Unavailable | ErrorCode::DeadlineExceeded
+                ) =>
+            {
+                return unavailable_response();
+            }
+            Ok(Err(_)) => return internal_response(),
+            Err(_) => return unavailable_response(),
+        }
+    } else {
+        None
+    };
+
     let Some(route_grant_signer) = service.route_grant_signer.as_ref().cloned() else {
-        // A machine principal must not accidentally activate this route before
-        // the independent v2 signing-key composition exists.
+        // A current principal cannot activate body reads when signer private
+        // material is disabled or otherwise absent.
         return unavailable_response();
     };
+    let route_grant_signer_binding = service.route_grant_signer_binding.as_ref().cloned();
+    if authenticated_principal.is_some() && route_grant_signer_binding.is_none() {
+        return unavailable_response();
+    }
 
     let headers = request.headers().clone();
     if single_header_text(&headers, header::CONTENT_TYPE.as_str()).is_none_or(|value| {
@@ -391,7 +527,9 @@ pub(crate) async fn resolve(
     let active_guest_digest = service.active_guest_digest.clone();
     let hostname = request.hostname;
     let store = service.store.clone();
-    let store_lease = Arc::clone(&request_lease);
+    let store_authentication_lease = Arc::clone(&authentication_lease);
+    let store_route_lease = Arc::clone(&request_lease);
+    let store_context = request_context.clone();
     #[cfg(test)]
     let store_pause = service
         .store_pause
@@ -401,19 +539,60 @@ pub(crate) async fn resolve(
     let loaded = tokio::time::timeout_at(
         tokio::time::Instant::from_std(deadline),
         store.execute(move |store| {
-            let _store_lease = store_lease;
+            let _store_authentication_lease = store_authentication_lease;
+            let _store_route_lease = store_route_lease;
             #[cfg(test)]
             if let Some(pause) = store_pause {
                 pause.entered.wait();
                 pause.release.wait();
             }
-            store.load_route_grant_v2_authority(&hostname, &signer_kid, &active_guest_digest)
+            if let Some(principal) = authenticated_principal.as_ref() {
+                let binding = route_grant_signer_binding.as_ref().ok_or_else(|| {
+                    ApiError::unavailable("Route Grant v2 signer binding is not composed")
+                })?;
+                store.issue_route_grant_v2_for_gateway(
+                    &hostname,
+                    principal,
+                    binding,
+                    &route_grant_signer,
+                    &active_guest_digest,
+                    &store_context,
+                )
+            } else {
+                // Explicit crate-test routers retain their historical route
+                // authority oracle without creating a production principal.
+                match store.load_route_grant_v2_authority(
+                    &hostname,
+                    &signer_kid,
+                    &active_guest_digest,
+                )? {
+                    RouteGrantV2AuthorityLoad::Ready(snapshot) => {
+                        let issued = route_grant_signer.issue(&snapshot).map_err(|_| {
+                            ApiError::unavailable("test Route Grant v2 signer failed")
+                        })?;
+                        Ok(RouteGrantV2MachineAuthorityLoad::Ready { snapshot, issued })
+                    }
+                    RouteGrantV2AuthorityLoad::Rejected(rejection) => {
+                        Ok(RouteGrantV2MachineAuthorityLoad::Rejected(rejection))
+                    }
+                }
+            }
         }),
     )
     .await;
-    let snapshot = match loaded {
-        Ok(Ok(RouteGrantV2AuthorityLoad::Ready(snapshot))) => snapshot,
-        Ok(Ok(RouteGrantV2AuthorityLoad::Rejected(rejection))) => {
+    let (snapshot, issued) = match loaded {
+        Ok(Ok(RouteGrantV2MachineAuthorityLoad::Ready { snapshot, issued })) => (snapshot, issued),
+        Ok(Ok(RouteGrantV2MachineAuthorityLoad::AuthenticationFailed)) => {
+            return rejection_response(
+                StatusCode::UNAUTHORIZED,
+                RouteResolveV2RejectionCode::AuthenticationFailed,
+                &[],
+            );
+        }
+        Ok(Ok(RouteGrantV2MachineAuthorityLoad::SignerUnavailable)) => {
+            return unavailable_response();
+        }
+        Ok(Ok(RouteGrantV2MachineAuthorityLoad::Rejected(rejection))) => {
             return authority_rejection_response(rejection);
         }
         Ok(Err(error))
@@ -425,10 +604,6 @@ pub(crate) async fn resolve(
             return unavailable_response();
         }
         Ok(Err(_)) => return internal_response(),
-        Err(_) => return unavailable_response(),
-    };
-    let issued = match route_grant_signer.issue(&snapshot) {
-        Ok(issued) => issued,
         Err(_) => return unavailable_response(),
     };
     let response = match RouteResolveV2Success::new(

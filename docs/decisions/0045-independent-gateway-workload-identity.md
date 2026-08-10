@@ -54,6 +54,18 @@ keepalive连接越过撤销继续签发。
     无配置仍在pre-body/pre-PG返回401，principal已认证但signer未组成则pre-body/pre-PG返回503。该决策不开放
     public proxy、不改变Node admission，也不定义Gateway到Node的TLS/proxy frame。
 
+## 当前实现边界
+
+Control现已从唯一固定目录用descriptor/stable-reopen合同读取policy、client CA、server chain与server key；
+启动在任何bind前验证TLS 1.3配置、Ed25519 server pair、Gateway PG candidate及Route signer PG exact current。
+独立machine listener只协商HTTP/1.1，每个request从verified leaf重新做pre-body PG认证，并在最终shared-lock
+snapshot内闭合hostname-derived Workspace、Route/Desired/ring ACK、Gateway scope与signer current后才签名。
+认证/resolve拥有独立bounded RAII owner，shutdown关闭两类admission并join Store closure与listener task。
+
+本实现仍不包含Gateway到Node credential/listener、public proxy、Route signer rotation writer或Node public-ring
+installer/全量ACK rollout。Gateway与signer表仍共同属于尚未合流部署的clean-slate schema 13最终形态；中间
+提交不构成可单独部署migration。
+
 ## 后果
 
 - credential撤销在PG线性化；旧replica、旧keepalive连接和TLS恢复session的下一request都必须重新失败。

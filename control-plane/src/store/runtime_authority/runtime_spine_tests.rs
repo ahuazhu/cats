@@ -2945,6 +2945,102 @@ fn route_ready_runtime(desired: &DesiredRuntimeSpec) -> ObservedRuntimeStatus {
     }
 }
 
+async fn gateway_test_tls_stream(
+    address: std::net::SocketAddr,
+) -> tokio_rustls::client::TlsStream<tokio::net::TcpStream> {
+    use rustls::pki_types::pem::PemObject as _;
+
+    let ca = include_bytes!("../../../tests/fixtures/gateway_machine_ca_certificate.pem");
+    let client_certificate =
+        include_bytes!("../../../tests/fixtures/gateway_machine_client_certificate.pem");
+    let client_private_key =
+        include_bytes!("../../../tests/fixtures/gateway_machine_client_private_key.pem");
+    let mut roots = rustls::RootCertStore::empty();
+    roots
+        .add(rustls::pki_types::CertificateDer::from_pem_slice(ca).unwrap())
+        .unwrap();
+    let certificates = rustls::pki_types::CertificateDer::pem_slice_iter(client_certificate)
+        .collect::<Result<Vec<_>, _>>()
+        .unwrap();
+    let private_key =
+        rustls::pki_types::PrivatePkcs8KeyDer::from_pem_slice(client_private_key).unwrap();
+    let mut config = rustls::ClientConfig::builder_with_provider(Arc::new(
+        rustls::crypto::aws_lc_rs::default_provider(),
+    ))
+    .with_protocol_versions(&[&rustls::version::TLS13])
+    .unwrap()
+    .with_root_certificates(roots)
+    .with_client_auth_cert(
+        certificates,
+        rustls::pki_types::PrivateKeyDer::Pkcs8(private_key),
+    )
+    .unwrap();
+    config.alpn_protocols = vec![b"http/1.1".to_vec()];
+    let tcp = tokio::net::TcpStream::connect(address).await.unwrap();
+    tokio_rustls::TlsConnector::from(Arc::new(config))
+        .connect(
+            rustls::pki_types::ServerName::try_from("localhost").unwrap(),
+            tcp,
+        )
+        .await
+        .unwrap()
+}
+
+async fn gateway_test_http_request(
+    stream: &mut tokio_rustls::client::TlsStream<tokio::net::TcpStream>,
+    request: &[u8],
+) -> Vec<u8> {
+    use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+
+    stream.write_all(request).await.unwrap();
+    tokio::time::timeout(Duration::from_secs(3), async {
+        let mut response = Vec::new();
+        loop {
+            let mut chunk = [0_u8; 4096];
+            let count = stream.read(&mut chunk).await.unwrap();
+            assert!(
+                count > 0,
+                "Gateway machine connection closed before its response"
+            );
+            response.extend_from_slice(&chunk[..count]);
+            let Some(header_end) = response.windows(4).position(|window| window == b"\r\n\r\n")
+            else {
+                continue;
+            };
+            let header_end = header_end + 4;
+            let headers = std::str::from_utf8(&response[..header_end]).unwrap();
+            let content_length = headers
+                .lines()
+                .find_map(|line| {
+                    line.split_once(':').and_then(|(name, value)| {
+                        name.eq_ignore_ascii_case("content-length")
+                            .then(|| value.trim().parse::<usize>().unwrap())
+                    })
+                })
+                .expect("Gateway response must carry Content-Length");
+            if response.len() >= header_end + content_length {
+                assert_eq!(response.len(), header_end + content_length);
+                break response;
+            }
+        }
+    })
+    .await
+    .expect("Gateway machine listener did not answer within the request deadline")
+}
+
+fn gateway_test_http_status(response: &[u8]) -> u16 {
+    std::str::from_utf8(response)
+        .unwrap()
+        .lines()
+        .next()
+        .unwrap()
+        .split_ascii_whitespace()
+        .nth(1)
+        .unwrap()
+        .parse()
+        .unwrap()
+}
+
 #[test]
 fn route_signer_snapshot_closes_hostname_runtime_and_ring_in_one_authority_read() {
     let (store, identity, authenticated, policy, session) = fixture();
@@ -3021,6 +3117,57 @@ fn route_signer_snapshot_closes_hostname_runtime_and_ring_in_one_authority_read(
         )
         .unwrap(),
     );
+    let signer_reference_bytes = br#"{"version":1,"deployment_id":"route_deployment_a","signer_revision":1,"expected_previous":null,"signer":{"state":"active","active_kid":"fd56fed3251463eff0063169a7f8fa9dce585b6eee429581264297c98ec58bcb","secret_reference_id":"route_secret_a"},"public_key_ring_version":1,"public_key_ring_digest":"sha256:4e6fec49756e03044438af279f7bfd9507f06cf065ff0673447bd6377cd07ac0"}"#;
+    let signer_ring_bytes = br#"{"version":1,"ring_version":1,"expected_previous":null,"keys":[{"kid":"fd56fed3251463eff0063169a7f8fa9dce585b6eee429581264297c98ec58bcb","public_key_spki":"MCowBQYDK2VwAyEA2-Jj2UvNCvQiUPNYRgSi0cJSPiJI6Rs6D0UTeEpQVj8"}]}"#;
+    let signer_reference =
+        cats_api::route_grant_v2::decode_route_grant_v2_signer_reference(signer_reference_bytes)
+            .unwrap();
+    let signer_ring =
+        cats_api::route_grant_v2::decode_route_grant_v2_public_key_ring(signer_ring_bytes).unwrap();
+    let installed_signing_authority =
+        crate::route_grant_v2::InstalledRouteGrantV2SigningAuthority::from_authority_artifacts(
+            &signer_reference,
+            signer_reference_bytes,
+            &signer_ring,
+            Some(include_bytes!(
+                "../../../../tests/fixtures/route_grant_private_ed25519.pem"
+            )),
+            120,
+        )
+        .unwrap();
+    assert_eq!(
+        installed_signing_authority.signer().unwrap().kid(),
+        route_signer.kid()
+    );
+    store
+        .install_route_grant_v2_signer_authority(&installed_signing_authority)
+        .unwrap();
+    let gateway_spki = cats_api::runtime_reconciliation::Base64UrlNoPad::new(
+        "MCowBQYDK2VwAyEAFqokynUVEeIXMF7pBwDCDQn6N97Q4hJUz7DUbPlbJu8",
+    )
+    .unwrap();
+    let initial_gateway_authority =
+        cats_api::gateway_workload_identity::GatewayWorkloadIdentityAuthority {
+            version: ContractVersion::V1,
+            authority_id: id("gateway_authority_route_test"),
+            fleet_id: id("fleet_route_test"),
+            policy_revision: Epoch::new(1).unwrap(),
+            expected_previous: None,
+            credentials: vec![
+                cats_api::gateway_workload_identity::GatewayWorkloadCredentialPolicy {
+                    credential_id: id("gateway_credential_route_test"),
+                    public_key_spki: gateway_spki.clone(),
+                    scope:
+                        cats_api::gateway_workload_identity::GatewayWorkloadCredentialScope::Fleet,
+                },
+            ],
+        };
+    store
+        .install_gateway_workload_identity_authority(&initial_gateway_authority)
+        .unwrap();
+    let gateway_peer_digest =
+        cats_api::runtime_reconciliation::canonical_ed25519_spki_sha256(&gateway_spki).unwrap();
+    let signer_binding = Arc::new(installed_signing_authority.binding().clone());
     let active_kid = route_signer.kid().clone();
     let ring_version = Epoch::new(3).unwrap();
     let mut full = observation(
@@ -3092,13 +3239,15 @@ fn route_signer_snapshot_closes_hostname_runtime_and_ring_in_one_authority_read(
         let address = listener.local_addr().unwrap();
         let server = tokio::spawn(async move { axum::serve(listener, unauthenticated).await });
 
-        // Deliberately omit the declared body. A prompt 401 proves production
-        // authentication precedes body read and therefore Store access.
+        // Deliberately omit the declared body and add a forged identity
+        // header. A prompt 401 proves production authentication cannot be
+        // constructed by HTTP and precedes body read and Store access.
         let mut stream = tokio::net::TcpStream::connect(address).await.unwrap();
         stream
             .write_all(
                 format!(
                     "POST {ROUTE_RESOLVE_V2_PATH} HTTP/1.1\r\nHost: {address}\r\n\
+                     X-Cats-Gateway-SPKI: sha256:ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff\r\n\
                      Content-Length: 100\r\nConnection: close\r\n\r\n"
                 )
                 .as_bytes(),
@@ -3135,7 +3284,7 @@ fn route_signer_snapshot_closes_hostname_runtime_and_ring_in_one_authority_read(
         let address = listener.local_addr().unwrap();
         let server = tokio::spawn(async move { axum::serve(listener, signerless).await });
 
-        // A future authenticated machine transport must still fail before the
+        // Even the explicit authenticated test router must fail before the
         // body and Store when the independent Route v2 signer is absent.
         let mut stream = tokio::net::TcpStream::connect(address).await.unwrap();
         stream
@@ -3351,6 +3500,195 @@ fn route_signer_snapshot_closes_hostname_runtime_and_ring_in_one_authority_read(
             .unwrap()
             .unwrap();
         assert_eq!(service.active_requests_for_test(), 0);
+
+        let production_signerless = Arc::new(
+            crate::api::route_resolve_v2::RouteResolveV2Service::for_gateway_machine(
+                Arc::clone(&store),
+                None,
+                Arc::clone(&signer_binding),
+                policy.approved_guest_config_digest().clone(),
+                8,
+                8,
+            ),
+        );
+        let mut signerless_request = axum::http::Request::builder()
+            .method("POST")
+            .uri(ROUTE_RESOLVE_V2_PATH)
+            .header(axum::http::header::CONTENT_LENGTH, "100")
+            .body(axum::body::Body::empty())
+            .unwrap();
+        signerless_request.extensions_mut().insert(
+            crate::api::route_resolve_v2::VerifiedGatewayTlsPeer::from_verified_spki_sha256(
+                gateway_peer_digest.clone(),
+            ),
+        );
+        let signerless_response = tokio::time::timeout(
+            Duration::from_secs(1),
+            crate::api::route_resolve_v2::resolve(
+                Extension(Arc::clone(&production_signerless)),
+                signerless_request,
+            ),
+        )
+        .await
+        .expect("authenticated signerless request read its declared body");
+        assert_eq!(
+            signerless_response.status(),
+            axum::http::StatusCode::SERVICE_UNAVAILABLE
+        );
+        production_signerless.shutdown().await.unwrap();
+
+        // Compose the production machine service and real TLS/h1 listener over
+        // the same real-PG authority. This is not the test-principal bypass.
+        let machine_service = Arc::new(
+            crate::api::route_resolve_v2::RouteResolveV2Service::for_gateway_machine(
+                Arc::clone(&store),
+                Some(Arc::clone(&route_signer)),
+                Arc::clone(&signer_binding),
+                policy.approved_guest_config_digest().clone(),
+                8,
+                8,
+            ),
+        );
+        let machine_tls = crate::gateway_machine::GatewayMachineTlsConfig::from_pem_for_test(
+            include_bytes!("../../../tests/fixtures/gateway_machine_ca_certificate.pem"),
+            include_bytes!("../../../tests/fixtures/gateway_machine_server_certificate.pem"),
+            include_bytes!("../../../tests/fixtures/gateway_machine_server_private_key.pem"),
+        )
+        .unwrap();
+        let readiness = Arc::new(crate::server::ReadinessLatch::new());
+        let machine_listener = crate::gateway_machine::GatewayMachineListener::spawn(
+            "127.0.0.1:0",
+            machine_tls,
+            Arc::clone(&machine_service),
+            Arc::clone(&readiness),
+        )
+        .await
+        .unwrap();
+        let mut machine_stream = gateway_test_tls_stream(machine_listener.addr()).await;
+        let machine_body =
+            encode_route_resolve_v2_request(&RouteResolveV2Request::new(hostname.clone())).unwrap();
+        let machine_request = format!(
+            "POST {ROUTE_RESOLVE_V2_PATH} HTTP/1.1\r\nHost: localhost\r\n\
+             Content-Type: {ROUTE_V2_JSON_CONTENT_TYPE}\r\n\
+             Accept: {ROUTE_V2_JSON_CONTENT_TYPE}\r\n\
+             Content-Length: {}\r\n\r\n{}",
+            machine_body.len(),
+            std::str::from_utf8(&machine_body).unwrap(),
+        );
+        let machine_response =
+            gateway_test_http_request(&mut machine_stream, machine_request.as_bytes()).await;
+        assert_eq!(gateway_test_http_status(&machine_response), 200);
+        let machine_body_start = machine_response
+            .windows(4)
+            .position(|window| window == b"\r\n\r\n")
+            .unwrap()
+            + 4;
+        let machine_success =
+            decode_route_resolve_v2_success(&machine_response[machine_body_start..]).unwrap();
+        assert_eq!(machine_success.endpoint_id, endpoint_id);
+
+        // A well-formed but non-current local descriptor cannot sign. The
+        // exact binding comparison occurs only in the final shared snapshot.
+        let mut stale_reference = signer_reference.clone();
+        stale_reference.deployment_id = id("route_deployment_stale");
+        let stale_reference_bytes =
+            cats_api::route_grant_v2::encode_route_grant_v2_signer_reference(&stale_reference)
+                .unwrap();
+        let stale_binding = Arc::new(
+            super::route_signing_authority::RouteGrantV2SignerBinding::from_authority_artifacts(
+                &stale_reference,
+                &stale_reference_bytes,
+                &signer_ring,
+            )
+            .unwrap(),
+        );
+        let stale_service = Arc::new(
+            crate::api::route_resolve_v2::RouteResolveV2Service::for_gateway_machine(
+                Arc::clone(&store),
+                Some(Arc::clone(&route_signer)),
+                stale_binding,
+                policy.approved_guest_config_digest().clone(),
+                8,
+                8,
+            ),
+        );
+        let mut stale_request = axum::http::Request::builder()
+            .method("POST")
+            .uri(ROUTE_RESOLVE_V2_PATH)
+            .header(axum::http::header::CONTENT_TYPE, ROUTE_V2_JSON_CONTENT_TYPE)
+            .header(axum::http::header::ACCEPT, ROUTE_V2_JSON_CONTENT_TYPE)
+            .body(axum::body::Body::from(machine_body.clone()))
+            .unwrap();
+        stale_request.extensions_mut().insert(
+            crate::api::route_resolve_v2::VerifiedGatewayTlsPeer::from_verified_spki_sha256(
+                gateway_peer_digest.clone(),
+            ),
+        );
+        let stale_response = crate::api::route_resolve_v2::resolve(
+            Extension(Arc::clone(&stale_service)),
+            stale_request,
+        )
+        .await;
+        assert_eq!(
+            stale_response.status(),
+            axum::http::StatusCode::SERVICE_UNAVAILABLE
+        );
+        stale_service.shutdown().await.unwrap();
+
+        // Scope shrink is observed by the next request on the same TLS
+        // keepalive connection. Pre-body auth still succeeds, but the
+        // hostname-derived Workspace check in the final snapshot returns 401.
+        let mut scoped_gateway_authority = initial_gateway_authority.clone();
+        scoped_gateway_authority.policy_revision = Epoch::new(2).unwrap();
+        scoped_gateway_authority.expected_previous = Some(
+            cats_api::gateway_workload_identity::GatewayWorkloadIdentityExpectedPrevious {
+                policy_revision: initial_gateway_authority.policy_revision,
+                policy_sha256: initial_gateway_authority.digest().unwrap(),
+            },
+        );
+        scoped_gateway_authority.credentials[0].scope =
+            cats_api::gateway_workload_identity::GatewayWorkloadCredentialScope::Workspaces {
+                workspace_ids: vec![id("workspace_not_route")],
+            };
+        let scoped_install = scoped_gateway_authority.clone();
+        store
+            .execute(move |store| {
+                store.install_gateway_workload_identity_authority(&scoped_install)
+            })
+            .await
+            .unwrap();
+        let scoped_response =
+            gateway_test_http_request(&mut machine_stream, machine_request.as_bytes()).await;
+        assert_eq!(gateway_test_http_status(&scoped_response), 401);
+
+        // Durable empty-set revocation is checked again before body read on
+        // that same TLS connection; declaring but withholding a body must not
+        // delay the authentication failure.
+        let mut disabled_gateway_authority = scoped_gateway_authority.clone();
+        disabled_gateway_authority.policy_revision = Epoch::new(3).unwrap();
+        disabled_gateway_authority.expected_previous = Some(
+            cats_api::gateway_workload_identity::GatewayWorkloadIdentityExpectedPrevious {
+                policy_revision: scoped_gateway_authority.policy_revision,
+                policy_sha256: scoped_gateway_authority.digest().unwrap(),
+            },
+        );
+        disabled_gateway_authority.credentials.clear();
+        store
+            .execute(move |store| {
+                store.install_gateway_workload_identity_authority(&disabled_gateway_authority)
+            })
+            .await
+            .unwrap();
+        let revoked_request = format!(
+            "POST {ROUTE_RESOLVE_V2_PATH} HTTP/1.1\r\nHost: localhost\r\n\
+             Content-Length: 100\r\n\r\n"
+        );
+        let revoked_response =
+            gateway_test_http_request(&mut machine_stream, revoked_request.as_bytes()).await;
+        assert_eq!(gateway_test_http_status(&revoked_response), 401);
+        drop(machine_stream);
+        machine_listener.shutdown().await.unwrap();
+        assert!(readiness.is_ready());
 
         server.abort();
         let _ = server.await;

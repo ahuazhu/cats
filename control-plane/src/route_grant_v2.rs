@@ -49,10 +49,6 @@ impl std::fmt::Debug for InstalledRouteGrantV2SigningAuthority {
     }
 }
 
-#[allow(
-    dead_code,
-    reason = "the validated signer installation is composed by the Route v2 machine listener in the next commit"
-)]
 impl InstalledRouteGrantV2SigningAuthority {
     pub(crate) fn from_installed_artifacts(
         installed: &InstalledRouteGrantV2Signer,
@@ -115,10 +111,6 @@ pub(crate) struct IssuedRouteGrantV2 {
 }
 
 impl RouteGrantV2Signer {
-    #[allow(
-        dead_code,
-        reason = "reachable in production through the next-commit installed signer composition"
-    )]
     fn from_authority_artifacts(
         reference: &RouteGrantV2SignerReference,
         ring: &RouteGrantV2PublicKeyRingArtifact,
@@ -241,10 +233,6 @@ impl RouteGrantV2Signer {
     }
 }
 
-#[allow(
-    dead_code,
-    reason = "reachable in production through the next-commit installed signer composition"
-)]
 fn checked_encoding_key(
     private_key_pem: &[u8],
     public: &RouteGrantV2PublicKey,

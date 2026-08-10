@@ -90,10 +90,6 @@ struct CurrentGatewayAuthority {
 impl Store {
     /// Install, exact-replay, or CAS-advance the fixed bootstrap candidate.
     /// PostgreSQL remains the only runtime-current source after this returns.
-    #[allow(
-        dead_code,
-        reason = "used by the Route v2 machine-listener startup composition"
-    )]
     pub(crate) fn install_gateway_workload_identity_authority(
         &self,
         authority: &GatewayWorkloadIdentityAuthority,
@@ -107,7 +103,6 @@ impl Store {
 
     /// Authenticate one CA-verified TLS leaf before the HTTP body or Route
     /// Store is read. Workspace scope is deliberately deferred.
-    #[allow(dead_code, reason = "used by the Route v2 machine-listener handler")]
     pub(crate) fn authenticate_gateway_tls_peer(
         &self,
         public_key_spki_sha256: &Sha256Digest,
@@ -172,29 +167,45 @@ pub(super) fn lock_route_v2_machine_authority_exclusive(
 
 /// Revalidate the pre-body proof and hostname-derived Workspace against the
 /// current exact revision while the caller retains the shared lock.
+#[cfg(test)]
 pub(super) fn revalidate_gateway_principal_for_workspace_in(
     transaction: &mut Transaction<'_>,
     principal: &AuthenticatedGatewayPrincipal,
     workspace_id: &Id,
 ) -> AuthorityTxResult<bool> {
+    Ok(
+        revalidate_gateway_principal_current_in(transaction, principal)?
+            .is_some_and(|scope| scope.authorizes_workspace(workspace_id)),
+    )
+}
+
+/// Revalidate the exact pre-body principal without yet granting any Workspace
+/// authority. The returned scope remains meaningful only inside the caller's
+/// retained snapshot and shared advisory lock.
+pub(super) fn revalidate_gateway_principal_current_in(
+    transaction: &mut Transaction<'_>,
+    principal: &AuthenticatedGatewayPrincipal,
+) -> AuthorityTxResult<Option<GatewayWorkloadCredentialScope>> {
     let Some(current) = load_current_gateway_authority(transaction, "")? else {
-        return Ok(false);
+        return Ok(None);
     };
     if current.pointer.authority_id != principal.authority_id
         || current.pointer.fleet_id != principal.fleet_id
         || current.pointer.policy_revision != principal.policy_revision
         || current.pointer.policy_sha256 != principal.policy_sha256
     {
-        return Ok(false);
+        return Ok(None);
     }
     let Some(credential) = current
         .authority
         .credential_by_spki_sha256(&principal.public_key_spki_sha256)
     else {
-        return Ok(false);
+        return Ok(None);
     };
-    Ok(credential.credential_id == principal.credential_id
-        && credential.scope.authorizes_workspace(workspace_id))
+    if credential.credential_id != principal.credential_id {
+        return Ok(None);
+    }
+    Ok(Some(credential.scope.clone()))
 }
 
 fn authenticate_gateway_tls_peer_in(

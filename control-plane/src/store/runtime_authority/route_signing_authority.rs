@@ -78,6 +78,13 @@ impl RouteGrantV2SignerBinding {
     pub(crate) fn exact_reference_bytes(&self) -> &[u8] {
         &self.exact_reference_bytes
     }
+
+    pub(crate) fn active_kid(&self) -> Option<&KeyId> {
+        match &self.reference.signer {
+            RouteGrantV2SignerSelection::Disabled => None,
+            RouteGrantV2SignerSelection::Active { active_kid, .. } => Some(active_kid),
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

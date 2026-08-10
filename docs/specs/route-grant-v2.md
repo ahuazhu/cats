@@ -1,7 +1,7 @@
 # Route Grant v2
 
-- 状态：Target contract；shared codec、Control resolve handler 与 Node verification/admission core
-  分阶段实现，production machine transports 与 public proxy 仍保持关闭
+- 状态：Target contract；shared codec、Control独立Gateway machine resolve transport与Node
+  verification/admission core已实现，Gateway到Node transport与public proxy仍保持关闭
 - Authority：[ADR-0041](../decisions/0041-node-verified-route-admission.md)
 - Runtime identity：[Runtime Reconciliation v1](runtime-reconciliation-v1.md)
 - Runtime accepted facts：[Runtime Inventory and Observation Spine v1](runtime-inventory-observation-v1.md)
@@ -190,7 +190,7 @@ legacy V1 signer/key fallback。Gateway到Node的credential/listener/proxy仍按
 
 A19只授权Node到Control，A23只授权deployment provisioner写placement policy；两者都不能授权Gateway。
 legacy shared bearer、`nodes.agent_url`、HTTP header自报principal、推测的SPIFFE/SAN或云IAM映射都不是
-fallback。在该新authority Accepted并组成listener前，test principal只能用于显式test router。
+fallback。test principal仍只用于显式test router，不能进入production machine listener。
 
 ### 4.2 Node admission frame的冻结边界
 

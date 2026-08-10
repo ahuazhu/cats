@@ -5,10 +5,6 @@
     reason = "F2c is the ready-to-wire service boundary consumed by the F2d HTTP cutover"
 )]
 pub(crate) mod cat_create_service;
-#[allow(
-    dead_code,
-    reason = "the Gateway authority is consumed by the Route v2 machine listener composition"
-)]
 pub(crate) mod gateway_identity;
 #[allow(
     dead_code,
@@ -20,15 +16,7 @@ pub(crate) mod placement_planner;
 pub(crate) mod placement_policy;
 mod product;
 mod product_rows;
-#[allow(
-    dead_code,
-    reason = "the closed snapshot loader is composed with the Route Grant v2 resolve service after the Node transport target authority lands"
-)]
 pub(crate) mod route_signer;
-#[allow(
-    dead_code,
-    reason = "the signer PG binding is composed by the Route v2 machine listener in the next commit"
-)]
 pub(crate) mod route_signing_authority;
 pub(super) mod rows;
 #[allow(

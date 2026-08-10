@@ -1,6 +1,7 @@
 # Gateway Workload Identity Authority v1
 
-- 状态：Frozen target contract；canonical authority codec与PG current/CAS writer已实现，machine listener尚未实现
+- 状态：Frozen target contract；canonical authority codec、PG current/CAS writer、fixed reader与
+  Control TLS 1.3/HTTP/1.1 machine listener已实现；Gateway到Node transport仍未实现
 - 决策：[ADR-0045](../decisions/0045-independent-gateway-workload-identity.md)
 - Resolve与Grant：[Route Grant v2](route-grant-v2.md)
 - Signer：[Route v2 Signing Authority v1](route-signing-authority-v1.md)
