@@ -1152,6 +1152,51 @@ fn refuses_missing_or_weakened_volume_owner_constraints_without_repair() {
 }
 
 #[test]
+fn refuses_missing_or_replaced_volume_primary_key_without_repair() {
+    for (ddl, expected_index_fragment) in [
+        (
+            "ALTER TABLE volume_records DROP CONSTRAINT volume_records_pkey CASCADE",
+            None,
+        ),
+        (
+            "ALTER TABLE volume_records DROP CONSTRAINT volume_records_pkey CASCADE;
+             CREATE UNIQUE INDEX volume_records_pkey ON volume_records(volume_id)",
+            Some("CREATE UNIQUE INDEX"),
+        ),
+    ] {
+        let url = crate::testsupport::isolated_control_store_url();
+        drop(Store::connect(&url, None).unwrap());
+        let mut admin = postgres::Client::connect(&url, postgres::NoTls).unwrap();
+        admin.batch_execute(ddl).unwrap();
+
+        let Err(error) = Store::connect(&url, None) else {
+            panic!("a stamped schema with a changed Volume primary key must fail closed");
+        };
+        assert_eq!(error.code, ErrorCode::FailedPrecondition);
+        assert!(error.to_string().contains("volume_records_pkey"), "{error}");
+        let definition: Option<String> = admin
+            .query_one(
+                "SELECT pg_get_indexdef(to_regclass('volume_records_pkey'))",
+                &[],
+            )
+            .unwrap()
+            .get(0);
+        match expected_index_fragment {
+            Some(fragment) => assert!(
+                definition
+                    .as_deref()
+                    .is_some_and(|value| value.contains(fragment)),
+                "startup repaired the deliberately non-primary unique index: {definition:?}"
+            ),
+            None => assert!(
+                definition.is_none(),
+                "startup recreated the deliberately dropped primary key: {definition:?}"
+            ),
+        }
+    }
+}
+
+#[test]
 fn refuses_missing_or_replaced_volume_owner_indexes_without_repair() {
     for (index, ddl, expected_fragment) in [
         (

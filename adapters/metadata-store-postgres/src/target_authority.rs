@@ -224,6 +224,93 @@ pub(super) fn verify_schema(client: &mut Client) -> cats_storage::metadata::Resu
             "target volume authority schema is unavailable or incompatible: {error}"
         ))
     })?;
+    let primary_key_present: bool = client
+        .query_one(
+            "SELECT EXISTS (
+                SELECT 1
+                  FROM pg_constraint c
+                  JOIN pg_class source ON source.oid=c.conrelid
+                  JOIN pg_namespace source_namespace
+                    ON source_namespace.oid=source.relnamespace
+                  JOIN pg_index i ON i.indexrelid=c.conindid
+                  JOIN pg_class index_relation ON index_relation.oid=i.indexrelid
+                  JOIN pg_am access_method ON access_method.oid=index_relation.relam
+                 WHERE source_namespace.nspname=current_schema()
+                   AND source.relname='volume_records'
+                   AND c.conname='volume_records_pkey'
+                   AND index_relation.relname='volume_records_pkey'
+                   AND c.contype='p' AND c.convalidated
+                   AND NOT c.condeferrable AND NOT c.condeferred
+                   AND i.indisprimary AND i.indisunique
+                   AND i.indisvalid AND i.indisready
+                   AND i.indnkeyatts=1 AND i.indnatts=1
+                   AND i.indexprs IS NULL AND i.indpred IS NULL
+                   AND access_method.amname='btree'
+                   AND ARRAY(
+                       SELECT attribute.attname::TEXT
+                         FROM unnest(c.conkey) WITH ORDINALITY AS key(attnum, ordinal)
+                         JOIN pg_attribute attribute
+                           ON attribute.attrelid=c.conrelid
+                          AND attribute.attnum=key.attnum
+                        ORDER BY key.ordinal
+                   ) = ARRAY['volume_id'::TEXT]
+             )",
+            &[],
+        )
+        .map_err(|error| {
+            MetaError::Backend(format!(
+                "target volume authority primary key is unavailable: {error}"
+            ))
+        })?
+        .get(0);
+    if !primary_key_present {
+        return Err(MetaError::Backend(
+            "target volume authority primary key volume_records_pkey is missing or incompatible"
+                .into(),
+        ));
+    }
+    for (constraint, definition) in [
+        (
+            "volume_records_owner_present_check",
+            "CHECK (((lease_owner IS NULL) = (owner_binding IS NULL)))",
+        ),
+        (
+            "volume_records_owner_node_present_check",
+            "CHECK (((owner_binding IS NULL) = (owner_node_id IS NULL)))",
+        ),
+        (
+            "volume_records_owner_binding_check",
+            "CHECK (((owner_binding IS NULL) OR (owner_binding = jsonb_build_object('volume_id', volume_id, 'owner_node_id', owner_node_id, 'attachment_id', lease_owner, 'attachment_epoch', lease_epoch))))",
+        ),
+    ] {
+        let present: bool = client
+            .query_one(
+                "SELECT EXISTS (
+                    SELECT 1
+                      FROM pg_constraint c
+                      JOIN pg_class source ON source.oid=c.conrelid
+                      JOIN pg_namespace source_namespace
+                        ON source_namespace.oid=source.relnamespace
+                     WHERE source_namespace.nspname=current_schema()
+                       AND source.relname='volume_records'
+                       AND c.conname=$1 AND c.contype='c'
+                       AND c.convalidated AND NOT c.connoinherit
+                       AND pg_get_constraintdef(c.oid, FALSE)=$2
+                 )",
+                &[&constraint, &definition],
+            )
+            .map_err(|error| {
+                MetaError::Backend(format!(
+                    "target volume authority constraint is unavailable: {error}"
+                ))
+            })?
+            .get(0);
+        if !present {
+            return Err(MetaError::Backend(format!(
+                "target volume authority constraint {constraint} is missing or incompatible"
+            )));
+        }
+    }
     for (index, first_key, expression_key, predicate) in [
         (
             "volume_records_owner_node",
@@ -325,11 +412,17 @@ fn load_node_owned_volumes(
     if rows.len() > MAX_NODE_OWNED_VOLUMES {
         return Err(AuthorityError::BackendUnknown);
     }
-    let mut volumes = Vec::with_capacity(rows.len());
+    let mut volumes: Vec<NodeOwnedVolume> = Vec::with_capacity(rows.len());
     for row in rows {
         let (volume, binding) = decode_stored_volume(&row)?;
         let binding = binding.ok_or(AuthorityError::BackendUnknown)?;
         if binding.owner_node_id != *node_id {
+            return Err(AuthorityError::BackendUnknown);
+        }
+        if volumes
+            .last()
+            .is_some_and(|previous| previous.volume.volume_id.as_str() >= volume.volume_id.as_str())
+        {
             return Err(AuthorityError::BackendUnknown);
         }
         volumes.push(NodeOwnedVolume { binding, volume });
@@ -958,6 +1051,122 @@ mod tests {
     }
 
     #[test]
+    fn target_rejects_missing_or_replaced_volume_primary_key_without_repair() {
+        for (ddl, expected_index_fragment) in [
+            (
+                "ALTER TABLE volume_records DROP CONSTRAINT volume_records_pkey CASCADE",
+                None,
+            ),
+            (
+                "ALTER TABLE volume_records DROP CONSTRAINT volume_records_pkey CASCADE;
+                 CREATE UNIQUE INDEX volume_records_pkey ON volume_records(volume_id)",
+                Some("CREATE UNIQUE INDEX"),
+            ),
+        ] {
+            let url = cats_control_plane::testsupport::isolated_control_store_url();
+            drop(Store::connect(&url, None).unwrap());
+            let mut client = Client::connect(&url, NoTls).unwrap();
+            insert_volume(&mut client, &owned_volume());
+            client.batch_execute(ddl).unwrap();
+            let before = raw_volume_row_json(&mut client);
+
+            let error = PostgresVolumeDataAuthority::connect(&url, None)
+                .err()
+                .expect("changed Volume primary key must reject target startup");
+            assert!(error.to_string().contains("volume_records_pkey"), "{error}");
+            assert_eq!(raw_volume_row_json(&mut client), before);
+            let definition: Option<String> = client
+                .query_one(
+                    "SELECT pg_get_indexdef(to_regclass('volume_records_pkey'))",
+                    &[],
+                )
+                .unwrap()
+                .get(0);
+            match expected_index_fragment {
+                Some(fragment) => assert!(
+                    definition
+                        .as_deref()
+                        .is_some_and(|value| value.contains(fragment)),
+                    "target startup repaired the non-primary unique index: {definition:?}"
+                ),
+                None => assert!(
+                    definition.is_none(),
+                    "target startup recreated the dropped primary key: {definition:?}"
+                ),
+            }
+        }
+    }
+
+    #[test]
+    fn target_rejects_missing_or_weakened_owner_constraints_without_repair() {
+        for (constraint, ddl, expected_definition) in [
+            (
+                "volume_records_owner_present_check",
+                "ALTER TABLE volume_records
+                     DROP CONSTRAINT volume_records_owner_present_check",
+                None,
+            ),
+            (
+                "volume_records_owner_node_present_check",
+                "ALTER TABLE volume_records
+                     DROP CONSTRAINT volume_records_owner_node_present_check;
+                 ALTER TABLE volume_records
+                     ADD CONSTRAINT volume_records_owner_node_present_check
+                     CHECK (owner_binding IS NULL OR owner_node_id IS NOT NULL)",
+                Some("owner_binding IS NULL"),
+            ),
+            (
+                "volume_records_owner_binding_check",
+                "ALTER TABLE volume_records
+                     DROP CONSTRAINT volume_records_owner_binding_check;
+                 ALTER TABLE volume_records
+                     ADD CONSTRAINT volume_records_owner_binding_check
+                     CHECK (owner_binding IS NULL OR jsonb_typeof(owner_binding)='object')",
+                Some("jsonb_typeof(owner_binding)"),
+            ),
+        ] {
+            let url = cats_control_plane::testsupport::isolated_control_store_url();
+            drop(Store::connect(&url, None).unwrap());
+            let mut client = Client::connect(&url, NoTls).unwrap();
+            insert_volume(&mut client, &owned_volume());
+            client.batch_execute(ddl).unwrap();
+            let before = raw_volume_row_json(&mut client);
+
+            let error = PostgresVolumeDataAuthority::connect(&url, None)
+                .err()
+                .expect("changed Volume owner constraint must reject target startup");
+            assert!(error.to_string().contains(constraint), "{error}");
+            assert_eq!(raw_volume_row_json(&mut client), before);
+            let definition: Option<String> = client
+                .query_opt(
+                    "SELECT pg_get_constraintdef(catalog_constraint.oid, FALSE)
+                       FROM pg_constraint catalog_constraint
+                       JOIN pg_class source ON source.oid=catalog_constraint.conrelid
+                       JOIN pg_namespace source_namespace
+                         ON source_namespace.oid=source.relnamespace
+                      WHERE source_namespace.nspname=current_schema()
+                        AND source.relname='volume_records'
+                        AND catalog_constraint.conname=$1",
+                    &[&constraint],
+                )
+                .unwrap()
+                .map(|row| row.get(0));
+            match expected_definition {
+                Some(fragment) => assert!(
+                    definition
+                        .as_deref()
+                        .is_some_and(|value| value.contains(fragment)),
+                    "target startup repaired the weak constraint: {definition:?}"
+                ),
+                None => assert!(
+                    definition.is_none(),
+                    "target startup recreated the dropped constraint: {definition:?}"
+                ),
+            }
+        }
+    }
+
+    #[test]
     fn target_uses_only_the_final_authority_row_and_preserves_a_legacy_sentinel() {
         let mut fixture = Fixture::new();
         assert_eq!(legacy_table(&mut fixture.client), None);
@@ -1034,6 +1243,31 @@ mod tests {
             fixture
                 .authority
                 .load_node_owned_volumes(&id("drifted-node")),
+            Err(AuthorityError::BackendUnknown)
+        );
+    }
+
+    #[test]
+    fn runtime_inventory_rejects_duplicate_volume_ids_without_the_catalog_guard() {
+        let mut fixture = Fixture::new();
+        fixture
+            .client
+            .batch_execute("ALTER TABLE volume_records DROP CONSTRAINT volume_records_pkey CASCADE")
+            .unwrap();
+        assert_eq!(
+            fixture
+                .client
+                .execute(
+                    "INSERT INTO volume_records
+                     SELECT * FROM volume_records WHERE volume_id=$1",
+                    &[&VOLUME_ID],
+                )
+                .unwrap(),
+            1
+        );
+
+        assert_eq!(
+            load_node_owned_volumes(&mut fixture.client, &id(NODE_ID)),
             Err(AuthorityError::BackendUnknown)
         );
     }

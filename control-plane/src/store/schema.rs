@@ -234,6 +234,48 @@ fn verify_current_schema(transaction: &mut postgres::Transaction<'_>) -> Result<
 /// structurally at every startup; a current stamp is never permission to
 /// recreate or repair one of them.
 fn verify_authority_catalog(transaction: &mut postgres::Transaction<'_>) -> Result<()> {
+    for (table, constraint, columns) in REQUIRED_PRIMARY_KEYS {
+        let present: bool = transaction
+            .query_one(
+                "SELECT EXISTS (
+                    SELECT 1
+                      FROM pg_constraint c
+                      JOIN pg_class source ON source.oid=c.conrelid
+                      JOIN pg_namespace source_namespace
+                        ON source_namespace.oid=source.relnamespace
+                      JOIN pg_index i ON i.indexrelid=c.conindid
+                      JOIN pg_class index_relation
+                        ON index_relation.oid=i.indexrelid
+                      JOIN pg_am access_method
+                        ON access_method.oid=index_relation.relam
+                     WHERE source_namespace.nspname=current_schema()
+                       AND source.relname=$1 AND c.conname=$2
+                       AND index_relation.relname=$2
+                       AND c.contype='p' AND c.convalidated
+                       AND NOT c.condeferrable AND NOT c.condeferred
+                       AND i.indisprimary AND i.indisunique
+                       AND i.indisvalid AND i.indisready
+                       AND i.indnkeyatts=array_length(string_to_array($3, ','), 1)
+                       AND i.indnatts=i.indnkeyatts
+                       AND i.indexprs IS NULL AND i.indpred IS NULL
+                       AND access_method.amname='btree'
+                       AND ARRAY(
+                           SELECT attribute.attname::TEXT
+                             FROM unnest(c.conkey) WITH ORDINALITY AS key(attnum, ordinal)
+                             JOIN pg_attribute attribute
+                               ON attribute.attrelid=c.conrelid
+                              AND attribute.attnum=key.attnum
+                            ORDER BY key.ordinal
+                       ) = string_to_array($3, ',')
+                 )",
+                &[table, constraint, columns],
+            )
+            .map_err(|error| internal(format!("verify authority primary-key catalog: {error:?}")))?
+            .get(0);
+        if !present {
+            return Err(partial_catalog_object(constraint));
+        }
+    }
     for (table, constraint, definition) in REQUIRED_CHECK_CONSTRAINTS {
         let present: bool = transaction
             .query_one(
@@ -591,6 +633,9 @@ const REQUIRED_CHECK_CONSTRAINTS: &[(&str, &str, &str)] = &[
         "CHECK (((owner_binding IS NULL) OR (owner_binding = jsonb_build_object('volume_id', volume_id, 'owner_node_id', owner_node_id, 'attachment_id', lease_owner, 'attachment_epoch', lease_epoch))))",
     ),
 ];
+
+const REQUIRED_PRIMARY_KEYS: &[(&str, &str, &str)] =
+    &[("volume_records", "volume_records_pkey", "volume_id")];
 
 const REQUIRED_DEFERRED_FOREIGN_KEYS: &[RequiredDeferredForeignKey] = &[
     (
