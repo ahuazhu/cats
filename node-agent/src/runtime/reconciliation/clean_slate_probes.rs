@@ -63,7 +63,10 @@ mod metadata_authority_reader_sealed {
 }
 
 const METADATA_AUTHORITY_PAGE_LIMIT: usize = 256;
-const METADATA_AUTHORITY_MAX_RECORDS: usize = 4_096;
+// Runtime v1 bounds one Node at 1,024 assigned Cats and each Desired at 64
+// volumes. The authority adapter reads at most this closed set plus one row to
+// prove overflow; Node-side publication never accepts the +1 row.
+const METADATA_AUTHORITY_MAX_RECORDS: usize = 65_536;
 
 /// One page of the future provider-neutral Node-owner index. The persisted
 /// authority must bind every live writer to `owner_node_id` in the same
@@ -73,7 +76,10 @@ const METADATA_AUTHORITY_MAX_RECORDS: usize = 4_096;
 struct MetadataAuthorityPageRequest {
     node_id: Id,
     desired_read_position: Sequence,
-    candidate_volume_ids: BTreeSet<Id>,
+    /// Present only on the first page. The port binds this complete set to its
+    /// immutable cached snapshot; continuation pages use the returned read
+    /// position instead of cloning up to 65,536 IDs again.
+    candidate_volume_ids: Option<BTreeSet<Id>>,
     snapshot_read_position: Option<Sequence>,
     after_volume_id: Option<Id>,
     limit: usize,
@@ -180,7 +186,9 @@ impl MetadataAuthorityAbsenceReader for PagedMetadataAuthorityReader {
             let request = MetadataAuthorityPageRequest {
                 node_id: node_id.clone(),
                 desired_read_position,
-                candidate_volume_ids: candidate_volume_ids.clone(),
+                candidate_volume_ids: snapshot_read_position
+                    .is_none()
+                    .then(|| candidate_volume_ids.clone()),
                 snapshot_read_position,
                 after_volume_id: after_volume_id.clone(),
                 limit: METADATA_AUTHORITY_PAGE_LIMIT,
@@ -2475,6 +2483,10 @@ mod tests {
         assert_eq!(calls[0].snapshot_read_position, None);
         assert_eq!(calls[0].after_volume_id, None);
         assert_eq!(calls[0].limit, METADATA_AUTHORITY_PAGE_LIMIT);
+        assert_eq!(
+            calls[0].candidate_volume_ids.as_ref(),
+            Some(&[record.volume_id].into_iter().collect())
+        );
     }
 
     #[test]
@@ -2549,6 +2561,7 @@ mod tests {
             calls[1].snapshot_read_position,
             Some(Sequence::new(77).unwrap())
         );
+        assert_eq!(calls[1].candidate_volume_ids, None);
         assert_eq!(
             calls[1].after_volume_id,
             Some(Id::new("vol_orphan").unwrap())
