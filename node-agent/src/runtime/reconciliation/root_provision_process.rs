@@ -10,8 +10,8 @@
 use anyhow::Context as _;
 use cats_api::runtime_reconciliation::{
     CheckpointEvidence, ControlHandshakeEvidence, Durability, Epoch, FenceEpoch, HostPath, Id,
-    OwnershipTokenEvidence, ProcessEvidence, ProcessRole, ProcessState, RandomId128, ReconcileStep,
-    RemoteHead, Revision, RuntimeCheckpoint, Sha256Digest, WireU64,
+    NodeBootId, OwnershipTokenEvidence, ProcessEvidence, ProcessRole, ProcessState, RandomId128,
+    ReconcileStep, RemoteHead, Revision, RuntimeCheckpoint, Sequence, Sha256Digest, WireU64,
 };
 use cats_storage::authority::{
     validate_authorized_serving_attachment, validate_volume_record, AttachmentLineageIdentity,
@@ -24,6 +24,25 @@ use super::{FileCheckpointStore, StoredCheckpoint};
 
 pub(crate) mod sealed {
     pub(crate) trait Sealed {}
+}
+
+/// A retirement read is stronger than an exact lookup of the expected unit.
+/// Implementations must bracket the same sealed Node-global
+/// systemd/process/socket sweep used by the full inventory scanner. Keeping a
+/// separate sealed port prevents a caller from accidentally substituting a
+/// naked `systemctl show <expected-unit>` lookup for global absence.
+pub(crate) mod retirement_sealed {
+    pub(crate) trait Sealed {}
+}
+
+pub(crate) trait RootProvisionProcessRetirementPort:
+    retirement_sealed::Sealed + Send + Sync
+{
+    fn inspect_after_node_global_sweep(
+        &self,
+        expected: &RootProvisionProcessExpectation,
+        context: &dyn RuntimePhysicalReadContext,
+    ) -> anyhow::Result<RootProvisionProcessInspection>;
 }
 
 /// The only two authority states in which the persisted root-provision
@@ -298,6 +317,21 @@ pub(crate) struct ExactRootProvisionProcessProof {
 pub(crate) struct ExactRootProvisionProcessAbsenceProof {
     checkpoint_content_digest: Sha256Digest,
     expectation: RootProvisionProcessExpectation,
+    admission: RootProvisionRetirementAdmission,
+}
+
+/// Durable coordinates of the accepted complete inventory that authorized
+/// one retirement attempt. The next token rotation must prove a strictly
+/// newer full admission; this is persisted in the retirement receipt rather
+/// than remembered by the Agent process.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct RootProvisionRetirementAdmission {
+    pub node_boot_id: NodeBootId,
+    pub agent_instance_id: RandomId128,
+    pub agent_session_epoch: Epoch,
+    pub inventory_epoch: Epoch,
+    pub inventory_digest: Sha256Digest,
+    pub inventory_read_position: Sequence,
 }
 
 impl RootProvisionProcessExpectation {
@@ -358,6 +392,10 @@ impl ExactRootProvisionProcessAbsenceProof {
 
     pub(crate) fn expectation(&self) -> &RootProvisionProcessExpectation {
         &self.expectation
+    }
+
+    pub(crate) fn admission(&self) -> &RootProvisionRetirementAdmission {
+        &self.admission
     }
 }
 
@@ -439,21 +477,24 @@ pub(crate) fn prove_exact_root_provision_process_absence<P>(
     context: &RuntimeDesiredEffectContext,
 ) -> anyhow::Result<ExactRootProvisionProcessAbsenceProof>
 where
-    P: RootProvisionProcessPort + ?Sized,
+    P: RootProvisionProcessRetirementPort + ?Sized,
 {
     context.check_active()?;
-    accepted_full_proves_exact_process_absence(context, checkpoint_store, stored_checkpoint)?;
+    let admission =
+        accepted_full_proves_exact_process_absence(context, checkpoint_store, stored_checkpoint)?;
     let expectation = RootProvisionProcessExpectation::from_checkpoint(
         stored_checkpoint.checkpoint(),
         authority,
         executable_path,
     )?;
-    match inspect_exact_root_provision_process(port, &expectation, context)
-        .context("reinspect exact root-provision identity before record retirement")?
+    match port
+        .inspect_after_node_global_sweep(&expectation, context)
+        .context("reinspect sealed Node-global root-provision inventory before record retirement")?
     {
         RootProvisionProcessInspection::Absent => Ok(ExactRootProvisionProcessAbsenceProof {
             checkpoint_content_digest: stored_checkpoint.content_digest().clone(),
             expectation,
+            admission,
         }),
         RootProvisionProcessInspection::Exact(_) => {
             anyhow::bail!("root-provision process is present; handoff record must remain sealed")
@@ -471,7 +512,7 @@ fn accepted_full_proves_exact_process_absence(
     context: &RuntimeDesiredEffectContext,
     checkpoint_store: &FileCheckpointStore,
     stored_checkpoint: &StoredCheckpoint,
-) -> anyhow::Result<()> {
+) -> anyhow::Result<RootProvisionRetirementAdmission> {
     let accepted = context.accepted_full()?;
     let observation = accepted.observation();
     let attestation = accepted.attestation();
@@ -547,7 +588,14 @@ fn accepted_full_proves_exact_process_absence(
     // this Cat. It is intentionally still insufficient by itself: the sealed
     // port inspection below owns the Node-global service/process/socket sweep
     // and rejects a late, foreign, or duplicate identity as non-absence.
-    Ok(())
+    Ok(RootProvisionRetirementAdmission {
+        node_boot_id: observation.node_boot_id.clone(),
+        agent_instance_id: observation.agent_instance_id.clone(),
+        agent_session_epoch: observation.agent_session_epoch,
+        inventory_epoch: observation.inventory_epoch,
+        inventory_digest: attestation.inventory_digest.clone(),
+        inventory_read_position: attestation.inventory_read_position,
+    })
 }
 
 /// Unforgeable proof, within this module, that the complete process identity

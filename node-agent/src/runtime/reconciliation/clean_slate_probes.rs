@@ -27,10 +27,12 @@ use anyhow::{bail, Context as _};
 use cats_api::chunk;
 use cats_api::runtime_reconciliation::{
     decode_runtime_checkpoint, DesiredRuntimeSpec, DiskKind, HostPath, Id, InventorySource,
-    ObservedDiskKind, ObservedVolume, RuntimeCheckpoint, Sequence, VolumeAcquire, VolumeAdminState,
-    VolumeAuthorityEvidence, VolumeIntent, RUNTIME_CHECKPOINT_MAX_WIRE_BYTES,
+    ObservedDiskKind, ObservedVolume, ReconcileStep, RuntimeCheckpoint, Sequence, Sha256Digest,
+    VolumeAcquire, VolumeAdminState, VolumeAuthorityEvidence, VolumeIntent, WireU64,
+    RUNTIME_CHECKPOINT_MAX_WIRE_BYTES,
 };
 use cats_blockd::format::{decode_bitmap_header, BITMAP_HEADER_LEN};
+use cats_blockd::target_control::TARGET_CONTROL_AUTHORIZATION_MAX_BYTES;
 #[cfg(test)]
 use cats_storage::authority::VolumeDataAuthority;
 use cats_storage::authority::{
@@ -39,9 +41,11 @@ use cats_storage::authority::{
     VolumeRecord,
 };
 use cats_storage::BlobStore;
+use sha2::{Digest as _, Sha256};
 
 use crate::runtime_spine::{
-    RuntimeInventoryScanContext, RuntimeInventoryScanner, RuntimePreScanRecoveryContext,
+    RuntimeInventoryScanContext, RuntimeInventoryScanner, RuntimePhysicalReadContext,
+    RuntimePreScanRecoveryContext,
 };
 use crate::state_directory::StateDirectory;
 
@@ -60,6 +64,11 @@ use super::inventory::{
     RuntimeCheckpointInventoryEvidence,
 };
 use super::root_provision_process::inspect_exact_root_provision_process;
+use super::serving_handoff::{
+    validate_scanned_serving_handoff_artifacts, ScannedServingHandoffArtifact,
+    ServingHandoffTempKind, SERVING_HANDOFF_RECORD_FILE, SERVING_HANDOFF_RECORD_MAX_BYTES,
+    SERVING_HANDOFF_RETIREMENT_FILE, SERVING_HANDOFF_RETIREMENT_MAX_BYTES,
+};
 use super::{
     inventory::{
         root_process_inventory_bridge_sealed, InstalledRuntimeInventoryKeyRingReader,
@@ -68,7 +77,7 @@ use super::{
     AuthorizedBlockdCheckpoint, CleanSlateInventoryScanner, InventoryAbsence,
     InventoryAbsenceProbe, PlatformSystemdRootProvisionProcessPort, RootProvisionProcessConflict,
     RootProvisionProcessExpectation, RootProvisionProcessInspection, RootProvisionProcessPort,
-    RootProvisionSystemdConfig,
+    RootProvisionProcessRetirementPort, RootProvisionSystemdConfig,
 };
 
 pub(crate) const CHECKPOINT_NAMESPACE: &str = "checkpoints";
@@ -98,11 +107,26 @@ const DEFAULT_NETWORK_CLASS_ROOT: &str = "/sys/class/net";
 /// lane. Classification never repairs, removes, or rewrites an entry.
 pub(crate) enum LocalPublicationRecoveryEvidence {
     None,
-    CheckpointTemp { cat_id: Id },
-    DefiniteReleaseRejectionTarget { cat_id: Id },
-    DefiniteReleaseRejectionTemp { cat_id: Id },
-    AuthorizedBlockd { cat_id: Id },
-    SupersededCheckpoint { cat_id: Id },
+    CheckpointTemp {
+        cat_id: Id,
+    },
+    DefiniteReleaseRejectionTarget {
+        cat_id: Id,
+    },
+    DefiniteReleaseRejectionTemp {
+        cat_id: Id,
+    },
+    AuthorizedBlockd {
+        cat_id: Id,
+    },
+    SupersededCheckpoint {
+        cat_id: Id,
+    },
+    ServingHandoffTemp {
+        cat_id: Id,
+        kind: ServingHandoffTempKind,
+        authorized: Box<AuthorizedBlockdCheckpoint>,
+    },
 }
 
 mod metadata_authority_reader_sealed {
@@ -1604,6 +1628,19 @@ pub(crate) fn classify_local_publication_recovery(
         &scan_context,
         ProbeLimits::default(),
     )?;
+    if data.handoff_temps.len() == 1
+        && data.evidence.len() + data.handoff_temps.len() == data.leaf_count
+    {
+        let (cat_id, kind, authorized) = data.handoff_temps[0].clone();
+        return Ok(LocalPublicationRecoveryEvidence::ServingHandoffTemp {
+            cat_id,
+            kind,
+            authorized: Box::new(authorized),
+        });
+    }
+    if !data.handoff_temps.is_empty() {
+        return Ok(LocalPublicationRecoveryEvidence::None);
+    }
     let authorized_recovery = context
         .coordinates()
         .desired
@@ -1683,7 +1720,9 @@ impl InventoryAbsenceProbe for AuthorizedBlockdDataProbe {
 struct AuthorizedBlockdDataScan {
     evidence: BTreeMap<Id, AuthorizedBlockdInventoryEvidence>,
     candidate_volume_ids: BTreeSet<Id>,
+    leaf_count: usize,
     complete: bool,
+    handoff_temps: Vec<(Id, ServingHandoffTempKind, AuthorizedBlockdCheckpoint)>,
 }
 
 fn scan_authorized_blockd_data(
@@ -1697,14 +1736,18 @@ fn scan_authorized_blockd_data(
             return Ok(AuthorizedBlockdDataScan {
                 evidence: BTreeMap::new(),
                 candidate_volume_ids: BTreeSet::new(),
+                leaf_count: 0,
                 complete: true,
+                handoff_temps: Vec::new(),
             })
         }
         ManagedDirectory::Unavailable => {
             return Ok(AuthorizedBlockdDataScan {
                 evidence: BTreeMap::new(),
                 candidate_volume_ids: BTreeSet::new(),
+                leaf_count: 0,
                 complete: false,
+                handoff_temps: Vec::new(),
             })
         }
         ManagedDirectory::Open(directory) => directory,
@@ -1721,13 +1764,17 @@ fn scan_authorized_blockd_data(
         return Ok(AuthorizedBlockdDataScan {
             evidence: BTreeMap::new(),
             candidate_volume_ids: BTreeSet::new(),
+            leaf_count: 0,
             complete: false,
+            handoff_temps: Vec::new(),
         });
     };
     let mut scan = AuthorizedBlockdDataScan {
         evidence: BTreeMap::new(),
         candidate_volume_ids: BTreeSet::new(),
+        leaf_count: 0,
         complete: true,
+        handoff_temps: Vec::new(),
     };
 
     for cat_entry in cat_entries {
@@ -1737,6 +1784,7 @@ fn scan_authorized_blockd_data(
         let Some(desired) = desired_by_directory.get(cat_name) else {
             bail!("authorized blockd data namespace retains foreign Cat {cat_name}")
         };
+        scan.leaf_count += 1;
 
         let Some(cat_directory) =
             open_exact_only_child_directory(&directory, &cat_entry, root, context)?
@@ -1934,28 +1982,225 @@ fn scan_authorized_blockd_data(
                 && epoch_name == format!("epoch-{}", identity.attachment_epoch.get()),
             "authorized blockd physical path and checkpoint identity disagree"
         );
-        if has_unvalidated_handoff_artifact {
-            // These files are a later serving-handoff authority, not generic
-            // data residue. Until that typed validator is composed into this
-            // full scan, preserve them and report DataDirectory unavailable;
-            // never whitelist their names into a false complete inventory.
-            scan.complete = false;
-            continue;
-        }
-        scan.candidate_volume_ids.insert(identity.volume_id.clone());
-        let data_directory = state_path
+        let data_directory_path = state_path
             .join(DATA_NAMESPACE)
             .join(cat_name)
             .join(&volume_name)
             .join(&attachment_name)
             .join(&epoch_name);
         let data_directory = HostPath::new(
-            data_directory
+            data_directory_path
                 .to_str()
                 .context("authorized blockd data directory is not UTF-8")?
                 .to_owned(),
         )
         .context("authorized blockd data directory is not a HostPath")?;
+        if !has_unvalidated_handoff_artifact {
+            if let Some(runtime_checkpoint) = read_runtime_checkpoint_for_handoff(
+                root,
+                state_path,
+                &desired.cat_id,
+                &mut budget,
+                context,
+            )? {
+                anyhow::ensure!(
+                    !matches!(
+                        runtime_checkpoint.step,
+                        ReconcileStep::PrepareDevice {
+                            serving_authority,
+                            ..
+                        } if matches!(
+                            serving_authority.as_ref(),
+                            cats_api::runtime_reconciliation::ServingAuthorityProvenance::AfterRootProvision { .. }
+                        )
+                    ),
+                    "after-root-provision checkpoint lacks its durable handoff artifacts"
+                );
+            }
+        }
+        if has_unvalidated_handoff_artifact {
+            let Some(runtime_checkpoint) = read_runtime_checkpoint_for_handoff(
+                root,
+                state_path,
+                &desired.cat_id,
+                &mut budget,
+                context,
+            )?
+            else {
+                scan.complete = false;
+                continue;
+            };
+            let provision_transition_id = match &runtime_checkpoint.step {
+                ReconcileStep::ProvisionRootImage {
+                    provision_transition_id,
+                    ..
+                } => provision_transition_id.clone(),
+                ReconcileStep::PrepareDevice {
+                    serving_authority, ..
+                } => {
+                    let cats_api::runtime_reconciliation::ServingAuthorityProvenance::AfterRootProvision {
+                        handoff,
+                    } = serving_authority.as_ref()
+                    else {
+                        bail!(
+                            "direct authorized attachment cannot retain root-provision handoff artifacts"
+                        )
+                    };
+                    let Some(entry) = by_name.get(SERVING_HANDOFF_RECORD_FILE) else {
+                        bail!("after-root-provision checkpoint lacks its sealed handoff record")
+                    };
+                    let Some(record_file) = read_scanned_handoff_artifact(
+                        &epoch_directory,
+                        entry,
+                        root,
+                        data_directory_path.join(SERVING_HANDOFF_RECORD_FILE),
+                        SERVING_HANDOFF_RECORD_MAX_BYTES,
+                        context,
+                    )? else {
+                        scan.complete = false;
+                        continue;
+                    };
+                    let record = super::serving_handoff::decode_serving_handoff_record(
+                        &record_file.bytes,
+                    )?;
+                    anyhow::ensure!(
+                        record_file.path == handoff.record.path
+                            && record_file.device == handoff.record.device
+                            && record_file.inode == handoff.record.inode
+                            && record_file.length == handoff.record.length
+                            && record_file.content_sha256 == handoff.record.content_sha256
+                            && record.checkpoint_content_digest
+                                == handoff.predecessor_checkpoint_content_digest,
+                        "after-root-provision handoff record changed physical identity or predecessor"
+                    );
+                    record.provision_transition_id
+                }
+                _ => bail!(
+                    "serving handoff artifacts require provision_root_image or after-root-provision PrepareDevice"
+                ),
+            };
+            let target_name = format!(
+                "authorized-target-control-{}.json",
+                provision_transition_id.as_str()
+            );
+            let target_temp = format!(".{target_name}.tmp");
+            let expected_reserved = [
+                target_name.as_str(),
+                target_temp.as_str(),
+                SERVING_HANDOFF_RECORD_FILE,
+                ".serving-handoff.json.tmp",
+                SERVING_HANDOFF_RETIREMENT_FILE,
+                ".serving-handoff-retirement.json.tmp",
+            ];
+            if let Some(foreign) = by_name.keys().find(|name| {
+                is_serving_handoff_artifact_name(name)
+                    && !expected_reserved.contains(&name.as_str())
+            }) {
+                bail!("authorized blockd leaf retains foreign handoff artifact {foreign}")
+            }
+            let present_temps = [
+                (
+                    target_temp.as_str(),
+                    ServingHandoffTempKind::TargetAuthorization,
+                    TARGET_CONTROL_AUTHORIZATION_MAX_BYTES,
+                ),
+                (
+                    ".serving-handoff.json.tmp",
+                    ServingHandoffTempKind::Record,
+                    SERVING_HANDOFF_RECORD_MAX_BYTES,
+                ),
+                (
+                    ".serving-handoff-retirement.json.tmp",
+                    ServingHandoffTempKind::RetirementReceipt,
+                    SERVING_HANDOFF_RETIREMENT_MAX_BYTES,
+                ),
+            ]
+            .into_iter()
+            .filter(|(name, _, _)| by_name.contains_key(*name))
+            .collect::<Vec<_>>();
+            if !present_temps.is_empty() {
+                if present_temps.len() == 1 {
+                    let (name, kind, maximum) = present_temps[0];
+                    if read_scanned_handoff_artifact(
+                        &epoch_directory,
+                        &by_name[name],
+                        root,
+                        data_directory_path.join(name),
+                        maximum,
+                        context,
+                    )?
+                    .is_some()
+                    {
+                        scan.handoff_temps
+                            .push((desired.cat_id.clone(), kind, checkpoint.clone()));
+                    }
+                }
+                scan.complete = false;
+                continue;
+            }
+            let Some(target_entry) = by_name.get(&target_name) else {
+                bail!("serving handoff artifact set lacks target-control authority")
+            };
+            let Some(target) = read_scanned_handoff_artifact(
+                &epoch_directory,
+                target_entry,
+                root,
+                data_directory_path.join(&target_name),
+                TARGET_CONTROL_AUTHORIZATION_MAX_BYTES,
+                context,
+            )?
+            else {
+                scan.complete = false;
+                continue;
+            };
+            let record = if let Some(entry) = by_name.get(SERVING_HANDOFF_RECORD_FILE) {
+                let Some(record) = read_scanned_handoff_artifact(
+                    &epoch_directory,
+                    entry,
+                    root,
+                    data_directory_path.join(SERVING_HANDOFF_RECORD_FILE),
+                    SERVING_HANDOFF_RECORD_MAX_BYTES,
+                    context,
+                )?
+                else {
+                    scan.complete = false;
+                    continue;
+                };
+                Some(record)
+            } else {
+                None
+            };
+            let retirement = if let Some(entry) = by_name.get(SERVING_HANDOFF_RETIREMENT_FILE) {
+                let Some(retirement) = read_scanned_handoff_artifact(
+                    &epoch_directory,
+                    entry,
+                    root,
+                    data_directory_path.join(SERVING_HANDOFF_RETIREMENT_FILE),
+                    SERVING_HANDOFF_RETIREMENT_MAX_BYTES,
+                    context,
+                )?
+                else {
+                    scan.complete = false;
+                    continue;
+                };
+                Some(retirement)
+            } else {
+                None
+            };
+            let target = target.borrowed();
+            let record = record.as_ref().map(OwnedScannedHandoffArtifact::borrowed);
+            let retirement = retirement
+                .as_ref()
+                .map(OwnedScannedHandoffArtifact::borrowed);
+            validate_scanned_serving_handoff_artifacts(
+                &runtime_checkpoint,
+                &checkpoint,
+                &target,
+                record.as_ref(),
+                retirement.as_ref(),
+            )?;
+        }
+        scan.candidate_volume_ids.insert(identity.volume_id.clone());
         anyhow::ensure!(
             scan.evidence
                 .insert(
@@ -1979,6 +2224,110 @@ fn is_serving_handoff_artifact_name(name: &str) -> bool {
         || name.starts_with(".authorized-target-control-")
         || name.starts_with("serving-handoff")
         || name.starts_with(".serving-handoff")
+}
+
+struct OwnedScannedHandoffArtifact {
+    path: HostPath,
+    device: WireU64,
+    inode: WireU64,
+    length: WireU64,
+    content_sha256: Sha256Digest,
+    bytes: Vec<u8>,
+}
+
+impl OwnedScannedHandoffArtifact {
+    fn borrowed(&self) -> ScannedServingHandoffArtifact<'_> {
+        ScannedServingHandoffArtifact {
+            path: self.path.clone(),
+            device: self.device,
+            inode: self.inode,
+            length: self.length,
+            content_sha256: self.content_sha256.clone(),
+            bytes: &self.bytes,
+        }
+    }
+}
+
+fn read_scanned_handoff_artifact(
+    directory: &File,
+    entry: &StrictDirectoryEntry,
+    root: &File,
+    path: PathBuf,
+    maximum: usize,
+    context: &RuntimeInventoryScanContext,
+) -> anyhow::Result<Option<OwnedScannedHandoffArtifact>> {
+    let Some(bytes) = read_strict_regular_at(directory, entry, root, maximum, context)? else {
+        return Ok(None);
+    };
+    let device = u64::try_from(entry.metadata.st_dev)
+        .ok()
+        .and_then(WireU64::new)
+        .context("handoff artifact device is outside the wire range")?;
+    let inode = WireU64::new(entry.metadata.st_ino)
+        .context("handoff artifact inode is outside the wire range")?;
+    let length = u64::try_from(bytes.len())
+        .ok()
+        .and_then(WireU64::new)
+        .context("handoff artifact length is outside the wire range")?;
+    Ok(Some(OwnedScannedHandoffArtifact {
+        path: HostPath::new(
+            path.to_str()
+                .context("handoff artifact path is not UTF-8")?
+                .to_owned(),
+        )
+        .context("handoff artifact path is not canonical")?,
+        device,
+        inode,
+        length,
+        content_sha256: Sha256Digest::from_bytes(Sha256::digest(&bytes).into()),
+        bytes,
+    }))
+}
+
+fn read_runtime_checkpoint_for_handoff(
+    root: &File,
+    state_path: &Path,
+    cat_id: &Id,
+    budget: &mut usize,
+    context: &RuntimeInventoryScanContext,
+) -> anyhow::Result<Option<RuntimeCheckpoint>> {
+    let directory = match open_state_namespace(root, CHECKPOINT_NAMESPACE)? {
+        ManagedDirectory::Open(directory) => directory,
+        ManagedDirectory::Missing | ManagedDirectory::Unavailable => return Ok(None),
+    };
+    let Some(entries) = strict_checkpoint_directory_entries(&directory, budget, context)? else {
+        return Ok(None);
+    };
+    let path = super::runtime_checkpoint_path(&state_path.join(CHECKPOINT_NAMESPACE), cat_id);
+    let expected_name = path
+        .file_name()
+        .context("Runtime checkpoint path has no basename")?;
+    let mut matches = entries
+        .iter()
+        .filter(|entry| entry.name.as_os_str() == expected_name);
+    let Some(entry) = matches.next() else {
+        return Ok(None);
+    };
+    anyhow::ensure!(
+        matches.next().is_none(),
+        "handoff classifier found duplicate Runtime checkpoint entries"
+    );
+    let Some(bytes) = read_strict_regular_at(
+        &directory,
+        entry,
+        root,
+        RUNTIME_CHECKPOINT_MAX_WIRE_BYTES,
+        context,
+    )?
+    else {
+        return Ok(None);
+    };
+    let checkpoint = decode_runtime_checkpoint(&bytes)?;
+    anyhow::ensure!(
+        checkpoint.cat_id == *cat_id,
+        "handoff classifier loaded another Cat checkpoint"
+    );
+    Ok(Some(checkpoint))
 }
 
 fn descend_only_directory(
@@ -2064,6 +2413,61 @@ struct PlatformRootProcessInventoryBridge {
     limits: ProbeLimits,
 }
 
+impl PlatformRootProcessInventoryBridge {
+    /// One shared sealed sweep for both full-inventory projection and
+    /// retirement absence. Every managed service, Cats binary process, and
+    /// managed socket must be accounted for by the exact identities supplied
+    /// by the caller; an empty allowlist therefore proves Node-global absence.
+    fn sweep_node_global_inventory(
+        &self,
+        allowed_units: &BTreeSet<Id>,
+        allowed_pids: &BTreeSet<u32>,
+        allowed_sockets: &BTreeSet<PathBuf>,
+        context: &dyn RuntimePhysicalReadContext,
+    ) -> anyhow::Result<ProbeFact> {
+        let mut budget = self.limits.os_entries;
+        let systemd = scan_cgroup_tree_allowing(
+            &self.systemd_root,
+            CgroupKind::Systemd,
+            0,
+            &mut budget,
+            self.limits.recursion_depth,
+            allowed_units,
+            context,
+        )?;
+        let metering = if let Some(root) = &self.metering_root {
+            scan_cgroup_tree_allowing(
+                root,
+                CgroupKind::DedicatedMeteringRoot,
+                0,
+                &mut budget,
+                self.limits.recursion_depth,
+                &BTreeSet::new(),
+                context,
+            )?
+        } else {
+            ProbeFact::Empty
+        };
+        let processes = scan_processes_allowing(&self.process_paths, allowed_pids, context)?;
+        let sockets = scan_root_process_sockets(
+            &self.state_directory,
+            &self.legacy_socket_root,
+            allowed_sockets,
+            self.limits,
+            context,
+        )?;
+        Ok(
+            if [systemd, metering, processes, sockets].contains(&ProbeFact::Present) {
+                ProbeFact::Present
+            } else if [systemd, metering, processes, sockets].contains(&ProbeFact::Unavailable) {
+                ProbeFact::Unavailable
+            } else {
+                ProbeFact::Empty
+            },
+        )
+    }
+}
+
 impl root_process_inventory_bridge_sealed::Sealed for PlatformRootProcessInventoryBridge {}
 
 impl RootProcessInventoryBridge for PlatformRootProcessInventoryBridge {
@@ -2113,42 +2517,17 @@ impl RootProcessInventoryBridge for PlatformRootProcessInventoryBridge {
             "root-provision process inventory contains duplicate physical identity"
         );
 
-        let mut budget = self.limits.os_entries;
-        let systemd = scan_cgroup_tree_allowing(
-            &self.systemd_root,
-            CgroupKind::Systemd,
-            0,
-            &mut budget,
-            self.limits.recursion_depth,
+        match self.sweep_node_global_inventory(
             &allowed_units,
-            context,
-        )?;
-        let metering = if let Some(root) = &self.metering_root {
-            scan_cgroup_tree_allowing(
-                root,
-                CgroupKind::DedicatedMeteringRoot,
-                0,
-                &mut budget,
-                self.limits.recursion_depth,
-                &BTreeSet::new(),
-                context,
-            )?
-        } else {
-            ProbeFact::Empty
-        };
-        let processes = scan_processes_allowing(&self.process_paths, &allowed_pids, context)?;
-        let sockets = scan_root_process_sockets(
-            &self.state_directory,
-            &self.legacy_socket_root,
+            &allowed_pids,
             &allowed_sockets,
-            self.limits,
             context,
-        )?;
-        if [systemd, metering, processes, sockets].contains(&ProbeFact::Present) {
-            bail!("root-provision process inventory found foreign or duplicate managed residue")
-        }
-        if [systemd, metering, processes, sockets].contains(&ProbeFact::Unavailable) {
-            return Ok(RootProcessInventoryBridgeOutcome::Unavailable);
+        )? {
+            ProbeFact::Present => {
+                bail!("root-provision process inventory found foreign or duplicate managed residue")
+            }
+            ProbeFact::Unavailable => return Ok(RootProcessInventoryBridgeOutcome::Unavailable),
+            ProbeFact::Empty => {}
         }
 
         let Some(second) = inspect_root_process_set(self.port.as_ref(), &expected, context)? else {
@@ -2170,6 +2549,62 @@ impl RootProcessInventoryBridge for PlatformRootProcessInventoryBridge {
             }
         }
         Ok(RootProcessInventoryBridgeOutcome::Complete(proofs))
+    }
+}
+
+impl super::root_provision_process::retirement_sealed::Sealed
+    for PlatformRootProcessInventoryBridge
+{
+}
+
+impl RootProvisionProcessRetirementPort for PlatformRootProcessInventoryBridge {
+    fn inspect_after_node_global_sweep(
+        &self,
+        expected: &RootProvisionProcessExpectation,
+        context: &dyn RuntimePhysicalReadContext,
+    ) -> anyhow::Result<RootProvisionProcessInspection> {
+        match inspect_exact_root_provision_process(self.port.as_ref(), expected, context)? {
+            RootProvisionProcessInspection::Absent => {}
+            present_or_conflict => return Ok(present_or_conflict),
+        }
+        let sweep = match self.sweep_node_global_inventory(
+            &BTreeSet::new(),
+            &BTreeSet::new(),
+            &BTreeSet::new(),
+            context,
+        ) {
+            Ok(sweep) => sweep,
+            Err(_) => {
+                // Preserve cancellation/deadline as an unavailable effect,
+                // while classifying any still-active malformed/foreign
+                // managed namespace as a typed physical conflict.
+                context.check_active()?;
+                return Ok(RootProvisionProcessInspection::Conflict(
+                    RootProvisionProcessConflict::DuplicateIdentity,
+                ));
+            }
+        };
+        match sweep {
+            ProbeFact::Present => {
+                return Ok(RootProvisionProcessInspection::Conflict(
+                    RootProvisionProcessConflict::DuplicateIdentity,
+                ));
+            }
+            ProbeFact::Unavailable => return Ok(RootProvisionProcessInspection::Unavailable),
+            ProbeFact::Empty => {}
+        }
+        match inspect_exact_root_provision_process(self.port.as_ref(), expected, context)? {
+            RootProvisionProcessInspection::Absent => Ok(RootProvisionProcessInspection::Absent),
+            RootProvisionProcessInspection::Unavailable => {
+                Ok(RootProvisionProcessInspection::Unavailable)
+            }
+            RootProvisionProcessInspection::Exact(_)
+            | RootProvisionProcessInspection::Conflict(_) => {
+                Ok(RootProvisionProcessInspection::Conflict(
+                    RootProvisionProcessConflict::IdentityMismatch,
+                ))
+            }
+        }
     }
 }
 
@@ -3133,7 +3568,7 @@ fn scan_state_namespace(
     root: &File,
     name: &str,
     cap: usize,
-    context: &RuntimeInventoryScanContext,
+    context: &dyn RuntimePhysicalReadContext,
 ) -> anyhow::Result<ProbeFact> {
     context.check_active()?;
     let directory = match open_state_namespace(root, name)? {
@@ -3228,7 +3663,7 @@ fn scan_state_volume_candidates(
 fn scan_managed_path_namespace(
     path: &Path,
     cap: usize,
-    context: &RuntimeInventoryScanContext,
+    context: &dyn RuntimePhysicalReadContext,
 ) -> anyhow::Result<ProbeFact> {
     scan_managed_path_namespace_matching(path, cap, context, |_| true)
 }
@@ -3236,7 +3671,7 @@ fn scan_managed_path_namespace(
 fn scan_managed_path_namespace_matching(
     path: &Path,
     cap: usize,
-    context: &RuntimeInventoryScanContext,
+    context: &dyn RuntimePhysicalReadContext,
     predicate: impl Fn(&OsStr) -> bool,
 ) -> anyhow::Result<ProbeFact> {
     context.check_active()?;
@@ -3699,7 +4134,7 @@ fn open_managed_directory(path: &Path) -> anyhow::Result<ManagedDirectory> {
 fn scan_open_managed_directory(
     directory: &File,
     cap: usize,
-    context: &RuntimeInventoryScanContext,
+    context: &dyn RuntimePhysicalReadContext,
     predicate: impl Fn(&OsStr) -> bool,
 ) -> anyhow::Result<ProbeFact> {
     let mut matched = false;
@@ -3717,7 +4152,7 @@ fn scan_open_managed_directory(
 fn inspect_open_managed_directory(
     directory: &File,
     cap: usize,
-    context: &RuntimeInventoryScanContext,
+    context: &dyn RuntimePhysicalReadContext,
     mut inspect: impl FnMut(&OsStr) -> anyhow::Result<()>,
 ) -> anyhow::Result<ProbeFact> {
     let mut stream = match DirectoryStream::open(directory) {
@@ -3859,7 +4294,7 @@ fn scan_cgroup_tree(
     depth: usize,
     budget: &mut usize,
     depth_cap: usize,
-    context: &RuntimeInventoryScanContext,
+    context: &dyn RuntimePhysicalReadContext,
 ) -> anyhow::Result<ProbeFact> {
     scan_cgroup_tree_allowing(
         root,
@@ -3879,7 +4314,7 @@ fn scan_cgroup_tree_allowing(
     budget: &mut usize,
     depth_cap: usize,
     allowed_systemd_units: &BTreeSet<Id>,
-    context: &RuntimeInventoryScanContext,
+    context: &dyn RuntimePhysicalReadContext,
 ) -> anyhow::Result<ProbeFact> {
     context.check_active()?;
     if depth > depth_cap {
@@ -3994,7 +4429,7 @@ fn is_cats_unit(name: &OsStr) -> bool {
 
 fn scan_processes(
     paths: &ProcessPaths,
-    context: &RuntimeInventoryScanContext,
+    context: &dyn RuntimePhysicalReadContext,
 ) -> anyhow::Result<ProbeFact> {
     scan_processes_allowing(paths, &BTreeSet::new(), context)
 }
@@ -4002,7 +4437,7 @@ fn scan_processes(
 fn scan_processes_allowing(
     paths: &ProcessPaths,
     allowed_pids: &BTreeSet<u32>,
-    context: &RuntimeInventoryScanContext,
+    context: &dyn RuntimePhysicalReadContext,
 ) -> anyhow::Result<ProbeFact> {
     if !paths.supported {
         return Ok(ProbeFact::Unavailable);
@@ -4106,7 +4541,7 @@ enum OptionalBytes {
 fn read_bounded_optional(
     path: &Path,
     cap: usize,
-    context: &RuntimeInventoryScanContext,
+    context: &dyn RuntimePhysicalReadContext,
 ) -> anyhow::Result<OptionalBytes> {
     context.check_active()?;
     let file = match File::open(path) {
@@ -4252,7 +4687,7 @@ fn scan_root_process_sockets(
     legacy_socket_root: &Path,
     allowed: &BTreeSet<PathBuf>,
     limits: ProbeLimits,
-    context: &RuntimeInventoryScanContext,
+    context: &dyn RuntimePhysicalReadContext,
 ) -> anyhow::Result<ProbeFact> {
     let Some(root) = clone_state_root(state_directory)? else {
         return Ok(ProbeFact::Unavailable);
@@ -4299,7 +4734,7 @@ fn collect_managed_sockets(
     depth: usize,
     depth_cap: usize,
     budget: &mut usize,
-    context: &RuntimeInventoryScanContext,
+    context: &dyn RuntimePhysicalReadContext,
     sockets: &mut BTreeSet<PathBuf>,
 ) -> anyhow::Result<ProbeFact> {
     context.check_active()?;
@@ -4428,11 +4863,13 @@ mod tests {
 
     use cats_api::runtime_reconciliation::{
         decode_desired_read_snapshot, spec_digest, AcquireOrigin, AsciiText, AssignedKind,
-        AssignedPlacement, CheckpointEvidence, ContractVersion, DesiredRuntimeSpec, DiskKind,
+        AssignedPlacement, CheckpointEvidence, ContractVersion, DesiredRuntimeSpec,
+        DirectAuthorizedAttachmentIdentity, DirectAuthorizedAttachmentPurpose, DiskKind,
         Durability, Epoch, FenceEpoch, Generation, GuestDeviceIdentity, HostPath, Id, Ipv4Address,
         IsolatedIpv4Kind, LifecycleAdmission, MacAddress, NetworkConfig, NormalAcquireRequest,
-        RandomId128, ReconcileStep, RemoteHead, Revision, RuntimeConfig, RuntimeTarget,
-        RuntimeTransition, RuntimeVolumeTransition, SessionBinding, Sha256Digest, VolumeAccess,
+        PrepareDeviceFrontend, RandomId128, ReconcileStep, RemoteHead, Revision, RuntimeConfig,
+        RuntimeTarget, RuntimeTransition, RuntimeVolumeTransition, ServingAuthorityProvenance,
+        ServingBlockdIdentity, SessionBinding, Sha256Digest, UnixMillis, VolumeAccess,
         VolumeAcquire, VolumeAcquireRequest, VolumeDisposition, VolumeIntent, WireU64,
     };
     use cats_storage::{
@@ -4442,14 +4879,15 @@ mod tests {
     use tempfile::TempDir;
 
     use crate::runtime_spine::{
-        RuntimeInventoryScanOutcome, RuntimeInventoryScanner, RuntimeSpineFullScan,
+        RuntimeInventoryScanOutcome, RuntimeInventoryScanner, RuntimePreScanRecovery,
+        RuntimePreScanRecoveryContext, RuntimePreScanRecoveryOutcome, RuntimeSpineFullScan,
     };
 
     use super::super::signed_running::{
         acquire_checkpoint, expected_provision_heads, prepared_owned_observed_volume,
-        ProvisionHeadRead,
+        ProvisionHeadRead, SignedRunningPublicationRecovery,
     };
-    use super::super::{AuthorizedBlockdStore, FileCheckpointStore};
+    use super::super::{AuthorizedBlockdStore, FileCheckpointStore, StoredCheckpoint};
 
     use super::*;
 
@@ -7089,12 +7527,15 @@ mod tests {
         blob: Arc<ExactManifestBlobStore>,
         expected: RootProvisionProcessExpectation,
         data_directory: PathBuf,
+        stored_checkpoint: StoredCheckpoint,
+        acquired: AuthorizedBlockdCheckpoint,
+        authority: super::super::serving_handoff::ServingAuthorityTargetEvidence,
     }
 
     fn full_root_scanner_fixture(environment: &TestEnvironment) -> FullRootScannerFixture {
         let scan_context = assigned_context(true);
         let desired = scan_context.coordinates().desired.desired_specs[0].clone();
-        let (record, attachment) = exact_owned_record_and_attachment(&desired);
+        let (mut record, attachment) = exact_owned_record_and_attachment(&desired);
         let data_directory = prepare_exact_lineage(environment, &desired, &attachment);
         let blob = Arc::new(ExactManifestBlobStore::for_desired(&desired));
         let ProvisionHeadRead::Ready { blank, target } = expected_provision_heads(
@@ -7105,6 +7546,7 @@ mod tests {
         ) else {
             panic!("exact manifest must produce deterministic provision heads")
         };
+        record.head = target.clone();
         let mut checkpoint = acquire_checkpoint(
             &desired,
             &desired.volumes[0],
@@ -7149,13 +7591,28 @@ mod tests {
             &attachment,
             data,
         )];
-        FileCheckpointStore::open(
+        let stored_checkpoint = FileCheckpointStore::open(
             &environment.state.join(CHECKPOINT_NAMESPACE),
             &desired.cat_id,
         )
         .unwrap()
         .create(&checkpoint)
         .unwrap();
+        let acquired: AuthorizedBlockdCheckpoint = serde_json::from_slice(
+            &std::fs::read(data_directory.join(LAUNCH_CHECKPOINT_FILE)).unwrap(),
+        )
+        .unwrap();
+        let ReconcileStep::ProvisionRootImage {
+            provision_transition_id,
+            ..
+        } = &checkpoint.step
+        else {
+            unreachable!()
+        };
+        let authority = super::super::serving_handoff::ServingAuthorityTargetEvidence::new(
+            provision_transition_id.clone(),
+            record.clone(),
+        );
         let expected = RootProvisionProcessExpectation::from_checkpoint(
             &checkpoint,
             super::super::root_provision_process::RootProvisionAuthoritySnapshot {
@@ -7172,6 +7629,9 @@ mod tests {
             blob,
             expected,
             data_directory,
+            stored_checkpoint,
+            acquired,
+            authority,
         }
     }
 
@@ -7191,6 +7651,288 @@ mod tests {
             Some(blob),
         )
         .unwrap()
+    }
+
+    fn prepare_device_successor(
+        fixture: &FullRootScannerFixture,
+        handoff: cats_api::runtime_reconciliation::RootServingHandoff,
+    ) -> RuntimeCheckpoint {
+        let mut checkpoint = fixture.stored_checkpoint.checkpoint().clone();
+        let attachment = &fixture.acquired.attachment;
+        let volume = &fixture.acquired.volume;
+        let data_directory =
+            HostPath::new(fixture.data_directory.to_string_lossy().into_owned()).unwrap();
+        checkpoint.step = ReconcileStep::PrepareDevice {
+            volume_id: volume.volume_id.clone(),
+            attachment_id: attachment.identity.attachment_id.clone(),
+            attachment_epoch: attachment.identity.attachment_epoch,
+            acquire_origin: attachment.identity.acquire_origin.clone(),
+            expected_head: fixture.record.head.clone(),
+            size_bytes: attachment.size_bytes,
+            durability: attachment.durability,
+            guest_device: volume.guest_device.clone(),
+            ownership_token: RandomId128::new("cccccccccccccccccccccccccccccccc").unwrap(),
+            serving_authority: Box::new(ServingAuthorityProvenance::AfterRootProvision { handoff }),
+            serving_process: ServingBlockdIdentity {
+                scope_id: Id::new("cats-serving-dddddddddddddddddddddddddddddddd.service").unwrap(),
+                control_socket_path: HostPath::new(
+                    fixture
+                        .data_directory
+                        .join("serving-control.sock")
+                        .to_string_lossy()
+                        .into_owned(),
+                )
+                .unwrap(),
+                data_directory,
+                executable_path: fixture.expected.executable_path.clone(),
+                process_identity_token: RandomId128::new("dddddddddddddddddddddddddddddddd")
+                    .unwrap(),
+            },
+            frontend: PrepareDeviceFrontend::VhostUserBlk {
+                socket_path: HostPath::new(
+                    fixture
+                        .data_directory
+                        .join("serving-vhost.sock")
+                        .to_string_lossy()
+                        .into_owned(),
+                )
+                .unwrap(),
+                queues: 2,
+                queue_size: 256,
+            },
+        };
+        let observed = checkpoint.volumes.first_mut().unwrap();
+        observed.authority = VolumeAuthorityEvidence::Owned {
+            attachment_id: attachment.identity.attachment_id.clone(),
+            attachment_epoch: attachment.identity.attachment_epoch,
+            head: fixture.record.head.clone(),
+        };
+        for lineage in &mut observed.local_lineages {
+            lineage.local_durable_generation = fixture.record.head.generation;
+            lineage.remote_durable_generation = fixture.record.head.generation;
+        }
+        checkpoint.updated_at_unix_ms = UnixMillis::new(
+            fixture
+                .stored_checkpoint
+                .checkpoint()
+                .updated_at_unix_ms
+                .get()
+                + 1,
+        )
+        .unwrap();
+        checkpoint
+    }
+
+    #[test]
+    fn consumed_root_handoff_remains_complete_in_a_fresh_prepare_device_scan() {
+        let environment = TestEnvironment::new();
+        let fixture = full_root_scanner_fixture(&environment);
+        install_exact_control_only_files(
+            &fixture.data_directory,
+            fixture.expected.attachment.size_bytes,
+        );
+        let proof = fixture
+            .expected
+            .clone()
+            .prove_exact_process(exact_process_evidence(&fixture.expected, 79))
+            .unwrap();
+        let handoff_store = super::super::serving_handoff::ServingHandoffStore::new(
+            StateDirectory::unanchored(environment.state.clone()),
+        );
+        let ready = handoff_store
+            .seal_serving_ready(
+                &fixture.stored_checkpoint,
+                &fixture.acquired,
+                &fixture.authority,
+                &proof,
+            )
+            .unwrap();
+        let checkpoint_store = FileCheckpointStore::open(
+            &environment.state.join(CHECKPOINT_NAMESPACE),
+            &fixture.expected.cat_id,
+        )
+        .unwrap();
+        let successor = ready
+            .consume_for_prepare_device(&fixture.stored_checkpoint, |handoff| {
+                let successor = prepare_device_successor(&fixture, handoff);
+                checkpoint_store
+                    .replace(&fixture.stored_checkpoint, &successor)
+                    .map(|_| successor)
+                    .map_err(anyhow::Error::from)
+            })
+            .unwrap();
+
+        let scanner = full_root_scanner(
+            &fixture,
+            [
+                RootProvisionProcessInspection::Absent,
+                RootProvisionProcessInspection::Absent,
+            ],
+        );
+        assert!(matches!(
+            scanner.scan_complete(fixture.scan_context.clone()).unwrap(),
+            RuntimeInventoryScanOutcome::Complete(_)
+        ));
+
+        let current = checkpoint_store.load().unwrap().unwrap();
+        let mut drifted = successor.clone();
+        let ReconcileStep::PrepareDevice {
+            serving_process, ..
+        } = &mut drifted.step
+        else {
+            unreachable!()
+        };
+        serving_process.data_directory = HostPath::new(
+            fixture
+                .data_directory
+                .join("drifted")
+                .to_string_lossy()
+                .into_owned(),
+        )
+        .unwrap();
+        let drifted = checkpoint_store.replace(&current, &drifted).unwrap();
+        assert!(full_root_scanner(&fixture, [])
+            .scan_complete(assigned_context(true))
+            .is_err());
+        checkpoint_store.replace(&drifted, &successor).unwrap();
+
+        let current = checkpoint_store.load().unwrap().unwrap();
+        let mut direct = successor.clone();
+        let authorization_path = fixture.data_directory.join(AUTHORIZED_SERVING_FILE);
+        let authorization_bytes = std::fs::read(&authorization_path).unwrap();
+        let metadata = std::fs::metadata(&authorization_path).unwrap();
+        let ReconcileStep::PrepareDevice {
+            serving_authority, ..
+        } = &mut direct.step
+        else {
+            unreachable!()
+        };
+        **serving_authority = ServingAuthorityProvenance::DirectAuthorizedAttachment {
+            authorization: DirectAuthorizedAttachmentIdentity {
+                path: HostPath::new(authorization_path.to_string_lossy().into_owned()).unwrap(),
+                device: WireU64::new(metadata.dev()).unwrap(),
+                inode: WireU64::new(metadata.ino()).unwrap(),
+                length: WireU64::new(metadata.len()).unwrap(),
+                content_sha256: Sha256Digest::from_bytes(
+                    Sha256::digest(authorization_bytes).into(),
+                ),
+            },
+            purpose: DirectAuthorizedAttachmentPurpose::ExistingRoot,
+        };
+        let direct = checkpoint_store.replace(&current, &direct).unwrap();
+        assert!(full_root_scanner(&fixture, [])
+            .scan_complete(assigned_context(true))
+            .is_err());
+        checkpoint_store.replace(&direct, &successor).unwrap();
+
+        for path in [
+            fixture.data_directory.join(SERVING_HANDOFF_RECORD_FILE),
+            fixture.data_directory.join(concat!(
+                "authorized-target-control-",
+                "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+                ".json"
+            )),
+        ] {
+            let bytes = std::fs::read(&path).unwrap();
+            let mut drift = bytes.clone();
+            drift.push(b' ');
+            std::fs::write(&path, &drift).unwrap();
+            assert!(full_root_scanner(&fixture, [])
+                .scan_complete(assigned_context(true))
+                .is_err());
+            std::fs::write(&path, bytes).unwrap();
+        }
+        assert!(matches!(
+            full_root_scanner(&fixture, [])
+                .scan_complete(assigned_context(true))
+                .unwrap(),
+            RuntimeInventoryScanOutcome::Complete(_)
+        ));
+    }
+
+    #[test]
+    fn production_pre_scan_recovers_each_safe_handoff_temp_then_requires_a_fresh_full_scan() {
+        for kind in [
+            ServingHandoffTempKind::TargetAuthorization,
+            ServingHandoffTempKind::Record,
+            ServingHandoffTempKind::RetirementReceipt,
+        ] {
+            let environment = TestEnvironment::new();
+            let fixture = full_root_scanner_fixture(&environment);
+            let handoff_store = super::super::serving_handoff::ServingHandoffStore::new(
+                StateDirectory::unanchored(environment.state.clone()),
+            );
+            match kind {
+                ServingHandoffTempKind::TargetAuthorization => {}
+                ServingHandoffTempKind::Record => {
+                    drop(
+                        handoff_store
+                            .seal_target_control_authorization(
+                                &fixture.stored_checkpoint,
+                                &fixture.acquired,
+                                &fixture.authority,
+                            )
+                            .unwrap(),
+                    );
+                }
+                ServingHandoffTempKind::RetirementReceipt => {
+                    let proof = fixture
+                        .expected
+                        .clone()
+                        .prove_exact_process(exact_process_evidence(&fixture.expected, 83))
+                        .unwrap();
+                    drop(
+                        handoff_store
+                            .seal_serving_ready(
+                                &fixture.stored_checkpoint,
+                                &fixture.acquired,
+                                &fixture.authority,
+                                &proof,
+                            )
+                            .unwrap(),
+                    );
+                }
+            }
+            let temp_name = match kind {
+                ServingHandoffTempKind::TargetAuthorization => concat!(
+                    ".authorized-target-control-",
+                    "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+                    ".json.tmp"
+                ),
+                ServingHandoffTempKind::Record => ".serving-handoff.json.tmp",
+                ServingHandoffTempKind::RetirementReceipt => ".serving-handoff-retirement.json.tmp",
+            };
+            let temp_path = fixture.data_directory.join(temp_name);
+            let mut options = std::fs::OpenOptions::new();
+            options.write(true).create_new(true).mode(0o600);
+            std::io::Write::write_all(&mut options.open(&temp_path).unwrap(), b"partial").unwrap();
+
+            let (authority, _) = TestVolumeDataAuthority::exact(fixture.record.clone());
+            let recovery = SignedRunningPublicationRecovery::new(authority);
+            let recovery_context = RuntimePreScanRecoveryContext::for_test(
+                StateDirectory::unanchored(environment.state.clone()),
+                fixture.scan_context.coordinates().clone(),
+                Instant::now() + Duration::from_secs(10),
+            );
+            assert!(matches!(
+                recovery.recover_one(recovery_context).unwrap(),
+                RuntimePreScanRecoveryOutcome::Recovered { cat_id }
+                    if cat_id == fixture.expected.cat_id
+            ));
+            assert!(!temp_path.exists());
+
+            let scanner = full_root_scanner(
+                &fixture,
+                [
+                    RootProvisionProcessInspection::Absent,
+                    RootProvisionProcessInspection::Absent,
+                ],
+            );
+            assert!(matches!(
+                scanner.scan_complete(fixture.scan_context).unwrap(),
+                RuntimeInventoryScanOutcome::Complete(_)
+            ));
+        }
     }
 
     #[test]
@@ -7372,6 +8114,104 @@ mod tests {
                 &assigned_context(true),
             )
             .is_err());
+    }
+
+    #[test]
+    fn production_retirement_adapter_reuses_the_sealed_node_global_sweep() {
+        let environment = TestEnvironment::new();
+        let (expected, _) = root_process_expectation(&environment);
+        let bridge = root_process_bridge(
+            &environment,
+            [
+                RootProvisionProcessInspection::Absent,
+                RootProvisionProcessInspection::Absent,
+            ],
+        );
+        assert!(matches!(
+            bridge
+                .inspect_after_node_global_sweep(&expected, &assigned_context(true))
+                .unwrap(),
+            RootProvisionProcessInspection::Absent
+        ));
+
+        let environment = TestEnvironment::new();
+        let (expected, _) = root_process_expectation(&environment);
+        let foreign_unit = environment.systemd_root.join("cats-foreign.service");
+        std::fs::create_dir(&foreign_unit).unwrap();
+        let bridge = root_process_bridge(&environment, [RootProvisionProcessInspection::Absent]);
+        assert!(matches!(
+            bridge
+                .inspect_after_node_global_sweep(&expected, &assigned_context(true))
+                .unwrap(),
+            RootProvisionProcessInspection::Conflict(
+                RootProvisionProcessConflict::DuplicateIdentity
+            )
+        ));
+        assert!(foreign_unit.exists(), "retirement sweep must be read-only");
+
+        let environment = TestEnvironment::new();
+        let (expected, _) = root_process_expectation(&environment);
+        let foreign_pid = environment.proc_root.join("73");
+        std::fs::create_dir(&foreign_pid).unwrap();
+        std::os::unix::fs::symlink(expected.executable_path.as_str(), foreign_pid.join("exe"))
+            .unwrap();
+        std::fs::write(
+            foreign_pid.join("cmdline"),
+            [expected.executable_path.as_str().as_bytes(), b"\0"].concat(),
+        )
+        .unwrap();
+        let bridge = root_process_bridge(&environment, [RootProvisionProcessInspection::Absent]);
+        assert!(matches!(
+            bridge
+                .inspect_after_node_global_sweep(&expected, &assigned_context(true))
+                .unwrap(),
+            RootProvisionProcessInspection::Conflict(
+                RootProvisionProcessConflict::DuplicateIdentity
+            )
+        ));
+        assert!(foreign_pid.exists(), "retirement sweep must not kill a PID");
+
+        let environment = TestEnvironment::new();
+        let (expected, _) = root_process_expectation(&environment);
+        let foreign_socket_path = environment
+            .state
+            .join(DATA_NAMESPACE)
+            .join("foreign")
+            .join("late.sock");
+        std::fs::create_dir_all(foreign_socket_path.parent().unwrap()).unwrap();
+        let _foreign_socket = std::os::unix::net::UnixListener::bind(&foreign_socket_path).unwrap();
+        let bridge = root_process_bridge(&environment, [RootProvisionProcessInspection::Absent]);
+        assert!(matches!(
+            bridge
+                .inspect_after_node_global_sweep(&expected, &assigned_context(true))
+                .unwrap(),
+            RootProvisionProcessInspection::Conflict(
+                RootProvisionProcessConflict::DuplicateIdentity
+            )
+        ));
+        assert!(foreign_socket_path.exists());
+    }
+
+    #[test]
+    fn production_retirement_adapter_rejects_a_late_expected_identity() {
+        let environment = TestEnvironment::new();
+        let (expected, _) = root_process_expectation(&environment);
+        let exact = exact_process_evidence(&expected, 75);
+        let bridge = root_process_bridge(
+            &environment,
+            [
+                RootProvisionProcessInspection::Absent,
+                RootProvisionProcessInspection::Exact(Box::new(exact)),
+            ],
+        );
+        assert!(matches!(
+            bridge
+                .inspect_after_node_global_sweep(&expected, &assigned_context(true))
+                .unwrap(),
+            RootProvisionProcessInspection::Conflict(
+                RootProvisionProcessConflict::IdentityMismatch
+            )
+        ));
     }
 
     #[test]

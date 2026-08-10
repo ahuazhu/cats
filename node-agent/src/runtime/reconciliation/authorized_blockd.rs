@@ -260,6 +260,14 @@ impl PreparedAuthorizedBlockd {
     pub fn checkpoint(&self) -> &AuthorizedBlockdCheckpoint {
         &self.checkpoint
     }
+
+    pub(crate) fn retained_directory(&self) -> &File {
+        &self._directory_lock
+    }
+
+    pub(crate) fn state_directory_path(&self) -> &Path {
+        &self.state_directory
+    }
 }
 
 /// Process composition values that are not part of Desired or Volume

@@ -101,7 +101,8 @@ pub(crate) use root_provision_process::{
     ensure_root_provision_process_after_checkpoint, RootProvisionAuthoritySnapshot,
     RootProvisionBlockdHandshake, RootProvisionProcessConflict, RootProvisionProcessEnsureResult,
     RootProvisionProcessEvidence, RootProvisionProcessExpectation, RootProvisionProcessInspection,
-    RootProvisionProcessOutcome, RootProvisionProcessPort, RootProvisionProcessStart,
+    RootProvisionProcessOutcome, RootProvisionProcessPort, RootProvisionProcessRetirementPort,
+    RootProvisionProcessStart,
 };
 #[allow(unused_imports)]
 pub(crate) use systemd_root_provision::{

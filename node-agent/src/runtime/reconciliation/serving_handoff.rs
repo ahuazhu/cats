@@ -28,9 +28,10 @@ use std::sync::Mutex;
 
 use anyhow::{Context as _, Result};
 use cats_api::runtime_reconciliation::{
-    encode_runtime_checkpoint, AcquireOrigin, ContractVersion, Durability, Epoch, FenceEpoch,
-    HostPath, Id, RandomId128, ReconcileStep, RemoteHead, Revision, RootServingHandoff,
-    RootServingHandoffRecordIdentity, Sha256Digest, VolumeRecord, WireU64,
+    checkpoint_content_digest, encode_runtime_checkpoint, AcquireOrigin, ContractVersion,
+    Durability, Epoch, FenceEpoch, HostPath, Id, NodeBootId, RandomId128, ReconcileStep,
+    RemoteHead, Revision, RootServingHandoff, RootServingHandoffRecordIdentity, RuntimeCheckpoint,
+    Sequence, ServingAuthorityProvenance, Sha256Digest, VolumeRecord, WireU64,
 };
 use cats_blockd::target_control::{
     decode_target_control_authorization, encode_target_control_authorization,
@@ -53,19 +54,31 @@ use crate::state_directory::StateDirectory;
 
 use super::authorized_blockd::{
     authorized_blockd_data_directory, validate_authorized_blockd_checkpoint,
-    AuthorizedBlockdCheckpoint, AUTHORIZED_SERVING_FILE, IDENTITY_FILE, LAUNCH_CHECKPOINT_FILE,
-    MAX_AUTHORIZED_SERVING_BYTES, MAX_IDENTITY_BYTES, MAX_LAUNCH_CHECKPOINT_BYTES,
+    AuthorizedBlockdCheckpoint, PreparedAuthorizedBlockd, AUTHORIZED_SERVING_FILE, IDENTITY_FILE,
+    LAUNCH_CHECKPOINT_FILE, MAX_AUTHORIZED_SERVING_BYTES, MAX_IDENTITY_BYTES,
+    MAX_LAUNCH_CHECKPOINT_BYTES,
 };
 use super::root_provision_process::{
     prove_exact_root_provision_process_absence, ExactRootProvisionProcessAbsenceProof,
     ExactRootProvisionProcessProof, RootProvisionAuthoritySnapshot, RootProvisionBlockdHandshake,
-    RootProvisionProcessEvidence, RootProvisionProcessExpectation, RootProvisionProcessPort,
+    RootProvisionProcessEvidence, RootProvisionProcessExpectation,
+    RootProvisionProcessRetirementPort,
 };
 use super::{FileCheckpointStore, StoredCheckpoint};
 
 pub(crate) const SERVING_HANDOFF_RECORD_FILE: &str = "serving-handoff.json";
 const SERVING_HANDOFF_RECORD_TEMP: &str = ".serving-handoff.json.tmp";
 pub(crate) const SERVING_HANDOFF_RECORD_MAX_BYTES: usize = 64 * 1024;
+pub(crate) const SERVING_HANDOFF_RETIREMENT_FILE: &str = "serving-handoff-retirement.json";
+const SERVING_HANDOFF_RETIREMENT_TEMP: &str = ".serving-handoff-retirement.json.tmp";
+pub(crate) const SERVING_HANDOFF_RETIREMENT_MAX_BYTES: usize = 128 * 1024;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ServingHandoffTempKind {
+    TargetAuthorization,
+    Record,
+    RetirementReceipt,
+}
 
 #[derive(Debug, Error, Clone, PartialEq, Eq)]
 pub(crate) enum ServingHandoffCodecError {
@@ -214,13 +227,50 @@ pub(crate) struct ServingHandoffRecord {
 }
 
 /// Content-addressed identity of the durable handoff record.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub(crate) struct ServingHandoffRecordIdentity {
     path: HostPath,
     device: WireU64,
     inode: WireU64,
     length: WireU64,
     content_sha256: Sha256Digest,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct ServingHandoffRetirementAdmission {
+    node_boot_id: NodeBootId,
+    agent_instance_id: RandomId128,
+    agent_session_epoch: Epoch,
+    inventory_epoch: Epoch,
+    inventory_digest: Sha256Digest,
+    inventory_read_position: Sequence,
+}
+
+/// Durable, attempt-specific authority for the gap between unlinking a dead
+/// handoff and rotating its checkpointed process token. It retains the full
+/// record plus descriptor identity, so an absent path after restart cannot be
+/// confused with a record that never existed.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct ServingHandoffRetirementReceipt {
+    version: ContractVersion,
+    old_checkpoint_content_digest: Sha256Digest,
+    old_checkpoint: RuntimeCheckpoint,
+    old_process_identity_token: RandomId128,
+    record_identity: ServingHandoffRecordIdentity,
+    record: ServingHandoffRecord,
+    admission: ServingHandoffRetirementAdmission,
+}
+
+pub(crate) struct ScannedServingHandoffArtifact<'a> {
+    pub path: HostPath,
+    pub device: WireU64,
+    pub inode: WireU64,
+    pub length: WireU64,
+    pub content_sha256: Sha256Digest,
+    pub bytes: &'a [u8],
 }
 
 impl ServingHandoffRecordIdentity {
@@ -369,7 +419,7 @@ fn encode_serving_handoff_record(
     canonical_encode(record, SERVING_HANDOFF_RECORD_MAX_BYTES, "record")
 }
 
-fn decode_serving_handoff_record(
+pub(crate) fn decode_serving_handoff_record(
     bytes: &[u8],
 ) -> std::result::Result<ServingHandoffRecord, ServingHandoffCodecError> {
     canonical_decode(
@@ -377,6 +427,28 @@ fn decode_serving_handoff_record(
         SERVING_HANDOFF_RECORD_MAX_BYTES,
         "record",
         validate_handoff_record,
+    )
+}
+
+fn encode_serving_handoff_retirement_receipt(
+    receipt: &ServingHandoffRetirementReceipt,
+) -> std::result::Result<Vec<u8>, ServingHandoffCodecError> {
+    validate_retirement_receipt(receipt)?;
+    canonical_encode(
+        receipt,
+        SERVING_HANDOFF_RETIREMENT_MAX_BYTES,
+        "retirement receipt",
+    )
+}
+
+pub(crate) fn decode_serving_handoff_retirement_receipt(
+    bytes: &[u8],
+) -> std::result::Result<ServingHandoffRetirementReceipt, ServingHandoffCodecError> {
+    canonical_decode(
+        bytes,
+        SERVING_HANDOFF_RETIREMENT_MAX_BYTES,
+        "retirement receipt",
+        validate_retirement_receipt,
     )
 }
 
@@ -408,6 +480,83 @@ impl ServingHandoffStore {
             #[cfg(test)]
             mutation_once: Mutex::new(None),
         }
+    }
+
+    /// Serialized pre-scan recovery for one deterministic unpublished temp.
+    /// The caller retains the attachment flock through `prepared` and the
+    /// current checkpoint guard through this call. A temp is never promoted:
+    /// it is identity-checked, descriptor-relatively unlinked, and the parent
+    /// directory is fsynced before the next fresh scan.
+    pub(crate) fn discard_recoverable_temp(
+        &self,
+        prepared: &PreparedAuthorizedBlockd,
+        stored_checkpoint: &StoredCheckpoint,
+        kind: ServingHandoffTempKind,
+        context: &crate::runtime_spine::RuntimePreScanRecoveryContext,
+    ) -> Result<bool> {
+        context.check_active()?;
+        anyhow::ensure!(
+            prepared.state_directory_path() == self.state_directory.path(),
+            "handoff temp recovery uses another Node state directory"
+        );
+        let checkpoint = stored_checkpoint.checkpoint();
+        let ReconcileStep::ProvisionRootImage {
+            provision_transition_id,
+            data_directory,
+            ..
+        } = &checkpoint.step
+        else {
+            anyhow::bail!("handoff temp recovery requires provision_root_image")
+        };
+        let acquired = prepared.checkpoint();
+        validate_authorized_blockd_checkpoint(acquired)?;
+        let expected_directory = authorized_blockd_data_directory(
+            self.state_directory.path(),
+            &acquired.desired,
+            &acquired.attachment.identity,
+        );
+        anyhow::ensure!(
+            expected_directory == Path::new(data_directory.as_str())
+                && acquired.desired.cat_id == checkpoint.cat_id,
+            "handoff temp recovery changed the checkpointed attachment lineage"
+        );
+        let target_name = target_control_file_name(provision_transition_id);
+        let target_temp = target_control_temp_name(provision_transition_id);
+        let directory = prepared.retained_directory();
+        validate_handoff_namespace(directory, &target_name, &target_temp)?;
+        let (name, maximum) = match kind {
+            ServingHandoffTempKind::TargetAuthorization => {
+                (target_temp.as_str(), TARGET_AUTHORIZED_SERVING_MAX_BYTES)
+            }
+            ServingHandoffTempKind::Record => (
+                SERVING_HANDOFF_RECORD_TEMP,
+                SERVING_HANDOFF_RECORD_MAX_BYTES,
+            ),
+            ServingHandoffTempKind::RetirementReceipt => (
+                SERVING_HANDOFF_RETIREMENT_TEMP,
+                SERVING_HANDOFF_RETIREMENT_MAX_BYTES,
+            ),
+        };
+        let name_c = c_string(name)?;
+        if read_optional_bounded(directory, &name_c, maximum)?.is_none() {
+            return Ok(false);
+        }
+        let path = host_path(
+            &expected_directory.join(name),
+            "recoverable serving handoff temp path",
+        )?;
+        let retained = RetainedFile::open_required(directory, name, path.clone(), maximum)?;
+        retained.assert_current(directory, &path)?;
+        context.check_active()?;
+        unlink_at(directory, &name_c).context("unlink exact unpublished handoff temp")?;
+        directory
+            .sync_all()
+            .context("sync unpublished handoff temp removal")?;
+        anyhow::ensure!(
+            read_optional_bounded(directory, &name_c, maximum)?.is_none(),
+            "unpublished handoff temp reappeared after recovery"
+        );
+        Ok(true)
     }
 
     /// Seal the exact target-head grant needed to recover a dead control-only
@@ -696,7 +845,7 @@ impl ServingHandoffStore {
         context: &crate::runtime_spine::RuntimeDesiredEffectContext,
     ) -> Result<ServingHandoffRetirement>
     where
-        P: RootProvisionProcessPort + ?Sized,
+        P: RootProvisionProcessRetirementPort + ?Sized,
     {
         context.check_active()?;
         let candidate = build_target_candidate(
@@ -771,16 +920,18 @@ impl ServingHandoffStore {
         )?;
         let record_name = c_string(SERVING_HANDOFF_RECORD_FILE)?;
         let record_temp_name = c_string(SERVING_HANDOFF_RECORD_TEMP)?;
+        let retirement_name = c_string(SERVING_HANDOFF_RETIREMENT_FILE)?;
+        let retirement_temp_name = c_string(SERVING_HANDOFF_RETIREMENT_TEMP)?;
         let Some(record_bytes) = read_optional_bounded(
             &retained.attachment_directory,
             &record_name,
             SERVING_HANDOFF_RECORD_MAX_BYTES,
         )?
         else {
-            // Visibility may be the result of a previously completed unlink
-            // whose fsync acknowledgement was lost. No other artifact is
-            // touched; the exact absence proof and retained checkpoint make
-            // this a safe durability recovery, not path-only adoption.
+            // Visibility may be the result of a previously completed unlink.
+            // It is recoverable only from the exact durable receipt published
+            // before that unlink; absence plus an in-memory proof is not
+            // durable authority after an Agent crash.
             anyhow::ensure!(
                 read_optional_bounded(
                     &retained.attachment_directory,
@@ -790,6 +941,29 @@ impl ServingHandoffStore {
                 .is_none(),
                 "absent serving handoff record retained an unpublished temp"
             );
+            anyhow::ensure!(
+                read_optional_bounded(
+                    &retained.attachment_directory,
+                    &retirement_temp_name,
+                    SERVING_HANDOFF_RETIREMENT_MAX_BYTES,
+                )?
+                .is_none(),
+                "absent serving handoff record retained an unpublished retirement receipt"
+            );
+            let receipt_bytes = read_optional_bounded(
+                &retained.attachment_directory,
+                &retirement_name,
+                SERVING_HANDOFF_RETIREMENT_MAX_BYTES,
+            )?
+            .context("absent serving handoff record lacks its durable retirement receipt")?;
+            let receipt = decode_serving_handoff_retirement_receipt(&receipt_bytes)?;
+            validate_receipt_for_current_attempt(
+                &receipt,
+                stored_checkpoint,
+                acquired,
+                &candidate,
+            )?;
+            validate_receipt_target_binding(&receipt, &target_artifact, &retained_target)?;
             self.maybe_crash(PublicationStage::new(
                 PublicationArtifact::HandoffRetirement,
                 PublicationPoint::BeforeDirectorySync,
@@ -844,6 +1018,23 @@ impl ServingHandoffStore {
             "serving handoff record changed between classification and retirement"
         );
         retained_record.assert_current(&retained.attachment_directory, &record_path)?;
+        let record_identity = ServingHandoffRecordIdentity {
+            path: record_path.clone(),
+            device: retained_record.identity.device,
+            inode: retained_record.identity.inode,
+            length: retained_record.identity.length,
+            content_sha256: retained_record.identity.content_sha256.clone(),
+        };
+        let receipt =
+            retirement_receipt(stored_checkpoint, record.clone(), record_identity, &absence)?;
+        let receipt_bytes = encode_serving_handoff_retirement_receipt(&receipt)?;
+        self.persist_retirement_receipt(
+            &retained.attachment_directory,
+            &receipt_bytes,
+            stored_checkpoint,
+            acquired,
+            &candidate,
+        )?;
         self.maybe_crash(PublicationStage::new(
             PublicationArtifact::HandoffRetirement,
             PublicationPoint::BeforeUnlink,
@@ -908,7 +1099,7 @@ impl ServingHandoffStore {
         context: &crate::runtime_spine::RuntimeDesiredEffectContext,
     ) -> Result<StoredCheckpoint>
     where
-        P: RootProvisionProcessPort + ?Sized,
+        P: RootProvisionProcessRetirementPort + ?Sized,
     {
         context.check_active()?;
         let candidate = build_target_candidate(
@@ -957,6 +1148,30 @@ impl ServingHandoffStore {
                 "cannot rotate process token while {label} remains"
             );
         }
+        anyhow::ensure!(
+            read_optional_bounded(
+                &retained.attachment_directory,
+                &c_string(SERVING_HANDOFF_RETIREMENT_TEMP)?,
+                SERVING_HANDOFF_RETIREMENT_MAX_BYTES,
+            )?
+            .is_none(),
+            "token rotation found an unpublished retirement receipt"
+        );
+        let receipt_path = host_path(
+            &candidate
+                .data_directory
+                .join(SERVING_HANDOFF_RETIREMENT_FILE),
+            "rotation retirement receipt path",
+        )?;
+        let retained_receipt = RetainedFile::open_required(
+            &retained.attachment_directory,
+            SERVING_HANDOFF_RETIREMENT_FILE,
+            receipt_path,
+            SERVING_HANDOFF_RETIREMENT_MAX_BYTES,
+        )?;
+        let receipt = decode_serving_handoff_retirement_receipt(&retained_receipt.bytes)?;
+        validate_receipt_for_current_attempt(&receipt, stored_checkpoint, acquired, &candidate)?;
+        accepted_full_strictly_succeeds_retirement(&receipt, &absence)?;
         let target_path = host_path(
             &candidate.data_directory.join(&target_name),
             "rotation target-control authorization path",
@@ -982,6 +1197,7 @@ impl ServingHandoffStore {
             target_artifact.attachment == candidate.target_attachment,
             "token rotation target-control authorization is not the exact authority target"
         );
+        validate_receipt_target_binding(&receipt, &target_artifact, &retained_target)?;
 
         let mut successor = stored_checkpoint.checkpoint().clone();
         let ReconcileStep::ProvisionRootImage {
@@ -1013,6 +1229,10 @@ impl ServingHandoffStore {
             &retained.attachment_directory,
             &retained_target.identity.path,
         )?;
+        retained_receipt.assert_current(
+            &retained.attachment_directory,
+            &retained_receipt.identity.path,
+        )?;
         context.check_active()?;
         let replaced = checkpoint_store
             .replace(stored_checkpoint, &successor)
@@ -1022,7 +1242,77 @@ impl ServingHandoffStore {
             &retained.attachment_directory,
             &retained_target.identity.path,
         )?;
+        retained_receipt.assert_current(
+            &retained.attachment_directory,
+            &retained_receipt.identity.path,
+        )?;
         Ok(replaced)
+    }
+
+    fn persist_retirement_receipt(
+        &self,
+        directory: &File,
+        expected: &[u8],
+        stored_checkpoint: &StoredCheckpoint,
+        acquired: &AuthorizedBlockdCheckpoint,
+        candidate: &TargetControlCandidate,
+    ) -> Result<()> {
+        let target = c_string(SERVING_HANDOFF_RETIREMENT_FILE)?;
+        if let Some(current) =
+            read_optional_bounded(directory, &target, SERVING_HANDOFF_RETIREMENT_MAX_BYTES)?
+        {
+            if current == expected {
+                return self.persist_immutable(
+                    directory,
+                    SERVING_HANDOFF_RETIREMENT_FILE,
+                    SERVING_HANDOFF_RETIREMENT_TEMP,
+                    expected,
+                    SERVING_HANDOFF_RETIREMENT_MAX_BYTES,
+                    PublicationArtifact::HandoffRetirementReceipt,
+                );
+            }
+            let previous = decode_serving_handoff_retirement_receipt(&current)?;
+            validate_receipt_as_direct_predecessor(
+                &previous,
+                stored_checkpoint,
+                acquired,
+                candidate,
+            )?;
+            let path = host_path(
+                &candidate
+                    .data_directory
+                    .join(SERVING_HANDOFF_RETIREMENT_FILE),
+                "previous retirement receipt path",
+            )?;
+            let retained = RetainedFile::open_required(
+                directory,
+                SERVING_HANDOFF_RETIREMENT_FILE,
+                path.clone(),
+                SERVING_HANDOFF_RETIREMENT_MAX_BYTES,
+            )?;
+            anyhow::ensure!(
+                retained.bytes == current,
+                "previous retirement receipt changed before replacement"
+            );
+            retained.assert_current(directory, &path)?;
+            self.maybe_crash(PublicationStage::new(
+                PublicationArtifact::HandoffRetirementReceipt,
+                PublicationPoint::BeforeUnlink,
+            ))?;
+            unlink_at(directory, &target)
+                .context("unlink direct-predecessor retirement receipt")?;
+            directory
+                .sync_all()
+                .context("sync direct-predecessor retirement receipt removal")?;
+        }
+        self.persist_immutable(
+            directory,
+            SERVING_HANDOFF_RETIREMENT_FILE,
+            SERVING_HANDOFF_RETIREMENT_TEMP,
+            expected,
+            SERVING_HANDOFF_RETIREMENT_MAX_BYTES,
+            PublicationArtifact::HandoffRetirementReceipt,
+        )
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -1409,6 +1699,153 @@ fn validate_record_absence_binding(
     Ok(())
 }
 
+fn retirement_receipt(
+    stored_checkpoint: &StoredCheckpoint,
+    record: ServingHandoffRecord,
+    record_identity: ServingHandoffRecordIdentity,
+    absence: &ExactRootProvisionProcessAbsenceProof,
+) -> Result<ServingHandoffRetirementReceipt> {
+    validate_record_absence_binding(&record, absence)?;
+    let admission = absence.admission();
+    let receipt = ServingHandoffRetirementReceipt {
+        version: ContractVersion::V1,
+        old_checkpoint_content_digest: stored_checkpoint.content_digest().clone(),
+        old_checkpoint: stored_checkpoint.checkpoint().clone(),
+        old_process_identity_token: absence.expectation().process_identity_token.clone(),
+        record_identity,
+        record,
+        admission: ServingHandoffRetirementAdmission {
+            node_boot_id: admission.node_boot_id.clone(),
+            agent_instance_id: admission.agent_instance_id.clone(),
+            agent_session_epoch: admission.agent_session_epoch,
+            inventory_epoch: admission.inventory_epoch,
+            inventory_digest: admission.inventory_digest.clone(),
+            inventory_read_position: admission.inventory_read_position,
+        },
+    };
+    validate_retirement_receipt(&receipt).map_err(anyhow::Error::from)?;
+    Ok(receipt)
+}
+
+fn validate_receipt_for_current_attempt(
+    receipt: &ServingHandoffRetirementReceipt,
+    stored_checkpoint: &StoredCheckpoint,
+    acquired: &AuthorizedBlockdCheckpoint,
+    candidate: &TargetControlCandidate,
+) -> Result<()> {
+    validate_retirement_receipt(receipt).map_err(anyhow::Error::from)?;
+    anyhow::ensure!(
+        receipt.old_checkpoint_content_digest == *stored_checkpoint.content_digest(),
+        "serving handoff retirement receipt belongs to another checkpoint attempt"
+    );
+    validate_record_checkpoint_context(&receipt.record, stored_checkpoint)?;
+    anyhow::ensure!(
+        receipt
+            .record
+            .target_control_authorization
+            .artifact
+            .attachment
+            == candidate.target_attachment
+            && receipt
+                .record
+                .target_control_authorization
+                .artifact
+                .attachment
+                .identity
+                == acquired.attachment.identity
+            && receipt.old_process_identity_token
+                == receipt.record.old_control_process.ownership_token,
+        "serving handoff retirement receipt changed its authority or old process token"
+    );
+    Ok(())
+}
+
+fn validate_receipt_target_binding(
+    receipt: &ServingHandoffRetirementReceipt,
+    target_artifact: &TargetControlAuthorizationArtifact,
+    retained_target: &RetainedFile,
+) -> Result<()> {
+    let identity = &receipt.record.target_control_authorization;
+    anyhow::ensure!(
+        identity.artifact == *target_artifact
+            && identity.device == retained_target.identity.device
+            && identity.inode == retained_target.identity.inode
+            && identity.length == retained_target.identity.length
+            && identity.content_sha256 == retained_target.identity.content_sha256,
+        "retirement receipt is not bound to the retained target-control authorization"
+    );
+    Ok(())
+}
+
+fn validate_receipt_as_direct_predecessor(
+    receipt: &ServingHandoffRetirementReceipt,
+    stored_checkpoint: &StoredCheckpoint,
+    acquired: &AuthorizedBlockdCheckpoint,
+    candidate: &TargetControlCandidate,
+) -> Result<()> {
+    validate_retirement_receipt(receipt).map_err(anyhow::Error::from)?;
+    let current = stored_checkpoint.checkpoint();
+    let mut expected_successor = receipt.old_checkpoint.clone();
+    let ReconcileStep::ProvisionRootImage {
+        process_identity_token: old_token,
+        ..
+    } = &mut expected_successor.step
+    else {
+        anyhow::bail!("retirement receipt predecessor is not provision_root_image")
+    };
+    let ReconcileStep::ProvisionRootImage {
+        process_identity_token: current_token,
+        ..
+    } = &current.step
+    else {
+        anyhow::bail!("retirement receipt successor is not provision_root_image")
+    };
+    anyhow::ensure!(
+        *old_token != *current_token,
+        "retirement receipt replacement requires a distinct process attempt"
+    );
+    *old_token = current_token.clone();
+    expected_successor.updated_at_unix_ms = current.updated_at_unix_ms;
+    anyhow::ensure!(
+        expected_successor == *current
+            && receipt.old_checkpoint_content_digest != *stored_checkpoint.content_digest()
+            && receipt
+                .record
+                .target_control_authorization
+                .artifact
+                .attachment
+                == candidate.target_attachment
+            && receipt
+                .record
+                .target_control_authorization
+                .artifact
+                .attachment
+                .identity
+                == acquired.attachment.identity,
+        "existing retirement receipt is not the exact token-only checkpoint predecessor"
+    );
+    Ok(())
+}
+
+fn accepted_full_strictly_succeeds_retirement(
+    receipt: &ServingHandoffRetirementReceipt,
+    absence: &ExactRootProvisionProcessAbsenceProof,
+) -> Result<()> {
+    let old = &receipt.admission;
+    let new = absence.admission();
+    let session_advances = new.agent_session_epoch > old.agent_session_epoch;
+    let same_session_advances = new.agent_session_epoch == old.agent_session_epoch
+        && new.node_boot_id == old.node_boot_id
+        && new.agent_instance_id == old.agent_instance_id
+        && new.inventory_epoch > old.inventory_epoch;
+    anyhow::ensure!(
+        (session_advances || same_session_advances)
+            && new.inventory_read_position > old.inventory_read_position,
+        "process token rotation requires a strictly successor full-inventory admission"
+    );
+    Ok(())
+}
+
 fn control_process_identity(
     evidence: &RootProvisionProcessEvidence,
     target: &AuthorizedServingAttachment,
@@ -1566,11 +2003,63 @@ fn validate_handoff_record(
     Ok(())
 }
 
+fn validate_retirement_receipt(
+    receipt: &ServingHandoffRetirementReceipt,
+) -> std::result::Result<(), ServingHandoffCodecError> {
+    validate_handoff_record(&receipt.record)?;
+    let record_bytes = encode_serving_handoff_record(&receipt.record)?;
+    let record_digest = Sha256Digest::from_bytes(Sha256::digest(&record_bytes).into());
+    let checkpoint_digest = checkpoint_content_digest(&receipt.old_checkpoint).map_err(|_| {
+        ServingHandoffCodecError::Invalid {
+            artifact: "retirement receipt",
+            reason: "old checkpoint is not a valid Runtime checkpoint",
+        }
+    })?;
+    let record_path = Path::new(receipt.record_identity.path.as_str());
+    let process = &receipt.record.old_control_process;
+    let old_checkpoint_token = match &receipt.old_checkpoint.step {
+        ReconcileStep::ProvisionRootImage {
+            process_identity_token,
+            ..
+        } => Some(process_identity_token),
+        _ => None,
+    };
+    if receipt.version != ContractVersion::V1
+        || receipt.old_checkpoint_content_digest != receipt.record.checkpoint_content_digest
+        || receipt.old_checkpoint_content_digest != checkpoint_digest
+        || receipt.old_checkpoint.version != receipt.version
+        || old_checkpoint_token != Some(&receipt.old_process_identity_token)
+        || receipt.old_process_identity_token != process.ownership_token
+        || receipt.old_process_identity_token != process.handshake.process_identity_token
+        || record_path.file_name().and_then(|name| name.to_str())
+            != Some(SERVING_HANDOFF_RECORD_FILE)
+        || receipt.record_identity.device.get() == 0
+        || receipt.record_identity.inode.get() == 0
+        || usize::try_from(receipt.record_identity.length.get()).ok() != Some(record_bytes.len())
+        || receipt.record_identity.content_sha256 != record_digest
+        || receipt.admission.agent_session_epoch.get() == 0
+        || receipt.admission.inventory_epoch.get() == 0
+        || receipt.admission.inventory_read_position.get() == 0
+    {
+        return Err(ServingHandoffCodecError::Invalid {
+            artifact: "retirement receipt",
+            reason: "receipt fields do not form one exact retired process attempt",
+        });
+    }
+    Ok(())
+}
+
 fn validate_target_checkpoint_context(
     artifact: &TargetControlAuthorizationArtifact,
     stored_checkpoint: &StoredCheckpoint,
 ) -> Result<()> {
-    let checkpoint = stored_checkpoint.checkpoint();
+    validate_target_checkpoint_value(artifact, stored_checkpoint.checkpoint())
+}
+
+fn validate_target_checkpoint_value(
+    artifact: &TargetControlAuthorizationArtifact,
+    checkpoint: &RuntimeCheckpoint,
+) -> Result<()> {
     let ReconcileStep::ProvisionRootImage {
         provision_transition_id,
         volume_id,
@@ -1614,11 +2103,19 @@ fn validate_record_checkpoint_context(
     record: &ServingHandoffRecord,
     stored_checkpoint: &StoredCheckpoint,
 ) -> Result<()> {
-    validate_target_checkpoint_context(
-        &record.target_control_authorization.artifact,
-        stored_checkpoint,
-    )?;
-    let checkpoint = stored_checkpoint.checkpoint();
+    validate_record_checkpoint_value(
+        record,
+        stored_checkpoint.checkpoint(),
+        stored_checkpoint.content_digest(),
+    )
+}
+
+fn validate_record_checkpoint_value(
+    record: &ServingHandoffRecord,
+    checkpoint: &RuntimeCheckpoint,
+    checkpoint_digest: &Sha256Digest,
+) -> Result<()> {
+    validate_target_checkpoint_value(&record.target_control_authorization.artifact, checkpoint)?;
     let ReconcileStep::ProvisionRootImage {
         provision_transition_id,
         volume_id,
@@ -1636,7 +2133,7 @@ fn validate_record_checkpoint_context(
     };
     let process = &record.old_control_process;
     anyhow::ensure!(
-        record.checkpoint_content_digest == *stored_checkpoint.content_digest()
+        record.checkpoint_content_digest == *checkpoint_digest
             && record.cat_id == checkpoint.cat_id
             && record.node_id == checkpoint.node_id
             && record.placement_epoch == checkpoint.placement_epoch
@@ -1653,6 +2150,250 @@ fn validate_record_checkpoint_context(
             && process.ownership_token == *process_identity_token
             && process.executable_path == record.expected_control_executable_path,
         "serving handoff record is stale for the current stored checkpoint"
+    );
+    Ok(())
+}
+
+/// Provider-private classifier used by the full inventory scanner. It does
+/// not project a public process proof; it only proves that every reserved
+/// handoff artifact in the strict data leaf is canonical and belongs to the
+/// current checkpoint/authorized attachment. This keeps the scanner from
+/// turning a filename allowlist into false completeness.
+pub(crate) fn validate_scanned_serving_handoff_artifacts(
+    checkpoint: &RuntimeCheckpoint,
+    acquired: &AuthorizedBlockdCheckpoint,
+    target: &ScannedServingHandoffArtifact<'_>,
+    record: Option<&ScannedServingHandoffArtifact<'_>>,
+    retirement: Option<&ScannedServingHandoffArtifact<'_>>,
+) -> Result<()> {
+    let checkpoint_digest = checkpoint_content_digest(checkpoint)?;
+    let target_artifact = decode_target_control_authorization(target.bytes)?;
+    validate_scanned_artifact_bytes(target, target.bytes)?;
+    anyhow::ensure!(
+        target_artifact.attachment.identity == acquired.attachment.identity
+            && target.path.as_str()
+                == format!(
+                    "{}/{}",
+                    target_artifact
+                        .local_state
+                        .attachment_directory
+                        .path
+                        .as_str(),
+                    target_control_file_name(&target_artifact.provision_transition_id)
+                ),
+        "scanned target-control artifact is outside its exact authorized lineage"
+    );
+
+    let decoded_record = record
+        .map(|file| {
+            validate_scanned_artifact_bytes(file, file.bytes)?;
+            let decoded = decode_serving_handoff_record(file.bytes)?;
+            anyhow::ensure!(
+                Path::new(file.path.as_str())
+                    .file_name()
+                    .and_then(|name| name.to_str())
+                    == Some(SERVING_HANDOFF_RECORD_FILE)
+                    && record_target_matches_scan(&decoded, &target_artifact, target),
+                "scanned handoff record changed physical or target identity"
+            );
+            Ok(decoded)
+        })
+        .transpose()?;
+
+    match &checkpoint.step {
+        ReconcileStep::ProvisionRootImage { .. } => {
+            validate_target_checkpoint_value(&target_artifact, checkpoint)?;
+            if let Some(decoded) = decoded_record.as_ref() {
+                validate_record_checkpoint_value(decoded, checkpoint, &checkpoint_digest)?;
+            }
+        }
+        ReconcileStep::PrepareDevice {
+            volume_id,
+            attachment_id,
+            attachment_epoch,
+            acquire_origin,
+            expected_head,
+            size_bytes,
+            durability,
+            serving_authority,
+            serving_process,
+            ..
+        } => {
+            let ServingAuthorityProvenance::AfterRootProvision { handoff } =
+                serving_authority.as_ref()
+            else {
+                anyhow::bail!(
+                    "direct authorized attachment cannot retain root-provision handoff artifacts"
+                )
+            };
+            let decoded = decoded_record
+                .as_ref()
+                .context("after-root-provision checkpoint lacks its sealed handoff record")?;
+            let file = record.context("after-root-provision checkpoint lacks record identity")?;
+            anyhow::ensure!(
+                handoff.predecessor_checkpoint_content_digest
+                    == decoded.checkpoint_content_digest
+                    && file.path == handoff.record.path
+                    && file.device == handoff.record.device
+                    && file.inode == handoff.record.inode
+                    && file.length == handoff.record.length
+                    && file.content_sha256 == handoff.record.content_sha256
+                    && decoded.cat_id == checkpoint.cat_id
+                    && decoded.node_id == checkpoint.node_id
+                    && decoded.placement_epoch == checkpoint.placement_epoch
+                    && decoded.desired_revision == checkpoint.desired_revision
+                    && decoded.spec_digest == checkpoint.spec_digest
+                    && decoded.volume_id == *volume_id
+                    && decoded.attachment_id == *attachment_id
+                    && decoded.attachment_epoch == *attachment_epoch
+                    && decoded.acquire_origin == *acquire_origin
+                    && decoded.expected_provisioned_head == *expected_head
+                    && decoded.expected_provisioned_head == target_artifact.attachment.head
+                    && target_artifact.attachment.identity == acquired.attachment.identity
+                    && target_artifact.attachment.acquire_request
+                        == acquired.attachment.acquire_request
+                    && target_artifact.attachment.size_bytes
+                        == acquired.attachment.size_bytes
+                    && target_artifact.attachment.durability
+                        == acquired.attachment.durability
+                    && acquired.attachment.size_bytes == *size_bytes
+                    && acquired.attachment.durability == *durability
+                    && decoded.old_control_process.data_directory
+                        == serving_process.data_directory,
+                "PrepareDevice handoff does not preserve the exact predecessor lineage"
+            );
+        }
+        _ => anyhow::bail!(
+            "serving handoff artifacts require provision_root_image or after-root-provision PrepareDevice"
+        ),
+    }
+
+    if let Some(file) = retirement {
+        validate_scanned_artifact_bytes(file, file.bytes)?;
+        let receipt = decode_serving_handoff_retirement_receipt(file.bytes)?;
+        let receipt_is_current = receipt.old_checkpoint_content_digest == checkpoint_digest
+            && receipt.old_checkpoint == *checkpoint;
+        match &checkpoint.step {
+            ReconcileStep::ProvisionRootImage { .. } => {
+                if !receipt_is_current {
+                    validate_receipt_checkpoint_direct_successor(
+                        &receipt,
+                        checkpoint,
+                        &checkpoint_digest,
+                    )?;
+                }
+            }
+            ReconcileStep::PrepareDevice { .. } => {
+                let decoded = decoded_record.as_ref().context(
+                    "PrepareDevice retirement receipt lacks the current sealed handoff record",
+                )?;
+                anyhow::ensure!(
+                    receipt.record != *decoded
+                        && receipt.old_checkpoint_content_digest
+                            != decoded.checkpoint_content_digest
+                        && receipt.record.target_control_authorization
+                            == decoded.target_control_authorization
+                        && receipt.old_process_identity_token
+                            != decoded.old_control_process.ownership_token,
+                    "PrepareDevice retirement receipt is not a distinct predecessor attempt"
+                );
+            }
+            _ => unreachable!("checkpoint step was closed above"),
+        }
+        anyhow::ensure!(
+            record_target_matches_scan(&receipt.record, &target_artifact, target),
+            "scanned retirement receipt changed target-control identity"
+        );
+        if let Some(decoded) = decoded_record.as_ref() {
+            if receipt.record == *decoded {
+                anyhow::ensure!(
+                    matches!(checkpoint.step, ReconcileStep::ProvisionRootImage { .. })
+                        && decoded.checkpoint_content_digest
+                            == receipt.old_checkpoint_content_digest
+                        && record.is_some_and(|file| {
+                            scanned_identity_matches_record(file, &receipt.record_identity)
+                        }),
+                    "scanned record and retirement receipt disagree on checkpoint attempt"
+                );
+            } else {
+                anyhow::ensure!(
+                    !receipt_is_current,
+                    "current-attempt retirement receipt conflicts with a different record"
+                );
+            }
+        }
+    }
+    Ok(())
+}
+
+fn validate_scanned_artifact_bytes(
+    artifact: &ScannedServingHandoffArtifact<'_>,
+    bytes: &[u8],
+) -> Result<()> {
+    anyhow::ensure!(
+        artifact.device.get() > 0
+            && artifact.inode.get() > 0
+            && artifact.length.get() == u64::try_from(bytes.len())?
+            && artifact.content_sha256 == Sha256Digest::from_bytes(Sha256::digest(bytes).into()),
+        "scanned serving handoff artifact changed physical content"
+    );
+    Ok(())
+}
+
+fn record_target_matches_scan(
+    record: &ServingHandoffRecord,
+    target_artifact: &TargetControlAuthorizationArtifact,
+    target: &ScannedServingHandoffArtifact<'_>,
+) -> bool {
+    let identity = &record.target_control_authorization;
+    identity.artifact == *target_artifact
+        && identity.path == target.path
+        && identity.device == target.device
+        && identity.inode == target.inode
+        && identity.length == target.length
+        && identity.content_sha256 == target.content_sha256
+}
+
+fn scanned_identity_matches_record(
+    artifact: &ScannedServingHandoffArtifact<'_>,
+    identity: &ServingHandoffRecordIdentity,
+) -> bool {
+    artifact.path == identity.path
+        && artifact.device == identity.device
+        && artifact.inode == identity.inode
+        && artifact.length == identity.length
+        && artifact.content_sha256 == identity.content_sha256
+}
+
+fn validate_receipt_checkpoint_direct_successor(
+    receipt: &ServingHandoffRetirementReceipt,
+    checkpoint: &RuntimeCheckpoint,
+    checkpoint_digest: &Sha256Digest,
+) -> Result<()> {
+    let mut expected = receipt.old_checkpoint.clone();
+    let ReconcileStep::ProvisionRootImage {
+        process_identity_token: old_token,
+        ..
+    } = &mut expected.step
+    else {
+        anyhow::bail!("retirement receipt old checkpoint is not provision_root_image")
+    };
+    let ReconcileStep::ProvisionRootImage {
+        process_identity_token: current_token,
+        ..
+    } = &checkpoint.step
+    else {
+        anyhow::bail!("retirement receipt current checkpoint is not provision_root_image")
+    };
+    anyhow::ensure!(
+        *old_token != *current_token && receipt.old_checkpoint_content_digest != *checkpoint_digest,
+        "retirement receipt does not precede a distinct process attempt"
+    );
+    *old_token = current_token.clone();
+    expected.updated_at_unix_ms = checkpoint.updated_at_unix_ms;
+    anyhow::ensure!(
+        expected == *checkpoint,
+        "retirement receipt is not the exact token-only checkpoint predecessor"
     );
     Ok(())
 }
@@ -2125,6 +2866,8 @@ fn validate_handoff_namespace(
         expected_target_temp.as_bytes(),
         SERVING_HANDOFF_RECORD_FILE.as_bytes(),
         SERVING_HANDOFF_RECORD_TEMP.as_bytes(),
+        SERVING_HANDOFF_RETIREMENT_FILE.as_bytes(),
+        SERVING_HANDOFF_RETIREMENT_TEMP.as_bytes(),
     ];
     let mut stream = DirectoryStream::open(directory)
         .context("open descriptor-relative serving handoff directory stream")?;
@@ -2432,6 +3175,7 @@ fn rename_no_replace(
 enum PublicationArtifact {
     TargetAuthorization,
     HandoffRecord,
+    HandoffRetirementReceipt,
     HandoffRetirement,
 }
 
@@ -2483,7 +3227,7 @@ mod tests {
 
     use super::*;
     use crate::runtime::reconciliation::root_provision_process::{
-        sealed as root_process_sealed, CheckpointedRootProvisionProcess, RootProvisionProcessStart,
+        retirement_sealed as root_process_retirement_sealed, RootProvisionProcessRetirementPort,
     };
     use crate::runtime::reconciliation::signed_running::prepared_owned_observed_volume;
     use crate::runtime::reconciliation::{
@@ -2515,10 +3259,10 @@ mod tests {
         }
     }
 
-    impl root_process_sealed::Sealed for RetirementProcessPort {}
+    impl root_process_retirement_sealed::Sealed for RetirementProcessPort {}
 
-    impl RootProvisionProcessPort for RetirementProcessPort {
-        fn inspect(
+    impl RootProvisionProcessRetirementPort for RetirementProcessPort {
+        fn inspect_after_node_global_sweep(
             &self,
             _expected: &RootProvisionProcessExpectation,
             _context: &dyn RuntimePhysicalReadContext,
@@ -2530,14 +3274,6 @@ mod tests {
                 .unwrap()
                 .pop_front()
                 .unwrap_or(RootProvisionProcessInspection::Unavailable))
-        }
-
-        fn start_checkpointed(
-            &self,
-            _checkpointed: CheckpointedRootProvisionProcess<'_>,
-            _context: &RuntimeDesiredEffectContext,
-        ) -> Result<RootProvisionProcessStart> {
-            panic!("record retirement must never start a process")
         }
     }
 
@@ -2579,6 +3315,14 @@ mod tests {
             self.data_directory.join(SERVING_HANDOFF_RECORD_TEMP)
         }
 
+        fn retirement_path(&self) -> PathBuf {
+            self.data_directory.join(SERVING_HANDOFF_RETIREMENT_FILE)
+        }
+
+        fn retirement_temp_path(&self) -> PathBuf {
+            self.data_directory.join(SERVING_HANDOFF_RETIREMENT_TEMP)
+        }
+
         fn exact_process_proof(&self) -> Result<ExactRootProvisionProcessProof> {
             self.exact_process_proof_for(self.process.clone())
         }
@@ -2606,6 +3350,18 @@ mod tests {
             .unwrap();
             let current = store.load().unwrap().unwrap();
             self.stored_checkpoint = store.replace(&current, &checkpoint).unwrap();
+        }
+    }
+
+    fn scanned_file<'a>(path: &Path, bytes: &'a [u8]) -> ScannedServingHandoffArtifact<'a> {
+        let metadata = std::fs::metadata(path).unwrap();
+        ScannedServingHandoffArtifact {
+            path: host(path.to_str().unwrap()),
+            device: WireU64::new(metadata.dev()).unwrap(),
+            inode: WireU64::new(metadata.ino()).unwrap(),
+            length: WireU64::new(metadata.len()).unwrap(),
+            content_sha256: Sha256Digest::from_bytes(Sha256::digest(bytes).into()),
+            bytes,
         }
     }
 
@@ -2708,6 +3464,33 @@ mod tests {
 
     fn absent_effect_context(fixture: &Fixture) -> RuntimeDesiredEffectContext {
         effect_context_with_processes(fixture, Vec::new())
+    }
+
+    fn successor_absent_effect_context(fixture: &Fixture) -> RuntimeDesiredEffectContext {
+        mutate_absent_effect_context(fixture, |_session, observation, attestation| {
+            observation.inventory_epoch = Epoch::new(5).unwrap();
+            observation.inventory_read_position = Some(Sequence::new(13).unwrap());
+            observation.inventory_digest = Some(digest('8'));
+            attestation.inventory_epoch = observation.inventory_epoch;
+            attestation.inventory_read_position = Sequence::new(13).unwrap();
+            attestation.inventory_digest = digest('8');
+        })
+    }
+
+    fn restarted_absent_effect_context(fixture: &Fixture) -> RuntimeDesiredEffectContext {
+        mutate_absent_effect_context(fixture, |session, observation, attestation| {
+            session.agent_instance_id = random('6');
+            session.agent_session_epoch = Epoch::new(3).unwrap();
+            observation.agent_instance_id = session.agent_instance_id.clone();
+            observation.agent_session_epoch = session.agent_session_epoch;
+            observation.inventory_epoch = Epoch::new(1).unwrap();
+            observation.inventory_read_position = Some(Sequence::new(13).unwrap());
+            observation.inventory_digest = Some(digest('8'));
+            attestation.agent_session_epoch = session.agent_session_epoch;
+            attestation.inventory_epoch = observation.inventory_epoch;
+            attestation.inventory_read_position = Sequence::new(13).unwrap();
+            attestation.inventory_digest = digest('8');
+        })
     }
 
     fn mutate_absent_effect_context(
@@ -3249,7 +4032,7 @@ mod tests {
                 )
                 .unwrap(),
                 &process_port,
-                &absent_effect_context(&fixture),
+                &successor_absent_effect_context(&fixture),
             )
             .unwrap();
         let ReconcileStep::ProvisionRootImage {
@@ -3306,6 +4089,20 @@ mod tests {
             )
             .unwrap();
         assert_ne!(second_ready.record_identity().inode(), first_record_inode);
+        let target_bytes = std::fs::read(fixture.target_path()).unwrap();
+        let record_bytes = std::fs::read(fixture.record_path()).unwrap();
+        let retirement_bytes = std::fs::read(fixture.retirement_path()).unwrap();
+        let target_scan = scanned_file(&fixture.target_path(), &target_bytes);
+        let record_scan = scanned_file(&fixture.record_path(), &record_bytes);
+        let retirement_scan = scanned_file(&fixture.retirement_path(), &retirement_bytes);
+        validate_scanned_serving_handoff_artifacts(
+            fixture.stored_checkpoint.checkpoint(),
+            &fixture.acquired,
+            &target_scan,
+            Some(&record_scan),
+            Some(&retirement_scan),
+        )
+        .expect("fresh classifier accepts rotated receipt plus the new exact handoff");
         let successor = second_ready
             .consume_for_prepare_device(&fixture.stored_checkpoint, |handoff| {
                 let successor = prepare_device_successor(&fixture, handoff);
@@ -3321,7 +4118,183 @@ mod tests {
             current.checkpoint().step,
             ReconcileStep::PrepareDevice { .. }
         ));
+        validate_scanned_serving_handoff_artifacts(
+            current.checkpoint(),
+            &fixture.acquired,
+            &target_scan,
+            Some(&record_scan),
+            Some(&retirement_scan),
+        )
+        .expect("PrepareDevice fresh classifier retains the exact rotated provenance");
+
+        let mut receipt_drift = retirement_bytes.clone();
+        receipt_drift.push(b' ');
+        let mut retirement_drift = scanned_file(&fixture.retirement_path(), &retirement_bytes);
+        retirement_drift.length = WireU64::new(receipt_drift.len() as u64).unwrap();
+        retirement_drift.content_sha256 =
+            Sha256Digest::from_bytes(Sha256::digest(&receipt_drift).into());
+        retirement_drift.bytes = &receipt_drift;
+        assert!(validate_scanned_serving_handoff_artifacts(
+            current.checkpoint(),
+            &fixture.acquired,
+            &target_scan,
+            Some(&record_scan),
+            Some(&retirement_drift),
+        )
+        .is_err());
         assert_eq!(process_port.inspect_calls(), 2);
+    }
+
+    #[test]
+    fn token_rotation_rejects_the_retirement_admission_but_accepts_a_fresh_session() {
+        let mut fixture = fixture();
+        let handoff_store = fixture.store();
+        drop(
+            handoff_store
+                .seal_serving_ready(
+                    &fixture.stored_checkpoint,
+                    &fixture.acquired,
+                    &fixture.authority,
+                    &fixture.exact_process_proof().unwrap(),
+                )
+                .unwrap(),
+        );
+        let checkpoint_store = FileCheckpointStore::open(
+            &fixture.checkpoint_directory,
+            &fixture.acquired.desired.cat_id,
+        )
+        .unwrap();
+        let port = RetirementProcessPort::with_inspections([
+            RootProvisionProcessInspection::Absent,
+            RootProvisionProcessInspection::Absent,
+            RootProvisionProcessInspection::Absent,
+        ]);
+        let retirement_context = absent_effect_context(&fixture);
+        handoff_store
+            .retire_record_after_exact_process_absence(
+                &checkpoint_store,
+                &fixture.stored_checkpoint,
+                &fixture.acquired,
+                &fixture.authority,
+                fixture.expected_executable_path.clone(),
+                &port,
+                &retirement_context,
+            )
+            .unwrap();
+        let old_digest = fixture.stored_checkpoint.content_digest().clone();
+        let timestamp = UnixMillis::new(
+            fixture
+                .stored_checkpoint
+                .checkpoint()
+                .updated_at_unix_ms
+                .get()
+                + 1,
+        )
+        .unwrap();
+        assert!(handoff_store
+            .rotate_process_token_after_retirement(
+                &checkpoint_store,
+                &fixture.stored_checkpoint,
+                &fixture.acquired,
+                &fixture.authority,
+                fixture.expected_executable_path.clone(),
+                random('5'),
+                timestamp,
+                &port,
+                &retirement_context,
+            )
+            .unwrap_err()
+            .to_string()
+            .contains("strictly successor"));
+        assert_eq!(
+            checkpoint_store.load().unwrap().unwrap().content_digest(),
+            &old_digest
+        );
+
+        fixture.stored_checkpoint = handoff_store
+            .rotate_process_token_after_retirement(
+                &checkpoint_store,
+                &fixture.stored_checkpoint,
+                &fixture.acquired,
+                &fixture.authority,
+                fixture.expected_executable_path.clone(),
+                random('5'),
+                timestamp,
+                &port,
+                &restarted_absent_effect_context(&fixture),
+            )
+            .unwrap();
+        assert_ne!(fixture.stored_checkpoint.content_digest(), &old_digest);
+        assert!(fixture.retirement_path().exists());
+    }
+
+    #[test]
+    fn retirement_receipt_publication_recovers_every_crash_window_before_unlink() {
+        for point in [
+            PublicationPoint::Created,
+            PublicationPoint::PartialWritten,
+            PublicationPoint::FullWritten,
+            PublicationPoint::TempSynced,
+            PublicationPoint::Published,
+            PublicationPoint::DirectorySynced,
+        ] {
+            let fixture = fixture();
+            let handoff_store = fixture.store();
+            drop(
+                handoff_store
+                    .seal_serving_ready(
+                        &fixture.stored_checkpoint,
+                        &fixture.acquired,
+                        &fixture.authority,
+                        &fixture.exact_process_proof().unwrap(),
+                    )
+                    .unwrap(),
+            );
+            let checkpoint_store = FileCheckpointStore::open(
+                &fixture.checkpoint_directory,
+                &fixture.acquired.desired.cat_id,
+            )
+            .unwrap();
+            let port = RetirementProcessPort::with_inspections([
+                RootProvisionProcessInspection::Absent,
+                RootProvisionProcessInspection::Absent,
+            ]);
+            handoff_store.inject_crash_once(PublicationStage::new(
+                PublicationArtifact::HandoffRetirementReceipt,
+                point,
+            ));
+            assert!(handoff_store
+                .retire_record_after_exact_process_absence(
+                    &checkpoint_store,
+                    &fixture.stored_checkpoint,
+                    &fixture.acquired,
+                    &fixture.authority,
+                    fixture.expected_executable_path.clone(),
+                    &port,
+                    &absent_effect_context(&fixture),
+                )
+                .is_err());
+            assert!(fixture.record_path().exists(), "{point:?}");
+
+            assert_eq!(
+                handoff_store
+                    .retire_record_after_exact_process_absence(
+                        &checkpoint_store,
+                        &fixture.stored_checkpoint,
+                        &fixture.acquired,
+                        &fixture.authority,
+                        fixture.expected_executable_path.clone(),
+                        &port,
+                        &absent_effect_context(&fixture),
+                    )
+                    .unwrap(),
+                ServingHandoffRetirement::Retired,
+                "{point:?}"
+            );
+            assert!(!fixture.record_path().exists(), "{point:?}");
+            assert!(fixture.retirement_path().exists(), "{point:?}");
+            assert!(!fixture.retirement_temp_path().exists(), "{point:?}");
+        }
     }
 
     #[test]
@@ -4048,7 +5021,8 @@ mod tests {
             let swap_path = match artifact {
                 PublicationArtifact::TargetAuthorization => fixture.target_path(),
                 PublicationArtifact::HandoffRecord => fixture.record_path(),
-                PublicationArtifact::HandoffRetirement => {
+                PublicationArtifact::HandoffRetirement
+                | PublicationArtifact::HandoffRetirementReceipt => {
                     unreachable!("publication matrix excludes retirement")
                 }
             };

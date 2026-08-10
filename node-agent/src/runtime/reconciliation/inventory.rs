@@ -676,6 +676,20 @@ fn runtime_from_inventory(
                 .volume_release
                 .as_ref()
                 .is_some_and(|release| release.generation == head.generation),
+            (
+                ReconcileStep::PrepareDevice {
+                    expected_head,
+                    serving_authority,
+                    ..
+                },
+                VolumeAuthorityEvidence::Owned { head, .. },
+            ) if matches!(
+                serving_authority.as_ref(),
+                cats_api::runtime_reconciliation::ServingAuthorityProvenance::AfterRootProvision { .. }
+            ) =>
+            {
+                head == expected_head
+            }
             (ReconcileStep::Quarantined, VolumeAuthorityEvidence::Owned { head, .. }) => {
                 runtime_checkpoint.volumes.iter().any(|checkpoint_volume| {
                     checkpoint_volume.volume_id == volume.volume_id
@@ -1126,6 +1140,54 @@ fn validate_scanned_checkpoint(
                     "current provision checkpoint does not bind the Desired image"
                 );
             }
+        }
+        ReconcileStep::PrepareDevice {
+            volume_id,
+            attachment_id,
+            attachment_epoch,
+            acquire_origin,
+            expected_head,
+            size_bytes,
+            durability,
+            guest_device,
+            serving_authority,
+            serving_process,
+            ..
+        } if binding == DesiredCheckpointBinding::Current
+            && matches!(
+                serving_authority.as_ref(),
+                cats_api::runtime_reconciliation::ServingAuthorityProvenance::AfterRootProvision { .. }
+            ) =>
+        {
+            let Some(blockd) = blockd else {
+                anyhow::bail!("PrepareDevice checkpoint lacks authorized blockd lineage")
+            };
+            let [intent] = desired.volumes.as_slice() else {
+                anyhow::bail!("current PrepareDevice checkpoint requires one root Volume")
+            };
+            let attachment = &blockd.checkpoint.attachment;
+            let checkpoint_volume = checkpoint
+                .volumes
+                .iter()
+                .find(|volume| volume.volume_id == *volume_id)
+                .context("PrepareDevice checkpoint lacks its observed Volume")?;
+            anyhow::ensure!(
+                volume_id == &intent.volume_id
+                    && attachment_id == &attachment.identity.attachment_id
+                    && *attachment_epoch == attachment.identity.attachment_epoch
+                    && *acquire_origin == attachment.identity.acquire_origin
+                    && *size_bytes == attachment.size_bytes
+                    && *durability == attachment.durability
+                    && guest_device == &intent.guest_device
+                    && serving_process.data_directory == blockd.data_directory
+                    && checkpoint_volume.size_bytes == Some(attachment.size_bytes)
+                    && checkpoint_volume.durability == Some(attachment.durability)
+                    && matches!(
+                        &checkpoint_volume.authority,
+                        VolumeAuthorityEvidence::Owned { head, .. } if head == expected_head
+                    ),
+                "PrepareDevice checkpoint does not bind authorized root handoff lineage"
+            );
         }
         ReconcileStep::CleanupRelease { cleanup }
             if binding == DesiredCheckpointBinding::Current =>

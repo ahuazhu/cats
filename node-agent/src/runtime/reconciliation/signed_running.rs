@@ -41,6 +41,7 @@ use crate::runtime_spine::{
 use super::clean_slate_probes::{
     classify_local_publication_recovery, LocalPublicationRecoveryEvidence, CHECKPOINT_NAMESPACE,
 };
+use super::serving_handoff::ServingHandoffStore;
 use super::{
     authorized_blockd::authorized_blockd_data_directory, recover_normal_acquire_from_authority,
     recover_normal_release_from_authority, runtime_checkpoint_path, AuthorizedBlockdStore,
@@ -278,6 +279,58 @@ impl RuntimePreScanRecovery for SignedRunningPublicationRecovery {
             }
             LocalPublicationRecoveryEvidence::AuthorizedBlockd { cat_id } => {
                 self.recover_authorized_blockd(&context, &cat_id)
+            }
+            LocalPublicationRecoveryEvidence::ServingHandoffTemp {
+                cat_id,
+                kind,
+                authorized,
+            } => {
+                let desired = context
+                    .coordinates()
+                    .desired
+                    .desired_specs
+                    .iter()
+                    .find(|desired| desired.cat_id == cat_id)
+                    .context("handoff temp recovery Cat is absent from current Desired")?;
+                let volume = desired
+                    .volumes
+                    .iter()
+                    .find(|volume| *volume == &authorized.volume)
+                    .context("handoff temp recovery volume is absent from current Desired")?;
+                let checkpoint_directory =
+                    context.state_directory().path().join(CHECKPOINT_NAMESPACE);
+                let store = FileCheckpointStore::open_preserving_checkpoint_temp(
+                    &checkpoint_directory,
+                    &cat_id,
+                )
+                .context("open handoff temp recovery checkpoint store")?;
+                let Some(stored) = store
+                    .load()
+                    .context("load handoff temp recovery checkpoint")?
+                else {
+                    return Ok(RuntimePreScanRecoveryOutcome::NoChange);
+                };
+                // The attachment flock is acquired before the checkpoint
+                // writer guard, matching every handoff publisher's lock order.
+                let prepared = AuthorizedBlockdStore::new(context.state_directory().clone())
+                    .reopen_adopted(desired, volume, &authorized.attachment.identity)
+                    .context("reopen scanned handoff attachment")?;
+                anyhow::ensure!(
+                    prepared.checkpoint() == authorized.as_ref(),
+                    "handoff attachment changed after the pre-scan classification"
+                );
+                let _current = store
+                    .assert_current(&stored)
+                    .context("retain current handoff recovery checkpoint")?;
+                let recovered = ServingHandoffStore::new(context.state_directory().clone())
+                    .discard_recoverable_temp(&prepared, &stored, kind, &context)
+                    .context("discard exact unpublished serving handoff temp")?;
+                context.check_active()?;
+                Ok(if recovered {
+                    RuntimePreScanRecoveryOutcome::Recovered { cat_id }
+                } else {
+                    RuntimePreScanRecoveryOutcome::NoChange
+                })
             }
         }
     }
@@ -2750,9 +2803,22 @@ pub(super) fn provision_checkpoint_is_bound(
         && checkpoint_blank == expected_blank_head
         && checkpoint_target == expected_provisioned_head
         && path_matches(data_directory, &expected_data_directory)
-        && scope_id.as_str() == format!("cats-root-{}.service", process_identity_token.as_str())
+        // The scope is stable for the whole provision transition, while an
+        // exact dead-process retirement rotates only the attempt token.
+        // Deriving the scope from the current token would make the first legal
+        // retry unreadable by a fresh scanner.
+        && root_provision_scope_id_is_canonical(scope_id)
+        && !process_identity_token.as_str().is_empty()
         && control_socket_path.as_str()
             == format!("{}/{}", data_directory.as_str(), ROOT_PROVISION_SOCKET)
+}
+
+fn root_provision_scope_id_is_canonical(scope_id: &Id) -> bool {
+    scope_id
+        .as_str()
+        .strip_prefix("cats-root-")
+        .and_then(|value| value.strip_suffix(".service"))
+        .is_some_and(|value| RandomId128::new(value).is_some())
 }
 
 pub(super) enum ProvisionHeadRead {
@@ -3334,16 +3400,33 @@ mod tests {
         assert!(scanner.scan_complete(scan_context(&desired)).is_err());
 
         let restored = store.replace(&wrong, &correct).unwrap();
-        let mut wrong_token = restored.checkpoint().clone();
+        let mut rotated_attempt = restored.checkpoint().clone();
         let ReconcileStep::ProvisionRootImage {
+            scope_id,
             process_identity_token,
             ..
-        } = &mut wrong_token.step
+        } = &mut rotated_attempt.step
         else {
             unreachable!("fixture reached ProvisionRootImage")
         };
+        let stable_scope_id = scope_id.clone();
         *process_identity_token = random('9');
-        store.replace(&restored, &wrong_token).unwrap();
+        assert_ne!(
+            stable_scope_id.as_str(),
+            format!("cats-root-{}.service", process_identity_token.as_str())
+        );
+        let rotated = store.replace(&restored, &rotated_attempt).unwrap();
+        assert!(matches!(
+            scanner.scan_complete(scan_context(&desired)).unwrap(),
+            RuntimeInventoryScanOutcome::Complete(_)
+        ));
+
+        let mut wrong_scope = rotated.checkpoint().clone();
+        let ReconcileStep::ProvisionRootImage { scope_id, .. } = &mut wrong_scope.step else {
+            unreachable!("fixture reached ProvisionRootImage")
+        };
+        *scope_id = Id::new("foreign-root.service").unwrap();
+        store.replace(&rotated, &wrong_scope).unwrap();
         assert!(scanner.scan_complete(scan_context(&desired)).is_err());
     }
 

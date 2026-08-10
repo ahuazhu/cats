@@ -966,15 +966,29 @@ canonical content SHA-256；record内容绑定最后一个target-control `Runtim
 不能被新process attempt覆盖或复用。当前进程已accepted的complete inventory必须先对该Cat投影
 `processes=[]`，随后sealed systemd/process/socket port在相同effect admission内再次对完整旧attempt identity
 返回exact `Absent`；present、duplicate、foreign、unavailable或任一不完整scan都不产生retirement authority。
+这里的sealed port必须复用full scanner同一套Node-global systemd unit/cgroup、`/proc` argv/token/executable、
+managed socket namespace穷举；只查询expected unit不是absence proof。accepted full之后晚到的foreign/duplicate
+unit、PID、token、argv、cgroup或socket一律成为Conflict，record保持原样。
 Node持有attachment directory descriptor/flock、record及target-control descriptor identity和exact current
 checkpoint writer guard/digest时，只执行一次descriptor-relative record unlink并fsync父目录，然后立即
-`RefreshInventory`。unlink前crash保留旧record；unlink后至directory fsync acknowledgement之间crash由相同
-exact absence和checkpoint重验只补同一目录fsync。malformed/foreign/temp/rename-recreate ABA record绝不删除。
+`RefreshInventory`。unlink前先no-replace发布并fsync attempt-specific retirement receipt；它绑定旧checkpoint
+完整digest/token、record canonical bytes及path/device/inode/length/SHA-256、session/inventory epoch和read
+position。receipt publication、record unlink及父目录fsync任一窗口crash后都从这份durable receipt恢复，不能靠
+进程内bool；malformed/foreign/rename-recreate ABA record绝不删除。
 下一轮新的accepted full scan再次确认旧attempt exact absent后，才可只replace checkpoint中的
 `process_identity_token`及timestamp；scope、control socket、data directory、provision transition、request及
-stable target-control authorization context全部不变。target artifact按原inode/bytes重放，新token进程完成
+stable target-control authorization context全部不变。该full admission必须在session/inventory/read-position上
+严格后继receipt所记admission；同坐标重放拒绝，Agent restart后的更高session可接受。target artifact按原inode/bytes重放，新token进程完成
 exact target handshake后发布新的no-replace record。旧进程晚归只能在后续global scan成为typed conflict/显式
 stop候选，不能按unit名称清理，也不能在retirement或token rotation轮顺带停止。
+
+scanner对target/record/retirement receipt做provider-private typed分类，不把文件名当白名单。
+`provision_root_image`按current checkpoint或receipt的exact token-only predecessor闭合；CAS进入
+`prepare_device.after_root_provision`后，必须由handoff predecessor digest、record完整内容及物理identity、
+target identity和current attachment/head/serving lineage共同闭合。`direct_authorized_attachment`不得夹带这些
+Root handoff artifacts。三种deterministic `.tmp`只允许serialized pre-scan每轮处理一个：持有attachment flock
+和current checkpoint guard，确认regular/0600/single-link及exact lineage后只unlink+fsync，绝不发布temp；然后
+必须重新fresh full scan。unsafe、foreign、corrupt或多个temp均fail closed。
 
 `prepare_device`完整绑定attachment id/epoch、typed `AcquireOrigin`、exact head、immutable size及durability；
 `serving_authority`是closed provenance。`after_root_provision`只用于上述首次Root handoff，携record的
