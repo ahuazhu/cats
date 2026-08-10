@@ -6248,7 +6248,7 @@ mod tests {
     }
 
     #[test]
-    fn kernel_nbd_prepare_network_physical_round_uses_the_bound_device_proof() {
+    fn kernel_nbd_prepare_network_recovers_serving_then_device_before_tap() {
         let mut fixture = fixture();
         complete_old_process_retirement(&mut fixture);
         replace_with_kernel_nbd_prepare_device(&mut fixture);
@@ -6280,7 +6280,84 @@ mod tests {
             fixture.stored_checkpoint.checkpoint().step,
             ReconcileStep::PrepareNetwork { .. }
         ));
+        let prepare_network_digest = fixture.stored_checkpoint.content_digest().clone();
 
+        // Round one owns only the absent serving process and forces a fresh
+        // full scan before the frontend effect may observe its listener.
+        let restarted_serving = Arc::new(FakeServingBlockdPort::new(
+            [ServingBlockdProcessInspectionKind::Absent],
+            ServingBlockdProcessStart::Submitted,
+        ));
+        let serving_absent_context = with_absent_network_admission(
+            absent_effect_context(&fixture),
+            fixture.stored_checkpoint.checkpoint(),
+        );
+        assert_eq!(
+            serving_effect(&fixture, Arc::clone(&restarted_serving))
+                .try_apply(&serving_absent_context, &fixture.acquired.desired)
+                .unwrap(),
+            Some(RuntimeDesiredEffectOutcome::RefreshInventory)
+        );
+        assert_eq!(restarted_serving.starts.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            current_runtime_checkpoint(&fixture).content_digest(),
+            &prepare_network_digest
+        );
+
+        // Round two proves the restarted listener exact while the durable NBD
+        // reservation remains physically absent, then submits exactly once.
+        let expected = serving_expectation(&fixture);
+        let exact_serving = expected
+            .clone()
+            .prove_exact_process(expected.exact_evidence_for_test(51))
+            .unwrap();
+        let attach_context = with_absent_network_admission(
+            effect_context_with_processes(
+                &fixture,
+                vec![exact_serving.clone().into_process_evidence()],
+            ),
+            fixture.stored_checkpoint.checkpoint(),
+        );
+        let pool = KernelNbdPoolScanAdmission::absent_for_test(
+            attach_context.accepted_full().unwrap().observation(),
+            fixture.stored_checkpoint.checkpoint(),
+            exact_serving.listener_proof(),
+        )
+        .unwrap();
+        let attach_context = attach_context.with_kernel_nbd_pool_for_test(pool);
+        let steady_serving = Arc::new(FakeServingBlockdPort::new(
+            [ServingBlockdProcessInspectionKind::Exact],
+            ServingBlockdProcessStart::Submitted,
+        ));
+        assert_eq!(
+            serving_effect(&fixture, Arc::clone(&steady_serving))
+                .try_apply(&attach_context, &fixture.acquired.desired)
+                .unwrap(),
+            None
+        );
+        assert_eq!(steady_serving.starts.load(Ordering::SeqCst), 0);
+        let attach = Arc::new(FakeKernelNbdAttachPort {
+            behavior: KernelAttachBehavior::OutcomeUnknown,
+            calls: AtomicUsize::new(0),
+        });
+        let attach_effect = KernelNbdAttachEffect::for_test(
+            Arc::new(FixedEffectAuthority::new(fixture.authority.volume.clone())),
+            attach.clone(),
+        );
+        assert_eq!(
+            attach_effect
+                .try_apply(&attach_context, &fixture.acquired.desired)
+                .unwrap(),
+            Some(RuntimeDesiredEffectOutcome::RefreshInventory)
+        );
+        assert_eq!(attach.calls.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            current_runtime_checkpoint(&fixture).content_digest(),
+            &prepare_network_digest
+        );
+
+        // Only a third accepted full with the exact NBD client can reach the
+        // independent TAP effect.
         let physical_context = with_absent_network_admission(
             with_exact_kernel_nbd_admission(
                 &fixture,
@@ -6315,6 +6392,10 @@ mod tests {
         );
         assert_eq!(events.creates.load(Ordering::SeqCst), 1);
         assert_eq!(events.publish_attempts.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            current_runtime_checkpoint(&fixture).content_digest(),
+            &prepare_network_digest
+        );
     }
 
     #[test]

@@ -2,7 +2,8 @@
 //! kernel-NBD frontend.
 //!
 //! A `/dev/nbdN` path becomes part of a `PrepareDevice` checkpoint before the
-//! attach effect. Two concurrent Cats must therefore serialize the sequence
+//! attach effect and remains in every launch successor. Two concurrent Cats
+//! must therefore serialize the sequence
 //! "read every durable reservation -> prove the slot free -> fsync the new
 //! checkpoint". [`KernelNbdAllocationPermit`] retains the Node-global flock
 //! and one exact pool snapshot across that caller-owned checkpoint replace.
@@ -45,11 +46,13 @@ use super::clean_slate_probes::{
     snapshot_runtime_checkpoint_namespace, RuntimeCheckpointNamespaceSnapshot,
     CHECKPOINT_NAMESPACE, RUNTIME_CHECKPOINT_NAMESPACE_ENTRY_LIMIT,
 };
+use super::network::{prepare_network_volume_admission_is_exact, prepared_device_input};
 use super::prepare_device_retirement::prepare_device_base_admission_is_exact;
 use super::root_provision_process::NodeGlobalManagedProcessScanAdmission;
 use super::serving_blockd_process::ServingBlockdListenerProof;
 use super::serving_handoff::ServingHandoffStore;
 use super::serving_handoff_effect::checkpoint_is_current_exact;
+use super::signed_root_provision::signed_inventory_admission_is_exact_with_networks;
 
 const ALLOCATION_LOCK_BASENAME: &str = "kernel-nbd-allocation.lock";
 const MAX_SYSFS_ATTRIBUTE_BYTES: u64 = 64;
@@ -225,23 +228,25 @@ impl KernelNbdAttachRequest {
     }
 
     fn from_runtime_checkpoint(checkpoint: &RuntimeCheckpoint) -> Result<Self> {
-        let ReconcileStep::PrepareDevice {
+        let prepared = prepared_device_input(checkpoint)
+            .context("kernel-NBD attach requires retained PrepareDevice authority")?;
+        let PreparedDeviceInput {
             volume_id,
             attachment_id,
             attachment_epoch,
             size_bytes,
             ownership_token,
             serving_process,
-            frontend:
-                PrepareDeviceFrontend::KernelNbd {
-                    listener_socket_path,
-                    device_path,
-                    ..
-                },
+            frontend,
             ..
-        } = &checkpoint.step
+        } = prepared;
+        let PrepareDeviceFrontend::KernelNbd {
+            listener_socket_path,
+            device_path,
+            ..
+        } = frontend
         else {
-            anyhow::bail!("kernel-NBD attach requires an exact PrepareDevice checkpoint")
+            anyhow::bail!("kernel-NBD attach checkpoint selects another frontend")
         };
         anyhow::ensure!(
             size_bytes % 512 == 0,
@@ -252,15 +257,15 @@ impl KernelNbdAttachRequest {
             .context("kernel-NBD checkpoint size has no positive sector capacity")?;
         Ok(Self {
             checkpoint_content_digest: checkpoint_content_digest(checkpoint)
-                .context("digest kernel-NBD PrepareDevice checkpoint")?,
+                .context("digest kernel-NBD attach checkpoint")?,
             cat_id: checkpoint.cat_id.clone(),
-            volume_id: volume_id.clone(),
-            attachment_id: attachment_id.clone(),
-            attachment_epoch: *attachment_epoch,
-            ownership_token: ownership_token.clone(),
-            serving_process_identity_token: serving_process.process_identity_token.clone(),
-            listener_socket_path: listener_socket_path.clone(),
-            device_path: device_path.clone(),
+            volume_id,
+            attachment_id,
+            attachment_epoch,
+            ownership_token,
+            serving_process_identity_token: serving_process.process_identity_token,
+            listener_socket_path,
+            device_path,
             expected_size_sectors,
         })
     }
@@ -361,6 +366,10 @@ impl KernelNbdDeviceExpectation {
             && self.expected_size_sectors == request.expected_size_sectors
     }
 
+    fn matches_prepared_device(&self, cat_id: &Id, prepared: &PreparedDeviceInput) -> bool {
+        self.cat_id == *cat_id && self.prepared_device == *prepared
+    }
+
     fn observed_device(&self) -> ObservedDevice {
         ObservedDevice::KernelNbd {
             guest_device: self.guest_device.clone(),
@@ -418,7 +427,7 @@ impl ExactKernelNbdDeviceProof {
         cat_id: &Id,
         prepared: &PreparedDeviceInput,
     ) -> bool {
-        self.expected.cat_id == *cat_id && self.expected.prepared_device == *prepared
+        self.expected.matches_prepared_device(cat_id, prepared)
     }
 }
 
@@ -487,13 +496,27 @@ pub(crate) struct KernelNbdPoolAdmission {
 
 impl KernelNbdPoolScanAdmission {
     #[cfg(test)]
+    fn expectation_for_test(checkpoint: &RuntimeCheckpoint) -> Result<KernelNbdDeviceExpectation> {
+        let expected = match &checkpoint.step {
+            ReconcileStep::PrepareNetwork { devices, .. }
+            | ReconcileStep::StartRuntime { devices, .. } => {
+                let [device] = devices.as_slice() else {
+                    anyhow::bail!("test kernel-NBD admission requires one prepared device")
+                };
+                KernelNbdDeviceExpectation::from_prepared_device(&checkpoint.cat_id, device)?
+            }
+            _ => KernelNbdDeviceExpectation::from_prepare_device(checkpoint)?,
+        };
+        expected.context("test kernel-NBD admission requires a kernel-NBD prepared device")
+    }
+
+    #[cfg(test)]
     pub(super) fn absent_for_test(
         observation: &NodeObservation,
         checkpoint: &RuntimeCheckpoint,
         listener: ServingBlockdListenerProof,
     ) -> Result<KernelNbdPoolAdmission> {
-        let expected = KernelNbdDeviceExpectation::from_prepare_device(checkpoint)?
-            .context("test kernel-NBD admission requires PrepareDevice")?;
+        let expected = Self::expectation_for_test(checkpoint)?;
         expected.assert_serving_listener(&listener)?;
         Self {
             devices_by_cat: BTreeMap::from([(
@@ -513,17 +536,7 @@ impl KernelNbdPoolScanAdmission {
         checkpoint: &RuntimeCheckpoint,
         listener: ServingBlockdListenerProof,
     ) -> Result<KernelNbdPoolAdmission> {
-        let expected = match &checkpoint.step {
-            ReconcileStep::PrepareNetwork { devices, .. }
-            | ReconcileStep::StartRuntime { devices, .. } => {
-                let [device] = devices.as_slice() else {
-                    anyhow::bail!("test kernel-NBD admission requires one prepared device")
-                };
-                KernelNbdDeviceExpectation::from_prepared_device(&checkpoint.cat_id, device)?
-            }
-            _ => KernelNbdDeviceExpectation::from_prepare_device(checkpoint)?,
-        }
-        .context("test kernel-NBD admission requires a kernel-NBD prepared device")?;
+        let expected = Self::expectation_for_test(checkpoint)?;
         expected.assert_serving_listener(&listener)?;
         let client = KernelNbdClientIdentity {
             process_id: 47,
@@ -1892,10 +1905,11 @@ impl KernelNbdAttachPort for PlatformKernelNbdAttachPort {
     }
 }
 
-/// Production `PrepareDevice` kernel-NBD effect. The accepted pool admission
-/// decides only whether this batch may attempt the effect; the sealed attach
-/// port still performs a new allocation-flock-protected namespace/pool scan,
-/// checkpoint guard and retained-listener revalidation at the submit edge.
+/// Production kernel-NBD effect for `PrepareDevice` and its retained
+/// `PrepareNetwork` successor. The accepted pool admission decides only
+/// whether this batch may attempt the effect; the sealed attach port still
+/// performs a new allocation-flock-protected namespace/pool scan, checkpoint
+/// guard and retained-listener revalidation at the submit edge.
 pub(crate) struct KernelNbdAttachEffect {
     authority: Arc<dyn VolumeDataAuthority>,
     attach: Arc<dyn KernelNbdAttachPort>,
@@ -1940,23 +1954,55 @@ impl KernelNbdAttachEffect {
             runtimes.next().is_none(),
             "kernel-NBD admission duplicates one Cat"
         );
-        let ReconcileStep::PrepareDevice {
-            frontend: PrepareDeviceFrontend::KernelNbd { .. },
-            ..
-        } = &runtime.step
-        else {
-            return Ok(None);
+        let prepare_network_device = match &runtime.step {
+            ReconcileStep::PrepareDevice {
+                frontend: PrepareDeviceFrontend::KernelNbd { .. },
+                ..
+            } => {
+                if !prepare_device_base_admission_is_exact(accepted, desired, runtime) {
+                    return Ok(Some(RuntimeDesiredEffectOutcome::Stop(
+                        RuntimeDesiredEffectStopReason::LocalContract,
+                    )));
+                }
+                None
+            }
+            ReconcileStep::PrepareNetwork { network, devices } => {
+                let [device] = devices.as_slice() else {
+                    return Ok(Some(RuntimeDesiredEffectOutcome::Stop(
+                        RuntimeDesiredEffectStopReason::LocalContract,
+                    )));
+                };
+                if !matches!(&device.frontend, PrepareDeviceFrontend::KernelNbd { .. }) {
+                    return Ok(None);
+                }
+                let Some(expected_networks) = context
+                    .node_global_network()?
+                    .expected_networks(&desired.cat_id, network)
+                else {
+                    return Ok(Some(RuntimeDesiredEffectOutcome::Stop(
+                        RuntimeDesiredEffectStopReason::LocalContract,
+                    )));
+                };
+                if !signed_inventory_admission_is_exact_with_networks(
+                    accepted,
+                    desired,
+                    runtime,
+                    &expected_networks,
+                ) || !checkpoint_is_current_exact(desired, runtime)
+                {
+                    return Ok(Some(RuntimeDesiredEffectOutcome::Stop(
+                        RuntimeDesiredEffectStopReason::LocalContract,
+                    )));
+                }
+                Some(device)
+            }
+            _ => return Ok(None),
         };
         let admission = context.kernel_nbd_pool()?;
         anyhow::ensure!(
             admission.matches_observation(accepted.observation()),
             "kernel-NBD pool admission is not bound to the accepted full observation"
         );
-        if !prepare_device_base_admission_is_exact(accepted, desired, runtime) {
-            return Ok(Some(RuntimeDesiredEffectOutcome::Stop(
-                RuntimeDesiredEffectStopReason::LocalContract,
-            )));
-        }
         if !checkpoint_is_current_exact(desired, runtime) {
             return Ok(None);
         }
@@ -1966,7 +2012,6 @@ impl KernelNbdAttachEffect {
                 && runtime.runtime_incarnation.is_none()
                 && runtime.stable_state.is_none()
                 && runtime.mounts.is_empty()
-                && runtime.networks.is_empty()
                 && runtime.routes.is_empty(),
             "kernel-NBD attach is outside the closed pre-launch phase"
         );
@@ -1974,6 +2019,40 @@ impl KernelNbdAttachEffect {
         let state = admission
             .device(&desired.cat_id)
             .context("kernel-NBD accepted full lacks this Cat's durable reservation")?;
+        let prepare_network_contract_is_exact = match (prepare_network_device, state) {
+            (None, _) => true,
+            (Some(device), KernelNbdDeviceScanState::Exact(proof)) => {
+                let (volume_id, observed) = proof.projection();
+                proof.matches_prepared_device(&desired.cat_id, device)
+                    && prepare_network_volume_admission_is_exact(
+                        desired,
+                        runtime,
+                        device,
+                        &volume_id,
+                        Some(&observed),
+                    )
+            }
+            (
+                Some(device),
+                KernelNbdDeviceScanState::Absent { expected, .. }
+                | KernelNbdDeviceScanState::Leaked { expected, .. }
+                | KernelNbdDeviceScanState::Unavailable { expected, .. },
+            ) => {
+                expected.matches_prepared_device(&desired.cat_id, device)
+                    && prepare_network_volume_admission_is_exact(
+                        desired,
+                        runtime,
+                        device,
+                        &expected.volume_id,
+                        None,
+                    )
+            }
+        };
+        if !prepare_network_contract_is_exact {
+            return Ok(Some(RuntimeDesiredEffectOutcome::Stop(
+                RuntimeDesiredEffectStopReason::LocalContract,
+            )));
+        }
         match state {
             KernelNbdDeviceScanState::Exact(proof) => {
                 let (volume_id, projected) = proof.projection();
@@ -2027,14 +2106,12 @@ impl KernelNbdAttachEffect {
                     &checkpoint_directory,
                     &desired.cat_id,
                 )
-                .context("open kernel-NBD PrepareDevice checkpoint")?;
+                .context("open kernel-NBD attach checkpoint")?;
                 anyhow::ensure!(
                     store.path() == Path::new(checkpoint_path.as_str()),
                     "kernel-NBD admission names another checkpoint path"
                 );
-                let Some(stored) = store
-                    .load()
-                    .context("load kernel-NBD PrepareDevice checkpoint")?
+                let Some(stored) = store.load().context("load kernel-NBD attach checkpoint")?
                 else {
                     return Ok(Some(RuntimeDesiredEffectOutcome::RefreshInventory));
                 };
