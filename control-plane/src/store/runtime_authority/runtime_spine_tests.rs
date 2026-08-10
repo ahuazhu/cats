@@ -106,9 +106,28 @@ fn fixture_at(
     (store, identity, authenticated, policy, session)
 }
 
+fn desired_read_raw_rows(store: &Store) -> String {
+    store
+        .with(|client| {
+            client
+                .query_one(
+                    "SELECT COALESCE(
+                         jsonb_agg(to_jsonb(state_row) ORDER BY state_row.node_id),
+                         '[]'::jsonb
+                     )::text
+                       FROM runtime_desired_read_states AS state_row",
+                    &[],
+                )
+                .map(|row| row.get(0))
+        })
+        .unwrap()
+}
+
 #[test]
-fn request_commit_response_loss_stops_internal_replay_and_exact_retry_recovers() {
-    let (store, _identity, authenticated, _policy, session) = fixture();
+fn cancellation_after_commit_ownership_still_commits_and_exact_retry_recovers() {
+    let url = crate::testsupport::isolated_control_store_url();
+    let (store, _identity, authenticated, _policy, session) = fixture_at(&url);
+    let observer = Store::connect(&url, None).unwrap();
     let request = cats_api::runtime_reconciliation::DesiredReadRequest {
         version: ContractVersion::V1,
         session: binding(&session),
@@ -116,9 +135,29 @@ fn request_commit_response_loss_stops_internal_replay_and_exact_retry_recovers()
     };
     store.inject_committed_response_loss_once();
     let first_context = AuthorityRequestContext::new(Instant::now() + Duration::from_secs(5));
-    let error = store
-        .runtime_desired_read_for_request(&authenticated, &request, &first_context)
-        .unwrap_err();
+    let entered = Arc::new(Barrier::new(2));
+    let release = Arc::new(Barrier::new(2));
+    first_context.pause_after_commit_claim_for_test(Arc::clone(&entered), Arc::clone(&release));
+    let worker_context = first_context.clone();
+    let worker_authenticated = authenticated.clone();
+    let worker_request = request.clone();
+    let worker = std::thread::spawn(move || {
+        store.runtime_desired_read_for_request(
+            &worker_authenticated,
+            &worker_request,
+            &worker_context,
+        )
+    });
+
+    entered.wait();
+    assert!(first_context.commit_was_attempted());
+    // This is the same cancellation edge used by the A20 handler deadline
+    // and CancelRequestOnDrop after the blocking worker owns COMMIT send.
+    first_context.cancel();
+    assert!(first_context.commit_was_attempted());
+    release.wait();
+    let error = worker.join().unwrap().unwrap_err();
+
     assert_eq!(error.code, ErrorCode::Unavailable);
     assert!(
         first_context.commit_was_attempted(),
@@ -127,12 +166,88 @@ fn request_commit_response_loss_stops_internal_replay_and_exact_retry_recovers()
 
     let retry_context = AuthorityRequestContext::new(Instant::now() + Duration::from_secs(5));
     let replay = accepted(
-        store
+        observer
             .runtime_desired_read_for_request(&authenticated, &request, &retry_context)
             .unwrap(),
     );
     assert_eq!(replay.request_sequence, request.request_sequence);
     assert!(replay.desired_specs.is_empty());
+}
+
+#[test]
+fn cancellation_before_definite_commit_reset_prevents_retry_without_any_row_change() {
+    let url = crate::testsupport::isolated_control_store_url();
+    let (store, _identity, authenticated, _policy, session) = fixture_at(&url);
+    store
+        .with(|client| {
+            client.batch_execute(
+                "CREATE SEQUENCE a20_operation_attempts;
+                 CREATE SEQUENCE a20_commit_attempts;
+                 CREATE FUNCTION count_a20_operation_for_test()
+                 RETURNS trigger LANGUAGE plpgsql AS $$
+                 BEGIN
+                   PERFORM nextval('a20_operation_attempts');
+                   RETURN NEW;
+                 END
+                 $$;
+                 CREATE TRIGGER count_a20_operation_for_test
+                   BEFORE INSERT ON runtime_desired_read_states
+                   FOR EACH ROW EXECUTE FUNCTION count_a20_operation_for_test();
+                 CREATE FUNCTION fail_a20_commit_for_test()
+                 RETURNS trigger LANGUAGE plpgsql AS $$
+                 BEGIN
+                   PERFORM nextval('a20_commit_attempts');
+                   RAISE EXCEPTION 'injected definite COMMIT failure'
+                     USING ERRCODE = '40001';
+                 END
+                 $$;
+                 CREATE CONSTRAINT TRIGGER fail_a20_commit_for_test
+                   AFTER INSERT ON runtime_desired_read_states
+                   DEFERRABLE INITIALLY DEFERRED
+                   FOR EACH ROW EXECUTE FUNCTION fail_a20_commit_for_test();",
+            )
+        })
+        .unwrap();
+    let before = desired_read_raw_rows(&store);
+    let observer = Store::connect(&url, None).unwrap();
+    let request = cats_api::runtime_reconciliation::DesiredReadRequest {
+        version: ContractVersion::V1,
+        session: binding(&session),
+        request_sequence: Sequence::new(1).unwrap(),
+    };
+    let context = AuthorityRequestContext::new(Instant::now() + Duration::from_secs(5));
+    let entered = Arc::new(Barrier::new(2));
+    let release = Arc::new(Barrier::new(2));
+    context.pause_before_definite_commit_reset_for_test(Arc::clone(&entered), Arc::clone(&release));
+    let worker_context = context.clone();
+    let worker = std::thread::spawn(move || {
+        store.runtime_desired_read_for_request(&authenticated, &request, &worker_context)
+    });
+
+    entered.wait();
+    assert!(context.commit_was_attempted());
+    assert_eq!(desired_read_raw_rows(&observer), before);
+    context.cancel();
+    assert!(context.commit_was_attempted());
+    release.wait();
+    let error = worker.join().unwrap().unwrap_err();
+
+    assert_eq!(error.code, ErrorCode::Unavailable);
+    assert!(!context.commit_was_attempted());
+    assert_eq!(desired_read_raw_rows(&observer), before);
+    let attempts: (i64, bool, i64, bool) = observer
+        .with(|client| {
+            let row = client.query_one(
+                "SELECT operation.last_value, operation.is_called,
+                        commit_attempt.last_value, commit_attempt.is_called
+                   FROM a20_operation_attempts AS operation
+                   CROSS JOIN a20_commit_attempts AS commit_attempt",
+                &[],
+            )?;
+            Ok((row.get(0), row.get(1), row.get(2), row.get(3)))
+        })
+        .unwrap();
+    assert_eq!(attempts, (1, true, 1, true));
 }
 
 #[test]

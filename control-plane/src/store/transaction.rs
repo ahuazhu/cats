@@ -2,7 +2,7 @@
 
 use std::error::Error as _;
 use std::io::ErrorKind;
-use std::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicU8, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -19,20 +19,21 @@ static RETRY_JITTER_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 /// Cancellation/deadline state shared by an HTTP request and the blocking
 /// authority worker that may outlive its async caller.
 ///
-/// A queued worker observes it before opening a transaction. A started worker
-/// checks it immediately before commit, so dropping or timing out the handler
-/// cannot cause a delayed mutation. Cancellation racing an already-started
-/// PostgreSQL COMMIT remains an intentionally ambiguous result recovered by
-/// the domain's exact replay key.
+/// A queued worker observes it before opening a transaction. Immediately before
+/// calling PostgreSQL COMMIT, the worker atomically claims irreversible send
+/// ownership. Cancellation wins by changing `Open` to `Cancelled` before that
+/// claim; afterward it remains sticky without revoking the commit owner, and
+/// the domain's exact replay key resolves any ambiguous response.
 #[derive(Clone)]
 pub(crate) struct AuthorityRequestContext {
     deadline: Instant,
-    cancel_requested: Arc<AtomicBool>,
     phase: Arc<AtomicU8>,
     #[cfg(test)]
     before_commit_claim: Arc<std::sync::Mutex<Option<CommitClaimBarrier>>>,
     #[cfg(test)]
     after_commit_claim: Arc<std::sync::Mutex<Option<CommitClaimBarrier>>>,
+    #[cfg(test)]
+    before_definite_commit_reset: Arc<std::sync::Mutex<Option<CommitClaimBarrier>>>,
 }
 
 #[cfg(test)]
@@ -42,29 +43,155 @@ struct CommitClaimBarrier {
     release: Arc<std::sync::Barrier>,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[repr(u8)]
 enum AuthorityRequestPhase {
     Open = 0,
     Cancelled = 1,
-    CommitAttempted = 2,
+    CommitOwned = 2,
+    CommitOwnedCancelled = 3,
+}
+
+impl AuthorityRequestPhase {
+    fn from_raw(raw: u8) -> Self {
+        match raw {
+            0 => Self::Open,
+            1 => Self::Cancelled,
+            2 => Self::CommitOwned,
+            3 => Self::CommitOwnedCancelled,
+            _ => {
+                unreachable!("authority request phase is written only by the closed state machine")
+            }
+        }
+    }
+
+    const fn raw(self) -> u8 {
+        self as u8
+    }
+
+    const fn is_commit_owned(self) -> bool {
+        matches!(self, Self::CommitOwned | Self::CommitOwnedCancelled)
+    }
+}
+
+trait AuthorityPhaseAtomic {
+    fn load_phase(&self, order: Ordering) -> u8;
+
+    fn compare_exchange_phase(
+        &self,
+        current: u8,
+        new: u8,
+        success: Ordering,
+        failure: Ordering,
+    ) -> std::result::Result<u8, u8>;
+}
+
+impl AuthorityPhaseAtomic for AtomicU8 {
+    fn load_phase(&self, order: Ordering) -> u8 {
+        self.load(order)
+    }
+
+    fn compare_exchange_phase(
+        &self,
+        current: u8,
+        new: u8,
+        success: Ordering,
+        failure: Ordering,
+    ) -> std::result::Result<u8, u8> {
+        self.compare_exchange(current, new, success, failure)
+    }
+}
+
+#[cfg(test)]
+impl AuthorityPhaseAtomic for loom::sync::atomic::AtomicU8 {
+    fn load_phase(&self, order: Ordering) -> u8 {
+        self.load(order)
+    }
+
+    fn compare_exchange_phase(
+        &self,
+        current: u8,
+        new: u8,
+        success: Ordering,
+        failure: Ordering,
+    ) -> std::result::Result<u8, u8> {
+        self.compare_exchange(current, new, success, failure)
+    }
+}
+
+fn request_cancel<A: AuthorityPhaseAtomic>(phase: &A) {
+    let mut current = AuthorityRequestPhase::from_raw(phase.load_phase(Ordering::Acquire));
+    loop {
+        let next = match current {
+            AuthorityRequestPhase::Open => AuthorityRequestPhase::Cancelled,
+            AuthorityRequestPhase::CommitOwned => AuthorityRequestPhase::CommitOwnedCancelled,
+            AuthorityRequestPhase::Cancelled | AuthorityRequestPhase::CommitOwnedCancelled => {
+                return;
+            }
+        };
+        match phase.compare_exchange_phase(
+            current.raw(),
+            next.raw(),
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        ) {
+            Ok(_) => return,
+            Err(observed) => current = AuthorityRequestPhase::from_raw(observed),
+        }
+    }
+}
+
+fn try_claim_commit<A: AuthorityPhaseAtomic>(phase: &A) -> bool {
+    phase
+        .compare_exchange_phase(
+            AuthorityRequestPhase::Open.raw(),
+            AuthorityRequestPhase::CommitOwned.raw(),
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        )
+        .is_ok()
+}
+
+fn reset_definite_commit<A: AuthorityPhaseAtomic>(phase: &A) -> bool {
+    let mut current = AuthorityRequestPhase::from_raw(phase.load_phase(Ordering::Acquire));
+    loop {
+        let next = match current {
+            AuthorityRequestPhase::CommitOwned => AuthorityRequestPhase::Open,
+            AuthorityRequestPhase::CommitOwnedCancelled => AuthorityRequestPhase::Cancelled,
+            AuthorityRequestPhase::Open | AuthorityRequestPhase::Cancelled => return false,
+        };
+        match phase.compare_exchange_phase(
+            current.raw(),
+            next.raw(),
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        ) {
+            Ok(_) => return true,
+            Err(observed) => current = AuthorityRequestPhase::from_raw(observed),
+        }
+    }
+}
+
+fn load_request_phase<A: AuthorityPhaseAtomic>(phase: &A) -> AuthorityRequestPhase {
+    AuthorityRequestPhase::from_raw(phase.load_phase(Ordering::Acquire))
 }
 
 impl AuthorityRequestContext {
     pub(crate) fn new(deadline: Instant) -> Self {
         Self {
             deadline,
-            cancel_requested: Arc::new(AtomicBool::new(false)),
-            phase: Arc::new(AtomicU8::new(AuthorityRequestPhase::Open as u8)),
+            phase: Arc::new(AtomicU8::new(AuthorityRequestPhase::Open.raw())),
             #[cfg(test)]
             before_commit_claim: Arc::new(std::sync::Mutex::new(None)),
             #[cfg(test)]
             after_commit_claim: Arc::new(std::sync::Mutex::new(None)),
+            #[cfg(test)]
+            before_definite_commit_reset: Arc::new(std::sync::Mutex::new(None)),
         }
     }
 
     pub(crate) fn cancel(&self) {
-        self.cancel_requested.store(true, Ordering::Release);
-        self.cancel_open_request();
+        request_cancel(self.phase.as_ref());
     }
 
     pub(crate) fn is_cancelled_or_expired(&self) -> bool {
@@ -72,11 +199,10 @@ impl AuthorityRequestContext {
     }
 
     fn must_rollback(&self) -> bool {
-        if self.cancel_requested.load(Ordering::Acquire) || Instant::now() >= self.deadline {
-            self.cancel_open_request();
-            return true;
+        if Instant::now() >= self.deadline {
+            self.cancel();
         }
-        self.phase.load(Ordering::Acquire) == AuthorityRequestPhase::Cancelled as u8
+        load_request_phase(self.phase.as_ref()) == AuthorityRequestPhase::Cancelled
     }
 
     fn remaining_timeout_millis(&self) -> Option<u64> {
@@ -88,35 +214,19 @@ impl AuthorityRequestContext {
         (millis > 0).then_some(millis)
     }
 
-    /// Atomically choose the pre-COMMIT winner. Cancellation observed before
-    /// the post-CAS check rolls the transaction back; after that check the
-    /// commit owner has won and any cancellation is resolved as ambiguous.
+    /// Atomically choose the pre-COMMIT winner. `Open -> CommitOwned` is the
+    /// irreversible send-owner linearization point. Any later cancellation is
+    /// sticky but cannot make this worker roll back instead of calling COMMIT.
     fn try_begin_commit(&self) -> bool {
         if self.must_rollback() {
             return false;
         }
         #[cfg(test)]
         self.wait_at_commit_barrier(&self.before_commit_claim);
-        if self
-            .phase
-            .compare_exchange(
-                AuthorityRequestPhase::Open as u8,
-                AuthorityRequestPhase::CommitAttempted as u8,
-                Ordering::AcqRel,
-                Ordering::Acquire,
-            )
-            .is_err()
-        {
-            return false;
+        if Instant::now() >= self.deadline {
+            self.cancel();
         }
-        if self.cancel_requested.load(Ordering::Acquire) || Instant::now() >= self.deadline {
-            let changed = self.phase.compare_exchange(
-                AuthorityRequestPhase::CommitAttempted as u8,
-                AuthorityRequestPhase::Cancelled as u8,
-                Ordering::AcqRel,
-                Ordering::Acquire,
-            );
-            debug_assert!(changed.is_ok(), "request commit claim changed unexpectedly");
+        if !try_claim_commit(self.phase.as_ref()) {
             return false;
         }
         #[cfg(test)]
@@ -129,15 +239,12 @@ impl AuthorityRequestContext {
     /// the closed transaction is replayed so an exhausted definite retry is
     /// not mislabeled as an unknown commit result by the HTTP owner.
     fn reset_after_definite_commit_failure(&self) {
-        let reset = self.phase.compare_exchange(
-            AuthorityRequestPhase::CommitAttempted as u8,
-            AuthorityRequestPhase::Open as u8,
-            Ordering::AcqRel,
-            Ordering::Acquire,
-        );
-        debug_assert!(reset.is_ok(), "only a claimed COMMIT attempt can reset");
-        if self.cancel_requested.load(Ordering::Acquire) || Instant::now() >= self.deadline {
-            self.cancel_open_request();
+        #[cfg(test)]
+        self.wait_at_commit_barrier(&self.before_definite_commit_reset);
+        let reset = reset_definite_commit(self.phase.as_ref());
+        debug_assert!(reset, "only a claimed COMMIT attempt can reset");
+        if Instant::now() >= self.deadline {
+            self.cancel();
         }
     }
 
@@ -146,16 +253,7 @@ impl AuthorityRequestContext {
     /// before that result crosses the executor channel; such a response must
     /// still close and let exact replay resolve what the client observed.
     pub(crate) fn commit_was_attempted(&self) -> bool {
-        self.phase.load(Ordering::Acquire) == AuthorityRequestPhase::CommitAttempted as u8
-    }
-
-    fn cancel_open_request(&self) {
-        let _ = self.phase.compare_exchange(
-            AuthorityRequestPhase::Open as u8,
-            AuthorityRequestPhase::Cancelled as u8,
-            Ordering::AcqRel,
-            Ordering::Acquire,
-        );
+        load_request_phase(self.phase.as_ref()).is_commit_owned()
     }
 
     #[cfg(test)]
@@ -179,6 +277,19 @@ impl AuthorityRequestContext {
     ) {
         *self
             .after_commit_claim
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) =
+            Some(CommitClaimBarrier { entered, release });
+    }
+
+    #[cfg(test)]
+    pub(crate) fn pause_before_definite_commit_reset_for_test(
+        &self,
+        entered: Arc<std::sync::Barrier>,
+        release: Arc<std::sync::Barrier>,
+    ) {
+        *self
+            .before_definite_commit_reset
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner) =
             Some(CommitClaimBarrier { entered, release });
@@ -851,6 +962,7 @@ mod request_context_tests {
         let context = AuthorityRequestContext::new(Instant::now() + Duration::from_secs(1));
         assert!(!context.commit_was_attempted());
         assert!(context.try_begin_commit());
+        context.cancel();
         assert!(context.commit_was_attempted());
     }
 
@@ -874,5 +986,47 @@ mod request_context_tests {
         assert!(!context.commit_was_attempted());
         assert!(context.must_rollback());
         assert!(!context.try_begin_commit());
+    }
+
+    #[test]
+    fn loom_cancel_and_commit_claim_have_exactly_one_winner() {
+        loom::model(|| {
+            let phase = loom::sync::Arc::new(loom::sync::atomic::AtomicU8::new(
+                AuthorityRequestPhase::Open.raw(),
+            ));
+            let cancel_phase = loom::sync::Arc::clone(&phase);
+            let cancel = loom::thread::spawn(move || request_cancel(cancel_phase.as_ref()));
+            let claim_phase = loom::sync::Arc::clone(&phase);
+            let claim = loom::thread::spawn(move || try_claim_commit(claim_phase.as_ref()));
+
+            let claimed = claim.join().unwrap();
+            cancel.join().unwrap();
+            let final_phase = load_request_phase(phase.as_ref());
+            if claimed {
+                assert_eq!(final_phase, AuthorityRequestPhase::CommitOwnedCancelled);
+            } else {
+                assert_eq!(final_phase, AuthorityRequestPhase::Cancelled);
+            }
+        });
+    }
+
+    #[test]
+    fn loom_definite_reset_cannot_lose_a_racing_cancellation() {
+        loom::model(|| {
+            let phase = loom::sync::Arc::new(loom::sync::atomic::AtomicU8::new(
+                AuthorityRequestPhase::CommitOwned.raw(),
+            ));
+            let cancel_phase = loom::sync::Arc::clone(&phase);
+            let cancel = loom::thread::spawn(move || request_cancel(cancel_phase.as_ref()));
+            let reset_phase = loom::sync::Arc::clone(&phase);
+            let reset = loom::thread::spawn(move || reset_definite_commit(reset_phase.as_ref()));
+
+            cancel.join().unwrap();
+            assert!(reset.join().unwrap());
+            assert_eq!(
+                load_request_phase(phase.as_ref()),
+                AuthorityRequestPhase::Cancelled
+            );
+        });
     }
 }

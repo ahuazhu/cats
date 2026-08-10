@@ -83,6 +83,7 @@ ring = "0.17"
 rand = "0.9"
 libc = "0.2"
 tempfile = "3"
+loom = "0.7"
 workos = "2.5"
 jsonwebtoken = { version = "10.4", default-features = false, features = ["aws_lc_rs", "use_pem"] }
 directories = "6"
