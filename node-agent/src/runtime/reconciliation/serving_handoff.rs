@@ -33,10 +33,10 @@ use cats_api::runtime_reconciliation::{
 };
 use cats_blockd::target_control::{
     decode_target_control_authorization, encode_target_control_authorization,
-    provision_root_authorization_context_digest, target_control_authorization_file_name,
-    validate_target_control_attachment, validate_target_control_authorization,
-    StableDirectoryIdentity, StableFileIdentity, TargetControlAuthorizationArtifact,
-    TargetControlAuthorizationCodecError,
+    provision_root_authorization_context_digest, provision_root_image_request,
+    target_control_authorization_file_name, validate_target_control_attachment,
+    validate_target_control_authorization, StableDirectoryIdentity, StableFileIdentity,
+    TargetControlAuthorizationArtifact, TargetControlAuthorizationCodecError,
     TargetControlLocalStateIdentity as ServingHandoffLocalStateIdentity,
     TARGET_CONTROL_AUTHORIZATION_MAX_BYTES as TARGET_AUTHORIZED_SERVING_MAX_BYTES,
 };
@@ -419,6 +419,7 @@ impl ServingHandoffStore {
         let target_artifact = TargetControlAuthorizationArtifact {
             version: ContractVersion::V1,
             provision_transition_id: candidate.provision_transition_id.clone(),
+            request: provision_root_image_request(stored_checkpoint.checkpoint())?,
             provision_context_digest: provision_root_authorization_context_digest(
                 stored_checkpoint.checkpoint(),
             )?,
@@ -1153,8 +1154,10 @@ fn validate_target_checkpoint_context(
     let attachment = &artifact.attachment;
     let provision_context_digest =
         provision_root_authorization_context_digest(checkpoint).map_err(anyhow::Error::from)?;
+    let request = provision_root_image_request(checkpoint).map_err(anyhow::Error::from)?;
     anyhow::ensure!(
         artifact.provision_context_digest == provision_context_digest
+            && artifact.request == request
             && artifact.provision_transition_id == *provision_transition_id
             && checkpoint.node_id == attachment.identity.node_id
             && checkpoint.placement_epoch == attachment.identity.placement_epoch
@@ -3162,6 +3165,13 @@ mod tests {
             ]),
             Err(TargetControlAuthorizationCodecError::WireBytesLimitExceeded { .. })
         ));
+        let mut wrong_request = target.clone();
+        wrong_request.request.boot_image_digest = digest('0');
+        encode_target_control_authorization(&wrong_request)
+            .expect("boot image is closed by the checkpoint context, not the grant alone");
+        assert!(
+            validate_target_checkpoint_context(&wrong_request, &fixture.stored_checkpoint).is_err()
+        );
         drop(control);
 
         let ready = store

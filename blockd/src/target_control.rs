@@ -9,8 +9,8 @@ use std::path::{Component, Path};
 use cats_api::runtime_reconciliation::{
     CheckpointRouteGate, ContractVersion, Epoch, FenceEpoch, GuestTransportEvidence, HostPath, Id,
     LifecycleAdmission, ObservedMount, ObservedNetwork, ObservedVolume, ProcessEvidence,
-    RandomId128, ReconcileStep, RemoteHead, RequireIdleCheckpoint, Revision, RuntimeCheckpoint,
-    Sha256Digest, StableState, WarmSnapshotEvidence, WireU64,
+    ProvisionRootImageRequest, RandomId128, ReconcileStep, RemoteHead, RequireIdleCheckpoint,
+    Revision, RuntimeCheckpoint, Sha256Digest, StableState, WarmSnapshotEvidence, WireU64,
 };
 use cats_storage::authority::{
     validate_authorized_serving_attachment, AuthorizedServingAttachment,
@@ -54,6 +54,7 @@ pub enum TargetControlAuthorizationCodecError {
 pub struct TargetControlAuthorizationArtifact {
     pub version: ContractVersion,
     pub provision_transition_id: RandomId128,
+    pub request: ProvisionRootImageRequest,
     pub provision_context_digest: ProvisionRootAuthorizationContextDigest,
     pub runtime_scope_id: Id,
     pub control_socket_path: HostPath,
@@ -174,6 +175,40 @@ pub fn provision_root_authorization_context_digest(
     ))
 }
 
+/// Projects the complete typed blockd request from one ProvisionRootImage
+/// checkpoint without carrying retryable process-attempt fields.
+pub fn provision_root_image_request(
+    checkpoint: &RuntimeCheckpoint,
+) -> Result<ProvisionRootImageRequest, TargetControlAuthorizationCodecError> {
+    let ReconcileStep::ProvisionRootImage {
+        provision_transition_id,
+        volume_id,
+        attachment_id,
+        attachment_epoch,
+        scope_id: _,
+        control_socket_path: _,
+        data_directory: _,
+        process_identity_token: _,
+        size_bytes,
+        boot_image_digest,
+        expected_blank_head,
+        expected_provisioned_head,
+    } = &checkpoint.step
+    else {
+        return Err(invalid("provision request requires provision_root_image"));
+    };
+    Ok(ProvisionRootImageRequest {
+        provision_transition_id: provision_transition_id.clone(),
+        volume_id: volume_id.clone(),
+        attachment_id: attachment_id.clone(),
+        attachment_epoch: *attachment_epoch,
+        size_bytes: *size_bytes,
+        boot_image_digest: boot_image_digest.clone(),
+        expected_blank_head: expected_blank_head.clone(),
+        expected_provisioned_head: expected_provisioned_head.clone(),
+    })
+}
+
 #[derive(Serialize)]
 struct ProvisionRootAuthorizationContext<'a> {
     version: ContractVersion,
@@ -269,7 +304,16 @@ pub fn validate_target_control_authorization(
     let expected_control_socket =
         Path::new(artifact.local_state.attachment_directory.path.as_str())
             .join("root-provision.sock");
+    let request = &artifact.request;
+    let attachment = &artifact.attachment;
     if artifact.version != ContractVersion::V1
+        || artifact.provision_transition_id != request.provision_transition_id
+        || request.volume_id != attachment.identity.volume_id
+        || request.attachment_id != attachment.identity.attachment_id
+        || request.attachment_epoch != attachment.identity.attachment_epoch
+        || request.size_bytes != attachment.size_bytes
+        || request.expected_blank_head != attachment.acquire_result.resulting_head
+        || request.expected_provisioned_head != attachment.head
         || Path::new(artifact.control_socket_path.as_str()) != expected_control_socket
     {
         return Err(invalid(
@@ -444,7 +488,9 @@ fn invalid(reason: &'static str) -> TargetControlAuthorizationCodecError {
 mod tests {
     use super::*;
 
-    const FIXED_TARGET_CONTROL_AUTHORIZATION: &[u8] = br#"{"attachment":{"acquire_request":{"attachment_id":"att_root","desired_revision":11,"expected_unowned_epoch":6,"lease_duration_ms":60000,"placement_epoch":3,"transition_id":"11111111111111111111111111111111","volume_id":"vol_root"},"acquire_result":{"attachment_id":"att_root","lease_expires_at":1720000060000,"resulting_epoch":7,"resulting_head":{"generation":0,"root_hash":null,"root_object_id":null},"transition_id":"11111111111111111111111111111111","volume_id":"vol_root"},"durability":"strict","head":{"generation":1,"root_hash":"sha256:0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d","root_object_id":"roots/generation-1.node"},"identity":{"acquire_origin":{"kind":"normal","transition_id":"11111111111111111111111111111111"},"attachment_epoch":7,"attachment_id":"att_root","node_id":"node_a","placement_epoch":3,"volume_id":"vol_root"},"lease_expires_at":1720000060000,"size_bytes":4194304},"control_socket_path":"/var/lib/cats/node/state_path_a/data/cat-cat_01/volume-vol_root/attachment-att_root/epoch-7/root-provision.sock","local_state":{"acquire_authorization_file":{"content_sha256":"sha256:7f8916bf692fad3e61120f4033f131c621fe15a8eda5e39927df5f3368616380","device":41,"inode":45,"length":811,"path":"/var/lib/cats/node/state_path_a/data/cat-cat_01/volume-vol_root/attachment-att_root/epoch-7/authorized-serving.json"},"attachment_directory":{"device":41,"inode":43,"path":"/var/lib/cats/node/state_path_a/data/cat-cat_01/volume-vol_root/attachment-att_root/epoch-7"},"attachment_identity_file":{"content_sha256":"sha256:3e32061ef92bb54f78dd7191aa9271ac07a6f4012ec5d333e04402eef00e0d9d","device":41,"inode":44,"length":197,"path":"/var/lib/cats/node/state_path_a/data/cat-cat_01/volume-vol_root/attachment-att_root/epoch-7/identity.json"},"launch_checkpoint_file":{"content_sha256":"sha256:0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b","device":41,"inode":46,"length":1024,"path":"/var/lib/cats/node/state_path_a/data/cat-cat_01/volume-vol_root/attachment-att_root/epoch-7/launch-checkpoint.json"},"state_directory":{"device":41,"inode":42,"path":"/var/lib/cats/node/state_path_a"}},"provision_context_digest":"sha256:0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a","provision_transition_id":"33333333333333333333333333333333","runtime_scope_id":"cats-root-44444444444444444444444444444444.service","version":1}"#;
+    const FIXED_PROVISION_CHECKPOINT: &[u8] = br#"{"cat_id":"cat_01","desired_revision":11,"guest_transport":{"kind":"unavailable"},"lifecycle_admission":"closed","mounts":[],"networks":[],"node_id":"node_a","placement_epoch":3,"processes":[],"require_idle":{"kind":"not_applicable"},"route_gates":[],"runtime_incarnation":null,"spec_digest":"sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc","stable_state":null,"step":{"attachment_epoch":7,"attachment_id":"att_root","boot_image_digest":"sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","control_socket_path":"/var/lib/cats/node/state_path_a/data/cat-cat_01/volume-vol_root/attachment-att_root/epoch-7/root-provision.sock","data_directory":"/var/lib/cats/node/state_path_a/data/cat-cat_01/volume-vol_root/attachment-att_root/epoch-7","expected_blank_head":{"generation":0,"root_hash":null,"root_object_id":null},"expected_provisioned_head":{"generation":1,"root_hash":"sha256:0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d","root_object_id":"roots/generation-1.node"},"kind":"provision_root_image","process_identity_token":"44444444444444444444444444444444","provision_transition_id":"33333333333333333333333333333333","scope_id":"cats-root-44444444444444444444444444444444.service","size_bytes":4194304,"volume_id":"vol_root"},"updated_at_unix_ms":1720000000000,"version":1,"volumes":[],"warm_snapshot":{"kind":"absent"}}"#;
+
+    const FIXED_TARGET_CONTROL_AUTHORIZATION: &[u8] = br#"{"attachment":{"acquire_request":{"attachment_id":"att_root","desired_revision":11,"expected_unowned_epoch":6,"lease_duration_ms":60000,"placement_epoch":3,"transition_id":"11111111111111111111111111111111","volume_id":"vol_root"},"acquire_result":{"attachment_id":"att_root","lease_expires_at":1720000060000,"resulting_epoch":7,"resulting_head":{"generation":0,"root_hash":null,"root_object_id":null},"transition_id":"11111111111111111111111111111111","volume_id":"vol_root"},"durability":"strict","head":{"generation":1,"root_hash":"sha256:0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d","root_object_id":"roots/generation-1.node"},"identity":{"acquire_origin":{"kind":"normal","transition_id":"11111111111111111111111111111111"},"attachment_epoch":7,"attachment_id":"att_root","node_id":"node_a","placement_epoch":3,"volume_id":"vol_root"},"lease_expires_at":1720000060000,"size_bytes":4194304},"control_socket_path":"/var/lib/cats/node/state_path_a/data/cat-cat_01/volume-vol_root/attachment-att_root/epoch-7/root-provision.sock","local_state":{"acquire_authorization_file":{"content_sha256":"sha256:7f8916bf692fad3e61120f4033f131c621fe15a8eda5e39927df5f3368616380","device":41,"inode":45,"length":811,"path":"/var/lib/cats/node/state_path_a/data/cat-cat_01/volume-vol_root/attachment-att_root/epoch-7/authorized-serving.json"},"attachment_directory":{"device":41,"inode":43,"path":"/var/lib/cats/node/state_path_a/data/cat-cat_01/volume-vol_root/attachment-att_root/epoch-7"},"attachment_identity_file":{"content_sha256":"sha256:3e32061ef92bb54f78dd7191aa9271ac07a6f4012ec5d333e04402eef00e0d9d","device":41,"inode":44,"length":197,"path":"/var/lib/cats/node/state_path_a/data/cat-cat_01/volume-vol_root/attachment-att_root/epoch-7/identity.json"},"launch_checkpoint_file":{"content_sha256":"sha256:0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b","device":41,"inode":46,"length":1024,"path":"/var/lib/cats/node/state_path_a/data/cat-cat_01/volume-vol_root/attachment-att_root/epoch-7/launch-checkpoint.json"},"state_directory":{"device":41,"inode":42,"path":"/var/lib/cats/node/state_path_a"}},"provision_context_digest":"sha256:59dd3c80e16df23f3c4f647178368ebdaf7e5f465c3c165030bf1349a139bdb3","provision_transition_id":"33333333333333333333333333333333","request":{"attachment_epoch":7,"attachment_id":"att_root","boot_image_digest":"sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","expected_blank_head":{"generation":0,"root_hash":null,"root_object_id":null},"expected_provisioned_head":{"generation":1,"root_hash":"sha256:0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d","root_object_id":"roots/generation-1.node"},"provision_transition_id":"33333333333333333333333333333333","size_bytes":4194304,"volume_id":"vol_root"},"runtime_scope_id":"cats-root-44444444444444444444444444444444.service","version":1}"#;
 
     #[test]
     fn fixed_target_control_authorization_bytes_are_stable() {
@@ -456,9 +502,74 @@ mod tests {
             "33333333333333333333333333333333"
         );
         assert_eq!(decoded.attachment.head.generation.get(), 1);
+        let checkpoint =
+            cats_api::runtime_reconciliation::decode_runtime_checkpoint(FIXED_PROVISION_CHECKPOINT)
+                .unwrap();
+        assert_eq!(
+            decoded.provision_context_digest,
+            provision_root_authorization_context_digest(&checkpoint).unwrap()
+        );
+        assert_eq!(
+            decoded.request,
+            provision_root_image_request(&checkpoint).unwrap()
+        );
         assert_eq!(
             encode_target_control_authorization(&decoded).unwrap(),
             FIXED_TARGET_CONTROL_AUTHORIZATION
+        );
+    }
+
+    #[test]
+    fn fixed_provision_checkpoint_has_one_stable_context_digest() {
+        let checkpoint =
+            cats_api::runtime_reconciliation::decode_runtime_checkpoint(FIXED_PROVISION_CHECKPOINT)
+                .expect("literal provision checkpoint decodes");
+        let digest = provision_root_authorization_context_digest(&checkpoint).unwrap();
+        assert_eq!(
+            digest.as_sha256_digest().as_str(),
+            "sha256:59dd3c80e16df23f3c4f647178368ebdaf7e5f465c3c165030bf1349a139bdb3"
+        );
+
+        let mut timestamp_only = checkpoint.clone();
+        timestamp_only.updated_at_unix_ms =
+            cats_api::runtime_reconciliation::UnixMillis::new(1_720_000_000_001).unwrap();
+        assert_eq!(
+            provision_root_authorization_context_digest(&timestamp_only).unwrap(),
+            digest
+        );
+
+        let mut token_only = checkpoint.clone();
+        let ReconcileStep::ProvisionRootImage {
+            process_identity_token,
+            ..
+        } = &mut token_only.step
+        else {
+            unreachable!()
+        };
+        *process_identity_token = RandomId128::new("55555555555555555555555555555555").unwrap();
+        assert_eq!(
+            provision_root_authorization_context_digest(&token_only).unwrap(),
+            digest
+        );
+
+        let mut changed_step = checkpoint.clone();
+        let ReconcileStep::ProvisionRootImage {
+            boot_image_digest, ..
+        } = &mut changed_step.step
+        else {
+            unreachable!()
+        };
+        *boot_image_digest = Sha256Digest::from_bytes([0xbb; 32]);
+        assert_ne!(
+            provision_root_authorization_context_digest(&changed_step).unwrap(),
+            digest
+        );
+
+        let mut changed_checkpoint = checkpoint;
+        changed_checkpoint.lifecycle_admission = LifecycleAdmission::Open;
+        assert_ne!(
+            provision_root_authorization_context_digest(&changed_checkpoint).unwrap(),
+            digest
         );
     }
 }

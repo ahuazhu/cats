@@ -10,7 +10,10 @@ use std::time::{Duration, Instant};
 
 use anyhow::{bail, Context, Result};
 use cats_api::blockd::{BlockdControlCommand, BlockdControlResponse};
-use cats_api::runtime_reconciliation::{Id, RandomId128, Sha256Digest};
+use cats_api::runtime_reconciliation::{
+    Id, ProvisionRootImageDefiniteConflictProblem, ProvisionRootImageError,
+    ProvisionRootImageRequest, ProvisionRootImageResult, RandomId128, Sha256Digest,
+};
 use cats_blockd::engine::{ChunkEngine, EngineConfig, ProvisionRootImageEffectError};
 use cats_blockd::nbd;
 use cats_blockd::target_control::{
@@ -651,6 +654,9 @@ fn main() -> Result<()> {
         } else {
             None
         };
+    let expected_target_request = authorized_target_control
+        .as_ref()
+        .map(|artifact| artifact.request.clone());
     let engine = if args.control_only {
         let authority = PostgresVolumeDataAuthority::open(&metadata_config)
             .context("open target volume authority")?;
@@ -739,6 +745,7 @@ fn main() -> Result<()> {
             runtime_process_identity
                 .clone()
                 .context("process-mode validation requires Runtime process identity")?,
+            expected_target_request,
         );
         return Ok(());
     }
@@ -927,6 +934,7 @@ fn serve_root_provision_control(
     listener: UnixListener,
     engine: std::sync::Arc<cats_blockd::engine::ChunkEngine>,
     process_identity: RuntimeProcessIdentity,
+    expected_target_request: Option<ProvisionRootImageRequest>,
 ) {
     for connection in listener.incoming() {
         let Ok(mut connection) = connection else {
@@ -961,19 +969,10 @@ fn serve_root_provision_control(
         else {
             continue;
         };
-        let response = match engine.provision_root_image(&request) {
-            Ok(result) => {
-                cats_api::runtime_reconciliation::encode_provision_root_image_result(&result)
-                    .ok()
-                    .map(|json| (b"OK ".as_slice(), json))
-            }
-            Err(ProvisionRootImageEffectError::Closed(error)) => {
-                cats_api::runtime_reconciliation::encode_provision_root_image_error(&error)
-                    .ok()
-                    .map(|json| (b"ERR ".as_slice(), json))
-            }
-            Err(ProvisionRootImageEffectError::ResultUnknown(_)) => None,
-        };
+        let response =
+            encode_root_provision_response(&request, expected_target_request.as_ref(), |request| {
+                engine.provision_root_image(request)
+            });
         if let Some((prefix, payload)) = response {
             let mut frame = Vec::with_capacity(prefix.len() + payload.len() + 1);
             frame.extend_from_slice(prefix);
@@ -981,6 +980,39 @@ fn serve_root_provision_control(
             frame.push(b'\n');
             let _ = write_all_before(&mut connection, &frame, PROVISION_CONTROL_IO_TIMEOUT);
         }
+    }
+}
+
+fn encode_root_provision_response(
+    request: &ProvisionRootImageRequest,
+    expected_target_request: Option<&ProvisionRootImageRequest>,
+    effect: impl FnOnce(
+        &ProvisionRootImageRequest,
+    )
+        -> std::result::Result<ProvisionRootImageResult, ProvisionRootImageEffectError>,
+) -> Option<(&'static [u8], Vec<u8>)> {
+    if expected_target_request.is_some_and(|expected| expected != request) {
+        let error = ProvisionRootImageError::DefiniteConflict {
+            provision_transition_id: request.provision_transition_id.clone(),
+            volume_id: request.volume_id.clone(),
+            attachment_id: request.attachment_id.clone(),
+            attachment_epoch: request.attachment_epoch,
+            problem: ProvisionRootImageDefiniteConflictProblem::RequestBinding,
+        };
+        let payload = cats_api::runtime_reconciliation::encode_provision_root_image_error(&error)
+            .expect("an already-decoded request always forms a canonical binding error");
+        return Some((b"ERR ", payload));
+    }
+    match effect(request) {
+        Ok(result) => cats_api::runtime_reconciliation::encode_provision_root_image_result(&result)
+            .ok()
+            .map(|json| (b"OK ".as_slice(), json)),
+        Err(ProvisionRootImageEffectError::Closed(error)) => {
+            cats_api::runtime_reconciliation::encode_provision_root_image_error(&error)
+                .ok()
+                .map(|json| (b"ERR ".as_slice(), json))
+        }
+        Err(ProvisionRootImageEffectError::ResultUnknown(_)) => None,
     }
 }
 
@@ -1403,9 +1435,20 @@ mod tests {
         let context_digest = Sha256Digest::from_bytes([0x6b; 32]);
         let runtime_scope_id = Id::new("cats-root-fixed.service").unwrap();
         let control_socket_path = data_dir.join("root-provision.sock");
+        let request = ProvisionRootImageRequest {
+            provision_transition_id: transition.clone(),
+            volume_id: attachment.identity.volume_id.clone(),
+            attachment_id: attachment.identity.attachment_id.clone(),
+            attachment_epoch: attachment.identity.attachment_epoch,
+            size_bytes: attachment.size_bytes,
+            boot_image_digest: Sha256Digest::from_bytes([0x4a; 32]),
+            expected_blank_head: attachment.acquire_result.resulting_head.clone(),
+            expected_provisioned_head: attachment.head.clone(),
+        };
         let artifact = TargetControlAuthorizationArtifact {
             version: ContractVersion::V1,
             provision_transition_id: transition.clone(),
+            request,
             provision_context_digest: ProvisionRootAuthorizationContextDigest::new(
                 context_digest.clone(),
             ),
@@ -1462,7 +1505,9 @@ mod tests {
     #[test]
     fn target_control_parser_accepts_only_the_exact_closed_context() {
         let fixture = target_control_fixture();
-        assert_eq!(fixture.parse().unwrap(), fixture.artifact);
+        let parsed = fixture.parse().unwrap();
+        assert_eq!(parsed, fixture.artifact);
+        assert_eq!(parsed.request, fixture.artifact.request);
 
         let wrong_transition = RandomId128::new("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa").unwrap();
         let mut expected = fixture.expectation();
@@ -1560,6 +1605,120 @@ mod tests {
         std::fs::rename(&symlinked.path, &real_path).unwrap();
         std::os::unix::fs::symlink(&real_path, &symlinked.path).unwrap();
         assert!(symlinked.parse().is_err());
+    }
+
+    #[test]
+    fn target_request_drift_is_typed_and_never_reaches_the_engine_effect() {
+        let fixture = target_control_fixture();
+        let expected = fixture.parse().unwrap().request;
+        let mut cases = Vec::new();
+
+        let mut changed = expected.clone();
+        changed.provision_transition_id =
+            RandomId128::new("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa").unwrap();
+        cases.push(changed);
+        let mut changed = expected.clone();
+        changed.volume_id = Id::new("vol_foreign").unwrap();
+        cases.push(changed);
+        let mut changed = expected.clone();
+        changed.attachment_id = Id::new("att_foreign").unwrap();
+        cases.push(changed);
+        let mut changed = expected.clone();
+        changed.attachment_epoch = FenceEpoch::new(8).unwrap();
+        cases.push(changed);
+        let mut changed = expected.clone();
+        changed.size_bytes += 4096;
+        cases.push(changed);
+        let mut changed = expected.clone();
+        changed.boot_image_digest = Sha256Digest::from_bytes([0x7d; 32]);
+        cases.push(changed);
+        let mut changed = expected.clone();
+        changed.expected_blank_head = changed.expected_provisioned_head.clone();
+        cases.push(changed);
+        let mut changed = expected.clone();
+        changed.expected_provisioned_head.root_hash = Some(Sha256Digest::from_bytes([0x7e; 32]));
+        cases.push(changed);
+
+        let effect_calls = std::cell::Cell::new(0_u64);
+        for incoming in cases {
+            let incoming_wire =
+                cats_api::runtime_reconciliation::encode_provision_root_image_request(&incoming)
+                    .unwrap();
+            let incoming = cats_api::runtime_reconciliation::decode_provision_root_image_request(
+                &incoming_wire,
+            )
+            .unwrap();
+            let (prefix, payload) =
+                encode_root_provision_response(&incoming, Some(&expected), |_| {
+                    effect_calls.set(effect_calls.get() + 1);
+                    unreachable!("mismatched target request reached the engine effect")
+                })
+                .expect("request drift must return a typed response rather than EOF");
+            assert_eq!(prefix, b"ERR ");
+            let error =
+                cats_api::runtime_reconciliation::decode_provision_root_image_error(&payload)
+                    .unwrap();
+            assert!(matches!(
+                error,
+                ProvisionRootImageError::DefiniteConflict {
+                    provision_transition_id,
+                    volume_id,
+                    attachment_id,
+                    attachment_epoch,
+                    problem: ProvisionRootImageDefiniteConflictProblem::RequestBinding,
+                } if provision_transition_id == incoming.provision_transition_id
+                    && volume_id == incoming.volume_id
+                    && attachment_id == incoming.attachment_id
+                    && attachment_epoch == incoming.attachment_epoch
+            ));
+        }
+        assert_eq!(effect_calls.get(), 0);
+    }
+
+    #[test]
+    fn exact_target_request_replays_across_process_attempt_tokens() {
+        let fixture = target_control_fixture();
+        let expected = fixture.parse().unwrap().request;
+        let process_tokens = [
+            RandomId128::new("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa").unwrap(),
+            RandomId128::new("bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb").unwrap(),
+        ];
+        assert_ne!(process_tokens[0], process_tokens[1]);
+        let effect_calls = std::cell::Cell::new(0_u64);
+
+        // The attempt token is deliberately not part of the retained request:
+        // Runtime may rotate it only after proving the old process absent.
+        for _process_token in process_tokens {
+            let request_wire =
+                cats_api::runtime_reconciliation::encode_provision_root_image_request(&expected)
+                    .unwrap();
+            let request = cats_api::runtime_reconciliation::decode_provision_root_image_request(
+                &request_wire,
+            )
+            .unwrap();
+            let (prefix, payload) =
+                encode_root_provision_response(&request, Some(&expected), |request| {
+                    effect_calls.set(effect_calls.get() + 1);
+                    Ok(ProvisionRootImageResult {
+                        provision_transition_id: request.provision_transition_id.clone(),
+                        volume_id: request.volume_id.clone(),
+                        attachment_id: request.attachment_id.clone(),
+                        attachment_epoch: request.attachment_epoch,
+                        resulting_head: request.expected_provisioned_head.clone(),
+                    })
+                })
+                .expect("an exact request must return success for either process attempt");
+            assert_eq!(prefix, b"OK ");
+            let result =
+                cats_api::runtime_reconciliation::decode_provision_root_image_result(&payload)
+                    .unwrap();
+            assert_eq!(
+                result.provision_transition_id,
+                expected.provision_transition_id
+            );
+            assert_eq!(result.resulting_head, expected.expected_provisioned_head);
+        }
+        assert_eq!(effect_calls.get(), 2);
     }
 
     fn parse_target_control_mode(extra: &[&str]) -> Args {
