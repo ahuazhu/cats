@@ -9,8 +9,8 @@ use reqwest::blocking::Client as HttpClient;
 use workos::resources::user_management::AuthenticateWithRefreshTokenParams;
 
 use crate::config::{
-    CliStateLock, Credentials, FleetAdminCredentials, FleetAdminStateLock, StoredConfig,
-    DEFAULT_API_URL,
+    canonical_https_origin, CliStateLock, Credentials, FleetAdminCredentials, FleetAdminStateLock,
+    StoredConfig, DEFAULT_API_URL,
 };
 
 pub(crate) struct UserSession {
@@ -130,8 +130,8 @@ pub(crate) fn login(provided_api_url: Option<&str>) -> Result<StoredConfig> {
 /// Acquire a WorkOS device session independently of all Cats Workspace state,
 /// then scope the rotating refresh token to the configured admin Organization.
 pub(crate) fn fleet_admin_login(provided_api_url: Option<&str>) -> Result<FleetAdminIdentity> {
-    let api_url = configured_api_url(provided_api_url)?;
-    let public = fleet_admin_public_config(&api_url)?;
+    let (raw_api_url, canonical_origin) = fleet_admin_origins(provided_api_url)?;
+    let public = fleet_admin_public_config(&canonical_origin)?;
     let workos = public_workos_client(&public.client_id, &public.api_base_url)?;
     let runtime = tokio::runtime::Runtime::new()?;
     let device = runtime
@@ -166,66 +166,97 @@ pub(crate) fn fleet_admin_login(provided_api_url: Option<&str>) -> Result<FleetA
     };
     let credentials =
         scope_fleet_admin_credentials(&runtime, &workos, initial, &public.organization_id)?;
-    let _lock = FleetAdminStateLock::acquire(&api_url)?;
+    let lock = FleetAdminStateLock::acquire(&canonical_origin)?;
     // Login intentionally replaces any prior administrator identity, but it
     // still rereads the globally shared credential while holding the same
     // origin lock as refresh/logout. This detects corrupt current state and
     // prevents a concurrent rotating refresh from being silently overwritten.
-    let _previous = FleetAdminCredentials::load(&api_url)?;
-    credentials.save(&api_url)?;
+    let _previous = lock.load_credentials(&raw_api_url)?;
+    lock.save_credentials(&credentials)?;
     Ok(FleetAdminIdentity {
         email: credentials.email,
     })
 }
 
 pub(crate) fn fleet_admin_session(provided_api_url: Option<&str>) -> Result<FleetAdminSession> {
-    let api_url = configured_api_url(provided_api_url)?;
-    let public = fleet_admin_public_config(&api_url)?;
-    let _lock = FleetAdminStateLock::acquire(&api_url)?;
-    let mut credentials = FleetAdminCredentials::load(&api_url)?
+    let (raw_api_url, canonical_origin) = fleet_admin_origins(provided_api_url)?;
+    let lock = FleetAdminStateLock::acquire(&canonical_origin)?;
+    let mut credentials = lock
+        .load_credentials(&raw_api_url)?
         .context("not signed in as a fleet administrator; run `cats admin login`")?;
+    let public = fleet_admin_public_config_locked(&lock, &canonical_origin)?;
     if credentials.organization_id != public.organization_id
         || token_expires_soon(&credentials.access_token)
     {
         let workos = public_workos_client(&public.client_id, &public.api_base_url)?;
         let runtime = tokio::runtime::Runtime::new()?;
-        credentials = refresh_for_fleet_admin(
+        lock.assert_current()?;
+        let refreshed = refresh_for_fleet_admin(
             &runtime,
             &workos,
             &credentials,
             &public.organization_id,
             Some(&credentials.subject),
-        )?;
-        credentials.save(&api_url)?;
+        );
+        lock.assert_current()?;
+        credentials = refreshed?;
+        lock.save_credentials(&credentials)?;
     }
     Ok(FleetAdminSession {
-        api_url,
+        api_url: canonical_origin,
         access_token: credentials.access_token,
     })
 }
 
 pub(crate) fn fleet_admin_logout(provided_api_url: Option<&str>) -> Result<()> {
-    let api_url = configured_api_url(provided_api_url)?;
-    let _lock = FleetAdminStateLock::acquire(&api_url)?;
-    if let Some(credentials) = FleetAdminCredentials::load(&api_url)? {
+    let (raw_api_url, canonical_origin) = fleet_admin_origins(provided_api_url)?;
+    let lock = FleetAdminStateLock::acquire(&canonical_origin)?;
+    if let Some(credentials) = lock.load_credentials(&raw_api_url)? {
         let http = http_client()?;
-        if let Err(error) = post_empty(
+        lock.assert_current()?;
+        let result = post_empty(
             &http,
-            &format!("{api_url}/v1/auth/logout"),
+            &fleet_admin_request_url(&canonical_origin, "/v1/auth/logout")?,
             &credentials.access_token,
-        ) {
+        );
+        lock.assert_current()?;
+        if let Err(error) = result {
             eprintln!("Warning: fleet-administrator session revocation failed: {error}");
         }
     }
-    FleetAdminCredentials::delete(&api_url)
+    lock.delete_credentials()
 }
 
-fn fleet_admin_public_config(api_url: &str) -> Result<FleetAdminPublicConfig> {
+fn fleet_admin_origins(provided_api_url: Option<&str>) -> Result<(String, String)> {
+    let raw_api_url = configured_api_url(provided_api_url)?;
+    let canonical_origin = canonical_https_origin(&raw_api_url)?;
+    Ok((raw_api_url, canonical_origin))
+}
+
+fn fleet_admin_public_config_locked(
+    lock: &FleetAdminStateLock,
+    canonical_origin: &str,
+) -> Result<FleetAdminPublicConfig> {
+    lock.assert_current()?;
+    let result = fleet_admin_public_config(canonical_origin);
+    lock.assert_current()?;
+    result
+}
+
+fn fleet_admin_public_config(canonical_origin: &str) -> Result<FleetAdminPublicConfig> {
+    anyhow::ensure!(
+        canonical_https_origin(canonical_origin)? == canonical_origin,
+        "fleet-administrator network authority is not canonical"
+    );
     let http = http_client()?;
-    let public: CliAuthConfigResponse = get_json(&http, &format!("{api_url}/auth/config"), None)?;
+    let public: CliAuthConfigResponse = get_json(
+        &http,
+        &fleet_admin_request_url(canonical_origin, "/auth/config")?,
+        None,
+    )?;
     anyhow::ensure!(
         public.workos_enabled,
-        "WorkOS fleet-administrator login is not configured at {api_url}"
+        "WorkOS fleet-administrator login is not configured at {canonical_origin}"
     );
     Ok(FleetAdminPublicConfig {
         client_id: public
@@ -238,6 +269,38 @@ fn fleet_admin_public_config(api_url: &str) -> Result<FleetAdminPublicConfig> {
             .workos_admin_organization_id
             .context("control plane did not publish its fleet-administrator Organization")?,
     })
+}
+
+fn fleet_admin_request_url(canonical_origin: &str, path: &str) -> Result<String> {
+    anyhow::ensure!(
+        canonical_https_origin(canonical_origin)? == canonical_origin,
+        "fleet-administrator request origin is not canonical"
+    );
+    anyhow::ensure!(
+        path.starts_with('/') && !path.starts_with("//"),
+        "invalid request path"
+    );
+    #[cfg(test)]
+    if let Some(base) = std::env::var_os("CATS_TEST_FLEET_ADMIN_HTTP_BASE_URL") {
+        let base = base
+            .to_str()
+            .context("test fleet-administrator HTTP base URL is not UTF-8")?;
+        let parsed =
+            reqwest::Url::parse(base).context("invalid test fleet-administrator HTTP base URL")?;
+        anyhow::ensure!(
+            matches!(parsed.scheme(), "http" | "https")
+                && parsed.host_str().is_some_and(|host| {
+                    host.eq_ignore_ascii_case("localhost")
+                        || host.parse::<std::net::IpAddr>().is_ok()
+                })
+                && parsed.path() == "/"
+                && parsed.query().is_none()
+                && parsed.fragment().is_none(),
+            "test fleet-administrator HTTP base URL must be an exact loopback origin"
+        );
+        return Ok(format!("{}{}", base.trim_end_matches('/'), path));
+    }
+    Ok(format!("{canonical_origin}{path}"))
 }
 
 fn public_workos_client(client_id: &str, api_base_url: &str) -> Result<workos::Client> {
@@ -591,7 +654,7 @@ mod tests {
     use std::io::{Read as _, Write as _};
     use std::net::TcpListener;
     use std::path::{Path, PathBuf};
-    use std::process::{Child, Command};
+    use std::process::{Child, Command, ExitStatus};
     use std::thread;
     use std::time::Instant;
 
@@ -600,6 +663,12 @@ mod tests {
     const ADMIN_REFRESH_CHILD_ROLE: &str = "CATS_TEST_ADMIN_REFRESH_CHILD_ROLE";
     const ADMIN_REFRESH_ROOT: &str = "CATS_TEST_ADMIN_REFRESH_ROOT";
     const ADMIN_REFRESH_API_URL: &str = "CATS_TEST_ADMIN_REFRESH_API_URL";
+    const ADMIN_LOCK_ABA_CHILD_ROLE: &str = "CATS_TEST_ADMIN_LOCK_ABA_CHILD_ROLE";
+    const ADMIN_LOCK_ABA_API_URL: &str = "CATS_TEST_ADMIN_LOCK_ABA_API_URL";
+    const ADMIN_LOCK_ABA_BACKUP: &str = "CATS_TEST_ADMIN_LOCK_ABA_BACKUP";
+    const ADMIN_LOCK_ABA_EXPECTED_ERROR: &str = "CATS_TEST_ADMIN_LOCK_ABA_EXPECTED_ERROR";
+    const ADMIN_MIGRATION_CHILD_MODE: &str = "CATS_TEST_ADMIN_MIGRATION_CHILD_MODE";
+    const ADMIN_MIGRATION_API_URL: &str = "CATS_TEST_ADMIN_MIGRATION_API_URL";
 
     fn admin_credentials(organization_id: &str) -> FleetAdminCredentials {
         FleetAdminCredentials {
@@ -694,9 +763,10 @@ mod tests {
     fn spawn_admin_refresh_child(
         root: &Path,
         lock_root: &Path,
-        credential_file: &Path,
+        credential_root: &Path,
         config_dir: &Path,
         api_url: &str,
+        http_base_url: &str,
         role: &str,
     ) -> Child {
         Command::new(std::env::current_exe().unwrap())
@@ -710,10 +780,117 @@ mod tests {
             .env(ADMIN_REFRESH_ROOT, root)
             .env(ADMIN_REFRESH_API_URL, api_url)
             .env("CATS_TEST_FLEET_ADMIN_LOCK_ROOT", lock_root)
-            .env("CATS_TEST_CREDENTIAL_STORE_FILE", credential_file)
+            .env("CATS_TEST_CREDENTIAL_STORE_DIR", credential_root)
+            .env("CATS_TEST_FLEET_ADMIN_HTTP_BASE_URL", http_base_url)
             .env("CATS_CONFIG_DIR", config_dir)
             .spawn()
             .unwrap()
+    }
+
+    fn spawn_admin_lock_aba_holder(
+        root: &Path,
+        lock_root: &Path,
+        credential_root: &Path,
+        config_dir: &Path,
+        api_url: &str,
+        http_base_url: &str,
+        expected_error: &str,
+    ) -> Child {
+        Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "auth::tests::fleet_admin_lock_aba_process_child",
+                "--ignored",
+                "--nocapture",
+            ])
+            .env(ADMIN_LOCK_ABA_CHILD_ROLE, "holder")
+            .env(ADMIN_LOCK_ABA_API_URL, api_url)
+            .env(ADMIN_LOCK_ABA_EXPECTED_ERROR, expected_error)
+            .env("CATS_TEST_FLEET_ADMIN_LOCK_ROOT", lock_root)
+            .env("CATS_TEST_CREDENTIAL_STORE_DIR", credential_root)
+            .env(
+                "CATS_TEST_CREDENTIAL_STORE_AUDIT_FILE",
+                marker(root, "credential-audit"),
+            )
+            .env("CATS_TEST_FLEET_ADMIN_HTTP_BASE_URL", http_base_url)
+            .env(
+                "CATS_TEST_FLEET_ADMIN_AFTER_LOCK_MARKER",
+                marker(root, "locked"),
+            )
+            .env(
+                "CATS_TEST_FLEET_ADMIN_AFTER_LOCK_RELEASE",
+                marker(root, "release"),
+            )
+            .env("CATS_CONFIG_DIR", config_dir)
+            .spawn()
+            .unwrap()
+    }
+
+    fn spawn_admin_lock_aba_mutator(
+        lock_root: &Path,
+        backup: &Path,
+        api_url: &str,
+        role: &str,
+    ) -> Child {
+        Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "auth::tests::fleet_admin_lock_aba_process_child",
+                "--ignored",
+                "--nocapture",
+            ])
+            .env(ADMIN_LOCK_ABA_CHILD_ROLE, role)
+            .env(ADMIN_LOCK_ABA_API_URL, api_url)
+            .env(ADMIN_LOCK_ABA_BACKUP, backup)
+            .env("CATS_TEST_FLEET_ADMIN_LOCK_ROOT", lock_root)
+            .spawn()
+            .unwrap()
+    }
+
+    fn spawn_admin_migration_child(
+        lock_root: &Path,
+        credential_root: &Path,
+        api_url: &str,
+        mode: &str,
+    ) -> ExitStatus {
+        Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "auth::tests::fleet_admin_credential_migration_process_child",
+                "--ignored",
+                "--nocapture",
+            ])
+            .env(ADMIN_MIGRATION_CHILD_MODE, mode)
+            .env(ADMIN_MIGRATION_API_URL, api_url)
+            .env("CATS_TEST_FLEET_ADMIN_LOCK_ROOT", lock_root)
+            .env("CATS_TEST_CREDENTIAL_STORE_DIR", credential_root)
+            .status()
+            .unwrap()
+    }
+
+    fn wait_for_child_without_network(child: &mut Child, listener: &TcpListener) -> ExitStatus {
+        listener.set_nonblocking(true).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(20);
+        loop {
+            match listener.accept() {
+                Ok((_stream, _)) => {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    panic!("stale fleet-administrator lock holder performed network I/O");
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {}
+                Err(error) => panic!("inspect test control listener: {error}"),
+            }
+            if let Some(status) = child.try_wait().unwrap() {
+                return status;
+            }
+            if Instant::now() >= deadline {
+                let _ = child.kill();
+                let _ = child.wait();
+                panic!("fleet-administrator lock holder did not exit after identity changed");
+            }
+            thread::sleep(Duration::from_millis(10));
+        }
     }
 
     #[test]
@@ -848,24 +1025,31 @@ mod tests {
     #[test]
     fn fleet_admin_refresh_is_serial_across_distinct_config_dirs() {
         let directory = tempfile::tempdir().unwrap();
-        let root = directory.path();
+        let root = std::fs::canonicalize(directory.path()).unwrap();
         let lock_root = root.join("global-lock-root");
-        let credential_file = root.join("credential-store");
+        let credential_root = root.join("credential-store");
         let config_a = root.join("config-a");
         let config_b = root.join("config-b");
         std::fs::create_dir(&config_a).unwrap();
         std::fs::create_dir(&config_b).unwrap();
-        std::fs::write(
-            &credential_file,
-            serde_json::to_vec(&admin_credentials("org_admin")).unwrap(),
-        )
-        .unwrap();
+        std::fs::create_dir(&credential_root).unwrap();
+        let first_api_url = "https://CONTROL.example";
+        let second_api_url = "https://control.example:443/";
+        let canonical_origin = canonical_https_origin(first_api_url).unwrap();
+        assert_eq!(
+            canonical_origin,
+            canonical_https_origin(second_api_url).unwrap()
+        );
+        let legacy_credential =
+            FleetAdminCredentials::test_store_path(&credential_root, first_api_url);
+        let encoded = serde_json::to_string(&admin_credentials("org_admin")).unwrap();
+        std::fs::write(&legacy_credential, &encoded).unwrap();
 
         let control_listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let control_address = control_listener.local_addr().unwrap();
         let workos_listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let workos_address = workos_listener.local_addr().unwrap();
-        let api_url = format!("http://{control_address}");
+        let http_base_url = format!("http://{control_address}");
         let workos_url = format!("http://{workos_address}");
 
         let control_server = thread::spawn(move || {
@@ -884,8 +1068,8 @@ mod tests {
             }
         });
 
-        let refresh_seen = marker(root, "refresh-seen");
-        let release_refresh = marker(root, "release-refresh");
+        let refresh_seen = marker(&root, "refresh-seen");
+        let release_refresh = marker(&root, "release-refresh");
         let refresh_seen_for_server = refresh_seen.clone();
         let release_for_server = release_refresh.clone();
         let refreshed_access_token = unexpired_access_token();
@@ -915,23 +1099,25 @@ mod tests {
         });
 
         let mut first = spawn_admin_refresh_child(
-            root,
+            &root,
             &lock_root,
-            &credential_file,
+            &credential_root,
             &config_a,
-            &api_url,
+            first_api_url,
+            &http_base_url,
             "first",
         );
         wait_for_marker(&refresh_seen, &mut first);
         let mut second = spawn_admin_refresh_child(
-            root,
+            &root,
             &lock_root,
-            &credential_file,
+            &credential_root,
             &config_b,
-            &api_url,
+            second_api_url,
+            &http_base_url,
             "second",
         );
-        wait_for_marker(&marker(root, "second-saw-contention"), &mut second);
+        wait_for_marker(&marker(&root, "second-saw-contention"), &mut second);
 
         std::fs::write(release_refresh, b"release").unwrap();
         let first_status = first.wait().unwrap();
@@ -945,17 +1131,196 @@ mod tests {
         workos_server.join().unwrap();
 
         assert_eq!(
-            std::fs::read_to_string(marker(root, "first-observed-access")).unwrap(),
+            std::fs::read_to_string(marker(&root, "first-observed-access")).unwrap(),
             refreshed_access_token
         );
         assert_eq!(
-            std::fs::read_to_string(marker(root, "second-observed-access")).unwrap(),
+            std::fs::read_to_string(marker(&root, "second-observed-access")).unwrap(),
             refreshed_access_token
         );
+        let canonical_credential =
+            FleetAdminCredentials::test_store_path(&credential_root, &canonical_origin);
         let persisted: FleetAdminCredentials =
-            serde_json::from_slice(&std::fs::read(&credential_file).unwrap()).unwrap();
+            serde_json::from_slice(&std::fs::read(&canonical_credential).unwrap()).unwrap();
         assert_eq!(persisted.refresh_token, "refresh-after");
         assert_eq!(persisted.access_token, refreshed_access_token);
+        assert!(
+            !legacy_credential.exists(),
+            "legacy raw-origin account must be removed only after exact canonical persistence"
+        );
+    }
+
+    #[test]
+    fn fleet_admin_legacy_credential_migration_is_exact_reentrant_and_conflict_closed() {
+        let raw_api_url = "https://CONTROL.example";
+        let canonical_origin = canonical_https_origin(raw_api_url).unwrap();
+        let original = serde_json::to_string(&admin_credentials("org_admin")).unwrap();
+
+        for mode in ["raw-only", "already-copied", "conflict"] {
+            let directory = tempfile::tempdir().unwrap();
+            let root = std::fs::canonicalize(directory.path()).unwrap();
+            let lock_root = root.join("global-lock-root");
+            let credential_root = root.join("credential-store");
+            std::fs::create_dir(&credential_root).unwrap();
+            let raw_path = FleetAdminCredentials::test_store_path(&credential_root, raw_api_url);
+            let canonical_path =
+                FleetAdminCredentials::test_store_path(&credential_root, &canonical_origin);
+            std::fs::write(&raw_path, &original).unwrap();
+            let mut conflicting_encoded = None;
+            if mode == "already-copied" {
+                std::fs::write(&canonical_path, &original).unwrap();
+            } else if mode == "conflict" {
+                let mut conflicting = admin_credentials("org_admin");
+                conflicting.refresh_token = "different-rotating-token".to_owned();
+                let encoded = serde_json::to_string(&conflicting).unwrap();
+                std::fs::write(&canonical_path, &encoded).unwrap();
+                conflicting_encoded = Some(encoded);
+            }
+
+            let status =
+                spawn_admin_migration_child(&lock_root, &credential_root, raw_api_url, mode);
+            assert!(status.success(), "migration child {mode} failed: {status}");
+            if mode == "conflict" {
+                assert_eq!(std::fs::read_to_string(&raw_path).unwrap(), original);
+                assert_eq!(
+                    std::fs::read_to_string(&canonical_path).unwrap(),
+                    conflicting_encoded.unwrap(),
+                    "conflicting accounts must remain byte-exact and untouched"
+                );
+            } else {
+                assert!(!raw_path.exists(), "legacy account remained after {mode}");
+                assert_eq!(
+                    std::fs::read_to_string(&canonical_path).unwrap(),
+                    original,
+                    "migration must preserve exact credential bytes for {mode}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    #[ignore = "spawned by fleet_admin_legacy_credential_migration_is_exact_reentrant_and_conflict_closed"]
+    fn fleet_admin_credential_migration_process_child() {
+        let Some(mode) = std::env::var_os(ADMIN_MIGRATION_CHILD_MODE) else {
+            return;
+        };
+        let mode = mode.to_str().unwrap();
+        let api_url = std::env::var(ADMIN_MIGRATION_API_URL).unwrap();
+        let lock = FleetAdminStateLock::acquire(&api_url).unwrap();
+        let result = lock.load_credentials(&api_url);
+        if mode == "conflict" {
+            let error = format!("{:#}", result.unwrap_err());
+            assert!(
+                error.contains("canonical and legacy fleet-administrator credentials disagree"),
+                "{error}"
+            );
+        } else {
+            assert_eq!(result.unwrap(), Some(admin_credentials("org_admin")));
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn fleet_admin_lock_identity_changes_fail_before_credentials_or_network() {
+        for (mutation, expected_error) in [
+            (
+                "rename-root",
+                "fleet-administrator lock ancestor identity changed",
+            ),
+            (
+                "replace-lock",
+                "fleet-administrator lock path was unlinked or replaced",
+            ),
+        ] {
+            let directory = tempfile::tempdir().unwrap();
+            let root = std::fs::canonicalize(directory.path()).unwrap();
+            let lock_root = root.join("global-lock-root");
+            let credential_root = root.join("credential-store");
+            let config_dir = root.join("config");
+            let backup = root.join("old-lock-root");
+            let api_url = "https://control.example";
+            std::fs::create_dir(&credential_root).unwrap();
+            std::fs::create_dir(&config_dir).unwrap();
+            let credential_path = FleetAdminCredentials::test_store_path(&credential_root, api_url);
+            std::fs::write(
+                credential_path,
+                serde_json::to_string(&admin_credentials("org_admin")).unwrap(),
+            )
+            .unwrap();
+
+            let control_listener = TcpListener::bind("127.0.0.1:0").unwrap();
+            let http_base_url = format!("http://{}", control_listener.local_addr().unwrap());
+            let mut holder = spawn_admin_lock_aba_holder(
+                &root,
+                &lock_root,
+                &credential_root,
+                &config_dir,
+                api_url,
+                &http_base_url,
+                expected_error,
+            );
+            wait_for_marker(&marker(&root, "locked"), &mut holder);
+
+            let mut mutator = spawn_admin_lock_aba_mutator(&lock_root, &backup, api_url, mutation);
+            let mutator_status = mutator.wait().unwrap();
+            assert!(
+                mutator_status.success(),
+                "{mutation} child failed: {mutator_status}"
+            );
+
+            std::fs::write(marker(&root, "release"), b"release").unwrap();
+            let holder_status = wait_for_child_without_network(&mut holder, &control_listener);
+            assert!(
+                holder_status.success(),
+                "holder after {mutation} failed its regression oracle: {holder_status}"
+            );
+            assert!(
+                !marker(&root, "credential-audit").exists(),
+                "stale holder touched credentials after {mutation}"
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    #[ignore = "spawned by fleet_admin_lock_identity_changes_fail_before_credentials_or_network"]
+    fn fleet_admin_lock_aba_process_child() {
+        let Some(role) = std::env::var_os(ADMIN_LOCK_ABA_CHILD_ROLE) else {
+            return;
+        };
+        let role = role.to_str().unwrap();
+        let api_url = std::env::var(ADMIN_LOCK_ABA_API_URL).unwrap();
+        let lock_root = PathBuf::from(std::env::var_os("CATS_TEST_FLEET_ADMIN_LOCK_ROOT").unwrap());
+        match role {
+            "holder" => {
+                let expected = std::env::var(ADMIN_LOCK_ABA_EXPECTED_ERROR).unwrap();
+                let error = fleet_admin_session(Some(&api_url))
+                    .err()
+                    .expect("stale lock holder must fail closed");
+                let error = format!("{error:#}");
+                assert!(error.contains(&expected), "{error}");
+            }
+            "rename-root" => {
+                let backup = PathBuf::from(std::env::var_os(ADMIN_LOCK_ABA_BACKUP).unwrap());
+                std::fs::rename(&lock_root, backup).unwrap();
+                let replacement = FleetAdminStateLock::try_acquire(&api_url).unwrap();
+                assert!(
+                    replacement.is_some(),
+                    "replacement root must create an independently lockable inode"
+                );
+            }
+            "replace-lock" => {
+                let lock_path =
+                    lock_root.join(crate::config::fleet_admin_lock_filename(&api_url).unwrap());
+                std::fs::remove_file(lock_path).unwrap();
+                let replacement = FleetAdminStateLock::try_acquire(&api_url).unwrap();
+                assert!(
+                    replacement.is_some(),
+                    "replacement path must create an independently lockable inode"
+                );
+            }
+            other => panic!("unknown fleet-administrator ABA child role {other}"),
+        }
     }
 
     #[test]
@@ -983,6 +1348,7 @@ mod tests {
             std::fs::write(marker(&root, "second-saw-contention"), b"contended").unwrap();
         }
         let session = fleet_admin_session(Some(&api_url)).unwrap();
+        assert_eq!(session.api_url, canonical_https_origin(&api_url).unwrap());
         std::fs::write(
             marker(&root, &format!("{role}-observed-access")),
             session.access_token,

@@ -18,6 +18,8 @@ mod runtime_node_admin;
 #[path = "runtime_node_admin_unsupported.rs"]
 mod runtime_node_admin_unsupported_compile_shape;
 mod shell;
+#[cfg(unix)]
+mod stable_unix_fs;
 
 use std::time::{Duration, Instant};
 

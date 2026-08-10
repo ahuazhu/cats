@@ -223,12 +223,22 @@ human先用`cats admin login`取得独立的admin-Organization WorkOS session（
 access JWT），再运行上述命令；这个login/session不读取Cats Account/Workspace login，`--workspace`与
 `CATS_WORKSPACE`在`admin login/logout`和`admin runtime-node`均固定拒绝。
 
-独立admin session的credential-store account和跨进程排他锁都以同一个canonical API URL为scope。锁必须位于
-OS user-global、`CATS_CONFIG_DIR`之外的稳定namespace；文件型实现以credential account的domain-separated
-SHA-256命名，不能把URL字节直接拼进path，Unix实现还必须拒绝symlink/hardlink alias。login最终替换、
-refresh和logout都先取得该锁再重读当前credential，且持锁完成rotating refresh token的替换或删除；因此
-指向同一API、使用不同`CATS_CONFIG_DIR`的两个CLI进程也不能同时消费同一个refresh token，后取得锁者必须
-看到已轮换的token。
+独立admin session的credential-store account、跨进程排他锁和Control network authority都以同一个
+canonical HTTPS origin为scope：由唯一URL parser序列化origin，host case与IDNA归一化、默认`:443`省略，且
+拒绝userinfo、非`/` path、query和fragment。锁必须位于OS user-global、`CATS_CONFIG_DIR`之外的稳定
+namespace；文件型实现以canonical credential account的domain-separated SHA-256命名，不能把URL字节直接
+拼进path。旧版raw URL account只可在canonical lock内迁移：canonical缺失时先逐byte写入并确认，再删除raw；
+两者已存在且bytes不同必须fail closed；写入后任一crash都可由下次调用按相同规则继续，不能双消费refresh
+token。
+
+Unix实现从稳定ancestor/root descriptor以`openat(O_NOFOLLOW)`打开single-link lock，取得`flock`后重验完整
+ancestor/root/lock dev+ino与owner/mode/link合同，并在持锁阶段的每次credential read/write/delete及
+Control/WorkOS network effect紧邻的前后再次重验；任何rename/recreate或unlink/recreate都在下一个effect前
+fail closed。login取得全新、尚未持久化session的public/device-flow network不消费shared refresh token，完成
+后才进入上述locked replacement。该descriptor identity合同不声称消除同UID actor在最终pre-effect check后
+纳秒级重命名的竞态。login最终替换、refresh和logout都先取得该锁再重读当前credential，且持锁完成
+rotating refresh token的替换或删除；因此指向同一origin、使用不同`CATS_CONFIG_DIR`的两个CLI进程也不能
+同时消费同一个refresh token，后取得锁者必须看到已轮换的token；不同non-default port origin则保持隔离。
 
 平台若尚未实现本节要求的crash-safe pending/receipt backend，普通CLI、admin login/logout与help仍必须可编译
 运行；`admin runtime-node`则在读取request/key、创建本地authority state或发送network request之前返回明确的
@@ -1215,7 +1225,7 @@ body_sha256 = sha256:a4636d17031808e21932b2f54dc3b0d104243a1e9e56e33962f678cd4d8
 | route/trust bounds | query、encoded/trailing path、wrong method/media mapping；chunked/Content-Length实际65536进decoder、65537为413；success/error cap叉rotate/admin-error fixed vectors；trust bundle 16384边界、metadata/path/read-change fail startup；active-set/initial/overlap/principal fixed vectors；persisted deployment current-pointer/revision-receipt/lineage DDL check/unique/FK/projection corruption fail closed |
 | trust revision/history | revision1 null-previous；old -> overlap old+new -> new-only使用连续revision/exact previous-set CAS；两个replica同revision exact replay零写；same revision不同set、old-only stale restart、gap、wrong previous和两个不同next-set竞态输家均fail startup且不能retire current key；已移除ID、已retire SPKI、same ID/different SPKI、different ID/same SPKI和deployment改名均fail；tombstone/revision receipt不GC/不重激活 |
 | apply replay | response loss exact replay原200或persisted precondition 409；same apply ID异payload 409；new trust key可重放old-key apply；revision/credential CAS conflict零domain写入且保存rejected outcome |
-| official CLI | machine fixed-vector headers且key octets不落argv/log/state、same pending可换current key重签；human admin-only与同时拥有ordinary Workspace两种identity都只取独立admin-org session，runtime/admin login拒绝Workspace selector；同API/不同`CATS_CONFIG_DIR`的两个真实进程由OS user-global origin lock串行refresh且后者重读rotated token；pending在首send前逐级ancestor/record fsync；canonical bound 200和带exact单一apply-ID header的persisted precondition 409才先durably写resolution/index再清pending；A→B→A、不同exact apply ID、不同normalized origin和root/ancestor ABA均零错误重发；409 header缺失/重复/错值、EOF/reset/timeout/redirect/401/403/429/5xx/apply conflict/超限或mismatched 200都保留same body/apply ID；apply conflict报警不换ID；crash每个fsync窗口都不重新结算；未实现durable backend的平台仍编译普通/admin CLI并在任何Runtime Node I/O前fail closed |
+| official CLI | machine fixed-vector headers且key octets不落argv/log/state、same pending可换current key重签；human admin-only与同时拥有ordinary Workspace两种identity都只取独立admin-org session，runtime/admin login拒绝Workspace selector；等价`https://CONTROL.example`/`https://control.example:443/`、不同`CATS_CONFIG_DIR`的两个真实进程共用canonical account/lock并只refresh一次，后者重读rotated token，不同port origin隔离；legacy raw account逐byte迁移可重入且conflict fail closed；root rename/recreate和lock unlink/recreate的两进程barrier均使旧holder在credential/network前失败；pending在首send前逐级ancestor/record fsync；canonical bound 200和带exact单一apply-ID header的persisted precondition 409才先durably写resolution/index再清pending；A→B→A、不同exact apply ID、不同normalized origin和root/ancestor ABA均零错误重发；409 header缺失/重复/错值、EOF/reset/timeout/redirect/401/403/429/5xx/apply conflict/超限或mismatched 200都保留same body/apply ID；apply conflict报警不换ID；crash每个fsync窗口都不重新结算；未实现durable backend的平台仍编译普通/admin CLI并在任何Runtime Node I/O前fail closed |
 | admission/shutdown | global 32、每principal 4恰好边界；无等待，global满503/per-principal满429且Retry-After 1、零apply；cancel在commit-send前回滚，之后permit留到resolution；shutdown拒绝新请求、join可能commit的job，30000 ms未解析只能非零退出 |
 | Node credential lineage | exact现有`node_identities`表名；deferred circular/composite FK令current public-key ID/digest/state只指向同Node exact active/retired lineage；A19锁后join且只给retired exact-attempt replay例外；provision/rotation只接受PublicKey，ProviderPrincipal持久409；same/different Node历史ID/SPKI重用均持久409；partial/错state constraint注入整笔abort且不伪造result |
 | A19a lifecycle | atomic identity+cordoned policy；cordoned/drained/expired-session rotation；pre-commit可保留old，commit后只能forward-complete new；old永久retired无reverse CAS；new half丢失只能retire/new lineage；crash windows只重放same apply/private half |

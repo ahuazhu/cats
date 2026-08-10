@@ -5,10 +5,10 @@
 //! two terminal responses frozen by A23 can publish a resolution receipt and
 //! durably remove that pending record.
 
-use std::ffi::{CStr, CString, OsStr};
+use std::ffi::{CStr, CString};
 use std::fs::{File, OpenOptions};
 use std::io::{self, Read, Write};
-use std::os::fd::{AsRawFd, FromRawFd};
+use std::os::fd::AsRawFd;
 use std::os::unix::ffi::OsStrExt as _;
 use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
@@ -36,6 +36,13 @@ use fs2::FileExt;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest as _, Sha256};
 
+#[cfg(test)]
+use crate::stable_unix_fs::DirectorySyncProbeGuard;
+use crate::stable_unix_fs::{
+    c_os_name, effective_uid, identity_at, open_directory_nofollow, open_file_at,
+    open_or_create_directory_at, sync_directory, validate_owned_directory, FileIdentity,
+    StableDirectory,
+};
 use crate::{
     auth, config, Cli, RuntimeNodeAuthorityAuth, RuntimeNodeCommand, RuntimeNodeCredentialCommand,
     RuntimeNodePolicyCommand,
@@ -1173,18 +1180,7 @@ fn report_terminal(cli: &Cli, terminal: TerminalOutcome) -> Result<()> {
 }
 
 fn validate_https_origin(value: &str) -> Result<String> {
-    let parsed = reqwest::Url::parse(value).context("invalid Runtime Node authority origin")?;
-    anyhow::ensure!(
-        parsed.scheme() == "https"
-            && parsed.has_host()
-            && parsed.username().is_empty()
-            && parsed.password().is_none()
-            && parsed.path() == "/"
-            && parsed.query().is_none()
-            && parsed.fragment().is_none(),
-        "Runtime Node authority requires an exact HTTPS origin without path, query, credentials, or fragment"
-    );
-    Ok(parsed.origin().ascii_serialization())
+    config::canonical_https_origin(value).context("invalid Runtime Node authority origin")
 }
 
 fn state_root() -> Result<PathBuf> {
@@ -1344,94 +1340,6 @@ fn read_bounded(file: File, maximum: usize) -> Result<Vec<u8>> {
     Ok(bytes)
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct FileIdentity {
-    device: u64,
-    inode: u64,
-}
-
-impl FileIdentity {
-    fn of(file: &File) -> io::Result<Self> {
-        let metadata = file.metadata()?;
-        Ok(Self {
-            device: metadata.dev(),
-            inode: metadata.ino(),
-        })
-    }
-}
-
-struct DirectoryLink {
-    parent: File,
-    entry_name: CString,
-    child_identity: FileIdentity,
-}
-
-struct StableDirectory {
-    directory: File,
-    links: Vec<DirectoryLink>,
-    identity: FileIdentity,
-}
-
-impl StableDirectory {
-    fn open_or_create(path: &Path) -> Result<Self> {
-        anyhow::ensure!(
-            path.is_absolute(),
-            "Runtime Node authority state requires an absolute CATS_CONFIG_DIR"
-        );
-        let mut directory = open_directory_nofollow(Path::new("/"))?;
-        let mut links = Vec::new();
-        for component in path.components() {
-            use std::path::Component;
-            let component = match component {
-                Component::RootDir | Component::CurDir => continue,
-                Component::Normal(component) => component,
-                Component::ParentDir => {
-                    bail!("Runtime Node authority state path may not contain '..'")
-                }
-                Component::Prefix(_) => bail!("unsupported Runtime Node authority state path"),
-            };
-            let name = c_os_name(component)?;
-            let (next, created) = open_or_create_directory_at(&directory, &name)?;
-            // Sync even when another process won the mkdir race: observing an
-            // entry does not prove that process completed its parent barrier.
-            // Thus every selected ancestor is durable before traversal moves
-            // below it, and no request can precede an ancestor barrier.
-            sync_directory(&directory, "sync selected state ancestor parent")?;
-            if created {
-                sync_directory(&next, "sync newly-created state ancestor")?;
-            }
-            links.push(DirectoryLink {
-                parent: directory.try_clone()?,
-                entry_name: name,
-                child_identity: FileIdentity::of(&next)?,
-            });
-            directory = next;
-        }
-        validate_owned_directory(&directory, false)?;
-        let identity = FileIdentity::of(&directory)?;
-        Ok(Self {
-            directory,
-            links,
-            identity,
-        })
-    }
-
-    fn assert_current(&self) -> Result<()> {
-        anyhow::ensure!(
-            FileIdentity::of(&self.directory)? == self.identity,
-            "Runtime Node authority state parent descriptor changed identity"
-        );
-        for link in &self.links {
-            let linked = identity_at(&link.parent, &link.entry_name, libc::AT_SYMLINK_NOFOLLOW)?;
-            anyhow::ensure!(
-                linked == link.child_identity,
-                "Runtime Node authority state ancestor was renamed or replaced"
-            );
-        }
-        Ok(())
-    }
-}
-
 struct StateRoot {
     parent: StableDirectory,
     directory: File,
@@ -1493,72 +1401,6 @@ impl StateRoot {
     }
 }
 
-fn open_or_create_directory_at(parent: &File, name: &CStr) -> Result<(File, bool)> {
-    match open_file_at(parent, name, libc::O_RDONLY | libc::O_DIRECTORY, 0) {
-        Ok(file) => Ok((file, false)),
-        Err(error) if error.kind() == io::ErrorKind::NotFound => {
-            match mkdir_at(parent, name, 0o700) {
-                Ok(()) => {}
-                Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
-                    return Ok((
-                        open_file_at(parent, name, libc::O_RDONLY | libc::O_DIRECTORY, 0)?,
-                        false,
-                    ));
-                }
-                Err(error) => return Err(error).context("create state directory"),
-            }
-            let file = open_file_at(parent, name, libc::O_RDONLY | libc::O_DIRECTORY, 0)?;
-            Ok((file, true))
-        }
-        Err(error) => Err(error).context("open Runtime Node authority state directory"),
-    }
-}
-
-fn sync_directory(directory: &File, context: &'static str) -> Result<()> {
-    #[cfg(test)]
-    if directory_sync_probe_should_fail() {
-        bail!("injected directory-sync failure: {context}");
-    }
-    directory.sync_all().context(context)
-}
-
-#[cfg(test)]
-thread_local! {
-    static DIRECTORY_SYNC_PROBE: std::cell::Cell<(Option<usize>, usize)> =
-        const { std::cell::Cell::new((None, 0)) };
-}
-
-#[cfg(test)]
-fn directory_sync_probe_should_fail() -> bool {
-    DIRECTORY_SYNC_PROBE.with(|probe| {
-        let (fail_at, count) = probe.get();
-        probe.set((fail_at, count + 1));
-        fail_at == Some(count)
-    })
-}
-
-#[cfg(test)]
-struct DirectorySyncProbeGuard;
-
-#[cfg(test)]
-impl DirectorySyncProbeGuard {
-    fn start(fail_at: Option<usize>) -> Self {
-        DIRECTORY_SYNC_PROBE.with(|probe| probe.set((fail_at, 0)));
-        Self
-    }
-
-    fn count(&self) -> usize {
-        DIRECTORY_SYNC_PROBE.with(|probe| probe.get().1)
-    }
-}
-
-#[cfg(test)]
-impl Drop for DirectorySyncProbeGuard {
-    fn drop(&mut self) {
-        DIRECTORY_SYNC_PROBE.with(|probe| probe.set((None, 0)));
-    }
-}
-
 fn open_state_lock(parent: &File, name: &CStr) -> Result<(File, bool)> {
     match open_file_at(
         parent,
@@ -1605,19 +1447,6 @@ fn open_read_only_nofollow(path: &Path) -> io::Result<File> {
     options.open(path)
 }
 
-fn open_directory_nofollow(path: &Path) -> Result<File> {
-    let mut options = OpenOptions::new();
-    options.read(true);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt;
-        options.custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC);
-    }
-    options
-        .open(path)
-        .with_context(|| format!("open directory {}", path.display()))
-}
-
 fn validate_private_regular_file(file: &File, path: &Path) -> Result<()> {
     let metadata = file.metadata()?;
     anyhow::ensure!(
@@ -1656,30 +1485,6 @@ fn validate_private_regular_file_descriptor(file: &File, display: &str) -> Resul
         metadata.mode() & 0o077 == 0,
         "{display} is accessible to another user"
     );
-    Ok(())
-}
-
-fn validate_owned_directory(directory: &File, private: bool) -> Result<()> {
-    let metadata = directory.metadata()?;
-    anyhow::ensure!(
-        metadata.file_type().is_dir(),
-        "state entry is not a directory"
-    );
-    anyhow::ensure!(
-        metadata.uid() == effective_uid(),
-        "state directory has a different owner"
-    );
-    if private {
-        anyhow::ensure!(
-            metadata.mode() & 0o7777 == 0o700,
-            "state directory must have exact mode 0700"
-        );
-    } else {
-        anyhow::ensure!(
-            metadata.mode() & 0o022 == 0,
-            "state directory is writable by another user"
-        );
-    }
     Ok(())
 }
 
@@ -1819,44 +1624,6 @@ fn c_name(value: &str) -> Result<CString> {
     CString::new(value).context("state entry contains NUL")
 }
 
-fn c_os_name(value: &OsStr) -> Result<CString> {
-    anyhow::ensure!(
-        !value.is_empty() && !value.as_bytes().contains(&b'/'),
-        "state entry is not a single path component"
-    );
-    CString::new(value.as_bytes()).context("state entry contains NUL")
-}
-
-fn open_file_at(directory: &File, name: &CStr, flags: i32, mode: libc::c_uint) -> io::Result<File> {
-    // SAFETY: `name` is a live NUL-terminated component and the returned file
-    // descriptor is uniquely transferred into `File` on success.
-    let descriptor = unsafe {
-        libc::openat(
-            directory.as_raw_fd(),
-            name.as_ptr(),
-            flags | libc::O_NOFOLLOW | libc::O_CLOEXEC,
-            mode,
-        )
-    };
-    if descriptor < 0 {
-        Err(io::Error::last_os_error())
-    } else {
-        // SAFETY: `descriptor` is a fresh owned descriptor from `openat`.
-        Ok(unsafe { File::from_raw_fd(descriptor) })
-    }
-}
-
-fn mkdir_at(directory: &File, name: &CStr, mode: libc::mode_t) -> io::Result<()> {
-    // SAFETY: `name` is a live NUL-terminated component resolved against the
-    // held directory descriptor.
-    let result = unsafe { libc::mkdirat(directory.as_raw_fd(), name.as_ptr(), mode) };
-    if result == 0 {
-        Ok(())
-    } else {
-        Err(io::Error::last_os_error())
-    }
-}
-
 fn unlink_at(directory: &File, name: &CStr) -> io::Result<()> {
     // SAFETY: `name` is a live NUL-terminated component resolved against the
     // held directory descriptor; flags zero refuses directory removal.
@@ -1866,46 +1633,6 @@ fn unlink_at(directory: &File, name: &CStr) -> io::Result<()> {
     } else {
         Err(io::Error::last_os_error())
     }
-}
-
-fn identity_at(directory: &File, name: &CStr, flags: i32) -> io::Result<FileIdentity> {
-    let mut metadata = std::mem::MaybeUninit::<libc::stat>::uninit();
-    // SAFETY: metadata points to writable storage for one `stat`, and `name`
-    // is a live NUL-terminated component beneath the held directory.
-    let result = unsafe {
-        libc::fstatat(
-            directory.as_raw_fd(),
-            name.as_ptr(),
-            metadata.as_mut_ptr(),
-            flags,
-        )
-    };
-    if result != 0 {
-        return Err(io::Error::last_os_error());
-    }
-    // SAFETY: successful `fstatat` initialized the complete structure.
-    let metadata = unsafe { metadata.assume_init() };
-    let file_type = metadata.st_mode & libc::S_IFMT;
-    if file_type != libc::S_IFREG && file_type != libc::S_IFDIR {
-        return Err(io::Error::other(
-            "state authority entry has an unsupported file type",
-        ));
-    }
-    #[cfg(target_os = "macos")]
-    let device = u64::try_from(metadata.st_dev).map_err(|_| io::Error::other("invalid device"))?;
-    #[cfg(not(target_os = "macos"))]
-    let device = metadata.st_dev;
-    Ok(FileIdentity {
-        device,
-        inode: metadata.st_ino,
-    })
-}
-
-#[cfg(unix)]
-fn effective_uid() -> u32 {
-    // SAFETY: `geteuid` takes no pointers and only reads the calling process's
-    // effective credential; it cannot violate Rust memory invariants.
-    unsafe { libc::geteuid() }
 }
 
 #[cfg(test)]
