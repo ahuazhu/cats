@@ -123,6 +123,17 @@ fn ensure_schema(client: &mut Client) -> Result<()> {
     // The xact-scoped lock lets two first replicas converge without leaving a
     // session lock behind after any error.
     let mut transaction = client.transaction().map_err(internal)?;
+    // Unit tests intentionally create many isolated schemas in parallel on
+    // one small disposable PostgreSQL. Give both the per-schema convergence
+    // lock and the initial DDL a separate bounded test budget. SET LOCAL
+    // restores the production 5s/2s session limits when the transaction ends.
+    #[cfg(test)]
+    transaction
+        .batch_execute(
+            "SET LOCAL statement_timeout = '30s'; \
+             SET LOCAL lock_timeout = '30s'",
+        )
+        .map_err(internal)?;
     transaction
         .query_one(
             "SELECT pg_advisory_xact_lock(hashtext(current_schema()), 420103)",
@@ -157,26 +168,12 @@ fn ensure_schema(client: &mut Client) -> Result<()> {
                 "control-plane schema is nonempty but unstamped; recreate it",
             ));
         }
-        // Unit tests intentionally create many isolated schemas in parallel on
-        // one small disposable PostgreSQL. Concurrent catalog-heavy DDL can
-        // otherwise consume the production five-second statement budget even
-        // though each schema initializes promptly in isolation. Serialize
-        // only the initial DDL in test builds and give that test-only critical
-        // section its own bounded budget. The per-schema lock above still
-        // exercises two-replica first-connect convergence, and SET LOCAL
-        // restores the production 5s/2s session limits at commit.
+        // Different test schemas do not share the production per-schema lock,
+        // so serialize only their catalog-heavy initial DDL.
         #[cfg(test)]
-        {
-            transaction
-                .batch_execute(
-                    "SET LOCAL statement_timeout = '30s'; \
-                     SET LOCAL lock_timeout = '30s'",
-                )
-                .map_err(internal)?;
-            transaction
-                .query_one("SELECT pg_advisory_xact_lock(420111, 1)", &[])
-                .map_err(internal)?;
-        }
+        transaction
+            .query_one("SELECT pg_advisory_xact_lock(420111, 1)", &[])
+            .map_err(internal)?;
         transaction.batch_execute(SCHEMA).map_err(internal)?;
         transaction
             .execute(
