@@ -32,6 +32,7 @@ const ADMIN_TOKEN: &str = "dev-admin-token";
 const ROUTE_GRANT_PRIVATE_KEY: &[u8] =
     include_bytes!("../fixtures/route_grant_private_ed25519.pem");
 const ROUTE_GRANT_PUBLIC_KEY: &[u8] = include_bytes!("../fixtures/route_grant_public_ed25519.pem");
+const RETIRED_INVENTORY_INTERVAL: Duration = Duration::from_millis(300);
 
 fn node_request_signer(id: &str) -> Ed25519RequestSigner {
     // Each simulated Host needs a distinct credential lineage. Derive a
@@ -53,10 +54,39 @@ struct Cluster {
     cp: cats_control_plane::server::Handle,
     gateway: cats_network::Handle,
     nodes: Vec<NodeHandle>,
+    retired_inventory_tasks: Vec<RetiredInventoryTask>,
     http: reqwest::Client,
     cli_bin: PathBuf,
     /// The bootstrap Account's default Workspace; resource routes key on its ID.
     workspace_id: String,
+}
+
+struct RetiredInventoryTask {
+    node_id: String,
+    cancel: Option<tokio::sync::oneshot::Sender<()>>,
+    task: Option<tokio::task::JoinHandle<()>>,
+}
+
+impl RetiredInventoryTask {
+    fn cancel(&mut self) {
+        if let Some(cancel) = self.cancel.take() {
+            let _ = cancel.send(());
+        }
+    }
+
+    async fn stop(&mut self) {
+        self.cancel();
+        if let Some(task) = self.task.take() {
+            task.await.expect("retired inventory fixture task panicked");
+        }
+    }
+
+    fn abort(&mut self) {
+        self.cancel();
+        if let Some(task) = self.task.take() {
+            task.abort();
+        }
+    }
 }
 
 impl Cluster {
@@ -116,8 +146,11 @@ impl Cluster {
         .unwrap();
 
         let mut nodes = Vec::new();
+        let mut retired_inventory_tasks = Vec::new();
         for id in node_ids {
-            nodes.push(Self::start_node(&dir, &cp, &gateway, id).await);
+            let (node, retired_inventory_task) = Self::start_node(&dir, &cp, &gateway, id).await;
+            nodes.push(node);
+            retired_inventory_tasks.push(retired_inventory_task);
         }
         let workspace_id = cp
             .state
@@ -133,6 +166,7 @@ impl Cluster {
             cp,
             gateway,
             nodes,
+            retired_inventory_tasks,
             http: reqwest::Client::new(),
             cli_bin: workspace_bin("cats"),
             workspace_id,
@@ -144,7 +178,7 @@ impl Cluster {
         cp: &cats_control_plane::server::Handle,
         gateway: &cats_network::Handle,
         id: &str,
-    ) -> NodeHandle {
+    ) -> (NodeHandle, RetiredInventoryTask) {
         let meta_path = dir.path().join("storage-meta.db");
         let metadata_store = AdapterSelection {
             name: "sqlite".into(),
@@ -231,10 +265,18 @@ impl Cluster {
         // with the old product E2E.
         let retired_store = Arc::clone(&cp.state.store);
         let node_id = id.to_string();
-        tokio::spawn(async move {
+        let task_node_id = node_id.clone();
+        let (cancel, mut cancelled) = tokio::sync::oneshot::channel();
+        let task = tokio::spawn(async move {
             let client = reqwest::Client::new();
             loop {
-                tokio::time::sleep(Duration::from_millis(300)).await;
+                tokio::select! {
+                    result = &mut cancelled => {
+                        let _ = result;
+                        break;
+                    }
+                    _ = tokio::time::sleep(RETIRED_INVENTORY_INTERVAL) => {}
+                }
                 if client.get(&node_health).send().await.is_err() {
                     break;
                 }
@@ -265,7 +307,42 @@ impl Cluster {
                     .await;
             }
         });
-        node
+        (
+            node,
+            RetiredInventoryTask {
+                node_id: task_node_id,
+                cancel: Some(cancel),
+                task: Some(task),
+            },
+        )
+    }
+
+    fn retired_inventory_projection(&self) -> Vec<(String, i64)> {
+        let mut projection = self
+            .retired_inventory_tasks
+            .iter()
+            .map(|task| {
+                let heartbeat = self
+                    .cp
+                    .state
+                    .store
+                    .get_node(&task.node_id)
+                    .unwrap()
+                    .last_heartbeat_unix;
+                (task.node_id.clone(), heartbeat)
+            })
+            .collect::<Vec<_>>();
+        projection.sort();
+        projection
+    }
+
+    async fn shutdown_control_plane(&mut self) -> Vec<(String, i64)> {
+        for task in &mut self.retired_inventory_tasks {
+            task.stop().await;
+        }
+        let stopped_projection = self.retired_inventory_projection();
+        self.cp.shutdown().await.unwrap();
+        stopped_projection
     }
 
     /// Run the real `cats` binary; returns (exit_ok, stdout, stderr).
@@ -480,6 +557,9 @@ impl Cluster {
 
 impl Drop for Cluster {
     fn drop(&mut self) {
+        for task in &mut self.retired_inventory_tasks {
+            task.abort();
+        }
         for i in 0..self.nodes.len() {
             self.cleanup_node_children(i);
         }
@@ -598,7 +678,7 @@ async fn absolute_expiry_reaps_the_cat_without_any_caller() {
 /// down an established WebSocket.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn established_endpoint_websocket_survives_control_plane_outage() {
-    let cluster = Cluster::start(&["node-a"]).await;
+    let mut cluster = Cluster::start(&["node-a"]).await;
     cluster
         .cli_ok(&[
             "create",
@@ -636,7 +716,7 @@ async fn established_endpoint_websocket_survives_control_plane_outage() {
         vec![0, 1, 2, 255]
     );
 
-    cluster.cp.shutdown().await.unwrap();
+    let stopped_inventory = cluster.shutdown_control_plane().await;
     // The removed control-plane work lease renewed every 30 seconds. Cross
     // that exact old failure boundary as well as the two-second test Grant.
     tokio::time::sleep(Duration::from_secs(31)).await;
@@ -646,6 +726,30 @@ async fn established_endpoint_websocket_survives_control_plane_outage() {
         "after control outage"
     );
     socket.close(None).await.unwrap();
+    assert_eq!(cluster.retired_inventory_projection(), stopped_inventory);
+}
+
+/// The old product fixture writes its private heartbeat projection directly.
+/// It must stop and join before a total control-plane outage so the test cannot
+/// keep hidden control authority alive through an Arc to the Store.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn retired_inventory_fixture_stops_before_control_plane_outage() {
+    let mut cluster = Cluster::start(&["node-a"]).await;
+    let initial = cluster.retired_inventory_projection();
+    tokio::time::sleep(Duration::from_millis(1_300)).await;
+    assert_ne!(
+        cluster.retired_inventory_projection(),
+        initial,
+        "the positive fixture did not update the retired heartbeat projection",
+    );
+
+    let stopped = cluster.shutdown_control_plane().await;
+    tokio::time::sleep(Duration::from_millis(1_300)).await;
+    assert_eq!(
+        cluster.retired_inventory_projection(),
+        stopped,
+        "retired inventory fixture mutated Store state after control-plane shutdown",
+    );
 }
 
 /// A Running Endpoint is data-plane traffic. Once the Gateway has a bounded V1
@@ -653,7 +757,7 @@ async fn established_endpoint_websocket_survives_control_plane_outage() {
 /// healthy Node and Guest before that authorization expires.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn running_endpoint_survives_control_plane_outage_with_cached_route_grant() {
-    let cluster = Cluster::start(&["node-a"]).await;
+    let mut cluster = Cluster::start(&["node-a"]).await;
     cluster
         .cli_ok(&[
             "create",
@@ -672,7 +776,7 @@ async fn running_endpoint_survives_control_plane_outage_with_cached_route_grant(
     let (status, first) = cluster.gateway_get(&hostname, "/before-outage").await;
     assert_eq!(status, 200, "failed to prime route cache: {first}");
 
-    cluster.cp.shutdown().await.unwrap();
+    let stopped_inventory = cluster.shutdown_control_plane().await;
     let deadline = Instant::now() + Duration::from_secs(4);
     let mut successful_requests = 0;
     loop {
@@ -702,6 +806,7 @@ async fn running_endpoint_survives_control_plane_outage_with_cached_route_grant(
         successful_requests >= 10,
         "the sustained outage probe did not exercise enough authorized requests"
     );
+    assert_eq!(cluster.retired_inventory_projection(), stopped_inventory);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

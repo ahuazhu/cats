@@ -36,7 +36,21 @@ const USAGE_HANG: Duration = Duration::from_secs(30);
 
 #[derive(Clone, Default)]
 struct MockControlPlane {
+    registrations: Arc<AtomicUsize>,
     usage_attempts: Arc<AtomicUsize>,
+    legacy_heartbeat_attempts: Arc<AtomicUsize>,
+    legacy_work_status_attempts: Arc<AtomicUsize>,
+}
+
+async fn trap_legacy_heartbeat(State(cp): State<MockControlPlane>) -> StatusCode {
+    cp.legacy_heartbeat_attempts.fetch_add(1, Ordering::SeqCst);
+    StatusCode::NO_CONTENT
+}
+
+async fn trap_legacy_work_status(State(cp): State<MockControlPlane>) -> StatusCode {
+    cp.legacy_work_status_attempts
+        .fetch_add(1, Ordering::SeqCst);
+    StatusCode::NO_CONTENT
 }
 
 /// Stands in for an ingest that is grinding through a large backlog: the request
@@ -52,7 +66,12 @@ async fn mock_usage_ok(State(cp): State<MockControlPlane>) -> StatusCode {
     StatusCode::NO_CONTENT
 }
 
-async fn mock_registration(headers: HeaderMap, body: Bytes) -> Response {
+async fn mock_registration(
+    State(cp): State<MockControlPlane>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Response {
+    cp.registrations.fetch_add(1, Ordering::SeqCst);
     verify_request_proof(
         "POST",
         REGISTRATION_PATH,
@@ -103,6 +122,11 @@ async fn start_mock(hang_usage: bool) -> (MockControlPlane, String) {
     let app = Router::new()
         .route("/v1/internal/usage/checkpoints", usage)
         .route(REGISTRATION_PATH, post(mock_registration))
+        // These are traps, not compatibility behavior: a regression in the
+        // agent's outbound task graph gets a successful response and is
+        // detected only by the exact zero-call assertions below.
+        .route("/v1/nodes/heartbeat", post(trap_legacy_heartbeat))
+        .route("/v1/nodes/work-status", post(trap_legacy_work_status))
         .with_state(cp.clone());
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
@@ -110,6 +134,23 @@ async fn start_mock(hang_usage: bool) -> (MockControlPlane, String) {
         axum::serve(listener, app).await.ok();
     });
     (cp, format!("http://{addr}"))
+}
+
+fn assert_signed_registration_without_legacy_posts(cp: &MockControlPlane) {
+    assert!(
+        cp.registrations.load(Ordering::SeqCst) >= 1,
+        "the positive signed registration probe never reached the mock control plane",
+    );
+    assert_eq!(
+        cp.legacy_heartbeat_attempts.load(Ordering::SeqCst),
+        0,
+        "the retired heartbeat transport was resurrected",
+    );
+    assert_eq!(
+        cp.legacy_work_status_attempts.load(Ordering::SeqCst),
+        0,
+        "the retired work-status transport was resurrected",
+    );
 }
 
 /// Put one checkpoint in the spool the agent will open, so the uploader has
@@ -211,6 +252,7 @@ async fn a_hanging_usage_upload_does_not_delay_the_heartbeat() {
         cp.usage_attempts.load(Ordering::SeqCst) >= 1,
         "the uploader must still be trying on its own channel"
     );
+    assert_signed_registration_without_legacy_posts(&cp);
 }
 
 /// The upload still happens without either retired Node transport.
@@ -225,4 +267,5 @@ async fn usage_upload_runs_on_its_own_channel() {
         cp.usage_attempts.load(Ordering::SeqCst) >= 1,
         "decoupling must not mean the upload stops happening"
     );
+    assert_signed_registration_without_legacy_posts(&cp);
 }
