@@ -23,6 +23,26 @@ pub(crate) struct UserSession {
 pub(crate) struct FleetAdminSession {
     pub api_url: String,
     pub access_token: String,
+    state_lock: FleetAdminStateLock,
+}
+
+impl FleetAdminSession {
+    pub(crate) fn assert_current(&self) -> Result<()> {
+        self.state_lock.assert_current()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn for_test(
+        api_url: String,
+        access_token: String,
+        state_lock: FleetAdminStateLock,
+    ) -> Self {
+        Self {
+            api_url,
+            access_token,
+            state_lock,
+        }
+    }
 }
 
 pub(crate) struct FleetAdminIdentity {
@@ -205,6 +225,7 @@ pub(crate) fn fleet_admin_session(provided_api_url: Option<&str>) -> Result<Flee
     Ok(FleetAdminSession {
         api_url: canonical_origin,
         access_token: credentials.access_token,
+        state_lock: lock,
     })
 }
 
@@ -762,9 +783,9 @@ mod tests {
 
     fn spawn_admin_refresh_child(
         root: &Path,
-        lock_root: &Path,
         credential_root: &Path,
         config_dir: &Path,
+        environment_root: &Path,
         api_url: &str,
         http_base_url: &str,
         role: &str,
@@ -779,10 +800,12 @@ mod tests {
             .env(ADMIN_REFRESH_CHILD_ROLE, role)
             .env(ADMIN_REFRESH_ROOT, root)
             .env(ADMIN_REFRESH_API_URL, api_url)
-            .env("CATS_TEST_FLEET_ADMIN_LOCK_ROOT", lock_root)
+            .env_remove("CATS_TEST_FLEET_ADMIN_LOCK_ROOT")
             .env("CATS_TEST_CREDENTIAL_STORE_DIR", credential_root)
             .env("CATS_TEST_FLEET_ADMIN_HTTP_BASE_URL", http_base_url)
             .env("CATS_CONFIG_DIR", config_dir)
+            .env("HOME", environment_root)
+            .env("XDG_DATA_HOME", environment_root)
             .spawn()
             .unwrap()
     }
@@ -1023,25 +1046,33 @@ mod tests {
     }
 
     #[test]
-    fn fleet_admin_refresh_is_serial_across_distinct_config_dirs() {
+    fn fleet_admin_refresh_is_serial_across_process_environment_splits() {
         let directory = tempfile::tempdir().unwrap();
         let root = std::fs::canonicalize(directory.path()).unwrap();
-        let lock_root = root.join("global-lock-root");
         let credential_root = root.join("credential-store");
         let config_a = root.join("config-a");
         let config_b = root.join("config-b");
-        std::fs::create_dir(&config_a).unwrap();
-        std::fs::create_dir(&config_b).unwrap();
-        std::fs::create_dir(&credential_root).unwrap();
-        let first_api_url = "https://CONTROL.example";
-        let second_api_url = "https://control.example:443/";
-        let canonical_origin = canonical_https_origin(first_api_url).unwrap();
+        let home_a = root.join("home-a");
+        let home_b = root.join("home-b");
+        for path in [&config_a, &config_b, &home_a, &home_b, &credential_root] {
+            std::fs::create_dir(path).unwrap();
+        }
+        let nonce = root
+            .file_name()
+            .unwrap()
+            .to_string_lossy()
+            .chars()
+            .filter(char::is_ascii_alphanumeric)
+            .collect::<String>();
+        let first_api_url = format!("https://LOCK-{nonce}.example");
+        let second_api_url = format!("https://lock-{nonce}.example:443/");
+        let canonical_origin = canonical_https_origin(&first_api_url).unwrap();
         assert_eq!(
             canonical_origin,
-            canonical_https_origin(second_api_url).unwrap()
+            canonical_https_origin(&second_api_url).unwrap()
         );
         let legacy_credential =
-            FleetAdminCredentials::test_store_path(&credential_root, first_api_url);
+            FleetAdminCredentials::test_store_path(&credential_root, &first_api_url);
         let encoded = serde_json::to_string(&admin_credentials("org_admin")).unwrap();
         std::fs::write(&legacy_credential, &encoded).unwrap();
 
@@ -1100,20 +1131,20 @@ mod tests {
 
         let mut first = spawn_admin_refresh_child(
             &root,
-            &lock_root,
             &credential_root,
             &config_a,
-            first_api_url,
+            &home_a,
+            &first_api_url,
             &http_base_url,
             "first",
         );
         wait_for_marker(&refresh_seen, &mut first);
         let mut second = spawn_admin_refresh_child(
             &root,
-            &lock_root,
             &credential_root,
             &config_b,
-            second_api_url,
+            &home_b,
+            &second_api_url,
             &http_base_url,
             "second",
         );
@@ -1324,7 +1355,7 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "spawned by fleet_admin_refresh_is_serial_across_distinct_config_dirs"]
+    #[ignore = "spawned by fleet_admin_refresh_is_serial_across_process_environment_splits"]
     fn fleet_admin_refresh_process_child() {
         let Some(role) = std::env::var_os(ADMIN_REFRESH_CHILD_ROLE) else {
             return;
@@ -1343,7 +1374,7 @@ mod tests {
                 FleetAdminStateLock::try_acquire(&api_url)
                     .unwrap()
                     .is_none(),
-                "different CATS_CONFIG_DIR values must contend on one API credential"
+                "HOME/XDG_DATA_HOME/CATS_CONFIG_DIR splits must contend on one API credential"
             );
             std::fs::write(marker(&root, "second-saw-contention"), b"contended").unwrap();
         }

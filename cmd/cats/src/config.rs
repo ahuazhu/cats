@@ -10,7 +10,8 @@ use sha2::{Digest as _, Sha256};
 
 #[cfg(unix)]
 use crate::stable_unix_fs::{
-    effective_uid, identity_at, open_file_at, FileIdentity, StableDirectory,
+    effective_uid, identity_at, open_directory_nofollow, open_file_at, FileIdentity,
+    StableDirectory,
 };
 use cats_api::auth::{UserProfile, Workspace};
 
@@ -278,9 +279,31 @@ impl FleetAdminStateLock {
     }
 
     #[cfg(test)]
+    pub(crate) fn acquire_in(root: &Path, api_url: &str) -> Result<Self> {
+        let canonical_origin = canonical_https_origin(api_url)?;
+        let state = open_fleet_admin_lock_in(root, &canonical_origin)?;
+        FileExt::lock_exclusive(&state.file)
+            .with_context(|| format!("lock fleet-administrator state for {canonical_origin}"))?;
+        state.finish_acquire()
+    }
+
+    #[cfg(test)]
     pub(crate) fn try_acquire(api_url: &str) -> Result<Option<Self>> {
         let canonical_origin = canonical_https_origin(api_url)?;
         let state = open_fleet_admin_lock(&canonical_origin)?;
+        match FileExt::try_lock_exclusive(&state.file) {
+            Ok(()) => state.finish_acquire().map(Some),
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => Ok(None),
+            Err(error) => Err(error).with_context(|| {
+                format!("try lock fleet-administrator state for {canonical_origin}")
+            }),
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn try_acquire_in(root: &Path, api_url: &str) -> Result<Option<Self>> {
+        let canonical_origin = canonical_https_origin(api_url)?;
+        let state = open_fleet_admin_lock_in(root, &canonical_origin)?;
         match FileExt::try_lock_exclusive(&state.file) {
             Ok(()) => state.finish_acquire().map(Some),
             Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => Ok(None),
@@ -534,14 +557,45 @@ fn fleet_admin_lock_root() -> Result<PathBuf> {
         return Ok(path);
     }
 
-    let project = ProjectDirs::from("run", "Cats", "cats")
-        .context("cannot locate a stable per-user directory for fleet-administrator locks")?;
-    let path = project.data_local_dir().join(ADMIN_LOCK_DIRECTORY);
+    #[cfg(unix)]
+    {
+        unix_fleet_admin_lock_root()
+    }
+
+    #[cfg(not(unix))]
+    {
+        let project = ProjectDirs::from("run", "Cats", "cats")
+            .context("cannot locate a stable per-user directory for fleet-administrator locks")?;
+        let path = project.data_local_dir().join(ADMIN_LOCK_DIRECTORY);
+        anyhow::ensure!(
+            path.is_absolute(),
+            "fleet-administrator lock directory is not absolute"
+        );
+        Ok(path)
+    }
+}
+
+#[cfg(unix)]
+fn unix_fleet_admin_lock_root() -> Result<PathBuf> {
+    #[cfg(target_os = "macos")]
+    const SHARED_ROOT: &str = "/private/tmp";
+    #[cfg(not(target_os = "macos"))]
+    const SHARED_ROOT: &str = "/tmp";
+
+    let directory = open_directory_nofollow(Path::new(SHARED_ROOT))
+        .context("open fixed fleet-administrator lock namespace")?;
+    use std::os::unix::fs::MetadataExt as _;
+    let metadata = directory
+        .metadata()
+        .context("inspect fixed fleet-administrator lock namespace")?;
     anyhow::ensure!(
-        path.is_absolute(),
-        "fleet-administrator lock directory is not absolute"
+        metadata.file_type().is_dir() && metadata.uid() == 0 && metadata.mode() & 0o7777 == 0o1777,
+        "fixed fleet-administrator lock namespace must be a root-owned sticky 01777 directory"
     );
-    Ok(path)
+    Ok(Path::new(SHARED_ROOT).join(format!(
+        "cats-{ADMIN_LOCK_DIRECTORY}-uid-{}",
+        effective_uid()
+    )))
 }
 
 fn fleet_admin_lock_filename_canonical(canonical_origin: &str) -> String {

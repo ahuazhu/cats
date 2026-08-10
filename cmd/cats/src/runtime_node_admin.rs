@@ -679,13 +679,23 @@ enum ResponseClassification {
 }
 
 enum RequestAuthority {
-    FleetAdministrator {
+    ExplicitFleetAdministrator {
         access_token: String,
     },
+    FleetAdministratorSession(auth::FleetAdminSession),
     DeploymentProvisioner {
         deployment_id: Id,
         signer: Ed25519RequestSigner,
     },
+}
+
+impl RequestAuthority {
+    fn assert_current(&self) -> Result<()> {
+        match self {
+            Self::FleetAdministratorSession(session) => session.assert_current(),
+            Self::ExplicitFleetAdministrator { .. } | Self::DeploymentProvisioner { .. } => Ok(()),
+        }
+    }
 }
 
 enum PreparedApply {
@@ -916,7 +926,7 @@ fn request_authority(
 
     if let Some(token) = &cli.token {
         anyhow::ensure!(!token.is_empty(), "--token is empty");
-        return Ok(RequestAuthority::FleetAdministrator {
+        return Ok(RequestAuthority::ExplicitFleetAdministrator {
             access_token: token.clone(),
         });
     }
@@ -925,9 +935,7 @@ fn request_authority(
         validate_https_origin(&session.api_url)? == origin,
         "fleet-administrator login origin changed after the request became pending"
     );
-    Ok(RequestAuthority::FleetAdministrator {
-        access_token: session.access_token,
-    })
+    Ok(RequestAuthority::FleetAdministratorSession(session))
 }
 
 fn send_pending(
@@ -961,9 +969,15 @@ fn send_pending(
         ),
     ];
     match authority {
-        RequestAuthority::FleetAdministrator { access_token } => headers.push((
+        RequestAuthority::ExplicitFleetAdministrator { access_token } => {
+            headers.push((
+                reqwest::header::AUTHORIZATION.as_str(),
+                format!("Bearer {access_token}"),
+            ));
+        }
+        RequestAuthority::FleetAdministratorSession(session) => headers.push((
             reqwest::header::AUTHORIZATION.as_str(),
-            format!("Bearer {access_token}"),
+            format!("Bearer {}", session.access_token),
         )),
         RequestAuthority::DeploymentProvisioner {
             deployment_id,
@@ -979,13 +993,19 @@ fn send_pending(
     // replaced while credentials were acquired, this invocation sends zero
     // bytes. A second instance cannot pass the same global lock until
     // this one releases it.
+    authority.assert_current()?;
     state.assert_current_authority()?;
-    transport.send(OutboundRequest {
+    let result = transport.send(OutboundRequest {
         method: METHOD,
         url: request_url,
         headers,
         body,
-    })
+    });
+    let authority_after = authority.assert_current();
+    let state_after = state.assert_current_authority();
+    authority_after.context("fleet-administrator lock changed during Runtime Node request")?;
+    state_after.context("Runtime Node authority state changed during request")?;
+    result
 }
 
 impl AuthorityTransport for ReqwestAuthorityTransport {
@@ -1637,7 +1657,7 @@ fn unlink_at(directory: &File, name: &CStr) -> io::Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use std::cell::RefCell;
+    use std::cell::{Cell, RefCell};
     use std::collections::VecDeque;
     use std::fs;
     use std::sync::mpsc;
@@ -1820,7 +1840,7 @@ mod tests {
                 let response = send_pending(
                     state,
                     &pending,
-                    &RequestAuthority::FleetAdministrator {
+                    &RequestAuthority::ExplicitFleetAdministrator {
                         access_token: "short-lived-workos-jwt".to_owned(),
                     },
                     transport,
@@ -1829,6 +1849,125 @@ mod tests {
                 state.settle(&pending, response).unwrap()
             }
         }
+    }
+
+    #[test]
+    fn explicit_admin_token_does_not_acquire_session_state() {
+        let cli = Cli {
+            api_url: Some("https://control.example:8443".to_owned()),
+            token: Some("explicit-short-lived-token".to_owned()),
+            workspace: None,
+            no_wait: false,
+            json: false,
+            command: crate::Command::Whoami,
+        };
+        let source = RuntimeNodeAuthorityAuth {
+            deployment_id: None,
+            provisioner_credential_id: None,
+            provisioner_private_key_file: None,
+        };
+        let authority = request_authority(&cli, &source, "https://control.example:8443").unwrap();
+        assert!(matches!(
+            authority,
+            RequestAuthority::ExplicitFleetAdministrator { access_token }
+                if access_token == "explicit-short-lived-token"
+        ));
+    }
+
+    #[test]
+    fn session_admin_lock_is_checked_before_the_final_send() {
+        let directory = tempfile::tempdir().unwrap();
+        let base = test_base(&directory);
+        let desired = generated_update(update());
+        let state = PendingState::acquire(&base.join("state"), desired.node_id()).unwrap();
+        let origin = "https://control.example:8443";
+        let pending = state.prepare(origin, &desired).unwrap();
+        let lock_root = base.join("admin-locks");
+        let lock = config::FleetAdminStateLock::acquire_in(&lock_root, origin).unwrap();
+        let authority =
+            RequestAuthority::FleetAdministratorSession(auth::FleetAdminSession::for_test(
+                origin.to_owned(),
+                "session-short-lived-token".to_owned(),
+                lock,
+            ));
+        let lock_path = lock_root.join(config::fleet_admin_lock_filename(origin).unwrap());
+        fs::remove_file(lock_path).unwrap();
+        let replacement = config::FleetAdminStateLock::acquire_in(&lock_root, origin).unwrap();
+
+        let transport = RecordingTransport::default();
+        transport.respond_with(success_for(&pending));
+        let error = send_pending(&state, &pending, &authority, &transport)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.contains("lock path was unlinked or replaced"),
+            "{error}"
+        );
+        assert_eq!(transport.request_count(), 0);
+        drop(replacement);
+    }
+
+    #[test]
+    fn session_admin_lock_stays_held_and_is_rechecked_after_send_errors() {
+        struct ReplacingErrorTransport {
+            lock_root: PathBuf,
+            origin: String,
+            calls: Cell<usize>,
+        }
+
+        impl AuthorityTransport for ReplacingErrorTransport {
+            fn send(&self, _request: OutboundRequest) -> Result<StoredHttpResponse> {
+                self.calls.set(self.calls.get() + 1);
+                assert!(
+                    config::FleetAdminStateLock::try_acquire_in(&self.lock_root, &self.origin)
+                        .unwrap()
+                        .is_none(),
+                    "session-derived Runtime Node send must retain the canonical admin lock"
+                );
+                let lock_path = self
+                    .lock_root
+                    .join(config::fleet_admin_lock_filename(&self.origin).unwrap());
+                fs::remove_file(lock_path).unwrap();
+                drop(
+                    config::FleetAdminStateLock::acquire_in(&self.lock_root, &self.origin).unwrap(),
+                );
+                Err(anyhow!("injected Runtime Node transport failure"))
+            }
+        }
+
+        let directory = tempfile::tempdir().unwrap();
+        let base = test_base(&directory);
+        let desired = generated_update(update());
+        let state = PendingState::acquire(&base.join("state"), desired.node_id()).unwrap();
+        let origin = "https://control.example:8443";
+        let pending = state.prepare(origin, &desired).unwrap();
+        let lock_root = base.join("admin-locks");
+        let lock = config::FleetAdminStateLock::acquire_in(&lock_root, origin).unwrap();
+        let authority =
+            RequestAuthority::FleetAdministratorSession(auth::FleetAdminSession::for_test(
+                origin.to_owned(),
+                "session-short-lived-token".to_owned(),
+                lock,
+            ));
+        let transport = ReplacingErrorTransport {
+            lock_root,
+            origin: origin.to_owned(),
+            calls: Cell::new(0),
+        };
+
+        let error = format!(
+            "{:#}",
+            send_pending(&state, &pending, &authority, &transport).unwrap_err()
+        );
+        assert_eq!(transport.calls.get(), 1);
+        assert!(
+            error.contains("fleet-administrator lock changed during Runtime Node request"),
+            "{error}"
+        );
+        assert!(
+            error.contains("lock path was unlinked or replaced"),
+            "{error}"
+        );
     }
 
     #[test]
@@ -2378,7 +2517,7 @@ mod tests {
         assert!(send_pending(
             &state,
             &pending,
-            &RequestAuthority::FleetAdministrator {
+            &RequestAuthority::ExplicitFleetAdministrator {
                 access_token: "short-lived-workos-jwt".to_owned(),
             },
             &transport,
@@ -2421,7 +2560,7 @@ mod tests {
         assert!(send_pending(
             &state,
             &pending,
-            &RequestAuthority::FleetAdministrator {
+            &RequestAuthority::ExplicitFleetAdministrator {
                 access_token: "short-lived-workos-jwt".to_owned(),
             },
             &transport,

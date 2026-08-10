@@ -227,7 +227,9 @@ access JWT），再运行上述命令；这个login/session不读取Cats Account
 canonical HTTPS origin为scope：由唯一URL parser序列化origin，host case与IDNA归一化、默认`:443`省略，且
 拒绝userinfo、非`/` path、query和fragment。锁必须位于OS user-global、`CATS_CONFIG_DIR`之外的稳定
 namespace；文件型实现以canonical credential account的domain-separated SHA-256命名，不能把URL字节直接
-拼进path。旧版raw URL account只可在canonical lock内迁移：canonical缺失时先逐byte写入并确认，再删除raw；
+拼进path。Unix使用不受`HOME`/`XDG_DATA_HOME`影响的固定root-owned sticky临时目录，并在其下使用按effective
+UID隔离、owner匹配且exact `0700`的私有目录；进程环境不能为同一OS user/keyring account选择第二个锁namespace。
+旧版raw URL account只可在canonical lock内迁移：canonical缺失时先逐byte写入并确认，再删除raw；
 两者已存在且bytes不同必须fail closed；写入后任一crash都可由下次调用按相同规则继续，不能双消费refresh
 token。
 
@@ -239,6 +241,8 @@ fail closed。login取得全新、尚未持久化session的public/device-flow ne
 纳秒级重命名的竞态。login最终替换、refresh和logout都先取得该锁再重读当前credential，且持锁完成
 rotating refresh token的替换或删除；因此指向同一origin、使用不同`CATS_CONFIG_DIR`的两个CLI进程也不能
 同时消费同一个refresh token，后取得锁者必须看到已轮换的token；不同non-default port origin则保持隔离。
+session-derived human Runtime Node请求从上述重读/refresh一直持有同一canonical锁，紧邻最终Control network
+effect前后都重验（包括network error）；显式`--token`不消费shared rotating credential，因此不取得该锁。
 
 平台若尚未实现本节要求的crash-safe pending/receipt backend，普通CLI、admin login/logout与help仍必须可编译
 运行；`admin runtime-node`则在读取request/key、创建本地authority state或发送network request之前返回明确的
