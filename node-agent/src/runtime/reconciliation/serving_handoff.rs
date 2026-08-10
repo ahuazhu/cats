@@ -33,9 +33,10 @@ use cats_api::runtime_reconciliation::{
 };
 use cats_blockd::target_control::{
     decode_target_control_authorization, encode_target_control_authorization,
-    target_control_authorization_file_name, validate_target_control_attachment,
-    validate_target_control_authorization, StableDirectoryIdentity, StableFileIdentity,
-    TargetControlAuthorizationArtifact, TargetControlAuthorizationCodecError,
+    provision_root_authorization_context_digest, target_control_authorization_file_name,
+    validate_target_control_attachment, validate_target_control_authorization,
+    StableDirectoryIdentity, StableFileIdentity, TargetControlAuthorizationArtifact,
+    TargetControlAuthorizationCodecError,
     TargetControlLocalStateIdentity as ServingHandoffLocalStateIdentity,
     TARGET_CONTROL_AUTHORIZATION_MAX_BYTES as TARGET_AUTHORIZED_SERVING_MAX_BYTES,
 };
@@ -407,10 +408,22 @@ impl ServingHandoffStore {
             &target_name,
             &temporary_name,
         )?;
+        let ReconcileStep::ProvisionRootImage {
+            scope_id,
+            control_socket_path,
+            ..
+        } = &stored_checkpoint.checkpoint().step
+        else {
+            unreachable!("target candidate accepted only provision_root_image")
+        };
         let target_artifact = TargetControlAuthorizationArtifact {
             version: ContractVersion::V1,
             provision_transition_id: candidate.provision_transition_id.clone(),
-            checkpoint_content_digest: stored_checkpoint.content_digest().clone(),
+            provision_context_digest: provision_root_authorization_context_digest(
+                stored_checkpoint.checkpoint(),
+            )?,
+            runtime_scope_id: scope_id.clone(),
+            control_socket_path: control_socket_path.clone(),
             local_state: retained.local_state.clone(),
             attachment: candidate.target_attachment,
         };
@@ -1061,10 +1074,8 @@ fn validate_handoff_record(
         .join(format!("attachment-{}", record.attachment_id.as_str()))
         .join(format!("epoch-{}", record.attachment_epoch.get()));
     let expected_control_socket = process_directory.join("root-provision.sock");
-    let expected_scope = format!("cats-root-{}.service", process.ownership_token.as_str());
     let expected_artifact_name = target_control_file_name(&record.provision_transition_id);
     if record.version != ContractVersion::V1
-        || record.checkpoint_content_digest != target_artifact.checkpoint_content_digest
         || target_artifact.version != record.version
         || target_artifact.provision_transition_id != record.provision_transition_id
         || record.volume_id != identity.volume_id
@@ -1077,6 +1088,8 @@ fn validate_handoff_record(
         || record.placement_epoch != acquire_request.placement_epoch
         || record.expected_provisioned_head != attachment.head
         || record.expected_control_executable_path != process.executable_path
+        || target_artifact.runtime_scope_id != process.scope_id
+        || target_artifact.control_socket_path != process.control_socket_path
         || record.target_control_authorization.device
             != target_artifact.local_state.attachment_directory.device
         || record.target_control_authorization.inode.get() == 0
@@ -1086,7 +1099,6 @@ fn validate_handoff_record(
         || process.unit_main_process_id != process.process_id
         || process.process_start_time_ticks.get() == 0
         || process.cgroup_process_ids != [process.process_id]
-        || process.scope_id.as_str() != expected_scope
         || process.cgroup_path.as_str() != expected_cgroup
         || !process_directory.ends_with(&expected_directory_suffix)
         || Path::new(process.control_socket_path.as_str()) != expected_control_socket
@@ -1128,6 +1140,8 @@ fn validate_target_checkpoint_context(
         volume_id,
         attachment_id,
         attachment_epoch,
+        scope_id,
+        control_socket_path,
         data_directory,
         size_bytes,
         expected_provisioned_head,
@@ -1137,8 +1151,10 @@ fn validate_target_checkpoint_context(
         anyhow::bail!("target-control artifact requires current provision_root_image")
     };
     let attachment = &artifact.attachment;
+    let provision_context_digest =
+        provision_root_authorization_context_digest(checkpoint).map_err(anyhow::Error::from)?;
     anyhow::ensure!(
-        artifact.checkpoint_content_digest == *stored_checkpoint.content_digest()
+        artifact.provision_context_digest == provision_context_digest
             && artifact.provision_transition_id == *provision_transition_id
             && checkpoint.node_id == attachment.identity.node_id
             && checkpoint.placement_epoch == attachment.identity.placement_epoch
@@ -1146,6 +1162,8 @@ fn validate_target_checkpoint_context(
             && *volume_id == attachment.identity.volume_id
             && *attachment_id == attachment.identity.attachment_id
             && *attachment_epoch == attachment.identity.attachment_epoch
+            && *scope_id == artifact.runtime_scope_id
+            && *control_socket_path == artifact.control_socket_path
             && *size_bytes == attachment.size_bytes
             && expected_provisioned_head == &attachment.head
             && data_directory.as_str() == artifact.local_state.attachment_directory.path.as_str(),
@@ -2293,6 +2311,37 @@ mod tests {
         }
     }
 
+    fn assert_target_context_mutation_rejected(mutate: impl FnOnce(&mut RuntimeCheckpoint)) {
+        let mut fixture = fixture();
+        let store = fixture.store();
+        let control = store
+            .seal_target_control_authorization(
+                &fixture.stored_checkpoint,
+                &fixture.acquired,
+                &fixture.authority,
+            )
+            .unwrap();
+        let original_digest = control.identity().artifact.provision_context_digest.clone();
+        let mut changed = fixture.stored_checkpoint.checkpoint().clone();
+        mutate(&mut changed);
+        assert_ne!(
+            provision_root_authorization_context_digest(&changed).unwrap(),
+            original_digest
+        );
+        changed.updated_at_unix_ms =
+            UnixMillis::new(changed.updated_at_unix_ms.get().checked_add(1).unwrap()).unwrap();
+        fixture.replace_checkpoint(changed);
+        assert!(control.assert_current(&fixture.stored_checkpoint).is_err());
+        drop(control);
+        assert!(store
+            .seal_target_control_authorization(
+                &fixture.stored_checkpoint,
+                &fixture.acquired,
+                &fixture.authority,
+            )
+            .is_err());
+    }
+
     #[test]
     fn target_with_absent_process_seals_control_recovery_then_exact_reload_seals_ready() {
         let fixture = fixture();
@@ -2744,7 +2793,7 @@ mod tests {
     }
 
     #[test]
-    fn stored_checkpoint_and_exact_process_proof_close_stale_or_mutated_context() {
+    fn process_token_rotation_replays_target_but_invalidates_concrete_handoff() {
         let mut wrong_executable = fixture();
         wrong_executable.process.executable_path = host("/opt/foreign/blockd");
         assert!(wrong_executable.exact_process_proof().is_err());
@@ -2761,21 +2810,89 @@ mod tests {
             )
             .unwrap();
         let original_digest = stale.stored_checkpoint.content_digest().clone();
+        let original_target = ready.target_control_authorization().clone();
         let mut successor = stale.stored_checkpoint.checkpoint().clone();
+        let ReconcileStep::ProvisionRootImage {
+            process_identity_token,
+            ..
+        } = &mut successor.step
+        else {
+            unreachable!()
+        };
+        *process_identity_token = random('5');
         successor.updated_at_unix_ms =
             UnixMillis::new(successor.updated_at_unix_ms.get().checked_add(1).unwrap()).unwrap();
         stale.replace_checkpoint(successor);
         assert_ne!(stale.stored_checkpoint.content_digest(), &original_digest);
         assert!(ready.assert_current(&stale.stored_checkpoint).is_err());
         drop(ready);
-        assert!(stale
+        let replay = stale
             .store()
             .seal_target_control_authorization(
                 &stale.stored_checkpoint,
                 &stale.acquired,
                 &stale.authority,
             )
-            .is_err());
+            .expect("token-only rotation replays the stable target authorization");
+        assert_eq!(replay.identity(), &original_target);
+    }
+
+    #[test]
+    fn target_context_digest_rejects_every_authorization_binding_change() {
+        assert_target_context_mutation_rejected(|checkpoint| {
+            let ReconcileStep::ProvisionRootImage { scope_id, .. } = &mut checkpoint.step else {
+                unreachable!()
+            };
+            *scope_id = id("cats-root-foreign.service");
+        });
+        assert_target_context_mutation_rejected(|checkpoint| {
+            let ReconcileStep::ProvisionRootImage {
+                control_socket_path,
+                ..
+            } = &mut checkpoint.step
+            else {
+                unreachable!()
+            };
+            *control_socket_path = host("/tmp/foreign-root-provision.sock");
+        });
+        assert_target_context_mutation_rejected(|checkpoint| {
+            let ReconcileStep::ProvisionRootImage { data_directory, .. } = &mut checkpoint.step
+            else {
+                unreachable!()
+            };
+            *data_directory = host("/tmp/foreign-root-data");
+        });
+        assert_target_context_mutation_rejected(|checkpoint| {
+            let ReconcileStep::ProvisionRootImage {
+                boot_image_digest, ..
+            } = &mut checkpoint.step
+            else {
+                unreachable!()
+            };
+            *boot_image_digest = digest('e');
+        });
+        assert_target_context_mutation_rejected(|checkpoint| {
+            let ReconcileStep::ProvisionRootImage {
+                expected_provisioned_head,
+                ..
+            } = &mut checkpoint.step
+            else {
+                unreachable!()
+            };
+            expected_provisioned_head.root_hash = Some(digest('e'));
+        });
+        assert_target_context_mutation_rejected(|checkpoint| {
+            checkpoint.spec_digest = digest('e');
+        });
+        assert_target_context_mutation_rejected(|checkpoint| {
+            checkpoint.desired_revision = Revision::new(12).unwrap();
+        });
+        assert_target_context_mutation_rejected(|checkpoint| {
+            checkpoint.placement_epoch = Epoch::new(4).unwrap();
+        });
+        assert_target_context_mutation_rejected(|checkpoint| {
+            checkpoint.lifecycle_admission = LifecycleAdmission::Open;
+        });
     }
 
     #[test]
@@ -3068,10 +3185,12 @@ mod tests {
         ));
         let mut wrong_checkpoint_digest = ready.record().clone();
         wrong_checkpoint_digest.checkpoint_content_digest = digest('0');
-        assert!(matches!(
-            encode_serving_handoff_record(&wrong_checkpoint_digest),
-            Err(ServingHandoffCodecError::Invalid { .. })
-        ));
+        encode_serving_handoff_record(&wrong_checkpoint_digest).unwrap();
+        assert!(validate_record_checkpoint_context(
+            &wrong_checkpoint_digest,
+            &fixture.stored_checkpoint
+        )
+        .is_err());
         let mut wrong_executable = ready.record().clone();
         wrong_executable.expected_control_executable_path = host("/opt/foreign/blockd");
         assert!(matches!(

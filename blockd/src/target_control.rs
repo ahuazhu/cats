@@ -7,7 +7,10 @@
 use std::path::{Component, Path};
 
 use cats_api::runtime_reconciliation::{
-    ContractVersion, HostPath, RandomId128, Sha256Digest, WireU64,
+    CheckpointRouteGate, ContractVersion, Epoch, FenceEpoch, GuestTransportEvidence, HostPath, Id,
+    LifecycleAdmission, ObservedMount, ObservedNetwork, ObservedVolume, ProcessEvidence,
+    RandomId128, ReconcileStep, RemoteHead, RequireIdleCheckpoint, Revision, RuntimeCheckpoint,
+    Sha256Digest, StableState, WarmSnapshotEvidence, WireU64,
 };
 use cats_storage::authority::{
     validate_authorized_serving_attachment, AuthorizedServingAttachment,
@@ -22,6 +25,8 @@ const ATTACHMENT_IDENTITY_FILE: &str = "identity.json";
 const ACQUIRE_AUTHORIZATION_FILE: &str = "authorized-serving.json";
 const LAUNCH_CHECKPOINT_FILE: &str = "launch-checkpoint.json";
 const MAX_LAUNCH_CHECKPOINT_BYTES: u64 = 512 * 1024;
+const PROVISION_ROOT_AUTHORIZATION_CONTEXT_DOMAIN: &[u8] =
+    b"cats.runtime.provision-root-authorization-context.v1";
 
 pub const TARGET_CONTROL_AUTHORIZATION_MAX_BYTES: usize = 32 * 1024;
 
@@ -49,9 +54,162 @@ pub enum TargetControlAuthorizationCodecError {
 pub struct TargetControlAuthorizationArtifact {
     pub version: ContractVersion,
     pub provision_transition_id: RandomId128,
-    pub checkpoint_content_digest: Sha256Digest,
+    pub provision_context_digest: ProvisionRootAuthorizationContextDigest,
+    pub runtime_scope_id: Id,
+    pub control_socket_path: HostPath,
     pub local_state: TargetControlLocalStateIdentity,
     pub attachment: AuthorizedServingAttachment,
+}
+
+/// Stable authorization context for a root-provision retry.
+///
+/// This digest deliberately excludes the checkpoint timestamp and process
+/// identity token. Runtime Reconciliation v1 permits a retry after exact
+/// process absence to rotate only that token while preserving every other
+/// checkpoint field.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct ProvisionRootAuthorizationContextDigest(Sha256Digest);
+
+impl ProvisionRootAuthorizationContextDigest {
+    pub fn new(digest: Sha256Digest) -> Self {
+        Self(digest)
+    }
+
+    pub fn as_sha256_digest(&self) -> &Sha256Digest {
+        &self.0
+    }
+}
+
+/// Computes the stable RuntimeCheckpoint authorization context.
+pub fn provision_root_authorization_context_digest(
+    checkpoint: &RuntimeCheckpoint,
+) -> Result<ProvisionRootAuthorizationContextDigest, TargetControlAuthorizationCodecError> {
+    let RuntimeCheckpoint {
+        version,
+        cat_id,
+        node_id,
+        placement_epoch,
+        desired_revision,
+        spec_digest,
+        runtime_incarnation,
+        stable_state,
+        step,
+        processes,
+        volumes,
+        mounts,
+        networks,
+        guest_transport,
+        warm_snapshot,
+        lifecycle_admission,
+        route_gates,
+        require_idle,
+        updated_at_unix_ms: _,
+    } = checkpoint;
+    let ReconcileStep::ProvisionRootImage {
+        provision_transition_id,
+        volume_id,
+        attachment_id,
+        attachment_epoch,
+        scope_id,
+        control_socket_path,
+        data_directory,
+        process_identity_token: _,
+        size_bytes,
+        boot_image_digest,
+        expected_blank_head,
+        expected_provisioned_head,
+    } = step
+    else {
+        return Err(invalid(
+            "provision authorization context requires provision_root_image",
+        ));
+    };
+    if runtime_incarnation.is_some() || stable_state.is_some() {
+        return Err(invalid(
+            "provision authorization context requires an unstable runtime",
+        ));
+    }
+    let value = serde_json::to_value(ProvisionRootAuthorizationContext {
+        version: *version,
+        cat_id,
+        node_id,
+        placement_epoch: *placement_epoch,
+        desired_revision: *desired_revision,
+        spec_digest,
+        runtime_incarnation,
+        stable_state,
+        step: ProvisionRootAuthorizationStep {
+            kind: "provision_root_image",
+            provision_transition_id,
+            volume_id,
+            attachment_id,
+            attachment_epoch: *attachment_epoch,
+            scope_id,
+            control_socket_path,
+            data_directory,
+            size_bytes: *size_bytes,
+            boot_image_digest,
+            expected_blank_head,
+            expected_provisioned_head,
+        },
+        processes,
+        volumes,
+        mounts,
+        networks,
+        guest_transport,
+        warm_snapshot,
+        lifecycle_admission: *lifecycle_admission,
+        route_gates,
+        require_idle,
+    })
+    .map_err(|_| malformed())?;
+    let canonical = canonical_json_bytes(&value)?;
+    let mut hasher = Sha256::new();
+    hasher.update(PROVISION_ROOT_AUTHORIZATION_CONTEXT_DOMAIN);
+    hasher.update([0]);
+    hasher.update(canonical);
+    Ok(ProvisionRootAuthorizationContextDigest(
+        Sha256Digest::from_bytes(hasher.finalize().into()),
+    ))
+}
+
+#[derive(Serialize)]
+struct ProvisionRootAuthorizationContext<'a> {
+    version: ContractVersion,
+    cat_id: &'a Id,
+    node_id: &'a Id,
+    placement_epoch: Epoch,
+    desired_revision: Revision,
+    spec_digest: &'a Sha256Digest,
+    runtime_incarnation: &'a Option<RandomId128>,
+    stable_state: &'a Option<StableState>,
+    step: ProvisionRootAuthorizationStep<'a>,
+    processes: &'a [ProcessEvidence],
+    volumes: &'a [ObservedVolume],
+    mounts: &'a [ObservedMount],
+    networks: &'a [ObservedNetwork],
+    guest_transport: &'a GuestTransportEvidence,
+    warm_snapshot: &'a WarmSnapshotEvidence,
+    lifecycle_admission: LifecycleAdmission,
+    route_gates: &'a [CheckpointRouteGate],
+    require_idle: &'a RequireIdleCheckpoint,
+}
+
+#[derive(Serialize)]
+struct ProvisionRootAuthorizationStep<'a> {
+    kind: &'static str,
+    provision_transition_id: &'a RandomId128,
+    volume_id: &'a Id,
+    attachment_id: &'a Id,
+    attachment_epoch: FenceEpoch,
+    scope_id: &'a Id,
+    control_socket_path: &'a HostPath,
+    data_directory: &'a HostPath,
+    size_bytes: u64,
+    boot_image_digest: &'a Sha256Digest,
+    expected_blank_head: &'a RemoteHead,
+    expected_provisioned_head: &'a RemoteHead,
 }
 
 /// Stable local identities retained by the Node when it sealed the artifact.
@@ -108,8 +266,15 @@ pub fn validate_target_control_authorization(
 ) -> Result<(), TargetControlAuthorizationCodecError> {
     validate_target_control_attachment(&artifact.attachment)?;
     validate_local_state_identity(&artifact.local_state, &artifact.attachment)?;
-    if artifact.version != ContractVersion::V1 {
-        return Err(invalid("version is not the exact supported contract"));
+    let expected_control_socket =
+        Path::new(artifact.local_state.attachment_directory.path.as_str())
+            .join("root-provision.sock");
+    if artifact.version != ContractVersion::V1
+        || Path::new(artifact.control_socket_path.as_str()) != expected_control_socket
+    {
+        return Err(invalid(
+            "version or control-process binding is not the exact supported contract",
+        ));
     }
     Ok(())
 }
@@ -200,6 +365,12 @@ fn canonical_encode<T: Serialize>(
     Ok(bytes)
 }
 
+fn canonical_json_bytes(value: &Value) -> Result<Vec<u8>, TargetControlAuthorizationCodecError> {
+    let mut bytes = Vec::new();
+    write_canonical_json(value, &mut bytes).map_err(|_| malformed())?;
+    Ok(bytes)
+}
+
 fn canonical_decode<T>(
     bytes: &[u8],
     validate: impl FnOnce(&T) -> Result<(), TargetControlAuthorizationCodecError>,
@@ -273,7 +444,7 @@ fn invalid(reason: &'static str) -> TargetControlAuthorizationCodecError {
 mod tests {
     use super::*;
 
-    const FIXED_TARGET_CONTROL_AUTHORIZATION: &[u8] = br#"{"attachment":{"acquire_request":{"attachment_id":"att_root","desired_revision":11,"expected_unowned_epoch":6,"lease_duration_ms":60000,"placement_epoch":3,"transition_id":"11111111111111111111111111111111","volume_id":"vol_root"},"acquire_result":{"attachment_id":"att_root","lease_expires_at":1720000060000,"resulting_epoch":7,"resulting_head":{"generation":0,"root_hash":null,"root_object_id":null},"transition_id":"11111111111111111111111111111111","volume_id":"vol_root"},"durability":"strict","head":{"generation":1,"root_hash":"sha256:0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d","root_object_id":"roots/generation-1.node"},"identity":{"acquire_origin":{"kind":"normal","transition_id":"11111111111111111111111111111111"},"attachment_epoch":7,"attachment_id":"att_root","node_id":"node_a","placement_epoch":3,"volume_id":"vol_root"},"lease_expires_at":1720000060000,"size_bytes":4194304},"checkpoint_content_digest":"sha256:0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a","local_state":{"acquire_authorization_file":{"content_sha256":"sha256:7f8916bf692fad3e61120f4033f131c621fe15a8eda5e39927df5f3368616380","device":41,"inode":45,"length":811,"path":"/var/lib/cats/node/state_path_a/data/cat-cat_01/volume-vol_root/attachment-att_root/epoch-7/authorized-serving.json"},"attachment_directory":{"device":41,"inode":43,"path":"/var/lib/cats/node/state_path_a/data/cat-cat_01/volume-vol_root/attachment-att_root/epoch-7"},"attachment_identity_file":{"content_sha256":"sha256:3e32061ef92bb54f78dd7191aa9271ac07a6f4012ec5d333e04402eef00e0d9d","device":41,"inode":44,"length":197,"path":"/var/lib/cats/node/state_path_a/data/cat-cat_01/volume-vol_root/attachment-att_root/epoch-7/identity.json"},"launch_checkpoint_file":{"content_sha256":"sha256:0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b","device":41,"inode":46,"length":1024,"path":"/var/lib/cats/node/state_path_a/data/cat-cat_01/volume-vol_root/attachment-att_root/epoch-7/launch-checkpoint.json"},"state_directory":{"device":41,"inode":42,"path":"/var/lib/cats/node/state_path_a"}},"provision_transition_id":"33333333333333333333333333333333","version":1}"#;
+    const FIXED_TARGET_CONTROL_AUTHORIZATION: &[u8] = br#"{"attachment":{"acquire_request":{"attachment_id":"att_root","desired_revision":11,"expected_unowned_epoch":6,"lease_duration_ms":60000,"placement_epoch":3,"transition_id":"11111111111111111111111111111111","volume_id":"vol_root"},"acquire_result":{"attachment_id":"att_root","lease_expires_at":1720000060000,"resulting_epoch":7,"resulting_head":{"generation":0,"root_hash":null,"root_object_id":null},"transition_id":"11111111111111111111111111111111","volume_id":"vol_root"},"durability":"strict","head":{"generation":1,"root_hash":"sha256:0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d","root_object_id":"roots/generation-1.node"},"identity":{"acquire_origin":{"kind":"normal","transition_id":"11111111111111111111111111111111"},"attachment_epoch":7,"attachment_id":"att_root","node_id":"node_a","placement_epoch":3,"volume_id":"vol_root"},"lease_expires_at":1720000060000,"size_bytes":4194304},"control_socket_path":"/var/lib/cats/node/state_path_a/data/cat-cat_01/volume-vol_root/attachment-att_root/epoch-7/root-provision.sock","local_state":{"acquire_authorization_file":{"content_sha256":"sha256:7f8916bf692fad3e61120f4033f131c621fe15a8eda5e39927df5f3368616380","device":41,"inode":45,"length":811,"path":"/var/lib/cats/node/state_path_a/data/cat-cat_01/volume-vol_root/attachment-att_root/epoch-7/authorized-serving.json"},"attachment_directory":{"device":41,"inode":43,"path":"/var/lib/cats/node/state_path_a/data/cat-cat_01/volume-vol_root/attachment-att_root/epoch-7"},"attachment_identity_file":{"content_sha256":"sha256:3e32061ef92bb54f78dd7191aa9271ac07a6f4012ec5d333e04402eef00e0d9d","device":41,"inode":44,"length":197,"path":"/var/lib/cats/node/state_path_a/data/cat-cat_01/volume-vol_root/attachment-att_root/epoch-7/identity.json"},"launch_checkpoint_file":{"content_sha256":"sha256:0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b","device":41,"inode":46,"length":1024,"path":"/var/lib/cats/node/state_path_a/data/cat-cat_01/volume-vol_root/attachment-att_root/epoch-7/launch-checkpoint.json"},"state_directory":{"device":41,"inode":42,"path":"/var/lib/cats/node/state_path_a"}},"provision_context_digest":"sha256:0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a","provision_transition_id":"33333333333333333333333333333333","runtime_scope_id":"cats-root-44444444444444444444444444444444.service","version":1}"#;
 
     #[test]
     fn fixed_target_control_authorization_bytes_are_stable() {
