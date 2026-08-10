@@ -65,6 +65,7 @@ AdmissionCell。它们由同一个vertical cutover合同和故障矩阵收敛。
 | [Immutable Image Manifest Read v1](specs/immutable-image-manifest-read-v1.md) | Frozen target，未实现 | golden manifest唯一DTO、canonical bytes、有界读取与Control只读组合 |
 | [Runtime Volume Transitions v1](specs/runtime-volume-transitions-v1.md) | Frozen target，未实现 | Node签名mutation、Control单事务卷转换与authorization evidence read |
 | [Route Grant v2](specs/route-grant-v2.md) | Target，未实现 | ADR-0041切换合同；固定向量待实现时重建 |
+| [Route v2 Signing Authority v1](specs/route-signing-authority-v1.md) | Frozen target，部分实现 | 独立signer reference/public ring artifact；持久rotation/ACK composition未实现 |
 | [Volume Authority](specs/volume-authority.md) | Target，未实现 | ADR-0042卷、attachment、ext4、snapshot和delete合同 |
 
 协议状态必须明确写 `Implemented/Frozen` 或 `Target, not implemented`。不存在“文档写了就算
@@ -117,6 +118,7 @@ AdmissionCell。它们由同一个vertical cutover合同和故障矩阵收敛。
 - [0040 level-triggered runtime reconciliation](decisions/0040-level-triggered-runtime-reconciliation.md)
 - [0041 Node-verified route admission](decisions/0041-node-verified-route-admission.md)
 - [0043 Provisioner-owned runtime placement policy](decisions/0043-provisioner-owned-runtime-placement-policy.md)
+- [0044 独立Route v2 signing authority](decisions/0044-independent-route-v2-signing-authority.md)
 
 ### Deferred
 
