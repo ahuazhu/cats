@@ -131,8 +131,7 @@ fn route_grant_private_key_reaches_only_control_plane_and_nodes_get_public_key()
     assert!(workflow.contains("openssl pkey"));
     assert!(workflow.contains("^ED25519 Private-Key:"));
     assert!(workflow.contains("-pubout"));
-    assert!(workflow.contains("route-grant-public.sha256"));
-    assert!(workflow.contains("-outform DER"));
+    assert!(!workflow.contains("route-grant-public.sha256"));
     assert!(workflow.contains(
         "--rawfile route_grant_private_key_pem \"$RUNNER_TEMP/route-grant-private.pem\""
     ));
@@ -154,6 +153,7 @@ fn production_artifacts_remove_the_v1_gateway_and_shared_route_mirror() {
         "deploy/aws/terraform/modules/route-cache-infrastructure/main.tf",
         "deploy/aws/terraform/modules/route-cache-infrastructure/variables.tf",
         "deploy/aws/terraform/modules/route-cache-infrastructure/outputs.tf",
+        "deploy/aws/check-route-grant-nodes.sh",
         "deploy/metal/systemd/cats-gatewayd.service",
     ] {
         assert!(
@@ -214,13 +214,144 @@ fn production_artifacts_remove_the_v1_gateway_and_shared_route_mirror() {
     }
 
     let metal = read_workspace_file("deploy/metal/install.sh");
-    assert!(metal.contains("systemctl disable --now cats-gatewayd.service"));
-    assert!(metal.contains(
-        "rm -f -- /etc/systemd/system/cats-gatewayd.service \"$PREFIX/bin/cats-gatewayd\""
-    ));
+    assert!(metal.contains("cats_retire_legacy_gateway \\"));
+    assert!(metal.contains("/etc/systemd/system/cats-gatewayd.service \\"));
+    assert!(metal.contains("/etc/systemd/system/multi-user.target.wants/cats-gatewayd.service \\"));
+    assert!(metal.contains("\"$PREFIX/bin/cats-gatewayd\""));
+    assert!(!metal.contains("systemctl disable --now cats-gatewayd.service"));
     assert!(!metal.contains("cats cats-controld cats-noded cats-gatewayd"));
     assert!(!metal.contains("enable --now cats-controld cats-gatewayd"));
     assert!(!metal.contains("status cats-controld cats-gatewayd cats-noded"));
+
+    let deployment = read_workspace_file("deploy/aws/metal/worker-deployment-transaction.sh");
+    for expected in [
+        "cats_retire_legacy_gateway()",
+        "systemctl disable \"$service\"",
+        "[ \"$load_state\" = not-found ]",
+        "cats_stop_node_service \"$service\" || return 1",
+        "cats_require_node_service_stopped \"$service\" || return 1",
+        "rm -f -- \"$unit_file\" \"$wants_link\" \"$binary_file\"",
+    ] {
+        assert!(
+            deployment.contains(expected),
+            "legacy Gateway retirement lost {expected:?}"
+        );
+    }
+    assert!(!deployment.contains("disable --now cats-gatewayd.service 2>/dev/null || true"));
+}
+
+#[cfg(unix)]
+#[test]
+fn legacy_gateway_retirement_fails_closed_before_removing_files() {
+    let fixture = tempfile::tempdir().expect("legacy Gateway retirement fixture");
+    let fake_bin = fixture.path().join("bin");
+    std::fs::create_dir_all(&fake_bin).expect("create fake systemctl directory");
+    let systemctl = fake_bin.join("systemctl");
+    std::fs::write(
+        &systemctl,
+        r#"#!/usr/bin/env bash
+set -euo pipefail
+printf '%s\n' "$*" >> "$CATS_FAKE_SYSTEMCTL_TRACE"
+case "$1" in
+  disable)
+    case "$CATS_FAKE_SYSTEMCTL_MODE" in
+      absent|disable-fails-loaded) exit 1 ;;
+      *) exit 0 ;;
+    esac
+    ;;
+  stop)
+    case "$CATS_FAKE_SYSTEMCTL_MODE" in
+      absent|active-stop-fails) exit 1 ;;
+      *) exit 0 ;;
+    esac
+    ;;
+  show)
+    property=""
+    for argument in "$@"; do
+      case "$argument" in
+        --property=*) property=${argument#--property=} ;;
+      esac
+    done
+    case "$property:$CATS_FAKE_SYSTEMCTL_MODE" in
+      LoadState:absent) printf 'not-found\n' ;;
+      LoadState:*) printf 'loaded\n' ;;
+      ActiveState:active-after-stop) printf 'active\n' ;;
+      ActiveState:*) printf 'inactive\n' ;;
+      *) exit 64 ;;
+    esac
+    ;;
+  *) exit 64 ;;
+esac
+"#,
+    )
+    .expect("write fake systemctl");
+    let mut permissions = std::fs::metadata(&systemctl)
+        .expect("fake systemctl metadata")
+        .permissions();
+    permissions.set_mode(0o755);
+    std::fs::set_permissions(&systemctl, permissions).expect("make fake systemctl executable");
+
+    let helper = workspace_root().join("deploy/aws/metal/worker-deployment-transaction.sh");
+    let inherited_path = std::env::var("PATH").expect("PATH");
+    for (mode, succeeds, removes_files) in [
+        ("stopped", true, true),
+        ("absent", true, true),
+        ("disable-fails-loaded", false, false),
+        ("active-stop-fails", false, false),
+        ("active-after-stop", false, false),
+    ] {
+        let case_dir = fixture.path().join(mode);
+        let systemd_dir = case_dir.join("etc/systemd/system");
+        let unit_file = systemd_dir.join("cats-gatewayd.service");
+        let wants_link = systemd_dir.join("multi-user.target.wants/cats-gatewayd.service");
+        let binary_file = case_dir.join("opt/cats/bin/cats-gatewayd");
+        for path in [&unit_file, &wants_link, &binary_file] {
+            std::fs::create_dir_all(path.parent().expect("artifact parent"))
+                .expect("create legacy artifact parent");
+            std::fs::write(path, b"legacy").expect("write legacy artifact");
+        }
+        let trace_file = case_dir.join("systemctl.trace");
+        let output = Command::new("bash")
+            .args([
+                "-c",
+                ". \"$1\"; cats_retire_legacy_gateway \"$2\" \"$3\" \"$4\"",
+                "legacy-gateway-retirement-test",
+            ])
+            .arg(&helper)
+            .arg(&unit_file)
+            .arg(&wants_link)
+            .arg(&binary_file)
+            .env("CATS_FAKE_SYSTEMCTL_MODE", mode)
+            .env("CATS_FAKE_SYSTEMCTL_TRACE", &trace_file)
+            .env("PATH", format!("{}:{inherited_path}", fake_bin.display()))
+            .output()
+            .expect("run legacy Gateway retirement helper");
+        assert_eq!(
+            output.status.success(),
+            succeeds,
+            "unexpected {mode} result: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        for path in [&unit_file, &wants_link, &binary_file] {
+            assert_eq!(
+                path.exists(),
+                !removes_files,
+                "{mode} left the wrong artifact state at {}",
+                path.display()
+            );
+        }
+
+        let trace = std::fs::read_to_string(&trace_file).expect("read systemctl trace");
+        assert!(trace.contains("disable cats-gatewayd.service"));
+        if mode == "disable-fails-loaded" {
+            assert!(!trace.contains("stop cats-gatewayd.service"));
+        } else {
+            assert!(trace.contains("stop cats-gatewayd.service"));
+        }
+        if mode == "active-after-stop" {
+            assert!(trace.contains("show cats-gatewayd.service --property=ActiveState --value"));
+        }
+    }
 }
 
 #[test]
@@ -273,12 +404,29 @@ fn control_plane_image_manifest_access_is_exact_and_read_only() {
 }
 
 #[test]
-fn route_grant_rotation_checks_schedulable_and_serving_nodes_before_a_rollout() {
+fn production_deploy_has_no_legacy_route_grant_admin_preflight() {
     let workflow = read_workspace_file(".github/workflows/deploy-production.yml");
-    let verifier = read_workspace_file("deploy/aws/check-route-grant-nodes.sh");
-    let preflight = workflow
-        .find("- name: Check Route Grant verifier compatibility")
-        .expect("Route Grant compatibility preflight");
+    for forbidden in [
+        "Check Route Grant verifier compatibility",
+        "/v1/admin/nodes",
+        "route-grant-public.sha256",
+        "check-route-grant-nodes.sh",
+    ] {
+        assert!(
+            !workflow.contains(forbidden),
+            "production deploy retained legacy Route Grant preflight {forbidden:?}"
+        );
+    }
+    assert!(
+        !workspace_root()
+            .join("deploy/aws/check-route-grant-nodes.sh")
+            .exists(),
+        "the unreachable V1 Node verifier must be removed with its workflow hook"
+    );
+
+    let initialize = workflow
+        .find("- name: Initialize application state")
+        .expect("application initialization step");
     let plan = workflow
         .find("- name: Plan production deployment")
         .expect("production plan step");
@@ -286,107 +434,29 @@ fn route_grant_rotation_checks_schedulable_and_serving_nodes_before_a_rollout() 
         .find("- name: Apply reviewed plan")
         .expect("production apply step");
     assert!(
-        preflight < plan && plan < apply,
-        "a verifier mismatch must fail before Terraform can mutate the application"
+        initialize < plan && plan < apply,
+        "removing the legacy preflight must preserve plan/apply ordering"
     );
-
-    let gate = &workflow[preflight..plan];
-    for fragment in [
-        "port-forward service/cats-controld 17300:7300",
-        "/v1/admin/nodes",
-        "route-grant-public.sha256",
-        "deploy/aws/check-route-grant-nodes.sh",
-    ] {
-        assert!(
-            gate.contains(fragment),
-            "Route Grant preflight lost {fragment:?}"
-        );
-    }
-    for fragment in [
-        ".node.state == \"ready\"",
-        "(.assigned_cats // 0) > 0",
-        "(.orphan_cats // 0) > 0",
-        ".node.route_grant_public_key_sha256",
-        "Interrupted Route Grant worker rollout",
-        "Schedulable or serving Nodes verify a different Route Grant key",
-    ] {
-        assert!(
-            verifier.contains(fragment),
-            "Route Grant Node verifier lost {fragment:?}"
-        );
-    }
 }
 
-#[cfg(unix)]
 #[test]
-fn route_grant_node_preflight_exercises_safe_and_interrupted_rollout_cohorts() {
-    let fixture = tempfile::tempdir().expect("Route Grant preflight fixture");
-    let expected = "a".repeat(64);
-    let run = |name: &str, items: serde_json::Value| {
-        let path = fixture.path().join(format!("{name}.json"));
-        std::fs::write(
-            &path,
-            serde_json::to_vec(&serde_json::json!({ "items": items })).unwrap(),
-        )
-        .unwrap();
-        Command::new("bash")
-            .arg(workspace_root().join("deploy/aws/check-route-grant-nodes.sh"))
-            .arg(&expected)
-            .arg(path)
-            .output()
-            .unwrap()
-    };
-    let node =
-        |id: &str, state: &str, fingerprint: Option<&str>, assigned_cats: u64, orphan_cats: u64| {
-            serde_json::json!({
-                "node": {
-                    "id": id,
-                    "state": state,
-                    "route_grant_public_key_sha256": fingerprint,
-                },
-                "assigned_cats": assigned_cats,
-                "orphan_cats": orphan_cats,
-            })
-        };
+fn release_build_publishes_the_control_plane_runtime_target() {
+    let workflow = read_workspace_file(".github/workflows/release.yml");
+    let build = workflow
+        .split_once("- name: Build and push")
+        .and_then(|(_, rest)| rest.split_once("- name: Report image reference"))
+        .map(|(step, _)| step)
+        .expect("control-plane Buildx step");
+    assert!(build.contains("file: deploy/aws/Dockerfile.control-plane"));
+    assert!(build.contains("target: runtime"));
 
-    let all_legacy = run(
-        "all-legacy",
-        serde_json::json!([
-            node("legacy-ready", "ready", None, 0, 0),
-            node("legacy-serving", "cordoned", None, 1, 0),
-        ]),
-    );
-    assert!(all_legacy.status.success());
-    assert!(String::from_utf8_lossy(&all_legacy.stdout).contains("Additive first rollout"));
-
-    let all_enforcing = run(
-        "all-enforcing",
-        serde_json::json!([
-            node("ready", "ready", Some(&expected), 0, 0),
-            node("empty-legacy", "cordoned", None, 0, 0),
-        ]),
-    );
-    assert!(all_enforcing.status.success());
-
-    let interrupted = run(
-        "interrupted",
-        serde_json::json!([
-            node("ready", "ready", Some(&expected), 0, 0),
-            node("legacy-serving", "draining", None, 2, 0),
-        ]),
-    );
-    assert!(!interrupted.status.success());
-    assert!(String::from_utf8_lossy(&interrupted.stderr)
-        .contains("Interrupted Route Grant worker rollout"));
-
-    let mismatch = "b".repeat(64);
-    let wrong_orphan = run(
-        "wrong-orphan",
-        serde_json::json!([node("wrong-orphan", "cordoned", Some(&mismatch), 0, 1,)]),
-    );
-    assert!(!wrong_orphan.status.success());
-    assert!(String::from_utf8_lossy(&wrong_orphan.stderr)
-        .contains("verify a different Route Grant key"));
+    let dockerfile = read_workspace_file("deploy/aws/Dockerfile.control-plane");
+    let runtime = dockerfile
+        .split_once("FROM debian:bookworm-slim AS runtime")
+        .and_then(|(_, rest)| rest.split_once("FROM runtime AS credential-refresher"))
+        .map(|(stage, _)| stage)
+        .expect("dedicated control-plane runtime stage");
+    assert!(runtime.contains("ENTRYPOINT [\"/usr/local/bin/cats-controld\"]"));
 }
 
 #[test]
@@ -462,10 +532,7 @@ fn production_schema_probe_fails_closed() {
     let probe = workflow
         .split("# The control store lives in PostgreSQL.")
         .nth(1)
-        .and_then(|rest| {
-            rest.split("- name: Check Route Grant verifier compatibility")
-                .next()
-        })
+        .and_then(|rest| rest.split("- name: Initialize application state").next())
         .expect("control schema probe block");
 
     assert!(probe.contains("query_status=$?"));

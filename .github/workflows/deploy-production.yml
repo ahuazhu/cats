@@ -185,14 +185,6 @@ jobs:
             -in "$RUNNER_TEMP/route-grant-public.pem" \
             -text_pub -noout \
             | grep -q '^ED25519 Public-Key:'
-          openssl pkey \
-            -pubin \
-            -in "$RUNNER_TEMP/route-grant-public.pem" \
-            -outform DER \
-            | sha256sum \
-            | awk '{print $1}' \
-            > "$RUNNER_TEMP/route-grant-public.sha256"
-
           aws eks update-kubeconfig \
             --name "$EKS_CLUSTER_NAME" \
             --region "$AWS_REGION" \
@@ -327,7 +319,6 @@ jobs:
             "$RUNNER_TEMP/rds-ca.pem" \
             "$RUNNER_TEMP/route-grant-private.pem" \
             "$RUNNER_TEMP/route-grant-public.pem" \
-            "$RUNNER_TEMP/route-grant-public.sha256" \
             "$RUNNER_TEMP/runtime-provisioner-trust.v1.json" \
             "$RUNNER_TEMP/production-secrets.tfvars.json"
 
@@ -375,60 +366,6 @@ jobs:
             echo "::error::Could not read the control database schema version (probe exit $query_status): $query_output"
             exit 1
           fi
-
-      - name: Check Route Grant verifier compatibility
-        shell: bash
-        run: |
-          set -euo pipefail
-          expected_fingerprint="$(tr -d '\r\n' < "$RUNNER_TEMP/route-grant-public.sha256")"
-          [[ "$expected_fingerprint" =~ ^[0-9a-f]{64}$ ]]
-          admin_token="$(jq -er '.CATS_ADMIN_TOKEN' "$RUNNER_TEMP/live-secret.json")"
-          echo "::add-mask::$admin_token"
-
-          port_forward_log="$RUNNER_TEMP/route-grant-port-forward.log"
-          port_forward_pid=""
-          cleanup_port_forward() {
-            if [[ -n "$port_forward_pid" ]]; then
-              kill "$port_forward_pid" 2>/dev/null || true
-              wait "$port_forward_pid" 2>/dev/null || true
-            fi
-          }
-          trap cleanup_port_forward EXIT
-          kubectl \
-            --kubeconfig "$RUNNER_TEMP/kubeconfig" \
-            --namespace cats \
-            port-forward service/cats-controld 17300:7300 \
-            > "$port_forward_log" 2>&1 &
-          port_forward_pid=$!
-
-          ready=false
-          for _ in $(seq 1 30); do
-            if curl -fsS http://127.0.0.1:17300/healthz >/dev/null 2>&1; then
-              ready=true
-              break
-            fi
-            if ! kill -0 "$port_forward_pid" 2>/dev/null; then
-              echo "::error::Control-plane port-forward exited before the Route Grant preflight"
-              sed -n '1,120p' "$port_forward_log"
-              exit 1
-            fi
-            sleep 1
-          done
-          if [[ "$ready" != true ]]; then
-            echo "::error::Control plane did not become reachable for the Route Grant preflight"
-            sed -n '1,120p' "$port_forward_log"
-            exit 1
-          fi
-
-          curl -fsS \
-            --header "Authorization: Bearer $admin_token" \
-            http://127.0.0.1:17300/v1/admin/nodes \
-            > "$RUNNER_TEMP/route-grant-nodes.json"
-          jq -e '.items | type == "array"' \
-            "$RUNNER_TEMP/route-grant-nodes.json" >/dev/null
-          deploy/aws/check-route-grant-nodes.sh \
-            "$expected_fingerprint" \
-            "$RUNNER_TEMP/route-grant-nodes.json"
 
       - name: Initialize application state
         shell: bash

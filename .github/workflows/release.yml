@@ -109,6 +109,7 @@ jobs:
         with:
           context: .
           file: deploy/aws/Dockerfile.control-plane
+          target: runtime
           platforms: linux/amd64
           push: ${{ github.event_name != 'workflow_dispatch' || inputs.push_image }}
           tags: ${{ steps.ecr.outputs.registry && format('{0}/{1}:{2}', steps.ecr.outputs.registry, vars.ECR_REPOSITORY, steps.meta.outputs.tag) || format('cats-control-plane:{0}', steps.meta.outputs.tag) }}
