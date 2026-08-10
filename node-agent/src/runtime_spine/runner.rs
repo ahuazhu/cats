@@ -1843,6 +1843,9 @@ fn invalid_session(error: &RuntimeSpineError) -> bool {
 
 #[cfg(test)]
 mod tests {
+    use std::ffi::CString;
+    use std::fs::OpenOptions;
+    use std::io::Read as _;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::{mpsc as test_mpsc, Mutex};
 
@@ -1863,7 +1866,7 @@ mod tests {
         UnixMillis, WarmSnapshotEvidence, DESIRED_READ_REQUEST_MAX_WIRE_BYTES,
         NODE_OBSERVATION_MAX_WIRE_BYTES,
     };
-    use std::os::unix::fs::PermissionsExt as _;
+    use std::os::unix::fs::{OpenOptionsExt as _, PermissionsExt as _};
 
     use crate::ch::{BlockPath, ChConfig, ChNetwork};
     use crate::runtime_spine::{ProductionRuntimeDesiredEffect, RuntimeLaunchPort};
@@ -2884,12 +2887,27 @@ mod tests {
     async fn hanging_production_ip_is_reaped_before_shutdown_releases_the_journal_flock() {
         let root = tempfile::tempdir().unwrap();
         let pid_file = root.path().join("ip.pid");
+        let started_fifo_path = root.path().join("ip.started");
+        let started_fifo_c =
+            CString::new(started_fifo_path.as_os_str().as_encoded_bytes()).unwrap();
+        // SAFETY: the path is a live NUL-terminated string and mode contains
+        // only permission bits. The test owns the previously absent path.
+        assert_eq!(unsafe { libc::mkfifo(started_fifo_c.as_ptr(), 0o600) }, 0);
+        // O_RDWR prevents either endpoint's open from becoming another timing
+        // condition. The byte itself is the exact child-started barrier.
+        let mut started_fifo = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .custom_flags(libc::O_NONBLOCK)
+            .open(&started_fifo_path)
+            .unwrap();
         let fake_ip = root.path().join("ip");
         std::fs::write(
             &fake_ip,
             format!(
-                "#!/bin/sh\nprintf '%s' \"$$\" > '{}'\nexec /bin/sleep 60\n",
-                pid_file.display()
+                "#!/bin/sh\nprintf '%s' \"$$\" > '{pid}'\nprintf x > '{started}'\nexec /bin/sleep 60\n",
+                pid = pid_file.display(),
+                started = started_fifo_path.display(),
             ),
         )
         .unwrap();
@@ -2920,18 +2938,36 @@ mod tests {
         runner.effect_admission = Some(effect_admission_for(&desired));
         runner.pending_effects.push_back(desired);
 
-        assert!(matches!(
-            runner
-                .run_once_until(Instant::now() + Duration::from_secs(2))
-                .await
-                .unwrap(),
-            RuntimeSpineRunStep::EffectUnavailable { .. }
-        ));
-        assert!(runner.pending_effects.is_empty());
-        assert!(
-            pid_file.exists(),
-            "fake ip never entered its hanging command"
-        );
+        let child_started = async {
+            let mut started = [0_u8; 1];
+            loop {
+                match started_fifo.read(&mut started) {
+                    Ok(1) => return started,
+                    Ok(0) => panic!("child-start FIFO closed before its barrier byte"),
+                    Ok(_) => unreachable!("one-byte child-start buffer cannot read more"),
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                        tokio::task::yield_now().await;
+                    }
+                    Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {}
+                    Err(error) => panic!("read child-start FIFO: {error}"),
+                }
+            }
+        };
+        tokio::pin!(child_started);
+        let mut effect_step =
+            Box::pin(runner.run_once_until(Instant::now() + Duration::from_secs(30)));
+        let started = tokio::time::timeout(Duration::from_secs(3), async {
+            tokio::select! {
+                result = &mut effect_step => {
+                    panic!("effect returned before the hanging ip child-start barrier: {result:?}")
+                }
+                started = &mut child_started => started,
+            }
+        })
+        .await
+        .expect("fake ip never entered its hanging command");
+        assert_eq!(started, [b'x']);
+        assert!(pid_file.exists());
         assert_eq!(launch.calls.load(Ordering::SeqCst), 0);
 
         let blocked_scanner: Arc<dyn RuntimeInventoryScanner> = Arc::new(EmptyScanner {
@@ -2949,10 +2985,27 @@ mod tests {
             ))
         ));
 
+        // Cancelling the in-flight wait must poison the lane and signal the
+        // exact active effect. Shutdown is then the oracle that the worker
+        // killed and reaped its child before releasing the journal flock.
+        drop(effect_step);
+        assert!(runner.effect_lane().unwrap().is_poisoned());
         tokio::time::timeout(Duration::from_secs(3), runner.shutdown())
             .await
             .expect("hanging ip prevented runner shutdown from joining")
             .unwrap();
+
+        let pid: libc::pid_t = std::fs::read_to_string(pid_file).unwrap().parse().unwrap();
+        let mut status = 0;
+        // SAFETY: pid was written by the exact child spawned above and the
+        // status pointer is valid for this nonblocking waitpid probe.
+        let wait = unsafe { libc::waitpid(pid, &mut status, libc::WNOHANG) };
+        assert_eq!(wait, -1, "Host ip remained waitable after runner shutdown");
+        assert_eq!(
+            std::io::Error::last_os_error().raw_os_error(),
+            Some(libc::ECHILD),
+            "Host ip was not reaped before the journal flock was released"
+        );
 
         let successor = RuntimeSpineRunner::new(
             state,
