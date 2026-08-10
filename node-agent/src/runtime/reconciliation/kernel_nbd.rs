@@ -347,6 +347,24 @@ struct KernelNbdReservationIdentity {
     ownership_token: RandomId128,
 }
 
+fn reservation_from_prepare_device(checkpoint: &RuntimeCheckpoint) -> Result<KernelNbdReservation> {
+    let ReconcileStep::PrepareDevice {
+        volume_id,
+        ownership_token,
+        frontend: PrepareDeviceFrontend::KernelNbd { device_path, .. },
+        ..
+    } = &checkpoint.step
+    else {
+        anyhow::bail!("checkpoint is not a kernel-NBD PrepareDevice reservation");
+    };
+    Ok(KernelNbdReservation {
+        cat_id: checkpoint.cat_id.clone(),
+        volume_id: volume_id.clone(),
+        device_path: device_path.clone(),
+        ownership_token: ownership_token.clone(),
+    })
+}
+
 impl KernelNbdReservations {
     fn from_snapshot(snapshot: &RuntimeCheckpointNamespaceSnapshot) -> Result<Self> {
         Self::from_checkpoints(snapshot.iter_checkpoints())
@@ -357,45 +375,82 @@ impl KernelNbdReservations {
     ) -> Result<Self> {
         let mut reservations = Self::default();
         for checkpoint in checkpoints {
-            if let ReconcileStep::PrepareDevice {
-                volume_id,
-                ownership_token,
-                frontend: PrepareDeviceFrontend::KernelNbd { device_path, .. },
-                ..
-            } = &checkpoint.step
-            {
-                reservations.insert(KernelNbdReservation {
+            reservations.insert_checkpoint(checkpoint)?;
+        }
+        Ok(reservations)
+    }
+
+    /// Rebuild the exact namespace state which will exist after one atomic
+    /// per-Cat checkpoint replacement. Validating only the incumbent snapshot
+    /// would let the newly generated device token or selected path collide at
+    /// the publication boundary itself.
+    fn after_replacing(
+        snapshot: &RuntimeCheckpointNamespaceSnapshot,
+        predecessor: &RuntimeCheckpoint,
+        replacement: &RuntimeCheckpoint,
+    ) -> Result<Self> {
+        anyhow::ensure!(
+            replacement.cat_id == predecessor.cat_id,
+            "kernel-NBD reservation replacement changed its Cat identity"
+        );
+        let mut found_predecessor = false;
+        let mut reservations = Self::default();
+        for checkpoint in snapshot.iter_checkpoints() {
+            if checkpoint.cat_id == predecessor.cat_id {
+                anyhow::ensure!(
+                    checkpoint == predecessor && !found_predecessor,
+                    "kernel-NBD prospective reservation lacks its exact predecessor"
+                );
+                found_predecessor = true;
+                reservations.insert_checkpoint(replacement)?;
+            } else {
+                reservations.insert_checkpoint(checkpoint)?;
+            }
+        }
+        anyhow::ensure!(
+            found_predecessor,
+            "kernel-NBD prospective reservation omitted its predecessor Cat"
+        );
+        Ok(reservations)
+    }
+
+    fn insert_checkpoint(&mut self, checkpoint: &RuntimeCheckpoint) -> Result<()> {
+        if let ReconcileStep::PrepareDevice {
+            volume_id,
+            ownership_token,
+            frontend: PrepareDeviceFrontend::KernelNbd { device_path, .. },
+            ..
+        } = &checkpoint.step
+        {
+            self.insert(KernelNbdReservation {
+                cat_id: checkpoint.cat_id.clone(),
+                volume_id: volume_id.clone(),
+                device_path: device_path.clone(),
+                ownership_token: ownership_token.clone(),
+            })?;
+        }
+        for volume in &checkpoint.volumes {
+            for device in &volume.devices {
+                let ObservedDevice::KernelNbd {
+                    device_path,
+                    ownership_token,
+                    ..
+                } = device
+                else {
+                    continue;
+                };
+                let OwnershipTokenEvidence::Valid { ownership_token } = ownership_token else {
+                    anyhow::bail!("durable kernel-NBD reservation has no valid ownership token");
+                };
+                self.insert(KernelNbdReservation {
                     cat_id: checkpoint.cat_id.clone(),
-                    volume_id: volume_id.clone(),
+                    volume_id: volume.volume_id.clone(),
                     device_path: device_path.clone(),
                     ownership_token: ownership_token.clone(),
                 })?;
             }
-            for volume in &checkpoint.volumes {
-                for device in &volume.devices {
-                    let ObservedDevice::KernelNbd {
-                        device_path,
-                        ownership_token,
-                        ..
-                    } = device
-                    else {
-                        continue;
-                    };
-                    let OwnershipTokenEvidence::Valid { ownership_token } = ownership_token else {
-                        anyhow::bail!(
-                            "durable kernel-NBD reservation has no valid ownership token"
-                        );
-                    };
-                    reservations.insert(KernelNbdReservation {
-                        cat_id: checkpoint.cat_id.clone(),
-                        volume_id: volume.volume_id.clone(),
-                        device_path: device_path.clone(),
-                        ownership_token: ownership_token.clone(),
-                    })?;
-                }
-            }
         }
-        Ok(reservations)
+        Ok(())
     }
 
     fn insert(&mut self, candidate: KernelNbdReservation) -> Result<()> {
@@ -439,9 +494,27 @@ impl KernelNbdReservations {
             device_path: request.device_path.clone(),
             ownership_token: request.ownership_token.clone(),
         };
+        self.assert_contains(
+            &expected,
+            "kernel-NBD attach lacks its exact durable reservation",
+        )
+    }
+
+    fn assert_contains(
+        &self,
+        expected: &KernelNbdReservation,
+        mismatch: &'static str,
+    ) -> Result<()> {
+        let identity = KernelNbdReservationIdentity {
+            cat_id: expected.cat_id.clone(),
+            volume_id: expected.volume_id.clone(),
+            ownership_token: expected.ownership_token.clone(),
+        };
         anyhow::ensure!(
-            self.by_device.get(&request.device_path) == Some(&expected),
-            "kernel-NBD attach lacks its exact durable device reservation"
+            self.by_device.get(&expected.device_path) == Some(expected)
+                && self.by_ownership_token.get(&expected.ownership_token) == Some(expected)
+                && self.by_identity.get(&identity) == Some(&expected.device_path),
+            mismatch
         );
         Ok(())
     }
@@ -454,7 +527,10 @@ impl KernelNbdReservations {
 pub(crate) struct KernelNbdAllocationPermit {
     state_root: File,
     allocation_lock: File,
+    allocation_lock_held: bool,
     snapshot: KernelNbdPoolSnapshot,
+    #[cfg(test)]
+    injected_unlock_failures: usize,
 }
 
 impl KernelNbdAllocationPermit {
@@ -531,16 +607,64 @@ impl KernelNbdAllocationPermit {
         self.assert_current_allocation_lock()?;
         self.assert_current_checkpoint_namespace(snapshot, store)
     }
+
+    /// Explicitly remove the flock from the shared open-file description
+    /// before closing our descriptor. A forked child retains the same lock
+    /// description until successful exec closes `O_CLOEXEC`; relying on close
+    /// alone therefore leaks a short-lived lock after an exec failure.
+    fn unlock_allocation_lock(&mut self) -> Result<()> {
+        if !self.allocation_lock_held {
+            return Ok(());
+        }
+        #[cfg(test)]
+        if self.injected_unlock_failures > 0 {
+            self.injected_unlock_failures -= 1;
+            anyhow::bail!("injected kernel-NBD allocation unlock failure");
+        }
+        unlock_exclusive(&self.allocation_lock)?;
+        self.allocation_lock_held = false;
+        Ok(())
+    }
+
+    fn release(mut self) -> Result<()> {
+        self.unlock_allocation_lock()
+    }
+
+    #[cfg(test)]
+    fn inject_unlock_failures(&mut self, count: usize) {
+        self.injected_unlock_failures = count;
+    }
+}
+
+impl Drop for KernelNbdAllocationPermit {
+    fn drop(&mut self) {
+        // Drop cannot report an error. Retain fail-closed behavior by leaving
+        // `allocation_lock_held` set until this last retry succeeds. If it
+        // fails again, an inherited descriptor keeps the shared lock alive;
+        // this path never returns a false success and never panics.
+        let _ = self.unlock_allocation_lock();
+    }
 }
 
 #[derive(Debug, Clone)]
 pub(crate) struct KernelNbdInventoryPort {
     config: KernelNbdInventoryConfig,
+    #[cfg(test)]
+    injected_unlock_failures: usize,
 }
 
 impl KernelNbdInventoryPort {
     pub(crate) fn new(config: KernelNbdInventoryConfig) -> Self {
-        Self { config }
+        Self {
+            config,
+            #[cfg(test)]
+            injected_unlock_failures: 0,
+        }
+    }
+
+    #[cfg(test)]
+    fn inject_unlock_failures(&mut self, count: usize) {
+        self.injected_unlock_failures = count;
     }
 
     /// Acquire the Node-global allocator and inspect every configured slot.
@@ -558,11 +682,21 @@ impl KernelNbdInventoryPort {
             .context("retain Node state root for kernel-NBD allocation")?;
         let allocation_lock = open_allocation_lock(&state_root)?;
         lock_exclusive_nonblocking(&allocation_lock)?;
-        let permit = KernelNbdAllocationPermit {
+        // Install the explicit-unlock Drop guard immediately after flock
+        // succeeds. Even an inventory error must not rely on close while a
+        // concurrent fork may retain this open-file description.
+        let mut permit = KernelNbdAllocationPermit {
             state_root,
             allocation_lock,
-            snapshot: inspect_pool(&self.config, context)?,
+            allocation_lock_held: true,
+            snapshot: KernelNbdPoolSnapshot {
+                slots: BTreeMap::new(),
+                ordered_paths: Vec::new(),
+            },
+            #[cfg(test)]
+            injected_unlock_failures: self.injected_unlock_failures,
         };
+        permit.snapshot = inspect_pool(&self.config, context)?;
         permit.assert_current_allocation_lock()?;
         context.check_active()?;
         Ok(permit)
@@ -610,7 +744,22 @@ impl KernelNbdInventoryPort {
         let reservations = KernelNbdReservations::from_snapshot(&snapshot)?;
         context.check_active()?;
         let selected = permit.select_free(&reservations)?;
-        let replacement = build_checkpoint(selected)?;
+        let replacement = build_checkpoint(selected.clone())?;
+        let replacement_reservation = reservation_from_prepare_device(&replacement)
+            .context("kernel-NBD replacement is not one exact PrepareDevice reservation")?;
+        anyhow::ensure!(
+            replacement_reservation.device_path == selected,
+            "kernel-NBD replacement ignored the allocator-selected device"
+        );
+        let prospective = KernelNbdReservations::after_replacing(
+            &snapshot,
+            predecessor.checkpoint(),
+            &replacement,
+        )?;
+        prospective.assert_contains(
+            &replacement_reservation,
+            "kernel-NBD replacement is not its exact prospective reservation",
+        )?;
         context.check_active()?;
         // The flock and namespace snapshots are descriptor-stable, but the
         // current state-root basenames could otherwise be renamed away and
@@ -634,6 +783,9 @@ impl KernelNbdInventoryPort {
         // recovery source, but this stale admission must never receive a
         // success value that could authorize a second physical effect.
         context.check_active()?;
+        permit
+            .release()
+            .context("unlock kernel-NBD allocator after reservation publication")?;
         Ok(persisted)
     }
 }
@@ -912,6 +1064,10 @@ where
             .poll_reap()
             .context("poll prior kernel-NBD client cleanup before attach")?;
         if self.cleanup_owner.pending_count() > 0 {
+            // This accepted call cannot submit while an earlier owned child is
+            // unsettled. An unlock failure is still terminally unknown rather
+            // than authority to retry this batch.
+            let _ = permit.release();
             return Ok(KernelNbdAttachResult::OutcomeUnknown);
         }
         context.check_active()?;
@@ -922,7 +1078,12 @@ where
             context,
             &self.cleanup_owner,
         ) {
-            KernelNbdClientSubmitAttempt::NotSubmitted(source) => return Err(source),
+            KernelNbdClientSubmitAttempt::NotSubmitted(source) => {
+                permit
+                    .release()
+                    .context("unlock kernel-NBD allocator after rejected submission")?;
+                return Err(source);
+            }
             KernelNbdClientSubmitAttempt::Submitted(submission) => submission,
         };
 
@@ -930,7 +1091,7 @@ where
         // succeeded, every authority drift, physical inspection failure and
         // conflicting postcondition is a closed terminal result for this batch,
         // never an error that a caller could mistake for zero effect.
-        Ok(SubmittedKernelNbdAttach {
+        let result = SubmittedKernelNbdAttach {
             submission,
             permit: &permit,
             namespace: &namespace,
@@ -943,7 +1104,13 @@ where
             context,
             config: &self.inventory.config,
         }
-        .settle())
+        .settle();
+        // After process creation, even an unlock failure cannot be exposed as
+        // a plain error: the client may already have performed its ioctl.
+        if permit.release().is_err() {
+            return Ok(KernelNbdAttachResult::OutcomeUnknown);
+        }
+        Ok(result)
     }
 }
 
@@ -1665,6 +1832,22 @@ fn lock_exclusive_nonblocking(file: &File) -> Result<()> {
     }
 }
 
+fn unlock_exclusive(file: &File) -> Result<()> {
+    loop {
+        // SAFETY: `file` owns a live descriptor and `flock` retains no Rust
+        // pointer or ownership after the call returns.
+        let result = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_UN) };
+        if result == 0 {
+            return Ok(());
+        }
+        let source = io::Error::last_os_error();
+        if source.kind() == io::ErrorKind::Interrupted {
+            continue;
+        }
+        return Err(source).context("unlock kernel-NBD allocator");
+    }
+}
+
 fn open_at(directory: &File, name: &CStr, flags: i32, mode: u32) -> io::Result<File> {
     // SAFETY: both descriptors/strings are live for the duration of `openat`;
     // the returned descriptor, when nonnegative, is newly owned by this call.
@@ -1692,6 +1875,7 @@ mod tests {
     use std::fs;
     use std::os::unix::ffi::OsStrExt as _;
     use std::os::unix::fs::{symlink, PermissionsExt as _};
+    use std::panic::AssertUnwindSafe;
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::sync::Arc;
     use std::time::{Duration, Instant};
@@ -1790,6 +1974,51 @@ mod tests {
                 socket,
                 &format!("/dev/nbd{index}"),
             );
+        }
+    }
+
+    struct InheritedAllocationLockChild {
+        child: Option<Child>,
+    }
+
+    impl InheritedAllocationLockChild {
+        fn spawn(permit: &KernelNbdAllocationPermit) -> Self {
+            // `dup` shares the exact open-file description carrying flock;
+            // using it as stdin deliberately keeps that description open
+            // across a successful exec, unlike the production CLOEXEC fd.
+            // SAFETY: the permit owns a live descriptor and a successful dup
+            // returns one fresh descriptor owned by this test.
+            let descriptor = unsafe { libc::dup(permit.allocation_lock.as_raw_fd()) };
+            assert!(descriptor >= 0, "{}", io::Error::last_os_error());
+            // SAFETY: successful `dup` transferred this fresh descriptor to
+            // the returned File exactly once.
+            let inherited = unsafe { File::from_raw_fd(descriptor) };
+            let child = Command::new("/bin/sleep")
+                .env_clear()
+                .stdin(Stdio::from(inherited))
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .arg("30")
+                .spawn()
+                .unwrap();
+            Self { child: Some(child) }
+        }
+
+        fn assert_running(&mut self) {
+            assert!(self.child.as_mut().unwrap().try_wait().unwrap().is_none());
+        }
+
+        fn terminate(&mut self) {
+            if let Some(mut child) = self.child.take() {
+                let _ = child.kill();
+                child.wait().unwrap();
+            }
+        }
+    }
+
+    impl Drop for InheritedAllocationLockChild {
+        fn drop(&mut self) {
+            self.terminate();
         }
     }
 
@@ -2322,6 +2551,138 @@ mod tests {
     }
 
     #[test]
+    fn allocation_permit_drop_unlocks_an_open_file_description_inherited_across_exec() {
+        let fixture = Fixture::new(1);
+        let first = KernelNbdInventoryPort::new(fixture.config(1));
+        let second = KernelNbdInventoryPort::new(fixture.config(1));
+        let permit = first.lock_and_inspect(&TestContext::active()).unwrap();
+        let mut inherited = InheritedAllocationLockChild::spawn(&permit);
+        inherited.assert_running();
+
+        drop(permit);
+
+        let reacquired = second.lock_and_inspect(&TestContext::active()).unwrap();
+        inherited.assert_running();
+        drop(reacquired);
+    }
+
+    #[test]
+    fn allocation_unlock_failure_is_closed_and_drop_never_panics() {
+        let fixture = Fixture::new(1);
+        let first = KernelNbdInventoryPort::new(fixture.config(1));
+        let second = KernelNbdInventoryPort::new(fixture.config(1));
+        let mut permit = first.lock_and_inspect(&TestContext::active()).unwrap();
+        let mut inherited = InheritedAllocationLockChild::spawn(&permit);
+        // Fail both the reporting release and Drop's last retry. The child is
+        // then the sole descriptor retaining the still-locked description.
+        permit.inject_unlock_failures(2);
+
+        let release = std::panic::catch_unwind(AssertUnwindSafe(|| permit.release()));
+
+        assert!(release.is_ok(), "allocation permit Drop must never panic");
+        assert!(release.unwrap().is_err(), "unlock failure must not succeed");
+        inherited.assert_running();
+        let error = second.lock_and_inspect(&TestContext::active()).unwrap_err();
+        assert!(error.to_string().contains("already active"), "{error:#}");
+
+        inherited.terminate();
+        second.lock_and_inspect(&TestContext::active()).unwrap();
+    }
+
+    #[test]
+    fn reservation_rejects_non_exact_replacement_without_publication() {
+        let fixture = Fixture::new(3);
+        let port = KernelNbdInventoryPort::new(fixture.config(3));
+        let checkpoint_directory = fixture.state.join(CHECKPOINT_NAMESPACE);
+        let source = checkpoint("cat_a", "vol_a", "/dev/nbd1", '6');
+        let store = FileCheckpointStore::open(&checkpoint_directory, &source.cat_id).unwrap();
+        let predecessor = store.create(&source).unwrap();
+        let incumbent = checkpoint("cat_b", "vol_b", "/dev/nbd0", '7');
+        let incumbent_store =
+            FileCheckpointStore::open(&checkpoint_directory, &incumbent.cat_id).unwrap();
+        let _incumbent = incumbent_store.create(&incumbent).unwrap();
+        let context = desired_effect_context(&fixture.state, &["cat_a", "cat_b"]);
+
+        let error = port
+            .reserve_and_replace(&context, &store, &predecessor, |_| {
+                Ok(predecessor.checkpoint().clone())
+            })
+            .unwrap_err();
+        assert!(
+            error.to_string().contains("ignored the allocator-selected"),
+            "{error:#}"
+        );
+        assert_eq!(
+            store.load().unwrap().unwrap().checkpoint(),
+            predecessor.checkpoint()
+        );
+
+        let error = port
+            .reserve_and_replace(&context, &store, &predecessor, |_| {
+                let mut replacement = predecessor.checkpoint().clone();
+                let ReconcileStep::PrepareDevice { frontend, .. } = &mut replacement.step else {
+                    panic!("fixture must be a PrepareDevice checkpoint")
+                };
+                *frontend = PrepareDeviceFrontend::VhostUserBlk {
+                    socket_path: host("/run/cats/vhost.sock"),
+                    queues: 1,
+                    queue_size: 128,
+                };
+                Ok(replacement)
+            })
+            .unwrap_err();
+        assert!(
+            format!("{error:#}").contains("not a kernel-NBD PrepareDevice reservation"),
+            "{error:#}"
+        );
+        assert_eq!(
+            store.load().unwrap().unwrap().checkpoint(),
+            predecessor.checkpoint()
+        );
+    }
+
+    #[test]
+    fn reservation_rejects_prospective_global_token_collision_without_publication() {
+        let fixture = Fixture::new(3);
+        let port = KernelNbdInventoryPort::new(fixture.config(3));
+        let checkpoint_directory = fixture.state.join(CHECKPOINT_NAMESPACE);
+        let source = checkpoint("cat_a", "vol_a", "/dev/nbd1", '6');
+        let store = FileCheckpointStore::open(&checkpoint_directory, &source.cat_id).unwrap();
+        let predecessor = store.create(&source).unwrap();
+        let incumbent = checkpoint("cat_b", "vol_b", "/dev/nbd0", '7');
+        let incumbent_store =
+            FileCheckpointStore::open(&checkpoint_directory, &incumbent.cat_id).unwrap();
+        let _incumbent = incumbent_store.create(&incumbent).unwrap();
+        let context = desired_effect_context(&fixture.state, &["cat_a", "cat_b"]);
+
+        let error = port
+            .reserve_and_replace(&context, &store, &predecessor, |selected| {
+                let mut replacement = predecessor.checkpoint().clone();
+                let ReconcileStep::PrepareDevice {
+                    ownership_token,
+                    frontend: PrepareDeviceFrontend::KernelNbd { device_path, .. },
+                    ..
+                } = &mut replacement.step
+                else {
+                    panic!("fixture must be a kernel-NBD PrepareDevice checkpoint")
+                };
+                *ownership_token = random('7');
+                *device_path = selected;
+                Ok(replacement)
+            })
+            .unwrap_err();
+
+        assert!(
+            error.to_string().contains("ownership token is reused"),
+            "{error:#}"
+        );
+        assert_eq!(
+            store.load().unwrap().unwrap().checkpoint(),
+            predecessor.checkpoint()
+        );
+    }
+
+    #[test]
     fn reservation_rejects_checkpoint_namespace_rename_recreate_before_publication() {
         let fixture = Fixture::new(2);
         let port = KernelNbdInventoryPort::new(fixture.config(2));
@@ -2823,6 +3184,45 @@ mod tests {
         assert_eq!(collected.len(), 1);
         assert_eq!(collected[0].0, &host("/dev/nbd0"));
         assert_eq!(collected[0].1, &KernelNbdSlotState::Serving(identity));
+    }
+
+    #[test]
+    fn post_submit_unlock_failure_is_unknown_and_never_resubmitted() {
+        let fixture = Fixture::new(1);
+        let source = checkpoint("cat_a", "vol_a", "/dev/nbd0", '6');
+        let store =
+            FileCheckpointStore::open(&fixture.state.join(CHECKPOINT_NAMESPACE), &source.cat_id)
+                .unwrap();
+        let stored = store.create(&source).unwrap();
+        let request = KernelNbdAttachRequest::from_checkpoint(&stored).unwrap();
+        let sys = fixture.sys.clone();
+        let proc_root = fixture.proc.clone();
+        let client = fixture.client.clone();
+        let submitter = FakeSubmitter::new(move |_, _, _| {
+            install_serving_client(
+                &sys,
+                &proc_root,
+                &client,
+                0,
+                47,
+                "/run/cats/nbd.sock",
+                "/dev/nbd0",
+            );
+            Ok(KernelNbdClientSubmission::Completed)
+        });
+        let calls = submitter.clone();
+        let mut port = ExactKernelNbdAttachPort::new(fixture.config(1), submitter);
+        // Exercise both the reporting unlock and Drop's non-panicking retry.
+        port.inventory.inject_unlock_failures(2);
+        let context = desired_effect_context(&fixture.state, &["cat_a"]);
+        let listener = FakeListenerGuard::fixed();
+
+        assert_eq!(
+            port.attach_checkpointed(&request, &listener, &store, &stored, &context)
+                .unwrap(),
+            KernelNbdAttachResult::OutcomeUnknown
+        );
+        assert_eq!(calls.calls(), 1);
     }
 
     #[test]
