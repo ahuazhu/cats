@@ -10,7 +10,7 @@
 
 use std::collections::BTreeMap;
 use std::ffi::{CStr, CString, OsString};
-use std::fs::File;
+use std::fs::{File, Metadata};
 use std::io::{self, Read as _};
 use std::os::fd::{AsRawFd as _, FromRawFd as _};
 use std::os::unix::ffi::OsStringExt as _;
@@ -29,7 +29,7 @@ use crate::state_directory::StateDirectory;
 use super::checkpoint::{FileCheckpointStore, StoredCheckpoint};
 use super::clean_slate_probes::{
     snapshot_runtime_checkpoint_namespace, RuntimeCheckpointNamespaceSnapshot,
-    RUNTIME_CHECKPOINT_NAMESPACE_ENTRY_LIMIT,
+    CHECKPOINT_NAMESPACE, RUNTIME_CHECKPOINT_NAMESPACE_ENTRY_LIMIT,
 };
 
 const ALLOCATION_LOCK_BASENAME: &str = "kernel-nbd-allocation.lock";
@@ -236,7 +236,7 @@ impl KernelNbdReservations {
 #[derive(Debug)]
 pub(crate) struct KernelNbdAllocationPermit {
     state_root: File,
-    _allocation_lock: File,
+    allocation_lock: File,
     snapshot: KernelNbdPoolSnapshot,
 }
 
@@ -283,6 +283,40 @@ impl KernelNbdAllocationPermit {
         );
         Ok(())
     }
+
+    fn assert_current_allocation_lock(&self) -> Result<()> {
+        let current = reopen_allocation_lock(&self.state_root)?;
+        ensure_same_allocation_lock(&self.allocation_lock, &current)
+    }
+
+    fn assert_current_checkpoint_namespace(
+        &self,
+        snapshot: &RuntimeCheckpointNamespaceSnapshot,
+        store: &FileCheckpointStore,
+    ) -> Result<()> {
+        let current = reopen_checkpoint_namespace(&self.state_root)?;
+        validate_checkpoint_namespace(&self.state_root, snapshot.retained_directory())?;
+        validate_checkpoint_namespace(&self.state_root, store.retained_directory())?;
+        ensure_same_directory(
+            snapshot.retained_directory(),
+            store.retained_directory(),
+            "kernel-NBD snapshot and checkpoint store use different directories",
+        )?;
+        ensure_same_directory(
+            snapshot.retained_directory(),
+            &current,
+            "kernel-NBD checkpoint namespace pathname changed during reservation",
+        )
+    }
+
+    fn assert_current_publication_paths(
+        &self,
+        snapshot: &RuntimeCheckpointNamespaceSnapshot,
+        store: &FileCheckpointStore,
+    ) -> Result<()> {
+        self.assert_current_allocation_lock()?;
+        self.assert_current_checkpoint_namespace(snapshot, store)
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -310,13 +344,14 @@ impl KernelNbdInventoryPort {
             .context("retain Node state root for kernel-NBD allocation")?;
         let allocation_lock = open_allocation_lock(&state_root)?;
         lock_exclusive_nonblocking(&allocation_lock)?;
-        let snapshot = inspect_pool(&self.config, context)?;
-        context.check_active()?;
-        Ok(KernelNbdAllocationPermit {
+        let permit = KernelNbdAllocationPermit {
             state_root,
-            _allocation_lock: allocation_lock,
-            snapshot,
-        })
+            allocation_lock,
+            snapshot: inspect_pool(&self.config, context)?,
+        };
+        permit.assert_current_allocation_lock()?;
+        context.check_active()?;
+        Ok(permit)
     }
 
     /// Serialize the complete durable-reservation read, deterministic free
@@ -340,7 +375,11 @@ impl KernelNbdInventoryPort {
             .state_directory()
             .try_clone_directory()
             .context("retain Desired-effect state root for kernel-NBD reservation")?;
-        ensure_same_directory(permit.state_root(), &context_state_root)?;
+        ensure_same_directory(
+            permit.state_root(),
+            &context_state_root,
+            "kernel-NBD Desired context and allocator use different directories",
+        )?;
         let assigned_cats = context.accepted_full()?.assigned_cats()?;
         let snapshot = snapshot_runtime_checkpoint_namespace(
             permit.state_root(),
@@ -349,40 +388,33 @@ impl KernelNbdInventoryPort {
             RUNTIME_CHECKPOINT_NAMESPACE_ENTRY_LIMIT,
         )?
         .context("kernel-NBD reservation requires a complete checkpoint namespace")?;
-        ensure_same_directory(snapshot.retained_directory(), store.retained_directory())?;
+        permit.assert_current_publication_paths(&snapshot, store)?;
         anyhow::ensure!(
             snapshot.checkpoint(&predecessor.checkpoint().cat_id) == Some(predecessor.checkpoint()),
             "kernel-NBD predecessor is not the exact checkpoint-namespace value"
         );
         let reservations = KernelNbdReservations::from_snapshot(&snapshot)?;
-        self.replace_selected(
-            permit,
-            context,
-            &reservations,
-            store,
-            predecessor,
-            build_checkpoint,
-        )
-    }
-
-    fn replace_selected(
-        &self,
-        permit: KernelNbdAllocationPermit,
-        context: &dyn RuntimePhysicalReadContext,
-        reservations: &KernelNbdReservations,
-        store: &FileCheckpointStore,
-        predecessor: &StoredCheckpoint,
-        build_checkpoint: impl FnOnce(HostPath) -> Result<RuntimeCheckpoint>,
-    ) -> Result<StoredCheckpoint> {
         context.check_active()?;
-        let selected = permit.select_free(reservations)?;
+        let selected = permit.select_free(&reservations)?;
         let replacement = build_checkpoint(selected)?;
         context.check_active()?;
+        // The flock and namespace snapshots are descriptor-stable, but the
+        // current state-root basenames could otherwise be renamed away and
+        // recreated around the callback. Reopen both lexical paths before
+        // publication so a reservation is never fsynced only into a detached
+        // namespace or under a split allocation-lock domain.
+        permit.assert_current_publication_paths(&snapshot, store)?;
         // `permit` remains live through FileCheckpointStore's file and parent
         // directory fsync barriers and is dropped only after publication.
-        store
+        let persisted = store
             .replace(predecessor, &replacement)
-            .context("persist kernel-NBD reservation checkpoint")
+            .context("persist kernel-NBD reservation checkpoint")?;
+        // A same-uid Host-state mutator is outside the cooperating flock
+        // protocol, but observing a post-publication lexical replacement must
+        // still fail closed: the caller must not proceed to attach a device
+        // from a checkpoint no longer reachable in the current namespace.
+        permit.assert_current_publication_paths(&snapshot, store)?;
+        Ok(persisted)
     }
 }
 
@@ -625,6 +657,24 @@ fn open_allocation_lock(directory: &File) -> Result<File> {
         0o600,
     )
     .context("open kernel-NBD allocation lock")?;
+    validate_allocation_lock(&file)?;
+    Ok(file)
+}
+
+fn reopen_allocation_lock(directory: &File) -> Result<File> {
+    let name = CString::new(ALLOCATION_LOCK_BASENAME).expect("fixed basename has no NUL");
+    let file = open_at(
+        directory,
+        &name,
+        libc::O_RDWR | libc::O_NOFOLLOW | libc::O_CLOEXEC | libc::O_NONBLOCK,
+        0,
+    )
+    .context("reopen current kernel-NBD allocation lock")?;
+    validate_allocation_lock(&file)?;
+    Ok(file)
+}
+
+fn validate_allocation_lock(file: &File) -> Result<Metadata> {
     let metadata = file
         .metadata()
         .context("inspect kernel-NBD allocation lock")?;
@@ -633,13 +683,54 @@ fn open_allocation_lock(directory: &File) -> Result<File> {
             && metadata.nlink() == 1
             && metadata.mode() & 0o7777 == 0o600
             && metadata.uid() == effective_user_id()
-            && metadata.gid() == effective_group_id(),
+            && metadata.gid() == effective_group_id()
+            && metadata.len() == 0,
         "kernel-NBD allocation lock has unsafe metadata"
     );
-    Ok(file)
+    Ok(metadata)
 }
 
-fn ensure_same_directory(left: &File, right: &File) -> Result<()> {
+fn ensure_same_allocation_lock(left: &File, right: &File) -> Result<()> {
+    let left = validate_allocation_lock(left)?;
+    let right = validate_allocation_lock(right)?;
+    anyhow::ensure!(
+        left.dev() == right.dev() && left.ino() == right.ino(),
+        "kernel-NBD allocation lock pathname changed while locked"
+    );
+    Ok(())
+}
+
+fn reopen_checkpoint_namespace(state_root: &File) -> Result<File> {
+    let name = CString::new(CHECKPOINT_NAMESPACE).expect("fixed namespace has no NUL");
+    let directory = open_at(
+        state_root,
+        &name,
+        libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC | libc::O_NONBLOCK,
+        0,
+    )
+    .context("reopen current kernel-NBD checkpoint namespace")?;
+    validate_checkpoint_namespace(state_root, &directory)?;
+    Ok(directory)
+}
+
+fn validate_checkpoint_namespace(state_root: &File, directory: &File) -> Result<Metadata> {
+    let root = state_root
+        .metadata()
+        .context("inspect retained kernel-NBD state root")?;
+    let metadata = directory
+        .metadata()
+        .context("inspect retained kernel-NBD checkpoint namespace")?;
+    anyhow::ensure!(
+        root.is_dir()
+            && metadata.is_dir()
+            && metadata.uid() == root.uid()
+            && metadata.mode() & 0o022 == 0,
+        "kernel-NBD checkpoint namespace has unsafe owner or mode"
+    );
+    Ok(metadata)
+}
+
+fn ensure_same_directory(left: &File, right: &File, mismatch: &'static str) -> Result<()> {
     let left = left
         .metadata()
         .context("inspect retained checkpoint namespace")?;
@@ -648,7 +739,7 @@ fn ensure_same_directory(left: &File, right: &File) -> Result<()> {
         .context("inspect checkpoint store directory")?;
     anyhow::ensure!(
         left.is_dir() && right.is_dir() && left.dev() == right.dev() && left.ino() == right.ino(),
-        "kernel-NBD snapshot and checkpoint store use different directories"
+        mismatch
     );
     Ok(())
 }
@@ -1092,6 +1183,144 @@ mod tests {
             persisted.checkpoint()
         );
         second.lock_and_inspect(&TestContext::active()).unwrap();
+    }
+
+    #[test]
+    fn reservation_rejects_checkpoint_namespace_rename_recreate_before_publication() {
+        let fixture = Fixture::new(2);
+        let port = KernelNbdInventoryPort::new(fixture.config(2));
+        let checkpoint_directory = fixture.state.join(CHECKPOINT_NAMESPACE);
+        let detached_directory = fixture.state.join("checkpoints-detached");
+        let source = checkpoint("cat_a", "vol_a", "/dev/nbd1", '6');
+        let store = FileCheckpointStore::open(&checkpoint_directory, &source.cat_id).unwrap();
+        let predecessor = store.create(&source).unwrap();
+        let target_name = format!("cat-{}.checkpoint.json", source.cat_id.as_str());
+        let predecessor_bytes = fs::read(checkpoint_directory.join(&target_name)).unwrap();
+        let context = desired_effect_context(&fixture.state, &["cat_a"]);
+
+        let error = port
+            .reserve_and_replace(&context, &store, &predecessor, |selected| {
+                fs::rename(&checkpoint_directory, &detached_directory).unwrap();
+                fs::create_dir(&checkpoint_directory).unwrap();
+                let mut replacement = predecessor.checkpoint().clone();
+                let ReconcileStep::PrepareDevice {
+                    frontend: PrepareDeviceFrontend::KernelNbd { device_path, .. },
+                    ..
+                } = &mut replacement.step
+                else {
+                    panic!("fixture must be a kernel-NBD PrepareDevice checkpoint")
+                };
+                *device_path = selected;
+                Ok(replacement)
+            })
+            .unwrap_err();
+
+        assert!(error.to_string().contains("pathname changed"), "{error:#}");
+        assert!(!checkpoint_directory.join(&target_name).exists());
+        assert_eq!(
+            fs::read(detached_directory.join(&target_name)).unwrap(),
+            predecessor_bytes
+        );
+        assert_eq!(
+            store.load().unwrap().unwrap().checkpoint(),
+            predecessor.checkpoint()
+        );
+    }
+
+    #[test]
+    fn reservation_never_authorizes_attach_after_post_publish_namespace_replacement() {
+        let fixture = Fixture::new(2);
+        let port = KernelNbdInventoryPort::new(fixture.config(2));
+        let checkpoint_directory = fixture.state.join(CHECKPOINT_NAMESPACE);
+        let detached_directory = fixture.state.join("checkpoints-post-publish-detached");
+        let source = checkpoint("cat_a", "vol_a", "/dev/nbd1", '6');
+        let store = FileCheckpointStore::open(&checkpoint_directory, &source.cat_id).unwrap();
+        let predecessor = store.create(&source).unwrap();
+        let target_name = format!("cat-{}.checkpoint.json", source.cat_id.as_str());
+        let hook_checkpoint_directory = checkpoint_directory.clone();
+        let hook_detached_directory = detached_directory.clone();
+        store.before_publish_once(move |_| {
+            fs::rename(&hook_checkpoint_directory, &hook_detached_directory).unwrap();
+            fs::create_dir(&hook_checkpoint_directory).unwrap();
+        });
+        let context = desired_effect_context(&fixture.state, &["cat_a"]);
+
+        let error = port
+            .reserve_and_replace(&context, &store, &predecessor, |selected| {
+                let mut replacement = predecessor.checkpoint().clone();
+                let ReconcileStep::PrepareDevice {
+                    frontend: PrepareDeviceFrontend::KernelNbd { device_path, .. },
+                    ..
+                } = &mut replacement.step
+                else {
+                    panic!("fixture must be a kernel-NBD PrepareDevice checkpoint")
+                };
+                *device_path = selected;
+                Ok(replacement)
+            })
+            .unwrap_err();
+
+        assert!(error.to_string().contains("pathname changed"), "{error:#}");
+        assert!(!checkpoint_directory.join(&target_name).exists());
+        let detached = store.load().unwrap().unwrap();
+        let ReconcileStep::PrepareDevice {
+            frontend: PrepareDeviceFrontend::KernelNbd { device_path, .. },
+            ..
+        } = &detached.checkpoint().step
+        else {
+            panic!("detached publication must remain PrepareDevice")
+        };
+        assert_eq!(device_path, &host("/dev/nbd0"));
+        assert!(detached_directory.join(&target_name).exists());
+    }
+
+    #[test]
+    fn reservation_rejects_allocation_lock_rename_recreate_before_publication() {
+        let fixture = Fixture::new(2);
+        let port = KernelNbdInventoryPort::new(fixture.config(2));
+        let checkpoint_directory = fixture.state.join(CHECKPOINT_NAMESPACE);
+        let source = checkpoint("cat_a", "vol_a", "/dev/nbd1", '6');
+        let store = FileCheckpointStore::open(&checkpoint_directory, &source.cat_id).unwrap();
+        let predecessor = store.create(&source).unwrap();
+        let context = desired_effect_context(&fixture.state, &["cat_a"]);
+        let lock_path = fixture.state.join(ALLOCATION_LOCK_BASENAME);
+        let detached_lock_path = fixture.state.join("kernel-nbd-allocation.detached");
+
+        let error = port
+            .reserve_and_replace(&context, &store, &predecessor, |selected| {
+                fs::rename(&lock_path, &detached_lock_path).unwrap();
+                fs::write(&lock_path, b"").unwrap();
+                fs::set_permissions(&lock_path, fs::Permissions::from_mode(0o600)).unwrap();
+                let replacement_identity = fs::metadata(&lock_path).unwrap();
+                let mut replacement = predecessor.checkpoint().clone();
+                let ReconcileStep::PrepareDevice {
+                    frontend: PrepareDeviceFrontend::KernelNbd { device_path, .. },
+                    ..
+                } = &mut replacement.step
+                else {
+                    panic!("fixture must be a kernel-NBD PrepareDevice checkpoint")
+                };
+                *device_path = selected;
+                assert_ne!(
+                    replacement_identity.ino(),
+                    fs::metadata(&detached_lock_path).unwrap().ino()
+                );
+                Ok(replacement)
+            })
+            .unwrap_err();
+
+        assert!(
+            error
+                .to_string()
+                .contains("allocation lock pathname changed"),
+            "{error:#}"
+        );
+        assert!(detached_lock_path.exists());
+        assert_eq!(fs::read(&lock_path).unwrap(), b"");
+        assert_eq!(
+            store.load().unwrap().unwrap().checkpoint(),
+            predecessor.checkpoint()
+        );
     }
 
     #[test]
