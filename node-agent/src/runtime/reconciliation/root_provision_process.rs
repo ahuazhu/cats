@@ -761,6 +761,27 @@ impl NodeGlobalManagedProcessScanAdmission {
             .collect()
     }
 
+    /// Provider-private serving proof retained by the same complete scanner
+    /// pass. Frontend scanners may join this proof with independent physical
+    /// device evidence, but public process/device projections cannot recreate
+    /// it.
+    pub(crate) fn serving_blockd(
+        &self,
+        cat_id: &Id,
+    ) -> Option<(
+        &super::serving_blockd_process::ServingBlockdExpectation,
+        Option<&super::serving_blockd_process::ExactServingBlockdProcessProof>,
+    )> {
+        self.entries.iter().find_map(|entry| match entry {
+            NodeGlobalManagedProcessExpectation::ServingBlockd { expectation, exact }
+                if expectation.cat_id() == cat_id =>
+            {
+                Some((expectation.as_ref(), exact.as_deref()))
+            }
+            _ => None,
+        })
+    }
+
     pub(crate) fn from_root_controls(
         expected: BTreeMap<Id, RootProvisionProcessExpectation>,
         mut exact: BTreeMap<Id, ExactRootProvisionProcessProof>,

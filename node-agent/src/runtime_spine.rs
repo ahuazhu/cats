@@ -22,16 +22,16 @@ pub(crate) mod runtime_launch_port_sealed {
 #[cfg(test)]
 pub(crate) use desired_effect::{ProductionRuntimeDesiredEffect, RuntimeLaunchPort};
 
+pub(crate) use runner::{
+    effect_resource_owner_sealed, InventoryCoverageAggregator, RuntimeAssignedCatSet,
+    RuntimeEffectResourceOwner, RuntimeInventoryKeyRing, RuntimePhysicalReadContext,
+};
 pub use runner::{
     CompleteRuntimeInventory, RuntimeDesiredEffect, RuntimeDesiredEffectAdmission,
     RuntimeDesiredEffectContext, RuntimeDesiredEffectOutcome, RuntimeDesiredEffectStopReason,
     RuntimeInventoryScanContext, RuntimeInventoryScanOutcome, RuntimeInventoryScanner,
     RuntimeSpineDeadlinePolicy, RuntimeSpineDeadlinePolicyError, RuntimeSpineRunDeadlines,
     RuntimeSpineRunError, RuntimeSpineRunRetry, RuntimeSpineRunStep, RuntimeSpineRunner,
-};
-pub(crate) use runner::{
-    InventoryCoverageAggregator, RuntimeAssignedCatSet, RuntimeInventoryKeyRing,
-    RuntimePhysicalReadContext,
 };
 pub(crate) use runner::{
     RuntimePreScanRecovery, RuntimePreScanRecoveryContext, RuntimePreScanRecoveryOutcome,

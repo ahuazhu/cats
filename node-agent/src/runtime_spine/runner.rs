@@ -40,6 +40,7 @@ const REQUIRED_INVENTORY_SOURCES: [InventorySource; 11] = [
     InventorySource::MetadataStore,
     InventorySource::GuestMount,
 ];
+const EFFECT_RESOURCE_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Performs one bounded scan of every physical source required by Runtime §6.
 ///
@@ -96,6 +97,29 @@ pub trait RuntimeDesiredEffect: Send + Sync + 'static {
         context: RuntimeDesiredEffectContext,
         desired: &DesiredRuntimeSpec,
     ) -> anyhow::Result<RuntimeDesiredEffectOutcome>;
+}
+
+pub(crate) mod effect_resource_owner_sealed {
+    pub(crate) trait Sealed {}
+}
+
+/// Process-local ownership for helper resources which may outlive one
+/// cancelled/ambiguous physical effect. The effect worker is the only
+/// producer. Shutdown therefore closes and joins that worker before invoking
+/// `shutdown_until`, while readiness is forbidden whenever `has_pending`
+/// reports an unresolved resource.
+pub(crate) trait RuntimeEffectResourceOwner:
+    effect_resource_owner_sealed::Sealed + Send + Sync + 'static
+{
+    /// Nonblocking maintenance. Implementations may reap completed resources
+    /// but must not wait for a live child here.
+    fn poll(&self) -> anyhow::Result<()>;
+
+    fn has_pending(&self) -> bool;
+
+    /// Bounded producer-closed shutdown. A deadline failure must retain the
+    /// unresolved resources so the caller cannot claim a clean join.
+    fn shutdown_until(&self, deadline: Instant) -> anyhow::Result<()>;
 }
 
 /// Closed control decision returned by a typed Desired effect. Only
@@ -924,6 +948,8 @@ pub enum RuntimeSpineRunError {
     JournalQueueFull,
     #[error("runtime-spine worker shutdown failed: {0}")]
     WorkerShutdown(String),
+    #[error("runtime-spine effect resource maintenance failed: {0}")]
+    EffectResource(String),
     #[error("runtime-spine scanner returned an invalid outcome: {0}")]
     InvalidScan(&'static str),
     #[error("runtime-spine worker composition is invalid: {0}")]
@@ -1334,6 +1360,7 @@ impl EffectLane {
     fn start(
         effect: Arc<dyn RuntimeDesiredEffect>,
         recovery: Option<Arc<dyn RuntimePreScanRecovery>>,
+        resource_owner: Option<Arc<dyn RuntimeEffectResourceOwner>>,
     ) -> Result<Self, RuntimeSpineRunError> {
         let (sender, receiver) = mpsc::sync_channel(1);
         let state = Arc::new(EffectLaneState::default());
@@ -1349,27 +1376,55 @@ impl EffectLane {
                             desired,
                             reply,
                         } => {
-                            let result = if context.check_active().is_ok() {
-                                effect.apply(*context, &desired)
-                            } else {
-                                Err(anyhow::anyhow!(
-                                    "runtime Desired effect was cancelled before execution"
-                                ))
-                            };
+                            let resources_ready = resource_owner
+                                .as_ref()
+                                .map(|owner| {
+                                    owner.poll()?;
+                                    anyhow::ensure!(
+                                        !owner.has_pending(),
+                                        "runtime effect resource owner retains pending work"
+                                    );
+                                    Ok(())
+                                })
+                                .unwrap_or(Ok(()));
+                            let result =
+                                if context.check_active().is_ok() && resources_ready.is_ok() {
+                                    effect.apply(*context, &desired)
+                                } else {
+                                    resources_ready.and_then(|()| {
+                                        Err(anyhow::anyhow!(
+                                            "runtime Desired effect was cancelled before execution"
+                                        ))
+                                    })
+                                };
                             active_effect(&worker_state.active).take();
                             let _ = reply.send(result);
                         }
                         EffectCommand::Recover { context, reply } => {
-                            let result = if context.check_active().is_ok() {
-                                recovery.as_ref().map_or_else(
-                                    || Ok(RuntimePreScanRecoveryOutcome::NoChange),
-                                    |recovery| recovery.recover_one(*context),
-                                )
-                            } else {
-                                Err(anyhow::anyhow!(
-                                    "runtime pre-scan recovery was cancelled before execution"
-                                ))
-                            };
+                            let resources_ready = resource_owner
+                                .as_ref()
+                                .map(|owner| {
+                                    owner.poll()?;
+                                    anyhow::ensure!(
+                                        !owner.has_pending(),
+                                        "runtime recovery resource owner retains pending work"
+                                    );
+                                    Ok(())
+                                })
+                                .unwrap_or(Ok(()));
+                            let result =
+                                if context.check_active().is_ok() && resources_ready.is_ok() {
+                                    recovery.as_ref().map_or_else(
+                                        || Ok(RuntimePreScanRecoveryOutcome::NoChange),
+                                        |recovery| recovery.recover_one(*context),
+                                    )
+                                } else {
+                                    resources_ready.and_then(|()| {
+                                        Err(anyhow::anyhow!(
+                                        "runtime pre-scan recovery was cancelled before execution"
+                                    ))
+                                    })
+                                };
                             active_effect(&worker_state.active).take();
                             let _ = reply.send(result);
                         }
@@ -1711,6 +1766,7 @@ pub struct RuntimeSpineRunner {
     journal_lane: Option<JournalLane>,
     scan_lane: Option<ScanLane>,
     effect_lane: Option<EffectLane>,
+    effect_resource_owner: Option<Arc<dyn RuntimeEffectResourceOwner>>,
     current_process_scan_observation_id: Option<RandomId128>,
     current_process_node_global_process: Option<NodeGlobalManagedProcessAdmission>,
     current_process_node_global_network: Option<NodeGlobalNetworkAdmission>,
@@ -1744,6 +1800,7 @@ impl RuntimeSpineRunner {
             scanner,
             None,
             None,
+            None,
         )
     }
 
@@ -1763,6 +1820,7 @@ impl RuntimeSpineRunner {
             client,
             scanner,
             Some(effect),
+            None,
             None,
         )
     }
@@ -1784,6 +1842,30 @@ impl RuntimeSpineRunner {
             scanner,
             Some(effect),
             Some(recovery),
+            None,
+        )
+    }
+
+    /// Production composition for an effect which may transfer a bounded
+    /// helper resource into process-local cleanup ownership after an ambiguous
+    /// provider call.
+    pub(crate) fn new_with_recovery_desired_effects_and_resource_owner(
+        state_directory: StateDirectory,
+        registered_session: AgentSession,
+        client: RuntimeSpineHttpClient,
+        scanner: Arc<dyn RuntimeInventoryScanner>,
+        recovery: Arc<dyn RuntimePreScanRecovery>,
+        effect: Arc<dyn RuntimeDesiredEffect>,
+        resource_owner: Arc<dyn RuntimeEffectResourceOwner>,
+    ) -> Result<Self, RuntimeSpineRunError> {
+        Self::new_inner(
+            state_directory,
+            registered_session,
+            client,
+            scanner,
+            Some(effect),
+            Some(recovery),
+            Some(resource_owner),
         )
     }
 
@@ -1794,6 +1876,7 @@ impl RuntimeSpineRunner {
         scanner: Arc<dyn RuntimeInventoryScanner>,
         effect: Option<Arc<dyn RuntimeDesiredEffect>>,
         recovery: Option<Arc<dyn RuntimePreScanRecovery>>,
+        resource_owner: Option<Arc<dyn RuntimeEffectResourceOwner>>,
     ) -> Result<Self, RuntimeSpineRunError> {
         // Start the non-authoritative scanner first. If acquiring the journal
         // flock then fails, the effect and ScanLane Drops join the already
@@ -1804,8 +1887,13 @@ impl RuntimeSpineRunner {
                 "pre-scan recovery requires the serialized Desired mutation lane",
             ));
         }
+        if resource_owner.is_some() && effect.is_none() {
+            return Err(RuntimeSpineRunError::InvalidComposition(
+                "effect resource owner requires the serialized Desired mutation lane",
+            ));
+        }
         let effect_lane = effect
-            .map(|effect| EffectLane::start(effect, recovery))
+            .map(|effect| EffectLane::start(effect, recovery, resource_owner.clone()))
             .transpose()?;
         let journal_lane = JournalLane::start(state_directory.clone(), registered_session.clone())?;
         Ok(Self {
@@ -1815,6 +1903,7 @@ impl RuntimeSpineRunner {
             journal_lane: Some(journal_lane),
             scan_lane: Some(scan_lane),
             effect_lane,
+            effect_resource_owner: resource_owner,
             current_process_scan_observation_id: None,
             current_process_node_global_process: None,
             current_process_node_global_network: None,
@@ -1828,6 +1917,11 @@ impl RuntimeSpineRunner {
         &mut self,
         deadlines: RuntimeSpineRunDeadlines,
     ) -> Result<RuntimeSpineRunStep, RuntimeSpineRunError> {
+        if let Some(owner) = &self.effect_resource_owner {
+            owner
+                .poll()
+                .map_err(|error| RuntimeSpineRunError::EffectResource(format!("{error:#}")))?;
+        }
         // A timed-out blocking effect may still be returning from its provider
         // call. Do not start a fresh scan beside that unknown physical phase;
         // shutdown joins it before a successor runner establishes new
@@ -1988,6 +2082,7 @@ impl RuntimeSpineRunner {
             effect_lane: self.effect_lane.take(),
             scan_lane: self.scan_lane.take(),
             journal_lane: self.journal_lane.take(),
+            effect_resource_owner: self.effect_resource_owner.take(),
         }
     }
 
@@ -2147,7 +2242,11 @@ impl RuntimeSpineRunner {
                     && self.current_process_scan_observation_id.as_ref()
                         == Some(&request.value().observation_id);
                 let service_ready = establishes_effect_admission
-                    && observation_opens_service_readiness(request.value());
+                    && observation_opens_service_readiness(request.value())
+                    && self
+                        .effect_resource_owner
+                        .as_ref()
+                        .is_none_or(|owner| !owner.has_pending());
                 let admission = if establishes_effect_admission {
                     let node_global_process = self.current_process_node_global_process.take();
                     let node_global_network = self.current_process_node_global_network.take();
@@ -2227,6 +2326,7 @@ struct RunnerWorkers {
     effect_lane: Option<EffectLane>,
     scan_lane: Option<ScanLane>,
     journal_lane: Option<JournalLane>,
+    effect_resource_owner: Option<Arc<dyn RuntimeEffectResourceOwner>>,
 }
 
 impl RunnerWorkers {
@@ -2241,6 +2341,18 @@ impl RunnerWorkers {
             .effect_lane
             .as_mut()
             .map_or(Ok(()), EffectLane::shutdown_blocking);
+        // EffectLane is the sole producer. Always attempt bounded cleanup only
+        // after its sender has closed and its worker has joined (or reported a
+        // join failure), before scanner/journal teardown can be reported as a
+        // clean runner shutdown.
+        let effect_resource_result = self.effect_resource_owner.as_ref().map_or(Ok(()), |owner| {
+            let deadline = Instant::now()
+                .checked_add(EFFECT_RESOURCE_SHUTDOWN_TIMEOUT)
+                .unwrap_or_else(Instant::now);
+            owner.shutdown_until(deadline).map_err(|error| {
+                RuntimeSpineRunError::WorkerShutdown(format!("effect resource owner: {error:#}"))
+            })
+        });
         let scan_result = self
             .scan_lane
             .as_mut()
@@ -2252,12 +2364,20 @@ impl RunnerWorkers {
             .journal_lane
             .as_mut()
             .map_or(Ok(()), JournalLane::shutdown_blocking);
-        match (effect_result, scan_result, journal_result) {
-            (Ok(()), Ok(()), Ok(())) => Ok(()),
-            (effect, scan, journal) => {
+        match (
+            effect_result,
+            effect_resource_result,
+            scan_result,
+            journal_result,
+        ) {
+            (Ok(()), Ok(()), Ok(()), Ok(())) => Ok(()),
+            (effect, effect_resource, scan, journal) => {
                 let mut failures = Vec::new();
                 if let Err(error) = effect {
                     failures.push(format!("Desired effect: {error}"));
+                }
+                if let Err(error) = effect_resource {
+                    failures.push(format!("effect resource owner: {error}"));
                 }
                 if let Err(error) = scan {
                     failures.push(format!("inventory scan: {error}"));
@@ -2595,7 +2715,7 @@ mod tests {
             calls: AtomicUsize::new(0),
         });
         let recovery_port: Arc<dyn RuntimePreScanRecovery> = recovery.clone();
-        let mut lane = EffectLane::start(effect.clone(), Some(recovery_port)).unwrap();
+        let mut lane = EffectLane::start(effect.clone(), Some(recovery_port), None).unwrap();
         let snapshot = decode_desired_read_snapshot(SNAPSHOT).unwrap();
         let coordinates = RuntimeSpineFullScan {
             session: snapshot.session.clone(),
