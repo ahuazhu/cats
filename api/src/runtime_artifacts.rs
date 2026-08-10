@@ -9,6 +9,12 @@ use std::{ffi::CString, os::fd::AsRawFd as _, os::fd::FromRawFd as _};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest as _, Sha256};
 
+use crate::route_grant_v2::{
+    decode_route_grant_v2_public_key_ring, decode_route_grant_v2_signer_reference,
+    RouteGrantV2PublicKeyRingArtifact, RouteGrantV2SignerReference, RouteGrantV2SignerSelection,
+    ROUTE_GRANT_V2_ARTIFACT_MAX_WIRE_BYTES, ROUTE_GRANT_V2_PUBLIC_KEY_RING_PATH,
+    ROUTE_GRANT_V2_SIGNER_PRIVATE_KEY_PATH, ROUTE_GRANT_V2_SIGNER_REFERENCE_PATH,
+};
 use crate::runtime_reconciliation::{
     decode_guest_runtime_profile_receipt, decode_runtime_provisioner_trust_bundle, ContractVersion,
     GuestRuntimeProfileReceipt, RuntimeProvisionerTrustBundle, Sha256Digest, WireU64,
@@ -59,6 +65,69 @@ pub struct InstalledGuestRuntimeProfileReceipt {
 pub struct InstalledRuntimeProvisionerTrustBundle {
     bundle: RuntimeProvisionerTrustBundle,
     exact_bytes: Vec<u8>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct InstalledRouteGrantV2PublicKeyRing {
+    ring: RouteGrantV2PublicKeyRingArtifact,
+    exact_bytes: Vec<u8>,
+}
+
+impl InstalledRouteGrantV2PublicKeyRing {
+    pub fn ring(&self) -> &RouteGrantV2PublicKeyRingArtifact {
+        &self.ring
+    }
+
+    pub fn exact_bytes(&self) -> &[u8] {
+        &self.exact_bytes
+    }
+
+    pub fn into_ring(self) -> RouteGrantV2PublicKeyRingArtifact {
+        self.ring
+    }
+}
+
+/// Startup-pinned Control artifacts. Debug output deliberately contains only
+/// non-secret lineage; private PEM bytes never implement `Debug` or `Display`.
+pub struct InstalledRouteGrantV2Signer {
+    reference: RouteGrantV2SignerReference,
+    exact_reference_bytes: Vec<u8>,
+    ring: InstalledRouteGrantV2PublicKeyRing,
+    private_key_pem: Option<Vec<u8>>,
+}
+
+impl std::fmt::Debug for InstalledRouteGrantV2Signer {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("InstalledRouteGrantV2Signer")
+            .field("reference", &self.reference)
+            .field("ring", &self.ring)
+            .field(
+                "private_key_pem",
+                &self.private_key_pem.as_ref().map(|_| "[redacted]"),
+            )
+            .finish()
+    }
+}
+
+impl InstalledRouteGrantV2Signer {
+    pub fn reference(&self) -> &RouteGrantV2SignerReference {
+        &self.reference
+    }
+
+    pub fn exact_reference_bytes(&self) -> &[u8] {
+        &self.exact_reference_bytes
+    }
+
+    pub fn ring(&self) -> &InstalledRouteGrantV2PublicKeyRing {
+        &self.ring
+    }
+
+    /// `Some` only for an `active` descriptor. Callers must keep the slice in
+    /// memory only long enough to construct the private-key provider object.
+    pub fn private_key_pem(&self) -> Option<&[u8]> {
+        self.private_key_pem.as_deref()
+    }
 }
 
 impl InstalledRuntimeProvisionerTrustBundle {
@@ -141,6 +210,10 @@ pub enum RuntimeArtifactError {
     WrongReceiptPath,
     #[error("Runtime provisioner trust path must be the canonical installed path")]
     WrongProvisionerTrustPath,
+    #[error("Route Grant v2 public-key ring path must be the canonical installed path")]
+    WrongRouteGrantV2PublicKeyRingPath,
+    #[error("Route Grant v2 signer paths must be the canonical installed paths")]
+    WrongRouteGrantV2SignerPath,
     #[error("Guest runtime release is not supported on this platform")]
     UnsupportedPlatform,
     #[error("Guest runtime release filesystem contract failed at {path}")]
@@ -151,6 +224,134 @@ pub enum RuntimeArtifactError {
     InvalidReceipt,
     #[error("Runtime provisioner trust bundle is invalid")]
     InvalidProvisionerTrust,
+    #[error("Route Grant v2 public-key ring is invalid")]
+    InvalidRouteGrantV2PublicKeyRing,
+    #[error("Route Grant v2 signer artifact set is invalid")]
+    InvalidRouteGrantV2Signer,
+}
+
+/// Load the one public ring installed on a Node. The path argument exists only
+/// so production CLI composition can prove it did not accept an alternate.
+pub fn load_installed_route_grant_v2_public_key_ring(
+    selected_path: &Path,
+) -> Result<InstalledRouteGrantV2PublicKeyRing, RuntimeArtifactError> {
+    if selected_path != Path::new(ROUTE_GRANT_V2_PUBLIC_KEY_RING_PATH) {
+        return Err(RuntimeArtifactError::WrongRouteGrantV2PublicKeyRingPath);
+    }
+    load_installed_route_grant_v2_public_key_ring_platform()
+}
+
+#[cfg(unix)]
+fn load_installed_route_grant_v2_public_key_ring_platform(
+) -> Result<InstalledRouteGrantV2PublicKeyRing, RuntimeArtifactError> {
+    let directory = open_installed_directory(
+        &["etc", "cats", "route-v2"],
+        InstalledDirectoryMode::Exact(0o700),
+    )?;
+    load_route_grant_v2_public_key_ring_from(&directory, InstalledFileContract::root(0o644))
+}
+
+#[cfg(not(unix))]
+fn load_installed_route_grant_v2_public_key_ring_platform(
+) -> Result<InstalledRouteGrantV2PublicKeyRing, RuntimeArtifactError> {
+    Err(RuntimeArtifactError::UnsupportedPlatform)
+}
+
+/// Load one Control-only descriptor/ring/private-material set from a retained
+/// directory descriptor. Disabled descriptors deliberately do not open or read
+/// the private-material entry.
+pub fn load_installed_route_grant_v2_signer(
+    signer_reference_path: &Path,
+    public_key_ring_path: &Path,
+    private_key_path: &Path,
+) -> Result<InstalledRouteGrantV2Signer, RuntimeArtifactError> {
+    if signer_reference_path != Path::new(ROUTE_GRANT_V2_SIGNER_REFERENCE_PATH)
+        || public_key_ring_path != Path::new(ROUTE_GRANT_V2_PUBLIC_KEY_RING_PATH)
+        || private_key_path != Path::new(ROUTE_GRANT_V2_SIGNER_PRIVATE_KEY_PATH)
+    {
+        return Err(RuntimeArtifactError::WrongRouteGrantV2SignerPath);
+    }
+    load_installed_route_grant_v2_signer_platform()
+}
+
+#[cfg(unix)]
+fn load_installed_route_grant_v2_signer_platform(
+) -> Result<InstalledRouteGrantV2Signer, RuntimeArtifactError> {
+    let directory = open_installed_directory(
+        &["etc", "cats", "route-v2"],
+        InstalledDirectoryMode::Exact(0o700),
+    )?;
+    load_route_grant_v2_signer_from(
+        &directory,
+        InstalledFileContract::root(0o644),
+        InstalledFileContract::root(0o600),
+    )
+}
+
+#[cfg(not(unix))]
+fn load_installed_route_grant_v2_signer_platform(
+) -> Result<InstalledRouteGrantV2Signer, RuntimeArtifactError> {
+    Err(RuntimeArtifactError::UnsupportedPlatform)
+}
+
+#[cfg(unix)]
+fn load_route_grant_v2_public_key_ring_from(
+    directory: &File,
+    file_contract: InstalledFileContract,
+) -> Result<InstalledRouteGrantV2PublicKeyRing, RuntimeArtifactError> {
+    let exact_bytes = read_exact_installed_file_at_with_contract(
+        directory,
+        "public-key-ring.v1.json",
+        Path::new(ROUTE_GRANT_V2_PUBLIC_KEY_RING_PATH),
+        ROUTE_GRANT_V2_ARTIFACT_MAX_WIRE_BYTES,
+        file_contract,
+    )?;
+    let ring = decode_route_grant_v2_public_key_ring(&exact_bytes)
+        .map_err(|_| RuntimeArtifactError::InvalidRouteGrantV2PublicKeyRing)?;
+    Ok(InstalledRouteGrantV2PublicKeyRing { ring, exact_bytes })
+}
+
+#[cfg(unix)]
+fn load_route_grant_v2_signer_from(
+    directory: &File,
+    public_file_contract: InstalledFileContract,
+    private_file_contract: InstalledFileContract,
+) -> Result<InstalledRouteGrantV2Signer, RuntimeArtifactError> {
+    let exact_reference_bytes = read_exact_installed_file_at_with_contract(
+        directory,
+        "signer.v1.json",
+        Path::new(ROUTE_GRANT_V2_SIGNER_REFERENCE_PATH),
+        ROUTE_GRANT_V2_ARTIFACT_MAX_WIRE_BYTES,
+        public_file_contract,
+    )?;
+    let reference = decode_route_grant_v2_signer_reference(&exact_reference_bytes)
+        .map_err(|_| RuntimeArtifactError::InvalidRouteGrantV2Signer)?;
+    let ring = load_route_grant_v2_public_key_ring_from(directory, public_file_contract)?;
+    reference
+        .validate_ring(ring.ring())
+        .map_err(|_| RuntimeArtifactError::InvalidRouteGrantV2Signer)?;
+    let private_key_pem = match &reference.signer {
+        RouteGrantV2SignerSelection::Disabled => None,
+        RouteGrantV2SignerSelection::Active { .. } => {
+            let bytes = read_exact_installed_file_at_with_contract(
+                directory,
+                "signer-private-key.pem",
+                Path::new(ROUTE_GRANT_V2_SIGNER_PRIVATE_KEY_PATH),
+                ROUTE_GRANT_V2_ARTIFACT_MAX_WIRE_BYTES,
+                private_file_contract,
+            )?;
+            if bytes.is_empty() {
+                return Err(RuntimeArtifactError::InvalidRouteGrantV2Signer);
+            }
+            Some(bytes)
+        }
+    };
+    Ok(InstalledRouteGrantV2Signer {
+        reference,
+        exact_reference_bytes,
+        ring,
+        private_key_pem,
+    })
 }
 
 /// Read and pin the one deployment-provisioner trust bundle before the admin
@@ -430,6 +631,25 @@ enum InstalledDirectoryMode {
 }
 
 #[cfg(unix)]
+#[derive(Clone, Copy)]
+struct InstalledFileContract {
+    uid: u32,
+    gid: u32,
+    mode: u32,
+}
+
+#[cfg(unix)]
+impl InstalledFileContract {
+    const fn root(mode: u32) -> Self {
+        Self {
+            uid: 0,
+            gid: 0,
+            mode,
+        }
+    }
+}
+
+#[cfg(unix)]
 impl InstalledDirectoryMode {
     fn accepts(self, mode: u32) -> bool {
         let mode = mode & 0o777;
@@ -565,9 +785,26 @@ fn read_exact_installed_file_at(
     path: &Path,
     cap: usize,
 ) -> Result<Vec<u8>, RuntimeArtifactError> {
+    read_exact_installed_file_at_with_contract(
+        directory,
+        name,
+        path,
+        cap,
+        InstalledFileContract::root(0o644),
+    )
+}
+
+#[cfg(unix)]
+fn read_exact_installed_file_at_with_contract(
+    directory: &File,
+    name: &str,
+    path: &Path,
+    cap: usize,
+    contract: InstalledFileContract,
+) -> Result<Vec<u8>, RuntimeArtifactError> {
     let mut file = open_file_at(directory, name, path)?;
     let before = StableFileMetadata::new(&file.metadata().map_err(|_| filesystem_error(path))?);
-    if !before.is_exact_installed_file() {
+    if !before.is_exact_installed_file(contract) {
         return Err(filesystem_error(path));
     }
     if before.len > cap as u64 {
@@ -599,7 +836,7 @@ fn open_verified_installed_member_at(
 ) -> Result<File, RuntimeArtifactError> {
     let mut file = open_file_at(directory, name, path)?;
     let before = StableFileMetadata::new(&file.metadata().map_err(|_| filesystem_error(path))?);
-    if !before.is_exact_installed_file()
+    if !before.is_exact_installed_file(InstalledFileContract::root(0o644))
         || before.len == 0
         || before.len > cap as u64
         || member.path != expected_path
@@ -668,11 +905,11 @@ impl StableFileMetadata {
         }
     }
 
-    fn is_exact_installed_file(self) -> bool {
+    fn is_exact_installed_file(self, contract: InstalledFileContract) -> bool {
         self.is_file
-            && self.mode & 0o777 == 0o644
-            && self.uid == 0
-            && self.gid == 0
+            && self.mode & 0o777 == contract.mode
+            && self.uid == contract.uid
+            && self.gid == contract.gid
             && self.nlink == 1
     }
 }
@@ -689,6 +926,10 @@ mod tests {
 
     const RECEIPT: &[u8] = br#"{"guest_agent_protocol_version":1,"initramfs_digest":"sha256:1111111111111111111111111111111111111111111111111111111111111111","kernel_cmdline":"console=ttyS0 root=/dev/vda rw clocksource=kvm-clock","kernel_digest":"sha256:0000000000000000000000000000000000000000000000000000000000000000","version":1}"#;
     const MANIFEST: &[u8] = br#"{"guest_runtime_profile":{"path":"guest-runtime-profile.v1.json","sha256":"sha256:dae6f9b08706e17d03cbeece8141fef960185fe0758f80f999f9f2218d43e10a","size_bytes":301},"initramfs":{"path":"guest/initramfs.img","sha256":"sha256:1111111111111111111111111111111111111111111111111111111111111111","size_bytes":8388608},"kernel":{"path":"guest/vmlinuz","sha256":"sha256:0000000000000000000000000000000000000000000000000000000000000000","size_bytes":16777216},"version":1}"#;
+    const ROUTE_RING: &[u8] = br#"{"version":1,"ring_version":1,"expected_previous":null,"keys":[{"kid":"fd56fed3251463eff0063169a7f8fa9dce585b6eee429581264297c98ec58bcb","public_key_spki":"MCowBQYDK2VwAyEA2-Jj2UvNCvQiUPNYRgSi0cJSPiJI6Rs6D0UTeEpQVj8"}]}"#;
+    const ROUTE_SIGNER: &[u8] = br#"{"version":1,"deployment_id":"route_deployment_a","signer_revision":1,"expected_previous":null,"signer":{"state":"active","active_kid":"fd56fed3251463eff0063169a7f8fa9dce585b6eee429581264297c98ec58bcb","secret_reference_id":"route_secret_a"},"public_key_ring_version":1,"public_key_ring_digest":"sha256:4e6fec49756e03044438af279f7bfd9507f06cf065ff0673447bd6377cd07ac0"}"#;
+    const ROUTE_PRIVATE_KEY: &[u8] =
+        include_bytes!("../../tests/fixtures/route_grant_private_ed25519.pem");
 
     #[test]
     fn fixed_manifest_vector_and_release_id_are_exact() {
@@ -723,6 +964,22 @@ mod tests {
         assert!(matches!(
             load_installed_runtime_provisioner_trust_bundle(Path::new("relative.json")),
             Err(RuntimeArtifactError::WrongProvisionerTrustPath)
+        ));
+    }
+
+    #[test]
+    fn route_signing_paths_reject_every_alternate_before_filesystem_access() {
+        assert!(matches!(
+            load_installed_route_grant_v2_public_key_ring(Path::new("relative.json")),
+            Err(RuntimeArtifactError::WrongRouteGrantV2PublicKeyRingPath)
+        ));
+        assert!(matches!(
+            load_installed_route_grant_v2_signer(
+                Path::new("relative.json"),
+                Path::new(ROUTE_GRANT_V2_PUBLIC_KEY_RING_PATH),
+                Path::new(ROUTE_GRANT_V2_SIGNER_PRIVATE_KEY_PATH),
+            ),
+            Err(RuntimeArtifactError::WrongRouteGrantV2SignerPath)
         ));
     }
 
@@ -780,5 +1037,106 @@ mod tests {
             std::fs::read(release_path.join("member")).unwrap(),
             b"replacement-directory"
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn route_signer_reader_pins_one_closed_set_and_redacts_private_material() {
+        use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
+
+        let temp = tempfile::tempdir().unwrap();
+        let directory_path = temp.path().join("route-v2");
+        std::fs::create_dir(&directory_path).unwrap();
+        std::fs::set_permissions(&directory_path, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let ring_path = directory_path.join("public-key-ring.v1.json");
+        let reference_path = directory_path.join("signer.v1.json");
+        let private_path = directory_path.join("signer-private-key.pem");
+        std::fs::write(&ring_path, ROUTE_RING).unwrap();
+        std::fs::write(&reference_path, ROUTE_SIGNER).unwrap();
+        std::fs::write(&private_path, ROUTE_PRIVATE_KEY).unwrap();
+        std::fs::set_permissions(&ring_path, std::fs::Permissions::from_mode(0o644)).unwrap();
+        std::fs::set_permissions(&reference_path, std::fs::Permissions::from_mode(0o644)).unwrap();
+        std::fs::set_permissions(&private_path, std::fs::Permissions::from_mode(0o600)).unwrap();
+
+        let metadata = std::fs::metadata(&reference_path).unwrap();
+        let public_contract = InstalledFileContract {
+            uid: metadata.uid(),
+            gid: metadata.gid(),
+            mode: 0o644,
+        };
+        let private_contract = InstalledFileContract {
+            uid: metadata.uid(),
+            gid: metadata.gid(),
+            mode: 0o600,
+        };
+        let retained = File::open(&directory_path).unwrap();
+        let installed =
+            load_route_grant_v2_signer_from(&retained, public_contract, private_contract).unwrap();
+        assert_eq!(installed.exact_reference_bytes(), ROUTE_SIGNER);
+        assert_eq!(installed.ring().exact_bytes(), ROUTE_RING);
+        assert_eq!(installed.private_key_pem(), Some(ROUTE_PRIVATE_KEY));
+        let debug = format!("{installed:?}");
+        assert!(debug.contains("[redacted]"));
+        assert!(!debug.contains("BEGIN PRIVATE KEY"));
+
+        std::fs::set_permissions(&private_path, std::fs::Permissions::from_mode(0o644)).unwrap();
+        assert!(
+            load_route_grant_v2_signer_from(&retained, public_contract, private_contract).is_err()
+        );
+        std::fs::set_permissions(&private_path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        std::fs::hard_link(&private_path, directory_path.join("private-hardlink")).unwrap();
+        assert!(
+            load_route_grant_v2_signer_from(&retained, public_contract, private_contract).is_err()
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn disabled_route_signer_never_opens_private_material() {
+        use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
+
+        let temp = tempfile::tempdir().unwrap();
+        let directory_path = temp.path().join("route-v2");
+        std::fs::create_dir(&directory_path).unwrap();
+        let ring_path = directory_path.join("public-key-ring.v1.json");
+        let reference_path = directory_path.join("signer.v1.json");
+        std::fs::write(&ring_path, ROUTE_RING).unwrap();
+        let mut disabled = decode_route_grant_v2_signer_reference(ROUTE_SIGNER).unwrap();
+        disabled.signer = RouteGrantV2SignerSelection::Disabled;
+        std::fs::write(
+            &reference_path,
+            crate::route_grant_v2::encode_route_grant_v2_signer_reference(&disabled).unwrap(),
+        )
+        .unwrap();
+        std::fs::set_permissions(&ring_path, std::fs::Permissions::from_mode(0o644)).unwrap();
+        std::fs::set_permissions(&reference_path, std::fs::Permissions::from_mode(0o644)).unwrap();
+        std::os::unix::fs::symlink(
+            "/definitely/not/a/route/key",
+            directory_path.join("signer-private-key.pem"),
+        )
+        .unwrap();
+
+        let metadata = std::fs::metadata(&reference_path).unwrap();
+        let public_contract = InstalledFileContract {
+            uid: metadata.uid(),
+            gid: metadata.gid(),
+            mode: 0o644,
+        };
+        let retained = File::open(&directory_path).unwrap();
+        let installed = load_route_grant_v2_signer_from(
+            &retained,
+            public_contract,
+            InstalledFileContract {
+                uid: metadata.uid(),
+                gid: metadata.gid(),
+                mode: 0o600,
+            },
+        )
+        .unwrap();
+        assert!(matches!(
+            &installed.reference().signer,
+            RouteGrantV2SignerSelection::Disabled
+        ));
+        assert_eq!(installed.private_key_pem(), None);
     }
 }
