@@ -601,6 +601,10 @@ const CONTROL_TABLES: &[&str] = &[
     "runtime_provisioner_deployment_identity",
     "runtime_provisioner_trust_revisions",
     "runtime_provisioner_credential_lineage",
+    "route_v2_gateway_identity_authority",
+    "route_v2_gateway_identity_revisions",
+    "route_v2_gateway_credential_lineage",
+    "route_v2_gateway_current_credentials",
 ];
 
 type RequiredDeferredForeignKey = (
@@ -636,8 +640,29 @@ const REQUIRED_CHECK_CONSTRAINTS: &[(&str, &str, &str)] = &[
     ),
 ];
 
-const REQUIRED_PRIMARY_KEYS: &[(&str, &str, &str)] =
-    &[("volume_records", "volume_records_pkey", "volume_id")];
+const REQUIRED_PRIMARY_KEYS: &[(&str, &str, &str)] = &[
+    ("volume_records", "volume_records_pkey", "volume_id"),
+    (
+        "route_v2_gateway_identity_authority",
+        "route_v2_gateway_identity_authority_pkey",
+        "singleton",
+    ),
+    (
+        "route_v2_gateway_identity_revisions",
+        "route_v2_gateway_identity_revisions_pkey",
+        "authority_id,policy_revision",
+    ),
+    (
+        "route_v2_gateway_credential_lineage",
+        "route_v2_gateway_credential_lineage_pkey",
+        "credential_id",
+    ),
+    (
+        "route_v2_gateway_current_credentials",
+        "route_v2_gateway_current_credentials_pkey",
+        "credential_id",
+    ),
+];
 
 const REQUIRED_DEFERRED_FOREIGN_KEYS: &[RequiredDeferredForeignKey] = &[
     (
@@ -675,6 +700,42 @@ const REQUIRED_DEFERRED_FOREIGN_KEYS: &[RequiredDeferredForeignKey] = &[
         "deployment_id",
         "r",
         "r",
+    ),
+    (
+        "route_v2_gateway_identity_authority",
+        "route_v2_gateway_current_policy_revision",
+        "route_v2_gateway_identity_revisions",
+        "authority_id,fleet_id,current_policy_revision,current_policy_sha256",
+        "authority_id,fleet_id,policy_revision,policy_sha256",
+        "r",
+        "r",
+    ),
+    (
+        "route_v2_gateway_identity_revisions",
+        "route_v2_gateway_revisions_authority_fkey",
+        "route_v2_gateway_identity_authority",
+        "authority_id,fleet_id",
+        "authority_id,fleet_id",
+        "r",
+        "r",
+    ),
+    (
+        "route_v2_gateway_current_credentials",
+        "route_v2_gateway_current_policy_fkey",
+        "route_v2_gateway_identity_authority",
+        "authority_id,fleet_id,policy_revision,policy_sha256",
+        "authority_id,fleet_id,current_policy_revision,current_policy_sha256",
+        "a",
+        "a",
+    ),
+    (
+        "route_v2_gateway_current_credentials",
+        "route_v2_gateway_current_lineage_fkey",
+        "route_v2_gateway_credential_lineage",
+        "credential_id,authority_id,public_key_spki_sha256,lineage_state",
+        "credential_id,authority_id,public_key_spki_sha256,state",
+        "a",
+        "a",
     ),
 ];
 
@@ -719,6 +780,48 @@ const REQUIRED_UNIQUE_INDEXES: &[(&str, &str, &str, Option<&str>)] = &[
         "runtime_provisioner_trust_revisions",
         "runtime_provisioner_trust_revisions_pkey",
         "deployment_id,trust_revision",
+        None,
+    ),
+    (
+        "route_v2_gateway_identity_authority",
+        "route_v2_gateway_identity_authority_authority_id_key",
+        "authority_id",
+        None,
+    ),
+    (
+        "route_v2_gateway_identity_authority",
+        "route_v2_gateway_identity_authority_authority_id_fleet_id_key",
+        "authority_id,fleet_id",
+        None,
+    ),
+    (
+        "route_v2_gateway_identity_authority",
+        "route_v2_gateway_identity_authority_current_key",
+        "authority_id,fleet_id,current_policy_revision,current_policy_sha256",
+        None,
+    ),
+    (
+        "route_v2_gateway_identity_revisions",
+        "route_v2_gateway_identity_revisions_exact_key",
+        "authority_id,fleet_id,policy_revision,policy_sha256",
+        None,
+    ),
+    (
+        "route_v2_gateway_credential_lineage",
+        "route_v2_gateway_credential_lineage_spki_key",
+        "public_key_spki",
+        None,
+    ),
+    (
+        "route_v2_gateway_credential_lineage",
+        "route_v2_gateway_credential_lineage_spki_sha256_key",
+        "public_key_spki_sha256",
+        None,
+    ),
+    (
+        "route_v2_gateway_credential_lineage",
+        "route_v2_gateway_credential_lineage_exact_key",
+        "credential_id,authority_id,public_key_spki_sha256,state",
         None,
     ),
 ];
@@ -844,6 +947,41 @@ const REQUIRED_IMMUTABILITY_TRIGGERS: &[(&str, &str, &str, i16, &str)] = &[
         "3ba58cdd898c1ded0023c8732a3ca155cc17caf6bba93d8346dcc43c2dbd9e76",
     ),
     (
+        "route_v2_gateway_identity_revisions",
+        "route_v2_gateway_revision_is_immutable",
+        "control_route_v2_gateway_revision_is_immutable",
+        BEFORE_ROW_UPDATE_DELETE,
+        "0361b1936fe77f8af0dc9dbfef74403fc35082cd9fcc7faa58b9aceb9046c86f",
+    ),
+    (
+        "route_v2_gateway_credential_lineage",
+        "route_v2_gateway_credential_update",
+        "control_route_v2_gateway_credential_update",
+        BEFORE_ROW_UPDATE,
+        "783e4594fc9bb232e0b699f053728a13b76515985a037b1ef37c88ec582bd350",
+    ),
+    (
+        "route_v2_gateway_credential_lineage",
+        "route_v2_gateway_credential_cannot_delete",
+        "control_route_v2_gateway_credential_cannot_delete",
+        BEFORE_ROW_DELETE,
+        "9f5496d7d7edd5410512a78d46de6b79c9c015f53153880eb982aa70e6ac0bd5",
+    ),
+    (
+        "route_v2_gateway_identity_authority",
+        "route_v2_gateway_pointer_update",
+        "control_route_v2_gateway_pointer_update",
+        BEFORE_ROW_UPDATE,
+        "b4b6b423ba8bd5cbdd225e3bc5edcf17c64330d303c61099832bbc374ae55bfe",
+    ),
+    (
+        "route_v2_gateway_identity_authority",
+        "route_v2_gateway_pointer_cannot_delete",
+        "control_route_v2_gateway_pointer_cannot_delete",
+        BEFORE_ROW_DELETE,
+        "95487da8f6a12df1ef2329176b8661fa2318dd5d9240e95550b15bb8e4e5d98d",
+    ),
+    (
         "node_identities",
         "node_identity_lineage_is_immutable",
         "control_node_identity_lineage_is_immutable",
@@ -966,6 +1104,20 @@ const AUTHORITY_SCHEMA_PROBES: &[&str] = &[
             public_key_spki_sha256, state, first_committed_at_unix_ms,
             retired_at_unix_ms
        FROM runtime_provisioner_credential_lineage WHERE FALSE",
+    "SELECT singleton, authority_id, fleet_id, current_policy_revision,
+            current_policy_sha256, first_committed_at_unix_ms
+       FROM route_v2_gateway_identity_authority WHERE FALSE",
+    "SELECT authority_id, fleet_id, policy_revision, policy_sha256,
+            policy_bytes, expected_previous_policy_revision,
+            expected_previous_policy_sha256, committed_at_unix_ms
+       FROM route_v2_gateway_identity_revisions WHERE FALSE",
+    "SELECT credential_id, authority_id, public_key_spki,
+            public_key_spki_sha256, state, first_committed_at_unix_ms,
+            revoked_at_unix_ms
+       FROM route_v2_gateway_credential_lineage WHERE FALSE",
+    "SELECT credential_id, authority_id, fleet_id, policy_revision,
+            policy_sha256, public_key_spki_sha256, scope, lineage_state
+       FROM route_v2_gateway_current_credentials WHERE FALSE",
 ];
 
 const SCHEMA: &str = "
@@ -1666,6 +1818,99 @@ CREATE TABLE IF NOT EXISTS runtime_provisioner_credential_lineage (
     CHECK ((state = 'active' AND retired_at_unix_ms IS NULL) OR
            (state = 'retired' AND retired_at_unix_ms IS NOT NULL))
 );
+CREATE TABLE IF NOT EXISTS route_v2_gateway_identity_authority (
+    singleton BOOLEAN PRIMARY KEY DEFAULT TRUE CHECK (singleton),
+    authority_id TEXT NOT NULL UNIQUE,
+    fleet_id TEXT NOT NULL,
+    current_policy_revision BIGINT NOT NULL CHECK (current_policy_revision > 0),
+    current_policy_sha256 TEXT NOT NULL
+        CHECK (current_policy_sha256 ~ '^sha256:[0-9a-f]{64}$'),
+    first_committed_at_unix_ms BIGINT NOT NULL CHECK (first_committed_at_unix_ms >= 0),
+    CONSTRAINT route_v2_gateway_identity_authority_authority_id_fleet_id_key
+        UNIQUE (authority_id, fleet_id),
+    CONSTRAINT route_v2_gateway_identity_authority_current_key
+        UNIQUE (authority_id, fleet_id, current_policy_revision, current_policy_sha256)
+);
+CREATE TABLE IF NOT EXISTS route_v2_gateway_identity_revisions (
+    authority_id TEXT NOT NULL,
+    fleet_id TEXT NOT NULL,
+    policy_revision BIGINT NOT NULL CHECK (policy_revision > 0),
+    policy_sha256 TEXT NOT NULL
+        CHECK (policy_sha256 ~ '^sha256:[0-9a-f]{64}$'),
+    policy_bytes BYTEA NOT NULL
+        CHECK (octet_length(policy_bytes) BETWEEN 1 AND 65536),
+    expected_previous_policy_revision BIGINT NULL
+        CHECK (expected_previous_policy_revision > 0),
+    expected_previous_policy_sha256 TEXT NULL
+        CHECK (expected_previous_policy_sha256 ~ '^sha256:[0-9a-f]{64}$'),
+    committed_at_unix_ms BIGINT NOT NULL CHECK (committed_at_unix_ms >= 0),
+    PRIMARY KEY (authority_id, policy_revision),
+    CONSTRAINT route_v2_gateway_identity_revisions_exact_key
+        UNIQUE (authority_id, fleet_id, policy_revision, policy_sha256),
+    CHECK (
+        (policy_revision = 1 AND expected_previous_policy_revision IS NULL
+            AND expected_previous_policy_sha256 IS NULL) OR
+        (policy_revision > 1
+            AND expected_previous_policy_revision = policy_revision - 1
+            AND expected_previous_policy_sha256 IS NOT NULL)
+    ),
+    CONSTRAINT route_v2_gateway_revisions_authority_fkey
+        FOREIGN KEY (authority_id, fleet_id)
+        REFERENCES route_v2_gateway_identity_authority(authority_id, fleet_id)
+        ON UPDATE RESTRICT ON DELETE RESTRICT DEFERRABLE INITIALLY DEFERRED
+);
+ALTER TABLE route_v2_gateway_identity_authority
+    ADD CONSTRAINT route_v2_gateway_current_policy_revision
+    FOREIGN KEY (
+        authority_id, fleet_id, current_policy_revision, current_policy_sha256)
+    REFERENCES route_v2_gateway_identity_revisions(
+        authority_id, fleet_id, policy_revision, policy_sha256)
+    ON UPDATE RESTRICT ON DELETE RESTRICT DEFERRABLE INITIALLY DEFERRED;
+CREATE TABLE IF NOT EXISTS route_v2_gateway_credential_lineage (
+    credential_id TEXT PRIMARY KEY,
+    authority_id TEXT NOT NULL
+        REFERENCES route_v2_gateway_identity_authority(authority_id)
+        ON UPDATE RESTRICT ON DELETE RESTRICT,
+    public_key_spki TEXT NOT NULL,
+    public_key_spki_sha256 TEXT NOT NULL
+        CHECK (public_key_spki_sha256 ~ '^sha256:[0-9a-f]{64}$'),
+    state TEXT NOT NULL CHECK (state IN ('active', 'revoked')),
+    first_committed_at_unix_ms BIGINT NOT NULL CHECK (first_committed_at_unix_ms >= 0),
+    revoked_at_unix_ms BIGINT NULL CHECK (
+        revoked_at_unix_ms IS NULL OR
+        revoked_at_unix_ms >= first_committed_at_unix_ms),
+    CHECK ((state = 'active' AND revoked_at_unix_ms IS NULL) OR
+           (state = 'revoked' AND revoked_at_unix_ms IS NOT NULL)),
+    CONSTRAINT route_v2_gateway_credential_lineage_spki_key
+        UNIQUE (public_key_spki),
+    CONSTRAINT route_v2_gateway_credential_lineage_spki_sha256_key
+        UNIQUE (public_key_spki_sha256),
+    CONSTRAINT route_v2_gateway_credential_lineage_exact_key
+        UNIQUE (credential_id, authority_id, public_key_spki_sha256, state)
+);
+CREATE TABLE IF NOT EXISTS route_v2_gateway_current_credentials (
+    credential_id TEXT PRIMARY KEY,
+    authority_id TEXT NOT NULL,
+    fleet_id TEXT NOT NULL,
+    policy_revision BIGINT NOT NULL CHECK (policy_revision > 0),
+    policy_sha256 TEXT NOT NULL
+        CHECK (policy_sha256 ~ '^sha256:[0-9a-f]{64}$'),
+    public_key_spki_sha256 TEXT NOT NULL
+        CHECK (public_key_spki_sha256 ~ '^sha256:[0-9a-f]{64}$'),
+    scope JSONB NOT NULL CHECK (jsonb_typeof(scope) = 'object'),
+    lineage_state TEXT NOT NULL CHECK (lineage_state = 'active'),
+    CONSTRAINT route_v2_gateway_current_policy_fkey
+        FOREIGN KEY (authority_id, fleet_id, policy_revision, policy_sha256)
+        REFERENCES route_v2_gateway_identity_authority(
+            authority_id, fleet_id, current_policy_revision, current_policy_sha256)
+        ON UPDATE NO ACTION ON DELETE NO ACTION DEFERRABLE INITIALLY DEFERRED,
+    CONSTRAINT route_v2_gateway_current_lineage_fkey
+        FOREIGN KEY (
+            credential_id, authority_id, public_key_spki_sha256, lineage_state)
+        REFERENCES route_v2_gateway_credential_lineage(
+            credential_id, authority_id, public_key_spki_sha256, state)
+        ON UPDATE NO ACTION ON DELETE NO ACTION DEFERRABLE INITIALLY DEFERRED
+);
 CREATE TABLE IF NOT EXISTS agent_registration_attempts (
     node_id TEXT NOT NULL REFERENCES node_identities(node_id),
     registration_attempt_id TEXT NOT NULL,
@@ -1875,6 +2120,71 @@ CREATE TRIGGER runtime_provisioner_pointer_update
 CREATE TRIGGER runtime_provisioner_pointer_cannot_delete
     BEFORE DELETE ON runtime_provisioner_deployment_identity
     FOR EACH ROW EXECUTE FUNCTION control_runtime_provisioner_pointer_cannot_delete();
+CREATE OR REPLACE FUNCTION control_route_v2_gateway_revision_is_immutable()
+RETURNS trigger AS $$
+BEGIN
+    RAISE EXCEPTION 'Route v2 Gateway identity revision is immutable';
+END;
+$$ LANGUAGE plpgsql;
+CREATE TRIGGER route_v2_gateway_revision_is_immutable
+    BEFORE UPDATE OR DELETE ON route_v2_gateway_identity_revisions
+    FOR EACH ROW EXECUTE FUNCTION control_route_v2_gateway_revision_is_immutable();
+CREATE OR REPLACE FUNCTION control_route_v2_gateway_credential_update()
+RETURNS trigger AS $$
+BEGIN
+    IF NEW.credential_id IS DISTINCT FROM OLD.credential_id
+       OR NEW.authority_id IS DISTINCT FROM OLD.authority_id
+       OR NEW.public_key_spki IS DISTINCT FROM OLD.public_key_spki
+       OR NEW.public_key_spki_sha256 IS DISTINCT FROM OLD.public_key_spki_sha256
+       OR NEW.first_committed_at_unix_ms IS DISTINCT FROM OLD.first_committed_at_unix_ms
+       OR OLD.state = 'revoked'
+       OR OLD.state <> 'active'
+       OR NEW.state <> 'revoked'
+       OR OLD.revoked_at_unix_ms IS NOT NULL
+       OR NEW.revoked_at_unix_ms IS NULL THEN
+        RAISE EXCEPTION 'Route v2 Gateway credential lineage is immutable';
+    END IF;
+    RETURN NEW;
+END;
+$$ LANGUAGE plpgsql;
+CREATE OR REPLACE FUNCTION control_route_v2_gateway_credential_cannot_delete()
+RETURNS trigger AS $$
+BEGIN
+    RAISE EXCEPTION 'Route v2 Gateway credential lineage cannot be deleted';
+END;
+$$ LANGUAGE plpgsql;
+CREATE TRIGGER route_v2_gateway_credential_update
+    BEFORE UPDATE ON route_v2_gateway_credential_lineage
+    FOR EACH ROW EXECUTE FUNCTION control_route_v2_gateway_credential_update();
+CREATE TRIGGER route_v2_gateway_credential_cannot_delete
+    BEFORE DELETE ON route_v2_gateway_credential_lineage
+    FOR EACH ROW EXECUTE FUNCTION control_route_v2_gateway_credential_cannot_delete();
+CREATE OR REPLACE FUNCTION control_route_v2_gateway_pointer_update()
+RETURNS trigger AS $$
+BEGIN
+    IF NEW.singleton IS DISTINCT FROM OLD.singleton
+       OR NEW.authority_id IS DISTINCT FROM OLD.authority_id
+       OR NEW.fleet_id IS DISTINCT FROM OLD.fleet_id
+       OR NEW.first_committed_at_unix_ms IS DISTINCT FROM OLD.first_committed_at_unix_ms
+       OR NEW.current_policy_revision <> OLD.current_policy_revision + 1
+       OR NEW.current_policy_sha256 = OLD.current_policy_sha256 THEN
+        RAISE EXCEPTION 'Route v2 Gateway identity pointer is not a successor';
+    END IF;
+    RETURN NEW;
+END;
+$$ LANGUAGE plpgsql;
+CREATE OR REPLACE FUNCTION control_route_v2_gateway_pointer_cannot_delete()
+RETURNS trigger AS $$
+BEGIN
+    RAISE EXCEPTION 'Route v2 Gateway identity authority cannot be deleted';
+END;
+$$ LANGUAGE plpgsql;
+CREATE TRIGGER route_v2_gateway_pointer_update
+    BEFORE UPDATE ON route_v2_gateway_identity_authority
+    FOR EACH ROW EXECUTE FUNCTION control_route_v2_gateway_pointer_update();
+CREATE TRIGGER route_v2_gateway_pointer_cannot_delete
+    BEFORE DELETE ON route_v2_gateway_identity_authority
+    FOR EACH ROW EXECUTE FUNCTION control_route_v2_gateway_pointer_cannot_delete();
 CREATE OR REPLACE FUNCTION control_node_identity_lineage_is_immutable()
 RETURNS trigger AS $$
 BEGIN

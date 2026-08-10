@@ -122,7 +122,7 @@ pub fn validate_authorized_serving_record(
 /// Sharing this release number lets the adapter reject an unstamped or
 /// incompatible authority shape without importing the product store or
 /// duplicating its schema.
-pub const AUTHORITY_RELEASE_SCHEMA_VERSION: i64 = 12;
+pub const AUTHORITY_RELEASE_SCHEMA_VERSION: i64 = 13;
 
 /// Maximum number of currently-owned Volume authority rows one Node snapshot
 /// may return. Runtime Reconciliation admits at most 1,024 Cats with at most

@@ -122,8 +122,8 @@ The same central provisioner must put the reviewed private-DNS Node listener int
 not from worker registration, observation, IMDS, the listener source address, or legacy `nodes.agent_url`.
 Changing it uses an A23 policy revision while the Node is cordoned and has no assigned Desired runtimes; credential
 rotation preserves it, and retirement makes it unavailable to the Route Grant v2 signer.
-This contract moves the exact clean-slate Control Store schema to version 12. An existing version-11 schema is not
-altered in place and refuses startup; provision or recreate an empty version-12 schema before starting any new
+This contract moves the exact clean-slate Control Store schema to version 13. An existing version-12 schema is not
+altered in place and refuses startup; provision or recreate an empty version-13 schema before starting any new
 Control replica, with no mixed-version rolling window.
 
 Every Host-side worker mutation runs under the single

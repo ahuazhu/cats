@@ -7,6 +7,11 @@
 pub(crate) mod cat_create_service;
 #[allow(
     dead_code,
+    reason = "the Gateway authority is consumed by the Route v2 machine listener composition"
+)]
+pub(crate) mod gateway_identity;
+#[allow(
+    dead_code,
     reason = "A21 production resolver is composed when the F2d Cat-create route is switched"
 )]
 pub(crate) mod image_manifest_resolver;
@@ -46,6 +51,9 @@ mod product_tests;
 
 #[cfg(test)]
 mod placement_policy_tests;
+
+#[cfg(test)]
+mod gateway_identity_tests;
 
 #[cfg(test)]
 mod placement_planner_tests;

@@ -82,6 +82,9 @@ PostgreSQL是唯一运行时current authority。schema至少保存：
 - 每个SPKI digest的first-seen credential ID/revision与永久tombstone；
 - current credential projection，仅作为exact revision bytes的校验后索引，不能独立更新或成为第二authority。
 
+这些表属于exact clean-slate authority schema 13；version 12不做in-place migration或repair，任何新Control
+replica都必须在空的version-13 schema上启动，不存在mixed-version rolling window。
+
 writer取schema-scoped exclusive advisory transaction lock并锁current pointer：
 
 1. 空Store只接受revision 1、null previous和fresh `authority_id/fleet_id`；
