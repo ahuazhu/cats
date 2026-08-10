@@ -414,6 +414,12 @@ impl KernelNbdInventoryPort {
         // still fail closed: the caller must not proceed to attach a device
         // from a checkpoint no longer reachable in the current namespace.
         permit.assert_current_publication_paths(&snapshot, store)?;
+        // Publication may legitimately have crossed the caller's deadline or
+        // cancellation boundary while the immutable temp, rename and parent
+        // directory barriers completed. The durable reservation remains the
+        // recovery source, but this stale admission must never receive a
+        // success value that could authorize a second physical effect.
+        context.check_active()?;
         Ok(persisted)
     }
 }
@@ -1275,6 +1281,45 @@ mod tests {
     }
 
     #[test]
+    fn reservation_never_returns_success_after_publication_cancellation() {
+        let fixture = Fixture::new(2);
+        let port = KernelNbdInventoryPort::new(fixture.config(2));
+        let checkpoint_directory = fixture.state.join(CHECKPOINT_NAMESPACE);
+        let source = checkpoint("cat_a", "vol_a", "/dev/nbd1", '6');
+        let store = FileCheckpointStore::open(&checkpoint_directory, &source.cat_id).unwrap();
+        let predecessor = store.create(&source).unwrap();
+        let context = desired_effect_context(&fixture.state, &["cat_a"]);
+        let cancellation = context.clone();
+        store.before_publish_once(move |_| cancellation.cancel_for_test());
+
+        let error = port
+            .reserve_and_replace(&context, &store, &predecessor, |selected| {
+                let mut replacement = predecessor.checkpoint().clone();
+                let ReconcileStep::PrepareDevice {
+                    frontend: PrepareDeviceFrontend::KernelNbd { device_path, .. },
+                    ..
+                } = &mut replacement.step
+                else {
+                    panic!("fixture must be a kernel-NBD PrepareDevice checkpoint")
+                };
+                *device_path = selected;
+                Ok(replacement)
+            })
+            .unwrap_err();
+
+        assert!(error.to_string().contains("cancelled"), "{error:#}");
+        let persisted = store.load().unwrap().unwrap();
+        let ReconcileStep::PrepareDevice {
+            frontend: PrepareDeviceFrontend::KernelNbd { device_path, .. },
+            ..
+        } = &persisted.checkpoint().step
+        else {
+            panic!("durable cancellation recovery must remain PrepareDevice")
+        };
+        assert_eq!(device_path, &host("/dev/nbd0"));
+    }
+
+    #[test]
     fn reservation_rejects_allocation_lock_rename_recreate_before_publication() {
         let fixture = Fixture::new(2);
         let port = KernelNbdInventoryPort::new(fixture.config(2));
@@ -1321,6 +1366,61 @@ mod tests {
             store.load().unwrap().unwrap().checkpoint(),
             predecessor.checkpoint()
         );
+    }
+
+    #[test]
+    fn reservation_never_authorizes_attach_after_post_publish_lock_replacement() {
+        let fixture = Fixture::new(2);
+        let port = KernelNbdInventoryPort::new(fixture.config(2));
+        let checkpoint_directory = fixture.state.join(CHECKPOINT_NAMESPACE);
+        let source = checkpoint("cat_a", "vol_a", "/dev/nbd1", '6');
+        let store = FileCheckpointStore::open(&checkpoint_directory, &source.cat_id).unwrap();
+        let predecessor = store.create(&source).unwrap();
+        let context = desired_effect_context(&fixture.state, &["cat_a"]);
+        let lock_path = fixture.state.join(ALLOCATION_LOCK_BASENAME);
+        let detached_lock_path = fixture
+            .state
+            .join("kernel-nbd-allocation-post-publish.detached");
+        let hook_lock_path = lock_path.clone();
+        let hook_detached_lock_path = detached_lock_path.clone();
+        store.before_publish_once(move |_| {
+            fs::rename(&hook_lock_path, &hook_detached_lock_path).unwrap();
+            fs::write(&hook_lock_path, b"").unwrap();
+            fs::set_permissions(&hook_lock_path, fs::Permissions::from_mode(0o600)).unwrap();
+        });
+
+        let error = port
+            .reserve_and_replace(&context, &store, &predecessor, |selected| {
+                let mut replacement = predecessor.checkpoint().clone();
+                let ReconcileStep::PrepareDevice {
+                    frontend: PrepareDeviceFrontend::KernelNbd { device_path, .. },
+                    ..
+                } = &mut replacement.step
+                else {
+                    panic!("fixture must be a kernel-NBD PrepareDevice checkpoint")
+                };
+                *device_path = selected;
+                Ok(replacement)
+            })
+            .unwrap_err();
+
+        assert!(
+            error
+                .to_string()
+                .contains("allocation lock pathname changed"),
+            "{error:#}"
+        );
+        assert!(detached_lock_path.exists());
+        assert_eq!(fs::read(&lock_path).unwrap(), b"");
+        let persisted = store.load().unwrap().unwrap();
+        let ReconcileStep::PrepareDevice {
+            frontend: PrepareDeviceFrontend::KernelNbd { device_path, .. },
+            ..
+        } = &persisted.checkpoint().step
+        else {
+            panic!("detached allocation domain publication must remain PrepareDevice")
+        };
+        assert_eq!(device_path, &host("/dev/nbd0"));
     }
 
     #[test]
