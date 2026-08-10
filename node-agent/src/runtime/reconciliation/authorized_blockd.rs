@@ -334,11 +334,8 @@ pub fn authorized_blockd_command(
         queues, queue_size, ..
     } = frontend
     {
-        anyhow::ensure!(*queues > 0, "vhost-user queue count must be positive");
-        anyhow::ensure!(
-            queue_size.is_power_of_two() && *queue_size >= 2,
-            "vhost-user queue size must be a power of two of at least 2"
-        );
+        cats_blockd::frontend_contract::validate_authorized_vhost_shape(*queues, *queue_size)
+            .context("authorized-serving vhost-user shape is outside the frozen contract")?;
     }
 
     let checkpoint = prepared.checkpoint();
@@ -1374,6 +1371,53 @@ mod tests {
         assert!(command
             .get_envs()
             .any(|(name, value)| name == "CATS_CRASH_POINT" && value.is_none()));
+    }
+
+    #[test]
+    fn authorized_serving_command_rejects_every_frozen_vhost_bound_before_building_argv() {
+        let temp = tempfile::tempdir().unwrap();
+        let (desired, volume, attachment) = fixture();
+        let prepared =
+            AuthorizedBlockdStore::new(StateDirectory::unanchored(temp.path().to_path_buf()))
+                .prepare(&desired, &volume, &attachment)
+                .unwrap();
+        let control = temp.path().join("control.sock");
+        let frontend = temp.path().join("vhost.sock");
+        for (queues, queue_size) in [(0, 256), (65, 256), (1, 0), (1, 1), (1, 3), (1, 32_769)] {
+            let result = authorized_blockd_command(
+                &launch_config(),
+                &prepared,
+                &id("cats-cat-1-root.scope"),
+                &random(2),
+                &random(3),
+                &control,
+                &AuthorizedBlockFrontend::VhostUser {
+                    socket: frontend.clone(),
+                    queues,
+                    queue_size,
+                },
+            );
+            assert!(
+                result.is_err(),
+                "accepted out-of-contract vhost shape {queues}/{queue_size}"
+            );
+        }
+        for (queues, queue_size) in [(1, 2), (64, 32_768)] {
+            authorized_blockd_command(
+                &launch_config(),
+                &prepared,
+                &id("cats-cat-1-root.scope"),
+                &random(2),
+                &random(3),
+                &control,
+                &AuthorizedBlockFrontend::VhostUser {
+                    socket: frontend.clone(),
+                    queues,
+                    queue_size,
+                },
+            )
+            .unwrap();
+        }
     }
 
     #[test]

@@ -1192,6 +1192,13 @@ fn validate_process_mode(args: &Args) -> Result<()> {
         {
             bail!("authorized serving listener paths must be pairwise distinct");
         }
+        if args.listen_vhost_user.is_some() {
+            cats_blockd::frontend_contract::validate_authorized_vhost_shape(
+                args.vhost_user_queues,
+                args.vhost_user_queue_size,
+            )
+            .context("authorized-serving vhost-user shape is outside the frozen contract")?;
+        }
     } else if args.attachment_epoch.is_some() {
         bail!("--attachment-epoch is only valid with --control-only");
     } else if args.authorized_control_spec.is_some()
@@ -1879,6 +1886,61 @@ mod tests {
                 "authorized serving unexpectedly accepted {forbidden:?}"
             );
         }
+    }
+
+    #[test]
+    fn authorized_serving_vhost_bounds_fail_before_the_engine_effect() {
+        for (queues, queue_size) in [(0, 256), (65, 256), (1, 0), (1, 1), (1, 3), (1, 32_769)] {
+            let args = parse_target(&[
+                "--listen-vhost-user",
+                "/runtime/vhost.sock",
+                "--vhost-user-queues",
+                &queues.to_string(),
+                "--vhost-user-queue-size",
+                &queue_size.to_string(),
+            ]);
+            let effect_calls = std::cell::Cell::new(0_u64);
+            let result = validate_process_mode(&args).map(|()| {
+                effect_calls.set(effect_calls.get() + 1);
+            });
+            assert!(
+                result.is_err(),
+                "accepted vhost shape {queues}/{queue_size}"
+            );
+            assert_eq!(effect_calls.get(), 0);
+        }
+        for (queues, queue_size) in [(1, 2), (64, 32_768)] {
+            let args = parse_target(&[
+                "--listen-vhost-user",
+                "/runtime/vhost.sock",
+                "--vhost-user-queues",
+                &queues.to_string(),
+                "--vhost-user-queue-size",
+                &queue_size.to_string(),
+            ]);
+            assert!(validate_process_mode(&args).is_ok());
+        }
+
+        // The same queue values remain untouched in a legacy NBD-only mode.
+        let legacy = Args::try_parse_from([
+            "cats-blockd",
+            "--volume-id",
+            TARGET_VOLUME_ID,
+            "--data-dir",
+            "/runtime/root-data",
+            "--attachment-id",
+            TARGET_ATTACHMENT_ID,
+            "--object-store-adapter",
+            "file",
+            "--listen-unix",
+            "/runtime/block.sock",
+            "--vhost-user-queues",
+            "0",
+            "--vhost-user-queue-size",
+            "1",
+        ])
+        .unwrap();
+        assert!(validate_process_mode(&legacy).is_ok());
     }
 
     #[test]

@@ -23,6 +23,7 @@
 pub mod crashpoint;
 pub mod engine;
 pub mod format;
+pub mod frontend_contract;
 pub mod image;
 pub mod nbd;
 pub mod target_control;
