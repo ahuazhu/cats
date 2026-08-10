@@ -13,6 +13,7 @@
 //! revision uses the global close path. The checkpoint intentionally does not
 //! duplicate enough Desired fields to make that classification here.
 
+mod admission_cell;
 mod admission_port;
 mod authorized_blockd;
 mod checkpoint;
@@ -49,6 +50,10 @@ pub(crate) mod inventory_probe_sealed {
     pub trait Sealed {}
 }
 
+pub use admission_cell::{
+    AdmissionCell, AdmissionCellBuildError, AdmissionCellPort, AdmissionGuardCounts,
+    PlatformAdmissionError, PlatformAdmissionGuard, RouteAdmissionGuard,
+};
 pub use admission_port::{
     AdmissionGatePort, AdmissionSnapshot, GatePortError, IdleCloseResult, SnapshotError,
 };

@@ -174,8 +174,10 @@ handler在读取body、取得admission permit或访问PostgreSQL前要求该prin
 - per-replica resolve semaphore与body/deadline是资源界，不是authority。client取消不会产生durable route
   workflow；签名response丢失后普通重试重新闭合当前snapshot，不复用丢失token。
 
-当前repository尚无能满足本节的Gateway workload credential authority，故production listener不会构造
-typed principal，普通Control组合固定在pre-body/pre-PG `401`。后续Accepted authority必须至少冻结：
+当前repository尚无能满足本节的Gateway workload credential authority，也尚未把独立Route v2 signer
+secret reference组成到Control；v2绝不借legacy V1 signer/key作为fallback。因此production listener不会
+构造typed principal，普通Control组合固定在pre-body/pre-PG `401`；即使未来误注入principal但尚无独立
+v2 signer，也在body/admission/PG前返回`503`。后续Accepted authority必须至少冻结：
 
 1. 独立Gateway workload ID、不可复用credential ID、credential lineage与current/revoked状态；
 2. Control与Node各自的current allow policy，以及TLS peer proof到该精确credential的绑定；
@@ -250,6 +252,14 @@ Node 对每个内部请求按以下顺序执行：
 admission、Endpoint/Platform guards 和 cancellation handles。HTTP/WebSocket、exec/deploy/control
 都必须在该 cell 内原子检查 open 并取 guard。cell 内不执行网络、数据库、文件、VMM 或 fsync I/O，
 也不持锁跨 `.await`。
+
+当前Node core实现以同一个mutex同时承载complete `AdmissionSnapshot` compare-and-apply和已验签Grant的
+binding compare/guard increment；snapshot精确包含desired revision、spec digest、placement、runtime
+incarnation、lifecycle与全部Endpoint bindings。replacement在取得mutex前完整验证；Endpoint-scoped
+stale revision/spec/placement compare零副作用，全局compare歧义则fail closed。Endpoint close和新guard
+不能跨两个锁竞态。guard是不可clone的RAII值，
+普通返回、错误、panic和async task取消都经`Drop`归还。该core要求不可由wire构造的authenticated
+Gateway principal，但不会自行构造principal或执行proxy I/O；HTTPS transport仍受§4.2阻塞。
 
 一旦 guard increment 成功，Node 后续只能返回 `UpstreamUnavailable` 或普通 upstream response，
 不能再伪装成 pre-admission rejection。一次 Grant 只授权指定 target 上的一次 admission，不授权
@@ -344,7 +354,7 @@ Node-to-Gateway 内部结果是闭集；公开响应不得泄漏 identity：
 
 ## 9. Key ring 与 rotation
 
-Signer 每一时刻只使用一个 active private key；Node 使用有界、版本化 public-key ring。ring 更新
+Signer 每一时刻只使用一个 active private key；Node 使用最多8把key的有界、版本化 public-key ring。ring 更新
 必须完整验证后原子 swap；加载失败的 Node 不 Ready并保持 admission Closed。heartbeat/
 observation 报告AgentSession、ring version、按
 [Runtime Reconciliation v1 §16](runtime-reconciliation-v1.md)计算的`key_ring_digest`和已排序

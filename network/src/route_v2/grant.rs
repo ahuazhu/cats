@@ -31,13 +31,14 @@ impl GrantDigest {
     }
 }
 
-/// Typed positive result supplied by a future machine-authenticated Control
-/// resolve adapter.
+/// Typed positive result supplied by the future machine-authenticated Control
+/// resolve adapter after decoding the frozen v2 HTTP envelope.
 ///
-/// This is deliberately an in-process port type, not an HTTP/JSON wire. The
-/// adapter must authenticate Control before constructing it and must supply
-/// the exact bounded encoded response-body size. Endpoint and target parsing
-/// happen at that transport boundary. The Grant remains opaque bytes here.
+/// This remains the in-process port type; the strict HTTP/JSON codec lives in
+/// `cats_api::route_grant_v2`. The adapter must authenticate Control before
+/// constructing it and must supply the exact bounded encoded response-body
+/// size. Endpoint and target parsing happen at that transport boundary. The
+/// Grant remains opaque bytes here.
 #[derive(Clone)]
 pub struct AuthenticatedResolveEnvelope {
     endpoint_id: Id,

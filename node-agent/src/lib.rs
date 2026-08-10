@@ -8,6 +8,7 @@ pub mod ch;
 pub mod guest_client;
 pub(crate) mod proc;
 pub mod route_grant;
+pub mod route_grant_v2;
 pub mod runtime;
 pub mod runtime_cutover;
 pub mod runtime_spine;

@@ -1255,6 +1255,7 @@ dependencies = [
  "jsonwebtoken",
  "libc",
  "reqwest",
+ "ring",
  "rusqlite",
  "serde",
  "serde_json",

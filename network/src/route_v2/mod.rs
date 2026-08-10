@@ -3,11 +3,12 @@
 //! The bounded cache and authenticated-envelope validation boundary are usable
 //! now. Gateway never parses Grant claims or owns a public-key ring; Node is the
 //! sole Grant verifier and final admission authority. The shipped Gateway stays
-//! closed until the Gateway workload identity authority, machine-authenticated
-//! Control/Node transports, and public proxy/listener composition are frozen
-//! and implemented. The strict Control resolve frame now exists, but its
-//! handler deliberately receives no production principal. This module does
-//! not infer identity from the retired V1 paths.
+//! closed until the Gateway workload identity authority, independent v2 key
+//! distribution, machine-authenticated Control/Node transports, and public
+//! proxy/listener composition are frozen and implemented. The strict Control
+//! resolve frame now exists, but its handler deliberately receives no
+//! production principal or legacy signer. This module does not infer identity
+//! from the retired V1 paths.
 
 mod cache;
 mod grant;
@@ -27,6 +28,7 @@ pub use http_body::{
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ProductionIngressSeam {
     GatewayWorkloadIdentityAuthority,
+    RouteV2KeyDistributionComposition,
     ControlMachineTransportComposition,
     NodeV2HttpsAdmissionTransport,
     PublicProxyListenerComposition,
@@ -37,6 +39,9 @@ impl std::fmt::Display for ProductionIngressSeam {
         match self {
             Self::GatewayWorkloadIdentityAuthority => {
                 formatter.write_str("Gateway workload credential and policy authority")
+            }
+            Self::RouteV2KeyDistributionComposition => {
+                formatter.write_str("Route v2 signer and Node key-ring distribution")
             }
             Self::ControlMachineTransportComposition => {
                 formatter.write_str("Control machine-authenticated resolve transport")
@@ -60,6 +65,7 @@ pub struct ProductionIngressBlocker {
 impl ProductionIngressBlocker {
     const MISSING: &'static [ProductionIngressSeam] = &[
         ProductionIngressSeam::GatewayWorkloadIdentityAuthority,
+        ProductionIngressSeam::RouteV2KeyDistributionComposition,
         ProductionIngressSeam::ControlMachineTransportComposition,
         ProductionIngressSeam::NodeV2HttpsAdmissionTransport,
         ProductionIngressSeam::PublicProxyListenerComposition,
@@ -102,6 +108,7 @@ mod tests {
             blocker.missing(),
             &[
                 ProductionIngressSeam::GatewayWorkloadIdentityAuthority,
+                ProductionIngressSeam::RouteV2KeyDistributionComposition,
                 ProductionIngressSeam::ControlMachineTransportComposition,
                 ProductionIngressSeam::NodeV2HttpsAdmissionTransport,
                 ProductionIngressSeam::PublicProxyListenerComposition,
@@ -109,7 +116,7 @@ mod tests {
         );
         assert_eq!(
             blocker.to_string(),
-            "missing Gateway workload credential and policy authority and Control machine-authenticated resolve transport and Node machine-authenticated v2 HTTPS admission transport and public ingress proxy/listener composition"
+            "missing Gateway workload credential and policy authority and Route v2 signer and Node key-ring distribution and Control machine-authenticated resolve transport and Node machine-authenticated v2 HTTPS admission transport and public ingress proxy/listener composition"
         );
     }
 }

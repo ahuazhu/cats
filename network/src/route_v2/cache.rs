@@ -19,8 +19,9 @@ pub type ResolveFuture =
 ///
 /// A production adapter must machine-authenticate Control, bound the response,
 /// construct [`super::AuthenticatedResolveEnvelope`], and validate it into a
-/// positive [`ResolvedRoute`] before returning from this port. Its HTTP wire is
-/// intentionally not declared here.
+/// positive [`ResolvedRoute`] before returning from this port. The HTTP frame
+/// is frozen in `cats_api::route_grant_v2`; the workload credential and TLS
+/// transport composition remain intentionally absent here.
 pub type RouteResolver = Arc<dyn Fn(Hostname) -> ResolveFuture + Send + Sync + 'static>;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
