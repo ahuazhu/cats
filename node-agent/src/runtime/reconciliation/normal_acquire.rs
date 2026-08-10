@@ -87,6 +87,10 @@ pub enum NormalReleaseAttempt {
     SessionReplacementRequired,
     IdentityRepairRequired,
     AuthorityRejected(RuntimeVolumeAuthorityRejection),
+    /// Control definitively rejected this exact checkpointed cleanup. The
+    /// caller must durably bind the typed problem to the exact request and
+    /// checkpoint before allowing another full inventory scan.
+    DefiniteCleanupConflict(RuntimeVolumeTransitionPreconditionProblem),
     StopForLocalContract,
     StopForDeploymentMismatch,
     Ambiguous,
@@ -726,10 +730,15 @@ fn map_closed_release_error(
             },
         ) if cat_id == &request.cat_id
     ) {
-        // These are definite A20/A22 rejections, not response loss. Replaying
-        // the same signed release after a point read cannot make its stale
-        // cleanup evidence or authorization branch current.
-        return NormalReleaseAttempt::StopForLocalContract;
+        // These are definite A20/A22 rejections, not response loss. Preserve
+        // the exact typed problem so the effect can durably bind it to this
+        // request before admitting another full inventory scan.
+        return NormalReleaseAttempt::DefiniteCleanupConflict(match error.error.as_ref() {
+            RuntimeVolumeTransitionErrorDetail::TransitionPreconditionFailed {
+                problem, ..
+            } => *problem,
+            _ => unreachable!("the guarded shape is a transition precondition failure"),
+        });
     }
     match map_closed_error(status, error, request, volume, accepted) {
         NormalAcquireAttempt::RetryExact => NormalReleaseAttempt::RetryExact,
@@ -1815,7 +1824,7 @@ mod tests {
     }
 
     #[test]
-    fn definite_release_cleanup_conflicts_are_non_replayable_local_stops() {
+    fn definite_release_cleanup_conflicts_retain_the_typed_problem() {
         let request = request();
         let accepted = accepted_context();
         let volume = volume();
@@ -1835,7 +1844,7 @@ mod tests {
             };
             assert_eq!(
                 map_closed_release_error(409, &error, &request, &volume, &accepted),
-                NormalReleaseAttempt::StopForLocalContract
+                NormalReleaseAttempt::DefiniteCleanupConflict(problem)
             );
         }
 

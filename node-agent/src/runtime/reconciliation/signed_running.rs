@@ -8,8 +8,7 @@
 //! the checkpoint advances to `ProvisionRootImage`. No process, frontend,
 //! device, network or VMM port is reachable from this module.
 
-use std::collections::BTreeSet;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 use std::time::Instant;
 
 use anyhow::Context as _;
@@ -116,7 +115,6 @@ pub(crate) struct SignedRunningAcquireEffect {
     authority: Arc<dyn VolumeDataAuthority>,
     blob: Arc<dyn BlobStore>,
     lease_duration_ms: u64,
-    definite_release_rejections: Mutex<BTreeSet<(Id, Id, RandomId128)>>,
     #[cfg(test)]
     after_prepare: Option<AfterPrepareHook>,
 }
@@ -228,6 +226,49 @@ impl RuntimePreScanRecovery for SignedRunningPublicationRecovery {
                 context.check_active()?;
                 Ok(RuntimePreScanRecoveryOutcome::Recovered { cat_id })
             }
+            LocalPublicationRecoveryEvidence::DefiniteReleaseRejectionTarget { cat_id } => {
+                let checkpoint_directory =
+                    context.state_directory().path().join(CHECKPOINT_NAMESPACE);
+                let store = FileCheckpointStore::open(&checkpoint_directory, &cat_id)
+                    .context("open definite release rejection confirmation store")?;
+                let Some(stored) = store
+                    .load()
+                    .context("load checkpoint for definite release rejection confirmation")?
+                else {
+                    return Ok(RuntimePreScanRecoveryOutcome::NoChange);
+                };
+                if !store
+                    .confirm_durable_definite_release_rejection(&stored)
+                    .context("confirm definite release rejection durability")?
+                {
+                    return Ok(RuntimePreScanRecoveryOutcome::NoChange);
+                }
+                context.check_active()?;
+                // Directory durability changed, but the visible inventory did
+                // not. Continue into the full scan instead of creating an
+                // endless pre-scan recovery loop for this stable marker.
+                Ok(RuntimePreScanRecoveryOutcome::NoChange)
+            }
+            LocalPublicationRecoveryEvidence::DefiniteReleaseRejectionTemp { cat_id } => {
+                let checkpoint_directory =
+                    context.state_directory().path().join(CHECKPOINT_NAMESPACE);
+                let store = FileCheckpointStore::open(&checkpoint_directory, &cat_id)
+                    .context("open definite release rejection recovery store")?;
+                let Some(stored) = store
+                    .load()
+                    .context("load checkpoint for definite release rejection recovery")?
+                else {
+                    return Ok(RuntimePreScanRecoveryOutcome::NoChange);
+                };
+                if !store
+                    .recover_definite_release_rejection_publication(&stored)
+                    .context("recover definite release rejection publication")?
+                {
+                    return Ok(RuntimePreScanRecoveryOutcome::NoChange);
+                }
+                context.check_active()?;
+                Ok(RuntimePreScanRecoveryOutcome::Recovered { cat_id })
+            }
             LocalPublicationRecoveryEvidence::AuthorizedBlockd { cat_id } => {
                 self.recover_authorized_blockd(&context, &cat_id)
             }
@@ -256,7 +297,6 @@ impl SignedRunningAcquireEffect {
             authority,
             blob,
             lease_duration_ms,
-            definite_release_rejections: Mutex::new(BTreeSet::new()),
             #[cfg(test)]
             after_prepare: None,
         })
@@ -964,18 +1004,9 @@ impl SignedRunningAcquireEffect {
                 predecessor,
             );
         }
-        let rejection_key = (
-            desired.cat_id.clone(),
-            volume_id.clone(),
-            replay.release_transition_id.clone(),
-        );
-        if self
-            .definite_release_rejections
-            .lock()
-            .map_err(|_| anyhow::anyhow!("definite release rejection set is poisoned"))?
-            .contains(&rejection_key)
-        {
-            return Ok(stop_local());
+        match store.load_definite_release_rejection(predecessor) {
+            Ok(Some(_)) | Err(_) => return Ok(stop_local()),
+            Ok(None) => {}
         }
         let request = release_transition_request(desired, cleanup.clone());
         let accepted_context = NormalAcquireAcceptedContext {
@@ -1011,13 +1042,16 @@ impl SignedRunningAcquireEffect {
                     RuntimeDesiredEffectStopReason::AuthorityRejected(reason),
                 ))
             }
-            NormalReleaseAttempt::StopForLocalContract => {
-                self.definite_release_rejections
-                    .lock()
-                    .map_err(|_| anyhow::anyhow!("definite release rejection set is poisoned"))?
-                    .insert(rejection_key);
-                Ok(stop_local())
+            NormalReleaseAttempt::DefiniteCleanupConflict(problem) => {
+                if store
+                    .persist_definite_release_rejection(predecessor, &request, problem)
+                    .is_err()
+                {
+                    return Ok(stop_local());
+                }
+                Ok(RuntimeDesiredEffectOutcome::RefreshInventory)
             }
+            NormalReleaseAttempt::StopForLocalContract => Ok(stop_local()),
             NormalReleaseAttempt::StopForDeploymentMismatch => {
                 Ok(RuntimeDesiredEffectOutcome::Stop(
                     RuntimeDesiredEffectStopReason::DeploymentMismatch,
@@ -1883,6 +1917,7 @@ pub(super) fn superseded_checkpoint_has_supported_replan(
                 .iter()
                 .all(|volume| volume.local_lineages.is_empty() && volume.devices.is_empty());
             if no_local_effect
+                && observed_is_unowned(old)
                 && observed_is_current_unowned(current, intent)
                 && observed_is_unowned(current)
             {
@@ -2789,7 +2824,7 @@ fn path_matches(path: &HostPath, expected: &std::path::Path) -> bool {
 #[cfg(test)]
 mod tests {
     use std::collections::{BTreeMap, VecDeque};
-    use std::os::unix::fs::PermissionsExt as _;
+    use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
     use std::process::Command;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Mutex;
@@ -2800,8 +2835,8 @@ mod tests {
         AgentSession, AssignedKind, AssignedPlacement, DesiredReadSnapshot, Epoch,
         GuestDeviceIdentity, Ipv4Address, IsolatedIpv4Kind, LastVolumeTransition, MacAddress,
         NetworkConfig, NodeBootId, NodeObservation, NormalAcquireRequest, NormalAcquireResult,
-        Revision, RuntimeConfig, RuntimeVolumeAuthorityRejection, Sequence, VolumeAdminState,
-        VolumeRecord,
+        Revision, RuntimeConfig, RuntimeVolumeAuthorityRejection,
+        RuntimeVolumeTransitionPreconditionProblem, Sequence, VolumeAdminState, VolumeRecord,
     };
     use cats_storage::authority::{
         AttachmentLineageIdentity, RenewLeaseRequest, RenewLeaseResult, VolumeHeadCasRequest,
@@ -4052,6 +4087,55 @@ mod tests {
     }
 
     #[test]
+    fn superseded_acquire_with_nonblank_old_unowned_head_stops_conditionless() {
+        let root = tempfile::tempdir().unwrap();
+        let old = desired();
+        let mut old_checkpoint = acquire_checkpoint_from_attachment(&old, &attachment(&old));
+        let VolumeAuthorityEvidence::Unowned { head, .. } =
+            &mut old_checkpoint.volumes[0].authority
+        else {
+            unreachable!()
+        };
+        *head = RemoteHead {
+            generation: Generation::new(1).unwrap(),
+            root_hash: Some(Sha256Digest::from_bytes([4; 32])),
+            root_object_id: Some(AsciiText::new("maps/nonblank-old-head").unwrap()),
+        };
+        persist_checkpoint(root.path(), &old_checkpoint);
+
+        let mut current = old;
+        current.desired_revision = Revision::new(2).unwrap();
+        current.runtime.memory_bytes += 4096;
+        current.spec_digest = spec_digest(&current).unwrap();
+        let authority = Arc::new(FakeAuthority::new(Ok(unowned_record(&current))));
+        let scanned = scan_runtime(root.path(), &current, authority.clone(), '8', 3);
+        assert!(matches!(scanned.step, ReconcileStep::AcquireVolume { .. }));
+        assert!(scanned.conditions.is_empty());
+
+        let path = checkpoint_path(root.path(), &current.cat_id);
+        let checkpoint_before = std::fs::read(&path).unwrap();
+        let (planner, calls) = effect(
+            &current,
+            Vec::new(),
+            authority,
+            Arc::new(RecordingBlob::present(&current)),
+            path.clone(),
+        );
+        let (context, _) = context_with_session(
+            root.path(),
+            &current,
+            Some(scanned),
+            '8',
+            3,
+            1_900_000_010_000,
+        );
+        assert_eq!(planner.apply(context, &current).unwrap(), stop_local());
+        assert_eq!(std::fs::read(path).unwrap(), checkpoint_before);
+        assert!(calls.lock().unwrap().requests.is_empty());
+        assert!(calls.lock().unwrap().release_requests.is_empty());
+    }
+
+    #[test]
     fn superseded_acquire_response_loss_adopts_only_after_current_journal_and_reread() {
         let root = tempfile::tempdir().unwrap();
         let old = desired();
@@ -4384,7 +4468,9 @@ mod tests {
         let (planner, calls) = effect_with_release(
             &current,
             vec![
-                NormalReleaseAttempt::StopForLocalContract,
+                NormalReleaseAttempt::DefiniteCleanupConflict(
+                    RuntimeVolumeTransitionPreconditionProblem::CleanupEvidenceMismatch,
+                ),
                 NormalReleaseAttempt::Released(cats_api::runtime_reconciliation::ReleaseResult {
                     volume_id: current.volumes[0].volume_id.clone(),
                     transition_id: random('7'),
@@ -4411,14 +4497,351 @@ mod tests {
         );
         let cleanup_bytes = std::fs::read(&path).unwrap();
 
-        for observed_at in [1_900_000_020_000, 1_900_000_030_000] {
-            let scan = scan_runtime(root.path(), &current, authority.clone(), '8', 3);
-            let (context, _) =
-                context_with_session(root.path(), &current, Some(scan), '8', 3, observed_at);
-            assert_eq!(planner.apply(context, &current).unwrap(), stop_local());
-            assert_eq!(std::fs::read(&path).unwrap(), cleanup_bytes);
-        }
+        let scan = scan_runtime(root.path(), &current, authority.clone(), '8', 3);
+        let (context, _) =
+            context_with_session(root.path(), &current, Some(scan), '8', 3, 1_900_000_020_000);
+        assert_eq!(
+            planner.apply(context, &current).unwrap(),
+            RuntimeDesiredEffectOutcome::RefreshInventory
+        );
+        assert_eq!(std::fs::read(&path).unwrap(), cleanup_bytes);
         assert_eq!(calls.lock().unwrap().release_requests.len(), 1);
+
+        let marker = super::super::checkpoint::release_rejection_path(
+            &root.path().join(CHECKPOINT_NAMESPACE),
+            &current.cat_id,
+        );
+        assert!(marker.exists());
+        let closed = scan_runtime(root.path(), &current, authority.clone(), '8', 3);
+        assert!(closed.conditions.is_empty());
+
+        // A fresh effect instance models Agent restart: no process-memory
+        // dedup state is available, but the exact durable marker still blocks
+        // the checkpointed release.
+        let (restart, restart_calls) = effect_with_release(
+            &current,
+            vec![NormalReleaseAttempt::Released(
+                cats_api::runtime_reconciliation::ReleaseResult {
+                    volume_id: current.volumes[0].volume_id.clone(),
+                    transition_id: random('7'),
+                    released_attachment_id: current.volumes[0].attachment_id.clone(),
+                    resulting_epoch: fence(2),
+                    resulting_head: expected_provisioned_head.clone(),
+                },
+            )],
+            authority,
+            Arc::new(RecordingBlob::present_with_chunk(&current, '4')),
+            path.clone(),
+        );
+        let (restart_context, _) = context_with_session(
+            root.path(),
+            &current,
+            Some(closed),
+            '8',
+            3,
+            1_900_000_030_000,
+        );
+        assert_eq!(
+            restart.apply(restart_context, &current).unwrap(),
+            stop_local()
+        );
+        assert!(restart_calls.lock().unwrap().release_requests.is_empty());
+        assert_eq!(std::fs::read(path).unwrap(), cleanup_bytes);
+    }
+
+    #[test]
+    fn definite_cleanup_rejection_publication_windows_recover_after_restart() {
+        for window in ["target", "temp", "linked"] {
+            let root = tempfile::tempdir().unwrap();
+            let old = desired();
+            let old_attachment = attachment(&old);
+            let authority = Arc::new(FakeAuthority::new(Err(AuthorityError::BackendUnknown)));
+            let path = checkpoint_path(root.path(), &old.cat_id);
+            let (initial, _) = effect(
+                &old,
+                vec![NormalAcquireAttempt::Granted(Box::new(
+                    old_attachment.clone(),
+                ))],
+                authority.clone(),
+                Arc::new(RecordingBlob::present(&old)),
+                path.clone(),
+            );
+            let (initial_context, _) = context(root.path(), &old, None);
+            initial.apply(initial_context, &old).unwrap();
+            let provision = read_checkpoint(&path);
+            let ReconcileStep::ProvisionRootImage {
+                expected_provisioned_head,
+                ..
+            } = &provision.step
+            else {
+                unreachable!()
+            };
+            let mut owned = owned_record(&old, &old_attachment);
+            owned.head = expected_provisioned_head.clone();
+            authority.set(Ok(owned));
+
+            let mut current = old.clone();
+            current.desired_revision = Revision::new(2).unwrap();
+            current.runtime.boot_image_digest = Sha256Digest::from_bytes([3; 32]);
+            current.spec_digest = spec_digest(&current).unwrap();
+            let stale = scan_runtime(root.path(), &current, authority.clone(), '8', 3);
+            let (planner, calls) = effect_with_release(
+                &current,
+                vec![NormalReleaseAttempt::DefiniteCleanupConflict(
+                    RuntimeVolumeTransitionPreconditionProblem::AuthorizationBranchConflict,
+                )],
+                authority.clone(),
+                Arc::new(RecordingBlob::present_with_chunk(&current, '4')),
+                path.clone(),
+            );
+            let (stage_context, _) = context_with_session(
+                root.path(),
+                &current,
+                Some(stale),
+                '8',
+                3,
+                1_900_000_010_000,
+            );
+            assert_eq!(
+                planner.apply(stage_context, &current).unwrap(),
+                RuntimeDesiredEffectOutcome::RefreshInventory,
+                "{window}"
+            );
+            let ready = scan_runtime(root.path(), &current, authority.clone(), '8', 3);
+            let (ready_context, _) = context_with_session(
+                root.path(),
+                &current,
+                Some(ready),
+                '8',
+                3,
+                1_900_000_020_000,
+            );
+            assert_eq!(
+                planner.apply(ready_context, &current).unwrap(),
+                RuntimeDesiredEffectOutcome::RefreshInventory,
+                "{window}"
+            );
+            assert_eq!(calls.lock().unwrap().release_requests.len(), 1, "{window}");
+
+            let checkpoint_directory = root.path().join(CHECKPOINT_NAMESPACE);
+            let marker = super::super::checkpoint::release_rejection_path(
+                &checkpoint_directory,
+                &current.cat_id,
+            );
+            let temporary = super::super::checkpoint::release_rejection_temporary_path(
+                &checkpoint_directory,
+                &current.cat_id,
+            );
+            match window {
+                "target" => {}
+                "temp" => std::fs::rename(&marker, &temporary).unwrap(),
+                "linked" => std::fs::hard_link(&marker, &temporary).unwrap(),
+                _ => unreachable!(),
+            }
+
+            let recovery = SignedRunningPublicationRecovery::new(authority.clone());
+            let outcome = recovery
+                .recover_one(recovery_context(root.path(), &current))
+                .unwrap();
+            match window {
+                "target" => assert_eq!(outcome, RuntimePreScanRecoveryOutcome::NoChange),
+                "temp" | "linked" => assert!(matches!(
+                    outcome,
+                    RuntimePreScanRecoveryOutcome::Recovered { ref cat_id }
+                        if cat_id == &current.cat_id
+                )),
+                _ => unreachable!(),
+            }
+            assert!(marker.exists(), "{window}");
+            assert!(!temporary.exists(), "{window}");
+            let second_restart = SignedRunningPublicationRecovery::new(authority.clone());
+            assert_eq!(
+                second_restart
+                    .recover_one(recovery_context(root.path(), &current))
+                    .unwrap(),
+                RuntimePreScanRecoveryOutcome::NoChange,
+                "second restart did not confirm the target-only durability barrier: {window}"
+            );
+
+            let closed = scan_runtime(root.path(), &current, authority.clone(), '8', 3);
+            assert!(closed.conditions.is_empty(), "{window}");
+            let (restart, restart_calls) = effect_with_release(
+                &current,
+                vec![NormalReleaseAttempt::RetryExact],
+                authority,
+                Arc::new(RecordingBlob::present_with_chunk(&current, '4')),
+                path,
+            );
+            let (restart_context, _) = context_with_session(
+                root.path(),
+                &current,
+                Some(closed),
+                '8',
+                3,
+                1_900_000_030_000,
+            );
+            assert_eq!(
+                restart.apply(restart_context, &current).unwrap(),
+                stop_local(),
+                "{window}"
+            );
+            assert!(
+                restart_calls.lock().unwrap().release_requests.is_empty(),
+                "{window}"
+            );
+        }
+    }
+
+    #[test]
+    fn invalid_release_rejection_residue_is_preserved_and_never_recovered() {
+        for residue in [
+            "corrupt-target",
+            "noncanonical-target",
+            "oversized-target",
+            "partial-temp",
+            "foreign",
+            "checkpoint-aba",
+            "request-mismatch",
+            "exact-temp-with-checkpoint-temp",
+        ] {
+            let root = tempfile::tempdir().unwrap();
+            let desired = desired();
+            let (authority, marker, temporary) = persist_release_rejection_fixture(
+                root.path(),
+                &desired,
+                RuntimeVolumeTransitionPreconditionProblem::CleanupEvidenceMismatch,
+            );
+            match residue {
+                "corrupt-target" => std::fs::write(&marker, b"{").unwrap(),
+                "noncanonical-target" => {
+                    let mut bytes = std::fs::read(&marker).unwrap();
+                    bytes.push(b'\n');
+                    std::fs::write(&marker, bytes).unwrap();
+                }
+                "oversized-target" => std::fs::write(
+                    &marker,
+                    vec![b'x'; super::super::checkpoint::RELEASE_REJECTION_MAX_BYTES + 1],
+                )
+                .unwrap(),
+                "partial-temp" => {
+                    std::fs::write(&temporary, b"{").unwrap();
+                    std::fs::set_permissions(
+                        &temporary,
+                        <std::fs::Permissions as std::os::unix::fs::PermissionsExt>::from_mode(
+                            0o600,
+                        ),
+                    )
+                    .unwrap();
+                }
+                "foreign" => {
+                    let foreign = marker.with_file_name("cat-foreign.release-rejection.json");
+                    std::fs::rename(&marker, foreign).unwrap();
+                }
+                "checkpoint-aba" => {
+                    let directory = root.path().join(CHECKPOINT_NAMESPACE);
+                    let store = FileCheckpointStore::open(&directory, &desired.cat_id).unwrap();
+                    let stored = store.load().unwrap().unwrap();
+                    let mut replacement = stored.checkpoint().clone();
+                    replacement.updated_at_unix_ms = unix_ms(1_900_000_099_000);
+                    store.replace(&stored, &replacement).unwrap();
+                }
+                "request-mismatch" => {
+                    let mut rejection =
+                        super::super::checkpoint::decode_definite_release_rejection(
+                            &std::fs::read(&marker).unwrap(),
+                            &marker,
+                        )
+                        .unwrap();
+                    let RuntimeVolumeTransition::Release { cleanup } =
+                        &mut rejection.request.transition
+                    else {
+                        unreachable!()
+                    };
+                    cleanup
+                        .volume_release
+                        .as_mut()
+                        .unwrap()
+                        .release_transition_id = random('9');
+                    std::fs::write(&marker, serde_json::to_vec(&rejection).unwrap()).unwrap();
+                }
+                "exact-temp-with-checkpoint-temp" => {
+                    std::fs::rename(&marker, &temporary).unwrap();
+                    let checkpoint_temp = root
+                        .path()
+                        .join(CHECKPOINT_NAMESPACE)
+                        .join(format!(".cat-{}.checkpoint.tmp", desired.cat_id));
+                    std::fs::write(&checkpoint_temp, b"partial checkpoint").unwrap();
+                    std::fs::set_permissions(
+                        &checkpoint_temp,
+                        <std::fs::Permissions as std::os::unix::fs::PermissionsExt>::from_mode(
+                            0o600,
+                        ),
+                    )
+                    .unwrap();
+                }
+                _ => unreachable!(),
+            }
+            let checkpoint_directory = root.path().join(CHECKPOINT_NAMESPACE);
+            let before = directory_file_snapshot(&checkpoint_directory);
+            let recovery = SignedRunningPublicationRecovery::new(authority.clone());
+            assert_eq!(
+                recovery
+                    .recover_one(recovery_context(root.path(), &desired))
+                    .unwrap(),
+                RuntimePreScanRecoveryOutcome::NoChange,
+                "{residue}"
+            );
+            assert_eq!(
+                directory_file_snapshot(&checkpoint_directory),
+                before,
+                "{residue}"
+            );
+
+            let scanner = fresh_scanner_with_blob(
+                root.path(),
+                authority,
+                Arc::new(RecordingBlob::present(&desired)),
+            );
+            let scan = scanner.scan_complete(scan_context(&desired));
+            assert!(
+                scan.is_err() || matches!(scan, Ok(RuntimeInventoryScanOutcome::Incomplete { .. })),
+                "{residue} unexpectedly admitted a complete inventory"
+            );
+        }
+    }
+
+    #[test]
+    fn release_rejection_target_is_no_replace_with_exact_replay() {
+        let root = tempfile::tempdir().unwrap();
+        let desired = desired();
+        let (_authority, marker_path, _) = persist_release_rejection_fixture(
+            root.path(),
+            &desired,
+            RuntimeVolumeTransitionPreconditionProblem::CleanupEvidenceMismatch,
+        );
+        let before = std::fs::read(&marker_path).unwrap();
+        let marker =
+            super::super::checkpoint::decode_definite_release_rejection(&before, &marker_path)
+                .unwrap();
+        let store =
+            FileCheckpointStore::open(&root.path().join(CHECKPOINT_NAMESPACE), &desired.cat_id)
+                .unwrap();
+        let stored = store.load().unwrap().unwrap();
+        assert_eq!(
+            store
+                .persist_definite_release_rejection(&stored, &marker.request, marker.problem,)
+                .unwrap(),
+            marker
+        );
+        assert_eq!(std::fs::read(&marker_path).unwrap(), before);
+        assert!(store
+            .persist_definite_release_rejection(
+                &stored,
+                &marker.request,
+                RuntimeVolumeTransitionPreconditionProblem::AuthorizationBranchConflict,
+            )
+            .is_err());
+        assert_eq!(std::fs::read(marker_path).unwrap(), before);
     }
 
     #[test]
@@ -5288,6 +5711,73 @@ mod tests {
             panic!("expected normal acquire")
         };
         assert_eq!(*lease_duration_ms, 60_000);
+    }
+
+    fn persist_release_rejection_fixture(
+        root: &std::path::Path,
+        desired: &DesiredRuntimeSpec,
+        problem: RuntimeVolumeTransitionPreconditionProblem,
+    ) -> (Arc<FakeAuthority>, std::path::PathBuf, std::path::PathBuf) {
+        let attachment = attachment(desired);
+        let cleanup = CleanupRelease {
+            target: CleanupTarget::Volume {
+                volume_id: attachment.identity.volume_id.clone(),
+                attachment_id: attachment.identity.attachment_id.clone(),
+                attachment_epoch: attachment.identity.attachment_epoch,
+            },
+            inventory_session: SessionBinding {
+                node_id: desired.placement.node_id.clone(),
+                node_boot_id: NodeBootId::new("33333333333333333333333333333333").unwrap(),
+                agent_instance_id: random('8'),
+                agent_session_epoch: epoch(3),
+            },
+            inventory_epoch: epoch(4),
+            inventory_read_position: sequence(12),
+            desired_read_position: sequence(21),
+            volume_release: Some(VolumeReleaseReplay {
+                release_transition_id: random('7'),
+                generation: attachment.head.generation,
+                disposition: desired.volumes[0].disposition.clone(),
+            }),
+        };
+        let checkpoint = closed_checkpoint(
+            desired,
+            ReconcileStep::CleanupRelease {
+                cleanup: cleanup.clone(),
+            },
+            vec![owned_observed_volume(&desired.volumes[0], &attachment)],
+            unix_ms(1_900_000_000_000),
+        );
+        let directory = root.join(CHECKPOINT_NAMESPACE);
+        let store = FileCheckpointStore::open(&directory, &desired.cat_id).unwrap();
+        let stored = store.create(&checkpoint).unwrap();
+        let request = release_transition_request(desired, cleanup);
+        store
+            .persist_definite_release_rejection(&stored, &request, problem)
+            .unwrap();
+        drop(store);
+        (
+            Arc::new(FakeAuthority::new(Ok(owned_record(desired, &attachment)))),
+            super::super::checkpoint::release_rejection_path(&directory, &desired.cat_id),
+            super::super::checkpoint::release_rejection_temporary_path(&directory, &desired.cat_id),
+        )
+    }
+
+    fn directory_file_snapshot(directory: &std::path::Path) -> Vec<(String, Vec<u8>, u64)> {
+        let mut files = std::fs::read_dir(directory)
+            .unwrap()
+            .map(|entry| {
+                let entry = entry.unwrap();
+                let metadata = entry.metadata().unwrap();
+                (
+                    entry.file_name().into_string().unwrap(),
+                    std::fs::read(entry.path()).unwrap(),
+                    metadata.nlink(),
+                )
+            })
+            .collect::<Vec<_>>();
+        files.sort_by(|left, right| left.0.cmp(&right.0));
+        files
     }
 
     fn read_checkpoint(path: &std::path::Path) -> RuntimeCheckpoint {

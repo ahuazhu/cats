@@ -7,9 +7,13 @@ use std::path::{Path, PathBuf};
 use std::sync::{Mutex, MutexGuard};
 
 use cats_api::runtime_reconciliation::{
-    checkpoint_content_digest, decode_runtime_checkpoint, encode_runtime_checkpoint, Id,
-    RuntimeCheckpoint, Sha256Digest, RUNTIME_CHECKPOINT_MAX_WIRE_BYTES,
+    checkpoint_content_digest, decode_runtime_checkpoint, decode_runtime_volume_transition_request,
+    encode_runtime_checkpoint, encode_runtime_volume_transition_request, ContractVersion, Id,
+    ReconcileStep, RuntimeCheckpoint, RuntimeVolumeTransition,
+    RuntimeVolumeTransitionPreconditionProblem, RuntimeVolumeTransitionRequest, Sha256Digest,
+    RUNTIME_CHECKPOINT_MAX_WIRE_BYTES, RUNTIME_VOLUME_TRANSITION_REQUEST_MAX_WIRE_BYTES,
 };
+use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 use super::admission_port::AdmissionSnapshot;
@@ -37,6 +41,23 @@ impl StoredCheckpoint {
     }
 }
 
+/// Provider-private durable evidence that Control definitively rejected one
+/// exact checkpointed A22 release. It is never projected as a terminal
+/// `QuarantineReason`: frozen V1 has no persisted reason slot for that claim.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(super) struct DefiniteReleaseRejection {
+    pub(super) version: ContractVersion,
+    pub(super) http_status: u16,
+    pub(super) cat_id: Id,
+    pub(super) checkpoint_content_digest: Sha256Digest,
+    pub(super) request: RuntimeVolumeTransitionRequest,
+    pub(super) problem: RuntimeVolumeTransitionPreconditionProblem,
+}
+
+pub(super) const RELEASE_REJECTION_MAX_BYTES: usize =
+    RUNTIME_VOLUME_TRANSITION_REQUEST_MAX_WIRE_BYTES + 2_048;
+
 #[derive(Debug, Error)]
 pub enum CheckpointStoreError {
     #[error("runtime checkpoint contract rejected: {0}")]
@@ -60,6 +81,8 @@ pub enum CheckpointStoreError {
     WriterSerializationPoisoned { path: PathBuf },
     #[error("checkpoint session continuity lock is poisoned: {path}")]
     SessionContinuityPoisoned { path: PathBuf },
+    #[error("definite release rejection marker at {path} is invalid: {reason}")]
+    InvalidReleaseRejection { path: PathBuf, reason: String },
     #[cfg(test)]
     #[error("injected checkpoint publication crash")]
     InjectedCrash,
@@ -80,6 +103,10 @@ pub struct FileCheckpointStore {
     target_path: PathBuf,
     temporary_name: CString,
     temporary_path: PathBuf,
+    release_rejection_name: CString,
+    release_rejection_path: PathBuf,
+    release_rejection_temporary_name: CString,
+    release_rejection_temporary_path: PathBuf,
     cat_id: Id,
     writer_serialization: Mutex<()>,
     // Deliberately process-memory-only. Every `open` starts empty, so a disk
@@ -124,9 +151,24 @@ impl FileCheckpointStore {
             .to_owned();
         let lock_file_name = format!("cat-{}.checkpoint.lock", cat_id.as_str());
         let temporary_file_name = format!(".cat-{}.checkpoint.tmp", cat_id.as_str());
+        let release_rejection_path = release_rejection_path(directory, cat_id);
+        let release_rejection_file_name = release_rejection_path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .expect("a release rejection basename is canonical ASCII")
+            .to_owned();
+        let release_rejection_temporary_path = release_rejection_temporary_path(directory, cat_id);
+        let release_rejection_temporary_file_name = release_rejection_temporary_path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .expect("a release rejection temp basename is canonical ASCII")
+            .to_owned();
         let target_name = c_string(&target_file_name, directory)?;
         let lock_name = c_string(&lock_file_name, directory)?;
         let temporary_name = c_string(&temporary_file_name, directory)?;
+        let release_rejection_name = c_string(&release_rejection_file_name, directory)?;
+        let release_rejection_temporary_name =
+            c_string(&release_rejection_temporary_file_name, directory)?;
         let lock_path = directory.join(&lock_file_name);
         let temporary_path = directory.join(&temporary_file_name);
         let writer_lock = open_at(
@@ -172,6 +214,10 @@ impl FileCheckpointStore {
             target_path,
             temporary_name,
             temporary_path,
+            release_rejection_name,
+            release_rejection_path,
+            release_rejection_temporary_name,
+            release_rejection_temporary_path,
             cat_id: cat_id.clone(),
             writer_serialization: Mutex::new(()),
             endpoint_effect_edges: Mutex::new(Vec::new()),
@@ -370,6 +416,386 @@ impl FileCheckpointStore {
         Ok(self
             .load_target()?
             .is_some_and(|stored| stored.checkpoint == *checkpoint))
+    }
+
+    /// Load a durable definite-release rejection only when it binds the exact
+    /// current checkpoint. A partial temp publication is residue and is never
+    /// removed or adopted here.
+    pub(super) fn load_definite_release_rejection(
+        &self,
+        expected: &StoredCheckpoint,
+    ) -> Result<Option<DefiniteReleaseRejection>, CheckpointStoreError> {
+        self.verify_expected(ExpectedTarget::Exact(expected))?;
+        self.ensure_release_rejection_temporary_absent()?;
+        self.load_release_rejection_target(expected.checkpoint())
+    }
+
+    /// Rebuilds the directory durability acknowledgement for an exact visible
+    /// target. This closes the response-loss window where `linkat` became
+    /// visible but the following directory fsync acknowledgement was lost.
+    pub(super) fn confirm_durable_definite_release_rejection(
+        &self,
+        expected: &StoredCheckpoint,
+    ) -> Result<bool, CheckpointStoreError> {
+        let _writer = self.writer_serialization.lock().map_err(|_| {
+            CheckpointStoreError::WriterSerializationPoisoned {
+                path: self.release_rejection_path.clone(),
+            }
+        })?;
+        self.verify_expected(ExpectedTarget::Exact(expected))?;
+        self.ensure_release_rejection_temporary_absent()?;
+        let Some(before) = self.load_release_rejection_target(expected.checkpoint())? else {
+            return Ok(false);
+        };
+        self.directory.sync_all().map_err(|source| {
+            io_error(
+                "confirm release rejection directory durability",
+                &self.directory_path,
+                source,
+            )
+        })?;
+        self.verify_expected(ExpectedTarget::Exact(expected))?;
+        self.ensure_release_rejection_temporary_absent()?;
+        Ok(self
+            .load_release_rejection_target(expected.checkpoint())?
+            .is_some_and(|after| after == before))
+    }
+
+    /// Durably publish the exact typed 409 which makes one checkpointed A22
+    /// release non-replayable. The target is no-replace; an existing exact
+    /// marker is an idempotent replay, while any mismatch or partial publish
+    /// remains untouched and fails closed.
+    pub(super) fn persist_definite_release_rejection(
+        &self,
+        expected: &StoredCheckpoint,
+        request: &RuntimeVolumeTransitionRequest,
+        problem: RuntimeVolumeTransitionPreconditionProblem,
+    ) -> Result<DefiniteReleaseRejection, CheckpointStoreError> {
+        let _writer = self.writer_serialization.lock().map_err(|_| {
+            CheckpointStoreError::WriterSerializationPoisoned {
+                path: self.release_rejection_path.clone(),
+            }
+        })?;
+        self.verify_expected(ExpectedTarget::Exact(expected))?;
+        self.ensure_release_rejection_temporary_absent()?;
+        let marker = DefiniteReleaseRejection {
+            version: ContractVersion::V1,
+            http_status: 409,
+            cat_id: self.cat_id.clone(),
+            checkpoint_content_digest: expected.content_digest().clone(),
+            request: request.clone(),
+            problem,
+        };
+        let bytes = encode_definite_release_rejection(
+            &marker,
+            expected.checkpoint(),
+            &self.release_rejection_path,
+        )?;
+        if let Some(existing) = self.load_release_rejection_target(expected.checkpoint())? {
+            if existing == marker {
+                return Ok(existing);
+            }
+            return Err(invalid_release_rejection(
+                &self.release_rejection_path,
+                "a different durable rejection already binds this checkpoint",
+            ));
+        }
+
+        let mut temporary = open_at(
+            &self.directory,
+            &self.release_rejection_temporary_name,
+            libc::O_WRONLY
+                | libc::O_CREAT
+                | libc::O_EXCL
+                | libc::O_NOFOLLOW
+                | libc::O_CLOEXEC
+                | libc::O_NONBLOCK,
+            0o600,
+        )
+        .map_err(|source| {
+            map_open_error(
+                "create release rejection temp file",
+                &self.release_rejection_temporary_path,
+                source,
+            )
+        })?;
+        verify_regular_single_link(&temporary, &self.release_rejection_temporary_path)?;
+        temporary.write_all(&bytes).map_err(|source| {
+            io_error(
+                "write release rejection temp file",
+                &self.release_rejection_temporary_path,
+                source,
+            )
+        })?;
+        temporary.sync_all().map_err(|source| {
+            io_error(
+                "sync release rejection temp file",
+                &self.release_rejection_temporary_path,
+                source,
+            )
+        })?;
+        // Once the closed 409 has been observed, a crash must leave either a
+        // durable exact target or durable residue which blocks replay. Sync
+        // the temp directory entry before linking the no-replace target.
+        self.directory.sync_all().map_err(|source| {
+            io_error(
+                "sync release rejection temp link",
+                &self.directory_path,
+                source,
+            )
+        })?;
+        self.verify_expected(ExpectedTarget::Exact(expected))?;
+        link_at(
+            &self.directory,
+            &self.release_rejection_temporary_name,
+            &self.directory,
+            &self.release_rejection_name,
+        )
+        .map_err(|source| {
+            io_error(
+                "publish release rejection marker without replacement",
+                &self.release_rejection_path,
+                source,
+            )
+        })?;
+        // Make the target link durable before removing the temp link. A crash
+        // between these barriers leaves either the exact target or a visible
+        // partial two-link publication, never silent absence after the 409.
+        self.directory.sync_all().map_err(|source| {
+            io_error(
+                "sync release rejection target link",
+                &self.directory_path,
+                source,
+            )
+        })?;
+        unlink_at_if_exists(&self.directory, &self.release_rejection_temporary_name).map_err(
+            |source| {
+                io_error(
+                    "remove published release rejection temp link",
+                    &self.release_rejection_temporary_path,
+                    source,
+                )
+            },
+        )?;
+        self.directory.sync_all().map_err(|source| {
+            io_error(
+                "sync release rejection directory",
+                &self.directory_path,
+                source,
+            )
+        })?;
+        self.verify_expected(ExpectedTarget::Exact(expected))?;
+        let visible = self
+            .load_release_rejection_target(expected.checkpoint())?
+            .ok_or_else(|| {
+                invalid_release_rejection(
+                    &self.release_rejection_path,
+                    "durable target disappeared after publication",
+                )
+            })?;
+        if visible != marker {
+            return Err(invalid_release_rejection(
+                &self.release_rejection_path,
+                "durable target differs from the published rejection",
+            ));
+        }
+        Ok(visible)
+    }
+
+    /// Completes an interrupted durable rejection publication. Only the two
+    /// exact states produced by `persist_definite_release_rejection` are
+    /// recoverable: a single-link canonical temp with no target, or the same
+    /// canonical inode linked at both temp and target. Every other shape is
+    /// left byte-for-byte intact and rejected.
+    pub(super) fn recover_definite_release_rejection_publication(
+        &self,
+        expected: &StoredCheckpoint,
+    ) -> Result<bool, CheckpointStoreError> {
+        let _writer = self.writer_serialization.lock().map_err(|_| {
+            CheckpointStoreError::WriterSerializationPoisoned {
+                path: self.release_rejection_path.clone(),
+            }
+        })?;
+        self.verify_expected(ExpectedTarget::Exact(expected))?;
+        let temporary = match open_at(
+            &self.directory,
+            &self.release_rejection_temporary_name,
+            libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_CLOEXEC | libc::O_NONBLOCK,
+            0,
+        ) {
+            Ok(file) => file,
+            Err(source) if source.kind() == io::ErrorKind::NotFound => return Ok(false),
+            Err(source) => {
+                return Err(map_open_error(
+                    "open release rejection temp for recovery",
+                    &self.release_rejection_temporary_path,
+                    source,
+                ))
+            }
+        };
+        let (marker, temporary_identity, temporary_links) = read_definite_release_rejection_file(
+            &temporary,
+            &self.release_rejection_temporary_path,
+            expected.checkpoint(),
+            &[1, 2],
+        )?;
+
+        let target = match open_at(
+            &self.directory,
+            &self.release_rejection_name,
+            libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_CLOEXEC | libc::O_NONBLOCK,
+            0,
+        ) {
+            Ok(file) => Some(file),
+            Err(source) if source.kind() == io::ErrorKind::NotFound => None,
+            Err(source) => {
+                return Err(map_open_error(
+                    "open release rejection target for recovery",
+                    &self.release_rejection_path,
+                    source,
+                ))
+            }
+        };
+        match target {
+            None if temporary_links == 1 => {
+                link_at(
+                    &self.directory,
+                    &self.release_rejection_temporary_name,
+                    &self.directory,
+                    &self.release_rejection_name,
+                )
+                .map_err(|source| {
+                    io_error(
+                        "recover release rejection target link",
+                        &self.release_rejection_path,
+                        source,
+                    )
+                })?;
+            }
+            Some(target) if temporary_links == 2 => {
+                let (target_marker, target_identity, target_links) =
+                    read_definite_release_rejection_file(
+                        &target,
+                        &self.release_rejection_path,
+                        expected.checkpoint(),
+                        &[2],
+                    )?;
+                if target_links != 2
+                    || target_identity.device != temporary_identity.device
+                    || target_identity.inode != temporary_identity.inode
+                    || target_marker != marker
+                {
+                    return Err(invalid_release_rejection(
+                        &self.release_rejection_temporary_path,
+                        "temp and target are not the same exact publication inode",
+                    ));
+                }
+            }
+            None => {
+                return Err(invalid_release_rejection(
+                    &self.release_rejection_temporary_path,
+                    "two-link rejection temp lacks its exact target",
+                ))
+            }
+            Some(_) => {
+                return Err(invalid_release_rejection(
+                    &self.release_rejection_temporary_path,
+                    "single-link rejection temp conflicts with an existing target",
+                ))
+            }
+        }
+        self.directory.sync_all().map_err(|source| {
+            io_error(
+                "sync recovered release rejection target",
+                &self.directory_path,
+                source,
+            )
+        })?;
+        self.verify_expected(ExpectedTarget::Exact(expected))?;
+        unlink_at_if_exists(&self.directory, &self.release_rejection_temporary_name).map_err(
+            |source| {
+                io_error(
+                    "remove recovered release rejection temp",
+                    &self.release_rejection_temporary_path,
+                    source,
+                )
+            },
+        )?;
+        self.directory.sync_all().map_err(|source| {
+            io_error(
+                "sync recovered release rejection directory",
+                &self.directory_path,
+                source,
+            )
+        })?;
+        self.verify_expected(ExpectedTarget::Exact(expected))?;
+        let visible = self
+            .load_release_rejection_target(expected.checkpoint())?
+            .ok_or_else(|| {
+                invalid_release_rejection(
+                    &self.release_rejection_path,
+                    "recovered rejection target disappeared",
+                )
+            })?;
+        if visible != marker {
+            return Err(invalid_release_rejection(
+                &self.release_rejection_path,
+                "recovered rejection target changed",
+            ));
+        }
+        Ok(true)
+    }
+
+    fn ensure_release_rejection_temporary_absent(&self) -> Result<(), CheckpointStoreError> {
+        match open_at(
+            &self.directory,
+            &self.release_rejection_temporary_name,
+            libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_CLOEXEC | libc::O_NONBLOCK,
+            0,
+        ) {
+            Ok(file) => {
+                verify_regular_single_link(&file, &self.release_rejection_temporary_path)?;
+                Err(CheckpointStoreError::UnsafeEntry {
+                    path: self.release_rejection_temporary_path.clone(),
+                    reason: "partial definite release rejection publication",
+                })
+            }
+            Err(source) if source.kind() == io::ErrorKind::NotFound => Ok(()),
+            Err(source) => Err(map_open_error(
+                "inspect release rejection temp file",
+                &self.release_rejection_temporary_path,
+                source,
+            )),
+        }
+    }
+
+    fn load_release_rejection_target(
+        &self,
+        checkpoint: &RuntimeCheckpoint,
+    ) -> Result<Option<DefiniteReleaseRejection>, CheckpointStoreError> {
+        let file = match open_at(
+            &self.directory,
+            &self.release_rejection_name,
+            libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_CLOEXEC | libc::O_NONBLOCK,
+            0,
+        ) {
+            Ok(file) => file,
+            Err(source) if source.kind() == io::ErrorKind::NotFound => return Ok(None),
+            Err(source) => {
+                return Err(map_open_error(
+                    "open definite release rejection marker",
+                    &self.release_rejection_path,
+                    source,
+                ))
+            }
+        };
+        let (marker, _, _) = read_definite_release_rejection_file(
+            &file,
+            &self.release_rejection_path,
+            checkpoint,
+            &[1],
+        )?;
+        Ok(Some(marker))
     }
 
     fn persist(
@@ -630,6 +1056,158 @@ pub fn runtime_checkpoint_path(directory: &Path, cat_id: &Id) -> PathBuf {
     directory.join(format!("cat-{}.checkpoint.json", cat_id.as_str()))
 }
 
+pub(super) fn release_rejection_path(directory: &Path, cat_id: &Id) -> PathBuf {
+    directory.join(format!("cat-{}.release-rejection.json", cat_id.as_str()))
+}
+
+pub(super) fn release_rejection_temporary_path(directory: &Path, cat_id: &Id) -> PathBuf {
+    directory.join(format!(".cat-{}.release-rejection.tmp", cat_id.as_str()))
+}
+
+pub(super) fn decode_definite_release_rejection(
+    bytes: &[u8],
+    path: &Path,
+) -> Result<DefiniteReleaseRejection, CheckpointStoreError> {
+    if bytes.len() > RELEASE_REJECTION_MAX_BYTES {
+        return Err(invalid_release_rejection(
+            path,
+            "marker exceeds its byte cap",
+        ));
+    }
+    let marker: DefiniteReleaseRejection = serde_json::from_slice(bytes).map_err(|source| {
+        invalid_release_rejection(path, format!("JSON decode failed: {source}"))
+    })?;
+    let canonical = serde_json::to_vec(&marker).map_err(|source| {
+        invalid_release_rejection(path, format!("canonical JSON encode failed: {source}"))
+    })?;
+    if canonical != bytes {
+        return Err(invalid_release_rejection(
+            path,
+            "marker is not canonical JSON",
+        ));
+    }
+    Ok(marker)
+}
+
+pub(super) fn validate_definite_release_rejection(
+    marker: &DefiniteReleaseRejection,
+    checkpoint: &RuntimeCheckpoint,
+    path: &Path,
+) -> Result<(), CheckpointStoreError> {
+    let request_bytes = encode_runtime_volume_transition_request(&marker.request)?;
+    let decoded_request = decode_runtime_volume_transition_request(&request_bytes)?;
+    let ReconcileStep::CleanupRelease {
+        cleanup: checkpoint_cleanup,
+    } = &checkpoint.step
+    else {
+        return Err(invalid_release_rejection(
+            path,
+            "bound checkpoint is not CleanupRelease",
+        ));
+    };
+    let RuntimeVolumeTransition::Release {
+        cleanup: request_cleanup,
+    } = &marker.request.transition
+    else {
+        return Err(invalid_release_rejection(
+            path,
+            "bound request is not Release",
+        ));
+    };
+    let digest = checkpoint_content_digest(checkpoint)?;
+    let supported_problem = matches!(
+        &marker.problem,
+        RuntimeVolumeTransitionPreconditionProblem::CleanupEvidenceMismatch
+            | RuntimeVolumeTransitionPreconditionProblem::AuthorizationBranchConflict
+    );
+    if marker.version != ContractVersion::V1
+        || marker.http_status != 409
+        || marker.cat_id != checkpoint.cat_id
+        || marker.checkpoint_content_digest != digest
+        || decoded_request != marker.request
+        || marker.request.version != checkpoint.version
+        || marker.request.cat_id != checkpoint.cat_id
+        || marker.request.desired_revision != checkpoint.desired_revision
+        || marker.request.spec_digest != checkpoint.spec_digest
+        || marker.request.placement.node_id != checkpoint.node_id
+        || marker.request.placement.placement_epoch != checkpoint.placement_epoch
+        || marker.request.session.node_id != checkpoint.node_id
+        || request_cleanup != checkpoint_cleanup
+        || request_cleanup.inventory_session != marker.request.session
+        || !supported_problem
+    {
+        return Err(invalid_release_rejection(
+            path,
+            "marker does not bind the exact checkpointed release rejection",
+        ));
+    }
+    Ok(())
+}
+
+fn read_definite_release_rejection_file(
+    file: &File,
+    path: &Path,
+    checkpoint: &RuntimeCheckpoint,
+    allowed_link_counts: &[u64],
+) -> Result<(DefiniteReleaseRejection, FileIdentity, u64), CheckpointStoreError> {
+    let before_metadata = file
+        .metadata()
+        .map_err(|source| io_error("inspect definite release rejection marker", path, source))?;
+    let before = FileIdentity::from_metadata(&before_metadata);
+    let link_count = before_metadata.nlink();
+    if !before_metadata.file_type().is_file() || !allowed_link_counts.contains(&link_count) {
+        return Err(CheckpointStoreError::UnsafeEntry {
+            path: path.to_path_buf(),
+            reason: "release rejection is not a regular file with the expected link count",
+        });
+    }
+    let mut bytes = Vec::new();
+    let cap = u64::try_from(RELEASE_REJECTION_MAX_BYTES)
+        .expect("release rejection byte cap fits u64")
+        .saturating_add(1);
+    file.take(cap)
+        .read_to_end(&mut bytes)
+        .map_err(|source| io_error("read definite release rejection marker", path, source))?;
+    let after_metadata = file
+        .metadata()
+        .map_err(|source| io_error("reinspect definite release rejection marker", path, source))?;
+    if before != FileIdentity::from_metadata(&after_metadata)
+        || link_count != after_metadata.nlink()
+    {
+        return Err(CheckpointStoreError::ConcurrentUpdate {
+            path: path.to_path_buf(),
+        });
+    }
+    let marker = decode_definite_release_rejection(&bytes, path)?;
+    validate_definite_release_rejection(&marker, checkpoint, path)?;
+    Ok((marker, before, link_count))
+}
+
+fn encode_definite_release_rejection(
+    marker: &DefiniteReleaseRejection,
+    checkpoint: &RuntimeCheckpoint,
+    path: &Path,
+) -> Result<Vec<u8>, CheckpointStoreError> {
+    validate_definite_release_rejection(marker, checkpoint, path)?;
+    let bytes = serde_json::to_vec(marker).map_err(|source| {
+        invalid_release_rejection(path, format!("canonical JSON encode failed: {source}"))
+    })?;
+    if bytes.len() > RELEASE_REJECTION_MAX_BYTES {
+        return Err(invalid_release_rejection(
+            path,
+            "marker exceeds its byte cap",
+        ));
+    }
+    Ok(bytes)
+}
+
+fn invalid_release_rejection(path: &Path, reason: impl Into<String>) -> CheckpointStoreError {
+    CheckpointStoreError::InvalidReleaseRejection {
+        path: path.to_path_buf(),
+        reason: reason.into(),
+    }
+}
+
 #[derive(Clone, Copy)]
 enum ExpectedTarget<'a> {
     Missing,
@@ -884,6 +1462,35 @@ fn rename_at(
                 old_name.as_ptr(),
                 new_directory.as_raw_fd(),
                 new_name.as_ptr(),
+            )
+        };
+        if result == 0 {
+            return Ok(());
+        }
+        let source = io::Error::last_os_error();
+        if source.kind() != io::ErrorKind::Interrupted {
+            return Err(source);
+        }
+    }
+}
+
+fn link_at(
+    old_directory: &File,
+    old_name: &CStr,
+    new_directory: &File,
+    new_name: &CStr,
+) -> io::Result<()> {
+    loop {
+        // SAFETY: both directory descriptors and NUL-terminated names remain
+        // live for the call. `linkat` retains neither pointer and does not
+        // replace an existing destination name.
+        let result = unsafe {
+            libc::linkat(
+                old_directory.as_raw_fd(),
+                old_name.as_ptr(),
+                new_directory.as_raw_fd(),
+                new_name.as_ptr(),
+                0,
             )
         };
         if result == 0 {

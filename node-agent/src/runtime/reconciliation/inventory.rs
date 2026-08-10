@@ -85,6 +85,10 @@ pub enum DesiredCheckpointBinding {
 pub struct RuntimeCheckpointInventoryEvidence {
     pub checkpoint: RuntimeCheckpoint,
     pub binding: DesiredCheckpointBinding,
+    /// The checkpoint scanner decoded and exactly validated a durable local
+    /// marker for a closed A22 cleanup rejection. The marker itself stays a
+    /// provider-private filesystem contract and is never projected to wire.
+    pub definite_release_rejected: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -448,6 +452,9 @@ fn runtime_from_inventory(
         evidence.binding == DesiredCheckpointBinding::Superseded
             && !superseded_checkpoint_has_supported_replan(desired, &evidence.checkpoint, &volumes)
     });
+    let definite_release_rejected = checkpoint
+        .as_ref()
+        .is_some_and(|evidence| evidence.definite_release_rejected);
 
     let (step, checkpoint_evidence, runtime_incarnation, stable_state, lifecycle_admission) =
         match checkpoint {
@@ -504,6 +511,7 @@ fn runtime_from_inventory(
 
     let frozen_contract_stop = matches!(&step, ReconcileStep::Quarantined)
         || unsupported_superseded
+        || definite_release_rejected
         || (matches!(&step, ReconcileStep::CleanupRelease { .. })
             && volumes.iter().any(|volume| {
                 matches!(&volume.authority, VolumeAuthorityEvidence::Unowned { .. })

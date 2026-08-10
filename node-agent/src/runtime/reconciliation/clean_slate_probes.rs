@@ -48,6 +48,10 @@ use super::authorized_blockd::{
     IDENTITY_FILE, IDENTITY_TEMP, LAUNCH_CHECKPOINT_FILE, LAUNCH_CHECKPOINT_TEMP,
     MAX_AUTHORIZED_SERVING_BYTES, MAX_IDENTITY_BYTES, MAX_LAUNCH_CHECKPOINT_BYTES,
 };
+use super::checkpoint::{
+    decode_definite_release_rejection, validate_definite_release_rejection,
+    DefiniteReleaseRejection, RELEASE_REJECTION_MAX_BYTES,
+};
 use super::inventory::{
     AuthorityVolumeInventoryEvidence, AuthorizedBlockdInventoryEvidence, DesiredCheckpointBinding,
     RuntimeCheckpointInventoryEvidence,
@@ -66,6 +70,11 @@ const PENDING_PACK_NAMESPACE: &str = "pending-packs";
 const WARM_SNAPSHOT_NAMESPACE: &str = "warm-snapshots";
 const GUEST_MOUNT_NAMESPACE: &str = "guest-mounts";
 
+fn is_release_rejection_entry(name: &str) -> bool {
+    (name.starts_with("cat-") && name.ends_with(".release-rejection.json"))
+        || (name.starts_with(".cat-") && name.ends_with(".release-rejection.tmp"))
+}
+
 const LEGACY_LEDGER: &str = "runtime-ledger";
 const LEGACY_CATS_DIRECTORY: &str = "cats";
 const DEFAULT_LEGACY_SOCKET_ROOT: &str = "/tmp/cats-sock";
@@ -79,6 +88,8 @@ const DEFAULT_NETWORK_CLASS_ROOT: &str = "/sys/class/net";
 pub(crate) enum LocalPublicationRecoveryEvidence {
     None,
     CheckpointTemp { cat_id: Id },
+    DefiniteReleaseRejectionTarget { cat_id: Id },
+    DefiniteReleaseRejectionTemp { cat_id: Id },
     AuthorizedBlockd { cat_id: Id },
     SupersededCheckpoint { cat_id: Id },
 }
@@ -1165,7 +1176,8 @@ fn scan_runtime_checkpoints(
         ManagedDirectory::Open(directory) => directory,
     };
     let mut budget = limits.state_entries;
-    let Some(entries) = strict_directory_entries(&directory, &mut budget, context)? else {
+    let Some(entries) = strict_checkpoint_directory_entries(&directory, &mut budget, context)?
+    else {
         return Ok(InventoryAbsence::Unavailable);
     };
     if entries.is_empty() {
@@ -1193,8 +1205,33 @@ fn scan_runtime_checkpoints(
         .iter()
         .map(|desired| (format!(".cat-{}.checkpoint.tmp", desired.cat_id), desired))
         .collect::<BTreeMap<_, _>>();
+    let desired_by_release_rejection = context
+        .coordinates()
+        .desired
+        .desired_specs
+        .iter()
+        .map(|desired| {
+            (
+                format!("cat-{}.release-rejection.json", desired.cat_id),
+                desired,
+            )
+        })
+        .collect::<BTreeMap<_, _>>();
+    let desired_by_release_rejection_temp = context
+        .coordinates()
+        .desired
+        .desired_specs
+        .iter()
+        .map(|desired| {
+            (
+                format!(".cat-{}.release-rejection.tmp", desired.cat_id),
+                desired,
+            )
+        })
+        .collect::<BTreeMap<_, _>>();
 
     let mut checkpoints = BTreeMap::new();
+    let mut release_rejections = BTreeMap::<Id, (DefiniteReleaseRejection, PathBuf)>::new();
     for entry in entries {
         let Some(name) = entry.name.to_str() else {
             bail!("checkpoint namespace contains a non-UTF-8 entry")
@@ -1208,7 +1245,46 @@ fn scan_runtime_checkpoints(
             // later exact writer recovery) must settle it before a full scan.
             return Ok(InventoryAbsence::Unavailable);
         }
+        if desired_by_release_rejection_temp.contains_key(name) {
+            // A durable temp entry proves publication was interrupted after
+            // Control answered. It is intentionally preserved and blocks
+            // both observation and effect replay.
+            let _ = read_release_rejection_publication_at(&directory, &entry, root, context)?;
+            return Ok(InventoryAbsence::Unavailable);
+        }
+        if let Some(desired) = desired_by_release_rejection.get(name) {
+            if entry.metadata.st_nlink != 1 {
+                let _ = read_release_rejection_publication_at(&directory, &entry, root, context)?;
+                return Ok(InventoryAbsence::Unavailable);
+            }
+            let Some(bytes) = read_strict_regular_at(
+                &directory,
+                &entry,
+                root,
+                RELEASE_REJECTION_MAX_BYTES,
+                context,
+            )?
+            else {
+                return Ok(InventoryAbsence::Unavailable);
+            };
+            let diagnostic_path = PathBuf::from(CHECKPOINT_NAMESPACE).join(name);
+            let marker = decode_definite_release_rejection(&bytes, &diagnostic_path)?;
+            anyhow::ensure!(
+                marker.cat_id == desired.cat_id,
+                "release rejection filename and Cat identity disagree"
+            );
+            anyhow::ensure!(
+                release_rejections
+                    .insert(desired.cat_id.clone(), (marker, diagnostic_path))
+                    .is_none(),
+                "release rejection inventory duplicated one Cat"
+            );
+            continue;
+        }
         let Some(desired) = desired_by_target.get(name) else {
+            if is_release_rejection_entry(name) {
+                return Ok(InventoryAbsence::Unavailable);
+            }
             bail!("checkpoint namespace retains foreign entry {name}")
         };
         let Some(bytes) = read_strict_regular_at(
@@ -1235,11 +1311,19 @@ fn scan_runtime_checkpoints(
                     RuntimeCheckpointInventoryEvidence {
                         checkpoint,
                         binding,
+                        definite_release_rejected: false,
                     },
                 )
                 .is_none(),
             "checkpoint inventory duplicated one Cat"
         );
+    }
+    for (cat_id, (marker, path)) in release_rejections {
+        let evidence = checkpoints
+            .get_mut(&cat_id)
+            .context("definite release rejection lacks its Runtime checkpoint")?;
+        validate_definite_release_rejection(&marker, &evidence.checkpoint, &path)?;
+        evidence.definite_release_rejected = true;
     }
     if checkpoints.is_empty() {
         Ok(InventoryAbsence::Empty)
@@ -1290,7 +1374,9 @@ pub(crate) fn classify_local_publication_recovery(
         ManagedDirectory::Open(directory) => directory,
     };
     let mut budget = ProbeLimits::default().state_entries;
-    let Some(entries) = strict_directory_entries(&directory, &mut budget, &scan_context)? else {
+    let Some(entries) =
+        strict_checkpoint_directory_entries(&directory, &mut budget, &scan_context)?
+    else {
         return Ok(LocalPublicationRecoveryEvidence::None);
     };
     let desired_by_target = context
@@ -1314,8 +1400,35 @@ pub(crate) fn classify_local_publication_recovery(
         .iter()
         .map(|desired| (format!(".cat-{}.checkpoint.tmp", desired.cat_id), desired))
         .collect::<BTreeMap<_, _>>();
+    let desired_by_release_rejection = context
+        .coordinates()
+        .desired
+        .desired_specs
+        .iter()
+        .map(|desired| {
+            (
+                format!("cat-{}.release-rejection.json", desired.cat_id),
+                desired,
+            )
+        })
+        .collect::<BTreeMap<_, _>>();
+    let desired_by_release_rejection_temp = context
+        .coordinates()
+        .desired
+        .desired_specs
+        .iter()
+        .map(|desired| {
+            (
+                format!(".cat-{}.release-rejection.tmp", desired.cat_id),
+                desired,
+            )
+        })
+        .collect::<BTreeMap<_, _>>();
     let mut temps = BTreeSet::new();
     let mut checkpoints = BTreeMap::new();
+    let mut all_checkpoints = BTreeMap::new();
+    let mut release_rejections = BTreeMap::<Id, (DefiniteReleaseRejection, PathBuf)>::new();
+    let mut release_rejection_temps = BTreeMap::<Id, (DefiniteReleaseRejection, PathBuf)>::new();
     let mut superseded = BTreeSet::new();
     for entry in entries {
         let Some(name) = entry.name.to_str() else {
@@ -1330,7 +1443,48 @@ pub(crate) fn classify_local_publication_recovery(
             temps.insert(desired.cat_id.clone());
             continue;
         }
+        if let Some(desired) = desired_by_release_rejection_temp.get(name) {
+            let Some(bytes) =
+                read_release_rejection_publication_at(&directory, &entry, &root, &scan_context)?
+            else {
+                return Ok(LocalPublicationRecoveryEvidence::None);
+            };
+            let diagnostic_path = PathBuf::from(CHECKPOINT_NAMESPACE).join(name);
+            let Ok(marker) = decode_definite_release_rejection(&bytes, &diagnostic_path) else {
+                return Ok(LocalPublicationRecoveryEvidence::None);
+            };
+            if marker.cat_id != desired.cat_id
+                || release_rejection_temps
+                    .insert(desired.cat_id.clone(), (marker, diagnostic_path))
+                    .is_some()
+            {
+                return Ok(LocalPublicationRecoveryEvidence::None);
+            }
+            continue;
+        }
+        if let Some(desired) = desired_by_release_rejection.get(name) {
+            let Some(bytes) =
+                read_release_rejection_publication_at(&directory, &entry, &root, &scan_context)?
+            else {
+                return Ok(LocalPublicationRecoveryEvidence::None);
+            };
+            let diagnostic_path = PathBuf::from(CHECKPOINT_NAMESPACE).join(name);
+            let Ok(marker) = decode_definite_release_rejection(&bytes, &diagnostic_path) else {
+                return Ok(LocalPublicationRecoveryEvidence::None);
+            };
+            if marker.cat_id != desired.cat_id
+                || release_rejections
+                    .insert(desired.cat_id.clone(), (marker, diagnostic_path))
+                    .is_some()
+            {
+                return Ok(LocalPublicationRecoveryEvidence::None);
+            }
+            continue;
+        }
         let Some(desired) = desired_by_target.get(name) else {
+            if is_release_rejection_entry(name) {
+                return Ok(LocalPublicationRecoveryEvidence::None);
+            }
             bail!("checkpoint namespace retains foreign entry {name}")
         };
         let Some(bytes) = read_strict_regular_at(
@@ -1349,6 +1503,12 @@ pub(crate) fn classify_local_publication_recovery(
             checkpoint.cat_id == desired.cat_id,
             "checkpoint filename and Cat identity disagree"
         );
+        anyhow::ensure!(
+            all_checkpoints
+                .insert(desired.cat_id.clone(), checkpoint.clone())
+                .is_none(),
+            "checkpoint recovery inventory duplicated one Cat"
+        );
         if checkpoint.desired_revision != desired.desired_revision
             || checkpoint.spec_digest != desired.spec_digest
             || checkpoint.node_id != desired.placement.node_id
@@ -1363,6 +1523,45 @@ pub(crate) fn classify_local_publication_recovery(
                 .is_none(),
             "checkpoint recovery inventory duplicated one Cat"
         );
+    }
+    for (cat_id, (marker, path)) in &release_rejections {
+        let Some(checkpoint) = all_checkpoints.get(cat_id) else {
+            return Ok(LocalPublicationRecoveryEvidence::None);
+        };
+        if validate_definite_release_rejection(marker, checkpoint, path).is_err() {
+            return Ok(LocalPublicationRecoveryEvidence::None);
+        }
+    }
+    for (cat_id, (marker, path)) in &release_rejection_temps {
+        let Some(checkpoint) = all_checkpoints.get(cat_id) else {
+            return Ok(LocalPublicationRecoveryEvidence::None);
+        };
+        if validate_definite_release_rejection(marker, checkpoint, path).is_err() {
+            return Ok(LocalPublicationRecoveryEvidence::None);
+        }
+    }
+    if let Some(cat_id) = release_rejection_temps
+        .keys()
+        .find(|cat_id| !temps.contains(cat_id))
+        .cloned()
+    {
+        return Ok(LocalPublicationRecoveryEvidence::DefiniteReleaseRejectionTemp { cat_id });
+    }
+    if !release_rejection_temps.is_empty() {
+        // A same-Cat checkpoint temp makes opening its store destructive: the
+        // store owns and settles that basename. Keep both publications intact
+        // until the release-rejection shape can be recovered in isolation.
+        return Ok(LocalPublicationRecoveryEvidence::None);
+    }
+    if let Some(cat_id) = release_rejections
+        .keys()
+        .find(|cat_id| !temps.contains(cat_id))
+        .cloned()
+    {
+        return Ok(LocalPublicationRecoveryEvidence::DefiniteReleaseRejectionTarget { cat_id });
+    }
+    if !release_rejections.is_empty() {
+        return Ok(LocalPublicationRecoveryEvidence::None);
     }
     if let Some(cat_id) = superseded.into_iter().next() {
         return Ok(LocalPublicationRecoveryEvidence::SupersededCheckpoint { cat_id });
@@ -2793,6 +2992,23 @@ fn strict_directory_entries(
     budget: &mut usize,
     context: &RuntimeInventoryScanContext,
 ) -> anyhow::Result<Option<Vec<StrictDirectoryEntry>>> {
+    strict_directory_entries_with_release_links(directory, budget, context, false)
+}
+
+fn strict_checkpoint_directory_entries(
+    directory: &File,
+    budget: &mut usize,
+    context: &RuntimeInventoryScanContext,
+) -> anyhow::Result<Option<Vec<StrictDirectoryEntry>>> {
+    strict_directory_entries_with_release_links(directory, budget, context, true)
+}
+
+fn strict_directory_entries_with_release_links(
+    directory: &File,
+    budget: &mut usize,
+    context: &RuntimeInventoryScanContext,
+    allow_release_publication_links: bool,
+) -> anyhow::Result<Option<Vec<StrictDirectoryEntry>>> {
     let mut stream = match DirectoryStream::open(directory) {
         Ok(stream) => stream,
         Err(source) if unavailable_io(&source) => return Ok(None),
@@ -2824,8 +3040,11 @@ fn strict_directory_entries(
             "authorized Runtime namespace contains an unsafe entry: {:?}",
             name
         );
+        let recoverable_release_link = allow_release_publication_links
+            && metadata.st_nlink == 2
+            && name.to_str().is_some_and(is_release_rejection_entry);
         anyhow::ensure!(
-            file_type != libc::S_IFREG || metadata.st_nlink == 1,
+            file_type != libc::S_IFREG || metadata.st_nlink == 1 || recoverable_release_link,
             "authorized Runtime namespace contains a multiply-linked file: {:?}",
             name
         );
@@ -2983,6 +3202,81 @@ fn read_strict_regular_at(
         bytes.len() <= cap,
         "authorized Runtime file exceeds byte cap {cap}"
     );
+    Ok(Some(bytes))
+}
+
+/// Reads the only recoverable hard-link shapes of a definite-release temp.
+/// Unlike ordinary evidence, the temp legitimately has two links after the
+/// no-replace target link is created and before its final directory barrier.
+fn read_release_rejection_publication_at(
+    directory: &File,
+    entry: &StrictDirectoryEntry,
+    root: &File,
+    context: &RuntimeInventoryScanContext,
+) -> anyhow::Result<Option<Vec<u8>>> {
+    let root_metadata = root.metadata().context("inspect retained state root")?;
+    anyhow::ensure!(
+        entry.metadata.st_mode & libc::S_IFMT == libc::S_IFREG
+            && matches!(entry.metadata.st_nlink, 1 | 2)
+            && entry.metadata.st_uid == root_metadata.uid()
+            && entry.metadata.st_mode & 0o777 == 0o600,
+        "release rejection temp owner, mode or identity is unsafe: {:?}",
+        entry.name
+    );
+    context.check_active()?;
+    let name = CString::new(entry.name.as_bytes()).context("file name contains NUL")?;
+    // SAFETY: the retained directory descriptor and NUL-terminated name stay
+    // live for the call. O_NOFOLLOW rejects replacement by a symlink.
+    let descriptor = unsafe {
+        libc::openat(
+            directory.as_raw_fd(),
+            name.as_ptr(),
+            libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_CLOEXEC | libc::O_NONBLOCK,
+            0,
+        )
+    };
+    if descriptor < 0 {
+        let source = io::Error::last_os_error();
+        return if unavailable_io(&source) || source.kind() == io::ErrorKind::NotFound {
+            Ok(None)
+        } else if source.raw_os_error() == Some(libc::ELOOP) {
+            bail!("release rejection temp changed to a symlink")
+        } else {
+            Err(source).context("open release rejection temp")
+        };
+    }
+    // SAFETY: successful `openat` returned this newly owned descriptor.
+    let file = unsafe { File::from_raw_fd(descriptor) };
+    let before = file
+        .metadata()
+        .context("inspect release rejection temp before read")?;
+    anyhow::ensure!(
+        before.is_file()
+            && u64::try_from(entry.metadata.st_dev).ok() == Some(before.dev())
+            && before.ino() == entry.metadata.st_ino
+            && before.nlink() == u64::from(entry.metadata.st_nlink),
+        "release rejection temp identity changed before read"
+    );
+    let mut bytes = Vec::new();
+    (&file)
+        .take(u64::try_from(RELEASE_REJECTION_MAX_BYTES)?.saturating_add(1))
+        .read_to_end(&mut bytes)
+        .context("read release rejection temp")?;
+    context.check_active()?;
+    let after = file
+        .metadata()
+        .context("inspect release rejection temp after read")?;
+    if before.len() != after.len()
+        || before.modified().ok() != after.modified().ok()
+        || before.ctime() != after.ctime()
+        || before.ctime_nsec() != after.ctime_nsec()
+        || before.nlink() != after.nlink()
+    {
+        return Ok(None);
+    }
+    if bytes.len() > RELEASE_REJECTION_MAX_BYTES {
+        return Ok(None);
+    }
     Ok(Some(bytes))
 }
 
