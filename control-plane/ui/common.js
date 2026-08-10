@@ -1,11 +1,14 @@
 import { getLocale, localizedApiMessage, t } from "/ui/i18n.js";
 
 export class ApiError extends Error {
-  constructor(message, status = 0, code = "") {
+  constructor(message, status = 0, code = "", response = {}) {
     super(message);
     this.name = "ApiError";
     this.status = status;
     this.code = code;
+    this.body = response.body || "";
+    this.contentType = response.contentType || "";
+    this.contentEncoding = response.contentEncoding || "";
   }
 }
 
@@ -23,15 +26,28 @@ export async function requestWithStatus(path, options = {}) {
     throw new ApiError(t("error.network", { message: error.message }));
   }
 
-  const body = await response.text();
   const contentType = response.headers.get("content-type") || "";
+  const contentEncoding = response.headers.get("content-encoding") || "";
+  let body;
+  try {
+    body = await response.text();
+  } catch (error) {
+    throw new ApiError(t("error.network", { message: error.message }), response.status, "", {
+      contentType,
+      contentEncoding,
+    });
+  }
   let value = null;
   if (body) {
     if (contentType.includes("json")) {
       try {
         value = JSON.parse(body);
       } catch (_) {
-        throw new ApiError(t("error.invalidJson"), response.status);
+        throw new ApiError(t("error.invalidJson"), response.status, "", {
+          body,
+          contentType,
+          contentEncoding,
+        });
       }
     } else {
       value = body;
@@ -44,9 +60,13 @@ export async function requestWithStatus(path, options = {}) {
       ? value.message
       : body || t("error.http", { status: response.status });
     const message = localizedApiMessage(code, fallback);
-    throw new ApiError(message, response.status, code);
+    throw new ApiError(message, response.status, code, {
+      body,
+      contentType,
+      contentEncoding,
+    });
   }
-  return { status: response.status, value, body };
+  return { status: response.status, value, body, contentType, contentEncoding };
 }
 
 export async function request(path, options = {}) {

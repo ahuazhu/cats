@@ -1131,14 +1131,27 @@ mod tests {
     fn shipped_consoles_expose_only_v2_create_across_the_closed_authority_boundary() {
         for contract in [
             "buildCatCreateV2Request",
-            "parseCatCreateV2AcceptedResponseBody",
-            "status !== 202",
+            "sendDurableCatCreateV2",
+            "resumePendingCatCreates",
             "bootImageDigest: values.get(\"boot_image_digest\")",
             "durability: values.get(\"durability\")",
         ] {
             assert!(
                 USER_JS.contains(contract),
                 "missing v2 create contract {contract:?}"
+            );
+        }
+        for contract in [
+            "parseCatCreateV2AcceptedResponseBody",
+            "status !== 202",
+            "globalThis.localStorage",
+            "globalThis.navigator?.locks",
+            "Idempotency-Key",
+            "request_body",
+        ] {
+            assert!(
+                CAT_CREATE_V2_JS.contains(contract),
+                "missing durable v2 create contract {contract:?}"
             );
         }
         for contract in [
@@ -1165,6 +1178,11 @@ mod tests {
                     .next()
             })
             .expect("create handler is present");
+        assert!(create_handler.contains("sendPendingCatCreate("));
+        assert!(
+            USER_JS.matches("resumePendingCatCreates()").count() >= 4,
+            "pending create recovery must be wired into initialization, Workspace switching, and refresh"
+        );
         for retired_create_field in [
             "values.get(\"image\")",
             "auto_suspend: true",

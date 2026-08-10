@@ -4,6 +4,15 @@
 //! internals ever appear here.
 
 mod auth;
+#[cfg(unix)]
+mod cat_create_pending;
+#[cfg(not(unix))]
+#[path = "cat_create_pending_unsupported.rs"]
+mod cat_create_pending;
+#[cfg(all(test, unix))]
+#[path = "cat_create_pending_unsupported.rs"]
+#[allow(dead_code)] // Compile-shape oracle: production selects exactly one implementation.
+mod cat_create_pending_unsupported_compile_shape;
 mod config;
 mod credential_store;
 #[cfg(unix)]
@@ -21,10 +30,13 @@ mod shell;
 #[cfg(unix)]
 mod stable_unix_fs;
 
+use std::io::{Read as _, Write as _};
 use std::time::{Duration, Instant};
 
 use anyhow::{anyhow, bail, Context, Result};
-use cats_api::cat_create::{decode_cat_create_v2_accepted_response, CatCreateV2Request};
+use cats_api::cat_create::{
+    decode_cat_create_v2_accepted_response, CatCreateV2AcceptedResponse, CatCreateV2Request,
+};
 use clap::{Args, Parser, Subcommand};
 use serde_json::json;
 
@@ -468,8 +480,11 @@ impl Client {
         if let Some(token) = &cli.token {
             let http = reqwest::blocking::Client::builder()
                 .timeout(Duration::from_secs(120))
+                .redirect(reqwest::redirect::Policy::none())
                 .build()?;
-            let base = auth::configured_api_url(cli.api_url.as_deref())?;
+            let base = cat_create_pending::canonical_api_origin(&auth::configured_api_url(
+                cli.api_url.as_deref(),
+            )?)?;
             let selector = workspace_override(cli).unwrap_or_else(|| "default".to_string());
             let workspace_id = resolve_workspace_id(&http, &base, token, &selector)?;
             return Ok(Self {
@@ -488,8 +503,9 @@ impl Client {
         Ok(Self {
             http: reqwest::blocking::Client::builder()
                 .timeout(Duration::from_secs(120))
+                .redirect(reqwest::redirect::Policy::none())
                 .build()?,
-            base: session.api_url,
+            base: cat_create_pending::canonical_api_origin(&session.api_url)?,
             token: session.access_token,
             workspace_id: session.workspace,
         })
@@ -543,6 +559,62 @@ impl Client {
             bail!("HTTP {status}: {}", String::from_utf8_lossy(&body));
         }
         Ok((status, body))
+    }
+
+    fn send_cat_create(
+        &self,
+        pending: &cat_create_pending::PreparedCatCreate,
+    ) -> Result<CatCreateHttpResponse> {
+        const MAX_RESPONSE_BYTES: usize = 64 * 1024;
+
+        pending.assert_current()?;
+        anyhow::ensure!(
+            pending.origin() == self.base,
+            "pending Cat-create request is bound to a different API origin"
+        );
+        let exact_url = format!("{}{}", pending.origin(), pending.target());
+        let response = self
+            .http
+            .post(&exact_url)
+            .bearer_auth(&self.token)
+            .header(reqwest::header::ACCEPT, "application/json")
+            .header(reqwest::header::CONTENT_TYPE, pending.content_type())
+            .header("Idempotency-Key", pending.idempotency_key())
+            .body(pending.body()?)
+            .send()
+            .context("control plane unreachable")?;
+        anyhow::ensure!(
+            response.url().as_str() == exact_url,
+            "Cat-create request did not remain on its exact canonical URL"
+        );
+        let status = response.status();
+        let content_types = response
+            .headers()
+            .get_all(reqwest::header::CONTENT_TYPE)
+            .iter()
+            .map(|value| value.as_bytes().to_vec())
+            .collect();
+        let content_encodings = response
+            .headers()
+            .get_all(reqwest::header::CONTENT_ENCODING)
+            .iter()
+            .map(|value| value.as_bytes().to_vec())
+            .collect();
+        let mut body = Vec::new();
+        response
+            .take(MAX_RESPONSE_BYTES.saturating_add(1) as u64)
+            .read_to_end(&mut body)
+            .context("read control-plane response")?;
+        anyhow::ensure!(
+            body.len() <= MAX_RESPONSE_BYTES,
+            "Cat-create response exceeds its closed byte limit"
+        );
+        Ok(CatCreateHttpResponse {
+            status,
+            content_types,
+            content_encodings,
+            body,
+        })
     }
 
     fn get(&self, path: &str) -> Result<serde_json::Value> {
@@ -868,7 +940,6 @@ pub fn run(cli: Cli) -> Result<()> {
         bail!("{surface} {RUNTIME_CUTOVER_UNSUPPORTED}");
     }
     let client = Client::new(&cli)?;
-    let idem = uuid_like();
 
     let mutate = |resp: serde_json::Value| -> Result<()> {
         let parsed: CatOperationResponse = serde_json::from_value(resp.clone())
@@ -947,28 +1018,66 @@ pub fn run(cli: Cli) -> Result<()> {
                 durability,
             )
             .context("invalid Cat-create request")?;
-            let (status, response) = client.send_with_status_raw(
-                client
-                    .http
-                    .post(client.url("/cats"))
-                    .header("Idempotency-Key", &idem)
-                    .json(&body),
+            let request_body = serde_json::to_vec(&body)?;
+            let pending = cat_create_pending::PreparedCatCreate::prepare(
+                &client.base,
+                &client.workspace_id,
+                &request_body,
+            )
+            .context(
+                "could not durably prepare Cat-create recovery state; no HTTP request was sent",
             )?;
-            anyhow::ensure!(
-                status == reqwest::StatusCode::ACCEPTED,
-                "unexpected Cat-create status {status}; expected 202 Accepted"
-            );
-            let accepted = decode_cat_create_v2_accepted_response(&response)
-                .context("malformed Cat-create accepted response")?;
-            if cli.json {
-                println!("{}", serde_json::to_string_pretty(&accepted)?);
-            } else {
-                println!(
-                    "Cat {} accepted (operation {})",
-                    accepted.cat_id, accepted.operation_id
-                );
+            let response = client.send_cat_create(&pending).with_context(|| {
+                format!(
+                    "Cat-create response is ambiguous; the exact path, body, and Idempotency-Key remain pending at {}",
+                    pending.pending_path().display()
+                )
+            })?;
+            match classify_cat_create_response(&response) {
+                CatCreateResponseClassification::Accepted(accepted) => {
+                    // Report the durable identity before acknowledging local
+                    // state. A crash before this output leaves the exact
+                    // request replayable; a crash after it can only repeat the
+                    // same accepted identity.
+                    if cli.json {
+                        println!("{}", serde_json::to_string_pretty(&accepted)?);
+                    } else {
+                        println!(
+                            "Cat {} accepted (operation {})",
+                            accepted.cat_id, accepted.operation_id
+                        );
+                    }
+                    std::io::stdout()
+                        .flush()
+                        .context("flush accepted Cat/Operation identity before cleanup")?;
+                    pending.clear().context(
+                        "Cat-create was accepted and reported, but its pending recovery state could not be durably cleared",
+                    )?;
+                    Ok(())
+                }
+                CatCreateResponseClassification::NameConflict => {
+                    pending.clear().context(
+                        "Cat name conflict is terminal, but its pending recovery state could not be durably cleared",
+                    )?;
+                    bail!("cat name already exists (AlreadyExists)")
+                }
+                CatCreateResponseClassification::Nonterminal => {
+                    let detail =
+                        serde_json::from_slice::<cats_api::error::ErrorBody>(&response.body)
+                            .map(|error| format!("{} ({:?})", error.message, error.code))
+                            .unwrap_or_else(|_| {
+                                format!(
+                                    "HTTP {}: {}",
+                                    response.status,
+                                    String::from_utf8_lossy(&response.body)
+                                )
+                            });
+                    bail!(
+                        "Cat-create response was not an exact terminal result ({detail}); replay the same command to reuse the pending Idempotency-Key at {}",
+                        pending.pending_path().display()
+                    )
+                }
             }
-            Ok(())
         }
         Command::Ls => {
             let v = client.get("/cats")?;
@@ -1610,14 +1719,42 @@ fn unix_now() -> i64 {
         .as_secs() as i64
 }
 
-/// Random idempotency key without pulling a uuid dependency.
-fn uuid_like() -> String {
-    use std::time::{SystemTime, UNIX_EPOCH};
-    let nanos = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap()
-        .as_nanos();
-    format!("cli-{nanos}-{}", std::process::id())
+const CAT_CREATE_NAME_CONFLICT_BODY: &[u8] =
+    br#"{"code":"already_exists","message":"cat name already exists"}"#;
+
+struct CatCreateHttpResponse {
+    status: reqwest::StatusCode,
+    content_types: Vec<Vec<u8>>,
+    content_encodings: Vec<Vec<u8>>,
+    body: Vec<u8>,
+}
+
+enum CatCreateResponseClassification {
+    Accepted(CatCreateV2AcceptedResponse),
+    NameConflict,
+    Nonterminal,
+}
+
+fn classify_cat_create_response(
+    response: &CatCreateHttpResponse,
+) -> CatCreateResponseClassification {
+    let exact_json_identity = response.content_types.as_slice() == [b"application/json"]
+        && response.content_encodings.is_empty();
+    if !exact_json_identity {
+        return CatCreateResponseClassification::Nonterminal;
+    }
+    if response.status == reqwest::StatusCode::ACCEPTED {
+        if let Ok(accepted) = decode_cat_create_v2_accepted_response(&response.body) {
+            if serde_json::to_vec(&accepted).ok().as_deref() == Some(response.body.as_slice()) {
+                return CatCreateResponseClassification::Accepted(accepted);
+            }
+        }
+    } else if response.status == reqwest::StatusCode::CONFLICT
+        && response.body == CAT_CREATE_NAME_CONFLICT_BODY
+    {
+        return CatCreateResponseClassification::NameConflict;
+    }
+    CatCreateResponseClassification::Nonterminal
 }
 
 #[cfg(test)]
@@ -1963,11 +2100,26 @@ mod tests {
         )
     }
 
+    fn request_header(headers: &str, expected_name: &str) -> String {
+        headers
+            .lines()
+            .find_map(|line| {
+                let (name, value) = line.split_once(':')?;
+                name.eq_ignore_ascii_case(expected_name)
+                    .then(|| value.trim().to_owned())
+            })
+            .unwrap_or_else(|| panic!("missing request header {expected_name}"))
+    }
+
+    #[cfg(unix)]
     #[test]
     fn create_sends_one_exact_v2_request_and_accepts_only_the_flat_202() {
         use clap::Parser;
         use std::io::Write;
 
+        let state_directory = tempfile::tempdir().unwrap();
+        let state_root = state_directory.path().canonicalize().unwrap().join("state");
+        let _state_guard = cat_create_pending::TestStateRootGuard::set(state_root.clone());
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let address = listener.local_addr().unwrap();
         let server = std::thread::spawn(move || {
@@ -2026,6 +2178,253 @@ mod tests {
             body,
             br#"{"name":"app","boot_image_digest":"sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef","vcpus":3,"memory_bytes":2147483648,"root_size_bytes":4294967296,"durability":"relaxed"}"#
         );
+        assert!(std::fs::read_dir(state_root).unwrap().all(|entry| {
+            !entry
+                .unwrap()
+                .file_name()
+                .to_string_lossy()
+                .ends_with(".pending.json")
+        }));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn cat_create_restart_process_helper() {
+        use clap::Parser as _;
+
+        let Some(mode) = std::env::var_os("CATS_TEST_CAT_CREATE_HELPER_MODE") else {
+            return;
+        };
+        let base = std::env::var("CATS_TEST_CAT_CREATE_HELPER_BASE").unwrap();
+        let cli = Cli::parse_from([
+            "cats",
+            "--api-url",
+            &base,
+            "--token",
+            "test-token",
+            "--workspace",
+            "ws_01",
+            "create",
+            "app",
+            "--boot-image-digest",
+            TEST_BOOT_IMAGE,
+            "--cpus",
+            "3",
+            "--memory",
+            "2GiB",
+            "--root-size",
+            "4GiB",
+            "--durability",
+            "relaxed",
+        ]);
+        match mode.to_string_lossy().as_ref() {
+            "lost" => {
+                let error = run(cli).expect_err("the committed response is deliberately dropped");
+                assert!(error.to_string().contains("ambiguous"), "{error:#}");
+            }
+            "replay" => run(cli).unwrap(),
+            unexpected => panic!("unexpected helper mode {unexpected}"),
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn committed_response_loss_process_restart_replays_one_cat_and_operation_exactly() {
+        use std::collections::{HashMap, HashSet};
+        use std::io::Write as _;
+        use std::process::Command as ProcessCommand;
+
+        let state_directory = tempfile::tempdir().unwrap();
+        let state_root = state_directory.path().canonicalize().unwrap().join("state");
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        let server_state_root = state_root.clone();
+        let server = std::thread::spawn(move || {
+            let mut requests = Vec::new();
+            let mut cats = HashSet::new();
+            let mut operations = HashMap::new();
+            for attempt in 0..2 {
+                let (mut stream, _) = listener.accept().unwrap();
+                let (headers, body) = read_request(&mut stream);
+                assert!(std::fs::read_dir(&server_state_root).unwrap().any(|entry| {
+                    entry
+                        .unwrap()
+                        .file_name()
+                        .to_string_lossy()
+                        .ends_with(".pending.json")
+                }));
+                let first_line = headers.lines().next().unwrap().to_owned();
+                let key = request_header(&headers, "Idempotency-Key");
+                requests.push((first_line, body.clone(), key.clone()));
+                let response = operations.entry(key).or_insert_with(|| {
+                    cats.insert("cat_01".to_owned());
+                    br#"{"cat_id":"cat_01","operation_id":"op_01"}"#.to_vec()
+                });
+                if attempt == 0 {
+                    // The server-side Cat/Operation commit above is complete;
+                    // close before any status line to model an ambiguous
+                    // post-commit transport loss.
+                    drop(stream);
+                    continue;
+                }
+                write!(
+                    stream,
+                    "HTTP/1.1 202 Accepted\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                    response.len()
+                )
+                .unwrap();
+                stream.write_all(response).unwrap();
+                stream.flush().unwrap();
+            }
+            (requests, cats.len(), operations.len())
+        });
+
+        let helper = "tests::cat_create_restart_process_helper";
+        let executable = std::env::current_exe().unwrap();
+        let invoke = |mode: &str| {
+            ProcessCommand::new(&executable)
+                .args(["--exact", helper, "--nocapture"])
+                .env("CATS_TEST_CAT_CREATE_HELPER_MODE", mode)
+                .env("CATS_TEST_CAT_CREATE_HELPER_BASE", &base)
+                .env("CATS_TEST_CAT_CREATE_STATE_ROOT", &state_root)
+                .output()
+                .unwrap()
+        };
+        let lost = invoke("lost");
+        assert!(
+            lost.status.success(),
+            "lost-response helper failed:\nstdout={}\nstderr={}",
+            String::from_utf8_lossy(&lost.stdout),
+            String::from_utf8_lossy(&lost.stderr)
+        );
+        let replay = invoke("replay");
+        assert!(
+            replay.status.success(),
+            "replay helper failed:\nstdout={}\nstderr={}",
+            String::from_utf8_lossy(&replay.stdout),
+            String::from_utf8_lossy(&replay.stderr)
+        );
+        assert!(String::from_utf8_lossy(&replay.stdout)
+            .contains("Cat cat_01 accepted (operation op_01)"));
+
+        let (requests, cat_count, operation_count) = server.join().unwrap();
+        assert_eq!(cat_count, 1);
+        assert_eq!(operation_count, 1);
+        assert_eq!(requests.len(), 2);
+        assert_eq!(requests[0], requests[1]);
+        assert_eq!(requests[0].0, "POST /v1/workspaces/ws_01/cats HTTP/1.1");
+        assert_eq!(
+            requests[0].1,
+            br#"{"name":"app","boot_image_digest":"sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef","vcpus":3,"memory_bytes":2147483648,"root_size_bytes":4294967296,"durability":"relaxed"}"#
+        );
+        assert!(requests[0].2.starts_with("cli-"));
+        assert!(std::fs::read_dir(&state_root).unwrap().all(|entry| {
+            !entry
+                .unwrap()
+                .file_name()
+                .to_string_lossy()
+                .ends_with(".pending.json")
+        }));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn exact_name_conflict_is_terminal_and_durably_clears_pending_state() {
+        use clap::Parser as _;
+        use std::io::Write as _;
+
+        let state_directory = tempfile::tempdir().unwrap();
+        let state_root = state_directory.path().canonicalize().unwrap().join("state");
+        let _state_guard = cat_create_pending::TestStateRootGuard::set(state_root.clone());
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let _request = read_request(&mut stream);
+            write!(
+                stream,
+                "HTTP/1.1 409 Conflict\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                CAT_CREATE_NAME_CONFLICT_BODY.len()
+            )
+            .unwrap();
+            stream.write_all(CAT_CREATE_NAME_CONFLICT_BODY).unwrap();
+            stream.flush().unwrap();
+        });
+        let cli = Cli::parse_from([
+            "cats",
+            "--api-url",
+            &base,
+            "--token",
+            "test-token",
+            "--workspace",
+            "ws_01",
+            "create",
+            "app",
+            "--boot-image-digest",
+            TEST_BOOT_IMAGE,
+        ]);
+        let error = run(cli).unwrap_err().to_string();
+        assert!(error.contains("cat name already exists"));
+        server.join().unwrap();
+        assert!(std::fs::read_dir(state_root).unwrap().all(|entry| {
+            !entry
+                .unwrap()
+                .file_name()
+                .to_string_lossy()
+                .ends_with(".pending.json")
+        }));
+    }
+
+    #[test]
+    fn cat_create_response_classification_is_exact_and_closed() {
+        let response = |status, body: &[u8]| CatCreateHttpResponse {
+            status,
+            content_types: vec![b"application/json".to_vec()],
+            content_encodings: Vec::new(),
+            body: body.to_vec(),
+        };
+        assert!(matches!(
+            classify_cat_create_response(&response(
+                reqwest::StatusCode::ACCEPTED,
+                br#"{"cat_id":"cat_01","operation_id":"op_01"}"#,
+            )),
+            CatCreateResponseClassification::Accepted(_)
+        ));
+        assert!(matches!(
+            classify_cat_create_response(&response(
+                reqwest::StatusCode::CONFLICT,
+                CAT_CREATE_NAME_CONFLICT_BODY,
+            )),
+            CatCreateResponseClassification::NameConflict
+        ));
+        for closed in [
+            response(
+                reqwest::StatusCode::OK,
+                br#"{"cat_id":"cat_01","operation_id":"op_01"}"#,
+            ),
+            response(
+                reqwest::StatusCode::ACCEPTED,
+                br#"{ "cat_id":"cat_01","operation_id":"op_01"}"#,
+            ),
+            response(
+                reqwest::StatusCode::SERVICE_UNAVAILABLE,
+                br#"{"code":"unavailable","message":"retry"}"#,
+            ),
+        ] {
+            assert!(matches!(
+                classify_cat_create_response(&closed),
+                CatCreateResponseClassification::Nonterminal
+            ));
+        }
+        let mut compressed = response(
+            reqwest::StatusCode::ACCEPTED,
+            br#"{"cat_id":"cat_01","operation_id":"op_01"}"#,
+        );
+        compressed.content_encodings.push(b"gzip".to_vec());
+        assert!(matches!(
+            classify_cat_create_response(&compressed),
+            CatCreateResponseClassification::Nonterminal
+        ));
     }
 
     #[test]

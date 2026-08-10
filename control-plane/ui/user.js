@@ -18,7 +18,9 @@ import { getLocale, initI18n, localizedApiMessage, onLocaleChange, t } from "/ui
 import {
   assertRuntimeCutoverClientRequestSupported,
   buildCatCreateV2Request,
-  parseCatCreateV2AcceptedResponseBody,
+  catCreateV2Path,
+  listPendingCatCreateV2,
+  sendDurableCatCreateV2,
 } from "/ui/cat-create-v2.mjs";
 
 initI18n();
@@ -121,6 +123,7 @@ async function switchWorkspace(workspaceId, { updateUrl = true } = {}) {
     if (workspace) window.history.pushState(null, "", workspaceUrl(workspace));
   }
   await loadAll({ quiet: true });
+  await resumePendingCatCreates();
 }
 
 async function authenticatedRequestWithStatus(path, options = {}) {
@@ -154,6 +157,38 @@ async function authenticatedRequest(path, options = {}) {
 
 function idempotencyHeaders() {
   return { "Idempotency-Key": globalThis.crypto?.randomUUID?.() || `${Date.now()}-${Math.random()}` };
+}
+
+async function sendPendingCatCreate(path, requestBody, onAccepted) {
+  return sendDurableCatCreateV2({
+    workspaceId: state.activeWorkspaceId,
+    path,
+    requestBody,
+    send: authenticatedRequestWithStatus,
+    onAccepted,
+  });
+}
+
+async function resumePendingCatCreates() {
+  if (!state.activeWorkspaceId) return;
+  let pending;
+  try {
+    pending = listPendingCatCreateV2({ workspaceId: state.activeWorkspaceId });
+  } catch (error) {
+    toast(t("common.error"), error.message, "error");
+    return;
+  }
+  for (const request of pending) {
+    try {
+      await sendPendingCatCreate(request.path, request.requestBody, (accepted) => {
+        toast(t("user.operation.accepted"), `${accepted.cat_id} · ${accepted.operation_id}`);
+      });
+    } catch (error) {
+      // Ambiguous and non-terminal outcomes intentionally retain the exact
+      // browser-persistent request for the next reload or explicit refresh.
+      toast(t("common.error"), error.message, "error");
+    }
+  }
 }
 
 function showApp() {
@@ -950,7 +985,7 @@ document.querySelector("#logout-button").addEventListener("click", () => {
   window.location.assign("/auth/logout?site=user");
 });
 document.querySelector("#refresh-button").addEventListener("click", () => {
-  const requests = [loadAll()];
+  const requests = [loadAll(), resumePendingCatCreates()];
   if (state.activeView === "billing") requests.push(loadBilling());
   Promise.all(requests).catch(() => {});
 });
@@ -1001,16 +1036,11 @@ document.querySelector("#create-cat-form").addEventListener("submit", async (eve
       rootGib: values.get("root_gib"),
       durability: values.get("durability"),
     });
-    const { status, body: responseBody } = await authenticatedRequestWithStatus(workspacePath("/cats"), {
-      method: "POST",
-      headers: idempotencyHeaders(),
-      body: JSON.stringify(body),
+    await sendPendingCatCreate(catCreateV2Path(state.activeWorkspaceId), JSON.stringify(body), (accepted) => {
+      toast(t("user.operation.accepted"), `${accepted.cat_id} · ${accepted.operation_id}`);
+      createCatDialog.close();
+      form.reset();
     });
-    if (status !== 202) throw new Error(`Cat create returned HTTP ${status}; expected 202`);
-    const accepted = parseCatCreateV2AcceptedResponseBody(responseBody);
-    toast(t("user.operation.accepted"), `${accepted.cat_id} · ${accepted.operation_id}`);
-    createCatDialog.close();
-    form.reset();
   } catch (caught) {
     error.textContent = caught.message;
   } finally {
@@ -1141,6 +1171,7 @@ async function initializeAuth() {
         }
         showApp();
         await loadAll({ quiet: true });
+        await resumePendingCatCreates();
         if (topupStatus) {
           switchView("billing");
           await loadBilling({ quiet: true }).catch(() => {});

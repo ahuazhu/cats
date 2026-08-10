@@ -1,0 +1,86 @@
+//! Non-Unix compile boundary for durable Cat-create recovery.
+//!
+//! The shipped implementation requires descriptor-relative `openat`, nofollow,
+//! durable directory barriers, and a process-wide file lock. Fail before any
+//! mutation rather than silently weakening that recovery contract.
+
+use std::path::PathBuf;
+
+use anyhow::{bail, Result};
+
+pub(crate) enum PreparedCatCreate {}
+
+impl PreparedCatCreate {
+    pub(crate) fn prepare(_origin: &str, _workspace_id: &str, _body: &[u8]) -> Result<Self> {
+        bail!(
+            "durable Cat-create recovery is unavailable on this platform; no HTTP request was sent"
+        )
+    }
+
+    pub(crate) fn origin(&self) -> &str {
+        match *self {}
+    }
+
+    pub(crate) fn target(&self) -> &str {
+        match *self {}
+    }
+
+    pub(crate) fn content_type(&self) -> &str {
+        match *self {}
+    }
+
+    pub(crate) fn idempotency_key(&self) -> &str {
+        match *self {}
+    }
+
+    pub(crate) fn body(&self) -> Result<Vec<u8>> {
+        match *self {}
+    }
+
+    pub(crate) fn assert_current(&self) -> Result<()> {
+        match *self {}
+    }
+
+    pub(crate) fn pending_path(&self) -> PathBuf {
+        match *self {}
+    }
+
+    pub(crate) fn clear(&self) -> Result<()> {
+        match *self {}
+    }
+}
+
+pub(crate) fn canonical_api_origin(value: &str) -> Result<String> {
+    let parsed = reqwest::Url::parse(value).map_err(anyhow::Error::from)?;
+    let has_userinfo = value.split_once("://").is_some_and(|(_, remainder)| {
+        let authority_end = remainder.find(['/', '?', '#']).unwrap_or(remainder.len());
+        remainder[..authority_end].contains('@')
+    });
+    anyhow::ensure!(
+        value.trim() == value
+            && matches!(parsed.scheme(), "http" | "https")
+            && parsed.has_host()
+            && !has_userinfo
+            && parsed.username().is_empty()
+            && parsed.password().is_none()
+            && parsed.path() == "/"
+            && parsed.query().is_none()
+            && parsed.fragment().is_none(),
+        "Cats API URL must be one exact HTTP(S) origin without path, query, credentials, or fragment"
+    );
+    Ok(parsed.origin().ascii_serialization())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn unsupported_platform_fails_before_request_materialization() {
+        let error = PreparedCatCreate::prepare("https://cats.run", "ws_01", b"{}")
+            .err()
+            .unwrap()
+            .to_string();
+        assert!(error.contains("no HTTP request was sent"));
+    }
+}
