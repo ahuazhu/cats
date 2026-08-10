@@ -90,6 +90,12 @@ struct Args {
     #[arg(long, value_name = "RANDOM_ID_128")]
     process_identity_token: Option<String>,
 
+    /// Fresh Guest-device token already fsynced by Runtime. Authorized serving
+    /// requires this even for kernel NBD; vhost-user binds the owned listener
+    /// atomically with process startup.
+    #[arg(long, value_name = "RANDOM_ID_128")]
+    device_ownership_token: Option<String>,
+
     /// Exact grant epoch to adopt in `--control-only` mode.
     #[arg(long, requires = "control_only")]
     attachment_epoch: Option<i64>,
@@ -910,6 +916,7 @@ const PROVISION_CONTROL_IO_TIMEOUT: Duration = Duration::from_secs(2);
 struct RuntimeProcessIdentity {
     scope_id: Id,
     process_identity_token: RandomId128,
+    device_ownership_token: Option<RandomId128>,
     control_only: bool,
 }
 
@@ -922,6 +929,7 @@ fn runtime_status_json(
         status.size_bytes = Some(engine.size());
         status.scope_id = Some(identity.scope_id.clone());
         status.process_identity_token = Some(identity.process_identity_token.clone());
+        status.device_ownership_token = identity.device_ownership_token.clone();
         status.control_only = Some(identity.control_only);
     }
     serde_json::to_string(&status)
@@ -1195,25 +1203,46 @@ fn validate_process_mode(args: &Args) -> Result<()> {
 
 fn runtime_process_identity(args: &Args) -> Result<Option<RuntimeProcessIdentity>> {
     let target_mode = args.control_only || args.authorized_serving_spec.is_some();
-    match (
-        target_mode,
-        args.runtime_scope_id.as_deref(),
-        args.process_identity_token.as_deref(),
-    ) {
-        (false, None, None) => Ok(None),
-        (false, _, _) => bail!(
-            "--runtime-scope-id and --process-identity-token are only valid for signed target modes"
-        ),
-        (true, Some(scope), Some(token)) => Ok(Some(RuntimeProcessIdentity {
-            scope_id: Id::new(scope.to_owned()).context("--runtime-scope-id is not a valid Id")?,
-            process_identity_token: RandomId128::new(token.to_owned())
-                .context("--process-identity-token is not a valid RandomId128")?,
-            control_only: args.control_only,
-        })),
-        (true, _, _) => bail!(
-            "signed target modes require --runtime-scope-id and --process-identity-token together"
-        ),
+    if !target_mode {
+        if args.runtime_scope_id.is_some()
+            || args.process_identity_token.is_some()
+            || args.device_ownership_token.is_some()
+        {
+            bail!(
+                "--runtime-scope-id, --process-identity-token and --device-ownership-token are only valid for signed target modes"
+            );
+        }
+        return Ok(None);
     }
+
+    let scope = args
+        .runtime_scope_id
+        .as_deref()
+        .context("signed target modes require --runtime-scope-id")?;
+    let process_token = args
+        .process_identity_token
+        .as_deref()
+        .context("signed target modes require --process-identity-token")?;
+    let process_identity_token = RandomId128::new(process_token.to_owned())
+        .context("--process-identity-token is not a valid RandomId128")?;
+    let device_ownership_token = match (args.control_only, args.device_ownership_token.as_deref()) {
+        (true, None) => None,
+        (true, Some(_)) => bail!("--control-only forbids --device-ownership-token"),
+        (false, Some(token)) => Some(
+            RandomId128::new(token.to_owned())
+                .context("--device-ownership-token is not a valid RandomId128")?,
+        ),
+        (false, None) => bail!("authorized serving requires --device-ownership-token"),
+    };
+    if device_ownership_token.as_ref() == Some(&process_identity_token) {
+        bail!("process and device ownership tokens must differ");
+    }
+    Ok(Some(RuntimeProcessIdentity {
+        scope_id: Id::new(scope.to_owned()).context("--runtime-scope-id is not a valid Id")?,
+        process_identity_token,
+        device_ownership_token,
+        control_only: args.control_only,
+    }))
 }
 
 /// NBD-only mode: the listener threads own the work, so the process lives as
@@ -1807,6 +1836,8 @@ mod tests {
             "cats-cat_01-root.scope",
             "--process-identity-token",
             "13579bdf2468ace013579bdf2468ace0",
+            "--device-ownership-token",
+            "2468ace013579bdf2468ace013579bdf",
         ];
         arguments.extend_from_slice(extra);
         Args::try_parse_from(arguments).unwrap()
@@ -1849,5 +1880,69 @@ mod tests {
 
         let same_name = parse_target(&["--listen-unix", "/runtime/control.sock"]);
         assert!(validate_process_mode(&same_name).is_err());
+    }
+
+    #[test]
+    fn authorized_serving_requires_a_distinct_canonical_device_token() {
+        let missing = Args::try_parse_from([
+            "cats-blockd",
+            "--object-store-adapter",
+            "file",
+            "--metadata-store-adapter",
+            "postgres",
+            "--authorized-serving-spec",
+            "/runtime/attachment.json",
+            "--listen-control",
+            "/runtime/control.sock",
+            "--listen-unix",
+            "/runtime/block.sock",
+            "--runtime-scope-id",
+            "cats-cat_01-root.scope",
+            "--process-identity-token",
+            "13579bdf2468ace013579bdf2468ace0",
+        ])
+        .unwrap();
+        assert!(validate_process_mode(&missing).is_err());
+
+        let mut malformed = parse_target(&["--listen-unix", "/runtime/block.sock"]);
+        malformed.device_ownership_token = Some("not-a-random-id".to_owned());
+        assert!(validate_process_mode(&malformed).is_err());
+
+        let same = Args::try_parse_from([
+            "cats-blockd",
+            "--object-store-adapter",
+            "file",
+            "--metadata-store-adapter",
+            "postgres",
+            "--authorized-serving-spec",
+            "/runtime/attachment.json",
+            "--listen-control",
+            "/runtime/control.sock",
+            "--listen-unix",
+            "/runtime/block.sock",
+            "--runtime-scope-id",
+            "cats-cat_01-root.scope",
+            "--process-identity-token",
+            "13579bdf2468ace013579bdf2468ace0",
+            "--device-ownership-token",
+            "13579bdf2468ace013579bdf2468ace0",
+        ])
+        .unwrap();
+        assert!(validate_process_mode(&same).is_err());
+
+        let identity = runtime_process_identity(&parse_target(&[
+            "--listen-vhost-user",
+            "/runtime/vhost.sock",
+        ]))
+        .unwrap()
+        .unwrap();
+        assert_eq!(
+            identity.device_ownership_token.as_ref().unwrap().as_str(),
+            "2468ace013579bdf2468ace013579bdf"
+        );
+        assert_ne!(
+            identity.device_ownership_token.as_ref(),
+            Some(&identity.process_identity_token)
+        );
     }
 }

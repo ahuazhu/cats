@@ -58,8 +58,9 @@ pub use admission_port::{
     AdmissionGatePort, AdmissionSnapshot, GatePortError, IdleCloseResult, SnapshotError,
 };
 pub use authorized_blockd::{
-    authorized_blockd_command, AuthorizedBlockFrontend, AuthorizedBlockdCheckpoint,
-    AuthorizedBlockdLaunchConfig, AuthorizedBlockdStore, PreparedAuthorizedBlockd,
+    authorized_blockd_command, authorized_blockd_status_is_bound, AuthorizedBlockFrontend,
+    AuthorizedBlockdCheckpoint, AuthorizedBlockdLaunchConfig, AuthorizedBlockdStore,
+    PreparedAuthorizedBlockd,
 };
 pub use checkpoint::{
     runtime_checkpoint_path, CheckpointStoreError, FileCheckpointStore, StoredCheckpoint,

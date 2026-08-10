@@ -976,11 +976,18 @@ token推导或复用另一个。kernel-NBD plan固定listener socket和device pa
 1..=64及`queue_size` 2..=32768的二次幂。control/frontend socket、kernel listener/device及authorization/
 process role path不得alias。
 
-每轮仍只执行一个physical effect：exact stop旧target-control、start serving blockd、或create/adopt Guest device。
-任一effect或响应不明后先发布/接受新full inventory，再由持久step判断exact present/absent；不同PID/start、
-token、lineage、head、CLI/handshake或frontend参数全部fail closed。public `ObservedDevice`只证明device path/socket、
-Guest slot和device token；vhost queue参数、serving CLI及`control_only=false`/Guest-I/O-open handshake必须由scanner
-读取provider-private exact process/CLI/socket evidence后才能投影为满足step，不能从`ObservedDevice`猜测。
+每轮仍只执行该frontend定义的一个bounded physical effect。exact stop旧target-control永远是独立effect。
+kernel-NBD先以一个effect启动serving blockd并取得owned listener，fresh scan闭合后才以另一个effect把同一持久
+device token绑定到OS NBD device；vhost-user则由serving blockd在启动时no-replace bind owned socket，process与
+listener是不可拆分的一个bounded effect，不存在下一轮单独“create vhost device”。任一effect或响应不明后先
+发布/接受新full inventory，再由持久step判断exact present/absent；不同PID/start、token、lineage、head、
+CLI/handshake或frontend参数全部fail closed。
+
+serving blockd CLI必须从同一个已fsync的`prepare_device` step取得process token及独立device token；严格parser
+拒绝缺失、非canonical、相同token或control-only携device token。authorized-serving status handshake必须逐字段
+回显二者、`control_only=false`和Guest-I/O-open；wrong/missing token均不可adopt。public `ObservedDevice`只证明
+device path/socket、Guest slot和device token；vhost queue参数、serving CLI及handshake必须由scanner读取
+provider-private exact process/CLI/socket evidence后才能投影为满足step，不能从`ObservedDevice`猜测。
 
 新建任一携scope/socket/device/tap等ownership token的物理实例前，必须先生成新的
 `RandomId128`并写入该Cat checkpoint；已用于另一物理实例或已完成cleanup的token

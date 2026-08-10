@@ -17,6 +17,7 @@ use std::path::{Component, Path, PathBuf};
 use std::process::Command;
 
 use anyhow::{Context as _, Result};
+use cats_api::blockd::DurabilityStatus;
 use cats_api::runtime_reconciliation::DesiredRuntimeSpec;
 use cats_api::runtime_reconciliation::{
     encode_desired_runtime_spec, ContractVersion, DiskKind, Durability, Id, RandomId128,
@@ -286,13 +287,16 @@ pub enum AuthorizedBlockFrontend {
     },
 }
 
-/// Build only the closed authorized-serving CLI. This does not start a child,
-/// create a scope or claim that the frontend is ready.
+/// Build only the closed authorized-serving CLI. The scope, process token,
+/// device token, control socket and frontend must be passed directly from one
+/// fsynced `PrepareDevice` checkpoint. This does not start a child, create a
+/// scope or claim that the frontend is ready.
 pub fn authorized_blockd_command(
     config: &AuthorizedBlockdLaunchConfig,
     prepared: &PreparedAuthorizedBlockd,
     scope_id: &Id,
     process_identity_token: &RandomId128,
+    device_ownership_token: &RandomId128,
     control_socket: &Path,
     frontend: &AuthorizedBlockFrontend,
 ) -> Result<Command> {
@@ -322,6 +326,10 @@ pub fn authorized_blockd_command(
         control_socket != frontend_socket,
         "authorized blockd control and frontend sockets must differ"
     );
+    anyhow::ensure!(
+        process_identity_token != device_ownership_token,
+        "authorized blockd process and device ownership tokens must differ"
+    );
     if let AuthorizedBlockFrontend::VhostUser {
         queues, queue_size, ..
     } = frontend
@@ -349,6 +357,8 @@ pub fn authorized_blockd_command(
         .arg(scope_id.as_str())
         .arg("--process-identity-token")
         .arg(process_identity_token.as_str())
+        .arg("--device-ownership-token")
+        .arg(device_ownership_token.as_str())
         .arg("--metadata-store-adapter")
         .arg(&config.metadata_store.name)
         .arg("--object-store-adapter")
@@ -396,6 +406,41 @@ pub fn authorized_blockd_command(
     // Node never forwards an ambient value across this signed seam.
     command.env_remove("CATS_CRASH_POINT");
     Ok(command)
+}
+
+/// Accept a serving handshake only when it echoes the complete, independently
+/// checkpointed process and device identities together with the exact
+/// authorized attachment. The caller must additionally bind the response to
+/// the inspected PID/socket/cgroup; this payload is not process authority by
+/// itself.
+pub fn authorized_blockd_status_is_bound(
+    status: &DurabilityStatus,
+    acquired: &AuthorizedBlockdCheckpoint,
+    scope_id: &Id,
+    process_identity_token: &RandomId128,
+    device_ownership_token: &RandomId128,
+) -> bool {
+    let attachment = &acquired.attachment;
+    process_identity_token != device_ownership_token
+        && status.volume_id == attachment.identity.volume_id.as_str()
+        && status.attachment_id == attachment.identity.attachment_id.as_str()
+        && status.attachment_epoch == Some(attachment.identity.attachment_epoch)
+        && status.acquire_origin.as_ref() == Some(&attachment.identity.acquire_origin)
+        && status.node_id.as_ref() == Some(&attachment.identity.node_id)
+        && status.placement_epoch == Some(attachment.identity.placement_epoch)
+        && status.guest_io_enabled == Some(true)
+        && status.size_bytes == Some(attachment.size_bytes)
+        && status.scope_id.as_ref() == Some(scope_id)
+        && status.process_identity_token.as_ref() == Some(process_identity_token)
+        && status.device_ownership_token.as_ref() == Some(device_ownership_token)
+        && status.control_only == Some(false)
+        && status.remote_head.as_ref() == Some(&attachment.head)
+        && status.mode
+            == match attachment.durability {
+                Durability::Strict => "strict",
+                Durability::Relaxed => "relaxed",
+            }
+        && !status.fenced
 }
 
 fn validate_checkpoint_inputs(
@@ -1203,6 +1248,48 @@ mod tests {
         command.get_args().map(ToOwned::to_owned).collect()
     }
 
+    fn serving_status(
+        acquired: &AuthorizedBlockdCheckpoint,
+        scope_id: &Id,
+        process_identity_token: &RandomId128,
+        device_ownership_token: &RandomId128,
+    ) -> DurabilityStatus {
+        let attachment = &acquired.attachment;
+        DurabilityStatus {
+            volume_id: attachment.identity.volume_id.to_string(),
+            attachment_id: attachment.identity.attachment_id.to_string(),
+            attachment_epoch: Some(attachment.identity.attachment_epoch),
+            acquire_origin: Some(attachment.identity.acquire_origin.clone()),
+            node_id: Some(attachment.identity.node_id.clone()),
+            placement_epoch: Some(attachment.identity.placement_epoch),
+            guest_io_enabled: Some(true),
+            size_bytes: Some(attachment.size_bytes),
+            scope_id: Some(scope_id.clone()),
+            process_identity_token: Some(process_identity_token.clone()),
+            device_ownership_token: Some(device_ownership_token.clone()),
+            control_only: Some(false),
+            remote_head: Some(attachment.head.clone()),
+            mode: match attachment.durability {
+                Durability::Strict => "strict".into(),
+                Durability::Relaxed => "relaxed".into(),
+            },
+            local_durable_generation: 1,
+            remote_durable_generation: 1,
+            unpublished_generations: 0,
+            unpublished_bytes: 0,
+            oldest_unpublished_age_ms: 0,
+            max_unpublished_generations: 1,
+            max_unpublished_bytes: 1,
+            local_allocated_bytes: 0,
+            local_accounted_bytes: 0,
+            max_local_bytes: 4 * 1024 * 1024,
+            evicted_cache_chunks: 0,
+            backpressured: false,
+            fenced: false,
+            last_publish_error: None,
+        }
+    }
+
     #[test]
     fn complete_desired_grant_and_network_are_checkpointed_before_closed_cli_is_built() {
         let temp = tempfile::tempdir().unwrap();
@@ -1243,6 +1330,7 @@ mod tests {
             &prepared,
             &id("cats-cat-1-root.scope"),
             &random(2),
+            &random(3),
             &control,
             &AuthorizedBlockFrontend::VhostUser {
                 socket: frontend.clone(),
@@ -1262,6 +1350,8 @@ mod tests {
             OsString::from("cats-cat-1-root.scope"),
             OsString::from("--process-identity-token"),
             OsString::from("00000000000000000000000000000002"),
+            OsString::from("--device-ownership-token"),
+            OsString::from("00000000000000000000000000000003"),
             OsString::from("--listen-vhost-user"),
             frontend.into_os_string(),
             OsString::from("--lease-ttl-ms"),
@@ -1284,6 +1374,59 @@ mod tests {
         assert!(command
             .get_envs()
             .any(|(name, value)| name == "CATS_CRASH_POINT" && value.is_none()));
+    }
+
+    #[test]
+    fn serving_handshake_requires_both_exact_independent_tokens() {
+        let temp = tempfile::tempdir().unwrap();
+        let (desired, volume, attachment) = fixture();
+        let prepared =
+            AuthorizedBlockdStore::new(StateDirectory::unanchored(temp.path().to_path_buf()))
+                .prepare(&desired, &volume, &attachment)
+                .unwrap();
+        let scope_id = id("cats-cat-1-root.scope");
+        let process_identity_token = random(2);
+        let device_ownership_token = random(3);
+        let status = serving_status(
+            prepared.checkpoint(),
+            &scope_id,
+            &process_identity_token,
+            &device_ownership_token,
+        );
+        assert!(authorized_blockd_status_is_bound(
+            &status,
+            prepared.checkpoint(),
+            &scope_id,
+            &process_identity_token,
+            &device_ownership_token,
+        ));
+
+        let mut missing_device = status.clone();
+        missing_device.device_ownership_token = None;
+        assert!(!authorized_blockd_status_is_bound(
+            &missing_device,
+            prepared.checkpoint(),
+            &scope_id,
+            &process_identity_token,
+            &device_ownership_token,
+        ));
+
+        let mut wrong_device = status.clone();
+        wrong_device.device_ownership_token = Some(random(4));
+        assert!(!authorized_blockd_status_is_bound(
+            &wrong_device,
+            prepared.checkpoint(),
+            &scope_id,
+            &process_identity_token,
+            &device_ownership_token,
+        ));
+        assert!(!authorized_blockd_status_is_bound(
+            &status,
+            prepared.checkpoint(),
+            &scope_id,
+            &process_identity_token,
+            &process_identity_token,
+        ));
     }
 
     #[test]
@@ -1412,7 +1555,22 @@ mod tests {
             &prepared,
             &id("cats-cat-1-root.scope"),
             &random(2),
+            &random(3),
             Path::new("/tmp/not-state-derived-control.sock"),
+            &AuthorizedBlockFrontend::NbdUnix {
+                socket: temp.path().join("frontends/root.sock"),
+            },
+        );
+        assert!(result.is_err());
+
+        let token = random(2);
+        let result = authorized_blockd_command(
+            &launch_config(),
+            &prepared,
+            &id("cats-cat-1-root.scope"),
+            &token,
+            &token,
+            &temp.path().join("control-sockets/cat-1-blockd.sock"),
             &AuthorizedBlockFrontend::NbdUnix {
                 socket: temp.path().join("frontends/root.sock"),
             },

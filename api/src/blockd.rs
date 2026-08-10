@@ -198,6 +198,11 @@ pub struct DurabilityStatus {
     /// are not adoptable and must never be reconstructed from a unit name.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub process_identity_token: Option<RandomId128>,
+    /// Fresh Guest-device token fsynced with the serving launch. For
+    /// vhost-user this identifies the listener atomically created by the
+    /// serving process; missing is legacy/unproven and cannot be adopted.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub device_ownership_token: Option<RandomId128>,
     /// Exact process mode. Missing means legacy; `guest_io_enabled=false`
     /// alone is not proof that the process exposes only Host control I/O.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -267,6 +272,7 @@ mod tests {
             size_bytes: None,
             scope_id: None,
             process_identity_token: None,
+            device_ownership_token: None,
             control_only: None,
             remote_head: None,
             mode: "relaxed".to_string(),

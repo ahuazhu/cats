@@ -1779,6 +1779,7 @@ mod tests {
             size_bytes: Some(expected.size_bytes),
             scope_id: Some(expected.scope_id),
             process_identity_token: Some(expected.process_identity_token),
+            device_ownership_token: None,
             control_only: Some(true),
             remote_head: Some(expected.attachment.head),
             mode: "strict".into(),

@@ -492,6 +492,7 @@ fn control_only_rejects_frontends_and_serves_only_the_typed_effect() {
         status.process_identity_token,
         Some(RandomId128::new(PROCESS_TOKEN).unwrap())
     );
+    assert_eq!(status.device_ownership_token, None);
     assert_eq!(status.control_only, Some(true));
     assert_eq!(status.guest_io_enabled, Some(false));
     let response = exchange(&env.control_socket(), &wire_request(&env.request));
