@@ -1455,7 +1455,7 @@ mod tests {
         fn inspect_exact_or_absent_after_node_global_sweep(
             &self,
             expected: &super::super::RootProvisionProcessExpectation,
-            _context: &dyn crate::runtime_spine::RuntimePhysicalReadContext,
+            _context: &crate::runtime_spine::RuntimeDesiredEffectContext,
         ) -> anyhow::Result<RootProvisionProcessInspection> {
             self.calls.fetch_add(1, Ordering::SeqCst);
             Ok(self.inspection(expected))
