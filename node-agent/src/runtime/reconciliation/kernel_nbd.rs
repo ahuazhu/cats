@@ -115,6 +115,7 @@ pub(crate) struct KernelNbdPoolSnapshot {
 }
 
 impl KernelNbdPoolSnapshot {
+    #[cfg(test)]
     pub(crate) fn slots(&self) -> &BTreeMap<HostPath, KernelNbdSlotState> {
         &self.slots
     }
@@ -225,6 +226,7 @@ impl KernelNbdReservations {
         Ok(())
     }
 
+    #[cfg(test)]
     pub(crate) fn by_device(&self) -> &BTreeMap<HostPath, KernelNbdReservation> {
         &self.by_device
     }
@@ -245,6 +247,7 @@ impl KernelNbdAllocationPermit {
         &self.state_root
     }
 
+    #[cfg(test)]
     pub(crate) fn snapshot(&self) -> &KernelNbdPoolSnapshot {
         &self.snapshot
     }
@@ -273,6 +276,7 @@ impl KernelNbdAllocationPermit {
         anyhow::bail!("no physically free, unreserved kernel-NBD device remains")
     }
 
+    #[cfg(test)]
     pub(crate) fn require_free(&self, device_path: &HostPath) -> Result<()> {
         anyhow::ensure!(
             matches!(

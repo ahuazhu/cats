@@ -1001,6 +1001,29 @@ pub(crate) fn installed_root_process_retirement_port(
     )?)
 }
 
+/// Production handoff uses the same provider-private Node-global sweep as the
+/// scanner and retirement paths. Keeping this as a sealed port prevents the
+/// target phase from degrading to a per-process point inspection.
+pub(crate) fn installed_root_process_global_port(
+    config: InstalledCleanSlateProbeConfig,
+) -> anyhow::Result<Arc<dyn RootProvisionProcessGlobalPort>> {
+    let config = ProbeConfig::installed(config)?;
+    let process_paths = ProcessPaths {
+        root: config.proc_root.clone(),
+        binaries: vec![
+            config.cloud_hypervisor_binary.clone(),
+            config.blockd_binary.clone(),
+            config.guest_agent_binary.clone(),
+        ],
+        supported: config.linux_sources_supported,
+        limits: config.limits,
+    };
+    Ok(platform_root_process_inventory_bridge(
+        &config,
+        process_paths,
+    )?)
+}
+
 #[cfg(test)]
 pub(crate) struct TestCleanSlateProbeConfig {
     pub state_directory: StateDirectory,

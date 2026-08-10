@@ -729,6 +729,18 @@ impl RetainedAuthorizedBlockd {
         &self.checkpoint
     }
 
+    /// Duplicate the already-flocked attachment descriptor for another typed
+    /// verifier. `File::try_clone` uses the same open file description, so it
+    /// preserves (and does not recursively reacquire) the cooperative flock.
+    /// The caller must keep this retained owner live while consuming the
+    /// duplicate.
+    pub(crate) fn duplicate_locked_attachment_directory(&self) -> Result<File> {
+        self.assert_current()?;
+        self.directory
+            .try_clone()
+            .context("duplicate retained authorized blockd attachment descriptor")
+    }
+
     pub(crate) fn assert_current(&self) -> Result<()> {
         anyhow::ensure!(
             verify_retained_state_root(&self.root_directory, self.state_directory.path())?

@@ -54,9 +54,9 @@ use crate::state_directory::StateDirectory;
 
 use super::authorized_blockd::{
     authorized_blockd_data_directory, validate_authorized_blockd_checkpoint,
-    AuthorizedBlockdCheckpoint, PreparedAuthorizedBlockd, AUTHORIZED_SERVING_FILE, IDENTITY_FILE,
-    LAUNCH_CHECKPOINT_FILE, MAX_AUTHORIZED_SERVING_BYTES, MAX_IDENTITY_BYTES,
-    MAX_LAUNCH_CHECKPOINT_BYTES,
+    AuthorizedBlockdCheckpoint, PreparedAuthorizedBlockd, RetainedAuthorizedBlockd,
+    AUTHORIZED_SERVING_FILE, IDENTITY_FILE, LAUNCH_CHECKPOINT_FILE, MAX_AUTHORIZED_SERVING_BYTES,
+    MAX_IDENTITY_BYTES, MAX_LAUNCH_CHECKPOINT_BYTES,
 };
 use super::root_provision_process::{
     prove_exact_root_provision_process_absence, ExactRootProvisionProcessAbsenceProof,
@@ -316,10 +316,24 @@ pub(crate) struct ServingHandoffReady {
 }
 
 impl ServingHandoffReady {
+    #[cfg_attr(
+        not(test),
+        expect(
+            dead_code,
+            reason = "descriptor identity accessor is exercised by contract tests"
+        )
+    )]
     pub(crate) fn record_path(&self) -> &HostPath {
         self.record_identity.path()
     }
 
+    #[cfg_attr(
+        not(test),
+        expect(
+            dead_code,
+            reason = "descriptor identity accessor is exercised by contract tests"
+        )
+    )]
     pub(crate) fn record_identity(&self) -> &ServingHandoffRecordIdentity {
         &self.record_identity
     }
@@ -341,6 +355,10 @@ impl ServingHandoffReady {
     /// this proof.
     pub(crate) fn assert_current(&self, stored_checkpoint: &StoredCheckpoint) -> Result<()> {
         validate_record_checkpoint_context(&self.record, stored_checkpoint)?;
+        self.assert_artifacts_current()
+    }
+
+    fn assert_artifacts_current(&self) -> Result<()> {
         self.retained.assert_current()?;
         let target_identity = &self.record.target_control_authorization;
         anyhow::ensure!(
@@ -388,7 +406,14 @@ impl ServingHandoffReady {
                 content_sha256: self.record_identity.content_sha256.clone(),
             },
         };
-        consume(handoff)
+        let result = consume(handoff)?;
+        // The checkpoint replace may have crossed cancellation or a hostile
+        // same-uid lexical mutation. Keep every retained descriptor and the
+        // attachment flock live through one last post-publication mapping
+        // check; an error leaves the durable checkpoint for the next fresh
+        // inventory and never authorizes another effect from this admission.
+        self.assert_artifacts_current()?;
+        Ok(result)
     }
 }
 
@@ -535,8 +560,52 @@ impl ServingHandoffStore {
             &target_name,
             &temporary_name,
         )?;
+        self.finish_reopen_target(stored_checkpoint, &candidate, &target_name, retained)
+    }
+
+    /// Reopen the target artifact through an attachment descriptor whose
+    /// flock is already owned by the superseded-checkpoint retirement path.
+    /// This is the launch-identity bridge for target wrappers: it never drops
+    /// to the blank-control argv expectation merely because the current
+    /// Desired no longer names the predecessor.
+    pub(crate) fn reopen_target_control_authorization_from_retained(
+        &self,
+        stored_checkpoint: &StoredCheckpoint,
+        acquired: &AuthorizedBlockdCheckpoint,
+        authority: &ServingAuthorityTargetEvidence,
+        predecessor: &RetainedAuthorizedBlockd,
+    ) -> Result<ReopenedTargetControlAuthorization> {
+        let candidate = build_target_candidate(
+            &self.state_directory,
+            stored_checkpoint,
+            acquired,
+            authority,
+        )?;
+        let target_name = target_control_file_name(&candidate.provision_transition_id);
+        let temporary_name = target_control_temp_name(&candidate.provision_transition_id);
+        let attachment_directory = predecessor.duplicate_locked_attachment_directory()?;
+        let retained = RetainedAttachmentContext::from_locked_directory(
+            self.state_directory.clone(),
+            &candidate.data_directory,
+            acquired,
+            &target_name,
+            &temporary_name,
+            attachment_directory,
+        )?;
+        predecessor.assert_current()?;
+        self.finish_reopen_target(stored_checkpoint, &candidate, &target_name, retained)
+    }
+
+    fn finish_reopen_target(
+        &self,
+        stored_checkpoint: &StoredCheckpoint,
+        candidate: &TargetControlCandidate,
+        target_name: &str,
+        retained: RetainedAttachmentContext,
+    ) -> Result<ReopenedTargetControlAuthorization> {
+        let temporary_name = target_control_temp_name(&candidate.provision_transition_id);
         ensure_no_unpublished_handoff_temp(&retained.attachment_directory, &temporary_name)?;
-        let target_name_c = c_string(&target_name)?;
+        let target_name_c = c_string(target_name)?;
         if read_optional_bounded(
             &retained.attachment_directory,
             &target_name_c,
@@ -547,17 +616,17 @@ impl ServingHandoffStore {
             return Ok(ReopenedTargetControlAuthorization::Absent);
         }
         let target_path = host_path(
-            &candidate.data_directory.join(&target_name),
+            &candidate.data_directory.join(target_name),
             "reopened target control authorization path",
         )?;
         let retained_target = RetainedFile::open_required(
             &retained.attachment_directory,
-            &target_name,
+            target_name,
             target_path,
             TARGET_AUTHORIZED_SERVING_MAX_BYTES,
         )?;
         let artifact = decode_target_control_authorization(&retained_target.bytes)?;
-        let expected = target_control_artifact(stored_checkpoint, &retained, &candidate)?;
+        let expected = target_control_artifact(stored_checkpoint, &retained, candidate)?;
         anyhow::ensure!(
             artifact == expected,
             "reopened target control authorization conflicts with current authority"
@@ -872,6 +941,13 @@ impl ServingHandoffStore {
     /// target, malformed/partial temp, unsafe entry, stale transition, wrong
     /// authority tuple, or wrong process handshake fails before a Ready proof
     /// can be returned.
+    #[cfg_attr(
+        not(test),
+        expect(
+            dead_code,
+            reason = "direct sealed-store entry remains a focused contract-test seam"
+        )
+    )]
     pub(crate) fn seal_serving_ready(
         &self,
         stored_checkpoint: &StoredCheckpoint,
@@ -2958,6 +3034,87 @@ impl RetainedAttachmentContext {
         Ok(retained)
     }
 
+    fn from_locked_directory(
+        state_directory: StateDirectory,
+        data_directory: &Path,
+        acquired: &AuthorizedBlockdCheckpoint,
+        expected_target: &str,
+        expected_target_temp: &str,
+        attachment_directory: File,
+    ) -> Result<Self> {
+        let root_directory = state_directory
+            .try_clone_directory()
+            .context("clone retained Node state directory")?;
+        verify_retained_state_directory(&root_directory, state_directory.path())?;
+        let state_identity = stable_directory_identity(&root_directory, state_directory.path())?;
+        verify_private_directory(&attachment_directory, data_directory)?;
+        let lexical_attachment = open_attachment_directory_from_root(
+            &root_directory,
+            state_directory.path(),
+            data_directory,
+        )?;
+        let attachment_identity = stable_directory_identity(&attachment_directory, data_directory)?;
+        anyhow::ensure!(
+            stable_directory_identity(&lexical_attachment, data_directory)? == attachment_identity,
+            "retained authorized blockd attachment descriptor is no longer lexical"
+        );
+        validate_handoff_namespace(&attachment_directory, expected_target, expected_target_temp)?;
+        let identity = RetainedFile::open_required(
+            &attachment_directory,
+            IDENTITY_FILE,
+            host_path(
+                &data_directory.join(IDENTITY_FILE),
+                "attachment identity path",
+            )?,
+            MAX_IDENTITY_BYTES,
+        )?;
+        let blank_grant = RetainedFile::open_required(
+            &attachment_directory,
+            AUTHORIZED_SERVING_FILE,
+            host_path(
+                &data_directory.join(AUTHORIZED_SERVING_FILE),
+                "acquire authorization path",
+            )?,
+            MAX_AUTHORIZED_SERVING_BYTES,
+        )?;
+        let launch_checkpoint = RetainedFile::open_required(
+            &attachment_directory,
+            LAUNCH_CHECKPOINT_FILE,
+            host_path(
+                &data_directory.join(LAUNCH_CHECKPOINT_FILE),
+                "authorized blockd launch checkpoint path",
+            )?,
+            MAX_LAUNCH_CHECKPOINT_BYTES,
+        )?;
+        validate_acquire_input_bytes(
+            &identity.bytes,
+            &blank_grant.bytes,
+            &launch_checkpoint.bytes,
+            acquired,
+        )?;
+        let local_state = ServingHandoffLocalStateIdentity {
+            state_directory: state_identity,
+            attachment_directory: attachment_identity,
+            attachment_identity_file: identity.identity.clone(),
+            acquire_authorization_file: blank_grant.identity.clone(),
+            launch_checkpoint_file: launch_checkpoint.identity.clone(),
+        };
+        let retained = Self {
+            state_directory,
+            root_directory,
+            attachment_directory,
+            data_directory: data_directory.to_path_buf(),
+            local_state,
+            acquire_inputs: RetainedAcquireInputs {
+                identity,
+                blank_grant,
+                launch_checkpoint,
+            },
+        };
+        retained.assert_current()?;
+        Ok(retained)
+    }
+
     fn assert_current(&self) -> Result<()> {
         verify_retained_state_directory(&self.root_directory, self.state_directory.path())?;
         assert_directory_identity(&self.root_directory, &self.local_state.state_directory)?;
@@ -3643,7 +3800,8 @@ mod tests {
         RootProvisionProcessStart, TargetControlProcessPort,
     };
     use crate::runtime::reconciliation::serving_handoff_effect::{
-        ServingHandoffEffect, ServingHandoffEffectProgress,
+        ServingHandoffEffect, ServingHandoffEffectProgress, ServingPrepareDeviceEffect,
+        ServingPrepareFrontend,
     };
     use crate::runtime::reconciliation::signed_running::prepared_owned_observed_volume;
     use crate::runtime::reconciliation::{
@@ -4751,6 +4909,209 @@ mod tests {
             blank_inode
         );
         assert_eq!(authority.loads.load(Ordering::SeqCst), 8);
+    }
+
+    #[test]
+    fn production_prepare_cas_freezes_complete_vhost_plan_and_is_the_only_effect() {
+        let fixture = fixture();
+        let ready = fixture
+            .store()
+            .seal_serving_ready(
+                &fixture.stored_checkpoint,
+                &fixture.acquired,
+                &fixture.authority,
+                &fixture.exact_process_proof().unwrap(),
+            )
+            .unwrap();
+        let context = effect_context_with_processes(
+            &fixture,
+            vec![fixture
+                .exact_process_proof()
+                .unwrap()
+                .into_process_evidence()],
+        );
+        let effect = ServingPrepareDeviceEffect::new(
+            ServingPrepareFrontend::vhost_user_blk(8, 256).unwrap(),
+            fixture.expected_executable_path.clone(),
+        )
+        .unwrap();
+
+        effect
+            .persist(&context, &fixture.acquired.desired, &ready)
+            .expect("persist complete production PrepareDevice successor");
+        let checkpoint_store = FileCheckpointStore::open(
+            &fixture.checkpoint_directory,
+            &fixture.acquired.desired.cat_id,
+        )
+        .unwrap();
+        let current = checkpoint_store.load().unwrap().unwrap();
+        let ReconcileStep::PrepareDevice {
+            volume_id,
+            attachment_id,
+            attachment_epoch,
+            acquire_origin,
+            expected_head,
+            size_bytes,
+            durability,
+            guest_device,
+            ownership_token,
+            serving_authority,
+            serving_process,
+            frontend,
+        } = &current.checkpoint().step
+        else {
+            panic!("production Ready must advance only to PrepareDevice")
+        };
+        let attachment = &fixture.acquired.attachment;
+        assert_eq!(volume_id, &attachment.identity.volume_id);
+        assert_eq!(attachment_id, &attachment.identity.attachment_id);
+        assert_eq!(*attachment_epoch, attachment.identity.attachment_epoch);
+        assert_eq!(acquire_origin, &attachment.identity.acquire_origin);
+        assert_eq!(expected_head, &fixture.authority.volume.head);
+        assert_eq!(*size_bytes, attachment.size_bytes);
+        assert_eq!(*durability, attachment.durability);
+        assert_eq!(guest_device, &fixture.acquired.volume.guest_device);
+        assert_ne!(ownership_token, &serving_process.process_identity_token);
+        assert_ne!(
+            serving_process.process_identity_token,
+            fixture.process.ownership_token
+        );
+        assert_eq!(
+            serving_process.executable_path,
+            fixture.expected_executable_path
+        );
+        assert_eq!(
+            serving_process.data_directory.as_str(),
+            fixture.data_directory.to_str().unwrap()
+        );
+        assert!(serving_process
+            .scope_id
+            .as_str()
+            .starts_with("cats-serving-"));
+        assert!(serving_process.scope_id.as_str().ends_with(".service"));
+        let ServingAuthorityProvenance::AfterRootProvision { handoff } = serving_authority.as_ref()
+        else {
+            panic!("new Root must retain after-root-provision provenance")
+        };
+        assert_eq!(
+            &handoff.predecessor_checkpoint_content_digest,
+            fixture.stored_checkpoint.content_digest()
+        );
+        assert_eq!(
+            handoff.record.path.as_str(),
+            fixture.record_path().to_str().unwrap()
+        );
+        assert_eq!(
+            frontend,
+            &PrepareDeviceFrontend::VhostUserBlk {
+                socket_path: host(&format!(
+                    "{}/serving-vhost.sock",
+                    fixture.data_directory.display()
+                )),
+                queues: fixture.acquired.desired.runtime.vcpus as u16,
+                queue_size: 256,
+            }
+        );
+        assert!(current.checkpoint().processes.is_empty());
+        assert!(current.checkpoint().volumes[0].devices.is_empty());
+
+        let durable_digest = current.content_digest().clone();
+        drop(checkpoint_store);
+        assert!(effect
+            .persist(&context, &fixture.acquired.desired, &ready)
+            .is_err());
+        let replayed = FileCheckpointStore::open(
+            &fixture.checkpoint_directory,
+            &fixture.acquired.desired.cat_id,
+        )
+        .unwrap()
+        .load()
+        .unwrap()
+        .unwrap();
+        assert_eq!(replayed.content_digest(), &durable_digest);
+    }
+
+    #[test]
+    fn cancelled_or_aba_after_prepare_cas_never_authorizes_a_second_effect() {
+        let cancelled = fixture();
+        let cancelled_ready = cancelled
+            .store()
+            .seal_serving_ready(
+                &cancelled.stored_checkpoint,
+                &cancelled.acquired,
+                &cancelled.authority,
+                &cancelled.exact_process_proof().unwrap(),
+            )
+            .unwrap();
+        let cancelled_context = effect_context_with_processes(
+            &cancelled,
+            vec![cancelled
+                .exact_process_proof()
+                .unwrap()
+                .into_process_evidence()],
+        );
+        let canceller = cancelled_context.clone();
+        let cancelled_effect = ServingPrepareDeviceEffect::new(
+            ServingPrepareFrontend::vhost_user_blk(2, 256).unwrap(),
+            cancelled.expected_executable_path.clone(),
+        )
+        .unwrap()
+        .with_after_replace(Arc::new(move || canceller.cancel_for_test()));
+        let cancellation = cancelled_effect
+            .persist(
+                &cancelled_context,
+                &cancelled.acquired.desired,
+                &cancelled_ready,
+            )
+            .unwrap_err();
+        assert!(cancellation.to_string().contains("cancelled"));
+        let cancelled_current = FileCheckpointStore::open(
+            &cancelled.checkpoint_directory,
+            &cancelled.acquired.desired.cat_id,
+        )
+        .unwrap()
+        .load()
+        .unwrap()
+        .unwrap();
+        assert!(matches!(
+            cancelled_current.checkpoint().step,
+            ReconcileStep::PrepareDevice { .. }
+        ));
+
+        let aba = fixture();
+        let aba_ready = aba
+            .store()
+            .seal_serving_ready(
+                &aba.stored_checkpoint,
+                &aba.acquired,
+                &aba.authority,
+                &aba.exact_process_proof().unwrap(),
+            )
+            .unwrap();
+        let aba_context = effect_context_with_processes(
+            &aba,
+            vec![aba.exact_process_proof().unwrap().into_process_evidence()],
+        );
+        let record_path = aba.record_path();
+        let aba_effect = ServingPrepareDeviceEffect::new(
+            ServingPrepareFrontend::vhost_user_blk(2, 256).unwrap(),
+            aba.expected_executable_path.clone(),
+        )
+        .unwrap()
+        .with_after_replace(Arc::new(move || swap_same_bytes(&record_path, "post-cas")));
+        assert!(aba_effect
+            .persist(&aba_context, &aba.acquired.desired, &aba_ready)
+            .is_err());
+        let aba_current =
+            FileCheckpointStore::open(&aba.checkpoint_directory, &aba.acquired.desired.cat_id)
+                .unwrap()
+                .load()
+                .unwrap()
+                .unwrap();
+        assert!(matches!(
+            aba_current.checkpoint().step,
+            ReconcileStep::PrepareDevice { .. }
+        ));
     }
 
     #[test]

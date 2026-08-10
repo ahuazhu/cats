@@ -21,36 +21,18 @@ mod clean_slate_probes;
 mod gate_planner;
 mod inventory;
 // Kernel NBD is the default ADR-0015 frontend and is a Host-global resource.
-// This provider-private slice lands the exact pool scan and durable-checkpoint
-// reservation permit before the PrepareDevice effect consumes it. Keeping the
-// exception on the private module prevents an incomplete public boundary.
-#[expect(
-    dead_code,
-    reason = "exact kernel-NBD reservation is consumed by the PrepareDevice effect"
+// Its reservation permit is consumed by the production PrepareDevice CAS.
+#[cfg_attr(
+    not(target_os = "linux"),
+    expect(dead_code, reason = "kernel-NBD production composition requires Linux")
 )]
 mod kernel_nbd;
 mod normal_acquire;
 mod root_provision;
+mod serving_handoff;
+mod serving_handoff_effect;
 mod signed_root_provision;
 mod signed_running;
-// This typed slice stops at `ServingHandoffReady`; production composition and
-// the PrepareDevice CAS intentionally land later.
-#[cfg_attr(
-    not(test),
-    expect(
-        dead_code,
-        reason = "serving handoff effect is staged before final Runtime composition"
-    )
-)]
-mod serving_handoff_effect;
-// The immutable proof seam is consumed by the expanded PrepareDevice
-// provenance while retained descriptors close the publication/replace ABA
-// window. Full process/device composition remains a later effect slice.
-#[expect(
-    dead_code,
-    reason = "sealed serving handoff is staged before full PrepareDevice effect composition"
-)]
-mod serving_handoff;
 // This focused foundation intentionally lands before the production systemd
 // adapter and signed launch orchestrator that consume it. Keep the exception
 // on this one private module; the follow-up composition removes it.
@@ -91,8 +73,8 @@ pub(crate) use clean_slate_probes::{
     clean_slate_scanner_with_volume_authority_for_test, TestCleanSlateProbeConfig,
 };
 pub(crate) use clean_slate_probes::{
-    installed_clean_slate_scanner, installed_root_process_retirement_port,
-    InstalledCleanSlateProbeConfig,
+    installed_clean_slate_scanner, installed_root_process_global_port,
+    installed_root_process_retirement_port, InstalledCleanSlateProbeConfig,
 };
 pub use gate_planner::{
     applied_desired_evidence, AppliedDesiredError, GateReconcileError, GateSequencer,
@@ -114,6 +96,7 @@ pub use root_provision::{
     AuthorityRereadRequired, RootProvisionClientError, RootProvisionControlPort,
     RootProvisionResponseHint, RootProvisionUnknownReason, UnixRootProvisionClient,
 };
+pub(crate) use serving_handoff_effect::ServingPrepareFrontend;
 pub(crate) use signed_root_provision::SignedRunningEffect;
 pub(crate) use signed_running::{SignedRunningAcquireEffect, SignedRunningPublicationRecovery};
 // This crate-private seam is landed before the systemd composition that

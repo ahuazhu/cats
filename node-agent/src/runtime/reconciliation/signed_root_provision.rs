@@ -35,7 +35,15 @@ use super::authorized_blockd::{
 use super::clean_slate_probes::CHECKPOINT_NAMESPACE;
 use super::root_provision_process::{
     inspect_exact_root_provision_process, prove_exact_root_provision_process_absence,
-    RootProvisionRetirementAdmission,
+    RootProvisionProcessGlobalPort, RootProvisionRetirementAdmission,
+};
+use super::serving_handoff::{
+    ReopenedTargetControlAuthorization, ServingAuthorityTargetEvidence, ServingHandoffStore,
+    TargetControlAuthorizationReady,
+};
+use super::serving_handoff_effect::{
+    ServingHandoffEffect, ServingHandoffEffectProgress, ServingPrepareDeviceEffect,
+    ServingPrepareFrontend,
 };
 use super::signed_running::{
     expected_provision_heads, provision_checkpoint_is_bound, ProvisionHeadRead,
@@ -120,6 +128,8 @@ pub(crate) struct SignedRootProvisionEffect {
 pub(crate) struct SignedRunningEffect {
     acquire: SignedRunningAcquireEffect,
     provision: SignedRootProvisionEffect,
+    handoff: ServingHandoffEffect,
+    prepare_device: ServingPrepareDeviceEffect,
 }
 
 impl SignedRunningEffect {
@@ -129,10 +139,34 @@ impl SignedRunningEffect {
         blob: Arc<dyn BlobStore>,
         systemd: RootProvisionSystemdConfig,
         retirement: Arc<dyn RootProvisionProcessRetirementPort>,
+        global_process: Arc<dyn RootProvisionProcessGlobalPort>,
+        prepare_frontend: ServingPrepareFrontend,
     ) -> anyhow::Result<Self> {
+        let executable = systemd
+            .blockd_binary()
+            .to_str()
+            .context("serving handoff blockd binary is not UTF-8")?;
+        let executable_path = HostPath::new(executable.to_owned())
+            .context("serving handoff blockd binary is not a canonical HostPath")?;
+        let target_process = Arc::new(PlatformSystemdRootProvisionProcessPort::platform(
+            systemd.clone(),
+        ));
         Ok(Self {
             acquire,
-            provision: SignedRootProvisionEffect::platform(authority, blob, systemd, retirement)?,
+            provision: SignedRootProvisionEffect::platform(
+                Arc::clone(&authority),
+                Arc::clone(&blob),
+                systemd,
+                retirement,
+            )?,
+            handoff: ServingHandoffEffect::new(
+                authority,
+                blob,
+                global_process,
+                target_process,
+                executable_path.clone(),
+            )?,
+            prepare_device: ServingPrepareDeviceEffect::new(prepare_frontend, executable_path)?,
         })
     }
 }
@@ -143,6 +177,16 @@ impl RuntimeDesiredEffect for SignedRunningEffect {
         context: RuntimeDesiredEffectContext,
         desired: &DesiredRuntimeSpec,
     ) -> anyhow::Result<RuntimeDesiredEffectOutcome> {
+        match self.handoff.try_apply(&context, desired)? {
+            ServingHandoffEffectProgress::NotApplicable => {}
+            ServingHandoffEffectProgress::RefreshInventory => {
+                return Ok(RuntimeDesiredEffectOutcome::RefreshInventory)
+            }
+            ServingHandoffEffectProgress::Ready(ready) => {
+                self.prepare_device.persist(&context, desired, &ready)?;
+                return Ok(RuntimeDesiredEffectOutcome::RefreshInventory);
+            }
+        }
         if let Some(outcome) = self.provision.try_apply(&context, desired)? {
             return Ok(outcome);
         }
@@ -483,6 +527,12 @@ impl SignedRootProvisionEffect {
             Ok(record) => record,
             Err(_) => return Ok(RuntimeDesiredEffectOutcome::RefreshInventory),
         };
+        let target_authorization = match self
+            .reopen_superseded_target_authorization(context, stored, &prepared, &record)
+        {
+            Ok(target) => target,
+            Err(_) => return Ok(stop_local()),
+        };
         let expectation = match existing_receipt.as_ref() {
             Some(receipt) => receipt.expectation_for_current_authority(
                 stored.checkpoint(),
@@ -505,6 +555,14 @@ impl SignedRootProvisionEffect {
                     self.executable_path.clone(),
                 )
             }
+        };
+        let expectation = match expectation {
+            Ok(expectation) => match target_authorization.as_ref() {
+                Some(target) => expectation
+                    .with_target_control_launch(target.identity().process_launch_identity()),
+                None => Ok(expectation),
+            },
+            Err(_) => return Ok(stop_local()),
         };
         let expectation = match expectation {
             Ok(expectation) => expectation,
@@ -650,6 +708,15 @@ impl SignedRootProvisionEffect {
         {
             return Ok(Some(stop_local()));
         }
+        let target_authorization = match self
+            .reopen_superseded_target_authorization(context, stored, &retained, &current)
+        {
+            Ok(target) => target,
+            Err(_) => return Ok(Some(stop_local())),
+        };
+        let target_control_launch = target_authorization
+            .as_ref()
+            .map(|target| target.identity().process_launch_identity());
         let absence = match prove_exact_root_provision_process_absence(
             store,
             stored,
@@ -658,7 +725,7 @@ impl SignedRootProvisionEffect {
                 volume: &current,
             },
             self.executable_path.clone(),
-            None,
+            target_control_launch,
             self.retirement.as_ref(),
             context,
         ) {
@@ -672,6 +739,46 @@ impl SignedRootProvisionEffect {
             .remove_stop_receipt(&receipt)
             .context("remove exact settled root-provision stop receipt")?;
         Ok(Some(RuntimeDesiredEffectOutcome::RefreshInventory))
+    }
+
+    fn reopen_superseded_target_authorization(
+        &self,
+        context: &RuntimeDesiredEffectContext,
+        stored: &super::StoredCheckpoint,
+        retained: &super::authorized_blockd::RetainedAuthorizedBlockd,
+        current: &VolumeRecord,
+    ) -> anyhow::Result<Option<Box<TargetControlAuthorizationReady>>> {
+        let ReconcileStep::ProvisionRootImage {
+            provision_transition_id,
+            expected_blank_head,
+            expected_provisioned_head,
+            ..
+        } = &stored.checkpoint().step
+        else {
+            anyhow::bail!("superseded target authorization requires provision_root_image")
+        };
+        if current.head == *expected_blank_head {
+            return Ok(None);
+        }
+        anyhow::ensure!(
+            current.head == *expected_provisioned_head,
+            "superseded provision authority is neither its blank nor target head"
+        );
+        context.check_active()?;
+        let authority =
+            ServingAuthorityTargetEvidence::new(provision_transition_id.clone(), current.clone());
+        let handoff = ServingHandoffStore::new(context.state_directory().clone());
+        let reopened = handoff.reopen_target_control_authorization_from_retained(
+            stored,
+            retained.checkpoint(),
+            &authority,
+            retained,
+        )?;
+        context.check_active()?;
+        Ok(match reopened {
+            ReopenedTargetControlAuthorization::Absent => None,
+            ReopenedTargetControlAuthorization::Exact(ready) => Some(ready),
+        })
     }
 }
 
@@ -927,8 +1034,9 @@ mod tests {
     use super::super::authorized_blockd::authorized_blockd_data_directory;
     use super::super::root_provision::RootProvisionProcessIdentityPort;
     use super::super::root_provision_process::{
-        CheckpointedRootProvisionProcess, RootProvisionBlockdHandshake,
-        RootProvisionProcessEvidence, RootProvisionProcessInspection, RootProvisionProcessStart,
+        CheckpointedRootProvisionProcess, CheckpointedTargetControlProcess,
+        RootProvisionBlockdHandshake, RootProvisionProcessEvidence, RootProvisionProcessInspection,
+        RootProvisionProcessStart, TargetControlProcessPort,
     };
     use super::super::signed_running::{SignedNormalAcquirePort, SignedRunningPublicationRecovery};
     use super::super::{
@@ -1222,6 +1330,22 @@ mod tests {
         }
     }
 
+    impl super::super::root_provision_process::target_start_sealed::Sealed for FakeProcessPort {}
+
+    impl TargetControlProcessPort for FakeProcessPort {
+        fn start_target_checkpointed(
+            &self,
+            checkpointed: CheckpointedTargetControlProcess<'_>,
+            _context: &RuntimeDesiredEffectContext,
+        ) -> anyhow::Result<RootProvisionProcessStart> {
+            checkpointed.assert_current()?;
+            self.starts.fetch_add(1, Ordering::SeqCst);
+            Ok(RootProvisionProcessStart::Started(Box::new(exact_process(
+                checkpointed.expected(),
+            ))))
+        }
+    }
+
     #[derive(Debug, Clone, Copy)]
     enum FakeRetirementInspection {
         Exact,
@@ -1289,6 +1413,18 @@ mod tests {
     }
 
     impl super::super::root_provision_process::retirement_sealed::Sealed for FakeRetirementPort {}
+    impl super::super::root_provision_process::global_sealed::Sealed for FakeRetirementPort {}
+
+    impl RootProvisionProcessGlobalPort for FakeRetirementPort {
+        fn inspect_exact_or_absent_after_node_global_sweep(
+            &self,
+            expected: &super::super::RootProvisionProcessExpectation,
+            _context: &dyn crate::runtime_spine::RuntimePhysicalReadContext,
+        ) -> anyhow::Result<RootProvisionProcessInspection> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            Ok(self.inspection(expected))
+        }
+    }
 
     impl RootProvisionProcessRetirementPort for FakeRetirementPort {
         fn inspect_exact_after_node_global_sweep(
@@ -1321,6 +1457,41 @@ mod tests {
         ) -> anyhow::Result<RootProvisionProcessInspection> {
             self.calls.fetch_add(1, Ordering::SeqCst);
             Ok(self.inspection(expected))
+        }
+    }
+
+    #[derive(Default)]
+    struct TargetLaunchRetirementPort {
+        calls: AtomicUsize,
+    }
+
+    impl super::super::root_provision_process::retirement_sealed::Sealed
+        for TargetLaunchRetirementPort
+    {
+    }
+
+    impl RootProvisionProcessRetirementPort for TargetLaunchRetirementPort {
+        fn inspect_exact_after_node_global_sweep(
+            &self,
+            expected: &super::super::RootProvisionProcessExpectation,
+            _context: &dyn crate::runtime_spine::RuntimePhysicalReadContext,
+        ) -> anyhow::Result<RootProvisionProcessInspection> {
+            anyhow::ensure!(
+                expected.target_control_launch().is_some(),
+                "target-wrapper retirement lost its sealed launch identity"
+            );
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            Ok(RootProvisionProcessInspection::Exact(Box::new(
+                exact_process(expected),
+            )))
+        }
+
+        fn inspect_after_node_global_sweep(
+            &self,
+            expected: &super::super::RootProvisionProcessExpectation,
+            context: &dyn crate::runtime_spine::RuntimePhysicalReadContext,
+        ) -> anyhow::Result<RootProvisionProcessInspection> {
+            self.inspect_exact_after_node_global_sweep(expected, context)
         }
     }
 
@@ -1930,9 +2101,25 @@ mod tests {
                 60_000,
             )
             .unwrap();
+            let executable_path = HostPath::new("/usr/bin/cats-blockd".to_owned()).unwrap();
+            let handoff = ServingHandoffEffect::new(
+                Arc::clone(&self.authority) as Arc<dyn VolumeDataAuthority>,
+                Arc::clone(&self.blob) as Arc<dyn BlobStore>,
+                Arc::clone(&retirement) as Arc<dyn RootProvisionProcessGlobalPort>,
+                Arc::clone(&process) as Arc<dyn TargetControlProcessPort>,
+                executable_path.clone(),
+            )
+            .unwrap();
+            let prepare_device = ServingPrepareDeviceEffect::new(
+                ServingPrepareFrontend::vhost_user_blk(2, 256).unwrap(),
+                executable_path,
+            )
+            .unwrap();
             SignedRunningEffect {
                 acquire,
                 provision: self.effect_with_ports(process, retirement, request),
+                handoff,
+                prepare_device,
             }
         }
     }
@@ -2129,6 +2316,196 @@ mod tests {
             .unwrap();
         assert_eq!(outcome, Some(RuntimeDesiredEffectOutcome::RefreshInventory));
         assert_eq!(request.calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn production_dispatcher_handoffs_target_then_cas_without_reentering_provision() {
+        let fixture = Fixture::new();
+        let ReconcileStep::ProvisionRootImage {
+            provision_transition_id,
+            expected_provisioned_head,
+            data_directory,
+            ..
+        } = &fixture.checkpoint.step
+        else {
+            unreachable!()
+        };
+        fixture
+            .authority
+            .set_head(expected_provisioned_head.clone());
+        let process = Arc::new(FakeProcessPort::exact(41, 42));
+        let retirement = Arc::new(FakeRetirementPort::exact());
+        let request = Arc::new(FakeRequestPort {
+            authority: Arc::clone(&fixture.authority),
+            calls: AtomicUsize::new(0),
+            conflict: false,
+            mutate_owner: false,
+            connect_failure: false,
+            identity_mismatch: false,
+        });
+        let mutations = Arc::new(NoSignedMutationPort::default());
+        let dispatcher = fixture.dispatcher_with_retirement(
+            Arc::clone(&process),
+            Arc::clone(&retirement),
+            Arc::clone(&request),
+            Arc::clone(&mutations),
+        );
+        let target_path = Path::new(data_directory.as_str()).join(
+            cats_blockd::target_control::target_control_authorization_file_name(
+                provision_transition_id,
+            ),
+        );
+        let record_path = Path::new(data_directory.as_str())
+            .join(super::super::serving_handoff::SERVING_HANDOFF_RECORD_FILE);
+
+        assert_eq!(
+            dispatcher
+                .apply(
+                    fixture.context_at(vec![fixture.public_process()], 4, 12),
+                    &fixture.desired,
+                )
+                .unwrap(),
+            RuntimeDesiredEffectOutcome::RefreshInventory
+        );
+        assert!(target_path.exists());
+        assert!(!record_path.exists());
+        assert_eq!(request.calls.load(Ordering::SeqCst), 0);
+        assert_eq!(process.starts.load(Ordering::SeqCst), 0);
+
+        assert_eq!(
+            dispatcher
+                .apply(
+                    fixture.context_at(vec![fixture.public_process()], 5, 13),
+                    &fixture.desired,
+                )
+                .unwrap(),
+            RuntimeDesiredEffectOutcome::RefreshInventory
+        );
+        assert!(record_path.exists());
+        let still_provision = FileCheckpointStore::open(
+            &fixture.state.path().join(CHECKPOINT_NAMESPACE),
+            &fixture.desired.cat_id,
+        )
+        .unwrap()
+        .load()
+        .unwrap()
+        .unwrap();
+        assert!(matches!(
+            still_provision.checkpoint().step,
+            ReconcileStep::ProvisionRootImage { .. }
+        ));
+        drop(still_provision);
+
+        assert_eq!(
+            dispatcher
+                .apply(
+                    fixture.context_at(vec![fixture.public_process()], 6, 14),
+                    &fixture.desired,
+                )
+                .unwrap(),
+            RuntimeDesiredEffectOutcome::RefreshInventory
+        );
+        let prepared = FileCheckpointStore::open(
+            &fixture.state.path().join(CHECKPOINT_NAMESPACE),
+            &fixture.desired.cat_id,
+        )
+        .unwrap()
+        .load()
+        .unwrap()
+        .unwrap();
+        let ReconcileStep::PrepareDevice {
+            ownership_token,
+            serving_process,
+            serving_authority,
+            frontend,
+            ..
+        } = &prepared.checkpoint().step
+        else {
+            panic!("third fresh target admission must perform only the Ready CAS")
+        };
+        assert_ne!(ownership_token, &serving_process.process_identity_token);
+        assert!(matches!(
+            serving_authority.as_ref(),
+            cats_api::runtime_reconciliation::ServingAuthorityProvenance::AfterRootProvision { .. }
+        ));
+        assert!(matches!(
+            frontend,
+            cats_api::runtime_reconciliation::PrepareDeviceFrontend::VhostUserBlk { .. }
+        ));
+        assert_eq!(request.calls.load(Ordering::SeqCst), 0);
+        assert_eq!(process.starts.load(Ordering::SeqCst), 0);
+        assert_eq!(mutations.calls.load(Ordering::SeqCst), 0);
+        assert_eq!(retirement.calls.load(Ordering::SeqCst), 2);
+    }
+
+    #[test]
+    fn superseded_target_wrapper_retirement_reopens_exact_launch_identity() {
+        let mut fixture = Fixture::new();
+        let ReconcileStep::ProvisionRootImage {
+            expected_provisioned_head,
+            ..
+        } = &fixture.checkpoint.step
+        else {
+            unreachable!()
+        };
+        fixture
+            .authority
+            .set_head(expected_provisioned_head.clone());
+        let process = Arc::new(FakeProcessPort::exact(41, 42));
+        let request = Arc::new(FakeRequestPort {
+            authority: Arc::clone(&fixture.authority),
+            calls: AtomicUsize::new(0),
+            conflict: false,
+            mutate_owner: false,
+            connect_failure: false,
+            identity_mismatch: false,
+        });
+        let dispatcher = fixture.dispatcher_with_retirement(
+            Arc::clone(&process),
+            Arc::new(FakeRetirementPort::exact()),
+            Arc::clone(&request),
+            Arc::new(NoSignedMutationPort::default()),
+        );
+        assert_eq!(
+            dispatcher
+                .apply(
+                    fixture.context(vec![fixture.public_process()]),
+                    &fixture.desired,
+                )
+                .unwrap(),
+            RuntimeDesiredEffectOutcome::RefreshInventory
+        );
+
+        // The target authorization now binds the target-wrapper CLI. Make the
+        // same durable checkpoint stale and prove retirement cannot fall back
+        // to the blank-control argv expectation.
+        fixture.desired.desired_revision = Revision::new(2).unwrap();
+        fixture.desired.runtime.memory_bytes += 4096;
+        fixture.desired.spec_digest = spec_digest(&fixture.desired).unwrap();
+        fixture.blob = Arc::new(ExactBlob::new(&fixture.desired));
+        let socket_path = fixture.control_socket_path();
+        let listener = UnixListener::bind(&socket_path).unwrap();
+        std::fs::set_permissions(&socket_path, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let retirement = Arc::new(TargetLaunchRetirementPort::default());
+        let effect = fixture.effect_with_ports(
+            Arc::clone(&process) as Arc<dyn RootProvisionProcessPort>,
+            Arc::clone(&retirement) as Arc<dyn RootProvisionProcessRetirementPort>,
+            Arc::clone(&request) as Arc<dyn RootProvisionRequestPort>,
+        );
+        assert_eq!(
+            effect
+                .try_apply(
+                    &fixture.context(vec![fixture.public_process()]),
+                    &fixture.desired,
+                )
+                .unwrap(),
+            Some(RuntimeDesiredEffectOutcome::RefreshInventory)
+        );
+        assert_eq!(retirement.calls.load(Ordering::SeqCst), 1);
+        assert_eq!(process.stops.load(Ordering::SeqCst), 1);
+        assert_eq!(request.calls.load(Ordering::SeqCst), 0);
+        assert!(fixture.stop_receipt_path().exists());
+        drop(listener);
     }
 
     #[test]

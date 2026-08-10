@@ -5,12 +5,12 @@
 //! scanner covers the physical clean-slate sources, including the bounded
 //! owner-Node Volume authority snapshot; no production full inventory is
 //! claimed from point reads. The first production effect is exactly one A22
-//! signed NormalAcquire after an accepted full inventory; it advances only to
-//! a durable `ProvisionRootImage` checkpoint and forces another full scan.
-//! Process, device, network and VMM effects remain unreachable until their own
-//! identity-aware scan bridges are composed. This path does not construct
-//! `NodeRuntime`, adopt a legacy ledger, or run a destructive residue/device
-//! sweep.
+//! signed NormalAcquire after an accepted full inventory. The composed Root
+//! prefix now continues through exact target-control handoff and the
+//! checkpoint-only `PrepareDevice` transition; starting the serving process or
+//! a device remains a later fresh-inventory effect. This path does not
+//! construct `NodeRuntime`, adopt a legacy ledger, or run a destructive
+//! residue/device sweep.
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -25,11 +25,12 @@ use cats_storage::authority::{RuntimeVolumeInventoryAuthority, VolumeDataAuthori
 use cats_storage::BlobStore;
 
 use crate::agent_registration::AgentRegistrationConfig;
-use crate::ch::ChConfig;
+use crate::ch::{BlockPath, ChConfig};
 use crate::runtime::reconciliation::{
-    installed_clean_slate_scanner, installed_root_process_retirement_port,
-    AuthorizedBlockdLaunchConfig, ControlSignedNormalAcquireClient, InstalledCleanSlateProbeConfig,
-    RootProvisionSystemdConfig, RuntimeVolumeTransitionHttpClient, SignedRunningAcquireEffect,
+    installed_clean_slate_scanner, installed_root_process_global_port,
+    installed_root_process_retirement_port, AuthorizedBlockdLaunchConfig,
+    ControlSignedNormalAcquireClient, InstalledCleanSlateProbeConfig, RootProvisionSystemdConfig,
+    RuntimeVolumeTransitionHttpClient, ServingPrepareFrontend, SignedRunningAcquireEffect,
     SignedRunningEffect, SignedRunningPublicationRecovery,
 };
 use crate::runtime_spine::{
@@ -227,6 +228,22 @@ async fn spawn_signed_runtime_cutover_with_scanner(
     let effect_root_process_retirement =
         installed_root_process_retirement_port(installed_probe_config.clone())
             .context("compose sealed root-process retirement inventory")?;
+    let effect_root_process_global =
+        installed_root_process_global_port(installed_probe_config.clone())
+            .context("compose sealed Node-global root-process inventory")?;
+    let effect_prepare_frontend = match config.ch_config.block_path {
+        BlockPath::KernelNbd => ServingPrepareFrontend::kernel_nbd(
+            config.agent_registration.runtime_state_directory(),
+            config.ch_config.nbd_client_bin.clone(),
+            config.ch_config.nbd_devices,
+        )
+        .context("compose kernel-NBD PrepareDevice reservation")?,
+        BlockPath::VhostUser => ServingPrepareFrontend::vhost_user_blk(
+            config.ch_config.vhost_user_queues,
+            config.ch_config.vhost_user_queue_size,
+        )
+        .context("compose vhost-user PrepareDevice plan")?,
+    };
     let session = config
         .agent_registration
         .register_until_session(&config.control_plane_url)
@@ -294,6 +311,8 @@ async fn spawn_signed_runtime_cutover_with_scanner(
             effect_blob_store,
             effect_root_provision_systemd,
             Arc::clone(&effect_root_process_retirement),
+            effect_root_process_global,
+            effect_prepare_frontend,
         )
         .context("compose signed Running root provision prefix")?;
         let recovery = SignedRunningPublicationRecovery::with_root_process_retirement(

@@ -1316,7 +1316,13 @@ pub fn file_disk_arg(path: &str, direct: bool) -> String {
 /// Cat. The Guest driver maps queues to vCPUs anyway, so more queues than vCPUs
 /// would buy nothing.
 pub fn vhost_user_queues_for(cfg: &ChConfig, cpus: u32) -> usize {
-    cfg.vhost_user_queues.clamp(1, cpus.max(1) as usize)
+    effective_vhost_user_queues(cfg.vhost_user_queues, cpus)
+}
+
+/// Shared projection used when the signed Runtime composer freezes only the
+/// vhost fields it needs instead of retaining the wider VMM configuration.
+pub(crate) fn effective_vhost_user_queues(maximum_queues: usize, cpus: u32) -> usize {
+    maximum_queues.clamp(1, cpus.max(1) as usize)
 }
 
 /// `--disk` argument for a `cats-blockd` vhost-user-blk backend.

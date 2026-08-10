@@ -4,8 +4,9 @@
 //! This slice owns only the current exact `ProvisionRootImage` target phase.
 //! It publishes the target-control artifact, starts/adopts a strict target
 //! wrapper, or seals the handoff record—never more than one physical effect
-//! from one accepted full inventory. It deliberately does not persist
-//! `PrepareDevice` or create any serving/device/VMM/network state.
+//! from one accepted full inventory. The production dispatcher may consume a
+//! returned `Ready` only by the CAS-only `PrepareDevice` effect below; neither
+//! slice creates serving/device/VMM/network state in that round.
 
 use std::path::Path;
 use std::sync::Arc;
@@ -13,22 +14,27 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::Context as _;
 use cats_api::runtime_reconciliation::{
-    encode_desired_runtime_spec, AppliedDesiredEvidence, CheckpointEvidence, Condition,
-    ContractVersion, ControlHandshakeEvidence, DesiredRuntimeSpec, DiskKind,
-    GuestTransportEvidence, HostPath, LifecycleAdmission, LocalLineageState, ObservedDiskKind,
-    ObservedRuntimeStatus, OwnershipTokenEvidence, ProcessRole, ProcessState, ProgressingReason,
-    RandomId128, ReconcileStep, RuntimeTarget, RuntimeTransition, UnixMillis, VolumeAccess,
-    VolumeAcquire, VolumeAuthorityEvidence, VolumeDisposition, VolumeIntent, VolumeRecord,
-    WarmSnapshotEvidence,
+    encode_desired_runtime_spec, encode_runtime_checkpoint, AppliedDesiredEvidence,
+    CheckpointEvidence, Condition, ContractVersion, ControlHandshakeEvidence, DesiredRuntimeSpec,
+    DiskKind, GuestTransportEvidence, HostPath, Id, LifecycleAdmission, LocalLineageState,
+    ObservedDiskKind, ObservedRuntimeStatus, OwnershipTokenEvidence, PrepareDeviceFrontend,
+    ProcessRole, ProcessState, ProgressingReason, RandomId128, ReconcileStep, RuntimeCheckpoint,
+    RuntimeTarget, RuntimeTransition, ServingAuthorityProvenance, ServingBlockdIdentity,
+    UnixMillis, VolumeAccess, VolumeAcquire, VolumeAuthorityEvidence, VolumeDisposition,
+    VolumeIntent, VolumeRecord, WarmSnapshotEvidence,
 };
 use cats_storage::authority::{
     validate_volume_record, AttachmentLineageIdentity, VolumeDataAuthority,
 };
 use cats_storage::BlobStore;
 
+use crate::ch::effective_vhost_user_queues;
 use crate::runtime_spine::RuntimeDesiredEffectContext;
+use crate::state_directory::StateDirectory;
 
 use super::clean_slate_probes::CHECKPOINT_NAMESPACE;
+#[cfg(target_os = "linux")]
+use super::kernel_nbd::{KernelNbdInventoryConfig, KernelNbdInventoryPort};
 use super::root_provision_process::{
     retain_target_control_process_start, RootProvisionAuthoritySnapshot,
     RootProvisionProcessConflict, RootProvisionProcessEvidence, RootProvisionProcessExpectation,
@@ -43,7 +49,415 @@ use super::serving_handoff::{
 use super::signed_running::{
     expected_provision_heads, provision_checkpoint_is_bound, ProvisionHeadRead,
 };
-use super::{AuthorizedBlockdStore, FileCheckpointStore};
+use super::{AuthorizedBlockdStore, FileCheckpointStore, StoredCheckpoint};
+
+const SERVING_SCOPE_PREFIX: &str = "cats-serving-";
+const SERVING_SCOPE_SUFFIX: &str = ".service";
+const SERVING_CONTROL_SOCKET_BASENAME: &str = "serving-control.sock";
+#[cfg(target_os = "linux")]
+const SERVING_NBD_SOCKET_BASENAME: &str = "serving-nbd.sock";
+const SERVING_VHOST_SOCKET_BASENAME: &str = "serving-vhost.sock";
+
+/// Frozen Node-local frontend inputs for the one durable transition from a
+/// sealed Root handoff to `PrepareDevice`. The wider Cloud Hypervisor config
+/// is projected once at production composition; the effect cannot silently
+/// choose a different block path later.
+#[derive(Debug, Clone)]
+pub(crate) enum ServingPrepareFrontend {
+    #[cfg(target_os = "linux")]
+    KernelNbd(KernelNbdInventoryPort),
+    #[cfg(not(target_os = "linux"))]
+    KernelNbdUnsupported,
+    VhostUserBlk {
+        maximum_queues: usize,
+        queue_size: u16,
+    },
+}
+
+impl ServingPrepareFrontend {
+    pub(crate) fn kernel_nbd(
+        state_directory: StateDirectory,
+        nbd_client_binary: std::path::PathBuf,
+        device_count: u32,
+    ) -> anyhow::Result<Self> {
+        anyhow::ensure!(
+            nbd_client_binary.is_absolute(),
+            "kernel-NBD client binary must be absolute"
+        );
+        anyhow::ensure!(device_count > 0, "kernel-NBD pool must not be empty");
+        #[cfg(target_os = "linux")]
+        {
+            let config = KernelNbdInventoryConfig::installed(
+                state_directory,
+                nbd_client_binary,
+                device_count,
+            )?;
+            Ok(Self::KernelNbd(KernelNbdInventoryPort::new(config)))
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            let _ = (state_directory, nbd_client_binary, device_count);
+            Ok(Self::KernelNbdUnsupported)
+        }
+    }
+
+    pub(crate) fn vhost_user_blk(maximum_queues: usize, queue_size: u16) -> anyhow::Result<Self> {
+        anyhow::ensure!(
+            maximum_queues > 0,
+            "vhost-user queue maximum must be positive"
+        );
+        cats_blockd::frontend_contract::validate_authorized_vhost_shape(1, queue_size)
+            .context("vhost-user queue size is outside the authorized-serving contract")?;
+        Ok(Self::VhostUserBlk {
+            maximum_queues,
+            queue_size,
+        })
+    }
+}
+
+/// The only durable effect allowed after [`ServingHandoffEffect`] returns
+/// `Ready`. It creates no process, socket or device; the new checkpoint is the
+/// recovery authority for those later one-effect rounds.
+pub(crate) struct ServingPrepareDeviceEffect {
+    frontend: ServingPrepareFrontend,
+    executable_path: HostPath,
+    #[cfg(test)]
+    after_replace: Option<Arc<dyn Fn() + Send + Sync>>,
+}
+
+impl ServingPrepareDeviceEffect {
+    pub(crate) fn new(
+        frontend: ServingPrepareFrontend,
+        executable_path: HostPath,
+    ) -> anyhow::Result<Self> {
+        anyhow::ensure!(
+            Path::new(executable_path.as_str()).is_absolute(),
+            "serving PrepareDevice blockd executable must be absolute"
+        );
+        Ok(Self {
+            frontend,
+            executable_path,
+            #[cfg(test)]
+            after_replace: None,
+        })
+    }
+
+    #[cfg(test)]
+    pub(crate) fn with_after_replace(mut self, hook: Arc<dyn Fn() + Send + Sync>) -> Self {
+        self.after_replace = Some(hook);
+        self
+    }
+
+    pub(crate) fn persist(
+        &self,
+        context: &RuntimeDesiredEffectContext,
+        desired: &DesiredRuntimeSpec,
+        ready: &ServingHandoffReady,
+    ) -> anyhow::Result<()> {
+        context.check_active()?;
+        // `ready` already owns the attachment-directory flock. Preserve the
+        // established attachment -> per-Cat checkpoint -> Node-global NBD
+        // order. Every filesystem lock in that order is acquired with `NB`,
+        // so a competing owner fails this admission instead of forming a
+        // wait edge while the retained artifact descriptors stay live.
+        let checkpoint_directory = context.state_directory().path().join(CHECKPOINT_NAMESPACE);
+        let store = FileCheckpointStore::open_preserving_checkpoint_temp(
+            &checkpoint_directory,
+            &desired.cat_id,
+        )
+        .context("open current checkpoint for sealed Root handoff consumption")?;
+        let stored = store
+            .load()
+            .context("load current checkpoint for sealed Root handoff consumption")?
+            .context("sealed Root handoff lost its predecessor checkpoint")?;
+        anyhow::ensure!(
+            stored.content_digest() == &ready.record().checkpoint_content_digest,
+            "sealed Root handoff predecessor digest is no longer current"
+        );
+        anyhow::ensure!(
+            ready.record().expected_control_executable_path == self.executable_path
+                && ready.old_control_process().executable_path == self.executable_path,
+            "sealed Root handoff executable differs from current production blockd config"
+        );
+        validate_prepare_predecessor(desired, &stored, ready)?;
+        context.check_active()?;
+
+        ready.consume_for_prepare_device(&stored, |handoff| match &self.frontend {
+            #[cfg(target_os = "linux")]
+            ServingPrepareFrontend::KernelNbd(port) => port
+                .reserve_and_replace(context, &store, &stored, |device_path| {
+                    prepare_device_successor(
+                        desired,
+                        &stored,
+                        ready,
+                        handoff,
+                        PrepareDeviceFrontend::KernelNbd {
+                            listener_socket_path: serving_path(
+                                &ready.old_control_process().data_directory,
+                                SERVING_NBD_SOCKET_BASENAME,
+                            )?,
+                            device_path,
+                        },
+                    )
+                })
+                .map(|_| ()),
+            #[cfg(not(target_os = "linux"))]
+            ServingPrepareFrontend::KernelNbdUnsupported => {
+                anyhow::bail!("kernel-NBD PrepareDevice composition requires Linux")
+            }
+            ServingPrepareFrontend::VhostUserBlk {
+                maximum_queues,
+                queue_size,
+            } => {
+                let queues = effective_vhost_user_queues(*maximum_queues, desired.runtime.vcpus);
+                let queues = u16::try_from(queues)
+                    .context("effective vhost-user queue count exceeds the wire range")?;
+                cats_blockd::frontend_contract::validate_authorized_vhost_shape(
+                    usize::from(queues),
+                    *queue_size,
+                )
+                .context("effective vhost-user shape is outside the authorized-serving contract")?;
+                let successor = prepare_device_successor(
+                    desired,
+                    &stored,
+                    ready,
+                    handoff,
+                    PrepareDeviceFrontend::VhostUserBlk {
+                        socket_path: serving_path(
+                            &ready.old_control_process().data_directory,
+                            SERVING_VHOST_SOCKET_BASENAME,
+                        )?,
+                        queues,
+                        queue_size: *queue_size,
+                    },
+                )?;
+                context.check_active()?;
+                store
+                    .replace(&stored, &successor)
+                    .context("atomically replace Root handoff with PrepareDevice")?;
+                #[cfg(test)]
+                if let Some(hook) = &self.after_replace {
+                    hook();
+                }
+                context.check_active()?;
+                Ok(())
+            }
+        })
+    }
+}
+
+fn checkpoint_is_current_exact(
+    desired: &DesiredRuntimeSpec,
+    runtime: &ObservedRuntimeStatus,
+) -> bool {
+    matches!(
+        &runtime.checkpoint,
+        CheckpointEvidence::Valid {
+            version,
+            cat_id,
+            node_id,
+            desired_revision,
+            spec_digest,
+            placement_epoch,
+            runtime_incarnation,
+            stable_state,
+            step,
+            ..
+        } if *version == ContractVersion::V1
+            && cat_id == &desired.cat_id
+            && node_id == &desired.placement.node_id
+            && *placement_epoch == desired.placement.placement_epoch
+            && *desired_revision == desired.desired_revision
+            && spec_digest == &desired.spec_digest
+            && runtime_incarnation.is_none()
+            && stable_state.is_none()
+            && step.as_ref() == &runtime.step
+    )
+}
+
+fn validate_prepare_predecessor(
+    desired: &DesiredRuntimeSpec,
+    stored: &StoredCheckpoint,
+    ready: &ServingHandoffReady,
+) -> anyhow::Result<()> {
+    let checkpoint = stored.checkpoint();
+    let record = ready.record();
+    let attachment = &ready.target_control_authorization().artifact.attachment;
+    let [intent] = desired.volumes.as_slice() else {
+        anyhow::bail!("Root handoff PrepareDevice requires one Desired volume")
+    };
+    let ReconcileStep::ProvisionRootImage {
+        provision_transition_id,
+        volume_id,
+        attachment_id,
+        attachment_epoch,
+        data_directory,
+        size_bytes,
+        expected_provisioned_head,
+        ..
+    } = &checkpoint.step
+    else {
+        anyhow::bail!("Root handoff predecessor is not provision_root_image")
+    };
+    anyhow::ensure!(
+        checkpoint.cat_id == desired.cat_id
+            && checkpoint.node_id == desired.placement.node_id
+            && checkpoint.placement_epoch == desired.placement.placement_epoch
+            && checkpoint.desired_revision == desired.desired_revision
+            && checkpoint.spec_digest == desired.spec_digest
+            && checkpoint.runtime_incarnation.is_none()
+            && checkpoint.stable_state.is_none()
+            && record.cat_id == desired.cat_id
+            && record.node_id == desired.placement.node_id
+            && record.placement_epoch == desired.placement.placement_epoch
+            && record.desired_revision == desired.desired_revision
+            && record.spec_digest == desired.spec_digest,
+        "Root handoff predecessor is not the frozen current Desired"
+    );
+    anyhow::ensure!(
+        matches!(intent.disk_kind, DiskKind::Root)
+            && matches!(intent.access, VolumeAccess::ReadWriteOnce)
+            && matches!(intent.disposition, VolumeDisposition::Retain)
+            && *volume_id == intent.volume_id
+            && *volume_id == record.volume_id
+            && *volume_id == attachment.identity.volume_id
+            && *attachment_id == intent.attachment_id
+            && *attachment_id == record.attachment_id
+            && *attachment_id == attachment.identity.attachment_id
+            && *attachment_epoch == record.attachment_epoch
+            && *attachment_epoch == attachment.identity.attachment_epoch
+            && attachment.identity.acquire_origin == record.acquire_origin
+            && *provision_transition_id == record.provision_transition_id
+            && *size_bytes == intent.size_bytes
+            && *size_bytes == attachment.size_bytes
+            && attachment.durability == intent.durability
+            && *expected_provisioned_head == record.expected_provisioned_head
+            && *expected_provisioned_head == attachment.head
+            && *data_directory == ready.old_control_process().data_directory,
+        "Root handoff predecessor, target artifact and Desired lineage disagree"
+    );
+    Ok(())
+}
+
+fn prepare_device_successor(
+    desired: &DesiredRuntimeSpec,
+    stored: &StoredCheckpoint,
+    ready: &ServingHandoffReady,
+    handoff: cats_api::runtime_reconciliation::RootServingHandoff,
+    frontend: PrepareDeviceFrontend,
+) -> anyhow::Result<RuntimeCheckpoint> {
+    validate_prepare_predecessor(desired, stored, ready)?;
+    let [intent] = desired.volumes.as_slice() else {
+        unreachable!("predecessor validation requires one Root volume")
+    };
+    let attachment = &ready.target_control_authorization().artifact.attachment;
+    let old_process = ready.old_control_process();
+    let process_identity_token = fresh_identity_token(&[&old_process.ownership_token])?;
+    let ownership_token =
+        fresh_identity_token(&[&old_process.ownership_token, &process_identity_token])?;
+    anyhow::ensure!(
+        process_identity_token != ownership_token,
+        "serving process and Guest device tokens must be independent"
+    );
+    let scope_id = Id::new(format!(
+        "{SERVING_SCOPE_PREFIX}{}{SERVING_SCOPE_SUFFIX}",
+        process_identity_token.as_str()
+    ))
+    .context("fresh serving process token does not form a canonical scope")?;
+    let control_socket_path =
+        serving_path(&old_process.data_directory, SERVING_CONTROL_SOCKET_BASENAME)?;
+
+    let mut checkpoint = stored.checkpoint().clone();
+    checkpoint.step = ReconcileStep::PrepareDevice {
+        volume_id: attachment.identity.volume_id.clone(),
+        attachment_id: attachment.identity.attachment_id.clone(),
+        attachment_epoch: attachment.identity.attachment_epoch,
+        acquire_origin: attachment.identity.acquire_origin.clone(),
+        expected_head: attachment.head.clone(),
+        size_bytes: attachment.size_bytes,
+        durability: attachment.durability,
+        guest_device: intent.guest_device.clone(),
+        ownership_token,
+        serving_authority: Box::new(ServingAuthorityProvenance::AfterRootProvision { handoff }),
+        serving_process: ServingBlockdIdentity {
+            scope_id,
+            control_socket_path,
+            data_directory: old_process.data_directory.clone(),
+            executable_path: ready.record().expected_control_executable_path.clone(),
+            process_identity_token,
+        },
+        frontend,
+    };
+    let [observed] = checkpoint.volumes.as_mut_slice() else {
+        anyhow::bail!("Root handoff predecessor does not carry one observed volume")
+    };
+    anyhow::ensure!(
+        observed.volume_id == intent.volume_id
+            && observed.disk_kind == ObservedDiskKind::Root
+            && observed.size_bytes == Some(attachment.size_bytes)
+            && observed.durability == Some(attachment.durability)
+            && !observed.local_lineages.is_empty(),
+        "Root handoff predecessor observed volume is not the frozen Root lineage"
+    );
+    observed.authority = VolumeAuthorityEvidence::Owned {
+        attachment_id: attachment.identity.attachment_id.clone(),
+        attachment_epoch: attachment.identity.attachment_epoch,
+        head: attachment.head.clone(),
+    };
+    for lineage in &mut observed.local_lineages {
+        anyhow::ensure!(
+            lineage.attachment_id == attachment.identity.attachment_id
+                && lineage.attachment_epoch == attachment.identity.attachment_epoch
+                && lineage.acquire_origin == attachment.identity.acquire_origin
+                && lineage.data_directory == old_process.data_directory
+                && lineage.state == LocalLineageState::Active
+                && !lineage.fenced,
+            "Root handoff predecessor contains another local lineage"
+        );
+        lineage.local_durable_generation = attachment.head.generation;
+        lineage.remote_durable_generation = attachment.head.generation;
+    }
+    checkpoint.updated_at_unix_ms = monotonic_wall_clock(stored)?;
+    encode_runtime_checkpoint(&checkpoint)
+        .context("constructed Root handoff PrepareDevice checkpoint is not canonical V1")?;
+    Ok(checkpoint)
+}
+
+fn fresh_identity_token(excluded: &[&RandomId128]) -> anyhow::Result<RandomId128> {
+    let token = RandomId128::new(uuid::Uuid::new_v4().simple().to_string())
+        .context("generate fresh Runtime physical identity token")?;
+    anyhow::ensure!(
+        excluded.iter().all(|candidate| **candidate != token),
+        "fresh Runtime physical identity token collided with retained authority"
+    );
+    Ok(token)
+}
+
+fn serving_path(data_directory: &HostPath, basename: &str) -> anyhow::Result<HostPath> {
+    let path = Path::new(data_directory.as_str()).join(basename);
+    let path = path
+        .to_str()
+        .context("serving path is not UTF-8")?
+        .to_owned();
+    HostPath::new(path).context("serving path is not a canonical absolute HostPath")
+}
+
+fn monotonic_wall_clock(stored: &StoredCheckpoint) -> anyhow::Result<UnixMillis> {
+    let wall_clock_ms = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .context("system clock precedes the Unix epoch")?
+        .as_millis();
+    let wall_clock_ms =
+        u64::try_from(wall_clock_ms).context("system time exceeds the Runtime wire range")?;
+    let minimum = stored
+        .checkpoint()
+        .updated_at_unix_ms
+        .get()
+        .checked_add(1)
+        .context("PrepareDevice checkpoint timestamp exhausted")?;
+    UnixMillis::new(wall_clock_ms.max(minimum))
+        .context("PrepareDevice checkpoint timestamp is outside the Runtime wire range")
+}
 
 #[derive(Debug)]
 pub(crate) enum ServingHandoffEffectProgress {
@@ -94,6 +508,9 @@ impl ServingHandoffEffect {
         if !matches!(runtime.step, ReconcileStep::ProvisionRootImage { .. }) {
             return Ok(ServingHandoffEffectProgress::NotApplicable);
         }
+        if !checkpoint_is_current_exact(desired, runtime) {
+            return Ok(ServingHandoffEffectProgress::NotApplicable);
+        }
         anyhow::ensure!(
             base_admission_is_exact(accepted, desired, runtime),
             "serving handoff lacks an exact current ProvisionRootImage admission"
@@ -123,6 +540,9 @@ impl ServingHandoffEffect {
         };
         let (identity, observed_head) = observed_lineage(runtime, volume, data_directory)
             .context("serving handoff lacks the exact observed Root lineage")?;
+        if observed_head == blank {
+            return Ok(ServingHandoffEffectProgress::NotApplicable);
+        }
         anyhow::ensure!(
             observed_head == target,
             "serving handoff accepted authority is not the exact provision target"
