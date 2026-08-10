@@ -30,6 +30,7 @@ mod inventory;
     reason = "sealed kernel-NBD attach provider is staged before production composition"
 )]
 mod kernel_nbd;
+mod network;
 mod normal_acquire;
 mod prepare_device_retirement;
 mod root_provision;
@@ -109,7 +110,9 @@ pub use root_provision::{
     RootProvisionResponseHint, RootProvisionUnknownReason, UnixRootProvisionClient,
 };
 pub(crate) use serving_handoff_effect::ServingPrepareFrontend;
-pub(crate) use signed_root_provision::{SignedRunningEffect, SignedRunningProcessPorts};
+pub(crate) use signed_root_provision::{
+    SignedRunningEffect, SignedRunningHostConfig, SignedRunningProcessPorts,
+};
 pub(crate) use signed_running::{SignedRunningAcquireEffect, SignedRunningPublicationRecovery};
 // This crate-private seam is landed before the systemd composition that
 // consumes it; keeping the re-export here prevents feature code from reaching

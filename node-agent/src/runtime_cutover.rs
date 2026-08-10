@@ -8,8 +8,10 @@
 //! signed NormalAcquire after an accepted full inventory. The composed Root
 //! prefix now continues through exact target-control handoff and the
 //! checkpoint-only `PrepareDevice` transition, old-process retirement, and
-//! one-effect start/adoption of the exact serving blockd. Kernel-NBD
-//! attachment and VMM/device consumption remain later fresh-inventory effects.
+//! one-effect start/adoption of the exact serving blockd. The vhost-user path
+//! then reserves its exact Host network in a separate checkpoint-only round.
+//! Kernel-NBD attachment, TAP creation, and VMM/device consumption remain
+//! later fresh-inventory effects.
 //! This path does not construct `NodeRuntime`, adopt a legacy ledger, or run a
 //! destructive residue/device sweep.
 
@@ -31,8 +33,8 @@ use crate::runtime::reconciliation::{
     installed_clean_slate_scanner, installed_root_process_effect_ports,
     AuthorizedBlockdLaunchConfig, ControlSignedNormalAcquireClient, InstalledCleanSlateProbeConfig,
     RootProvisionSystemdConfig, RuntimeVolumeTransitionHttpClient, ServingPrepareFrontend,
-    SignedRunningAcquireEffect, SignedRunningEffect, SignedRunningProcessPorts,
-    SignedRunningPublicationRecovery,
+    SignedRunningAcquireEffect, SignedRunningEffect, SignedRunningHostConfig,
+    SignedRunningProcessPorts, SignedRunningPublicationRecovery,
 };
 use crate::runtime_spine::{
     RuntimeInventoryScanner, RuntimeSpineDeadlinePolicy, RuntimeSpineHttpClient,
@@ -276,6 +278,7 @@ async fn spawn_signed_runtime_cutover_with_scanner(
     let effect_blob_store = Arc::clone(&config.blob_store);
     let effect_lease_duration_ms = config.volume_lease_duration_ms;
     let effect_state_directory = config.agent_registration.runtime_state_directory();
+    let effect_network_ip_binary = config.ch_config.ip_bin.clone();
     let runner = tokio::task::spawn_blocking(move || {
         #[cfg(not(test))]
         let volume_transition_transport = RuntimeVolumeTransitionHttpClient::for_production(
@@ -308,7 +311,11 @@ async fn spawn_signed_runtime_cutover_with_scanner(
             acquire,
             Arc::clone(&effect_volume_authority),
             effect_blob_store,
-            effect_root_provision_systemd,
+            SignedRunningHostConfig::new(
+                effect_root_provision_systemd,
+                effect_state_directory.clone(),
+                effect_network_ip_binary,
+            ),
             SignedRunningProcessPorts::new(
                 Arc::clone(&effect_root_process_ports.retirement),
                 Arc::clone(&effect_root_process_ports.global),

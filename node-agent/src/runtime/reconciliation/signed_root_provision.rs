@@ -6,7 +6,7 @@
 //! process. Every mutation returns `RefreshInventory`; target-control reload,
 //! serving handoff, and `PrepareDevice` remain separate later effects.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Instant;
 
@@ -28,12 +28,14 @@ use crate::runtime_spine::{
     RuntimeDesiredEffect, RuntimeDesiredEffectContext, RuntimeDesiredEffectOutcome,
     RuntimeDesiredEffectStopReason,
 };
+use crate::state_directory::StateDirectory;
 
 use super::authorized_blockd::{
     ExactControlSocketCleanup, RootProvisionStopReceipt, StopReceiptPublication,
     StopReceiptSettlement,
 };
 use super::clean_slate_probes::CHECKPOINT_NAMESPACE;
+use super::network::PrepareNetworkReservationEffect;
 use super::prepare_device_retirement::PrepareDeviceTargetRetirementEffect;
 use super::root_provision_process::{
     inspect_exact_root_provision_process, prove_exact_root_provision_process_absence,
@@ -136,12 +138,33 @@ pub(crate) struct SignedRunningEffect {
     prepare_device: ServingPrepareDeviceEffect,
     prepare_device_retirement: Option<PrepareDeviceTargetRetirementEffect>,
     serving_process: Option<ServingBlockdStartEffect>,
+    prepare_network: Option<PrepareNetworkReservationEffect>,
 }
 
 pub(crate) struct SignedRunningProcessPorts {
     retirement: Arc<dyn RootProvisionProcessRetirementPort>,
     root_global: Arc<dyn RootProvisionProcessGlobalPort>,
     serving_global: Arc<dyn ServingBlockdProcessGlobalPort>,
+}
+
+pub(crate) struct SignedRunningHostConfig {
+    systemd: RootProvisionSystemdConfig,
+    state_directory: StateDirectory,
+    network_ip_binary: PathBuf,
+}
+
+impl SignedRunningHostConfig {
+    pub(crate) fn new(
+        systemd: RootProvisionSystemdConfig,
+        state_directory: StateDirectory,
+        network_ip_binary: PathBuf,
+    ) -> Self {
+        Self {
+            systemd,
+            state_directory,
+            network_ip_binary,
+        }
+    }
 }
 
 impl SignedRunningProcessPorts {
@@ -163,10 +186,15 @@ impl SignedRunningEffect {
         acquire: SignedRunningAcquireEffect,
         authority: Arc<dyn VolumeDataAuthority>,
         blob: Arc<dyn BlobStore>,
-        systemd: RootProvisionSystemdConfig,
+        host: SignedRunningHostConfig,
         process_ports: SignedRunningProcessPorts,
         prepare_frontend: ServingPrepareFrontend,
     ) -> anyhow::Result<Self> {
+        let SignedRunningHostConfig {
+            systemd,
+            state_directory,
+            network_ip_binary,
+        } = host;
         let executable = systemd
             .blockd_binary()
             .to_str()
@@ -204,6 +232,10 @@ impl SignedRunningEffect {
             prepare_device: ServingPrepareDeviceEffect::new(prepare_frontend, executable_path)?,
             prepare_device_retirement: Some(prepare_device_retirement),
             serving_process: Some(serving_process_effect),
+            prepare_network: Some(PrepareNetworkReservationEffect::new(
+                state_directory,
+                network_ip_binary,
+            )?),
         })
     }
 }
@@ -224,6 +256,11 @@ impl RuntimeDesiredEffect for SignedRunningEffect {
                 return Ok(outcome);
             }
         }
+        if let Some(prepare_network) = &self.prepare_network {
+            if let Some(outcome) = prepare_network.try_apply(&context, desired)? {
+                return Ok(outcome);
+            }
+        }
         match self.handoff.try_apply(&context, desired)? {
             ServingHandoffEffectProgress::NotApplicable => {}
             ServingHandoffEffectProgress::RefreshInventory => {
@@ -237,19 +274,18 @@ impl RuntimeDesiredEffect for SignedRunningEffect {
         if let Some(outcome) = self.provision.try_apply(&context, desired)? {
             return Ok(outcome);
         }
-        if current_prepare_device_waits_for_later_effect(&context, desired)? {
-            // `PrepareDevice` is owned by the serving/device suffix.  Until
-            // the next bounded serving effect is composed here, preserve its
-            // current checkpoint and demand a fresh full inventory instead
-            // of falling back into the pre-acquire planner (which correctly
-            // rejects later steps with StopLocal).
+        if current_prelaunch_waits_for_later_effect(&context, desired)? {
+            // The remaining PrepareDevice/PrepareNetwork/StartRuntime suffix
+            // is checkpoint-first. Preserve any exact current later step and
+            // demand a fresh full inventory instead of falling into the
+            // pre-acquire planner, which correctly rejects later phases.
             return Ok(RuntimeDesiredEffectOutcome::RefreshInventory);
         }
         self.acquire.apply(context, desired)
     }
 }
 
-fn current_prepare_device_waits_for_later_effect(
+fn current_prelaunch_waits_for_later_effect(
     context: &RuntimeDesiredEffectContext,
     desired: &DesiredRuntimeSpec,
 ) -> anyhow::Result<bool> {
@@ -257,8 +293,12 @@ fn current_prepare_device_waits_for_later_effect(
     let Some(runtime) = unique_runtime(&accepted.observation().runtimes, desired) else {
         return Ok(false);
     };
-    Ok(matches!(runtime.step, ReconcileStep::PrepareDevice { .. })
-        && signed_inventory_admission_is_exact(accepted, desired, runtime)
+    Ok(matches!(
+        runtime.step,
+        ReconcileStep::PrepareDevice { .. }
+            | ReconcileStep::PrepareNetwork { .. }
+            | ReconcileStep::StartRuntime { .. }
+    ) && signed_inventory_admission_is_exact(accepted, desired, runtime)
         && checkpoint_is_current_exact(desired, runtime))
 }
 
@@ -2240,6 +2280,7 @@ mod tests {
                 prepare_device,
                 prepare_device_retirement: None,
                 serving_process: None,
+                prepare_network: None,
             }
         }
     }
