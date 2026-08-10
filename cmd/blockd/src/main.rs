@@ -511,9 +511,8 @@ impl AuthorizedServingInput {
 }
 
 struct ValidatedServingHandoff {
-    data_directory_path: PathBuf,
-    data_directory: File,
-    data_directory_identity: LocalFileMetadata,
+    data_directory: RetainedPrivateDirectory,
+    local_state: RetainedTargetLocalState,
     record: RetainedPrivateFile,
     target: RetainedPrivateFile,
     decoded: ServingHandoffRecord,
@@ -529,35 +528,177 @@ impl ValidatedServingHandoff {
     }
 
     fn assert_current(&self) -> Result<()> {
-        let retained_directory = self
-            .data_directory
-            .metadata()
-            .context("reinspect retained serving handoff directory")?;
-        if LocalFileMetadata::from_metadata(&retained_directory) != self.data_directory_identity {
-            bail!("retained serving handoff directory changed identity");
-        }
-        let lexical_directory = open_private_directory(&self.data_directory_path)?;
-        let lexical_identity = LocalFileMetadata::from_metadata(
-            &lexical_directory
-                .metadata()
-                .context("reinspect lexical serving handoff directory")?,
-        );
-        if lexical_identity != self.data_directory_identity {
-            bail!("serving handoff directory path changed identity");
-        }
+        let lexical_directory = self.local_state.assert_current(&self.data_directory)?;
         self.record.assert_current(
-            &self.data_directory,
+            &self.data_directory.file,
             &lexical_directory,
             SERVING_HANDOFF_RECORD_MAX_BYTES,
         )?;
         self.target.assert_current(
-            &self.data_directory,
+            &self.data_directory.file,
             &lexical_directory,
             TARGET_CONTROL_AUTHORIZATION_MAX_BYTES,
         )?;
         Ok(())
     }
 }
+
+struct RetainedPrivateDirectory {
+    path: PathBuf,
+    file: File,
+    identity: LocalFileMetadata,
+}
+
+impl RetainedPrivateDirectory {
+    fn open(path: &Path) -> Result<Self> {
+        let file = open_private_directory(path)?;
+        let identity = LocalFileMetadata::from_metadata(
+            &file
+                .metadata()
+                .with_context(|| format!("inspect retained directory {}", path.display()))?,
+        );
+        Ok(Self {
+            path: path.to_path_buf(),
+            file,
+            identity,
+        })
+    }
+
+    fn assert_retained(&self) -> Result<()> {
+        let current =
+            LocalFileMetadata::from_metadata(&self.file.metadata().with_context(|| {
+                format!("reinspect retained directory {}", self.path.display())
+            })?);
+        if current != self.identity {
+            bail!(
+                "retained directory {} changed identity",
+                self.path.display()
+            );
+        }
+        Ok(())
+    }
+
+    fn open_current_lexical(&self) -> Result<File> {
+        self.assert_retained()?;
+        let lexical = open_private_directory(&self.path)?;
+        let lexical_identity = LocalFileMetadata::from_metadata(
+            &lexical
+                .metadata()
+                .with_context(|| format!("reinspect lexical directory {}", self.path.display()))?,
+        );
+        if lexical_identity != self.identity {
+            bail!("directory path {} changed identity", self.path.display());
+        }
+        Ok(lexical)
+    }
+}
+
+struct RetainedTargetLocalState {
+    state_directory: RetainedPrivateDirectory,
+    attachment_relative_path: PathBuf,
+    attachment_identity_file: RetainedPrivateFile,
+    acquire_authorization_file: RetainedPrivateFile,
+    launch_checkpoint_file: RetainedPrivateFile,
+}
+
+impl RetainedTargetLocalState {
+    fn retain(
+        expected: &cats_blockd::target_control::TargetControlLocalStateIdentity,
+        attachment_directory: &RetainedPrivateDirectory,
+    ) -> Result<Self> {
+        let state_path = Path::new(expected.state_directory.path.as_str());
+        let attachment_path = Path::new(expected.attachment_directory.path.as_str());
+        if attachment_directory.path != attachment_path
+            || attachment_directory.identity.device != expected.attachment_directory.device.get()
+            || attachment_directory.identity.inode != expected.attachment_directory.inode.get()
+        {
+            bail!("retained target-control attachment directory changed identity");
+        }
+        let attachment_relative_path = strict_descendant_path(state_path, attachment_path)
+            .context("target-control attachment directory is not below its state directory")?;
+        let state_directory = RetainedPrivateDirectory::open(state_path)?;
+        if state_directory.identity.device != expected.state_directory.device.get()
+            || state_directory.identity.inode != expected.state_directory.inode.get()
+        {
+            bail!("retained target-control state directory changed identity");
+        }
+        let relative_attachment = open_private_directory_at_path(
+            &state_directory.file,
+            &attachment_relative_path,
+            attachment_path,
+        )?;
+        assert_directory_identity(
+            &relative_attachment,
+            attachment_directory.identity,
+            attachment_path,
+        )?;
+
+        let attachment_identity_file = retain_target_local_file(
+            &attachment_directory.file,
+            attachment_path,
+            &expected.attachment_identity_file,
+        )?;
+        let acquire_authorization_file = retain_target_local_file(
+            &attachment_directory.file,
+            attachment_path,
+            &expected.acquire_authorization_file,
+        )?;
+        let launch_checkpoint_file = retain_target_local_file(
+            &attachment_directory.file,
+            attachment_path,
+            &expected.launch_checkpoint_file,
+        )?;
+
+        Ok(Self {
+            state_directory,
+            attachment_relative_path,
+            attachment_identity_file,
+            acquire_authorization_file,
+            launch_checkpoint_file,
+        })
+    }
+
+    fn assert_current(&self, attachment_directory: &RetainedPrivateDirectory) -> Result<File> {
+        attachment_directory.assert_retained()?;
+        let lexical_state = self.state_directory.open_current_lexical()?;
+
+        let retained_relative_attachment = open_private_directory_at_path(
+            &self.state_directory.file,
+            &self.attachment_relative_path,
+            &attachment_directory.path,
+        )?;
+        assert_directory_identity(
+            &retained_relative_attachment,
+            attachment_directory.identity,
+            &attachment_directory.path,
+        )?;
+        let lexical_attachment = open_private_directory_at_path(
+            &lexical_state,
+            &self.attachment_relative_path,
+            &attachment_directory.path,
+        )?;
+        assert_directory_identity(
+            &lexical_attachment,
+            attachment_directory.identity,
+            &attachment_directory.path,
+        )?;
+
+        for retained in [
+            &self.attachment_identity_file,
+            &self.acquire_authorization_file,
+            &self.launch_checkpoint_file,
+        ] {
+            retained.assert_current(
+                &attachment_directory.file,
+                &lexical_attachment,
+                TARGET_LOCAL_STATE_FILE_MAX_BYTES,
+            )?;
+        }
+        Ok(lexical_attachment)
+    }
+}
+
+const TARGET_LOCAL_STATE_FILE_MAX_BYTES: usize = 512 * 1024;
 
 struct RetainedPrivateFile {
     path: PathBuf,
@@ -657,22 +798,6 @@ fn read_serving_handoff_authorization(
     process_identity: &RuntimeProcessIdentity,
     expected: &ServingHandoffRecordExpectation,
 ) -> Result<ValidatedServingHandoff> {
-    read_serving_handoff_authorization_before_revalidation(
-        config,
-        args,
-        process_identity,
-        expected,
-        || {},
-    )
-}
-
-fn read_serving_handoff_authorization_before_revalidation(
-    config: &EngineConfig,
-    args: &Args,
-    process_identity: &RuntimeProcessIdentity,
-    expected: &ServingHandoffRecordExpectation,
-    before_revalidation: impl FnOnce(),
-) -> Result<ValidatedServingHandoff> {
     if !config.data_dir.is_absolute()
         || expected.path != config.data_dir.join(SERVING_HANDOFF_RECORD_FILE)
         || expected.device == 0
@@ -682,14 +807,10 @@ fn read_serving_handoff_authorization_before_revalidation(
     {
         bail!("serving-from-handoff record identity is outside its exact data directory");
     }
-    let data_directory = open_private_directory(&config.data_dir)?;
-    let data_directory_identity = LocalFileMetadata::from_metadata(
-        &data_directory
-            .metadata()
-            .context("inspect serving handoff data directory")?,
-    );
+    let data_directory = RetainedPrivateDirectory::open(&config.data_dir)?;
+    let data_directory_identity = data_directory.identity;
     let record = read_private_file_at(
-        &data_directory,
+        &data_directory.file,
         &expected.path,
         SERVING_HANDOFF_RECORD_MAX_BYTES,
     )?;
@@ -746,7 +867,7 @@ fn read_serving_handoff_authorization_before_revalidation(
         );
     }
     let target = read_private_file_at(
-        &data_directory,
+        &data_directory.file,
         target_path,
         TARGET_CONTROL_AUTHORIZATION_MAX_BYTES,
     )?;
@@ -763,11 +884,8 @@ fn read_serving_handoff_authorization_before_revalidation(
     if target_artifact != target_identity.artifact {
         bail!("serving-from-handoff target-control bytes differ from the sealed record");
     }
-    validate_target_local_directory(&target_artifact.local_state.state_directory)?;
-    validate_target_local_directory(&target_artifact.local_state.attachment_directory)?;
-    validate_target_local_file(&target_artifact.local_state.attachment_identity_file)?;
-    validate_target_local_file(&target_artifact.local_state.acquire_authorization_file)?;
-    validate_target_local_file(&target_artifact.local_state.launch_checkpoint_file)?;
+    let local_state =
+        RetainedTargetLocalState::retain(&target_artifact.local_state, &data_directory)?;
 
     let attachment = &target_artifact.attachment;
     let lease_ttl_ms = u64::try_from(config.lease_ttl_ms)
@@ -815,14 +933,12 @@ fn read_serving_handoff_authorization_before_revalidation(
     }
 
     let ready = ValidatedServingHandoff {
-        data_directory_path: config.data_dir.clone(),
         data_directory,
-        data_directory_identity,
+        local_state,
         record,
         target,
         decoded,
     };
-    before_revalidation();
     ready.assert_current()?;
     Ok(ready)
 }
@@ -871,6 +987,112 @@ fn open_private_directory(path: &Path) -> Result<File> {
         );
     }
     Ok(directory)
+}
+
+fn strict_descendant_path(parent: &Path, child: &Path) -> Option<PathBuf> {
+    let relative = child.strip_prefix(parent).ok()?;
+    let mut saw_component = false;
+    for component in relative.components() {
+        if !matches!(component, std::path::Component::Normal(_)) {
+            return None;
+        }
+        saw_component = true;
+    }
+    saw_component.then(|| relative.to_path_buf())
+}
+
+fn open_private_directory_at_path(
+    parent: &File,
+    relative: &Path,
+    display_path: &Path,
+) -> Result<File> {
+    let mut directory = parent
+        .try_clone()
+        .with_context(|| format!("retain parent directory for {}", display_path.display()))?;
+    let mut saw_component = false;
+    for component in relative.components() {
+        let std::path::Component::Normal(name) = component else {
+            bail!(
+                "retained directory path {} is not a strict canonical descendant",
+                display_path.display()
+            );
+        };
+        saw_component = true;
+        let name =
+            CString::new(name.as_bytes()).context("retained directory component contains NUL")?;
+        directory = open_directory_at(&directory, &name).with_context(|| {
+            format!(
+                "open retained directory descriptor-relative {}",
+                display_path.display()
+            )
+        })?;
+    }
+    if !saw_component {
+        bail!(
+            "retained directory path {} is not a strict descendant",
+            display_path.display()
+        );
+    }
+    let metadata = directory
+        .metadata()
+        .with_context(|| format!("inspect retained directory {}", display_path.display()))?;
+    if !metadata.file_type().is_dir()
+        || metadata.uid() != effective_uid()
+        || metadata.mode() & 0o7777 != 0o700
+    {
+        bail!(
+            "retained directory {} has unsafe metadata",
+            display_path.display()
+        );
+    }
+    Ok(directory)
+}
+
+fn assert_directory_identity(
+    directory: &File,
+    expected: LocalFileMetadata,
+    path: &Path,
+) -> Result<()> {
+    let current = LocalFileMetadata::from_metadata(
+        &directory
+            .metadata()
+            .with_context(|| format!("reinspect retained directory {}", path.display()))?,
+    );
+    if current != expected {
+        bail!("retained directory {} changed identity", path.display());
+    }
+    Ok(())
+}
+
+fn retain_target_local_file(
+    attachment_directory: &File,
+    attachment_path: &Path,
+    expected: &StableFileIdentity,
+) -> Result<RetainedPrivateFile> {
+    let path = Path::new(expected.path.as_str());
+    if path.parent() != Some(attachment_path) {
+        bail!(
+            "retained target-control file {} is outside its attachment directory",
+            path.display()
+        );
+    }
+    let retained = read_private_file_at(
+        attachment_directory,
+        path,
+        TARGET_LOCAL_STATE_FILE_MAX_BYTES,
+    )?;
+    let digest = Sha256Digest::from_bytes(cats_blockd::format::sha256(&retained.bytes));
+    if retained.identity.device != expected.device.get()
+        || retained.identity.inode != expected.inode.get()
+        || retained.identity.length != expected.length.get()
+        || digest != expected.content_sha256
+    {
+        bail!(
+            "retained target-control file {} changed identity or bytes",
+            path.display()
+        );
+    }
+    Ok(retained)
 }
 
 fn read_private_file_at(
@@ -2314,23 +2536,23 @@ mod tests {
         }
     }
 
-    fn invoke_handoff_before_revalidation(
+    fn invoke_handoff_before_effect_revalidation(
         args: &Args,
         effect_calls: &std::cell::Cell<u64>,
         before_revalidation: impl FnOnce(),
     ) -> Result<AuthorizedServingAttachment> {
         validate_process_mode(args)?;
         let process_identity = runtime_process_identity(args)?.unwrap();
-        read_serving_handoff_authorization_before_revalidation(
+        let input = read_serving_handoff_authorization(
             &serving_config(args),
             args,
             &process_identity,
             &serving_expectation(args),
-            before_revalidation,
         )
         .map(Box::new)
-        .map(AuthorizedServingInput::RootHandoff)?
-        .apply(|attachment| {
+        .map(AuthorizedServingInput::RootHandoff)?;
+        before_revalidation();
+        input.apply(|attachment| {
             effect_calls.set(effect_calls.get() + 1);
             Ok(attachment)
         })
@@ -2343,6 +2565,14 @@ mod tests {
         // permission bits. The test owns the absent destination path.
         let result = unsafe { libc::mkfifo(path.as_ptr(), 0o600) };
         assert_eq!(result, 0, "mkfifo failed: {}", io::Error::last_os_error());
+    }
+
+    fn rename_and_recreate_private_file(path: &Path) {
+        let bytes = std::fs::read(path).unwrap();
+        let backup = path.with_extension("retained-old");
+        std::fs::rename(path, backup).unwrap();
+        std::fs::write(path, bytes).unwrap();
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600)).unwrap();
     }
 
     #[test]
@@ -2580,13 +2810,13 @@ mod tests {
     }
 
     #[test]
-    fn serving_from_handoff_revalidation_rejects_file_and_ancestor_aba_before_effect() {
+    fn serving_from_handoff_revalidation_rejects_every_retained_artifact_aba_before_effect() {
         let record_aba = serving_handoff_fixture();
         let args = record_aba.args();
         let effect_calls = std::cell::Cell::new(0_u64);
         let backup = record_aba.record_path.with_extension("old");
         let bytes = record_aba.record_bytes.clone();
-        let result = invoke_handoff_before_revalidation(&args, &effect_calls, || {
+        let result = invoke_handoff_before_effect_revalidation(&args, &effect_calls, || {
             std::fs::rename(&record_aba.record_path, &backup).unwrap();
             std::fs::write(&record_aba.record_path, bytes).unwrap();
             std::fs::set_permissions(
@@ -2603,7 +2833,7 @@ mod tests {
         let effect_calls = std::cell::Cell::new(0_u64);
         let backup = target_aba.target.path.with_extension("old");
         let bytes = std::fs::read(&target_aba.target.path).unwrap();
-        let result = invoke_handoff_before_revalidation(&args, &effect_calls, || {
+        let result = invoke_handoff_before_effect_revalidation(&args, &effect_calls, || {
             std::fs::rename(&target_aba.target.path, &backup).unwrap();
             std::fs::write(&target_aba.target.path, bytes).unwrap();
             std::fs::set_permissions(
@@ -2615,6 +2845,76 @@ mod tests {
         assert!(result.is_err());
         assert_eq!(effect_calls.get(), 0);
 
+        let attachment_directory_aba = serving_handoff_fixture();
+        let args = attachment_directory_aba.args();
+        let effect_calls = std::cell::Cell::new(0_u64);
+        let moved = attachment_directory_aba
+            .target
+            .data_dir
+            .with_extension("retained-old");
+        let result = invoke_handoff_before_effect_revalidation(&args, &effect_calls, || {
+            std::fs::rename(&attachment_directory_aba.target.data_dir, moved).unwrap();
+            std::fs::create_dir_all(&attachment_directory_aba.target.data_dir).unwrap();
+            std::fs::set_permissions(
+                &attachment_directory_aba.target.data_dir,
+                std::fs::Permissions::from_mode(0o700),
+            )
+            .unwrap();
+        });
+        assert!(result.is_err());
+        assert_eq!(effect_calls.get(), 0);
+
+        let local_paths: [fn(&ServingHandoffFixture) -> PathBuf; 3] = [
+            |fixture: &ServingHandoffFixture| {
+                PathBuf::from(
+                    fixture
+                        .target
+                        .artifact
+                        .local_state
+                        .attachment_identity_file
+                        .path
+                        .as_str(),
+                )
+            },
+            |fixture: &ServingHandoffFixture| {
+                PathBuf::from(
+                    fixture
+                        .target
+                        .artifact
+                        .local_state
+                        .acquire_authorization_file
+                        .path
+                        .as_str(),
+                )
+            },
+            |fixture: &ServingHandoffFixture| {
+                PathBuf::from(
+                    fixture
+                        .target
+                        .artifact
+                        .local_state
+                        .launch_checkpoint_file
+                        .path
+                        .as_str(),
+                )
+            },
+        ];
+        for local_path in local_paths {
+            let local_file_aba = serving_handoff_fixture();
+            let args = local_file_aba.args();
+            let path = local_path(&local_file_aba);
+            let effect_calls = std::cell::Cell::new(0_u64);
+            let result = invoke_handoff_before_effect_revalidation(&args, &effect_calls, || {
+                rename_and_recreate_private_file(&path);
+            });
+            assert!(
+                result.is_err(),
+                "accepted ABA replacement of {}",
+                path.display()
+            );
+            assert_eq!(effect_calls.get(), 0);
+        }
+
         let ancestor_symlink = serving_handoff_fixture();
         let args = ancestor_symlink.args();
         let moved = ancestor_symlink.target.state_dir.with_extension("moved");
@@ -2622,20 +2922,20 @@ mod tests {
         symlink(&moved, &ancestor_symlink.target.state_dir).unwrap();
         assert_authorized_serving_rejected(&args);
 
-        let ancestor_recreated = serving_handoff_fixture();
-        let args = ancestor_recreated.args();
+        let state_directory_aba = serving_handoff_fixture();
+        let args = state_directory_aba.args();
         let effect_calls = std::cell::Cell::new(0_u64);
-        let moved = ancestor_recreated.target.state_dir.with_extension("moved");
-        let result = invoke_handoff_before_revalidation(&args, &effect_calls, || {
-            std::fs::rename(&ancestor_recreated.target.state_dir, &moved).unwrap();
-            std::fs::create_dir_all(&ancestor_recreated.target.data_dir).unwrap();
+        let moved = state_directory_aba.target.state_dir.with_extension("moved");
+        let result = invoke_handoff_before_effect_revalidation(&args, &effect_calls, || {
+            std::fs::rename(&state_directory_aba.target.state_dir, &moved).unwrap();
+            std::fs::create_dir_all(&state_directory_aba.target.data_dir).unwrap();
             std::fs::set_permissions(
-                &ancestor_recreated.target.state_dir,
+                &state_directory_aba.target.state_dir,
                 std::fs::Permissions::from_mode(0o700),
             )
             .unwrap();
             std::fs::set_permissions(
-                &ancestor_recreated.target.data_dir,
+                &state_directory_aba.target.data_dir,
                 std::fs::Permissions::from_mode(0o700),
             )
             .unwrap();
