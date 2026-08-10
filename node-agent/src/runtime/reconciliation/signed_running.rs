@@ -176,7 +176,11 @@ impl SignedRunningAcquireEffect {
             None => store
                 .create(&acquire_checkpoint)
                 .context("persist normal-acquire request before authority mutation")?,
-            Some(stored) if stored.checkpoint() == &acquire_checkpoint => stored,
+            Some(stored)
+                if checkpoint_eq_except_updated_at(stored.checkpoint(), &acquire_checkpoint) =>
+            {
+                stored
+            }
             Some(stored)
                 if provision_checkpoint_is_bound(
                     stored.checkpoint(),
@@ -676,7 +680,7 @@ fn normal_acquire_request(
     }
 }
 
-fn request_matches_volume(
+pub(super) fn request_matches_volume(
     request: &VolumeAcquireRequest,
     desired: &DesiredRuntimeSpec,
     volume: &VolumeIntent,
@@ -709,7 +713,7 @@ fn request_matches_volume(
         && (1..=MAX_LEASE_DURATION_MS).contains(lease_duration_ms)
 }
 
-fn acquire_checkpoint(
+pub(super) fn acquire_checkpoint(
     desired: &DesiredRuntimeSpec,
     volume: &VolumeIntent,
     transition: RuntimeVolumeTransition,
@@ -741,7 +745,13 @@ fn acquire_checkpoint(
     }
 }
 
-fn unowned_observed_volume(volume: &VolumeIntent) -> ObservedVolume {
+fn checkpoint_eq_except_updated_at(stored: &RuntimeCheckpoint, fresh: &RuntimeCheckpoint) -> bool {
+    let mut stored = stored.clone();
+    stored.updated_at_unix_ms = fresh.updated_at_unix_ms;
+    stored == *fresh
+}
+
+pub(super) fn unowned_observed_volume(volume: &VolumeIntent) -> ObservedVolume {
     let VolumeAcquire::Normal {
         expected_unowned_epoch,
         ..
@@ -786,7 +796,7 @@ fn owned_observed_volume(
     }
 }
 
-fn prepared_owned_observed_volume(
+pub(super) fn prepared_owned_observed_volume(
     volume: &VolumeIntent,
     attachment: &AuthorizedServingAttachment,
     data_directory: HostPath,
@@ -937,10 +947,11 @@ mod tests {
 
     use cats_api::runtime_reconciliation::{
         decode_runtime_checkpoint, spec_digest, AcquireOrigin, AdmissionInventoryAttestation,
-        AgentSession, AssignedKind, AssignedPlacement, Epoch, GuestDeviceIdentity, Ipv4Address,
-        IsolatedIpv4Kind, LastVolumeTransition, MacAddress, NetworkConfig, NodeBootId,
-        NodeObservation, NormalAcquireRequest, NormalAcquireResult, Revision, RuntimeConfig,
-        RuntimeVolumeAuthorityRejection, Sequence, VolumeAdminState, VolumeRecord,
+        AgentSession, AssignedKind, AssignedPlacement, DesiredReadSnapshot, Epoch,
+        GuestDeviceIdentity, Ipv4Address, IsolatedIpv4Kind, LastVolumeTransition, MacAddress,
+        NetworkConfig, NodeBootId, NodeObservation, NormalAcquireRequest, NormalAcquireResult,
+        Revision, RuntimeConfig, RuntimeVolumeAuthorityRejection, Sequence, VolumeAdminState,
+        VolumeRecord,
     };
     use cats_storage::authority::{
         AttachmentLineageIdentity, RenewLeaseRequest, RenewLeaseResult, VolumeHeadCasRequest,
@@ -948,8 +959,15 @@ mod tests {
     };
     use cats_storage::{encode_image_manifest, BlobError, ImageManifestV1, LowerHexSha256};
 
-    use crate::runtime_spine::RuntimeDesiredEffectAdmission;
+    use crate::runtime_spine::{
+        RuntimeDesiredEffectAdmission, RuntimeInventoryScanContext, RuntimeInventoryScanOutcome,
+        RuntimeSpineFullScan,
+    };
     use crate::state_directory::StateDirectory;
+
+    use super::super::{
+        clean_slate_scanner_with_volume_authority_for_test, TestCleanSlateProbeConfig,
+    };
 
     use super::*;
 
@@ -1269,8 +1287,14 @@ mod tests {
             blob,
             checkpoint_path.clone(),
         );
-        let (restart_context, _) =
-            context_with_session(root.path(), &desired, Some(fresh_runtime), '8', 3);
+        let (restart_context, _) = context_with_session(
+            root.path(),
+            &desired,
+            Some(fresh_runtime),
+            '8',
+            3,
+            1_900_000_010_000,
+        );
 
         assert_eq!(
             restart_effect.apply(restart_context, &desired).unwrap(),
@@ -1283,6 +1307,151 @@ mod tests {
             &attachment,
             &data_directory,
         );
+    }
+
+    #[test]
+    fn production_probe_fresh_scan_projects_exact_prepared_lineage_for_restart_adoption() {
+        let root = tempfile::tempdir().unwrap();
+        let desired = desired();
+        let attachment = attachment(&desired);
+        let authority = Arc::new(FakeAuthority::new(Err(AuthorityError::BackendUnknown)));
+        let blob = Arc::new(RecordingBlob::present(&desired));
+        let checkpoint_path = checkpoint_path(root.path(), &desired.cat_id);
+        let (base_effect, _) = effect(
+            &desired,
+            vec![NormalAcquireAttempt::Granted(Box::new(attachment.clone()))],
+            Arc::clone(&authority),
+            Arc::clone(&blob),
+            checkpoint_path.clone(),
+        );
+        let interrupted_effect =
+            base_effect.with_after_prepare(Arc::new(|context| context.cancel_for_test()));
+        let (initial_context, _) = context(root.path(), &desired, None);
+        interrupted_effect
+            .apply(initial_context, &desired)
+            .expect_err("fixture must stop after persisting the exact grant");
+        let acquire = read_checkpoint(&checkpoint_path);
+        assert_eq!(acquire.updated_at_unix_ms, unix_ms(1_900_000_000_000));
+
+        authority.set(Ok(owned_record(&desired, &attachment)));
+        let scanner_authority: Arc<dyn VolumeDataAuthority> = authority.clone();
+        let scanner = fresh_scanner(root.path(), scanner_authority);
+        let scan_session = SessionBinding {
+            node_id: desired.placement.node_id.clone(),
+            node_boot_id: NodeBootId::new("33333333333333333333333333333333").unwrap(),
+            agent_instance_id: random('8'),
+            agent_session_epoch: epoch(3),
+        };
+        let scan_context = RuntimeInventoryScanContext::for_test(
+            RuntimeSpineFullScan {
+                session: scan_session.clone(),
+                heartbeat_sequence: sequence(10),
+                inventory_epoch: epoch(5),
+                desired: DesiredReadSnapshot {
+                    version: ContractVersion::V1,
+                    session: scan_session,
+                    request_sequence: sequence(20),
+                    read_position: sequence(21),
+                    issued_at_unix_ms: unix_ms(1_900_000_005_000),
+                    expires_at_unix_ms: unix_ms(1_900_000_035_000),
+                    desired_specs: vec![desired.clone()],
+                },
+            },
+            Instant::now() + Duration::from_secs(30),
+        );
+        let RuntimeInventoryScanOutcome::Complete(inventory) =
+            scanner.scan_complete(scan_context).unwrap()
+        else {
+            panic!("the exact checkpoint, grant files and authority must close a fresh scan")
+        };
+        let [scanned_runtime] = inventory.runtimes() else {
+            panic!("fresh scan must project exactly one Runtime")
+        };
+        assert!(matches!(
+            scanned_runtime.step,
+            ReconcileStep::AcquireVolume { .. }
+        ));
+        assert_eq!(scanned_runtime.volumes.len(), 1);
+        assert_eq!(scanned_runtime.volumes[0].local_lineages.len(), 1);
+        assert_eq!(
+            scanned_runtime.volumes[0].local_lineages[0].acquire_origin,
+            attachment.identity.acquire_origin
+        );
+
+        let data_directory =
+            authorized_blockd_data_directory(root.path(), &desired, &attachment.identity);
+        let before = prepared_file_snapshot(&data_directory);
+        let (restart_effect, restart_calls) = effect(
+            &desired,
+            vec![NormalAcquireAttempt::Granted(Box::new(attachment.clone()))],
+            Arc::clone(&authority),
+            blob,
+            checkpoint_path.clone(),
+        );
+        let (restart_context, _) = context_with_session(
+            root.path(),
+            &desired,
+            Some(scanned_runtime.clone()),
+            '8',
+            3,
+            1_900_000_010_000,
+        );
+        assert_eq!(
+            restart_effect.apply(restart_context, &desired).unwrap(),
+            RuntimeDesiredEffectOutcome::RefreshInventory
+        );
+        assert_eq!(restart_calls.lock().unwrap().requests.len(), 1);
+        assert_eq!(prepared_file_snapshot(&data_directory), before);
+        let provision = read_checkpoint(&checkpoint_path);
+        assert_eq!(provision.updated_at_unix_ms, unix_ms(1_900_000_010_000));
+        assert_prepared_provision_checkpoint(&provision, &attachment, &data_directory);
+    }
+
+    #[test]
+    fn acquire_checkpoint_restart_identity_ignores_only_observation_time() {
+        let desired = desired();
+        let attachment = attachment(&desired);
+        let request = &attachment.acquire_request;
+        let stored = acquire_checkpoint(
+            &desired,
+            &desired.volumes[0],
+            RuntimeVolumeTransition::Acquire {
+                request: VolumeAcquireRequest::Normal {
+                    volume_id: request.volume_id.clone(),
+                    transition_id: request.transition_id.clone(),
+                    attachment_id: request.attachment_id.clone(),
+                    expected_unowned_epoch: request.expected_unowned_epoch,
+                    desired_revision: request.desired_revision,
+                    placement_epoch: request.placement_epoch,
+                    lease_duration_ms: request.lease_duration_ms,
+                },
+            },
+            unix_ms(1_900_000_000_000),
+        );
+        let mut fresh = stored.clone();
+        fresh.updated_at_unix_ms = unix_ms(1_900_000_010_000);
+        assert!(checkpoint_eq_except_updated_at(&stored, &fresh));
+
+        let mut changed = fresh.clone();
+        changed.cat_id = id("cat_other");
+        assert!(!checkpoint_eq_except_updated_at(&stored, &changed));
+        let mut changed = fresh.clone();
+        changed.desired_revision = Revision::new(2).unwrap();
+        assert!(!checkpoint_eq_except_updated_at(&stored, &changed));
+        let mut changed = fresh.clone();
+        changed.spec_digest = Sha256Digest::from_bytes([8; 32]);
+        assert!(!checkpoint_eq_except_updated_at(&stored, &changed));
+        let mut changed = fresh.clone();
+        changed.placement_epoch = epoch(4);
+        assert!(!checkpoint_eq_except_updated_at(&stored, &changed));
+        let ReconcileStep::AcquireVolume {
+            request: VolumeAcquireRequest::Normal { transition_id, .. },
+        } = &mut changed.step
+        else {
+            unreachable!("fixture checkpoint is normal acquire")
+        };
+        *transition_id = random('9');
+        assert!(!checkpoint_eq_except_updated_at(&stored, &changed));
     }
 
     #[test]
@@ -1339,8 +1508,14 @@ mod tests {
             blob,
             checkpoint_path.clone(),
         );
-        let (restart_context, _) =
-            context_with_session(root.path(), &desired, Some(fresh_runtime), '8', 3);
+        let (restart_context, _) = context_with_session(
+            root.path(),
+            &desired,
+            Some(fresh_runtime),
+            '8',
+            3,
+            1_900_000_010_000,
+        );
 
         assert_eq!(
             restart_effect.apply(restart_context, &desired).unwrap(),
@@ -1403,8 +1578,14 @@ mod tests {
             blob,
             checkpoint_path.clone(),
         );
-        let (restart_context, _) =
-            context_with_session(root.path(), &desired, Some(fresh_runtime), '8', 3);
+        let (restart_context, _) = context_with_session(
+            root.path(),
+            &desired,
+            Some(fresh_runtime),
+            '8',
+            3,
+            1_900_000_010_000,
+        );
 
         assert_eq!(
             restart_effect.apply(restart_context, &desired).unwrap(),
@@ -1632,7 +1813,7 @@ mod tests {
         desired: &DesiredRuntimeSpec,
         runtime: Option<ObservedRuntimeStatus>,
     ) -> (RuntimeDesiredEffectContext, Instant) {
-        context_with_session(root, desired, runtime, '4', 2)
+        context_with_session(root, desired, runtime, '4', 2, 1_900_000_000_000)
     }
 
     fn context_with_session(
@@ -1641,6 +1822,7 @@ mod tests {
         runtime: Option<ObservedRuntimeStatus>,
         agent_instance: char,
         session_epoch: u64,
+        accepted_at_unix_ms: u64,
     ) -> (RuntimeDesiredEffectContext, Instant) {
         let session = AgentSession {
             version: ContractVersion::V1,
@@ -1661,7 +1843,7 @@ mod tests {
             inventory_epoch: epoch(4),
             inventory_digest: digest.clone(),
             inventory_read_position: sequence(12),
-            accepted_at_unix_ms: unix_ms(1_900_000_000_000),
+            accepted_at_unix_ms: unix_ms(accepted_at_unix_ms),
         };
         let observation = NodeObservation {
             version: ContractVersion::V1,
@@ -1692,6 +1874,41 @@ mod tests {
             ),
             deadline,
         )
+    }
+
+    fn fresh_scanner(
+        root: &std::path::Path,
+        authority: Arc<dyn VolumeDataAuthority>,
+    ) -> Arc<dyn crate::runtime_spine::RuntimeInventoryScanner> {
+        let proc_root = root.join("probe-proc");
+        let systemd_root = root.join("probe-systemd");
+        let block_root = root.join("probe-block");
+        let network_root = root.join("probe-network");
+        let socket_root = root.join("probe-sockets");
+        for directory in [
+            &proc_root,
+            &systemd_root,
+            &block_root,
+            &network_root,
+            &socket_root,
+        ] {
+            std::fs::create_dir(directory).unwrap();
+        }
+        clean_slate_scanner_with_volume_authority_for_test(
+            TestCleanSlateProbeConfig {
+                state_directory: StateDirectory::unanchored(root.to_path_buf()),
+                proc_root,
+                systemd_cgroup_root: systemd_root,
+                block_class_root: block_root,
+                network_class_root: network_root,
+                legacy_socket_root: socket_root,
+                cloud_hypervisor_binary: root.join("bin/cloud-hypervisor"),
+                blockd_binary: root.join("bin/cats-blockd"),
+                guest_agent_binary: root.join("bin/cats-guest-agent"),
+            },
+            authority,
+        )
+        .unwrap()
     }
 
     fn observed_runtime(

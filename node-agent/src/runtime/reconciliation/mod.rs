@@ -56,7 +56,10 @@ pub use checkpoint::{
     runtime_checkpoint_path, CheckpointStoreError, FileCheckpointStore, StoredCheckpoint,
 };
 #[cfg(test)]
-pub(crate) use clean_slate_probes::{clean_slate_scanner_for_test, TestCleanSlateProbeConfig};
+pub(crate) use clean_slate_probes::{
+    clean_slate_scanner_for_test, clean_slate_scanner_with_volume_authority_for_test,
+    TestCleanSlateProbeConfig,
+};
 pub(crate) use clean_slate_probes::{
     installed_clean_slate_scanner, InstalledCleanSlateProbeConfig,
 };

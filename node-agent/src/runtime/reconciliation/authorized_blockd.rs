@@ -31,15 +31,15 @@ use serde::{Deserialize, Serialize};
 use crate::state_directory::StateDirectory;
 
 const DATA_DIRECTORY: &str = "data";
-const IDENTITY_FILE: &str = "identity.json";
-const IDENTITY_TEMP: &str = ".identity.json.tmp";
-const AUTHORIZED_SERVING_FILE: &str = "authorized-serving.json";
-const AUTHORIZED_SERVING_TEMP: &str = ".authorized-serving.json.tmp";
-const LAUNCH_CHECKPOINT_FILE: &str = "launch-checkpoint.json";
-const LAUNCH_CHECKPOINT_TEMP: &str = ".launch-checkpoint.json.tmp";
-const MAX_IDENTITY_BYTES: usize = 4 * 1024;
-const MAX_AUTHORIZED_SERVING_BYTES: usize = 32 * 1024;
-const MAX_LAUNCH_CHECKPOINT_BYTES: usize = 512 * 1024;
+pub(crate) const IDENTITY_FILE: &str = "identity.json";
+pub(crate) const IDENTITY_TEMP: &str = ".identity.json.tmp";
+pub(crate) const AUTHORIZED_SERVING_FILE: &str = "authorized-serving.json";
+pub(crate) const AUTHORIZED_SERVING_TEMP: &str = ".authorized-serving.json.tmp";
+pub(crate) const LAUNCH_CHECKPOINT_FILE: &str = "launch-checkpoint.json";
+pub(crate) const LAUNCH_CHECKPOINT_TEMP: &str = ".launch-checkpoint.json.tmp";
+pub(crate) const MAX_IDENTITY_BYTES: usize = 4 * 1024;
+pub(crate) const MAX_AUTHORIZED_SERVING_BYTES: usize = 32 * 1024;
+pub(crate) const MAX_LAUNCH_CHECKPOINT_BYTES: usize = 512 * 1024;
 
 /// Exact signed inputs persisted before starting an authorized blockd.
 ///
@@ -377,6 +377,20 @@ fn validate_checkpoint_inputs(
         "Desired, root VolumeIntent and authorized grant do not form one exact lineage"
     );
     Ok(())
+}
+
+pub(crate) fn validate_authorized_blockd_checkpoint(
+    checkpoint: &AuthorizedBlockdCheckpoint,
+) -> Result<()> {
+    anyhow::ensure!(
+        checkpoint.version == ContractVersion::V1,
+        "authorized blockd checkpoint has an unsupported version"
+    );
+    validate_checkpoint_inputs(
+        &checkpoint.desired,
+        &checkpoint.volume,
+        &checkpoint.attachment,
+    )
 }
 
 fn directory_components(
