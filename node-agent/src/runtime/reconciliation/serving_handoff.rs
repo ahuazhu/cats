@@ -4611,7 +4611,10 @@ mod tests {
         let ownership_token = random('8');
         let data_directory = host(fixture.data_directory.to_str().unwrap());
         checkpoint.step = ReconcileStep::PrepareDevice {
+            volume_intent_id: volume.volume_intent_id.clone(),
+            disk_id: volume.disk_id.clone(),
             volume_id: volume.volume_id.clone(),
+            disk_kind: volume.disk_kind,
             attachment_id: attachment.identity.attachment_id.clone(),
             attachment_epoch: attachment.identity.attachment_epoch,
             acquire_origin: attachment.identity.acquire_origin.clone(),
@@ -6414,7 +6417,10 @@ mod tests {
         .unwrap();
         let current = checkpoint_store.load().unwrap().unwrap();
         let ReconcileStep::PrepareDevice {
+            volume_intent_id,
+            disk_id,
             volume_id,
+            disk_kind,
             attachment_id,
             attachment_epoch,
             acquire_origin,
@@ -6431,7 +6437,10 @@ mod tests {
             panic!("production Ready must advance only to PrepareDevice")
         };
         let attachment = &fixture.acquired.attachment;
+        assert_eq!(volume_intent_id, &fixture.acquired.volume.volume_intent_id);
+        assert_eq!(disk_id, &fixture.acquired.volume.disk_id);
         assert_eq!(volume_id, &attachment.identity.volume_id);
+        assert_eq!(*disk_kind, fixture.acquired.volume.disk_kind);
         assert_eq!(attachment_id, &attachment.identity.attachment_id);
         assert_eq!(*attachment_epoch, attachment.identity.attachment_epoch);
         assert_eq!(acquire_origin, &attachment.identity.acquire_origin);

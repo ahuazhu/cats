@@ -65,7 +65,10 @@ pub(super) const SERVING_VHOST_SOCKET_BASENAME: &str = "serving-vhost.sock";
 #[derive(Debug, Clone)]
 pub(crate) enum ServingPrepareFrontend {
     #[cfg(target_os = "linux")]
-    KernelNbd(KernelNbdInventoryPort),
+    KernelNbd {
+        port: KernelNbdInventoryPort,
+        direct: bool,
+    },
     #[cfg(not(target_os = "linux"))]
     KernelNbdUnsupported,
     VhostUserBlk {
@@ -79,6 +82,7 @@ impl ServingPrepareFrontend {
         state_directory: StateDirectory,
         nbd_client_binary: std::path::PathBuf,
         device_count: u32,
+        direct: bool,
     ) -> anyhow::Result<Self> {
         anyhow::ensure!(
             nbd_client_binary.is_absolute(),
@@ -92,11 +96,14 @@ impl ServingPrepareFrontend {
                 nbd_client_binary,
                 device_count,
             )?;
-            Ok(Self::KernelNbd(KernelNbdInventoryPort::new(config)))
+            Ok(Self::KernelNbd {
+                port: KernelNbdInventoryPort::new(config),
+                direct,
+            })
         }
         #[cfg(not(target_os = "linux"))]
         {
-            let _ = (state_directory, nbd_client_binary, device_count);
+            let _ = (state_directory, nbd_client_binary, device_count, direct);
             Ok(Self::KernelNbdUnsupported)
         }
     }
@@ -202,7 +209,7 @@ impl ServingPrepareDeviceEffect {
 
         ready.consume_for_prepare_device(&stored, |handoff| match &self.frontend {
             #[cfg(target_os = "linux")]
-            ServingPrepareFrontend::KernelNbd(port) => port
+            ServingPrepareFrontend::KernelNbd { port, direct } => port
                 .reserve_and_replace(context, &store, &stored, |device_path| {
                     prepare_device_successor(
                         desired,
@@ -215,6 +222,7 @@ impl ServingPrepareDeviceEffect {
                                 SERVING_NBD_SOCKET_BASENAME,
                             )?,
                             device_path,
+                            direct: *direct,
                         },
                     )
                 })
@@ -403,7 +411,10 @@ fn prepare_device_successor(
 
     let mut checkpoint = stored.checkpoint().clone();
     checkpoint.step = ReconcileStep::PrepareDevice {
+        volume_intent_id: intent.volume_intent_id.clone(),
+        disk_id: intent.disk_id.clone(),
         volume_id: attachment.identity.volume_id.clone(),
+        disk_kind: intent.disk_kind,
         attachment_id: attachment.identity.attachment_id.clone(),
         attachment_epoch: attachment.identity.attachment_epoch,
         acquire_origin: attachment.identity.acquire_origin.clone(),

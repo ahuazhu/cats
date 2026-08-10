@@ -1697,9 +1697,9 @@ mod tests {
 
     use cats_api::runtime_reconciliation::{
         AcquireOrigin, AdmissionInventoryAttestation, AgentSession, AssignedKind,
-        AssignedPlacement, ContractVersion, DesiredReadSnapshot, DesiredRuntimeSpec, Durability,
-        Epoch, FenceEpoch, Generation, GuestDeviceIdentity, GuestTransportEvidence, Ipv4Address,
-        IsolatedIpv4Kind, LifecycleAdmission, MacAddress, NetworkConfig, NodeBootId,
+        AssignedPlacement, ContractVersion, DesiredReadSnapshot, DesiredRuntimeSpec, DiskKind,
+        Durability, Epoch, FenceEpoch, Generation, GuestDeviceIdentity, GuestTransportEvidence,
+        Ipv4Address, IsolatedIpv4Kind, LifecycleAdmission, MacAddress, NetworkConfig, NodeBootId,
         NodeObservation, RemoteHead, RequireIdleCheckpoint, Revision, RuntimeConfig, RuntimeTarget,
         RuntimeTransition, Sequence, ServingAuthorityProvenance, ServingBlockdIdentity,
         SessionBinding, Sha256Digest, UnixMillis, WarmSnapshotEvidence,
@@ -2047,7 +2047,10 @@ mod tests {
             runtime_incarnation: None,
             stable_state: None,
             step: ReconcileStep::PrepareDevice {
+                volume_intent_id: id(&format!("intent_{volume}")),
+                disk_id: id(&format!("disk_{volume}")),
                 volume_id: id(volume),
+                disk_kind: DiskKind::Root,
                 attachment_id: id("att_a"),
                 attachment_epoch: FenceEpoch::new(1).unwrap(),
                 acquire_origin: AcquireOrigin::Normal {
@@ -2098,6 +2101,7 @@ mod tests {
                 frontend: PrepareDeviceFrontend::KernelNbd {
                     listener_socket_path: host("/run/cats/nbd.sock"),
                     device_path: host(device),
+                    direct: false,
                 },
             },
             require_idle: RequireIdleCheckpoint::NotApplicable,

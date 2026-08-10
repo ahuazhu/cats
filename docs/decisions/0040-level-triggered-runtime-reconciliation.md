@@ -182,12 +182,21 @@ placement authority；晚到的本地结果绑定精确 incarnation，由下一�
 
 planner 的逐步 token、条件和晚到结果处理以 Runtime Reconciliation spec 的表格为准。
 
-V1启动链固定为`PrepareDevice -> PrepareNetwork -> StartRuntime`，三个step不能合并。`PrepareNetwork`
-的checkpoint replace是该轮唯一effect：它持久完整`NetworkConfig`、Linux IFNAMSIZ范围内的随机
+V1启动链固定为`PrepareDevice -> PrepareNetwork -> StartRuntime`，三个step不能合并。`PrepareDevice`
+先持久`volume_intent_id`/`disk_id`/`volume_id`/显式disk kind、完整attachment lineage和随机process/device
+identity；`PrepareNetwork`与`StartRuntime`都逐字段复制按Guest slot排序的同一closed
+`PreparedDeviceInput`，包括sealed serving provenance、Blockd scope/control/data/executable/token及完整frontend
+参数。该嵌套对象是Agent crash/restart后的authority；公开`ProcessEvidence`/`ObservedDevice`可在待重扫时缺失，
+出现时只能是逐项exact projection且不得有extra/duplicate，top-level `ObservedVolume`的logical IDs、kind、
+authority和唯一active lineage始终必须exact，不能从当前Desired或公开path反向补齐。
+
+`PrepareNetwork`的checkpoint replace是该轮唯一effect：它持久完整`NetworkConfig`、Linux IFNAMSIZ范围内的随机
 `tap_name`及独立`ownership_token`，fsync后必须先取得新的accepted full inventory；只有其中证明tap
 absent或逐字段exact present时，下一轮才可create/adopt，一次模糊结果后也只能再读fresh full。再次得到
 exact present的accepted full后，后续另一轮才能CAS到`StartRuntime`。同名foreign/missing/corrupt token、
 重复tap、地址冲突或ABA均保持原物并fail closed，不能由旧`RuntimeLaunchPort`或一次旧inventory旁路。
+`PrepareNetwork`和`StartRuntime`都只允许`stable_state=null`、admission Closed且route gates为空；InstallGate
+之前不能借已有stable/route authority越过启动phase。
 
 `StartRuntime`是可独立重启解释的完整launch expectation，而不是三字段提示。它冻结runtime incarnation、
 transient service、独立process token，actual installed runtime configuration选择的launcher/VMM/kernel/
@@ -205,6 +214,9 @@ Node-global allocation flock，在一次严格有界的checkpoint namespace/full
 若validated occupied count为N，只检查N+1个连续candidate（每Node assigned上限使其至多1025），选中后只做
 checkpoint replace并fsync。V1 Guest Agent vsock port固定为5000，因此不在step复制第二份authority；inventory
 中的任何Ready transport必须回显checkpoint CID、同incarnation、port 5000和protocol v1。
+`StartRuntime`允许VMM尚不存在时仅报告Guest transport Unavailable；Malformed或VsockReady都要求恰好一个
+逐字段exact VMM，Ready还必须精确匹配incarnation/CID/5000/protocol v1。公开VMM process只是一致性投影，
+provider-private exact argv/env/cgroup/unit/PID/start/executable/file/tap/device proof才可授权adopt。
 
 启动端只允许no-replace创建全部socket/RAM/log路径和exact transient service，不预先unlink或truncate。
 launcher以已验证descriptor启动并`exec`成checkpointed VMM；inspection必须同时闭合systemd ExecStart、唯一

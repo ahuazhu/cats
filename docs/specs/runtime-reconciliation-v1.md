@@ -95,7 +95,8 @@ V1的值只能是`1`；顶层不存在`format_version`或按合同名变化的ve
 
 `prepare_device`、新`prepare_network`和扩展后的`start_runtime`在首次clean-slate vertical cutover前以
 本规格的完整字段集合锁步替换旧开发形态，`ContractVersion`仍为`1`；旧形态缺少handoff/process/frontend、
-network reservation、boot artifact、CID和exact device authority，必须按missing/unknown fields严格拒绝，
+logical disk IDs/kind、跨step完整`PreparedDeviceInput`、network reservation、boot artifact、CID和exact device
+authority，必须按missing/unknown fields严格拒绝，
 不能以optional/default/compatibility alias接受。Node、Control和所有wire fixture必须同时升级，组件不匹配按
 ADR-0040启动失败，不存在与旧开发checkpoint混跑的兼容期。
 
@@ -868,13 +869,13 @@ unit。Inspect、Verify 和 Quarantine 本身不产生外部 effect。
 | CloseGate | `close_gate {endpoint_id, old route_epoch}`及checkpoint top-level、所选old `route_gates`完整entry | 只compare-and-close该Endpoint；revision或完整binding不匹配零副作用，exact same binding Closed是close postcondition；成功/结果不明后确认Closed才fsync且旧epoch不重开。changed以更高epoch另走InstallGate；removed drain后以old Closed binding compare-remove cell entry，确认absent才删除checkpoint entry/推进step，不install |
 | AcquireVolume | normal时完整`VolumeAcquireRequest`（含positive lease duration），takeover时只有authorization id | 只通过Runtime Volume Transitions签名mutation route交给Control的单一PostgreSQL事务；authorization首次消费还要求Active event并原子写`AuthorizationConsumedReceipt`，结果不明只经同规格signed evidence read闭合；只有完整typed request或同authorization可adopt，或在 `R == L` 后精确release |
 | ProvisionRootImage | 完整`provision_root_image` step（包含不与provision transition混用的control-only blockd物理身份）、checkpoint top-level revision/spec/placement和该attachment的现有process/volume evidence | 只允许current non-Deleted Desired的唯一Root；step必须先fsync再spawn/adopt精确blockd实例，并以已持久transition ID发送显式typed request，把exact blank head CAS为纯确定计算的generation-1 target。响应不明只读权威head；closed retryable/conflict按§7.1处理。成功前不得创建Guest device或VMM |
-| PrepareDevice | 完整attachment lineage/origin/head/size/durability、closed serving-authority provenance、serving blockd scope/socket/data/executable/process token、closed frontend plan、Guest device及device-only ownership token | 首次Root使用ProvisionRootImage完成的sealed handoff；已有Root及Persistent使用descriptor-stable exact direct authorization，绝不伪造Root handoff。每轮fresh full inventory后只执行该frontend定义的一个bounded effect；晚到资源只按各自独立token和完整物理证据adopt |
-| PrepareNetwork | 完整`NetworkConfig`、Linux IFNAMSIZ内的fresh random tap name和独立network ownership token；top-level runtime incarnation必须null且不得有VMM/Guest transport evidence | checkpoint replace是该轮唯一effect；下一轮accepted fresh full证明exact absent/present后才create/adopt tap，模糊结果再读fresh full。exact tap被新full接受后，后续另一轮才可CAS `StartRuntime`；foreign/duplicate/address collision/ABA零修改并fail closed |
+| PrepareDevice | 完整logical disk IDs/kind、attachment lineage/origin/head/size/durability、closed serving-authority provenance、serving blockd scope/socket/data/executable/process token、closed frontend plan、Guest device及device-only ownership token | 首次Root使用ProvisionRootImage完成的sealed handoff；已有Root及Persistent使用descriptor-stable exact direct authorization，绝不伪造Root handoff。每轮fresh full inventory后只执行该frontend定义的一个bounded effect；晚到资源只按各自独立token和完整物理证据adopt |
+| PrepareNetwork | 完整`NetworkConfig`、Linux IFNAMSIZ内的fresh random tap name、独立network ownership token及全量sorted `PreparedDeviceInput`；top-level stable state null、admission Closed、route gates empty、runtime incarnation null且不得有VMM/Guest transport evidence | checkpoint replace是该轮唯一effect；下一轮accepted fresh full证明exact absent/present后才create/adopt tap，模糊结果再读fresh full。exact tap被新full接受后，后续另一轮才可CAS `StartRuntime`；foreign/duplicate/address collision/ABA零修改并fail closed |
 | FormatFilesystem | attachment、device、filesystem UUID、initialization token、blank predecessor | Guest Agent 只按精确 predecessor 格式化；晚到结果按 UUID probe/adopt，冲突立即 quarantine |
 | DrainInitialization | attachment epoch、local/remote root generation | device flush 后只向精确 owner/epoch publish，直到 `R == L` |
 | CommitInitialized | token、blank predecessor exact RemoteHead、UUID、新exact RemoteHead | Control Store 精确 CAS；相同结果幂等，冲突 quarantine |
 | MountFilesystem | attachment、device、UUID、mount path | 只 mount 精确 device/UUID；晚到 mount 不产生 route authority，stale 时按精确 identity unmount |
-| StartRuntime | runtime incarnation、exact reserved unit、launcher/VMM/kernel/initramfs file provenance、cmdline、VM shape digests、全部socket/RAM/log path、Node-global Guest CID、exact network、按slot排序的closed device inputs及独立process token | 只在accepted fresh full逐字段证明PrepareDevice/PrepareNetwork exact postcondition后no-replace create；fixed launcher验证descriptor并exec VMM。结果不明只做fresh full exact inspect；公共ProcessEvidence本身不授权adopt。late/foreign/duplicate/ABA不覆写、不unlink、不启第二实例，stale结果不开route |
+| StartRuntime | runtime incarnation、exact reserved unit、launcher/VMM/kernel/initramfs file provenance、cmdline、VM shape digests、全部socket/RAM/log path、Node-global Guest CID、exact network、按slot排序的全量`PreparedDeviceInput`及独立process token；stable state null、admission Closed、route gates empty | 只在accepted fresh full逐字段证明PrepareDevice/PrepareNetwork exact postcondition后no-replace create；fixed launcher验证descriptor并exec VMM。结果不明只做fresh full exact inspect；公共process/device evidence可缺失且本身不授权adopt，present必须exact无extra/duplicate。late/foreign/duplicate/ABA不覆写、不unlink、不启第二实例，stale结果不开route |
 | DrainPublish | attachment epoch、local/remote root generation | 只向精确 owner/epoch CAS publish；晚到成功可安全 adopt，旧 epoch 不能写新 root |
 | PauseRuntime | runtime incarnation、process start time | 只 pause 该 incarnation；晚到 pause 可发生，当前 revision 负责 resume 或重建 |
 | SnapshotWarmRuntime | runtime incarnation、snapshot temp id、source root/epoch | 验证VMM postcondition与durable rename；晚到文件不覆盖其他WarmRuntimeSnapshot |
@@ -1098,10 +1099,14 @@ adopt或按名删除。
 fresh boot进入VMM前的固定顺序是`prepare_device -> prepare_network -> start_runtime`。三个checkpoint
 replace与其物理effect不得合并；每轮最多发生其中一个。`prepare_network`必须在current Desired、accepted
 fresh full、全部expected volume/device和provider-private serving proof仍逐字段相同后构造。它持久完整
-`NetworkConfig`、随机tap name及新的network-only ownership token。该token不得从Cat、network ID/MAC、tap
-name、runtime incarnation或任一process/device token推导，也不得等于checkpoint内任一valid process/device
-token。此step要求top-level `runtime_incarnation=null`、`guest_transport=unavailable`且VMM process count为0；
-已有VMM、旧Guest transport或任一foreign/duplicate process都不能成为network create的前置。
+`NetworkConfig`、随机tap name、新的network-only ownership token及全量sorted `PreparedDeviceInput`。后者把
+PrepareDevice的logical disk IDs/kind、attachment/epoch/origin/head/size/durability、Guest slot、随机device/
+process token、sealed authority、Blockd scope/control/data/executable和frontend direct/queues完整带过crash/restart；
+不能从公开process/device投影或current Desired重新猜测。network token不得从Cat、network ID/MAC、tap name、
+runtime incarnation或任一process/device token推导，也不得等于任一prepared/公开valid token。此step要求
+top-level `stable_state=null`、admission Closed、route gates empty、`runtime_incarnation=null`、
+`guest_transport=unavailable`且VMM process count为0；已有VMM、旧Guest transport或任一foreign/duplicate
+process都不能成为network create的前置。
 
 首次写`prepare_network`时只执行checkpoint CAS+file/parent fsync。该CAS是本轮唯一effect，不创建tap、不生成
 runtime incarnation，也不顺带CAS `start_runtime`。tap name须为1..=15 bytes且只含`[A-Za-z0-9_.-]`，不得为
@@ -1117,13 +1122,15 @@ rename/recreate ABA全部保留原物并Quarantine。create/adopt返回、EOF或
 fresh full；只有其中恰好一个`ObservedNetwork`逐字段exact且provider-private proof也闭合才满足postcondition。
 这次accepted full之后，后续独立一轮才允许把checkpoint CAS到`start_runtime`。
 
-`start_runtime`从该accepted full和current `prepare_device` proof冻结全部VMM输入。`devices`必须与checkpoint
-volumes一一对应、slot从0连续递增且Root必须且只在slot 0；其余只能是Persistent。所有输入使用同一种frontend；
-kernel-NBD保留每盘path/token/`direct`，vhost-user保留每盘socket/token及全局一致的`queues/queue_size`，queues
-不得超过vCPU。public `ObservedDevice`只有path/socket、Guest slot和device token，不能证明serving blockd的
-exact executable/argv/handshake、attachment/head或vhost queue配置；scanner必须先把同一个accepted full与
-provider-private exact process、CLI、socket和authorized-serving proof join，任一缺失/冲突都不能构造或adopt
-`start_runtime`。
+`start_runtime`直接复制该accepted `prepare_network.devices`，不得从projection缩减或重建。`devices`必须与
+checkpoint volumes一一对应、slot从0连续递增且Root必须且只在slot 0；其余只能是Persistent。每个top-level
+volume的intent/disk/volume ID、kind、Owned authority及唯一active/no-pending lineage都必须与input exact，即使
+公开process/device尚未扫到也不能删volume。公开Blockd process/device可为absent；present时必须各自恰好匹配
+一个input且无extra/duplicate。所有输入使用同一种frontend；kernel-NBD保留每盘listener/path/token/`direct`，
+vhost-user保留每盘socket/token及全局一致的`queues/queue_size`，queues不得超过vCPU。public
+`ObservedDevice`只有path/socket、Guest slot和device token，不能证明serving blockd的exact executable/argv/
+handshake、attachment/head或vhost queue配置；provider-private exact process、CLI、socket和authorized-serving
+proof仍须逐项重开验证，任一缺失/冲突都不能构造或adopt`start_runtime`。
 
 启动shape还冻结Desired的`vcpus`、`memory_bytes`、`boot_image_digest`和`guest_config_digest`；V1 fresh CH
 memory必须至少128 MiB且是1 MiB整倍数。`RuntimeLaunchArtifact`保存canonical installed HostPath、positive
@@ -1149,11 +1156,14 @@ guest_config_digest == guest_config_digest(GuestRuntimeProfileReceipt {
 planner再要求该值逐字段等于current Desired的approved `runtime.guest_config_digest`。因此替换kernel/initramfs
 bytes或cmdline而只保留旧digest，在Guest启动或回显前已经fail closed。
 
-`runtime_incarnation`和process token分别fresh且互不相等；systemd unit只接受精确
+`runtime_incarnation`、VMM process token、network token及每个prepared device/serving process token形成单一
+全局unique集合，VMM scope也不得等于任一prepared serving scope；systemd unit只接受精确
 `cats-vmm-<runtime_incarnation>.service`，从而与Node-global scanner的reserved `cats-` namespace闭合，禁止
 `dbus.service`、`.service`、空body、额外dot/dash或调用方自选managed name。API/vsock socket、RAM backing、
-serial log及VMM log均为absolute HostPath，并与launcher/VMM/kernel/initramfs、全部device path以及checkpoint
-现有blockd control socket、local-lineage data directory、mount source/target两两不alias。launcher用
+serial log及VMM log均为absolute HostPath；全部launch/artifact path不得alias任一prepared
+authority/control/data/frontend path、serving executable或checkpoint mount source/target，prepared identity paths
+彼此也必须唯一。不同volume只允许彼此共享同一只读Blockd executable，不能让该executable alias其他physical
+identity。launcher用
 `O_CREAT|O_EXCL`/descriptor方式创建RAM和log；API/vsock只允许CH在已证明absent的locked managed namespace
 no-replace bind。任何路径都不得预先unlink、truncate或rename foreign entry。
 
@@ -1166,6 +1176,10 @@ malformed/foreign VMM或不完整scan拒绝。本Node assigned Cat上限为1024�
 reservation，不创建文件、unit或VMM；不得线性扫描整个u32空间。所有新增/移除CID reservation的checkpoint
 replace使用同一flock。V1 Guest Agent AF_VSOCK port固定5000，不在step复制；`vsock_ready`必须回显同incarnation、
 checkpoint CID、port 5000和protocol v1。
+
+`start_runtime`同样要求top-level `stable_state=null`、admission Closed和route gates empty。公开VMM count只允许
+zero或one且one必须逐字段exact；zero VMM时Guest transport只能Unavailable，Malformed或VsockReady都要求one
+exact VMM，VsockReady再精确匹配checkpoint incarnation/CID、port 5000和protocol v1。
 
 provider-private launcher的systemd ExecStart、launcher argv builder和CH argv builder必须是一个closed版本，
 scanner复用同一builder逐byte比较，不能从basename或部分flag采用。launcher重验上述descriptors后，使
@@ -1484,7 +1498,10 @@ ReconcileStep =
   }
 | {
     kind: "prepare_device",
+    volume_intent_id: Id,
+    disk_id: Id,
     volume_id: Id,
+    disk_kind: "root" | "persistent",
     attachment_id: Id,
     attachment_epoch: FenceEpoch,
     acquire_origin: AcquireOrigin,
@@ -1499,7 +1516,8 @@ ReconcileStep =
   }
 | {
     kind: "prepare_network",
-    network: RuntimeNetworkIdentity
+    network: RuntimeNetworkIdentity,
+    devices: [PreparedDeviceInput]
   }
 | {
     kind: "format_filesystem",
@@ -1548,7 +1566,7 @@ ReconcileStep =
     serial_log_path: HostPath,
     vmm_log_path: HostPath,
     network: RuntimeNetworkIdentity,
-    devices: [VmmDeviceInput]
+    devices: [PreparedDeviceInput]
   }
 | {
     kind: "drain_publish",
@@ -1687,7 +1705,8 @@ PrepareDeviceFrontend =
   {
     kind: "kernel_nbd",
     listener_socket_path: HostPath,
-    device_path: HostPath
+    device_path: HostPath,
+    direct: boolean
   }
 | {
     kind: "vhost_user_blk",
@@ -1715,24 +1734,23 @@ VmmBootProvenance {
   kernel_cmdline: AsciiText
 }
 
-VmmDeviceInput =
-  {
-    kind: "kernel_nbd",
-    volume_id: Id,
-    guest_device: GuestDeviceIdentity,
-    device_path: HostPath,
-    ownership_token: RandomId128,
-    direct: boolean
-  }
-| {
-    kind: "vhost_user_blk",
-    volume_id: Id,
-    guest_device: GuestDeviceIdentity,
-    socket_path: HostPath,
-    ownership_token: RandomId128,
-    queues: integer 1..=64,
-    queue_size: integer 2..=32768 and power-of-two
-  }
+PreparedDeviceInput {
+  volume_intent_id: Id,
+  disk_id: Id,
+  volume_id: Id,
+  disk_kind: "root" | "persistent",
+  attachment_id: Id,
+  attachment_epoch: FenceEpoch,
+  acquire_origin: AcquireOrigin,
+  expected_head: RemoteHead,
+  size_bytes: integer 1..=9223372036854775807,
+  durability: "strict" | "relaxed",
+  guest_device: GuestDeviceIdentity,
+  ownership_token: RandomId128,
+  serving_authority: ServingAuthorityProvenance,
+  serving_process: ServingBlockdIdentity,
+  frontend: PrepareDeviceFrontend
+}
 ```
 
 `source_heads`按`volume_id`升序且无重复。`ObservedRuntimeStatus.step`与valid checkpoint中的`step`必须
@@ -1745,7 +1763,8 @@ VmmDeviceInput =
 `ownership_token`的target还要求full inventory中该token只出现一次且evidence为valid；
 missing/corrupt或同token出现在多个实例上都不得自动cleanup。
 
-`prepare_device.ownership_token`只属于最终Guest device；它不得等于
+`prepare_device`必须显式冻结`volume_intent_id`、`disk_id`、`volume_id`和`disk_kind`；Root必须绑定slot 0，
+Persistent不得绑定slot 0。`ownership_token`只属于最终Guest device；它不得等于
 `serving_process.process_identity_token`。`after_root_provision`、`existing_root`和`persistent_initialized`的
 `expected_head`必须是完整nonblank `RemoteHead`；只有`persistent_uninitialized`必须是exact blank head。零
 attachment epoch、零inode、零size、空/仅path authorization、authorization/process/frontend path alias、
@@ -1754,19 +1773,29 @@ direct authorization内容与checkpoint、current Desired/placement及authority�
 context validation，不能由wire decoder凭digest字符串猜测。
 
 `prepare_network.network`必须满足§3的同一isolated `/30`/locally-administered unicast MAC规则；tap name另按
-§7.2限制为安全的1..=15 bytes。checkpoint在该step时只允许`networks=[]`或恰好一个逐字段exact且token为valid
-的projection；top-level incarnation必须null、Guest transport unavailable且VMM count为0。network token不得
-等于checkpoint中任一valid process/device token。
+§7.2限制为安全的1..=15 bytes。其`devices`是nonempty、按slot从0连续排序的完整
+`PreparedDeviceInput`：logical IDs/kind、attachment/epoch/origin/head/size/durability、Guest identity、随机
+device/process token、sealed authority、Blockd scope/control/data/executable及frontend direct/queues全部跨
+PrepareDevice→PrepareNetwork→StartRuntime逐字段保留。Root必须且只在slot 0，其他为Persistent；全部logical/
+physical/token identities无重复，所有frontend同kind且参数一致。checkpoint top-level `ObservedVolume`必须逐volume
+exact匹配logical IDs/kind、Owned authority和唯一active/no-pending lineage，即使公开process/device evidence暂缺也
+不能清空volume；公开Blockd process/device可为absent，present则每个input至多一个exact projection且不得有extra。
+checkpoint在该step时只允许`networks=[]`或恰好一个逐字段exact且token为valid的projection；top-level
+`stable_state=null`、admission Closed、route gates empty、incarnation null、Guest transport unavailable且VMM
+count为0。network token不得等于任一prepared device/serving process token或公开valid token。
 
 `start_runtime.scope_id`必须逐byte等于
-`cats-vmm-<runtime_incarnation>.service`。checkpoint top-level incarnation、恰好一个exact network、全部
-volume/device projection必须与step逐字段相同；devices从slot 0连续排序、volume/serial/path/token分别唯一，
-Root必须且只在slot 0，其余volume必须为Persistent。frontend不得混用且参数必须一致；vhost queues不得超过
-vCPU。zero或one VMM process合法：one只有在role/incarnation、reserved unit、VMM executable path、API path、
-valid process token、Running/verified handshake和完整VM shape全等时合法；任何foreign或duplicate VMM拒绝。
-launch/artifact路径彼此不同，也不得alias device physical path、existing blockd control socket、local-lineage
-data directory或checkpoint mount source/target。`runtime_incarnation`、process/network/device tokens分别不同。
-这些planned token也都不得等于checkpoint中任一existing Blockd process的valid ownership token。
+`cats-vmm-<runtime_incarnation>.service`。checkpoint必须为`stable_state=null`、admission Closed且route gates
+empty；top-level incarnation、恰好一个exact network及完整`PreparedDeviceInput`/volume authority闭包必须与step
+逐字段相同，公开Blockd process/device仍可absent但present必须exact且无extra/duplicate。frontend不得混用且
+参数必须一致；vhost queues不得超过vCPU。zero或one VMM process合法：one只有在role/incarnation、reserved
+unit、VMM executable path、API path、valid process token、Running/verified handshake和完整VM shape全等时合法；
+任何foreign或duplicate VMM拒绝。zero VMM时Guest transport只能Unavailable；Malformed和VsockReady都要求一个
+exact VMM，VsockReady还必须逐字段匹配incarnation、checkpoint CID、固定port 5000和protocol v1。
+launch/artifact路径彼此不同，也不得alias任一prepared authority/control/data/frontend physical path、serving
+executable或checkpoint mount source/target。`runtime_incarnation`、VMM process、network、每个device及每个serving
+process token组成单一全局unique集合；VMM scope也不得等于任一serving scope。公开ProcessEvidence仅作一致性
+projection，不能替代provider-private exact argv/env/cgroup/unit/PID/start/executable/file/tap/device proof授权adopt。
 
 `CleanupRelease`持久化的`inventory_session`/epoch/read position必须逐字段等于用于
 规划该step的已接受`AdmissionInventoryAttestation`及其当前`SessionBinding`；
@@ -2725,12 +2754,14 @@ Rejoined；`host_destroyed`永不Rejoined，因此在没有tombstone、其他Hos
 | Root provision后checkpoint未推进或Agent restart | 新session full inventory后从持久step重算同一target；exact target推进，blank重试，其他结果fail closed，不依赖进程内bool或第二receipt |
 | Root provision与Desired变化 | effect前revision/spec/placement或Root image/size/attachment改变则零副作用replan；in-flight旧effect不能结算新revision。同volume/image/size且exact target可由新planner采用，attachment/placement另走Volume Authority；Deleted/移除走disposition，仍用同volume却改image/size才Quarantine |
 | Root provision顺序 | acquire后可有control-only blockd，但exact target确认前NBD/vhost-user device与VMM均不得出现；Persistent initialization不得产生或消费该step |
-| PrepareDevice serving provenance wire | 首次Root的target-control exact handshake及sealed record仍在ProvisionRootImage完成；已有Root/Persistent只使用descriptor-stable direct authorized attachment及closed purpose。只有persistent_uninitialized接受exact blank；其他分支必须nonblank。fixed vectors逐byte绑定provenance、attachment/origin/head/size/durability、独立process/device token及closed frontend；旧三字段、path-only/opaque proof、token/path alias、错误head state及非法vhost queue全部拒绝 |
+| PrepareDevice serving provenance wire | 首次Root的target-control exact handshake及sealed record仍在ProvisionRootImage完成；已有Root/Persistent只使用descriptor-stable direct authorized attachment及closed purpose。只有persistent_uninitialized接受exact blank；其他分支必须nonblank。fixed vectors逐byte绑定logical disk IDs/kind、provenance、attachment/origin/head/size/durability、独立process/device token及closed frontend；旧三字段、path-only/opaque proof、token/path alias、错误head state及非法vhost queue全部拒绝 |
 | PrepareDevice inventory projection | `ObservedDevice`仅凭path/socket+device token不能证明serving CLI、handshake或vhost queue参数；scanner必须从provider-private exact process/CLI/socket evidence闭合，任何缺失/冲突保持fail closed |
-| PrepareNetwork checkpoint CAS / crash | 首次CAS只持久exact config/name/token且是该轮唯一effect；runtime incarnation null、Guest transport unavailable、VMM count 0。CAS前kill无reservation；file/parent fsync任一点kill按同一step恢复，不创建tap或StartRuntime |
+| PrepareNetwork checkpoint CAS / crash | 首次CAS持久exact config/name/token和全部sorted `PreparedDeviceInput`且是该轮唯一effect；stable null、Closed、route gates empty、runtime incarnation null、Guest transport unavailable、VMM count 0。CAS前kill无reservation；file/parent fsync任一点kill按同一step恢复，不创建tap或StartRuntime |
+| PrepareDevice→PrepareNetwork→StartRuntime restart | checkpoint encode/decode后logical IDs/kind、attachment/epoch/origin/head/size/durability、Guest slot、device/process random token、sealed artifact descriptor/digest、Blockd scope/control/data/exe及frontend direct/queues逐字段不变；公开process/device可absent，present则exact且无extra/duplicate，top-level volume authority/lineage始终exact |
 | PrepareNetwork token/physical冲突 | network token与任一valid serving process/device token相同、same-name foreign/missing/corrupt token、duplicate tap、重叠IPv4或ABA都拒绝且零修改；logical Cat/network/MAC不能推导token/name |
 | PrepareNetwork create response loss | checkpoint accepted full absent后才create/adopt；EOF/timeout后只靠新的full inventory exact projection+provider proof结算。exact present被接受后的下一轮才CAS StartRuntime，不能一轮跨两个effect |
-| StartRuntime wire/fixed vector | 冻结launcher/VMM/kernel/initramfs path+positive length+SHA、exact cmdline/shape/digests、CID、全部paths/network/devices，并从kernel/initramfs/cmdline+protocol v1重算`guest_config_digest`。Root必须slot0且其余Persistent；旧三字段、CID ANY、mixed frontend、queue>vCPU、artifact缺失/零length、boot profile drift、token/path alias与非exact `cats-vmm-<inc>.service`均F0拒绝 |
+| StartRuntime wire/fixed vector | 冻结launcher/VMM/kernel/initramfs path+positive length+SHA、exact cmdline/shape/digests、CID、全部paths/network/`PreparedDeviceInput`，并从kernel/initramfs/cmdline+protocol v1重算`guest_config_digest`。Root必须slot0且其余Persistent；logical ID/kind/lineage drift、旧slim device、CID ANY、mixed frontend、queue>vCPU、artifact缺失/零length、boot profile drift、token/path alias与非exact `cats-vmm-<inc>.service`均F0拒绝 |
+| StartRuntime phase/Guest transport matrix | stable必须null、admission Closed、route gates empty；zero VMM只允许Unavailable，Malformed/VsockReady要求唯一exact VMM，Ready再精确匹配incarnation/CID/5000/v1。foreign/duplicate VMM或仅凭公共ProcessEvidence授权adopt都拒绝 |
 | Node-global Guest CID allocation | global flock内完整checkpoint/live-VMM scan；N个validated occupied只检查N+1个candidate且排除0..2/ANY。CAS轮只写reservation；duplicate/uncheckpointed live CID或scanner unavailable不启动VMM |
 | StartRuntime artifact/path replacement | checkpoint后替换任一installed byte/path、symlink/rename ABA、API/vsock/RAM/log预存在、launch path与blockd control/lineage/mount alias都零unlink/零truncate/零spawn并fail closed |
 | StartRuntime create response loss | 新full inspection逐字段闭合unit/cgroup/MainPID/start/exe/argv/env/fds/API peer+handshake/network/devices/CID后才adopt；公共ProcessEvidence alone、basename或unit name不够。zero exact才重试同attempt；foreign/duplicate/late不stop、不覆盖、不启第二实例 |
@@ -2922,37 +2953,39 @@ validator保持为空；exact target-control PID/start/token/handshake由sealed 
 checkpoint_content_digest = sha256:f4f5073559b8918c500ac706bb395afa9958f309ae8783ff96f980be60d37f2e
 ```
 
-**PrepareDevice checkpoint vector**使用同一个checkpoint-content domain，冻结closed serving provenance、
-完整attachment lineage、彼此不同的process/device token及vhost frontend参数：
+**PrepareDevice checkpoint vector**使用同一个checkpoint-content domain，冻结logical disk IDs/kind、closed
+serving provenance、完整attachment lineage、彼此不同的process/device token及vhost frontend参数：
 
 ```json
-{"cat_id":"cat_01","desired_revision":7,"guest_transport":{"kind":"unavailable"},"lifecycle_admission":"closed","mounts":[],"networks":[],"node_id":"node_a","placement_epoch":3,"processes":[],"require_idle":{"kind":"not_applicable"},"route_gates":[],"runtime_incarnation":null,"spec_digest":"sha256:529c32e8600910283f99bf949af5c31fdadcf3757463eb6c4811c61673ed9409","stable_state":null,"step":{"acquire_origin":{"kind":"normal","transition_id":"22222222222222222222222222222222"},"attachment_epoch":1,"attachment_id":"att_01","durability":"strict","expected_head":{"generation":1,"root_hash":"sha256:0000000000000000000000000000000000000000000000000000000000000000","root_object_id":"volumes/vol_root/roots/1"},"frontend":{"kind":"vhost_user_blk","queue_size":256,"queues":2,"socket_path":"/run/cats/cat_01/root-vhost.sock"},"guest_device":{"serial":"cats-root","slot":0},"kind":"prepare_device","ownership_token":"88888888888888888888888888888888","serving_authority":{"handoff":{"predecessor_checkpoint_content_digest":"sha256:f4f5073559b8918c500ac706bb395afa9958f309ae8783ff96f980be60d37f2e","record":{"content_sha256":"sha256:3333333333333333333333333333333333333333333333333333333333333333","device":16777217,"inode":42,"length":1024,"path":"/var/lib/cats/handoffs/cat_01/root-serving.json"}},"kind":"after_root_provision"},"serving_process":{"control_socket_path":"/var/lib/cats/data/cat-cat_01/volume-vol_root/attachment-att_01/epoch-1/serving-control.sock","data_directory":"/var/lib/cats/data/cat-cat_01/volume-vol_root/attachment-att_01/epoch-1","executable_path":"/usr/bin/cats-blockd","process_identity_token":"77777777777777777777777777777777","scope_id":"cats-serving-77777777777777777777777777777777.service"},"size_bytes":4294967296,"volume_id":"vol_root"},"updated_at_unix_ms":1720000000000,"version":1,"volumes":[{"authority":{"attachment_epoch":1,"attachment_id":"att_01","head":{"generation":1,"root_hash":"sha256:0000000000000000000000000000000000000000000000000000000000000000","root_object_id":"volumes/vol_root/roots/1"},"kind":"owned"},"devices":[],"disk_id":"disk_root","disk_kind":"root","durability":"strict","local_lineages":[{"acquire_origin":{"kind":"normal","transition_id":"22222222222222222222222222222222"},"attachment_epoch":1,"attachment_id":"att_01","data_directory":"/var/lib/cats/data/cat-cat_01/volume-vol_root/attachment-att_01/epoch-1","fenced":false,"local_durable_generation":1,"node_id":"node_a","pending_pack_count":0,"placement_epoch":3,"remote_durable_generation":1,"state":"active"}],"size_bytes":4294967296,"volume_id":"vol_root","volume_intent_id":"vint_root"}],"warm_snapshot":{"kind":"absent"}}
+{"cat_id":"cat_01","desired_revision":7,"guest_transport":{"kind":"unavailable"},"lifecycle_admission":"closed","mounts":[],"networks":[],"node_id":"node_a","placement_epoch":3,"processes":[],"require_idle":{"kind":"not_applicable"},"route_gates":[],"runtime_incarnation":null,"spec_digest":"sha256:529c32e8600910283f99bf949af5c31fdadcf3757463eb6c4811c61673ed9409","stable_state":null,"step":{"acquire_origin":{"kind":"normal","transition_id":"22222222222222222222222222222222"},"attachment_epoch":1,"attachment_id":"att_01","disk_id":"disk_root","disk_kind":"root","durability":"strict","expected_head":{"generation":1,"root_hash":"sha256:0000000000000000000000000000000000000000000000000000000000000000","root_object_id":"volumes/vol_root/roots/1"},"frontend":{"kind":"vhost_user_blk","queue_size":256,"queues":2,"socket_path":"/run/cats/cat_01/root-vhost.sock"},"guest_device":{"serial":"cats-root","slot":0},"kind":"prepare_device","ownership_token":"88888888888888888888888888888888","serving_authority":{"handoff":{"predecessor_checkpoint_content_digest":"sha256:f4f5073559b8918c500ac706bb395afa9958f309ae8783ff96f980be60d37f2e","record":{"content_sha256":"sha256:3333333333333333333333333333333333333333333333333333333333333333","device":16777217,"inode":42,"length":1024,"path":"/var/lib/cats/handoffs/cat_01/root-serving.json"}},"kind":"after_root_provision"},"serving_process":{"control_socket_path":"/var/lib/cats/data/cat-cat_01/volume-vol_root/attachment-att_01/epoch-1/serving-control.sock","data_directory":"/var/lib/cats/data/cat-cat_01/volume-vol_root/attachment-att_01/epoch-1","executable_path":"/usr/bin/cats-blockd","process_identity_token":"77777777777777777777777777777777","scope_id":"cats-serving-77777777777777777777777777777777.service"},"size_bytes":4294967296,"volume_id":"vol_root","volume_intent_id":"vint_root"},"updated_at_unix_ms":1720000000000,"version":1,"volumes":[{"authority":{"attachment_epoch":1,"attachment_id":"att_01","head":{"generation":1,"root_hash":"sha256:0000000000000000000000000000000000000000000000000000000000000000","root_object_id":"volumes/vol_root/roots/1"},"kind":"owned"},"devices":[],"disk_id":"disk_root","disk_kind":"root","durability":"strict","local_lineages":[{"acquire_origin":{"kind":"normal","transition_id":"22222222222222222222222222222222"},"attachment_epoch":1,"attachment_id":"att_01","data_directory":"/var/lib/cats/data/cat-cat_01/volume-vol_root/attachment-att_01/epoch-1","fenced":false,"local_durable_generation":1,"node_id":"node_a","pending_pack_count":0,"placement_epoch":3,"remote_durable_generation":1,"state":"active"}],"size_bytes":4294967296,"volume_id":"vol_root","volume_intent_id":"vint_root"}],"warm_snapshot":{"kind":"absent"}}
 ```
 
 ```text
-checkpoint_content_digest = sha256:7ea5745da9320827d9e7370a03e1d8743c53bcd7ee88fa86c701ec5d98ed9ed8
+checkpoint_content_digest = sha256:c9c0fe2ac27ac10391779def77f17033f4f72c1de5d1de1cd19d25120d8c0167
 ```
 
-**PrepareNetwork checkpoint vector**使用同一个checkpoint-content domain。它刻意只持久network
-reservation，top-level network projection仍为空，证明CAS轮没有顺带创建tap：
+**PrepareNetwork checkpoint vector**使用同一个checkpoint-content domain。它持久network reservation和
+完整nested `PreparedDeviceInput`，且保留exact top-level volume authority/lineage；公开process/device与network
+projection刻意为空，证明crash/redecode不丢随机identity且CAS轮没有顺带创建tap：
 
 ```json
-{"cat_id":"cat_01","desired_revision":7,"guest_transport":{"kind":"unavailable"},"lifecycle_admission":"closed","mounts":[],"networks":[],"node_id":"node_a","placement_epoch":3,"processes":[],"require_idle":{"kind":"not_applicable"},"route_gates":[],"runtime_incarnation":null,"spec_digest":"sha256:529c32e8600910283f99bf949af5c31fdadcf3757463eb6c4811c61673ed9409","stable_state":null,"step":{"kind":"prepare_network","network":{"network_config":{"gateway_ipv4":"10.240.0.5","guest_ipv4":"10.240.0.6","guest_mac":"02:ca:0a:f0:00:06","kind":"isolated_ipv4","network_id":"net_01","prefix_length":30},"ownership_token":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","tap_name":"cats0001"}},"updated_at_unix_ms":1720000000000,"version":1,"volumes":[],"warm_snapshot":{"kind":"absent"}}
+{"cat_id":"cat_01","desired_revision":7,"guest_transport":{"kind":"unavailable"},"lifecycle_admission":"closed","mounts":[],"networks":[],"node_id":"node_a","placement_epoch":3,"processes":[],"require_idle":{"kind":"not_applicable"},"route_gates":[],"runtime_incarnation":null,"spec_digest":"sha256:529c32e8600910283f99bf949af5c31fdadcf3757463eb6c4811c61673ed9409","stable_state":null,"step":{"devices":[{"acquire_origin":{"kind":"normal","transition_id":"22222222222222222222222222222222"},"attachment_epoch":1,"attachment_id":"att_01","disk_id":"disk_root","disk_kind":"root","durability":"strict","expected_head":{"generation":1,"root_hash":"sha256:0000000000000000000000000000000000000000000000000000000000000000","root_object_id":"volumes/vol_root/roots/1"},"frontend":{"kind":"vhost_user_blk","queue_size":256,"queues":2,"socket_path":"/run/cats/cat_01/root-vhost.sock"},"guest_device":{"serial":"cats-root","slot":0},"ownership_token":"88888888888888888888888888888888","serving_authority":{"handoff":{"predecessor_checkpoint_content_digest":"sha256:f4f5073559b8918c500ac706bb395afa9958f309ae8783ff96f980be60d37f2e","record":{"content_sha256":"sha256:3333333333333333333333333333333333333333333333333333333333333333","device":16777217,"inode":42,"length":1024,"path":"/var/lib/cats/handoffs/cat_01/root-serving.json"}},"kind":"after_root_provision"},"serving_process":{"control_socket_path":"/var/lib/cats/data/cat-cat_01/volume-vol_root/attachment-att_01/epoch-1/serving-control.sock","data_directory":"/var/lib/cats/data/cat-cat_01/volume-vol_root/attachment-att_01/epoch-1","executable_path":"/usr/bin/cats-blockd","process_identity_token":"77777777777777777777777777777777","scope_id":"cats-serving-77777777777777777777777777777777.service"},"size_bytes":4294967296,"volume_id":"vol_root","volume_intent_id":"vint_root"}],"kind":"prepare_network","network":{"network_config":{"gateway_ipv4":"10.240.0.5","guest_ipv4":"10.240.0.6","guest_mac":"02:ca:0a:f0:00:06","kind":"isolated_ipv4","network_id":"net_01","prefix_length":30},"ownership_token":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","tap_name":"cats0001"}},"updated_at_unix_ms":1720000000000,"version":1,"volumes":[{"authority":{"attachment_epoch":1,"attachment_id":"att_01","head":{"generation":1,"root_hash":"sha256:0000000000000000000000000000000000000000000000000000000000000000","root_object_id":"volumes/vol_root/roots/1"},"kind":"owned"},"devices":[],"disk_id":"disk_root","disk_kind":"root","durability":"strict","local_lineages":[{"acquire_origin":{"kind":"normal","transition_id":"22222222222222222222222222222222"},"attachment_epoch":1,"attachment_id":"att_01","data_directory":"/var/lib/cats/data/cat-cat_01/volume-vol_root/attachment-att_01/epoch-1","fenced":false,"local_durable_generation":1,"node_id":"node_a","pending_pack_count":0,"placement_epoch":3,"remote_durable_generation":1,"state":"active"}],"size_bytes":4294967296,"volume_id":"vol_root","volume_intent_id":"vint_root"}],"warm_snapshot":{"kind":"absent"}}
 ```
 
 ```text
-checkpoint_content_digest = sha256:ab1b7e329ae084752c635224a9c60db7284d2b405a9d58f45a9ba693a21c5256
+checkpoint_content_digest = sha256:44d7e56d7af5de6ef4afa6232a673a5c068c8db9fc4558e8f937ccb0a6ea6de9
 ```
 
-**StartRuntime checkpoint vector**使用同一个checkpoint-content domain。它冻结accepted exact tap、Root
-slot 0 frontend、boot artifacts/shape/CID及全部launch path；`processes=[]`表示物理create尚未发生：
+**StartRuntime checkpoint vector**使用同一个checkpoint-content domain。它继续携带同一完整nested Root
+authority，冻结accepted exact tap、boot artifacts/shape/CID及全部launch path；公开`processes=[]`和
+`ObservedVolume.devices=[]`表示物理证据待重扫/物理VMM create尚未发生，并不丢失provider-private authority：
 
 ```json
-{"cat_id":"cat_01","desired_revision":7,"guest_transport":{"kind":"unavailable"},"lifecycle_admission":"closed","mounts":[],"networks":[{"gateway_ipv4":"10.240.0.5","guest_ipv4":"10.240.0.6","guest_mac":"02:ca:0a:f0:00:06","kind":"isolated_ipv4","network_id":"net_01","ownership_token":{"kind":"valid","ownership_token":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"},"prefix_length":30,"tap_name":"cats0001"}],"node_id":"node_a","placement_epoch":3,"processes":[],"require_idle":{"kind":"not_applicable"},"route_gates":[],"runtime_incarnation":"55555555555555555555555555555555","spec_digest":"sha256:aad5d63a496f538b00b9eb27bbe1133ec83f5b238b14cb4e19d604fdcd99a6f8","stable_state":null,"step":{"api_socket_path":"/run/cats/cat_01/vmm-api.sock","boot":{"initramfs":{"content_sha256":"sha256:1111111111111111111111111111111111111111111111111111111111111111","length":8388608,"path":"/opt/cats/guest/initramfs.img"},"kernel":{"content_sha256":"sha256:0000000000000000000000000000000000000000000000000000000000000000","length":16777216,"path":"/opt/cats/guest/vmlinuz"},"kernel_cmdline":"console=ttyS0 root=/dev/vda rw clocksource=kvm-clock","vmm_executable":{"content_sha256":"sha256:4444444444444444444444444444444444444444444444444444444444444444","length":33554432,"path":"/usr/bin/cloud-hypervisor"}},"boot_image_digest":"sha256:0000000000000000000000000000000000000000000000000000000000000000","devices":[{"guest_device":{"serial":"cats-root","slot":0},"kind":"vhost_user_blk","ownership_token":"88888888888888888888888888888888","queue_size":256,"queues":2,"socket_path":"/run/cats/cat_01/root-vhost.sock","volume_id":"vol_root"}],"guest_cid":3,"guest_config_digest":"sha256:78215611e8c3bd683eb542b5696a6316156365a94624c7521446ab5660d067e2","kind":"start_runtime","launcher_executable":{"content_sha256":"sha256:3333333333333333333333333333333333333333333333333333333333333333","length":1048576,"path":"/usr/libexec/cats-vmm-launcher"},"memory_bytes":2147483648,"memory_file_path":"/var/lib/cats/cat_01/memory.bin","network":{"network_config":{"gateway_ipv4":"10.240.0.5","guest_ipv4":"10.240.0.6","guest_mac":"02:ca:0a:f0:00:06","kind":"isolated_ipv4","network_id":"net_01","prefix_length":30},"ownership_token":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","tap_name":"cats0001"},"process_identity_token":"66666666666666666666666666666666","runtime_incarnation":"55555555555555555555555555555555","scope_id":"cats-vmm-55555555555555555555555555555555.service","serial_log_path":"/var/log/cats/cat_01/serial.log","vcpus":2,"vmm_log_path":"/var/log/cats/cat_01/vmm.log","vsock_socket_path":"/run/cats/cat_01/vmm-vsock.sock"},"updated_at_unix_ms":1720000000000,"version":1,"volumes":[{"authority":{"attachment_epoch":8,"attachment_id":"att_01","head":{"generation":4,"root_hash":"sha256:2222222222222222222222222222222222222222222222222222222222222222","root_object_id":"volumes/vol_root/roots/4"},"kind":"owned"},"devices":[{"guest_device":{"serial":"cats-root","slot":0},"kind":"vhost_user_blk","ownership_token":{"kind":"valid","ownership_token":"88888888888888888888888888888888"},"socket_path":"/run/cats/cat_01/root-vhost.sock"}],"disk_id":"disk_root","disk_kind":"root","durability":"strict","local_lineages":[{"acquire_origin":{"kind":"normal","transition_id":"13579bdf2468ace013579bdf2468ace0"},"attachment_epoch":8,"attachment_id":"att_01","data_directory":"/var/lib/cats/vol_root","fenced":false,"local_durable_generation":5,"node_id":"node_a","pending_pack_count":1,"placement_epoch":3,"remote_durable_generation":4,"state":"active"}],"size_bytes":4294967296,"volume_id":"vol_root","volume_intent_id":"vint_root"}],"warm_snapshot":{"kind":"absent"}}
+{"cat_id":"cat_01","desired_revision":7,"guest_transport":{"kind":"unavailable"},"lifecycle_admission":"closed","mounts":[],"networks":[{"gateway_ipv4":"10.240.0.5","guest_ipv4":"10.240.0.6","guest_mac":"02:ca:0a:f0:00:06","kind":"isolated_ipv4","network_id":"net_01","ownership_token":{"kind":"valid","ownership_token":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"},"prefix_length":30,"tap_name":"cats0001"}],"node_id":"node_a","placement_epoch":3,"processes":[],"require_idle":{"kind":"not_applicable"},"route_gates":[],"runtime_incarnation":"55555555555555555555555555555555","spec_digest":"sha256:aad5d63a496f538b00b9eb27bbe1133ec83f5b238b14cb4e19d604fdcd99a6f8","stable_state":null,"step":{"api_socket_path":"/run/cats/cat_01/vmm-api.sock","boot":{"initramfs":{"content_sha256":"sha256:1111111111111111111111111111111111111111111111111111111111111111","length":8388608,"path":"/opt/cats/guest/initramfs.img"},"kernel":{"content_sha256":"sha256:0000000000000000000000000000000000000000000000000000000000000000","length":16777216,"path":"/opt/cats/guest/vmlinuz"},"kernel_cmdline":"console=ttyS0 root=/dev/vda rw clocksource=kvm-clock","vmm_executable":{"content_sha256":"sha256:4444444444444444444444444444444444444444444444444444444444444444","length":33554432,"path":"/usr/bin/cloud-hypervisor"}},"boot_image_digest":"sha256:0000000000000000000000000000000000000000000000000000000000000000","devices":[{"acquire_origin":{"kind":"normal","transition_id":"22222222222222222222222222222222"},"attachment_epoch":1,"attachment_id":"att_01","disk_id":"disk_root","disk_kind":"root","durability":"strict","expected_head":{"generation":1,"root_hash":"sha256:0000000000000000000000000000000000000000000000000000000000000000","root_object_id":"volumes/vol_root/roots/1"},"frontend":{"kind":"vhost_user_blk","queue_size":256,"queues":2,"socket_path":"/run/cats/cat_01/root-vhost.sock"},"guest_device":{"serial":"cats-root","slot":0},"ownership_token":"88888888888888888888888888888888","serving_authority":{"handoff":{"predecessor_checkpoint_content_digest":"sha256:f4f5073559b8918c500ac706bb395afa9958f309ae8783ff96f980be60d37f2e","record":{"content_sha256":"sha256:3333333333333333333333333333333333333333333333333333333333333333","device":16777217,"inode":42,"length":1024,"path":"/var/lib/cats/handoffs/cat_01/root-serving.json"}},"kind":"after_root_provision"},"serving_process":{"control_socket_path":"/var/lib/cats/data/cat-cat_01/volume-vol_root/attachment-att_01/epoch-1/serving-control.sock","data_directory":"/var/lib/cats/data/cat-cat_01/volume-vol_root/attachment-att_01/epoch-1","executable_path":"/usr/bin/cats-blockd","process_identity_token":"77777777777777777777777777777777","scope_id":"cats-serving-77777777777777777777777777777777.service"},"size_bytes":4294967296,"volume_id":"vol_root","volume_intent_id":"vint_root"}],"guest_cid":3,"guest_config_digest":"sha256:78215611e8c3bd683eb542b5696a6316156365a94624c7521446ab5660d067e2","kind":"start_runtime","launcher_executable":{"content_sha256":"sha256:3333333333333333333333333333333333333333333333333333333333333333","length":1048576,"path":"/usr/libexec/cats-vmm-launcher"},"memory_bytes":2147483648,"memory_file_path":"/var/lib/cats/cat_01/memory.bin","network":{"network_config":{"gateway_ipv4":"10.240.0.5","guest_ipv4":"10.240.0.6","guest_mac":"02:ca:0a:f0:00:06","kind":"isolated_ipv4","network_id":"net_01","prefix_length":30},"ownership_token":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","tap_name":"cats0001"},"process_identity_token":"66666666666666666666666666666666","runtime_incarnation":"55555555555555555555555555555555","scope_id":"cats-vmm-55555555555555555555555555555555.service","serial_log_path":"/var/log/cats/cat_01/serial.log","vcpus":2,"vmm_log_path":"/var/log/cats/cat_01/vmm.log","vsock_socket_path":"/run/cats/cat_01/vmm-vsock.sock"},"updated_at_unix_ms":1720000000000,"version":1,"volumes":[{"authority":{"attachment_epoch":1,"attachment_id":"att_01","head":{"generation":1,"root_hash":"sha256:0000000000000000000000000000000000000000000000000000000000000000","root_object_id":"volumes/vol_root/roots/1"},"kind":"owned"},"devices":[],"disk_id":"disk_root","disk_kind":"root","durability":"strict","local_lineages":[{"acquire_origin":{"kind":"normal","transition_id":"22222222222222222222222222222222"},"attachment_epoch":1,"attachment_id":"att_01","data_directory":"/var/lib/cats/data/cat-cat_01/volume-vol_root/attachment-att_01/epoch-1","fenced":false,"local_durable_generation":1,"node_id":"node_a","pending_pack_count":0,"placement_epoch":3,"remote_durable_generation":1,"state":"active"}],"size_bytes":4294967296,"volume_id":"vol_root","volume_intent_id":"vint_root"}],"warm_snapshot":{"kind":"absent"}}
 ```
 
 ```text
-checkpoint_content_digest = sha256:47485c632e606032e9b866cded68152f0b6ccc265a2b649a3b77dd329e5b12c2
+checkpoint_content_digest = sha256:9d0d04db3378a41897252da5b9671b4685d9e94961d8384b45c76d7dafe24fa4
 ```
 
 **Non-empty full inventory vector**使用同一个inventory domain。它刻意包含两个frontend、两个tap、

@@ -3,6 +3,8 @@ use std::sync::LazyLock;
 
 use cats_api::runtime_reconciliation::*;
 
+type CheckpointFactory = fn() -> serde_json::Value;
+
 const ZERO_DIGEST: &str = "sha256:0000000000000000000000000000000000000000000000000000000000000000";
 const GUEST_CONFIG_DIGEST: &str =
     "sha256:78215611e8c3bd683eb542b5696a6316156365a94624c7521446ab5660d067e2";
@@ -15,13 +17,13 @@ const CHECKPOINT_DIGEST: &str =
 const PROVISION_ROOT_CHECKPOINT_DIGEST: &str =
     "sha256:f4f5073559b8918c500ac706bb395afa9958f309ae8783ff96f980be60d37f2e";
 const PREPARE_DEVICE_CHECKPOINT_DIGEST: &str =
-    "sha256:7ea5745da9320827d9e7370a03e1d8743c53bcd7ee88fa86c701ec5d98ed9ed8";
+    "sha256:c9c0fe2ac27ac10391779def77f17033f4f72c1de5d1de1cd19d25120d8c0167";
 const PREPARE_NETWORK_CHECKPOINT_DIGEST: &str =
-    "sha256:ab1b7e329ae084752c635224a9c60db7284d2b405a9d58f45a9ba693a21c5256";
+    "sha256:44d7e56d7af5de6ef4afa6232a673a5c068c8db9fc4558e8f937ccb0a6ea6de9";
 const START_RUNTIME_SPEC_DIGEST: &str =
     "sha256:aad5d63a496f538b00b9eb27bbe1133ec83f5b238b14cb4e19d604fdcd99a6f8";
 const START_RUNTIME_CHECKPOINT_DIGEST: &str =
-    "sha256:47485c632e606032e9b866cded68152f0b6ccc265a2b649a3b77dd329e5b12c2";
+    "sha256:9d0d04db3378a41897252da5b9671b4685d9e94961d8384b45c76d7dafe24fa4";
 const SHARED_DESIRED_WIRE: &str =
     include_str!("../../testdata/runtime-reconciliation-v1-desired.json");
 const SHARED_PROVISION_ROOT_CHECKPOINT_WIRE: &str =
@@ -190,7 +192,10 @@ fn provision_root_image_step(size_bytes: u64) -> serde_json::Value {
 fn prepare_device_step() -> serde_json::Value {
     serde_json::json!({
         "kind": "prepare_device",
+        "volume_intent_id": "vint_root",
+        "disk_id": "disk_root",
         "volume_id": "vol_root",
+        "disk_kind": "root",
         "attachment_id": "att_01",
         "attachment_epoch": 8,
         "acquire_origin": {
@@ -232,6 +237,144 @@ fn prepare_device_step() -> serde_json::Value {
             "queue_size": 256,
         },
     })
+}
+
+fn prepared_device_input() -> serde_json::Value {
+    let mut input = prepare_device_step();
+    input.as_object_mut().unwrap().remove("kind");
+    input
+}
+
+fn observed_prepared_volume(device_present: bool) -> serde_json::Value {
+    let devices = if device_present {
+        serde_json::json!([{
+            "kind": "vhost_user_blk",
+            "guest_device": {"serial": "cats-root", "slot": 0},
+            "socket_path": "/run/cats/cat_01/root-vhost.sock",
+            "ownership_token": {
+                "kind": "valid",
+                "ownership_token": "88888888888888888888888888888888",
+            },
+        }])
+    } else {
+        serde_json::json!([])
+    };
+    serde_json::json!({
+        "volume_intent_id": "vint_root",
+        "disk_id": "disk_root",
+        "volume_id": "vol_root",
+        "disk_kind": "root",
+        "size_bytes": 4_294_967_296_u64,
+        "durability": "strict",
+        "authority": {
+            "kind": "owned",
+            "attachment_id": "att_01",
+            "attachment_epoch": 8,
+            "head": nonzero_remote_head(),
+        },
+        "local_lineages": [{
+            "attachment_id": "att_01",
+            "attachment_epoch": 8,
+            "acquire_origin": {
+                "kind": "normal",
+                "transition_id": "22222222222222222222222222222222",
+            },
+            "node_id": "node_a",
+            "placement_epoch": 3,
+            "local_durable_generation": 1,
+            "remote_durable_generation": 1,
+            "data_directory": "/var/lib/cats/vol_root",
+            "pending_pack_count": 0,
+            "fenced": false,
+            "state": "active",
+        }],
+        "devices": devices,
+    })
+}
+
+fn observed_prepared_blockd() -> serde_json::Value {
+    serde_json::json!({
+        "role": {
+            "kind": "blockd",
+            "volume_id": "vol_root",
+            "attachment_id": "att_01",
+            "attachment_epoch": 8,
+        },
+        "process_id": 1002,
+        "process_start_time_ticks": 9002,
+        "executable_path": "/usr/bin/cats-blockd",
+        "scope_id": "cats-cat_01-root-serving",
+        "control_socket_path": "/run/cats/cat_01/blockd-serving-control.sock",
+        "state": "running",
+        "ownership_token": {
+            "kind": "valid",
+            "ownership_token": "77777777777777777777777777777777",
+        },
+        "control_handshake": {"kind": "verified"},
+        "observed_vm_shape": null,
+    })
+}
+
+fn prepared_follower_input() -> serde_json::Value {
+    let mut input = prepared_device_input();
+    input["volume_intent_id"] = "vint_zdata".into();
+    input["disk_id"] = "disk_zdata".into();
+    input["volume_id"] = "vol_zdata".into();
+    input["disk_kind"] = "persistent".into();
+    input["attachment_id"] = "att_zdata".into();
+    input["attachment_epoch"] = 9.into();
+    input["acquire_origin"] = serde_json::json!({
+        "kind": "normal",
+        "transition_id": "33333333333333333333333333333333",
+    });
+    input["expected_head"] = serde_json::json!({
+        "generation": 1,
+        "root_hash": ZERO_DIGEST,
+        "root_object_id": "volumes/vol_zdata/roots/1",
+    });
+    input["guest_device"] = serde_json::json!({"serial": "cats-data", "slot": 1});
+    input["ownership_token"] = "99999999999999999999999999999999".into();
+    input["serving_authority"] = serde_json::json!({
+        "kind": "direct_authorized_attachment",
+        "authorization": {
+            "path": "/var/lib/cats/attachments/cat_01/data-authorized-serving.json",
+            "device": 16_777_217,
+            "inode": 43,
+            "length": 2_048,
+            "content_sha256": "sha256:4444444444444444444444444444444444444444444444444444444444444444",
+        },
+        "purpose": "persistent_initialized",
+    });
+    input["serving_process"] = serde_json::json!({
+        "scope_id": "cats-cat_01-data-serving",
+        "control_socket_path": "/run/cats/cat_01/blockd-data-control.sock",
+        "data_directory": "/var/lib/cats/vol_zdata",
+        "executable_path": "/usr/bin/cats-blockd",
+        "process_identity_token": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+    });
+    input["frontend"]["socket_path"] = "/run/cats/cat_01/data-vhost.sock".into();
+    input
+}
+
+fn observed_prepared_follower_volume() -> serde_json::Value {
+    let mut volume = observed_prepared_volume(false);
+    volume["volume_intent_id"] = "vint_zdata".into();
+    volume["disk_id"] = "disk_zdata".into();
+    volume["volume_id"] = "vol_zdata".into();
+    volume["disk_kind"] = "persistent".into();
+    volume["authority"]["attachment_id"] = "att_zdata".into();
+    volume["authority"]["attachment_epoch"] = 9.into();
+    volume["authority"]["head"] = serde_json::json!({
+        "generation": 1,
+        "root_hash": ZERO_DIGEST,
+        "root_object_id": "volumes/vol_zdata/roots/1",
+    });
+    volume["local_lineages"][0]["attachment_id"] = "att_zdata".into();
+    volume["local_lineages"][0]["attachment_epoch"] = 9.into();
+    volume["local_lineages"][0]["acquire_origin"]["transition_id"] =
+        "33333333333333333333333333333333".into();
+    volume["local_lineages"][0]["data_directory"] = "/var/lib/cats/vol_zdata".into();
+    volume
 }
 
 fn runtime_network_identity() -> serde_json::Value {
@@ -313,18 +456,7 @@ fn start_runtime_step() -> serde_json::Value {
         "serial_log_path": "/var/log/cats/cat_01/serial.log",
         "vmm_log_path": "/var/log/cats/cat_01/vmm.log",
         "network": runtime_network_identity(),
-        "devices": [{
-            "kind": "vhost_user_blk",
-            "volume_id": "vol_root",
-            "guest_device": {
-                "serial": "cats-root",
-                "slot": 0,
-            },
-            "socket_path": "/run/cats/cat_01/root-vhost.sock",
-            "ownership_token": "88888888888888888888888888888888",
-            "queues": 2,
-            "queue_size": 256,
-        }],
+        "devices": [prepared_device_input()],
     });
     bind_start_runtime_guest_profile(&mut step);
     step
@@ -347,36 +479,60 @@ fn observed_runtime_network() -> serde_json::Value {
     })
 }
 
-fn start_runtime_checkpoint_value() -> serde_json::Value {
-    let mut checkpoint: serde_json::Value = serde_json::from_str(CHECKPOINT_WIRE).unwrap();
-    let projection: serde_json::Value = serde_json::from_str(NONEMPTY_INVENTORY_INPUT).unwrap();
-    let mut volume = projection["runtimes"][0]["volumes"][0].clone();
-    volume["devices"] = serde_json::json!([{
-        "kind": "vhost_user_blk",
-        "guest_device": {"serial": "cats-root", "slot": 0},
-        "socket_path": "/run/cats/cat_01/root-vhost.sock",
+fn observed_exact_vmm() -> serde_json::Value {
+    serde_json::json!({
+        "role": {
+            "kind": "vmm",
+            "runtime_incarnation": "55555555555555555555555555555555",
+        },
+        "process_id": 1001,
+        "process_start_time_ticks": 9001,
+        "executable_path": "/usr/bin/cloud-hypervisor",
+        "scope_id": "cats-vmm-55555555555555555555555555555555.service",
+        "control_socket_path": "/run/cats/cat_01/vmm-api.sock",
+        "state": "running",
         "ownership_token": {
             "kind": "valid",
-            "ownership_token": "88888888888888888888888888888888",
+            "ownership_token": "66666666666666666666666666666666",
         },
-    }]);
+        "control_handshake": {"kind": "verified"},
+        "observed_vm_shape": {
+            "vcpus": 2,
+            "memory_bytes": 2_147_483_648_u64,
+            "boot_image_digest": ZERO_DIGEST,
+            "guest_config_digest": GUEST_CONFIG_DIGEST,
+        },
+    })
+}
+
+fn start_runtime_checkpoint_value() -> serde_json::Value {
+    let mut checkpoint: serde_json::Value = serde_json::from_str(CHECKPOINT_WIRE).unwrap();
     checkpoint["runtime_incarnation"] = "55555555555555555555555555555555".into();
     checkpoint["spec_digest"] = START_RUNTIME_SPEC_DIGEST.into();
     checkpoint["networks"] = serde_json::json!([observed_runtime_network()]);
-    checkpoint["volumes"] = serde_json::json!([volume]);
+    checkpoint["volumes"] = serde_json::json!([observed_prepared_volume(false)]);
     checkpoint["step"] = start_runtime_step();
     checkpoint
 }
 
+fn prepare_network_checkpoint_value() -> serde_json::Value {
+    let mut checkpoint: serde_json::Value = serde_json::from_str(CHECKPOINT_WIRE).unwrap();
+    checkpoint["volumes"] = serde_json::json!([observed_prepared_volume(false)]);
+    checkpoint["step"] = serde_json::json!({
+        "kind": "prepare_network",
+        "network": runtime_network_identity(),
+        "devices": [prepared_device_input()],
+    });
+    checkpoint
+}
+
 fn set_start_runtime_kernel_device_path(checkpoint: &mut serde_json::Value, device_path: &str) {
-    checkpoint["step"]["devices"] = serde_json::json!([{
+    checkpoint["step"]["devices"][0]["frontend"] = serde_json::json!({
         "kind": "kernel_nbd",
-        "volume_id": "vol_root",
-        "guest_device": {"serial": "cats-root", "slot": 0},
+        "listener_socket_path": "/run/cats/cat_01/root-nbd.sock",
         "device_path": device_path,
-        "ownership_token": "88888888888888888888888888888888",
         "direct": true,
-    }]);
+    });
     checkpoint["volumes"][0]["devices"] = serde_json::json!([{
         "kind": "kernel_nbd",
         "guest_device": {"serial": "cats-root", "slot": 0},
@@ -2646,11 +2802,7 @@ fn volume_and_gate_reconcile_steps_round_trip_without_copied_authority_payloads(
 
 #[test]
 fn prepare_network_and_start_runtime_round_trip_with_closed_inputs() {
-    let mut prepare: serde_json::Value = serde_json::from_str(CHECKPOINT_WIRE).unwrap();
-    prepare["step"] = serde_json::json!({
-        "kind": "prepare_network",
-        "network": runtime_network_identity(),
-    });
+    let mut prepare = prepare_network_checkpoint_value();
     let decoded = decode_runtime_checkpoint(&serde_json::to_vec(&prepare).unwrap()).unwrap();
     assert!(matches!(decoded.step, ReconcileStep::PrepareNetwork { .. }));
     assert_eq!(
@@ -2662,6 +2814,12 @@ fn prepare_network_and_start_runtime_round_trip_with_closed_inputs() {
     // The same checkpoint is also a valid idempotent adoption reservation once
     // a fresh full inventory projects the exact tap.
     prepare["networks"] = serde_json::json!([observed_runtime_network()]);
+    decode_runtime_checkpoint(&serde_json::to_vec(&prepare).unwrap()).unwrap();
+
+    // Public Blockd/device evidence is an optional projection. When present it
+    // must be exactly the nested restart authority.
+    prepare["processes"] = serde_json::json!([observed_prepared_blockd()]);
+    prepare["volumes"][0] = observed_prepared_volume(true);
     decode_runtime_checkpoint(&serde_json::to_vec(&prepare).unwrap()).unwrap();
 
     let start = start_runtime_checkpoint_value();
@@ -2684,12 +2842,308 @@ fn prepare_network_and_start_runtime_round_trip_with_closed_inputs() {
             .unwrap(),
         start,
     );
+    let mut projected_start = start.clone();
+    projected_start["processes"] = serde_json::json!([observed_prepared_blockd()]);
+    projected_start["volumes"][0] = observed_prepared_volume(true);
+    decode_runtime_checkpoint(&serde_json::to_vec(&projected_start).unwrap()).unwrap();
 
     let mut kernel = start_runtime_checkpoint_value();
     set_start_runtime_kernel_device_path(&mut kernel, "/dev/nbd0");
     kernel["step"]["boot"]["initramfs"] = serde_json::Value::Null;
     bind_start_runtime_guest_profile(&mut kernel["step"]);
     decode_runtime_checkpoint(&serde_json::to_vec(&kernel).unwrap()).unwrap();
+}
+
+#[test]
+fn prepared_device_authority_survives_prepare_network_redecode_into_start_runtime() {
+    let mut prepare_device: serde_json::Value = serde_json::from_str(CHECKPOINT_WIRE).unwrap();
+    prepare_device["step"] = prepare_device_step();
+    let prepare_device =
+        decode_runtime_checkpoint(&serde_json::to_vec(&prepare_device).unwrap()).unwrap();
+    let prepare_device: serde_json::Value =
+        serde_json::from_slice(&encode_runtime_checkpoint(&prepare_device).unwrap()).unwrap();
+    let mut retained = prepare_device["step"].clone();
+    retained.as_object_mut().unwrap().remove("kind");
+
+    let mut prepare_network = prepare_network_checkpoint_value();
+    prepare_network["step"]["devices"] = serde_json::json!([retained.clone()]);
+    let prepare_network =
+        decode_runtime_checkpoint(&serde_json::to_vec(&prepare_network).unwrap()).unwrap();
+    let prepare_network_wire = encode_runtime_checkpoint(&prepare_network).unwrap();
+    let prepare_network = decode_runtime_checkpoint(&prepare_network_wire).unwrap();
+    let prepare_network: serde_json::Value =
+        serde_json::from_slice(&encode_runtime_checkpoint(&prepare_network).unwrap()).unwrap();
+    let retained_after_restart = prepare_network["step"]["devices"][0].clone();
+
+    assert_eq!(retained_after_restart, retained);
+    assert_eq!(
+        retained_after_restart["ownership_token"],
+        "88888888888888888888888888888888"
+    );
+    assert_eq!(
+        retained_after_restart["serving_process"]["process_identity_token"],
+        "77777777777777777777777777777777"
+    );
+    assert_eq!(
+        retained_after_restart["serving_authority"]["handoff"]["record"]["path"],
+        "/var/lib/cats/handoffs/cat_01/root-serving.json"
+    );
+    assert_eq!(
+        retained_after_restart["serving_authority"]["handoff"]["record"]["device"],
+        16_777_217
+    );
+    assert_eq!(
+        retained_after_restart["serving_authority"]["handoff"]["record"]["inode"],
+        42
+    );
+    assert_eq!(
+        retained_after_restart["serving_authority"]["handoff"]["record"]["content_sha256"],
+        "sha256:3333333333333333333333333333333333333333333333333333333333333333"
+    );
+    assert_eq!(
+        retained_after_restart["frontend"],
+        serde_json::json!({
+            "kind": "vhost_user_blk",
+            "socket_path": "/run/cats/cat_01/root-vhost.sock",
+            "queues": 2,
+            "queue_size": 256,
+        })
+    );
+
+    let mut start = start_runtime_checkpoint_value();
+    start["step"]["devices"] = serde_json::json!([retained_after_restart]);
+    decode_runtime_checkpoint(&serde_json::to_vec(&start).unwrap()).unwrap();
+}
+
+#[test]
+fn launch_phase_steps_require_the_pre_install_gate_envelope() {
+    let factories: [(&str, CheckpointFactory); 2] = [
+        ("prepare_network", prepare_network_checkpoint_value),
+        ("start_runtime", start_runtime_checkpoint_value),
+    ];
+    for (step, factory) in factories {
+        let mut stable = factory();
+        stable["stable_state"] = "running".into();
+        let error = reject_checkpoint(&serde_json::to_vec(&stable).unwrap());
+        assert_eq!(malformed(&error).0.as_str(), "", "{step}/stable");
+
+        let mut open = factory();
+        open["lifecycle_admission"] = "open".into();
+        let error = reject_checkpoint(&serde_json::to_vec(&open).unwrap());
+        assert_eq!(malformed(&error).0.as_str(), "", "{step}/admission");
+
+        let mut routed = factory();
+        routed["route_gates"] = serde_json::json!([checkpoint_route_gate("ep_01", 9, "closed")]);
+        let error = reject_checkpoint(&serde_json::to_vec(&routed).unwrap());
+        assert_eq!(malformed(&error).0.as_str(), "", "{step}/route_gates");
+    }
+}
+
+#[test]
+fn launch_phase_steps_require_exact_volume_authority_and_lineage() {
+    let factories: [(&str, CheckpointFactory); 2] = [
+        ("prepare_network", prepare_network_checkpoint_value),
+        ("start_runtime", start_runtime_checkpoint_value),
+    ];
+    for (step, factory) in factories {
+        for mutation in [
+            "input_volume_intent_id",
+            "input_disk_id",
+            "volume_intent_id",
+            "disk_id",
+            "volume_id",
+            "disk_kind",
+            "size",
+            "durability",
+            "authority_attachment",
+            "authority_epoch",
+            "authority_head",
+            "lineage_attachment",
+            "lineage_epoch",
+            "lineage_origin",
+            "lineage_node",
+            "lineage_placement",
+            "lineage_generations",
+            "lineage_directory",
+            "lineage_pending",
+            "lineage_fenced",
+            "lineage_state",
+            "missing_lineage",
+            "extra_volume",
+        ] {
+            let mut checkpoint = factory();
+            match mutation {
+                "input_volume_intent_id" => {
+                    checkpoint["step"]["devices"][0]["volume_intent_id"] = "vint_foreign".into()
+                }
+                "input_disk_id" => {
+                    checkpoint["step"]["devices"][0]["disk_id"] = "disk_foreign".into()
+                }
+                "volume_intent_id" => {
+                    checkpoint["volumes"][0]["volume_intent_id"] = "vint_foreign".into()
+                }
+                "disk_id" => checkpoint["volumes"][0]["disk_id"] = "disk_foreign".into(),
+                "volume_id" => checkpoint["volumes"][0]["volume_id"] = "vol_foreign".into(),
+                "disk_kind" => checkpoint["volumes"][0]["disk_kind"] = "persistent".into(),
+                "size" => checkpoint["volumes"][0]["size_bytes"] = 4_294_967_295_u64.into(),
+                "durability" => checkpoint["volumes"][0]["durability"] = "relaxed".into(),
+                "authority_attachment" => {
+                    checkpoint["volumes"][0]["authority"]["attachment_id"] = "att_foreign".into()
+                }
+                "authority_epoch" => {
+                    checkpoint["volumes"][0]["authority"]["attachment_epoch"] = 9.into()
+                }
+                "authority_head" => {
+                    checkpoint["volumes"][0]["authority"]["head"] = serde_json::json!({
+                        "generation": 2,
+                        "root_hash": ZERO_DIGEST,
+                        "root_object_id": "volumes/vol_root/roots/2",
+                    })
+                }
+                "lineage_attachment" => {
+                    checkpoint["volumes"][0]["local_lineages"][0]["attachment_id"] =
+                        "att_foreign".into()
+                }
+                "lineage_epoch" => {
+                    checkpoint["volumes"][0]["local_lineages"][0]["attachment_epoch"] = 9.into()
+                }
+                "lineage_origin" => {
+                    checkpoint["volumes"][0]["local_lineages"][0]["acquire_origin"] = serde_json::json!({
+                        "kind": "normal",
+                        "transition_id": "33333333333333333333333333333333",
+                    })
+                }
+                "lineage_node" => {
+                    checkpoint["volumes"][0]["local_lineages"][0]["node_id"] = "node_foreign".into()
+                }
+                "lineage_placement" => {
+                    checkpoint["volumes"][0]["local_lineages"][0]["placement_epoch"] = 4.into()
+                }
+                "lineage_generations" => {
+                    checkpoint["volumes"][0]["local_lineages"][0]["local_durable_generation"] =
+                        2.into();
+                    checkpoint["volumes"][0]["local_lineages"][0]["remote_durable_generation"] =
+                        2.into();
+                }
+                "lineage_directory" => {
+                    checkpoint["volumes"][0]["local_lineages"][0]["data_directory"] =
+                        "/var/lib/cats/foreign".into()
+                }
+                "lineage_pending" => {
+                    checkpoint["volumes"][0]["local_lineages"][0]["pending_pack_count"] = 1.into()
+                }
+                "lineage_fenced" => {
+                    checkpoint["volumes"][0]["local_lineages"][0]["fenced"] = true.into()
+                }
+                "lineage_state" => {
+                    checkpoint["volumes"][0]["local_lineages"][0]["state"] = "released".into()
+                }
+                "missing_lineage" => {
+                    checkpoint["volumes"][0]["local_lineages"] = serde_json::json!([])
+                }
+                "extra_volume" => checkpoint["volumes"]
+                    .as_array_mut()
+                    .unwrap()
+                    .push(observed_prepared_follower_volume()),
+                _ => unreachable!(),
+            }
+            let error = reject_checkpoint(&serde_json::to_vec(&checkpoint).unwrap());
+            assert_eq!(
+                malformed(&error).0.as_str(),
+                "/volumes",
+                "{step}/{mutation}"
+            );
+            assert_eq!(
+                malformed(&error).1,
+                MalformedProblem::InvalidValue,
+                "{step}/{mutation}"
+            );
+        }
+    }
+}
+
+#[test]
+fn launch_phase_public_device_and_blockd_projections_are_optional_but_exact() {
+    let factories: [(&str, CheckpointFactory); 2] = [
+        ("prepare_network", prepare_network_checkpoint_value),
+        ("start_runtime", start_runtime_checkpoint_value),
+    ];
+    for (step, factory) in factories {
+        let mut exact = factory();
+        exact["volumes"][0] = observed_prepared_volume(true);
+        exact["processes"] = serde_json::json!([observed_prepared_blockd()]);
+        decode_runtime_checkpoint(&serde_json::to_vec(&exact).unwrap()).unwrap();
+
+        let mut device_mismatch = exact.clone();
+        device_mismatch["volumes"][0]["devices"][0]["guest_device"]["slot"] = 1.into();
+        let error = reject_checkpoint(&serde_json::to_vec(&device_mismatch).unwrap());
+        assert_eq!(malformed(&error).0.as_str(), "/volumes", "{step}/device");
+
+        let mut duplicate_device = exact.clone();
+        let duplicate = duplicate_device["volumes"][0]["devices"][0].clone();
+        duplicate_device["volumes"][0]["devices"]
+            .as_array_mut()
+            .unwrap()
+            .push(duplicate);
+        let error = reject_checkpoint(&serde_json::to_vec(&duplicate_device).unwrap());
+        assert_eq!(
+            malformed(&error).0.as_str(),
+            "/volumes/0/devices",
+            "{step}/duplicate_device"
+        );
+
+        for mutation in [
+            "role",
+            "scope",
+            "control",
+            "executable",
+            "token",
+            "handshake",
+        ] {
+            let mut mismatch = exact.clone();
+            match mutation {
+                "role" => mismatch["processes"][0]["role"]["attachment_epoch"] = 9.into(),
+                "scope" => mismatch["processes"][0]["scope_id"] = "cats-foreign.service".into(),
+                "control" => {
+                    mismatch["processes"][0]["control_socket_path"] =
+                        "/run/cats/foreign.sock".into()
+                }
+                "executable" => {
+                    mismatch["processes"][0]["executable_path"] = "/usr/bin/foreign-blockd".into()
+                }
+                "token" => {
+                    mismatch["processes"][0]["ownership_token"]["ownership_token"] =
+                        "cccccccccccccccccccccccccccccccc".into()
+                }
+                "handshake" => {
+                    mismatch["processes"][0]["control_handshake"] =
+                        serde_json::json!({"kind": "unavailable"})
+                }
+                _ => unreachable!(),
+            }
+            let error = reject_checkpoint(&serde_json::to_vec(&mismatch).unwrap());
+            assert_eq!(
+                malformed(&error).0.as_str(),
+                "/processes",
+                "{step}/{mutation}"
+            );
+        }
+
+        let mut duplicate_process = exact.clone();
+        let mut duplicate = duplicate_process["processes"][0].clone();
+        duplicate["process_id"] = 1003.into();
+        duplicate["process_start_time_ticks"] = 9003.into();
+        duplicate_process["processes"]
+            .as_array_mut()
+            .unwrap()
+            .push(duplicate);
+        let error = reject_checkpoint(&serde_json::to_vec(&duplicate_process).unwrap());
+        assert_eq!(
+            malformed(&error).0.as_str(),
+            "/processes",
+            "{step}/duplicate_process"
+        );
+    }
 }
 
 #[test]
@@ -2701,11 +3155,7 @@ fn prepare_network_rejects_non_exact_or_unsafe_identity() {
         ("multicast_mac", "guest_mac", "03:ca:0a:f0:00:06"),
     ];
     for (name, field, value) in cases {
-        let mut checkpoint: serde_json::Value = serde_json::from_str(CHECKPOINT_WIRE).unwrap();
-        checkpoint["step"] = serde_json::json!({
-            "kind": "prepare_network",
-            "network": runtime_network_identity(),
-        });
+        let mut checkpoint = prepare_network_checkpoint_value();
         if field == "tap_name" {
             checkpoint["step"]["network"][field] = value.into();
         } else {
@@ -2725,11 +3175,7 @@ fn prepare_network_rejects_non_exact_or_unsafe_identity() {
         );
     }
 
-    let mut mismatch: serde_json::Value = serde_json::from_str(CHECKPOINT_WIRE).unwrap();
-    mismatch["step"] = serde_json::json!({
-        "kind": "prepare_network",
-        "network": runtime_network_identity(),
-    });
+    let mut mismatch = prepare_network_checkpoint_value();
     mismatch["networks"] = serde_json::json!([observed_runtime_network()]);
     mismatch["networks"][0]["tap_name"] = "foreign0".into();
     let error = reject_checkpoint(&serde_json::to_vec(&mismatch).unwrap());
@@ -2749,23 +3195,33 @@ fn prepare_network_rejects_non_exact_or_unsafe_identity() {
     );
     assert_eq!(malformed(&error).1, MalformedProblem::MissingField);
 
-    let mut prepare: serde_json::Value = serde_json::from_str(CHECKPOINT_WIRE).unwrap();
-    prepare["step"] = serde_json::json!({
-        "kind": "prepare_network",
-        "network": runtime_network_identity(),
-    });
-    let projection: serde_json::Value = serde_json::from_str(NONEMPTY_INVENTORY_INPUT).unwrap();
+    let prepare = prepare_network_checkpoint_value();
     let mut vmm = prepare.clone();
     vmm["networks"] = serde_json::json!([]);
-    vmm["processes"] = serde_json::json!([projection["runtimes"][0]["processes"][0].clone()]);
+    vmm["processes"] = serde_json::json!([{
+        "role": {"kind": "vmm", "runtime_incarnation": "55555555555555555555555555555555"},
+        "process_id": 1001,
+        "process_start_time_ticks": 9001,
+        "executable_path": "/usr/bin/cloud-hypervisor",
+        "scope_id": "cats-vmm-55555555555555555555555555555555.service",
+        "control_socket_path": "/run/cats/cat_01/vmm-api.sock",
+        "state": "running",
+        "ownership_token": {"kind": "valid", "ownership_token": "66666666666666666666666666666666"},
+        "control_handshake": {"kind": "verified"},
+        "observed_vm_shape": {
+            "vcpus": 2,
+            "memory_bytes": 2_147_483_648_u64,
+            "boot_image_digest": ZERO_DIGEST,
+            "guest_config_digest": GUEST_CONFIG_DIGEST,
+        },
+    }]);
     let error = reject_checkpoint(&serde_json::to_vec(&vmm).unwrap());
     assert_eq!(malformed(&error).0.as_str(), "/processes");
     assert_eq!(malformed(&error).1, MalformedProblem::InvalidValue);
 
     let mut process_alias = prepare.clone();
     process_alias["networks"] = serde_json::json!([]);
-    process_alias["processes"] =
-        serde_json::json!([projection["runtimes"][0]["processes"][1].clone()]);
+    process_alias["processes"] = serde_json::json!([observed_prepared_blockd()]);
     process_alias["step"]["network"]["ownership_token"] = "77777777777777777777777777777777".into();
     let error = reject_checkpoint(&serde_json::to_vec(&process_alias).unwrap());
     assert_eq!(
@@ -2774,13 +3230,7 @@ fn prepare_network_rejects_non_exact_or_unsafe_identity() {
     );
     assert_eq!(malformed(&error).1, MalformedProblem::InvalidValue);
 
-    let mut device_alias = start_runtime_checkpoint_value();
-    device_alias["runtime_incarnation"] = serde_json::Value::Null;
-    device_alias["networks"] = serde_json::json!([]);
-    device_alias["step"] = serde_json::json!({
-        "kind": "prepare_network",
-        "network": runtime_network_identity(),
-    });
+    let mut device_alias = prepare_network_checkpoint_value();
     device_alias["step"]["network"]["ownership_token"] = "88888888888888888888888888888888".into();
     let error = reject_checkpoint(&serde_json::to_vec(&device_alias).unwrap());
     assert_eq!(
@@ -2916,7 +3366,7 @@ fn start_runtime_closes_cid_artifact_shape_tokens_paths_and_devices() {
     cases.push((
         "process_incarnation_alias",
         process_alias,
-        "/step/process_identity_token",
+        "/step",
         MalformedProblem::InvalidValue,
     ));
 
@@ -2928,19 +3378,17 @@ fn start_runtime_closes_cid_artifact_shape_tokens_paths_and_devices() {
     cases.push((
         "network_incarnation_alias",
         network_alias,
-        "/step/network/ownership_token",
+        "/step",
         MalformedProblem::InvalidValue,
     ));
 
     let mut device_alias = start_runtime_checkpoint_value();
     device_alias["step"]["devices"][0]["ownership_token"] =
         device_alias["step"]["runtime_incarnation"].clone();
-    device_alias["volumes"][0]["devices"][0]["ownership_token"]["ownership_token"] =
-        device_alias["step"]["runtime_incarnation"].clone();
     cases.push((
         "device_incarnation_alias",
         device_alias,
-        "/step/devices",
+        "/step",
         MalformedProblem::InvalidValue,
     ));
 
@@ -2966,7 +3414,6 @@ fn start_runtime_closes_cid_artifact_shape_tokens_paths_and_devices() {
 
     let mut gapped_device = start_runtime_checkpoint_value();
     gapped_device["step"]["devices"][0]["guest_device"]["slot"] = 1.into();
-    gapped_device["volumes"][0]["devices"][0]["guest_device"]["slot"] = 1.into();
     cases.push((
         "gapped_device",
         gapped_device,
@@ -2975,16 +3422,16 @@ fn start_runtime_closes_cid_artifact_shape_tokens_paths_and_devices() {
     ));
 
     let mut bad_queue_size = start_runtime_checkpoint_value();
-    bad_queue_size["step"]["devices"][0]["queue_size"] = 3.into();
+    bad_queue_size["step"]["devices"][0]["frontend"]["queue_size"] = 3.into();
     cases.push((
         "bad_queue_size",
         bad_queue_size,
-        "/step/devices",
+        "/step/devices/0/frontend/queue_size",
         MalformedProblem::InvalidValue,
     ));
 
     let mut too_many_queues = start_runtime_checkpoint_value();
-    too_many_queues["step"]["devices"][0]["queues"] = 3.into();
+    too_many_queues["step"]["devices"][0]["frontend"]["queues"] = 3.into();
     cases.push((
         "queues_exceed_vcpus",
         too_many_queues,
@@ -2993,14 +3440,12 @@ fn start_runtime_closes_cid_artifact_shape_tokens_paths_and_devices() {
     ));
 
     let mut device_path_alias = start_runtime_checkpoint_value();
-    device_path_alias["step"]["devices"][0]["socket_path"] =
-        device_path_alias["step"]["api_socket_path"].clone();
-    device_path_alias["volumes"][0]["devices"][0]["socket_path"] =
+    device_path_alias["step"]["devices"][0]["frontend"]["socket_path"] =
         device_path_alias["step"]["api_socket_path"].clone();
     cases.push((
         "device_launch_path_alias",
         device_path_alias,
-        "/step/devices",
+        "/step",
         MalformedProblem::InvalidValue,
     ));
 
@@ -3024,6 +3469,7 @@ fn start_runtime_checkpoint_requires_exact_projected_reservations() {
     cases.push(("network", network, "/networks"));
 
     let mut device = start_runtime_checkpoint_value();
+    device["volumes"][0] = observed_prepared_volume(true);
     device["volumes"][0]["devices"][0]["ownership_token"]["ownership_token"] =
         "99999999999999999999999999999999".into();
     cases.push(("device", device, "/volumes"));
@@ -3072,30 +3518,8 @@ fn start_runtime_requires_one_root_at_slot_zero_and_only_persistent_followers() 
     two_devices["step"]["devices"]
         .as_array_mut()
         .unwrap()
-        .push(serde_json::json!({
-            "kind": "vhost_user_blk",
-            "volume_id": "vol_zdata",
-            "guest_device": {"serial": "cats-data", "slot": 1},
-            "socket_path": "/run/cats/cat_01/data-vhost.sock",
-            "ownership_token": "99999999999999999999999999999999",
-            "queues": 2,
-            "queue_size": 256,
-        }));
-    let mut follower = two_devices["volumes"][0].clone();
-    follower["volume_intent_id"] = "vint_zdata".into();
-    follower["disk_id"] = "disk_zdata".into();
-    follower["volume_id"] = "vol_zdata".into();
-    follower["disk_kind"] = "persistent".into();
-    follower["local_lineages"][0]["data_directory"] = "/var/lib/cats/vol_zdata".into();
-    follower["devices"] = serde_json::json!([{
-        "kind": "vhost_user_blk",
-        "guest_device": {"serial": "cats-data", "slot": 1},
-        "socket_path": "/run/cats/cat_01/data-vhost.sock",
-        "ownership_token": {
-            "kind": "valid",
-            "ownership_token": "99999999999999999999999999999999",
-        },
-    }]);
+        .push(prepared_follower_input());
+    let follower = observed_prepared_follower_volume();
     two_devices["volumes"]
         .as_array_mut()
         .unwrap()
@@ -3111,7 +3535,7 @@ fn start_runtime_requires_one_root_at_slot_zero_and_only_persistent_followers() 
 #[test]
 fn start_runtime_launch_paths_do_not_alias_checkpoint_resources() {
     let projection: serde_json::Value = serde_json::from_str(NONEMPTY_INVENTORY_INPUT).unwrap();
-    let blockd = projection["runtimes"][0]["processes"][1].clone();
+    let blockd = observed_prepared_blockd();
     let mount = projection["runtimes"][0]["mounts"][0].clone();
 
     let mut process_alias = start_runtime_checkpoint_value();
@@ -3122,8 +3546,7 @@ fn start_runtime_launch_paths_do_not_alias_checkpoint_resources() {
     let mut vhost_control_alias = start_runtime_checkpoint_value();
     vhost_control_alias["processes"] = serde_json::json!([blockd.clone()]);
     let blockd_control_path = vhost_control_alias["processes"][0]["control_socket_path"].clone();
-    vhost_control_alias["step"]["devices"][0]["socket_path"] = blockd_control_path.clone();
-    vhost_control_alias["volumes"][0]["devices"][0]["socket_path"] = blockd_control_path;
+    vhost_control_alias["step"]["devices"][0]["frontend"]["socket_path"] = blockd_control_path;
 
     let mut process_token_alias = start_runtime_checkpoint_value();
     process_token_alias["processes"] = serde_json::json!([blockd.clone()]);
@@ -3141,8 +3564,6 @@ fn start_runtime_launch_paths_do_not_alias_checkpoint_resources() {
     device_token_alias["processes"] = serde_json::json!([blockd.clone()]);
     device_token_alias["step"]["devices"][0]["ownership_token"] =
         "77777777777777777777777777777777".into();
-    device_token_alias["volumes"][0]["devices"][0]["ownership_token"]["ownership_token"] =
-        "77777777777777777777777777777777".into();
 
     let mut incarnation_token_alias = start_runtime_checkpoint_value();
     incarnation_token_alias["processes"] = serde_json::json!([blockd.clone()]);
@@ -3153,8 +3574,8 @@ fn start_runtime_launch_paths_do_not_alias_checkpoint_resources() {
         "cats-vmm-77777777777777777777777777777777.service".into();
 
     let mut scope_alias = start_runtime_checkpoint_value();
-    scope_alias["processes"] = serde_json::json!([blockd]);
-    scope_alias["processes"][0]["scope_id"] = scope_alias["step"]["scope_id"].clone();
+    scope_alias["step"]["devices"][0]["serving_process"]["scope_id"] =
+        scope_alias["step"]["scope_id"].clone();
 
     let mut lineage_alias = start_runtime_checkpoint_value();
     lineage_alias["step"]["memory_file_path"] =
@@ -3189,57 +3610,96 @@ fn start_runtime_launch_paths_do_not_alias_checkpoint_resources() {
         mount["mount_path"].as_str().unwrap(),
     );
 
-    for (name, checkpoint) in [
-        ("blockd_control_socket", process_alias),
-        ("vhost_blockd_control_socket", vhost_control_alias),
-        ("blockd_process_token", process_token_alias),
-        ("blockd_network_token", network_token_alias),
-        ("blockd_device_token", device_token_alias),
-        ("blockd_incarnation_token", incarnation_token_alias),
-        ("blockd_scope", scope_alias),
-        ("lineage_data_directory", lineage_alias),
-        ("nbd_lineage_data_directory", nbd_lineage_alias),
-        ("mount_source", mount_source_alias),
-        ("nbd_mount_source", nbd_mount_source_alias),
-        ("mount_target", mount_target_alias),
-        ("nbd_mount_target", nbd_mount_target_alias),
+    for (name, checkpoint, pointer, problem) in [
+        (
+            "blockd_control_socket",
+            process_alias,
+            "/step",
+            MalformedProblem::InvalidValue,
+        ),
+        (
+            "vhost_blockd_control_socket",
+            vhost_control_alias,
+            "/step/devices",
+            MalformedProblem::DuplicateIdentity,
+        ),
+        (
+            "blockd_process_token",
+            process_token_alias,
+            "/step",
+            MalformedProblem::InvalidValue,
+        ),
+        (
+            "blockd_network_token",
+            network_token_alias,
+            "/step",
+            MalformedProblem::InvalidValue,
+        ),
+        (
+            "blockd_device_token",
+            device_token_alias,
+            "/step/devices",
+            MalformedProblem::DuplicateIdentity,
+        ),
+        (
+            "blockd_incarnation_token",
+            incarnation_token_alias,
+            "/step",
+            MalformedProblem::InvalidValue,
+        ),
+        (
+            "blockd_scope",
+            scope_alias,
+            "/step",
+            MalformedProblem::InvalidValue,
+        ),
+        (
+            "lineage_data_directory",
+            lineage_alias,
+            "/step",
+            MalformedProblem::InvalidValue,
+        ),
+        (
+            "nbd_lineage_data_directory",
+            nbd_lineage_alias,
+            "/step/devices",
+            MalformedProblem::DuplicateIdentity,
+        ),
+        (
+            "mount_source",
+            mount_source_alias,
+            "/step",
+            MalformedProblem::InvalidValue,
+        ),
+        (
+            "nbd_mount_source",
+            nbd_mount_source_alias,
+            "/step",
+            MalformedProblem::InvalidValue,
+        ),
+        (
+            "mount_target",
+            mount_target_alias,
+            "/step",
+            MalformedProblem::InvalidValue,
+        ),
+        (
+            "nbd_mount_target",
+            nbd_mount_target_alias,
+            "/step",
+            MalformedProblem::InvalidValue,
+        ),
     ] {
         let error = reject_checkpoint(&serde_json::to_vec(&checkpoint).unwrap());
-        assert_eq!(malformed(&error).0.as_str(), "/step", "{name}");
-        assert_eq!(
-            malformed(&error).1,
-            MalformedProblem::InvalidValue,
-            "{name}"
-        );
+        assert_eq!(malformed(&error).0.as_str(), pointer, "{name}");
+        assert_eq!(malformed(&error).1, problem, "{name}");
     }
 }
 
 #[test]
 fn start_runtime_allows_only_an_exact_already_started_vmm() {
     let mut checkpoint = start_runtime_checkpoint_value();
-    checkpoint["processes"] = serde_json::json!([{
-        "role": {
-            "kind": "vmm",
-            "runtime_incarnation": "55555555555555555555555555555555",
-        },
-        "process_id": 1001,
-        "process_start_time_ticks": 9001,
-        "executable_path": "/usr/bin/cloud-hypervisor",
-        "scope_id": "cats-vmm-55555555555555555555555555555555.service",
-        "control_socket_path": "/run/cats/cat_01/vmm-api.sock",
-        "state": "running",
-        "ownership_token": {
-            "kind": "valid",
-            "ownership_token": "66666666666666666666666666666666",
-        },
-        "control_handshake": {"kind": "verified"},
-        "observed_vm_shape": {
-            "vcpus": 2,
-            "memory_bytes": 2_147_483_648_u64,
-            "boot_image_digest": ZERO_DIGEST,
-            "guest_config_digest": GUEST_CONFIG_DIGEST,
-        },
-    }]);
+    checkpoint["processes"] = serde_json::json!([observed_exact_vmm()]);
     decode_runtime_checkpoint(&serde_json::to_vec(&checkpoint).unwrap()).unwrap();
 
     let mutations = [
@@ -3278,6 +3738,7 @@ fn start_runtime_allows_only_an_exact_already_started_vmm() {
 #[test]
 fn v1_guest_transport_uses_the_checkpointed_cid_and_fixed_port() {
     let mut checkpoint = start_runtime_checkpoint_value();
+    checkpoint["processes"] = serde_json::json!([observed_exact_vmm()]);
     checkpoint["guest_transport"] = serde_json::json!({
         "kind": "vsock_ready",
         "runtime_incarnation": "55555555555555555555555555555555",
@@ -3287,6 +3748,34 @@ fn v1_guest_transport_uses_the_checkpointed_cid_and_fixed_port() {
         "guest_boot_id": "cccccccccccccccccccccccccccccccc",
     });
     decode_runtime_checkpoint(&serde_json::to_vec(&checkpoint).unwrap()).unwrap();
+
+    let mut malformed_with_vmm = checkpoint.clone();
+    malformed_with_vmm["guest_transport"] = serde_json::json!({
+        "kind": "malformed",
+        "raw_response_digest": ZERO_DIGEST,
+    });
+    decode_runtime_checkpoint(&serde_json::to_vec(&malformed_with_vmm).unwrap()).unwrap();
+
+    for (name, evidence) in [
+        (
+            "malformed_without_vmm",
+            serde_json::json!({
+                "kind": "malformed",
+                "raw_response_digest": ZERO_DIGEST,
+            }),
+        ),
+        ("ready_without_vmm", checkpoint["guest_transport"].clone()),
+    ] {
+        let mut without_vmm = start_runtime_checkpoint_value();
+        without_vmm["guest_transport"] = evidence;
+        let error = reject_checkpoint(&serde_json::to_vec(&without_vmm).unwrap());
+        assert_eq!(malformed(&error).0.as_str(), "/guest_transport", "{name}");
+        assert_eq!(
+            malformed(&error).1,
+            MalformedProblem::InvalidValue,
+            "{name}"
+        );
+    }
 
     let mut wrong_cid = checkpoint.clone();
     wrong_cid["guest_transport"]["guest_cid"] = 4.into();
@@ -3715,6 +4204,7 @@ fn prepare_device_numeric_boundaries_and_frontends_are_closed() {
         "kind": "kernel_nbd",
         "listener_socket_path": "/run/cats/cat_01/root-nbd.sock",
         "device_path": "/dev/nbd0",
+        "direct": true,
     });
     let mut checkpoint: serde_json::Value = serde_json::from_str(CHECKPOINT_WIRE).unwrap();
     checkpoint["step"] = kernel;
@@ -3764,6 +4254,7 @@ fn prepare_device_rejects_token_and_path_aliases() {
                     "kind": "kernel_nbd",
                     "listener_socket_path": "/dev/nbd0",
                     "device_path": "/dev/nbd0",
+                    "direct": true,
                 })
             }
             "record" => {
@@ -3782,6 +4273,7 @@ fn prepare_device_rejects_token_and_path_aliases() {
                     "kind": "kernel_nbd",
                     "listener_socket_path": "/run/cats/cat_01/root-nbd.sock",
                     "device_path": step["serving_authority"]["handoff"]["record"]["path"].clone(),
+                    "direct": true,
                 })
             }
             _ => unreachable!(),

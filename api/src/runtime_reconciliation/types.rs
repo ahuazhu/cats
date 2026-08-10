@@ -1075,6 +1075,7 @@ pub enum PrepareDeviceFrontend {
     KernelNbd {
         listener_socket_path: HostPath,
         device_path: HostPath,
+        direct: bool,
     },
     VhostUserBlk {
         socket_path: HostPath,
@@ -1125,30 +1126,29 @@ pub struct VmmBootProvenance {
     pub kernel_cmdline: AsciiText,
 }
 
-/// One exact, already prepared block frontend consumed by a VMM launch.
+/// One exact PrepareDevice expectation retained by every later launch phase.
 ///
-/// This deliberately retains the frontend parameters that are present in the
-/// preceding `prepare_device` step but are not part of public
-/// `ObservedDevice` evidence.  A StartRuntime checkpoint therefore remains
-/// independently interpretable after an Agent restart.
+/// Public process/device observations are only projections of this authority:
+/// direct/queue settings and sealed serving provenance cannot be reconstructed
+/// from them after an Agent restart.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
-pub enum VmmDeviceInput {
-    KernelNbd {
-        volume_id: Id,
-        guest_device: GuestDeviceIdentity,
-        device_path: HostPath,
-        ownership_token: RandomId128,
-        direct: bool,
-    },
-    VhostUserBlk {
-        volume_id: Id,
-        guest_device: GuestDeviceIdentity,
-        socket_path: HostPath,
-        ownership_token: RandomId128,
-        queues: u16,
-        queue_size: u16,
-    },
+#[serde(deny_unknown_fields)]
+pub struct PreparedDeviceInput {
+    pub volume_intent_id: Id,
+    pub disk_id: Id,
+    pub volume_id: Id,
+    pub disk_kind: DiskKind,
+    pub attachment_id: Id,
+    pub attachment_epoch: FenceEpoch,
+    pub acquire_origin: AcquireOrigin,
+    pub expected_head: RemoteHead,
+    pub size_bytes: u64,
+    pub durability: Durability,
+    pub guest_device: GuestDeviceIdentity,
+    pub ownership_token: RandomId128,
+    pub serving_authority: Box<ServingAuthorityProvenance>,
+    pub serving_process: ServingBlockdIdentity,
+    pub frontend: PrepareDeviceFrontend,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -1185,7 +1185,10 @@ pub enum ReconcileStep {
         expected_provisioned_head: RemoteHead,
     },
     PrepareDevice {
+        volume_intent_id: Id,
+        disk_id: Id,
         volume_id: Id,
+        disk_kind: DiskKind,
         attachment_id: Id,
         attachment_epoch: FenceEpoch,
         acquire_origin: AcquireOrigin,
@@ -1204,6 +1207,7 @@ pub enum ReconcileStep {
     },
     PrepareNetwork {
         network: RuntimeNetworkIdentity,
+        devices: Vec<PreparedDeviceInput>,
     },
     FormatFilesystem {
         volume_id: Id,
@@ -1249,7 +1253,7 @@ pub enum ReconcileStep {
         serial_log_path: HostPath,
         vmm_log_path: HostPath,
         network: Box<RuntimeNetworkIdentity>,
-        devices: Vec<VmmDeviceInput>,
+        devices: Vec<PreparedDeviceInput>,
     },
     DrainPublish {
         volume_id: Id,

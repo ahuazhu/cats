@@ -234,6 +234,7 @@ async fn spawn_signed_runtime_cutover_with_scanner(
             config.agent_registration.runtime_state_directory(),
             config.ch_config.nbd_client_bin.clone(),
             config.ch_config.nbd_devices,
+            config.ch_config.block_direct,
         )
         .context("compose kernel-NBD PrepareDevice reservation")?,
         BlockPath::VhostUser => ServingPrepareFrontend::vhost_user_blk(

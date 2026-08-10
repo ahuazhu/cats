@@ -8993,7 +8993,10 @@ mod tests {
         let data_directory =
             HostPath::new(fixture.data_directory.to_string_lossy().into_owned()).unwrap();
         checkpoint.step = ReconcileStep::PrepareDevice {
+            volume_intent_id: volume.volume_intent_id.clone(),
+            disk_id: volume.disk_id.clone(),
             volume_id: volume.volume_id.clone(),
+            disk_kind: volume.disk_kind,
             attachment_id: attachment.identity.attachment_id.clone(),
             attachment_epoch: attachment.identity.attachment_epoch,
             acquire_origin: attachment.identity.acquire_origin.clone(),
