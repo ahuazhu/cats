@@ -365,12 +365,15 @@ impl SignedRootProvisionEffect {
         if matches!(
             hint,
             RootProvisionResponseHint::Unknown(
-                super::RootProvisionUnknownReason::MismatchedIdentity
+                super::RootProvisionUnknownReason::PeerIdentityMismatch
             )
         ) {
             return Ok(Some(stop_local()));
         }
-        context.check_active()?;
+        // Every non-peer outcome may follow a complete or partial request
+        // write. Cancellation while waiting for the response is therefore not
+        // authority to skip the mandatory point read: the remote data effect
+        // may already have committed before cancellation was observed.
         let current = match self.authority.load_volume(&volume.volume_id) {
             Ok(record) => record,
             Err(_) => return Ok(Some(RuntimeDesiredEffectOutcome::RefreshInventory)),
@@ -944,7 +947,7 @@ mod tests {
             }
             if self.identity_mismatch {
                 return Ok(RootProvisionResponseHint::Unknown(
-                    super::super::RootProvisionUnknownReason::MismatchedIdentity,
+                    super::super::RootProvisionUnknownReason::PeerIdentityMismatch,
                 ));
             }
             self.calls.fetch_add(1, Ordering::SeqCst);
@@ -1029,6 +1032,7 @@ mod tests {
     struct SerialRequestPort {
         process_identity: FixedProcessIdentity,
         socket_path: PathBuf,
+        calls: AtomicUsize,
     }
 
     impl request_sealed::Sealed for SerialRequestPort {}
@@ -1041,6 +1045,7 @@ mod tests {
             request: &cats_api::runtime_reconciliation::ProvisionRootImageRequest,
             context: &RuntimeDesiredEffectContext,
         ) -> anyhow::Result<RootProvisionResponseHint> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
             let remaining = context.deadline().saturating_duration_since(Instant::now());
             Ok(
                 UnixRootProvisionClient::new(&self.socket_path, remaining, remaining)
@@ -1611,12 +1616,13 @@ mod tests {
         let request = Arc::new(SerialRequestPort {
             process_identity: FixedProcessIdentity(expected_identity),
             socket_path,
+            calls: AtomicUsize::new(0),
         });
         let effect = SignedRootProvisionEffect::for_test(
             Arc::clone(&fixture.authority) as Arc<dyn VolumeDataAuthority>,
             Arc::clone(&fixture.blob) as Arc<dyn BlobStore>,
             Arc::clone(&process) as Arc<dyn RootProvisionProcessPort>,
-            request,
+            Arc::clone(&request) as Arc<dyn RootProvisionRequestPort>,
             HostPath::new("/usr/bin/cats-blockd".to_owned()).unwrap(),
         );
         let mut accepted_process = fixture.public_process();
@@ -1640,8 +1646,214 @@ mod tests {
             "the provision request must reach the same one-at-a-time listener after status closes"
         );
         server.join().unwrap();
+        assert_eq!(request.calls.load(Ordering::SeqCst), 1);
         assert_eq!(process.inspections.load(Ordering::SeqCst), 1);
         assert_eq!(fixture.authority.record().head, result.resulting_head);
+    }
+
+    #[test]
+    fn real_request_with_mismatched_response_rereads_target_or_keeps_blank_unconfirmed() {
+        for authority_reaches_target in [true, false] {
+            let fixture = Fixture::new();
+            let ReconcileStep::ProvisionRootImage {
+                expected_provisioned_head,
+                ..
+            } = &fixture.checkpoint.step
+            else {
+                unreachable!()
+            };
+            let expected_request = provision_root_image_request(&fixture.checkpoint).unwrap();
+            let mut expected_request_frame = b"provision_root_image ".to_vec();
+            expected_request_frame
+                .extend(encode_provision_root_image_request(&expected_request).unwrap());
+            expected_request_frame.push(b'\n');
+
+            let mut wrong_result = ProvisionRootImageResult {
+                provision_transition_id: expected_request.provision_transition_id.clone(),
+                volume_id: expected_request.volume_id.clone(),
+                attachment_id: expected_request.attachment_id.clone(),
+                attachment_epoch: expected_request.attachment_epoch,
+                resulting_head: expected_request.expected_provisioned_head.clone(),
+            };
+            wrong_result.provision_transition_id = random('9');
+            let mut wrong_response = b"OK ".to_vec();
+            wrong_response.extend(encode_provision_root_image_result(&wrong_result).unwrap());
+            wrong_response.push(b'\n');
+
+            let socket_root = tempfile::Builder::new()
+                .prefix("cats-rp-wrong-")
+                .tempdir_in("/tmp")
+                .unwrap();
+            let socket_path = socket_root.path().join("control.sock");
+            let listener = UnixListener::bind(&socket_path).unwrap();
+            let authority = Arc::clone(&fixture.authority);
+            let target = expected_provisioned_head.clone();
+            let (request_tx, request_rx) = mpsc::channel();
+            let server = std::thread::spawn(move || {
+                let (mut stream, _) = listener.accept().unwrap();
+                stream
+                    .set_read_timeout(Some(Duration::from_secs(1)))
+                    .unwrap();
+                let mut request_frame = Vec::new();
+                BufReader::new(&mut stream)
+                    .read_until(b'\n', &mut request_frame)
+                    .unwrap();
+                request_tx.send(request_frame).unwrap();
+                if authority_reaches_target {
+                    authority.set_head(target);
+                }
+                stream.write_all(&wrong_response).unwrap();
+            });
+
+            let process_id = std::process::id();
+            let start_time_ticks = 42;
+            let process = Arc::new(FakeProcessPort::exact(process_id, start_time_ticks));
+            let request = Arc::new(SerialRequestPort {
+                process_identity: FixedProcessIdentity(ProcIdentity {
+                    pid: process_id,
+                    start_ticks: Some(start_time_ticks),
+                    exe: Some(Path::new("/usr/bin/cats-blockd").to_path_buf()),
+                }),
+                socket_path,
+                calls: AtomicUsize::new(0),
+            });
+            let effect = SignedRootProvisionEffect::for_test(
+                Arc::clone(&fixture.authority) as Arc<dyn VolumeDataAuthority>,
+                Arc::clone(&fixture.blob) as Arc<dyn BlobStore>,
+                process,
+                Arc::clone(&request) as Arc<dyn RootProvisionRequestPort>,
+                HostPath::new("/usr/bin/cats-blockd".to_owned()).unwrap(),
+            );
+            let mut accepted_process = fixture.public_process();
+            accepted_process.process_id = process_id;
+            accepted_process.process_start_time_ticks = WireU64::new(start_time_ticks).unwrap();
+            assert_eq!(
+                effect
+                    .try_apply(&fixture.context(vec![accepted_process]), &fixture.desired)
+                    .unwrap(),
+                Some(RuntimeDesiredEffectOutcome::RefreshInventory),
+                "a post-send response mismatch remains authority-reread ambiguity"
+            );
+            assert_eq!(
+                request_rx.recv_timeout(Duration::from_secs(2)).unwrap(),
+                expected_request_frame,
+                "positive calibration: the exact provision request reached the real socket"
+            );
+            server.join().unwrap();
+            assert_eq!(request.calls.load(Ordering::SeqCst), 1);
+            assert_eq!(fixture.authority.loads.load(Ordering::SeqCst), 2);
+            assert_eq!(
+                fixture.authority.record().head,
+                if authority_reaches_target {
+                    expected_request.expected_provisioned_head.clone()
+                } else {
+                    fixture.attachment.head.clone()
+                },
+                "a mismatched response cannot manufacture a target head or hide an authoritative one"
+            );
+        }
+    }
+
+    #[test]
+    fn cancellation_after_real_request_rereads_target_before_refresh_and_never_resends() {
+        let fixture = Fixture::new();
+        let ReconcileStep::ProvisionRootImage {
+            expected_provisioned_head,
+            ..
+        } = &fixture.checkpoint.step
+        else {
+            unreachable!()
+        };
+        let expected_request = provision_root_image_request(&fixture.checkpoint).unwrap();
+        let mut expected_request_frame = b"provision_root_image ".to_vec();
+        expected_request_frame
+            .extend(encode_provision_root_image_request(&expected_request).unwrap());
+        expected_request_frame.push(b'\n');
+
+        let socket_root = tempfile::Builder::new()
+            .prefix("cats-rp-cancel-")
+            .tempdir_in("/tmp")
+            .unwrap();
+        let socket_path = socket_root.path().join("control.sock");
+        let listener = UnixListener::bind(&socket_path).unwrap();
+        let authority = Arc::clone(&fixture.authority);
+        let target = expected_provisioned_head.clone();
+        let (request_tx, request_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            stream
+                .set_read_timeout(Some(Duration::from_secs(1)))
+                .unwrap();
+            let mut request_frame = Vec::new();
+            BufReader::new(&mut stream)
+                .read_until(b'\n', &mut request_frame)
+                .unwrap();
+            authority.set_head(target);
+            request_tx.send(request_frame).unwrap();
+            release_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+        });
+
+        let process_id = std::process::id();
+        let start_time_ticks = 42;
+        let process = Arc::new(FakeProcessPort::exact(process_id, start_time_ticks));
+        let request = Arc::new(SerialRequestPort {
+            process_identity: FixedProcessIdentity(ProcIdentity {
+                pid: process_id,
+                start_ticks: Some(start_time_ticks),
+                exe: Some(Path::new("/usr/bin/cats-blockd").to_path_buf()),
+            }),
+            socket_path,
+            calls: AtomicUsize::new(0),
+        });
+        let effect = Arc::new(SignedRootProvisionEffect::for_test(
+            Arc::clone(&fixture.authority) as Arc<dyn VolumeDataAuthority>,
+            Arc::clone(&fixture.blob) as Arc<dyn BlobStore>,
+            process,
+            Arc::clone(&request) as Arc<dyn RootProvisionRequestPort>,
+            HostPath::new("/usr/bin/cats-blockd".to_owned()).unwrap(),
+        ));
+        let mut accepted_process = fixture.public_process();
+        accepted_process.process_id = process_id;
+        accepted_process.process_start_time_ticks = WireU64::new(start_time_ticks).unwrap();
+        let context = Arc::new(fixture.context(vec![accepted_process.clone()]));
+        let desired = fixture.desired.clone();
+        let worker_effect = Arc::clone(&effect);
+        let worker_context = Arc::clone(&context);
+        let worker =
+            std::thread::spawn(move || worker_effect.try_apply(worker_context.as_ref(), &desired));
+
+        assert_eq!(
+            request_rx.recv_timeout(Duration::from_secs(2)).unwrap(),
+            expected_request_frame,
+            "positive calibration: the complete provision frame reached the real serial socket"
+        );
+        context.cancel_for_test();
+        assert_eq!(
+            worker.join().unwrap().unwrap(),
+            Some(RuntimeDesiredEffectOutcome::RefreshInventory),
+            "post-request cancellation must not suppress the mandatory authority reread"
+        );
+        assert_eq!(fixture.authority.loads.load(Ordering::SeqCst), 2);
+        assert_eq!(
+            fixture.authority.record().head,
+            expected_provisioned_head.clone()
+        );
+        assert_eq!(request.calls.load(Ordering::SeqCst), 1);
+        release_tx.send(()).unwrap();
+        server.join().unwrap();
+
+        assert_eq!(
+            effect
+                .try_apply(&fixture.context(vec![accepted_process]), &fixture.desired,)
+                .unwrap(),
+            Some(RuntimeDesiredEffectOutcome::RefreshInventory)
+        );
+        assert_eq!(
+            request.calls.load(Ordering::SeqCst),
+            1,
+            "the authoritative target prevents a replay on the next fresh admission"
+        );
     }
 
     #[test]

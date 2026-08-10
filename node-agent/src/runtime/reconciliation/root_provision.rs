@@ -33,6 +33,10 @@ pub enum RootProvisionResponseHint {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RootProvisionUnknownReason {
     Connect,
+    /// The connected Unix peer or its socket-free process sample did not
+    /// match the process revalidated before connect. No request byte was
+    /// written for this outcome.
+    PeerIdentityMismatch,
     Write,
     Timeout,
     Eof,
@@ -146,7 +150,7 @@ impl UnixRootProvisionClient {
         };
         if let Some(expected) = expected_peer_process {
             let Some(actual_process_id) = connected_peer_process_id(&stream) else {
-                return Ok(unknown(RootProvisionUnknownReason::MismatchedIdentity));
+                return Ok(unknown(RootProvisionUnknownReason::PeerIdentityMismatch));
             };
             if actual_process_id != expected.pid
                 || process_identity
@@ -154,7 +158,7 @@ impl UnixRootProvisionClient {
                     .as_ref()
                     != Some(expected)
             {
-                return Ok(unknown(RootProvisionUnknownReason::MismatchedIdentity));
+                return Ok(unknown(RootProvisionUnknownReason::PeerIdentityMismatch));
             }
         }
         let mut frame = Vec::with_capacity(COMMAND_PREFIX.len() + payload.len() + 1);
@@ -945,7 +949,7 @@ mod tests {
                 .unwrap();
         assert_eq!(
             observed.hint(),
-            &RootProvisionResponseHint::Unknown(RootProvisionUnknownReason::MismatchedIdentity)
+            &RootProvisionResponseHint::Unknown(RootProvisionUnknownReason::PeerIdentityMismatch)
         );
         assert_eq!(
             received.recv_timeout(Duration::from_secs(2)).unwrap(),
@@ -1025,7 +1029,9 @@ mod tests {
                     .unwrap();
             assert_eq!(
                 observed.hint(),
-                &RootProvisionResponseHint::Unknown(RootProvisionUnknownReason::MismatchedIdentity)
+                &RootProvisionResponseHint::Unknown(
+                    RootProvisionUnknownReason::PeerIdentityMismatch
+                )
             );
             assert_eq!(
                 received.recv_timeout(Duration::from_secs(2)).unwrap(),
