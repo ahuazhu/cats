@@ -94,6 +94,14 @@ mod vmm_api_inspection;
     reason = "checkpointed VMM systemd port awaits full-inventory composition"
 )]
 mod vmm_process;
+// Guest CID reservation is checkpoint-first and provider-private.  The VMM
+// process scanner and physical start effect consume this sealed allocator in
+// the following StartRuntime composition slice.
+#[expect(
+    dead_code,
+    reason = "sealed VMM CID allocator is staged before StartRuntime composition"
+)]
+mod vmm_cid;
 mod volume_transitions;
 
 pub(crate) mod inventory_probe_sealed {
