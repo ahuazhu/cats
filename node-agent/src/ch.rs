@@ -509,12 +509,30 @@ fn ip_status(context: &IpCommandContext<'_>, ip_bin: &Path, args: &[&str]) -> Re
 /// The caller must durably checkpoint the return value before calling
 /// [`prepare_network`]. A checkpoint replay must reuse this exact value.
 pub fn plan_network(desired: &NetworkConfig) -> Result<ChNetwork> {
+    plan_network_with_random(desired, || {
+        RandomId128::new(uuid::Uuid::new_v4().simple().to_string())
+            .context("generate Host network identity entropy")
+    })
+}
+
+fn plan_network_with_random(
+    desired: &NetworkConfig,
+    mut random: impl FnMut() -> Result<RandomId128>,
+) -> Result<ChNetwork> {
     validate_desired_network(desired)?;
-    let random = uuid::Uuid::new_v4().simple().to_string();
+    // The Linux-visible name is not an authority token.  Mint it from a
+    // separate CSPRNG sample so publishing the name does not disclose any
+    // prefix of the provider-private ownership capability.
+    let tap_entropy = random()?;
+    let ownership_token = random()?;
+    anyhow::ensure!(
+        tap_entropy != ownership_token,
+        "Host TAP name entropy collided with its ownership token"
+    );
     bind_desired_network(
         desired,
-        format!("cat{}", &random[..11]),
-        RandomId128::new(random).expect("UUID v4 is a nonzero RandomId128"),
+        format!("cat{}", &tap_entropy.as_str()[..11]),
+        ownership_token,
     )
 }
 
@@ -575,6 +593,22 @@ impl Ipv4Cidr {
     }
 }
 
+pub(crate) fn network_configs_overlap(left: &NetworkConfig, right: &NetworkConfig) -> Result<bool> {
+    validate_desired_network(left)?;
+    validate_desired_network(right)?;
+    let left = Ipv4Cidr::parse(&format!(
+        "{}/{}",
+        left.gateway_ipv4.as_str(),
+        left.prefix_length
+    ))?;
+    let right = Ipv4Cidr::parse(&format!(
+        "{}/{}",
+        right.gateway_ipv4.as_str(),
+        right.prefix_length
+    ))?;
+    Ok(left.overlaps(right))
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct HostIpv4Address {
     interface: String,
@@ -597,6 +631,12 @@ struct HostNetworkLinkSnapshot {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct HostNetworkSnapshot {
     links: BTreeMap<String, HostNetworkLinkSnapshot>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ReservedHostNetworkState {
+    Absent,
+    Exact,
 }
 
 #[derive(serde::Deserialize)]
@@ -711,6 +751,39 @@ impl HostNetworkSnapshot {
         Ok(())
     }
 
+    /// Close every durable reservation against the complete Host IPv4 set.
+    /// Its own exact TAP/address is the sole allowed overlap; an absent
+    /// reservation therefore conflicts with any physical owner of its range.
+    pub(crate) fn ensure_reserved_network_ranges<'a>(
+        &self,
+        reserved: impl IntoIterator<Item = &'a RuntimeNetworkIdentity>,
+    ) -> Result<()> {
+        let reserved = reserved.into_iter().collect::<Vec<_>>();
+        for identity in &reserved {
+            let expected = ChNetwork {
+                tap: identity.tap_name.as_str().to_owned(),
+                ownership_token: identity.ownership_token.clone(),
+                config: identity.network_config.clone(),
+            };
+            validate_network_plan(&expected)?;
+            let desired = Ipv4Cidr::parse(&host_cidr(&expected))?;
+            for (name, link) in &self.links {
+                for address in &link.ipv4 {
+                    if name == &expected.tap && address == &desired {
+                        continue;
+                    }
+                    anyhow::ensure!(
+                        !address.overlaps(desired),
+                        "durable Host network range {} overlaps {} on {name}",
+                        desired.display(),
+                        address.display()
+                    );
+                }
+            }
+        }
+        Ok(())
+    }
+
     /// Prove that a fresh random reservation does not reuse a Host link,
     /// network identity, ownership token, or overlapping IPv4 range. Existing
     /// managed links must themselves be well-formed TAPs so a foreign alias
@@ -745,6 +818,47 @@ impl HostNetworkSnapshot {
         }
         Ok(())
     }
+
+    /// Classify one durable reservation from this complete snapshot.  A
+    /// present name is exact only when TAP kind, link state, alias authority,
+    /// ifindex/address join and IPv4 tuple all match.  Partial or foreign
+    /// state is an error, never an adoptable absence.
+    pub(crate) fn reserved_network_state(
+        &self,
+        identity: &RuntimeNetworkIdentity,
+    ) -> Result<ReservedHostNetworkState> {
+        let expected = ChNetwork {
+            tap: identity.tap_name.as_str().to_owned(),
+            ownership_token: identity.ownership_token.clone(),
+            config: identity.network_config.clone(),
+        };
+        validate_network_plan(&expected)?;
+        let Some(link) = self.links.get(&expected.tap) else {
+            return Ok(ReservedHostNetworkState::Absent);
+        };
+        anyhow::ensure!(
+            link.is_tap
+                && link.is_up
+                && link.alias.as_deref() == Some(network_alias(&expected).as_str())
+                && link.ipv4 == [Ipv4Cidr::parse(&host_cidr(&expected))?],
+            "durable Host network reservation is present with partial or foreign state"
+        );
+        Ok(ReservedHostNetworkState::Exact)
+    }
+
+    pub(crate) fn unchanged_except_reserved_tap(
+        &self,
+        after: &Self,
+        identity: &RuntimeNetworkIdentity,
+    ) -> bool {
+        self.links
+            .iter()
+            .filter(|(name, _)| name.as_str() != identity.tap_name.as_str())
+            .eq(after
+                .links
+                .iter()
+                .filter(|(name, _)| name.as_str() != identity.tap_name.as_str()))
+    }
 }
 
 fn is_managed_tap_name(name: &str) -> bool {
@@ -756,20 +870,15 @@ fn is_managed_tap_name(name: &str) -> bool {
 }
 
 fn parse_network_alias(alias: &str) -> Result<(cats_api::runtime_reconciliation::Id, RandomId128)> {
-    let mut fields = alias.split(':');
-    anyhow::ensure!(
-        fields.next() == Some("cats-network"),
-        "Host network alias is outside the Cats namespace"
-    );
-    let network_id = fields
-        .next()
-        .context("Cats Host network alias lacks network ID")?;
-    let ownership_token = fields
-        .next()
+    let fields = alias
+        .strip_prefix("cats-network:")
+        .context("Host network alias is outside the Cats namespace")?;
+    let (network_id, ownership_token) = fields
+        .rsplit_once(':')
         .context("Cats Host network alias lacks ownership token")?;
     anyhow::ensure!(
-        fields.next().is_none(),
-        "Cats Host network alias has trailing fields"
+        !network_id.is_empty(),
+        "Cats Host network alias lacks network ID"
     );
     Ok((
         cats_api::runtime_reconciliation::Id::new(network_id.to_owned())
@@ -1000,17 +1109,17 @@ fn exact_network_exists(
 }
 
 fn ensure_host_cidr_available(
-    cfg: &ChConfig,
+    ip_bin: &Path,
     desired: Ipv4Cidr,
     adopted_tap: Option<&str>,
     context: &IpCommandContext<'_>,
 ) -> Result<()> {
-    let addresses = run_ip_command(context, &cfg.ip_bin, &["-o", "-4", "addr", "show"])
-        .with_context(|| format!("run {} -o -4 addr show", cfg.ip_bin.display()))?;
+    let addresses = run_ip_command(context, ip_bin, &["-o", "-4", "addr", "show"])
+        .with_context(|| format!("run {} -o -4 addr show", ip_bin.display()))?;
     anyhow::ensure!(
         addresses.status.success(),
         "{} -o -4 addr show failed: {}",
-        cfg.ip_bin.display(),
+        ip_bin.display(),
         String::from_utf8_lossy(&addresses.stderr).trim()
     );
     let addresses = ipv4_addresses(&addresses.stdout)?;
@@ -1081,7 +1190,7 @@ pub(crate) fn prepare_network_with_tap_port(
         );
         let assigned = ipv4_addresses(&addresses.stdout)?;
         if assigned.is_empty() {
-            ensure_host_cidr_available(cfg, desired_cidr, None, &context)?;
+            ensure_host_cidr_available(&cfg.ip_bin, desired_cidr, None, &context)?;
             ip_status(
                 &context,
                 &cfg.ip_bin,
@@ -1093,7 +1202,7 @@ pub(crate) fn prepare_network_with_tap_port(
                 "Host tap {} has an address other than exact checkpointed {host_cidr}",
                 network.tap
             );
-            ensure_host_cidr_available(cfg, desired_cidr, Some(&network.tap), &context)?;
+            ensure_host_cidr_available(&cfg.ip_bin, desired_cidr, Some(&network.tap), &context)?;
         }
         return ip_status(
             &context,
@@ -1102,7 +1211,7 @@ pub(crate) fn prepare_network_with_tap_port(
         );
     }
 
-    ensure_host_cidr_available(cfg, desired_cidr, None, &context)?;
+    ensure_host_cidr_available(&cfg.ip_bin, desired_cidr, None, &context)?;
     let pending_tap = tap_create
         .create_nonpersistent(&network.tap)
         .with_context(|| format!("create unpublished Host tap {}", network.tap))?;
@@ -1137,6 +1246,71 @@ pub(crate) fn prepare_network_with_tap_port(
             .publish()
             .with_context(|| format!("publish configured Host tap {}", network.tap))
     })()
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum NetworkCreateAttempt {
+    Published,
+    DefinitelyNotPublished,
+    PublicationOutcomeUnknown,
+}
+
+/// Create only from a caller-retained complete absence proof. This primitive
+/// never adopts or completes an existing interface: `TUNSETIFF|TUN_EXCL` is
+/// the sole name claim, and every pre-publication path drops the clone fd.
+/// Once creation is attempted, the closed outcome deliberately contains no
+/// retry instruction; the reconciler must Refresh and obtain a new scan.
+pub(crate) fn create_network_from_sealed_absence_with_tap_port(
+    ip_bin: &Path,
+    network: &ChNetwork,
+    effect_context: &RuntimeDesiredEffectContext,
+    tap_create: &dyn TapCreatePort,
+) -> Result<NetworkCreateAttempt> {
+    anyhow::ensure!(ip_bin.is_absolute(), "Host ip binary must be absolute");
+    validate_network_plan(network)?;
+    let host_cidr = host_cidr(network);
+    let desired_cidr = Ipv4Cidr::parse(&host_cidr).context("parse checkpointed Host IPv4 CIDR")?;
+    let context = IpCommandContext::Desired(effect_context);
+    ensure_host_cidr_available(ip_bin, desired_cidr, None, &context)?;
+    context.check_active()?;
+
+    let pending_tap = match tap_create.create_nonpersistent(&network.tap) {
+        Ok(pending) => pending,
+        Err(_) => return Ok(NetworkCreateAttempt::DefinitelyNotPublished),
+    };
+    let configured = (|| {
+        ip_status(
+            &context,
+            ip_bin,
+            &[
+                "link",
+                "set",
+                "dev",
+                &network.tap,
+                "alias",
+                &network_alias(network),
+            ],
+        )?;
+        ip_status(
+            &context,
+            ip_bin,
+            &["addr", "add", &host_cidr, "dev", &network.tap],
+        )?;
+        ip_status(
+            &context,
+            ip_bin,
+            &["link", "set", "dev", &network.tap, "up"],
+        )?;
+        context.check_active()
+    })();
+    if configured.is_err() {
+        drop(pending_tap);
+        return Ok(NetworkCreateAttempt::DefinitelyNotPublished);
+    }
+    match pending_tap.publish() {
+        Ok(()) => Ok(NetworkCreateAttempt::Published),
+        Err(_) => Ok(NetworkCreateAttempt::PublicationOutcomeUnknown),
+    }
 }
 
 pub fn remove_network(cfg: &ChConfig, network: &ChNetwork) -> Result<()> {
@@ -2651,6 +2825,49 @@ mod tests {
         assert_eq!(second.config, desired);
         assert_ne!(first.ownership_token, second.ownership_token);
         assert_ne!(first.tap, second.tap);
+    }
+
+    #[test]
+    fn network_plan_mints_independent_name_and_authority_samples() {
+        let samples = [
+            RandomId128::new("11111111111aaaaaaaaaaaaaaaaaaaaa").unwrap(),
+            RandomId128::new("22222222222bbbbbbbbbbbbbbbbbbbbb").unwrap(),
+        ];
+        let mut samples = samples.into_iter();
+        let planned = plan_network_with_random(&desired_network(), || {
+            samples.next().context("test random sample exhausted")
+        })
+        .unwrap();
+
+        assert_eq!(planned.tap, "cat11111111111");
+        assert_eq!(
+            planned.ownership_token,
+            RandomId128::new("22222222222bbbbbbbbbbbbbbbbbbbbb").unwrap()
+        );
+        assert_ne!(
+            &planned.tap[3..],
+            &planned.ownership_token.as_str()[..11],
+            "published TAP name leaked the ownership-token prefix"
+        );
+        assert!(samples.next().is_none());
+    }
+
+    #[test]
+    fn network_alias_round_trips_colon_bearing_network_id() {
+        let config = NetworkConfig {
+            network_id: cats_api::runtime_reconciliation::Id::new("tenant:segment:42").unwrap(),
+            ..desired_network()
+        };
+        let network = bind_desired_network(
+            &config,
+            "catphysical01".into(),
+            RandomId128::new("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa").unwrap(),
+        )
+        .unwrap();
+
+        let parsed = parse_network_alias(&network_alias(&network)).unwrap();
+        assert_eq!(parsed.0, config.network_id);
+        assert_eq!(parsed.1, network.ownership_token);
     }
 
     #[test]

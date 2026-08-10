@@ -69,6 +69,7 @@ use super::authorized_blockd::{
     RetainedAuthorizedBlockd, AUTHORIZED_SERVING_FILE, IDENTITY_FILE, LAUNCH_CHECKPOINT_FILE,
     MAX_AUTHORIZED_SERVING_BYTES, MAX_IDENTITY_BYTES, MAX_LAUNCH_CHECKPOINT_BYTES,
 };
+use super::network::{prepare_device_checkpoint_view, prepared_device_input};
 use super::root_provision_process::{
     prove_exact_root_provision_process_absence, ExactRootProvisionProcessAbsenceProof,
     ExactRootProvisionProcessProof, RetainedRootProvisionPhysicalIdentity,
@@ -226,26 +227,18 @@ impl PrepareDeviceHandoffReady {
         authority: &VolumeRecord,
     ) -> Result<Command> {
         self.assert_current(checkpoint, desired, authority)?;
-        let ReconcileStep::PrepareDevice {
-            volume_id,
-            attachment_id,
-            serving_authority,
-            serving_process,
-            ownership_token,
-            frontend,
-            ..
-        } = &checkpoint.step
-        else {
-            anyhow::bail!("authorized Root serving command requires prepare_device")
-        };
-        let ServingAuthorityProvenance::AfterRootProvision { handoff } = serving_authority.as_ref()
+        let prepared = prepared_device_input(checkpoint)
+            .context("authorized Root serving command requires a prepared device")?;
+        let ServingAuthorityProvenance::AfterRootProvision { handoff } =
+            prepared.serving_authority.as_ref()
         else {
             anyhow::bail!("authorized Root serving command requires sealed handoff provenance")
         };
         let attachment = &self.attempt.attachment;
         anyhow::ensure!(
             config.blockd_binary.is_absolute()
-                && config.blockd_binary == Path::new(serving_process.executable_path.as_str()),
+                && config.blockd_binary
+                    == Path::new(prepared.serving_process.executable_path.as_str()),
             "authorized Root serving executable differs from installed blockd"
         );
         anyhow::ensure!(
@@ -259,25 +252,25 @@ impl PrepareDeviceHandoffReady {
             "authorized Root serving resource limits must be positive"
         );
         anyhow::ensure!(
-            volume_id == &attachment.identity.volume_id
-                && attachment_id == &attachment.identity.attachment_id
-                && Path::new(serving_process.data_directory.as_str())
+            prepared.volume_id == attachment.identity.volume_id
+                && prepared.attachment_id == attachment.identity.attachment_id
+                && Path::new(prepared.serving_process.data_directory.as_str())
                     == self.retained_authorized.data_directory(),
             "authorized Root serving command changed its retained attachment"
         );
         anyhow::ensure!(
-            serving_process.process_identity_token != *ownership_token,
+            prepared.serving_process.process_identity_token != prepared.ownership_token,
             "authorized Root serving process and device tokens must differ"
         );
 
         let mut command = Command::new(&config.blockd_binary);
         command
             .arg("--volume-id")
-            .arg(volume_id.as_str())
+            .arg(prepared.volume_id.as_str())
             .arg("--data-dir")
             .arg(self.retained_authorized.data_directory())
             .arg("--attachment-id")
-            .arg(attachment_id.as_str())
+            .arg(prepared.attachment_id.as_str())
             .arg("--authorized-serving-handoff-record")
             .arg(handoff.record.path.as_str())
             .arg("--authorized-serving-handoff-predecessor-checkpoint-content-digest")
@@ -291,11 +284,11 @@ impl PrepareDeviceHandoffReady {
             .arg("--authorized-serving-handoff-record-content-sha256")
             .arg(handoff.record.content_sha256.as_str())
             .arg("--runtime-scope-id")
-            .arg(serving_process.scope_id.as_str())
+            .arg(prepared.serving_process.scope_id.as_str())
             .arg("--process-identity-token")
-            .arg(serving_process.process_identity_token.as_str())
+            .arg(prepared.serving_process.process_identity_token.as_str())
             .arg("--device-ownership-token")
-            .arg(ownership_token.as_str())
+            .arg(prepared.ownership_token.as_str())
             .arg("--metadata-store-adapter")
             .arg(&config.metadata_store.name)
             .arg("--object-store-adapter")
@@ -314,8 +307,8 @@ impl PrepareDeviceHandoffReady {
                 cats_api::runtime_reconciliation::Durability::Relaxed => "relaxed",
             })
             .arg("--listen-control")
-            .arg(serving_process.control_socket_path.as_str());
-        match frontend {
+            .arg(prepared.serving_process.control_socket_path.as_str());
+        match &prepared.frontend {
             PrepareDeviceFrontend::KernelNbd {
                 listener_socket_path,
                 ..
@@ -751,21 +744,16 @@ impl ServingHandoffStore {
             self.state_directory.path() == retained_authorized.state_directory_path(),
             "PrepareDevice handoff reopen uses another Node state directory"
         );
-        let ReconcileStep::PrepareDevice {
-            serving_authority,
-            serving_process,
-            ..
-        } = &checkpoint.step
-        else {
-            anyhow::bail!("PrepareDevice handoff reopen requires prepare_device")
-        };
-        let ServingAuthorityProvenance::AfterRootProvision { handoff } = serving_authority.as_ref()
+        let prepared = prepared_device_input(checkpoint)
+            .context("PrepareDevice handoff reopen requires a prepared device")?;
+        let ServingAuthorityProvenance::AfterRootProvision { handoff } =
+            prepared.serving_authority.as_ref()
         else {
             anyhow::bail!("PrepareDevice handoff reopen requires Root serving provenance")
         };
         let data_directory = retained_authorized.data_directory();
         anyhow::ensure!(
-            Path::new(serving_process.data_directory.as_str()) == data_directory
+            Path::new(prepared.serving_process.data_directory.as_str()) == data_directory
                 && Path::new(handoff.record.path.as_str())
                     == data_directory.join(SERVING_HANDOFF_RECORD_FILE),
             "PrepareDevice handoff paths leave the retained attachment directory"
@@ -2572,19 +2560,24 @@ fn validate_retained_prepare_device_handoff(
     retained_record: &RetainedFile,
     retained_retirement: Option<&RetainedFile>,
 ) -> Result<RetainedRootProvisionProcessAttempt> {
+    let prepared_checkpoint = prepare_device_checkpoint_view(checkpoint)?;
     let target = retained_scanned_artifact(retained_target);
     let record = retained_scanned_artifact(retained_record);
     let retirement = retained_retirement.map(retained_scanned_artifact);
     let attempt = validate_scanned_serving_handoff_artifacts(
-        checkpoint,
+        &prepared_checkpoint,
         retained_authorized.checkpoint(),
         &target,
         Some(&record),
         retirement.as_ref(),
     )?
     .context("PrepareDevice Root handoff did not retain one old process attempt")?;
-    RootProvisionProcessExpectation::from_retained_prepare_device(checkpoint, desired, &attempt)
-        .context("PrepareDevice Root handoff is not bound to current Desired")?;
+    RootProvisionProcessExpectation::from_retained_prepare_device(
+        &prepared_checkpoint,
+        desired,
+        &attempt,
+    )
+    .context("PrepareDevice Root handoff is not bound to current Desired")?;
     validate_authorized_serving_record(authority, &attempt.attachment, None)
         .map_err(|error| anyhow::anyhow!("PrepareDevice Root authority is not exact: {error}"))?;
     Ok(attempt)
@@ -2613,6 +2606,13 @@ pub(crate) fn validate_scanned_serving_handoff_artifacts(
     record: Option<&ScannedServingHandoffArtifact<'_>>,
     retirement: Option<&ScannedServingHandoffArtifact<'_>>,
 ) -> Result<Option<RetainedRootProvisionProcessAttempt>> {
+    let prepared_checkpoint;
+    let checkpoint = if matches!(checkpoint.step, ReconcileStep::PrepareNetwork { .. }) {
+        prepared_checkpoint = prepare_device_checkpoint_view(checkpoint)?;
+        &prepared_checkpoint
+    } else {
+        checkpoint
+    };
     let checkpoint_digest = checkpoint_content_digest(checkpoint)?;
     let target_artifact = validate_scanned_target_control(checkpoint, acquired, target)?;
 
@@ -2821,6 +2821,13 @@ pub(crate) fn scanned_target_control_process_launch(
     acquired: &AuthorizedBlockdCheckpoint,
     target: &ScannedServingHandoffArtifact<'_>,
 ) -> Result<TargetControlProcessLaunchIdentity> {
+    let prepared_checkpoint;
+    let checkpoint = if matches!(checkpoint.step, ReconcileStep::PrepareNetwork { .. }) {
+        prepared_checkpoint = prepare_device_checkpoint_view(checkpoint)?;
+        &prepared_checkpoint
+    } else {
+        checkpoint
+    };
     let artifact = validate_scanned_target_control(checkpoint, acquired, target)?;
     Ok(TargetControlProcessLaunchIdentity::new(
         target.path.clone(),

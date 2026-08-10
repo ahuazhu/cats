@@ -18,6 +18,7 @@ use thiserror::Error;
 
 use crate::runtime::reconciliation::{
     NodeGlobalManagedProcessAdmission, NodeGlobalManagedProcessScanAdmission,
+    NodeGlobalNetworkAdmission, NodeGlobalNetworkScanAdmission,
 };
 use crate::state_directory::StateDirectory;
 
@@ -186,6 +187,7 @@ pub struct RuntimeDesiredEffectContext {
     cancellation: RuntimeInventoryScanCancellation,
     accepted_full: Option<RuntimeDesiredEffectAdmission>,
     node_global_process: Option<NodeGlobalManagedProcessAdmission>,
+    node_global_network: Option<NodeGlobalNetworkAdmission>,
 }
 
 /// Shared read-only deadline/cancellation boundary for physical identity
@@ -305,6 +307,7 @@ pub struct RuntimeDesiredEffectAdmission {
     desired_read_position: Option<cats_api::runtime_reconciliation::Sequence>,
     assigned_cats: Option<RuntimeAssignedCatSet>,
     node_global_process: Option<NodeGlobalManagedProcessAdmission>,
+    node_global_network: Option<NodeGlobalNetworkAdmission>,
 }
 
 impl RuntimeDesiredEffectAdmission {
@@ -313,6 +316,7 @@ impl RuntimeDesiredEffectAdmission {
         observation: NodeObservation,
         acceptance: &ObservationAcceptance,
         node_global_process: Option<NodeGlobalManagedProcessAdmission>,
+        node_global_network: Option<NodeGlobalNetworkAdmission>,
     ) -> Option<Self> {
         let ObservationInventoryAcceptance::Full { attestation } = &acceptance.inventory else {
             return None;
@@ -327,6 +331,9 @@ impl RuntimeDesiredEffectAdmission {
             || node_global_process
                 .as_ref()
                 .is_some_and(|admission| !admission.matches_observation(&observation))
+            || node_global_network
+                .as_ref()
+                .is_some_and(|admission| !admission.matches_observation(&observation))
         {
             return None;
         }
@@ -338,6 +345,7 @@ impl RuntimeDesiredEffectAdmission {
             desired_read_position: None,
             assigned_cats: None,
             node_global_process,
+            node_global_network,
         })
     }
 
@@ -393,6 +401,7 @@ impl RuntimeDesiredEffectAdmission {
             desired_read_position: Some(desired_read_position),
             assigned_cats: None,
             node_global_process: None,
+            node_global_network: None,
         }
     }
 
@@ -416,12 +425,16 @@ impl RuntimeDesiredEffectContext {
         let node_global_process = accepted_full
             .as_ref()
             .and_then(|admission| admission.node_global_process.clone());
+        let node_global_network = accepted_full
+            .as_ref()
+            .and_then(|admission| admission.node_global_network.clone());
         Self {
             state_directory,
             deadline,
             cancellation,
             accepted_full,
             node_global_process,
+            node_global_network,
         }
     }
 
@@ -455,6 +468,14 @@ impl RuntimeDesiredEffectContext {
         self.node_global_process.as_ref().ok_or_else(|| {
             anyhow::anyhow!(
                 "runtime Desired effect lacks its scanner-sealed Node-global process admission"
+            )
+        })
+    }
+
+    pub(crate) fn node_global_network(&self) -> anyhow::Result<&NodeGlobalNetworkAdmission> {
+        self.node_global_network.as_ref().ok_or_else(|| {
+            anyhow::anyhow!(
+                "runtime Desired effect lacks its scanner-sealed Node-global network admission"
             )
         })
     }
@@ -495,6 +516,7 @@ impl RuntimeDesiredEffectContext {
             cancellation: RuntimeInventoryScanCancellation::new(),
             accepted_full: None,
             node_global_process: Some(admission),
+            node_global_network: None,
         }
     }
 
@@ -504,6 +526,15 @@ impl RuntimeDesiredEffectContext {
         admission: NodeGlobalManagedProcessAdmission,
     ) -> Self {
         self.node_global_process = Some(admission);
+        self
+    }
+
+    #[cfg(test)]
+    pub(crate) fn with_node_global_network_for_test(
+        mut self,
+        admission: NodeGlobalNetworkAdmission,
+    ) -> Self {
+        self.node_global_network = Some(admission);
         self
     }
 
@@ -645,6 +676,7 @@ pub struct CompleteRuntimeInventory {
     runtimes: Vec<ObservedRuntimeStatus>,
     residue: Vec<NodeResidue>,
     node_global_process: Option<NodeGlobalManagedProcessScanAdmission>,
+    node_global_network: Option<NodeGlobalNetworkScanAdmission>,
 }
 
 impl CompleteRuntimeInventory {
@@ -661,6 +693,7 @@ impl CompleteRuntimeInventory {
             runtimes,
             residue,
             node_global_process: None,
+            node_global_network: None,
         }
     }
 
@@ -678,6 +711,20 @@ impl CompleteRuntimeInventory {
         self.node_global_process.take()
     }
 
+    pub(crate) fn with_node_global_network_admission(
+        mut self,
+        admission: Option<NodeGlobalNetworkScanAdmission>,
+    ) -> Self {
+        self.node_global_network = admission;
+        self
+    }
+
+    pub(crate) fn take_node_global_network_admission(
+        &mut self,
+    ) -> Option<NodeGlobalNetworkScanAdmission> {
+        self.node_global_network.take()
+    }
+
     #[cfg(test)]
     fn for_test(
         observed_at_unix_ms: UnixMillis,
@@ -691,6 +738,7 @@ impl CompleteRuntimeInventory {
             runtimes,
             residue,
             node_global_process: None,
+            node_global_network: None,
         }
     }
 
@@ -1665,6 +1713,7 @@ pub struct RuntimeSpineRunner {
     effect_lane: Option<EffectLane>,
     current_process_scan_observation_id: Option<RandomId128>,
     current_process_node_global_process: Option<NodeGlobalManagedProcessAdmission>,
+    current_process_node_global_network: Option<NodeGlobalNetworkAdmission>,
     effect_admission_open: bool,
     effect_admission: Option<RuntimeDesiredEffectAdmission>,
     pending_effects: VecDeque<DesiredRuntimeSpec>,
@@ -1768,6 +1817,7 @@ impl RuntimeSpineRunner {
             effect_lane,
             current_process_scan_observation_id: None,
             current_process_node_global_process: None,
+            current_process_node_global_network: None,
             effect_admission_open: false,
             effect_admission: None,
             pending_effects: VecDeque::new(),
@@ -1799,6 +1849,7 @@ impl RuntimeSpineRunner {
             PendingWork::Observation(request) => self.send_observation(request).await,
             PendingWork::Scan(scan) => {
                 self.current_process_node_global_process = None;
+                self.current_process_node_global_network = None;
                 if self
                     .effect_lane
                     .as_ref()
@@ -1858,8 +1909,9 @@ impl RuntimeSpineRunner {
                     }
                 };
                 let node_global_process = inventory.take_node_global_process_admission();
+                let node_global_network = inventory.take_node_global_network_admission();
                 let candidate = build_full_observation(coordinates, inventory)?;
-                self.current_process_node_global_process = node_global_process
+                let node_global_process = node_global_process
                     .map(|admission| admission.bind(&candidate))
                     .transpose()
                     .map_err(|_| {
@@ -1867,6 +1919,16 @@ impl RuntimeSpineRunner {
                             "provider-private process admission conflicts with full observation",
                         )
                     })?;
+                let node_global_network = node_global_network
+                    .map(|admission| admission.bind(&candidate))
+                    .transpose()
+                    .map_err(|_| {
+                        RuntimeSpineRunError::InvalidScan(
+                            "provider-private network admission conflicts with full observation",
+                        )
+                    })?;
+                self.current_process_node_global_process = node_global_process;
+                self.current_process_node_global_network = node_global_network;
                 let request = self.journal_lane()?.prepare_observation(candidate).await?;
                 self.current_process_scan_observation_id =
                     Some(request.value().observation_id.clone());
@@ -2088,12 +2150,14 @@ impl RuntimeSpineRunner {
                     && observation_opens_service_readiness(request.value());
                 let admission = if establishes_effect_admission {
                     let node_global_process = self.current_process_node_global_process.take();
+                    let node_global_network = self.current_process_node_global_network.take();
                     Some(
                         RuntimeDesiredEffectAdmission::from_acceptance(
                             self.registered_session.clone(),
                             request.value().clone(),
                             &accepted.value,
                             node_global_process,
+                            node_global_network,
                         )
                         .ok_or(RuntimeSpineRunError::InvalidScan(
                             "accepted full observation does not form one effect admission",
@@ -2107,6 +2171,7 @@ impl RuntimeSpineRunner {
                     .await?;
                 self.current_process_scan_observation_id = None;
                 self.current_process_node_global_process = None;
+                self.current_process_node_global_network = None;
                 if establishes_effect_admission {
                     self.effect_admission = admission;
                     self.effect_admission_open = true;
@@ -2125,6 +2190,7 @@ impl RuntimeSpineRunner {
                         self.journal_lane()?.invalidate_desired().await?;
                         self.current_process_scan_observation_id = None;
                         self.current_process_node_global_process = None;
+                        self.current_process_node_global_network = None;
                         Ok(RuntimeSpineRunStep::DesiredInvalidated { status, error })
                     }
                     DesiredInvalidationBinding::Mismatch => Ok(RuntimeSpineRunStep::RetryExact(
@@ -2780,6 +2846,7 @@ mod tests {
             observation.clone(),
             &acceptance,
             Some(private),
+            None,
         )
         .expect("exact private scan binding must enter the effect context");
         assert!(admitted.node_global_process.is_some());
@@ -2799,6 +2866,7 @@ mod tests {
             observation,
             &acceptance,
             Some(foreign_private),
+            None,
         )
         .is_none());
     }

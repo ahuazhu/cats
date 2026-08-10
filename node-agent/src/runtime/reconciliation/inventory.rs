@@ -37,6 +37,7 @@ use crate::runtime_spine::{
 };
 
 use super::{
+    network::{prepare_device_checkpoint_view, NodeGlobalNetworkScanAdmission},
     root_provision_process::{
         NodeGlobalManagedProcessScanAdmission, RetainedRootProvisionProcessAttempt,
         RootProvisionAuthoritySnapshot, RootProvisionProcessExpectation,
@@ -188,6 +189,28 @@ pub(crate) trait RootProcessInventoryBridge:
     ) -> anyhow::Result<RootProcessInventoryBridgeOutcome>;
 }
 
+pub(crate) mod network_inventory_bridge_sealed {
+    pub(crate) trait Sealed {}
+}
+
+#[derive(Debug)]
+pub(crate) enum NetworkInventoryBridgeOutcome {
+    Complete(NodeGlobalNetworkScanAdmission),
+    Unavailable,
+}
+
+/// Joint durable-reservation and complete Host link/address inspection.  The
+/// bridge is the only scanner path allowed to project a managed TAP.
+pub(crate) trait NetworkInventoryBridge:
+    network_inventory_bridge_sealed::Sealed + Send + Sync + 'static
+{
+    fn inspect_all(
+        &self,
+        checkpoints: &BTreeMap<Id, RuntimeCheckpointInventoryEvidence>,
+        context: &RuntimeInventoryScanContext,
+    ) -> anyhow::Result<NetworkInventoryBridgeOutcome>;
+}
+
 pub(crate) mod runtime_inventory_key_ring_reader_sealed {
     pub(crate) trait Sealed {}
 }
@@ -248,6 +271,7 @@ pub struct CleanSlateInventoryScanner {
     probes: Vec<Arc<dyn InventoryAbsenceProbe>>,
     blob: Option<Arc<dyn BlobStore>>,
     root_process_bridge: Option<Arc<dyn RootProcessInventoryBridge>>,
+    network_bridge: Option<Arc<dyn NetworkInventoryBridge>>,
     key_ring_reader: Option<Arc<dyn RuntimeInventoryKeyRingReader>>,
 }
 
@@ -292,6 +316,7 @@ impl CleanSlateInventoryScanner {
             probes,
             blob: None,
             root_process_bridge: None,
+            network_bridge: None,
             key_ring_reader: None,
         })
     }
@@ -322,6 +347,11 @@ impl CleanSlateInventoryScanner {
         reader: Arc<dyn RuntimeInventoryKeyRingReader>,
     ) -> Self {
         self.key_ring_reader = Some(reader);
+        self
+    }
+
+    pub(crate) fn with_network_bridge(mut self, bridge: Arc<dyn NetworkInventoryBridge>) -> Self {
+        self.network_bridge = Some(bridge);
         self
     }
 }
@@ -415,7 +445,9 @@ impl RuntimeInventoryScanner for CleanSlateInventoryScanner {
         let mut aggregate = InventoryProbeAggregation::new();
         let mut processes_by_cat = BTreeMap::new();
         let mut serving_devices_by_cat = BTreeMap::new();
+        let mut networks_by_cat = BTreeMap::new();
         let mut node_global_process_admission = None;
+        let mut node_global_network_admission = None;
         if let Some(bridge) = &self.root_process_bridge {
             // The process expectation cannot be derived until all three data
             // authorities have completed. Read each prerequisite exactly
@@ -527,15 +559,38 @@ impl RuntimeInventoryScanner for CleanSlateInventoryScanner {
                         | InventorySource::Systemd
                         | InventorySource::Process
                         | InventorySource::ControlSocket
-                ) {
+                ) || (self.network_bridge.is_some()
+                    && probe.source() == InventorySource::Network)
+                {
                     continue;
                 }
                 inspect_inventory_probe(probe, &context, &mut aggregate)?;
             }
         } else {
             for probe in &self.probes {
+                if self.network_bridge.is_some() && probe.source() == InventorySource::Network {
+                    continue;
+                }
                 inspect_inventory_probe(probe, &context, &mut aggregate)?;
             }
+        }
+        if let Some(bridge) = &self.network_bridge {
+            context
+                .remaining()
+                .context("network inventory bridge deadline expired before inspection")?;
+            match bridge.inspect_all(&aggregate.checkpoints_by_cat, &context)? {
+                NetworkInventoryBridgeOutcome::Complete(admission) => {
+                    networks_by_cat = admission.network_projections();
+                    node_global_network_admission = Some(admission);
+                }
+                NetworkInventoryBridgeOutcome::Unavailable => {
+                    aggregate.unavailable_sources.push(InventorySource::Network);
+                }
+            }
+            context
+                .remaining()
+                .context("network inventory bridge deadline expired after inspection")?;
+            aggregate.coverage.record(InventorySource::Network)?;
         }
         if !aggregate.unavailable_sources.is_empty() {
             return Ok(RuntimeInventoryScanOutcome::Incomplete {
@@ -582,6 +637,7 @@ impl RuntimeInventoryScanner for CleanSlateInventoryScanner {
                     RuntimeManagedProjection {
                         processes: processes_by_cat.remove(&desired.cat_id).unwrap_or_default(),
                         serving_device: serving_devices_by_cat.remove(&desired.cat_id),
+                        networks: networks_by_cat.remove(&desired.cat_id).unwrap_or_default(),
                     },
                 )
             })
@@ -591,7 +647,8 @@ impl RuntimeInventoryScanner for CleanSlateInventoryScanner {
                 && aggregate.checkpoints_by_cat.is_empty()
                 && aggregate.blockd_by_cat.is_empty()
                 && processes_by_cat.is_empty()
-                && serving_devices_by_cat.is_empty(),
+                && serving_devices_by_cat.is_empty()
+                && networks_by_cat.is_empty(),
             "inventory named a Cat outside Desired"
         );
 
@@ -603,7 +660,8 @@ impl RuntimeInventoryScanner for CleanSlateInventoryScanner {
                 runtimes,
                 Vec::new(),
             )
-            .with_node_global_process_admission(node_global_process_admission),
+            .with_node_global_process_admission(node_global_process_admission)
+            .with_node_global_network_admission(node_global_network_admission),
         ))
     }
 }
@@ -633,6 +691,7 @@ fn root_process_expectations(
                 serving_authority.as_ref(),
                 cats_api::runtime_reconciliation::ServingAuthorityProvenance::AfterRootProvision { .. }
             ),
+            ReconcileStep::PrepareNetwork { .. } => true,
             _ => false,
         };
         if !needs_root_process_bridge {
@@ -658,12 +717,13 @@ fn root_process_expectations(
             anyhow::ensure!(
                 matches!(
                     checkpoint.checkpoint.step,
-                    ReconcileStep::PrepareDevice { .. }
+                    ReconcileStep::PrepareDevice { .. } | ReconcileStep::PrepareNetwork { .. }
                 ),
-                "retained Root process projection is outside PrepareDevice"
+                "retained Root process projection is outside a prepared-device phase"
             );
+            let prepared_checkpoint = prepare_device_checkpoint_view(&checkpoint.checkpoint)?;
             let expectation = RootProvisionProcessExpectation::from_retained_prepare_device(
-                &checkpoint.checkpoint,
+                &prepared_checkpoint,
                 desired,
                 retained,
             )?;
@@ -734,7 +794,7 @@ fn serving_process_expectations(
             || blockd.binding != DesiredCheckpointBinding::Current
             || !matches!(
                 checkpoint.checkpoint.step,
-                ReconcileStep::PrepareDevice { .. }
+                ReconcileStep::PrepareDevice { .. } | ReconcileStep::PrepareNetwork { .. }
             )
         {
             continue;
@@ -768,6 +828,7 @@ struct InventoryProjectionContext<'a> {
 struct RuntimeManagedProjection {
     processes: Vec<ProcessEvidence>,
     serving_device: Option<(Id, ObservedDevice)>,
+    networks: Vec<cats_api::runtime_reconciliation::ObservedNetwork>,
 }
 
 fn runtime_from_inventory(
@@ -1026,7 +1087,7 @@ fn runtime_from_inventory(
         processes: managed.processes,
         volumes,
         mounts: Vec::new(),
-        networks: Vec::new(),
+        networks: managed.networks,
         guest_transport: GuestTransportEvidence::Unavailable,
         warm_snapshot: WarmSnapshotEvidence::Absent,
         lifecycle_admission,

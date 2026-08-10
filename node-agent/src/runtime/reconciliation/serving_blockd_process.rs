@@ -16,7 +16,10 @@ use cats_api::runtime_reconciliation::{
     ObservedRuntimeStatus, OwnershipTokenEvidence, PrepareDeviceFrontend, ProcessEvidence,
     ProcessRole, ProcessState, RandomId128, ReconcileStep, WireU64,
 };
-use cats_storage::authority::{VolumeDataAuthority, VolumeRecord};
+use cats_storage::authority::{
+    validate_authorized_serving_attachment, validate_volume_record, LastVolumeTransition,
+    VolumeDataAuthority, VolumeRecord,
+};
 
 use crate::runtime_spine::{
     RuntimeDesiredEffectContext, RuntimeDesiredEffectOutcome, RuntimeDesiredEffectStopReason,
@@ -25,6 +28,7 @@ use crate::runtime_spine::{
 
 use super::checkpoint::CurrentCheckpointGuard;
 use super::clean_slate_probes::CHECKPOINT_NAMESPACE;
+use super::network::prepared_device_input;
 use super::prepare_device_retirement::{
     prepare_device_base_admission_is_exact, retirement_authority_lease_is_monotonic, unique_runtime,
 };
@@ -128,15 +132,9 @@ impl ServingBlockdExpectation {
             desired,
             authority,
         )?;
-        let ReconcileStep::PrepareDevice {
-            serving_process,
-            ownership_token,
-            frontend,
-            ..
-        } = &checkpoint.step
-        else {
-            anyhow::bail!("serving blockd expectation requires prepare_device")
-        };
+        let prepared = prepared_device_input(checkpoint)
+            .context("serving blockd expectation requires a prepared device")?;
+        let serving_process = &prepared.serving_process;
         let executable_path = HostPath::new(command.get_program().to_string_lossy().into_owned())
             .context("serving blockd executable is not a canonical HostPath")?;
         anyhow::ensure!(
@@ -172,8 +170,8 @@ impl ServingBlockdExpectation {
             control_socket_path: serving_process.control_socket_path.clone(),
             data_directory: serving_process.data_directory.clone(),
             process_identity_token: serving_process.process_identity_token.clone(),
-            device_ownership_token: ownership_token.clone(),
-            frontend: frontend.clone(),
+            device_ownership_token: prepared.ownership_token,
+            frontend: prepared.frontend,
         })
     }
 
@@ -200,6 +198,37 @@ impl ServingBlockdExpectation {
 
     pub(crate) fn cat_id(&self) -> &Id {
         &self.volume.desired.cat_id
+    }
+
+    pub(crate) fn volume_id(&self) -> &Id {
+        &self.volume.attachment.identity.volume_id
+    }
+
+    /// Check the provider authority behind this scanner-minted expectation.
+    /// Lease renewal may advance, but owner, acquire marker, head, sizing and
+    /// durability must remain the exact retained serving attachment.
+    pub(crate) fn matches_current_authority(&self, current: &VolumeRecord) -> bool {
+        let attachment = &self.volume.attachment;
+        validate_volume_record(current).is_ok()
+            && validate_authorized_serving_attachment(attachment).is_ok()
+            && current.volume_id == attachment.identity.volume_id
+            && current.size_bytes == attachment.size_bytes
+            && current.durability == attachment.durability
+            && matches!(
+                current.admin_state,
+                cats_api::runtime_reconciliation::VolumeAdminState::Active
+            )
+            && current.lease_owner.as_ref() == Some(&attachment.identity.attachment_id)
+            && current.lease_epoch == attachment.identity.attachment_epoch
+            && current
+                .lease_expires_at
+                .is_some_and(|expiry| expiry >= attachment.lease_expires_at)
+            && current.head == attachment.head
+            && current.last_transition
+                == Some(LastVolumeTransition::NormalAcquire {
+                    request: attachment.acquire_request.clone(),
+                    result: attachment.acquire_result.clone(),
+                })
     }
 
     pub(super) fn unit_id(&self) -> &Id {

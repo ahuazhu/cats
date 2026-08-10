@@ -340,6 +340,7 @@ pub(super) fn prepare_device_base_admission_is_exact(
         return false;
     };
     encode_desired_runtime_spec(desired).is_ok()
+        && super::serving_handoff_effect::checkpoint_is_current_exact(desired, runtime)
         && desired.version == ContractVersion::V1
         && desired.target == RuntimeTarget::Running
         && matches!(desired.transition, RuntimeTransition::CancelAndDrain)

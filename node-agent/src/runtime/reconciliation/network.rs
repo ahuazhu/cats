@@ -13,19 +13,28 @@ use std::io;
 use std::os::fd::{AsRawFd as _, FromRawFd as _};
 use std::os::unix::fs::MetadataExt as _;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context as _, Result};
 use cats_api::runtime_reconciliation::{
-    encode_runtime_checkpoint, CheckpointEvidence, Condition, DesiredRuntimeSpec, Id,
-    LifecycleAdmission, ObservedDevice, OwnershipTokenEvidence, PrepareDeviceFrontend,
-    PreparedDeviceInput, ProgressingReason, RandomId128, ReconcileStep, RuntimeCheckpoint,
-    RuntimeNetworkIdentity, RuntimeTarget, RuntimeTransition, UnixMillis, WarmSnapshotEvidence,
+    encode_runtime_checkpoint, CheckpointEvidence, DesiredRuntimeSpec, DiskKind, Epoch, Id,
+    LocalLineageState, NodeBootId, NodeObservation, ObservedDevice, ObservedDiskKind,
+    ObservedNetwork, OwnershipTokenEvidence, PrepareDeviceFrontend, PreparedDeviceInput,
+    RandomId128, ReconcileStep, RuntimeCheckpoint, RuntimeNetworkIdentity, RuntimeTarget,
+    RuntimeTransition, Sequence, Sha256Digest, UnixMillis, VolumeAccess, VolumeAcquire,
+    VolumeAuthorityEvidence, VolumeDisposition,
 };
+use cats_storage::authority::{VolumeDataAuthority, VolumeRecord};
 
-use crate::ch::{inspect_host_network_snapshot, plan_network, ChNetwork};
+use crate::ch::{
+    create_network_from_sealed_absence_with_tap_port, inspect_host_network_snapshot,
+    network_configs_overlap, plan_network, ChNetwork, HostNetworkSnapshot, NetworkCreateAttempt,
+    PlatformTapCreatePort, ReservedHostNetworkState, TapCreatePort,
+};
 use crate::runtime_spine::{
-    RuntimeDesiredEffectContext, RuntimeDesiredEffectOutcome, RuntimePhysicalReadContext,
+    RuntimeDesiredEffectContext, RuntimeDesiredEffectOutcome, RuntimeDesiredEffectStopReason,
+    RuntimeInventoryScanContext, RuntimePhysicalReadContext,
 };
 use crate::state_directory::StateDirectory;
 
@@ -34,7 +43,19 @@ use super::clean_slate_probes::{
     snapshot_runtime_checkpoint_namespace, RuntimeCheckpointNamespaceSnapshot,
     CHECKPOINT_NAMESPACE, RUNTIME_CHECKPOINT_NAMESPACE_ENTRY_LIMIT,
 };
+use super::inventory::{
+    network_inventory_bridge_sealed, NetworkInventoryBridge, NetworkInventoryBridgeOutcome,
+    RuntimeCheckpointInventoryEvidence,
+};
+use super::prepare_device_retirement::{
+    prepare_device_base_admission_is_exact, retirement_authority_lease_is_monotonic, unique_runtime,
+};
+use super::serving_blockd_process::{
+    ExactServingBlockdProcessProof, ServingBlockdExpectation, ServingBlockdProcessGlobalPort,
+    ServingBlockdProcessInspection,
+};
 use super::serving_handoff_effect::checkpoint_is_current_exact;
+use super::signed_root_provision::signed_inventory_admission_is_exact_with_networks;
 
 const NETWORK_ALLOCATION_LOCK_BASENAME: &str = "network-allocation.lock";
 
@@ -42,6 +63,147 @@ const NETWORK_ALLOCATION_LOCK_BASENAME: &str = "network-allocation.lock";
 struct NetworkReservation {
     cat_id: Id,
     identity: RuntimeNetworkIdentity,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct NetworkInventoryEntry {
+    reservation: NetworkReservation,
+    state: ReservedHostNetworkState,
+}
+
+/// Provider-private result of one complete checkpoint/TAP scan.  The exact
+/// physical snapshot and explicit absent/exact classification cannot be
+/// reconstructed from the public `ObservedNetwork` vector.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct NodeGlobalNetworkScanAdmission {
+    entries: BTreeMap<Id, NetworkInventoryEntry>,
+    physical: HostNetworkSnapshot,
+}
+
+/// The same sealed network inventory after binding to the exact full
+/// observation accepted by Control. It is process-local and intentionally has
+/// no wire decoder.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct NodeGlobalNetworkAdmission {
+    observation_id: RandomId128,
+    node_id: Id,
+    node_boot_id: NodeBootId,
+    agent_instance_id: RandomId128,
+    agent_session_epoch: Epoch,
+    inventory_epoch: Epoch,
+    inventory_digest: Sha256Digest,
+    inventory_read_position: Sequence,
+    entries: BTreeMap<Id, NetworkInventoryEntry>,
+    physical: HostNetworkSnapshot,
+}
+
+impl NodeGlobalNetworkScanAdmission {
+    fn new(
+        reservations: impl IntoIterator<Item = NetworkReservation>,
+        physical: HostNetworkSnapshot,
+    ) -> Result<Self> {
+        let mut entries = BTreeMap::new();
+        for reservation in reservations {
+            let state = physical.reserved_network_state(&reservation.identity)?;
+            let cat_id = reservation.cat_id.clone();
+            anyhow::ensure!(
+                entries
+                    .insert(cat_id, NetworkInventoryEntry { reservation, state })
+                    .is_none(),
+                "network inventory repeats one Cat reservation"
+            );
+        }
+        Ok(Self { entries, physical })
+    }
+
+    pub(crate) fn network_projections(&self) -> BTreeMap<Id, Vec<ObservedNetwork>> {
+        self.entries
+            .iter()
+            .filter_map(|(cat_id, entry)| {
+                (entry.state == ReservedHostNetworkState::Exact).then(|| {
+                    (
+                        cat_id.clone(),
+                        vec![observed_network(&entry.reservation.identity)],
+                    )
+                })
+            })
+            .collect()
+    }
+
+    pub(crate) fn bind(self, observation: &NodeObservation) -> Result<NodeGlobalNetworkAdmission> {
+        anyhow::ensure!(
+            observation.complete_inventory,
+            "Node-global network admission requires a complete observation"
+        );
+        let inventory_digest = observation
+            .inventory_digest
+            .clone()
+            .context("Node-global network admission lacks inventory digest")?;
+        let inventory_read_position = observation
+            .inventory_read_position
+            .context("Node-global network admission lacks inventory read position")?;
+        let mut projections = self.network_projections();
+        for runtime in &observation.runtimes {
+            let expected = projections.remove(&runtime.cat_id).unwrap_or_default();
+            anyhow::ensure!(
+                runtime.networks == expected,
+                "provider-private network proof conflicts with public projection"
+            );
+        }
+        anyhow::ensure!(
+            projections.is_empty()
+                && self.entries.keys().all(|cat_id| observation
+                    .runtimes
+                    .iter()
+                    .any(|runtime| &runtime.cat_id == cat_id)),
+            "Node-global network admission names a Cat absent from inventory"
+        );
+        Ok(NodeGlobalNetworkAdmission {
+            observation_id: observation.observation_id.clone(),
+            node_id: observation.node_id.clone(),
+            node_boot_id: observation.node_boot_id.clone(),
+            agent_instance_id: observation.agent_instance_id.clone(),
+            agent_session_epoch: observation.agent_session_epoch,
+            inventory_epoch: observation.inventory_epoch,
+            inventory_digest,
+            inventory_read_position,
+            entries: self.entries,
+            physical: self.physical,
+        })
+    }
+}
+
+impl NodeGlobalNetworkAdmission {
+    pub(crate) fn matches_observation(&self, observation: &NodeObservation) -> bool {
+        observation.complete_inventory
+            && self.observation_id == observation.observation_id
+            && self.node_id == observation.node_id
+            && self.node_boot_id == observation.node_boot_id
+            && self.agent_instance_id == observation.agent_instance_id
+            && self.agent_session_epoch == observation.agent_session_epoch
+            && self.inventory_epoch == observation.inventory_epoch
+            && observation.inventory_digest.as_ref() == Some(&self.inventory_digest)
+            && observation.inventory_read_position == Some(self.inventory_read_position)
+    }
+
+    fn reservation(&self, cat_id: &Id) -> Option<&NetworkInventoryEntry> {
+        self.entries.get(cat_id)
+    }
+}
+
+fn observed_network(identity: &RuntimeNetworkIdentity) -> ObservedNetwork {
+    ObservedNetwork {
+        kind: identity.network_config.kind,
+        network_id: identity.network_config.network_id.clone(),
+        guest_mac: identity.network_config.guest_mac.clone(),
+        guest_ipv4: identity.network_config.guest_ipv4.clone(),
+        prefix_length: identity.network_config.prefix_length,
+        gateway_ipv4: identity.network_config.gateway_ipv4.clone(),
+        tap_name: identity.tap_name.clone(),
+        ownership_token: OwnershipTokenEvidence::Valid {
+            ownership_token: identity.ownership_token.clone(),
+        },
+    }
 }
 
 #[derive(Debug, Clone, Default)]
@@ -165,6 +327,17 @@ impl NetworkReservations {
     }
 
     fn insert(&mut self, candidate: NetworkReservation) -> Result<()> {
+        for existing in self.by_tap.values() {
+            if existing != &candidate {
+                anyhow::ensure!(
+                    !network_configs_overlap(
+                        &existing.identity.network_config,
+                        &candidate.identity.network_config,
+                    )?,
+                    "Host network reservation overlaps another durable IPv4 range"
+                );
+            }
+        }
         for existing in [
             self.by_tap.get(&candidate.identity.tap_name),
             self.by_network
@@ -196,6 +369,15 @@ impl NetworkReservations {
     }
 
     fn assert_candidate_available(&self, candidate: &NetworkReservation) -> Result<()> {
+        for existing in self.by_tap.values() {
+            anyhow::ensure!(
+                !network_configs_overlap(
+                    &existing.identity.network_config,
+                    &candidate.identity.network_config,
+                )?,
+                "fresh Host network reservation overlaps a durable IPv4 range"
+            );
+        }
         anyhow::ensure!(
             !self.by_tap.contains_key(&candidate.identity.tap_name),
             "fresh Host TAP name collides with a durable reservation"
@@ -245,6 +427,28 @@ impl NetworkAllocationPermit {
             &[snapshot.retained_directory(), store.retained_directory()],
         )
         .context("network reservation checkpoint namespace changed")?;
+        Ok(())
+    }
+
+    fn assert_current_snapshot(&self, snapshot: &RuntimeCheckpointNamespaceSnapshot) -> Result<()> {
+        let reopened = open_network_allocation_lock(&self.state_root)?;
+        ensure_same_file(self.lock()?, &reopened, "network allocation lock changed")?;
+        let _reopened_namespace = revalidate_checkpoint_namespace(
+            &self.state_root,
+            CHECKPOINT_NAMESPACE,
+            &[snapshot.retained_directory()],
+        )
+        .context("network inventory checkpoint namespace changed")?;
+        Ok(())
+    }
+
+    fn assert_current_absent_namespace(&self) -> Result<()> {
+        let reopened = open_network_allocation_lock(&self.state_root)?;
+        ensure_same_file(self.lock()?, &reopened, "network allocation lock changed")?;
+        anyhow::ensure!(
+            checkpoint_namespace_is_absent(&self.state_root)?,
+            "network inventory checkpoint namespace appeared during scan"
+        );
         Ok(())
     }
 
@@ -385,16 +589,232 @@ impl NetworkAllocationPort {
         permit.release()?;
         Ok(persisted)
     }
+
+    fn create_or_adopt_reserved(
+        &self,
+        context: &RuntimeDesiredEffectContext,
+        admission: &NodeGlobalNetworkAdmission,
+        store: &FileCheckpointStore,
+        stored: &StoredCheckpoint,
+        tap_create: &dyn TapCreatePort,
+        mut revalidate_authority: impl FnMut() -> Result<()>,
+    ) -> Result<NetworkPhysicalRound> {
+        let entry = admission
+            .reservation(&stored.checkpoint().cat_id)
+            .context("PrepareNetwork lacks its provider-private TAP reservation")?;
+        let ReconcileStep::PrepareNetwork { network, .. } = &stored.checkpoint().step else {
+            anyhow::bail!("physical network effect requires PrepareNetwork")
+        };
+        anyhow::ensure!(
+            &entry.reservation.identity == network,
+            "provider-private TAP proof changed its durable reservation"
+        );
+
+        let permit = self.lock(context)?;
+        let context_root = context
+            .state_directory()
+            .try_clone_directory()
+            .context("retain Desired-effect state root for TAP create/adopt")?;
+        ensure_same_file(
+            &permit.state_root,
+            &context_root,
+            "network admission and Desired effect use different state roots",
+        )?;
+        let assigned = context.accepted_full()?.assigned_cats()?;
+        let snapshot = snapshot_runtime_checkpoint_namespace(
+            &permit.state_root,
+            context,
+            assigned,
+            RUNTIME_CHECKPOINT_NAMESPACE_ENTRY_LIMIT,
+        )?
+        .context("TAP create/adopt requires a complete checkpoint namespace")?;
+        permit.assert_current_paths(&snapshot, store)?;
+        anyhow::ensure!(
+            snapshot.checkpoint(&stored.checkpoint().cat_id) == Some(stored.checkpoint()),
+            "PrepareNetwork checkpoint changed after accepted inventory"
+        );
+        let reservations = NetworkReservations::from_snapshot(&snapshot)?;
+        anyhow::ensure!(
+            reservations
+                .by_tap
+                .get(&network.tap_name)
+                .is_some_and(|reservation| reservation == &entry.reservation),
+            "complete checkpoint namespace changed the TAP reservation"
+        );
+
+        let inspect_closed = || -> Result<HostNetworkSnapshot> {
+            let physical = inspect_host_network_snapshot(&self.ip_binary, context)?;
+            physical.ensure_managed_networks_are_reserved(
+                reservations
+                    .by_tap
+                    .values()
+                    .map(|reservation| &reservation.identity),
+            )?;
+            physical.ensure_reserved_network_ranges(
+                reservations
+                    .by_tap
+                    .values()
+                    .map(|reservation| &reservation.identity),
+            )?;
+            Ok(physical)
+        };
+        let admitted_physical = inspect_closed()?;
+        anyhow::ensure!(
+            admitted_physical == admission.physical
+                && admitted_physical.reserved_network_state(network)? == entry.state,
+            "Host TAP inventory drifted after accepted full admission"
+        );
+        revalidate_authority()?;
+        permit.assert_current_paths(&snapshot, store)?;
+        let immediately_before = inspect_closed()?;
+        anyhow::ensure!(
+            immediately_before == admitted_physical,
+            "Host TAP inventory changed before physical effect"
+        );
+        revalidate_authority()?;
+        context.check_active()?;
+
+        if entry.state == ReservedHostNetworkState::Exact {
+            permit.assert_current_paths(&snapshot, store)?;
+            permit.release()?;
+            return Ok(NetworkPhysicalRound::AdoptedExact);
+        }
+
+        let planned = ChNetwork {
+            tap: network.tap_name.as_str().to_owned(),
+            ownership_token: network.ownership_token.clone(),
+            config: network.network_config.clone(),
+        };
+        let attempt = create_network_from_sealed_absence_with_tap_port(
+            &self.ip_binary,
+            &planned,
+            context,
+            tap_create,
+        )?;
+
+        // A physical create was attempted. No error below may retain this
+        // admission for a retry: the next full scan is the sole postcondition
+        // oracle for success, response loss, cancellation or cleanup.
+        let _postcondition = (|| -> Result<()> {
+            let after = inspect_closed()?;
+            anyhow::ensure!(
+                admitted_physical.unchanged_except_reserved_tap(&after, network),
+                "Host network inventory changed outside the attempted TAP"
+            );
+            let after_state = after.reserved_network_state(network)?;
+            match attempt {
+                NetworkCreateAttempt::Published => anyhow::ensure!(
+                    after_state == ReservedHostNetworkState::Exact,
+                    "published TAP is not exact"
+                ),
+                NetworkCreateAttempt::DefinitelyNotPublished => anyhow::ensure!(
+                    after_state == ReservedHostNetworkState::Absent,
+                    "definitively unpublished TAP remained visible"
+                ),
+                NetworkCreateAttempt::PublicationOutcomeUnknown => anyhow::ensure!(
+                    matches!(
+                        after_state,
+                        ReservedHostNetworkState::Absent | ReservedHostNetworkState::Exact
+                    ),
+                    "ambiguous TAP publication left partial state"
+                ),
+            }
+            permit.assert_current_paths(&snapshot, store)?;
+            revalidate_authority()?;
+            context.check_active()
+        })();
+        drop(permit);
+        Ok(NetworkPhysicalRound::CreateAttempted)
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum NetworkPhysicalRound {
+    AdoptedExact,
+    CreateAttempted,
+}
+
+impl network_inventory_bridge_sealed::Sealed for NetworkAllocationPort {}
+
+impl NetworkInventoryBridge for NetworkAllocationPort {
+    fn inspect_all(
+        &self,
+        checkpoints: &BTreeMap<Id, RuntimeCheckpointInventoryEvidence>,
+        context: &RuntimeInventoryScanContext,
+    ) -> Result<NetworkInventoryBridgeOutcome> {
+        let permit = self.lock(context)?;
+        let assigned = context.assigned_cats()?;
+        let snapshot = snapshot_runtime_checkpoint_namespace(
+            &permit.state_root,
+            context,
+            &assigned,
+            RUNTIME_CHECKPOINT_NAMESPACE_ENTRY_LIMIT,
+        )?;
+        let Some(snapshot) = snapshot else {
+            if !checkpoints.is_empty() || !checkpoint_namespace_is_absent(&permit.state_root)? {
+                permit.release()?;
+                return Ok(NetworkInventoryBridgeOutcome::Unavailable);
+            }
+            permit.assert_current_absent_namespace()?;
+            let physical = inspect_host_network_snapshot(&self.ip_binary, context)?;
+            physical.ensure_managed_networks_are_reserved(std::iter::empty())?;
+            physical.ensure_reserved_network_ranges(std::iter::empty())?;
+            permit.assert_current_absent_namespace()?;
+            let admission = NodeGlobalNetworkScanAdmission::new([], physical)?;
+            permit.release()?;
+            return Ok(NetworkInventoryBridgeOutcome::Complete(admission));
+        };
+
+        permit.assert_current_snapshot(&snapshot)?;
+        anyhow::ensure!(
+            snapshot.iter_checkpoints().len() == checkpoints.len()
+                && checkpoints.iter().all(|(cat_id, evidence)| {
+                    snapshot.checkpoint(cat_id) == Some(&evidence.checkpoint)
+                }),
+            "network bridge checkpoint snapshot differs from checkpoint inventory"
+        );
+        let reservations = NetworkReservations::from_snapshot(&snapshot)?;
+        let physical = inspect_host_network_snapshot(&self.ip_binary, context)?;
+        physical.ensure_managed_networks_are_reserved(
+            reservations
+                .by_tap
+                .values()
+                .map(|reservation| &reservation.identity),
+        )?;
+        physical.ensure_reserved_network_ranges(
+            reservations
+                .by_tap
+                .values()
+                .map(|reservation| &reservation.identity),
+        )?;
+        let admission =
+            NodeGlobalNetworkScanAdmission::new(reservations.by_tap.into_values(), physical)?;
+        permit.assert_current_snapshot(&snapshot)?;
+        context.check_active()?;
+        permit.release()?;
+        Ok(NetworkInventoryBridgeOutcome::Complete(admission))
+    }
 }
 
 pub(crate) struct PrepareNetworkReservationEffect {
     allocation: NetworkAllocationPort,
+    authority: Arc<dyn VolumeDataAuthority>,
+    serving_process: Arc<dyn ServingBlockdProcessGlobalPort>,
+    tap_create: Arc<dyn TapCreatePort>,
 }
 
 impl PrepareNetworkReservationEffect {
-    pub(crate) fn new(state_directory: StateDirectory, ip_binary: PathBuf) -> Result<Self> {
+    pub(crate) fn new(
+        state_directory: StateDirectory,
+        ip_binary: PathBuf,
+        authority: Arc<dyn VolumeDataAuthority>,
+        serving_process: Arc<dyn ServingBlockdProcessGlobalPort>,
+    ) -> Result<Self> {
         Ok(Self {
             allocation: NetworkAllocationPort::new(state_directory, ip_binary)?,
+            authority,
+            serving_process,
+            tap_create: Arc::new(PlatformTapCreatePort),
         })
     }
 
@@ -408,46 +828,22 @@ impl PrepareNetworkReservationEffect {
         desired: &DesiredRuntimeSpec,
     ) -> Result<Option<RuntimeDesiredEffectOutcome>> {
         let accepted = context.accepted_full()?;
-        let mut runtimes = accepted
-            .observation()
-            .runtimes
-            .iter()
-            .filter(|runtime| runtime.cat_id == desired.cat_id);
-        let Some(runtime) = runtimes.next() else {
+        let Some(runtime) = unique_runtime(&accepted.observation().runtimes, desired)? else {
             return Ok(None);
         };
-        anyhow::ensure!(
-            runtimes.next().is_none(),
-            "PrepareNetwork admission duplicates one Cat"
-        );
+        if matches!(runtime.step, ReconcileStep::PrepareNetwork { .. }) {
+            return self.try_apply_physical(context, desired, runtime).map(Some);
+        }
         let ReconcileStep::PrepareDevice { frontend, .. } = &runtime.step else {
             return Ok(None);
         };
         if !matches!(frontend, PrepareDeviceFrontend::VhostUserBlk { .. }) {
             return Ok(None);
         }
-        if !checkpoint_is_current_exact(desired, runtime) {
-            return Ok(None);
+        if !prepare_device_base_admission_is_exact(accepted, desired, runtime) {
+            return Ok(Some(local_contract_stop()));
         }
-        anyhow::ensure!(
-            desired.target == RuntimeTarget::Running
-                && matches!(desired.transition, RuntimeTransition::CancelAndDrain)
-                && runtime.runtime_incarnation.is_none()
-                && runtime.stable_state.is_none()
-                && runtime.mounts.is_empty()
-                && runtime.networks.is_empty()
-                && matches!(runtime.warm_snapshot, WarmSnapshotEvidence::Absent)
-                && runtime.lifecycle_admission == LifecycleAdmission::Closed
-                && runtime.routes.is_empty()
-                && runtime.conditions
-                    == [Condition::Progressing {
-                        reason: ProgressingReason::ReconcileStep {
-                            step: runtime.step.clone(),
-                        },
-                    }],
-            "PrepareNetwork admission is not the exact closed pre-launch phase"
-        );
-        let Some((_expectation, Some(serving))) = context
+        let Some((expectation, Some(serving))) = context
             .node_global_process()?
             .serving_blockd(&desired.cat_id)
         else {
@@ -462,8 +858,24 @@ impl PrepareNetworkReservationEffect {
             }),
             "PrepareNetwork public device projection changed after provider proof"
         );
-        let listener = serving.listener_proof();
-        listener.assert_current(context)?;
+        let [desired_volume] = desired.volumes.as_slice() else {
+            return Ok(Some(local_contract_stop()));
+        };
+        anyhow::ensure!(
+            expectation.volume_id() == &desired_volume.volume_id,
+            "PrepareNetwork serving proof names another Volume"
+        );
+        let first_authority = self
+            .authority
+            .load_volume(&desired_volume.volume_id)
+            .context("load PrepareNetwork Volume authority")?;
+        anyhow::ensure!(
+            expectation.matches_current_authority(&first_authority),
+            "PrepareNetwork Volume authority conflicts with serving admission"
+        );
+        let first_lease_expiry = first_authority
+            .lease_expires_at
+            .context("PrepareNetwork Volume authority lacks a serving lease")?;
 
         let CheckpointEvidence::Valid {
             checkpoint_path,
@@ -495,14 +907,238 @@ impl PrepareNetworkReservationEffect {
             &store,
             &stored,
             &desired.runtime.network_config,
-            || listener.assert_current(context),
+            || {
+                self.revalidate_serving_authority(
+                    context,
+                    expectation,
+                    serving,
+                    &first_authority,
+                    first_lease_expiry,
+                )
+            },
             |network| prepare_network_successor(&stored, network, prepared),
         )?;
         Ok(Some(RuntimeDesiredEffectOutcome::RefreshInventory))
     }
+
+    fn try_apply_physical(
+        &self,
+        context: &RuntimeDesiredEffectContext,
+        desired: &DesiredRuntimeSpec,
+        runtime: &cats_api::runtime_reconciliation::ObservedRuntimeStatus,
+    ) -> Result<RuntimeDesiredEffectOutcome> {
+        let accepted = context.accepted_full()?;
+        let ReconcileStep::PrepareNetwork { network, devices } = &runtime.step else {
+            unreachable!("caller selected PrepareNetwork")
+        };
+        let [device] = devices.as_slice() else {
+            return Ok(local_contract_stop());
+        };
+        let network_admission = context.node_global_network()?;
+        let Some(network_entry) = network_admission.reservation(&desired.cat_id) else {
+            return Ok(local_contract_stop());
+        };
+        if &network_entry.reservation.identity != network {
+            return Ok(local_contract_stop());
+        }
+        let expected_networks = match network_entry.state {
+            ReservedHostNetworkState::Absent => Vec::new(),
+            ReservedHostNetworkState::Exact => vec![observed_network(network)],
+        };
+        if !signed_inventory_admission_is_exact_with_networks(
+            accepted,
+            desired,
+            runtime,
+            &expected_networks,
+        ) || !checkpoint_is_current_exact(desired, runtime)
+        {
+            return Ok(local_contract_stop());
+        }
+        let Some((expectation, Some(serving))) = context
+            .node_global_process()?
+            .serving_blockd(&desired.cat_id)
+        else {
+            return Ok(RuntimeDesiredEffectOutcome::RefreshInventory);
+        };
+        let Some((volume_id, observed_device)) = serving.vhost_device_projection() else {
+            return Ok(local_contract_stop());
+        };
+        if !prepare_network_volume_admission_is_exact(
+            desired,
+            runtime,
+            device,
+            &volume_id,
+            &observed_device,
+        ) || !matches!(
+            runtime.processes.as_slice(),
+            [process] if serving.matches_public_process(process)
+        ) {
+            return Ok(local_contract_stop());
+        }
+        let first_authority = self
+            .authority
+            .load_volume(expectation.volume_id())
+            .context("load TAP effect Volume authority")?;
+        anyhow::ensure!(
+            expectation.matches_current_authority(&first_authority),
+            "TAP effect Volume authority conflicts with serving admission"
+        );
+        let first_lease_expiry = first_authority
+            .lease_expires_at
+            .context("TAP effect Volume authority lacks a serving lease")?;
+
+        let CheckpointEvidence::Valid {
+            checkpoint_path,
+            content_digest,
+            ..
+        } = &runtime.checkpoint
+        else {
+            return Ok(local_contract_stop());
+        };
+        let store = FileCheckpointStore::open_preserving_checkpoint_temp(
+            &context.state_directory().path().join(CHECKPOINT_NAMESPACE),
+            &desired.cat_id,
+        )?;
+        anyhow::ensure!(
+            store.path() == Path::new(checkpoint_path.as_str()),
+            "TAP effect admission names another checkpoint path"
+        );
+        let Some(stored) = store.load()? else {
+            return Ok(RuntimeDesiredEffectOutcome::RefreshInventory);
+        };
+        if stored.content_digest() != content_digest || stored.checkpoint().step != runtime.step {
+            return Ok(RuntimeDesiredEffectOutcome::RefreshInventory);
+        }
+        let _round = self.allocation.create_or_adopt_reserved(
+            context,
+            network_admission,
+            &store,
+            &stored,
+            self.tap_create.as_ref(),
+            || {
+                self.revalidate_serving_authority(
+                    context,
+                    expectation,
+                    serving,
+                    &first_authority,
+                    first_lease_expiry,
+                )
+            },
+        )?;
+        Ok(RuntimeDesiredEffectOutcome::RefreshInventory)
+    }
+
+    fn revalidate_serving_authority(
+        &self,
+        context: &RuntimeDesiredEffectContext,
+        expected: &ServingBlockdExpectation,
+        admitted: &ExactServingBlockdProcessProof,
+        first_authority: &VolumeRecord,
+        first_lease_expiry: UnixMillis,
+    ) -> Result<()> {
+        context.check_active()?;
+        let inspection = self
+            .serving_process
+            .inspect_serving_exact_or_absent_after_node_global_sweep(expected, context)
+            .context("reinspect PrepareNetwork serving authority across Node-global sweep")?;
+        let ServingBlockdProcessInspection::Exact(current_process) = inspection else {
+            anyhow::bail!("PrepareNetwork serving authority is no longer exact")
+        };
+        anyhow::ensure!(
+            current_process.exactly_matches(expected)
+                && current_process.as_ref() == admitted.evidence(),
+            "PrepareNetwork serving process/status authority drifted"
+        );
+        let current_authority = self
+            .authority
+            .load_volume(expected.volume_id())
+            .context("reread PrepareNetwork Volume authority")?;
+        anyhow::ensure!(
+            expected.matches_current_authority(&current_authority)
+                && retirement_authority_lease_is_monotonic(
+                    first_authority,
+                    &current_authority,
+                    first_lease_expiry,
+                ),
+            "PrepareNetwork Volume authority changed before checkpoint publication"
+        );
+        context.check_active()
+    }
 }
 
-fn prepared_device_input(checkpoint: &RuntimeCheckpoint) -> Result<PreparedDeviceInput> {
+fn prepare_network_volume_admission_is_exact(
+    desired: &DesiredRuntimeSpec,
+    runtime: &cats_api::runtime_reconciliation::ObservedRuntimeStatus,
+    device: &PreparedDeviceInput,
+    volume_id: &Id,
+    observed_device: &ObservedDevice,
+) -> bool {
+    let [desired_volume] = desired.volumes.as_slice() else {
+        return false;
+    };
+    let [observed_volume] = runtime.volumes.as_slice() else {
+        return false;
+    };
+    let [lineage] = observed_volume.local_lineages.as_slice() else {
+        return false;
+    };
+    let VolumeAuthorityEvidence::Owned {
+        attachment_id,
+        attachment_epoch,
+        head,
+    } = &observed_volume.authority
+    else {
+        return false;
+    };
+    desired.target == RuntimeTarget::Running
+        && matches!(desired.transition, RuntimeTransition::CancelAndDrain)
+        && desired_volume.disk_kind == DiskKind::Root
+        && desired_volume.access == VolumeAccess::ReadWriteOnce
+        && matches!(desired_volume.acquire, VolumeAcquire::Normal { .. })
+        && matches!(desired_volume.disposition, VolumeDisposition::Retain)
+        && desired_volume.mount.is_none()
+        && device.volume_intent_id == desired_volume.volume_intent_id
+        && device.disk_id == desired_volume.disk_id
+        && device.volume_id == desired_volume.volume_id
+        && device.volume_id == *volume_id
+        && device.disk_kind == desired_volume.disk_kind
+        && device.attachment_id == *attachment_id
+        && device.attachment_epoch == *attachment_epoch
+        && device.expected_head == *head
+        && device.size_bytes == desired_volume.size_bytes
+        && device.durability == desired_volume.durability
+        && matches!(device.frontend, PrepareDeviceFrontend::VhostUserBlk { .. })
+        && observed_volume.volume_intent_id.as_ref() == Some(&desired_volume.volume_intent_id)
+        && observed_volume.disk_id.as_ref() == Some(&desired_volume.disk_id)
+        && observed_volume.volume_id == desired_volume.volume_id
+        && observed_volume.disk_kind == ObservedDiskKind::Root
+        && observed_volume.size_bytes == Some(desired_volume.size_bytes)
+        && observed_volume.durability == Some(desired_volume.durability)
+        && observed_volume.devices == [observed_device.clone()]
+        && lineage.attachment_id == *attachment_id
+        && lineage.attachment_epoch == *attachment_epoch
+        && lineage.acquire_origin == device.acquire_origin
+        && lineage.node_id == desired.placement.node_id
+        && lineage.placement_epoch == desired.placement.placement_epoch
+        && lineage.local_durable_generation == head.generation
+        && lineage.remote_durable_generation == head.generation
+        && lineage.data_directory == device.serving_process.data_directory
+        && lineage.pending_pack_count.get() == 0
+        && !lineage.fenced
+        && lineage.state == LocalLineageState::Active
+}
+
+fn local_contract_stop() -> RuntimeDesiredEffectOutcome {
+    RuntimeDesiredEffectOutcome::Stop(RuntimeDesiredEffectStopReason::LocalContract)
+}
+
+pub(super) fn prepared_device_input(checkpoint: &RuntimeCheckpoint) -> Result<PreparedDeviceInput> {
+    if let ReconcileStep::PrepareNetwork { devices, .. } = &checkpoint.step {
+        let [device] = devices.as_slice() else {
+            anyhow::bail!("PrepareNetwork must retain exactly one prepared device")
+        };
+        return Ok(device.clone());
+    }
     let ReconcileStep::PrepareDevice {
         volume_intent_id,
         disk_id,
@@ -540,6 +1176,31 @@ fn prepared_device_input(checkpoint: &RuntimeCheckpoint) -> Result<PreparedDevic
         serving_process: serving_process.clone(),
         frontend: frontend.clone(),
     })
+}
+
+pub(super) fn prepare_device_checkpoint_view(
+    checkpoint: &RuntimeCheckpoint,
+) -> Result<RuntimeCheckpoint> {
+    let device = prepared_device_input(checkpoint)?;
+    let mut prepared = checkpoint.clone();
+    prepared.step = ReconcileStep::PrepareDevice {
+        volume_intent_id: device.volume_intent_id,
+        disk_id: device.disk_id,
+        volume_id: device.volume_id,
+        disk_kind: device.disk_kind,
+        attachment_id: device.attachment_id,
+        attachment_epoch: device.attachment_epoch,
+        acquire_origin: device.acquire_origin,
+        expected_head: device.expected_head,
+        size_bytes: device.size_bytes,
+        durability: device.durability,
+        guest_device: device.guest_device,
+        ownership_token: device.ownership_token,
+        serving_authority: device.serving_authority,
+        serving_process: device.serving_process,
+        frontend: device.frontend,
+    };
+    Ok(prepared)
 }
 
 fn prepare_network_successor(
@@ -611,6 +1272,32 @@ fn open_network_allocation_lock(root: &File) -> Result<File> {
     Ok(file)
 }
 
+fn checkpoint_namespace_is_absent(root: &File) -> Result<bool> {
+    let name = CString::new(CHECKPOINT_NAMESPACE).expect("checkpoint namespace is static ASCII");
+    // SAFETY: root is a retained directory and name is a live NUL-terminated
+    // lexical basename. No symlink is followed and a successful fd is closed
+    // below without escaping this probe.
+    let fd = unsafe {
+        libc::openat(
+            root.as_raw_fd(),
+            name.as_ptr(),
+            libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+        )
+    };
+    if fd >= 0 {
+        // SAFETY: openat returned this owned descriptor and it is closed once.
+        let directory = unsafe { File::from_raw_fd(fd) };
+        drop(directory);
+        return Ok(false);
+    }
+    let error = io::Error::last_os_error();
+    if error.raw_os_error() == Some(libc::ENOENT) {
+        Ok(true)
+    } else {
+        Err(error).context("inspect absent checkpoint namespace for network inventory")
+    }
+}
+
 fn lock_exclusive_nonblocking(file: &File) -> Result<()> {
     loop {
         // SAFETY: file is a live descriptor; flock retains no Rust memory.
@@ -672,8 +1359,8 @@ mod tests {
     use cats_api::runtime_reconciliation::{
         decode_desired_runtime_spec, decode_runtime_checkpoint, AdmissionInventoryAttestation,
         AgentSession, ContractVersion, DesiredReadSnapshot, DesiredRuntimeSpec, Epoch,
-        NetworkConfig, NodeBootId, NodeObservation, RuntimeTarget, RuntimeTransition, Sequence,
-        SessionBinding, Sha256Digest,
+        LifecycleAdmission, NetworkConfig, NodeBootId, NodeObservation, RuntimeTarget,
+        RuntimeTransition, Sequence, SessionBinding, Sha256Digest,
     };
     use tempfile::TempDir;
 
@@ -1017,6 +1704,14 @@ exit 97\n",
                 ownership_token: random('a'),
             },
         };
+        let distinct_network = NetworkConfig {
+            network_id: Id::new("net_b").unwrap(),
+            gateway_ipv4: cats_api::runtime_reconciliation::Ipv4Address::new("10.240.0.9").unwrap(),
+            guest_ipv4: cats_api::runtime_reconciliation::Ipv4Address::new("10.240.0.10").unwrap(),
+            guest_mac: cats_api::runtime_reconciliation::MacAddress::new("02:ca:0a:f0:00:0a")
+                .unwrap(),
+            ..first.identity.network_config.clone()
+        };
         let mut reservations = NetworkReservations::default();
         reservations.insert(first.clone()).unwrap();
         for second in [
@@ -1025,10 +1720,7 @@ exit 97\n",
                 identity: RuntimeNetworkIdentity {
                     tap_name: first.identity.tap_name.clone(),
                     ownership_token: random('b'),
-                    network_config: NetworkConfig {
-                        network_id: Id::new("net_b").unwrap(),
-                        ..first.identity.network_config.clone()
-                    },
+                    network_config: distinct_network.clone(),
                 },
             },
             NetworkReservation {
@@ -1036,15 +1728,29 @@ exit 97\n",
                 identity: RuntimeNetworkIdentity {
                     tap_name: Id::new("catb00000001").unwrap(),
                     ownership_token: first.identity.ownership_token.clone(),
-                    network_config: NetworkConfig {
-                        network_id: Id::new("net_b").unwrap(),
-                        ..first.identity.network_config.clone()
-                    },
+                    network_config: distinct_network.clone(),
                 },
             },
         ] {
             assert!(reservations.insert(second).is_err());
         }
+
+        let overlapping_absent_reservation = NetworkReservation {
+            cat_id: Id::new("cat_b").unwrap(),
+            identity: RuntimeNetworkIdentity {
+                tap_name: Id::new("catb00000002").unwrap(),
+                ownership_token: random('d'),
+                network_config: NetworkConfig {
+                    network_id: Id::new("net_overlap").unwrap(),
+                    ..first.identity.network_config.clone()
+                },
+            },
+        };
+        let overlap = reservations
+            .insert(overlapping_absent_reservation)
+            .expect_err("two durable absent TAP reservations overlapped");
+        assert!(format!("{overlap:#}").contains("overlaps"));
+
         reservations
             .occupied_tokens
             .insert(random('f'), Id::new("cat_z").unwrap());
@@ -1055,11 +1761,33 @@ exit 97\n",
                 ownership_token: random('f'),
                 network_config: NetworkConfig {
                     network_id: Id::new("net_fresh").unwrap(),
-                    ..first.identity.network_config
+                    ..distinct_network
                 },
             },
         };
         assert!(reservations.assert_candidate_available(&fresh).is_err());
+    }
+
+    #[test]
+    fn sealed_network_admission_binds_only_the_exact_full_observation() {
+        let fixture = Fixture::empty();
+        let context = desired_effect_context(&fixture.state, &[]);
+        let observation = context.accepted_full().unwrap().observation().clone();
+        let physical =
+            inspect_host_network_snapshot(&fixture.ip, &TestPhysicalContext::active()).unwrap();
+        let bound = NodeGlobalNetworkScanAdmission::new([], physical)
+            .unwrap()
+            .bind(&observation)
+            .unwrap();
+        let context = context.with_node_global_network_for_test(bound.clone());
+        assert!(context
+            .node_global_network()
+            .unwrap()
+            .matches_observation(&observation));
+
+        let mut changed = observation;
+        changed.inventory_epoch = Epoch::new(2).unwrap();
+        assert!(!bound.matches_observation(&changed));
     }
 
     #[derive(Debug)]

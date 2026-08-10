@@ -15,9 +15,10 @@ use cats_api::runtime_reconciliation::{
     encode_desired_runtime_spec, AppliedDesiredEvidence, CheckpointEvidence, Condition,
     ContractVersion, ControlHandshakeEvidence, DesiredRuntimeSpec, DiskKind,
     GuestTransportEvidence, HostPath, LifecycleAdmission, LocalLineageState, ObservedDiskKind,
-    ObservedRuntimeStatus, OwnershipTokenEvidence, ProcessRole, ProcessState, ProgressingReason,
-    ProvisionRootImageError, ReconcileStep, RuntimeTarget, RuntimeTransition, VolumeAccess,
-    VolumeAcquire, VolumeAuthorityEvidence, VolumeDisposition, VolumeIntent, WarmSnapshotEvidence,
+    ObservedNetwork, ObservedRuntimeStatus, OwnershipTokenEvidence, ProcessRole, ProcessState,
+    ProgressingReason, ProvisionRootImageError, ReconcileStep, RuntimeTarget, RuntimeTransition,
+    VolumeAccess, VolumeAcquire, VolumeAuthorityEvidence, VolumeDisposition, VolumeIntent,
+    WarmSnapshotEvidence,
 };
 use cats_blockd::target_control::provision_root_image_request;
 use cats_storage::authority::{AttachmentLineageIdentity, VolumeDataAuthority, VolumeRecord};
@@ -212,7 +213,7 @@ impl SignedRunningEffect {
         let serving_process_effect = ServingBlockdStartEffect::new(
             Arc::clone(&authority),
             systemd.clone(),
-            process_ports.serving_global,
+            Arc::clone(&process_ports.serving_global),
         );
         Ok(Self {
             acquire,
@@ -223,7 +224,7 @@ impl SignedRunningEffect {
                 process_ports.retirement,
             )?,
             handoff: ServingHandoffEffect::new(
-                authority,
+                Arc::clone(&authority),
                 blob,
                 process_ports.root_global,
                 target_process,
@@ -235,6 +236,8 @@ impl SignedRunningEffect {
             prepare_network: Some(PrepareNetworkReservationEffect::new(
                 state_directory,
                 network_ip_binary,
+                Arc::clone(&authority),
+                process_ports.serving_global,
             )?),
         })
     }
@@ -947,6 +950,15 @@ fn signed_inventory_admission_is_exact(
     desired: &DesiredRuntimeSpec,
     runtime: &ObservedRuntimeStatus,
 ) -> bool {
+    signed_inventory_admission_is_exact_with_networks(accepted, desired, runtime, &[])
+}
+
+pub(super) fn signed_inventory_admission_is_exact_with_networks(
+    accepted: &crate::runtime_spine::RuntimeDesiredEffectAdmission,
+    desired: &DesiredRuntimeSpec,
+    runtime: &ObservedRuntimeStatus,
+    expected_networks: &[ObservedNetwork],
+) -> bool {
     let observation = accepted.observation();
     let expected_applied = AppliedDesiredEvidence {
         desired_revision: desired.desired_revision,
@@ -973,7 +985,7 @@ fn signed_inventory_admission_is_exact(
         && runtime.runtime_incarnation.is_none()
         && runtime.stable_state.is_none()
         && runtime.mounts.is_empty()
-        && runtime.networks.is_empty()
+        && runtime.networks == expected_networks
         && matches!(runtime.guest_transport, GuestTransportEvidence::Unavailable)
         && matches!(runtime.warm_snapshot, WarmSnapshotEvidence::Absent)
         && runtime.lifecycle_admission == LifecycleAdmission::Closed

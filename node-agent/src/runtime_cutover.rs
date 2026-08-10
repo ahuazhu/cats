@@ -223,6 +223,7 @@ async fn spawn_signed_runtime_cutover_with_scanner(
         cloud_hypervisor_binary: config.ch_config.ch_bin.clone(),
         blockd_binary: config.authorized_blockd_launch.blockd_binary.clone(),
         guest_agent_binary: config.guest_agent_binary.clone(),
+        ip_binary: config.ch_config.ip_bin.clone(),
         metering_cgroup_root: config.metering_cgroup_root.clone(),
         volume_inventory_authority: Arc::clone(&config.volume_inventory_authority),
         blob_store: Arc::clone(&config.blob_store),

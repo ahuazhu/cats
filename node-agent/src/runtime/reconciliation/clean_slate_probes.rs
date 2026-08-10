@@ -67,6 +67,7 @@ use super::inventory::{
     AuthorizedBlockdInventoryEvidence, DesiredCheckpointBinding,
     RuntimeCheckpointInventoryEvidence,
 };
+use super::network::NetworkAllocationPort;
 use super::root_provision_process::inspect_exact_root_provision_process;
 use super::root_provision_process::StopReceiptSocketAdmission;
 use super::serving_blockd_process::{
@@ -924,6 +925,7 @@ pub(crate) struct InstalledCleanSlateProbeConfig {
     pub cloud_hypervisor_binary: PathBuf,
     pub blockd_binary: PathBuf,
     pub guest_agent_binary: PathBuf,
+    pub ip_binary: PathBuf,
     pub metering_cgroup_root: Option<PathBuf>,
     pub volume_inventory_authority: Arc<dyn RuntimeVolumeInventoryAuthority>,
     pub blob_store: Arc<dyn BlobStore>,
@@ -938,6 +940,7 @@ impl std::fmt::Debug for InstalledCleanSlateProbeConfig {
             .field("cloud_hypervisor_binary", &self.cloud_hypervisor_binary)
             .field("blockd_binary", &self.blockd_binary)
             .field("guest_agent_binary", &self.guest_agent_binary)
+            .field("ip_binary", &self.ip_binary)
             .field("metering_cgroup_root", &self.metering_cgroup_root)
             .field(
                 "volume_inventory_authority",
@@ -966,6 +969,7 @@ struct ProbeConfig {
     root_process_port: Option<Arc<dyn RootProvisionProcessPort>>,
     serving_process_port: Option<Arc<dyn ServingBlockdProcessPort>>,
     root_provision_systemd: Option<RootProvisionSystemdConfig>,
+    network_allocation_port: Option<NetworkAllocationPort>,
 }
 
 impl ProbeConfig {
@@ -974,6 +978,7 @@ impl ProbeConfig {
             ("Cloud Hypervisor", &config.cloud_hypervisor_binary),
             ("cats-blockd", &config.blockd_binary),
             ("cats-guest-agent", &config.guest_agent_binary),
+            ("ip", &config.ip_binary),
         ] {
             anyhow::ensure!(
                 binary.is_absolute(),
@@ -1003,6 +1008,10 @@ impl ProbeConfig {
                 PlatformSystemdServingBlockdProcessPort::platform(config.state_directory.clone()),
             )),
             root_provision_systemd: Some(config.root_provision_systemd),
+            network_allocation_port: Some(NetworkAllocationPort::new(
+                config.state_directory,
+                config.ip_binary,
+            )?),
         })
     }
 }
@@ -1123,6 +1132,7 @@ fn clean_slate_scanner_with_metadata_for_test(
             root_process_port: None,
             serving_process_port: None,
             root_provision_systemd: None,
+            network_allocation_port: None,
         },
         metadata_authority,
         blob_store,
@@ -1147,6 +1157,7 @@ fn scanner_with_metadata_authority_and_blob(
     metadata_authority: Arc<dyn MetadataAuthorityAbsenceReader>,
     blob_store: Option<Arc<dyn BlobStore>>,
 ) -> anyhow::Result<CleanSlateInventoryScanner> {
+    let network_bridge = config.network_allocation_port.clone();
     let state = config.state_directory.clone();
     let process_paths = ProcessPaths {
         root: config.proc_root.clone(),
@@ -1227,7 +1238,7 @@ fn scanner_with_metadata_authority_and_blob(
             limits: config.limits,
         }),
     ];
-    match blob_store {
+    let scanner = match blob_store {
         Some(blob_store) if config.root_process_port.is_some() => {
             let bridge = platform_root_process_inventory_bridge(&config, process_paths)?;
             CleanSlateInventoryScanner::new_with_blob_and_root_process_bridge(
@@ -1244,7 +1255,11 @@ fn scanner_with_metadata_authority_and_blob(
         ),
         None => CleanSlateInventoryScanner::new(config.checkpoint_directory, probes),
     }
-    .map_err(anyhow::Error::from)
+    .map_err(anyhow::Error::from)?;
+    Ok(match network_bridge {
+        Some(bridge) => scanner.with_network_bridge(Arc::new(bridge)),
+        None => scanner,
+    })
 }
 
 fn platform_root_process_inventory_bridge(
@@ -6153,6 +6168,7 @@ mod tests {
                 root_process_port: None,
                 serving_process_port: None,
                 root_provision_systemd: None,
+                network_allocation_port: None,
             }
         }
     }
@@ -8473,6 +8489,7 @@ mod tests {
             cloud_hypervisor_binary: environment.ch_binary.clone(),
             blockd_binary: environment.blockd_binary.clone(),
             guest_agent_binary: environment.guest_binary.clone(),
+            ip_binary: PathBuf::from("/sbin/ip"),
             metering_cgroup_root: None,
             volume_inventory_authority: Arc::new(TestUnavailableRuntimeVolumeInventoryAuthority),
             blob_store: Arc::new(TestUnavailableBlobStore),

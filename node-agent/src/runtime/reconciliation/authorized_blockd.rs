@@ -35,6 +35,7 @@ use sha2::{Digest as _, Sha256};
 
 use crate::state_directory::StateDirectory;
 
+use super::network::prepared_device_input;
 use super::root_provision_process::{
     RootProvisionAuthoritySnapshot, RootProvisionProcessEvidence, RootProvisionProcessExpectation,
     RootProvisionRetirementAdmission,
@@ -578,24 +579,11 @@ impl AuthorizedBlockdStore {
         runtime: &RuntimeCheckpoint,
         desired: &DesiredRuntimeSpec,
     ) -> Result<RetainedAuthorizedBlockd> {
-        let ReconcileStep::PrepareDevice {
-            volume_id,
-            attachment_id,
-            attachment_epoch,
-            acquire_origin,
-            expected_head,
-            size_bytes,
-            durability,
-            serving_authority,
-            serving_process,
-            ..
-        } = &runtime.step
-        else {
-            anyhow::bail!("exact authorized blockd handoff reopen requires prepare_device")
-        };
+        let prepared = prepared_device_input(runtime)
+            .context("exact authorized blockd handoff reopen requires a prepared device")?;
         anyhow::ensure!(
             matches!(
-                serving_authority.as_ref(),
+                prepared.serving_authority.as_ref(),
                 cats_api::runtime_reconciliation::ServingAuthorityProvenance::AfterRootProvision { .. }
             ),
             "exact authorized blockd handoff reopen requires Root serving provenance"
@@ -603,16 +591,16 @@ impl AuthorizedBlockdStore {
         let components = [
             DATA_DIRECTORY.to_owned(),
             format!("cat-{}", runtime.cat_id),
-            format!("volume-{volume_id}"),
-            format!("attachment-{attachment_id}"),
-            format!("epoch-{}", attachment_epoch.get()),
+            format!("volume-{}", prepared.volume_id),
+            format!("attachment-{}", prepared.attachment_id),
+            format!("epoch-{}", prepared.attachment_epoch.get()),
         ];
         let expected_directory = components.iter().fold(
             self.state_directory.path().to_path_buf(),
             |path, component| path.join(component),
         );
         anyhow::ensure!(
-            Path::new(serving_process.data_directory.as_str()) == expected_directory,
+            Path::new(prepared.serving_process.data_directory.as_str()) == expected_directory,
             "PrepareDevice data directory is not its exact retained Node path"
         );
 
@@ -694,16 +682,16 @@ impl AuthorizedBlockdStore {
                 && runtime.placement_epoch == desired.placement.placement_epoch
                 && runtime.desired_revision == desired.desired_revision
                 && runtime.spec_digest == desired.spec_digest
-                && *volume_id == desired_volume.volume_id
-                && *volume_id == identity.volume_id
-                && *attachment_id == identity.attachment_id
-                && *attachment_epoch == identity.attachment_epoch
-                && *acquire_origin == identity.acquire_origin
-                && *size_bytes == attachment.size_bytes
-                && *durability == attachment.durability
-                && expected_head.generation.get() > 0
-                && expected_head.root_hash.is_some()
-                && expected_head.root_object_id.is_some(),
+                && prepared.volume_id == desired_volume.volume_id
+                && prepared.volume_id == identity.volume_id
+                && prepared.attachment_id == identity.attachment_id
+                && prepared.attachment_epoch == identity.attachment_epoch
+                && prepared.acquire_origin == identity.acquire_origin
+                && prepared.size_bytes == attachment.size_bytes
+                && prepared.durability == attachment.durability
+                && prepared.expected_head.generation.get() > 0
+                && prepared.expected_head.root_hash.is_some()
+                && prepared.expected_head.root_object_id.is_some(),
             "PrepareDevice checkpoint and immutable authorized blockd inputs conflict"
         );
 
