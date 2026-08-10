@@ -77,6 +77,14 @@ impl RootProvisionSystemdConfig {
     pub(crate) fn blockd_binary(&self) -> &Path {
         &self.blockd.blockd_binary
     }
+
+    /// The serving-process suffix may consume only the blockd configuration
+    /// which already crossed this type's credentialless constructor.  Keeping
+    /// this accessor provider-private prevents a raw launch config from
+    /// bypassing that validation at the PrepareDevice boundary.
+    pub(super) fn validated_blockd(&self) -> &AuthorizedBlockdLaunchConfig {
+        &self.blockd
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

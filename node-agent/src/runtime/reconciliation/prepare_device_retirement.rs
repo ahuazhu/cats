@@ -234,7 +234,7 @@ impl PrepareDeviceTargetRetirementEffect {
 /// The process/data authority fields may not move during an exact stop.  A
 /// lease renewal is the sole legal concurrent authority change and its
 /// absolute expiry can only advance from the first point read.
-fn retirement_authority_lease_is_monotonic(
+pub(super) fn retirement_authority_lease_is_monotonic(
     before: &VolumeRecord,
     after: &VolumeRecord,
     first_lease_expiry: cats_api::runtime_reconciliation::UnixMillis,
@@ -251,7 +251,7 @@ fn retirement_authority_lease_is_monotonic(
         && matches!(after.lease_expires_at, Some(current) if current >= first_lease_expiry)
 }
 
-fn unique_runtime<'a>(
+pub(super) fn unique_runtime<'a>(
     runtimes: &'a [ObservedRuntimeStatus],
     desired: &DesiredRuntimeSpec,
 ) -> anyhow::Result<Option<&'a ObservedRuntimeStatus>> {
@@ -268,7 +268,7 @@ fn unique_runtime<'a>(
     Ok(Some(runtime))
 }
 
-fn prepare_device_admission_is_exact(
+pub(super) fn prepare_device_admission_is_exact(
     accepted: &crate::runtime_spine::RuntimeDesiredEffectAdmission,
     desired: &DesiredRuntimeSpec,
     runtime: &ObservedRuntimeStatus,

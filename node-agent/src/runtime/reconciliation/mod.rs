@@ -30,6 +30,14 @@ mod kernel_nbd;
 mod normal_acquire;
 mod prepare_device_retirement;
 mod root_provision;
+// The sealed serving-process foundation is composed with the Node-global
+// managed-process admission port in the following integration slice.  Its
+// fake port already exercises the complete one-effect start/adopt contract.
+#[expect(
+    dead_code,
+    reason = "sealed serving-process foundation awaits Node-global production admission"
+)]
+mod serving_blockd_process;
 mod serving_handoff;
 mod serving_handoff_effect;
 mod signed_root_provision;

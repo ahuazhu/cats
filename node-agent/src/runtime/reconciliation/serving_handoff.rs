@@ -177,6 +177,10 @@ impl PrepareDeviceHandoffReady {
         &self.attempt
     }
 
+    pub(crate) fn authorized_checkpoint(&self) -> &AuthorizedBlockdCheckpoint {
+        self.retained_authorized.checkpoint()
+    }
+
     pub(crate) fn assert_current(
         &self,
         checkpoint: &RuntimeCheckpoint,
