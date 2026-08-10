@@ -38,8 +38,8 @@ use crate::runtime_spine::{
 
 use super::{
     root_provision_process::{
-        ExactRootProvisionProcessProof, RootProvisionAuthoritySnapshot,
-        RootProvisionProcessExpectation,
+        ExactRootProvisionProcessProof, RetainedRootProvisionProcessAttempt,
+        RootProvisionAuthoritySnapshot, RootProvisionProcessExpectation,
     },
     runtime_checkpoint_path,
     signed_running::{
@@ -114,6 +114,10 @@ pub struct AuthorizedBlockdInventoryEvidence {
     /// to the Runtime inventory wire: it only prevents a process handshake
     /// from outrunning the engine files it claims to represent.
     pub control_state: AuthorizedBlockdControlState,
+    /// Exact old control-only process identity retained by a validated
+    /// `PrepareDevice.after_root_provision` handoff. This keeps the live old
+    /// process in the Node-global allowlist until a later one-effect stop.
+    pub(crate) retained_root_process: Option<RetainedRootProvisionProcessAttempt>,
 }
 
 /// Provider-private authority evidence retained until the local attachment
@@ -568,12 +572,7 @@ fn root_process_expectations(
         let Some(checkpoint) = checkpoints_by_cat.get(&desired.cat_id) else {
             continue;
         };
-        if checkpoint.binding != DesiredCheckpointBinding::Current
-            || !matches!(
-                checkpoint.checkpoint.step,
-                ReconcileStep::ProvisionRootImage { .. }
-            )
-        {
+        if checkpoint.binding != DesiredCheckpointBinding::Current {
             continue;
         }
         let blockd = blockd_by_cat
@@ -592,6 +591,33 @@ fn root_process_expectations(
             blob,
             context.deadline(),
         )?;
+        if let Some(retained) = &blockd.retained_root_process {
+            anyhow::ensure!(
+                matches!(
+                    checkpoint.checkpoint.step,
+                    ReconcileStep::PrepareDevice { .. }
+                ),
+                "retained Root process projection is outside PrepareDevice"
+            );
+            let expectation = RootProvisionProcessExpectation::from_retained_prepare_device(
+                &checkpoint.checkpoint,
+                desired,
+                retained,
+            )?;
+            anyhow::ensure!(
+                expected
+                    .insert(desired.cat_id.clone(), expectation)
+                    .is_none(),
+                "root-provision process expectation duplicated one Cat"
+            );
+            continue;
+        }
+        if !matches!(
+            checkpoint.checkpoint.step,
+            ReconcileStep::ProvisionRootImage { .. }
+        ) {
+            continue;
+        }
         let attachment = blockd.checkpoint.attachment.clone();
         let volume = volumes_by_cat
             .get(&desired.cat_id)
@@ -1182,6 +1208,7 @@ fn validate_scanned_checkpoint(
                     && serving_process.data_directory == blockd.data_directory
                     && checkpoint_volume.size_bytes == Some(attachment.size_bytes)
                     && checkpoint_volume.durability == Some(attachment.durability)
+                    && blockd.retained_root_process.is_some()
                     && matches!(
                         &checkpoint_volume.authority,
                         VolumeAuthorityEvidence::Owned { head, .. } if head == expected_head

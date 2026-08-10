@@ -9,9 +9,10 @@
 
 use anyhow::Context as _;
 use cats_api::runtime_reconciliation::{
-    CheckpointEvidence, ControlHandshakeEvidence, Durability, Epoch, FenceEpoch, HostPath, Id,
-    NodeBootId, OwnershipTokenEvidence, ProcessEvidence, ProcessRole, ProcessState, RandomId128,
-    ReconcileStep, RemoteHead, Revision, RuntimeCheckpoint, Sequence, Sha256Digest, WireU64,
+    CheckpointEvidence, ControlHandshakeEvidence, DesiredRuntimeSpec, Durability, Epoch,
+    FenceEpoch, HostPath, Id, NodeBootId, OwnershipTokenEvidence, ProcessEvidence, ProcessRole,
+    ProcessState, RandomId128, ReconcileStep, RemoteHead, Revision, RuntimeCheckpoint, Sequence,
+    Sha256Digest, WireU64,
 };
 use cats_storage::authority::{
     validate_authorized_serving_attachment, validate_volume_record, AttachmentLineageIdentity,
@@ -96,6 +97,32 @@ pub(crate) struct RootProvisionProcessExpectation {
     pub boot_image_digest: Sha256Digest,
     pub attachment: AuthorizedServingAttachment,
     pub(super) phase: RootProvisionProcessPhase,
+    pub executable_path: HostPath,
+}
+
+/// Provider-private projection of the old control-only attempt retained by a
+/// sealed Root handoff after the Runtime checkpoint has advanced to
+/// `PrepareDevice`. Every field originates in the already validated immutable
+/// handoff record/target pair; the inventory join supplies the current Desired
+/// only for the boot-image binding.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct RetainedRootProvisionProcessAttempt {
+    pub cat_id: Id,
+    pub node_id: Id,
+    pub placement_epoch: Epoch,
+    pub desired_revision: Revision,
+    pub spec_digest: Sha256Digest,
+    pub provision_transition_id: RandomId128,
+    pub volume_id: Id,
+    pub attachment_id: Id,
+    pub attachment_epoch: FenceEpoch,
+    pub scope_id: Id,
+    pub cgroup_path: HostPath,
+    pub control_socket_path: HostPath,
+    pub data_directory: HostPath,
+    pub process_identity_token: RandomId128,
+    pub expected_provisioned_head: RemoteHead,
+    pub attachment: AuthorizedServingAttachment,
     pub executable_path: HostPath,
 }
 
@@ -186,6 +213,89 @@ impl RootProvisionProcessExpectation {
             attachment,
             phase,
             executable_path,
+        })
+    }
+
+    pub(crate) fn from_retained_prepare_device(
+        checkpoint: &RuntimeCheckpoint,
+        desired: &DesiredRuntimeSpec,
+        attempt: &RetainedRootProvisionProcessAttempt,
+    ) -> anyhow::Result<Self> {
+        let ReconcileStep::PrepareDevice {
+            volume_id,
+            attachment_id,
+            attachment_epoch,
+            acquire_origin,
+            expected_head,
+            size_bytes,
+            durability,
+            serving_authority,
+            ..
+        } = &checkpoint.step
+        else {
+            anyhow::bail!("retained Root handoff requires prepare_device")
+        };
+        anyhow::ensure!(
+            matches!(
+                serving_authority.as_ref(),
+                cats_api::runtime_reconciliation::ServingAuthorityProvenance::AfterRootProvision { .. }
+            ) && desired.cat_id == checkpoint.cat_id
+                && desired.placement.node_id == checkpoint.node_id
+                && desired.placement.placement_epoch == checkpoint.placement_epoch
+                && desired.desired_revision == checkpoint.desired_revision
+                && desired.spec_digest == checkpoint.spec_digest
+                && attempt.cat_id == checkpoint.cat_id
+                && attempt.node_id == checkpoint.node_id
+                && attempt.placement_epoch == checkpoint.placement_epoch
+                && attempt.desired_revision == checkpoint.desired_revision
+                && attempt.spec_digest == checkpoint.spec_digest
+                && attempt.volume_id == *volume_id
+                && attempt.attachment_id == *attachment_id
+                && attempt.attachment_epoch == *attachment_epoch
+                && attempt.attachment.identity.volume_id == *volume_id
+                && attempt.attachment.identity.attachment_id == *attachment_id
+                && attempt.attachment.identity.attachment_epoch == *attachment_epoch
+                && attempt.attachment.identity.acquire_origin == *acquire_origin
+                && attempt.expected_provisioned_head == *expected_head
+                && attempt.attachment.head == *expected_head
+                && attempt.attachment.size_bytes == *size_bytes
+                && attempt.attachment.durability == *durability,
+            "retained Root process attempt conflicts with current PrepareDevice authority"
+        );
+        anyhow::ensure!(
+            attempt.executable_path.as_str().starts_with('/')
+                && attempt.scope_id.as_str().ends_with(".service")
+                && attempt
+                    .scope_id
+                    .as_str()
+                    .bytes()
+                    .all(|byte| byte.is_ascii_alphanumeric() || b"_.-".contains(&byte))
+                && attempt.cgroup_path.as_str()
+                    == format!("/sys/fs/cgroup/system.slice/{}", attempt.scope_id.as_str()),
+            "retained Root process attempt has a noncanonical physical owner"
+        );
+        Ok(Self {
+            cat_id: attempt.cat_id.clone(),
+            node_id: attempt.node_id.clone(),
+            placement_epoch: attempt.placement_epoch,
+            desired_revision: attempt.desired_revision,
+            spec_digest: attempt.spec_digest.clone(),
+            provision_transition_id: attempt.provision_transition_id.clone(),
+            volume_id: attempt.volume_id.clone(),
+            attachment_id: attempt.attachment_id.clone(),
+            attachment_epoch: attempt.attachment_epoch,
+            scope_id: attempt.scope_id.clone(),
+            cgroup_path: attempt.cgroup_path.clone(),
+            control_socket_path: attempt.control_socket_path.clone(),
+            data_directory: attempt.data_directory.clone(),
+            process_identity_token: attempt.process_identity_token.clone(),
+            size_bytes: attempt.attachment.size_bytes,
+            boot_image_digest: desired.runtime.boot_image_digest.clone(),
+            attachment: attempt.attachment.clone(),
+            phase: RootProvisionProcessPhase::Provisioned {
+                expected_provisioned_head: attempt.expected_provisioned_head.clone(),
+            },
+            executable_path: attempt.executable_path.clone(),
         })
     }
 

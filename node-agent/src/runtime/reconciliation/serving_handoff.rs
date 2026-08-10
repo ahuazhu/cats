@@ -60,9 +60,9 @@ use super::authorized_blockd::{
 };
 use super::root_provision_process::{
     prove_exact_root_provision_process_absence, ExactRootProvisionProcessAbsenceProof,
-    ExactRootProvisionProcessProof, RootProvisionAuthoritySnapshot, RootProvisionBlockdHandshake,
-    RootProvisionProcessEvidence, RootProvisionProcessExpectation,
-    RootProvisionProcessRetirementPort,
+    ExactRootProvisionProcessProof, RetainedRootProvisionProcessAttempt,
+    RootProvisionAuthoritySnapshot, RootProvisionBlockdHandshake, RootProvisionProcessEvidence,
+    RootProvisionProcessExpectation, RootProvisionProcessRetirementPort,
 };
 use super::{FileCheckpointStore, StoredCheckpoint};
 
@@ -2165,7 +2165,7 @@ pub(crate) fn validate_scanned_serving_handoff_artifacts(
     target: &ScannedServingHandoffArtifact<'_>,
     record: Option<&ScannedServingHandoffArtifact<'_>>,
     retirement: Option<&ScannedServingHandoffArtifact<'_>>,
-) -> Result<()> {
+) -> Result<Option<RetainedRootProvisionProcessAttempt>> {
     let checkpoint_digest = checkpoint_content_digest(checkpoint)?;
     let target_artifact = decode_target_control_authorization(target.bytes)?;
     validate_scanned_artifact_bytes(target, target.bytes)?;
@@ -2200,12 +2200,13 @@ pub(crate) fn validate_scanned_serving_handoff_artifacts(
         })
         .transpose()?;
 
-    match &checkpoint.step {
+    let retained_process = match &checkpoint.step {
         ReconcileStep::ProvisionRootImage { .. } => {
             validate_target_checkpoint_value(&target_artifact, checkpoint)?;
             if let Some(decoded) = decoded_record.as_ref() {
                 validate_record_checkpoint_value(decoded, checkpoint, &checkpoint_digest)?;
             }
+            None
         }
         ReconcileStep::PrepareDevice {
             volume_id,
@@ -2262,11 +2263,30 @@ pub(crate) fn validate_scanned_serving_handoff_artifacts(
                         == serving_process.data_directory,
                 "PrepareDevice handoff does not preserve the exact predecessor lineage"
             );
+            Some(RetainedRootProvisionProcessAttempt {
+                cat_id: decoded.cat_id.clone(),
+                node_id: decoded.node_id.clone(),
+                placement_epoch: decoded.placement_epoch,
+                desired_revision: decoded.desired_revision,
+                spec_digest: decoded.spec_digest.clone(),
+                provision_transition_id: decoded.provision_transition_id.clone(),
+                volume_id: decoded.volume_id.clone(),
+                attachment_id: decoded.attachment_id.clone(),
+                attachment_epoch: decoded.attachment_epoch,
+                scope_id: decoded.old_control_process.scope_id.clone(),
+                cgroup_path: decoded.old_control_process.cgroup_path.clone(),
+                control_socket_path: decoded.old_control_process.control_socket_path.clone(),
+                data_directory: decoded.old_control_process.data_directory.clone(),
+                process_identity_token: decoded.old_control_process.ownership_token.clone(),
+                expected_provisioned_head: decoded.expected_provisioned_head.clone(),
+                attachment: target_artifact.attachment.clone(),
+                executable_path: decoded.expected_control_executable_path.clone(),
+            })
         }
         _ => anyhow::bail!(
             "serving handoff artifacts require provision_root_image or after-root-provision PrepareDevice"
         ),
-    }
+    };
 
     if let Some(file) = retirement {
         validate_scanned_artifact_bytes(file, file.bytes)?;
@@ -2323,7 +2343,7 @@ pub(crate) fn validate_scanned_serving_handoff_artifacts(
             }
         }
     }
-    Ok(())
+    Ok(retained_process)
 }
 
 fn validate_scanned_artifact_bytes(

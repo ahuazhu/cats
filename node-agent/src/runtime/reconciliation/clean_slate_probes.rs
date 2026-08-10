@@ -1995,6 +1995,7 @@ fn scan_authorized_blockd_data(
                 .to_owned(),
         )
         .context("authorized blockd data directory is not a HostPath")?;
+        let mut retained_root_process = None;
         if !has_unvalidated_handoff_artifact {
             if let Some(runtime_checkpoint) = read_runtime_checkpoint_for_handoff(
                 root,
@@ -2192,7 +2193,7 @@ fn scan_authorized_blockd_data(
             let retirement = retirement
                 .as_ref()
                 .map(OwnedScannedHandoffArtifact::borrowed);
-            validate_scanned_serving_handoff_artifacts(
+            retained_root_process = validate_scanned_serving_handoff_artifacts(
                 &runtime_checkpoint,
                 &checkpoint,
                 &target,
@@ -2210,6 +2211,7 @@ fn scan_authorized_blockd_data(
                         checkpoint,
                         binding,
                         control_state,
+                        retained_root_process,
                     },
                 )
                 .is_none(),
@@ -7762,17 +7764,26 @@ mod tests {
             })
             .unwrap();
 
+        let live_old_process = exact_process_evidence(&fixture.expected, 79);
+        let _live_old_socket = install_exact_process_fixture(
+            &environment,
+            &fixture.expected,
+            live_old_process.process_id,
+        );
         let scanner = full_root_scanner(
             &fixture,
             [
-                RootProvisionProcessInspection::Absent,
-                RootProvisionProcessInspection::Absent,
+                RootProvisionProcessInspection::Exact(Box::new(live_old_process.clone())),
+                RootProvisionProcessInspection::Exact(Box::new(live_old_process.clone())),
             ],
         );
-        assert!(matches!(
-            scanner.scan_complete(fixture.scan_context.clone()).unwrap(),
-            RuntimeInventoryScanOutcome::Complete(_)
-        ));
+        let RuntimeInventoryScanOutcome::Complete(inventory) =
+            scanner.scan_complete(fixture.scan_context.clone()).unwrap()
+        else {
+            panic!("live old target-control process must remain exact after PrepareDevice CAS")
+        };
+        assert_eq!(inventory.runtimes()[0].processes.len(), 1);
+        assert_eq!(inventory.runtimes()[0].processes[0].process_id, 79);
 
         let current = checkpoint_store.load().unwrap().unwrap();
         let mut drifted = successor.clone();
@@ -7843,9 +7854,15 @@ mod tests {
             std::fs::write(&path, bytes).unwrap();
         }
         assert!(matches!(
-            full_root_scanner(&fixture, [])
-                .scan_complete(assigned_context(true))
-                .unwrap(),
+            full_root_scanner(
+                &fixture,
+                [
+                    RootProvisionProcessInspection::Exact(Box::new(live_old_process.clone())),
+                    RootProvisionProcessInspection::Exact(Box::new(live_old_process)),
+                ],
+            )
+            .scan_complete(assigned_context(true))
+            .unwrap(),
             RuntimeInventoryScanOutcome::Complete(_)
         ));
     }
