@@ -23,15 +23,16 @@ use std::os::fd::{AsRawFd as _, FromRawFd as _};
 use std::os::unix::ffi::OsStrExt as _;
 use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
 use std::path::{Component, Path, PathBuf};
+use std::process::Command;
 #[cfg(test)]
 use std::sync::Mutex;
 
 use anyhow::{Context as _, Result};
 use cats_api::runtime_reconciliation::{
     checkpoint_content_digest, encode_runtime_checkpoint, ContractVersion, DesiredRuntimeSpec,
-    Epoch, HostPath, Id, NodeBootId, RandomId128, ReconcileStep, RemoteHead, RootServingHandoff,
-    RootServingHandoffRecordIdentity, RuntimeCheckpoint, Sequence, ServingAuthorityProvenance,
-    Sha256Digest, VolumeRecord, WireU64,
+    Epoch, HostPath, Id, NodeBootId, PrepareDeviceFrontend, RandomId128, ReconcileStep, RemoteHead,
+    RootServingHandoff, RootServingHandoffRecordIdentity, RuntimeCheckpoint, Sequence,
+    ServingAuthorityProvenance, Sha256Digest, VolumeRecord, WireU64,
 };
 #[cfg(test)]
 use cats_api::runtime_reconciliation::{AcquireOrigin, Durability, FenceEpoch, Revision};
@@ -64,9 +65,9 @@ use crate::state_directory::StateDirectory;
 
 use super::authorized_blockd::{
     authorized_blockd_data_directory, validate_authorized_blockd_checkpoint,
-    AuthorizedBlockdCheckpoint, PreparedAuthorizedBlockd, RetainedAuthorizedBlockd,
-    AUTHORIZED_SERVING_FILE, IDENTITY_FILE, LAUNCH_CHECKPOINT_FILE, MAX_AUTHORIZED_SERVING_BYTES,
-    MAX_IDENTITY_BYTES, MAX_LAUNCH_CHECKPOINT_BYTES,
+    AuthorizedBlockdCheckpoint, AuthorizedBlockdLaunchConfig, PreparedAuthorizedBlockd,
+    RetainedAuthorizedBlockd, AUTHORIZED_SERVING_FILE, IDENTITY_FILE, LAUNCH_CHECKPOINT_FILE,
+    MAX_AUTHORIZED_SERVING_BYTES, MAX_IDENTITY_BYTES, MAX_LAUNCH_CHECKPOINT_BYTES,
 };
 use super::root_provision_process::{
     prove_exact_root_provision_process_absence, ExactRootProvisionProcessAbsenceProof,
@@ -205,6 +206,154 @@ impl PrepareDeviceHandoffReady {
             "retained PrepareDevice handoff changed its old process identity"
         );
         Ok(())
+    }
+
+    /// Build the only authorized-serving argv accepted after a sealed Root
+    /// handoff. The caller must keep this proof and the per-Cat checkpoint
+    /// writer guard alive through process submission, and must call
+    /// [`Self::assert_current`] again at the submit boundary. Returning a
+    /// [`Command`] here performs no Host effect.
+    #[cfg_attr(
+        not(test),
+        expect(
+            dead_code,
+            reason = "the next PrepareDevice serving effect consumes this strict command boundary"
+        )
+    )]
+    pub(crate) fn authorized_serving_command(
+        &self,
+        config: &AuthorizedBlockdLaunchConfig,
+        checkpoint: &RuntimeCheckpoint,
+        desired: &DesiredRuntimeSpec,
+        authority: &VolumeRecord,
+    ) -> Result<Command> {
+        self.assert_current(checkpoint, desired, authority)?;
+        let ReconcileStep::PrepareDevice {
+            volume_id,
+            attachment_id,
+            serving_authority,
+            serving_process,
+            ownership_token,
+            frontend,
+            ..
+        } = &checkpoint.step
+        else {
+            anyhow::bail!("authorized Root serving command requires prepare_device")
+        };
+        let ServingAuthorityProvenance::AfterRootProvision { handoff } = serving_authority.as_ref()
+        else {
+            anyhow::bail!("authorized Root serving command requires sealed handoff provenance")
+        };
+        let attachment = &self.attempt.attachment;
+        anyhow::ensure!(
+            config.blockd_binary.is_absolute()
+                && config.blockd_binary == Path::new(serving_process.executable_path.as_str()),
+            "authorized Root serving executable differs from installed blockd"
+        );
+        anyhow::ensure!(
+            config.metadata_store.name == "postgres",
+            "authorized Root serving requires the frozen postgres authority adapter"
+        );
+        anyhow::ensure!(
+            config.max_staged_bytes > 0
+                && config.max_staged_packs > 0
+                && config.max_local_bytes > 0,
+            "authorized Root serving resource limits must be positive"
+        );
+        anyhow::ensure!(
+            volume_id == &attachment.identity.volume_id
+                && attachment_id == &attachment.identity.attachment_id
+                && Path::new(serving_process.data_directory.as_str())
+                    == self.retained_authorized.data_directory(),
+            "authorized Root serving command changed its retained attachment"
+        );
+        anyhow::ensure!(
+            serving_process.process_identity_token != *ownership_token,
+            "authorized Root serving process and device tokens must differ"
+        );
+
+        let mut command = Command::new(&config.blockd_binary);
+        command
+            .arg("--volume-id")
+            .arg(volume_id.as_str())
+            .arg("--data-dir")
+            .arg(self.retained_authorized.data_directory())
+            .arg("--attachment-id")
+            .arg(attachment_id.as_str())
+            .arg("--authorized-serving-handoff-record")
+            .arg(handoff.record.path.as_str())
+            .arg("--authorized-serving-handoff-predecessor-checkpoint-content-digest")
+            .arg(handoff.predecessor_checkpoint_content_digest.as_str())
+            .arg("--authorized-serving-handoff-record-device")
+            .arg(handoff.record.device.get().to_string())
+            .arg("--authorized-serving-handoff-record-inode")
+            .arg(handoff.record.inode.get().to_string())
+            .arg("--authorized-serving-handoff-record-length")
+            .arg(handoff.record.length.get().to_string())
+            .arg("--authorized-serving-handoff-record-content-sha256")
+            .arg(handoff.record.content_sha256.as_str())
+            .arg("--runtime-scope-id")
+            .arg(serving_process.scope_id.as_str())
+            .arg("--process-identity-token")
+            .arg(serving_process.process_identity_token.as_str())
+            .arg("--device-ownership-token")
+            .arg(ownership_token.as_str())
+            .arg("--metadata-store-adapter")
+            .arg(&config.metadata_store.name)
+            .arg("--object-store-adapter")
+            .arg(&config.object_store.name)
+            .arg("--lease-ttl-ms")
+            .arg(attachment.acquire_request.lease_duration_ms.to_string())
+            .arg("--max-staged-bytes")
+            .arg(config.max_staged_bytes.to_string())
+            .arg("--max-staged-packs")
+            .arg(config.max_staged_packs.to_string())
+            .arg("--max-local-bytes")
+            .arg(config.max_local_bytes.to_string())
+            .arg("--durability")
+            .arg(match attachment.durability {
+                cats_api::runtime_reconciliation::Durability::Strict => "strict",
+                cats_api::runtime_reconciliation::Durability::Relaxed => "relaxed",
+            })
+            .arg("--listen-control")
+            .arg(serving_process.control_socket_path.as_str());
+        match frontend {
+            PrepareDeviceFrontend::KernelNbd {
+                listener_socket_path,
+                ..
+            } => {
+                command
+                    .arg("--listen-unix")
+                    .arg(listener_socket_path.as_str());
+            }
+            PrepareDeviceFrontend::VhostUserBlk {
+                socket_path,
+                queues,
+                queue_size,
+            } => {
+                cats_blockd::frontend_contract::validate_authorized_vhost_shape(
+                    usize::from(*queues),
+                    *queue_size,
+                )
+                .context("authorized Root serving vhost shape violates the frozen contract")?;
+                command
+                    .arg("--listen-vhost-user")
+                    .arg(socket_path.as_str())
+                    .arg("--vhost-user-queues")
+                    .arg(queues.to_string())
+                    .arg("--vhost-user-queue-size")
+                    .arg(queue_size.to_string());
+            }
+        }
+        for option in config.metadata_store.config.to_cli() {
+            command.arg("--metadata-store-option").arg(option);
+        }
+        for option in config.object_store.config.to_cli() {
+            command.arg("--object-store-option").arg(option);
+        }
+        command.env_remove("CATS_CRASH_POINT");
+        self.assert_current(checkpoint, desired, authority)?;
+        Ok(command)
     }
 }
 
@@ -3726,7 +3875,8 @@ mod tests {
         VolumeDataAuthority, VolumeHeadCasRequest, VolumeHeadCasResult,
     };
     use cats_storage::{
-        encode_image_manifest, BlobError, BlobStore, ImageManifestV1, LowerHexSha256,
+        encode_image_manifest, AdapterConfig, AdapterSelection, BlobError, BlobStore,
+        ImageManifestV1, LowerHexSha256,
     };
 
     use super::*;
@@ -4885,6 +5035,147 @@ mod tests {
             current.checkpoint().step,
             ReconcileStep::PrepareDevice { .. }
         ));
+    }
+
+    #[test]
+    fn prepare_device_handoff_builds_only_the_strict_serving_from_handoff_command() {
+        fn argument_after<'a>(arguments: &'a [String], flag: &str) -> &'a str {
+            arguments
+                .windows(2)
+                .find_map(|pair| (pair[0] == flag).then_some(pair[1].as_str()))
+                .unwrap_or_else(|| panic!("missing {flag}"))
+        }
+
+        let mut fixture = fixture();
+        advance_fixture_to_prepare_device(&mut fixture);
+        let retained = AuthorizedBlockdStore::new(fixture.state_directory.clone())
+            .retain_prepare_device_handoff(
+                fixture.stored_checkpoint.checkpoint(),
+                &fixture.acquired.desired,
+            )
+            .expect("retain exact PrepareDevice attachment inputs");
+        let ready = fixture
+            .store()
+            .reopen_prepare_device_handoff(
+                fixture.stored_checkpoint.checkpoint(),
+                &fixture.acquired.desired,
+                &fixture.authority.volume,
+                retained,
+            )
+            .expect("reopen sealed PrepareDevice handoff");
+        let config = AuthorizedBlockdLaunchConfig {
+            blockd_binary: PathBuf::from(fixture.expected_executable_path.as_str()),
+            metadata_store: AdapterSelection::new(
+                "postgres",
+                AdapterConfig::from_pairs([("url-file", "/run/cats/postgres-url")]).unwrap(),
+            ),
+            object_store: AdapterSelection::new(
+                "aws-s3",
+                AdapterConfig::from_pairs([("bucket", "cats-runtime-test")]).unwrap(),
+            ),
+            max_staged_bytes: 101,
+            max_staged_packs: 102,
+            max_local_bytes: 103,
+        };
+
+        let command = ready
+            .authorized_serving_command(
+                &config,
+                fixture.stored_checkpoint.checkpoint(),
+                &fixture.acquired.desired,
+                &fixture.authority.volume,
+            )
+            .expect("construct strict serving-from-handoff command");
+        assert_eq!(command.get_program(), config.blockd_binary.as_os_str());
+        let arguments = command
+            .get_args()
+            .map(|argument| argument.to_string_lossy().into_owned())
+            .collect::<Vec<_>>();
+        let ReconcileStep::PrepareDevice {
+            serving_authority,
+            serving_process,
+            ownership_token,
+            frontend,
+            ..
+        } = &fixture.stored_checkpoint.checkpoint().step
+        else {
+            panic!("fixture must have reached PrepareDevice")
+        };
+        let ServingAuthorityProvenance::AfterRootProvision { handoff } = serving_authority.as_ref()
+        else {
+            panic!("fixture must retain Root handoff provenance")
+        };
+        let PrepareDeviceFrontend::VhostUserBlk {
+            socket_path,
+            queues,
+            queue_size,
+        } = frontend
+        else {
+            panic!("fixture must use vhost-user")
+        };
+
+        assert_eq!(
+            argument_after(&arguments, "--authorized-serving-handoff-record"),
+            handoff.record.path.as_str()
+        );
+        assert_eq!(
+            argument_after(
+                &arguments,
+                "--authorized-serving-handoff-predecessor-checkpoint-content-digest"
+            ),
+            handoff.predecessor_checkpoint_content_digest.as_str()
+        );
+        assert_eq!(
+            argument_after(&arguments, "--runtime-scope-id"),
+            serving_process.scope_id.as_str()
+        );
+        assert_eq!(
+            argument_after(&arguments, "--process-identity-token"),
+            serving_process.process_identity_token.as_str()
+        );
+        assert_eq!(
+            argument_after(&arguments, "--device-ownership-token"),
+            ownership_token.as_str()
+        );
+        assert_eq!(
+            argument_after(&arguments, "--listen-control"),
+            serving_process.control_socket_path.as_str()
+        );
+        assert_eq!(
+            argument_after(&arguments, "--listen-vhost-user"),
+            socket_path.as_str()
+        );
+        assert_eq!(
+            argument_after(&arguments, "--vhost-user-queues"),
+            queues.to_string()
+        );
+        assert_eq!(
+            argument_after(&arguments, "--vhost-user-queue-size"),
+            queue_size.to_string()
+        );
+        assert!(!arguments.iter().any(|argument| {
+            matches!(
+                argument.as_str(),
+                "--authorized-serving-spec"
+                    | "--authorized-control-spec"
+                    | "--authorized-target-control-spec"
+                    | "--control-only"
+            )
+        }));
+        assert!(command
+            .get_envs()
+            .any(|(name, value)| { name == "CATS_CRASH_POINT" && value.is_none() }));
+
+        let mut wrong_binary = config.clone();
+        wrong_binary.blockd_binary = PathBuf::from("/opt/cats/bin/foreign-blockd");
+        assert!(ready
+            .authorized_serving_command(
+                &wrong_binary,
+                fixture.stored_checkpoint.checkpoint(),
+                &fixture.acquired.desired,
+                &fixture.authority.volume,
+            )
+            .is_err());
     }
 
     #[test]
