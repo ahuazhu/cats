@@ -926,6 +926,7 @@ const fn maximum_base64url_bytes(decoded_bytes: usize) -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use ring::rand::SystemRandom;
     use ring::signature::{Ed25519KeyPair, KeyPair as _};
 
     const PRIVATE_KEY: &[u8] =
@@ -943,6 +944,19 @@ mod tests {
                 kid: KeyId::new(PUBLIC_KEY_KID).unwrap(),
                 public_key_spki: Base64UrlNoPad::new(PUBLIC_KEY_SPKI).unwrap(),
             }],
+        }
+    }
+
+    fn generated_public_entry() -> RouteGrantV2PublicKeyEntry {
+        let document = Ed25519KeyPair::generate_pkcs8(&SystemRandom::new()).unwrap();
+        let pair = Ed25519KeyPair::from_pkcs8(document.as_ref()).unwrap();
+        let mut spki = ED25519_SPKI_PREFIX.to_vec();
+        spki.extend_from_slice(pair.public_key().as_ref());
+        let public = RouteGrantV2PublicKey::from_spki_der(&spki).unwrap();
+        RouteGrantV2PublicKeyEntry {
+            kid: public.kid().clone(),
+            public_key_spki: Base64UrlNoPad::new(URL_SAFE_NO_PAD.encode(public.spki_der()))
+                .unwrap(),
         }
     }
 
@@ -1293,6 +1307,25 @@ mod tests {
 
     #[test]
     fn signing_authority_artifacts_reject_open_or_conflicting_lineage() {
+        let mut empty = public_ring();
+        empty.keys.clear();
+        decode_route_grant_v2_public_key_ring(
+            &encode_route_grant_v2_public_key_ring(&empty).unwrap(),
+        )
+        .unwrap();
+        let mut maximum = public_ring();
+        maximum.keys = (0..MAX_ROUTE_GRANT_V2_RING_KEYS)
+            .map(|_| generated_public_entry())
+            .collect();
+        maximum.keys.sort_by(|left, right| left.kid.cmp(&right.kid));
+        maximum.validate().unwrap();
+        let mut oversized = maximum.clone();
+        oversized.keys.push(generated_public_entry());
+        assert_eq!(
+            oversized.validate(),
+            Err(RouteGrantV2ArtifactError::TooManyKeys)
+        );
+
         let mut ring = public_ring();
         ring.ring_version = Epoch::new(2).unwrap();
         assert_eq!(
@@ -1304,6 +1337,12 @@ mod tests {
             key_ring_digest: public_ring().digest().unwrap(),
         });
         ring.validate().unwrap();
+        let mut gap = ring.clone();
+        gap.ring_version = Epoch::new(3).unwrap();
+        assert_eq!(
+            gap.validate(),
+            Err(RouteGrantV2ArtifactError::InvalidLineage)
+        );
 
         let other = RouteGrantV2PublicKeyEntry {
             kid: KeyId::new("47ff3f28dd2cc185ac432f34ecc346a121c52934b16993ab9fb7fcb92a3406f8")
@@ -1357,11 +1396,38 @@ mod tests {
             reference.validate(),
             Err(RouteGrantV2ArtifactError::InvalidLineage)
         );
+        let previous_reference = signer_reference();
+        reference.expected_previous = Some(RouteGrantV2SignerExpectedPrevious {
+            signer_revision: Epoch::new(1).unwrap(),
+            signer_reference_sha256: previous_reference.digest().unwrap(),
+        });
+        reference.validate().unwrap();
+        reference
+            .expected_previous
+            .as_mut()
+            .unwrap()
+            .signer_revision = Epoch::new(2).unwrap();
+        assert_eq!(
+            reference.validate(),
+            Err(RouteGrantV2ArtifactError::InvalidLineage)
+        );
 
         let noncanonical = br#"{"ring_version":1,"version":1,"expected_previous":null,"keys":[]}"#;
         assert_eq!(
             decode_route_grant_v2_public_key_ring(noncanonical),
             Err(RouteGrantV2ArtifactError::NonCanonical)
+        );
+        let duplicate =
+            br#"{"version":1,"version":1,"ring_version":1,"expected_previous":null,"keys":[]}"#;
+        assert_eq!(
+            decode_route_grant_v2_public_key_ring(duplicate),
+            Err(RouteGrantV2ArtifactError::Malformed)
+        );
+        let unknown =
+            br#"{"version":1,"ring_version":1,"expected_previous":null,"keys":[],"unknown":true}"#;
+        assert_eq!(
+            decode_route_grant_v2_public_key_ring(unknown),
+            Err(RouteGrantV2ArtifactError::Malformed)
         );
         assert_eq!(
             decode_route_grant_v2_public_key_ring(&vec![

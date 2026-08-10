@@ -39,8 +39,8 @@ key lineage。它不是 private bytes、provider credential、ARN parser 或调�
 | descriptor/ring owner/mode | root:root, exact `0644` |
 | private material owner/mode | root:root, exact `0600` |
 
-每个文件必须是regular、link count恰好1；路径和final entry都不得是symlink、hardlink或writable bind
-alias。reader从filesystem root逐component no-follow打开固定目录，只从保留的directory descriptor打开
+每个文件必须是regular、link count恰好1；路径和final entry都不得是symlink或hardlink。reader从
+filesystem root逐component no-follow打开固定目录，只从保留的directory descriptor打开
 固定basename；bounded read前后descriptor metadata必须逐字段稳定，且实际byte count等于metadata length。
 任一owner/mode/type/link/path/read-change不等都 fail startup。production没有任意path、inline JSON、env
 bytes或provider-derived fallback。
