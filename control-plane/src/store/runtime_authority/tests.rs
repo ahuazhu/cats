@@ -1221,6 +1221,10 @@ fn stored_volume(store: &Store, volume_id: &Id) -> VolumeRecord {
         .unwrap()
 }
 
+pub(crate) fn stored_volume_for_a22_http_test(store: &Store, volume_id: &Id) -> VolumeRecord {
+    stored_volume(store, volume_id)
+}
+
 fn stored_volume_owner(store: &Store, volume_id: &Id) -> Option<VolumeOwnerBinding> {
     store
         .authority_transaction(|transaction| {

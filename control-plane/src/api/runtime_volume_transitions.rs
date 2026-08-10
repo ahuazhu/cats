@@ -645,8 +645,8 @@ mod tests {
         encode_runtime_volume_transition_evidence_request,
         encode_runtime_volume_transition_request, guest_config_digest, AgentRegistrationAttempt,
         ContractVersion, CredentialBinding, Id, NodeBootId, NodeIdentity, NodeIdentityState,
-        RandomId128, RuntimeVolumeTransitionErrorDetail, RuntimeVolumeTransitionEvidenceRequest,
-        SessionBinding,
+        RandomId128, RuntimeVolumeTransition, RuntimeVolumeTransitionErrorDetail,
+        RuntimeVolumeTransitionEvidenceRequest, SessionBinding, VolumeAcquireRequest,
     };
     use cats_metadata_store_sqlite::SqliteMetadataStore;
     use cats_metering::SqliteUsageStore;
@@ -1039,6 +1039,13 @@ mod tests {
             })
             .await
             .unwrap();
+        let RuntimeVolumeTransition::Acquire {
+            request: VolumeAcquireRequest::Normal { volume_id, .. },
+        } = &request.transition
+        else {
+            panic!("A22 HTTP fixture must be one normal acquire")
+        };
+        let volume_id = volume_id.clone();
         let body = encode_runtime_volume_transition_request(&request).unwrap();
         context
             .server
@@ -1095,6 +1102,23 @@ mod tests {
             incomplete.is_err(),
             "an ambiguous commit must not become a typed HTTP response"
         );
+        let committed_volume_id = volume_id.clone();
+        let committed = context
+            .server
+            .state
+            .store
+            .execute(move |store| {
+                Ok(
+                    crate::store::runtime_authority::tests::stored_volume_for_a22_http_test(
+                        store,
+                        &committed_volume_id,
+                    ),
+                )
+            })
+            .await
+            .unwrap();
+        assert_eq!(committed.lease_epoch.get(), 8);
+        assert!(committed.last_transition.is_some());
         let replay = context
             .signed(&node, RUNTIME_VOLUME_TRANSITION_PATH, body)
             .send()
@@ -1105,6 +1129,20 @@ mod tests {
             decode_runtime_volume_transition_success(&replay.bytes().await.unwrap()).unwrap();
         assert_eq!(success.session, request.session);
         assert_eq!(success.cat_id, request.cat_id);
+        let replay_volume = context
+            .server
+            .state
+            .store
+            .execute(move |store| {
+                Ok(
+                    crate::store::runtime_authority::tests::stored_volume_for_a22_http_test(
+                        store, &volume_id,
+                    ),
+                )
+            })
+            .await
+            .unwrap();
+        assert_eq!(replay_volume, committed);
     }
 
     #[tokio::test]
