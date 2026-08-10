@@ -30,6 +30,9 @@ pub use runner::{
     RuntimeSpineRunError, RuntimeSpineRunRetry, RuntimeSpineRunStep, RuntimeSpineRunner,
 };
 pub(crate) use runner::{InventoryCoverageAggregator, RuntimeInventoryKeyRing};
+pub(crate) use runner::{
+    RuntimePreScanRecovery, RuntimePreScanRecoveryContext, RuntimePreScanRecoveryOutcome,
+};
 pub(crate) use state::RuntimeSpineJournal;
 pub use state::{
     DurableRuntimeSpineRequest, RuntimeSpineDesiredWork, RuntimeSpineFullScan,

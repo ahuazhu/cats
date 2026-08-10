@@ -36,8 +36,11 @@ use cats_storage::authority::{
     AuthorizedServingAttachment, NodeVolumeInventorySnapshot, RuntimeVolumeInventoryAuthority,
     VolumeRecord,
 };
+use cats_storage::BlobStore;
 
-use crate::runtime_spine::{RuntimeInventoryScanContext, RuntimeInventoryScanner};
+use crate::runtime_spine::{
+    RuntimeInventoryScanContext, RuntimeInventoryScanner, RuntimePreScanRecoveryContext,
+};
 use crate::state_directory::StateDirectory;
 
 use super::authorized_blockd::{
@@ -67,6 +70,16 @@ const DEFAULT_SYSTEMD_CGROUP_ROOT: &str = "/sys/fs/cgroup/system.slice";
 const DEFAULT_PROC_ROOT: &str = "/proc";
 const DEFAULT_BLOCK_CLASS_ROOT: &str = "/sys/class/block";
 const DEFAULT_NETWORK_CLASS_ROOT: &str = "/sys/class/net";
+
+/// Read-only classification consumed by the explicit pre-scan mutation lane.
+/// The superseded variant is intentionally distinct so the stale-checkpoint
+/// planner can compose without teaching the scanner to mutate anything.
+pub(crate) enum LocalPublicationRecoveryEvidence {
+    None,
+    CheckpointTemp { cat_id: Id },
+    AuthorizedBlockd { cat_id: Id },
+    SupersededCheckpoint { cat_id: Id },
+}
 
 mod metadata_authority_reader_sealed {
     pub(super) trait Sealed {}
@@ -815,6 +828,7 @@ pub(crate) struct InstalledCleanSlateProbeConfig {
     pub guest_agent_binary: PathBuf,
     pub metering_cgroup_root: Option<PathBuf>,
     pub volume_inventory_authority: Arc<dyn RuntimeVolumeInventoryAuthority>,
+    pub blob_store: Arc<dyn BlobStore>,
 }
 
 impl std::fmt::Debug for InstalledCleanSlateProbeConfig {
@@ -889,8 +903,10 @@ pub(crate) fn installed_clean_slate_scanner(
     let metadata_authority = Arc::new(PagedMetadataAuthorityReader::new(Arc::new(
         RuntimeVolumeInventoryPagePort::start(Arc::clone(&config.volume_inventory_authority))?,
     )));
+    let blob_store = Arc::clone(&config.blob_store);
     let config = ProbeConfig::installed(config)?;
-    let scanner = scanner_with_metadata_authority(config, metadata_authority)?;
+    let scanner =
+        scanner_with_metadata_authority_and_blob(config, metadata_authority, Some(blob_store))?;
     Ok(Arc::new(scanner))
 }
 
@@ -914,6 +930,7 @@ pub(crate) fn clean_slate_scanner_for_test(
     clean_slate_scanner_with_metadata_for_test(
         config,
         Arc::new(TestAuthoritativeEmptyMetadataReader),
+        None,
     )
 }
 
@@ -925,6 +942,20 @@ pub(crate) fn clean_slate_scanner_with_volume_authority_for_test(
     clean_slate_scanner_with_metadata_for_test(
         config,
         Arc::new(VolumeDataAuthorityMetadataReader::start(authority)?),
+        None,
+    )
+}
+
+#[cfg(test)]
+pub(crate) fn clean_slate_scanner_with_volume_authority_and_blob_for_test(
+    config: TestCleanSlateProbeConfig,
+    authority: Arc<dyn VolumeDataAuthority>,
+    blob_store: Arc<dyn BlobStore>,
+) -> anyhow::Result<Arc<dyn RuntimeInventoryScanner>> {
+    clean_slate_scanner_with_metadata_for_test(
+        config,
+        Arc::new(VolumeDataAuthorityMetadataReader::start(authority)?),
+        Some(blob_store),
     )
 }
 
@@ -932,9 +963,10 @@ pub(crate) fn clean_slate_scanner_with_volume_authority_for_test(
 fn clean_slate_scanner_with_metadata_for_test(
     config: TestCleanSlateProbeConfig,
     metadata_authority: Arc<dyn MetadataAuthorityAbsenceReader>,
+    blob_store: Option<Arc<dyn BlobStore>>,
 ) -> anyhow::Result<Arc<dyn RuntimeInventoryScanner>> {
     let checkpoint_directory = config.state_directory.path().join(CHECKPOINT_NAMESPACE);
-    Ok(Arc::new(scanner_with_metadata_authority(
+    Ok(Arc::new(scanner_with_metadata_authority_and_blob(
         ProbeConfig {
             state_directory: config.state_directory,
             checkpoint_directory,
@@ -951,6 +983,7 @@ fn clean_slate_scanner_with_metadata_for_test(
             limits: ProbeLimits::default(),
         },
         metadata_authority,
+        blob_store,
     )?))
 }
 
@@ -959,9 +992,18 @@ fn scanner(config: ProbeConfig) -> anyhow::Result<CleanSlateInventoryScanner> {
     scanner_with_metadata_authority(config, Arc::new(TestAuthoritativeEmptyMetadataReader))
 }
 
+#[cfg(test)]
 fn scanner_with_metadata_authority(
     config: ProbeConfig,
     metadata_authority: Arc<dyn MetadataAuthorityAbsenceReader>,
+) -> anyhow::Result<CleanSlateInventoryScanner> {
+    scanner_with_metadata_authority_and_blob(config, metadata_authority, None)
+}
+
+fn scanner_with_metadata_authority_and_blob(
+    config: ProbeConfig,
+    metadata_authority: Arc<dyn MetadataAuthorityAbsenceReader>,
+    blob_store: Option<Arc<dyn BlobStore>>,
 ) -> anyhow::Result<CleanSlateInventoryScanner> {
     let state = config.state_directory.clone();
     let process_paths = ProcessPaths {
@@ -1043,8 +1085,15 @@ fn scanner_with_metadata_authority(
             limits: config.limits,
         }),
     ];
-    CleanSlateInventoryScanner::new(config.checkpoint_directory, probes)
-        .map_err(anyhow::Error::from)
+    match blob_store {
+        Some(blob_store) => CleanSlateInventoryScanner::new_with_blob(
+            config.checkpoint_directory,
+            probes,
+            blob_store,
+        ),
+        None => CleanSlateInventoryScanner::new(config.checkpoint_directory, probes),
+    }
+    .map_err(anyhow::Error::from)
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1199,6 +1248,128 @@ fn scan_runtime_checkpoints(
     } else {
         Ok(InventoryAbsence::RuntimeCheckpoints(checkpoints))
     }
+}
+
+/// Classify one current-Desired local publication repair without changing the
+/// filesystem. Every namespace entry is validated before a candidate is
+/// returned, so a foreign or unsafe sibling fails closed rather than being
+/// hidden by an otherwise recoverable temp or partial grant publication.
+pub(crate) fn classify_local_publication_recovery(
+    context: &RuntimePreScanRecoveryContext,
+) -> anyhow::Result<LocalPublicationRecoveryEvidence> {
+    context.check_active()?;
+    let scan_context = context.inventory_context();
+    let Some(root) = clone_state_root(context.state_directory())? else {
+        return Ok(LocalPublicationRecoveryEvidence::None);
+    };
+    let directory = match open_state_namespace(&root, CHECKPOINT_NAMESPACE)? {
+        ManagedDirectory::Missing => return Ok(LocalPublicationRecoveryEvidence::None),
+        ManagedDirectory::Unavailable => return Ok(LocalPublicationRecoveryEvidence::None),
+        ManagedDirectory::Open(directory) => directory,
+    };
+    let mut budget = ProbeLimits::default().state_entries;
+    let Some(entries) = strict_directory_entries(&directory, &mut budget, &scan_context)? else {
+        return Ok(LocalPublicationRecoveryEvidence::None);
+    };
+    let desired_by_target = context
+        .coordinates()
+        .desired
+        .desired_specs
+        .iter()
+        .map(|desired| (format!("cat-{}.checkpoint.json", desired.cat_id), desired))
+        .collect::<BTreeMap<_, _>>();
+    let desired_by_lock = context
+        .coordinates()
+        .desired
+        .desired_specs
+        .iter()
+        .map(|desired| (format!("cat-{}.checkpoint.lock", desired.cat_id), desired))
+        .collect::<BTreeMap<_, _>>();
+    let desired_by_temp = context
+        .coordinates()
+        .desired
+        .desired_specs
+        .iter()
+        .map(|desired| (format!(".cat-{}.checkpoint.tmp", desired.cat_id), desired))
+        .collect::<BTreeMap<_, _>>();
+    let mut temps = BTreeSet::new();
+    let mut checkpoints = BTreeMap::new();
+    let mut superseded = BTreeSet::new();
+    for entry in entries {
+        let Some(name) = entry.name.to_str() else {
+            bail!("checkpoint namespace contains a non-UTF-8 entry")
+        };
+        if desired_by_lock.contains_key(name) {
+            validate_strict_regular_entry(&entry, &root, 0o600)?;
+            continue;
+        }
+        if let Some(desired) = desired_by_temp.get(name) {
+            validate_strict_regular_entry(&entry, &root, 0o600)?;
+            temps.insert(desired.cat_id.clone());
+            continue;
+        }
+        let Some(desired) = desired_by_target.get(name) else {
+            bail!("checkpoint namespace retains foreign entry {name}")
+        };
+        let Some(bytes) = read_strict_regular_at(
+            &directory,
+            &entry,
+            &root,
+            RUNTIME_CHECKPOINT_MAX_WIRE_BYTES,
+            &scan_context,
+        )?
+        else {
+            return Ok(LocalPublicationRecoveryEvidence::None);
+        };
+        let checkpoint =
+            decode_runtime_checkpoint(&bytes).context("decode recovery Runtime checkpoint")?;
+        anyhow::ensure!(
+            checkpoint.cat_id == desired.cat_id,
+            "checkpoint filename and Cat identity disagree"
+        );
+        if checkpoint.desired_revision != desired.desired_revision
+            || checkpoint.spec_digest != desired.spec_digest
+            || checkpoint.node_id != desired.placement.node_id
+            || checkpoint.placement_epoch != desired.placement.placement_epoch
+        {
+            superseded.insert(desired.cat_id.clone());
+            continue;
+        }
+        anyhow::ensure!(
+            checkpoints
+                .insert(desired.cat_id.clone(), checkpoint)
+                .is_none(),
+            "checkpoint recovery inventory duplicated one Cat"
+        );
+    }
+    if let Some(cat_id) = superseded.into_iter().next() {
+        return Ok(LocalPublicationRecoveryEvidence::SupersededCheckpoint { cat_id });
+    }
+    if let Some(cat_id) = temps.into_iter().next() {
+        return Ok(LocalPublicationRecoveryEvidence::CheckpointTemp { cat_id });
+    }
+
+    let data = scan_authorized_blockd_data(
+        &root,
+        context.state_directory().path(),
+        &scan_context,
+        ProbeLimits::default(),
+    )?;
+    for desired in &context.coordinates().desired.desired_specs {
+        let Some(checkpoint) = checkpoints.get(&desired.cat_id) else {
+            continue;
+        };
+        if matches!(
+            checkpoint.step,
+            cats_api::runtime_reconciliation::ReconcileStep::AcquireVolume { .. }
+        ) && !data.evidence.contains_key(&desired.cat_id)
+        {
+            return Ok(LocalPublicationRecoveryEvidence::AuthorizedBlockd {
+                cat_id: desired.cat_id.clone(),
+            });
+        }
+    }
+    Ok(LocalPublicationRecoveryEvidence::None)
 }
 
 struct AuthorizedBlockdDataProbe {
@@ -3009,6 +3180,7 @@ mod tests {
         RuntimeTransition, RuntimeVolumeTransition, SessionBinding, Sha256Digest, VolumeAccess,
         VolumeAcquire, VolumeAcquireRequest, VolumeDisposition, VolumeIntent,
     };
+    use cats_storage::BlobError;
     use tempfile::TempDir;
 
     use crate::runtime_spine::{
@@ -3132,6 +3304,37 @@ mod tests {
             _candidate_volume_ids: &BTreeSet<Id>,
         ) -> cats_storage::authority::Result<NodeVolumeInventorySnapshot> {
             Err(cats_storage::authority::AuthorityError::BackendUnknown)
+        }
+    }
+
+    struct TestUnavailableBlobStore;
+
+    impl BlobStore for TestUnavailableBlobStore {
+        fn put_immutable(&self, key: &str, _data: &[u8]) -> Result<(), BlobError> {
+            Err(test_blob_error(key))
+        }
+
+        fn get(&self, key: &str) -> Result<Vec<u8>, BlobError> {
+            Err(test_blob_error(key))
+        }
+
+        fn exists(&self, key: &str) -> Result<bool, BlobError> {
+            Err(test_blob_error(key))
+        }
+
+        fn delete(&self, key: &str) -> Result<(), BlobError> {
+            Err(test_blob_error(key))
+        }
+
+        fn list(&self, prefix: &str) -> Result<Vec<String>, BlobError> {
+            Err(test_blob_error(prefix))
+        }
+    }
+
+    fn test_blob_error(key: &str) -> BlobError {
+        BlobError::Backend {
+            key: key.to_owned(),
+            message: "test blob store unavailable".to_owned(),
         }
     }
 
@@ -5104,6 +5307,7 @@ mod tests {
             guest_agent_binary: environment.guest_binary.clone(),
             metering_cgroup_root: None,
             volume_inventory_authority: Arc::new(TestUnavailableRuntimeVolumeInventoryAuthority),
+            blob_store: Arc::new(TestUnavailableBlobStore),
         })
         .unwrap();
         assert_eq!(

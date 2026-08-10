@@ -53,8 +53,8 @@ pub use checkpoint::{
 };
 #[cfg(test)]
 pub(crate) use clean_slate_probes::{
-    clean_slate_scanner_for_test, clean_slate_scanner_with_volume_authority_for_test,
-    TestCleanSlateProbeConfig,
+    clean_slate_scanner_for_test, clean_slate_scanner_with_volume_authority_and_blob_for_test,
+    clean_slate_scanner_with_volume_authority_for_test, TestCleanSlateProbeConfig,
 };
 pub(crate) use clean_slate_probes::{
     installed_clean_slate_scanner, InstalledCleanSlateProbeConfig,
@@ -76,7 +76,7 @@ pub use root_provision::{
     AuthorityRereadRequired, RootProvisionClientError, RootProvisionControlPort,
     RootProvisionResponseHint, RootProvisionUnknownReason, UnixRootProvisionClient,
 };
-pub(crate) use signed_running::SignedRunningAcquireEffect;
+pub(crate) use signed_running::{SignedRunningAcquireEffect, SignedRunningPublicationRecovery};
 // This crate-private seam is landed before the systemd composition that
 // consumes it; keeping the re-export here prevents feature code from reaching
 // through the module path while preserving the sealed boundary.

@@ -18,6 +18,7 @@ use cats_api::runtime_reconciliation::{
     ProgressingReason, ReconcileStep, RequireIdleCheckpoint, RuntimeCheckpoint, UnixMillis,
     VolumeAuthorityEvidence, WarmSnapshotEvidence, WireU64,
 };
+use cats_storage::BlobStore;
 use thiserror::Error;
 
 use crate::runtime_spine::{
@@ -28,7 +29,8 @@ use crate::runtime_spine::{
 use super::{
     runtime_checkpoint_path,
     signed_running::{
-        prepared_owned_observed_volume, request_matches_volume, unowned_observed_volume,
+        expected_provision_heads, prepared_owned_observed_volume, provision_checkpoint_is_bound,
+        request_matches_volume, unowned_observed_volume, ProvisionHeadRead,
     },
     AuthorizedBlockdCheckpoint,
 };
@@ -92,6 +94,7 @@ pub enum InventoryProbeSetError {
 pub struct CleanSlateInventoryScanner {
     checkpoint_directory: PathBuf,
     probes: Vec<Arc<dyn InventoryAbsenceProbe>>,
+    blob: Option<Arc<dyn BlobStore>>,
 }
 
 impl crate::runtime_spine::inventory_scanner_sealed::Sealed for CleanSlateInventoryScanner {}
@@ -133,7 +136,18 @@ impl CleanSlateInventoryScanner {
         Ok(Self {
             checkpoint_directory,
             probes,
+            blob: None,
         })
+    }
+
+    pub(crate) fn new_with_blob(
+        checkpoint_directory: PathBuf,
+        probes: Vec<Arc<dyn InventoryAbsenceProbe>>,
+        blob: Arc<dyn BlobStore>,
+    ) -> Result<Self, InventoryProbeSetError> {
+        let mut scanner = Self::new(checkpoint_directory, probes)?;
+        scanner.blob = Some(blob);
+        Ok(scanner)
     }
 }
 
@@ -217,6 +231,11 @@ impl RuntimeInventoryScanner for CleanSlateInventoryScanner {
             .context("system time does not fit UnixMillis")?;
         let coverage = coverage.finish()?;
         let inventory_epoch = context.coordinates().inventory_epoch;
+        let projection = InventoryProjectionContext {
+            checkpoint_directory: &self.checkpoint_directory,
+            blob: self.blob.as_deref(),
+            deadline: context.deadline(),
+        };
         let runtimes = context
             .coordinates()
             .desired
@@ -226,7 +245,7 @@ impl RuntimeInventoryScanner for CleanSlateInventoryScanner {
                 runtime_from_inventory(
                     desired,
                     inventory_epoch,
-                    &self.checkpoint_directory,
+                    &projection,
                     volumes_by_cat.remove(&desired.cat_id).unwrap_or_default(),
                     checkpoints_by_cat.remove(&desired.cat_id),
                     blockd_by_cat.remove(&desired.cat_id),
@@ -250,15 +269,21 @@ impl RuntimeInventoryScanner for CleanSlateInventoryScanner {
     }
 }
 
+struct InventoryProjectionContext<'a> {
+    checkpoint_directory: &'a std::path::Path,
+    blob: Option<&'a dyn BlobStore>,
+    deadline: std::time::Instant,
+}
+
 fn runtime_from_inventory(
     desired: &DesiredRuntimeSpec,
     inventory_epoch: cats_api::runtime_reconciliation::Epoch,
-    checkpoint_directory: &std::path::Path,
+    projection: &InventoryProjectionContext<'_>,
     mut volumes: Vec<ObservedVolume>,
     checkpoint: Option<RuntimeCheckpoint>,
     blockd: Option<AuthorizedBlockdInventoryEvidence>,
 ) -> anyhow::Result<ObservedRuntimeStatus> {
-    let checkpoint_path = runtime_checkpoint_path(checkpoint_directory, &desired.cat_id);
+    let checkpoint_path = runtime_checkpoint_path(projection.checkpoint_directory, &desired.cat_id);
     let checkpoint_path = HostPath::new(
         checkpoint_path
             .to_str()
@@ -316,7 +341,14 @@ fn runtime_from_inventory(
     let (step, checkpoint_evidence, runtime_incarnation, stable_state, lifecycle_admission) =
         match checkpoint {
             Some(checkpoint) => {
-                validate_scanned_checkpoint(desired, &checkpoint, blockd.as_ref())?;
+                validate_scanned_checkpoint(
+                    desired,
+                    &checkpoint,
+                    blockd.as_ref(),
+                    projection.checkpoint_directory,
+                    projection.blob,
+                    projection.deadline,
+                )?;
                 let evidence = CheckpointEvidence::Valid {
                     checkpoint_path,
                     content_digest: checkpoint_content_digest(&checkpoint)
@@ -388,6 +420,9 @@ fn validate_scanned_checkpoint(
     desired: &DesiredRuntimeSpec,
     checkpoint: &RuntimeCheckpoint,
     blockd: Option<&AuthorizedBlockdInventoryEvidence>,
+    checkpoint_directory: &std::path::Path,
+    blob: Option<&dyn BlobStore>,
+    deadline: std::time::Instant,
 ) -> anyhow::Result<()> {
     anyhow::ensure!(
         checkpoint.version == cats_api::runtime_reconciliation::ContractVersion::V1
@@ -439,6 +474,15 @@ fn validate_scanned_checkpoint(
                 anyhow::bail!("provision checkpoint lacks authorized blockd lineage")
             };
             let attachment = &blockd.checkpoint.attachment;
+            let blob = blob.context("provision checkpoint validation lacks image BlobStore")?;
+            let ProvisionHeadRead::Ready { blank, target } =
+                expected_provision_heads(blob, desired, intent, deadline)
+            else {
+                anyhow::bail!("provision checkpoint image manifest is unavailable or invalid")
+            };
+            let state_directory = checkpoint_directory
+                .parent()
+                .context("checkpoint namespace lacks its state-directory parent")?;
             anyhow::ensure!(
                 volume_id == &intent.volume_id
                     && attachment_id == &attachment.identity.attachment_id
@@ -447,6 +491,14 @@ fn validate_scanned_checkpoint(
                     && *size_bytes == intent.size_bytes
                     && boot_image_digest == &desired.runtime.boot_image_digest
                     && expected_blank_head == &attachment.head
+                    && provision_checkpoint_is_bound(
+                        checkpoint,
+                        desired,
+                        intent,
+                        state_directory,
+                        &blank,
+                        &target,
+                    )
                     && checkpoint.volumes
                         == [prepared_owned_observed_volume(
                             intent,

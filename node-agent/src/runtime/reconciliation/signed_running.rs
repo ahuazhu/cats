@@ -27,10 +27,13 @@ use cats_storage::{read_image_manifest_until, BlobStore, ImageManifestReadError}
 
 use crate::runtime_spine::{
     RuntimeDesiredEffect, RuntimeDesiredEffectContext, RuntimeDesiredEffectOutcome,
-    RuntimeDesiredEffectStopReason,
+    RuntimeDesiredEffectStopReason, RuntimePreScanRecovery, RuntimePreScanRecoveryContext,
+    RuntimePreScanRecoveryOutcome,
 };
 
-use super::clean_slate_probes::CHECKPOINT_NAMESPACE;
+use super::clean_slate_probes::{
+    classify_local_publication_recovery, LocalPublicationRecoveryEvidence, CHECKPOINT_NAMESPACE,
+};
 use super::{
     authorized_blockd::authorized_blockd_data_directory, recover_normal_acquire_from_authority,
     runtime_checkpoint_path, AuthorizedBlockdStore, ControlSignedNormalAcquireClient,
@@ -79,6 +82,111 @@ pub(crate) struct SignedRunningAcquireEffect {
     lease_duration_ms: u64,
     #[cfg(test)]
     after_prepare: Option<AfterPrepareHook>,
+}
+
+/// Exact restart-only recovery for the local publications surrounding A22.
+/// It has no signed mutation client and cannot manufacture a new lease; the
+/// current point-read authority must prove the persisted request already won.
+pub(crate) struct SignedRunningPublicationRecovery {
+    authority: Arc<dyn VolumeDataAuthority>,
+}
+
+impl SignedRunningPublicationRecovery {
+    pub(crate) fn new(authority: Arc<dyn VolumeDataAuthority>) -> Self {
+        Self { authority }
+    }
+
+    fn recover_authorized_blockd(
+        &self,
+        context: &RuntimePreScanRecoveryContext,
+        cat_id: &Id,
+    ) -> anyhow::Result<RuntimePreScanRecoveryOutcome> {
+        let desired = context
+            .coordinates()
+            .desired
+            .desired_specs
+            .iter()
+            .find(|desired| &desired.cat_id == cat_id)
+            .context("publication recovery Cat is absent from current Desired")?;
+        let Some(volume) = recovery_volume(desired, &context.coordinates().session) else {
+            return Ok(RuntimePreScanRecoveryOutcome::NoChange);
+        };
+        let checkpoint_directory = context.state_directory().path().join(CHECKPOINT_NAMESPACE);
+        let store = FileCheckpointStore::open(&checkpoint_directory, cat_id)
+            .context("open publication recovery checkpoint store")?;
+        let Some(stored) = store
+            .load()
+            .context("load publication recovery checkpoint")?
+        else {
+            return Ok(RuntimePreScanRecoveryOutcome::NoChange);
+        };
+        let Some(persisted) =
+            persisted_acquire_request(stored.checkpoint(), desired, volume).cloned()
+        else {
+            return Ok(RuntimePreScanRecoveryOutcome::NoChange);
+        };
+        let request = normal_acquire_request_with_binding(
+            desired,
+            context.coordinates().session.clone(),
+            persisted,
+        );
+        context.check_active()?;
+        let record = match self.authority.load_volume(&volume.volume_id) {
+            Ok(record) => record,
+            Err(AuthorityError::BackendUnknown) => {
+                anyhow::bail!("volume authority unavailable during publication recovery")
+            }
+            Err(_) => return Ok(RuntimePreScanRecoveryOutcome::NoChange),
+        };
+        context.check_active()?;
+        let attachment = match recover_normal_acquire_from_authority(&request, volume, &record) {
+            Ok(NormalAcquireAuthorityRecovery::Granted(attachment)) => attachment,
+            Ok(
+                NormalAcquireAuthorityRecovery::RetryExact
+                | NormalAcquireAuthorityRecovery::Blocked,
+            ) => return Ok(RuntimePreScanRecoveryOutcome::NoChange),
+            Err(_) => return Ok(RuntimePreScanRecoveryOutcome::NoChange),
+        };
+        AuthorizedBlockdStore::new(context.state_directory().clone())
+            .prepare(desired, volume, &attachment)
+            .context("recover exact authorized blockd publication")?;
+        context.check_active()?;
+        Ok(RuntimePreScanRecoveryOutcome::Recovered {
+            cat_id: cat_id.clone(),
+        })
+    }
+}
+
+impl RuntimePreScanRecovery for SignedRunningPublicationRecovery {
+    fn recover_one(
+        &self,
+        context: RuntimePreScanRecoveryContext,
+    ) -> anyhow::Result<RuntimePreScanRecoveryOutcome> {
+        context.check_active()?;
+        match classify_local_publication_recovery(&context)? {
+            LocalPublicationRecoveryEvidence::None => Ok(RuntimePreScanRecoveryOutcome::NoChange),
+            LocalPublicationRecoveryEvidence::SupersededCheckpoint { cat_id } => {
+                // Deliberately leave this typed evidence for the independent
+                // superseded-checkpoint planner; publication recovery cannot
+                // infer cleanup authority from it.
+                drop(cat_id);
+                Ok(RuntimePreScanRecoveryOutcome::NoChange)
+            }
+            LocalPublicationRecoveryEvidence::CheckpointTemp { cat_id } => {
+                let checkpoint_directory =
+                    context.state_directory().path().join(CHECKPOINT_NAMESPACE);
+                drop(
+                    FileCheckpointStore::open(&checkpoint_directory, &cat_id)
+                        .context("settle exact checkpoint temp publication")?,
+                );
+                context.check_active()?;
+                Ok(RuntimePreScanRecoveryOutcome::Recovered { cat_id })
+            }
+            LocalPublicationRecoveryEvidence::AuthorizedBlockd { cat_id } => {
+                self.recover_authorized_blockd(&context, &cat_id)
+            }
+        }
+    }
 }
 
 impl SignedRunningAcquireEffect {
@@ -136,58 +244,42 @@ impl SignedRunningAcquireEffect {
         // before creating the first checkpoint so an unavailable image does
         // not acquire a lease that this step cannot yet journal forward.
         context.check_active()?;
-        let manifest = match read_image_manifest_until(
-            self.blob.as_ref(),
-            &desired.runtime.boot_image_digest,
-            context.deadline(),
-        ) {
-            Ok(manifest) => manifest,
-            Err(
-                ImageManifestReadError::NotFound { .. }
-                | ImageManifestReadError::BackendUnavailable { .. },
-            ) => return Ok(RuntimeDesiredEffectOutcome::RetryExact),
-            Err(
-                ImageManifestReadError::TooLarge { .. } | ImageManifestReadError::Corrupt { .. },
-            ) => return Ok(stop_local()),
-        };
-        let image_identity =
-            match cats_blockd::format::image_root_identity(&manifest, volume.size_bytes) {
-                Ok(identity) => identity,
-                Err(_) => return Ok(stop_local()),
+        let (expected_blank_head, expected_provisioned_head) =
+            match expected_provision_heads(self.blob.as_ref(), desired, volume, context.deadline())
+            {
+                ProvisionHeadRead::Ready { blank, target } => (blank, target),
+                ProvisionHeadRead::Retry => return Ok(RuntimeDesiredEffectOutcome::RetryExact),
+                ProvisionHeadRead::Invalid => return Ok(stop_local()),
             };
-        let expected_blank_head = blank_head();
-        let expected_provisioned_head = RemoteHead {
-            generation: Generation::new(1).expect("one is a valid generation"),
-            root_hash: Some(Sha256Digest::from_bytes(image_identity.root_hash)),
-            root_object_id: Some(
-                AsciiText::new(image_identity.root_object_id)
-                    .expect("a computed map object ID is printable ASCII"),
-            ),
-        };
         context.check_active()?;
 
-        let request =
+        let fresh_request =
             normal_acquire_request(desired, volume, accepted.session(), self.lease_duration_ms);
         let acquire_checkpoint = acquire_checkpoint(
             desired,
             volume,
-            request.transition.clone(),
+            fresh_request.transition.clone(),
             accepted.attestation().accepted_at_unix_ms,
         );
         let checkpoint_directory = context.state_directory().path().join(CHECKPOINT_NAMESPACE);
         let store = FileCheckpointStore::open(&checkpoint_directory, &desired.cat_id)
             .context("open signed Running checkpoint store")?;
-        let predecessor = match store.load().context("load signed Running checkpoint")? {
-            None => store
-                .create(&acquire_checkpoint)
-                .context("persist normal-acquire request before authority mutation")?,
-            Some(stored)
-                if checkpoint_eq_except_updated_at(stored.checkpoint(), &acquire_checkpoint) =>
-            {
-                stored
-            }
-            Some(stored)
-                if provision_checkpoint_is_bound(
+        let (predecessor, request) = match store.load().context("load signed Running checkpoint")? {
+            None => (
+                store
+                    .create(&acquire_checkpoint)
+                    .context("persist normal-acquire request before authority mutation")?,
+                fresh_request,
+            ),
+            Some(stored) => match persisted_acquire_request(stored.checkpoint(), desired, volume) {
+                Some(persisted) => {
+                    let persisted = persisted.clone();
+                    (
+                        stored,
+                        normal_acquire_request_with_payload(desired, accepted.session(), persisted),
+                    )
+                }
+                None if provision_checkpoint_is_bound(
                     stored.checkpoint(),
                     desired,
                     volume,
@@ -195,13 +287,15 @@ impl SignedRunningAcquireEffect {
                     &expected_blank_head,
                     &expected_provisioned_head,
                 ) =>
-            {
-                // A previous invocation crossed the directory durability
-                // barrier and lost only its return path. Do not perform a
-                // second mutation from the stale pre-acquire observation.
-                return Ok(RuntimeDesiredEffectOutcome::RefreshInventory);
-            }
-            Some(_) => return Ok(stop_local()),
+                {
+                    // A previous invocation crossed the directory durability
+                    // barrier and a fresh accepted scan proved the complete
+                    // next-step checkpoint. This acquire unit is converged;
+                    // do not perform a second mutation.
+                    return Ok(RuntimeDesiredEffectOutcome::Applied);
+                }
+                None => return Ok(stop_local()),
+            },
         };
 
         context.check_active()?;
@@ -602,6 +696,39 @@ fn runtime_is_acquire_only(
                                     expectation.data_directory,
                                 )])))
         }
+        (
+            ReconcileStep::ProvisionRootImage { .. },
+            CheckpointEvidence::Valid {
+                cat_id,
+                node_id,
+                placement_epoch,
+                desired_revision,
+                spec_digest,
+                runtime_incarnation,
+                stable_state,
+                step,
+                require_idle,
+                checkpoint_path,
+                ..
+            },
+        ) => {
+            cat_id == &desired.cat_id
+                && node_id == &desired.placement.node_id
+                && *placement_epoch == desired.placement.placement_epoch
+                && *desired_revision == desired.desired_revision
+                && spec_digest == &desired.spec_digest
+                && runtime_incarnation.is_none()
+                && stable_state.is_none()
+                && step.as_ref() == &runtime.step
+                && matches!(require_idle.as_ref(), RequireIdleCheckpoint::NotApplicable)
+                && path_matches(checkpoint_path, expectation.checkpoint_path)
+                && authority_is_owned
+                && observed.local_lineages
+                    == [expected_local_lineage(
+                        expectation.identity,
+                        expectation.data_directory,
+                    )]
+        }
         _ => false,
     }
 }
@@ -659,30 +786,78 @@ fn normal_acquire_request(
     else {
         unreachable!("slice validation accepted only Normal")
     };
-    RuntimeVolumeTransitionRequest {
-        version: ContractVersion::V1,
-        session: SessionBinding {
+    normal_acquire_request_with_payload(
+        desired,
+        session,
+        VolumeAcquireRequest::Normal {
+            volume_id: volume.volume_id.clone(),
+            transition_id: transition_id.clone(),
+            attachment_id: volume.attachment_id.clone(),
+            expected_unowned_epoch: *expected_unowned_epoch,
+            desired_revision: desired.desired_revision,
+            placement_epoch: desired.placement.placement_epoch,
+            lease_duration_ms,
+        },
+    )
+}
+
+fn normal_acquire_request_with_payload(
+    desired: &DesiredRuntimeSpec,
+    session: &AgentSession,
+    request: VolumeAcquireRequest,
+) -> RuntimeVolumeTransitionRequest {
+    normal_acquire_request_with_binding(
+        desired,
+        SessionBinding {
             node_id: session.node_id.clone(),
             node_boot_id: session.node_boot_id.clone(),
             agent_instance_id: session.agent_instance_id.clone(),
             agent_session_epoch: session.agent_session_epoch,
         },
+        request,
+    )
+}
+
+fn normal_acquire_request_with_binding(
+    desired: &DesiredRuntimeSpec,
+    session: SessionBinding,
+    request: VolumeAcquireRequest,
+) -> RuntimeVolumeTransitionRequest {
+    RuntimeVolumeTransitionRequest {
+        version: ContractVersion::V1,
+        session,
         cat_id: desired.cat_id.clone(),
         desired_revision: desired.desired_revision,
         spec_digest: desired.spec_digest.clone(),
         placement: desired.placement.clone(),
-        transition: RuntimeVolumeTransition::Acquire {
-            request: VolumeAcquireRequest::Normal {
-                volume_id: volume.volume_id.clone(),
-                transition_id: transition_id.clone(),
-                attachment_id: volume.attachment_id.clone(),
-                expected_unowned_epoch: *expected_unowned_epoch,
-                desired_revision: desired.desired_revision,
-                placement_epoch: desired.placement.placement_epoch,
-                lease_duration_ms,
-            },
-        },
+        transition: RuntimeVolumeTransition::Acquire { request },
     }
+}
+
+fn recovery_volume<'a>(
+    desired: &'a DesiredRuntimeSpec,
+    session: &SessionBinding,
+) -> Option<&'a VolumeIntent> {
+    if encode_desired_runtime_spec(desired).is_err()
+        || desired.version != ContractVersion::V1
+        || desired.target != RuntimeTarget::Running
+        || !matches!(desired.transition, RuntimeTransition::CancelAndDrain)
+        || desired.placement.node_id != session.node_id
+    {
+        return None;
+    }
+    let [volume] = desired.volumes.as_slice() else {
+        return None;
+    };
+    if !matches!(volume.acquire, VolumeAcquire::Normal { .. })
+        || volume.disk_kind != DiskKind::Root
+        || volume.access != VolumeAccess::ReadWriteOnce
+        || volume.mount.is_some()
+        || !matches!(volume.disposition, VolumeDisposition::Retain)
+    {
+        return None;
+    }
+    Some(volume)
 }
 
 pub(super) fn request_matches_volume(
@@ -750,10 +925,33 @@ pub(super) fn acquire_checkpoint(
     }
 }
 
+#[cfg(test)]
 fn checkpoint_eq_except_updated_at(stored: &RuntimeCheckpoint, fresh: &RuntimeCheckpoint) -> bool {
     let mut stored = stored.clone();
     stored.updated_at_unix_ms = fresh.updated_at_unix_ms;
     stored == *fresh
+}
+
+fn persisted_acquire_request<'a>(
+    checkpoint: &'a RuntimeCheckpoint,
+    desired: &DesiredRuntimeSpec,
+    volume: &VolumeIntent,
+) -> Option<&'a VolumeAcquireRequest> {
+    let ReconcileStep::AcquireVolume { request } = &checkpoint.step else {
+        return None;
+    };
+    if !request_matches_volume(request, desired, volume) {
+        return None;
+    }
+    let expected = acquire_checkpoint(
+        desired,
+        volume,
+        RuntimeVolumeTransition::Acquire {
+            request: request.clone(),
+        },
+        checkpoint.updated_at_unix_ms,
+    );
+    (checkpoint == &expected).then_some(request)
 }
 
 pub(super) fn unowned_observed_volume(volume: &VolumeIntent) -> ObservedVolume {
@@ -814,7 +1012,7 @@ pub(super) fn prepared_owned_observed_volume(
     observed
 }
 
-fn provision_checkpoint_is_bound(
+pub(super) fn provision_checkpoint_is_bound(
     checkpoint: &RuntimeCheckpoint,
     desired: &DesiredRuntimeSpec,
     volume: &VolumeIntent,
@@ -913,6 +1111,49 @@ fn provision_checkpoint_is_bound(
             == format!("{}/{}", data_directory.as_str(), ROOT_PROVISION_SOCKET)
 }
 
+pub(super) enum ProvisionHeadRead {
+    Ready {
+        blank: RemoteHead,
+        target: RemoteHead,
+    },
+    Retry,
+    Invalid,
+}
+
+pub(super) fn expected_provision_heads(
+    blob: &dyn BlobStore,
+    desired: &DesiredRuntimeSpec,
+    volume: &VolumeIntent,
+    deadline: Instant,
+) -> ProvisionHeadRead {
+    let manifest =
+        match read_image_manifest_until(blob, &desired.runtime.boot_image_digest, deadline) {
+            Ok(manifest) => manifest,
+            Err(
+                ImageManifestReadError::NotFound { .. }
+                | ImageManifestReadError::BackendUnavailable { .. },
+            ) => return ProvisionHeadRead::Retry,
+            Err(
+                ImageManifestReadError::TooLarge { .. } | ImageManifestReadError::Corrupt { .. },
+            ) => return ProvisionHeadRead::Invalid,
+        };
+    let Ok(image_identity) = cats_blockd::format::image_root_identity(&manifest, volume.size_bytes)
+    else {
+        return ProvisionHeadRead::Invalid;
+    };
+    ProvisionHeadRead::Ready {
+        blank: blank_head(),
+        target: RemoteHead {
+            generation: Generation::new(1).expect("one is a valid generation"),
+            root_hash: Some(Sha256Digest::from_bytes(image_identity.root_hash)),
+            root_object_id: Some(
+                AsciiText::new(image_identity.root_object_id)
+                    .expect("a computed map object ID is printable ASCII"),
+            ),
+        },
+    }
+}
+
 fn blank_head() -> RemoteHead {
     RemoteHead {
         generation: Generation::new(0).expect("zero is a valid generation"),
@@ -946,6 +1187,8 @@ fn path_matches(path: &HostPath, expected: &std::path::Path) -> bool {
 #[cfg(test)]
 mod tests {
     use std::collections::VecDeque;
+    use std::os::unix::fs::PermissionsExt as _;
+    use std::process::Command;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Mutex;
     use std::time::Duration;
@@ -966,11 +1209,12 @@ mod tests {
 
     use crate::runtime_spine::{
         RuntimeDesiredEffectAdmission, RuntimeInventoryScanContext, RuntimeInventoryScanOutcome,
-        RuntimeSpineFullScan,
+        RuntimePreScanRecoveryContext, RuntimeSpineFullScan,
     };
     use crate::state_directory::StateDirectory;
 
     use super::super::{
+        clean_slate_scanner_with_volume_authority_and_blob_for_test,
         clean_slate_scanner_with_volume_authority_for_test, TestCleanSlateProbeConfig,
     };
 
@@ -1141,6 +1385,17 @@ mod tests {
         blob: Arc<RecordingBlob>,
         checkpoint_path: std::path::PathBuf,
     ) -> (SignedRunningAcquireEffect, Arc<Mutex<AcquireState>>) {
+        effect_with_lease(desired, outcomes, authority, blob, checkpoint_path, 60_000)
+    }
+
+    fn effect_with_lease(
+        desired: &DesiredRuntimeSpec,
+        outcomes: Vec<NormalAcquireAttempt>,
+        authority: Arc<FakeAuthority>,
+        blob: Arc<RecordingBlob>,
+        checkpoint_path: std::path::PathBuf,
+        lease_duration_ms: u64,
+    ) -> (SignedRunningAcquireEffect, Arc<Mutex<AcquireState>>) {
         let state = Arc::new(Mutex::new(AcquireState {
             outcomes: outcomes.into(),
             checkpoint_path: Some(checkpoint_path),
@@ -1149,7 +1404,8 @@ mod tests {
         let port: Arc<dyn SignedNormalAcquirePort> = Arc::new(FakeAcquire {
             state: Arc::clone(&state),
         });
-        let effect = SignedRunningAcquireEffect::new(port, authority, blob, 60_000).unwrap();
+        let effect =
+            SignedRunningAcquireEffect::new(port, authority, blob, lease_duration_ms).unwrap();
         // Ensure the fixture itself remains bound to the constructor budget.
         assert!(matches!(
             desired.volumes[0].acquire,
@@ -1244,6 +1500,66 @@ mod tests {
             .join("launch-checkpoint.json")
             .is_file());
         assert!(!root.path().join("runtime-effects").exists());
+    }
+
+    #[test]
+    fn production_scanner_binds_provision_identity_and_exact_manifest_target() {
+        let root = tempfile::tempdir().unwrap();
+        let desired = desired();
+        let attachment = attachment(&desired);
+        let authority = Arc::new(FakeAuthority::new(Err(AuthorityError::BackendUnknown)));
+        let blob = Arc::new(RecordingBlob::present(&desired));
+        let checkpoint_path = checkpoint_path(root.path(), &desired.cat_id);
+        let (effect, _) = effect(
+            &desired,
+            vec![NormalAcquireAttempt::Granted(Box::new(attachment.clone()))],
+            Arc::clone(&authority),
+            Arc::clone(&blob),
+            checkpoint_path.clone(),
+        );
+        let (context, _) = context(root.path(), &desired, None);
+        assert_eq!(
+            effect.apply(context, &desired).unwrap(),
+            RuntimeDesiredEffectOutcome::RefreshInventory
+        );
+        authority.set(Ok(owned_record(&desired, &attachment)));
+        let scanner_authority: Arc<dyn VolumeDataAuthority> = authority;
+        let scanner_blob: Arc<dyn BlobStore> = blob;
+        let scanner = fresh_scanner_with_blob(root.path(), scanner_authority, scanner_blob);
+        assert!(matches!(
+            scanner.scan_complete(scan_context(&desired)).unwrap(),
+            RuntimeInventoryScanOutcome::Complete(_)
+        ));
+
+        let store =
+            FileCheckpointStore::open(&root.path().join(CHECKPOINT_NAMESPACE), &desired.cat_id)
+                .unwrap();
+        let current = store.load().unwrap().unwrap();
+        let correct = current.checkpoint().clone();
+        let mut wrong_target = current.checkpoint().clone();
+        let ReconcileStep::ProvisionRootImage {
+            expected_provisioned_head,
+            ..
+        } = &mut wrong_target.step
+        else {
+            unreachable!("fixture reached ProvisionRootImage")
+        };
+        expected_provisioned_head.root_hash = Some(Sha256Digest::from_bytes([0x55; 32]));
+        let wrong = store.replace(&current, &wrong_target).unwrap();
+        assert!(scanner.scan_complete(scan_context(&desired)).is_err());
+
+        let restored = store.replace(&wrong, &correct).unwrap();
+        let mut wrong_token = restored.checkpoint().clone();
+        let ReconcileStep::ProvisionRootImage {
+            process_identity_token,
+            ..
+        } = &mut wrong_token.step
+        else {
+            unreachable!("fixture reached ProvisionRootImage")
+        };
+        *process_identity_token = random('9');
+        store.replace(&restored, &wrong_token).unwrap();
+        assert!(scanner.scan_complete(scan_context(&desired)).is_err());
     }
 
     #[test]
@@ -1457,6 +1773,240 @@ mod tests {
         };
         *transition_id = random('9');
         assert!(!checkpoint_eq_except_updated_at(&stored, &changed));
+    }
+
+    #[test]
+    fn restart_replays_persisted_acquire_lease_when_current_config_changes() {
+        let root = tempfile::tempdir().unwrap();
+        let desired = desired();
+        let checkpoint_path = checkpoint_path(root.path(), &desired.cat_id);
+        let authority = Arc::new(FakeAuthority::new(Ok(unowned_record(&desired))));
+        let blob = Arc::new(RecordingBlob::present(&desired));
+        let (first, first_calls) = effect_with_lease(
+            &desired,
+            vec![NormalAcquireAttempt::RetryExact],
+            Arc::clone(&authority),
+            Arc::clone(&blob),
+            checkpoint_path.clone(),
+            60_000,
+        );
+        let (first_context, _) = context(root.path(), &desired, None);
+        assert_eq!(
+            first.apply(first_context, &desired).unwrap(),
+            RuntimeDesiredEffectOutcome::RetryExact
+        );
+        let acquire = read_checkpoint(&checkpoint_path);
+        let acquire_runtime = observed_runtime(
+            root.path(),
+            &desired,
+            Some((&acquire, unowned_observed_volume(&desired.volumes[0]))),
+        );
+
+        let attachment = attachment(&desired);
+        let (restart, restart_calls) = effect_with_lease(
+            &desired,
+            vec![NormalAcquireAttempt::Granted(Box::new(attachment))],
+            authority,
+            blob,
+            checkpoint_path,
+            90_000,
+        );
+        let (restart_context, _) = context_with_session(
+            root.path(),
+            &desired,
+            Some(acquire_runtime),
+            '8',
+            3,
+            1_900_000_010_000,
+        );
+        assert_eq!(
+            restart.apply(restart_context, &desired).unwrap(),
+            RuntimeDesiredEffectOutcome::RefreshInventory
+        );
+        let first = first_calls.lock().unwrap();
+        let restart = restart_calls.lock().unwrap();
+        let lease = |request: &RuntimeVolumeTransitionRequest| match &request.transition {
+            RuntimeVolumeTransition::Acquire {
+                request:
+                    VolumeAcquireRequest::Normal {
+                        lease_duration_ms, ..
+                    },
+            } => *lease_duration_ms,
+            _ => unreachable!("fixture uses normal acquire"),
+        };
+        assert_eq!(lease(&first.requests[0]), 60_000);
+        assert_eq!(lease(&restart.requests[0]), 60_000);
+        assert_ne!(first.requests[0].session, restart.requests[0].session);
+    }
+
+    #[test]
+    fn pre_scan_recovery_completes_every_authorized_blockd_publication_window() {
+        for window in [
+            PublicationWindow::BeforeIdentity,
+            PublicationWindow::IdentityTemp,
+            PublicationWindow::Identity,
+            PublicationWindow::AuthorizedTemp,
+            PublicationWindow::Authorized,
+            PublicationWindow::LaunchTemp,
+        ] {
+            let root = tempfile::tempdir().unwrap();
+            let desired = desired();
+            let attachment = attachment(&desired);
+            persist_acquire_checkpoint(root.path(), &desired);
+            let authority = Arc::new(FakeAuthority::new(Ok(owned_record(&desired, &attachment))));
+            let data_directory =
+                authorized_blockd_data_directory(root.path(), &desired, &attachment.identity);
+            drop(
+                AuthorizedBlockdStore::new(StateDirectory::unanchored(root.path().to_path_buf()))
+                    .prepare(&desired, &desired.volumes[0], &attachment)
+                    .unwrap(),
+            );
+            shape_publication_window(&data_directory, window);
+
+            let recovery = SignedRunningPublicationRecovery::new(authority);
+            let outcome = recovery
+                .recover_one(recovery_context(root.path(), &desired))
+                .unwrap();
+            assert_eq!(
+                outcome,
+                RuntimePreScanRecoveryOutcome::Recovered {
+                    cat_id: desired.cat_id.clone()
+                }
+            );
+            for name in [
+                super::super::authorized_blockd::IDENTITY_FILE,
+                super::super::authorized_blockd::AUTHORIZED_SERVING_FILE,
+                super::super::authorized_blockd::LAUNCH_CHECKPOINT_FILE,
+            ] {
+                assert!(data_directory.join(name).is_file());
+            }
+            for name in [
+                super::super::authorized_blockd::IDENTITY_TEMP,
+                super::super::authorized_blockd::AUTHORIZED_SERVING_TEMP,
+                super::super::authorized_blockd::LAUNCH_CHECKPOINT_TEMP,
+            ] {
+                assert!(!data_directory.join(name).exists());
+            }
+
+            assert_eq!(
+                recovery
+                    .recover_one(recovery_context(root.path(), &desired))
+                    .unwrap(),
+                RuntimePreScanRecoveryOutcome::NoChange
+            );
+        }
+    }
+
+    #[test]
+    fn fork_kill_at_each_authorized_publication_barrier_recovers_exactly() {
+        for point in [
+            "identity.json:temp",
+            "identity.json:target",
+            "authorized-serving.json:temp",
+            "authorized-serving.json:target",
+            "launch-checkpoint.json:temp",
+        ] {
+            let root = tempfile::tempdir().unwrap();
+            let desired = desired();
+            let attachment = attachment(&desired);
+            persist_acquire_checkpoint(root.path(), &desired);
+            let marker = root.path().join("kill-ready");
+            let mut child = Command::new(std::env::current_exe().unwrap())
+                .arg("--exact")
+                .arg("runtime::reconciliation::signed_running::tests::authorized_publication_kill_probe_child")
+                .arg("--nocapture")
+                .env("CATS_AUTHORIZED_BLOCKD_KILL_ROOT", root.path())
+                .env("CATS_AUTHORIZED_BLOCKD_KILL_POINT", point)
+                .env("CATS_AUTHORIZED_BLOCKD_KILL_MARKER", &marker)
+                .spawn()
+                .unwrap();
+            let deadline = Instant::now() + Duration::from_secs(5);
+            while !marker.exists() {
+                if let Some(status) = child.try_wait().unwrap() {
+                    panic!("authorized publication child exited early at {point}: {status}");
+                }
+                assert!(
+                    Instant::now() < deadline,
+                    "kill probe did not reach {point}"
+                );
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            child.kill().unwrap();
+            let status = child.wait().unwrap();
+            assert!(!status.success());
+
+            let authority = Arc::new(FakeAuthority::new(Ok(owned_record(&desired, &attachment))));
+            let recovery = SignedRunningPublicationRecovery::new(authority);
+            assert_eq!(
+                recovery
+                    .recover_one(recovery_context(root.path(), &desired))
+                    .unwrap(),
+                RuntimePreScanRecoveryOutcome::Recovered {
+                    cat_id: desired.cat_id.clone()
+                },
+                "failed to recover process-kill point {point}"
+            );
+            let data_directory =
+                authorized_blockd_data_directory(root.path(), &desired, &attachment.identity);
+            assert_eq!(
+                prepared_file_snapshot(&data_directory).len(),
+                3,
+                "recovery did not complete {point}"
+            );
+        }
+    }
+
+    #[test]
+    fn authorized_publication_kill_probe_child() {
+        let Ok(root) = std::env::var("CATS_AUTHORIZED_BLOCKD_KILL_ROOT") else {
+            return;
+        };
+        let desired = desired();
+        let attachment = attachment(&desired);
+        let prepared = AuthorizedBlockdStore::new(StateDirectory::unanchored(root.into()))
+            .prepare(&desired, &desired.volumes[0], &attachment)
+            .unwrap();
+        drop(prepared);
+        panic!("authorized publication kill probe passed its requested barrier");
+    }
+
+    #[test]
+    fn pre_scan_recovery_settles_checkpoint_temp_but_never_hides_foreign_evidence() {
+        let root = tempfile::tempdir().unwrap();
+        let desired = desired();
+        persist_acquire_checkpoint(root.path(), &desired);
+        let temporary = root
+            .path()
+            .join(CHECKPOINT_NAMESPACE)
+            .join(format!(".cat-{}.checkpoint.tmp", desired.cat_id));
+        std::fs::write(&temporary, b"crashed writer bytes").unwrap();
+        std::fs::set_permissions(&temporary, std::fs::Permissions::from_mode(0o600)).unwrap();
+        let authority = Arc::new(FakeAuthority::new(Ok(unowned_record(&desired))));
+        let recovery = SignedRunningPublicationRecovery::new(authority);
+        assert_eq!(
+            recovery
+                .recover_one(recovery_context(root.path(), &desired))
+                .unwrap(),
+            RuntimePreScanRecoveryOutcome::Recovered {
+                cat_id: desired.cat_id.clone()
+            }
+        );
+        assert!(!temporary.exists());
+
+        let attachment = attachment(&desired);
+        let authority = Arc::new(FakeAuthority::new(Ok(owned_record(&desired, &attachment))));
+        let data_directory =
+            authorized_blockd_data_directory(root.path(), &desired, &attachment.identity);
+        std::fs::create_dir_all(&data_directory).unwrap();
+        set_directory_tree_mode(root.path(), &data_directory);
+        let foreign = data_directory.join("foreign.bin");
+        std::fs::write(&foreign, b"do not adopt").unwrap();
+        let recovery = SignedRunningPublicationRecovery::new(authority);
+        assert!(recovery
+            .recover_one(recovery_context(root.path(), &desired))
+            .is_err());
+        assert_eq!(std::fs::read(foreign).unwrap(), b"do not adopt");
+        assert!(!data_directory.join("identity.json").exists());
     }
 
     #[test]
@@ -1758,6 +2308,118 @@ mod tests {
         assert!(!missing_checkpoint.exists());
     }
 
+    #[derive(Clone, Copy)]
+    enum PublicationWindow {
+        BeforeIdentity,
+        IdentityTemp,
+        Identity,
+        AuthorizedTemp,
+        Authorized,
+        LaunchTemp,
+    }
+
+    fn persist_acquire_checkpoint(root: &std::path::Path, desired: &DesiredRuntimeSpec) {
+        let session = AgentSession {
+            version: ContractVersion::V1,
+            node_id: desired.placement.node_id.clone(),
+            immutable_host_id: id("host_a"),
+            node_boot_id: NodeBootId::new("33333333333333333333333333333333").unwrap(),
+            agent_instance_id: random('4'),
+            agent_session_epoch: epoch(2),
+            registration_attempt_id: random('5'),
+            guest_config_digest: desired.runtime.guest_config_digest.clone(),
+            lease_deadline_unix_ms: unix_ms(1_900_000_120_000),
+        };
+        let request = normal_acquire_request(desired, &desired.volumes[0], &session, 60_000);
+        let checkpoint = acquire_checkpoint(
+            desired,
+            &desired.volumes[0],
+            request.transition,
+            unix_ms(1_900_000_000_000),
+        );
+        let store =
+            FileCheckpointStore::open(&root.join(CHECKPOINT_NAMESPACE), &desired.cat_id).unwrap();
+        store.create(&checkpoint).unwrap();
+    }
+
+    fn recovery_context(
+        root: &std::path::Path,
+        desired: &DesiredRuntimeSpec,
+    ) -> RuntimePreScanRecoveryContext {
+        let session = SessionBinding {
+            node_id: desired.placement.node_id.clone(),
+            node_boot_id: NodeBootId::new("33333333333333333333333333333333").unwrap(),
+            agent_instance_id: random('8'),
+            agent_session_epoch: epoch(3),
+        };
+        RuntimePreScanRecoveryContext::for_test(
+            StateDirectory::unanchored(root.to_path_buf()),
+            RuntimeSpineFullScan {
+                session: session.clone(),
+                heartbeat_sequence: sequence(10),
+                inventory_epoch: epoch(5),
+                desired: DesiredReadSnapshot {
+                    version: ContractVersion::V1,
+                    session,
+                    request_sequence: sequence(20),
+                    read_position: sequence(21),
+                    issued_at_unix_ms: unix_ms(1_900_000_005_000),
+                    expires_at_unix_ms: unix_ms(1_900_000_035_000),
+                    desired_specs: vec![desired.clone()],
+                },
+            },
+            Instant::now() + Duration::from_secs(30),
+        )
+    }
+
+    fn shape_publication_window(directory: &std::path::Path, window: PublicationWindow) {
+        use super::super::authorized_blockd::{
+            AUTHORIZED_SERVING_FILE, AUTHORIZED_SERVING_TEMP, IDENTITY_FILE, IDENTITY_TEMP,
+            LAUNCH_CHECKPOINT_FILE, LAUNCH_CHECKPOINT_TEMP,
+        };
+        match window {
+            PublicationWindow::BeforeIdentity => {
+                std::fs::remove_dir_all(directory).unwrap();
+            }
+            PublicationWindow::IdentityTemp => {
+                std::fs::remove_file(directory.join(AUTHORIZED_SERVING_FILE)).unwrap();
+                std::fs::remove_file(directory.join(LAUNCH_CHECKPOINT_FILE)).unwrap();
+                std::fs::rename(directory.join(IDENTITY_FILE), directory.join(IDENTITY_TEMP))
+                    .unwrap();
+            }
+            PublicationWindow::Identity => {
+                std::fs::remove_file(directory.join(AUTHORIZED_SERVING_FILE)).unwrap();
+                std::fs::remove_file(directory.join(LAUNCH_CHECKPOINT_FILE)).unwrap();
+            }
+            PublicationWindow::AuthorizedTemp => {
+                std::fs::remove_file(directory.join(LAUNCH_CHECKPOINT_FILE)).unwrap();
+                std::fs::rename(
+                    directory.join(AUTHORIZED_SERVING_FILE),
+                    directory.join(AUTHORIZED_SERVING_TEMP),
+                )
+                .unwrap();
+            }
+            PublicationWindow::Authorized => {
+                std::fs::remove_file(directory.join(LAUNCH_CHECKPOINT_FILE)).unwrap();
+            }
+            PublicationWindow::LaunchTemp => {
+                std::fs::rename(
+                    directory.join(LAUNCH_CHECKPOINT_FILE),
+                    directory.join(LAUNCH_CHECKPOINT_TEMP),
+                )
+                .unwrap();
+            }
+        }
+    }
+
+    fn set_directory_tree_mode(root: &std::path::Path, leaf: &std::path::Path) {
+        let mut path = root.to_path_buf();
+        for component in leaf.strip_prefix(root).unwrap().components() {
+            path.push(component);
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o700)).unwrap();
+        }
+    }
+
     fn desired() -> DesiredRuntimeSpec {
         let volume = VolumeIntent {
             volume_intent_id: id("vint_root"),
@@ -1914,6 +2576,69 @@ mod tests {
             authority,
         )
         .unwrap()
+    }
+
+    fn fresh_scanner_with_blob(
+        root: &std::path::Path,
+        authority: Arc<dyn VolumeDataAuthority>,
+        blob: Arc<dyn BlobStore>,
+    ) -> Arc<dyn crate::runtime_spine::RuntimeInventoryScanner> {
+        let proc_root = root.join("probe-proc");
+        let systemd_root = root.join("probe-systemd");
+        let block_root = root.join("probe-block");
+        let network_root = root.join("probe-network");
+        let socket_root = root.join("probe-sockets");
+        for directory in [
+            &proc_root,
+            &systemd_root,
+            &block_root,
+            &network_root,
+            &socket_root,
+        ] {
+            std::fs::create_dir(directory).unwrap();
+        }
+        clean_slate_scanner_with_volume_authority_and_blob_for_test(
+            TestCleanSlateProbeConfig {
+                state_directory: StateDirectory::unanchored(root.to_path_buf()),
+                proc_root,
+                systemd_cgroup_root: systemd_root,
+                block_class_root: block_root,
+                network_class_root: network_root,
+                legacy_socket_root: socket_root,
+                cloud_hypervisor_binary: root.join("bin/cloud-hypervisor"),
+                blockd_binary: root.join("bin/cats-blockd"),
+                guest_agent_binary: root.join("bin/cats-guest-agent"),
+            },
+            authority,
+            blob,
+        )
+        .unwrap()
+    }
+
+    fn scan_context(desired: &DesiredRuntimeSpec) -> RuntimeInventoryScanContext {
+        let session = SessionBinding {
+            node_id: desired.placement.node_id.clone(),
+            node_boot_id: NodeBootId::new("33333333333333333333333333333333").unwrap(),
+            agent_instance_id: random('8'),
+            agent_session_epoch: epoch(3),
+        };
+        RuntimeInventoryScanContext::for_test(
+            RuntimeSpineFullScan {
+                session: session.clone(),
+                heartbeat_sequence: sequence(10),
+                inventory_epoch: epoch(5),
+                desired: DesiredReadSnapshot {
+                    version: ContractVersion::V1,
+                    session,
+                    request_sequence: sequence(20),
+                    read_position: sequence(21),
+                    issued_at_unix_ms: unix_ms(1_900_000_005_000),
+                    expires_at_unix_ms: unix_ms(1_900_000_035_000),
+                    desired_specs: vec![desired.clone()],
+                },
+            },
+            Instant::now() + Duration::from_secs(30),
+        )
     }
 
     fn observed_runtime(

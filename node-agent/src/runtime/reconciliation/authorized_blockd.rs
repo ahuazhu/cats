@@ -568,6 +568,8 @@ fn persist_ordered_file(
             .with_context(|| format!("sync {}", temporary_path.display()))?;
         verify_regular_file(&file, &temporary_path, Some(expected.len() as u64))?;
     }
+    #[cfg(test)]
+    pause_authorized_publication_for_process_kill(target_name, "temp");
 
     anyhow::ensure!(
         read_optional_bounded(directory, &target_c, &target_path, maximum)?.is_none(),
@@ -579,6 +581,8 @@ fn persist_ordered_file(
     directory
         .sync_all()
         .with_context(|| format!("sync {}", relative_directory.display()))?;
+    #[cfg(test)]
+    pause_authorized_publication_for_process_kill(target_name, "target");
     let published = read_optional_bounded(directory, &target_c, &target_path, maximum)?
         .context("published authorized blockd input disappeared")?;
     anyhow::ensure!(
@@ -586,6 +590,22 @@ fn persist_ordered_file(
         "published authorized blockd input changed"
     );
     Ok(())
+}
+
+#[cfg(test)]
+fn pause_authorized_publication_for_process_kill(target_name: &str, phase: &str) {
+    let Ok(requested) = std::env::var("CATS_AUTHORIZED_BLOCKD_KILL_POINT") else {
+        return;
+    };
+    if requested != format!("{target_name}:{phase}") {
+        return;
+    }
+    let marker = std::env::var("CATS_AUTHORIZED_BLOCKD_KILL_MARKER")
+        .expect("authorized blockd kill probe marker path");
+    std::fs::write(marker, requested.as_bytes()).expect("write authorized blockd kill marker");
+    loop {
+        std::thread::park_timeout(std::time::Duration::from_secs(60));
+    }
 }
 
 fn read_optional_bounded(

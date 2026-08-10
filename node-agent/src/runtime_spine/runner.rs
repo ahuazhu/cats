@@ -53,6 +53,24 @@ pub trait RuntimeInventoryScanner:
     ) -> anyhow::Result<RuntimeInventoryScanOutcome>;
 }
 
+/// Performs at most one explicitly typed local publication repair before a
+/// physical inventory scan. Unlike [`RuntimeInventoryScanner`], this port may
+/// mutate only crash-recovery artifacts that are exactly bound to the current
+/// durable Desired snapshot. Returning `Recovered` forces the runner to start
+/// a new iteration; repaired state is never projected without a fresh scan.
+pub(crate) trait RuntimePreScanRecovery: Send + Sync + 'static {
+    fn recover_one(
+        &self,
+        context: RuntimePreScanRecoveryContext,
+    ) -> anyhow::Result<RuntimePreScanRecoveryOutcome>;
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum RuntimePreScanRecoveryOutcome {
+    NoChange,
+    Recovered { cat_id: Id },
+}
+
 /// Executes one bounded, typed reconciliation unit for an exact fresh Desired
 /// spec after restart admission has been re-established.
 ///
@@ -164,6 +182,72 @@ pub struct RuntimeDesiredEffectContext {
     deadline: Instant,
     cancellation: RuntimeInventoryScanCancellation,
     accepted_full: Option<RuntimeDesiredEffectAdmission>,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct RuntimePreScanRecoveryContext {
+    state_directory: StateDirectory,
+    coordinates: RuntimeSpineFullScan,
+    deadline: Instant,
+    cancellation: RuntimeInventoryScanCancellation,
+}
+
+impl RuntimePreScanRecoveryContext {
+    fn new(
+        state_directory: StateDirectory,
+        coordinates: RuntimeSpineFullScan,
+        deadline: Instant,
+        cancellation: RuntimeInventoryScanCancellation,
+    ) -> Self {
+        Self {
+            state_directory,
+            coordinates,
+            deadline,
+            cancellation,
+        }
+    }
+
+    pub(crate) fn state_directory(&self) -> &StateDirectory {
+        &self.state_directory
+    }
+
+    pub(crate) fn coordinates(&self) -> &RuntimeSpineFullScan {
+        &self.coordinates
+    }
+
+    pub(crate) fn check_active(&self) -> anyhow::Result<()> {
+        anyhow::ensure!(
+            !self.cancellation.is_cancelled(),
+            "runtime pre-scan recovery was cancelled"
+        );
+        anyhow::ensure!(
+            Instant::now() < self.deadline,
+            "runtime pre-scan recovery deadline expired"
+        );
+        Ok(())
+    }
+
+    pub(crate) fn inventory_context(&self) -> RuntimeInventoryScanContext {
+        RuntimeInventoryScanContext::new(
+            self.coordinates.clone(),
+            self.deadline,
+            self.cancellation.clone(),
+        )
+    }
+
+    #[cfg(test)]
+    pub(crate) fn for_test(
+        state_directory: StateDirectory,
+        coordinates: RuntimeSpineFullScan,
+        deadline: Instant,
+    ) -> Self {
+        Self::new(
+            state_directory,
+            coordinates,
+            deadline,
+            RuntimeInventoryScanCancellation::new(),
+        )
+    }
 }
 
 /// The exact current-process full inventory acceptance that opened the one
@@ -530,6 +614,11 @@ pub enum RuntimeSpineRunStep {
     /// It repairs an ambiguous result but cannot establish restart admission
     /// or local readiness without a new physical scan.
     ObservationReplayed,
+    /// One exact local crash-publication artifact was repaired. The next
+    /// iteration must perform recovery classification again before scanning.
+    PreScanRecovered {
+        cat_id: Id,
+    },
     EffectApplied {
         cat_id: Id,
     },
@@ -575,6 +664,8 @@ pub enum RuntimeSpineRunStep {
         unavailable_sources: Vec<InventorySource>,
     },
     ScanDeadlineExceeded,
+    PreScanRecoveryUnavailable(anyhow::Error),
+    PreScanRecoveryDeadlineExceeded,
     EffectUnavailable {
         cat_id: Id,
         error: anyhow::Error,
@@ -612,6 +703,8 @@ pub enum RuntimeSpineRunError {
     WorkerShutdown(String),
     #[error("runtime-spine scanner returned an invalid outcome: {0}")]
     InvalidScan(&'static str),
+    #[error("runtime-spine worker composition is invalid: {0}")]
+    InvalidComposition(&'static str),
 }
 
 enum PendingWork {
@@ -991,9 +1084,13 @@ impl Drop for ScanLane {
 
 enum EffectCommand {
     Apply {
-        context: RuntimeDesiredEffectContext,
-        desired: DesiredRuntimeSpec,
+        context: Box<RuntimeDesiredEffectContext>,
+        desired: Box<DesiredRuntimeSpec>,
         reply: tokio::sync::oneshot::Sender<anyhow::Result<RuntimeDesiredEffectOutcome>>,
+    },
+    Recover {
+        context: Box<RuntimePreScanRecoveryContext>,
+        reply: tokio::sync::oneshot::Sender<anyhow::Result<RuntimePreScanRecoveryOutcome>>,
     },
 }
 
@@ -1007,31 +1104,53 @@ struct EffectLane {
     sender: Option<mpsc::SyncSender<EffectCommand>>,
     thread: Option<std::thread::JoinHandle<()>>,
     state: Arc<EffectLaneState>,
+    has_recovery: bool,
 }
 
 impl EffectLane {
-    fn start(effect: Arc<dyn RuntimeDesiredEffect>) -> Result<Self, RuntimeSpineRunError> {
+    fn start(
+        effect: Arc<dyn RuntimeDesiredEffect>,
+        recovery: Option<Arc<dyn RuntimePreScanRecovery>>,
+    ) -> Result<Self, RuntimeSpineRunError> {
         let (sender, receiver) = mpsc::sync_channel(1);
         let state = Arc::new(EffectLaneState::default());
         let worker_state = Arc::clone(&state);
+        let has_recovery = recovery.is_some();
         let thread = std::thread::Builder::new()
             .name("cats-runtime-spine-effect".to_owned())
             .spawn(move || {
-                while let Ok(EffectCommand::Apply {
-                    context,
-                    desired,
-                    reply,
-                }) = receiver.recv()
-                {
-                    let result = if context.check_active().is_ok() {
-                        effect.apply(context, &desired)
-                    } else {
-                        Err(anyhow::anyhow!(
-                            "runtime Desired effect was cancelled before execution"
-                        ))
-                    };
-                    active_effect(&worker_state.active).take();
-                    let _ = reply.send(result);
+                while let Ok(command) = receiver.recv() {
+                    match command {
+                        EffectCommand::Apply {
+                            context,
+                            desired,
+                            reply,
+                        } => {
+                            let result = if context.check_active().is_ok() {
+                                effect.apply(*context, &desired)
+                            } else {
+                                Err(anyhow::anyhow!(
+                                    "runtime Desired effect was cancelled before execution"
+                                ))
+                            };
+                            active_effect(&worker_state.active).take();
+                            let _ = reply.send(result);
+                        }
+                        EffectCommand::Recover { context, reply } => {
+                            let result = if context.check_active().is_ok() {
+                                recovery.as_ref().map_or_else(
+                                    || Ok(RuntimePreScanRecoveryOutcome::NoChange),
+                                    |recovery| recovery.recover_one(*context),
+                                )
+                            } else {
+                                Err(anyhow::anyhow!(
+                                    "runtime pre-scan recovery was cancelled before execution"
+                                ))
+                            };
+                            active_effect(&worker_state.active).take();
+                            let _ = reply.send(result);
+                        }
+                    }
                 }
             })
             .map_err(|source| RuntimeSpineRunError::WorkerStart {
@@ -1042,7 +1161,81 @@ impl EffectLane {
             sender: Some(sender),
             thread: Some(thread),
             state,
+            has_recovery,
         })
+    }
+
+    fn has_recovery(&self) -> bool {
+        self.has_recovery
+    }
+
+    async fn recover(
+        &self,
+        state_directory: StateDirectory,
+        coordinates: RuntimeSpineFullScan,
+        deadline: Instant,
+    ) -> Result<RecoveryWait, RuntimeSpineRunError> {
+        if self.state.poisoned.load(Ordering::Acquire) {
+            return Err(RuntimeSpineRunError::EffectLanePoisoned);
+        }
+        if Instant::now() >= deadline {
+            return Ok(RecoveryWait::DeadlineExceeded);
+        }
+        let cancellation = RuntimeInventoryScanCancellation::new();
+        let context = RuntimePreScanRecoveryContext::new(
+            state_directory,
+            coordinates,
+            deadline,
+            cancellation.clone(),
+        );
+        {
+            let mut active = active_effect(&self.state.active);
+            if active.is_some() {
+                return Err(RuntimeSpineRunError::EffectQueueFull);
+            }
+            *active = Some(cancellation.clone());
+        }
+        let (reply, received) = tokio::sync::oneshot::channel();
+        let command = EffectCommand::Recover {
+            context: Box::new(context),
+            reply,
+        };
+        let send_result = self
+            .sender
+            .as_ref()
+            .ok_or_else(|| RuntimeSpineRunError::WorkerStopped("pre-scan recovery".to_owned()))?
+            .try_send(command);
+        if let Err(error) = send_result {
+            active_effect(&self.state.active).take();
+            return match error {
+                mpsc::TrySendError::Full(_) => Err(RuntimeSpineRunError::EffectQueueFull),
+                mpsc::TrySendError::Disconnected(_) => Err(RuntimeSpineRunError::WorkerStopped(
+                    "pre-scan recovery".to_owned(),
+                )),
+            };
+        }
+
+        let mut guard = ActiveEffectGuard {
+            cancellation,
+            state: Arc::clone(&self.state),
+            armed: true,
+        };
+        match receive_effect_result_until(received, deadline).await {
+            EffectReceive::Delivered(result) => {
+                guard.disarm();
+                Ok(RecoveryWait::Finished(result))
+            }
+            EffectReceive::Closed => {
+                guard.poison();
+                Err(RuntimeSpineRunError::WorkerStopped(
+                    "pre-scan recovery".to_owned(),
+                ))
+            }
+            EffectReceive::DeadlineExceeded => {
+                guard.poison();
+                Ok(RecoveryWait::DeadlineExceeded)
+            }
+        }
     }
 
     async fn apply(
@@ -1074,8 +1267,8 @@ impl EffectLane {
         }
         let (reply, received) = tokio::sync::oneshot::channel();
         let command = EffectCommand::Apply {
-            context,
-            desired,
+            context: Box::new(context),
+            desired: Box::new(desired),
             reply,
         };
         let send_result = self
@@ -1158,8 +1351,13 @@ enum EffectWait {
     DeadlineExceeded,
 }
 
-enum EffectReceive {
-    Delivered(anyhow::Result<RuntimeDesiredEffectOutcome>),
+enum RecoveryWait {
+    Finished(anyhow::Result<RuntimePreScanRecoveryOutcome>),
+    DeadlineExceeded,
+}
+
+enum EffectReceive<T> {
+    Delivered(anyhow::Result<T>),
     Closed,
     DeadlineExceeded,
 }
@@ -1168,10 +1366,10 @@ enum EffectReceive {
 /// explicit winner when both are ready. The final `try_recv` closes the small
 /// scheduler window between the deadline branch becoming ready and it being
 /// selected; a result not yet delivered at that point remains unknown.
-async fn receive_effect_result_until(
-    mut received: tokio::sync::oneshot::Receiver<anyhow::Result<RuntimeDesiredEffectOutcome>>,
+async fn receive_effect_result_until<T>(
+    mut received: tokio::sync::oneshot::Receiver<anyhow::Result<T>>,
     deadline: Instant,
-) -> EffectReceive {
+) -> EffectReceive<T> {
     let timer = tokio::time::sleep_until(tokio::time::Instant::from_std(deadline));
     tokio::pin!(timer);
     tokio::select! {
@@ -1314,7 +1512,14 @@ impl RuntimeSpineRunner {
         client: RuntimeSpineHttpClient,
         scanner: Arc<dyn RuntimeInventoryScanner>,
     ) -> Result<Self, RuntimeSpineRunError> {
-        Self::new_inner(state_directory, registered_session, client, scanner, None)
+        Self::new_inner(
+            state_directory,
+            registered_session,
+            client,
+            scanner,
+            None,
+            None,
+        )
     }
 
     /// Production composition with the only typed Desired-to-effect seam.
@@ -1333,6 +1538,27 @@ impl RuntimeSpineRunner {
             client,
             scanner,
             Some(effect),
+            None,
+        )
+    }
+
+    /// Production composition with a serialized, typed local publication
+    /// recovery step before each physical scan.
+    pub(crate) fn new_with_recovery_and_desired_effects(
+        state_directory: StateDirectory,
+        registered_session: AgentSession,
+        client: RuntimeSpineHttpClient,
+        scanner: Arc<dyn RuntimeInventoryScanner>,
+        recovery: Arc<dyn RuntimePreScanRecovery>,
+        effect: Arc<dyn RuntimeDesiredEffect>,
+    ) -> Result<Self, RuntimeSpineRunError> {
+        Self::new_inner(
+            state_directory,
+            registered_session,
+            client,
+            scanner,
+            Some(effect),
+            Some(recovery),
         )
     }
 
@@ -1342,12 +1568,20 @@ impl RuntimeSpineRunner {
         client: RuntimeSpineHttpClient,
         scanner: Arc<dyn RuntimeInventoryScanner>,
         effect: Option<Arc<dyn RuntimeDesiredEffect>>,
+        recovery: Option<Arc<dyn RuntimePreScanRecovery>>,
     ) -> Result<Self, RuntimeSpineRunError> {
         // Start the non-authoritative scanner first. If acquiring the journal
         // flock then fails, the effect and ScanLane Drops join the already
         // started threads before this constructor returns.
         let scan_lane = ScanLane::start(scanner)?;
-        let effect_lane = effect.map(EffectLane::start).transpose()?;
+        if recovery.is_some() && effect.is_none() {
+            return Err(RuntimeSpineRunError::InvalidComposition(
+                "pre-scan recovery requires the serialized Desired mutation lane",
+            ));
+        }
+        let effect_lane = effect
+            .map(|effect| EffectLane::start(effect, recovery))
+            .transpose()?;
         let journal_lane = JournalLane::start(state_directory.clone(), registered_session.clone())?;
         Ok(Self {
             state_directory,
@@ -1387,6 +1621,32 @@ impl RuntimeSpineRunner {
             PendingWork::Desired(request) => self.send_desired(request).await,
             PendingWork::Observation(request) => self.send_observation(request).await,
             PendingWork::Scan(scan) => {
+                if self
+                    .effect_lane
+                    .as_ref()
+                    .is_some_and(EffectLane::has_recovery)
+                {
+                    match self
+                        .effect_lane()?
+                        .recover(
+                            self.state_directory.clone(),
+                            scan.clone(),
+                            deadlines.effect_step,
+                        )
+                        .await?
+                    {
+                        RecoveryWait::Finished(Ok(RuntimePreScanRecoveryOutcome::Recovered {
+                            cat_id,
+                        })) => return Ok(RuntimeSpineRunStep::PreScanRecovered { cat_id }),
+                        RecoveryWait::Finished(Ok(RuntimePreScanRecoveryOutcome::NoChange)) => {}
+                        RecoveryWait::Finished(Err(error)) => {
+                            return Ok(RuntimeSpineRunStep::PreScanRecoveryUnavailable(error));
+                        }
+                        RecoveryWait::DeadlineExceeded => {
+                            return Ok(RuntimeSpineRunStep::PreScanRecoveryDeadlineExceeded);
+                        }
+                    }
+                }
                 let coordinates = scan.clone();
                 let outcome = match self
                     .scan_lane()?
@@ -1972,6 +2232,27 @@ mod tests {
         calls: AtomicUsize,
     }
 
+    struct SequencedRecovery {
+        calls: AtomicUsize,
+    }
+
+    impl RuntimePreScanRecovery for SequencedRecovery {
+        fn recover_one(
+            &self,
+            context: RuntimePreScanRecoveryContext,
+        ) -> anyhow::Result<RuntimePreScanRecoveryOutcome> {
+            context.check_active()?;
+            let call = self.calls.fetch_add(1, Ordering::SeqCst);
+            if call == 0 {
+                Ok(RuntimePreScanRecoveryOutcome::Recovered {
+                    cat_id: Id::new("cat_recovered").unwrap(),
+                })
+            } else {
+                Ok(RuntimePreScanRecoveryOutcome::NoChange)
+            }
+        }
+    }
+
     struct NonCooperativeEffect {
         calls: AtomicUsize,
         delay: Duration,
@@ -2033,6 +2314,62 @@ mod tests {
             self.calls.fetch_add(1, Ordering::SeqCst);
             Ok(RuntimeDesiredEffectOutcome::Applied)
         }
+    }
+
+    #[tokio::test]
+    async fn typed_pre_scan_recovery_is_serialized_on_the_mutation_lane() {
+        let effect = Arc::new(CountingEffect {
+            calls: AtomicUsize::new(0),
+        });
+        let recovery = Arc::new(SequencedRecovery {
+            calls: AtomicUsize::new(0),
+        });
+        let recovery_port: Arc<dyn RuntimePreScanRecovery> = recovery.clone();
+        let mut lane = EffectLane::start(effect.clone(), Some(recovery_port)).unwrap();
+        let snapshot = decode_desired_read_snapshot(SNAPSHOT).unwrap();
+        let coordinates = RuntimeSpineFullScan {
+            session: snapshot.session.clone(),
+            heartbeat_sequence: Sequence::new(1).unwrap(),
+            inventory_epoch: Epoch::new(1).unwrap(),
+            desired: snapshot,
+        };
+        let root = tempfile::tempdir().unwrap();
+        assert!(matches!(
+            lane.recover(
+                StateDirectory::unanchored(root.path().to_path_buf()),
+                coordinates.clone(),
+                Instant::now(),
+            )
+            .await
+            .unwrap(),
+            RecoveryWait::DeadlineExceeded
+        ));
+        assert_eq!(recovery.calls.load(Ordering::SeqCst), 0);
+        let RecoveryWait::Finished(Ok(RuntimePreScanRecoveryOutcome::Recovered { cat_id })) = lane
+            .recover(
+                StateDirectory::unanchored(root.path().to_path_buf()),
+                coordinates.clone(),
+                Instant::now() + Duration::from_secs(2),
+            )
+            .await
+            .unwrap()
+        else {
+            panic!("first recovery command did not return its typed repair")
+        };
+        assert_eq!(cat_id, Id::new("cat_recovered").unwrap());
+        assert!(matches!(
+            lane.recover(
+                StateDirectory::unanchored(root.path().to_path_buf()),
+                coordinates,
+                Instant::now() + Duration::from_secs(2),
+            )
+            .await
+            .unwrap(),
+            RecoveryWait::Finished(Ok(RuntimePreScanRecoveryOutcome::NoChange))
+        ));
+        assert_eq!(recovery.calls.load(Ordering::SeqCst), 2);
+        assert_eq!(effect.calls.load(Ordering::SeqCst), 0);
+        lane.shutdown_blocking().unwrap();
     }
 
     impl RuntimeDesiredEffect for DecisionEffect {
