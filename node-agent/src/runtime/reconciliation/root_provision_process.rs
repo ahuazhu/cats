@@ -56,7 +56,7 @@ pub(crate) mod target_start_sealed {
 }
 
 pub(crate) trait RootProvisionProcessGlobalPort:
-    global_sealed::Sealed + Send + Sync
+    global_sealed::Sealed + RootProvisionProcessRetirementPort + Send + Sync
 {
     fn inspect_exact_or_absent_after_node_global_sweep(
         &self,

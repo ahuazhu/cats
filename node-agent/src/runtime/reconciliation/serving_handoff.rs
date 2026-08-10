@@ -413,6 +413,13 @@ pub(crate) enum ReopenedServingHandoff {
     Exact(Box<ServingHandoffReady>),
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ServingHandoffRetirementState {
+    None,
+    CurrentAttempt,
+    DirectPredecessor,
+}
+
 impl TargetControlAuthorizationReady {
     pub(crate) fn identity(&self) -> &TargetControlAuthorizationIdentity {
         &self.identity
@@ -624,6 +631,94 @@ impl ServingHandoffStore {
         };
         ready.assert_current(stored_checkpoint)?;
         Ok(ReopenedServingHandoff::Exact(Box::new(ready)))
+    }
+
+    /// Classify the durable retirement receipt under the same retained
+    /// attachment and target descriptors used to reopen the handoff. A
+    /// current-attempt receipt prevents all process starts until its record
+    /// unlink is durable and a strictly successor full admission rotates the
+    /// attempt token. A direct-predecessor receipt is accepted only after that
+    /// exact token-only checkpoint replacement.
+    pub(crate) fn classify_retirement_state(
+        &self,
+        stored_checkpoint: &StoredCheckpoint,
+        acquired: &AuthorizedBlockdCheckpoint,
+        authority: &ServingAuthorityTargetEvidence,
+        target_ready: &TargetControlAuthorizationReady,
+    ) -> Result<ServingHandoffRetirementState> {
+        target_ready.assert_current(stored_checkpoint)?;
+        anyhow::ensure!(
+            self.state_directory.path() == target_ready.retained.state_directory.path(),
+            "retirement receipt classification uses another Node state directory"
+        );
+        let candidate = build_target_candidate(
+            &self.state_directory,
+            stored_checkpoint,
+            acquired,
+            authority,
+        )?;
+        anyhow::ensure!(
+            target_ready.identity.artifact.attachment == candidate.target_attachment,
+            "retirement receipt classification changed target authority"
+        );
+        ensure_no_unpublished_handoff_temp(
+            &target_ready.retained.attachment_directory,
+            &target_control_temp_name(&candidate.provision_transition_id),
+        )?;
+        let receipt_name = c_string(SERVING_HANDOFF_RETIREMENT_FILE)?;
+        let Some(receipt_bytes) = read_optional_bounded(
+            &target_ready.retained.attachment_directory,
+            &receipt_name,
+            SERVING_HANDOFF_RETIREMENT_MAX_BYTES,
+        )?
+        else {
+            return Ok(ServingHandoffRetirementState::None);
+        };
+        let receipt_path = host_path(
+            &candidate
+                .data_directory
+                .join(SERVING_HANDOFF_RETIREMENT_FILE),
+            "classified serving handoff retirement receipt path",
+        )?;
+        let retained_receipt = RetainedFile::open_required(
+            &target_ready.retained.attachment_directory,
+            SERVING_HANDOFF_RETIREMENT_FILE,
+            receipt_path.clone(),
+            SERVING_HANDOFF_RETIREMENT_MAX_BYTES,
+        )?;
+        anyhow::ensure!(
+            retained_receipt.bytes == receipt_bytes,
+            "serving handoff retirement receipt changed during classification"
+        );
+        let receipt = decode_serving_handoff_retirement_receipt(&receipt_bytes)?;
+        let state = if receipt.old_checkpoint_content_digest == *stored_checkpoint.content_digest()
+            && receipt.old_checkpoint == *stored_checkpoint.checkpoint()
+        {
+            validate_receipt_for_current_attempt(
+                &receipt,
+                stored_checkpoint,
+                acquired,
+                &candidate,
+            )?;
+            ServingHandoffRetirementState::CurrentAttempt
+        } else {
+            validate_receipt_as_direct_predecessor(
+                &receipt,
+                stored_checkpoint,
+                acquired,
+                &candidate,
+            )?;
+            ServingHandoffRetirementState::DirectPredecessor
+        };
+        validate_receipt_target_binding(
+            &receipt,
+            &target_ready.identity.artifact,
+            &target_ready.retained_target,
+        )?;
+        retained_receipt
+            .assert_current(&target_ready.retained.attachment_directory, &receipt_path)?;
+        target_ready.assert_current(stored_checkpoint)?;
+        Ok(state)
     }
 
     /// Serialized pre-scan recovery for one deterministic unpublished temp.
@@ -1380,6 +1475,15 @@ impl ServingHandoffStore {
                 && provision_root_image_request(&successor)? == target_artifact.request,
             "process token rotation changed the stable target-control authorization context"
         );
+        // A crash after unlink but before the retirement directory fsync can
+        // reopen with an absent record and the already durable receipt. The
+        // strictly successor full admission above is the only authority to
+        // continue; re-establish the unlink durability barrier before the
+        // token-only checkpoint replacement makes a new attempt possible.
+        retained
+            .attachment_directory
+            .sync_all()
+            .context("sync retired handoff before process-token rotation")?;
         retained_target.assert_current(
             &retained.attachment_directory,
             &retained_target.identity.path,
@@ -3656,12 +3760,9 @@ mod tests {
         calls: AtomicUsize,
     }
 
-    impl root_process_global_sealed::Sealed for EffectGlobalProcessPort {}
-
-    impl RootProvisionProcessGlobalPort for EffectGlobalProcessPort {
-        fn inspect_exact_or_absent_after_node_global_sweep(
+    impl EffectGlobalProcessPort {
+        fn inspect_one(
             &self,
-            _expected: &RootProvisionProcessExpectation,
             context: &dyn RuntimePhysicalReadContext,
         ) -> Result<RootProvisionProcessInspection> {
             context.check_active()?;
@@ -3672,6 +3773,29 @@ mod tests {
                 .unwrap()
                 .pop_front()
                 .unwrap_or(RootProvisionProcessInspection::Unavailable))
+        }
+    }
+
+    impl root_process_global_sealed::Sealed for EffectGlobalProcessPort {}
+    impl root_process_retirement_sealed::Sealed for EffectGlobalProcessPort {}
+
+    impl RootProvisionProcessRetirementPort for EffectGlobalProcessPort {
+        fn inspect_after_node_global_sweep(
+            &self,
+            _expected: &RootProvisionProcessExpectation,
+            context: &dyn RuntimePhysicalReadContext,
+        ) -> Result<RootProvisionProcessInspection> {
+            self.inspect_one(context)
+        }
+    }
+
+    impl RootProvisionProcessGlobalPort for EffectGlobalProcessPort {
+        fn inspect_exact_or_absent_after_node_global_sweep(
+            &self,
+            _expected: &RootProvisionProcessExpectation,
+            context: &dyn RuntimePhysicalReadContext,
+        ) -> Result<RootProvisionProcessInspection> {
+            self.inspect_one(context)
         }
     }
 
@@ -3687,6 +3811,18 @@ mod tests {
     }
 
     impl root_process_global_sealed::Sealed for AuthorityDriftingGlobalPort {}
+    impl root_process_retirement_sealed::Sealed for AuthorityDriftingGlobalPort {}
+
+    impl RootProvisionProcessRetirementPort for AuthorityDriftingGlobalPort {
+        fn inspect_after_node_global_sweep(
+            &self,
+            _expected: &RootProvisionProcessExpectation,
+            context: &dyn RuntimePhysicalReadContext,
+        ) -> Result<RootProvisionProcessInspection> {
+            context.check_active()?;
+            Ok(RootProvisionProcessInspection::Unavailable)
+        }
+    }
 
     impl RootProvisionProcessGlobalPort for AuthorityDriftingGlobalPort {
         fn inspect_exact_or_absent_after_node_global_sweep(
@@ -4615,6 +4751,244 @@ mod tests {
             blank_inode
         );
         assert_eq!(authority.loads.load(Ordering::SeqCst), 8);
+    }
+
+    #[test]
+    fn sealed_handoff_process_exit_enters_durable_retirement_before_any_restart() {
+        let fixture = fixture();
+        drop(
+            fixture
+                .store()
+                .seal_serving_ready(
+                    &fixture.stored_checkpoint,
+                    &fixture.acquired,
+                    &fixture.authority,
+                    &fixture.exact_process_proof().unwrap(),
+                )
+                .unwrap(),
+        );
+        let global = Arc::new(EffectGlobalProcessPort {
+            inspections: Mutex::new([RootProvisionProcessInspection::Absent].into()),
+            calls: AtomicUsize::new(0),
+        });
+        let target_process = Arc::new(EffectTargetProcessPort {
+            starts: AtomicUsize::new(0),
+            evidence: fixture.process.clone(),
+            outcome: EffectTargetProcessOutcome::Started,
+        });
+        let effect = ServingHandoffEffect::new(
+            Arc::new(FixedEffectAuthority::new(fixture.authority.volume.clone())),
+            Arc::new(exact_manifest_blob(&fixture)),
+            global,
+            target_process.clone(),
+            fixture.expected_executable_path.clone(),
+        )
+        .unwrap();
+
+        assert!(matches!(
+            effect
+                .try_apply(&absent_effect_context(&fixture), &fixture.acquired.desired)
+                .unwrap(),
+            ServingHandoffEffectProgress::RefreshInventory
+        ));
+        assert!(!fixture.record_path().exists());
+        assert!(fixture.retirement_path().exists());
+        assert_eq!(target_process.starts.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn retirement_receipt_blocks_restart_until_successor_rotation_then_reseals() {
+        let mut fixture = fixture();
+        drop(
+            fixture
+                .store()
+                .seal_serving_ready(
+                    &fixture.stored_checkpoint,
+                    &fixture.acquired,
+                    &fixture.authority,
+                    &fixture.exact_process_proof().unwrap(),
+                )
+                .unwrap(),
+        );
+        let old_checkpoint = fixture.stored_checkpoint.checkpoint().clone();
+        let old_process = fixture
+            .exact_process_proof()
+            .unwrap()
+            .into_process_evidence();
+        let authority = Arc::new(FixedEffectAuthority::new(fixture.authority.volume.clone()));
+        let retirement_global = Arc::new(EffectGlobalProcessPort {
+            inspections: Mutex::new(
+                [
+                    RootProvisionProcessInspection::Absent,
+                    RootProvisionProcessInspection::Absent,
+                    RootProvisionProcessInspection::Absent,
+                ]
+                .into(),
+            ),
+            calls: AtomicUsize::new(0),
+        });
+        let forbidden_start = Arc::new(EffectTargetProcessPort {
+            starts: AtomicUsize::new(0),
+            evidence: fixture.process.clone(),
+            outcome: EffectTargetProcessOutcome::Started,
+        });
+        let retirement_effect = ServingHandoffEffect::new(
+            authority.clone(),
+            Arc::new(exact_manifest_blob(&fixture)),
+            retirement_global.clone(),
+            forbidden_start.clone(),
+            fixture.expected_executable_path.clone(),
+        )
+        .unwrap();
+
+        assert!(matches!(
+            retirement_effect
+                .try_apply(&absent_effect_context(&fixture), &fixture.acquired.desired)
+                .unwrap(),
+            ServingHandoffEffectProgress::RefreshInventory
+        ));
+        assert!(fixture.retirement_path().exists());
+        assert!(!fixture.record_path().exists());
+
+        let same_admission = retirement_effect
+            .try_apply(&absent_effect_context(&fixture), &fixture.acquired.desired)
+            .unwrap_err();
+        assert!(
+            same_admission.to_string().contains("strictly successor"),
+            "same retirement admission was not rejected: {same_admission:#}"
+        );
+        assert_eq!(forbidden_start.starts.load(Ordering::SeqCst), 0);
+        assert_eq!(
+            FileCheckpointStore::open(
+                &fixture.checkpoint_directory,
+                &fixture.acquired.desired.cat_id,
+            )
+            .unwrap()
+            .load()
+            .unwrap()
+            .unwrap()
+            .checkpoint(),
+            &old_checkpoint
+        );
+
+        // A restarted Agent with a strictly later accepted full may perform
+        // only the token/timestamp replacement. The durable current-attempt
+        // receipt still forbids a process start in this round.
+        assert!(matches!(
+            retirement_effect
+                .try_apply(
+                    &restarted_absent_effect_context(&fixture),
+                    &fixture.acquired.desired,
+                )
+                .unwrap(),
+            ServingHandoffEffectProgress::RefreshInventory
+        ));
+        assert_eq!(forbidden_start.starts.load(Ordering::SeqCst), 0);
+        assert_eq!(retirement_global.calls.load(Ordering::SeqCst), 3);
+        let checkpoint_store = FileCheckpointStore::open(
+            &fixture.checkpoint_directory,
+            &fixture.acquired.desired.cat_id,
+        )
+        .unwrap();
+        let rotated = checkpoint_store.load().unwrap().unwrap();
+        let ReconcileStep::ProvisionRootImage {
+            process_identity_token: new_token,
+            ..
+        } = &rotated.checkpoint().step
+        else {
+            unreachable!()
+        };
+        let new_token = new_token.clone();
+        let mut expected_rotated = old_checkpoint.clone();
+        let ReconcileStep::ProvisionRootImage {
+            process_identity_token,
+            ..
+        } = &mut expected_rotated.step
+        else {
+            unreachable!()
+        };
+        *process_identity_token = new_token.clone();
+        expected_rotated.updated_at_unix_ms = rotated.checkpoint().updated_at_unix_ms;
+        assert_eq!(rotated.checkpoint(), &expected_rotated);
+        fixture.stored_checkpoint = rotated;
+        drop(checkpoint_store);
+
+        // A late old process still carrying the retired token cannot be
+        // rebound to the successor checkpoint or trigger a start/reseal.
+        assert!(retirement_effect
+            .try_apply(
+                &effect_context_with_processes(&fixture, vec![old_process]),
+                &fixture.acquired.desired,
+            )
+            .is_err());
+        assert_eq!(forbidden_start.starts.load(Ordering::SeqCst), 0);
+        assert!(!fixture.record_path().exists());
+
+        fixture.process.ownership_token = new_token.clone();
+        fixture.process.handshake.process_identity_token = new_token;
+        let exact = fixture.process.clone();
+        let converge_global = Arc::new(EffectGlobalProcessPort {
+            inspections: Mutex::new(
+                [
+                    RootProvisionProcessInspection::Absent,
+                    RootProvisionProcessInspection::Exact(Box::new(exact.clone())),
+                    RootProvisionProcessInspection::Exact(Box::new(exact)),
+                ]
+                .into(),
+            ),
+            calls: AtomicUsize::new(0),
+        });
+        let target_process = Arc::new(EffectTargetProcessPort {
+            starts: AtomicUsize::new(0),
+            evidence: fixture.process.clone(),
+            outcome: EffectTargetProcessOutcome::ResponseLost,
+        });
+        let converge_effect = ServingHandoffEffect::new(
+            authority,
+            Arc::new(exact_manifest_blob(&fixture)),
+            converge_global.clone(),
+            target_process.clone(),
+            fixture.expected_executable_path.clone(),
+        )
+        .unwrap();
+
+        assert!(matches!(
+            converge_effect
+                .try_apply(
+                    &successor_absent_effect_context(&fixture),
+                    &fixture.acquired.desired,
+                )
+                .unwrap(),
+            ServingHandoffEffectProgress::RefreshInventory
+        ));
+        assert_eq!(target_process.starts.load(Ordering::SeqCst), 1);
+        assert!(!fixture.record_path().exists());
+        let process = fixture
+            .exact_process_proof()
+            .unwrap()
+            .into_process_evidence();
+        assert!(matches!(
+            converge_effect
+                .try_apply(
+                    &effect_context_with_processes(&fixture, vec![process.clone()]),
+                    &fixture.acquired.desired,
+                )
+                .unwrap(),
+            ServingHandoffEffectProgress::RefreshInventory
+        ));
+        assert!(fixture.record_path().exists());
+        assert!(fixture.retirement_path().exists());
+        assert!(matches!(
+            converge_effect
+                .try_apply(
+                    &effect_context_with_processes(&fixture, vec![process]),
+                    &fixture.acquired.desired,
+                )
+                .unwrap(),
+            ServingHandoffEffectProgress::Ready(_)
+        ));
+        assert_eq!(target_process.starts.load(Ordering::SeqCst), 1);
+        assert_eq!(converge_global.calls.load(Ordering::SeqCst), 3);
     }
 
     #[test]

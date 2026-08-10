@@ -9,6 +9,7 @@
 
 use std::path::Path;
 use std::sync::Arc;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::Context as _;
 use cats_api::runtime_reconciliation::{
@@ -16,8 +17,9 @@ use cats_api::runtime_reconciliation::{
     ContractVersion, ControlHandshakeEvidence, DesiredRuntimeSpec, DiskKind,
     GuestTransportEvidence, HostPath, LifecycleAdmission, LocalLineageState, ObservedDiskKind,
     ObservedRuntimeStatus, OwnershipTokenEvidence, ProcessRole, ProcessState, ProgressingReason,
-    ReconcileStep, RuntimeTarget, RuntimeTransition, VolumeAccess, VolumeAcquire,
-    VolumeAuthorityEvidence, VolumeDisposition, VolumeIntent, VolumeRecord, WarmSnapshotEvidence,
+    RandomId128, ReconcileStep, RuntimeTarget, RuntimeTransition, UnixMillis, VolumeAccess,
+    VolumeAcquire, VolumeAuthorityEvidence, VolumeDisposition, VolumeIntent, VolumeRecord,
+    WarmSnapshotEvidence,
 };
 use cats_storage::authority::{
     validate_volume_record, AttachmentLineageIdentity, VolumeDataAuthority,
@@ -35,7 +37,8 @@ use super::root_provision_process::{
 };
 use super::serving_handoff::{
     ReopenedServingHandoff, ReopenedTargetControlAuthorization, ServingAuthorityTargetEvidence,
-    ServingHandoffReady, ServingHandoffStore, TargetControlAuthorizationReady,
+    ServingHandoffReady, ServingHandoffRetirementState, ServingHandoffStore,
+    TargetControlAuthorizationReady,
 };
 use super::signed_running::{
     expected_provision_heads, provision_checkpoint_is_bound, ProvisionHeadRead,
@@ -214,9 +217,62 @@ impl ServingHandoffEffect {
             };
         let expectation = base_expectation
             .with_target_control_launch(target_ready.identity().process_launch_identity())?;
+        let retirement =
+            handoff.classify_retirement_state(&stored, &acquired, &authority, &target_ready)?;
 
-        match handoff.reopen_serving_handoff(&stored, *target_ready)? {
-            ReopenedServingHandoff::Exact(ready) => {
+        match (
+            retirement,
+            handoff.reopen_serving_handoff(&stored, *target_ready)?,
+        ) {
+            (
+                ServingHandoffRetirementState::CurrentAttempt,
+                ReopenedServingHandoff::Exact(ready),
+            ) => {
+                drop(ready);
+                self.retire_record(
+                    context,
+                    &checkpoint_store,
+                    &stored,
+                    &acquired,
+                    &first_authority,
+                    &target,
+                    provision_transition_id,
+                    &handoff,
+                )?;
+                Ok(ServingHandoffEffectProgress::RefreshInventory)
+            }
+            (
+                ServingHandoffRetirementState::CurrentAttempt,
+                ReopenedServingHandoff::Absent(target_ready),
+            ) => {
+                drop(target_ready);
+                self.rotate_process_attempt(
+                    context,
+                    &checkpoint_store,
+                    &stored,
+                    &acquired,
+                    &first_authority,
+                    &target,
+                    provision_transition_id,
+                    &handoff,
+                )?;
+                Ok(ServingHandoffEffectProgress::RefreshInventory)
+            }
+            (_, ReopenedServingHandoff::Exact(ready)) if runtime.processes.is_empty() => {
+                drop(ready);
+                self.retire_record(
+                    context,
+                    &checkpoint_store,
+                    &stored,
+                    &acquired,
+                    &first_authority,
+                    &target,
+                    provision_transition_id,
+                    &handoff,
+                )?;
+                Ok(ServingHandoffEffectProgress::RefreshInventory)
+            }
+            (_, ReopenedServingHandoff::Exact(ready)) => {
                 self.reinspect_ready(
                     context,
                     runtime,
@@ -229,7 +285,7 @@ impl ServingHandoffEffect {
                 )?;
                 Ok(ServingHandoffEffectProgress::Ready(ready))
             }
-            ReopenedServingHandoff::Absent(target_ready) if runtime.processes.is_empty() => {
+            (_, ReopenedServingHandoff::Absent(target_ready)) if runtime.processes.is_empty() => {
                 self.start_target_process(
                     context,
                     &checkpoint_store,
@@ -241,7 +297,7 @@ impl ServingHandoffEffect {
                 )?;
                 Ok(ServingHandoffEffectProgress::RefreshInventory)
             }
-            ReopenedServingHandoff::Absent(target_ready) => {
+            (_, ReopenedServingHandoff::Absent(target_ready)) => {
                 self.seal_record(
                     context,
                     runtime,
@@ -258,6 +314,63 @@ impl ServingHandoffEffect {
                 Ok(ServingHandoffEffectProgress::RefreshInventory)
             }
         }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn retire_record(
+        &self,
+        context: &RuntimeDesiredEffectContext,
+        checkpoint_store: &FileCheckpointStore,
+        stored: &super::StoredCheckpoint,
+        acquired: &super::AuthorizedBlockdCheckpoint,
+        first_authority: &VolumeRecord,
+        target: &cats_api::runtime_reconciliation::RemoteHead,
+        provision_transition_id: &RandomId128,
+        handoff: &ServingHandoffStore,
+    ) -> anyhow::Result<()> {
+        let current = self.reread_same_target(context, first_authority, target)?;
+        let authority =
+            ServingAuthorityTargetEvidence::new(provision_transition_id.clone(), current);
+        handoff.retire_record_after_exact_process_absence(
+            checkpoint_store,
+            stored,
+            acquired,
+            &authority,
+            self.executable_path.clone(),
+            self.global_process.as_ref(),
+            context,
+        )?;
+        context.check_active()
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn rotate_process_attempt(
+        &self,
+        context: &RuntimeDesiredEffectContext,
+        checkpoint_store: &FileCheckpointStore,
+        stored: &super::StoredCheckpoint,
+        acquired: &super::AuthorizedBlockdCheckpoint,
+        first_authority: &VolumeRecord,
+        target: &cats_api::runtime_reconciliation::RemoteHead,
+        provision_transition_id: &RandomId128,
+        handoff: &ServingHandoffStore,
+    ) -> anyhow::Result<()> {
+        let current = self.reread_same_target(context, first_authority, target)?;
+        let authority =
+            ServingAuthorityTargetEvidence::new(provision_transition_id.clone(), current);
+        let (token, updated_at) = fresh_process_attempt(stored)?;
+        handoff.rotate_process_token_after_retirement(
+            checkpoint_store,
+            stored,
+            acquired,
+            &authority,
+            self.executable_path.clone(),
+            token,
+            updated_at,
+            self.global_process.as_ref(),
+            context,
+        )?;
+        context.check_active()
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -431,6 +544,39 @@ impl ServingHandoffEffect {
         );
         Ok(current)
     }
+}
+
+fn fresh_process_attempt(
+    stored: &super::StoredCheckpoint,
+) -> anyhow::Result<(RandomId128, UnixMillis)> {
+    let ReconcileStep::ProvisionRootImage {
+        process_identity_token: old_token,
+        ..
+    } = &stored.checkpoint().step
+    else {
+        anyhow::bail!("root-process token rotation requires provision_root_image")
+    };
+    let token = RandomId128::new(uuid::Uuid::new_v4().simple().to_string())
+        .context("generate fresh root-process attempt token")?;
+    anyhow::ensure!(
+        token != *old_token,
+        "fresh root-process attempt token collided with its predecessor"
+    );
+    let wall_clock_ms = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .context("system clock precedes the Unix epoch")?
+        .as_millis();
+    let wall_clock_ms =
+        u64::try_from(wall_clock_ms).context("system time exceeds the Runtime wire range")?;
+    let minimum = stored
+        .checkpoint()
+        .updated_at_unix_ms
+        .get()
+        .checked_add(1)
+        .context("root-process attempt timestamp exhausted")?;
+    let updated_at = UnixMillis::new(wall_clock_ms.max(minimum))
+        .context("root-process attempt timestamp is outside the Runtime wire range")?;
+    Ok((token, updated_at))
 }
 
 fn unique_runtime<'a>(
