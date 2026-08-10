@@ -6031,17 +6031,24 @@ mod tests {
             .unwrap();
         let reader = PagedMetadataAuthorityReader::new(Arc::new(port));
         let first = context_until(Instant::now() + Duration::from_millis(50));
-        assert_eq!(
-            reader
-                .read_candidates(
-                    &Id::new("node_a").unwrap(),
-                    &BTreeSet::new(),
-                    first.deadline(),
-                    &first,
-                )
-                .unwrap(),
-            MetadataAuthorityCandidateInventory::Unavailable
-        );
+        match reader.read_candidates(
+            &Id::new("node_a").unwrap(),
+            &BTreeSet::new(),
+            first.deadline(),
+            &first,
+        ) {
+            Ok(MetadataAuthorityCandidateInventory::Unavailable) => {}
+            Err(error) => assert!(
+                error
+                    .to_string()
+                    .contains("runtime inventory scan deadline expired"),
+                "first read failed for a reason other than its shared deadline: {error:#}"
+            ),
+            Ok(other) => panic!("timed-out first read unexpectedly completed: {other:?}"),
+        }
+        // The first backend call is still sleeping. A successor must fail
+        // immediately at the operation guard rather than overlap it, so its
+        // own shared scan deadline remains active and returns Unavailable.
         let second = context_until(Instant::now() + Duration::from_millis(50));
         assert_eq!(
             reader
