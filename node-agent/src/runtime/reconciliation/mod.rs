@@ -60,6 +60,14 @@ mod root_provision_process;
     reason = "systemd root-provision adapter is staged before signed launch composition"
 )]
 mod systemd_root_provision;
+// StartRuntime consumes one descriptor-retained projection of the installed
+// launcher, VMM and Guest boot bytes.  The physical VMM effect lands in the
+// following composition slice; keep this provider private until then.
+#[expect(
+    dead_code,
+    reason = "fixed VMM launch artifacts are staged before StartRuntime composition"
+)]
+mod vmm_launch_artifacts;
 mod volume_transitions;
 
 pub(crate) mod inventory_probe_sealed {
