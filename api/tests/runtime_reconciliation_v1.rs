@@ -523,6 +523,65 @@ fn prepare_network_checkpoint_value() -> serde_json::Value {
     checkpoint
 }
 
+fn fixed_launch_observation_value(
+    checkpoint_wire: &str,
+    checkpoint_digest: &str,
+) -> serde_json::Value {
+    let checkpoint: serde_json::Value = serde_json::from_str(checkpoint_wire).unwrap();
+    assert!(checkpoint["route_gates"].as_array().unwrap().is_empty());
+    let checkpoint_evidence = serde_json::json!({
+        "kind": "valid",
+        "checkpoint_path": "/var/lib/cats/checkpoints/cat_01.json",
+        "content_digest": checkpoint_digest,
+        "version": checkpoint["version"].clone(),
+        "cat_id": checkpoint["cat_id"].clone(),
+        "node_id": checkpoint["node_id"].clone(),
+        "desired_revision": checkpoint["desired_revision"].clone(),
+        "spec_digest": checkpoint["spec_digest"].clone(),
+        "placement_epoch": checkpoint["placement_epoch"].clone(),
+        "runtime_incarnation": checkpoint["runtime_incarnation"].clone(),
+        "stable_state": checkpoint["stable_state"].clone(),
+        "step": checkpoint["step"].clone(),
+        "require_idle": checkpoint["require_idle"].clone(),
+        "updated_at_unix_ms": checkpoint["updated_at_unix_ms"].clone(),
+    });
+    let runtime = serde_json::json!({
+        "cat_id": checkpoint["cat_id"].clone(),
+        "applied_desired": {
+            "desired_revision": checkpoint["desired_revision"].clone(),
+            "spec_digest": checkpoint["spec_digest"].clone(),
+            "placement": {
+                "kind": "assigned",
+                "node_id": checkpoint["node_id"].clone(),
+                "placement_epoch": checkpoint["placement_epoch"].clone(),
+            },
+            "target": "running",
+        },
+        "runtime_incarnation": checkpoint["runtime_incarnation"].clone(),
+        "stable_state": checkpoint["stable_state"].clone(),
+        "step": checkpoint["step"].clone(),
+        "checkpoint": checkpoint_evidence,
+        "processes": checkpoint["processes"].clone(),
+        "volumes": checkpoint["volumes"].clone(),
+        "mounts": checkpoint["mounts"].clone(),
+        "networks": checkpoint["networks"].clone(),
+        "guest_transport": checkpoint["guest_transport"].clone(),
+        "warm_snapshot": checkpoint["warm_snapshot"].clone(),
+        "lifecycle_admission": checkpoint["lifecycle_admission"].clone(),
+        "routes": [],
+        "platform_guards": 0,
+        "conditions": [],
+    });
+    let mut observation: serde_json::Value = serde_json::from_slice(&complete_observation_wire(
+        EMPTY_INVENTORY_INPUT,
+        "sha256:12c19ac927b853c8f66f6dac52d448d6f2e797925527a0c606c7692b6f714e05",
+    ))
+    .unwrap();
+    observation["runtimes"] = serde_json::json!([runtime]);
+    refresh_inventory_digest(&mut observation);
+    observation
+}
+
 fn set_start_runtime_kernel_device_path(checkpoint: &mut serde_json::Value, device_path: &str) {
     checkpoint["step"]["devices"][0]["frontend"] = serde_json::json!({
         "kind": "kernel_nbd",
@@ -555,6 +614,13 @@ fn direct_prepare_device_step(purpose: &str, head: serde_json::Value) -> serde_j
         },
         "purpose": purpose,
     });
+    step
+}
+
+fn persistent_prepare_device_step(purpose: &str, head: serde_json::Value) -> serde_json::Value {
+    let mut step = direct_prepare_device_step(purpose, head);
+    step["disk_kind"] = "persistent".into();
+    step["guest_device"] = serde_json::json!({"serial": "cats-data", "slot": 1});
     step
 }
 
@@ -2879,6 +2945,95 @@ fn prepare_network_and_start_runtime_round_trip_with_closed_inputs() {
 }
 
 #[test]
+fn fixed_launch_checkpoints_have_exact_node_observation_projections() {
+    for (name, wire, digest) in [
+        (
+            "prepare_network",
+            PREPARE_NETWORK_CHECKPOINT_WIRE.as_ref(),
+            PREPARE_NETWORK_CHECKPOINT_DIGEST,
+        ),
+        (
+            "start_runtime",
+            START_RUNTIME_CHECKPOINT_WIRE.as_ref(),
+            START_RUNTIME_CHECKPOINT_DIGEST,
+        ),
+    ] {
+        let observation = fixed_launch_observation_value(wire, digest);
+        let decoded = decode_node_observation(&serde_json::to_vec(&observation).unwrap())
+            .unwrap_or_else(|error| panic!("{name}: {error:?}"));
+        assert_eq!(
+            serde_json::from_slice::<serde_json::Value>(
+                &encode_node_observation(&decoded).unwrap(),
+            )
+            .unwrap(),
+            observation,
+            "{name}",
+        );
+    }
+}
+
+#[test]
+fn launch_observation_closes_phase_volume_network_and_guest_vmm_siblings() {
+    let mut open_prepare = fixed_launch_observation_value(
+        PREPARE_NETWORK_CHECKPOINT_WIRE.as_ref(),
+        PREPARE_NETWORK_CHECKPOINT_DIGEST,
+    );
+    open_prepare["runtimes"][0]["lifecycle_admission"] = "open".into();
+
+    let mut missing_prepared_volume = fixed_launch_observation_value(
+        PREPARE_NETWORK_CHECKPOINT_WIRE.as_ref(),
+        PREPARE_NETWORK_CHECKPOINT_DIGEST,
+    );
+    missing_prepared_volume["runtimes"][0]["volumes"] = serde_json::json!([]);
+
+    let mut missing_start_network = fixed_launch_observation_value(
+        START_RUNTIME_CHECKPOINT_WIRE.as_ref(),
+        START_RUNTIME_CHECKPOINT_DIGEST,
+    );
+    missing_start_network["runtimes"][0]["networks"] = serde_json::json!([]);
+
+    let mut malformed_guest_without_vmm = fixed_launch_observation_value(
+        START_RUNTIME_CHECKPOINT_WIRE.as_ref(),
+        START_RUNTIME_CHECKPOINT_DIGEST,
+    );
+    malformed_guest_without_vmm["runtimes"][0]["guest_transport"] = serde_json::json!({
+        "kind": "malformed",
+        "raw_response_digest": ZERO_DIGEST,
+    });
+    assert!(malformed_guest_without_vmm["runtimes"][0]["processes"]
+        .as_array()
+        .unwrap()
+        .is_empty());
+
+    for (name, observation, pointer) in [
+        ("phase_envelope", open_prepare, "/runtimes/0"),
+        (
+            "prepared_volume_projection",
+            missing_prepared_volume,
+            "/runtimes/0/volumes",
+        ),
+        (
+            "network_projection",
+            missing_start_network,
+            "/runtimes/0/networks",
+        ),
+        (
+            "guest_vmm_matrix",
+            malformed_guest_without_vmm,
+            "/runtimes/0/guest_transport",
+        ),
+    ] {
+        let error = reject_observation(&serde_json::to_vec(&observation).unwrap());
+        assert_eq!(malformed(&error).0.as_str(), pointer, "{name}");
+        assert_eq!(
+            malformed(&error).1,
+            MalformedProblem::InvalidValue,
+            "{name}",
+        );
+    }
+}
+
+#[test]
 fn fixed_running_launch_chain_preserves_desired_binding_and_prepared_authority() {
     let desired = decode_desired_runtime_spec(SHARED_DESIRED_WIRE.as_bytes()).unwrap();
     assert_eq!(desired.target, RuntimeTarget::Running);
@@ -4108,7 +4263,7 @@ fn prepare_device_step_is_shared_by_every_wire_host() {
 }
 
 #[test]
-fn prepare_device_head_state_is_closed_by_serving_authority_in_every_wire_host() {
+fn prepare_device_head_and_disk_kind_are_closed_by_authority_in_every_wire_host() {
     type Reject = fn(&[u8]) -> ContractError;
 
     let invalid_steps = [
@@ -4184,17 +4339,136 @@ fn prepare_device_head_state_is_closed_by_serving_authority_in_every_wire_host()
         ),
         (
             "persistent_initialized",
-            direct_prepare_device_step("persistent_initialized", nonzero_remote_head()),
+            persistent_prepare_device_step("persistent_initialized", nonzero_remote_head()),
         ),
         (
             "persistent_uninitialized",
-            direct_prepare_device_step("persistent_uninitialized", zero_remote_head()),
+            persistent_prepare_device_step("persistent_uninitialized", zero_remote_head()),
         ),
     ] {
         let mut checkpoint: serde_json::Value = serde_json::from_str(CHECKPOINT_WIRE).unwrap();
         checkpoint["step"] = step;
         decode_runtime_checkpoint(&serde_json::to_vec(&checkpoint).unwrap())
             .unwrap_or_else(|error| panic!("{name} must be valid: {error:?}"));
+    }
+
+    let invalid_kind_steps = [
+        (
+            "root_persistent_initialized",
+            direct_prepare_device_step("persistent_initialized", nonzero_remote_head()),
+        ),
+        (
+            "root_persistent_uninitialized",
+            direct_prepare_device_step("persistent_uninitialized", zero_remote_head()),
+        ),
+        ("persistent_root_handoff", {
+            let mut step = prepare_device_step();
+            step["disk_kind"] = "persistent".into();
+            step["guest_device"] = serde_json::json!({"serial": "cats-data", "slot": 1});
+            step
+        }),
+        (
+            "persistent_existing_root",
+            persistent_prepare_device_step("existing_root", nonzero_remote_head()),
+        ),
+    ];
+    for (name, invalid_step) in invalid_kind_steps {
+        let mut checkpoint: serde_json::Value = serde_json::from_str(CHECKPOINT_WIRE).unwrap();
+        checkpoint["step"] = invalid_step.clone();
+
+        let mut observation = nonempty_observation_value();
+        observation["runtimes"][0]["step"] = invalid_step.clone();
+        observation["runtimes"][0]["checkpoint"]["step"] = invalid_step.clone();
+
+        let mut condition_host = nonempty_observation_value();
+        condition_host["runtimes"][0]["conditions"] = serde_json::json!([{
+            "kind": "progressing",
+            "reason": {"kind": "reconcile_step", "step": invalid_step},
+        }]);
+
+        for (host, value, reject, pointer) in [
+            (
+                "runtime_checkpoint",
+                checkpoint,
+                reject_checkpoint as Reject,
+                "/step/serving_authority",
+            ),
+            (
+                "observation_runtime_and_checkpoint",
+                observation,
+                reject_observation as Reject,
+                "/runtimes/0/checkpoint/step/serving_authority",
+            ),
+            (
+                "progressing_condition",
+                condition_host,
+                reject_observation as Reject,
+                "/runtimes/0/conditions/0/reason/step/serving_authority",
+            ),
+        ] {
+            let error = reject(&serde_json::to_vec(&value).unwrap());
+            assert_eq!(malformed(&error).0.as_str(), pointer, "{name}/{host}");
+            assert_eq!(
+                malformed(&error).1,
+                MalformedProblem::InvalidValue,
+                "{name}/{host}",
+            );
+        }
+    }
+}
+
+#[test]
+fn launch_steps_close_nested_device_kind_and_authority_purpose() {
+    let add_follower = |checkpoint: &mut serde_json::Value| {
+        checkpoint["step"]["devices"]
+            .as_array_mut()
+            .unwrap()
+            .push(prepared_follower_input());
+        checkpoint["volumes"]
+            .as_array_mut()
+            .unwrap()
+            .push(observed_prepared_follower_volume());
+    };
+
+    for (name, mut checkpoint) in [
+        ("prepare_network", prepare_network_checkpoint_value()),
+        ("start_runtime", start_runtime_checkpoint_value()),
+    ] {
+        add_follower(&mut checkpoint);
+        decode_runtime_checkpoint(&serde_json::to_vec(&checkpoint).unwrap())
+            .unwrap_or_else(|error| panic!("{name}: {error:?}"));
+    }
+
+    let root_persistent_authority =
+        direct_prepare_device_step("persistent_initialized", nonzero_remote_head())
+            ["serving_authority"]
+            .clone();
+    let mut prepare_network = prepare_network_checkpoint_value();
+    prepare_network["step"]["devices"][0]["serving_authority"] = root_persistent_authority;
+
+    let mut start_runtime = start_runtime_checkpoint_value();
+    add_follower(&mut start_runtime);
+    start_runtime["step"]["devices"][1]["serving_authority"]["purpose"] = "existing_root".into();
+
+    for (name, checkpoint, pointer) in [
+        (
+            "prepare_network_root_persistent_purpose",
+            prepare_network,
+            "/step/devices/0/serving_authority",
+        ),
+        (
+            "start_runtime_persistent_root_purpose",
+            start_runtime,
+            "/step/devices/1/serving_authority",
+        ),
+    ] {
+        let error = reject_checkpoint(&serde_json::to_vec(&checkpoint).unwrap());
+        assert_eq!(malformed(&error).0.as_str(), pointer, "{name}");
+        assert_eq!(
+            malformed(&error).1,
+            MalformedProblem::InvalidValue,
+            "{name}",
+        );
     }
 }
 

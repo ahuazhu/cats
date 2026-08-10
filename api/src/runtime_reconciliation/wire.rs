@@ -6491,7 +6491,7 @@ fn validate_runtime_checkpoint(checkpoint: &RuntimeCheckpoint) -> Result<(), Con
     collect_physical_cross(&checkpoint.processes, &checkpoint.volumes, &[], &mut cross);
     collect_reconcile_step_cross(&checkpoint.step, &path(&["step"]), false, &mut cross);
     collect_close_gate_checkpoint_cross(checkpoint, &mut cross);
-    collect_runtime_resource_checkpoint_cross(checkpoint, &mut cross);
+    collect_runtime_resource_cross(checkpoint, &[], &mut cross);
     collect_warm_snapshot_cross(
         &checkpoint.warm_snapshot,
         &path(&["warm_snapshot"]),
@@ -6509,44 +6509,182 @@ fn validate_runtime_checkpoint(checkpoint: &RuntimeCheckpoint) -> Result<(), Con
     Ok(())
 }
 
-fn collect_runtime_resource_checkpoint_cross(
-    checkpoint: &RuntimeCheckpoint,
+trait RuntimeResourceEvidence {
+    fn resource_node_id(&self) -> Option<&Id>;
+    fn resource_placement_epoch(&self) -> Option<&Epoch>;
+    fn resource_runtime_incarnation(&self) -> Option<&RandomId128>;
+    fn resource_stable_state(&self) -> Option<StableState>;
+    fn resource_step(&self) -> &ReconcileStep;
+    fn resource_processes(&self) -> &[ProcessEvidence];
+    fn resource_volumes(&self) -> &[ObservedVolume];
+    fn resource_mounts(&self) -> &[ObservedMount];
+    fn resource_networks(&self) -> &[ObservedNetwork];
+    fn resource_guest_transport(&self) -> &GuestTransportEvidence;
+    fn resource_lifecycle_admission(&self) -> LifecycleAdmission;
+    fn resource_routes_are_empty(&self) -> bool;
+}
+
+impl RuntimeResourceEvidence for RuntimeCheckpoint {
+    fn resource_node_id(&self) -> Option<&Id> {
+        Some(&self.node_id)
+    }
+
+    fn resource_placement_epoch(&self) -> Option<&Epoch> {
+        Some(&self.placement_epoch)
+    }
+
+    fn resource_runtime_incarnation(&self) -> Option<&RandomId128> {
+        self.runtime_incarnation.as_ref()
+    }
+
+    fn resource_stable_state(&self) -> Option<StableState> {
+        self.stable_state
+    }
+
+    fn resource_step(&self) -> &ReconcileStep {
+        &self.step
+    }
+
+    fn resource_processes(&self) -> &[ProcessEvidence] {
+        &self.processes
+    }
+
+    fn resource_volumes(&self) -> &[ObservedVolume] {
+        &self.volumes
+    }
+
+    fn resource_mounts(&self) -> &[ObservedMount] {
+        &self.mounts
+    }
+
+    fn resource_networks(&self) -> &[ObservedNetwork] {
+        &self.networks
+    }
+
+    fn resource_guest_transport(&self) -> &GuestTransportEvidence {
+        &self.guest_transport
+    }
+
+    fn resource_lifecycle_admission(&self) -> LifecycleAdmission {
+        self.lifecycle_admission
+    }
+
+    fn resource_routes_are_empty(&self) -> bool {
+        self.route_gates.is_empty()
+    }
+}
+
+impl RuntimeResourceEvidence for ObservedRuntimeStatus {
+    fn resource_node_id(&self) -> Option<&Id> {
+        match &self.checkpoint {
+            CheckpointEvidence::Valid { node_id, .. } => Some(node_id),
+            CheckpointEvidence::Missing { .. } | CheckpointEvidence::Corrupt { .. } => None,
+        }
+    }
+
+    fn resource_placement_epoch(&self) -> Option<&Epoch> {
+        match &self.checkpoint {
+            CheckpointEvidence::Valid {
+                placement_epoch, ..
+            } => Some(placement_epoch),
+            CheckpointEvidence::Missing { .. } | CheckpointEvidence::Corrupt { .. } => None,
+        }
+    }
+
+    fn resource_runtime_incarnation(&self) -> Option<&RandomId128> {
+        self.runtime_incarnation.as_ref()
+    }
+
+    fn resource_stable_state(&self) -> Option<StableState> {
+        self.stable_state
+    }
+
+    fn resource_step(&self) -> &ReconcileStep {
+        &self.step
+    }
+
+    fn resource_processes(&self) -> &[ProcessEvidence] {
+        &self.processes
+    }
+
+    fn resource_volumes(&self) -> &[ObservedVolume] {
+        &self.volumes
+    }
+
+    fn resource_mounts(&self) -> &[ObservedMount] {
+        &self.mounts
+    }
+
+    fn resource_networks(&self) -> &[ObservedNetwork] {
+        &self.networks
+    }
+
+    fn resource_guest_transport(&self) -> &GuestTransportEvidence {
+        &self.guest_transport
+    }
+
+    fn resource_lifecycle_admission(&self) -> LifecycleAdmission {
+        self.lifecycle_admission
+    }
+
+    fn resource_routes_are_empty(&self) -> bool {
+        self.routes.is_empty()
+    }
+}
+
+fn collect_runtime_resource_cross(
+    runtime: &impl RuntimeResourceEvidence,
+    runtime_path: &[PathSegment],
     output: &mut Vec<Candidate>,
 ) {
-    match &checkpoint.step {
+    let (Some(node_id), Some(placement_epoch)) = (
+        runtime.resource_node_id(),
+        runtime.resource_placement_epoch(),
+    ) else {
+        return;
+    };
+    match runtime.resource_step() {
         ReconcileStep::PrepareNetwork { network, devices } => {
-            collect_launch_phase_checkpoint_envelope(checkpoint, output);
-            collect_prepared_device_checkpoint_cross(checkpoint, devices, output);
-            if !checkpoint.networks.is_empty() && !checkpoint_network_is_exact(checkpoint, network)
+            collect_launch_phase_resource_envelope(runtime, runtime_path, output);
+            collect_prepared_device_resource_cross(
+                runtime,
+                node_id,
+                placement_epoch,
+                devices,
+                runtime_path,
+                output,
+            );
+            if !runtime.resource_networks().is_empty()
+                && !runtime_network_is_exact(runtime.resource_networks(), network)
             {
                 output.push(Candidate::at(
-                    &path(&["networks"]),
+                    &child(runtime_path, "networks"),
                     MalformedProblem::InvalidValue,
                 ));
             }
-            if checkpoint.runtime_incarnation.is_some() {
+            if runtime.resource_runtime_incarnation().is_some() {
                 output.push(Candidate::field(
-                    &[],
+                    runtime_path,
                     "runtime_incarnation",
                     MalformedProblem::InvalidValue,
                 ));
             }
             if !matches!(
-                checkpoint.guest_transport,
+                runtime.resource_guest_transport(),
                 GuestTransportEvidence::Unavailable
             ) {
                 output.push(Candidate::at(
-                    &path(&["guest_transport"]),
+                    &child(runtime_path, "guest_transport"),
                     MalformedProblem::InvalidValue,
                 ));
             }
-            if checkpoint
-                .processes
+            if runtime
+                .resource_processes()
                 .iter()
                 .any(|process| matches!(process.role, ProcessRole::Vmm { .. }))
             {
                 output.push(Candidate::at(
-                    &path(&["processes"]),
+                    &child(runtime_path, "processes"),
                     MalformedProblem::InvalidValue,
                 ));
             }
@@ -6571,18 +6709,25 @@ fn collect_runtime_resource_checkpoint_cross(
             devices,
             ..
         } => {
-            collect_launch_phase_checkpoint_envelope(checkpoint, output);
-            collect_prepared_device_checkpoint_cross(checkpoint, devices, output);
-            if checkpoint.runtime_incarnation.as_ref() != Some(runtime_incarnation) {
+            collect_launch_phase_resource_envelope(runtime, runtime_path, output);
+            collect_prepared_device_resource_cross(
+                runtime,
+                node_id,
+                placement_epoch,
+                devices,
+                runtime_path,
+                output,
+            );
+            if runtime.resource_runtime_incarnation() != Some(runtime_incarnation) {
                 output.push(Candidate::field(
-                    &[],
+                    runtime_path,
                     "runtime_incarnation",
                     MalformedProblem::InvalidValue,
                 ));
             }
-            if !checkpoint_network_is_exact(checkpoint, network) {
+            if !runtime_network_is_exact(runtime.resource_networks(), network) {
                 output.push(Candidate::at(
-                    &path(&["networks"]),
+                    &child(runtime_path, "networks"),
                     MalformedProblem::InvalidValue,
                 ));
             }
@@ -6609,25 +6754,25 @@ fn collect_runtime_resource_checkpoint_cross(
                             && shape.guest_config_digest == *expected_guest_config_digest
                     })
             };
-            let exact_vmm_count = checkpoint
-                .processes
+            let exact_vmm_count = runtime
+                .resource_processes()
                 .iter()
                 .filter(|process| matches!(process.role, ProcessRole::Vmm { .. }))
                 .filter(|process| vmm_is_exact(process))
                 .count();
-            let observed_vmm_count = checkpoint
-                .processes
+            let observed_vmm_count = runtime
+                .resource_processes()
                 .iter()
                 .filter(|process| matches!(process.role, ProcessRole::Vmm { .. }))
                 .count();
             if observed_vmm_count > 1 || exact_vmm_count != observed_vmm_count {
                 output.push(Candidate::at(
-                    &path(&["processes"]),
+                    &child(runtime_path, "processes"),
                     MalformedProblem::InvalidValue,
                 ));
             }
 
-            match &checkpoint.guest_transport {
+            match runtime.resource_guest_transport() {
                 GuestTransportEvidence::Unavailable => {}
                 GuestTransportEvidence::Malformed { .. } if observed_vmm_count == 1 => {}
                 GuestTransportEvidence::VsockReady {
@@ -6643,7 +6788,7 @@ fn collect_runtime_resource_checkpoint_cross(
                 GuestTransportEvidence::Malformed { .. }
                 | GuestTransportEvidence::VsockReady { .. } => {
                     output.push(Candidate::at(
-                        &path(&["guest_transport"]),
+                        &child(runtime_path, "guest_transport"),
                         MalformedProblem::InvalidValue,
                     ));
                 }
@@ -6677,13 +6822,13 @@ fn collect_runtime_resource_checkpoint_cross(
                     )
                     .any(|planned_path| planned_path == candidate)
             };
-            let mount_path_conflict = checkpoint.mounts.iter().any(|mount| {
+            let mount_path_conflict = runtime.resource_mounts().iter().any(|mount| {
                 conflicts_with_planned_path(&mount.source_path)
                     || conflicts_with_planned_path(&mount.mount_path)
             });
             if mount_path_conflict {
                 output.push(Candidate::at(
-                    &path(&["step"]),
+                    &child(runtime_path, "step"),
                     MalformedProblem::InvalidValue,
                 ));
             }
@@ -6692,41 +6837,46 @@ fn collect_runtime_resource_checkpoint_cross(
     }
 }
 
-fn collect_launch_phase_checkpoint_envelope(
-    checkpoint: &RuntimeCheckpoint,
+fn collect_launch_phase_resource_envelope(
+    runtime: &impl RuntimeResourceEvidence,
+    runtime_path: &[PathSegment],
     output: &mut Vec<Candidate>,
 ) {
-    if checkpoint.stable_state.is_some()
-        || checkpoint.lifecycle_admission != LifecycleAdmission::Closed
-        || !checkpoint.route_gates.is_empty()
+    if runtime.resource_stable_state().is_some()
+        || runtime.resource_lifecycle_admission() != LifecycleAdmission::Closed
+        || !runtime.resource_routes_are_empty()
     {
-        output.push(Candidate::at(&[], MalformedProblem::InvalidValue));
+        output.push(Candidate::at(runtime_path, MalformedProblem::InvalidValue));
     }
 }
 
-fn collect_prepared_device_checkpoint_cross(
-    checkpoint: &RuntimeCheckpoint,
+fn collect_prepared_device_resource_cross(
+    runtime: &impl RuntimeResourceEvidence,
+    node_id: &Id,
+    placement_epoch: &Epoch,
     inputs: &[PreparedDeviceInput],
+    runtime_path: &[PathSegment],
     output: &mut Vec<Candidate>,
 ) {
-    let volumes_are_exact = checkpoint.volumes.len() == inputs.len()
+    let volumes_are_exact = runtime.resource_volumes().len() == inputs.len()
         && inputs.iter().all(|input| {
-            let matching = checkpoint
-                .volumes
+            let matching = runtime
+                .resource_volumes()
                 .iter()
                 .filter(|volume| volume.volume_id == input.volume_id)
                 .collect::<Vec<_>>();
-            matching.len() == 1 && prepared_volume_is_exact(checkpoint, input, matching[0])
+            matching.len() == 1
+                && prepared_volume_is_exact(node_id, placement_epoch, input, matching[0])
         });
     if !volumes_are_exact {
         output.push(Candidate::at(
-            &path(&["volumes"]),
+            &child(runtime_path, "volumes"),
             MalformedProblem::InvalidValue,
         ));
     }
 
-    let observed_blockd = checkpoint
-        .processes
+    let observed_blockd = runtime
+        .resource_processes()
         .iter()
         .filter(|process| matches!(process.role, ProcessRole::Blockd { .. }))
         .collect::<Vec<_>>();
@@ -6745,14 +6895,15 @@ fn collect_prepared_device_checkpoint_cross(
     });
     if !blockd_are_exact {
         output.push(Candidate::at(
-            &path(&["processes"]),
+            &child(runtime_path, "processes"),
             MalformedProblem::InvalidValue,
         ));
     }
 }
 
 fn prepared_volume_is_exact(
-    checkpoint: &RuntimeCheckpoint,
+    node_id: &Id,
+    placement_epoch: &Epoch,
     input: &PreparedDeviceInput,
     observed: &ObservedVolume,
 ) -> bool {
@@ -6776,8 +6927,8 @@ fn prepared_volume_is_exact(
             if lineage.attachment_id == input.attachment_id
                 && lineage.attachment_epoch == input.attachment_epoch
                 && lineage.acquire_origin == input.acquire_origin
-                && lineage.node_id == checkpoint.node_id
-                && lineage.placement_epoch == checkpoint.placement_epoch
+                && lineage.node_id == *node_id
+                && lineage.placement_epoch == *placement_epoch
                 && lineage.local_durable_generation == input.expected_head.generation
                 && lineage.remote_durable_generation == input.expected_head.generation
                 && lineage.data_directory == input.serving_process.data_directory
@@ -6822,11 +6973,11 @@ fn prepared_blockd_is_exact(input: &PreparedDeviceInput, observed: &ProcessEvide
         && observed.observed_vm_shape.is_none()
 }
 
-fn checkpoint_network_is_exact(
-    checkpoint: &RuntimeCheckpoint,
+fn runtime_network_is_exact(
+    networks: &[ObservedNetwork],
     expected: &RuntimeNetworkIdentity,
 ) -> bool {
-    let [observed] = checkpoint.networks.as_slice() else {
+    let [observed] = networks else {
         return false;
     };
     observed.kind == expected.network_config.kind
@@ -7667,13 +7818,20 @@ fn collect_prepared_devices_cross(
     output: &mut Vec<Candidate>,
 ) {
     for (index, device) in devices.iter().enumerate() {
+        let device_path = indexed(path, index);
+        collect_device_kind_authority_cross(
+            device.disk_kind,
+            &device.serving_authority,
+            &device_path,
+            output,
+        );
         collect_prepared_device_cross(
             &device.expected_head,
             &device.ownership_token,
             &device.serving_authority,
             &device.serving_process,
             &device.frontend,
-            &indexed(path, index),
+            &device_path,
             output,
         );
     }
@@ -8327,6 +8485,40 @@ fn collect_prepared_device_cross(
     }
 }
 
+fn collect_device_kind_authority_cross(
+    disk_kind: DiskKind,
+    serving_authority: &ServingAuthorityProvenance,
+    path: &[PathSegment],
+    output: &mut Vec<Candidate>,
+) {
+    let authority_matches_disk_kind = matches!(
+        (disk_kind, serving_authority),
+        (
+            DiskKind::Root,
+            ServingAuthorityProvenance::AfterRootProvision { .. }
+        ) | (
+            DiskKind::Root,
+            ServingAuthorityProvenance::DirectAuthorizedAttachment {
+                purpose: DirectAuthorizedAttachmentPurpose::ExistingRoot,
+                ..
+            }
+        ) | (
+            DiskKind::Persistent,
+            ServingAuthorityProvenance::DirectAuthorizedAttachment {
+                purpose: DirectAuthorizedAttachmentPurpose::PersistentInitialized
+                    | DirectAuthorizedAttachmentPurpose::PersistentUninitialized,
+                ..
+            }
+        )
+    );
+    if !authority_matches_disk_kind {
+        output.push(Candidate::at(
+            &child(path, "serving_authority"),
+            MalformedProblem::InvalidValue,
+        ));
+    }
+}
+
 fn collect_reconcile_step_cross(
     step: &ReconcileStep,
     path: &[PathSegment],
@@ -8344,6 +8536,7 @@ fn collect_reconcile_step_cross(
             frontend,
             ..
         } => {
+            collect_device_kind_authority_cross(*disk_kind, serving_authority, path, output);
             collect_prepared_device_cross(
                 expected_head,
                 ownership_token,
@@ -8834,6 +9027,7 @@ fn collect_runtime_cross(
     output: &mut Vec<Candidate>,
 ) {
     collect_reconcile_step_cross(&runtime.step, &child(path, "step"), false, output);
+    collect_runtime_resource_cross(runtime, path, output);
     collect_physical_cross(&runtime.processes, &runtime.volumes, path, output);
     collect_warm_snapshot_cross(
         &runtime.warm_snapshot,

@@ -1033,7 +1033,9 @@ descriptor-stable identity及predecessor full digest，并要求nonblank head。
 携exact authorized-serving artifact的absolute path、descriptor device/inode/length、canonical content SHA-256
 和closed purpose：`existing_root`、`persistent_initialized`或`persistent_uninitialized`。前两者要求nonblank
 head；只有`persistent_uninitialized`要求exact blank head，且planner还必须把purpose与current Desired中
-Control Store的初始化状态逐字段绑定。已有Root或Persistent不得制造、复制或消费Root handoff。
+Control Store的初始化状态逐字段绑定。Root只允许`after_root_provision`或purpose=`existing_root`；Persistent
+只允许purpose=`persistent_initialized|persistent_uninitialized`，不得使用Root handoff或`existing_root`。
+已有Root或Persistent不得制造、复制或消费Root handoff。
 
 step还绑定预期serving blockd的scope/control socket/data directory/executable/process token、closed frontend
 plan、Guest device和device-only `ownership_token`。device token与serving process token必须不同，不能从一个
@@ -1774,7 +1776,9 @@ missing/corrupt或同token出现在多个实例上都不得自动cleanup。
 `prepare_device`必须显式冻结`volume_intent_id`、`disk_id`、`volume_id`和`disk_kind`；Root必须绑定slot 0，
 Persistent不得绑定slot 0。`ownership_token`只属于最终Guest device；它不得等于
 `serving_process.process_identity_token`。`after_root_provision`、`existing_root`和`persistent_initialized`的
-`expected_head`必须是完整nonblank `RemoteHead`；只有`persistent_uninitialized`必须是exact blank head。零
+`expected_head`必须是完整nonblank `RemoteHead`；只有`persistent_uninitialized`必须是exact blank head。磁盘
+类型与provenance/purpose同时closed：Root仅接受`after_root_provision|existing_root`，Persistent仅接受
+`persistent_initialized|persistent_uninitialized`。零
 attachment epoch、零inode、零size、空/仅path authorization、authorization/process/frontend path alias、
 kernel listener/device alias、vhost queue越界或非二次幂都在wire intrinsic validation阶段拒绝。handoff record或
 direct authorization内容与checkpoint、current Desired/placement及authority的逐字段关联仍是planner/scanner
@@ -1804,6 +1808,10 @@ launch/artifact路径彼此不同，也不得alias任一prepared authority/contr
 executable或checkpoint mount source/target。`runtime_incarnation`、VMM process、network、每个device及每个serving
 process token组成单一全局unique集合；VMM scope也不得等于任一serving scope。公开ProcessEvidence仅作一致性
 projection，不能替代provider-private exact argv/env/cgroup/unit/PID/start/executable/file/tap/device proof授权adopt。
+上述PrepareNetwork/StartRuntime envelope、volume/network projection和Guest/VMM matrix同时约束独立
+`RuntimeCheckpoint`与`NodeObservation.runtimes[*]` sibling。Observation内嵌的valid checkpoint step相同并不能
+替代对runtime sibling的逐字段验证；runtime的admission/routes/processes/volumes/networks/Guest transport任一
+漂移都使整个observation malformed。
 
 `CleanupRelease`持久化的`inventory_session`/epoch/read position必须逐字段等于用于
 规划该step的已接受`AdmissionInventoryAttestation`及其当前`SessionBinding`；

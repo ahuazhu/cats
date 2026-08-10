@@ -189,6 +189,8 @@ identity；`PrepareNetwork`与`StartRuntime`都逐字段复制按Guest slot排�
 参数。该嵌套对象是Agent crash/restart后的authority；公开`ProcessEvidence`/`ObservedDevice`可在待重扫时缺失，
 出现时只能是逐项exact projection且不得有extra/duplicate，top-level `ObservedVolume`的logical IDs、kind、
 authority和唯一active lineage始终必须exact，不能从当前Desired或公开path反向补齐。
+disk kind与sealed provenance同时closed：Root只接受`after_root_provision`或direct `existing_root`，Persistent
+只接受direct `persistent_initialized|persistent_uninitialized`；两类authority不得互换。
 
 整条chain只能服务同一个current `target=Running` Desired；revision/spec/Node/placement从PrepareDevice到
 StartRuntime逐字段不变，不能在同revision把Cold或不同Guest profile换成另一digest继续启动。Cold→Running必须
@@ -201,7 +203,8 @@ absent或逐字段exact present时，下一轮才可create/adopt，一次模糊�
 exact present的accepted full后，后续另一轮才能CAS到`StartRuntime`。同名foreign/missing/corrupt token、
 重复tap、地址冲突或ABA均保持原物并fail closed，不能由旧`RuntimeLaunchPort`或一次旧inventory旁路。
 `PrepareNetwork`和`StartRuntime`都只允许`stable_state=null`、admission Closed且route gates为空；InstallGate
-之前不能借已有stable/route authority越过启动phase。
+之前不能借已有stable/route authority越过启动phase。相同phase/resource/Guest-VMM约束同时应用于独立
+checkpoint及`NodeObservation`中的runtime sibling，内嵌valid checkpoint不能替代对sibling evidence的验证。
 
 `StartRuntime`是可独立重启解释的完整launch expectation，而不是三字段提示。它冻结runtime incarnation、
 transient service、独立process token，actual installed runtime configuration选择的launcher/VMM/kernel/
