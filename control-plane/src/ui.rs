@@ -1144,8 +1144,11 @@ mod tests {
         for contract in [
             "parseCatCreateV2AcceptedResponseBody",
             "status !== 202",
-            "globalThis.localStorage",
+            "globalThis.indexedDB",
             "globalThis.navigator?.locks",
+            "{ durability: \"strict\" }",
+            "insertWithinWorkspaceLimit",
+            "PendingReplayToken",
             "Idempotency-Key",
             "request_body",
         ] {
@@ -1179,6 +1182,7 @@ mod tests {
             })
             .expect("create handler is present");
         assert!(create_handler.contains("sendPendingCatCreate("));
+        assert!(USER_JS.contains("request.expectedPending"));
         assert!(
             USER_JS.matches("resumePendingCatCreates()").count() >= 4,
             "pending create recovery must be wired into initialization, Workspace switching, and refresh"

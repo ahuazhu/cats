@@ -5,6 +5,8 @@ const MAX_ROOT_SIZE_BYTES = 1_099_511_627_776;
 const JSON_CONTENT_TYPE = "application/json";
 const PENDING_PREFIX = "cats.cat-create-v2.pending.v1:";
 const MAX_PENDING_PER_WORKSPACE = 32;
+const PENDING_DATABASE = "cats-cat-create-v2-authority-v1";
+const PENDING_STORE = "pending";
 const NAME_CONFLICT_BODY = '{"code":"already_exists","message":"cat name already exists"}';
 
 function positiveSafeInteger(value, field) {
@@ -167,6 +169,10 @@ function pendingLockName(workspaceId, name) {
   return `cats-cat-create-v2:${encodeURIComponent(workspaceId)}:${encodeURIComponent(name)}`;
 }
 
+function pendingWorkspacePrefix(workspaceId) {
+  return `${PENDING_PREFIX}${encodeURIComponent(workspaceId)}:`;
+}
+
 function validateIdempotencyKey(value) {
   if (typeof value !== "string" || value.length < 1 || value.length > 512) {
     throw new Error("invalid Cat-create Idempotency-Key");
@@ -235,67 +241,290 @@ function exactPendingRecord(raw, expectedKey = "") {
   return { record, request, storageKey };
 }
 
-function storageGet(storage, key) {
-  let value;
-  try {
-    value = storage.getItem(key);
-  } catch (error) {
-    throw new Error(`browser durable storage is unavailable: ${error.message}; no Cat-create request was sent`);
-  }
-  return value;
+function transactionFailure(context, transaction) {
+  const detail = transaction.error?.message || "transaction aborted";
+  return new Error(`${context}: ${detail}`);
 }
 
-function persistNewPending(storage, key, record) {
-  const raw = JSON.stringify(record);
-  try {
-    storage.setItem(key, raw);
-  } catch (error) {
-    throw new Error(`could not durably save Cat-create recovery state: ${error.message}; no request was sent`);
-  }
-  if (storageGet(storage, key) !== raw) {
-    throw new Error("browser did not retain exact Cat-create recovery state; no request was sent");
-  }
-  return exactPendingRecord(raw, key).record;
+function transactionCompletion(transaction, context) {
+  return new Promise((resolve, reject) => {
+    transaction.addEventListener("complete", () => resolve(), { once: true });
+    transaction.addEventListener(
+      "abort",
+      () => reject(transactionFailure(context, transaction)),
+      { once: true },
+    );
+  });
 }
 
-function clearPending(storage, key, expected) {
-  const current = storageGet(storage, key);
-  if (current === null) return;
-  const loaded = exactPendingRecord(current, key).record;
-  if (JSON.stringify(loaded) !== JSON.stringify(expected)) {
-    throw new Error("pending Cat-create state changed before terminal cleanup");
-  }
+function strictReadwriteTransaction(database) {
+  let transaction;
   try {
-    storage.removeItem(key);
+    transaction = database.transaction(
+      PENDING_STORE,
+      "readwrite",
+      { durability: "strict" },
+    );
   } catch (error) {
-    throw new Error(`could not clear terminal Cat-create recovery state: ${error.message}`);
+    throw new Error(
+      `strict browser durability is unavailable: ${error.message}; no Cat-create request was sent`,
+    );
   }
-  if (storageGet(storage, key) !== null) {
-    throw new Error("browser did not clear terminal Cat-create recovery state");
+  if (transaction.durability !== "strict") {
+    transaction.abort();
+    throw new Error(
+      "strict browser durability is unavailable; no Cat-create request was sent",
+    );
+  }
+  return transaction;
+}
+
+class IndexedDbPendingStore {
+  constructor(indexedDb, keyRange) {
+    this.indexedDb = indexedDb;
+    this.keyRange = keyRange;
+    this.opening = null;
+  }
+
+  async database() {
+    if (this.opening) return this.opening;
+    this.opening = new Promise((resolve, reject) => {
+      let settled = false;
+      const request = this.indexedDb.open(PENDING_DATABASE, 1);
+      request.addEventListener("upgradeneeded", () => {
+        if (!request.result.objectStoreNames.contains(PENDING_STORE)) {
+          request.result.createObjectStore(PENDING_STORE);
+        }
+      });
+      request.addEventListener("blocked", () => {
+        if (!settled) {
+          settled = true;
+          reject(new Error(
+            "browser durable storage upgrade is blocked; no Cat-create request was sent",
+          ));
+        }
+      });
+      request.addEventListener("error", () => {
+        if (!settled) {
+          settled = true;
+          reject(new Error(
+            `browser durable storage is unavailable: ${request.error?.message || "open failed"}; no Cat-create request was sent`,
+          ));
+        }
+      });
+      request.addEventListener("success", () => {
+        const database = request.result;
+        if (settled) {
+          database.close();
+          return;
+        }
+        if (!database.objectStoreNames.contains(PENDING_STORE)) {
+          settled = true;
+          database.close();
+          reject(new Error(
+            "browser durable storage schema is invalid; no Cat-create request was sent",
+          ));
+          return;
+        }
+        settled = true;
+        database.addEventListener("versionchange", () => database.close());
+        resolve(database);
+      });
+    });
+    return this.opening;
+  }
+
+  workspaceRange(workspaceId) {
+    const prefix = pendingWorkspacePrefix(workspaceId);
+    return this.keyRange.bound(prefix, `${prefix}\uffff`);
+  }
+
+  async load(key) {
+    const database = await this.database();
+    const transaction = database.transaction(PENDING_STORE, "readonly");
+    const complete = transactionCompletion(
+      transaction,
+      "read pending Cat-create state",
+    );
+    const request = transaction.objectStore(PENDING_STORE).get(key);
+    let result = null;
+    request.addEventListener("success", () => {
+      result = request.result === undefined ? null : request.result;
+    });
+    await complete;
+    return result;
+  }
+
+  async insertWithinWorkspaceLimit({ workspaceId, key, raw, maximum }) {
+    const database = await this.database();
+    const transaction = strictReadwriteTransaction(database);
+    const complete = transactionCompletion(
+      transaction,
+      "persist pending Cat-create state",
+    );
+    const store = transaction.objectStore(PENDING_STORE);
+    const existingRequest = store.get(key);
+    const countRequest = store.count(this.workspaceRange(workspaceId));
+    let existingReady = false;
+    let countReady = false;
+    let existing;
+    let count = 0;
+    let outcome = null;
+    const decide = () => {
+      if (!existingReady || !countReady || outcome) return;
+      if (existing !== undefined) {
+        outcome = { kind: "existing", raw: existing };
+      } else if (count >= maximum) {
+        outcome = { kind: "limit" };
+      } else {
+        outcome = { kind: "inserted", raw };
+        store.add(raw, key);
+      }
+    };
+    existingRequest.addEventListener("success", () => {
+      existing = existingRequest.result;
+      existingReady = true;
+      decide();
+    });
+    countRequest.addEventListener("success", () => {
+      count = countRequest.result;
+      countReady = true;
+      decide();
+    });
+    await complete;
+    if (!outcome) {
+      throw new Error("browser durable storage transaction produced no result");
+    }
+    return outcome;
+  }
+
+  async deleteIfExact(key, expectedRaw) {
+    const database = await this.database();
+    const transaction = strictReadwriteTransaction(database);
+    const complete = transactionCompletion(
+      transaction,
+      "clear terminal Cat-create recovery state",
+    );
+    const store = transaction.objectStore(PENDING_STORE);
+    const request = store.get(key);
+    let outcome = null;
+    request.addEventListener("success", () => {
+      if (request.result === undefined) {
+        outcome = "absent";
+      } else if (request.result !== expectedRaw) {
+        outcome = "changed";
+      } else {
+        outcome = "deleted";
+        store.delete(key);
+      }
+    });
+    await complete;
+    if (!outcome) {
+      throw new Error("browser durable storage cleanup produced no result");
+    }
+    return outcome;
+  }
+
+  async listWorkspace(workspaceId, maximum) {
+    const database = await this.database();
+    const transaction = database.transaction(PENDING_STORE, "readonly");
+    const complete = transactionCompletion(
+      transaction,
+      "list pending Cat-create state",
+    );
+    const entries = [];
+    const request = transaction
+      .objectStore(PENDING_STORE)
+      .openCursor(this.workspaceRange(workspaceId));
+    request.addEventListener("success", () => {
+      const cursor = request.result;
+      if (!cursor || entries.length >= maximum) return;
+      entries.push({ key: cursor.key, raw: cursor.value });
+      cursor.continue();
+    });
+    await complete;
+    return entries;
   }
 }
 
-function preparePending(storage, workspaceId, path, requestBody, idempotencyKeyFactory) {
-  const request = parseCatCreateV2RequestBody(requestBody);
-  const canonicalPath = catCreateV2Path(workspaceId);
-  if (path !== canonicalPath) throw new Error("Cat-create path is not canonical; no request was sent");
-  assertRuntimeCutoverClientRequestSupported(path, "POST");
-  const key = pendingStorageKey(workspaceId, request.name);
-  const existingRaw = storageGet(storage, key);
-  if (existingRaw !== null) {
-    const existing = exactPendingRecord(existingRaw, key).record;
-    if (
-      existing.authenticated_workspace_id !== workspaceId
-      || existing.path !== path
-      || existing.request_body !== requestBody
-    ) {
+let defaultStore;
+
+function defaultPendingStore() {
+  if (!globalThis.indexedDB || !globalThis.IDBKeyRange) {
+    throw new Error(
+      "strict browser durable storage is unavailable; no Cat-create request was sent",
+    );
+  }
+  if (!defaultStore) {
+    defaultStore = new IndexedDbPendingStore(globalThis.indexedDB, globalThis.IDBKeyRange);
+  }
+  return defaultStore;
+}
+
+function validatePendingStore(store) {
+  for (const method of [
+    "load",
+    "insertWithinWorkspaceLimit",
+    "deleteIfExact",
+    "listWorkspace",
+  ]) {
+    if (typeof store?.[method] !== "function") {
       throw new Error(
-        "an unresolved Cat-create request for this Workspace and Cat name has a different exact body; no request was sent",
+        "browser durable storage adapter is invalid; no Cat-create request was sent",
       );
     }
-    return { key, record: existing };
   }
-  const record = {
+  return store;
+}
+
+function exactBinding(record, workspaceId, path, requestBody) {
+  if (
+    record.authenticated_workspace_id !== workspaceId
+    || record.path !== path
+    || record.request_body !== requestBody
+  ) {
+    throw new Error(
+      "an unresolved Cat-create request for this Workspace and Cat name has a different exact body; no request was sent",
+    );
+  }
+}
+
+const replayTokenBindings = new WeakMap();
+
+class PendingReplayToken {
+  constructor(key, raw) {
+    replayTokenBindings.set(this, Object.freeze({ key, raw }));
+    Object.freeze(this);
+  }
+}
+
+function replayTokenBinding(token, workspaceId, path, requestBody) {
+  const binding = replayTokenBindings.get(token);
+  if (!(token instanceof PendingReplayToken) || !binding) {
+    throw new Error("pending Cat-create replay token is invalid; no request was sent");
+  }
+  const { key, raw } = binding;
+  const { record } = exactPendingRecord(raw, key);
+  exactBinding(record, workspaceId, path, requestBody);
+  return { key, raw, record };
+}
+
+async function prepareFreshPending(
+  store,
+  workspaceId,
+  path,
+  requestBody,
+  request,
+  idempotencyKeyFactory,
+) {
+  const key = pendingStorageKey(workspaceId, request.name);
+  const existingRaw = await store.load(key);
+  if (existingRaw !== null) {
+    const existing = exactPendingRecord(existingRaw, key).record;
+    exactBinding(existing, workspaceId, path, requestBody);
+    return { key, raw: existingRaw, record: existing };
+  }
+  const desired = {
     version: 1,
     authenticated_workspace_id: workspaceId,
     method: "POST",
@@ -304,7 +533,48 @@ function preparePending(storage, workspaceId, path, requestBody, idempotencyKeyF
     idempotency_key: validateIdempotencyKey(idempotencyKeyFactory()),
     request_body: requestBody,
   };
-  return { key, record: persistNewPending(storage, key, record) };
+  const desiredRaw = JSON.stringify(desired);
+  exactPendingRecord(desiredRaw, key);
+  const result = await store.insertWithinWorkspaceLimit({
+    workspaceId,
+    key,
+    raw: desiredRaw,
+    maximum: MAX_PENDING_PER_WORKSPACE,
+  });
+  if (result.kind === "limit") {
+    throw new Error(
+      "too many pending Cat-create requests; no new request was sent",
+    );
+  }
+  if (result.kind !== "inserted" && result.kind !== "existing") {
+    throw new Error("browser durable storage returned an invalid insert result");
+  }
+  const raw = result.raw;
+  const record = exactPendingRecord(raw, key).record;
+  exactBinding(record, workspaceId, path, requestBody);
+  return { key, raw, record };
+}
+
+async function prepareReplayPending(store, expected) {
+  const current = await store.load(expected.key);
+  if (current === null) return null;
+  if (current !== expected.raw) {
+    throw new Error(
+      "pending Cat-create state changed after recovery enumeration; no request was sent",
+    );
+  }
+  exactPendingRecord(current, expected.key);
+  return expected;
+}
+
+async function clearPending(store, prepared) {
+  const outcome = await store.deleteIfExact(prepared.key, prepared.raw);
+  if (outcome === "changed") {
+    throw new Error("pending Cat-create state changed before terminal cleanup");
+  }
+  if (outcome !== "deleted" && outcome !== "absent") {
+    throw new Error("browser durable storage returned an invalid cleanup result");
+  }
 }
 
 function isExactNameConflict(error) {
@@ -328,11 +598,12 @@ function pendingFailure(error) {
 
 /**
  * Save and send one exact Cat-create request under a same-origin Web Lock.
- * `localStorage` is browser-persistent recovery state, not a defense against
- * malicious local users or scripts already executing in this origin.
+ * The production adapter commits every mutation through a strict IndexedDB
+ * transaction. The adapter is not a defense against malicious scripts already
+ * executing in this origin.
  */
 export async function sendDurableCatCreateV2({
-  storage = globalThis.localStorage,
+  pendingStore,
   lockManager = globalThis.navigator?.locks,
   workspaceId,
   path,
@@ -340,12 +611,18 @@ export async function sendDurableCatCreateV2({
   send,
   onAccepted = () => {},
   idempotencyKeyFactory = defaultIdempotencyKey,
+  expectedPending,
 }) {
   const request = parseCatCreateV2RequestBody(requestBody);
+  const canonicalPath = catCreateV2Path(workspaceId);
+  if (path !== canonicalPath) throw new Error("Cat-create path is not canonical; no request was sent");
+  assertRuntimeCutoverClientRequestSupported(path, "POST");
   if (!lockManager?.request) {
     throw new Error("browser cross-page locking is unavailable; no Cat-create request was sent");
   }
   if (typeof send !== "function") throw new Error("Cat-create transport is unavailable");
+  const store = validatePendingStore(pendingStore || defaultPendingStore());
+  const hasExpected = expectedPending !== undefined;
   const lockName = pendingLockName(workspaceId, request.name);
   return lockManager.request(
     lockName,
@@ -354,13 +631,24 @@ export async function sendDurableCatCreateV2({
       if (!lock) {
         throw new Error("this Cat-create request is already active in another page; no duplicate request was sent");
       }
-      const { key, record } = preparePending(
-        storage,
-        workspaceId,
-        path,
-        requestBody,
-        idempotencyKeyFactory,
-      );
+      const expected = hasExpected
+        ? replayTokenBinding(expectedPending, workspaceId, path, requestBody)
+        : null;
+      const prepared = expected
+        ? await prepareReplayPending(store, expected)
+        : await prepareFreshPending(
+          store,
+          workspaceId,
+          path,
+          requestBody,
+          request,
+          idempotencyKeyFactory,
+        );
+      // A replay-only caller may have enumerated this record just before
+      // another page received the terminal result and durably removed it.
+      // Absence is therefore "already resolved", never permission to mint.
+      if (prepared === null) return null;
+      const { record } = prepared;
       let response;
       try {
         response = await send(record.path, {
@@ -374,7 +662,7 @@ export async function sendDurableCatCreateV2({
         });
       } catch (error) {
         if (isExactNameConflict(error)) {
-          clearPending(storage, key, record);
+          await clearPending(store, prepared);
           throw error;
         }
         throw pendingFailure(error);
@@ -401,37 +689,31 @@ export async function sendDurableCatCreateV2({
       } catch (error) {
         throw pendingFailure(error);
       }
-      clearPending(storage, key, record);
+      await clearPending(store, prepared);
       return accepted;
     },
   );
 }
 
-export function listPendingCatCreateV2({ storage = globalThis.localStorage, workspaceId }) {
+export async function listPendingCatCreateV2({ pendingStore, workspaceId }) {
   catCreateV2Path(workspaceId);
-  const prefix = `${PENDING_PREFIX}${encodeURIComponent(workspaceId)}:`;
-  const keys = [];
-  let length;
-  try {
-    length = storage.length;
-    for (let index = 0; index < length; index += 1) {
-      const key = storage.key(index);
-      if (key?.startsWith(prefix)) keys.push(key);
-    }
-  } catch (error) {
-    throw new Error(`browser durable storage is unavailable: ${error.message}`);
-  }
-  if (keys.length > MAX_PENDING_PER_WORKSPACE) {
+  const store = validatePendingStore(pendingStore || defaultPendingStore());
+  const entries = await store.listWorkspace(
+    workspaceId,
+    MAX_PENDING_PER_WORKSPACE + 1,
+  );
+  if (entries.length > MAX_PENDING_PER_WORKSPACE) {
     throw new Error("too many pending Cat-create requests; automatic replay stopped");
   }
-  keys.sort();
-  return keys.map((key) => {
-    const raw = storageGet(storage, key);
-    if (raw === null) return null;
+  return entries.map(({ key, raw }) => {
     const { record } = exactPendingRecord(raw, key);
     if (record.authenticated_workspace_id !== workspaceId) {
       throw new Error("pending Cat-create state crossed its Workspace boundary");
     }
-    return { path: record.path, requestBody: record.request_body };
-  }).filter(Boolean);
+    return {
+      path: record.path,
+      requestBody: record.request_body,
+      expectedPending: new PendingReplayToken(key, raw),
+    };
+  });
 }

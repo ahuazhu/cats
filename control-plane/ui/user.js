@@ -159,13 +159,14 @@ function idempotencyHeaders() {
   return { "Idempotency-Key": globalThis.crypto?.randomUUID?.() || `${Date.now()}-${Math.random()}` };
 }
 
-async function sendPendingCatCreate(path, requestBody, onAccepted) {
+async function sendPendingCatCreate(path, requestBody, onAccepted, expectedPending) {
   return sendDurableCatCreateV2({
     workspaceId: state.activeWorkspaceId,
     path,
     requestBody,
     send: authenticatedRequestWithStatus,
     onAccepted,
+    ...(expectedPending ? { expectedPending } : {}),
   });
 }
 
@@ -173,7 +174,7 @@ async function resumePendingCatCreates() {
   if (!state.activeWorkspaceId) return;
   let pending;
   try {
-    pending = listPendingCatCreateV2({ workspaceId: state.activeWorkspaceId });
+    pending = await listPendingCatCreateV2({ workspaceId: state.activeWorkspaceId });
   } catch (error) {
     toast(t("common.error"), error.message, "error");
     return;
@@ -182,7 +183,7 @@ async function resumePendingCatCreates() {
     try {
       await sendPendingCatCreate(request.path, request.requestBody, (accepted) => {
         toast(t("user.operation.accepted"), `${accepted.cat_id} · ${accepted.operation_id}`);
-      });
+      }, request.expectedPending);
     } catch (error) {
       // Ambiguous and non-terminal outcomes intentionally retain the exact
       // browser-persistent request for the next reload or explicit refresh.
