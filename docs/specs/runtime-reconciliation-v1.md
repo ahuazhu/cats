@@ -1045,6 +1045,31 @@ listener是不可拆分的一个bounded effect，不存在下一轮单独“crea
 发布/接受新full inventory，再由持久step判断exact present/absent；不同PID/start、token、lineage、head、
 CLI/handshake或frontend参数全部fail closed。
 
+kernel-NBD的Host全局预留不是从一次旧inventory中挑一个看似空闲的path。planner在把
+`prepare_device.frontend.device_path`首次写入checkpoint时，必须取得一个descriptor-relative、regular、
+single-link、exact `0600`的Node全局allocation flock；持锁期间重新完成以下闭合并把锁保持到checkpoint file及
+父目录fsync返回：
+
+1. 对checkpoint namespace做一次有界、strict canonical、descriptor-stable全量枚举，从每个
+   `prepare_device.kernel_nbd` step及后继checkpoint的`ObservedVolume.devices.kernel_nbd`重建全部durable
+   reservation；同device的不同Cat/volume/token、missing/corrupt token、超出配置pool的path或重复物理identity
+   都拒绝；
+2. 对配置的每个`/dev/nbdN`读取sysfs `pid`和`size`，只把前后两次均为pid absent/zero且size zero的slot视为
+   `Free`；pid存在但size zero、malformed/oversize属性或扫描中变化使本轮Unavailable；size非零但没有exact live
+   client是`Leaked`，不得由allocation effect顺带detach；
+3. live slot只有在前后相同的PID/start ticks、exact `nbd-client` executable及完整
+   `-nonetlink -unix <persisted-listener> /dev/nbdN -b 512 -N ""` argv都闭合时才可成为provider-private
+   `Serving` evidence；public device token仍必须来自同一serving blockd的exact authorized-serving handshake，
+   不能从path、PID或argv猜出；
+4. 从`Free - durable reservations`按device index稳定选择一个path，只做一次checkpoint replace；同一轮不启动
+   blockd、不运行`nbd-client`。下一次accepted fresh full后，attach effect在同一allocation flock下重验current
+   checkpoint、exact listener及该slot仍Free，response loss后只靠新的full inventory采用exact Serving。
+
+所有会新增、迁移或移除kernel-NBD reservation的Runtime checkpoint replace都必须使用同一个allocation flock；
+旧product allocator不得与该切换composition并存。外部/晚到client即使绕过flock，也只能让后续scan产生Conflict，
+不能使Node把busy device交给第二个Cat。leaked device的disconnect、serving device的detach及token retirement分别
+使用checkpoint-first cleanup effect，不能夹在reserve或attach中。
+
 serving blockd CLI必须从同一个已fsync的`prepare_device` step取得process token及独立device token；严格parser
 拒绝缺失、非canonical、相同token或control-only携device token，并要求恰好一种与closed frontend plan一致的
 NBD/vhost listener；零个或同时两种都必须在构造engine/listener effect前拒绝。authorized-serving status handshake必须逐字段

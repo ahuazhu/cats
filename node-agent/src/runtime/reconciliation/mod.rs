@@ -20,6 +20,15 @@ mod checkpoint;
 mod clean_slate_probes;
 mod gate_planner;
 mod inventory;
+// Kernel NBD is the default ADR-0015 frontend and is a Host-global resource.
+// This provider-private slice lands the exact pool scan and durable-checkpoint
+// reservation permit before the PrepareDevice effect consumes it. Keeping the
+// exception on the private module prevents an incomplete public boundary.
+#[expect(
+    dead_code,
+    reason = "exact kernel-NBD reservation is consumed by the PrepareDevice effect"
+)]
+mod kernel_nbd;
 mod normal_acquire;
 mod root_provision;
 mod signed_root_provision;
