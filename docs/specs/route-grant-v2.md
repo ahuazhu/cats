@@ -171,7 +171,9 @@ handler在读取body、取得admission permit或访问PostgreSQL前要求该prin
   `409 wake_required|pending`、`503 unavailable`。认证失败为`401 authentication_failed`；frame错误为
   `400/405/406/413/415 invalid_request`；stored/internal错误为`500 internal`。所有response带
   `Cache-Control: no-store`；`405`带`Allow: POST`，`503`带`Retry-After: 1`；不redirect；
-- per-replica resolve semaphore与body/deadline是资源界，不是authority。client取消不会产生durable route
+- per-replica resolve semaphore与body/deadline是资源界，不是authority。handler与其已经启动的Store
+  closure共同持有同一个active owner；timeout或client取消只能释放handler owner，不能提前释放Store owner。
+  graceful shutdown先关闭新admission，再等待所有active owner归零。client取消不会产生durable route
   workflow；签名response丢失后普通重试重新闭合当前snapshot，不复用丢失token。
 
 当前repository尚无能满足本节的Gateway workload credential authority，也尚未把独立Route v2 signer
