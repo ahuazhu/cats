@@ -220,6 +220,8 @@ impl MetadataAuthorityAbsenceReader for PagedMetadataAuthorityReader {
                         (&indexed.record.lease_owner, &indexed.owner_node_id),
                         (None, None) | (Some(_), Some(_))
                     )
+                    || (indexed.record.lease_owner.is_some()
+                        && indexed.owner_node_id.as_ref() != Some(node_id))
                     || (!candidate_volume_ids.contains(volume_id)
                         && indexed.owner_node_id.as_ref() != Some(node_id))
                     || records
@@ -2528,6 +2530,26 @@ mod tests {
                 InventoryAbsence::Unavailable
             );
         }
+    }
+
+    #[test]
+    fn desired_candidate_owned_by_another_node_cannot_project_as_local_owned() {
+        let environment = TestEnvironment::new();
+        let (port, _calls) = scripted_metadata_inventory_port([metadata_page(
+            vec![MetadataAuthorityIndexedRecord {
+                record: owned_record("vol_root", "att_01"),
+                owner_node_id: Some(Id::new("node_b").unwrap()),
+            }],
+            None,
+        )]);
+        let reader = Arc::new(PagedMetadataAuthorityReader::new(port));
+
+        assert_eq!(
+            metadata_probe(&environment, reader)
+                .prove_absent(&assigned_context(true))
+                .unwrap(),
+            InventoryAbsence::Unavailable
+        );
     }
 
     #[test]
