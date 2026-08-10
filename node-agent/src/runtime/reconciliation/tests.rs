@@ -19,6 +19,7 @@ use cats_api::runtime_reconciliation::{
 };
 use tempfile::TempDir;
 
+use super::admission_cell::AdmissionCell;
 use super::admission_port::{AdmissionGatePort, AdmissionSnapshot, GatePortError, IdleCloseResult};
 use super::checkpoint::{
     CheckpointStoreError, EndpointEffectEdge, EndpointEffectEdgeStatus, FileCheckpointStore,
@@ -892,6 +893,221 @@ fn install_and_close_are_checkpoint_first() {
     assert_eq!(installed.lifecycle_admission, LifecycleAdmission::Open);
     assert_eq!(installed.route_gates[0].binding.route_epoch, epoch(2));
     assert_eq!(installed.route_gates[0].gate, RouteGateState::Active);
+}
+
+#[test]
+fn real_admission_cell_installs_the_first_endpoint_from_closed_lifecycle() {
+    let root = TempDir::new().expect("tempdir");
+    let source_desired = running_desired_with_endpoints(1, Vec::new());
+    let source_checkpoint = running_checkpoint(&source_desired, 10);
+    let store = store(&root, &source_desired.cat_id);
+    let source = store.create(&source_checkpoint).expect("source checkpoint");
+    let cell = AdmissionCell::new(
+        AdmissionSnapshot::from_checkpoint(&source_checkpoint).expect("source snapshot"),
+    )
+    .expect("admission cell");
+    let mut port = cell.port();
+
+    let mut stop = source_desired;
+    stop.desired_revision = revision(2);
+    stop.target = RuntimeTarget::Suspended;
+    refresh_spec_digest(&mut stop);
+    let closed = GateSequencer::new(&store, &mut port)
+        .close_all(&source, &stop, times(20, 21))
+        .expect("close the empty route set");
+    assert_eq!(
+        cell.snapshot().lifecycle_admission(),
+        LifecycleAdmission::Closed
+    );
+    assert!(cell.snapshot().endpoints().is_empty());
+
+    let fresh =
+        running_desired_with_endpoints(3, vec![endpoint("ep_a", "a.example.test", 1, 8080)]);
+    let installed = GateSequencer::new(&store, &mut port)
+        .install_gate(closed.checkpoint(), &fresh, &id("ep_a"), times(30, 31))
+        .expect("install the first Endpoint and open lifecycle admission");
+    assert_eq!(
+        cell.snapshot().lifecycle_admission(),
+        LifecycleAdmission::Open
+    );
+    assert_eq!(
+        snapshot_route(&cell.snapshot(), "ep_a").gate,
+        RouteGateState::Active
+    );
+    assert!(matches!(
+        installed.checkpoint().checkpoint().step,
+        ReconcileStep::Stable {
+            state: StableState::Running
+        }
+    ));
+}
+
+#[test]
+fn real_admission_cell_global_close_requires_higher_epochs_before_reopen() {
+    let root = TempDir::new().expect("tempdir");
+    let source_desired = running_desired_with_endpoints(
+        1,
+        vec![
+            endpoint("ep_a", "a.example.test", 1, 8080),
+            endpoint("ep_b", "b.example.test", 7, 8081),
+        ],
+    );
+    let source_checkpoint = running_checkpoint(&source_desired, 10);
+    let store = store(&root, &source_desired.cat_id);
+    let source = store.create(&source_checkpoint).expect("source checkpoint");
+    let cell = AdmissionCell::new(
+        AdmissionSnapshot::from_checkpoint(&source_checkpoint).expect("source snapshot"),
+    )
+    .expect("admission cell");
+    let mut port = cell.port();
+
+    let mut stop = source_desired;
+    stop.desired_revision = revision(2);
+    stop.target = RuntimeTarget::Suspended;
+    refresh_spec_digest(&mut stop);
+    let closed = GateSequencer::new(&store, &mut port)
+        .close_all(&source, &stop, times(20, 21))
+        .expect("global close");
+    let closed_snapshot = cell.snapshot();
+    assert_eq!(
+        closed_snapshot.lifecycle_admission(),
+        LifecycleAdmission::Closed
+    );
+
+    // A globally closed binding is not a prepared InstallGate edge. Merely
+    // changing it back to Active must not resurrect the old serving epoch.
+    let mut old_routes = closed_snapshot.endpoints().to_vec();
+    old_routes[0].gate = RouteGateState::Active;
+    let old_reopen = AdmissionSnapshot::new(
+        closed_snapshot.applied_desired_revision(),
+        closed_snapshot.spec_digest().clone(),
+        closed_snapshot.placement().clone(),
+        closed_snapshot.runtime_incarnation().cloned(),
+        LifecycleAdmission::Open,
+        old_routes,
+    );
+    assert_eq!(
+        port.install_gate(&closed_snapshot, &old_reopen, &id("ep_a")),
+        Err(GatePortError::Unavailable)
+    );
+    assert_eq!(cell.snapshot(), closed_snapshot);
+
+    let fresh = running_desired_with_endpoints(
+        3,
+        vec![
+            endpoint("ep_a", "a.example.test", 2, 9090),
+            endpoint("ep_b", "b.example.test", 8, 9091),
+        ],
+    );
+    let a = GateSequencer::new(&store, &mut port)
+        .install_gate(closed.checkpoint(), &fresh, &id("ep_a"), times(30, 31))
+        .expect("install fresh A");
+    assert_eq!(
+        snapshot_route(&cell.snapshot(), "ep_a").binding.route_epoch,
+        epoch(2)
+    );
+    assert_eq!(
+        snapshot_route(&cell.snapshot(), "ep_a").gate,
+        RouteGateState::Active
+    );
+    assert_eq!(
+        snapshot_route(&cell.snapshot(), "ep_b").binding.route_epoch,
+        epoch(7)
+    );
+    assert_eq!(
+        snapshot_route(&cell.snapshot(), "ep_b").gate,
+        RouteGateState::Closed
+    );
+
+    GateSequencer::new(&store, &mut port)
+        .install_gate(a.checkpoint(), &fresh, &id("ep_b"), times(32, 33))
+        .expect("install fresh B");
+    assert_eq!(
+        snapshot_route(&cell.snapshot(), "ep_b").binding.route_epoch,
+        epoch(8)
+    );
+    assert!(cell
+        .snapshot()
+        .endpoints()
+        .iter()
+        .all(|route| route.gate == RouteGateState::Active));
+}
+
+#[test]
+fn real_admission_cell_global_close_rejects_top_tuple_drift_without_effect() {
+    let source_desired = desired(
+        2,
+        RuntimeTarget::Running,
+        7,
+        RuntimeTransition::CancelAndDrain,
+    );
+    let source_checkpoint = running_checkpoint(&source_desired, 10);
+    let source = AdmissionSnapshot::from_checkpoint(&source_checkpoint).expect("source snapshot");
+    let cell = AdmissionCell::new(source.clone()).expect("admission cell");
+    let mut port = cell.port();
+
+    let closed_routes = source
+        .endpoints()
+        .iter()
+        .cloned()
+        .map(|mut route| {
+            route.gate = RouteGateState::Closed;
+            route
+        })
+        .collect::<Vec<_>>();
+    let mut lower_placement = source.placement().clone();
+    lower_placement.placement_epoch = epoch(2);
+    let mut wrong_node = source.placement().clone();
+    wrong_node.node_id = id("node_b");
+    let candidates = [
+        AdmissionSnapshot::new(
+            revision(1),
+            source.spec_digest().clone(),
+            source.placement().clone(),
+            source.runtime_incarnation().cloned(),
+            LifecycleAdmission::Closed,
+            closed_routes.clone(),
+        ),
+        AdmissionSnapshot::new(
+            source.applied_desired_revision(),
+            digest('e'),
+            source.placement().clone(),
+            source.runtime_incarnation().cloned(),
+            LifecycleAdmission::Closed,
+            closed_routes.clone(),
+        ),
+        AdmissionSnapshot::new(
+            revision(3),
+            digest('e'),
+            lower_placement,
+            source.runtime_incarnation().cloned(),
+            LifecycleAdmission::Closed,
+            closed_routes.clone(),
+        ),
+        AdmissionSnapshot::new(
+            revision(3),
+            digest('e'),
+            wrong_node,
+            source.runtime_incarnation().cloned(),
+            LifecycleAdmission::Closed,
+            closed_routes.clone(),
+        ),
+        AdmissionSnapshot::new(
+            revision(3),
+            digest('e'),
+            source.placement().clone(),
+            Some(random('6')),
+            LifecycleAdmission::Closed,
+            closed_routes,
+        ),
+    ];
+    for candidate in candidates {
+        assert_eq!(
+            port.close_all(&source, &candidate),
+            Err(GatePortError::Unavailable)
+        );
+        assert_eq!(cell.snapshot(), source);
+    }
 }
 
 #[test]

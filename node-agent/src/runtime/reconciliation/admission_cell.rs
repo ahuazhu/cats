@@ -294,6 +294,7 @@ impl AdmissionGatePort for AdmissionCellPort {
         replacement: &AdmissionSnapshot,
         endpoint_id: &Id,
     ) -> Result<(), GatePortError> {
+        validate_snapshot(expected).map_err(|_| GatePortError::Unavailable)?;
         validate_snapshot(replacement).map_err(|_| GatePortError::Unavailable)?;
         if !valid_endpoint_top_transition(expected, replacement)
             || !other_endpoints_equal(expected, replacement, endpoint_id)
@@ -329,8 +330,10 @@ impl AdmissionGatePort for AdmissionCellPort {
         replacement: &AdmissionSnapshot,
         endpoint_id: &Id,
     ) -> Result<(), GatePortError> {
+        validate_snapshot(expected).map_err(|_| GatePortError::Unavailable)?;
         validate_snapshot(replacement).map_err(|_| GatePortError::Unavailable)?;
         if !valid_endpoint_top_transition(expected, replacement)
+            || expected.lifecycle_admission() != replacement.lifecycle_admission()
             || !other_endpoints_equal(expected, replacement, endpoint_id)
             || !valid_close_transition(expected, replacement, endpoint_id)
         {
@@ -353,8 +356,10 @@ impl AdmissionGatePort for AdmissionCellPort {
         replacement: &AdmissionSnapshot,
         endpoint_id: &Id,
     ) -> Result<(), GatePortError> {
+        validate_snapshot(expected).map_err(|_| GatePortError::Unavailable)?;
         validate_snapshot(replacement).map_err(|_| GatePortError::Unavailable)?;
         if !valid_endpoint_top_transition(expected, replacement)
+            || expected.lifecycle_admission() != replacement.lifecycle_admission()
             || !other_endpoints_equal(expected, replacement, endpoint_id)
             || !matches!(endpoint(expected, endpoint_id), Some(route) if route.gate == RouteGateState::Closed)
             || endpoint(replacement, endpoint_id).is_some()
@@ -507,7 +512,6 @@ fn valid_endpoint_top_transition(
 ) -> bool {
     expected.placement() == replacement.placement()
         && expected.runtime_incarnation() == replacement.runtime_incarnation()
-        && expected.lifecycle_admission() == replacement.lifecycle_admission()
         && replacement.applied_desired_revision() >= expected.applied_desired_revision()
         && (replacement.applied_desired_revision() > expected.applied_desired_revision()
             || replacement.spec_digest() == expected.spec_digest())
@@ -554,8 +558,18 @@ fn validate_global_close(
     expected: &AdmissionSnapshot,
     replacement: &AdmissionSnapshot,
 ) -> Result<(), GatePortError> {
+    validate_snapshot(expected).map_err(|_| GatePortError::Unavailable)?;
     validate_snapshot(replacement).map_err(|_| GatePortError::Unavailable)?;
-    if replacement.lifecycle_admission() != LifecycleAdmission::Closed
+    let expected_placement = expected.placement();
+    let replacement_placement = replacement.placement();
+    if replacement.applied_desired_revision() < expected.applied_desired_revision()
+        || (replacement.applied_desired_revision() == expected.applied_desired_revision()
+            && replacement.spec_digest() != expected.spec_digest())
+        || replacement_placement.kind != expected_placement.kind
+        || replacement_placement.node_id != expected_placement.node_id
+        || replacement_placement.placement_epoch < expected_placement.placement_epoch
+        || replacement.runtime_incarnation() != expected.runtime_incarnation()
+        || replacement.lifecycle_admission() != LifecycleAdmission::Closed
         || replacement
             .endpoints()
             .iter()
