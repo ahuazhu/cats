@@ -147,8 +147,9 @@ impl SignedRunningPublicationRecovery {
             return Ok(RuntimePreScanRecoveryOutcome::NoChange);
         };
         let checkpoint_directory = context.state_directory().path().join(CHECKPOINT_NAMESPACE);
-        let store = FileCheckpointStore::open(&checkpoint_directory, cat_id)
-            .context("open publication recovery checkpoint store")?;
+        let store =
+            FileCheckpointStore::open_preserving_checkpoint_temp(&checkpoint_directory, cat_id)
+                .context("open publication recovery checkpoint store")?;
         let Some(stored) = store
             .load()
             .context("load publication recovery checkpoint")?
@@ -229,8 +230,11 @@ impl RuntimePreScanRecovery for SignedRunningPublicationRecovery {
             LocalPublicationRecoveryEvidence::DefiniteReleaseRejectionTarget { cat_id } => {
                 let checkpoint_directory =
                     context.state_directory().path().join(CHECKPOINT_NAMESPACE);
-                let store = FileCheckpointStore::open(&checkpoint_directory, &cat_id)
-                    .context("open definite release rejection confirmation store")?;
+                let store = FileCheckpointStore::open_preserving_checkpoint_temp(
+                    &checkpoint_directory,
+                    &cat_id,
+                )
+                .context("open definite release rejection confirmation store")?;
                 let Some(stored) = store
                     .load()
                     .context("load checkpoint for definite release rejection confirmation")?
@@ -252,8 +256,11 @@ impl RuntimePreScanRecovery for SignedRunningPublicationRecovery {
             LocalPublicationRecoveryEvidence::DefiniteReleaseRejectionTemp { cat_id } => {
                 let checkpoint_directory =
                     context.state_directory().path().join(CHECKPOINT_NAMESPACE);
-                let store = FileCheckpointStore::open(&checkpoint_directory, &cat_id)
-                    .context("open definite release rejection recovery store")?;
+                let store = FileCheckpointStore::open_preserving_checkpoint_temp(
+                    &checkpoint_directory,
+                    &cat_id,
+                )
+                .context("open definite release rejection recovery store")?;
                 let Some(stored) = store
                     .load()
                     .context("load checkpoint for definite release rejection recovery")?
@@ -4693,6 +4700,226 @@ mod tests {
     }
 
     #[test]
+    fn unsynced_release_rejection_temp_is_durable_before_recovery_links_it() {
+        let root = tempfile::tempdir().unwrap();
+        let desired = desired();
+        let (authority, marker_path, temporary_path) = persist_release_rejection_fixture(
+            root.path(),
+            &desired,
+            RuntimeVolumeTransitionPreconditionProblem::CleanupEvidenceMismatch,
+        );
+        let canonical = std::fs::read(&marker_path).unwrap();
+        let marker =
+            super::super::checkpoint::decode_definite_release_rejection(&canonical, &marker_path)
+                .unwrap();
+        let directory = root.path().join(CHECKPOINT_NAMESPACE);
+        let store = FileCheckpointStore::open(&directory, &desired.cat_id).unwrap();
+        let stored = store.load().unwrap().unwrap();
+        std::fs::remove_file(&marker_path).unwrap();
+        std::fs::File::open(&directory).unwrap().sync_all().unwrap();
+        store.inject_release_rejection_crash_once(
+            super::super::checkpoint::ReleaseRejectionWriteStage::BeforeTempFileSync,
+        );
+        assert!(matches!(
+            store.persist_definite_release_rejection(&stored, &marker.request, marker.problem,),
+            Err(super::super::CheckpointStoreError::InjectedCrash)
+        ));
+        drop(store);
+        assert!(!marker_path.exists());
+        assert_eq!(std::fs::read(&temporary_path).unwrap(), canonical);
+
+        // A fresh recovery instance represents the process which inherited a
+        // write-complete but never-fsynced temp from its predecessor.
+        let recovery = SignedRunningPublicationRecovery::new(authority.clone());
+        assert_eq!(
+            recovery
+                .recover_one(recovery_context(root.path(), &desired))
+                .unwrap(),
+            RuntimePreScanRecoveryOutcome::Recovered {
+                cat_id: desired.cat_id.clone()
+            }
+        );
+        assert!(!temporary_path.exists());
+        assert_eq!(std::fs::read(&marker_path).unwrap(), canonical);
+
+        // Reopen from another fresh owner after the recovered directory
+        // barriers. The only visible target remains canonical and exact.
+        let reopened = FileCheckpointStore::open(&directory, &desired.cat_id).unwrap();
+        let reopened_checkpoint = reopened.load().unwrap().unwrap();
+        assert_eq!(
+            reopened
+                .load_definite_release_rejection(&reopened_checkpoint)
+                .unwrap(),
+            Some(marker.clone())
+        );
+        drop(reopened);
+        assert_eq!(
+            SignedRunningPublicationRecovery::new(authority.clone())
+                .recover_one(recovery_context(root.path(), &desired))
+                .unwrap(),
+            RuntimePreScanRecoveryOutcome::NoChange
+        );
+
+        let attachment = attachment(&desired);
+        drop(
+            AuthorizedBlockdStore::new(StateDirectory::unanchored(root.path().to_path_buf()))
+                .prepare(&desired, &desired.volumes[0], &attachment)
+                .unwrap(),
+        );
+        let closed = scan_runtime(root.path(), &desired, authority, '8', 3);
+        assert!(closed.conditions.is_empty());
+    }
+
+    #[test]
+    fn node_wide_unstable_publications_precede_stable_rejection_confirmation() {
+        for unstable in ["checkpoint", "release-rejection", "authorized-blockd"] {
+            let root = tempfile::tempdir().unwrap();
+            let stable = desired();
+            let other = second_desired();
+            let stable_attachment = attachment(&stable);
+            let other_attachment = attachment(&other);
+            let (authority, stable_marker, _) = persist_release_rejection_fixture(
+                root.path(),
+                &stable,
+                RuntimeVolumeTransitionPreconditionProblem::CleanupEvidenceMismatch,
+            );
+            drop(
+                AuthorizedBlockdStore::new(StateDirectory::unanchored(root.path().to_path_buf()))
+                    .prepare(&stable, &stable.volumes[0], &stable_attachment)
+                    .unwrap(),
+            );
+
+            let checkpoint_directory = root.path().join(CHECKPOINT_NAMESPACE);
+            let other_checkpoint_temp =
+                checkpoint_directory.join(format!(".cat-{}.checkpoint.tmp", other.cat_id));
+            let other_data =
+                authorized_blockd_data_directory(root.path(), &other, &other_attachment.identity);
+            let other_rejection = super::super::checkpoint::release_rejection_path(
+                &checkpoint_directory,
+                &other.cat_id,
+            );
+            let other_rejection_temp = super::super::checkpoint::release_rejection_temporary_path(
+                &checkpoint_directory,
+                &other.cat_id,
+            );
+            match unstable {
+                "checkpoint" => {
+                    std::fs::write(&other_checkpoint_temp, b"interrupted checkpoint").unwrap();
+                    std::fs::set_permissions(
+                        &other_checkpoint_temp,
+                        std::fs::Permissions::from_mode(0o600),
+                    )
+                    .unwrap();
+                }
+                "release-rejection" => {
+                    let _ = persist_release_rejection_fixture(
+                        root.path(),
+                        &other,
+                        RuntimeVolumeTransitionPreconditionProblem::AuthorizationBranchConflict,
+                    );
+                    drop(
+                        AuthorizedBlockdStore::new(StateDirectory::unanchored(
+                            root.path().to_path_buf(),
+                        ))
+                        .prepare(&other, &other.volumes[0], &other_attachment)
+                        .unwrap(),
+                    );
+                    std::fs::rename(&other_rejection, &other_rejection_temp).unwrap();
+                }
+                "authorized-blockd" => {
+                    persist_acquire_checkpoint(root.path(), &other);
+                    drop(
+                        AuthorizedBlockdStore::new(StateDirectory::unanchored(
+                            root.path().to_path_buf(),
+                        ))
+                        .prepare(&other, &other.volumes[0], &other_attachment)
+                        .unwrap(),
+                    );
+                    shape_publication_window(&other_data, PublicationWindow::IdentityTemp);
+                }
+                _ => unreachable!(),
+            }
+            authority.set_records(BTreeMap::from([
+                (
+                    stable.volumes[0].volume_id.clone(),
+                    Ok(owned_record(&stable, &stable_attachment)),
+                ),
+                (
+                    other.volumes[0].volume_id.clone(),
+                    if unstable == "checkpoint" {
+                        Ok(unowned_record(&other))
+                    } else {
+                        Ok(owned_record(&other, &other_attachment))
+                    },
+                ),
+            ]));
+
+            let stable_before = std::fs::read(&stable_marker).unwrap();
+            let stable_identity_before = std::fs::metadata(&stable_marker).unwrap();
+            let desireds = vec![stable.clone(), other.clone()];
+            assert_eq!(
+                SignedRunningPublicationRecovery::new(authority.clone())
+                    .recover_one(recovery_context_with_desireds(
+                        root.path(),
+                        desireds.clone(),
+                    ))
+                    .unwrap(),
+                RuntimePreScanRecoveryOutcome::Recovered {
+                    cat_id: other.cat_id.clone()
+                },
+                "{unstable} did not run before the stable target"
+            );
+            assert_eq!(std::fs::read(&stable_marker).unwrap(), stable_before);
+            let stable_identity_after = std::fs::metadata(&stable_marker).unwrap();
+            assert_eq!(stable_identity_after.dev(), stable_identity_before.dev());
+            assert_eq!(stable_identity_after.ino(), stable_identity_before.ino());
+            assert_eq!(
+                stable_identity_after.nlink(),
+                stable_identity_before.nlink()
+            );
+            match unstable {
+                "checkpoint" => assert!(!other_checkpoint_temp.exists()),
+                "release-rejection" => {
+                    assert!(other_rejection.exists());
+                    assert!(!other_rejection_temp.exists());
+                }
+                "authorized-blockd" => {
+                    assert_eq!(prepared_file_snapshot(&other_data).len(), 3)
+                }
+                _ => unreachable!(),
+            }
+
+            assert_eq!(
+                SignedRunningPublicationRecovery::new(authority.clone())
+                    .recover_one(recovery_context_with_desireds(
+                        root.path(),
+                        desireds.clone(),
+                    ))
+                    .unwrap(),
+                RuntimePreScanRecoveryOutcome::NoChange,
+                "{unstable} did not leave stable target confirmation for the next round"
+            );
+            let scanner = fresh_scanner_with_blob(
+                root.path(),
+                authority,
+                Arc::new(RecordingBlob::present(&stable)),
+            );
+            let RuntimeInventoryScanOutcome::Complete(inventory) = scanner
+                .scan_complete(scan_context_with_desireds(desireds))
+                .unwrap()
+            else {
+                panic!("{unstable} did not converge to a complete full scan")
+            };
+            let stable_runtime = inventory
+                .runtimes()
+                .iter()
+                .find(|runtime| runtime.cat_id == stable.cat_id)
+                .unwrap();
+            assert!(stable_runtime.conditions.is_empty(), "{unstable}");
+        }
+    }
+
+    #[test]
     fn invalid_release_rejection_residue_is_preserved_and_never_recovered() {
         for residue in [
             "corrupt-target",
@@ -4702,6 +4929,7 @@ mod tests {
             "foreign",
             "checkpoint-aba",
             "request-mismatch",
+            "target-with-checkpoint-temp",
             "exact-temp-with-checkpoint-temp",
         ] {
             let root = tempfile::tempdir().unwrap();
@@ -4763,6 +4991,20 @@ mod tests {
                         .unwrap()
                         .release_transition_id = random('9');
                     std::fs::write(&marker, serde_json::to_vec(&rejection).unwrap()).unwrap();
+                }
+                "target-with-checkpoint-temp" => {
+                    let checkpoint_temp = root
+                        .path()
+                        .join(CHECKPOINT_NAMESPACE)
+                        .join(format!(".cat-{}.checkpoint.tmp", desired.cat_id));
+                    std::fs::write(&checkpoint_temp, b"partial checkpoint").unwrap();
+                    std::fs::set_permissions(
+                        &checkpoint_temp,
+                        <std::fs::Permissions as std::os::unix::fs::PermissionsExt>::from_mode(
+                            0o600,
+                        ),
+                    )
+                    .unwrap();
                 }
                 "exact-temp-with-checkpoint-temp" => {
                     std::fs::rename(&marker, &temporary).unwrap();
@@ -5165,8 +5407,21 @@ mod tests {
         root: &std::path::Path,
         desired: &DesiredRuntimeSpec,
     ) -> RuntimePreScanRecoveryContext {
+        recovery_context_with_desireds(root, vec![desired.clone()])
+    }
+
+    fn recovery_context_with_desireds(
+        root: &std::path::Path,
+        desired_specs: Vec<DesiredRuntimeSpec>,
+    ) -> RuntimePreScanRecoveryContext {
+        let node_id = desired_specs
+            .first()
+            .expect("recovery fixture has at least one Desired")
+            .placement
+            .node_id
+            .clone();
         let session = SessionBinding {
-            node_id: desired.placement.node_id.clone(),
+            node_id,
             node_boot_id: NodeBootId::new("33333333333333333333333333333333").unwrap(),
             agent_instance_id: random('8'),
             agent_session_epoch: epoch(3),
@@ -5184,7 +5439,7 @@ mod tests {
                     read_position: sequence(21),
                     issued_at_unix_ms: unix_ms(1_900_000_005_000),
                     expires_at_unix_ms: unix_ms(1_900_000_035_000),
-                    desired_specs: vec![desired.clone()],
+                    desired_specs,
                 },
             },
             Instant::now() + Duration::from_secs(30),
@@ -5290,6 +5545,26 @@ mod tests {
             transition: RuntimeTransition::CancelAndDrain,
             spec_digest: Sha256Digest::from_bytes([9; 32]),
         };
+        desired.spec_digest = spec_digest(&desired).unwrap();
+        desired
+    }
+
+    fn second_desired() -> DesiredRuntimeSpec {
+        let mut desired = desired();
+        desired.cat_id = id("cat_02");
+        desired.volumes[0].volume_intent_id = id("vint_second");
+        desired.volumes[0].disk_id = id("disk_second");
+        desired.volumes[0].volume_id = id("vol_second");
+        desired.volumes[0].attachment_id = id("att_second");
+        desired.volumes[0].guest_device.serial = id("cats-second");
+        desired.volumes[0].acquire = VolumeAcquire::Normal {
+            transition_id: random('a'),
+            expected_unowned_epoch: fence(0),
+        };
+        desired.runtime.network_config.network_id = id("net_02");
+        desired.runtime.network_config.guest_mac = MacAddress::new("02:ca:0a:f0:00:0a").unwrap();
+        desired.runtime.network_config.guest_ipv4 = Ipv4Address::new("10.240.0.10").unwrap();
+        desired.runtime.network_config.gateway_ipv4 = Ipv4Address::new("10.240.0.9").unwrap();
         desired.spec_digest = spec_digest(&desired).unwrap();
         desired
     }
@@ -5435,8 +5710,20 @@ mod tests {
     }
 
     fn scan_context(desired: &DesiredRuntimeSpec) -> RuntimeInventoryScanContext {
+        scan_context_with_desireds(vec![desired.clone()])
+    }
+
+    fn scan_context_with_desireds(
+        desired_specs: Vec<DesiredRuntimeSpec>,
+    ) -> RuntimeInventoryScanContext {
+        let node_id = desired_specs
+            .first()
+            .expect("scan fixture has at least one Desired")
+            .placement
+            .node_id
+            .clone();
         let session = SessionBinding {
-            node_id: desired.placement.node_id.clone(),
+            node_id,
             node_boot_id: NodeBootId::new("33333333333333333333333333333333").unwrap(),
             agent_instance_id: random('8'),
             agent_session_epoch: epoch(3),
@@ -5453,7 +5740,7 @@ mod tests {
                     read_position: sequence(21),
                     issued_at_unix_ms: unix_ms(1_900_000_005_000),
                     expires_at_unix_ms: unix_ms(1_900_000_035_000),
-                    desired_specs: vec![desired.clone()],
+                    desired_specs,
                 },
             },
             Instant::now() + Duration::from_secs(30),

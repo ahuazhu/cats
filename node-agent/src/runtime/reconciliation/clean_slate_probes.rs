@@ -1540,55 +1540,58 @@ pub(crate) fn classify_local_publication_recovery(
             return Ok(LocalPublicationRecoveryEvidence::None);
         }
     }
-    if let Some(cat_id) = release_rejection_temps
-        .keys()
-        .find(|cat_id| !temps.contains(cat_id))
-        .cloned()
-    {
+    if temps.iter().any(|cat_id| {
+        release_rejections.contains_key(cat_id) || release_rejection_temps.contains_key(cat_id)
+    }) {
+        // Opening a same-Cat checkpoint store owns and removes its generic
+        // checkpoint temp. Never do that while either form of durable release
+        // rejection evidence is present for that Cat.
+        return Ok(LocalPublicationRecoveryEvidence::None);
+    }
+    if let Some(cat_id) = release_rejection_temps.keys().next().cloned() {
         return Ok(LocalPublicationRecoveryEvidence::DefiniteReleaseRejectionTemp { cat_id });
     }
-    if !release_rejection_temps.is_empty() {
-        // A same-Cat checkpoint temp makes opening its store destructive: the
-        // store owns and settles that basename. Keep both publications intact
-        // until the release-rejection shape can be recovered in isolation.
-        return Ok(LocalPublicationRecoveryEvidence::None);
-    }
-    if let Some(cat_id) = release_rejections
-        .keys()
-        .find(|cat_id| !temps.contains(cat_id))
-        .cloned()
-    {
-        return Ok(LocalPublicationRecoveryEvidence::DefiniteReleaseRejectionTarget { cat_id });
-    }
-    if !release_rejections.is_empty() {
-        return Ok(LocalPublicationRecoveryEvidence::None);
-    }
-    if let Some(cat_id) = superseded.into_iter().next() {
-        return Ok(LocalPublicationRecoveryEvidence::SupersededCheckpoint { cat_id });
-    }
-    if let Some(cat_id) = temps.into_iter().next() {
+    if let Some(cat_id) = temps.iter().next().cloned() {
         return Ok(LocalPublicationRecoveryEvidence::CheckpointTemp { cat_id });
     }
 
+    // Stable target durability confirmation is deliberately last among local
+    // publication work. A target fsync is not allowed to hide a recoverable
+    // checkpoint or authorized-blockd temp for another Cat on the same Node.
     let data = scan_authorized_blockd_data(
         &root,
         context.state_directory().path(),
         &scan_context,
         ProbeLimits::default(),
     )?;
-    for desired in &context.coordinates().desired.desired_specs {
-        let Some(checkpoint) = checkpoints.get(&desired.cat_id) else {
-            continue;
-        };
-        if matches!(
-            checkpoint.step,
-            cats_api::runtime_reconciliation::ReconcileStep::AcquireVolume { .. }
-        ) && !data.evidence.contains_key(&desired.cat_id)
-        {
-            return Ok(LocalPublicationRecoveryEvidence::AuthorizedBlockd {
-                cat_id: desired.cat_id.clone(),
-            });
-        }
+    let authorized_recovery = context
+        .coordinates()
+        .desired
+        .desired_specs
+        .iter()
+        .filter_map(|desired| {
+            let checkpoint = checkpoints.get(&desired.cat_id)?;
+            (matches!(
+                checkpoint.step,
+                cats_api::runtime_reconciliation::ReconcileStep::AcquireVolume { .. }
+            ) && !data.evidence.contains_key(&desired.cat_id))
+            .then(|| desired.cat_id.clone())
+        })
+        .collect::<BTreeSet<_>>();
+    if let Some(cat_id) = authorized_recovery.into_iter().next() {
+        return Ok(LocalPublicationRecoveryEvidence::AuthorizedBlockd { cat_id });
+    }
+    if !data.complete {
+        // An unsupported, racing or foreign authorized publication remains
+        // unstable evidence even when no current Acquire can recover it.
+        // Do not let a stable rejection-target fsync jump ahead of it.
+        return Ok(LocalPublicationRecoveryEvidence::None);
+    }
+    if let Some(cat_id) = release_rejections.keys().next().cloned() {
+        return Ok(LocalPublicationRecoveryEvidence::DefiniteReleaseRejectionTarget { cat_id });
+    }
+    if let Some(cat_id) = superseded.into_iter().next() {
+        return Ok(LocalPublicationRecoveryEvidence::SupersededCheckpoint { cat_id });
     }
     Ok(LocalPublicationRecoveryEvidence::None)
 }

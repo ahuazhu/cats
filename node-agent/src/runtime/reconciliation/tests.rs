@@ -2,6 +2,7 @@ use std::collections::VecDeque;
 use std::ffi::CString;
 use std::fs;
 use std::os::unix::fs::symlink;
+use std::os::unix::fs::MetadataExt as _;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::{Arc, Barrier};
@@ -538,6 +539,37 @@ fn checkpoint_temp_space_is_bounded_across_failures_and_restart() {
         .replace(&expected, &replacement)
         .expect("eventual successful replacement");
     assert_eq!(checkpoint_temp_stats(root.path()), (0, 0));
+}
+
+#[test]
+fn unrelated_publication_recovery_open_preserves_checkpoint_temp() {
+    let root = TempDir::new().expect("tempdir");
+    let desired = desired(
+        1,
+        RuntimeTarget::Running,
+        1,
+        RuntimeTransition::CancelAndDrain,
+    );
+    let checkpoint = running_checkpoint(&desired, 10);
+    let store = store(&root, &desired.cat_id);
+    store.create(&checkpoint).expect("initial checkpoint");
+    drop(store);
+
+    let temporary = root.path().join(".cat-cat_01.checkpoint.tmp");
+    let bytes = b"interrupted checkpoint publication";
+    fs::write(&temporary, bytes).expect("write checkpoint temp");
+    let before = fs::metadata(&temporary).expect("checkpoint temp metadata");
+
+    let opened = FileCheckpointStore::open_preserving_checkpoint_temp(root.path(), &desired.cat_id);
+    assert!(matches!(
+        opened,
+        Err(CheckpointStoreError::UnsafeEntry { .. })
+    ));
+    assert_eq!(fs::read(&temporary).expect("checkpoint temp bytes"), bytes);
+    let after = fs::metadata(&temporary).expect("checkpoint temp metadata after open");
+    assert_eq!(after.dev(), before.dev());
+    assert_eq!(after.ino(), before.ino());
+    assert_eq!(after.nlink(), before.nlink());
 }
 
 fn assert_checkpoint_temp_bound(root: &Path) {

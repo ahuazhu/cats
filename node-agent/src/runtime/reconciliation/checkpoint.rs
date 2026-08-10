@@ -1,6 +1,6 @@
 use std::ffi::{CStr, CString};
 use std::fs::{File, Metadata, OpenOptions};
-use std::io::{self, Read, Write};
+use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::os::fd::{AsRawFd, FromRawFd};
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
@@ -122,6 +122,25 @@ impl FileCheckpointStore {
     /// The final directory component and the per-Cat lock file must not be
     /// symlinks.
     pub fn open(directory: &Path, cat_id: &Id) -> Result<Self, CheckpointStoreError> {
+        Self::open_with_checkpoint_temp_policy(directory, cat_id, true)
+    }
+
+    /// Opens the same locked store but refuses to remove a checkpoint temp.
+    /// Pre-scan recovery uses this after a read-only global classification so
+    /// a late same-Cat temp cannot be silently consumed by an unrelated
+    /// release-rejection or authorized-publication recovery.
+    pub(super) fn open_preserving_checkpoint_temp(
+        directory: &Path,
+        cat_id: &Id,
+    ) -> Result<Self, CheckpointStoreError> {
+        Self::open_with_checkpoint_temp_policy(directory, cat_id, false)
+    }
+
+    fn open_with_checkpoint_temp_policy(
+        directory: &Path,
+        cat_id: &Id,
+        settle_checkpoint_temp: bool,
+    ) -> Result<Self, CheckpointStoreError> {
         std::fs::create_dir_all(directory)
             .map_err(|source| io_error("create checkpoint directory", directory, source))?;
 
@@ -199,12 +218,37 @@ impl FileCheckpointStore {
             return Err(io_error("lock checkpoint writer", &lock_path, source));
         }
 
-        // The held per-Cat lock makes this exact deterministic basename ours.
-        // A crashed predecessor is never opened, inspected, scanned for, or
-        // adopted; unlinkat removes only this one directory-relative entry.
-        unlink_at_if_exists(&directory_file, &temporary_name).map_err(|source| {
-            io_error("remove stale checkpoint temp file", &temporary_path, source)
-        })?;
+        if settle_checkpoint_temp {
+            // The held per-Cat lock makes this exact deterministic basename
+            // ours. Only the explicitly classified CheckpointTemp recovery
+            // path may consume it.
+            unlink_at_if_exists(&directory_file, &temporary_name).map_err(|source| {
+                io_error("remove stale checkpoint temp file", &temporary_path, source)
+            })?;
+        } else {
+            match open_at(
+                &directory_file,
+                &temporary_name,
+                libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_CLOEXEC | libc::O_NONBLOCK,
+                0,
+            ) {
+                Ok(file) => {
+                    verify_regular_single_link(&file, &temporary_path)?;
+                    return Err(CheckpointStoreError::UnsafeEntry {
+                        path: temporary_path,
+                        reason: "checkpoint temp conflicts with this recovery",
+                    });
+                }
+                Err(source) if source.kind() == io::ErrorKind::NotFound => {}
+                Err(source) => {
+                    return Err(map_open_error(
+                        "inspect checkpoint temp before recovery",
+                        &temporary_path,
+                        source,
+                    ))
+                }
+            }
+        }
 
         Ok(Self {
             directory: directory_file,
@@ -527,6 +571,7 @@ impl FileCheckpointStore {
                 source,
             )
         })?;
+        self.maybe_crash_release_rejection(ReleaseRejectionWriteStage::BeforeTempFileSync)?;
         temporary.sync_all().map_err(|source| {
             io_error(
                 "sync release rejection temp file",
@@ -639,6 +684,40 @@ impl FileCheckpointStore {
             expected.checkpoint(),
             &[1, 2],
         )?;
+        // The predecessor may have exited after `write_all` but before its
+        // file durability barrier. Never link even canonical bytes into the
+        // target namespace until this exact open inode is durable.
+        temporary.sync_all().map_err(|source| {
+            io_error(
+                "sync release rejection temp during recovery",
+                &self.release_rejection_temporary_path,
+                source,
+            )
+        })?;
+        self.directory.sync_all().map_err(|source| {
+            io_error(
+                "sync release rejection temp link during recovery",
+                &self.directory_path,
+                source,
+            )
+        })?;
+        let (synced_marker, synced_identity, synced_links) = read_definite_release_rejection_file(
+            &temporary,
+            &self.release_rejection_temporary_path,
+            expected.checkpoint(),
+            &[1, 2],
+        )?;
+        if synced_identity.device != temporary_identity.device
+            || synced_identity.inode != temporary_identity.inode
+            || synced_links != temporary_links
+            || synced_marker != marker
+        {
+            return Err(invalid_release_rejection(
+                &self.release_rejection_temporary_path,
+                "temp identity, link count or content changed across its durability barrier",
+            ));
+        }
+        self.verify_expected(ExpectedTarget::Exact(expected))?;
 
         let target = match open_at(
             &self.directory,
@@ -1043,6 +1122,35 @@ impl FileCheckpointStore {
         });
     }
 
+    #[cfg(not(test))]
+    fn maybe_crash_release_rejection(
+        &self,
+        _stage: ReleaseRejectionWriteStage,
+    ) -> Result<(), CheckpointStoreError> {
+        Ok(())
+    }
+
+    #[cfg(test)]
+    fn maybe_crash_release_rejection(
+        &self,
+        stage: ReleaseRejectionWriteStage,
+    ) -> Result<(), CheckpointStoreError> {
+        let mut faults = self.faults.lock().expect("test fault lock");
+        if faults.release_rejection_crash_once == Some(stage) {
+            faults.release_rejection_crash_once = None;
+            return Err(CheckpointStoreError::InjectedCrash);
+        }
+        Ok(())
+    }
+
+    #[cfg(test)]
+    pub(super) fn inject_release_rejection_crash_once(&self, stage: ReleaseRejectionWriteStage) {
+        self.faults
+            .lock()
+            .expect("test fault lock")
+            .release_rejection_crash_once = Some(stage);
+    }
+
     #[cfg(test)]
     pub(super) fn before_publish_once(&self, hook: impl FnOnce(&Path) + Send + 'static) {
         self.faults.lock().expect("test fault lock").before_publish = Some(Box::new(hook));
@@ -1165,7 +1273,12 @@ fn read_definite_release_rejection_file(
     let cap = u64::try_from(RELEASE_REJECTION_MAX_BYTES)
         .expect("release rejection byte cap fits u64")
         .saturating_add(1);
-    file.take(cap)
+    let mut reader = file;
+    reader
+        .seek(SeekFrom::Start(0))
+        .map_err(|source| io_error("rewind definite release rejection marker", path, source))?;
+    reader
+        .take(cap)
         .read_to_end(&mut bytes)
         .map_err(|source| io_error("read definite release rejection marker", path, source))?;
     let after_metadata = file
@@ -1351,6 +1464,11 @@ pub(super) enum WriteStage {
     DirectorySynced,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum ReleaseRejectionWriteStage {
+    BeforeTempFileSync,
+}
+
 #[cfg(test)]
 pub(super) const TEST_PROCESS_EXIT_CODE: i32 = 86;
 
@@ -1360,6 +1478,7 @@ struct TestFaults {
     crash_once: Option<TestCrash>,
     exit_once: Option<TestCrash>,
     before_publish: Option<BeforePublishHook>,
+    release_rejection_crash_once: Option<ReleaseRejectionWriteStage>,
 }
 
 #[cfg(test)]
