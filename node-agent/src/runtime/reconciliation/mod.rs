@@ -21,6 +21,11 @@ mod gate_planner;
 mod inventory;
 mod normal_acquire;
 mod root_provision;
+#[expect(
+    dead_code,
+    reason = "the focused AcquireVolume step lands before its production Running dispatcher"
+)]
+mod signed_running;
 // This focused foundation intentionally lands before the production systemd
 // adapter and signed launch orchestrator that consume it. Keep the exception
 // on this one private module; the follow-up composition removes it.
@@ -72,6 +77,8 @@ pub use root_provision::{
     AuthorityRereadRequired, RootProvisionClientError, RootProvisionControlPort,
     RootProvisionResponseHint, RootProvisionUnknownReason, UnixRootProvisionClient,
 };
+#[allow(unused_imports)]
+pub(crate) use signed_running::{SignedNormalAcquirePort, SignedRunningAcquireEffect};
 // This crate-private seam is landed before the systemd composition that
 // consumes it; keeping the re-export here prevents feature code from reaching
 // through the module path while preserving the sealed boundary.

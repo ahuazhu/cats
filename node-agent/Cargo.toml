@@ -8,6 +8,7 @@ publish = false
 [dependencies]
 cats-api = { workspace = true }
 cats-block-client = { workspace = true }
+cats-blockd = { workspace = true }
 cats-metering = { workspace = true }
 cats-storage = { workspace = true }
 anyhow = { workspace = true }

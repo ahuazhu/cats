@@ -214,6 +214,19 @@ impl RuntimeDesiredEffectAdmission {
     pub fn attestation(&self) -> &AdmissionInventoryAttestation {
         &self.attestation
     }
+
+    #[cfg(test)]
+    pub(crate) fn for_test(
+        session: AgentSession,
+        observation: NodeObservation,
+        attestation: AdmissionInventoryAttestation,
+    ) -> Self {
+        Self {
+            session,
+            observation,
+            attestation,
+        }
+    }
 }
 
 impl RuntimeDesiredEffectContext {
@@ -264,6 +277,20 @@ impl RuntimeDesiredEffectContext {
             deadline,
             RuntimeInventoryScanCancellation::new(),
             None,
+        )
+    }
+
+    #[cfg(test)]
+    pub(crate) fn for_test_with_admission(
+        state_directory: StateDirectory,
+        deadline: Instant,
+        admission: RuntimeDesiredEffectAdmission,
+    ) -> Self {
+        Self::new(
+            state_directory,
+            deadline,
+            RuntimeInventoryScanCancellation::new(),
+            Some(admission),
         )
     }
 

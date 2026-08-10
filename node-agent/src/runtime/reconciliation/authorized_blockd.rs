@@ -1,10 +1,12 @@
 //! Descriptor-relative, checkpoint-first inputs for one authorized blockd.
 //!
 //! This module deliberately stops before process creation. The signed Runtime
-//! may persist these exact inputs only after a Normal acquire and root
-//! provision have completed. A later process-owner port must create the
-//! systemd scope and prove the blockd handshake before any observation calls
-//! the lineage serving; writing these files alone is not serving evidence.
+//! may persist these exact inputs only after a Normal acquire. They authorize
+//! the later control-only root-provision process as well as the eventual
+//! serving process, but do not prove either one exists. A later process-owner
+//! port must create the systemd service and prove the blockd handshake before
+//! any observation calls the lineage serving; writing these files alone is
+//! not serving evidence.
 
 use std::ffi::{CStr, CString};
 use std::fs::File;
