@@ -115,11 +115,6 @@ pub(crate) struct KernelNbdPoolSnapshot {
 }
 
 impl KernelNbdPoolSnapshot {
-    #[cfg(test)]
-    pub(crate) fn slots(&self) -> &BTreeMap<HostPath, KernelNbdSlotState> {
-        &self.slots
-    }
-
     pub(crate) fn state(&self, path: &HostPath) -> Option<&KernelNbdSlotState> {
         self.slots.get(path)
     }
@@ -225,11 +220,6 @@ impl KernelNbdReservations {
             .insert(candidate.device_path.clone(), candidate);
         Ok(())
     }
-
-    #[cfg(test)]
-    pub(crate) fn by_device(&self) -> &BTreeMap<HostPath, KernelNbdReservation> {
-        &self.by_device
-    }
 }
 
 /// Held across the final durable-reservation index read and the caller's
@@ -274,18 +264,6 @@ impl KernelNbdAllocationPermit {
             }
         }
         anyhow::bail!("no physically free, unreserved kernel-NBD device remains")
-    }
-
-    #[cfg(test)]
-    pub(crate) fn require_free(&self, device_path: &HostPath) -> Result<()> {
-        anyhow::ensure!(
-            matches!(
-                self.snapshot.state(device_path),
-                Some(KernelNbdSlotState::Free)
-            ),
-            "checkpointed kernel-NBD device is not physically free"
-        );
-        Ok(())
     }
 
     fn assert_current_allocation_lock(&self) -> Result<()> {
