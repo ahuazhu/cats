@@ -81,10 +81,10 @@ fn route_grant_private_key_reaches_only_control_plane_and_nodes_get_public_key()
         .and_then(|(_, rest)| rest.split_once("resource \"kubernetes_pod_disruption_budget_v1\""))
         .map(|(section, _)| section)
         .expect("control-plane Deployment section");
-    let gateway = kubernetes
-        .split_once("resource \"kubernetes_deployment_v1\" \"gateway\"")
-        .map(|(_, section)| section)
-        .expect("Gateway Deployment section");
+    assert!(
+        !kubernetes.contains("resource \"kubernetes_deployment_v1\" \"gateway\""),
+        "the V1 Gateway must remain undeployed during the v2 cutover"
+    );
     for fragment in [
         "kubernetes_secret_v1.route_grant_signing",
         "CATS_ROUTE_GRANT_PRIVATE_KEY_FILE",
@@ -93,10 +93,6 @@ fn route_grant_private_key_reaches_only_control_plane_and_nodes_get_public_key()
         assert!(
             control.contains(fragment) || kubernetes.contains(fragment),
             "control-plane Route Grant delivery lost {fragment:?}"
-        );
-        assert!(
-            !gateway.contains(fragment),
-            "Gateway must never receive Route Grant signing material: {fragment:?}"
         );
     }
     for fragment in [
@@ -153,66 +149,78 @@ fn route_grant_private_key_reaches_only_control_plane_and_nodes_get_public_key()
 }
 
 #[test]
-fn gateway_replicas_share_only_already_signed_route_grants_outside_postgres() {
-    let infrastructure =
-        read_workspace_file("deploy/aws/terraform/modules/route-cache-infrastructure/main.tf");
-    for expected in [
-        "resource \"aws_dynamodb_table\" \"route_grants\"",
-        "billing_mode = \"PAY_PER_REQUEST\"",
-        "hash_key     = \"hostname\"",
-        "attribute_name = \"expires_at_unix\"",
-        "point_in_time_recovery",
-        "server_side_encryption",
-        "\"dynamodb:GetItem\"",
-        "\"dynamodb:PutItem\"",
-        "resource \"aws_eks_pod_identity_association\" \"gateway\"",
-        "service_account = var.gateway_service_account_name",
+fn production_artifacts_remove_the_v1_gateway_and_shared_route_mirror() {
+    for removed in [
+        "deploy/aws/terraform/modules/route-cache-infrastructure/main.tf",
+        "deploy/aws/terraform/modules/route-cache-infrastructure/variables.tf",
+        "deploy/aws/terraform/modules/route-cache-infrastructure/outputs.tf",
+        "deploy/metal/systemd/cats-gatewayd.service",
     ] {
         assert!(
-            infrastructure.contains(expected),
-            "shared Route cache infrastructure lost {expected:?}"
+            !workspace_root().join(removed).exists(),
+            "legacy production artifact still exists: {removed}"
         );
     }
+
+    for path in [
+        "deploy/aws/terraform/modules/cats-kubernetes/main.tf",
+        "deploy/aws/terraform/modules/cats-kubernetes/variables.tf",
+        "deploy/aws/terraform/modules/cats-kubernetes/outputs.tf",
+        "deploy/aws/terraform/stacks/production-application/main.tf",
+        "deploy/aws/terraform/stacks/production-application/variables.tf",
+        "deploy/aws/terraform/stacks/production-application/outputs.tf",
+        "deploy/aws/terraform/stacks/production-infrastructure/main.tf",
+        "deploy/aws/terraform/stacks/production-infrastructure/outputs.tf",
+        ".github/workflows/deploy-production.yml",
+        "deploy/aws/Dockerfile.control-plane",
+    ] {
+        let source = read_workspace_file(path);
+        for forbidden in [
+            "CATS_SHARED_ROUTE_CACHE_TABLE",
+            "shared_route_cache_table",
+            "ROUTE_CACHE_TABLE_NAME",
+            "route_cache_infrastructure",
+            "cats-gatewayd",
+            "kubernetes_deployment_v1.gateway",
+            "kubernetes_service_v1.gateway",
+        ] {
+            assert!(
+                !source.contains(forbidden),
+                "{path} still ships or deploys legacy Gateway surface {forbidden:?}"
+            );
+        }
+    }
+
+    let manifest = read_workspace_file("network/Cargo.toml");
+    assert!(manifest.contains("legacy-test-harness"));
+    assert!(!manifest.contains("aws-sdk-dynamodb"));
+    assert!(!manifest.contains("aws-config"));
+
+    let binary = read_workspace_file("network/src/main.rs");
+    assert!(binary.contains("Route Grant v2 is not composed"));
+    assert!(binary.contains("ExitCode::FAILURE"));
     for forbidden in [
-        "dynamodb:Scan",
-        "dynamodb:Query",
-        "dynamodb:DeleteTable",
-        "dynamodb:CreateTable",
-    ] {
-        assert!(
-            !infrastructure.contains(forbidden),
-            "Gateway Route cache identity gained unnecessary permission {forbidden:?}"
-        );
-    }
-
-    let kubernetes = read_workspace_file("deploy/aws/terraform/modules/cats-kubernetes/main.tf");
-    let gateway = kubernetes
-        .split_once("resource \"kubernetes_deployment_v1\" \"gateway\"")
-        .map(|(_, section)| section)
-        .expect("Gateway Deployment section");
-    for expected in [
-        "resource \"kubernetes_service_account_v1\" \"gateway\"",
-        "service_account_name",
-        "kubernetes_service_account_v1.gateway.metadata[0].name",
+        "cats_network::spawn",
+        "/v1/routes/resolve",
+        "/v1/routes/wake",
+        "/v1/cats/",
         "CATS_SHARED_ROUTE_CACHE_TABLE",
-        "AWS_REGION",
+        "READY ",
     ] {
         assert!(
-            kubernetes.contains(expected) || gateway.contains(expected),
-            "Gateway deployment lost shared Route cache wiring {expected:?}"
+            !binary.contains(forbidden),
+            "default Gateway binary retained legacy behavior {forbidden:?}"
         );
     }
 
-    let workflow = read_workspace_file(".github/workflows/deploy-production.yml");
-    for expected in [
-        "ROUTE_CACHE_TABLE_NAME: ${{ vars.ROUTE_CACHE_TABLE_NAME }}",
-        "-var=\"shared_route_cache_table=$ROUTE_CACHE_TABLE_NAME\"",
-    ] {
-        assert!(
-            workflow.contains(expected),
-            "production deployment lost shared Route cache input {expected:?}"
-        );
-    }
+    let metal = read_workspace_file("deploy/metal/install.sh");
+    assert!(metal.contains("systemctl disable --now cats-gatewayd.service"));
+    assert!(metal.contains(
+        "rm -f -- /etc/systemd/system/cats-gatewayd.service \"$PREFIX/bin/cats-gatewayd\""
+    ));
+    assert!(!metal.contains("cats cats-controld cats-noded cats-gatewayd"));
+    assert!(!metal.contains("enable --now cats-controld cats-gatewayd"));
+    assert!(!metal.contains("status cats-controld cats-gatewayd cats-noded"));
 }
 
 #[test]
@@ -382,30 +390,24 @@ fn route_grant_node_preflight_exercises_safe_and_interrupted_rollout_cohorts() {
 }
 
 #[test]
-fn route_grant_application_rolls_control_plane_before_gateway() {
+fn route_grant_application_keeps_gateway_undeployed_until_v2() {
     let kubernetes = read_workspace_file("deploy/aws/terraform/modules/cats-kubernetes/main.tf");
     let control = kubernetes
         .split_once("resource \"kubernetes_deployment_v1\" \"control_plane\"")
         .and_then(|(_, rest)| rest.split_once("resource \"kubernetes_pod_disruption_budget_v1\""))
         .map(|(section, _)| section)
         .expect("control-plane Deployment section");
-    let gateway = kubernetes
-        .split_once("resource \"kubernetes_deployment_v1\" \"gateway\"")
-        .and_then(|(_, rest)| rest.split_once("resource \"kubernetes_service_v1\" \"gateway\""))
-        .map(|(section, _)| section)
-        .expect("Gateway Deployment section");
-
     assert!(
         control.contains("wait_for_rollout = true"),
-        "the Gateway dependency is safe only if Terraform waits for the complete control-plane rollout"
+        "Terraform must wait for the complete control-plane rollout"
     );
     assert!(
-        gateway.contains("wait_for_rollout = true"),
-        "Terraform must wait for the Gateway rollout too"
+        !kubernetes.contains("resource \"kubernetes_deployment_v1\" \"gateway\""),
+        "production must not deploy the legacy Gateway while v2 is incomplete"
     );
     assert!(
-        gateway.contains("depends_on = [kubernetes_deployment_v1.control_plane]"),
-        "a new Gateway must not start until every control-plane replica issues Route Grants"
+        !kubernetes.contains("endpoint_wildcard_host"),
+        "production must not publish an Endpoint ingress route without the v2 Gateway"
     );
 }
 
@@ -1226,76 +1228,23 @@ fn production_control_plane_survives_one_pod_or_node_disruption() {
 }
 
 #[test]
-fn production_gateway_survives_one_pod_or_node_disruption() {
+fn production_endpoint_ingress_stays_absent_until_route_grant_v2() {
     let terraform = read_workspace_file("deploy/aws/terraform/modules/cats-kubernetes/main.tf");
     let variables =
         read_workspace_file("deploy/aws/terraform/modules/cats-kubernetes/variables.tf");
-    let deployment = terraform
-        .split("resource \"kubernetes_deployment_v1\" \"gateway\"")
-        .nth(1)
-        .and_then(|rest| {
-            rest.split("resource \"kubernetes_service_v1\" \"gateway\"")
-                .next()
-        })
-        .expect("Gateway Deployment block");
+    assert!(terraform.contains("Public Endpoint ingress stays absent"));
+    assert!(terraform.contains("for host in var.control_plane_hosts"));
+    assert!(!terraform.contains("endpoint_wildcard_host"));
+    assert!(!variables.contains("endpoint_wildcard_host"));
 
-    for expected in [
-        "replicas = var.gateway_replicas",
-        "type = \"RollingUpdate\"",
-        "max_surge       = \"1\"",
-        "max_unavailable = \"0\"",
-        "termination_grace_period_seconds = local.public_target_termination_grace_period_seconds",
-        "pre_stop {",
-        "command = [\"/bin/sh\", \"-c\", \"sleep ${local.public_target_pre_stop_delay_seconds}\"]",
-        "pod_anti_affinity {",
-        "required_during_scheduling_ignored_during_execution {",
-        "topology_key       = \"kubernetes.io/hostname\"",
-        "when_unsatisfiable = \"DoNotSchedule\"",
-    ] {
-        assert!(
-            deployment.contains(expected),
-            "Gateway Deployment is missing {expected:?}"
-        );
-    }
-    let required_anti_affinity = deployment
-        .split("required_during_scheduling_ignored_during_execution {")
-        .nth(1)
-        .and_then(|rest| rest.split("topology_spread_constraint {").next())
-        .expect("required Gateway hostname anti-affinity block");
-    for expected in [
-        "topology_key = \"kubernetes.io/hostname\"",
-        "\"app.kubernetes.io/name\" = \"cats-gatewayd\"",
-    ] {
-        assert!(
-            required_anti_affinity.contains(expected),
-            "required Gateway anti-affinity is missing {expected:?}"
-        );
-    }
-    for expected in [
-        "public_target_pre_stop_delay_seconds           = 15",
-        "public_target_termination_grace_period_seconds = 60",
-        "condition     = local.public_target_pre_stop_delay_seconds + 30 <= local.public_target_termination_grace_period_seconds",
-    ] {
-        assert!(
-            terraform.contains(expected),
-            "public target drain is missing {expected:?}"
-        );
-    }
-    assert!(variables.contains("var.gateway_replicas >= 2"));
-    let disruption_budget = terraform
-        .split("resource \"kubernetes_pod_disruption_budget_v1\" \"gateway\"")
-        .nth(1)
-        .and_then(|rest| {
-            rest.split("resource \"kubernetes_service_v1\" \"gateway\"")
-                .next()
-        })
-        .expect("Gateway PodDisruptionBudget block");
-    assert!(disruption_budget.contains("min_available = \"1\""));
-    assert!(disruption_budget.contains("\"app.kubernetes.io/name\" = \"cats-gatewayd\""));
-    assert!(
-        !deployment.contains("type = \"Recreate\""),
-        "Recreate deliberately creates a total Gateway outage"
-    );
+    let application =
+        read_workspace_file("deploy/aws/terraform/stacks/production-application/main.tf");
+    assert!(application.contains("dns_hosts = toset(var.control_plane_hosts)"));
+    assert!(!application.contains("endpoint_wildcard_host"));
+
+    let workflow = read_workspace_file(".github/workflows/deploy-production.yml");
+    assert!(workflow.contains("for deployment in cats-controld"));
+    assert!(!workflow.contains("for deployment in cats-controld cats-gatewayd"));
 }
 
 #[test]

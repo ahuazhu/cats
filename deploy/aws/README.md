@@ -9,15 +9,12 @@ them. See
 
 Production-shaped split:
 
-- EKS Pods: `cats-controld` (portal, user console, admin console and API) and
-  `cats-gatewayd`.
+- EKS Pods: `cats-controld` (portal, user console, admin console and API).
+  Public Endpoint ingress remains undeployed until Route Grant v2 is composed.
 - EC2 bare metal: only `cats-noded`, `cats-blockd`, Cloud Hypervisor and guest
   assets. It is not an EKS node.
 - RDS PostgreSQL: authoritative ChunkStore roots, leases and fencing epochs.
 - S3: immutable durable ChunkStore objects.
-- Endpoint continuity: a regional DynamoDB table replicates only short-lived,
-  already-signed Route Grants across `cats-gatewayd` replicas; Nodes remain the
-  authorization verifier.
 - Usage billing: `cats-controld` publishes attributed cumulative checkpoints to
   Kinesis; its projector writes 50-second/4-MiB/1000-record NDJSON batches to a
   seven-year Object Lock S3 archive, updates the PostgreSQL `cats_usage`
@@ -28,15 +25,16 @@ Production-shaped split:
   refund reversals; Stripe is collection infrastructure, not the balance or
   usage truth.
 - One EKS Auto Mode ALB: the user site at `cats.run`, the operator site at
-  `ops.cats.run`, legacy-host redirects and the endpoint wildcard.
+  `ops.cats.run` and the configured control-plane hosts. It does not advertise
+  or route the Endpoint wildcard yet.
 
-The Terraform application stack creates the `cats-controld` and
-`cats-gatewayd` ServiceAccounts, `cats-runtime` and `cats-rds-ca`;
+The Terraform application stack creates the `cats-controld` ServiceAccount,
+`cats-runtime` and `cats-rds-ca`;
 secrets are injected by CI and remain protected in remote state. It also
 renders the target ACM ARN and every public subnet into EKS Auto Mode ingress.
 EKS Pod Identity grants the control plane only the Kinesis/S3/DynamoDB usage
-permissions. A separate least-privilege Gateway identity may read and write
-only the signed Route Grant table. Do not create or patch these objects manually.
+permissions. No Gateway identity or shared Route table is provisioned. Do not
+create or patch these objects manually.
 
 The worker does not hold a copy of the database password. Set
 `database_master_user_secret_arn` and the non-secret half of the DSN in
@@ -152,9 +150,9 @@ apt/curl/wget/git; cloud-init, snapd, LXD, wait-online, package timers and the
 unused serial getty are not on the Cold-to-Agent readiness path. Each Cat gets
 an isolated tap `/30` with outbound host NAT; host, VPC-private and cloud
 metadata destinations are blocked before the general egress allow rule.
-Every Cat receives a stable wildcard HTTPS Endpoint for Guest port 8080; the
-ALB sends wildcard hosts to `cats-gatewayd`, which resolves the owning worker
-and the worker connects the service through that Cat's tap address.
+Every Cat still has the stable Endpoint identity in control truth, but public
+Endpoint traffic intentionally remains unavailable until the v2 signer,
+bounded per-replica Gateway cache and Node admission gate are composed.
 
 `cats-noded` detects the host's logical CPU and memory totals when it starts;
 the administrator console reports those schedulable totals plus sampled host

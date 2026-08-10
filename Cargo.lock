@@ -1223,12 +1223,9 @@ name = "cats-network"
 version = "0.1.0"
 dependencies = [
  "anyhow",
- "aws-config",
- "aws-sdk-dynamodb",
  "axum",
  "base64",
  "cats-api",
- "clap",
  "futures-util",
  "reqwest",
  "serde",
@@ -1236,7 +1233,6 @@ dependencies = [
  "tokio",
  "tokio-tungstenite",
  "tracing",
- "tracing-subscriber",
 ]
 
 [[package]]

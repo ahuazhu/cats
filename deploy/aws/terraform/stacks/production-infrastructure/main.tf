@@ -15,18 +15,6 @@ module "usage_infrastructure" {
   tags                            = var.tags
 }
 
-# Independent from PostgreSQL and from any individual Gateway Pod. Apply this
-# before the application rollout so every Gateway replica has its Pod Identity
-# and regional shared cache when signed Route Grants become required.
-module "route_cache_infrastructure" {
-  source = "../../modules/route-cache-infrastructure"
-
-  name_prefix      = "cats"
-  environment      = var.environment
-  eks_cluster_name = var.eks_cluster_name
-  tags             = var.tags
-}
-
 locals {
   metal_worker_enabled = (
     var.metal_worker_enabled != null

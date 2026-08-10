@@ -1,6 +1,9 @@
-//! Cats edge/node gateway (dev topology: one process plays both roles).
+#![cfg(feature = "legacy-test-harness")]
+
+//! Historical V1 edge/node Gateway test harness.
 //!
-//! Request path (arch doc §9.1, minimal): `Host:` header -> control-plane
+//! This module is intentionally absent from the default production build. Its
+//! request path is `Host:` header -> legacy control-plane
 //! route resolve (cached briefly) -> node-agent proxy hop. The node agent
 //! re-validates possession and answers 409 for stale routes, which makes
 //! the gateway re-resolve once — that is the "old epoch fails closed"
@@ -13,7 +16,6 @@ use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::Context;
-use aws_sdk_dynamodb::types::AttributeValue;
 use axum::body::{to_bytes, Body};
 use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
 use axum::extract::{FromRequestParts, State};
@@ -41,10 +43,6 @@ pub struct GatewayConfig {
     pub auth_token: String,
     /// Route cache TTL; kept tiny so rebinding propagates fast in dev.
     pub cache_ttl_ms: u64,
-    /// Optional regional shared cache for signed Route Grants. Production
-    /// supplies a DynamoDB table so any Gateway replica can survive a
-    /// control-plane outage after another replica resolved the route.
-    pub shared_route_cache_table: Option<String>,
 }
 
 #[derive(Debug, Clone, serde::Deserialize, serde::Serialize)]
@@ -61,10 +59,6 @@ struct ResolveResponse {
 #[derive(Clone)]
 enum SharedRouteCache {
     Disabled,
-    DynamoDb {
-        client: aws_sdk_dynamodb::Client,
-        table: String,
-    },
     #[cfg(test)]
     Memory(Arc<Mutex<HashMap<String, ResolveResponse>>>),
     #[cfg(test)]
@@ -72,122 +66,41 @@ enum SharedRouteCache {
 }
 
 impl SharedRouteCache {
-    async fn from_config(cfg: &GatewayConfig) -> anyhow::Result<Self> {
-        let Some(table) = cfg.shared_route_cache_table.as_deref() else {
-            return Ok(Self::Disabled);
-        };
-        let table = table.trim();
-        anyhow::ensure!(!table.is_empty(), "shared Route cache table is empty");
-        let sdk_config = aws_config::load_defaults(aws_config::BehaviorVersion::latest()).await;
-        let client = aws_sdk_dynamodb::Client::new(&sdk_config);
-        // Do not probe DynamoDB here. The shared mirror is an independent
-        // continuity path, not a Gateway readiness dependency; every runtime
-        // operation is bounded and falls through to a healthy control plane.
-        Ok(Self::DynamoDb {
-            client,
-            table: table.to_string(),
-        })
-    }
-
     #[cfg(test)]
     fn memory() -> Self {
         Self::Memory(Arc::new(Mutex::new(HashMap::new())))
     }
 
-    async fn load(&self, hostname: &str) -> anyhow::Result<Option<ResolveResponse>> {
+    async fn load(&self, _hostname: &str) -> anyhow::Result<Option<ResolveResponse>> {
         match self {
             Self::Disabled => Ok(None),
-            Self::DynamoDb { client, table } => {
-                let output = client
-                    .get_item()
-                    .table_name(table)
-                    .key("hostname", AttributeValue::S(hostname.to_string()))
-                    .consistent_read(true)
-                    .send()
-                    .await
-                    .context("load shared signed Route Grant")?;
-                let Some(item) = output.item() else {
-                    return Ok(None);
-                };
-                decode_shared_route_record(item).map(Some)
-            }
             #[cfg(test)]
-            Self::Memory(records) => Ok(records.lock().unwrap().get(hostname).cloned()),
+            Self::Memory(records) => Ok(records.lock().unwrap().get(_hostname).cloned()),
             #[cfg(test)]
             Self::Hanging => std::future::pending().await,
         }
     }
 
-    async fn publish(&self, hostname: &str, resolved: &ResolveResponse) -> anyhow::Result<()> {
-        let issued_at = resolved
+    async fn publish(&self, _hostname: &str, _resolved: &ResolveResponse) -> anyhow::Result<()> {
+        #[cfg(test)]
+        let issued_at = _resolved
             .route_grant_issued_at_unix
             .context("shared Route Grant has no issue time")?;
-        let expires_at = resolved
-            .route_grant_expires_at_unix
-            .context("shared Route Grant has no expiry")?;
         match self {
             Self::Disabled => Ok(()),
-            Self::DynamoDb { client, table } => {
-                let payload = serde_json::to_string(resolved)
-                    .context("serialize shared signed Route Grant")?;
-                let result = client
-                    .put_item()
-                    .table_name(table)
-                    .item("hostname", AttributeValue::S(hostname.to_string()))
-                    .item("payload", AttributeValue::S(payload))
-                    .item(
-                        "route_epoch",
-                        AttributeValue::N(resolved.binding.epoch.to_string()),
-                    )
-                    .item("issued_at_unix", AttributeValue::N(issued_at.to_string()))
-                    .item("expires_at_unix", AttributeValue::N(expires_at.to_string()))
-                    .condition_expression(
-                        "attribute_not_exists(#hostname) \
-                         OR #epoch < :epoch \
-                         OR (#epoch = :epoch AND #issued < :issued)",
-                    )
-                    .expression_attribute_names("#hostname", "hostname")
-                    .expression_attribute_names("#epoch", "route_epoch")
-                    .expression_attribute_names("#issued", "issued_at_unix")
-                    .expression_attribute_values(
-                        ":epoch",
-                        AttributeValue::N(resolved.binding.epoch.to_string()),
-                    )
-                    .expression_attribute_values(
-                        ":issued",
-                        AttributeValue::N(issued_at.to_string()),
-                    )
-                    .send()
-                    .await;
-                match result {
-                    Ok(_) => Ok(()),
-                    Err(error)
-                        if error.as_service_error().is_some_and(|service| {
-                            service.is_conditional_check_failed_exception()
-                        }) =>
-                    {
-                        // A higher PostgreSQL route epoch, or a later renewal
-                        // of the same epoch, already won. The caller may still
-                        // use this locally signed response; the shared mirror
-                        // must never move route authority backwards.
-                        Ok(())
-                    }
-                    Err(error) => Err(error).context("publish shared signed Route Grant"),
-                }
-            }
             #[cfg(test)]
             Self::Memory(records) => {
                 let mut records = records.lock().unwrap();
-                let replace = match records.get(hostname) {
+                let replace = match records.get(_hostname) {
                     None => true,
                     Some(current) => {
-                        current.binding.epoch < resolved.binding.epoch
-                            || (current.binding.epoch == resolved.binding.epoch
+                        current.binding.epoch < _resolved.binding.epoch
+                            || (current.binding.epoch == _resolved.binding.epoch
                                 && current.route_grant_issued_at_unix.unwrap_or(0) < issued_at)
                     }
                 };
                 if replace {
-                    records.insert(hostname.to_string(), resolved.clone());
+                    records.insert(_hostname.to_string(), _resolved.clone());
                 }
                 Ok(())
             }
@@ -195,67 +108,6 @@ impl SharedRouteCache {
             Self::Hanging => std::future::pending().await,
         }
     }
-}
-
-fn decode_shared_route_record(
-    item: &HashMap<String, AttributeValue>,
-) -> anyhow::Result<ResolveResponse> {
-    let payload = dynamodb_string(item, "payload")?;
-    let resolved: ResolveResponse =
-        serde_json::from_str(payload).context("decode shared signed Route Grant")?;
-    anyhow::ensure!(
-        dynamodb_i64(item, "route_epoch")? == resolved.binding.epoch,
-        "shared Route epoch metadata does not match its payload"
-    );
-    anyhow::ensure!(
-        dynamodb_u64(item, "issued_at_unix")?
-            == resolved
-                .route_grant_issued_at_unix
-                .context("shared Route payload has no issue time")?,
-        "shared Route issue-time metadata does not match its payload"
-    );
-    anyhow::ensure!(
-        dynamodb_u64(item, "expires_at_unix")?
-            == resolved
-                .route_grant_expires_at_unix
-                .context("shared Route payload has no expiry")?,
-        "shared Route expiry metadata does not match its payload"
-    );
-    Ok(resolved)
-}
-
-fn dynamodb_string<'a>(
-    item: &'a HashMap<String, AttributeValue>,
-    name: &str,
-) -> anyhow::Result<&'a str> {
-    item.get(name)
-        .with_context(|| format!("shared Route record has no {name}"))?
-        .as_s()
-        .map(String::as_str)
-        .map_err(|_| anyhow::anyhow!("shared Route record {name} is not a string"))
-}
-
-fn dynamodb_u64(item: &HashMap<String, AttributeValue>, name: &str) -> anyhow::Result<u64> {
-    dynamodb_string_number(item, name)?
-        .parse()
-        .with_context(|| format!("shared Route record {name} is not an unsigned integer"))
-}
-
-fn dynamodb_i64(item: &HashMap<String, AttributeValue>, name: &str) -> anyhow::Result<i64> {
-    dynamodb_string_number(item, name)?
-        .parse()
-        .with_context(|| format!("shared Route record {name} is not an integer"))
-}
-
-fn dynamodb_string_number<'a>(
-    item: &'a HashMap<String, AttributeValue>,
-    name: &str,
-) -> anyhow::Result<&'a str> {
-    item.get(name)
-        .with_context(|| format!("shared Route record has no {name}"))?
-        .as_n()
-        .map(String::as_str)
-        .map_err(|_| anyhow::anyhow!("shared Route record {name} is not a number"))
 }
 
 #[cfg(test)]
@@ -1634,14 +1486,13 @@ async fn entry(State(gw): State<Gateway>, req: Request<Body>) -> Response {
 const MAX_PROXY_REQUEST_BYTES: usize = 16 * 1024 * 1024;
 
 pub async fn spawn(cfg: GatewayConfig) -> anyhow::Result<Handle> {
-    let shared_cache = SharedRouteCache::from_config(&cfg).await?;
     let gw = Gateway {
         cfg: Arc::new(cfg),
         http: reqwest::Client::builder()
             .timeout(Duration::from_secs(60))
             .build()?,
         cache: Arc::new(Mutex::new(HashMap::new())),
-        shared_cache,
+        shared_cache: SharedRouteCache::Disabled,
     };
     let listener = tokio::net::TcpListener::bind(&gw.cfg.listen)
         .await
@@ -1813,7 +1664,6 @@ mod tests {
                 control_plane_url: format!("http://{addr}"),
                 auth_token: "service-token".to_string(),
                 cache_ttl_ms,
-                shared_route_cache_table: None,
             }),
             http: reqwest::Client::new(),
             cache: Arc::new(Mutex::new(HashMap::new())),
@@ -2221,89 +2071,6 @@ mod tests {
         assert_eq!(resolved.route_grant.as_deref(), Some("grant-2"));
         assert_eq!(state.calls(), 0);
         control_task.abort();
-    }
-
-    #[test]
-    fn shared_route_record_rejects_malformed_or_inconsistent_metadata() {
-        let resolved = active_resolved_route(
-            "dev.cats.run".to_string(),
-            "http://node-a".to_string(),
-            "grant-1",
-            100,
-            160,
-        );
-        let valid = HashMap::from([
-            (
-                "hostname".to_string(),
-                AttributeValue::S("dev.cats.run".to_string()),
-            ),
-            (
-                "payload".to_string(),
-                AttributeValue::S(serde_json::to_string(&resolved).unwrap()),
-            ),
-            (
-                "route_epoch".to_string(),
-                AttributeValue::N("7".to_string()),
-            ),
-            (
-                "issued_at_unix".to_string(),
-                AttributeValue::N("100".to_string()),
-            ),
-            (
-                "expires_at_unix".to_string(),
-                AttributeValue::N("160".to_string()),
-            ),
-        ]);
-
-        let decoded = decode_shared_route_record(&valid).unwrap();
-        assert_eq!(decoded.binding.epoch, 7);
-        assert_eq!(decoded.route_grant.as_deref(), Some("grant-1"));
-
-        for (field, value, expected) in [
-            (
-                "route_epoch",
-                AttributeValue::N("8".to_string()),
-                "epoch metadata does not match",
-            ),
-            (
-                "issued_at_unix",
-                AttributeValue::N("101".to_string()),
-                "issue-time metadata does not match",
-            ),
-            (
-                "expires_at_unix",
-                AttributeValue::N("161".to_string()),
-                "expiry metadata does not match",
-            ),
-            (
-                "issued_at_unix",
-                AttributeValue::N("-1".to_string()),
-                "not an unsigned integer",
-            ),
-            (
-                "expires_at_unix",
-                AttributeValue::S("160".to_string()),
-                "is not a number",
-            ),
-        ] {
-            let mut item = valid.clone();
-            item.insert(field.to_string(), value);
-            let error = decode_shared_route_record(&item).unwrap_err().to_string();
-            assert!(
-                error.contains(expected),
-                "unexpected {field} error: {error}"
-            );
-        }
-
-        let mut malformed_payload = valid;
-        malformed_payload.insert(
-            "payload".to_string(),
-            AttributeValue::S("not-json".to_string()),
-        );
-        assert!(decode_shared_route_record(&malformed_payload)
-            .unwrap_err()
-            .to_string()
-            .contains("decode shared signed Route Grant"));
     }
 
     #[tokio::test]

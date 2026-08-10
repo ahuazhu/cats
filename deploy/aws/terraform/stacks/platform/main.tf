@@ -203,8 +203,8 @@ resource "aws_iam_role_policy" "github_application_deploy" {
 }
 
 # Bare-metal workers: the network position they occupy. cats-noded listens on
-# 7301 and is reached by cats-gatewayd and cats-controld from inside the
-# cluster; nothing else may reach it. The instances themselves are declared
+# 7301 and is reached by cats-controld (and, after cutover, the v2 Gateway) from
+# inside the cluster; nothing else may reach it. The instances themselves are declared
 # further down, and the infrastructure stack installs onto them by id.
 resource "aws_security_group" "metal_worker" {
   name        = "${var.name_prefix}-${var.environment}-metal-worker"

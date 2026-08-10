@@ -2,7 +2,8 @@ name: Release
 
 # Builds the two reviewed production artifacts:
 #
-#   * the control-plane container image (cats-controld + cats-gatewayd),
+#   * the control-plane container image (cats-controld only; public Endpoint
+#     ingress stays undeployed until Route Grant v2 is composed),
 #     pushed to ECR; its immutable digest is what the application stack's
 #     tfvars must reference.
 #   * the metal worker bundle (host binaries, guest-agent + guest units, seed

@@ -30,16 +30,6 @@ variable "control_plane_replicas" {
   }
 }
 
-variable "gateway_image" {
-  description = "Immutable cats-gatewayd container image, including its sha256 digest."
-  type        = string
-
-  validation {
-    condition     = can(regex("@sha256:[0-9a-f]{64}$", var.gateway_image))
-    error_message = "gateway_image must be pinned by sha256 digest."
-  }
-}
-
 variable "runtime_secret_data" {
   description = "Additional cats-runtime environment variables, such as WorkOS credentials and Cats service tokens."
   type        = map(string)
@@ -349,32 +339,6 @@ variable "auto_cold_after_seconds" {
   }
 }
 
-variable "gateway_replicas" {
-  description = "Number of stateless endpoint gateway replicas."
-  type        = number
-  default     = 2
-
-  validation {
-    condition     = var.gateway_replicas >= 2 && floor(var.gateway_replicas) == var.gateway_replicas
-    error_message = "gateway_replicas must be an integer of at least 2."
-  }
-}
-
-variable "shared_route_cache_table" {
-  description = "DynamoDB table that replicates short-lived signed Route Grants across Gateway replicas. Null disables it outside production."
-  type        = string
-  default     = null
-  nullable    = true
-
-  validation {
-    condition = (
-      var.shared_route_cache_table == null ||
-      can(regex("^[A-Za-z0-9_.-]{3,255}$", var.shared_route_cache_table))
-    )
-    error_message = "shared_route_cache_table must be null or a valid DynamoDB table name."
-  }
-}
-
 variable "enable_public_ingress" {
   description = "Create the EKS Auto Mode ALB ingress resources."
   type        = bool
@@ -451,17 +415,6 @@ variable "control_plane_hosts" {
   validation {
     condition     = length(var.control_plane_hosts) == length(toset(var.control_plane_hosts))
     error_message = "control_plane_hosts must not contain duplicates."
-  }
-}
-
-variable "endpoint_wildcard_host" {
-  description = "Wildcard hostname routed to cats-gatewayd."
-  type        = string
-  default     = "*.cats.run"
-
-  validation {
-    condition     = startswith(var.endpoint_wildcard_host, "*.")
-    error_message = "endpoint_wildcard_host must begin with '*.'."
   }
 }
 

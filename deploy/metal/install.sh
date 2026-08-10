@@ -114,7 +114,7 @@ cats_worker_deployment_crash_probe after-installer-return
 echo "==> install binaries to $PREFIX/bin"
 install -d "$PREFIX/bin"
 cats_worker_deployment_crash_probe after-install-bin-directory
-for bin in cats cats-controld cats-noded cats-gatewayd cats-blockd cats-guest-agent; do
+for bin in cats cats-controld cats-noded cats-blockd cats-guest-agent; do
   install -m 0755 "$REPO/target/release/$bin" "$PREFIX/bin/$bin"
   cats_worker_deployment_crash_probe "after-install-$bin"
 done
@@ -242,6 +242,13 @@ rm -f -- "$route_public_temp"
 route_public_temp=""
 
 echo "==> systemd units"
+# A host upgraded from the V1 development shape may still have the old
+# Gateway enabled. Stop it before daemon-reload and remove its exact unit and
+# binary; leaving either behind would let a reboot revive legacy route
+# resolve/wake and Node proxy traffic.
+systemctl disable --now cats-gatewayd.service 2>/dev/null || true
+rm -f -- /etc/systemd/system/cats-gatewayd.service "$PREFIX/bin/cats-gatewayd"
+cats_worker_deployment_crash_probe after-remove-legacy-gateway
 for unit in "$REPO"/deploy/metal/systemd/*.service; do
   [[ ${unit##*/} == cats-noded.service ]] && continue
   install -m 0644 "$unit" /etc/systemd/system/
@@ -249,7 +256,7 @@ done
 cats_worker_deployment_crash_probe after-install-systemd-units
 systemctl daemon-reload
 cats_worker_deployment_crash_probe after-daemon-reload
-systemctl enable --now cats-controld cats-gatewayd
+systemctl enable --now cats-controld
 cats_worker_deployment_crash_probe after-start-control-services
 cats_begin_candidate_lifetime cats-noded "$release_installer"
 cats_worker_deployment_crash_probe after-authorize-worker-start
@@ -266,7 +273,7 @@ release_transaction_active=0
 cats_worker_deployment_crash_probe after-release-commit
 
 sleep 1
-systemctl --no-pager --lines 0 status cats-controld cats-gatewayd cats-noded | grep -E "●|Active"
+systemctl --no-pager --lines 0 status cats-controld cats-noded | grep -E "●|Active"
 echo
 echo "install complete. Try:"
 echo "  cats create dev --root-size 1GiB && cats exec dev -- uname -a"

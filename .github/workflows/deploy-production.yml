@@ -41,7 +41,6 @@ jobs:
       TF_STATE_BUCKET: ${{ vars.TF_STATE_BUCKET }}
       TF_STATE_APPLICATION_KEY: ${{ vars.TF_STATE_APPLICATION_KEY }}
       EKS_CLUSTER_NAME: ${{ vars.EKS_CLUSTER_NAME }}
-      ROUTE_CACHE_TABLE_NAME: ${{ vars.ROUTE_CACHE_TABLE_NAME }}
       PRODUCTION_TFVARS_B64: ${{ vars.PRODUCTION_TFVARS_B64 }}
       # The platform stack's database_master_user_secret_arn output. Not a
       # secret -- it is an ARN -- but it is the authority this deployment reads
@@ -150,7 +149,6 @@ jobs:
             TF_STATE_BUCKET \
             TF_STATE_APPLICATION_KEY \
             EKS_CLUSTER_NAME \
-            ROUTE_CACHE_TABLE_NAME \
             PRODUCTION_TFVARS_B64 \
             RDS_MASTER_USER_SECRET_ARN \
             ROUTE_GRANT_PRIVATE_KEY_PEM_B64 \
@@ -490,8 +488,6 @@ jobs:
             -var="kubeconfig_path=$RUNNER_TEMP/kubeconfig" \
             -var="kubeconfig_context=$EKS_CLUSTER_NAME" \
             -var="control_plane_image=$IMAGE_REF" \
-            -var="gateway_image=$IMAGE_REF" \
-            -var="shared_route_cache_table=$ROUTE_CACHE_TABLE_NAME" \
             -var="chunkstore_bucket_name=$CHUNKSTORE_BUCKET_NAME" \
             -var="credential_refresher_image=$REFRESHER_REF" \
             -var="database_master_user_secret_arn=$RDS_MASTER_USER_SECRET_ARN"
@@ -513,7 +509,7 @@ jobs:
           IMAGE_REF: ${{ steps.image.outputs.ref }}
         run: |
           set -euo pipefail
-          for deployment in cats-controld cats-gatewayd
+          for deployment in cats-controld
           do
             kubectl \
               --kubeconfig "$RUNNER_TEMP/kubeconfig" \

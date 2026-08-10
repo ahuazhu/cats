@@ -111,7 +111,6 @@ impl Cluster {
             control_plane_url: cp.base_url(),
             auth_token: SERVICE_TOKEN.into(),
             cache_ttl_ms: 500,
-            shared_route_cache_table: None,
         })
         .await
         .unwrap();

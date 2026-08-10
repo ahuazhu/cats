@@ -12,7 +12,7 @@ No cloud resource is created merely by checking in this directory.
 |---|---|---|
 | `bootstrap/` | bootstrap state | Versioned, encrypted, private S3 state bucket |
 | `stacks/platform/` | platform state | VPC, EKS cluster, RDS PostgreSQL, Route 53 zone, ACM certificate, ECR repository, bare-metal worker capacity and security group, GitHub Actions release role |
-| `stacks/production-infrastructure/` | infrastructure state | Usage stream/archive/checkpoints, shared signed-Route cache, Pod Identity, alarms, worker artifacts/secrets/SSM deployment |
+| `stacks/production-infrastructure/` | infrastructure state | Usage stream/archive/checkpoints, Pod Identity, alarms, worker artifacts/secrets/SSM deployment |
 | `stacks/production-payments/` | payments state | Stripe prepaid-credit Product, fixed one-time Prices and signed webhook endpoint |
 | `stacks/production-application/` | application state | Cats Namespace/ServiceAccount, Secret/ConfigMap, EBS PVC, Deployments, Services and public ingress |
 | `modules/` | none | Reusable implementation called by stacks |
@@ -140,7 +140,6 @@ Defaults are deliberately cost-conscious:
 - one dedicated S3 bucket, batched-object lifecycle to Standard-IA after
   30 days and Deep Archive after 365 days;
 - one on-demand DynamoDB projector checkpoint table;
-- one on-demand DynamoDB table for short-lived, already-signed Route Grants;
 - AWS-managed Kinesis encryption and SSE-S3 for the archive;
 - seven-year S3 Object Lock in GOVERNANCE mode.
 
@@ -150,10 +149,9 @@ period before the first apply. `prevent_destroy` also blocks accidental bucket
 replacement. The archive must never be reused for ChunkStore blocks.
 
 The usage module attaches the producer and consumer policies to one EKS Pod
-Identity role, associated only with the `cats-controld` ServiceAccount. The
-gateway uses its own `cats-gatewayd` ServiceAccount and receives only
-`GetItem`/`PutItem` on the Route Grant table; it receives no usage AWS
-permissions. The replay policy remains unattached and is reserved for
+Identity role, associated only with the `cats-controld` ServiceAccount. No
+Gateway Pod Identity or shared Route table exists before the v2 route module is
+composed. The replay policy remains unattached and is reserved for
 controlled reconciliation jobs:
 
 - `usage_producer_policy_arn`: Kinesis publication;
@@ -241,17 +239,10 @@ private value retained in historical Terraform state is cryptographically obsole
 versioned Terraform state remains restricted infrastructure evidence; it is not imported
 as product data and is not deleted by the cutover.
 
-The current infrastructure state also owns a regional Route Grant cache and a
-Gateway-only Pod Identity. Set `ROUTE_CACHE_TABLE_NAME` from the infrastructure
-output. The table is only a bounded-expiry availability cache for already
-signed V1 grants; PostgreSQL route state and the signer remain authoritative.
-Keep this table and its IAM boundary unchanged until the ADR-0041 cutover.
-
-Ordinary V1 releases preserve one compatible key and wire contract across the
-control plane, Gateway, and workers. Deploy workers one at a time through the
-drain procedure below and verify the installed public-key fingerprint before
-uncordon. Rotate the single V1 key only in a coordinated drained maintenance
-window that installs one matching pair everywhere before reopening admission.
+The old regional Route Grant cache and Gateway-only Pod Identity have been
+removed. The production stack does not deploy `cats-gatewayd`, publish Endpoint
+wildcard DNS or route wildcard ingress until the ADR-0041 implementation and
+its qualification matrix land. Workers remain gate-closed during this gap.
 
 The first ADR-0040/0041 deployment follows the single ordered runbook in
 [Operations and HA §8](../../../docs/operations-ha.md#8-首次终态部署). The Terraform plan used there
@@ -316,9 +307,8 @@ The disruptive drill separately uploads fixed-rate public-probe results and
 Pod/EndpointSlice transition evidence; those artifacts contain no Secret
 values or response bodies and are retained for 30 days for failure correlation.
 
-Terraform will additionally create `cats-gateway-runtime`, which exposes only
-`CATS_AUTH_TOKEN` to the gateway, plus the non-secret Route cache table name and
-AWS region. The gateway must not receive PostgreSQL or WorkOS credentials.
+Terraform deliberately creates no Gateway Secret, ServiceAccount, Deployment,
+Service, Pod Identity or DynamoDB Route mirror in this release.
 
 ## Metal worker deployment
 
