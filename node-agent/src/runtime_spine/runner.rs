@@ -585,6 +585,15 @@ impl RuntimeDesiredEffectContext {
     }
 
     #[cfg(test)]
+    pub(crate) fn with_kernel_nbd_pool_for_test(
+        mut self,
+        admission: KernelNbdPoolAdmission,
+    ) -> Self {
+        self.kernel_nbd_pool = Some(admission);
+        self
+    }
+
+    #[cfg(test)]
     pub(crate) fn cancel_for_test(&self) {
         self.cancellation.cancel();
     }
@@ -723,7 +732,7 @@ pub struct CompleteRuntimeInventory {
     residue: Vec<NodeResidue>,
     node_global_process: Option<NodeGlobalManagedProcessScanAdmission>,
     node_global_network: Option<Box<NodeGlobalNetworkScanAdmission>>,
-    kernel_nbd_pool: Option<KernelNbdPoolScanAdmission>,
+    kernel_nbd_pool: Option<Box<KernelNbdPoolScanAdmission>>,
 }
 
 impl CompleteRuntimeInventory {
@@ -777,12 +786,12 @@ impl CompleteRuntimeInventory {
         mut self,
         admission: Option<KernelNbdPoolScanAdmission>,
     ) -> Self {
-        self.kernel_nbd_pool = admission;
+        self.kernel_nbd_pool = admission.map(Box::new);
         self
     }
 
     pub(crate) fn take_kernel_nbd_pool_admission(&mut self) -> Option<KernelNbdPoolScanAdmission> {
-        self.kernel_nbd_pool.take()
+        self.kernel_nbd_pool.take().map(|admission| *admission)
     }
 
     #[cfg(test)]
@@ -1332,7 +1341,7 @@ impl ScanLane {
                 if Instant::now() >= deadline {
                     Ok(ScanWait::DeadlineExceeded)
                 } else {
-                    Ok(ScanWait::Finished(result))
+                    Ok(ScanWait::Finished(Box::new(result)))
                 }
             }
             Ok(Err(_)) => {
@@ -1741,7 +1750,7 @@ fn active_scan(
 }
 
 enum ScanWait {
-    Finished(anyhow::Result<RuntimeInventoryScanOutcome>),
+    Finished(Box<anyhow::Result<RuntimeInventoryScanOutcome>>),
     DeadlineExceeded,
 }
 
@@ -1995,10 +2004,12 @@ impl RuntimeSpineRunner {
                     .scan_complete(scan, deadlines.scan)
                     .await?
                 {
-                    ScanWait::Finished(Ok(outcome)) => outcome,
-                    ScanWait::Finished(Err(error)) => {
-                        return Ok(RuntimeSpineRunStep::ScanUnavailable(error));
-                    }
+                    ScanWait::Finished(result) => match *result {
+                        Ok(outcome) => outcome,
+                        Err(error) => {
+                            return Ok(RuntimeSpineRunStep::ScanUnavailable(error));
+                        }
+                    },
                     ScanWait::DeadlineExceeded => {
                         return Ok(RuntimeSpineRunStep::ScanDeadlineExceeded);
                     }

@@ -33,7 +33,7 @@ use cats_storage::authority::VolumeDataAuthority;
 
 use crate::runtime_spine::{
     effect_resource_owner_sealed, RuntimeDesiredEffectContext, RuntimeDesiredEffectOutcome,
-    RuntimeEffectResourceOwner, RuntimePhysicalReadContext,
+    RuntimeDesiredEffectStopReason, RuntimeEffectResourceOwner, RuntimePhysicalReadContext,
 };
 use crate::state_directory::StateDirectory;
 
@@ -45,6 +45,7 @@ use super::clean_slate_probes::{
     snapshot_runtime_checkpoint_namespace, RuntimeCheckpointNamespaceSnapshot,
     CHECKPOINT_NAMESPACE, RUNTIME_CHECKPOINT_NAMESPACE_ENTRY_LIMIT,
 };
+use super::prepare_device_retirement::prepare_device_base_admission_is_exact;
 use super::root_provision_process::NodeGlobalManagedProcessScanAdmission;
 use super::serving_blockd_process::ServingBlockdListenerProof;
 use super::serving_handoff::ServingHandoffStore;
@@ -293,92 +294,49 @@ pub(crate) struct KernelNbdDeviceExpectation {
     device_path: HostPath,
     expected_size_sectors: WireU64,
     guest_device: GuestDeviceIdentity,
+    prepared_device: PreparedDeviceInput,
 }
 
 impl KernelNbdDeviceExpectation {
-    fn from_prepare_device(checkpoint: &RuntimeCheckpoint) -> Result<Option<Self>> {
-        let ReconcileStep::PrepareDevice {
-            volume_id,
-            attachment_id,
-            attachment_epoch,
-            size_bytes,
-            guest_device,
-            ownership_token,
-            serving_process,
-            frontend,
-            ..
-        } = &checkpoint.step
-        else {
+    pub(super) fn from_prepare_device(checkpoint: &RuntimeCheckpoint) -> Result<Option<Self>> {
+        if !matches!(checkpoint.step, ReconcileStep::PrepareDevice { .. }) {
             return Ok(None);
-        };
-        Self::from_parts(
-            &checkpoint.cat_id,
-            volume_id,
-            attachment_id,
-            *attachment_epoch,
-            *size_bytes,
-            guest_device,
-            ownership_token,
-            serving_process,
-            frontend,
-        )
+        }
+        let prepared = super::network::prepared_device_input(checkpoint)?;
+        Self::from_prepared_device(&checkpoint.cat_id, &prepared)
     }
 
     fn from_prepared_device(cat_id: &Id, prepared: &PreparedDeviceInput) -> Result<Option<Self>> {
-        Self::from_parts(
-            cat_id,
-            &prepared.volume_id,
-            &prepared.attachment_id,
-            prepared.attachment_epoch,
-            prepared.size_bytes,
-            &prepared.guest_device,
-            &prepared.ownership_token,
-            &prepared.serving_process,
-            &prepared.frontend,
-        )
-    }
-
-    #[allow(clippy::too_many_arguments)]
-    fn from_parts(
-        cat_id: &Id,
-        volume_id: &Id,
-        attachment_id: &Id,
-        attachment_epoch: FenceEpoch,
-        size_bytes: u64,
-        guest_device: &GuestDeviceIdentity,
-        ownership_token: &RandomId128,
-        serving_process: &cats_api::runtime_reconciliation::ServingBlockdIdentity,
-        frontend: &PrepareDeviceFrontend,
-    ) -> Result<Option<Self>> {
         let PrepareDeviceFrontend::KernelNbd {
             listener_socket_path,
             device_path,
             ..
-        } = frontend
+        } = &prepared.frontend
         else {
             return Ok(None);
         };
         anyhow::ensure!(
-            size_bytes > 0 && size_bytes % 512 == 0,
+            prepared.size_bytes > 0 && prepared.size_bytes.is_multiple_of(512),
             "persisted kernel-NBD device size is not positive and 512-byte aligned"
         );
-        let expected_size_sectors = WireU64::new(size_bytes / 512)
+        let expected_size_sectors = WireU64::new(prepared.size_bytes / 512)
             .context("persisted kernel-NBD device capacity exceeds the wire range")?;
         anyhow::ensure!(
-            serving_process.process_identity_token != *ownership_token,
+            prepared.serving_process.process_identity_token != prepared.ownership_token,
             "persisted kernel-NBD process and device tokens alias"
         );
         Ok(Some(Self {
             cat_id: cat_id.clone(),
-            volume_id: volume_id.clone(),
-            attachment_id: attachment_id.clone(),
-            attachment_epoch,
-            ownership_token: ownership_token.clone(),
-            serving_process_identity_token: serving_process.process_identity_token.clone(),
+            volume_id: prepared.volume_id.clone(),
+            attachment_id: prepared.attachment_id.clone(),
+            attachment_epoch: prepared.attachment_epoch,
+            ownership_token: prepared.ownership_token.clone(),
+            serving_process_identity_token: prepared.serving_process.process_identity_token.clone(),
             listener_socket_path: listener_socket_path.clone(),
             device_path: device_path.clone(),
             expected_size_sectors,
-            guest_device: guest_device.clone(),
+            guest_device: prepared.guest_device.clone(),
+            prepared_device: prepared.clone(),
         }))
     }
 
@@ -457,31 +415,14 @@ impl ExactKernelNbdDeviceProof {
 }
 
 impl KernelNbdDeviceExpectation {
-    fn assert_serving_listener(&self, listener: &ServingBlockdListenerProof) -> Result<()> {
-        let size_bytes = self
-            .expected_size_sectors
-            .get()
-            .checked_mul(512)
-            .context("persisted kernel-NBD sector capacity overflows bytes")?;
+    pub(super) fn assert_serving_listener(
+        &self,
+        listener: &ServingBlockdListenerProof,
+    ) -> Result<()> {
         anyhow::ensure!(
-            listener.expectation().matches_device_contract(
-                &self.cat_id,
-                &self.volume_id,
-                &self.attachment_id,
-                self.attachment_epoch,
-                size_bytes,
-            ) && listener.listener_path() == &self.listener_socket_path
-                && listener.process_identity_token() == &self.serving_process_identity_token
-                && listener.device_ownership_token() == &self.ownership_token
-                && listener.expectation().frontend()
-                    == &PrepareDeviceFrontend::KernelNbd {
-                        listener_socket_path: self.listener_socket_path.clone(),
-                        device_path: self.device_path.clone(),
-                        direct: match listener.expectation().frontend() {
-                            PrepareDeviceFrontend::KernelNbd { direct, .. } => *direct,
-                            PrepareDeviceFrontend::VhostUserBlk { .. } => false,
-                        },
-                    },
+            listener
+                .expectation()
+                .matches_device_contract(&self.cat_id, &self.prepared_device),
             "authorized-serving proof does not match the persisted kernel-NBD contract"
         );
         Ok(())
@@ -537,6 +478,27 @@ pub(crate) struct KernelNbdPoolAdmission {
 }
 
 impl KernelNbdPoolScanAdmission {
+    #[cfg(test)]
+    pub(super) fn absent_for_test(
+        observation: &NodeObservation,
+        checkpoint: &RuntimeCheckpoint,
+        listener: ServingBlockdListenerProof,
+    ) -> Result<KernelNbdPoolAdmission> {
+        let expected = KernelNbdDeviceExpectation::from_prepare_device(checkpoint)?
+            .context("test kernel-NBD admission requires PrepareDevice")?;
+        expected.assert_serving_listener(&listener)?;
+        Self {
+            devices_by_cat: BTreeMap::from([(
+                checkpoint.cat_id.clone(),
+                KernelNbdDeviceScanState::Absent {
+                    expected,
+                    listener: Some(listener),
+                },
+            )]),
+        }
+        .bind(observation)
+    }
+
     pub(crate) fn has_unavailable_device(&self) -> bool {
         self.devices_by_cat
             .values()
@@ -760,6 +722,21 @@ fn reservation_from_prepare_device(checkpoint: &RuntimeCheckpoint) -> Result<Ker
     })
 }
 
+fn reservation_from_prepared_device(
+    cat_id: &Id,
+    prepared: &PreparedDeviceInput,
+) -> Option<KernelNbdReservation> {
+    let PrepareDeviceFrontend::KernelNbd { device_path, .. } = &prepared.frontend else {
+        return None;
+    };
+    Some(KernelNbdReservation {
+        cat_id: cat_id.clone(),
+        volume_id: prepared.volume_id.clone(),
+        device_path: device_path.clone(),
+        ownership_token: prepared.ownership_token.clone(),
+    })
+}
+
 impl KernelNbdReservations {
     fn from_snapshot(snapshot: &RuntimeCheckpointNamespaceSnapshot) -> Result<Self> {
         Self::from_checkpoints(snapshot.iter_checkpoints())
@@ -823,6 +800,16 @@ impl KernelNbdReservations {
                 device_path: device_path.clone(),
                 ownership_token: ownership_token.clone(),
             })?;
+        }
+        if let ReconcileStep::PrepareNetwork { devices, .. }
+        | ReconcileStep::StartRuntime { devices, .. } = &checkpoint.step
+        {
+            for reservation in devices
+                .iter()
+                .filter_map(|device| reservation_from_prepared_device(&checkpoint.cat_id, device))
+            {
+                self.insert(reservation)?;
+            }
         }
         for volume in &checkpoint.volumes {
             for device in &volume.devices {
@@ -1880,6 +1867,14 @@ impl KernelNbdAttachEffect {
         }
     }
 
+    #[cfg(test)]
+    pub(super) fn for_test(
+        authority: Arc<dyn VolumeDataAuthority>,
+        attach: Arc<dyn KernelNbdAttachPort>,
+    ) -> Self {
+        Self { authority, attach }
+    }
+
     pub(crate) fn try_apply(
         &self,
         context: &RuntimeDesiredEffectContext,
@@ -1911,6 +1906,11 @@ impl KernelNbdAttachEffect {
         else {
             return Ok(None);
         };
+        if !prepare_device_base_admission_is_exact(accepted, desired, runtime) {
+            return Ok(Some(RuntimeDesiredEffectOutcome::Stop(
+                RuntimeDesiredEffectStopReason::LocalContract,
+            )));
+        }
         if !checkpoint_is_current_exact(desired, runtime) {
             return Ok(None);
         }
@@ -1945,15 +1945,15 @@ impl KernelNbdAttachEffect {
                 proof.listener().assert_current(context)?;
                 // A fresh exact full may fall through to the independent
                 // PrepareNetwork reservation in this same dispatcher call.
-                return Ok(None);
+                Ok(None)
             }
             KernelNbdDeviceScanState::Leaked { .. }
             | KernelNbdDeviceScanState::Unavailable { .. } => {
-                return Ok(Some(RuntimeDesiredEffectOutcome::RefreshInventory));
+                Ok(Some(RuntimeDesiredEffectOutcome::RefreshInventory))
             }
             KernelNbdDeviceScanState::Absent { listener: None, .. } => {
                 // The preceding serving-process effect owns this admission.
-                return Ok(Some(RuntimeDesiredEffectOutcome::RefreshInventory));
+                Ok(Some(RuntimeDesiredEffectOutcome::RefreshInventory))
             }
             KernelNbdDeviceScanState::Absent {
                 expected,
@@ -2028,7 +2028,6 @@ impl KernelNbdAttachEffect {
                     Err(_) => return Ok(Some(RuntimeDesiredEffectOutcome::RefreshInventory)),
                 };
                 ready.assert_current(stored.checkpoint(), desired, &current_authority)?;
-                listener.assert_current(context)?;
                 context.check_active()?;
 
                 let _result = self
@@ -3342,10 +3341,10 @@ mod tests {
     fn complete_pool_scan_preserves_absent_unavailable_and_unreserved_uncertainty() {
         let fixture = Fixture::new(2);
         let source = checkpoint("cat_a", "vol_a", "/dev/nbd0", '6');
-        FileCheckpointStore::open(&fixture.state.join(CHECKPOINT_NAMESPACE), &source.cat_id)
-            .unwrap()
-            .create(&source)
-            .unwrap();
+        let store =
+            FileCheckpointStore::open(&fixture.state.join(CHECKPOINT_NAMESPACE), &source.cat_id)
+                .unwrap();
+        store.create(&source).unwrap();
         let processes = NodeGlobalManagedProcessScanAdmission::from_root_controls(
             BTreeMap::new(),
             BTreeMap::new(),
@@ -3386,6 +3385,59 @@ mod tests {
                 .unwrap(),
             KernelNbdPoolScanOutcome::Unavailable
         ));
+    }
+
+    #[test]
+    fn prepare_network_step_devices_remain_durable_reservations() {
+        let source = checkpoint("cat_a", "vol_a", "/dev/nbd0", '6');
+        let expected = reservation_from_prepare_device(&source).unwrap();
+        let mut successor = source.clone();
+        successor.step = ReconcileStep::PrepareNetwork {
+            network: cats_api::runtime_reconciliation::RuntimeNetworkIdentity {
+                network_config: desired("cat_a").runtime.network_config,
+                tap_name: id("cata00000001"),
+                ownership_token: random('9'),
+            },
+            devices: vec![super::super::network::prepared_device_input(&source).unwrap()],
+        };
+        successor.volumes.clear();
+
+        let reservations = KernelNbdReservations::from_checkpoints([&successor]).unwrap();
+        reservations
+            .assert_contains(
+                &expected,
+                "PrepareNetwork lost its persisted kernel-NBD reservation",
+            )
+            .unwrap();
+    }
+
+    #[test]
+    fn persisted_device_expectation_binds_kernel_direct_mode() {
+        let buffered = checkpoint("cat_a", "vol_a", "/dev/nbd0", '6');
+        let mut direct_checkpoint = buffered.clone();
+        let ReconcileStep::PrepareDevice {
+            frontend:
+                PrepareDeviceFrontend::KernelNbd {
+                    direct: direct_mode,
+                    ..
+                },
+            ..
+        } = &mut direct_checkpoint.step
+        else {
+            unreachable!()
+        };
+        *direct_mode = true;
+
+        let buffered = KernelNbdDeviceExpectation::from_prepare_device(&buffered)
+            .unwrap()
+            .unwrap();
+        let direct = KernelNbdDeviceExpectation::from_prepare_device(&direct_checkpoint)
+            .unwrap()
+            .unwrap();
+        assert_ne!(
+            buffered, direct,
+            "listener admission must not erase the persisted direct mode"
+        );
     }
 
     #[test]
@@ -4423,7 +4475,10 @@ mod tests {
         let error = port
             .attach_checkpointed(&request, &listener, &store, &stored, &context)
             .unwrap_err();
-        assert!(format!("{error:#}").contains("physical identity changed"));
+        assert!(
+            format!("{error:#}").contains("fake retained listener identity changed"),
+            "{error:#}"
+        );
         assert_eq!(calls.calls(), 0);
         assert_eq!(listener.calls(), 1);
     }

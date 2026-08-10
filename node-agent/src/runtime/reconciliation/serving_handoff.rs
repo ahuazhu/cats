@@ -3890,6 +3890,11 @@ mod tests {
 
     use super::*;
     use crate::ch::{PendingTap, TapCreatePort};
+    use crate::runtime::reconciliation::kernel_nbd::{
+        attach_port_sealed as kernel_attach_sealed, KernelNbdAttachConflict, KernelNbdAttachEffect,
+        KernelNbdAttachPort, KernelNbdAttachRequest, KernelNbdAttachResult,
+        KernelNbdPoolScanAdmission, RetainedKernelNbdListenerGuard,
+    };
     use crate::runtime::reconciliation::network::{
         NodeGlobalNetworkScanAdmission, PrepareNetworkReservationEffect,
     };
@@ -4985,6 +4990,43 @@ mod tests {
             _context: &RuntimeDesiredEffectContext,
         ) -> Result<ServingBlockdProcessInspection> {
             Ok(self.inspection(expected))
+        }
+    }
+
+    #[derive(Clone, Copy)]
+    enum KernelAttachBehavior {
+        OutcomeUnknown,
+        Conflict,
+        Cancelled,
+    }
+
+    struct FakeKernelNbdAttachPort {
+        behavior: KernelAttachBehavior,
+        calls: AtomicUsize,
+    }
+
+    impl kernel_attach_sealed::Sealed for FakeKernelNbdAttachPort {}
+
+    impl KernelNbdAttachPort for FakeKernelNbdAttachPort {
+        fn attach_checkpointed(
+            &self,
+            _request: &KernelNbdAttachRequest,
+            _listener: &dyn RetainedKernelNbdListenerGuard,
+            _store: &FileCheckpointStore,
+            _stored: &StoredCheckpoint,
+            context: &RuntimeDesiredEffectContext,
+        ) -> Result<KernelNbdAttachResult> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            Ok(match self.behavior {
+                KernelAttachBehavior::OutcomeUnknown => KernelNbdAttachResult::OutcomeUnknown,
+                KernelAttachBehavior::Conflict => KernelNbdAttachResult::ConflictAfterSubmit(
+                    KernelNbdAttachConflict::LiveClientIdentity,
+                ),
+                KernelAttachBehavior::Cancelled => {
+                    context.cancel_for_test();
+                    KernelNbdAttachResult::OutcomeUnknown
+                }
+            })
         }
     }
 
@@ -6249,6 +6291,52 @@ mod tests {
                 } => {
                     assert_eq!(listener.listener_path(), listener_socket_path);
                     assert!(projected_device.is_none());
+                    let persisted =
+                        super::super::kernel_nbd::KernelNbdDeviceExpectation::from_prepare_device(
+                            fixture.stored_checkpoint.checkpoint(),
+                        )
+                        .unwrap()
+                        .unwrap();
+                    persisted.assert_serving_listener(&listener).unwrap();
+
+                    let mut wrong_direct = fixture.stored_checkpoint.checkpoint().clone();
+                    let ReconcileStep::PrepareDevice {
+                        frontend: PrepareDeviceFrontend::KernelNbd { direct, .. },
+                        ..
+                    } = &mut wrong_direct.step
+                    else {
+                        unreachable!()
+                    };
+                    *direct = !*direct;
+                    assert!(
+                        super::super::kernel_nbd::KernelNbdDeviceExpectation::from_prepare_device(
+                            &wrong_direct,
+                        )
+                        .unwrap()
+                        .unwrap()
+                        .assert_serving_listener(&listener)
+                        .is_err(),
+                        "listener proof must not erase persisted direct mode",
+                    );
+
+                    let mut wrong_epoch = fixture.stored_checkpoint.checkpoint().clone();
+                    let ReconcileStep::PrepareDevice {
+                        attachment_epoch, ..
+                    } = &mut wrong_epoch.step
+                    else {
+                        unreachable!()
+                    };
+                    *attachment_epoch = FenceEpoch::new(attachment_epoch.get() + 1).unwrap();
+                    assert!(
+                        super::super::kernel_nbd::KernelNbdDeviceExpectation::from_prepare_device(
+                            &wrong_epoch,
+                        )
+                        .unwrap()
+                        .unwrap()
+                        .assert_serving_listener(&listener)
+                        .is_err(),
+                        "listener proof must not erase the attachment epoch",
+                    );
                 }
                 PrepareDeviceFrontend::VhostUserBlk { socket_path, .. } => {
                     assert_eq!(listener.listener_path(), socket_path);
@@ -6265,6 +6353,78 @@ mod tests {
                     ));
                 }
             }
+        }
+    }
+
+    #[test]
+    fn kernel_attach_effect_submits_once_and_refreshes_every_ambiguous_outcome() {
+        for behavior in [
+            KernelAttachBehavior::OutcomeUnknown,
+            KernelAttachBehavior::Conflict,
+            KernelAttachBehavior::Cancelled,
+        ] {
+            let mut fixture = fixture();
+            complete_old_process_retirement(&mut fixture);
+            let mut checkpoint = fixture.stored_checkpoint.checkpoint().clone();
+            let ReconcileStep::PrepareDevice { frontend, .. } = &mut checkpoint.step else {
+                unreachable!()
+            };
+            *frontend = PrepareDeviceFrontend::KernelNbd {
+                listener_socket_path: host(&format!(
+                    "{}/serving-nbd.sock",
+                    fixture.data_directory.display()
+                )),
+                device_path: host("/dev/nbd7"),
+                direct: false,
+            };
+            fixture.stored_checkpoint = FileCheckpointStore::open(
+                &fixture.checkpoint_directory,
+                &fixture.acquired.desired.cat_id,
+            )
+            .unwrap()
+            .replace(&fixture.stored_checkpoint, &checkpoint)
+            .unwrap();
+
+            let expected = serving_expectation(&fixture);
+            let exact = expected
+                .clone()
+                .prove_exact_process(expected.exact_evidence_for_test(51))
+                .unwrap();
+            let context = effect_context_with_processes(
+                &fixture,
+                vec![exact.clone().into_process_evidence()],
+            );
+            let pool = KernelNbdPoolScanAdmission::absent_for_test(
+                context.accepted_full().unwrap().observation(),
+                fixture.stored_checkpoint.checkpoint(),
+                exact.listener_proof(),
+            )
+            .unwrap();
+            let context = context.with_kernel_nbd_pool_for_test(pool);
+            let attach = Arc::new(FakeKernelNbdAttachPort {
+                behavior,
+                calls: AtomicUsize::new(0),
+            });
+            let effect = KernelNbdAttachEffect::for_test(
+                Arc::new(FixedEffectAuthority::new(fixture.authority.volume.clone())),
+                attach.clone(),
+            );
+
+            assert_eq!(
+                effect
+                    .try_apply(
+                        &context,
+                        &fixture.acquired.desired,
+                        context.kernel_nbd_pool().unwrap(),
+                    )
+                    .unwrap(),
+                Some(RuntimeDesiredEffectOutcome::RefreshInventory)
+            );
+            assert_eq!(
+                attach.calls.load(Ordering::SeqCst),
+                1,
+                "ambiguous attach outcome was retried in the same admission",
+            );
         }
     }
 

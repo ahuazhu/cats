@@ -12,9 +12,9 @@ use std::sync::Arc;
 use anyhow::Context as _;
 use cats_api::blockd::DurabilityStatus;
 use cats_api::runtime_reconciliation::{
-    ControlHandshakeEvidence, DesiredRuntimeSpec, FenceEpoch, HostPath, Id, ObservedDevice,
-    ObservedRuntimeStatus, OwnershipTokenEvidence, PrepareDeviceFrontend, ProcessEvidence,
-    ProcessRole, ProcessState, RandomId128, ReconcileStep, WireU64,
+    ControlHandshakeEvidence, DesiredRuntimeSpec, HostPath, Id, ObservedDevice,
+    ObservedRuntimeStatus, OwnershipTokenEvidence, PrepareDeviceFrontend, PreparedDeviceInput,
+    ProcessEvidence, ProcessRole, ProcessState, RandomId128, ReconcileStep, WireU64,
 };
 use cats_storage::authority::{
     validate_authorized_serving_attachment, validate_volume_record, LastVolumeTransition,
@@ -116,6 +116,7 @@ pub(crate) struct ServingBlockdExpectation {
     process_identity_token: RandomId128,
     device_ownership_token: RandomId128,
     frontend: PrepareDeviceFrontend,
+    prepared_device: PreparedDeviceInput,
 }
 
 impl ServingBlockdExpectation {
@@ -176,8 +177,9 @@ impl ServingBlockdExpectation {
             control_socket_path: serving_process.control_socket_path.clone(),
             data_directory: serving_process.data_directory.clone(),
             process_identity_token: serving_process.process_identity_token.clone(),
-            device_ownership_token: prepared.ownership_token,
-            frontend: prepared.frontend,
+            device_ownership_token: prepared.ownership_token.clone(),
+            frontend: prepared.frontend.clone(),
+            prepared_device: prepared,
         })
     }
 
@@ -216,17 +218,9 @@ impl ServingBlockdExpectation {
     pub(crate) fn matches_device_contract(
         &self,
         cat_id: &Id,
-        volume_id: &Id,
-        attachment_id: &Id,
-        attachment_epoch: FenceEpoch,
-        size_bytes: u64,
+        prepared: &PreparedDeviceInput,
     ) -> bool {
-        let attachment = &self.volume.attachment;
-        self.cat_id() == cat_id
-            && attachment.identity.volume_id == *volume_id
-            && attachment.identity.attachment_id == *attachment_id
-            && attachment.identity.attachment_epoch == attachment_epoch
-            && attachment.size_bytes == size_bytes
+        self.cat_id() == cat_id && self.prepared_device == *prepared
     }
 
     /// Check the provider authority behind this scanner-minted expectation.
