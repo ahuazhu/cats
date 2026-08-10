@@ -1,7 +1,11 @@
 //! cats-blockd composition root: selects storage adapters and serves one
 //! volume under one attachment lease.
 
-use std::io::{Read, Write};
+use std::ffi::{CStr, CString};
+use std::fs::File;
+use std::io::{self, Read, Write};
+use std::os::fd::{AsRawFd as _, FromRawFd as _};
+use std::os::unix::ffi::OsStrExt as _;
 use std::os::unix::fs::MetadataExt as _;
 use std::os::unix::fs::OpenOptionsExt as _;
 use std::os::unix::net::{UnixListener, UnixStream};
@@ -16,6 +20,10 @@ use cats_api::runtime_reconciliation::{
 };
 use cats_blockd::engine::{ChunkEngine, EngineConfig, ProvisionRootImageEffectError};
 use cats_blockd::nbd;
+use cats_blockd::serving_handoff::{
+    decode_serving_handoff_record, ServingHandoffRecord, SERVING_HANDOFF_RECORD_FILE,
+    SERVING_HANDOFF_RECORD_MAX_BYTES,
+};
 use cats_blockd::target_control::{
     decode_target_control_authorization, target_control_authorization_file_name,
     StableDirectoryIdentity, StableFileIdentity, TargetControlAuthorizationArtifact,
@@ -53,6 +61,27 @@ struct Args {
     /// increments, releases, or otherwise changes attachment ownership.
     #[arg(long, value_name = "PATH")]
     authorized_serving_spec: Option<PathBuf>,
+
+    /// Sealed first-Root handoff record. Unlike `--authorized-serving-spec`,
+    /// this mode derives the target-head attachment only after it validates
+    /// both this record and its physically bound target-control artifact.
+    #[arg(long, value_name = "PATH")]
+    authorized_serving_handoff_record: Option<PathBuf>,
+
+    /// Exact ProvisionRootImage checkpoint digest named by the persisted
+    /// PrepareDevice handoff provenance.
+    #[arg(long, value_name = "SHA256")]
+    authorized_serving_handoff_predecessor_checkpoint_content_digest: Option<String>,
+
+    /// Descriptor identity of the sealed record persisted in PrepareDevice.
+    #[arg(long, value_name = "U64")]
+    authorized_serving_handoff_record_device: Option<u64>,
+    #[arg(long, value_name = "U64")]
+    authorized_serving_handoff_record_inode: Option<u64>,
+    #[arg(long, value_name = "U64")]
+    authorized_serving_handoff_record_length: Option<u64>,
+    #[arg(long, value_name = "SHA256")]
+    authorized_serving_handoff_record_content_sha256: Option<String>,
 
     /// Complete exact grant for the signed root-provision control process.
     /// This shares the frozen grant shape with serving but never opens a Guest
@@ -413,6 +442,9 @@ struct LocalFileMetadata {
     inode: u64,
     length: u64,
     links: u64,
+    mode: u32,
+    uid: u32,
+    gid: u32,
     modified_seconds: i64,
     modified_nanoseconds: i64,
     changed_seconds: i64,
@@ -426,10 +458,503 @@ impl LocalFileMetadata {
             inode: metadata.ino(),
             length: metadata.len(),
             links: metadata.nlink(),
+            mode: metadata.mode(),
+            uid: metadata.uid(),
+            gid: metadata.gid(),
             modified_seconds: metadata.mtime(),
             modified_nanoseconds: metadata.mtime_nsec(),
             changed_seconds: metadata.ctime(),
             changed_nanoseconds: metadata.ctime_nsec(),
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+struct ServingHandoffRecordExpectation {
+    path: PathBuf,
+    device: u64,
+    inode: u64,
+    length: u64,
+    content_sha256: Sha256Digest,
+    predecessor_checkpoint_content_digest: Sha256Digest,
+}
+
+enum AuthorizedServingInput {
+    Direct(Box<AuthorizedServingAttachment>),
+    RootHandoff(Box<ValidatedServingHandoff>),
+}
+
+impl AuthorizedServingInput {
+    fn attachment(&self) -> &AuthorizedServingAttachment {
+        match self {
+            Self::Direct(attachment) => attachment,
+            Self::RootHandoff(handoff) => handoff.attachment(),
+        }
+    }
+
+    fn assert_current(&self) -> Result<()> {
+        match self {
+            Self::Direct(_) => Ok(()),
+            Self::RootHandoff(handoff) => handoff.assert_current(),
+        }
+    }
+
+    fn apply<T>(self, effect: impl FnOnce(AuthorizedServingAttachment) -> Result<T>) -> Result<T> {
+        self.assert_current()?;
+        let attachment = self.attachment().clone();
+        // Keep every handoff descriptor live until the engine has consumed
+        // the closed attachment. No effect is invoked before this point.
+        let result = effect(attachment);
+        drop(self);
+        result
+    }
+}
+
+struct ValidatedServingHandoff {
+    data_directory_path: PathBuf,
+    data_directory: File,
+    data_directory_identity: LocalFileMetadata,
+    record: RetainedPrivateFile,
+    target: RetainedPrivateFile,
+    decoded: ServingHandoffRecord,
+}
+
+impl ValidatedServingHandoff {
+    fn attachment(&self) -> &AuthorizedServingAttachment {
+        &self
+            .decoded
+            .target_control_authorization
+            .artifact
+            .attachment
+    }
+
+    fn assert_current(&self) -> Result<()> {
+        let retained_directory = self
+            .data_directory
+            .metadata()
+            .context("reinspect retained serving handoff directory")?;
+        if LocalFileMetadata::from_metadata(&retained_directory) != self.data_directory_identity {
+            bail!("retained serving handoff directory changed identity");
+        }
+        let lexical_directory = open_private_directory(&self.data_directory_path)?;
+        let lexical_identity = LocalFileMetadata::from_metadata(
+            &lexical_directory
+                .metadata()
+                .context("reinspect lexical serving handoff directory")?,
+        );
+        if lexical_identity != self.data_directory_identity {
+            bail!("serving handoff directory path changed identity");
+        }
+        self.record.assert_current(
+            &self.data_directory,
+            &lexical_directory,
+            SERVING_HANDOFF_RECORD_MAX_BYTES,
+        )?;
+        self.target.assert_current(
+            &self.data_directory,
+            &lexical_directory,
+            TARGET_CONTROL_AUTHORIZATION_MAX_BYTES,
+        )?;
+        Ok(())
+    }
+}
+
+struct RetainedPrivateFile {
+    path: PathBuf,
+    file: File,
+    identity: LocalFileMetadata,
+    bytes: Vec<u8>,
+}
+
+impl RetainedPrivateFile {
+    fn assert_current(
+        &self,
+        retained_directory: &File,
+        lexical_directory: &File,
+        maximum: usize,
+    ) -> Result<()> {
+        let current = LocalFileMetadata::from_metadata(
+            &self
+                .file
+                .metadata()
+                .with_context(|| format!("reinspect retained {}", self.path.display()))?,
+        );
+        if current != self.identity {
+            bail!("retained serving handoff file changed identity");
+        }
+        for directory in [retained_directory, lexical_directory] {
+            let reopened = read_private_file_at(directory, &self.path, maximum)?;
+            if reopened.identity != self.identity || reopened.bytes != self.bytes {
+                bail!(
+                    "serving handoff file {} changed identity or bytes",
+                    self.path.display()
+                );
+            }
+        }
+        Ok(())
+    }
+}
+
+fn read_authorized_serving_input(
+    args: &Args,
+    config: &EngineConfig,
+    process_identity: Option<&RuntimeProcessIdentity>,
+) -> Result<Option<AuthorizedServingInput>> {
+    match (
+        args.authorized_serving_spec.as_deref(),
+        args.authorized_serving_handoff_record.as_deref(),
+    ) {
+        (None, None) => Ok(None),
+        (Some(_), Some(_)) => {
+            bail!("direct authorized serving conflicts with serving-from-handoff")
+        }
+        (Some(path), None) => read_authorized_serving_attachment(path)
+            .map(Box::new)
+            .map(AuthorizedServingInput::Direct)
+            .map(Some),
+        (None, Some(path)) => {
+            let predecessor_checkpoint_content_digest = Sha256Digest::new(
+                args.authorized_serving_handoff_predecessor_checkpoint_content_digest
+                    .clone()
+                    .context("serving-from-handoff requires its predecessor checkpoint digest")?,
+            )
+            .context(
+                "--authorized-serving-handoff-predecessor-checkpoint-content-digest is invalid",
+            )?;
+            let content_sha256 = Sha256Digest::new(
+                args.authorized_serving_handoff_record_content_sha256
+                    .clone()
+                    .context("serving-from-handoff requires its record content digest")?,
+            )
+            .context("--authorized-serving-handoff-record-content-sha256 is invalid")?;
+            let expectation = ServingHandoffRecordExpectation {
+                path: path.to_path_buf(),
+                device: args
+                    .authorized_serving_handoff_record_device
+                    .context("serving-from-handoff requires its record device")?,
+                inode: args
+                    .authorized_serving_handoff_record_inode
+                    .context("serving-from-handoff requires its record inode")?,
+                length: args
+                    .authorized_serving_handoff_record_length
+                    .context("serving-from-handoff requires its record length")?,
+                content_sha256,
+                predecessor_checkpoint_content_digest,
+            };
+            let process_identity = process_identity
+                .context("serving-from-handoff requires Runtime process identity")?;
+            read_serving_handoff_authorization(config, args, process_identity, &expectation)
+                .map(Box::new)
+                .map(AuthorizedServingInput::RootHandoff)
+                .map(Some)
+        }
+    }
+}
+
+fn read_serving_handoff_authorization(
+    config: &EngineConfig,
+    args: &Args,
+    process_identity: &RuntimeProcessIdentity,
+    expected: &ServingHandoffRecordExpectation,
+) -> Result<ValidatedServingHandoff> {
+    read_serving_handoff_authorization_before_revalidation(
+        config,
+        args,
+        process_identity,
+        expected,
+        || {},
+    )
+}
+
+fn read_serving_handoff_authorization_before_revalidation(
+    config: &EngineConfig,
+    args: &Args,
+    process_identity: &RuntimeProcessIdentity,
+    expected: &ServingHandoffRecordExpectation,
+    before_revalidation: impl FnOnce(),
+) -> Result<ValidatedServingHandoff> {
+    if !config.data_dir.is_absolute()
+        || expected.path != config.data_dir.join(SERVING_HANDOFF_RECORD_FILE)
+        || expected.device == 0
+        || expected.inode == 0
+        || expected.length == 0
+        || expected.length > SERVING_HANDOFF_RECORD_MAX_BYTES as u64
+    {
+        bail!("serving-from-handoff record identity is outside its exact data directory");
+    }
+    let data_directory = open_private_directory(&config.data_dir)?;
+    let data_directory_identity = LocalFileMetadata::from_metadata(
+        &data_directory
+            .metadata()
+            .context("inspect serving handoff data directory")?,
+    );
+    let record = read_private_file_at(
+        &data_directory,
+        &expected.path,
+        SERVING_HANDOFF_RECORD_MAX_BYTES,
+    )?;
+    let record_digest = Sha256Digest::from_bytes(cats_blockd::format::sha256(&record.bytes));
+    if record.identity.device != expected.device
+        || record.identity.inode != expected.inode
+        || record.identity.length != expected.length
+        || record_digest != expected.content_sha256
+    {
+        bail!("serving-from-handoff record changed its persisted physical identity");
+    }
+    let decoded = decode_serving_handoff_record(&record.bytes)
+        .context("decode canonical serving handoff record")?;
+    let target_identity = &decoded.target_control_authorization;
+    let target_path = Path::new(target_identity.path.as_str());
+    let expected_target_name =
+        target_control_authorization_file_name(&decoded.provision_transition_id);
+    if decoded.checkpoint_content_digest != expected.predecessor_checkpoint_content_digest
+        || decoded.volume_id.as_str() != config.volume_id
+        || decoded.attachment_id.as_str() != config.attachment_id
+        || Path::new(decoded.old_control_process.data_directory.as_str()) != config.data_dir
+        || Path::new(
+            decoded
+                .target_control_authorization
+                .artifact
+                .local_state
+                .attachment_directory
+                .path
+                .as_str(),
+        ) != config.data_dir
+        || target_path.parent() != Some(config.data_dir.as_path())
+        || target_path.file_name().and_then(|name| name.to_str())
+            != Some(expected_target_name.as_str())
+        || data_directory_identity.device != target_identity.device.get()
+        || data_directory_identity.device
+            != decoded
+                .target_control_authorization
+                .artifact
+                .local_state
+                .attachment_directory
+                .device
+                .get()
+        || data_directory_identity.inode
+            != decoded
+                .target_control_authorization
+                .artifact
+                .local_state
+                .attachment_directory
+                .inode
+                .get()
+    {
+        bail!(
+            "serving-from-handoff record is stale for its predecessor, attachment, or data directory"
+        );
+    }
+    let target = read_private_file_at(
+        &data_directory,
+        target_path,
+        TARGET_CONTROL_AUTHORIZATION_MAX_BYTES,
+    )?;
+    let target_digest = Sha256Digest::from_bytes(cats_blockd::format::sha256(&target.bytes));
+    if target.identity.device != target_identity.device.get()
+        || target.identity.inode != target_identity.inode.get()
+        || target.identity.length != target_identity.length.get()
+        || target_digest != target_identity.content_sha256
+    {
+        bail!("serving-from-handoff target-control artifact changed physical identity");
+    }
+    let target_artifact = decode_target_control_authorization(&target.bytes)
+        .context("decode serving-from-handoff target-control authorization")?;
+    if target_artifact != target_identity.artifact {
+        bail!("serving-from-handoff target-control bytes differ from the sealed record");
+    }
+    validate_target_local_directory(&target_artifact.local_state.state_directory)?;
+    validate_target_local_directory(&target_artifact.local_state.attachment_directory)?;
+    validate_target_local_file(&target_artifact.local_state.attachment_identity_file)?;
+    validate_target_local_file(&target_artifact.local_state.acquire_authorization_file)?;
+    validate_target_local_file(&target_artifact.local_state.launch_checkpoint_file)?;
+
+    let attachment = &target_artifact.attachment;
+    let lease_ttl_ms = u64::try_from(config.lease_ttl_ms)
+        .context("serving-from-handoff lease duration is not positive")?;
+    let durability_matches = matches!(
+        (&config.durability, attachment.durability),
+        (
+            cats_blockd::engine::DurabilityMode::Strict,
+            cats_storage::authority::VolumeDurability::Strict
+        ) | (
+            cats_blockd::engine::DurabilityMode::Relaxed { .. },
+            cats_storage::authority::VolumeDurability::Relaxed
+        )
+    );
+    let device_token = process_identity
+        .device_ownership_token
+        .as_ref()
+        .context("serving-from-handoff requires a device ownership token")?;
+    let old_process = &decoded.old_control_process;
+    let serving_control = args
+        .listen_control
+        .as_deref()
+        .context("serving-from-handoff requires a control socket")?;
+    let serving_frontend = args
+        .listen_unix
+        .as_deref()
+        .or(args.listen_vhost_user.as_deref())
+        .context("serving-from-handoff requires one Guest frontend")?;
+    if attachment.identity.volume_id.as_str() != config.volume_id
+        || attachment.identity.attachment_id.as_str() != config.attachment_id
+        || attachment.identity != old_process.handshake.identity
+        || attachment.head != decoded.expected_provisioned_head
+        || attachment.acquire_request.lease_duration_ms != lease_ttl_ms
+        || !durability_matches
+        || process_identity.control_only
+        || process_identity.process_identity_token == old_process.ownership_token
+        || *device_token == old_process.ownership_token
+        || process_identity.scope_id == old_process.scope_id
+        || serving_control == Path::new(old_process.control_socket_path.as_str())
+        || serving_frontend == Path::new(old_process.control_socket_path.as_str())
+    {
+        bail!(
+            "serving-from-handoff does not bind one fresh serving process to the sealed attachment"
+        );
+    }
+
+    let ready = ValidatedServingHandoff {
+        data_directory_path: config.data_dir.clone(),
+        data_directory,
+        data_directory_identity,
+        record,
+        target,
+        decoded,
+    };
+    before_revalidation();
+    ready.assert_current()?;
+    Ok(ready)
+}
+
+fn open_private_directory(path: &Path) -> Result<File> {
+    if !path.is_absolute() {
+        bail!("serving handoff directory must be absolute");
+    }
+    let mut options = std::fs::OpenOptions::new();
+    options
+        .read(true)
+        .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC | libc::O_NONBLOCK);
+    let mut directory = options
+        .open(Path::new("/"))
+        .context("open serving handoff filesystem root")?;
+    for component in path.components() {
+        match component {
+            std::path::Component::RootDir => {}
+            std::path::Component::Normal(name) => {
+                let name = CString::new(name.as_bytes())
+                    .context("serving handoff directory component contains NUL")?;
+                directory = open_directory_at(&directory, &name).with_context(|| {
+                    format!(
+                        "open serving handoff directory without symlink ancestors {}",
+                        path.display()
+                    )
+                })?;
+            }
+            std::path::Component::CurDir
+            | std::path::Component::ParentDir
+            | std::path::Component::Prefix(_) => {
+                bail!("serving handoff directory path is not canonical")
+            }
+        }
+    }
+    let metadata = directory
+        .metadata()
+        .with_context(|| format!("inspect serving handoff directory {}", path.display()))?;
+    if !metadata.file_type().is_dir()
+        || metadata.uid() != effective_uid()
+        || metadata.mode() & 0o7777 != 0o700
+    {
+        bail!(
+            "serving handoff directory {} has unsafe metadata",
+            path.display()
+        );
+    }
+    Ok(directory)
+}
+
+fn read_private_file_at(
+    directory: &File,
+    path: &Path,
+    maximum: usize,
+) -> Result<RetainedPrivateFile> {
+    let name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .context("serving handoff path lacks a canonical basename")?;
+    let name = CString::new(name).context("serving handoff basename contains NUL")?;
+    let mut file = open_file_at(directory, &name)
+        .with_context(|| format!("open serving handoff file {}", path.display()))?;
+    let before = file
+        .metadata()
+        .with_context(|| format!("inspect serving handoff file {}", path.display()))?;
+    let before_identity = LocalFileMetadata::from_metadata(&before);
+    if !before.file_type().is_file()
+        || before.nlink() != 1
+        || before.uid() != effective_uid()
+        || before.mode() & 0o7777 != 0o600
+        || before.len() > maximum as u64
+    {
+        bail!(
+            "serving handoff file {} is not one private bounded regular file",
+            path.display()
+        );
+    }
+    let mut bytes = Vec::with_capacity((before.len() as usize).min(maximum));
+    std::io::Read::by_ref(&mut file)
+        .take(maximum as u64 + 1)
+        .read_to_end(&mut bytes)
+        .with_context(|| format!("read serving handoff file {}", path.display()))?;
+    if bytes.len() > maximum {
+        bail!(
+            "serving handoff file {} exceeds {maximum} bytes",
+            path.display()
+        );
+    }
+    let after = file
+        .metadata()
+        .with_context(|| format!("reinspect serving handoff file {}", path.display()))?;
+    if before_identity != LocalFileMetadata::from_metadata(&after)
+        || before.len() != bytes.len() as u64
+    {
+        bail!("serving handoff file changed while it was read");
+    }
+    Ok(RetainedPrivateFile {
+        path: path.to_path_buf(),
+        file,
+        identity: before_identity,
+        bytes,
+    })
+}
+
+fn open_file_at(directory: &File, name: &CStr) -> io::Result<File> {
+    open_at(
+        directory,
+        name,
+        libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_CLOEXEC | libc::O_NONBLOCK,
+    )
+}
+
+fn open_directory_at(directory: &File, name: &CStr) -> io::Result<File> {
+    open_at(
+        directory,
+        name,
+        libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC | libc::O_NONBLOCK,
+    )
+}
+
+fn open_at(directory: &File, name: &CStr, flags: i32) -> io::Result<File> {
+    loop {
+        // SAFETY: the directory descriptor and NUL-terminated name remain
+        // live for this call. openat retains neither and returns one owned fd.
+        let descriptor = unsafe { libc::openat(directory.as_raw_fd(), name.as_ptr(), flags) };
+        if descriptor >= 0 {
+            // SAFETY: openat returned one fresh owned descriptor.
+            return Ok(unsafe { File::from_raw_fd(descriptor) });
+        }
+        let error = io::Error::last_os_error();
+        if error.kind() != io::ErrorKind::Interrupted {
+            return Err(error);
         }
     }
 }
@@ -451,7 +976,7 @@ fn validate_target_local_directory(identity: &StableDirectoryIdentity) -> Result
     })?;
     if !metadata.file_type().is_dir()
         || metadata.uid() != effective_uid()
-        || metadata.mode() & 0o777 != 0o700
+        || metadata.mode() & 0o7777 != 0o700
         || metadata.dev() != identity.device.get()
         || metadata.ino() != identity.inode.get()
     {
@@ -477,7 +1002,7 @@ fn validate_target_local_file(identity: &StableFileIdentity) -> Result<()> {
     if !before.file_type().is_file()
         || before.nlink() != 1
         || before.uid() != effective_uid()
-        || before.mode() & 0o777 != 0o600
+        || before.mode() & 0o7777 != 0o600
         || before.dev() != identity.device.get()
         || before.ino() != identity.inode.get()
         || before.len() != identity.length.get()
@@ -519,7 +1044,7 @@ fn main() -> Result<()> {
         )
         .with_writer(std::io::stderr)
         .init();
-    let args = Args::parse();
+    let mut args = Args::parse();
     validate_process_mode(&args)?;
     let runtime_process_identity = runtime_process_identity(&args)?;
     // Copied out before the adapter option vectors are consumed below.
@@ -529,8 +1054,8 @@ fn main() -> Result<()> {
         queue_size: args.vhost_user_queue_size,
     };
 
-    let object_config =
-        AdapterConfig::from_cli(args.object_store_options).context("object adapter options")?;
+    let object_config = AdapterConfig::from_cli(std::mem::take(&mut args.object_store_options))
+        .context("object adapter options")?;
     let object_factories: [&dyn BlobStoreFactory; 2] =
         [&FileBlobStoreFactory, &AwsS3BlobStoreFactory];
     let blob = open_blob_store(
@@ -591,8 +1116,8 @@ fn main() -> Result<()> {
         (None, None) => None,
     };
 
-    let metadata_config =
-        AdapterConfig::from_cli(args.metadata_store_options).context("metadata adapter options")?;
+    let metadata_config = AdapterConfig::from_cli(std::mem::take(&mut args.metadata_store_options))
+        .context("metadata adapter options")?;
     let durability = match args.durability.as_str() {
         "strict" => cats_blockd::engine::DurabilityMode::Strict,
         "relaxed" => cats_blockd::engine::DurabilityMode::Relaxed {
@@ -610,11 +1135,9 @@ fn main() -> Result<()> {
         max_staged_packs: args.max_staged_packs,
         max_local_bytes: args.max_local_bytes,
     };
-    let authorized_serving = args
-        .authorized_serving_spec
-        .as_deref()
-        .map(read_authorized_serving_attachment)
-        .transpose()?;
+    let authorized_serving =
+        read_authorized_serving_input(&args, &config, runtime_process_identity.as_ref())?;
+    let authorized_serving_mode = authorized_serving.is_some();
     let authorized_control = args
         .authorized_control_spec
         .as_deref()
@@ -684,11 +1207,13 @@ fn main() -> Result<()> {
             authority,
         )
         .context("adopt exact authorized control-only chunk engine")?
-    } else if let Some(attachment) = authorized_serving.as_ref() {
-        let authority = PostgresVolumeDataAuthority::open(&metadata_config)
-            .context("open target volume authority")?;
-        ChunkEngine::attach_authorized_serving(config, attachment.clone(), blob.clone(), authority)
-            .context("adopt authorized serving chunk engine")?
+    } else if let Some(input) = authorized_serving {
+        input.apply(|attachment| {
+            let authority = PostgresVolumeDataAuthority::open(&metadata_config)
+                .context("open target volume authority")?;
+            ChunkEngine::attach_authorized_serving(config, attachment, blob.clone(), authority)
+                .context("adopt authorized serving chunk engine")
+        })?
     } else {
         let deadline =
             std::time::Instant::now() + std::time::Duration::from_millis(args.acquire_wait_ms);
@@ -777,7 +1302,7 @@ fn main() -> Result<()> {
     // The signed Runtime slice does not invoke the legacy attachment-owned GC
     // loop. Object reclamation remains fail-closed until it has its own typed
     // target authority/evidence boundary.
-    if authorized_serving.is_none() {
+    if !authorized_serving_mode {
         engine.start_gc_thread(std::time::Duration::from_millis(args.gc_interval_ms));
     }
 
@@ -786,7 +1311,7 @@ fn main() -> Result<()> {
     let nbd_unix = match &args.listen_unix {
         Some(path) => {
             if path.exists() {
-                if authorized_serving.is_some() {
+                if authorized_serving_mode {
                     bail!(
                         "authorized serving socket {} already exists; refusing to replace an unverified owner",
                         path.display()
@@ -807,10 +1332,10 @@ fn main() -> Result<()> {
         ),
         None => None,
     };
-    let vhost_user = bind_vhost_user(&vhost_user_args, authorized_serving.is_none())?;
+    let vhost_user = bind_vhost_user(&vhost_user_args, !authorized_serving_mode)?;
     if let Some(path) = &args.listen_control {
         if path.exists() {
-            if authorized_serving.is_some() {
+            if authorized_serving_mode {
                 bail!(
                     "authorized control socket {} already exists; refusing to replace an unverified owner",
                     path.display()
@@ -858,7 +1383,7 @@ fn main() -> Result<()> {
         }));
     }
     let serving = serve_vhost_user(vhost_user, &vhost_user_args, engine.clone(), nbd_threads);
-    let detached = if authorized_serving.is_some() {
+    let detached = if authorized_serving_mode {
         engine
             .stop_authorized_serving()
             .context("final authorized blockd drain and stop")
@@ -1099,9 +1624,32 @@ fn ensure_before(deadline: Instant) -> Option<()> {
 }
 
 fn validate_process_mode(args: &Args) -> Result<()> {
+    let direct_serving = args.authorized_serving_spec.is_some();
+    let handoff_serving = args.authorized_serving_handoff_record.is_some();
+    if direct_serving && handoff_serving {
+        bail!("--authorized-serving-spec conflicts with --authorized-serving-handoff-record");
+    }
+    let handoff_expectations = [
+        args.authorized_serving_handoff_predecessor_checkpoint_content_digest
+            .is_some(),
+        args.authorized_serving_handoff_record_device.is_some(),
+        args.authorized_serving_handoff_record_inode.is_some(),
+        args.authorized_serving_handoff_record_length.is_some(),
+        args.authorized_serving_handoff_record_content_sha256
+            .is_some(),
+    ];
+    if handoff_serving && handoff_expectations.iter().any(|present| !present) {
+        bail!(
+            "--authorized-serving-handoff-record requires predecessor digest and complete record physical identity"
+        );
+    }
+    if !handoff_serving && handoff_expectations.iter().any(|present| *present) {
+        bail!("serving handoff expectations require --authorized-serving-handoff-record");
+    }
+    let authorized_serving = direct_serving || handoff_serving;
     if args.control_only {
-        if args.authorized_serving_spec.is_some() {
-            bail!("--control-only conflicts with --authorized-serving-spec");
+        if authorized_serving {
+            bail!("--control-only conflicts with authorized serving input");
         }
         if args.authorized_control_spec.is_none() && args.authorized_target_control_spec.is_none() {
             bail!("--control-only requires --authorized-control-spec");
@@ -1150,12 +1698,15 @@ fn validate_process_mode(args: &Args) -> Result<()> {
         if args.metadata_store_adapter.as_deref() != Some("postgres") {
             bail!("--control-only requires --metadata-store-adapter postgres");
         }
-    } else if args.authorized_serving_spec.is_some() {
+    } else if authorized_serving {
         if args.authorized_control_spec.is_some() || args.authorized_target_control_spec.is_some() {
-            bail!("--authorized-serving-spec conflicts with authorized control input");
+            bail!("authorized serving input conflicts with authorized control input");
         }
-        if args.attachment_epoch.is_some() {
-            bail!("--authorized-serving-spec carries its own exact attachment epoch");
+        if args.attachment_epoch.is_some()
+            || args.provision_transition_id.is_some()
+            || args.provision_root_authorization_context_digest.is_some()
+        {
+            bail!("authorized serving input carries its own target lineage and epoch");
         }
         if args.seed_image_id.is_some()
             || args.seed_image.is_some()
@@ -1164,24 +1715,24 @@ fn validate_process_mode(args: &Args) -> Result<()> {
             || args.create_volume_size.is_some()
         {
             bail!(
-                "--authorized-serving-spec forbids legacy seed, image publish, GC, and volume creation modes"
+                "authorized serving input forbids legacy seed, image publish, GC, and volume creation modes"
             );
         }
         if args.metadata_store_adapter.as_deref() != Some("postgres") {
-            bail!("--authorized-serving-spec requires --metadata-store-adapter postgres");
+            bail!("authorized serving input requires --metadata-store-adapter postgres");
         }
         if args.listen_tcp.is_some() {
-            bail!("--authorized-serving-spec forbids the unscoped TCP frontend");
+            bail!("authorized serving input forbids the unscoped TCP frontend");
         }
         let control = args
             .listen_control
             .as_ref()
-            .context("--authorized-serving-spec requires --listen-control for exact handshake")?;
+            .context("authorized serving input requires --listen-control for exact handshake")?;
         if !matches!(
             (args.listen_unix.is_some(), args.listen_vhost_user.is_some()),
             (true, false) | (false, true)
         ) {
-            bail!("--authorized-serving-spec requires exactly one NBD or vhost-user frontend");
+            bail!("authorized serving input requires exactly one NBD or vhost-user frontend");
         }
         if args.listen_unix.as_ref() == Some(control)
             || args.listen_vhost_user.as_ref() == Some(control)
@@ -1215,7 +1766,9 @@ fn validate_process_mode(args: &Args) -> Result<()> {
 }
 
 fn runtime_process_identity(args: &Args) -> Result<Option<RuntimeProcessIdentity>> {
-    let target_mode = args.control_only || args.authorized_serving_spec.is_some();
+    let target_mode = args.control_only
+        || args.authorized_serving_spec.is_some()
+        || args.authorized_serving_handoff_record.is_some();
     if !target_mode {
         if args.runtime_scope_id.is_some()
             || args.process_identity_token.is_some()
@@ -1353,15 +1906,20 @@ fn serve_vhost_user(
 mod tests {
     use super::*;
     use cats_api::runtime_reconciliation::{
-        AcquireOrigin, AsciiText, ContractVersion, Epoch, FenceEpoch, Generation, HostPath,
-        NormalAcquireRequest, NormalAcquireResult, RemoteHead, Revision, UnixMillis, WireU64,
+        AcquireOrigin, AsciiText, ContractVersion, Durability, Epoch, FenceEpoch, Generation,
+        HostPath, NormalAcquireRequest, NormalAcquireResult, RemoteHead, Revision, UnixMillis,
+        WireU64,
+    };
+    use cats_blockd::serving_handoff::{
+        encode_serving_handoff_record, ServingControlProcessIdentity,
+        ServingControlReloadHandshake, TargetControlAuthorizationIdentity,
     };
     use cats_blockd::target_control::{
         encode_target_control_authorization, ProvisionRootAuthorizationContextDigest,
         TargetControlLocalStateIdentity,
     };
     use cats_storage::authority::{AttachmentLineageIdentity, VolumeDurability};
-    use std::os::unix::fs::PermissionsExt as _;
+    use std::os::unix::fs::{symlink, PermissionsExt as _};
 
     const TARGET_VOLUME_ID: &str = "vol_target";
     const TARGET_ATTACHMENT_ID: &str = "att_target";
@@ -1369,6 +1927,7 @@ mod tests {
 
     struct TargetControlFixture {
         _root: tempfile::TempDir,
+        state_dir: PathBuf,
         data_dir: PathBuf,
         path: PathBuf,
         transition: RandomId128,
@@ -1403,7 +1962,7 @@ mod tests {
 
     fn target_control_fixture() -> TargetControlFixture {
         let root = tempfile::tempdir().unwrap();
-        let state_dir = root.path().join("state-a");
+        let state_dir = root.path().canonicalize().unwrap().join("state-a");
         let data_dir = state_dir
             .join("data")
             .join("cat-cat_01")
@@ -1514,6 +2073,7 @@ mod tests {
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
         TargetControlFixture {
             _root: root,
+            state_dir,
             data_dir,
             path,
             transition,
@@ -1542,6 +2102,546 @@ mod tests {
             length: WireU64::new(bytes.len() as u64).unwrap(),
             content_sha256: Sha256Digest::from_bytes(cats_blockd::format::sha256(bytes)),
         }
+    }
+
+    struct ServingHandoffFixture {
+        target: TargetControlFixture,
+        record_path: PathBuf,
+        record_bytes: Vec<u8>,
+        predecessor_checkpoint_content_digest: Sha256Digest,
+    }
+
+    impl ServingHandoffFixture {
+        fn args(&self) -> Args {
+            let metadata = std::fs::metadata(&self.record_path).unwrap();
+            let digest = Sha256Digest::from_bytes(cats_blockd::format::sha256(&self.record_bytes));
+            Args::try_parse_from(vec![
+                "cats-blockd".to_owned(),
+                "--volume-id".to_owned(),
+                TARGET_VOLUME_ID.to_owned(),
+                "--data-dir".to_owned(),
+                self.target.data_dir.display().to_string(),
+                "--attachment-id".to_owned(),
+                TARGET_ATTACHMENT_ID.to_owned(),
+                "--object-store-adapter".to_owned(),
+                "file".to_owned(),
+                "--metadata-store-adapter".to_owned(),
+                "postgres".to_owned(),
+                "--authorized-serving-handoff-record".to_owned(),
+                self.record_path.display().to_string(),
+                "--authorized-serving-handoff-predecessor-checkpoint-content-digest".to_owned(),
+                self.predecessor_checkpoint_content_digest
+                    .as_str()
+                    .to_owned(),
+                "--authorized-serving-handoff-record-device".to_owned(),
+                metadata.dev().to_string(),
+                "--authorized-serving-handoff-record-inode".to_owned(),
+                metadata.ino().to_string(),
+                "--authorized-serving-handoff-record-length".to_owned(),
+                metadata.len().to_string(),
+                "--authorized-serving-handoff-record-content-sha256".to_owned(),
+                digest.as_str().to_owned(),
+                "--lease-ttl-ms".to_owned(),
+                "60000".to_owned(),
+                "--listen-control".to_owned(),
+                self.target
+                    .data_dir
+                    .join("serving-control.sock")
+                    .display()
+                    .to_string(),
+                "--listen-unix".to_owned(),
+                self.target
+                    .data_dir
+                    .join("block.sock")
+                    .display()
+                    .to_string(),
+                "--runtime-scope-id".to_owned(),
+                "cats-serving-fixed.service".to_owned(),
+                "--process-identity-token".to_owned(),
+                "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_owned(),
+                "--device-ownership-token".to_owned(),
+                "cccccccccccccccccccccccccccccccc".to_owned(),
+            ])
+            .unwrap()
+        }
+
+        fn refresh_record_expectation(&self, args: &mut Args) {
+            set_record_expectation(args, &self.record_path);
+        }
+    }
+
+    fn serving_handoff_fixture() -> ServingHandoffFixture {
+        let target = target_control_fixture();
+        let target_bytes = std::fs::read(&target.path).unwrap();
+        let target_metadata = std::fs::metadata(&target.path).unwrap();
+        let predecessor_checkpoint_content_digest = Sha256Digest::from_bytes([0x7d; 32]);
+        let process_id = WireU64::new(4242).unwrap();
+        let ownership_token = RandomId128::new("bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb").unwrap();
+        let executable_path = HostPath::new("/usr/bin/cats-blockd").unwrap();
+        let record = ServingHandoffRecord {
+            version: ContractVersion::V1,
+            checkpoint_content_digest: predecessor_checkpoint_content_digest.clone(),
+            cat_id: Id::new("cat_01").unwrap(),
+            desired_revision: Revision::new(11).unwrap(),
+            spec_digest: Sha256Digest::from_bytes([0xcc; 32]),
+            provision_transition_id: target.transition.clone(),
+            volume_id: target.artifact.attachment.identity.volume_id.clone(),
+            attachment_id: target.artifact.attachment.identity.attachment_id.clone(),
+            attachment_epoch: target.artifact.attachment.identity.attachment_epoch,
+            acquire_origin: target.artifact.attachment.identity.acquire_origin.clone(),
+            node_id: target.artifact.attachment.identity.node_id.clone(),
+            placement_epoch: target.artifact.attachment.identity.placement_epoch,
+            expected_provisioned_head: target.artifact.attachment.head.clone(),
+            expected_control_executable_path: executable_path.clone(),
+            target_control_authorization: TargetControlAuthorizationIdentity {
+                path: HostPath::new(target.path.to_str().unwrap()).unwrap(),
+                device: WireU64::new(target_metadata.dev()).unwrap(),
+                inode: WireU64::new(target_metadata.ino()).unwrap(),
+                length: WireU64::new(target_metadata.len()).unwrap(),
+                content_sha256: Sha256Digest::from_bytes(cats_blockd::format::sha256(
+                    &target_bytes,
+                )),
+                artifact: target.artifact.clone(),
+            },
+            old_control_process: ServingControlProcessIdentity {
+                process_id,
+                unit_main_process_id: process_id,
+                process_start_time_ticks: WireU64::new(9001).unwrap(),
+                executable_path,
+                scope_id: target.runtime_scope_id.clone(),
+                cgroup_path: HostPath::new(format!(
+                    "/sys/fs/cgroup/system.slice/{}",
+                    target.runtime_scope_id.as_str()
+                ))
+                .unwrap(),
+                cgroup_process_ids: vec![process_id],
+                control_socket_path: HostPath::new(target.control_socket_path.to_str().unwrap())
+                    .unwrap(),
+                data_directory: HostPath::new(target.data_dir.to_str().unwrap()).unwrap(),
+                ownership_token: ownership_token.clone(),
+                handshake: ServingControlReloadHandshake {
+                    peer_process_id: process_id,
+                    identity: target.artifact.attachment.identity.clone(),
+                    size_bytes: target.artifact.attachment.size_bytes,
+                    durability: Durability::Strict,
+                    remote_head: target.artifact.attachment.head.clone(),
+                    process_identity_token: ownership_token,
+                    control_only: true,
+                    guest_io_enabled: false,
+                },
+            },
+        };
+        let record_bytes = encode_serving_handoff_record(&record).unwrap();
+        let record_path = target.data_dir.join(SERVING_HANDOFF_RECORD_FILE);
+        std::fs::write(&record_path, &record_bytes).unwrap();
+        std::fs::set_permissions(&record_path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        ServingHandoffFixture {
+            target,
+            record_path,
+            record_bytes,
+            predecessor_checkpoint_content_digest,
+        }
+    }
+
+    fn serving_config(args: &Args) -> EngineConfig {
+        EngineConfig {
+            volume_id: args.volume_id.clone().unwrap(),
+            data_dir: args.data_dir.clone().unwrap(),
+            attachment_id: args.attachment_id.clone().unwrap(),
+            lease_ttl_ms: args.lease_ttl_ms,
+            durability: cats_blockd::engine::DurabilityMode::Strict,
+            max_staged_bytes: args.max_staged_bytes,
+            max_staged_packs: args.max_staged_packs,
+            max_local_bytes: args.max_local_bytes,
+        }
+    }
+
+    fn invoke_authorized_serving_effect(
+        args: &Args,
+        effect_calls: &std::cell::Cell<u64>,
+    ) -> Result<AuthorizedServingAttachment> {
+        validate_process_mode(args)?;
+        let process_identity = runtime_process_identity(args)?;
+        read_authorized_serving_input(args, &serving_config(args), process_identity.as_ref())?
+            .context("test expected authorized serving input")?
+            .apply(|attachment| {
+                effect_calls.set(effect_calls.get() + 1);
+                Ok(attachment)
+            })
+    }
+
+    fn set_record_expectation(args: &mut Args, path: &Path) {
+        let bytes = std::fs::read(path).unwrap();
+        let metadata = std::fs::metadata(path).unwrap();
+        args.authorized_serving_handoff_record_device = Some(metadata.dev());
+        args.authorized_serving_handoff_record_inode = Some(metadata.ino());
+        args.authorized_serving_handoff_record_length = Some(metadata.len());
+        args.authorized_serving_handoff_record_content_sha256 = Some(
+            Sha256Digest::from_bytes(cats_blockd::format::sha256(&bytes))
+                .as_str()
+                .to_owned(),
+        );
+    }
+
+    fn assert_authorized_serving_rejected(args: &Args) {
+        let effect_calls = std::cell::Cell::new(0_u64);
+        let error = invoke_authorized_serving_effect(args, &effect_calls).unwrap_err();
+        assert_eq!(
+            effect_calls.get(),
+            0,
+            "effect ran before rejection: {error:#}"
+        );
+    }
+
+    fn serving_expectation(args: &Args) -> ServingHandoffRecordExpectation {
+        ServingHandoffRecordExpectation {
+            path: args.authorized_serving_handoff_record.clone().unwrap(),
+            device: args.authorized_serving_handoff_record_device.unwrap(),
+            inode: args.authorized_serving_handoff_record_inode.unwrap(),
+            length: args.authorized_serving_handoff_record_length.unwrap(),
+            content_sha256: Sha256Digest::new(
+                args.authorized_serving_handoff_record_content_sha256
+                    .clone()
+                    .unwrap(),
+            )
+            .unwrap(),
+            predecessor_checkpoint_content_digest: Sha256Digest::new(
+                args.authorized_serving_handoff_predecessor_checkpoint_content_digest
+                    .clone()
+                    .unwrap(),
+            )
+            .unwrap(),
+        }
+    }
+
+    fn invoke_handoff_before_revalidation(
+        args: &Args,
+        effect_calls: &std::cell::Cell<u64>,
+        before_revalidation: impl FnOnce(),
+    ) -> Result<AuthorizedServingAttachment> {
+        validate_process_mode(args)?;
+        let process_identity = runtime_process_identity(args)?.unwrap();
+        read_serving_handoff_authorization_before_revalidation(
+            &serving_config(args),
+            args,
+            &process_identity,
+            &serving_expectation(args),
+            before_revalidation,
+        )
+        .map(Box::new)
+        .map(AuthorizedServingInput::RootHandoff)?
+        .apply(|attachment| {
+            effect_calls.set(effect_calls.get() + 1);
+            Ok(attachment)
+        })
+    }
+
+    fn replace_with_fifo(path: &Path) {
+        std::fs::remove_file(path).unwrap();
+        let path = CString::new(path.as_os_str().as_bytes()).unwrap();
+        // SAFETY: `path` is NUL-terminated and the mode contains only
+        // permission bits. The test owns the absent destination path.
+        let result = unsafe { libc::mkfifo(path.as_ptr(), 0o600) };
+        assert_eq!(result, 0, "mkfifo failed: {}", io::Error::last_os_error());
+    }
+
+    #[test]
+    fn serving_from_handoff_is_one_distinct_closed_authorization_mode() {
+        let fixture = serving_handoff_fixture();
+        let args = fixture.args();
+        let effect_calls = std::cell::Cell::new(0_u64);
+        let attachment = invoke_authorized_serving_effect(&args, &effect_calls).unwrap();
+        assert_eq!(effect_calls.get(), 1);
+        assert_eq!(attachment, fixture.target.artifact.attachment);
+
+        let direct_conflict = serving_handoff_fixture();
+        let mut args = direct_conflict.args();
+        args.authorized_serving_spec = Some(PathBuf::from("/runtime/legacy-serving.json"));
+        assert_authorized_serving_rejected(&args);
+
+        let control_conflict = serving_handoff_fixture();
+        let mut args = control_conflict.args();
+        args.control_only = true;
+        assert_authorized_serving_rejected(&args);
+
+        let missing_identity = serving_handoff_fixture();
+        let mut args = missing_identity.args();
+        args.authorized_serving_handoff_record_inode = None;
+        assert_authorized_serving_rejected(&args);
+
+        let missing_frontend = serving_handoff_fixture();
+        let mut args = missing_frontend.args();
+        args.listen_unix = None;
+        assert_authorized_serving_rejected(&args);
+
+        let duplicate_frontend = serving_handoff_fixture();
+        let mut args = duplicate_frontend.args();
+        args.listen_vhost_user = Some(duplicate_frontend.target.data_dir.join("vhost.sock"));
+        assert_authorized_serving_rejected(&args);
+
+        let mut target_control_only = parse_target_control_mode(&[]);
+        target_control_only.listen_unix = Some(PathBuf::from("/runtime/root-data/block.sock"));
+        assert_authorized_serving_rejected(&target_control_only);
+    }
+
+    #[test]
+    fn serving_from_handoff_rejects_stale_or_unsealed_record_inputs_before_effect() {
+        let wrong_predecessor = serving_handoff_fixture();
+        let mut args = wrong_predecessor.args();
+        args.authorized_serving_handoff_predecessor_checkpoint_content_digest =
+            Some(Sha256Digest::from_bytes([0xee; 32]).as_str().to_owned());
+        assert_authorized_serving_rejected(&args);
+
+        let wrong_device = serving_handoff_fixture();
+        let mut args = wrong_device.args();
+        args.authorized_serving_handoff_record_device = Some(
+            args.authorized_serving_handoff_record_device
+                .unwrap()
+                .saturating_add(1),
+        );
+        assert_authorized_serving_rejected(&args);
+
+        let wrong_inode = serving_handoff_fixture();
+        let mut args = wrong_inode.args();
+        args.authorized_serving_handoff_record_inode = Some(
+            args.authorized_serving_handoff_record_inode
+                .unwrap()
+                .saturating_add(1),
+        );
+        assert_authorized_serving_rejected(&args);
+
+        let wrong_length = serving_handoff_fixture();
+        let mut args = wrong_length.args();
+        args.authorized_serving_handoff_record_length = Some(
+            args.authorized_serving_handoff_record_length
+                .unwrap()
+                .saturating_add(1),
+        );
+        assert_authorized_serving_rejected(&args);
+
+        let wrong_digest = serving_handoff_fixture();
+        let mut args = wrong_digest.args();
+        args.authorized_serving_handoff_record_content_sha256 =
+            Some(Sha256Digest::from_bytes([0xef; 32]).as_str().to_owned());
+        assert_authorized_serving_rejected(&args);
+
+        let blank = serving_handoff_fixture();
+        let mut args = blank.args();
+        let blank_path = PathBuf::from(
+            blank
+                .target
+                .artifact
+                .local_state
+                .acquire_authorization_file
+                .path
+                .as_str(),
+        );
+        args.authorized_serving_handoff_record = Some(blank_path.clone());
+        set_record_expectation(&mut args, &blank_path);
+        assert_authorized_serving_rejected(&args);
+
+        let stale_process_token = serving_handoff_fixture();
+        let mut args = stale_process_token.args();
+        args.process_identity_token = Some("bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb".to_owned());
+        assert_authorized_serving_rejected(&args);
+
+        let stale_device_token = serving_handoff_fixture();
+        let mut args = stale_device_token.args();
+        args.device_ownership_token = Some("bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb".to_owned());
+        assert_authorized_serving_rejected(&args);
+
+        let stale_scope = serving_handoff_fixture();
+        let mut args = stale_scope.args();
+        args.runtime_scope_id = Some(stale_scope.target.runtime_scope_id.as_str().to_owned());
+        assert_authorized_serving_rejected(&args);
+    }
+
+    #[test]
+    fn serving_from_handoff_rejects_noncanonical_unknown_and_oversize_records_before_effect() {
+        let noncanonical = serving_handoff_fixture();
+        let mut args = noncanonical.args();
+        let mut bytes = b" ".to_vec();
+        bytes.extend_from_slice(&noncanonical.record_bytes);
+        std::fs::write(&noncanonical.record_path, bytes).unwrap();
+        noncanonical.refresh_record_expectation(&mut args);
+        assert_authorized_serving_rejected(&args);
+
+        let unknown = serving_handoff_fixture();
+        let mut args = unknown.args();
+        let mut value = serde_json::from_slice::<serde_json::Value>(&unknown.record_bytes).unwrap();
+        value
+            .as_object_mut()
+            .unwrap()
+            .insert("unknown".to_owned(), serde_json::Value::Bool(true));
+        std::fs::write(&unknown.record_path, serde_json::to_vec(&value).unwrap()).unwrap();
+        unknown.refresh_record_expectation(&mut args);
+        assert_authorized_serving_rejected(&args);
+
+        let oversized = serving_handoff_fixture();
+        let mut args = oversized.args();
+        std::fs::write(
+            &oversized.record_path,
+            vec![b' '; SERVING_HANDOFF_RECORD_MAX_BYTES + 1],
+        )
+        .unwrap();
+        oversized.refresh_record_expectation(&mut args);
+        assert_authorized_serving_rejected(&args);
+    }
+
+    #[test]
+    fn serving_from_handoff_rejects_unsafe_record_target_and_local_files_without_blocking() {
+        let permissive_record = serving_handoff_fixture();
+        let args = permissive_record.args();
+        std::fs::set_permissions(
+            &permissive_record.record_path,
+            std::fs::Permissions::from_mode(0o644),
+        )
+        .unwrap();
+        assert_authorized_serving_rejected(&args);
+
+        let hardlinked_record = serving_handoff_fixture();
+        let args = hardlinked_record.args();
+        std::fs::hard_link(
+            &hardlinked_record.record_path,
+            hardlinked_record.record_path.with_extension("alias"),
+        )
+        .unwrap();
+        assert_authorized_serving_rejected(&args);
+
+        let symlinked_record = serving_handoff_fixture();
+        let args = symlinked_record.args();
+        let real_record = symlinked_record.record_path.with_extension("real");
+        std::fs::rename(&symlinked_record.record_path, &real_record).unwrap();
+        symlink(&real_record, &symlinked_record.record_path).unwrap();
+        assert_authorized_serving_rejected(&args);
+
+        let fifo_record = serving_handoff_fixture();
+        let args = fifo_record.args();
+        replace_with_fifo(&fifo_record.record_path);
+        let started = Instant::now();
+        assert_authorized_serving_rejected(&args);
+        assert!(started.elapsed() < Duration::from_secs(2));
+
+        let permissive_target = serving_handoff_fixture();
+        let args = permissive_target.args();
+        std::fs::set_permissions(
+            &permissive_target.target.path,
+            std::fs::Permissions::from_mode(0o644),
+        )
+        .unwrap();
+        assert_authorized_serving_rejected(&args);
+
+        let hardlinked_target = serving_handoff_fixture();
+        let args = hardlinked_target.args();
+        std::fs::hard_link(
+            &hardlinked_target.target.path,
+            hardlinked_target.target.path.with_extension("alias"),
+        )
+        .unwrap();
+        assert_authorized_serving_rejected(&args);
+
+        let symlinked_target = serving_handoff_fixture();
+        let args = symlinked_target.args();
+        let real_target = symlinked_target.target.path.with_extension("real");
+        std::fs::rename(&symlinked_target.target.path, &real_target).unwrap();
+        symlink(&real_target, &symlinked_target.target.path).unwrap();
+        assert_authorized_serving_rejected(&args);
+
+        let fifo_target = serving_handoff_fixture();
+        let args = fifo_target.args();
+        replace_with_fifo(&fifo_target.target.path);
+        let started = Instant::now();
+        assert_authorized_serving_rejected(&args);
+        assert!(started.elapsed() < Duration::from_secs(2));
+
+        let permissive_directory = serving_handoff_fixture();
+        let args = permissive_directory.args();
+        std::fs::set_permissions(
+            &permissive_directory.target.data_dir,
+            std::fs::Permissions::from_mode(0o755),
+        )
+        .unwrap();
+        assert_authorized_serving_rejected(&args);
+
+        let changed_local_file = serving_handoff_fixture();
+        let args = changed_local_file.args();
+        std::fs::write(
+            changed_local_file
+                .target
+                .artifact
+                .local_state
+                .launch_checkpoint_file
+                .path
+                .as_str(),
+            b"changed launch checkpoint",
+        )
+        .unwrap();
+        assert_authorized_serving_rejected(&args);
+    }
+
+    #[test]
+    fn serving_from_handoff_revalidation_rejects_file_and_ancestor_aba_before_effect() {
+        let record_aba = serving_handoff_fixture();
+        let args = record_aba.args();
+        let effect_calls = std::cell::Cell::new(0_u64);
+        let backup = record_aba.record_path.with_extension("old");
+        let bytes = record_aba.record_bytes.clone();
+        let result = invoke_handoff_before_revalidation(&args, &effect_calls, || {
+            std::fs::rename(&record_aba.record_path, &backup).unwrap();
+            std::fs::write(&record_aba.record_path, bytes).unwrap();
+            std::fs::set_permissions(
+                &record_aba.record_path,
+                std::fs::Permissions::from_mode(0o600),
+            )
+            .unwrap();
+        });
+        assert!(result.is_err());
+        assert_eq!(effect_calls.get(), 0);
+
+        let target_aba = serving_handoff_fixture();
+        let args = target_aba.args();
+        let effect_calls = std::cell::Cell::new(0_u64);
+        let backup = target_aba.target.path.with_extension("old");
+        let bytes = std::fs::read(&target_aba.target.path).unwrap();
+        let result = invoke_handoff_before_revalidation(&args, &effect_calls, || {
+            std::fs::rename(&target_aba.target.path, &backup).unwrap();
+            std::fs::write(&target_aba.target.path, bytes).unwrap();
+            std::fs::set_permissions(
+                &target_aba.target.path,
+                std::fs::Permissions::from_mode(0o600),
+            )
+            .unwrap();
+        });
+        assert!(result.is_err());
+        assert_eq!(effect_calls.get(), 0);
+
+        let ancestor_symlink = serving_handoff_fixture();
+        let args = ancestor_symlink.args();
+        let moved = ancestor_symlink.target.state_dir.with_extension("moved");
+        std::fs::rename(&ancestor_symlink.target.state_dir, &moved).unwrap();
+        symlink(&moved, &ancestor_symlink.target.state_dir).unwrap();
+        assert_authorized_serving_rejected(&args);
+
+        let ancestor_recreated = serving_handoff_fixture();
+        let args = ancestor_recreated.args();
+        let effect_calls = std::cell::Cell::new(0_u64);
+        let moved = ancestor_recreated.target.state_dir.with_extension("moved");
+        let result = invoke_handoff_before_revalidation(&args, &effect_calls, || {
+            std::fs::rename(&ancestor_recreated.target.state_dir, &moved).unwrap();
+            std::fs::create_dir_all(&ancestor_recreated.target.data_dir).unwrap();
+            std::fs::set_permissions(
+                &ancestor_recreated.target.state_dir,
+                std::fs::Permissions::from_mode(0o700),
+            )
+            .unwrap();
+            std::fs::set_permissions(
+                &ancestor_recreated.target.data_dir,
+                std::fs::Permissions::from_mode(0o700),
+            )
+            .unwrap();
+        });
+        assert!(result.is_err());
+        assert_eq!(effect_calls.get(), 0);
     }
 
     #[test]
