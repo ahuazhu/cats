@@ -15,3 +15,4 @@ pub mod runtime_spine;
 pub mod server;
 pub mod state_directory;
 pub mod usage_spool;
+pub mod vmm_launcher;

@@ -9,6 +9,10 @@ publish = false
 name = "cats-noded"
 path = "src/main.rs"
 
+[[bin]]
+name = "cats-vmm-launcher"
+path = "src/vmm_launcher.rs"
+
 [dependencies]
 cats-api = { workspace = true }
 cats-node-agent = { workspace = true }
