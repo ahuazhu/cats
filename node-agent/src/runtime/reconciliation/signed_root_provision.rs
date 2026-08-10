@@ -39,8 +39,8 @@ use super::root_provision_process::{
     RootProvisionProcessGlobalPort, RootProvisionRetirementAdmission,
 };
 use super::serving_handoff::{
-    ReopenedTargetControlAuthorization, ServingAuthorityTargetEvidence, ServingHandoffStore,
-    TargetControlAuthorizationReady,
+    target_control_process_launch_identity, ReopenedTargetControlAuthorization,
+    ServingAuthorityTargetEvidence, ServingHandoffStore, TargetControlAuthorizationReady,
 };
 use super::serving_handoff_effect::{
     checkpoint_is_current_exact, ServingHandoffEffect, ServingHandoffEffectProgress,
@@ -593,8 +593,9 @@ impl SignedRootProvisionEffect {
         };
         let expectation = match expectation {
             Ok(expectation) => match target_authorization.as_ref() {
-                Some(target) => expectation
-                    .with_target_control_launch(target.identity().process_launch_identity()),
+                Some(target) => expectation.with_target_control_launch(
+                    target_control_process_launch_identity(target.identity()),
+                ),
                 None => Ok(expectation),
             },
             Err(_) => return Ok(stop_local()),
@@ -751,7 +752,7 @@ impl SignedRootProvisionEffect {
         };
         let target_control_launch = target_authorization
             .as_ref()
-            .map(|target| target.identity().process_launch_identity());
+            .map(|target| target_control_process_launch_identity(target.identity()));
         let absence = match prove_exact_root_provision_process_absence(
             store,
             stored,
