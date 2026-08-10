@@ -376,9 +376,11 @@ impl RuntimeVolumeInventoryPagePort {
             .saturating_add(request.limit)
             .min(snapshot.records.len());
         let records = snapshot.records[start..end].to_vec();
-        let next_after_volume_id = (end < snapshot.records.len())
-            .then(|| records.last().map(|record| record.record.volume_id.clone()))
-            .flatten();
+        // Every nonempty page carries a cursor, including the last record in
+        // the cached vector. Only a subsequent explicit empty page proves
+        // exhaustion; a truncated provider cannot turn a short nonempty page
+        // into a complete inventory.
+        let next_after_volume_id = records.last().map(|record| record.record.volume_id.clone());
         let page = MetadataAuthorityPage {
             node_id: snapshot.node_id.clone(),
             desired_read_position: snapshot.desired_read_position,
@@ -386,7 +388,7 @@ impl RuntimeVolumeInventoryPagePort {
             records,
             next_after_volume_id,
         };
-        if page.next_after_volume_id.is_none() {
+        if page.records.is_empty() {
             *cache = None;
         }
         Ok(MetadataAuthorityPageRead::Page(page))
@@ -537,7 +539,7 @@ impl MetadataAuthorityAbsenceReader for PagedMetadataAuthorityReader {
                     after_volume_id = Some(next);
                 }
                 Some(_) => return Ok(MetadataAuthorityCandidateInventory::Unavailable),
-                None => {
+                None if page.records.is_empty() => {
                     if candidate_volume_ids
                         .iter()
                         .any(|volume_id| !records.contains_key(volume_id))
@@ -546,6 +548,7 @@ impl MetadataAuthorityAbsenceReader for PagedMetadataAuthorityReader {
                     }
                     return Ok(MetadataAuthorityCandidateInventory::Records(records));
                 }
+                None => return Ok(MetadataAuthorityCandidateInventory::Unavailable),
             }
         }
 
@@ -2518,7 +2521,7 @@ mod tests {
                 })
                 .collect::<Vec<_>>();
             let next_after_volume_id =
-                (end < self.total_records).then(|| Id::new(boundary_volume_id(end - 1)).unwrap());
+                (!records.is_empty()).then(|| Id::new(boundary_volume_id(end - 1)).unwrap());
             self.calls.fetch_add(1, Ordering::SeqCst);
             Ok(MetadataAuthorityPageRead::Page(MetadataAuthorityPage {
                 node_id: request.node_id.clone(),
@@ -2885,13 +2888,16 @@ mod tests {
     fn paged_node_snapshot_can_prove_the_exact_desired_candidate() {
         let environment = TestEnvironment::new();
         let record = unowned_record("vol_root", 4_294_967_296);
-        let (port, calls) = scripted_metadata_inventory_port([metadata_page(
-            vec![MetadataAuthorityIndexedRecord {
-                record: record.clone(),
-                owner_node_id: None,
-            }],
-            None,
-        )]);
+        let (port, calls) = scripted_metadata_inventory_port([
+            metadata_page(
+                vec![MetadataAuthorityIndexedRecord {
+                    record: record.clone(),
+                    owner_node_id: None,
+                }],
+                Some("vol_root"),
+            ),
+            metadata_page(Vec::new(), None),
+        ]);
         let reader = Arc::new(PagedMetadataAuthorityReader::new(port));
 
         let InventoryAbsence::DesiredVolumes(by_cat) = metadata_probe(&environment, reader)
@@ -2905,7 +2911,7 @@ mod tests {
             record.volume_id
         );
         let calls = calls.lock().unwrap();
-        assert_eq!(calls.len(), 1);
+        assert_eq!(calls.len(), 2);
         assert_eq!(calls[0].node_id, Id::new("node_a").unwrap());
         assert_eq!(calls[0].desired_read_position.get(), 12);
         assert_eq!(calls[0].snapshot_read_position, None);
@@ -2915,6 +2921,12 @@ mod tests {
             calls[0].candidate_volume_ids.as_ref(),
             Some(&[record.volume_id].into_iter().collect())
         );
+        assert_eq!(
+            calls[1].snapshot_read_position,
+            Some(Sequence::new(77).unwrap())
+        );
+        assert_eq!(calls[1].candidate_volume_ids, None);
+        assert_eq!(calls[1].after_volume_id, Some(Id::new("vol_root").unwrap()));
     }
 
     #[test]
@@ -3142,8 +3154,9 @@ mod tests {
                     record: unowned_record("vol_root", 4_294_967_296),
                     owner_node_id: None,
                 }],
-                None,
+                Some("vol_root"),
             ),
+            metadata_page(Vec::new(), None),
         ]);
         let reader = Arc::new(PagedMetadataAuthorityReader::new(port));
         let error = metadata_probe(&environment, reader)
@@ -3152,7 +3165,7 @@ mod tests {
         assert!(format!("{error:#}").contains("Node-owned volume outside scan candidates"));
 
         let calls = calls.lock().unwrap();
-        assert_eq!(calls.len(), 2);
+        assert_eq!(calls.len(), 3);
         assert_eq!(
             calls[1].snapshot_read_position,
             Some(Sequence::new(77).unwrap())
@@ -3162,6 +3175,7 @@ mod tests {
             calls[1].after_volume_id,
             Some(Id::new("vol_orphan").unwrap())
         );
+        assert_eq!(calls[2].after_volume_id, Some(Id::new("vol_root").unwrap()));
     }
 
     #[test]
@@ -3170,6 +3184,9 @@ mod tests {
             record: unowned_record("vol_root", 4_294_967_296),
             owner_node_id: None,
         };
+        // A provider must prove exhaustion with a separate empty page. A
+        // short or truncated nonempty page cannot self-certify completeness.
+        let nonempty_without_cursor = metadata_page(vec![base_record.clone()], None);
         let mut wrong_node = metadata_page(vec![base_record.clone()], None);
         let MetadataAuthorityPageRead::Page(page) = &mut wrong_node else {
             unreachable!()
@@ -3222,6 +3239,7 @@ mod tests {
         page.snapshot_read_position = Sequence::new(78).unwrap();
 
         for (case, reads) in [
+            ("nonempty_without_cursor", vec![nonempty_without_cursor]),
             ("wrong_node", vec![wrong_node]),
             ("wrong_desired_position", vec![wrong_desired_position]),
             ("bad_cursor", vec![bad_cursor]),
@@ -3275,7 +3293,7 @@ mod tests {
         assert!(records.keys().eq(candidates.iter()));
         assert_eq!(
             calls.load(Ordering::SeqCst),
-            METADATA_AUTHORITY_MAX_RECORDS.div_ceil(METADATA_AUTHORITY_PAGE_LIMIT)
+            METADATA_AUTHORITY_MAX_RECORDS.div_ceil(METADATA_AUTHORITY_PAGE_LIMIT) + 1
         );
     }
 
