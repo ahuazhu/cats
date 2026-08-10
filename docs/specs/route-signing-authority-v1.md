@@ -166,4 +166,3 @@ replica停止签发。reachable Node先关闭全部Route admission并drain/fence
 | rotation（future） | overlap ACK -> switch -> 305s retention -> remove ACK -> retire；边界相等不retire；old-only restart switch后不签发；uncordon需要current ACK |
 | revocation（future） | disable先于新签发停止；reachable close/drain、unreachable fence；fresh全量ACK后才resume；existing stream不因删key被伪装终止 |
 | deploy（future） | Terraform plan/state无private PEM；只含reference/public ring/IAM；secret bytes不进argv/env/log；projected symlink不能冒充real installed file |
-

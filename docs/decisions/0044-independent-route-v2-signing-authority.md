@@ -52,4 +52,3 @@ TLS listener 或 proxy。上述生产组合缺任一项时仍保持关闭，不�
   或启动顺序决定 authority。
 - public ring 可以安全分发到 Node，但它只是 verifier input，不会成为 Endpoint、placement 或
   admission 的第二份 authority。
-
