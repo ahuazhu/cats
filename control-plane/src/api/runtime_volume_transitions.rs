@@ -654,7 +654,7 @@ mod tests {
 
     use super::*;
     use crate::controller::AutoTierPolicy;
-    use crate::server::{spawn, spawn_with_legacy_node_runtime_for_tests, Config, Handle};
+    use crate::server::{spawn, spawn_for_retired_product_tests, Config, Handle};
     use crate::store::DsnSource;
 
     const SERVICE_TOKEN: &str = "a22-http-service-token";
@@ -694,10 +694,10 @@ mod tests {
 
     impl Context {
         async fn new() -> Self {
-            Self::new_with_legacy(false).await
+            Self::new_with_retired_product_authority(false).await
         }
 
-        async fn new_with_legacy(legacy: bool) -> Self {
+        async fn new_with_retired_product_authority(retired: bool) -> Self {
             let dir = tempfile::tempdir().unwrap();
             let usage = Arc::new(SqliteUsageStore::open(&dir.path().join("usage.db")).unwrap());
             let storage_meta: Arc<dyn MetadataStore> =
@@ -727,10 +727,8 @@ mod tests {
                 auto_tier_policy: AutoTierPolicy::default(),
                 oci_deploy_sync_wait_ms: 5_000,
             };
-            let server = if legacy {
-                spawn_with_legacy_node_runtime_for_tests(config)
-                    .await
-                    .unwrap()
+            let server = if retired {
+                spawn_for_retired_product_tests(config).await.unwrap()
             } else {
                 spawn(config).await.unwrap()
             };
@@ -1219,8 +1217,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn legacy_test_composition_does_not_register_a22_routes() {
-        let context = Context::new_with_legacy(true).await;
+    async fn retired_product_test_composition_does_not_register_a22_routes() {
+        let context = Context::new_with_retired_product_authority(true).await;
         let response = context
             .client
             .post(format!(

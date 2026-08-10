@@ -97,7 +97,7 @@ pub(super) async fn disk_action(
     Json(body): Json<DiskActionBody>,
 ) -> ApiResult<Response> {
     if matches!(verb.as_str(), "mount" | "unmount") {
-        require_legacy_node_runtime_for_tests(&state)?;
+        require_retired_product_authority_for_tests(&state)?;
     }
     check_workspace_auth(&state, &headers, &workspace).await?;
     let lookup_workspace = workspace.clone();
@@ -422,7 +422,7 @@ pub(super) async fn create_snapshot(
     Path((workspace, disk)): Path<(String, String)>,
     headers: HeaderMap,
 ) -> ApiResult<Json<Snapshot>> {
-    require_legacy_node_runtime_for_tests(&state)?;
+    require_retired_product_authority_for_tests(&state)?;
     check_workspace_auth(&state, &headers, &workspace).await?;
     let (disk, bound_cat) = state
         .store

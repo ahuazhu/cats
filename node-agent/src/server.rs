@@ -1,6 +1,6 @@
-//! Node agent HTTP surface + registration/heartbeat loops.
+//! Retired NodeJob HTTP surface plus signed session registration.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::ffi::CString;
 use std::mem::MaybeUninit;
 use std::os::unix::ffi::OsStrExt;
@@ -28,8 +28,8 @@ use cats_api::metering::{
 use cats_api::nodejob::{JobPhase, NodeJob};
 use cats_api::oci::{DeployOciRequest, OciDeployment};
 use cats_api::requests::{
-    ExecRequest, ExecResponse, NodeWorkStatusRequest, ProxyHttpRequest, ShellClientControl,
-    ShellServerControl, MAX_SHELL_MESSAGE_BYTES,
+    ExecRequest, ExecResponse, ProxyHttpRequest, ShellClientControl, ShellServerControl,
+    MAX_SHELL_MESSAGE_BYTES,
 };
 use cats_api::resources::{CatResourceTelemetry, NodeTelemetry};
 use cats_api::route_grant::{ROUTE_GRANT_REJECTION_EXPIRED, ROUTE_GRANT_REJECTION_HEADER};
@@ -38,55 +38,10 @@ use cats_storage::MetadataStore;
 
 use crate::guest_client::GuestShell;
 use crate::runtime::{
-    allocated_tree_bytes, CatTelemetryTarget, GuestConn, NodeConfig, NodeRuntime, ProxyTarget,
+    allocated_tree_bytes, CatTelemetryTarget, NodeConfig, NodeRuntime, ProxyTarget,
     RuntimeActivityGuard, UsageFinalizer,
 };
 use crate::usage_spool::UsageSpool;
-
-async fn watch_guest_work(
-    client: reqwest::Client,
-    cp: String,
-    token: String,
-    node_id: String,
-    cat_id: String,
-    generation: i64,
-    conn: GuestConn,
-) {
-    let mut after_sequence = None;
-    loop {
-        let watch_conn = conn.clone();
-        let status = tokio::task::spawn_blocking(move || {
-            let mut guest = watch_conn.connect()?;
-            guest.work_status(after_sequence, 1_000)
-        })
-        .await;
-        let status = match status {
-            Ok(Ok(status)) => status,
-            _ => {
-                tokio::time::sleep(Duration::from_millis(200)).await;
-                continue;
-            }
-        };
-        after_sequence = Some(status.lease_sequence);
-        let request = NodeWorkStatusRequest {
-            node_id: node_id.clone(),
-            cat_id: cat_id.clone(),
-            generation,
-            guest_source_epoch: status.source_epoch,
-            guest_lease_sequence: status.lease_sequence,
-            leases: status.leases,
-        };
-        let response = client
-            .post(format!("{cp}/v1/nodes/work-status"))
-            .bearer_auth(&token)
-            .json(&request)
-            .send()
-            .await;
-        if response.is_err() {
-            tokio::time::sleep(Duration::from_millis(200)).await;
-        }
-    }
-}
 
 #[derive(Clone)]
 pub struct ServerConfig {
@@ -1967,9 +1922,6 @@ pub async fn spawn(cfg: ServerConfig) -> anyhow::Result<Handle> {
         }
     });
 
-    let cp = cfg.control_plane_url.trim_end_matches('/').to_string();
-    let token = cfg.auth_token.clone();
-
     let sampling_state = state.clone();
     let sampling_interval = Duration::from_millis(cfg.heartbeat_ms);
     let telemetry_sampler =
@@ -2022,58 +1974,10 @@ pub async fn spawn(cfg: ServerConfig) -> anyhow::Result<Handle> {
         }
     });
 
-    // One long-poll watcher per Running Cat. Lease changes are pushed to the
-    // control plane immediately; the 1s timeout refreshes source freshness
-    // and repairs a lost event without high-rate polling.
-    let watch_state = state.clone();
-    let watch_client = client.clone();
-    let watch_cp = cp.clone();
-    let watch_token = token.clone();
-    let watch_node_id = cfg.node.node_id.clone();
-    let activity_watchers = tokio::spawn(async move {
-        let mut watchers: HashMap<(String, i64), tokio::task::JoinHandle<()>> = HashMap::new();
-        loop {
-            let targets = watch_state.runtime.activity_targets();
-            let wanted: HashSet<(String, i64)> = targets
-                .iter()
-                .map(|(cat_id, generation, _)| (cat_id.clone(), *generation))
-                .collect();
-            watchers.retain(|key, task| {
-                if wanted.contains(key) {
-                    true
-                } else {
-                    task.abort();
-                    false
-                }
-            });
-            for (cat_id, generation, conn) in targets {
-                let key = (cat_id.clone(), generation);
-                watchers.entry(key).or_insert_with(|| {
-                    tokio::spawn(watch_guest_work(
-                        watch_client.clone(),
-                        watch_cp.clone(),
-                        watch_token.clone(),
-                        watch_node_id.clone(),
-                        cat_id,
-                        generation,
-                        conn,
-                    ))
-                });
-            }
-            tokio::time::sleep(Duration::from_millis(100)).await;
-        }
-    });
-
     Ok(Handle {
         addr,
         state,
-        tasks: vec![
-            server,
-            telemetry_sampler,
-            usage_uploader,
-            residue_sweeper,
-            activity_watchers,
-        ],
+        tasks: vec![server, telemetry_sampler, usage_uploader, residue_sweeper],
     })
 }
 

@@ -1,20 +1,9 @@
-//! Liveness must not share a channel with anything remote.
-//!
-//! Usage upload used to run inline in the heartbeat loop, so its duration was
-//! added to the interval between heartbeats. In production the upload backlog
-//! grew until one attempt hit the agent's 10 s client timeout, which is the same
-//! value as the control plane's node lease -- so a single slow upload was enough
-//! to have the Host declared Lost, every ~70 s, indefinitely. Every Cat on it
-//! flapped with it, new Cats could not be scheduled during the Lost windows, and
-//! stops could not converge.
-//!
-//! These tests pin the separation: a usage endpoint that hangs far longer than
-//! the lease must not disturb the heartbeat cadence, and the upload must still
-//! happen on its own.
+//! Durable usage delivery remains independent after the legacy heartbeat and
+//! work-status transports have been removed.
 
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex};
-use std::time::{Duration, Instant};
+use std::sync::Arc;
+use std::time::Duration;
 
 use axum::body::Bytes;
 use axum::extract::State;
@@ -47,13 +36,7 @@ const USAGE_HANG: Duration = Duration::from_secs(30);
 
 #[derive(Clone, Default)]
 struct MockControlPlane {
-    heartbeats: Arc<Mutex<Vec<Instant>>>,
     usage_attempts: Arc<AtomicUsize>,
-}
-
-async fn mock_heartbeat(State(cp): State<MockControlPlane>) -> StatusCode {
-    cp.heartbeats.lock().unwrap().push(Instant::now());
-    StatusCode::NO_CONTENT
 }
 
 /// Stands in for an ingest that is grinding through a large backlog: the request
@@ -118,13 +101,8 @@ async fn start_mock(hang_usage: bool) -> (MockControlPlane, String) {
         post(mock_usage_ok)
     };
     let app = Router::new()
-        .route("/v1/nodes/heartbeat", post(mock_heartbeat))
         .route("/v1/internal/usage/checkpoints", usage)
         .route(REGISTRATION_PATH, post(mock_registration))
-        .route(
-            "/v1/nodes/work-status",
-            post(|| async { StatusCode::NO_CONTENT }),
-        )
         .with_state(cp.clone());
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
@@ -218,7 +196,7 @@ async fn start_agent(
     .unwrap()
 }
 
-/// A wedged legacy upload does not resurrect the removed legacy heartbeat.
+/// A wedged upload remains bounded to its own task.
 #[tokio::test]
 async fn a_hanging_usage_upload_does_not_delay_the_heartbeat() {
     let dir = TempDirFixture::new();
@@ -229,14 +207,13 @@ async fn a_hanging_usage_upload_does_not_delay_the_heartbeat() {
     // inline call the second heartbeat would not arrive for 10 s.
     tokio::time::sleep(Duration::from_millis(HEARTBEAT_MS * 12)).await;
 
-    assert!(cp.heartbeats.lock().unwrap().is_empty());
     assert!(
         cp.usage_attempts.load(Ordering::SeqCst) >= 1,
         "the uploader must still be trying on its own channel"
     );
 }
 
-/// The upload still happens without the heartbeat carrying it.
+/// The upload still happens without either retired Node transport.
 #[tokio::test]
 async fn usage_upload_runs_on_its_own_channel() {
     let dir = TempDirFixture::new();
@@ -247,9 +224,5 @@ async fn usage_upload_runs_on_its_own_channel() {
     assert!(
         cp.usage_attempts.load(Ordering::SeqCst) >= 1,
         "decoupling must not mean the upload stops happening"
-    );
-    assert!(
-        cp.heartbeats.lock().unwrap().is_empty(),
-        "the runtime session cutover must not double-write legacy heartbeats"
     );
 }

@@ -103,7 +103,7 @@ pub(super) async fn cat_action(
     headers: HeaderMap,
 ) -> ApiResult<Response> {
     if verb == "sync" {
-        require_legacy_node_runtime_for_tests(&state)?;
+        require_retired_product_authority_for_tests(&state)?;
     }
     check_workspace_auth(&state, &headers, &workspace).await?;
     let lookup_workspace = workspace.clone();
@@ -204,7 +204,7 @@ pub(super) async fn get_auto_suspend(
     Path((workspace, cat)): Path<(String, String)>,
     headers: HeaderMap,
 ) -> ApiResult<Json<AutoSuspendResponse>> {
-    require_legacy_node_runtime_for_tests(&state)?;
+    require_retired_product_authority_for_tests(&state)?;
     check_workspace_auth(&state, &headers, &workspace).await?;
     let lease_timeout_ms = state.cfg.node_lease_timeout_ms;
     let (cat, work) = state
@@ -224,7 +224,7 @@ pub(super) async fn update_auto_suspend(
     headers: HeaderMap,
     Json(request): Json<UpdateAutoSuspendRequest>,
 ) -> ApiResult<Json<AutoSuspendResponse>> {
-    require_legacy_node_runtime_for_tests(&state)?;
+    require_retired_product_authority_for_tests(&state)?;
     check_workspace_auth(&state, &headers, &workspace).await?;
     let cat = state
         .store
@@ -290,7 +290,7 @@ pub(super) async fn get_cat_work(
     Path((workspace, cat)): Path<(String, String)>,
     headers: HeaderMap,
 ) -> ApiResult<Json<CatWorkStatus>> {
-    require_legacy_node_runtime_for_tests(&state)?;
+    require_retired_product_authority_for_tests(&state)?;
     check_workspace_auth(&state, &headers, &workspace).await?;
     let lease_timeout_ms = state.cfg.node_lease_timeout_ms;
     let work = state

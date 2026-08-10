@@ -19,9 +19,7 @@ use cats_api::runtime_node_authority::{
     NODE_AUTHORITY_APPLY_ID_HEADER, RUNTIME_NODE_AUTHORITY_PATH,
 };
 use cats_control_plane::auth::{WorkOsConfig, WorkOsConfigParams};
-use cats_control_plane::server::{
-    spawn_with_legacy_node_runtime_for_tests as spawn, Config, Handle,
-};
+use cats_control_plane::server::{spawn_for_retired_product_tests as spawn, Config, Handle};
 use cats_metadata_store_sqlite::SqliteMetadataStore;
 use cats_metering::SqliteUsageStore;
 use cats_storage::MetadataStore;

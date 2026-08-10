@@ -6,7 +6,7 @@ pub(super) async fn exec_cat(
     headers: HeaderMap,
     Json(req): Json<ExecRequest>,
 ) -> ApiResult<Json<ExecResponse>> {
-    require_legacy_node_runtime_for_tests(&state)?;
+    require_retired_product_authority_for_tests(&state)?;
     check_workspace_auth(&state, &headers, &workspace).await?;
     let cat = state
         .store
@@ -154,7 +154,7 @@ pub(super) async fn deploy_oci(
     headers: HeaderMap,
     Json(request): Json<DeployOciRequest>,
 ) -> ApiResult<Response> {
-    require_legacy_node_runtime_for_tests(&state)?;
+    require_retired_product_authority_for_tests(&state)?;
     check_workspace_auth(&state, &headers, &workspace).await?;
     let cat = state
         .store
@@ -470,7 +470,7 @@ pub(super) async fn shell_cat(
     headers: HeaderMap,
     ws: WebSocketUpgrade,
 ) -> ApiResult<Response> {
-    require_legacy_node_runtime_for_tests(&state)?;
+    require_retired_product_authority_for_tests(&state)?;
     check_workspace_auth(&state, &headers, &workspace).await?;
     if !(1..=1_000).contains(&query.rows) || !(1..=1_000).contains(&query.cols) {
         return Err(ApiError::invalid("terminal dimensions must be in 1..=1000").into());

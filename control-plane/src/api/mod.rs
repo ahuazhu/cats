@@ -104,8 +104,8 @@ type ApiResult<T> = std::result::Result<T, Failure>;
 /// or calls the retired Node HTTP runtime. This check must be the first handler
 /// action so production cannot authenticate, write an idempotency/work row, or
 /// emit an outbound call before failing closed.
-fn require_legacy_node_runtime_for_tests(state: &AppState) -> ApiResult<()> {
-    if state.legacy_node_runtime_for_tests {
+fn require_retired_product_authority_for_tests(state: &AppState) -> ApiResult<()> {
+    if state.retired_product_authority_for_tests {
         Ok(())
     } else {
         Err(
@@ -429,7 +429,7 @@ fn metering_failure(error: cats_metering::MeteringError) -> Failure {
     }
 }
 
-async fn reject_legacy_authority(
+async fn reject_retired_product_authority(
     _request: axum::extract::Request,
     _next: axum::middleware::Next,
 ) -> Response {
@@ -439,8 +439,18 @@ async fn reject_legacy_authority(
     .into_response()
 }
 
+fn retired_product_support_router(enabled: bool) -> Router<AppState> {
+    if enabled {
+        Router::new()
+            .route("/v1/internal/work/acquire", post(acquire_work))
+            .route("/v1/internal/work/release", post(release_work))
+    } else {
+        Router::new()
+    }
+}
+
 pub fn router(state: AppState) -> Router {
-    let cat_create_route = if state.legacy_node_runtime_for_tests {
+    let cat_create_route = if state.retired_product_authority_for_tests {
         post(create_cat_legacy_for_tests)
     } else {
         post(create_cat_v2)
@@ -449,7 +459,7 @@ pub fn router(state: AppState) -> Router {
     // Keep them reachable only from the explicit pre-cutover test composition.
     // The production middleware runs before authentication, body extraction,
     // PostgreSQL access, idempotency writes, and outbound Node calls.
-    let legacy_authority = Router::new()
+    let retired_product_authority = Router::new()
         .route("/v1/workspaces/{workspace}/cats", get(list_cats))
         .route(
             "/v1/workspaces/{workspace}/cats/{cat}",
@@ -529,12 +539,15 @@ pub fn router(state: AppState) -> Router {
         .route("/v1/admin/monitoring", get(admin_monitoring))
         .route("/v1/routes/resolve", get(resolve_route))
         .route("/v1/routes/wake", post(wake_route_handler));
-    let legacy_authority = if state.legacy_node_runtime_for_tests {
-        legacy_authority
+    let retired_product_authority = if state.retired_product_authority_for_tests {
+        retired_product_authority
     } else {
-        legacy_authority.route_layer(axum::middleware::from_fn(reject_legacy_authority))
+        retired_product_authority
+            .route_layer(axum::middleware::from_fn(reject_retired_product_authority))
     };
-    let runtime_volume_authority = if state.legacy_node_runtime_for_tests {
+    let retired_product_support =
+        retired_product_support_router(state.retired_product_authority_for_tests);
+    let runtime_volume_authority = if state.retired_product_authority_for_tests {
         Router::new()
     } else {
         Router::new()
@@ -667,27 +680,10 @@ pub fn router(state: AppState) -> Router {
         .route("/v1/admin/workspaces", get(admin_list_workspaces))
         .merge(runtime_volume_authority)
         .merge(route_resolve_v2)
-        .merge(legacy_authority)
+        .merge(retired_product_support)
+        .merge(retired_product_authority)
         .fallback(crate::ui::not_found)
         .with_state(state)
-}
-
-/// Adds the retired shared-bearer Node heartbeat/work mutation surface only
-/// for pre-cutover integration suites. No production composition root calls
-/// this function.
-#[doc(hidden)]
-pub fn router_with_legacy_node_runtime_for_tests(state: AppState) -> Router {
-    router(state.clone()).merge(
-        Router::new()
-            .route(
-                "/v1/nodes/heartbeat",
-                post(nodes::legacy_heartbeat_for_tests),
-            )
-            .route("/v1/nodes/work-status", post(node_work_status))
-            .route("/v1/internal/work/acquire", post(acquire_work))
-            .route("/v1/internal/work/release", post(release_work))
-            .with_state(state),
-    )
 }
 
 #[cfg(test)]

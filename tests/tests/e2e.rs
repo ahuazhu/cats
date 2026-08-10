@@ -65,7 +65,7 @@ impl Cluster {
         let storage_meta_path = dir.path().join("storage-meta.db");
         let storage_meta: Arc<dyn MetadataStore> =
             Arc::new(SqliteMetadataStore::open(&storage_meta_path).unwrap());
-        let cp = cats_control_plane::server::spawn_with_legacy_node_runtime_for_tests(
+        let cp = cats_control_plane::server::spawn_for_retired_product_tests(
             cats_control_plane::server::Config {
                 listen: "127.0.0.1:0".into(),
                 control_store_dsn: cats_control_plane::store::DsnSource::Literal(
@@ -225,7 +225,11 @@ impl Cluster {
         .await;
         let runtime = node.state.runtime.clone();
         let node_health = format!("{}/healthz", node.base_url());
-        let cp_heartbeat = format!("{}/v1/nodes/heartbeat", cp.base_url());
+        // The retired product loop still reads its private Node row, but no
+        // HTTP caller may update it. Signed A19/A20 coverage lives in the
+        // production Runtime suites; this direct fixture update disappears
+        // with the old product E2E.
+        let retired_store = Arc::clone(&cp.state.store);
         let node_id = id.to_string();
         tokio::spawn(async move {
             let client = reqwest::Client::new();
@@ -243,15 +247,21 @@ impl Cluster {
                         state,
                     })
                     .collect();
-                let _ = client
-                    .post(&cp_heartbeat)
-                    .bearer_auth(SERVICE_TOKEN)
-                    .json(&HeartbeatRequest {
-                        node_id: node_id.clone(),
-                        cats,
-                        telemetry: None,
+                let request = HeartbeatRequest {
+                    node_id: node_id.clone(),
+                    cats,
+                    telemetry: None,
+                };
+                let _ = retired_store
+                    .execute(move |store| {
+                        store
+                            .heartbeat_node(
+                                &request.node_id,
+                                request.telemetry.as_ref(),
+                                &request.cats,
+                            )
+                            .map(|_| ())
                     })
-                    .send()
                     .await;
             }
         });

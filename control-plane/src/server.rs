@@ -471,11 +471,10 @@ pub struct AppState {
     pub(crate) runtime_volume_transition_service: Arc<RuntimeVolumeTransitionService>,
     pub(crate) runtime_node_authority:
         Arc<crate::api::runtime_node_authority::RuntimeNodeAuthorityService>,
-    /// The old Controller/NodeJob runtime exists only to keep the explicit
-    /// pre-cutover integration harness exercising its historical contract.
-    /// Production handlers consult this before touching any legacy work row
-    /// or Node HTTP surface.
-    pub(crate) legacy_node_runtime_for_tests: bool,
+    /// The retired product authority exists only while its historical
+    /// controller tests are being replaced. It never adds a Node HTTP route:
+    /// every composition uses the production A19/A20 ingress map.
+    pub(crate) retired_product_authority_for_tests: bool,
 }
 
 pub struct Handle {
@@ -773,14 +772,18 @@ pub async fn spawn(cfg: Config) -> anyhow::Result<Handle> {
     spawn_inner(cfg, false).await
 }
 
-/// Pre-cutover integration harness. The shipped daemon calls [`spawn`], whose
-/// production route map has no legacy heartbeat or Node work mutation routes.
+/// Retired product/controller harness. It uses the exact production Node
+/// ingress map; in particular it cannot install heartbeat, inventory,
+/// registration, or work-status compatibility routes.
 #[doc(hidden)]
-pub async fn spawn_with_legacy_node_runtime_for_tests(cfg: Config) -> anyhow::Result<Handle> {
+pub async fn spawn_for_retired_product_tests(cfg: Config) -> anyhow::Result<Handle> {
     spawn_inner(cfg, true).await
 }
 
-async fn spawn_inner(cfg: Config, legacy_node_runtime_for_tests: bool) -> anyhow::Result<Handle> {
+async fn spawn_inner(
+    cfg: Config,
+    retired_product_authority_for_tests: bool,
+) -> anyhow::Result<Handle> {
     anyhow::ensure!(
         !cfg.auth_token.is_empty(),
         "service token must not be empty"
@@ -791,7 +794,7 @@ async fn spawn_inner(cfg: Config, legacy_node_runtime_for_tests: bool) -> anyhow
         "service and admin tokens must be different"
     );
     anyhow::ensure!(
-        legacy_node_runtime_for_tests || !cfg.billing_enforcement_enabled,
+        retired_product_authority_for_tests || !cfg.billing_enforcement_enabled,
         "legacy Cat billing enforcement is unavailable during the signed runtime cutover"
     );
     anyhow::ensure!(
@@ -849,7 +852,7 @@ async fn spawn_inner(cfg: Config, legacy_node_runtime_for_tests: bool) -> anyhow
             })
             .await?;
     }
-    if legacy_node_runtime_for_tests {
+    if retired_product_authority_for_tests {
         // Legacy OCI deploys are driven by an in-memory Node HTTP task. Only
         // the explicit legacy harness is allowed to converge those rows; the
         // signed production process must not claim ownership of that runtime.
@@ -898,7 +901,7 @@ async fn spawn_inner(cfg: Config, legacy_node_runtime_for_tests: bool) -> anyhow
         cfg.node_lease_timeout_ms,
         cfg.auth_token.clone(),
         cfg.auto_tier_policy,
-        if legacy_node_runtime_for_tests {
+        if retired_product_authority_for_tests {
             NodeLivenessAuthority::LegacyHeartbeatForTests
         } else {
             NodeLivenessAuthority::SignedSession
@@ -931,18 +934,14 @@ async fn spawn_inner(cfg: Config, legacy_node_runtime_for_tests: bool) -> anyhow
         ),
         runtime_volume_transition_admission: Arc::new(RuntimeSpineAdmission::new()),
         runtime_volume_transition_service: Arc::new(RuntimeVolumeTransitionService::new()),
-        legacy_node_runtime_for_tests,
+        retired_product_authority_for_tests,
     };
 
     let listener = tokio::net::TcpListener::bind(&cfg.listen)
         .await
         .with_context(|| format!("bind {}", cfg.listen))?;
     let addr = listener.local_addr()?;
-    let app = if legacy_node_runtime_for_tests {
-        crate::api::router_with_legacy_node_runtime_for_tests(state.clone())
-    } else {
-        crate::api::router(state.clone())
-    };
+    let app = crate::api::router(state.clone());
     let (server_shutdown, server_shutdown_rx) = tokio::sync::oneshot::channel();
     let server_task = tokio::spawn(async move {
         if let Err(e) = axum::serve(listener, app)
@@ -955,7 +954,7 @@ async fn spawn_inner(cfg: Config, legacy_node_runtime_for_tests: bool) -> anyhow
         }
     });
     let interval = Duration::from_millis(cfg.reconcile_interval_ms);
-    let reconciler_task = legacy_node_runtime_for_tests.then(|| {
+    let reconciler_task = retired_product_authority_for_tests.then(|| {
         let reconciler = controller.clone();
         let reconciler_store = state.store.clone();
         spawn_singleton_task(state.store.clone(), SingletonRole::Reconciler, move || {
@@ -963,7 +962,7 @@ async fn spawn_inner(cfg: Config, legacy_node_runtime_for_tests: bool) -> anyhow
         })
     });
     let billing_enforcer_task =
-        (legacy_node_runtime_for_tests && cfg.billing_enforcement_enabled).then(|| {
+        (retired_product_authority_for_tests && cfg.billing_enforcement_enabled).then(|| {
         let enforcement_state = state.clone();
         spawn_singleton_task(
             state.store.clone(),
