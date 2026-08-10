@@ -117,6 +117,17 @@ pub struct FileCheckpointStore {
     faults: Mutex<TestFaults>,
 }
 
+/// In-process serialization proof that one previously loaded checkpoint is
+/// still the exact target protected by this store's held per-Cat `flock`.
+///
+/// Keeping this guard alive prevents another writer using the same store from
+/// replacing the target between the assertion and the caller's bounded
+/// physical effect. The borrow also keeps `_writer_lock` alive, so the
+/// cross-process lock remains held for the same interval.
+pub(super) struct CurrentCheckpointGuard<'a> {
+    _writer: MutexGuard<'a, ()>,
+}
+
 impl FileCheckpointStore {
     /// Opens (and, when absent, creates) the protected checkpoint directory.
     /// The final directory component and the per-Cat lock file must not be
@@ -445,6 +456,22 @@ impl FileCheckpointStore {
         checkpoint: &RuntimeCheckpoint,
     ) -> Result<StoredCheckpoint, CheckpointStoreError> {
         self.persist(ExpectedTarget::Exact(expected), checkpoint)
+    }
+
+    /// Assert that `expected` is still the exact visible target and keep both
+    /// the store's process-wide `flock` and its in-process writer
+    /// serialization held until the returned guard is dropped.
+    pub(super) fn assert_current(
+        &self,
+        expected: &StoredCheckpoint,
+    ) -> Result<CurrentCheckpointGuard<'_>, CheckpointStoreError> {
+        let writer = self.writer_serialization.lock().map_err(|_| {
+            CheckpointStoreError::WriterSerializationPoisoned {
+                path: self.target_path.clone(),
+            }
+        })?;
+        self.verify_expected(ExpectedTarget::Exact(expected))?;
+        Ok(CurrentCheckpointGuard { _writer: writer })
     }
 
     /// Re-establishes the directory durability barrier after a caller lost a

@@ -276,27 +276,6 @@ impl RootProvisionProcessEvidence {
             && self.handshake.control_only
             && !self.handshake.guest_io_enabled
     }
-
-    pub(crate) fn into_process_evidence(self) -> ProcessEvidence {
-        ProcessEvidence {
-            role: ProcessRole::Blockd {
-                volume_id: self.handshake.identity.volume_id,
-                attachment_id: self.handshake.identity.attachment_id,
-                attachment_epoch: self.handshake.identity.attachment_epoch,
-            },
-            process_id: self.process_id,
-            process_start_time_ticks: self.process_start_time_ticks,
-            executable_path: self.executable_path,
-            scope_id: self.scope_id,
-            control_socket_path: self.control_socket_path,
-            state: ProcessState::Running,
-            ownership_token: OwnershipTokenEvidence::Valid {
-                ownership_token: self.ownership_token,
-            },
-            control_handshake: ControlHandshakeEvidence::Verified,
-            observed_vm_shape: None,
-        }
-    }
 }
 
 /// Unforgeable proof that one complete process observation exactly matched
@@ -334,6 +313,31 @@ impl ExactRootProvisionProcessProof {
 
     pub(crate) fn evidence(&self) -> &RootProvisionProcessEvidence {
         &self.evidence
+    }
+
+    /// Consume the exact-match proof before projecting a process as verified
+    /// public inventory evidence. Raw platform observations deliberately have
+    /// no such projection capability.
+    pub(crate) fn into_process_evidence(self) -> ProcessEvidence {
+        let evidence = self.evidence;
+        ProcessEvidence {
+            role: ProcessRole::Blockd {
+                volume_id: evidence.handshake.identity.volume_id,
+                attachment_id: evidence.handshake.identity.attachment_id,
+                attachment_epoch: evidence.handshake.identity.attachment_epoch,
+            },
+            process_id: evidence.process_id,
+            process_start_time_ticks: evidence.process_start_time_ticks,
+            executable_path: evidence.executable_path,
+            scope_id: evidence.scope_id,
+            control_socket_path: evidence.control_socket_path,
+            state: ProcessState::Running,
+            ownership_token: OwnershipTokenEvidence::Valid {
+                ownership_token: evidence.ownership_token,
+            },
+            control_handshake: ControlHandshakeEvidence::Verified,
+            observed_vm_shape: None,
+        }
     }
 }
 
@@ -474,6 +478,7 @@ where
 /// durable `ProvisionRootImage` checkpoint. This restart/full-scan entrypoint
 /// cannot replace the checkpoint or mint a new process attempt token.
 pub(crate) fn ensure_root_provision_process_from_persisted_checkpoint<P>(
+    store: &FileCheckpointStore,
     persisted: &StoredCheckpoint,
     authority: RootProvisionAuthoritySnapshot<'_>,
     executable_path: HostPath,
@@ -489,6 +494,13 @@ where
         authority,
         executable_path,
     )?;
+    // A decoded value is not a durable-current proof: the checkpoint target
+    // may have been atomically replaced since it was loaded. Revalidate file
+    // identity, content digest, and decoded value while retaining the same
+    // store's per-Cat flock and in-process writer guard across all process I/O.
+    let _current = store
+        .assert_current(persisted)
+        .context("assert persisted root-provision checkpoint is still current")?;
     ensure_root_provision_process_from_expectation(expected, port, context)
 }
 
@@ -585,7 +597,7 @@ mod tests {
     };
 
     use super::*;
-    use crate::runtime::reconciliation::checkpoint::WriteStage;
+    use crate::runtime::reconciliation::checkpoint::{CheckpointStoreError, WriteStage};
     use crate::state_directory::StateDirectory;
 
     #[derive(Default)]
@@ -733,6 +745,7 @@ mod tests {
             )));
 
         let outcome = ensure_root_provision_process_from_persisted_checkpoint(
+            &store,
             &persisted,
             authority_snapshot(attachment, &authority),
             host("/usr/bin/cats-blockd"),
@@ -750,6 +763,34 @@ mod tests {
         assert_eq!(after.content_digest(), &before_digest);
         let fake = port.state.lock().unwrap();
         assert_eq!((fake.inspect_calls, fake.start_calls), (1, 0));
+    }
+
+    #[test]
+    fn restart_rejects_a_replaced_checkpoint_before_any_process_io() {
+        let (_root, state, store, predecessor, staged, attachment, _evidence) = fixture();
+        let authority = authority_record(&attachment, attachment.head.clone());
+        let persisted = store.replace(&predecessor, &staged).unwrap();
+        let mut successor = staged.clone();
+        successor.updated_at_unix_ms = UnixMillis::new(1_900_000_000_001).unwrap();
+        store.replace(&persisted, &successor).unwrap();
+        let port = FakePort::default();
+
+        let error = ensure_root_provision_process_from_persisted_checkpoint(
+            &store,
+            &persisted,
+            authority_snapshot(attachment, &authority),
+            host("/usr/bin/cats-blockd"),
+            &port,
+            &context(state),
+        )
+        .expect_err("a successor checkpoint must invalidate the loaded predecessor");
+
+        assert!(matches!(
+            error.downcast_ref::<CheckpointStoreError>(),
+            Some(CheckpointStoreError::ConcurrentUpdate { .. })
+        ));
+        let fake = port.state.lock().unwrap();
+        assert_eq!((fake.inspect_calls, fake.start_calls), (0, 0));
     }
 
     #[test]
@@ -1092,10 +1133,20 @@ mod tests {
 
     #[test]
     fn exact_root_provision_identity_projects_one_verified_blockd_process() {
-        let attachment = attachment();
+        let (_root, _state, _store, _predecessor, staged, attachment, evidence) = fixture();
         let expected_identity = attachment.identity.clone();
         let expected_token = random('4');
-        let process = evidence(&attachment).into_process_evidence();
+        let authority = authority_record(&attachment, attachment.head.clone());
+        let expected = RootProvisionProcessExpectation::from_checkpoint(
+            &staged,
+            authority_snapshot(attachment, &authority),
+            host("/usr/bin/cats-blockd"),
+        )
+        .unwrap();
+        let process = expected
+            .prove_exact_process(evidence)
+            .unwrap()
+            .into_process_evidence();
 
         assert_eq!(
             process.role,
@@ -1125,6 +1176,85 @@ mod tests {
             ControlHandshakeEvidence::Verified
         );
         assert_eq!(process.observed_vm_shape, None);
+    }
+
+    #[test]
+    fn every_identity_mismatch_is_rejected_before_verified_projection() {
+        let variants = [
+            "zero_pid",
+            "wrong_main_pid",
+            "zero_start",
+            "wrong_cgroup_members",
+            "foreign_socket_peer",
+            "wrong_executable",
+            "wrong_scope",
+            "wrong_cgroup_path",
+            "wrong_socket",
+            "wrong_data_directory",
+            "wrong_owner_token",
+            "wrong_attachment_identity",
+            "wrong_size",
+            "wrong_durability",
+            "wrong_remote_head",
+            "wrong_handshake_token",
+            "not_control_only",
+            "guest_io_enabled",
+        ];
+        for variant in variants {
+            let (_root, _state, _store, _predecessor, staged, attachment, mut evidence) = fixture();
+            let authority = authority_record(&attachment, attachment.head.clone());
+            let expected = RootProvisionProcessExpectation::from_checkpoint(
+                &staged,
+                authority_snapshot(attachment, &authority),
+                host("/usr/bin/cats-blockd"),
+            )
+            .unwrap();
+            match variant {
+                "zero_pid" => evidence.process_id = 0,
+                "wrong_main_pid" => evidence.unit_main_process_id += 1,
+                "zero_start" => evidence.process_start_time_ticks = WireU64::new(0).unwrap(),
+                "wrong_cgroup_members" => evidence.cgroup_process_ids.push(5252),
+                "foreign_socket_peer" => evidence.handshake.peer_process_id += 1,
+                "wrong_executable" => evidence.executable_path = host("/usr/bin/foreign"),
+                "wrong_scope" => evidence.scope_id = id("cats-foreign.service"),
+                "wrong_cgroup_path" => {
+                    evidence.cgroup_path = host("/sys/fs/cgroup/system.slice/cats-foreign.service");
+                }
+                "wrong_socket" => {
+                    evidence.control_socket_path = host("/run/cats/foreign.sock");
+                }
+                "wrong_data_directory" => {
+                    evidence.data_directory = host("/var/lib/cats/foreign");
+                }
+                "wrong_owner_token" => evidence.ownership_token = random('9'),
+                "wrong_attachment_identity" => {
+                    evidence.handshake.identity.attachment_id = id("att_foreign");
+                }
+                "wrong_size" => evidence.handshake.size_bytes += 1,
+                "wrong_durability" => evidence.handshake.durability = Durability::Relaxed,
+                "wrong_remote_head" => {
+                    evidence.handshake.remote_head = RemoteHead {
+                        generation: Generation::new(1).unwrap(),
+                        root_hash: Some(digest('9')),
+                        root_object_id: Some(
+                            cats_api::runtime_reconciliation::AsciiText::new("roots/foreign")
+                                .unwrap(),
+                        ),
+                    };
+                }
+                "wrong_handshake_token" => {
+                    evidence.handshake.process_identity_token = random('9');
+                }
+                "not_control_only" => evidence.handshake.control_only = false,
+                "guest_io_enabled" => evidence.handshake.guest_io_enabled = true,
+                _ => unreachable!(),
+            }
+
+            assert!(
+                expected.prove_exact_process(evidence).is_err(),
+                "{variant} must not construct an exact proof"
+            );
+        }
     }
 
     #[test]
