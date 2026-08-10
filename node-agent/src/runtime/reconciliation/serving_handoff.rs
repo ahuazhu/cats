@@ -5075,6 +5075,105 @@ mod tests {
     }
 
     #[test]
+    fn prepare_device_retirement_rejects_initial_and_mid_sweep_lease_rollback() {
+        for rollback_before_sweep in [true, false] {
+            let mut fixture = fixture();
+            let accepted_process = advance_fixture_to_prepare_device(&mut fixture);
+            let authority = Arc::new(FixedEffectAuthority::new(fixture.authority.volume.clone()));
+            let rollback_expiry = UnixMillis::new(
+                fixture
+                    .acquired
+                    .attachment
+                    .lease_expires_at
+                    .get()
+                    .checked_sub(1)
+                    .unwrap(),
+            )
+            .unwrap();
+            let global = if rollback_before_sweep {
+                authority.record.lock().unwrap().lease_expires_at = Some(rollback_expiry);
+                Arc::new(RetirementEffectGlobalPort::new([
+                    RootProvisionProcessInspection::Exact(Box::new(fixture.process.clone())),
+                ]))
+            } else {
+                let rollback = Arc::clone(&authority);
+                Arc::new(RetirementEffectGlobalPort::with_after_sweep(
+                    RootProvisionProcessInspection::Exact(Box::new(fixture.process.clone())),
+                    move || {
+                        rollback.record.lock().unwrap().lease_expires_at = Some(rollback_expiry);
+                    },
+                ))
+            };
+            let process = Arc::new(RetirementEffectStopPort::new([]));
+            let effect = PrepareDeviceTargetRetirementEffect::for_test(
+                authority,
+                global.clone(),
+                process.clone(),
+            );
+
+            assert_eq!(
+                effect
+                    .try_apply(
+                        &effect_context_with_processes(&fixture, vec![accepted_process]),
+                        &fixture.acquired.desired,
+                    )
+                    .unwrap(),
+                Some(RuntimeDesiredEffectOutcome::Stop(
+                    RuntimeDesiredEffectStopReason::LocalContract,
+                ))
+            );
+            assert_eq!(
+                global.calls.load(Ordering::SeqCst),
+                usize::from(!rollback_before_sweep)
+            );
+            assert!(process.stopped().is_empty());
+        }
+    }
+
+    #[test]
+    fn prepare_device_retirement_allows_monotonic_lease_renewal_during_sweep() {
+        let mut fixture = fixture();
+        let accepted_process = advance_fixture_to_prepare_device(&mut fixture);
+        let authority = Arc::new(FixedEffectAuthority::new(fixture.authority.volume.clone()));
+        let renewal = Arc::clone(&authority);
+        let renewed_expiry = UnixMillis::new(
+            fixture
+                .authority
+                .volume
+                .lease_expires_at
+                .unwrap()
+                .get()
+                .checked_add(60_000)
+                .unwrap(),
+        )
+        .unwrap();
+        let global = Arc::new(RetirementEffectGlobalPort::with_after_sweep(
+            RootProvisionProcessInspection::Exact(Box::new(fixture.process.clone())),
+            move || renewal.record.lock().unwrap().lease_expires_at = Some(renewed_expiry),
+        ));
+        let process = Arc::new(RetirementEffectStopPort::new([
+            RootProvisionProcessStop::Submitted,
+        ]));
+        let effect = PrepareDeviceTargetRetirementEffect::for_test(
+            authority,
+            global.clone(),
+            process.clone(),
+        );
+
+        assert_eq!(
+            effect
+                .try_apply(
+                    &effect_context_with_processes(&fixture, vec![accepted_process]),
+                    &fixture.acquired.desired,
+                )
+                .unwrap(),
+            Some(RuntimeDesiredEffectOutcome::RefreshInventory)
+        );
+        assert_eq!(global.calls.load(Ordering::SeqCst), 1);
+        assert_eq!(process.stopped(), vec![fixture.process.clone()]);
+    }
+
+    #[test]
     fn prepare_device_retirement_rejects_late_process_after_accepted_absence() {
         let mut fixture = fixture();
         advance_fixture_to_prepare_device(&mut fixture);

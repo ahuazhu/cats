@@ -21,7 +21,7 @@ use cats_api::runtime_reconciliation::{
     ServingAuthorityProvenance, VolumeAccess, VolumeAcquire, VolumeAuthorityEvidence,
     VolumeDisposition, WarmSnapshotEvidence,
 };
-use cats_storage::authority::VolumeDataAuthority;
+use cats_storage::authority::{VolumeDataAuthority, VolumeRecord};
 
 use crate::runtime_spine::{
     RuntimeDesiredEffectContext, RuntimeDesiredEffectOutcome, RuntimeDesiredEffectStopReason,
@@ -151,6 +151,12 @@ impl PrepareDeviceTargetRetirementEffect {
             Ok(ready) => ready,
             Err(_) => return Ok(Some(stop_local())),
         };
+        let Some(first_lease_expiry) = authority
+            .lease_expires_at
+            .filter(|current| *current >= ready.attempt().attachment.lease_expires_at)
+        else {
+            return Ok(Some(stop_local()));
+        };
         let expectation = match RootProvisionProcessExpectation::from_retained_prepare_device(
             stored.checkpoint(),
             desired,
@@ -198,6 +204,11 @@ impl PrepareDeviceTargetRetirementEffect {
         if ready
             .assert_current(stored.checkpoint(), desired, &current_authority)
             .is_err()
+            || !retirement_authority_lease_is_monotonic(
+                &authority,
+                &current_authority,
+                first_lease_expiry,
+            )
             || store
                 .revalidate_current(&stored, &checkpoint_guard)
                 .is_err()
@@ -218,6 +229,26 @@ impl PrepareDeviceTargetRetirementEffect {
             RootProvisionProcessStop::Conflict(_) => stop_local(),
         }))
     }
+}
+
+/// The process/data authority fields may not move during an exact stop.  A
+/// lease renewal is the sole legal concurrent authority change and its
+/// absolute expiry can only advance from the first point read.
+fn retirement_authority_lease_is_monotonic(
+    before: &VolumeRecord,
+    after: &VolumeRecord,
+    first_lease_expiry: cats_api::runtime_reconciliation::UnixMillis,
+) -> bool {
+    before.volume_id == after.volume_id
+        && before.size_bytes == after.size_bytes
+        && before.durability == after.durability
+        && before.admin_state == after.admin_state
+        && before.head == after.head
+        && before.lease_owner == after.lease_owner
+        && before.lease_epoch == after.lease_epoch
+        && before.last_transition == after.last_transition
+        && before.lease_expires_at == Some(first_lease_expiry)
+        && matches!(after.lease_expires_at, Some(current) if current >= first_lease_expiry)
 }
 
 fn unique_runtime<'a>(
