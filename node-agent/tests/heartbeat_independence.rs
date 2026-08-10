@@ -16,6 +16,8 @@ use cats_api::agent_registration::{
     NODE_PUBLIC_KEY_SPKI_HEADER, NODE_SIGNATURE_HEADER, REGISTRATION_PATH,
 };
 use cats_api::metering::{CatUsageCheckpoint, UsageMetric};
+use cats_api::nodejob::{job_id, NodeJob, NodeJobAction, VolumeGrant};
+use cats_api::resources::ObservedState;
 use cats_api::runtime_reconciliation::{
     decode_agent_registration_attempt, encode_agent_session, AgentSession, AsciiText,
     ContractVersion, CredentialBinding, Epoch, GuestRuntimeProfileReceipt, Id, NodeBootId,
@@ -29,6 +31,8 @@ use cats_storage::MetadataStore;
 use cats_test_support::{fake_node_config, NodeConfigBuilder, TempDirFixture};
 
 const HEARTBEAT_MS: u64 = 200;
+const WORK_PRODUCER_CAT: &str = "cat_work_producer";
+const WORK_PRODUCER_GENERATION: i64 = 1;
 
 /// Longer than any plausible lease, so if liveness is coupled to upload at all
 /// the heartbeat gap becomes unmistakable rather than marginal.
@@ -237,6 +241,75 @@ async fn start_agent(
     .unwrap()
 }
 
+async fn start_running_work_producer(agent: &cats_node_agent::server::Handle) {
+    let runtime = Arc::clone(&agent.state.runtime);
+    let result = tokio::task::spawn_blocking(move || {
+        runtime.execute(NodeJob {
+            job_id: job_id(WORK_PRODUCER_CAT, WORK_PRODUCER_GENERATION, "start_cat"),
+            cat_generation: WORK_PRODUCER_GENERATION,
+            action: NodeJobAction::StartCat {
+                cat_id: WORK_PRODUCER_CAT.into(),
+                image: "test".into(),
+                cpus: 1,
+                memory_mib: 256,
+                volumes: vec![VolumeGrant {
+                    disk_id: "root_work_producer".into(),
+                    volume_id: "vol_work_producer".into(),
+                    attachment_id: "att_work_producer".into(),
+                    epoch: 0,
+                    size_bytes: 2 * cats_api::chunk::CHUNK_SIZE as u64,
+                    mount_path: "/".into(),
+                    durability: Default::default(),
+                }],
+            },
+        })
+    })
+    .await
+    .unwrap();
+    assert_eq!(
+        result.observed_state,
+        ObservedState::Running,
+        "FakeVmm work producer did not start: {:?}",
+        result.error,
+    );
+
+    // This is the exact positive seam the removed watcher used: a Running
+    // runtime must be discoverable and its Guest must produce work status.
+    let mut targets = agent.state.runtime.activity_targets();
+    assert_eq!(
+        targets.len(),
+        1,
+        "Running Cat missing from activity targets"
+    );
+    let (cat_id, generation, connection) = targets.pop().unwrap();
+    assert_eq!(cat_id, WORK_PRODUCER_CAT);
+    assert_eq!(generation, WORK_PRODUCER_GENERATION);
+    let status = tokio::task::spawn_blocking(move || {
+        let mut guest = connection.connect()?;
+        guest.work_status(None, 0)
+    })
+    .await
+    .unwrap()
+    .unwrap();
+    assert!(!status.source_epoch.is_empty());
+}
+
+async fn stop_running_work_producer(agent: &cats_node_agent::server::Handle) {
+    let runtime = Arc::clone(&agent.state.runtime);
+    let result = tokio::task::spawn_blocking(move || {
+        runtime.execute(NodeJob {
+            job_id: job_id(WORK_PRODUCER_CAT, WORK_PRODUCER_GENERATION, "cleanup_cat"),
+            cat_generation: WORK_PRODUCER_GENERATION,
+            action: NodeJobAction::CleanupCat {
+                cat_id: WORK_PRODUCER_CAT.into(),
+            },
+        })
+    })
+    .await
+    .unwrap();
+    assert_eq!(result.observed_state, ObservedState::Cold);
+}
+
 /// A wedged upload remains bounded to its own task.
 #[tokio::test]
 async fn a_hanging_usage_upload_does_not_delay_the_heartbeat() {
@@ -260,9 +333,11 @@ async fn a_hanging_usage_upload_does_not_delay_the_heartbeat() {
 async fn usage_upload_runs_on_its_own_channel() {
     let dir = TempDirFixture::new();
     let (cp, url) = start_mock(false).await;
-    let _agent = start_agent(&dir, url).await;
+    let agent = start_agent(&dir, url).await;
+    start_running_work_producer(&agent).await;
 
     tokio::time::sleep(Duration::from_millis(HEARTBEAT_MS * 10)).await;
+    stop_running_work_producer(&agent).await;
     assert!(
         cp.usage_attempts.load(Ordering::SeqCst) >= 1,
         "decoupling must not mean the upload stops happening"
