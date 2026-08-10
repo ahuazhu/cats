@@ -92,6 +92,29 @@ fn row_versions(store: &Store) -> Vec<String> {
         .unwrap()
 }
 
+fn lineage_first_revisions(store: &Store) -> Vec<(String, i64, String)> {
+    store
+        .with(|client| {
+            client
+                .query(
+                    "SELECT credential_id, first_policy_revision, state
+                       FROM route_v2_gateway_credential_lineage
+                      ORDER BY credential_id COLLATE \"C\"",
+                    &[],
+                )?
+                .into_iter()
+                .map(|row| {
+                    Ok((
+                        row.try_get::<_, String>(0)?,
+                        row.try_get::<_, i64>(1)?,
+                        row.try_get::<_, String>(2)?,
+                    ))
+                })
+                .collect()
+        })
+        .unwrap()
+}
+
 #[test]
 fn initial_exact_replay_rotation_revocation_and_empty_disable_are_closed() {
     let store = Store::connect(&crate::testsupport::isolated_control_store_url(), None).unwrap();
@@ -107,6 +130,10 @@ fn initial_exact_replay_rotation_revocation_and_empty_disable_are_closed() {
     store
         .install_gateway_workload_identity_authority(&revision1)
         .unwrap();
+    assert_eq!(
+        lineage_first_revisions(&store),
+        vec![("gateway_a".to_owned(), 1, "active".to_owned())]
+    );
     let before_replay = row_versions(&store);
     store
         .install_gateway_workload_identity_authority(&revision1)
@@ -134,6 +161,13 @@ fn initial_exact_replay_rotation_revocation_and_empty_disable_are_closed() {
     store
         .install_gateway_workload_identity_authority(&revision2)
         .unwrap();
+    assert_eq!(
+        lineage_first_revisions(&store),
+        vec![
+            ("gateway_a".to_owned(), 1, "active".to_owned()),
+            ("gateway_b".to_owned(), 2, "active".to_owned()),
+        ]
+    );
     let principal_b = store
         .authenticate_gateway_tls_peer_for_test(&spki_digest(SPKI_B))
         .unwrap()
@@ -149,6 +183,13 @@ fn initial_exact_replay_rotation_revocation_and_empty_disable_are_closed() {
     store
         .install_gateway_workload_identity_authority(&revision3)
         .unwrap();
+    assert_eq!(
+        lineage_first_revisions(&store),
+        vec![
+            ("gateway_a".to_owned(), 1, "revoked".to_owned()),
+            ("gateway_b".to_owned(), 2, "active".to_owned()),
+        ]
+    );
     assert!(store
         .authenticate_gateway_tls_peer_for_test(&spki_digest(SPKI_A))
         .unwrap()
@@ -183,6 +224,13 @@ fn initial_exact_replay_rotation_revocation_and_empty_disable_are_closed() {
     store
         .install_gateway_workload_identity_authority(&revision4)
         .unwrap();
+    assert_eq!(
+        lineage_first_revisions(&store),
+        vec![
+            ("gateway_a".to_owned(), 1, "revoked".to_owned()),
+            ("gateway_b".to_owned(), 2, "revoked".to_owned()),
+        ]
+    );
     assert!(store
         .authenticate_gateway_tls_peer_for_test(&spki_digest(SPKI_B))
         .unwrap()
@@ -379,6 +427,23 @@ fn projection_drift_and_partial_revocation_fail_closed() {
     store
         .install_gateway_workload_identity_authority(&initial)
         .unwrap();
+    store
+        .with(|client| {
+            assert!(client
+                .execute(
+                    "UPDATE route_v2_gateway_credential_lineage
+                        SET first_policy_revision=first_policy_revision+1
+                      WHERE credential_id='gateway_a'",
+                    &[],
+                )
+                .is_err());
+            Ok(())
+        })
+        .unwrap();
+    assert_eq!(
+        lineage_first_revisions(&store),
+        vec![("gateway_a".to_owned(), 1, "active".to_owned())]
+    );
     store
         .with(|client| {
             let mut transaction = client.transaction()?;

@@ -617,7 +617,117 @@ type RequiredDeferredForeignKey = (
     &'static str,
 );
 
-const REQUIRED_CHECK_CONSTRAINTS: &[(&str, &str, &str)] = &[
+pub(super) const REQUIRED_CHECK_CONSTRAINTS: &[(&str, &str, &str)] = &[
+    (
+        "route_v2_gateway_identity_authority",
+        "route_v2_gateway_authority_singleton_ck",
+        "CHECK (singleton)",
+    ),
+    (
+        "route_v2_gateway_identity_authority",
+        "route_v2_gateway_authority_revision_ck",
+        "CHECK ((current_policy_revision > 0))",
+    ),
+    (
+        "route_v2_gateway_identity_authority",
+        "route_v2_gateway_authority_digest_ck",
+        "CHECK ((current_policy_sha256 ~ '^sha256:[0-9a-f]{64}$'::text))",
+    ),
+    (
+        "route_v2_gateway_identity_authority",
+        "route_v2_gateway_authority_first_time_ck",
+        "CHECK ((first_committed_at_unix_ms >= 0))",
+    ),
+    (
+        "route_v2_gateway_identity_revisions",
+        "route_v2_gateway_revision_revision_ck",
+        "CHECK ((policy_revision > 0))",
+    ),
+    (
+        "route_v2_gateway_identity_revisions",
+        "route_v2_gateway_revision_digest_ck",
+        "CHECK ((policy_sha256 ~ '^sha256:[0-9a-f]{64}$'::text))",
+    ),
+    (
+        "route_v2_gateway_identity_revisions",
+        "route_v2_gateway_revision_bytes_ck",
+        "CHECK (((octet_length(policy_bytes) >= 1) AND (octet_length(policy_bytes) <= 65536)))",
+    ),
+    (
+        "route_v2_gateway_identity_revisions",
+        "route_v2_gateway_revision_previous_revision_ck",
+        "CHECK ((expected_previous_policy_revision > 0))",
+    ),
+    (
+        "route_v2_gateway_identity_revisions",
+        "route_v2_gateway_revision_previous_digest_ck",
+        "CHECK ((expected_previous_policy_sha256 ~ '^sha256:[0-9a-f]{64}$'::text))",
+    ),
+    (
+        "route_v2_gateway_identity_revisions",
+        "route_v2_gateway_revision_committed_time_ck",
+        "CHECK ((committed_at_unix_ms >= 0))",
+    ),
+    (
+        "route_v2_gateway_identity_revisions",
+        "route_v2_gateway_revision_lineage_ck",
+        "CHECK ((((policy_revision = 1) AND (expected_previous_policy_revision IS NULL) AND (expected_previous_policy_sha256 IS NULL)) OR ((policy_revision > 1) AND (expected_previous_policy_revision = (policy_revision - 1)) AND (expected_previous_policy_sha256 IS NOT NULL))))",
+    ),
+    (
+        "route_v2_gateway_credential_lineage",
+        "route_v2_gateway_credential_digest_ck",
+        "CHECK ((public_key_spki_sha256 ~ '^sha256:[0-9a-f]{64}$'::text))",
+    ),
+    (
+        "route_v2_gateway_credential_lineage",
+        "route_v2_gateway_credential_state_ck",
+        "CHECK ((state = ANY (ARRAY['active'::text, 'revoked'::text])))",
+    ),
+    (
+        "route_v2_gateway_credential_lineage",
+        "route_v2_gateway_credential_first_revision_ck",
+        "CHECK ((first_policy_revision > 0))",
+    ),
+    (
+        "route_v2_gateway_credential_lineage",
+        "route_v2_gateway_credential_first_time_ck",
+        "CHECK ((first_committed_at_unix_ms >= 0))",
+    ),
+    (
+        "route_v2_gateway_credential_lineage",
+        "route_v2_gateway_credential_revoked_time_ck",
+        "CHECK (((revoked_at_unix_ms IS NULL) OR (revoked_at_unix_ms >= first_committed_at_unix_ms)))",
+    ),
+    (
+        "route_v2_gateway_credential_lineage",
+        "route_v2_gateway_credential_state_time_ck",
+        "CHECK ((((state = 'active'::text) AND (revoked_at_unix_ms IS NULL)) OR ((state = 'revoked'::text) AND (revoked_at_unix_ms IS NOT NULL))))",
+    ),
+    (
+        "route_v2_gateway_current_credentials",
+        "route_v2_gateway_current_revision_ck",
+        "CHECK ((policy_revision > 0))",
+    ),
+    (
+        "route_v2_gateway_current_credentials",
+        "route_v2_gateway_current_policy_digest_ck",
+        "CHECK ((policy_sha256 ~ '^sha256:[0-9a-f]{64}$'::text))",
+    ),
+    (
+        "route_v2_gateway_current_credentials",
+        "route_v2_gateway_current_spki_digest_ck",
+        "CHECK ((public_key_spki_sha256 ~ '^sha256:[0-9a-f]{64}$'::text))",
+    ),
+    (
+        "route_v2_gateway_current_credentials",
+        "route_v2_gateway_current_scope_ck",
+        "CHECK ((jsonb_typeof(scope) = 'object'::text))",
+    ),
+    (
+        "route_v2_gateway_current_credentials",
+        "route_v2_gateway_current_state_ck",
+        "CHECK ((lineage_state = 'active'::text))",
+    ),
     (
         "runtime_node_placement_policies",
         "runtime_node_placement_policies_node_transport_target_check",
@@ -727,6 +837,15 @@ const REQUIRED_DEFERRED_FOREIGN_KEYS: &[RequiredDeferredForeignKey] = &[
         "authority_id,fleet_id,current_policy_revision,current_policy_sha256",
         "a",
         "a",
+    ),
+    (
+        "route_v2_gateway_credential_lineage",
+        "route_v2_gateway_credential_first_revision_fkey",
+        "route_v2_gateway_identity_revisions",
+        "authority_id,first_policy_revision",
+        "authority_id,policy_revision",
+        "r",
+        "r",
     ),
     (
         "route_v2_gateway_current_credentials",
@@ -958,7 +1077,7 @@ const REQUIRED_IMMUTABILITY_TRIGGERS: &[(&str, &str, &str, i16, &str)] = &[
         "route_v2_gateway_credential_update",
         "control_route_v2_gateway_credential_update",
         BEFORE_ROW_UPDATE,
-        "783e4594fc9bb232e0b699f053728a13b76515985a037b1ef37c88ec582bd350",
+        "1fcef7a6e0026d0c3ee3715baa8011a1c751ccc6b1ce371005dc6881b9d5006f",
     ),
     (
         "route_v2_gateway_credential_lineage",
@@ -1112,7 +1231,8 @@ const AUTHORITY_SCHEMA_PROBES: &[&str] = &[
             expected_previous_policy_sha256, committed_at_unix_ms
        FROM route_v2_gateway_identity_revisions WHERE FALSE",
     "SELECT credential_id, authority_id, public_key_spki,
-            public_key_spki_sha256, state, first_committed_at_unix_ms,
+            public_key_spki_sha256, state, first_policy_revision,
+            first_committed_at_unix_ms,
             revoked_at_unix_ms
        FROM route_v2_gateway_credential_lineage WHERE FALSE",
     "SELECT credential_id, authority_id, fleet_id, policy_revision,
@@ -1819,13 +1939,19 @@ CREATE TABLE IF NOT EXISTS runtime_provisioner_credential_lineage (
            (state = 'retired' AND retired_at_unix_ms IS NOT NULL))
 );
 CREATE TABLE IF NOT EXISTS route_v2_gateway_identity_authority (
-    singleton BOOLEAN PRIMARY KEY DEFAULT TRUE CHECK (singleton),
+    singleton BOOLEAN PRIMARY KEY DEFAULT TRUE
+        CONSTRAINT route_v2_gateway_authority_singleton_ck CHECK (singleton),
     authority_id TEXT NOT NULL UNIQUE,
     fleet_id TEXT NOT NULL,
-    current_policy_revision BIGINT NOT NULL CHECK (current_policy_revision > 0),
+    current_policy_revision BIGINT NOT NULL
+        CONSTRAINT route_v2_gateway_authority_revision_ck
+        CHECK (current_policy_revision > 0),
     current_policy_sha256 TEXT NOT NULL
+        CONSTRAINT route_v2_gateway_authority_digest_ck
         CHECK (current_policy_sha256 ~ '^sha256:[0-9a-f]{64}$'),
-    first_committed_at_unix_ms BIGINT NOT NULL CHECK (first_committed_at_unix_ms >= 0),
+    first_committed_at_unix_ms BIGINT NOT NULL
+        CONSTRAINT route_v2_gateway_authority_first_time_ck
+        CHECK (first_committed_at_unix_ms >= 0),
     CONSTRAINT route_v2_gateway_identity_authority_authority_id_fleet_id_key
         UNIQUE (authority_id, fleet_id),
     CONSTRAINT route_v2_gateway_identity_authority_current_key
@@ -1834,20 +1960,28 @@ CREATE TABLE IF NOT EXISTS route_v2_gateway_identity_authority (
 CREATE TABLE IF NOT EXISTS route_v2_gateway_identity_revisions (
     authority_id TEXT NOT NULL,
     fleet_id TEXT NOT NULL,
-    policy_revision BIGINT NOT NULL CHECK (policy_revision > 0),
+    policy_revision BIGINT NOT NULL
+        CONSTRAINT route_v2_gateway_revision_revision_ck
+        CHECK (policy_revision > 0),
     policy_sha256 TEXT NOT NULL
+        CONSTRAINT route_v2_gateway_revision_digest_ck
         CHECK (policy_sha256 ~ '^sha256:[0-9a-f]{64}$'),
     policy_bytes BYTEA NOT NULL
+        CONSTRAINT route_v2_gateway_revision_bytes_ck
         CHECK (octet_length(policy_bytes) BETWEEN 1 AND 65536),
     expected_previous_policy_revision BIGINT NULL
+        CONSTRAINT route_v2_gateway_revision_previous_revision_ck
         CHECK (expected_previous_policy_revision > 0),
     expected_previous_policy_sha256 TEXT NULL
+        CONSTRAINT route_v2_gateway_revision_previous_digest_ck
         CHECK (expected_previous_policy_sha256 ~ '^sha256:[0-9a-f]{64}$'),
-    committed_at_unix_ms BIGINT NOT NULL CHECK (committed_at_unix_ms >= 0),
+    committed_at_unix_ms BIGINT NOT NULL
+        CONSTRAINT route_v2_gateway_revision_committed_time_ck
+        CHECK (committed_at_unix_ms >= 0),
     PRIMARY KEY (authority_id, policy_revision),
     CONSTRAINT route_v2_gateway_identity_revisions_exact_key
         UNIQUE (authority_id, fleet_id, policy_revision, policy_sha256),
-    CHECK (
+    CONSTRAINT route_v2_gateway_revision_lineage_ck CHECK (
         (policy_revision = 1 AND expected_previous_policy_revision IS NULL
             AND expected_previous_policy_sha256 IS NULL) OR
         (policy_revision > 1
@@ -1873,32 +2007,54 @@ CREATE TABLE IF NOT EXISTS route_v2_gateway_credential_lineage (
         ON UPDATE RESTRICT ON DELETE RESTRICT,
     public_key_spki TEXT NOT NULL,
     public_key_spki_sha256 TEXT NOT NULL
+        CONSTRAINT route_v2_gateway_credential_digest_ck
         CHECK (public_key_spki_sha256 ~ '^sha256:[0-9a-f]{64}$'),
-    state TEXT NOT NULL CHECK (state IN ('active', 'revoked')),
-    first_committed_at_unix_ms BIGINT NOT NULL CHECK (first_committed_at_unix_ms >= 0),
-    revoked_at_unix_ms BIGINT NULL CHECK (
+    state TEXT NOT NULL
+        CONSTRAINT route_v2_gateway_credential_state_ck
+        CHECK (state IN ('active', 'revoked')),
+    first_policy_revision BIGINT NOT NULL
+        CONSTRAINT route_v2_gateway_credential_first_revision_ck
+        CHECK (first_policy_revision > 0),
+    first_committed_at_unix_ms BIGINT NOT NULL
+        CONSTRAINT route_v2_gateway_credential_first_time_ck
+        CHECK (first_committed_at_unix_ms >= 0),
+    revoked_at_unix_ms BIGINT NULL
+        CONSTRAINT route_v2_gateway_credential_revoked_time_ck CHECK (
         revoked_at_unix_ms IS NULL OR
         revoked_at_unix_ms >= first_committed_at_unix_ms),
-    CHECK ((state = 'active' AND revoked_at_unix_ms IS NULL) OR
+    CONSTRAINT route_v2_gateway_credential_state_time_ck
+        CHECK ((state = 'active' AND revoked_at_unix_ms IS NULL) OR
            (state = 'revoked' AND revoked_at_unix_ms IS NOT NULL)),
     CONSTRAINT route_v2_gateway_credential_lineage_spki_key
         UNIQUE (public_key_spki),
     CONSTRAINT route_v2_gateway_credential_lineage_spki_sha256_key
         UNIQUE (public_key_spki_sha256),
     CONSTRAINT route_v2_gateway_credential_lineage_exact_key
-        UNIQUE (credential_id, authority_id, public_key_spki_sha256, state)
+        UNIQUE (credential_id, authority_id, public_key_spki_sha256, state),
+    CONSTRAINT route_v2_gateway_credential_first_revision_fkey
+        FOREIGN KEY (authority_id, first_policy_revision)
+        REFERENCES route_v2_gateway_identity_revisions(authority_id, policy_revision)
+        ON UPDATE RESTRICT ON DELETE RESTRICT DEFERRABLE INITIALLY DEFERRED
 );
 CREATE TABLE IF NOT EXISTS route_v2_gateway_current_credentials (
     credential_id TEXT PRIMARY KEY,
     authority_id TEXT NOT NULL,
     fleet_id TEXT NOT NULL,
-    policy_revision BIGINT NOT NULL CHECK (policy_revision > 0),
+    policy_revision BIGINT NOT NULL
+        CONSTRAINT route_v2_gateway_current_revision_ck
+        CHECK (policy_revision > 0),
     policy_sha256 TEXT NOT NULL
+        CONSTRAINT route_v2_gateway_current_policy_digest_ck
         CHECK (policy_sha256 ~ '^sha256:[0-9a-f]{64}$'),
     public_key_spki_sha256 TEXT NOT NULL
+        CONSTRAINT route_v2_gateway_current_spki_digest_ck
         CHECK (public_key_spki_sha256 ~ '^sha256:[0-9a-f]{64}$'),
-    scope JSONB NOT NULL CHECK (jsonb_typeof(scope) = 'object'),
-    lineage_state TEXT NOT NULL CHECK (lineage_state = 'active'),
+    scope JSONB NOT NULL
+        CONSTRAINT route_v2_gateway_current_scope_ck
+        CHECK (jsonb_typeof(scope) = 'object'),
+    lineage_state TEXT NOT NULL
+        CONSTRAINT route_v2_gateway_current_state_ck
+        CHECK (lineage_state = 'active'),
     CONSTRAINT route_v2_gateway_current_policy_fkey
         FOREIGN KEY (authority_id, fleet_id, policy_revision, policy_sha256)
         REFERENCES route_v2_gateway_identity_authority(
@@ -2136,6 +2292,7 @@ BEGIN
        OR NEW.authority_id IS DISTINCT FROM OLD.authority_id
        OR NEW.public_key_spki IS DISTINCT FROM OLD.public_key_spki
        OR NEW.public_key_spki_sha256 IS DISTINCT FROM OLD.public_key_spki_sha256
+       OR NEW.first_policy_revision IS DISTINCT FROM OLD.first_policy_revision
        OR NEW.first_committed_at_unix_ms IS DISTINCT FROM OLD.first_committed_at_unix_ms
        OR OLD.state = 'revoked'
        OR OLD.state <> 'active'

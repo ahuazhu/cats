@@ -1200,6 +1200,87 @@ fn refuses_missing_or_weakened_volume_owner_constraints_without_repair() {
 }
 
 #[test]
+fn gateway_check_constraints_are_exact_and_current_stamp_rejects_drift() {
+    let url = crate::testsupport::isolated_control_store_url();
+    drop(Store::connect(&url, None).unwrap());
+    let mut admin = postgres::Client::connect(&url, postgres::NoTls).unwrap();
+    let gateway_constraints = super::schema::REQUIRED_CHECK_CONSTRAINTS
+        .iter()
+        .filter(|(table, _, _)| table.starts_with("route_v2_gateway_"))
+        .collect::<Vec<_>>();
+    assert_eq!(gateway_constraints.len(), 22);
+    for (table, constraint, expected_definition) in gateway_constraints {
+        let definition: String = admin
+            .query_one(
+                "SELECT pg_get_constraintdef(catalog_constraint.oid, FALSE)
+                   FROM pg_constraint catalog_constraint
+                   JOIN pg_class source ON source.oid=catalog_constraint.conrelid
+                   JOIN pg_namespace source_namespace
+                     ON source_namespace.oid=source.relnamespace
+                  WHERE source_namespace.nspname=current_schema()
+                    AND source.relname=$1 AND catalog_constraint.conname=$2",
+                &[table, constraint],
+            )
+            .unwrap()
+            .get(0);
+        assert_eq!(&definition, expected_definition, "{constraint}");
+    }
+
+    for (constraint, ddl, expected_definition) in [
+        (
+            "route_v2_gateway_credential_first_revision_ck",
+            "ALTER TABLE route_v2_gateway_credential_lineage
+                 DROP CONSTRAINT route_v2_gateway_credential_first_revision_ck",
+            None,
+        ),
+        (
+            "route_v2_gateway_current_scope_ck",
+            "ALTER TABLE route_v2_gateway_current_credentials
+                 DROP CONSTRAINT route_v2_gateway_current_scope_ck;
+             ALTER TABLE route_v2_gateway_current_credentials
+                 ADD CONSTRAINT route_v2_gateway_current_scope_ck
+                 CHECK (scope IS NOT NULL)",
+            Some("scope IS NOT NULL"),
+        ),
+    ] {
+        let drift_url = crate::testsupport::isolated_control_store_url();
+        drop(Store::connect(&drift_url, None).unwrap());
+        let mut drift_admin = postgres::Client::connect(&drift_url, postgres::NoTls).unwrap();
+        drift_admin.batch_execute(ddl).unwrap();
+        let Err(error) = Store::connect(&drift_url, None) else {
+            panic!("a current stamp with changed {constraint} must fail closed");
+        };
+        assert_eq!(error.code, ErrorCode::FailedPrecondition);
+        assert!(error.to_string().contains(constraint), "{error}");
+        let definition: Option<String> = drift_admin
+            .query_opt(
+                "SELECT pg_get_constraintdef(catalog_constraint.oid, FALSE)
+                   FROM pg_constraint catalog_constraint
+                   JOIN pg_class source ON source.oid=catalog_constraint.conrelid
+                   JOIN pg_namespace source_namespace
+                     ON source_namespace.oid=source.relnamespace
+                  WHERE source_namespace.nspname=current_schema()
+                    AND catalog_constraint.conname=$1",
+                &[&constraint],
+            )
+            .unwrap()
+            .map(|row| row.get(0));
+        match expected_definition {
+            Some(fragment) => assert!(
+                definition
+                    .as_deref()
+                    .is_some_and(|value| value.contains(fragment)),
+                "startup repaired the weakened constraint: {definition:?}"
+            ),
+            None => assert!(
+                definition.is_none(),
+                "startup recreated the dropped constraint: {definition:?}"
+            ),
+        }
+    }
+}
+
+#[test]
 fn refuses_missing_or_replaced_volume_primary_key_without_repair() {
     for (ddl, expected_index_fragment) in [
         (

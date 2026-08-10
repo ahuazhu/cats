@@ -48,6 +48,7 @@ struct GatewayCredentialLineageRow {
     public_key_spki: Base64UrlNoPad,
     public_key_spki_sha256: Sha256Digest,
     state: String,
+    first_policy_revision: Epoch,
 }
 
 impl GatewayCredentialLineageRow {
@@ -61,6 +62,7 @@ impl GatewayCredentialLineageRow {
             return Err(corrupt("stored Gateway SPKI digest mismatch"));
         }
         let state = closed_text(row.try_get("state")?, &["active", "revoked"])?;
+        let first_policy_revision: Epoch = from_pg(row.try_get("first_policy_revision")?)?;
         let first_committed_at: UnixMillis = from_pg(row.try_get("first_committed_at_unix_ms")?)?;
         let revoked_at: Option<UnixMillis> = optional_from_pg(row.try_get("revoked_at_unix_ms")?)?;
         if (state == "active" && revoked_at.is_some())
@@ -73,6 +75,7 @@ impl GatewayCredentialLineageRow {
             public_key_spki,
             public_key_spki_sha256: persisted,
             state,
+            first_policy_revision,
         })
     }
 }
@@ -266,6 +269,7 @@ fn install_gateway_authority_in(
         admit_gateway_credential(
             transaction,
             &authority.authority_id,
+            authority.policy_revision,
             candidate,
             committed_at_pg,
         )?;
@@ -371,6 +375,7 @@ fn insert_initial_gateway_authority(
         admit_gateway_credential(
             transaction,
             &authority.authority_id,
+            authority.policy_revision,
             credential,
             committed_at_pg,
         )?;
@@ -382,14 +387,17 @@ fn insert_initial_gateway_authority(
 fn admit_gateway_credential(
     transaction: &mut Transaction<'_>,
     authority_id: &Id,
+    policy_revision: Epoch,
     candidate: &GatewayWorkloadCredentialPolicy,
     committed_at_pg: i64,
 ) -> AuthorityTxResult<()> {
+    let policy_revision_pg = policy_revision.to_pg().map_err(corrupt)?;
     let digest = canonical_ed25519_spki_sha256(&candidate.public_key_spki)
         .ok_or_else(|| corrupt("validated Gateway SPKI became invalid"))?;
     let matching = transaction.query(
         "SELECT credential_id, authority_id, public_key_spki,
-                public_key_spki_sha256, state, first_committed_at_unix_ms,
+                public_key_spki_sha256, state, first_policy_revision,
+                first_committed_at_unix_ms,
                 revoked_at_unix_ms
            FROM route_v2_gateway_credential_lineage
           WHERE credential_id=$1 OR public_key_spki=$2 OR public_key_spki_sha256=$3
@@ -405,13 +413,15 @@ fn admit_gateway_credential(
             "INSERT INTO route_v2_gateway_credential_lineage (
                 credential_id, authority_id, public_key_spki,
                 public_key_spki_sha256, state,
-                first_committed_at_unix_ms, revoked_at_unix_ms
-             ) VALUES ($1, $2, $3, $4, 'active', $5, NULL)",
+                first_policy_revision, first_committed_at_unix_ms,
+                revoked_at_unix_ms
+             ) VALUES ($1, $2, $3, $4, 'active', $5, $6, NULL)",
             &[
                 &candidate.credential_id.as_str(),
                 &authority_id.as_str(),
                 &candidate.public_key_spki.as_str(),
                 &digest.as_str(),
+                &policy_revision_pg,
                 &committed_at_pg,
             ],
         )?)?;
@@ -427,6 +437,7 @@ fn admit_gateway_credential(
         || stored.public_key_spki != candidate.public_key_spki
         || stored.public_key_spki_sha256 != digest
         || stored.state != "active"
+        || stored.first_policy_revision > policy_revision
     {
         return Err(rejected("Gateway credential lineage cannot be reused"));
     }
@@ -582,7 +593,8 @@ fn validate_current_gateway_projections(
     )?;
     let lineage_rows = transaction.query(
         "SELECT credential_id, authority_id, public_key_spki,
-                public_key_spki_sha256, state, first_committed_at_unix_ms,
+                public_key_spki_sha256, state, first_policy_revision,
+                first_committed_at_unix_ms,
                 revoked_at_unix_ms
            FROM route_v2_gateway_credential_lineage
           WHERE state='active' ORDER BY credential_id COLLATE \"C\"",
@@ -613,6 +625,7 @@ fn validate_current_gateway_projections(
         let expected_spki_digest = canonical_ed25519_spki_sha256(&expected.public_key_spki)
             .ok_or_else(|| corrupt("validated current Gateway SPKI became invalid"))?;
         if lineage_authority != pointer.authority_id
+            || lineage.first_policy_revision > pointer.policy_revision
             || lineage.credential_id != expected.credential_id
             || lineage.public_key_spki != expected.public_key_spki
             || lineage.public_key_spki_sha256 != expected_spki_digest
