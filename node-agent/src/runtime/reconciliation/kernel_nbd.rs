@@ -26,7 +26,7 @@ use cats_api::runtime_reconciliation::{
 use crate::runtime_spine::{RuntimeDesiredEffectContext, RuntimePhysicalReadContext};
 use crate::state_directory::StateDirectory;
 
-use super::checkpoint::{FileCheckpointStore, StoredCheckpoint};
+use super::checkpoint::{revalidate_checkpoint_namespace, FileCheckpointStore, StoredCheckpoint};
 use super::clean_slate_probes::{
     snapshot_runtime_checkpoint_namespace, RuntimeCheckpointNamespaceSnapshot,
     CHECKPOINT_NAMESPACE, RUNTIME_CHECKPOINT_NAMESPACE_ENTRY_LIMIT,
@@ -298,19 +298,18 @@ impl KernelNbdAllocationPermit {
         snapshot: &RuntimeCheckpointNamespaceSnapshot,
         store: &FileCheckpointStore,
     ) -> Result<()> {
-        let current = reopen_checkpoint_namespace(&self.state_root)?;
-        validate_checkpoint_namespace(&self.state_root, snapshot.retained_directory())?;
-        validate_checkpoint_namespace(&self.state_root, store.retained_directory())?;
         ensure_same_directory(
             snapshot.retained_directory(),
             store.retained_directory(),
             "kernel-NBD snapshot and checkpoint store use different directories",
         )?;
-        ensure_same_directory(
-            snapshot.retained_directory(),
-            &current,
-            "kernel-NBD checkpoint namespace pathname changed during reservation",
+        revalidate_checkpoint_namespace(
+            &self.state_root,
+            CHECKPOINT_NAMESPACE,
+            &[snapshot.retained_directory(), store.retained_directory()],
         )
+        .context("kernel-NBD checkpoint namespace pathname changed during reservation")
+        .map(|_| ())
     }
 
     fn assert_current_publication_paths(
@@ -708,36 +707,6 @@ fn ensure_same_allocation_lock(left: &File, right: &File) -> Result<()> {
         "kernel-NBD allocation lock pathname changed while locked"
     );
     Ok(())
-}
-
-fn reopen_checkpoint_namespace(state_root: &File) -> Result<File> {
-    let name = CString::new(CHECKPOINT_NAMESPACE).expect("fixed namespace has no NUL");
-    let directory = open_at(
-        state_root,
-        &name,
-        libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC | libc::O_NONBLOCK,
-        0,
-    )
-    .context("reopen current kernel-NBD checkpoint namespace")?;
-    validate_checkpoint_namespace(state_root, &directory)?;
-    Ok(directory)
-}
-
-fn validate_checkpoint_namespace(state_root: &File, directory: &File) -> Result<Metadata> {
-    let root = state_root
-        .metadata()
-        .context("inspect retained kernel-NBD state root")?;
-    let metadata = directory
-        .metadata()
-        .context("inspect retained kernel-NBD checkpoint namespace")?;
-    anyhow::ensure!(
-        root.is_dir()
-            && metadata.is_dir()
-            && metadata.uid() == root.uid()
-            && metadata.mode() & 0o022 == 0,
-        "kernel-NBD checkpoint namespace has unsafe owner or mode"
-    );
-    Ok(metadata)
 }
 
 fn ensure_same_directory(left: &File, right: &File, mismatch: &'static str) -> Result<()> {

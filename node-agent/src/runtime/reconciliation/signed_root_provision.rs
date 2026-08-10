@@ -2150,7 +2150,7 @@ mod tests {
             )
             .unwrap();
             let prepare_device = ServingPrepareDeviceEffect::new(
-                ServingPrepareFrontend::vhost_user_blk(2, 256).unwrap(),
+                ServingPrepareFrontend::vhost_user_blk(64, 256).unwrap(),
                 executable_path,
             )
             .unwrap();
@@ -2468,10 +2468,16 @@ mod tests {
             serving_authority.as_ref(),
             cats_api::runtime_reconciliation::ServingAuthorityProvenance::AfterRootProvision { .. }
         ));
-        assert!(matches!(
-            frontend,
-            cats_api::runtime_reconciliation::PrepareDeviceFrontend::VhostUserBlk { .. }
-        ));
+        let cats_api::runtime_reconciliation::PrepareDeviceFrontend::VhostUserBlk {
+            queues,
+            queue_size,
+            ..
+        } = frontend
+        else {
+            panic!("production PrepareDevice must select vhost-user-blk")
+        };
+        assert_eq!(*queues, fixture.desired.runtime.vcpus as u16);
+        assert_eq!(*queue_size, 256);
         assert_eq!(request.calls.load(Ordering::SeqCst), 0);
         assert_eq!(process.starts.load(Ordering::SeqCst), 0);
         assert_eq!(mutations.calls.load(Ordering::SeqCst), 0);
@@ -2493,6 +2499,128 @@ mod tests {
         assert_eq!(request.calls.load(Ordering::SeqCst), 0);
         assert_eq!(process.starts.load(Ordering::SeqCst), 0);
         assert_eq!(mutations.calls.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn vhost_queue_maximum_obeys_the_shared_one_through_sixty_four_contract() {
+        assert!(ServingPrepareFrontend::vhost_user_blk(0, 256).is_err());
+        assert!(ServingPrepareFrontend::vhost_user_blk(65, 256).is_err());
+        assert!(ServingPrepareFrontend::vhost_user_blk(64, 256).is_ok());
+    }
+
+    #[test]
+    fn vhost_prepare_device_rejects_checkpoint_namespace_aba_before_and_after_publication() {
+        for after_publication in [false, true] {
+            let fixture = Fixture::new();
+            let ReconcileStep::ProvisionRootImage {
+                expected_provisioned_head,
+                ..
+            } = &fixture.checkpoint.step
+            else {
+                unreachable!()
+            };
+            fixture
+                .authority
+                .set_head(expected_provisioned_head.clone());
+            let process = Arc::new(FakeProcessPort::exact(41, 42));
+            let retirement = Arc::new(FakeRetirementPort::exact());
+            let request = Arc::new(FakeRequestPort {
+                authority: Arc::clone(&fixture.authority),
+                calls: AtomicUsize::new(0),
+                conflict: false,
+                mutate_owner: false,
+                connect_failure: false,
+                identity_mismatch: false,
+            });
+            let mutations = Arc::new(NoSignedMutationPort::default());
+            let mut dispatcher = fixture.dispatcher_with_retirement(
+                Arc::clone(&process),
+                Arc::clone(&retirement),
+                Arc::clone(&request),
+                Arc::clone(&mutations),
+            );
+
+            // Publish the target-control wrapper and sealed handoff in their
+            // own two accepted full-inventory rounds.
+            for (inventory_epoch, read_position) in [(4, 12), (5, 13)] {
+                assert_eq!(
+                    dispatcher
+                        .apply(
+                            fixture.context_at(
+                                vec![fixture.public_process()],
+                                inventory_epoch,
+                                read_position,
+                            ),
+                            &fixture.desired,
+                        )
+                        .unwrap(),
+                    RuntimeDesiredEffectOutcome::RefreshInventory
+                );
+            }
+
+            let checkpoint_directory = fixture.state.path().join(CHECKPOINT_NAMESPACE);
+            let detached_directory = fixture.state.path().join(if after_publication {
+                "checkpoints-post-publication-detached"
+            } else {
+                "checkpoints-pre-publication-detached"
+            });
+            let mode = std::fs::metadata(&checkpoint_directory)
+                .unwrap()
+                .permissions()
+                .mode();
+            let hook_checkpoint_directory = checkpoint_directory.clone();
+            let hook_detached_directory = detached_directory.clone();
+            let hook = Arc::new(move || {
+                std::fs::rename(&hook_checkpoint_directory, &hook_detached_directory).unwrap();
+                std::fs::create_dir(&hook_checkpoint_directory).unwrap();
+                std::fs::set_permissions(
+                    &hook_checkpoint_directory,
+                    std::fs::Permissions::from_mode(mode),
+                )
+                .unwrap();
+            });
+            let executable = HostPath::new("/usr/bin/cats-blockd".to_owned()).unwrap();
+            let prepare = ServingPrepareDeviceEffect::new(
+                ServingPrepareFrontend::vhost_user_blk(64, 256).unwrap(),
+                executable,
+            )
+            .unwrap();
+            dispatcher.prepare_device = if after_publication {
+                prepare.with_after_replace(hook)
+            } else {
+                prepare.with_before_replace(hook)
+            };
+
+            let error = dispatcher
+                .apply(
+                    fixture.context_at(vec![fixture.public_process()], 6, 14),
+                    &fixture.desired,
+                )
+                .unwrap_err();
+            assert!(
+                format!("{error:#}").contains(
+                    "retained checkpoint namespace is no longer the current lexical directory"
+                ),
+                "unexpected error: {error:#}"
+            );
+            let detached = FileCheckpointStore::open(&detached_directory, &fixture.desired.cat_id)
+                .unwrap()
+                .load()
+                .unwrap()
+                .unwrap();
+            assert_eq!(
+                matches!(detached.checkpoint().step, ReconcileStep::PrepareDevice { .. }),
+                after_publication,
+                "pre-publication ABA must retain the predecessor; post-publication ABA may durably publish only in the detached directory but must not return success"
+            );
+            assert!(!super::super::runtime_checkpoint_path(
+                &checkpoint_directory,
+                &fixture.desired.cat_id,
+            )
+            .exists());
+            assert_eq!(request.calls.load(Ordering::SeqCst), 0);
+            assert_eq!(mutations.calls.load(Ordering::SeqCst), 0);
+        }
     }
 
     #[test]

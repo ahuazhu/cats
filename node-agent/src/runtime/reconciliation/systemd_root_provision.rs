@@ -269,22 +269,49 @@ where
     ) -> anyhow::Result<RootProvisionProcessStop> {
         context.check_active()?;
         let expected = exact.expectation();
-        let launch = self.launch(expected)?;
-        match self.inspect_exact(expected, &launch, context)? {
-            RootProvisionProcessInspection::Exact(current) if *current == *exact.evidence() => {}
-            RootProvisionProcessInspection::Absent => {
-                return Ok(RootProvisionProcessStop::AlreadyAbsent)
-            }
-            RootProvisionProcessInspection::Unavailable => {
-                return Ok(RootProvisionProcessStop::Unavailable)
-            }
-            RootProvisionProcessInspection::Exact(_)
-            | RootProvisionProcessInspection::Conflict(_) => {
-                return Ok(RootProvisionProcessStop::Conflict(
-                    RootProvisionProcessConflict::IdentityMismatch,
-                ))
+        let blank = self.launch(expected)?;
+        let target = expected
+            .target_control_launch()
+            .map(|target| self.target_launch(expected, target))
+            .transpose()?;
+        let launch_count = usize::from(target.is_some()) + 1;
+        let mut absent_count = 0_usize;
+        let mut saw_unavailable = false;
+        let mut saw_foreign_exact = false;
+        let mut selected = None;
+        for launch in std::iter::once(blank).chain(target) {
+            match self.inspect_exact(expected, &launch, context)? {
+                RootProvisionProcessInspection::Exact(current) if *current == *exact.evidence() => {
+                    if selected.replace(launch).is_some() {
+                        return Ok(RootProvisionProcessStop::Conflict(
+                            RootProvisionProcessConflict::IdentityMismatch,
+                        ));
+                    }
+                }
+                RootProvisionProcessInspection::Exact(_) => saw_foreign_exact = true,
+                RootProvisionProcessInspection::Absent => absent_count += 1,
+                RootProvisionProcessInspection::Unavailable => saw_unavailable = true,
+                // The other allowed launch normally sees an argv conflict.
+                // It is safe to ignore only after the entire closed union has
+                // produced one unique exact physical match.
+                RootProvisionProcessInspection::Conflict(_) => {}
             }
         }
+        if saw_unavailable {
+            return Ok(RootProvisionProcessStop::Unavailable);
+        }
+        if saw_foreign_exact {
+            return Ok(RootProvisionProcessStop::Conflict(
+                RootProvisionProcessConflict::IdentityMismatch,
+            ));
+        }
+        let Some(launch) = selected else {
+            return Ok(if absent_count == launch_count {
+                RootProvisionProcessStop::AlreadyAbsent
+            } else {
+                RootProvisionProcessStop::Conflict(RootProvisionProcessConflict::IdentityMismatch)
+            });
+        };
         Ok(
             match self
                 .systemd
@@ -1597,7 +1624,9 @@ mod tests {
     struct FakeSystemd {
         inspections: Mutex<VecDeque<SystemdInspection>>,
         submissions: Mutex<Vec<SystemdStartSubmission>>,
+        stop_submissions: Mutex<Vec<SystemdStopSubmission>>,
         launches: Mutex<Vec<TransientServiceLaunch>>,
+        stops: Mutex<Vec<TransientServiceLaunch>>,
     }
 
     impl SystemdTransientServicePort for Arc<FakeSystemd> {
@@ -1627,6 +1656,21 @@ mod tests {
                 .unwrap()
                 .pop()
                 .unwrap_or(SystemdStartSubmission::DefinitelyNotStarted))
+        }
+
+        fn stop_exact(
+            &self,
+            launch: &TransientServiceLaunch,
+            _evidence: &RootProvisionProcessEvidence,
+            _context: &RuntimeDesiredEffectContext,
+        ) -> anyhow::Result<SystemdStopSubmission> {
+            self.stops.lock().unwrap().push(launch.clone());
+            Ok(self
+                .stop_submissions
+                .lock()
+                .unwrap()
+                .pop()
+                .unwrap_or(SystemdStopSubmission::Unavailable))
         }
     }
 
@@ -1778,6 +1822,102 @@ mod tests {
                 RootProvisionProcessConflict::IdentityMismatch
             )
         ));
+    }
+
+    #[test]
+    fn exact_target_wrapper_stop_uses_the_wrapper_launch_not_blank_authorization() {
+        let expected = target_expectation();
+        let exact_evidence = target_evidence();
+        let exact = expected
+            .clone()
+            .prove_exact_process(exact_evidence)
+            .unwrap();
+        let process = proof();
+        let systemd = Arc::new(FakeSystemd::default());
+        systemd.inspections.lock().unwrap().extend([
+            // The installed unit carries the target wrapper argv, so the
+            // blank launch is outside this physical instance.
+            SystemdInspection::Conflict,
+            SystemdInspection::Exact(process.clone()),
+            SystemdInspection::Exact(process),
+        ]);
+        systemd
+            .stop_submissions
+            .lock()
+            .unwrap()
+            .push(SystemdStopSubmission::Submitted);
+        let handshake = Arc::new(FakeHandshake::default());
+        handshake
+            .inspections
+            .lock()
+            .unwrap()
+            .push_back(target_verified_handshake());
+        let port = SystemdRootProvisionProcessPort::new(config(), systemd.clone(), handshake);
+
+        assert_eq!(
+            port.stop_exact(exact, &context()).unwrap(),
+            RootProvisionProcessStop::Submitted
+        );
+        let stops = systemd.stops.lock().unwrap();
+        assert_eq!(stops.len(), 1);
+        assert!(stops[0]
+            .arguments
+            .contains(&OsString::from("--authorized-target-control-spec")));
+        assert!(!stops[0]
+            .arguments
+            .contains(&OsString::from("--authorized-control-spec")));
+    }
+
+    #[test]
+    fn foreign_or_duplicate_allowed_launch_evidence_never_submits_a_stop() {
+        for duplicate in [false, true] {
+            let expected = target_expectation();
+            let exact = expected
+                .clone()
+                .prove_exact_process(target_evidence())
+                .unwrap();
+            let systemd = Arc::new(FakeSystemd::default());
+            let handshake = Arc::new(FakeHandshake::default());
+            if duplicate {
+                let process = proof();
+                systemd.inspections.lock().unwrap().extend([
+                    SystemdInspection::Exact(process.clone()),
+                    SystemdInspection::Exact(process.clone()),
+                    SystemdInspection::Exact(process.clone()),
+                    SystemdInspection::Exact(process),
+                ]);
+                handshake
+                    .inspections
+                    .lock()
+                    .unwrap()
+                    .extend([target_verified_handshake(), target_verified_handshake()]);
+            } else {
+                let mut foreign = proof();
+                foreign.process_start_time_ticks += 1;
+                systemd.inspections.lock().unwrap().extend([
+                    SystemdInspection::Conflict,
+                    SystemdInspection::Exact(foreign.clone()),
+                    SystemdInspection::Exact(foreign),
+                ]);
+                handshake
+                    .inspections
+                    .lock()
+                    .unwrap()
+                    .push_back(target_verified_handshake());
+            }
+            systemd
+                .stop_submissions
+                .lock()
+                .unwrap()
+                .push(SystemdStopSubmission::Submitted);
+            let port = SystemdRootProvisionProcessPort::new(config(), systemd.clone(), handshake);
+
+            assert_eq!(
+                port.stop_exact(exact, &context()).unwrap(),
+                RootProvisionProcessStop::Conflict(RootProvisionProcessConflict::IdentityMismatch)
+            );
+            assert!(systemd.stops.lock().unwrap().is_empty());
+        }
     }
 
     #[test]
@@ -2489,6 +2629,20 @@ mod tests {
             ownership_token: random('4'),
             handshake,
         }
+    }
+
+    fn target_evidence() -> RootProvisionProcessEvidence {
+        let expected = target_expectation();
+        let BlockdHandshakeInspection::Verified {
+            peer_process_id,
+            status,
+        } = target_verified_handshake()
+        else {
+            unreachable!()
+        };
+        let mut evidence = evidence();
+        evidence.handshake = exact_handshake(&expected, peer_process_id, &status).unwrap();
+        evidence
     }
 
     fn verified_handshake(peer_process_id: u32) -> BlockdHandshakeInspection {

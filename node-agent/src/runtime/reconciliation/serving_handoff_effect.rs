@@ -32,6 +32,7 @@ use crate::ch::effective_vhost_user_queues;
 use crate::runtime_spine::RuntimeDesiredEffectContext;
 use crate::state_directory::StateDirectory;
 
+use super::checkpoint::revalidate_checkpoint_namespace;
 use super::clean_slate_probes::CHECKPOINT_NAMESPACE;
 #[cfg(target_os = "linux")]
 use super::kernel_nbd::{KernelNbdInventoryConfig, KernelNbdInventoryPort};
@@ -102,12 +103,10 @@ impl ServingPrepareFrontend {
     }
 
     pub(crate) fn vhost_user_blk(maximum_queues: usize, queue_size: u16) -> anyhow::Result<Self> {
-        anyhow::ensure!(
-            maximum_queues > 0,
-            "vhost-user queue maximum must be positive"
-        );
-        cats_blockd::frontend_contract::validate_authorized_vhost_shape(1, queue_size)
-            .context("vhost-user queue size is outside the authorized-serving contract")?;
+        cats_blockd::frontend_contract::validate_authorized_vhost_shape(maximum_queues, queue_size)
+            .context(
+                "vhost-user queue maximum or size is outside the authorized-serving contract",
+            )?;
         Ok(Self::VhostUserBlk {
             maximum_queues,
             queue_size,
@@ -121,6 +120,8 @@ impl ServingPrepareFrontend {
 pub(crate) struct ServingPrepareDeviceEffect {
     frontend: ServingPrepareFrontend,
     executable_path: HostPath,
+    #[cfg(test)]
+    before_replace: Option<Arc<dyn Fn() + Send + Sync>>,
     #[cfg(test)]
     after_replace: Option<Arc<dyn Fn() + Send + Sync>>,
 }
@@ -138,8 +139,16 @@ impl ServingPrepareDeviceEffect {
             frontend,
             executable_path,
             #[cfg(test)]
+            before_replace: None,
+            #[cfg(test)]
             after_replace: None,
         })
+    }
+
+    #[cfg(test)]
+    pub(crate) fn with_before_replace(mut self, hook: Arc<dyn Fn() + Send + Sync>) -> Self {
+        self.before_replace = Some(hook);
+        self
     }
 
     #[cfg(test)]
@@ -161,11 +170,21 @@ impl ServingPrepareDeviceEffect {
         // so a competing owner fails this admission instead of forming a
         // wait edge while the retained artifact descriptors stay live.
         let checkpoint_directory = context.state_directory().path().join(CHECKPOINT_NAMESPACE);
+        let state_root = context
+            .state_directory()
+            .try_clone_directory()
+            .context("retain Node state root for PrepareDevice publication")?;
         let store = FileCheckpointStore::open_preserving_checkpoint_temp(
             &checkpoint_directory,
             &desired.cat_id,
         )
         .context("open current checkpoint for sealed Root handoff consumption")?;
+        revalidate_checkpoint_namespace(
+            &state_root,
+            CHECKPOINT_NAMESPACE,
+            &[store.retained_directory()],
+        )
+        .context("validate PrepareDevice checkpoint namespace before admission")?;
         let stored = store
             .load()
             .context("load current checkpoint for sealed Root handoff consumption")?
@@ -232,6 +251,16 @@ impl ServingPrepareDeviceEffect {
                     },
                 )?;
                 context.check_active()?;
+                #[cfg(test)]
+                if let Some(hook) = &self.before_replace {
+                    hook();
+                }
+                revalidate_checkpoint_namespace(
+                    &state_root,
+                    CHECKPOINT_NAMESPACE,
+                    &[store.retained_directory()],
+                )
+                .context("validate PrepareDevice checkpoint namespace before publication")?;
                 store
                     .replace(&stored, &successor)
                     .context("atomically replace Root handoff with PrepareDevice")?;
@@ -239,6 +268,12 @@ impl ServingPrepareDeviceEffect {
                 if let Some(hook) = &self.after_replace {
                     hook();
                 }
+                revalidate_checkpoint_namespace(
+                    &state_root,
+                    CHECKPOINT_NAMESPACE,
+                    &[store.retained_directory()],
+                )
+                .context("validate PrepareDevice checkpoint namespace after publication")?;
                 context.check_active()?;
                 Ok(())
             }

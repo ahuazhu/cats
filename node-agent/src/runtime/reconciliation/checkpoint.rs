@@ -6,6 +6,7 @@ use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
 use std::sync::{Mutex, MutexGuard};
 
+use anyhow::Context as _;
 use cats_api::runtime_reconciliation::{
     checkpoint_content_digest, decode_runtime_checkpoint, decode_runtime_volume_transition_request,
     encode_runtime_checkpoint, encode_runtime_volume_transition_request, ContractVersion, Id,
@@ -1201,6 +1202,57 @@ impl FileCheckpointStore {
     pub(super) fn before_publish_once(&self, hook: impl FnOnce(&Path) + Send + 'static) {
         self.faults.lock().expect("test fault lock").before_publish = Some(Box::new(hook));
     }
+}
+
+/// Reopens the current lexical checkpoint namespace from the already-retained
+/// Node state root and proves that every caller-retained directory still names
+/// that exact directory with the same owner and mode.
+///
+/// A descriptor-relative writer remains able to publish into a directory
+/// after its basename has been renamed away. Callers must therefore run this
+/// immediately before and after an authority-bearing checkpoint publication;
+/// retaining only `FileCheckpointStore::directory` is not a reachability
+/// proof for the current Node namespace.
+pub(super) fn revalidate_checkpoint_namespace(
+    state_root: &File,
+    namespace: &str,
+    retained_directories: &[&File],
+) -> anyhow::Result<File> {
+    let root = state_root
+        .metadata()
+        .context("inspect retained Node state root")?;
+    anyhow::ensure!(root.is_dir(), "retained Node state root is not a directory");
+    let name = CString::new(namespace).context("checkpoint namespace contains NUL")?;
+    let current = open_at(
+        state_root,
+        &name,
+        libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC | libc::O_NONBLOCK,
+        0,
+    )
+    .context("reopen current lexical checkpoint namespace")?;
+    let current_metadata = current
+        .metadata()
+        .context("inspect current lexical checkpoint namespace")?;
+    anyhow::ensure!(
+        current_metadata.is_dir()
+            && current_metadata.uid() == root.uid()
+            && current_metadata.mode() & 0o022 == 0,
+        "current checkpoint namespace has unsafe owner or mode"
+    );
+    for retained in retained_directories {
+        let retained_metadata = retained
+            .metadata()
+            .context("inspect retained checkpoint namespace")?;
+        anyhow::ensure!(
+            retained_metadata.is_dir()
+                && retained_metadata.dev() == current_metadata.dev()
+                && retained_metadata.ino() == current_metadata.ino()
+                && retained_metadata.uid() == current_metadata.uid()
+                && retained_metadata.mode() == current_metadata.mode(),
+            "retained checkpoint namespace is no longer the current lexical directory"
+        );
+    }
+    Ok(current)
 }
 
 /// The single deterministic path used by both the read-only inventory pass
