@@ -30,6 +30,7 @@ use cats_storage::BlobStore;
 
 use crate::ch::effective_vhost_user_queues;
 use crate::runtime_spine::RuntimeDesiredEffectContext;
+#[cfg(not(target_os = "linux"))]
 use crate::state_directory::StateDirectory;
 
 use super::checkpoint::revalidate_checkpoint_namespace;
@@ -78,6 +79,7 @@ pub(crate) enum ServingPrepareFrontend {
 }
 
 impl ServingPrepareFrontend {
+    #[cfg(not(target_os = "linux"))]
     pub(crate) fn kernel_nbd(
         state_directory: StateDirectory,
         nbd_client_binary: std::path::PathBuf,
@@ -89,20 +91,8 @@ impl ServingPrepareFrontend {
             "kernel-NBD client binary must be absolute"
         );
         anyhow::ensure!(device_count > 0, "kernel-NBD pool must not be empty");
-        #[cfg(target_os = "linux")]
-        {
-            let config = KernelNbdInventoryConfig::installed(
-                state_directory,
-                nbd_client_binary,
-                device_count,
-            )?;
-            Ok(Self::kernel_nbd_from_inventory(config, direct))
-        }
-        #[cfg(not(target_os = "linux"))]
-        {
-            let _ = (state_directory, nbd_client_binary, device_count, direct);
-            Ok(Self::KernelNbdUnsupported)
-        }
+        let _ = (state_directory, nbd_client_binary, direct);
+        Ok(Self::KernelNbdUnsupported)
     }
 
     #[cfg(target_os = "linux")]
