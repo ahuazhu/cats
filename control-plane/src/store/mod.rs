@@ -768,6 +768,18 @@ impl Store {
         &self,
         f: impl FnOnce(std::result::Result<&mut Client, ApiError>) -> T + Send,
     ) -> T {
+        self.enter_with_retirement(|client| (f(client), false))
+    }
+
+    /// Variant of [`Self::enter`] for operations that may leave session-level
+    /// PostgreSQL state behind when their cleanup result is uncertain. A true
+    /// retirement flag closes that connection before another caller can use
+    /// it. Panics also retire the session, which makes session advisory locks
+    /// fail-safe without attempting PostgreSQL work while unwinding.
+    fn enter_with_retirement<T: Send>(
+        &self,
+        f: impl FnOnce(std::result::Result<&mut Client, ApiError>) -> (T, bool) + Send,
+    ) -> T {
         let mut guard = self.client.lock().unwrap();
         let client: &mut Option<Client> = &mut guard;
         off_runtime(move || {
@@ -778,14 +790,30 @@ impl Store {
                 match schema::connect_client(&self.dsn, self.ca_file.as_deref()) {
                     Ok(mut fresh) => {
                         if let Err(error) = configure_session(&mut fresh) {
-                            return f(Err(error));
+                            return f(Err(error)).0;
                         }
                         *client = Some(fresh);
                     }
-                    Err(error) => return f(Err(error)),
+                    Err(error) => return f(Err(error)).0,
                 }
             }
-            f(Ok(client.as_mut().expect("client was just ensured")))
+            let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                f(Ok(client.as_mut().expect("client was just ensured")))
+            }));
+            match outcome {
+                Ok((value, retire)) => {
+                    if retire {
+                        drop(client.take());
+                    }
+                    value
+                }
+                Err(payload) => {
+                    // Closing the session is the only panic-safe proof that a
+                    // session advisory lock cannot survive this operation.
+                    drop(client.take());
+                    std::panic::resume_unwind(payload)
+                }
+            }
         })
     }
 

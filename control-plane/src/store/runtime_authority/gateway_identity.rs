@@ -109,7 +109,7 @@ impl Store {
         request: &AuthorityRequestContext,
     ) -> Result<Option<AuthenticatedGatewayPrincipal>> {
         let public_key_spki_sha256 = public_key_spki_sha256.clone();
-        self.authority_request_locking_read_snapshot(request, |transaction| {
+        self.authority_request_route_v2_read_snapshot(request, |transaction| {
             authenticate_gateway_tls_peer_in(transaction, &public_key_spki_sha256)
         })
     }
@@ -133,6 +133,29 @@ impl Store {
         self.authority_locking_read_snapshot(|transaction| {
             lock_route_v2_machine_authority_shared(transaction)?;
             revalidate_gateway_principal_for_workspace_in(transaction, principal, workspace_id)
+        })
+    }
+
+    /// Deterministic writer-first race fixture: the production install has
+    /// completed all writes while retaining its exclusive transaction barrier,
+    /// and commits only after the test releases it.
+    #[cfg(test)]
+    pub(crate) fn install_gateway_authority_paused_before_commit_for_test(
+        &self,
+        authority: &GatewayWorkloadIdentityAuthority,
+        entered: std::sync::Arc<std::sync::Barrier>,
+        release: std::sync::Arc<std::sync::Barrier>,
+    ) -> Result<()> {
+        let exact_bytes = encode_gateway_workload_identity_authority(authority)
+            .map_err(|_| ApiError::invalid("Gateway workload identity authority is invalid"))?;
+        let mut pause = Some((entered, release));
+        self.authority_transaction(|transaction| {
+            install_gateway_authority_in(transaction, authority, &exact_bytes)?;
+            if let Some((entered, release)) = pause.take() {
+                entered.wait();
+                release.wait();
+            }
+            Ok(())
         })
     }
 }

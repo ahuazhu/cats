@@ -100,7 +100,7 @@ impl Store {
         active_guest_digest: &cats_api::runtime_reconciliation::Sha256Digest,
         request: &AuthorityRequestContext,
     ) -> Result<RouteGrantV2MachineAuthorityLoad> {
-        self.authority_request_locking_read_snapshot(request, |transaction| {
+        self.authority_request_route_v2_read_snapshot(request, |transaction| {
             lock_route_v2_machine_authority_shared(transaction)?;
             let Some(scope) = revalidate_gateway_principal_current_in(transaction, principal)?
             else {

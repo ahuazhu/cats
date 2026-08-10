@@ -1,6 +1,7 @@
 //! Real PostgreSQL acceptance for the independent Gateway workload authority.
 
 use std::sync::{Arc, Barrier};
+use std::time::{Duration, Instant};
 
 use cats_api::gateway_workload_identity::{
     GatewayWorkloadCredentialPolicy, GatewayWorkloadCredentialScope,
@@ -10,7 +11,7 @@ use cats_api::runtime_reconciliation::{
     canonical_ed25519_spki_sha256, Base64UrlNoPad, ContractVersion, Epoch, Id, Sha256Digest,
 };
 
-use crate::store::Store;
+use crate::store::{AuthorityRequestContext, Store};
 
 const SPKI_A: &str = "MCowBQYDK2VwAyEA2-Jj2UvNCvQiUPNYRgSi0cJSPiJI6Rs6D0UTeEpQVj8";
 const SPKI_B: &str = "MCowBQYDK2VwAyEAJJHj__Po94RauBD2QsCa8LKrwcrVFdomZbKbCGBbvuk";
@@ -418,6 +419,64 @@ fn concurrent_successor_cas_has_one_exact_winner() {
         Ok(())
     })
     .unwrap();
+}
+
+#[test]
+fn writer_first_revocation_commits_before_a_new_route_v2_snapshot_authenticates() {
+    let url = crate::testsupport::isolated_control_store_url();
+    let seed = Store::connect(&url, None).unwrap();
+    let initial = authority(1, vec![fleet_credential("gateway_a", SPKI_A)], None);
+    seed.install_gateway_workload_identity_authority(&initial)
+        .unwrap();
+    let revoked = authority(2, Vec::new(), Some(&initial));
+
+    let writer_entered = Arc::new(Barrier::new(2));
+    let release_writer = Arc::new(Barrier::new(2));
+    let writer = {
+        let url = url.clone();
+        let writer_entered = Arc::clone(&writer_entered);
+        let release_writer = Arc::clone(&release_writer);
+        std::thread::spawn(move || {
+            Store::connect(&url, None)
+                .unwrap()
+                .install_gateway_authority_paused_before_commit_for_test(
+                    &revoked,
+                    writer_entered,
+                    release_writer,
+                )
+        })
+    };
+    writer_entered.wait();
+
+    let (authenticated_tx, authenticated_rx) = std::sync::mpsc::channel();
+    let reader = {
+        let url = url.clone();
+        std::thread::spawn(move || {
+            let reader = Store::connect(&url, None).unwrap();
+            let request = AuthorityRequestContext::new(Instant::now() + Duration::from_secs(5));
+            authenticated_tx
+                .send(reader.authenticate_gateway_tls_peer(&spki_digest(SPKI_A), &request))
+                .unwrap();
+        })
+    };
+    assert!(
+        authenticated_rx
+            .recv_timeout(Duration::from_millis(100))
+            .is_err(),
+        "reader did not wait behind the writer's exclusive barrier"
+    );
+
+    release_writer.wait();
+    writer.join().unwrap().unwrap();
+    let authenticated = authenticated_rx
+        .recv_timeout(Duration::from_secs(5))
+        .expect("reader finished after writer commit")
+        .unwrap();
+    reader.join().unwrap();
+    assert!(
+        authenticated.is_none(),
+        "post-writer snapshot authenticated a revoked credential"
+    );
 }
 
 #[test]

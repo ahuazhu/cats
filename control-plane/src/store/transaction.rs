@@ -371,6 +371,11 @@ enum AttemptFailure {
 enum AuthorityTransactionMode {
     ReadWrite,
     RepeatableRead,
+    /// Acquire the Route v2 machine-authority session barrier before BEGIN.
+    /// PostgreSQL establishes a repeatable-read snapshot at the first query,
+    /// so taking only an xact lock after BEGIN can otherwise retain facts from
+    /// before a writer that committed while this reader waited.
+    RouteV2RepeatableRead,
     RepeatableReadOnly,
 }
 
@@ -530,6 +535,33 @@ impl Store {
         }
     }
 
+    /// Route v2 machine-authority read whose shared writer barrier is acquired
+    /// on this exact PostgreSQL session before the repeatable-read transaction
+    /// begins. The session lock is released after rollback on every ordinary
+    /// path; any ambiguous acquire/release or panic retires the connection so
+    /// a lock can never leak into the next request.
+    pub(super) fn authority_request_route_v2_read_snapshot<T: Send>(
+        &self,
+        request: &AuthorityRequestContext,
+        mut operation: impl FnMut(&mut postgres::Transaction<'_>) -> AuthorityTxResult<T> + Send,
+    ) -> Result<T> {
+        match self.authority_transaction_outcome_with_hook(
+            move |transaction| operation(transaction).map(AuthorityRequestDisposition::Reject),
+            AuthorityTransactionMode::RouteV2RepeatableRead,
+            Some(request),
+            || {},
+        ) {
+            Ok(value) => Ok(value),
+            Err(AuthorityExecutionError::Store(error)) => Err(error),
+            Err(AuthorityExecutionError::CandidateCollision) => Err(internal(
+                "unexpected candidate-collision marker in a Route v2 authority read",
+            )),
+            Err(AuthorityExecutionError::PlacementStale) => Err(internal(
+                "unexpected placement-stale marker in a Route v2 authority read",
+            )),
+        }
+    }
+
     pub(super) fn authority_transaction_outcome<T: Send>(
         &self,
         operation: impl FnMut(&mut postgres::Transaction<'_>) -> AuthorityTxResult<T> + Send,
@@ -589,116 +621,49 @@ impl Store {
                     "runtime authority request was cancelled or exceeded its deadline",
                 )));
             }
-            let outcome = self.enter(|client| {
-                let client = client.map_err(AttemptFailure::Infrastructure)?;
-                let mut transaction = match mode {
-                    AuthorityTransactionMode::ReadWrite => client.transaction(),
-                    AuthorityTransactionMode::RepeatableRead => client
-                        .build_transaction()
-                        .isolation_level(IsolationLevel::RepeatableRead)
-                        .start(),
-                    AuthorityTransactionMode::RepeatableReadOnly => client
-                        .build_transaction()
-                        .isolation_level(IsolationLevel::RepeatableRead)
-                        .read_only(true)
-                        .start(),
-                }
-                .map_err(AttemptFailure::Postgres)?;
-                if let Some(request) = request {
-                    let Some(timeout_ms) = request.remaining_timeout_millis() else {
-                        transaction.rollback().map_err(AttemptFailure::Rollback)?;
-                        return Err(AttemptFailure::Application(ApiError::unavailable(
-                            "runtime authority request was cancelled or exceeded its deadline",
-                        )));
-                    };
-                    let lock_timeout_ms = timeout_ms.min(2_000);
-                    if let Err(error) = transaction.batch_execute(&format!(
-                        "SET LOCAL statement_timeout = '{timeout_ms}ms'; \
-                         SET LOCAL lock_timeout = '{lock_timeout_ms}ms'"
-                    )) {
-                        if let Err(rollback_error) = transaction.rollback() {
-                            if client.is_closed() && authority_retry_reason(&error).is_some() {
-                                return Err(AttemptFailure::Postgres(error));
-                            }
-                            return Err(AttemptFailure::Rollback(rollback_error));
-                        }
-                        return Err(AttemptFailure::Postgres(error));
+            let outcome = self.enter_with_retirement(|client| {
+                let client = match client {
+                    Ok(client) => client,
+                    Err(error) => return (Err(AttemptFailure::Infrastructure(error)), false),
+                };
+                let session_barrier_held =
+                    matches!(mode, AuthorityTransactionMode::RouteV2RepeatableRead);
+                if session_barrier_held {
+                    if let Err(error) = acquire_route_v2_machine_session_barrier(client, request) {
+                        // A lost response cannot prove whether the session
+                        // acquired the lock. Retiring it is the only safe
+                        // cleanup and also makes a retry use a fresh snapshot.
+                        return (Err(AttemptFailure::Postgres(error)), true);
                     }
                 }
-                match operation(&mut transaction) {
-                    Ok(AuthorityRequestDisposition::Reject(value)) => {
-                        transaction.rollback().map_err(AttemptFailure::Rollback)?;
-                        Ok(AuthorityRequestDisposition::Reject(value))
-                    }
-                    Ok(AuthorityRequestDisposition::Commit(value)) => {
-                        if request.is_some_and(|request| !request.try_begin_commit()) {
-                            transaction.rollback().map_err(AttemptFailure::Rollback)?;
-                            return Err(AttemptFailure::Application(ApiError::unavailable(
-                                "runtime authority request was cancelled or exceeded its deadline",
-                            )));
-                        }
-                        match transaction.commit() {
-                            Ok(()) => {
-                                #[cfg(test)]
-                                {
-                                    let inject_response_loss = self
-                                        .commit_response_loss_once
-                                        .swap(false, Ordering::AcqRel)
-                                        || (request.is_some()
-                                            && self
-                                                .request_commit_response_loss_once
-                                                .swap(false, Ordering::AcqRel));
-                                    if inject_response_loss {
-                                        let delay_ms = self
-                                            .commit_response_loss_delay_ms
-                                            .swap(0, Ordering::AcqRel);
-                                        if delay_ms != 0 {
-                                            std::thread::sleep(Duration::from_millis(delay_ms));
-                                        }
-                                        return Err(AttemptFailure::Infrastructure(
-                                            ApiError::unavailable(
-                                                "injected loss of a successful PostgreSQL commit response",
-                                            ),
-                                        ));
-                                    }
-                                }
-                                Ok(AuthorityRequestDisposition::Commit(value))
-                            }
-                            Err(error) => Err(AttemptFailure::Commit(error)),
-                        }
-                    }
-                    Err(AuthorityTransactionError::Domain(error)) => {
-                        // A domain rejection is never replayed. If its explicit
-                        // rollback fails, the transaction outcome is unknown
-                        // and must fail closed instead of being mislabeled as
-                        // a retriable serialization/connection error.
-                        transaction.rollback().map_err(AttemptFailure::Rollback)?;
-                        Err(AttemptFailure::Domain(error))
-                    }
-                    Err(AuthorityTransactionError::Application(error)) => {
-                        transaction.rollback().map_err(AttemptFailure::Rollback)?;
-                        Err(AttemptFailure::Application(error))
-                    }
-                    Err(AuthorityTransactionError::CandidateCollision) => {
-                        transaction.rollback().map_err(AttemptFailure::Rollback)?;
-                        Err(AttemptFailure::CandidateCollision)
-                    }
-                    Err(AuthorityTransactionError::PlacementStale) => {
-                        transaction.rollback().map_err(AttemptFailure::Rollback)?;
-                        Err(AttemptFailure::PlacementStale)
-                    }
-                    Err(AuthorityTransactionError::Postgres(error)) => {
-                        if let Err(rollback_error) = transaction.rollback() {
-                            // A closed PostgreSQL session has already lost its
-                            // transaction. Retrying the original explicitly
-                            // transient error on a fresh connection is safe;
-                            // every authority mutation is a closed replay.
-                            if client.is_closed() && authority_retry_reason(&error).is_some() {
-                                return Err(AttemptFailure::Postgres(error));
-                            }
-                            return Err(AttemptFailure::Rollback(rollback_error));
-                        }
-                        Err(AttemptFailure::Postgres(error))
+
+                let transaction_outcome =
+                    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                        run_authority_transaction_attempt(
+                            client,
+                            &mut operation,
+                            mode,
+                            request,
+                            self,
+                        )
+                    }));
+                let release =
+                    session_barrier_held.then(|| release_route_v2_machine_session_barrier(client));
+                match transaction_outcome {
+                    Ok(outcome) => match release {
+                        Some(Ok(true)) | None => (outcome, false),
+                        Some(Ok(false)) => (
+                            Err(AttemptFailure::Infrastructure(ApiError::unavailable(
+                                "Route v2 PostgreSQL session barrier was not held at release",
+                            ))),
+                            true,
+                        ),
+                        Some(Err(error)) => (Err(AttemptFailure::Postgres(error)), true),
+                    },
+                    Err(payload) => {
+                        // `enter_with_retirement` closes the client before
+                        // propagating this panic, irrespective of unlock.
+                        std::panic::resume_unwind(payload)
                     }
                 }
             });
@@ -861,6 +826,166 @@ impl Store {
         }
         unreachable!("the bounded authority transaction loop always returns")
     }
+}
+
+fn run_authority_transaction_attempt<T: Send>(
+    client: &mut postgres::Client,
+    operation: &mut impl FnMut(
+        &mut postgres::Transaction<'_>,
+    ) -> AuthorityTxResult<AuthorityRequestDisposition<T>>,
+    mode: AuthorityTransactionMode,
+    request: Option<&AuthorityRequestContext>,
+    store: &Store,
+) -> std::result::Result<AuthorityRequestDisposition<T>, AttemptFailure> {
+    #[cfg(not(test))]
+    let _ = store;
+    let mut transaction = match mode {
+        AuthorityTransactionMode::ReadWrite => client.transaction(),
+        AuthorityTransactionMode::RepeatableRead
+        | AuthorityTransactionMode::RouteV2RepeatableRead => client
+            .build_transaction()
+            .isolation_level(IsolationLevel::RepeatableRead)
+            .start(),
+        AuthorityTransactionMode::RepeatableReadOnly => client
+            .build_transaction()
+            .isolation_level(IsolationLevel::RepeatableRead)
+            .read_only(true)
+            .start(),
+    }
+    .map_err(AttemptFailure::Postgres)?;
+    if let Some(request) = request {
+        let Some(timeout_ms) = request.remaining_timeout_millis() else {
+            transaction.rollback().map_err(AttemptFailure::Rollback)?;
+            return Err(AttemptFailure::Application(ApiError::unavailable(
+                "runtime authority request was cancelled or exceeded its deadline",
+            )));
+        };
+        let lock_timeout_ms = timeout_ms.min(2_000);
+        if let Err(error) = transaction.batch_execute(&format!(
+            "SET LOCAL statement_timeout = '{timeout_ms}ms'; \
+                         SET LOCAL lock_timeout = '{lock_timeout_ms}ms'"
+        )) {
+            if let Err(rollback_error) = transaction.rollback() {
+                if client.is_closed() && authority_retry_reason(&error).is_some() {
+                    return Err(AttemptFailure::Postgres(error));
+                }
+                return Err(AttemptFailure::Rollback(rollback_error));
+            }
+            return Err(AttemptFailure::Postgres(error));
+        }
+    }
+    match operation(&mut transaction) {
+        Ok(AuthorityRequestDisposition::Reject(value)) => {
+            transaction.rollback().map_err(AttemptFailure::Rollback)?;
+            Ok(AuthorityRequestDisposition::Reject(value))
+        }
+        Ok(AuthorityRequestDisposition::Commit(value)) => {
+            if request.is_some_and(|request| !request.try_begin_commit()) {
+                transaction.rollback().map_err(AttemptFailure::Rollback)?;
+                return Err(AttemptFailure::Application(ApiError::unavailable(
+                    "runtime authority request was cancelled or exceeded its deadline",
+                )));
+            }
+            match transaction.commit() {
+                Ok(()) => {
+                    #[cfg(test)]
+                    {
+                        let inject_response_loss = store
+                            .commit_response_loss_once
+                            .swap(false, Ordering::AcqRel)
+                            || (request.is_some()
+                                && store
+                                    .request_commit_response_loss_once
+                                    .swap(false, Ordering::AcqRel));
+                        if inject_response_loss {
+                            let delay_ms = store
+                                .commit_response_loss_delay_ms
+                                .swap(0, Ordering::AcqRel);
+                            if delay_ms != 0 {
+                                std::thread::sleep(Duration::from_millis(delay_ms));
+                            }
+                            return Err(AttemptFailure::Infrastructure(ApiError::unavailable(
+                                "injected loss of a successful PostgreSQL commit response",
+                            )));
+                        }
+                    }
+                    Ok(AuthorityRequestDisposition::Commit(value))
+                }
+                Err(error) => Err(AttemptFailure::Commit(error)),
+            }
+        }
+        Err(AuthorityTransactionError::Domain(error)) => {
+            // A domain rejection is never replayed. If its explicit
+            // rollback fails, the transaction outcome is unknown
+            // and must fail closed instead of being mislabeled as
+            // a retriable serialization/connection error.
+            transaction.rollback().map_err(AttemptFailure::Rollback)?;
+            Err(AttemptFailure::Domain(error))
+        }
+        Err(AuthorityTransactionError::Application(error)) => {
+            transaction.rollback().map_err(AttemptFailure::Rollback)?;
+            Err(AttemptFailure::Application(error))
+        }
+        Err(AuthorityTransactionError::CandidateCollision) => {
+            transaction.rollback().map_err(AttemptFailure::Rollback)?;
+            Err(AttemptFailure::CandidateCollision)
+        }
+        Err(AuthorityTransactionError::PlacementStale) => {
+            transaction.rollback().map_err(AttemptFailure::Rollback)?;
+            Err(AttemptFailure::PlacementStale)
+        }
+        Err(AuthorityTransactionError::Postgres(error)) => {
+            if let Err(rollback_error) = transaction.rollback() {
+                // A closed PostgreSQL session has already lost its
+                // transaction. Retrying the original explicitly
+                // transient error on a fresh connection is safe;
+                // every authority mutation is a closed replay.
+                if client.is_closed() && authority_retry_reason(&error).is_some() {
+                    return Err(AttemptFailure::Postgres(error));
+                }
+                return Err(AttemptFailure::Rollback(rollback_error));
+            }
+            Err(AttemptFailure::Postgres(error))
+        }
+    }
+}
+
+fn acquire_route_v2_machine_session_barrier(
+    client: &mut postgres::Client,
+    request: Option<&AuthorityRequestContext>,
+) -> std::result::Result<(), postgres::Error> {
+    let timeout_ms = request
+        .and_then(AuthorityRequestContext::remaining_timeout_millis)
+        .unwrap_or(1);
+    let lock_timeout_ms = timeout_ms.min(2_000);
+    client.batch_execute(&format!(
+        "SET statement_timeout = '{timeout_ms}ms'; \
+         SET lock_timeout = '{lock_timeout_ms}ms'"
+    ))?;
+    let lock = client.query_one(
+        "SELECT pg_advisory_lock_shared(hashtextextended(\
+             current_schema() || ':route-v2-gateway-identity', 0::BIGINT))",
+        &[],
+    );
+    let restore = client.batch_execute(
+        "SET statement_timeout = '5s'; \
+         SET lock_timeout = '2s'",
+    );
+    lock?;
+    restore?;
+    Ok(())
+}
+
+fn release_route_v2_machine_session_barrier(
+    client: &mut postgres::Client,
+) -> std::result::Result<bool, postgres::Error> {
+    Ok(client
+        .query_one(
+            "SELECT pg_advisory_unlock_shared(hashtextextended(\
+                 current_schema() || ':route-v2-gateway-identity', 0::BIGINT))",
+            &[],
+        )?
+        .get(0))
 }
 
 fn authority_retry_is_definite(error: &postgres::Error) -> bool {
