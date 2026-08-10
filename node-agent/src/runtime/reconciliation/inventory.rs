@@ -18,7 +18,13 @@ use cats_api::runtime_reconciliation::{
     ProgressingReason, ReconcileStep, RequireIdleCheckpoint, RuntimeCheckpoint, UnixMillis,
     VolumeAuthorityEvidence, WarmSnapshotEvidence, WireU64,
 };
-use cats_storage::BlobStore;
+use cats_storage::{
+    authority::{
+        validate_authorized_serving_attachment, validate_volume_record, LastVolumeTransition,
+        VolumeRecord,
+    },
+    BlobStore,
+};
 use thiserror::Error;
 
 use crate::runtime_spine::{
@@ -29,8 +35,8 @@ use crate::runtime_spine::{
 use super::{
     runtime_checkpoint_path,
     signed_running::{
-        expected_provision_heads, prepared_owned_observed_volume, provision_checkpoint_is_bound,
-        request_matches_volume, unowned_observed_volume, ProvisionHeadRead,
+        expected_provision_heads, provision_checkpoint_is_bound, request_matches_volume,
+        superseded_checkpoint_has_supported_replan, unowned_observed_volume, ProvisionHeadRead,
     },
     AuthorizedBlockdCheckpoint,
 };
@@ -52,20 +58,49 @@ const REQUIRED_SOURCES: [InventorySource; 11] = [
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum InventoryAbsence {
     Empty,
-    RuntimeCheckpoints(BTreeMap<Id, RuntimeCheckpoint>),
+    RuntimeCheckpoints(BTreeMap<Id, RuntimeCheckpointInventoryEvidence>),
     AuthorizedBlockd(BTreeMap<Id, AuthorizedBlockdInventoryEvidence>),
     /// The metadata source contains exactly the Desired-bound volume facts
     /// supplied here and no discovered local-only candidate. These are not
     /// physical residue: a newly assigned Cat must be able to report its
     /// authoritative root before its first local effect exists.
-    DesiredVolumes(BTreeMap<Id, Vec<ObservedVolume>>),
+    DesiredVolumes(BTreeMap<Id, Vec<AuthorityVolumeInventoryEvidence>>),
     Unavailable,
+}
+
+/// Read-only classification of a syntactically valid per-Cat checkpoint
+/// against the exact Desired snapshot which bounded this inventory scan.
+///
+/// A superseded checkpoint is physical evidence, not an unavailable source.
+/// Keeping the complete old checkpoint lets the effect planner distinguish a
+/// pre-effect journal from an already-authorized old attachment without ever
+/// rewriting or deleting either one in the scanner.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DesiredCheckpointBinding {
+    Current,
+    Superseded,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RuntimeCheckpointInventoryEvidence {
+    pub checkpoint: RuntimeCheckpoint,
+    pub binding: DesiredCheckpointBinding,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AuthorizedBlockdInventoryEvidence {
     pub data_directory: HostPath,
     pub checkpoint: AuthorizedBlockdCheckpoint,
+    pub binding: DesiredCheckpointBinding,
+}
+
+/// Provider-private authority evidence retained until the local attachment
+/// has been checked against the complete fresh record. Only `observed` is
+/// projected onto the frozen Runtime inventory wire contract.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AuthorityVolumeInventoryEvidence {
+    pub observed: ObservedVolume,
+    pub record: VolumeRecord,
 }
 
 /// One read-only proof for exactly one member of the Runtime inventory-source
@@ -279,8 +314,8 @@ fn runtime_from_inventory(
     desired: &DesiredRuntimeSpec,
     inventory_epoch: cats_api::runtime_reconciliation::Epoch,
     projection: &InventoryProjectionContext<'_>,
-    mut volumes: Vec<ObservedVolume>,
-    checkpoint: Option<RuntimeCheckpoint>,
+    mut volume_evidence: Vec<AuthorityVolumeInventoryEvidence>,
+    checkpoint: Option<RuntimeCheckpointInventoryEvidence>,
     blockd: Option<AuthorizedBlockdInventoryEvidence>,
 ) -> anyhow::Result<ObservedRuntimeStatus> {
     let checkpoint_path = runtime_checkpoint_path(projection.checkpoint_directory, &desired.cat_id);
@@ -293,57 +328,135 @@ fn runtime_from_inventory(
     .ok_or_else(|| anyhow::anyhow!("checkpoint path is not a valid HostPath"))?;
 
     if let Some(blockd) = &blockd {
-        let [intent] = desired.volumes.as_slice() else {
-            anyhow::bail!("authorized blockd lineage requires one Desired root")
-        };
         anyhow::ensure!(
             checkpoint.is_some(),
             "authorized blockd lineage lacks its Runtime checkpoint"
         );
-        anyhow::ensure!(
-            blockd.checkpoint.desired == *desired && blockd.checkpoint.volume == *intent,
-            "authorized blockd lineage does not bind current Desired"
-        );
-        let [volume] = volumes.as_mut_slice() else {
-            anyhow::bail!("authorized blockd lineage lacks one authority Volume")
-        };
         let attachment = &blockd.checkpoint.attachment;
+        let volume_evidence = volume_evidence
+            .iter_mut()
+            .find(|volume| volume.observed.volume_id == attachment.identity.volume_id)
+            .context("authorized blockd lineage lacks its authority Volume")?;
+        let volume = &mut volume_evidence.observed;
+        let authority_record = &volume_evidence.record;
+        let checkpoint_binding = checkpoint.as_ref().expect("presence checked above").binding;
+        let runtime_checkpoint = &checkpoint
+            .as_ref()
+            .expect("presence checked above")
+            .checkpoint;
+        let authoritative_head_is_adoptable = match (&runtime_checkpoint.step, &volume.authority) {
+            (
+                ReconcileStep::ProvisionRootImage {
+                    expected_blank_head,
+                    expected_provisioned_head,
+                    ..
+                },
+                VolumeAuthorityEvidence::Owned { head, .. },
+            ) => head == expected_blank_head || head == expected_provisioned_head,
+            (
+                ReconcileStep::CleanupRelease { cleanup },
+                VolumeAuthorityEvidence::Owned { head, .. },
+            ) => cleanup
+                .volume_release
+                .as_ref()
+                .is_some_and(|release| release.generation == head.generation),
+            (ReconcileStep::Quarantined, VolumeAuthorityEvidence::Owned { head, .. }) => {
+                runtime_checkpoint.volumes.iter().any(|checkpoint_volume| {
+                    checkpoint_volume.volume_id == volume.volume_id
+                        && matches!(
+                            &checkpoint_volume.authority,
+                            VolumeAuthorityEvidence::Owned {
+                                head: checkpoint_head,
+                                ..
+                            } if checkpoint_head == head
+                        )
+                })
+            }
+            (_, VolumeAuthorityEvidence::Owned { head, .. }) => head == &attachment.head,
+            (
+                ReconcileStep::CleanupRelease { cleanup },
+                VolumeAuthorityEvidence::Unowned {
+                    attachment_epoch,
+                    head,
+                },
+            ) => cleanup_release_matches_released_authority(
+                cleanup,
+                attachment,
+                *attachment_epoch,
+                head,
+            ),
+            (ReconcileStep::Quarantined, VolumeAuthorityEvidence::Unowned { .. }) => true,
+            _ => false,
+        };
+        let mixed_binding_is_closed = checkpoint_binding == DesiredCheckpointBinding::Current
+            && blockd.binding == DesiredCheckpointBinding::Superseded
+            && current_checkpoint_adopts_blockd(runtime_checkpoint, attachment);
+        anyhow::ensure!(
+            blockd.binding == checkpoint_binding || mixed_binding_is_closed,
+            "Runtime and authorized blockd checkpoint bindings disagree"
+        );
         anyhow::ensure!(
             volume.volume_id == attachment.identity.volume_id
-                && matches!(
+                && authority_owner_or_exact_release_matches(
                     &volume.authority,
-                    VolumeAuthorityEvidence::Owned {
-                        attachment_id,
-                        attachment_epoch,
-                        head,
-                    } if attachment_id == &attachment.identity.attachment_id
-                        && *attachment_epoch == attachment.identity.attachment_epoch
-                        && head == &attachment.head
+                    runtime_checkpoint,
+                    attachment,
                 )
+                && authority_record_matches_local_attachment(
+                    authority_record,
+                    runtime_checkpoint,
+                    attachment,
+                )
+                && authoritative_head_is_adoptable
                 && volume.local_lineages.is_empty(),
             "authorized blockd lineage conflicts with Volume authority"
         );
+        let released = matches!(volume.authority, VolumeAuthorityEvidence::Unowned { .. });
+        let lineage_generation = match &volume.authority {
+            VolumeAuthorityEvidence::Owned { head, .. }
+            | VolumeAuthorityEvidence::Unowned { head, .. } => head.generation,
+            _ => unreachable!("owned or exact released authority was checked above"),
+        };
         volume.local_lineages.push(LocalVolumeLineage {
             attachment_id: attachment.identity.attachment_id.clone(),
             attachment_epoch: attachment.identity.attachment_epoch,
             acquire_origin: attachment.identity.acquire_origin.clone(),
             node_id: attachment.identity.node_id.clone(),
             placement_epoch: attachment.identity.placement_epoch,
-            local_durable_generation: attachment.head.generation,
-            remote_durable_generation: attachment.head.generation,
+            // The authorized pre-Guest lineage cannot contain Guest writes.
+            // A late deterministic provision may already have advanced the
+            // remote head; projecting that exact authoritative generation is
+            // therefore the closed R == L boundary used by stale cleanup.
+            local_durable_generation: lineage_generation,
+            remote_durable_generation: lineage_generation,
             data_directory: blockd.data_directory.clone(),
             pending_pack_count: WireU64::new(0).expect("zero fits WireU64"),
-            fenced: false,
-            state: LocalLineageState::Active,
+            fenced: released,
+            state: if released {
+                LocalLineageState::Released
+            } else {
+                LocalLineageState::Active
+            },
         });
     }
 
+    let volumes: Vec<ObservedVolume> = volume_evidence
+        .into_iter()
+        .map(|evidence| evidence.observed)
+        .collect();
+    let unsupported_superseded = checkpoint.as_ref().is_some_and(|evidence| {
+        evidence.binding == DesiredCheckpointBinding::Superseded
+            && !superseded_checkpoint_has_supported_replan(desired, &evidence.checkpoint, &volumes)
+    });
+
     let (step, checkpoint_evidence, runtime_incarnation, stable_state, lifecycle_admission) =
         match checkpoint {
-            Some(checkpoint) => {
+            Some(inventory_checkpoint) => {
+                let checkpoint = inventory_checkpoint.checkpoint;
                 validate_scanned_checkpoint(
                     desired,
                     &checkpoint,
+                    inventory_checkpoint.binding,
                     blockd.as_ref(),
                     projection.checkpoint_directory,
                     projection.blob,
@@ -389,6 +502,25 @@ fn runtime_from_inventory(
             }
         };
 
+    let frozen_contract_stop = matches!(&step, ReconcileStep::Quarantined)
+        || unsupported_superseded
+        || (matches!(&step, ReconcileStep::CleanupRelease { .. })
+            && volumes.iter().any(|volume| {
+                matches!(&volume.authority, VolumeAuthorityEvidence::Unowned { .. })
+            }));
+    let conditions = if frozen_contract_stop {
+        // A superseded checkpoint and a completed release are still exact
+        // physical evidence, but neither is itself a terminal typed reason.
+        // V1's persisted Quarantined step also lacks the reason required by
+        // `Condition::Quarantined`. Keep these states closed and conditionless
+        // instead of claiming progress or inventing a Control-settling fact.
+        Vec::new()
+    } else {
+        vec![Condition::Progressing {
+            reason: ProgressingReason::ReconcileStep { step: step.clone() },
+        }]
+    };
+
     Ok(ObservedRuntimeStatus {
         cat_id: desired.cat_id.clone(),
         applied_desired: Some(AppliedDesiredEvidence {
@@ -410,27 +542,176 @@ fn runtime_from_inventory(
         lifecycle_admission,
         routes: Vec::new(),
         platform_guards: 0,
-        conditions: vec![Condition::Progressing {
-            reason: ProgressingReason::ReconcileStep { step },
-        }],
+        conditions,
     })
+}
+
+fn authority_record_matches_local_attachment(
+    record: &VolumeRecord,
+    checkpoint: &RuntimeCheckpoint,
+    attachment: &cats_storage::authority::AuthorizedServingAttachment,
+) -> bool {
+    if record.lease_owner.is_none() {
+        // Released local bytes may remain only behind an exact cleanup or a
+        // durable closed quarantine. The metadata probe validates the release
+        // marker before constructing the former projection.
+        return matches!(
+            checkpoint.step,
+            ReconcileStep::CleanupRelease { .. } | ReconcileStep::Quarantined
+        );
+    }
+
+    validate_volume_record(record).is_ok()
+        && validate_authorized_serving_attachment(attachment).is_ok()
+        && record.volume_id == attachment.identity.volume_id
+        && record.size_bytes == attachment.size_bytes
+        && record.durability == attachment.durability
+        && matches!(
+            record.admin_state,
+            cats_api::runtime_reconciliation::VolumeAdminState::Active
+        )
+        && record.lease_owner.as_ref() == Some(&attachment.identity.attachment_id)
+        && record.lease_epoch == attachment.identity.attachment_epoch
+        && record.lease_expires_at == Some(attachment.lease_expires_at)
+        && record.last_transition
+            == Some(LastVolumeTransition::NormalAcquire {
+                request: attachment.acquire_request.clone(),
+                result: attachment.acquire_result.clone(),
+            })
+}
+
+fn current_checkpoint_adopts_blockd(
+    checkpoint: &RuntimeCheckpoint,
+    attachment: &cats_storage::authority::AuthorizedServingAttachment,
+) -> bool {
+    match &checkpoint.step {
+        ReconcileStep::ProvisionRootImage {
+            volume_id,
+            attachment_id,
+            attachment_epoch,
+            ..
+        } => {
+            volume_id == &attachment.identity.volume_id
+                && attachment_id == &attachment.identity.attachment_id
+                && *attachment_epoch == attachment.identity.attachment_epoch
+        }
+        ReconcileStep::CleanupRelease { cleanup } => matches!(
+            &cleanup.target,
+            cats_api::runtime_reconciliation::CleanupTarget::Volume {
+                volume_id,
+                attachment_id,
+                attachment_epoch,
+            } if volume_id == &attachment.identity.volume_id
+                && attachment_id == &attachment.identity.attachment_id
+                && *attachment_epoch == attachment.identity.attachment_epoch
+        ),
+        ReconcileStep::Quarantined => checkpoint.volumes.iter().any(|volume| {
+            volume.volume_id == attachment.identity.volume_id
+                && volume.local_lineages.iter().any(|lineage| {
+                    lineage.attachment_id == attachment.identity.attachment_id
+                        && lineage.attachment_epoch == attachment.identity.attachment_epoch
+                        && lineage.acquire_origin == attachment.identity.acquire_origin
+                        && lineage.node_id == attachment.identity.node_id
+                        && lineage.placement_epoch == attachment.identity.placement_epoch
+                })
+        }),
+        _ => false,
+    }
+}
+
+fn authority_owner_or_exact_release_matches(
+    authority: &VolumeAuthorityEvidence,
+    checkpoint: &RuntimeCheckpoint,
+    attachment: &cats_storage::authority::AuthorizedServingAttachment,
+) -> bool {
+    match authority {
+        VolumeAuthorityEvidence::Owned {
+            attachment_id,
+            attachment_epoch,
+            ..
+        } => {
+            attachment_id == &attachment.identity.attachment_id
+                && *attachment_epoch == attachment.identity.attachment_epoch
+        }
+        VolumeAuthorityEvidence::Unowned {
+            attachment_epoch,
+            head,
+        } => match &checkpoint.step {
+            ReconcileStep::CleanupRelease { cleanup } => {
+                cleanup_release_matches_released_authority(
+                    cleanup,
+                    attachment,
+                    *attachment_epoch,
+                    head,
+                )
+            }
+            ReconcileStep::Quarantined => checkpoint.volumes.iter().any(|volume| {
+                matches!(
+                    &volume.authority,
+                    VolumeAuthorityEvidence::Unowned {
+                        attachment_epoch: checkpoint_epoch,
+                        head: checkpoint_head,
+                    } if checkpoint_epoch == attachment_epoch && checkpoint_head == head
+                )
+            }),
+            _ => false,
+        },
+        _ => false,
+    }
+}
+
+fn cleanup_release_matches_released_authority(
+    cleanup: &cats_api::runtime_reconciliation::CleanupRelease,
+    attachment: &cats_storage::authority::AuthorizedServingAttachment,
+    resulting_epoch: cats_api::runtime_reconciliation::FenceEpoch,
+    head: &cats_api::runtime_reconciliation::RemoteHead,
+) -> bool {
+    let (
+        cats_api::runtime_reconciliation::CleanupTarget::Volume {
+            volume_id,
+            attachment_id,
+            attachment_epoch,
+        },
+        Some(replay),
+    ) = (&cleanup.target, &cleanup.volume_release)
+    else {
+        return false;
+    };
+    attachment_epoch
+        .get()
+        .checked_add(1)
+        .is_some_and(|next| next == resulting_epoch.get())
+        && volume_id == &attachment.identity.volume_id
+        && attachment_id == &attachment.identity.attachment_id
+        && *attachment_epoch == attachment.identity.attachment_epoch
+        && replay.generation == head.generation
 }
 
 fn validate_scanned_checkpoint(
     desired: &DesiredRuntimeSpec,
     checkpoint: &RuntimeCheckpoint,
+    binding: DesiredCheckpointBinding,
     blockd: Option<&AuthorizedBlockdInventoryEvidence>,
     checkpoint_directory: &std::path::Path,
     blob: Option<&dyn BlobStore>,
     deadline: std::time::Instant,
 ) -> anyhow::Result<()> {
+    let top_level_binding_is_valid = match binding {
+        DesiredCheckpointBinding::Current => {
+            checkpoint.placement_epoch == desired.placement.placement_epoch
+                && checkpoint.desired_revision == desired.desired_revision
+                && checkpoint.spec_digest == desired.spec_digest
+        }
+        DesiredCheckpointBinding::Superseded => {
+            checkpoint.desired_revision < desired.desired_revision
+                && checkpoint.placement_epoch <= desired.placement.placement_epoch
+        }
+    };
     anyhow::ensure!(
         checkpoint.version == cats_api::runtime_reconciliation::ContractVersion::V1
             && checkpoint.cat_id == desired.cat_id
             && checkpoint.node_id == desired.placement.node_id
-            && checkpoint.placement_epoch == desired.placement.placement_epoch
-            && checkpoint.desired_revision == desired.desired_revision
-            && checkpoint.spec_digest == desired.spec_digest
+            && top_level_binding_is_valid
             && checkpoint.runtime_incarnation.is_none()
             && checkpoint.stable_state.is_none()
             && checkpoint.processes.is_empty()
@@ -449,17 +730,23 @@ fn validate_scanned_checkpoint(
             ),
         "Runtime checkpoint does not bind the current pre-launch Desired"
     );
-    let [intent] = desired.volumes.as_slice() else {
-        anyhow::bail!("scanned signed Running checkpoint requires one root Volume")
-    };
     match &checkpoint.step {
-        ReconcileStep::AcquireVolume { request } => {
-            anyhow::ensure!(
-                request_matches_volume(request, desired, intent)
-                    && checkpoint.volumes == [unowned_observed_volume(intent)],
-                "Acquire checkpoint does not bind the exact Desired root"
-            );
-        }
+        ReconcileStep::AcquireVolume { request } => match binding {
+            DesiredCheckpointBinding::Current => {
+                let [intent] = desired.volumes.as_slice() else {
+                    anyhow::bail!("current Acquire checkpoint requires one root Volume")
+                };
+                anyhow::ensure!(
+                    request_matches_volume(request, desired, intent)
+                        && (checkpoint.volumes == [unowned_observed_volume(intent)]
+                            || current_acquire_adoption_is_closed(checkpoint, intent, blockd,)),
+                    "Acquire checkpoint does not bind the exact Desired root"
+                );
+            }
+            DesiredCheckpointBinding::Superseded => {
+                validate_superseded_acquire_checkpoint(checkpoint, request)?;
+            }
+        },
         ReconcileStep::ProvisionRootImage {
             volume_id,
             attachment_id,
@@ -474,42 +761,195 @@ fn validate_scanned_checkpoint(
                 anyhow::bail!("provision checkpoint lacks authorized blockd lineage")
             };
             let attachment = &blockd.checkpoint.attachment;
-            let blob = blob.context("provision checkpoint validation lacks image BlobStore")?;
-            let ProvisionHeadRead::Ready { blank, target } =
-                expected_provision_heads(blob, desired, intent, deadline)
-            else {
-                anyhow::bail!("provision checkpoint image manifest is unavailable or invalid")
-            };
-            let state_directory = checkpoint_directory
-                .parent()
-                .context("checkpoint namespace lacks its state-directory parent")?;
+            let checkpoint_volume = checkpoint
+                .volumes
+                .iter()
+                .find(|volume| volume.volume_id == *volume_id)
+                .context("provision checkpoint lacks its observed Volume")?;
             anyhow::ensure!(
-                volume_id == &intent.volume_id
-                    && attachment_id == &attachment.identity.attachment_id
+                attachment_id == &attachment.identity.attachment_id
                     && *attachment_epoch == attachment.identity.attachment_epoch
                     && data_directory == &blockd.data_directory
-                    && *size_bytes == intent.size_bytes
-                    && boot_image_digest == &desired.runtime.boot_image_digest
+                    && *size_bytes == attachment.size_bytes
                     && expected_blank_head == &attachment.head
-                    && provision_checkpoint_is_bound(
-                        checkpoint,
-                        desired,
-                        intent,
-                        state_directory,
-                        &blank,
-                        &target,
-                    )
-                    && checkpoint.volumes
-                        == [prepared_owned_observed_volume(
-                            intent,
-                            attachment,
-                            blockd.data_directory.clone(),
-                        )],
+                    && checkpoint_volume.size_bytes == Some(attachment.size_bytes)
+                    && checkpoint_volume.durability == Some(attachment.durability),
                 "provision checkpoint does not bind authorized blockd lineage"
+            );
+            if binding == DesiredCheckpointBinding::Current {
+                let [intent] = desired.volumes.as_slice() else {
+                    anyhow::bail!("current provision checkpoint requires one root Volume")
+                };
+                let blob = blob.context("provision checkpoint validation lacks image BlobStore")?;
+                let ProvisionHeadRead::Ready { blank, target } =
+                    expected_provision_heads(blob, desired, intent, deadline)
+                else {
+                    anyhow::bail!("provision checkpoint image manifest is unavailable or invalid")
+                };
+                let state_directory = checkpoint_directory
+                    .parent()
+                    .context("checkpoint namespace lacks its state-directory parent")?;
+                anyhow::ensure!(
+                    volume_id == &intent.volume_id
+                        && boot_image_digest == &desired.runtime.boot_image_digest
+                        && provision_checkpoint_is_bound(
+                            checkpoint,
+                            desired,
+                            intent,
+                            state_directory,
+                            &blank,
+                            &target,
+                        ),
+                    "current provision checkpoint does not bind the Desired image"
+                );
+            }
+        }
+        ReconcileStep::CleanupRelease { cleanup }
+            if binding == DesiredCheckpointBinding::Current =>
+        {
+            validate_current_cleanup_checkpoint(desired, checkpoint, cleanup, blockd)?;
+        }
+        ReconcileStep::Quarantined if binding == DesiredCheckpointBinding::Current => {
+            anyhow::ensure!(
+                checkpoint
+                    .volumes
+                    .iter()
+                    .all(|volume| volume.devices.is_empty()),
+                "quarantined pre-launch checkpoint contains a device"
             );
         }
         _ => anyhow::bail!("pre-launch scanner encountered an unsupported Runtime step"),
     }
+    Ok(())
+}
+
+fn current_acquire_adoption_is_closed(
+    checkpoint: &RuntimeCheckpoint,
+    intent: &cats_api::runtime_reconciliation::VolumeIntent,
+    blockd: Option<&AuthorizedBlockdInventoryEvidence>,
+) -> bool {
+    let [observed] = checkpoint.volumes.as_slice() else {
+        return false;
+    };
+    let VolumeAuthorityEvidence::Owned {
+        attachment_id,
+        attachment_epoch,
+        head,
+    } = &observed.authority
+    else {
+        return false;
+    };
+    let Some(expected_epoch) = (match &intent.acquire {
+        cats_api::runtime_reconciliation::VolumeAcquire::Normal {
+            expected_unowned_epoch,
+            ..
+        } => expected_unowned_epoch
+            .get()
+            .checked_add(1)
+            .and_then(cats_api::runtime_reconciliation::FenceEpoch::new),
+        cats_api::runtime_reconciliation::VolumeAcquire::Takeover { .. } => None,
+    }) else {
+        return false;
+    };
+    observed.volume_intent_id.as_ref() == Some(&intent.volume_intent_id)
+        && observed.disk_id.as_ref() == Some(&intent.disk_id)
+        && observed.volume_id == intent.volume_id
+        && observed.size_bytes == Some(intent.size_bytes)
+        && observed.durability == Some(intent.durability)
+        && attachment_id == &intent.attachment_id
+        && *attachment_epoch == expected_epoch
+        && head.generation.get() == 0
+        && observed.devices.is_empty()
+        && (observed.local_lineages.is_empty()
+            || blockd.is_some_and(|blockd| {
+                blockd.checkpoint.attachment.identity.attachment_id == *attachment_id
+                    && blockd.checkpoint.attachment.identity.attachment_epoch == *attachment_epoch
+            }))
+}
+
+fn validate_current_cleanup_checkpoint(
+    desired: &DesiredRuntimeSpec,
+    checkpoint: &RuntimeCheckpoint,
+    cleanup: &cats_api::runtime_reconciliation::CleanupRelease,
+    blockd: Option<&AuthorizedBlockdInventoryEvidence>,
+) -> anyhow::Result<()> {
+    let [intent] = desired.volumes.as_slice() else {
+        anyhow::bail!("current cleanup requires one root intent")
+    };
+    let [observed] = checkpoint.volumes.as_slice() else {
+        anyhow::bail!("current cleanup requires one observed root")
+    };
+    let (
+        cats_api::runtime_reconciliation::CleanupTarget::Volume {
+            volume_id,
+            attachment_id,
+            attachment_epoch,
+        },
+        Some(replay),
+    ) = (&cleanup.target, &cleanup.volume_release)
+    else {
+        anyhow::bail!("current cleanup is not an exact Volume release")
+    };
+    anyhow::ensure!(
+        cleanup.inventory_session.node_id == desired.placement.node_id
+            && cleanup.desired_read_position >= cleanup.inventory_read_position
+            && volume_id == &intent.volume_id
+            && attachment_id == &intent.attachment_id
+            && replay.disposition == intent.disposition
+            && observed.volume_intent_id.as_ref() == Some(&intent.volume_intent_id)
+            && observed.disk_id.as_ref() == Some(&intent.disk_id)
+            && observed.volume_id == intent.volume_id
+            && observed.size_bytes == Some(intent.size_bytes)
+            && observed.durability == Some(intent.durability)
+            && observed.devices.is_empty()
+            && blockd.is_some_and(|blockd| {
+                blockd.checkpoint.attachment.identity.attachment_id == *attachment_id
+                    && blockd.checkpoint.attachment.identity.attachment_epoch == *attachment_epoch
+            }),
+        "current cleanup checkpoint does not bind the exact stale lineage"
+    );
+    Ok(())
+}
+
+fn validate_superseded_acquire_checkpoint(
+    checkpoint: &RuntimeCheckpoint,
+    request: &cats_api::runtime_reconciliation::VolumeAcquireRequest,
+) -> anyhow::Result<()> {
+    let cats_api::runtime_reconciliation::VolumeAcquireRequest::Normal {
+        volume_id,
+        attachment_id,
+        expected_unowned_epoch,
+        desired_revision,
+        placement_epoch,
+        lease_duration_ms,
+        ..
+    } = request
+    else {
+        anyhow::bail!("superseded first-slice checkpoint is not a normal acquire")
+    };
+    let [volume] = checkpoint.volumes.as_slice() else {
+        anyhow::bail!("superseded Acquire checkpoint does not contain one Volume")
+    };
+    anyhow::ensure!(
+        volume.volume_id == *volume_id
+            && volume.disk_kind == cats_api::runtime_reconciliation::ObservedDiskKind::Root
+            && volume.size_bytes.is_some()
+            && volume.durability.is_some()
+            && volume.local_lineages.is_empty()
+            && volume.devices.is_empty()
+            && matches!(
+                volume.authority,
+                VolumeAuthorityEvidence::Unowned {
+                    attachment_epoch,
+                    ..
+                } if attachment_epoch == *expected_unowned_epoch
+            )
+            && *desired_revision == checkpoint.desired_revision
+            && *placement_epoch == checkpoint.placement_epoch
+            && !attachment_id.as_str().is_empty()
+            && *lease_duration_ms > 0,
+        "superseded Acquire checkpoint is not a closed pre-effect journal"
+    );
     Ok(())
 }
 

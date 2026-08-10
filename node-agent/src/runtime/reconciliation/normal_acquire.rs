@@ -715,6 +715,22 @@ fn map_closed_release_error(
     volume: &VolumeIntent,
     accepted: &NormalAcquireAcceptedContext,
 ) -> NormalReleaseAttempt {
+    if matches!(
+        (status, error.error.as_ref()),
+        (
+            409,
+            RuntimeVolumeTransitionErrorDetail::TransitionPreconditionFailed {
+                cat_id,
+                problem: RuntimeVolumeTransitionPreconditionProblem::CleanupEvidenceMismatch
+                    | RuntimeVolumeTransitionPreconditionProblem::AuthorizationBranchConflict,
+            },
+        ) if cat_id == &request.cat_id
+    ) {
+        // These are definite A20/A22 rejections, not response loss. Replaying
+        // the same signed release after a point read cannot make its stale
+        // cleanup evidence or authorization branch current.
+        return NormalReleaseAttempt::StopForLocalContract;
+    }
     match map_closed_error(status, error, request, volume, accepted) {
         NormalAcquireAttempt::RetryExact => NormalReleaseAttempt::RetryExact,
         NormalAcquireAttempt::RefreshInventory => NormalReleaseAttempt::RefreshInventory,
@@ -1796,6 +1812,47 @@ mod tests {
                 expected
             );
         }
+    }
+
+    #[test]
+    fn definite_release_cleanup_conflicts_are_non_replayable_local_stops() {
+        let request = request();
+        let accepted = accepted_context();
+        let volume = volume();
+        for problem in [
+            RuntimeVolumeTransitionPreconditionProblem::CleanupEvidenceMismatch,
+            RuntimeVolumeTransitionPreconditionProblem::AuthorizationBranchConflict,
+        ] {
+            let error = RuntimeVolumeTransitionError {
+                version: ContractVersion::V1,
+                error: Box::new(
+                    RuntimeVolumeTransitionErrorDetail::TransitionPreconditionFailed {
+                        cat_id: request.cat_id.clone(),
+                        problem,
+                    },
+                ),
+                message: "definite release conflict".to_owned(),
+            };
+            assert_eq!(
+                map_closed_release_error(409, &error, &request, &volume, &accepted),
+                NormalReleaseAttempt::StopForLocalContract
+            );
+        }
+
+        let wrong_cat = RuntimeVolumeTransitionError {
+            version: ContractVersion::V1,
+            error: Box::new(
+                RuntimeVolumeTransitionErrorDetail::TransitionPreconditionFailed {
+                    cat_id: Id::new("other-cat").unwrap(),
+                    problem: RuntimeVolumeTransitionPreconditionProblem::CleanupEvidenceMismatch,
+                },
+            ),
+            message: "wrong Cat".to_owned(),
+        };
+        assert_eq!(
+            map_closed_release_error(409, &wrong_cat, &request, &volume, &accepted),
+            NormalReleaseAttempt::Ambiguous
+        );
     }
 
     #[test]

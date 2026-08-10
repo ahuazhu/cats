@@ -25,8 +25,8 @@ use std::time::{Duration, Instant};
 
 use anyhow::{bail, Context as _};
 use cats_api::runtime_reconciliation::{
-    decode_runtime_checkpoint, DesiredRuntimeSpec, DiskKind, FenceEpoch, HostPath, Id,
-    InventorySource, ObservedDiskKind, ObservedVolume, Sequence, VolumeAcquire, VolumeAdminState,
+    decode_runtime_checkpoint, DesiredRuntimeSpec, DiskKind, HostPath, Id, InventorySource,
+    ObservedDiskKind, ObservedVolume, RuntimeCheckpoint, Sequence, VolumeAcquire, VolumeAdminState,
     VolumeAuthorityEvidence, VolumeIntent, RUNTIME_CHECKPOINT_MAX_WIRE_BYTES,
 };
 #[cfg(test)]
@@ -48,7 +48,10 @@ use super::authorized_blockd::{
     IDENTITY_FILE, IDENTITY_TEMP, LAUNCH_CHECKPOINT_FILE, LAUNCH_CHECKPOINT_TEMP,
     MAX_AUTHORIZED_SERVING_BYTES, MAX_IDENTITY_BYTES, MAX_LAUNCH_CHECKPOINT_BYTES,
 };
-use super::inventory::AuthorizedBlockdInventoryEvidence;
+use super::inventory::{
+    AuthorityVolumeInventoryEvidence, AuthorizedBlockdInventoryEvidence, DesiredCheckpointBinding,
+    RuntimeCheckpointInventoryEvidence,
+};
 use super::{
     AuthorizedBlockdCheckpoint, CleanSlateInventoryScanner, InventoryAbsence, InventoryAbsenceProbe,
 };
@@ -71,9 +74,8 @@ const DEFAULT_PROC_ROOT: &str = "/proc";
 const DEFAULT_BLOCK_CLASS_ROOT: &str = "/sys/class/block";
 const DEFAULT_NETWORK_CLASS_ROOT: &str = "/sys/class/net";
 
-/// Read-only classification consumed by the explicit pre-scan mutation lane.
-/// The superseded variant is intentionally distinct so the stale-checkpoint
-/// planner can compose without teaching the scanner to mutate anything.
+/// Read-only classification consumed by the serialized pre-scan mutation
+/// lane. Classification never repairs, removes, or rewrites an entry.
 pub(crate) enum LocalPublicationRecoveryEvidence {
     None,
     CheckpointTemp { cat_id: Id },
@@ -1225,20 +1227,16 @@ fn scan_runtime_checkpoints(
             checkpoint.cat_id == desired.cat_id,
             "checkpoint filename and Cat identity disagree"
         );
-        if checkpoint.desired_revision != desired.desired_revision
-            || checkpoint.spec_digest != desired.spec_digest
-            || checkpoint.node_id != desired.placement.node_id
-            || checkpoint.placement_epoch != desired.placement.placement_epoch
-        {
-            // A complete checkpoint from a superseded assignment is not
-            // corruption. This first slice has no stale-checkpoint planner,
-            // so keep the scan incomplete instead of projecting it as current
-            // or trapping the Node in a residue error.
-            return Ok(InventoryAbsence::Unavailable);
-        }
+        let binding = checkpoint_binding(desired, &checkpoint)?;
         anyhow::ensure!(
             checkpoints
-                .insert(desired.cat_id.clone(), checkpoint)
+                .insert(
+                    desired.cat_id.clone(),
+                    RuntimeCheckpointInventoryEvidence {
+                        checkpoint,
+                        binding,
+                    },
+                )
                 .is_none(),
             "checkpoint inventory duplicated one Cat"
         );
@@ -1250,10 +1248,33 @@ fn scan_runtime_checkpoints(
     }
 }
 
-/// Classify one current-Desired local publication repair without changing the
-/// filesystem. Every namespace entry is validated before a candidate is
-/// returned, so a foreign or unsafe sibling fails closed rather than being
-/// hidden by an otherwise recoverable temp or partial grant publication.
+fn checkpoint_binding(
+    desired: &DesiredRuntimeSpec,
+    checkpoint: &RuntimeCheckpoint,
+) -> anyhow::Result<DesiredCheckpointBinding> {
+    anyhow::ensure!(
+        checkpoint.cat_id == desired.cat_id && checkpoint.node_id == desired.placement.node_id,
+        "checkpoint is not attributable to the current same-Node Desired"
+    );
+    if checkpoint.desired_revision == desired.desired_revision {
+        anyhow::ensure!(
+            checkpoint.spec_digest == desired.spec_digest
+                && checkpoint.placement_epoch == desired.placement.placement_epoch,
+            "same-revision checkpoint conflicts with current Desired"
+        );
+        return Ok(DesiredCheckpointBinding::Current);
+    }
+    anyhow::ensure!(
+        checkpoint.desired_revision < desired.desired_revision
+            && checkpoint.placement_epoch <= desired.placement.placement_epoch,
+        "checkpoint revision or placement is ahead of current Desired"
+    );
+    Ok(DesiredCheckpointBinding::Superseded)
+}
+
+/// Classify one publication or superseded-checkpoint recovery candidate
+/// without mutating the filesystem. Every sibling is validated before a
+/// candidate is returned, so a recoverable entry cannot hide foreign residue.
 pub(crate) fn classify_local_publication_recovery(
     context: &RuntimePreScanRecoveryContext,
 ) -> anyhow::Result<LocalPublicationRecoveryEvidence> {
@@ -1263,8 +1284,9 @@ pub(crate) fn classify_local_publication_recovery(
         return Ok(LocalPublicationRecoveryEvidence::None);
     };
     let directory = match open_state_namespace(&root, CHECKPOINT_NAMESPACE)? {
-        ManagedDirectory::Missing => return Ok(LocalPublicationRecoveryEvidence::None),
-        ManagedDirectory::Unavailable => return Ok(LocalPublicationRecoveryEvidence::None),
+        ManagedDirectory::Missing | ManagedDirectory::Unavailable => {
+            return Ok(LocalPublicationRecoveryEvidence::None)
+        }
         ManagedDirectory::Open(directory) => directory,
     };
     let mut budget = ProbeLimits::default().state_entries;
@@ -1473,22 +1495,6 @@ fn scan_authorized_blockd_data(
         let Some(desired) = desired_by_directory.get(cat_name) else {
             bail!("authorized blockd data namespace retains foreign Cat {cat_name}")
         };
-        let [intent] = desired.volumes.as_slice() else {
-            bail!("authorized blockd data Cat does not have one Desired root")
-        };
-        let VolumeAcquire::Normal {
-            expected_unowned_epoch,
-            ..
-        } = intent.acquire
-        else {
-            bail!("authorized blockd data Cat lacks normal acquire")
-        };
-        let Some(expected_epoch) = expected_unowned_epoch.get().checked_add(1) else {
-            bail!("authorized blockd data Cat has an exhausted acquire epoch")
-        };
-        let expected_epoch = FenceEpoch::new(expected_epoch)
-            .context("authorized blockd attachment epoch exceeds wire range")?;
-        scan.candidate_volume_ids.insert(intent.volume_id.clone());
 
         let Some(cat_directory) =
             open_exact_only_child_directory(&directory, &cat_entry, root, context)?
@@ -1496,36 +1502,20 @@ fn scan_authorized_blockd_data(
             scan.complete = false;
             continue;
         };
-        let Some(volume_directory) = descend_exact_directory(
-            &cat_directory,
-            &format!("volume-{}", intent.volume_id),
-            root,
-            &mut budget,
-            context,
-        )?
+        let Some((volume_name, volume_directory)) =
+            descend_only_directory(&cat_directory, root, &mut budget, context, "volume")?
         else {
             scan.complete = false;
             continue;
         };
-        let Some(attachment_directory) = descend_exact_directory(
-            &volume_directory,
-            &format!("attachment-{}", intent.attachment_id),
-            root,
-            &mut budget,
-            context,
-        )?
+        let Some((attachment_name, attachment_directory)) =
+            descend_only_directory(&volume_directory, root, &mut budget, context, "attachment")?
         else {
             scan.complete = false;
             continue;
         };
-        let epoch_name = format!("epoch-{}", expected_epoch.get());
-        let Some(epoch_directory) = descend_exact_directory(
-            &attachment_directory,
-            &epoch_name,
-            root,
-            &mut budget,
-            context,
-        )?
+        let Some((epoch_name, epoch_directory)) =
+            descend_only_directory(&attachment_directory, root, &mut budget, context, "epoch")?
         else {
             scan.complete = false;
             continue;
@@ -1624,26 +1614,21 @@ fn scan_authorized_blockd_data(
             identity == attachment.identity && attachment == checkpoint.attachment,
             "authorized blockd files do not form one exact lineage"
         );
-        if checkpoint.desired.cat_id == desired.cat_id
-            && (checkpoint.desired.desired_revision != desired.desired_revision
-                || checkpoint.desired.spec_digest != desired.spec_digest
-                || checkpoint.desired.placement != desired.placement)
-        {
-            scan.complete = false;
-            continue;
-        }
+        let binding = authorized_blockd_binding(desired, &checkpoint)?;
         anyhow::ensure!(
-            checkpoint.desired == **desired
-                && checkpoint.volume == *intent
-                && identity.attachment_epoch == expected_epoch,
-            "authorized blockd files do not bind the current Desired lineage"
+            cat_name == format!("cat-{}", checkpoint.desired.cat_id)
+                && volume_name == format!("volume-{}", identity.volume_id)
+                && attachment_name == format!("attachment-{}", identity.attachment_id)
+                && epoch_name == format!("epoch-{}", identity.attachment_epoch.get()),
+            "authorized blockd physical path and checkpoint identity disagree"
         );
+        scan.candidate_volume_ids.insert(identity.volume_id.clone());
         let data_directory = state_path
             .join(DATA_NAMESPACE)
             .join(cat_name)
-            .join(format!("volume-{}", intent.volume_id))
-            .join(format!("attachment-{}", intent.attachment_id))
-            .join(epoch_name);
+            .join(&volume_name)
+            .join(&attachment_name)
+            .join(&epoch_name);
         let data_directory = HostPath::new(
             data_directory
                 .to_str()
@@ -1658,6 +1643,7 @@ fn scan_authorized_blockd_data(
                     AuthorizedBlockdInventoryEvidence {
                         data_directory,
                         checkpoint,
+                        binding,
                     },
                 )
                 .is_none(),
@@ -1665,6 +1651,58 @@ fn scan_authorized_blockd_data(
         );
     }
     Ok(scan)
+}
+
+fn descend_only_directory(
+    parent: &File,
+    root: &File,
+    budget: &mut usize,
+    context: &RuntimeInventoryScanContext,
+    label: &str,
+) -> anyhow::Result<Option<(String, File)>> {
+    let Some(entries) = strict_directory_entries(parent, budget, context)? else {
+        return Ok(None);
+    };
+    if entries.is_empty() {
+        return Ok(None);
+    }
+    anyhow::ensure!(
+        entries.len() == 1,
+        "authorized blockd {label} directory contains duplicate or foreign entries"
+    );
+    let name = entries[0]
+        .name
+        .to_str()
+        .with_context(|| format!("authorized blockd {label} path is not UTF-8"))?
+        .to_owned();
+    let Some(directory) = open_strict_child_directory(parent, &entries[0], root)? else {
+        return Ok(None);
+    };
+    Ok(Some((name, directory)))
+}
+
+fn authorized_blockd_binding(
+    desired: &DesiredRuntimeSpec,
+    checkpoint: &AuthorizedBlockdCheckpoint,
+) -> anyhow::Result<DesiredCheckpointBinding> {
+    let stored = &checkpoint.desired;
+    anyhow::ensure!(
+        stored.cat_id == desired.cat_id && stored.placement.node_id == desired.placement.node_id,
+        "authorized blockd checkpoint is not attributable to current same-Node Desired"
+    );
+    if stored.desired_revision == desired.desired_revision {
+        anyhow::ensure!(
+            stored == desired,
+            "same-revision authorized blockd checkpoint conflicts with current Desired"
+        );
+        return Ok(DesiredCheckpointBinding::Current);
+    }
+    anyhow::ensure!(
+        stored.desired_revision < desired.desired_revision
+            && stored.placement.placement_epoch <= desired.placement.placement_epoch,
+        "authorized blockd checkpoint revision or placement is ahead of current Desired"
+    );
+    Ok(DesiredCheckpointBinding::Superseded)
 }
 
 fn decode_exact_json<T>(bytes: &[u8], label: &str) -> anyhow::Result<T>
@@ -1941,9 +1979,87 @@ impl InventoryAbsenceProbe for MetadataStoreProbe {
         };
         let desired_volume_ids: BTreeSet<Id> = desired_volumes.keys().cloned().collect();
         let mut candidate_volume_ids = desired_volume_ids.clone();
+        let mut stale_volumes: BTreeMap<Id, StaleVolumeProjection> = BTreeMap::new();
+        let mut cleanup_replays = BTreeMap::new();
 
         let mut local_candidates_complete = true;
         if let Some(root) = clone_state_root(&self.state_directory)? {
+            match scan_runtime_checkpoints(&root, context, self.limits)? {
+                InventoryAbsence::RuntimeCheckpoints(checkpoints) => {
+                    for (cat_id, evidence) in checkpoints {
+                        if evidence.binding == DesiredCheckpointBinding::Current {
+                            if let cats_api::runtime_reconciliation::ReconcileStep::CleanupRelease {
+                                cleanup,
+                            } = &evidence.checkpoint.step
+                            {
+                                if let cats_api::runtime_reconciliation::CleanupTarget::Volume {
+                                    volume_id,
+                                    ..
+                                } = &cleanup.target
+                                {
+                                    anyhow::ensure!(
+                                        cleanup_replays
+                                            .insert(volume_id.clone(), cleanup.clone())
+                                            .is_none(),
+                                        "multiple current cleanups name one Volume"
+                                    );
+                                }
+                            }
+                        }
+                        let carries_superseded_acquire = matches!(
+                            &evidence.checkpoint.step,
+                            cats_api::runtime_reconciliation::ReconcileStep::AcquireVolume {
+                                request: cats_api::runtime_reconciliation::VolumeAcquireRequest::Normal {
+                                    desired_revision,
+                                    ..
+                                },
+                            } if *desired_revision < evidence.checkpoint.desired_revision
+                        );
+                        let carries_owned_adoption = evidence.binding
+                            == DesiredCheckpointBinding::Current
+                            && matches!(
+                                evidence.checkpoint.step,
+                                cats_api::runtime_reconciliation::ReconcileStep::AcquireVolume { .. }
+                            )
+                            && evidence.checkpoint.volumes.iter().any(|volume| {
+                                matches!(volume.authority, VolumeAuthorityEvidence::Owned { .. })
+                            });
+                        let carries_quarantined_lineage = evidence.binding
+                            == DesiredCheckpointBinding::Current
+                            && matches!(
+                                evidence.checkpoint.step,
+                                cats_api::runtime_reconciliation::ReconcileStep::Quarantined
+                            );
+                        if evidence.binding != DesiredCheckpointBinding::Superseded
+                            && !carries_superseded_acquire
+                            && !carries_owned_adoption
+                            && !carries_quarantined_lineage
+                        {
+                            continue;
+                        }
+                        for observed in &evidence.checkpoint.volumes {
+                            insert_stale_volume_projection(
+                                &mut stale_volumes,
+                                StaleVolumeProjection {
+                                    cat_id: cat_id.clone(),
+                                    observed: observed.clone(),
+                                    conflict_only: carries_quarantined_lineage
+                                        || carries_owned_adoption,
+                                    acquire_request: match &evidence.checkpoint.step {
+                                        cats_api::runtime_reconciliation::ReconcileStep::AcquireVolume {
+                                            request,
+                                        } => Some(request.clone()),
+                                        _ => None,
+                                    },
+                                },
+                            )?;
+                        }
+                    }
+                }
+                InventoryAbsence::Empty => {}
+                InventoryAbsence::Unavailable => local_candidates_complete = false,
+                _ => unreachable!("checkpoint scan returns only checkpoint evidence"),
+            }
             match scan_authorized_blockd_data(
                 &root,
                 self.state_directory.path(),
@@ -1952,6 +2068,49 @@ impl InventoryAbsenceProbe for MetadataStoreProbe {
             ) {
                 Ok(data) => {
                     candidate_volume_ids.extend(data.candidate_volume_ids);
+                    for (cat_id, evidence) in &data.evidence {
+                        let carries_superseded_receipt = evidence
+                            .checkpoint
+                            .attachment
+                            .acquire_request
+                            .desired_revision
+                            < evidence.checkpoint.desired.desired_revision;
+                        if evidence.binding != DesiredCheckpointBinding::Superseded
+                            && !carries_superseded_receipt
+                        {
+                            continue;
+                        }
+                        let volume = &evidence.checkpoint.volume;
+                        insert_stale_volume_projection(
+                            &mut stale_volumes,
+                            StaleVolumeProjection {
+                                cat_id: cat_id.clone(),
+                                conflict_only: false,
+                                observed: ObservedVolume {
+                                    volume_intent_id: Some(volume.volume_intent_id.clone()),
+                                    disk_id: Some(volume.disk_id.clone()),
+                                    volume_id: volume.volume_id.clone(),
+                                    disk_kind: cats_api::runtime_reconciliation::ObservedDiskKind::Root,
+                                    size_bytes: Some(volume.size_bytes),
+                                    durability: Some(volume.durability),
+                                    authority: VolumeAuthorityEvidence::Unavailable,
+                                    local_lineages: Vec::new(),
+                                    devices: Vec::new(),
+                                },
+                                acquire_request: Some(
+                                    cats_api::runtime_reconciliation::VolumeAcquireRequest::Normal {
+                                        volume_id: evidence.checkpoint.attachment.acquire_request.volume_id.clone(),
+                                        transition_id: evidence.checkpoint.attachment.acquire_request.transition_id.clone(),
+                                        attachment_id: evidence.checkpoint.attachment.acquire_request.attachment_id.clone(),
+                                        expected_unowned_epoch: evidence.checkpoint.attachment.acquire_request.expected_unowned_epoch,
+                                        desired_revision: evidence.checkpoint.attachment.acquire_request.desired_revision,
+                                        placement_epoch: evidence.checkpoint.attachment.acquire_request.placement_epoch,
+                                        lease_duration_ms: evidence.checkpoint.attachment.acquire_request.lease_duration_ms,
+                                    },
+                                ),
+                            },
+                        )?;
+                    }
                     local_candidates_complete &= data.complete;
                 }
                 Err(_) => {
@@ -1985,6 +2144,7 @@ impl InventoryAbsenceProbe for MetadataStoreProbe {
         } else {
             local_candidates_complete = false;
         }
+        candidate_volume_ids.extend(stale_volumes.keys().cloned());
 
         // Every nonempty candidate is read through the strict authority port.
         // An empty candidate set is still unavailable because point reads
@@ -2017,29 +2177,102 @@ impl InventoryAbsenceProbe for MetadataStoreProbe {
                 if records.len() != candidate_volume_ids.len() {
                     return Ok(InventoryAbsence::Unavailable);
                 }
-                if let Some(local_only) =
-                    candidate_volume_ids.difference(&desired_volume_ids).next()
+                if let Some(local_only) = candidate_volume_ids
+                    .difference(&desired_volume_ids)
+                    .find(|volume_id| !stale_volumes.contains_key(*volume_id))
                 {
                     bail!(
                         "metadata authority/local namespaces retain volume outside Desired: {local_only}"
                     );
                 }
 
-                let mut by_cat: BTreeMap<Id, Vec<ObservedVolume>> = BTreeMap::new();
+                let mut by_cat: BTreeMap<Id, Vec<AuthorityVolumeInventoryEvidence>> =
+                    BTreeMap::new();
                 for (volume_id, (desired, intent)) in desired_volumes {
                     let Some(record) = records.get(&volume_id) else {
                         return Ok(InventoryAbsence::Unavailable);
                     };
-                    let observed = observe_desired_volume(desired, intent, record)?;
-                    by_cat
-                        .entry(desired.cat_id.clone())
-                        .or_default()
-                        .push(observed);
+                    let stale_request = stale_volumes
+                        .get(&volume_id)
+                        .and_then(|projection| projection.acquire_request.as_ref());
+                    let conflict_only = stale_volumes
+                        .get(&volume_id)
+                        .is_some_and(|projection| projection.conflict_only);
+                    let observed = observe_desired_volume(
+                        desired,
+                        intent,
+                        record,
+                        stale_request,
+                        cleanup_replays.get(&volume_id),
+                        conflict_only,
+                    )?;
+                    by_cat.entry(desired.cat_id.clone()).or_default().push(
+                        AuthorityVolumeInventoryEvidence {
+                            observed,
+                            record: record.clone(),
+                        },
+                    );
+                }
+                for (volume_id, projection) in stale_volumes {
+                    if desired_volume_ids.contains(&volume_id) {
+                        continue;
+                    }
+                    let Some(record) = records.get(&volume_id) else {
+                        return Ok(InventoryAbsence::Unavailable);
+                    };
+                    let observed = observe_stale_volume(&projection, record)?;
+                    by_cat.entry(projection.cat_id).or_default().push(
+                        AuthorityVolumeInventoryEvidence {
+                            observed,
+                            record: record.clone(),
+                        },
+                    );
+                }
+                for volumes in by_cat.values_mut() {
+                    volumes.sort_by(|left, right| {
+                        left.observed.volume_id.cmp(&right.observed.volume_id)
+                    });
                 }
                 Ok(InventoryAbsence::DesiredVolumes(by_cat))
             }
         }
     }
+}
+
+#[derive(Debug, Clone)]
+struct StaleVolumeProjection {
+    cat_id: Id,
+    observed: ObservedVolume,
+    acquire_request: Option<cats_api::runtime_reconciliation::VolumeAcquireRequest>,
+    conflict_only: bool,
+}
+
+fn insert_stale_volume_projection(
+    projections: &mut BTreeMap<Id, StaleVolumeProjection>,
+    projection: StaleVolumeProjection,
+) -> anyhow::Result<()> {
+    let volume_id = projection.observed.volume_id.clone();
+    if let Some(existing) = projections.get_mut(&volume_id) {
+        anyhow::ensure!(
+            existing.cat_id == projection.cat_id
+                && existing.observed.volume_intent_id == projection.observed.volume_intent_id
+                && existing.observed.disk_id == projection.observed.disk_id
+                && existing.observed.disk_kind == projection.observed.disk_kind
+                && existing.observed.size_bytes == projection.observed.size_bytes
+                && existing.observed.durability == projection.observed.durability
+                && (existing.acquire_request.is_none()
+                    || projection.acquire_request.is_none()
+                    || existing.acquire_request == projection.acquire_request),
+            "stale checkpoint sources disagree on one Volume identity"
+        );
+        existing.conflict_only |= projection.conflict_only;
+        if existing.acquire_request.is_none() && projection.acquire_request.is_some() {
+            existing.acquire_request = projection.acquire_request;
+        }
+        return Ok(());
+    }
+    projections.insert(volume_id, projection);
+    Ok(())
 }
 
 fn supported_desired_volumes(
@@ -2077,6 +2310,9 @@ fn observe_desired_volume(
     desired: &DesiredRuntimeSpec,
     intent: &VolumeIntent,
     record: &VolumeRecord,
+    stale_request: Option<&cats_api::runtime_reconciliation::VolumeAcquireRequest>,
+    cleanup: Option<&cats_api::runtime_reconciliation::CleanupRelease>,
+    conflict_only: bool,
 ) -> anyhow::Result<ObservedVolume> {
     validate_volume_record(record).context("validate Desired-bound authority Volume")?;
     anyhow::ensure!(
@@ -2092,23 +2328,36 @@ fn observe_desired_volume(
         "authority Volume durability does not match Desired"
     );
 
-    if record.lease_owner.as_ref() == Some(&intent.attachment_id) {
-        let VolumeAcquire::Normal {
-            transition_id,
-            expected_unowned_epoch,
-        } = &intent.acquire
-        else {
-            anyhow::bail!("the first Running slice supports only normal acquire")
-        };
-        let Some(cats_api::runtime_reconciliation::LastVolumeTransition::NormalAcquire {
-            request,
-            result,
-        }) = &record.last_transition
-        else {
-            anyhow::bail!("Desired attachment owner lacks its exact normal-acquire receipt")
-        };
-        anyhow::ensure!(
-            request.volume_id == intent.volume_id
+    if record.lease_owner.is_none() {
+        if let Some(cleanup) = cleanup {
+            validate_completed_cleanup(record, cleanup)?;
+        }
+    }
+
+    if let Some(owner) = &record.lease_owner {
+        if owner != &intent.attachment_id {
+            anyhow::ensure!(
+                conflict_only
+                    || stale_request
+                        .is_some_and(|stale| stale_normal_marker_matches(record, stale)),
+                "Desired Volume is owned by an untyped foreign attachment"
+            );
+        } else {
+            let VolumeAcquire::Normal {
+                transition_id,
+                expected_unowned_epoch,
+            } = &intent.acquire
+            else {
+                anyhow::bail!("the first Running slice supports only normal acquire")
+            };
+            let Some(cats_api::runtime_reconciliation::LastVolumeTransition::NormalAcquire {
+                request,
+                result,
+            }) = &record.last_transition
+            else {
+                anyhow::bail!("Desired attachment owner lacks its exact normal-acquire receipt")
+            };
+            let current_marker_matches = request.volume_id == intent.volume_id
                 && request.transition_id == *transition_id
                 && request.attachment_id == intent.attachment_id
                 && request.expected_unowned_epoch == *expected_unowned_epoch
@@ -2117,9 +2366,14 @@ fn observe_desired_volume(
                 && result.volume_id == intent.volume_id
                 && result.transition_id == *transition_id
                 && result.attachment_id == intent.attachment_id
-                && result.resulting_epoch == record.lease_epoch,
-            "Desired attachment owner does not bind the current Desired grant"
-        );
+                && result.resulting_epoch == record.lease_epoch;
+            let stale_marker_matches =
+                stale_request.is_some_and(|stale| stale_normal_marker_matches(record, stale));
+            anyhow::ensure!(
+                current_marker_matches || stale_marker_matches || conflict_only,
+                "Desired attachment owner lacks current, typed stale, or quarantined evidence"
+            );
+        }
     }
 
     let authority = match &record.admin_state {
@@ -2151,6 +2405,163 @@ fn observe_desired_volume(
         local_lineages: Vec::new(),
         devices: Vec::new(),
     })
+}
+
+fn stale_normal_marker_matches(
+    record: &VolumeRecord,
+    stale: &cats_api::runtime_reconciliation::VolumeAcquireRequest,
+) -> bool {
+    let cats_api::runtime_reconciliation::VolumeAcquireRequest::Normal {
+        volume_id,
+        transition_id,
+        attachment_id,
+        expected_unowned_epoch,
+        desired_revision,
+        placement_epoch,
+        lease_duration_ms,
+    } = stale
+    else {
+        return false;
+    };
+    let Some(cats_api::runtime_reconciliation::LastVolumeTransition::NormalAcquire {
+        request,
+        result,
+    }) = &record.last_transition
+    else {
+        return false;
+    };
+    record.lease_owner.as_ref() == Some(attachment_id)
+        && request.volume_id == *volume_id
+        && request.transition_id == *transition_id
+        && request.attachment_id == *attachment_id
+        && request.expected_unowned_epoch == *expected_unowned_epoch
+        && request.desired_revision == *desired_revision
+        && request.placement_epoch == *placement_epoch
+        && request.lease_duration_ms == *lease_duration_ms
+        && result.volume_id == *volume_id
+        && result.transition_id == *transition_id
+        && result.attachment_id == *attachment_id
+        && result.resulting_epoch == record.lease_epoch
+}
+
+fn validate_completed_cleanup(
+    record: &VolumeRecord,
+    cleanup: &cats_api::runtime_reconciliation::CleanupRelease,
+) -> anyhow::Result<()> {
+    let (
+        cats_api::runtime_reconciliation::CleanupTarget::Volume {
+            volume_id,
+            attachment_id,
+            attachment_epoch,
+        },
+        Some(replay),
+        Some(cats_api::runtime_reconciliation::LastVolumeTransition::Release { request, result }),
+    ) = (
+        &cleanup.target,
+        &cleanup.volume_release,
+        &record.last_transition,
+    )
+    else {
+        anyhow::bail!("Unowned cleanup Volume lacks its exact release marker")
+    };
+    let resulting_epoch = attachment_epoch
+        .get()
+        .checked_add(1)
+        .and_then(cats_api::runtime_reconciliation::FenceEpoch::new)
+        .context("cleanup release epoch overflowed")?;
+    anyhow::ensure!(
+        volume_id == &record.volume_id
+            && request.volume_id == *volume_id
+            && request.transition_id == replay.release_transition_id
+            && request.attachment_id == *attachment_id
+            && request.expected_epoch == *attachment_epoch
+            && result.volume_id == *volume_id
+            && result.transition_id == replay.release_transition_id
+            && result.released_attachment_id == *attachment_id
+            && result.resulting_epoch == resulting_epoch
+            && result.resulting_head == record.head
+            && record.lease_epoch == resulting_epoch
+            && record.lease_expires_at.is_none()
+            && replay.generation == record.head.generation,
+        "Unowned cleanup Volume does not match its exact release replay"
+    );
+    Ok(())
+}
+
+fn observe_stale_volume(
+    projection: &StaleVolumeProjection,
+    record: &VolumeRecord,
+) -> anyhow::Result<ObservedVolume> {
+    validate_volume_record(record).context("validate stale-checkpoint authority Volume")?;
+    anyhow::ensure!(
+        record.volume_id == projection.observed.volume_id
+            && projection.observed.size_bytes == Some(record.size_bytes)
+            && projection.observed.durability == Some(record.durability),
+        "stale checkpoint Volume projection conflicts with authority"
+    );
+    if let (Some(owner), Some(stale)) = (&record.lease_owner, &projection.acquire_request) {
+        let cats_api::runtime_reconciliation::VolumeAcquireRequest::Normal {
+            volume_id,
+            transition_id,
+            attachment_id,
+            expected_unowned_epoch,
+            desired_revision,
+            placement_epoch,
+            lease_duration_ms,
+        } = stale
+        else {
+            anyhow::bail!("stale first-slice acquire is not normal")
+        };
+        let Some(cats_api::runtime_reconciliation::LastVolumeTransition::NormalAcquire {
+            request,
+            result,
+        }) = &record.last_transition
+        else {
+            anyhow::bail!("stale owned Volume lacks its exact acquire marker")
+        };
+        anyhow::ensure!(
+            owner == attachment_id
+                && request.volume_id == *volume_id
+                && request.transition_id == *transition_id
+                && request.attachment_id == *attachment_id
+                && request.expected_unowned_epoch == *expected_unowned_epoch
+                && request.desired_revision == *desired_revision
+                && request.placement_epoch == *placement_epoch
+                && request.lease_duration_ms == *lease_duration_ms
+                && result.volume_id == *volume_id
+                && result.transition_id == *transition_id
+                && result.attachment_id == *attachment_id
+                && result.resulting_epoch == record.lease_epoch,
+            "stale owned Volume marker does not match its checkpoint"
+        );
+    } else if record.lease_owner.is_some() {
+        anyhow::ensure!(
+            projection.conflict_only,
+            "owned stale Volume lacks typed acquire or quarantine evidence"
+        );
+    }
+    let mut observed = projection.observed.clone();
+    observed.authority = match &record.admin_state {
+        VolumeAdminState::Active => match &record.lease_owner {
+            Some(attachment_id) => VolumeAuthorityEvidence::Owned {
+                attachment_id: attachment_id.clone(),
+                attachment_epoch: record.lease_epoch,
+                head: record.head.clone(),
+            },
+            None => VolumeAuthorityEvidence::Unowned {
+                attachment_epoch: record.lease_epoch,
+                head: record.head.clone(),
+            },
+        },
+        VolumeAdminState::Deleting { delete_id } => VolumeAuthorityEvidence::Deleting {
+            delete_id: delete_id.clone(),
+            attachment_epoch: record.lease_epoch,
+            head: record.head.clone(),
+        },
+    };
+    observed.local_lineages.clear();
+    observed.devices.clear();
+    Ok(observed)
 }
 
 struct LocalVolumeCandidates {
@@ -2433,26 +2844,6 @@ fn open_exact_only_child_directory(
 ) -> anyhow::Result<Option<File>> {
     context.check_active()?;
     open_strict_child_directory(parent, entry, root)
-}
-
-fn descend_exact_directory(
-    parent: &File,
-    expected_name: &str,
-    root: &File,
-    budget: &mut usize,
-    context: &RuntimeInventoryScanContext,
-) -> anyhow::Result<Option<File>> {
-    let Some(entries) = strict_directory_entries(parent, budget, context)? else {
-        return Ok(None);
-    };
-    if entries.is_empty() {
-        return Ok(None);
-    }
-    anyhow::ensure!(
-        entries.len() == 1 && entries[0].name == OsStr::new(expected_name),
-        "authorized blockd directory does not contain only {expected_name}"
-    );
-    open_strict_child_directory(parent, &entries[0], root)
 }
 
 fn open_strict_child_directory(
@@ -3194,6 +3585,37 @@ mod tests {
 
     const SNAPSHOT: &[u8] = br#"{"desired_specs":[],"expires_at_unix_ms":1720000030000,"issued_at_unix_ms":1720000000000,"read_position":12,"request_sequence":1,"session":{"agent_instance_id":"44444444444444444444444444444444","agent_session_epoch":2,"node_boot_id":"33333333333333333333333333333333","node_id":"node_a"},"version":1}"#;
 
+    struct TestUnavailableBlobStore;
+
+    impl BlobStore for TestUnavailableBlobStore {
+        fn put_immutable(&self, key: &str, _data: &[u8]) -> Result<(), BlobError> {
+            Err(test_blob_error(key))
+        }
+
+        fn get(&self, key: &str) -> Result<Vec<u8>, BlobError> {
+            Err(test_blob_error(key))
+        }
+
+        fn exists(&self, key: &str) -> Result<bool, BlobError> {
+            Err(test_blob_error(key))
+        }
+
+        fn delete(&self, key: &str) -> Result<(), BlobError> {
+            Err(test_blob_error(key))
+        }
+
+        fn list(&self, prefix: &str) -> Result<Vec<String>, BlobError> {
+            Err(test_blob_error(prefix))
+        }
+    }
+
+    fn test_blob_error(key: &str) -> BlobError {
+        BlobError::Backend {
+            key: key.to_owned(),
+            message: "test blob store unavailable".to_owned(),
+        }
+    }
+
     struct TestVolumeDataAuthority {
         present: bool,
         exact_record: Option<cats_storage::authority::VolumeRecord>,
@@ -3304,37 +3726,6 @@ mod tests {
             _candidate_volume_ids: &BTreeSet<Id>,
         ) -> cats_storage::authority::Result<NodeVolumeInventorySnapshot> {
             Err(cats_storage::authority::AuthorityError::BackendUnknown)
-        }
-    }
-
-    struct TestUnavailableBlobStore;
-
-    impl BlobStore for TestUnavailableBlobStore {
-        fn put_immutable(&self, key: &str, _data: &[u8]) -> Result<(), BlobError> {
-            Err(test_blob_error(key))
-        }
-
-        fn get(&self, key: &str) -> Result<Vec<u8>, BlobError> {
-            Err(test_blob_error(key))
-        }
-
-        fn exists(&self, key: &str) -> Result<bool, BlobError> {
-            Err(test_blob_error(key))
-        }
-
-        fn delete(&self, key: &str) -> Result<(), BlobError> {
-            Err(test_blob_error(key))
-        }
-
-        fn list(&self, prefix: &str) -> Result<Vec<String>, BlobError> {
-            Err(test_blob_error(prefix))
-        }
-    }
-
-    fn test_blob_error(key: &str) -> BlobError {
-        BlobError::Backend {
-            key: key.to_owned(),
-            message: "test blob store unavailable".to_owned(),
         }
     }
 
@@ -4092,22 +4483,55 @@ mod tests {
     }
 
     #[test]
-    fn authority_owner_or_head_drift_never_projects_a_prepared_local_lineage() {
-        for drift_head in [false, true] {
+    fn incomplete_authority_marker_never_projects_a_prepared_local_lineage() {
+        enum Drift {
+            Owner,
+            Head,
+            LeaseExpiry,
+            AcquireMarker,
+        }
+
+        for drift in [
+            Drift::Owner,
+            Drift::Head,
+            Drift::LeaseExpiry,
+            Drift::AcquireMarker,
+        ] {
             let environment = TestEnvironment::new();
             let scan_context = assigned_context(true);
             let desired = scan_context.coordinates().desired.desired_specs[0].clone();
             let (mut record, attachment) = exact_owned_record_and_attachment(&desired);
             let data_directory = prepare_exact_lineage(&environment, &desired, &attachment);
             persist_acquire_checkpoint(&environment, &desired, &attachment);
-            if drift_head {
-                record.head = RemoteHead {
-                    generation: Generation::new(1).unwrap(),
-                    root_hash: Some(Sha256Digest::from_bytes([3; 32])),
-                    root_object_id: Some(AsciiText::new("roots/drift").unwrap()),
-                };
-            } else {
-                record.lease_owner = Some(Id::new("att_foreign").unwrap());
+            match drift {
+                Drift::Owner => {
+                    record.lease_owner = Some(Id::new("att_foreign").unwrap());
+                }
+                Drift::Head => {
+                    record.head = RemoteHead {
+                        generation: Generation::new(1).unwrap(),
+                        root_hash: Some(Sha256Digest::from_bytes([3; 32])),
+                        root_object_id: Some(AsciiText::new("roots/drift").unwrap()),
+                    };
+                }
+                Drift::LeaseExpiry => {
+                    record.lease_expires_at = Some(
+                        cats_storage::authority::UnixMillis::new(
+                            attachment.lease_expires_at.get() + 1,
+                        )
+                        .unwrap(),
+                    );
+                }
+                Drift::AcquireMarker => {
+                    let Some(cats_storage::authority::LastVolumeTransition::NormalAcquire {
+                        request,
+                        ..
+                    }) = &mut record.last_transition
+                    else {
+                        unreachable!("fixture has a normal-acquire marker")
+                    };
+                    request.lease_duration_ms += 1;
+                }
             }
             let before = leaf_snapshot(&data_directory);
             let (authority, _calls) = TestVolumeDataAuthority::exact(record);
@@ -4124,7 +4548,7 @@ mod tests {
     }
 
     #[test]
-    fn superseded_checkpoint_revision_spec_or_placement_is_incomplete_not_corruption() {
+    fn superseded_checkpoint_revision_spec_or_placement_is_typed_physical_evidence() {
         enum Supersede {
             Revision,
             Spec,
@@ -4143,9 +4567,11 @@ mod tests {
             match supersede {
                 Supersede::Revision => current.desired_revision = Revision::new(2).unwrap(),
                 Supersede::Spec => {
+                    current.desired_revision = Revision::new(2).unwrap();
                     current.runtime.guest_config_digest = Sha256Digest::from_bytes([4; 32]);
                 }
                 Supersede::Placement => {
+                    current.desired_revision = Revision::new(2).unwrap();
                     current.placement.placement_epoch = Epoch::new(2).unwrap();
                 }
             }
@@ -4155,13 +4581,28 @@ mod tests {
             let (authority, _calls) = TestVolumeDataAuthority::exact(record);
             let reader = Arc::new(VolumeDataAuthorityMetadataReader::start(authority).unwrap());
             let scanner = scanner_with_metadata_authority(environment.config(), reader).unwrap();
-            let RuntimeInventoryScanOutcome::Incomplete {
-                unavailable_sources,
-            } = scanner.scan_complete(scan_context).unwrap()
+            let RuntimeInventoryScanOutcome::Complete(inventory) =
+                scanner.scan_complete(scan_context).unwrap()
             else {
-                panic!("superseded checkpoint must stay incomplete until a stale planner exists")
+                panic!("superseded checkpoint must remain typed full-inventory evidence")
             };
-            assert!(unavailable_sources.contains(&InventorySource::Checkpoint));
+            let runtime = &inventory.runtimes()[0];
+            assert_eq!(
+                runtime
+                    .applied_desired
+                    .as_ref()
+                    .expect("assigned Cat has current applied evidence")
+                    .desired_revision,
+                Revision::new(2).unwrap()
+            );
+            assert!(matches!(
+                &runtime.checkpoint,
+                cats_api::runtime_reconciliation::CheckpointEvidence::Valid {
+                    desired_revision,
+                    ..
+                } if *desired_revision == Revision::new(1).unwrap()
+            ));
+            assert_eq!(runtime.volumes[0].local_lineages.len(), 1);
             assert_eq!(leaf_snapshot(&data_directory), before);
         }
     }
@@ -4189,7 +4630,7 @@ mod tests {
             panic!("exact indexed candidate must form typed Desired volume evidence")
         };
         assert_eq!(
-            by_cat[&Id::new("cat_01").unwrap()][0].volume_id,
+            by_cat[&Id::new("cat_01").unwrap()][0].observed.volume_id,
             record.volume_id
         );
         let calls = calls.lock().unwrap();

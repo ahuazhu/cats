@@ -78,6 +78,68 @@ impl AuthorizedBlockdStore {
         attachment: &AuthorizedServingAttachment,
     ) -> Result<PreparedAuthorizedBlockd> {
         validate_checkpoint_inputs(desired, volume, attachment)?;
+        self.prepare_validated(desired, volume, attachment, false)
+    }
+
+    /// Persist or reopen an attachment whose exact NormalAcquire receipt was
+    /// issued to an older revision of the same-Node Desired. This never
+    /// rewrites an existing launch checkpoint: a compatible old checkpoint is
+    /// retained as provenance, while an absent directory receives the current
+    /// Desired plus the immutable old receipt. The caller must already have a
+    /// current Runtime checkpoint authorizing this adoption.
+    pub(crate) fn prepare_adopted(
+        &self,
+        desired: &DesiredRuntimeSpec,
+        volume: &VolumeIntent,
+        attachment: &AuthorizedServingAttachment,
+    ) -> Result<PreparedAuthorizedBlockd> {
+        validate_adopted_checkpoint_inputs(desired, volume, attachment)?;
+        self.prepare_validated(desired, volume, attachment, true)
+    }
+
+    /// Reopen the scanner-attributed attachment and close the scan/effect ABA
+    /// window by feeding the decoded candidate back through the locked,
+    /// descriptor-relative exact-file verifier in `prepare_adopted`.
+    pub(crate) fn reopen_adopted(
+        &self,
+        desired: &DesiredRuntimeSpec,
+        volume: &VolumeIntent,
+        identity: &AttachmentLineageIdentity,
+    ) -> Result<PreparedAuthorizedBlockd> {
+        let directory =
+            authorized_blockd_data_directory(self.state_directory.path(), desired, identity);
+        let path = directory.join(AUTHORIZED_SERVING_FILE);
+        let metadata = std::fs::symlink_metadata(&path)
+            .with_context(|| format!("inspect adopted attachment {}", path.display()))?;
+        anyhow::ensure!(
+            metadata.file_type().is_file()
+                && !metadata.file_type().is_symlink()
+                && metadata.len() <= MAX_AUTHORIZED_SERVING_BYTES as u64,
+            "adopted authorized-serving candidate has unsafe metadata"
+        );
+        let bytes = std::fs::read(&path)
+            .with_context(|| format!("read adopted attachment {}", path.display()))?;
+        anyhow::ensure!(
+            bytes.len() <= MAX_AUTHORIZED_SERVING_BYTES,
+            "adopted authorized-serving candidate exceeds its bound"
+        );
+        let attachment: AuthorizedServingAttachment = serde_json::from_slice(&bytes)
+            .context("decode adopted authorized-serving attachment")?;
+        anyhow::ensure!(
+            serde_json::to_vec(&attachment).context("re-encode adopted attachment")? == bytes
+                && attachment.identity == *identity,
+            "adopted authorized-serving candidate conflicts with scanned identity"
+        );
+        self.prepare_adopted(desired, volume, &attachment)
+    }
+
+    fn prepare_validated(
+        &self,
+        desired: &DesiredRuntimeSpec,
+        volume: &VolumeIntent,
+        attachment: &AuthorizedServingAttachment,
+        permit_compatible_superseded_launch: bool,
+    ) -> Result<PreparedAuthorizedBlockd> {
         let checkpoint = AuthorizedBlockdCheckpoint {
             version: ContractVersion::V1,
             desired: desired.clone(),
@@ -135,15 +197,20 @@ impl AuthorizedBlockdStore {
             &[IDENTITY_FILE],
             MAX_AUTHORIZED_SERVING_BYTES,
         )?;
-        persist_ordered_file(
-            &directory,
-            &relative,
-            LAUNCH_CHECKPOINT_FILE,
-            LAUNCH_CHECKPOINT_TEMP,
-            &checkpoint_bytes,
-            &[IDENTITY_FILE, AUTHORIZED_SERVING_FILE],
-            MAX_LAUNCH_CHECKPOINT_BYTES,
-        )?;
+        let checkpoint = if permit_compatible_superseded_launch {
+            persist_adopted_launch_file(&directory, &relative, &checkpoint, &checkpoint_bytes)?
+        } else {
+            persist_ordered_file(
+                &directory,
+                &relative,
+                LAUNCH_CHECKPOINT_FILE,
+                LAUNCH_CHECKPOINT_TEMP,
+                &checkpoint_bytes,
+                &[IDENTITY_FILE, AUTHORIZED_SERVING_FILE],
+                MAX_LAUNCH_CHECKPOINT_BYTES,
+            )?;
+            checkpoint
+        };
 
         let data_directory = self.state_directory.path().join(&relative);
         Ok(PreparedAuthorizedBlockd {
@@ -379,6 +446,52 @@ fn validate_checkpoint_inputs(
     Ok(())
 }
 
+fn validate_adopted_checkpoint_inputs(
+    desired: &DesiredRuntimeSpec,
+    volume: &VolumeIntent,
+    attachment: &AuthorizedServingAttachment,
+) -> Result<()> {
+    encode_desired_runtime_spec(desired).context("validate complete DesiredRuntimeSpec")?;
+    validate_authorized_serving_attachment(attachment)
+        .map_err(|error| anyhow::anyhow!("invalid authorized serving attachment: {error}"))?;
+    anyhow::ensure!(
+        desired.version == ContractVersion::V1
+            && desired.target == RuntimeTarget::Running
+            && desired.volumes.len() == 1
+            && desired.volumes.first() == Some(volume)
+            && volume.disk_kind == DiskKind::Root
+            && volume.access == VolumeAccess::ReadWriteOnce
+            && volume.mount.is_none()
+            && matches!(volume.disposition, VolumeDisposition::Retain),
+        "authorized blockd adoption requires one retained RWO Running root"
+    );
+    let VolumeAcquire::Normal {
+        transition_id,
+        expected_unowned_epoch,
+    } = &volume.acquire
+    else {
+        anyhow::bail!("authorized blockd adoption requires a Normal acquire")
+    };
+    let identity = &attachment.identity;
+    let request = &attachment.acquire_request;
+    anyhow::ensure!(
+        volume.volume_id == identity.volume_id
+            && volume.attachment_id == identity.attachment_id
+            && volume.size_bytes == attachment.size_bytes
+            && volume.durability == attachment.durability
+            && desired.placement.node_id == identity.node_id
+            && desired.placement.placement_epoch == identity.placement_epoch
+            && request.transition_id == *transition_id
+            && request.expected_unowned_epoch == *expected_unowned_epoch
+            && request.volume_id == volume.volume_id
+            && request.attachment_id == volume.attachment_id
+            && request.desired_revision <= desired.desired_revision
+            && request.placement_epoch == desired.placement.placement_epoch,
+        "current Desired and superseded authorized grant are not one adoptable lineage"
+    );
+    Ok(())
+}
+
 pub(crate) fn validate_authorized_blockd_checkpoint(
     checkpoint: &AuthorizedBlockdCheckpoint,
 ) -> Result<()> {
@@ -391,6 +504,13 @@ pub(crate) fn validate_authorized_blockd_checkpoint(
         &checkpoint.volume,
         &checkpoint.attachment,
     )
+    .or_else(|_| {
+        validate_adopted_checkpoint_inputs(
+            &checkpoint.desired,
+            &checkpoint.volume,
+            &checkpoint.attachment,
+        )
+    })
 }
 
 fn directory_components(
@@ -606,6 +726,73 @@ fn pause_authorized_publication_for_process_kill(target_name: &str, phase: &str)
     loop {
         std::thread::park_timeout(std::time::Duration::from_secs(60));
     }
+}
+
+fn persist_adopted_launch_file(
+    directory: &File,
+    relative_directory: &Path,
+    current: &AuthorizedBlockdCheckpoint,
+    current_bytes: &[u8],
+) -> Result<AuthorizedBlockdCheckpoint> {
+    let target_path = relative_directory.join(LAUNCH_CHECKPOINT_FILE);
+    let temporary_path = relative_directory.join(LAUNCH_CHECKPOINT_TEMP);
+    let target_c = c_string(LAUNCH_CHECKPOINT_FILE, &target_path)?;
+    let temporary_c = c_string(LAUNCH_CHECKPOINT_TEMP, &temporary_path)?;
+    let Some(existing_bytes) = read_optional_bounded(
+        directory,
+        &target_c,
+        &target_path,
+        MAX_LAUNCH_CHECKPOINT_BYTES,
+    )?
+    else {
+        persist_ordered_file(
+            directory,
+            relative_directory,
+            LAUNCH_CHECKPOINT_FILE,
+            LAUNCH_CHECKPOINT_TEMP,
+            current_bytes,
+            &[IDENTITY_FILE, AUTHORIZED_SERVING_FILE],
+            MAX_LAUNCH_CHECKPOINT_BYTES,
+        )?;
+        return Ok(current.clone());
+    };
+
+    let existing: AuthorizedBlockdCheckpoint = serde_json::from_slice(&existing_bytes)
+        .context("decode existing authorized blockd launch checkpoint for adoption")?;
+    anyhow::ensure!(
+        serde_json::to_vec(&existing).context("re-encode adopted blockd checkpoint")?
+            == existing_bytes,
+        "existing authorized blockd launch checkpoint is not canonical"
+    );
+    validate_authorized_blockd_checkpoint(&existing)?;
+    anyhow::ensure!(
+        existing.attachment == current.attachment
+            && existing.volume == current.volume
+            && existing.desired.cat_id == current.desired.cat_id
+            && existing.desired.placement.node_id == current.desired.placement.node_id
+            && existing.desired.placement.placement_epoch
+                == current.desired.placement.placement_epoch
+            && existing.desired.desired_revision <= current.desired.desired_revision,
+        "existing authorized blockd launch checkpoint is not compatible with adoption"
+    );
+    if let Some(temporary) = read_optional_bounded(
+        directory,
+        &temporary_c,
+        &temporary_path,
+        MAX_LAUNCH_CHECKPOINT_BYTES,
+    )? {
+        anyhow::ensure!(
+            temporary == existing_bytes || temporary == current_bytes,
+            "{} conflicts with adopted blockd provenance",
+            temporary_path.display()
+        );
+        unlink_at(directory, &temporary_c)
+            .with_context(|| format!("remove recovered {}", temporary_path.display()))?;
+        directory
+            .sync_all()
+            .with_context(|| format!("sync {}", relative_directory.display()))?;
+    }
+    Ok(existing)
 }
 
 fn read_optional_bounded(
