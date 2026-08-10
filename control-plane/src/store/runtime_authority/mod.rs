@@ -25,6 +25,11 @@ mod product_rows;
     reason = "the closed snapshot loader is composed with the Route Grant v2 resolve service after the Node transport target authority lands"
 )]
 pub(crate) mod route_signer;
+#[allow(
+    dead_code,
+    reason = "the signer PG binding is composed by the Route v2 machine listener in the next commit"
+)]
+pub(crate) mod route_signing_authority;
 pub(super) mod rows;
 #[allow(
     dead_code,
@@ -54,6 +59,9 @@ mod placement_policy_tests;
 
 #[cfg(test)]
 mod gateway_identity_tests;
+
+#[cfg(test)]
+mod route_signing_authority_tests;
 
 #[cfg(test)]
 mod placement_planner_tests;

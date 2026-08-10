@@ -134,12 +134,14 @@ exact bytes SHA-256 是
 部署artifact只是给持久Store writer的typed candidate，不凭本地文件覆盖PG。最终startup transaction必须
 以`deployment_id + signer_revision + expected_previous`做exact CAS并永久保存每个revision/digest、
 secret-reference/kid lineage；same exact revision replay零写，same revision不同bytes、gap、stale、曾retire
-的reference/kid复用全部fail startup。该writer尚未实现，本slice因此不会把reader接到production service。
+的reference/kid复用全部fail startup。当前initial-install slice只接受revision 1/null previous或其exact
+零写replay；即使本地artifact是合法successor也不会自动推进PG current。successor/rotation writer仍未实现。
 
 每次resolve的单一PG signer snapshot最终还必须比较进程内`deployment_id/signer_revision/reference digest/
 active kid/secret reference`与current persisted state。旧replica即使仍能访问旧private file也只能返回503。
 这项compare与rotation writer共享singleton lock；snapshot的DB now产生Grant `iat`，writer切key时同一DB now
-作为`last_old_issue_at`上界。writer和resolve compare尚未实现。
+作为`last_old_issue_at`上界。PG current compare与共享lock已实现；machine listener内的最终同snapshot组合在
+Gateway slice完成前仍保持关闭。
 
 ## 5. Rotation, retirement and revocation
 
@@ -186,7 +188,7 @@ replica停止签发。reachable Node先关闭全部Route admission并drain/fence
 | filesystem | exact fixed path、root owner/mode/type/link、directory retention、bounded read前后metadata；symlink/hardlink/rename-recreate/byte-ABA拒绝 |
 | signer pair | active kid在exact ring；private->SPKI->kid exact；mismatch/wrong algorithm/malformed PEM不构造signer；disabled不读private |
 | separation | A19/A23/V1 keys、shared bearer、header identity均不能构造descriptor、signer或ring ACK |
-| persisted lineage（future） | initial null previous；exact replay；stale/gap/same-revision conflict；retired reference/kid永不复用；old replica在current compare后503 |
+| persisted initial/current | initial null previous；exact replay零写；same-revision conflict和合法successor均不从startup推进；immutable exact bytes/current projection/key+secret lineage；old/local mismatch current compare后503 |
 | rotation（future） | overlap ACK -> switch -> 305s retention -> remove ACK -> retire；边界相等不retire；old-only restart switch后不签发；uncordon需要current ACK |
 | revocation（future） | disable先于新签发停止；reachable close/drain、unreachable fence；fresh全量ACK后才resume；existing stream不因删key被伪装终止 |
 | deploy（future） | Terraform plan/state无private PEM；只含reference/public ring/IAM；secret bytes不进argv/env/log；projected symlink不能冒充real installed file |

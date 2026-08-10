@@ -21,12 +21,80 @@ use jsonwebtoken::{Algorithm, DecodingKey, EncodingKey};
 use ring::signature::{Ed25519KeyPair, KeyPair as _};
 
 use crate::store::runtime_authority::route_signer::RouteGrantV2AuthoritySnapshot;
+use crate::store::runtime_authority::route_signing_authority::RouteGrantV2SignerBinding;
 
 #[derive(Clone)]
 pub(crate) struct RouteGrantV2Signer {
     key: Arc<EncodingKey>,
     kid: KeyId,
     ttl_seconds: u64,
+}
+
+/// One startup-pinned signer artifact set after the descriptor/ring and, for
+/// an active selection, private/public pair have all been validated. The Store
+/// accepts only this type for initial PG installation, so descriptor bytes
+/// cannot become current before their private pair is proven.
+pub(crate) struct InstalledRouteGrantV2SigningAuthority {
+    binding: RouteGrantV2SignerBinding,
+    signer: Option<RouteGrantV2Signer>,
+}
+
+impl std::fmt::Debug for InstalledRouteGrantV2SigningAuthority {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("InstalledRouteGrantV2SigningAuthority")
+            .field("binding", &self.binding)
+            .field("signer", &self.signer)
+            .finish()
+    }
+}
+
+#[allow(
+    dead_code,
+    reason = "the validated signer installation is composed by the Route v2 machine listener in the next commit"
+)]
+impl InstalledRouteGrantV2SigningAuthority {
+    pub(crate) fn from_installed_artifacts(
+        installed: &InstalledRouteGrantV2Signer,
+        ttl_seconds: u64,
+    ) -> anyhow::Result<Self> {
+        Self::from_authority_artifacts(
+            installed.reference(),
+            installed.exact_reference_bytes(),
+            installed.ring().ring(),
+            installed.private_key_pem(),
+            ttl_seconds,
+        )
+    }
+
+    pub(crate) fn from_authority_artifacts(
+        reference: &RouteGrantV2SignerReference,
+        exact_reference_bytes: &[u8],
+        ring: &RouteGrantV2PublicKeyRingArtifact,
+        private_key_pem: Option<&[u8]>,
+        ttl_seconds: u64,
+    ) -> anyhow::Result<Self> {
+        let signer = RouteGrantV2Signer::from_authority_artifacts(
+            reference,
+            ring,
+            private_key_pem,
+            ttl_seconds,
+        )?;
+        let binding = RouteGrantV2SignerBinding::from_authority_artifacts(
+            reference,
+            exact_reference_bytes,
+            ring,
+        )?;
+        Ok(Self { binding, signer })
+    }
+
+    pub(crate) fn binding(&self) -> &RouteGrantV2SignerBinding {
+        &self.binding
+    }
+
+    pub(crate) fn signer(&self) -> Option<&RouteGrantV2Signer> {
+        self.signer.as_ref()
+    }
 }
 
 impl std::fmt::Debug for RouteGrantV2Signer {
@@ -47,28 +115,9 @@ pub(crate) struct IssuedRouteGrantV2 {
 }
 
 impl RouteGrantV2Signer {
-    /// Validate a startup-pinned, independent Route v2 artifact set without
-    /// composing it into the production resolve service. `None` is the exact
-    /// fail-closed result for a disabled descriptor.
     #[allow(
         dead_code,
-        reason = "the frozen artifact reader is intentionally not production-composed until the persisted signer CAS and Gateway principal contracts land"
-    )]
-    pub(crate) fn from_installed_artifacts(
-        installed: &InstalledRouteGrantV2Signer,
-        ttl_seconds: u64,
-    ) -> anyhow::Result<Option<Self>> {
-        Self::from_authority_artifacts(
-            installed.reference(),
-            installed.ring().ring(),
-            installed.private_key_pem(),
-            ttl_seconds,
-        )
-    }
-
-    #[allow(
-        dead_code,
-        reason = "reachable only through the deliberately uncomposed installed-artifact constructor"
+        reason = "reachable in production through the next-commit installed signer composition"
     )]
     fn from_authority_artifacts(
         reference: &RouteGrantV2SignerReference,
@@ -192,6 +241,10 @@ impl RouteGrantV2Signer {
     }
 }
 
+#[allow(
+    dead_code,
+    reason = "reachable in production through the next-commit installed signer composition"
+)]
 fn checked_encoding_key(
     private_key_pem: &[u8],
     public: &RouteGrantV2PublicKey,
@@ -311,6 +364,26 @@ mod tests {
 
         ring = decode_route_grant_v2_public_key_ring(INSTALLED_RING).unwrap();
         reference = decode_route_grant_v2_signer_reference(INSTALLED_SIGNER).unwrap();
+        let installed = InstalledRouteGrantV2SigningAuthority::from_authority_artifacts(
+            &reference,
+            INSTALLED_SIGNER,
+            &ring,
+            Some(PRIVATE_KEY),
+            120,
+        )
+        .unwrap();
+        assert!(installed.signer().is_some());
+        assert_eq!(installed.binding().reference(), &reference);
+        assert!(
+            InstalledRouteGrantV2SigningAuthority::from_authority_artifacts(
+                &reference,
+                INSTALLED_SIGNER,
+                &ring,
+                Some(WRONG_ALGORITHM_KEY),
+                120,
+            )
+            .is_err()
+        );
         assert!(RouteGrantV2Signer::from_authority_artifacts(
             &reference,
             &ring,

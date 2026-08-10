@@ -605,6 +605,9 @@ const CONTROL_TABLES: &[&str] = &[
     "route_v2_gateway_identity_revisions",
     "route_v2_gateway_credential_lineage",
     "route_v2_gateway_current_credentials",
+    "route_v2_signing_authority",
+    "route_v2_signer_revisions",
+    "route_v2_signer_key_lineage",
 ];
 
 type RequiredDeferredForeignKey = (
@@ -618,6 +621,141 @@ type RequiredDeferredForeignKey = (
 );
 
 pub(super) const REQUIRED_CHECK_CONSTRAINTS: &[(&str, &str, &str)] = &[
+    (
+        "route_v2_signing_authority",
+        "route_v2_signing_authority_singleton_ck",
+        "CHECK (singleton)",
+    ),
+    (
+        "route_v2_signing_authority",
+        "route_v2_signing_authority_revision_ck",
+        "CHECK ((current_signer_revision > 0))",
+    ),
+    (
+        "route_v2_signing_authority",
+        "route_v2_signing_authority_digest_ck",
+        "CHECK ((current_signer_reference_sha256 ~ '^sha256:[0-9a-f]{64}$'::text))",
+    ),
+    (
+        "route_v2_signing_authority",
+        "route_v2_signing_authority_state_ck",
+        "CHECK ((signer_state = ANY (ARRAY['active'::text, 'disabled'::text])))",
+    ),
+    (
+        "route_v2_signing_authority",
+        "route_v2_signing_authority_active_kid_ck",
+        "CHECK (((active_kid = ''::text) OR (active_kid ~ '^[0-9a-f]{64}$'::text)))",
+    ),
+    (
+        "route_v2_signing_authority",
+        "route_v2_signing_authority_ring_version_ck",
+        "CHECK ((public_key_ring_version > 0))",
+    ),
+    (
+        "route_v2_signing_authority",
+        "route_v2_signing_authority_ring_digest_ck",
+        "CHECK ((public_key_ring_digest ~ '^sha256:[0-9a-f]{64}$'::text))",
+    ),
+    (
+        "route_v2_signing_authority",
+        "route_v2_signing_authority_selection_ck",
+        "CHECK ((((signer_state = 'active'::text) AND (active_kid <> ''::text) AND (secret_reference_id <> ''::text)) OR ((signer_state = 'disabled'::text) AND (active_kid = ''::text) AND (secret_reference_id = ''::text))))",
+    ),
+    (
+        "route_v2_signing_authority",
+        "route_v2_signing_authority_first_time_ck",
+        "CHECK ((first_committed_at_unix_ms >= 0))",
+    ),
+    (
+        "route_v2_signer_revisions",
+        "route_v2_signer_revision_revision_ck",
+        "CHECK ((signer_revision > 0))",
+    ),
+    (
+        "route_v2_signer_revisions",
+        "route_v2_signer_revision_digest_ck",
+        "CHECK ((signer_reference_sha256 ~ '^sha256:[0-9a-f]{64}$'::text))",
+    ),
+    (
+        "route_v2_signer_revisions",
+        "route_v2_signer_revision_bytes_ck",
+        "CHECK (((octet_length(signer_reference_bytes) >= 1) AND (octet_length(signer_reference_bytes) <= 16384)))",
+    ),
+    (
+        "route_v2_signer_revisions",
+        "route_v2_signer_revision_previous_revision_ck",
+        "CHECK ((expected_previous_signer_revision > 0))",
+    ),
+    (
+        "route_v2_signer_revisions",
+        "route_v2_signer_revision_previous_digest_ck",
+        "CHECK ((expected_previous_signer_reference_sha256 ~ '^sha256:[0-9a-f]{64}$'::text))",
+    ),
+    (
+        "route_v2_signer_revisions",
+        "route_v2_signer_revision_lineage_ck",
+        "CHECK ((((signer_revision = 1) AND (expected_previous_signer_revision IS NULL) AND (expected_previous_signer_reference_sha256 IS NULL)) OR ((signer_revision > 1) AND (expected_previous_signer_revision = (signer_revision - 1)) AND (expected_previous_signer_reference_sha256 IS NOT NULL))))",
+    ),
+    (
+        "route_v2_signer_revisions",
+        "route_v2_signer_revision_state_ck",
+        "CHECK ((signer_state = ANY (ARRAY['active'::text, 'disabled'::text])))",
+    ),
+    (
+        "route_v2_signer_revisions",
+        "route_v2_signer_revision_active_kid_ck",
+        "CHECK (((active_kid = ''::text) OR (active_kid ~ '^[0-9a-f]{64}$'::text)))",
+    ),
+    (
+        "route_v2_signer_revisions",
+        "route_v2_signer_revision_ring_version_ck",
+        "CHECK ((public_key_ring_version > 0))",
+    ),
+    (
+        "route_v2_signer_revisions",
+        "route_v2_signer_revision_ring_digest_ck",
+        "CHECK ((public_key_ring_digest ~ '^sha256:[0-9a-f]{64}$'::text))",
+    ),
+    (
+        "route_v2_signer_revisions",
+        "route_v2_signer_revision_selection_ck",
+        "CHECK ((((signer_state = 'active'::text) AND (active_kid <> ''::text) AND (secret_reference_id <> ''::text)) OR ((signer_state = 'disabled'::text) AND (active_kid = ''::text) AND (secret_reference_id = ''::text))))",
+    ),
+    (
+        "route_v2_signer_revisions",
+        "route_v2_signer_revision_committed_time_ck",
+        "CHECK ((committed_at_unix_ms >= 0))",
+    ),
+    (
+        "route_v2_signer_key_lineage",
+        "route_v2_signer_key_lineage_kid_ck",
+        "CHECK ((kid ~ '^[0-9a-f]{64}$'::text))",
+    ),
+    (
+        "route_v2_signer_key_lineage",
+        "route_v2_signer_key_lineage_first_revision_ck",
+        "CHECK ((first_signer_revision > 0))",
+    ),
+    (
+        "route_v2_signer_key_lineage",
+        "route_v2_signer_key_lineage_state_ck",
+        "CHECK ((state = ANY (ARRAY['active'::text, 'retired'::text])))",
+    ),
+    (
+        "route_v2_signer_key_lineage",
+        "route_v2_signer_key_lineage_first_time_ck",
+        "CHECK ((first_committed_at_unix_ms >= 0))",
+    ),
+    (
+        "route_v2_signer_key_lineage",
+        "route_v2_signer_key_lineage_retired_time_ck",
+        "CHECK (((retired_at_unix_ms IS NULL) OR (retired_at_unix_ms >= first_committed_at_unix_ms)))",
+    ),
+    (
+        "route_v2_signer_key_lineage",
+        "route_v2_signer_key_lineage_state_time_ck",
+        "CHECK ((((state = 'active'::text) AND (retired_at_unix_ms IS NULL)) OR ((state = 'retired'::text) AND (retired_at_unix_ms IS NOT NULL))))",
+    ),
     (
         "route_v2_gateway_identity_authority",
         "route_v2_gateway_authority_singleton_ck",
@@ -753,6 +891,21 @@ pub(super) const REQUIRED_CHECK_CONSTRAINTS: &[(&str, &str, &str)] = &[
 const REQUIRED_PRIMARY_KEYS: &[(&str, &str, &str)] = &[
     ("volume_records", "volume_records_pkey", "volume_id"),
     (
+        "route_v2_signing_authority",
+        "route_v2_signing_authority_pkey",
+        "singleton",
+    ),
+    (
+        "route_v2_signer_revisions",
+        "route_v2_signer_revisions_pkey",
+        "deployment_id,signer_revision",
+    ),
+    (
+        "route_v2_signer_key_lineage",
+        "route_v2_signer_key_lineage_pkey",
+        "kid",
+    ),
+    (
         "route_v2_gateway_identity_authority",
         "route_v2_gateway_identity_authority_pkey",
         "singleton",
@@ -775,6 +928,42 @@ const REQUIRED_PRIMARY_KEYS: &[(&str, &str, &str)] = &[
 ];
 
 const REQUIRED_DEFERRED_FOREIGN_KEYS: &[RequiredDeferredForeignKey] = &[
+    (
+        "route_v2_signing_authority",
+        "route_v2_signing_authority_current_revision_fkey",
+        "route_v2_signer_revisions",
+        "deployment_id,current_signer_revision,current_signer_reference_sha256,signer_state,active_kid,public_key_ring_version,public_key_ring_digest,secret_reference_id",
+        "deployment_id,signer_revision,signer_reference_sha256,signer_state,active_kid,public_key_ring_version,public_key_ring_digest,secret_reference_id",
+        "r",
+        "r",
+    ),
+    (
+        "route_v2_signer_revisions",
+        "route_v2_signer_revisions_authority_fkey",
+        "route_v2_signing_authority",
+        "deployment_id",
+        "deployment_id",
+        "r",
+        "r",
+    ),
+    (
+        "route_v2_signer_key_lineage",
+        "route_v2_signer_key_lineage_first_revision_fkey",
+        "route_v2_signer_revisions",
+        "deployment_id,first_signer_revision",
+        "deployment_id,signer_revision",
+        "r",
+        "r",
+    ),
+    (
+        "route_v2_signer_key_lineage",
+        "route_v2_signer_key_lineage_authority_fkey",
+        "route_v2_signing_authority",
+        "deployment_id",
+        "deployment_id",
+        "r",
+        "r",
+    ),
     (
         "node_identities",
         "node_identity_current_public_key_lineage",
@@ -859,6 +1048,36 @@ const REQUIRED_DEFERRED_FOREIGN_KEYS: &[RequiredDeferredForeignKey] = &[
 ];
 
 const REQUIRED_UNIQUE_INDEXES: &[(&str, &str, &str, Option<&str>)] = &[
+    (
+        "route_v2_signing_authority",
+        "route_v2_signing_authority_deployment_id_key",
+        "deployment_id",
+        None,
+    ),
+    (
+        "route_v2_signing_authority",
+        "route_v2_signing_authority_current_key",
+        "deployment_id,current_signer_revision,current_signer_reference_sha256,signer_state,active_kid,public_key_ring_version,public_key_ring_digest,secret_reference_id",
+        None,
+    ),
+    (
+        "route_v2_signer_revisions",
+        "route_v2_signer_revisions_exact_key",
+        "deployment_id,signer_revision,signer_reference_sha256,signer_state,active_kid,public_key_ring_version,public_key_ring_digest,secret_reference_id",
+        None,
+    ),
+    (
+        "route_v2_signer_key_lineage",
+        "route_v2_signer_key_lineage_public_key_spki_key",
+        "public_key_spki",
+        None,
+    ),
+    (
+        "route_v2_signer_key_lineage",
+        "route_v2_signer_key_lineage_secret_reference_id_key",
+        "secret_reference_id",
+        None,
+    ),
     (
         "host_fence_events",
         "runtime_node_one_active_host_fence_event",
@@ -1066,6 +1285,41 @@ const REQUIRED_IMMUTABILITY_TRIGGERS: &[(&str, &str, &str, i16, &str)] = &[
         "3ba58cdd898c1ded0023c8732a3ca155cc17caf6bba93d8346dcc43c2dbd9e76",
     ),
     (
+        "route_v2_signer_revisions",
+        "route_v2_signer_revision_is_immutable",
+        "control_route_v2_signer_revision_is_immutable",
+        BEFORE_ROW_UPDATE_DELETE,
+        "8b0be4bcd5c553e9a341b7c865b72c9d471ddb323677a1f7e57b2ab5f221a2bc",
+    ),
+    (
+        "route_v2_signer_key_lineage",
+        "route_v2_signer_key_lineage_update",
+        "control_route_v2_signer_key_lineage_update",
+        BEFORE_ROW_UPDATE,
+        "6aa312c3de5125a6caeabe30fde0ed30e51b852cf51181584bcd49aed2cc90d9",
+    ),
+    (
+        "route_v2_signer_key_lineage",
+        "route_v2_signer_key_lineage_cannot_delete",
+        "control_route_v2_signer_key_lineage_cannot_delete",
+        BEFORE_ROW_DELETE,
+        "f5e2468ec0b2a0ae7446a73b0625623fba9278ca53f6279de52795d451e1be7f",
+    ),
+    (
+        "route_v2_signing_authority",
+        "route_v2_signing_authority_update",
+        "control_route_v2_signing_authority_update",
+        BEFORE_ROW_UPDATE,
+        "bc4e33c4752b5f6f5fb6978b00cebcc985e05d512df7bd8e144426663f3cb330",
+    ),
+    (
+        "route_v2_signing_authority",
+        "route_v2_signing_authority_cannot_delete",
+        "control_route_v2_signing_authority_cannot_delete",
+        BEFORE_ROW_DELETE,
+        "d689c869eaa0b1d0ad50a0b5e9b81be3a093cf63d1b64cbb0057b89cd4b17286",
+    ),
+    (
         "route_v2_gateway_identity_revisions",
         "route_v2_gateway_revision_is_immutable",
         "control_route_v2_gateway_revision_is_immutable",
@@ -1223,6 +1477,21 @@ const AUTHORITY_SCHEMA_PROBES: &[&str] = &[
             public_key_spki_sha256, state, first_committed_at_unix_ms,
             retired_at_unix_ms
        FROM runtime_provisioner_credential_lineage WHERE FALSE",
+    "SELECT singleton, deployment_id, current_signer_revision,
+            current_signer_reference_sha256, signer_state, active_kid,
+            public_key_ring_version, public_key_ring_digest,
+            secret_reference_id, first_committed_at_unix_ms
+       FROM route_v2_signing_authority WHERE FALSE",
+    "SELECT deployment_id, signer_revision, signer_reference_sha256,
+            signer_reference_bytes, expected_previous_signer_revision,
+            expected_previous_signer_reference_sha256, signer_state,
+            active_kid, public_key_ring_version, public_key_ring_digest,
+            secret_reference_id, committed_at_unix_ms
+       FROM route_v2_signer_revisions WHERE FALSE",
+    "SELECT kid, deployment_id, public_key_spki, secret_reference_id,
+            first_signer_revision, state, first_committed_at_unix_ms,
+            retired_at_unix_ms
+       FROM route_v2_signer_key_lineage WHERE FALSE",
     "SELECT singleton, authority_id, fleet_id, current_policy_revision,
             current_policy_sha256, first_committed_at_unix_ms
        FROM route_v2_gateway_identity_authority WHERE FALSE",
@@ -1938,6 +2207,138 @@ CREATE TABLE IF NOT EXISTS runtime_provisioner_credential_lineage (
     CHECK ((state = 'active' AND retired_at_unix_ms IS NULL) OR
            (state = 'retired' AND retired_at_unix_ms IS NOT NULL))
 );
+CREATE TABLE IF NOT EXISTS route_v2_signing_authority (
+    singleton BOOLEAN PRIMARY KEY DEFAULT TRUE
+        CONSTRAINT route_v2_signing_authority_singleton_ck CHECK (singleton),
+    deployment_id TEXT NOT NULL UNIQUE,
+    current_signer_revision BIGINT NOT NULL
+        CONSTRAINT route_v2_signing_authority_revision_ck
+        CHECK (current_signer_revision > 0),
+    current_signer_reference_sha256 TEXT NOT NULL
+        CONSTRAINT route_v2_signing_authority_digest_ck
+        CHECK (current_signer_reference_sha256 ~ '^sha256:[0-9a-f]{64}$'),
+    signer_state TEXT NOT NULL
+        CONSTRAINT route_v2_signing_authority_state_ck
+        CHECK (signer_state IN ('active', 'disabled')),
+    active_kid TEXT NOT NULL
+        CONSTRAINT route_v2_signing_authority_active_kid_ck
+        CHECK (active_kid = '' OR active_kid ~ '^[0-9a-f]{64}$'),
+    public_key_ring_version BIGINT NOT NULL
+        CONSTRAINT route_v2_signing_authority_ring_version_ck
+        CHECK (public_key_ring_version > 0),
+    public_key_ring_digest TEXT NOT NULL
+        CONSTRAINT route_v2_signing_authority_ring_digest_ck
+        CHECK (public_key_ring_digest ~ '^sha256:[0-9a-f]{64}$'),
+    secret_reference_id TEXT NOT NULL,
+    first_committed_at_unix_ms BIGINT NOT NULL
+        CONSTRAINT route_v2_signing_authority_first_time_ck
+        CHECK (first_committed_at_unix_ms >= 0),
+    CONSTRAINT route_v2_signing_authority_selection_ck CHECK (
+        (signer_state = 'active' AND active_kid <> '' AND secret_reference_id <> '') OR
+        (signer_state = 'disabled' AND active_kid = '' AND secret_reference_id = '')
+    ),
+    CONSTRAINT route_v2_signing_authority_current_key UNIQUE (
+        deployment_id, current_signer_revision,
+        current_signer_reference_sha256, signer_state, active_kid,
+        public_key_ring_version, public_key_ring_digest, secret_reference_id)
+);
+CREATE TABLE IF NOT EXISTS route_v2_signer_revisions (
+    deployment_id TEXT NOT NULL,
+    signer_revision BIGINT NOT NULL
+        CONSTRAINT route_v2_signer_revision_revision_ck
+        CHECK (signer_revision > 0),
+    signer_reference_sha256 TEXT NOT NULL
+        CONSTRAINT route_v2_signer_revision_digest_ck
+        CHECK (signer_reference_sha256 ~ '^sha256:[0-9a-f]{64}$'),
+    signer_reference_bytes BYTEA NOT NULL
+        CONSTRAINT route_v2_signer_revision_bytes_ck
+        CHECK (octet_length(signer_reference_bytes) BETWEEN 1 AND 16384),
+    expected_previous_signer_revision BIGINT NULL
+        CONSTRAINT route_v2_signer_revision_previous_revision_ck
+        CHECK (expected_previous_signer_revision > 0),
+    expected_previous_signer_reference_sha256 TEXT NULL
+        CONSTRAINT route_v2_signer_revision_previous_digest_ck
+        CHECK (expected_previous_signer_reference_sha256 ~ '^sha256:[0-9a-f]{64}$'),
+    signer_state TEXT NOT NULL
+        CONSTRAINT route_v2_signer_revision_state_ck
+        CHECK (signer_state IN ('active', 'disabled')),
+    active_kid TEXT NOT NULL
+        CONSTRAINT route_v2_signer_revision_active_kid_ck
+        CHECK (active_kid = '' OR active_kid ~ '^[0-9a-f]{64}$'),
+    public_key_ring_version BIGINT NOT NULL
+        CONSTRAINT route_v2_signer_revision_ring_version_ck
+        CHECK (public_key_ring_version > 0),
+    public_key_ring_digest TEXT NOT NULL
+        CONSTRAINT route_v2_signer_revision_ring_digest_ck
+        CHECK (public_key_ring_digest ~ '^sha256:[0-9a-f]{64}$'),
+    secret_reference_id TEXT NOT NULL,
+    committed_at_unix_ms BIGINT NOT NULL
+        CONSTRAINT route_v2_signer_revision_committed_time_ck
+        CHECK (committed_at_unix_ms >= 0),
+    PRIMARY KEY (deployment_id, signer_revision),
+    CONSTRAINT route_v2_signer_revisions_exact_key UNIQUE (
+        deployment_id, signer_revision, signer_reference_sha256,
+        signer_state, active_kid, public_key_ring_version,
+        public_key_ring_digest, secret_reference_id),
+    CONSTRAINT route_v2_signer_revision_lineage_ck CHECK (
+        (signer_revision = 1 AND expected_previous_signer_revision IS NULL
+            AND expected_previous_signer_reference_sha256 IS NULL) OR
+        (signer_revision > 1
+            AND expected_previous_signer_revision = signer_revision - 1
+            AND expected_previous_signer_reference_sha256 IS NOT NULL)
+    ),
+    CONSTRAINT route_v2_signer_revision_selection_ck CHECK (
+        (signer_state = 'active' AND active_kid <> '' AND secret_reference_id <> '') OR
+        (signer_state = 'disabled' AND active_kid = '' AND secret_reference_id = '')
+    ),
+    CONSTRAINT route_v2_signer_revisions_authority_fkey
+        FOREIGN KEY (deployment_id)
+        REFERENCES route_v2_signing_authority(deployment_id)
+        ON UPDATE RESTRICT ON DELETE RESTRICT DEFERRABLE INITIALLY DEFERRED
+);
+ALTER TABLE route_v2_signing_authority
+    ADD CONSTRAINT route_v2_signing_authority_current_revision_fkey
+    FOREIGN KEY (
+        deployment_id, current_signer_revision,
+        current_signer_reference_sha256, signer_state, active_kid,
+        public_key_ring_version, public_key_ring_digest, secret_reference_id)
+    REFERENCES route_v2_signer_revisions(
+        deployment_id, signer_revision, signer_reference_sha256,
+        signer_state, active_kid, public_key_ring_version,
+        public_key_ring_digest, secret_reference_id)
+    ON UPDATE RESTRICT ON DELETE RESTRICT DEFERRABLE INITIALLY DEFERRED;
+CREATE TABLE IF NOT EXISTS route_v2_signer_key_lineage (
+    kid TEXT PRIMARY KEY
+        CONSTRAINT route_v2_signer_key_lineage_kid_ck
+        CHECK (kid ~ '^[0-9a-f]{64}$'),
+    deployment_id TEXT NOT NULL,
+    public_key_spki TEXT NOT NULL UNIQUE,
+    secret_reference_id TEXT NOT NULL UNIQUE,
+    first_signer_revision BIGINT NOT NULL
+        CONSTRAINT route_v2_signer_key_lineage_first_revision_ck
+        CHECK (first_signer_revision > 0),
+    state TEXT NOT NULL
+        CONSTRAINT route_v2_signer_key_lineage_state_ck
+        CHECK (state IN ('active', 'retired')),
+    first_committed_at_unix_ms BIGINT NOT NULL
+        CONSTRAINT route_v2_signer_key_lineage_first_time_ck
+        CHECK (first_committed_at_unix_ms >= 0),
+    retired_at_unix_ms BIGINT NULL
+        CONSTRAINT route_v2_signer_key_lineage_retired_time_ck CHECK (
+        retired_at_unix_ms IS NULL OR
+        retired_at_unix_ms >= first_committed_at_unix_ms),
+    CONSTRAINT route_v2_signer_key_lineage_state_time_ck
+        CHECK ((state = 'active' AND retired_at_unix_ms IS NULL) OR
+               (state = 'retired' AND retired_at_unix_ms IS NOT NULL)),
+    CONSTRAINT route_v2_signer_key_lineage_first_revision_fkey
+        FOREIGN KEY (deployment_id, first_signer_revision)
+        REFERENCES route_v2_signer_revisions(deployment_id, signer_revision)
+        ON UPDATE RESTRICT ON DELETE RESTRICT DEFERRABLE INITIALLY DEFERRED,
+    CONSTRAINT route_v2_signer_key_lineage_authority_fkey
+        FOREIGN KEY (deployment_id)
+        REFERENCES route_v2_signing_authority(deployment_id)
+        ON UPDATE RESTRICT ON DELETE RESTRICT DEFERRABLE INITIALLY DEFERRED
+);
 CREATE TABLE IF NOT EXISTS route_v2_gateway_identity_authority (
     singleton BOOLEAN PRIMARY KEY DEFAULT TRUE
         CONSTRAINT route_v2_gateway_authority_singleton_ck CHECK (singleton),
@@ -2276,6 +2677,71 @@ CREATE TRIGGER runtime_provisioner_pointer_update
 CREATE TRIGGER runtime_provisioner_pointer_cannot_delete
     BEFORE DELETE ON runtime_provisioner_deployment_identity
     FOR EACH ROW EXECUTE FUNCTION control_runtime_provisioner_pointer_cannot_delete();
+CREATE OR REPLACE FUNCTION control_route_v2_signer_revision_is_immutable()
+RETURNS trigger AS $$
+BEGIN
+    RAISE EXCEPTION 'Route v2 signer revision is immutable';
+END;
+$$ LANGUAGE plpgsql;
+CREATE TRIGGER route_v2_signer_revision_is_immutable
+    BEFORE UPDATE OR DELETE ON route_v2_signer_revisions
+    FOR EACH ROW EXECUTE FUNCTION control_route_v2_signer_revision_is_immutable();
+CREATE OR REPLACE FUNCTION control_route_v2_signer_key_lineage_update()
+RETURNS trigger AS $$
+BEGIN
+    IF NEW.kid IS DISTINCT FROM OLD.kid
+       OR NEW.deployment_id IS DISTINCT FROM OLD.deployment_id
+       OR NEW.public_key_spki IS DISTINCT FROM OLD.public_key_spki
+       OR NEW.secret_reference_id IS DISTINCT FROM OLD.secret_reference_id
+       OR NEW.first_signer_revision IS DISTINCT FROM OLD.first_signer_revision
+       OR NEW.first_committed_at_unix_ms IS DISTINCT FROM OLD.first_committed_at_unix_ms
+       OR OLD.state = 'retired'
+       OR OLD.state <> 'active'
+       OR NEW.state <> 'retired'
+       OR OLD.retired_at_unix_ms IS NOT NULL
+       OR NEW.retired_at_unix_ms IS NULL THEN
+        RAISE EXCEPTION 'Route v2 signer key lineage is immutable';
+    END IF;
+    RETURN NEW;
+END;
+$$ LANGUAGE plpgsql;
+CREATE OR REPLACE FUNCTION control_route_v2_signer_key_lineage_cannot_delete()
+RETURNS trigger AS $$
+BEGIN
+    RAISE EXCEPTION 'Route v2 signer key lineage cannot be deleted';
+END;
+$$ LANGUAGE plpgsql;
+CREATE TRIGGER route_v2_signer_key_lineage_update
+    BEFORE UPDATE ON route_v2_signer_key_lineage
+    FOR EACH ROW EXECUTE FUNCTION control_route_v2_signer_key_lineage_update();
+CREATE TRIGGER route_v2_signer_key_lineage_cannot_delete
+    BEFORE DELETE ON route_v2_signer_key_lineage
+    FOR EACH ROW EXECUTE FUNCTION control_route_v2_signer_key_lineage_cannot_delete();
+CREATE OR REPLACE FUNCTION control_route_v2_signing_authority_update()
+RETURNS trigger AS $$
+BEGIN
+    IF NEW.singleton IS DISTINCT FROM OLD.singleton
+       OR NEW.deployment_id IS DISTINCT FROM OLD.deployment_id
+       OR NEW.first_committed_at_unix_ms IS DISTINCT FROM OLD.first_committed_at_unix_ms
+       OR NEW.current_signer_revision <> OLD.current_signer_revision + 1
+       OR NEW.current_signer_reference_sha256 = OLD.current_signer_reference_sha256 THEN
+        RAISE EXCEPTION 'Route v2 signing authority pointer is not a successor';
+    END IF;
+    RETURN NEW;
+END;
+$$ LANGUAGE plpgsql;
+CREATE OR REPLACE FUNCTION control_route_v2_signing_authority_cannot_delete()
+RETURNS trigger AS $$
+BEGIN
+    RAISE EXCEPTION 'Route v2 signing authority cannot be deleted';
+END;
+$$ LANGUAGE plpgsql;
+CREATE TRIGGER route_v2_signing_authority_update
+    BEFORE UPDATE ON route_v2_signing_authority
+    FOR EACH ROW EXECUTE FUNCTION control_route_v2_signing_authority_update();
+CREATE TRIGGER route_v2_signing_authority_cannot_delete
+    BEFORE DELETE ON route_v2_signing_authority
+    FOR EACH ROW EXECUTE FUNCTION control_route_v2_signing_authority_cannot_delete();
 CREATE OR REPLACE FUNCTION control_route_v2_gateway_revision_is_immutable()
 RETURNS trigger AS $$
 BEGIN

@@ -136,7 +136,7 @@ impl Store {
         workspace_id: &Id,
     ) -> Result<bool> {
         self.authority_locking_read_snapshot(|transaction| {
-            lock_gateway_identity_authority_shared(transaction)?;
+            lock_route_v2_machine_authority_shared(transaction)?;
             revalidate_gateway_principal_for_workspace_in(transaction, principal, workspace_id)
         })
     }
@@ -145,11 +145,25 @@ impl Store {
 /// Acquire the shared linearization barrier used by both pre-body auth and
 /// the complete Route signing snapshot. Policy writers take the exclusive
 /// form of this exact key.
-pub(super) fn lock_gateway_identity_authority_shared(
+pub(super) fn lock_route_v2_machine_authority_shared(
     transaction: &mut Transaction<'_>,
 ) -> AuthorityTxResult<()> {
     transaction.query_one(
         "SELECT pg_advisory_xact_lock_shared(hashtextextended(
+            current_schema() || ':route-v2-gateway-identity', 0::BIGINT))",
+        &[],
+    )?;
+    Ok(())
+}
+
+/// Writers for either the Gateway credential current pointer or the Route v2
+/// signer current pointer take the exclusive form of the same barrier. This
+/// gives the final signing snapshot one ordering against both rotations.
+pub(super) fn lock_route_v2_machine_authority_exclusive(
+    transaction: &mut Transaction<'_>,
+) -> AuthorityTxResult<()> {
+    transaction.query_one(
+        "SELECT pg_advisory_xact_lock(hashtextextended(
             current_schema() || ':route-v2-gateway-identity', 0::BIGINT))",
         &[],
     )?;
@@ -187,7 +201,7 @@ fn authenticate_gateway_tls_peer_in(
     transaction: &mut Transaction<'_>,
     public_key_spki_sha256: &Sha256Digest,
 ) -> AuthorityTxResult<Option<AuthenticatedGatewayPrincipal>> {
-    lock_gateway_identity_authority_shared(transaction)?;
+    lock_route_v2_machine_authority_shared(transaction)?;
     let Some(current) = load_current_gateway_authority(transaction, "")? else {
         return Ok(None);
     };
@@ -212,11 +226,7 @@ fn install_gateway_authority_in(
     authority: &GatewayWorkloadIdentityAuthority,
     exact_bytes: &[u8],
 ) -> AuthorityTxResult<()> {
-    transaction.query_one(
-        "SELECT pg_advisory_xact_lock(hashtextextended(
-            current_schema() || ':route-v2-gateway-identity', 0::BIGINT))",
-        &[],
-    )?;
+    lock_route_v2_machine_authority_exclusive(transaction)?;
     let candidate_digest = Sha256Digest::from_bytes(Sha256::digest(exact_bytes).into());
     let current_pointer = load_gateway_authority_pointer(transaction, "FOR UPDATE")?;
     let Some(current_pointer) = current_pointer else {

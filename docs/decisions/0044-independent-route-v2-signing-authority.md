@@ -42,9 +42,15 @@ provisioner key。这三者都拥有不同 principal、签名 domain、轮换和
 当前实现包含 canonical artifact codecs、固定路径/metadata reader、private/public pair check，以及 Node
 production full-inventory 对已安装 public ring 的只读 exact observation。Control 的 signer snapshot 会消费
 该 observation 中的 exact version/digest/sorted kids；artifact 缺席保持 unavailable，存在但无法完整验证时
-不接受该轮 full inventory。它仍不实现 public-ring installer、PostgreSQL rotation writer/transaction、
-schedulable 全量 ACK rollout、Gateway principal、Control/Node TLS listener 或 proxy。上述生产组合缺任一项时
-仍保持关闭，不能用测试 constructor 或旧 authority 补齐。
+不接受该轮 full inventory。PostgreSQL现已保存revision-one immutable exact descriptor、current exact
+projection和permanent key/secret-reference lineage；startup只允许initial install或exact replay，不把合法本地
+successor自动当作rotation authority，且resolve可在共享lock内比较进程内binding与PG current。它仍不实现
+public-ring installer、successor/rotation writer、schedulable全量ACK rollout、Control/Node TLS listener或proxy。
+Gateway PG principal虽已落库，但machine listener组合完成前仍保持关闭，不能用测试constructor或旧authority
+补齐。
+
+上述Gateway与signer表共同属于尚未合流部署的exact clean-slate schema 13最终形态；此前Gateway-only提交不是
+可独立部署的version 13迁移，也不允许当前stamp启动时补表或repair catalog。
 
 ## 后果
 
