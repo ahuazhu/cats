@@ -22,6 +22,14 @@ mod inventory;
 mod normal_acquire;
 mod root_provision;
 mod signed_running;
+// This immutable proof seam intentionally lands before Runtime's next
+// persisted device step is frozen. It cannot advance the current three-field
+// PrepareDevice variant without losing the provision/process handoff proof.
+#[expect(
+    dead_code,
+    reason = "sealed serving handoff record is staged before PrepareDevice composition"
+)]
+mod serving_handoff;
 // This focused foundation intentionally lands before the production systemd
 // adapter and signed launch orchestrator that consume it. Keep the exception
 // on this one private module; the follow-up composition removes it.
