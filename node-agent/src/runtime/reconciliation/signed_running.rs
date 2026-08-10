@@ -2838,12 +2838,13 @@ mod tests {
     use std::time::Duration;
 
     use cats_api::runtime_reconciliation::{
-        decode_runtime_checkpoint, spec_digest, AcquireOrigin, AdmissionInventoryAttestation,
-        AgentSession, AssignedKind, AssignedPlacement, DesiredReadSnapshot, Epoch,
-        GuestDeviceIdentity, Ipv4Address, IsolatedIpv4Kind, LastVolumeTransition, MacAddress,
-        NetworkConfig, NodeBootId, NodeObservation, NormalAcquireRequest, NormalAcquireResult,
-        Revision, RuntimeConfig, RuntimeVolumeAuthorityRejection,
-        RuntimeVolumeTransitionPreconditionProblem, Sequence, VolumeAdminState, VolumeRecord,
+        checkpoint_content_digest, decode_desired_runtime_spec, decode_runtime_checkpoint,
+        spec_digest, AcquireOrigin, AdmissionInventoryAttestation, AgentSession, AssignedKind,
+        AssignedPlacement, DesiredReadSnapshot, Epoch, GuestDeviceIdentity, Ipv4Address,
+        IsolatedIpv4Kind, LastVolumeTransition, MacAddress, NetworkConfig, NodeBootId,
+        NodeObservation, NormalAcquireRequest, NormalAcquireResult, Revision, RuntimeConfig,
+        RuntimeVolumeAuthorityRejection, RuntimeVolumeTransitionPreconditionProblem, Sequence,
+        VolumeAdminState, VolumeRecord,
     };
     use cats_storage::authority::{
         AttachmentLineageIdentity, RenewLeaseRequest, RenewLeaseResult, VolumeHeadCasRequest,
@@ -2863,6 +2864,15 @@ mod tests {
         clean_slate_scanner_with_volume_authority_and_blob_for_test,
         clean_slate_scanner_with_volume_authority_for_test, TestCleanSlateProbeConfig,
     };
+
+    const FIXED_DESIRED_WIRE: &str =
+        include_str!("../../../../testdata/runtime-reconciliation-v1-desired.json");
+    const FIXED_PROVISION_ROOT_CHECKPOINT_WIRE: &str =
+        include_str!("../../../../testdata/runtime-reconciliation-v1-provision-checkpoint.json");
+
+    fn literal_file_bytes(value: &'static str) -> &'static [u8] {
+        value.strip_suffix('\n').unwrap_or(value).as_bytes()
+    }
 
     use super::*;
 
@@ -3134,6 +3144,59 @@ mod tests {
             VolumeAcquire::Normal { .. }
         ));
         (effect, state)
+    }
+
+    #[test]
+    fn shared_provision_predecessor_is_production_bound() {
+        let desired = decode_desired_runtime_spec(literal_file_bytes(FIXED_DESIRED_WIRE)).unwrap();
+        let checkpoint =
+            decode_runtime_checkpoint(literal_file_bytes(FIXED_PROVISION_ROOT_CHECKPOINT_WIRE))
+                .unwrap();
+        assert_eq!(
+            checkpoint_content_digest(&checkpoint).unwrap().as_str(),
+            "sha256:f4f5073559b8918c500ac706bb395afa9958f309ae8783ff96f980be60d37f2e"
+        );
+        let (expected_blank_head, expected_provisioned_head) = match &checkpoint.step {
+            ReconcileStep::ProvisionRootImage {
+                expected_blank_head,
+                expected_provisioned_head,
+                ..
+            } => (
+                expected_blank_head.clone(),
+                expected_provisioned_head.clone(),
+            ),
+            _ => panic!("fixed predecessor must remain ProvisionRootImage"),
+        };
+        assert!(provision_checkpoint_is_bound(
+            &checkpoint,
+            &desired,
+            &desired.volumes[0],
+            std::path::Path::new("/var/lib/cats"),
+            &expected_blank_head,
+            &expected_provisioned_head,
+        ));
+
+        let mut missing_owned_volume = checkpoint.clone();
+        missing_owned_volume.volumes.clear();
+        assert!(!provision_checkpoint_is_bound(
+            &missing_owned_volume,
+            &desired,
+            &desired.volumes[0],
+            std::path::Path::new("/var/lib/cats"),
+            &expected_blank_head,
+            &expected_provisioned_head,
+        ));
+        let mut wrong_lineage = checkpoint.clone();
+        wrong_lineage.volumes[0].local_lineages[0].remote_durable_generation =
+            Generation::new(1).unwrap();
+        assert!(!provision_checkpoint_is_bound(
+            &wrong_lineage,
+            &desired,
+            &desired.volumes[0],
+            std::path::Path::new("/var/lib/cats"),
+            &expected_blank_head,
+            &expected_provisioned_head,
+        ));
     }
 
     #[test]

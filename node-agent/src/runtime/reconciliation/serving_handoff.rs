@@ -12,8 +12,9 @@
 //! postconditions required by Runtime Reconciliation v1: a raw `VolumeRecord`
 //! reread at the exact target, and the exact old control-only process after it
 //! has reloaded and handshaken at that same target. The returned proof does not
-//! create a device, start a process, or advance `RuntimeCheckpoint`: the frozen
-//! three-field `PrepareDevice` step cannot yet retain this proof honestly.
+//! create a device or start a process. It can be consumed only while all
+//! retained descriptors remain current, producing the exact closed handoff
+//! provenance persisted by the expanded `PrepareDevice` step.
 
 use std::ffi::{CStr, CString};
 use std::fs::File;
@@ -28,8 +29,8 @@ use std::sync::Mutex;
 use anyhow::{Context as _, Result};
 use cats_api::runtime_reconciliation::{
     encode_runtime_checkpoint, AcquireOrigin, ContractVersion, Durability, Epoch, FenceEpoch,
-    HostPath, Id, RandomId128, ReconcileStep, RemoteHead, Revision, Sha256Digest, VolumeRecord,
-    WireU64,
+    HostPath, Id, RandomId128, ReconcileStep, RemoteHead, Revision, RootServingHandoff,
+    RootServingHandoffRecordIdentity, Sha256Digest, VolumeRecord, WireU64,
 };
 use cats_blockd::target_control::{
     decode_target_control_authorization, encode_target_control_authorization,
@@ -307,6 +308,29 @@ impl ServingHandoffReady {
             self.record_identity.path(),
         )?;
         Ok(())
+    }
+
+    /// Keep every descriptor and the attachment-directory lock retained while
+    /// the caller atomically persists the next `PrepareDevice` checkpoint.
+    /// Returning the typed value without executing the consumer would reopen
+    /// a rename/recreate ABA window between validation and checkpoint replace.
+    pub(crate) fn consume_for_prepare_device<T>(
+        &self,
+        stored_checkpoint: &StoredCheckpoint,
+        consume: impl FnOnce(RootServingHandoff) -> Result<T>,
+    ) -> Result<T> {
+        self.assert_current(stored_checkpoint)?;
+        let handoff = RootServingHandoff {
+            predecessor_checkpoint_content_digest: self.record.checkpoint_content_digest.clone(),
+            record: RootServingHandoffRecordIdentity {
+                path: self.record_identity.path.clone(),
+                device: self.record_identity.device,
+                inode: self.record_identity.inode,
+                length: self.record_identity.length,
+                content_sha256: self.record_identity.content_sha256.clone(),
+            },
+        };
+        consume(handoff)
     }
 }
 
@@ -2036,6 +2060,7 @@ mod tests {
     use cats_storage::authority::LastVolumeTransition;
 
     use super::*;
+    use crate::runtime::reconciliation::signed_running::prepared_owned_observed_volume;
     use crate::runtime::reconciliation::{AuthorizedBlockdStore, FileCheckpointStore};
 
     struct Fixture {
@@ -2241,7 +2266,11 @@ mod tests {
                 expected_provisioned_head: target.clone(),
             },
             processes: Vec::new(),
-            volumes: Vec::new(),
+            volumes: vec![prepared_owned_observed_volume(
+                &volume,
+                &blank_attachment,
+                data_directory_host.clone(),
+            )],
             mounts: Vec::new(),
             networks: Vec::new(),
             guest_transport: GuestTransportEvidence::Unavailable,
@@ -2430,6 +2459,21 @@ mod tests {
         ready
             .assert_current(&fixture.stored_checkpoint)
             .expect("serving proof remains current before consume");
+        let consumed = ready
+            .consume_for_prepare_device(&fixture.stored_checkpoint, Ok)
+            .expect("consume exact handoff into PrepareDevice provenance");
+        assert_eq!(
+            &consumed.predecessor_checkpoint_content_digest,
+            fixture.stored_checkpoint.content_digest()
+        );
+        assert_eq!(&consumed.record.path, ready.record_path());
+        assert_eq!(consumed.record.device, ready.record_identity().device());
+        assert_eq!(consumed.record.inode, ready.record_identity().inode());
+        assert_eq!(consumed.record.length, ready.record_identity().length());
+        assert_eq!(
+            &consumed.record.content_sha256,
+            ready.record_identity().content_sha256()
+        );
         let ready_record = ready.record().clone();
         drop(ready);
         let replay = store

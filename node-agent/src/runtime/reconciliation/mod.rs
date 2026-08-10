@@ -23,12 +23,12 @@ mod inventory;
 mod normal_acquire;
 mod root_provision;
 mod signed_running;
-// This immutable proof seam intentionally lands before Runtime's next
-// persisted device step is frozen. It cannot advance the current three-field
-// PrepareDevice variant without losing the provision/process handoff proof.
+// The immutable proof seam is consumed by the expanded PrepareDevice
+// provenance while retained descriptors close the publication/replace ABA
+// window. Full process/device composition remains a later effect slice.
 #[expect(
     dead_code,
-    reason = "sealed serving handoff record is staged before PrepareDevice composition"
+    reason = "sealed serving handoff is staged before full PrepareDevice effect composition"
 )]
 mod serving_handoff;
 // This focused foundation intentionally lands before the production systemd

@@ -1,4 +1,5 @@
 use std::fmt::Write as _;
+use std::sync::LazyLock;
 
 use cats_api::runtime_reconciliation::*;
 
@@ -12,15 +13,29 @@ const SPEC_DIGEST: &str = "sha256:529c32e8600910283f99bf949af5c31fdadcf3757463eb
 const CHECKPOINT_DIGEST: &str =
     "sha256:602bd0f3a0f1a29f269fa2946fa1a52ea154ba1623b5ca2de18e657cad3753fb";
 const PROVISION_ROOT_CHECKPOINT_DIGEST: &str =
-    "sha256:ed788516e920c57a6700eef477a9e8af48bee99ee0ded541965a6fda96aa9a4c";
+    "sha256:f4f5073559b8918c500ac706bb395afa9958f309ae8783ff96f980be60d37f2e";
 const PREPARE_DEVICE_CHECKPOINT_DIGEST: &str =
-    "sha256:98a44252c94fe4c8bbec172cc87effee14b8df6af581122c32b2e0770ebe7d7e";
+    "sha256:7ea5745da9320827d9e7370a03e1d8743c53bcd7ee88fa86c701ec5d98ed9ed8";
+const SHARED_DESIRED_WIRE: &str =
+    include_str!("../../testdata/runtime-reconciliation-v1-desired.json");
+const SHARED_PROVISION_ROOT_CHECKPOINT_WIRE: &str =
+    include_str!("../../testdata/runtime-reconciliation-v1-provision-checkpoint.json");
+const SHARED_PREPARE_DEVICE_CHECKPOINT_WIRE: &str =
+    include_str!("../../testdata/runtime-reconciliation-v1-prepare-device-checkpoint.json");
 
 const DESIRED_DIGEST_INPUT: &str = r#"{"cat_id":"cat_01","desired_revision":7,"endpoints":[{"endpoint_id":"ep_01","hostname":"app.example.test","protocol":"http","route_epoch":9,"target_port":8080}],"placement":{"kind":"assigned","node_id":"node_a","placement_epoch":3},"runtime":{"boot_image_digest":"sha256:0000000000000000000000000000000000000000000000000000000000000000","guest_config_digest":"sha256:1111111111111111111111111111111111111111111111111111111111111111","memory_bytes":2147483648,"network_config":{"gateway_ipv4":"10.240.0.5","guest_ipv4":"10.240.0.6","guest_mac":"02:ca:0a:f0:00:06","kind":"isolated_ipv4","network_id":"net_01","prefix_length":30},"vcpus":2},"target":"cold","transition":{"kind":"cancel_and_drain"},"version":1,"volumes":[{"access":"read_write_once","acquire":{"expected_unowned_epoch":0,"kind":"normal","transition_id":"22222222222222222222222222222222"},"attachment_id":"att_01","disk_id":"disk_root","disk_kind":"root","disposition":{"kind":"retain"},"durability":"strict","guest_device":{"serial":"cats-root","slot":0},"mount":null,"size_bytes":4294967296,"volume_id":"vol_root","volume_intent_id":"vint_root"}],"workspace_id":"ws_01"}"#;
 
 const CHECKPOINT_WIRE: &str = r#"{"cat_id":"cat_01","desired_revision":7,"guest_transport":{"kind":"unavailable"},"lifecycle_admission":"closed","mounts":[],"networks":[],"node_id":"node_a","placement_epoch":3,"processes":[],"require_idle":{"kind":"not_applicable"},"route_gates":[],"runtime_incarnation":null,"spec_digest":"sha256:529c32e8600910283f99bf949af5c31fdadcf3757463eb6c4811c61673ed9409","stable_state":null,"step":{"inventory_epoch":4,"kind":"inspect_inventory"},"updated_at_unix_ms":1720000000000,"version":1,"volumes":[],"warm_snapshot":{"kind":"absent"}}"#;
-const PROVISION_ROOT_CHECKPOINT_WIRE: &str = r#"{"cat_id":"cat_01","desired_revision":7,"guest_transport":{"kind":"unavailable"},"lifecycle_admission":"closed","mounts":[],"networks":[],"node_id":"node_a","placement_epoch":3,"processes":[],"require_idle":{"kind":"not_applicable"},"route_gates":[],"runtime_incarnation":null,"spec_digest":"sha256:529c32e8600910283f99bf949af5c31fdadcf3757463eb6c4811c61673ed9409","stable_state":null,"step":{"attachment_epoch":8,"attachment_id":"att_01","boot_image_digest":"sha256:0000000000000000000000000000000000000000000000000000000000000000","control_socket_path":"/run/cats/cat_01/blockd-root.sock","data_directory":"/var/lib/cats/vol_root","expected_blank_head":{"generation":0,"root_hash":null,"root_object_id":null},"expected_provisioned_head":{"generation":1,"root_hash":"sha256:0000000000000000000000000000000000000000000000000000000000000000","root_object_id":"volumes/vol_root/roots/1"},"kind":"provision_root_image","process_identity_token":"fedcba0987654321fedcba0987654321","provision_transition_id":"1234567890abcdef1234567890abcdef","scope_id":"cats-cat_01-root-provision","size_bytes":4294967296,"volume_id":"vol_root"},"updated_at_unix_ms":1720000000000,"version":1,"volumes":[],"warm_snapshot":{"kind":"absent"}}"#;
-const PREPARE_DEVICE_CHECKPOINT_WIRE: &str = r#"{"cat_id":"cat_01","desired_revision":7,"guest_transport":{"kind":"unavailable"},"lifecycle_admission":"closed","mounts":[],"networks":[],"node_id":"node_a","placement_epoch":3,"processes":[],"require_idle":{"kind":"not_applicable"},"route_gates":[],"runtime_incarnation":null,"spec_digest":"sha256:529c32e8600910283f99bf949af5c31fdadcf3757463eb6c4811c61673ed9409","stable_state":null,"step":{"acquire_origin":{"kind":"normal","transition_id":"22222222222222222222222222222222"},"attachment_epoch":8,"attachment_id":"att_01","durability":"strict","expected_head":{"generation":1,"root_hash":"sha256:0000000000000000000000000000000000000000000000000000000000000000","root_object_id":"volumes/vol_root/roots/1"},"frontend":{"kind":"vhost_user_blk","queue_size":256,"queues":2,"socket_path":"/run/cats/cat_01/root-vhost.sock"},"guest_device":{"serial":"cats-root","slot":0},"kind":"prepare_device","ownership_token":"88888888888888888888888888888888","serving_authority":{"handoff":{"predecessor_checkpoint_content_digest":"sha256:ed788516e920c57a6700eef477a9e8af48bee99ee0ded541965a6fda96aa9a4c","record":{"content_sha256":"sha256:3333333333333333333333333333333333333333333333333333333333333333","device":16777217,"inode":42,"length":1024,"path":"/var/lib/cats/handoffs/cat_01/root-serving.json"}},"kind":"after_root_provision"},"serving_process":{"control_socket_path":"/run/cats/cat_01/blockd-serving-control.sock","data_directory":"/var/lib/cats/vol_root","executable_path":"/usr/bin/cats-blockd","process_identity_token":"77777777777777777777777777777777","scope_id":"cats-cat_01-root-serving"},"size_bytes":4294967296,"volume_id":"vol_root"},"updated_at_unix_ms":1720000000000,"version":1,"volumes":[],"warm_snapshot":{"kind":"absent"}}"#;
+static PROVISION_ROOT_CHECKPOINT_WIRE: LazyLock<&'static str> = LazyLock::new(|| {
+    SHARED_PROVISION_ROOT_CHECKPOINT_WIRE
+        .strip_suffix('\n')
+        .unwrap_or(SHARED_PROVISION_ROOT_CHECKPOINT_WIRE)
+});
+static PREPARE_DEVICE_CHECKPOINT_WIRE: LazyLock<&'static str> = LazyLock::new(|| {
+    SHARED_PREPARE_DEVICE_CHECKPOINT_WIRE
+        .strip_suffix('\n')
+        .unwrap_or(SHARED_PREPARE_DEVICE_CHECKPOINT_WIRE)
+});
 
 const EMPTY_INVENTORY_INPUT: &str = r#"{"agent_instance_id":"44444444444444444444444444444444","agent_session_epoch":2,"inventory_epoch":4,"inventory_read_position":12,"node_boot_id":"33333333333333333333333333333333","node_id":"node_a","residue":[],"runtimes":[],"version":1}"#;
 
@@ -53,6 +68,10 @@ fn desired_wire(claim: &str) -> Vec<u8> {
         .unwrap()
         .insert("spec_digest".to_owned(), claim.into());
     serde_json::to_vec(&value).unwrap()
+}
+
+fn literal_file_bytes(value: &'static str) -> &'static [u8] {
+    value.strip_suffix('\n').unwrap_or(value).as_bytes()
 }
 
 fn desired_value() -> serde_json::Value {
@@ -603,6 +622,10 @@ fn inventory_projection(observation: &NodeObservation) -> serde_json::Value {
 
 #[test]
 fn fixed_desired_and_checkpoint_digests_match() {
+    assert_eq!(
+        desired_wire(SPEC_DIGEST),
+        literal_file_bytes(SHARED_DESIRED_WIRE)
+    );
     let desired = decode_desired_runtime_spec(&desired_wire(SPEC_DIGEST)).unwrap();
     assert_eq!(
         canonical_json(&desired_projection(&desired)),
@@ -617,6 +640,10 @@ fn fixed_desired_and_checkpoint_digests_match() {
         CHECKPOINT_DIGEST
     );
 
+    assert_eq!(
+        PROVISION_ROOT_CHECKPOINT_WIRE.as_bytes(),
+        literal_file_bytes(SHARED_PROVISION_ROOT_CHECKPOINT_WIRE)
+    );
     let provision = decode_runtime_checkpoint(PROVISION_ROOT_CHECKPOINT_WIRE.as_bytes()).unwrap();
     assert_eq!(
         canonical_json(&provision),
@@ -643,6 +670,20 @@ fn fixed_desired_and_checkpoint_digests_match() {
     assert_eq!(
         checkpoint_content_digest(&prepare).unwrap().as_str(),
         PREPARE_DEVICE_CHECKPOINT_DIGEST
+    );
+    let ReconcileStep::PrepareDevice {
+        serving_authority, ..
+    } = &prepare.step
+    else {
+        panic!("fixed PrepareDevice vector changed step kind")
+    };
+    let ServingAuthorityProvenance::AfterRootProvision { handoff } = serving_authority.as_ref()
+    else {
+        panic!("fixed PrepareDevice vector lost root handoff provenance")
+    };
+    assert_eq!(
+        handoff.predecessor_checkpoint_content_digest,
+        checkpoint_content_digest(&provision).unwrap()
     );
 }
 
