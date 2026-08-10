@@ -24,6 +24,8 @@ use cats_api::runtime_reconciliation::{Durability, HostPath, Id, RandomId128, Wi
 use crate::runtime_spine::RuntimeDesiredEffectContext;
 
 use super::authorized_blockd::AuthorizedBlockdLaunchConfig;
+#[cfg(test)]
+use super::root_provision_process::RootProvisionProcessPhase;
 use super::root_provision_process::{
     sealed, CheckpointedRootProvisionProcess, RootProvisionBlockdHandshake,
     RootProvisionProcessConflict, RootProvisionProcessEvidence, RootProvisionProcessExpectation,
@@ -321,7 +323,7 @@ fn exact_handshake(
         && status.scope_id.as_ref() == Some(&expected.scope_id)
         && status.process_identity_token.as_ref() == Some(&expected.process_identity_token)
         && status.control_only == Some(true)
-        && status.remote_head.as_ref() == Some(&expected.attachment.head)
+        && status.remote_head.as_ref() == Some(expected.expected_remote_head())
         && status.guest_io_enabled == Some(false)
         && status.mode == expected_mode
         && !status.fenced)
@@ -330,7 +332,7 @@ fn exact_handshake(
             identity: expected.attachment.identity.clone(),
             size_bytes: expected.size_bytes,
             durability: expected.attachment.durability,
-            remote_head: expected.attachment.head.clone(),
+            remote_head: expected.expected_remote_head().clone(),
             process_identity_token: expected.process_identity_token.clone(),
             control_only: true,
             guest_io_enabled: false,
@@ -1319,6 +1321,42 @@ mod tests {
     }
 
     #[test]
+    fn authority_confirmed_target_adopts_the_same_unit_pid_and_socket() {
+        let target = RemoteHead {
+            generation: Generation::new(1).unwrap(),
+            root_hash: Some(Sha256Digest::from_bytes([2; 32])),
+            root_object_id: Some(
+                cats_api::runtime_reconciliation::AsciiText::new("roots/root-1").unwrap(),
+            ),
+        };
+        let expected = expectation().with_provisioned_head_for_test(target.clone());
+        let proof = proof();
+        let systemd = Arc::new(FakeSystemd::default());
+        systemd.inspections.lock().unwrap().extend([
+            SystemdInspection::Exact(proof.clone()),
+            SystemdInspection::Exact(proof),
+        ]);
+        let mut target_status = status();
+        target_status.remote_head = Some(target.clone());
+        let handshake = Arc::new(FakeHandshake::default());
+        handshake
+            .inspections
+            .lock()
+            .unwrap()
+            .push_back(BlockdHandshakeInspection::Verified {
+                peer_process_id: 4242,
+                status: Box::new(target_status),
+            });
+        let port = SystemdRootProvisionProcessPort::new(config(), systemd, handshake);
+        let mut target_evidence = evidence();
+        target_evidence.handshake.remote_head = target;
+        assert_eq!(
+            port.inspect(&expected, &context()).unwrap(),
+            RootProvisionProcessInspection::Exact(Box::new(target_evidence))
+        );
+    }
+
+    #[test]
     fn generation_only_or_different_remote_head_is_not_an_exact_handshake() {
         let expected = expectation();
         let proof = proof();
@@ -1666,6 +1704,9 @@ mod tests {
 
     fn expectation() -> RootProvisionProcessExpectation {
         let attachment = attachment();
+        let phase = RootProvisionProcessPhase::AwaitingProvision {
+            expected_blank_head: attachment.head.clone(),
+        };
         RootProvisionProcessExpectation {
             cat_id: id("cat_01"),
             node_id: id("node_a"),
@@ -1684,6 +1725,7 @@ mod tests {
             size_bytes: 4_194_304,
             boot_image_digest: digest('1'),
             attachment,
+            phase,
             executable_path: host("/usr/bin/cats-blockd"),
         }
     }

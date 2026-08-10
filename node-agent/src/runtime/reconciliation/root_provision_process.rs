@@ -12,7 +12,10 @@ use cats_api::runtime_reconciliation::{
     Durability, Epoch, FenceEpoch, HostPath, Id, RandomId128, ReconcileStep, RemoteHead, Revision,
     RuntimeCheckpoint, Sha256Digest, WireU64,
 };
-use cats_storage::authority::{AttachmentLineageIdentity, AuthorizedServingAttachment};
+use cats_storage::authority::{
+    validate_authorized_serving_attachment, validate_volume_record, AttachmentLineageIdentity,
+    AuthorizedServingAttachment, LastVolumeTransition, VolumeAdminState, VolumeRecord,
+};
 
 use crate::runtime_spine::RuntimeDesiredEffectContext;
 
@@ -20,6 +23,36 @@ use super::{FileCheckpointStore, StoredCheckpoint};
 
 pub(crate) mod sealed {
     pub(crate) trait Sealed {}
+}
+
+/// The only two authority states in which the persisted root-provision
+/// process may be adopted. The selected head is copied from the checkpoint,
+/// never from an unbound process response or from the original acquire grant.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) enum RootProvisionProcessPhase {
+    AwaitingProvision {
+        expected_blank_head: RemoteHead,
+    },
+    Provisioned {
+        expected_provisioned_head: RemoteHead,
+    },
+}
+
+impl RootProvisionProcessPhase {
+    fn expected_remote_head(&self) -> &RemoteHead {
+        match self {
+            Self::AwaitingProvision {
+                expected_blank_head,
+            } => expected_blank_head,
+            Self::Provisioned {
+                expected_provisioned_head,
+            } => expected_provisioned_head,
+        }
+    }
+
+    fn may_start_from_blank_authorized_artifact(&self) -> bool {
+        matches!(self, Self::AwaitingProvision { .. })
+    }
 }
 
 /// The exact checkpoint and grant binding a control-only blockd attempt.
@@ -42,15 +75,28 @@ pub(crate) struct RootProvisionProcessExpectation {
     pub size_bytes: u64,
     pub boot_image_digest: Sha256Digest,
     pub attachment: AuthorizedServingAttachment,
+    pub(super) phase: RootProvisionProcessPhase,
     pub executable_path: HostPath,
+}
+
+/// One strict authority reread paired with the immutable acquire-time
+/// artifact. Keeping the pair in one argument prevents process creation from
+/// being planned from either half in isolation.
+pub(crate) struct RootProvisionAuthoritySnapshot<'a> {
+    pub attachment: AuthorizedServingAttachment,
+    pub volume: &'a VolumeRecord,
 }
 
 impl RootProvisionProcessExpectation {
     pub(crate) fn from_checkpoint(
         checkpoint: &RuntimeCheckpoint,
-        attachment: AuthorizedServingAttachment,
+        authority: RootProvisionAuthoritySnapshot<'_>,
         executable_path: HostPath,
     ) -> anyhow::Result<Self> {
+        let RootProvisionAuthoritySnapshot {
+            attachment,
+            volume: authority,
+        } = authority;
         let ReconcileStep::ProvisionRootImage {
             provision_transition_id,
             volume_id,
@@ -63,7 +109,7 @@ impl RootProvisionProcessExpectation {
             size_bytes,
             boot_image_digest,
             expected_blank_head,
-            ..
+            expected_provisioned_head,
         } = &checkpoint.step
         else {
             anyhow::bail!("checkpoint is not at provision_root_image")
@@ -79,6 +125,12 @@ impl RootProvisionProcessExpectation {
                 && *expected_blank_head == attachment.head,
             "root-provision checkpoint and authorized grant do not form one exact lineage"
         );
+        let phase = phase_from_exact_authority(
+            &attachment,
+            authority,
+            expected_blank_head,
+            expected_provisioned_head,
+        )?;
         anyhow::ensure!(
             executable_path.as_str().starts_with('/'),
             "root-provision executable path must be absolute"
@@ -112,8 +164,62 @@ impl RootProvisionProcessExpectation {
             size_bytes: *size_bytes,
             boot_image_digest: boot_image_digest.clone(),
             attachment,
+            phase,
             executable_path,
         })
+    }
+
+    pub(crate) fn expected_remote_head(&self) -> &RemoteHead {
+        self.phase.expected_remote_head()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn with_provisioned_head_for_test(
+        mut self,
+        expected_provisioned_head: RemoteHead,
+    ) -> Self {
+        self.phase = RootProvisionProcessPhase::Provisioned {
+            expected_provisioned_head,
+        };
+        self
+    }
+}
+
+fn phase_from_exact_authority(
+    attachment: &AuthorizedServingAttachment,
+    authority: &VolumeRecord,
+    expected_blank_head: &RemoteHead,
+    expected_provisioned_head: &RemoteHead,
+) -> anyhow::Result<RootProvisionProcessPhase> {
+    validate_authorized_serving_attachment(attachment)
+        .context("root-provision authorized grant is not closed")?;
+    validate_volume_record(authority).context("root-provision authority record is not closed")?;
+    let exact_acquire_marker = matches!(
+        &authority.last_transition,
+        Some(LastVolumeTransition::NormalAcquire { request, result })
+            if request == &attachment.acquire_request && result == &attachment.acquire_result
+    );
+    anyhow::ensure!(
+        authority.volume_id == attachment.identity.volume_id
+            && authority.size_bytes == attachment.size_bytes
+            && authority.durability == attachment.durability
+            && matches!(authority.admin_state, VolumeAdminState::Active)
+            && authority.lease_owner.as_ref() == Some(&attachment.identity.attachment_id)
+            && authority.lease_epoch == attachment.identity.attachment_epoch
+            && authority.lease_expires_at.is_some()
+            && exact_acquire_marker,
+        "root-provision authority does not bind the checkpointed attachment"
+    );
+    if &authority.head == expected_blank_head {
+        Ok(RootProvisionProcessPhase::AwaitingProvision {
+            expected_blank_head: expected_blank_head.clone(),
+        })
+    } else if &authority.head == expected_provisioned_head {
+        Ok(RootProvisionProcessPhase::Provisioned {
+            expected_provisioned_head: expected_provisioned_head.clone(),
+        })
+    } else {
+        anyhow::bail!("root-provision authority head is neither exact blank nor exact target")
     }
 }
 
@@ -164,7 +270,7 @@ impl RootProvisionProcessEvidence {
             && self.handshake.identity == expected.attachment.identity
             && self.handshake.size_bytes == expected.size_bytes
             && self.handshake.durability == expected.attachment.durability
-            && self.handshake.remote_head == expected.attachment.head
+            && &self.handshake.remote_head == expected.expected_remote_head()
             && self.handshake.process_identity_token == expected.process_identity_token
             && self.handshake.control_only
             && !self.handshake.guest_io_enabled
@@ -239,6 +345,10 @@ pub(crate) enum RootProvisionProcessOutcome {
     AbsentAfterAmbiguousStart,
     Conflict(RootProvisionProcessConflict),
     CancelledClean,
+    /// The target head is authoritative, but the immutable authorized
+    /// artifact still carries the acquire-time blank head. A replacement
+    /// process cannot use that artifact and must not be submitted.
+    TargetControlArtifactRequired,
     Unavailable,
 }
 
@@ -255,7 +365,7 @@ pub(crate) fn ensure_root_provision_process_after_checkpoint<P>(
     store: &FileCheckpointStore,
     predecessor: &StoredCheckpoint,
     checkpoint: &RuntimeCheckpoint,
-    attachment: AuthorizedServingAttachment,
+    authority: RootProvisionAuthoritySnapshot<'_>,
     executable_path: HostPath,
     port: &P,
     context: &RuntimeDesiredEffectContext,
@@ -265,7 +375,7 @@ where
 {
     context.check_active()?;
     let expected =
-        RootProvisionProcessExpectation::from_checkpoint(checkpoint, attachment, executable_path)?;
+        RootProvisionProcessExpectation::from_checkpoint(checkpoint, authority, executable_path)?;
     let persisted = store
         .replace(predecessor, checkpoint)
         .context("persist root-provision process identity before process effect")?;
@@ -282,6 +392,11 @@ where
             RootProvisionProcessOutcome::Conflict(problem)
         }
         RootProvisionProcessInspection::Unavailable => RootProvisionProcessOutcome::Unavailable,
+        RootProvisionProcessInspection::Absent
+            if !expected.phase.may_start_from_blank_authorized_artifact() =>
+        {
+            RootProvisionProcessOutcome::TargetControlArtifactRequired
+        }
         RootProvisionProcessInspection::Absent => {
             context.check_active()?;
             let checkpointed = CheckpointedRootProvisionProcess {
@@ -457,6 +572,7 @@ mod tests {
     #[test]
     fn durable_checkpoint_precedes_inspect_and_start() {
         let (_root, state, store, predecessor, staged, attachment, evidence) = fixture();
+        let authority = authority_record(&attachment, attachment.head.clone());
         let port = FakePort::default();
         {
             let mut fake = port.state.lock().unwrap();
@@ -471,7 +587,7 @@ mod tests {
             &store,
             &predecessor,
             &staged,
-            attachment,
+            authority_snapshot(attachment, &authority),
             host("/usr/bin/cats-blockd"),
             &port,
             &context(state),
@@ -487,6 +603,142 @@ mod tests {
     }
 
     #[test]
+    fn lost_provision_response_then_node_restart_adopts_same_process_at_exact_target() {
+        let (root, state, store, predecessor, staged, attachment, blank_evidence) = fixture();
+        let blank_authority = authority_record(&attachment, attachment.head.clone());
+        let first_port = FakePort::default();
+        {
+            let mut fake = first_port.state.lock().unwrap();
+            fake.inspections
+                .push_back(RootProvisionProcessInspection::Absent);
+            fake.starts
+                .push_back(RootProvisionProcessStart::Started(Box::new(
+                    blank_evidence.clone(),
+                )));
+        }
+        let started = ensure_root_provision_process_after_checkpoint(
+            &store,
+            &predecessor,
+            &staged,
+            authority_snapshot(attachment.clone(), &blank_authority),
+            host("/usr/bin/cats-blockd"),
+            &first_port,
+            &context(state.clone()),
+        )
+        .unwrap();
+        assert!(matches!(
+            started.outcome,
+            RootProvisionProcessOutcome::Started(_)
+        ));
+
+        let target = match &staged.step {
+            ReconcileStep::ProvisionRootImage {
+                expected_provisioned_head,
+                ..
+            } => expected_provisioned_head.clone(),
+            _ => unreachable!("fixture is a root-provision checkpoint"),
+        };
+        let provisioned_authority = authority_record(&attachment, target.clone());
+        let mut target_evidence = blank_evidence;
+        target_evidence.handshake.remote_head = target;
+
+        drop(store);
+        let restarted_store =
+            FileCheckpointStore::open(&root.path().join("checkpoints"), &id("cat_01")).unwrap();
+        let restarted_predecessor = restarted_store.load().unwrap().unwrap();
+        let restarted_port = FakePort::default();
+        restarted_port.state.lock().unwrap().inspections.push_back(
+            RootProvisionProcessInspection::Exact(Box::new(target_evidence.clone())),
+        );
+
+        let adopted = ensure_root_provision_process_after_checkpoint(
+            &restarted_store,
+            &restarted_predecessor,
+            &staged,
+            authority_snapshot(attachment.clone(), &provisioned_authority),
+            host("/usr/bin/cats-blockd"),
+            &restarted_port,
+            &context(state),
+        )
+        .unwrap();
+        assert_eq!(
+            adopted.outcome,
+            RootProvisionProcessOutcome::Adopted(Box::new(target_evidence))
+        );
+        let fake = restarted_port.state.lock().unwrap();
+        assert_eq!((fake.inspect_calls, fake.start_calls), (1, 0));
+        assert_eq!(attachment.head, blank_head());
+        assert_eq!(attachment.acquire_result.resulting_head, blank_head());
+    }
+
+    #[test]
+    fn authority_head_outside_persisted_blank_or_target_stops_before_process_io() {
+        let (_root, state, store, predecessor, staged, attachment, _evidence) = fixture();
+        let foreign_head = RemoteHead {
+            generation: Generation::new(1).unwrap(),
+            root_hash: Some(digest('9')),
+            root_object_id: Some(
+                cats_api::runtime_reconciliation::AsciiText::new("roots/foreign").unwrap(),
+            ),
+        };
+        let authority = authority_record(&attachment, foreign_head);
+        let port = FakePort::default();
+        let error = ensure_root_provision_process_after_checkpoint(
+            &store,
+            &predecessor,
+            &staged,
+            authority_snapshot(attachment, &authority),
+            host("/usr/bin/cats-blockd"),
+            &port,
+            &context(state),
+        )
+        .expect_err("a foreign authority head must not select a process phase");
+        assert!(format!("{error:#}").contains("neither exact blank nor exact target"));
+        let fake = port.state.lock().unwrap();
+        assert_eq!((fake.inspect_calls, fake.start_calls), (0, 0));
+        assert_eq!(
+            store.load().unwrap().unwrap().checkpoint(),
+            predecessor.checkpoint()
+        );
+    }
+
+    #[test]
+    fn target_phase_with_absent_process_never_submits_the_blank_artifact() {
+        let (_root, state, store, predecessor, staged, attachment, _evidence) = fixture();
+        let target = match &staged.step {
+            ReconcileStep::ProvisionRootImage {
+                expected_provisioned_head,
+                ..
+            } => expected_provisioned_head.clone(),
+            _ => unreachable!("fixture is a root-provision checkpoint"),
+        };
+        let provisioned_authority = authority_record(&attachment, target);
+        let port = FakePort::default();
+        port.state
+            .lock()
+            .unwrap()
+            .inspections
+            .push_back(RootProvisionProcessInspection::Absent);
+        let result = ensure_root_provision_process_after_checkpoint(
+            &store,
+            &predecessor,
+            &staged,
+            authority_snapshot(attachment, &provisioned_authority),
+            host("/usr/bin/cats-blockd"),
+            &port,
+            &context(state),
+        )
+        .unwrap();
+        assert_eq!(
+            result.outcome,
+            RootProvisionProcessOutcome::TargetControlArtifactRequired
+        );
+        assert_eq!(result.checkpoint.checkpoint(), &staged);
+        let fake = port.state.lock().unwrap();
+        assert_eq!((fake.inspect_calls, fake.start_calls), (1, 0));
+    }
+
+    #[test]
     fn every_checkpoint_crash_window_has_zero_process_effect() {
         for stage in [
             WriteStage::Write,
@@ -496,13 +748,14 @@ mod tests {
             WriteStage::DirectorySynced,
         ] {
             let (_root, state, store, predecessor, staged, attachment, _evidence) = fixture();
+            let authority = authority_record(&attachment, attachment.head.clone());
             let port = FakePort::default();
             store.inject_crash_once(stage);
             let error = ensure_root_provision_process_after_checkpoint(
                 &store,
                 &predecessor,
                 &staged,
-                attachment,
+                authority_snapshot(attachment, &authority),
                 host("/usr/bin/cats-blockd"),
                 &port,
                 &context(state),
@@ -517,6 +770,7 @@ mod tests {
     #[test]
     fn ambiguous_start_adopts_only_one_exact_reinspection() {
         let (_root, state, store, predecessor, staged, attachment, evidence) = fixture();
+        let authority = authority_record(&attachment, attachment.head.clone());
         let port = FakePort::default();
         {
             let mut fake = port.state.lock().unwrap();
@@ -530,7 +784,7 @@ mod tests {
             &store,
             &predecessor,
             &staged,
-            attachment,
+            authority_snapshot(attachment, &authority),
             host("/usr/bin/cats-blockd"),
             &port,
             &context(state),
@@ -547,6 +801,7 @@ mod tests {
     #[test]
     fn ambiguous_absence_and_foreign_identity_never_retry_or_terminate() {
         let (_root, state, store, predecessor, staged, attachment, _evidence) = fixture();
+        let authority = authority_record(&attachment, attachment.head.clone());
         let port = FakePort::default();
         {
             let mut fake = port.state.lock().unwrap();
@@ -560,7 +815,7 @@ mod tests {
             &store,
             &predecessor,
             &staged,
-            attachment,
+            authority_snapshot(attachment, &authority),
             host("/usr/bin/cats-blockd"),
             &port,
             &context(state),
@@ -574,6 +829,7 @@ mod tests {
         assert_eq!((fake.inspect_calls, fake.start_calls), (2, 1));
 
         let (_root, state, store, predecessor, staged, attachment, _evidence) = fixture();
+        let authority = authority_record(&attachment, attachment.head.clone());
         let port = FakePort::default();
         port.state
             .lock()
@@ -586,7 +842,7 @@ mod tests {
             &store,
             &predecessor,
             &staged,
-            attachment,
+            authority_snapshot(attachment, &authority),
             host("/usr/bin/cats-blockd"),
             &port,
             &context(state),
@@ -603,6 +859,7 @@ mod tests {
     #[test]
     fn mismatched_started_evidence_is_conflict_and_never_killed() {
         let (_root, state, store, predecessor, staged, attachment, mut evidence) = fixture();
+        let authority = authority_record(&attachment, attachment.head.clone());
         evidence.ownership_token = random('9');
         let port = FakePort::default();
         {
@@ -616,7 +873,7 @@ mod tests {
             &store,
             &predecessor,
             &staged,
-            attachment,
+            authority_snapshot(attachment, &authority),
             host("/usr/bin/cats-blockd"),
             &port,
             &context(state),
@@ -641,6 +898,7 @@ mod tests {
         ];
         for variant in variants {
             let (_root, state, store, predecessor, staged, attachment, mut evidence) = fixture();
+            let authority = authority_record(&attachment, attachment.head.clone());
             match variant {
                 "zero_pid" => evidence.process_id = 0,
                 "zero_start" => {
@@ -666,7 +924,7 @@ mod tests {
                 &store,
                 &predecessor,
                 &staged,
-                attachment,
+                authority_snapshot(attachment, &authority),
                 host("/usr/bin/cats-blockd"),
                 &port,
                 &context(state),
@@ -685,6 +943,7 @@ mod tests {
     #[test]
     fn cancelled_start_is_closed_only_after_the_port_reports_cleanup() {
         let (_root, state, store, predecessor, staged, attachment, _evidence) = fixture();
+        let authority = authority_record(&attachment, attachment.head.clone());
         let port = FakePort::default();
         {
             let mut fake = port.state.lock().unwrap();
@@ -697,7 +956,7 @@ mod tests {
             &store,
             &predecessor,
             &staged,
-            attachment,
+            authority_snapshot(attachment, &authority),
             host("/usr/bin/cats-blockd"),
             &port,
             &context(state),
@@ -770,6 +1029,33 @@ mod tests {
             },
             acquire_request: request,
         }
+    }
+
+    fn authority_record(
+        attachment: &AuthorizedServingAttachment,
+        head: RemoteHead,
+    ) -> VolumeRecord {
+        VolumeRecord {
+            volume_id: attachment.identity.volume_id.clone(),
+            size_bytes: attachment.size_bytes,
+            durability: attachment.durability,
+            admin_state: VolumeAdminState::Active,
+            head,
+            lease_owner: Some(attachment.identity.attachment_id.clone()),
+            lease_epoch: attachment.identity.attachment_epoch,
+            lease_expires_at: Some(attachment.lease_expires_at),
+            last_transition: Some(LastVolumeTransition::NormalAcquire {
+                request: attachment.acquire_request.clone(),
+                result: attachment.acquire_result.clone(),
+            }),
+        }
+    }
+
+    fn authority_snapshot<'a>(
+        attachment: AuthorizedServingAttachment,
+        volume: &'a VolumeRecord,
+    ) -> RootProvisionAuthoritySnapshot<'a> {
+        RootProvisionAuthoritySnapshot { attachment, volume }
     }
 
     fn evidence(attachment: &AuthorizedServingAttachment) -> RootProvisionProcessEvidence {
