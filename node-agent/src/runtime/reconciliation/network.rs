@@ -119,13 +119,12 @@ impl NodeGlobalNetworkScanAdmission {
     pub(crate) fn network_projections(&self) -> BTreeMap<Id, Vec<ObservedNetwork>> {
         self.entries
             .iter()
-            .filter_map(|(cat_id, entry)| {
-                (entry.state == ReservedHostNetworkState::Exact).then(|| {
-                    (
-                        cat_id.clone(),
-                        vec![observed_network(&entry.reservation.identity)],
-                    )
-                })
+            .filter(|(_, entry)| entry.state == ReservedHostNetworkState::Exact)
+            .map(|(cat_id, entry)| {
+                (
+                    cat_id.clone(),
+                    vec![observed_network(&entry.reservation.identity)],
+                )
             })
             .collect()
     }
@@ -170,6 +169,20 @@ impl NodeGlobalNetworkScanAdmission {
             entries: self.entries,
             physical: self.physical,
         })
+    }
+
+    #[cfg(test)]
+    pub(crate) fn absent_checkpoint_for_test(checkpoint: &RuntimeCheckpoint) -> Result<Self> {
+        let ReconcileStep::PrepareNetwork { network, .. } = &checkpoint.step else {
+            anyhow::bail!("test network admission requires PrepareNetwork")
+        };
+        Self::new(
+            [NetworkReservation {
+                cat_id: checkpoint.cat_id.clone(),
+                identity: network.clone(),
+            }],
+            HostNetworkSnapshot::empty_for_test(),
+        )
     }
 }
 
@@ -816,6 +829,12 @@ impl PrepareNetworkReservationEffect {
             serving_process,
             tap_create: Arc::new(PlatformTapCreatePort),
         })
+    }
+
+    #[cfg(test)]
+    pub(crate) fn with_tap_create_for_test(mut self, tap_create: Arc<dyn TapCreatePort>) -> Self {
+        self.tap_create = tap_create;
+        self
     }
 
     /// Reserve the Host network only after the accepted full scan and sealed

@@ -3869,14 +3869,15 @@ mod tests {
 
     use cats_api::runtime_reconciliation::{
         spec_digest, AdmissionInventoryAttestation, AgentSession, AppliedDesiredEvidence,
-        AsciiText, AssignedKind, AssignedPlacement, CheckpointEvidence, Condition, DiskKind,
-        Generation, GuestDeviceIdentity, GuestTransportEvidence, Ipv4Address, IsolatedIpv4Kind,
-        LifecycleAdmission, MacAddress, NetworkConfig, NodeBootId, NodeObservation,
-        NormalAcquireRequest, NormalAcquireResult, ObservedRuntimeStatus, OwnershipTokenEvidence,
-        PrepareDeviceFrontend, ProgressingReason, RequireIdleCheckpoint, RuntimeCheckpoint,
-        RuntimeConfig, RuntimeTarget, RuntimeTransition, Sequence, ServingAuthorityProvenance,
-        ServingBlockdIdentity, UnixMillis, VolumeAccess, VolumeAcquire, VolumeAdminState,
-        VolumeAuthorityEvidence, VolumeDisposition, VolumeIntent, WarmSnapshotEvidence,
+        AsciiText, AssignedKind, AssignedPlacement, CheckpointEvidence, Condition,
+        DesiredReadSnapshot, DiskKind, Generation, GuestDeviceIdentity, GuestTransportEvidence,
+        Ipv4Address, IsolatedIpv4Kind, LifecycleAdmission, MacAddress, NetworkConfig, NodeBootId,
+        NodeObservation, NormalAcquireRequest, NormalAcquireResult, ObservedRuntimeStatus,
+        OwnershipTokenEvidence, PrepareDeviceFrontend, ProgressingReason, RequireIdleCheckpoint,
+        RuntimeCheckpoint, RuntimeConfig, RuntimeTarget, RuntimeTransition, Sequence,
+        ServingAuthorityProvenance, ServingBlockdIdentity, SessionBinding, UnixMillis,
+        VolumeAccess, VolumeAcquire, VolumeAdminState, VolumeAuthorityEvidence, VolumeDisposition,
+        VolumeIntent, WarmSnapshotEvidence,
     };
     use cats_storage::authority::{
         AuthorityError, LastVolumeTransition, RenewLeaseRequest, RenewLeaseResult,
@@ -3888,6 +3889,10 @@ mod tests {
     };
 
     use super::*;
+    use crate::ch::{PendingTap, TapCreatePort};
+    use crate::runtime::reconciliation::network::{
+        NodeGlobalNetworkScanAdmission, PrepareNetworkReservationEffect,
+    };
     use crate::runtime::reconciliation::prepare_device_retirement::PrepareDeviceTargetRetirementEffect;
     use crate::runtime::reconciliation::root_provision_process::{
         global_sealed as root_process_global_sealed,
@@ -3991,6 +3996,49 @@ mod tests {
             _request: &VolumeHeadCasRequest,
         ) -> std::result::Result<VolumeHeadCasResult, AuthorityError> {
             unreachable!("serving handoff effect never mutates authority")
+        }
+    }
+
+    struct SequencedEffectAuthority {
+        records: Mutex<VecDeque<VolumeRecord>>,
+        loads: AtomicUsize,
+    }
+
+    impl SequencedEffectAuthority {
+        fn new(records: impl IntoIterator<Item = VolumeRecord>) -> Self {
+            Self {
+                records: Mutex::new(records.into_iter().collect()),
+                loads: AtomicUsize::new(0),
+            }
+        }
+    }
+
+    impl VolumeDataAuthority for SequencedEffectAuthority {
+        fn load_volume(&self, volume_id: &Id) -> std::result::Result<VolumeRecord, AuthorityError> {
+            self.loads.fetch_add(1, Ordering::SeqCst);
+            let mut records = self.records.lock().unwrap();
+            let record = match records.len() {
+                0 => return Err(AuthorityError::NotFound),
+                1 => records.front().unwrap().clone(),
+                _ => records.pop_front().unwrap(),
+            };
+            (record.volume_id == *volume_id)
+                .then_some(record)
+                .ok_or(AuthorityError::NotFound)
+        }
+
+        fn renew_lease(
+            &self,
+            _request: &RenewLeaseRequest,
+        ) -> std::result::Result<RenewLeaseResult, AuthorityError> {
+            unreachable!("PrepareNetwork effect is read-only authority")
+        }
+
+        fn compare_and_swap_head(
+            &self,
+            _request: &VolumeHeadCasRequest,
+        ) -> std::result::Result<VolumeHeadCasResult, AuthorityError> {
+            unreachable!("PrepareNetwork effect never mutates Volume authority")
         }
     }
 
@@ -4399,8 +4447,10 @@ mod tests {
             lineage.local_durable_generation = fixture.authority.volume.head.generation;
             lineage.remote_durable_generation = fixture.authority.volume.head.generation;
         }
-        let node_global_process = if matches!(checkpoint.step, ReconcileStep::PrepareDevice { .. })
-        {
+        let node_global_process = if matches!(
+            checkpoint.step,
+            ReconcileStep::PrepareDevice { .. } | ReconcileStep::PrepareNetwork { .. }
+        ) {
             let retained = AuthorizedBlockdStore::new(fixture.state_directory.clone())
                 .retain_prepare_device_handoff(checkpoint, desired)
                 .unwrap();
@@ -4413,8 +4463,9 @@ mod tests {
                     retained,
                 )
                 .unwrap();
+            let prepared_checkpoint = prepare_device_checkpoint_view(checkpoint).unwrap();
             let root_expectation = RootProvisionProcessExpectation::from_retained_prepare_device(
-                checkpoint,
+                &prepared_checkpoint,
                 desired,
                 ready.attempt(),
             )
@@ -4539,10 +4590,26 @@ mod tests {
             runtimes: vec![runtime],
             residue: Vec::new(),
         };
+        let desired_snapshot = DesiredReadSnapshot {
+            version: ContractVersion::V1,
+            session: SessionBinding {
+                node_id: session.node_id.clone(),
+                node_boot_id: session.node_boot_id.clone(),
+                agent_instance_id: session.agent_instance_id.clone(),
+                agent_session_epoch: session.agent_session_epoch,
+            },
+            request_sequence: Sequence::new(13).unwrap(),
+            read_position: attestation.inventory_read_position,
+            issued_at_unix_ms: UnixMillis::new(1_899_999_999_500).unwrap(),
+            expires_at_unix_ms: UnixMillis::new(1_900_000_119_000).unwrap(),
+            desired_specs: vec![desired.clone()],
+        };
+        let admission = RuntimeDesiredEffectAdmission::for_test(session, observation, attestation)
+            .bind_assigned_cats_for_test(&desired_snapshot);
         let context = RuntimeDesiredEffectContext::for_test_with_admission(
             fixture.state_directory.clone(),
             Instant::now() + Duration::from_secs(10),
-            RuntimeDesiredEffectAdmission::for_test(session, observation, attestation),
+            admission,
         );
         match node_global_process {
             Some(admission) => context.with_node_global_process_for_test(admission),
@@ -4786,6 +4853,8 @@ mod tests {
         Exact,
         Conflict,
         WrongStatus(&'static str),
+        WrongCommand,
+        WrongCgroup,
     }
 
     impl FakeServingBlockdPort {
@@ -4859,7 +4928,24 @@ mod tests {
                     }
                     ServingBlockdProcessInspection::Exact(Box::new(evidence))
                 }
+                ServingBlockdProcessInspectionKind::WrongCommand => {
+                    let mut evidence = expected.exact_evidence_for_test(51);
+                    evidence
+                        .command_line_mut_for_test()
+                        .push("--foreign-argument".into());
+                    ServingBlockdProcessInspection::Exact(Box::new(evidence))
+                }
+                ServingBlockdProcessInspectionKind::WrongCgroup => {
+                    let mut evidence = expected.exact_evidence_for_test(51);
+                    *evidence.cgroup_path_mut_for_test() =
+                        host("/sys/fs/cgroup/system.slice/foreign.service");
+                    ServingBlockdProcessInspection::Exact(Box::new(evidence))
+                }
             }
+        }
+
+        fn remaining_inspections(&self) -> usize {
+            self.inspections.lock().unwrap().len()
         }
     }
 
@@ -4902,6 +4988,65 @@ mod tests {
         }
     }
 
+    #[derive(Clone, Copy)]
+    enum NetworkTapBehavior {
+        Publish,
+        CancelAfterCreate,
+        LosePublishResponse,
+    }
+
+    #[derive(Default)]
+    struct NetworkTapEvents {
+        creates: AtomicUsize,
+        publish_attempts: AtomicUsize,
+        unpublished_drops: AtomicUsize,
+    }
+
+    struct NetworkTapPort {
+        behavior: NetworkTapBehavior,
+        context: RuntimeDesiredEffectContext,
+        events: Arc<NetworkTapEvents>,
+    }
+
+    struct NetworkPendingTap {
+        lose_response: bool,
+        published: bool,
+        events: Arc<NetworkTapEvents>,
+    }
+
+    impl PendingTap for NetworkPendingTap {
+        fn publish(mut self: Box<Self>) -> Result<()> {
+            self.events.publish_attempts.fetch_add(1, Ordering::SeqCst);
+            if self.lose_response {
+                anyhow::bail!("injected TAP publish response loss")
+            }
+            self.published = true;
+            Ok(())
+        }
+    }
+
+    impl Drop for NetworkPendingTap {
+        fn drop(&mut self) {
+            if !self.published {
+                self.events.unpublished_drops.fetch_add(1, Ordering::SeqCst);
+            }
+        }
+    }
+
+    impl TapCreatePort for NetworkTapPort {
+        fn create_nonpersistent(&self, _tap_name: &str) -> Result<Box<dyn PendingTap>> {
+            self.events.creates.fetch_add(1, Ordering::SeqCst);
+            if matches!(self.behavior, NetworkTapBehavior::CancelAfterCreate) {
+                self.context.cancel_for_test();
+            }
+            Ok(Box::new(NetworkPendingTap {
+                lose_response: matches!(self.behavior, NetworkTapBehavior::LosePublishResponse),
+                published: false,
+                events: Arc::clone(&self.events),
+            }))
+        }
+    }
+
     fn serving_effect(
         fixture: &Fixture,
         port: Arc<FakeServingBlockdPort>,
@@ -4911,6 +5056,64 @@ mod tests {
             serving_systemd_config(fixture),
             port,
         )
+    }
+
+    fn accepted_serving_process(
+        fixture: &Fixture,
+    ) -> cats_api::runtime_reconciliation::ProcessEvidence {
+        let expected = serving_expectation(fixture);
+        expected
+            .clone()
+            .prove_exact_process(expected.exact_evidence_for_test(51))
+            .unwrap()
+            .into_process_evidence()
+    }
+
+    fn empty_ip_binary(fixture: &Fixture) -> PathBuf {
+        let path = fixture.data_directory.join("test-ip");
+        std::fs::write(
+            &path,
+            "#!/bin/sh\nif [ \"$1\" = '-j' ]; then printf '[]'; fi\n",
+        )
+        .unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o700)).unwrap();
+        path
+    }
+
+    fn current_runtime_checkpoint(fixture: &Fixture) -> StoredCheckpoint {
+        FileCheckpointStore::open(
+            &fixture.checkpoint_directory,
+            &fixture.acquired.desired.cat_id,
+        )
+        .unwrap()
+        .load()
+        .unwrap()
+        .unwrap()
+    }
+
+    fn with_absent_network_admission(
+        context: RuntimeDesiredEffectContext,
+        checkpoint: &RuntimeCheckpoint,
+    ) -> RuntimeDesiredEffectContext {
+        let scan = NodeGlobalNetworkScanAdmission::absent_checkpoint_for_test(checkpoint).unwrap();
+        let admission = scan
+            .bind(context.accepted_full().unwrap().observation())
+            .unwrap();
+        context.with_node_global_network_for_test(admission)
+    }
+
+    fn prepare_network_reservation_effect(
+        fixture: &Fixture,
+        authority: Arc<dyn VolumeDataAuthority>,
+        port: Arc<FakeServingBlockdPort>,
+    ) -> PrepareNetworkReservationEffect {
+        PrepareNetworkReservationEffect::new(
+            fixture.state_directory.clone(),
+            empty_ip_binary(fixture),
+            authority,
+            port,
+        )
+        .unwrap()
     }
 
     fn prepare_device_retirement_effect(
@@ -5681,6 +5884,265 @@ mod tests {
                 Some(expected_outcome),
             );
             assert_eq!(port.starts.load(Ordering::SeqCst), 0);
+        }
+    }
+
+    #[test]
+    fn prepare_network_reservation_publishes_only_after_two_exact_authority_rounds() {
+        let mut fixture = fixture();
+        complete_old_process_retirement(&mut fixture);
+        let predecessor_digest = fixture.stored_checkpoint.content_digest().clone();
+        let accepted = accepted_serving_process(&fixture);
+        let authority = Arc::new(FixedEffectAuthority::new(fixture.authority.volume.clone()));
+        let port = Arc::new(FakeServingBlockdPort::new(
+            [
+                ServingBlockdProcessInspectionKind::Exact,
+                ServingBlockdProcessInspectionKind::Exact,
+            ],
+            ServingBlockdProcessStart::Submitted,
+        ));
+        let effect =
+            prepare_network_reservation_effect(&fixture, authority.clone(), Arc::clone(&port));
+
+        assert_eq!(
+            effect
+                .try_apply(
+                    &effect_context_with_processes(&fixture, vec![accepted]),
+                    &fixture.acquired.desired,
+                )
+                .unwrap(),
+            Some(RuntimeDesiredEffectOutcome::RefreshInventory)
+        );
+        let current = current_runtime_checkpoint(&fixture);
+        assert_ne!(current.content_digest(), &predecessor_digest);
+        assert!(matches!(
+            current.checkpoint().step,
+            ReconcileStep::PrepareNetwork { .. }
+        ));
+        assert_eq!(authority.loads.load(Ordering::SeqCst), 3);
+        assert_eq!(port.remaining_inspections(), 0);
+    }
+
+    #[test]
+    fn prepare_network_reservation_rejects_incomplete_prepare_device_envelope_without_effect() {
+        for field in [
+            "applied_desired",
+            "session",
+            "guest_transport",
+            "platform_guards",
+            "volume_lineage",
+        ] {
+            let mut fixture = fixture();
+            complete_old_process_retirement(&mut fixture);
+            let predecessor_digest = fixture.stored_checkpoint.content_digest().clone();
+            let accepted = accepted_serving_process(&fixture);
+            let base = effect_context_with_processes(&fixture, vec![accepted]);
+            let context =
+                mutate_effect_context(&fixture, base, |_session, observation, _attestation| {
+                    match field {
+                        "applied_desired" => observation.runtimes[0].applied_desired = None,
+                        "session" => {
+                            observation.agent_session_epoch = Epoch::new(99).unwrap();
+                        }
+                        "guest_transport" => {
+                            observation.runtimes[0].guest_transport =
+                                GuestTransportEvidence::Malformed {
+                                    raw_response_digest: digest('9'),
+                                };
+                        }
+                        "platform_guards" => observation.runtimes[0].platform_guards = 1,
+                        "volume_lineage" => {
+                            observation.runtimes[0].volumes[0].local_lineages.clear();
+                        }
+                        _ => unreachable!(),
+                    }
+                });
+            let authority = Arc::new(FixedEffectAuthority::new(fixture.authority.volume.clone()));
+            let port = Arc::new(FakeServingBlockdPort::new(
+                [
+                    ServingBlockdProcessInspectionKind::Exact,
+                    ServingBlockdProcessInspectionKind::Exact,
+                ],
+                ServingBlockdProcessStart::Submitted,
+            ));
+            let effect =
+                prepare_network_reservation_effect(&fixture, authority.clone(), Arc::clone(&port));
+
+            assert_eq!(
+                effect
+                    .try_apply(&context, &fixture.acquired.desired)
+                    .unwrap(),
+                Some(RuntimeDesiredEffectOutcome::Stop(
+                    RuntimeDesiredEffectStopReason::LocalContract,
+                )),
+                "incomplete {field} escaped the closed PrepareDevice envelope"
+            );
+            assert_eq!(
+                current_runtime_checkpoint(&fixture).content_digest(),
+                &predecessor_digest
+            );
+            assert_eq!(authority.loads.load(Ordering::SeqCst), 0);
+            assert_eq!(port.remaining_inspections(), 2);
+        }
+    }
+
+    #[test]
+    fn prepare_network_reservation_rejects_same_listener_private_process_drift() {
+        for drift in [
+            ServingBlockdProcessInspectionKind::WrongStatus("head"),
+            ServingBlockdProcessInspectionKind::WrongStatus("fenced"),
+            ServingBlockdProcessInspectionKind::WrongCommand,
+            ServingBlockdProcessInspectionKind::WrongCgroup,
+        ] {
+            let mut fixture = fixture();
+            complete_old_process_retirement(&mut fixture);
+            let predecessor_digest = fixture.stored_checkpoint.content_digest().clone();
+            let accepted = accepted_serving_process(&fixture);
+            let authority = Arc::new(FixedEffectAuthority::new(fixture.authority.volume.clone()));
+            let port = Arc::new(FakeServingBlockdPort::new(
+                [drift, ServingBlockdProcessInspectionKind::Exact],
+                ServingBlockdProcessStart::Submitted,
+            ));
+            let effect =
+                prepare_network_reservation_effect(&fixture, authority.clone(), Arc::clone(&port));
+
+            assert!(effect
+                .try_apply(
+                    &effect_context_with_processes(&fixture, vec![accepted]),
+                    &fixture.acquired.desired,
+                )
+                .is_err());
+            assert_eq!(
+                current_runtime_checkpoint(&fixture).content_digest(),
+                &predecessor_digest
+            );
+            assert_eq!(authority.loads.load(Ordering::SeqCst), 1);
+            assert_eq!(port.remaining_inspections(), 1);
+        }
+    }
+
+    #[test]
+    fn prepare_network_reservation_rechecks_volume_authority_at_both_cas_boundaries() {
+        for exact_revalidations_before_drift in [0, 1] {
+            let mut fixture = fixture();
+            complete_old_process_retirement(&mut fixture);
+            let predecessor_digest = fixture.stored_checkpoint.content_digest().clone();
+            let accepted = accepted_serving_process(&fixture);
+            let exact = fixture.authority.volume.clone();
+            let mut drifted = exact.clone();
+            drifted.head.generation = Generation::new(99).unwrap();
+            let mut records = vec![exact.clone()];
+            records.extend(std::iter::repeat_n(exact, exact_revalidations_before_drift));
+            records.push(drifted);
+            let authority = Arc::new(SequencedEffectAuthority::new(records));
+            let port = Arc::new(FakeServingBlockdPort::new(
+                [
+                    ServingBlockdProcessInspectionKind::Exact,
+                    ServingBlockdProcessInspectionKind::Exact,
+                ],
+                ServingBlockdProcessStart::Submitted,
+            ));
+            let effect =
+                prepare_network_reservation_effect(&fixture, authority.clone(), Arc::clone(&port));
+
+            assert!(effect
+                .try_apply(
+                    &effect_context_with_processes(&fixture, vec![accepted]),
+                    &fixture.acquired.desired,
+                )
+                .is_err());
+            assert_eq!(
+                current_runtime_checkpoint(&fixture).content_digest(),
+                &predecessor_digest
+            );
+            assert_eq!(
+                authority.loads.load(Ordering::SeqCst),
+                2 + exact_revalidations_before_drift
+            );
+            assert_eq!(
+                port.remaining_inspections(),
+                1 - exact_revalidations_before_drift
+            );
+        }
+    }
+
+    #[test]
+    fn prepare_network_physical_round_closes_publish_cancellation_and_response_loss() {
+        for (behavior, expected_publish_attempts, expected_unpublished, expected_inspections) in [
+            (NetworkTapBehavior::Publish, 1, 0, 2),
+            (NetworkTapBehavior::CancelAfterCreate, 0, 1, 2),
+            (NetworkTapBehavior::LosePublishResponse, 1, 1, 3),
+        ] {
+            let mut fixture = fixture();
+            complete_old_process_retirement(&mut fixture);
+            let reservation_port = Arc::new(FakeServingBlockdPort::new(
+                [
+                    ServingBlockdProcessInspectionKind::Exact,
+                    ServingBlockdProcessInspectionKind::Exact,
+                ],
+                ServingBlockdProcessStart::Submitted,
+            ));
+            let reservation = prepare_network_reservation_effect(
+                &fixture,
+                Arc::new(FixedEffectAuthority::new(fixture.authority.volume.clone())),
+                reservation_port,
+            );
+            reservation
+                .try_apply(
+                    &effect_context_with_processes(
+                        &fixture,
+                        vec![accepted_serving_process(&fixture)],
+                    ),
+                    &fixture.acquired.desired,
+                )
+                .unwrap();
+            fixture.stored_checkpoint = current_runtime_checkpoint(&fixture);
+            let checkpoint_digest = fixture.stored_checkpoint.content_digest().clone();
+            let context = with_absent_network_admission(
+                effect_context_with_processes(&fixture, vec![accepted_serving_process(&fixture)]),
+                fixture.stored_checkpoint.checkpoint(),
+            );
+            let events = Arc::new(NetworkTapEvents::default());
+            let tap = Arc::new(NetworkTapPort {
+                behavior,
+                context: context.clone(),
+                events: Arc::clone(&events),
+            });
+            let process = Arc::new(FakeServingBlockdPort::new(
+                [
+                    ServingBlockdProcessInspectionKind::Exact,
+                    ServingBlockdProcessInspectionKind::Exact,
+                    ServingBlockdProcessInspectionKind::Exact,
+                ],
+                ServingBlockdProcessStart::Submitted,
+            ));
+            let effect = prepare_network_reservation_effect(
+                &fixture,
+                Arc::new(FixedEffectAuthority::new(fixture.authority.volume.clone())),
+                Arc::clone(&process),
+            )
+            .with_tap_create_for_test(tap);
+
+            assert_eq!(
+                effect
+                    .try_apply(&context, &fixture.acquired.desired)
+                    .unwrap(),
+                Some(RuntimeDesiredEffectOutcome::RefreshInventory)
+            );
+            assert_eq!(events.creates.load(Ordering::SeqCst), 1);
+            assert_eq!(
+                events.publish_attempts.load(Ordering::SeqCst),
+                expected_publish_attempts
+            );
+            assert_eq!(
+                events.unpublished_drops.load(Ordering::SeqCst),
+                expected_unpublished
+            );
+            assert_eq!(process.remaining_inspections(), 3 - expected_inspections);
+            assert_eq!(
+                current_runtime_checkpoint(&fixture).content_digest(),
+                &checkpoint_digest
+            );
         }
     }
 

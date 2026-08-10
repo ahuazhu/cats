@@ -679,6 +679,13 @@ struct IpJsonAddress {
 }
 
 impl HostNetworkSnapshot {
+    #[cfg(test)]
+    pub(crate) fn empty_for_test() -> Self {
+        Self {
+            links: BTreeMap::new(),
+        }
+    }
+
     fn managed_networks(
         &self,
     ) -> Result<BTreeMap<String, (cats_api::runtime_reconciliation::Id, RandomId128, Ipv4Cidr)>>
@@ -2232,6 +2239,7 @@ mod tests {
     #[derive(Debug, Clone, Copy)]
     enum FakePublishBehavior {
         Succeed,
+        ReturnError,
         PanicBeforePublish,
     }
 
@@ -2271,6 +2279,9 @@ mod tests {
         fn publish(mut self: Box<Self>) -> Result<()> {
             if matches!(self.behavior, FakePublishBehavior::PanicBeforePublish) {
                 panic!("injected process crash before TAP publish");
+            }
+            if matches!(self.behavior, FakePublishBehavior::ReturnError) {
+                anyhow::bail!("injected TAP publication response loss")
             }
             self.events.lock().unwrap().publishes += 1;
             self.published = true;
@@ -3003,6 +3014,124 @@ exit 0\n",
         assert_eq!(events.creates, 1);
         assert_eq!(events.publishes, 0);
         assert_eq!(events.unpublished_drops, 1);
+    }
+
+    #[test]
+    fn sealed_absence_create_has_closed_publish_and_response_loss_outcomes() {
+        for (behavior, cancel, expected, remains) in [
+            (
+                FakePublishBehavior::Succeed,
+                false,
+                NetworkCreateAttempt::Published,
+                true,
+            ),
+            (
+                FakePublishBehavior::Succeed,
+                true,
+                NetworkCreateAttempt::DefinitelyNotPublished,
+                false,
+            ),
+            (
+                FakePublishBehavior::ReturnError,
+                false,
+                NetworkCreateAttempt::PublicationOutcomeUnknown,
+                false,
+            ),
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let link = dir.path().join("tap-live");
+            let log = dir.path().join("ip.log");
+            let fake_ip = dir.path().join("ip");
+            std::fs::write(
+                &fake_ip,
+                format!(
+                    "#!/bin/sh\nprintf '%s\\n' \"$*\" >> '{log}'\n\
+if [ \"$1\" = '-o' ]; then exit 0; fi\n\
+exit 0\n",
+                    log = log.display(),
+                ),
+            )
+            .unwrap();
+            std::fs::set_permissions(&fake_ip, std::fs::Permissions::from_mode(0o755)).unwrap();
+            let network = plan_network(&desired_network()).unwrap();
+            let context = desired_effect_context(dir.path());
+            let mut tap_create = MarkerTapCreatePort::new(link.clone());
+            tap_create.behavior = behavior;
+            if cancel {
+                tap_create.cancel_after_create = Some(context.clone());
+            }
+            let events = Arc::clone(&tap_create.events);
+
+            assert_eq!(
+                create_network_from_sealed_absence_with_tap_port(
+                    &fake_ip,
+                    &network,
+                    &context,
+                    &tap_create,
+                )
+                .unwrap(),
+                expected
+            );
+            assert_eq!(link.exists(), remains);
+            assert!(!std::fs::read_to_string(log)
+                .unwrap()
+                .contains("link delete"));
+            let events = events.lock().unwrap();
+            assert_eq!(events.creates, 1);
+            assert_eq!(
+                events.publishes,
+                usize::from(expected == NetworkCreateAttempt::Published)
+            );
+            assert_eq!(events.unpublished_drops, usize::from(!remains));
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    #[ignore = "requires Linux CAP_SYS_ADMIN, CAP_NET_ADMIN, and /dev/net/tun"]
+    fn real_linux_scoped_tap_is_published_and_exact_in_a_private_network_namespace() {
+        let ip = ["/usr/sbin/ip", "/sbin/ip", "/usr/bin/ip"]
+            .into_iter()
+            .map(PathBuf::from)
+            .find(|candidate| candidate.is_file())
+            .expect("install iproute2 for the scoped TAP test");
+        assert!(Path::new("/dev/net/tun").exists(), "/dev/net/tun is absent");
+        // SAFETY: unshare changes only this test thread's network namespace.
+        // The ignored test is run in a disposable privileged Linux process;
+        // the namespace (and its persistent TAP) is destroyed with the thread.
+        let result = unsafe { libc::unshare(libc::CLONE_NEWNET) };
+        assert_eq!(
+            result,
+            0,
+            "unshare(CLONE_NEWNET): {}",
+            io::Error::last_os_error()
+        );
+
+        let state = tempfile::tempdir().unwrap();
+        let context = desired_effect_context(state.path());
+        let network = plan_network(&desired_network()).unwrap();
+        assert_eq!(
+            create_network_from_sealed_absence_with_tap_port(
+                &ip,
+                &network,
+                &context,
+                &PlatformTapCreatePort,
+            )
+            .unwrap(),
+            NetworkCreateAttempt::Published
+        );
+        let identity = RuntimeNetworkIdentity {
+            network_config: network.config.clone(),
+            tap_name: cats_api::runtime_reconciliation::Id::new(network.tap.clone()).unwrap(),
+            ownership_token: network.ownership_token.clone(),
+        };
+        assert_eq!(
+            inspect_host_network_snapshot(&ip, &context)
+                .unwrap()
+                .reserved_network_state(&identity)
+                .unwrap(),
+            ReservedHostNetworkState::Exact
+        );
     }
 
     #[test]

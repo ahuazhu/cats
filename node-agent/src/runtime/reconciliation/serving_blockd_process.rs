@@ -161,8 +161,14 @@ impl ServingBlockdExpectation {
                 .any(|(name, value)| name == "CATS_CRASH_POINT" && value.is_none()),
             "serving blockd command did not clear crash injection"
         );
+        let mut volume = ready.authorized_checkpoint().clone();
+        // The acquire-time file deliberately remains immutable at the blank
+        // head.  Root provisioning advances that same attachment before the
+        // handoff, so serving status and later authority revalidation must be
+        // bound to the descriptor-retained target attachment instead.
+        volume.attachment = ready.attempt().attachment.clone();
         Ok(Self {
-            volume: ready.authorized_checkpoint().clone(),
+            volume,
             unit_id: serving_process.scope_id.clone(),
             cgroup_path,
             executable_path,
@@ -504,6 +510,16 @@ impl ServingBlockdProcessEvidence {
     #[cfg(test)]
     pub(crate) fn status_mut_for_test(&mut self) -> &mut DurabilityStatus {
         &mut self.status
+    }
+
+    #[cfg(test)]
+    pub(crate) fn command_line_mut_for_test(&mut self) -> &mut Vec<OsString> {
+        &mut self.command_line
+    }
+
+    #[cfg(test)]
+    pub(crate) fn cgroup_path_mut_for_test(&mut self) -> &mut HostPath {
+        &mut self.cgroup_path
     }
 }
 

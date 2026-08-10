@@ -722,7 +722,7 @@ pub struct CompleteRuntimeInventory {
     runtimes: Vec<ObservedRuntimeStatus>,
     residue: Vec<NodeResidue>,
     node_global_process: Option<NodeGlobalManagedProcessScanAdmission>,
-    node_global_network: Option<NodeGlobalNetworkScanAdmission>,
+    node_global_network: Option<Box<NodeGlobalNetworkScanAdmission>>,
     kernel_nbd_pool: Option<KernelNbdPoolScanAdmission>,
 }
 
@@ -763,14 +763,14 @@ impl CompleteRuntimeInventory {
         mut self,
         admission: Option<NodeGlobalNetworkScanAdmission>,
     ) -> Self {
-        self.node_global_network = admission;
+        self.node_global_network = admission.map(Box::new);
         self
     }
 
     pub(crate) fn take_node_global_network_admission(
         &mut self,
     ) -> Option<NodeGlobalNetworkScanAdmission> {
-        self.node_global_network.take()
+        self.node_global_network.take().map(|admission| *admission)
     }
 
     pub(crate) fn with_kernel_nbd_pool_admission(

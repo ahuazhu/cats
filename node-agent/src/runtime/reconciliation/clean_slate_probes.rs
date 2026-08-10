@@ -1216,6 +1216,7 @@ fn scanner_with_metadata_authority_and_blob(
             state_directory: state.clone(),
             network_class_root: config.network_class_root.clone(),
             supported: config.linux_sources_supported,
+            physical_inventory_owned_by_bridge: network_bridge.is_some(),
             limits: config.limits,
         }),
         Arc::new(AuthorizedBlockdDataProbe {
@@ -3625,6 +3626,7 @@ struct NetworkProbe {
     state_directory: StateDirectory,
     network_class_root: PathBuf,
     supported: bool,
+    physical_inventory_owned_by_bridge: bool,
     limits: ProbeLimits,
 }
 
@@ -3642,7 +3644,9 @@ impl InventoryAbsenceProbe for NetworkProbe {
         let Some(root) = clone_state_root(&self.state_directory)? else {
             return Ok(InventoryAbsence::Unavailable);
         };
-        let interfaces = if self.supported {
+        let interfaces = if self.physical_inventory_owned_by_bridge {
+            ProbeFact::Empty
+        } else if self.supported {
             scan_network_interfaces(&self.network_class_root, self.limits.os_entries, context)?
         } else {
             ProbeFact::Unavailable
@@ -8308,6 +8312,7 @@ mod tests {
                 state_directory: StateDirectory::unanchored(environment.state.clone()),
                 network_class_root: environment.network_root.clone(),
                 supported: false,
+                physical_inventory_owned_by_bridge: false,
                 limits,
             }),
             Box::new(StateNamespaceProbe {
@@ -8487,8 +8492,30 @@ mod tests {
             state_directory: StateDirectory::unanchored(environment.state.clone()),
             network_class_root: environment.network_root.clone(),
             supported: true,
+            physical_inventory_owned_by_bridge: false,
             limits: ProbeLimits::default(),
         };
+        assert!(network.prove_absent(&context()).is_err());
+    }
+
+    #[test]
+    fn typed_network_bridge_does_not_turn_legacy_state_into_authority() {
+        let environment = TestEnvironment::new();
+        let network = NetworkProbe {
+            state_directory: StateDirectory::unanchored(environment.state.clone()),
+            network_class_root: environment.network_root.join("not-scanned-by-typed-bridge"),
+            supported: true,
+            physical_inventory_owned_by_bridge: true,
+            limits: ProbeLimits::default(),
+        };
+        assert_eq!(
+            network.prove_absent(&context()).unwrap(),
+            InventoryAbsence::Empty
+        );
+
+        let legacy = environment.state.join(RUNTIME_EFFECTS_NAMESPACE);
+        std::fs::create_dir(&legacy).unwrap();
+        std::fs::write(legacy.join("old-network.json"), b"foreign").unwrap();
         assert!(network.prove_absent(&context()).is_err());
     }
 

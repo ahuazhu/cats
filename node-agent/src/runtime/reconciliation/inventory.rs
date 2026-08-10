@@ -594,18 +594,13 @@ impl RuntimeInventoryScanner for CleanSlateInventoryScanner {
                         | InventorySource::Systemd
                         | InventorySource::Process
                         | InventorySource::ControlSocket
-                ) || (self.network_bridge.is_some()
-                    && probe.source() == InventorySource::Network)
-                {
+                ) {
                     continue;
                 }
                 inspect_inventory_probe(probe, &context, &mut aggregate)?;
             }
         } else {
             for probe in &self.probes {
-                if self.network_bridge.is_some() && probe.source() == InventorySource::Network {
-                    continue;
-                }
                 inspect_inventory_probe(probe, &context, &mut aggregate)?;
             }
         }
@@ -625,7 +620,6 @@ impl RuntimeInventoryScanner for CleanSlateInventoryScanner {
             context
                 .remaining()
                 .context("network inventory bridge deadline expired after inspection")?;
-            aggregate.coverage.record(InventorySource::Network)?;
         }
         if !aggregate.unavailable_sources.is_empty() {
             return Ok(RuntimeInventoryScanOutcome::Incomplete {
