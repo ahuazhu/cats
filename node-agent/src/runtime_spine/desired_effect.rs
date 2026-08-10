@@ -18,7 +18,7 @@ use std::time::{Duration, Instant};
 use anyhow::Context as _;
 use cats_api::runtime_reconciliation::{
     encode_desired_runtime_spec, ContractVersion, DesiredRuntimeSpec, Id, NetworkConfig,
-    RandomId128, RuntimeTarget,
+    NodeResidue, ObservedNetwork, OwnershipTokenEvidence, RandomId128, RuntimeTarget,
 };
 use serde::{Deserialize, Serialize};
 
@@ -142,9 +142,14 @@ impl RuntimeDesiredEffect for ProductionRuntimeDesiredEffect {
         encode_desired_runtime_spec(desired)
             .context("validate signed Desired before planning a Host effect")?;
 
+        // Establish the current-process accepted full-inventory binding before
+        // opening or creating any effect state. The durable network tuple is
+        // a crash-recovery aid; it can never manufacture admission on its own.
+        let accepted_runtime = accepted_full_runtime(&context, desired)?;
+
         let store = NetworkCheckpointStore::open(context.state_directory(), &context)?;
-        let network = match store.load(desired)? {
-            Some(network) => network,
+        let (network, publish) = match store.load(desired)? {
+            Some(network) => (network, false),
             None => {
                 let planned = self
                     .network
@@ -154,41 +159,178 @@ impl RuntimeDesiredEffect for ProductionRuntimeDesiredEffect {
                 // Planning is zero-effect, so cancellation here may safely
                 // leave no record. No physical mutation can have occurred.
                 context.check_active()?;
-                store.publish(desired, &planned)?;
-                let persisted = store
-                    .load(desired)?
-                    .context("durable Host network checkpoint disappeared after publish")?;
-                anyhow::ensure!(
-                    persisted == planned,
-                    "durable Host network checkpoint changed during publish"
-                );
-                persisted
+                (planned, true)
             }
         };
+        let network_is_ready =
+            accepted_full_proves_exact_network(&context, desired, accepted_runtime, &network)?;
+        if publish {
+            store.publish(desired, &network)?;
+            let persisted = store
+                .load(desired)?
+                .context("durable Host network checkpoint disappeared after publish")?;
+            anyhow::ensure!(
+                persisted == network,
+                "durable Host network checkpoint changed during publish"
+            );
+        }
 
         // Hold the effect-directory lock and the exact checkpoint lineage
-        // through Host preparation and launch handoff.
+        // through this one physical planner step. A fresh accepted full scan,
+        // not the checkpoint alone, decides whether Host network preparation
+        // or runtime launch is next.
         #[cfg(test)]
         if let Some(after_checkpoint) = &self.after_checkpoint {
             after_checkpoint();
         }
         context.check_active()?;
-        self.network
-            .prepare(&context, &network)
-            .context("prepare exact checkpointed Host network")?;
-        // `prepare_network` is idempotent. If cancellation arrived while `ip`
-        // was running, retain the tuple and let the next admitted unit adopt
-        // it; never start a VMM after the deadline/cancellation boundary.
+        if network_is_ready {
+            self.launch
+                .launch(desired, &network)
+                .context("launch exact checkpointed Desired runtime")?;
+        } else {
+            self.network
+                .prepare(&context, &network)
+                .context("prepare exact checkpointed Host network")?;
+        }
+        // If cancellation or the deadline crossed the physical call, retain
+        // the checkpoint but publish no success from the stale admission.
+        // The runner discards the batch and a fresh full scan observes the
+        // exact late result before any successor step can be chosen.
         context.check_active()?;
-        self.launch
-            .launch(desired, &network)
-            .context("launch exact checkpointed Desired runtime")?;
-        // This adapter wrote a checkpoint and prepared Host networking before
-        // launch. Even a successful exact launch must return through a fresh
-        // complete physical scan; it may not advance another Cat from the
-        // predecessor admission batch.
+        // Every successful invocation performed at most one physical step.
+        // The runner must discard this admission and establish another full
+        // physical inventory before it can choose the successor step.
         Ok(RuntimeDesiredEffectOutcome::RefreshInventory)
     }
+}
+
+fn accepted_full_runtime<'a>(
+    context: &'a RuntimeDesiredEffectContext,
+    desired: &DesiredRuntimeSpec,
+) -> anyhow::Result<&'a cats_api::runtime_reconciliation::ObservedRuntimeStatus> {
+    let accepted = context.accepted_full()?;
+    let observation = accepted.observation();
+    let attestation = accepted.attestation();
+    let session = accepted.session();
+    anyhow::ensure!(
+        observation.complete_inventory
+            && observation.node_id == desired.placement.node_id
+            && session.node_id == desired.placement.node_id
+            && observation.node_id == session.node_id
+            && observation.node_boot_id == session.node_boot_id
+            && observation.agent_instance_id == session.agent_instance_id
+            && observation.agent_session_epoch == session.agent_session_epoch
+            && attestation.node_id == observation.node_id
+            && attestation.agent_session_epoch == observation.agent_session_epoch
+            && attestation.inventory_epoch == observation.inventory_epoch
+            && observation.inventory_digest.as_ref() == Some(&attestation.inventory_digest)
+            && observation.inventory_read_position == Some(attestation.inventory_read_position),
+        "Host network step lacks an exact accepted full-inventory admission"
+    );
+
+    let mut matching_runtimes = observation
+        .runtimes
+        .iter()
+        .filter(|runtime| runtime.cat_id == desired.cat_id);
+    let runtime = matching_runtimes
+        .next()
+        .context("accepted full inventory omitted the exact Desired Cat")?;
+    anyhow::ensure!(
+        matching_runtimes.next().is_none(),
+        "accepted full inventory contains duplicate Runtime entries for the Desired Cat"
+    );
+    anyhow::ensure!(
+        runtime.applied_desired.as_ref().is_some_and(|applied| {
+            applied.desired_revision == desired.desired_revision
+                && applied.spec_digest == desired.spec_digest
+                && applied.placement == desired.placement
+                && applied.target == desired.target
+        }),
+        "accepted full inventory does not bind the exact Desired revision"
+    );
+    Ok(runtime)
+}
+
+fn accepted_full_proves_exact_network(
+    context: &RuntimeDesiredEffectContext,
+    desired: &DesiredRuntimeSpec,
+    runtime: &cats_api::runtime_reconciliation::ObservedRuntimeStatus,
+    expected: &ChNetwork,
+) -> anyhow::Result<bool> {
+    let accepted = context.accepted_full()?;
+    let observation = accepted.observation();
+
+    for foreign in observation
+        .runtimes
+        .iter()
+        .filter(|runtime| runtime.cat_id != desired.cat_id)
+        .flat_map(|runtime| &runtime.networks)
+    {
+        anyhow::ensure!(
+            !observed_network_identity_overlaps(foreign, expected),
+            "accepted full inventory contains a foreign Runtime using the checkpointed network identity"
+        );
+    }
+    for residue in &observation.residue {
+        if let NodeResidue::NetworkTap {
+            network_id_hint,
+            tap_name,
+            ownership_token,
+        } = residue
+        {
+            let token_matches = matches!(
+                ownership_token,
+                OwnershipTokenEvidence::Valid { ownership_token }
+                    if ownership_token == &expected.ownership_token
+            );
+            anyhow::ensure!(
+                network_id_hint.as_ref() != Some(&expected.config.network_id)
+                    && tap_name.as_str() != expected.tap
+                    && !token_matches,
+                "accepted full inventory contains residue using the checkpointed network identity"
+            );
+        }
+    }
+
+    match runtime.networks.as_slice() {
+        [] => Ok(false),
+        [observed] => {
+            anyhow::ensure!(
+                observed_network_exactly_matches(observed, expected),
+                "accepted full inventory contains a non-matching network for the Desired Cat"
+            );
+            Ok(true)
+        }
+        _ => {
+            anyhow::bail!("accepted full inventory contains duplicate networks for the Desired Cat")
+        }
+    }
+}
+
+fn observed_network_identity_overlaps(observed: &ObservedNetwork, expected: &ChNetwork) -> bool {
+    observed.network_id == expected.config.network_id
+        || observed.tap_name.as_str() == expected.tap
+        || matches!(
+            &observed.ownership_token,
+            OwnershipTokenEvidence::Valid { ownership_token }
+                if ownership_token == &expected.ownership_token
+        )
+}
+
+fn observed_network_exactly_matches(observed: &ObservedNetwork, expected: &ChNetwork) -> bool {
+    observed.kind == expected.config.kind
+        && observed.network_id == expected.config.network_id
+        && observed.guest_mac == expected.config.guest_mac
+        && observed.guest_ipv4 == expected.config.guest_ipv4
+        && observed.prefix_length == expected.config.prefix_length
+        && observed.gateway_ipv4 == expected.config.gateway_ipv4
+        && observed.tap_name.as_str() == expected.tap
+        && matches!(
+            &observed.ownership_token,
+            OwnershipTokenEvidence::Valid { ownership_token }
+                if ownership_token == &expected.ownership_token
+        )
 }
 
 fn validate_planned_network(
@@ -514,11 +656,15 @@ mod tests {
     use std::time::{Duration, Instant};
 
     use cats_api::runtime_reconciliation::{
-        spec_digest, AssignedKind, AssignedPlacement, Epoch, Ipv4Address, IsolatedIpv4Kind,
-        MacAddress, Revision, RuntimeConfig, RuntimeTransition, Sha256Digest,
+        spec_digest, AdmissionInventoryAttestation, AgentSession, AppliedDesiredEvidence,
+        AssignedKind, AssignedPlacement, CheckpointEvidence, Epoch, GuestTransportEvidence,
+        HostPath, Ipv4Address, IsolatedIpv4Kind, LifecycleAdmission, MacAddress, NodeBootId,
+        NodeObservation, ObservedRuntimeStatus, ReconcileStep, Revision, RuntimeConfig,
+        RuntimeTransition, Sequence, Sha256Digest, UnixMillis, WarmSnapshotEvidence,
     };
 
     use crate::ch::PendingTap;
+    use crate::runtime_spine::RuntimeDesiredEffectAdmission;
 
     use super::*;
 
@@ -696,10 +842,154 @@ mod tests {
         }
     }
 
-    fn effect_context(root: &Path) -> RuntimeDesiredEffectContext {
-        RuntimeDesiredEffectContext::for_test(
+    fn observed_network(network: &ChNetwork) -> ObservedNetwork {
+        ObservedNetwork {
+            kind: network.config.kind,
+            network_id: network.config.network_id.clone(),
+            guest_mac: network.config.guest_mac.clone(),
+            guest_ipv4: network.config.guest_ipv4.clone(),
+            prefix_length: network.config.prefix_length,
+            gateway_ipv4: network.config.gateway_ipv4.clone(),
+            tap_name: Id::new(network.tap.clone()).unwrap(),
+            ownership_token: OwnershipTokenEvidence::Valid {
+                ownership_token: network.ownership_token.clone(),
+            },
+        }
+    }
+
+    fn observed_runtime(
+        root: &Path,
+        desired: &DesiredRuntimeSpec,
+        networks: Vec<ObservedNetwork>,
+    ) -> ObservedRuntimeStatus {
+        ObservedRuntimeStatus {
+            cat_id: desired.cat_id.clone(),
+            applied_desired: Some(AppliedDesiredEvidence {
+                desired_revision: desired.desired_revision,
+                spec_digest: desired.spec_digest.clone(),
+                placement: desired.placement.clone(),
+                target: desired.target,
+            }),
+            runtime_incarnation: None,
+            stable_state: None,
+            step: ReconcileStep::InspectInventory {
+                inventory_epoch: Epoch::new(4).unwrap(),
+            },
+            checkpoint: CheckpointEvidence::Missing {
+                checkpoint_path: HostPath::new(
+                    root.join(format!("{}.runtime.json", desired.cat_id))
+                        .display()
+                        .to_string(),
+                )
+                .unwrap(),
+            },
+            processes: Vec::new(),
+            volumes: Vec::new(),
+            mounts: Vec::new(),
+            networks,
+            guest_transport: GuestTransportEvidence::Unavailable,
+            warm_snapshot: WarmSnapshotEvidence::Absent,
+            lifecycle_admission: LifecycleAdmission::Closed,
+            routes: Vec::new(),
+            platform_guards: 0,
+            conditions: Vec::new(),
+        }
+    }
+
+    fn effect_context_with_runtimes(
+        root: &Path,
+        desired: &DesiredRuntimeSpec,
+        runtimes: Vec<ObservedRuntimeStatus>,
+        residue: Vec<NodeResidue>,
+    ) -> RuntimeDesiredEffectContext {
+        let session = AgentSession {
+            version: ContractVersion::V1,
+            node_id: desired.placement.node_id.clone(),
+            immutable_host_id: Id::new("host_01").unwrap(),
+            node_boot_id: NodeBootId::new("11111111111111111111111111111111").unwrap(),
+            agent_instance_id: RandomId128::new("22222222222222222222222222222222").unwrap(),
+            agent_session_epoch: Epoch::new(2).unwrap(),
+            registration_attempt_id: RandomId128::new("33333333333333333333333333333333").unwrap(),
+            guest_config_digest: desired.runtime.guest_config_digest.clone(),
+            lease_deadline_unix_ms: UnixMillis::new(1_900_000_120_000).unwrap(),
+        };
+        let inventory_digest = Sha256Digest::from_bytes([7; 32]);
+        let attestation = AdmissionInventoryAttestation {
+            version: ContractVersion::V1,
+            node_id: session.node_id.clone(),
+            agent_session_epoch: session.agent_session_epoch,
+            inventory_epoch: Epoch::new(4).unwrap(),
+            inventory_digest: inventory_digest.clone(),
+            inventory_read_position: Sequence::new(12).unwrap(),
+            accepted_at_unix_ms: UnixMillis::new(1_900_000_000_000).unwrap(),
+        };
+        let observation = NodeObservation {
+            version: ContractVersion::V1,
+            observation_id: RandomId128::new("44444444444444444444444444444444").unwrap(),
+            node_id: session.node_id.clone(),
+            node_boot_id: session.node_boot_id.clone(),
+            agent_instance_id: session.agent_instance_id.clone(),
+            agent_session_epoch: session.agent_session_epoch,
+            heartbeat_sequence: Sequence::new(9).unwrap(),
+            observed_at_unix_ms: UnixMillis::new(1_899_999_999_000).unwrap(),
+            complete_inventory: true,
+            inventory_epoch: attestation.inventory_epoch,
+            inventory_digest: Some(inventory_digest),
+            inventory_read_position: Some(attestation.inventory_read_position),
+            key_ring_version: None,
+            key_ring_digest: None,
+            loaded_kids: Vec::new(),
+            runtimes,
+            residue,
+        };
+        RuntimeDesiredEffectContext::for_test_with_admission(
             StateDirectory::unanchored(root.to_path_buf()),
             Instant::now() + Duration::from_secs(10),
+            RuntimeDesiredEffectAdmission::for_test(session, observation, attestation),
+        )
+    }
+
+    fn effect_context(root: &Path, desired: &DesiredRuntimeSpec) -> RuntimeDesiredEffectContext {
+        effect_context_with_runtimes(
+            root,
+            desired,
+            vec![observed_runtime(root, desired, Vec::new())],
+            Vec::new(),
+        )
+    }
+
+    fn launch_context(
+        root: &Path,
+        desired: &DesiredRuntimeSpec,
+        network: &ChNetwork,
+    ) -> RuntimeDesiredEffectContext {
+        effect_context_with_runtimes(
+            root,
+            desired,
+            vec![observed_runtime(
+                root,
+                desired,
+                vec![observed_network(network)],
+            )],
+            Vec::new(),
+        )
+    }
+
+    fn mutate_effect_context(
+        root: &Path,
+        desired: &DesiredRuntimeSpec,
+        mutate: impl FnOnce(&mut AgentSession, &mut NodeObservation, &mut AdmissionInventoryAttestation),
+    ) -> RuntimeDesiredEffectContext {
+        let base = effect_context(root, desired);
+        let accepted = base.accepted_full().unwrap();
+        let mut session = accepted.session().clone();
+        let mut observation = accepted.observation().clone();
+        let mut attestation = accepted.attestation().clone();
+        mutate(&mut session, &mut observation, &mut attestation);
+        RuntimeDesiredEffectContext::for_test_with_admission(
+            StateDirectory::unanchored(root.to_path_buf()),
+            Instant::now() + Duration::from_secs(10),
+            RuntimeDesiredEffectAdmission::for_test(session, observation, attestation),
         )
     }
 
@@ -738,7 +1028,7 @@ mod tests {
     }
 
     #[test]
-    fn durable_reread_precedes_prepare_and_launch_receives_every_exact_field() {
+    fn prepare_and_launch_are_separate_steps_bridged_only_by_exact_full_inventory() {
         let root = tempfile::tempdir().unwrap();
         let desired = desired();
         let planned = planned_network(&desired);
@@ -753,17 +1043,33 @@ mod tests {
             assert_eq!(encode_checkpoint(&stored).unwrap(), bytes);
         }));
         let (launch, launch_calls) = RecordingLaunch::new(false);
-        let outcome = adapter(network, launch)
-            .apply(effect_context(root.path()), &desired)
+        let effect = adapter(network, launch);
+        let outcome = effect
+            .apply(effect_context(root.path(), &desired), &desired)
             .unwrap();
         assert_eq!(outcome, RuntimeDesiredEffectOutcome::RefreshInventory);
-
-        let network_calls = network_calls.lock().unwrap();
-        assert_eq!(network_calls.plans, 1);
-        assert_eq!(network_calls.prepares, vec![planned.clone()]);
-        let launch_calls = launch_calls.lock().unwrap();
+        assert_eq!(network_calls.lock().unwrap().plans, 1);
         assert_eq!(
-            launch_calls.as_slice(),
+            network_calls.lock().unwrap().prepares,
+            vec![planned.clone()]
+        );
+        assert!(
+            launch_calls.lock().unwrap().is_empty(),
+            "the prepare admission must not also reach launch"
+        );
+
+        let outcome = effect
+            .apply(launch_context(root.path(), &desired, &planned), &desired)
+            .unwrap();
+        assert_eq!(outcome, RuntimeDesiredEffectOutcome::RefreshInventory);
+        assert_eq!(network_calls.lock().unwrap().plans, 1);
+        assert_eq!(
+            network_calls.lock().unwrap().prepares,
+            vec![planned.clone()],
+            "the launch admission must not repeat prepare"
+        );
+        assert_eq!(
+            launch_calls.lock().unwrap().as_slice(),
             &[(desired.clone(), planned.clone())]
         );
         let stored = checkpoint(root.path(), &desired);
@@ -782,6 +1088,97 @@ mod tests {
     }
 
     #[test]
+    fn current_process_full_admission_is_required_before_any_effect_state_or_plan() {
+        let root = tempfile::tempdir().unwrap();
+        let desired = desired();
+        let planned = planned_network(&desired);
+        let context = RuntimeDesiredEffectContext::for_test(
+            StateDirectory::unanchored(root.path().to_path_buf()),
+            Instant::now() + Duration::from_secs(10),
+        );
+        let (network, network_calls) = FakeNetworkPort::new(planned);
+        let (launch, launch_calls) = RecordingLaunch::new(false);
+
+        let error = adapter(network, launch)
+            .apply(context, &desired)
+            .unwrap_err();
+
+        assert!(format!("{error:#}").contains("current-process full admission"));
+        let network_calls = network_calls.lock().unwrap();
+        assert_eq!(network_calls.plans, 0);
+        assert!(network_calls.prepares.is_empty());
+        assert!(launch_calls.lock().unwrap().is_empty());
+        assert!(!root.path().join(DIRECTORY_NAME).exists());
+    }
+
+    #[test]
+    fn stale_duplicate_or_colliding_full_evidence_has_zero_physical_effect() {
+        #[derive(Clone, Copy)]
+        enum Case {
+            StaleRevision,
+            DuplicateRuntime,
+            NonMatchingOwnNetwork,
+            ForeignNetworkIdentity,
+            ResidueNetworkIdentity,
+        }
+
+        for case in [
+            Case::StaleRevision,
+            Case::DuplicateRuntime,
+            Case::NonMatchingOwnNetwork,
+            Case::ForeignNetworkIdentity,
+            Case::ResidueNetworkIdentity,
+        ] {
+            let root = tempfile::tempdir().unwrap();
+            let desired = desired();
+            let planned = planned_network(&desired);
+            let context =
+                mutate_effect_context(root.path(), &desired, |_, observation, _| match case {
+                    Case::StaleRevision => {
+                        observation.runtimes[0]
+                            .applied_desired
+                            .as_mut()
+                            .unwrap()
+                            .desired_revision = Revision::new(2).unwrap();
+                    }
+                    Case::DuplicateRuntime => {
+                        observation.runtimes.push(observation.runtimes[0].clone());
+                    }
+                    Case::NonMatchingOwnNetwork => {
+                        let mut observed = observed_network(&planned);
+                        observed.tap_name = Id::new("foreign_tap").unwrap();
+                        observation.runtimes[0].networks.push(observed);
+                    }
+                    Case::ForeignNetworkIdentity => {
+                        let mut foreign = observed_runtime(
+                            root.path(),
+                            &desired,
+                            vec![observed_network(&planned)],
+                        );
+                        foreign.cat_id = Id::new("cat_02").unwrap();
+                        observation.runtimes.push(foreign);
+                    }
+                    Case::ResidueNetworkIdentity => {
+                        observation.residue.push(NodeResidue::NetworkTap {
+                            network_id_hint: Some(planned.config.network_id.clone()),
+                            tap_name: Id::new("foreign_tap").unwrap(),
+                            ownership_token: OwnershipTokenEvidence::Missing,
+                        });
+                    }
+                });
+            let (network, network_calls) = FakeNetworkPort::new(planned);
+            let (launch, launch_calls) = RecordingLaunch::new(false);
+
+            assert!(adapter(network, launch).apply(context, &desired).is_err());
+
+            let network_calls = network_calls.lock().unwrap();
+            assert!(network_calls.prepares.is_empty());
+            assert!(launch_calls.lock().unwrap().is_empty());
+            assert!(!checkpoint_path(root.path(), &desired).exists());
+        }
+    }
+
+    #[test]
     fn prepare_failure_restart_reuses_checkpoint_and_never_replans() {
         let root = tempfile::tempdir().unwrap();
         let desired = desired();
@@ -790,7 +1187,7 @@ mod tests {
         first_network.fail_prepare = true;
         let (first_launch, first_launch_calls) = RecordingLaunch::new(false);
         let error = adapter(first_network, first_launch)
-            .apply(effect_context(root.path()), &desired)
+            .apply(effect_context(root.path(), &desired), &desired)
             .unwrap_err();
         assert!(error.to_string().contains("prepare exact checkpointed"));
         assert_eq!(first_calls.lock().unwrap().plans, 1);
@@ -801,15 +1198,12 @@ mod tests {
         restarted_network.fail_plan = true;
         let (restarted_launch, restarted_launch_calls) = RecordingLaunch::new(false);
         adapter(restarted_network, restarted_launch)
-            .apply(effect_context(root.path()), &desired)
+            .apply(effect_context(root.path(), &desired), &desired)
             .unwrap();
         let restarted_calls = restarted_calls.lock().unwrap();
         assert_eq!(restarted_calls.plans, 0);
         assert_eq!(restarted_calls.prepares, vec![planned.clone()]);
-        assert_eq!(
-            restarted_launch_calls.lock().unwrap().as_slice(),
-            &[(desired.clone(), planned)]
-        );
+        assert!(restarted_launch_calls.lock().unwrap().is_empty());
         assert_eq!(
             std::fs::read(checkpoint_path(root.path(), &desired)).unwrap(),
             durable_bytes
@@ -821,13 +1215,22 @@ mod tests {
         let root = tempfile::tempdir().unwrap();
         let desired = desired();
         let planned = planned_network(&desired);
-        let (first_network, first_calls) = FakeNetworkPort::new(planned.clone());
+        let setup_context = effect_context(root.path(), &desired);
+        NetworkCheckpointStore::open(setup_context.state_directory(), &setup_context)
+            .unwrap()
+            .publish(&desired, &planned)
+            .unwrap();
+
+        let (mut first_network, first_calls) = FakeNetworkPort::new(planned.clone());
+        first_network.fail_plan = true;
+        first_network.fail_prepare = true;
         let (first_launch, first_launch_calls) = RecordingLaunch::new(true);
         let error = adapter(first_network, first_launch)
-            .apply(effect_context(root.path()), &desired)
+            .apply(launch_context(root.path(), &desired, &planned), &desired)
             .unwrap_err();
         assert!(error.to_string().contains("launch exact checkpointed"));
-        assert_eq!(first_calls.lock().unwrap().plans, 1);
+        assert_eq!(first_calls.lock().unwrap().plans, 0);
+        assert!(first_calls.lock().unwrap().prepares.is_empty());
         assert_eq!(
             first_launch_calls.lock().unwrap().as_slice(),
             &[(desired.clone(), planned.clone())]
@@ -835,11 +1238,13 @@ mod tests {
 
         let (mut restarted_network, restarted_calls) = FakeNetworkPort::new(planned.clone());
         restarted_network.fail_plan = true;
+        restarted_network.fail_prepare = true;
         let (restarted_launch, restarted_launch_calls) = RecordingLaunch::new(false);
         adapter(restarted_network, restarted_launch)
-            .apply(effect_context(root.path()), &desired)
+            .apply(launch_context(root.path(), &desired, &planned), &desired)
             .unwrap();
         assert_eq!(restarted_calls.lock().unwrap().plans, 0);
+        assert!(restarted_calls.lock().unwrap().prepares.is_empty());
         assert_eq!(
             restarted_launch_calls.lock().unwrap().as_slice(),
             &[(desired, planned)]
@@ -851,7 +1256,7 @@ mod tests {
         let root = tempfile::tempdir().unwrap();
         let desired = desired();
         let planned = planned_network(&desired);
-        let context = effect_context(root.path());
+        let context = effect_context(root.path(), &desired);
         let canceller = context.clone();
         let (mut network, calls) = FakeNetworkPort::new(planned);
         network.on_plan = Some(Arc::new(move || canceller.cancel_for_test()));
@@ -872,7 +1277,7 @@ mod tests {
         let root = tempfile::tempdir().unwrap();
         let desired = desired();
         let planned = planned_network(&desired);
-        let context = effect_context(root.path());
+        let context = effect_context(root.path(), &desired);
         let canceller = context.clone();
         let (network, calls) = FakeNetworkPort::new(planned.clone());
         let (launch, launch_calls) = RecordingLaunch::new(false);
@@ -894,15 +1299,12 @@ mod tests {
         restarted_network.fail_plan = true;
         let (restarted_launch, restarted_launch_calls) = RecordingLaunch::new(false);
         adapter(restarted_network, restarted_launch)
-            .apply(effect_context(root.path()), &desired)
+            .apply(effect_context(root.path(), &desired), &desired)
             .unwrap();
         let restarted_calls = restarted_calls.lock().unwrap();
         assert_eq!(restarted_calls.plans, 0);
         assert_eq!(restarted_calls.prepares, vec![planned.clone()]);
-        assert_eq!(
-            restarted_launch_calls.lock().unwrap().as_slice(),
-            &[(desired, planned)]
-        );
+        assert!(restarted_launch_calls.lock().unwrap().is_empty());
     }
 
     #[test]
@@ -910,7 +1312,7 @@ mod tests {
         let root = tempfile::tempdir().unwrap();
         let desired = desired();
         let planned = planned_network(&desired);
-        let context = effect_context(root.path());
+        let context = effect_context(root.path(), &desired);
         let canceller = context.clone();
         let (mut network, calls) = FakeNetworkPort::new(planned.clone());
         network.on_prepare = Some(Arc::new(move || canceller.cancel_for_test()));
@@ -942,7 +1344,7 @@ mod tests {
         let (network, calls) = FakeNetworkPort::new(planned.clone());
         let (launch, _) = RecordingLaunch::new(false);
         adapter(network, launch)
-            .apply(effect_context(root.path()), &desired)
+            .apply(effect_context(root.path(), &desired), &desired)
             .unwrap();
         assert_eq!(calls.lock().unwrap().plans, 1);
         assert!(!temporary.exists());
@@ -980,7 +1382,7 @@ mod tests {
             network.fail_plan = true;
             let (launch, launch_calls) = RecordingLaunch::new(false);
             assert!(adapter(network, launch)
-                .apply(effect_context(root.path()), &desired)
+                .apply(effect_context(root.path(), &desired), &desired)
                 .is_err());
             let calls = calls.lock().unwrap();
             assert_eq!(calls.plans, 0);
@@ -1004,7 +1406,7 @@ mod tests {
             let (network, calls) = FakeNetworkPort::new(planned_network(&desired));
             let (launch, launch_calls) = RecordingLaunch::new(false);
             let error = adapter(network, launch)
-                .apply(effect_context(root.path()), &desired)
+                .apply(effect_context(root.path(), &desired), &desired)
                 .unwrap_err();
             assert!(error.to_string().contains("no composed effect adapter"));
             let calls = calls.lock().unwrap();
@@ -1033,27 +1435,29 @@ mod tests {
         let (launch, launch_calls) = RecordingLaunch::new(false);
         let tap_create = Arc::new(FakeTapCreatePort::default());
         let tap_calls = Arc::clone(&tap_create.calls);
-        let outcome = ProductionRuntimeDesiredEffect::with_tap_create_port(
+        let effect = ProductionRuntimeDesiredEffect::with_tap_create_port(
             ch_config(fake_ip),
             tap_create,
             Arc::new(launch),
-        )
-        .apply(effect_context(root.path()), &desired)
-        .unwrap();
+        );
+        let outcome = effect
+            .apply(effect_context(root.path(), &desired), &desired)
+            .unwrap();
         assert_eq!(outcome, RuntimeDesiredEffectOutcome::RefreshInventory);
 
-        let launch_calls = launch_calls.lock().unwrap();
-        assert_eq!(launch_calls.len(), 1);
-        let (launched_desired, network) = &launch_calls[0];
-        assert_eq!(launched_desired, &desired);
+        assert!(launch_calls.lock().unwrap().is_empty());
+        let network = checkpoint(root.path(), &desired)
+            .into_network(&desired)
+            .unwrap();
         assert_eq!(network.config, desired.runtime.network_config);
         assert_eq!(
             checkpoint(root.path(), &desired),
-            DurableNetworkCheckpoint::from_network(&desired, network)
+            DurableNetworkCheckpoint::from_network(&desired, &network)
         );
         let tap_calls = tap_calls.lock().unwrap();
         assert_eq!(tap_calls.created, vec![network.tap.clone()]);
         assert_eq!(tap_calls.published, vec![network.tap.clone()]);
+        drop(tap_calls);
         let ip_calls = std::fs::read_to_string(ip_log).unwrap();
         assert!(
             !ip_calls.contains("tuntap"),
@@ -1065,6 +1469,15 @@ mod tests {
             network.config.prefix_length,
             network.tap
         )));
+
+        let outcome = effect
+            .apply(launch_context(root.path(), &desired, &network), &desired)
+            .unwrap();
+        assert_eq!(outcome, RuntimeDesiredEffectOutcome::RefreshInventory);
+        assert_eq!(
+            launch_calls.lock().unwrap().as_slice(),
+            &[(desired, network)]
+        );
     }
 
     #[test]
@@ -1133,7 +1546,7 @@ if [ \"$1\" = '-o' ]; then exit 0; fi\n\
 
             let (launch, launch_calls) = RecordingLaunch::new(false);
             let error = ProductionRuntimeDesiredEffect::new(ch_config(fake_ip), Arc::new(launch))
-                .apply(effect_context(root.path()), &desired)
+                .apply(effect_context(root.path(), &desired), &desired)
                 .unwrap_err();
             let error = format!("{error:#}");
             if wrong_token {
@@ -1191,7 +1604,7 @@ exit 0\n",
 
             let (launch, launch_calls) = RecordingLaunch::new(false);
             let error = ProductionRuntimeDesiredEffect::new(ch_config(fake_ip), Arc::new(launch))
-                .apply(effect_context(root.path()), &desired)
+                .apply(effect_context(root.path(), &desired), &desired)
                 .unwrap_err();
             assert!(
                 format!("{error:#}").contains(expected_error),
@@ -1248,8 +1661,7 @@ exit 0\n",
             .unwrap()
             .publish(&desired, &network)
             .unwrap();
-        let context =
-            RuntimeDesiredEffectContext::for_test(state, Instant::now() + Duration::from_secs(10));
+        let context = effect_context(root.path(), &desired);
         let cancellation = context.clone();
         let (launch, launch_calls) = RecordingLaunch::new(false);
         let worker = std::thread::spawn(move || {

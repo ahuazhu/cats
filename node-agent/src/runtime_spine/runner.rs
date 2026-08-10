@@ -1859,8 +1859,9 @@ mod tests {
         ContractVersion, GuestTransportEvidence, HostPath, Id, Ipv4Address, IsolatedIpv4Kind,
         LifecycleAdmission, MacAddress, NetworkConfig, ObservationAcceptance,
         ObservationInventoryAcceptance, ReconcileStep, Revision, RuntimeConfig,
-        RuntimeSpineErrorDetail, RuntimeTarget, RuntimeTransition, SessionBinding, UnixMillis,
-        WarmSnapshotEvidence, DESIRED_READ_REQUEST_MAX_WIRE_BYTES, NODE_OBSERVATION_MAX_WIRE_BYTES,
+        RuntimeSpineErrorDetail, RuntimeTarget, RuntimeTransition, Sequence, SessionBinding,
+        UnixMillis, WarmSnapshotEvidence, DESIRED_READ_REQUEST_MAX_WIRE_BYTES,
+        NODE_OBSERVATION_MAX_WIRE_BYTES,
     };
     use std::os::unix::fs::PermissionsExt as _;
 
@@ -2102,6 +2103,69 @@ mod tests {
         };
         desired.spec_digest = spec_digest(&desired).unwrap();
         desired
+    }
+
+    fn effect_admission_for(desired: &DesiredRuntimeSpec) -> RuntimeDesiredEffectAdmission {
+        let session = decode_agent_session(SESSION).unwrap();
+        let mut snapshot = decode_desired_read_snapshot(SNAPSHOT).unwrap();
+        snapshot.desired_specs = vec![desired.clone()];
+        let runtime = ObservedRuntimeStatus {
+            cat_id: desired.cat_id.clone(),
+            applied_desired: Some(AppliedDesiredEvidence {
+                desired_revision: desired.desired_revision,
+                spec_digest: desired.spec_digest.clone(),
+                placement: desired.placement.clone(),
+                target: desired.target,
+            }),
+            runtime_incarnation: None,
+            stable_state: None,
+            step: ReconcileStep::InspectInventory {
+                inventory_epoch: Epoch::new(1).unwrap(),
+            },
+            checkpoint: CheckpointEvidence::Missing {
+                checkpoint_path: HostPath::new("/var/lib/cats/cat_01.json").unwrap(),
+            },
+            processes: Vec::new(),
+            volumes: Vec::new(),
+            mounts: Vec::new(),
+            networks: Vec::new(),
+            guest_transport: GuestTransportEvidence::Unavailable,
+            warm_snapshot: WarmSnapshotEvidence::Absent,
+            lifecycle_admission: LifecycleAdmission::Closed,
+            routes: Vec::new(),
+            platform_guards: 0,
+            conditions: Vec::new(),
+        };
+        let observation = build_full_observation(
+            RuntimeSpineFullScan {
+                session: SessionBinding {
+                    node_id: session.node_id.clone(),
+                    node_boot_id: session.node_boot_id.clone(),
+                    agent_instance_id: session.agent_instance_id.clone(),
+                    agent_session_epoch: session.agent_session_epoch,
+                },
+                heartbeat_sequence: Sequence::new(1).unwrap(),
+                inventory_epoch: Epoch::new(1).unwrap(),
+                desired: snapshot,
+            },
+            CompleteRuntimeInventory::for_test(
+                UnixMillis::new(1_720_000_004_000).unwrap(),
+                RuntimeInventoryKeyRing::Unavailable,
+                vec![runtime],
+                Vec::new(),
+            ),
+        )
+        .unwrap();
+        let attestation = AdmissionInventoryAttestation {
+            version: ContractVersion::V1,
+            node_id: observation.node_id.clone(),
+            agent_session_epoch: observation.agent_session_epoch,
+            inventory_epoch: observation.inventory_epoch,
+            inventory_digest: observation.inventory_digest.clone().unwrap(),
+            inventory_read_position: observation.inventory_read_position.unwrap(),
+            accepted_at_unix_ms: UnixMillis::new(1_720_000_005_000).unwrap(),
+        };
+        RuntimeDesiredEffectAdmission::for_test(session, observation, attestation)
     }
 
     fn snapshot_with_network() -> Vec<u8> {
@@ -2852,7 +2916,9 @@ mod tests {
             effect,
         )
         .unwrap();
-        runner.pending_effects.push_back(desired_with_network());
+        let desired = desired_with_network();
+        runner.effect_admission = Some(effect_admission_for(&desired));
+        runner.pending_effects.push_back(desired);
 
         assert!(matches!(
             runner
