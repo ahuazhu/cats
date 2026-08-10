@@ -96,10 +96,20 @@ pub struct RuntimeCheckpointInventoryEvidence {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AuthorizedBlockdControlState {
+    NotStarted,
+    ExactControlOnlyEmpty,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AuthorizedBlockdInventoryEvidence {
     pub data_directory: HostPath,
     pub checkpoint: AuthorizedBlockdCheckpoint,
     pub binding: DesiredCheckpointBinding,
+    /// Closed provider-private evidence. This is deliberately not projected
+    /// to the Runtime inventory wire: it only prevents a process handshake
+    /// from outrunning the engine files it claims to represent.
+    pub control_state: AuthorizedBlockdControlState,
 }
 
 /// Provider-private authority evidence retained until the local attachment
@@ -369,6 +379,28 @@ impl RuntimeInventoryScanner for CleanSlateInventoryScanner {
             context
                 .remaining()
                 .context("root-process inventory bridge deadline expired after inspection")?;
+            if processes_by_cat.keys().any(|cat_id| {
+                !matches!(
+                    aggregate
+                        .blockd_by_cat
+                        .get(cat_id)
+                        .map(|blockd| &blockd.control_state),
+                    Some(AuthorizedBlockdControlState::ExactControlOnlyEmpty)
+                )
+            }) {
+                // A verified process is one half of a joint physical fact. If
+                // the same scan did not also prove the exact empty control-only
+                // engine state, keep every involved source unavailable and do
+                // not let the proof reach wire projection.
+                return Ok(RuntimeInventoryScanOutcome::Incomplete {
+                    unavailable_sources: vec![
+                        InventorySource::Systemd,
+                        InventorySource::Process,
+                        InventorySource::ControlSocket,
+                        InventorySource::DataDirectory,
+                    ],
+                });
+            }
             for source in [
                 InventorySource::Systemd,
                 InventorySource::Process,

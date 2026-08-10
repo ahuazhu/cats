@@ -55,7 +55,8 @@ use super::checkpoint::{
     DefiniteReleaseRejection, RELEASE_REJECTION_MAX_BYTES,
 };
 use super::inventory::{
-    AuthorityVolumeInventoryEvidence, AuthorizedBlockdInventoryEvidence, DesiredCheckpointBinding,
+    AuthorityVolumeInventoryEvidence, AuthorizedBlockdControlState,
+    AuthorizedBlockdInventoryEvidence, DesiredCheckpointBinding,
     RuntimeCheckpointInventoryEvidence,
 };
 use super::root_provision_process::inspect_exact_root_provision_process;
@@ -1879,11 +1880,9 @@ fn scan_authorized_blockd_data(
             .into_iter()
             .filter(|name| by_name.contains_key(*name))
             .count();
-        if present_control_files != 0 && present_control_files != control_files.len() {
-            scan.complete = false;
-            continue;
-        }
-        if present_control_files == control_files.len() {
+        let control_state = if present_control_files == 0 {
+            AuthorizedBlockdControlState::NotStarted
+        } else if present_control_files == control_files.len() {
             let root_metadata = root.metadata().context("inspect retained state root")?;
             let cache = &by_name["cache.data"].metadata;
             anyhow::ensure!(
@@ -1921,7 +1920,11 @@ fn scan_authorized_blockd_data(
                 pending_entries.is_empty(),
                 "root-provision control-only blockd retains a pending pack"
             );
-        }
+            AuthorizedBlockdControlState::ExactControlOnlyEmpty
+        } else {
+            scan.complete = false;
+            continue;
+        };
         let binding = authorized_blockd_binding(desired, &checkpoint)?;
         anyhow::ensure!(
             cat_name == format!("cat-{}", checkpoint.desired.cat_id)
@@ -1960,6 +1963,7 @@ fn scan_authorized_blockd_data(
                         data_directory,
                         checkpoint,
                         binding,
+                        control_state,
                     },
                 )
                 .is_none(),
@@ -3485,6 +3489,10 @@ fn inspect_empty_dirty_bitmap_at(
     context: &RuntimeInventoryScanContext,
 ) -> anyhow::Result<Option<()>> {
     validate_strict_regular_entry(entry, root, 0o600)?;
+    let root_uid = root
+        .metadata()
+        .context("inspect retained state root for dirty bitmap")?
+        .uid();
     let chunk_count = chunk::chunk_count(size_bytes);
     let expected_len = BITMAP_HEADER_LEN
         .checked_add(
@@ -3527,12 +3535,7 @@ fn inspect_empty_dirty_bitmap_at(
     let before = file
         .metadata()
         .context("inspect root-provision dirty bitmap before read")?;
-    if !before.is_file()
-        || u64::try_from(entry.metadata.st_dev).ok() != Some(before.dev())
-        || before.ino() != entry.metadata.st_ino
-        || before.nlink() != 1
-        || before.len() != expected_len
-    {
+    if !exact_dirty_bitmap_descriptor_metadata(&before, entry, root_uid, expected_len) {
         return Ok(None);
     }
 
@@ -3572,7 +3575,8 @@ fn inspect_empty_dirty_bitmap_at(
     let after = file
         .metadata()
         .context("inspect root-provision dirty bitmap after read")?;
-    if before.len() != after.len()
+    if !exact_dirty_bitmap_descriptor_metadata(&after, entry, root_uid, expected_len)
+        || before.len() != after.len()
         || before.modified().ok() != after.modified().ok()
         || before.ctime() != after.ctime()
         || before.ctime_nsec() != after.ctime_nsec()
@@ -3580,6 +3584,21 @@ fn inspect_empty_dirty_bitmap_at(
         return Ok(None);
     }
     Ok(Some(()))
+}
+
+fn exact_dirty_bitmap_descriptor_metadata(
+    metadata: &std::fs::Metadata,
+    entry: &StrictDirectoryEntry,
+    root_uid: u32,
+    expected_len: u64,
+) -> bool {
+    metadata.is_file()
+        && u64::try_from(entry.metadata.st_dev).ok() == Some(metadata.dev())
+        && metadata.ino() == entry.metadata.st_ino
+        && metadata.uid() == root_uid
+        && metadata.mode() & 0o777 == 0o600
+        && metadata.nlink() == 1
+        && metadata.len() == expected_len
 }
 
 /// Reads the only recoverable hard-link shapes of a definite-release temp.
@@ -5277,6 +5296,25 @@ mod tests {
         std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600)).unwrap();
     }
 
+    fn install_exact_control_only_files(data_directory: &Path, size_bytes: u64) {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let cache = std::fs::File::create(data_directory.join("cache.data")).unwrap();
+        cache.set_len(size_bytes).unwrap();
+        std::fs::set_permissions(
+            data_directory.join("cache.data"),
+            std::fs::Permissions::from_mode(0o600),
+        )
+        .unwrap();
+        write_empty_dirty_bitmap(&data_directory.join("dirty.bitmap"), size_bytes);
+        std::fs::create_dir(data_directory.join("pending-packs")).unwrap();
+        std::fs::set_permissions(
+            data_directory.join("pending-packs"),
+            std::fs::Permissions::from_mode(0o700),
+        )
+        .unwrap();
+    }
+
     #[test]
     fn authorized_data_probe_accepts_exact_control_only_engine_files_and_socket() {
         use std::os::unix::fs::PermissionsExt as _;
@@ -5286,20 +5324,7 @@ mod tests {
         let desired = &scan_context.coordinates().desired.desired_specs[0];
         let (_record, attachment) = exact_owned_record_and_attachment(desired);
         let data_directory = prepare_exact_lineage(&environment, desired, &attachment);
-        let cache = std::fs::File::create(data_directory.join("cache.data")).unwrap();
-        cache.set_len(attachment.size_bytes).unwrap();
-        std::fs::set_permissions(
-            data_directory.join("cache.data"),
-            std::fs::Permissions::from_mode(0o600),
-        )
-        .unwrap();
-        write_empty_dirty_bitmap(&data_directory.join("dirty.bitmap"), attachment.size_bytes);
-        std::fs::create_dir(data_directory.join("pending-packs")).unwrap();
-        std::fs::set_permissions(
-            data_directory.join("pending-packs"),
-            std::fs::Permissions::from_mode(0o700),
-        )
-        .unwrap();
+        install_exact_control_only_files(&data_directory, attachment.size_bytes);
         let _socket =
             std::os::unix::net::UnixListener::bind(data_directory.join("root-provision.sock"))
                 .unwrap();
@@ -5314,7 +5339,10 @@ mod tests {
                 .prove_absent(&scan_context)
                 .unwrap(),
             InventoryAbsence::AuthorizedBlockd(evidence)
-                if evidence.contains_key(&desired.cat_id)
+                if matches!(
+                    evidence.get(&desired.cat_id).map(|item| &item.control_state),
+                    Some(AuthorizedBlockdControlState::ExactControlOnlyEmpty)
+                )
         ));
     }
 
@@ -5364,6 +5392,42 @@ mod tests {
             );
             assert_eq!(std::fs::read(&bitmap_path).unwrap(), before, "{mutation}");
         }
+    }
+
+    #[test]
+    fn dirty_bitmap_descriptor_rejects_chmod_after_enumeration_without_cleanup() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let environment = TestEnvironment::new();
+        let scan_context = assigned_context(true);
+        let desired = &scan_context.coordinates().desired.desired_specs[0];
+        let (_record, attachment) = exact_owned_record_and_attachment(desired);
+        let data_directory = prepare_exact_lineage(&environment, desired, &attachment);
+        install_exact_control_only_files(&data_directory, attachment.size_bytes);
+        let bitmap_path = data_directory.join("dirty.bitmap");
+        let before = std::fs::read(&bitmap_path).unwrap();
+        let root = File::open(&environment.state).unwrap();
+        let directory = File::open(&data_directory).unwrap();
+        let entry = StrictDirectoryEntry {
+            name: OsString::from("dirty.bitmap"),
+            metadata: stat_at(&directory, OsStr::new("dirty.bitmap")).unwrap(),
+        };
+
+        std::fs::set_permissions(&bitmap_path, std::fs::Permissions::from_mode(0o644)).unwrap();
+        assert!(inspect_empty_dirty_bitmap_at(
+            &directory,
+            &entry,
+            &root,
+            attachment.size_bytes,
+            &scan_context,
+        )
+        .unwrap()
+        .is_none());
+        assert_eq!(std::fs::read(&bitmap_path).unwrap(), before);
+        assert_eq!(
+            std::fs::metadata(&bitmap_path).unwrap().mode() & 0o777,
+            0o644
+        );
     }
 
     #[test]
@@ -7010,13 +7074,20 @@ mod tests {
         ));
     }
 
-    #[test]
-    fn full_scanner_projects_exact_root_process_from_all_three_raw_authorities() {
-        let environment = TestEnvironment::new();
+    struct FullRootScannerFixture {
+        scan_context: RuntimeInventoryScanContext,
+        config: ProbeConfig,
+        record: VolumeRecord,
+        blob: Arc<ExactManifestBlobStore>,
+        expected: RootProvisionProcessExpectation,
+        data_directory: PathBuf,
+    }
+
+    fn full_root_scanner_fixture(environment: &TestEnvironment) -> FullRootScannerFixture {
         let scan_context = assigned_context(true);
         let desired = scan_context.coordinates().desired.desired_specs[0].clone();
         let (record, attachment) = exact_owned_record_and_attachment(&desired);
-        let data_directory = prepare_exact_lineage(&environment, &desired, &attachment);
+        let data_directory = prepare_exact_lineage(environment, &desired, &attachment);
         let blob = Arc::new(ExactManifestBlobStore::for_desired(&desired));
         let ProvisionHeadRead::Ready { blank, target } = expected_provision_heads(
             blob.as_ref(),
@@ -7086,25 +7157,114 @@ mod tests {
             HostPath::new(environment.blockd_binary.to_string_lossy().into_owned()).unwrap(),
         )
         .unwrap();
-        let exact = exact_process_evidence(&expected, 71);
-        let _socket = install_exact_process_fixture(&environment, &expected, exact.process_id);
+        FullRootScannerFixture {
+            scan_context,
+            config: environment.config(),
+            record,
+            blob,
+            expected,
+            data_directory,
+        }
+    }
 
-        let mut config = environment.config();
+    fn full_root_scanner(
+        fixture: &FullRootScannerFixture,
+        inspections: impl IntoIterator<Item = RootProvisionProcessInspection>,
+    ) -> CleanSlateInventoryScanner {
+        let mut config = fixture.config.clone();
         config.root_process_port = Some(Arc::new(FakeRootProcessPort {
-            inspections: Mutex::new(VecDeque::from([
-                RootProvisionProcessInspection::Exact(Box::new(exact.clone())),
-                RootProvisionProcessInspection::Exact(Box::new(exact)),
-            ])),
+            inspections: Mutex::new(inspections.into_iter().collect()),
         }));
-        let (authority, _) = TestVolumeDataAuthority::exact(record);
-        let scanner = scanner_with_metadata_authority_and_blob(
+        let (authority, _) = TestVolumeDataAuthority::exact(fixture.record.clone());
+        let blob: Arc<dyn BlobStore> = fixture.blob.clone();
+        scanner_with_metadata_authority_and_blob(
             config,
             Arc::new(VolumeDataAuthorityMetadataReader::start(authority).unwrap()),
             Some(blob),
         )
-        .unwrap();
+        .unwrap()
+    }
+
+    #[test]
+    fn full_scanner_rejects_exact_process_without_exact_control_only_files() {
+        let environment = TestEnvironment::new();
+        let fixture = full_root_scanner_fixture(&environment);
+        let exact = exact_process_evidence(&fixture.expected, 69);
+        let _socket =
+            install_exact_process_fixture(&environment, &fixture.expected, exact.process_id);
+        let scanner = full_root_scanner(
+            &fixture,
+            [
+                RootProvisionProcessInspection::Exact(Box::new(exact.clone())),
+                RootProvisionProcessInspection::Exact(Box::new(exact)),
+            ],
+        );
+
+        assert!(matches!(
+            scanner.scan_complete(fixture.scan_context).unwrap(),
+            RuntimeInventoryScanOutcome::Incomplete { unavailable_sources }
+                if unavailable_sources.contains(&InventorySource::DataDirectory)
+        ));
+        for name in ["cache.data", "dirty.bitmap", "pending-packs"] {
+            assert!(!fixture.data_directory.join(name).exists(), "{name}");
+        }
+    }
+
+    #[test]
+    fn full_scanner_accepts_absent_process_with_not_started_control_state() {
+        let environment = TestEnvironment::new();
+        let fixture = full_root_scanner_fixture(&environment);
+        assert!(matches!(
+            authorized_data_probe(&environment)
+                .prove_absent(&fixture.scan_context)
+                .unwrap(),
+            InventoryAbsence::AuthorizedBlockd(evidence)
+                if matches!(
+                    evidence
+                        .get(&fixture.expected.cat_id)
+                        .map(|item| &item.control_state),
+                    Some(AuthorizedBlockdControlState::NotStarted)
+                )
+        ));
+        let scanner = full_root_scanner(
+            &fixture,
+            [
+                RootProvisionProcessInspection::Absent,
+                RootProvisionProcessInspection::Absent,
+            ],
+        );
+
         let RuntimeInventoryScanOutcome::Complete(inventory) =
-            scanner.scan_complete(scan_context).unwrap()
+            scanner.scan_complete(fixture.scan_context).unwrap()
+        else {
+            panic!("absent process and not-started engine state must be complete")
+        };
+        assert!(inventory.runtimes()[0].processes.is_empty());
+        for name in ["cache.data", "dirty.bitmap", "pending-packs"] {
+            assert!(!fixture.data_directory.join(name).exists(), "{name}");
+        }
+    }
+
+    #[test]
+    fn full_scanner_projects_exact_root_process_from_all_three_raw_authorities() {
+        let environment = TestEnvironment::new();
+        let fixture = full_root_scanner_fixture(&environment);
+        install_exact_control_only_files(
+            &fixture.data_directory,
+            fixture.expected.attachment.size_bytes,
+        );
+        let exact = exact_process_evidence(&fixture.expected, 71);
+        let _socket =
+            install_exact_process_fixture(&environment, &fixture.expected, exact.process_id);
+        let scanner = full_root_scanner(
+            &fixture,
+            [
+                RootProvisionProcessInspection::Exact(Box::new(exact.clone())),
+                RootProvisionProcessInspection::Exact(Box::new(exact)),
+            ],
+        );
+        let RuntimeInventoryScanOutcome::Complete(inventory) =
+            scanner.scan_complete(fixture.scan_context).unwrap()
         else {
             panic!("all exact sources must complete the full scan")
         };
