@@ -212,6 +212,10 @@ struct EngineState {
     map: Vec<ChunkRef>,
     /// Committed leaf references matching `map`.
     leaf_refs: Vec<LeafRef>,
+    /// Complete remote authority tuple matching `generation` and `map`.
+    /// Keeping the hashes here lets the control handshake prove the exact
+    /// checkpointed root without a second, weaker generation-only protocol.
+    remote_head: RemoteHead,
     generation: i64,
     /// Chunk cache holds the full authoritative-local content of the chunk.
     hydrated: Vec<bool>,
@@ -962,6 +966,11 @@ impl ChunkEngine {
                 dirty_ranges: vec![Vec::new(); chunk_count as usize],
                 map: vec![ChunkRef::Hole; chunk_count as usize],
                 leaf_refs: vec![LeafRef::Empty; chunk::leaf_count(size) as usize],
+                remote_head: RemoteHead {
+                    generation: Generation::new(0).expect("zero is a valid generation"),
+                    root_hash: None,
+                    root_object_id: None,
+                },
                 generation: 0,
                 discarded: HashSet::new(),
                 hydrated: vec![false; chunk_count as usize],
@@ -1232,6 +1241,7 @@ impl ChunkEngine {
 
         let mut st = self.state.lock().unwrap();
         st.generation = head.generation;
+        st.remote_head = remote_head_from_legacy_projection(&head)?;
         st.map = refs;
         st.leaf_refs = leaf_refs;
         // Dirty chunks carry uncommitted local data: their cache content is
@@ -1320,7 +1330,7 @@ impl ChunkEngine {
         let chunks: Vec<u64> = manifest.chunks.iter().map(|c| c.chunk_idx).collect();
         let txn = format!("img-{}", &manifest.image_id.as_str()[..16]);
         let mut new_leaves = vec![LeafRef::Empty; chunk::leaf_count(self.size) as usize];
-        let new_gen = self.publish_map(
+        let (new_gen, remote_head) = self.publish_map(
             &txn,
             0,
             1,
@@ -1335,6 +1345,7 @@ impl ChunkEngine {
         st.map = new_map;
         st.leaf_refs = new_leaves;
         st.generation = new_gen;
+        st.remote_head = remote_head;
         // Provisioning published a generation without going through the staged
         // queue; the next staged pack chains onto it. (The queue is empty —
         // checked above — so next_base is exactly the committed generation.)

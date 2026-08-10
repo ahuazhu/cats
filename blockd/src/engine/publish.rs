@@ -468,7 +468,7 @@ impl ChunkEngine {
         leaves: &mut [LeafRef],
         map_chunks: &[u64],
         record_chunks: &[u64],
-    ) -> Result<i64> {
+    ) -> Result<(i64, RemoteHead)> {
         let vol = &self.cfg.volume_id;
         let prepared = self.prepare_map_publication(base_generation, new_map, leaves, map_chunks);
         for (hash, encoded) in &prepared.leaf_nodes {
@@ -521,8 +521,13 @@ impl ChunkEngine {
             Err(error) => return Err(EngineError::Meta(error)),
         };
         crashpoint::maybe_crash(crashpoint::AFTER_CAS);
+        if new_gen != new_generation {
+            return Err(EngineError::Corrupt(
+                "authority returned a generation different from the exact published head".into(),
+            ));
+        }
         leaves.clone_from_slice(&prepared.leaves);
-        Ok(new_gen)
+        Ok((new_gen, target_head))
     }
 
     pub(super) fn prepare_map_publication(
@@ -821,7 +826,7 @@ impl ChunkEngine {
 
         // 3-5. Map, root, commit record, CAS jumping one step per pack.
         let mut new_leaves = base_leaves;
-        let new_gen = self.publish_map(
+        let (new_gen, remote_head) = self.publish_map(
             &last.txn,
             base_generation,
             new_generation,
@@ -839,6 +844,7 @@ impl ChunkEngine {
             st.map = new_map;
             st.leaf_refs = new_leaves;
             st.generation = new_gen;
+            st.remote_head = remote_head;
             // Publication materializes cold Relaxed overlays in private publisher
             // memory, not in `cache.data`. Preserve each chunk's existing cache
             // completeness instead of promoting it merely because its remote map

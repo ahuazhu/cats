@@ -24,7 +24,10 @@ pub enum DurabilityMode {
 
 impl ChunkEngine {
     pub fn durability_status(&self) -> DurabilityStatus {
-        let remote_durable_generation = self.generation();
+        let (remote_durable_generation, remote_head) = {
+            let state = self.state.lock().unwrap();
+            (state.generation, state.remote_head.clone())
+        };
         let unstaged_reservation = self.unstaged_pack_reservation_bytes();
         let staged = self.staged.lock().unwrap();
         let unpublished_generations = staged.packs.len();
@@ -60,6 +63,7 @@ impl ChunkEngine {
             scope_id: None,
             process_identity_token: None,
             control_only: None,
+            remote_head: self.authorized_attachment.as_ref().map(|_| remote_head),
             mode: match self.cfg.durability {
                 DurabilityMode::Strict => "strict",
                 DurabilityMode::Relaxed { .. } => "relaxed",

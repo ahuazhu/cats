@@ -9,7 +9,7 @@
 
 use anyhow::Context as _;
 use cats_api::runtime_reconciliation::{
-    Durability, Epoch, FenceEpoch, HostPath, Id, RandomId128, ReconcileStep, Revision,
+    Durability, Epoch, FenceEpoch, HostPath, Id, RandomId128, ReconcileStep, RemoteHead, Revision,
     RuntimeCheckpoint, Sha256Digest, WireU64,
 };
 use cats_storage::authority::{AttachmentLineageIdentity, AuthorizedServingAttachment};
@@ -125,6 +125,7 @@ pub(crate) struct RootProvisionBlockdHandshake {
     pub identity: AttachmentLineageIdentity,
     pub size_bytes: u64,
     pub durability: Durability,
+    pub remote_head: RemoteHead,
     pub process_identity_token: RandomId128,
     pub control_only: bool,
     pub guest_io_enabled: bool,
@@ -163,6 +164,7 @@ impl RootProvisionProcessEvidence {
             && self.handshake.identity == expected.attachment.identity
             && self.handshake.size_bytes == expected.size_bytes
             && self.handshake.durability == expected.attachment.durability
+            && self.handshake.remote_head == expected.attachment.head
             && self.handshake.process_identity_token == expected.process_identity_token
             && self.handshake.control_only
             && !self.handshake.guest_io_enabled
@@ -787,6 +789,7 @@ mod tests {
                 identity: attachment.identity.clone(),
                 size_bytes: attachment.size_bytes,
                 durability: attachment.durability,
+                remote_head: attachment.head.clone(),
                 process_identity_token: random('4'),
                 control_only: true,
                 guest_io_enabled: false,

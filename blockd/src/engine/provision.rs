@@ -153,6 +153,7 @@ impl ChunkEngine {
             state.map = new_map;
             state.leaf_refs = prepared.leaves;
             state.generation = 1;
+            state.remote_head = request.expected_provisioned_head.clone();
             state.hydrated.fill(false);
         }
         self.staged

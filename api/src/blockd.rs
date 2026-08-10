@@ -17,7 +17,9 @@ use std::str::FromStr;
 
 use serde::{Deserialize, Serialize};
 
-use crate::runtime_reconciliation::{AcquireOrigin, Epoch, FenceEpoch, Id, RandomId128};
+use crate::runtime_reconciliation::{
+    AcquireOrigin, Epoch, FenceEpoch, Id, RandomId128, RemoteHead,
+};
 
 /// Directory under a blockd `--data-dir` holding locally durable, remotely
 /// unpublished packs.
@@ -200,6 +202,11 @@ pub struct DurabilityStatus {
     /// alone is not proof that the process exposes only Host control I/O.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub control_only: Option<bool>,
+    /// Complete authoritative head loaded by a signed target-authority
+    /// process. Missing is legacy/unproven; a generation counter alone cannot
+    /// distinguish the checkpointed image root from an unrelated commit.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub remote_head: Option<RemoteHead>,
     pub mode: String,
     pub local_durable_generation: i64,
     pub remote_durable_generation: i64,
@@ -261,6 +268,7 @@ mod tests {
             scope_id: None,
             process_identity_token: None,
             control_only: None,
+            remote_head: None,
             mode: "relaxed".to_string(),
             local_durable_generation: 7,
             remote_durable_generation: 5,

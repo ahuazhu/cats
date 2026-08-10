@@ -405,6 +405,7 @@ fn authorized_control_only_renews_exact_grant_and_keeps_guest_io_closed() {
         Some(&fixture.attachment.identity.acquire_origin)
     );
     assert_eq!(status.guest_io_enabled, Some(false));
+    assert_eq!(status.remote_head, Some(fixture.attachment.head.clone()));
     assert!(matches!(
         engine.write(0, b"must stay closed"),
         Err(EngineError::GuestIoDisabled)
@@ -3701,6 +3702,11 @@ fn typed_root_provision_is_exact_idempotent_and_never_enables_guest_io() {
         fixture.request.expected_provisioned_head
     );
     assert_eq!(fixture.meta.cas_calls.load(Ordering::SeqCst), 1);
+    assert_eq!(
+        fixture.engine.state.lock().unwrap().remote_head.clone(),
+        fixture.request.expected_provisioned_head,
+        "engine state must retain the complete target rather than generation alone"
+    );
     let head = fixture.meta.load_head(VOL).unwrap();
     assert_eq!(head.generation, 1);
     assert_eq!(

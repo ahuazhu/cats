@@ -321,6 +321,7 @@ fn exact_handshake(
         && status.scope_id.as_ref() == Some(&expected.scope_id)
         && status.process_identity_token.as_ref() == Some(&expected.process_identity_token)
         && status.control_only == Some(true)
+        && status.remote_head.as_ref() == Some(&expected.attachment.head)
         && status.guest_io_enabled == Some(false)
         && status.mode == expected_mode
         && !status.fenced)
@@ -329,6 +330,7 @@ fn exact_handshake(
             identity: expected.attachment.identity.clone(),
             size_bytes: expected.size_bytes,
             durability: expected.attachment.durability,
+            remote_head: expected.attachment.head.clone(),
             process_identity_token: expected.process_identity_token.clone(),
             control_only: true,
             guest_io_enabled: false,
@@ -1317,6 +1319,46 @@ mod tests {
     }
 
     #[test]
+    fn generation_only_or_different_remote_head_is_not_an_exact_handshake() {
+        let expected = expectation();
+        let proof = proof();
+        for remote_head in [
+            None,
+            Some(RemoteHead {
+                generation: Generation::new(1).unwrap(),
+                root_hash: Some(Sha256Digest::from_bytes([9; 32])),
+                root_object_id: Some(
+                    cats_api::runtime_reconciliation::AsciiText::new("different.node").unwrap(),
+                ),
+            }),
+        ] {
+            let systemd = Arc::new(FakeSystemd::default());
+            systemd.inspections.lock().unwrap().extend([
+                SystemdInspection::Exact(proof.clone()),
+                SystemdInspection::Exact(proof.clone()),
+            ]);
+            let mut wrong_status = status();
+            wrong_status.remote_head = remote_head;
+            let handshake = Arc::new(FakeHandshake::default());
+            handshake
+                .inspections
+                .lock()
+                .unwrap()
+                .push_back(BlockdHandshakeInspection::Verified {
+                    peer_process_id: 4242,
+                    status: Box::new(wrong_status),
+                });
+            let port = SystemdRootProvisionProcessPort::new(config(), systemd, handshake);
+            assert!(matches!(
+                port.inspect(&expected, &context()).unwrap(),
+                RootProvisionProcessInspection::Conflict(
+                    RootProvisionProcessConflict::IdentityMismatch
+                )
+            ));
+        }
+    }
+
+    #[test]
     fn response_loss_polls_exact_identity_without_a_second_submission() {
         let expected = expectation();
         let proof = proof();
@@ -1696,6 +1738,7 @@ mod tests {
             scope_id: Some(expected.scope_id),
             process_identity_token: Some(expected.process_identity_token),
             control_only: Some(true),
+            remote_head: Some(expected.attachment.head),
             mode: "strict".into(),
             local_durable_generation: 0,
             remote_durable_generation: 0,
