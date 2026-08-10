@@ -2,8 +2,8 @@
 //! work-status transports have been removed.
 
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::Arc;
-use std::time::Duration;
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 use axum::body::Bytes;
 use axum::extract::State;
@@ -25,6 +25,7 @@ use cats_api::runtime_reconciliation::{
 };
 use cats_metadata_store_sqlite::SqliteMetadataStore;
 use cats_node_agent::agent_registration::AgentRegistrationConfig;
+use cats_node_agent::runtime::NodeRuntime;
 use cats_node_agent::server::{spawn, ServerConfig};
 use cats_node_agent::usage_spool::UsageSpool;
 use cats_storage::MetadataStore;
@@ -241,73 +242,182 @@ async fn start_agent(
     .unwrap()
 }
 
-async fn start_running_work_producer(agent: &cats_node_agent::server::Handle) {
-    let runtime = Arc::clone(&agent.state.runtime);
-    let result = tokio::task::spawn_blocking(move || {
-        runtime.execute(NodeJob {
-            job_id: job_id(WORK_PRODUCER_CAT, WORK_PRODUCER_GENERATION, "start_cat"),
-            cat_generation: WORK_PRODUCER_GENERATION,
-            action: NodeJobAction::StartCat {
-                cat_id: WORK_PRODUCER_CAT.into(),
-                image: "test".into(),
-                cpus: 1,
-                memory_mib: 256,
-                volumes: vec![VolumeGrant {
-                    disk_id: "root_work_producer".into(),
-                    volume_id: "vol_work_producer".into(),
-                    attachment_id: "att_work_producer".into(),
-                    epoch: 0,
-                    size_bytes: 2 * cats_api::chunk::CHUNK_SIZE as u64,
-                    mount_path: "/".into(),
-                    durability: Default::default(),
-                }],
-            },
-        })
-    })
-    .await
-    .unwrap();
-    assert_eq!(
-        result.observed_state,
-        ObservedState::Running,
-        "FakeVmm work producer did not start: {:?}",
-        result.error,
-    );
+fn start_work_producer_job() -> NodeJob {
+    NodeJob {
+        job_id: job_id(WORK_PRODUCER_CAT, WORK_PRODUCER_GENERATION, "start_cat"),
+        cat_generation: WORK_PRODUCER_GENERATION,
+        action: NodeJobAction::StartCat {
+            cat_id: WORK_PRODUCER_CAT.into(),
+            image: "test".into(),
+            cpus: 1,
+            memory_mib: 256,
+            volumes: vec![VolumeGrant {
+                disk_id: "root_work_producer".into(),
+                volume_id: "vol_work_producer".into(),
+                attachment_id: "att_work_producer".into(),
+                epoch: 0,
+                size_bytes: 2 * cats_api::chunk::CHUNK_SIZE as u64,
+                mount_path: "/".into(),
+                durability: Default::default(),
+            }],
+        },
+    }
+}
 
-    // This is the exact positive seam the removed watcher used: a Running
-    // runtime must be discoverable and its Guest must produce work status.
-    let mut targets = agent.state.runtime.activity_targets();
-    assert_eq!(
-        targets.len(),
-        1,
-        "Running Cat missing from activity targets"
-    );
-    let (cat_id, generation, connection) = targets.pop().unwrap();
-    assert_eq!(cat_id, WORK_PRODUCER_CAT);
-    assert_eq!(generation, WORK_PRODUCER_GENERATION);
-    let status = tokio::task::spawn_blocking(move || {
-        let mut guest = connection.connect()?;
-        guest.work_status(None, 0)
+fn cleanup_work_producer_job() -> NodeJob {
+    NodeJob {
+        job_id: job_id(WORK_PRODUCER_CAT, WORK_PRODUCER_GENERATION, "cleanup_cat"),
+        cat_generation: WORK_PRODUCER_GENERATION,
+        action: NodeJobAction::CleanupCat {
+            cat_id: WORK_PRODUCER_CAT.into(),
+        },
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct WorkProducerPids {
+    guest: u32,
+    blockd: u32,
+}
+
+fn work_producer_pids(runtime: &NodeRuntime) -> WorkProducerPids {
+    let path = runtime
+        .cfg
+        .state_dir
+        .path()
+        .join("runtime-ledger")
+        .join(format!("{WORK_PRODUCER_CAT}.json"));
+    let record: serde_json::Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+    let guest = u32::try_from(record["guest"]["pid"].as_u64().unwrap()).unwrap();
+    let blockds = record["blockds"].as_array().unwrap();
+    assert_eq!(blockds.len(), 1, "calibration Cat must own one blockd");
+    let blockd = u32::try_from(blockds[0]["proc"]["pid"].as_u64().unwrap()).unwrap();
+    assert_ne!(guest, blockd);
+    WorkProducerPids { guest, blockd }
+}
+
+fn process_exists(pid: u32) -> bool {
+    let pid = libc::pid_t::try_from(pid).unwrap();
+    // SAFETY: signal 0 sends no signal and copies the scalar pid. This probe
+    // never kills a process, including if the numeric pid was already reused.
+    let result = unsafe { libc::kill(pid, 0) };
+    if result == 0 {
+        return true;
+    }
+    match std::io::Error::last_os_error().raw_os_error() {
+        Some(libc::ESRCH) => false,
+        Some(libc::EPERM) => true,
+        error => panic!("probing pid {pid} failed with {error:?}"),
+    }
+}
+
+fn wait_for_exact_children_reaped(pids: WorkProducerPids) {
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while process_exists(pids.guest) || process_exists(pids.blockd) {
+        assert!(
+            Instant::now() < deadline,
+            "calibration children were not reaped: {pids:?}",
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    }
+}
+
+/// Owns the exact FakeVmm children from the instant StartCat succeeds. Its
+/// Drop path is deliberately assertion-free: it may run while another test
+/// assertion is already unwinding and must still attempt CleanupCat.
+struct RunningWorkProducer {
+    runtime: Arc<NodeRuntime>,
+    pids: Option<WorkProducerPids>,
+    armed: bool,
+}
+
+impl RunningWorkProducer {
+    fn start(runtime: Arc<NodeRuntime>) -> Self {
+        let result = runtime.execute(start_work_producer_job());
+        let mut producer = Self {
+            runtime,
+            pids: None,
+            armed: result.observed_state == ObservedState::Running,
+        };
+        assert_eq!(
+            result.observed_state,
+            ObservedState::Running,
+            "FakeVmm work producer did not start: {:?}",
+            result.error,
+        );
+        producer.pids = Some(work_producer_pids(&producer.runtime));
+        producer
+    }
+
+    fn calibrate(&self, inject_panic_after_status: bool) {
+        // This is the exact positive seam the removed watcher used: a Running
+        // runtime must be discoverable and its Guest must produce work status.
+        let mut targets = self.runtime.activity_targets();
+        assert_eq!(
+            targets.len(),
+            1,
+            "Running Cat missing from activity targets"
+        );
+        let (cat_id, generation, connection) = targets.pop().unwrap();
+        assert_eq!(cat_id, WORK_PRODUCER_CAT);
+        assert_eq!(generation, WORK_PRODUCER_GENERATION);
+        let status = connection
+            .connect()
+            .and_then(|mut guest| guest.work_status(None, 0))
+            .unwrap();
+        assert!(!status.source_epoch.is_empty());
+        if inject_panic_after_status {
+            panic!("injected work-producer calibration failure");
+        }
+    }
+
+    fn pids(&self) -> WorkProducerPids {
+        self.pids.expect("Running producer has recorded child pids")
+    }
+
+    async fn stop(mut self) {
+        let runtime = Arc::clone(&self.runtime);
+        let pids = self.pids();
+        let result = tokio::task::spawn_blocking(move || {
+            let result = runtime.execute(cleanup_work_producer_job());
+            if result.observed_state == ObservedState::Cold {
+                wait_for_exact_children_reaped(pids);
+            }
+            result
+        })
+        .await
+        .unwrap();
+        if result.observed_state == ObservedState::Cold {
+            self.armed = false;
+        }
+        assert_eq!(result.observed_state, ObservedState::Cold);
+    }
+}
+
+impl Drop for RunningWorkProducer {
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+        let runtime = Arc::clone(&self.runtime);
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
+            runtime.execute(cleanup_work_producer_job())
+        }));
+        self.armed = false;
+    }
+}
+
+async fn start_running_work_producer(
+    agent: &cats_node_agent::server::Handle,
+) -> RunningWorkProducer {
+    let runtime = Arc::clone(&agent.state.runtime);
+    tokio::task::spawn_blocking(move || {
+        let producer = RunningWorkProducer::start(runtime);
+        producer.calibrate(false);
+        producer
     })
     .await
     .unwrap()
-    .unwrap();
-    assert!(!status.source_epoch.is_empty());
-}
-
-async fn stop_running_work_producer(agent: &cats_node_agent::server::Handle) {
-    let runtime = Arc::clone(&agent.state.runtime);
-    let result = tokio::task::spawn_blocking(move || {
-        runtime.execute(NodeJob {
-            job_id: job_id(WORK_PRODUCER_CAT, WORK_PRODUCER_GENERATION, "cleanup_cat"),
-            cat_generation: WORK_PRODUCER_GENERATION,
-            action: NodeJobAction::CleanupCat {
-                cat_id: WORK_PRODUCER_CAT.into(),
-            },
-        })
-    })
-    .await
-    .unwrap();
-    assert_eq!(result.observed_state, ObservedState::Cold);
 }
 
 /// A wedged upload remains bounded to its own task.
@@ -334,13 +444,41 @@ async fn usage_upload_runs_on_its_own_channel() {
     let dir = TempDirFixture::new();
     let (cp, url) = start_mock(false).await;
     let agent = start_agent(&dir, url).await;
-    start_running_work_producer(&agent).await;
+    let producer = start_running_work_producer(&agent).await;
 
     tokio::time::sleep(Duration::from_millis(HEARTBEAT_MS * 10)).await;
-    stop_running_work_producer(&agent).await;
+    producer.stop().await;
     assert!(
         cp.usage_attempts.load(Ordering::SeqCst) >= 1,
         "decoupling must not mean the upload stops happening"
     );
     assert_signed_registration_without_legacy_posts(&cp);
+}
+
+#[test]
+fn panicking_calibration_reaps_its_exact_fakevmm_children() {
+    let dir = TempDirFixture::new();
+    let runtime = Arc::new(
+        NodeRuntime::new(fake_node_config!(NodeConfigBuilder::new(
+            dir.path(),
+            "node_panic_cleanup",
+        )))
+        .unwrap(),
+    );
+    let observed_pids = Arc::new(Mutex::new(None));
+    let capture = Arc::clone(&observed_pids);
+    let panic = std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
+        let producer = RunningWorkProducer::start(runtime);
+        *capture.lock().unwrap() = Some(producer.pids());
+        producer.calibrate(true);
+    }));
+    assert!(panic.is_err(), "calibration failure was not injected");
+
+    let pids = observed_pids
+        .lock()
+        .unwrap()
+        .expect("calibration did not record exact child pids");
+    wait_for_exact_children_reaped(pids);
+    assert!(!process_exists(pids.guest), "Guest pid survived unwind");
+    assert!(!process_exists(pids.blockd), "blockd pid survived unwind");
 }
