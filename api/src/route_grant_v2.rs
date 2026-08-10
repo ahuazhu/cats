@@ -14,7 +14,8 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest as _, Sha256};
 
 use crate::runtime_reconciliation::{
-    Epoch, Hostname, HttpProtocol, Id, KeyId, NodeTransportTarget, RandomId128, Sha256Digest,
+    key_ring_digest, Base64UrlNoPad, ContractVersion, Epoch, Hostname, HttpProtocol, Id, KeyId,
+    NodeTransportTarget, RandomId128, Sha256Digest,
 };
 
 pub const ROUTE_GRANT_V2_VERSION: u8 = 2;
@@ -39,6 +40,260 @@ pub const ROUTE_RESOLVE_V2_REQUEST_MAX_WIRE_BYTES: usize = 512;
 pub const ROUTE_RESOLVE_V2_RESPONSE_MAX_WIRE_BYTES: usize = 8192;
 pub const ROUTE_RESOLVE_V2_DEADLINE_MILLIS: u64 = 2_000;
 pub const MAX_ROUTE_GRANT_V2_RING_KEYS: usize = 8;
+pub const ROUTE_GRANT_V2_ARTIFACT_MAX_WIRE_BYTES: usize = 16_384;
+pub const ROUTE_GRANT_V2_ARTIFACT_DIRECTORY: &str = "/etc/cats/route-v2";
+pub const ROUTE_GRANT_V2_SIGNER_REFERENCE_PATH: &str = "/etc/cats/route-v2/signer.v1.json";
+pub const ROUTE_GRANT_V2_SIGNER_PRIVATE_KEY_PATH: &str =
+    "/etc/cats/route-v2/signer-private-key.pem";
+pub const ROUTE_GRANT_V2_PUBLIC_KEY_RING_PATH: &str = "/etc/cats/route-v2/public-key-ring.v1.json";
+
+/// Exact previous public-ring pointer used by the installer to reject a stale,
+/// conflicting or skipped rotation before replacing the current artifact.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RouteGrantV2PublicKeyRingExpectedPrevious {
+    pub ring_version: Epoch,
+    pub key_ring_digest: Sha256Digest,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RouteGrantV2PublicKeyEntry {
+    pub kid: KeyId,
+    pub public_key_spki: Base64UrlNoPad,
+}
+
+/// Canonical, non-secret public-key ring installed on Control and every Node.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RouteGrantV2PublicKeyRingArtifact {
+    pub version: ContractVersion,
+    pub ring_version: Epoch,
+    pub expected_previous: Option<RouteGrantV2PublicKeyRingExpectedPrevious>,
+    pub keys: Vec<RouteGrantV2PublicKeyEntry>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RouteGrantV2SignerExpectedPrevious {
+    pub signer_revision: Epoch,
+    pub signer_reference_sha256: Sha256Digest,
+}
+
+/// The private-key selection is explicit so emergency disable never depends
+/// on deleting a secret file or interpreting an absent local value.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "state", rename_all = "snake_case", deny_unknown_fields)]
+pub enum RouteGrantV2SignerSelection {
+    Disabled,
+    Active {
+        active_kid: KeyId,
+        secret_reference_id: Id,
+    },
+}
+
+/// Canonical, non-secret Control artifact naming one independent Route v2
+/// signer lineage and the exact public ring distributed to Nodes.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RouteGrantV2SignerReference {
+    pub version: ContractVersion,
+    pub deployment_id: Id,
+    pub signer_revision: Epoch,
+    pub expected_previous: Option<RouteGrantV2SignerExpectedPrevious>,
+    pub signer: RouteGrantV2SignerSelection,
+    pub public_key_ring_version: Epoch,
+    pub public_key_ring_digest: Sha256Digest,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+pub enum RouteGrantV2ArtifactError {
+    #[error("Route Grant v2 artifact exceeds its wire-byte limit")]
+    WireTooLarge,
+    #[error("Route Grant v2 artifact is malformed")]
+    Malformed,
+    #[error("Route Grant v2 artifact is not the canonical encoding")]
+    NonCanonical,
+    #[error("Route Grant v2 artifact version or previous pointer is invalid")]
+    InvalidLineage,
+    #[error("Route Grant v2 public-key ring exceeds its key bound")]
+    TooManyKeys,
+    #[error("Route Grant v2 public-key ring is not strictly ordered")]
+    InvalidKeyOrder,
+    #[error("Route Grant v2 public key is not canonical Ed25519 SPKI")]
+    InvalidPublicKey,
+    #[error("Route Grant v2 public key does not match its kid")]
+    KeyIdMismatch,
+    #[error("Route Grant v2 signer does not bind the exact installed public ring")]
+    RingMismatch,
+    #[error("Route Grant v2 active signer kid is absent from the installed public ring")]
+    ActiveKeyMissing,
+}
+
+impl RouteGrantV2PublicKeyRingArtifact {
+    pub fn validate(&self) -> Result<(), RouteGrantV2ArtifactError> {
+        if self.version != ContractVersion::V1 || !previous_ring_is_adjacent(self) {
+            return Err(RouteGrantV2ArtifactError::InvalidLineage);
+        }
+        if self.keys.len() > MAX_ROUTE_GRANT_V2_RING_KEYS {
+            return Err(RouteGrantV2ArtifactError::TooManyKeys);
+        }
+        let mut previous_kid: Option<&KeyId> = None;
+        for entry in &self.keys {
+            if previous_kid.is_some_and(|previous| previous >= &entry.kid) {
+                return Err(RouteGrantV2ArtifactError::InvalidKeyOrder);
+            }
+            let public = RouteGrantV2PublicKey::from_base64url_spki(&entry.public_key_spki)
+                .map_err(|_| RouteGrantV2ArtifactError::InvalidPublicKey)?;
+            if public.kid() != &entry.kid {
+                return Err(RouteGrantV2ArtifactError::KeyIdMismatch);
+            }
+            previous_kid = Some(&entry.kid);
+        }
+        Ok(())
+    }
+
+    pub fn digest(&self) -> Result<Sha256Digest, RouteGrantV2ArtifactError> {
+        self.validate()?;
+        let loaded_kids = self
+            .keys
+            .iter()
+            .map(|entry| entry.kid.clone())
+            .collect::<Vec<_>>();
+        key_ring_digest(self.ring_version, &loaded_kids)
+            .map_err(|_| RouteGrantV2ArtifactError::InvalidKeyOrder)
+    }
+
+    pub fn public_keys(&self) -> Result<Vec<RouteGrantV2PublicKey>, RouteGrantV2ArtifactError> {
+        self.validate()?;
+        self.keys
+            .iter()
+            .map(|entry| {
+                RouteGrantV2PublicKey::from_base64url_spki(&entry.public_key_spki)
+                    .map_err(|_| RouteGrantV2ArtifactError::InvalidPublicKey)
+            })
+            .collect()
+    }
+
+    pub fn key(&self, kid: &KeyId) -> Option<&RouteGrantV2PublicKeyEntry> {
+        self.keys
+            .binary_search_by(|entry| entry.kid.cmp(kid))
+            .ok()
+            .map(|index| &self.keys[index])
+    }
+}
+
+impl RouteGrantV2SignerReference {
+    pub fn validate(&self) -> Result<(), RouteGrantV2ArtifactError> {
+        if self.version != ContractVersion::V1 || !previous_signer_is_adjacent(self) {
+            return Err(RouteGrantV2ArtifactError::InvalidLineage);
+        }
+        Ok(())
+    }
+
+    pub fn validate_ring(
+        &self,
+        ring: &RouteGrantV2PublicKeyRingArtifact,
+    ) -> Result<(), RouteGrantV2ArtifactError> {
+        self.validate()?;
+        ring.validate()?;
+        if self.public_key_ring_version != ring.ring_version
+            || self.public_key_ring_digest != ring.digest()?
+        {
+            return Err(RouteGrantV2ArtifactError::RingMismatch);
+        }
+        if let RouteGrantV2SignerSelection::Active { active_kid, .. } = &self.signer {
+            if ring.key(active_kid).is_none() {
+                return Err(RouteGrantV2ArtifactError::ActiveKeyMissing);
+            }
+        }
+        Ok(())
+    }
+
+    pub fn digest(&self) -> Result<Sha256Digest, RouteGrantV2ArtifactError> {
+        let bytes = encode_route_grant_v2_signer_reference(self)?;
+        Ok(Sha256Digest::from_bytes(Sha256::digest(bytes).into()))
+    }
+}
+
+fn previous_ring_is_adjacent(ring: &RouteGrantV2PublicKeyRingArtifact) -> bool {
+    match (ring.ring_version.get(), &ring.expected_previous) {
+        (1, None) => true,
+        (1, Some(_)) | (_, None) => false,
+        (revision, Some(previous)) => previous
+            .ring_version
+            .get()
+            .checked_add(1)
+            .is_some_and(|next| next == revision),
+    }
+}
+
+fn previous_signer_is_adjacent(reference: &RouteGrantV2SignerReference) -> bool {
+    match (
+        reference.signer_revision.get(),
+        &reference.expected_previous,
+    ) {
+        (1, None) => true,
+        (1, Some(_)) | (_, None) => false,
+        (revision, Some(previous)) => previous
+            .signer_revision
+            .get()
+            .checked_add(1)
+            .is_some_and(|next| next == revision),
+    }
+}
+
+pub fn encode_route_grant_v2_public_key_ring(
+    value: &RouteGrantV2PublicKeyRingArtifact,
+) -> Result<Vec<u8>, RouteGrantV2ArtifactError> {
+    value.validate()?;
+    encode_route_artifact(value)
+}
+
+pub fn decode_route_grant_v2_public_key_ring(
+    bytes: &[u8],
+) -> Result<RouteGrantV2PublicKeyRingArtifact, RouteGrantV2ArtifactError> {
+    let value: RouteGrantV2PublicKeyRingArtifact = decode_route_artifact(bytes)?;
+    value.validate()?;
+    Ok(value)
+}
+
+pub fn encode_route_grant_v2_signer_reference(
+    value: &RouteGrantV2SignerReference,
+) -> Result<Vec<u8>, RouteGrantV2ArtifactError> {
+    value.validate()?;
+    encode_route_artifact(value)
+}
+
+pub fn decode_route_grant_v2_signer_reference(
+    bytes: &[u8],
+) -> Result<RouteGrantV2SignerReference, RouteGrantV2ArtifactError> {
+    let value: RouteGrantV2SignerReference = decode_route_artifact(bytes)?;
+    value.validate()?;
+    Ok(value)
+}
+
+fn encode_route_artifact<T: Serialize>(value: &T) -> Result<Vec<u8>, RouteGrantV2ArtifactError> {
+    let bytes = serde_json::to_vec(value).map_err(|_| RouteGrantV2ArtifactError::Malformed)?;
+    if bytes.len() > ROUTE_GRANT_V2_ARTIFACT_MAX_WIRE_BYTES {
+        return Err(RouteGrantV2ArtifactError::WireTooLarge);
+    }
+    Ok(bytes)
+}
+
+fn decode_route_artifact<T: DeserializeOwned + Serialize>(
+    bytes: &[u8],
+) -> Result<T, RouteGrantV2ArtifactError> {
+    if bytes.len() > ROUTE_GRANT_V2_ARTIFACT_MAX_WIRE_BYTES {
+        return Err(RouteGrantV2ArtifactError::WireTooLarge);
+    }
+    let value = serde_json::from_slice(bytes).map_err(|_| RouteGrantV2ArtifactError::Malformed)?;
+    let canonical = serde_json::to_vec(&value).map_err(|_| RouteGrantV2ArtifactError::Malformed)?;
+    if canonical != bytes {
+        return Err(RouteGrantV2ArtifactError::NonCanonical);
+    }
+    Ok(value)
+}
 
 /// Canonical, body-bound input to the authenticated Control resolve service.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -549,6 +804,15 @@ pub struct RouteGrantV2PublicKey {
 }
 
 impl RouteGrantV2PublicKey {
+    pub fn from_base64url_spki(
+        public_key_spki: &Base64UrlNoPad,
+    ) -> Result<Self, RouteGrantV2Error> {
+        let der = URL_SAFE_NO_PAD
+            .decode(public_key_spki.as_str())
+            .map_err(|_| RouteGrantV2Error::InvalidPublicKey)?;
+        Self::from_spki_der(&der)
+    }
+
     pub fn from_spki_der(spki_der: &[u8]) -> Result<Self, RouteGrantV2Error> {
         let raw_public_key = spki_der
             .strip_prefix(&ED25519_SPKI_PREFIX)
@@ -584,6 +848,13 @@ impl RouteGrantV2PublicKey {
 
     pub fn kid(&self) -> &KeyId {
         &self.kid
+    }
+
+    pub fn spki_der(&self) -> [u8; ED25519_SPKI_PREFIX.len() + ED25519_PUBLIC_KEY_BYTES] {
+        let mut spki_der = [0_u8; ED25519_SPKI_PREFIX.len() + ED25519_PUBLIC_KEY_BYTES];
+        spki_der[..ED25519_SPKI_PREFIX.len()].copy_from_slice(&ED25519_SPKI_PREFIX);
+        spki_der[ED25519_SPKI_PREFIX.len()..].copy_from_slice(&self.raw_public_key);
+        spki_der
     }
 
     pub fn verify<'a>(
@@ -653,6 +924,35 @@ mod tests {
     const PRIVATE_KEY: &[u8] =
         include_bytes!("../../tests/fixtures/route_grant_private_ed25519.pem");
     const PUBLIC_KEY: &[u8] = include_bytes!("../../tests/fixtures/route_grant_public_ed25519.pem");
+    const PUBLIC_KEY_SPKI: &str = "MCowBQYDK2VwAyEA2-Jj2UvNCvQiUPNYRgSi0cJSPiJI6Rs6D0UTeEpQVj8";
+    const PUBLIC_KEY_KID: &str = "fd56fed3251463eff0063169a7f8fa9dce585b6eee429581264297c98ec58bcb";
+
+    fn public_ring() -> RouteGrantV2PublicKeyRingArtifact {
+        RouteGrantV2PublicKeyRingArtifact {
+            version: ContractVersion::V1,
+            ring_version: Epoch::new(1).unwrap(),
+            expected_previous: None,
+            keys: vec![RouteGrantV2PublicKeyEntry {
+                kid: KeyId::new(PUBLIC_KEY_KID).unwrap(),
+                public_key_spki: Base64UrlNoPad::new(PUBLIC_KEY_SPKI).unwrap(),
+            }],
+        }
+    }
+
+    fn signer_reference() -> RouteGrantV2SignerReference {
+        RouteGrantV2SignerReference {
+            version: ContractVersion::V1,
+            deployment_id: Id::new("route_deployment_a").unwrap(),
+            signer_revision: Epoch::new(1).unwrap(),
+            expected_previous: None,
+            signer: RouteGrantV2SignerSelection::Active {
+                active_kid: KeyId::new(PUBLIC_KEY_KID).unwrap(),
+                secret_reference_id: Id::new("route_secret_a").unwrap(),
+            },
+            public_key_ring_version: Epoch::new(1).unwrap(),
+            public_key_ring_digest: public_ring().digest().unwrap(),
+        }
+    }
 
     fn claims() -> RouteGrantV2Claims {
         RouteGrantV2Claims {
@@ -930,6 +1230,138 @@ mod tests {
         assert_eq!(
             RouteGrantV2PublicKey::from_spki_der(&[0_u8; 44]).err(),
             Some(RouteGrantV2Error::InvalidPublicKey)
+        );
+        let from_artifact = RouteGrantV2PublicKey::from_base64url_spki(
+            &Base64UrlNoPad::new(PUBLIC_KEY_SPKI).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(from_artifact.kid(), public.kid());
+        assert_eq!(
+            RouteGrantV2PublicKey::from_spki_der(&from_artifact.spki_der())
+                .unwrap()
+                .kid(),
+            public.kid()
+        );
+    }
+
+    #[test]
+    fn signing_authority_artifacts_have_exact_canonical_vectors() {
+        let ring = public_ring();
+        let ring_bytes = encode_route_grant_v2_public_key_ring(&ring).unwrap();
+        assert_eq!(ring_bytes.len(), 219);
+        assert_eq!(
+            ring_bytes,
+            br#"{"version":1,"ring_version":1,"expected_previous":null,"keys":[{"kid":"fd56fed3251463eff0063169a7f8fa9dce585b6eee429581264297c98ec58bcb","public_key_spki":"MCowBQYDK2VwAyEA2-Jj2UvNCvQiUPNYRgSi0cJSPiJI6Rs6D0UTeEpQVj8"}]}"#
+        );
+        assert_eq!(
+            ring.digest().unwrap().as_str(),
+            "sha256:4e6fec49756e03044438af279f7bfd9507f06cf065ff0673447bd6377cd07ac0"
+        );
+        assert_eq!(
+            Sha256Digest::from_bytes(Sha256::digest(&ring_bytes).into()).as_str(),
+            "sha256:614059d6616d068e7d210da2c26a15cfb42c0d3933a7144670d13c658b1bb2c8"
+        );
+        assert_eq!(
+            decode_route_grant_v2_public_key_ring(&ring_bytes).unwrap(),
+            ring
+        );
+
+        let reference = signer_reference();
+        reference.validate_ring(&ring).unwrap();
+        let reference_bytes = encode_route_grant_v2_signer_reference(&reference).unwrap();
+        assert_eq!(reference_bytes.len(), 369);
+        assert_eq!(
+            reference_bytes,
+            br#"{"version":1,"deployment_id":"route_deployment_a","signer_revision":1,"expected_previous":null,"signer":{"state":"active","active_kid":"fd56fed3251463eff0063169a7f8fa9dce585b6eee429581264297c98ec58bcb","secret_reference_id":"route_secret_a"},"public_key_ring_version":1,"public_key_ring_digest":"sha256:4e6fec49756e03044438af279f7bfd9507f06cf065ff0673447bd6377cd07ac0"}"#
+        );
+        assert_eq!(
+            reference.digest().unwrap().as_str(),
+            "sha256:c2c83d723f0bcd83560a19eadecbd64d574c7d0332c50700bea3bd8cb3f5da5c"
+        );
+        assert_eq!(
+            decode_route_grant_v2_signer_reference(&reference_bytes).unwrap(),
+            reference
+        );
+    }
+
+    #[test]
+    fn signing_authority_artifacts_reject_open_or_conflicting_lineage() {
+        let mut ring = public_ring();
+        ring.ring_version = Epoch::new(2).unwrap();
+        assert_eq!(
+            ring.validate(),
+            Err(RouteGrantV2ArtifactError::InvalidLineage)
+        );
+        ring.expected_previous = Some(RouteGrantV2PublicKeyRingExpectedPrevious {
+            ring_version: Epoch::new(1).unwrap(),
+            key_ring_digest: public_ring().digest().unwrap(),
+        });
+        ring.validate().unwrap();
+
+        let other = RouteGrantV2PublicKeyEntry {
+            kid: KeyId::new("47ff3f28dd2cc185ac432f34ecc346a121c52934b16993ab9fb7fcb92a3406f8")
+                .unwrap(),
+            public_key_spki: Base64UrlNoPad::new(
+                "MCowBQYDK2VwAyEAJJHj__Po94RauBD2QsCa8LKrwcrVFdomZbKbCGBbvuk",
+            )
+            .unwrap(),
+        };
+        ring.keys.insert(0, other.clone());
+        ring.validate().unwrap();
+        ring.keys.swap(0, 1);
+        assert_eq!(
+            ring.validate(),
+            Err(RouteGrantV2ArtifactError::InvalidKeyOrder)
+        );
+        ring.keys = vec![other; MAX_ROUTE_GRANT_V2_RING_KEYS + 1];
+        assert_eq!(ring.validate(), Err(RouteGrantV2ArtifactError::TooManyKeys));
+
+        let mut wrong_kid = public_ring();
+        wrong_kid.keys[0].kid = KeyId::new("0".repeat(64)).unwrap();
+        assert_eq!(
+            wrong_kid.validate(),
+            Err(RouteGrantV2ArtifactError::KeyIdMismatch)
+        );
+        let mut wrong_spki = public_ring();
+        wrong_spki.keys[0].public_key_spki = Base64UrlNoPad::new("AA").unwrap();
+        assert_eq!(
+            wrong_spki.validate(),
+            Err(RouteGrantV2ArtifactError::InvalidPublicKey)
+        );
+
+        let mut reference = signer_reference();
+        reference.public_key_ring_digest = Sha256Digest::from_bytes([0; 32]);
+        assert_eq!(
+            reference.validate_ring(&public_ring()),
+            Err(RouteGrantV2ArtifactError::RingMismatch)
+        );
+        reference = signer_reference();
+        reference.signer = RouteGrantV2SignerSelection::Active {
+            active_kid: KeyId::new("0".repeat(64)).unwrap(),
+            secret_reference_id: Id::new("route_secret_b").unwrap(),
+        };
+        assert_eq!(
+            reference.validate_ring(&public_ring()),
+            Err(RouteGrantV2ArtifactError::ActiveKeyMissing)
+        );
+        reference = signer_reference();
+        reference.signer_revision = Epoch::new(2).unwrap();
+        assert_eq!(
+            reference.validate(),
+            Err(RouteGrantV2ArtifactError::InvalidLineage)
+        );
+
+        let noncanonical = br#"{"ring_version":1,"version":1,"expected_previous":null,"keys":[]}"#;
+        assert_eq!(
+            decode_route_grant_v2_public_key_ring(noncanonical),
+            Err(RouteGrantV2ArtifactError::NonCanonical)
+        );
+        assert_eq!(
+            decode_route_grant_v2_public_key_ring(&vec![
+                b'x';
+                ROUTE_GRANT_V2_ARTIFACT_MAX_WIRE_BYTES + 1
+            ]),
+            Err(RouteGrantV2ArtifactError::WireTooLarge)
         );
     }
 }
