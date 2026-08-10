@@ -21,6 +21,7 @@ use crate::store::{
 const SINGLETON_ELECTION_RETRY: Duration = Duration::from_millis(500);
 const SINGLETON_HEALTH_INTERVAL: Duration = Duration::from_secs(1);
 const RUNTIME_SPINE_GLOBAL_IN_FLIGHT: usize = 64;
+const ROUTE_RESOLVE_V2_GLOBAL_IN_FLIGHT: usize = 32;
 const RUNTIME_VOLUME_TRANSITION_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// Non-authoritative, per-replica admission for signed A19/A20 Node ingress.
@@ -463,6 +464,9 @@ pub struct AppState {
     pub cfg: Arc<Config>,
     pub(crate) agent_session_registration_policy: Arc<crate::store::AgentSessionRegistrationPolicy>,
     pub(crate) runtime_spine_admission: Arc<RuntimeSpineAdmission>,
+    /// Per-replica work bound for the machine-authenticated Route Grant v2
+    /// resolve lane. Authentication is checked before a permit is acquired.
+    pub(crate) route_resolve_admission: Arc<tokio::sync::Semaphore>,
     pub(crate) runtime_volume_transition_admission: Arc<RuntimeSpineAdmission>,
     pub(crate) runtime_volume_transition_service: Arc<RuntimeVolumeTransitionService>,
     pub(crate) runtime_node_authority:
@@ -909,6 +913,9 @@ async fn spawn_inner(cfg: Config, legacy_node_runtime_for_tests: bool) -> anyhow
         cfg: cfg.clone(),
         agent_session_registration_policy,
         runtime_spine_admission: Arc::new(RuntimeSpineAdmission::new()),
+        route_resolve_admission: Arc::new(tokio::sync::Semaphore::new(
+            ROUTE_RESOLVE_V2_GLOBAL_IN_FLIGHT,
+        )),
         runtime_volume_transition_admission: Arc::new(RuntimeSpineAdmission::new()),
         runtime_volume_transition_service: Arc::new(RuntimeVolumeTransitionService::new()),
         legacy_node_runtime_for_tests,

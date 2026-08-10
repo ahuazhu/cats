@@ -1,6 +1,7 @@
 # Route Grant v2
 
-- 状态：Target contract；尚未实现
+- 状态：Target contract；shared codec、Control resolve handler 与 Node verification/admission core
+  分阶段实现，production machine transports 与 public proxy 仍保持关闭
 - Authority：[ADR-0041](../decisions/0041-node-verified-route-admission.md)
 - Runtime identity：[Runtime Reconciliation v1](runtime-reconciliation-v1.md)
 - Runtime accepted facts：[Runtime Inventory and Observation Spine v1](runtime-inventory-observation-v1.md)
@@ -149,6 +150,51 @@ Gateway -> Control Plane resolve 和 Gateway -> Node hop 必须使用独立的 w
 并全程加密；Node 同时要求可信 Gateway identity 和有效 Grant。Grant 放在保留的内部字段，进入
 Guest 前删除，不能发送给浏览器。日志、trace、错误页和 qualification evidence 都不能包含 token、
 signature、private key、Cookie 或用户 Authorization。
+
+### 4.1 Control resolve HTTP frame
+
+machine transport 完成身份认证后，只能把不可由HTTP字段构造的typed Gateway principal注入handler；
+handler在读取body、取得admission permit或访问PostgreSQL前要求该principal。resolve frame冻结为：
+
+- method/path精确为`POST /v1/internal/routes/resolve`，不得带query；它与legacy
+  `/v1/routes/resolve`完全不同，也不接受legacy wake、Node URL或shared bearer；
+- request/response media type精确为`application/json`，不接受content encoding、media parameter、
+  `Authorization`、`Cookie`、条件或method-override headers；request body最多512 bytes，完整deadline
+  从headers到最终response为2000ms；
+- request是canonical JSON `{"version":2,"hostname":"app.cats.run"}`。decoder拒绝非canonical
+  member order/whitespace、重复或未知字段；
+- success最多8192 bytes，canonical JSON字段依次是`version`、`endpoint_id`、
+  `node_transport_target`、`expires_at_unix_seconds`、`opaque_grant`、`grant_sha256`。Gateway只校验
+  strict A23 target、expiry range、opaque grant ASCII/4096-byte bound和`SHA-256(opaque_grant)`；不解析
+  protected header、claims或签名；
+- authenticated authority outcome精确映射为`200` success，`404 not_found`、`410 gone`、
+  `409 wake_required|pending`、`503 unavailable`。认证失败为`401 authentication_failed`；frame错误为
+  `400/405/406/413/415 invalid_request`；stored/internal错误为`500 internal`。所有response带
+  `Cache-Control: no-store`；`405`带`Allow: POST`，`503`带`Retry-After: 1`；不redirect；
+- per-replica resolve semaphore与body/deadline是资源界，不是authority。client取消不会产生durable route
+  workflow；签名response丢失后普通重试重新闭合当前snapshot，不复用丢失token。
+
+当前repository尚无能满足本节的Gateway workload credential authority，故production listener不会构造
+typed principal，普通Control组合固定在pre-body/pre-PG `401`。后续Accepted authority必须至少冻结：
+
+1. 独立Gateway workload ID、不可复用credential ID、credential lineage与current/revoked状态；
+2. Control与Node各自的current allow policy，以及TLS peer proof到该精确credential的绑定；
+3. verifier-first rotation overlap、撤销、重启加载失败和credential丢失的fail-closed行为；
+4. Control与Node encrypted listener的trust root、部署artifact固定路径/权限以及rotation ACK证据。
+
+A19只授权Node到Control，A23只授权deployment provisioner写placement policy；两者都不能授权Gateway。
+legacy shared bearer、`nodes.agent_url`、HTTP header自报principal、推测的SPIFFE/SAN或云IAM映射都不是
+fallback。在该新authority Accepted并组成listener前，test principal只能用于显式test router。
+
+### 4.2 Node admission frame的冻结边界
+
+Node typed failure envelope已经冻结为canonical JSON
+`{"version":2,"guard_acquired":false,"reason":"expired"}`及§8闭集；只有
+`UpstreamUnavailable`允许`guard_acquired=true`。但完整Gateway->Node HTTPS request frame尚不能从现有
+authority推导：Gateway credential/trust、内部grant保留字段、public request header/body streaming、
+upgrade、deadline、取消以及guard与proxy lifetime的组合仍未冻结。实现不得增加裸Grant preflight，
+也不得借legacy Node HTTP/shared bearer旁路；Node verification/admission core保持可组合但production
+HTTPS route/listener关闭，直到同一Accepted合同闭合这些边界。
 
 ## 5. Gateway cache
 

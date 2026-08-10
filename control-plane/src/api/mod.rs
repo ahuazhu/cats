@@ -49,6 +49,7 @@ mod disks;
 mod endpoints;
 mod nodes;
 mod operations;
+pub(crate) mod route_resolve_v2;
 mod routes;
 pub(crate) mod runtime_node_authority;
 mod runtime_spine;
@@ -548,6 +549,14 @@ pub fn router(state: AppState) -> Router {
                     .fallback(runtime_volume_transitions::evidence),
             )
     };
+    let route_resolve_v2 = Router::<AppState>::new()
+        .route(
+            "/v1/internal/routes/resolve",
+            post(route_resolve_v2::resolve).fallback(route_resolve_v2::resolve),
+        )
+        .layer(axum::Extension(std::sync::Arc::new(
+            route_resolve_v2::RouteResolveV2Service::from_app_state(&state),
+        )));
 
     Router::new()
         .route("/", get(crate::ui::portal))
@@ -657,6 +666,7 @@ pub fn router(state: AppState) -> Router {
         .route("/v1/billing/stripe/webhook", post(stripe_webhook))
         .route("/v1/admin/workspaces", get(admin_list_workspaces))
         .merge(runtime_volume_authority)
+        .merge(route_resolve_v2)
         .merge(legacy_authority)
         .fallback(crate::ui::not_found)
         .with_state(state)
@@ -835,6 +845,7 @@ POST /v1/admin/nodes/{id}/actions/{verb}
 POST /v1/admin/runtime/node-authority-applies
 POST /v1/auth/logout
 POST /v1/billing/stripe/webhook
+POST /v1/internal/routes/resolve
 POST /v1/internal/runtime/agent-sessions
 POST /v1/internal/runtime/desired-reads
 POST /v1/internal/runtime/observations

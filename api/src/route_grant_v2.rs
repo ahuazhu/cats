@@ -9,10 +9,13 @@
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use base64::Engine as _;
 use ring::signature;
+use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest as _, Sha256};
 
-use crate::runtime_reconciliation::{Epoch, Hostname, HttpProtocol, Id, KeyId, RandomId128};
+use crate::runtime_reconciliation::{
+    Epoch, Hostname, HttpProtocol, Id, KeyId, NodeTransportTarget, RandomId128, Sha256Digest,
+};
 
 pub const ROUTE_GRANT_V2_VERSION: u8 = 2;
 pub const ROUTE_GRANT_V2_ISSUER: &str = "cats-control-plane";
@@ -24,6 +27,278 @@ pub const MAX_ROUTE_GRANT_V2_CLOCK_SKEW_SECONDS: u64 = 5;
 pub const MAX_ROUTE_GRANT_V2_COMPACT_BYTES: usize = 4096;
 pub const MAX_ROUTE_GRANT_V2_HEADER_BYTES: usize = 512;
 pub const MAX_ROUTE_GRANT_V2_PAYLOAD_BYTES: usize = 2048;
+
+/// Exact Control resolve method once a Gateway machine-auth transport is
+/// composed around the handler.
+pub const ROUTE_RESOLVE_V2_METHOD: &str = "POST";
+/// Exact Control resolve path. It is deliberately disjoint from the retired
+/// `/v1/routes/resolve` public/shared-bearer surface.
+pub const ROUTE_RESOLVE_V2_PATH: &str = "/v1/internal/routes/resolve";
+pub const ROUTE_V2_JSON_CONTENT_TYPE: &str = "application/json";
+pub const ROUTE_RESOLVE_V2_REQUEST_MAX_WIRE_BYTES: usize = 512;
+pub const ROUTE_RESOLVE_V2_RESPONSE_MAX_WIRE_BYTES: usize = 8192;
+pub const ROUTE_RESOLVE_V2_DEADLINE_MILLIS: u64 = 2_000;
+pub const MAX_ROUTE_GRANT_V2_RING_KEYS: usize = 8;
+
+/// Canonical, body-bound input to the authenticated Control resolve service.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RouteResolveV2Request {
+    pub version: u8,
+    pub hostname: Hostname,
+}
+
+/// Positive authenticated Control envelope. `opaque_grant` is intentionally
+/// a string rather than [`RouteGrantV2Compact`]: Gateway must never parse it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RouteResolveV2Success {
+    pub version: u8,
+    pub endpoint_id: Id,
+    pub node_transport_target: NodeTransportTarget,
+    pub expires_at_unix_seconds: u64,
+    pub opaque_grant: String,
+    pub grant_sha256: Sha256Digest,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RouteResolveV2RejectionCode {
+    AuthenticationFailed,
+    InvalidRequest,
+    NotFound,
+    Gone,
+    WakeRequired,
+    Pending,
+    Unavailable,
+    Internal,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RouteResolveV2Rejection {
+    pub version: u8,
+    pub code: RouteResolveV2RejectionCode,
+}
+
+/// Closed Node-to-Gateway failure set. Every value except
+/// `UpstreamUnavailable` is a pre-admission result and therefore proves that
+/// no guard was acquired and no Guest byte was touched.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RouteAdmissionV2Reason {
+    Expired,
+    NotYetValid,
+    BindingMismatch,
+    GateClosed,
+    RuntimeNotReady,
+    UnknownKey,
+    InvalidSignature,
+    InvalidClaims,
+    UpstreamUnavailable,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RouteAdmissionV2Failure {
+    pub version: u8,
+    pub guard_acquired: bool,
+    pub reason: RouteAdmissionV2Reason,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+pub enum RouteV2EnvelopeError {
+    #[error("Route v2 envelope exceeds its wire-byte limit")]
+    WireTooLarge,
+    #[error("Route v2 envelope is malformed")]
+    Malformed,
+    #[error("Route v2 envelope is not the canonical encoding")]
+    NonCanonical,
+    #[error("Route v2 envelope fields are invalid")]
+    Invalid,
+}
+
+impl RouteResolveV2Request {
+    pub fn new(hostname: Hostname) -> Self {
+        Self {
+            version: ROUTE_GRANT_V2_VERSION,
+            hostname,
+        }
+    }
+}
+
+impl RouteResolveV2Success {
+    pub fn new(
+        endpoint_id: Id,
+        node_transport_target: NodeTransportTarget,
+        expires_at_unix_seconds: u64,
+        opaque_grant: String,
+    ) -> Result<Self, RouteV2EnvelopeError> {
+        let grant_sha256 = Sha256Digest::from_bytes(Sha256::digest(opaque_grant.as_bytes()).into());
+        let value = Self {
+            version: ROUTE_GRANT_V2_VERSION,
+            endpoint_id,
+            node_transport_target,
+            expires_at_unix_seconds,
+            opaque_grant,
+            grant_sha256,
+        };
+        value.validate()?;
+        Ok(value)
+    }
+
+    pub fn validate(&self) -> Result<(), RouteV2EnvelopeError> {
+        if self.version != ROUTE_GRANT_V2_VERSION
+            || self.expires_at_unix_seconds > i64::MAX as u64
+            || self.opaque_grant.is_empty()
+            || self.opaque_grant.len() > MAX_ROUTE_GRANT_V2_COMPACT_BYTES
+            || !self.opaque_grant.is_ascii()
+            || self.grant_sha256
+                != Sha256Digest::from_bytes(Sha256::digest(self.opaque_grant.as_bytes()).into())
+        {
+            return Err(RouteV2EnvelopeError::Invalid);
+        }
+        Ok(())
+    }
+}
+
+impl RouteResolveV2Rejection {
+    pub const fn new(code: RouteResolveV2RejectionCode) -> Self {
+        Self {
+            version: ROUTE_GRANT_V2_VERSION,
+            code,
+        }
+    }
+}
+
+impl RouteAdmissionV2Failure {
+    pub const fn pre_admission(reason: RouteAdmissionV2Reason) -> Option<Self> {
+        match reason {
+            RouteAdmissionV2Reason::UpstreamUnavailable => None,
+            _ => Some(Self {
+                version: ROUTE_GRANT_V2_VERSION,
+                guard_acquired: false,
+                reason,
+            }),
+        }
+    }
+
+    pub const fn upstream_unavailable() -> Self {
+        Self {
+            version: ROUTE_GRANT_V2_VERSION,
+            guard_acquired: true,
+            reason: RouteAdmissionV2Reason::UpstreamUnavailable,
+        }
+    }
+
+    fn validate(&self) -> Result<(), RouteV2EnvelopeError> {
+        let guard_matches_reason = match self.reason {
+            RouteAdmissionV2Reason::UpstreamUnavailable => self.guard_acquired,
+            _ => !self.guard_acquired,
+        };
+        if self.version != ROUTE_GRANT_V2_VERSION || !guard_matches_reason {
+            return Err(RouteV2EnvelopeError::Invalid);
+        }
+        Ok(())
+    }
+}
+
+pub fn encode_route_resolve_v2_request(
+    value: &RouteResolveV2Request,
+) -> Result<Vec<u8>, RouteV2EnvelopeError> {
+    if value.version != ROUTE_GRANT_V2_VERSION {
+        return Err(RouteV2EnvelopeError::Invalid);
+    }
+    encode_canonical(value, ROUTE_RESOLVE_V2_REQUEST_MAX_WIRE_BYTES)
+}
+
+pub fn decode_route_resolve_v2_request(
+    bytes: &[u8],
+) -> Result<RouteResolveV2Request, RouteV2EnvelopeError> {
+    let value: RouteResolveV2Request =
+        decode_canonical(bytes, ROUTE_RESOLVE_V2_REQUEST_MAX_WIRE_BYTES)?;
+    if value.version != ROUTE_GRANT_V2_VERSION {
+        return Err(RouteV2EnvelopeError::Invalid);
+    }
+    Ok(value)
+}
+
+pub fn encode_route_resolve_v2_success(
+    value: &RouteResolveV2Success,
+) -> Result<Vec<u8>, RouteV2EnvelopeError> {
+    value.validate()?;
+    encode_canonical(value, ROUTE_RESOLVE_V2_RESPONSE_MAX_WIRE_BYTES)
+}
+
+pub fn decode_route_resolve_v2_success(
+    bytes: &[u8],
+) -> Result<RouteResolveV2Success, RouteV2EnvelopeError> {
+    let value: RouteResolveV2Success =
+        decode_canonical(bytes, ROUTE_RESOLVE_V2_RESPONSE_MAX_WIRE_BYTES)?;
+    value.validate()?;
+    Ok(value)
+}
+
+pub fn encode_route_resolve_v2_rejection(
+    value: &RouteResolveV2Rejection,
+) -> Result<Vec<u8>, RouteV2EnvelopeError> {
+    if value.version != ROUTE_GRANT_V2_VERSION {
+        return Err(RouteV2EnvelopeError::Invalid);
+    }
+    encode_canonical(value, ROUTE_RESOLVE_V2_RESPONSE_MAX_WIRE_BYTES)
+}
+
+pub fn decode_route_resolve_v2_rejection(
+    bytes: &[u8],
+) -> Result<RouteResolveV2Rejection, RouteV2EnvelopeError> {
+    let value: RouteResolveV2Rejection =
+        decode_canonical(bytes, ROUTE_RESOLVE_V2_RESPONSE_MAX_WIRE_BYTES)?;
+    if value.version != ROUTE_GRANT_V2_VERSION {
+        return Err(RouteV2EnvelopeError::Invalid);
+    }
+    Ok(value)
+}
+
+pub fn encode_route_admission_v2_failure(
+    value: &RouteAdmissionV2Failure,
+) -> Result<Vec<u8>, RouteV2EnvelopeError> {
+    value.validate()?;
+    encode_canonical(value, 256)
+}
+
+pub fn decode_route_admission_v2_failure(
+    bytes: &[u8],
+) -> Result<RouteAdmissionV2Failure, RouteV2EnvelopeError> {
+    let value: RouteAdmissionV2Failure = decode_canonical(bytes, 256)?;
+    value.validate()?;
+    Ok(value)
+}
+
+fn encode_canonical<T: Serialize>(
+    value: &T,
+    maximum: usize,
+) -> Result<Vec<u8>, RouteV2EnvelopeError> {
+    let bytes = serde_json::to_vec(value).map_err(|_| RouteV2EnvelopeError::Invalid)?;
+    if bytes.len() > maximum {
+        return Err(RouteV2EnvelopeError::WireTooLarge);
+    }
+    Ok(bytes)
+}
+
+fn decode_canonical<T: DeserializeOwned + Serialize>(
+    bytes: &[u8],
+    maximum: usize,
+) -> Result<T, RouteV2EnvelopeError> {
+    if bytes.len() > maximum {
+        return Err(RouteV2EnvelopeError::WireTooLarge);
+    }
+    let value = serde_json::from_slice(bytes).map_err(|_| RouteV2EnvelopeError::Malformed)?;
+    let canonical = serde_json::to_vec(&value).map_err(|_| RouteV2EnvelopeError::Malformed)?;
+    if canonical != bytes {
+        return Err(RouteV2EnvelopeError::NonCanonical);
+    }
+    Ok(value)
+}
 
 const ED25519_SPKI_PREFIX: [u8; 12] = [
     0x30, 0x2a, 0x30, 0x05, 0x06, 0x03, 0x2b, 0x65, 0x70, 0x03, 0x21, 0x00,
@@ -569,6 +844,80 @@ mod tests {
         invalid = valid;
         invalid.exp = i64::MAX as u64 + 1;
         assert_eq!(invalid.validate(), Err(RouteGrantV2Error::InvalidClaims));
+    }
+
+    #[test]
+    fn resolve_and_admission_envelopes_have_exact_canonical_vectors() {
+        let request = RouteResolveV2Request::new(Hostname::new("app.cats.run").unwrap());
+        let request_bytes = encode_route_resolve_v2_request(&request).unwrap();
+        assert_eq!(request_bytes, br#"{"version":2,"hostname":"app.cats.run"}"#);
+        assert_eq!(
+            decode_route_resolve_v2_request(&request_bytes).unwrap(),
+            request
+        );
+
+        let success = RouteResolveV2Success::new(
+            Id::new("ep_01").unwrap(),
+            NodeTransportTarget::new("https://node-a.internal:7301").unwrap(),
+            1_786_156_920,
+            "opaque-grant-v2".to_owned(),
+        )
+        .unwrap();
+        let success_bytes = encode_route_resolve_v2_success(&success).unwrap();
+        assert_eq!(
+            success_bytes,
+            br#"{"version":2,"endpoint_id":"ep_01","node_transport_target":"https://node-a.internal:7301","expires_at_unix_seconds":1786156920,"opaque_grant":"opaque-grant-v2","grant_sha256":"sha256:535211e38407e27449db1cd21b6e5e3e82c3fe1fd6aa55fc59308dd8bc6d293a"}"#
+        );
+        assert_eq!(
+            decode_route_resolve_v2_success(&success_bytes).unwrap(),
+            success
+        );
+
+        let rejection = RouteResolveV2Rejection::new(RouteResolveV2RejectionCode::Pending);
+        assert_eq!(
+            encode_route_resolve_v2_rejection(&rejection).unwrap(),
+            br#"{"version":2,"code":"pending"}"#
+        );
+        let expired =
+            RouteAdmissionV2Failure::pre_admission(RouteAdmissionV2Reason::Expired).unwrap();
+        assert_eq!(
+            encode_route_admission_v2_failure(&expired).unwrap(),
+            br#"{"version":2,"guard_acquired":false,"reason":"expired"}"#
+        );
+        assert_eq!(
+            encode_route_admission_v2_failure(&RouteAdmissionV2Failure::upstream_unavailable())
+                .unwrap(),
+            br#"{"version":2,"guard_acquired":true,"reason":"upstream_unavailable"}"#
+        );
+    }
+
+    #[test]
+    fn envelope_decoders_reject_noncanonical_duplicate_unknown_and_cross_field_values() {
+        for malformed in [
+            br#"{"hostname":"app.cats.run","version":2}"#.as_slice(),
+            br#"{"version":2,"version":2,"hostname":"app.cats.run"}"#.as_slice(),
+            br#"{"version":2,"hostname":"app.cats.run","extra":1}"#.as_slice(),
+        ] {
+            assert!(decode_route_resolve_v2_request(malformed).is_err());
+        }
+        assert_eq!(
+            decode_route_resolve_v2_request(&vec![
+                b'x';
+                ROUTE_RESOLVE_V2_REQUEST_MAX_WIRE_BYTES + 1
+            ]),
+            Err(RouteV2EnvelopeError::WireTooLarge)
+        );
+
+        let inconsistent = br#"{"version":2,"guard_acquired":true,"reason":"expired"}"#;
+        assert_eq!(
+            decode_route_admission_v2_failure(inconsistent),
+            Err(RouteV2EnvelopeError::Invalid)
+        );
+        let wrong_digest = br#"{"version":2,"endpoint_id":"ep_01","node_transport_target":"https://node-a.internal:7301","expires_at_unix_seconds":1786156920,"opaque_grant":"opaque-grant-v2","grant_sha256":"sha256:0000000000000000000000000000000000000000000000000000000000000000"}"#;
+        assert_eq!(
+            decode_route_resolve_v2_success(wrong_digest),
+            Err(RouteV2EnvelopeError::Invalid)
+        );
     }
 
     #[test]

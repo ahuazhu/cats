@@ -5,22 +5,21 @@
 //! active private key and converts one already-closed authority snapshot into
 //! the frozen compact token.
 
-#![allow(
-    dead_code,
-    reason = "the v2 signer is composed with the machine-authenticated resolve route after the Node transport target authority lands"
-)]
-
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::Context as _;
 use cats_api::route_grant_v2::{
-    RouteGrantV2Claims, RouteGrantV2ProtectedHeader, RouteGrantV2PublicKey,
-    RouteGrantV2SigningInput, DEFAULT_ROUTE_GRANT_V2_TTL_SECONDS, MAX_ROUTE_GRANT_V2_TTL_SECONDS,
+    RouteGrantV2Claims, RouteGrantV2ProtectedHeader, RouteGrantV2SigningInput,
     ROUTE_GRANT_V2_AUDIENCE, ROUTE_GRANT_V2_ISSUER, ROUTE_GRANT_V2_VERSION,
 };
 use cats_api::runtime_reconciliation::KeyId;
-use jsonwebtoken::{Algorithm, DecodingKey, EncodingKey};
+use jsonwebtoken::{Algorithm, EncodingKey};
+
+#[cfg(test)]
+use cats_api::route_grant_v2::{RouteGrantV2PublicKey, MAX_ROUTE_GRANT_V2_TTL_SECONDS};
+#[cfg(test)]
+use jsonwebtoken::DecodingKey;
 
 use crate::store::runtime_authority::route_signer::RouteGrantV2AuthoritySnapshot;
 
@@ -49,6 +48,7 @@ pub(crate) struct IssuedRouteGrantV2 {
 }
 
 impl RouteGrantV2Signer {
+    #[cfg(test)]
     pub(crate) fn from_ed25519_pem(
         private_key_pem: &[u8],
         public_key_pem: &[u8],
@@ -77,17 +77,6 @@ impl RouteGrantV2Signer {
             kid: public.kid().clone(),
             ttl_seconds,
         })
-    }
-
-    pub(crate) fn with_default_ttl(
-        private_key_pem: &[u8],
-        public_key_pem: &[u8],
-    ) -> anyhow::Result<Self> {
-        Self::from_ed25519_pem(
-            private_key_pem,
-            public_key_pem,
-            DEFAULT_ROUTE_GRANT_V2_TTL_SECONDS,
-        )
     }
 
     pub(crate) fn kid(&self) -> &KeyId {

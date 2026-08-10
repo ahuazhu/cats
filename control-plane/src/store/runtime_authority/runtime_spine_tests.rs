@@ -6,6 +6,11 @@ use std::time::{Duration, Instant};
 
 use cats_api::agent_registration::AuthenticatedNodeCredential;
 use cats_api::error::ErrorCode;
+use cats_api::route_grant_v2::{
+    decode_route_resolve_v2_rejection, decode_route_resolve_v2_success,
+    encode_route_resolve_v2_request, RouteResolveV2RejectionCode, RouteResolveV2Request,
+    ROUTE_RESOLVE_V2_PATH, ROUTE_V2_JSON_CONTENT_TYPE,
+};
 use cats_api::runtime_reconciliation::{
     decode_operation, encode_admission_inventory_attestation, encode_agent_session,
     encode_desired_read_snapshot, encode_node_observation, guest_config_digest, inventory_digest,
@@ -2943,6 +2948,7 @@ fn route_ready_runtime(desired: &DesiredRuntimeSpec) -> ObservedRuntimeStatus {
 #[test]
 fn route_signer_snapshot_closes_hostname_runtime_and_ring_in_one_authority_read() {
     let (store, identity, authenticated, policy, session) = fixture();
+    let store = Arc::new(store);
     insert_policy_on_store_for_test(
         &store,
         &route_placement_policy(&identity.node_id, policy.approved_guest_config_digest()),
@@ -3007,7 +3013,15 @@ fn route_signer_snapshot_closes_hostname_runtime_and_ring_in_one_authority_read(
             .runtime_desired_read(&authenticated, &request)
             .unwrap(),
     );
-    let active_kid = KeyId::new("a".repeat(64)).unwrap();
+    let route_signer = Arc::new(
+        crate::route_grant_v2::RouteGrantV2Signer::from_ed25519_pem(
+            include_bytes!("../../../../tests/fixtures/route_grant_private_ed25519.pem"),
+            include_bytes!("../../../../tests/fixtures/route_grant_public_ed25519.pem"),
+            120,
+        )
+        .unwrap(),
+    );
+    let active_kid = route_signer.kid().clone();
     let ring_version = Epoch::new(3).unwrap();
     let mut full = observation(
         &store,
@@ -3050,6 +3064,119 @@ fn route_signer_snapshot_closes_hostname_runtime_and_ring_in_one_authority_read(
         "https://node-a.internal:7301"
     );
     assert!(snapshot.evaluated_at_unix_ms.get() > 0);
+
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    runtime.block_on(async {
+        use axum::routing::post;
+        use axum::{Extension, Router};
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let service = Arc::new(
+            crate::api::route_resolve_v2::RouteResolveV2Service::for_test(
+                Arc::clone(&store),
+                Arc::clone(&route_signer),
+                policy.approved_guest_config_digest().clone(),
+            ),
+        );
+        let unauthenticated = Router::new()
+            .route(
+                ROUTE_RESOLVE_V2_PATH,
+                post(crate::api::route_resolve_v2::resolve)
+                    .fallback(crate::api::route_resolve_v2::resolve),
+            )
+            .layer(Extension(Arc::clone(&service)));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move { axum::serve(listener, unauthenticated).await });
+
+        // Deliberately omit the declared body. A prompt 401 proves production
+        // authentication precedes body read and therefore Store access.
+        let mut stream = tokio::net::TcpStream::connect(address).await.unwrap();
+        stream
+            .write_all(
+                format!(
+                    "POST {ROUTE_RESOLVE_V2_PATH} HTTP/1.1\r\nHost: {address}\r\n\
+                     Content-Length: 100\r\nConnection: close\r\n\r\n"
+                )
+                .as_bytes(),
+            )
+            .await
+            .unwrap();
+        let mut raw = Vec::new();
+        tokio::time::timeout(Duration::from_secs(1), stream.read_to_end(&mut raw))
+            .await
+            .expect("unauthenticated resolve waited for the body")
+            .unwrap();
+        let status = std::str::from_utf8(&raw).unwrap().lines().next().unwrap();
+        assert!(status.contains(" 401 "), "unexpected response: {status}");
+        server.abort();
+        let _ = server.await;
+
+        let authenticated = Router::new()
+            .route(
+                ROUTE_RESOLVE_V2_PATH,
+                post(crate::api::route_resolve_v2::resolve)
+                    .fallback(crate::api::route_resolve_v2::resolve),
+            )
+            .layer(Extension(
+                crate::api::route_resolve_v2::AuthenticatedGatewayPrincipal::for_test(),
+            ))
+            .layer(Extension(service));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move { axum::serve(listener, authenticated).await });
+        let client = reqwest::Client::builder()
+            .redirect(reqwest::redirect::Policy::none())
+            .build()
+            .unwrap();
+        let request =
+            encode_route_resolve_v2_request(&RouteResolveV2Request::new(hostname.clone())).unwrap();
+        let response = client
+            .post(format!("http://{address}{ROUTE_RESOLVE_V2_PATH}"))
+            .header(reqwest::header::CONTENT_TYPE, ROUTE_V2_JSON_CONTENT_TYPE)
+            .header(reqwest::header::ACCEPT, ROUTE_V2_JSON_CONTENT_TYPE)
+            .body(request)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), reqwest::StatusCode::OK);
+        assert_eq!(
+            response.headers()[reqwest::header::CACHE_CONTROL],
+            "no-store"
+        );
+        let success = decode_route_resolve_v2_success(&response.bytes().await.unwrap()).unwrap();
+        assert_eq!(success.endpoint_id, endpoint_id);
+        assert_eq!(
+            success.node_transport_target.as_str(),
+            "https://node-a.internal:7301"
+        );
+        assert!(!success.opaque_grant.is_empty());
+
+        let missing = encode_route_resolve_v2_request(&RouteResolveV2Request::new(
+            Hostname::new("missing.cats.run").unwrap(),
+        ))
+        .unwrap();
+        let response = client
+            .post(format!("http://{address}{ROUTE_RESOLVE_V2_PATH}"))
+            .header(reqwest::header::CONTENT_TYPE, ROUTE_V2_JSON_CONTENT_TYPE)
+            .header(reqwest::header::ACCEPT, ROUTE_V2_JSON_CONTENT_TYPE)
+            .body(missing)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), reqwest::StatusCode::NOT_FOUND);
+        assert_eq!(
+            decode_route_resolve_v2_rejection(&response.bytes().await.unwrap())
+                .unwrap()
+                .code,
+            RouteResolveV2RejectionCode::NotFound
+        );
+        server.abort();
+        let _ = server.await;
+    });
 
     let unknown = KeyId::new("b".repeat(64)).unwrap();
     assert_eq!(
