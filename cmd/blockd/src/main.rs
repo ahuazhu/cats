@@ -1430,9 +1430,12 @@ fn main() -> Result<()> {
         )
         .context("adopt exact authorized control-only chunk engine")?
     } else if let Some(input) = authorized_serving {
+        // Opening PostgreSQL may block. Complete it before `apply` performs
+        // the final descriptor-relative handoff revalidation, so the closure
+        // crosses directly into the engine effect with no intervening setup.
+        let authority = PostgresVolumeDataAuthority::open(&metadata_config)
+            .context("open target volume authority")?;
         input.apply(|attachment| {
-            let authority = PostgresVolumeDataAuthority::open(&metadata_config)
-                .context("open target volume authority")?;
             ChunkEngine::attach_authorized_serving(config, attachment, blob.clone(), authority)
                 .context("adopt authorized serving chunk engine")
         })?
@@ -2559,7 +2562,7 @@ mod tests {
 
     fn invoke_handoff_before_effect_revalidation(
         args: &Args,
-        effect_calls: &std::cell::Cell<u64>,
+        engine_calls: &std::cell::Cell<u64>,
         before_revalidation: impl FnOnce(),
     ) -> Result<AuthorizedServingAttachment> {
         validate_process_mode(args)?;
@@ -2574,7 +2577,7 @@ mod tests {
         .map(AuthorizedServingInput::RootHandoff)?;
         before_revalidation();
         input.apply(|attachment| {
-            effect_calls.set(effect_calls.get() + 1);
+            engine_calls.set(engine_calls.get() + 1);
             Ok(attachment)
         })
     }
