@@ -85,6 +85,10 @@ use super::serving_handoff::{
 use super::serving_handoff_effect::{
     SERVING_CONTROL_SOCKET_BASENAME, SERVING_NBD_SOCKET_BASENAME, SERVING_VHOST_SOCKET_BASENAME,
 };
+use super::vmm_process::{
+    PlatformSystemdVmmProcessPort, VmmProcessConflict, VmmProcessExpectation, VmmProcessInspection,
+    VmmProcessPort,
+};
 use super::{
     inventory::{
         root_process_inventory_bridge_sealed, InstalledRuntimeInventoryKeyRingReader,
@@ -1318,6 +1322,7 @@ fn platform_root_process_inventory_bridge(
                 .context("installed root-process bridge lacks its exact process port")?,
         ),
         serving_port,
+        vmm_port: Arc::new(PlatformSystemdVmmProcessPort),
         root_provision_systemd,
         executable_path,
         state_directory: config.state_directory.clone(),
@@ -2875,6 +2880,7 @@ struct StateNamespaceProbe {
 struct PlatformRootProcessInventoryBridge {
     port: Arc<dyn RootProvisionProcessPort>,
     serving_port: Arc<dyn ServingBlockdProcessPort>,
+    vmm_port: Arc<dyn VmmProcessPort>,
     root_provision_systemd: RootProvisionSystemdConfig,
     executable_path: HostPath,
     state_directory: StateDirectory,
@@ -2966,6 +2972,7 @@ impl PlatformRootProcessInventoryBridge {
     ) -> anyhow::Result<AdmittedManagedProcessInspection> {
         let (root_expected, root_admitted) = admission.root_control_state();
         let (serving_expected, serving_admitted) = admission.serving_blockd_state();
+        let (vmm_expected, vmm_admitted) = admission.vmm_state();
         let Some(root_first) =
             inspect_root_process_set(self.port.as_ref(), &root_expected, context)?
         else {
@@ -2976,7 +2983,15 @@ impl PlatformRootProcessInventoryBridge {
         else {
             return Ok(AdmittedManagedProcessInspection::Unavailable);
         };
-        if root_first != root_admitted || serving_first != serving_admitted {
+        let Some(vmm_first) =
+            inspect_vmm_process_set(self.vmm_port.as_ref(), &vmm_expected, context)?
+        else {
+            return Ok(AdmittedManagedProcessInspection::Unavailable);
+        };
+        if root_first != root_admitted
+            || serving_first != serving_admitted
+            || vmm_first != vmm_admitted
+        {
             return Ok(AdmittedManagedProcessInspection::IdentityMismatch);
         }
 
@@ -3000,6 +3015,17 @@ impl PlatformRootProcessInventoryBridge {
                     || !allowed_sockets
                         .insert(PathBuf::from(evidence.control_socket_path().as_str()))
                     || !allowed_sockets.insert(PathBuf::from(evidence.listener_path().as_str()))
+                {
+                    return Ok(AdmittedManagedProcessInspection::DuplicateIdentity);
+                }
+            }
+        }
+        for inspection in vmm_first.values() {
+            if let VmmProcessInspection::Exact(evidence) = inspection {
+                if !allowed_units.insert(evidence.unit_id().clone())
+                    || !allowed_pids.insert(evidence.process_id())
+                    || !allowed_sockets.insert(PathBuf::from(evidence.api_socket_path().as_str()))
+                    || !allowed_sockets.insert(PathBuf::from(evidence.vsock_socket_path().as_str()))
                 {
                     return Ok(AdmittedManagedProcessInspection::DuplicateIdentity);
                 }
@@ -3043,7 +3069,12 @@ impl PlatformRootProcessInventoryBridge {
         else {
             return Ok(AdmittedManagedProcessInspection::Unavailable);
         };
-        if root_first != root_second || serving_first != serving_second {
+        let Some(vmm_second) =
+            inspect_vmm_process_set(self.vmm_port.as_ref(), &vmm_expected, context)?
+        else {
+            return Ok(AdmittedManagedProcessInspection::Unavailable);
+        };
+        if root_first != root_second || serving_first != serving_second || vmm_first != vmm_second {
             return Ok(AdmittedManagedProcessInspection::IdentityMismatch);
         }
         Ok(AdmittedManagedProcessInspection::Exact {
@@ -3136,6 +3167,7 @@ impl RootProcessInventoryBridge for PlatformRootProcessInventoryBridge {
         &self,
         root_expected: BTreeMap<Id, RootProvisionProcessExpectation>,
         serving_expected: BTreeMap<Id, ServingBlockdExpectation>,
+        vmm_expected: BTreeMap<Id, VmmProcessExpectation>,
         stop_receipt_sockets: BTreeMap<Id, StopReceiptSocketAdmission>,
         context: &RuntimeInventoryScanContext,
     ) -> anyhow::Result<RootProcessInventoryBridgeOutcome> {
@@ -3146,6 +3178,11 @@ impl RootProcessInventoryBridge for PlatformRootProcessInventoryBridge {
         };
         let Some(serving_first) =
             inspect_serving_process_set(self.serving_port.as_ref(), &serving_expected, context)?
+        else {
+            return Ok(RootProcessInventoryBridgeOutcome::Unavailable);
+        };
+        let Some(vmm_first) =
+            inspect_vmm_process_set(self.vmm_port.as_ref(), &vmm_expected, context)?
         else {
             return Ok(RootProcessInventoryBridgeOutcome::Unavailable);
         };
@@ -3185,6 +3222,19 @@ impl RootProcessInventoryBridge for PlatformRootProcessInventoryBridge {
                             .insert(PathBuf::from(evidence.control_socket_path().as_str()))
                         && allowed_sockets.insert(PathBuf::from(evidence.listener_path().as_str())),
                     "managed-process inventory contains duplicate physical identity"
+                );
+            }
+        }
+        for inspection in vmm_first.values() {
+            if let VmmProcessInspection::Exact(evidence) = inspection {
+                anyhow::ensure!(
+                    allowed_units.insert(evidence.unit_id().clone())
+                        && allowed_pids.insert(evidence.process_id())
+                        && allowed_sockets
+                            .insert(PathBuf::from(evidence.api_socket_path().as_str()))
+                        && allowed_sockets
+                            .insert(PathBuf::from(evidence.vsock_socket_path().as_str())),
+                    "managed-process inventory contains duplicate VMM physical identity"
                 );
             }
         }
@@ -3244,8 +3294,13 @@ impl RootProcessInventoryBridge for PlatformRootProcessInventoryBridge {
         else {
             return Ok(RootProcessInventoryBridgeOutcome::Unavailable);
         };
+        let Some(vmm_second) =
+            inspect_vmm_process_set(self.vmm_port.as_ref(), &vmm_expected, context)?
+        else {
+            return Ok(RootProcessInventoryBridgeOutcome::Unavailable);
+        };
         anyhow::ensure!(
-            root_first == root_second && serving_first == serving_second,
+            root_first == root_second && serving_first == serving_second && vmm_first == vmm_second,
             "managed-process identity changed across the global inventory sweep"
         );
         let mut root_proofs = BTreeMap::new();
@@ -3269,11 +3324,22 @@ impl RootProcessInventoryBridge for PlatformRootProcessInventoryBridge {
                 serving_proofs.insert(cat_id, expectation.prove_exact_process(*evidence)?);
             }
         }
+        let mut vmm_proofs = BTreeMap::new();
+        for (cat_id, inspection) in vmm_second {
+            if let VmmProcessInspection::Exact(evidence) = inspection {
+                let expectation = vmm_expected
+                    .get(&cat_id)
+                    .expect("inspection keys originate from expectations")
+                    .clone();
+                vmm_proofs.insert(cat_id, expectation.prove_exact_process(*evidence)?);
+            }
+        }
         Ok(RootProcessInventoryBridgeOutcome::Complete(
             super::root_provision_process::NodeGlobalManagedProcessScanAdmission::from_root_controls(
                 root_expected, root_proofs,
             )?
             .with_serving_blockds(serving_expected, serving_proofs)?
+            .with_vmms(vmm_expected, vmm_proofs)?
             .with_stop_receipt_sockets(stop_receipt_sockets)?,
         ))
     }
@@ -3420,6 +3486,30 @@ fn inspect_serving_process_set(
             ServingBlockdProcessInspection::Unavailable => return Ok(None),
             ServingBlockdProcessInspection::Conflict(_) => {
                 bail!("serving blockd process conflict for {cat_id}")
+            }
+        }
+        inspected.insert(cat_id.clone(), inspection);
+    }
+    Ok(Some(inspected))
+}
+
+fn inspect_vmm_process_set(
+    port: &dyn VmmProcessPort,
+    expected: &BTreeMap<Id, VmmProcessExpectation>,
+    context: &dyn RuntimePhysicalReadContext,
+) -> anyhow::Result<Option<BTreeMap<Id, VmmProcessInspection>>> {
+    let mut inspected = BTreeMap::new();
+    for (cat_id, expectation) in expected {
+        let inspection = port.inspect(expectation, context)?;
+        match inspection {
+            VmmProcessInspection::Absent | VmmProcessInspection::Exact(_) => {}
+            VmmProcessInspection::Unavailable => return Ok(None),
+            VmmProcessInspection::Conflict(problem) => {
+                let problem = match problem {
+                    VmmProcessConflict::DuplicateIdentity => "duplicate identity",
+                    VmmProcessConflict::IdentityMismatch => "identity mismatch",
+                };
+                bail!("VMM process conflict for {cat_id}: {problem}")
             }
         }
         inspected.insert(cat_id.clone(), inspection);
@@ -5687,18 +5777,18 @@ mod tests {
     use std::time::{Duration, Instant};
 
     use cats_api::runtime_reconciliation::{
-        decode_desired_read_snapshot, inventory_digest, spec_digest, AcquireOrigin, AsciiText,
-        AssignedKind, AssignedPlacement, CheckpointEvidence, CleanupRelease, CleanupTarget,
-        ContractVersion, DesiredRuntimeSpec, DirectAuthorizedAttachmentIdentity,
-        DirectAuthorizedAttachmentPurpose, DiskKind, Durability, Epoch, FenceEpoch, Generation,
-        GuestDeviceIdentity, HostPath, Id, Ipv4Address, IsolatedIpv4Kind, LifecycleAdmission,
-        MacAddress, NetworkConfig, NodeBootId, NodeObservation, NormalAcquireRequest,
-        PrepareDeviceFrontend, RandomId128, ReconcileStep, RemoteHead, Revision, RuntimeConfig,
-        RuntimeTarget, RuntimeTransition, RuntimeVolumeTransition,
-        RuntimeVolumeTransitionPreconditionProblem, RuntimeVolumeTransitionRequest,
-        ServingAuthorityProvenance, ServingBlockdIdentity, SessionBinding, Sha256Digest,
-        UnixMillis, VolumeAccess, VolumeAcquire, VolumeAcquireRequest, VolumeDisposition,
-        VolumeIntent, VolumeReleaseReplay, WireU64,
+        decode_desired_read_snapshot, decode_runtime_checkpoint, inventory_digest, spec_digest,
+        AcquireOrigin, AsciiText, AssignedKind, AssignedPlacement, CheckpointEvidence,
+        CleanupRelease, CleanupTarget, ContractVersion, DesiredRuntimeSpec,
+        DirectAuthorizedAttachmentIdentity, DirectAuthorizedAttachmentPurpose, DiskKind,
+        Durability, Epoch, FenceEpoch, Generation, GuestDeviceIdentity, HostPath, Id, Ipv4Address,
+        IsolatedIpv4Kind, LifecycleAdmission, MacAddress, NetworkConfig, NodeBootId,
+        NodeObservation, NormalAcquireRequest, PrepareDeviceFrontend, RandomId128, ReconcileStep,
+        RemoteHead, Revision, RuntimeConfig, RuntimeTarget, RuntimeTransition,
+        RuntimeVolumeTransition, RuntimeVolumeTransitionPreconditionProblem,
+        RuntimeVolumeTransitionRequest, ServingAuthorityProvenance, ServingBlockdIdentity,
+        SessionBinding, Sha256Digest, UnixMillis, VolumeAccess, VolumeAcquire,
+        VolumeAcquireRequest, VolumeDisposition, VolumeIntent, VolumeReleaseReplay, WireU64,
     };
     use cats_storage::{
         encode_image_manifest, AdapterConfig, AdapterSelection, BlobError, ImageManifestV1,
@@ -5721,6 +5811,36 @@ mod tests {
     use super::*;
 
     const SNAPSHOT: &[u8] = br#"{"desired_specs":[],"expires_at_unix_ms":1720000030000,"issued_at_unix_ms":1720000000000,"read_position":12,"request_sequence":1,"session":{"agent_instance_id":"44444444444444444444444444444444","agent_session_epoch":2,"node_boot_id":"33333333333333333333333333333333","node_id":"node_a"},"version":1}"#;
+
+    #[test]
+    fn start_runtime_cannot_be_projected_before_the_exact_vmm_inspector_is_available() {
+        let environment = TestEnvironment::new();
+        let checkpoint = decode_runtime_checkpoint(include_bytes!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../testdata/runtime-reconciliation-v1-start-runtime-checkpoint.json"
+        )))
+        .unwrap();
+        let expected = VmmProcessExpectation::from_checkpoint(checkpoint)
+            .unwrap()
+            .with_checkpoint_path(
+                HostPath::new("/var/lib/cats/checkpoints/cat-cat_01.checkpoint.json").unwrap(),
+            )
+            .unwrap();
+        let cat_id = expected.cat_id().clone();
+        let bridge = root_process_bridge(&environment, []);
+        assert!(matches!(
+            bridge
+                .inspect_all(
+                    BTreeMap::new(),
+                    BTreeMap::new(),
+                    BTreeMap::from([(cat_id, expected)]),
+                    BTreeMap::new(),
+                    &assigned_context(true),
+                )
+                .unwrap(),
+            RootProcessInventoryBridgeOutcome::Unavailable
+        ));
+    }
 
     #[test]
     fn recoverable_stop_receipt_publication_precedes_another_cats_stable_receipt() {
@@ -6658,6 +6778,7 @@ mod tests {
         PlatformRootProcessInventoryBridge {
             port,
             serving_port,
+            vmm_port: Arc::new(PlatformSystemdVmmProcessPort),
             root_provision_systemd: test_root_provision_systemd(&environment.blockd_binary),
             executable_path: HostPath::new(
                 environment.blockd_binary.to_string_lossy().into_owned(),
@@ -8629,6 +8750,7 @@ mod tests {
                 BTreeMap::from([(expected.cat_id.clone(), expected)]),
                 BTreeMap::new(),
                 BTreeMap::new(),
+                BTreeMap::new(),
                 &assigned_context(true),
             )
             .unwrap();
@@ -10146,12 +10268,13 @@ mod tests {
         );
         assert!(matches!(
             bridge
-                .inspect_all(
-                    BTreeMap::from([(expected.cat_id.clone(), expected)]),
-                    BTreeMap::new(),
-                    BTreeMap::new(),
-                    &assigned_context(true),
-                )
+            .inspect_all(
+                BTreeMap::from([(expected.cat_id.clone(), expected)]),
+                BTreeMap::new(),
+                BTreeMap::new(),
+                BTreeMap::new(),
+                &assigned_context(true),
+            )
                 .unwrap(),
             RootProcessInventoryBridgeOutcome::Complete(admission)
                 if admission.root_control_proofs().is_empty()
@@ -10165,6 +10288,7 @@ mod tests {
             bridge
                 .inspect_all(
                     BTreeMap::from([(expected.cat_id.clone(), expected)]),
+                    BTreeMap::new(),
                     BTreeMap::new(),
                     BTreeMap::new(),
                     &assigned_context(true),
@@ -10189,6 +10313,7 @@ mod tests {
                 BTreeMap::from([(expected.cat_id.clone(), expected)]),
                 BTreeMap::new(),
                 BTreeMap::new(),
+                BTreeMap::new(),
                 &assigned_context(true),
             )
             .is_err());
@@ -10206,6 +10331,7 @@ mod tests {
         assert!(bridge
             .inspect_all(
                 BTreeMap::from([(expected.cat_id.clone(), expected)]),
+                BTreeMap::new(),
                 BTreeMap::new(),
                 BTreeMap::new(),
                 &assigned_context(true),
@@ -10231,6 +10357,7 @@ mod tests {
         assert!(bridge
             .inspect_all(
                 BTreeMap::from([(expected.cat_id.clone(), expected)]),
+                BTreeMap::new(),
                 BTreeMap::new(),
                 BTreeMap::new(),
                 &assigned_context(true),
@@ -10596,6 +10723,7 @@ mod tests {
                 BTreeMap::from([(expected.cat_id.clone(), expected)]),
                 BTreeMap::new(),
                 BTreeMap::new(),
+                BTreeMap::new(),
                 &assigned_context(true),
             )
             .is_err());
@@ -10614,6 +10742,7 @@ mod tests {
         assert!(bridge
             .inspect_all(
                 BTreeMap::from([(expected.cat_id.clone(), expected)]),
+                BTreeMap::new(),
                 BTreeMap::new(),
                 BTreeMap::new(),
                 &assigned_context(true),

@@ -185,6 +185,7 @@ pub(crate) trait RootProcessInventoryBridge:
         &self,
         root_expected: BTreeMap<Id, RootProvisionProcessExpectation>,
         serving_expected: BTreeMap<Id, super::serving_blockd_process::ServingBlockdExpectation>,
+        vmm_expected: BTreeMap<Id, super::vmm_process::VmmProcessExpectation>,
         stop_receipt_sockets: BTreeMap<Id, StopReceiptSocketAdmission>,
         context: &RuntimeInventoryScanContext,
     ) -> anyhow::Result<RootProcessInventoryBridgeOutcome>;
@@ -495,6 +496,10 @@ impl RuntimeInventoryScanner for CleanSlateInventoryScanner {
                 &aggregate.blockd_by_cat,
                 &aggregate.volumes_by_cat,
             )?;
+            let vmm_expected = vmm_process_expectations(
+                &self.checkpoint_directory,
+                &aggregate.checkpoints_by_cat,
+            )?;
             let stop_receipt_sockets = aggregate
                 .blockd_by_cat
                 .iter()
@@ -511,6 +516,7 @@ impl RuntimeInventoryScanner for CleanSlateInventoryScanner {
             match bridge.inspect_all(
                 root_expected,
                 serving_expected,
+                vmm_expected,
                 stop_receipt_sockets,
                 &context,
             )? {
@@ -694,6 +700,35 @@ impl RuntimeInventoryScanner for CleanSlateInventoryScanner {
             .with_kernel_nbd_pool_admission(kernel_nbd_pool_admission),
         ))
     }
+}
+
+fn vmm_process_expectations(
+    checkpoint_directory: &std::path::Path,
+    checkpoints_by_cat: &BTreeMap<Id, RuntimeCheckpointInventoryEvidence>,
+) -> anyhow::Result<BTreeMap<Id, super::vmm_process::VmmProcessExpectation>> {
+    let mut expected = BTreeMap::new();
+    for (cat_id, evidence) in checkpoints_by_cat {
+        if evidence.binding != DesiredCheckpointBinding::Current
+            || !matches!(evidence.checkpoint.step, ReconcileStep::StartRuntime { .. })
+        {
+            continue;
+        }
+        let checkpoint_path = HostPath::new(
+            runtime_checkpoint_path(checkpoint_directory, cat_id)
+                .to_string_lossy()
+                .into_owned(),
+        )
+        .context("StartRuntime checkpoint path is not canonical")?;
+        let expectation = super::vmm_process::VmmProcessExpectation::from_checkpoint(
+            evidence.checkpoint.clone(),
+        )?
+        .with_checkpoint_path(checkpoint_path)?;
+        anyhow::ensure!(
+            expected.insert(cat_id.clone(), expectation).is_none(),
+            "VMM process expectation duplicated one Cat"
+        );
+    }
+    Ok(expected)
 }
 
 fn root_process_expectations(
@@ -1589,16 +1624,53 @@ mod tests {
     use std::time::Instant;
 
     use cats_api::runtime_reconciliation::{
-        decode_desired_read_snapshot, encode_node_observation, inventory_digest, spec_digest,
-        AssignedKind, AssignedPlacement, ContractVersion, DesiredRuntimeSpec, Epoch, Id,
-        InventorySource, Ipv4Address, IsolatedIpv4Kind, KeyId, MacAddress, NetworkConfig,
-        NodeObservation, RandomId128, Revision, RuntimeConfig, RuntimeTarget, RuntimeTransition,
-        SessionBinding, Sha256Digest,
+        decode_desired_read_snapshot, decode_runtime_checkpoint, encode_node_observation,
+        inventory_digest, spec_digest, AssignedKind, AssignedPlacement, ContractVersion,
+        DesiredRuntimeSpec, Epoch, Id, InventorySource, Ipv4Address, IsolatedIpv4Kind, KeyId,
+        MacAddress, NetworkConfig, NodeObservation, RandomId128, Revision, RuntimeConfig,
+        RuntimeTarget, RuntimeTransition, SessionBinding, Sha256Digest,
     };
 
     use super::*;
 
     const SNAPSHOT: &[u8] = br#"{"desired_specs":[],"expires_at_unix_ms":1720000030000,"issued_at_unix_ms":1720000000000,"read_position":12,"request_sequence":1,"session":{"agent_instance_id":"44444444444444444444444444444444","agent_session_epoch":2,"node_boot_id":"33333333333333333333333333333333","node_id":"node_a"},"version":1}"#;
+
+    #[test]
+    fn only_current_start_runtime_mints_a_vmm_inventory_expectation() {
+        let checkpoint = decode_runtime_checkpoint(include_bytes!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../testdata/runtime-reconciliation-v1-start-runtime-checkpoint.json"
+        )))
+        .unwrap();
+        let cat_id = checkpoint.cat_id.clone();
+        let evidence = RuntimeCheckpointInventoryEvidence {
+            checkpoint,
+            binding: DesiredCheckpointBinding::Current,
+            definite_release_rejected: false,
+        };
+        let expected = vmm_process_expectations(
+            std::path::Path::new("/var/lib/cats/checkpoints"),
+            &BTreeMap::from([(cat_id.clone(), evidence.clone())]),
+        )
+        .unwrap();
+        let expectation = expected.get(&cat_id).unwrap();
+        assert_eq!(expectation.cat_id(), &cat_id);
+        assert_eq!(
+            expectation.checkpoint_path().unwrap().as_str(),
+            "/var/lib/cats/checkpoints/cat-cat_01.checkpoint.json"
+        );
+
+        let superseded = RuntimeCheckpointInventoryEvidence {
+            binding: DesiredCheckpointBinding::Superseded,
+            ..evidence
+        };
+        assert!(vmm_process_expectations(
+            std::path::Path::new("/var/lib/cats/checkpoints"),
+            &BTreeMap::from([(cat_id, superseded)]),
+        )
+        .unwrap()
+        .is_empty());
+    }
 
     struct Probe {
         source: InventorySource,
