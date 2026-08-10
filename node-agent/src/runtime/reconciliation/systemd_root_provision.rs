@@ -36,6 +36,10 @@ const SYSTEMD_RUN: &str = "/usr/bin/systemd-run";
 const SYSTEMCTL: &str = "/usr/bin/systemctl";
 const SYSTEM_SLICE: &str = "system.slice";
 const CGROUP_ROOT: &str = "/sys/fs/cgroup";
+const ROOT_PROVISION_KILL_MODE: &str = "control-group";
+const ROOT_PROVISION_RESTART: &str = "no";
+const ROOT_PROVISION_UMASK: &str = "0077";
+const ROOT_PROVISION_TIMEOUT_STOP_USEC: &str = "2s";
 const AUTHORIZED_CONTROL_SPEC: &str = "authorized-serving.json";
 const STATUS_MAX_BYTES: usize = 64 * 1024;
 const COMMAND_OUTPUT_MAX_BYTES: usize = 32 * 1024;
@@ -585,9 +589,9 @@ fn platform_submit_systemd(
         .arg(format!("--unit={}", launch.unit_id))
         .arg("--service-type=exec")
         .arg(format!("--slice={SYSTEM_SLICE}"))
-        .arg("--property=KillMode=control-group")
-        .arg("--property=Restart=no")
-        .arg("--property=UMask=0077")
+        .arg(format!("--property=KillMode={ROOT_PROVISION_KILL_MODE}"))
+        .arg(format!("--property=Restart={ROOT_PROVISION_RESTART}"))
+        .arg(format!("--property=UMask={ROOT_PROVISION_UMASK}"))
         .arg("--property=TimeoutStopSec=2s")
         .arg("--property=Environment=")
         .arg("--property=EnvironmentFile=")
@@ -802,6 +806,10 @@ struct SystemdUnitProperties {
     environment_files: String,
     pass_environment: String,
     unset_environment: String,
+    kill_mode: String,
+    restart: String,
+    umask: String,
+    timeout_stop_usec: String,
 }
 
 impl SystemdUnitProperties {
@@ -843,6 +851,10 @@ impl SystemdUnitProperties {
             && self.environment_files.is_empty()
             && self.pass_environment.is_empty()
             && exact_unset_environment(&self.unset_environment)
+            && self.kill_mode == ROOT_PROVISION_KILL_MODE
+            && self.restart == ROOT_PROVISION_RESTART
+            && self.umask == ROOT_PROVISION_UMASK
+            && self.timeout_stop_usec == ROOT_PROVISION_TIMEOUT_STOP_USEC
     }
 }
 
@@ -871,6 +883,10 @@ fn systemd_unit_properties(
         "EnvironmentFiles",
         "PassEnvironment",
         "UnsetEnvironment",
+        "KillMode",
+        "Restart",
+        "UMask",
+        "TimeoutStopUSec",
     ] {
         command.arg(format!("--property={property}"));
     }
@@ -896,7 +912,7 @@ fn parse_systemd_properties(bytes: &[u8]) -> anyhow::Result<SystemdUnitPropertie
         );
     }
     anyhow::ensure!(
-        values.len() == 11,
+        values.len() == 15,
         "systemctl show omitted a fixed property"
     );
     let take = |values: &mut BTreeMap<&str, String>, key| {
@@ -919,6 +935,10 @@ fn parse_systemd_properties(bytes: &[u8]) -> anyhow::Result<SystemdUnitPropertie
         environment_files: take(&mut values, "EnvironmentFiles")?,
         pass_environment: take(&mut values, "PassEnvironment")?,
         unset_environment: take(&mut values, "UnsetEnvironment")?,
+        kill_mode: take(&mut values, "KillMode")?,
+        restart: take(&mut values, "Restart")?,
+        umask: take(&mut values, "UMask")?,
+        timeout_stop_usec: take(&mut values, "TimeoutStopUSec")?,
     })
 }
 
@@ -1583,23 +1603,49 @@ mod tests {
     #[test]
     fn fixed_systemctl_properties_distinguish_absent_and_exact_running_unit() {
         let absent = parse_systemd_properties(
-            b"Id=cats-root.service\nLoadState=not-found\nActiveState=inactive\nSubState=dead\nMainPID=0\nControlGroup=\nExecStart=\nEnvironment=\nEnvironmentFiles=\nPassEnvironment=\nUnsetEnvironment=\n",
+            b"Id=cats-root.service\nLoadState=not-found\nActiveState=inactive\nSubState=dead\nMainPID=0\nControlGroup=\nExecStart=\nEnvironment=\nEnvironmentFiles=\nPassEnvironment=\nUnsetEnvironment=\nKillMode=control-group\nRestart=no\nUMask=0022\nTimeoutStopUSec=1min 30s\n",
         )
         .unwrap();
         assert!(absent.proves_absent(&id("cats-root.service")));
 
         let launch = build_launch(&config(), &expectation()).unwrap();
         let running = parse_systemd_properties(
-            b"Id=cats-root.service\nLoadState=loaded\nActiveState=active\nSubState=running\nMainPID=4242\nControlGroup=/system.slice/cats-root.service\nExecStart={ path=/usr/bin/cats-blockd ; argv[]=/usr/bin/cats-blockd --process-identity-token 44444444444444444444444444444444 ; }\nEnvironment=\nEnvironmentFiles=\nPassEnvironment=\nUnsetEnvironment=AWS_ACCESS_KEY_ID AWS_SECRET_ACCESS_KEY AWS_SESSION_TOKEN AWS_CONTAINER_CREDENTIALS_FULL_URI AWS_CONTAINER_AUTHORIZATION_TOKEN_FILE CATS_POSTGRES_URL\n",
+            b"Id=cats-root.service\nLoadState=loaded\nActiveState=active\nSubState=running\nMainPID=4242\nControlGroup=/system.slice/cats-root.service\nExecStart={ path=/usr/bin/cats-blockd ; argv[]=/usr/bin/cats-blockd --process-identity-token 44444444444444444444444444444444 ; }\nEnvironment=\nEnvironmentFiles=\nPassEnvironment=\nUnsetEnvironment=AWS_ACCESS_KEY_ID AWS_SECRET_ACCESS_KEY AWS_SESSION_TOKEN AWS_CONTAINER_CREDENTIALS_FULL_URI AWS_CONTAINER_AUTHORIZATION_TOKEN_FILE CATS_POSTGRES_URL\nKillMode=control-group\nRestart=no\nUMask=0077\nTimeoutStopUSec=2s\n",
         )
         .unwrap();
         assert!(running.is_running(&launch));
 
         let wrong_token = parse_systemd_properties(
-            b"Id=cats-root.service\nLoadState=loaded\nActiveState=active\nSubState=running\nMainPID=4242\nControlGroup=/system.slice/cats-root.service\nExecStart={ path=/usr/bin/cats-blockd ; argv[]=/usr/bin/cats-blockd --process-identity-token 55555555555555555555555555555555 ; }\nEnvironment=\nEnvironmentFiles=\nPassEnvironment=\nUnsetEnvironment=AWS_ACCESS_KEY_ID AWS_SECRET_ACCESS_KEY AWS_SESSION_TOKEN AWS_CONTAINER_CREDENTIALS_FULL_URI AWS_CONTAINER_AUTHORIZATION_TOKEN_FILE CATS_POSTGRES_URL\n",
+            b"Id=cats-root.service\nLoadState=loaded\nActiveState=active\nSubState=running\nMainPID=4242\nControlGroup=/system.slice/cats-root.service\nExecStart={ path=/usr/bin/cats-blockd ; argv[]=/usr/bin/cats-blockd --process-identity-token 55555555555555555555555555555555 ; }\nEnvironment=\nEnvironmentFiles=\nPassEnvironment=\nUnsetEnvironment=AWS_ACCESS_KEY_ID AWS_SECRET_ACCESS_KEY AWS_SESSION_TOKEN AWS_CONTAINER_CREDENTIALS_FULL_URI AWS_CONTAINER_AUTHORIZATION_TOKEN_FILE CATS_POSTGRES_URL\nKillMode=control-group\nRestart=no\nUMask=0077\nTimeoutStopUSec=2s\n",
         )
         .unwrap();
         assert!(!wrong_token.is_running(&launch));
+
+        for (property, wrong) in [
+            ("KillMode", "process"),
+            ("Restart", "on-failure"),
+            ("UMask", "0022"),
+            ("TimeoutStopUSec", "3s"),
+        ] {
+            let wire = String::from_utf8(
+                b"Id=cats-root.service\nLoadState=loaded\nActiveState=active\nSubState=running\nMainPID=4242\nControlGroup=/system.slice/cats-root.service\nExecStart={ path=/usr/bin/cats-blockd ; argv[]=/usr/bin/cats-blockd --process-identity-token 44444444444444444444444444444444 ; }\nEnvironment=\nEnvironmentFiles=\nPassEnvironment=\nUnsetEnvironment=AWS_ACCESS_KEY_ID AWS_SECRET_ACCESS_KEY AWS_SESSION_TOKEN AWS_CONTAINER_CREDENTIALS_FULL_URI AWS_CONTAINER_AUTHORIZATION_TOKEN_FILE CATS_POSTGRES_URL\nKillMode=control-group\nRestart=no\nUMask=0077\nTimeoutStopUSec=2s\n"
+                    .to_vec(),
+            )
+            .unwrap()
+            .replace(
+                &format!("{property}={}", match property {
+                    "KillMode" => "control-group",
+                    "Restart" => "no",
+                    "UMask" => "0077",
+                    "TimeoutStopUSec" => "2s",
+                    _ => unreachable!(),
+                }),
+                &format!("{property}={wrong}"),
+            );
+            assert!(!parse_systemd_properties(wire.as_bytes())
+                .unwrap()
+                .is_running(&launch));
+        }
     }
 
     #[test]
@@ -1612,7 +1658,13 @@ mod tests {
             &b"Id=cats-root.service\nLoadState=loaded\nActiveState=active\nSubState=running\nMainPID=4242\nControlGroup=/system.slice/cats-root.service\nExecStart=/usr/bin/cats-blockd --process-identity-token 44444444444444444444444444444444\nEnvironment=\nEnvironmentFiles=\nPassEnvironment=\nUnsetEnvironment=AWS_ACCESS_KEY_ID AWS_SECRET_ACCESS_KEY AWS_SESSION_TOKEN AWS_CONTAINER_CREDENTIALS_FULL_URI CATS_POSTGRES_URL\n"[..],
             &b"Id=cats-root.service\nLoadState=loaded\nActiveState=active\nSubState=running\nMainPID=4242\nControlGroup=/system.slice/cats-root.service\nExecStart=/usr/bin/cats-blockd --process-identity-token 44444444444444444444444444444444\nEnvironment=\nEnvironmentFiles=\nPassEnvironment=\nUnsetEnvironment=AWS_ACCESS_KEY_ID AWS_SECRET_ACCESS_KEY AWS_SESSION_TOKEN AWS_CONTAINER_CREDENTIALS_FULL_URI AWS_CONTAINER_AUTHORIZATION_TOKEN_FILE CATS_POSTGRES_URL EXTRA\n"[..],
         ] {
-            assert!(!parse_systemd_properties(bytes).unwrap().is_running(&launch));
+            let mut wire = bytes.to_vec();
+            wire.extend_from_slice(
+                b"KillMode=control-group\nRestart=no\nUMask=0077\nTimeoutStopUSec=2s\n",
+            );
+            assert!(!parse_systemd_properties(&wire)
+                .unwrap()
+                .is_running(&launch));
         }
     }
 

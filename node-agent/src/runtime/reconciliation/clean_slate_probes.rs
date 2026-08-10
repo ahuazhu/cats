@@ -24,11 +24,13 @@ use std::sync::{mpsc, Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use anyhow::{bail, Context as _};
+use cats_api::chunk;
 use cats_api::runtime_reconciliation::{
     decode_runtime_checkpoint, DesiredRuntimeSpec, DiskKind, HostPath, Id, InventorySource,
     ObservedDiskKind, ObservedVolume, RuntimeCheckpoint, Sequence, VolumeAcquire, VolumeAdminState,
     VolumeAuthorityEvidence, VolumeIntent, RUNTIME_CHECKPOINT_MAX_WIRE_BYTES,
 };
+use cats_blockd::format::{decode_bitmap_header, BITMAP_HEADER_LEN};
 #[cfg(test)]
 use cats_storage::authority::VolumeDataAuthority;
 use cats_storage::authority::{
@@ -1884,7 +1886,6 @@ fn scan_authorized_blockd_data(
         if present_control_files == control_files.len() {
             let root_metadata = root.metadata().context("inspect retained state root")?;
             let cache = &by_name["cache.data"].metadata;
-            let bitmap = &by_name["dirty.bitmap"].metadata;
             anyhow::ensure!(
                 cache.st_mode & libc::S_IFMT == libc::S_IFREG
                     && cache.st_nlink == 1
@@ -1893,13 +1894,18 @@ fn scan_authorized_blockd_data(
                     && u64::try_from(cache.st_size).ok() == Some(attachment.size_bytes),
                 "root-provision control-only cache has unsafe identity or size"
             );
-            anyhow::ensure!(
-                bitmap.st_mode & libc::S_IFMT == libc::S_IFREG
-                    && bitmap.st_nlink == 1
-                    && bitmap.st_uid == root_metadata.uid()
-                    && bitmap.st_mode & 0o777 == 0o600,
-                "root-provision dirty bitmap has unsafe identity"
-            );
+            if inspect_empty_dirty_bitmap_at(
+                &epoch_directory,
+                &by_name["dirty.bitmap"],
+                root,
+                attachment.size_bytes,
+                context,
+            )?
+            .is_none()
+            {
+                scan.complete = false;
+                continue;
+            }
             let Some(pending) =
                 open_strict_child_directory(&epoch_directory, &by_name["pending-packs"], root)?
             else {
@@ -3465,6 +3471,115 @@ fn read_strict_regular_at(
         "authorized Runtime file exceeds byte cap {cap}"
     );
     Ok(Some(bytes))
+}
+
+/// Proves the control-only engine has the exact frozen bitmap for this volume
+/// and that no dirty page survived. The file remains descriptor-relative and
+/// no-follow throughout; malformed/racing contents are incomplete inventory,
+/// never absence or verified process evidence.
+fn inspect_empty_dirty_bitmap_at(
+    directory: &File,
+    entry: &StrictDirectoryEntry,
+    root: &File,
+    size_bytes: u64,
+    context: &RuntimeInventoryScanContext,
+) -> anyhow::Result<Option<()>> {
+    validate_strict_regular_entry(entry, root, 0o600)?;
+    let chunk_count = chunk::chunk_count(size_bytes);
+    let expected_len = BITMAP_HEADER_LEN
+        .checked_add(
+            chunk_count
+                .checked_mul(u64::try_from(std::mem::size_of::<u64>())?)
+                .context("root-provision dirty bitmap length overflow")?,
+        )
+        .context("root-provision dirty bitmap length overflow")?;
+    if u64::try_from(entry.metadata.st_size).ok() != Some(expected_len) {
+        return Ok(None);
+    }
+
+    context.check_active()?;
+    let name = CString::new(entry.name.as_bytes()).context("bitmap file name contains NUL")?;
+    // SAFETY: `directory` and `name` remain live for the call. A successful
+    // open returns one new descriptor owned below; O_NOFOLLOW closes symlink
+    // traversal and the descriptor metadata is compared with the enumerated
+    // entry before any bytes become evidence.
+    let descriptor = unsafe {
+        libc::openat(
+            directory.as_raw_fd(),
+            name.as_ptr(),
+            libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_CLOEXEC | libc::O_NONBLOCK,
+            0,
+        )
+    };
+    if descriptor < 0 {
+        let source = io::Error::last_os_error();
+        return if unavailable_io(&source) || source.kind() == io::ErrorKind::NotFound {
+            Ok(None)
+        } else if source.raw_os_error() == Some(libc::ELOOP) {
+            bail!("root-provision dirty bitmap changed to a symlink")
+        } else {
+            Err(source).context("open root-provision dirty bitmap")
+        };
+    }
+    // SAFETY: successful `openat` returned this newly owned descriptor and no
+    // other `File` has been constructed from it.
+    let file = unsafe { File::from_raw_fd(descriptor) };
+    let before = file
+        .metadata()
+        .context("inspect root-provision dirty bitmap before read")?;
+    if !before.is_file()
+        || u64::try_from(entry.metadata.st_dev).ok() != Some(before.dev())
+        || before.ino() != entry.metadata.st_ino
+        || before.nlink() != 1
+        || before.len() != expected_len
+    {
+        return Ok(None);
+    }
+
+    let mut reader = &file;
+    let mut header = vec![0_u8; usize::try_from(BITMAP_HEADER_LEN)?];
+    if let Err(source) = reader.read_exact(&mut header) {
+        return if unavailable_io(&source) || source.kind() == io::ErrorKind::UnexpectedEof {
+            Ok(None)
+        } else {
+            Err(source).context("read root-provision dirty bitmap header")
+        };
+    }
+    if decode_bitmap_header(&header).ok() != Some(chunk_count) {
+        return Ok(None);
+    }
+
+    let mut remaining = chunk_count
+        .checked_mul(u64::try_from(std::mem::size_of::<u64>())?)
+        .context("root-provision dirty bitmap body length overflow")?;
+    let mut buffer = [0_u8; 4096];
+    while remaining != 0 {
+        context.check_active()?;
+        let take = usize::try_from(remaining.min(u64::try_from(buffer.len())?))?;
+        if let Err(source) = reader.read_exact(&mut buffer[..take]) {
+            return if unavailable_io(&source) || source.kind() == io::ErrorKind::UnexpectedEof {
+                Ok(None)
+            } else {
+                Err(source).context("stream root-provision dirty bitmap words")
+            };
+        }
+        if buffer[..take].iter().any(|byte| *byte != 0) {
+            return Ok(None);
+        }
+        remaining -= u64::try_from(take)?;
+    }
+    context.check_active()?;
+    let after = file
+        .metadata()
+        .context("inspect root-provision dirty bitmap after read")?;
+    if before.len() != after.len()
+        || before.modified().ok() != after.modified().ok()
+        || before.ctime() != after.ctime()
+        || before.ctime_nsec() != after.ctime_nsec()
+    {
+        return Ok(None);
+    }
+    Ok(Some(()))
 }
 
 /// Reads the only recoverable hard-link shapes of a definite-release temp.
@@ -5149,6 +5264,19 @@ mod tests {
         }
     }
 
+    fn write_empty_dirty_bitmap(path: &Path, size_bytes: u64) {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let chunk_count = chunk::chunk_count(size_bytes);
+        let mut bytes = cats_blockd::format::encode_bitmap_header(chunk_count);
+        bytes.resize(
+            usize::try_from(BITMAP_HEADER_LEN + chunk_count * 8).unwrap(),
+            0,
+        );
+        std::fs::write(path, bytes).unwrap();
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600)).unwrap();
+    }
+
     #[test]
     fn authorized_data_probe_accepts_exact_control_only_engine_files_and_socket() {
         use std::os::unix::fs::PermissionsExt as _;
@@ -5165,12 +5293,7 @@ mod tests {
             std::fs::Permissions::from_mode(0o600),
         )
         .unwrap();
-        std::fs::write(data_directory.join("dirty.bitmap"), b"closed-empty-bitmap").unwrap();
-        std::fs::set_permissions(
-            data_directory.join("dirty.bitmap"),
-            std::fs::Permissions::from_mode(0o600),
-        )
-        .unwrap();
+        write_empty_dirty_bitmap(&data_directory.join("dirty.bitmap"), attachment.size_bytes);
         std::fs::create_dir(data_directory.join("pending-packs")).unwrap();
         std::fs::set_permissions(
             data_directory.join("pending-packs"),
@@ -5193,6 +5316,54 @@ mod tests {
             InventoryAbsence::AuthorizedBlockd(evidence)
                 if evidence.contains_key(&desired.cat_id)
         ));
+    }
+
+    #[test]
+    fn authorized_data_probe_rejects_nonempty_malformed_or_wrong_length_dirty_bitmap() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        for mutation in ["nonzero", "bad-header", "wrong-length"] {
+            let environment = TestEnvironment::new();
+            let scan_context = assigned_context(true);
+            let desired = &scan_context.coordinates().desired.desired_specs[0];
+            let (_record, attachment) = exact_owned_record_and_attachment(desired);
+            let data_directory = prepare_exact_lineage(&environment, desired, &attachment);
+            let cache = std::fs::File::create(data_directory.join("cache.data")).unwrap();
+            cache.set_len(attachment.size_bytes).unwrap();
+            std::fs::set_permissions(
+                data_directory.join("cache.data"),
+                std::fs::Permissions::from_mode(0o600),
+            )
+            .unwrap();
+            let bitmap_path = data_directory.join("dirty.bitmap");
+            write_empty_dirty_bitmap(&bitmap_path, attachment.size_bytes);
+            let mut before = std::fs::read(&bitmap_path).unwrap();
+            match mutation {
+                "nonzero" => *before.last_mut().unwrap() = 1,
+                "bad-header" => before[0] ^= 0xff,
+                "wrong-length" => {
+                    before.pop();
+                }
+                _ => unreachable!(),
+            }
+            std::fs::write(&bitmap_path, &before).unwrap();
+            std::fs::set_permissions(&bitmap_path, std::fs::Permissions::from_mode(0o600)).unwrap();
+            std::fs::create_dir(data_directory.join("pending-packs")).unwrap();
+            std::fs::set_permissions(
+                data_directory.join("pending-packs"),
+                std::fs::Permissions::from_mode(0o700),
+            )
+            .unwrap();
+
+            assert_eq!(
+                authorized_data_probe(&environment)
+                    .prove_absent(&scan_context)
+                    .unwrap(),
+                InventoryAbsence::Unavailable,
+                "{mutation}"
+            );
+            assert_eq!(std::fs::read(&bitmap_path).unwrap(), before, "{mutation}");
+        }
     }
 
     #[test]
