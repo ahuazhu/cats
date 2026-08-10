@@ -9,6 +9,13 @@ use std::{ffi::CString, os::fd::AsRawFd as _, os::fd::FromRawFd as _};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest as _, Sha256};
 
+use crate::gateway_workload_identity::{
+    decode_gateway_workload_identity_authority, GatewayWorkloadIdentityAuthority,
+    CONTROL_MACHINE_SERVER_CERTIFICATE_MAX_WIRE_BYTES, CONTROL_MACHINE_SERVER_CERTIFICATE_PATH,
+    CONTROL_MACHINE_SERVER_PRIVATE_KEY_MAX_WIRE_BYTES, CONTROL_MACHINE_SERVER_PRIVATE_KEY_PATH,
+    GATEWAY_CLIENT_CA_BUNDLE_MAX_WIRE_BYTES, GATEWAY_CLIENT_CA_BUNDLE_PATH,
+    GATEWAY_WORKLOAD_IDENTITY_AUTHORITY_MAX_WIRE_BYTES, GATEWAY_WORKLOAD_IDENTITY_AUTHORITY_PATH,
+};
 use crate::route_grant_v2::{
     decode_route_grant_v2_public_key_ring, decode_route_grant_v2_signer_reference,
     RouteGrantV2PublicKeyRingArtifact, RouteGrantV2SignerReference, RouteGrantV2SignerSelection,
@@ -106,6 +113,59 @@ pub struct InstalledRouteGrantV2Signer {
     exact_reference_bytes: Vec<u8>,
     ring: InstalledRouteGrantV2PublicKeyRing,
     private_key_pem: Option<Vec<u8>>,
+}
+
+/// Startup-pinned Gateway authentication and machine-listener TLS artifacts.
+///
+/// All four files come from one retained fixed directory and are revalidated
+/// together against the canonical lexical path before this value is returned.
+/// Debug output deliberately exposes neither exact policy bytes nor PEM
+/// material, and in particular never formats the server private key.
+pub struct InstalledGatewayMachineArtifacts {
+    authority: GatewayWorkloadIdentityAuthority,
+    exact_authority_bytes: Vec<u8>,
+    client_ca_bundle_pem: Vec<u8>,
+    server_certificate_pem: Vec<u8>,
+    server_private_key_pem: Vec<u8>,
+}
+
+impl std::fmt::Debug for InstalledGatewayMachineArtifacts {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("InstalledGatewayMachineArtifacts")
+            .field("authority_id", &self.authority.authority_id)
+            .field("fleet_id", &self.authority.fleet_id)
+            .field("policy_revision", &self.authority.policy_revision)
+            .field("exact_authority_bytes", &"[redacted]")
+            .field("client_ca_bundle_pem", &"[redacted]")
+            .field("server_certificate_pem", &"[redacted]")
+            .field("server_private_key_pem", &"[redacted]")
+            .finish()
+    }
+}
+
+impl InstalledGatewayMachineArtifacts {
+    pub fn authority(&self) -> &GatewayWorkloadIdentityAuthority {
+        &self.authority
+    }
+
+    pub fn exact_authority_bytes(&self) -> &[u8] {
+        &self.exact_authority_bytes
+    }
+
+    pub fn client_ca_bundle_pem(&self) -> &[u8] {
+        &self.client_ca_bundle_pem
+    }
+
+    pub fn server_certificate_pem(&self) -> &[u8] {
+        &self.server_certificate_pem
+    }
+
+    /// The returned bytes are secret material and must only be retained long
+    /// enough to construct the TLS private-key provider object.
+    pub fn server_private_key_pem(&self) -> &[u8] {
+        &self.server_private_key_pem
+    }
 }
 
 impl std::fmt::Debug for InstalledRouteGrantV2Signer {
@@ -226,6 +286,8 @@ pub enum RuntimeArtifactError {
     WrongRouteGrantV2PublicKeyRingPath,
     #[error("Route Grant v2 signer paths must be the canonical installed paths")]
     WrongRouteGrantV2SignerPath,
+    #[error("Gateway machine artifact paths must be the canonical installed paths")]
+    WrongGatewayMachineArtifactPath,
     #[error("Guest runtime release is not supported on this platform")]
     UnsupportedPlatform,
     #[error("Guest runtime release filesystem contract failed at {path}")]
@@ -240,6 +302,157 @@ pub enum RuntimeArtifactError {
     InvalidRouteGrantV2PublicKeyRing,
     #[error("Route Grant v2 signer artifact set is invalid")]
     InvalidRouteGrantV2Signer,
+    #[error("Gateway machine artifact set is invalid")]
+    InvalidGatewayMachineArtifacts,
+}
+
+/// Load the one fixed Gateway policy and Control machine-listener TLS set.
+/// Path arguments exist only so startup composition can prove that it accepted
+/// no alternate installation roots or secret locations.
+pub fn load_installed_gateway_machine_artifacts(
+    authority_path: &Path,
+    client_ca_bundle_path: &Path,
+    server_certificate_path: &Path,
+    server_private_key_path: &Path,
+) -> Result<InstalledGatewayMachineArtifacts, RuntimeArtifactError> {
+    if authority_path != Path::new(GATEWAY_WORKLOAD_IDENTITY_AUTHORITY_PATH)
+        || client_ca_bundle_path != Path::new(GATEWAY_CLIENT_CA_BUNDLE_PATH)
+        || server_certificate_path != Path::new(CONTROL_MACHINE_SERVER_CERTIFICATE_PATH)
+        || server_private_key_path != Path::new(CONTROL_MACHINE_SERVER_PRIVATE_KEY_PATH)
+    {
+        return Err(RuntimeArtifactError::WrongGatewayMachineArtifactPath);
+    }
+    load_installed_gateway_machine_artifacts_platform()
+}
+
+#[cfg(unix)]
+fn load_installed_gateway_machine_artifacts_platform(
+) -> Result<InstalledGatewayMachineArtifacts, RuntimeArtifactError> {
+    let directory = open_installed_directory(
+        &["etc", "cats", "route-v2"],
+        InstalledDirectoryMode::Exact(0o700),
+    )?;
+    load_gateway_machine_artifacts_from(
+        &directory,
+        InstalledFileContract::root(0o644),
+        InstalledFileContract::root(0o600),
+    )
+}
+
+#[cfg(not(unix))]
+fn load_installed_gateway_machine_artifacts_platform(
+) -> Result<InstalledGatewayMachineArtifacts, RuntimeArtifactError> {
+    Err(RuntimeArtifactError::UnsupportedPlatform)
+}
+
+#[cfg(unix)]
+fn load_gateway_machine_artifacts_from(
+    directory: &InstalledDirectoryPath,
+    public_file_contract: InstalledFileContract,
+    private_file_contract: InstalledFileContract,
+) -> Result<InstalledGatewayMachineArtifacts, RuntimeArtifactError> {
+    load_gateway_machine_artifacts_from_with_phase(
+        directory,
+        public_file_contract,
+        private_file_contract,
+        |_| {},
+    )
+}
+
+#[cfg(unix)]
+fn load_gateway_machine_artifacts_from_with_phase(
+    directory: &InstalledDirectoryPath,
+    public_file_contract: InstalledFileContract,
+    private_file_contract: InstalledFileContract,
+    mut after_read: impl FnMut(GatewayMachineArtifactReadPhase),
+) -> Result<InstalledGatewayMachineArtifacts, RuntimeArtifactError> {
+    let authority_file = read_pinned_installed_file_at_with_contract(
+        directory.final_descriptor(),
+        "gateway-workload-authority.v1.json",
+        Path::new(GATEWAY_WORKLOAD_IDENTITY_AUTHORITY_PATH),
+        GATEWAY_WORKLOAD_IDENTITY_AUTHORITY_MAX_WIRE_BYTES,
+        public_file_contract,
+    )?;
+    after_read(GatewayMachineArtifactReadPhase::Authority);
+    let client_ca_file = read_pinned_installed_file_at_with_contract(
+        directory.final_descriptor(),
+        "gateway-client-ca-bundle.pem",
+        Path::new(GATEWAY_CLIENT_CA_BUNDLE_PATH),
+        GATEWAY_CLIENT_CA_BUNDLE_MAX_WIRE_BYTES,
+        public_file_contract,
+    )?;
+    after_read(GatewayMachineArtifactReadPhase::ClientCaBundle);
+    let server_certificate_file = read_pinned_installed_file_at_with_contract(
+        directory.final_descriptor(),
+        "control-machine-server-certificate.pem",
+        Path::new(CONTROL_MACHINE_SERVER_CERTIFICATE_PATH),
+        CONTROL_MACHINE_SERVER_CERTIFICATE_MAX_WIRE_BYTES,
+        public_file_contract,
+    )?;
+    after_read(GatewayMachineArtifactReadPhase::ServerCertificate);
+    let server_private_key_file = read_pinned_installed_file_at_with_contract(
+        directory.final_descriptor(),
+        "control-machine-server-private-key.pem",
+        Path::new(CONTROL_MACHINE_SERVER_PRIVATE_KEY_PATH),
+        CONTROL_MACHINE_SERVER_PRIVATE_KEY_MAX_WIRE_BYTES,
+        private_file_contract,
+    )?;
+    after_read(GatewayMachineArtifactReadPhase::ServerPrivateKey);
+
+    if client_ca_file.exact_bytes().is_empty()
+        || server_certificate_file.exact_bytes().is_empty()
+        || server_private_key_file.exact_bytes().is_empty()
+    {
+        return Err(RuntimeArtifactError::InvalidGatewayMachineArtifacts);
+    }
+
+    // This is one startup/read transaction. Reopening the canonical directory
+    // once and comparing every retained descriptor closes directory and
+    // basename replacement during any of the four reads.
+    let fresh_directory = directory.reopen_canonical_path()?;
+    for (file, cap, contract) in [
+        (
+            &authority_file,
+            GATEWAY_WORKLOAD_IDENTITY_AUTHORITY_MAX_WIRE_BYTES,
+            public_file_contract,
+        ),
+        (
+            &client_ca_file,
+            GATEWAY_CLIENT_CA_BUNDLE_MAX_WIRE_BYTES,
+            public_file_contract,
+        ),
+        (
+            &server_certificate_file,
+            CONTROL_MACHINE_SERVER_CERTIFICATE_MAX_WIRE_BYTES,
+            public_file_contract,
+        ),
+        (
+            &server_private_key_file,
+            CONTROL_MACHINE_SERVER_PRIVATE_KEY_MAX_WIRE_BYTES,
+            private_file_contract,
+        ),
+    ] {
+        file.revalidate_from(&fresh_directory, cap, contract)?;
+    }
+
+    let authority = decode_gateway_workload_identity_authority(authority_file.exact_bytes())
+        .map_err(|_| RuntimeArtifactError::InvalidGatewayMachineArtifacts)?;
+    Ok(InstalledGatewayMachineArtifacts {
+        authority,
+        exact_authority_bytes: authority_file.into_exact_bytes(),
+        client_ca_bundle_pem: client_ca_file.into_exact_bytes(),
+        server_certificate_pem: server_certificate_file.into_exact_bytes(),
+        server_private_key_pem: server_private_key_file.into_exact_bytes(),
+    })
+}
+
+#[cfg(unix)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum GatewayMachineArtifactReadPhase {
+    Authority,
+    ClientCaBundle,
+    ServerCertificate,
+    ServerPrivateKey,
 }
 
 /// Load the one public ring installed on a Node. The path argument exists only
@@ -1523,6 +1736,13 @@ mod tests {
     const ROUTE_SIGNER: &[u8] = br#"{"version":1,"deployment_id":"route_deployment_a","signer_revision":1,"expected_previous":null,"signer":{"state":"active","active_kid":"fd56fed3251463eff0063169a7f8fa9dce585b6eee429581264297c98ec58bcb","secret_reference_id":"route_secret_a"},"public_key_ring_version":1,"public_key_ring_digest":"sha256:4e6fec49756e03044438af279f7bfd9507f06cf065ff0673447bd6377cd07ac0"}"#;
     const ROUTE_PRIVATE_KEY: &[u8] =
         include_bytes!("../../tests/fixtures/route_grant_private_ed25519.pem");
+    const GATEWAY_AUTHORITY: &[u8] = br#"{"version":1,"authority_id":"gateway_authority_a","fleet_id":"fleet_a","policy_revision":1,"expected_previous":null,"credentials":[{"credential_id":"gateway_credential_a","public_key_spki":"MCowBQYDK2VwAyEA2-Jj2UvNCvQiUPNYRgSi0cJSPiJI6Rs6D0UTeEpQVj8","scope":{"kind":"fleet"}}]}"#;
+    const TEST_CLIENT_CA: &[u8] =
+        b"-----BEGIN CERTIFICATE-----\nclient-ca\n-----END CERTIFICATE-----\n";
+    const TEST_SERVER_CERTIFICATE: &[u8] =
+        b"-----BEGIN CERTIFICATE-----\nserver\n-----END CERTIFICATE-----\n";
+    const TEST_SERVER_PRIVATE_KEY: &[u8] =
+        b"-----BEGIN PRIVATE KEY-----\nprivate\n-----END PRIVATE KEY-----\n";
 
     #[cfg(unix)]
     fn open_test_route_directory(root: &Path) -> InstalledDirectoryPath {
@@ -1578,6 +1798,86 @@ mod tests {
             std::fs::set_permissions(&private_path, std::fs::Permissions::from_mode(0o600))
                 .unwrap();
         }
+    }
+
+    #[cfg(unix)]
+    fn write_test_gateway_machine_artifacts(directory: &Path) {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        std::fs::create_dir(directory).unwrap();
+        std::fs::set_permissions(directory, std::fs::Permissions::from_mode(0o700)).unwrap();
+        for (basename, bytes, mode) in [
+            (
+                "gateway-workload-authority.v1.json",
+                GATEWAY_AUTHORITY,
+                0o644,
+            ),
+            ("gateway-client-ca-bundle.pem", TEST_CLIENT_CA, 0o644),
+            (
+                "control-machine-server-certificate.pem",
+                TEST_SERVER_CERTIFICATE,
+                0o644,
+            ),
+            (
+                "control-machine-server-private-key.pem",
+                TEST_SERVER_PRIVATE_KEY,
+                0o600,
+            ),
+        ] {
+            let path = directory.join(basename);
+            std::fs::write(&path, bytes).unwrap();
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(mode)).unwrap();
+        }
+    }
+
+    #[cfg(unix)]
+    fn test_gateway_contracts(directory: &Path) -> (InstalledFileContract, InstalledFileContract) {
+        use std::os::unix::fs::MetadataExt as _;
+
+        let metadata =
+            std::fs::metadata(directory.join("gateway-workload-authority.v1.json")).unwrap();
+        (
+            InstalledFileContract {
+                uid: metadata.uid(),
+                gid: metadata.gid(),
+                mode: 0o644,
+            },
+            InstalledFileContract {
+                uid: metadata.uid(),
+                gid: metadata.gid(),
+                mode: 0o600,
+            },
+        )
+    }
+
+    #[cfg(unix)]
+    fn replace_gateway_basename(directory: &Path, phase: GatewayMachineArtifactReadPhase) {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let (basename, bytes, mode) = match phase {
+            GatewayMachineArtifactReadPhase::Authority => (
+                "gateway-workload-authority.v1.json",
+                GATEWAY_AUTHORITY,
+                0o644,
+            ),
+            GatewayMachineArtifactReadPhase::ClientCaBundle => {
+                ("gateway-client-ca-bundle.pem", TEST_CLIENT_CA, 0o644)
+            }
+            GatewayMachineArtifactReadPhase::ServerCertificate => (
+                "control-machine-server-certificate.pem",
+                TEST_SERVER_CERTIFICATE,
+                0o644,
+            ),
+            GatewayMachineArtifactReadPhase::ServerPrivateKey => (
+                "control-machine-server-private-key.pem",
+                TEST_SERVER_PRIVATE_KEY,
+                0o600,
+            ),
+        };
+        let path = directory.join(basename);
+        std::fs::rename(&path, directory.join(format!("{basename}.displaced"))).unwrap();
+        std::fs::write(&path, bytes).unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(mode)).unwrap();
     }
 
     #[cfg(unix)]
@@ -1742,6 +2042,19 @@ mod tests {
                 Path::new(ROUTE_GRANT_V2_SIGNER_PRIVATE_KEY_PATH),
             ),
             Err(RuntimeArtifactError::WrongRouteGrantV2SignerPath)
+        ));
+    }
+
+    #[test]
+    fn gateway_machine_paths_reject_every_alternate_before_filesystem_access() {
+        assert!(matches!(
+            load_installed_gateway_machine_artifacts(
+                Path::new("relative.json"),
+                Path::new(GATEWAY_CLIENT_CA_BUNDLE_PATH),
+                Path::new(CONTROL_MACHINE_SERVER_CERTIFICATE_PATH),
+                Path::new(CONTROL_MACHINE_SERVER_PRIVATE_KEY_PATH),
+            ),
+            Err(RuntimeArtifactError::WrongGatewayMachineArtifactPath)
         ));
     }
 
@@ -2187,6 +2500,107 @@ mod tests {
         assert!(matches!(
             inspect_route_grant_v2_public_key_ring_from(&retained, contract),
             Err(RuntimeArtifactError::InvalidRouteGrantV2PublicKeyRing)
+        ));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn gateway_machine_reader_pins_one_closed_set_and_redacts_private_material() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let temp = tempfile::tempdir().unwrap();
+        let directory_path = temp.path().join("route-v2");
+        write_test_gateway_machine_artifacts(&directory_path);
+        let (public_contract, private_contract) = test_gateway_contracts(&directory_path);
+        let retained = open_test_route_directory(temp.path());
+        let installed =
+            load_gateway_machine_artifacts_from(&retained, public_contract, private_contract)
+                .unwrap();
+        assert_eq!(installed.exact_authority_bytes(), GATEWAY_AUTHORITY);
+        assert_eq!(installed.client_ca_bundle_pem(), TEST_CLIENT_CA);
+        assert_eq!(installed.server_certificate_pem(), TEST_SERVER_CERTIFICATE);
+        assert_eq!(installed.server_private_key_pem(), TEST_SERVER_PRIVATE_KEY);
+        assert_eq!(
+            installed.authority().authority_id.as_str(),
+            "gateway_authority_a"
+        );
+        let debug = format!("{installed:?}");
+        assert!(debug.contains("gateway_authority_a"));
+        assert!(debug.contains("[redacted]"));
+        assert!(!debug.contains("BEGIN PRIVATE KEY"));
+
+        let private_path = directory_path.join("control-machine-server-private-key.pem");
+        std::fs::set_permissions(&private_path, std::fs::Permissions::from_mode(0o644)).unwrap();
+        assert!(matches!(
+            load_gateway_machine_artifacts_from(&retained, public_contract, private_contract),
+            Err(RuntimeArtifactError::Filesystem { .. })
+        ));
+        std::fs::set_permissions(&private_path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        std::fs::hard_link(&private_path, directory_path.join("private-hardlink")).unwrap();
+        assert!(matches!(
+            load_gateway_machine_artifacts_from(&retained, public_contract, private_contract),
+            Err(RuntimeArtifactError::Filesystem { .. })
+        ));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn gateway_machine_reader_rejects_basename_replacement_after_every_read_phase() {
+        for target in [
+            GatewayMachineArtifactReadPhase::Authority,
+            GatewayMachineArtifactReadPhase::ClientCaBundle,
+            GatewayMachineArtifactReadPhase::ServerCertificate,
+            GatewayMachineArtifactReadPhase::ServerPrivateKey,
+        ] {
+            let temp = tempfile::tempdir().unwrap();
+            let directory_path = temp.path().join("route-v2");
+            write_test_gateway_machine_artifacts(&directory_path);
+            let (public_contract, private_contract) = test_gateway_contracts(&directory_path);
+            let retained = open_test_route_directory(temp.path());
+            let result = load_gateway_machine_artifacts_from_with_phase(
+                &retained,
+                public_contract,
+                private_contract,
+                |phase| {
+                    if phase == target {
+                        replace_gateway_basename(&directory_path, phase);
+                    }
+                },
+            );
+            assert!(
+                matches!(result, Err(RuntimeArtifactError::Filesystem { .. })),
+                "Gateway artifact replacement escaped at {target:?}: {result:?}"
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn gateway_machine_reader_enforces_pem_bounds_and_nonempty_files() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let temp = tempfile::tempdir().unwrap();
+        let directory_path = temp.path().join("route-v2");
+        write_test_gateway_machine_artifacts(&directory_path);
+        let (public_contract, private_contract) = test_gateway_contracts(&directory_path);
+        let ca_path = directory_path.join("gateway-client-ca-bundle.pem");
+        std::fs::write(
+            &ca_path,
+            vec![b'x'; GATEWAY_CLIENT_CA_BUNDLE_MAX_WIRE_BYTES + 1],
+        )
+        .unwrap();
+        std::fs::set_permissions(&ca_path, std::fs::Permissions::from_mode(0o644)).unwrap();
+        let retained = open_test_route_directory(temp.path());
+        assert!(matches!(
+            load_gateway_machine_artifacts_from(&retained, public_contract, private_contract),
+            Err(RuntimeArtifactError::LimitExceeded)
+        ));
+
+        std::fs::write(&ca_path, []).unwrap();
+        let retained = open_test_route_directory(temp.path());
+        assert!(matches!(
+            load_gateway_machine_artifacts_from(&retained, public_contract, private_contract),
+            Err(RuntimeArtifactError::InvalidGatewayMachineArtifacts)
         ));
     }
 
