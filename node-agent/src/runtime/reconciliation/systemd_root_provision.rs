@@ -13,6 +13,8 @@ use std::ffi::OsString;
 use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitStatus, Stdio};
+#[cfg(target_os = "linux")]
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use anyhow::Context as _;
@@ -26,6 +28,7 @@ use crate::proc::ProcHandle;
 #[cfg(target_os = "linux")]
 use crate::proc::{ExactPidFd, ExactPidFdOpen, PidFdSignal, ProcIdentity};
 use crate::runtime_spine::{RuntimeDesiredEffectContext, RuntimePhysicalReadContext};
+use crate::state_directory::StateDirectory;
 
 use super::authorized_blockd::AuthorizedBlockdLaunchConfig;
 #[cfg(test)]
@@ -36,6 +39,11 @@ use super::root_provision_process::{
     RootProvisionProcessConflict, RootProvisionProcessEvidence, RootProvisionProcessExpectation,
     RootProvisionProcessInspection, RootProvisionProcessPort, RootProvisionProcessStart,
     RootProvisionProcessStop, TargetControlProcessLaunchIdentity, TargetControlProcessPort,
+};
+use super::serving_blockd_process::{
+    process_sealed as serving_process_sealed, CheckpointedServingBlockdProcess,
+    ServingBlockdExpectation, ServingBlockdProcessConflict, ServingBlockdProcessEvidence,
+    ServingBlockdProcessInspection, ServingBlockdProcessPort, ServingBlockdProcessStart,
 };
 
 const SYSTEMD_RUN: &str = "/usr/bin/systemd-run";
@@ -51,13 +59,14 @@ const AUTHORIZED_CONTROL_SPEC: &str = "authorized-serving.json";
 const STATUS_MAX_BYTES: usize = 64 * 1024;
 const COMMAND_OUTPUT_MAX_BYTES: usize = 32 * 1024;
 const POLL_INTERVAL: Duration = Duration::from_millis(5);
-const UNSET_CREDENTIAL_ENVIRONMENT: [&str; 6] = [
+const UNSET_PROCESS_ENVIRONMENT: [&str; 7] = [
     "AWS_ACCESS_KEY_ID",
     "AWS_SECRET_ACCESS_KEY",
     "AWS_SESSION_TOKEN",
     "AWS_CONTAINER_CREDENTIALS_FULL_URI",
     "AWS_CONTAINER_AUTHORIZATION_TOKEN_FILE",
     "CATS_POSTGRES_URL",
+    "CATS_CRASH_POINT",
 ];
 
 /// Credentialless process inputs. PostgreSQL must use its rotating `url-file`
@@ -758,6 +767,172 @@ pub(crate) struct PlatformSystemdRootProvisionProcessPort {
     inner: SystemdRootProvisionProcessPort<PlatformSystemdTransientService, UnixBlockdHandshake>,
 }
 
+pub(crate) struct PlatformSystemdServingBlockdProcessPort {
+    systemd: PlatformSystemdTransientService,
+    handshake: UnixBlockdHandshake,
+    state_directory: StateDirectory,
+}
+
+impl PlatformSystemdServingBlockdProcessPort {
+    pub(crate) fn platform(state_directory: StateDirectory) -> Self {
+        Self {
+            systemd: PlatformSystemdTransientService,
+            handshake: UnixBlockdHandshake,
+            state_directory,
+        }
+    }
+
+    fn launch(
+        &self,
+        expected: &ServingBlockdExpectation,
+    ) -> anyhow::Result<TransientServiceLaunch> {
+        let [program, arguments @ ..] = expected.command_line() else {
+            anyhow::bail!("serving blockd exact command line is empty")
+        };
+        anyhow::ensure!(
+            program == expected.executable_path().as_str()
+                && Path::new(expected.executable_path().as_str()).is_absolute(),
+            "serving blockd command changed its exact executable"
+        );
+        Ok(TransientServiceLaunch {
+            unit_id: expected.unit_id().clone(),
+            cgroup_path: expected.cgroup_path().clone(),
+            executable: PathBuf::from(expected.executable_path().as_str()),
+            arguments: arguments.to_vec(),
+            process_identity_token: expected.process_identity_token().clone(),
+        })
+    }
+
+    fn inspect_exact(
+        &self,
+        expected: &ServingBlockdExpectation,
+        launch: &TransientServiceLaunch,
+        context: &dyn RuntimePhysicalReadContext,
+    ) -> anyhow::Result<ServingBlockdProcessInspection> {
+        let first = match self.systemd.inspect(launch, context)? {
+            SystemdInspection::Absent => return Ok(ServingBlockdProcessInspection::Absent),
+            SystemdInspection::Starting | SystemdInspection::Unavailable => {
+                return Ok(ServingBlockdProcessInspection::Unavailable)
+            }
+            SystemdInspection::Conflict => {
+                return Ok(ServingBlockdProcessInspection::Conflict(
+                    ServingBlockdProcessConflict::IdentityMismatch,
+                ))
+            }
+            SystemdInspection::Exact(proof) => proof,
+        };
+        let (peer_process_id, status) = match self
+            .handshake
+            .status(expected.control_socket_path(), context)?
+        {
+            BlockdHandshakeInspection::Verified {
+                peer_process_id,
+                status,
+            } => (peer_process_id, status),
+            BlockdHandshakeInspection::Unavailable => {
+                return Ok(ServingBlockdProcessInspection::Unavailable)
+            }
+            BlockdHandshakeInspection::Malformed => {
+                return Ok(ServingBlockdProcessInspection::Conflict(
+                    ServingBlockdProcessConflict::IdentityMismatch,
+                ))
+            }
+        };
+        let listener_identity = match platform_listener_peer(
+            &self.state_directory,
+            expected.frontend(),
+            first.process_id,
+            context,
+        )? {
+            ListenerPeerInspection::Exact(identity) => identity,
+            ListenerPeerInspection::Unavailable => {
+                return Ok(ServingBlockdProcessInspection::Unavailable)
+            }
+            ListenerPeerInspection::Conflict => {
+                return Ok(ServingBlockdProcessInspection::Conflict(
+                    ServingBlockdProcessConflict::IdentityMismatch,
+                ))
+            }
+        };
+        let second = match self.systemd.inspect(launch, context)? {
+            SystemdInspection::Exact(proof) if proof == first => proof,
+            SystemdInspection::Starting | SystemdInspection::Unavailable => {
+                return Ok(ServingBlockdProcessInspection::Unavailable)
+            }
+            SystemdInspection::Absent
+            | SystemdInspection::Exact(_)
+            | SystemdInspection::Conflict => {
+                return Ok(ServingBlockdProcessInspection::Conflict(
+                    ServingBlockdProcessConflict::IdentityMismatch,
+                ))
+            }
+        };
+        let start_ticks = WireU64::new(second.process_start_time_ticks)
+            .context("systemd serving blockd start ticks exceed Runtime wire range")?;
+        let evidence = ServingBlockdProcessEvidence::from_inspected(
+            second.process_id,
+            start_ticks,
+            HostPath::new(second.executable_path.to_string_lossy().into_owned())
+                .context("systemd returned a noncanonical serving executable")?,
+            second.unit_id,
+            second.cgroup_path,
+            second.cgroup_process_ids,
+            launch.expected_command_line(),
+            expected.control_socket_path().clone(),
+            expected.data_directory().clone(),
+            expected.process_identity_token().clone(),
+            expected.device_ownership_token().clone(),
+            expected.frontend().clone(),
+            listener_identity,
+            peer_process_id,
+            *status,
+        );
+        Ok(
+            if peer_process_id == second.process_id && evidence.exactly_matches(expected) {
+                ServingBlockdProcessInspection::Exact(Box::new(evidence))
+            } else {
+                ServingBlockdProcessInspection::Conflict(
+                    ServingBlockdProcessConflict::IdentityMismatch,
+                )
+            },
+        )
+    }
+}
+
+impl serving_process_sealed::Sealed for PlatformSystemdServingBlockdProcessPort {}
+
+impl ServingBlockdProcessPort for PlatformSystemdServingBlockdProcessPort {
+    fn inspect(
+        &self,
+        expected: &ServingBlockdExpectation,
+        context: &dyn RuntimePhysicalReadContext,
+    ) -> anyhow::Result<ServingBlockdProcessInspection> {
+        let launch = self.launch(expected)?;
+        self.inspect_exact(expected, &launch, context)
+    }
+
+    fn start_checkpointed(
+        &self,
+        checkpointed: CheckpointedServingBlockdProcess<'_>,
+        context: &RuntimeDesiredEffectContext,
+    ) -> anyhow::Result<ServingBlockdProcessStart> {
+        context.check_active()?;
+        checkpointed.assert_current()?;
+        let launch = self.launch(checkpointed.expected())?;
+        checkpointed.assert_current()?;
+        context.check_active()?;
+        let submitted = self.systemd.submit(&launch, context)?;
+        checkpointed.assert_current()?;
+        Ok(match submitted {
+            SystemdStartSubmission::Submitted => ServingBlockdProcessStart::Submitted,
+            SystemdStartSubmission::OutcomeUnknown => ServingBlockdProcessStart::OutcomeUnknown,
+            SystemdStartSubmission::DefinitelyNotStarted => {
+                ServingBlockdProcessStart::DefinitelyNotStarted
+            }
+        })
+    }
+}
+
 impl PlatformSystemdRootProvisionProcessPort {
     pub(crate) fn platform(config: RootProvisionSystemdConfig) -> Self {
         Self {
@@ -883,7 +1058,7 @@ fn systemd_run_command(launch: &TransientServiceLaunch) -> Command {
         .arg("--property=PassEnvironment=")
         .arg(format!(
             "--property=UnsetEnvironment={}",
-            UNSET_CREDENTIAL_ENVIRONMENT.join(" ")
+            UNSET_PROCESS_ENVIRONMENT.join(" ")
         ));
     command
         .arg("--")
@@ -1301,7 +1476,7 @@ fn exact_unset_environment(value: &str) -> bool {
         .map(|entry| entry.trim_matches('"'))
         .collect::<Vec<_>>();
     actual.sort_unstable();
-    let mut expected = UNSET_CREDENTIAL_ENVIRONMENT.to_vec();
+    let mut expected = UNSET_PROCESS_ENVIRONMENT.to_vec();
     expected.sort_unstable();
     actual == expected
 }
@@ -1341,7 +1516,7 @@ fn sample_linux_process(process_id: u32) -> Option<LinuxProcessSample> {
     }
     let environment = std::fs::read(format!("/proc/{process_id}/environ")).ok()?;
     let environment_keys = parse_process_environment_keys(&environment)?;
-    if !credential_environment_is_absent(&environment_keys) {
+    if !forbidden_process_environment_is_absent(&environment_keys) {
         return None;
     }
     Some(LinuxProcessSample {
@@ -1371,8 +1546,8 @@ fn parse_process_environment_keys(bytes: &[u8]) -> Option<Vec<Vec<u8>>> {
     (keys.len() == before).then_some(keys)
 }
 
-fn credential_environment_is_absent(keys: &[Vec<u8>]) -> bool {
-    UNSET_CREDENTIAL_ENVIRONMENT.iter().all(|forbidden| {
+fn forbidden_process_environment_is_absent(keys: &[Vec<u8>]) -> bool {
+    UNSET_PROCESS_ENVIRONMENT.iter().all(|forbidden| {
         !keys
             .iter()
             .any(|key| key.as_slice() == forbidden.as_bytes())
@@ -1405,13 +1580,45 @@ fn platform_blockd_status(
     socket_path: &HostPath,
     context: &dyn RuntimePhysicalReadContext,
 ) -> anyhow::Result<BlockdHandshakeInspection> {
+    use std::os::fd::AsRawFd as _;
+
+    let Some(mut stream) = platform_connect_unix(socket_path, context)? else {
+        return Ok(BlockdHandshakeInspection::Unavailable);
+    };
+    let peer_process_id = peer_process_id(stream.as_raw_fd())?;
+    if !write_socket(&mut stream, b"status\n", context)? {
+        return Ok(BlockdHandshakeInspection::Unavailable);
+    }
+    let Some(line) = read_status_line(&mut stream, context)? else {
+        return Ok(BlockdHandshakeInspection::Unavailable);
+    };
+    let Ok(line) = std::str::from_utf8(&line) else {
+        return Ok(BlockdHandshakeInspection::Malformed);
+    };
+    let Ok(BlockdControlResponse::Ok(payload)) = BlockdControlResponse::parse_wire(line) else {
+        return Ok(BlockdHandshakeInspection::Malformed);
+    };
+    let Ok(status) = serde_json::from_str::<DurabilityStatus>(&payload) else {
+        return Ok(BlockdHandshakeInspection::Malformed);
+    };
+    Ok(BlockdHandshakeInspection::Verified {
+        peer_process_id,
+        status: Box::new(status),
+    })
+}
+
+#[cfg(target_os = "linux")]
+fn platform_connect_unix(
+    socket_path: &HostPath,
+    context: &dyn RuntimePhysicalReadContext,
+) -> anyhow::Result<Option<std::os::unix::net::UnixStream>> {
     use std::mem::size_of;
-    use std::os::fd::{AsRawFd as _, FromRawFd as _};
+    use std::os::fd::FromRawFd as _;
 
     context.check_active()?;
     let path = socket_path.as_str().as_bytes();
     if path.len() >= 108 {
-        return Ok(BlockdHandshakeInspection::Malformed);
+        return Ok(None);
     }
     // SAFETY: socket returns a fresh descriptor and retains no Rust memory.
     let descriptor = unsafe {
@@ -1422,7 +1629,7 @@ fn platform_blockd_status(
         )
     };
     if descriptor < 0 {
-        return Ok(BlockdHandshakeInspection::Unavailable);
+        return Ok(None);
     }
     // SAFETY: all-zero is a valid initial sockaddr_un; the used family and
     // pathname bytes are initialized below before connect reads the value.
@@ -1448,31 +1655,674 @@ fn platform_blockd_status(
         {
             // SAFETY: descriptor is still owned here.
             unsafe { libc::close(descriptor) };
-            return Ok(BlockdHandshakeInspection::Unavailable);
+            return Ok(None);
         }
     }
     // SAFETY: ownership of the connected descriptor moves into UnixStream.
-    let mut stream = unsafe { std::os::unix::net::UnixStream::from_raw_fd(descriptor) };
-    let peer_process_id = peer_process_id(stream.as_raw_fd())?;
-    if !write_socket(&mut stream, b"status\n", context)? {
-        return Ok(BlockdHandshakeInspection::Unavailable);
+    Ok(Some(unsafe {
+        std::os::unix::net::UnixStream::from_raw_fd(descriptor)
+    }))
+}
+
+#[cfg(target_os = "linux")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ListenerPathIdentity {
+    device: u64,
+    inode: u64,
+    mode: u32,
+    links: u64,
+    user: u32,
+    group: u32,
+}
+
+#[cfg(target_os = "linux")]
+#[derive(Clone)]
+struct RetainedListenerPath {
+    root: Arc<std::fs::File>,
+    root_identity: ListenerPathIdentity,
+    directories: Vec<RetainedListenerDirectory>,
+    leaf: Arc<std::fs::File>,
+    leaf_name: OsString,
+    identity: ListenerPathIdentity,
+}
+
+#[cfg(target_os = "linux")]
+#[derive(Clone)]
+struct RetainedListenerDirectory {
+    name: OsString,
+    descriptor: Arc<std::fs::File>,
+    identity: ListenerPathIdentity,
+}
+
+#[cfg(target_os = "linux")]
+impl std::fmt::Debug for RetainedListenerDirectory {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("RetainedListenerDirectory")
+            .field("name", &self.name)
+            .field("identity", &self.identity)
+            .finish_non_exhaustive()
     }
-    let Some(line) = read_status_line(&mut stream, context)? else {
-        return Ok(BlockdHandshakeInspection::Unavailable);
+}
+
+#[cfg(target_os = "linux")]
+impl PartialEq for RetainedListenerDirectory {
+    fn eq(&self, other: &Self) -> bool {
+        self.name == other.name && self.identity == other.identity
+    }
+}
+
+#[cfg(target_os = "linux")]
+impl Eq for RetainedListenerDirectory {}
+
+#[cfg(target_os = "linux")]
+impl std::fmt::Debug for RetainedListenerPath {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("RetainedListenerPath")
+            .field("root_identity", &self.root_identity)
+            .field("directories", &self.directories)
+            .field("leaf_name", &self.leaf_name)
+            .field("identity", &self.identity)
+            .finish_non_exhaustive()
+    }
+}
+
+#[cfg(target_os = "linux")]
+impl PartialEq for RetainedListenerPath {
+    fn eq(&self, other: &Self) -> bool {
+        self.root_identity == other.root_identity
+            && self.directories == other.directories
+            && self.leaf_name == other.leaf_name
+            && self.identity == other.identity
+    }
+}
+
+#[cfg(target_os = "linux")]
+impl Eq for RetainedListenerPath {}
+
+#[cfg(target_os = "linux")]
+enum RetainedListenerPathInspection {
+    Exact(RetainedListenerPath),
+    Unavailable,
+    Conflict,
+}
+
+#[cfg(target_os = "linux")]
+impl RetainedListenerPath {
+    fn open(
+        state_directory: &StateDirectory,
+        socket: &HostPath,
+    ) -> anyhow::Result<RetainedListenerPathInspection> {
+        use std::path::Component;
+
+        let relative = match Path::new(socket.as_str()).strip_prefix(state_directory.path()) {
+            Ok(relative) => relative,
+            Err(_) => return Ok(RetainedListenerPathInspection::Conflict),
+        };
+        let mut components = Vec::new();
+        for component in relative.components() {
+            match component {
+                Component::Normal(component) => components.push(component.to_owned()),
+                Component::Prefix(_)
+                | Component::RootDir
+                | Component::CurDir
+                | Component::ParentDir => return Ok(RetainedListenerPathInspection::Conflict),
+            }
+        }
+        if components.is_empty() {
+            return Ok(RetainedListenerPathInspection::Conflict);
+        }
+        let root = match state_directory.try_clone_directory() {
+            Ok(root) => Arc::new(root),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                return Ok(RetainedListenerPathInspection::Unavailable)
+            }
+            Err(error) => return Err(error).context("retain serving listener state root"),
+        };
+        let root_identity = match root.metadata() {
+            Ok(metadata) if metadata.is_dir() => listener_path_identity(&metadata),
+            Ok(_) => return Ok(RetainedListenerPathInspection::Conflict),
+            Err(_) => return Ok(RetainedListenerPathInspection::Unavailable),
+        };
+        let (directories, leaf) = match retain_listener_relative(&root, &components) {
+            Ok(retained) => retained,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                return Ok(RetainedListenerPathInspection::Unavailable)
+            }
+            Err(error)
+                if matches!(
+                    error.raw_os_error(),
+                    Some(libc::ELOOP) | Some(libc::ENOTDIR) | Some(libc::EINVAL)
+                ) =>
+            {
+                return Ok(RetainedListenerPathInspection::Conflict)
+            }
+            Err(_) => return Ok(RetainedListenerPathInspection::Unavailable),
+        };
+        let leaf = Arc::new(leaf);
+        let metadata = match leaf.metadata() {
+            Ok(metadata) => metadata,
+            Err(_) => return Ok(RetainedListenerPathInspection::Unavailable),
+        };
+        use std::os::unix::fs::FileTypeExt as _;
+        if !metadata.file_type().is_socket() {
+            return Ok(RetainedListenerPathInspection::Conflict);
+        }
+        let identity = listener_path_identity(&metadata);
+        Ok(RetainedListenerPathInspection::Exact(Self {
+            root,
+            root_identity,
+            directories,
+            leaf,
+            leaf_name: components
+                .last()
+                .expect("nonempty lexical listener components")
+                .clone(),
+            identity,
+        }))
+    }
+
+    fn assert_current(&self) -> anyhow::Result<()> {
+        anyhow::ensure!(
+            listener_path_identity(
+                &self
+                    .root
+                    .metadata()
+                    .context("reinspect retained serving listener state root")?
+            ) == self.root_identity,
+            "retained serving listener state root identity changed"
+        );
+        let mut current = self.root.try_clone()?;
+        for directory in &self.directories {
+            anyhow::ensure!(
+                listener_path_identity(
+                    &directory
+                        .descriptor
+                        .metadata()
+                        .context("reinspect retained serving listener parent")?
+                ) == directory.identity,
+                "retained serving listener parent identity changed"
+            );
+            let reopened = open_path_component(
+                &current,
+                &directory.name,
+                libc::O_PATH | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+            )
+            .context("reopen serving listener parent from retained state root")?;
+            anyhow::ensure!(
+                listener_path_identity(
+                    &reopened
+                        .metadata()
+                        .context("reinspect reopened serving listener parent")?
+                ) == directory.identity,
+                "serving listener parent chain no longer names the retained directory"
+            );
+            current = reopened;
+        }
+        let retained = self
+            .leaf
+            .metadata()
+            .context("reinspect retained serving listener descriptor")?;
+        anyhow::ensure!(
+            listener_path_identity(&retained) == self.identity,
+            "retained serving listener descriptor identity changed"
+        );
+        let reopened = open_path_component(
+            &current,
+            &self.leaf_name,
+            libc::O_PATH | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+        )
+        .context("reopen serving listener from retained parent chain")?;
+        let reopened = reopened
+            .metadata()
+            .context("reinspect reopened serving listener")?;
+        anyhow::ensure!(
+            listener_path_identity(&reopened) == self.identity,
+            "serving listener lexical path no longer names the retained inode"
+        );
+        Ok(())
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn listener_path_identity(metadata: &std::fs::Metadata) -> ListenerPathIdentity {
+    use std::os::unix::fs::MetadataExt as _;
+
+    ListenerPathIdentity {
+        device: metadata.dev(),
+        inode: metadata.ino(),
+        mode: metadata.mode(),
+        links: metadata.nlink(),
+        user: metadata.uid(),
+        group: metadata.gid(),
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn retain_listener_relative(
+    root: &std::fs::File,
+    components: &[OsString],
+) -> std::io::Result<(Vec<RetainedListenerDirectory>, std::fs::File)> {
+    let mut current = root.try_clone()?;
+    let mut directories = Vec::with_capacity(components.len().saturating_sub(1));
+    for component in &components[..components.len() - 1] {
+        let descriptor = open_path_component(
+            &current,
+            component,
+            libc::O_PATH | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+        )?;
+        let identity = listener_path_identity(&descriptor.metadata()?);
+        current = descriptor.try_clone()?;
+        directories.push(RetainedListenerDirectory {
+            name: component.clone(),
+            descriptor: Arc::new(descriptor),
+            identity,
+        });
+    }
+    let leaf = open_path_component(
+        &current,
+        components.last().expect("nonempty listener path"),
+        libc::O_PATH | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+    )?;
+    Ok((directories, leaf))
+}
+
+#[cfg(target_os = "linux")]
+fn open_path_component(
+    parent: &std::fs::File,
+    component: &std::ffi::OsStr,
+    flags: libc::c_int,
+) -> std::io::Result<std::fs::File> {
+    use std::os::fd::{AsRawFd as _, FromRawFd as _};
+    use std::os::unix::ffi::OsStrExt as _;
+
+    let component = std::ffi::CString::new(component.as_bytes())
+        .map_err(|_| std::io::Error::from(std::io::ErrorKind::InvalidInput))?;
+    // SAFETY: `parent` owns a live directory descriptor, the component is
+    // NUL-terminated for this call, and a successful descriptor moves exactly
+    // once into `File`.
+    let descriptor = unsafe { libc::openat(parent.as_raw_fd(), component.as_ptr(), flags) };
+    if descriptor < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    // SAFETY: `openat` returned a new owned descriptor above.
+    Ok(unsafe { std::fs::File::from_raw_fd(descriptor) })
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) struct ListenerPhysicalIdentity {
+    pub(super) process_id: u32,
+    pub(super) path_device: u64,
+    pub(super) path_inode: u64,
+    pub(super) socket_inode: u64,
+    #[cfg(target_os = "linux")]
+    retained_path: Option<Arc<RetainedListenerPath>>,
+}
+
+impl ListenerPhysicalIdentity {
+    #[cfg(test)]
+    pub(super) fn for_test(
+        process_id: u32,
+        path_device: u64,
+        path_inode: u64,
+        socket_inode: u64,
+    ) -> Self {
+        Self {
+            process_id,
+            path_device,
+            path_inode,
+            socket_inode,
+            #[cfg(target_os = "linux")]
+            retained_path: None,
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    fn assert_path_current(&self) -> anyhow::Result<()> {
+        let retained = self
+            .retained_path
+            .as_ref()
+            .context("serving listener proof did not retain its pathname descriptor")?;
+        retained.assert_current()
+    }
+
+    #[cfg(target_os = "linux")]
+    pub(super) fn assert_current(
+        &self,
+        frontend: &cats_api::runtime_reconciliation::PrepareDeviceFrontend,
+        context: &dyn RuntimePhysicalReadContext,
+    ) -> anyhow::Result<()> {
+        let socket = match frontend {
+            cats_api::runtime_reconciliation::PrepareDeviceFrontend::KernelNbd {
+                listener_socket_path,
+                ..
+            } => listener_socket_path,
+            cats_api::runtime_reconciliation::PrepareDeviceFrontend::VhostUserBlk {
+                socket_path,
+                ..
+            } => socket_path,
+        };
+        for _ in 0..2 {
+            context.check_active()?;
+            self.assert_path_current()?;
+            anyhow::ensure!(
+                matches!(
+                    proc_unix_listener_inode(socket, context)?,
+                    ListenerInodeInspection::Exact(inode) if inode == self.socket_inode
+                ),
+                "serving listener kernel inode changed after full inventory"
+            );
+            anyhow::ensure!(
+                node_global_listener_fd_owner(self.process_id, self.socket_inode, context)?
+                    == ListenerHolderInspection::Exact,
+                "serving listener holder set changed after full inventory"
+            );
+        }
+        Ok(())
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    pub(super) fn assert_current(
+        &self,
+        _frontend: &cats_api::runtime_reconciliation::PrepareDeviceFrontend,
+        _context: &dyn RuntimePhysicalReadContext,
+    ) -> anyhow::Result<()> {
+        anyhow::bail!("serving listener physical proof is unavailable on this platform")
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) enum ListenerPeerInspection {
+    Exact(ListenerPhysicalIdentity),
+    Unavailable,
+    Conflict,
+}
+
+#[cfg(target_os = "linux")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ListenerHolderInspection {
+    Exact,
+    Unavailable,
+    Conflict,
+}
+
+#[cfg(target_os = "linux")]
+pub(super) fn platform_listener_peer(
+    state_directory: &StateDirectory,
+    frontend: &cats_api::runtime_reconciliation::PrepareDeviceFrontend,
+    expected_process_id: u32,
+    context: &dyn RuntimePhysicalReadContext,
+) -> anyhow::Result<ListenerPeerInspection> {
+    use std::os::unix::fs::MetadataExt as _;
+
+    let socket = match frontend {
+        cats_api::runtime_reconciliation::PrepareDeviceFrontend::KernelNbd {
+            listener_socket_path,
+            ..
+        } => listener_socket_path,
+        cats_api::runtime_reconciliation::PrepareDeviceFrontend::VhostUserBlk {
+            socket_path,
+            ..
+        } => socket_path,
     };
-    let Ok(line) = std::str::from_utf8(&line) else {
-        return Ok(BlockdHandshakeInspection::Malformed);
+    context.check_active()?;
+    let retained_path = match RetainedListenerPath::open(state_directory, socket)? {
+        RetainedListenerPathInspection::Exact(retained) => Arc::new(retained),
+        RetainedListenerPathInspection::Unavailable => {
+            return Ok(ListenerPeerInspection::Unavailable)
+        }
+        RetainedListenerPathInspection::Conflict => return Ok(ListenerPeerInspection::Conflict),
     };
-    let Ok(BlockdControlResponse::Ok(payload)) = BlockdControlResponse::parse_wire(line) else {
-        return Ok(BlockdHandshakeInspection::Malformed);
+    let process = PathBuf::from(format!("/proc/{expected_process_id}"));
+    let process_metadata = match std::fs::metadata(&process) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(ListenerPeerInspection::Unavailable)
+        }
+        Err(error) => return Err(error).context("inspect serving listener process"),
     };
-    let Ok(status) = serde_json::from_str::<DurabilityStatus>(&payload) else {
-        return Ok(BlockdHandshakeInspection::Malformed);
+    if expected_process_id == 0
+        || !process_metadata.is_dir()
+        || retained_path.identity.links != 1
+        || retained_path.identity.mode & 0o7777 != 0o700
+        || retained_path.identity.user != process_metadata.uid()
+        || retained_path.identity.group != process_metadata.gid()
+    {
+        return Ok(ListenerPeerInspection::Conflict);
+    }
+
+    let socket_inode = match proc_unix_listener_inode(socket, context)? {
+        ListenerInodeInspection::Exact(inode) => inode,
+        ListenerInodeInspection::Unavailable => return Ok(ListenerPeerInspection::Unavailable),
+        ListenerInodeInspection::Conflict => return Ok(ListenerPeerInspection::Conflict),
     };
-    Ok(BlockdHandshakeInspection::Verified {
-        peer_process_id,
-        status: Box::new(status),
+    match node_global_listener_fd_owner(expected_process_id, socket_inode, context)? {
+        ListenerHolderInspection::Exact => {}
+        ListenerHolderInspection::Unavailable => return Ok(ListenerPeerInspection::Unavailable),
+        ListenerHolderInspection::Conflict => return Ok(ListenerPeerInspection::Conflict),
+    }
+    context.check_active()?;
+    if retained_path.assert_current().is_err() {
+        return Ok(ListenerPeerInspection::Conflict);
+    }
+    match proc_unix_listener_inode(socket, context)? {
+        ListenerInodeInspection::Exact(inode) if inode == socket_inode => {}
+        ListenerInodeInspection::Unavailable => return Ok(ListenerPeerInspection::Unavailable),
+        ListenerInodeInspection::Exact(_) | ListenerInodeInspection::Conflict => {
+            return Ok(ListenerPeerInspection::Conflict)
+        }
+    }
+    match node_global_listener_fd_owner(expected_process_id, socket_inode, context)? {
+        ListenerHolderInspection::Exact => {}
+        ListenerHolderInspection::Unavailable => return Ok(ListenerPeerInspection::Unavailable),
+        ListenerHolderInspection::Conflict => return Ok(ListenerPeerInspection::Conflict),
+    }
+    Ok(ListenerPeerInspection::Exact(ListenerPhysicalIdentity {
+        process_id: expected_process_id,
+        path_device: retained_path.identity.device,
+        path_inode: retained_path.identity.inode,
+        socket_inode,
+        retained_path: Some(retained_path),
+    }))
+}
+
+#[cfg(target_os = "linux")]
+fn node_global_listener_fd_owner(
+    expected_process_id: u32,
+    socket_inode: u64,
+    context: &dyn RuntimePhysicalReadContext,
+) -> anyhow::Result<ListenerHolderInspection> {
+    use std::os::unix::ffi::OsStringExt as _;
+
+    const MAX_PROC_ENTRIES: usize = 131_072;
+    const MAX_PROCESS_DESCRIPTORS: usize = 4_096;
+    const MAX_TOTAL_DESCRIPTORS: usize = 262_144;
+
+    let expected_link = OsString::from_vec(format!("socket:[{socket_inode}]").into_bytes());
+    let processes = match std::fs::read_dir("/proc") {
+        Ok(processes) => processes,
+        Err(error) => return Err(error).context("enumerate Node-global process table"),
+    };
+    let mut process_entries = 0_usize;
+    let mut total_descriptors = 0_usize;
+    let mut expected_descriptors = 0_usize;
+    let mut foreign_holder = false;
+    for process in processes {
+        context.check_active()?;
+        process_entries = process_entries.saturating_add(1);
+        if process_entries > MAX_PROC_ENTRIES {
+            return Ok(ListenerHolderInspection::Conflict);
+        }
+        let process = match process {
+            Ok(process) => process,
+            Err(_) => return Ok(ListenerHolderInspection::Unavailable),
+        };
+        let Some(process_id) = process
+            .file_name()
+            .to_str()
+            .and_then(|name| name.parse::<u32>().ok())
+            .filter(|process_id| *process_id > 0)
+        else {
+            continue;
+        };
+        let descriptors = match std::fs::read_dir(process.path().join("fd")) {
+            Ok(descriptors) => descriptors,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(error) if error.kind() == std::io::ErrorKind::PermissionDenied => {
+                return Ok(ListenerHolderInspection::Unavailable)
+            }
+            Err(_) => return Ok(ListenerHolderInspection::Unavailable),
+        };
+        let mut process_descriptors = 0_usize;
+        for descriptor in descriptors {
+            context.check_active()?;
+            process_descriptors = process_descriptors.saturating_add(1);
+            total_descriptors = total_descriptors.saturating_add(1);
+            if process_descriptors > MAX_PROCESS_DESCRIPTORS
+                || total_descriptors > MAX_TOTAL_DESCRIPTORS
+            {
+                return Ok(ListenerHolderInspection::Conflict);
+            }
+            let descriptor = match descriptor {
+                Ok(descriptor) => descriptor,
+                Err(_) => return Ok(ListenerHolderInspection::Unavailable),
+            };
+            match std::fs::read_link(descriptor.path()) {
+                Ok(target) if target.as_os_str() == expected_link => {
+                    if process_id == expected_process_id {
+                        expected_descriptors = expected_descriptors.saturating_add(1);
+                    } else {
+                        foreign_holder = true;
+                    }
+                }
+                Ok(_) => {}
+                // Descriptor and process churn is bracketed by a second full
+                // holder scan. A disappeared unrelated descriptor cannot
+                // still own the listener at the end of this read.
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) if error.kind() == std::io::ErrorKind::PermissionDenied => {
+                    return Ok(ListenerHolderInspection::Unavailable)
+                }
+                Err(_) => return Ok(ListenerHolderInspection::Unavailable),
+            }
+        }
+    }
+    Ok(if expected_descriptors == 1 && !foreign_holder {
+        ListenerHolderInspection::Exact
+    } else {
+        ListenerHolderInspection::Conflict
     })
+}
+
+#[cfg(target_os = "linux")]
+enum ListenerInodeInspection {
+    Exact(u64),
+    Unavailable,
+    Conflict,
+}
+
+#[cfg(target_os = "linux")]
+fn proc_unix_listener_inode(
+    socket_path: &HostPath,
+    context: &dyn RuntimePhysicalReadContext,
+) -> anyhow::Result<ListenerInodeInspection> {
+    const PROC_NET_UNIX_MAX_BYTES: u64 = 4 * 1024 * 1024;
+
+    context.check_active()?;
+    let file = std::fs::File::open("/proc/net/unix").context("open /proc/net/unix")?;
+    let mut bytes = Vec::new();
+    file.take(PROC_NET_UNIX_MAX_BYTES.saturating_add(1))
+        .read_to_end(&mut bytes)
+        .context("read /proc/net/unix")?;
+    context.check_active()?;
+    anyhow::ensure!(
+        bytes.len() as u64 <= PROC_NET_UNIX_MAX_BYTES,
+        "/proc/net/unix exceeds byte bound"
+    );
+    let text = std::str::from_utf8(&bytes).context("/proc/net/unix is not UTF-8")?;
+    let mut matching = Vec::new();
+    for line in text.lines().skip(1) {
+        let Some(fields) = parse_proc_net_unix_line(line) else {
+            continue;
+        };
+        if fields.path == socket_path.as_str() {
+            if fields.flags != "00010000" || fields.socket_type != "0001" || fields.state != "01" {
+                return Ok(ListenerInodeInspection::Conflict);
+            }
+            matching.push(fields.inode);
+        }
+    }
+    Ok(match matching.as_slice() {
+        [inode] => ListenerInodeInspection::Exact(*inode),
+        [] => ListenerInodeInspection::Unavailable,
+        _ => ListenerInodeInspection::Conflict,
+    })
+}
+
+#[cfg(target_os = "linux")]
+struct ProcNetUnixLine<'a> {
+    flags: &'a str,
+    socket_type: &'a str,
+    state: &'a str,
+    inode: u64,
+    path: &'a str,
+}
+
+#[cfg(target_os = "linux")]
+fn parse_proc_net_unix_line(line: &str) -> Option<ProcNetUnixLine<'_>> {
+    fn next_field<'a>(line: &'a str, offset: &mut usize) -> Option<&'a str> {
+        while line
+            .as_bytes()
+            .get(*offset)
+            .is_some_and(u8::is_ascii_whitespace)
+        {
+            *offset += 1;
+        }
+        let start = *offset;
+        while line
+            .as_bytes()
+            .get(*offset)
+            .is_some_and(|byte| !byte.is_ascii_whitespace())
+        {
+            *offset += 1;
+        }
+        (*offset > start).then(|| &line[start..*offset])
+    }
+
+    let mut offset = 0;
+    let _number = next_field(line, &mut offset)?;
+    let _reference_count = next_field(line, &mut offset)?;
+    let _protocol = next_field(line, &mut offset)?;
+    let flags = next_field(line, &mut offset)?;
+    let socket_type = next_field(line, &mut offset)?;
+    let state = next_field(line, &mut offset)?;
+    let inode = next_field(line, &mut offset)?.parse::<u64>().ok()?;
+    while line
+        .as_bytes()
+        .get(offset)
+        .is_some_and(u8::is_ascii_whitespace)
+    {
+        offset += 1;
+    }
+    let path = line.get(offset..)?;
+    (!path.is_empty()).then_some(ProcNetUnixLine {
+        flags,
+        socket_type,
+        state,
+        inode,
+        path,
+    })
+}
+
+#[cfg(not(target_os = "linux"))]
+pub(super) fn platform_listener_peer(
+    _state_directory: &StateDirectory,
+    _frontend: &cats_api::runtime_reconciliation::PrepareDeviceFrontend,
+    _expected_process_id: u32,
+    _context: &dyn RuntimePhysicalReadContext,
+) -> anyhow::Result<ListenerPeerInspection> {
+    Ok(ListenerPeerInspection::Unavailable)
 }
 
 #[cfg(not(target_os = "linux"))]
@@ -2245,6 +3095,159 @@ mod tests {
         );
     }
 
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn serving_listener_probe_does_not_consume_the_real_vhost_connection() {
+        use std::os::fd::AsRawFd as _;
+        use std::os::unix::fs::PermissionsExt as _;
+        use std::os::unix::net::UnixStream;
+
+        use cats_blockd::engine::{ChunkEngine, EngineConfig};
+        use cats_blockd::vhost_user::{self, VhostUserOptions};
+        use cats_metadata_store_sqlite::SqliteMetadataStore;
+        use cats_object_store_file::FileBlobStore;
+        use cats_storage::MetadataStore as _;
+        use vhost::vhost_user::Frontend;
+        use vhost::VhostBackend as _;
+
+        let directory = tempfile::tempdir().unwrap();
+        let blob = Arc::new(FileBlobStore::open(directory.path().join("blob")).unwrap());
+        let metadata =
+            Arc::new(SqliteMetadataStore::open(&directory.path().join("meta.db")).unwrap());
+        metadata
+            .create_volume("vol_listener_probe", 16 * 1024 * 1024)
+            .unwrap();
+        let engine = ChunkEngine::attach(
+            EngineConfig::new(
+                "vol_listener_probe",
+                directory.path().join("data"),
+                "att_listener_probe",
+            ),
+            blob,
+            metadata,
+        )
+        .unwrap();
+        let listener_parent = directory.path().join("listener-parent");
+        std::fs::create_dir(&listener_parent).unwrap();
+        let socket = listener_parent.join("vhost.sock");
+        let options = VhostUserOptions::default();
+        let mut listener = vhost_user::bind_new(&socket, options).unwrap();
+        std::fs::set_permissions(&socket, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let listener_fd = listener.as_raw_fd();
+        // SAFETY: `listener_fd` is owned by `listener` for this whole block and
+        // `F_GETFD`/`F_SETFD` do not transfer or close ownership.
+        let descriptor_flags = unsafe { libc::fcntl(listener_fd, libc::F_GETFD) };
+        assert!(descriptor_flags >= 0);
+        // Deliberately lend the listener across one exec so the Node-global
+        // holder proof observes a foreign process. The scanner must reject it
+        // without connecting to (and consuming) the single-session listener.
+        // SAFETY: the same live descriptor invariant applies to `F_SETFD`.
+        // SAFETY: the same live descriptor invariant applies to `F_SETFD`.
+        let clear_close_on_exec = unsafe {
+            libc::fcntl(
+                listener_fd,
+                libc::F_SETFD,
+                descriptor_flags & !libc::FD_CLOEXEC,
+            )
+        };
+        assert_eq!(clear_close_on_exec, 0);
+        let mut foreign_holder = Command::new("/bin/sleep")
+            .arg("30")
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap();
+        // SAFETY: restore the original close-on-exec contract on the live
+        // descriptor before any other child can be launched by this test.
+        // SAFETY: the same live descriptor invariant applies to `F_SETFD`.
+        let restore_close_on_exec =
+            unsafe { libc::fcntl(listener_fd, libc::F_SETFD, descriptor_flags) };
+        assert_eq!(restore_close_on_exec, 0);
+        let server =
+            std::thread::spawn(move || vhost_user::serve_listener(&mut listener, engine, options));
+        let frontend = cats_api::runtime_reconciliation::PrepareDeviceFrontend::VhostUserBlk {
+            socket_path: host(socket.to_str().unwrap()),
+            queues: 1,
+            queue_size: 256,
+        };
+        let process_id = std::process::id();
+        let listener_state = StateDirectory::unanchored(directory.path().to_path_buf());
+
+        assert_eq!(
+            platform_listener_peer(&listener_state, &frontend, process_id, &context()).unwrap(),
+            ListenerPeerInspection::Conflict,
+            "a foreign process sharing the listener fd must fail the closed holder proof"
+        );
+        assert!(
+            !server.is_finished(),
+            "foreign-holder inventory must not consume the single VMM connection"
+        );
+        foreign_holder.kill().unwrap();
+        foreign_holder.wait().unwrap();
+
+        let mut exact_identity = None;
+        for _ in 0..100 {
+            if let ListenerPeerInspection::Exact(identity) =
+                platform_listener_peer(&listener_state, &frontend, process_id, &context()).unwrap()
+            {
+                exact_identity = Some(identity);
+                break;
+            }
+            std::thread::sleep(POLL_INTERVAL);
+        }
+        let exact_identity = exact_identity.expect("listener must become uniquely owned");
+        assert_eq!(exact_identity.process_id, process_id);
+
+        let displaced_parent = directory.path().join("listener-parent-displaced");
+        std::fs::rename(&listener_parent, &displaced_parent).unwrap();
+        std::fs::create_dir(&listener_parent).unwrap();
+        std::fs::rename(displaced_parent.join("vhost.sock"), &socket).unwrap();
+        assert!(
+            exact_identity.assert_current(&frontend, &context()).is_err(),
+            "retained listener proof must reject intermediate-parent ABA even when the exact leaf inode is moved back"
+        );
+        std::fs::rename(&socket, displaced_parent.join("vhost.sock")).unwrap();
+        std::fs::remove_dir(&listener_parent).unwrap();
+        std::fs::rename(&displaced_parent, &listener_parent).unwrap();
+        exact_identity
+            .assert_current(&frontend, &context())
+            .unwrap();
+
+        let displaced_socket = directory.path().join("vhost-displaced.sock");
+        std::fs::rename(&socket, &displaced_socket).unwrap();
+        let replacement = std::os::unix::net::UnixListener::bind(&socket).unwrap();
+        std::fs::set_permissions(&socket, std::fs::Permissions::from_mode(0o700)).unwrap();
+        assert!(
+            exact_identity
+                .assert_current(&frontend, &context())
+                .is_err(),
+            "retained listener proof must reject pathname rename/recreate ABA"
+        );
+        drop(replacement);
+        std::fs::remove_file(&socket).unwrap();
+        std::fs::rename(&displaced_socket, &socket).unwrap();
+        exact_identity
+            .assert_current(&frontend, &context())
+            .unwrap();
+        assert_eq!(
+            platform_listener_peer(&listener_state, &frontend, process_id, &context()).unwrap(),
+            ListenerPeerInspection::Exact(exact_identity),
+            "repeated inventory must remain a read-only listener observation"
+        );
+        assert!(
+            !server.is_finished(),
+            "listener probe must not impersonate the single VMM connection"
+        );
+
+        let stream = UnixStream::connect(&socket).unwrap();
+        let vmm = Frontend::from_stream(stream, 1);
+        vmm.set_owner().unwrap();
+        assert_ne!(vmm.get_features().unwrap(), 0);
+        drop(vmm);
+        assert!(server.join().unwrap().is_ok());
+    }
+
     #[test]
     fn pid_replacement_or_foreign_socket_is_conflict_and_never_submits() {
         for foreign_peer in [false, true] {
@@ -2331,6 +3334,10 @@ mod tests {
             1,
             "transient services must be collected after their exact process exits"
         );
+        assert!(systemd_arguments.contains(&OsString::from(format!(
+            "--property=UnsetEnvironment={}",
+            UNSET_PROCESS_ENVIRONMENT.join(" ")
+        ))));
     }
 
     #[test]
@@ -2343,13 +3350,13 @@ mod tests {
 
         let launch = build_launch(&config(), &expectation()).unwrap();
         let running = parse_systemd_properties(
-            b"Id=cats-root.service\nLoadState=loaded\nActiveState=active\nSubState=running\nMainPID=4242\nControlGroup=/system.slice/cats-root.service\nExecStart={ path=/usr/bin/cats-blockd ; argv[]=/usr/bin/cats-blockd --process-identity-token 44444444444444444444444444444444 ; }\nEnvironment=\nEnvironmentFiles=\nPassEnvironment=\nUnsetEnvironment=AWS_ACCESS_KEY_ID AWS_SECRET_ACCESS_KEY AWS_SESSION_TOKEN AWS_CONTAINER_CREDENTIALS_FULL_URI AWS_CONTAINER_AUTHORIZATION_TOKEN_FILE CATS_POSTGRES_URL\nKillMode=control-group\nRestart=no\nUMask=0077\nTimeoutStopUSec=2s\nCollectMode=inactive-or-failed\n",
+            b"Id=cats-root.service\nLoadState=loaded\nActiveState=active\nSubState=running\nMainPID=4242\nControlGroup=/system.slice/cats-root.service\nExecStart={ path=/usr/bin/cats-blockd ; argv[]=/usr/bin/cats-blockd --process-identity-token 44444444444444444444444444444444 ; }\nEnvironment=\nEnvironmentFiles=\nPassEnvironment=\nUnsetEnvironment=AWS_ACCESS_KEY_ID AWS_SECRET_ACCESS_KEY AWS_SESSION_TOKEN AWS_CONTAINER_CREDENTIALS_FULL_URI AWS_CONTAINER_AUTHORIZATION_TOKEN_FILE CATS_POSTGRES_URL CATS_CRASH_POINT\nKillMode=control-group\nRestart=no\nUMask=0077\nTimeoutStopUSec=2s\nCollectMode=inactive-or-failed\n",
         )
         .unwrap();
         assert!(running.is_running(&launch));
 
         let wrong_token = parse_systemd_properties(
-            b"Id=cats-root.service\nLoadState=loaded\nActiveState=active\nSubState=running\nMainPID=4242\nControlGroup=/system.slice/cats-root.service\nExecStart={ path=/usr/bin/cats-blockd ; argv[]=/usr/bin/cats-blockd --process-identity-token 55555555555555555555555555555555 ; }\nEnvironment=\nEnvironmentFiles=\nPassEnvironment=\nUnsetEnvironment=AWS_ACCESS_KEY_ID AWS_SECRET_ACCESS_KEY AWS_SESSION_TOKEN AWS_CONTAINER_CREDENTIALS_FULL_URI AWS_CONTAINER_AUTHORIZATION_TOKEN_FILE CATS_POSTGRES_URL\nKillMode=control-group\nRestart=no\nUMask=0077\nTimeoutStopUSec=2s\nCollectMode=inactive-or-failed\n",
+            b"Id=cats-root.service\nLoadState=loaded\nActiveState=active\nSubState=running\nMainPID=4242\nControlGroup=/system.slice/cats-root.service\nExecStart={ path=/usr/bin/cats-blockd ; argv[]=/usr/bin/cats-blockd --process-identity-token 55555555555555555555555555555555 ; }\nEnvironment=\nEnvironmentFiles=\nPassEnvironment=\nUnsetEnvironment=AWS_ACCESS_KEY_ID AWS_SECRET_ACCESS_KEY AWS_SESSION_TOKEN AWS_CONTAINER_CREDENTIALS_FULL_URI AWS_CONTAINER_AUTHORIZATION_TOKEN_FILE CATS_POSTGRES_URL CATS_CRASH_POINT\nKillMode=control-group\nRestart=no\nUMask=0077\nTimeoutStopUSec=2s\nCollectMode=inactive-or-failed\n",
         )
         .unwrap();
         assert!(!wrong_token.is_running(&launch));
@@ -2362,7 +3369,7 @@ mod tests {
             ("CollectMode", "inactive"),
         ] {
             let wire = String::from_utf8(
-                b"Id=cats-root.service\nLoadState=loaded\nActiveState=active\nSubState=running\nMainPID=4242\nControlGroup=/system.slice/cats-root.service\nExecStart={ path=/usr/bin/cats-blockd ; argv[]=/usr/bin/cats-blockd --process-identity-token 44444444444444444444444444444444 ; }\nEnvironment=\nEnvironmentFiles=\nPassEnvironment=\nUnsetEnvironment=AWS_ACCESS_KEY_ID AWS_SECRET_ACCESS_KEY AWS_SESSION_TOKEN AWS_CONTAINER_CREDENTIALS_FULL_URI AWS_CONTAINER_AUTHORIZATION_TOKEN_FILE CATS_POSTGRES_URL\nKillMode=control-group\nRestart=no\nUMask=0077\nTimeoutStopUSec=2s\nCollectMode=inactive-or-failed\n"
+                b"Id=cats-root.service\nLoadState=loaded\nActiveState=active\nSubState=running\nMainPID=4242\nControlGroup=/system.slice/cats-root.service\nExecStart={ path=/usr/bin/cats-blockd ; argv[]=/usr/bin/cats-blockd --process-identity-token 44444444444444444444444444444444 ; }\nEnvironment=\nEnvironmentFiles=\nPassEnvironment=\nUnsetEnvironment=AWS_ACCESS_KEY_ID AWS_SECRET_ACCESS_KEY AWS_SESSION_TOKEN AWS_CONTAINER_CREDENTIALS_FULL_URI AWS_CONTAINER_AUTHORIZATION_TOKEN_FILE CATS_POSTGRES_URL CATS_CRASH_POINT\nKillMode=control-group\nRestart=no\nUMask=0077\nTimeoutStopUSec=2s\nCollectMode=inactive-or-failed\n"
                     .to_vec(),
             )
             .unwrap()
@@ -2418,12 +3425,12 @@ mod tests {
     fn process_environment_parser_rejects_credentials_and_ambiguous_samples() {
         let ordinary = parse_process_environment_keys(b"LANG=C\0PATH=/usr/bin\0").unwrap();
         assert_eq!(ordinary, [b"LANG".to_vec(), b"PATH".to_vec()]);
-        assert!(credential_environment_is_absent(&ordinary));
+        assert!(forbidden_process_environment_is_absent(&ordinary));
 
-        for forbidden in UNSET_CREDENTIAL_ENVIRONMENT {
+        for forbidden in UNSET_PROCESS_ENVIRONMENT {
             let sample = format!("LANG=C\0{forbidden}=secret\0");
             let keys = parse_process_environment_keys(sample.as_bytes()).unwrap();
-            assert!(!credential_environment_is_absent(&keys));
+            assert!(!forbidden_process_environment_is_absent(&keys));
         }
         for malformed in [
             &b"LANG=C"[..],

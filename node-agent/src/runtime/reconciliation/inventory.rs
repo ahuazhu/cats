@@ -17,9 +17,9 @@ use cats_api::runtime_artifacts::{
 use cats_api::runtime_reconciliation::{
     checkpoint_content_digest, AppliedDesiredEvidence, CheckpointEvidence, Condition,
     DesiredRuntimeSpec, GuestTransportEvidence, HostPath, Id, InventorySource, LifecycleAdmission,
-    LocalLineageState, LocalVolumeLineage, ObservedRuntimeStatus, ObservedVolume,
-    ProgressingReason, ReconcileStep, RequireIdleCheckpoint, RuntimeCheckpoint, UnixMillis,
-    VolumeAuthorityEvidence, WarmSnapshotEvidence, WireU64,
+    LocalLineageState, LocalVolumeLineage, ObservedDevice, ObservedRuntimeStatus, ObservedVolume,
+    ProcessEvidence, ProgressingReason, ReconcileStep, RequireIdleCheckpoint, RuntimeCheckpoint,
+    UnixMillis, VolumeAuthorityEvidence, WarmSnapshotEvidence, WireU64,
 };
 use cats_storage::{
     authority::{
@@ -38,9 +38,9 @@ use crate::runtime_spine::{
 
 use super::{
     root_provision_process::{
-        ExactRootProvisionProcessProof, NodeGlobalManagedProcessScanAdmission,
-        RetainedRootProvisionProcessAttempt, RootProvisionAuthoritySnapshot,
-        RootProvisionProcessExpectation, TargetControlProcessLaunchIdentity,
+        NodeGlobalManagedProcessScanAdmission, RetainedRootProvisionProcessAttempt,
+        RootProvisionAuthoritySnapshot, RootProvisionProcessExpectation,
+        StopReceiptSocketAdmission, TargetControlProcessLaunchIdentity,
     },
     runtime_checkpoint_path,
     signed_running::{
@@ -124,6 +124,10 @@ pub struct AuthorizedBlockdInventoryEvidence {
     /// closed blank-or-wrapper argv union without projecting that private
     /// artifact onto the public Runtime wire.
     pub(crate) target_control_launch: Option<TargetControlProcessLaunchIdentity>,
+    /// Typed stale control socket retained by an exact durable stop receipt.
+    /// It is an additional allowlist member only while the corresponding
+    /// RootControl expectation is physically absent.
+    pub(crate) stop_receipt_socket: Option<StopReceiptSocketAdmission>,
 }
 
 /// Provider-private authority evidence retained until the local attachment
@@ -168,9 +172,18 @@ pub(crate) trait RootProcessInventoryBridge:
 {
     fn executable_path(&self) -> &HostPath;
 
+    fn serving_expectation(
+        &self,
+        checkpoint: &RuntimeCheckpoint,
+        desired: &DesiredRuntimeSpec,
+        authority: &VolumeRecord,
+    ) -> anyhow::Result<super::serving_blockd_process::ServingBlockdExpectation>;
+
     fn inspect_all(
         &self,
-        expected: BTreeMap<Id, RootProvisionProcessExpectation>,
+        root_expected: BTreeMap<Id, RootProvisionProcessExpectation>,
+        serving_expected: BTreeMap<Id, super::serving_blockd_process::ServingBlockdExpectation>,
+        stop_receipt_sockets: BTreeMap<Id, StopReceiptSocketAdmission>,
         context: &RuntimeInventoryScanContext,
     ) -> anyhow::Result<RootProcessInventoryBridgeOutcome>;
 }
@@ -401,6 +414,7 @@ impl RuntimeInventoryScanner for CleanSlateInventoryScanner {
     ) -> anyhow::Result<RuntimeInventoryScanOutcome> {
         let mut aggregate = InventoryProbeAggregation::new();
         let mut processes_by_cat = BTreeMap::new();
+        let mut serving_devices_by_cat = BTreeMap::new();
         let mut node_global_process_admission = None;
         if let Some(bridge) = &self.root_process_bridge {
             // The process expectation cannot be derived until all three data
@@ -424,7 +438,7 @@ impl RuntimeInventoryScanner for CleanSlateInventoryScanner {
                 });
             }
 
-            let expected = root_process_expectations(
+            let root_expected = root_process_expectations(
                 &context,
                 &self.checkpoint_directory,
                 self.blob.as_deref(),
@@ -433,12 +447,35 @@ impl RuntimeInventoryScanner for CleanSlateInventoryScanner {
                 &aggregate.blockd_by_cat,
                 &aggregate.volumes_by_cat,
             )?;
+            let serving_expected = serving_process_expectations(
+                &context,
+                bridge.as_ref(),
+                &aggregate.checkpoints_by_cat,
+                &aggregate.blockd_by_cat,
+                &aggregate.volumes_by_cat,
+            )?;
+            let stop_receipt_sockets = aggregate
+                .blockd_by_cat
+                .iter()
+                .filter_map(|(cat_id, evidence)| {
+                    evidence
+                        .stop_receipt_socket
+                        .clone()
+                        .map(|socket| (cat_id.clone(), socket))
+                })
+                .collect();
             context
                 .remaining()
                 .context("root-process inventory bridge deadline expired before inspection")?;
-            match bridge.inspect_all(expected, &context)? {
+            match bridge.inspect_all(
+                root_expected,
+                serving_expected,
+                stop_receipt_sockets,
+                &context,
+            )? {
                 RootProcessInventoryBridgeOutcome::Complete(admission) => {
-                    processes_by_cat = admission.root_control_proofs();
+                    processes_by_cat = admission.process_projections();
+                    serving_devices_by_cat = admission.vhost_device_projections();
                     node_global_process_admission = Some(admission);
                 }
                 RootProcessInventoryBridgeOutcome::Unavailable => {
@@ -542,7 +579,10 @@ impl RuntimeInventoryScanner for CleanSlateInventoryScanner {
                         .unwrap_or_default(),
                     aggregate.checkpoints_by_cat.remove(&desired.cat_id),
                     aggregate.blockd_by_cat.remove(&desired.cat_id),
-                    processes_by_cat.remove(&desired.cat_id),
+                    RuntimeManagedProjection {
+                        processes: processes_by_cat.remove(&desired.cat_id).unwrap_or_default(),
+                        serving_device: serving_devices_by_cat.remove(&desired.cat_id),
+                    },
                 )
             })
             .collect::<anyhow::Result<Vec<_>>>()?;
@@ -550,7 +590,8 @@ impl RuntimeInventoryScanner for CleanSlateInventoryScanner {
             aggregate.volumes_by_cat.is_empty()
                 && aggregate.checkpoints_by_cat.is_empty()
                 && aggregate.blockd_by_cat.is_empty()
-                && processes_by_cat.is_empty(),
+                && processes_by_cat.is_empty()
+                && serving_devices_by_cat.is_empty(),
             "inventory named a Cat outside Desired"
         );
 
@@ -674,10 +715,59 @@ fn root_process_expectations(
     Ok(expected)
 }
 
+fn serving_process_expectations(
+    context: &RuntimeInventoryScanContext,
+    bridge: &dyn RootProcessInventoryBridge,
+    checkpoints_by_cat: &BTreeMap<Id, RuntimeCheckpointInventoryEvidence>,
+    blockd_by_cat: &BTreeMap<Id, AuthorizedBlockdInventoryEvidence>,
+    volumes_by_cat: &BTreeMap<Id, Vec<AuthorityVolumeInventoryEvidence>>,
+) -> anyhow::Result<BTreeMap<Id, super::serving_blockd_process::ServingBlockdExpectation>> {
+    let mut expected = BTreeMap::new();
+    for desired in &context.coordinates().desired.desired_specs {
+        let Some(checkpoint) = checkpoints_by_cat.get(&desired.cat_id) else {
+            continue;
+        };
+        let Some(blockd) = blockd_by_cat.get(&desired.cat_id) else {
+            continue;
+        };
+        if checkpoint.binding != DesiredCheckpointBinding::Current
+            || blockd.binding != DesiredCheckpointBinding::Current
+            || !matches!(
+                checkpoint.checkpoint.step,
+                ReconcileStep::PrepareDevice { .. }
+            )
+        {
+            continue;
+        }
+        let authority = volumes_by_cat
+            .get(&desired.cat_id)
+            .and_then(|volumes| {
+                volumes.iter().find(|volume| {
+                    volume.record.volume_id == blockd.checkpoint.attachment.identity.volume_id
+                })
+            })
+            .context("serving blockd process lacks its raw authority VolumeRecord")?;
+        let expectation =
+            bridge.serving_expectation(&checkpoint.checkpoint, desired, &authority.record)?;
+        anyhow::ensure!(
+            expected
+                .insert(desired.cat_id.clone(), expectation)
+                .is_none(),
+            "serving blockd process expectation duplicated one Cat"
+        );
+    }
+    Ok(expected)
+}
+
 struct InventoryProjectionContext<'a> {
     checkpoint_directory: &'a std::path::Path,
     blob: Option<&'a dyn BlobStore>,
     deadline: std::time::Instant,
+}
+
+struct RuntimeManagedProjection {
+    processes: Vec<ProcessEvidence>,
+    serving_device: Option<(Id, ObservedDevice)>,
 }
 
 fn runtime_from_inventory(
@@ -687,7 +777,7 @@ fn runtime_from_inventory(
     mut volume_evidence: Vec<AuthorityVolumeInventoryEvidence>,
     checkpoint: Option<RuntimeCheckpointInventoryEvidence>,
     blockd: Option<AuthorizedBlockdInventoryEvidence>,
-    process: Option<ExactRootProvisionProcessProof>,
+    managed: RuntimeManagedProjection,
 ) -> anyhow::Result<ObservedRuntimeStatus> {
     let checkpoint_path = runtime_checkpoint_path(projection.checkpoint_directory, &desired.cat_id);
     let checkpoint_path = HostPath::new(
@@ -825,10 +915,21 @@ fn runtime_from_inventory(
         });
     }
 
-    let volumes: Vec<ObservedVolume> = volume_evidence
+    let mut volumes: Vec<ObservedVolume> = volume_evidence
         .into_iter()
         .map(|evidence| evidence.observed)
         .collect();
+    if let Some((volume_id, device)) = managed.serving_device {
+        let volume = volumes
+            .iter_mut()
+            .find(|volume| volume.volume_id == volume_id)
+            .context("serving vhost device lacks its observed Volume")?;
+        anyhow::ensure!(
+            volume.devices.is_empty(),
+            "serving vhost device conflicts with another frontend projection"
+        );
+        volume.devices.push(device);
+    }
     let unsupported_superseded = checkpoint.as_ref().is_some_and(|evidence| {
         evidence.binding == DesiredCheckpointBinding::Superseded
             && !superseded_checkpoint_has_supported_replan(desired, &evidence.checkpoint, &volumes)
@@ -922,10 +1023,7 @@ fn runtime_from_inventory(
         stable_state,
         step: step.clone(),
         checkpoint: checkpoint_evidence,
-        processes: process
-            .map(ExactRootProvisionProcessProof::into_process_evidence)
-            .into_iter()
-            .collect(),
+        processes: managed.processes,
         volumes,
         mounts: Vec::new(),
         networks: Vec::new(),

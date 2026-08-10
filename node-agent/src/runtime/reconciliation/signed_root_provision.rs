@@ -30,14 +30,16 @@ use crate::runtime_spine::{
 };
 
 use super::authorized_blockd::{
-    RootProvisionStopReceipt, StopReceiptPublication, StopReceiptSettlement,
+    ExactControlSocketCleanup, RootProvisionStopReceipt, StopReceiptPublication,
+    StopReceiptSettlement,
 };
 use super::clean_slate_probes::CHECKPOINT_NAMESPACE;
 use super::prepare_device_retirement::PrepareDeviceTargetRetirementEffect;
 use super::root_provision_process::{
     inspect_exact_root_provision_process, prove_exact_root_provision_process_absence,
-    RootProvisionProcessGlobalPort, RootProvisionRetirementAdmission,
+    RootProvisionAbsencePurpose, RootProvisionProcessGlobalPort, RootProvisionRetirementAdmission,
 };
+use super::serving_blockd_process::{ServingBlockdProcessGlobalPort, ServingBlockdStartEffect};
 use super::serving_handoff::{
     target_control_process_launch_identity, ReopenedTargetControlAuthorization,
     ServingAuthorityTargetEvidence, ServingHandoffStore, TargetControlAuthorizationReady,
@@ -133,6 +135,27 @@ pub(crate) struct SignedRunningEffect {
     handoff: ServingHandoffEffect,
     prepare_device: ServingPrepareDeviceEffect,
     prepare_device_retirement: Option<PrepareDeviceTargetRetirementEffect>,
+    serving_process: Option<ServingBlockdStartEffect>,
+}
+
+pub(crate) struct SignedRunningProcessPorts {
+    retirement: Arc<dyn RootProvisionProcessRetirementPort>,
+    root_global: Arc<dyn RootProvisionProcessGlobalPort>,
+    serving_global: Arc<dyn ServingBlockdProcessGlobalPort>,
+}
+
+impl SignedRunningProcessPorts {
+    pub(crate) fn new(
+        retirement: Arc<dyn RootProvisionProcessRetirementPort>,
+        root_global: Arc<dyn RootProvisionProcessGlobalPort>,
+        serving_global: Arc<dyn ServingBlockdProcessGlobalPort>,
+    ) -> Self {
+        Self {
+            retirement,
+            root_global,
+            serving_global,
+        }
+    }
 }
 
 impl SignedRunningEffect {
@@ -141,8 +164,7 @@ impl SignedRunningEffect {
         authority: Arc<dyn VolumeDataAuthority>,
         blob: Arc<dyn BlobStore>,
         systemd: RootProvisionSystemdConfig,
-        retirement: Arc<dyn RootProvisionProcessRetirementPort>,
-        global_process: Arc<dyn RootProvisionProcessGlobalPort>,
+        process_ports: SignedRunningProcessPorts,
         prepare_frontend: ServingPrepareFrontend,
     ) -> anyhow::Result<Self> {
         let executable = systemd
@@ -156,8 +178,13 @@ impl SignedRunningEffect {
         ));
         let prepare_device_retirement = PrepareDeviceTargetRetirementEffect::platform(
             Arc::clone(&authority),
-            Arc::clone(&global_process),
+            Arc::clone(&process_ports.root_global),
             systemd.clone(),
+        );
+        let serving_process_effect = ServingBlockdStartEffect::new(
+            Arc::clone(&authority),
+            systemd.clone(),
+            process_ports.serving_global,
         );
         Ok(Self {
             acquire,
@@ -165,17 +192,18 @@ impl SignedRunningEffect {
                 Arc::clone(&authority),
                 Arc::clone(&blob),
                 systemd,
-                retirement,
+                process_ports.retirement,
             )?,
             handoff: ServingHandoffEffect::new(
                 authority,
                 blob,
-                global_process,
+                process_ports.root_global,
                 target_process,
                 executable_path.clone(),
             )?,
             prepare_device: ServingPrepareDeviceEffect::new(prepare_frontend, executable_path)?,
             prepare_device_retirement: Some(prepare_device_retirement),
+            serving_process: Some(serving_process_effect),
         })
     }
 }
@@ -188,6 +216,11 @@ impl RuntimeDesiredEffect for SignedRunningEffect {
     ) -> anyhow::Result<RuntimeDesiredEffectOutcome> {
         if let Some(prepare_device_retirement) = &self.prepare_device_retirement {
             if let Some(outcome) = prepare_device_retirement.try_apply(&context, desired)? {
+                return Ok(outcome);
+            }
+        }
+        if let Some(serving_process) = &self.serving_process {
+            if let Some(outcome) = serving_process.try_apply(&context, desired)? {
                 return Ok(outcome);
             }
         }
@@ -761,7 +794,7 @@ impl SignedRootProvisionEffect {
                 volume: &current,
             },
             self.executable_path.clone(),
-            target_control_launch,
+            RootProvisionAbsencePurpose::AdmittedStopReceipt(target_control_launch),
             self.retirement.as_ref(),
             context,
         ) {
@@ -770,6 +803,17 @@ impl SignedRootProvisionEffect {
         };
         if !retirement_admission_strictly_succeeds(receipt.admission(), absence.admission()) {
             return Ok(Some(RuntimeDesiredEffectOutcome::RefreshInventory));
+        }
+        if absence.stop_receipt_socket_present() {
+            return Ok(Some(
+                match retained.remove_exact_stale_control_socket(receipt.socket())? {
+                    ExactControlSocketCleanup::Removed
+                    | ExactControlSocketCleanup::AlreadyAbsent => {
+                        RuntimeDesiredEffectOutcome::RefreshInventory
+                    }
+                    ExactControlSocketCleanup::LiveOrChanged => stop_local(),
+                },
+            ));
         }
         retained
             .remove_stop_receipt(&receipt)
@@ -1466,7 +1510,7 @@ mod tests {
         fn inspect_exact_after_node_global_sweep(
             &self,
             expected: &super::super::RootProvisionProcessExpectation,
-            _context: &dyn crate::runtime_spine::RuntimePhysicalReadContext,
+            _context: &RuntimeDesiredEffectContext,
         ) -> anyhow::Result<RootProvisionProcessInspection> {
             self.calls.fetch_add(1, Ordering::SeqCst);
             let inspection = self.inspection(expected);
@@ -1476,11 +1520,10 @@ mod tests {
             Ok(inspection)
         }
 
-        fn inspect_absent_allowing_socket_after_node_global_sweep(
+        fn inspect_absent_with_admitted_stop_receipt(
             &self,
             expected: &super::super::RootProvisionProcessExpectation,
-            _allowed_socket: &HostPath,
-            _context: &dyn crate::runtime_spine::RuntimePhysicalReadContext,
+            _context: &RuntimeDesiredEffectContext,
         ) -> anyhow::Result<RootProvisionProcessInspection> {
             self.calls.fetch_add(1, Ordering::SeqCst);
             Ok(self.inspection(expected))
@@ -1489,7 +1532,7 @@ mod tests {
         fn inspect_after_node_global_sweep(
             &self,
             expected: &super::super::RootProvisionProcessExpectation,
-            _context: &dyn crate::runtime_spine::RuntimePhysicalReadContext,
+            _context: &RuntimeDesiredEffectContext,
         ) -> anyhow::Result<RootProvisionProcessInspection> {
             self.calls.fetch_add(1, Ordering::SeqCst);
             Ok(self.inspection(expected))
@@ -1510,7 +1553,7 @@ mod tests {
         fn inspect_exact_after_node_global_sweep(
             &self,
             expected: &super::super::RootProvisionProcessExpectation,
-            _context: &dyn crate::runtime_spine::RuntimePhysicalReadContext,
+            _context: &RuntimeDesiredEffectContext,
         ) -> anyhow::Result<RootProvisionProcessInspection> {
             anyhow::ensure!(
                 expected.target_control_launch().is_some(),
@@ -1525,7 +1568,7 @@ mod tests {
         fn inspect_after_node_global_sweep(
             &self,
             expected: &super::super::RootProvisionProcessExpectation,
-            context: &dyn crate::runtime_spine::RuntimePhysicalReadContext,
+            context: &RuntimeDesiredEffectContext,
         ) -> anyhow::Result<RootProvisionProcessInspection> {
             self.inspect_exact_after_node_global_sweep(expected, context)
         }
@@ -1900,6 +1943,42 @@ mod tests {
             )
         }
 
+        fn context_at_with_stop_receipt(
+            &self,
+            physical_paths: impl IntoIterator<Item = HostPath>,
+            inventory_epoch: u64,
+            inventory_read_position: u64,
+        ) -> RuntimeDesiredEffectContext {
+            let expectation = super::super::RootProvisionProcessExpectation::from_checkpoint(
+                &self.checkpoint,
+                super::super::root_provision_process::RootProvisionAuthoritySnapshot {
+                    attachment: self.attachment.clone(),
+                    volume: &self.authority.record(),
+                },
+                HostPath::new("/usr/bin/cats-blockd".to_owned()).unwrap(),
+            )
+            .unwrap();
+            let cat_id = expectation.cat_id.clone();
+            let receipt_socket = expectation.control_socket_path.clone();
+            let admission = super::super::root_provision_process::NodeGlobalManagedProcessScanAdmission::from_root_controls(
+                std::collections::BTreeMap::from([(cat_id.clone(), expectation)]),
+                std::collections::BTreeMap::new(),
+            )
+            .unwrap()
+            .with_stop_receipt_sockets(std::collections::BTreeMap::from([(
+                cat_id,
+                super::super::root_provision_process::StopReceiptSocketAdmission::new(
+                    receipt_socket,
+                    physical_paths.into_iter().collect(),
+                )
+                .unwrap(),
+            )]))
+            .unwrap()
+            .into_admission_for_test();
+            self.context_at(Vec::new(), inventory_epoch, inventory_read_position)
+                .with_node_global_process_for_test(admission)
+        }
+
         fn context_with_lineage_path(
             &self,
             processes: Vec<ProcessEvidence>,
@@ -2160,6 +2239,7 @@ mod tests {
                 handoff,
                 prepare_device,
                 prepare_device_retirement: None,
+                serving_process: None,
             }
         }
     }
@@ -3290,20 +3370,19 @@ mod tests {
             let recovery_retirement = Arc::new(FakeRetirementPort::absent());
             let recovery = SignedRunningPublicationRecovery::with_root_process_retirement(
                 Arc::clone(&fixture.authority) as Arc<dyn VolumeDataAuthority>,
-                recovery_retirement,
+                Arc::clone(&recovery_retirement) as Arc<dyn RootProvisionProcessRetirementPort>,
             );
             assert_eq!(
                 recovery.recover_one(recovery_context(&fixture)).unwrap(),
-                RuntimePreScanRecoveryOutcome::Recovered {
-                    cat_id: fixture.desired.cat_id.clone(),
-                }
+                RuntimePreScanRecoveryOutcome::NoChange
             );
-            assert!(!socket_path.exists());
+            assert!(socket_path.exists());
             assert!(fixture.stop_receipt_path().exists());
+            assert_eq!(recovery_retirement.calls.load(Ordering::SeqCst), 0);
             assert_eq!(std::fs::read(&checkpoint_path).unwrap(), checkpoint_before);
 
-            // Only a strictly newer full admission may retire the receipt.
-            // That round still leaves the old Runtime checkpoint untouched.
+            // Only a strictly newer full admission may unlink the typed
+            // receipted inode. A still newer full then retires the receipt.
             let absence_retirement = Arc::new(FakeRetirementPort::absent());
             let finish = fixture.dispatcher_with_retirement(
                 Arc::clone(&process),
@@ -3313,10 +3392,18 @@ mod tests {
             );
             assert_eq!(
                 finish
-                    .apply(fixture.context_at(Vec::new(), 4, 12), &fixture.desired)
+                    .apply(
+                        fixture.context_at_with_stop_receipt(
+                            [HostPath::new(socket_path.to_string_lossy().into_owned()).unwrap()],
+                            5,
+                            13,
+                        ),
+                        &fixture.desired,
+                    )
                     .unwrap(),
                 RuntimeDesiredEffectOutcome::RefreshInventory
             );
+            assert!(!socket_path.exists());
             assert!(
                 fixture.stop_receipt_path().exists(),
                 "the stop-authorizing admission cannot also remove its receipt"
@@ -3324,7 +3411,10 @@ mod tests {
             assert_eq!(std::fs::read(&checkpoint_path).unwrap(), checkpoint_before);
             assert_eq!(
                 finish
-                    .apply(fixture.context_at(Vec::new(), 5, 13), &fixture.desired)
+                    .apply(
+                        fixture.context_at_with_stop_receipt([], 6, 14),
+                        &fixture.desired,
+                    )
                     .unwrap(),
                 RuntimeDesiredEffectOutcome::RefreshInventory
             );
@@ -3336,7 +3426,7 @@ mod tests {
             // disposition performs A22 or root-process I/O in this round.
             assert_eq!(
                 finish
-                    .apply(fixture.context_at(Vec::new(), 6, 14), &fixture.desired)
+                    .apply(fixture.context_at(Vec::new(), 7, 15), &fixture.desired)
                     .unwrap(),
                 RuntimeDesiredEffectOutcome::RefreshInventory
             );
@@ -3387,9 +3477,27 @@ mod tests {
         );
         assert_eq!(
             recovery.recover_one(recovery_context(&fixture)).unwrap(),
-            RuntimePreScanRecoveryOutcome::Recovered {
-                cat_id: fixture.desired.cat_id.clone(),
-            }
+            RuntimePreScanRecoveryOutcome::NoChange
+        );
+        assert!(socket_path.exists());
+        assert_eq!(retirement.calls.load(Ordering::SeqCst), 0);
+        let effect = fixture.effect_with_ports(
+            Arc::clone(&process) as Arc<dyn RootProvisionProcessPort>,
+            Arc::clone(&retirement) as Arc<dyn RootProvisionProcessRetirementPort>,
+            Arc::clone(&request) as Arc<dyn RootProvisionRequestPort>,
+        );
+        assert_eq!(
+            effect
+                .try_apply(
+                    &fixture.context_at_with_stop_receipt(
+                        [HostPath::new(socket_path.to_string_lossy().into_owned()).unwrap()],
+                        5,
+                        13,
+                    ),
+                    &fixture.desired,
+                )
+                .unwrap(),
+            Some(RuntimeDesiredEffectOutcome::RefreshInventory)
         );
         assert!(!socket_path.exists());
         assert_eq!(retirement.calls.load(Ordering::SeqCst), 1);
@@ -3750,7 +3858,7 @@ mod tests {
             if late_replacement {
                 recovery
                     .recover_one(recovery_context(&fixture))
-                    .expect_err("a late basename must preserve both socket inodes as conflict");
+                    .expect_err("a late basename must conflict with the receipted quarantine");
                 assert!(socket_path.exists());
                 assert!(quarantine.exists());
                 assert_eq!(
@@ -3760,15 +3868,13 @@ mod tests {
             } else {
                 assert_eq!(
                     recovery.recover_one(recovery_context(&fixture)).unwrap(),
-                    RuntimePreScanRecoveryOutcome::Recovered {
-                        cat_id: fixture.desired.cat_id.clone(),
-                    }
+                    RuntimePreScanRecoveryOutcome::NoChange
                 );
                 assert!(!socket_path.exists());
-                assert!(!quarantine.exists());
+                assert!(quarantine.exists());
             }
             assert!(fixture.stop_receipt_path().exists());
-            assert_eq!(retirement.calls.load(Ordering::SeqCst), 1);
+            assert_eq!(retirement.calls.load(Ordering::SeqCst), 0);
             assert_eq!(process.stops.load(Ordering::SeqCst), 1);
             assert_eq!(request.calls.load(Ordering::SeqCst), 0);
             drop(replacement);
@@ -3911,14 +4017,14 @@ mod tests {
         );
         recovery
             .recover_one(recovery_context(&fixture))
-            .expect_err("a connectable replacement socket must remain a physical conflict");
+            .expect_err("a replacement inode must conflict with the durable receipt");
         assert!(socket_path.exists());
         assert_eq!(
             std::fs::symlink_metadata(&socket_path).unwrap().ino(),
             new_inode
         );
         assert!(fixture.stop_receipt_path().exists());
-        assert_eq!(retirement.calls.load(Ordering::SeqCst), 1);
+        assert_eq!(retirement.calls.load(Ordering::SeqCst), 0);
         assert_eq!(process.stops.load(Ordering::SeqCst), 1);
         assert_eq!(request.calls.load(Ordering::SeqCst), 0);
         drop(replacement);
@@ -4101,12 +4207,33 @@ mod tests {
 
             assert_eq!(
                 recovery.recover_one(recovery_context(&fixture)).unwrap(),
-                RuntimePreScanRecoveryOutcome::Recovered {
-                    cat_id: fixture.desired.cat_id.clone(),
-                }
+                RuntimePreScanRecoveryOutcome::NoChange
+            );
+            assert!(fixture.control_socket_path().exists());
+            assert!(target.exists());
+            assert_eq!(retirement.calls.load(Ordering::SeqCst), 0);
+            let effect = fixture.effect_with_ports(
+                Arc::clone(&process) as Arc<dyn RootProvisionProcessPort>,
+                Arc::clone(&retirement) as Arc<dyn RootProvisionProcessRetirementPort>,
+                Arc::clone(&request) as Arc<dyn RootProvisionRequestPort>,
+            );
+            assert_eq!(
+                effect
+                    .try_apply(
+                        &fixture.context_at_with_stop_receipt(
+                            [HostPath::new(
+                                fixture.control_socket_path().to_string_lossy().into_owned(),
+                            )
+                            .unwrap()],
+                            5,
+                            13,
+                        ),
+                        &fixture.desired,
+                    )
+                    .unwrap(),
+                Some(RuntimeDesiredEffectOutcome::RefreshInventory)
             );
             assert!(!fixture.control_socket_path().exists());
-            assert!(target.exists());
             assert_eq!(retirement.calls.load(Ordering::SeqCst), 1);
         }
 
@@ -4121,14 +4248,12 @@ mod tests {
         );
         assert_eq!(
             recovery.recover_one(recovery_context(&fixture)).unwrap(),
-            RuntimePreScanRecoveryOutcome::Recovered {
-                cat_id: fixture.desired.cat_id.clone(),
-            },
-            "an acknowledgement-lost unlink is parent-fsynced and forces a fresh full scan"
+            RuntimePreScanRecoveryOutcome::NoChange,
+            "an acknowledgement-lost unlink remains effect work for a fresh full scan"
         );
         assert!(!socket_path.exists());
         assert!(fixture.stop_receipt_path().exists());
-        assert_eq!(retirement.calls.load(Ordering::SeqCst), 1);
+        assert_eq!(retirement.calls.load(Ordering::SeqCst), 0);
 
         let effect = fixture.effect_with_ports(
             Arc::clone(&process) as Arc<dyn RootProvisionProcessPort>,
@@ -4137,7 +4262,10 @@ mod tests {
         );
         assert_eq!(
             effect
-                .try_apply(&fixture.context_at(Vec::new(), 5, 13), &fixture.desired,)
+                .try_apply(
+                    &fixture.context_at_with_stop_receipt([], 5, 13),
+                    &fixture.desired,
+                )
                 .unwrap(),
             Some(RuntimeDesiredEffectOutcome::RefreshInventory)
         );

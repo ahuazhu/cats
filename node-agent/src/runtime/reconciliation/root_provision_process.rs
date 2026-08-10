@@ -13,9 +13,9 @@ use std::path::Path;
 use anyhow::Context as _;
 use cats_api::runtime_reconciliation::{
     CheckpointEvidence, ControlHandshakeEvidence, DesiredRuntimeSpec, Durability, Epoch,
-    FenceEpoch, HostPath, Id, NodeBootId, NodeObservation, OwnershipTokenEvidence, ProcessEvidence,
-    ProcessRole, ProcessState, RandomId128, ReconcileStep, RemoteHead, Revision, RuntimeCheckpoint,
-    Sequence, Sha256Digest, WireU64,
+    FenceEpoch, HostPath, Id, NodeBootId, NodeObservation, ObservedDevice, OwnershipTokenEvidence,
+    ProcessEvidence, ProcessRole, ProcessState, RandomId128, ReconcileStep, RemoteHead, Revision,
+    RuntimeCheckpoint, Sequence, Sha256Digest, WireU64,
 };
 use cats_blockd::target_control::{
     target_control_authorization_file_name, ProvisionRootAuthorizationContextDigest,
@@ -27,6 +27,7 @@ use cats_storage::authority::{
 
 use crate::runtime_spine::{RuntimeDesiredEffectContext, RuntimePhysicalReadContext};
 
+use super::authorized_blockd::ROOT_PROVISION_STOP_SOCKET_QUARANTINE;
 use super::checkpoint::CurrentCheckpointGuard;
 use super::serving_handoff::{
     target_control_process_launch_identity, TargetControlAuthorizationReady,
@@ -87,7 +88,7 @@ pub(crate) trait RootProvisionProcessRetirementPort:
     fn inspect_exact_after_node_global_sweep(
         &self,
         _expected: &RootProvisionProcessExpectation,
-        _context: &dyn RuntimePhysicalReadContext,
+        _context: &RuntimeDesiredEffectContext,
     ) -> anyhow::Result<RootProvisionProcessInspection> {
         Ok(RootProvisionProcessInspection::Unavailable)
     }
@@ -97,11 +98,10 @@ pub(crate) trait RootProvisionProcessRetirementPort:
     /// restart path between an exact stop and descriptor-relative unlink of
     /// that stale inode; implementations must not treat the allowed pathname
     /// itself as process evidence.
-    fn inspect_absent_allowing_socket_after_node_global_sweep(
+    fn inspect_absent_with_admitted_stop_receipt(
         &self,
         _expected: &RootProvisionProcessExpectation,
-        _allowed_socket: &HostPath,
-        _context: &dyn RuntimePhysicalReadContext,
+        _context: &RuntimeDesiredEffectContext,
     ) -> anyhow::Result<RootProvisionProcessInspection> {
         Ok(RootProvisionProcessInspection::Unavailable)
     }
@@ -109,7 +109,7 @@ pub(crate) trait RootProvisionProcessRetirementPort:
     fn inspect_after_node_global_sweep(
         &self,
         expected: &RootProvisionProcessExpectation,
-        context: &dyn RuntimePhysicalReadContext,
+        context: &RuntimeDesiredEffectContext,
     ) -> anyhow::Result<RootProvisionProcessInspection>;
 }
 
@@ -605,15 +605,18 @@ pub(crate) struct ExactRootProvisionProcessProof {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum NodeGlobalManagedProcessExpectation {
     RootControl {
-        expectation: RootProvisionProcessExpectation,
-        exact: Option<ExactRootProvisionProcessProof>,
+        expectation: Box<RootProvisionProcessExpectation>,
+        exact: Option<Box<ExactRootProvisionProcessProof>>,
+    },
+    ServingBlockd {
+        expectation: Box<super::serving_blockd_process::ServingBlockdExpectation>,
+        exact: Option<Box<super::serving_blockd_process::ExactServingBlockdProcessProof>>,
     },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub(crate) enum NodeGlobalManagedProcessRole {
     RootControl,
-    #[allow(dead_code)] // Filled by the PrepareDevice serving scanner stage.
     ServingBlockd,
     #[allow(dead_code)] // Filled by the VMM scanner stage.
     Vmm,
@@ -625,12 +628,70 @@ pub(crate) struct NodeGlobalManagedProcessKey {
     role: NodeGlobalManagedProcessRole,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct StopReceiptSocketAdmission {
+    receipt_socket: HostPath,
+    physical_paths: BTreeSet<HostPath>,
+}
+
+impl StopReceiptSocketAdmission {
+    pub(crate) fn new(
+        receipt_socket: HostPath,
+        physical_paths: BTreeSet<HostPath>,
+    ) -> anyhow::Result<Self> {
+        anyhow::ensure!(
+            physical_paths.len() <= 1,
+            "stop receipt retains more than one physical socket path"
+        );
+        let receipt_path = Path::new(receipt_socket.as_str());
+        anyhow::ensure!(
+            receipt_path.file_name().is_some_and(|name| {
+                name != std::ffi::OsStr::new(ROOT_PROVISION_STOP_SOCKET_QUARANTINE)
+            }),
+            "stop receipt public socket cannot use the quarantine basename"
+        );
+        let parent = receipt_path
+            .parent()
+            .context("stop receipt socket has no parent")?;
+        let quarantine_path = parent.join(ROOT_PROVISION_STOP_SOCKET_QUARANTINE);
+        let quarantine = HostPath::new(
+            quarantine_path
+                .to_str()
+                .context("stop receipt quarantine path is not UTF-8")?
+                .to_owned(),
+        )
+        .context("stop receipt quarantine path is not canonical")?;
+        anyhow::ensure!(
+            physical_paths
+                .iter()
+                .all(|path| path == &receipt_socket || path == &quarantine),
+            "stop receipt physical socket lies outside its closed public/quarantine union"
+        );
+        Ok(Self {
+            receipt_socket,
+            physical_paths,
+        })
+    }
+
+    pub(crate) fn receipt_socket(&self) -> &HostPath {
+        &self.receipt_socket
+    }
+
+    pub(crate) fn physical_paths(&self) -> &BTreeSet<HostPath> {
+        &self.physical_paths
+    }
+}
+
 impl NodeGlobalManagedProcessExpectation {
     pub(crate) fn key(&self) -> NodeGlobalManagedProcessKey {
         match self {
             Self::RootControl { expectation, .. } => NodeGlobalManagedProcessKey {
                 cat_id: expectation.cat_id.clone(),
                 role: NodeGlobalManagedProcessRole::RootControl,
+            },
+            Self::ServingBlockd { expectation, .. } => NodeGlobalManagedProcessKey {
+                cat_id: expectation.cat_id().clone(),
+                role: NodeGlobalManagedProcessRole::ServingBlockd,
             },
         }
     }
@@ -642,6 +703,7 @@ impl NodeGlobalManagedProcessExpectation {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct NodeGlobalManagedProcessScanAdmission {
     entries: Vec<NodeGlobalManagedProcessExpectation>,
+    stop_receipt_sockets: BTreeMap<Id, StopReceiptSocketAdmission>,
 }
 
 /// The same closed set after it is bound to the exact full observation sent
@@ -658,9 +720,47 @@ pub(crate) struct NodeGlobalManagedProcessAdmission {
     inventory_digest: Sha256Digest,
     inventory_read_position: Sequence,
     entries: Vec<NodeGlobalManagedProcessExpectation>,
+    stop_receipt_sockets: BTreeMap<Id, StopReceiptSocketAdmission>,
 }
 
 impl NodeGlobalManagedProcessScanAdmission {
+    pub(crate) fn process_projections(&self) -> BTreeMap<Id, Vec<ProcessEvidence>> {
+        let mut projections = BTreeMap::<Id, Vec<ProcessEvidence>>::new();
+        for entry in &self.entries {
+            match entry {
+                NodeGlobalManagedProcessExpectation::RootControl { expectation, exact } => {
+                    projections
+                        .entry(expectation.cat_id.clone())
+                        .or_default()
+                        .extend(exact.clone().map(|proof| proof.into_process_evidence()))
+                }
+                NodeGlobalManagedProcessExpectation::ServingBlockd { expectation, exact } => {
+                    projections
+                        .entry(expectation.cat_id().clone())
+                        .or_default()
+                        .extend(exact.clone().map(|proof| proof.into_process_evidence()))
+                }
+            }
+        }
+        projections.retain(|_, processes| !processes.is_empty());
+        projections
+    }
+
+    pub(crate) fn vhost_device_projections(&self) -> BTreeMap<Id, (Id, ObservedDevice)> {
+        self.entries
+            .iter()
+            .filter_map(|entry| match entry {
+                NodeGlobalManagedProcessExpectation::ServingBlockd {
+                    expectation,
+                    exact: Some(proof),
+                } => proof
+                    .vhost_device_projection()
+                    .map(|device| (expectation.cat_id().clone(), device)),
+                _ => None,
+            })
+            .collect()
+    }
+
     pub(crate) fn from_root_controls(
         expected: BTreeMap<Id, RootProvisionProcessExpectation>,
         mut exact: BTreeMap<Id, ExactRootProvisionProcessProof>,
@@ -690,8 +790,8 @@ impl NodeGlobalManagedProcessScanAdmission {
                 );
             }
             let entry = NodeGlobalManagedProcessExpectation::RootControl {
-                expectation,
-                exact: proof,
+                expectation: Box::new(expectation),
+                exact: proof.map(Box::new),
             };
             anyhow::ensure!(
                 keys.insert(entry.key()),
@@ -703,7 +803,160 @@ impl NodeGlobalManagedProcessScanAdmission {
             exact.is_empty(),
             "Node-global Root-control proof lacks an authoritative expectation"
         );
-        Ok(Self { entries })
+        Ok(Self {
+            entries,
+            stop_receipt_sockets: BTreeMap::new(),
+        })
+    }
+
+    pub(crate) fn with_stop_receipt_sockets(
+        mut self,
+        sockets: BTreeMap<Id, StopReceiptSocketAdmission>,
+    ) -> anyhow::Result<Self> {
+        let mut physical_paths = BTreeSet::new();
+        for (cat_id, socket) in &sockets {
+            let expected = self.entries.iter().find_map(|entry| match entry {
+                NodeGlobalManagedProcessExpectation::RootControl { expectation, exact }
+                    if &expectation.cat_id == cat_id =>
+                {
+                    Some((expectation, exact.is_some()))
+                }
+                _ => None,
+            });
+            anyhow::ensure!(
+                expected.is_some_and(|(expected, _)| {
+                    &expected.control_socket_path == socket.receipt_socket()
+                }),
+                "stop receipt socket lacks its exact RootControl expectation"
+            );
+            if expected.is_some_and(|(_, exact)| exact) {
+                anyhow::ensure!(
+                    socket.physical_paths() == &BTreeSet::from([socket.receipt_socket().clone()]),
+                    "live RootControl receipt must retain its exact public socket"
+                );
+            }
+            anyhow::ensure!(
+                socket
+                    .physical_paths()
+                    .iter()
+                    .all(|path| physical_paths.insert(path.clone())),
+                "stop receipt admissions duplicate one physical socket path"
+            );
+            for path in socket.physical_paths() {
+                for entry in &self.entries {
+                    match entry {
+                        NodeGlobalManagedProcessExpectation::RootControl {
+                            expectation,
+                            exact: Some(_),
+                        } => {
+                            anyhow::ensure!(
+                                (&expectation.cat_id == cat_id && path == socket.receipt_socket())
+                                    || path != &expectation.control_socket_path,
+                                "stop receipt socket aliases another RootControl owner"
+                            );
+                        }
+                        NodeGlobalManagedProcessExpectation::ServingBlockd {
+                            expectation,
+                            exact: Some(_),
+                        } => {
+                            anyhow::ensure!(
+                                path != expectation.control_socket_path()
+                                    && path != expectation.listener_path(),
+                                "stop receipt socket aliases a ServingBlockd owner"
+                            );
+                        }
+                        _ => {}
+                    }
+                }
+            }
+        }
+        self.stop_receipt_sockets = sockets;
+        Ok(self)
+    }
+
+    pub(crate) fn with_serving_blockds(
+        mut self,
+        expected: BTreeMap<Id, super::serving_blockd_process::ServingBlockdExpectation>,
+        mut exact: BTreeMap<Id, super::serving_blockd_process::ExactServingBlockdProcessProof>,
+    ) -> anyhow::Result<Self> {
+        let mut units = self
+            .entries
+            .iter()
+            .filter_map(|entry| match entry {
+                NodeGlobalManagedProcessExpectation::RootControl {
+                    exact: Some(proof), ..
+                } => Some(proof.evidence().scope_id.clone()),
+                NodeGlobalManagedProcessExpectation::ServingBlockd {
+                    exact: Some(proof), ..
+                } => Some(proof.evidence().unit_id().clone()),
+                _ => None,
+            })
+            .collect::<BTreeSet<_>>();
+        let mut pids = self
+            .entries
+            .iter()
+            .filter_map(|entry| match entry {
+                NodeGlobalManagedProcessExpectation::RootControl {
+                    exact: Some(proof), ..
+                } => Some(proof.evidence().process_id),
+                NodeGlobalManagedProcessExpectation::ServingBlockd {
+                    exact: Some(proof), ..
+                } => Some(proof.evidence().process_id()),
+                _ => None,
+            })
+            .collect::<BTreeSet<_>>();
+        let mut sockets = self
+            .entries
+            .iter()
+            .filter_map(|entry| match entry {
+                NodeGlobalManagedProcessExpectation::RootControl {
+                    exact: Some(proof), ..
+                } => Some(proof.evidence().control_socket_path.clone()),
+                NodeGlobalManagedProcessExpectation::ServingBlockd {
+                    exact: Some(proof), ..
+                } => Some(proof.evidence().control_socket_path().clone()),
+                _ => None,
+            })
+            .collect::<BTreeSet<_>>();
+        let mut keys = self
+            .entries
+            .iter()
+            .map(NodeGlobalManagedProcessExpectation::key)
+            .collect::<BTreeSet<_>>();
+        for (cat_id, expectation) in expected {
+            anyhow::ensure!(
+                expectation.cat_id() == &cat_id,
+                "Node-global serving expectation is indexed by another Cat"
+            );
+            let proof = exact.remove(&cat_id);
+            if let Some(proof) = &proof {
+                anyhow::ensure!(
+                    proof.expectation() == &expectation,
+                    "Node-global serving proof changed its full expectation"
+                );
+                let evidence = proof.evidence();
+                anyhow::ensure!(
+                    units.insert(evidence.unit_id().clone())
+                        && pids.insert(evidence.process_id())
+                        && sockets.insert(evidence.control_socket_path().clone()),
+                    "Node-global serving proof duplicates a physical identity"
+                );
+            }
+            let entry = NodeGlobalManagedProcessExpectation::ServingBlockd {
+                expectation: Box::new(expectation),
+                exact: proof.map(Box::new),
+            };
+            anyhow::ensure!(
+                keys.insert(entry.key()),
+                "Node-global managed-process admission duplicates one typed key"
+            );
+            self.entries.push(entry);
+        }
+        anyhow::ensure!(
+            exact.is_empty(),
+            "Node-global serving proof lacks an authoritative expectation"
+        );
+        Ok(self)
     }
 
     pub(crate) fn root_control_proofs(&self) -> BTreeMap<Id, ExactRootProvisionProcessProof> {
@@ -713,8 +966,24 @@ impl NodeGlobalManagedProcessScanAdmission {
                 NodeGlobalManagedProcessExpectation::RootControl {
                     expectation,
                     exact: Some(proof),
-                } => Some((expectation.cat_id.clone(), proof.clone())),
+                } => Some((expectation.cat_id.clone(), (**proof).clone())),
                 NodeGlobalManagedProcessExpectation::RootControl { exact: None, .. } => None,
+                NodeGlobalManagedProcessExpectation::ServingBlockd { .. } => None,
+            })
+            .collect()
+    }
+
+    pub(crate) fn serving_blockd_proofs(
+        &self,
+    ) -> BTreeMap<Id, super::serving_blockd_process::ExactServingBlockdProcessProof> {
+        self.entries
+            .iter()
+            .filter_map(|entry| match entry {
+                NodeGlobalManagedProcessExpectation::ServingBlockd {
+                    expectation,
+                    exact: Some(proof),
+                } => Some((expectation.cat_id().clone(), (**proof).clone())),
+                _ => None,
             })
             .collect()
     }
@@ -738,31 +1007,45 @@ impl NodeGlobalManagedProcessScanAdmission {
         for entry in &self.entries {
             match entry {
                 NodeGlobalManagedProcessExpectation::RootControl { expectation, exact } => {
-                    anyhow::ensure!(
-                        admitted_processes
-                            .insert(
-                                expectation.cat_id.clone(),
-                                exact
-                                    .clone()
-                                    .map(ExactRootProvisionProcessProof::into_process_evidence),
-                            )
-                            .is_none(),
-                        "Node-global managed-process admission repeats one Cat/role"
-                    );
+                    admitted_processes
+                        .entry(expectation.cat_id.clone())
+                        .or_insert_with(Vec::new)
+                        .extend(exact.clone().map(|proof| proof.into_process_evidence()));
+                }
+                NodeGlobalManagedProcessExpectation::ServingBlockd { expectation, exact } => {
+                    admitted_processes
+                        .entry(expectation.cat_id().clone())
+                        .or_insert_with(Vec::new)
+                        .extend(exact.clone().map(|proof| proof.into_process_evidence()));
                 }
             }
         }
         for runtime in &observation.runtimes {
             let expected = admitted_processes.remove(&runtime.cat_id);
             match expected {
-                Some(Some(process)) => anyhow::ensure!(
-                    runtime.processes == [process],
+                Some(processes) => anyhow::ensure!(
+                    runtime.processes == processes,
                     "Node-global managed-process proof conflicts with public projection"
                 ),
-                Some(None) | None => anyhow::ensure!(
+                None => anyhow::ensure!(
                     runtime.processes.is_empty(),
                     "public process projection lacks a provider-private global expectation"
                 ),
+            }
+            let expected_device = self.entries.iter().find_map(|entry| match entry {
+                NodeGlobalManagedProcessExpectation::ServingBlockd {
+                    expectation,
+                    exact: Some(proof),
+                } if expectation.cat_id() == &runtime.cat_id => proof.vhost_device_projection(),
+                _ => None,
+            });
+            if let Some((volume_id, device)) = expected_device {
+                anyhow::ensure!(
+                    runtime.volumes.iter().any(|volume| {
+                        volume.volume_id == volume_id && volume.devices == [device.clone()]
+                    }),
+                    "serving vhost proof conflicts with public device projection"
+                );
             }
         }
         anyhow::ensure!(
@@ -779,6 +1062,7 @@ impl NodeGlobalManagedProcessScanAdmission {
             inventory_digest,
             inventory_read_position,
             entries: self.entries,
+            stop_receipt_sockets: self.stop_receipt_sockets,
         })
     }
 
@@ -794,11 +1078,23 @@ impl NodeGlobalManagedProcessScanAdmission {
             inventory_digest: Sha256Digest::from_bytes([4; 32]),
             inventory_read_position: Sequence::new(1).unwrap(),
             entries: self.entries,
+            stop_receipt_sockets: self.stop_receipt_sockets,
         }
     }
 }
 
 impl NodeGlobalManagedProcessAdmission {
+    pub(crate) fn stop_receipt_socket(&self, cat_id: &Id) -> Option<&StopReceiptSocketAdmission> {
+        self.stop_receipt_sockets.get(cat_id)
+    }
+
+    pub(crate) fn stop_receipt_physical_paths(&self) -> BTreeSet<HostPath> {
+        self.stop_receipt_sockets
+            .values()
+            .flat_map(|socket| socket.physical_paths().iter().cloned())
+            .collect()
+    }
+
     pub(crate) fn matches_observation(&self, observation: &NodeObservation) -> bool {
         observation.complete_inventory
             && self.observation_id == observation.observation_id
@@ -822,7 +1118,7 @@ impl NodeGlobalManagedProcessAdmission {
         for entry in &self.entries {
             match entry {
                 NodeGlobalManagedProcessExpectation::RootControl { expectation, exact } => {
-                    expected.insert(expectation.cat_id.clone(), expectation.clone());
+                    expected.insert(expectation.cat_id.clone(), (**expectation).clone());
                     admitted.insert(
                         expectation.cat_id.clone(),
                         exact
@@ -834,6 +1130,35 @@ impl NodeGlobalManagedProcessAdmission {
                             }),
                     );
                 }
+                NodeGlobalManagedProcessExpectation::ServingBlockd { .. } => {}
+            }
+        }
+        (expected, admitted)
+    }
+
+    pub(crate) fn serving_blockd_state(
+        &self,
+    ) -> (
+        BTreeMap<Id, super::serving_blockd_process::ServingBlockdExpectation>,
+        BTreeMap<Id, super::serving_blockd_process::ServingBlockdProcessInspection>,
+    ) {
+        let mut expected = BTreeMap::new();
+        let mut admitted = BTreeMap::new();
+        for entry in &self.entries {
+            if let NodeGlobalManagedProcessExpectation::ServingBlockd { expectation, exact } = entry
+            {
+                expected.insert(expectation.cat_id().clone(), (**expectation).clone());
+                admitted.insert(
+                    expectation.cat_id().clone(),
+                    exact.as_ref().map_or(
+                        super::serving_blockd_process::ServingBlockdProcessInspection::Absent,
+                        |proof| {
+                            super::serving_blockd_process::ServingBlockdProcessInspection::Exact(
+                                Box::new(proof.evidence().clone()),
+                            )
+                        },
+                    ),
+                );
             }
         }
         (expected, admitted)
@@ -850,9 +1175,27 @@ impl NodeGlobalManagedProcessAdmission {
             NodeGlobalManagedProcessExpectation::RootControl { expectation, exact }
                 if &expectation.cat_id == cat_id =>
             {
-                Some((expectation, exact.as_ref()))
+                Some((expectation.as_ref(), exact.as_deref()))
             }
             NodeGlobalManagedProcessExpectation::RootControl { .. } => None,
+            NodeGlobalManagedProcessExpectation::ServingBlockd { .. } => None,
+        })
+    }
+
+    pub(crate) fn serving_blockd(
+        &self,
+        cat_id: &Id,
+    ) -> Option<(
+        &super::serving_blockd_process::ServingBlockdExpectation,
+        Option<&super::serving_blockd_process::ExactServingBlockdProcessProof>,
+    )> {
+        self.entries.iter().find_map(|entry| match entry {
+            NodeGlobalManagedProcessExpectation::ServingBlockd { expectation, exact }
+                if expectation.cat_id() == cat_id =>
+            {
+                Some((expectation.as_ref(), exact.as_deref()))
+            }
+            _ => None,
         })
     }
 }
@@ -866,6 +1209,12 @@ pub(crate) struct ExactRootProvisionProcessAbsenceProof {
     checkpoint_content_digest: Sha256Digest,
     expectation: RootProvisionProcessExpectation,
     admission: RootProvisionRetirementAdmission,
+    stop_receipt_socket_present: bool,
+}
+
+pub(crate) enum RootProvisionAbsencePurpose {
+    Ordinary(Option<TargetControlProcessLaunchIdentity>),
+    AdmittedStopReceipt(Option<TargetControlProcessLaunchIdentity>),
 }
 
 /// Durable coordinates of the accepted complete inventory that authorized
@@ -945,6 +1294,10 @@ impl ExactRootProvisionProcessAbsenceProof {
 
     pub(crate) fn admission(&self) -> &RootProvisionRetirementAdmission {
         &self.admission
+    }
+
+    pub(crate) fn stop_receipt_socket_present(&self) -> bool {
+        self.stop_receipt_socket_present
     }
 }
 
@@ -1043,7 +1396,7 @@ pub(crate) fn prove_exact_root_provision_process_absence<P>(
     stored_checkpoint: &StoredCheckpoint,
     authority: RootProvisionAuthoritySnapshot<'_>,
     executable_path: HostPath,
-    target_control_launch: Option<TargetControlProcessLaunchIdentity>,
+    purpose: RootProvisionAbsencePurpose,
     port: &P,
     context: &RuntimeDesiredEffectContext,
 ) -> anyhow::Result<ExactRootProvisionProcessAbsenceProof>
@@ -1058,17 +1411,37 @@ where
         authority,
         executable_path,
     )?;
+    let (target_control_launch, with_stop_receipt) = match purpose {
+        RootProvisionAbsencePurpose::Ordinary(launch) => (launch, false),
+        RootProvisionAbsencePurpose::AdmittedStopReceipt(launch) => (launch, true),
+    };
     if let Some(target_control_launch) = target_control_launch {
         expectation = expectation.with_target_control_launch(target_control_launch)?;
     }
-    match port
-        .inspect_after_node_global_sweep(&expectation, context)
+    let stop_receipt_socket_present = if with_stop_receipt {
+        let Some(receipt) = context
+            .node_global_process()?
+            .stop_receipt_socket(&expectation.cat_id)
+        else {
+            anyhow::bail!("accepted full lacks the expected stop receipt socket")
+        };
+        !receipt.physical_paths().is_empty()
+    } else {
+        false
+    };
+    let inspection = if with_stop_receipt {
+        port.inspect_absent_with_admitted_stop_receipt(&expectation, context)
+    } else {
+        port.inspect_after_node_global_sweep(&expectation, context)
+    };
+    match inspection
         .context("reinspect sealed Node-global root-provision inventory before record retirement")?
     {
         RootProvisionProcessInspection::Absent => Ok(ExactRootProvisionProcessAbsenceProof {
             checkpoint_content_digest: stored_checkpoint.content_digest().clone(),
             expectation,
             admission,
+            stop_receipt_socket_present,
         }),
         RootProvisionProcessInspection::Exact(_) => {
             anyhow::bail!("root-provision process is present; handoff record must remain sealed")
@@ -1505,6 +1878,94 @@ mod tests {
             attachment,
             evidence,
         )
+    }
+
+    #[test]
+    fn stop_receipt_socket_admission_closes_the_public_quarantine_union() {
+        let public = host("/run/cats/cat_01/root-provision.sock");
+        let quarantine = host("/run/cats/cat_01/.rp-stop.sock");
+        for physical in [
+            BTreeSet::new(),
+            BTreeSet::from([public.clone()]),
+            BTreeSet::from([quarantine]),
+        ] {
+            StopReceiptSocketAdmission::new(public.clone(), physical).unwrap();
+        }
+        assert!(StopReceiptSocketAdmission::new(
+            public.clone(),
+            BTreeSet::from([host("/run/cats/cat_01/arbitrary.sock")]),
+        )
+        .is_err());
+        assert!(StopReceiptSocketAdmission::new(
+            public.clone(),
+            BTreeSet::from([public, host("/run/cats/cat_01/.rp-stop.sock")]),
+        )
+        .is_err());
+        assert!(StopReceiptSocketAdmission::new(
+            host("/run/cats/cat_01/.rp-stop.sock"),
+            BTreeSet::new(),
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn stop_receipt_admission_allows_its_live_root_but_rejects_cross_cat_alias() {
+        let (_root, _state, _store, _predecessor, staged, attachment, evidence) = fixture();
+        let authority = authority_record(&attachment, attachment.head.clone());
+        let expectation = RootProvisionProcessExpectation::from_checkpoint(
+            &staged,
+            authority_snapshot(attachment, &authority),
+            host("/usr/bin/cats-blockd"),
+        )
+        .unwrap();
+        let exact = expectation
+            .clone()
+            .prove_exact_process(evidence.clone())
+            .unwrap();
+        NodeGlobalManagedProcessScanAdmission::from_root_controls(
+            BTreeMap::from([(expectation.cat_id.clone(), expectation.clone())]),
+            BTreeMap::from([(expectation.cat_id.clone(), exact)]),
+        )
+        .unwrap()
+        .with_stop_receipt_sockets(BTreeMap::from([(
+            expectation.cat_id.clone(),
+            StopReceiptSocketAdmission::new(
+                expectation.control_socket_path.clone(),
+                BTreeSet::from([expectation.control_socket_path.clone()]),
+            )
+            .unwrap(),
+        )]))
+        .unwrap();
+
+        let quarantine = host("/run/cats/cat_01/.rp-stop.sock");
+        let mut other = expectation.clone();
+        other.cat_id = id("cat_02");
+        other.scope_id = id("cats-root-other.service");
+        other.cgroup_path = host("/sys/fs/cgroup/system.slice/cats-root-other.service");
+        other.control_socket_path = quarantine.clone();
+        let mut other_evidence = evidence;
+        other_evidence.scope_id = other.scope_id.clone();
+        other_evidence.cgroup_path = other.cgroup_path.clone();
+        other_evidence.control_socket_path = quarantine.clone();
+        let other_exact = other.clone().prove_exact_process(other_evidence).unwrap();
+        let admission = NodeGlobalManagedProcessScanAdmission::from_root_controls(
+            BTreeMap::from([
+                (expectation.cat_id.clone(), expectation.clone()),
+                (other.cat_id.clone(), other.clone()),
+            ]),
+            BTreeMap::from([(other.cat_id.clone(), other_exact)]),
+        )
+        .unwrap();
+        assert!(admission
+            .with_stop_receipt_sockets(BTreeMap::from([(
+                expectation.cat_id.clone(),
+                StopReceiptSocketAdmission::new(
+                    expectation.control_socket_path.clone(),
+                    BTreeSet::from([quarantine]),
+                )
+                .unwrap(),
+            )]))
+            .is_err());
     }
 
     #[test]

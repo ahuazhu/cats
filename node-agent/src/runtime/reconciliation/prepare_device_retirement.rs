@@ -97,7 +97,7 @@ impl PrepareDeviceTargetRetirementEffect {
         ) {
             return Ok(None);
         }
-        if !prepare_device_admission_is_exact(accepted, desired, runtime) {
+        if !prepare_device_base_admission_is_exact(accepted, desired, runtime) {
             return Ok(Some(stop_local()));
         }
 
@@ -165,11 +165,32 @@ impl PrepareDeviceTargetRetirementEffect {
             Ok(expectation) => expectation,
             Err(_) => return Ok(Some(stop_local())),
         };
+        let admission = context.node_global_process()?;
+        let Some((_, admitted_serving)) = admission.serving_blockd(&desired.cat_id) else {
+            return Ok(Some(stop_local()));
+        };
+        enum AcceptedProcess<'a> {
+            None,
+            Root(&'a cats_api::runtime_reconciliation::ProcessEvidence),
+            Serving,
+        }
         let accepted_process = match runtime.processes.as_slice() {
-            [] => None,
-            [process] if public_process_matches_expectation(process, &expectation) => Some(process),
+            [] if admitted_serving.is_none() => AcceptedProcess::None,
+            [process] if public_process_matches_expectation(process, &expectation) => {
+                AcceptedProcess::Root(process)
+            }
+            [process]
+                if admitted_serving.is_some_and(|proof| proof.matches_public_process(process)) =>
+            {
+                AcceptedProcess::Serving
+            }
             _ => return Ok(Some(stop_local())),
         };
+        if !matches!(accepted_process, AcceptedProcess::Serving)
+            && !runtime.volumes[0].devices.is_empty()
+        {
+            return Ok(Some(stop_local()));
+        }
 
         context.check_active()?;
         let inspection = self
@@ -177,19 +198,25 @@ impl PrepareDeviceTargetRetirementEffect {
             .inspect_exact_or_absent_after_node_global_sweep(&expectation, context)
             .context("reinspect old target-control process across Node-global sweep")?;
         let evidence = match (accepted_process, inspection) {
-            (None, RootProvisionProcessInspection::Absent) => return Ok(None),
-            (Some(_), RootProvisionProcessInspection::Absent)
+            (
+                AcceptedProcess::None | AcceptedProcess::Serving,
+                RootProvisionProcessInspection::Absent,
+            ) => return Ok(None),
+            (AcceptedProcess::Root(_), RootProvisionProcessInspection::Absent)
             | (_, RootProvisionProcessInspection::Unavailable) => {
                 return Ok(Some(RuntimeDesiredEffectOutcome::RefreshInventory))
             }
-            (Some(accepted), RootProvisionProcessInspection::Exact(evidence))
+            (AcceptedProcess::Root(accepted), RootProvisionProcessInspection::Exact(evidence))
                 if accepted.process_id == evidence.process_id
                     && accepted.process_start_time_ticks == evidence.process_start_time_ticks =>
             {
                 evidence
             }
-            (None, RootProvisionProcessInspection::Exact(_))
-            | (Some(_), RootProvisionProcessInspection::Exact(_))
+            (
+                AcceptedProcess::None | AcceptedProcess::Serving,
+                RootProvisionProcessInspection::Exact(_),
+            )
+            | (AcceptedProcess::Root(_), RootProvisionProcessInspection::Exact(_))
             | (_, RootProvisionProcessInspection::Conflict(_)) => return Ok(Some(stop_local())),
         };
 
@@ -268,7 +295,7 @@ pub(super) fn unique_runtime<'a>(
     Ok(Some(runtime))
 }
 
-pub(super) fn prepare_device_admission_is_exact(
+pub(super) fn prepare_device_base_admission_is_exact(
     accepted: &crate::runtime_spine::RuntimeDesiredEffectAdmission,
     desired: &DesiredRuntimeSpec,
     runtime: &ObservedRuntimeStatus,
@@ -364,7 +391,6 @@ pub(super) fn prepare_device_admission_is_exact(
         && observed_volume.size_bytes == Some(desired_volume.size_bytes)
         && observed_volume.durability == Some(*durability)
         && observed_volume.durability == Some(desired_volume.durability)
-        && observed_volume.devices.is_empty()
         && *observed_attachment == *attachment_id
         && *observed_epoch == *attachment_epoch
         && *observed_head == *expected_head

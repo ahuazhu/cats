@@ -1252,6 +1252,7 @@ dependencies = [
  "cats-blockd",
  "cats-metadata-store-sqlite",
  "cats-metering",
+ "cats-object-store-file",
  "cats-storage",
  "cats-test-support",
  "futures-util",
@@ -1270,6 +1271,7 @@ dependencies = [
  "tokio-tungstenite",
  "tracing",
  "uuid",
+ "vhost",
 ]
 
 [[package]]

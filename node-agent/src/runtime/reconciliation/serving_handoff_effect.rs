@@ -54,10 +54,9 @@ use super::{AuthorizedBlockdStore, FileCheckpointStore, StoredCheckpoint};
 
 const SERVING_SCOPE_PREFIX: &str = "cats-serving-";
 const SERVING_SCOPE_SUFFIX: &str = ".service";
-const SERVING_CONTROL_SOCKET_BASENAME: &str = "serving-control.sock";
-#[cfg(target_os = "linux")]
-const SERVING_NBD_SOCKET_BASENAME: &str = "serving-nbd.sock";
-const SERVING_VHOST_SOCKET_BASENAME: &str = "serving-vhost.sock";
+pub(super) const SERVING_CONTROL_SOCKET_BASENAME: &str = "serving-control.sock";
+pub(super) const SERVING_NBD_SOCKET_BASENAME: &str = "serving-nbd.sock";
+pub(super) const SERVING_VHOST_SOCKET_BASENAME: &str = "serving-vhost.sock";
 
 /// Frozen Node-local frontend inputs for the one durable transition from a
 /// sealed Root handoff to `PrepareDevice`. The wider Cloud Hypervisor config

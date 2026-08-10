@@ -499,6 +499,15 @@ impl RuntimeDesiredEffectContext {
     }
 
     #[cfg(test)]
+    pub(crate) fn with_node_global_process_for_test(
+        mut self,
+        admission: NodeGlobalManagedProcessAdmission,
+    ) -> Self {
+        self.node_global_process = Some(admission);
+        self
+    }
+
+    #[cfg(test)]
     pub(crate) fn cancel_for_test(&self) {
         self.cancellation.cancel();
     }

@@ -26,23 +26,27 @@ use crate::runtime_spine::{
 use super::checkpoint::CurrentCheckpointGuard;
 use super::clean_slate_probes::CHECKPOINT_NAMESPACE;
 use super::prepare_device_retirement::{
-    prepare_device_admission_is_exact, retirement_authority_lease_is_monotonic, unique_runtime,
+    prepare_device_base_admission_is_exact, retirement_authority_lease_is_monotonic, unique_runtime,
 };
 use super::serving_handoff::{PrepareDeviceHandoffReady, ServingHandoffStore};
+use super::systemd_root_provision::ListenerPhysicalIdentity;
 use super::{
     authorized_blockd_status_is_bound, AuthorizedBlockdCheckpoint, AuthorizedBlockdStore,
     FileCheckpointStore, RootProvisionSystemdConfig, StoredCheckpoint,
 };
 
-pub(crate) mod sealed {
+pub(crate) mod process_sealed {
     pub(crate) trait Sealed {}
 }
 
-/// The only provider boundary allowed to decide whether the serving process
-/// is globally absent or exact.  Implementations must include the full
-/// systemd unit/cgroup, process argv, managed socket and Unix status sweep.
-pub(crate) trait ServingBlockdProcessGlobalPort: sealed::Sealed + Send + Sync {
-    fn inspect_exact_or_absent_after_node_global_sweep(
+pub(crate) mod global_sealed {
+    pub(crate) trait Sealed {}
+}
+
+/// Exact provider-local systemd/process/status inspection.  This is not an
+/// absence authority: only the Node-global port below may authorize a start.
+pub(crate) trait ServingBlockdProcessPort: process_sealed::Sealed + Send + Sync {
+    fn inspect(
         &self,
         expected: &ServingBlockdExpectation,
         context: &dyn RuntimePhysicalReadContext,
@@ -56,6 +60,19 @@ pub(crate) trait ServingBlockdProcessGlobalPort: sealed::Sealed + Send + Sync {
         checkpointed: CheckpointedServingBlockdProcess<'_>,
         context: &RuntimeDesiredEffectContext,
     ) -> anyhow::Result<ServingBlockdProcessStart>;
+}
+
+/// The only provider boundary allowed to decide whether the serving process
+/// is globally absent or exact.  Implementations must include the full
+/// systemd unit/cgroup, process argv, managed socket and Unix status sweep.
+pub(crate) trait ServingBlockdProcessGlobalPort:
+    global_sealed::Sealed + ServingBlockdProcessPort
+{
+    fn inspect_serving_exact_or_absent_after_node_global_sweep(
+        &self,
+        expected: &ServingBlockdExpectation,
+        context: &RuntimeDesiredEffectContext,
+    ) -> anyhow::Result<ServingBlockdProcessInspection>;
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -98,7 +115,7 @@ pub(crate) struct ServingBlockdExpectation {
 }
 
 impl ServingBlockdExpectation {
-    fn from_handoff(
+    pub(crate) fn from_handoff(
         ready: &PrepareDeviceHandoffReady,
         systemd: &RootProvisionSystemdConfig,
         checkpoint: &cats_api::runtime_reconciliation::RuntimeCheckpoint,
@@ -181,6 +198,70 @@ impl ServingBlockdExpectation {
             && !status.backpressured
     }
 
+    pub(crate) fn cat_id(&self) -> &Id {
+        &self.volume.desired.cat_id
+    }
+
+    pub(super) fn unit_id(&self) -> &Id {
+        &self.unit_id
+    }
+
+    pub(super) fn cgroup_path(&self) -> &HostPath {
+        &self.cgroup_path
+    }
+
+    pub(super) fn executable_path(&self) -> &HostPath {
+        &self.executable_path
+    }
+
+    pub(super) fn command_line(&self) -> &[OsString] {
+        &self.command_line
+    }
+
+    pub(super) fn process_identity_token(&self) -> &RandomId128 {
+        &self.process_identity_token
+    }
+
+    pub(super) fn control_socket_path(&self) -> &HostPath {
+        &self.control_socket_path
+    }
+
+    pub(super) fn data_directory(&self) -> &HostPath {
+        &self.data_directory
+    }
+
+    pub(super) fn device_ownership_token(&self) -> &RandomId128 {
+        &self.device_ownership_token
+    }
+
+    pub(super) fn frontend(&self) -> &PrepareDeviceFrontend {
+        &self.frontend
+    }
+
+    pub(super) fn listener_path(&self) -> &HostPath {
+        match &self.frontend {
+            PrepareDeviceFrontend::KernelNbd {
+                listener_socket_path,
+                ..
+            } => listener_socket_path,
+            PrepareDeviceFrontend::VhostUserBlk { socket_path, .. } => socket_path,
+        }
+    }
+
+    pub(crate) fn prove_exact_process(
+        self,
+        evidence: ServingBlockdProcessEvidence,
+    ) -> anyhow::Result<ExactServingBlockdProcessProof> {
+        anyhow::ensure!(
+            evidence.exactly_matches(&self),
+            "serving blockd evidence does not exactly match its expectation"
+        );
+        Ok(ExactServingBlockdProcessProof {
+            expectation: self,
+            evidence,
+        })
+    }
+
     #[cfg(test)]
     pub(crate) fn exact_evidence_for_test(&self, process_id: u32) -> ServingBlockdProcessEvidence {
         let head_generation = i64::try_from(self.volume.attachment.head.generation.get()).unwrap();
@@ -198,6 +279,12 @@ impl ServingBlockdExpectation {
             process_identity_token: self.process_identity_token.clone(),
             device_ownership_token: self.device_ownership_token.clone(),
             frontend: self.frontend.clone(),
+            listener_identity: ListenerPhysicalIdentity::for_test(
+                process_id,
+                1,
+                u64::from(process_id) + 1_000,
+                u64::from(process_id) + 2_000,
+            ),
             handshake_peer_process_id: process_id,
             status: DurabilityStatus {
                 volume_id: self.volume.attachment.identity.volume_id.to_string(),
@@ -255,12 +342,51 @@ pub(crate) struct ServingBlockdProcessEvidence {
     process_identity_token: RandomId128,
     device_ownership_token: RandomId128,
     frontend: PrepareDeviceFrontend,
+    listener_identity: ListenerPhysicalIdentity,
     handshake_peer_process_id: u32,
     status: DurabilityStatus,
 }
 
 impl ServingBlockdProcessEvidence {
-    fn exactly_matches(&self, expected: &ServingBlockdExpectation) -> bool {
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn from_inspected(
+        process_id: u32,
+        process_start_time_ticks: WireU64,
+        executable_path: HostPath,
+        unit_id: Id,
+        cgroup_path: HostPath,
+        cgroup_process_ids: Vec<u32>,
+        command_line: Vec<OsString>,
+        control_socket_path: HostPath,
+        data_directory: HostPath,
+        process_identity_token: RandomId128,
+        device_ownership_token: RandomId128,
+        frontend: PrepareDeviceFrontend,
+        listener_identity: ListenerPhysicalIdentity,
+        handshake_peer_process_id: u32,
+        status: DurabilityStatus,
+    ) -> Self {
+        Self {
+            process_id,
+            unit_main_process_id: process_id,
+            process_start_time_ticks,
+            executable_path,
+            unit_id,
+            cgroup_path,
+            cgroup_process_ids,
+            command_line,
+            control_socket_path,
+            data_directory,
+            process_identity_token,
+            device_ownership_token,
+            frontend,
+            listener_identity,
+            handshake_peer_process_id,
+            status,
+        }
+    }
+
+    pub(super) fn exactly_matches(&self, expected: &ServingBlockdExpectation) -> bool {
         self.process_id > 0
             && self.unit_main_process_id == self.process_id
             && self.process_start_time_ticks.get() > 0
@@ -275,29 +401,186 @@ impl ServingBlockdProcessEvidence {
             && self.process_identity_token == expected.process_identity_token
             && self.device_ownership_token == expected.device_ownership_token
             && self.frontend == expected.frontend
+            && self.listener_identity.process_id == self.process_id
             && expected.status_is_exact(&self.status)
     }
 
-    #[cfg(test)]
-    pub(crate) fn into_process_evidence(&self) -> ProcessEvidence {
+    pub(crate) fn unit_id(&self) -> &Id {
+        &self.unit_id
+    }
+
+    pub(crate) fn process_id(&self) -> u32 {
+        self.process_id
+    }
+
+    pub(crate) fn control_socket_path(&self) -> &HostPath {
+        &self.control_socket_path
+    }
+
+    pub(crate) fn listener_path(&self) -> &HostPath {
+        match &self.frontend {
+            PrepareDeviceFrontend::KernelNbd {
+                listener_socket_path,
+                ..
+            } => listener_socket_path,
+            PrepareDeviceFrontend::VhostUserBlk { socket_path, .. } => socket_path,
+        }
+    }
+
+    pub(crate) fn into_process_evidence(self) -> ProcessEvidence {
         ProcessEvidence {
             role: ProcessRole::Blockd {
-                volume_id: Id::new(self.status.volume_id.clone()).unwrap(),
-                attachment_id: Id::new(self.status.attachment_id.clone()).unwrap(),
-                attachment_epoch: self.status.attachment_epoch.unwrap(),
+                volume_id: Id::new(self.status.volume_id.clone())
+                    .expect("exact serving status has a valid volume ID"),
+                attachment_id: Id::new(self.status.attachment_id.clone())
+                    .expect("exact serving status has a valid attachment ID"),
+                attachment_epoch: self
+                    .status
+                    .attachment_epoch
+                    .expect("exact serving status has an attachment epoch"),
             },
             process_id: self.process_id,
             process_start_time_ticks: self.process_start_time_ticks,
-            executable_path: self.executable_path.clone(),
-            scope_id: self.unit_id.clone(),
-            control_socket_path: self.control_socket_path.clone(),
+            executable_path: self.executable_path,
+            scope_id: self.unit_id,
+            control_socket_path: self.control_socket_path,
             state: ProcessState::Running,
             ownership_token: OwnershipTokenEvidence::Valid {
-                ownership_token: self.process_identity_token.clone(),
+                ownership_token: self.process_identity_token,
             },
             control_handshake: ControlHandshakeEvidence::Verified,
             observed_vm_shape: None,
         }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn status_mut_for_test(&mut self) -> &mut DurabilityStatus {
+        &mut self.status
+    }
+}
+
+/// Unforgeable proof that one full provider-private process observation
+/// exactly matched the serving expectation derived from PrepareDevice.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ExactServingBlockdProcessProof {
+    expectation: ServingBlockdExpectation,
+    evidence: ServingBlockdProcessEvidence,
+}
+
+impl ExactServingBlockdProcessProof {
+    pub(crate) fn expectation(&self) -> &ServingBlockdExpectation {
+        &self.expectation
+    }
+
+    pub(crate) fn evidence(&self) -> &ServingBlockdProcessEvidence {
+        &self.evidence
+    }
+
+    pub(crate) fn matches_public_process(&self, process: &ProcessEvidence) -> bool {
+        public_process_matches(process, &self.expectation)
+            && accepted_process_matches_evidence(process, &self.evidence)
+    }
+
+    pub(crate) fn into_process_evidence(self) -> ProcessEvidence {
+        self.evidence.into_process_evidence()
+    }
+
+    pub(crate) fn vhost_device_projection(&self) -> Option<(Id, ObservedDevice)> {
+        let PrepareDeviceFrontend::VhostUserBlk { socket_path, .. } = &self.expectation.frontend
+        else {
+            return None;
+        };
+        let intent = self
+            .expectation
+            .volume
+            .desired
+            .volumes
+            .iter()
+            .find(|intent| {
+                intent.volume_id == self.expectation.volume.attachment.identity.volume_id
+            })
+            .expect("exact serving expectation retained its authorized Volume intent");
+        Some((
+            intent.volume_id.clone(),
+            ObservedDevice::VhostUserBlk {
+                guest_device: intent.guest_device.clone(),
+                socket_path: socket_path.clone(),
+                ownership_token: OwnershipTokenEvidence::Valid {
+                    ownership_token: self.expectation.device_ownership_token.clone(),
+                },
+            },
+        ))
+    }
+
+    /// Narrow provider-private listener proof for the later frontend effect.
+    /// Holding this value retains the complete exact CLI, handshake, systemd
+    /// owner and both independent tokens; callers cannot manufacture it from
+    /// public `ObservedDevice` projection.
+    pub(crate) fn listener_proof(&self) -> ServingBlockdListenerProof {
+        ServingBlockdListenerProof {
+            exact: self.clone(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ServingBlockdListenerProof {
+    exact: ExactServingBlockdProcessProof,
+}
+
+impl ServingBlockdListenerProof {
+    pub(crate) fn listener_path(&self) -> &HostPath {
+        match &self.exact.expectation.frontend {
+            PrepareDeviceFrontend::KernelNbd {
+                listener_socket_path,
+                ..
+            } => listener_socket_path,
+            PrepareDeviceFrontend::VhostUserBlk { socket_path, .. } => socket_path,
+        }
+    }
+
+    pub(crate) fn process_identity_token(&self) -> &RandomId128 {
+        &self.exact.expectation.process_identity_token
+    }
+
+    pub(crate) fn device_ownership_token(&self) -> &RandomId128 {
+        &self.exact.expectation.device_ownership_token
+    }
+
+    pub(crate) fn expectation(&self) -> &ServingBlockdExpectation {
+        &self.exact.expectation
+    }
+
+    pub(crate) fn evidence(&self) -> &ServingBlockdProcessEvidence {
+        &self.exact.evidence
+    }
+
+    /// Reopen the listener and process identity before a later frontend
+    /// submission. The retained proof keeps the filesystem and kernel socket
+    /// inodes private; callers receive only success or a closed error and
+    /// cannot widen the listener pathname or PID admitted by the full scan.
+    pub(crate) fn assert_current(
+        &self,
+        context: &dyn RuntimePhysicalReadContext,
+    ) -> anyhow::Result<()> {
+        context.check_active()?;
+        let before = crate::proc::ProcIdentity::sample(self.exact.evidence.process_id);
+        anyhow::ensure!(
+            before.start_ticks == Some(self.exact.evidence.process_start_time_ticks.get())
+                && before.exe.as_deref()
+                    == Some(Path::new(self.exact.evidence.executable_path.as_str())),
+            "serving listener process identity changed after full inventory"
+        );
+        self.exact
+            .evidence
+            .listener_identity
+            .assert_current(&self.exact.expectation.frontend, context)?;
+        let after = crate::proc::ProcIdentity::sample(self.exact.evidence.process_id);
+        anyhow::ensure!(
+            after == before,
+            "serving listener process identity changed during current revalidation"
+        );
+        context.check_active()
     }
 }
 
@@ -310,7 +593,8 @@ pub(crate) struct CheckpointedServingBlockdProcess<'a> {
     stored: &'a StoredCheckpoint,
     desired: &'a DesiredRuntimeSpec,
     authority: &'a VolumeRecord,
-    _current_checkpoint: CurrentCheckpointGuard<'a>,
+    store: &'a FileCheckpointStore,
+    current_checkpoint: CurrentCheckpointGuard<'a>,
 }
 
 impl CheckpointedServingBlockdProcess<'_> {
@@ -319,6 +603,8 @@ impl CheckpointedServingBlockdProcess<'_> {
     }
 
     pub(crate) fn assert_current(&self) -> anyhow::Result<()> {
+        self.store
+            .revalidate_current(self.stored, &self.current_checkpoint)?;
         self.handoff
             .assert_current(self.stored.checkpoint(), self.desired, self.authority)
     }
@@ -359,7 +645,7 @@ impl ServingBlockdStartEffect {
         if !matches!(runtime.step, ReconcileStep::PrepareDevice { .. }) {
             return Ok(None);
         }
-        if !prepare_device_admission_is_exact(accepted, desired, runtime) {
+        if !prepare_device_base_admission_is_exact(accepted, desired, runtime) {
             return Ok(Some(stop_local()));
         }
 
@@ -423,19 +709,30 @@ impl ServingBlockdStartEffect {
             desired,
             &first_authority,
         )?;
-        if !accepted_devices_are_compatible(runtime, &expected) {
+        let admission = context.node_global_process()?;
+        let Some((admitted_expected, admitted_exact)) = admission.serving_blockd(&desired.cat_id)
+        else {
+            return Ok(Some(stop_local()));
+        };
+        if admitted_expected != &expected
+            || !accepted_devices_are_compatible(runtime, &expected, admitted_exact)
+        {
             return Ok(Some(stop_local()));
         }
         let accepted_process = match runtime.processes.as_slice() {
-            [] => None,
-            [process] if public_process_matches(process, &expected) => Some(process),
+            [] if admitted_exact.is_none() => None,
+            [process]
+                if admitted_exact.is_some_and(|proof| proof.matches_public_process(process)) =>
+            {
+                Some(process)
+            }
             _ => return Ok(Some(stop_local())),
         };
 
         context.check_active()?;
         let inspection = self
             .process
-            .inspect_exact_or_absent_after_node_global_sweep(&expected, context)?;
+            .inspect_serving_exact_or_absent_after_node_global_sweep(&expected, context)?;
         match (accepted_process, inspection) {
             (None, ServingBlockdProcessInspection::Exact(_))
             | (Some(_), ServingBlockdProcessInspection::Absent)
@@ -476,7 +773,8 @@ impl ServingBlockdStartEffect {
                     stored: &stored,
                     desired,
                     authority: &current,
-                    _current_checkpoint: guard,
+                    store: &store,
+                    current_checkpoint: guard,
                 };
                 checkpointed.assert_current()?;
                 let _submission = self.process.start_checkpointed(checkpointed, context)?;
@@ -548,21 +846,17 @@ fn accepted_process_matches_evidence(
 fn accepted_devices_are_compatible(
     runtime: &ObservedRuntimeStatus,
     expected: &ServingBlockdExpectation,
+    admitted_exact: Option<&ExactServingBlockdProcessProof>,
 ) -> bool {
     match &expected.frontend {
         PrepareDeviceFrontend::KernelNbd { .. } => runtime.volumes[0].devices.is_empty(),
-        PrepareDeviceFrontend::VhostUserBlk { socket_path, .. } => {
-            runtime.volumes[0].devices.is_empty()
-                || matches!(
-                    runtime.volumes[0].devices.as_slice(),
-                    [ObservedDevice::VhostUserBlk {
-                        guest_device: _,
-                        socket_path: observed_socket,
-                        ownership_token: OwnershipTokenEvidence::Valid { ownership_token },
-                    }] if observed_socket == socket_path
-                        && ownership_token == &expected.device_ownership_token
-                )
-        }
+        PrepareDeviceFrontend::VhostUserBlk { .. } => match runtime.volumes[0].devices.as_slice() {
+            [] => admitted_exact.is_none(),
+            [observed] => admitted_exact
+                .and_then(ExactServingBlockdProcessProof::vhost_device_projection)
+                .is_some_and(|(_, expected)| observed == &expected),
+            _ => false,
+        },
     }
 }
 

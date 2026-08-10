@@ -1045,6 +1045,13 @@ listener是不可拆分的一个bounded effect，不存在下一轮单独“crea
 发布/接受新full inventory，再由持久step判断exact present/absent；不同PID/start、token、lineage、head、
 CLI/handshake或frontend参数全部fail closed。
 
+data listener的exact proof必须是被动、bounded且绝不`connect`：从retained StateDirectory root逐级保留并重验
+parent与leaf的`O_PATH|O_NOFOLLOW` descriptor及device/inode/owner/mode/type/link identity，必须绑定
+`/proc/net/unix`中唯一exact pathname的listening stream socket
+inode，并由前后有界的Node-global `/proc/[0-9]+/fd`枚举证明该MainPID持有exact one fd且不存在任何foreign
+inode holder。NBD与vhost listener都是
+单会话数据面；scanner不得以探测连接消费本应留给kernel client或VMM的会话。
+
 kernel-NBD的Host全局预留不是从一次旧inventory中挑一个看似空闲的path。planner在把
 `prepare_device.frontend.device_path`首次写入checkpoint时，必须取得一个descriptor-relative、regular、
 single-link、exact `0600`的Node全局allocation flock；持锁期间重新完成以下闭合并把锁保持到checkpoint file及

@@ -72,9 +72,10 @@ use super::authorized_blockd::{
 use super::root_provision_process::{
     prove_exact_root_provision_process_absence, ExactRootProvisionProcessAbsenceProof,
     ExactRootProvisionProcessProof, RetainedRootProvisionPhysicalIdentity,
-    RetainedRootProvisionProcessAttempt, RootProvisionAuthoritySnapshot,
-    RootProvisionBlockdHandshake, RootProvisionProcessEvidence, RootProvisionProcessExpectation,
-    RootProvisionProcessRetirementPort, TargetControlProcessLaunchIdentity,
+    RetainedRootProvisionProcessAttempt, RootProvisionAbsencePurpose,
+    RootProvisionAuthoritySnapshot, RootProvisionBlockdHandshake, RootProvisionProcessEvidence,
+    RootProvisionProcessExpectation, RootProvisionProcessRetirementPort,
+    TargetControlProcessLaunchIdentity,
 };
 use super::{FileCheckpointStore, StoredCheckpoint};
 
@@ -217,13 +218,6 @@ impl PrepareDeviceHandoffReady {
     /// writer guard alive through process submission, and must call
     /// [`Self::assert_current`] again at the submit boundary. Returning a
     /// [`Command`] here performs no Host effect.
-    #[cfg_attr(
-        not(test),
-        expect(
-            dead_code,
-            reason = "the next PrepareDevice serving effect consumes this strict command boundary"
-        )
-    )]
     pub(crate) fn authorized_serving_command(
         &self,
         config: &AuthorizedBlockdLaunchConfig,
@@ -1359,7 +1353,7 @@ impl ServingHandoffStore {
                 volume: &authority.volume,
             },
             executable_path,
-            Some(target_launch),
+            RootProvisionAbsencePurpose::Ordinary(Some(target_launch)),
             process_port,
             context,
         )?;
@@ -1607,7 +1601,7 @@ impl ServingHandoffStore {
                 volume: &authority.volume,
             },
             executable_path,
-            Some(target_launch),
+            RootProvisionAbsencePurpose::Ordinary(Some(target_launch)),
             process_port,
             context,
         )?;
@@ -3857,7 +3851,7 @@ impl PublicationStage {
 #[cfg(test)]
 mod tests {
     use std::cell::Cell;
-    use std::collections::VecDeque;
+    use std::collections::{BTreeMap, VecDeque};
     use std::os::unix::fs::{symlink, MetadataExt as _, PermissionsExt as _};
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Arc;
@@ -3893,6 +3887,12 @@ mod tests {
         RootProvisionProcessRetirementPort, RootProvisionProcessStart, RootProvisionProcessStop,
         TargetControlProcessPort,
     };
+    use crate::runtime::reconciliation::serving_blockd_process::{
+        global_sealed as serving_global_sealed, process_sealed as serving_process_sealed,
+        CheckpointedServingBlockdProcess, ServingBlockdExpectation, ServingBlockdProcessConflict,
+        ServingBlockdProcessGlobalPort, ServingBlockdProcessInspection, ServingBlockdProcessPort,
+        ServingBlockdProcessStart, ServingBlockdStartEffect,
+    };
     use crate::runtime::reconciliation::serving_handoff_effect::{
         ServingHandoffEffect, ServingHandoffEffectProgress, ServingPrepareDeviceEffect,
         ServingPrepareFrontend,
@@ -3900,7 +3900,7 @@ mod tests {
     use crate::runtime::reconciliation::signed_running::prepared_owned_observed_volume;
     use crate::runtime::reconciliation::{
         AuthorizedBlockdStore, FileCheckpointStore, RootProvisionProcessConflict,
-        RootProvisionProcessInspection,
+        RootProvisionProcessInspection, RootProvisionSystemdConfig,
     };
     use crate::runtime_spine::{
         RuntimeDesiredEffectAdmission, RuntimeDesiredEffectContext, RuntimeDesiredEffectOutcome,
@@ -3934,7 +3934,7 @@ mod tests {
         fn inspect_after_node_global_sweep(
             &self,
             _expected: &RootProvisionProcessExpectation,
-            _context: &dyn RuntimePhysicalReadContext,
+            _context: &RuntimeDesiredEffectContext,
         ) -> Result<RootProvisionProcessInspection> {
             *self.inspect_calls.lock().unwrap() += 1;
             Ok(self
@@ -4016,7 +4016,7 @@ mod tests {
     impl EffectGlobalProcessPort {
         fn inspect_one(
             &self,
-            context: &dyn RuntimePhysicalReadContext,
+            context: &RuntimeDesiredEffectContext,
         ) -> Result<RootProvisionProcessInspection> {
             context.check_active()?;
             self.calls.fetch_add(1, Ordering::SeqCst);
@@ -4036,7 +4036,7 @@ mod tests {
         fn inspect_after_node_global_sweep(
             &self,
             _expected: &RootProvisionProcessExpectation,
-            context: &dyn RuntimePhysicalReadContext,
+            context: &RuntimeDesiredEffectContext,
         ) -> Result<RootProvisionProcessInspection> {
             self.inspect_one(context)
         }
@@ -4080,7 +4080,7 @@ mod tests {
 
         fn inspect_one(
             &self,
-            context: &dyn RuntimePhysicalReadContext,
+            context: &RuntimeDesiredEffectContext,
         ) -> Result<RootProvisionProcessInspection> {
             context.check_active()?;
             self.calls.fetch_add(1, Ordering::SeqCst);
@@ -4104,7 +4104,7 @@ mod tests {
         fn inspect_after_node_global_sweep(
             &self,
             _expected: &RootProvisionProcessExpectation,
-            context: &dyn RuntimePhysicalReadContext,
+            context: &RuntimeDesiredEffectContext,
         ) -> Result<RootProvisionProcessInspection> {
             self.inspect_one(context)
         }
@@ -4191,7 +4191,7 @@ mod tests {
         fn inspect_after_node_global_sweep(
             &self,
             _expected: &RootProvisionProcessExpectation,
-            context: &dyn RuntimePhysicalReadContext,
+            context: &RuntimeDesiredEffectContext,
         ) -> Result<RootProvisionProcessInspection> {
             context.check_active()?;
             Ok(RootProvisionProcessInspection::Unavailable)
@@ -4389,6 +4389,79 @@ mod tests {
             lineage.local_durable_generation = fixture.authority.volume.head.generation;
             lineage.remote_durable_generation = fixture.authority.volume.head.generation;
         }
+        let node_global_process = if matches!(checkpoint.step, ReconcileStep::PrepareDevice { .. })
+        {
+            let retained = AuthorizedBlockdStore::new(fixture.state_directory.clone())
+                .retain_prepare_device_handoff(checkpoint, desired)
+                .unwrap();
+            let ready = fixture
+                .store()
+                .reopen_prepare_device_handoff(
+                    checkpoint,
+                    desired,
+                    &fixture.authority.volume,
+                    retained,
+                )
+                .unwrap();
+            let root_expectation = RootProvisionProcessExpectation::from_retained_prepare_device(
+                checkpoint,
+                desired,
+                ready.attempt(),
+            )
+            .unwrap();
+            let root_proof = root_expectation
+                .clone()
+                .prove_exact_process(fixture.process.clone())
+                .unwrap();
+            let root_public = root_proof.clone().into_process_evidence();
+            let root_exact = processes
+                .iter()
+                .any(|process| process == &root_public)
+                .then_some(root_proof);
+
+            let serving_expectation = ServingBlockdExpectation::from_handoff(
+                &ready,
+                &serving_systemd_config(fixture),
+                checkpoint,
+                desired,
+                &fixture.authority.volume,
+            )
+            .unwrap();
+            let serving_proof = serving_expectation
+                .clone()
+                .prove_exact_process(serving_expectation.exact_evidence_for_test(51))
+                .unwrap();
+            let serving_public = serving_proof.clone().into_process_evidence();
+            let serving_exact = processes
+                .iter()
+                .any(|process| process == &serving_public)
+                .then_some(serving_proof);
+            if let Some((_, device)) = serving_exact
+                .as_ref()
+                .and_then(|proof| proof.vhost_device_projection())
+            {
+                observed_volume.devices = vec![device];
+            }
+            Some(
+                super::super::root_provision_process::NodeGlobalManagedProcessScanAdmission::from_root_controls(
+                    BTreeMap::from([(desired.cat_id.clone(), root_expectation)]),
+                    root_exact
+                        .map(|proof| BTreeMap::from([(desired.cat_id.clone(), proof)]))
+                        .unwrap_or_default(),
+                )
+                .unwrap()
+                .with_serving_blockds(
+                    BTreeMap::from([(desired.cat_id.clone(), serving_expectation)]),
+                    serving_exact
+                        .map(|proof| BTreeMap::from([(desired.cat_id.clone(), proof)]))
+                        .unwrap_or_default(),
+                )
+                .unwrap()
+                .into_admission_for_test(),
+            )
+        } else {
+            None
+        };
         let runtime = ObservedRuntimeStatus {
             cat_id: checkpoint.cat_id.clone(),
             applied_desired: Some(AppliedDesiredEvidence {
@@ -4456,11 +4529,15 @@ mod tests {
             runtimes: vec![runtime],
             residue: Vec::new(),
         };
-        RuntimeDesiredEffectContext::for_test_with_admission(
+        let context = RuntimeDesiredEffectContext::for_test_with_admission(
             fixture.state_directory.clone(),
             Instant::now() + Duration::from_secs(10),
             RuntimeDesiredEffectAdmission::for_test(session, observation, attestation),
-        )
+        );
+        match node_global_process {
+            Some(admission) => context.with_node_global_process_for_test(admission),
+            None => context,
+        }
     }
 
     fn absent_effect_context(fixture: &Fixture) -> RuntimeDesiredEffectContext {
@@ -4498,17 +4575,29 @@ mod tests {
         fixture: &Fixture,
         mutate: impl FnOnce(&mut AgentSession, &mut NodeObservation, &mut AdmissionInventoryAttestation),
     ) -> RuntimeDesiredEffectContext {
-        let base = absent_effect_context(fixture);
+        mutate_effect_context(fixture, absent_effect_context(fixture), mutate)
+    }
+
+    fn mutate_effect_context(
+        fixture: &Fixture,
+        base: RuntimeDesiredEffectContext,
+        mutate: impl FnOnce(&mut AgentSession, &mut NodeObservation, &mut AdmissionInventoryAttestation),
+    ) -> RuntimeDesiredEffectContext {
+        let node_global_process = base.node_global_process().ok().cloned();
         let accepted = base.accepted_full().unwrap();
         let mut session = accepted.session().clone();
         let mut observation = accepted.observation().clone();
         let mut attestation = accepted.attestation().clone();
         mutate(&mut session, &mut observation, &mut attestation);
-        RuntimeDesiredEffectContext::for_test_with_admission(
+        let context = RuntimeDesiredEffectContext::for_test_with_admission(
             fixture.state_directory.clone(),
             Instant::now() + Duration::from_secs(10),
             RuntimeDesiredEffectAdmission::for_test(session, observation, attestation),
-        )
+        );
+        match node_global_process {
+            Some(admission) => context.with_node_global_process_for_test(admission),
+            None => context,
+        }
     }
 
     fn prepare_device_successor(
@@ -4610,6 +4699,205 @@ mod tests {
             .unwrap();
         fixture.stored_checkpoint = replaced;
         old_process
+    }
+
+    fn serving_systemd_config(fixture: &Fixture) -> RootProvisionSystemdConfig {
+        RootProvisionSystemdConfig::new(AuthorizedBlockdLaunchConfig {
+            blockd_binary: PathBuf::from(fixture.expected_executable_path.as_str()),
+            metadata_store: AdapterSelection::new(
+                "postgres",
+                AdapterConfig::from_pairs([("url-file", "/run/cats/postgres-url")]).unwrap(),
+            ),
+            object_store: AdapterSelection::new(
+                "aws-s3",
+                AdapterConfig::from_pairs([("bucket", "cats-runtime-test")]).unwrap(),
+            ),
+            max_staged_bytes: 101,
+            max_staged_packs: 102,
+            max_local_bytes: 103,
+        })
+        .unwrap()
+    }
+
+    fn complete_old_process_retirement(fixture: &mut Fixture) {
+        advance_fixture_to_prepare_device(fixture);
+        let global = Arc::new(RetirementEffectGlobalPort::new([
+            RootProvisionProcessInspection::Absent,
+        ]));
+        let process = Arc::new(RetirementEffectStopPort::new([]));
+        let effect = prepare_device_retirement_effect(fixture, global, process);
+        assert_eq!(
+            effect
+                .try_apply(&absent_effect_context(fixture), &fixture.acquired.desired)
+                .unwrap(),
+            None
+        );
+    }
+
+    fn serving_expectation(fixture: &Fixture) -> ServingBlockdExpectation {
+        let retained = AuthorizedBlockdStore::new(fixture.state_directory.clone())
+            .retain_prepare_device_handoff(
+                fixture.stored_checkpoint.checkpoint(),
+                &fixture.acquired.desired,
+            )
+            .unwrap();
+        let ready = fixture
+            .store()
+            .reopen_prepare_device_handoff(
+                fixture.stored_checkpoint.checkpoint(),
+                &fixture.acquired.desired,
+                &fixture.authority.volume,
+                retained,
+            )
+            .unwrap();
+        ServingBlockdExpectation::from_handoff(
+            &ready,
+            &serving_systemd_config(fixture),
+            fixture.stored_checkpoint.checkpoint(),
+            &fixture.acquired.desired,
+            &fixture.authority.volume,
+        )
+        .unwrap()
+    }
+
+    struct FakeServingBlockdPort {
+        inspections: Mutex<VecDeque<ServingBlockdProcessInspectionKind>>,
+        starts: AtomicUsize,
+        start: ServingBlockdProcessStart,
+        before_start: Mutex<Option<Arc<dyn Fn() + Send + Sync>>>,
+    }
+
+    #[derive(Clone, Copy)]
+    enum ServingBlockdProcessInspectionKind {
+        Absent,
+        Exact,
+        Conflict,
+        WrongStatus(&'static str),
+    }
+
+    impl FakeServingBlockdPort {
+        fn new(
+            inspections: impl IntoIterator<Item = ServingBlockdProcessInspectionKind>,
+            start: ServingBlockdProcessStart,
+        ) -> Self {
+            Self {
+                inspections: Mutex::new(inspections.into_iter().collect()),
+                starts: AtomicUsize::new(0),
+                start,
+                before_start: Mutex::new(None),
+            }
+        }
+
+        fn inspection(
+            &self,
+            expected: &ServingBlockdExpectation,
+        ) -> ServingBlockdProcessInspection {
+            let kind = self
+                .inspections
+                .lock()
+                .unwrap()
+                .pop_front()
+                .expect("fake serving inspection exhausted");
+            match kind {
+                ServingBlockdProcessInspectionKind::Absent => {
+                    ServingBlockdProcessInspection::Absent
+                }
+                ServingBlockdProcessInspectionKind::Conflict => {
+                    ServingBlockdProcessInspection::Conflict(
+                        ServingBlockdProcessConflict::DuplicateIdentity,
+                    )
+                }
+                ServingBlockdProcessInspectionKind::Exact => ServingBlockdProcessInspection::Exact(
+                    Box::new(expected.exact_evidence_for_test(51)),
+                ),
+                ServingBlockdProcessInspectionKind::WrongStatus(field) => {
+                    let mut evidence = expected.exact_evidence_for_test(51);
+                    let status = evidence.status_mut_for_test();
+                    match field {
+                        "volume" => status.volume_id = "vol_foreign".to_owned(),
+                        "attachment" => status.attachment_id = "att_foreign".to_owned(),
+                        "epoch" => status.attachment_epoch = Some(FenceEpoch::new(99).unwrap()),
+                        "origin" => {
+                            status.acquire_origin = Some(AcquireOrigin::Normal {
+                                transition_id: random('9'),
+                            })
+                        }
+                        "node" => status.node_id = Some(id("node_foreign")),
+                        "placement" => status.placement_epoch = Some(Epoch::new(99).unwrap()),
+                        "head" => {
+                            status.remote_head.as_mut().unwrap().generation =
+                                Generation::new(99).unwrap()
+                        }
+                        "size" => status.size_bytes = Some(status.size_bytes.unwrap() + 1),
+                        "durability" => status.mode = "relaxed".to_owned(),
+                        "scope" => status.scope_id = Some(id("foreign.service")),
+                        "process_token" => status.process_identity_token = Some(random('9')),
+                        "device_token" => status.device_ownership_token = Some(random('9')),
+                        "control_only" => status.control_only = Some(true),
+                        "guest_io" => status.guest_io_enabled = Some(false),
+                        "local_generation" => status.local_durable_generation += 1,
+                        "remote_generation" => status.remote_durable_generation += 1,
+                        "unpublished_generations" => status.unpublished_generations = 1,
+                        "unpublished_bytes" => status.unpublished_bytes = 1,
+                        "unpublished_age" => status.oldest_unpublished_age_ms = 1,
+                        "backpressured" => status.backpressured = true,
+                        "fenced" => status.fenced = true,
+                        _ => unreachable!(),
+                    }
+                    ServingBlockdProcessInspection::Exact(Box::new(evidence))
+                }
+            }
+        }
+    }
+
+    impl serving_process_sealed::Sealed for FakeServingBlockdPort {}
+    impl serving_global_sealed::Sealed for FakeServingBlockdPort {}
+
+    impl ServingBlockdProcessPort for FakeServingBlockdPort {
+        fn inspect(
+            &self,
+            expected: &ServingBlockdExpectation,
+            _context: &dyn RuntimePhysicalReadContext,
+        ) -> Result<ServingBlockdProcessInspection> {
+            Ok(self.inspection(expected))
+        }
+
+        fn start_checkpointed(
+            &self,
+            checkpointed: CheckpointedServingBlockdProcess<'_>,
+            context: &RuntimeDesiredEffectContext,
+        ) -> Result<ServingBlockdProcessStart> {
+            context.check_active()?;
+            if let Some(hook) = self.before_start.lock().unwrap().take() {
+                hook();
+            }
+            checkpointed.assert_current()?;
+            context.check_active()?;
+            self.starts.fetch_add(1, Ordering::SeqCst);
+            checkpointed.assert_current()?;
+            Ok(self.start)
+        }
+    }
+
+    impl ServingBlockdProcessGlobalPort for FakeServingBlockdPort {
+        fn inspect_serving_exact_or_absent_after_node_global_sweep(
+            &self,
+            expected: &ServingBlockdExpectation,
+            _context: &RuntimeDesiredEffectContext,
+        ) -> Result<ServingBlockdProcessInspection> {
+            Ok(self.inspection(expected))
+        }
+    }
+
+    fn serving_effect(
+        fixture: &Fixture,
+        port: Arc<FakeServingBlockdPort>,
+    ) -> ServingBlockdStartEffect {
+        ServingBlockdStartEffect::new(
+            Arc::new(FixedEffectAuthority::new(fixture.authority.volume.clone())),
+            serving_systemd_config(fixture),
+            port,
+        )
     }
 
     fn prepare_device_retirement_effect(
@@ -5187,6 +5475,358 @@ mod tests {
                 &fixture.authority.volume,
             )
             .is_err());
+    }
+
+    #[test]
+    fn serving_blockd_response_loss_submits_once_then_requires_fresh_exact_projection() {
+        let mut fixture = fixture();
+        complete_old_process_retirement(&mut fixture);
+        let expected = serving_expectation(&fixture);
+        let accepted = expected
+            .clone()
+            .prove_exact_process(expected.exact_evidence_for_test(51))
+            .unwrap()
+            .into_process_evidence();
+        let port = Arc::new(FakeServingBlockdPort::new(
+            [
+                ServingBlockdProcessInspectionKind::Absent,
+                ServingBlockdProcessInspectionKind::Exact,
+                ServingBlockdProcessInspectionKind::Exact,
+            ],
+            ServingBlockdProcessStart::OutcomeUnknown,
+        ));
+        let effect = serving_effect(&fixture, Arc::clone(&port));
+
+        assert_eq!(
+            effect
+                .try_apply(&absent_effect_context(&fixture), &fixture.acquired.desired)
+                .unwrap(),
+            Some(RuntimeDesiredEffectOutcome::RefreshInventory)
+        );
+        assert_eq!(port.starts.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            effect
+                .try_apply(&absent_effect_context(&fixture), &fixture.acquired.desired)
+                .unwrap(),
+            Some(RuntimeDesiredEffectOutcome::RefreshInventory)
+        );
+        assert_eq!(port.starts.load(Ordering::SeqCst), 1);
+        let exact_context = effect_context_with_processes(&fixture, vec![accepted]);
+        let retirement_global = Arc::new(RetirementEffectGlobalPort::new([
+            RootProvisionProcessInspection::Absent,
+        ]));
+        let retirement_stop = Arc::new(RetirementEffectStopPort::new([]));
+        assert_eq!(
+            prepare_device_retirement_effect(&fixture, retirement_global, retirement_stop.clone(),)
+                .try_apply(&exact_context, &fixture.acquired.desired)
+                .unwrap(),
+            None,
+            "exact serving projection must fall through old-Root retirement"
+        );
+        assert!(retirement_stop.stopped().is_empty());
+        assert_eq!(
+            effect
+                .try_apply(&exact_context, &fixture.acquired.desired)
+                .unwrap(),
+            None
+        );
+        assert_eq!(port.starts.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn serving_vhost_device_projection_is_exact_and_provider_bound() {
+        for field in ["guest_device", "socket", "token", "duplicate"] {
+            let mut fixture = fixture();
+            complete_old_process_retirement(&mut fixture);
+            let expected = serving_expectation(&fixture);
+            let accepted = expected
+                .clone()
+                .prove_exact_process(expected.exact_evidence_for_test(51))
+                .unwrap()
+                .into_process_evidence();
+            let base = effect_context_with_processes(&fixture, vec![accepted]);
+            let context =
+                mutate_effect_context(&fixture, base, |_session, observation, _attestation| {
+                    let devices = &mut observation.runtimes[0].volumes[0].devices;
+                    if field == "duplicate" {
+                        devices.push(devices[0].clone());
+                        return;
+                    }
+                    let [cats_api::runtime_reconciliation::ObservedDevice::VhostUserBlk {
+                        guest_device,
+                        socket_path,
+                        ownership_token,
+                    }] = devices.as_mut_slice()
+                    else {
+                        panic!("positive fixture must project one exact vhost device")
+                    };
+                    match field {
+                        "guest_device" => {
+                            *guest_device = cats_api::runtime_reconciliation::GuestDeviceIdentity {
+                                serial: id("foreign-device"),
+                                slot: 9,
+                            };
+                        }
+                        "socket" => *socket_path = host("/run/cats/foreign-vhost.sock"),
+                        "token" => {
+                            *ownership_token = OwnershipTokenEvidence::Valid {
+                                ownership_token: random('9'),
+                            };
+                        }
+                        _ => unreachable!(),
+                    }
+                });
+            let port = Arc::new(FakeServingBlockdPort::new(
+                [ServingBlockdProcessInspectionKind::Exact],
+                ServingBlockdProcessStart::Submitted,
+            ));
+            assert_eq!(
+                serving_effect(&fixture, Arc::clone(&port))
+                    .try_apply(&context, &fixture.acquired.desired)
+                    .unwrap(),
+                Some(RuntimeDesiredEffectOutcome::Stop(
+                    RuntimeDesiredEffectStopReason::LocalContract,
+                )),
+                "wrong vhost {field} escaped the bound provider proof"
+            );
+            assert_eq!(port.starts.load(Ordering::SeqCst), 0);
+        }
+    }
+
+    #[test]
+    fn serving_blockd_rejects_every_bound_status_or_closed_set_conflict() {
+        const FIELDS: &[&str] = &[
+            "volume",
+            "attachment",
+            "epoch",
+            "origin",
+            "node",
+            "placement",
+            "head",
+            "size",
+            "durability",
+            "scope",
+            "process_token",
+            "device_token",
+            "control_only",
+            "guest_io",
+            "local_generation",
+            "remote_generation",
+            "unpublished_generations",
+            "unpublished_bytes",
+            "unpublished_age",
+            "backpressured",
+            "fenced",
+        ];
+        for field in FIELDS {
+            let mut fixture = fixture();
+            complete_old_process_retirement(&mut fixture);
+            let expected = serving_expectation(&fixture);
+            let accepted = expected
+                .clone()
+                .prove_exact_process(expected.exact_evidence_for_test(51))
+                .unwrap()
+                .into_process_evidence();
+            let port = Arc::new(FakeServingBlockdPort::new(
+                [ServingBlockdProcessInspectionKind::WrongStatus(field)],
+                ServingBlockdProcessStart::Submitted,
+            ));
+            assert_eq!(
+                serving_effect(&fixture, Arc::clone(&port))
+                    .try_apply(
+                        &effect_context_with_processes(&fixture, vec![accepted]),
+                        &fixture.acquired.desired,
+                    )
+                    .unwrap(),
+                Some(RuntimeDesiredEffectOutcome::Stop(
+                    RuntimeDesiredEffectStopReason::LocalContract,
+                )),
+                "status field {field} was not closed",
+            );
+            assert_eq!(port.starts.load(Ordering::SeqCst), 0);
+        }
+
+        for kind in [
+            ServingBlockdProcessInspectionKind::Conflict,
+            ServingBlockdProcessInspectionKind::Exact,
+        ] {
+            let mut fixture = fixture();
+            complete_old_process_retirement(&mut fixture);
+            let port = Arc::new(FakeServingBlockdPort::new(
+                [kind],
+                ServingBlockdProcessStart::Submitted,
+            ));
+            let expected_outcome = if matches!(kind, ServingBlockdProcessInspectionKind::Exact) {
+                RuntimeDesiredEffectOutcome::RefreshInventory
+            } else {
+                RuntimeDesiredEffectOutcome::Stop(RuntimeDesiredEffectStopReason::LocalContract)
+            };
+            assert_eq!(
+                serving_effect(&fixture, Arc::clone(&port))
+                    .try_apply(&absent_effect_context(&fixture), &fixture.acquired.desired)
+                    .unwrap(),
+                Some(expected_outcome),
+            );
+            assert_eq!(port.starts.load(Ordering::SeqCst), 0);
+        }
+    }
+
+    #[test]
+    fn serving_blockd_start_rejects_checkpoint_aba_and_cancellation_before_submit() {
+        for cancel in [false, true] {
+            let mut fixture = fixture();
+            complete_old_process_retirement(&mut fixture);
+            let port = Arc::new(FakeServingBlockdPort::new(
+                [ServingBlockdProcessInspectionKind::Absent],
+                ServingBlockdProcessStart::Submitted,
+            ));
+            let context = absent_effect_context(&fixture);
+            if cancel {
+                let canceller = context.clone();
+                *port.before_start.lock().unwrap() = Some(Arc::new(move || {
+                    canceller.cancel_for_test();
+                }));
+            } else {
+                let checkpoint_path = super::super::runtime_checkpoint_path(
+                    &fixture.checkpoint_directory,
+                    &fixture.acquired.desired.cat_id,
+                );
+                let detached = fixture
+                    .checkpoint_directory
+                    .join("serving-aba-detached.json");
+                *port.before_start.lock().unwrap() = Some(Arc::new(move || {
+                    std::fs::rename(&checkpoint_path, &detached).unwrap();
+                    std::fs::copy(&detached, &checkpoint_path).unwrap();
+                }));
+            }
+            assert!(serving_effect(&fixture, Arc::clone(&port))
+                .try_apply(&context, &fixture.acquired.desired)
+                .is_err());
+            assert_eq!(port.starts.load(Ordering::SeqCst), 0);
+        }
+    }
+
+    #[test]
+    fn serving_listener_proof_retains_exact_vhost_and_kernel_bindings() {
+        for kernel in [false, true] {
+            let mut fixture = fixture();
+            complete_old_process_retirement(&mut fixture);
+            if kernel {
+                let mut checkpoint = fixture.stored_checkpoint.checkpoint().clone();
+                let ReconcileStep::PrepareDevice { frontend, .. } = &mut checkpoint.step else {
+                    unreachable!()
+                };
+                *frontend = PrepareDeviceFrontend::KernelNbd {
+                    listener_socket_path: host(&format!(
+                        "{}/serving-nbd.sock",
+                        fixture.data_directory.display()
+                    )),
+                    device_path: host("/dev/nbd7"),
+                };
+                fixture.stored_checkpoint = FileCheckpointStore::open(
+                    &fixture.checkpoint_directory,
+                    &fixture.acquired.desired.cat_id,
+                )
+                .unwrap()
+                .replace(&fixture.stored_checkpoint, &checkpoint)
+                .unwrap();
+            }
+            let expected = serving_expectation(&fixture);
+            let exact = expected
+                .clone()
+                .prove_exact_process(expected.exact_evidence_for_test(51))
+                .unwrap();
+            let projected_device = exact.vhost_device_projection();
+            let listener = exact.listener_proof();
+            let context = effect_context_with_processes(
+                &fixture,
+                vec![exact.clone().into_process_evidence()],
+            );
+            let observed_devices =
+                &context.accepted_full().unwrap().observation().runtimes[0].volumes[0].devices;
+            assert_eq!(observed_devices.is_empty(), kernel);
+            let port = Arc::new(FakeServingBlockdPort::new(
+                [ServingBlockdProcessInspectionKind::Exact],
+                ServingBlockdProcessStart::Submitted,
+            ));
+            assert_eq!(
+                serving_effect(&fixture, port)
+                    .try_apply(&context, &fixture.acquired.desired)
+                    .unwrap(),
+                None,
+                "exact kernel/vhost serving proof must reach the later device suffix"
+            );
+            assert_eq!(listener.expectation(), &expected);
+            assert_eq!(listener.evidence().process_id(), 51);
+            assert_eq!(
+                listener.process_identity_token(),
+                expected.process_identity_token()
+            );
+            assert_eq!(
+                listener.device_ownership_token(),
+                expected.device_ownership_token()
+            );
+            match expected.frontend() {
+                PrepareDeviceFrontend::KernelNbd {
+                    listener_socket_path,
+                    ..
+                } => {
+                    assert_eq!(listener.listener_path(), listener_socket_path);
+                    assert!(projected_device.is_none());
+                }
+                PrepareDeviceFrontend::VhostUserBlk { socket_path, .. } => {
+                    assert_eq!(listener.listener_path(), socket_path);
+                    let (volume_id, device) = projected_device.unwrap();
+                    assert_eq!(volume_id, fixture.acquired.volume.volume_id);
+                    assert!(matches!(
+                        device,
+                        cats_api::runtime_reconciliation::ObservedDevice::VhostUserBlk {
+                            socket_path: projected_socket,
+                            ownership_token: OwnershipTokenEvidence::Valid { ownership_token },
+                            ..
+                        } if projected_socket == *socket_path
+                            && ownership_token == *expected.device_ownership_token()
+                    ));
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn node_global_admission_keeps_same_cat_root_and_serving_as_two_closed_roles() {
+        let mut fixture = fixture();
+        let root = fixture.exact_process_proof().unwrap();
+        let root_expectation = root.expectation().clone();
+        complete_old_process_retirement(&mut fixture);
+        let serving_expectation = serving_expectation(&fixture);
+        let serving = serving_expectation
+            .clone()
+            .prove_exact_process(serving_expectation.exact_evidence_for_test(51))
+            .unwrap();
+        let admission = super::super::root_provision_process::NodeGlobalManagedProcessScanAdmission::from_root_controls(
+            BTreeMap::from([(fixture.acquired.desired.cat_id.clone(), root_expectation)]),
+            BTreeMap::from([(fixture.acquired.desired.cat_id.clone(), root)]),
+        )
+        .unwrap()
+        .with_serving_blockds(
+            BTreeMap::from([(
+                fixture.acquired.desired.cat_id.clone(),
+                serving_expectation,
+            )]),
+            BTreeMap::from([(fixture.acquired.desired.cat_id.clone(), serving)]),
+        )
+        .unwrap();
+        assert_eq!(
+            admission
+                .process_projections()
+                .remove(&fixture.acquired.desired.cat_id)
+                .unwrap()
+                .len(),
+            2
+        );
+        assert!(admission
+            .vhost_device_projections()
+            .contains_key(&fixture.acquired.desired.cat_id));
     }
 
     #[test]

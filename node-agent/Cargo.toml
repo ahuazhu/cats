@@ -35,8 +35,12 @@ ring = { workspace = true }
 # `tests/heartbeat_independence.rs` need a real `MetadataStore` for
 # `ServerConfig`; this is the workspace's SQLite adapter.
 cats-metadata-store-sqlite = { workspace = true }
+cats-object-store-file = { workspace = true }
 tempfile = { workspace = true }
 hex = { workspace = true }
+
+[target.'cfg(target_os = "linux")'.dev-dependencies]
+vhost = { workspace = true, features = ["vhost-user-frontend"] }
 
 [lints]
 workspace = true

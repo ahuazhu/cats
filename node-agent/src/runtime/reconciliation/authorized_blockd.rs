@@ -153,10 +153,6 @@ impl RootProvisionStopReceipt {
         &self.authorized_checkpoint_content_digest
     }
 
-    pub(crate) fn authority(&self) -> &VolumeRecord {
-        &self.authority
-    }
-
     pub(crate) fn process(&self) -> &RootProvisionProcessEvidence {
         &self.process
     }
@@ -165,6 +161,30 @@ impl RootProvisionStopReceipt {
         RetainedExactControlSocket {
             identity: self.socket,
         }
+    }
+
+    pub(crate) fn socket_matches_scanned_stat(&self, metadata: &libc::stat) -> bool {
+        let (Some(device), Some(links), Some(length)) = (
+            raw_stat_u64(metadata.st_dev),
+            raw_stat_u64(metadata.st_nlink),
+            raw_stat_u64(metadata.st_size),
+        ) else {
+            return false;
+        };
+        let scanned = StableFsIdentity {
+            device,
+            inode: metadata.st_ino,
+            mode: raw_mode_to_u32(metadata.st_mode),
+            links,
+            uid: metadata.st_uid,
+            gid: metadata.st_gid,
+            length,
+            modified_seconds: metadata.st_mtime,
+            modified_nanoseconds: metadata.st_mtime_nsec,
+            changed_seconds: metadata.st_ctime,
+            changed_nanoseconds: metadata.st_ctime_nsec,
+        };
+        same_socket_after_rename(&self.socket, &scanned)
     }
 
     pub(crate) fn admission(&self) -> &RootProvisionRetirementAdmission {
@@ -2243,13 +2263,16 @@ fn stat_at_optional(directory: &File, name: &CStr) -> Result<Option<StableFsIden
         return Err(source).context("inspect exact root-provision socket basename");
     }
     Ok(Some(StableFsIdentity {
-        device: metadata.st_dev as u64,
+        device: raw_stat_u64(metadata.st_dev)
+            .context("root-provision socket has invalid device identity")?,
         inode: metadata.st_ino,
         mode: raw_mode_to_u32(metadata.st_mode),
-        links: metadata.st_nlink as u64,
+        links: raw_stat_u64(metadata.st_nlink)
+            .context("root-provision socket has invalid link count")?,
         uid: metadata.st_uid,
         gid: metadata.st_gid,
-        length: metadata.st_size as u64,
+        length: raw_stat_u64(metadata.st_size)
+            .context("root-provision socket has negative length")?,
         modified_seconds: metadata.st_mtime,
         modified_nanoseconds: metadata.st_mtime_nsec,
         changed_seconds: metadata.st_ctime,
@@ -2280,6 +2303,13 @@ fn raw_mode_to_u32(mode: libc::mode_t) -> u32 {
 #[cfg(not(target_os = "linux"))]
 fn raw_mode_to_u32(mode: libc::mode_t) -> u32 {
     u32::from(mode)
+}
+
+fn raw_stat_u64<T>(value: T) -> Option<u64>
+where
+    u64: TryFrom<T>,
+{
+    u64::try_from(value).ok()
 }
 
 enum UnixSocketState {

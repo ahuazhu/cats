@@ -106,7 +106,7 @@ pub use root_provision::{
     RootProvisionResponseHint, RootProvisionUnknownReason, UnixRootProvisionClient,
 };
 pub(crate) use serving_handoff_effect::ServingPrepareFrontend;
-pub(crate) use signed_root_provision::SignedRunningEffect;
+pub(crate) use signed_root_provision::{SignedRunningEffect, SignedRunningProcessPorts};
 pub(crate) use signed_running::{SignedRunningAcquireEffect, SignedRunningPublicationRecovery};
 // This crate-private seam is landed before the systemd composition that
 // consumes it; keeping the re-export here prevents feature code from reaching
@@ -124,7 +124,8 @@ pub(crate) use root_provision_process::{
 };
 #[allow(unused_imports)]
 pub(crate) use systemd_root_provision::{
-    PlatformSystemdRootProvisionProcessPort, RootProvisionSystemdConfig,
+    PlatformSystemdRootProvisionProcessPort, PlatformSystemdServingBlockdProcessPort,
+    RootProvisionSystemdConfig,
 };
 pub use volume_transitions::{
     A19SignedVolumeEvidenceTransport, ControlSignedVolumeEvidenceClient,
