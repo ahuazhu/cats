@@ -31,9 +31,16 @@ use cats_api::runtime_reconciliation::{
     HostPath, Id, RandomId128, ReconcileStep, RemoteHead, Revision, Sha256Digest, VolumeRecord,
     WireU64,
 };
+use cats_blockd::target_control::{
+    decode_target_control_authorization, encode_target_control_authorization,
+    target_control_authorization_file_name, validate_target_control_attachment,
+    validate_target_control_authorization, StableDirectoryIdentity, StableFileIdentity,
+    TargetControlAuthorizationArtifact, TargetControlAuthorizationCodecError,
+    TargetControlLocalStateIdentity as ServingHandoffLocalStateIdentity,
+    TARGET_CONTROL_AUTHORIZATION_MAX_BYTES as TARGET_AUTHORIZED_SERVING_MAX_BYTES,
+};
 use cats_storage::authority::{
-    validate_authorized_serving_attachment, validate_authorized_serving_record,
-    AttachmentLineageIdentity, AuthorizedServingAttachment,
+    validate_authorized_serving_record, AttachmentLineageIdentity, AuthorizedServingAttachment,
 };
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use serde_json::Value;
@@ -57,7 +64,6 @@ use super::StoredCheckpoint;
 
 pub(crate) const SERVING_HANDOFF_RECORD_FILE: &str = "serving-handoff.json";
 const SERVING_HANDOFF_RECORD_TEMP: &str = ".serving-handoff.json.tmp";
-pub(crate) const TARGET_AUTHORIZED_SERVING_MAX_BYTES: usize = 32 * 1024;
 pub(crate) const SERVING_HANDOFF_RECORD_MAX_BYTES: usize = 64 * 1024;
 
 #[derive(Debug, Error, Clone, PartialEq, Eq)]
@@ -78,6 +84,25 @@ pub(crate) enum ServingHandoffCodecError {
     },
 }
 
+impl From<TargetControlAuthorizationCodecError> for ServingHandoffCodecError {
+    fn from(error: TargetControlAuthorizationCodecError) -> Self {
+        match error {
+            TargetControlAuthorizationCodecError::WireBytesLimitExceeded { artifact, maximum } => {
+                Self::WireBytesLimitExceeded { artifact, maximum }
+            }
+            TargetControlAuthorizationCodecError::Malformed { artifact } => {
+                Self::Malformed { artifact }
+            }
+            TargetControlAuthorizationCodecError::NonCanonical { artifact } => {
+                Self::NonCanonical { artifact }
+            }
+            TargetControlAuthorizationCodecError::Invalid { artifact, reason } => {
+                Self::Invalid { artifact, reason }
+            }
+        }
+    }
+}
+
 /// The exact raw-authority reread associated with the current provision step.
 ///
 /// The transition ID is repeated intentionally: a target head left by a
@@ -95,51 +120,6 @@ impl ServingAuthorityTargetEvidence {
             volume,
         }
     }
-}
-
-/// Canonical bytes consumed by a future target-control-only start.
-///
-/// The provision transition lives in the bytes, not merely in the dynamic
-/// filename. Copying the same target attachment under another transition's
-/// filename therefore cannot authorize that transition.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub(crate) struct TargetControlAuthorizationArtifact {
-    pub version: ContractVersion,
-    pub provision_transition_id: RandomId128,
-    pub checkpoint_content_digest: Sha256Digest,
-    pub local_state: ServingHandoffLocalStateIdentity,
-    pub attachment: AuthorizedServingAttachment,
-}
-
-/// Stable descriptor identities needed to reject rename/recreate and
-/// exact-byte file ABA across either publication phase.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub(crate) struct ServingHandoffLocalStateIdentity {
-    pub state_directory: StableDirectoryIdentity,
-    pub attachment_directory: StableDirectoryIdentity,
-    pub attachment_identity_file: StableFileIdentity,
-    pub acquire_authorization_file: StableFileIdentity,
-    pub launch_checkpoint_file: StableFileIdentity,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub(crate) struct StableDirectoryIdentity {
-    pub path: HostPath,
-    pub device: WireU64,
-    pub inode: WireU64,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub(crate) struct StableFileIdentity {
-    pub path: HostPath,
-    pub device: WireU64,
-    pub inode: WireU64,
-    pub length: WireU64,
-    pub content_sha256: Sha256Digest,
 }
 
 /// Durable identity of the no-replace target-head grant.
@@ -356,28 +336,6 @@ impl TargetControlAuthorizationReady {
         self.retained_target
             .assert_current(&self.retained.attachment_directory, self.identity.path())
     }
-}
-
-fn encode_target_control_authorization(
-    artifact: &TargetControlAuthorizationArtifact,
-) -> std::result::Result<Vec<u8>, ServingHandoffCodecError> {
-    validate_target_control_authorization(artifact)?;
-    canonical_encode(
-        artifact,
-        TARGET_AUTHORIZED_SERVING_MAX_BYTES,
-        "target authorization",
-    )
-}
-
-fn decode_target_control_authorization(
-    bytes: &[u8],
-) -> std::result::Result<TargetControlAuthorizationArtifact, ServingHandoffCodecError> {
-    canonical_decode(
-        bytes,
-        TARGET_AUTHORIZED_SERVING_MAX_BYTES,
-        "target authorization",
-        validate_target_control_authorization,
-    )
 }
 
 fn encode_serving_handoff_record(
@@ -928,7 +886,8 @@ fn build_target_candidate(
 
     let mut target_attachment = blank_attachment.clone();
     target_attachment.head = expected_provisioned_head.clone();
-    validate_target_attachment(&target_attachment).map_err(|error| anyhow::anyhow!(error))?;
+    validate_target_control_attachment(&target_attachment)
+        .map_err(|error| anyhow::anyhow!(error))?;
     validate_authorized_serving_record(&authority.volume, &target_attachment, None)
         .map_err(|error| anyhow::anyhow!("serving authority target tuple is not exact: {error}"))?;
     let _ = (scope_id, control_socket_path, process_identity_token);
@@ -1080,110 +1039,14 @@ fn wire_pid(process_id: u32) -> Result<WireU64> {
     WireU64::new(u64::from(process_id)).context("serving handoff process ID exceeds wire range")
 }
 
-fn validate_target_attachment(
-    attachment: &AuthorizedServingAttachment,
-) -> std::result::Result<(), ServingHandoffCodecError> {
-    validate_authorized_serving_attachment(attachment).map_err(|_| {
-        ServingHandoffCodecError::Invalid {
-            artifact: "target authorization",
-            reason: "authorized serving attachment is not internally closed",
-        }
-    })?;
-    if attachment.head.generation.get() != 1
-        || attachment.head.root_hash.is_none()
-        || attachment.head.root_object_id.is_none()
-    {
-        return Err(ServingHandoffCodecError::Invalid {
-            artifact: "target authorization",
-            reason: "head is not exact generation one",
-        });
-    }
-    Ok(())
-}
-
-fn validate_target_control_authorization(
-    artifact: &TargetControlAuthorizationArtifact,
-) -> std::result::Result<(), ServingHandoffCodecError> {
-    validate_target_attachment(&artifact.attachment)?;
-    validate_local_state_identity(&artifact.local_state, &artifact.attachment)?;
-    if artifact.version != ContractVersion::V1 {
-        return Err(ServingHandoffCodecError::Invalid {
-            artifact: "target authorization",
-            reason: "version is not the exact supported contract",
-        });
-    }
-    Ok(())
-}
-
-fn validate_local_state_identity(
-    local: &ServingHandoffLocalStateIdentity,
-    attachment: &AuthorizedServingAttachment,
-) -> std::result::Result<(), ServingHandoffCodecError> {
-    let state_path = Path::new(local.state_directory.path.as_str());
-    let attachment_path = Path::new(local.attachment_directory.path.as_str());
-    let strict_descendant = attachment_path
-        .strip_prefix(state_path)
-        .is_ok_and(|relative| {
-            relative.components().next().is_some()
-                && relative
-                    .components()
-                    .all(|component| matches!(component, Component::Normal(_)))
-        });
-    let expected_identity_path = attachment_path.join(IDENTITY_FILE);
-    let expected_blank_path = attachment_path.join(AUTHORIZED_SERVING_FILE);
-    let expected_launch_path = attachment_path.join(LAUNCH_CHECKPOINT_FILE);
-    let identity_bytes = serde_json::to_vec(&attachment.identity).map_err(|_| {
-        ServingHandoffCodecError::Malformed {
-            artifact: "target authorization",
-        }
-    })?;
-    let mut blank_attachment = attachment.clone();
-    blank_attachment.head = attachment.acquire_result.resulting_head.clone();
-    let blank_bytes =
-        serde_json::to_vec(&blank_attachment).map_err(|_| ServingHandoffCodecError::Malformed {
-            artifact: "target authorization",
-        })?;
-    let identity_digest = Sha256Digest::from_bytes(Sha256::digest(&identity_bytes).into());
-    let blank_digest = Sha256Digest::from_bytes(Sha256::digest(&blank_bytes).into());
-    if !strict_descendant
-        || local.state_directory.inode.get() == 0
-        || local.attachment_directory.inode.get() == 0
-        || Path::new(local.attachment_identity_file.path.as_str()) != expected_identity_path
-        || Path::new(local.acquire_authorization_file.path.as_str()) != expected_blank_path
-        || Path::new(local.launch_checkpoint_file.path.as_str()) != expected_launch_path
-        || local.attachment_identity_file.inode.get() == 0
-        || local.acquire_authorization_file.inode.get() == 0
-        || local.launch_checkpoint_file.inode.get() == 0
-        || local.attachment_identity_file.device != local.attachment_directory.device
-        || local.acquire_authorization_file.device != local.attachment_directory.device
-        || local.launch_checkpoint_file.device != local.attachment_directory.device
-        || local.attachment_identity_file.length.get() != identity_bytes.len() as u64
-        || local.acquire_authorization_file.length.get() != blank_bytes.len() as u64
-        || local.launch_checkpoint_file.length.get() == 0
-        || local.launch_checkpoint_file.length.get() > MAX_LAUNCH_CHECKPOINT_BYTES as u64
-        || local.attachment_identity_file.content_sha256 != identity_digest
-        || local.acquire_authorization_file.content_sha256 != blank_digest
-        || !exact_blank_head(&blank_attachment.head)
-    {
-        return Err(ServingHandoffCodecError::Invalid {
-            artifact: "target authorization",
-            reason: "retained local state identities are not one closed attachment",
-        });
-    }
-    Ok(())
-}
-
 fn validate_handoff_record(
     record: &ServingHandoffRecord,
 ) -> std::result::Result<(), ServingHandoffCodecError> {
     let target_artifact = &record.target_control_authorization.artifact;
     validate_target_control_authorization(target_artifact)?;
     let attachment = &target_artifact.attachment;
-    let target_bytes = canonical_encode(
-        target_artifact,
-        TARGET_AUTHORIZED_SERVING_MAX_BYTES,
-        "target authorization",
-    )?;
+    let target_bytes = encode_target_control_authorization(target_artifact)
+        .map_err(ServingHandoffCodecError::from)?;
     let target_digest = Sha256Digest::from_bytes(Sha256::digest(&target_bytes).into());
     let identity = &attachment.identity;
     let acquire_request = &attachment.acquire_request;
@@ -2000,10 +1863,7 @@ fn exact_blank_head(head: &RemoteHead) -> bool {
 }
 
 fn target_control_file_name(provision_transition_id: &RandomId128) -> String {
-    format!(
-        "authorized-target-control-{}.json",
-        provision_transition_id.as_str()
-    )
+    target_control_authorization_file_name(provision_transition_id)
 }
 
 fn target_control_temp_name(provision_transition_id: &RandomId128) -> String {
@@ -3176,14 +3036,14 @@ mod tests {
         noncanonical.extend_from_slice(&target_bytes);
         assert!(matches!(
             decode_target_control_authorization(&noncanonical),
-            Err(ServingHandoffCodecError::NonCanonical { .. })
+            Err(TargetControlAuthorizationCodecError::NonCanonical { .. })
         ));
         assert!(matches!(
             decode_target_control_authorization(&vec![
                 b' ';
                 TARGET_AUTHORIZED_SERVING_MAX_BYTES + 1
             ]),
-            Err(ServingHandoffCodecError::WireBytesLimitExceeded { .. })
+            Err(TargetControlAuthorizationCodecError::WireBytesLimitExceeded { .. })
         ));
         drop(control);
 

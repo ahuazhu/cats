@@ -25,5 +25,6 @@ pub mod engine;
 pub mod format;
 pub mod image;
 pub mod nbd;
+pub mod target_control;
 #[cfg(target_os = "linux")]
 pub mod vhost_user;
