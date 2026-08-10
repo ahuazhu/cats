@@ -1042,7 +1042,7 @@ mod tests {
         let (token, public) = signed_token(&expected);
         assert_eq!(
             token,
-            "eyJhbGciOiJFZERTQSIsInR5cCI6ImNhdHMtcm91dGUtZ3JhbnQrand0Iiwia2lkIjoiZmQ1NmZlZDMyNTE0NjNlZmYwMDYzMTY5YTdmOGZhOWRjZTU4NWI2ZWVlNDI5NTgxMjY0Mjk3Yzk4ZWM1OGJjYiJ9.eyJ2ZXJzaW9uIjoyLCJpc3MiOiJjYXRzLWNvbnRyb2wtcGxhbmUiLCJhdWQiOiJjYXRzLW5vZGUtYWdlbnQiLCJ3b3Jrc3BhY2VfaWQiOiJ3c18wMSIsImVuZHBvaW50X2lkIjoiZXBfMDEiLCJob3N0bmFtZSI6ImFwcC5jYXRzLnJ1biIsImNhdF9pZCI6ImNhdF8wMSIsIm5vZGVfaWQiOiJub2RlLWEiLCJydW50aW1lX2luY2FybmF0aW9uIjoiMTExMTExMTExMTExMTExMTExMTExMTExMTExMTExMTEiLCJyb3V0ZV9lcG9jaCI6NywicHJvdG9jb2wiOiJodHRwIiwidGFyZ2V0X3BvcnQiOjgwODAsImlhdCI6MTc4NjE1NjgwMCwibmJmIjoxNzg2MTU2ODAwLCJleHAiOjE3ODYxNTY5MjB9.3Gry0VCwbWEypf9oCgQrT6DUWtb5bgBHYYE9KCbABm73M8OOh71HCvsFsoemyJ_v-WeIM6gb7I0O0Pb_zHyZAQ"
+            "eyJhbGciOiJFZERTQSIsInR5cCI6ImNhdHMtcm91dGUtZ3JhbnQrand0Iiwia2lkIjoiMjI4MWEwMmE3ZjQyZDkyZmE5Y2FhNWI3OTA3YjI5YzJmMDYwY2IwMDE5NmJlMjgwYWYzM2ZiN2JjOGUyN2U5OSJ9.eyJ2ZXJzaW9uIjoyLCJpc3MiOiJjYXRzLWNvbnRyb2wtcGxhbmUiLCJhdWQiOiJjYXRzLW5vZGUtYWdlbnQiLCJ3b3Jrc3BhY2VfaWQiOiJ3c18wMSIsImVuZHBvaW50X2lkIjoiZXBfMDEiLCJob3N0bmFtZSI6ImFwcC5jYXRzLnJ1biIsImNhdF9pZCI6ImNhdF8wMSIsIm5vZGVfaWQiOiJub2RlLWEiLCJydW50aW1lX2luY2FybmF0aW9uIjoiMTExMTExMTExMTExMTExMTExMTExMTExMTExMTExMTEiLCJyb3V0ZV9lcG9jaCI6NywicHJvdG9jb2wiOiJodHRwIiwidGFyZ2V0X3BvcnQiOjgwODAsImlhdCI6MTc4NjE1NjgwMCwibmJmIjoxNzg2MTU2ODAwLCJleHAiOjE3ODYxNTY5MjB9.665Xtyyij0KLYLtJFLKhc7MxT5u96GI3qllvKvpLwR592PLlpP_eWdi0Ctmnll6RSopLxMNaKxW7f6YfansuBQ"
         );
         let compact = RouteGrantV2Compact::parse(&token).unwrap();
         assert_eq!(compact.header().kid, *public.kid());
@@ -1353,7 +1353,8 @@ mod tests {
             )
             .unwrap(),
         };
-        ring.keys.insert(0, other.clone());
+        ring.keys.push(other.clone());
+        ring.keys.sort_by(|left, right| left.kid.cmp(&right.kid));
         ring.validate().unwrap();
         ring.keys.swap(0, 1);
         assert_eq!(

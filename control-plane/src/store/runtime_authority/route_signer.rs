@@ -77,11 +77,6 @@ struct RouteGrantV2AuthorityLocator {
     endpoint: EndpointRecord,
 }
 
-struct RouteGrantV2HostnameScopeLocator {
-    workspace_id: Id,
-    endpoint_id: Id,
-}
-
 impl Store {
     pub(crate) fn load_route_grant_v2_authority(
         &self,
@@ -117,17 +112,24 @@ impl Store {
             else {
                 return Ok(RouteGrantV2MachineAuthorityLoad::AuthenticationFailed);
             };
-            let Some(locator) = load_hostname_scope_locator_in(transaction, hostname)? else {
+            let Some(hostname_workspace_id) =
+                load_hostname_scope_workspace_in(transaction, hostname)?
+            else {
                 return Ok(RouteGrantV2MachineAuthorityLoad::Rejected(
                     RouteGrantV2AuthorityRejection::NotFound,
                 ));
             };
-            if !scope.authorizes_workspace(&locator.workspace_id) {
+            if !scope.authorizes_workspace(&hostname_workspace_id) {
                 return Ok(RouteGrantV2MachineAuthorityLoad::AuthenticationFailed);
             }
+            // Do not even parse the Endpoint projection until the hostname's
+            // authoritative Workspace has passed scope. Corrupt outside-scope
+            // Endpoint data must be indistinguishable from every other
+            // outside-scope route state.
+            let endpoint_id =
+                load_hostname_scope_endpoint_in(transaction, hostname)?.ok_or_else(corrupt)?;
             let endpoint_workspace_id =
-                load_endpoint_scope_workspace_in(transaction, &locator.endpoint_id)?
-                    .ok_or_else(corrupt)?;
+                load_endpoint_scope_workspace_in(transaction, &endpoint_id)?.ok_or_else(corrupt)?;
             if !scope.authorizes_workspace(&endpoint_workspace_id) {
                 return Ok(RouteGrantV2MachineAuthorityLoad::AuthenticationFailed);
             }
@@ -138,10 +140,10 @@ impl Store {
             // Desired/runtime/signer facts from the uniform 401.
             let lookup =
                 load_hostname_lookup_unlocked(transaction, hostname)?.ok_or_else(corrupt)?;
-            let endpoint = load_endpoint_by_id_unlocked(transaction, &locator.endpoint_id)?
-                .ok_or_else(corrupt)?;
-            if lookup.workspace_id != locator.workspace_id
-                || lookup.endpoint_id != locator.endpoint_id
+            let endpoint =
+                load_endpoint_by_id_unlocked(transaction, &endpoint_id)?.ok_or_else(corrupt)?;
+            if lookup.workspace_id != hostname_workspace_id
+                || lookup.endpoint_id != endpoint_id
                 || endpoint.workspace_id != endpoint_workspace_id
             {
                 return Err(corrupt());
@@ -182,25 +184,33 @@ impl Store {
     }
 }
 
-fn load_hostname_scope_locator_in(
+fn load_hostname_scope_workspace_in(
     transaction: &mut postgres::Transaction<'_>,
     hostname: &Hostname,
-) -> AuthorityTxResult<Option<RouteGrantV2HostnameScopeLocator>> {
+) -> AuthorityTxResult<Option<Id>> {
     transaction
         .query_opt(
-            "SELECT workspace_id, endpoint_id
+            "SELECT workspace_id
                FROM hostname_desired_lookups
               WHERE hostname=$1",
             &[&hostname.as_str()],
         )?
-        .map(|row| {
-            Ok(RouteGrantV2HostnameScopeLocator {
-                workspace_id: Id::new(row.try_get::<_, String>("workspace_id")?)
-                    .ok_or_else(corrupt)?,
-                endpoint_id: Id::new(row.try_get::<_, String>("endpoint_id")?)
-                    .ok_or_else(corrupt)?,
-            })
-        })
+        .map(|row| Id::new(row.try_get::<_, String>("workspace_id")?).ok_or_else(corrupt))
+        .transpose()
+}
+
+fn load_hostname_scope_endpoint_in(
+    transaction: &mut postgres::Transaction<'_>,
+    hostname: &Hostname,
+) -> AuthorityTxResult<Option<Id>> {
+    transaction
+        .query_opt(
+            "SELECT endpoint_id
+               FROM hostname_desired_lookups
+              WHERE hostname=$1",
+            &[&hostname.as_str()],
+        )?
+        .map(|row| Id::new(row.try_get::<_, String>("endpoint_id")?).ok_or_else(corrupt))
         .transpose()
 }
 

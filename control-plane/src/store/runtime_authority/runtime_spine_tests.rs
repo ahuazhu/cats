@@ -3690,6 +3690,14 @@ fn route_signer_snapshot_closes_hostname_runtime_and_ring_in_one_authority_read(
             cats_api::gateway_workload_identity::GatewayWorkloadCredentialScope::Workspaces {
                 workspace_ids: vec![id("workspace_not_route")],
             };
+        let final_reader_backend_pid: i32 = store
+            .with(|client| {
+                client
+                    .query_one("SELECT pg_backend_pid()", &[])
+                    .map(|row| row.get(0))
+            })
+            .unwrap();
+        let lock_observer = Store::connect(&url, None).unwrap();
         let final_reader_entered = Arc::new(Barrier::new(2));
         let release_final_reader = Arc::new(Barrier::new(2));
         machine_service.pause_store_after_start_for_test(
@@ -3729,7 +3737,40 @@ fn route_signer_snapshot_closes_hostname_runtime_and_ring_in_one_authority_read(
         tokio::task::spawn_blocking(move || release_final_reader.wait())
             .await
             .unwrap();
-        tokio::time::sleep(Duration::from_millis(100)).await;
+
+        // A positive PostgreSQL observation, rather than timing, proves that
+        // the final reader reached the session-level shared barrier while the
+        // writer still owns its exclusive advisory lock. Releasing the writer
+        // only after this point makes an old snapshot-before-lock
+        // implementation deterministically issue from stale authority.
+        let lock_wait_deadline = Instant::now() + Duration::from_secs(1);
+        loop {
+            let waiting_on_shared_advisory: bool = lock_observer
+                .with(|client| {
+                    client
+                        .query_one(
+                            "SELECT EXISTS (
+                                 SELECT 1
+                                   FROM pg_locks
+                                  WHERE pid=$1
+                                    AND locktype='advisory'
+                                    AND mode='ShareLock'
+                                    AND NOT granted
+                             )",
+                            &[&final_reader_backend_pid],
+                        )
+                        .map(|row| row.get(0))
+                })
+                .unwrap();
+            if waiting_on_shared_advisory {
+                break;
+            }
+            assert!(
+                Instant::now() < lock_wait_deadline,
+                "final reader never waited on the shared PG advisory barrier"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
         assert!(
             !raced_resolve.is_finished(),
             "final reader did not wait behind the writer-first PG barrier"
@@ -3772,6 +3813,48 @@ fn route_signer_snapshot_closes_hostname_runtime_and_ring_in_one_authority_read(
             gateway_test_http_request(&mut machine_stream, machine_request.as_bytes()).await;
         assert_eq!(
             gateway_test_http_status(&corrupt_outside_scope_response),
+            401
+        );
+
+        // Simulate a row that predates the Endpoint FK backstop. Even an
+        // unparseable endpoint_id projection remains a uniform 401 once the
+        // authoritative hostname Workspace is outside the principal's scope.
+        // An implementation that parses endpoint_id together with Workspace
+        // before the first scope check returns 500 here.
+        let corrupt_projection_hostname = hostname.clone();
+        store
+            .execute(move |store| {
+                store.with(|client| {
+                    client.batch_execute(
+                        "DO $$
+                         DECLARE target_constraint TEXT;
+                         BEGIN
+                           SELECT conname INTO STRICT target_constraint
+                             FROM pg_constraint
+                            WHERE conrelid='hostname_desired_lookups'::regclass
+                              AND confrelid='endpoint_records'::regclass
+                              AND contype='f';
+                           EXECUTE format(
+                             'ALTER TABLE hostname_desired_lookups DROP CONSTRAINT %I',
+                             target_constraint
+                           );
+                         END $$;",
+                    )?;
+                    client.execute(
+                        "UPDATE hostname_desired_lookups
+                            SET endpoint_id='not-an-id!'
+                          WHERE hostname=$1",
+                        &[&corrupt_projection_hostname.as_str()],
+                    )?;
+                    Ok(())
+                })
+            })
+            .await
+            .unwrap();
+        let corrupt_endpoint_projection_response =
+            gateway_test_http_request(&mut machine_stream, machine_request.as_bytes()).await;
+        assert_eq!(
+            gateway_test_http_status(&corrupt_endpoint_projection_response),
             401
         );
 
