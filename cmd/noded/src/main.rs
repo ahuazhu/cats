@@ -4,11 +4,12 @@ use std::time::Duration;
 
 use anyhow::Context;
 use cats_node_agent::ch::{BlockPath, ChConfig};
+use cats_node_agent::runtime::reconciliation::AuthorizedBlockdLaunchConfig;
 use cats_node_agent::runtime_cutover::{spawn_signed_runtime_cutover, SignedRuntimeCutoverConfig};
 use cats_node_agent::runtime_spine::RuntimeSpineDeadlinePolicy;
 use cats_object_store_aws_s3::AwsS3BlobStoreFactory;
 use cats_object_store_file::FileBlobStoreFactory;
-use cats_storage::{open_blob_store, AdapterConfig, BlobStoreFactory};
+use cats_storage::{open_blob_store, AdapterConfig, AdapterSelection, BlobStoreFactory};
 use clap::Parser;
 
 #[derive(Parser, Debug)]
@@ -159,6 +160,20 @@ async fn main() -> anyhow::Result<()> {
         AdapterConfig::from_cli(args.metadata_store_options).context("metadata adapter options")?;
     let object_config =
         AdapterConfig::from_cli(args.object_store_options).context("object adapter options")?;
+    let authorized_blockd_launch = AuthorizedBlockdLaunchConfig {
+        blockd_binary: args.blockd_bin.clone(),
+        metadata_store: AdapterSelection::new(
+            args.metadata_store_adapter.clone(),
+            metadata_config.clone(),
+        ),
+        object_store: AdapterSelection::new(
+            args.object_store_adapter.clone(),
+            object_config.clone(),
+        ),
+        max_staged_bytes: args.blockd_max_staged_bytes,
+        max_staged_packs: args.blockd_max_staged_packs,
+        max_local_bytes: args.blockd_max_local_bytes,
+    };
     let object_factories: [&dyn BlobStoreFactory; 2] =
         [&FileBlobStoreFactory, &AwsS3BlobStoreFactory];
     let blob_store = open_blob_store(
@@ -189,7 +204,7 @@ async fn main() -> anyhow::Result<()> {
         control_plane_url: args.control_plane_url,
         agent_registration,
         ch_config,
-        blockd_binary: args.blockd_bin,
+        authorized_blockd_launch,
         guest_agent_binary: args.guest_agent_bin,
         metering_cgroup_root: args.metering_cgroup_root,
         volume_data_authority,

@@ -27,9 +27,9 @@ use cats_storage::BlobStore;
 use crate::agent_registration::AgentRegistrationConfig;
 use crate::ch::ChConfig;
 use crate::runtime::reconciliation::{
-    installed_clean_slate_scanner, ControlSignedNormalAcquireClient,
-    InstalledCleanSlateProbeConfig, RuntimeVolumeTransitionHttpClient, SignedRunningAcquireEffect,
-    SignedRunningPublicationRecovery,
+    installed_clean_slate_scanner, AuthorizedBlockdLaunchConfig, ControlSignedNormalAcquireClient,
+    InstalledCleanSlateProbeConfig, RootProvisionSystemdConfig, RuntimeVolumeTransitionHttpClient,
+    SignedRunningAcquireEffect, SignedRunningPublicationRecovery,
 };
 use crate::runtime_spine::{
     RuntimeInventoryScanner, RuntimeSpineDeadlinePolicy, RuntimeSpineHttpClient,
@@ -43,7 +43,7 @@ pub struct SignedRuntimeCutoverConfig {
     pub control_plane_url: String,
     pub agent_registration: AgentRegistrationConfig,
     pub ch_config: ChConfig,
-    pub blockd_binary: std::path::PathBuf,
+    pub authorized_blockd_launch: AuthorizedBlockdLaunchConfig,
     pub guest_agent_binary: std::path::PathBuf,
     pub metering_cgroup_root: Option<std::path::PathBuf>,
     /// Retained for the signed acquire/provision effect. It is deliberately
@@ -209,6 +209,9 @@ async fn spawn_signed_runtime_cutover_with_scanner(
         .context("validate signed Runtime startup deadlines")?;
     SignedRunningAcquireEffect::validate_lease_duration(config.volume_lease_duration_ms)
         .context("compose one-step signed Running acquire")?;
+    let root_provision_systemd =
+        RootProvisionSystemdConfig::new(config.authorized_blockd_launch.clone())
+            .context("compose credentialless root-provision systemd process owner")?;
     let session = config
         .agent_registration
         .register_until_session(&config.control_plane_url)
@@ -236,11 +239,12 @@ async fn spawn_signed_runtime_cutover_with_scanner(
         None => installed_clean_slate_scanner(InstalledCleanSlateProbeConfig {
             state_directory: config.agent_registration.runtime_state_directory(),
             cloud_hypervisor_binary: config.ch_config.ch_bin.clone(),
-            blockd_binary: config.blockd_binary.clone(),
+            blockd_binary: config.authorized_blockd_launch.blockd_binary.clone(),
             guest_agent_binary: config.guest_agent_binary.clone(),
             metering_cgroup_root: config.metering_cgroup_root.clone(),
             volume_inventory_authority: Arc::clone(&config.volume_inventory_authority),
             blob_store: Arc::clone(&config.blob_store),
+            root_provision_systemd,
         })
         .context("compose installed clean-slate inventory probes")?,
     };
@@ -467,7 +471,10 @@ mod tests {
         AuthorityError, NodeVolumeInventorySnapshot, RenewLeaseRequest, RenewLeaseResult,
         VolumeHeadCasRequest, VolumeHeadCasResult, VolumeRecord,
     };
-    use cats_storage::{encode_image_manifest, BlobError, ImageManifestV1, LowerHexSha256};
+    use cats_storage::{
+        encode_image_manifest, AdapterConfig, AdapterSelection, BlobError, ImageManifestV1,
+        LowerHexSha256,
+    };
 
     use crate::runtime::reconciliation::{
         clean_slate_scanner_with_volume_authority_and_blob_for_test, runtime_checkpoint_path,
@@ -534,6 +541,23 @@ mod tests {
         BlobError::Backend {
             key: key.to_owned(),
             message: "test blob store is unavailable".to_owned(),
+        }
+    }
+
+    fn test_authorized_blockd_launch() -> AuthorizedBlockdLaunchConfig {
+        AuthorizedBlockdLaunchConfig {
+            blockd_binary: "/opt/cats/bin/cats-blockd".into(),
+            metadata_store: AdapterSelection::new(
+                "postgres",
+                AdapterConfig::from_pairs([("url-file", "/run/cats/postgres.url")]).unwrap(),
+            ),
+            object_store: AdapterSelection::new(
+                "aws-s3",
+                AdapterConfig::from_pairs([("bucket", "cats-test")]).unwrap(),
+            ),
+            max_staged_bytes: cats_api::blockd::DEFAULT_MAX_STAGED_BYTES,
+            max_staged_packs: cats_api::blockd::DEFAULT_MAX_STAGED_PACKS,
+            max_local_bytes: cats_api::blockd::DEFAULT_MAX_LOCAL_BYTES,
         }
     }
 
@@ -1027,7 +1051,7 @@ mod tests {
             control_plane_url: origin,
             agent_registration: registration_config(state_path).unwrap(),
             ch_config: test_ch_config(),
-            blockd_binary: "/opt/cats/bin/cats-blockd".into(),
+            authorized_blockd_launch: test_authorized_blockd_launch(),
             guest_agent_binary: "/opt/cats/bin/cats-guest-agent".into(),
             metering_cgroup_root: None,
             volume_data_authority: data_authority,
@@ -1265,7 +1289,7 @@ mod tests {
             control_plane_url: origin.clone(),
             agent_registration: registration,
             ch_config: test_ch_config(),
-            blockd_binary: "/opt/cats/bin/cats-blockd".into(),
+            authorized_blockd_launch: test_authorized_blockd_launch(),
             guest_agent_binary: "/opt/cats/bin/cats-guest-agent".into(),
             metering_cgroup_root: None,
             volume_data_authority: Arc::new(TestUnavailableVolumeDataAuthority),
@@ -1336,7 +1360,7 @@ mod tests {
             control_plane_url: format!("http://{control_address}"),
             agent_registration: registration_config(state_root.path().join("state")).unwrap(),
             ch_config: test_ch_config(),
-            blockd_binary: "/opt/cats/bin/cats-blockd".into(),
+            authorized_blockd_launch: test_authorized_blockd_launch(),
             guest_agent_binary: "/opt/cats/bin/cats-guest-agent".into(),
             metering_cgroup_root: None,
             volume_data_authority: Arc::new(TestUnavailableVolumeDataAuthority),
@@ -1382,7 +1406,7 @@ mod tests {
             control_plane_url: format!("http://{control_address}"),
             agent_registration: registration_config(state_root.path().join("state")).unwrap(),
             ch_config: test_ch_config(),
-            blockd_binary: "/opt/cats/bin/cats-blockd".into(),
+            authorized_blockd_launch: test_authorized_blockd_launch(),
             guest_agent_binary: "/opt/cats/bin/cats-guest-agent".into(),
             metering_cgroup_root: None,
             volume_data_authority: Arc::new(TestUnavailableVolumeDataAuthority),

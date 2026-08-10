@@ -327,6 +327,14 @@ fn exact_handshake(
         && status.remote_head.as_ref() == Some(expected.expected_remote_head())
         && status.guest_io_enabled == Some(false)
         && status.mode == expected_mode
+        && status.local_durable_generation
+            == i64::try_from(expected.expected_remote_head().generation.get()).ok()?
+        && status.remote_durable_generation
+            == i64::try_from(expected.expected_remote_head().generation.get()).ok()?
+        && status.unpublished_generations == 0
+        && status.unpublished_bytes == 0
+        && status.oldest_unpublished_age_ms == 0
+        && !status.backpressured
         && !status.fenced)
         .then(|| RootProvisionBlockdHandshake {
             peer_process_id,
@@ -579,6 +587,7 @@ fn platform_submit_systemd(
         .arg(format!("--slice={SYSTEM_SLICE}"))
         .arg("--property=KillMode=control-group")
         .arg("--property=Restart=no")
+        .arg("--property=UMask=0077")
         .arg("--property=TimeoutStopSec=2s")
         .arg("--property=Environment=")
         .arg("--property=EnvironmentFile=")
@@ -1339,6 +1348,8 @@ mod tests {
         ]);
         let mut target_status = status();
         target_status.remote_head = Some(target.clone());
+        target_status.local_durable_generation = 1;
+        target_status.remote_durable_generation = 1;
         let handshake = Arc::new(FakeHandshake::default());
         handshake
             .inspections
@@ -1428,6 +1439,24 @@ mod tests {
                 RootProvisionProcessConflict::IdentityMismatch
             )
         ));
+    }
+
+    #[test]
+    fn staged_dirty_or_backpressured_status_is_not_root_provision_evidence() {
+        let expected = expectation();
+        for mutate in [
+            (|status: &mut DurabilityStatus| status.unpublished_generations = 1)
+                as fn(&mut DurabilityStatus),
+            |status: &mut DurabilityStatus| status.unpublished_bytes = 1,
+            |status: &mut DurabilityStatus| status.oldest_unpublished_age_ms = 1,
+            |status: &mut DurabilityStatus| status.local_durable_generation = 1,
+            |status: &mut DurabilityStatus| status.remote_durable_generation = 1,
+            |status: &mut DurabilityStatus| status.backpressured = true,
+        ] {
+            let mut status = status();
+            mutate(&mut status);
+            assert!(exact_handshake(&expected, 4242, &status).is_none());
+        }
     }
 
     #[test]

@@ -33,6 +33,10 @@ use crate::runtime_spine::{
 };
 
 use super::{
+    root_provision_process::{
+        ExactRootProvisionProcessProof, RootProvisionAuthoritySnapshot,
+        RootProvisionProcessExpectation,
+    },
     runtime_checkpoint_path,
     signed_running::{
         expected_provision_heads, provision_checkpoint_is_bound, request_matches_volume,
@@ -122,6 +126,31 @@ pub trait InventoryAbsenceProbe:
     ) -> anyhow::Result<InventoryAbsence>;
 }
 
+pub(crate) mod root_process_inventory_bridge_sealed {
+    pub(crate) trait Sealed {}
+}
+
+#[derive(Debug)]
+pub(crate) enum RootProcessInventoryBridgeOutcome {
+    Complete(BTreeMap<Id, ExactRootProvisionProcessProof>),
+    Unavailable,
+}
+
+/// Joint Systemd/process/control-socket inspection. It consumes expectations
+/// derived from the already-complete checkpoint, data-directory and authority
+/// sources, and is the only path that may project a verified process.
+pub(crate) trait RootProcessInventoryBridge:
+    root_process_inventory_bridge_sealed::Sealed + Send + Sync + 'static
+{
+    fn executable_path(&self) -> &HostPath;
+
+    fn inspect_all(
+        &self,
+        expected: BTreeMap<Id, RootProvisionProcessExpectation>,
+        context: &RuntimeInventoryScanContext,
+    ) -> anyhow::Result<RootProcessInventoryBridgeOutcome>;
+}
+
 #[derive(Debug, Error, PartialEq, Eq)]
 pub enum InventoryProbeSetError {
     #[error("inventory absence probe is duplicated for {0:?}")]
@@ -134,6 +163,7 @@ pub struct CleanSlateInventoryScanner {
     checkpoint_directory: PathBuf,
     probes: Vec<Arc<dyn InventoryAbsenceProbe>>,
     blob: Option<Arc<dyn BlobStore>>,
+    root_process_bridge: Option<Arc<dyn RootProcessInventoryBridge>>,
 }
 
 impl crate::runtime_spine::inventory_scanner_sealed::Sealed for CleanSlateInventoryScanner {}
@@ -176,6 +206,7 @@ impl CleanSlateInventoryScanner {
             checkpoint_directory,
             probes,
             blob: None,
+            root_process_bridge: None,
         })
     }
 
@@ -188,6 +219,98 @@ impl CleanSlateInventoryScanner {
         scanner.blob = Some(blob);
         Ok(scanner)
     }
+
+    pub(crate) fn new_with_blob_and_root_process_bridge(
+        checkpoint_directory: PathBuf,
+        probes: Vec<Arc<dyn InventoryAbsenceProbe>>,
+        blob: Arc<dyn BlobStore>,
+        bridge: Arc<dyn RootProcessInventoryBridge>,
+    ) -> Result<Self, InventoryProbeSetError> {
+        let mut scanner = Self::new_with_blob(checkpoint_directory, probes, blob)?;
+        scanner.root_process_bridge = Some(bridge);
+        Ok(scanner)
+    }
+}
+
+struct InventoryProbeAggregation {
+    unavailable_sources: Vec<InventorySource>,
+    volumes_by_cat: BTreeMap<Id, Vec<AuthorityVolumeInventoryEvidence>>,
+    checkpoints_by_cat: BTreeMap<Id, RuntimeCheckpointInventoryEvidence>,
+    blockd_by_cat: BTreeMap<Id, AuthorizedBlockdInventoryEvidence>,
+    coverage: InventoryCoverageAggregator,
+}
+
+impl InventoryProbeAggregation {
+    fn new() -> Self {
+        Self {
+            unavailable_sources: Vec::new(),
+            volumes_by_cat: BTreeMap::new(),
+            checkpoints_by_cat: BTreeMap::new(),
+            blockd_by_cat: BTreeMap::new(),
+            coverage: InventoryCoverageAggregator::new(),
+        }
+    }
+}
+
+fn inspect_inventory_probe(
+    probe: &Arc<dyn InventoryAbsenceProbe>,
+    context: &RuntimeInventoryScanContext,
+    aggregate: &mut InventoryProbeAggregation,
+) -> anyhow::Result<()> {
+    context
+        .remaining()
+        .with_context(|| format!("clean-slate inventory stopped before {:?}", probe.source()))?;
+    match probe
+        .prove_absent(context)
+        .with_context(|| format!("prove {:?} inventory is absent", probe.source()))?
+    {
+        InventoryAbsence::Empty => {}
+        InventoryAbsence::RuntimeCheckpoints(checkpoints) => {
+            anyhow::ensure!(
+                probe.source() == InventorySource::Checkpoint,
+                "only the checkpoint source may report Runtime checkpoints"
+            );
+            for (cat_id, checkpoint) in checkpoints {
+                anyhow::ensure!(
+                    aggregate
+                        .checkpoints_by_cat
+                        .insert(cat_id, checkpoint)
+                        .is_none(),
+                    "checkpoint inventory duplicated one Cat"
+                );
+            }
+        }
+        InventoryAbsence::AuthorizedBlockd(blockds) => {
+            anyhow::ensure!(
+                probe.source() == InventorySource::DataDirectory,
+                "only the data-directory source may report authorized blockd lineage"
+            );
+            for (cat_id, blockd) in blockds {
+                anyhow::ensure!(
+                    aggregate.blockd_by_cat.insert(cat_id, blockd).is_none(),
+                    "data-directory inventory duplicated one Cat"
+                );
+            }
+        }
+        InventoryAbsence::DesiredVolumes(observed) => {
+            anyhow::ensure!(
+                probe.source() == InventorySource::MetadataStore,
+                "only the metadata source may report Desired volume facts"
+            );
+            for (cat_id, volumes) in observed {
+                anyhow::ensure!(
+                    aggregate.volumes_by_cat.insert(cat_id, volumes).is_none(),
+                    "metadata inventory duplicated one Cat"
+                );
+            }
+        }
+        InventoryAbsence::Unavailable => aggregate.unavailable_sources.push(probe.source()),
+    }
+    context
+        .remaining()
+        .with_context(|| format!("clean-slate inventory stopped after {:?}", probe.source()))?;
+    aggregate.coverage.record(probe.source())?;
+    Ok(())
 }
 
 impl RuntimeInventoryScanner for CleanSlateInventoryScanner {
@@ -195,68 +318,86 @@ impl RuntimeInventoryScanner for CleanSlateInventoryScanner {
         &self,
         context: RuntimeInventoryScanContext,
     ) -> anyhow::Result<RuntimeInventoryScanOutcome> {
-        let mut unavailable_sources = Vec::new();
-        let mut volumes_by_cat = BTreeMap::new();
-        let mut checkpoints_by_cat = BTreeMap::new();
-        let mut blockd_by_cat = BTreeMap::new();
-        let mut coverage = InventoryCoverageAggregator::new();
-        for probe in &self.probes {
-            context.remaining().with_context(|| {
-                format!("clean-slate inventory stopped before {:?}", probe.source())
-            })?;
-            match probe
-                .prove_absent(&context)
-                .with_context(|| format!("prove {:?} inventory is absent", probe.source()))?
-            {
-                InventoryAbsence::Empty => {}
-                InventoryAbsence::RuntimeCheckpoints(checkpoints) => {
-                    anyhow::ensure!(
-                        probe.source() == InventorySource::Checkpoint,
-                        "only the checkpoint source may report Runtime checkpoints"
-                    );
-                    for (cat_id, checkpoint) in checkpoints {
-                        anyhow::ensure!(
-                            checkpoints_by_cat.insert(cat_id, checkpoint).is_none(),
-                            "checkpoint inventory duplicated one Cat"
-                        );
-                    }
-                }
-                InventoryAbsence::AuthorizedBlockd(blockds) => {
-                    anyhow::ensure!(
-                        probe.source() == InventorySource::DataDirectory,
-                        "only the data-directory source may report authorized blockd lineage"
-                    );
-                    for (cat_id, blockd) in blockds {
-                        anyhow::ensure!(
-                            blockd_by_cat.insert(cat_id, blockd).is_none(),
-                            "data-directory inventory duplicated one Cat"
-                        );
-                    }
-                }
-                InventoryAbsence::DesiredVolumes(observed) => {
-                    anyhow::ensure!(
-                        probe.source() == InventorySource::MetadataStore,
-                        "only the metadata source may report Desired volume facts"
-                    );
-                    for (cat_id, volumes) in observed {
-                        anyhow::ensure!(
-                            volumes_by_cat.insert(cat_id, volumes).is_none(),
-                            "metadata inventory duplicated one Cat"
-                        );
-                    }
-                }
-                InventoryAbsence::Unavailable => unavailable_sources.push(probe.source()),
+        let mut aggregate = InventoryProbeAggregation::new();
+        let mut processes_by_cat = BTreeMap::new();
+        if let Some(bridge) = &self.root_process_bridge {
+            // The process expectation cannot be derived until all three data
+            // authorities have completed. Read each prerequisite exactly
+            // once, then inspect the three physical process sources jointly.
+            for source in [
+                InventorySource::Checkpoint,
+                InventorySource::DataDirectory,
+                InventorySource::MetadataStore,
+            ] {
+                let probe = self
+                    .probes
+                    .iter()
+                    .find(|probe| probe.source() == source)
+                    .expect("probe-set validation established every source");
+                inspect_inventory_probe(probe, &context, &mut aggregate)?;
             }
-            // A probe may return only after its underlying I/O consumed the
-            // deadline. Never count that late result as complete coverage.
-            context.remaining().with_context(|| {
-                format!("clean-slate inventory stopped after {:?}", probe.source())
-            })?;
-            coverage.record(probe.source())?;
+            if !aggregate.unavailable_sources.is_empty() {
+                return Ok(RuntimeInventoryScanOutcome::Incomplete {
+                    unavailable_sources: aggregate.unavailable_sources,
+                });
+            }
+
+            let expected = root_process_expectations(
+                &context,
+                &self.checkpoint_directory,
+                self.blob.as_deref(),
+                bridge.executable_path(),
+                &aggregate.checkpoints_by_cat,
+                &aggregate.blockd_by_cat,
+                &aggregate.volumes_by_cat,
+            )?;
+            context
+                .remaining()
+                .context("root-process inventory bridge deadline expired before inspection")?;
+            match bridge.inspect_all(expected, &context)? {
+                RootProcessInventoryBridgeOutcome::Complete(processes) => {
+                    processes_by_cat = processes;
+                }
+                RootProcessInventoryBridgeOutcome::Unavailable => {
+                    aggregate.unavailable_sources.extend([
+                        InventorySource::Systemd,
+                        InventorySource::Process,
+                        InventorySource::ControlSocket,
+                    ]);
+                }
+            }
+            context
+                .remaining()
+                .context("root-process inventory bridge deadline expired after inspection")?;
+            for source in [
+                InventorySource::Systemd,
+                InventorySource::Process,
+                InventorySource::ControlSocket,
+            ] {
+                aggregate.coverage.record(source)?;
+            }
+            for probe in &self.probes {
+                if matches!(
+                    probe.source(),
+                    InventorySource::Checkpoint
+                        | InventorySource::DataDirectory
+                        | InventorySource::MetadataStore
+                        | InventorySource::Systemd
+                        | InventorySource::Process
+                        | InventorySource::ControlSocket
+                ) {
+                    continue;
+                }
+                inspect_inventory_probe(probe, &context, &mut aggregate)?;
+            }
+        } else {
+            for probe in &self.probes {
+                inspect_inventory_probe(probe, &context, &mut aggregate)?;
+            }
         }
-        if !unavailable_sources.is_empty() {
+        if !aggregate.unavailable_sources.is_empty() {
             return Ok(RuntimeInventoryScanOutcome::Incomplete {
-                unavailable_sources,
+                unavailable_sources: aggregate.unavailable_sources,
             });
         }
 
@@ -268,7 +409,7 @@ impl RuntimeInventoryScanner for CleanSlateInventoryScanner {
             .ok()
             .and_then(UnixMillis::new)
             .context("system time does not fit UnixMillis")?;
-        let coverage = coverage.finish()?;
+        let coverage = aggregate.coverage.finish()?;
         let inventory_epoch = context.coordinates().inventory_epoch;
         let projection = InventoryProjectionContext {
             checkpoint_directory: &self.checkpoint_directory,
@@ -285,14 +426,21 @@ impl RuntimeInventoryScanner for CleanSlateInventoryScanner {
                     desired,
                     inventory_epoch,
                     &projection,
-                    volumes_by_cat.remove(&desired.cat_id).unwrap_or_default(),
-                    checkpoints_by_cat.remove(&desired.cat_id),
-                    blockd_by_cat.remove(&desired.cat_id),
+                    aggregate
+                        .volumes_by_cat
+                        .remove(&desired.cat_id)
+                        .unwrap_or_default(),
+                    aggregate.checkpoints_by_cat.remove(&desired.cat_id),
+                    aggregate.blockd_by_cat.remove(&desired.cat_id),
+                    processes_by_cat.remove(&desired.cat_id),
                 )
             })
             .collect::<anyhow::Result<Vec<_>>>()?;
         anyhow::ensure!(
-            volumes_by_cat.is_empty() && checkpoints_by_cat.is_empty() && blockd_by_cat.is_empty(),
+            aggregate.volumes_by_cat.is_empty()
+                && aggregate.checkpoints_by_cat.is_empty()
+                && aggregate.blockd_by_cat.is_empty()
+                && processes_by_cat.is_empty(),
             "inventory named a Cat outside Desired"
         );
 
@@ -308,6 +456,71 @@ impl RuntimeInventoryScanner for CleanSlateInventoryScanner {
     }
 }
 
+fn root_process_expectations(
+    context: &RuntimeInventoryScanContext,
+    checkpoint_directory: &std::path::Path,
+    blob: Option<&dyn BlobStore>,
+    executable_path: &HostPath,
+    checkpoints_by_cat: &BTreeMap<Id, RuntimeCheckpointInventoryEvidence>,
+    blockd_by_cat: &BTreeMap<Id, AuthorizedBlockdInventoryEvidence>,
+    volumes_by_cat: &BTreeMap<Id, Vec<AuthorityVolumeInventoryEvidence>>,
+) -> anyhow::Result<BTreeMap<Id, RootProvisionProcessExpectation>> {
+    let mut expected = BTreeMap::new();
+    for desired in &context.coordinates().desired.desired_specs {
+        let Some(checkpoint) = checkpoints_by_cat.get(&desired.cat_id) else {
+            continue;
+        };
+        if checkpoint.binding != DesiredCheckpointBinding::Current
+            || !matches!(
+                checkpoint.checkpoint.step,
+                ReconcileStep::ProvisionRootImage { .. }
+            )
+        {
+            continue;
+        }
+        let blockd = blockd_by_cat
+            .get(&desired.cat_id)
+            .context("current root-provision checkpoint lacks AuthorizedBlockd lineage")?;
+        anyhow::ensure!(
+            blockd.binding == DesiredCheckpointBinding::Current,
+            "current root-provision checkpoint has superseded AuthorizedBlockd lineage"
+        );
+        validate_scanned_checkpoint(
+            desired,
+            &checkpoint.checkpoint,
+            checkpoint.binding,
+            Some(blockd),
+            checkpoint_directory,
+            blob,
+            context.deadline(),
+        )?;
+        let attachment = blockd.checkpoint.attachment.clone();
+        let volume = volumes_by_cat
+            .get(&desired.cat_id)
+            .and_then(|volumes| {
+                volumes
+                    .iter()
+                    .find(|volume| volume.record.volume_id == attachment.identity.volume_id)
+            })
+            .context("root-provision process lacks its raw authority VolumeRecord")?;
+        let expectation = RootProvisionProcessExpectation::from_checkpoint(
+            &checkpoint.checkpoint,
+            RootProvisionAuthoritySnapshot {
+                attachment,
+                volume: &volume.record,
+            },
+            executable_path.clone(),
+        )?;
+        anyhow::ensure!(
+            expected
+                .insert(desired.cat_id.clone(), expectation)
+                .is_none(),
+            "root-provision process expectation duplicated one Cat"
+        );
+    }
+    Ok(expected)
+}
+
 struct InventoryProjectionContext<'a> {
     checkpoint_directory: &'a std::path::Path,
     blob: Option<&'a dyn BlobStore>,
@@ -321,6 +534,7 @@ fn runtime_from_inventory(
     mut volume_evidence: Vec<AuthorityVolumeInventoryEvidence>,
     checkpoint: Option<RuntimeCheckpointInventoryEvidence>,
     blockd: Option<AuthorizedBlockdInventoryEvidence>,
+    process: Option<ExactRootProvisionProcessProof>,
 ) -> anyhow::Result<ObservedRuntimeStatus> {
     let checkpoint_path = runtime_checkpoint_path(projection.checkpoint_directory, &desired.cat_id);
     let checkpoint_path = HostPath::new(
@@ -541,7 +755,10 @@ fn runtime_from_inventory(
         stable_state,
         step: step.clone(),
         checkpoint: checkpoint_evidence,
-        processes: Vec::new(),
+        processes: process
+            .map(ExactRootProvisionProcessProof::into_process_evidence)
+            .into_iter()
+            .collect(),
         volumes,
         mounts: Vec::new(),
         networks: Vec::new(),
