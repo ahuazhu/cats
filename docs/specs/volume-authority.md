@@ -305,7 +305,10 @@ schema v11提供两个partial ordered B-tree：projection arm
 `((owner_binding->>'owner_node_id'), volume_id COLLATE "C") WHERE owner_binding IS NOT NULL`。Runtime
 inventory在一个read-only Repeatable Read事务中以两臂各自bounded查询并严格解码，最多返回`65536`
 条；第`65537`条、双向漂移、重复或backend不确定都拒绝，不能截断成complete。这个provider-neutral
-enumeration port只供signed Runtime scanner；blockd的`VolumeDataAuthority`仍只能读取自己的exact grant，
+enumeration port还接收该次Desired read-position固定的完整volume candidate ID集合，并在同一事务中通过
+`volume_records`主键把candidate行并入Node-owned两臂的去重结果；candidate缺失或总union越界由Node
+scanner拒绝，不能另开point-read事务拼出complete。该port只供signed Runtime scanner；blockd的
+`VolumeDataAuthority`仍只能读取自己的exact grant，
 不得枚举Node或fleet ownership。
 
 `RemoteHead`只有两种合法形态：`generation == 0`当且仅当`root_hash`和`root_object_id`都为`null`；

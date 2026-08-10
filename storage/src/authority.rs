@@ -4,6 +4,8 @@
 //! responsible for locking and validating Control rows before applying the
 //! returned replacement rows in the same transaction.
 
+use std::collections::BTreeSet;
+
 pub use cats_api::runtime_reconciliation::{
     AcquireOrigin, AsciiText, AuthorizationConsumedReceipt, AuthorizationRecord,
     AuthorizationState, BeginDeleteRequest, BeginDeleteResult,
@@ -144,16 +146,23 @@ pub struct VolumeOwnerBinding {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct NodeOwnedVolume {
-    pub binding: VolumeOwnerBinding,
+pub struct NodeVolumeInventoryRecord {
+    /// `None` is valid only for an explicitly read Unowned candidate. Owned
+    /// rows always carry the exact canonical Node attribution, including when
+    /// that owner is another Node and the caller must fail closed.
+    pub binding: Option<VolumeOwnerBinding>,
     pub volume: VolumeRecord,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct NodeOwnedVolumeSnapshot {
+pub struct NodeVolumeInventorySnapshot {
     pub node_id: Id,
     pub read_at_unix_ms: UnixMillis,
-    pub volumes: Vec<NodeOwnedVolume>,
+    /// Sorted union of every requested Desired candidate and every authority
+    /// row currently attributed to `node_id`, read in one repeatable-read
+    /// transaction. A missing requested candidate is represented by absence
+    /// from this vector so the scanner can reject the incomplete set.
+    pub records: Vec<NodeVolumeInventoryRecord>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -302,10 +311,16 @@ pub trait VolumeDataAuthority: Send + Sync {
 /// `VolumeDataAuthority`: a data plane can inspect only its exact grant and
 /// must never enumerate fleet ownership.
 pub trait RuntimeVolumeInventoryAuthority: Send + Sync {
-    /// Returns one repeatable-read, bounded, complete set of Volume rows whose
-    /// canonical owner binding names `node_id`. Projection/canonical drift,
-    /// duplicate rows, overflow, or backend uncertainty are closed errors.
-    fn load_node_owned_volumes(&self, node_id: &Id) -> Result<NodeOwnedVolumeSnapshot>;
+    /// Returns one repeatable-read, bounded union of all `candidate_volume_ids`
+    /// and all Volume rows whose canonical owner binding names `node_id`.
+    /// Projection/canonical drift, duplicate rows, overflow, or backend
+    /// uncertainty are closed errors. The caller must additionally reject a
+    /// requested candidate that is absent from the returned union.
+    fn load_node_volume_inventory(
+        &self,
+        node_id: &Id,
+        candidate_volume_ids: &BTreeSet<Id>,
+    ) -> Result<NodeVolumeInventorySnapshot>;
 }
 
 pub fn validate_volume_owner_binding(

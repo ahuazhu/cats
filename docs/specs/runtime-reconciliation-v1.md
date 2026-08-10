@@ -807,6 +807,7 @@ MetadataStore来源不能只按Desired逐卷point-read后宣称complete。scanne
 read-position及其完整volume候选集，再读取[Volume Authority §3](volume-authority.md#3-postgresql-authority-模型)
 的Node-owned bounded snapshot：同一Repeatable Read snapshot返回所有持久`owner_node_id`等于该Node的
 authority rows，最多`65536`条，并在Node内存中与候选全集合并、分页给同一次scan。owner属于其他Node、
+同一RR事务也必须按主键读取该完整candidate集合并返回去重union；不得在snapshot前后另做point read。
 candidate缺失、unknown extra、cursor/read-position变化、乱序/重复、projection/canonical漂移、overflow或backend错误都使
 `metadata_store`为Unavailable，不能把point-read成功或空候选误报为complete。只有读到显式final empty page且
 全集闭合，才可证明该Node的MetadataStore来源完成。

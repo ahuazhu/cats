@@ -2,9 +2,9 @@
 //!
 //! The legacy [`crate::server`] remains available to the pre-cutover test
 //! suite, but the shipped Node binary starts here. The first production
-//! scanner covers the physical clean-slate sources, but MetadataStore remains
-//! unavailable until Volume authority persists a pageable owner-Node index;
-//! no production full inventory is claimed from point reads. The typed network
+//! scanner covers the physical clean-slate sources, including the bounded
+//! owner-Node Volume authority snapshot; no production full inventory is
+//! claimed from point reads. The typed network
 //! effect is composed only after an accepted full inventory, and its launch
 //! port remains fail-closed until the signed VMM/volume reconciler lands. This
 //! path does not construct `NodeRuntime`, adopt a legacy ledger, or run a
@@ -19,7 +19,7 @@ use axum::extract::State;
 use axum::http::StatusCode;
 use axum::routing::get;
 use axum::Router;
-use cats_storage::authority::VolumeDataAuthority;
+use cats_storage::authority::{RuntimeVolumeInventoryAuthority, VolumeDataAuthority};
 
 use crate::agent_registration::AgentRegistrationConfig;
 use crate::ch::{ChConfig, ChNetwork};
@@ -63,6 +63,9 @@ pub struct SignedRuntimeCutoverConfig {
     /// not adapted into a metadata inventory proof: `load_volume` cannot list
     /// authority-only writers or bind them to this Node.
     pub volume_data_authority: Arc<dyn VolumeDataAuthority>,
+    /// Enumeration-only authority used by the full inventory scanner. It is
+    /// separate from blockd's exact-grant data-plane port.
+    pub volume_inventory_authority: Arc<dyn RuntimeVolumeInventoryAuthority>,
     pub deadline_policy: RuntimeSpineDeadlinePolicy,
 }
 
@@ -234,6 +237,7 @@ pub async fn spawn_signed_runtime_cutover(
         blockd_binary: config.blockd_binary,
         guest_agent_binary: config.guest_agent_binary,
         metering_cgroup_root: config.metering_cgroup_root,
+        volume_inventory_authority: config.volume_inventory_authority,
     })
     .context("compose installed clean-slate inventory probes")?;
     let effect =
@@ -403,8 +407,8 @@ mod tests {
         NodeIdentity, NodeIdentityState, Sha256Digest, UnixMillis, DESIRED_READ_PATH,
     };
     use cats_storage::authority::{
-        AuthorityError, RenewLeaseRequest, RenewLeaseResult, VolumeHeadCasRequest,
-        VolumeHeadCasResult, VolumeRecord,
+        AuthorityError, NodeVolumeInventorySnapshot, RenewLeaseRequest, RenewLeaseResult,
+        VolumeHeadCasRequest, VolumeHeadCasResult, VolumeRecord,
     };
 
     struct TestUnavailableVolumeDataAuthority;
@@ -425,6 +429,16 @@ mod tests {
             &self,
             _request: &VolumeHeadCasRequest,
         ) -> Result<VolumeHeadCasResult, AuthorityError> {
+            Err(AuthorityError::BackendUnknown)
+        }
+    }
+
+    impl RuntimeVolumeInventoryAuthority for TestUnavailableVolumeDataAuthority {
+        fn load_node_volume_inventory(
+            &self,
+            _node_id: &Id,
+            _candidate_volume_ids: &std::collections::BTreeSet<Id>,
+        ) -> Result<NodeVolumeInventorySnapshot, AuthorityError> {
             Err(AuthorityError::BackendUnknown)
         }
     }
@@ -597,6 +611,7 @@ mod tests {
             guest_agent_binary: "/opt/cats/bin/cats-guest-agent".into(),
             metering_cgroup_root: None,
             volume_data_authority: Arc::new(TestUnavailableVolumeDataAuthority),
+            volume_inventory_authority: Arc::new(TestUnavailableVolumeDataAuthority),
             deadline_policy: RuntimeSpineDeadlinePolicy::new(
                 Duration::from_secs(5),
                 Duration::from_secs(30),
@@ -665,6 +680,7 @@ mod tests {
             guest_agent_binary: "/opt/cats/bin/cats-guest-agent".into(),
             metering_cgroup_root: None,
             volume_data_authority: Arc::new(TestUnavailableVolumeDataAuthority),
+            volume_inventory_authority: Arc::new(TestUnavailableVolumeDataAuthority),
             deadline_policy: RuntimeSpineDeadlinePolicy::new(Duration::MAX, Duration::from_secs(1))
                 .unwrap(),
         })

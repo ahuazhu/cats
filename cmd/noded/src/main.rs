@@ -1,4 +1,5 @@
 use std::path::PathBuf;
+use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::Context;
@@ -145,9 +146,14 @@ async fn main() -> anyhow::Result<()> {
     );
     let metadata_config =
         AdapterConfig::from_cli(args.metadata_store_options).context("metadata adapter options")?;
-    let volume_data_authority =
-        cats_metadata_store_postgres::PostgresVolumeDataAuthority::open(&metadata_config)
-            .context("open PostgreSQL VolumeDataAuthority")?;
+    let volume_authority =
+        cats_metadata_store_postgres::PostgresVolumeDataAuthority::open_runtime(&metadata_config)
+            .context("open PostgreSQL Runtime Volume authorities")?;
+    let volume_data_authority: Arc<dyn cats_storage::authority::VolumeDataAuthority> =
+        volume_authority.clone();
+    let volume_inventory_authority: Arc<
+        dyn cats_storage::authority::RuntimeVolumeInventoryAuthority,
+    > = volume_authority;
     let agent_registration =
         cats_node_agent::agent_registration::AgentRegistrationConfig::load_installed(
             installed_receipt.receipt(),
@@ -166,6 +172,7 @@ async fn main() -> anyhow::Result<()> {
         guest_agent_binary: args.guest_agent_bin,
         metering_cgroup_root: args.metering_cgroup_root,
         volume_data_authority,
+        volume_inventory_authority,
         deadline_policy,
     })
     .await?;
@@ -237,7 +244,7 @@ mod tests {
     fn production_entrypoint_cannot_start_the_legacy_node_runtime() {
         let source = include_str!("main.rs");
         assert!(source.contains("spawn_signed_runtime_cutover"));
-        assert!(source.contains("PostgresVolumeDataAuthority::open"));
+        assert!(source.contains("PostgresVolumeDataAuthority::open_runtime"));
         let legacy_spawn = ["server", "::{", "spawn"].concat();
         let legacy_runtime = ["Node", "Runtime", "::", "new"].concat();
         assert!(!source.contains(&legacy_spawn));
