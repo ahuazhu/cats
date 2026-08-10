@@ -67,6 +67,7 @@ use super::inventory::{
     AuthorizedBlockdInventoryEvidence, DesiredCheckpointBinding,
     RuntimeCheckpointInventoryEvidence,
 };
+use super::kernel_nbd::{KernelNbdInventoryConfig, KernelNbdInventoryPort};
 use super::network::NetworkAllocationPort;
 use super::root_provision_process::inspect_exact_root_provision_process;
 use super::root_provision_process::StopReceiptSocketAdmission;
@@ -926,6 +927,7 @@ pub(crate) struct InstalledCleanSlateProbeConfig {
     pub blockd_binary: PathBuf,
     pub guest_agent_binary: PathBuf,
     pub ip_binary: PathBuf,
+    pub kernel_nbd_inventory: Option<KernelNbdInventoryConfig>,
     pub metering_cgroup_root: Option<PathBuf>,
     pub volume_inventory_authority: Arc<dyn RuntimeVolumeInventoryAuthority>,
     pub blob_store: Arc<dyn BlobStore>,
@@ -941,6 +943,7 @@ impl std::fmt::Debug for InstalledCleanSlateProbeConfig {
             .field("blockd_binary", &self.blockd_binary)
             .field("guest_agent_binary", &self.guest_agent_binary)
             .field("ip_binary", &self.ip_binary)
+            .field("kernel_nbd_inventory", &self.kernel_nbd_inventory)
             .field("metering_cgroup_root", &self.metering_cgroup_root)
             .field(
                 "volume_inventory_authority",
@@ -970,6 +973,7 @@ struct ProbeConfig {
     serving_process_port: Option<Arc<dyn ServingBlockdProcessPort>>,
     root_provision_systemd: Option<RootProvisionSystemdConfig>,
     network_allocation_port: Option<NetworkAllocationPort>,
+    kernel_nbd_inventory_port: Option<KernelNbdInventoryPort>,
 }
 
 impl ProbeConfig {
@@ -987,6 +991,12 @@ impl ProbeConfig {
             );
         }
         let checkpoint_directory = config.state_directory.path().join(CHECKPOINT_NAMESPACE);
+        if let Some(kernel_nbd) = &config.kernel_nbd_inventory {
+            anyhow::ensure!(
+                kernel_nbd.state_directory().path() == config.state_directory.path(),
+                "installed kernel-NBD scanner uses another StateDirectory"
+            );
+        }
         Ok(Self {
             state_directory: config.state_directory.clone(),
             checkpoint_directory,
@@ -1012,6 +1022,7 @@ impl ProbeConfig {
                 config.state_directory,
                 config.ip_binary,
             )?),
+            kernel_nbd_inventory_port: config.kernel_nbd_inventory.map(KernelNbdInventoryPort::new),
         })
     }
 }
@@ -1133,6 +1144,7 @@ fn clean_slate_scanner_with_metadata_for_test(
             serving_process_port: None,
             root_provision_systemd: None,
             network_allocation_port: None,
+            kernel_nbd_inventory_port: None,
         },
         metadata_authority,
         blob_store,
@@ -1158,6 +1170,7 @@ fn scanner_with_metadata_authority_and_blob(
     blob_store: Option<Arc<dyn BlobStore>>,
 ) -> anyhow::Result<CleanSlateInventoryScanner> {
     let network_bridge = config.network_allocation_port.clone();
+    let kernel_nbd_port = config.kernel_nbd_inventory_port.clone();
     let state = config.state_directory.clone();
     let process_paths = ProcessPaths {
         root: config.proc_root.clone(),
@@ -1194,6 +1207,9 @@ fn scanner_with_metadata_authority_and_blob(
             block_class_root: config.block_class_root.clone(),
             legacy_socket_root: config.legacy_socket_root.clone(),
             supported: config.linux_sources_supported,
+            managed_kernel_nbd_device_count: kernel_nbd_port
+                .as_ref()
+                .map(KernelNbdInventoryPort::device_count),
             limits: config.limits,
         }),
         Arc::new(NetworkProbe {
@@ -1256,8 +1272,12 @@ fn scanner_with_metadata_authority_and_blob(
         None => CleanSlateInventoryScanner::new(config.checkpoint_directory, probes),
     }
     .map_err(anyhow::Error::from)?;
-    Ok(match network_bridge {
+    let scanner = match network_bridge {
         Some(bridge) => scanner.with_network_bridge(Arc::new(bridge)),
+        None => scanner,
+    };
+    Ok(match kernel_nbd_port {
+        Some(port) => scanner.with_kernel_nbd_pool(port),
         None => scanner,
     })
 }
@@ -3557,6 +3577,7 @@ struct BlockFrontendProbe {
     block_class_root: PathBuf,
     legacy_socket_root: PathBuf,
     supported: bool,
+    managed_kernel_nbd_device_count: Option<u32>,
     limits: ProbeLimits,
 }
 
@@ -3575,7 +3596,12 @@ impl InventoryAbsenceProbe for BlockFrontendProbe {
             return Ok(InventoryAbsence::Unavailable);
         };
         let nbd = if self.supported {
-            scan_nbd(&self.block_class_root, self.limits.os_entries, context)?
+            scan_nbd(
+                &self.block_class_root,
+                self.limits.os_entries,
+                self.managed_kernel_nbd_device_count,
+                context,
+            )?
         } else {
             ProbeFact::Unavailable
         };
@@ -5352,6 +5378,7 @@ fn read_bounded_optional(
 fn scan_nbd(
     root: &Path,
     cap: usize,
+    managed_device_count: Option<u32>,
     context: &RuntimeInventoryScanContext,
 ) -> anyhow::Result<ProbeFact> {
     let Some(entries) = required_directory_entries(root)? else {
@@ -5369,6 +5396,17 @@ fn scan_nbd(
         anyhow::ensure!(count <= cap, "block class exceeds entry cap {cap}");
         let name = entry.file_name();
         if !is_nbd_name(&name) {
+            continue;
+        }
+        let index = std::str::from_utf8(&name.as_bytes()[3..])
+            .ok()
+            .and_then(|value| value.parse::<u32>().ok())
+            .context("kernel-NBD sysfs entry index is not a u32")?;
+        if managed_device_count.is_some_and(|count| index < count) {
+            // The allocation-flock-protected kernel pool bridge inspects this
+            // configured slot and joins it to the complete checkpoint
+            // namespace. This generic residue probe owns only slots outside
+            // that closed pool.
             continue;
         }
         let pid = read_kernel_u64(&entry.path().join("pid"), context)?;
@@ -6169,6 +6207,7 @@ mod tests {
                 serving_process_port: None,
                 root_provision_systemd: None,
                 network_allocation_port: None,
+                kernel_nbd_inventory_port: None,
             }
         }
     }
@@ -8262,6 +8301,7 @@ mod tests {
                 block_class_root: environment.block_root.clone(),
                 legacy_socket_root: environment.socket_root.clone(),
                 supported: false,
+                managed_kernel_nbd_device_count: None,
                 limits,
             }),
             Box::new(NetworkProbe {
@@ -8468,7 +8508,7 @@ mod tests {
             }
             std::fs::write(nbd.join("size"), size).unwrap();
             assert_eq!(
-                scan_nbd(&environment.block_root, 16, &context()).unwrap(),
+                scan_nbd(&environment.block_root, 16, None, &context()).unwrap(),
                 expected
             );
         }
@@ -8477,7 +8517,7 @@ mod tests {
         let nbd = environment.block_root.join("nbd0");
         std::fs::create_dir(&nbd).unwrap();
         std::fs::write(nbd.join("size"), "not-a-number").unwrap();
-        assert!(scan_nbd(&environment.block_root, 16, &context()).is_err());
+        assert!(scan_nbd(&environment.block_root, 16, None, &context()).is_err());
     }
 
     #[test]
@@ -8490,6 +8530,7 @@ mod tests {
             blockd_binary: environment.blockd_binary.clone(),
             guest_agent_binary: environment.guest_binary.clone(),
             ip_binary: PathBuf::from("/sbin/ip"),
+            kernel_nbd_inventory: None,
             metering_cgroup_root: None,
             volume_inventory_authority: Arc::new(TestUnavailableRuntimeVolumeInventoryAuthority),
             blob_store: Arc::new(TestUnavailableBlobStore),

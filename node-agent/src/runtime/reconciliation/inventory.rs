@@ -37,6 +37,7 @@ use crate::runtime_spine::{
 };
 
 use super::{
+    kernel_nbd::{KernelNbdInventoryPort, KernelNbdPoolScanOutcome},
     network::{prepare_device_checkpoint_view, NodeGlobalNetworkScanAdmission},
     root_provision_process::{
         NodeGlobalManagedProcessScanAdmission, RetainedRootProvisionProcessAttempt,
@@ -272,6 +273,7 @@ pub struct CleanSlateInventoryScanner {
     blob: Option<Arc<dyn BlobStore>>,
     root_process_bridge: Option<Arc<dyn RootProcessInventoryBridge>>,
     network_bridge: Option<Arc<dyn NetworkInventoryBridge>>,
+    kernel_nbd_port: Option<KernelNbdInventoryPort>,
     key_ring_reader: Option<Arc<dyn RuntimeInventoryKeyRingReader>>,
 }
 
@@ -317,6 +319,7 @@ impl CleanSlateInventoryScanner {
             blob: None,
             root_process_bridge: None,
             network_bridge: None,
+            kernel_nbd_port: None,
             key_ring_reader: None,
         })
     }
@@ -352,6 +355,11 @@ impl CleanSlateInventoryScanner {
 
     pub(crate) fn with_network_bridge(mut self, bridge: Arc<dyn NetworkInventoryBridge>) -> Self {
         self.network_bridge = Some(bridge);
+        self
+    }
+
+    pub(crate) fn with_kernel_nbd_pool(mut self, port: KernelNbdInventoryPort) -> Self {
+        self.kernel_nbd_port = Some(port);
         self
     }
 }
@@ -448,6 +456,7 @@ impl RuntimeInventoryScanner for CleanSlateInventoryScanner {
         let mut networks_by_cat = BTreeMap::new();
         let mut node_global_process_admission = None;
         let mut node_global_network_admission = None;
+        let mut kernel_nbd_pool_admission = None;
         if let Some(bridge) = &self.root_process_bridge {
             // The process expectation cannot be derived until all three data
             // authorities have completed. Read each prerequisite exactly
@@ -521,6 +530,32 @@ impl RuntimeInventoryScanner for CleanSlateInventoryScanner {
             context
                 .remaining()
                 .context("root-process inventory bridge deadline expired after inspection")?;
+            if let Some(kernel_nbd) = &self.kernel_nbd_port {
+                let managed_processes = node_global_process_admission.as_ref().context(
+                    "kernel-NBD pool scan lacks its same-pass managed-process admission",
+                )?;
+                match kernel_nbd.scan_complete_pool(&context, managed_processes)? {
+                    KernelNbdPoolScanOutcome::Complete(admission) => {
+                        if admission.has_unavailable_device() {
+                            aggregate
+                                .unavailable_sources
+                                .push(InventorySource::BlockFrontend);
+                        }
+                        for (cat_id, projection) in admission.device_projections() {
+                            anyhow::ensure!(
+                                serving_devices_by_cat.insert(cat_id, projection).is_none(),
+                                "managed frontend scan projects two devices for one V1 Cat"
+                            );
+                        }
+                        kernel_nbd_pool_admission = Some(admission);
+                    }
+                    KernelNbdPoolScanOutcome::Unavailable => {
+                        aggregate
+                            .unavailable_sources
+                            .push(InventorySource::BlockFrontend);
+                    }
+                }
+            }
             if processes_by_cat.keys().any(|cat_id| {
                 !matches!(
                     aggregate
@@ -661,7 +696,8 @@ impl RuntimeInventoryScanner for CleanSlateInventoryScanner {
                 Vec::new(),
             )
             .with_node_global_process_admission(node_global_process_admission)
-            .with_node_global_network_admission(node_global_network_admission),
+            .with_node_global_network_admission(node_global_network_admission)
+            .with_kernel_nbd_pool_admission(kernel_nbd_pool_admission),
         ))
     }
 }

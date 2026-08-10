@@ -32,9 +32,10 @@ use crate::ch::{BlockPath, ChConfig};
 use crate::runtime::reconciliation::{
     installed_clean_slate_scanner, installed_root_process_effect_ports,
     AuthorizedBlockdLaunchConfig, ControlSignedNormalAcquireClient, InstalledCleanSlateProbeConfig,
-    RootProvisionSystemdConfig, RuntimeVolumeTransitionHttpClient, ServingPrepareFrontend,
-    SignedRunningAcquireEffect, SignedRunningEffect, SignedRunningHostConfig,
-    SignedRunningProcessPorts, SignedRunningPublicationRecovery,
+    KernelNbdClientCleanupOwner, KernelNbdInventoryConfig, RootProvisionSystemdConfig,
+    RuntimeVolumeTransitionHttpClient, ServingPrepareFrontend, SignedRunningAcquireEffect,
+    SignedRunningEffect, SignedRunningHostConfig, SignedRunningProcessPorts,
+    SignedRunningPublicationRecovery,
 };
 use crate::runtime_spine::{
     RuntimeInventoryScanner, RuntimeSpineDeadlinePolicy, RuntimeSpineHttpClient,
@@ -218,12 +219,28 @@ async fn spawn_signed_runtime_cutover_with_scanner(
         RootProvisionSystemdConfig::new(config.authorized_blockd_launch.clone())
             .context("compose credentialless root-provision systemd process owner")?;
     let effect_root_provision_systemd = root_provision_systemd.clone();
+    #[cfg(target_os = "linux")]
+    let kernel_nbd_inventory = match config.ch_config.block_path {
+        BlockPath::KernelNbd => Some(
+            KernelNbdInventoryConfig::installed(
+                config.agent_registration.runtime_state_directory(),
+                config.ch_config.nbd_client_bin.clone(),
+                config.ch_config.nbd_devices,
+            )
+            .context("compose installed kernel-NBD inventory")?,
+        ),
+        BlockPath::VhostUser => None,
+    };
+    #[cfg(not(target_os = "linux"))]
+    let kernel_nbd_inventory: Option<KernelNbdInventoryConfig> = None;
+    let kernel_nbd_cleanup_owner = Arc::new(KernelNbdClientCleanupOwner::new());
     let installed_probe_config = InstalledCleanSlateProbeConfig {
         state_directory: config.agent_registration.runtime_state_directory(),
         cloud_hypervisor_binary: config.ch_config.ch_bin.clone(),
         blockd_binary: config.authorized_blockd_launch.blockd_binary.clone(),
         guest_agent_binary: config.guest_agent_binary.clone(),
         ip_binary: config.ch_config.ip_bin.clone(),
+        kernel_nbd_inventory: kernel_nbd_inventory.clone(),
         metering_cgroup_root: config.metering_cgroup_root.clone(),
         volume_inventory_authority: Arc::clone(&config.volume_inventory_authority),
         blob_store: Arc::clone(&config.blob_store),
@@ -233,13 +250,27 @@ async fn spawn_signed_runtime_cutover_with_scanner(
         installed_root_process_effect_ports(installed_probe_config.clone())
             .context("compose sealed root-process effect inventory")?;
     let effect_prepare_frontend = match config.ch_config.block_path {
-        BlockPath::KernelNbd => ServingPrepareFrontend::kernel_nbd(
-            config.agent_registration.runtime_state_directory(),
-            config.ch_config.nbd_client_bin.clone(),
-            config.ch_config.nbd_devices,
-            config.ch_config.block_direct,
-        )
-        .context("compose kernel-NBD PrepareDevice reservation")?,
+        BlockPath::KernelNbd => {
+            #[cfg(target_os = "linux")]
+            {
+                ServingPrepareFrontend::kernel_nbd_from_inventory(
+                    kernel_nbd_inventory
+                        .clone()
+                        .context("kernel-NBD frontend lacks installed inventory config")?,
+                    config.ch_config.block_direct,
+                )
+            }
+            #[cfg(not(target_os = "linux"))]
+            {
+                ServingPrepareFrontend::kernel_nbd(
+                    config.agent_registration.runtime_state_directory(),
+                    config.ch_config.nbd_client_bin.clone(),
+                    config.ch_config.nbd_devices,
+                    config.ch_config.block_direct,
+                )
+                .context("compose kernel-NBD PrepareDevice reservation")?
+            }
+        }
         BlockPath::VhostUser => ServingPrepareFrontend::vhost_user_blk(
             config.ch_config.vhost_user_queues,
             config.ch_config.vhost_user_queue_size,
@@ -280,6 +311,8 @@ async fn spawn_signed_runtime_cutover_with_scanner(
     let effect_lease_duration_ms = config.volume_lease_duration_ms;
     let effect_state_directory = config.agent_registration.runtime_state_directory();
     let effect_network_ip_binary = config.ch_config.ip_bin.clone();
+    let effect_kernel_nbd_inventory = kernel_nbd_inventory;
+    let effect_kernel_nbd_cleanup_owner = Arc::clone(&kernel_nbd_cleanup_owner);
     let runner = tokio::task::spawn_blocking(move || {
         #[cfg(not(test))]
         let volume_transition_transport = RuntimeVolumeTransitionHttpClient::for_production(
@@ -316,6 +349,8 @@ async fn spawn_signed_runtime_cutover_with_scanner(
                 effect_root_provision_systemd,
                 effect_state_directory.clone(),
                 effect_network_ip_binary,
+                effect_kernel_nbd_inventory,
+                Arc::clone(&effect_kernel_nbd_cleanup_owner),
             ),
             SignedRunningProcessPorts::new(
                 Arc::clone(&effect_root_process_ports.retirement),
@@ -326,13 +361,14 @@ async fn spawn_signed_runtime_cutover_with_scanner(
         )
         .context("compose signed Running root provision prefix")?;
         let recovery = SignedRunningPublicationRecovery::new(Arc::clone(&effect_volume_authority));
-        RuntimeSpineRunner::new_with_recovery_and_desired_effects(
+        RuntimeSpineRunner::new_with_recovery_desired_effects_and_resource_owner(
             effect_state_directory,
             session,
             client,
             scanner,
             Arc::new(recovery),
             Arc::new(effect),
+            effect_kernel_nbd_cleanup_owner,
         )
         .map_err(anyhow::Error::from)
     })

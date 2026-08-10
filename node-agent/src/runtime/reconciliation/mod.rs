@@ -21,13 +21,14 @@ mod clean_slate_probes;
 mod gate_planner;
 mod inventory;
 // Kernel NBD is the default ADR-0015 frontend and is a Host-global resource.
-// Its reservation permit is consumed by the production PrepareDevice CAS;
-// the sealed attach/listener/cleanup foundation intentionally lands before
-// the follow-up inventory and dispatcher composition. Keep the exception on
-// this one private provider module so that composition can remove it whole.
-#[expect(
-    dead_code,
-    reason = "sealed kernel-NBD attach provider is staged before production composition"
+// Keep its provider-private scan, attach and cleanup capabilities behind this
+// module; production composition receives only the sealed admissions below.
+#[cfg_attr(
+    not(target_os = "linux"),
+    allow(
+        dead_code,
+        reason = "installed kernel-NBD reservation and attach compile only on Linux"
+    )
 )]
 mod kernel_nbd;
 mod network;
@@ -95,6 +96,10 @@ pub use gate_planner::{
 };
 pub use inventory::{
     CleanSlateInventoryScanner, InventoryAbsence, InventoryAbsenceProbe, InventoryProbeSetError,
+};
+pub(crate) use kernel_nbd::{
+    KernelNbdClientCleanupOwner, KernelNbdInventoryConfig, KernelNbdPoolAdmission,
+    KernelNbdPoolScanAdmission,
 };
 pub(crate) use network::{NodeGlobalNetworkAdmission, NodeGlobalNetworkScanAdmission};
 pub use normal_acquire::{

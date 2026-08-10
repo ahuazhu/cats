@@ -96,15 +96,23 @@ impl ServingPrepareFrontend {
                 nbd_client_binary,
                 device_count,
             )?;
-            Ok(Self::KernelNbd {
-                port: KernelNbdInventoryPort::new(config),
-                direct,
-            })
+            Ok(Self::kernel_nbd_from_inventory(config, direct))
         }
         #[cfg(not(target_os = "linux"))]
         {
             let _ = (state_directory, nbd_client_binary, device_count, direct);
             Ok(Self::KernelNbdUnsupported)
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    pub(crate) fn kernel_nbd_from_inventory(
+        config: KernelNbdInventoryConfig,
+        direct: bool,
+    ) -> Self {
+        Self::KernelNbd {
+            port: KernelNbdInventoryPort::new(config),
+            direct,
         }
     }
 

@@ -36,6 +36,9 @@ use super::authorized_blockd::{
     StopReceiptSettlement,
 };
 use super::clean_slate_probes::CHECKPOINT_NAMESPACE;
+use super::kernel_nbd::{
+    KernelNbdAttachEffect, KernelNbdClientCleanupOwner, KernelNbdInventoryConfig,
+};
 use super::network::PrepareNetworkReservationEffect;
 use super::prepare_device_retirement::PrepareDeviceTargetRetirementEffect;
 use super::root_provision_process::{
@@ -139,6 +142,7 @@ pub(crate) struct SignedRunningEffect {
     prepare_device: ServingPrepareDeviceEffect,
     prepare_device_retirement: Option<PrepareDeviceTargetRetirementEffect>,
     serving_process: Option<ServingBlockdStartEffect>,
+    kernel_nbd_attach: Option<KernelNbdAttachEffect>,
     prepare_network: Option<PrepareNetworkReservationEffect>,
 }
 
@@ -152,6 +156,8 @@ pub(crate) struct SignedRunningHostConfig {
     systemd: RootProvisionSystemdConfig,
     state_directory: StateDirectory,
     network_ip_binary: PathBuf,
+    kernel_nbd_inventory: Option<KernelNbdInventoryConfig>,
+    kernel_nbd_cleanup_owner: Arc<KernelNbdClientCleanupOwner>,
 }
 
 impl SignedRunningHostConfig {
@@ -159,11 +165,15 @@ impl SignedRunningHostConfig {
         systemd: RootProvisionSystemdConfig,
         state_directory: StateDirectory,
         network_ip_binary: PathBuf,
+        kernel_nbd_inventory: Option<KernelNbdInventoryConfig>,
+        kernel_nbd_cleanup_owner: Arc<KernelNbdClientCleanupOwner>,
     ) -> Self {
         Self {
             systemd,
             state_directory,
             network_ip_binary,
+            kernel_nbd_inventory,
+            kernel_nbd_cleanup_owner,
         }
     }
 }
@@ -195,6 +205,8 @@ impl SignedRunningEffect {
             systemd,
             state_directory,
             network_ip_binary,
+            kernel_nbd_inventory,
+            kernel_nbd_cleanup_owner,
         } = host;
         let executable = systemd
             .blockd_binary()
@@ -215,6 +227,13 @@ impl SignedRunningEffect {
             systemd.clone(),
             Arc::clone(&process_ports.serving_global),
         );
+        let kernel_nbd_attach = kernel_nbd_inventory.map(|config| {
+            KernelNbdAttachEffect::platform(
+                Arc::clone(&authority),
+                config,
+                kernel_nbd_cleanup_owner,
+            )
+        });
         Ok(Self {
             acquire,
             provision: SignedRootProvisionEffect::platform(
@@ -233,6 +252,7 @@ impl SignedRunningEffect {
             prepare_device: ServingPrepareDeviceEffect::new(prepare_frontend, executable_path)?,
             prepare_device_retirement: Some(prepare_device_retirement),
             serving_process: Some(serving_process_effect),
+            kernel_nbd_attach,
             prepare_network: Some(PrepareNetworkReservationEffect::new(
                 state_directory,
                 network_ip_binary,
@@ -256,6 +276,13 @@ impl RuntimeDesiredEffect for SignedRunningEffect {
         }
         if let Some(serving_process) = &self.serving_process {
             if let Some(outcome) = serving_process.try_apply(&context, desired)? {
+                return Ok(outcome);
+            }
+        }
+        if let Some(kernel_nbd_attach) = &self.kernel_nbd_attach {
+            if let Some(outcome) =
+                kernel_nbd_attach.try_apply(&context, desired, context.kernel_nbd_pool()?)?
+            {
                 return Ok(outcome);
             }
         }
@@ -2292,6 +2319,7 @@ mod tests {
                 prepare_device,
                 prepare_device_retirement: None,
                 serving_process: None,
+                kernel_nbd_attach: None,
                 prepare_network: None,
             }
         }

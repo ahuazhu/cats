@@ -160,6 +160,9 @@ pub(crate) enum KernelNbdSlotState {
     Leaked {
         recorded_process_id: Option<u32>,
     },
+    /// This bounded sample could not distinguish free, serving or leaked.
+    /// It is never allocatable and never authorizes a public projection.
+    Unavailable,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -448,16 +451,26 @@ impl ExactKernelNbdDeviceProof {
         )
     }
 
-    fn listener(&self) -> &ServingBlockdListenerProof {
+    pub(crate) fn listener(&self) -> &ServingBlockdListenerProof {
         &self.listener
     }
 }
 
 impl KernelNbdDeviceExpectation {
     fn assert_serving_listener(&self, listener: &ServingBlockdListenerProof) -> Result<()> {
+        let size_bytes = self
+            .expected_size_sectors
+            .get()
+            .checked_mul(512)
+            .context("persisted kernel-NBD sector capacity overflows bytes")?;
         anyhow::ensure!(
-            listener.expectation().cat_id() == &self.cat_id
-                && listener.listener_path() == &self.listener_socket_path
+            listener.expectation().matches_device_contract(
+                &self.cat_id,
+                &self.volume_id,
+                &self.attachment_id,
+                self.attachment_epoch,
+                size_bytes,
+            ) && listener.listener_path() == &self.listener_socket_path
                 && listener.process_identity_token() == &self.serving_process_identity_token
                 && listener.device_ownership_token() == &self.ownership_token
                 && listener.expectation().frontend()
@@ -524,6 +537,12 @@ pub(crate) struct KernelNbdPoolAdmission {
 }
 
 impl KernelNbdPoolScanAdmission {
+    pub(crate) fn has_unavailable_device(&self) -> bool {
+        self.devices_by_cat
+            .values()
+            .any(|state| matches!(state, KernelNbdDeviceScanState::Unavailable { .. }))
+    }
+
     pub(crate) fn device_projections(&self) -> BTreeMap<Id, (Id, ObservedDevice)> {
         self.devices_by_cat
             .iter()
@@ -579,6 +598,13 @@ impl KernelNbdPoolAdmission {
 
     pub(crate) fn device(&self, cat_id: &Id) -> Option<&KernelNbdDeviceScanState> {
         self.devices_by_cat.get(cat_id)
+    }
+
+    pub(crate) fn exact_device(&self, cat_id: &Id) -> Option<&ExactKernelNbdDeviceProof> {
+        match self.device(cat_id) {
+            Some(KernelNbdDeviceScanState::Exact(proof)) => Some(proof),
+            _ => None,
+        }
     }
 }
 
@@ -1045,6 +1071,10 @@ impl KernelNbdInventoryPort {
         }
     }
 
+    pub(crate) fn device_count(&self) -> u32 {
+        self.config.device_count()
+    }
+
     #[cfg(test)]
     fn inject_unlock_failures(&mut self, count: usize) {
         self.injected_unlock_failures = count;
@@ -1130,12 +1160,18 @@ impl KernelNbdInventoryPort {
                 let reservation = reservations.by_device.get(device_path);
                 let expected = expectations.get(device_path);
                 let (Some(reservation), Some(expected)) = (reservation, expected) else {
-                    anyhow::ensure!(
-                        reservation.is_none()
-                            && expected.is_none()
-                            && matches!(slot, KernelNbdSlotState::Free),
-                        "physical kernel-NBD slot has no exact durable reservation"
-                    );
+                    anyhow::ensure!(reservation.is_none() && expected.is_none());
+                    match slot {
+                        KernelNbdSlotState::Free => {}
+                        KernelNbdSlotState::Unavailable => {
+                            return Ok(KernelNbdPoolScanOutcome::Unavailable);
+                        }
+                        KernelNbdSlotState::Serving(_) | KernelNbdSlotState::Leaked { .. } => {
+                            anyhow::bail!(
+                                "physical kernel-NBD slot has no exact durable reservation"
+                            )
+                        }
+                    }
                     continue;
                 };
                 anyhow::ensure!(
@@ -1183,6 +1219,9 @@ impl KernelNbdInventoryPort {
                     ) => KernelNbdDeviceScanState::Leaked {
                         expected: expected.clone(),
                         recorded_process_id: *recorded_process_id,
+                    },
+                    (KernelNbdSlotState::Unavailable, _) => KernelNbdDeviceScanState::Unavailable {
+                        expected: expected.clone(),
                     },
                 };
                 anyhow::ensure!(
@@ -1756,7 +1795,9 @@ impl SubmittedKernelNbdAttach<'_> {
                     recorded_process_id,
                 },
             ),
-            Ok(KernelNbdSlotState::Free) | Err(_) => KernelNbdAttachResult::OutcomeUnknown,
+            Ok(KernelNbdSlotState::Free | KernelNbdSlotState::Unavailable) | Err(_) => {
+                KernelNbdAttachResult::OutcomeUnknown
+            }
         }
     }
 }
@@ -1837,14 +1878,6 @@ impl KernelNbdAttachEffect {
             authority,
             attach: Arc::new(PlatformKernelNbdAttachPort::new(config, cleanup_owner)),
         }
-    }
-
-    #[cfg(test)]
-    fn for_test(
-        authority: Arc<dyn VolumeDataAuthority>,
-        attach: Arc<dyn KernelNbdAttachPort>,
-    ) -> Self {
-        Self { authority, attach }
     }
 
     pub(crate) fn try_apply(
@@ -2153,6 +2186,9 @@ fn inspect_pool(
         let device_path = HostPath::new(format!("/dev/nbd{index}"))
             .expect("fixed kernel-NBD path is a canonical HostPath");
         let state = inspect_slot(config, index, &device_path, context)
+            .unwrap_or(KernelNbdSlotState::Unavailable);
+        context
+            .check_active()
             .with_context(|| format!("inspect exact kernel-NBD slot /dev/nbd{index}"))?;
         slots.insert(device_path.clone(), state);
         ordered_paths.push(device_path);
@@ -2645,7 +2681,9 @@ mod tests {
     };
     use tempfile::TempDir;
 
-    use crate::runtime_spine::RuntimeDesiredEffectAdmission;
+    use crate::runtime_spine::{
+        RuntimeDesiredEffectAdmission, RuntimeInventoryScanContext, RuntimeSpineFullScan,
+    };
 
     use super::super::checkpoint::runtime_checkpoint_path;
 
@@ -3219,6 +3257,34 @@ mod tests {
         )
     }
 
+    fn inventory_scan_context(cats: &[&str]) -> RuntimeInventoryScanContext {
+        let node_boot_id = NodeBootId::new("a".repeat(32)).unwrap();
+        let agent_instance_id = random('b');
+        let session = SessionBinding {
+            node_id: id("node_a"),
+            node_boot_id,
+            agent_instance_id,
+            agent_session_epoch: Epoch::new(1).unwrap(),
+        };
+        RuntimeInventoryScanContext::for_test(
+            RuntimeSpineFullScan {
+                session: session.clone(),
+                heartbeat_sequence: Sequence::new(1).unwrap(),
+                inventory_epoch: Epoch::new(1).unwrap(),
+                desired: DesiredReadSnapshot {
+                    version: ContractVersion::V1,
+                    session,
+                    request_sequence: Sequence::new(1).unwrap(),
+                    read_position: Sequence::new(1).unwrap(),
+                    issued_at_unix_ms: UnixMillis::new(1_000).unwrap(),
+                    expires_at_unix_ms: UnixMillis::new(2_000).unwrap(),
+                    desired_specs: cats.iter().map(|cat| desired(cat)).collect(),
+                },
+            },
+            Instant::now() + Duration::from_secs(5),
+        )
+    }
+
     #[test]
     fn installed_config_rejects_an_unbounded_device_pool_before_allocation() {
         let temporary = TempDir::new().unwrap();
@@ -3270,6 +3336,56 @@ mod tests {
             permit.select_free(&reservations).unwrap(),
             host("/dev/nbd3")
         );
+    }
+
+    #[test]
+    fn complete_pool_scan_preserves_absent_unavailable_and_unreserved_uncertainty() {
+        let fixture = Fixture::new(2);
+        let source = checkpoint("cat_a", "vol_a", "/dev/nbd0", '6');
+        FileCheckpointStore::open(&fixture.state.join(CHECKPOINT_NAMESPACE), &source.cat_id)
+            .unwrap()
+            .create(&source)
+            .unwrap();
+        let processes = NodeGlobalManagedProcessScanAdmission::from_root_controls(
+            BTreeMap::new(),
+            BTreeMap::new(),
+        )
+        .unwrap();
+        let port = KernelNbdInventoryPort::new(fixture.config(2));
+
+        let KernelNbdPoolScanOutcome::Complete(absent) = port
+            .scan_complete_pool(&inventory_scan_context(&["cat_a"]), &processes)
+            .unwrap()
+        else {
+            panic!("free reserved slot must form an explicit Absent admission")
+        };
+        assert!(matches!(
+            absent.devices_by_cat.get(&id("cat_a")),
+            Some(KernelNbdDeviceScanState::Absent { listener: None, .. })
+        ));
+        assert!(absent.device_projections().is_empty());
+        assert!(!absent.has_unavailable_device());
+
+        fs::write(fixture.sys.join("nbd0/size"), b"not-a-number\n").unwrap();
+        let KernelNbdPoolScanOutcome::Complete(unavailable) = port
+            .scan_complete_pool(&inventory_scan_context(&["cat_a"]), &processes)
+            .unwrap()
+        else {
+            panic!("reserved uncertain slot must retain its typed state")
+        };
+        assert!(matches!(
+            unavailable.devices_by_cat.get(&id("cat_a")),
+            Some(KernelNbdDeviceScanState::Unavailable { .. })
+        ));
+        assert!(unavailable.has_unavailable_device());
+
+        fs::write(fixture.sys.join("nbd0/size"), b"0\n").unwrap();
+        fs::write(fixture.sys.join("nbd1/size"), b"not-a-number\n").unwrap();
+        assert!(matches!(
+            port.scan_complete_pool(&inventory_scan_context(&["cat_a"]), &processes)
+                .unwrap(),
+            KernelNbdPoolScanOutcome::Unavailable
+        ));
     }
 
     #[test]
@@ -3829,7 +3945,7 @@ mod tests {
     }
 
     #[test]
-    fn malformed_unavailable_or_half_configured_inputs_still_fail_the_pool_scan() {
+    fn malformed_unavailable_or_half_configured_inputs_are_explicitly_unavailable() {
         let cases: [fn(&Fixture); 4] = [
             |fixture| fs::write(fixture.sys.join("nbd0/size"), b"not-a-number\n").unwrap(),
             |fixture| fs::write(fixture.sys.join("nbd0/size"), vec![b'1'; 65]).unwrap(),
@@ -3848,7 +3964,17 @@ mod tests {
             let fixture = Fixture::new(3);
             arrange(&fixture);
             let port = KernelNbdInventoryPort::new(fixture.config(3));
-            assert!(port.lock_and_inspect(&TestContext::active()).is_err());
+            let permit = port.lock_and_inspect(&TestContext::active()).unwrap();
+            assert_eq!(
+                permit.snapshot().state(&host("/dev/nbd0")),
+                Some(&KernelNbdSlotState::Unavailable)
+            );
+            assert_eq!(
+                permit
+                    .select_free(&KernelNbdReservations::default())
+                    .unwrap(),
+                host("/dev/nbd1")
+            );
         }
     }
 

@@ -17,8 +17,9 @@ use cats_api::runtime_reconciliation::{
 use thiserror::Error;
 
 use crate::runtime::reconciliation::{
-    NodeGlobalManagedProcessAdmission, NodeGlobalManagedProcessScanAdmission,
-    NodeGlobalNetworkAdmission, NodeGlobalNetworkScanAdmission,
+    KernelNbdPoolAdmission, KernelNbdPoolScanAdmission, NodeGlobalManagedProcessAdmission,
+    NodeGlobalManagedProcessScanAdmission, NodeGlobalNetworkAdmission,
+    NodeGlobalNetworkScanAdmission,
 };
 use crate::state_directory::StateDirectory;
 
@@ -212,6 +213,7 @@ pub struct RuntimeDesiredEffectContext {
     accepted_full: Option<RuntimeDesiredEffectAdmission>,
     node_global_process: Option<NodeGlobalManagedProcessAdmission>,
     node_global_network: Option<NodeGlobalNetworkAdmission>,
+    kernel_nbd_pool: Option<KernelNbdPoolAdmission>,
 }
 
 /// Shared read-only deadline/cancellation boundary for physical identity
@@ -332,6 +334,7 @@ pub struct RuntimeDesiredEffectAdmission {
     assigned_cats: Option<RuntimeAssignedCatSet>,
     node_global_process: Option<NodeGlobalManagedProcessAdmission>,
     node_global_network: Option<NodeGlobalNetworkAdmission>,
+    kernel_nbd_pool: Option<KernelNbdPoolAdmission>,
 }
 
 impl RuntimeDesiredEffectAdmission {
@@ -341,6 +344,7 @@ impl RuntimeDesiredEffectAdmission {
         acceptance: &ObservationAcceptance,
         node_global_process: Option<NodeGlobalManagedProcessAdmission>,
         node_global_network: Option<NodeGlobalNetworkAdmission>,
+        kernel_nbd_pool: Option<KernelNbdPoolAdmission>,
     ) -> Option<Self> {
         let ObservationInventoryAcceptance::Full { attestation } = &acceptance.inventory else {
             return None;
@@ -358,6 +362,9 @@ impl RuntimeDesiredEffectAdmission {
             || node_global_network
                 .as_ref()
                 .is_some_and(|admission| !admission.matches_observation(&observation))
+            || kernel_nbd_pool
+                .as_ref()
+                .is_some_and(|admission| !admission.matches_observation(&observation))
         {
             return None;
         }
@@ -370,6 +377,7 @@ impl RuntimeDesiredEffectAdmission {
             assigned_cats: None,
             node_global_process,
             node_global_network,
+            kernel_nbd_pool,
         })
     }
 
@@ -426,6 +434,7 @@ impl RuntimeDesiredEffectAdmission {
             assigned_cats: None,
             node_global_process: None,
             node_global_network: None,
+            kernel_nbd_pool: None,
         }
     }
 
@@ -452,6 +461,9 @@ impl RuntimeDesiredEffectContext {
         let node_global_network = accepted_full
             .as_ref()
             .and_then(|admission| admission.node_global_network.clone());
+        let kernel_nbd_pool = accepted_full
+            .as_ref()
+            .and_then(|admission| admission.kernel_nbd_pool.clone());
         Self {
             state_directory,
             deadline,
@@ -459,6 +471,7 @@ impl RuntimeDesiredEffectContext {
             accepted_full,
             node_global_process,
             node_global_network,
+            kernel_nbd_pool,
         }
     }
 
@@ -504,6 +517,14 @@ impl RuntimeDesiredEffectContext {
         })
     }
 
+    pub(crate) fn kernel_nbd_pool(&self) -> anyhow::Result<&KernelNbdPoolAdmission> {
+        self.kernel_nbd_pool.as_ref().ok_or_else(|| {
+            anyhow::anyhow!(
+                "runtime Desired effect lacks its scanner-sealed kernel-NBD pool admission"
+            )
+        })
+    }
+
     #[cfg(test)]
     pub(crate) fn for_test(state_directory: StateDirectory, deadline: Instant) -> Self {
         Self::new(
@@ -541,6 +562,7 @@ impl RuntimeDesiredEffectContext {
             accepted_full: None,
             node_global_process: Some(admission),
             node_global_network: None,
+            kernel_nbd_pool: None,
         }
     }
 
@@ -701,6 +723,7 @@ pub struct CompleteRuntimeInventory {
     residue: Vec<NodeResidue>,
     node_global_process: Option<NodeGlobalManagedProcessScanAdmission>,
     node_global_network: Option<NodeGlobalNetworkScanAdmission>,
+    kernel_nbd_pool: Option<KernelNbdPoolScanAdmission>,
 }
 
 impl CompleteRuntimeInventory {
@@ -718,6 +741,7 @@ impl CompleteRuntimeInventory {
             residue,
             node_global_process: None,
             node_global_network: None,
+            kernel_nbd_pool: None,
         }
     }
 
@@ -749,6 +773,18 @@ impl CompleteRuntimeInventory {
         self.node_global_network.take()
     }
 
+    pub(crate) fn with_kernel_nbd_pool_admission(
+        mut self,
+        admission: Option<KernelNbdPoolScanAdmission>,
+    ) -> Self {
+        self.kernel_nbd_pool = admission;
+        self
+    }
+
+    pub(crate) fn take_kernel_nbd_pool_admission(&mut self) -> Option<KernelNbdPoolScanAdmission> {
+        self.kernel_nbd_pool.take()
+    }
+
     #[cfg(test)]
     fn for_test(
         observed_at_unix_ms: UnixMillis,
@@ -763,6 +799,7 @@ impl CompleteRuntimeInventory {
             residue,
             node_global_process: None,
             node_global_network: None,
+            kernel_nbd_pool: None,
         }
     }
 
@@ -1770,6 +1807,7 @@ pub struct RuntimeSpineRunner {
     current_process_scan_observation_id: Option<RandomId128>,
     current_process_node_global_process: Option<NodeGlobalManagedProcessAdmission>,
     current_process_node_global_network: Option<NodeGlobalNetworkAdmission>,
+    current_process_kernel_nbd_pool: Option<KernelNbdPoolAdmission>,
     effect_admission_open: bool,
     effect_admission: Option<RuntimeDesiredEffectAdmission>,
     pending_effects: VecDeque<DesiredRuntimeSpec>,
@@ -1821,27 +1859,6 @@ impl RuntimeSpineRunner {
             scanner,
             Some(effect),
             None,
-            None,
-        )
-    }
-
-    /// Production composition with a serialized, typed local publication
-    /// recovery step before each physical scan.
-    pub(crate) fn new_with_recovery_and_desired_effects(
-        state_directory: StateDirectory,
-        registered_session: AgentSession,
-        client: RuntimeSpineHttpClient,
-        scanner: Arc<dyn RuntimeInventoryScanner>,
-        recovery: Arc<dyn RuntimePreScanRecovery>,
-        effect: Arc<dyn RuntimeDesiredEffect>,
-    ) -> Result<Self, RuntimeSpineRunError> {
-        Self::new_inner(
-            state_directory,
-            registered_session,
-            client,
-            scanner,
-            Some(effect),
-            Some(recovery),
             None,
         )
     }
@@ -1907,6 +1924,7 @@ impl RuntimeSpineRunner {
             current_process_scan_observation_id: None,
             current_process_node_global_process: None,
             current_process_node_global_network: None,
+            current_process_kernel_nbd_pool: None,
             effect_admission_open: false,
             effect_admission: None,
             pending_effects: VecDeque::new(),
@@ -1944,6 +1962,7 @@ impl RuntimeSpineRunner {
             PendingWork::Scan(scan) => {
                 self.current_process_node_global_process = None;
                 self.current_process_node_global_network = None;
+                self.current_process_kernel_nbd_pool = None;
                 if self
                     .effect_lane
                     .as_ref()
@@ -2004,6 +2023,7 @@ impl RuntimeSpineRunner {
                 };
                 let node_global_process = inventory.take_node_global_process_admission();
                 let node_global_network = inventory.take_node_global_network_admission();
+                let kernel_nbd_pool = inventory.take_kernel_nbd_pool_admission();
                 let candidate = build_full_observation(coordinates, inventory)?;
                 let node_global_process = node_global_process
                     .map(|admission| admission.bind(&candidate))
@@ -2021,8 +2041,17 @@ impl RuntimeSpineRunner {
                             "provider-private network admission conflicts with full observation",
                         )
                     })?;
+                let kernel_nbd_pool = kernel_nbd_pool
+                    .map(|admission| admission.bind(&candidate))
+                    .transpose()
+                    .map_err(|_| {
+                        RuntimeSpineRunError::InvalidScan(
+                            "provider-private kernel-NBD admission conflicts with full observation",
+                        )
+                    })?;
                 self.current_process_node_global_process = node_global_process;
                 self.current_process_node_global_network = node_global_network;
+                self.current_process_kernel_nbd_pool = kernel_nbd_pool;
                 let request = self.journal_lane()?.prepare_observation(candidate).await?;
                 self.current_process_scan_observation_id =
                     Some(request.value().observation_id.clone());
@@ -2250,6 +2279,7 @@ impl RuntimeSpineRunner {
                 let admission = if establishes_effect_admission {
                     let node_global_process = self.current_process_node_global_process.take();
                     let node_global_network = self.current_process_node_global_network.take();
+                    let kernel_nbd_pool = self.current_process_kernel_nbd_pool.take();
                     Some(
                         RuntimeDesiredEffectAdmission::from_acceptance(
                             self.registered_session.clone(),
@@ -2257,6 +2287,7 @@ impl RuntimeSpineRunner {
                             &accepted.value,
                             node_global_process,
                             node_global_network,
+                            kernel_nbd_pool,
                         )
                         .ok_or(RuntimeSpineRunError::InvalidScan(
                             "accepted full observation does not form one effect admission",
@@ -2271,6 +2302,7 @@ impl RuntimeSpineRunner {
                 self.current_process_scan_observation_id = None;
                 self.current_process_node_global_process = None;
                 self.current_process_node_global_network = None;
+                self.current_process_kernel_nbd_pool = None;
                 if establishes_effect_admission {
                     self.effect_admission = admission;
                     self.effect_admission_open = true;
@@ -2290,6 +2322,7 @@ impl RuntimeSpineRunner {
                         self.current_process_scan_observation_id = None;
                         self.current_process_node_global_process = None;
                         self.current_process_node_global_network = None;
+                        self.current_process_kernel_nbd_pool = None;
                         Ok(RuntimeSpineRunStep::DesiredInvalidated { status, error })
                     }
                     DesiredInvalidationBinding::Mismatch => Ok(RuntimeSpineRunStep::RetryExact(
@@ -2353,6 +2386,17 @@ impl RunnerWorkers {
                 RuntimeSpineRunError::WorkerShutdown(format!("effect resource owner: {error:#}"))
             })
         });
+        if effect_resource_result.is_err() {
+            // `RuntimeSpineRunner::shutdown` consumes the runner, so there is
+            // no caller-owned value to carry an unresolved child after this
+            // error. Quarantine the owner for the remaining process lifetime
+            // rather than dropping its waitable handles and falsely turning
+            // an owned late helper into an unowned process. Readiness is
+            // already closed before production enters this boundary.
+            if let Some(owner) = self.effect_resource_owner.take() {
+                std::mem::forget(owner);
+            }
+        }
         let scan_result = self
             .scan_lane
             .as_mut()
@@ -2496,7 +2540,7 @@ mod tests {
     use std::ffi::CString;
     use std::fs::OpenOptions;
     use std::io::Read as _;
-    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::sync::{mpsc as test_mpsc, Mutex};
 
     use axum::body::{to_bytes, Body};
@@ -2624,6 +2668,73 @@ mod tests {
 
     struct SequencedRecovery {
         calls: AtomicUsize,
+    }
+
+    struct TestEffectResourceOwner {
+        pending: AtomicBool,
+        polls: AtomicUsize,
+        shutdowns: AtomicUsize,
+        fail_shutdown: bool,
+        effect_dropped: Option<Arc<AtomicBool>>,
+    }
+
+    impl TestEffectResourceOwner {
+        fn new(pending: bool) -> Self {
+            Self {
+                pending: AtomicBool::new(pending),
+                polls: AtomicUsize::new(0),
+                shutdowns: AtomicUsize::new(0),
+                fail_shutdown: false,
+                effect_dropped: None,
+            }
+        }
+    }
+
+    impl effect_resource_owner_sealed::Sealed for TestEffectResourceOwner {}
+
+    impl RuntimeEffectResourceOwner for TestEffectResourceOwner {
+        fn poll(&self) -> anyhow::Result<()> {
+            self.polls.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        }
+
+        fn has_pending(&self) -> bool {
+            self.pending.load(Ordering::SeqCst)
+        }
+
+        fn shutdown_until(&self, _deadline: Instant) -> anyhow::Result<()> {
+            self.shutdowns.fetch_add(1, Ordering::SeqCst);
+            if let Some(effect_dropped) = &self.effect_dropped {
+                anyhow::ensure!(
+                    effect_dropped.load(Ordering::SeqCst),
+                    "resource shutdown ran before the effect producer joined"
+                );
+            }
+            anyhow::ensure!(!self.fail_shutdown, "injected resource shutdown timeout");
+            self.pending.store(false, Ordering::SeqCst);
+            Ok(())
+        }
+    }
+
+    struct DropWitnessEffect {
+        dropped: Arc<AtomicBool>,
+    }
+
+    impl Drop for DropWitnessEffect {
+        fn drop(&mut self) {
+            self.dropped.store(true, Ordering::SeqCst);
+        }
+    }
+
+    impl RuntimeDesiredEffect for DropWitnessEffect {
+        fn apply(
+            &self,
+            context: RuntimeDesiredEffectContext,
+            _desired: &DesiredRuntimeSpec,
+        ) -> anyhow::Result<RuntimeDesiredEffectOutcome> {
+            context.check_active()?;
+            Ok(RuntimeDesiredEffectOutcome::Applied)
+        }
     }
 
     impl RuntimePreScanRecovery for SequencedRecovery {
@@ -2760,6 +2871,126 @@ mod tests {
         assert_eq!(recovery.calls.load(Ordering::SeqCst), 2);
         assert_eq!(effect.calls.load(Ordering::SeqCst), 0);
         lane.shutdown_blocking().unwrap();
+    }
+
+    #[tokio::test]
+    async fn pending_effect_resource_blocks_apply_and_recovery_before_user_code() {
+        let effect = Arc::new(CountingEffect {
+            calls: AtomicUsize::new(0),
+        });
+        let recovery = Arc::new(SequencedRecovery {
+            calls: AtomicUsize::new(0),
+        });
+        let owner = Arc::new(TestEffectResourceOwner::new(true));
+        let recovery_port: Arc<dyn RuntimePreScanRecovery> = recovery.clone();
+        let owner_port: Arc<dyn RuntimeEffectResourceOwner> = owner.clone();
+        let mut lane =
+            EffectLane::start(effect.clone(), Some(recovery_port), Some(owner_port)).unwrap();
+        let root = tempfile::tempdir().unwrap();
+        let deadline = Instant::now() + Duration::from_secs(2);
+        let EffectWait::Finished(Err(error)) = lane
+            .apply(
+                StateDirectory::unanchored(root.path().to_path_buf()),
+                desired_with_network(),
+                None,
+                deadline,
+            )
+            .await
+            .unwrap()
+        else {
+            panic!("pending owner did not close the Desired effect")
+        };
+        assert!(
+            error.to_string().contains("retains pending work"),
+            "{error:#}"
+        );
+
+        let snapshot = decode_desired_read_snapshot(SNAPSHOT).unwrap();
+        let coordinates = RuntimeSpineFullScan {
+            session: snapshot.session.clone(),
+            heartbeat_sequence: Sequence::new(1).unwrap(),
+            inventory_epoch: Epoch::new(1).unwrap(),
+            desired: snapshot,
+        };
+        let RecoveryWait::Finished(Err(error)) = lane
+            .recover(
+                StateDirectory::unanchored(root.path().to_path_buf()),
+                coordinates,
+                deadline,
+            )
+            .await
+            .unwrap()
+        else {
+            panic!("pending owner did not close pre-scan recovery")
+        };
+        assert!(
+            error.to_string().contains("retains pending work"),
+            "{error:#}"
+        );
+        assert_eq!(effect.calls.load(Ordering::SeqCst), 0);
+        assert_eq!(recovery.calls.load(Ordering::SeqCst), 0);
+        assert_eq!(owner.polls.load(Ordering::SeqCst), 2);
+        owner.pending.store(false, Ordering::SeqCst);
+        lane.shutdown_blocking().unwrap();
+    }
+
+    #[test]
+    fn resource_shutdown_follows_effect_join_and_failure_retains_the_owner() {
+        let effect_dropped = Arc::new(AtomicBool::new(false));
+        let owner = Arc::new(TestEffectResourceOwner {
+            pending: AtomicBool::new(false),
+            polls: AtomicUsize::new(0),
+            shutdowns: AtomicUsize::new(0),
+            fail_shutdown: false,
+            effect_dropped: Some(Arc::clone(&effect_dropped)),
+        });
+        let owner_port: Arc<dyn RuntimeEffectResourceOwner> = owner.clone();
+        let lane = EffectLane::start(
+            Arc::new(DropWitnessEffect {
+                dropped: Arc::clone(&effect_dropped),
+            }),
+            None,
+            Some(owner_port.clone()),
+        )
+        .unwrap();
+        RunnerWorkers {
+            effect_lane: Some(lane),
+            scan_lane: None,
+            journal_lane: None,
+            effect_resource_owner: Some(owner_port),
+        }
+        .shutdown_blocking()
+        .unwrap();
+        assert!(effect_dropped.load(Ordering::SeqCst));
+        assert_eq!(owner.shutdowns.load(Ordering::SeqCst), 1);
+
+        let failing_owner = Arc::new(TestEffectResourceOwner {
+            pending: AtomicBool::new(true),
+            polls: AtomicUsize::new(0),
+            shutdowns: AtomicUsize::new(0),
+            fail_shutdown: true,
+            effect_dropped: None,
+        });
+        let retained = Arc::downgrade(&failing_owner);
+        let failing_owner_port: Arc<dyn RuntimeEffectResourceOwner> = failing_owner;
+        let error = RunnerWorkers {
+            effect_lane: None,
+            scan_lane: None,
+            journal_lane: None,
+            effect_resource_owner: Some(failing_owner_port),
+        }
+        .shutdown_blocking()
+        .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("injected resource shutdown timeout"),
+            "{error}"
+        );
+        assert!(
+            retained.upgrade().is_some(),
+            "failed shutdown dropped its unresolved resource owner"
+        );
     }
 
     impl RuntimeDesiredEffect for DecisionEffect {
@@ -2967,6 +3198,7 @@ mod tests {
             &acceptance,
             Some(private),
             None,
+            None,
         )
         .expect("exact private scan binding must enter the effect context");
         assert!(admitted.node_global_process.is_some());
@@ -2986,6 +3218,7 @@ mod tests {
             observation,
             &acceptance,
             Some(foreign_private),
+            None,
             None,
         )
         .is_none());
@@ -3470,7 +3703,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn effect_waits_for_current_process_full_acceptance_and_fresh_desired() {
+    async fn pending_resource_blocks_readiness_until_a_fresh_desired_effect_batch() {
         let app = Router::new()
             .route(
                 cats_api::runtime_reconciliation::DESIRED_READ_PATH,
@@ -3534,13 +3767,17 @@ mod tests {
         let effect = Arc::new(CountingEffect {
             calls: AtomicUsize::new(0),
         });
+        let resource_owner = Arc::new(TestEffectResourceOwner::new(true));
+        let resource_owner_port: Arc<dyn RuntimeEffectResourceOwner> = resource_owner.clone();
         let root = tempfile::tempdir().unwrap();
-        let mut runner = RuntimeSpineRunner::new_with_desired_effects(
+        let mut runner = RuntimeSpineRunner::new_inner(
             StateDirectory::unanchored(root.path().to_path_buf()),
             decode_agent_session(SESSION).unwrap(),
             RuntimeSpineHttpClient::for_loopback_test(&origin, signer()).unwrap(),
             Arc::new(AssignedScanner),
-            effect.clone(),
+            Some(effect.clone()),
+            None,
+            Some(resource_owner_port),
         )
         .unwrap();
 
@@ -3558,10 +3795,11 @@ mod tests {
                 .await
                 .unwrap(),
             RuntimeSpineRunStep::ObservationAccepted {
-                service_ready: true
+                service_ready: false
             }
         ));
         assert_eq!(effect.calls.load(Ordering::SeqCst), 0);
+        resource_owner.pending.store(false, Ordering::SeqCst);
         assert!(matches!(
             runner
                 .run_once_until(Instant::now() + Duration::from_secs(5))

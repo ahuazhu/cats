@@ -819,9 +819,9 @@ impl PrepareNetworkReservationEffect {
     }
 
     /// Reserve the Host network only after the accepted full scan and sealed
-    /// serving proof agree on one exact vhost-user device. Kernel-NBD remains
-    /// with its independent attach admission and deliberately cannot reach
-    /// this CAS from public device projection alone.
+    /// serving proof agree on one exact device. Kernel-NBD reaches this CAS
+    /// only through its scanner-sealed physical client proof; a checkpoint or
+    /// public device projection alone remains insufficient.
     pub(crate) fn try_apply(
         &self,
         context: &RuntimeDesiredEffectContext,
@@ -837,9 +837,6 @@ impl PrepareNetworkReservationEffect {
         let ReconcileStep::PrepareDevice { frontend, .. } = &runtime.step else {
             return Ok(None);
         };
-        if !matches!(frontend, PrepareDeviceFrontend::VhostUserBlk { .. }) {
-            return Ok(None);
-        }
         if !prepare_device_base_admission_is_exact(accepted, desired, runtime) {
             return Ok(Some(local_contract_stop()));
         }
@@ -849,8 +846,21 @@ impl PrepareNetworkReservationEffect {
         else {
             anyhow::bail!("PrepareNetwork lacks exact provider-private serving proof")
         };
-        let Some((volume_id, device)) = serving.vhost_device_projection() else {
-            anyhow::bail!("PrepareNetwork serving proof is not vhost-user")
+        let (volume_id, device) = match frontend {
+            PrepareDeviceFrontend::VhostUserBlk { .. } => serving
+                .vhost_device_projection()
+                .context("PrepareNetwork serving proof is not vhost-user")?,
+            PrepareDeviceFrontend::KernelNbd { .. } => {
+                let exact = context
+                    .kernel_nbd_pool()?
+                    .exact_device(&desired.cat_id)
+                    .context("PrepareNetwork lacks exact kernel-NBD client proof")?;
+                anyhow::ensure!(
+                    exact.listener().expectation() == expectation,
+                    "PrepareNetwork kernel-NBD and serving proofs disagree"
+                );
+                exact.projection()
+            }
         };
         anyhow::ensure!(
             runtime.volumes.iter().any(|volume| {

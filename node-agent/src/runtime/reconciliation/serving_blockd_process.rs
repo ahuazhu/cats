@@ -12,7 +12,7 @@ use std::sync::Arc;
 use anyhow::Context as _;
 use cats_api::blockd::DurabilityStatus;
 use cats_api::runtime_reconciliation::{
-    ControlHandshakeEvidence, DesiredRuntimeSpec, HostPath, Id, ObservedDevice,
+    ControlHandshakeEvidence, DesiredRuntimeSpec, FenceEpoch, HostPath, Id, ObservedDevice,
     ObservedRuntimeStatus, OwnershipTokenEvidence, PrepareDeviceFrontend, ProcessEvidence,
     ProcessRole, ProcessState, RandomId128, ReconcileStep, WireU64,
 };
@@ -202,6 +202,25 @@ impl ServingBlockdExpectation {
 
     pub(crate) fn volume_id(&self) -> &Id {
         &self.volume.attachment.identity.volume_id
+    }
+
+    /// Bind a provider-private device proof to the complete persisted serving
+    /// attachment. The device scanner cannot reach into the authorized
+    /// checkpoint or reconstruct these fields from public `ObservedDevice`.
+    pub(crate) fn matches_device_contract(
+        &self,
+        cat_id: &Id,
+        volume_id: &Id,
+        attachment_id: &Id,
+        attachment_epoch: FenceEpoch,
+        size_bytes: u64,
+    ) -> bool {
+        let attachment = &self.volume.attachment;
+        self.cat_id() == cat_id
+            && attachment.identity.volume_id == *volume_id
+            && attachment.identity.attachment_id == *attachment_id
+            && attachment.identity.attachment_epoch == attachment_epoch
+            && attachment.size_bytes == size_bytes
     }
 
     /// Check the provider authority behind this scanner-minted expectation.
