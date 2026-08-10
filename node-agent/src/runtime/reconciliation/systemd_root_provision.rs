@@ -21,7 +21,7 @@ use cats_api::blockd::BlockdControlResponse;
 use cats_api::blockd::DurabilityStatus;
 use cats_api::runtime_reconciliation::{Durability, HostPath, Id, RandomId128, WireU64};
 
-use crate::runtime_spine::RuntimeDesiredEffectContext;
+use crate::runtime_spine::{RuntimeDesiredEffectContext, RuntimePhysicalReadContext};
 
 use super::authorized_blockd::AuthorizedBlockdLaunchConfig;
 #[cfg(test)]
@@ -111,7 +111,7 @@ trait SystemdTransientServicePort: Send + Sync {
     fn inspect(
         &self,
         launch: &TransientServiceLaunch,
-        context: &RuntimeDesiredEffectContext,
+        context: &dyn RuntimePhysicalReadContext,
     ) -> anyhow::Result<SystemdInspection>;
 
     fn submit(
@@ -135,7 +135,7 @@ trait BlockdHandshakePort: Send + Sync {
     fn status(
         &self,
         socket_path: &HostPath,
-        context: &RuntimeDesiredEffectContext,
+        context: &dyn RuntimePhysicalReadContext,
     ) -> anyhow::Result<BlockdHandshakeInspection>;
 }
 
@@ -177,7 +177,7 @@ where
     fn inspect(
         &self,
         expected: &RootProvisionProcessExpectation,
-        context: &RuntimeDesiredEffectContext,
+        context: &dyn RuntimePhysicalReadContext,
     ) -> anyhow::Result<RootProvisionProcessInspection> {
         let launch = self.launch(expected)?;
         self.inspect_exact(expected, &launch, context)
@@ -225,7 +225,7 @@ where
         &self,
         expected: &RootProvisionProcessExpectation,
         launch: &TransientServiceLaunch,
-        context: &RuntimeDesiredEffectContext,
+        context: &dyn RuntimePhysicalReadContext,
     ) -> anyhow::Result<RootProvisionProcessInspection> {
         let first = match self.systemd.inspect(launch, context)? {
             SystemdInspection::Absent => return Ok(RootProvisionProcessInspection::Absent),
@@ -519,7 +519,7 @@ impl RootProvisionProcessPort for PlatformSystemdRootProvisionProcessPort {
     fn inspect(
         &self,
         expected: &RootProvisionProcessExpectation,
-        context: &RuntimeDesiredEffectContext,
+        context: &dyn RuntimePhysicalReadContext,
     ) -> anyhow::Result<RootProvisionProcessInspection> {
         self.inner.inspect(expected, context)
     }
@@ -537,7 +537,7 @@ impl SystemdTransientServicePort for PlatformSystemdTransientService {
     fn inspect(
         &self,
         launch: &TransientServiceLaunch,
-        context: &RuntimeDesiredEffectContext,
+        context: &dyn RuntimePhysicalReadContext,
     ) -> anyhow::Result<SystemdInspection> {
         platform_inspect_systemd(launch, context)
     }
@@ -555,7 +555,7 @@ impl BlockdHandshakePort for UnixBlockdHandshake {
     fn status(
         &self,
         socket_path: &HostPath,
-        context: &RuntimeDesiredEffectContext,
+        context: &dyn RuntimePhysicalReadContext,
     ) -> anyhow::Result<BlockdHandshakeInspection> {
         platform_blockd_status(socket_path, context)
     }
@@ -610,7 +610,7 @@ fn platform_submit_systemd(
 #[cfg(target_os = "linux")]
 fn platform_inspect_systemd(
     launch: &TransientServiceLaunch,
-    context: &RuntimeDesiredEffectContext,
+    context: &dyn RuntimePhysicalReadContext,
 ) -> anyhow::Result<SystemdInspection> {
     validate_launch(launch)?;
     let Some(first) = systemd_unit_properties(&launch.unit_id, context)? else {
@@ -675,7 +675,7 @@ fn platform_inspect_systemd(
 #[cfg(not(target_os = "linux"))]
 fn platform_inspect_systemd(
     _launch: &TransientServiceLaunch,
-    _context: &RuntimeDesiredEffectContext,
+    _context: &dyn RuntimePhysicalReadContext,
 ) -> anyhow::Result<SystemdInspection> {
     Ok(SystemdInspection::Unavailable)
 }
@@ -715,7 +715,7 @@ enum BoundedCommandResult {
 
 fn run_bounded(
     mut command: Command,
-    context: &RuntimeDesiredEffectContext,
+    context: &dyn RuntimePhysicalReadContext,
 ) -> anyhow::Result<BoundedCommandResult> {
     context.check_active()?;
     let mut child = command.spawn().context("spawn fixed systemd helper")?;
@@ -839,7 +839,7 @@ impl SystemdUnitProperties {
 #[cfg(target_os = "linux")]
 fn systemd_unit_properties(
     unit_id: &Id,
-    context: &RuntimeDesiredEffectContext,
+    context: &dyn RuntimePhysicalReadContext,
 ) -> anyhow::Result<Option<SystemdUnitProperties>> {
     let mut command = Command::new(SYSTEMCTL);
     sanitized_systemd_command(&mut command);
@@ -1020,7 +1020,7 @@ fn read_cgroup_processes(path: &Path) -> anyhow::Result<Option<Vec<u32>>> {
 #[cfg(target_os = "linux")]
 fn platform_blockd_status(
     socket_path: &HostPath,
-    context: &RuntimeDesiredEffectContext,
+    context: &dyn RuntimePhysicalReadContext,
 ) -> anyhow::Result<BlockdHandshakeInspection> {
     use std::mem::size_of;
     use std::os::fd::{AsRawFd as _, FromRawFd as _};
@@ -1093,7 +1093,7 @@ fn platform_blockd_status(
 #[cfg(not(target_os = "linux"))]
 fn platform_blockd_status(
     _socket_path: &HostPath,
-    _context: &RuntimeDesiredEffectContext,
+    _context: &dyn RuntimePhysicalReadContext,
 ) -> anyhow::Result<BlockdHandshakeInspection> {
     Ok(BlockdHandshakeInspection::Unavailable)
 }
@@ -1123,7 +1123,7 @@ fn peer_process_id(descriptor: std::os::fd::RawFd) -> anyhow::Result<u32> {
 fn poll_socket(
     descriptor: std::os::fd::RawFd,
     events: i16,
-    context: &RuntimeDesiredEffectContext,
+    context: &dyn RuntimePhysicalReadContext,
 ) -> anyhow::Result<bool> {
     loop {
         context.check_active()?;
@@ -1169,7 +1169,7 @@ fn socket_error(descriptor: std::os::fd::RawFd) -> anyhow::Result<i32> {
 fn write_socket(
     stream: &mut std::os::unix::net::UnixStream,
     mut bytes: &[u8],
-    context: &RuntimeDesiredEffectContext,
+    context: &dyn RuntimePhysicalReadContext,
 ) -> anyhow::Result<bool> {
     use std::io::Write as _;
     use std::os::fd::AsRawFd as _;
@@ -1193,7 +1193,7 @@ fn write_socket(
 #[cfg(target_os = "linux")]
 fn read_status_line(
     stream: &mut std::os::unix::net::UnixStream,
-    context: &RuntimeDesiredEffectContext,
+    context: &dyn RuntimePhysicalReadContext,
 ) -> anyhow::Result<Option<Vec<u8>>> {
     use std::os::fd::AsRawFd as _;
 
@@ -1252,7 +1252,7 @@ mod tests {
         fn inspect(
             &self,
             launch: &TransientServiceLaunch,
-            _context: &RuntimeDesiredEffectContext,
+            _context: &dyn RuntimePhysicalReadContext,
         ) -> anyhow::Result<SystemdInspection> {
             self.launches.lock().unwrap().push(launch.clone());
             Ok(self
@@ -1287,7 +1287,7 @@ mod tests {
         fn status(
             &self,
             _socket_path: &HostPath,
-            _context: &RuntimeDesiredEffectContext,
+            _context: &dyn RuntimePhysicalReadContext,
         ) -> anyhow::Result<BlockdHandshakeInspection> {
             Ok(self
                 .inspections

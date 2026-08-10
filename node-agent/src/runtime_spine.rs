@@ -29,7 +29,9 @@ pub use runner::{
     RuntimeSpineDeadlinePolicy, RuntimeSpineDeadlinePolicyError, RuntimeSpineRunDeadlines,
     RuntimeSpineRunError, RuntimeSpineRunRetry, RuntimeSpineRunStep, RuntimeSpineRunner,
 };
-pub(crate) use runner::{InventoryCoverageAggregator, RuntimeInventoryKeyRing};
+pub(crate) use runner::{
+    InventoryCoverageAggregator, RuntimeInventoryKeyRing, RuntimePhysicalReadContext,
+};
 pub(crate) use runner::{
     RuntimePreScanRecovery, RuntimePreScanRecoveryContext, RuntimePreScanRecoveryOutcome,
 };

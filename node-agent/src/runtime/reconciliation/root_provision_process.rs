@@ -17,7 +17,7 @@ use cats_storage::authority::{
     AuthorizedServingAttachment, LastVolumeTransition, VolumeAdminState, VolumeRecord,
 };
 
-use crate::runtime_spine::RuntimeDesiredEffectContext;
+use crate::runtime_spine::{RuntimeDesiredEffectContext, RuntimePhysicalReadContext};
 
 use super::{FileCheckpointStore, StoredCheckpoint};
 
@@ -348,7 +348,7 @@ pub(crate) trait RootProvisionProcessPort: sealed::Sealed + Send + Sync {
     fn inspect(
         &self,
         expected: &RootProvisionProcessExpectation,
-        context: &RuntimeDesiredEffectContext,
+        context: &dyn RuntimePhysicalReadContext,
     ) -> anyhow::Result<RootProvisionProcessInspection>;
 
     fn start_checkpointed(
@@ -530,7 +530,7 @@ mod tests {
         fn inspect(
             &self,
             _expected: &RootProvisionProcessExpectation,
-            _context: &RuntimeDesiredEffectContext,
+            _context: &dyn RuntimePhysicalReadContext,
         ) -> anyhow::Result<RootProvisionProcessInspection> {
             let mut state = self.state.lock().unwrap();
             state.inspect_calls += 1;

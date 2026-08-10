@@ -184,6 +184,14 @@ pub struct RuntimeDesiredEffectContext {
     accepted_full: Option<RuntimeDesiredEffectAdmission>,
 }
 
+/// Shared read-only deadline/cancellation boundary for physical identity
+/// inspection. Both a full inventory scan and a Desired effect may inspect
+/// the same systemd/process/socket tuple; creation remains effect-only.
+pub(crate) trait RuntimePhysicalReadContext {
+    fn deadline(&self) -> Instant;
+    fn check_active(&self) -> anyhow::Result<()>;
+}
+
 #[derive(Debug, Clone)]
 pub(crate) struct RuntimePreScanRecoveryContext {
     state_directory: StateDirectory,
@@ -410,6 +418,16 @@ impl RuntimeDesiredEffectContext {
     }
 }
 
+impl RuntimePhysicalReadContext for RuntimeDesiredEffectContext {
+    fn deadline(&self) -> Instant {
+        RuntimeDesiredEffectContext::deadline(self)
+    }
+
+    fn check_active(&self) -> anyhow::Result<()> {
+        RuntimeDesiredEffectContext::check_active(self)
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct RuntimeInventoryScanContext {
     coordinates: RuntimeSpineFullScan,
@@ -476,6 +494,16 @@ impl RuntimeInventoryScanContext {
             "runtime inventory scan deadline expired"
         );
         Ok(())
+    }
+}
+
+impl RuntimePhysicalReadContext for RuntimeInventoryScanContext {
+    fn deadline(&self) -> Instant {
+        RuntimeInventoryScanContext::deadline(self)
+    }
+
+    fn check_active(&self) -> anyhow::Result<()> {
+        RuntimeInventoryScanContext::check_active(self)
     }
 }
 
