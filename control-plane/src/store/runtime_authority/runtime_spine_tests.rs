@@ -3111,14 +3111,14 @@ fn route_signer_snapshot_closes_hostname_runtime_and_ring_in_one_authority_read(
     );
     let route_signer = Arc::new(
         crate::route_grant_v2::RouteGrantV2Signer::from_ed25519_pem(
-            include_bytes!("../../../../tests/fixtures/route_grant_private_ed25519.pem"),
-            include_bytes!("../../../../tests/fixtures/route_grant_public_ed25519.pem"),
+            include_bytes!("../../../../tests/fixtures/route_grant_v2_private_ed25519.pem"),
+            include_bytes!("../../../../tests/fixtures/route_grant_v2_public_ed25519.pem"),
             120,
         )
         .unwrap(),
     );
-    let signer_reference_bytes = br#"{"version":1,"deployment_id":"route_deployment_a","signer_revision":1,"expected_previous":null,"signer":{"state":"active","active_kid":"fd56fed3251463eff0063169a7f8fa9dce585b6eee429581264297c98ec58bcb","secret_reference_id":"route_secret_a"},"public_key_ring_version":1,"public_key_ring_digest":"sha256:4e6fec49756e03044438af279f7bfd9507f06cf065ff0673447bd6377cd07ac0"}"#;
-    let signer_ring_bytes = br#"{"version":1,"ring_version":1,"expected_previous":null,"keys":[{"kid":"fd56fed3251463eff0063169a7f8fa9dce585b6eee429581264297c98ec58bcb","public_key_spki":"MCowBQYDK2VwAyEA2-Jj2UvNCvQiUPNYRgSi0cJSPiJI6Rs6D0UTeEpQVj8"}]}"#;
+    let signer_reference_bytes = br#"{"version":1,"deployment_id":"route_deployment_a","signer_revision":1,"expected_previous":null,"signer":{"state":"active","active_kid":"2281a02a7f42d92fa9caa5b7907b29c2f060cb00196be280af33fb7bc8e27e99","secret_reference_id":"route_secret_a"},"public_key_ring_version":1,"public_key_ring_digest":"sha256:7c7e324d7be6c6ee71735c900ce1041de63af7cc08fb39b6800853f966e81e34"}"#;
+    let signer_ring_bytes = br#"{"version":1,"ring_version":1,"expected_previous":null,"keys":[{"kid":"2281a02a7f42d92fa9caa5b7907b29c2f060cb00196be280af33fb7bc8e27e99","public_key_spki":"MCowBQYDK2VwAyEAsz3X-kqrYHysotqiQjIuGgGom4LK9bK8tonhiWAQ0To"}]}"#;
     let signer_reference =
         cats_api::route_grant_v2::decode_route_grant_v2_signer_reference(signer_reference_bytes)
             .unwrap();
@@ -3130,7 +3130,7 @@ fn route_signer_snapshot_closes_hostname_runtime_and_ring_in_one_authority_read(
             signer_reference_bytes,
             &signer_ring,
             Some(include_bytes!(
-                "../../../../tests/fixtures/route_grant_private_ed25519.pem"
+                "../../../../tests/fixtures/route_grant_v2_private_ed25519.pem"
             )),
             120,
         )

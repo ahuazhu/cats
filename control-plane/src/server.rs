@@ -871,6 +871,12 @@ async fn spawn_inner(
         retired_product_authority_for_tests || !cfg.billing_enforcement_enabled,
         "legacy Cat billing enforcement is unavailable during the signed runtime cutover"
     );
+    ensure_route_signing_keys_are_separate(
+        cfg.route_grant_signer.public_key_sha256(),
+        gateway_machine
+            .as_ref()
+            .and_then(|machine| machine.signing_authority.binding().active_kid()),
+    )?;
     anyhow::ensure!(
         cfg.auto_tier_policy
             .warm_after_ms
@@ -1117,4 +1123,36 @@ async fn spawn_inner(
         server_shutdown: std::sync::Mutex::new(Some(server_shutdown)),
         gateway_machine_listener,
     })
+}
+
+/// Route Grant v1 remains live during the v2 cutover, but its signing key must
+/// never be repurposed as the independent Gateway-to-Node capability key. This
+/// check deliberately runs before any PostgreSQL connection or listener bind.
+fn ensure_route_signing_keys_are_separate(
+    legacy_v1_spki_sha256: &str,
+    route_v2_active_kid: Option<&cats_api::runtime_reconciliation::KeyId>,
+) -> anyhow::Result<()> {
+    anyhow::ensure!(
+        route_v2_active_kid.is_none_or(|kid| kid.as_str() != legacy_v1_spki_sha256),
+        "Route Grant v1 and v2 must use different Ed25519 signing keys"
+    );
+    Ok(())
+}
+
+#[cfg(test)]
+mod route_signing_key_separation_tests {
+    use super::ensure_route_signing_keys_are_separate;
+    use cats_api::runtime_reconciliation::KeyId;
+
+    #[test]
+    fn startup_rejects_reusing_the_legacy_v1_spki_as_the_v2_active_kid() {
+        let legacy = "fd56fed3251463eff0063169a7f8fa9dce585b6eee429581264297c98ec58bcb";
+        let reused = KeyId::new(legacy).unwrap();
+        assert!(ensure_route_signing_keys_are_separate(legacy, Some(&reused)).is_err());
+
+        let independent =
+            KeyId::new("2281a02a7f42d92fa9caa5b7907b29c2f060cb00196be280af33fb7bc8e27e99").unwrap();
+        ensure_route_signing_keys_are_separate(legacy, Some(&independent)).unwrap();
+        ensure_route_signing_keys_are_separate(legacy, None).unwrap();
+    }
 }

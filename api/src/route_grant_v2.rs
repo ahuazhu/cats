@@ -930,10 +930,11 @@ mod tests {
     use ring::signature::{Ed25519KeyPair, KeyPair as _};
 
     const PRIVATE_KEY: &[u8] =
-        include_bytes!("../../tests/fixtures/route_grant_private_ed25519.pem");
-    const PUBLIC_KEY: &[u8] = include_bytes!("../../tests/fixtures/route_grant_public_ed25519.pem");
-    const PUBLIC_KEY_SPKI: &str = "MCowBQYDK2VwAyEA2-Jj2UvNCvQiUPNYRgSi0cJSPiJI6Rs6D0UTeEpQVj8";
-    const PUBLIC_KEY_KID: &str = "fd56fed3251463eff0063169a7f8fa9dce585b6eee429581264297c98ec58bcb";
+        include_bytes!("../../tests/fixtures/route_grant_v2_private_ed25519.pem");
+    const PUBLIC_KEY: &[u8] =
+        include_bytes!("../../tests/fixtures/route_grant_v2_public_ed25519.pem");
+    const PUBLIC_KEY_SPKI: &str = "MCowBQYDK2VwAyEAsz3X-kqrYHysotqiQjIuGgGom4LK9bK8tonhiWAQ0To";
+    const PUBLIC_KEY_KID: &str = "2281a02a7f42d92fa9caa5b7907b29c2f060cb00196be280af33fb7bc8e27e99";
 
     fn public_ring() -> RouteGrantV2PublicKeyRingArtifact {
         RouteGrantV2PublicKeyRingArtifact {
@@ -1070,8 +1071,8 @@ mod tests {
         ));
 
         for json in [
-            br#"{"alg":"EdDSA","alg":"EdDSA","typ":"cats-route-grant+jwt","kid":"fd56fed3251463eff0063169a7f8fa9dce585b6eee429581264297c98ec58bcb"}"#.as_slice(),
-            br#"{"alg":"EdDSA","typ":"cats-route-grant+jwt","kid":"fd56fed3251463eff0063169a7f8fa9dce585b6eee429581264297c98ec58bcb","extra":1}"#.as_slice(),
+            br#"{"alg":"EdDSA","alg":"EdDSA","typ":"cats-route-grant+jwt","kid":"2281a02a7f42d92fa9caa5b7907b29c2f060cb00196be280af33fb7bc8e27e99"}"#.as_slice(),
+            br#"{"alg":"EdDSA","typ":"cats-route-grant+jwt","kid":"2281a02a7f42d92fa9caa5b7907b29c2f060cb00196be280af33fb7bc8e27e99","extra":1}"#.as_slice(),
         ] {
             let token = format!(
                 "{}.e30.{}",
@@ -1096,8 +1097,8 @@ mod tests {
         let public = RouteGrantV2PublicKey::from_public_key_pem(PUBLIC_KEY).unwrap();
         let payload = serde_json::to_vec(&claims()).unwrap();
         for header in [
-            br#"{"alg":"HS256","typ":"cats-route-grant+jwt","kid":"fd56fed3251463eff0063169a7f8fa9dce585b6eee429581264297c98ec58bcb"}"#.as_slice(),
-            br#"{"alg":"EdDSA","typ":"JWT","kid":"fd56fed3251463eff0063169a7f8fa9dce585b6eee429581264297c98ec58bcb"}"#.as_slice(),
+            br#"{"alg":"HS256","typ":"cats-route-grant+jwt","kid":"2281a02a7f42d92fa9caa5b7907b29c2f060cb00196be280af33fb7bc8e27e99"}"#.as_slice(),
+            br#"{"alg":"EdDSA","typ":"JWT","kid":"2281a02a7f42d92fa9caa5b7907b29c2f060cb00196be280af33fb7bc8e27e99"}"#.as_slice(),
         ] {
             assert_eq!(
                 RouteGrantV2Compact::parse(&sign_raw(header, &payload)).err(),
@@ -1246,7 +1247,7 @@ mod tests {
         let public = RouteGrantV2PublicKey::from_public_key_pem(PUBLIC_KEY).unwrap();
         assert_eq!(
             public.kid().as_str(),
-            "fd56fed3251463eff0063169a7f8fa9dce585b6eee429581264297c98ec58bcb"
+            "2281a02a7f42d92fa9caa5b7907b29c2f060cb00196be280af33fb7bc8e27e99"
         );
         assert_eq!(
             RouteGrantV2PublicKey::from_spki_der(&[0_u8; 44]).err(),
@@ -1272,15 +1273,15 @@ mod tests {
         assert_eq!(ring_bytes.len(), 219);
         assert_eq!(
             ring_bytes,
-            br#"{"version":1,"ring_version":1,"expected_previous":null,"keys":[{"kid":"fd56fed3251463eff0063169a7f8fa9dce585b6eee429581264297c98ec58bcb","public_key_spki":"MCowBQYDK2VwAyEA2-Jj2UvNCvQiUPNYRgSi0cJSPiJI6Rs6D0UTeEpQVj8"}]}"#
+            br#"{"version":1,"ring_version":1,"expected_previous":null,"keys":[{"kid":"2281a02a7f42d92fa9caa5b7907b29c2f060cb00196be280af33fb7bc8e27e99","public_key_spki":"MCowBQYDK2VwAyEAsz3X-kqrYHysotqiQjIuGgGom4LK9bK8tonhiWAQ0To"}]}"#
         );
         assert_eq!(
             ring.digest().unwrap().as_str(),
-            "sha256:4e6fec49756e03044438af279f7bfd9507f06cf065ff0673447bd6377cd07ac0"
+            "sha256:7c7e324d7be6c6ee71735c900ce1041de63af7cc08fb39b6800853f966e81e34"
         );
         assert_eq!(
             Sha256Digest::from_bytes(Sha256::digest(&ring_bytes).into()).as_str(),
-            "sha256:614059d6616d068e7d210da2c26a15cfb42c0d3933a7144670d13c658b1bb2c8"
+            "sha256:c3b1840a4ee7bd38425adb5f77cc7c32efdf306bb733e06dba2802851dbfc5a9"
         );
         assert_eq!(
             decode_route_grant_v2_public_key_ring(&ring_bytes).unwrap(),
@@ -1293,11 +1294,11 @@ mod tests {
         assert_eq!(reference_bytes.len(), 369);
         assert_eq!(
             reference_bytes,
-            br#"{"version":1,"deployment_id":"route_deployment_a","signer_revision":1,"expected_previous":null,"signer":{"state":"active","active_kid":"fd56fed3251463eff0063169a7f8fa9dce585b6eee429581264297c98ec58bcb","secret_reference_id":"route_secret_a"},"public_key_ring_version":1,"public_key_ring_digest":"sha256:4e6fec49756e03044438af279f7bfd9507f06cf065ff0673447bd6377cd07ac0"}"#
+            br#"{"version":1,"deployment_id":"route_deployment_a","signer_revision":1,"expected_previous":null,"signer":{"state":"active","active_kid":"2281a02a7f42d92fa9caa5b7907b29c2f060cb00196be280af33fb7bc8e27e99","secret_reference_id":"route_secret_a"},"public_key_ring_version":1,"public_key_ring_digest":"sha256:7c7e324d7be6c6ee71735c900ce1041de63af7cc08fb39b6800853f966e81e34"}"#
         );
         assert_eq!(
             reference.digest().unwrap().as_str(),
-            "sha256:c2c83d723f0bcd83560a19eadecbd64d574c7d0332c50700bea3bd8cb3f5da5c"
+            "sha256:2e9c1e3de14fc1154123d9b0be6f0415bf76eb58a3be1244885a6676668898b0"
         );
         assert_eq!(
             decode_route_grant_v2_signer_reference(&reference_bytes).unwrap(),

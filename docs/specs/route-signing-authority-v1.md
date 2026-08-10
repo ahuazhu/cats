@@ -120,17 +120,20 @@ SPKI/kid并与该entry逐byte匹配，再做sign/verify challenge。任一步失
 handler进入authenticated serving状态且readiness关闭。`disabled`不读取或构造private signer，即使旧
 material仍因retention存在。
 
+Route v2 active kid还必须不同于同一Control进程的legacy Route Grant v1 public-SPKI SHA-256；Control在
+连接PG或bind任一listener之前比较并拒绝相等值。两条签发域不得共享private key。
+
 下列initial artifact是跨component fixed vector；code block中每个JSON各为单行、没有结尾LF：
 
 ```json
-{"version":1,"ring_version":1,"expected_previous":null,"keys":[{"kid":"fd56fed3251463eff0063169a7f8fa9dce585b6eee429581264297c98ec58bcb","public_key_spki":"MCowBQYDK2VwAyEA2-Jj2UvNCvQiUPNYRgSi0cJSPiJI6Rs6D0UTeEpQVj8"}]}
-{"version":1,"deployment_id":"route_deployment_a","signer_revision":1,"expected_previous":null,"signer":{"state":"active","active_kid":"fd56fed3251463eff0063169a7f8fa9dce585b6eee429581264297c98ec58bcb","secret_reference_id":"route_secret_a"},"public_key_ring_version":1,"public_key_ring_digest":"sha256:4e6fec49756e03044438af279f7bfd9507f06cf065ff0673447bd6377cd07ac0"}
+{"version":1,"ring_version":1,"expected_previous":null,"keys":[{"kid":"2281a02a7f42d92fa9caa5b7907b29c2f060cb00196be280af33fb7bc8e27e99","public_key_spki":"MCowBQYDK2VwAyEAsz3X-kqrYHysotqiQjIuGgGom4LK9bK8tonhiWAQ0To"}]}
+{"version":1,"deployment_id":"route_deployment_a","signer_revision":1,"expected_previous":null,"signer":{"state":"active","active_kid":"2281a02a7f42d92fa9caa5b7907b29c2f060cb00196be280af33fb7bc8e27e99","secret_reference_id":"route_secret_a"},"public_key_ring_version":1,"public_key_ring_digest":"sha256:7c7e324d7be6c6ee71735c900ce1041de63af7cc08fb39b6800853f966e81e34"}
 ```
 
 ring exact bytes SHA-256 是
-`sha256:614059d6616d068e7d210da2c26a15cfb42c0d3933a7144670d13c658b1bb2c8`；signer descriptor
+`sha256:c3b1840a4ee7bd38425adb5f77cc7c32efdf306bb733e06dba2802851dbfc5a9`；signer descriptor
 exact bytes SHA-256 是
-`sha256:c2c83d723f0bcd83560a19eadecbd64d574c7d0332c50700bea3bd8cb3f5da5c`。
+`sha256:2e9c1e3de14fc1154123d9b0be6f0415bf76eb58a3be1244885a6676668898b0`。
 
 部署artifact只是给持久Store writer的typed candidate，不凭本地文件覆盖PG。最终startup transaction必须
 以`deployment_id + signer_revision + expected_previous`做exact CAS并永久保存每个revision/digest、
