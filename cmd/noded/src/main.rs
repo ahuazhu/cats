@@ -6,7 +6,9 @@ use anyhow::Context;
 use cats_node_agent::ch::{BlockPath, ChConfig};
 use cats_node_agent::runtime_cutover::{spawn_signed_runtime_cutover, SignedRuntimeCutoverConfig};
 use cats_node_agent::runtime_spine::RuntimeSpineDeadlinePolicy;
-use cats_storage::AdapterConfig;
+use cats_object_store_aws_s3::AwsS3BlobStoreFactory;
+use cats_object_store_file::FileBlobStoreFactory;
+use cats_storage::{open_blob_store, AdapterConfig, BlobStoreFactory};
 use clap::Parser;
 
 #[derive(Parser, Debug)]
@@ -37,6 +39,15 @@ struct Args {
     object_store_adapter: String,
     #[arg(long = "object-store-option", value_name = "KEY=VALUE")]
     object_store_options: Vec<String>,
+    /// Initial A22 NormalAcquire lease. This must cover the checkpoint and
+    /// fresh-scan bridge to the root-provision process; serving blockd renews
+    /// the exact epoch independently afterwards.
+    #[arg(
+        long,
+        env = "CATS_RUNTIME_VOLUME_LEASE_DURATION_MS",
+        default_value_t = 60_000
+    )]
+    runtime_volume_lease_duration_ms: u64,
     #[arg(long, default_value_t = 1500)]
     blockd_lease_ttl_ms: i64,
     /// Per-volume remotely unpublished local journal limit.
@@ -146,6 +157,16 @@ async fn main() -> anyhow::Result<()> {
     );
     let metadata_config =
         AdapterConfig::from_cli(args.metadata_store_options).context("metadata adapter options")?;
+    let object_config =
+        AdapterConfig::from_cli(args.object_store_options).context("object adapter options")?;
+    let object_factories: [&dyn BlobStoreFactory; 2] =
+        [&FileBlobStoreFactory, &AwsS3BlobStoreFactory];
+    let blob_store = open_blob_store(
+        &args.object_store_adapter,
+        &object_config,
+        &object_factories,
+    )
+    .context("open signed Runtime object store")?;
     let volume_authority =
         cats_metadata_store_postgres::PostgresVolumeDataAuthority::open_runtime(&metadata_config)
             .context("open PostgreSQL Runtime Volume authorities")?;
@@ -173,6 +194,8 @@ async fn main() -> anyhow::Result<()> {
         metering_cgroup_root: args.metering_cgroup_root,
         volume_data_authority,
         volume_inventory_authority,
+        blob_store,
+        volume_lease_duration_ms: args.runtime_volume_lease_duration_ms,
         deadline_policy,
     })
     .await?;
@@ -237,6 +260,7 @@ mod tests {
             );
         }
         assert!(ids.contains(&"guest_runtime_profile_receipt_file"));
+        assert!(ids.contains(&"runtime_volume_lease_duration_ms"));
         assert!(!ids.contains(&"auth_token"));
     }
 
@@ -245,6 +269,7 @@ mod tests {
         let source = include_str!("main.rs");
         assert!(source.contains("spawn_signed_runtime_cutover"));
         assert!(source.contains("PostgresVolumeDataAuthority::open_runtime"));
+        assert!(source.contains("open_blob_store"));
         let legacy_spawn = ["server", "::{", "spawn"].concat();
         let legacy_runtime = ["Node", "Runtime", "::", "new"].concat();
         assert!(!source.contains(&legacy_spawn));

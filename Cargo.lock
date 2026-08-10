@@ -1273,6 +1273,8 @@ dependencies = [
  "cats-api",
  "cats-metadata-store-postgres",
  "cats-node-agent",
+ "cats-object-store-aws-s3",
+ "cats-object-store-file",
  "cats-storage",
  "clap",
  "tempfile",

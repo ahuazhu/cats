@@ -82,16 +82,21 @@ pub(crate) struct SignedRunningAcquireEffect {
 }
 
 impl SignedRunningAcquireEffect {
+    pub(crate) fn validate_lease_duration(lease_duration_ms: u64) -> anyhow::Result<()> {
+        anyhow::ensure!(
+            (1..=MAX_LEASE_DURATION_MS).contains(&lease_duration_ms),
+            "signed normal-acquire lease duration is outside the frozen wire range"
+        );
+        Ok(())
+    }
+
     pub(crate) fn new(
         acquire: Arc<dyn SignedNormalAcquirePort>,
         authority: Arc<dyn VolumeDataAuthority>,
         blob: Arc<dyn BlobStore>,
         lease_duration_ms: u64,
     ) -> anyhow::Result<Self> {
-        anyhow::ensure!(
-            (1..=MAX_LEASE_DURATION_MS).contains(&lease_duration_ms),
-            "signed normal-acquire lease duration is outside the frozen wire range"
-        );
+        Self::validate_lease_duration(lease_duration_ms)?;
         Ok(Self {
             acquire,
             authority,

@@ -14,6 +14,8 @@ cats-api = { workspace = true }
 cats-node-agent = { workspace = true }
 cats-storage = { workspace = true }
 cats-metadata-store-postgres = { workspace = true }
+cats-object-store-file = { workspace = true }
+cats-object-store-aws-s3 = { workspace = true }
 anyhow = { workspace = true }
 tokio = { workspace = true }
 clap = { workspace = true }

@@ -5,6 +5,7 @@
 //! [`RuntimeSpineAttempt::RetryExact`]; the adapter never manufactures a new
 //! domain sequence after an ambiguous outcome.
 
+#[cfg(test)]
 mod desired_effect;
 mod runner;
 mod state;
@@ -13,10 +14,12 @@ pub(crate) mod inventory_scanner_sealed {
     pub trait Sealed {}
 }
 
+#[cfg(test)]
 pub(crate) mod runtime_launch_port_sealed {
     pub(crate) trait Sealed {}
 }
 
+#[cfg(test)]
 pub(crate) use desired_effect::{ProductionRuntimeDesiredEffect, RuntimeLaunchPort};
 
 pub use runner::{

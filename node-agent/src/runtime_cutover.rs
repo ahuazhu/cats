@@ -4,11 +4,13 @@
 //! suite, but the shipped Node binary starts here. The first production
 //! scanner covers the physical clean-slate sources, including the bounded
 //! owner-Node Volume authority snapshot; no production full inventory is
-//! claimed from point reads. The typed network
-//! effect is composed only after an accepted full inventory, and its launch
-//! port remains fail-closed until the signed VMM/volume reconciler lands. This
-//! path does not construct `NodeRuntime`, adopt a legacy ledger, or run a
-//! destructive residue/device sweep.
+//! claimed from point reads. The first production effect is exactly one A22
+//! signed NormalAcquire after an accepted full inventory; it advances only to
+//! a durable `ProvisionRootImage` checkpoint and forces another full scan.
+//! Process, device, network and VMM effects remain unreachable until their own
+//! identity-aware scan bridges are composed. This path does not construct
+//! `NodeRuntime`, adopt a legacy ledger, or run a destructive residue/device
+//! sweep.
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -20,36 +22,19 @@ use axum::http::StatusCode;
 use axum::routing::get;
 use axum::Router;
 use cats_storage::authority::{RuntimeVolumeInventoryAuthority, VolumeDataAuthority};
+use cats_storage::BlobStore;
 
 use crate::agent_registration::AgentRegistrationConfig;
-use crate::ch::{ChConfig, ChNetwork};
+use crate::ch::ChConfig;
 use crate::runtime::reconciliation::{
-    installed_clean_slate_scanner, InstalledCleanSlateProbeConfig,
+    installed_clean_slate_scanner, ControlSignedNormalAcquireClient,
+    InstalledCleanSlateProbeConfig, RuntimeVolumeTransitionHttpClient, SignedRunningAcquireEffect,
 };
 use crate::runtime_spine::{
-    ProductionRuntimeDesiredEffect, RuntimeLaunchPort, RuntimeSpineDeadlinePolicy,
-    RuntimeSpineHttpClient, RuntimeSpineRunStep, RuntimeSpineRunner,
+    RuntimeSpineDeadlinePolicy, RuntimeSpineHttpClient, RuntimeSpineRunStep, RuntimeSpineRunner,
 };
 
 const RETRY_DELAY: Duration = Duration::from_secs(1);
-
-/// Fail-closed endpoint for the next signed reconciliation slice. The
-/// production effect plans, checkpoints, and prepares only after a
-/// current-process full inventory is accepted. VMM/volume launch remains
-/// unavailable until the identity-aware non-empty reconciler is composed.
-struct UnavailableRuntimeLaunch;
-
-impl crate::runtime_spine::runtime_launch_port_sealed::Sealed for UnavailableRuntimeLaunch {}
-
-impl RuntimeLaunchPort for UnavailableRuntimeLaunch {
-    fn launch(
-        &self,
-        _desired: &cats_api::runtime_reconciliation::DesiredRuntimeSpec,
-        _network: &ChNetwork,
-    ) -> anyhow::Result<()> {
-        anyhow::bail!("signed Runtime VMM/volume launch port is not composed")
-    }
-}
 
 pub struct SignedRuntimeCutoverConfig {
     pub listen: String,
@@ -66,6 +51,10 @@ pub struct SignedRuntimeCutoverConfig {
     /// Enumeration-only authority used by the full inventory scanner. It is
     /// separate from blockd's exact-grant data-plane port.
     pub volume_inventory_authority: Arc<dyn RuntimeVolumeInventoryAuthority>,
+    /// Read-only image manifest authority used to bind the exact expected
+    /// provisioned root before the first lease mutation.
+    pub blob_store: Arc<dyn BlobStore>,
+    pub volume_lease_duration_ms: u64,
     pub deadline_policy: RuntimeSpineDeadlinePolicy,
 }
 
@@ -209,6 +198,8 @@ pub async fn spawn_signed_runtime_cutover(
         .deadline_policy
         .deadlines_from(Instant::now())
         .context("validate signed Runtime startup deadlines")?;
+    SignedRunningAcquireEffect::validate_lease_duration(config.volume_lease_duration_ms)
+        .context("compose one-step signed Running acquire")?;
     let session = config
         .agent_registration
         .register_until_session(&config.control_plane_url)
@@ -240,15 +231,51 @@ pub async fn spawn_signed_runtime_cutover(
         volume_inventory_authority: config.volume_inventory_authority,
     })
     .context("compose installed clean-slate inventory probes")?;
-    let effect =
-        ProductionRuntimeDesiredEffect::new(config.ch_config, Arc::new(UnavailableRuntimeLaunch));
-    let runner = RuntimeSpineRunner::new_with_desired_effects(
-        config.agent_registration.runtime_state_directory(),
-        session,
-        client,
-        scanner,
-        Arc::new(effect),
-    )?;
+    let effect_registration = config.agent_registration.clone();
+    let effect_control_plane_url = config.control_plane_url.clone();
+    let effect_volume_authority = Arc::clone(&config.volume_data_authority);
+    let effect_blob_store = Arc::clone(&config.blob_store);
+    let effect_lease_duration_ms = config.volume_lease_duration_ms;
+    let effect_state_directory = config.agent_registration.runtime_state_directory();
+    let runner = tokio::task::spawn_blocking(move || {
+        #[cfg(not(test))]
+        let volume_transition_transport = RuntimeVolumeTransitionHttpClient::for_production(
+            &effect_control_plane_url,
+            &effect_registration,
+        )?;
+        #[cfg(test)]
+        let volume_transition_transport = if effect_registration.uses_loopback_transport_for_test()
+        {
+            RuntimeVolumeTransitionHttpClient::for_loopback_test(
+                &effect_control_plane_url,
+                effect_registration.runtime_request_signer(),
+            )?
+        } else {
+            RuntimeVolumeTransitionHttpClient::for_production(
+                &effect_control_plane_url,
+                &effect_registration,
+            )?
+        };
+        let effect = SignedRunningAcquireEffect::new(
+            Arc::new(ControlSignedNormalAcquireClient::new(
+                volume_transition_transport,
+            )),
+            effect_volume_authority,
+            effect_blob_store,
+            effect_lease_duration_ms,
+        )
+        .context("compose one-step signed Running acquire")?;
+        RuntimeSpineRunner::new_with_desired_effects(
+            effect_state_directory,
+            session,
+            client,
+            scanner,
+            Arc::new(effect),
+        )
+        .map_err(anyhow::Error::from)
+    })
+    .await
+    .context("join signed Runtime runner construction")??;
     // Bind before spawning either owned task. If binding fails, `runner` drops
     // synchronously and no detached worker can outlive this failed startup.
     let listener = tokio::net::TcpListener::bind(&config.listen)
@@ -410,6 +437,7 @@ mod tests {
         AuthorityError, NodeVolumeInventorySnapshot, RenewLeaseRequest, RenewLeaseResult,
         VolumeHeadCasRequest, VolumeHeadCasResult, VolumeRecord,
     };
+    use cats_storage::BlobError;
 
     struct TestUnavailableVolumeDataAuthority;
 
@@ -440,6 +468,37 @@ mod tests {
             _candidate_volume_ids: &std::collections::BTreeSet<Id>,
         ) -> Result<NodeVolumeInventorySnapshot, AuthorityError> {
             Err(AuthorityError::BackendUnknown)
+        }
+    }
+
+    struct TestUnavailableBlobStore;
+
+    impl BlobStore for TestUnavailableBlobStore {
+        fn put_immutable(&self, key: &str, _data: &[u8]) -> Result<(), BlobError> {
+            Err(test_blob_error(key))
+        }
+
+        fn get(&self, key: &str) -> Result<Vec<u8>, BlobError> {
+            Err(test_blob_error(key))
+        }
+
+        fn exists(&self, key: &str) -> Result<bool, BlobError> {
+            Err(test_blob_error(key))
+        }
+
+        fn delete(&self, key: &str) -> Result<(), BlobError> {
+            Err(test_blob_error(key))
+        }
+
+        fn list(&self, prefix: &str) -> Result<Vec<String>, BlobError> {
+            Err(test_blob_error(prefix))
+        }
+    }
+
+    fn test_blob_error(key: &str) -> BlobError {
+        BlobError::Backend {
+            key: key.to_owned(),
+            message: "test blob store is unavailable".to_owned(),
         }
     }
 
@@ -530,14 +589,18 @@ mod tests {
     }
 
     #[test]
-    fn production_composition_uses_the_typed_network_adapter_only() {
+    fn production_composition_starts_with_one_checkpointed_signed_acquire() {
         let source = include_str!("runtime_cutover.rs");
-        assert!(source.contains("ProductionRuntimeDesiredEffect::new"));
+        assert!(source.contains("SignedRunningAcquireEffect::new"));
+        assert!(source.contains("RuntimeVolumeTransitionHttpClient::for_production"));
         assert!(source.contains("installed_clean_slate_scanner"));
-        assert!(source.contains("UnavailableRuntimeLaunch"));
         let placeholder_effect = ["Unavailable", "Desired", "Effect"].concat();
         let legacy_job = ["Node", "Job"].concat();
         let legacy_runtime = ["Node", "Runtime", "::", "new"].concat();
+        let old_network_effect = ["ProductionRuntimeDesiredEffect", "::", "new"].concat();
+        let old_unavailable_launch = ["Unavailable", "Runtime", "Launch"].concat();
+        assert!(!source.contains(&old_network_effect));
+        assert!(!source.contains(&old_unavailable_launch));
         assert!(!source.contains(&placeholder_effect));
         assert!(!source.contains(&legacy_job));
         assert!(!source.contains(&legacy_runtime));
@@ -612,6 +675,8 @@ mod tests {
             metering_cgroup_root: None,
             volume_data_authority: Arc::new(TestUnavailableVolumeDataAuthority),
             volume_inventory_authority: Arc::new(TestUnavailableVolumeDataAuthority),
+            blob_store: Arc::new(TestUnavailableBlobStore),
+            volume_lease_duration_ms: 60_000,
             deadline_policy: RuntimeSpineDeadlinePolicy::new(
                 Duration::from_secs(5),
                 Duration::from_secs(30),
@@ -681,6 +746,8 @@ mod tests {
             metering_cgroup_root: None,
             volume_data_authority: Arc::new(TestUnavailableVolumeDataAuthority),
             volume_inventory_authority: Arc::new(TestUnavailableVolumeDataAuthority),
+            blob_store: Arc::new(TestUnavailableBlobStore),
+            volume_lease_duration_ms: 60_000,
             deadline_policy: RuntimeSpineDeadlinePolicy::new(Duration::MAX, Duration::from_secs(1))
                 .unwrap(),
         })
@@ -692,6 +759,55 @@ mod tests {
         assert!(error
             .to_string()
             .contains("validate signed Runtime startup deadlines"));
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+        control.abort();
+    }
+
+    #[tokio::test]
+    async fn invalid_acquire_lease_fails_before_registration_or_listener_binding() {
+        let state_root = tempfile::tempdir().unwrap();
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let control_address = listener.local_addr().unwrap();
+        let stub = RegistrationStub {
+            calls: calls.clone(),
+        };
+        let control = tokio::spawn(async move {
+            axum::serve(
+                listener,
+                Router::new()
+                    .route(REGISTRATION_PATH, post(accept_registration))
+                    .with_state(stub),
+            )
+            .await
+            .unwrap();
+        });
+        let result = spawn_signed_runtime_cutover(SignedRuntimeCutoverConfig {
+            listen: "not-a-socket-address".into(),
+            control_plane_url: format!("http://{control_address}"),
+            agent_registration: registration_config(state_root.path().join("state")).unwrap(),
+            ch_config: test_ch_config(),
+            blockd_binary: "/opt/cats/bin/cats-blockd".into(),
+            guest_agent_binary: "/opt/cats/bin/cats-guest-agent".into(),
+            metering_cgroup_root: None,
+            volume_data_authority: Arc::new(TestUnavailableVolumeDataAuthority),
+            volume_inventory_authority: Arc::new(TestUnavailableVolumeDataAuthority),
+            blob_store: Arc::new(TestUnavailableBlobStore),
+            volume_lease_duration_ms: 0,
+            deadline_policy: RuntimeSpineDeadlinePolicy::new(
+                Duration::from_secs(5),
+                Duration::from_secs(30),
+            )
+            .unwrap(),
+        })
+        .await;
+        let Err(error) = result else {
+            panic!("zero acquire lease must fail before startup")
+        };
+
+        assert!(error
+            .to_string()
+            .contains("compose one-step signed Running acquire"));
         assert_eq!(calls.load(Ordering::SeqCst), 0);
         control.abort();
     }
