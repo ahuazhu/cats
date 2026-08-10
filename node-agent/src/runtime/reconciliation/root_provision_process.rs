@@ -375,7 +375,8 @@ fn phase_from_exact_authority(
 }
 
 /// Exact self-description required from the blockd control handshake.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 pub(crate) struct RootProvisionBlockdHandshake {
     /// Linux `SO_PEERCRED` PID from the exact connected control socket.
     pub peer_process_id: u32,
@@ -389,7 +390,8 @@ pub(crate) struct RootProvisionBlockdHandshake {
 }
 
 /// One process identity proven jointly by the process owner and blockd.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 pub(crate) struct RootProvisionProcessEvidence {
     pub process_id: u32,
     pub unit_main_process_id: u32,
@@ -467,7 +469,8 @@ pub(crate) struct ExactRootProvisionProcessAbsenceProof {
 /// one retirement attempt. The next token rotation must prove a strictly
 /// newer full admission; this is persisted in the retirement receipt rather
 /// than remembered by the Agent process.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 pub(crate) struct RootProvisionRetirementAdmission {
     pub node_boot_id: NodeBootId,
     pub agent_instance_id: RandomId128,

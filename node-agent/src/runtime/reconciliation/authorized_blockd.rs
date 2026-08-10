@@ -18,18 +18,27 @@ use std::process::Command;
 
 use anyhow::{Context as _, Result};
 use cats_api::blockd::DurabilityStatus;
-use cats_api::runtime_reconciliation::DesiredRuntimeSpec;
+use cats_api::runtime_reconciliation::{
+    checkpoint_content_digest, DesiredRuntimeSpec, ReconcileStep, RuntimeCheckpoint, Sha256Digest,
+};
 use cats_api::runtime_reconciliation::{
     encode_desired_runtime_spec, ContractVersion, DiskKind, Durability, Id, RandomId128,
     RuntimeTarget, VolumeAccess, VolumeAcquire, VolumeDisposition, VolumeIntent,
 };
 use cats_storage::authority::{
-    validate_authorized_serving_attachment, AttachmentLineageIdentity, AuthorizedServingAttachment,
+    validate_authorized_serving_attachment, validate_volume_record, AttachmentLineageIdentity,
+    AuthorizedServingAttachment, VolumeRecord,
 };
 use cats_storage::AdapterSelection;
 use serde::{Deserialize, Serialize};
+use sha2::{Digest as _, Sha256};
 
 use crate::state_directory::StateDirectory;
+
+use super::root_provision_process::{
+    RootProvisionAuthoritySnapshot, RootProvisionProcessEvidence, RootProvisionProcessExpectation,
+    RootProvisionRetirementAdmission,
+};
 
 const DATA_DIRECTORY: &str = "data";
 pub(crate) const IDENTITY_FILE: &str = "identity.json";
@@ -41,6 +50,17 @@ pub(crate) const LAUNCH_CHECKPOINT_TEMP: &str = ".launch-checkpoint.json.tmp";
 pub(crate) const MAX_IDENTITY_BYTES: usize = 4 * 1024;
 pub(crate) const MAX_AUTHORIZED_SERVING_BYTES: usize = 32 * 1024;
 pub(crate) const MAX_LAUNCH_CHECKPOINT_BYTES: usize = 512 * 1024;
+pub(crate) const ROOT_PROVISION_STOP_RECEIPT_FILE: &str = "root-provision-stop.json";
+pub(crate) const ROOT_PROVISION_STOP_RECEIPT_TEMP: &str = ".root-provision-stop.json.tmp";
+const STAT_FILE_TYPE_MASK: u32 = 0o170000;
+const STAT_SOCKET_FILE_TYPE: u32 = 0o140000;
+// The receipt stores fixed-size digests plus the bounded physical/authority
+// identity only; it deliberately does not duplicate either the (up to 4 MiB)
+// Runtime checkpoint or the (up to 512 KiB) launch checkpoint. Four HostPath
+// fields dominate its wire size, including JSON escaping at their 4 KiB
+// contract bound. Keep a closed 64 KiB ceiling so a 1,024-Cat scan cannot be
+// turned into a GiB-scale sidecar workload.
+pub(crate) const ROOT_PROVISION_STOP_RECEIPT_MAX_BYTES: usize = 64 * 1024;
 
 /// Exact signed inputs persisted before starting an authorized blockd.
 ///
@@ -56,6 +76,235 @@ pub struct AuthorizedBlockdCheckpoint {
     pub desired: DesiredRuntimeSpec,
     pub volume: VolumeIntent,
     pub attachment: AuthorizedServingAttachment,
+}
+
+/// Durable provider-private journal for one exact superseded control-process
+/// stop. The receipt is fsynced before the signal is submitted and survives
+/// response loss or Agent restart. In particular, it fixes cleanup to the
+/// socket inode owned by that accepted process incarnation; a later process
+/// which reuses the basename cannot be mistaken for the old residue.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct RootProvisionStopReceipt {
+    version: ContractVersion,
+    checkpoint_content_digest: Sha256Digest,
+    authorized_checkpoint_content_digest: Sha256Digest,
+    authority: VolumeRecord,
+    process: RootProvisionProcessEvidence,
+    socket: StableFsIdentity,
+    admission: RootProvisionRetirementAdmission,
+}
+
+impl RootProvisionStopReceipt {
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn new(
+        checkpoint: &RuntimeCheckpoint,
+        authorized: &AuthorizedBlockdCheckpoint,
+        authority: VolumeRecord,
+        process: RootProvisionProcessEvidence,
+        socket: RetainedExactControlSocket,
+        admission: RootProvisionRetirementAdmission,
+    ) -> Result<Self> {
+        let expectation = RootProvisionProcessExpectation::from_checkpoint(
+            checkpoint,
+            RootProvisionAuthoritySnapshot {
+                attachment: authorized.attachment.clone(),
+                volume: &authority,
+            },
+            process.executable_path.clone(),
+        )?;
+        anyhow::ensure!(
+            process.exactly_matches(&expectation),
+            "root-provision stop process is not its exact old expectation"
+        );
+        let receipt = Self {
+            version: ContractVersion::V1,
+            checkpoint_content_digest: checkpoint_content_digest(checkpoint)
+                .context("digest root-provision stop checkpoint")?,
+            authorized_checkpoint_content_digest: authorized_blockd_checkpoint_content_digest(
+                authorized,
+            )?,
+            authority,
+            process,
+            socket: socket.identity,
+            admission,
+        };
+        validate_root_provision_stop_receipt(&receipt)?;
+        Ok(receipt)
+    }
+
+    pub(crate) fn checkpoint_content_digest(&self) -> &Sha256Digest {
+        &self.checkpoint_content_digest
+    }
+
+    pub(crate) fn authorized_checkpoint_content_digest(&self) -> &Sha256Digest {
+        &self.authorized_checkpoint_content_digest
+    }
+
+    pub(crate) fn authority(&self) -> &VolumeRecord {
+        &self.authority
+    }
+
+    pub(crate) fn process(&self) -> &RootProvisionProcessEvidence {
+        &self.process
+    }
+
+    pub(crate) fn socket(&self) -> RetainedExactControlSocket {
+        RetainedExactControlSocket {
+            identity: self.socket,
+        }
+    }
+
+    pub(crate) fn admission(&self) -> &RootProvisionRetirementAdmission {
+        &self.admission
+    }
+
+    /// Reconstruct the old process expectation from a fresh point read. Lease
+    /// renewal may advance only `lease_expires_at`; every field which owns the
+    /// process and its remote-head handshake remains exact.
+    pub(crate) fn expectation_for_current_authority(
+        &self,
+        checkpoint: &RuntimeCheckpoint,
+        authorized: &AuthorizedBlockdCheckpoint,
+        current: &VolumeRecord,
+    ) -> Result<RootProvisionProcessExpectation> {
+        self.binds_retained_values(checkpoint, authorized)?;
+        let expectation = RootProvisionProcessExpectation::from_checkpoint(
+            checkpoint,
+            RootProvisionAuthoritySnapshot {
+                attachment: authorized.attachment.clone(),
+                volume: current,
+            },
+            self.process.executable_path.clone(),
+        )?;
+        anyhow::ensure!(
+            self.process.exactly_matches(&expectation)
+                && same_retirement_authority(&self.authority, current),
+            "current authority no longer owns the receipted root-provision process"
+        );
+        Ok(expectation)
+    }
+
+    pub(crate) fn binds_retained_values(
+        &self,
+        checkpoint: &RuntimeCheckpoint,
+        authorized: &AuthorizedBlockdCheckpoint,
+    ) -> Result<()> {
+        anyhow::ensure!(
+            checkpoint_content_digest(checkpoint)? == self.checkpoint_content_digest
+                && authorized_blockd_checkpoint_content_digest(authorized)?
+                    == self.authorized_checkpoint_content_digest,
+            "root-provision stop receipt belongs to another retained checkpoint or launch grant"
+        );
+        Ok(())
+    }
+
+    fn same_stop_attempt(&self, candidate: &Self) -> bool {
+        self.version == candidate.version
+            && self.checkpoint_content_digest == candidate.checkpoint_content_digest
+            && self.authorized_checkpoint_content_digest
+                == candidate.authorized_checkpoint_content_digest
+            && same_retirement_authority(&self.authority, &candidate.authority)
+            && self.process == candidate.process
+            && self.socket == candidate.socket
+    }
+}
+
+fn same_retirement_authority(before: &VolumeRecord, after: &VolumeRecord) -> bool {
+    before.volume_id == after.volume_id
+        && before.size_bytes == after.size_bytes
+        && before.durability == after.durability
+        && before.admin_state == after.admin_state
+        && before.head == after.head
+        && before.lease_owner == after.lease_owner
+        && before.lease_epoch == after.lease_epoch
+        && before.last_transition == after.last_transition
+        && before.lease_expires_at.is_some()
+        && after.lease_expires_at.is_some()
+}
+
+pub(crate) fn authorized_blockd_checkpoint_content_digest(
+    checkpoint: &AuthorizedBlockdCheckpoint,
+) -> Result<Sha256Digest> {
+    validate_authorized_blockd_checkpoint(checkpoint)?;
+    let bytes = bounded_json(
+        checkpoint,
+        MAX_LAUNCH_CHECKPOINT_BYTES,
+        "authorized blockd launch checkpoint",
+    )?;
+    Ok(Sha256Digest::from_bytes(Sha256::digest(bytes).into()))
+}
+
+pub(crate) fn encode_root_provision_stop_receipt(
+    receipt: &RootProvisionStopReceipt,
+) -> Result<Vec<u8>> {
+    validate_root_provision_stop_receipt(receipt)?;
+    bounded_json(
+        receipt,
+        ROOT_PROVISION_STOP_RECEIPT_MAX_BYTES,
+        "root-provision stop receipt",
+    )
+}
+
+pub(crate) fn decode_root_provision_stop_receipt(bytes: &[u8]) -> Result<RootProvisionStopReceipt> {
+    anyhow::ensure!(
+        bytes.len() <= ROOT_PROVISION_STOP_RECEIPT_MAX_BYTES,
+        "root-provision stop receipt exceeds its bound"
+    );
+    let receipt: RootProvisionStopReceipt =
+        serde_json::from_slice(bytes).context("decode root-provision stop receipt")?;
+    anyhow::ensure!(
+        serde_json::to_vec(&receipt).context("re-encode root-provision stop receipt")? == bytes,
+        "root-provision stop receipt is not canonical"
+    );
+    validate_root_provision_stop_receipt(&receipt)?;
+    Ok(receipt)
+}
+
+fn validate_root_provision_stop_receipt(receipt: &RootProvisionStopReceipt) -> Result<()> {
+    anyhow::ensure!(
+        receipt.version == ContractVersion::V1
+            && Path::new(receipt.process.control_socket_path.as_str())
+                == Path::new(receipt.process.data_directory.as_str()).join("root-provision.sock"),
+        "root-provision stop receipt does not bind one old checkpoint attempt"
+    );
+    validate_volume_record(&receipt.authority)
+        .context("root-provision stop receipt authority is not closed")?;
+    anyhow::ensure!(
+        receipt.process.process_id > 0
+            && receipt.process.unit_main_process_id == receipt.process.process_id
+            && receipt.process.process_start_time_ticks.get() > 0
+            && receipt.process.cgroup_process_ids == [receipt.process.process_id]
+            && receipt.process.handshake.peer_process_id == receipt.process.process_id
+            && receipt.process.ownership_token == receipt.process.handshake.process_identity_token
+            && receipt.authority.volume_id == receipt.process.handshake.identity.volume_id
+            && receipt.authority.size_bytes == receipt.process.handshake.size_bytes
+            && receipt.authority.durability == receipt.process.handshake.durability
+            && receipt.authority.lease_owner.as_ref()
+                == Some(&receipt.process.handshake.identity.attachment_id)
+            && receipt.authority.lease_epoch == receipt.process.handshake.identity.attachment_epoch
+            && receipt.authority.head == receipt.process.handshake.remote_head
+            && receipt.process.handshake.control_only
+            && !receipt.process.handshake.guest_io_enabled,
+        "root-provision stop receipt process and authority are not one exact control attempt"
+    );
+    anyhow::ensure!(
+        receipt.socket.device > 0 && receipt.socket.inode > 0,
+        "root-provision stop receipt socket lacks a stable filesystem identity"
+    );
+    anyhow::ensure!(
+        receipt.socket.mode & STAT_FILE_TYPE_MASK == STAT_SOCKET_FILE_TYPE
+            && receipt.socket.links == 1
+            && receipt.socket.mode & 0o7777 == 0o700,
+        "root-provision stop receipt socket has an unsafe type, link count, or mode"
+    );
+    anyhow::ensure!(
+        receipt.admission.agent_session_epoch.get() > 0
+            && receipt.admission.inventory_epoch.get() > 0
+            && receipt.admission.inventory_read_position.get() > 0,
+        "root-provision stop receipt lacks a valid accepted-full admission"
+    );
+    Ok(())
 }
 
 /// Descriptor-relative store rooted in the identity-selected Node state fd.
@@ -132,6 +381,142 @@ impl AuthorizedBlockdStore {
             "adopted authorized-serving candidate conflicts with scanned identity"
         );
         self.prepare_adopted(desired, volume, &attachment)
+    }
+
+    /// Reopen the immutable launch inputs named by an already persisted
+    /// `ProvisionRootImage` checkpoint without interpreting them through the
+    /// current Desired. This is the read-only retirement path for a
+    /// superseded control process: every directory and file is opened beneath
+    /// the retained Node-state descriptor, the leaf is locked, and missing or
+    /// conflicting bytes fail closed rather than being repaired.
+    pub(crate) fn retain_exact_runtime_checkpoint(
+        &self,
+        runtime: &RuntimeCheckpoint,
+    ) -> Result<RetainedAuthorizedBlockd> {
+        let ReconcileStep::ProvisionRootImage {
+            volume_id,
+            attachment_id,
+            attachment_epoch,
+            data_directory,
+            size_bytes,
+            boot_image_digest,
+            expected_blank_head,
+            ..
+        } = &runtime.step
+        else {
+            anyhow::bail!("exact authorized blockd reopen requires provision_root_image")
+        };
+        let components = [
+            DATA_DIRECTORY.to_owned(),
+            format!("cat-{}", runtime.cat_id),
+            format!("volume-{volume_id}"),
+            format!("attachment-{attachment_id}"),
+            format!("epoch-{}", attachment_epoch.get()),
+        ];
+        let expected_directory = components.iter().fold(
+            self.state_directory.path().to_path_buf(),
+            |path, component| path.join(component),
+        );
+        anyhow::ensure!(
+            Path::new(data_directory.as_str()) == expected_directory,
+            "provision checkpoint data directory is not its exact retained Node path"
+        );
+
+        let root_directory = self
+            .state_directory
+            .try_clone_directory()
+            .context("clone retained Node state directory")?;
+        let root_identity =
+            verify_retained_state_root(&root_directory, self.state_directory.path())?;
+        let mut relative = PathBuf::new();
+        let mut directory = root_directory
+            .try_clone()
+            .context("clone retained Node state directory descriptor")?;
+        let mut component_identities = Vec::with_capacity(components.len());
+        for component in &components {
+            relative.push(component);
+            directory =
+                open_existing_directory_at(&directory, component, &relative, &root_identity)?;
+            component_identities.push(stable_identity(&directory, &relative)?);
+        }
+        lock_directory(&directory).with_context(|| {
+            format!(
+                "lock exact authorized blockd directory {}",
+                relative.display()
+            )
+        })?;
+        for temporary in [
+            IDENTITY_TEMP,
+            AUTHORIZED_SERVING_TEMP,
+            LAUNCH_CHECKPOINT_TEMP,
+        ] {
+            let path = relative.join(temporary);
+            let name = c_string(temporary, &path)?;
+            anyhow::ensure!(
+                read_optional_bounded(&directory, &name, &path, MAX_LAUNCH_CHECKPOINT_BYTES)?
+                    .is_none(),
+                "exact authorized blockd reopen found unpublished input {}",
+                path.display()
+            );
+        }
+
+        let (identity, identity_file): (AttachmentLineageIdentity, _) = read_required_canonical(
+            &directory,
+            &relative,
+            IDENTITY_FILE,
+            MAX_IDENTITY_BYTES,
+            "attachment identity",
+            &root_identity,
+        )?;
+        let (attachment, attachment_file): (AuthorizedServingAttachment, _) =
+            read_required_canonical(
+                &directory,
+                &relative,
+                AUTHORIZED_SERVING_FILE,
+                MAX_AUTHORIZED_SERVING_BYTES,
+                "authorized serving attachment",
+                &root_identity,
+            )?;
+        let (checkpoint, checkpoint_file): (AuthorizedBlockdCheckpoint, _) =
+            read_required_canonical(
+                &directory,
+                &relative,
+                LAUNCH_CHECKPOINT_FILE,
+                MAX_LAUNCH_CHECKPOINT_BYTES,
+                "authorized blockd launch checkpoint",
+                &root_identity,
+            )?;
+        validate_authorized_blockd_checkpoint(&checkpoint)?;
+        anyhow::ensure!(
+            identity == attachment.identity
+                && attachment == checkpoint.attachment
+                && runtime.cat_id == checkpoint.desired.cat_id
+                && runtime.node_id == checkpoint.desired.placement.node_id
+                && runtime.placement_epoch == checkpoint.desired.placement.placement_epoch
+                && runtime.desired_revision == checkpoint.desired.desired_revision
+                && runtime.spec_digest == checkpoint.desired.spec_digest
+                && *volume_id == checkpoint.volume.volume_id
+                && *attachment_id == identity.attachment_id
+                && *attachment_epoch == identity.attachment_epoch
+                && *size_bytes == attachment.size_bytes
+                && *boot_image_digest == checkpoint.desired.runtime.boot_image_digest
+                && *expected_blank_head == attachment.head,
+            "Runtime checkpoint and immutable authorized blockd inputs conflict"
+        );
+
+        let retained = RetainedAuthorizedBlockd {
+            state_directory: self.state_directory.clone(),
+            root_directory,
+            root_identity,
+            components,
+            component_identities,
+            data_directory: expected_directory,
+            checkpoint,
+            directory,
+            files: [identity_file, attachment_file, checkpoint_file],
+        };
+        retained.assert_current()?;
+        Ok(retained)
     }
 
     fn prepare_validated(
@@ -238,6 +623,410 @@ pub struct PreparedAuthorizedBlockd {
     launch_checkpoint_path: PathBuf,
     checkpoint: AuthorizedBlockdCheckpoint,
     _directory_lock: File,
+}
+
+/// Read-only, descriptor-retained proof of the immutable launch inputs for a
+/// superseded control process. Unlike [`PreparedAuthorizedBlockd`], this value
+/// can neither create nor repair a file. `assert_current` reopens every lexical
+/// component and input immediately before a destructive retirement action, so
+/// a rename/recreate ABA cannot authorize that action through stale fds.
+pub(crate) struct RetainedAuthorizedBlockd {
+    state_directory: StateDirectory,
+    root_directory: File,
+    root_identity: StableFsIdentity,
+    components: [String; 5],
+    component_identities: Vec<StableFsIdentity>,
+    data_directory: PathBuf,
+    checkpoint: AuthorizedBlockdCheckpoint,
+    directory: File,
+    files: [RetainedExactFile; 3],
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct StableFsIdentity {
+    device: u64,
+    inode: u64,
+    mode: u32,
+    links: u64,
+    uid: u32,
+    gid: u32,
+    length: u64,
+    modified_seconds: i64,
+    modified_nanoseconds: i64,
+    changed_seconds: i64,
+    changed_nanoseconds: i64,
+}
+
+struct RetainedExactFile {
+    name: &'static str,
+    file: File,
+    identity: StableFsIdentity,
+    bytes: Vec<u8>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ExactControlSocketCleanup {
+    Removed,
+    AlreadyAbsent,
+    LiveOrChanged,
+}
+
+pub(crate) enum StopReceiptSettlement {
+    Absent,
+    Stable(RootProvisionStopReceipt),
+    Recovered(RootProvisionStopReceipt),
+}
+
+pub(crate) enum StopReceiptPublication {
+    Stable(RootProvisionStopReceipt),
+    Published(RootProvisionStopReceipt),
+    Recovered(RootProvisionStopReceipt),
+}
+
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct RetainedExactControlSocket {
+    identity: StableFsIdentity,
+}
+
+impl RetainedAuthorizedBlockd {
+    pub(crate) fn checkpoint(&self) -> &AuthorizedBlockdCheckpoint {
+        &self.checkpoint
+    }
+
+    pub(crate) fn assert_current(&self) -> Result<()> {
+        anyhow::ensure!(
+            verify_retained_state_root(&self.root_directory, self.state_directory.path())?
+                == self.root_identity,
+            "retained Node state directory changed identity"
+        );
+        let current_root = self
+            .state_directory
+            .try_clone_directory()
+            .context("reopen current Node state directory")?;
+        anyhow::ensure!(
+            verify_retained_state_root(&current_root, self.state_directory.path())?
+                == self.root_identity,
+            "lexical Node state directory changed identity"
+        );
+        let mut current = current_root;
+        let mut relative = PathBuf::new();
+        for (component, expected) in self.components.iter().zip(self.component_identities.iter()) {
+            relative.push(component);
+            current =
+                open_existing_directory_at(&current, component, &relative, &self.root_identity)?;
+            anyhow::ensure!(
+                stable_identity(&current, &relative)? == *expected,
+                "authorized blockd path component {} changed identity",
+                relative.display()
+            );
+        }
+        anyhow::ensure!(
+            stable_identity(&self.directory, &self.data_directory)?
+                == *self
+                    .component_identities
+                    .last()
+                    .context("retained authorized blockd path is empty")?,
+            "retained authorized blockd leaf changed identity"
+        );
+        for retained in &self.files {
+            retained.assert_current(&current, &self.root_identity, &self.data_directory)?;
+        }
+        Ok(())
+    }
+
+    /// Recover an exact sidecar publication, if present. A valid temp could
+    /// only have been written before the stop signal: publishing it is safe
+    /// even when the process exited independently, and preserves the socket
+    /// identity needed by the later cleanup. Conflicting/partial bytes remain
+    /// fail-closed residue.
+    pub(crate) fn settle_stop_receipt(&self) -> Result<StopReceiptSettlement> {
+        self.assert_current()?;
+        let target = self.read_stop_receipt_bytes(ROOT_PROVISION_STOP_RECEIPT_FILE)?;
+        let temporary = self.read_stop_receipt_bytes(ROOT_PROVISION_STOP_RECEIPT_TEMP)?;
+        match (target, temporary) {
+            (None, None) => Ok(StopReceiptSettlement::Absent),
+            (Some(target), None) => {
+                let receipt = decode_root_provision_stop_receipt(&target)?;
+                self.validate_receipt_for_retained_inputs(&receipt)?;
+                Ok(StopReceiptSettlement::Stable(receipt))
+            }
+            (Some(target), Some(temporary)) => {
+                anyhow::ensure!(
+                    target == temporary,
+                    "root-provision stop receipt target and temp conflict"
+                );
+                let receipt = decode_root_provision_stop_receipt(&target)?;
+                self.validate_receipt_for_retained_inputs(&receipt)?;
+                let temp = c_string(
+                    ROOT_PROVISION_STOP_RECEIPT_TEMP,
+                    &self.data_directory.join(ROOT_PROVISION_STOP_RECEIPT_TEMP),
+                )?;
+                unlink_at(&self.directory, &temp)
+                    .context("remove recovered root-provision stop receipt temp")?;
+                self.directory
+                    .sync_all()
+                    .context("sync recovered root-provision stop receipt temp removal")?;
+                Ok(StopReceiptSettlement::Recovered(receipt))
+            }
+            (None, Some(temporary)) => {
+                let receipt = decode_root_provision_stop_receipt(&temporary)?;
+                self.validate_receipt_for_retained_inputs(&receipt)?;
+                let target = c_string(
+                    ROOT_PROVISION_STOP_RECEIPT_FILE,
+                    &self.data_directory.join(ROOT_PROVISION_STOP_RECEIPT_FILE),
+                )?;
+                let temp = c_string(
+                    ROOT_PROVISION_STOP_RECEIPT_TEMP,
+                    &self.data_directory.join(ROOT_PROVISION_STOP_RECEIPT_TEMP),
+                )?;
+                anyhow::ensure!(
+                    read_optional_bounded(
+                        &self.directory,
+                        &target,
+                        &self.data_directory.join(ROOT_PROVISION_STOP_RECEIPT_FILE),
+                        ROOT_PROVISION_STOP_RECEIPT_MAX_BYTES,
+                    )?
+                    .is_none(),
+                    "root-provision stop receipt target appeared during recovery"
+                );
+                rename_at(&self.directory, &temp, &self.directory, &target)
+                    .context("publish recovered root-provision stop receipt")?;
+                self.directory
+                    .sync_all()
+                    .context("sync recovered root-provision stop receipt")?;
+                Ok(StopReceiptSettlement::Recovered(receipt))
+            }
+        }
+    }
+
+    /// Durably publish or reopen the immutable journal before signalling. A
+    /// replay may carry a later accepted-full admission, but every field which
+    /// identifies the old checkpoint/process/socket/authority must be exact.
+    pub(crate) fn persist_or_reopen_stop_receipt(
+        &mut self,
+        candidate: &RootProvisionStopReceipt,
+    ) -> Result<StopReceiptPublication> {
+        match self.settle_stop_receipt()? {
+            StopReceiptSettlement::Stable(receipt) => {
+                anyhow::ensure!(
+                    receipt.same_stop_attempt(candidate),
+                    "existing root-provision stop receipt belongs to another attempt"
+                );
+                Ok(StopReceiptPublication::Stable(receipt))
+            }
+            StopReceiptSettlement::Recovered(receipt) => {
+                anyhow::ensure!(
+                    receipt.same_stop_attempt(candidate),
+                    "recovered root-provision stop receipt belongs to another attempt"
+                );
+                Ok(StopReceiptPublication::Recovered(receipt))
+            }
+            StopReceiptSettlement::Absent => {
+                self.validate_receipt_for_retained_inputs(candidate)?;
+                let bytes = encode_root_provision_stop_receipt(candidate)?;
+                let temp_path = self.data_directory.join(ROOT_PROVISION_STOP_RECEIPT_TEMP);
+                let temp = c_string(ROOT_PROVISION_STOP_RECEIPT_TEMP, &temp_path)?;
+                let mut file = open_at(
+                    &self.directory,
+                    &temp,
+                    libc::O_WRONLY
+                        | libc::O_CREAT
+                        | libc::O_EXCL
+                        | libc::O_NOFOLLOW
+                        | libc::O_CLOEXEC,
+                    0o600,
+                )
+                .with_context(|| format!("create {}", temp_path.display()))?;
+                verify_retained_regular_file(&file, &temp_path, &self.root_identity, Some(0))?;
+                file.write_all(&bytes)
+                    .context("write root-provision stop receipt temp")?;
+                file.sync_all()
+                    .context("sync root-provision stop receipt temp")?;
+                verify_retained_regular_file(
+                    &file,
+                    &temp_path,
+                    &self.root_identity,
+                    Some(bytes.len()),
+                )?;
+                let target_path = self.data_directory.join(ROOT_PROVISION_STOP_RECEIPT_FILE);
+                let target = c_string(ROOT_PROVISION_STOP_RECEIPT_FILE, &target_path)?;
+                anyhow::ensure!(
+                    read_optional_bounded(
+                        &self.directory,
+                        &target,
+                        &target_path,
+                        ROOT_PROVISION_STOP_RECEIPT_MAX_BYTES,
+                    )?
+                    .is_none(),
+                    "root-provision stop receipt target appeared before publish"
+                );
+                rename_at(&self.directory, &temp, &self.directory, &target)
+                    .context("publish root-provision stop receipt")?;
+                self.directory
+                    .sync_all()
+                    .context("sync root-provision stop receipt publication")?;
+                let current_leaf = stable_identity(&self.directory, &self.data_directory)?;
+                *self
+                    .component_identities
+                    .last_mut()
+                    .context("retained authorized blockd path is empty")? = current_leaf;
+                Ok(StopReceiptPublication::Published(candidate.clone()))
+            }
+        }
+    }
+
+    pub(crate) fn remove_stop_receipt(&self, expected: &RootProvisionStopReceipt) -> Result<()> {
+        self.assert_current()?;
+        let bytes = encode_root_provision_stop_receipt(expected)?;
+        anyhow::ensure!(
+            self.read_stop_receipt_bytes(ROOT_PROVISION_STOP_RECEIPT_FILE)?
+                .as_deref()
+                == Some(bytes.as_slice())
+                && self
+                    .read_stop_receipt_bytes(ROOT_PROVISION_STOP_RECEIPT_TEMP)?
+                    .is_none(),
+            "root-provision stop receipt changed before cleanup"
+        );
+        let target = c_string(
+            ROOT_PROVISION_STOP_RECEIPT_FILE,
+            &self.data_directory.join(ROOT_PROVISION_STOP_RECEIPT_FILE),
+        )?;
+        unlink_at(&self.directory, &target).context("unlink exact root-provision stop receipt")?;
+        self.directory
+            .sync_all()
+            .context("sync root-provision stop receipt removal")?;
+        anyhow::ensure!(
+            self.read_stop_receipt_bytes(ROOT_PROVISION_STOP_RECEIPT_FILE)?
+                .is_none(),
+            "root-provision stop receipt reappeared during cleanup"
+        );
+        Ok(())
+    }
+
+    fn validate_receipt_for_retained_inputs(
+        &self,
+        receipt: &RootProvisionStopReceipt,
+    ) -> Result<()> {
+        validate_root_provision_stop_receipt(receipt)?;
+        anyhow::ensure!(
+            receipt.authorized_checkpoint_content_digest
+                == authorized_blockd_checkpoint_content_digest(&self.checkpoint)?
+                && Path::new(receipt.process.data_directory.as_str()) == self.data_directory,
+            "root-provision stop receipt is outside the retained old inputs"
+        );
+        Ok(())
+    }
+
+    fn read_stop_receipt_bytes(&self, name: &str) -> Result<Option<Vec<u8>>> {
+        let path = self.data_directory.join(name);
+        let name = c_string(name, &path)?;
+        read_optional_bounded(
+            &self.directory,
+            &name,
+            &path,
+            ROOT_PROVISION_STOP_RECEIPT_MAX_BYTES,
+        )
+    }
+
+    /// Capture the exact managed socket identity before process-absence
+    /// inspection. An absent pathname is synced before returning `None`, which
+    /// closes a prior unlink/acknowledgement-loss window.
+    pub(crate) fn retain_exact_control_socket(&self) -> Result<Option<RetainedExactControlSocket>> {
+        self.assert_current()?;
+        let socket = c_string("root-provision.sock", &self.data_directory)?;
+        let Some(identity) = stat_at_optional(&self.directory, &socket)? else {
+            self.directory
+                .sync_all()
+                .context("sync absent exact root-provision socket")?;
+            return Ok(None);
+        };
+        verify_retained_socket_identity(&identity, &self.root_identity)?;
+        Ok(Some(RetainedExactControlSocket { identity }))
+    }
+
+    /// Remove only the exact socket captured before the sealed absence sweep.
+    /// A connectable peer, pathname replacement, unsafe metadata, or any
+    /// uncertain connect result is preserved for the next full scan.
+    pub(crate) fn remove_exact_stale_control_socket(
+        &self,
+        retained: RetainedExactControlSocket,
+    ) -> Result<ExactControlSocketCleanup> {
+        self.assert_current()?;
+        let socket_name = "root-provision.sock";
+        let socket = c_string(socket_name, &self.data_directory.join(socket_name))?;
+        match nonblocking_unix_socket_state(&self.data_directory.join(socket_name))? {
+            UnixSocketState::ConnectableOrUnknown => {
+                return Ok(ExactControlSocketCleanup::LiveOrChanged)
+            }
+            UnixSocketState::Absent => {
+                self.directory
+                    .sync_all()
+                    .context("sync already-absent root-provision socket")?;
+                return Ok(ExactControlSocketCleanup::AlreadyAbsent);
+            }
+            UnixSocketState::Refused => {}
+        }
+        let Some(current) = stat_at_optional(&self.directory, &socket)? else {
+            self.directory
+                .sync_all()
+                .context("sync concurrently absent root-provision socket")?;
+            return Ok(ExactControlSocketCleanup::AlreadyAbsent);
+        };
+        if current != retained.identity
+            || verify_retained_socket_identity(&current, &self.root_identity).is_err()
+        {
+            return Ok(ExactControlSocketCleanup::LiveOrChanged);
+        }
+        unlink_at(&self.directory, &socket).context("unlink exact stale root-provision socket")?;
+        self.directory
+            .sync_all()
+            .context("sync exact stale root-provision socket removal")?;
+        anyhow::ensure!(
+            stat_at_optional(&self.directory, &socket)?.is_none(),
+            "root-provision socket reappeared during exact cleanup"
+        );
+        Ok(ExactControlSocketCleanup::Removed)
+    }
+}
+
+impl RetainedExactFile {
+    fn assert_current(
+        &self,
+        current_directory: &File,
+        root_identity: &StableFsIdentity,
+        data_directory: &Path,
+    ) -> Result<()> {
+        let path = data_directory.join(self.name);
+        verify_retained_regular_file(&self.file, &path, root_identity, Some(self.bytes.len()))?;
+        anyhow::ensure!(
+            stable_identity(&self.file, &path)? == self.identity,
+            "retained authorized blockd input {} changed identity",
+            path.display()
+        );
+        let name = c_string(self.name, &path)?;
+        let mut current = open_at(
+            current_directory,
+            &name,
+            libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_CLOEXEC | libc::O_NONBLOCK,
+            0,
+        )
+        .with_context(|| format!("reopen exact authorized blockd input {}", path.display()))?;
+        verify_retained_regular_file(&current, &path, root_identity, Some(self.bytes.len()))?;
+        let before = stable_identity(&current, &path)?;
+        let mut bytes = Vec::with_capacity(self.bytes.len());
+        std::io::Read::by_ref(&mut current)
+            .take(self.bytes.len() as u64 + 1)
+            .read_to_end(&mut bytes)
+            .with_context(|| format!("reread exact authorized blockd input {}", path.display()))?;
+        let after = stable_identity(&current, &path)?;
+        anyhow::ensure!(
+            before == self.identity && after == self.identity && bytes == self.bytes,
+            "authorized blockd input {} changed identity or bytes",
+            path.display()
+        );
+        Ok(())
+    }
 }
 
 impl PreparedAuthorizedBlockd {
@@ -635,6 +1424,34 @@ fn ensure_directory_at(parent: &File, name: &str, relative: &Path) -> Result<Fil
     Ok(directory)
 }
 
+fn open_existing_directory_at(
+    parent: &File,
+    name: &str,
+    relative: &Path,
+    root_identity: &StableFsIdentity,
+) -> Result<File> {
+    let name = c_string(name, relative)?;
+    let directory = open_at(
+        parent,
+        &name,
+        libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+        0,
+    )
+    .with_context(|| format!("open {}", relative.display()))?;
+    let metadata = directory
+        .metadata()
+        .with_context(|| format!("inspect {}", relative.display()))?;
+    anyhow::ensure!(
+        metadata.file_type().is_dir()
+            && metadata.uid() == root_identity.uid
+            && metadata.gid() == root_identity.gid
+            && metadata.permissions().mode() & 0o7777 == 0o700,
+        "authorized blockd directory {} has unsafe metadata",
+        relative.display()
+    );
+    Ok(directory)
+}
+
 fn lock_directory(directory: &File) -> io::Result<()> {
     // SAFETY: the descriptor is live and flock retains no Rust memory. The
     // lock remains held by the returned Prepared object.
@@ -883,6 +1700,266 @@ fn read_optional_bounded(
     Ok(Some(bytes))
 }
 
+fn read_required_canonical<T>(
+    directory: &File,
+    relative_directory: &Path,
+    file_name: &str,
+    maximum: usize,
+    label: &str,
+    root_identity: &StableFsIdentity,
+) -> Result<(T, RetainedExactFile)>
+where
+    T: serde::de::DeserializeOwned + Serialize,
+{
+    let path = relative_directory.join(file_name);
+    let name = c_string(file_name, &path)?;
+    let mut file = open_at(
+        directory,
+        &name,
+        libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_CLOEXEC | libc::O_NONBLOCK,
+        0,
+    )
+    .with_context(|| format!("open exact {label} at {}", path.display()))?;
+    verify_retained_regular_file(&file, &path, root_identity, None)?;
+    let before = stable_identity(&file, &path)?;
+    anyhow::ensure!(
+        before.length <= maximum as u64,
+        "exact {label} exceeds its bounded size"
+    );
+    let mut bytes = Vec::with_capacity((before.length as usize).min(maximum));
+    std::io::Read::by_ref(&mut file)
+        .take(maximum as u64 + 1)
+        .read_to_end(&mut bytes)
+        .with_context(|| format!("read exact {label}"))?;
+    anyhow::ensure!(bytes.len() <= maximum, "exact {label} exceeds its bound");
+    let after = stable_identity(&file, &path)?;
+    anyhow::ensure!(before == after, "exact {label} changed while read");
+    let value = serde_json::from_slice(&bytes).with_context(|| format!("decode exact {label}"))?;
+    anyhow::ensure!(
+        serde_json::to_vec(&value).with_context(|| format!("re-encode exact {label}"))? == bytes,
+        "exact {label} is not canonical"
+    );
+    let name = match file_name {
+        IDENTITY_FILE => IDENTITY_FILE,
+        AUTHORIZED_SERVING_FILE => AUTHORIZED_SERVING_FILE,
+        LAUNCH_CHECKPOINT_FILE => LAUNCH_CHECKPOINT_FILE,
+        _ => anyhow::bail!("retained exact input has an unsupported name"),
+    };
+    Ok((
+        value,
+        RetainedExactFile {
+            name,
+            file,
+            identity: after,
+            bytes,
+        },
+    ))
+}
+
+fn verify_retained_state_root(file: &File, path: &Path) -> Result<StableFsIdentity> {
+    let metadata = file
+        .metadata()
+        .with_context(|| format!("inspect retained Node state root {}", path.display()))?;
+    // SAFETY: geteuid takes no pointers and cannot fail.
+    let euid = unsafe { libc::geteuid() };
+    anyhow::ensure!(
+        metadata.file_type().is_dir()
+            && metadata.uid() == euid
+            && metadata.permissions().mode() & 0o7022 == 0,
+        "retained Node state root {} has unsafe owner or mode",
+        path.display()
+    );
+    stable_identity(file, path)
+}
+
+fn verify_retained_regular_file(
+    file: &File,
+    path: &Path,
+    root_identity: &StableFsIdentity,
+    expected_len: Option<usize>,
+) -> Result<()> {
+    let metadata = file
+        .metadata()
+        .with_context(|| format!("inspect retained input {}", path.display()))?;
+    anyhow::ensure!(
+        metadata.file_type().is_file()
+            && metadata.nlink() == 1
+            && metadata.uid() == root_identity.uid
+            && metadata.gid() == root_identity.gid
+            && metadata.permissions().mode() & 0o7777 == 0o600
+            && expected_len.is_none_or(|len| metadata.len() == len as u64),
+        "retained input {} has unsafe identity, owner, or mode",
+        path.display()
+    );
+    Ok(())
+}
+
+fn stable_identity(file: &File, path: &Path) -> Result<StableFsIdentity> {
+    let metadata = file
+        .metadata()
+        .with_context(|| format!("inspect stable filesystem identity {}", path.display()))?;
+    anyhow::ensure!(metadata.ino() > 0, "{} has no stable inode", path.display());
+    Ok(StableFsIdentity {
+        device: metadata.dev(),
+        inode: metadata.ino(),
+        mode: metadata.mode(),
+        links: metadata.nlink(),
+        uid: metadata.uid(),
+        gid: metadata.gid(),
+        length: metadata.len(),
+        modified_seconds: metadata.mtime(),
+        modified_nanoseconds: metadata.mtime_nsec(),
+        changed_seconds: metadata.ctime(),
+        changed_nanoseconds: metadata.ctime_nsec(),
+    })
+}
+
+fn stat_at_optional(directory: &File, name: &CStr) -> Result<Option<StableFsIdentity>> {
+    // SAFETY: all-zero is a valid initial stat buffer and fstatat writes it
+    // only for this call. `directory` and `name` remain live throughout.
+    let mut metadata: libc::stat = unsafe { std::mem::zeroed() };
+    // SAFETY: `directory`, `name`, and the writable stat buffer remain live
+    // for this call; fstatat retains none of them.
+    let result = unsafe {
+        libc::fstatat(
+            directory.as_raw_fd(),
+            name.as_ptr(),
+            &raw mut metadata,
+            libc::AT_SYMLINK_NOFOLLOW,
+        )
+    };
+    if result != 0 {
+        let source = io::Error::last_os_error();
+        if source.kind() == io::ErrorKind::NotFound {
+            return Ok(None);
+        }
+        return Err(source).context("inspect exact root-provision socket basename");
+    }
+    Ok(Some(StableFsIdentity {
+        device: metadata.st_dev as u64,
+        inode: metadata.st_ino,
+        mode: raw_mode_to_u32(metadata.st_mode),
+        links: metadata.st_nlink as u64,
+        uid: metadata.st_uid,
+        gid: metadata.st_gid,
+        length: metadata.st_size as u64,
+        modified_seconds: metadata.st_mtime,
+        modified_nanoseconds: metadata.st_mtime_nsec,
+        changed_seconds: metadata.st_ctime,
+        changed_nanoseconds: metadata.st_ctime_nsec,
+    }))
+}
+
+fn verify_retained_socket_identity(
+    identity: &StableFsIdentity,
+    root_identity: &StableFsIdentity,
+) -> Result<()> {
+    anyhow::ensure!(
+        identity.mode & STAT_FILE_TYPE_MASK == STAT_SOCKET_FILE_TYPE
+            && identity.links == 1
+            && identity.uid == root_identity.uid
+            && identity.gid == root_identity.gid
+            && identity.mode & 0o7777 == 0o700,
+        "root-provision socket has unsafe type, identity, owner, or mode"
+    );
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+fn raw_mode_to_u32(mode: libc::mode_t) -> u32 {
+    mode
+}
+
+#[cfg(not(target_os = "linux"))]
+fn raw_mode_to_u32(mode: libc::mode_t) -> u32 {
+    u32::from(mode)
+}
+
+enum UnixSocketState {
+    Refused,
+    Absent,
+    ConnectableOrUnknown,
+}
+
+fn nonblocking_unix_socket_state(path: &Path) -> Result<UnixSocketState> {
+    use std::mem::offset_of;
+    use std::os::unix::ffi::OsStrExt as _;
+
+    let bytes = path.as_os_str().as_bytes();
+    // SAFETY: zero is a valid initial sockaddr_un representation; all used
+    // fields and bytes are initialized below before connect.
+    let mut address: libc::sockaddr_un = unsafe { std::mem::zeroed() };
+    anyhow::ensure!(
+        !bytes.is_empty() && bytes.len() < address.sun_path.len() && !bytes.contains(&0),
+        "root-provision socket path is not connectable"
+    );
+    let address_length = offset_of!(libc::sockaddr_un, sun_path) + bytes.len() + 1;
+    let socket_type = libc::SOCK_STREAM;
+    #[cfg(target_os = "linux")]
+    let socket_type = socket_type | libc::SOCK_CLOEXEC | libc::SOCK_NONBLOCK;
+    // SAFETY: socket returns a fresh descriptor and retains no Rust memory.
+    let descriptor = unsafe { libc::socket(libc::AF_UNIX, socket_type, 0) };
+    if descriptor < 0 {
+        return Ok(UnixSocketState::ConnectableOrUnknown);
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        // SAFETY: descriptor is live; fcntl consumes and returns only integer
+        // descriptor/status flags.
+        let status = unsafe { libc::fcntl(descriptor, libc::F_GETFL) };
+        // SAFETY: descriptor is still owned and fcntl retains no Rust memory.
+        let set_nonblocking =
+            unsafe { libc::fcntl(descriptor, libc::F_SETFL, status | libc::O_NONBLOCK) } == 0;
+        // SAFETY: descriptor is still owned and fcntl retains no Rust memory.
+        let set_close_on_exec =
+            unsafe { libc::fcntl(descriptor, libc::F_SETFD, libc::FD_CLOEXEC) } == 0;
+        let nonblocking = status >= 0 && set_nonblocking && set_close_on_exec;
+        if !nonblocking {
+            // SAFETY: this function still owns descriptor.
+            unsafe { libc::close(descriptor) };
+            return Ok(UnixSocketState::ConnectableOrUnknown);
+        }
+    }
+    address.sun_family = libc::AF_UNIX as libc::sa_family_t;
+    #[cfg(any(
+        target_os = "macos",
+        target_os = "ios",
+        target_os = "freebsd",
+        target_os = "netbsd",
+        target_os = "openbsd",
+        target_os = "dragonfly"
+    ))]
+    {
+        let Ok(length) = u8::try_from(address_length) else {
+            // SAFETY: this function still owns descriptor.
+            unsafe { libc::close(descriptor) };
+            return Ok(UnixSocketState::ConnectableOrUnknown);
+        };
+        address.sun_len = length;
+    }
+    for (target, source) in address.sun_path.iter_mut().zip(bytes.iter().copied()) {
+        *target = source as libc::c_char;
+    }
+    // SAFETY: descriptor and address are initialized for this call and retain
+    // no borrowed Rust memory.
+    let connected = unsafe {
+        libc::connect(
+            descriptor,
+            (&raw const address).cast::<libc::sockaddr>(),
+            address_length as libc::socklen_t,
+        )
+    };
+    let error = (connected != 0).then(io::Error::last_os_error);
+    // SAFETY: this function owns descriptor exactly once.
+    unsafe { libc::close(descriptor) };
+    Ok(match error.and_then(|error| error.raw_os_error()) {
+        None => UnixSocketState::ConnectableOrUnknown,
+        Some(libc::ECONNREFUSED) => UnixSocketState::Refused,
+        Some(libc::ENOENT) => UnixSocketState::Absent,
+        Some(_) => UnixSocketState::ConnectableOrUnknown,
+    })
+}
+
 fn verify_regular_file(file: &File, path: &Path, expected_len: Option<u64>) -> Result<()> {
     let metadata = file
         .metadata()
@@ -893,7 +1970,7 @@ fn verify_regular_file(file: &File, path: &Path, expected_len: Option<u64>) -> R
         metadata.file_type().is_file()
             && metadata.nlink() == 1
             && metadata.uid() == euid
-            && metadata.permissions().mode() & 0o777 == 0o600
+            && metadata.permissions().mode() & 0o7777 == 0o600
             && expected_len.is_none_or(|len| metadata.len() == len),
         "authorized blockd file {} has unsafe metadata",
         path.display()
@@ -1072,13 +2149,15 @@ mod tests {
 
     use cats_api::runtime_reconciliation::{
         spec_digest, AcquireOrigin, AsciiText, AssignedKind, AssignedPlacement, Epoch, FenceEpoch,
-        Generation, GuestDeviceIdentity, Id, Ipv4Address, IsolatedIpv4Kind, MacAddress,
-        NetworkConfig, NormalAcquireRequest, NormalAcquireResult, RandomId128, RemoteHead,
-        Revision, RuntimeConfig, RuntimeTransition, Sha256Digest, UnixMillis,
+        Generation, GuestDeviceIdentity, HostPath, Id, Ipv4Address, IsolatedIpv4Kind,
+        LastVolumeTransition, MacAddress, NetworkConfig, NodeBootId, NormalAcquireRequest,
+        NormalAcquireResult, RandomId128, RemoteHead, Revision, RuntimeConfig, RuntimeTransition,
+        Sequence, Sha256Digest, UnixMillis, VolumeAdminState, WireU64,
     };
     use cats_storage::authority::AttachmentLineageIdentity;
     use cats_storage::AdapterConfig;
 
+    use super::super::root_provision_process::RootProvisionBlockdHandshake;
     use super::*;
 
     fn id(value: &str) -> Id {
@@ -1247,6 +2326,113 @@ mod tests {
             max_staged_packs: 102,
             max_local_bytes: 103,
         }
+    }
+
+    fn maximally_escaped_host_path(length: usize) -> HostPath {
+        assert!(length >= 2);
+        let mut path = String::from("/");
+        while path.len() < length {
+            path.push(if path.len() % 2 == 0 { '\\' } else { '"' });
+        }
+        HostPath::new(path).unwrap()
+    }
+
+    #[test]
+    fn maximum_physical_identity_receipt_stays_within_the_closed_scan_budget() {
+        let (_, _, attachment) = fixture();
+        let authority = VolumeRecord {
+            volume_id: attachment.identity.volume_id.clone(),
+            size_bytes: attachment.size_bytes,
+            durability: attachment.durability,
+            admin_state: VolumeAdminState::Active,
+            head: attachment.head.clone(),
+            lease_owner: Some(attachment.identity.attachment_id.clone()),
+            lease_epoch: attachment.identity.attachment_epoch,
+            lease_expires_at: Some(attachment.lease_expires_at),
+            last_transition: Some(LastVolumeTransition::NormalAcquire {
+                request: attachment.acquire_request.clone(),
+                result: attachment.acquire_result.clone(),
+            }),
+        };
+        let executable_path = maximally_escaped_host_path(4096);
+        let cgroup_path = maximally_escaped_host_path(4096);
+        let suffix = "/root-provision.sock";
+        let data_directory = maximally_escaped_host_path(4096 - suffix.len());
+        let control_socket_path =
+            HostPath::new(format!("{}{suffix}", data_directory.as_str())).unwrap();
+        let process_id = 4242;
+        let process_identity_token = random(4);
+        let process = RootProvisionProcessEvidence {
+            process_id,
+            unit_main_process_id: process_id,
+            process_start_time_ticks: WireU64::new(u64::MAX / 2).unwrap(),
+            executable_path,
+            scope_id: id(&"s".repeat(128)),
+            cgroup_path,
+            cgroup_process_ids: vec![process_id],
+            control_socket_path,
+            data_directory,
+            ownership_token: process_identity_token.clone(),
+            handshake: RootProvisionBlockdHandshake {
+                peer_process_id: process_id,
+                identity: attachment.identity,
+                size_bytes: attachment.size_bytes,
+                durability: attachment.durability,
+                remote_head: attachment.head,
+                process_identity_token,
+                control_only: true,
+                guest_io_enabled: false,
+            },
+        };
+        // SAFETY CONTRACT TEST: these are the exact fields serialized by the
+        // private constructor after it has descriptor-retained the socket.
+        let receipt = RootProvisionStopReceipt {
+            version: ContractVersion::V1,
+            checkpoint_content_digest: Sha256Digest::from_bytes([7; 32]),
+            authorized_checkpoint_content_digest: Sha256Digest::from_bytes([8; 32]),
+            authority,
+            process,
+            socket: StableFsIdentity {
+                device: u64::MAX,
+                inode: u64::MAX,
+                mode: STAT_SOCKET_FILE_TYPE | 0o700,
+                links: 1,
+                // Metadata ownership is checked against the retained state
+                // root before these values are admitted to a real receipt;
+                // the codec bound itself is independent of these scalars.
+                uid: 0,
+                gid: 0,
+                length: 0,
+                modified_seconds: i64::MAX,
+                modified_nanoseconds: 999_999_999,
+                changed_seconds: i64::MAX,
+                changed_nanoseconds: 999_999_999,
+            },
+            admission: RootProvisionRetirementAdmission {
+                node_boot_id: NodeBootId::new("11111111111111111111111111111111").unwrap(),
+                agent_instance_id: random(5),
+                agent_session_epoch: Epoch::new(i64::MAX as u64).unwrap(),
+                inventory_epoch: Epoch::new(i64::MAX as u64).unwrap(),
+                inventory_digest: Sha256Digest::from_bytes([9; 32]),
+                inventory_read_position: Sequence::new(i64::MAX as u64).unwrap(),
+            },
+        };
+        let encoded = encode_root_provision_stop_receipt(&receipt).unwrap();
+        assert!(
+            encoded.len() > 32 * 1024,
+            "max-path probe was not calibrated: {} bytes",
+            encoded.len()
+        );
+        assert!(encoded.len() <= ROOT_PROVISION_STOP_RECEIPT_MAX_BYTES);
+        assert!(
+            encoded.len() * 1024 <= 48 * 1024 * 1024,
+            "1,024 maximum-path receipts exceed the closed scan budget: {} bytes each",
+            encoded.len()
+        );
+        assert_eq!(
+            decode_root_provision_stop_receipt(&encoded).unwrap(),
+            receipt
+        );
     }
 
     fn argv(command: &Command) -> Vec<OsString> {
