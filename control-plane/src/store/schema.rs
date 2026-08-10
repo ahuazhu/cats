@@ -615,6 +615,11 @@ type RequiredDeferredForeignKey = (
 
 const REQUIRED_CHECK_CONSTRAINTS: &[(&str, &str, &str)] = &[
     (
+        "runtime_node_placement_policies",
+        "runtime_node_placement_policies_node_transport_target_check",
+        "CHECK ((node_transport_target ~ '^https://[a-z0-9.-]+:[1-9][0-9]{0,4}$'::text))",
+    ),
+    (
         "volume_records",
         "volume_records_owner_present_check",
         "CHECK (((lease_owner IS NULL) = (owner_binding IS NULL)))",
@@ -941,7 +946,8 @@ const AUTHORITY_SCHEMA_PROBES: &[&str] = &[
        FROM runtime_current_cat_observations WHERE FALSE",
     "SELECT node_id, record, policy_revision, scheduling_state,
             allocatable_vcpus, allocatable_memory_bytes,
-            guest_config_digest, block_frontend, guest_ipv4_network_address
+            guest_config_digest, block_frontend, guest_ipv4_network_address,
+            node_transport_target
        FROM runtime_node_placement_policies WHERE FALSE",
     "SELECT apply_id, request, request_sha256, principal, principal_kind,
             node_id, outcome, outcome_kind, committed_at_unix_ms
@@ -1591,7 +1597,10 @@ CREATE TABLE IF NOT EXISTS runtime_node_placement_policies (
         CHECK (guest_config_digest ~ '^sha256:[0-9a-f]{64}$'),
     block_frontend TEXT NOT NULL CHECK (block_frontend IN ('kernel_nbd', 'vhost_user_blk')),
     guest_ipv4_network_address TEXT NOT NULL
-        CHECK (guest_ipv4_network_address ~ '^[0-9]{1,3}([.][0-9]{1,3}){3}$')
+        CHECK (guest_ipv4_network_address ~ '^[0-9]{1,3}([.][0-9]{1,3}){3}$'),
+    node_transport_target TEXT NOT NULL
+        CONSTRAINT runtime_node_placement_policies_node_transport_target_check
+        CHECK (node_transport_target ~ '^https://[a-z0-9.-]+:[1-9][0-9]{0,4}$')
 );
 CREATE TABLE IF NOT EXISTS runtime_node_authority_apply_records (
     apply_id TEXT PRIMARY KEY,

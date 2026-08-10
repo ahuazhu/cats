@@ -159,7 +159,7 @@ mod tests {
     use super::*;
     use cats_api::route_grant_v2::{RouteGrantV2Compact, RouteGrantV2PublicKey};
     use cats_api::runtime_reconciliation::{
-        Epoch, Hostname, HttpProtocol, Id, RandomId128, UnixMillis,
+        Epoch, Hostname, HttpProtocol, Id, NodeTransportTarget, RandomId128, UnixMillis,
     };
 
     const PRIVATE_KEY: &[u8] =
@@ -177,6 +177,8 @@ mod tests {
             route_epoch: Epoch::new(7).unwrap(),
             protocol: HttpProtocol::Http,
             target_port: 8080,
+            node_transport_target: NodeTransportTarget::new("https://node-a.internal:7301")
+                .unwrap(),
             evaluated_at_unix_ms: UnixMillis::new(1_786_156_800_000).unwrap(),
         }
     }

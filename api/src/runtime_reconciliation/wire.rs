@@ -713,6 +713,7 @@ enum StringRule {
     KeyId,
     HostPath,
     Hostname,
+    NodeTransportTarget,
     Ipv4,
     Mac,
     Base64UrlNoPad,
@@ -1365,6 +1366,7 @@ fn valid_string(rule: StringRule, value: &str) -> bool {
         StringRule::KeyId => valid_key_id(value),
         StringRule::HostPath => valid_host_path(value),
         StringRule::Hostname => valid_hostname(value),
+        StringRule::NodeTransportTarget => valid_node_transport_target(value),
         StringRule::Ipv4 => valid_ipv4(value),
         StringRule::Mac => valid_mac(value),
         StringRule::Base64UrlNoPad => valid_base64url_no_pad(value),
@@ -4151,6 +4153,10 @@ fn node_placement_policy_schema() -> Schema {
         field("allocatable_memory_bytes", number(1, MAX_WIRE_INTEGER)),
         field("capabilities", runtime_placement_capabilities_schema()),
         field("guest_ipv4_pool", guest_ipv4_pool_schema()),
+        field(
+            "node_transport_target",
+            string(StringRule::NodeTransportTarget),
+        ),
     ])
 }
 

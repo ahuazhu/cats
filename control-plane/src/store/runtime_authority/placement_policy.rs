@@ -10,11 +10,11 @@ use cats_api::runtime_reconciliation::{
     encode_runtime_provisioner_active_set, encode_runtime_provisioner_trust_bundle,
     runtime_provisioner_active_set_digest, Base64UrlNoPad, ContractVersion, CredentialBinding,
     Epoch, FleetPolicyPrincipal, Id, NodeIdentity, NodeIdentityState, NodePlacementPolicy,
-    PublicKeyCredentialBinding, RuntimeNodeAuthorityApply, RuntimeNodeAuthorityApplyRecord,
-    RuntimeNodeAuthorityApplyResult, RuntimeNodeAuthorityMutation, RuntimeNodeAuthorityOutcome,
-    RuntimeNodeAuthorityStoredOutcome, RuntimeProvisionerActiveSet, RuntimeProvisionerCredential,
-    RuntimeProvisionerExpectedPrevious, RuntimeProvisionerTrustBundle, RuntimeSchedulingState,
-    Sha256Digest, UnixMillis,
+    NodeTransportTarget, PublicKeyCredentialBinding, RuntimeNodeAuthorityApply,
+    RuntimeNodeAuthorityApplyRecord, RuntimeNodeAuthorityApplyResult, RuntimeNodeAuthorityMutation,
+    RuntimeNodeAuthorityOutcome, RuntimeNodeAuthorityStoredOutcome, RuntimeProvisionerActiveSet,
+    RuntimeProvisionerCredential, RuntimeProvisionerExpectedPrevious,
+    RuntimeProvisionerTrustBundle, RuntimeSchedulingState, Sha256Digest, UnixMillis,
 };
 use cats_storage::authority::AuthorityError;
 use postgres::{Row, Transaction};
@@ -36,7 +36,7 @@ use crate::store::{ApiError, AuthorityRequestContext, Result, Store};
 const POLICY_COLUMNS: &str = "
     node_id, record::text AS record_json, policy_revision, scheduling_state,
     allocatable_vcpus, allocatable_memory_bytes, guest_config_digest,
-    block_frontend, guest_ipv4_network_address";
+    block_frontend, guest_ipv4_network_address, node_transport_target";
 const APPLY_COLUMNS: &str = "
     apply_id, request::text AS request_json, request_sha256,
     principal::text AS principal_json, principal_kind, node_id,
@@ -60,6 +60,7 @@ struct PolicyProjection {
     guest_config_digest: String,
     block_frontend: String,
     guest_ipv4_network_address: String,
+    node_transport_target: NodeTransportTarget,
 }
 
 impl PolicyProjection {
@@ -82,6 +83,7 @@ impl PolicyProjection {
             }
             .to_owned(),
             guest_ipv4_network_address: policy.guest_ipv4_pool.network_address.to_string(),
+            node_transport_target: policy.node_transport_target.clone(),
         })
     }
 
@@ -101,6 +103,10 @@ impl PolicyProjection {
                 &["kernel_nbd", "vhost_user_blk"],
             )?,
             guest_ipv4_network_address: row.try_get("guest_ipv4_network_address")?,
+            node_transport_target: NodeTransportTarget::new(
+                row.try_get::<_, String>("node_transport_target")?,
+            )
+            .ok_or_else(|| corrupt("stored Node transport target projection is malformed"))?,
         })
     }
 }
@@ -826,7 +832,8 @@ fn valid_policy_update(
     let static_changed = current.allocatable_vcpus != next.allocatable_vcpus
         || current.allocatable_memory_bytes != next.allocatable_memory_bytes
         || current.capabilities != next.capabilities
-        || current.guest_ipv4_pool != next.guest_ipv4_pool;
+        || current.guest_ipv4_pool != next.guest_ipv4_pool
+        || current.node_transport_target != next.node_transport_target;
     if !static_changed && current.scheduling_state == next.scheduling_state {
         return Ok(false);
     }
@@ -941,8 +948,9 @@ fn insert_policy(
         "INSERT INTO runtime_node_placement_policies (
             node_id, record, policy_revision, scheduling_state,
             allocatable_vcpus, allocatable_memory_bytes,
-            guest_config_digest, block_frontend, guest_ipv4_network_address
-         ) VALUES ($1, $2::TEXT::jsonb, $3, $4, $5, $6, $7, $8, $9)",
+            guest_config_digest, block_frontend, guest_ipv4_network_address,
+            node_transport_target
+         ) VALUES ($1, $2::TEXT::jsonb, $3, $4, $5, $6, $7, $8, $9, $10)",
         &[
             &projection.node_id,
             &record_json,
@@ -953,6 +961,7 @@ fn insert_policy(
             &projection.guest_config_digest,
             &projection.block_frontend,
             &projection.guest_ipv4_network_address,
+            &projection.node_transport_target.as_str(),
         ],
     )?)
 }
@@ -1010,8 +1019,9 @@ fn update_policy(
             SET record=$2::TEXT::jsonb, policy_revision=$3,
                 scheduling_state=$4, allocatable_vcpus=$5,
                 allocatable_memory_bytes=$6, guest_config_digest=$7,
-                block_frontend=$8, guest_ipv4_network_address=$9
-          WHERE node_id=$1 AND policy_revision=$10",
+                block_frontend=$8, guest_ipv4_network_address=$9,
+                node_transport_target=$10
+          WHERE node_id=$1 AND policy_revision=$11",
         &[
             &projection.node_id,
             &record_json,
@@ -1022,6 +1032,7 @@ fn update_policy(
             &projection.guest_config_digest,
             &projection.block_frontend,
             &projection.guest_ipv4_network_address,
+            &projection.node_transport_target.as_str(),
             &expected_revision,
         ],
     )?)

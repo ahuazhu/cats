@@ -195,6 +195,41 @@ pub(crate) fn valid_hostname(value: &str) -> bool {
         })
 }
 
+fn ipv4_number_like_hostname(value: &str) -> bool {
+    value.split('.').all(|component| {
+        component.bytes().all(|byte| byte.is_ascii_digit())
+            || component
+                .strip_prefix("0x")
+                .is_some_and(|digits| digits.bytes().all(|byte| byte.is_ascii_hexdigit()))
+    })
+}
+
+pub(crate) fn valid_node_transport_target(value: &str) -> bool {
+    if !(1..=512).contains(&value.len()) {
+        return false;
+    }
+    let Some(authority) = value.strip_prefix("https://") else {
+        return false;
+    };
+    if authority
+        .bytes()
+        .any(|byte| matches!(byte, b'/' | b'?' | b'#' | b'@'))
+    {
+        return false;
+    }
+    let Some((hostname, port)) = authority.rsplit_once(':') else {
+        return false;
+    };
+    valid_hostname(hostname)
+        && hostname.parse::<Ipv4Addr>().is_err()
+        && !ipv4_number_like_hostname(hostname)
+        && port
+            .parse::<u16>()
+            .ok()
+            .filter(|port| *port != 0)
+            .is_some_and(|parsed| parsed.to_string() == port)
+}
+
 pub(crate) fn valid_ipv4(value: &str) -> bool {
     value
         .parse::<Ipv4Addr>()
@@ -238,6 +273,7 @@ string_newtype!(GuestBootId, valid_random_id);
 string_newtype!(KeyId, valid_key_id);
 string_newtype!(HostPath, valid_host_path);
 string_newtype!(Hostname, valid_hostname);
+string_newtype!(NodeTransportTarget, valid_node_transport_target);
 string_newtype!(Ipv4Address, valid_ipv4);
 string_newtype!(MacAddress, valid_mac);
 string_newtype!(Base64UrlNoPad, valid_base64url_no_pad);
@@ -428,6 +464,7 @@ pub struct NodePlacementPolicy {
     pub allocatable_memory_bytes: AllocatableMemoryBytes,
     pub capabilities: RuntimePlacementCapabilities,
     pub guest_ipv4_pool: GuestIpv4Pool,
+    pub node_transport_target: NodeTransportTarget,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

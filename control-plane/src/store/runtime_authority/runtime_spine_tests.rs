@@ -9,21 +9,25 @@ use cats_api::error::ErrorCode;
 use cats_api::runtime_reconciliation::{
     decode_operation, encode_admission_inventory_attestation, encode_agent_session,
     encode_desired_read_snapshot, encode_node_observation, guest_config_digest, inventory_digest,
-    key_ring_digest, spec_digest, AgentRegistrationAttempt, AgentSession, AppliedDesiredEvidence,
-    AsciiText, AssignedKind, AssignedPlacement, BlockedReason, CheckpointEvidence, Condition,
-    ContractErrorDetail, ContractVersion, ControlHandshakeEvidence, CredentialBinding,
-    DesiredRuntimeSpec, EndpointIntent, Epoch, GuestBootId, GuestRuntimeProfileReceipt,
+    key_ring_digest, spec_digest, AgentRegistrationAttempt, AgentSession, AllocatableMemoryBytes,
+    AllocatableVcpus, AppliedDesiredEvidence, AsciiText, AssignedKind, AssignedPlacement,
+    BlockedReason, CheckpointEvidence, Condition, ContractErrorDetail, ContractVersion,
+    ControlHandshakeEvidence, CredentialBinding, DesiredRuntimeSpec, EndpointIntent, Epoch,
+    GuestBootId, GuestIpv4Pool, GuestIpv4PoolKind, GuestRuntimeProfileReceipt,
     GuestTransportEvidence, HostPath, Hostname, HttpProtocol, Id, InventorySource, Ipv4Address,
     IsolatedIpv4Kind, KeyId, LifecycleAdmission, MacAddress, NetworkConfig, NodeBootId,
-    NodeIdentity, NodeIdentityState, NodeObservation, ObservationInventoryAcceptance,
-    ObservedNetwork, ObservedRouteGate, ObservedRuntimeStatus, ObservedVmShape, Operation,
-    OperationFailure, OperationPhase, OperationTerminal, OwnershipTokenEvidence,
-    PlacementRejectionReason, PreconditionFailureReason, ProcessEvidence, ProcessRole,
-    ProcessState, QuarantineReason, RandomId128, ReadyReason, ReconcileStep, Revision,
-    RouteGateBinding, RouteGateState, RuntimeConfig, RuntimeTarget, RuntimeTransition, Sequence,
+    NodeIdentity, NodeIdentityState, NodeObservation, NodePlacementPolicy, NodeTransportTarget,
+    ObservationInventoryAcceptance, ObservedNetwork, ObservedRouteGate, ObservedRuntimeStatus,
+    ObservedVmShape, Operation, OperationFailure, OperationPhase, OperationTerminal,
+    OwnershipTokenEvidence, PlacementRejectionReason, PreconditionFailureReason, ProcessEvidence,
+    ProcessRole, ProcessState, QuarantineReason, RandomId128, ReadyReason, ReconcileStep, Revision,
+    RouteGateBinding, RouteGateState, RuntimeConfig, RuntimePlacementBlockFrontend,
+    RuntimePlacementCapabilities, RuntimePlacementGuestNetwork, RuntimePlacementGuestTransport,
+    RuntimePlacementVmm, RuntimeSchedulingState, RuntimeTarget, RuntimeTransition, Sequence,
     SessionBinding, Sha256Digest, StableState, UnixMillis, WarmSnapshotEvidence, WireU64,
 };
 
+use super::placement_policy::insert_policy_on_store_for_test;
 use super::product::{CatRecord, EndpointRecord, HostnameDesiredLookup};
 use super::product_rows::{
     insert_cat, insert_desired, insert_endpoint, insert_hostname_lookup, insert_operation,
@@ -62,6 +66,31 @@ fn release() -> GuestRuntimeProfileReceipt {
         initramfs_digest: Some(digest(2)),
         kernel_cmdline: AsciiText::new("console=hvc0 root=/dev/vda").unwrap(),
         guest_agent_protocol_version: ContractVersion::V1,
+    }
+}
+
+fn route_placement_policy(node_id: &Id, guest_config_digest: &Sha256Digest) -> NodePlacementPolicy {
+    NodePlacementPolicy {
+        version: ContractVersion::V1,
+        node_id: node_id.clone(),
+        policy_revision: Epoch::new(1).unwrap(),
+        scheduling_state: RuntimeSchedulingState::Cordoned,
+        allocatable_vcpus: AllocatableVcpus::new(8).unwrap(),
+        allocatable_memory_bytes: AllocatableMemoryBytes::new(16 << 30).unwrap(),
+        capabilities: RuntimePlacementCapabilities {
+            vmm: RuntimePlacementVmm::CloudHypervisor,
+            block_frontend: RuntimePlacementBlockFrontend::KernelNbd,
+            guest_network: RuntimePlacementGuestNetwork::IsolatedIpv4,
+            guest_transport: RuntimePlacementGuestTransport::Vsock,
+            guest_agent_protocol_version: ContractVersion::V1,
+            guest_config_digest: guest_config_digest.clone(),
+        },
+        guest_ipv4_pool: GuestIpv4Pool {
+            kind: GuestIpv4PoolKind::PrivateIpv4_16,
+            network_address: Ipv4Address::new("10.240.0.0").unwrap(),
+            prefix_length: 16,
+        },
+        node_transport_target: NodeTransportTarget::new("https://node-a.internal:7301").unwrap(),
     }
 }
 
@@ -2914,6 +2943,11 @@ fn route_ready_runtime(desired: &DesiredRuntimeSpec) -> ObservedRuntimeStatus {
 #[test]
 fn route_signer_snapshot_closes_hostname_runtime_and_ring_in_one_authority_read() {
     let (store, identity, authenticated, policy, session) = fixture();
+    insert_policy_on_store_for_test(
+        &store,
+        &route_placement_policy(&identity.node_id, policy.approved_guest_config_digest()),
+    )
+    .unwrap();
     let workspace = bootstrap_workspace(&store, "route-v2-snapshot");
     let endpoint_id = id("ep_route");
     let hostname = Hostname::new("route.cats.run").unwrap();
@@ -3011,6 +3045,10 @@ fn route_signer_snapshot_closes_hostname_runtime_and_ring_in_one_authority_read(
     assert_eq!(snapshot.node_id, identity.node_id);
     assert_eq!(snapshot.route_epoch.get(), 7);
     assert_eq!(snapshot.target_port, 8080);
+    assert_eq!(
+        snapshot.node_transport_target.as_str(),
+        "https://node-a.internal:7301"
+    );
     assert!(snapshot.evaluated_at_unix_ms.get() > 0);
 
     let unknown = KeyId::new("b".repeat(64)).unwrap();
@@ -3024,4 +3062,25 @@ fn route_signer_snapshot_closes_hostname_runtime_and_ring_in_one_authority_read(
             .unwrap(),
         RouteGrantV2AuthorityLoad::Rejected(RouteGrantV2AuthorityRejection::Unavailable)
     );
+
+    store
+        .with(|client| {
+            client
+                .execute(
+                    "UPDATE runtime_node_placement_policies
+                        SET record=jsonb_set(record, '{policy_revision}', '2'::jsonb),
+                            policy_revision=2,
+                            node_transport_target='https://node-b.internal:7301'",
+                    &[],
+                )
+                .map(|_| ())
+        })
+        .unwrap();
+    assert!(store
+        .load_route_grant_v2_authority(
+            &hostname,
+            &active_kid,
+            policy.approved_guest_config_digest(),
+        )
+        .is_err());
 }

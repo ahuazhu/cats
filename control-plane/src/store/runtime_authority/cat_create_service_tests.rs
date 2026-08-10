@@ -7,7 +7,7 @@ use cats_api::runtime_reconciliation::{
     decode_desired_runtime_spec, guest_config_digest, AllocatableMemoryBytes, AllocatableVcpus,
     AsciiText, AssignedKind, ContractVersion, DiskKind, Durability, Epoch, GuestIpv4Pool,
     GuestIpv4PoolKind, GuestRuntimeProfileReceipt, Id, Ipv4Address, NodeIdentityState,
-    NodePlacementPolicy, RandomId128, Revision, RuntimePlacementBlockFrontend,
+    NodePlacementPolicy, NodeTransportTarget, RandomId128, Revision, RuntimePlacementBlockFrontend,
     RuntimePlacementCapabilities, RuntimePlacementGuestNetwork, RuntimePlacementGuestTransport,
     RuntimePlacementVmm, RuntimeSchedulingState, RuntimeTarget, RuntimeTransition, Sha256Digest,
     VolumeAccess, VolumeAcquire, VolumeDisposition,
@@ -312,6 +312,7 @@ pub(crate) fn placement_policy(admission: &PlacementAdmissionSnapshot) -> NodePl
             network_address: Ipv4Address::new("10.0.0.0").unwrap(),
             prefix_length: 16,
         },
+        node_transport_target: NodeTransportTarget::new("https://node-a.internal:7301").unwrap(),
     }
 }
 

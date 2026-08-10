@@ -372,7 +372,7 @@ pub(crate) struct RuntimeNodeAuthorityAuth<'a> {
 
 #[derive(Subcommand, Debug)]
 pub enum RuntimeNodeCommand {
-    /// Atomically provision one Node identity and its initial cordoned policy.
+    /// Provision one identity and cordoned policy, including its trusted HTTPS transport target.
     Provision {
         #[arg(long)]
         identity: std::path::PathBuf,
@@ -398,6 +398,7 @@ pub enum RuntimeNodeCommand {
 
 #[derive(Subcommand, Debug)]
 pub enum RuntimeNodePolicyCommand {
+    /// Apply the complete policy, including the fleet-owned HTTPS Node transport target.
     Apply {
         #[arg(long)]
         node: String,

@@ -882,6 +882,47 @@ fn refuses_an_old_stamp_without_repairing_its_shape() {
 }
 
 #[test]
+fn refuses_current_stamp_without_node_transport_target_projection() {
+    assert_eq!(SCHEMA_VERSION, 12);
+    let url = crate::testsupport::isolated_control_store_url();
+    drop(Store::connect(&url, None).unwrap());
+    {
+        let mut admin = postgres::Client::connect(&url, postgres::NoTls).unwrap();
+        admin
+            .batch_execute(
+                "ALTER TABLE runtime_node_placement_policies
+                    DROP COLUMN node_transport_target;",
+            )
+            .unwrap();
+    }
+
+    let Err(error) = Store::connect(&url, None) else {
+        panic!("a stamped schema missing the transport target projection must fail closed");
+    };
+    assert_eq!(error.code, ErrorCode::FailedPrecondition);
+    assert!(error
+        .to_string()
+        .contains(&format!("version {SCHEMA_VERSION}")));
+
+    let mut admin = postgres::Client::connect(&url, postgres::NoTls).unwrap();
+    let column_still_absent: bool = admin
+        .query_one(
+            "SELECT NOT EXISTS (
+                SELECT 1 FROM information_schema.columns
+                 WHERE table_schema=current_schema()
+                   AND table_name='runtime_node_placement_policies'
+                   AND column_name='node_transport_target')",
+            &[],
+        )
+        .unwrap()
+        .get(0);
+    assert!(
+        column_still_absent,
+        "startup must not repair a stamped schema"
+    );
+}
+
+#[test]
 fn refuses_unstamped_partial_control_schema_without_adding_tables() {
     let url = crate::testsupport::isolated_control_store_url();
     let mut admin = postgres::Client::connect(&url, postgres::NoTls).unwrap();
@@ -999,6 +1040,13 @@ fn refuses_current_stamp_with_missing_authority_catalog_barriers() {
              BEFORE UPDATE OF record ON runtime_node_placement_policies
              FOR EACH ROW
              EXECUTE FUNCTION control_runtime_node_policy_update()",
+        "ALTER TABLE runtime_node_placement_policies
+             DROP CONSTRAINT runtime_node_placement_policies_node_transport_target_check",
+        "ALTER TABLE runtime_node_placement_policies
+             DROP CONSTRAINT runtime_node_placement_policies_node_transport_target_check;
+         ALTER TABLE runtime_node_placement_policies
+             ADD CONSTRAINT runtime_node_placement_policies_node_transport_target_check
+             CHECK (node_transport_target LIKE 'https://%')",
     ] {
         let url = crate::testsupport::isolated_control_store_url();
         drop(Store::connect(&url, None).unwrap());

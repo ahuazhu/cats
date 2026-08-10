@@ -17,11 +17,11 @@ use cats_api::runtime_reconciliation::{
     decode_runtime_node_authority_apply_result, encode_runtime_node_authority_apply,
     runtime_provisioner_active_set_digest, AllocatableMemoryBytes, AllocatableVcpus,
     Base64UrlNoPad, ContractVersion, CredentialBinding, Epoch, GuestIpv4Pool, GuestIpv4PoolKind,
-    Id, Ipv4Address, NodeIdentity, NodeIdentityState, NodePlacementPolicy, RandomId128,
-    RuntimeNodeAuthorityApply, RuntimeNodeAuthorityMutation, RuntimeNodeAuthorityOutcome,
-    RuntimePlacementBlockFrontend, RuntimePlacementCapabilities, RuntimePlacementGuestNetwork,
-    RuntimePlacementGuestTransport, RuntimePlacementVmm, RuntimeProvisionerActiveSet,
-    RuntimeProvisionerCredential, RuntimeProvisionerExpectedPrevious,
+    Id, Ipv4Address, NodeIdentity, NodeIdentityState, NodePlacementPolicy, NodeTransportTarget,
+    RandomId128, RuntimeNodeAuthorityApply, RuntimeNodeAuthorityMutation,
+    RuntimeNodeAuthorityOutcome, RuntimePlacementBlockFrontend, RuntimePlacementCapabilities,
+    RuntimePlacementGuestNetwork, RuntimePlacementGuestTransport, RuntimePlacementVmm,
+    RuntimeProvisionerActiveSet, RuntimeProvisionerCredential, RuntimeProvisionerExpectedPrevious,
     RuntimeProvisionerTrustBundle, RuntimeSchedulingState, Sha256Digest,
 };
 use cats_control_plane::controller::AutoTierPolicy;
@@ -272,6 +272,7 @@ fn policy(revision: u64, state: RuntimeSchedulingState, memory: u64) -> NodePlac
             network_address: Ipv4Address::new("10.240.0.0").unwrap(),
             prefix_length: 16,
         },
+        node_transport_target: NodeTransportTarget::new("https://node-http.internal:7301").unwrap(),
     }
 }
 

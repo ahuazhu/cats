@@ -1,21 +1,24 @@
 //! Complete PostgreSQL snapshot consumed by the Route Grant v2 signer.
 //!
 //! The hostname index is only a locator.  This loader closes it against the
-//! current complete Desired, current AgentSession, accepted full inventory,
-//! latest per-Cat runtime observation, and the active signer key ACK inside
-//! one repeatable-read read-only transaction.  It returns no token and owns no
+//! current complete Desired, provisioned NodeIdentity, fleet-owned placement
+//! policy and transport target, current AgentSession, accepted full inventory,
+//! latest per-Cat runtime observation, and the active signer key ACK inside one
+//! repeatable-read read-only transaction. It returns no token and owns no
 //! private key.
 
 use cats_api::runtime_reconciliation::{
-    key_ring_digest, Condition, Hostname, Id, KeyId, LifecycleAdmission, ReadyReason,
-    RouteGateState, RuntimeTarget, UnixMillis,
+    key_ring_digest, Condition, Hostname, Id, KeyId, LifecycleAdmission, NodeIdentityState,
+    NodeTransportTarget, ReadyReason, RouteGateState, RuntimeTarget, UnixMillis,
 };
 
+use super::placement_policy::load_policy_unlocked;
 use super::product::validate_endpoint_lookup;
 use super::product_rows::{
     load_desired_unlocked, load_endpoint_by_id_unlocked, load_hostname_lookup_unlocked,
 };
 use super::runtime_spine::{load_route_runtime_in, RouteRuntimeLoad, RouteRuntimeRejection};
+use crate::store::agent_sessions::load_identity_by_node_unlocked;
 use crate::store::transaction::AuthorityTransactionError;
 use crate::store::{Result, Store};
 
@@ -30,6 +33,7 @@ pub(crate) struct RouteGrantV2AuthoritySnapshot {
     pub(crate) route_epoch: cats_api::runtime_reconciliation::Epoch,
     pub(crate) protocol: cats_api::runtime_reconciliation::HttpProtocol,
     pub(crate) target_port: u16,
+    pub(crate) node_transport_target: NodeTransportTarget,
     pub(crate) evaluated_at_unix_ms: UnixMillis,
 }
 
@@ -111,6 +115,16 @@ impl Store {
                 .find(|candidate| candidate.cat_id == desired.cat_id)
                 .ok_or_else(corrupt)?;
             if attested_desired != &desired {
+                return Err(corrupt());
+            }
+            let Some((transport_identity, node_transport_target)) =
+                load_node_transport_authority_in(transaction, &desired.placement.node_id)?
+            else {
+                return Err(corrupt());
+            };
+            if transport_identity != route.admission.node_identity
+                || transport_identity.node_id != desired.placement.node_id
+            {
                 return Err(corrupt());
             }
 
@@ -207,9 +221,45 @@ impl Store {
                     route_epoch: endpoint_binding.route_epoch,
                     protocol: endpoint_binding.protocol,
                     target_port: endpoint_binding.target_port,
+                    node_transport_target,
                     evaluated_at_unix_ms: route.admission.evaluated_at_unix_ms,
                 },
             )))
+        })
+    }
+}
+
+fn load_node_transport_authority_in(
+    transaction: &mut postgres::Transaction<'_>,
+    node_id: &Id,
+) -> std::result::Result<
+    Option<(
+        cats_api::runtime_reconciliation::NodeIdentity,
+        NodeTransportTarget,
+    )>,
+    AuthorityTransactionError,
+> {
+    let Some(identity) = load_identity_by_node_unlocked(transaction, node_id)? else {
+        return Ok(None);
+    };
+    if identity.state != NodeIdentityState::Provisioned {
+        return Ok(None);
+    }
+    let policy = load_policy_unlocked(transaction, node_id)?.ok_or_else(corrupt)?;
+    if identity.node_id != *node_id || policy.node_id != identity.node_id {
+        return Err(corrupt());
+    }
+    Ok(Some((identity, policy.node_transport_target)))
+}
+
+#[cfg(test)]
+impl Store {
+    pub(crate) fn load_node_transport_target_for_test(
+        &self,
+        node_id: &Id,
+    ) -> Result<Option<NodeTransportTarget>> {
+        self.authority_read_snapshot(|transaction| {
+            Ok(load_node_transport_authority_in(transaction, node_id)?.map(|(_, target)| target))
         })
     }
 }

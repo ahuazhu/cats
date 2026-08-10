@@ -8,10 +8,10 @@ use cats_api::runtime_reconciliation::{
 };
 use sha2::{Digest, Sha256};
 
-const POLICY: &[u8] = br#"{"allocatable_memory_bytes":17179869184,"allocatable_vcpus":8,"capabilities":{"block_frontend":"kernel_nbd","guest_agent_protocol_version":1,"guest_config_digest":"sha256:78215611e8c3bd683eb542b5696a6316156365a94624c7521446ab5660d067e2","guest_network":"isolated_ipv4","guest_transport":"vsock","vmm":"cloud_hypervisor"},"guest_ipv4_pool":{"kind":"private_ipv4_16","network_address":"10.240.0.0","prefix_length":16},"node_id":"node_a","policy_revision":1,"scheduling_state":"cordoned","version":1}"#;
+const POLICY: &[u8] = br#"{"allocatable_memory_bytes":17179869184,"allocatable_vcpus":8,"capabilities":{"block_frontend":"kernel_nbd","guest_agent_protocol_version":1,"guest_config_digest":"sha256:78215611e8c3bd683eb542b5696a6316156365a94624c7521446ab5660d067e2","guest_network":"isolated_ipv4","guest_transport":"vsock","vmm":"cloud_hypervisor"},"guest_ipv4_pool":{"kind":"private_ipv4_16","network_address":"10.240.0.0","prefix_length":16},"node_id":"node_a","node_transport_target":"https://node-a.internal:7301","policy_revision":1,"scheduling_state":"cordoned","version":1}"#;
 const ACTIVE_SET: &[u8] = br#"{"credentials":[{"credential_id":"provisioner_a","public_key_spki":"MCowBQYDK2VwAyEA11qYAYKxCrfVS_7TyWQHOg7hcvPapiMlrwIaaPcHURo"}],"deployment_id":"deployment_a","version":1}"#;
 const TRUST_BUNDLE: &[u8] = br#"{"credentials":[{"credential_id":"provisioner_a","public_key_spki":"MCowBQYDK2VwAyEA11qYAYKxCrfVS_7TyWQHOg7hcvPapiMlrwIaaPcHURo"}],"deployment_id":"deployment_a","expected_previous":null,"trust_revision":1,"version":1}"#;
-const APPLY: &[u8] = br#"{"apply_id":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","mutation":{"expected_policy_revision":1,"kind":"update_policy","placement_policy":{"allocatable_memory_bytes":17179869184,"allocatable_vcpus":8,"capabilities":{"block_frontend":"kernel_nbd","guest_agent_protocol_version":1,"guest_config_digest":"sha256:78215611e8c3bd683eb542b5696a6316156365a94624c7521446ab5660d067e2","guest_network":"isolated_ipv4","guest_transport":"vsock","vmm":"cloud_hypervisor"},"guest_ipv4_pool":{"kind":"private_ipv4_16","network_address":"10.240.0.0","prefix_length":16},"node_id":"node_a","policy_revision":2,"scheduling_state":"schedulable","version":1}},"node_id":"node_a","version":1}"#;
+const APPLY: &[u8] = br#"{"apply_id":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","mutation":{"expected_policy_revision":1,"kind":"update_policy","placement_policy":{"allocatable_memory_bytes":17179869184,"allocatable_vcpus":8,"capabilities":{"block_frontend":"kernel_nbd","guest_agent_protocol_version":1,"guest_config_digest":"sha256:78215611e8c3bd683eb542b5696a6316156365a94624c7521446ab5660d067e2","guest_network":"isolated_ipv4","guest_transport":"vsock","vmm":"cloud_hypervisor"},"guest_ipv4_pool":{"kind":"private_ipv4_16","network_address":"10.240.0.0","prefix_length":16},"node_id":"node_a","node_transport_target":"https://node-a.internal:7301","policy_revision":2,"scheduling_state":"schedulable","version":1}},"node_id":"node_a","version":1}"#;
 const RESULT: &[u8] = br#"{"apply_id":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","identity_state":"provisioned","node_id":"node_a","outcome":"policy_updated","policy_revision":2,"version":1}"#;
 
 fn assert_vector(bytes: &[u8], expected_len: usize, expected_sha256: &str) {
@@ -25,8 +25,8 @@ fn canonical_fixed_vectors_round_trip_exactly() {
     assert_eq!(encode_node_placement_policy(&policy).unwrap(), POLICY);
     assert_vector(
         POLICY,
-        497,
-        "e6f9c7b26334e4728119a96a40579f8f6ba3862c557160eb078cbc97428ab620",
+        552,
+        "fdfcf8bb96ab5ba124aeeaff498eb4bbd88eeda2e0afd2cf0ab188778e67464e",
     );
 
     let active_set = decode_runtime_provisioner_active_set(ACTIVE_SET).unwrap();
@@ -61,8 +61,8 @@ fn canonical_fixed_vectors_round_trip_exactly() {
     assert_eq!(encode_runtime_node_authority_apply(&apply).unwrap(), APPLY);
     assert_vector(
         APPLY,
-        663,
-        "1934e94054f59ea3f20de3232a9783448943e76c664f94977d93c490459fa702",
+        718,
+        "b03395b52d23522f5c549493b82c5d00f1b4ee102dbbe27770c475509cf36d21",
     );
 
     let result = decode_runtime_node_authority_apply_result(RESULT).unwrap();
@@ -84,6 +84,51 @@ fn policy_rejects_unaligned_or_non_private_pool() {
             .unwrap()
             .replace("10.240.0.0", address);
         assert!(decode_node_placement_policy(candidate.as_bytes()).is_err());
+    }
+}
+
+#[test]
+fn policy_requires_one_canonical_https_node_transport_authority() {
+    let policy = decode_node_placement_policy(POLICY).unwrap();
+    assert_eq!(
+        policy.node_transport_target.as_str(),
+        "https://node-a.internal:7301"
+    );
+    for target in [
+        "http://node-a.internal:7301",
+        "HTTPS://node-a.internal:7301",
+        "https://user@node-a.internal:7301",
+        "https://node-a.internal:7301/",
+        "https://node-a.internal:7301?query",
+        "https://node-a.internal:7301#fragment",
+        "https://NODE-a.internal:7301",
+        "https://node-a.internal",
+        "https://node-a.internal:0",
+        "https://node-a.internal:07301",
+        "https://node-a.internal:65536",
+        "https://10.0.0.1:7301",
+        "https://2130706433:7301",
+        "https://127.1:7301",
+        "https://010.0.0.1:7301",
+        "https://0x7f.0.0.1:7301",
+        "https://0x.0.0.1:7301",
+    ] {
+        let candidate = String::from_utf8(POLICY.to_vec())
+            .unwrap()
+            .replace("https://node-a.internal:7301", target);
+        assert!(
+            decode_node_placement_policy(candidate.as_bytes()).is_err(),
+            "accepted non-canonical target {target:?}"
+        );
+    }
+    for target in ["https://node-a.internal:1", "https://node-a.internal:65535"] {
+        let candidate = String::from_utf8(POLICY.to_vec())
+            .unwrap()
+            .replace("https://node-a.internal:7301", target);
+        assert!(
+            decode_node_placement_policy(candidate.as_bytes()).is_ok(),
+            "rejected canonical boundary target {target:?}"
+        );
     }
 }
 

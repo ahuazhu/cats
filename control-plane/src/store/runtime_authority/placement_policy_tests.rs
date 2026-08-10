@@ -7,12 +7,13 @@ use cats_api::runtime_reconciliation::{
     canonical_ed25519_spki_sha256, runtime_provisioner_active_set_digest, AllocatableMemoryBytes,
     AllocatableVcpus, Base64UrlNoPad, ContractVersion, CredentialBinding, Epoch,
     FleetPolicyPrincipal, GuestIpv4Pool, GuestIpv4PoolKind, Id, Ipv4Address, NodeIdentity,
-    NodeIdentityState, NodePlacementPolicy, PublicKeyCredentialBinding, RandomId128,
-    RuntimeNodeAuthorityApply, RuntimeNodeAuthorityMutation, RuntimeNodeAuthorityOutcome,
-    RuntimeNodeAuthorityStoredOutcome, RuntimePlacementBlockFrontend, RuntimePlacementCapabilities,
-    RuntimePlacementGuestNetwork, RuntimePlacementGuestTransport, RuntimePlacementVmm,
-    RuntimeProvisionerActiveSet, RuntimeProvisionerCredential, RuntimeProvisionerExpectedPrevious,
-    RuntimeProvisionerTrustBundle, RuntimeSchedulingState, Sha256Digest,
+    NodeIdentityState, NodePlacementPolicy, NodeTransportTarget, PublicKeyCredentialBinding,
+    RandomId128, RuntimeNodeAuthorityApply, RuntimeNodeAuthorityMutation,
+    RuntimeNodeAuthorityOutcome, RuntimeNodeAuthorityStoredOutcome, RuntimePlacementBlockFrontend,
+    RuntimePlacementCapabilities, RuntimePlacementGuestNetwork, RuntimePlacementGuestTransport,
+    RuntimePlacementVmm, RuntimeProvisionerActiveSet, RuntimeProvisionerCredential,
+    RuntimeProvisionerExpectedPrevious, RuntimeProvisionerTrustBundle, RuntimeSchedulingState,
+    Sha256Digest,
 };
 
 use super::placement_policy::RuntimeNodeAuthorityApplyStoreOutcome;
@@ -109,6 +110,7 @@ fn policy(revision: u64, state: RuntimeSchedulingState, memory: u64) -> NodePlac
             network_address: Ipv4Address::new("10.240.0.0").unwrap(),
             prefix_length: 16,
         },
+        node_transport_target: NodeTransportTarget::new("https://node-a.internal:7301").unwrap(),
     }
 }
 
@@ -318,6 +320,14 @@ fn apply_replay_preconditions_policy_and_credential_lineage_are_atomic() {
         store.apply_runtime_node_authority(&actor, &create).unwrap(),
         RuntimeNodeAuthorityOutcome::Provisioned,
     );
+    assert_eq!(
+        store
+            .load_node_transport_target_for_test(&id("node_a"))
+            .unwrap()
+            .unwrap()
+            .as_str(),
+        "https://node-a.internal:7301"
+    );
     assert_applied(
         store.apply_runtime_node_authority(&actor, &create).unwrap(),
         RuntimeNodeAuthorityOutcome::Provisioned,
@@ -341,6 +351,31 @@ fn apply_replay_preconditions_policy_and_credential_lineage_are_atomic() {
         store.apply_runtime_node_authority(&actor, &enable).unwrap(),
         RuntimeNodeAuthorityOutcome::PolicyUpdated,
     );
+    let mut illegal_target_rotation = update(8, 2, RuntimeSchedulingState::Schedulable, 16 << 30);
+    let RuntimeNodeAuthorityMutation::UpdatePolicy {
+        placement_policy, ..
+    } = &mut illegal_target_rotation.mutation
+    else {
+        panic!("test request is not a policy update");
+    };
+    placement_policy.node_transport_target =
+        NodeTransportTarget::new("https://node-b.internal:7301").unwrap();
+    assert_eq!(
+        stored(
+            store
+                .apply_runtime_node_authority(&actor, &illegal_target_rotation)
+                .unwrap()
+        ),
+        RuntimeNodeAuthorityStoredOutcome::AuthorityPreconditionFailed
+    );
+    assert_eq!(
+        store
+            .load_node_transport_target_for_test(&id("node_a"))
+            .unwrap()
+            .unwrap()
+            .as_str(),
+        "https://node-a.internal:7301"
+    );
     let illegal_resize = update(3, 2, RuntimeSchedulingState::Schedulable, 32 << 30);
     assert_eq!(
         stored(
@@ -360,6 +395,29 @@ fn apply_replay_preconditions_policy_and_credential_lineage_are_atomic() {
         store.apply_runtime_node_authority(&actor, &resize).unwrap(),
         RuntimeNodeAuthorityOutcome::PolicyUpdated,
     );
+    let mut rotate_target = update(9, 4, RuntimeSchedulingState::Cordoned, 32 << 30);
+    let RuntimeNodeAuthorityMutation::UpdatePolicy {
+        placement_policy, ..
+    } = &mut rotate_target.mutation
+    else {
+        panic!("test request is not a policy update");
+    };
+    placement_policy.node_transport_target =
+        NodeTransportTarget::new("https://node-b.internal:7301").unwrap();
+    assert_applied(
+        store
+            .apply_runtime_node_authority(&actor, &rotate_target)
+            .unwrap(),
+        RuntimeNodeAuthorityOutcome::PolicyUpdated,
+    );
+    assert_eq!(
+        store
+            .load_node_transport_target_for_test(&id("node_a"))
+            .unwrap()
+            .unwrap()
+            .as_str(),
+        "https://node-b.internal:7301"
+    );
     assert_eq!(
         stored(
             store
@@ -374,7 +432,7 @@ fn apply_replay_preconditions_policy_and_credential_lineage_are_atomic() {
         apply_id: random(6),
         node_id: id("node_a"),
         mutation: RuntimeNodeAuthorityMutation::RotateCredential {
-            expected_policy_revision: Epoch::new(4).unwrap(),
+            expected_policy_revision: Epoch::new(5).unwrap(),
             expected_credential_id: id("credential_a"),
             expected_credential_binding: PublicKeyCredentialBinding::PublicKey {
                 public_key_spki_sha256: digest(6),
@@ -389,12 +447,20 @@ fn apply_replay_preconditions_policy_and_credential_lineage_are_atomic() {
         store.apply_runtime_node_authority(&actor, &rotate).unwrap(),
         RuntimeNodeAuthorityOutcome::CredentialRotated,
     );
+    assert_eq!(
+        store
+            .load_node_transport_target_for_test(&id("node_a"))
+            .unwrap()
+            .unwrap()
+            .as_str(),
+        "https://node-b.internal:7301"
+    );
     let retire = RuntimeNodeAuthorityApply {
         version: ContractVersion::V1,
         apply_id: random(7),
         node_id: id("node_a"),
         mutation: RuntimeNodeAuthorityMutation::Retire {
-            expected_policy_revision: Epoch::new(4).unwrap(),
+            expected_policy_revision: Epoch::new(5).unwrap(),
             expected_credential_id: id("credential_b"),
             expected_credential_binding: PublicKeyCredentialBinding::PublicKey {
                 public_key_spki_sha256: digest(8),
@@ -404,6 +470,12 @@ fn apply_replay_preconditions_policy_and_credential_lineage_are_atomic() {
     assert_applied(
         store.apply_runtime_node_authority(&actor, &retire).unwrap(),
         RuntimeNodeAuthorityOutcome::Retired,
+    );
+    assert_eq!(
+        store
+            .load_node_transport_target_for_test(&id("node_a"))
+            .unwrap(),
+        None
     );
     assert_applied(
         store.apply_runtime_node_authority(&actor, &create).unwrap(),
@@ -428,6 +500,13 @@ fn apply_replay_preconditions_policy_and_credential_lineage_are_atomic() {
             assert_eq!(lineage.len(), 2);
             assert_eq!(lineage[0].get::<_, String>(1), "retired");
             assert_eq!(lineage[1].get::<_, String>(1), "retired");
+            let target = client.query_one(
+                "SELECT record->>'node_transport_target', node_transport_target
+                   FROM runtime_node_placement_policies WHERE node_id='node_a'",
+                &[],
+            )?;
+            assert_eq!(target.get::<_, String>(0), "https://node-b.internal:7301");
+            assert_eq!(target.get::<_, String>(1), "https://node-b.internal:7301");
             assert_eq!(
                 client
                     .query_one(
@@ -435,7 +514,7 @@ fn apply_replay_preconditions_policy_and_credential_lineage_are_atomic() {
                         &[],
                     )?
                     .get::<_, i64>(0),
-                7
+                9
             );
             Ok(())
         })

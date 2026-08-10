@@ -735,9 +735,10 @@ mod tests {
     use super::*;
     use cats_api::runtime_reconciliation::{
         AllocatableMemoryBytes, AllocatableVcpus, AssignedKind, AssignedPlacement, ContractVersion,
-        DesiredRuntimeSpec, Epoch, GuestIpv4Pool, GuestIpv4PoolKind, Revision, RuntimeConfig,
-        RuntimePlacementBlockFrontend, RuntimePlacementCapabilities, RuntimePlacementGuestNetwork,
-        RuntimePlacementGuestTransport, RuntimePlacementVmm, RuntimeTarget, RuntimeTransition,
+        DesiredRuntimeSpec, Epoch, GuestIpv4Pool, GuestIpv4PoolKind, NodeTransportTarget, Revision,
+        RuntimeConfig, RuntimePlacementBlockFrontend, RuntimePlacementCapabilities,
+        RuntimePlacementGuestNetwork, RuntimePlacementGuestTransport, RuntimePlacementVmm,
+        RuntimeTarget, RuntimeTransition,
     };
 
     fn id(value: &str) -> Id {
@@ -772,6 +773,8 @@ mod tests {
                 network_address: Ipv4Address::new("10.240.0.0").unwrap(),
                 prefix_length: 16,
             },
+            node_transport_target: NodeTransportTarget::new("https://node-a.internal:7301")
+                .unwrap(),
         }
     }
 

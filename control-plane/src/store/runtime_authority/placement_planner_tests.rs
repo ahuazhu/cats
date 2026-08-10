@@ -6,9 +6,10 @@ use cats_api::runtime_reconciliation::{
     AssignedKind, AssignedPlacement, ContractVersion, CredentialBinding, DesiredRuntimeSpec,
     Durability, Epoch, GuestIpv4Pool, GuestIpv4PoolKind, GuestRuntimeProfileReceipt, Id,
     Ipv4Address, IsolatedIpv4Kind, MacAddress, NetworkConfig, NodeIdentity, NodeIdentityState,
-    NodePlacementPolicy, Revision, RuntimeConfig, RuntimePlacementBlockFrontend,
-    RuntimePlacementCapabilities, RuntimePlacementGuestNetwork, RuntimePlacementGuestTransport,
-    RuntimePlacementVmm, RuntimeSchedulingState, RuntimeTarget, RuntimeTransition, Sha256Digest,
+    NodePlacementPolicy, NodeTransportTarget, Revision, RuntimeConfig,
+    RuntimePlacementBlockFrontend, RuntimePlacementCapabilities, RuntimePlacementGuestNetwork,
+    RuntimePlacementGuestTransport, RuntimePlacementVmm, RuntimeSchedulingState, RuntimeTarget,
+    RuntimeTransition, Sha256Digest,
 };
 
 use super::cat_create_service::CatCreatePlanRequest;
@@ -63,6 +64,8 @@ fn policy(
             network_address: Ipv4Address::new("10.240.0.0").unwrap(),
             prefix_length: 16,
         },
+        node_transport_target: NodeTransportTarget::new("https://runtime-node.internal:7301")
+            .unwrap(),
     }
 }
 
