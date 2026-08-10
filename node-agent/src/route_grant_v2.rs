@@ -11,7 +11,8 @@ use std::sync::{Arc, RwLock};
 
 use cats_api::route_grant_v2::{
     RouteAdmissionV2Failure, RouteAdmissionV2Reason, RouteGrantV2Compact, RouteGrantV2Error,
-    RouteGrantV2PublicKey, MAX_ROUTE_GRANT_V2_RING_KEYS, ROUTE_GRANT_V2_VERSION,
+    RouteGrantV2PublicKey, RouteGrantV2PublicKeyRingArtifact, MAX_ROUTE_GRANT_V2_RING_KEYS,
+    ROUTE_GRANT_V2_VERSION,
 };
 use cats_api::runtime_reconciliation::{
     key_ring_digest, Epoch, Hostname, HttpProtocol, Id, KeyId, Sha256Digest,
@@ -40,6 +41,31 @@ impl std::fmt::Debug for RouteGrantV2KeyRing {
 }
 
 impl RouteGrantV2KeyRing {
+    /// Convert one already pinned and decoded installation artifact into the
+    /// complete in-process replacement. Publication remains the caller's
+    /// separate atomic step; no filesystem scan or listener is composed here.
+    pub fn from_artifact(
+        artifact: &RouteGrantV2PublicKeyRingArtifact,
+    ) -> Result<Self, RouteGrantV2KeyRingError> {
+        artifact
+            .validate()
+            .map_err(|_| RouteGrantV2KeyRingError::InvalidArtifact)?;
+        let ring = Self::new(
+            artifact.ring_version,
+            artifact
+                .public_keys()
+                .map_err(|_| RouteGrantV2KeyRingError::InvalidArtifact)?,
+        )?;
+        if ring.digest()
+            != &artifact
+                .digest()
+                .map_err(|_| RouteGrantV2KeyRingError::InvalidArtifact)?
+        {
+            return Err(RouteGrantV2KeyRingError::InvalidArtifact);
+        }
+        Ok(ring)
+    }
+
     /// Builds a complete replacement before it can be published. Empty is a
     /// valid loaded ring but admits no Grant; duplicate or oversized input is
     /// rejected without changing the verifier's current snapshot.
@@ -87,6 +113,8 @@ impl RouteGrantV2KeyRing {
 
 #[derive(Debug, Clone, PartialEq, Eq, Error)]
 pub enum RouteGrantV2KeyRingError {
+    #[error("Route Grant v2 installed key-ring artifact is invalid")]
+    InvalidArtifact,
     #[error("Route Grant v2 key ring exceeds its key bound")]
     TooManyKeys,
     #[error("Route Grant v2 key ring repeats kid {kid}")]
@@ -285,8 +313,8 @@ mod tests {
     use std::sync::atomic::{AtomicBool, Ordering};
 
     use cats_api::route_grant_v2::{
-        RouteGrantV2Claims, RouteGrantV2ProtectedHeader, RouteGrantV2SigningInput,
-        ROUTE_GRANT_V2_AUDIENCE, ROUTE_GRANT_V2_ISSUER,
+        decode_route_grant_v2_public_key_ring, RouteGrantV2Claims, RouteGrantV2ProtectedHeader,
+        RouteGrantV2SigningInput, ROUTE_GRANT_V2_AUDIENCE, ROUTE_GRANT_V2_ISSUER,
     };
     use cats_api::runtime_reconciliation::{
         AssignedKind, AssignedPlacement, CheckpointRouteGate, LifecycleAdmission, RandomId128,
@@ -301,6 +329,23 @@ mod tests {
     const ED25519_SPKI_PREFIX: [u8; 12] = [
         0x30, 0x2a, 0x30, 0x05, 0x06, 0x03, 0x2b, 0x65, 0x70, 0x03, 0x21, 0x00,
     ];
+    const INSTALLED_RING: &[u8] = br#"{"version":1,"ring_version":1,"expected_previous":null,"keys":[{"kid":"fd56fed3251463eff0063169a7f8fa9dce585b6eee429581264297c98ec58bcb","public_key_spki":"MCowBQYDK2VwAyEA2-Jj2UvNCvQiUPNYRgSi0cJSPiJI6Rs6D0UTeEpQVj8"}]}"#;
+
+    #[test]
+    fn installed_artifact_converts_to_one_exact_bounded_ring() {
+        let artifact = decode_route_grant_v2_public_key_ring(INSTALLED_RING).unwrap();
+        let ring = RouteGrantV2KeyRing::from_artifact(&artifact).unwrap();
+        assert_eq!(ring.version(), artifact.ring_version);
+        assert_eq!(ring.digest(), &artifact.digest().unwrap());
+        assert_eq!(ring.loaded_kids(), &[artifact.keys[0].kid.clone()]);
+
+        let mut invalid = artifact;
+        invalid.keys[0].kid = KeyId::new("0".repeat(64)).unwrap();
+        assert!(matches!(
+            RouteGrantV2KeyRing::from_artifact(&invalid),
+            Err(RouteGrantV2KeyRingError::InvalidArtifact)
+        ));
+    }
 
     fn generated_key() -> (RouteGrantV2PublicKey, Ed25519KeyPair) {
         let document = Ed25519KeyPair::generate_pkcs8(&SystemRandom::new()).unwrap();

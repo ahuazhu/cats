@@ -857,6 +857,13 @@ impl RouteGrantV2PublicKey {
         spki_der
     }
 
+    /// Exact Ed25519 verification bytes carried by the canonical SPKI. This
+    /// lets a Control-only loader compare the public half derived from a
+    /// private key without accepting another public-key encoding.
+    pub fn verification_key_bytes(&self) -> &[u8; ED25519_PUBLIC_KEY_BYTES] {
+        &self.raw_public_key
+    }
+
     pub fn verify<'a>(
         &self,
         compact: &'a RouteGrantV2Compact,
