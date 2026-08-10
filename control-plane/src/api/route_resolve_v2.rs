@@ -9,7 +9,7 @@
 //! in-process proof to exercise the remainder of this route over loopback.
 
 use std::error::Error as _;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use axum::body::{to_bytes, Body};
@@ -30,6 +30,8 @@ use crate::store::runtime_authority::route_signer::{
     RouteGrantV2AuthorityLoad, RouteGrantV2AuthorityRejection,
 };
 use crate::store::Store;
+
+const ROUTE_RESOLVE_V2_SHUTDOWN_DEADLINE: Duration = Duration::from_secs(30);
 
 /// Proof constructed only by a trusted in-process machine transport adapter.
 ///
@@ -59,7 +61,123 @@ pub(crate) struct RouteResolveV2Service {
     store: Arc<Store>,
     route_grant_signer: Option<Arc<crate::route_grant_v2::RouteGrantV2Signer>>,
     active_guest_digest: cats_api::runtime_reconciliation::Sha256Digest,
-    admission: Arc<tokio::sync::Semaphore>,
+    admission: Arc<RouteResolveV2Admission>,
+    #[cfg(test)]
+    store_pause: Mutex<Option<RouteResolveV2StorePause>>,
+}
+
+/// Owns admitted Route v2 reads until both the handler and any Store closure
+/// it started have settled. This is deliberately separate from the public API
+/// admission lanes: a future machine listener must be able to stop and join
+/// exactly its own work during shutdown.
+pub(crate) struct RouteResolveV2Admission {
+    permits: Arc<tokio::sync::Semaphore>,
+    state: Mutex<RouteResolveV2AdmissionState>,
+    changed: tokio::sync::Notify,
+}
+
+struct RouteResolveV2AdmissionState {
+    accepting: bool,
+    active: usize,
+}
+
+impl RouteResolveV2Admission {
+    pub(crate) fn new(limit: usize) -> Self {
+        Self {
+            permits: Arc::new(tokio::sync::Semaphore::new(limit)),
+            state: Mutex::new(RouteResolveV2AdmissionState {
+                accepting: true,
+                active: 0,
+            }),
+            changed: tokio::sync::Notify::new(),
+        }
+    }
+
+    fn try_begin(self: &Arc<Self>) -> Option<Arc<RouteResolveV2Lease>> {
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if !state.accepting {
+            return None;
+        }
+        let permit = Arc::clone(&self.permits).try_acquire_owned().ok()?;
+        state.active += 1;
+        Some(Arc::new(RouteResolveV2Lease {
+            admission: Arc::clone(self),
+            _permit: permit,
+        }))
+    }
+
+    pub(crate) fn begin_shutdown(&self) {
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        state.accepting = false;
+        self.permits.close();
+        self.changed.notify_waiters();
+    }
+
+    pub(crate) async fn shutdown(&self) -> anyhow::Result<()> {
+        self.begin_shutdown();
+        let joined = tokio::time::timeout(ROUTE_RESOLVE_V2_SHUTDOWN_DEADLINE, async {
+            loop {
+                let changed = self.changed.notified();
+                if self.active_count() == 0 {
+                    break;
+                }
+                changed.await;
+            }
+        })
+        .await;
+        anyhow::ensure!(
+            joined.is_ok(),
+            "Route v2 Store reads exceeded the shutdown deadline"
+        );
+        Ok(())
+    }
+
+    fn active_count(&self) -> usize {
+        self.state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .active
+    }
+
+    #[cfg(test)]
+    fn exhaust_for_test(&self) -> tokio::sync::OwnedSemaphorePermit {
+        Arc::clone(&self.permits)
+            .try_acquire_many_owned(self.permits.available_permits() as u32)
+            .expect("test admission permits are available")
+    }
+}
+
+struct RouteResolveV2Lease {
+    admission: Arc<RouteResolveV2Admission>,
+    _permit: tokio::sync::OwnedSemaphorePermit,
+}
+
+impl Drop for RouteResolveV2Lease {
+    fn drop(&mut self) {
+        let mut state = self
+            .admission
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        debug_assert!(state.active > 0, "only an active Route v2 owner can finish");
+        state.active -= 1;
+        if state.active == 0 {
+            self.admission.changed.notify_waiters();
+        }
+    }
+}
+
+#[cfg(test)]
+#[derive(Clone)]
+struct RouteResolveV2StorePause {
+    entered: Arc<std::sync::Barrier>,
+    release: Arc<std::sync::Barrier>,
 }
 
 impl RouteResolveV2Service {
@@ -74,6 +192,8 @@ impl RouteResolveV2Service {
                 .approved_guest_config_digest()
                 .clone(),
             admission: Arc::clone(&state.route_resolve_admission),
+            #[cfg(test)]
+            store_pause: Mutex::new(None),
         }
     }
 
@@ -87,8 +207,51 @@ impl RouteResolveV2Service {
             store,
             route_grant_signer: Some(route_grant_signer),
             active_guest_digest,
-            admission: Arc::new(tokio::sync::Semaphore::new(32)),
+            admission: Arc::new(RouteResolveV2Admission::new(32)),
+            store_pause: Mutex::new(None),
         }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn without_signer_for_test(
+        store: Arc<Store>,
+        active_guest_digest: cats_api::runtime_reconciliation::Sha256Digest,
+    ) -> Self {
+        Self {
+            store,
+            route_grant_signer: None,
+            active_guest_digest,
+            admission: Arc::new(RouteResolveV2Admission::new(32)),
+            store_pause: Mutex::new(None),
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn exhaust_admission_for_test(&self) -> tokio::sync::OwnedSemaphorePermit {
+        self.admission.exhaust_for_test()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn active_requests_for_test(&self) -> usize {
+        self.admission.active_count()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn pause_store_after_start_for_test(
+        &self,
+        entered: Arc<std::sync::Barrier>,
+        release: Arc<std::sync::Barrier>,
+    ) {
+        *self
+            .store_pause
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) =
+            Some(RouteResolveV2StorePause { entered, release });
+    }
+
+    #[cfg(test)]
+    pub(crate) async fn shutdown_for_test(&self) -> anyhow::Result<()> {
+        self.admission.shutdown().await
     }
 }
 
@@ -153,17 +316,7 @@ pub(crate) async fn resolve(
             &[],
         );
     }
-    if headers.contains_key(header::AUTHORIZATION)
-        || headers.contains_key(header::COOKIE)
-        || [
-            "idempotency-key",
-            header::IF_MATCH.as_str(),
-            header::IF_NONE_MATCH.as_str(),
-            "x-http-method-override",
-        ]
-        .iter()
-        .any(|name| headers.contains_key(*name))
-    {
+    if !headers.keys().all(route_resolve_v2_header_allowed) {
         return rejection_response(
             StatusCode::BAD_REQUEST,
             RouteResolveV2RejectionCode::InvalidRequest,
@@ -191,9 +344,9 @@ pub(crate) async fn resolve(
         );
     }
 
-    let _permit = match service.admission.clone().try_acquire_owned() {
-        Ok(permit) => permit,
-        Err(_) => return unavailable_response(),
+    let request_lease = match service.admission.try_begin() {
+        Some(lease) => lease,
+        None => return unavailable_response(),
     };
     let body = match tokio::time::timeout_at(
         tokio::time::Instant::from_std(deadline),
@@ -238,9 +391,22 @@ pub(crate) async fn resolve(
     let active_guest_digest = service.active_guest_digest.clone();
     let hostname = request.hostname;
     let store = service.store.clone();
+    let store_lease = Arc::clone(&request_lease);
+    #[cfg(test)]
+    let store_pause = service
+        .store_pause
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .take();
     let loaded = tokio::time::timeout_at(
         tokio::time::Instant::from_std(deadline),
         store.execute(move |store| {
+            let _store_lease = store_lease;
+            #[cfg(test)]
+            if let Some(pause) = store_pause {
+                pause.entered.wait();
+                pause.release.wait();
+            }
             store.load_route_grant_v2_authority(&hostname, &signer_kid, &active_guest_digest)
         }),
     )
@@ -280,6 +446,14 @@ pub(crate) async fn resolve(
         return unavailable_response();
     }
     success_response(response)
+}
+
+fn route_resolve_v2_header_allowed(name: &header::HeaderName) -> bool {
+    name == header::HOST
+        || name == header::CONTENT_TYPE
+        || name == header::CONTENT_LENGTH
+        || name == header::ACCEPT
+        || name == header::TRANSFER_ENCODING
 }
 
 fn single_header_text<'a>(headers: &'a HeaderMap, name: &str) -> Option<&'a str> {

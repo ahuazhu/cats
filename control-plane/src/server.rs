@@ -466,7 +466,7 @@ pub struct AppState {
     pub(crate) runtime_spine_admission: Arc<RuntimeSpineAdmission>,
     /// Per-replica work bound for the machine-authenticated Route Grant v2
     /// resolve lane. Authentication is checked before a permit is acquired.
-    pub(crate) route_resolve_admission: Arc<tokio::sync::Semaphore>,
+    pub(crate) route_resolve_admission: Arc<crate::api::route_resolve_v2::RouteResolveV2Admission>,
     pub(crate) runtime_volume_transition_admission: Arc<RuntimeSpineAdmission>,
     pub(crate) runtime_volume_transition_service: Arc<RuntimeVolumeTransitionService>,
     pub(crate) runtime_node_authority:
@@ -516,6 +516,7 @@ impl Handle {
         self.state
             .runtime_volume_transition_service
             .begin_shutdown();
+        self.state.route_resolve_admission.begin_shutdown();
         self.state.runtime_node_authority.begin_shutdown();
         self.image_manifest_resolver.begin_shutdown();
         self.state.observation_store.begin_shutdown();
@@ -542,15 +543,24 @@ impl Handle {
         self.begin_shutdown();
         let observation_store = self.state.observation_store.shutdown();
         let volume_transitions = self.state.runtime_volume_transition_service.shutdown();
+        let route_resolutions = self.state.route_resolve_admission.shutdown();
         let commit_resolutions = self.state.cat_create.shutdown_commit_resolutions();
         let node_authority_resolutions = self
             .state
             .runtime_node_authority
             .shutdown_commit_resolutions();
         let manifest_reads = self.image_manifest_resolver.shutdown();
-        let (_, transition_result, commit_result, node_authority_result, manifest_result) = tokio::join!(
+        let (
+            _,
+            transition_result,
+            route_result,
+            commit_result,
+            node_authority_result,
+            manifest_result,
+        ) = tokio::join!(
             observation_store,
             volume_transitions,
+            route_resolutions,
             commit_resolutions,
             node_authority_resolutions,
             manifest_reads
@@ -562,6 +572,7 @@ impl Handle {
         // long-lived HTTP connection after Cat commit ownership is resolved.
         self.server_task.abort();
         transition_result?;
+        route_result?;
         commit_result.map_err(anyhow::Error::from)?;
         node_authority_result.map_err(anyhow::Error::from)
     }
@@ -913,9 +924,11 @@ async fn spawn_inner(cfg: Config, legacy_node_runtime_for_tests: bool) -> anyhow
         cfg: cfg.clone(),
         agent_session_registration_policy,
         runtime_spine_admission: Arc::new(RuntimeSpineAdmission::new()),
-        route_resolve_admission: Arc::new(tokio::sync::Semaphore::new(
-            ROUTE_RESOLVE_V2_GLOBAL_IN_FLIGHT,
-        )),
+        route_resolve_admission: Arc::new(
+            crate::api::route_resolve_v2::RouteResolveV2Admission::new(
+                ROUTE_RESOLVE_V2_GLOBAL_IN_FLIGHT,
+            ),
+        ),
         runtime_volume_transition_admission: Arc::new(RuntimeSpineAdmission::new()),
         runtime_volume_transition_service: Arc::new(RuntimeVolumeTransitionService::new()),
         legacy_node_runtime_for_tests,

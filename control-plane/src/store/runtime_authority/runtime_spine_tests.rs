@@ -3115,6 +3115,49 @@ fn route_signer_snapshot_closes_hostname_runtime_and_ring_in_one_authority_read(
         server.abort();
         let _ = server.await;
 
+        let signerless_service = Arc::new(
+            crate::api::route_resolve_v2::RouteResolveV2Service::without_signer_for_test(
+                Arc::clone(&store),
+                policy.approved_guest_config_digest().clone(),
+            ),
+        );
+        let signerless = Router::new()
+            .route(
+                ROUTE_RESOLVE_V2_PATH,
+                post(crate::api::route_resolve_v2::resolve)
+                    .fallback(crate::api::route_resolve_v2::resolve),
+            )
+            .layer(Extension(
+                crate::api::route_resolve_v2::AuthenticatedGatewayPrincipal::for_test(),
+            ))
+            .layer(Extension(signerless_service));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move { axum::serve(listener, signerless).await });
+
+        // A future authenticated machine transport must still fail before the
+        // body and Store when the independent Route v2 signer is absent.
+        let mut stream = tokio::net::TcpStream::connect(address).await.unwrap();
+        stream
+            .write_all(
+                format!(
+                    "POST {ROUTE_RESOLVE_V2_PATH} HTTP/1.1\r\nHost: {address}\r\n\
+                     Content-Length: 100\r\nConnection: close\r\n\r\n"
+                )
+                .as_bytes(),
+            )
+            .await
+            .unwrap();
+        let mut raw = Vec::new();
+        tokio::time::timeout(Duration::from_secs(1), stream.read_to_end(&mut raw))
+            .await
+            .expect("signerless resolve waited for the body")
+            .unwrap();
+        let status = std::str::from_utf8(&raw).unwrap().lines().next().unwrap();
+        assert!(status.contains(" 503 "), "unexpected response: {status}");
+        server.abort();
+        let _ = server.await;
+
         let authenticated = Router::new()
             .route(
                 ROUTE_RESOLVE_V2_PATH,
@@ -3124,7 +3167,7 @@ fn route_signer_snapshot_closes_hostname_runtime_and_ring_in_one_authority_read(
             .layer(Extension(
                 crate::api::route_resolve_v2::AuthenticatedGatewayPrincipal::for_test(),
             ))
-            .layer(Extension(service));
+            .layer(Extension(Arc::clone(&service)));
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
         let server = tokio::spawn(async move { axum::serve(listener, authenticated).await });
@@ -3174,6 +3217,141 @@ fn route_signer_snapshot_closes_hostname_runtime_and_ring_in_one_authority_read(
                 .code,
             RouteResolveV2RejectionCode::NotFound
         );
+
+        // Every standard conditional request header is rejected before the
+        // admission lane and therefore before Store access. Exhausting all
+        // permits turns an accidental pass-through into a visible 503.
+        let exhausted = service.exhaust_admission_for_test();
+        for conditional in [
+            "if-match",
+            "if-none-match",
+            "if-modified-since",
+            "if-unmodified-since",
+            "if-range",
+        ] {
+            let body =
+                encode_route_resolve_v2_request(&RouteResolveV2Request::new(hostname.clone()))
+                    .unwrap();
+            let response = client
+                .post(format!("http://{address}{ROUTE_RESOLVE_V2_PATH}"))
+                .header(reqwest::header::CONTENT_TYPE, ROUTE_V2_JSON_CONTENT_TYPE)
+                .header(reqwest::header::ACCEPT, ROUTE_V2_JSON_CONTENT_TYPE)
+                .header(conditional, "test")
+                .body(body)
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(
+                response.status(),
+                reqwest::StatusCode::BAD_REQUEST,
+                "conditional header {conditional} reached admission"
+            );
+        }
+        drop(exhausted);
+
+        let authenticated_request = |hostname: Hostname| {
+            let body =
+                encode_route_resolve_v2_request(&RouteResolveV2Request::new(hostname)).unwrap();
+            let mut request = axum::http::Request::builder()
+                .method("POST")
+                .uri(ROUTE_RESOLVE_V2_PATH)
+                .header(axum::http::header::CONTENT_TYPE, ROUTE_V2_JSON_CONTENT_TYPE)
+                .header(axum::http::header::ACCEPT, ROUTE_V2_JSON_CONTENT_TYPE)
+                .body(axum::body::Body::from(body))
+                .unwrap();
+            request
+                .extensions_mut()
+                .insert(crate::api::route_resolve_v2::AuthenticatedGatewayPrincipal::for_test());
+            request
+        };
+
+        // The handler's two-second deadline may expire while an already
+        // started Store closure is still running. The shared lease keeps that
+        // request active until the closure itself settles.
+        let entered = Arc::new(Barrier::new(2));
+        let release = Arc::new(Barrier::new(2));
+        service.pause_store_after_start_for_test(Arc::clone(&entered), Arc::clone(&release));
+        let timed_service = Arc::clone(&service);
+        let timed_hostname = hostname.clone();
+        let timed = tokio::spawn(async move {
+            crate::api::route_resolve_v2::resolve(
+                Extension(timed_service),
+                authenticated_request(timed_hostname),
+            )
+            .await
+        });
+        let entered_wait = tokio::task::spawn_blocking(move || {
+            entered.wait();
+        });
+        tokio::time::timeout(Duration::from_secs(1), entered_wait)
+            .await
+            .expect("Store closure did not start")
+            .unwrap();
+        assert_eq!(service.active_requests_for_test(), 1);
+        let response = tokio::time::timeout(Duration::from_secs(3), timed)
+            .await
+            .expect("Route v2 handler did not enforce its deadline")
+            .unwrap();
+        assert_eq!(
+            response.status(),
+            axum::http::StatusCode::SERVICE_UNAVAILABLE
+        );
+        assert_eq!(service.active_requests_for_test(), 1);
+        tokio::task::spawn_blocking(move || {
+            release.wait();
+        })
+        .await
+        .unwrap();
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while service.active_requests_for_test() != 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("timed-out Store closure did not settle");
+
+        // Cancellation drops the handler's owner but not the Store owner's
+        // lease. Graceful shutdown must wait for that final owner and then
+        // observe an exact active count of zero.
+        let entered = Arc::new(Barrier::new(2));
+        let release = Arc::new(Barrier::new(2));
+        service.pause_store_after_start_for_test(Arc::clone(&entered), Arc::clone(&release));
+        let cancelled_service = Arc::clone(&service);
+        let cancelled_hostname = hostname.clone();
+        let cancelled = tokio::spawn(async move {
+            crate::api::route_resolve_v2::resolve(
+                Extension(cancelled_service),
+                authenticated_request(cancelled_hostname),
+            )
+            .await
+        });
+        let entered_wait = tokio::task::spawn_blocking(move || {
+            entered.wait();
+        });
+        tokio::time::timeout(Duration::from_secs(1), entered_wait)
+            .await
+            .expect("cancelled Store closure did not start")
+            .unwrap();
+        assert_eq!(service.active_requests_for_test(), 1);
+        let shutdown_service = Arc::clone(&service);
+        let shutdown = tokio::spawn(async move { shutdown_service.shutdown_for_test().await });
+        tokio::task::yield_now().await;
+        assert!(!shutdown.is_finished());
+        cancelled.abort();
+        assert!(cancelled.await.unwrap_err().is_cancelled());
+        assert_eq!(service.active_requests_for_test(), 1);
+        tokio::task::spawn_blocking(move || {
+            release.wait();
+        })
+        .await
+        .unwrap();
+        tokio::time::timeout(Duration::from_secs(1), shutdown)
+            .await
+            .expect("shutdown did not join the cancelled Store closure")
+            .unwrap()
+            .unwrap();
+        assert_eq!(service.active_requests_for_test(), 0);
+
         server.abort();
         let _ = server.await;
     });
