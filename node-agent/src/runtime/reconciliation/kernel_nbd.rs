@@ -31,7 +31,9 @@ use cats_api::runtime_reconciliation::{
 use crate::runtime_spine::{RuntimeDesiredEffectContext, RuntimePhysicalReadContext};
 use crate::state_directory::StateDirectory;
 
-use super::checkpoint::{revalidate_checkpoint_namespace, FileCheckpointStore, StoredCheckpoint};
+use super::checkpoint::{
+    revalidate_checkpoint_namespace, CurrentCheckpointGuard, FileCheckpointStore, StoredCheckpoint,
+};
 use super::clean_slate_probes::{
     snapshot_runtime_checkpoint_namespace, RuntimeCheckpointNamespaceSnapshot,
     CHECKPOINT_NAMESPACE, RUNTIME_CHECKPOINT_NAMESPACE_ENTRY_LIMIT,
@@ -284,6 +286,16 @@ pub(crate) trait RetainedKernelNbdListenerGuard:
 pub(crate) enum KernelNbdAttachResult {
     Exact(KernelNbdClientIdentity),
     OutcomeUnknown,
+    ConflictAfterSubmit(KernelNbdAttachConflict),
+}
+
+/// A physical conflict proved only after one client submission. Every variant
+/// is terminal for the accepted effect batch: the caller must publish and
+/// accept a successor full inventory before planning another effect.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum KernelNbdAttachConflict {
+    LiveClientIdentity,
+    LeakedOrIncompleteAttachment { recorded_process_id: Option<u32> },
 }
 
 /// Sealed provider boundary for the one bounded kernel-NBD attach effect.
@@ -318,6 +330,7 @@ pub(crate) struct KernelNbdReservation {
 pub(crate) struct KernelNbdReservations {
     by_device: BTreeMap<HostPath, KernelNbdReservation>,
     by_identity: BTreeMap<KernelNbdReservationIdentity, HostPath>,
+    by_ownership_token: BTreeMap<RandomId128, KernelNbdReservation>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
@@ -384,6 +397,12 @@ impl KernelNbdReservations {
             volume_id: candidate.volume_id.clone(),
             ownership_token: candidate.ownership_token.clone(),
         };
+        if let Some(existing) = self.by_ownership_token.get(&candidate.ownership_token) {
+            anyhow::ensure!(
+                existing == &candidate,
+                "kernel-NBD device ownership token is reused by conflicting identities"
+            );
+        }
         if let Some(existing_path) = self.by_identity.get(&identity) {
             anyhow::ensure!(
                 existing_path == &candidate.device_path,
@@ -397,6 +416,8 @@ impl KernelNbdReservations {
             );
             return Ok(());
         }
+        self.by_ownership_token
+            .insert(candidate.ownership_token.clone(), candidate.clone());
         self.by_identity
             .insert(identity, candidate.device_path.clone());
         self.by_device
@@ -758,6 +779,16 @@ enum KernelNbdClientSubmission {
     OutcomeUnknown,
 }
 
+/// Closed boundary around process creation. `NotSubmitted` is permitted only
+/// when no child was created and therefore no NBD ioctl can arrive later.
+/// Once a child exists, every outcome is `Submitted`, including poll, kill,
+/// cancellation and deadline failures.
+#[derive(Debug)]
+enum KernelNbdClientSubmitAttempt {
+    NotSubmitted(anyhow::Error),
+    Submitted(KernelNbdClientSubmission),
+}
+
 trait KernelNbdClientSubmitPort: Send + Sync + 'static {
     fn submit(
         &self,
@@ -765,7 +796,7 @@ trait KernelNbdClientSubmitPort: Send + Sync + 'static {
         request: &KernelNbdAttachRequest,
         context: &RuntimeDesiredEffectContext,
         cleanup_owner: &KernelNbdClientCleanupOwner,
-    ) -> Result<KernelNbdClientSubmission>;
+    ) -> KernelNbdClientSubmitAttempt;
 }
 
 #[derive(Debug, Clone)]
@@ -878,26 +909,75 @@ where
         }
         context.check_active()?;
 
-        let submission = self.submitter.submit(
+        let submission = match self.submitter.submit(
             &self.inventory.config,
             &checkpoint_request,
             context,
             &self.cleanup_owner,
-        )?;
+        ) {
+            KernelNbdClientSubmitAttempt::NotSubmitted(source) => return Err(source),
+            KernelNbdClientSubmitAttempt::Submitted(submission) => submission,
+        };
 
+        // The helper below cannot return `Result`. Once process creation has
+        // succeeded, every authority drift, physical inspection failure and
+        // conflicting postcondition is a closed terminal result for this batch,
+        // never an error that a caller could mistake for zero effect.
+        Ok(SubmittedKernelNbdAttach {
+            submission,
+            permit: &permit,
+            namespace: &namespace,
+            store,
+            stored,
+            current: &current,
+            request,
+            listener,
+            device_index,
+            context,
+            config: &self.inventory.config,
+        }
+        .settle())
+    }
+}
+
+/// All evidence retained after process creation. Consuming this value through
+/// [`Self::settle`] is the only post-submit exit path, and that path cannot
+/// return a generic error.
+struct SubmittedKernelNbdAttach<'a> {
+    submission: KernelNbdClientSubmission,
+    permit: &'a KernelNbdAllocationPermit,
+    namespace: &'a RuntimeCheckpointNamespaceSnapshot,
+    store: &'a FileCheckpointStore,
+    stored: &'a StoredCheckpoint,
+    current: &'a CurrentCheckpointGuard<'a>,
+    request: &'a KernelNbdAttachRequest,
+    listener: &'a dyn RetainedKernelNbdListenerGuard,
+    device_index: u32,
+    context: &'a RuntimeDesiredEffectContext,
+    config: &'a KernelNbdInventoryConfig,
+}
+
+impl SubmittedKernelNbdAttach<'_> {
+    fn settle(self) -> KernelNbdAttachResult {
         // Revalidate every retained authority even when the helper result or
         // cancellation boundary is ambiguous. A detached lock/checkpoint
         // namespace can never receive an Exact result.
-        permit.assert_current_publication_paths(&namespace, store)?;
-        store
-            .revalidate_current(stored, &current)
-            .context("revalidate current checkpoint after kernel-NBD attach")?;
-        assert_current_listener(request, listener)
-            .context("revalidate retained serving listener after kernel-NBD attach")?;
-        if submission == KernelNbdClientSubmission::OutcomeUnknown
-            || context.check_active().is_err()
+        if self
+            .permit
+            .assert_current_publication_paths(self.namespace, self.store)
+            .is_err()
+            || self
+                .store
+                .revalidate_current(self.stored, self.current)
+                .is_err()
+            || assert_current_listener(self.request, self.listener).is_err()
         {
-            return Ok(KernelNbdAttachResult::OutcomeUnknown);
+            return KernelNbdAttachResult::OutcomeUnknown;
+        }
+        if self.submission == KernelNbdClientSubmission::OutcomeUnknown
+            || self.context.check_active().is_err()
+        {
+            return KernelNbdAttachResult::OutcomeUnknown;
         }
 
         // Use the identical strict inspector as the future full-inventory
@@ -905,35 +985,43 @@ where
         // non-zero-capacity client with exact executable and full frozen argv
         // can produce `Serving`.
         let post_scan = inspect_slot(
-            &self.inventory.config,
-            device_index,
-            &request.device_path,
-            context,
+            self.config,
+            self.device_index,
+            &self.request.device_path,
+            self.context,
         );
-        permit.assert_current_publication_paths(&namespace, store)?;
-        store
-            .revalidate_current(stored, &current)
-            .context("revalidate current checkpoint after kernel-NBD post-scan")?;
-        assert_current_listener(request, listener)
-            .context("revalidate retained serving listener after kernel-NBD post-scan")?;
-        if context.check_active().is_err() {
-            return Ok(KernelNbdAttachResult::OutcomeUnknown);
+        if self
+            .permit
+            .assert_current_publication_paths(self.namespace, self.store)
+            .is_err()
+            || self
+                .store
+                .revalidate_current(self.stored, self.current)
+                .is_err()
+            || assert_current_listener(self.request, self.listener).is_err()
+            || self.context.check_active().is_err()
+        {
+            return KernelNbdAttachResult::OutcomeUnknown;
         }
-        match post_scan? {
-            KernelNbdSlotState::Serving(identity)
-                if identity.listener_socket_path == request.listener_socket_path
-                    && identity.device_path == request.device_path
-                    && identity.size_sectors == request.expected_size_sectors =>
+        match post_scan {
+            Ok(KernelNbdSlotState::Serving(identity))
+                if identity.listener_socket_path == self.request.listener_socket_path
+                    && identity.device_path == self.request.device_path
+                    && identity.size_sectors == self.request.expected_size_sectors =>
             {
-                Ok(KernelNbdAttachResult::Exact(identity))
+                KernelNbdAttachResult::Exact(identity)
             }
-            KernelNbdSlotState::Serving(_) => {
-                anyhow::bail!("kernel-NBD post-scan found a conflicting live client identity")
-            }
-            KernelNbdSlotState::Leaked { .. } => {
-                anyhow::bail!("kernel-NBD post-scan found a leaked or incomplete attachment")
-            }
-            KernelNbdSlotState::Free => Ok(KernelNbdAttachResult::OutcomeUnknown),
+            Ok(KernelNbdSlotState::Serving(_)) => KernelNbdAttachResult::ConflictAfterSubmit(
+                KernelNbdAttachConflict::LiveClientIdentity,
+            ),
+            Ok(KernelNbdSlotState::Leaked {
+                recorded_process_id,
+            }) => KernelNbdAttachResult::ConflictAfterSubmit(
+                KernelNbdAttachConflict::LeakedOrIncompleteAttachment {
+                    recorded_process_id,
+                },
+            ),
+            Ok(KernelNbdSlotState::Free) | Err(_) => KernelNbdAttachResult::OutcomeUnknown,
         }
     }
 }
@@ -948,7 +1036,7 @@ impl KernelNbdClientSubmitPort for PlatformKernelNbdClientSubmitPort {
         request: &KernelNbdAttachRequest,
         context: &RuntimeDesiredEffectContext,
         cleanup_owner: &KernelNbdClientCleanupOwner,
-    ) -> Result<KernelNbdClientSubmission> {
+    ) -> KernelNbdClientSubmitAttempt {
         run_bounded_nbd_client(
             kernel_nbd_client_command(config, request),
             context,
@@ -1038,37 +1126,42 @@ fn run_bounded_nbd_client(
     mut command: Command,
     context: &dyn RuntimePhysicalReadContext,
     cleanup_owner: &KernelNbdClientCleanupOwner,
-) -> Result<KernelNbdClientSubmission> {
-    context.check_active()?;
-    let child = command.spawn().context("spawn exact kernel-NBD client")?;
-    run_bounded_client_process(
+) -> KernelNbdClientSubmitAttempt {
+    if let Err(source) = context.check_active() {
+        return KernelNbdClientSubmitAttempt::NotSubmitted(source);
+    }
+    let child = match command.spawn().context("spawn exact kernel-NBD client") {
+        Ok(child) => child,
+        Err(source) => return KernelNbdClientSubmitAttempt::NotSubmitted(source),
+    };
+    KernelNbdClientSubmitAttempt::Submitted(run_bounded_client_process(
         Box::new(PlatformOwnedKernelNbdClient { child }),
         context,
         cleanup_owner,
-    )
+    ))
 }
 
 fn run_bounded_client_process(
     mut client: Box<dyn OwnedKernelNbdClient>,
     context: &dyn RuntimePhysicalReadContext,
     cleanup_owner: &KernelNbdClientCleanupOwner,
-) -> Result<KernelNbdClientSubmission> {
+) -> KernelNbdClientSubmission {
     loop {
         match client.poll() {
             Ok(KernelNbdClientPoll::Exited { success }) => {
-                return Ok(if success {
+                return if success {
                     KernelNbdClientSubmission::Completed
                 } else {
                     // The process existed, so a non-zero exit cannot prove
                     // that no ioctl reached the kernel. A successor fresh full
                     // scan must settle it.
                     KernelNbdClientSubmission::OutcomeUnknown
-                });
+                };
             }
             Ok(KernelNbdClientPoll::Running) => {}
             Err(_) => {
                 settle_or_transfer_owned_client(client, context, cleanup_owner);
-                return Ok(KernelNbdClientSubmission::OutcomeUnknown);
+                return KernelNbdClientSubmission::OutcomeUnknown;
             }
         }
         if context.check_active().is_err() {
@@ -1076,7 +1169,7 @@ fn run_bounded_client_process(
             // daemonized client may already exist, so no detach or retry is
             // permitted in this admission batch.
             settle_or_transfer_owned_client(client, context, cleanup_owner);
-            return Ok(KernelNbdClientSubmission::OutcomeUnknown);
+            return KernelNbdClientSubmission::OutcomeUnknown;
         }
         let remaining = context.deadline().saturating_duration_since(Instant::now());
         std::thread::sleep(CLIENT_POLL_INTERVAL.min(remaining));
@@ -1663,9 +1756,12 @@ mod tests {
             request: &KernelNbdAttachRequest,
             context: &RuntimeDesiredEffectContext,
             _cleanup_owner: &KernelNbdClientCleanupOwner,
-        ) -> Result<KernelNbdClientSubmission> {
+        ) -> KernelNbdClientSubmitAttempt {
             self.calls.fetch_add(1, Ordering::SeqCst);
-            (self.action)(config, request, context)
+            match (self.action)(config, request, context) {
+                Ok(submission) => KernelNbdClientSubmitAttempt::Submitted(submission),
+                Err(source) => KernelNbdClientSubmitAttempt::NotSubmitted(source),
+            }
         }
     }
 
@@ -1715,19 +1811,29 @@ mod tests {
             _request: &KernelNbdAttachRequest,
             context: &RuntimeDesiredEffectContext,
             cleanup_owner: &KernelNbdClientCleanupOwner,
-        ) -> Result<KernelNbdClientSubmission> {
+        ) -> KernelNbdClientSubmitAttempt {
             let call = self.calls.fetch_add(1, Ordering::SeqCst);
             if call > 0 {
                 (self.after_cleanup)();
-                return Ok(KernelNbdClientSubmission::Completed);
+                return KernelNbdClientSubmitAttempt::Submitted(
+                    KernelNbdClientSubmission::Completed,
+                );
             }
-            let client = self
+            let Some(client) = self
                 .client
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
                 .take()
-                .context("stubborn test client already submitted")?;
-            run_bounded_client_process(client, context, cleanup_owner)
+            else {
+                return KernelNbdClientSubmitAttempt::NotSubmitted(anyhow::anyhow!(
+                    "stubborn test client already submitted"
+                ));
+            };
+            KernelNbdClientSubmitAttempt::Submitted(run_bounded_client_process(
+                client,
+                context,
+                cleanup_owner,
+            ))
         }
     }
 
@@ -2403,6 +2509,20 @@ mod tests {
         assert!(
             KernelNbdReservations::from_checkpoints([&first, &same_identity_other_device]).is_err()
         );
+        let same_token_other_cat = checkpoint("cat_b", "vol_b", "/dev/nbd1", '6');
+        let error =
+            KernelNbdReservations::from_checkpoints([&first, &same_token_other_cat]).unwrap_err();
+        assert!(
+            error.to_string().contains("ownership token is reused"),
+            "{error:#}"
+        );
+        let same_token_other_volume = checkpoint("cat_a", "vol_b", "/dev/nbd1", '6');
+        let error = KernelNbdReservations::from_checkpoints([&first, &same_token_other_volume])
+            .unwrap_err();
+        assert!(
+            error.to_string().contains("ownership token is reused"),
+            "{error:#}"
+        );
 
         let other = Fixture::new(2);
         let port = KernelNbdInventoryPort::new(other.config(2));
@@ -2526,6 +2646,37 @@ mod tests {
     }
 
     #[test]
+    fn pre_submit_spawn_failure_is_the_only_plain_attach_error_after_admission() {
+        let fixture = Fixture::new(1);
+        let source = checkpoint("cat_a", "vol_a", "/dev/nbd0", '6');
+        let store =
+            FileCheckpointStore::open(&fixture.state.join(CHECKPOINT_NAMESPACE), &source.cat_id)
+                .unwrap();
+        let stored = store.create(&source).unwrap();
+        let request = KernelNbdAttachRequest::from_checkpoint(&stored).unwrap();
+        fs::remove_file(&fixture.client).unwrap();
+        let port =
+            ExactKernelNbdAttachPort::new(fixture.config(1), PlatformKernelNbdClientSubmitPort);
+        let context = desired_effect_context(&fixture.state, &["cat_a"]);
+        let listener = FakeListenerGuard::fixed();
+
+        let error = port
+            .attach_checkpointed(&request, &listener, &store, &stored, &context)
+            .unwrap_err();
+        assert!(
+            format!("{error:#}").contains("spawn exact kernel-NBD client"),
+            "{error:#}"
+        );
+        assert_eq!(listener.calls(), 1);
+        let inventory = KernelNbdInventoryPort::new(fixture.config(1));
+        let permit = inventory.lock_and_inspect(&TestContext::active()).unwrap();
+        assert_eq!(
+            permit.snapshot().state(&host("/dev/nbd0")),
+            Some(&KernelNbdSlotState::Free)
+        );
+    }
+
+    #[test]
     fn attach_rejects_busy_foreign_leaked_and_half_configured_slots_before_submit() {
         let cases: [fn(&Fixture); 4] = [
             |fixture| fixture.serving(0, 44, "/run/cats/nbd.sock"),
@@ -2568,6 +2719,7 @@ mod tests {
 
     #[test]
     fn attach_post_scan_rejects_listener_device_size_and_half_state_drift() {
+        #[derive(Clone, Copy)]
         enum Drift {
             Listener,
             Device,
@@ -2639,9 +2791,21 @@ mod tests {
             let context = desired_effect_context(&fixture.state, &["cat_a"]);
             let listener = FakeListenerGuard::fixed();
 
-            assert!(port
+            let result = port
                 .attach_checkpointed(&request, &listener, &store, &stored, &context)
-                .is_err());
+                .unwrap();
+            let expected = match drift {
+                Drift::Listener | Drift::Size => KernelNbdAttachResult::ConflictAfterSubmit(
+                    KernelNbdAttachConflict::LiveClientIdentity,
+                ),
+                Drift::Leaked => KernelNbdAttachResult::ConflictAfterSubmit(
+                    KernelNbdAttachConflict::LeakedOrIncompleteAttachment {
+                        recorded_process_id: None,
+                    },
+                ),
+                Drift::Device | Drift::Half => KernelNbdAttachResult::OutcomeUnknown,
+            };
+            assert_eq!(result, expected);
         }
     }
 
@@ -2698,11 +2862,10 @@ mod tests {
         let port = ExactKernelNbdAttachPort::new(fixture.config(1), submitter);
         let context = desired_effect_context(&fixture.state, &["cat_a"]);
 
-        let error = port
+        let result = port
             .attach_checkpointed(&request, &listener, &store, &stored, &context)
-            .unwrap_err();
-        let rendered = format!("{error:#}");
-        assert!(rendered.contains("physical identity changed"), "{rendered}");
+            .unwrap();
+        assert_eq!(result, KernelNbdAttachResult::OutcomeUnknown);
         assert_eq!(calls.calls(), 1);
         assert_eq!(listener.calls(), 2);
     }
@@ -2804,9 +2967,11 @@ mod tests {
             let context = desired_effect_context(&fixture.state, &["cat_a"]);
             let listener = FakeListenerGuard::fixed();
 
-            assert!(port
-                .attach_checkpointed(&request, &listener, &store, &stored, &context)
-                .is_err());
+            assert_eq!(
+                port.attach_checkpointed(&request, &listener, &store, &stored, &context)
+                    .unwrap(),
+                KernelNbdAttachResult::OutcomeUnknown
+            );
         }
     }
 
@@ -2900,17 +3065,15 @@ exit 0
             StateDirectory::unanchored(fixture.state.clone()),
             Instant::now() + Duration::from_secs(2),
         );
-        assert_eq!(
-            PlatformKernelNbdClientSubmitPort
-                .submit(
-                    &fixture.config(1),
-                    &request,
-                    &context,
-                    &KernelNbdClientCleanupOwner::new(),
-                )
-                .unwrap(),
-            KernelNbdClientSubmission::Completed
-        );
+        assert!(matches!(
+            PlatformKernelNbdClientSubmitPort.submit(
+                &fixture.config(1),
+                &request,
+                &context,
+                &KernelNbdClientCleanupOwner::new(),
+            ),
+            KernelNbdClientSubmitAttempt::Submitted(KernelNbdClientSubmission::Completed)
+        ));
     }
 
     #[test]
@@ -2948,12 +3111,15 @@ exit 0
         });
         let started = Instant::now();
         let cleanup_owner = KernelNbdClientCleanupOwner::new();
-        assert_eq!(
-            PlatformKernelNbdClientSubmitPort
-                .submit(&fixture.config(1), &request, &context, &cleanup_owner,)
-                .unwrap(),
-            KernelNbdClientSubmission::OutcomeUnknown
-        );
+        assert!(matches!(
+            PlatformKernelNbdClientSubmitPort.submit(
+                &fixture.config(1),
+                &request,
+                &context,
+                &cleanup_owner,
+            ),
+            KernelNbdClientSubmitAttempt::Submitted(KernelNbdClientSubmission::OutcomeUnknown)
+        ));
         canceller.join().unwrap();
         assert!(started.elapsed() < Duration::from_secs(2));
         let pid: libc::pid_t = fs::read_to_string(pid_file).unwrap().parse().unwrap();
