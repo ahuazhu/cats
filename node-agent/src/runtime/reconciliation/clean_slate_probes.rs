@@ -89,6 +89,8 @@ const DATA_NAMESPACE: &str = "data";
 const PENDING_PACK_NAMESPACE: &str = "pending-packs";
 const WARM_SNAPSHOT_NAMESPACE: &str = "warm-snapshots";
 const GUEST_MOUNT_NAMESPACE: &str = "guest-mounts";
+const RUNTIME_V1_MAX_ASSIGNED_CATS: usize = 1_024;
+const RUNTIME_STATE_ENTRIES_PER_ASSIGNED_CAT: usize = 32;
 
 fn is_release_rejection_entry(name: &str) -> bool {
     (name.starts_with("cat-") && name.ends_with(".release-rejection.json"))
@@ -860,7 +862,11 @@ struct ProbeLimits {
 impl Default for ProbeLimits {
     fn default() -> Self {
         Self {
-            state_entries: 4_096,
+            // One current Cat may contribute a checkpoint/lock pair, four
+            // data-directory levels, the three immutable authorization files,
+            // control-only state, and bounded handoff publications. Keep the
+            // cap proportional to the wire-level 1,024-Cat bound.
+            state_entries: RUNTIME_V1_MAX_ASSIGNED_CATS * RUNTIME_STATE_ENTRIES_PER_ASSIGNED_CAT,
             os_entries: 131_072,
             recursion_depth: 16,
             process_cmdline_bytes: 64 * 1024,
@@ -1725,6 +1731,98 @@ struct AuthorizedBlockdDataScan {
     handoff_temps: Vec<(Id, ServingHandoffTempKind, AuthorizedBlockdCheckpoint)>,
 }
 
+/// One immutable checkpoint-namespace join for the whole data-directory
+/// scan. Re-enumerating this namespace once per Cat is both racy and
+/// quadratic; this index validates every name and target exactly once, then
+/// all handoff leaves use an in-memory Cat lookup from the same snapshot.
+fn snapshot_runtime_checkpoints_for_handoff(
+    root: &File,
+    context: &RuntimeInventoryScanContext,
+    limit: usize,
+) -> anyhow::Result<Option<BTreeMap<Id, RuntimeCheckpoint>>> {
+    let directory = match open_state_namespace(root, CHECKPOINT_NAMESPACE)? {
+        ManagedDirectory::Open(directory) => directory,
+        ManagedDirectory::Missing | ManagedDirectory::Unavailable => return Ok(None),
+    };
+    let mut budget = limit;
+    let Some(entries) = strict_checkpoint_directory_entries(&directory, &mut budget, context)?
+    else {
+        return Ok(None);
+    };
+    let desired_by_target = context
+        .coordinates()
+        .desired
+        .desired_specs
+        .iter()
+        .map(|desired| (format!("cat-{}.checkpoint.json", desired.cat_id), desired))
+        .collect::<BTreeMap<_, _>>();
+    let desired_locks = context
+        .coordinates()
+        .desired
+        .desired_specs
+        .iter()
+        .map(|desired| format!("cat-{}.checkpoint.lock", desired.cat_id))
+        .collect::<BTreeSet<_>>();
+    let desired_temps = context
+        .coordinates()
+        .desired
+        .desired_specs
+        .iter()
+        .flat_map(|desired| {
+            [
+                format!(".cat-{}.checkpoint.tmp", desired.cat_id),
+                format!("cat-{}.release-rejection.json", desired.cat_id),
+                format!(".cat-{}.release-rejection.tmp", desired.cat_id),
+            ]
+        })
+        .collect::<BTreeSet<_>>();
+    let mut checkpoints = BTreeMap::new();
+    for entry in entries {
+        let Some(name) = entry.name.to_str() else {
+            bail!("checkpoint namespace contains a non-UTF-8 entry")
+        };
+        if desired_locks.contains(name) {
+            validate_strict_regular_entry(&entry, root, 0o600)?;
+            continue;
+        }
+        if desired_temps.contains(name) {
+            // A generic temp or release publication has its own serialized
+            // pre-scan recovery. It cannot share a handoff snapshot.
+            return Ok(None);
+        }
+        let Some(desired) = desired_by_target.get(name) else {
+            bail!("checkpoint namespace retains foreign entry {name}")
+        };
+        let Some(bytes) = read_strict_regular_at(
+            &directory,
+            &entry,
+            root,
+            RUNTIME_CHECKPOINT_MAX_WIRE_BYTES,
+            context,
+        )?
+        else {
+            return Ok(None);
+        };
+        let checkpoint =
+            decode_runtime_checkpoint(&bytes).context("decode handoff-index Runtime checkpoint")?;
+        anyhow::ensure!(
+            checkpoint.cat_id == desired.cat_id,
+            "handoff index checkpoint filename and Cat identity disagree"
+        );
+        anyhow::ensure!(
+            checkpoints
+                .insert(desired.cat_id.clone(), checkpoint)
+                .is_none(),
+            "handoff index contains duplicate Runtime checkpoints for one Cat"
+        );
+    }
+    anyhow::ensure!(
+        checkpoints.len() <= RUNTIME_V1_MAX_ASSIGNED_CATS,
+        "handoff checkpoint index exceeds the assigned-Cat cap"
+    );
+    Ok(Some(checkpoints))
+}
+
 fn scan_authorized_blockd_data(
     root: &File,
     state_path: &Path,
@@ -1759,6 +1857,8 @@ fn scan_authorized_blockd_data(
         .iter()
         .map(|desired| (format!("cat-{}", desired.cat_id), desired))
         .collect::<BTreeMap<_, _>>();
+    let handoff_checkpoints =
+        snapshot_runtime_checkpoints_for_handoff(root, context, limits.state_entries)?;
     let mut budget = limits.state_entries;
     let Some(cat_entries) = strict_directory_entries(&directory, &mut budget, context)? else {
         return Ok(AuthorizedBlockdDataScan {
@@ -1997,16 +2097,13 @@ fn scan_authorized_blockd_data(
         .context("authorized blockd data directory is not a HostPath")?;
         let mut retained_root_process = None;
         if !has_unvalidated_handoff_artifact {
-            if let Some(runtime_checkpoint) = read_runtime_checkpoint_for_handoff(
-                root,
-                state_path,
-                &desired.cat_id,
-                &mut budget,
-                context,
-            )? {
+            if let Some(runtime_checkpoint) = handoff_checkpoints
+                .as_ref()
+                .and_then(|checkpoints| checkpoints.get(&desired.cat_id))
+            {
                 anyhow::ensure!(
                     !matches!(
-                        runtime_checkpoint.step,
+                        &runtime_checkpoint.step,
                         ReconcileStep::PrepareDevice {
                             serving_authority,
                             ..
@@ -2020,13 +2117,10 @@ fn scan_authorized_blockd_data(
             }
         }
         if has_unvalidated_handoff_artifact {
-            let Some(runtime_checkpoint) = read_runtime_checkpoint_for_handoff(
-                root,
-                state_path,
-                &desired.cat_id,
-                &mut budget,
-                context,
-            )?
+            let Some(runtime_checkpoint) = handoff_checkpoints
+                .as_ref()
+                .and_then(|checkpoints| checkpoints.get(&desired.cat_id))
+                .cloned()
             else {
                 scan.complete = false;
                 continue;
@@ -2284,52 +2378,6 @@ fn read_scanned_handoff_artifact(
         content_sha256: Sha256Digest::from_bytes(Sha256::digest(&bytes).into()),
         bytes,
     }))
-}
-
-fn read_runtime_checkpoint_for_handoff(
-    root: &File,
-    state_path: &Path,
-    cat_id: &Id,
-    budget: &mut usize,
-    context: &RuntimeInventoryScanContext,
-) -> anyhow::Result<Option<RuntimeCheckpoint>> {
-    let directory = match open_state_namespace(root, CHECKPOINT_NAMESPACE)? {
-        ManagedDirectory::Open(directory) => directory,
-        ManagedDirectory::Missing | ManagedDirectory::Unavailable => return Ok(None),
-    };
-    let Some(entries) = strict_checkpoint_directory_entries(&directory, budget, context)? else {
-        return Ok(None);
-    };
-    let path = super::runtime_checkpoint_path(&state_path.join(CHECKPOINT_NAMESPACE), cat_id);
-    let expected_name = path
-        .file_name()
-        .context("Runtime checkpoint path has no basename")?;
-    let mut matches = entries
-        .iter()
-        .filter(|entry| entry.name.as_os_str() == expected_name);
-    let Some(entry) = matches.next() else {
-        return Ok(None);
-    };
-    anyhow::ensure!(
-        matches.next().is_none(),
-        "handoff classifier found duplicate Runtime checkpoint entries"
-    );
-    let Some(bytes) = read_strict_regular_at(
-        &directory,
-        entry,
-        root,
-        RUNTIME_CHECKPOINT_MAX_WIRE_BYTES,
-        context,
-    )?
-    else {
-        return Ok(None);
-    };
-    let checkpoint = decode_runtime_checkpoint(&bytes)?;
-    anyhow::ensure!(
-        checkpoint.cat_id == *cat_id,
-        "handoff classifier loaded another Cat checkpoint"
-    );
-    Ok(Some(checkpoint))
 }
 
 fn descend_only_directory(
@@ -7950,6 +7998,163 @@ mod tests {
                 RuntimeInventoryScanOutcome::Complete(_)
             ));
         }
+    }
+
+    #[test]
+    fn handoff_checkpoint_join_is_linear_at_a_cap_scaled_cat_count() {
+        const CAT_COUNT: usize = RUNTIME_V1_MAX_ASSIGNED_CATS / 16;
+        let environment = TestEnvironment::new();
+        let mut scan_context = context_until(Instant::now() + Duration::from_secs(60));
+        let base = assigned_context(true).coordinates().desired.desired_specs[0].clone();
+        let desired_specs = (0..CAT_COUNT)
+            .map(|index| {
+                let mut desired = base.clone();
+                desired.cat_id = Id::new(format!("cat_{index:04}")).unwrap();
+                desired.runtime.network_config.network_id =
+                    Id::new(format!("net_{index:04}")).unwrap();
+                let volume = desired.volumes.first_mut().unwrap();
+                volume.volume_intent_id = Id::new(format!("vint_{index:04}")).unwrap();
+                volume.disk_id = Id::new(format!("disk_{index:04}")).unwrap();
+                volume.volume_id = Id::new(format!("vol_{index:04}")).unwrap();
+                volume.attachment_id = Id::new(format!("att_{index:04}")).unwrap();
+                volume.guest_device.serial = Id::new(format!("root-{index:04}")).unwrap();
+                let VolumeAcquire::Normal { transition_id, .. } = &mut volume.acquire else {
+                    unreachable!()
+                };
+                *transition_id = RandomId128::new(format!("{:032x}", index + 1)).unwrap();
+                desired.spec_digest = spec_digest(&desired).unwrap();
+                desired
+            })
+            .collect::<Vec<_>>();
+        scan_context.coordinates_mut().desired.desired_specs = desired_specs.clone();
+
+        let checkpoint_directory = environment.state.join(CHECKPOINT_NAMESPACE);
+        let mut first_checkpoint_path = None;
+        for (index, desired) in desired_specs.iter().enumerate() {
+            let (mut record, attachment) = exact_owned_record_and_attachment(desired);
+            let prepared =
+                AuthorizedBlockdStore::new(StateDirectory::unanchored(environment.state.clone()))
+                    .prepare(desired, &desired.volumes[0], &attachment)
+                    .unwrap();
+            let data_directory = prepared.data_directory().to_path_buf();
+            let acquired = prepared.checkpoint().clone();
+            drop(prepared);
+            let blob = ExactManifestBlobStore::for_desired(desired);
+            let ProvisionHeadRead::Ready { blank, target } = expected_provision_heads(
+                &blob,
+                desired,
+                &desired.volumes[0],
+                scan_context.deadline(),
+            ) else {
+                panic!("cap-scaled fixture manifest must be exact")
+            };
+            let mut checkpoint = acquire_checkpoint(
+                desired,
+                &desired.volumes[0],
+                RuntimeVolumeTransition::Acquire {
+                    request: VolumeAcquireRequest::Normal {
+                        volume_id: attachment.acquire_request.volume_id.clone(),
+                        transition_id: attachment.acquire_request.transition_id.clone(),
+                        attachment_id: attachment.acquire_request.attachment_id.clone(),
+                        expected_unowned_epoch: attachment.acquire_request.expected_unowned_epoch,
+                        desired_revision: attachment.acquire_request.desired_revision,
+                        placement_epoch: attachment.acquire_request.placement_epoch,
+                        lease_duration_ms: attachment.acquire_request.lease_duration_ms,
+                    },
+                },
+                UnixMillis::new(10_000 + index as u64).unwrap(),
+            );
+            let provision_transition_id =
+                RandomId128::new(format!("{:032x}", CAT_COUNT + index)).unwrap();
+            let process_identity_token =
+                RandomId128::new(format!("{:032x}", 2 * CAT_COUNT + index)).unwrap();
+            let scope_id = Id::new(format!(
+                "cats-root-{}.service",
+                RandomId128::new(format!("{:032x}", 3 * CAT_COUNT + index))
+                    .unwrap()
+                    .as_str()
+            ))
+            .unwrap();
+            let data = HostPath::new(data_directory.to_string_lossy().into_owned()).unwrap();
+            checkpoint.step = ReconcileStep::ProvisionRootImage {
+                provision_transition_id: provision_transition_id.clone(),
+                volume_id: attachment.identity.volume_id.clone(),
+                attachment_id: attachment.identity.attachment_id.clone(),
+                attachment_epoch: attachment.identity.attachment_epoch,
+                scope_id,
+                control_socket_path: HostPath::new(
+                    data_directory
+                        .join("root-provision.sock")
+                        .to_string_lossy()
+                        .into_owned(),
+                )
+                .unwrap(),
+                data_directory: data.clone(),
+                process_identity_token,
+                size_bytes: attachment.size_bytes,
+                boot_image_digest: desired.runtime.boot_image_digest.clone(),
+                expected_blank_head: blank,
+                expected_provisioned_head: target.clone(),
+            };
+            checkpoint.volumes = vec![prepared_owned_observed_volume(
+                &desired.volumes[0],
+                &attachment,
+                data,
+            )];
+            let stored = FileCheckpointStore::open(&checkpoint_directory, &desired.cat_id)
+                .unwrap()
+                .create(&checkpoint)
+                .unwrap();
+            if index == 0 {
+                record.head = target;
+                let authority = super::super::serving_handoff::ServingAuthorityTargetEvidence::new(
+                    provision_transition_id,
+                    record,
+                );
+                drop(
+                    super::super::serving_handoff::ServingHandoffStore::new(
+                        StateDirectory::unanchored(environment.state.clone()),
+                    )
+                    .seal_target_control_authorization(&stored, &acquired, &authority)
+                    .unwrap(),
+                );
+                first_checkpoint_path = Some(super::super::runtime_checkpoint_path(
+                    &checkpoint_directory,
+                    &desired.cat_id,
+                ));
+            }
+        }
+
+        let limits = ProbeLimits {
+            // Enough for one checkpoint enumeration plus one linear data-tree
+            // traversal, but far below the old 2*N^2 checkpoint cost.
+            state_entries: 1_024,
+            ..ProbeLimits::default()
+        };
+        let root = clone_state_root(&StateDirectory::unanchored(environment.state.clone()))
+            .unwrap()
+            .unwrap();
+        let data =
+            scan_authorized_blockd_data(&root, &environment.state, &scan_context, limits).unwrap();
+        assert!(data.complete);
+        assert_eq!(data.evidence.len(), CAT_COUNT);
+
+        let foreign = checkpoint_directory.join("foreign.checkpoint");
+        let mut options = std::fs::OpenOptions::new();
+        options.write(true).create_new(true).mode(0o600);
+        std::io::Write::write_all(&mut options.open(&foreign).unwrap(), b"foreign").unwrap();
+        assert!(
+            scan_authorized_blockd_data(&root, &environment.state, &scan_context, limits,).is_err()
+        );
+        std::fs::remove_file(foreign).unwrap();
+
+        let first_bytes = std::fs::read(first_checkpoint_path.unwrap()).unwrap();
+        let duplicate_path =
+            super::super::runtime_checkpoint_path(&checkpoint_directory, &desired_specs[1].cat_id);
+        std::fs::write(duplicate_path, first_bytes).unwrap();
+        assert!(
+            scan_authorized_blockd_data(&root, &environment.state, &scan_context, limits,).is_err()
+        );
     }
 
     #[test]

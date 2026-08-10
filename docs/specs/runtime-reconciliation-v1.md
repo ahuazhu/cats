@@ -986,7 +986,10 @@ scanner对target/record/retirement receipt做provider-private typed分类，不�
 `provision_root_image`按current checkpoint或receipt的exact token-only predecessor闭合；CAS进入
 `prepare_device.after_root_provision`后，必须由handoff predecessor digest、record完整内容及物理identity、
 target identity和current attachment/head/serving lineage共同闭合。`direct_authorized_attachment`不得夹带这些
-Root handoff artifacts。三种deterministic `.tmp`只允许serialized pre-scan每轮处理一个：持有attachment flock
+Root handoff artifacts。若CAS后旧target-control仍存活，scanner必须从这组已验证record/target重建旧attempt的
+exact scope/cgroup/PID/socket/token/handshake expectation，将其纳入同一次Node-global allowlist并投影到fresh full；
+停止旧进程仍是下一轮独立的一个physical effect，不能与CAS合并。checkpoint namespace在每轮data scan中只允许
+一次有界严格枚举并按Cat join；不得为每个data leaf重复全目录扫描。三种deterministic `.tmp`只允许serialized pre-scan每轮处理一个：持有attachment flock
 和current checkpoint guard，确认regular/0600/single-link及exact lineage后只unlink+fsync，绝不发布temp；然后
 必须重新fresh full scan。unsafe、foreign、corrupt或多个temp均fail closed。
 
