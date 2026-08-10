@@ -39,6 +39,7 @@ use super::root_provision_process::{
     RootProvisionAuthoritySnapshot, RootProvisionProcessEvidence, RootProvisionProcessExpectation,
     RootProvisionRetirementAdmission,
 };
+use super::serving_handoff::rename_no_replace;
 
 const DATA_DIRECTORY: &str = "data";
 pub(crate) const IDENTITY_FILE: &str = "identity.json";
@@ -52,6 +53,9 @@ pub(crate) const MAX_AUTHORIZED_SERVING_BYTES: usize = 32 * 1024;
 pub(crate) const MAX_LAUNCH_CHECKPOINT_BYTES: usize = 512 * 1024;
 pub(crate) const ROOT_PROVISION_STOP_RECEIPT_FILE: &str = "root-provision-stop.json";
 pub(crate) const ROOT_PROVISION_STOP_RECEIPT_TEMP: &str = ".root-provision-stop.json.tmp";
+// Shorter than `root-provision.sock` so every admitted control path remains
+// connect-probeable after an atomic claim on platforms with a small sun_path.
+pub(crate) const ROOT_PROVISION_STOP_SOCKET_QUARANTINE: &str = ".rp-stop.sock";
 const STAT_FILE_TYPE_MASK: u32 = 0o170000;
 const STAT_SOCKET_FILE_TYPE: u32 = 0o140000;
 // The receipt stores fixed-size digests plus the bounded physical/authority
@@ -117,6 +121,13 @@ impl RootProvisionStopReceipt {
             process.exactly_matches(&expectation),
             "root-provision stop process is not its exact old expectation"
         );
+        anyhow::ensure!(
+            matches!(
+                authority.lease_expires_at,
+                Some(current) if current >= authorized.attachment.lease_expires_at
+            ),
+            "root-provision stop authority lease predates its retained launch grant"
+        );
         let receipt = Self {
             version: ContractVersion::V1,
             checkpoint_content_digest: checkpoint_content_digest(checkpoint)
@@ -137,6 +148,7 @@ impl RootProvisionStopReceipt {
         &self.checkpoint_content_digest
     }
 
+    #[cfg(test)]
     pub(crate) fn authorized_checkpoint_content_digest(&self) -> &Sha256Digest {
         &self.authorized_checkpoint_content_digest
     }
@@ -191,10 +203,25 @@ impl RootProvisionStopReceipt {
         authorized: &AuthorizedBlockdCheckpoint,
     ) -> Result<()> {
         anyhow::ensure!(
-            checkpoint_content_digest(checkpoint)? == self.checkpoint_content_digest
-                && authorized_blockd_checkpoint_content_digest(authorized)?
-                    == self.authorized_checkpoint_content_digest,
-            "root-provision stop receipt belongs to another retained checkpoint or launch grant"
+            checkpoint_content_digest(checkpoint)? == self.checkpoint_content_digest,
+            "root-provision stop receipt belongs to another retained Runtime checkpoint"
+        );
+        self.binds_authorized_checkpoint(authorized)?;
+        Ok(())
+    }
+
+    pub(crate) fn binds_authorized_checkpoint(
+        &self,
+        authorized: &AuthorizedBlockdCheckpoint,
+    ) -> Result<()> {
+        anyhow::ensure!(
+            authorized_blockd_checkpoint_content_digest(authorized)?
+                == self.authorized_checkpoint_content_digest
+                && matches!(
+                    self.authority.lease_expires_at,
+                    Some(current) if current >= authorized.attachment.lease_expires_at
+                ),
+            "root-provision stop receipt belongs to another launch grant or predates it"
         );
         Ok(())
     }
@@ -219,8 +246,10 @@ fn same_retirement_authority(before: &VolumeRecord, after: &VolumeRecord) -> boo
         && before.lease_owner == after.lease_owner
         && before.lease_epoch == after.lease_epoch
         && before.last_transition == after.last_transition
-        && before.lease_expires_at.is_some()
-        && after.lease_expires_at.is_some()
+        && matches!(
+            (before.lease_expires_at, after.lease_expires_at),
+            (Some(before), Some(after)) if after >= before
+        )
 }
 
 pub(crate) fn authorized_blockd_checkpoint_content_digest(
@@ -684,6 +713,12 @@ pub(crate) enum StopReceiptPublication {
     Recovered(RootProvisionStopReceipt),
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum NoReplaceReceiptPublication {
+    Published,
+    ExactReplay,
+}
+
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct RetainedExactControlSocket {
     identity: StableFsIdentity,
@@ -772,29 +807,8 @@ impl RetainedAuthorizedBlockd {
             (None, Some(temporary)) => {
                 let receipt = decode_root_provision_stop_receipt(&temporary)?;
                 self.validate_receipt_for_retained_inputs(&receipt)?;
-                let target = c_string(
-                    ROOT_PROVISION_STOP_RECEIPT_FILE,
-                    &self.data_directory.join(ROOT_PROVISION_STOP_RECEIPT_FILE),
-                )?;
-                let temp = c_string(
-                    ROOT_PROVISION_STOP_RECEIPT_TEMP,
-                    &self.data_directory.join(ROOT_PROVISION_STOP_RECEIPT_TEMP),
-                )?;
-                anyhow::ensure!(
-                    read_optional_bounded(
-                        &self.directory,
-                        &target,
-                        &self.data_directory.join(ROOT_PROVISION_STOP_RECEIPT_FILE),
-                        ROOT_PROVISION_STOP_RECEIPT_MAX_BYTES,
-                    )?
-                    .is_none(),
-                    "root-provision stop receipt target appeared during recovery"
-                );
-                rename_at(&self.directory, &temp, &self.directory, &target)
+                self.publish_stop_receipt_no_replace(&temporary)
                     .context("publish recovered root-provision stop receipt")?;
-                self.directory
-                    .sync_all()
-                    .context("sync recovered root-provision stop receipt")?;
                 Ok(StopReceiptSettlement::Recovered(receipt))
             }
         }
@@ -806,6 +820,23 @@ impl RetainedAuthorizedBlockd {
     pub(crate) fn persist_or_reopen_stop_receipt(
         &mut self,
         candidate: &RootProvisionStopReceipt,
+    ) -> Result<StopReceiptPublication> {
+        self.persist_or_reopen_stop_receipt_before_publish(candidate, || {})
+    }
+
+    #[cfg(test)]
+    pub(crate) fn persist_or_reopen_stop_receipt_with_hook(
+        &mut self,
+        candidate: &RootProvisionStopReceipt,
+        before_publish: impl FnOnce(),
+    ) -> Result<StopReceiptPublication> {
+        self.persist_or_reopen_stop_receipt_before_publish(candidate, before_publish)
+    }
+
+    fn persist_or_reopen_stop_receipt_before_publish(
+        &mut self,
+        candidate: &RootProvisionStopReceipt,
+        before_publish: impl FnOnce(),
     ) -> Result<StopReceiptPublication> {
         match self.settle_stop_receipt()? {
             StopReceiptSettlement::Stable(receipt) => {
@@ -849,30 +880,77 @@ impl RetainedAuthorizedBlockd {
                     &self.root_identity,
                     Some(bytes.len()),
                 )?;
-                let target_path = self.data_directory.join(ROOT_PROVISION_STOP_RECEIPT_FILE);
-                let target = c_string(ROOT_PROVISION_STOP_RECEIPT_FILE, &target_path)?;
-                anyhow::ensure!(
-                    read_optional_bounded(
-                        &self.directory,
-                        &target,
-                        &target_path,
-                        ROOT_PROVISION_STOP_RECEIPT_MAX_BYTES,
-                    )?
-                    .is_none(),
-                    "root-provision stop receipt target appeared before publish"
-                );
-                rename_at(&self.directory, &temp, &self.directory, &target)
+                before_publish();
+                let publication = self
+                    .publish_stop_receipt_no_replace(&bytes)
                     .context("publish root-provision stop receipt")?;
-                self.directory
-                    .sync_all()
-                    .context("sync root-provision stop receipt publication")?;
                 let current_leaf = stable_identity(&self.directory, &self.data_directory)?;
                 *self
                     .component_identities
                     .last_mut()
                     .context("retained authorized blockd path is empty")? = current_leaf;
-                Ok(StopReceiptPublication::Published(candidate.clone()))
+                Ok(match publication {
+                    NoReplaceReceiptPublication::Published => {
+                        StopReceiptPublication::Published(candidate.clone())
+                    }
+                    NoReplaceReceiptPublication::ExactReplay => {
+                        StopReceiptPublication::Recovered(candidate.clone())
+                    }
+                })
             }
+        }
+    }
+
+    /// Atomically publish the already-fsynced temp without replacing an entry
+    /// which appeared after the preceding scan. EEXIST is recoverable only
+    /// when both names still contain the same canonical receipt; conflicting
+    /// bytes are deliberately left in place for the next full scan.
+    fn publish_stop_receipt_no_replace(
+        &self,
+        expected: &[u8],
+    ) -> Result<NoReplaceReceiptPublication> {
+        let temp_path = self.data_directory.join(ROOT_PROVISION_STOP_RECEIPT_TEMP);
+        let target_path = self.data_directory.join(ROOT_PROVISION_STOP_RECEIPT_FILE);
+        let temp = c_string(ROOT_PROVISION_STOP_RECEIPT_TEMP, &temp_path)?;
+        let target = c_string(ROOT_PROVISION_STOP_RECEIPT_FILE, &target_path)?;
+        match rename_no_replace(&self.directory, &temp, &self.directory, &target) {
+            Ok(()) => {
+                self.directory
+                    .sync_all()
+                    .context("sync root-provision stop receipt publication")?;
+                anyhow::ensure!(
+                    self.read_stop_receipt_bytes(ROOT_PROVISION_STOP_RECEIPT_FILE)?
+                        .as_deref()
+                        == Some(expected)
+                        && self
+                            .read_stop_receipt_bytes(ROOT_PROVISION_STOP_RECEIPT_TEMP)?
+                            .is_none(),
+                    "published root-provision stop receipt changed or retained its temp"
+                );
+                Ok(NoReplaceReceiptPublication::Published)
+            }
+            Err(source)
+                if source.kind() == io::ErrorKind::AlreadyExists
+                    || source.raw_os_error() == Some(libc::EEXIST) =>
+            {
+                anyhow::ensure!(
+                    self.read_stop_receipt_bytes(ROOT_PROVISION_STOP_RECEIPT_FILE)?
+                        .as_deref()
+                        == Some(expected)
+                        && self
+                            .read_stop_receipt_bytes(ROOT_PROVISION_STOP_RECEIPT_TEMP)?
+                            .as_deref()
+                            == Some(expected),
+                    "root-provision stop receipt no-replace conflict"
+                );
+                unlink_at(&self.directory, &temp)
+                    .context("remove exact replay root-provision stop receipt temp")?;
+                self.directory
+                    .sync_all()
+                    .context("sync exact replay root-provision stop receipt temp removal")?;
+                Ok(NoReplaceReceiptPublication::ExactReplay)
+            }
+            Err(source) => Err(source).context("atomically publish root-provision stop receipt"),
         }
     }
 
@@ -910,11 +988,10 @@ impl RetainedAuthorizedBlockd {
     ) -> Result<()> {
         validate_root_provision_stop_receipt(receipt)?;
         anyhow::ensure!(
-            receipt.authorized_checkpoint_content_digest
-                == authorized_blockd_checkpoint_content_digest(&self.checkpoint)?
-                && Path::new(receipt.process.data_directory.as_str()) == self.data_directory,
+            Path::new(receipt.process.data_directory.as_str()) == self.data_directory,
             "root-provision stop receipt is outside the retained old inputs"
         );
+        receipt.binds_authorized_checkpoint(&self.checkpoint)?;
         Ok(())
     }
 
@@ -952,10 +1029,36 @@ impl RetainedAuthorizedBlockd {
         &self,
         retained: RetainedExactControlSocket,
     ) -> Result<ExactControlSocketCleanup> {
+        self.remove_exact_stale_control_socket_before_claim(retained, || {})
+    }
+
+    #[cfg(test)]
+    pub(crate) fn remove_exact_stale_control_socket_with_hook(
+        &self,
+        retained: RetainedExactControlSocket,
+        before_claim: impl FnOnce(),
+    ) -> Result<ExactControlSocketCleanup> {
+        self.remove_exact_stale_control_socket_before_claim(retained, before_claim)
+    }
+
+    fn remove_exact_stale_control_socket_before_claim(
+        &self,
+        retained: RetainedExactControlSocket,
+        before_claim: impl FnOnce(),
+    ) -> Result<ExactControlSocketCleanup> {
         self.assert_current()?;
         let socket_name = "root-provision.sock";
-        let socket = c_string(socket_name, &self.data_directory.join(socket_name))?;
-        match nonblocking_unix_socket_state(&self.data_directory.join(socket_name))? {
+        let socket_path = self.data_directory.join(socket_name);
+        let socket = c_string(socket_name, &socket_path)?;
+        let quarantine_path = self
+            .data_directory
+            .join(ROOT_PROVISION_STOP_SOCKET_QUARANTINE);
+        let quarantine = c_string(ROOT_PROVISION_STOP_SOCKET_QUARANTINE, &quarantine_path)?;
+
+        if stat_at_optional(&self.directory, &quarantine)?.is_some() {
+            return self.finish_claimed_control_socket(retained, &socket, &quarantine);
+        }
+        match nonblocking_unix_socket_state(&socket_path)? {
             UnixSocketState::ConnectableOrUnknown => {
                 return Ok(ExactControlSocketCleanup::LiveOrChanged)
             }
@@ -978,16 +1081,142 @@ impl RetainedAuthorizedBlockd {
         {
             return Ok(ExactControlSocketCleanup::LiveOrChanged);
         }
-        unlink_at(&self.directory, &socket).context("unlink exact stale root-provision socket")?;
+        before_claim();
+        match rename_no_replace(&self.directory, &socket, &self.directory, &quarantine) {
+            Ok(()) => {}
+            Err(source)
+                if source.kind() == io::ErrorKind::AlreadyExists
+                    || source.raw_os_error() == Some(libc::EEXIST) =>
+            {
+                return Ok(ExactControlSocketCleanup::LiveOrChanged)
+            }
+            Err(source)
+                if source.kind() == io::ErrorKind::NotFound
+                    || source.raw_os_error() == Some(libc::ENOENT) =>
+            {
+                if stat_at_optional(&self.directory, &socket)?.is_some()
+                    || stat_at_optional(&self.directory, &quarantine)?.is_some()
+                {
+                    return Ok(ExactControlSocketCleanup::LiveOrChanged);
+                }
+                self.directory
+                    .sync_all()
+                    .context("sync concurrently absent root-provision socket")?;
+                return Ok(ExactControlSocketCleanup::AlreadyAbsent);
+            }
+            Err(source) => {
+                return Err(source).context("atomically claim exact stale root-provision socket")
+            }
+        }
+        self.directory
+            .sync_all()
+            .context("sync exact stale root-provision socket claim")?;
+        self.finish_claimed_control_socket(retained, &socket, &quarantine)
+    }
+
+    fn finish_claimed_control_socket(
+        &self,
+        retained: RetainedExactControlSocket,
+        socket: &CStr,
+        quarantine: &CStr,
+    ) -> Result<ExactControlSocketCleanup> {
+        let Some(claimed) = stat_at_optional(&self.directory, quarantine)? else {
+            if stat_at_optional(&self.directory, socket)?.is_none() {
+                self.directory
+                    .sync_all()
+                    .context("sync absent claimed root-provision socket")?;
+                return Ok(ExactControlSocketCleanup::AlreadyAbsent);
+            }
+            return Ok(ExactControlSocketCleanup::LiveOrChanged);
+        };
+        if verify_retained_socket_identity(&claimed, &self.root_identity).is_err()
+            || !same_socket_after_rename(&retained.identity, &claimed)
+        {
+            self.restore_changed_socket_claim(socket, quarantine)?;
+            return Ok(ExactControlSocketCleanup::LiveOrChanged);
+        }
+        if stat_at_optional(&self.directory, socket)?.is_some() {
+            return Ok(ExactControlSocketCleanup::LiveOrChanged);
+        }
+        let quarantine_path = self
+            .data_directory
+            .join(ROOT_PROVISION_STOP_SOCKET_QUARANTINE);
+        match nonblocking_unix_socket_state(&quarantine_path)? {
+            UnixSocketState::ConnectableOrUnknown => {
+                return Ok(ExactControlSocketCleanup::LiveOrChanged)
+            }
+            UnixSocketState::Absent => {
+                if stat_at_optional(&self.directory, quarantine)?.is_some()
+                    || stat_at_optional(&self.directory, socket)?.is_some()
+                {
+                    return Ok(ExactControlSocketCleanup::LiveOrChanged);
+                }
+                self.directory
+                    .sync_all()
+                    .context("sync concurrently absent claimed root-provision socket")?;
+                return Ok(ExactControlSocketCleanup::AlreadyAbsent);
+            }
+            UnixSocketState::Refused => {}
+        }
+        let Some(final_claimed) = stat_at_optional(&self.directory, quarantine)? else {
+            self.directory
+                .sync_all()
+                .context("sync concurrently absent claimed root-provision socket")?;
+            return Ok(ExactControlSocketCleanup::AlreadyAbsent);
+        };
+        if verify_retained_socket_identity(&final_claimed, &self.root_identity).is_err()
+            || !same_socket_after_rename(&retained.identity, &final_claimed)
+        {
+            self.restore_changed_socket_claim(socket, quarantine)?;
+            return Ok(ExactControlSocketCleanup::LiveOrChanged);
+        }
+        unlink_at(&self.directory, quarantine)
+            .context("unlink atomically claimed stale root-provision socket")?;
         self.directory
             .sync_all()
             .context("sync exact stale root-provision socket removal")?;
         anyhow::ensure!(
-            stat_at_optional(&self.directory, &socket)?.is_none(),
-            "root-provision socket reappeared during exact cleanup"
+            stat_at_optional(&self.directory, quarantine)?.is_none(),
+            "root-provision socket quarantine reappeared during exact cleanup"
         );
         Ok(ExactControlSocketCleanup::Removed)
     }
+
+    /// A changed inode may have been atomically captured by the claim race.
+    /// Never unlink it: restore it to the public basename only when that name
+    /// is still empty, otherwise preserve both names as an inventory conflict.
+    fn restore_changed_socket_claim(&self, socket: &CStr, quarantine: &CStr) -> Result<()> {
+        match rename_no_replace(&self.directory, quarantine, &self.directory, socket) {
+            Ok(()) => self
+                .directory
+                .sync_all()
+                .context("sync restored changed root-provision socket"),
+            Err(source)
+                if source.kind() == io::ErrorKind::AlreadyExists
+                    || source.raw_os_error() == Some(libc::EEXIST)
+                    || source.kind() == io::ErrorKind::NotFound
+                    || source.raw_os_error() == Some(libc::ENOENT) =>
+            {
+                Ok(())
+            }
+            Err(source) => Err(source).context("restore changed root-provision socket claim"),
+        }
+    }
+}
+
+fn same_socket_after_rename(before: &StableFsIdentity, after: &StableFsIdentity) -> bool {
+    // rename may advance ctime, so object identity and every other socket
+    // attribute remain exact while the mutable ctime fields are deliberately
+    // excluded after the atomic claim.
+    before.device == after.device
+        && before.inode == after.inode
+        && before.mode == after.mode
+        && before.links == after.links
+        && before.uid == after.uid
+        && before.gid == after.gid
+        && before.length == after.length
+        && before.modified_seconds == after.modified_seconds
+        && before.modified_nanoseconds == after.modified_nanoseconds
 }
 
 impl RetainedExactFile {

@@ -50,12 +50,12 @@ use crate::runtime_spine::{
 use crate::state_directory::StateDirectory;
 
 use super::authorized_blockd::{
-    authorized_blockd_checkpoint_content_digest, decode_root_provision_stop_receipt,
-    validate_authorized_blockd_checkpoint, AUTHORIZED_SERVING_FILE, AUTHORIZED_SERVING_TEMP,
-    IDENTITY_FILE, IDENTITY_TEMP, LAUNCH_CHECKPOINT_FILE, LAUNCH_CHECKPOINT_TEMP,
-    MAX_AUTHORIZED_SERVING_BYTES, MAX_IDENTITY_BYTES, MAX_LAUNCH_CHECKPOINT_BYTES,
-    ROOT_PROVISION_STOP_RECEIPT_FILE, ROOT_PROVISION_STOP_RECEIPT_MAX_BYTES,
-    ROOT_PROVISION_STOP_RECEIPT_TEMP,
+    decode_root_provision_stop_receipt, validate_authorized_blockd_checkpoint,
+    AUTHORIZED_SERVING_FILE, AUTHORIZED_SERVING_TEMP, IDENTITY_FILE, IDENTITY_TEMP,
+    LAUNCH_CHECKPOINT_FILE, LAUNCH_CHECKPOINT_TEMP, MAX_AUTHORIZED_SERVING_BYTES,
+    MAX_IDENTITY_BYTES, MAX_LAUNCH_CHECKPOINT_BYTES, ROOT_PROVISION_STOP_RECEIPT_FILE,
+    ROOT_PROVISION_STOP_RECEIPT_MAX_BYTES, ROOT_PROVISION_STOP_RECEIPT_TEMP,
+    ROOT_PROVISION_STOP_SOCKET_QUARANTINE,
 };
 use super::checkpoint::{
     decode_definite_release_rejection, validate_definite_release_rejection,
@@ -2071,6 +2071,7 @@ fn scan_authorized_blockd_data(
             LAUNCH_CHECKPOINT_TEMP,
             ROOT_PROVISION_STOP_RECEIPT_FILE,
             ROOT_PROVISION_STOP_RECEIPT_TEMP,
+            ROOT_PROVISION_STOP_SOCKET_QUARANTINE,
             "root-provision.sock",
             "cache.data",
             ".cache.data.init",
@@ -2103,13 +2104,17 @@ fn scan_authorized_blockd_data(
             scan.complete = false;
             continue;
         }
-        if let Some(socket) = by_name.get("root-provision.sock") {
-            let root_metadata = root.metadata().context("inspect retained state root")?;
+        let root_metadata = root.metadata().context("inspect retained state root")?;
+        for socket_name in ["root-provision.sock", ROOT_PROVISION_STOP_SOCKET_QUARANTINE] {
+            let Some(socket) = by_name.get(socket_name) else {
+                continue;
+            };
             anyhow::ensure!(
                 socket.metadata.st_mode & libc::S_IFMT == libc::S_IFSOCK
                     && socket.metadata.st_nlink == 1
                     && socket.metadata.st_uid == root_metadata.uid()
-                    && socket.metadata.st_mode & 0o077 == 0,
+                    && socket.metadata.st_gid == root_metadata.gid()
+                    && socket.metadata.st_mode & 0o7777 == 0o700,
                 "root-provision control socket has unsafe type or identity"
             );
         }
@@ -2205,16 +2210,24 @@ fn scan_authorized_blockd_data(
             anyhow::ensure!(
                 checkpoint_content_digest(runtime_checkpoint)?
                     == *receipt.checkpoint_content_digest()
-                    && authorized_blockd_checkpoint_content_digest(&checkpoint)?
-                        == *receipt.authorized_checkpoint_content_digest()
                     && runtime_checkpoint.cat_id == desired.cat_id
                     && !has_unvalidated_handoff_artifact,
                 "root-provision stop receipt conflicts with its checkpoint, launch grant, or handoff"
             );
+            receipt.binds_authorized_checkpoint(&checkpoint)?;
             scan.stop_receipts.push(desired.cat_id.clone());
             if stop_temp.is_some() {
                 scan.complete = false;
             }
+        }
+        if by_name.contains_key(ROOT_PROVISION_STOP_SOCKET_QUARANTINE) {
+            anyhow::ensure!(
+                stop_target.is_some() || stop_temp.is_some(),
+                "root-provision socket quarantine lacks its durable stop receipt"
+            );
+            // A claimed inode is an interrupted cleanup effect, never stable
+            // full-inventory evidence. Pre-scan recovery owns its resolution.
+            scan.complete = false;
         }
         let control_files = ["cache.data", "dirty.bitmap", "pending-packs"];
         let present_control_files = control_files

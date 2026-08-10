@@ -3164,7 +3164,7 @@ fn unlink_at(directory: &File, name: &CStr) -> io::Result<()> {
 }
 
 #[cfg(target_os = "linux")]
-fn rename_no_replace(
+pub(crate) fn rename_no_replace(
     old_directory: &File,
     old_name: &CStr,
     new_directory: &File,
@@ -3193,7 +3193,7 @@ fn rename_no_replace(
 }
 
 #[cfg(target_os = "macos")]
-fn rename_no_replace(
+pub(crate) fn rename_no_replace(
     old_directory: &File,
     old_name: &CStr,
     new_directory: &File,

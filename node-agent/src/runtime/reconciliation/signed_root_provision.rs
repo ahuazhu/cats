@@ -64,6 +64,9 @@ trait RootProvisionRequestPort: request_sealed::Sealed + Send + Sync {
     ) -> anyhow::Result<RootProvisionResponseHint>;
 }
 
+#[cfg(test)]
+type BeforeStopReceiptPublishHook = Arc<dyn Fn() + Send + Sync>;
+
 #[derive(Debug, Clone, Copy)]
 struct PlatformRootProvisionRequestPort;
 
@@ -106,6 +109,8 @@ pub(crate) struct SignedRootProvisionEffect {
     retirement: Arc<dyn RootProvisionProcessRetirementPort>,
     request: Arc<dyn RootProvisionRequestPort>,
     executable_path: HostPath,
+    #[cfg(test)]
+    before_stop_receipt_publish: Option<BeforeStopReceiptPublishHook>,
 }
 
 /// Production dispatcher for the currently implemented Running prefix. A
@@ -166,6 +171,8 @@ impl SignedRootProvisionEffect {
             retirement,
             request: Arc::new(PlatformRootProvisionRequestPort),
             executable_path,
+            #[cfg(test)]
+            before_stop_receipt_publish: None,
         })
     }
 
@@ -185,7 +192,14 @@ impl SignedRootProvisionEffect {
             retirement,
             request,
             executable_path,
+            before_stop_receipt_publish: None,
         }
+    }
+
+    #[cfg(test)]
+    fn with_before_stop_receipt_publish(mut self, hook: BeforeStopReceiptPublishHook) -> Self {
+        self.before_stop_receipt_publish = Some(hook);
+        self
     }
 
     /// Returns `None` when the accepted current Cat is not at
@@ -435,6 +449,26 @@ impl SignedRootProvisionEffect {
             Ok(prepared) => prepared,
             Err(_) => return Ok(stop_local()),
         };
+        let settlement = match prepared.settle_stop_receipt() {
+            Ok(settlement) => settlement,
+            Err(_) => return Ok(stop_local()),
+        };
+        let existing_receipt = match settlement {
+            StopReceiptSettlement::Absent => None,
+            StopReceiptSettlement::Recovered(_) => {
+                return Ok(RuntimeDesiredEffectOutcome::RefreshInventory)
+            }
+            StopReceiptSettlement::Stable(receipt) => {
+                if receipt.checkpoint_content_digest() != stored.content_digest()
+                    || receipt
+                        .binds_retained_values(stored.checkpoint(), prepared.checkpoint())
+                        .is_err()
+                {
+                    return Ok(stop_local());
+                }
+                Some(receipt)
+            }
+        };
         let old_volume = &prepared.checkpoint().volume;
         let attachment = prepared.checkpoint().attachment.clone();
         let Some((identity, observed_head)) = observed_lineage(runtime, old_volume, data_directory)
@@ -449,14 +483,30 @@ impl SignedRootProvisionEffect {
             Ok(record) => record,
             Err(_) => return Ok(RuntimeDesiredEffectOutcome::RefreshInventory),
         };
-        let expectation = match super::RootProvisionProcessExpectation::from_checkpoint(
-            stored.checkpoint(),
-            super::RootProvisionAuthoritySnapshot {
-                attachment,
-                volume: &record,
-            },
-            self.executable_path.clone(),
-        ) {
+        let expectation = match existing_receipt.as_ref() {
+            Some(receipt) => receipt.expectation_for_current_authority(
+                stored.checkpoint(),
+                prepared.checkpoint(),
+                &record,
+            ),
+            None => {
+                if !matches!(
+                    record.lease_expires_at,
+                    Some(current) if current >= attachment.lease_expires_at
+                ) {
+                    return Ok(stop_local());
+                }
+                super::RootProvisionProcessExpectation::from_checkpoint(
+                    stored.checkpoint(),
+                    super::RootProvisionAuthoritySnapshot {
+                        attachment,
+                        volume: &record,
+                    },
+                    self.executable_path.clone(),
+                )
+            }
+        };
+        let expectation = match expectation {
             Ok(expectation) => expectation,
             Err(_) => return Ok(stop_local()),
         };
@@ -497,7 +547,14 @@ impl SignedRootProvisionEffect {
             Ok(receipt) => receipt,
             Err(_) => return Ok(stop_local()),
         };
-        let publication = match prepared.persist_or_reopen_stop_receipt(&receipt) {
+        #[cfg(test)]
+        let publication_result = match self.before_stop_receipt_publish.as_ref() {
+            Some(hook) => prepared.persist_or_reopen_stop_receipt_with_hook(&receipt, || hook()),
+            None => prepared.persist_or_reopen_stop_receipt(&receipt),
+        };
+        #[cfg(not(test))]
+        let publication_result = prepared.persist_or_reopen_stop_receipt(&receipt);
+        let publication = match publication_result {
             Ok(publication) => publication,
             Err(_) => return Ok(stop_local()),
         };
@@ -2776,7 +2833,7 @@ mod tests {
         assert_eq!(process.stops.load(Ordering::SeqCst), 1);
         assert_eq!(request.calls.load(Ordering::SeqCst), 0);
 
-        for drift in ["owner", "head", "marker"] {
+        for drift in ["owner", "head", "marker", "lease_rollback"] {
             let (fixture, process, request, listener) = stopped_receipt_fixture();
             let socket_path = fixture.control_socket_path();
             drop(listener);
@@ -2795,6 +2852,10 @@ mod tests {
                         .set_head(expected_provisioned_head.clone());
                 }
                 "marker" => fixture.authority.clear_transition_marker(),
+                "lease_rollback" => {
+                    let current = fixture.authority.record().lease_expires_at.unwrap().get();
+                    fixture.authority.set_lease_expiry(unix_ms(current - 1));
+                }
                 _ => unreachable!(),
             }
             let retirement = Arc::new(FakeRetirementPort::absent());
@@ -2816,6 +2877,338 @@ mod tests {
             );
             assert_eq!(process.stops.load(Ordering::SeqCst), 1);
             assert_eq!(request.calls.load(Ordering::SeqCst), 0);
+        }
+    }
+
+    #[test]
+    fn lease_expiry_must_not_move_back_from_artifact_or_receipted_attempt() {
+        // First calibrate that a renewal after the retained launch grant can
+        // authorize one durable receipt and exact stop.
+        let fixture = same_image_superseded_fixture();
+        let artifact_expiry = fixture.authority.record().lease_expires_at.unwrap().get();
+        let receipted_expiry = artifact_expiry + 60_000;
+        fixture
+            .authority
+            .set_lease_expiry(unix_ms(receipted_expiry));
+        let socket_path = fixture.control_socket_path();
+        let listener = UnixListener::bind(&socket_path).unwrap();
+        std::fs::set_permissions(&socket_path, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let process = Arc::new(FakeProcessPort::exact(41, 42));
+        let request = Arc::new(FakeRequestPort {
+            authority: Arc::clone(&fixture.authority),
+            calls: AtomicUsize::new(0),
+            conflict: false,
+            mutate_owner: false,
+            connect_failure: false,
+            identity_mismatch: false,
+        });
+        let retirement = Arc::new(FakeRetirementPort::exact());
+        let effect = fixture.effect_with_ports(
+            Arc::clone(&process) as Arc<dyn RootProvisionProcessPort>,
+            Arc::clone(&retirement) as Arc<dyn RootProvisionProcessRetirementPort>,
+            Arc::clone(&request) as Arc<dyn RootProvisionRequestPort>,
+        );
+        assert_eq!(
+            effect
+                .try_apply(
+                    &fixture.context(vec![fixture.public_process()]),
+                    &fixture.desired,
+                )
+                .unwrap(),
+            Some(RuntimeDesiredEffectOutcome::RefreshInventory)
+        );
+        assert_eq!(retirement.calls.load(Ordering::SeqCst), 1);
+        assert_eq!(process.stops.load(Ordering::SeqCst), 1);
+        let receipt_before = std::fs::read(fixture.stop_receipt_path()).unwrap();
+
+        // This point read is still newer than the launch artifact, but older
+        // than the durable receipt. Replay must stop before even the sealed
+        // retirement inspection, and cleanup must preserve both artifacts.
+        fixture
+            .authority
+            .set_lease_expiry(unix_ms(receipted_expiry - 1));
+        let replay_retirement = Arc::new(FakeRetirementPort::exact());
+        let replay = fixture.effect_with_ports(
+            Arc::clone(&process) as Arc<dyn RootProvisionProcessPort>,
+            Arc::clone(&replay_retirement) as Arc<dyn RootProvisionProcessRetirementPort>,
+            Arc::clone(&request) as Arc<dyn RootProvisionRequestPort>,
+        );
+        assert_eq!(
+            replay
+                .try_apply(
+                    &fixture.context(vec![fixture.public_process()]),
+                    &fixture.desired,
+                )
+                .unwrap(),
+            Some(stop_local())
+        );
+        assert_eq!(replay_retirement.calls.load(Ordering::SeqCst), 0);
+        assert_eq!(process.stops.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            std::fs::read(fixture.stop_receipt_path()).unwrap(),
+            receipt_before
+        );
+
+        drop(listener);
+        let cleanup_retirement = Arc::new(FakeRetirementPort::absent());
+        let recovery = SignedRunningPublicationRecovery::with_root_process_retirement(
+            Arc::clone(&fixture.authority) as Arc<dyn VolumeDataAuthority>,
+            Arc::clone(&cleanup_retirement) as Arc<dyn RootProvisionProcessRetirementPort>,
+        );
+        assert_eq!(
+            recovery.recover_one(recovery_context(&fixture)).unwrap(),
+            RuntimePreScanRecoveryOutcome::NoChange
+        );
+        assert_eq!(cleanup_retirement.calls.load(Ordering::SeqCst), 0);
+        assert!(socket_path.exists());
+        assert_eq!(
+            std::fs::read(fixture.stop_receipt_path()).unwrap(),
+            receipt_before
+        );
+
+        // A rollback behind the retained launch artifact is rejected before
+        // the first receipt or any retirement inspection as well.
+        let artifact_fixture = same_image_superseded_fixture();
+        let artifact_expiry = artifact_fixture
+            .authority
+            .record()
+            .lease_expires_at
+            .unwrap()
+            .get();
+        artifact_fixture
+            .authority
+            .set_lease_expiry(unix_ms(artifact_expiry - 1));
+        let artifact_socket = artifact_fixture.control_socket_path();
+        let artifact_listener = UnixListener::bind(&artifact_socket).unwrap();
+        std::fs::set_permissions(&artifact_socket, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let artifact_process = Arc::new(FakeProcessPort::exact(41, 42));
+        let artifact_retirement = Arc::new(FakeRetirementPort::exact());
+        let artifact_request = Arc::new(FakeRequestPort {
+            authority: Arc::clone(&artifact_fixture.authority),
+            calls: AtomicUsize::new(0),
+            conflict: false,
+            mutate_owner: false,
+            connect_failure: false,
+            identity_mismatch: false,
+        });
+        assert_eq!(
+            artifact_fixture
+                .effect_with_ports(
+                    Arc::clone(&artifact_process) as Arc<dyn RootProvisionProcessPort>,
+                    Arc::clone(&artifact_retirement) as Arc<dyn RootProvisionProcessRetirementPort>,
+                    Arc::clone(&artifact_request) as Arc<dyn RootProvisionRequestPort>,
+                )
+                .try_apply(
+                    &artifact_fixture.context(vec![artifact_fixture.public_process()]),
+                    &artifact_fixture.desired,
+                )
+                .unwrap(),
+            Some(stop_local())
+        );
+        assert_eq!(artifact_retirement.calls.load(Ordering::SeqCst), 0);
+        assert_eq!(artifact_process.stops.load(Ordering::SeqCst), 0);
+        assert!(!artifact_fixture.stop_receipt_path().exists());
+        drop(artifact_listener);
+    }
+
+    #[test]
+    fn receipt_publication_atomically_preserves_conflict_and_recovers_exact_eexist() {
+        for exact_replay in [false, true] {
+            let fixture = same_image_superseded_fixture();
+            let socket_path = fixture.control_socket_path();
+            let listener = UnixListener::bind(&socket_path).unwrap();
+            std::fs::set_permissions(&socket_path, std::fs::Permissions::from_mode(0o700)).unwrap();
+            let process = Arc::new(FakeProcessPort::exact(41, 42));
+            let retirement = Arc::new(FakeRetirementPort::exact());
+            let request = Arc::new(FakeRequestPort {
+                authority: Arc::clone(&fixture.authority),
+                calls: AtomicUsize::new(0),
+                conflict: false,
+                mutate_owner: false,
+                connect_failure: false,
+                identity_mismatch: false,
+            });
+            let target = fixture.stop_receipt_path();
+            let temporary = target
+                .with_file_name(super::super::authorized_blockd::ROOT_PROVISION_STOP_RECEIPT_TEMP);
+            let target_for_hook = target.clone();
+            let temporary_for_hook = temporary.clone();
+            let hook = Arc::new(move || {
+                if exact_replay {
+                    std::fs::copy(&temporary_for_hook, &target_for_hook).unwrap();
+                } else {
+                    std::fs::write(&target_for_hook, b"foreign receipt").unwrap();
+                }
+                std::fs::set_permissions(&target_for_hook, std::fs::Permissions::from_mode(0o600))
+                    .unwrap();
+            });
+            let effect = fixture
+                .effect_with_ports(
+                    Arc::clone(&process) as Arc<dyn RootProvisionProcessPort>,
+                    Arc::clone(&retirement) as Arc<dyn RootProvisionProcessRetirementPort>,
+                    Arc::clone(&request) as Arc<dyn RootProvisionRequestPort>,
+                )
+                .with_before_stop_receipt_publish(hook);
+            let first = effect
+                .try_apply(
+                    &fixture.context(vec![fixture.public_process()]),
+                    &fixture.desired,
+                )
+                .unwrap();
+            assert_eq!(retirement.calls.load(Ordering::SeqCst), 1);
+            assert_eq!(process.stops.load(Ordering::SeqCst), 0);
+            assert_eq!(request.calls.load(Ordering::SeqCst), 0);
+            if exact_replay {
+                assert_eq!(first, Some(RuntimeDesiredEffectOutcome::RefreshInventory));
+                assert!(target.exists());
+                assert!(!temporary.exists());
+                let replay = fixture.effect_with_ports(
+                    Arc::clone(&process) as Arc<dyn RootProvisionProcessPort>,
+                    Arc::new(FakeRetirementPort::exact()),
+                    Arc::clone(&request) as Arc<dyn RootProvisionRequestPort>,
+                );
+                assert_eq!(
+                    replay
+                        .try_apply(
+                            &fixture.context(vec![fixture.public_process()]),
+                            &fixture.desired,
+                        )
+                        .unwrap(),
+                    Some(RuntimeDesiredEffectOutcome::RefreshInventory)
+                );
+                assert_eq!(process.stops.load(Ordering::SeqCst), 1);
+            } else {
+                assert_eq!(first, Some(stop_local()));
+                assert_eq!(std::fs::read(&target).unwrap(), b"foreign receipt");
+                assert!(temporary.exists());
+            }
+            drop(listener);
+        }
+    }
+
+    #[test]
+    fn socket_claim_final_window_never_unlinks_a_replacement_inode() {
+        // Positive calibration: the ordinary refused receipted inode is
+        // claimed and removed through the same quarantine path.
+        let (calibration, _, _, calibration_listener) = stopped_receipt_fixture();
+        let calibration_store = AuthorizedBlockdStore::new(calibration.state.clone());
+        let calibration_retained = calibration_store
+            .retain_exact_runtime_checkpoint(&calibration.checkpoint)
+            .unwrap();
+        let calibration_receipt = match calibration_retained.settle_stop_receipt().unwrap() {
+            StopReceiptSettlement::Stable(receipt) => receipt,
+            _ => panic!("positive calibration requires a stable stop receipt"),
+        };
+        drop(calibration_listener);
+        assert_eq!(
+            calibration_retained
+                .remove_exact_stale_control_socket(calibration_receipt.socket())
+                .unwrap(),
+            super::super::authorized_blockd::ExactControlSocketCleanup::Removed
+        );
+        assert!(!calibration.control_socket_path().exists());
+
+        let (fixture, process, request, listener) = stopped_receipt_fixture();
+        let socket_path = fixture.control_socket_path();
+        let old_inode = std::fs::symlink_metadata(&socket_path).unwrap().ino();
+        let retained = AuthorizedBlockdStore::new(fixture.state.clone())
+            .retain_exact_runtime_checkpoint(&fixture.checkpoint)
+            .unwrap();
+        let receipt = match retained.settle_stop_receipt().unwrap() {
+            StopReceiptSettlement::Stable(receipt) => receipt,
+            _ => panic!("replacement barrier requires a stable stop receipt"),
+        };
+        drop(listener);
+        let moved_old = socket_path.with_file_name(".test-old-root-provision.sock");
+        let socket_for_hook = socket_path.clone();
+        let moved_for_hook = moved_old.clone();
+        let replacement = Arc::new(Mutex::new(None));
+        let replacement_for_hook = Arc::clone(&replacement);
+        let outcome = retained
+            .remove_exact_stale_control_socket_with_hook(receipt.socket(), move || {
+                std::fs::rename(&socket_for_hook, &moved_for_hook).unwrap();
+                let listener = UnixListener::bind(&socket_for_hook).unwrap();
+                std::fs::set_permissions(&socket_for_hook, std::fs::Permissions::from_mode(0o700))
+                    .unwrap();
+                *replacement_for_hook.lock().unwrap() = Some(listener);
+            })
+            .unwrap();
+        assert_eq!(
+            outcome,
+            super::super::authorized_blockd::ExactControlSocketCleanup::LiveOrChanged
+        );
+        let replacement_inode = std::fs::symlink_metadata(&socket_path).unwrap().ino();
+        assert_ne!(old_inode, replacement_inode);
+        assert!(moved_old.exists());
+        assert!(fixture.stop_receipt_path().exists());
+        assert_eq!(process.stops.load(Ordering::SeqCst), 1);
+        assert_eq!(request.calls.load(Ordering::SeqCst), 0);
+        assert!(!fixture
+            .control_socket_path()
+            .with_file_name(super::super::authorized_blockd::ROOT_PROVISION_STOP_SOCKET_QUARANTINE)
+            .exists());
+        std::fs::remove_file(moved_old).unwrap();
+        drop(replacement.lock().unwrap().take());
+    }
+
+    #[test]
+    fn socket_quarantine_crash_state_recovers_but_preserves_a_late_basename() {
+        for late_replacement in [false, true] {
+            let (fixture, process, request, listener) = stopped_receipt_fixture();
+            let socket_path = fixture.control_socket_path();
+            let old_inode = std::fs::symlink_metadata(&socket_path).unwrap().ino();
+            drop(listener);
+            let quarantine = socket_path.with_file_name(
+                super::super::authorized_blockd::ROOT_PROVISION_STOP_SOCKET_QUARANTINE,
+            );
+            std::fs::rename(&socket_path, &quarantine).unwrap();
+            assert_eq!(
+                std::fs::symlink_metadata(&quarantine).unwrap().ino(),
+                old_inode,
+                "positive calibration: the crash fixture must retain the receipted inode"
+            );
+            let replacement = if late_replacement {
+                let listener = UnixListener::bind(&socket_path).unwrap();
+                std::fs::set_permissions(&socket_path, std::fs::Permissions::from_mode(0o700))
+                    .unwrap();
+                assert_ne!(
+                    std::fs::symlink_metadata(&socket_path).unwrap().ino(),
+                    old_inode
+                );
+                Some(listener)
+            } else {
+                None
+            };
+            let retirement = Arc::new(FakeRetirementPort::absent());
+            let recovery = SignedRunningPublicationRecovery::with_root_process_retirement(
+                Arc::clone(&fixture.authority) as Arc<dyn VolumeDataAuthority>,
+                Arc::clone(&retirement) as Arc<dyn RootProvisionProcessRetirementPort>,
+            );
+            if late_replacement {
+                recovery
+                    .recover_one(recovery_context(&fixture))
+                    .expect_err("a late basename must preserve both socket inodes as conflict");
+                assert!(socket_path.exists());
+                assert!(quarantine.exists());
+                assert_eq!(
+                    std::fs::symlink_metadata(&quarantine).unwrap().ino(),
+                    old_inode
+                );
+            } else {
+                assert_eq!(
+                    recovery.recover_one(recovery_context(&fixture)).unwrap(),
+                    RuntimePreScanRecoveryOutcome::Recovered {
+                        cat_id: fixture.desired.cat_id.clone(),
+                    }
+                );
+                assert!(!socket_path.exists());
+                assert!(!quarantine.exists());
+            }
+            assert!(fixture.stop_receipt_path().exists());
+            assert_eq!(retirement.calls.load(Ordering::SeqCst), 1);
+            assert_eq!(process.stops.load(Ordering::SeqCst), 1);
+            assert_eq!(request.calls.load(Ordering::SeqCst), 0);
+            drop(replacement);
         }
     }
 

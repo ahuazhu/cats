@@ -956,7 +956,8 @@ planner因`processes`非空直接StopLocal。Node必须按每轮一个physical e
 Runtime checkpoint和descriptor-retained authorized-serving文件重算完整content digest，以current Volume
 Authority闭合旧owner/epoch/size/durability/head/NormalAcquire marker；在同一accepted full admission下完成
 Node-global systemd/process/socket复验，并把provider-private stop receipt以temp fsync、no-replace rename和父目录
-fsync持久化。receipt只保存两份content digest及必要typed identity，不复制大checkpoint；它还绑定exact
+fsync持久化；publication的`EEXIST`只在target与temp均为同一canonical receipt时算response-loss replay，任何
+不同bytes都原样保留且零signal。receipt只保存两份content digest及必要typed identity，不复制大checkpoint；它还绑定exact
 PID/MainPID/start ticks、executable、unit/scope/cgroup唯一PID、process token、handshake peer、control socket
 path的device/inode/type/uid/gid/mode/nlink，以及session/inventory epoch、digest和read position。receipt durable
 后才允许在Linux以`pidfd_open`固定该PID incarnation，随后重验`/proc` start ticks与executable；TERM、必要的
@@ -966,12 +967,15 @@ basename或当前Desired枚举停止。该transient service必须以`systemd-run
 让failed unit永久阻塞fresh global absence。
 
 信号响应丢失或Agent restart后必须重放同一receipt。serialized pre-scan先重验旧checkpoint/authorized digests
-和current authority；合法续租可以只推进`lease_expires_at`，owner/epoch/head/transition marker等任何漂移都零
-删除。随后用sealed Node-global sweep证明旧进程exact absent，并且只临时允许receipt记录的旧socket pathname。
+和current authority；`lease_expires_at`必须不早于retained launch artifact，重放时还不得早于receipt记录值，
+合法续租只能单调推进；回退或owner/epoch/head/transition marker等任何漂移都零retirement、零cleanup。随后用
+sealed Node-global sweep证明旧进程exact absent，并且只临时允许receipt记录的旧socket pathname。
 只有basename仍是receipt的同一device/inode、安全socket metadata且deadline-bound nonblocking connect明确
-`ECONNREFUSED`时，才可descriptor-relative unlink并fsync父目录；pathname absent也必须重做父目录fsync。两种
+`ECONNREFUSED`时，才可以atomic no-replace rename把该inode claim到provider-private quarantine，先fsync父目录，
+再重验quarantine仍是同一inode且refused后unlink并再次fsync；pathname absent也必须重做父目录fsync。两种
 结果都立即`RefreshInventory`。新inode、late/可连接peer、foreign/duplicate process、symlink、非socket或
-rename-recreate ABA全部保留为Conflict，绝不再按basename删除。下一次fresh full确认global absent后只删除并
+rename-recreate ABA全部保留为Conflict；claim窗口捕获的新inode只能原子恢复basename或原样保留，绝不unlink。
+restart发现quarantine时也必须凭同一receipt收敛，且fresh basename已出现时两者都保留。下一次fresh full确认global absent后只删除并
 fsync receipt，再次`RefreshInventory`；只有再下一次fresh full才可委托原stale planner做same-image rebind或
 changed-image release。receipt publication、signal、socket unlink/fsync和receipt cleanup每个crash窗口都按
 上述顺序收敛，不能在一轮跨越两个effect。
