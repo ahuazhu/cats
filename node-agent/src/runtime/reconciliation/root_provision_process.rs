@@ -277,6 +277,44 @@ impl RootProvisionProcessEvidence {
     }
 }
 
+/// Unforgeable proof that one complete process observation exactly matched
+/// the expectation derived from the authoritative provision checkpoint.
+///
+/// The fields stay private so downstream handoff code cannot manufacture a
+/// "matched" process from a naked status response. Construction always runs
+/// the same full matcher used by process adoption.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ExactRootProvisionProcessProof {
+    expectation: RootProvisionProcessExpectation,
+    evidence: RootProvisionProcessEvidence,
+}
+
+impl RootProvisionProcessExpectation {
+    pub(crate) fn prove_exact_process(
+        self,
+        evidence: RootProvisionProcessEvidence,
+    ) -> anyhow::Result<ExactRootProvisionProcessProof> {
+        anyhow::ensure!(
+            evidence.exactly_matches(&self),
+            "root-provision process did not exactly match its authoritative expectation"
+        );
+        Ok(ExactRootProvisionProcessProof {
+            expectation: self,
+            evidence,
+        })
+    }
+}
+
+impl ExactRootProvisionProcessProof {
+    pub(crate) fn expectation(&self) -> &RootProvisionProcessExpectation {
+        &self.expectation
+    }
+
+    pub(crate) fn evidence(&self) -> &RootProvisionProcessEvidence {
+        &self.evidence
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum RootProvisionProcessConflict {
     DuplicateIdentity,

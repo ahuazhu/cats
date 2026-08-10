@@ -28,8 +28,8 @@ use std::sync::Mutex;
 use anyhow::{Context as _, Result};
 use cats_api::runtime_reconciliation::{
     encode_runtime_checkpoint, AcquireOrigin, ContractVersion, Durability, Epoch, FenceEpoch,
-    HostPath, Id, RandomId128, ReconcileStep, RemoteHead, Revision, RuntimeCheckpoint,
-    Sha256Digest, VolumeRecord, WireU64,
+    HostPath, Id, RandomId128, ReconcileStep, RemoteHead, Revision, Sha256Digest, VolumeRecord,
+    WireU64,
 };
 use cats_storage::authority::{
     validate_authorized_serving_attachment, validate_authorized_serving_record,
@@ -47,7 +47,13 @@ use super::authorized_blockd::{
     AuthorizedBlockdCheckpoint, AUTHORIZED_SERVING_FILE, IDENTITY_FILE, LAUNCH_CHECKPOINT_FILE,
     MAX_AUTHORIZED_SERVING_BYTES, MAX_IDENTITY_BYTES, MAX_LAUNCH_CHECKPOINT_BYTES,
 };
-use super::root_provision_process::{RootProvisionBlockdHandshake, RootProvisionProcessEvidence};
+#[cfg(test)]
+use super::root_provision_process::RootProvisionAuthoritySnapshot;
+use super::root_provision_process::{
+    ExactRootProvisionProcessProof, RootProvisionBlockdHandshake, RootProvisionProcessEvidence,
+    RootProvisionProcessExpectation,
+};
+use super::StoredCheckpoint;
 
 pub(crate) const SERVING_HANDOFF_RECORD_FILE: &str = "serving-handoff.json";
 const SERVING_HANDOFF_RECORD_TEMP: &str = ".serving-handoff.json.tmp";
@@ -101,7 +107,39 @@ impl ServingAuthorityTargetEvidence {
 pub(crate) struct TargetControlAuthorizationArtifact {
     pub version: ContractVersion,
     pub provision_transition_id: RandomId128,
+    pub checkpoint_content_digest: Sha256Digest,
+    pub local_state: ServingHandoffLocalStateIdentity,
     pub attachment: AuthorizedServingAttachment,
+}
+
+/// Stable descriptor identities needed to reject rename/recreate and
+/// exact-byte file ABA across either publication phase.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct ServingHandoffLocalStateIdentity {
+    pub state_directory: StableDirectoryIdentity,
+    pub attachment_directory: StableDirectoryIdentity,
+    pub attachment_identity_file: StableFileIdentity,
+    pub acquire_authorization_file: StableFileIdentity,
+    pub launch_checkpoint_file: StableFileIdentity,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct StableDirectoryIdentity {
+    pub path: HostPath,
+    pub device: WireU64,
+    pub inode: WireU64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct StableFileIdentity {
+    pub path: HostPath,
+    pub device: WireU64,
+    pub inode: WireU64,
+    pub length: WireU64,
+    pub content_sha256: Sha256Digest,
 }
 
 /// Durable identity of the no-replace target-head grant.
@@ -109,8 +147,33 @@ pub(crate) struct TargetControlAuthorizationArtifact {
 #[serde(deny_unknown_fields)]
 pub(crate) struct TargetControlAuthorizationIdentity {
     pub path: HostPath,
+    pub device: WireU64,
+    pub inode: WireU64,
+    pub length: WireU64,
     pub content_sha256: Sha256Digest,
     pub artifact: TargetControlAuthorizationArtifact,
+}
+
+impl TargetControlAuthorizationIdentity {
+    pub(crate) fn path(&self) -> &HostPath {
+        &self.path
+    }
+
+    pub(crate) fn device(&self) -> WireU64 {
+        self.device
+    }
+
+    pub(crate) fn inode(&self) -> WireU64 {
+        self.inode
+    }
+
+    pub(crate) fn length(&self) -> WireU64 {
+        self.length
+    }
+
+    pub(crate) fn content_sha256(&self) -> &Sha256Digest {
+        &self.content_sha256
+    }
 }
 
 /// The exact target reload observed on the old control-only process.
@@ -152,6 +215,7 @@ pub(crate) struct ServingControlProcessIdentity {
 #[serde(deny_unknown_fields)]
 pub(crate) struct ServingHandoffRecord {
     pub version: ContractVersion,
+    pub checkpoint_content_digest: Sha256Digest,
     pub cat_id: Id,
     pub desired_revision: Revision,
     pub spec_digest: Sha256Digest,
@@ -163,6 +227,7 @@ pub(crate) struct ServingHandoffRecord {
     pub node_id: Id,
     pub placement_epoch: Epoch,
     pub expected_provisioned_head: RemoteHead,
+    pub expected_control_executable_path: HostPath,
     pub target_control_authorization: TargetControlAuthorizationIdentity,
     pub old_control_process: ServingControlProcessIdentity,
 }
@@ -171,12 +236,27 @@ pub(crate) struct ServingHandoffRecord {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct ServingHandoffRecordIdentity {
     path: HostPath,
+    device: WireU64,
+    inode: WireU64,
+    length: WireU64,
     content_sha256: Sha256Digest,
 }
 
 impl ServingHandoffRecordIdentity {
     pub(crate) fn path(&self) -> &HostPath {
         &self.path
+    }
+
+    pub(crate) fn device(&self) -> WireU64 {
+        self.device
+    }
+
+    pub(crate) fn inode(&self) -> WireU64 {
+        self.inode
+    }
+
+    pub(crate) fn length(&self) -> WireU64 {
+        self.length
     }
 
     pub(crate) fn content_sha256(&self) -> &Sha256Digest {
@@ -186,8 +266,11 @@ impl ServingHandoffRecordIdentity {
 
 /// In-memory proof returned only after both immutable files and their parent
 /// directory have crossed their durability barriers.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug)]
 pub(crate) struct ServingHandoffReady {
+    retained: RetainedAttachmentContext,
+    retained_target: RetainedFile,
+    retained_record: RetainedFile,
     record_identity: ServingHandoffRecordIdentity,
     record: ServingHandoffRecord,
 }
@@ -212,22 +295,70 @@ impl ServingHandoffReady {
     pub(crate) fn record(&self) -> &ServingHandoffRecord {
         &self.record
     }
+
+    /// Revalidate every retained descriptor and every lexical mapping at the
+    /// last possible point before a future persisted handoff step consumes
+    /// this proof.
+    pub(crate) fn assert_current(&self, stored_checkpoint: &StoredCheckpoint) -> Result<()> {
+        validate_record_checkpoint_context(&self.record, stored_checkpoint)?;
+        self.retained.assert_current()?;
+        let target_identity = &self.record.target_control_authorization;
+        anyhow::ensure!(
+            target_identity.device() == self.retained_target.identity.device
+                && target_identity.inode() == self.retained_target.identity.inode
+                && target_identity.length() == self.retained_target.identity.length
+                && target_identity.content_sha256()
+                    == &self.retained_target.identity.content_sha256,
+            "retained target-control authorization no longer matches its typed identity"
+        );
+        self.retained_target
+            .assert_current(&self.retained.attachment_directory, target_identity.path())?;
+        anyhow::ensure!(
+            self.record_identity.device() == self.retained_record.identity.device
+                && self.record_identity.inode() == self.retained_record.identity.inode
+                && self.record_identity.length() == self.retained_record.identity.length
+                && self.record_identity.content_sha256()
+                    == &self.retained_record.identity.content_sha256,
+            "retained handoff record no longer matches its typed identity"
+        );
+        self.retained_record.assert_current(
+            &self.retained.attachment_directory,
+            self.record_identity.path(),
+        )?;
+        Ok(())
+    }
 }
 
 /// Durable target-head grant that is sufficient only to restart/inspect the
 /// old role as `control_only`. It is not a serving-ready proof.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug)]
 pub(crate) struct TargetControlAuthorizationReady {
     identity: TargetControlAuthorizationIdentity,
+    retained: RetainedAttachmentContext,
+    retained_target: RetainedFile,
 }
 
 impl TargetControlAuthorizationReady {
     pub(crate) fn identity(&self) -> &TargetControlAuthorizationIdentity {
         &self.identity
     }
+
+    pub(crate) fn assert_current(&self, stored_checkpoint: &StoredCheckpoint) -> Result<()> {
+        validate_target_checkpoint_context(&self.identity.artifact, stored_checkpoint)?;
+        self.retained.assert_current()?;
+        anyhow::ensure!(
+            self.identity.device() == self.retained_target.identity.device
+                && self.identity.inode() == self.retained_target.identity.inode
+                && self.identity.length() == self.retained_target.identity.length
+                && self.identity.content_sha256() == &self.retained_target.identity.content_sha256,
+            "retained target-control authorization no longer matches its typed identity"
+        );
+        self.retained_target
+            .assert_current(&self.retained.attachment_directory, self.identity.path())
+    }
 }
 
-pub(crate) fn encode_target_control_authorization(
+fn encode_target_control_authorization(
     artifact: &TargetControlAuthorizationArtifact,
 ) -> std::result::Result<Vec<u8>, ServingHandoffCodecError> {
     validate_target_control_authorization(artifact)?;
@@ -238,7 +369,7 @@ pub(crate) fn encode_target_control_authorization(
     )
 }
 
-pub(crate) fn decode_target_control_authorization(
+fn decode_target_control_authorization(
     bytes: &[u8],
 ) -> std::result::Result<TargetControlAuthorizationArtifact, ServingHandoffCodecError> {
     canonical_decode(
@@ -249,14 +380,14 @@ pub(crate) fn decode_target_control_authorization(
     )
 }
 
-pub(crate) fn encode_serving_handoff_record(
+fn encode_serving_handoff_record(
     record: &ServingHandoffRecord,
 ) -> std::result::Result<Vec<u8>, ServingHandoffCodecError> {
     validate_handoff_record(record)?;
     canonical_encode(record, SERVING_HANDOFF_RECORD_MAX_BYTES, "record")
 }
 
-pub(crate) fn decode_serving_handoff_record(
+fn decode_serving_handoff_record(
     bytes: &[u8],
 ) -> std::result::Result<ServingHandoffRecord, ServingHandoffCodecError> {
     canonical_decode(
@@ -267,10 +398,17 @@ pub(crate) fn decode_serving_handoff_record(
     )
 }
 
+#[cfg(test)]
+type TestMutation = Box<dyn FnOnce() + Send>;
+#[cfg(test)]
+type PendingTestMutation = Option<(PublicationStage, TestMutation)>;
+
 pub(crate) struct ServingHandoffStore {
     state_directory: StateDirectory,
     #[cfg(test)]
     crash_once: Mutex<Option<PublicationStage>>,
+    #[cfg(test)]
+    mutation_once: Mutex<PendingTestMutation>,
 }
 
 impl ServingHandoffStore {
@@ -279,6 +417,8 @@ impl ServingHandoffStore {
             state_directory,
             #[cfg(test)]
             crash_once: Mutex::new(None),
+            #[cfg(test)]
+            mutation_once: Mutex::new(None),
         }
     }
 
@@ -290,55 +430,69 @@ impl ServingHandoffStore {
     /// target-head `control_only` start/adopt attempt.
     pub(crate) fn seal_target_control_authorization(
         &self,
-        checkpoint: &RuntimeCheckpoint,
+        stored_checkpoint: &StoredCheckpoint,
         acquired: &AuthorizedBlockdCheckpoint,
         authority: &ServingAuthorityTargetEvidence,
     ) -> Result<TargetControlAuthorizationReady> {
-        let candidate =
-            build_target_candidate(&self.state_directory, checkpoint, acquired, authority)?;
+        let candidate = build_target_candidate(
+            &self.state_directory,
+            stored_checkpoint,
+            acquired,
+            authority,
+        )?;
+        let target_name = target_control_file_name(&candidate.provision_transition_id);
+        let temporary_name = target_control_temp_name(&candidate.provision_transition_id);
+        let retained = RetainedAttachmentContext::open_and_lock(
+            self.state_directory.clone(),
+            &candidate.data_directory,
+            acquired,
+            &target_name,
+            &temporary_name,
+        )?;
         let target_artifact = TargetControlAuthorizationArtifact {
             version: ContractVersion::V1,
             provision_transition_id: candidate.provision_transition_id.clone(),
+            checkpoint_content_digest: stored_checkpoint.content_digest().clone(),
+            local_state: retained.local_state.clone(),
             attachment: candidate.target_attachment,
         };
         let target_bytes = encode_target_control_authorization(&target_artifact)
             .context("encode target-head control authorization")?;
-        let identity =
-            target_control_identity(&candidate.data_directory, target_artifact, &target_bytes)?;
-        let target_name = target_control_file_name(&identity.artifact.provision_transition_id);
-        let temporary_name = target_control_temp_name(&identity.artifact.provision_transition_id);
-        let directory =
-            open_attachment_directory(&self.state_directory, &candidate.data_directory)?;
-        lock_directory(&directory).with_context(|| {
-            format!(
-                "lock target control authorization directory {}",
-                candidate.data_directory.display()
-            )
-        })?;
-        validate_handoff_namespace(&directory, &target_name, &temporary_name)?;
-        validate_persisted_acquire_inputs(&directory, acquired)?;
         self.persist_immutable(
-            &directory,
+            &retained.attachment_directory,
             &target_name,
             &temporary_name,
             &target_bytes,
             TARGET_AUTHORIZED_SERVING_MAX_BYTES,
             PublicationArtifact::TargetAuthorization,
         )?;
-        validate_persisted_acquire_inputs(&directory, acquired)?;
-        directory
+        retained.assert_current()?;
+        retained
+            .attachment_directory
             .sync_all()
             .with_context(|| format!("sync {}", candidate.data_directory.display()))?;
-        let visible = read_required_bounded(
-            &directory,
+        let target_path = host_path(
+            &candidate.data_directory.join(&target_name),
+            "target control authorization path",
+        )?;
+        let retained_target = RetainedFile::open_required(
+            &retained.attachment_directory,
             &target_name,
+            target_path,
             TARGET_AUTHORIZED_SERVING_MAX_BYTES,
         )?;
         anyhow::ensure!(
-            decode_target_control_authorization(&visible)? == identity.artifact,
+            decode_target_control_authorization(&retained_target.bytes)? == target_artifact,
             "published target control authorization changed"
         );
-        Ok(TargetControlAuthorizationReady { identity })
+        let identity = target_control_identity(&retained_target, target_artifact);
+        let ready = TargetControlAuthorizationReady {
+            identity,
+            retained,
+            retained_target,
+        };
+        ready.assert_current(stored_checkpoint)?;
+        Ok(ready)
     }
 
     /// Seal the immutable handoff record after the target control process has
@@ -350,15 +504,21 @@ impl ServingHandoffStore {
     /// can be returned.
     pub(crate) fn seal_serving_ready(
         &self,
-        checkpoint: &RuntimeCheckpoint,
+        stored_checkpoint: &StoredCheckpoint,
         acquired: &AuthorizedBlockdCheckpoint,
         authority: &ServingAuthorityTargetEvidence,
-        reloaded_process: &RootProvisionProcessEvidence,
+        reloaded_process: &ExactRootProvisionProcessProof,
     ) -> Result<ServingHandoffReady> {
         let target_ready =
-            self.seal_target_control_authorization(checkpoint, acquired, authority)?;
-        let candidate =
-            build_target_candidate(&self.state_directory, checkpoint, acquired, authority)?;
+            self.seal_target_control_authorization(stored_checkpoint, acquired, authority)?;
+        target_ready.assert_current(stored_checkpoint)?;
+        let checkpoint = stored_checkpoint.checkpoint();
+        let candidate = build_target_candidate(
+            &self.state_directory,
+            stored_checkpoint,
+            acquired,
+            authority,
+        )?;
         let ReconcileStep::ProvisionRootImage {
             scope_id,
             control_socket_path,
@@ -369,8 +529,14 @@ impl ServingHandoffStore {
         else {
             unreachable!("target candidate accepted only ProvisionRootImage")
         };
+        validate_exact_process_proof(
+            stored_checkpoint,
+            acquired,
+            &candidate,
+            reloaded_process.expectation(),
+        )?;
         let control_process = control_process_identity(
-            reloaded_process,
+            reloaded_process.evidence(),
             &candidate.target_attachment,
             scope_id,
             control_socket_path,
@@ -383,6 +549,7 @@ impl ServingHandoffStore {
         );
         let record = ServingHandoffRecord {
             version: ContractVersion::V1,
+            checkpoint_content_digest: stored_checkpoint.content_digest().clone(),
             cat_id: checkpoint.cat_id.clone(),
             desired_revision: checkpoint.desired_revision,
             spec_digest: checkpoint.spec_digest.clone(),
@@ -428,41 +595,33 @@ impl ServingHandoffStore {
                 .identity
                 .placement_epoch,
             expected_provisioned_head: target_ready.identity().artifact.attachment.head.clone(),
-            target_control_authorization: target_ready.identity,
+            expected_control_executable_path: reloaded_process
+                .expectation()
+                .executable_path
+                .clone(),
+            target_control_authorization: target_ready.identity.clone(),
             old_control_process: control_process,
         };
         let record_bytes =
             encode_serving_handoff_record(&record).context("encode serving handoff record")?;
 
-        let directory =
-            open_attachment_directory(&self.state_directory, &candidate.data_directory)?;
-        lock_directory(&directory).with_context(|| {
-            format!(
-                "lock serving handoff directory {}",
-                candidate.data_directory.display()
-            )
-        })?;
         validate_handoff_namespace(
-            &directory,
+            &target_ready.retained.attachment_directory,
             &target_control_file_name(&candidate.provision_transition_id),
             &target_control_temp_name(&candidate.provision_transition_id),
         )?;
-        validate_persisted_acquire_inputs(&directory, acquired)?;
+        target_ready.assert_current(stored_checkpoint)?;
 
-        let target_bytes = read_required_bounded(
-            &directory,
-            &target_control_file_name(&candidate.provision_transition_id),
-            TARGET_AUTHORIZED_SERVING_MAX_BYTES,
-        )?;
         anyhow::ensure!(
-            decode_target_control_authorization(&target_bytes)?
+            decode_target_control_authorization(&target_ready.retained_target.bytes)?
                 == record.target_control_authorization.artifact
-                && Sha256Digest::from_bytes(Sha256::digest(&target_bytes).into())
-                    == record.target_control_authorization.content_sha256,
+                && Sha256Digest::from_bytes(
+                    Sha256::digest(&target_ready.retained_target.bytes).into()
+                ) == record.target_control_authorization.content_sha256,
             "target control authorization is not the exact serving handoff predecessor"
         );
         self.persist_immutable(
-            &directory,
+            &target_ready.retained.attachment_directory,
             SERVING_HANDOFF_RECORD_FILE,
             SERVING_HANDOFF_RECORD_TEMP,
             &record_bytes,
@@ -470,32 +629,47 @@ impl ServingHandoffStore {
             PublicationArtifact::HandoffRecord,
         )?;
 
-        // Recheck the acquire-time grant after both publications. It remains
-        // the immutable blank predecessor and was never a rename target.
-        validate_persisted_acquire_inputs(&directory, acquired)?;
-        directory
+        target_ready.assert_current(stored_checkpoint)?;
+        target_ready
+            .retained
+            .attachment_directory
             .sync_all()
             .with_context(|| format!("sync {}", candidate.data_directory.display()))?;
-        let visible_record = read_required_bounded(
-            &directory,
+        let record_path = host_path(
+            &candidate.data_directory.join(SERVING_HANDOFF_RECORD_FILE),
+            "serving handoff record path",
+        )?;
+        let retained_record = RetainedFile::open_required(
+            &target_ready.retained.attachment_directory,
             SERVING_HANDOFF_RECORD_FILE,
+            record_path.clone(),
             SERVING_HANDOFF_RECORD_MAX_BYTES,
         )?;
         anyhow::ensure!(
-            decode_serving_handoff_record(&visible_record)? == record,
+            decode_serving_handoff_record(&retained_record.bytes)? == record,
             "published serving handoff record changed after its durability barrier"
         );
         let record_identity = ServingHandoffRecordIdentity {
-            path: host_path(
-                &candidate.data_directory.join(SERVING_HANDOFF_RECORD_FILE),
-                "serving handoff record path",
-            )?,
-            content_sha256: Sha256Digest::from_bytes(Sha256::digest(&visible_record).into()),
+            path: record_path,
+            device: retained_record.identity.device,
+            inode: retained_record.identity.inode,
+            length: retained_record.identity.length,
+            content_sha256: retained_record.identity.content_sha256.clone(),
         };
-        Ok(ServingHandoffReady {
+        let TargetControlAuthorizationReady {
+            retained,
+            retained_target,
+            ..
+        } = target_ready;
+        let ready = ServingHandoffReady {
+            retained,
+            retained_target,
+            retained_record,
             record_identity,
             record,
-        })
+        };
+        ready.assert_current(stored_checkpoint)?;
+        Ok(ready)
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -515,13 +689,12 @@ impl ServingHandoffStore {
                 current == expected,
                 "serving handoff target {target_name} conflicts with the sealed value"
             );
-            if let Some(residue) = read_optional_bounded(directory, &temporary, maximum)? {
-                anyhow::ensure!(
-                    residue == expected,
-                    "serving handoff temp {temporary_name} conflicts with the sealed value"
-                );
+            if read_optional_bounded(directory, &temporary, maximum)?.is_some() {
+                // A safe deterministic staging file is never authoritative.
+                // Once the exact no-replace target exists, discard any such
+                // pre-fsync/partial residue without touching the target.
                 unlink_at(directory, &temporary)
-                    .with_context(|| format!("remove exact replay temp {temporary_name}"))?;
+                    .with_context(|| format!("remove replay temp {temporary_name}"))?;
             }
             // Re-establish a durability barrier after a lost acknowledgement.
             directory
@@ -530,13 +703,11 @@ impl ServingHandoffStore {
             return Ok(());
         }
 
-        if let Some(residue) = read_optional_bounded(directory, &temporary, maximum)? {
-            anyhow::ensure!(
-                residue == expected,
-                "serving handoff temp {temporary_name} is partial or foreign"
-            );
-            // Never adopt unknown temp durability. Remove only byte-exact
-            // residue, sync that removal, and rewrite the same canonical bytes.
+        if read_optional_bounded(directory, &temporary, maximum)?.is_some() {
+            // With the target absent, exact checkpoint/authority/acquire
+            // inputs and the directory flock make a safe regular single-link
+            // deterministic temp an unpublished Node attempt. Never adopt its
+            // unknown durability: unlink, fsync the removal, then rewrite.
             unlink_at(directory, &temporary)
                 .with_context(|| format!("remove exact unpublished temp {temporary_name}"))?;
             directory
@@ -557,12 +728,23 @@ impl ServingHandoffStore {
         )
         .with_context(|| format!("create serving handoff temp {temporary_name}"))?;
         verify_regular_file(&file, temporary_name, Some(0))?;
-        file.write_all(expected)
-            .with_context(|| format!("write serving handoff temp {temporary_name}"))?;
+        self.maybe_crash(PublicationStage::new(artifact, PublicationPoint::Created))?;
+        let split = expected.len().div_ceil(2);
+        file.write_all(&expected[..split])
+            .with_context(|| format!("partially write serving handoff temp {temporary_name}"))?;
+        self.maybe_crash(PublicationStage::new(
+            artifact,
+            PublicationPoint::PartialWritten,
+        ))?;
+        file.write_all(&expected[split..])
+            .with_context(|| format!("finish serving handoff temp {temporary_name}"))?;
+        self.maybe_crash(PublicationStage::new(
+            artifact,
+            PublicationPoint::FullWritten,
+        ))?;
         file.sync_all()
             .with_context(|| format!("sync serving handoff temp {temporary_name}"))?;
         verify_regular_file(&file, temporary_name, Some(expected.len() as u64))?;
-        drop(file);
         self.maybe_crash(PublicationStage::new(
             artifact,
             PublicationPoint::TempSynced,
@@ -570,6 +752,11 @@ impl ServingHandoffStore {
 
         rename_no_replace(directory, &temporary, directory, &target)
             .with_context(|| format!("publish no-replace serving handoff {target_name}"))?;
+        let published_identity = FileIdentity::from_metadata(
+            &file
+                .metadata()
+                .with_context(|| format!("inspect published serving handoff {target_name}"))?,
+        );
         self.maybe_crash(PublicationStage::new(artifact, PublicationPoint::Published))?;
         directory
             .sync_all()
@@ -579,6 +766,31 @@ impl ServingHandoffStore {
             PublicationPoint::DirectorySynced,
         ))?;
 
+        verify_regular_file(&file, target_name, Some(expected.len() as u64))?;
+        anyhow::ensure!(
+            FileIdentity::from_metadata(
+                &file
+                    .metadata()
+                    .with_context(|| format!("reinspect published handoff {target_name}"))?,
+            ) == published_identity,
+            "published serving handoff {target_name} changed through its retained descriptor"
+        );
+        let visible_file = open_at(
+            directory,
+            &target,
+            libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_CLOEXEC | libc::O_NONBLOCK,
+            0,
+        )
+        .with_context(|| format!("reopen published serving handoff {target_name}"))?;
+        verify_regular_file(&visible_file, target_name, Some(expected.len() as u64))?;
+        anyhow::ensure!(
+            FileIdentity::from_metadata(
+                &visible_file
+                    .metadata()
+                    .with_context(|| format!("inspect visible handoff {target_name}"))?,
+            ) == published_identity,
+            "published serving handoff {target_name} was replaced at its durability barrier"
+        );
         let visible = read_required_bounded(directory, target_name, maximum)?;
         anyhow::ensure!(
             visible == expected,
@@ -598,6 +810,17 @@ impl ServingHandoffStore {
 
     #[cfg(test)]
     fn maybe_crash(&self, stage: PublicationStage) -> Result<()> {
+        let mutation = {
+            let mut pending = self.mutation_once.lock().expect("handoff mutation lock");
+            if pending.as_ref().is_some_and(|(at, _)| *at == stage) {
+                pending.take().map(|(_, mutation)| mutation)
+            } else {
+                None
+            }
+        };
+        if let Some(mutation) = mutation {
+            mutation();
+        }
         let mut crash = self.crash_once.lock().expect("handoff fault lock");
         if crash.as_ref() == Some(&stage) {
             *crash = None;
@@ -610,6 +833,16 @@ impl ServingHandoffStore {
     fn inject_crash_once(&self, stage: PublicationStage) {
         *self.crash_once.lock().expect("handoff fault lock") = Some(stage);
     }
+
+    #[cfg(test)]
+    fn inject_mutation_once(
+        &self,
+        stage: PublicationStage,
+        mutation: impl FnOnce() + Send + 'static,
+    ) {
+        *self.mutation_once.lock().expect("handoff mutation lock") =
+            Some((stage, Box::new(mutation)));
+    }
 }
 
 struct TargetControlCandidate {
@@ -620,10 +853,11 @@ struct TargetControlCandidate {
 
 fn build_target_candidate(
     state_directory: &StateDirectory,
-    checkpoint: &RuntimeCheckpoint,
+    stored_checkpoint: &StoredCheckpoint,
     acquired: &AuthorizedBlockdCheckpoint,
     authority: &ServingAuthorityTargetEvidence,
 ) -> Result<TargetControlCandidate> {
+    let checkpoint = stored_checkpoint.checkpoint();
     encode_runtime_checkpoint(checkpoint).context("validate current Runtime checkpoint")?;
     validate_authorized_blockd_checkpoint(acquired)
         .context("validate acquire-time authorized blockd checkpoint")?;
@@ -706,19 +940,65 @@ fn build_target_candidate(
 }
 
 fn target_control_identity(
-    data_directory: &Path,
+    retained: &RetainedFile,
     artifact: TargetControlAuthorizationArtifact,
-    canonical_bytes: &[u8],
-) -> Result<TargetControlAuthorizationIdentity> {
-    let file_name = target_control_file_name(&artifact.provision_transition_id);
-    Ok(TargetControlAuthorizationIdentity {
-        path: host_path(
-            &data_directory.join(file_name),
-            "target control authorization path",
-        )?,
-        content_sha256: Sha256Digest::from_bytes(Sha256::digest(canonical_bytes).into()),
+) -> TargetControlAuthorizationIdentity {
+    TargetControlAuthorizationIdentity {
+        path: retained.identity.path.clone(),
+        device: retained.identity.device,
+        inode: retained.identity.inode,
+        length: retained.identity.length,
+        content_sha256: retained.identity.content_sha256.clone(),
         artifact,
-    })
+    }
+}
+
+fn validate_exact_process_proof(
+    stored_checkpoint: &StoredCheckpoint,
+    acquired: &AuthorizedBlockdCheckpoint,
+    candidate: &TargetControlCandidate,
+    expected: &RootProvisionProcessExpectation,
+) -> Result<()> {
+    let checkpoint = stored_checkpoint.checkpoint();
+    let ReconcileStep::ProvisionRootImage {
+        provision_transition_id,
+        volume_id,
+        attachment_id,
+        attachment_epoch,
+        scope_id,
+        control_socket_path,
+        data_directory,
+        process_identity_token,
+        size_bytes,
+        boot_image_digest,
+        expected_provisioned_head,
+        ..
+    } = &checkpoint.step
+    else {
+        anyhow::bail!("serving process proof requires provision_root_image")
+    };
+    anyhow::ensure!(
+        expected.cat_id == checkpoint.cat_id
+            && expected.node_id == checkpoint.node_id
+            && expected.placement_epoch == checkpoint.placement_epoch
+            && expected.desired_revision == checkpoint.desired_revision
+            && expected.spec_digest == checkpoint.spec_digest
+            && expected.provision_transition_id == *provision_transition_id
+            && expected.volume_id == *volume_id
+            && expected.attachment_id == *attachment_id
+            && expected.attachment_epoch == *attachment_epoch
+            && expected.scope_id == *scope_id
+            && expected.control_socket_path == *control_socket_path
+            && expected.data_directory == *data_directory
+            && expected.process_identity_token == *process_identity_token
+            && expected.size_bytes == *size_bytes
+            && expected.boot_image_digest == *boot_image_digest
+            && expected.attachment == acquired.attachment
+            && expected.expected_remote_head() == expected_provisioned_head
+            && expected.expected_remote_head() == &candidate.target_attachment.head,
+        "exact process proof is not bound to the current stored provision checkpoint"
+    );
+    Ok(())
 }
 
 fn control_process_identity(
@@ -825,10 +1105,69 @@ fn validate_target_control_authorization(
     artifact: &TargetControlAuthorizationArtifact,
 ) -> std::result::Result<(), ServingHandoffCodecError> {
     validate_target_attachment(&artifact.attachment)?;
+    validate_local_state_identity(&artifact.local_state, &artifact.attachment)?;
     if artifact.version != ContractVersion::V1 {
         return Err(ServingHandoffCodecError::Invalid {
             artifact: "target authorization",
             reason: "version is not the exact supported contract",
+        });
+    }
+    Ok(())
+}
+
+fn validate_local_state_identity(
+    local: &ServingHandoffLocalStateIdentity,
+    attachment: &AuthorizedServingAttachment,
+) -> std::result::Result<(), ServingHandoffCodecError> {
+    let state_path = Path::new(local.state_directory.path.as_str());
+    let attachment_path = Path::new(local.attachment_directory.path.as_str());
+    let strict_descendant = attachment_path
+        .strip_prefix(state_path)
+        .is_ok_and(|relative| {
+            relative.components().next().is_some()
+                && relative
+                    .components()
+                    .all(|component| matches!(component, Component::Normal(_)))
+        });
+    let expected_identity_path = attachment_path.join(IDENTITY_FILE);
+    let expected_blank_path = attachment_path.join(AUTHORIZED_SERVING_FILE);
+    let expected_launch_path = attachment_path.join(LAUNCH_CHECKPOINT_FILE);
+    let identity_bytes = serde_json::to_vec(&attachment.identity).map_err(|_| {
+        ServingHandoffCodecError::Malformed {
+            artifact: "target authorization",
+        }
+    })?;
+    let mut blank_attachment = attachment.clone();
+    blank_attachment.head = attachment.acquire_result.resulting_head.clone();
+    let blank_bytes =
+        serde_json::to_vec(&blank_attachment).map_err(|_| ServingHandoffCodecError::Malformed {
+            artifact: "target authorization",
+        })?;
+    let identity_digest = Sha256Digest::from_bytes(Sha256::digest(&identity_bytes).into());
+    let blank_digest = Sha256Digest::from_bytes(Sha256::digest(&blank_bytes).into());
+    if !strict_descendant
+        || local.state_directory.inode.get() == 0
+        || local.attachment_directory.inode.get() == 0
+        || Path::new(local.attachment_identity_file.path.as_str()) != expected_identity_path
+        || Path::new(local.acquire_authorization_file.path.as_str()) != expected_blank_path
+        || Path::new(local.launch_checkpoint_file.path.as_str()) != expected_launch_path
+        || local.attachment_identity_file.inode.get() == 0
+        || local.acquire_authorization_file.inode.get() == 0
+        || local.launch_checkpoint_file.inode.get() == 0
+        || local.attachment_identity_file.device != local.attachment_directory.device
+        || local.acquire_authorization_file.device != local.attachment_directory.device
+        || local.launch_checkpoint_file.device != local.attachment_directory.device
+        || local.attachment_identity_file.length.get() != identity_bytes.len() as u64
+        || local.acquire_authorization_file.length.get() != blank_bytes.len() as u64
+        || local.launch_checkpoint_file.length.get() == 0
+        || local.launch_checkpoint_file.length.get() > MAX_LAUNCH_CHECKPOINT_BYTES as u64
+        || local.attachment_identity_file.content_sha256 != identity_digest
+        || local.acquire_authorization_file.content_sha256 != blank_digest
+        || !exact_blank_head(&blank_attachment.head)
+    {
+        return Err(ServingHandoffCodecError::Invalid {
+            artifact: "target authorization",
+            reason: "retained local state identities are not one closed attachment",
         });
     }
     Ok(())
@@ -862,6 +1201,7 @@ fn validate_handoff_record(
     let expected_scope = format!("cats-root-{}.service", process.ownership_token.as_str());
     let expected_artifact_name = target_control_file_name(&record.provision_transition_id);
     if record.version != ContractVersion::V1
+        || record.checkpoint_content_digest != target_artifact.checkpoint_content_digest
         || target_artifact.version != record.version
         || target_artifact.provision_transition_id != record.provision_transition_id
         || record.volume_id != identity.volume_id
@@ -873,6 +1213,11 @@ fn validate_handoff_record(
         || record.desired_revision != acquire_request.desired_revision
         || record.placement_epoch != acquire_request.placement_epoch
         || record.expected_provisioned_head != attachment.head
+        || record.expected_control_executable_path != process.executable_path
+        || record.target_control_authorization.device
+            != target_artifact.local_state.attachment_directory.device
+        || record.target_control_authorization.inode.get() == 0
+        || record.target_control_authorization.length.get() != target_bytes.len() as u64
         || record.target_control_authorization.content_sha256 != target_digest
         || process.process_id.get() == 0
         || process.unit_main_process_id != process.process_id
@@ -893,12 +1238,103 @@ fn validate_handoff_record(
         || artifact_path.file_name().and_then(|name| name.to_str())
             != Some(expected_artifact_name.as_str())
         || artifact_path.parent() != Some(process_directory)
+        || process_directory
+            != Path::new(
+                target_artifact
+                    .local_state
+                    .attachment_directory
+                    .path
+                    .as_str(),
+            )
     {
         return Err(ServingHandoffCodecError::Invalid {
             artifact: "record",
             reason: "record fields do not form one exact serving handoff",
         });
     }
+    Ok(())
+}
+
+fn validate_target_checkpoint_context(
+    artifact: &TargetControlAuthorizationArtifact,
+    stored_checkpoint: &StoredCheckpoint,
+) -> Result<()> {
+    let checkpoint = stored_checkpoint.checkpoint();
+    let ReconcileStep::ProvisionRootImage {
+        provision_transition_id,
+        volume_id,
+        attachment_id,
+        attachment_epoch,
+        data_directory,
+        size_bytes,
+        expected_provisioned_head,
+        ..
+    } = &checkpoint.step
+    else {
+        anyhow::bail!("target-control artifact requires current provision_root_image")
+    };
+    let attachment = &artifact.attachment;
+    anyhow::ensure!(
+        artifact.checkpoint_content_digest == *stored_checkpoint.content_digest()
+            && artifact.provision_transition_id == *provision_transition_id
+            && checkpoint.node_id == attachment.identity.node_id
+            && checkpoint.placement_epoch == attachment.identity.placement_epoch
+            && checkpoint.desired_revision == attachment.acquire_request.desired_revision
+            && *volume_id == attachment.identity.volume_id
+            && *attachment_id == attachment.identity.attachment_id
+            && *attachment_epoch == attachment.identity.attachment_epoch
+            && *size_bytes == attachment.size_bytes
+            && expected_provisioned_head == &attachment.head
+            && data_directory.as_str() == artifact.local_state.attachment_directory.path.as_str(),
+        "target-control artifact is stale for the current stored checkpoint"
+    );
+    Ok(())
+}
+
+fn validate_record_checkpoint_context(
+    record: &ServingHandoffRecord,
+    stored_checkpoint: &StoredCheckpoint,
+) -> Result<()> {
+    validate_target_checkpoint_context(
+        &record.target_control_authorization.artifact,
+        stored_checkpoint,
+    )?;
+    let checkpoint = stored_checkpoint.checkpoint();
+    let ReconcileStep::ProvisionRootImage {
+        provision_transition_id,
+        volume_id,
+        attachment_id,
+        attachment_epoch,
+        scope_id,
+        control_socket_path,
+        data_directory,
+        process_identity_token,
+        expected_provisioned_head,
+        ..
+    } = &checkpoint.step
+    else {
+        anyhow::bail!("serving handoff record requires current provision_root_image")
+    };
+    let process = &record.old_control_process;
+    anyhow::ensure!(
+        record.checkpoint_content_digest == *stored_checkpoint.content_digest()
+            && record.cat_id == checkpoint.cat_id
+            && record.node_id == checkpoint.node_id
+            && record.placement_epoch == checkpoint.placement_epoch
+            && record.desired_revision == checkpoint.desired_revision
+            && record.spec_digest == checkpoint.spec_digest
+            && record.provision_transition_id == *provision_transition_id
+            && record.volume_id == *volume_id
+            && record.attachment_id == *attachment_id
+            && record.attachment_epoch == *attachment_epoch
+            && record.expected_provisioned_head == *expected_provisioned_head
+            && process.scope_id == *scope_id
+            && process.control_socket_path == *control_socket_path
+            && process.data_directory == *data_directory
+            && process.ownership_token == *process_identity_token
+            && process.executable_path == record.expected_control_executable_path,
+        "serving handoff record is stale for the current stored checkpoint"
+    );
     Ok(())
 }
 
@@ -974,27 +1410,228 @@ fn write_canonical_json(value: &Value, output: &mut Vec<u8>) -> serde_json::Resu
     Ok(())
 }
 
-fn validate_persisted_acquire_inputs(
-    directory: &File,
+#[derive(Debug)]
+struct RetainedAttachmentContext {
+    state_directory: StateDirectory,
+    root_directory: File,
+    attachment_directory: File,
+    data_directory: PathBuf,
+    local_state: ServingHandoffLocalStateIdentity,
+    acquire_inputs: RetainedAcquireInputs,
+}
+
+#[derive(Debug)]
+struct RetainedAcquireInputs {
+    identity: RetainedFile,
+    blank_grant: RetainedFile,
+    launch_checkpoint: RetainedFile,
+}
+
+#[derive(Debug)]
+struct RetainedFile {
+    file: File,
+    identity: StableFileIdentity,
+    bytes: Vec<u8>,
+}
+
+impl RetainedAttachmentContext {
+    fn open_and_lock(
+        state_directory: StateDirectory,
+        data_directory: &Path,
+        acquired: &AuthorizedBlockdCheckpoint,
+        expected_target: &str,
+        expected_target_temp: &str,
+    ) -> Result<Self> {
+        let root_directory = state_directory
+            .try_clone_directory()
+            .context("clone retained Node state directory")?;
+        verify_retained_state_directory(&root_directory, state_directory.path())?;
+        let state_identity = stable_directory_identity(&root_directory, state_directory.path())?;
+        let attachment_directory = open_attachment_directory_from_root(
+            &root_directory,
+            state_directory.path(),
+            data_directory,
+        )?;
+        lock_directory(&attachment_directory).with_context(|| {
+            format!(
+                "lock serving handoff attachment directory {}",
+                data_directory.display()
+            )
+        })?;
+        validate_handoff_namespace(&attachment_directory, expected_target, expected_target_temp)?;
+        let attachment_identity = stable_directory_identity(&attachment_directory, data_directory)?;
+        let identity = RetainedFile::open_required(
+            &attachment_directory,
+            IDENTITY_FILE,
+            host_path(
+                &data_directory.join(IDENTITY_FILE),
+                "attachment identity path",
+            )?,
+            MAX_IDENTITY_BYTES,
+        )?;
+        let blank_grant = RetainedFile::open_required(
+            &attachment_directory,
+            AUTHORIZED_SERVING_FILE,
+            host_path(
+                &data_directory.join(AUTHORIZED_SERVING_FILE),
+                "acquire authorization path",
+            )?,
+            MAX_AUTHORIZED_SERVING_BYTES,
+        )?;
+        let launch_checkpoint = RetainedFile::open_required(
+            &attachment_directory,
+            LAUNCH_CHECKPOINT_FILE,
+            host_path(
+                &data_directory.join(LAUNCH_CHECKPOINT_FILE),
+                "authorized blockd launch checkpoint path",
+            )?,
+            MAX_LAUNCH_CHECKPOINT_BYTES,
+        )?;
+        validate_acquire_input_bytes(
+            &identity.bytes,
+            &blank_grant.bytes,
+            &launch_checkpoint.bytes,
+            acquired,
+        )?;
+        let local_state = ServingHandoffLocalStateIdentity {
+            state_directory: state_identity,
+            attachment_directory: attachment_identity,
+            attachment_identity_file: identity.identity.clone(),
+            acquire_authorization_file: blank_grant.identity.clone(),
+            launch_checkpoint_file: launch_checkpoint.identity.clone(),
+        };
+        let retained = Self {
+            state_directory,
+            root_directory,
+            attachment_directory,
+            data_directory: data_directory.to_path_buf(),
+            local_state,
+            acquire_inputs: RetainedAcquireInputs {
+                identity,
+                blank_grant,
+                launch_checkpoint,
+            },
+        };
+        retained.assert_current()?;
+        Ok(retained)
+    }
+
+    fn assert_current(&self) -> Result<()> {
+        verify_retained_state_directory(&self.root_directory, self.state_directory.path())?;
+        assert_directory_identity(&self.root_directory, &self.local_state.state_directory)?;
+        verify_private_directory(&self.attachment_directory, &self.data_directory)?;
+        assert_directory_identity(
+            &self.attachment_directory,
+            &self.local_state.attachment_directory,
+        )?;
+
+        // Reopen the lexical root and full descendant path. A retained fd by
+        // itself is insufficient after rename/recreate because its old inode
+        // no longer names the path a future consumer would open.
+        let current_root = self
+            .state_directory
+            .try_clone_directory()
+            .context("reopen current Node state directory")?;
+        verify_retained_state_directory(&current_root, self.state_directory.path())?;
+        assert_directory_identity(&current_root, &self.local_state.state_directory)?;
+        let current_attachment = open_attachment_directory_from_root(
+            &current_root,
+            self.state_directory.path(),
+            &self.data_directory,
+        )?;
+        assert_directory_identity(&current_attachment, &self.local_state.attachment_directory)?;
+
+        self.acquire_inputs.identity.assert_current(
+            &self.attachment_directory,
+            &self.local_state.attachment_identity_file.path,
+        )?;
+        self.acquire_inputs.blank_grant.assert_current(
+            &self.attachment_directory,
+            &self.local_state.acquire_authorization_file.path,
+        )?;
+        self.acquire_inputs.launch_checkpoint.assert_current(
+            &self.attachment_directory,
+            &self.local_state.launch_checkpoint_file.path,
+        )?;
+        Ok(())
+    }
+}
+
+impl RetainedFile {
+    fn open_required(directory: &File, name: &str, path: HostPath, maximum: usize) -> Result<Self> {
+        let name_c = c_string(name)?;
+        let mut file = open_at(
+            directory,
+            &name_c,
+            libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_CLOEXEC | libc::O_NONBLOCK,
+            0,
+        )
+        .with_context(|| format!("open retained serving handoff file {name}"))?;
+        verify_regular_file(&file, name, None)?;
+        let before = FileIdentity::from_metadata(
+            &file
+                .metadata()
+                .with_context(|| format!("inspect retained {name}"))?,
+        );
+        anyhow::ensure!(
+            before.len <= maximum as u64,
+            "retained serving handoff file {name} exceeds {maximum} bytes"
+        );
+        let mut bytes = Vec::with_capacity((before.len as usize).min(maximum));
+        (&mut file)
+            .take(maximum as u64 + 1)
+            .read_to_end(&mut bytes)
+            .with_context(|| format!("read retained {name}"))?;
+        anyhow::ensure!(
+            bytes.len() <= maximum,
+            "retained serving handoff file {name} exceeds {maximum} bytes"
+        );
+        let after = FileIdentity::from_metadata(
+            &file
+                .metadata()
+                .with_context(|| format!("reinspect retained {name}"))?,
+        );
+        anyhow::ensure!(before == after, "retained file {name} changed while read");
+        let identity = stable_file_identity(&file, path, &bytes)?;
+        Ok(Self {
+            file,
+            identity,
+            bytes,
+        })
+    }
+
+    fn assert_current(&self, directory: &File, expected_path: &HostPath) -> Result<()> {
+        anyhow::ensure!(
+            &self.identity.path == expected_path,
+            "retained serving handoff path changed"
+        );
+        assert_file_identity(&self.file, &self.identity)?;
+        let name = Path::new(expected_path.as_str())
+            .file_name()
+            .and_then(|name| name.to_str())
+            .context("retained serving handoff path has no canonical basename")?;
+        let current =
+            Self::open_required(directory, name, expected_path.clone(), self.bytes.len())?;
+        anyhow::ensure!(
+            current.identity == self.identity && current.bytes == self.bytes,
+            "serving handoff file {name} changed identity or bytes"
+        );
+        Ok(())
+    }
+}
+
+fn validate_acquire_input_bytes(
+    identity: &[u8],
+    blank_grant: &[u8],
+    launch: &[u8],
     acquired: &AuthorizedBlockdCheckpoint,
 ) -> Result<()> {
-    let identity = read_required_bounded(directory, IDENTITY_FILE, MAX_IDENTITY_BYTES)?;
-    let blank_grant = read_required_bounded(
-        directory,
-        AUTHORIZED_SERVING_FILE,
-        MAX_AUTHORIZED_SERVING_BYTES,
-    )?;
-    let launch = read_required_bounded(
-        directory,
-        LAUNCH_CHECKPOINT_FILE,
-        MAX_LAUNCH_CHECKPOINT_BYTES,
-    )?;
     let decoded_identity: AttachmentLineageIdentity =
-        serde_json::from_slice(&identity).context("decode persisted attachment identity")?;
+        serde_json::from_slice(identity).context("decode persisted attachment identity")?;
     let decoded_blank: AuthorizedServingAttachment =
-        serde_json::from_slice(&blank_grant).context("decode persisted acquire-time grant")?;
+        serde_json::from_slice(blank_grant).context("decode persisted acquire-time grant")?;
     let decoded_launch: AuthorizedBlockdCheckpoint =
-        serde_json::from_slice(&launch).context("decode persisted authorized blockd checkpoint")?;
+        serde_json::from_slice(launch).context("decode persisted authorized blockd checkpoint")?;
     anyhow::ensure!(
         decoded_identity == acquired.attachment.identity
             && decoded_blank == acquired.attachment
@@ -1013,12 +1650,13 @@ fn validate_persisted_acquire_inputs(
     Ok(())
 }
 
-fn open_attachment_directory(
-    state_directory: &StateDirectory,
+fn open_attachment_directory_from_root(
+    root_directory: &File,
+    state_directory_path: &Path,
     data_directory: &Path,
 ) -> Result<File> {
     let relative = data_directory
-        .strip_prefix(state_directory.path())
+        .strip_prefix(state_directory_path)
         .context("serving handoff directory is outside the retained Node state directory")?;
     anyhow::ensure!(
         relative.components().next().is_some()
@@ -1027,9 +1665,9 @@ fn open_attachment_directory(
                 .all(|component| matches!(component, Component::Normal(_))),
         "serving handoff directory is not a strict descriptor-relative descendant"
     );
-    let mut directory = state_directory
-        .try_clone_directory()
-        .context("clone retained Node state directory")?;
+    let mut directory = root_directory
+        .try_clone()
+        .context("clone retained Node state directory descriptor")?;
     for component in relative.components() {
         let Component::Normal(name) = component else {
             unreachable!("relative path components were validated")
@@ -1070,6 +1708,81 @@ fn verify_private_directory(directory: &File, path: &Path) -> Result<()> {
         path.display()
     );
     Ok(())
+}
+
+fn verify_retained_state_directory(directory: &File, path: &Path) -> Result<()> {
+    let metadata = directory
+        .metadata()
+        .with_context(|| format!("inspect retained state directory {}", path.display()))?;
+    // SAFETY: geteuid has no pointer arguments and retains no Rust memory.
+    let euid = unsafe { libc::geteuid() };
+    anyhow::ensure!(
+        metadata.file_type().is_dir()
+            && metadata.uid() == euid
+            && metadata.permissions().mode() & 0o022 == 0,
+        "retained state directory {} has unsafe metadata",
+        path.display()
+    );
+    Ok(())
+}
+
+fn stable_directory_identity(file: &File, path: &Path) -> Result<StableDirectoryIdentity> {
+    let metadata = file
+        .metadata()
+        .with_context(|| format!("inspect stable directory {}", path.display()))?;
+    anyhow::ensure!(metadata.ino() > 0, "stable directory has no inode");
+    Ok(StableDirectoryIdentity {
+        path: host_path(path, "stable serving handoff directory path")?,
+        device: wire_filesystem_value(metadata.dev(), "directory device")?,
+        inode: wire_filesystem_value(metadata.ino(), "directory inode")?,
+    })
+}
+
+fn assert_directory_identity(file: &File, expected: &StableDirectoryIdentity) -> Result<()> {
+    let path = Path::new(expected.path.as_str());
+    let metadata = file
+        .metadata()
+        .with_context(|| format!("reinspect stable directory {}", path.display()))?;
+    anyhow::ensure!(
+        metadata.file_type().is_dir()
+            && metadata.dev() == expected.device.get()
+            && metadata.ino() == expected.inode.get(),
+        "serving handoff directory {} changed identity",
+        path.display()
+    );
+    Ok(())
+}
+
+fn stable_file_identity(file: &File, path: HostPath, bytes: &[u8]) -> Result<StableFileIdentity> {
+    verify_regular_file(file, path.as_str(), Some(bytes.len() as u64))?;
+    let metadata = file
+        .metadata()
+        .with_context(|| format!("inspect stable file {}", path.as_str()))?;
+    anyhow::ensure!(metadata.ino() > 0, "stable file has no inode");
+    Ok(StableFileIdentity {
+        path,
+        device: wire_filesystem_value(metadata.dev(), "file device")?,
+        inode: wire_filesystem_value(metadata.ino(), "file inode")?,
+        length: wire_filesystem_value(metadata.len(), "file length")?,
+        content_sha256: Sha256Digest::from_bytes(Sha256::digest(bytes).into()),
+    })
+}
+
+fn assert_file_identity(file: &File, expected: &StableFileIdentity) -> Result<()> {
+    verify_regular_file(file, expected.path.as_str(), Some(expected.length.get()))?;
+    let metadata = file
+        .metadata()
+        .with_context(|| format!("reinspect stable file {}", expected.path.as_str()))?;
+    anyhow::ensure!(
+        metadata.dev() == expected.device.get() && metadata.ino() == expected.inode.get(),
+        "serving handoff file {} changed identity",
+        expected.path.as_str()
+    );
+    Ok(())
+}
+
+fn wire_filesystem_value(value: u64, label: &'static str) -> Result<WireU64> {
+    WireU64::new(value).with_context(|| format!("serving handoff {label} exceeds wire range"))
 }
 
 fn lock_directory(directory: &File) -> io::Result<()> {
@@ -1407,6 +2120,9 @@ enum PublicationArtifact {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum PublicationPoint {
+    Created,
+    PartialWritten,
+    FullWritten,
     TempSynced,
     Published,
     DirectorySynced,
@@ -1432,23 +2148,25 @@ mod tests {
         spec_digest, AsciiText, AssignedKind, AssignedPlacement, DiskKind, Generation,
         GuestDeviceIdentity, GuestTransportEvidence, Ipv4Address, IsolatedIpv4Kind,
         LifecycleAdmission, MacAddress, NetworkConfig, NormalAcquireRequest, NormalAcquireResult,
-        RequireIdleCheckpoint, RuntimeConfig, RuntimeTarget, RuntimeTransition, UnixMillis,
-        VolumeAccess, VolumeAcquire, VolumeAdminState, VolumeDisposition, VolumeIntent,
+        RequireIdleCheckpoint, RuntimeCheckpoint, RuntimeConfig, RuntimeTarget, RuntimeTransition,
+        UnixMillis, VolumeAccess, VolumeAcquire, VolumeAdminState, VolumeDisposition, VolumeIntent,
         WarmSnapshotEvidence,
     };
     use cats_storage::authority::LastVolumeTransition;
 
     use super::*;
-    use crate::runtime::reconciliation::AuthorizedBlockdStore;
+    use crate::runtime::reconciliation::{AuthorizedBlockdStore, FileCheckpointStore};
 
     struct Fixture {
         _root: tempfile::TempDir,
         state_directory: StateDirectory,
+        checkpoint_directory: PathBuf,
         data_directory: PathBuf,
         blank_authorization_path: PathBuf,
-        checkpoint: RuntimeCheckpoint,
+        stored_checkpoint: StoredCheckpoint,
         acquired: AuthorizedBlockdCheckpoint,
         authority: ServingAuthorityTargetEvidence,
+        expected_executable_path: HostPath,
         process: RootProvisionProcessEvidence,
     }
 
@@ -1476,10 +2194,40 @@ mod tests {
         fn record_temp_path(&self) -> PathBuf {
             self.data_directory.join(SERVING_HANDOFF_RECORD_TEMP)
         }
+
+        fn exact_process_proof(&self) -> Result<ExactRootProvisionProcessProof> {
+            self.exact_process_proof_for(self.process.clone())
+        }
+
+        fn exact_process_proof_for(
+            &self,
+            process: RootProvisionProcessEvidence,
+        ) -> Result<ExactRootProvisionProcessProof> {
+            RootProvisionProcessExpectation::from_checkpoint(
+                self.stored_checkpoint.checkpoint(),
+                RootProvisionAuthoritySnapshot {
+                    attachment: self.acquired.attachment.clone(),
+                    volume: &self.authority.volume,
+                },
+                self.expected_executable_path.clone(),
+            )?
+            .prove_exact_process(process)
+        }
+
+        fn replace_checkpoint(&mut self, checkpoint: RuntimeCheckpoint) {
+            let store = FileCheckpointStore::open(
+                &self.checkpoint_directory,
+                &self.stored_checkpoint.checkpoint().cat_id,
+            )
+            .unwrap();
+            let current = store.load().unwrap().unwrap();
+            self.stored_checkpoint = store.replace(&current, &checkpoint).unwrap();
+        }
     }
 
     fn fixture() -> Fixture {
         let root = tempfile::tempdir().expect("create serving handoff fixture");
+        std::fs::set_permissions(root.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
         let state_directory = StateDirectory::unanchored(root.path().to_path_buf());
         let transition_id = random('1');
         let expected_unowned_epoch = FenceEpoch::new(6).unwrap();
@@ -1623,6 +2371,11 @@ mod tests {
             updated_at_unix_ms: UnixMillis::new(1_720_000_000_000).unwrap(),
         };
         encode_runtime_checkpoint(&checkpoint).expect("fixture checkpoint is valid");
+        let checkpoint_directory = root.path().join("runtime-checkpoints");
+        let checkpoint_store =
+            FileCheckpointStore::open(&checkpoint_directory, &checkpoint.cat_id).unwrap();
+        let stored_checkpoint = checkpoint_store.create(&checkpoint).unwrap();
+        drop(checkpoint_store);
         let authority_record = VolumeRecord {
             volume_id: volume.volume_id.clone(),
             size_bytes: volume.size_bytes,
@@ -1640,11 +2393,12 @@ mod tests {
         };
         let authority =
             ServingAuthorityTargetEvidence::new(provision_transition_id, authority_record);
+        let expected_executable_path = host("/opt/cats/bin/cats-blockd");
         let process = RootProvisionProcessEvidence {
             process_id: 4321,
             unit_main_process_id: 4321,
             process_start_time_ticks: WireU64::new(998_877).unwrap(),
-            executable_path: host("/opt/cats/bin/cats-blockd"),
+            executable_path: expected_executable_path.clone(),
             scope_id: scope_id.clone(),
             cgroup_path: host(&format!(
                 "/sys/fs/cgroup/system.slice/{}",
@@ -1668,11 +2422,13 @@ mod tests {
         Fixture {
             _root: root,
             state_directory,
+            checkpoint_directory,
             data_directory,
             blank_authorization_path,
-            checkpoint,
+            stored_checkpoint,
             acquired,
             authority,
+            expected_executable_path,
             process,
         }
     }
@@ -1691,7 +2447,7 @@ mod tests {
         // a serving-ready record.
         let control = store
             .seal_target_control_authorization(
-                &fixture.checkpoint,
+                &fixture.stored_checkpoint,
                 &fixture.acquired,
                 &fixture.authority,
             )
@@ -1715,16 +2471,21 @@ mod tests {
                 .unwrap(),
             control.identity().artifact
         );
+        let control_identity = control.identity().clone();
+        control
+            .assert_current(&fixture.stored_checkpoint)
+            .expect("target-control proof remains current");
+        drop(control);
 
         let ready = store
             .seal_serving_ready(
-                &fixture.checkpoint,
+                &fixture.stored_checkpoint,
                 &fixture.acquired,
                 &fixture.authority,
-                &fixture.process,
+                &fixture.exact_process_proof().unwrap(),
             )
             .expect("seal serving ready after exact target reload");
-        assert_eq!(ready.target_control_authorization(), control.identity());
+        assert_eq!(ready.target_control_authorization(), &control_identity);
         assert_eq!(ready.old_control_process().process_id.get(), 4321);
         assert_eq!(
             ready.record_path().as_str(),
@@ -1754,15 +2515,20 @@ mod tests {
 
         let target_inode = std::fs::metadata(fixture.target_path()).unwrap().ino();
         let record_inode = std::fs::metadata(fixture.record_path()).unwrap().ino();
+        ready
+            .assert_current(&fixture.stored_checkpoint)
+            .expect("serving proof remains current before consume");
+        let ready_record = ready.record().clone();
+        drop(ready);
         let replay = store
             .seal_serving_ready(
-                &fixture.checkpoint,
+                &fixture.stored_checkpoint,
                 &fixture.acquired,
                 &fixture.authority,
-                &fixture.process,
+                &fixture.exact_process_proof().unwrap(),
             )
             .expect("exact serving handoff replay");
-        assert_eq!(replay, ready);
+        assert_eq!(replay.record(), &ready_record);
         assert_eq!(
             std::fs::metadata(fixture.target_path()).unwrap().ino(),
             target_inode
@@ -1781,7 +2547,7 @@ mod tests {
         assert!(wrong_transition
             .store()
             .seal_target_control_authorization(
-                &wrong_transition.checkpoint,
+                &wrong_transition.stored_checkpoint,
                 &wrong_transition.acquired,
                 &evidence,
             )
@@ -1794,24 +2560,29 @@ mod tests {
         // sealed wrapper names the old provision transition. Copying those
         // bytes under the new transition's filename must not rebind them.
         let mut rebound = fixture();
-        let old_transition = rebound.authority.provision_transition_id.clone();
-        let mut target_attachment = rebound.acquired.attachment.clone();
-        target_attachment.head = rebound.authority.volume.head.clone();
-        let copied = encode_target_control_authorization(&TargetControlAuthorizationArtifact {
-            version: ContractVersion::V1,
-            provision_transition_id: old_transition,
-            attachment: target_attachment,
-        })
-        .unwrap();
+        let sealed = rebound
+            .store()
+            .seal_target_control_authorization(
+                &rebound.stored_checkpoint,
+                &rebound.acquired,
+                &rebound.authority,
+            )
+            .unwrap();
+        let old_target_path = rebound.target_path();
+        let copied = std::fs::read(&old_target_path).unwrap();
+        drop(sealed);
+        std::fs::remove_file(old_target_path).unwrap();
         let new_transition = random('9');
+        let mut checkpoint = rebound.stored_checkpoint.checkpoint().clone();
         let ReconcileStep::ProvisionRootImage {
             provision_transition_id,
             ..
-        } = &mut rebound.checkpoint.step
+        } = &mut checkpoint.step
         else {
             unreachable!()
         };
         *provision_transition_id = new_transition.clone();
+        rebound.replace_checkpoint(checkpoint);
         rebound.authority.provision_transition_id = new_transition;
         std::fs::write(rebound.target_path(), &copied).unwrap();
         std::fs::set_permissions(
@@ -1822,7 +2593,7 @@ mod tests {
         assert!(rebound
             .store()
             .seal_target_control_authorization(
-                &rebound.checkpoint,
+                &rebound.stored_checkpoint,
                 &rebound.acquired,
                 &rebound.authority,
             )
@@ -1837,7 +2608,7 @@ mod tests {
         assert!(wrong_head
             .store()
             .seal_target_control_authorization(
-                &wrong_head.checkpoint,
+                &wrong_head.stored_checkpoint,
                 &wrong_head.acquired,
                 &evidence,
             )
@@ -1850,7 +2621,7 @@ mod tests {
         assert!(wrong_tuple
             .store()
             .seal_target_control_authorization(
-                &wrong_tuple.checkpoint,
+                &wrong_tuple.stored_checkpoint,
                 &wrong_tuple.acquired,
                 &evidence,
             )
@@ -1861,23 +2632,18 @@ mod tests {
         let store = wrong_reload.store();
         store
             .seal_target_control_authorization(
-                &wrong_reload.checkpoint,
+                &wrong_reload.stored_checkpoint,
                 &wrong_reload.acquired,
                 &wrong_reload.authority,
             )
             .unwrap();
         let mut process = wrong_reload.process.clone();
         process.handshake.remote_head = blank_head();
-        assert!(store
-            .seal_serving_ready(
-                &wrong_reload.checkpoint,
-                &wrong_reload.acquired,
-                &wrong_reload.authority,
-                &process,
-            )
+        assert!(wrong_reload
+            .exact_process_proof_for(process)
             .unwrap_err()
             .to_string()
-            .contains("did not reload"));
+            .contains("did not exactly match"));
         assert!(wrong_reload.target_path().exists());
         assert!(!wrong_reload.record_path().exists());
     }
@@ -1885,6 +2651,18 @@ mod tests {
     #[test]
     fn every_publication_crash_window_recovers_only_by_exact_replay() {
         let stages = [
+            PublicationStage::new(
+                PublicationArtifact::TargetAuthorization,
+                PublicationPoint::Created,
+            ),
+            PublicationStage::new(
+                PublicationArtifact::TargetAuthorization,
+                PublicationPoint::PartialWritten,
+            ),
+            PublicationStage::new(
+                PublicationArtifact::TargetAuthorization,
+                PublicationPoint::FullWritten,
+            ),
             PublicationStage::new(
                 PublicationArtifact::TargetAuthorization,
                 PublicationPoint::TempSynced,
@@ -1896,6 +2674,18 @@ mod tests {
             PublicationStage::new(
                 PublicationArtifact::TargetAuthorization,
                 PublicationPoint::DirectorySynced,
+            ),
+            PublicationStage::new(
+                PublicationArtifact::HandoffRecord,
+                PublicationPoint::Created,
+            ),
+            PublicationStage::new(
+                PublicationArtifact::HandoffRecord,
+                PublicationPoint::PartialWritten,
+            ),
+            PublicationStage::new(
+                PublicationArtifact::HandoffRecord,
+                PublicationPoint::FullWritten,
             ),
             PublicationStage::new(
                 PublicationArtifact::HandoffRecord,
@@ -1917,20 +2707,20 @@ mod tests {
             store.inject_crash_once(stage);
             let error = store
                 .seal_serving_ready(
-                    &fixture.checkpoint,
+                    &fixture.stored_checkpoint,
                     &fixture.acquired,
                     &fixture.authority,
-                    &fixture.process,
+                    &fixture.exact_process_proof().unwrap(),
                 )
                 .unwrap_err();
             assert!(error.to_string().contains("injected"), "{stage:?}: {error}");
 
             let ready = store
                 .seal_serving_ready(
-                    &fixture.checkpoint,
+                    &fixture.stored_checkpoint,
                     &fixture.acquired,
                     &fixture.authority,
-                    &fixture.process,
+                    &fixture.exact_process_proof().unwrap(),
                 )
                 .unwrap_or_else(|error| panic!("{stage:?} exact replay failed: {error:#}"));
             assert_eq!(
@@ -1948,26 +2738,331 @@ mod tests {
     }
 
     #[test]
-    fn partial_foreign_and_symlink_entries_fail_closed_without_replacement() {
-        let partial = fixture();
-        std::fs::write(partial.target_temp_path(), b"{").unwrap();
+    fn rename_recreate_and_exact_byte_aba_never_return_or_retain_ready() {
+        for stage in [
+            PublicationStage::new(
+                PublicationArtifact::TargetAuthorization,
+                PublicationPoint::DirectorySynced,
+            ),
+            PublicationStage::new(
+                PublicationArtifact::HandoffRecord,
+                PublicationPoint::DirectorySynced,
+            ),
+        ] {
+            for name in [
+                IDENTITY_FILE,
+                AUTHORIZED_SERVING_FILE,
+                LAUNCH_CHECKPOINT_FILE,
+            ] {
+                let fixture = fixture();
+                let store = fixture.store();
+                let path = fixture.data_directory.join(name);
+                let before = std::fs::read(&path).unwrap();
+                let before_inode = std::fs::metadata(&path).unwrap().ino();
+                let backup = fixture.data_directory.join(format!(".aba-{name}"));
+                let mutation_path = path.clone();
+                let mutation_bytes = before.clone();
+                store.inject_mutation_once(stage, move || {
+                    std::fs::rename(&mutation_path, &backup).unwrap();
+                    std::fs::write(&mutation_path, &mutation_bytes).unwrap();
+                    std::fs::set_permissions(
+                        &mutation_path,
+                        std::fs::Permissions::from_mode(0o600),
+                    )
+                    .unwrap();
+                });
+                assert!(store
+                    .seal_serving_ready(
+                        &fixture.stored_checkpoint,
+                        &fixture.acquired,
+                        &fixture.authority,
+                        &fixture.exact_process_proof().unwrap(),
+                    )
+                    .is_err());
+                assert_eq!(std::fs::read(&path).unwrap(), before, "{stage:?} {name}");
+                assert_ne!(
+                    std::fs::metadata(&path).unwrap().ino(),
+                    before_inode,
+                    "{stage:?} {name}"
+                );
+            }
+        }
+
+        for artifact in [
+            PublicationArtifact::TargetAuthorization,
+            PublicationArtifact::HandoffRecord,
+        ] {
+            let fixture = fixture();
+            let store = fixture.store();
+            let swap_path = match artifact {
+                PublicationArtifact::TargetAuthorization => fixture.target_path(),
+                PublicationArtifact::HandoffRecord => fixture.record_path(),
+            };
+            store.inject_mutation_once(
+                PublicationStage::new(artifact, PublicationPoint::DirectorySynced),
+                move || swap_same_bytes(&swap_path, "publish-barrier"),
+            );
+            assert!(store
+                .seal_serving_ready(
+                    &fixture.stored_checkpoint,
+                    &fixture.acquired,
+                    &fixture.authority,
+                    &fixture.exact_process_proof().unwrap(),
+                )
+                .is_err());
+        }
+
+        let attachment_replaced = fixture();
+        let store = attachment_replaced.store();
+        let attachment_path = attachment_replaced.data_directory.clone();
+        let moved_attachment = attachment_path.with_extension("retained-old");
+        let replacement_path = attachment_path.clone();
+        store.inject_mutation_once(
+            PublicationStage::new(
+                PublicationArtifact::HandoffRecord,
+                PublicationPoint::DirectorySynced,
+            ),
+            move || {
+                std::fs::rename(&replacement_path, &moved_attachment).unwrap();
+                std::fs::create_dir(&replacement_path).unwrap();
+                std::fs::set_permissions(&replacement_path, std::fs::Permissions::from_mode(0o700))
+                    .unwrap();
+            },
+        );
+        assert!(store
+            .seal_serving_ready(
+                &attachment_replaced.stored_checkpoint,
+                &attachment_replaced.acquired,
+                &attachment_replaced.authority,
+                &attachment_replaced.exact_process_proof().unwrap(),
+            )
+            .is_err());
+
+        let root_replaced = fixture();
+        let store = root_replaced.store();
+        let root_path = root_replaced.state_directory.path().to_path_buf();
+        let moved_root = root_path.with_extension("retained-old");
+        let moved_root_cleanup = moved_root.clone();
+        let replacement_root = root_path.clone();
+        store.inject_mutation_once(
+            PublicationStage::new(
+                PublicationArtifact::TargetAuthorization,
+                PublicationPoint::DirectorySynced,
+            ),
+            move || {
+                std::fs::rename(&replacement_root, &moved_root).unwrap();
+                std::fs::create_dir(&replacement_root).unwrap();
+                std::fs::set_permissions(&replacement_root, std::fs::Permissions::from_mode(0o700))
+                    .unwrap();
+            },
+        );
+        assert!(store
+            .seal_target_control_authorization(
+                &root_replaced.stored_checkpoint,
+                &root_replaced.acquired,
+                &root_replaced.authority,
+            )
+            .is_err());
+        drop(store);
+        std::fs::remove_dir(&root_path).unwrap();
+        std::fs::rename(moved_root_cleanup, &root_path).unwrap();
+
+        let consume_aba = fixture();
+        let ready = consume_aba
+            .store()
+            .seal_serving_ready(
+                &consume_aba.stored_checkpoint,
+                &consume_aba.acquired,
+                &consume_aba.authority,
+                &consume_aba.exact_process_proof().unwrap(),
+            )
+            .unwrap();
+        swap_same_bytes(&consume_aba.record_path(), "consume");
+        assert!(ready
+            .assert_current(&consume_aba.stored_checkpoint)
+            .is_err());
+    }
+
+    #[test]
+    fn stored_checkpoint_and_exact_process_proof_close_stale_or_mutated_context() {
+        let mut wrong_executable = fixture();
+        wrong_executable.process.executable_path = host("/opt/foreign/blockd");
+        assert!(wrong_executable.exact_process_proof().is_err());
+        assert!(!wrong_executable.record_path().exists());
+
+        let mut stale = fixture();
+        let ready = stale
+            .store()
+            .seal_serving_ready(
+                &stale.stored_checkpoint,
+                &stale.acquired,
+                &stale.authority,
+                &stale.exact_process_proof().unwrap(),
+            )
+            .unwrap();
+        let original_digest = stale.stored_checkpoint.content_digest().clone();
+        let mut successor = stale.stored_checkpoint.checkpoint().clone();
+        successor.updated_at_unix_ms =
+            UnixMillis::new(successor.updated_at_unix_ms.get().checked_add(1).unwrap()).unwrap();
+        stale.replace_checkpoint(successor);
+        assert_ne!(stale.stored_checkpoint.content_digest(), &original_digest);
+        assert!(ready.assert_current(&stale.stored_checkpoint).is_err());
+        drop(ready);
+        assert!(stale
+            .store()
+            .seal_target_control_authorization(
+                &stale.stored_checkpoint,
+                &stale.acquired,
+                &stale.authority,
+            )
+            .is_err());
+    }
+
+    #[test]
+    fn unsafe_foreign_and_symlink_entries_fail_closed_without_replacement() {
+        let unsafe_temp = fixture();
+        std::fs::write(unsafe_temp.target_temp_path(), b"{").unwrap();
         std::fs::set_permissions(
-            partial.target_temp_path(),
+            unsafe_temp.target_temp_path(),
+            std::fs::Permissions::from_mode(0o640),
+        )
+        .unwrap();
+        let unsafe_inode = std::fs::metadata(unsafe_temp.target_temp_path())
+            .unwrap()
+            .ino();
+        assert!(unsafe_temp
+            .store()
+            .seal_target_control_authorization(
+                &unsafe_temp.stored_checkpoint,
+                &unsafe_temp.acquired,
+                &unsafe_temp.authority,
+            )
+            .is_err());
+        assert!(!unsafe_temp.target_path().exists());
+        assert_eq!(std::fs::read(unsafe_temp.target_temp_path()).unwrap(), b"{");
+        assert_eq!(
+            std::fs::metadata(unsafe_temp.target_temp_path())
+                .unwrap()
+                .ino(),
+            unsafe_inode
+        );
+
+        let hardlinked_temp = fixture();
+        let external_temp = hardlinked_temp
+            .data_directory
+            .parent()
+            .unwrap()
+            .join("external-temp.json");
+        std::fs::write(&external_temp, b"{").unwrap();
+        std::fs::set_permissions(&external_temp, std::fs::Permissions::from_mode(0o600)).unwrap();
+        std::fs::hard_link(&external_temp, hardlinked_temp.target_temp_path()).unwrap();
+        assert!(hardlinked_temp
+            .store()
+            .seal_target_control_authorization(
+                &hardlinked_temp.stored_checkpoint,
+                &hardlinked_temp.acquired,
+                &hardlinked_temp.authority,
+            )
+            .is_err());
+        assert_eq!(std::fs::read(&external_temp).unwrap(), b"{");
+        assert!(hardlinked_temp.target_temp_path().exists());
+        assert_eq!(std::fs::metadata(&external_temp).unwrap().nlink(), 2);
+
+        let symlink_temp = fixture();
+        let external_symlink_temp = symlink_temp
+            .data_directory
+            .parent()
+            .unwrap()
+            .join("external-symlink-temp.json");
+        std::fs::write(&external_symlink_temp, b"external").unwrap();
+        symlink(&external_symlink_temp, symlink_temp.target_temp_path()).unwrap();
+        assert!(symlink_temp
+            .store()
+            .seal_target_control_authorization(
+                &symlink_temp.stored_checkpoint,
+                &symlink_temp.acquired,
+                &symlink_temp.authority,
+            )
+            .is_err());
+        assert_eq!(std::fs::read(&external_symlink_temp).unwrap(), b"external");
+        assert!(std::fs::symlink_metadata(symlink_temp.target_temp_path())
+            .unwrap()
+            .file_type()
+            .is_symlink());
+
+        let partial_beside_target = fixture();
+        let store = partial_beside_target.store();
+        drop(
+            store
+                .seal_target_control_authorization(
+                    &partial_beside_target.stored_checkpoint,
+                    &partial_beside_target.acquired,
+                    &partial_beside_target.authority,
+                )
+                .unwrap(),
+        );
+        let target_inode = std::fs::metadata(partial_beside_target.target_path())
+            .unwrap()
+            .ino();
+        std::fs::write(partial_beside_target.target_temp_path(), b"{").unwrap();
+        std::fs::set_permissions(
+            partial_beside_target.target_temp_path(),
             std::fs::Permissions::from_mode(0o600),
         )
         .unwrap();
-        assert!(partial
-            .store()
+        let replay = store
             .seal_target_control_authorization(
-                &partial.checkpoint,
-                &partial.acquired,
-                &partial.authority,
+                &partial_beside_target.stored_checkpoint,
+                &partial_beside_target.acquired,
+                &partial_beside_target.authority,
             )
-            .unwrap_err()
-            .to_string()
-            .contains("partial or foreign"));
-        assert!(!partial.target_path().exists());
-        assert_eq!(std::fs::read(partial.target_temp_path()).unwrap(), b"{");
+            .unwrap();
+        assert_eq!(
+            std::fs::metadata(partial_beside_target.target_path())
+                .unwrap()
+                .ino(),
+            target_inode
+        );
+        assert!(!partial_beside_target.target_temp_path().exists());
+        drop(replay);
+
+        let partial_beside_record = fixture();
+        let store = partial_beside_record.store();
+        drop(
+            store
+                .seal_serving_ready(
+                    &partial_beside_record.stored_checkpoint,
+                    &partial_beside_record.acquired,
+                    &partial_beside_record.authority,
+                    &partial_beside_record.exact_process_proof().unwrap(),
+                )
+                .unwrap(),
+        );
+        let record_inode = std::fs::metadata(partial_beside_record.record_path())
+            .unwrap()
+            .ino();
+        std::fs::write(partial_beside_record.record_temp_path(), b"{").unwrap();
+        std::fs::set_permissions(
+            partial_beside_record.record_temp_path(),
+            std::fs::Permissions::from_mode(0o600),
+        )
+        .unwrap();
+        let replay = store
+            .seal_serving_ready(
+                &partial_beside_record.stored_checkpoint,
+                &partial_beside_record.acquired,
+                &partial_beside_record.authority,
+                &partial_beside_record.exact_process_proof().unwrap(),
+            )
+            .unwrap();
+        assert_eq!(
+            std::fs::metadata(partial_beside_record.record_path())
+                .unwrap()
+                .ino(),
+            record_inode
+        );
+        assert!(!partial_beside_record.record_temp_path().exists());
+        drop(replay);
 
         let foreign = fixture();
         std::fs::write(foreign.target_path(), b"{}").unwrap();
@@ -1980,7 +3075,7 @@ mod tests {
         assert!(foreign
             .store()
             .seal_target_control_authorization(
-                &foreign.checkpoint,
+                &foreign.stored_checkpoint,
                 &foreign.acquired,
                 &foreign.authority,
             )
@@ -2003,7 +3098,7 @@ mod tests {
         assert!(stale_transition
             .store()
             .seal_target_control_authorization(
-                &stale_transition.checkpoint,
+                &stale_transition.stored_checkpoint,
                 &stale_transition.acquired,
                 &stale_transition.authority,
             )
@@ -2023,7 +3118,7 @@ mod tests {
         assert!(linked
             .store()
             .seal_target_control_authorization(
-                &linked.checkpoint,
+                &linked.stored_checkpoint,
                 &linked.acquired,
                 &linked.authority,
             )
@@ -2038,7 +3133,7 @@ mod tests {
         let store = foreign_record.store();
         store
             .seal_target_control_authorization(
-                &foreign_record.checkpoint,
+                &foreign_record.stored_checkpoint,
                 &foreign_record.acquired,
                 &foreign_record.authority,
             )
@@ -2051,10 +3146,10 @@ mod tests {
         .unwrap();
         assert!(store
             .seal_serving_ready(
-                &foreign_record.checkpoint,
+                &foreign_record.stored_checkpoint,
                 &foreign_record.acquired,
                 &foreign_record.authority,
-                &foreign_record.process,
+                &foreign_record.exact_process_proof().unwrap(),
             )
             .is_err());
         assert_eq!(std::fs::read(foreign_record.record_path()).unwrap(), b"{}");
@@ -2063,13 +3158,15 @@ mod tests {
     #[test]
     fn codecs_require_bounded_canonical_closed_values() {
         let fixture = fixture();
-        let mut target = fixture.acquired.attachment.clone();
-        target.head = fixture.authority.volume.head.clone();
-        let target = TargetControlAuthorizationArtifact {
-            version: ContractVersion::V1,
-            provision_transition_id: fixture.authority.provision_transition_id.clone(),
-            attachment: target,
-        };
+        let store = fixture.store();
+        let control = store
+            .seal_target_control_authorization(
+                &fixture.stored_checkpoint,
+                &fixture.acquired,
+                &fixture.authority,
+            )
+            .unwrap();
+        let target = control.identity().artifact.clone();
         let target_bytes = encode_target_control_authorization(&target).unwrap();
         assert_eq!(
             decode_target_control_authorization(&target_bytes).unwrap(),
@@ -2088,14 +3185,14 @@ mod tests {
             ]),
             Err(ServingHandoffCodecError::WireBytesLimitExceeded { .. })
         ));
+        drop(control);
 
-        let ready = fixture
-            .store()
+        let ready = store
             .seal_serving_ready(
-                &fixture.checkpoint,
+                &fixture.stored_checkpoint,
                 &fixture.acquired,
                 &fixture.authority,
-                &fixture.process,
+                &fixture.exact_process_proof().unwrap(),
             )
             .unwrap();
         let record_bytes = encode_serving_handoff_record(ready.record()).unwrap();
@@ -2109,12 +3206,35 @@ mod tests {
             encode_serving_handoff_record(&wrong_digest),
             Err(ServingHandoffCodecError::Invalid { .. })
         ));
+        let mut wrong_checkpoint_digest = ready.record().clone();
+        wrong_checkpoint_digest.checkpoint_content_digest = digest('0');
+        assert!(matches!(
+            encode_serving_handoff_record(&wrong_checkpoint_digest),
+            Err(ServingHandoffCodecError::Invalid { .. })
+        ));
+        let mut wrong_executable = ready.record().clone();
+        wrong_executable.expected_control_executable_path = host("/opt/foreign/blockd");
+        assert!(matches!(
+            encode_serving_handoff_record(&wrong_executable),
+            Err(ServingHandoffCodecError::Invalid { .. })
+        ));
         let mut wrong_revision = ready.record().clone();
         wrong_revision.desired_revision = Revision::new(12).unwrap();
         assert!(matches!(
             encode_serving_handoff_record(&wrong_revision),
             Err(ServingHandoffCodecError::Invalid { .. })
         ));
+        let mut wrong_placement = ready.record().clone();
+        wrong_placement.placement_epoch = Epoch::new(4).unwrap();
+        assert!(matches!(
+            encode_serving_handoff_record(&wrong_placement),
+            Err(ServingHandoffCodecError::Invalid { .. })
+        ));
+        let mut wrong_spec = ready.record().clone();
+        wrong_spec.spec_digest = digest('0');
+        assert!(
+            validate_record_checkpoint_context(&wrong_spec, &fixture.stored_checkpoint).is_err()
+        );
         let mut wrong_cat = ready.record().clone();
         wrong_cat.cat_id = id("cat_foreign");
         assert!(matches!(
@@ -2158,6 +3278,14 @@ mod tests {
     fn digest(value: char) -> Sha256Digest {
         let digit = value.to_digit(16).unwrap_or(1) as u8;
         Sha256Digest::from_bytes([digit; 32])
+    }
+
+    fn swap_same_bytes(path: &Path, label: &str) {
+        let bytes = std::fs::read(path).unwrap();
+        let backup = path.with_extension(format!("{label}.old"));
+        std::fs::rename(path, backup).unwrap();
+        std::fs::write(path, bytes).unwrap();
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600)).unwrap();
     }
 
     fn blank_head() -> RemoteHead {
