@@ -1173,9 +1173,14 @@ bytes或cmdline而只保留旧digest，在Guest启动或回显前已经fail clos
 serial log及VMM log均为absolute HostPath；全部launch/artifact path不得alias任一prepared
 authority/control/data/frontend path、serving executable或checkpoint mount source/target，prepared identity paths
 彼此也必须唯一。不同volume只允许彼此共享同一只读Blockd executable，不能让该executable alias其他physical
-identity。launcher用
+identity。`vsock_socket_path`还不得包含Cloud Hypervisor composite参数的`,`分隔符，F0和fixed launcher
+builder都必须在创建任何RAM/log文件前拒绝。launcher用
 `O_CREAT|O_EXCL`/descriptor方式创建RAM和log；API/vsock只允许CH在已证明absent的locked managed namespace
-no-replace bind。任何路径都不得预先unlink、truncate或rename foreign entry。
+no-replace bind。RAM、serial log和VMM log属于同一exclusive-create batch：先保留全部canonical parent并证明
+leaf absent；三个leaf parent只能相同或互不为ancestor，嵌套parent在F0、builder和batch首次create前拒绝。每个
+`O_EXCL` create和定长后立即保存stable leaf metadata，全部创建完成后才冻结parent baseline并复核leaf snapshot；
+共享parent的已知兄弟create不能自拒绝，batch窗口内leaf ABA以及冻结后的foreign sibling或ancestor ABA仍须
+fail closed。任何路径都不得预先unlink、truncate或rename foreign entry。
 
 Guest CID是Node-global checkpoint reservation，合法范围`3..=4294967294`；`0..=2`为保留值，
 `4294967295`是`VMADDR_CID_ANY`，均不得持久。写`start_runtime` CAS前取得descriptor-relative、regular、
@@ -2777,10 +2782,10 @@ Rejoined；`host_destroyed`永不Rejoined，因此在没有tombstone、其他Hos
 | Running Desired launch binding | fixed chain的Desired target必须为Running且approved Guest profile与StartRuntime重算值相同；ProvisionRootImage/PrepareDevice/PrepareNetwork/StartRuntime全程保持同一revision/spec/Node/placement。same-revision Cold或任一字段/digest fork不能构造successor；superseded PrepareNetwork/StartRuntime无rebind authority并fail closed |
 | PrepareNetwork token/physical冲突 | network token与任一valid serving process/device token相同、same-name foreign/missing/corrupt token、duplicate tap、重叠IPv4或ABA都拒绝且零修改；logical Cat/network/MAC不能推导token/name |
 | PrepareNetwork create response loss | checkpoint accepted full absent后才create/adopt；EOF/timeout后只靠新的full inventory exact projection+provider proof结算。exact present被接受后的下一轮才CAS StartRuntime，不能一轮跨两个effect |
-| StartRuntime wire/fixed vector | 冻结launcher/VMM/kernel/initramfs path+positive length+SHA、exact cmdline/shape/digests、CID、全部paths/network/`PreparedDeviceInput`，并从kernel/initramfs/cmdline+protocol v1重算`guest_config_digest`。Root必须slot0且其余Persistent；logical ID/kind/lineage drift、旧slim device、CID ANY、mixed frontend、queue>vCPU、artifact缺失/零length、boot profile drift、token/path alias与非exact `cats-vmm-<inc>.service`均F0拒绝 |
+| StartRuntime wire/fixed vector | 冻结launcher/VMM/kernel/initramfs path+positive length+SHA、exact cmdline/shape/digests、CID、全部paths/network/`PreparedDeviceInput`，并从kernel/initramfs/cmdline+protocol v1重算`guest_config_digest`。Root必须slot0且其余Persistent；logical ID/kind/lineage drift、旧slim device、CID ANY、mixed frontend、queue>vCPU、artifact缺失/零length、boot profile drift、含`,`的vsock path、嵌套RAM/log parent、token/path alias与非exact `cats-vmm-<inc>.service`均F0拒绝 |
 | StartRuntime phase/Guest transport matrix | stable必须null、admission Closed、route gates empty；zero VMM只允许Unavailable，Malformed/VsockReady要求唯一exact VMM，Ready再精确匹配incarnation/CID/5000/v1。foreign/duplicate VMM或仅凭公共ProcessEvidence授权adopt都拒绝 |
 | Node-global Guest CID allocation | global flock内完整checkpoint/live-VMM scan；N个validated occupied只检查N+1个candidate且排除0..2/ANY。CAS轮只写reservation；duplicate/uncheckpointed live CID或scanner unavailable不启动VMM |
-| StartRuntime artifact/path replacement | checkpoint后替换任一installed byte/path、symlink/rename ABA、API/vsock/RAM/log预存在、launch path与blockd control/lineage/mount alias都零unlink/零truncate/零spawn并fail closed |
+| StartRuntime artifact/path replacement | RAM/serial/VMM-log同batch共享parent可成功冻结；checkpoint后替换任一installed byte/path、batch freeze前leaf ABA、symlink/rename ABA、freeze后foreign sibling ABA、API/vsock/RAM/log预存在、launch path与blockd control/lineage/mount alias都零unlink/零truncate/零spawn并fail closed |
 | StartRuntime create response loss | 新full inspection逐字段闭合unit/cgroup/MainPID/start/exe/argv/env/fds/API peer+handshake/network/devices/CID后才adopt；公共ProcessEvidence alone、basename或unit name不够。zero exact才重试同attempt；foreign/duplicate/late不stop、不覆盖、不启第二实例 |
 | StartRuntime cancel/late linearization | linearization前只清同attempt exclusive unpublished file；模糊或已linearize先fresh inspect。exact late旧incarnation不开route并由后继独立stop step处理；PID/start/socket/unit ABA使旧cleanup零signal/零unlink |
 | 新物理实例遇到旧token | 每个新create attempt使用新token；名称/path已有不同token时Quarantine，不覆写/adopt/删除 |

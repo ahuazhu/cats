@@ -3647,6 +3647,24 @@ fn start_runtime_closes_cid_artifact_shape_tokens_paths_and_devices() {
         MalformedProblem::InvalidValue,
     ));
 
+    let mut nested_launch_file_parents = start_runtime_checkpoint_value();
+    nested_launch_file_parents["step"]["memory_file_path"] = "/var/log/cats/memory.bin".into();
+    cases.push((
+        "nested_launch_file_parents",
+        nested_launch_file_parents,
+        "/step",
+        MalformedProblem::InvalidValue,
+    ));
+
+    let mut vsock_separator = start_runtime_checkpoint_value();
+    vsock_separator["step"]["vsock_socket_path"] = "/run/cats/cat_01/vmm,vsock.sock".into();
+    cases.push((
+        "vsock_cloud_hypervisor_separator",
+        vsock_separator,
+        "/step/vsock_socket_path",
+        MalformedProblem::InvalidValue,
+    ));
+
     let mut empty_devices = start_runtime_checkpoint_value();
     empty_devices["step"]["devices"] = serde_json::json!([]);
     empty_devices["volumes"] = serde_json::json!([]);

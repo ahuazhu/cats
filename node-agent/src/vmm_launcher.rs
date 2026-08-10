@@ -61,9 +61,9 @@ impl VmmLauncherPlan {
             api_socket_path,
             vsock_socket_path,
             guest_cid,
-            memory_file_path: _,
-            serial_log_path: _,
-            vmm_log_path: _,
+            memory_file_path,
+            serial_log_path,
+            vmm_log_path,
             network,
             devices,
             ..
@@ -86,6 +86,19 @@ impl VmmLauncherPlan {
         anyhow::ensure!(
             (3..=u32::MAX - 1).contains(guest_cid),
             "StartRuntime Guest CID is outside the allocatable range"
+        );
+        anyhow::ensure!(
+            !vsock_socket_path.as_str().contains(','),
+            "vsock socket path contains a Cloud Hypervisor separator"
+        );
+        let launch_file_paths = [
+            Path::new(memory_file_path.as_str()),
+            Path::new(serial_log_path.as_str()),
+            Path::new(vmm_log_path.as_str()),
+        ];
+        anyhow::ensure!(
+            launch_file_parents_are_equal_or_disjoint(&launch_file_paths),
+            "VMM launch file parents are nested"
         );
 
         let mut arguments = vec![
@@ -188,6 +201,25 @@ fn fixed_fd_path(fd: i32) -> OsString {
     OsString::from(format!("/proc/self/fd/{fd}"))
 }
 
+fn launch_file_parents_are_equal_or_disjoint(paths: &[&Path]) -> bool {
+    for (index, left) in paths.iter().enumerate() {
+        let Some(left_parent) = left.parent() else {
+            return false;
+        };
+        for right in &paths[index + 1..] {
+            let Some(right_parent) = right.parent() else {
+                return false;
+            };
+            if left_parent != right_parent
+                && (left_parent.starts_with(right_parent) || right_parent.starts_with(left_parent))
+            {
+                return false;
+            }
+        }
+    }
+    true
+}
+
 #[cfg(target_os = "linux")]
 mod linux {
     use std::collections::BTreeMap;
@@ -272,13 +304,11 @@ mod linux {
         api_parent.ensure_absent()?;
         let vsock_parent = CheckedParent::open(Path::new(vsock_socket_path.as_str()))?;
         vsock_parent.ensure_absent()?;
-        let memory = OwnedLaunchFile::create(Path::new(memory_file_path.as_str()))?;
-        memory
-            .file
-            .set_len(*memory_bytes)
-            .context("size exclusive Guest memory file")?;
-        let serial_log = OwnedLaunchFile::create(Path::new(serial_log_path.as_str()))?;
-        let vmm_log = OwnedLaunchFile::create(Path::new(vmm_log_path.as_str()))?;
+        let [memory, serial_log, vmm_log] = OwnedLaunchFile::create_batch([
+            (Path::new(memory_file_path.as_str()), *memory_bytes),
+            (Path::new(serial_log_path.as_str()), 0),
+            (Path::new(vmm_log_path.as_str()), 0),
+        ])?;
 
         // Close replacement and late-socket windows after all exclusive files
         // exist but before the process boundary linearizes at exec.
@@ -614,6 +644,16 @@ mod linux {
             Ok(current)
         }
 
+        fn freeze_after_batch(&self) -> Result<Self> {
+            let current = Self::open(&self.path)?;
+            anyhow::ensure!(
+                self.directories
+                    .retained_matches_after_batch(&current.directories)?,
+                "launch resource ancestor changed while its file batch was created"
+            );
+            Ok(current)
+        }
+
         fn assert_current_and_absent(&self) -> Result<()> {
             let current = self.assert_current()?;
             self.ensure_absent()?;
@@ -629,55 +669,113 @@ mod linux {
     }
 
     impl OwnedLaunchFile {
+        #[cfg(test)]
         fn create(path: &Path) -> Result<Self> {
-            let parent = CheckedParent::open(path)?;
-            parent.ensure_absent()?;
-            // SAFETY: `parent` is a retained directory descriptor and
-            // `basename` is NUL-free. O_EXCL/O_NOFOLLOW prevent replacement or
-            // symlink adoption at the leaf.
-            let fd = unsafe {
-                libc::openat(
-                    parent.descriptor().as_raw_fd(),
-                    parent.basename.as_ptr(),
-                    libc::O_RDWR
-                        | libc::O_CREAT
-                        | libc::O_EXCL
-                        | libc::O_NOFOLLOW
-                        | libc::O_CLOEXEC,
-                    0o600,
-                )
-            };
-            if fd < 0 {
-                return Err(io::Error::last_os_error()).context("create exclusive VMM launch file");
+            let [owned] = Self::create_batch([(path, 0)])?;
+            Ok(owned)
+        }
+
+        fn create_batch<const N: usize>(requests: [(&Path, u64); N]) -> Result<[Self; N]> {
+            Self::create_batch_inner(requests, || Ok(()))
+        }
+
+        #[cfg(test)]
+        fn create_batch_with_before_freeze<const N: usize>(
+            requests: [(&Path, u64); N],
+            before_freeze: impl FnOnce() -> Result<()>,
+        ) -> Result<[Self; N]> {
+            Self::create_batch_inner(requests, before_freeze)
+        }
+
+        fn create_batch_inner<const N: usize>(
+            requests: [(&Path, u64); N],
+            before_freeze: impl FnOnce() -> Result<()>,
+        ) -> Result<[Self; N]> {
+            for (index, (path, _)) in requests.iter().enumerate() {
+                anyhow::ensure!(
+                    !requests[..index]
+                        .iter()
+                        .any(|(other_path, _)| other_path == path),
+                    "VMM launch file batch contains a duplicate path"
+                );
             }
-            // SAFETY: successful openat returned one newly-owned descriptor.
-            let file = unsafe { File::from_raw_fd(fd) };
-            let metadata = file.metadata().context("stat exclusive VMM launch file")?;
-            anyhow::ensure!(metadata.file_type().is_file(), "launch file is not regular");
-            anyhow::ensure!(metadata.nlink() == 1, "launch file is not single-link");
+            let request_paths = requests.iter().map(|(path, _)| *path).collect::<Vec<_>>();
             anyhow::ensure!(
-                metadata.mode() & 0o7777 == 0o600,
-                "launch file mode changed"
+                super::launch_file_parents_are_equal_or_disjoint(&request_paths),
+                "VMM launch file parents are nested"
             );
-            let current_parent = CheckedParent::open(path)?;
-            anyhow::ensure!(
-                parent
-                    .directories
-                    .retained_matches_after_leaf_creation(&current_parent.directories)?,
-                "launch resource ancestor changed while its leaf was created"
-            );
-            let current_path = stat_at(current_parent.descriptor(), &current_parent.basename)
-                .context("reopen newly-created VMM launch file")?;
-            anyhow::ensure!(
-                same_stable_file(&metadata, &current_path),
-                "new VMM launch file pathname is not exact"
-            );
-            Ok(Self {
-                parent: current_parent,
-                file,
-                device: metadata.dev(),
-                inode: metadata.ino(),
-            })
+
+            // Resolve every canonical parent and prove every leaf absent before
+            // the first no-replace create. The batch's own sibling creates may
+            // then update a shared parent, so all parent baselines are frozen
+            // only after the complete known set exists.
+            let mut prepared = Vec::with_capacity(N);
+            for (path, expected_length) in requests {
+                let parent = CheckedParent::open(path)?;
+                parent.ensure_absent()?;
+                prepared.push((parent, expected_length));
+            }
+            let mut created = Vec::with_capacity(N);
+            for (parent, expected_length) in prepared {
+                // SAFETY: `parent` is a retained directory descriptor and
+                // `basename` is NUL-free. O_EXCL/O_NOFOLLOW prevent replacement
+                // or symlink adoption at the leaf.
+                let fd = unsafe {
+                    libc::openat(
+                        parent.descriptor().as_raw_fd(),
+                        parent.basename.as_ptr(),
+                        libc::O_RDWR
+                            | libc::O_CREAT
+                            | libc::O_EXCL
+                            | libc::O_NOFOLLOW
+                            | libc::O_CLOEXEC,
+                        0o600,
+                    )
+                };
+                if fd < 0 {
+                    return Err(io::Error::last_os_error())
+                        .context("create exclusive VMM launch file");
+                }
+                // SAFETY: successful openat returned one newly-owned descriptor.
+                let file = unsafe { File::from_raw_fd(fd) };
+                file.set_len(expected_length)
+                    .context("size exclusive VMM launch file")?;
+                let baseline = file.metadata().context("stat exclusive VMM launch file")?;
+                ensure_owned_launch_file(&baseline, expected_length)?;
+                created.push((parent, file, baseline, expected_length));
+            }
+            before_freeze()?;
+
+            let mut owned = Vec::with_capacity(N);
+            for (parent, file, baseline, expected_length) in created {
+                let current_parent = parent.freeze_after_batch()?;
+                let retained_path = stat_at(parent.descriptor(), &parent.basename)
+                    .context("reinspect newly-created VMM launch file")?;
+                let current_path = stat_at(current_parent.descriptor(), &current_parent.basename)
+                    .context("reopen newly-created VMM launch file")?;
+                let after = file
+                    .metadata()
+                    .context("re-stat exclusive VMM launch file")?;
+                anyhow::ensure!(
+                    same_stable_file(&baseline, &after)
+                        && same_stable_file(&baseline, &retained_path)
+                        && same_stable_file(&baseline, &current_path),
+                    "new VMM launch file pathname or contents changed"
+                );
+                owned.push(Self {
+                    parent: current_parent,
+                    file,
+                    device: baseline.dev(),
+                    inode: baseline.ino(),
+                });
+            }
+
+            for (file, (_, expected_length)) in owned.iter().zip(requests.iter()) {
+                file.assert_current(*expected_length)?;
+            }
+            owned
+                .try_into()
+                .map_err(|_| anyhow::anyhow!("VMM launch file batch length changed"))
         }
 
         fn assert_current(&self, expected_length: u64) -> Result<()> {
@@ -799,7 +897,7 @@ mod linux {
             Ok(true)
         }
 
-        fn retained_matches_after_leaf_creation(&self, current: &Self) -> Result<bool> {
+        fn retained_matches_after_batch(&self, current: &Self) -> Result<bool> {
             if self.directories.len() != current.directories.len() {
                 return Ok(false);
             }
@@ -813,7 +911,7 @@ mod linux {
                 let retained_metadata = retained
                     .descriptor
                     .metadata()
-                    .context("reinspect launch ancestor after leaf creation")?;
+                    .context("reinspect launch ancestor after file batch")?;
                 ensure_safe_directory(&retained_metadata)?;
                 let retained_current = DirectoryIdentity::from(&retained_metadata);
                 if index == last {
@@ -1038,6 +1136,101 @@ mod linux {
 
             assert!(owned.assert_current(0).is_err());
         }
+
+        #[test]
+        fn launch_file_batch_freezes_one_shared_parent_after_all_owned_creates() {
+            if !running_as_root() {
+                return;
+            }
+            let (root, path) = launch_path();
+            let parent = path.parent().unwrap();
+            let memory_path = parent.join("memory.bin");
+            let serial_log_path = parent.join("serial.log");
+            let vmm_log_path = parent.join("vmm.log");
+            let [memory, serial_log, vmm_log] = OwnedLaunchFile::create_batch([
+                (memory_path.as_path(), 4096),
+                (serial_log_path.as_path(), 0),
+                (vmm_log_path.as_path(), 0),
+            ])
+            .unwrap();
+
+            memory.assert_current(4096).unwrap();
+            serial_log.assert_current(0).unwrap();
+            vmm_log.assert_current(0).unwrap();
+
+            let foreign_sibling = parent.join("foreign");
+            std::fs::write(&foreign_sibling, b"changed").unwrap();
+            std::fs::remove_file(&foreign_sibling).unwrap();
+            assert!(memory.assert_current(4096).is_err());
+            assert!(serial_log.assert_current(0).is_err());
+            assert!(vmm_log.assert_current(0).is_err());
+            drop(root);
+        }
+
+        #[test]
+        fn launch_file_batch_rejects_nested_parents_before_any_create() {
+            if !running_as_root() {
+                return;
+            }
+            let (root, path) = launch_path();
+            let runtime_parent = path.parent().unwrap();
+            let cat_parent = runtime_parent.parent().unwrap();
+            let memory_path = cat_parent.join("memory.bin");
+            let serial_log_path = runtime_parent.join("serial.log");
+            let vmm_log_path = runtime_parent.join("vmm.log");
+
+            let error = OwnedLaunchFile::create_batch([
+                (memory_path.as_path(), 4096),
+                (serial_log_path.as_path(), 0),
+                (vmm_log_path.as_path(), 0),
+            ])
+            .err()
+            .expect("nested launch parents must fail before create");
+            assert!(error.to_string().contains("parents are nested"));
+            assert!(!memory_path.exists());
+            assert!(!serial_log_path.exists());
+            assert!(!vmm_log_path.exists());
+            drop(root);
+        }
+
+        #[test]
+        fn launch_file_batch_rejects_leaf_aba_before_parent_freeze() {
+            if !running_as_root() {
+                return;
+            }
+            let (_root, path) = launch_path();
+            let parent = path.parent().unwrap();
+            let memory_path = parent.join("memory.bin");
+            let moved_memory_path = parent.join("memory.moved");
+            let serial_log_path = parent.join("serial.log");
+            let vmm_log_path = parent.join("vmm.log");
+            let error = OwnedLaunchFile::create_batch_with_before_freeze(
+                [
+                    (memory_path.as_path(), 4096),
+                    (serial_log_path.as_path(), 0),
+                    (vmm_log_path.as_path(), 0),
+                ],
+                || {
+                    std::thread::sleep(std::time::Duration::from_millis(2));
+                    std::fs::rename(&memory_path, &moved_memory_path)?;
+                    let mut moved = std::fs::OpenOptions::new()
+                        .write(true)
+                        .open(&moved_memory_path)?;
+                    moved.write_all(b"foreign")?;
+                    moved.sync_all()?;
+                    std::fs::rename(&moved_memory_path, &memory_path)?;
+                    Ok(())
+                },
+            )
+            .err()
+            .expect("leaf ABA before parent freeze must fail");
+
+            assert!(error.to_string().contains("pathname or contents changed"));
+            assert!(memory_path.exists());
+            assert!(serial_log_path.exists());
+            assert!(vmm_log_path.exists());
+            assert!(!moved_memory_path.exists());
+        }
     }
 }
 
@@ -1144,5 +1337,44 @@ mod tests {
         assert!(arguments
             .windows(2)
             .any(|pair| pair == ["--disk", "path=/dev/nbd7,image_type=raw,direct=on"]));
+    }
+
+    #[test]
+    fn vsock_paths_with_a_cloud_hypervisor_separator_are_rejected() {
+        let mut checkpoint = start_runtime();
+        let ReconcileStep::StartRuntime {
+            vsock_socket_path, ..
+        } = &mut checkpoint.step
+        else {
+            unreachable!()
+        };
+        *vsock_socket_path = cats_api::runtime_reconciliation::HostPath::new(
+            "/run/cats/cat_01/vmm,vsock.sock".to_owned(),
+        )
+        .unwrap();
+
+        let error = VmmLauncherPlan::from_checkpoint(checkpoint).unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("vsock socket path contains a Cloud Hypervisor separator"));
+    }
+
+    #[test]
+    fn nested_launch_file_parents_are_rejected_by_the_builder() {
+        let mut checkpoint = start_runtime();
+        let ReconcileStep::StartRuntime {
+            memory_file_path, ..
+        } = &mut checkpoint.step
+        else {
+            unreachable!()
+        };
+        *memory_file_path =
+            cats_api::runtime_reconciliation::HostPath::new("/var/log/cats/memory.bin".to_owned())
+                .unwrap();
+
+        let error = VmmLauncherPlan::from_checkpoint(checkpoint).unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("VMM launch file parents are nested"));
     }
 }

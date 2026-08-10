@@ -1,5 +1,6 @@
 use std::cmp::Ordering;
 use std::collections::{BTreeMap, BTreeSet};
+use std::path::Path;
 use std::sync::LazyLock;
 
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
@@ -41,6 +42,25 @@ pub const RUNTIME_PROVISIONER_TRUST_BUNDLE_MAX_WIRE_BYTES: usize = 16_384;
 pub const RUNTIME_PROVISIONER_ACTIVE_SET_MAX_WIRE_BYTES: usize = 16_384;
 
 const MEBIBYTE: u64 = 1_048_576;
+
+fn launch_file_parents_are_equal_or_disjoint(paths: &[&HostPath]) -> bool {
+    for (index, left) in paths.iter().enumerate() {
+        let Some(left_parent) = Path::new(left.as_str()).parent() else {
+            return false;
+        };
+        for right in &paths[index + 1..] {
+            let Some(right_parent) = Path::new(right.as_str()).parent() else {
+                return false;
+            };
+            if left_parent != right_parent
+                && (left_parent.starts_with(right_parent) || right_parent.starts_with(left_parent))
+            {
+                return false;
+            }
+        }
+    }
+    true
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum PathSegment {
@@ -8635,6 +8655,20 @@ fn collect_reconcile_step_cross(
                     "memory_bytes",
                     MalformedProblem::InvalidValue,
                 ));
+            }
+            if vsock_socket_path.as_str().contains(',') {
+                output.push(Candidate::field(
+                    path,
+                    "vsock_socket_path",
+                    MalformedProblem::InvalidValue,
+                ));
+            }
+            if !launch_file_parents_are_equal_or_disjoint(&[
+                memory_file_path,
+                serial_log_path,
+                vmm_log_path,
+            ]) {
+                output.push(Candidate::at(path, MalformedProblem::InvalidValue));
             }
 
             let profile = GuestRuntimeProfileReceipt {
