@@ -656,9 +656,10 @@ socket，两者服务同一个 engine 与同一个 attachment lease。
   generations/bytes/oldest age、max staged/local bytes、allocated/accounted
   bytes、eviction、backpressure、fenced、last publish error以及精确attachment lineage。由signed
   Runtime启动的target模式还必须回显engine实际immutable `size_bytes`、checkpointed `scope_id`、
-  `process_identity_token`、`control_only`和Guest-I/O gate；任一字段缺失都只表示legacy/unproven，不能
-  adopt。scope回显不是systemd authority：Node仍须把它与unit的exact PID/start ticks/cgroup membership
-  和同一PID持有的control socket逐项交叉验证。
+  `process_identity_token`、`control_only`、Guest-I/O gate以及完整authoritative `RemoteHead`；只有
+  generation而没有root hash/object ID不能证明checkpoint指定的image target。任一字段缺失都只表示
+  legacy/unproven，不能adopt。scope回显不是systemd authority：Node仍须把它与unit的exact PID/start
+  ticks/cgroup membership和同一PID持有的control socket逐项交叉验证。
 - `drain`只在`R == L`后成功；它不释放lease。Node停止blockd后调用MetadataStore的幂等release。
   任一步失败必须可重试，不能清理journal。
 - blockd不执行volume delete。disposable Root必须先停止blockd，再由Node消费
