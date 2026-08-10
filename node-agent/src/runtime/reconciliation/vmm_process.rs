@@ -292,7 +292,7 @@ impl SystemdVmmOpenFiles {
             checkpoint: checkpointed.checkpoint_descriptor().as_raw_fd(),
             vmm: artifacts.vmm_executable().as_raw_fd(),
             kernel: artifacts.kernel().as_raw_fd(),
-            initramfs: artifacts.initramfs().map(AsRawFd::as_raw_fd),
+            initramfs: artifacts.initramfs().map(|file| file.as_raw_fd()),
         }
     }
 
