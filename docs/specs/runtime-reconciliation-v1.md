@@ -959,7 +959,11 @@ Node-global systemd/process/socket复验，并把provider-private stop receipt�
 fsync持久化。receipt只保存两份content digest及必要typed identity，不复制大checkpoint；它还绑定exact
 PID/MainPID/start ticks、executable、unit/scope/cgroup唯一PID、process token、handshake peer、control socket
 path的device/inode/type/uid/gid/mode/nlink，以及session/inventory epoch、digest和read position。receipt durable
-后才允许对该PID/start incarnation提交TERM/KILL并等待其消失；不得按unit名、basename或当前Desired枚举停止。
+后才允许在Linux以`pidfd_open`固定该PID incarnation，随后重验`/proc` start ticks与executable；TERM、必要的
+KILL及exit poll都只走同一pidfd。pidfd不支持或任何重验漂移都fail closed且零signal，不得按unit名、bare PID、
+basename或当前Desired枚举停止。该transient service必须以`systemd-run --collect`创建并在inspection中精确绑定
+`CollectMode=inactive-or-failed`；即使进程忽略TERM并由pidfd KILL，unit也必须最终成为`LoadState=not-found`，不能
+让failed unit永久阻塞fresh global absence。
 
 信号响应丢失或Agent restart后必须重放同一receipt。serialized pre-scan先重验旧checkpoint/authorized digests
 和current authority；合法续租可以只推进`lease_expires_at`，owner/epoch/head/transition marker等任何漂移都零

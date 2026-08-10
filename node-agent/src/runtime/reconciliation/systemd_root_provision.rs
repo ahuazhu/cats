@@ -21,7 +21,10 @@ use cats_api::blockd::BlockdControlResponse;
 use cats_api::blockd::DurabilityStatus;
 use cats_api::runtime_reconciliation::{Durability, HostPath, Id, RandomId128, WireU64};
 
-use crate::proc::{ProcHandle, ProcIdentity};
+#[cfg(all(test, target_os = "linux"))]
+use crate::proc::ProcHandle;
+#[cfg(target_os = "linux")]
+use crate::proc::{ExactPidFd, ExactPidFdOpen, PidFdSignal, ProcIdentity};
 use crate::runtime_spine::{RuntimeDesiredEffectContext, RuntimePhysicalReadContext};
 
 use super::authorized_blockd::AuthorizedBlockdLaunchConfig;
@@ -42,6 +45,7 @@ const ROOT_PROVISION_KILL_MODE: &str = "control-group";
 const ROOT_PROVISION_RESTART: &str = "no";
 const ROOT_PROVISION_UMASK: &str = "0077";
 const ROOT_PROVISION_TIMEOUT_STOP_USEC: &str = "2s";
+const ROOT_PROVISION_COLLECT_MODE: &str = "inactive-or-failed";
 const AUTHORIZED_CONTROL_SPEC: &str = "authorized-serving.json";
 const STATUS_MAX_BYTES: usize = 64 * 1024;
 const COMMAND_OUTPUT_MAX_BYTES: usize = 32 * 1024;
@@ -658,12 +662,25 @@ fn platform_submit_systemd(
     context: &RuntimeDesiredEffectContext,
 ) -> anyhow::Result<SystemdStartSubmission> {
     validate_launch(launch)?;
+    let command = systemd_run_command(launch);
+    match run_bounded(command, context)? {
+        BoundedCommandResult::Exited(output) if output.status.success() => {
+            Ok(SystemdStartSubmission::Submitted)
+        }
+        BoundedCommandResult::Exited(_) => Ok(SystemdStartSubmission::OutcomeUnknown),
+        BoundedCommandResult::Cancelled => Ok(SystemdStartSubmission::OutcomeUnknown),
+    }
+}
+
+#[cfg(any(target_os = "linux", test))]
+fn systemd_run_command(launch: &TransientServiceLaunch) -> Command {
     let mut command = Command::new(SYSTEMD_RUN);
     sanitized_systemd_command(&mut command);
     command
         .arg("--system")
         .arg("--quiet")
         .arg("--no-ask-password")
+        .arg("--collect")
         .arg(format!("--unit={}", launch.unit_id))
         .arg("--service-type=exec")
         .arg(format!("--slice={SYSTEM_SLICE}"))
@@ -682,15 +699,10 @@ fn platform_submit_systemd(
         .arg("--")
         .arg(&launch.executable)
         .args(&launch.arguments);
-    match run_bounded(command, context)? {
-        BoundedCommandResult::Exited(output) if output.status.success() => {
-            Ok(SystemdStartSubmission::Submitted)
-        }
-        BoundedCommandResult::Exited(_) => Ok(SystemdStartSubmission::OutcomeUnknown),
-        BoundedCommandResult::Cancelled => Ok(SystemdStartSubmission::OutcomeUnknown),
-    }
+    command
 }
 
+#[cfg(target_os = "linux")]
 fn platform_stop_exact_process(
     launch: &TransientServiceLaunch,
     evidence: &RootProvisionProcessEvidence,
@@ -712,15 +724,15 @@ fn platform_stop_exact_process(
         start_ticks: Some(evidence.process_start_time_ticks.get()),
         exe: Some(launch.executable.clone()),
     };
-    if ProcIdentity::sample(evidence.process_id) != expected_identity {
-        return Ok(SystemdStopSubmission::Conflict);
-    }
-    let mut process = ProcHandle::Adopted {
-        pid: evidence.process_id,
-        start_ticks: expected_identity.start_ticks,
+    let process = match ExactPidFd::open_exact(&expected_identity)? {
+        ExactPidFdOpen::Exact(process) => process,
+        ExactPidFdOpen::Absent => return Ok(SystemdStopSubmission::AlreadyAbsent),
+        ExactPidFdOpen::IdentityMismatch => return Ok(SystemdStopSubmission::Conflict),
+        ExactPidFdOpen::Unsupported => return Ok(SystemdStopSubmission::Unavailable),
     };
-    if !process.signal_if_same(libc::SIGTERM)? {
-        return Ok(SystemdStopSubmission::Conflict);
+    match process.signal(libc::SIGTERM)? {
+        PidFdSignal::Submitted | PidFdSignal::AlreadyExited => {}
+        PidFdSignal::Unsupported => return Ok(SystemdStopSubmission::Unavailable),
     }
 
     let graceful_deadline = (Instant::now() + Duration::from_secs(2)).min(context.deadline());
@@ -736,8 +748,9 @@ fn platform_stop_exact_process(
         }
         std::thread::sleep(POLL_INTERVAL);
     }
-    if !process.signal_if_same(libc::SIGKILL)? {
-        return Ok(SystemdStopSubmission::Submitted);
+    match process.signal(libc::SIGKILL)? {
+        PidFdSignal::Submitted | PidFdSignal::AlreadyExited => {}
+        PidFdSignal::Unsupported => return Ok(SystemdStopSubmission::Unavailable),
     }
     loop {
         if process.exited()?
@@ -748,6 +761,15 @@ fn platform_stop_exact_process(
         }
         std::thread::sleep(POLL_INTERVAL);
     }
+}
+
+#[cfg(not(target_os = "linux"))]
+fn platform_stop_exact_process(
+    _launch: &TransientServiceLaunch,
+    _evidence: &RootProvisionProcessEvidence,
+    _context: &RuntimeDesiredEffectContext,
+) -> anyhow::Result<SystemdStopSubmission> {
+    Ok(SystemdStopSubmission::Unavailable)
 }
 
 #[cfg(not(target_os = "linux"))]
@@ -947,6 +969,7 @@ struct SystemdUnitProperties {
     restart: String,
     umask: String,
     timeout_stop_usec: String,
+    collect_mode: String,
 }
 
 impl SystemdUnitProperties {
@@ -992,6 +1015,7 @@ impl SystemdUnitProperties {
             && self.restart == ROOT_PROVISION_RESTART
             && self.umask == ROOT_PROVISION_UMASK
             && self.timeout_stop_usec == ROOT_PROVISION_TIMEOUT_STOP_USEC
+            && self.collect_mode == ROOT_PROVISION_COLLECT_MODE
     }
 }
 
@@ -1024,6 +1048,7 @@ fn systemd_unit_properties(
         "Restart",
         "UMask",
         "TimeoutStopUSec",
+        "CollectMode",
     ] {
         command.arg(format!("--property={property}"));
     }
@@ -1049,7 +1074,7 @@ fn parse_systemd_properties(bytes: &[u8]) -> anyhow::Result<SystemdUnitPropertie
         );
     }
     anyhow::ensure!(
-        values.len() == 15,
+        values.len() == 16,
         "systemctl show omitted a fixed property"
     );
     let take = |values: &mut BTreeMap<&str, String>, key| {
@@ -1076,6 +1101,7 @@ fn parse_systemd_properties(bytes: &[u8]) -> anyhow::Result<SystemdUnitPropertie
         restart: take(&mut values, "Restart")?,
         umask: take(&mut values, "UMask")?,
         timeout_stop_usec: take(&mut values, "TimeoutStopUSec")?,
+        collect_mode: take(&mut values, "CollectMode")?,
     })
 }
 
@@ -1669,7 +1695,7 @@ mod tests {
     #[test]
     fn platform_exact_stop_signals_only_the_recorded_child_and_both_children_are_reaped() {
         let executable = std::fs::canonicalize("/bin/sleep").unwrap();
-        let (target, target_wait) = spawn_reaping_sleep(&executable);
+        let (target, target_wait) = spawn_reaping_term_ignoring_sleep(&executable);
         let (foreign, foreign_wait) = spawn_reaping_sleep(&executable);
         let mut launch = build_launch(&config(), &expectation()).unwrap();
         launch.executable = executable.clone();
@@ -1681,9 +1707,15 @@ mod tests {
         exact.cgroup_process_ids = vec![target.pid];
         exact.handshake.peer_process_id = target.pid;
 
+        let before_stop = Instant::now();
         assert_eq!(
-            platform_stop_exact_process(&launch, &exact, &context()).unwrap(),
+            platform_stop_exact_process(&launch, &exact, &context_for(Duration::from_secs(5)))
+                .unwrap(),
             SystemdStopSubmission::Submitted
+        );
+        assert!(
+            before_stop.elapsed() >= Duration::from_secs(2),
+            "positive calibration: the child ignored TERM and required pidfd SIGKILL"
         );
         let target_status = target_wait.join().unwrap();
         assert!(!target_status.success());
@@ -1748,6 +1780,50 @@ mod tests {
             .stderr(Stdio::null())
             .spawn()
             .unwrap();
+        let identity = ProcIdentity::sample(child.id());
+        assert!(identity.start_ticks.is_some() && identity.exe.as_deref() == Some(executable));
+        let waiter = std::thread::spawn(move || {
+            let cleanup_deadline = Instant::now() + Duration::from_secs(10);
+            loop {
+                if let Some(status) = child.try_wait().unwrap() {
+                    return status;
+                }
+                if Instant::now() >= cleanup_deadline {
+                    child.kill().unwrap();
+                    return child.wait().unwrap();
+                }
+                std::thread::sleep(POLL_INTERVAL);
+            }
+        });
+        (identity, waiter)
+    }
+
+    #[cfg(target_os = "linux")]
+    fn spawn_reaping_term_ignoring_sleep(
+        executable: &Path,
+    ) -> (
+        ProcIdentity,
+        std::thread::JoinHandle<std::process::ExitStatus>,
+    ) {
+        use std::os::unix::process::CommandExt as _;
+
+        let mut command = Command::new(executable);
+        command
+            .arg("60")
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
+        // SAFETY: the callback uses only async-signal-safe `signal(2)` and
+        // returns immediately. It touches no shared Rust state after fork.
+        unsafe {
+            command.pre_exec(|| {
+                if libc::signal(libc::SIGTERM, libc::SIG_IGN) == libc::SIG_ERR {
+                    return Err(std::io::Error::last_os_error());
+                }
+                Ok(())
+            });
+        }
+        let mut child = command.spawn().unwrap();
         let identity = ProcIdentity::sample(child.id());
         assert!(identity.start_ticks.is_some() && identity.exe.as_deref() == Some(executable));
         let waiter = std::thread::spawn(move || {
@@ -1840,25 +1916,37 @@ mod tests {
         }));
         assert_eq!(SYSTEMD_RUN, "/usr/bin/systemd-run");
         assert_eq!(SYSTEMCTL, "/usr/bin/systemctl");
+        let systemd_arguments = systemd_run_command(&launch)
+            .get_args()
+            .map(|argument| argument.to_owned())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            systemd_arguments
+                .iter()
+                .filter(|argument| argument.as_os_str() == std::ffi::OsStr::new("--collect"))
+                .count(),
+            1,
+            "transient services must be collected after their exact process exits"
+        );
     }
 
     #[test]
     fn fixed_systemctl_properties_distinguish_absent_and_exact_running_unit() {
         let absent = parse_systemd_properties(
-            b"Id=cats-root.service\nLoadState=not-found\nActiveState=inactive\nSubState=dead\nMainPID=0\nControlGroup=\nExecStart=\nEnvironment=\nEnvironmentFiles=\nPassEnvironment=\nUnsetEnvironment=\nKillMode=control-group\nRestart=no\nUMask=0022\nTimeoutStopUSec=1min 30s\n",
+            b"Id=cats-root.service\nLoadState=not-found\nActiveState=inactive\nSubState=dead\nMainPID=0\nControlGroup=\nExecStart=\nEnvironment=\nEnvironmentFiles=\nPassEnvironment=\nUnsetEnvironment=\nKillMode=control-group\nRestart=no\nUMask=0022\nTimeoutStopUSec=1min 30s\nCollectMode=inactive\n",
         )
         .unwrap();
         assert!(absent.proves_absent(&id("cats-root.service")));
 
         let launch = build_launch(&config(), &expectation()).unwrap();
         let running = parse_systemd_properties(
-            b"Id=cats-root.service\nLoadState=loaded\nActiveState=active\nSubState=running\nMainPID=4242\nControlGroup=/system.slice/cats-root.service\nExecStart={ path=/usr/bin/cats-blockd ; argv[]=/usr/bin/cats-blockd --process-identity-token 44444444444444444444444444444444 ; }\nEnvironment=\nEnvironmentFiles=\nPassEnvironment=\nUnsetEnvironment=AWS_ACCESS_KEY_ID AWS_SECRET_ACCESS_KEY AWS_SESSION_TOKEN AWS_CONTAINER_CREDENTIALS_FULL_URI AWS_CONTAINER_AUTHORIZATION_TOKEN_FILE CATS_POSTGRES_URL\nKillMode=control-group\nRestart=no\nUMask=0077\nTimeoutStopUSec=2s\n",
+            b"Id=cats-root.service\nLoadState=loaded\nActiveState=active\nSubState=running\nMainPID=4242\nControlGroup=/system.slice/cats-root.service\nExecStart={ path=/usr/bin/cats-blockd ; argv[]=/usr/bin/cats-blockd --process-identity-token 44444444444444444444444444444444 ; }\nEnvironment=\nEnvironmentFiles=\nPassEnvironment=\nUnsetEnvironment=AWS_ACCESS_KEY_ID AWS_SECRET_ACCESS_KEY AWS_SESSION_TOKEN AWS_CONTAINER_CREDENTIALS_FULL_URI AWS_CONTAINER_AUTHORIZATION_TOKEN_FILE CATS_POSTGRES_URL\nKillMode=control-group\nRestart=no\nUMask=0077\nTimeoutStopUSec=2s\nCollectMode=inactive-or-failed\n",
         )
         .unwrap();
         assert!(running.is_running(&launch));
 
         let wrong_token = parse_systemd_properties(
-            b"Id=cats-root.service\nLoadState=loaded\nActiveState=active\nSubState=running\nMainPID=4242\nControlGroup=/system.slice/cats-root.service\nExecStart={ path=/usr/bin/cats-blockd ; argv[]=/usr/bin/cats-blockd --process-identity-token 55555555555555555555555555555555 ; }\nEnvironment=\nEnvironmentFiles=\nPassEnvironment=\nUnsetEnvironment=AWS_ACCESS_KEY_ID AWS_SECRET_ACCESS_KEY AWS_SESSION_TOKEN AWS_CONTAINER_CREDENTIALS_FULL_URI AWS_CONTAINER_AUTHORIZATION_TOKEN_FILE CATS_POSTGRES_URL\nKillMode=control-group\nRestart=no\nUMask=0077\nTimeoutStopUSec=2s\n",
+            b"Id=cats-root.service\nLoadState=loaded\nActiveState=active\nSubState=running\nMainPID=4242\nControlGroup=/system.slice/cats-root.service\nExecStart={ path=/usr/bin/cats-blockd ; argv[]=/usr/bin/cats-blockd --process-identity-token 55555555555555555555555555555555 ; }\nEnvironment=\nEnvironmentFiles=\nPassEnvironment=\nUnsetEnvironment=AWS_ACCESS_KEY_ID AWS_SECRET_ACCESS_KEY AWS_SESSION_TOKEN AWS_CONTAINER_CREDENTIALS_FULL_URI AWS_CONTAINER_AUTHORIZATION_TOKEN_FILE CATS_POSTGRES_URL\nKillMode=control-group\nRestart=no\nUMask=0077\nTimeoutStopUSec=2s\nCollectMode=inactive-or-failed\n",
         )
         .unwrap();
         assert!(!wrong_token.is_running(&launch));
@@ -1868,9 +1956,10 @@ mod tests {
             ("Restart", "on-failure"),
             ("UMask", "0022"),
             ("TimeoutStopUSec", "3s"),
+            ("CollectMode", "inactive"),
         ] {
             let wire = String::from_utf8(
-                b"Id=cats-root.service\nLoadState=loaded\nActiveState=active\nSubState=running\nMainPID=4242\nControlGroup=/system.slice/cats-root.service\nExecStart={ path=/usr/bin/cats-blockd ; argv[]=/usr/bin/cats-blockd --process-identity-token 44444444444444444444444444444444 ; }\nEnvironment=\nEnvironmentFiles=\nPassEnvironment=\nUnsetEnvironment=AWS_ACCESS_KEY_ID AWS_SECRET_ACCESS_KEY AWS_SESSION_TOKEN AWS_CONTAINER_CREDENTIALS_FULL_URI AWS_CONTAINER_AUTHORIZATION_TOKEN_FILE CATS_POSTGRES_URL\nKillMode=control-group\nRestart=no\nUMask=0077\nTimeoutStopUSec=2s\n"
+                b"Id=cats-root.service\nLoadState=loaded\nActiveState=active\nSubState=running\nMainPID=4242\nControlGroup=/system.slice/cats-root.service\nExecStart={ path=/usr/bin/cats-blockd ; argv[]=/usr/bin/cats-blockd --process-identity-token 44444444444444444444444444444444 ; }\nEnvironment=\nEnvironmentFiles=\nPassEnvironment=\nUnsetEnvironment=AWS_ACCESS_KEY_ID AWS_SECRET_ACCESS_KEY AWS_SESSION_TOKEN AWS_CONTAINER_CREDENTIALS_FULL_URI AWS_CONTAINER_AUTHORIZATION_TOKEN_FILE CATS_POSTGRES_URL\nKillMode=control-group\nRestart=no\nUMask=0077\nTimeoutStopUSec=2s\nCollectMode=inactive-or-failed\n"
                     .to_vec(),
             )
             .unwrap()
@@ -1880,6 +1969,7 @@ mod tests {
                     "Restart" => "no",
                     "UMask" => "0077",
                     "TimeoutStopUSec" => "2s",
+                    "CollectMode" => "inactive-or-failed",
                     _ => unreachable!(),
                 }),
                 &format!("{property}={wrong}"),
@@ -1902,7 +1992,7 @@ mod tests {
         ] {
             let mut wire = bytes.to_vec();
             wire.extend_from_slice(
-                b"KillMode=control-group\nRestart=no\nUMask=0077\nTimeoutStopUSec=2s\n",
+                b"KillMode=control-group\nRestart=no\nUMask=0077\nTimeoutStopUSec=2s\nCollectMode=inactive-or-failed\n",
             );
             assert!(!parse_systemd_properties(&wire)
                 .unwrap()
@@ -2201,11 +2291,15 @@ mod tests {
     }
 
     fn context() -> RuntimeDesiredEffectContext {
+        context_for(Duration::from_secs(1))
+    }
+
+    fn context_for(duration: Duration) -> RuntimeDesiredEffectContext {
         let root = tempfile::tempdir().unwrap();
         let path = root.keep();
         RuntimeDesiredEffectContext::for_test(
             StateDirectory::unanchored(path),
-            Instant::now() + Duration::from_secs(1),
+            Instant::now() + duration,
         )
     }
 

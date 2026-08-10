@@ -19,6 +19,9 @@ use std::path::PathBuf;
 use std::process::Child;
 use std::time::{Duration, Instant};
 
+#[cfg(target_os = "linux")]
+use std::os::fd::{AsRawFd as _, FromRawFd as _, OwnedFd};
+
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 
@@ -231,6 +234,125 @@ impl ProcIdentity {
             pid,
             start_ticks: sample_start_ticks(pid),
             exe: sample_exe(pid),
+        }
+    }
+}
+
+/// Result of binding a Linux pidfd to an already-recorded process identity.
+/// A pidfd is the only signal handle used by exact retirement: a numeric PID
+/// can be recycled after the pre-effect inventory and must never be signalled
+/// directly.
+#[cfg(target_os = "linux")]
+pub(crate) enum ExactPidFdOpen {
+    Exact(ExactPidFd),
+    Absent,
+    IdentityMismatch,
+    Unsupported,
+}
+
+#[cfg(target_os = "linux")]
+#[derive(Debug)]
+pub(crate) struct ExactPidFd {
+    descriptor: OwnedFd,
+}
+
+#[cfg(target_os = "linux")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum PidFdSignal {
+    Submitted,
+    AlreadyExited,
+    Unsupported,
+}
+
+#[cfg(target_os = "linux")]
+impl ExactPidFd {
+    /// Open the kernel handle first, then re-sample the PID's start time and
+    /// executable. If the process exits and the numeric PID is recycled in
+    /// that window, the pidfd still names the old task while `/proc` names the
+    /// replacement; the mismatch therefore fails before any signal.
+    pub(crate) fn open_exact(expected: &ProcIdentity) -> Result<ExactPidFdOpen> {
+        Self::open_exact_with_sampler(expected, ProcIdentity::sample)
+    }
+
+    fn open_exact_with_sampler(
+        expected: &ProcIdentity,
+        sample: impl FnOnce(u32) -> ProcIdentity,
+    ) -> Result<ExactPidFdOpen> {
+        let Some(pid) = pid_t(expected.pid) else {
+            return Ok(ExactPidFdOpen::IdentityMismatch);
+        };
+        if expected.start_ticks.is_none() || expected.exe.is_none() {
+            return Ok(ExactPidFdOpen::IdentityMismatch);
+        }
+        // SAFETY: pidfd_open copies its scalar arguments and returns a fresh
+        // descriptor on success. Flags are frozen to zero by the syscall ABI.
+        let descriptor = unsafe { libc::syscall(libc::SYS_pidfd_open, pid, 0_u32) };
+        if descriptor < 0 {
+            let source = std::io::Error::last_os_error();
+            return match source.raw_os_error() {
+                Some(libc::ESRCH) => Ok(ExactPidFdOpen::Absent),
+                Some(libc::ENOSYS) | Some(libc::EINVAL) => Ok(ExactPidFdOpen::Unsupported),
+                _ => Err(source).context("open exact process pidfd"),
+            };
+        }
+        let descriptor = i32::try_from(descriptor).context("pidfd exceeds descriptor range")?;
+        // SAFETY: successful pidfd_open returned one fresh descriptor, whose
+        // ownership moves exactly once into OwnedFd.
+        let descriptor = unsafe { OwnedFd::from_raw_fd(descriptor) };
+        if sample(expected.pid) != *expected {
+            return Ok(ExactPidFdOpen::IdentityMismatch);
+        }
+        Ok(ExactPidFdOpen::Exact(Self { descriptor }))
+    }
+
+    pub(crate) fn signal(&self, signal: i32) -> Result<PidFdSignal> {
+        // SAFETY: pidfd_send_signal copies scalar arguments. A null siginfo
+        // requests ordinary process-directed signal semantics and is not
+        // retained by the kernel.
+        let result = unsafe {
+            libc::syscall(
+                libc::SYS_pidfd_send_signal,
+                self.descriptor.as_raw_fd(),
+                signal,
+                std::ptr::null::<libc::siginfo_t>(),
+                0_u32,
+            )
+        };
+        if result == 0 {
+            return Ok(PidFdSignal::Submitted);
+        }
+        let source = std::io::Error::last_os_error();
+        match source.raw_os_error() {
+            Some(libc::ESRCH) => Ok(PidFdSignal::AlreadyExited),
+            Some(libc::ENOSYS) | Some(libc::EINVAL) => Ok(PidFdSignal::Unsupported),
+            _ => Err(source).context("signal exact process through pidfd"),
+        }
+    }
+
+    /// pidfds become readable when their exact task exits. Polling this
+    /// descriptor never follows a later process which reuses the numeric PID.
+    pub(crate) fn exited(&self) -> Result<bool> {
+        let mut descriptor = libc::pollfd {
+            fd: self.descriptor.as_raw_fd(),
+            events: libc::POLLIN,
+            revents: 0,
+        };
+        loop {
+            // SAFETY: `descriptor` points to one initialized pollfd for this
+            // nonblocking call and poll retains no pointer.
+            let result = unsafe { libc::poll(&raw mut descriptor, 1, 0) };
+            if result >= 0 {
+                anyhow::ensure!(
+                    descriptor.revents & libc::POLLNVAL == 0,
+                    "exact process pidfd became invalid"
+                );
+                return Ok(result > 0
+                    && descriptor.revents & (libc::POLLIN | libc::POLLHUP | libc::POLLERR) != 0);
+            }
+            let source = std::io::Error::last_os_error();
+            if source.kind() != std::io::ErrorKind::Interrupted {
+                return Err(source).context("poll exact process pidfd");
+            }
         }
     }
 }
@@ -456,6 +578,51 @@ mod tests {
         assert_eq!(identity.pid, 0);
         assert_eq!(identity.start_ticks, None);
         assert_eq!(identity.exe, None);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn pidfd_signals_and_waits_for_the_exact_kernel_task() {
+        let mut child = spawn_sleeper();
+        let expected = ProcIdentity::sample(child.id());
+        assert!(expected.start_ticks.is_some() && expected.exe.is_some());
+        let ExactPidFdOpen::Exact(pidfd) = ExactPidFd::open_exact(&expected).unwrap() else {
+            panic!("positive calibration: this Linux kernel must open an exact pidfd")
+        };
+        assert!(!pidfd.exited().unwrap());
+        assert_eq!(pidfd.signal(libc::SIGKILL).unwrap(), PidFdSignal::Submitted);
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !pidfd.exited().unwrap() {
+            assert!(
+                Instant::now() < deadline,
+                "pidfd never reported process exit"
+            );
+            std::thread::sleep(ADOPTED_EXIT_POLL);
+        }
+        assert!(!child.wait().unwrap().success());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn pidfd_open_barrier_rejects_a_replacement_sample_without_signalling() {
+        let mut child = spawn_sleeper();
+        let expected = ProcIdentity::sample(child.id());
+        assert!(matches!(
+            ExactPidFd::open_exact(&expected).unwrap(),
+            ExactPidFdOpen::Exact(_)
+        ));
+        let mut replacement = expected.clone();
+        replacement.start_ticks = replacement.start_ticks.map(|ticks| ticks + 1);
+        assert!(matches!(
+            ExactPidFd::open_exact_with_sampler(&expected, |_| replacement).unwrap(),
+            ExactPidFdOpen::IdentityMismatch
+        ));
+        assert!(
+            child.try_wait().unwrap().is_none(),
+            "the replacement barrier must return before any signal reaches the PID"
+        );
+        child.kill().unwrap();
+        assert!(!child.wait().unwrap().success());
     }
 
     #[test]
