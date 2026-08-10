@@ -61,10 +61,10 @@
       </div>
       <nav class="nav-list" data-i18n-aria-label="user.nav.aria" aria-label="User console navigation">
         <button class="nav-item is-active" data-view="overview"><span>⌂</span><b data-i18n="user.nav.overview">Overview</b></button>
-        <button class="nav-item" data-view="cats"><span>◇</span><b data-i18n="user.nav.cats">Cats</b></button>
-        <button class="nav-item" data-view="disks"><span>▱</span><b data-i18n="user.nav.disks">Disks</b></button>
+        <button class="nav-item" data-view="cats" hidden><span>◇</span><b data-i18n="user.nav.cats">Cats</b></button>
+        <button class="nav-item" data-view="disks" hidden><span>▱</span><b data-i18n="user.nav.disks">Disks</b></button>
         <button class="nav-item" data-view="billing"><span>$</span><b data-i18n="user.nav.billing">Billing</b></button>
-        <button class="nav-item" data-view="operations"><span>↻</span><b data-i18n="user.nav.operations">Operations</b></button>
+        <button class="nav-item" data-view="operations" hidden><span>↻</span><b data-i18n="user.nav.operations">Operations</b></button>
       </nav>
       <div class="sidebar-footer">
         <label class="language-picker language-picker-sidebar">
@@ -96,8 +96,11 @@
 
       <div class="content">
         <section class="view is-active" id="view-overview">
-          <div class="metric-grid" id="user-metrics"></div>
-          <div class="dashboard-grid">
+          <section class="panel">
+            <header class="panel-header"><div><small data-i18n="section.compute">COMPUTE</small><h2 data-i18n="user.cutover.title">Signed runtime creation</h2><p data-i18n="user.cutover.description">Create is available now. Resource lists and lifecycle actions remain unavailable while the signed runtime cutover is completed.</p></div><button class="button button-primary" data-create-cat>＋ <span data-i18n="user.createCat">Create Cat</span></button></header>
+          </section>
+          <div class="metric-grid" id="user-metrics" hidden></div>
+          <div class="dashboard-grid" hidden>
             <section class="panel panel-span-2">
               <header class="panel-header"><div><small data-i18n="section.compute">COMPUTE</small><h2 data-i18n="user.overview.recentCats">Recent Cats</h2></div><button class="text-button" data-go="cats" data-i18n="user.overview.viewAll">View all →</button></header>
               <div id="recent-cats"></div>
@@ -109,7 +112,7 @@
           </div>
         </section>
 
-        <section class="view" id="view-cats">
+        <section class="view" id="view-cats" hidden>
           <section class="panel">
             <header class="panel-header"><div><small data-i18n="section.compute">COMPUTE</small><h2 data-i18n="user.cats.title">My Cats</h2><p data-i18n="user.cats.description">Start, suspend, or manage your cloud workspaces.</p></div><button class="button button-primary" data-create-cat>＋ <span data-i18n="user.createCat">Create Cat</span></button></header>
             <div class="table-wrap"><table><thead><tr><th data-i18n="common.name">Name</th><th data-i18n="common.status">Status</th><th data-i18n="user.cats.spec">Size</th><th data-i18n="common.node">Node</th><th data-i18n="common.created">Created</th><th class="align-right" data-i18n="common.actions">Actions</th></tr></thead><tbody id="cats-table"></tbody></table></div>
@@ -117,7 +120,7 @@
           </section>
         </section>
 
-        <section class="view" id="view-disks">
+        <section class="view" id="view-disks" hidden>
           <section class="panel">
             <header class="panel-header"><div><small data-i18n="section.storage">STORAGE</small><h2 data-i18n="user.disks.title">Persistent Disks</h2><p data-i18n="user.disks.description">RWO persistent disks with a lifecycle independent from Cats.</p></div><button class="button button-primary" id="create-disk-button">＋ <span data-i18n="user.disks.create">Create disk</span></button></header>
             <div class="table-wrap"><table><thead><tr><th data-i18n="common.name">Name</th><th data-i18n="common.type">Type</th><th data-i18n="common.capacity">Capacity</th><th data-i18n="common.status">Status</th><th data-i18n="user.disks.boundCat">Attached Cat</th><th class="align-right" data-i18n="common.actions">Actions</th></tr></thead><tbody id="disks-table"></tbody></table></div>
@@ -169,7 +172,7 @@
           </div>
         </section>
 
-        <section class="view" id="view-operations">
+        <section class="view" id="view-operations" hidden>
           <section class="panel">
             <header class="panel-header"><div><small data-i18n="section.controlPlane">CONTROL PLANE</small><h2 data-i18n="user.nav.operations">Operations</h2><p data-i18n="user.operations.description">Status, target resource, and final result for every asynchronous change.</p></div></header>
             <div class="table-wrap"><table><thead><tr><th data-i18n="user.operations.operation">Operation</th><th data-i18n="common.type">Type</th><th data-i18n="user.operations.resource">Resource</th><th data-i18n="user.operations.phase">Phase</th><th data-i18n="user.operations.updated">Updated</th><th data-i18n="common.error">Error</th></tr></thead><tbody id="operations-table"></tbody></table></div>
@@ -184,18 +187,19 @@
     <form method="dialog" id="create-cat-form">
       <header><div><small data-i18n="user.catDialog.eyebrow">NEW COMPUTE</small><h2 data-i18n="user.catDialog.title">Create Cat</h2></div><button class="icon-button" value="cancel" data-i18n-aria-label="common.close" aria-label="Close">×</button></header>
       <div class="form-grid">
-        <label class="span-2"><span data-i18n="common.name">Name</span><input name="name" placeholder="dev" pattern="[A-Za-z0-9-]+" required><small data-i18n="user.catDialog.nameHint">Letters, numbers, and hyphens</small></label>
-        <label class="span-2"><span data-i18n="user.catDialog.image">Image</span><input name="image" value="ubuntu-24.04" required></label>
-        <label><span>CPU</span><input name="cpus" type="number" min="1" max="64" value="2" required></label>
+        <label class="span-2"><span data-i18n="common.name">Name</span><input name="name" placeholder="dev" pattern="[a-z0-9](?:[a-z0-9-]{0,28}[a-z0-9])?" maxlength="30" required><small data-i18n="user.catDialog.nameHint">Letters, numbers, and hyphens</small></label>
+        <label class="span-2"><span data-i18n="user.catDialog.image">Boot image digest</span><input name="boot_image_digest" placeholder="sha256:…" pattern="sha256:[0-9a-f]{64}" required></label>
+        <label><span>CPU</span><input name="vcpus" type="number" min="1" max="64" value="2" required></label>
         <label><span data-i18n="user.catDialog.memory">Memory (MiB)</span><input name="memory_mib" type="number" min="128" value="2048" required></label>
         <label class="span-2"><span data-i18n="user.catDialog.rootDisk">RootDisk (GiB)</span><input name="root_gib" type="number" min="0.0625" step="0.0625" value="1" required></label>
+        <label class="span-2"><span>Durability</span><select name="durability"><option value="strict" selected>strict</option><option value="relaxed">relaxed</option></select></label>
       </div>
       <p class="form-error" data-form-error></p>
       <footer><button class="button button-quiet" value="cancel" data-i18n="common.cancel">Cancel</button><button class="button button-primary" value="default" data-i18n="user.catDialog.submit">Create and start</button></footer>
     </form>
   </dialog>
 
-  <dialog id="create-disk-dialog" class="modal">
+  <dialog id="create-disk-dialog" class="modal" hidden>
     <form method="dialog" id="create-disk-form">
       <header><div><small data-i18n="user.diskDialog.eyebrow">NEW STORAGE</small><h2 data-i18n="user.diskDialog.title">Create PersistentDisk</h2></div><button class="icon-button" value="cancel" data-i18n-aria-label="common.close" aria-label="Close">×</button></header>
       <div class="form-grid"><label class="span-2"><span data-i18n="common.name">Name</span><input name="name" placeholder="workspace-data" required></label><label class="span-2"><span data-i18n="user.diskDialog.size">Capacity (GiB)</span><input name="size_gib" type="number" min="0.0625" step="0.0625" value="1" required></label></div>
@@ -237,7 +241,7 @@
     </form>
   </dialog>
 
-  <dialog id="exec-dialog" class="modal modal-wide">
+  <dialog id="exec-dialog" class="modal modal-wide" hidden>
     <form method="dialog" id="exec-form">
       <header><div><small data-i18n="user.execDialog.eyebrow">GUEST EXEC</small><h2><span data-i18n="user.execDialog.title">Run in</span> <span id="exec-cat-name"></span></h2></div><button class="icon-button" value="cancel" data-i18n-aria-label="common.close" aria-label="Close">×</button></header>
       <label><span data-i18n="user.execDialog.command">Command</span><input name="command" value="uname -a" required><small data-i18n="user.execDialog.hint">Split into argv on spaces; this development console does not perform shell expansion.</small></label>

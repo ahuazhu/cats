@@ -9,7 +9,7 @@ export class ApiError extends Error {
   }
 }
 
-export async function request(path, options = {}) {
+export async function requestWithStatus(path, options = {}) {
   const headers = new Headers(options.headers || {});
   headers.set("Accept", "application/json, text/plain;q=0.9");
   if (options.body !== undefined && !headers.has("Content-Type")) {
@@ -46,7 +46,12 @@ export async function request(path, options = {}) {
     const message = localizedApiMessage(code, fallback);
     throw new ApiError(message, response.status, code);
   }
-  return value;
+  return { status: response.status, value, body };
+}
+
+export async function request(path, options = {}) {
+  const response = await requestWithStatus(path, options);
+  return response.value;
 }
 
 export function escapeHtml(value) {

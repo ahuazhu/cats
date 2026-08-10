@@ -17,6 +17,7 @@ pub mod agent_registration;
 pub mod auth;
 pub mod billing;
 pub mod blockd;
+pub mod cat_create;
 pub mod chunk;
 pub mod error;
 pub mod guest;

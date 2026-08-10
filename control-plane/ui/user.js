@@ -6,6 +6,7 @@ import {
   metricCard,
   operationKind,
   request,
+  requestWithStatus,
   resourceKind,
   setBusy,
   sleep,
@@ -14,6 +15,11 @@ import {
   toast,
 } from "/ui/common.js";
 import { getLocale, initI18n, localizedApiMessage, onLocaleChange, t } from "/ui/i18n.js";
+import {
+  assertRuntimeCutoverClientRequestSupported,
+  buildCatCreateV2Request,
+  parseCatCreateV2AcceptedResponseBody,
+} from "/ui/cat-create-v2.mjs";
 
 initI18n();
 
@@ -117,15 +123,16 @@ async function switchWorkspace(workspaceId, { updateUrl = true } = {}) {
   await loadAll({ quiet: true });
 }
 
-async function authenticatedRequest(path, options) {
+async function authenticatedRequestWithStatus(path, options = {}) {
+  assertRuntimeCutoverClientRequestSupported(path, options.method || "GET");
   try {
-    return await request(path, options);
+    return await requestWithStatus(path, options);
   } catch (error) {
     let failure = error;
     if (failure.status === 401) {
       await request("/auth/session?site=user");
       try {
-        return await request(path, options);
+        return await requestWithStatus(path, options);
       } catch (retryFailure) {
         failure = retryFailure;
       }
@@ -138,6 +145,11 @@ async function authenticatedRequest(path, options) {
     }
     throw failure;
   }
+}
+
+async function authenticatedRequest(path, options = {}) {
+  const response = await authenticatedRequestWithStatus(path, options);
+  return response.value;
 }
 
 function idempotencyHeaders() {
@@ -182,14 +194,11 @@ async function loadAll({ quiet = false } = {}) {
   const button = document.querySelector("#refresh-button");
   if (!quiet) setBusy(button, true, t("common.refreshing"));
   try {
-    const [cats, disks, operations] = await Promise.all([
-      authenticatedRequest(workspacePath("/cats")),
-      authenticatedRequest(workspacePath("/disks")),
-      authenticatedRequest(workspacePath("/operations")),
-    ]);
-    state.cats = cats.items || [];
-    state.disks = disks.items || [];
-    state.operations = operations.items || [];
+    // Read projections remain closed in production. Preserve an honest empty
+    // local view instead of probing retired authority routes on every refresh.
+    state.cats = [];
+    state.disks = [];
+    state.operations = [];
     render();
   } catch (error) {
     if (error.status === 401 || error.status === 403) {
@@ -984,25 +993,24 @@ document.querySelector("#create-cat-form").addEventListener("submit", async (eve
   error.textContent = "";
   setBusy(button, true);
   try {
-    const response = await authenticatedRequest(workspacePath("/cats"), {
+    const body = buildCatCreateV2Request({
+      name: values.get("name"),
+      bootImageDigest: values.get("boot_image_digest"),
+      vcpus: values.get("vcpus"),
+      memoryMib: values.get("memory_mib"),
+      rootGib: values.get("root_gib"),
+      durability: values.get("durability"),
+    });
+    const { status, body: responseBody } = await authenticatedRequestWithStatus(workspacePath("/cats"), {
       method: "POST",
       headers: idempotencyHeaders(),
-      body: JSON.stringify({
-        name: String(values.get("name")).trim(),
-        image: String(values.get("image")).trim(),
-        cpus: Number(values.get("cpus")),
-        memory_mib: Number(values.get("memory_mib")),
-        root_size_bytes: Math.round(Number(values.get("root_gib")) * (1024 ** 3)),
-        auto_suspend: true,
-        disk: null,
-      }),
+      body: JSON.stringify(body),
     });
-    toast(t("user.cat.creating"), response.cat.name);
+    if (status !== 202) throw new Error(`Cat create returned HTTP ${status}; expected 202`);
+    const accepted = parseCatCreateV2AcceptedResponseBody(responseBody);
+    toast(t("user.operation.accepted"), `${accepted.cat_id} · ${accepted.operation_id}`);
     createCatDialog.close();
     form.reset();
-    await waitForOperation(response.operation);
-    await loadAll({ quiet: true });
-    toast(t("user.cat.ready"), response.cat.name);
   } catch (caught) {
     error.textContent = caught.message;
   } finally {

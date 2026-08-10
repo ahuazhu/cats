@@ -566,21 +566,12 @@ pub(crate) fn api_request_fingerprint(
     Ok(Sha256Digest::from_bytes(hasher.finalize().into()))
 }
 
-#[derive(Serialize)]
-struct CatCreateAcceptedResponse<'a> {
-    cat_id: &'a str,
-    operation_id: &'a str,
-}
-
 pub(crate) fn encode_cat_create_accepted_response(
     cat_id: &Id,
     operation_id: &Id,
 ) -> Result<Vec<u8>> {
-    serde_json::to_vec(&CatCreateAcceptedResponse {
-        cat_id: cat_id.as_str(),
-        operation_id: operation_id.as_str(),
-    })
-    .map_err(internal)
+    cats_api::cat_create::encode_cat_create_v2_accepted_response(cat_id, operation_id)
+        .map_err(internal)
 }
 
 #[allow(dead_code, reason = "consumed by the later HTTP/service cutover")]

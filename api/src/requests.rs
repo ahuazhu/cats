@@ -15,6 +15,8 @@ use crate::resources::{
     WorkLease,
 };
 
+/// Legacy product-authority request retained only for the explicit pre-cutover
+/// test composition. Production clients use [`crate::cat_create::CatCreateV2Request`].
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CreateCatRequest {
     pub name: String,

@@ -10,6 +10,9 @@ use std::pin::Pin;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use cats_api::cat_create::{
+    CatCreateV2Request, CatCreateV2ValidationError, CAT_CREATE_V2_MAX_ROOT_SIZE_BYTES,
+};
 use cats_api::error::{ApiError, ErrorCode};
 use cats_api::runtime_reconciliation::{
     encode_admission_inventory_attestation, encode_agent_session, encode_desired_runtime_spec,
@@ -41,7 +44,6 @@ pub(crate) const CAT_CREATE_CANONICAL_ROUTE: &str = "POST /v1/workspaces/{worksp
 const CAT_CREATE_CONTENT_TYPE: &[u8] = b"application/json";
 const IDENTITY_CONTENT_ENCODING: &[u8] = b"identity";
 const CHUNK_SIZE_BYTES: u64 = 4_194_304;
-const MAX_VOLUME_BYTES: u64 = 1_099_511_627_776;
 pub(crate) const CAT_CREATE_TOTAL_DEADLINE: Duration = Duration::from_secs(10);
 const CAT_CREATE_RESOLUTION_SHUTDOWN_DEADLINE: Duration = Duration::from_secs(30);
 
@@ -64,16 +66,7 @@ pub(crate) struct CatCreateHttpFields {
     pub(crate) idempotency_key: Vec<Vec<u8>>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub(crate) struct CatCreateRequestBody {
-    pub(crate) name: Id,
-    pub(crate) boot_image_digest: Sha256Digest,
-    pub(crate) vcpus: u32,
-    pub(crate) memory_bytes: u64,
-    pub(crate) root_size_bytes: u64,
-    pub(crate) durability: Durability,
-}
+type CatCreateRequestBody = CatCreateV2Request;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct AuthorizedCatCreateIngress {
@@ -205,36 +198,17 @@ fn trim_ows(mut value: &[u8]) -> &[u8] {
 }
 
 fn validate_request(request: &CatCreateRequestBody) -> Result<()> {
-    let name = request.name.as_str().as_bytes();
-    if !(1..=30).contains(&name.len())
-        || !name
-            .iter()
-            .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || *byte == b'-')
-        || !name
-            .first()
-            .is_some_and(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit())
-        || !name
-            .last()
-            .is_some_and(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit())
-    {
-        return Err(ApiError::invalid(
-            "Cat name must be 1..=30 lowercase ASCII letters, digits or interior hyphens",
-        ));
-    }
-    if request.vcpus == 0 {
-        return Err(ApiError::invalid("vcpus must be positive"));
-    }
-    if request.memory_bytes == 0 || request.memory_bytes > i64::MAX as u64 {
-        return Err(ApiError::invalid(
-            "memory_bytes must be in 1..=9223372036854775807",
-        ));
-    }
-    if request.root_size_bytes == 0 || request.root_size_bytes > MAX_VOLUME_BYTES {
-        return Err(ApiError::invalid(
-            "root_size_bytes must be in 1..=1099511627776",
-        ));
-    }
-    Ok(())
+    request.validate().map_err(|error| match error {
+        CatCreateV2ValidationError::Name
+        | CatCreateV2ValidationError::Vcpus
+        | CatCreateV2ValidationError::MemoryBytes
+        | CatCreateV2ValidationError::RootSizeBytes => ApiError::invalid(error.to_string()),
+        // JSON decoding rejects this before semantic validation. Keep the arm
+        // explicit so a future construction path cannot weaken the boundary.
+        CatCreateV2ValidationError::BootImageDigest => {
+            ApiError::invalid("Cat create body is malformed")
+        }
+    })
 }
 
 /// Result of the immutable-image adapter's complete manifest validation.
@@ -752,7 +726,7 @@ fn rounded_root_size(requested: u64) -> Result<u64> {
         .checked_add(CHUNK_SIZE_BYTES - 1)
         .map(|value| value / CHUNK_SIZE_BYTES * CHUNK_SIZE_BYTES)
         .ok_or_else(|| ApiError::invalid("root_size_bytes cannot be rounded safely"))?;
-    if rounded > MAX_VOLUME_BYTES {
+    if rounded > CAT_CREATE_V2_MAX_ROOT_SIZE_BYTES {
         return Err(ApiError::invalid(
             "rounded root_size_bytes exceeds 1099511627776",
         ));

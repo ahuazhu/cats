@@ -583,6 +583,10 @@ pub fn router(state: AppState) -> Router {
         .route("/ui/common.js", get(crate::ui::common_script))
         .route("/ui/user.js", get(crate::ui::user_script))
         .route("/ui/admin.js", get(crate::ui::admin_script))
+        .route(
+            "/ui/cat-create-v2.mjs",
+            get(crate::ui::cat_create_v2_script),
+        )
         .route("/auth/config", get(crate::auth::config))
         .route("/auth/login", get(crate::auth::login))
         .route("/auth/callback", get(crate::auth::callback))
@@ -779,6 +783,7 @@ GET /robots.txt
 GET /site.webmanifest
 GET /sitemap.xml
 GET /ui/admin.js
+GET /ui/cat-create-v2.mjs
 GET /ui/common.js
 GET /ui/i18n.js
 GET /ui/styles.css
