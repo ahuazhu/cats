@@ -28,6 +28,7 @@ pub mod oci;
 pub mod requests;
 pub mod resources;
 pub mod route_grant;
+pub mod route_grant_v2;
 pub mod runtime_artifacts;
 pub mod runtime_node_authority;
 pub mod runtime_reconciliation;
