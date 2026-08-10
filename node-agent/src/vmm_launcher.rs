@@ -983,10 +983,9 @@ mod linux {
             let flags = unsafe { libc::fcntl(file.as_raw_fd(), libc::F_GETFD) };
             assert!(flags >= 0);
             // SAFETY: F_SETFD changes only this live test descriptor.
-            assert!(
-                unsafe { libc::fcntl(file.as_raw_fd(), libc::F_SETFD, flags & !libc::FD_CLOEXEC,) }
-                    >= 0
-            );
+            let result =
+                unsafe { libc::fcntl(file.as_raw_fd(), libc::F_SETFD, flags & !libc::FD_CLOEXEC) };
+            assert!(result >= 0);
 
             set_close_on_exec(&file).unwrap();
 
