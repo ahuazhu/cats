@@ -652,7 +652,7 @@ impl InstalledFileContract {
 #[cfg(unix)]
 impl InstalledDirectoryMode {
     fn accepts(self, mode: u32) -> bool {
-        let mode = mode & 0o777;
+        let mode = mode & 0o7777;
         match self {
             Self::Exact(expected) => mode == expected,
             // Metal keeps identity material private (0700), while the
@@ -911,7 +911,7 @@ impl StableFileMetadata {
 
     fn is_exact_installed_file(self, contract: InstalledFileContract) -> bool {
         self.is_file
-            && self.mode & 0o777 == contract.mode
+            && self.mode & 0o7777 == contract.mode
             && self.uid == contract.uid
             && self.gid == contract.gid
             && self.nlink == 1
@@ -993,12 +993,17 @@ mod tests {
         let contract = InstalledDirectoryMode::ProvisionerIdentity;
         assert!(contract.accepts(0o700), "Metal identity directory");
         assert!(contract.accepts(0o755), "container identity directory");
-        for unsafe_mode in [0o000, 0o500, 0o711, 0o750, 0o770, 0o775, 0o777] {
+        for unsafe_mode in [
+            0o000, 0o500, 0o711, 0o750, 0o770, 0o775, 0o777, 0o1700, 0o2700, 0o4700,
+        ] {
             assert!(
                 !contract.accepts(unsafe_mode),
                 "mode {unsafe_mode:o} escaped the closed identity-directory contract"
             );
         }
+        let route_contract = InstalledDirectoryMode::Exact(0o700);
+        assert!(route_contract.accepts(0o700));
+        assert!(!route_contract.accepts(0o1700));
     }
 
     #[test]
@@ -1084,6 +1089,10 @@ mod tests {
         assert!(!debug.contains("BEGIN PRIVATE KEY"));
 
         std::fs::set_permissions(&private_path, std::fs::Permissions::from_mode(0o644)).unwrap();
+        assert!(
+            load_route_grant_v2_signer_from(&retained, public_contract, private_contract).is_err()
+        );
+        std::fs::set_permissions(&private_path, std::fs::Permissions::from_mode(0o4600)).unwrap();
         assert!(
             load_route_grant_v2_signer_from(&retained, public_contract, private_contract).is_err()
         );
