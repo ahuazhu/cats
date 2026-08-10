@@ -106,7 +106,8 @@ pub(crate) use signed_running::{SignedRunningAcquireEffect, SignedRunningPublica
 #[allow(unused_imports)]
 pub(crate) use root_provision_process::{
     ensure_root_provision_process_after_checkpoint,
-    ensure_root_provision_process_from_persisted_checkpoint, RootProvisionAuthoritySnapshot,
+    ensure_root_provision_process_from_persisted_checkpoint, NodeGlobalManagedProcessAdmission,
+    NodeGlobalManagedProcessScanAdmission, RootProvisionAuthoritySnapshot,
     RootProvisionBlockdHandshake, RootProvisionProcessConflict, RootProvisionProcessEnsureResult,
     RootProvisionProcessEvidence, RootProvisionProcessExpectation, RootProvisionProcessGlobalPort,
     RootProvisionProcessInspection, RootProvisionProcessOutcome, RootProvisionProcessPort,

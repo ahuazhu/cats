@@ -7,14 +7,15 @@
 //! is resolved by inspection; it is never retried in the same reconciliation
 //! unit and a mismatching process is never stopped by name.
 
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
 
 use anyhow::Context as _;
 use cats_api::runtime_reconciliation::{
     CheckpointEvidence, ControlHandshakeEvidence, DesiredRuntimeSpec, Durability, Epoch,
-    FenceEpoch, HostPath, Id, NodeBootId, OwnershipTokenEvidence, ProcessEvidence, ProcessRole,
-    ProcessState, RandomId128, ReconcileStep, RemoteHead, Revision, RuntimeCheckpoint, Sequence,
-    Sha256Digest, WireU64,
+    FenceEpoch, HostPath, Id, NodeBootId, NodeObservation, OwnershipTokenEvidence, ProcessEvidence,
+    ProcessRole, ProcessState, RandomId128, ReconcileStep, RemoteHead, Revision, RuntimeCheckpoint,
+    Sequence, Sha256Digest, WireU64,
 };
 use cats_blockd::target_control::{
     target_control_authorization_file_name, ProvisionRootAuthorizationContextDigest,
@@ -63,7 +64,7 @@ pub(crate) trait RootProvisionProcessGlobalPort:
     fn inspect_exact_or_absent_after_node_global_sweep(
         &self,
         expected: &RootProvisionProcessExpectation,
-        context: &dyn RuntimePhysicalReadContext,
+        context: &RuntimeDesiredEffectContext,
     ) -> anyhow::Result<RootProvisionProcessInspection>;
 }
 
@@ -593,6 +594,267 @@ impl RootProvisionProcessEvidence {
 pub(crate) struct ExactRootProvisionProcessProof {
     expectation: RootProvisionProcessExpectation,
     evidence: RootProvisionProcessEvidence,
+}
+
+/// One provider-private member of the Node-global managed-process closed set.
+///
+/// Variants are explicit so future serving blockd and VMM scanners can add
+/// their own complete expectations without accepting an arbitrary
+/// unit/PID/socket allowlist from an effect.  The first cutover stage contains
+/// only the already implemented Root control process expectation.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum NodeGlobalManagedProcessExpectation {
+    RootControl {
+        expectation: RootProvisionProcessExpectation,
+        exact: Option<ExactRootProvisionProcessProof>,
+    },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub(crate) enum NodeGlobalManagedProcessRole {
+    RootControl,
+    #[allow(dead_code)] // Filled by the PrepareDevice serving scanner stage.
+    ServingBlockd,
+    #[allow(dead_code)] // Filled by the VMM scanner stage.
+    Vmm,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+pub(crate) struct NodeGlobalManagedProcessKey {
+    cat_id: Id,
+    role: NodeGlobalManagedProcessRole,
+}
+
+impl NodeGlobalManagedProcessExpectation {
+    pub(crate) fn key(&self) -> NodeGlobalManagedProcessKey {
+        match self {
+            Self::RootControl { expectation, .. } => NodeGlobalManagedProcessKey {
+                cat_id: expectation.cat_id.clone(),
+                role: NodeGlobalManagedProcessRole::RootControl,
+            },
+        }
+    }
+}
+
+/// Unbound output of one complete scanner pass.  It contains the full
+/// provider-private expectation even for an absent process; public inventory
+/// projection alone deliberately cannot recreate it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct NodeGlobalManagedProcessScanAdmission {
+    entries: Vec<NodeGlobalManagedProcessExpectation>,
+}
+
+/// The same closed set after it is bound to the exact full observation sent
+/// and accepted by Control.  This remains process-local and is never decoded
+/// from an observation replay after Agent restart.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct NodeGlobalManagedProcessAdmission {
+    observation_id: RandomId128,
+    node_id: Id,
+    node_boot_id: NodeBootId,
+    agent_instance_id: RandomId128,
+    agent_session_epoch: Epoch,
+    inventory_epoch: Epoch,
+    inventory_digest: Sha256Digest,
+    inventory_read_position: Sequence,
+    entries: Vec<NodeGlobalManagedProcessExpectation>,
+}
+
+impl NodeGlobalManagedProcessScanAdmission {
+    pub(crate) fn from_root_controls(
+        expected: BTreeMap<Id, RootProvisionProcessExpectation>,
+        mut exact: BTreeMap<Id, ExactRootProvisionProcessProof>,
+    ) -> anyhow::Result<Self> {
+        let mut entries = Vec::with_capacity(expected.len());
+        let mut units = BTreeSet::new();
+        let mut pids = BTreeSet::new();
+        let mut sockets = BTreeSet::new();
+        let mut keys = BTreeSet::new();
+        for (cat_id, expectation) in expected {
+            anyhow::ensure!(
+                expectation.cat_id == cat_id,
+                "Node-global Root-control expectation is indexed by another Cat"
+            );
+            let proof = exact.remove(&cat_id);
+            if let Some(proof) = &proof {
+                anyhow::ensure!(
+                    proof.expectation() == &expectation,
+                    "Node-global Root-control proof changed its full expectation"
+                );
+                let evidence = proof.evidence();
+                anyhow::ensure!(
+                    units.insert(evidence.scope_id.clone())
+                        && pids.insert(evidence.process_id)
+                        && sockets.insert(evidence.control_socket_path.clone()),
+                    "Node-global Root-control proof duplicates a physical identity"
+                );
+            }
+            let entry = NodeGlobalManagedProcessExpectation::RootControl {
+                expectation,
+                exact: proof,
+            };
+            anyhow::ensure!(
+                keys.insert(entry.key()),
+                "Node-global managed-process admission duplicates one typed key"
+            );
+            entries.push(entry);
+        }
+        anyhow::ensure!(
+            exact.is_empty(),
+            "Node-global Root-control proof lacks an authoritative expectation"
+        );
+        Ok(Self { entries })
+    }
+
+    pub(crate) fn root_control_proofs(&self) -> BTreeMap<Id, ExactRootProvisionProcessProof> {
+        self.entries
+            .iter()
+            .filter_map(|entry| match entry {
+                NodeGlobalManagedProcessExpectation::RootControl {
+                    expectation,
+                    exact: Some(proof),
+                } => Some((expectation.cat_id.clone(), proof.clone())),
+                NodeGlobalManagedProcessExpectation::RootControl { exact: None, .. } => None,
+            })
+            .collect()
+    }
+
+    pub(crate) fn bind(
+        self,
+        observation: &NodeObservation,
+    ) -> anyhow::Result<NodeGlobalManagedProcessAdmission> {
+        anyhow::ensure!(
+            observation.complete_inventory,
+            "Node-global managed-process admission requires a complete observation"
+        );
+        let inventory_digest = observation
+            .inventory_digest
+            .clone()
+            .context("Node-global managed-process admission lacks inventory digest")?;
+        let inventory_read_position = observation
+            .inventory_read_position
+            .context("Node-global managed-process admission lacks inventory read position")?;
+        let mut admitted_processes = BTreeMap::new();
+        for entry in &self.entries {
+            match entry {
+                NodeGlobalManagedProcessExpectation::RootControl { expectation, exact } => {
+                    anyhow::ensure!(
+                        admitted_processes
+                            .insert(
+                                expectation.cat_id.clone(),
+                                exact
+                                    .clone()
+                                    .map(ExactRootProvisionProcessProof::into_process_evidence),
+                            )
+                            .is_none(),
+                        "Node-global managed-process admission repeats one Cat/role"
+                    );
+                }
+            }
+        }
+        for runtime in &observation.runtimes {
+            let expected = admitted_processes.remove(&runtime.cat_id);
+            match expected {
+                Some(Some(process)) => anyhow::ensure!(
+                    runtime.processes == [process],
+                    "Node-global managed-process proof conflicts with public projection"
+                ),
+                Some(None) | None => anyhow::ensure!(
+                    runtime.processes.is_empty(),
+                    "public process projection lacks a provider-private global expectation"
+                ),
+            }
+        }
+        anyhow::ensure!(
+            admitted_processes.is_empty(),
+            "Node-global managed-process admission names a Cat absent from inventory"
+        );
+        Ok(NodeGlobalManagedProcessAdmission {
+            observation_id: observation.observation_id.clone(),
+            node_id: observation.node_id.clone(),
+            node_boot_id: observation.node_boot_id.clone(),
+            agent_instance_id: observation.agent_instance_id.clone(),
+            agent_session_epoch: observation.agent_session_epoch,
+            inventory_epoch: observation.inventory_epoch,
+            inventory_digest,
+            inventory_read_position,
+            entries: self.entries,
+        })
+    }
+
+    #[cfg(test)]
+    pub(crate) fn into_admission_for_test(self) -> NodeGlobalManagedProcessAdmission {
+        NodeGlobalManagedProcessAdmission {
+            observation_id: RandomId128::new("11111111111111111111111111111111").unwrap(),
+            node_id: Id::new("node_test").unwrap(),
+            node_boot_id: NodeBootId::new("22222222222222222222222222222222").unwrap(),
+            agent_instance_id: RandomId128::new("33333333333333333333333333333333").unwrap(),
+            agent_session_epoch: Epoch::new(1).unwrap(),
+            inventory_epoch: Epoch::new(1).unwrap(),
+            inventory_digest: Sha256Digest::from_bytes([4; 32]),
+            inventory_read_position: Sequence::new(1).unwrap(),
+            entries: self.entries,
+        }
+    }
+}
+
+impl NodeGlobalManagedProcessAdmission {
+    pub(crate) fn matches_observation(&self, observation: &NodeObservation) -> bool {
+        observation.complete_inventory
+            && self.observation_id == observation.observation_id
+            && self.node_id == observation.node_id
+            && self.node_boot_id == observation.node_boot_id
+            && self.agent_instance_id == observation.agent_instance_id
+            && self.agent_session_epoch == observation.agent_session_epoch
+            && self.inventory_epoch == observation.inventory_epoch
+            && observation.inventory_digest.as_ref() == Some(&self.inventory_digest)
+            && observation.inventory_read_position == Some(self.inventory_read_position)
+    }
+
+    pub(crate) fn root_control_state(
+        &self,
+    ) -> (
+        BTreeMap<Id, RootProvisionProcessExpectation>,
+        BTreeMap<Id, RootProvisionProcessInspection>,
+    ) {
+        let mut expected = BTreeMap::new();
+        let mut admitted = BTreeMap::new();
+        for entry in &self.entries {
+            match entry {
+                NodeGlobalManagedProcessExpectation::RootControl { expectation, exact } => {
+                    expected.insert(expectation.cat_id.clone(), expectation.clone());
+                    admitted.insert(
+                        expectation.cat_id.clone(),
+                        exact
+                            .as_ref()
+                            .map_or(RootProvisionProcessInspection::Absent, |proof| {
+                                RootProvisionProcessInspection::Exact(Box::new(
+                                    proof.evidence().clone(),
+                                ))
+                            }),
+                    );
+                }
+            }
+        }
+        (expected, admitted)
+    }
+
+    pub(crate) fn root_control(
+        &self,
+        cat_id: &Id,
+    ) -> Option<(
+        &RootProvisionProcessExpectation,
+        Option<&ExactRootProvisionProcessProof>,
+    )> {
+        self.entries.iter().find_map(|entry| match entry {
+            NodeGlobalManagedProcessExpectation::RootControl { expectation, exact }
+                if &expectation.cat_id == cat_id =>
+            {
+                Some((expectation, exact.as_ref()))
+            }
+            NodeGlobalManagedProcessExpectation::RootControl { .. } => None,
+        })
+    }
 }
 
 /// One current-process proof that the accepted complete inventory and the

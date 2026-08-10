@@ -16,6 +16,9 @@ use cats_api::runtime_reconciliation::{
 };
 use thiserror::Error;
 
+use crate::runtime::reconciliation::{
+    NodeGlobalManagedProcessAdmission, NodeGlobalManagedProcessScanAdmission,
+};
 use crate::state_directory::StateDirectory;
 
 use super::{
@@ -182,6 +185,7 @@ pub struct RuntimeDesiredEffectContext {
     deadline: Instant,
     cancellation: RuntimeInventoryScanCancellation,
     accepted_full: Option<RuntimeDesiredEffectAdmission>,
+    node_global_process: Option<NodeGlobalManagedProcessAdmission>,
 }
 
 /// Shared read-only deadline/cancellation boundary for physical identity
@@ -300,6 +304,7 @@ pub struct RuntimeDesiredEffectAdmission {
     // advanced after the scan but still accepted the same physical evidence.
     desired_read_position: Option<cats_api::runtime_reconciliation::Sequence>,
     assigned_cats: Option<RuntimeAssignedCatSet>,
+    node_global_process: Option<NodeGlobalManagedProcessAdmission>,
 }
 
 impl RuntimeDesiredEffectAdmission {
@@ -307,6 +312,7 @@ impl RuntimeDesiredEffectAdmission {
         mut session: AgentSession,
         observation: NodeObservation,
         acceptance: &ObservationAcceptance,
+        node_global_process: Option<NodeGlobalManagedProcessAdmission>,
     ) -> Option<Self> {
         let ObservationInventoryAcceptance::Full { attestation } = &acceptance.inventory else {
             return None;
@@ -318,6 +324,9 @@ impl RuntimeDesiredEffectAdmission {
             || session.agent_session_epoch != observation.agent_session_epoch
             || acceptance.lease_deadline_unix_ms < session.lease_deadline_unix_ms
             || attestation.accepted_at_unix_ms != acceptance.accepted_at_unix_ms
+            || node_global_process
+                .as_ref()
+                .is_some_and(|admission| !admission.matches_observation(&observation))
         {
             return None;
         }
@@ -328,6 +337,7 @@ impl RuntimeDesiredEffectAdmission {
             attestation: attestation.clone(),
             desired_read_position: None,
             assigned_cats: None,
+            node_global_process,
         })
     }
 
@@ -382,6 +392,7 @@ impl RuntimeDesiredEffectAdmission {
             attestation,
             desired_read_position: Some(desired_read_position),
             assigned_cats: None,
+            node_global_process: None,
         }
     }
 
@@ -402,11 +413,15 @@ impl RuntimeDesiredEffectContext {
         cancellation: RuntimeInventoryScanCancellation,
         accepted_full: Option<RuntimeDesiredEffectAdmission>,
     ) -> Self {
+        let node_global_process = accepted_full
+            .as_ref()
+            .and_then(|admission| admission.node_global_process.clone());
         Self {
             state_directory,
             deadline,
             cancellation,
             accepted_full,
+            node_global_process,
         }
     }
 
@@ -436,6 +451,14 @@ impl RuntimeDesiredEffectContext {
         })
     }
 
+    pub(crate) fn node_global_process(&self) -> anyhow::Result<&NodeGlobalManagedProcessAdmission> {
+        self.node_global_process.as_ref().ok_or_else(|| {
+            anyhow::anyhow!(
+                "runtime Desired effect lacks its scanner-sealed Node-global process admission"
+            )
+        })
+    }
+
     #[cfg(test)]
     pub(crate) fn for_test(state_directory: StateDirectory, deadline: Instant) -> Self {
         Self::new(
@@ -458,6 +481,21 @@ impl RuntimeDesiredEffectContext {
             RuntimeInventoryScanCancellation::new(),
             Some(admission),
         )
+    }
+
+    #[cfg(test)]
+    pub(crate) fn for_test_with_node_global_process(
+        state_directory: StateDirectory,
+        deadline: Instant,
+        admission: NodeGlobalManagedProcessAdmission,
+    ) -> Self {
+        Self {
+            state_directory,
+            deadline,
+            cancellation: RuntimeInventoryScanCancellation::new(),
+            accepted_full: None,
+            node_global_process: Some(admission),
+        }
     }
 
     #[cfg(test)]
@@ -597,6 +635,7 @@ pub struct CompleteRuntimeInventory {
     key_ring: RuntimeInventoryKeyRing,
     runtimes: Vec<ObservedRuntimeStatus>,
     residue: Vec<NodeResidue>,
+    node_global_process: Option<NodeGlobalManagedProcessScanAdmission>,
 }
 
 impl CompleteRuntimeInventory {
@@ -612,7 +651,22 @@ impl CompleteRuntimeInventory {
             key_ring,
             runtimes,
             residue,
+            node_global_process: None,
         }
+    }
+
+    pub(crate) fn with_node_global_process_admission(
+        mut self,
+        admission: Option<NodeGlobalManagedProcessScanAdmission>,
+    ) -> Self {
+        self.node_global_process = admission;
+        self
+    }
+
+    pub(crate) fn take_node_global_process_admission(
+        &mut self,
+    ) -> Option<NodeGlobalManagedProcessScanAdmission> {
+        self.node_global_process.take()
     }
 
     #[cfg(test)]
@@ -627,6 +681,7 @@ impl CompleteRuntimeInventory {
             key_ring,
             runtimes,
             residue,
+            node_global_process: None,
         }
     }
 
@@ -1600,6 +1655,7 @@ pub struct RuntimeSpineRunner {
     scan_lane: Option<ScanLane>,
     effect_lane: Option<EffectLane>,
     current_process_scan_observation_id: Option<RandomId128>,
+    current_process_node_global_process: Option<NodeGlobalManagedProcessAdmission>,
     effect_admission_open: bool,
     effect_admission: Option<RuntimeDesiredEffectAdmission>,
     pending_effects: VecDeque<DesiredRuntimeSpec>,
@@ -1702,6 +1758,7 @@ impl RuntimeSpineRunner {
             scan_lane: Some(scan_lane),
             effect_lane,
             current_process_scan_observation_id: None,
+            current_process_node_global_process: None,
             effect_admission_open: false,
             effect_admission: None,
             pending_effects: VecDeque::new(),
@@ -1732,6 +1789,7 @@ impl RuntimeSpineRunner {
             PendingWork::Desired(request) => self.send_desired(request).await,
             PendingWork::Observation(request) => self.send_observation(request).await,
             PendingWork::Scan(scan) => {
+                self.current_process_node_global_process = None;
                 if self
                     .effect_lane
                     .as_ref()
@@ -1775,7 +1833,7 @@ impl RuntimeSpineRunner {
                 if Instant::now() >= deadlines.scan {
                     return Ok(RuntimeSpineRunStep::ScanDeadlineExceeded);
                 }
-                let inventory = match outcome {
+                let mut inventory = match outcome {
                     RuntimeInventoryScanOutcome::Complete(inventory) => inventory,
                     RuntimeInventoryScanOutcome::Incomplete {
                         unavailable_sources,
@@ -1790,7 +1848,16 @@ impl RuntimeSpineRunner {
                         });
                     }
                 };
+                let node_global_process = inventory.take_node_global_process_admission();
                 let candidate = build_full_observation(coordinates, inventory)?;
+                self.current_process_node_global_process = node_global_process
+                    .map(|admission| admission.bind(&candidate))
+                    .transpose()
+                    .map_err(|_| {
+                        RuntimeSpineRunError::InvalidScan(
+                            "provider-private process admission conflicts with full observation",
+                        )
+                    })?;
                 let request = self.journal_lane()?.prepare_observation(candidate).await?;
                 self.current_process_scan_observation_id =
                     Some(request.value().observation_id.clone());
@@ -2011,11 +2078,13 @@ impl RuntimeSpineRunner {
                 let service_ready = establishes_effect_admission
                     && observation_opens_service_readiness(request.value());
                 let admission = if establishes_effect_admission {
+                    let node_global_process = self.current_process_node_global_process.take();
                     Some(
                         RuntimeDesiredEffectAdmission::from_acceptance(
                             self.registered_session.clone(),
                             request.value().clone(),
                             &accepted.value,
+                            node_global_process,
                         )
                         .ok_or(RuntimeSpineRunError::InvalidScan(
                             "accepted full observation does not form one effect admission",
@@ -2028,6 +2097,7 @@ impl RuntimeSpineRunner {
                     .accept_observation(accepted.value, accepted.bytes)
                     .await?;
                 self.current_process_scan_observation_id = None;
+                self.current_process_node_global_process = None;
                 if establishes_effect_admission {
                     self.effect_admission = admission;
                     self.effect_admission_open = true;
@@ -2045,6 +2115,7 @@ impl RuntimeSpineRunner {
                     DesiredInvalidationBinding::Exact => {
                         self.journal_lane()?.invalidate_desired().await?;
                         self.current_process_scan_observation_id = None;
+                        self.current_process_node_global_process = None;
                         Ok(RuntimeSpineRunStep::DesiredInvalidated { status, error })
                     }
                     DesiredInvalidationBinding::Mismatch => Ok(RuntimeSpineRunStep::RetryExact(
@@ -2663,6 +2734,64 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec![Id::new("cat_01").unwrap()]
         );
+    }
+
+    #[test]
+    fn accepted_effect_admission_keeps_only_the_exact_scanner_private_process_binding() {
+        let desired = desired_with_network();
+        let base = effect_admission_for(&desired);
+        let session = base.session().clone();
+        let observation = base.observation().clone();
+        let attestation = base.attestation().clone();
+        let acceptance = ObservationAcceptance {
+            version: ContractVersion::V1,
+            session: SessionBinding {
+                node_id: observation.node_id.clone(),
+                node_boot_id: observation.node_boot_id.clone(),
+                agent_instance_id: observation.agent_instance_id.clone(),
+                agent_session_epoch: observation.agent_session_epoch,
+            },
+            observation_id: observation.observation_id.clone(),
+            heartbeat_sequence: observation.heartbeat_sequence,
+            accepted_at_unix_ms: attestation.accepted_at_unix_ms,
+            lease_deadline_unix_ms: session.lease_deadline_unix_ms,
+            inventory: ObservationInventoryAcceptance::Full {
+                attestation: attestation.clone(),
+            },
+        };
+        let private = NodeGlobalManagedProcessScanAdmission::from_root_controls(
+            std::collections::BTreeMap::new(),
+            std::collections::BTreeMap::new(),
+        )
+        .unwrap()
+        .bind(&observation)
+        .unwrap();
+        let admitted = RuntimeDesiredEffectAdmission::from_acceptance(
+            session.clone(),
+            observation.clone(),
+            &acceptance,
+            Some(private),
+        )
+        .expect("exact private scan binding must enter the effect context");
+        assert!(admitted.node_global_process.is_some());
+
+        let mut another_observation = observation.clone();
+        another_observation.observation_id =
+            RandomId128::new("99999999999999999999999999999999").unwrap();
+        let foreign_private = NodeGlobalManagedProcessScanAdmission::from_root_controls(
+            std::collections::BTreeMap::new(),
+            std::collections::BTreeMap::new(),
+        )
+        .unwrap()
+        .bind(&another_observation)
+        .unwrap();
+        assert!(RuntimeDesiredEffectAdmission::from_acceptance(
+            session,
+            observation,
+            &acceptance,
+            Some(foreign_private),
+        )
+        .is_none());
     }
 
     fn snapshot_with_network() -> Vec<u8> {

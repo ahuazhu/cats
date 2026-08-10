@@ -2865,7 +2865,11 @@ impl RootProcessInventoryBridge for PlatformRootProcessInventoryBridge {
                 proofs.insert(cat_id, proof);
             }
         }
-        Ok(RootProcessInventoryBridgeOutcome::Complete(proofs))
+        Ok(RootProcessInventoryBridgeOutcome::Complete(
+            super::root_provision_process::NodeGlobalManagedProcessScanAdmission::from_root_controls(
+                expected, proofs,
+            )?,
+        ))
     }
 }
 
@@ -2880,21 +2884,60 @@ impl RootProvisionProcessGlobalPort for PlatformRootProcessInventoryBridge {
     fn inspect_exact_or_absent_after_node_global_sweep(
         &self,
         expected: &RootProvisionProcessExpectation,
-        context: &dyn RuntimePhysicalReadContext,
+        context: &crate::runtime_spine::RuntimeDesiredEffectContext,
     ) -> anyhow::Result<RootProvisionProcessInspection> {
-        let first =
-            match inspect_exact_root_provision_process(self.port.as_ref(), expected, context)? {
-                inspection @ (RootProvisionProcessInspection::Absent
-                | RootProvisionProcessInspection::Exact(_)) => inspection,
-                other => return Ok(other),
-            };
-        let mut allowed_units = BTreeSet::new();
-        let mut allowed_pids = BTreeSet::new();
-        let mut allowed_sockets = BTreeSet::new();
-        if let RootProvisionProcessInspection::Exact(evidence) = &first {
-            allowed_units.insert(evidence.scope_id.clone());
-            allowed_pids.insert(evidence.process_id);
-            allowed_sockets.insert(PathBuf::from(evidence.control_socket_path.as_str()));
+        let admission = context.node_global_process()?;
+        let Some((admitted_target, _)) = admission.root_control(&expected.cat_id) else {
+            return Ok(RootProvisionProcessInspection::Conflict(
+                RootProvisionProcessConflict::IdentityMismatch,
+            ));
+        };
+        if admitted_target != expected {
+            return Ok(RootProvisionProcessInspection::Conflict(
+                RootProvisionProcessConflict::IdentityMismatch,
+            ));
+        }
+        let (expectations, admitted) = admission.root_control_state();
+        let Some(first) = inspect_root_process_set(self.port.as_ref(), &expectations, context)?
+        else {
+            return Ok(RootProvisionProcessInspection::Unavailable);
+        };
+        if first != admitted {
+            return Ok(RootProvisionProcessInspection::Conflict(
+                RootProvisionProcessConflict::IdentityMismatch,
+            ));
+        }
+        let allowed_units = first
+            .values()
+            .filter_map(|inspection| match inspection {
+                RootProvisionProcessInspection::Exact(evidence) => Some(evidence.scope_id.clone()),
+                RootProvisionProcessInspection::Absent => None,
+                _ => unreachable!("closed process set contains only exact or absent"),
+            })
+            .collect::<BTreeSet<_>>();
+        let allowed_pids = first
+            .values()
+            .filter_map(|inspection| match inspection {
+                RootProvisionProcessInspection::Exact(evidence) => Some(evidence.process_id),
+                RootProvisionProcessInspection::Absent => None,
+                _ => unreachable!("closed process set contains only exact or absent"),
+            })
+            .collect::<BTreeSet<_>>();
+        let allowed_sockets = first
+            .values()
+            .filter_map(|inspection| match inspection {
+                RootProvisionProcessInspection::Exact(evidence) => {
+                    Some(PathBuf::from(evidence.control_socket_path.as_str()))
+                }
+                RootProvisionProcessInspection::Absent => None,
+                _ => unreachable!("closed process set contains only exact or absent"),
+            })
+            .collect::<BTreeSet<_>>();
+        if allowed_units.len() != allowed_pids.len() || allowed_pids.len() != allowed_sockets.len()
+        {
+            return Ok(RootProvisionProcessInspection::Conflict(
+                RootProvisionProcessConflict::DuplicateIdentity,
+            ));
         }
         let sweep = match self.sweep_node_global_inventory(
             &allowed_units,
@@ -2919,21 +2962,19 @@ impl RootProvisionProcessGlobalPort for PlatformRootProcessInventoryBridge {
             ProbeFact::Unavailable => return Ok(RootProvisionProcessInspection::Unavailable),
             ProbeFact::Empty => {}
         }
-        let second = inspect_exact_root_provision_process(self.port.as_ref(), expected, context)?;
-        Ok(match (&first, &second) {
-            (RootProvisionProcessInspection::Absent, RootProvisionProcessInspection::Absent)
-            | (
-                RootProvisionProcessInspection::Exact(_),
-                RootProvisionProcessInspection::Exact(_),
-            ) if first == second => second,
-            (RootProvisionProcessInspection::Unavailable, _)
-            | (_, RootProvisionProcessInspection::Unavailable) => {
-                RootProvisionProcessInspection::Unavailable
-            }
-            _ => RootProvisionProcessInspection::Conflict(
+        let Some(second) = inspect_root_process_set(self.port.as_ref(), &expectations, context)?
+        else {
+            return Ok(RootProvisionProcessInspection::Unavailable);
+        };
+        if first != second {
+            return Ok(RootProvisionProcessInspection::Conflict(
                 RootProvisionProcessConflict::IdentityMismatch,
-            ),
-        })
+            ));
+        }
+        Ok(second
+            .get(&expected.cat_id)
+            .expect("target expectation was retained in the closed set")
+            .clone())
     }
 }
 
@@ -3016,7 +3057,7 @@ impl RootProvisionProcessRetirementPort for PlatformRootProcessInventoryBridge {
 fn inspect_root_process_set(
     port: &dyn RootProvisionProcessPort,
     expected: &BTreeMap<Id, RootProvisionProcessExpectation>,
-    context: &RuntimeInventoryScanContext,
+    context: &dyn RuntimePhysicalReadContext,
 ) -> anyhow::Result<Option<BTreeMap<Id, RootProvisionProcessInspection>>> {
     let mut inspected = BTreeMap::new();
     for (cat_id, expectation) in expected {
@@ -5267,13 +5308,14 @@ mod tests {
     use std::time::{Duration, Instant};
 
     use cats_api::runtime_reconciliation::{
-        decode_desired_read_snapshot, spec_digest, AcquireOrigin, AsciiText, AssignedKind,
-        AssignedPlacement, CheckpointEvidence, CleanupRelease, CleanupTarget, ContractVersion,
-        DesiredRuntimeSpec, DirectAuthorizedAttachmentIdentity, DirectAuthorizedAttachmentPurpose,
-        DiskKind, Durability, Epoch, FenceEpoch, Generation, GuestDeviceIdentity, HostPath, Id,
-        Ipv4Address, IsolatedIpv4Kind, LifecycleAdmission, MacAddress, NetworkConfig, NodeBootId,
-        NormalAcquireRequest, PrepareDeviceFrontend, RandomId128, ReconcileStep, RemoteHead,
-        Revision, RuntimeConfig, RuntimeTarget, RuntimeTransition, RuntimeVolumeTransition,
+        decode_desired_read_snapshot, inventory_digest, spec_digest, AcquireOrigin, AsciiText,
+        AssignedKind, AssignedPlacement, CheckpointEvidence, CleanupRelease, CleanupTarget,
+        ContractVersion, DesiredRuntimeSpec, DirectAuthorizedAttachmentIdentity,
+        DirectAuthorizedAttachmentPurpose, DiskKind, Durability, Epoch, FenceEpoch, Generation,
+        GuestDeviceIdentity, HostPath, Id, Ipv4Address, IsolatedIpv4Kind, LifecycleAdmission,
+        MacAddress, NetworkConfig, NodeBootId, NodeObservation, NormalAcquireRequest,
+        PrepareDeviceFrontend, RandomId128, ReconcileStep, RemoteHead, Revision, RuntimeConfig,
+        RuntimeTarget, RuntimeTransition, RuntimeVolumeTransition,
         RuntimeVolumeTransitionPreconditionProblem, RuntimeVolumeTransitionRequest,
         ServingAuthorityProvenance, ServingBlockdIdentity, SessionBinding, Sha256Digest,
         UnixMillis, VolumeAccess, VolumeAcquire, VolumeAcquireRequest, VolumeDisposition,
@@ -5286,8 +5328,9 @@ mod tests {
     use tempfile::TempDir;
 
     use crate::runtime_spine::{
-        RuntimeInventoryScanOutcome, RuntimeInventoryScanner, RuntimePreScanRecovery,
-        RuntimePreScanRecoveryContext, RuntimePreScanRecoveryOutcome, RuntimeSpineFullScan,
+        RuntimeDesiredEffectContext, RuntimeInventoryScanOutcome, RuntimeInventoryScanner,
+        RuntimePreScanRecovery, RuntimePreScanRecoveryContext, RuntimePreScanRecoveryOutcome,
+        RuntimeSpineFullScan,
     };
 
     use super::super::signed_running::{
@@ -5974,6 +6017,47 @@ mod tests {
         }
     }
 
+    struct CancellingRootProcessPort {
+        inspections: Mutex<VecDeque<RootProvisionProcessInspection>>,
+        calls: AtomicUsize,
+        cancel_after: usize,
+        context: RuntimeDesiredEffectContext,
+    }
+
+    impl super::super::root_provision_process::sealed::Sealed for CancellingRootProcessPort {}
+
+    impl RootProvisionProcessPort for CancellingRootProcessPort {
+        fn inspect(
+            &self,
+            _expected: &RootProvisionProcessExpectation,
+            context: &dyn crate::runtime_spine::RuntimePhysicalReadContext,
+        ) -> anyhow::Result<RootProvisionProcessInspection> {
+            context.check_active()?;
+            let call = self.calls.fetch_add(1, Ordering::SeqCst) + 1;
+            let inspection = self
+                .inspections
+                .lock()
+                .unwrap()
+                .pop_front()
+                .context("cancelling root-process inspection exhausted")?;
+            if call == self.cancel_after {
+                self.context.cancel_for_test();
+            }
+            Ok(inspection)
+        }
+
+        fn start_checkpointed(
+            &self,
+            _checkpointed: super::super::root_provision_process::CheckpointedRootProvisionProcess<
+                '_,
+            >,
+            _context: &crate::runtime_spine::RuntimeDesiredEffectContext,
+        ) -> anyhow::Result<super::super::root_provision_process::RootProvisionProcessStart>
+        {
+            unreachable!("global allowlist tests never start a process")
+        }
+    }
+
     fn root_process_expectation(
         environment: &TestEnvironment,
     ) -> (RootProvisionProcessExpectation, PathBuf) {
@@ -6064,14 +6148,58 @@ mod tests {
         }
     }
 
+    fn second_root_process_expectation(
+        environment: &TestEnvironment,
+        first: &RootProvisionProcessExpectation,
+    ) -> RootProvisionProcessExpectation {
+        let mut second = first.clone();
+        second.cat_id = Id::new("cat_02").unwrap();
+        second.scope_id = Id::new("cats-root-bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb.service").unwrap();
+        second.cgroup_path = HostPath::new(
+            environment
+                .systemd_root
+                .join(second.scope_id.as_str())
+                .to_string_lossy()
+                .into_owned(),
+        )
+        .unwrap();
+        let data_directory = environment
+            .state
+            .join(DATA_NAMESPACE)
+            .join("second-control");
+        std::fs::create_dir_all(&data_directory).unwrap();
+        second.data_directory =
+            HostPath::new(data_directory.to_string_lossy().into_owned()).unwrap();
+        second.control_socket_path = HostPath::new(
+            data_directory
+                .join("root-provision.sock")
+                .to_string_lossy()
+                .into_owned(),
+        )
+        .unwrap();
+        second.process_identity_token =
+            RandomId128::new("bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb").unwrap();
+        second
+    }
+
     fn root_process_bridge(
         environment: &TestEnvironment,
         inspections: impl IntoIterator<Item = RootProvisionProcessInspection>,
     ) -> PlatformRootProcessInventoryBridge {
-        PlatformRootProcessInventoryBridge {
-            port: Arc::new(FakeRootProcessPort {
+        root_process_bridge_with_port(
+            environment,
+            Arc::new(FakeRootProcessPort {
                 inspections: Mutex::new(inspections.into_iter().collect()),
             }),
+        )
+    }
+
+    fn root_process_bridge_with_port(
+        environment: &TestEnvironment,
+        port: Arc<dyn RootProvisionProcessPort>,
+    ) -> PlatformRootProcessInventoryBridge {
+        PlatformRootProcessInventoryBridge {
+            port,
             executable_path: HostPath::new(
                 environment.blockd_binary.to_string_lossy().into_owned(),
             )
@@ -6088,6 +6216,40 @@ mod tests {
             legacy_socket_root: environment.socket_root.clone(),
             limits: ProbeLimits::default(),
         }
+    }
+
+    fn effect_context_with_root_controls(
+        environment: &TestEnvironment,
+        entries: impl IntoIterator<
+            Item = (
+                RootProvisionProcessExpectation,
+                Option<super::super::root_provision_process::RootProvisionProcessEvidence>,
+            ),
+        >,
+    ) -> RuntimeDesiredEffectContext {
+        let mut expected = BTreeMap::new();
+        let mut exact = BTreeMap::new();
+        for (expectation, evidence) in entries {
+            let cat_id = expectation.cat_id.clone();
+            if let Some(evidence) = evidence {
+                exact.insert(
+                    cat_id.clone(),
+                    expectation.clone().prove_exact_process(evidence).unwrap(),
+                );
+            }
+            expected.insert(cat_id, expectation);
+        }
+        let admission = super::super::root_provision_process::NodeGlobalManagedProcessScanAdmission::from_root_controls(
+            expected,
+            exact,
+        )
+        .unwrap()
+        .into_admission_for_test();
+        RuntimeDesiredEffectContext::for_test_with_node_global_process(
+            StateDirectory::unanchored(environment.state.clone()),
+            Instant::now() + Duration::from_secs(5),
+            admission,
+        )
     }
 
     fn persist_acquire_checkpoint(
@@ -7913,9 +8075,10 @@ mod tests {
                 &assigned_context(true),
             )
             .unwrap();
-        let RootProcessInventoryBridgeOutcome::Complete(mut processes) = outcome else {
+        let RootProcessInventoryBridgeOutcome::Complete(admission) = outcome else {
             panic!("exact physical process must complete the three-source bridge")
         };
+        let mut processes = admission.root_control_proofs();
         let evidence = processes
             .remove(&Id::new("cat_01").unwrap())
             .unwrap()
@@ -8849,6 +9012,71 @@ mod tests {
     }
 
     #[test]
+    fn scanner_private_process_admission_binds_exact_full_observation_coordinates() {
+        let environment = TestEnvironment::new();
+        let fixture = full_root_scanner_fixture(&environment);
+        let coordinates = fixture.scan_context.coordinates().clone();
+        install_exact_control_only_files(
+            &fixture.data_directory,
+            fixture.expected.attachment.size_bytes,
+        );
+        let exact = exact_process_evidence(&fixture.expected, 71);
+        let _socket =
+            install_exact_process_fixture(&environment, &fixture.expected, exact.process_id);
+        let scanner = full_root_scanner(
+            &fixture,
+            [
+                RootProvisionProcessInspection::Exact(Box::new(exact.clone())),
+                RootProvisionProcessInspection::Exact(Box::new(exact)),
+            ],
+        );
+        let RuntimeInventoryScanOutcome::Complete(mut inventory) =
+            scanner.scan_complete(fixture.scan_context).unwrap()
+        else {
+            panic!("all exact sources must complete the full scan")
+        };
+        let scan_admission = inventory
+            .take_node_global_process_admission()
+            .expect("full scanner must retain its private process admission");
+        let mut observation = NodeObservation {
+            version: ContractVersion::V1,
+            observation_id: RandomId128::new("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa").unwrap(),
+            node_id: coordinates.session.node_id.clone(),
+            node_boot_id: coordinates.session.node_boot_id.clone(),
+            agent_instance_id: coordinates.session.agent_instance_id.clone(),
+            agent_session_epoch: coordinates.session.agent_session_epoch,
+            heartbeat_sequence: coordinates.heartbeat_sequence,
+            observed_at_unix_ms: inventory.observed_at_unix_ms(),
+            complete_inventory: true,
+            inventory_epoch: coordinates.inventory_epoch,
+            inventory_digest: Some(Sha256Digest::from_bytes([0; 32])),
+            inventory_read_position: Some(coordinates.desired.read_position),
+            key_ring_version: None,
+            key_ring_digest: None,
+            loaded_kids: Vec::new(),
+            runtimes: inventory.runtimes().to_vec(),
+            residue: inventory.residue().to_vec(),
+        };
+        observation.inventory_digest = Some(inventory_digest(&observation).unwrap());
+        let admission = scan_admission.bind(&observation).unwrap();
+        assert!(admission.matches_observation(&observation));
+
+        let mut changed = observation.clone();
+        changed.observation_id = RandomId128::new("bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb").unwrap();
+        assert!(!admission.matches_observation(&changed));
+        let mut changed = observation.clone();
+        changed.inventory_digest = Some(Sha256Digest::from_bytes([9; 32]));
+        assert!(!admission.matches_observation(&changed));
+        let mut changed = observation.clone();
+        changed.agent_session_epoch = Epoch::new(changed.agent_session_epoch.get() + 1).unwrap();
+        assert!(!admission.matches_observation(&changed));
+        let mut changed = observation;
+        changed.inventory_read_position =
+            Some(cats_api::runtime_reconciliation::Sequence::new(13).unwrap());
+        assert!(!admission.matches_observation(&changed));
+    }
+
+    #[test]
     fn root_process_bridge_absent_and_unavailable_are_distinct() {
         let environment = TestEnvironment::new();
         let (expected, _) = root_process_expectation(&environment);
@@ -8866,7 +9094,8 @@ mod tests {
                     &assigned_context(true),
                 )
                 .unwrap(),
-            RootProcessInventoryBridgeOutcome::Complete(processes) if processes.is_empty()
+            RootProcessInventoryBridgeOutcome::Complete(admission)
+                if admission.root_control_proofs().is_empty()
         ));
 
         let environment = TestEnvironment::new();
@@ -9022,6 +9251,8 @@ mod tests {
     fn effect_global_port_brackets_exact_and_absent_and_rejects_late_duplicate() {
         let environment = TestEnvironment::new();
         let (expected, _) = root_process_expectation(&environment);
+        let effect_context =
+            effect_context_with_root_controls(&environment, [(expected.clone(), None)]);
         let bridge = root_process_bridge(
             &environment,
             [
@@ -9031,10 +9262,7 @@ mod tests {
         );
         assert_eq!(
             bridge
-                .inspect_exact_or_absent_after_node_global_sweep(
-                    &expected,
-                    &assigned_context(true),
-                )
+                .inspect_exact_or_absent_after_node_global_sweep(&expected, &effect_context,)
                 .unwrap(),
             RootProvisionProcessInspection::Absent
         );
@@ -9042,6 +9270,10 @@ mod tests {
         let environment = TestEnvironment::new();
         let (expected, _) = root_process_expectation(&environment);
         let exact = exact_process_evidence(&expected, 76);
+        let effect_context = effect_context_with_root_controls(
+            &environment,
+            [(expected.clone(), Some(exact.clone()))],
+        );
         let _socket = install_exact_process_fixture(&environment, &expected, exact.process_id);
         let bridge = root_process_bridge(
             &environment,
@@ -9052,10 +9284,7 @@ mod tests {
         );
         assert_eq!(
             bridge
-                .inspect_exact_or_absent_after_node_global_sweep(
-                    &expected,
-                    &assigned_context(true),
-                )
+                .inspect_exact_or_absent_after_node_global_sweep(&expected, &effect_context,)
                 .unwrap(),
             RootProvisionProcessInspection::Exact(Box::new(exact))
         );
@@ -9064,16 +9293,17 @@ mod tests {
         // blank/wrapper incarnation elsewhere in the Node-global namespace.
         std::fs::create_dir(environment.systemd_root.join("cats-second.service")).unwrap();
         let exact = exact_process_evidence(&expected, 76);
+        let effect_context = effect_context_with_root_controls(
+            &environment,
+            [(expected.clone(), Some(exact.clone()))],
+        );
         let bridge = root_process_bridge(
             &environment,
             [RootProvisionProcessInspection::Exact(Box::new(exact))],
         );
         assert!(matches!(
             bridge
-                .inspect_exact_or_absent_after_node_global_sweep(
-                    &expected,
-                    &assigned_context(true),
-                )
+                .inspect_exact_or_absent_after_node_global_sweep(&expected, &effect_context,)
                 .unwrap(),
             RootProvisionProcessInspection::Conflict(
                 RootProvisionProcessConflict::DuplicateIdentity
@@ -9082,19 +9312,172 @@ mod tests {
 
         let environment = TestEnvironment::new();
         let (expected, _) = root_process_expectation(&environment);
+        let effect_context =
+            effect_context_with_root_controls(&environment, [(expected.clone(), None)]);
         std::fs::create_dir(environment.systemd_root.join("cats-late.service")).unwrap();
         let bridge = root_process_bridge(&environment, [RootProvisionProcessInspection::Absent]);
         assert!(matches!(
             bridge
-                .inspect_exact_or_absent_after_node_global_sweep(
-                    &expected,
-                    &assigned_context(true),
-                )
+                .inspect_exact_or_absent_after_node_global_sweep(&expected, &effect_context,)
                 .unwrap(),
             RootProvisionProcessInspection::Conflict(
                 RootProvisionProcessConflict::DuplicateIdentity
             )
         ));
+    }
+
+    #[test]
+    fn effect_global_port_allows_two_exact_cats_but_rejects_a_third_foreign_identity() {
+        let environment = TestEnvironment::new();
+        let (first, _) = root_process_expectation(&environment);
+        let second = second_root_process_expectation(&environment, &first);
+        let first_process = exact_process_evidence(&first, 76);
+        let second_process = exact_process_evidence(&second, 77);
+        let _first_socket =
+            install_exact_process_fixture(&environment, &first, first_process.process_id);
+        let _second_socket =
+            install_exact_process_fixture(&environment, &second, second_process.process_id);
+        let context = effect_context_with_root_controls(
+            &environment,
+            [
+                (first.clone(), Some(first_process.clone())),
+                (second.clone(), Some(second_process.clone())),
+            ],
+        );
+        let bridge = root_process_bridge(
+            &environment,
+            [
+                RootProvisionProcessInspection::Exact(Box::new(first_process.clone())),
+                RootProvisionProcessInspection::Exact(Box::new(second_process.clone())),
+                RootProvisionProcessInspection::Exact(Box::new(first_process.clone())),
+                RootProvisionProcessInspection::Exact(Box::new(second_process.clone())),
+            ],
+        );
+        assert_eq!(
+            bridge
+                .inspect_exact_or_absent_after_node_global_sweep(&first, &context)
+                .unwrap(),
+            RootProvisionProcessInspection::Exact(Box::new(first_process.clone()))
+        );
+
+        std::fs::create_dir(environment.systemd_root.join("cats-foreign.service")).unwrap();
+        let bridge = root_process_bridge(
+            &environment,
+            [
+                RootProvisionProcessInspection::Exact(Box::new(first_process)),
+                RootProvisionProcessInspection::Exact(Box::new(second_process)),
+            ],
+        );
+        assert!(matches!(
+            bridge
+                .inspect_exact_or_absent_after_node_global_sweep(&first, &context)
+                .unwrap(),
+            RootProvisionProcessInspection::Conflict(
+                RootProvisionProcessConflict::DuplicateIdentity
+            )
+        ));
+    }
+
+    #[test]
+    fn node_global_admission_rejects_duplicate_exact_physical_identity() {
+        let environment = TestEnvironment::new();
+        let (first, _) = root_process_expectation(&environment);
+        let mut duplicate = first.clone();
+        duplicate.cat_id = Id::new("cat_02").unwrap();
+        let first_process = exact_process_evidence(&first, 76);
+        let duplicate_process = exact_process_evidence(&duplicate, 76);
+        let first_proof = first.clone().prove_exact_process(first_process).unwrap();
+        let duplicate_proof = duplicate
+            .clone()
+            .prove_exact_process(duplicate_process)
+            .unwrap();
+
+        assert!(super::super::root_provision_process::NodeGlobalManagedProcessScanAdmission::from_root_controls(
+            BTreeMap::from([
+                (first.cat_id.clone(), first),
+                (duplicate.cat_id.clone(), duplicate),
+            ]),
+            BTreeMap::from([
+                (first_proof.expectation().cat_id.clone(), first_proof),
+                (duplicate_proof.expectation().cat_id.clone(), duplicate_proof),
+            ]),
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn effect_global_port_rejects_other_cat_aba_and_honors_mid_sweep_cancellation() {
+        let environment = TestEnvironment::new();
+        let (first, _) = root_process_expectation(&environment);
+        let second = second_root_process_expectation(&environment, &first);
+        let first_process = exact_process_evidence(&first, 76);
+        let second_process = exact_process_evidence(&second, 77);
+        let _first_socket =
+            install_exact_process_fixture(&environment, &first, first_process.process_id);
+        let _second_socket =
+            install_exact_process_fixture(&environment, &second, second_process.process_id);
+        let context = effect_context_with_root_controls(
+            &environment,
+            [
+                (first.clone(), Some(first_process.clone())),
+                (second.clone(), Some(second_process.clone())),
+            ],
+        );
+        let mut changed_second = second_process.clone();
+        changed_second.process_start_time_ticks =
+            WireU64::new(changed_second.process_start_time_ticks.get() + 1).unwrap();
+        let bridge = root_process_bridge(
+            &environment,
+            [
+                RootProvisionProcessInspection::Exact(Box::new(first_process.clone())),
+                RootProvisionProcessInspection::Exact(Box::new(second_process.clone())),
+                RootProvisionProcessInspection::Exact(Box::new(first_process.clone())),
+                RootProvisionProcessInspection::Exact(Box::new(changed_second)),
+            ],
+        );
+        assert!(matches!(
+            bridge
+                .inspect_exact_or_absent_after_node_global_sweep(&first, &context)
+                .unwrap(),
+            RootProvisionProcessInspection::Conflict(
+                RootProvisionProcessConflict::IdentityMismatch
+            )
+        ));
+
+        let environment = TestEnvironment::new();
+        let (first, _) = root_process_expectation(&environment);
+        let second = second_root_process_expectation(&environment, &first);
+        let first_process = exact_process_evidence(&first, 76);
+        let second_process = exact_process_evidence(&second, 77);
+        let _first_socket =
+            install_exact_process_fixture(&environment, &first, first_process.process_id);
+        let _second_socket =
+            install_exact_process_fixture(&environment, &second, second_process.process_id);
+        let context = effect_context_with_root_controls(
+            &environment,
+            [
+                (first.clone(), Some(first_process.clone())),
+                (second, Some(second_process.clone())),
+            ],
+        );
+        let bridge = root_process_bridge_with_port(
+            &environment,
+            Arc::new(CancellingRootProcessPort {
+                inspections: Mutex::new(
+                    [
+                        RootProvisionProcessInspection::Exact(Box::new(first_process)),
+                        RootProvisionProcessInspection::Exact(Box::new(second_process)),
+                    ]
+                    .into(),
+                ),
+                calls: AtomicUsize::new(0),
+                cancel_after: 2,
+                context: context.clone(),
+            }),
+        );
+        assert!(bridge
+            .inspect_exact_or_absent_after_node_global_sweep(&first, &context)
+            .is_err());
     }
 
     #[test]

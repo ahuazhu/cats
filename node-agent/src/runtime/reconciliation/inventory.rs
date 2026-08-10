@@ -38,9 +38,9 @@ use crate::runtime_spine::{
 
 use super::{
     root_provision_process::{
-        ExactRootProvisionProcessProof, RetainedRootProvisionProcessAttempt,
-        RootProvisionAuthoritySnapshot, RootProvisionProcessExpectation,
-        TargetControlProcessLaunchIdentity,
+        ExactRootProvisionProcessProof, NodeGlobalManagedProcessScanAdmission,
+        RetainedRootProvisionProcessAttempt, RootProvisionAuthoritySnapshot,
+        RootProvisionProcessExpectation, TargetControlProcessLaunchIdentity,
     },
     runtime_checkpoint_path,
     signed_running::{
@@ -156,7 +156,7 @@ pub(crate) mod root_process_inventory_bridge_sealed {
 
 #[derive(Debug)]
 pub(crate) enum RootProcessInventoryBridgeOutcome {
-    Complete(BTreeMap<Id, ExactRootProvisionProcessProof>),
+    Complete(NodeGlobalManagedProcessScanAdmission),
     Unavailable,
 }
 
@@ -401,6 +401,7 @@ impl RuntimeInventoryScanner for CleanSlateInventoryScanner {
     ) -> anyhow::Result<RuntimeInventoryScanOutcome> {
         let mut aggregate = InventoryProbeAggregation::new();
         let mut processes_by_cat = BTreeMap::new();
+        let mut node_global_process_admission = None;
         if let Some(bridge) = &self.root_process_bridge {
             // The process expectation cannot be derived until all three data
             // authorities have completed. Read each prerequisite exactly
@@ -436,8 +437,9 @@ impl RuntimeInventoryScanner for CleanSlateInventoryScanner {
                 .remaining()
                 .context("root-process inventory bridge deadline expired before inspection")?;
             match bridge.inspect_all(expected, &context)? {
-                RootProcessInventoryBridgeOutcome::Complete(processes) => {
-                    processes_by_cat = processes;
+                RootProcessInventoryBridgeOutcome::Complete(admission) => {
+                    processes_by_cat = admission.root_control_proofs();
+                    node_global_process_admission = Some(admission);
                 }
                 RootProcessInventoryBridgeOutcome::Unavailable => {
                     aggregate.unavailable_sources.extend([
@@ -559,7 +561,8 @@ impl RuntimeInventoryScanner for CleanSlateInventoryScanner {
                 key_ring,
                 runtimes,
                 Vec::new(),
-            ),
+            )
+            .with_node_global_process_admission(node_global_process_admission),
         ))
     }
 }

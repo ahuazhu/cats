@@ -4042,7 +4042,7 @@ mod tests {
         fn inspect_exact_or_absent_after_node_global_sweep(
             &self,
             _expected: &RootProvisionProcessExpectation,
-            context: &dyn RuntimePhysicalReadContext,
+            context: &RuntimeDesiredEffectContext,
         ) -> Result<RootProvisionProcessInspection> {
             self.inspect_one(context)
         }
@@ -4073,25 +4073,9 @@ mod tests {
                 after_sweep: Mutex::new(Some(Box::new(after_sweep))),
             }
         }
-    }
 
-    impl root_process_global_sealed::Sealed for RetirementEffectGlobalPort {}
-    impl root_process_retirement_sealed::Sealed for RetirementEffectGlobalPort {}
-
-    impl RootProvisionProcessRetirementPort for RetirementEffectGlobalPort {
-        fn inspect_after_node_global_sweep(
+        fn inspect_one(
             &self,
-            expected: &RootProvisionProcessExpectation,
-            context: &dyn RuntimePhysicalReadContext,
-        ) -> Result<RootProvisionProcessInspection> {
-            self.inspect_exact_or_absent_after_node_global_sweep(expected, context)
-        }
-    }
-
-    impl RootProvisionProcessGlobalPort for RetirementEffectGlobalPort {
-        fn inspect_exact_or_absent_after_node_global_sweep(
-            &self,
-            _expected: &RootProvisionProcessExpectation,
             context: &dyn RuntimePhysicalReadContext,
         ) -> Result<RootProvisionProcessInspection> {
             context.check_active()?;
@@ -4106,6 +4090,29 @@ mod tests {
                 after_sweep();
             }
             Ok(inspection)
+        }
+    }
+
+    impl root_process_global_sealed::Sealed for RetirementEffectGlobalPort {}
+    impl root_process_retirement_sealed::Sealed for RetirementEffectGlobalPort {}
+
+    impl RootProvisionProcessRetirementPort for RetirementEffectGlobalPort {
+        fn inspect_after_node_global_sweep(
+            &self,
+            _expected: &RootProvisionProcessExpectation,
+            context: &dyn RuntimePhysicalReadContext,
+        ) -> Result<RootProvisionProcessInspection> {
+            self.inspect_one(context)
+        }
+    }
+
+    impl RootProvisionProcessGlobalPort for RetirementEffectGlobalPort {
+        fn inspect_exact_or_absent_after_node_global_sweep(
+            &self,
+            _expected: &RootProvisionProcessExpectation,
+            context: &RuntimeDesiredEffectContext,
+        ) -> Result<RootProvisionProcessInspection> {
+            self.inspect_one(context)
         }
     }
 
@@ -4191,7 +4198,7 @@ mod tests {
         fn inspect_exact_or_absent_after_node_global_sweep(
             &self,
             _expected: &RootProvisionProcessExpectation,
-            context: &dyn RuntimePhysicalReadContext,
+            context: &RuntimeDesiredEffectContext,
         ) -> Result<RootProvisionProcessInspection> {
             context.check_active()?;
             let mut record = self.authority.record.lock().unwrap();
