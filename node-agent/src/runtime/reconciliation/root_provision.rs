@@ -94,22 +94,30 @@ impl UnixRootProvisionClient {
         &self.socket_path
     }
 
-    /// Execute under the runner's one absolute effect deadline and
-    /// cancellation boundary. Production composition uses this entrypoint;
-    /// the public port method retains its standalone timeout contract for
-    /// focused clients/tests.
-    pub(crate) fn execute_with_context(
+    /// Execute only when the connected Unix peer is the process which the
+    /// caller revalidated immediately before this transport effect. The peer
+    /// check happens before the first request byte is written.
+    pub(crate) fn execute_with_context_for_peer(
         &self,
         request: &ProvisionRootImageRequest,
+        expected_peer_process_id: u32,
+        validate_current_process: &mut dyn FnMut() -> bool,
         context: &dyn RuntimePhysicalReadContext,
     ) -> Result<AuthorityRereadRequired, RootProvisionClientError> {
-        self.execute_bounded(request, Some(context))
+        self.execute_bounded(
+            request,
+            Some(context),
+            Some(expected_peer_process_id),
+            Some(validate_current_process),
+        )
     }
 
     fn execute_bounded(
         &self,
         request: &ProvisionRootImageRequest,
         context: Option<&dyn RuntimePhysicalReadContext>,
+        expected_peer_process_id: Option<u32>,
+        mut validate_current_process: Option<&mut dyn FnMut() -> bool>,
     ) -> Result<AuthorityRereadRequired, RootProvisionClientError> {
         let payload = encode_provision_root_image_request(request)?;
         let write_deadline = phase_deadline(self.write_timeout, context);
@@ -117,6 +125,17 @@ impl UnixRootProvisionClient {
             Ok(stream) => stream,
             Err(reason) => return Ok(unknown(reason)),
         };
+        if expected_peer_process_id.is_some_and(|expected| {
+            connected_peer_process_id(&stream).is_none_or(|actual| actual != expected)
+        }) {
+            return Ok(unknown(RootProvisionUnknownReason::MismatchedIdentity));
+        }
+        if validate_current_process
+            .as_mut()
+            .is_some_and(|validate| !validate())
+        {
+            return Ok(unknown(RootProvisionUnknownReason::MismatchedIdentity));
+        }
         let mut frame = Vec::with_capacity(COMMAND_PREFIX.len() + payload.len() + 1);
         frame.extend_from_slice(COMMAND_PREFIX);
         frame.extend_from_slice(&payload);
@@ -139,7 +158,7 @@ impl RootProvisionControlPort for UnixRootProvisionClient {
         &self,
         request: &ProvisionRootImageRequest,
     ) -> Result<AuthorityRereadRequired, RootProvisionClientError> {
-        self.execute_bounded(request, None)
+        self.execute_bounded(request, None, None, None)
     }
 }
 
@@ -367,9 +386,13 @@ fn connect_before(
         // SAFETY: descriptor is live and each fcntl reads or updates only its
         // integer flags.
         let status = unsafe { libc::fcntl(descriptor, libc::F_GETFL) };
-        let nonblocking = status >= 0
-            && unsafe { libc::fcntl(descriptor, libc::F_SETFL, status | libc::O_NONBLOCK) } == 0
-            && unsafe { libc::fcntl(descriptor, libc::F_SETFD, libc::FD_CLOEXEC) } == 0;
+        // SAFETY: descriptor is live and F_SETFL consumes only the integer
+        // status flags obtained immediately above.
+        let set_nonblocking =
+            unsafe { libc::fcntl(descriptor, libc::F_SETFL, status | libc::O_NONBLOCK) };
+        // SAFETY: descriptor is live and F_SETFD consumes only FD_CLOEXEC.
+        let set_close_on_exec = unsafe { libc::fcntl(descriptor, libc::F_SETFD, libc::FD_CLOEXEC) };
+        let nonblocking = status >= 0 && set_nonblocking == 0 && set_close_on_exec == 0;
         if !nonblocking {
             // SAFETY: descriptor remains owned here.
             unsafe { libc::close(descriptor) };
@@ -430,6 +453,57 @@ fn connect_before(
         }
     }
     Ok(stream)
+}
+
+#[cfg(target_os = "linux")]
+fn connected_peer_process_id(stream: &UnixStream) -> Option<u32> {
+    use std::os::fd::AsRawFd as _;
+
+    // SAFETY: all-zero is a valid initial value for ucred before getsockopt
+    // writes the complete structure below.
+    let mut credentials: libc::ucred = unsafe { std::mem::zeroed() };
+    let mut length = std::mem::size_of::<libc::ucred>() as libc::socklen_t;
+    // SAFETY: credentials and length are valid writable storage for this
+    // getsockopt call, and stream retains ownership of its live descriptor.
+    let result = unsafe {
+        libc::getsockopt(
+            stream.as_raw_fd(),
+            libc::SOL_SOCKET,
+            libc::SO_PEERCRED,
+            (&raw mut credentials).cast(),
+            &raw mut length,
+        )
+    };
+    (result == 0 && length as usize == std::mem::size_of::<libc::ucred>() && credentials.pid > 0)
+        .then(|| u32::try_from(credentials.pid).ok())
+        .flatten()
+}
+
+#[cfg(target_os = "macos")]
+fn connected_peer_process_id(stream: &UnixStream) -> Option<u32> {
+    use std::os::fd::AsRawFd as _;
+
+    let mut process_id: libc::pid_t = 0;
+    let mut length = std::mem::size_of::<libc::pid_t>() as libc::socklen_t;
+    // SAFETY: process_id and length are valid writable storage for this
+    // getsockopt call, and stream retains ownership of its live descriptor.
+    let result = unsafe {
+        libc::getsockopt(
+            stream.as_raw_fd(),
+            libc::SOL_LOCAL,
+            libc::LOCAL_PEERPID,
+            (&raw mut process_id).cast(),
+            &raw mut length,
+        )
+    };
+    (result == 0 && length as usize == std::mem::size_of::<libc::pid_t>() && process_id > 0)
+        .then(|| u32::try_from(process_id).ok())
+        .flatten()
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+fn connected_peer_process_id(_stream: &UnixStream) -> Option<u32> {
+    None
 }
 
 fn classify_read_error(error: std::io::Error) -> RootProvisionUnknownReason {
@@ -788,8 +862,14 @@ mod tests {
         let client = server.client(Duration::from_secs(1));
         let worker_context = Arc::clone(&context);
         let worker = std::thread::spawn(move || {
+            let mut validate = || true;
             client
-                .execute_with_context(&request, worker_context.as_ref())
+                .execute_with_context_for_peer(
+                    &request,
+                    std::process::id(),
+                    &mut validate,
+                    worker_context.as_ref(),
+                )
                 .unwrap()
         });
         server.wait_for_request();
@@ -801,5 +881,59 @@ mod tests {
             &RootProvisionResponseHint::Unknown(RootProvisionUnknownReason::Cancelled)
         );
         assert!(cancelled_at.elapsed() < Duration::from_millis(100));
+    }
+
+    #[test]
+    fn wrong_connected_peer_pid_receives_zero_request_bytes() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("peer.sock");
+        let listener = UnixListener::bind(&path).unwrap();
+        let (sent, received) = mpsc::channel();
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut bytes = Vec::new();
+            stream.read_to_end(&mut bytes).unwrap();
+            sent.send(bytes).unwrap();
+        });
+        let state = tempfile::tempdir().unwrap();
+        let context = RuntimeDesiredEffectContext::for_test(
+            crate::state_directory::StateDirectory::unanchored(state.path().to_path_buf()),
+            Instant::now() + Duration::from_secs(2),
+        );
+        let wrong_pid = std::process::id().checked_add(1).unwrap();
+        let mut validate = || true;
+        let observed =
+            UnixRootProvisionClient::new(&path, Duration::from_secs(1), Duration::from_secs(1))
+                .execute_with_context_for_peer(&request(), wrong_pid, &mut validate, &context)
+                .unwrap();
+        assert_eq!(
+            observed.hint(),
+            &RootProvisionResponseHint::Unknown(RootProvisionUnknownReason::MismatchedIdentity)
+        );
+        assert_eq!(
+            received.recv_timeout(Duration::from_secs(2)).unwrap(),
+            Vec::<u8>::new()
+        );
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn exact_connected_peer_pid_sends_the_bounded_request() {
+        let request = request();
+        let server = TestServer::one(ok_wire(&result(&request)), Duration::ZERO);
+        let state = tempfile::tempdir().unwrap();
+        let context = RuntimeDesiredEffectContext::for_test(
+            crate::state_directory::StateDirectory::unanchored(state.path().to_path_buf()),
+            Instant::now() + Duration::from_secs(2),
+        );
+        let observed = server
+            .client(Duration::from_secs(1))
+            .execute_with_context_for_peer(&request, std::process::id(), &mut || true, &context)
+            .unwrap();
+        server.wait_for_request();
+        assert_eq!(
+            observed.hint(),
+            &RootProvisionResponseHint::Ok(result(&request))
+        );
     }
 }

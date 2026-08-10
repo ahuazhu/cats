@@ -29,6 +29,7 @@ use crate::runtime_spine::{
 };
 
 use super::clean_slate_probes::CHECKPOINT_NAMESPACE;
+use super::root_provision_process::inspect_exact_root_provision_process;
 use super::signed_running::{
     expected_provision_heads, provision_checkpoint_is_bound, ProvisionHeadRead,
 };
@@ -36,8 +37,8 @@ use super::SignedRunningAcquireEffect;
 use super::{
     ensure_root_provision_process_from_persisted_checkpoint, AuthorizedBlockdStore,
     FileCheckpointStore, PlatformSystemdRootProvisionProcessPort, RootProvisionProcessConflict,
-    RootProvisionProcessOutcome, RootProvisionProcessPort, RootProvisionResponseHint,
-    RootProvisionSystemdConfig, UnixRootProvisionClient,
+    RootProvisionProcessInspection, RootProvisionProcessOutcome, RootProvisionProcessPort,
+    RootProvisionResponseHint, RootProvisionSystemdConfig, UnixRootProvisionClient,
 };
 
 pub(crate) mod request_sealed {
@@ -48,6 +49,8 @@ trait RootProvisionRequestPort: request_sealed::Sealed + Send + Sync {
     fn execute(
         &self,
         socket_path: &HostPath,
+        expected_peer_process_id: u32,
+        validate_current_process: &mut dyn FnMut() -> bool,
         request: &cats_api::runtime_reconciliation::ProvisionRootImageRequest,
         context: &RuntimeDesiredEffectContext,
     ) -> anyhow::Result<RootProvisionResponseHint>;
@@ -62,6 +65,8 @@ impl RootProvisionRequestPort for PlatformRootProvisionRequestPort {
     fn execute(
         &self,
         socket_path: &HostPath,
+        expected_peer_process_id: u32,
+        validate_current_process: &mut dyn FnMut() -> bool,
         request: &cats_api::runtime_reconciliation::ProvisionRootImageRequest,
         context: &RuntimeDesiredEffectContext,
     ) -> anyhow::Result<RootProvisionResponseHint> {
@@ -73,7 +78,12 @@ impl RootProvisionRequestPort for PlatformRootProvisionRequestPort {
         let client =
             UnixRootProvisionClient::new(Path::new(socket_path.as_str()), remaining, remaining);
         let reread = client
-            .execute_with_context(request, context)
+            .execute_with_context_for_peer(
+                request,
+                expected_peer_process_id,
+                validate_current_process,
+                context,
+            )
             .context("send exact root provision request")?;
         Ok(reread.hint().clone())
     }
@@ -203,13 +213,17 @@ impl SignedRootProvisionEffect {
         let Some(stored) = store.load().context("load root provision checkpoint")? else {
             return Ok(Some(RuntimeDesiredEffectOutcome::RefreshInventory));
         };
-        if stored.content_digest() != content_digest
-            || stored.checkpoint().step != runtime.step
-            || stored.checkpoint().desired_revision != desired.desired_revision
+        if stored.content_digest() != content_digest || stored.checkpoint().step != runtime.step {
+            return Ok(Some(RuntimeDesiredEffectOutcome::RefreshInventory));
+        }
+        if stored.checkpoint().desired_revision != desired.desired_revision
             || stored.checkpoint().spec_digest != desired.spec_digest
             || stored.checkpoint().placement_epoch != desired.placement.placement_epoch
         {
-            return Ok(Some(RuntimeDesiredEffectOutcome::RefreshInventory));
+            // This is a stable superseded checkpoint, not a concurrent file
+            // replacement. Let the existing stale planner consume the same
+            // accepted full admission and perform its exact rebind/release.
+            return Ok(None);
         }
 
         let [volume] = desired.volumes.as_slice() else {
@@ -311,9 +325,61 @@ impl SignedRootProvisionEffect {
         let request = provision_root_image_request(stored.checkpoint())
             .context("project exact root provision request")?;
         context.check_active()?;
-        let hint = self
-            .request
-            .execute(&expectation.control_socket_path, &request, context)?;
+        let [accepted_process] = runtime.processes.as_slice() else {
+            return Ok(Some(stop_local()));
+        };
+        let mut reinspection = None;
+        let hint = {
+            let mut validate_current_process = || {
+                let result = inspect_exact_root_provision_process(
+                    self.process.as_ref(),
+                    &expectation,
+                    context,
+                );
+                let exact = matches!(
+                    &result,
+                    Ok(RootProvisionProcessInspection::Exact(evidence))
+                        if accepted_process_matches_reinspection(runtime, evidence)
+                );
+                reinspection = Some(result);
+                exact
+            };
+            self.request.execute(
+                &expectation.control_socket_path,
+                accepted_process.process_id,
+                &mut validate_current_process,
+                &request,
+                context,
+            )?
+        };
+        let Some(reinspection) = reinspection else {
+            // Connect/timeout failures happen before a peer can be retained
+            // and are retried from a fresh full scan. A connected peer with
+            // the wrong PID is a local identity conflict; neither case sends
+            // a request byte or invokes the process revalidation callback.
+            return Ok(Some(
+                if matches!(
+                    hint,
+                    RootProvisionResponseHint::Unknown(
+                        super::RootProvisionUnknownReason::MismatchedIdentity
+                    )
+                ) {
+                    stop_local()
+                } else {
+                    RuntimeDesiredEffectOutcome::RefreshInventory
+                },
+            ));
+        };
+        match reinspection.context("reinspect exact root-provision process before request")? {
+            RootProvisionProcessInspection::Exact(evidence)
+                if accepted_process_matches_reinspection(runtime, &evidence) => {}
+            RootProvisionProcessInspection::Exact(_)
+            | RootProvisionProcessInspection::Conflict(_) => return Ok(Some(stop_local())),
+            RootProvisionProcessInspection::Absent
+            | RootProvisionProcessInspection::Unavailable => {
+                return Ok(Some(RuntimeDesiredEffectOutcome::RefreshInventory))
+            }
+        }
         context.check_active()?;
         let current = match self.authority.load_volume(&volume.volume_id) {
             Ok(record) => record,
@@ -493,6 +559,17 @@ fn observed_processes_are_exact(
     }
 }
 
+fn accepted_process_matches_reinspection(
+    runtime: &ObservedRuntimeStatus,
+    current: &super::RootProvisionProcessEvidence,
+) -> bool {
+    let [accepted] = runtime.processes.as_slice() else {
+        return false;
+    };
+    accepted.process_id == current.process_id
+        && accepted.process_start_time_ticks == current.process_start_time_ticks
+}
+
 fn same_owner_and_marker(before: &VolumeRecord, after: &VolumeRecord) -> bool {
     before.volume_id == after.volume_id
         && before.size_bytes == after.size_bytes
@@ -519,14 +596,16 @@ mod tests {
         Epoch, FenceEpoch, GuestDeviceIdentity, Id, Ipv4Address, IsolatedIpv4Kind,
         LocalVolumeLineage, MacAddress, NetworkConfig, NodeBootId, NodeObservation,
         NormalAcquireRequest, NormalAcquireResult, ObservedRuntimeStatus, ObservedVolume,
-        ProcessEvidence, RandomId128, Revision, RuntimeCheckpoint, RuntimeConfig, Sequence,
-        Sha256Digest, UnixMillis, VolumeRecord, WireU64,
+        ProcessEvidence, RandomId128, RemoteHead, Revision, RuntimeCheckpoint, RuntimeConfig,
+        RuntimeVolumeTransitionRequest, Sequence, Sha256Digest, UnixMillis, VolumeRecord, WireU64,
     };
     use cats_storage::authority::{
         AuthorityError, AuthorizedServingAttachment, LastVolumeTransition, RenewLeaseRequest,
         RenewLeaseResult, VolumeAdminState, VolumeHeadCasRequest, VolumeHeadCasResult,
     };
-    use cats_storage::{encode_image_manifest, BlobError, ImageManifestV1, LowerHexSha256};
+    use cats_storage::{
+        encode_image_manifest, BlobError, ImageManifestChunkV1, ImageManifestV1, LowerHexSha256,
+    };
 
     use crate::runtime_spine::{RuntimeDesiredEffectAdmission, RuntimeDesiredEffectContext};
     use crate::state_directory::StateDirectory;
@@ -535,6 +614,11 @@ mod tests {
     use super::super::root_provision_process::{
         CheckpointedRootProvisionProcess, RootProvisionBlockdHandshake,
         RootProvisionProcessEvidence, RootProvisionProcessInspection, RootProvisionProcessStart,
+    };
+    use super::super::signed_running::SignedNormalAcquirePort;
+    use super::super::{
+        NormalAcquireAcceptedContext, NormalAcquireAttempt, NormalAcquireClientError,
+        NormalReleaseAttempt,
     };
     use super::*;
 
@@ -622,6 +706,23 @@ mod tests {
                 image_id: LowerHexSha256::from_digest(&desired.runtime.boot_image_digest),
                 size_bytes: desired.volumes[0].size_bytes,
                 chunks: Vec::new(),
+            };
+            Self(encode_image_manifest(&manifest).unwrap())
+        }
+
+        fn with_chunk(desired: &DesiredRuntimeSpec, byte: char) -> Self {
+            let manifest = ImageManifestV1 {
+                version: 1,
+                image_id: LowerHexSha256::from_digest(&desired.runtime.boot_image_digest),
+                size_bytes: desired.volumes[0].size_bytes,
+                chunks: vec![ImageManifestChunkV1 {
+                    chunk_idx: 0,
+                    len: u32::try_from(desired.volumes[0].size_bytes).unwrap(),
+                    object_id: LowerHexSha256::new(
+                        std::iter::repeat_n(byte, 64).collect::<String>(),
+                    )
+                    .unwrap(),
+                }],
             };
             Self(encode_image_manifest(&manifest).unwrap())
         }
@@ -721,10 +822,30 @@ mod tests {
         }
     }
 
-    #[derive(Default)]
     struct FakeProcessPort {
         inspections: AtomicUsize,
         starts: AtomicUsize,
+        inspected_identity: Option<(u32, u64)>,
+    }
+
+    impl Default for FakeProcessPort {
+        fn default() -> Self {
+            Self {
+                inspections: AtomicUsize::new(0),
+                starts: AtomicUsize::new(0),
+                inspected_identity: None,
+            }
+        }
+    }
+
+    impl FakeProcessPort {
+        fn exact(process_id: u32, start_time_ticks: u64) -> Self {
+            Self {
+                inspections: AtomicUsize::new(0),
+                starts: AtomicUsize::new(0),
+                inspected_identity: Some((process_id, start_time_ticks)),
+            }
+        }
     }
 
     impl super::super::root_provision_process::sealed::Sealed for FakeProcessPort {}
@@ -732,11 +853,22 @@ mod tests {
     impl RootProvisionProcessPort for FakeProcessPort {
         fn inspect(
             &self,
-            _expected: &super::super::RootProvisionProcessExpectation,
+            expected: &super::super::RootProvisionProcessExpectation,
             _context: &dyn crate::runtime_spine::RuntimePhysicalReadContext,
         ) -> anyhow::Result<RootProvisionProcessInspection> {
             self.inspections.fetch_add(1, Ordering::SeqCst);
-            Ok(RootProvisionProcessInspection::Absent)
+            Ok(match self.inspected_identity {
+                Some((process_id, start_time_ticks)) => {
+                    let mut evidence = exact_process(expected);
+                    evidence.process_id = process_id;
+                    evidence.unit_main_process_id = process_id;
+                    evidence.process_start_time_ticks = WireU64::new(start_time_ticks).unwrap();
+                    evidence.cgroup_process_ids = vec![process_id];
+                    evidence.handshake.peer_process_id = process_id;
+                    RootProvisionProcessInspection::Exact(Box::new(evidence))
+                }
+                None => RootProvisionProcessInspection::Absent,
+            })
         }
 
         fn start_checkpointed(
@@ -756,6 +888,37 @@ mod tests {
         calls: AtomicUsize,
         conflict: bool,
         mutate_owner: bool,
+        connect_failure: bool,
+    }
+
+    #[derive(Default)]
+    struct NoSignedMutationPort {
+        calls: AtomicUsize,
+    }
+
+    impl SignedNormalAcquirePort for NoSignedMutationPort {
+        fn acquire(
+            &self,
+            _request: &RuntimeVolumeTransitionRequest,
+            _volume: &VolumeIntent,
+            _accepted: &NormalAcquireAcceptedContext,
+            _deadline: Instant,
+        ) -> Result<NormalAcquireAttempt, NormalAcquireClientError> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            Ok(NormalAcquireAttempt::RefreshInventory)
+        }
+
+        fn release(
+            &self,
+            _request: &RuntimeVolumeTransitionRequest,
+            _volume: &VolumeIntent,
+            _expected_head: &RemoteHead,
+            _accepted: &NormalAcquireAcceptedContext,
+            _deadline: Instant,
+        ) -> Result<NormalReleaseAttempt, NormalAcquireClientError> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            Ok(NormalReleaseAttempt::RefreshInventory)
+        }
     }
 
     impl request_sealed::Sealed for FakeRequestPort {}
@@ -764,10 +927,23 @@ mod tests {
         fn execute(
             &self,
             _socket_path: &HostPath,
+            expected_peer_process_id: u32,
+            validate_current_process: &mut dyn FnMut() -> bool,
             request: &cats_api::runtime_reconciliation::ProvisionRootImageRequest,
             context: &RuntimeDesiredEffectContext,
         ) -> anyhow::Result<RootProvisionResponseHint> {
             context.check_active()?;
+            assert_eq!(expected_peer_process_id, 41);
+            if self.connect_failure {
+                return Ok(RootProvisionResponseHint::Unknown(
+                    super::super::RootProvisionUnknownReason::Connect,
+                ));
+            }
+            if !validate_current_process() {
+                return Ok(RootProvisionResponseHint::Unknown(
+                    super::super::RootProvisionUnknownReason::MismatchedIdentity,
+                ));
+            }
             self.calls.fetch_add(1, Ordering::SeqCst);
             if self.conflict {
                 return Ok(RootProvisionResponseHint::Closed(
@@ -1111,6 +1287,25 @@ mod tests {
                 HostPath::new("/usr/bin/cats-blockd".to_owned()).unwrap(),
             )
         }
+
+        fn dispatcher(
+            &self,
+            process: Arc<FakeProcessPort>,
+            request: Arc<FakeRequestPort>,
+            mutations: Arc<NoSignedMutationPort>,
+        ) -> SignedRunningEffect {
+            let acquire = SignedRunningAcquireEffect::new(
+                mutations,
+                Arc::clone(&self.authority) as Arc<dyn VolumeDataAuthority>,
+                Arc::clone(&self.blob) as Arc<dyn BlobStore>,
+                60_000,
+            )
+            .unwrap();
+            SignedRunningEffect {
+                acquire,
+                provision: self.effect(process, request),
+            }
+        }
     }
 
     fn observed_volume(
@@ -1184,6 +1379,7 @@ mod tests {
             calls: AtomicUsize::new(0),
             conflict: false,
             mutate_owner: false,
+            connect_failure: false,
         });
         let effect = fixture.effect(Arc::clone(&process), Arc::clone(&request));
         let outcome = effect
@@ -1198,12 +1394,13 @@ mod tests {
     #[test]
     fn exact_process_sends_once_then_authority_target_prevents_replay() {
         let fixture = Fixture::new();
-        let process = Arc::new(FakeProcessPort::default());
+        let process = Arc::new(FakeProcessPort::exact(41, 42));
         let request = Arc::new(FakeRequestPort {
             authority: Arc::clone(&fixture.authority),
             calls: AtomicUsize::new(0),
             conflict: false,
             mutate_owner: false,
+            connect_failure: false,
         });
         let effect = fixture.effect(Arc::clone(&process), Arc::clone(&request));
         let outcome = effect
@@ -1214,7 +1411,7 @@ mod tests {
             .unwrap();
         assert_eq!(outcome, Some(RuntimeDesiredEffectOutcome::RefreshInventory));
         assert_eq!(request.calls.load(Ordering::SeqCst), 1);
-        assert_eq!(process.inspections.load(Ordering::SeqCst), 0);
+        assert_eq!(process.inspections.load(Ordering::SeqCst), 1);
         assert_eq!(process.starts.load(Ordering::SeqCst), 0);
 
         // A new accepted full inventory observes the target head. Replaying
@@ -1232,12 +1429,13 @@ mod tests {
     #[test]
     fn exact_closed_conflict_with_blank_authority_stops_without_retry() {
         let fixture = Fixture::new();
-        let process = Arc::new(FakeProcessPort::default());
+        let process = Arc::new(FakeProcessPort::exact(41, 42));
         let request = Arc::new(FakeRequestPort {
             authority: Arc::clone(&fixture.authority),
             calls: AtomicUsize::new(0),
             conflict: true,
             mutate_owner: false,
+            connect_failure: false,
         });
         let effect = fixture.effect(process, Arc::clone(&request));
         let outcome = effect
@@ -1260,6 +1458,7 @@ mod tests {
             calls: AtomicUsize::new(0),
             conflict: false,
             mutate_owner: false,
+            connect_failure: false,
         });
         let effect = fixture.effect(Arc::clone(&process), Arc::clone(&request));
         let context = fixture.context_with_lineage_path(
@@ -1278,12 +1477,13 @@ mod tests {
     #[test]
     fn authority_owner_drift_after_request_stops_despite_target_head() {
         let fixture = Fixture::new();
-        let process = Arc::new(FakeProcessPort::default());
+        let process = Arc::new(FakeProcessPort::exact(41, 42));
         let request = Arc::new(FakeRequestPort {
             authority: Arc::clone(&fixture.authority),
             calls: AtomicUsize::new(0),
             conflict: false,
             mutate_owner: true,
+            connect_failure: false,
         });
         let effect = fixture.effect(process, Arc::clone(&request));
         assert_eq!(
@@ -1296,5 +1496,192 @@ mod tests {
             Some(stop_local())
         );
         assert_eq!(request.calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn process_replacement_after_accepted_scan_stops_without_request() {
+        let fixture = Fixture::new();
+        let process = Arc::new(FakeProcessPort::exact(43, 44));
+        let request = Arc::new(FakeRequestPort {
+            authority: Arc::clone(&fixture.authority),
+            calls: AtomicUsize::new(0),
+            conflict: false,
+            mutate_owner: false,
+            connect_failure: false,
+        });
+        let effect = fixture.effect(Arc::clone(&process), Arc::clone(&request));
+        assert_eq!(
+            effect
+                .try_apply(
+                    &fixture.context(vec![fixture.public_process()]),
+                    &fixture.desired,
+                )
+                .unwrap(),
+            Some(stop_local())
+        );
+        assert_eq!(process.inspections.load(Ordering::SeqCst), 1);
+        assert_eq!(request.calls.load(Ordering::SeqCst), 0);
+        assert_eq!(
+            fixture.authority.record().head,
+            fixture.attachment.head,
+            "a replaced process must not receive the provision mutation"
+        );
+    }
+
+    #[test]
+    fn unavailable_connection_refreshes_before_process_reinspection_or_request() {
+        let fixture = Fixture::new();
+        let process = Arc::new(FakeProcessPort::exact(41, 42));
+        let request = Arc::new(FakeRequestPort {
+            authority: Arc::clone(&fixture.authority),
+            calls: AtomicUsize::new(0),
+            conflict: false,
+            mutate_owner: false,
+            connect_failure: true,
+        });
+        let effect = fixture.effect(Arc::clone(&process), Arc::clone(&request));
+        assert_eq!(
+            effect
+                .try_apply(
+                    &fixture.context(vec![fixture.public_process()]),
+                    &fixture.desired,
+                )
+                .unwrap(),
+            Some(RuntimeDesiredEffectOutcome::RefreshInventory)
+        );
+        assert_eq!(process.inspections.load(Ordering::SeqCst), 0);
+        assert_eq!(request.calls.load(Ordering::SeqCst), 0);
+        assert_eq!(fixture.authority.record().head, fixture.attachment.head);
+    }
+
+    #[test]
+    fn superseded_provision_falls_through_to_existing_stale_planner() {
+        let mut fixture = Fixture::new();
+        fixture.desired.desired_revision = Revision::new(2).unwrap();
+        fixture.desired.runtime.memory_bytes += 4096;
+        fixture.desired.spec_digest = spec_digest(&fixture.desired).unwrap();
+
+        let process = Arc::new(FakeProcessPort::default());
+        let request = Arc::new(FakeRequestPort {
+            authority: Arc::clone(&fixture.authority),
+            calls: AtomicUsize::new(0),
+            conflict: false,
+            mutate_owner: false,
+            connect_failure: false,
+        });
+        let effect = fixture.effect(Arc::clone(&process), Arc::clone(&request));
+        assert_eq!(
+            effect
+                .try_apply(&fixture.context(Vec::new()), &fixture.desired)
+                .unwrap(),
+            None,
+            "the SignedRunningAcquireEffect stale planner must own this checkpoint"
+        );
+        assert_eq!(process.inspections.load(Ordering::SeqCst), 0);
+        assert_eq!(request.calls.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn dispatcher_rebinds_same_image_superseded_provision_without_process_or_request_io() {
+        let mut fixture = Fixture::new();
+        fixture.desired.desired_revision = Revision::new(2).unwrap();
+        fixture.desired.runtime.memory_bytes += 4096;
+        fixture.desired.spec_digest = spec_digest(&fixture.desired).unwrap();
+        fixture.blob = Arc::new(ExactBlob::new(&fixture.desired));
+        let process = Arc::new(FakeProcessPort::default());
+        let request = Arc::new(FakeRequestPort {
+            authority: Arc::clone(&fixture.authority),
+            calls: AtomicUsize::new(0),
+            conflict: false,
+            mutate_owner: false,
+            connect_failure: false,
+        });
+        let mutations = Arc::new(NoSignedMutationPort::default());
+        let dispatcher = fixture.dispatcher(
+            Arc::clone(&process),
+            Arc::clone(&request),
+            Arc::clone(&mutations),
+        );
+        assert_eq!(
+            dispatcher
+                .apply(fixture.context(Vec::new()), &fixture.desired)
+                .unwrap(),
+            RuntimeDesiredEffectOutcome::RefreshInventory
+        );
+        let store = FileCheckpointStore::open(
+            &fixture.state.path().join(CHECKPOINT_NAMESPACE),
+            &fixture.desired.cat_id,
+        )
+        .unwrap();
+        let rebound = store.load().unwrap().unwrap();
+        assert_eq!(
+            rebound.checkpoint().desired_revision,
+            fixture.desired.desired_revision
+        );
+        assert_eq!(
+            rebound.checkpoint().spec_digest,
+            fixture.desired.spec_digest
+        );
+        assert!(matches!(
+            rebound.checkpoint().step,
+            ReconcileStep::ProvisionRootImage { .. }
+        ));
+        assert_eq!(process.inspections.load(Ordering::SeqCst), 0);
+        assert_eq!(request.calls.load(Ordering::SeqCst), 0);
+        assert_eq!(mutations.calls.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn dispatcher_checkpoints_release_for_changed_image_without_process_or_request_io() {
+        let mut fixture = Fixture::new();
+        let ReconcileStep::ProvisionRootImage {
+            expected_provisioned_head: old_target,
+            ..
+        } = &fixture.checkpoint.step
+        else {
+            unreachable!()
+        };
+        fixture.authority.set_head(old_target.clone());
+        fixture.desired.desired_revision = Revision::new(2).unwrap();
+        fixture.desired.runtime.boot_image_digest = Sha256Digest::from_bytes([3; 32]);
+        fixture.desired.spec_digest = spec_digest(&fixture.desired).unwrap();
+        fixture.blob = Arc::new(ExactBlob::with_chunk(&fixture.desired, '4'));
+        let process = Arc::new(FakeProcessPort::default());
+        let request = Arc::new(FakeRequestPort {
+            authority: Arc::clone(&fixture.authority),
+            calls: AtomicUsize::new(0),
+            conflict: false,
+            mutate_owner: false,
+            connect_failure: false,
+        });
+        let mutations = Arc::new(NoSignedMutationPort::default());
+        let dispatcher = fixture.dispatcher(
+            Arc::clone(&process),
+            Arc::clone(&request),
+            Arc::clone(&mutations),
+        );
+        assert_eq!(
+            dispatcher
+                .apply(fixture.context(Vec::new()), &fixture.desired)
+                .unwrap(),
+            RuntimeDesiredEffectOutcome::RefreshInventory
+        );
+        let store = FileCheckpointStore::open(
+            &fixture.state.path().join(CHECKPOINT_NAMESPACE),
+            &fixture.desired.cat_id,
+        )
+        .unwrap();
+        let cleanup = store.load().unwrap().unwrap();
+        assert!(
+            matches!(
+                cleanup.checkpoint().step,
+                ReconcileStep::CleanupRelease { .. }
+            ),
+            "unexpected checkpoint: {:?}",
+            cleanup.checkpoint().step
+        );
+        assert_eq!(process.inspections.load(Ordering::SeqCst), 0);
+        assert_eq!(request.calls.load(Ordering::SeqCst), 0);
+        assert_eq!(mutations.calls.load(Ordering::SeqCst), 0);
     }
 }
