@@ -970,11 +970,14 @@ fn open_file_at(
     let name = CString::new(name).map_err(|_| filesystem_error(display))?;
     // SAFETY: `directory` remains open for the call, `name` is
     // NUL-terminated, and a successful descriptor is immediately owned.
+    // `O_NONBLOCK` prevents a FIFO from hanging before every caller's
+    // immediate exact-regular-file metadata check; it is inert for regular
+    // installed files.
     let descriptor = unsafe {
         libc::openat(
             directory.as_raw_fd(),
             name.as_ptr(),
-            libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+            libc::O_RDONLY | libc::O_NONBLOCK | libc::O_NOFOLLOW | libc::O_CLOEXEC,
         )
     };
     if descriptor < 0 {
@@ -992,11 +995,13 @@ fn ensure_entry_absent_at(
 ) -> Result<(), RuntimeArtifactError> {
     let name = CString::new(name).map_err(|_| filesystem_error(display))?;
     // SAFETY: arguments satisfy `openat`; no descriptor is retained on error.
+    // `O_NONBLOCK` also keeps an unexpected FIFO from hanging this absence
+    // probe before it can reject the existing entry.
     let descriptor = unsafe {
         libc::openat(
             directory.as_raw_fd(),
             name.as_ptr(),
-            libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+            libc::O_RDONLY | libc::O_NONBLOCK | libc::O_NOFOLLOW | libc::O_CLOEXEC,
         )
     };
     if descriptor >= 0 {
@@ -1059,13 +1064,25 @@ fn read_exact_installed_file_at_with_contract(
 }
 
 #[cfg(unix)]
-#[derive(Debug)]
 struct PinnedInstalledFile {
     basename: &'static str,
     display: &'static Path,
     descriptor: File,
     metadata: StableFileMetadata,
     exact_bytes: Vec<u8>,
+}
+
+#[cfg(unix)]
+impl std::fmt::Debug for PinnedInstalledFile {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("PinnedInstalledFile")
+            .field("basename", &self.basename)
+            .field("display", &self.display)
+            .field("metadata", &self.metadata)
+            .field("exact_bytes", &"[redacted]")
+            .finish()
+    }
 }
 
 #[cfg(unix)]
@@ -1391,6 +1408,62 @@ mod tests {
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(mode)).unwrap();
     }
 
+    #[cfg(unix)]
+    fn replace_route_basename_with_fifo(directory: &Path, basename: &str, mode: u32) -> PathBuf {
+        use std::os::unix::ffi::OsStrExt as _;
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let path = directory.join(basename);
+        std::fs::remove_file(&path).unwrap();
+        let raw_path = CString::new(path.as_os_str().as_bytes()).unwrap();
+        // SAFETY: `raw_path` is a valid NUL-terminated filesystem path.
+        let result = unsafe { libc::mkfifo(raw_path.as_ptr(), mode as libc::mode_t) };
+        assert_eq!(result, 0);
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(mode)).unwrap();
+        path
+    }
+
+    #[cfg(unix)]
+    fn assert_fifo_read_fails_bounded(
+        fifo_path: &Path,
+        read: impl FnOnce() -> Result<(), RuntimeArtifactError> + Send + 'static,
+    ) {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        use std::sync::mpsc;
+        use std::time::Duration;
+
+        let (sender, receiver) = mpsc::sync_channel(1);
+        let reader = std::thread::spawn(move || sender.send(read()).unwrap());
+        let outcome = match receiver.recv_timeout(Duration::from_secs(2)) {
+            Ok(outcome) => outcome,
+            Err(mpsc::RecvTimeoutError::Timeout) => {
+                // Cleanup for the pre-fix failure mode: pair with a reader
+                // blocked in `open(O_RDONLY)` so it can reach fstat, reject
+                // the FIFO, and join instead of leaking a stuck test thread.
+                let writer = std::fs::OpenOptions::new()
+                    .write(true)
+                    .custom_flags(libc::O_NONBLOCK)
+                    .open(fifo_path)
+                    .expect("the timed-out FIFO reader must be waiting in open");
+                let outcome = receiver
+                    .recv_timeout(Duration::from_secs(2))
+                    .expect("the FIFO reader must settle after cleanup");
+                drop(writer);
+                reader.join().unwrap();
+                panic!("installed artifact FIFO open exceeded its bound: {outcome:?}");
+            }
+            Err(mpsc::RecvTimeoutError::Disconnected) => {
+                reader.join().unwrap();
+                panic!("installed artifact FIFO reader disconnected")
+            }
+        };
+        reader.join().unwrap();
+        assert!(matches!(
+            outcome,
+            Err(RuntimeArtifactError::Filesystem { .. })
+        ));
+    }
+
     #[test]
     fn fixed_manifest_vector_and_release_id_are_exact() {
         assert_eq!(RECEIPT.len(), 301);
@@ -1638,6 +1711,62 @@ mod tests {
                 "public-ring path replacement escaped: {result:?}"
             );
         }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn every_route_artifact_fifo_is_rejected_without_blocking() {
+        for (basename, mode) in [
+            ("signer.v1.json", 0o644),
+            ("public-key-ring.v1.json", 0o644),
+            ("signer-private-key.pem", 0o600),
+        ] {
+            let temp = tempfile::tempdir().unwrap();
+            let directory_path = temp.path().join("route-v2");
+            write_test_route_artifacts(&directory_path, false);
+            let (public_contract, private_contract) = test_route_contracts(&directory_path);
+            let fifo_path = replace_route_basename_with_fifo(&directory_path, basename, mode);
+            let retained = open_test_route_directory(temp.path());
+            assert_fifo_read_fails_bounded(&fifo_path, move || {
+                load_route_grant_v2_signer_from(&retained, public_contract, private_contract)
+                    .map(|_| ())
+            });
+        }
+
+        let temp = tempfile::tempdir().unwrap();
+        let directory_path = temp.path().join("route-v2");
+        write_test_route_artifacts(&directory_path, false);
+        let (public_contract, _) = test_route_contracts(&directory_path);
+        let fifo_path =
+            replace_route_basename_with_fifo(&directory_path, "public-key-ring.v1.json", 0o644);
+        let retained = open_test_route_directory(temp.path());
+        assert_fifo_read_fails_bounded(&fifo_path, move || {
+            load_route_grant_v2_public_key_ring_from(&retained, public_contract).map(|_| ())
+        });
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn pinned_private_file_debug_never_contains_exact_bytes() {
+        let temp = tempfile::tempdir().unwrap();
+        let directory_path = temp.path().join("route-v2");
+        write_test_route_artifacts(&directory_path, false);
+        let (_, private_contract) = test_route_contracts(&directory_path);
+        let retained = open_test_route_directory(temp.path());
+        let pinned = read_pinned_installed_file_at_with_contract(
+            retained.final_descriptor(),
+            "signer-private-key.pem",
+            Path::new(ROUTE_GRANT_V2_SIGNER_PRIVATE_KEY_PATH),
+            ROUTE_GRANT_V2_ARTIFACT_MAX_WIRE_BYTES,
+            private_contract,
+        )
+        .unwrap();
+
+        let debug = format!("{pinned:?}");
+        assert!(debug.contains("[redacted]"));
+        assert!(debug.contains("signer-private-key.pem"));
+        assert!(!debug.contains("BEGIN PRIVATE KEY"));
+        assert!(!debug.contains(&format!("{:?}", ROUTE_PRIVATE_KEY)));
     }
 
     #[cfg(unix)]
