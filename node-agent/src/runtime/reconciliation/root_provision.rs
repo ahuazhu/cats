@@ -16,6 +16,8 @@ use cats_api::runtime_reconciliation::{
     PROVISION_ROOT_IMAGE_ERROR_MAX_WIRE_BYTES, PROVISION_ROOT_IMAGE_RESULT_MAX_WIRE_BYTES,
 };
 
+use crate::runtime_spine::RuntimePhysicalReadContext;
+
 const COMMAND_PREFIX: &[u8] = b"provision_root_image ";
 const OK_PREFIX: &[u8] = b"OK ";
 const ERR_PREFIX: &[u8] = b"ERR ";
@@ -35,6 +37,7 @@ pub enum RootProvisionUnknownReason {
     Eof,
     MalformedFrame,
     MismatchedIdentity,
+    Cancelled,
 }
 
 /// The only successful client return. Its name makes the required next read
@@ -90,6 +93,45 @@ impl UnixRootProvisionClient {
     pub fn socket_path(&self) -> &Path {
         &self.socket_path
     }
+
+    /// Execute under the runner's one absolute effect deadline and
+    /// cancellation boundary. Production composition uses this entrypoint;
+    /// the public port method retains its standalone timeout contract for
+    /// focused clients/tests.
+    pub(crate) fn execute_with_context(
+        &self,
+        request: &ProvisionRootImageRequest,
+        context: &dyn RuntimePhysicalReadContext,
+    ) -> Result<AuthorityRereadRequired, RootProvisionClientError> {
+        self.execute_bounded(request, Some(context))
+    }
+
+    fn execute_bounded(
+        &self,
+        request: &ProvisionRootImageRequest,
+        context: Option<&dyn RuntimePhysicalReadContext>,
+    ) -> Result<AuthorityRereadRequired, RootProvisionClientError> {
+        let payload = encode_provision_root_image_request(request)?;
+        let write_deadline = phase_deadline(self.write_timeout, context);
+        let mut stream = match connect_before(&self.socket_path, write_deadline, context) {
+            Ok(stream) => stream,
+            Err(reason) => return Ok(unknown(reason)),
+        };
+        let mut frame = Vec::with_capacity(COMMAND_PREFIX.len() + payload.len() + 1);
+        frame.extend_from_slice(COMMAND_PREFIX);
+        frame.extend_from_slice(&payload);
+        frame.push(b'\n');
+        if let Err(reason) = write_all_before(&mut stream, &frame, write_deadline, context) {
+            return Ok(unknown(reason));
+        }
+
+        let read_deadline = phase_deadline(self.read_timeout, context);
+        let frame = match read_response_frame(&mut stream, read_deadline, context) {
+            Ok(frame) => frame,
+            Err(reason) => return Ok(unknown(reason)),
+        };
+        Ok(AuthorityRereadRequired::new(classify_frame(frame, request)))
+    }
 }
 
 impl RootProvisionControlPort for UnixRootProvisionClient {
@@ -97,51 +139,37 @@ impl RootProvisionControlPort for UnixRootProvisionClient {
         &self,
         request: &ProvisionRootImageRequest,
     ) -> Result<AuthorityRereadRequired, RootProvisionClientError> {
-        let payload = encode_provision_root_image_request(request)?;
-        let mut stream = match UnixStream::connect(&self.socket_path) {
-            Ok(stream) => stream,
-            Err(_) => return Ok(unknown(RootProvisionUnknownReason::Connect)),
-        };
-        if stream.set_nonblocking(true).is_err() {
-            return Ok(unknown(RootProvisionUnknownReason::Connect));
-        }
-        let mut frame = Vec::with_capacity(COMMAND_PREFIX.len() + payload.len() + 1);
-        frame.extend_from_slice(COMMAND_PREFIX);
-        frame.extend_from_slice(&payload);
-        frame.push(b'\n');
-        if !write_all_before(&mut stream, &frame, self.write_timeout) {
-            return Ok(unknown(RootProvisionUnknownReason::Write));
-        }
+        self.execute_bounded(request, None)
+    }
+}
 
-        let frame = match read_response_frame(&mut stream, self.read_timeout) {
-            Ok(frame) => frame,
-            Err(reason) => return Ok(unknown(reason)),
-        };
-        let hint = match frame {
-            ResponseFrame::Ok(payload) => match decode_provision_root_image_result(&payload) {
-                Ok(result) if result_matches_request(&result, request) => {
-                    RootProvisionResponseHint::Ok(result)
-                }
-                Ok(_) => RootProvisionResponseHint::Unknown(
-                    RootProvisionUnknownReason::MismatchedIdentity,
-                ),
-                Err(_) => {
-                    RootProvisionResponseHint::Unknown(RootProvisionUnknownReason::MalformedFrame)
-                }
-            },
-            ResponseFrame::Error(payload) => match decode_provision_root_image_error(&payload) {
-                Ok(error) if error_matches_request(&error, request) => {
-                    RootProvisionResponseHint::Closed(error)
-                }
-                Ok(_) => RootProvisionResponseHint::Unknown(
-                    RootProvisionUnknownReason::MismatchedIdentity,
-                ),
-                Err(_) => {
-                    RootProvisionResponseHint::Unknown(RootProvisionUnknownReason::MalformedFrame)
-                }
-            },
-        };
-        Ok(AuthorityRereadRequired::new(hint))
+fn classify_frame(
+    frame: ResponseFrame,
+    request: &ProvisionRootImageRequest,
+) -> RootProvisionResponseHint {
+    match frame {
+        ResponseFrame::Ok(payload) => match decode_provision_root_image_result(&payload) {
+            Ok(result) if result_matches_request(&result, request) => {
+                RootProvisionResponseHint::Ok(result)
+            }
+            Ok(_) => {
+                RootProvisionResponseHint::Unknown(RootProvisionUnknownReason::MismatchedIdentity)
+            }
+            Err(_) => {
+                RootProvisionResponseHint::Unknown(RootProvisionUnknownReason::MalformedFrame)
+            }
+        },
+        ResponseFrame::Error(payload) => match decode_provision_root_image_error(&payload) {
+            Ok(error) if error_matches_request(&error, request) => {
+                RootProvisionResponseHint::Closed(error)
+            }
+            Ok(_) => {
+                RootProvisionResponseHint::Unknown(RootProvisionUnknownReason::MismatchedIdentity)
+            }
+            Err(_) => {
+                RootProvisionResponseHint::Unknown(RootProvisionUnknownReason::MalformedFrame)
+            }
+        },
     }
 }
 
@@ -152,13 +180,11 @@ enum ResponseFrame {
 
 fn read_response_frame(
     stream: &mut UnixStream,
-    timeout: Duration,
+    deadline: Instant,
+    context: Option<&dyn RuntimePhysicalReadContext>,
 ) -> Result<ResponseFrame, RootProvisionUnknownReason> {
-    let deadline = Instant::now()
-        .checked_add(timeout)
-        .ok_or(RootProvisionUnknownReason::Timeout)?;
     let mut prefix = [0_u8; 4];
-    read_exact_before(stream, &mut prefix, deadline)?;
+    read_exact_before(stream, &mut prefix, deadline, context)?;
     let (kind, maximum) = if prefix.starts_with(OK_PREFIX) {
         // `OK ` is three bytes; the fourth byte is the first payload byte.
         (true, PROVISION_ROOT_IMAGE_RESULT_MAX_WIRE_BYTES)
@@ -178,7 +204,7 @@ fn read_response_frame(
     }
     let mut buffer = [0_u8; 512];
     loop {
-        let read = read_before(stream, &mut buffer, deadline)?;
+        let read = read_before(stream, &mut buffer, deadline, context)?;
         if read == 0 {
             return Err(RootProvisionUnknownReason::Eof);
         }
@@ -205,10 +231,11 @@ fn read_exact_before(
     stream: &mut UnixStream,
     bytes: &mut [u8],
     deadline: Instant,
+    context: Option<&dyn RuntimePhysicalReadContext>,
 ) -> Result<(), RootProvisionUnknownReason> {
     let mut filled = 0;
     while filled < bytes.len() {
-        let read = read_before(stream, &mut bytes[filled..], deadline)?;
+        let read = read_before(stream, &mut bytes[filled..], deadline, context)?;
         if read == 0 {
             return Err(RootProvisionUnknownReason::Eof);
         }
@@ -221,42 +248,49 @@ fn read_before(
     stream: &mut UnixStream,
     bytes: &mut [u8],
     deadline: Instant,
+    context: Option<&dyn RuntimePhysicalReadContext>,
 ) -> Result<usize, RootProvisionUnknownReason> {
     loop {
-        ensure_before(deadline)?;
+        ensure_before(deadline, context)?;
         match stream.read(bytes) {
             Ok(read) => return Ok(read),
             Err(error) if error.kind() == ErrorKind::Interrupted => {}
-            Err(error) if error.kind() == ErrorKind::WouldBlock => wait_for_io(deadline)?,
+            Err(error) if error.kind() == ErrorKind::WouldBlock => {
+                wait_for_io(stream, libc::POLLIN, deadline, context)?
+            }
             Err(error) => return Err(classify_read_error(error)),
         }
     }
 }
 
-fn write_all_before(stream: &mut UnixStream, mut bytes: &[u8], timeout: Duration) -> bool {
-    let Some(deadline) = Instant::now().checked_add(timeout) else {
-        return false;
-    };
+fn write_all_before(
+    stream: &mut UnixStream,
+    mut bytes: &[u8],
+    deadline: Instant,
+    context: Option<&dyn RuntimePhysicalReadContext>,
+) -> Result<(), RootProvisionUnknownReason> {
     while !bytes.is_empty() {
-        if ensure_before(deadline).is_err() {
-            return false;
-        }
+        ensure_before(deadline, context)?;
         match stream.write(bytes) {
-            Ok(0) => return false,
+            Ok(0) => return Err(RootProvisionUnknownReason::Write),
             Ok(written) => bytes = &bytes[written..],
             Err(error) if error.kind() == ErrorKind::Interrupted => {}
             Err(error) if error.kind() == ErrorKind::WouldBlock => {
-                if wait_for_io(deadline).is_err() {
-                    return false;
-                }
+                wait_for_io(stream, libc::POLLOUT, deadline, context)?;
             }
-            Err(_) => return false,
+            Err(_) => return Err(RootProvisionUnknownReason::Write),
         }
     }
-    true
+    Ok(())
 }
 
-fn ensure_before(deadline: Instant) -> Result<(), RootProvisionUnknownReason> {
+fn ensure_before(
+    deadline: Instant,
+    context: Option<&dyn RuntimePhysicalReadContext>,
+) -> Result<(), RootProvisionUnknownReason> {
+    if context.is_some_and(|context| context.check_active().is_err()) {
+        return Err(RootProvisionUnknownReason::Cancelled);
+    }
     deadline
         .checked_duration_since(Instant::now())
         .filter(|remaining| !remaining.is_zero())
@@ -264,13 +298,138 @@ fn ensure_before(deadline: Instant) -> Result<(), RootProvisionUnknownReason> {
         .ok_or(RootProvisionUnknownReason::Timeout)
 }
 
-fn wait_for_io(deadline: Instant) -> Result<(), RootProvisionUnknownReason> {
-    let remaining = deadline
-        .checked_duration_since(Instant::now())
-        .filter(|remaining| !remaining.is_zero())
-        .ok_or(RootProvisionUnknownReason::Timeout)?;
-    std::thread::sleep(remaining.min(Duration::from_millis(1)));
-    Ok(())
+fn phase_deadline(timeout: Duration, context: Option<&dyn RuntimePhysicalReadContext>) -> Instant {
+    let local = Instant::now()
+        .checked_add(timeout)
+        .unwrap_or(Instant::now());
+    context.map_or(local, |context| local.min(context.deadline()))
+}
+
+fn wait_for_io(
+    stream: &UnixStream,
+    events: i16,
+    deadline: Instant,
+    context: Option<&dyn RuntimePhysicalReadContext>,
+) -> Result<(), RootProvisionUnknownReason> {
+    use std::os::fd::AsRawFd as _;
+    loop {
+        ensure_before(deadline, context)?;
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        let timeout = i32::try_from(remaining.min(Duration::from_millis(5)).as_millis())
+            .unwrap_or(1)
+            .max(1);
+        let mut poll = libc::pollfd {
+            fd: stream.as_raw_fd(),
+            events,
+            revents: 0,
+        };
+        // SAFETY: poll points to one initialized pollfd for this call only.
+        let result = unsafe { libc::poll(&raw mut poll, 1, timeout) };
+        if result > 0 {
+            return Ok(());
+        }
+        if result < 0 && std::io::Error::last_os_error().kind() != ErrorKind::Interrupted {
+            return Err(RootProvisionUnknownReason::Connect);
+        }
+    }
+}
+
+fn connect_before(
+    path: &Path,
+    deadline: Instant,
+    context: Option<&dyn RuntimePhysicalReadContext>,
+) -> Result<UnixStream, RootProvisionUnknownReason> {
+    use std::mem::{offset_of, size_of};
+    use std::os::fd::{AsRawFd as _, FromRawFd as _};
+    use std::os::unix::ffi::OsStrExt as _;
+
+    ensure_before(deadline, context)?;
+    let bytes = path.as_os_str().as_bytes();
+    // SAFETY: zero is a valid initial representation for sockaddr_un; the
+    // family, optional BSD length, and used path bytes are initialized below.
+    let mut address: libc::sockaddr_un = unsafe { std::mem::zeroed() };
+    if bytes.is_empty() || bytes.len() >= address.sun_path.len() || bytes.contains(&0) {
+        return Err(RootProvisionUnknownReason::Connect);
+    }
+    let address_length = offset_of!(libc::sockaddr_un, sun_path) + bytes.len() + 1;
+    let socket_type = libc::SOCK_STREAM;
+    #[cfg(target_os = "linux")]
+    let socket_type = socket_type | libc::SOCK_CLOEXEC | libc::SOCK_NONBLOCK;
+    // SAFETY: socket returns a fresh descriptor and retains no Rust memory.
+    let descriptor = unsafe { libc::socket(libc::AF_UNIX, socket_type, 0) };
+    if descriptor < 0 {
+        return Err(RootProvisionUnknownReason::Connect);
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        // Darwin/BSD do not expose Linux's atomic socket type flags. Set both
+        // descriptor flags before the fd enters any blocking operation.
+        // SAFETY: descriptor is live and each fcntl reads or updates only its
+        // integer flags.
+        let status = unsafe { libc::fcntl(descriptor, libc::F_GETFL) };
+        let nonblocking = status >= 0
+            && unsafe { libc::fcntl(descriptor, libc::F_SETFL, status | libc::O_NONBLOCK) } == 0
+            && unsafe { libc::fcntl(descriptor, libc::F_SETFD, libc::FD_CLOEXEC) } == 0;
+        if !nonblocking {
+            // SAFETY: descriptor remains owned here.
+            unsafe { libc::close(descriptor) };
+            return Err(RootProvisionUnknownReason::Connect);
+        }
+    }
+    address.sun_family = libc::AF_UNIX as libc::sa_family_t;
+    #[cfg(any(
+        target_os = "macos",
+        target_os = "ios",
+        target_os = "freebsd",
+        target_os = "netbsd",
+        target_os = "openbsd",
+        target_os = "dragonfly"
+    ))]
+    {
+        address.sun_len =
+            u8::try_from(address_length).map_err(|_| RootProvisionUnknownReason::Connect)?;
+    }
+    for (target, source) in address.sun_path.iter_mut().zip(bytes.iter().copied()) {
+        *target = source as libc::c_char;
+    }
+    let address_length = address_length as libc::socklen_t;
+    // SAFETY: descriptor/address are initialized and connect retains neither.
+    let connected = unsafe {
+        libc::connect(
+            descriptor,
+            (&raw const address).cast::<libc::sockaddr>(),
+            address_length,
+        )
+    };
+    if connected != 0 {
+        let error = std::io::Error::last_os_error();
+        if error.raw_os_error() != Some(libc::EINPROGRESS) {
+            // SAFETY: descriptor remains owned here.
+            unsafe { libc::close(descriptor) };
+            return Err(RootProvisionUnknownReason::Connect);
+        }
+    }
+    // SAFETY: ownership of the descriptor moves into UnixStream.
+    let stream = unsafe { UnixStream::from_raw_fd(descriptor) };
+    if connected != 0 {
+        wait_for_io(&stream, libc::POLLOUT, deadline, context)?;
+        let mut socket_error = 0_i32;
+        let mut length = size_of::<i32>() as libc::socklen_t;
+        // SAFETY: both pointers reference valid writable scalars for this call.
+        let result = unsafe {
+            libc::getsockopt(
+                stream.as_raw_fd(),
+                libc::SOL_SOCKET,
+                libc::SO_ERROR,
+                (&raw mut socket_error).cast(),
+                &raw mut length,
+            )
+        };
+        if result != 0 || socket_error != 0 {
+            return Err(RootProvisionUnknownReason::Connect);
+        }
+    }
+    Ok(stream)
 }
 
 fn classify_read_error(error: std::io::Error) -> RootProvisionUnknownReason {
@@ -331,8 +490,9 @@ fn unknown(reason: RootProvisionUnknownReason) -> AuthorityRereadRequired {
 mod tests {
     use super::*;
     use std::os::unix::net::UnixListener;
-    use std::sync::mpsc;
+    use std::sync::{mpsc, Arc};
 
+    use crate::runtime_spine::RuntimeDesiredEffectContext;
     use cats_api::runtime_reconciliation::{
         encode_provision_root_image_error, encode_provision_root_image_result, AsciiText,
         FenceEpoch, Generation, Id, ProvisionRootImageRetryableProblem, RandomId128, RemoteHead,
@@ -373,6 +533,7 @@ mod tests {
     struct TestServer {
         _dir: tempfile::TempDir,
         path: PathBuf,
+        request_received: mpsc::Receiver<()>,
         done: mpsc::Receiver<()>,
     }
 
@@ -401,6 +562,7 @@ mod tests {
             let dir = tempfile::tempdir().unwrap();
             let path = dir.path().join("control.sock");
             let listener = UnixListener::bind(&path).unwrap();
+            let (request_sent, request_received) = mpsc::channel();
             let (sent, done) = mpsc::channel();
             std::thread::spawn(move || {
                 let (mut stream, _) = listener.accept().unwrap();
@@ -413,18 +575,26 @@ mod tests {
                     }
                 }
                 assert!(request.starts_with(COMMAND_PREFIX));
+                let _ = request_sent.send(());
                 write_response(&mut stream);
                 let _ = sent.send(());
             });
             Self {
                 _dir: dir,
                 path,
+                request_received,
                 done,
             }
         }
 
         fn client(&self, timeout: Duration) -> UnixRootProvisionClient {
             UnixRootProvisionClient::new(&self.path, timeout, Duration::from_secs(1))
+        }
+
+        fn wait_for_request(&self) {
+            self.request_received
+                .recv_timeout(Duration::from_secs(2))
+                .expect("server did not receive the exact request");
         }
     }
 
@@ -604,5 +774,32 @@ mod tests {
             client.execute(&request),
             Err(RootProvisionClientError::InvalidRequest(_))
         ));
+    }
+
+    #[test]
+    fn runner_cancellation_bounds_an_inflight_response_wait() {
+        let request = request();
+        let server = TestServer::one(ok_wire(&result(&request)), Duration::from_millis(250));
+        let state = tempfile::tempdir().unwrap();
+        let context = Arc::new(RuntimeDesiredEffectContext::for_test(
+            crate::state_directory::StateDirectory::unanchored(state.path().to_path_buf()),
+            Instant::now() + Duration::from_secs(2),
+        ));
+        let client = server.client(Duration::from_secs(1));
+        let worker_context = Arc::clone(&context);
+        let worker = std::thread::spawn(move || {
+            client
+                .execute_with_context(&request, worker_context.as_ref())
+                .unwrap()
+        });
+        server.wait_for_request();
+        let cancelled_at = Instant::now();
+        context.cancel_for_test();
+        let observed = worker.join().unwrap();
+        assert_eq!(
+            observed.hint(),
+            &RootProvisionResponseHint::Unknown(RootProvisionUnknownReason::Cancelled)
+        );
+        assert!(cancelled_at.elapsed() < Duration::from_millis(100));
     }
 }

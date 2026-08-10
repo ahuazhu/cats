@@ -66,6 +66,10 @@ impl RootProvisionSystemdConfig {
         validate_credentialless_blockd_config(&blockd)?;
         Ok(Self { blockd })
     }
+
+    pub(crate) fn blockd_binary(&self) -> &Path {
+        &self.blockd.blockd_binary
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

@@ -22,6 +22,7 @@ mod gate_planner;
 mod inventory;
 mod normal_acquire;
 mod root_provision;
+mod signed_root_provision;
 mod signed_running;
 // The immutable proof seam is consumed by the expanded PrepareDevice
 // provenance while retained descriptors close the publication/replace ABA
@@ -92,13 +93,15 @@ pub use root_provision::{
     AuthorityRereadRequired, RootProvisionClientError, RootProvisionControlPort,
     RootProvisionResponseHint, RootProvisionUnknownReason, UnixRootProvisionClient,
 };
+pub(crate) use signed_root_provision::SignedRunningEffect;
 pub(crate) use signed_running::{SignedRunningAcquireEffect, SignedRunningPublicationRecovery};
 // This crate-private seam is landed before the systemd composition that
 // consumes it; keeping the re-export here prevents feature code from reaching
 // through the module path while preserving the sealed boundary.
 #[allow(unused_imports)]
 pub(crate) use root_provision_process::{
-    ensure_root_provision_process_after_checkpoint, RootProvisionAuthoritySnapshot,
+    ensure_root_provision_process_after_checkpoint,
+    ensure_root_provision_process_from_persisted_checkpoint, RootProvisionAuthoritySnapshot,
     RootProvisionBlockdHandshake, RootProvisionProcessConflict, RootProvisionProcessEnsureResult,
     RootProvisionProcessEvidence, RootProvisionProcessExpectation, RootProvisionProcessInspection,
     RootProvisionProcessOutcome, RootProvisionProcessPort, RootProvisionProcessRetirementPort,

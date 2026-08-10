@@ -29,7 +29,7 @@ use crate::ch::ChConfig;
 use crate::runtime::reconciliation::{
     installed_clean_slate_scanner, AuthorizedBlockdLaunchConfig, ControlSignedNormalAcquireClient,
     InstalledCleanSlateProbeConfig, RootProvisionSystemdConfig, RuntimeVolumeTransitionHttpClient,
-    SignedRunningAcquireEffect, SignedRunningPublicationRecovery,
+    SignedRunningAcquireEffect, SignedRunningEffect, SignedRunningPublicationRecovery,
 };
 use crate::runtime_spine::{
     RuntimeInventoryScanner, RuntimeSpineDeadlinePolicy, RuntimeSpineHttpClient,
@@ -212,6 +212,7 @@ async fn spawn_signed_runtime_cutover_with_scanner(
     let root_provision_systemd =
         RootProvisionSystemdConfig::new(config.authorized_blockd_launch.clone())
             .context("compose credentialless root-provision systemd process owner")?;
+    let effect_root_provision_systemd = root_provision_systemd.clone();
     let session = config
         .agent_registration
         .register_until_session(&config.control_plane_url)
@@ -273,15 +274,22 @@ async fn spawn_signed_runtime_cutover_with_scanner(
                 &effect_registration,
             )?
         };
-        let effect = SignedRunningAcquireEffect::new(
+        let acquire = SignedRunningAcquireEffect::new(
             Arc::new(ControlSignedNormalAcquireClient::new(
                 volume_transition_transport,
             )),
             Arc::clone(&effect_volume_authority),
-            effect_blob_store,
+            Arc::clone(&effect_blob_store),
             effect_lease_duration_ms,
         )
         .context("compose one-step signed Running acquire")?;
+        let effect = SignedRunningEffect::platform(
+            acquire,
+            Arc::clone(&effect_volume_authority),
+            effect_blob_store,
+            effect_root_provision_systemd,
+        )
+        .context("compose signed Running root provision prefix")?;
         let recovery = SignedRunningPublicationRecovery::new(Arc::clone(&effect_volume_authority));
         RuntimeSpineRunner::new_with_recovery_and_desired_effects(
             effect_state_directory,
