@@ -98,6 +98,24 @@ pub(crate) struct RootProvisionProcessExpectation {
     pub attachment: AuthorizedServingAttachment,
     pub(super) phase: RootProvisionProcessPhase,
     pub executable_path: HostPath,
+    /// A sealed handoff fixes the old control process to one physical
+    /// incarnation. A live process retained across the PrepareDevice CAS may
+    /// not be rebound to a later process which happens to reuse its logical
+    /// unit, token and socket identity.
+    pub(crate) retained_physical_identity: Option<RetainedRootProvisionPhysicalIdentity>,
+}
+
+/// Exact OS/process identity captured in the immutable serving-handoff
+/// record. PIDs are converted into the platform process-ID domain before the
+/// value enters inventory, so an out-of-range wire value cannot be truncated
+/// into an allowlisted process.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct RetainedRootProvisionPhysicalIdentity {
+    pub process_id: u32,
+    pub unit_main_process_id: u32,
+    pub process_start_time_ticks: WireU64,
+    pub cgroup_process_ids: Vec<u32>,
+    pub handshake_peer_process_id: u32,
 }
 
 /// Provider-private projection of the old control-only attempt retained by a
@@ -124,6 +142,7 @@ pub(crate) struct RetainedRootProvisionProcessAttempt {
     pub expected_provisioned_head: RemoteHead,
     pub attachment: AuthorizedServingAttachment,
     pub executable_path: HostPath,
+    pub physical_identity: RetainedRootProvisionPhysicalIdentity,
 }
 
 /// One strict authority reread paired with the immutable acquire-time
@@ -213,6 +232,7 @@ impl RootProvisionProcessExpectation {
             attachment,
             phase,
             executable_path,
+            retained_physical_identity: None,
         })
     }
 
@@ -296,6 +316,7 @@ impl RootProvisionProcessExpectation {
                 expected_provisioned_head: attempt.expected_provisioned_head.clone(),
             },
             executable_path: attempt.executable_path.clone(),
+            retained_physical_identity: Some(attempt.physical_identity.clone()),
         })
     }
 
@@ -386,6 +407,17 @@ pub(crate) struct RootProvisionProcessEvidence {
 
 impl RootProvisionProcessEvidence {
     pub(crate) fn exactly_matches(&self, expected: &RootProvisionProcessExpectation) -> bool {
+        let retained_identity_matches = expected
+            .retained_physical_identity
+            .as_ref()
+            .map(|identity| {
+                self.process_id == identity.process_id
+                    && self.unit_main_process_id == identity.unit_main_process_id
+                    && self.process_start_time_ticks == identity.process_start_time_ticks
+                    && self.cgroup_process_ids == identity.cgroup_process_ids
+                    && self.handshake.peer_process_id == identity.handshake_peer_process_id
+            })
+            .unwrap_or(true);
         self.process_id > 0
             && self.unit_main_process_id == self.process_id
             && self.process_start_time_ticks.get() > 0
@@ -404,6 +436,7 @@ impl RootProvisionProcessEvidence {
             && self.handshake.process_identity_token == expected.process_identity_token
             && self.handshake.control_only
             && !self.handshake.guest_io_enabled
+            && retained_identity_matches
     }
 }
 

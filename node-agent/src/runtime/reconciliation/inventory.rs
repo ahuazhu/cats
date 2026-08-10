@@ -575,6 +575,19 @@ fn root_process_expectations(
         if checkpoint.binding != DesiredCheckpointBinding::Current {
             continue;
         }
+        let needs_root_process_bridge = match &checkpoint.checkpoint.step {
+            ReconcileStep::ProvisionRootImage { .. } => true,
+            ReconcileStep::PrepareDevice {
+                serving_authority, ..
+            } => matches!(
+                serving_authority.as_ref(),
+                cats_api::runtime_reconciliation::ServingAuthorityProvenance::AfterRootProvision { .. }
+            ),
+            _ => false,
+        };
+        if !needs_root_process_bridge {
+            continue;
+        }
         let blockd = blockd_by_cat
             .get(&desired.cat_id)
             .context("current root-provision checkpoint lacks AuthorizedBlockd lineage")?;

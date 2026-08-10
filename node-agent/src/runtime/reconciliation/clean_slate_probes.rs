@@ -1763,20 +1763,39 @@ fn snapshot_runtime_checkpoints_for_handoff(
         .iter()
         .map(|desired| format!("cat-{}.checkpoint.lock", desired.cat_id))
         .collect::<BTreeSet<_>>();
-    let desired_temps = context
+    let desired_checkpoint_temps = context
         .coordinates()
         .desired
         .desired_specs
         .iter()
-        .flat_map(|desired| {
-            [
-                format!(".cat-{}.checkpoint.tmp", desired.cat_id),
-                format!("cat-{}.release-rejection.json", desired.cat_id),
-                format!(".cat-{}.release-rejection.tmp", desired.cat_id),
-            ]
-        })
+        .map(|desired| format!(".cat-{}.checkpoint.tmp", desired.cat_id))
         .collect::<BTreeSet<_>>();
+    let desired_by_release_rejection = context
+        .coordinates()
+        .desired
+        .desired_specs
+        .iter()
+        .map(|desired| {
+            (
+                format!("cat-{}.release-rejection.json", desired.cat_id),
+                desired,
+            )
+        })
+        .collect::<BTreeMap<_, _>>();
+    let desired_by_release_rejection_temp = context
+        .coordinates()
+        .desired
+        .desired_specs
+        .iter()
+        .map(|desired| {
+            (
+                format!(".cat-{}.release-rejection.tmp", desired.cat_id),
+                desired,
+            )
+        })
+        .collect::<BTreeMap<_, _>>();
     let mut checkpoints = BTreeMap::new();
+    let mut release_rejections = BTreeMap::<Id, (DefiniteReleaseRejection, PathBuf)>::new();
     for entry in entries {
         let Some(name) = entry.name.to_str() else {
             bail!("checkpoint namespace contains a non-UTF-8 entry")
@@ -1785,10 +1804,50 @@ fn snapshot_runtime_checkpoints_for_handoff(
             validate_strict_regular_entry(&entry, root, 0o600)?;
             continue;
         }
-        if desired_temps.contains(name) {
-            // A generic temp or release publication has its own serialized
-            // pre-scan recovery. It cannot share a handoff snapshot.
+        if desired_checkpoint_temps.contains(name) {
+            // A generic checkpoint temp has its own serialized pre-scan
+            // recovery. It cannot share a handoff snapshot.
             return Ok(None);
+        }
+        if desired_by_release_rejection_temp.contains_key(name) {
+            // Validate the bounded typed publication before withholding the
+            // snapshot. A safe temp is still an interrupted publication and
+            // cannot coexist with a handoff join; unsafe/corrupt residue is a
+            // hard scan error and is never normalized to ordinary absence.
+            let _ = read_release_rejection_publication_at(&directory, &entry, root, context)?;
+            return Ok(None);
+        }
+        if let Some(desired) = desired_by_release_rejection.get(name) {
+            if entry.metadata.st_nlink != 1 {
+                // During the no-replace link publication both deterministic
+                // names refer to one inode. Preserve that bounded window for
+                // serialized recovery and refuse to form a mixed snapshot.
+                let _ = read_release_rejection_publication_at(&directory, &entry, root, context)?;
+                return Ok(None);
+            }
+            let Some(bytes) = read_strict_regular_at(
+                &directory,
+                &entry,
+                root,
+                RELEASE_REJECTION_MAX_BYTES,
+                context,
+            )?
+            else {
+                return Ok(None);
+            };
+            let diagnostic_path = PathBuf::from(CHECKPOINT_NAMESPACE).join(name);
+            let marker = decode_definite_release_rejection(&bytes, &diagnostic_path)?;
+            anyhow::ensure!(
+                marker.cat_id == desired.cat_id,
+                "handoff index release rejection filename and Cat identity disagree"
+            );
+            anyhow::ensure!(
+                release_rejections
+                    .insert(desired.cat_id.clone(), (marker, diagnostic_path))
+                    .is_none(),
+                "handoff index contains duplicate release rejections for one Cat"
+            );
+            continue;
         }
         let Some(desired) = desired_by_target.get(name) else {
             bail!("checkpoint namespace retains foreign entry {name}")
@@ -1815,6 +1874,12 @@ fn snapshot_runtime_checkpoints_for_handoff(
                 .is_none(),
             "handoff index contains duplicate Runtime checkpoints for one Cat"
         );
+    }
+    for (cat_id, (marker, path)) in release_rejections {
+        let checkpoint = checkpoints
+            .get(&cat_id)
+            .context("handoff index release rejection lacks its Runtime checkpoint")?;
+        validate_definite_release_rejection(&marker, checkpoint, &path)?;
     }
     anyhow::ensure!(
         checkpoints.len() <= RUNTIME_V1_MAX_ASSIGNED_CATS,
@@ -4913,14 +4978,16 @@ mod tests {
 
     use cats_api::runtime_reconciliation::{
         decode_desired_read_snapshot, spec_digest, AcquireOrigin, AsciiText, AssignedKind,
-        AssignedPlacement, CheckpointEvidence, ContractVersion, DesiredRuntimeSpec,
-        DirectAuthorizedAttachmentIdentity, DirectAuthorizedAttachmentPurpose, DiskKind,
-        Durability, Epoch, FenceEpoch, Generation, GuestDeviceIdentity, HostPath, Id, Ipv4Address,
-        IsolatedIpv4Kind, LifecycleAdmission, MacAddress, NetworkConfig, NormalAcquireRequest,
-        PrepareDeviceFrontend, RandomId128, ReconcileStep, RemoteHead, Revision, RuntimeConfig,
-        RuntimeTarget, RuntimeTransition, RuntimeVolumeTransition, ServingAuthorityProvenance,
-        ServingBlockdIdentity, SessionBinding, Sha256Digest, UnixMillis, VolumeAccess,
-        VolumeAcquire, VolumeAcquireRequest, VolumeDisposition, VolumeIntent, WireU64,
+        AssignedPlacement, CheckpointEvidence, CleanupRelease, CleanupTarget, ContractVersion,
+        DesiredRuntimeSpec, DirectAuthorizedAttachmentIdentity, DirectAuthorizedAttachmentPurpose,
+        DiskKind, Durability, Epoch, FenceEpoch, Generation, GuestDeviceIdentity, HostPath, Id,
+        Ipv4Address, IsolatedIpv4Kind, LifecycleAdmission, MacAddress, NetworkConfig, NodeBootId,
+        NormalAcquireRequest, PrepareDeviceFrontend, RandomId128, ReconcileStep, RemoteHead,
+        Revision, RuntimeConfig, RuntimeTarget, RuntimeTransition, RuntimeVolumeTransition,
+        RuntimeVolumeTransitionPreconditionProblem, RuntimeVolumeTransitionRequest,
+        ServingAuthorityProvenance, ServingBlockdIdentity, SessionBinding, Sha256Digest,
+        UnixMillis, VolumeAccess, VolumeAcquire, VolumeAcquireRequest, VolumeDisposition,
+        VolumeIntent, VolumeReleaseReplay, WireU64,
     };
     use cats_storage::{
         encode_image_manifest, AdapterConfig, AdapterSelection, BlobError, ImageManifestV1,
@@ -7685,6 +7752,72 @@ mod tests {
         }
     }
 
+    #[test]
+    fn current_acquire_crash_retry_completes_without_root_process_or_blockd_lineage() {
+        let environment = TestEnvironment::new();
+        let scan_context = assigned_context(true);
+        let desired = scan_context.coordinates().desired.desired_specs[0].clone();
+        let volume = &desired.volumes[0];
+        let VolumeAcquire::Normal {
+            transition_id,
+            expected_unowned_epoch,
+        } = &volume.acquire
+        else {
+            unreachable!()
+        };
+        let checkpoint = acquire_checkpoint(
+            &desired,
+            volume,
+            RuntimeVolumeTransition::Acquire {
+                request: VolumeAcquireRequest::Normal {
+                    volume_id: volume.volume_id.clone(),
+                    transition_id: transition_id.clone(),
+                    attachment_id: volume.attachment_id.clone(),
+                    expected_unowned_epoch: *expected_unowned_epoch,
+                    desired_revision: desired.desired_revision,
+                    placement_epoch: desired.placement.placement_epoch,
+                    lease_duration_ms: 60_000,
+                },
+            },
+            UnixMillis::new(9_000).unwrap(),
+        );
+        FileCheckpointStore::open(
+            &environment.state.join(CHECKPOINT_NAMESPACE),
+            &desired.cat_id,
+        )
+        .unwrap()
+        .create(&checkpoint)
+        .unwrap();
+
+        let mut config = environment.config();
+        config.root_process_port = Some(Arc::new(FakeRootProcessPort {
+            inspections: Mutex::new(VecDeque::new()),
+        }));
+        let (authority, _) = TestVolumeDataAuthority::exact(unowned_record(
+            volume.volume_id.as_str(),
+            volume.size_bytes,
+        ));
+        let scanner = scanner_with_metadata_authority_and_blob(
+            config,
+            Arc::new(VolumeDataAuthorityMetadataReader::start(authority).unwrap()),
+            None,
+        )
+        .unwrap();
+
+        let RuntimeInventoryScanOutcome::Complete(inventory) =
+            scanner.scan_complete(scan_context).unwrap()
+        else {
+            panic!("current Acquire retry must not require a root-process or blockd projection")
+        };
+        assert!(matches!(
+            &inventory.runtimes()[0].checkpoint,
+            CheckpointEvidence::Valid { step, .. }
+                if matches!(step.as_ref(), ReconcileStep::AcquireVolume { .. })
+        ));
+        assert!(inventory.runtimes()[0].processes.is_empty());
+        assert!(!environment.state.join(DATA_NAMESPACE).exists());
+    }
+
     fn full_root_scanner(
         fixture: &FullRootScannerFixture,
         inspections: impl IntoIterator<Item = RootProvisionProcessInspection>,
@@ -7832,6 +7965,49 @@ mod tests {
         };
         assert_eq!(inventory.runtimes()[0].processes.len(), 1);
         assert_eq!(inventory.runtimes()[0].processes[0].process_id, 79);
+
+        let mut physical_mismatches = Vec::new();
+        let mut mismatch = live_old_process.clone();
+        mismatch.process_id = 80;
+        physical_mismatches.push(("process_id", mismatch));
+        let mut mismatch = live_old_process.clone();
+        mismatch.unit_main_process_id = 80;
+        physical_mismatches.push(("unit_main_process_id", mismatch));
+        let mut mismatch = live_old_process.clone();
+        mismatch.process_start_time_ticks = WireU64::new(124).unwrap();
+        physical_mismatches.push(("process_start_time_ticks", mismatch));
+        let mut mismatch = live_old_process.clone();
+        mismatch.cgroup_process_ids = vec![80];
+        physical_mismatches.push(("cgroup_process_ids", mismatch));
+        let mut mismatch = live_old_process.clone();
+        mismatch.handshake.peer_process_id = 80;
+        physical_mismatches.push(("handshake_peer_process_id", mismatch));
+        for (field, mismatch) in physical_mismatches {
+            assert!(
+                full_root_scanner(
+                    &fixture,
+                    [RootProvisionProcessInspection::Exact(Box::new(mismatch))],
+                )
+                .scan_complete(fixture.scan_context.clone())
+                .is_err(),
+                "sealed old process {field} drift must conflict before an allowlist is formed"
+            );
+            assert!(
+                environment
+                    .systemd_root
+                    .join(fixture.expected.scope_id.as_str())
+                    .exists(),
+                "conflict classification must not delete the retained unit"
+            );
+            assert!(
+                environment.proc_root.join("79").exists(),
+                "conflict classification must not delete the retained process"
+            );
+            assert!(
+                Path::new(fixture.expected.control_socket_path.as_str()).exists(),
+                "conflict classification must not delete the retained socket"
+            );
+        }
 
         let current = checkpoint_store.load().unwrap().unwrap();
         let mut drifted = successor.clone();
@@ -8125,6 +8301,63 @@ mod tests {
             }
         }
 
+        // A stable, single-link rejection for another Cat is closed typed
+        // checkpoint evidence. It must not hide the first Cat's handoff from
+        // the one immutable namespace join.
+        let rejection_desired = &desired_specs[1];
+        let (_, rejection_attachment) = exact_owned_record_and_attachment(rejection_desired);
+        let cleanup = CleanupRelease {
+            target: CleanupTarget::Volume {
+                volume_id: rejection_attachment.identity.volume_id.clone(),
+                attachment_id: rejection_attachment.identity.attachment_id.clone(),
+                attachment_epoch: rejection_attachment.identity.attachment_epoch,
+            },
+            inventory_session: SessionBinding {
+                node_id: rejection_desired.placement.node_id.clone(),
+                node_boot_id: NodeBootId::new("33333333333333333333333333333333").unwrap(),
+                agent_instance_id: RandomId128::new("44444444444444444444444444444444").unwrap(),
+                agent_session_epoch: Epoch::new(2).unwrap(),
+            },
+            inventory_epoch: Epoch::new(3).unwrap(),
+            inventory_read_position: Sequence::new(12).unwrap(),
+            desired_read_position: Sequence::new(21).unwrap(),
+            volume_release: Some(VolumeReleaseReplay {
+                release_transition_id: RandomId128::new("55555555555555555555555555555555")
+                    .unwrap(),
+                generation: rejection_attachment.head.generation,
+                disposition: rejection_desired.volumes[0].disposition.clone(),
+            }),
+        };
+        let rejection_store =
+            FileCheckpointStore::open(&checkpoint_directory, &rejection_desired.cat_id).unwrap();
+        let current = rejection_store.load().unwrap().unwrap();
+        let mut cleanup_checkpoint = current.checkpoint().clone();
+        cleanup_checkpoint.step = ReconcileStep::CleanupRelease {
+            cleanup: cleanup.clone(),
+        };
+        cleanup_checkpoint.updated_at_unix_ms =
+            UnixMillis::new(cleanup_checkpoint.updated_at_unix_ms.get() + 1).unwrap();
+        let cleanup_checkpoint = rejection_store
+            .replace(&current, &cleanup_checkpoint)
+            .unwrap();
+        let release_request = RuntimeVolumeTransitionRequest {
+            version: ContractVersion::V1,
+            session: cleanup.inventory_session.clone(),
+            cat_id: rejection_desired.cat_id.clone(),
+            desired_revision: rejection_desired.desired_revision,
+            spec_digest: rejection_desired.spec_digest.clone(),
+            placement: rejection_desired.placement.clone(),
+            transition: RuntimeVolumeTransition::Release { cleanup },
+        };
+        rejection_store
+            .persist_definite_release_rejection(
+                &cleanup_checkpoint,
+                &release_request,
+                RuntimeVolumeTransitionPreconditionProblem::CleanupEvidenceMismatch,
+            )
+            .unwrap();
+        drop(rejection_store);
+
         let limits = ProbeLimits {
             // Enough for one checkpoint enumeration plus one linear data-tree
             // traversal, but far below the old 2*N^2 checkpoint cost.
@@ -8138,6 +8371,77 @@ mod tests {
             scan_authorized_blockd_data(&root, &environment.state, &scan_context, limits).unwrap();
         assert!(data.complete);
         assert_eq!(data.evidence.len(), CAT_COUNT);
+
+        let rejection_target = super::super::checkpoint::release_rejection_path(
+            &checkpoint_directory,
+            &rejection_desired.cat_id,
+        );
+        let rejection_temp = super::super::checkpoint::release_rejection_temporary_path(
+            &checkpoint_directory,
+            &rejection_desired.cat_id,
+        );
+        let rejection_bytes = std::fs::read(&rejection_target).unwrap();
+        let mut options = std::fs::OpenOptions::new();
+        options.write(true).create_new(true).mode(0o600);
+        std::io::Write::write_all(
+            &mut options.open(&rejection_temp).unwrap(),
+            &rejection_bytes,
+        )
+        .unwrap();
+        let interrupted =
+            scan_authorized_blockd_data(&root, &environment.state, &scan_context, limits).unwrap();
+        assert!(
+            !interrupted.complete,
+            "single-link rejection temp must fail closed"
+        );
+        assert_eq!(std::fs::read(&rejection_target).unwrap(), rejection_bytes);
+        assert_eq!(std::fs::read(&rejection_temp).unwrap(), rejection_bytes);
+        std::fs::remove_file(&rejection_temp).unwrap();
+
+        std::fs::hard_link(&rejection_target, &rejection_temp).unwrap();
+        let publishing =
+            scan_authorized_blockd_data(&root, &environment.state, &scan_context, limits).unwrap();
+        assert!(
+            !publishing.complete,
+            "two-link rejection publication must fail closed"
+        );
+        assert_eq!(std::fs::metadata(&rejection_target).unwrap().nlink(), 2);
+        assert_eq!(std::fs::metadata(&rejection_temp).unwrap().nlink(), 2);
+        std::fs::remove_file(&rejection_temp).unwrap();
+        assert!(
+            scan_authorized_blockd_data(&root, &environment.state, &scan_context, limits)
+                .unwrap()
+                .complete,
+            "stable single-link rejection must rejoin the cross-Cat handoff"
+        );
+
+        let mut mismatched_marker =
+            decode_definite_release_rejection(&rejection_bytes, &rejection_target).unwrap();
+        mismatched_marker.checkpoint_content_digest = Sha256Digest::from_bytes([0xee; 32]);
+        std::fs::write(
+            &rejection_target,
+            serde_json::to_vec(&mismatched_marker).unwrap(),
+        )
+        .unwrap();
+        assert!(
+            scan_authorized_blockd_data(&root, &environment.state, &scan_context, limits).is_err(),
+            "stable rejection must validate against its exact checkpoint"
+        );
+        std::fs::write(&rejection_target, &rejection_bytes).unwrap();
+
+        let foreign_rejection = checkpoint_directory.join("cat-foreign.release-rejection.json");
+        let mut options = std::fs::OpenOptions::new();
+        options.write(true).create_new(true).mode(0o600);
+        std::io::Write::write_all(
+            &mut options.open(&foreign_rejection).unwrap(),
+            &rejection_bytes,
+        )
+        .unwrap();
+        assert!(
+            scan_authorized_blockd_data(&root, &environment.state, &scan_context, limits).is_err(),
+            "foreign stable rejection must fail closed"
+        );
+        std::fs::remove_file(foreign_rejection).unwrap();
 
         let foreign = checkpoint_directory.join("foreign.checkpoint");
         let mut options = std::fs::OpenOptions::new();

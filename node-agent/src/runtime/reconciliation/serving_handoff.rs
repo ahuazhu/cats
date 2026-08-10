@@ -60,9 +60,10 @@ use super::authorized_blockd::{
 };
 use super::root_provision_process::{
     prove_exact_root_provision_process_absence, ExactRootProvisionProcessAbsenceProof,
-    ExactRootProvisionProcessProof, RetainedRootProvisionProcessAttempt,
-    RootProvisionAuthoritySnapshot, RootProvisionBlockdHandshake, RootProvisionProcessEvidence,
-    RootProvisionProcessExpectation, RootProvisionProcessRetirementPort,
+    ExactRootProvisionProcessProof, RetainedRootProvisionPhysicalIdentity,
+    RetainedRootProvisionProcessAttempt, RootProvisionAuthoritySnapshot,
+    RootProvisionBlockdHandshake, RootProvisionProcessEvidence, RootProvisionProcessExpectation,
+    RootProvisionProcessRetirementPort,
 };
 use super::{FileCheckpointStore, StoredCheckpoint};
 
@@ -2281,6 +2282,35 @@ pub(crate) fn validate_scanned_serving_handoff_artifacts(
                 expected_provisioned_head: decoded.expected_provisioned_head.clone(),
                 attachment: target_artifact.attachment.clone(),
                 executable_path: decoded.expected_control_executable_path.clone(),
+                physical_identity: RetainedRootProvisionPhysicalIdentity {
+                    process_id: u32::try_from(decoded.old_control_process.process_id.get())
+                        .context("sealed old control process PID exceeds the platform PID domain")?,
+                    unit_main_process_id: u32::try_from(
+                        decoded.old_control_process.unit_main_process_id.get(),
+                    )
+                    .context(
+                        "sealed old control unit MainPID exceeds the platform PID domain",
+                    )?,
+                    process_start_time_ticks: decoded
+                        .old_control_process
+                        .process_start_time_ticks,
+                    cgroup_process_ids: decoded
+                        .old_control_process
+                        .cgroup_process_ids
+                        .iter()
+                        .map(|process_id| {
+                            u32::try_from(process_id.get()).context(
+                                "sealed old control cgroup PID exceeds the platform PID domain",
+                            )
+                        })
+                        .collect::<Result<Vec<_>>>()?,
+                    handshake_peer_process_id: u32::try_from(
+                        decoded.old_control_process.handshake.peer_process_id.get(),
+                    )
+                    .context(
+                        "sealed old control handshake peer PID exceeds the platform PID domain",
+                    )?,
+                },
             })
         }
         _ => anyhow::bail!(
@@ -4138,14 +4168,66 @@ mod tests {
             current.checkpoint().step,
             ReconcileStep::PrepareDevice { .. }
         ));
-        validate_scanned_serving_handoff_artifacts(
+        let retained = validate_scanned_serving_handoff_artifacts(
             current.checkpoint(),
             &fixture.acquired,
             &target_scan,
             Some(&record_scan),
             Some(&retirement_scan),
         )
-        .expect("PrepareDevice fresh classifier retains the exact rotated provenance");
+        .expect("PrepareDevice fresh classifier retains the exact rotated provenance")
+        .expect("PrepareDevice after-root handoff retains its old physical process");
+        assert_eq!(
+            retained.physical_identity,
+            RetainedRootProvisionPhysicalIdentity {
+                process_id: fixture.process.process_id,
+                unit_main_process_id: fixture.process.unit_main_process_id,
+                process_start_time_ticks: fixture.process.process_start_time_ticks,
+                cgroup_process_ids: fixture.process.cgroup_process_ids.clone(),
+                handshake_peer_process_id: fixture.process.handshake.peer_process_id,
+            }
+        );
+
+        let mut oversized_record = decode_serving_handoff_record(&record_bytes).unwrap();
+        let oversized_pid = WireU64::new(u64::from(u32::MAX) + 1).unwrap();
+        oversized_record.old_control_process.process_id = oversized_pid;
+        oversized_record.old_control_process.unit_main_process_id = oversized_pid;
+        oversized_record.old_control_process.cgroup_process_ids = vec![oversized_pid];
+        oversized_record
+            .old_control_process
+            .handshake
+            .peer_process_id = oversized_pid;
+        let oversized_record_bytes = encode_serving_handoff_record(&oversized_record).unwrap();
+        let mut oversized_record_scan =
+            scanned_file(&fixture.record_path(), &oversized_record_bytes);
+        oversized_record_scan.length = WireU64::new(oversized_record_bytes.len() as u64).unwrap();
+        let mut oversized_successor = successor.clone();
+        let ReconcileStep::PrepareDevice {
+            serving_authority, ..
+        } = &mut oversized_successor.step
+        else {
+            unreachable!()
+        };
+        let ServingAuthorityProvenance::AfterRootProvision { handoff } = serving_authority.as_mut()
+        else {
+            unreachable!()
+        };
+        handoff.record.length = oversized_record_scan.length;
+        handoff.record.content_sha256 = oversized_record_scan.content_sha256.clone();
+        let overflow = validate_scanned_serving_handoff_artifacts(
+            &oversized_successor,
+            &fixture.acquired,
+            &target_scan,
+            Some(&oversized_record_scan),
+            None,
+        )
+        .unwrap_err();
+        assert!(
+            overflow
+                .to_string()
+                .contains("exceeds the platform PID domain"),
+            "checked PID conversion failed for an oversized sealed record: {overflow:#}"
+        );
 
         let mut receipt_drift = retirement_bytes.clone();
         receipt_drift.push(b' ');

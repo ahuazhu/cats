@@ -1842,6 +1842,7 @@ mod tests {
             attachment,
             phase,
             executable_path: host("/usr/bin/cats-blockd"),
+            retained_physical_identity: None,
         }
     }
 
