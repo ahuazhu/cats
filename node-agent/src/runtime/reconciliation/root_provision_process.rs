@@ -9,7 +9,8 @@
 
 use anyhow::Context as _;
 use cats_api::runtime_reconciliation::{
-    Durability, Epoch, FenceEpoch, HostPath, Id, RandomId128, ReconcileStep, RemoteHead, Revision,
+    ControlHandshakeEvidence, Durability, Epoch, FenceEpoch, HostPath, Id, OwnershipTokenEvidence,
+    ProcessEvidence, ProcessRole, ProcessState, RandomId128, ReconcileStep, RemoteHead, Revision,
     RuntimeCheckpoint, Sha256Digest, WireU64,
 };
 use cats_storage::authority::{
@@ -255,7 +256,7 @@ pub(crate) struct RootProvisionProcessEvidence {
 }
 
 impl RootProvisionProcessEvidence {
-    fn exactly_matches(&self, expected: &RootProvisionProcessExpectation) -> bool {
+    pub(crate) fn exactly_matches(&self, expected: &RootProvisionProcessExpectation) -> bool {
         self.process_id > 0
             && self.unit_main_process_id == self.process_id
             && self.process_start_time_ticks.get() > 0
@@ -274,6 +275,27 @@ impl RootProvisionProcessEvidence {
             && self.handshake.process_identity_token == expected.process_identity_token
             && self.handshake.control_only
             && !self.handshake.guest_io_enabled
+    }
+
+    pub(crate) fn into_process_evidence(self) -> ProcessEvidence {
+        ProcessEvidence {
+            role: ProcessRole::Blockd {
+                volume_id: self.handshake.identity.volume_id,
+                attachment_id: self.handshake.identity.attachment_id,
+                attachment_epoch: self.handshake.identity.attachment_epoch,
+            },
+            process_id: self.process_id,
+            process_start_time_ticks: self.process_start_time_ticks,
+            executable_path: self.executable_path,
+            scope_id: self.scope_id,
+            control_socket_path: self.control_socket_path,
+            state: ProcessState::Running,
+            ownership_token: OwnershipTokenEvidence::Valid {
+                ownership_token: self.ownership_token,
+            },
+            control_handshake: ControlHandshakeEvidence::Verified,
+            observed_vm_shape: None,
+        }
     }
 }
 
@@ -358,6 +380,28 @@ pub(crate) trait RootProvisionProcessPort: sealed::Sealed + Send + Sync {
     ) -> anyhow::Result<RootProvisionProcessStart>;
 }
 
+/// Read and revalidate one exact process identity without creating, stopping,
+/// or otherwise mutating it. Sealing the underlying port is not itself proof
+/// that a returned test/platform value matches the checkpoint expectation.
+pub(crate) fn inspect_exact_root_provision_process<P>(
+    port: &P,
+    expected: &RootProvisionProcessExpectation,
+    context: &dyn RuntimePhysicalReadContext,
+) -> anyhow::Result<RootProvisionProcessInspection>
+where
+    P: RootProvisionProcessPort + ?Sized,
+{
+    Ok(match port.inspect(expected, context)? {
+        RootProvisionProcessInspection::Exact(evidence) if evidence.exactly_matches(expected) => {
+            RootProvisionProcessInspection::Exact(evidence)
+        }
+        RootProvisionProcessInspection::Exact(_) => {
+            RootProvisionProcessInspection::Conflict(RootProvisionProcessConflict::IdentityMismatch)
+        }
+        other => other,
+    })
+}
+
 /// Unforgeable proof, within this module, that the complete process identity
 /// crossed the checkpoint directory durability barrier.
 pub(crate) struct CheckpointedRootProvisionProcess<'a> {
@@ -419,8 +463,7 @@ where
         .context("persist root-provision process identity before process effect")?;
 
     context.check_active()?;
-    let inspection = port
-        .inspect(&expected, context)
+    let inspection = inspect_exact_root_provision_process(port, &expected, context)
         .context("inspect exact root-provision process identity")?;
     let outcome = match inspection {
         RootProvisionProcessInspection::Exact(evidence) => {
@@ -455,8 +498,7 @@ where
                 }
                 RootProvisionProcessStart::Unavailable => RootProvisionProcessOutcome::Unavailable,
                 RootProvisionProcessStart::Ambiguous => {
-                    match port
-                        .inspect(&expected, context)
+                    match inspect_exact_root_provision_process(port, &expected, context)
                         .context("recover ambiguous root-provision process start")?
                     {
                         RootProvisionProcessInspection::Exact(evidence) => match_exact(
@@ -976,6 +1018,43 @@ mod tests {
                 "{variant}"
             );
         }
+    }
+
+    #[test]
+    fn exact_root_provision_identity_projects_one_verified_blockd_process() {
+        let attachment = attachment();
+        let expected_identity = attachment.identity.clone();
+        let expected_token = random('4');
+        let process = evidence(&attachment).into_process_evidence();
+
+        assert_eq!(
+            process.role,
+            ProcessRole::Blockd {
+                volume_id: expected_identity.volume_id,
+                attachment_id: expected_identity.attachment_id,
+                attachment_epoch: expected_identity.attachment_epoch,
+            }
+        );
+        assert_eq!(process.process_id, 4242);
+        assert_eq!(process.process_start_time_ticks, WireU64::new(700).unwrap());
+        assert_eq!(process.executable_path, host("/usr/bin/cats-blockd"));
+        assert_eq!(process.scope_id, id("cats-root.service"));
+        assert_eq!(
+            process.control_socket_path,
+            host("/run/cats/cat_01/root-provision.sock")
+        );
+        assert_eq!(process.state, ProcessState::Running);
+        assert_eq!(
+            process.ownership_token,
+            OwnershipTokenEvidence::Valid {
+                ownership_token: expected_token,
+            }
+        );
+        assert_eq!(
+            process.control_handshake,
+            ControlHandshakeEvidence::Verified
+        );
+        assert_eq!(process.observed_vm_shape, None);
     }
 
     #[test]
