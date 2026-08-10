@@ -300,11 +300,14 @@ impl Drop for VmmCidAllocationPermit {
     }
 }
 
+#[cfg(test)]
+type AfterReplaceHook = Arc<dyn Fn(&RuntimeDesiredEffectContext) + Send + Sync>;
+
 pub(crate) struct VmmCidAllocationPort {
     state_directory: StateDirectory,
     inventory: Arc<dyn VmmCidInventoryPort>,
     #[cfg(test)]
-    after_replace: Option<Arc<dyn Fn(&RuntimeDesiredEffectContext) + Send + Sync>>,
+    after_replace: Option<AfterReplaceHook>,
 }
 
 impl std::fmt::Debug for VmmCidAllocationPort {
@@ -331,10 +334,7 @@ impl VmmCidAllocationPort {
     }
 
     #[cfg(test)]
-    fn with_after_replace(
-        mut self,
-        hook: Arc<dyn Fn(&RuntimeDesiredEffectContext) + Send + Sync>,
-    ) -> Self {
+    fn with_after_replace(mut self, hook: AfterReplaceHook) -> Self {
         self.after_replace = Some(hook);
         self
     }
