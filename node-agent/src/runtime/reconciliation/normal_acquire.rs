@@ -16,9 +16,10 @@ use cats_api::agent_registration::{
 use cats_api::runtime_reconciliation::{
     decode_runtime_volume_transition_error, decode_runtime_volume_transition_success,
     encode_runtime_volume_transition_request, AcquireOrigin, AdmissionInventoryAttestation,
-    AgentSession, ContractErrorDetail, ContractName, DiskKind, NormalAcquireRequest,
-    NormalAcquireResult, RuntimeSpineHttpProblem, RuntimeVolumeAuthorityRejection,
-    RuntimeVolumeTransition, RuntimeVolumeTransitionError, RuntimeVolumeTransitionErrorDetail,
+    AgentSession, CleanupRelease, CleanupTarget, ContractErrorDetail, ContractName, DiskKind,
+    LastVolumeTransition, NormalAcquireRequest, NormalAcquireResult, ReleaseRequest, ReleaseResult,
+    RemoteHead, RuntimeSpineHttpProblem, RuntimeVolumeAuthorityRejection, RuntimeVolumeTransition,
+    RuntimeVolumeTransitionError, RuntimeVolumeTransitionErrorDetail,
     RuntimeVolumeTransitionOutcome, RuntimeVolumeTransitionPreconditionProblem,
     RuntimeVolumeTransitionRequest, SessionBinding, VolumeAccess, VolumeAcquire,
     VolumeAcquireRequest, VolumeAdminState, VolumeDisposition, VolumeIntent, VolumeRecord,
@@ -75,6 +76,22 @@ pub enum NormalAcquireAttempt {
     Ambiguous,
 }
 
+/// Closed result classes for the same signed A22 route when a checkpointed
+/// stale-lineage cleanup releases its exact current owner.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum NormalReleaseAttempt {
+    Released(ReleaseResult),
+    RetryExact,
+    RefreshInventory,
+    ReplanDesired,
+    SessionReplacementRequired,
+    IdentityRepairRequired,
+    AuthorityRejected(RuntimeVolumeAuthorityRejection),
+    StopForLocalContract,
+    StopForDeploymentMismatch,
+    Ambiguous,
+}
+
 /// The exact accepted A20 context against which a closed A22 rejection can be
 /// interpreted. The mutation body intentionally does not duplicate these
 /// session/attestation fields, so accepting a 409 without this context would
@@ -93,6 +110,13 @@ pub enum NormalAcquireAuthorityRecovery {
     Blocked,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum NormalReleaseAuthorityRecovery {
+    Released(ReleaseResult),
+    RetryExact,
+    Blocked,
+}
+
 #[derive(Debug, thiserror::Error)]
 pub enum NormalAcquireClientError {
     #[error("invalid local A22 mutation request: {0:?}")]
@@ -101,6 +125,10 @@ pub enum NormalAcquireClientError {
     InvalidVolumeBinding,
     #[error("normal-acquire request is not exactly bound to one accepted full A20 context")]
     InvalidAcceptedContext,
+    #[error(
+        "normal-release request is not exactly bound to the supplied root VolumeIntent and head"
+    )]
+    InvalidReleaseBinding,
 }
 
 #[derive(Debug, Clone)]
@@ -165,6 +193,124 @@ where
             SignedVolumeTransitionResponse::Ambiguous => Ok(NormalAcquireAttempt::Ambiguous),
         }
     }
+
+    pub fn release(
+        &self,
+        request: &RuntimeVolumeTransitionRequest,
+        volume: &VolumeIntent,
+        expected_head: &RemoteHead,
+        accepted: &NormalAcquireAcceptedContext,
+        deadline: Instant,
+    ) -> Result<NormalReleaseAttempt, NormalAcquireClientError> {
+        let body = encode_runtime_volume_transition_request(request)
+            .map_err(NormalAcquireClientError::InvalidRequest)?;
+        let cleanup = validate_local_release_request(request, volume, expected_head)?;
+        validate_accepted_context(request, accepted)?;
+        let response = match self.transport.post_a19_signed_json(
+            RUNTIME_VOLUME_TRANSITION_PATH,
+            &body,
+            RUNTIME_VOLUME_TRANSITION_SUCCESS_MAX_WIRE_BYTES,
+            deadline,
+        ) {
+            Ok(response) => response,
+            Err(_) => return Ok(NormalReleaseAttempt::Ambiguous),
+        };
+        match response {
+            SignedVolumeTransitionResponse::Success(body) => {
+                let Ok(success) = decode_runtime_volume_transition_success(&body) else {
+                    return Ok(NormalReleaseAttempt::Ambiguous);
+                };
+                let Some(release) = exact_release_success(request, cleanup, expected_head, success)
+                else {
+                    return Ok(NormalReleaseAttempt::Ambiguous);
+                };
+                Ok(NormalReleaseAttempt::Released(release))
+            }
+            SignedVolumeTransitionResponse::ClosedError { status, body } => {
+                let Ok(error) = decode_runtime_volume_transition_error(&body) else {
+                    return Ok(NormalReleaseAttempt::Ambiguous);
+                };
+                Ok(map_closed_release_error(
+                    status, &error, request, volume, accepted,
+                ))
+            }
+            SignedVolumeTransitionResponse::PlainRouteNotFound => {
+                Ok(NormalReleaseAttempt::StopForDeploymentMismatch)
+            }
+            SignedVolumeTransitionResponse::Ambiguous => Ok(NormalReleaseAttempt::Ambiguous),
+        }
+    }
+}
+
+/// Resolve an ambiguous release only from its exact immutable marker. An
+/// Unowned record without the matching transition/result pair is not success.
+pub fn recover_normal_release_from_authority(
+    request: &RuntimeVolumeTransitionRequest,
+    volume: &VolumeIntent,
+    expected_head: &RemoteHead,
+    record: &VolumeRecord,
+) -> Result<NormalReleaseAuthorityRecovery, NormalAcquireClientError> {
+    let cleanup = validate_local_release_request(request, volume, expected_head)?;
+    if validate_volume_record(record).is_err()
+        || record.volume_id != volume.volume_id
+        || record.size_bytes != volume.size_bytes
+        || record.durability != volume.durability
+        || !matches!(record.admin_state, VolumeAdminState::Active)
+    {
+        return Ok(NormalReleaseAuthorityRecovery::Blocked);
+    }
+    let (
+        CleanupTarget::Volume {
+            volume_id,
+            attachment_id,
+            attachment_epoch,
+        },
+        Some(replay),
+    ) = (&cleanup.target, &cleanup.volume_release)
+    else {
+        unreachable!("local release validation accepted only a Volume replay")
+    };
+    if record.lease_owner.as_ref() == Some(attachment_id)
+        && record.lease_epoch == *attachment_epoch
+        && record.lease_expires_at.is_some()
+        && record.head == *expected_head
+    {
+        return Ok(NormalReleaseAuthorityRecovery::RetryExact);
+    }
+    let Some(LastVolumeTransition::Release {
+        request: stored_request,
+        result,
+    }) = &record.last_transition
+    else {
+        return Ok(NormalReleaseAuthorityRecovery::Blocked);
+    };
+    let expected_request = ReleaseRequest {
+        volume_id: volume_id.clone(),
+        transition_id: replay.release_transition_id.clone(),
+        attachment_id: attachment_id.clone(),
+        expected_epoch: *attachment_epoch,
+    };
+    let Some(resulting_epoch) = attachment_epoch
+        .get()
+        .checked_add(1)
+        .and_then(cats_api::runtime_reconciliation::FenceEpoch::new)
+    else {
+        return Ok(NormalReleaseAuthorityRecovery::Blocked);
+    };
+    if stored_request != &expected_request
+        || result.volume_id != *volume_id
+        || result.transition_id != replay.release_transition_id
+        || result.released_attachment_id != *attachment_id
+        || result.resulting_epoch != resulting_epoch
+        || result.resulting_head != *expected_head
+        || record.lease_owner.is_some()
+        || record.lease_expires_at.is_some()
+        || record.lease_epoch != resulting_epoch
+        || record.head != *expected_head
+    {
+        return Ok(NormalReleaseAuthorityRecovery::Blocked);
+    }
+    Ok(NormalReleaseAuthorityRecovery::Released(result.clone()))
 }
 
 /// Resolve an unknown HTTP outcome through the exact point-read authority
@@ -302,6 +448,47 @@ fn validate_local_normal_request<'a>(
     Ok(acquire)
 }
 
+fn validate_local_release_request<'a>(
+    request: &'a RuntimeVolumeTransitionRequest,
+    volume: &VolumeIntent,
+    expected_head: &RemoteHead,
+) -> Result<&'a CleanupRelease, NormalAcquireClientError> {
+    let RuntimeVolumeTransition::Release { cleanup } = &request.transition else {
+        return Err(NormalAcquireClientError::InvalidReleaseBinding);
+    };
+    let (
+        CleanupTarget::Volume {
+            volume_id,
+            attachment_id,
+            attachment_epoch,
+        },
+        Some(replay),
+    ) = (&cleanup.target, &cleanup.volume_release)
+    else {
+        return Err(NormalAcquireClientError::InvalidReleaseBinding);
+    };
+    let VolumeAcquire::Normal { .. } = &volume.acquire else {
+        return Err(NormalAcquireClientError::InvalidReleaseBinding);
+    };
+    if request.placement.node_id != request.session.node_id
+        || cleanup.inventory_session != request.session
+        || cleanup.desired_read_position < cleanup.inventory_read_position
+        || volume_id != &volume.volume_id
+        || attachment_id != &volume.attachment_id
+        || replay.generation != expected_head.generation
+        || replay.disposition != volume.disposition
+        || volume.size_bytes == 0
+        || volume.disk_kind != DiskKind::Root
+        || volume.access != VolumeAccess::ReadWriteOnce
+        || volume.mount.is_some()
+        || !matches!(volume.disposition, VolumeDisposition::Retain)
+        || attachment_epoch.get() == u64::MAX
+    {
+        return Err(NormalAcquireClientError::InvalidReleaseBinding);
+    }
+    Ok(cleanup)
+}
+
 fn validate_accepted_context(
     request: &RuntimeVolumeTransitionRequest,
     accepted: &NormalAcquireAcceptedContext,
@@ -407,6 +594,44 @@ fn exact_success_attachment(
         .then_some(attachment)
 }
 
+fn exact_release_success(
+    request: &RuntimeVolumeTransitionRequest,
+    cleanup: &CleanupRelease,
+    expected_head: &RemoteHead,
+    success: cats_api::runtime_reconciliation::RuntimeVolumeTransitionSuccess,
+) -> Option<ReleaseResult> {
+    if success.version != request.version
+        || success.session != request.session
+        || success.cat_id != request.cat_id
+        || success.desired_revision != request.desired_revision
+        || success.spec_digest != request.spec_digest
+        || success.placement != request.placement
+    {
+        return None;
+    }
+    let RuntimeVolumeTransitionOutcome::Released { release } = success.outcome else {
+        return None;
+    };
+    let (
+        CleanupTarget::Volume {
+            volume_id,
+            attachment_id,
+            attachment_epoch,
+        },
+        Some(replay),
+    ) = (&cleanup.target, &cleanup.volume_release)
+    else {
+        return None;
+    };
+    let resulting_epoch = attachment_epoch.get().checked_add(1)?;
+    (release.volume_id == *volume_id
+        && release.transition_id == replay.release_transition_id
+        && release.released_attachment_id == *attachment_id
+        && release.resulting_epoch.get() == resulting_epoch
+        && release.resulting_head == *expected_head)
+        .then_some(release)
+}
+
 fn map_closed_error(
     status: u16,
     error: &RuntimeVolumeTransitionError,
@@ -480,6 +705,37 @@ fn map_closed_error(
             NormalAcquireAttempt::StopForLocalContract
         }
         _ => NormalAcquireAttempt::Ambiguous,
+    }
+}
+
+fn map_closed_release_error(
+    status: u16,
+    error: &RuntimeVolumeTransitionError,
+    request: &RuntimeVolumeTransitionRequest,
+    volume: &VolumeIntent,
+    accepted: &NormalAcquireAcceptedContext,
+) -> NormalReleaseAttempt {
+    match map_closed_error(status, error, request, volume, accepted) {
+        NormalAcquireAttempt::RetryExact => NormalReleaseAttempt::RetryExact,
+        NormalAcquireAttempt::RefreshInventory => NormalReleaseAttempt::RefreshInventory,
+        NormalAcquireAttempt::ReplanDesired => NormalReleaseAttempt::ReplanDesired,
+        NormalAcquireAttempt::SessionReplacementRequired => {
+            NormalReleaseAttempt::SessionReplacementRequired
+        }
+        NormalAcquireAttempt::IdentityRepairRequired => {
+            NormalReleaseAttempt::IdentityRepairRequired
+        }
+        NormalAcquireAttempt::AuthorityRejected(reason) => {
+            NormalReleaseAttempt::AuthorityRejected(reason)
+        }
+        NormalAcquireAttempt::StopForLocalContract => NormalReleaseAttempt::StopForLocalContract,
+        NormalAcquireAttempt::StopForDeploymentMismatch => {
+            NormalReleaseAttempt::StopForDeploymentMismatch
+        }
+        NormalAcquireAttempt::Ambiguous => NormalReleaseAttempt::Ambiguous,
+        NormalAcquireAttempt::Granted(_) => {
+            unreachable!("closed error mapping never produces an acquire grant")
+        }
     }
 }
 

@@ -67,10 +67,12 @@ pub use inventory::{
     CleanSlateInventoryScanner, InventoryAbsence, InventoryAbsenceProbe, InventoryProbeSetError,
 };
 pub use normal_acquire::{
-    recover_normal_acquire_from_authority, A19SignedVolumeTransitionTransport,
-    ControlSignedNormalAcquireClient, NormalAcquireAcceptedContext, NormalAcquireAttempt,
-    NormalAcquireAuthorityRecovery, NormalAcquireClientError, RuntimeVolumeTransitionHttpClient,
-    SignedVolumeTransitionResponse, VolumeTransitionTransportFailure,
+    recover_normal_acquire_from_authority, recover_normal_release_from_authority,
+    A19SignedVolumeTransitionTransport, ControlSignedNormalAcquireClient,
+    NormalAcquireAcceptedContext, NormalAcquireAttempt, NormalAcquireAuthorityRecovery,
+    NormalAcquireClientError, NormalReleaseAttempt, NormalReleaseAuthorityRecovery,
+    RuntimeVolumeTransitionHttpClient, SignedVolumeTransitionResponse,
+    VolumeTransitionTransportFailure,
 };
 pub use root_provision::{
     AuthorityRereadRequired, RootProvisionClientError, RootProvisionControlPort,

@@ -258,6 +258,11 @@ pub struct RuntimeDesiredEffectAdmission {
     session: AgentSession,
     observation: NodeObservation,
     attestation: AdmissionInventoryAttestation,
+    // Bound only by the successful Desired read which opens the effect batch.
+    // CleanupRelease must carry this exact accepted cursor; reconstructing it
+    // from the inventory attestation would lose the case where Desired
+    // advanced after the scan but still accepted the same physical evidence.
+    desired_read_position: Option<cats_api::runtime_reconciliation::Sequence>,
 }
 
 impl RuntimeDesiredEffectAdmission {
@@ -284,6 +289,7 @@ impl RuntimeDesiredEffectAdmission {
             session,
             observation,
             attestation: attestation.clone(),
+            desired_read_position: None,
         })
     }
 
@@ -299,16 +305,36 @@ impl RuntimeDesiredEffectAdmission {
         &self.attestation
     }
 
+    pub fn desired_read_position(&self) -> Option<cats_api::runtime_reconciliation::Sequence> {
+        self.desired_read_position
+    }
+
+    fn bind_desired_read_position(&mut self, snapshot: &DesiredReadSnapshot) -> anyhow::Result<()> {
+        anyhow::ensure!(
+            snapshot.version == self.session.version
+                && snapshot.session.node_id == self.session.node_id
+                && snapshot.session.node_boot_id == self.session.node_boot_id
+                && snapshot.session.agent_instance_id == self.session.agent_instance_id
+                && snapshot.session.agent_session_epoch == self.session.agent_session_epoch
+                && snapshot.read_position >= self.attestation.inventory_read_position,
+            "accepted Desired snapshot does not bind the current full effect admission"
+        );
+        self.desired_read_position = Some(snapshot.read_position);
+        Ok(())
+    }
+
     #[cfg(test)]
     pub(crate) fn for_test(
         session: AgentSession,
         observation: NodeObservation,
         attestation: AdmissionInventoryAttestation,
     ) -> Self {
+        let desired_read_position = attestation.inventory_read_position;
         Self {
             session,
             observation,
             attestation,
+            desired_read_position: Some(desired_read_position),
         }
     }
 }
@@ -1841,6 +1867,19 @@ impl RuntimeSpineRunner {
         match self.client.desired_read(request.bytes()).await? {
             RuntimeSpineAttempt::Accepted(accepted) => {
                 let desired_specs = accepted.value.desired_specs.clone();
+                if self.effect_lane.is_some() && self.effect_admission_open {
+                    self.effect_admission
+                        .as_mut()
+                        .ok_or(RuntimeSpineRunError::InvalidScan(
+                            "effect admission opened without its accepted full inventory",
+                        ))?
+                        .bind_desired_read_position(&accepted.value)
+                        .map_err(|_| {
+                            RuntimeSpineRunError::InvalidScan(
+                                "accepted Desired does not bind the effect admission",
+                            )
+                        })?;
+                }
                 self.journal_lane()?
                     .accept_desired(accepted.value, accepted.bytes)
                     .await?;
