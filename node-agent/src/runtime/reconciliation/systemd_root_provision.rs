@@ -3287,6 +3287,7 @@ while True:
         let frontend = cats_api::runtime_reconciliation::PrepareDeviceFrontend::KernelNbd {
             listener_socket_path: host(listener_socket.to_str().expect("listener path is UTF-8")),
             device_path: host("/dev/nbd0"),
+            direct: false,
         };
         let listener = match platform_listener_peer(
             &state,
