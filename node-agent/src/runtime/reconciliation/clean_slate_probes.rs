@@ -44,8 +44,8 @@ use cats_storage::BlobStore;
 use sha2::{Digest as _, Sha256};
 
 use crate::runtime_spine::{
-    RuntimeInventoryScanContext, RuntimeInventoryScanner, RuntimePhysicalReadContext,
-    RuntimePreScanRecoveryContext,
+    RuntimeAssignedCatSet, RuntimeInventoryScanContext, RuntimeInventoryScanner,
+    RuntimePhysicalReadContext, RuntimePreScanRecoveryContext,
 };
 use crate::state_directory::StateDirectory;
 
@@ -96,6 +96,8 @@ const WARM_SNAPSHOT_NAMESPACE: &str = "warm-snapshots";
 const GUEST_MOUNT_NAMESPACE: &str = "guest-mounts";
 const RUNTIME_V1_MAX_ASSIGNED_CATS: usize = 1_024;
 const RUNTIME_STATE_ENTRIES_PER_ASSIGNED_CAT: usize = 32;
+pub(crate) const RUNTIME_CHECKPOINT_NAMESPACE_ENTRY_LIMIT: usize =
+    RUNTIME_V1_MAX_ASSIGNED_CATS * RUNTIME_STATE_ENTRIES_PER_ASSIGNED_CAT;
 
 fn is_release_rejection_entry(name: &str) -> bool {
     (name.starts_with("cat-") && name.ends_with(".release-rejection.json"))
@@ -874,7 +876,7 @@ impl Default for ProbeLimits {
             // data-directory levels, the three immutable authorization files,
             // control-only state, and bounded handoff publications. Keep the
             // cap proportional to the wire-level 1,024-Cat bound.
-            state_entries: RUNTIME_V1_MAX_ASSIGNED_CATS * RUNTIME_STATE_ENTRIES_PER_ASSIGNED_CAT,
+            state_entries: RUNTIME_CHECKPOINT_NAMESPACE_ENTRY_LIMIT,
             os_entries: 131_072,
             recursion_depth: 16,
             process_cmdline_bytes: 64 * 1024,
@@ -1784,6 +1786,7 @@ struct AuthorizedBlockdDataScan {
 /// quadratic; this index validates every name and target exactly once, then
 /// all handoff leaves use an in-memory Cat lookup from the same snapshot.
 pub(crate) struct RuntimeCheckpointNamespaceSnapshot {
+    directory: File,
     checkpoints: BTreeMap<Id, RuntimeCheckpoint>,
 }
 
@@ -1795,14 +1798,23 @@ impl RuntimeCheckpointNamespaceSnapshot {
         self.checkpoints.values()
     }
 
-    fn get(&self, cat_id: &Id) -> Option<&RuntimeCheckpoint> {
+    pub(crate) fn checkpoint(&self, cat_id: &Id) -> Option<&RuntimeCheckpoint> {
         self.checkpoints.get(cat_id)
+    }
+
+    pub(crate) fn retained_directory(&self) -> &File {
+        &self.directory
+    }
+
+    fn get(&self, cat_id: &Id) -> Option<&RuntimeCheckpoint> {
+        self.checkpoint(cat_id)
     }
 }
 
 pub(crate) fn snapshot_runtime_checkpoint_namespace(
     root: &File,
-    context: &RuntimeInventoryScanContext,
+    context: &dyn RuntimePhysicalReadContext,
+    assigned_cats: &RuntimeAssignedCatSet,
     limit: usize,
 ) -> anyhow::Result<Option<RuntimeCheckpointNamespaceSnapshot>> {
     let directory = match open_state_namespace(root, CHECKPOINT_NAMESPACE)? {
@@ -1814,50 +1826,25 @@ pub(crate) fn snapshot_runtime_checkpoint_namespace(
     else {
         return Ok(None);
     };
-    let desired_by_target = context
-        .coordinates()
-        .desired
-        .desired_specs
+    let desired_by_target = assigned_cats
         .iter()
-        .map(|desired| (format!("cat-{}.checkpoint.json", desired.cat_id), desired))
+        .map(|cat_id| (format!("cat-{cat_id}.checkpoint.json"), cat_id))
         .collect::<BTreeMap<_, _>>();
-    let desired_locks = context
-        .coordinates()
-        .desired
-        .desired_specs
+    let desired_locks = assigned_cats
         .iter()
-        .map(|desired| format!("cat-{}.checkpoint.lock", desired.cat_id))
+        .map(|cat_id| format!("cat-{cat_id}.checkpoint.lock"))
         .collect::<BTreeSet<_>>();
-    let desired_checkpoint_temps = context
-        .coordinates()
-        .desired
-        .desired_specs
+    let desired_checkpoint_temps = assigned_cats
         .iter()
-        .map(|desired| format!(".cat-{}.checkpoint.tmp", desired.cat_id))
+        .map(|cat_id| format!(".cat-{cat_id}.checkpoint.tmp"))
         .collect::<BTreeSet<_>>();
-    let desired_by_release_rejection = context
-        .coordinates()
-        .desired
-        .desired_specs
+    let desired_by_release_rejection = assigned_cats
         .iter()
-        .map(|desired| {
-            (
-                format!("cat-{}.release-rejection.json", desired.cat_id),
-                desired,
-            )
-        })
+        .map(|cat_id| (format!("cat-{cat_id}.release-rejection.json"), cat_id))
         .collect::<BTreeMap<_, _>>();
-    let desired_by_release_rejection_temp = context
-        .coordinates()
-        .desired
-        .desired_specs
+    let desired_by_release_rejection_temp = assigned_cats
         .iter()
-        .map(|desired| {
-            (
-                format!(".cat-{}.release-rejection.tmp", desired.cat_id),
-                desired,
-            )
-        })
+        .map(|cat_id| (format!(".cat-{cat_id}.release-rejection.tmp"), cat_id))
         .collect::<BTreeMap<_, _>>();
     let mut checkpoints = BTreeMap::new();
     let mut release_rejections = BTreeMap::<Id, (DefiniteReleaseRejection, PathBuf)>::new();
@@ -1882,7 +1869,7 @@ pub(crate) fn snapshot_runtime_checkpoint_namespace(
             let _ = read_release_rejection_publication_at(&directory, &entry, root, context)?;
             return Ok(None);
         }
-        if let Some(desired) = desired_by_release_rejection.get(name) {
+        if let Some(cat_id) = desired_by_release_rejection.get(name) {
             if entry.metadata.st_nlink != 1 {
                 // During the no-replace link publication both deterministic
                 // names refer to one inode. Preserve that bounded window for
@@ -1903,18 +1890,18 @@ pub(crate) fn snapshot_runtime_checkpoint_namespace(
             let diagnostic_path = PathBuf::from(CHECKPOINT_NAMESPACE).join(name);
             let marker = decode_definite_release_rejection(&bytes, &diagnostic_path)?;
             anyhow::ensure!(
-                marker.cat_id == desired.cat_id,
+                &marker.cat_id == *cat_id,
                 "handoff index release rejection filename and Cat identity disagree"
             );
             anyhow::ensure!(
                 release_rejections
-                    .insert(desired.cat_id.clone(), (marker, diagnostic_path))
+                    .insert((*cat_id).clone(), (marker, diagnostic_path))
                     .is_none(),
                 "handoff index contains duplicate release rejections for one Cat"
             );
             continue;
         }
-        let Some(desired) = desired_by_target.get(name) else {
+        let Some(cat_id) = desired_by_target.get(name) else {
             bail!("checkpoint namespace retains foreign entry {name}")
         };
         let Some(bytes) = read_strict_regular_at(
@@ -1930,13 +1917,11 @@ pub(crate) fn snapshot_runtime_checkpoint_namespace(
         let checkpoint =
             decode_runtime_checkpoint(&bytes).context("decode handoff-index Runtime checkpoint")?;
         anyhow::ensure!(
-            checkpoint.cat_id == desired.cat_id,
+            &checkpoint.cat_id == *cat_id,
             "handoff index checkpoint filename and Cat identity disagree"
         );
         anyhow::ensure!(
-            checkpoints
-                .insert(desired.cat_id.clone(), checkpoint)
-                .is_none(),
+            checkpoints.insert((*cat_id).clone(), checkpoint).is_none(),
             "handoff index contains duplicate Runtime checkpoints for one Cat"
         );
     }
@@ -1946,7 +1931,10 @@ pub(crate) fn snapshot_runtime_checkpoint_namespace(
             .context("handoff index release rejection lacks its Runtime checkpoint")?;
         validate_definite_release_rejection(&marker, checkpoint, &path)?;
     }
-    let snapshot = RuntimeCheckpointNamespaceSnapshot { checkpoints };
+    let snapshot = RuntimeCheckpointNamespaceSnapshot {
+        directory,
+        checkpoints,
+    };
     anyhow::ensure!(
         snapshot.iter_checkpoints().len() <= RUNTIME_V1_MAX_ASSIGNED_CATS,
         "handoff checkpoint index exceeds the assigned-Cat cap"
@@ -1990,8 +1978,9 @@ fn scan_authorized_blockd_data(
         .iter()
         .map(|desired| (format!("cat-{}", desired.cat_id), desired))
         .collect::<BTreeMap<_, _>>();
+    let assigned_cats = context.assigned_cats()?;
     let checkpoint_snapshot =
-        snapshot_runtime_checkpoint_namespace(root, context, limits.state_entries)?;
+        snapshot_runtime_checkpoint_namespace(root, context, &assigned_cats, limits.state_entries)?;
     let mut budget = limits.state_entries;
     let Some(cat_entries) = strict_directory_entries(&directory, &mut budget, context)? else {
         return Ok(AuthorizedBlockdDataScan {
@@ -4108,7 +4097,7 @@ struct StrictDirectoryEntry {
 fn strict_directory_entries(
     directory: &File,
     budget: &mut usize,
-    context: &RuntimeInventoryScanContext,
+    context: &dyn RuntimePhysicalReadContext,
 ) -> anyhow::Result<Option<Vec<StrictDirectoryEntry>>> {
     strict_directory_entries_with_release_links(directory, budget, context, false)
 }
@@ -4116,7 +4105,7 @@ fn strict_directory_entries(
 fn strict_checkpoint_directory_entries(
     directory: &File,
     budget: &mut usize,
-    context: &RuntimeInventoryScanContext,
+    context: &dyn RuntimePhysicalReadContext,
 ) -> anyhow::Result<Option<Vec<StrictDirectoryEntry>>> {
     strict_directory_entries_with_release_links(directory, budget, context, true)
 }
@@ -4124,7 +4113,7 @@ fn strict_checkpoint_directory_entries(
 fn strict_directory_entries_with_release_links(
     directory: &File,
     budget: &mut usize,
-    context: &RuntimeInventoryScanContext,
+    context: &dyn RuntimePhysicalReadContext,
     allow_release_publication_links: bool,
 ) -> anyhow::Result<Option<Vec<StrictDirectoryEntry>>> {
     let mut stream = match DirectoryStream::open(directory) {
@@ -4261,7 +4250,7 @@ fn read_strict_regular_at(
     entry: &StrictDirectoryEntry,
     root: &File,
     cap: usize,
-    context: &RuntimeInventoryScanContext,
+    context: &dyn RuntimePhysicalReadContext,
 ) -> anyhow::Result<Option<Vec<u8>>> {
     validate_strict_regular_entry(entry, root, 0o600)?;
     context.check_active()?;
@@ -4454,7 +4443,7 @@ fn read_release_rejection_publication_at(
     directory: &File,
     entry: &StrictDirectoryEntry,
     root: &File,
-    context: &RuntimeInventoryScanContext,
+    context: &dyn RuntimePhysicalReadContext,
 ) -> anyhow::Result<Option<Vec<u8>>> {
     let root_metadata = root.metadata().context("inspect retained state root")?;
     anyhow::ensure!(
@@ -8662,10 +8651,15 @@ mod tests {
         let root = clone_state_root(&StateDirectory::unanchored(environment.state.clone()))
             .unwrap()
             .unwrap();
-        let checkpoint_snapshot =
-            snapshot_runtime_checkpoint_namespace(&root, &scan_context, limits.state_entries)
-                .unwrap()
-                .unwrap();
+        let assigned_cats = scan_context.assigned_cats().unwrap();
+        let checkpoint_snapshot = snapshot_runtime_checkpoint_namespace(
+            &root,
+            &scan_context,
+            &assigned_cats,
+            limits.state_entries,
+        )
+        .unwrap()
+        .unwrap();
         assert_eq!(checkpoint_snapshot.iter_checkpoints().len(), CAT_COUNT);
         let data =
             scan_authorized_blockd_data(&root, &environment.state, &scan_context, limits).unwrap();

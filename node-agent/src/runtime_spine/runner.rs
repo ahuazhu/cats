@@ -192,6 +192,34 @@ pub(crate) trait RuntimePhysicalReadContext {
     fn check_active(&self) -> anyhow::Result<()>;
 }
 
+/// The complete Cat-name set from one accepted Desired snapshot. The private
+/// field prevents a provider adapter from constructing "all checkpoints" out
+/// of a hand-picked subset; only the runner's accepted scan/effect contexts
+/// can mint this proof.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct RuntimeAssignedCatSet {
+    cat_ids: BTreeSet<Id>,
+}
+
+impl RuntimeAssignedCatSet {
+    fn from_snapshot(snapshot: &DesiredReadSnapshot) -> anyhow::Result<Self> {
+        let cat_ids = snapshot
+            .desired_specs
+            .iter()
+            .map(|desired| desired.cat_id.clone())
+            .collect::<BTreeSet<_>>();
+        anyhow::ensure!(
+            cat_ids.len() == snapshot.desired_specs.len(),
+            "accepted Desired snapshot repeats a Cat identity"
+        );
+        Ok(Self { cat_ids })
+    }
+
+    pub(crate) fn iter(&self) -> impl ExactSizeIterator<Item = &Id> {
+        self.cat_ids.iter()
+    }
+}
+
 #[derive(Debug, Clone)]
 pub(crate) struct RuntimePreScanRecoveryContext {
     state_directory: StateDirectory,
@@ -271,6 +299,7 @@ pub struct RuntimeDesiredEffectAdmission {
     // from the inventory attestation would lose the case where Desired
     // advanced after the scan but still accepted the same physical evidence.
     desired_read_position: Option<cats_api::runtime_reconciliation::Sequence>,
+    assigned_cats: Option<RuntimeAssignedCatSet>,
 }
 
 impl RuntimeDesiredEffectAdmission {
@@ -298,6 +327,7 @@ impl RuntimeDesiredEffectAdmission {
             observation,
             attestation: attestation.clone(),
             desired_read_position: None,
+            assigned_cats: None,
         })
     }
 
@@ -317,6 +347,12 @@ impl RuntimeDesiredEffectAdmission {
         self.desired_read_position
     }
 
+    pub(crate) fn assigned_cats(&self) -> anyhow::Result<&RuntimeAssignedCatSet> {
+        self.assigned_cats.as_ref().ok_or_else(|| {
+            anyhow::anyhow!("runtime Desired effect lacks its accepted assigned-Cat set")
+        })
+    }
+
     fn bind_desired_read_position(&mut self, snapshot: &DesiredReadSnapshot) -> anyhow::Result<()> {
         anyhow::ensure!(
             snapshot.version == self.session.version
@@ -327,7 +363,9 @@ impl RuntimeDesiredEffectAdmission {
                 && snapshot.read_position >= self.attestation.inventory_read_position,
             "accepted Desired snapshot does not bind the current full effect admission"
         );
+        let assigned_cats = RuntimeAssignedCatSet::from_snapshot(snapshot)?;
         self.desired_read_position = Some(snapshot.read_position);
+        self.assigned_cats = Some(assigned_cats);
         Ok(())
     }
 
@@ -343,7 +381,17 @@ impl RuntimeDesiredEffectAdmission {
             observation,
             attestation,
             desired_read_position: Some(desired_read_position),
+            assigned_cats: None,
         }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn bind_assigned_cats_for_test(mut self, snapshot: &DesiredReadSnapshot) -> Self {
+        self.assigned_cats = Some(
+            RuntimeAssignedCatSet::from_snapshot(snapshot)
+                .expect("test Desired snapshot has unique Cat identities"),
+        );
+        self
     }
 }
 
@@ -469,6 +517,10 @@ impl RuntimeInventoryScanContext {
 
     pub fn coordinates(&self) -> &RuntimeSpineFullScan {
         &self.coordinates
+    }
+
+    pub(crate) fn assigned_cats(&self) -> anyhow::Result<RuntimeAssignedCatSet> {
+        RuntimeAssignedCatSet::from_snapshot(&self.coordinates.desired)
     }
 
     /// The one absolute deadline shared by the scan and every underlying I/O.
@@ -2521,6 +2573,7 @@ mod tests {
         let session = decode_agent_session(SESSION).unwrap();
         let mut snapshot = decode_desired_read_snapshot(SNAPSHOT).unwrap();
         snapshot.desired_specs = vec![desired.clone()];
+        let accepted_desired = snapshot.clone();
         let runtime = ObservedRuntimeStatus {
             cat_id: desired.cat_id.clone(),
             applied_desired: Some(AppliedDesiredEvidence {
@@ -2578,6 +2631,38 @@ mod tests {
             accepted_at_unix_ms: UnixMillis::new(1_720_000_005_000).unwrap(),
         };
         RuntimeDesiredEffectAdmission::for_test(session, observation, attestation)
+            .bind_assigned_cats_for_test(&accepted_desired)
+    }
+
+    #[test]
+    fn effect_admission_retains_the_complete_unique_desired_cat_set() {
+        let desired = desired_with_network();
+        let mut admission = effect_admission_for(&desired);
+        assert_eq!(
+            admission
+                .assigned_cats()
+                .unwrap()
+                .iter()
+                .cloned()
+                .collect::<Vec<_>>(),
+            vec![desired.cat_id.clone()]
+        );
+
+        let mut duplicate = decode_desired_read_snapshot(SNAPSHOT).unwrap();
+        duplicate.desired_specs = vec![desired.clone(), desired];
+        let previous_read_position = admission.desired_read_position();
+        duplicate.read_position = Sequence::new(previous_read_position.unwrap().get() + 1).unwrap();
+        assert!(admission.bind_desired_read_position(&duplicate).is_err());
+        assert_eq!(admission.desired_read_position(), previous_read_position);
+        assert_eq!(
+            admission
+                .assigned_cats()
+                .unwrap()
+                .iter()
+                .cloned()
+                .collect::<Vec<_>>(),
+            vec![Id::new("cat_01").unwrap()]
+        );
     }
 
     fn snapshot_with_network() -> Vec<u8> {

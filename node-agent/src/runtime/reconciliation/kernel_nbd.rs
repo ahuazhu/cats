@@ -23,10 +23,14 @@ use cats_api::runtime_reconciliation::{
     ReconcileStep, RuntimeCheckpoint, WireU64,
 };
 
-use crate::runtime_spine::RuntimePhysicalReadContext;
+use crate::runtime_spine::{RuntimeDesiredEffectContext, RuntimePhysicalReadContext};
 use crate::state_directory::StateDirectory;
 
 use super::checkpoint::{FileCheckpointStore, StoredCheckpoint};
+use super::clean_slate_probes::{
+    snapshot_runtime_checkpoint_namespace, RuntimeCheckpointNamespaceSnapshot,
+    RUNTIME_CHECKPOINT_NAMESPACE_ENTRY_LIMIT,
+};
 
 const ALLOCATION_LOCK_BASENAME: &str = "kernel-nbd-allocation.lock";
 const MAX_SYSFS_ATTRIBUTE_BYTES: u64 = 64;
@@ -145,7 +149,11 @@ struct KernelNbdReservationIdentity {
 }
 
 impl KernelNbdReservations {
-    pub(crate) fn from_checkpoints<'a>(
+    fn from_snapshot(snapshot: &RuntimeCheckpointNamespaceSnapshot) -> Result<Self> {
+        Self::from_checkpoints(snapshot.iter_checkpoints())
+    }
+
+    fn from_checkpoints<'a>(
         checkpoints: impl IntoIterator<Item = &'a RuntimeCheckpoint>,
     ) -> Result<Self> {
         let mut reservations = Self::default();
@@ -227,11 +235,16 @@ impl KernelNbdReservations {
 /// it never changes a kernel device.
 #[derive(Debug)]
 pub(crate) struct KernelNbdAllocationPermit {
+    state_root: File,
     _allocation_lock: File,
     snapshot: KernelNbdPoolSnapshot,
 }
 
 impl KernelNbdAllocationPermit {
+    fn state_root(&self) -> &File {
+        &self.state_root
+    }
+
     pub(crate) fn snapshot(&self) -> &KernelNbdPoolSnapshot {
         &self.snapshot
     }
@@ -290,11 +303,17 @@ impl KernelNbdInventoryPort {
         context: &dyn RuntimePhysicalReadContext,
     ) -> Result<KernelNbdAllocationPermit> {
         context.check_active()?;
-        let allocation_lock = open_allocation_lock(&self.config.state_directory)?;
+        let state_root = self
+            .config
+            .state_directory
+            .try_clone_directory()
+            .context("retain Node state root for kernel-NBD allocation")?;
+        let allocation_lock = open_allocation_lock(&state_root)?;
         lock_exclusive_nonblocking(&allocation_lock)?;
         let snapshot = inspect_pool(&self.config, context)?;
         context.check_active()?;
         Ok(KernelNbdAllocationPermit {
+            state_root,
             _allocation_lock: allocation_lock,
             snapshot,
         })
@@ -302,24 +321,61 @@ impl KernelNbdInventoryPort {
 
     /// Serialize the complete durable-reservation read, deterministic free
     /// slot choice, and an actual [`FileCheckpointStore`] replacement.
-    /// `read_reservations` must enumerate the descriptor-stable checkpoint
-    /// namespace; a cached inventory projection is intentionally not accepted
-    /// here. Returning a generic callback result would let a caller drop this
-    /// permit before it had durably published the reservation, so this API
-    /// deliberately returns only a [`StoredCheckpoint`].
+    /// The accepted Desired Cat set and a fresh descriptor-stable checkpoint
+    /// namespace are read while the allocator remains locked; a cached
+    /// inventory projection is intentionally not accepted here. Returning a
+    /// generic callback result would let a caller drop this permit before it
+    /// had durably published the reservation, so this API deliberately returns
+    /// only a [`StoredCheckpoint`].
     pub(crate) fn reserve_and_replace(
         &self,
-        context: &dyn RuntimePhysicalReadContext,
-        read_reservations: impl FnOnce() -> Result<KernelNbdReservations>,
+        context: &RuntimeDesiredEffectContext,
         store: &FileCheckpointStore,
         predecessor: &StoredCheckpoint,
         build_checkpoint: impl FnOnce(HostPath) -> Result<RuntimeCheckpoint>,
     ) -> Result<StoredCheckpoint> {
         let permit = self.lock_and_inspect(context)?;
         context.check_active()?;
-        let reservations = read_reservations()?;
+        let context_state_root = context
+            .state_directory()
+            .try_clone_directory()
+            .context("retain Desired-effect state root for kernel-NBD reservation")?;
+        ensure_same_directory(permit.state_root(), &context_state_root)?;
+        let assigned_cats = context.accepted_full()?.assigned_cats()?;
+        let snapshot = snapshot_runtime_checkpoint_namespace(
+            permit.state_root(),
+            context,
+            assigned_cats,
+            RUNTIME_CHECKPOINT_NAMESPACE_ENTRY_LIMIT,
+        )?
+        .context("kernel-NBD reservation requires a complete checkpoint namespace")?;
+        ensure_same_directory(snapshot.retained_directory(), store.retained_directory())?;
+        anyhow::ensure!(
+            snapshot.checkpoint(&predecessor.checkpoint().cat_id) == Some(predecessor.checkpoint()),
+            "kernel-NBD predecessor is not the exact checkpoint-namespace value"
+        );
+        let reservations = KernelNbdReservations::from_snapshot(&snapshot)?;
+        self.replace_selected(
+            permit,
+            context,
+            &reservations,
+            store,
+            predecessor,
+            build_checkpoint,
+        )
+    }
+
+    fn replace_selected(
+        &self,
+        permit: KernelNbdAllocationPermit,
+        context: &dyn RuntimePhysicalReadContext,
+        reservations: &KernelNbdReservations,
+        store: &FileCheckpointStore,
+        predecessor: &StoredCheckpoint,
+        build_checkpoint: impl FnOnce(HostPath) -> Result<RuntimeCheckpoint>,
+    ) -> Result<StoredCheckpoint> {
         context.check_active()?;
-        let selected = permit.select_free(&reservations)?;
+        let selected = permit.select_free(reservations)?;
         let replacement = build_checkpoint(selected)?;
         context.check_active()?;
         // `permit` remains live through FileCheckpointStore's file and parent
@@ -560,13 +616,10 @@ fn read_required_bounded(
         .with_context(|| format!("required kernel-NBD input {} is absent", path.display()))
 }
 
-fn open_allocation_lock(state_directory: &StateDirectory) -> Result<File> {
-    let directory = state_directory
-        .try_clone_directory()
-        .context("open retained Node state directory for kernel-NBD allocation")?;
+fn open_allocation_lock(directory: &File) -> Result<File> {
     let name = CString::new(ALLOCATION_LOCK_BASENAME).expect("fixed basename has no NUL");
     let file = open_at(
-        &directory,
+        directory,
         &name,
         libc::O_RDWR | libc::O_CREAT | libc::O_NOFOLLOW | libc::O_CLOEXEC | libc::O_NONBLOCK,
         0o600,
@@ -584,6 +637,20 @@ fn open_allocation_lock(state_directory: &StateDirectory) -> Result<File> {
         "kernel-NBD allocation lock has unsafe metadata"
     );
     Ok(file)
+}
+
+fn ensure_same_directory(left: &File, right: &File) -> Result<()> {
+    let left = left
+        .metadata()
+        .context("inspect retained checkpoint namespace")?;
+    let right = right
+        .metadata()
+        .context("inspect checkpoint store directory")?;
+    anyhow::ensure!(
+        left.is_dir() && right.is_dir() && left.dev() == right.dev() && left.ino() == right.ino(),
+        "kernel-NBD snapshot and checkpoint store use different directories"
+    );
+    Ok(())
 }
 
 fn lock_exclusive_nonblocking(file: &File) -> Result<()> {
@@ -637,11 +704,17 @@ mod tests {
     use std::time::{Duration, Instant};
 
     use cats_api::runtime_reconciliation::{
-        AcquireOrigin, ContractVersion, Durability, FenceEpoch, Generation, GuestDeviceIdentity,
-        GuestTransportEvidence, LifecycleAdmission, RemoteHead, RequireIdleCheckpoint, Revision,
-        ServingAuthorityProvenance, ServingBlockdIdentity, WarmSnapshotEvidence,
+        AcquireOrigin, AdmissionInventoryAttestation, AgentSession, AssignedKind,
+        AssignedPlacement, ContractVersion, DesiredReadSnapshot, DesiredRuntimeSpec, Durability,
+        Epoch, FenceEpoch, Generation, GuestDeviceIdentity, GuestTransportEvidence, Ipv4Address,
+        IsolatedIpv4Kind, LifecycleAdmission, MacAddress, NetworkConfig, NodeBootId,
+        NodeObservation, RemoteHead, RequireIdleCheckpoint, Revision, RuntimeConfig, RuntimeTarget,
+        RuntimeTransition, Sequence, ServingAuthorityProvenance, ServingBlockdIdentity,
+        SessionBinding, Sha256Digest, UnixMillis, WarmSnapshotEvidence,
     };
     use tempfile::TempDir;
+
+    use crate::runtime_spine::RuntimeDesiredEffectAdmission;
 
     use super::*;
 
@@ -842,6 +915,107 @@ mod tests {
         }
     }
 
+    fn desired(cat: &str) -> DesiredRuntimeSpec {
+        DesiredRuntimeSpec {
+            version: ContractVersion::V1,
+            workspace_id: id("ws_a"),
+            cat_id: id(cat),
+            desired_revision: Revision::new(1).unwrap(),
+            target: RuntimeTarget::Running,
+            placement: AssignedPlacement {
+                kind: AssignedKind::Assigned,
+                node_id: id("node_a"),
+                placement_epoch: Epoch::new(1).unwrap(),
+            },
+            runtime: RuntimeConfig {
+                vcpus: 1,
+                memory_bytes: 1_073_741_824,
+                boot_image_digest: Sha256Digest::from_bytes([8; 32]),
+                guest_config_digest: Sha256Digest::from_bytes([9; 32]),
+                network_config: NetworkConfig {
+                    kind: IsolatedIpv4Kind::IsolatedIpv4,
+                    network_id: id("net_a"),
+                    guest_mac: MacAddress::new("02:ca:0a:f0:00:06").unwrap(),
+                    guest_ipv4: Ipv4Address::new("10.240.0.6").unwrap(),
+                    prefix_length: 30,
+                    gateway_ipv4: Ipv4Address::new("10.240.0.5").unwrap(),
+                },
+            },
+            volumes: Vec::new(),
+            endpoints: Vec::new(),
+            transition: RuntimeTransition::CancelAndDrain,
+            spec_digest: Sha256Digest::from_bytes([7; 32]),
+        }
+    }
+
+    fn desired_effect_context(state: &Path, cats: &[&str]) -> RuntimeDesiredEffectContext {
+        let node_boot_id = NodeBootId::new("a".repeat(32)).unwrap();
+        let agent_instance_id = random('b');
+        let session = AgentSession {
+            version: ContractVersion::V1,
+            node_id: id("node_a"),
+            immutable_host_id: id("host_a"),
+            node_boot_id: node_boot_id.clone(),
+            agent_instance_id: agent_instance_id.clone(),
+            agent_session_epoch: Epoch::new(1).unwrap(),
+            registration_attempt_id: random('c'),
+            guest_config_digest: Sha256Digest::from_bytes([6; 32]),
+            lease_deadline_unix_ms: UnixMillis::new(2_000).unwrap(),
+        };
+        let binding = SessionBinding {
+            node_id: session.node_id.clone(),
+            node_boot_id: node_boot_id.clone(),
+            agent_instance_id: agent_instance_id.clone(),
+            agent_session_epoch: session.agent_session_epoch,
+        };
+        let read_position = Sequence::new(1).unwrap();
+        let snapshot = DesiredReadSnapshot {
+            version: ContractVersion::V1,
+            session: binding,
+            request_sequence: Sequence::new(1).unwrap(),
+            read_position,
+            issued_at_unix_ms: UnixMillis::new(1_000).unwrap(),
+            expires_at_unix_ms: UnixMillis::new(2_000).unwrap(),
+            desired_specs: cats.iter().map(|cat| desired(cat)).collect(),
+        };
+        let inventory_digest = Sha256Digest::from_bytes([5; 32]);
+        let observation = NodeObservation {
+            version: ContractVersion::V1,
+            observation_id: random('d'),
+            node_id: session.node_id.clone(),
+            node_boot_id,
+            agent_instance_id,
+            agent_session_epoch: session.agent_session_epoch,
+            heartbeat_sequence: Sequence::new(1).unwrap(),
+            observed_at_unix_ms: UnixMillis::new(1_000).unwrap(),
+            complete_inventory: true,
+            inventory_epoch: Epoch::new(1).unwrap(),
+            inventory_digest: Some(inventory_digest.clone()),
+            inventory_read_position: Some(read_position),
+            key_ring_version: None,
+            key_ring_digest: None,
+            loaded_kids: Vec::new(),
+            runtimes: Vec::new(),
+            residue: Vec::new(),
+        };
+        let attestation = AdmissionInventoryAttestation {
+            version: ContractVersion::V1,
+            node_id: session.node_id.clone(),
+            agent_session_epoch: session.agent_session_epoch,
+            inventory_epoch: Epoch::new(1).unwrap(),
+            inventory_digest,
+            inventory_read_position: read_position,
+            accepted_at_unix_ms: UnixMillis::new(1_100).unwrap(),
+        };
+        let admission = RuntimeDesiredEffectAdmission::for_test(session, observation, attestation)
+            .bind_assigned_cats_for_test(&snapshot);
+        RuntimeDesiredEffectContext::for_test_with_admission(
+            StateDirectory::unanchored(state.to_path_buf()),
+            Instant::now() + Duration::from_secs(5),
+            admission,
+        )
+    }
+
     #[test]
     fn locked_scan_distinguishes_free_serving_and_leaked_and_selects_unreserved() {
         let fixture = Fixture::new(12);
@@ -888,27 +1062,22 @@ mod tests {
         let source = checkpoint("cat_a", "vol_a", "/dev/nbd1", '6');
         let store = FileCheckpointStore::open(&checkpoint_directory, &source.cat_id).unwrap();
         let predecessor = store.create(&source).unwrap();
+        let context = desired_effect_context(&fixture.state, &["cat_a"]);
         let persisted = first
-            .reserve_and_replace(
-                &TestContext::active(),
-                || KernelNbdReservations::from_checkpoints([predecessor.checkpoint()]),
-                &store,
-                &predecessor,
-                |selected| {
-                    let error = second.lock_and_inspect(&TestContext::active()).unwrap_err();
-                    assert!(error.to_string().contains("already active"), "{error:#}");
-                    let mut replacement = predecessor.checkpoint().clone();
-                    let ReconcileStep::PrepareDevice {
-                        frontend: PrepareDeviceFrontend::KernelNbd { device_path, .. },
-                        ..
-                    } = &mut replacement.step
-                    else {
-                        panic!("fixture must be a kernel-NBD PrepareDevice checkpoint")
-                    };
-                    *device_path = selected;
-                    Ok(replacement)
-                },
-            )
+            .reserve_and_replace(&context, &store, &predecessor, |selected| {
+                let error = second.lock_and_inspect(&TestContext::active()).unwrap_err();
+                assert!(error.to_string().contains("already active"), "{error:#}");
+                let mut replacement = predecessor.checkpoint().clone();
+                let ReconcileStep::PrepareDevice {
+                    frontend: PrepareDeviceFrontend::KernelNbd { device_path, .. },
+                    ..
+                } = &mut replacement.step
+                else {
+                    panic!("fixture must be a kernel-NBD PrepareDevice checkpoint")
+                };
+                *device_path = selected;
+                Ok(replacement)
+            })
             .unwrap();
         let ReconcileStep::PrepareDevice {
             frontend: PrepareDeviceFrontend::KernelNbd { device_path, .. },
@@ -923,6 +1092,64 @@ mod tests {
             persisted.checkpoint()
         );
         second.lock_and_inspect(&TestContext::active()).unwrap();
+    }
+
+    #[test]
+    fn reservation_rejects_cross_root_store_and_stale_predecessor() {
+        let fixture = Fixture::new(2);
+        let port = KernelNbdInventoryPort::new(fixture.config(2));
+        let source = checkpoint("cat_a", "vol_a", "/dev/nbd1", '6');
+        let store =
+            FileCheckpointStore::open(&fixture.state.join("checkpoints"), &source.cat_id).unwrap();
+        let predecessor = store.create(&source).unwrap();
+
+        let other = tempfile::tempdir().unwrap();
+        let other_state = other.path().join("state");
+        fs::create_dir(&other_state).unwrap();
+        let other_store =
+            FileCheckpointStore::open(&other_state.join("checkpoints"), &source.cat_id).unwrap();
+        let other_predecessor = other_store.create(&source).unwrap();
+
+        let cross_root = desired_effect_context(&other_state, &["cat_a"]);
+        let error = port
+            .reserve_and_replace(&cross_root, &store, &predecessor, |_| {
+                panic!("cross-root reservation must fail before checkpoint construction")
+            })
+            .unwrap_err();
+        assert!(
+            error.to_string().contains("different directories"),
+            "{error:#}"
+        );
+
+        let context = desired_effect_context(&fixture.state, &["cat_a"]);
+        let error = port
+            .reserve_and_replace(&context, &other_store, &other_predecessor, |_| {
+                panic!("cross-store reservation must fail before checkpoint construction")
+            })
+            .unwrap_err();
+        assert!(
+            error.to_string().contains("different directories"),
+            "{error:#}"
+        );
+
+        let mut successor = source.clone();
+        successor.updated_at_unix_ms = UnixMillis::new(2).unwrap();
+        let successor = store.replace(&predecessor, &successor).unwrap();
+        let error = port
+            .reserve_and_replace(&context, &store, &predecessor, |_| {
+                panic!("stale predecessor must fail before checkpoint construction")
+            })
+            .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("not the exact checkpoint-namespace value"),
+            "{error:#}"
+        );
+        assert_eq!(
+            store.load().unwrap().unwrap().checkpoint(),
+            successor.checkpoint()
+        );
     }
 
     #[test]

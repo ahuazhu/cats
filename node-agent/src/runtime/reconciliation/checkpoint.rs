@@ -136,6 +136,13 @@ impl FileCheckpointStore {
         Self::open_with_checkpoint_temp_policy(directory, cat_id, true)
     }
 
+    /// The retained directory used for every descriptor-relative checkpoint
+    /// operation. Provider adapters may compare this physical identity with a
+    /// separately retained complete namespace proof before a global effect.
+    pub(super) fn retained_directory(&self) -> &File {
+        &self.directory
+    }
+
     /// Opens the same locked store but refuses to remove a checkpoint temp.
     /// Pre-scan recovery uses this after a read-only global classification so
     /// a late same-Cat temp cannot be silently consumed by an unrelated

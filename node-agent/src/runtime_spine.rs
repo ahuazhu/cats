@@ -30,7 +30,8 @@ pub use runner::{
     RuntimeSpineRunError, RuntimeSpineRunRetry, RuntimeSpineRunStep, RuntimeSpineRunner,
 };
 pub(crate) use runner::{
-    InventoryCoverageAggregator, RuntimeInventoryKeyRing, RuntimePhysicalReadContext,
+    InventoryCoverageAggregator, RuntimeAssignedCatSet, RuntimeInventoryKeyRing,
+    RuntimePhysicalReadContext,
 };
 pub(crate) use runner::{
     RuntimePreScanRecovery, RuntimePreScanRecoveryContext, RuntimePreScanRecoveryOutcome,
