@@ -21,10 +21,13 @@ mod clean_slate_probes;
 mod gate_planner;
 mod inventory;
 // Kernel NBD is the default ADR-0015 frontend and is a Host-global resource.
-// Its reservation permit is consumed by the production PrepareDevice CAS.
-#[cfg_attr(
-    not(target_os = "linux"),
-    expect(dead_code, reason = "kernel-NBD production composition requires Linux")
+// Its reservation permit is consumed by the production PrepareDevice CAS;
+// the sealed attach/listener/cleanup foundation intentionally lands before
+// the follow-up inventory and dispatcher composition. Keep the exception on
+// this one private provider module so that composition can remove it whole.
+#[expect(
+    dead_code,
+    reason = "sealed kernel-NBD attach provider is staged before production composition"
 )]
 mod kernel_nbd;
 mod normal_acquire;
