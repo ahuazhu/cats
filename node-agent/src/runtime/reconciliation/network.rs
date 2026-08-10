@@ -202,6 +202,21 @@ impl NodeGlobalNetworkAdmission {
     fn reservation(&self, cat_id: &Id) -> Option<&NetworkInventoryEntry> {
         self.entries.get(cat_id)
     }
+
+    pub(crate) fn expected_networks(
+        &self,
+        cat_id: &Id,
+        identity: &RuntimeNetworkIdentity,
+    ) -> Option<Vec<ObservedNetwork>> {
+        let entry = self.reservation(cat_id)?;
+        if entry.reservation.identity != *identity {
+            return None;
+        }
+        Some(match entry.state {
+            ReservedHostNetworkState::Absent => Vec::new(),
+            ReservedHostNetworkState::Exact => vec![observed_network(identity)],
+        })
+    }
 }
 
 fn observed_network(identity: &RuntimeNetworkIdentity) -> ObservedNetwork {
@@ -964,15 +979,9 @@ impl PrepareNetworkReservationEffect {
             return Ok(local_contract_stop());
         };
         let network_admission = context.node_global_network()?;
-        let Some(network_entry) = network_admission.reservation(&desired.cat_id) else {
+        let Some(expected_networks) = network_admission.expected_networks(&desired.cat_id, network)
+        else {
             return Ok(local_contract_stop());
-        };
-        if &network_entry.reservation.identity != network {
-            return Ok(local_contract_stop());
-        }
-        let expected_networks = match network_entry.state {
-            ReservedHostNetworkState::Absent => Vec::new(),
-            ReservedHostNetworkState::Exact => vec![observed_network(network)],
         };
         if !signed_inventory_admission_is_exact_with_networks(
             accepted,
@@ -989,15 +998,35 @@ impl PrepareNetworkReservationEffect {
         else {
             return Ok(RuntimeDesiredEffectOutcome::RefreshInventory);
         };
-        let Some((volume_id, observed_device)) = serving.vhost_device_projection() else {
+        if !expectation.matches_device_contract(&desired.cat_id, device) {
             return Ok(local_contract_stop());
+        }
+        let (volume_id, observed_device) = match &device.frontend {
+            PrepareDeviceFrontend::VhostUserBlk { .. } => {
+                let Some(projection) = serving.vhost_device_projection() else {
+                    return Ok(local_contract_stop());
+                };
+                projection
+            }
+            PrepareDeviceFrontend::KernelNbd { .. } => {
+                let exact = context
+                    .kernel_nbd_pool()?
+                    .exact_device(&desired.cat_id)
+                    .context("PrepareNetwork lacks exact kernel-NBD client proof")?;
+                if exact.listener().expectation() != expectation
+                    || !exact.matches_prepared_device(&desired.cat_id, device)
+                {
+                    return Ok(local_contract_stop());
+                }
+                exact.projection()
+            }
         };
         if !prepare_network_volume_admission_is_exact(
             desired,
             runtime,
             device,
             &volume_id,
-            &observed_device,
+            Some(&observed_device),
         ) || !matches!(
             runtime.processes.as_slice(),
             [process] if serving.matches_public_process(process)
@@ -1095,12 +1124,12 @@ impl PrepareNetworkReservationEffect {
     }
 }
 
-fn prepare_network_volume_admission_is_exact(
+pub(super) fn prepare_network_volume_admission_is_exact(
     desired: &DesiredRuntimeSpec,
     runtime: &cats_api::runtime_reconciliation::ObservedRuntimeStatus,
     device: &PreparedDeviceInput,
     volume_id: &Id,
-    observed_device: &ObservedDevice,
+    observed_device: Option<&ObservedDevice>,
 ) -> bool {
     let [desired_volume] = desired.volumes.as_slice() else {
         return false;
@@ -1136,14 +1165,14 @@ fn prepare_network_volume_admission_is_exact(
         && device.expected_head == *head
         && device.size_bytes == desired_volume.size_bytes
         && device.durability == desired_volume.durability
-        && matches!(device.frontend, PrepareDeviceFrontend::VhostUserBlk { .. })
         && observed_volume.volume_intent_id.as_ref() == Some(&desired_volume.volume_intent_id)
         && observed_volume.disk_id.as_ref() == Some(&desired_volume.disk_id)
         && observed_volume.volume_id == desired_volume.volume_id
         && observed_volume.disk_kind == ObservedDiskKind::Root
         && observed_volume.size_bytes == Some(desired_volume.size_bytes)
         && observed_volume.durability == Some(desired_volume.durability)
-        && observed_volume.devices == [observed_device.clone()]
+        && observed_volume.devices.as_slice()
+            == observed_device.map_or(&[][..], std::slice::from_ref)
         && lineage.attachment_id == *attachment_id
         && lineage.attachment_epoch == *attachment_epoch
         && lineage.acquire_origin == device.acquire_origin

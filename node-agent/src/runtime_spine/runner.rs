@@ -42,6 +42,7 @@ const REQUIRED_INVENTORY_SOURCES: [InventorySource; 11] = [
     InventorySource::GuestMount,
 ];
 const EFFECT_RESOURCE_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(5);
+const EFFECT_RESOURCE_SHUTDOWN_RETRY_INTERVAL: Duration = Duration::from_millis(10);
 
 /// Performs one bounded scan of every physical source required by Runtime §6.
 ///
@@ -444,6 +445,12 @@ impl RuntimeDesiredEffectAdmission {
             RuntimeAssignedCatSet::from_snapshot(snapshot)
                 .expect("test Desired snapshot has unique Cat identities"),
         );
+        self
+    }
+
+    #[cfg(test)]
+    pub(crate) fn with_observation_for_test(mut self, observation: NodeObservation) -> Self {
+        self.observation = observation;
         self
     }
 }
@@ -2390,24 +2397,32 @@ impl RunnerWorkers {
         // join failure), before scanner/journal teardown can be reported as a
         // clean runner shutdown.
         let effect_resource_result = self.effect_resource_owner.as_ref().map_or(Ok(()), |owner| {
-            let deadline = Instant::now()
-                .checked_add(EFFECT_RESOURCE_SHUTDOWN_TIMEOUT)
-                .unwrap_or_else(Instant::now);
-            owner.shutdown_until(deadline).map_err(|error| {
-                RuntimeSpineRunError::WorkerShutdown(format!("effect resource owner: {error:#}"))
-            })
-        });
-        if effect_resource_result.is_err() {
-            // `RuntimeSpineRunner::shutdown` consumes the runner, so there is
-            // no caller-owned value to carry an unresolved child after this
-            // error. Quarantine the owner for the remaining process lifetime
-            // rather than dropping its waitable handles and falsely turning
-            // an owned late helper into an unowned process. Readiness is
-            // already closed before production enters this boundary.
-            if let Some(owner) = self.effect_resource_owner.take() {
-                std::mem::forget(owner);
+            let shutdown_once = || {
+                let deadline = Instant::now()
+                    .checked_add(EFFECT_RESOURCE_SHUTDOWN_TIMEOUT)
+                    .unwrap_or_else(Instant::now);
+                owner.shutdown_until(deadline)
+            };
+            match shutdown_once() {
+                Ok(()) => Ok(()),
+                Err(first_error) => {
+                    // The Host registration lease lives outside this runner
+                    // task and is released only after shutdown returns. Never
+                    // turn a bounded timeout into a leaked owner followed by
+                    // lease release: retain and retry until every late helper
+                    // is reaped. A permanently uncooperative helper therefore
+                    // quarantines this task without reopening Host authority.
+                    loop {
+                        std::thread::sleep(EFFECT_RESOURCE_SHUTDOWN_RETRY_INTERVAL);
+                        if shutdown_once().is_ok() {
+                            break Err(RuntimeSpineRunError::WorkerShutdown(format!(
+                                "effect resource owner: {first_error:#}"
+                            )));
+                        }
+                    }
+                }
             }
-        }
+        });
         let scan_result = self
             .scan_lane
             .as_mut()
@@ -2685,7 +2700,7 @@ mod tests {
         pending: AtomicBool,
         polls: AtomicUsize,
         shutdowns: AtomicUsize,
-        fail_shutdown: bool,
+        shutdown_failures: AtomicUsize,
         effect_dropped: Option<Arc<AtomicBool>>,
     }
 
@@ -2695,7 +2710,7 @@ mod tests {
                 pending: AtomicBool::new(pending),
                 polls: AtomicUsize::new(0),
                 shutdowns: AtomicUsize::new(0),
-                fail_shutdown: false,
+                shutdown_failures: AtomicUsize::new(0),
                 effect_dropped: None,
             }
         }
@@ -2721,7 +2736,15 @@ mod tests {
                     "resource shutdown ran before the effect producer joined"
                 );
             }
-            anyhow::ensure!(!self.fail_shutdown, "injected resource shutdown timeout");
+            if self
+                .shutdown_failures
+                .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |remaining| {
+                    remaining.checked_sub(1)
+                })
+                .is_ok()
+            {
+                anyhow::bail!("injected resource shutdown timeout");
+            }
             self.pending.store(false, Ordering::SeqCst);
             Ok(())
         }
@@ -2952,7 +2975,7 @@ mod tests {
             pending: AtomicBool::new(false),
             polls: AtomicUsize::new(0),
             shutdowns: AtomicUsize::new(0),
-            fail_shutdown: false,
+            shutdown_failures: AtomicUsize::new(0),
             effect_dropped: Some(Arc::clone(&effect_dropped)),
         });
         let owner_port: Arc<dyn RuntimeEffectResourceOwner> = owner.clone();
@@ -2979,11 +3002,10 @@ mod tests {
             pending: AtomicBool::new(true),
             polls: AtomicUsize::new(0),
             shutdowns: AtomicUsize::new(0),
-            fail_shutdown: true,
+            shutdown_failures: AtomicUsize::new(1),
             effect_dropped: None,
         });
-        let retained = Arc::downgrade(&failing_owner);
-        let failing_owner_port: Arc<dyn RuntimeEffectResourceOwner> = failing_owner;
+        let failing_owner_port: Arc<dyn RuntimeEffectResourceOwner> = failing_owner.clone();
         let error = RunnerWorkers {
             effect_lane: None,
             scan_lane: None,
@@ -2998,10 +3020,8 @@ mod tests {
                 .contains("injected resource shutdown timeout"),
             "{error}"
         );
-        assert!(
-            retained.upgrade().is_some(),
-            "failed shutdown dropped its unresolved resource owner"
-        );
+        assert_eq!(failing_owner.shutdowns.load(Ordering::SeqCst), 2);
+        assert!(!failing_owner.pending.load(Ordering::SeqCst));
     }
 
     impl RuntimeDesiredEffect for DecisionEffect {

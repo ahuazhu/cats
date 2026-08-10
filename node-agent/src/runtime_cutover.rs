@@ -38,8 +38,8 @@ use crate::runtime::reconciliation::{
     SignedRunningPublicationRecovery,
 };
 use crate::runtime_spine::{
-    RuntimeInventoryScanner, RuntimeSpineDeadlinePolicy, RuntimeSpineHttpClient,
-    RuntimeSpineRunStep, RuntimeSpineRunner,
+    RuntimeEffectResourceOwner, RuntimeInventoryScanner, RuntimeSpineDeadlinePolicy,
+    RuntimeSpineHttpClient, RuntimeSpineRunStep, RuntimeSpineRunner,
 };
 
 const RETRY_DELAY: Duration = Duration::from_secs(1);
@@ -207,6 +207,14 @@ async fn spawn_signed_runtime_cutover_with_scanner(
     config: SignedRuntimeCutoverConfig,
     scanner_override: Option<Arc<dyn RuntimeInventoryScanner>>,
 ) -> anyhow::Result<SignedRuntimeCutoverHandle> {
+    spawn_signed_runtime_cutover_with_overrides(config, scanner_override, None).await
+}
+
+async fn spawn_signed_runtime_cutover_with_overrides(
+    config: SignedRuntimeCutoverConfig,
+    scanner_override: Option<Arc<dyn RuntimeInventoryScanner>>,
+    resource_owner_override: Option<Arc<dyn RuntimeEffectResourceOwner>>,
+) -> anyhow::Result<SignedRuntimeCutoverHandle> {
     // Reject an unrepresentable operator budget before registration, worker
     // construction, or listener binding can mutate external/local state.
     config
@@ -313,6 +321,9 @@ async fn spawn_signed_runtime_cutover_with_scanner(
     let effect_network_ip_binary = config.ch_config.ip_bin.clone();
     let effect_kernel_nbd_inventory = kernel_nbd_inventory;
     let effect_kernel_nbd_cleanup_owner = Arc::clone(&kernel_nbd_cleanup_owner);
+    let runner_effect_resource_owner = resource_owner_override.unwrap_or_else(|| {
+        Arc::clone(&kernel_nbd_cleanup_owner) as Arc<dyn RuntimeEffectResourceOwner>
+    });
     let runner = tokio::task::spawn_blocking(move || {
         #[cfg(not(test))]
         let volume_transition_transport = RuntimeVolumeTransitionHttpClient::for_production(
@@ -368,7 +379,7 @@ async fn spawn_signed_runtime_cutover_with_scanner(
             scanner,
             Arc::new(recovery),
             Arc::new(effect),
-            effect_kernel_nbd_cleanup_owner,
+            runner_effect_resource_owner,
         )
         .map_err(anyhow::Error::from)
     })
@@ -559,6 +570,35 @@ mod tests {
         clean_slate_scanner_with_volume_authority_and_blob_for_test, runtime_checkpoint_path,
         TestCleanSlateProbeConfig,
     };
+
+    struct StubbornEffectChildOwner {
+        pending: AtomicBool,
+        shutdowns: std::sync::atomic::AtomicUsize,
+    }
+
+    impl crate::runtime_spine::effect_resource_owner_sealed::Sealed for StubbornEffectChildOwner {}
+
+    impl RuntimeEffectResourceOwner for StubbornEffectChildOwner {
+        fn poll(&self) -> anyhow::Result<()> {
+            Ok(())
+        }
+
+        fn has_pending(&self) -> bool {
+            self.pending.load(Ordering::Acquire)
+        }
+
+        fn shutdown_until(&self, deadline: Instant) -> anyhow::Result<()> {
+            self.shutdowns.fetch_add(1, Ordering::SeqCst);
+            while self.pending.load(Ordering::Acquire) {
+                anyhow::ensure!(
+                    Instant::now() < deadline,
+                    "stubborn effect child outlived its shutdown deadline"
+                );
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            Ok(())
+        }
+    }
 
     struct TestUnavailableVolumeDataAuthority;
 
@@ -1414,6 +1454,94 @@ mod tests {
         assert_eq!(successor_session.agent_session_epoch.get(), 2);
         assert_eq!(calls.load(Ordering::SeqCst), 2);
         drop(successor);
+        control.abort();
+    }
+
+    #[tokio::test]
+    async fn stubborn_effect_child_keeps_readiness_and_host_lease_closed_past_timeout() {
+        let state_root = tempfile::tempdir().unwrap();
+        let state_path = state_root.path().join("state");
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let control_address = listener.local_addr().unwrap();
+        let stub = RegistrationStub {
+            calls: calls.clone(),
+        };
+        let control = tokio::spawn(async move {
+            axum::serve(
+                listener,
+                Router::new()
+                    .route(REGISTRATION_PATH, post(accept_registration))
+                    .route(DESIRED_READ_PATH, post(hold_desired_read))
+                    .with_state(stub),
+            )
+            .await
+            .unwrap();
+        });
+        let origin = format!("http://{control_address}");
+        let owner = Arc::new(StubbornEffectChildOwner {
+            pending: AtomicBool::new(true),
+            shutdowns: std::sync::atomic::AtomicUsize::new(0),
+        });
+        let owner_port: Arc<dyn RuntimeEffectResourceOwner> = owner.clone();
+        let mut handle = spawn_signed_runtime_cutover_with_overrides(
+            SignedRuntimeCutoverConfig {
+                listen: "127.0.0.1:0".into(),
+                control_plane_url: origin,
+                agent_registration: registration_config(state_path.clone()).unwrap(),
+                ch_config: test_ch_config(),
+                authorized_blockd_launch: test_authorized_blockd_launch(),
+                guest_agent_binary: "/opt/cats/bin/cats-guest-agent".into(),
+                metering_cgroup_root: None,
+                volume_data_authority: Arc::new(TestUnavailableVolumeDataAuthority),
+                volume_inventory_authority: Arc::new(TestUnavailableVolumeDataAuthority),
+                blob_store: Arc::new(TestUnavailableBlobStore),
+                volume_lease_duration_ms: 60_000,
+                deadline_policy: RuntimeSpineDeadlinePolicy::new(
+                    Duration::from_secs(5),
+                    Duration::from_secs(30),
+                )
+                .unwrap(),
+            },
+            None,
+            Some(owner_port),
+        )
+        .await
+        .unwrap();
+
+        handle.request_runner_shutdown();
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while owner.shutdowns.load(Ordering::SeqCst) == 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("runner did not begin resource-owner shutdown");
+        tokio::time::sleep(Duration::from_millis(5_200)).await;
+        assert!(
+            owner.shutdowns.load(Ordering::SeqCst) >= 2,
+            "runner did not retain and retry the timed-out resource owner"
+        );
+        assert!(!handle.runner_task.is_finished());
+        assert!(registration_config(state_path.clone()).is_err());
+        let response = reqwest::get(format!("http://{}/healthz", handle.addr))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), reqwest::StatusCode::SERVICE_UNAVAILABLE);
+
+        owner.pending.store(false, Ordering::Release);
+        let error = join_result(
+            (&mut handle.runner_task).await,
+            "join stubborn-child runner shutdown",
+        )
+        .unwrap_err();
+        assert!(
+            format!("{error:#}").contains("stubborn effect child outlived"),
+            "{error:#}"
+        );
+        let successor = registration_config(state_path).unwrap();
+        drop(successor);
+        drop(handle);
         control.abort();
     }
 

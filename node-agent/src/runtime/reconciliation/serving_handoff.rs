@@ -3872,10 +3872,10 @@ mod tests {
         AsciiText, AssignedKind, AssignedPlacement, CheckpointEvidence, Condition,
         DesiredReadSnapshot, DiskKind, Generation, GuestDeviceIdentity, GuestTransportEvidence,
         Ipv4Address, IsolatedIpv4Kind, LifecycleAdmission, MacAddress, NetworkConfig, NodeBootId,
-        NodeObservation, NormalAcquireRequest, NormalAcquireResult, ObservedRuntimeStatus,
-        OwnershipTokenEvidence, PrepareDeviceFrontend, ProgressingReason, RequireIdleCheckpoint,
-        RuntimeCheckpoint, RuntimeConfig, RuntimeTarget, RuntimeTransition, Sequence,
-        ServingAuthorityProvenance, ServingBlockdIdentity, SessionBinding, UnixMillis,
+        NodeObservation, NormalAcquireRequest, NormalAcquireResult, ObservedDevice,
+        ObservedRuntimeStatus, OwnershipTokenEvidence, PrepareDeviceFrontend, ProgressingReason,
+        RequireIdleCheckpoint, RuntimeCheckpoint, RuntimeConfig, RuntimeTarget, RuntimeTransition,
+        Sequence, ServingAuthorityProvenance, ServingBlockdIdentity, SessionBinding, UnixMillis,
         VolumeAccess, VolumeAcquire, VolumeAdminState, VolumeAuthorityEvidence, VolumeDisposition,
         VolumeIntent, WarmSnapshotEvidence,
     };
@@ -4819,6 +4819,22 @@ mod tests {
         );
     }
 
+    fn replace_with_kernel_nbd_prepare_device(fixture: &mut Fixture) {
+        let mut checkpoint = fixture.stored_checkpoint.checkpoint().clone();
+        let ReconcileStep::PrepareDevice { frontend, .. } = &mut checkpoint.step else {
+            panic!("kernel-NBD test fixture is not at PrepareDevice")
+        };
+        *frontend = PrepareDeviceFrontend::KernelNbd {
+            listener_socket_path: host(&format!(
+                "{}/serving-nbd.sock",
+                fixture.data_directory.display()
+            )),
+            device_path: host("/dev/nbd7"),
+            direct: false,
+        };
+        fixture.replace_checkpoint(checkpoint);
+    }
+
     fn serving_expectation(fixture: &Fixture) -> ServingBlockdExpectation {
         let retained = AuthorizedBlockdStore::new(fixture.state_directory.clone())
             .retain_prepare_device_handoff(
@@ -5142,6 +5158,49 @@ mod tests {
             .bind(context.accepted_full().unwrap().observation())
             .unwrap();
         context.with_node_global_network_for_test(admission)
+    }
+
+    fn with_exact_kernel_nbd_admission(
+        fixture: &Fixture,
+        base: RuntimeDesiredEffectContext,
+    ) -> RuntimeDesiredEffectContext {
+        let node_global_process = base.node_global_process().unwrap().clone();
+        let mut observation = base.accepted_full().unwrap().observation().clone();
+        let prepared = prepared_device_input(fixture.stored_checkpoint.checkpoint()).unwrap();
+        let PrepareDeviceFrontend::KernelNbd { device_path, .. } = &prepared.frontend else {
+            panic!("kernel-NBD test admission requires a kernel-NBD checkpoint")
+        };
+        observation.runtimes[0].volumes[0].devices = vec![ObservedDevice::KernelNbd {
+            guest_device: prepared.guest_device.clone(),
+            device_path: device_path.clone(),
+            ownership_token: OwnershipTokenEvidence::Valid {
+                ownership_token: prepared.ownership_token.clone(),
+            },
+        }];
+        let admission = base
+            .accepted_full()
+            .unwrap()
+            .clone()
+            .with_observation_for_test(observation);
+        let context = RuntimeDesiredEffectContext::for_test_with_admission(
+            fixture.state_directory.clone(),
+            Instant::now() + Duration::from_secs(10),
+            admission,
+        )
+        .with_node_global_process_for_test(node_global_process);
+        let expected = serving_expectation(fixture);
+        let listener = expected
+            .clone()
+            .prove_exact_process(expected.exact_evidence_for_test(51))
+            .unwrap()
+            .listener_proof();
+        let pool = KernelNbdPoolScanAdmission::exact_for_test(
+            context.accepted_full().unwrap().observation(),
+            fixture.stored_checkpoint.checkpoint(),
+            listener,
+        )
+        .unwrap();
+        context.with_kernel_nbd_pool_for_test(pool)
     }
 
     fn prepare_network_reservation_effect(
@@ -6186,6 +6245,131 @@ mod tests {
                 &checkpoint_digest
             );
         }
+    }
+
+    #[test]
+    fn kernel_nbd_prepare_network_physical_round_uses_the_bound_device_proof() {
+        let mut fixture = fixture();
+        complete_old_process_retirement(&mut fixture);
+        replace_with_kernel_nbd_prepare_device(&mut fixture);
+
+        let reservation_process = Arc::new(FakeServingBlockdPort::new(
+            [
+                ServingBlockdProcessInspectionKind::Exact,
+                ServingBlockdProcessInspectionKind::Exact,
+            ],
+            ServingBlockdProcessStart::Submitted,
+        ));
+        let reservation = prepare_network_reservation_effect(
+            &fixture,
+            Arc::new(FixedEffectAuthority::new(fixture.authority.volume.clone())),
+            reservation_process,
+        );
+        let reservation_context = with_exact_kernel_nbd_admission(
+            &fixture,
+            effect_context_with_processes(&fixture, vec![accepted_serving_process(&fixture)]),
+        );
+        assert_eq!(
+            reservation
+                .try_apply(&reservation_context, &fixture.acquired.desired)
+                .unwrap(),
+            Some(RuntimeDesiredEffectOutcome::RefreshInventory)
+        );
+        fixture.stored_checkpoint = current_runtime_checkpoint(&fixture);
+        assert!(matches!(
+            fixture.stored_checkpoint.checkpoint().step,
+            ReconcileStep::PrepareNetwork { .. }
+        ));
+
+        let physical_context = with_absent_network_admission(
+            with_exact_kernel_nbd_admission(
+                &fixture,
+                effect_context_with_processes(&fixture, vec![accepted_serving_process(&fixture)]),
+            ),
+            fixture.stored_checkpoint.checkpoint(),
+        );
+        let events = Arc::new(NetworkTapEvents::default());
+        let tap = Arc::new(NetworkTapPort {
+            behavior: NetworkTapBehavior::Publish,
+            context: physical_context.clone(),
+            events: Arc::clone(&events),
+        });
+        let effect = prepare_network_reservation_effect(
+            &fixture,
+            Arc::new(FixedEffectAuthority::new(fixture.authority.volume.clone())),
+            Arc::new(FakeServingBlockdPort::new(
+                [
+                    ServingBlockdProcessInspectionKind::Exact,
+                    ServingBlockdProcessInspectionKind::Exact,
+                    ServingBlockdProcessInspectionKind::Exact,
+                ],
+                ServingBlockdProcessStart::Submitted,
+            )),
+        )
+        .with_tap_create_for_test(tap);
+        assert_eq!(
+            effect
+                .try_apply(&physical_context, &fixture.acquired.desired)
+                .unwrap(),
+            Some(RuntimeDesiredEffectOutcome::RefreshInventory)
+        );
+        assert_eq!(events.creates.load(Ordering::SeqCst), 1);
+        assert_eq!(events.publish_attempts.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn persisted_prepare_network_restarts_absent_serving_once_then_requires_fresh_full() {
+        let mut fixture = fixture();
+        complete_old_process_retirement(&mut fixture);
+        let reservation = prepare_network_reservation_effect(
+            &fixture,
+            Arc::new(FixedEffectAuthority::new(fixture.authority.volume.clone())),
+            Arc::new(FakeServingBlockdPort::new(
+                [
+                    ServingBlockdProcessInspectionKind::Exact,
+                    ServingBlockdProcessInspectionKind::Exact,
+                ],
+                ServingBlockdProcessStart::Submitted,
+            )),
+        );
+        reservation
+            .try_apply(
+                &effect_context_with_processes(&fixture, vec![accepted_serving_process(&fixture)]),
+                &fixture.acquired.desired,
+            )
+            .unwrap();
+        fixture.stored_checkpoint = current_runtime_checkpoint(&fixture);
+
+        let port = Arc::new(FakeServingBlockdPort::new(
+            [
+                ServingBlockdProcessInspectionKind::Absent,
+                ServingBlockdProcessInspectionKind::Exact,
+            ],
+            ServingBlockdProcessStart::Submitted,
+        ));
+        let absent = with_absent_network_admission(
+            absent_effect_context(&fixture),
+            fixture.stored_checkpoint.checkpoint(),
+        );
+        assert_eq!(
+            serving_effect(&fixture, Arc::clone(&port))
+                .try_apply(&absent, &fixture.acquired.desired)
+                .unwrap(),
+            Some(RuntimeDesiredEffectOutcome::RefreshInventory)
+        );
+        assert_eq!(port.starts.load(Ordering::SeqCst), 1);
+
+        let fresh = with_absent_network_admission(
+            effect_context_with_processes(&fixture, vec![accepted_serving_process(&fixture)]),
+            fixture.stored_checkpoint.checkpoint(),
+        );
+        assert_eq!(
+            serving_effect(&fixture, Arc::clone(&port))
+                .try_apply(&fresh, &fixture.acquired.desired)
+                .unwrap(),
+            None
+        );
+        assert_eq!(port.starts.load(Ordering::SeqCst), 1);
     }
 
     #[test]

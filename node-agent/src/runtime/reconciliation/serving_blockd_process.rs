@@ -28,11 +28,13 @@ use crate::runtime_spine::{
 
 use super::checkpoint::CurrentCheckpointGuard;
 use super::clean_slate_probes::CHECKPOINT_NAMESPACE;
-use super::network::prepared_device_input;
+use super::network::{prepare_network_volume_admission_is_exact, prepared_device_input};
 use super::prepare_device_retirement::{
     prepare_device_base_admission_is_exact, retirement_authority_lease_is_monotonic, unique_runtime,
 };
 use super::serving_handoff::{PrepareDeviceHandoffReady, ServingHandoffStore};
+use super::serving_handoff_effect::checkpoint_is_current_exact;
+use super::signed_root_provision::signed_inventory_admission_is_exact_with_networks;
 use super::systemd_root_provision::ListenerPhysicalIdentity;
 use super::{
     authorized_blockd_status_is_bound, AuthorizedBlockdCheckpoint, AuthorizedBlockdStore,
@@ -700,12 +702,36 @@ impl ServingBlockdStartEffect {
         let Some(runtime) = unique_runtime(&accepted.observation().runtimes, desired)? else {
             return Ok(None);
         };
-        if !matches!(runtime.step, ReconcileStep::PrepareDevice { .. }) {
-            return Ok(None);
-        }
-        if !prepare_device_base_admission_is_exact(accepted, desired, runtime) {
-            return Ok(Some(stop_local()));
-        }
+        let prepare_network_device = match &runtime.step {
+            ReconcileStep::PrepareDevice { .. } => {
+                if !prepare_device_base_admission_is_exact(accepted, desired, runtime) {
+                    return Ok(Some(stop_local()));
+                }
+                None
+            }
+            ReconcileStep::PrepareNetwork { network, devices } => {
+                let [device] = devices.as_slice() else {
+                    return Ok(Some(stop_local()));
+                };
+                let Some(expected_networks) = context
+                    .node_global_network()?
+                    .expected_networks(&desired.cat_id, network)
+                else {
+                    return Ok(Some(stop_local()));
+                };
+                if !signed_inventory_admission_is_exact_with_networks(
+                    accepted,
+                    desired,
+                    runtime,
+                    &expected_networks,
+                ) || !checkpoint_is_current_exact(desired, runtime)
+                {
+                    return Ok(Some(stop_local()));
+                }
+                Some(device)
+            }
+            _ => return Ok(None),
+        };
 
         let cats_api::runtime_reconciliation::CheckpointEvidence::Valid {
             checkpoint_path,
@@ -772,8 +798,25 @@ impl ServingBlockdStartEffect {
         else {
             return Ok(Some(stop_local()));
         };
+        let prepare_network_is_exact = prepare_network_device.is_none_or(|device| {
+            expected.matches_device_contract(&desired.cat_id, device)
+                && prepare_network_volume_admission_is_exact(
+                    desired,
+                    runtime,
+                    device,
+                    expected.volume_id(),
+                    runtime
+                        .volumes
+                        .first()
+                        .and_then(|volume| match volume.devices.as_slice() {
+                            [observed] => Some(observed),
+                            _ => None,
+                        }),
+                )
+        });
         if admitted_expected != &expected
-            || !accepted_devices_are_compatible(runtime, &expected, admitted_exact)
+            || !prepare_network_is_exact
+            || !accepted_devices_are_compatible(context, runtime, &expected, admitted_exact)?
         {
             return Ok(Some(stop_local()));
         }
@@ -902,18 +945,35 @@ fn accepted_process_matches_evidence(
 }
 
 fn accepted_devices_are_compatible(
+    context: &RuntimeDesiredEffectContext,
     runtime: &ObservedRuntimeStatus,
     expected: &ServingBlockdExpectation,
     admitted_exact: Option<&ExactServingBlockdProcessProof>,
-) -> bool {
+) -> anyhow::Result<bool> {
+    let Some(volume) = runtime.volumes.first() else {
+        return Ok(false);
+    };
     match &expected.frontend {
-        PrepareDeviceFrontend::KernelNbd { .. } => runtime.volumes[0].devices.is_empty(),
-        PrepareDeviceFrontend::VhostUserBlk { .. } => match runtime.volumes[0].devices.as_slice() {
-            [] => admitted_exact.is_none(),
-            [observed] => admitted_exact
+        PrepareDeviceFrontend::KernelNbd { .. } => match volume.devices.as_slice() {
+            [] => Ok(true),
+            [observed] if admitted_exact.is_some() => {
+                let Some(exact) = context.kernel_nbd_pool()?.exact_device(expected.cat_id()) else {
+                    return Ok(false);
+                };
+                let (volume_id, projected) = exact.projection();
+                Ok(exact.listener().expectation() == expected
+                    && exact.matches_prepared_device(expected.cat_id(), &expected.prepared_device)
+                    && volume_id == *expected.volume_id()
+                    && observed == &projected)
+            }
+            _ => Ok(false),
+        },
+        PrepareDeviceFrontend::VhostUserBlk { .. } => match volume.devices.as_slice() {
+            [] => Ok(admitted_exact.is_none()),
+            [observed] => Ok(admitted_exact
                 .and_then(ExactServingBlockdProcessProof::vhost_device_projection)
-                .is_some_and(|(_, expected)| observed == &expected),
-            _ => false,
+                .is_some_and(|(_, expected)| observed == &expected)),
+            _ => Ok(false),
         },
     }
 }

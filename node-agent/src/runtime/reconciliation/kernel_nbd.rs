@@ -412,6 +412,14 @@ impl ExactKernelNbdDeviceProof {
     pub(crate) fn listener(&self) -> &ServingBlockdListenerProof {
         &self.listener
     }
+
+    pub(crate) fn matches_prepared_device(
+        &self,
+        cat_id: &Id,
+        prepared: &PreparedDeviceInput,
+    ) -> bool {
+        self.expected.cat_id == *cat_id && self.expected.prepared_device == *prepared
+    }
 }
 
 impl KernelNbdDeviceExpectation {
@@ -494,6 +502,44 @@ impl KernelNbdPoolScanAdmission {
                     expected,
                     listener: Some(listener),
                 },
+            )]),
+        }
+        .bind(observation)
+    }
+
+    #[cfg(test)]
+    pub(super) fn exact_for_test(
+        observation: &NodeObservation,
+        checkpoint: &RuntimeCheckpoint,
+        listener: ServingBlockdListenerProof,
+    ) -> Result<KernelNbdPoolAdmission> {
+        let expected = match &checkpoint.step {
+            ReconcileStep::PrepareNetwork { devices, .. }
+            | ReconcileStep::StartRuntime { devices, .. } => {
+                let [device] = devices.as_slice() else {
+                    anyhow::bail!("test kernel-NBD admission requires one prepared device")
+                };
+                KernelNbdDeviceExpectation::from_prepared_device(&checkpoint.cat_id, device)?
+            }
+            _ => KernelNbdDeviceExpectation::from_prepare_device(checkpoint)?,
+        }
+        .context("test kernel-NBD admission requires a kernel-NBD prepared device")?;
+        expected.assert_serving_listener(&listener)?;
+        let client = KernelNbdClientIdentity {
+            process_id: 47,
+            process_start_time_ticks: WireU64::new(91)
+                .context("test kernel-NBD process ticks are positive")?,
+            executable_path: HostPath::new("/usr/bin/nbd-client")
+                .context("test kernel-NBD executable path is canonical")?,
+            listener_socket_path: expected.listener_socket_path.clone(),
+            device_path: expected.device_path.clone(),
+            size_sectors: expected.expected_size_sectors,
+        };
+        let proof = ExactKernelNbdDeviceProof::new(expected, client, listener)?;
+        Self {
+            devices_by_cat: BTreeMap::from([(
+                checkpoint.cat_id.clone(),
+                KernelNbdDeviceScanState::Exact(proof),
             )]),
         }
         .bind(observation)
