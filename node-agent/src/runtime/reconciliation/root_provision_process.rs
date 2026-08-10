@@ -456,12 +456,50 @@ where
     P: RootProvisionProcessPort + ?Sized,
 {
     context.check_active()?;
+    // Validate the complete authority/checkpoint tuple before replacing the
+    // predecessor. A foreign head or lineage must have zero checkpoint effect.
     let expected =
         RootProvisionProcessExpectation::from_checkpoint(checkpoint, authority, executable_path)?;
     let persisted = store
         .replace(predecessor, checkpoint)
         .context("persist root-provision process identity before process effect")?;
+    let outcome = ensure_root_provision_process_from_expectation(expected, port, context)?;
+    Ok(RootProvisionProcessEnsureResult {
+        checkpoint: persisted,
+        outcome,
+    })
+}
 
+/// Inspect or start only the exact process identity already present in a
+/// durable `ProvisionRootImage` checkpoint. This restart/full-scan entrypoint
+/// cannot replace the checkpoint or mint a new process attempt token.
+pub(crate) fn ensure_root_provision_process_from_persisted_checkpoint<P>(
+    persisted: &StoredCheckpoint,
+    authority: RootProvisionAuthoritySnapshot<'_>,
+    executable_path: HostPath,
+    port: &P,
+    context: &RuntimeDesiredEffectContext,
+) -> anyhow::Result<RootProvisionProcessOutcome>
+where
+    P: RootProvisionProcessPort + ?Sized,
+{
+    context.check_active()?;
+    let expected = RootProvisionProcessExpectation::from_checkpoint(
+        persisted.checkpoint(),
+        authority,
+        executable_path,
+    )?;
+    ensure_root_provision_process_from_expectation(expected, port, context)
+}
+
+fn ensure_root_provision_process_from_expectation<P>(
+    expected: RootProvisionProcessExpectation,
+    port: &P,
+    context: &RuntimeDesiredEffectContext,
+) -> anyhow::Result<RootProvisionProcessOutcome>
+where
+    P: RootProvisionProcessPort + ?Sized,
+{
     context.check_active()?;
     let inspection = inspect_exact_root_provision_process(port, &expected, context)
         .context("inspect exact root-provision process identity")?;
@@ -520,10 +558,7 @@ where
             }
         }
     };
-    Ok(RootProvisionProcessEnsureResult {
-        checkpoint: persisted,
-        outcome,
-    })
+    Ok(outcome)
 }
 
 fn match_exact(
@@ -680,6 +715,41 @@ mod tests {
         );
         let fake = port.state.lock().unwrap();
         assert_eq!((fake.inspect_calls, fake.start_calls), (1, 1));
+    }
+
+    #[test]
+    fn restart_uses_the_persisted_attempt_without_replacing_it() {
+        let (_root, state, store, predecessor, staged, attachment, evidence) = fixture();
+        let authority = authority_record(&attachment, attachment.head.clone());
+        let persisted = store.replace(&predecessor, &staged).unwrap();
+        let before_digest = persisted.content_digest().clone();
+        let port = FakePort::default();
+        port.state
+            .lock()
+            .unwrap()
+            .inspections
+            .push_back(RootProvisionProcessInspection::Exact(Box::new(
+                evidence.clone(),
+            )));
+
+        let outcome = ensure_root_provision_process_from_persisted_checkpoint(
+            &persisted,
+            authority_snapshot(attachment, &authority),
+            host("/usr/bin/cats-blockd"),
+            &port,
+            &context(state),
+        )
+        .unwrap();
+
+        assert_eq!(
+            outcome,
+            RootProvisionProcessOutcome::Adopted(Box::new(evidence))
+        );
+        let after = store.load().unwrap().unwrap();
+        assert_eq!(after.checkpoint(), &staged);
+        assert_eq!(after.content_digest(), &before_digest);
+        let fake = port.state.lock().unwrap();
+        assert_eq!((fake.inspect_calls, fake.start_calls), (1, 0));
     }
 
     #[test]
