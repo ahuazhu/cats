@@ -2,12 +2,13 @@
 //!
 //! The legacy [`crate::server`] remains available to the pre-cutover test
 //! suite, but the shipped Node binary starts here. The first production
-//! scanner can attest only a physically empty Host; any non-empty fact remains
-//! fail-closed for the later identity-aware scanner. The typed network effect
-//! is composed after that accepted full inventory, but its launch port remains
-//! fail-closed until the signed VMM/volume reconciler lands. This path does not
-//! construct `NodeRuntime`, adopt a legacy ledger, or run a destructive
-//! residue/device sweep.
+//! scanner covers the physical clean-slate sources, but MetadataStore remains
+//! unavailable until Volume authority persists a pageable owner-Node index;
+//! no production full inventory is claimed from point reads. The typed network
+//! effect is composed only after an accepted full inventory, and its launch
+//! port remains fail-closed until the signed VMM/volume reconciler lands. This
+//! path does not construct `NodeRuntime`, adopt a legacy ledger, or run a
+//! destructive residue/device sweep.
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -58,6 +59,9 @@ pub struct SignedRuntimeCutoverConfig {
     pub blockd_binary: std::path::PathBuf,
     pub guest_agent_binary: std::path::PathBuf,
     pub metering_cgroup_root: Option<std::path::PathBuf>,
+    /// Retained for the signed acquire/provision effect. It is deliberately
+    /// not adapted into a metadata inventory proof: `load_volume` cannot list
+    /// authority-only writers or bind them to this Node.
     pub volume_data_authority: Arc<dyn VolumeDataAuthority>,
     pub deadline_policy: RuntimeSpineDeadlinePolicy,
 }
@@ -230,7 +234,6 @@ pub async fn spawn_signed_runtime_cutover(
         blockd_binary: config.blockd_binary,
         guest_agent_binary: config.guest_agent_binary,
         metering_cgroup_root: config.metering_cgroup_root,
-        volume_data_authority: config.volume_data_authority,
     })
     .context("compose installed clean-slate inventory probes")?;
     let effect =

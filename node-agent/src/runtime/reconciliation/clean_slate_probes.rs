@@ -1,10 +1,13 @@
 //! Read-only production probes for the first Running inventory vertical.
 //!
-//! These probes recognize an otherwise-empty Host plus the exact authority
-//! records named by a root-only Running Desired. Finding any local Cats
-//! runtime fact is still an error, not an invitation to infer an identity,
-//! adopt it, or clean it up. A source that cannot be enumerated exhaustively
-//! reports `Unavailable`; it never turns an I/O failure into absence.
+//! These probes recognize an otherwise-empty Host; the typed test seam can
+//! also compose a complete per-Node authority-index snapshot for a root-only
+//! Running Desired. Production keeps MetadataStore `Unavailable` until Volume
+//! authority persists and pages the authenticated owner Node alongside every
+//! live writer. Finding any local Cats runtime fact is still an error, not an
+//! invitation to infer an identity, adopt it, or clean it up. A source that
+//! cannot be enumerated exhaustively reports `Unavailable`; it never turns an
+//! I/O failure into absence.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::{CStr, CString, OsStr, OsString};
@@ -14,16 +17,23 @@ use std::os::fd::{AsRawFd as _, FromRawFd as _};
 use std::os::unix::ffi::{OsStrExt as _, OsStringExt as _};
 use std::os::unix::fs::{MetadataExt as _, OpenOptionsExt as _};
 use std::path::{Path, PathBuf};
+#[cfg(test)]
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{mpsc, Arc};
-use std::time::{Duration, Instant};
+#[cfg(test)]
+use std::sync::mpsc;
+use std::sync::Arc;
+#[cfg(test)]
+use std::time::Duration;
+use std::time::Instant;
 
 use anyhow::{bail, Context as _};
 use cats_api::runtime_reconciliation::{
-    DesiredRuntimeSpec, DiskKind, Id, InventorySource, ObservedDiskKind, ObservedVolume,
+    DesiredRuntimeSpec, DiskKind, Id, InventorySource, ObservedDiskKind, ObservedVolume, Sequence,
     VolumeAcquire, VolumeAdminState, VolumeAuthorityEvidence, VolumeIntent,
 };
-use cats_storage::authority::{validate_volume_record, VolumeDataAuthority, VolumeRecord};
+#[cfg(test)]
+use cats_storage::authority::VolumeDataAuthority;
+use cats_storage::authority::{validate_volume_record, VolumeRecord};
 
 use crate::runtime_spine::{RuntimeInventoryScanContext, RuntimeInventoryScanner};
 use crate::state_directory::StateDirectory;
@@ -52,6 +62,194 @@ mod metadata_authority_reader_sealed {
     pub(super) trait Sealed {}
 }
 
+const METADATA_AUTHORITY_PAGE_LIMIT: usize = 256;
+const METADATA_AUTHORITY_MAX_RECORDS: usize = 4_096;
+
+/// One page of the future provider-neutral Node-owner index. The persisted
+/// authority must bind every live writer to `owner_node_id` in the same
+/// transaction that changes `lease_owner`; a point load of Desired/local
+/// candidates cannot synthesize this proof after the Desired row disappears.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct MetadataAuthorityPageRequest {
+    node_id: Id,
+    desired_read_position: Sequence,
+    candidate_volume_ids: BTreeSet<Id>,
+    snapshot_read_position: Option<Sequence>,
+    after_volume_id: Option<Id>,
+    limit: usize,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct MetadataAuthorityIndexedRecord {
+    record: VolumeRecord,
+    owner_node_id: Option<Id>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct MetadataAuthorityPage {
+    node_id: Id,
+    desired_read_position: Sequence,
+    snapshot_read_position: Sequence,
+    records: Vec<MetadataAuthorityIndexedRecord>,
+    next_after_volume_id: Option<Id>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum MetadataAuthorityPageRead {
+    #[cfg_attr(
+        not(test),
+        expect(
+            dead_code,
+            reason = "production constructs this only after the owner-node authority index lands"
+        )
+    )]
+    Page(MetadataAuthorityPage),
+    Unavailable,
+}
+
+/// Descriptor for the only metadata listing shape the scanner may trust.
+/// Each page belongs to one bounded immutable read position, contains all
+/// candidate rows plus every authority row whose persisted owner is this
+/// Node, and never infers ownership from attachment spelling or current
+/// Desired membership.
+trait MetadataAuthorityInventoryPort:
+    metadata_authority_reader_sealed::Sealed + std::fmt::Debug + Send + Sync + 'static
+{
+    fn read_page(
+        &self,
+        request: &MetadataAuthorityPageRequest,
+        deadline: Instant,
+        context: &RuntimeInventoryScanContext,
+    ) -> anyhow::Result<MetadataAuthorityPageRead>;
+}
+
+#[derive(Debug)]
+struct UnavailableMetadataAuthorityInventoryPort;
+
+impl metadata_authority_reader_sealed::Sealed for UnavailableMetadataAuthorityInventoryPort {}
+
+impl MetadataAuthorityInventoryPort for UnavailableMetadataAuthorityInventoryPort {
+    fn read_page(
+        &self,
+        _request: &MetadataAuthorityPageRequest,
+        deadline: Instant,
+        context: &RuntimeInventoryScanContext,
+    ) -> anyhow::Result<MetadataAuthorityPageRead> {
+        debug_assert_eq!(deadline, context.deadline());
+        context.check_active()?;
+        Ok(MetadataAuthorityPageRead::Unavailable)
+    }
+}
+
+#[derive(Debug)]
+struct PagedMetadataAuthorityReader {
+    port: Arc<dyn MetadataAuthorityInventoryPort>,
+}
+
+impl PagedMetadataAuthorityReader {
+    fn new(port: Arc<dyn MetadataAuthorityInventoryPort>) -> Self {
+        Self { port }
+    }
+}
+
+impl metadata_authority_reader_sealed::Sealed for PagedMetadataAuthorityReader {}
+
+impl MetadataAuthorityAbsenceReader for PagedMetadataAuthorityReader {
+    fn read_candidates(
+        &self,
+        node_id: &Id,
+        candidate_volume_ids: &BTreeSet<Id>,
+        deadline: Instant,
+        context: &RuntimeInventoryScanContext,
+    ) -> anyhow::Result<MetadataAuthorityCandidateInventory> {
+        debug_assert_eq!(deadline, context.deadline());
+        context.check_active()?;
+        if node_id != &context.coordinates().session.node_id
+            || candidate_volume_ids.len() > METADATA_AUTHORITY_MAX_RECORDS
+        {
+            return Ok(MetadataAuthorityCandidateInventory::Unavailable);
+        }
+
+        let desired_read_position = context.coordinates().desired.read_position;
+        let mut snapshot_read_position = None;
+        let mut after_volume_id = None;
+        let mut records = BTreeMap::new();
+        let max_pages = METADATA_AUTHORITY_MAX_RECORDS.div_ceil(METADATA_AUTHORITY_PAGE_LIMIT) + 1;
+
+        for _ in 0..max_pages {
+            let request = MetadataAuthorityPageRequest {
+                node_id: node_id.clone(),
+                desired_read_position,
+                candidate_volume_ids: candidate_volume_ids.clone(),
+                snapshot_read_position,
+                after_volume_id: after_volume_id.clone(),
+                limit: METADATA_AUTHORITY_PAGE_LIMIT,
+            };
+            let MetadataAuthorityPageRead::Page(page) =
+                self.port.read_page(&request, deadline, context)?
+            else {
+                return Ok(MetadataAuthorityCandidateInventory::Unavailable);
+            };
+            context.check_active()?;
+
+            if page.node_id != request.node_id
+                || page.desired_read_position != request.desired_read_position
+                || request
+                    .snapshot_read_position
+                    .is_some_and(|position| position != page.snapshot_read_position)
+                || page.records.len() > request.limit
+            {
+                return Ok(MetadataAuthorityCandidateInventory::Unavailable);
+            }
+            snapshot_read_position = Some(page.snapshot_read_position);
+
+            let mut previous_volume_id = request.after_volume_id.as_ref();
+            for indexed in &page.records {
+                let volume_id = &indexed.record.volume_id;
+                if previous_volume_id.is_some_and(|previous| volume_id <= previous)
+                    || validate_volume_record(&indexed.record).is_err()
+                    || !matches!(
+                        (&indexed.record.lease_owner, &indexed.owner_node_id),
+                        (None, None) | (Some(_), Some(_))
+                    )
+                    || (!candidate_volume_ids.contains(volume_id)
+                        && indexed.owner_node_id.as_ref() != Some(node_id))
+                    || records
+                        .insert(volume_id.clone(), indexed.record.clone())
+                        .is_some()
+                {
+                    return Ok(MetadataAuthorityCandidateInventory::Unavailable);
+                }
+                previous_volume_id = Some(volume_id);
+            }
+            if records.len() > METADATA_AUTHORITY_MAX_RECORDS {
+                return Ok(MetadataAuthorityCandidateInventory::Unavailable);
+            }
+
+            match page.next_after_volume_id {
+                Some(next)
+                    if page.records.last().map(|indexed| &indexed.record.volume_id)
+                        == Some(&next) =>
+                {
+                    after_volume_id = Some(next);
+                }
+                Some(_) => return Ok(MetadataAuthorityCandidateInventory::Unavailable),
+                None => {
+                    if candidate_volume_ids
+                        .iter()
+                        .any(|volume_id| !records.contains_key(volume_id))
+                    {
+                        return Ok(MetadataAuthorityCandidateInventory::Unavailable);
+                    }
+                    return Ok(MetadataAuthorityCandidateInventory::Records(records));
+                }
+            }
+        }
+
+        Ok(MetadataAuthorityCandidateInventory::Unavailable)
+    }
+}
+
 /// A bounded read-only proof over the complete set of volume candidates seen
 /// by the scan. Implementations must use the supplied absolute deadline and
 /// consult `context.check_active()` around every potentially blocking
@@ -68,6 +266,7 @@ trait MetadataAuthorityAbsenceReader:
     ) -> anyhow::Result<MetadataAuthorityCandidateInventory>;
 }
 
+#[cfg(test)]
 enum MetadataAuthorityRead {
     Complete { records: BTreeMap<Id, VolumeRecord> },
     Incomplete,
@@ -75,13 +274,13 @@ enum MetadataAuthorityRead {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum MetadataAuthorityCandidateInventory {
-    /// An empty map is a global-empty proof only when the requested candidate
-    /// set is also empty. The current point-reader never manufactures that
-    /// result; a future bounded listing port may do so.
+    /// An empty map is a complete per-Node authority-index proof only when the
+    /// requested candidate set is also empty.
     Records(BTreeMap<Id, VolumeRecord>),
     Unavailable,
 }
 
+#[cfg(test)]
 struct MetadataAuthorityReadRequest {
     candidate_volume_ids: BTreeSet<Id>,
     reply: mpsc::SyncSender<MetadataAuthorityRead>,
@@ -93,11 +292,13 @@ struct MetadataAuthorityReadRequest {
 /// reads. The scan lane can stop waiting at its deadline without starting a
 /// second overlapping metadata read; while the worker is occupied, later
 /// scans report the source unavailable.
+#[cfg(test)]
 struct VolumeDataAuthorityMetadataReader {
     requests: mpsc::SyncSender<MetadataAuthorityReadRequest>,
     in_flight: Arc<AtomicBool>,
 }
 
+#[cfg(test)]
 impl std::fmt::Debug for VolumeDataAuthorityMetadataReader {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter
@@ -106,6 +307,7 @@ impl std::fmt::Debug for VolumeDataAuthorityMetadataReader {
     }
 }
 
+#[cfg(test)]
 impl VolumeDataAuthorityMetadataReader {
     fn start(authority: Arc<dyn VolumeDataAuthority>) -> anyhow::Result<Self> {
         // `in_flight` admits work only while the single reader is idle. The
@@ -156,8 +358,10 @@ impl VolumeDataAuthorityMetadataReader {
     }
 }
 
+#[cfg(test)]
 impl metadata_authority_reader_sealed::Sealed for VolumeDataAuthorityMetadataReader {}
 
+#[cfg(test)]
 impl MetadataAuthorityAbsenceReader for VolumeDataAuthorityMetadataReader {
     fn read_candidates(
         &self,
@@ -292,7 +496,6 @@ pub(crate) struct InstalledCleanSlateProbeConfig {
     pub blockd_binary: PathBuf,
     pub guest_agent_binary: PathBuf,
     pub metering_cgroup_root: Option<PathBuf>,
-    pub volume_data_authority: Arc<dyn VolumeDataAuthority>,
 }
 
 impl std::fmt::Debug for InstalledCleanSlateProbeConfig {
@@ -304,7 +507,6 @@ impl std::fmt::Debug for InstalledCleanSlateProbeConfig {
             .field("blockd_binary", &self.blockd_binary)
             .field("guest_agent_binary", &self.guest_agent_binary)
             .field("metering_cgroup_root", &self.metering_cgroup_root)
-            .field("volume_data_authority", &"<provider-neutral authority>")
             .finish()
     }
 }
@@ -361,9 +563,13 @@ impl ProbeConfig {
 pub(crate) fn installed_clean_slate_scanner(
     config: InstalledCleanSlateProbeConfig,
 ) -> anyhow::Result<Arc<dyn RuntimeInventoryScanner>> {
-    let metadata_authority = Arc::new(VolumeDataAuthorityMetadataReader::start(Arc::clone(
-        &config.volume_data_authority,
-    ))?);
+    // `VolumeRecord` does not yet persist the authenticated owner Node. Point
+    // reads therefore cannot enumerate authority-only owners after their
+    // Desired row disappears. Keep production incomplete until the indexed,
+    // paged snapshot port above is backed by that same-transaction binding.
+    let metadata_authority = Arc::new(PagedMetadataAuthorityReader::new(Arc::new(
+        UnavailableMetadataAuthorityInventoryPort,
+    )));
     let config = ProbeConfig::installed(config)?;
     let scanner = scanner_with_metadata_authority(config, metadata_authority)?;
     Ok(Arc::new(scanner))
@@ -829,9 +1035,14 @@ impl InventoryAbsenceProbe for MetadataStoreProbe {
                 if candidate_volume_ids.is_empty() && records.is_empty() {
                     return Ok(InventoryAbsence::Empty);
                 }
-                if records.len() != candidate_volume_ids.len()
-                    || records.keys().any(|id| !candidate_volume_ids.contains(id))
+                if let Some(authority_only) =
+                    records.keys().find(|id| !candidate_volume_ids.contains(id))
                 {
+                    bail!(
+                        "metadata authority retains Node-owned volume outside scan candidates: {authority_only}"
+                    );
+                }
+                if records.len() != candidate_volume_ids.len() {
                     return Ok(InventoryAbsence::Unavailable);
                 }
                 if let Some(local_only) =
@@ -1760,6 +1971,7 @@ fn errno() -> libc::c_int {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::VecDeque;
     use std::sync::Mutex;
     use std::time::{Duration, Instant};
 
@@ -1905,6 +2117,49 @@ mod tests {
     struct RecordingMetadataAuthorityReader {
         behavior: MetadataReaderBehavior,
         calls: Arc<Mutex<Vec<MetadataReadCall>>>,
+    }
+
+    #[derive(Debug)]
+    struct ScriptedMetadataAuthorityInventoryPort {
+        reads: Mutex<VecDeque<MetadataAuthorityPageRead>>,
+        calls: Arc<Mutex<Vec<MetadataAuthorityPageRequest>>>,
+    }
+
+    impl metadata_authority_reader_sealed::Sealed for ScriptedMetadataAuthorityInventoryPort {}
+
+    impl MetadataAuthorityInventoryPort for ScriptedMetadataAuthorityInventoryPort {
+        fn read_page(
+            &self,
+            request: &MetadataAuthorityPageRequest,
+            deadline: Instant,
+            context: &RuntimeInventoryScanContext,
+        ) -> anyhow::Result<MetadataAuthorityPageRead> {
+            assert_eq!(deadline, context.deadline());
+            context.check_active()?;
+            self.calls.lock().unwrap().push(request.clone());
+            Ok(self
+                .reads
+                .lock()
+                .unwrap()
+                .pop_front()
+                .unwrap_or(MetadataAuthorityPageRead::Unavailable))
+        }
+    }
+
+    fn scripted_metadata_inventory_port(
+        reads: impl IntoIterator<Item = MetadataAuthorityPageRead>,
+    ) -> (
+        Arc<dyn MetadataAuthorityInventoryPort>,
+        Arc<Mutex<Vec<MetadataAuthorityPageRequest>>>,
+    ) {
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        (
+            Arc::new(ScriptedMetadataAuthorityInventoryPort {
+                reads: Mutex::new(reads.into_iter().collect()),
+                calls: calls.clone(),
+            }),
+            calls,
+        )
     }
 
     impl metadata_authority_reader_sealed::Sealed for RecordingMetadataAuthorityReader {}
@@ -2126,8 +2381,270 @@ mod tests {
         context
     }
 
+    fn unowned_record(volume_id: &str, size_bytes: u64) -> VolumeRecord {
+        VolumeRecord {
+            volume_id: Id::new(volume_id).unwrap(),
+            size_bytes,
+            durability: Durability::Strict,
+            admin_state: VolumeAdminState::Active,
+            head: cats_storage::authority::RemoteHead {
+                generation: cats_storage::authority::Generation::new(0).unwrap(),
+                root_hash: None,
+                root_object_id: None,
+            },
+            lease_owner: None,
+            lease_epoch: FenceEpoch::new(0).unwrap(),
+            lease_expires_at: None,
+            last_transition: None,
+        }
+    }
+
+    fn owned_record(volume_id: &str, attachment_id: &str) -> VolumeRecord {
+        let predecessor = unowned_record(volume_id, 4_096);
+        cats_storage::authority::normal_acquire(
+            &predecessor,
+            &cats_storage::authority::NormalAcquireRequest {
+                volume_id: predecessor.volume_id.clone(),
+                transition_id: RandomId128::new("22222222222222222222222222222222").unwrap(),
+                attachment_id: Id::new(attachment_id).unwrap(),
+                expected_unowned_epoch: predecessor.lease_epoch,
+                desired_revision: Revision::new(1).unwrap(),
+                placement_epoch: Epoch::new(1).unwrap(),
+                lease_duration_ms: 5_000,
+            },
+            cats_storage::authority::UnixMillis::new(10_000).unwrap(),
+        )
+        .unwrap()
+        .0
+    }
+
+    fn metadata_page(
+        records: Vec<MetadataAuthorityIndexedRecord>,
+        next_after_volume_id: Option<&str>,
+    ) -> MetadataAuthorityPageRead {
+        MetadataAuthorityPageRead::Page(MetadataAuthorityPage {
+            node_id: Id::new("node_a").unwrap(),
+            desired_read_position: Sequence::new(12).unwrap(),
+            snapshot_read_position: Sequence::new(77).unwrap(),
+            records,
+            next_after_volume_id: next_after_volume_id.map(|value| Id::new(value).unwrap()),
+        })
+    }
+
     #[test]
-    fn production_clean_host_is_incomplete_without_global_authority_absence_port() {
+    fn production_metadata_port_remains_unavailable_without_owner_node_index() {
+        let environment = TestEnvironment::new();
+        let reader = Arc::new(PagedMetadataAuthorityReader::new(Arc::new(
+            UnavailableMetadataAuthorityInventoryPort,
+        )));
+        assert_eq!(
+            metadata_probe(&environment, reader)
+                .prove_absent(&assigned_context(true))
+                .unwrap(),
+            InventoryAbsence::Unavailable
+        );
+    }
+
+    #[test]
+    fn paged_node_snapshot_can_prove_the_exact_desired_candidate() {
+        let environment = TestEnvironment::new();
+        let record = unowned_record("vol_root", 4_294_967_296);
+        let (port, calls) = scripted_metadata_inventory_port([metadata_page(
+            vec![MetadataAuthorityIndexedRecord {
+                record: record.clone(),
+                owner_node_id: None,
+            }],
+            None,
+        )]);
+        let reader = Arc::new(PagedMetadataAuthorityReader::new(port));
+
+        let InventoryAbsence::DesiredVolumes(by_cat) = metadata_probe(&environment, reader)
+            .prove_absent(&assigned_context(true))
+            .unwrap()
+        else {
+            panic!("exact indexed candidate must form typed Desired volume evidence")
+        };
+        assert_eq!(
+            by_cat[&Id::new("cat_01").unwrap()][0].volume_id,
+            record.volume_id
+        );
+        let calls = calls.lock().unwrap();
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].node_id, Id::new("node_a").unwrap());
+        assert_eq!(calls[0].desired_read_position.get(), 12);
+        assert_eq!(calls[0].snapshot_read_position, None);
+        assert_eq!(calls[0].after_volume_id, None);
+        assert_eq!(calls[0].limit, METADATA_AUTHORITY_PAGE_LIMIT);
+    }
+
+    #[test]
+    fn paged_node_snapshot_empty_final_page_proves_node_absence() {
+        let environment = TestEnvironment::new();
+        let (port, calls) = scripted_metadata_inventory_port([metadata_page(Vec::new(), None)]);
+        let reader = Arc::new(PagedMetadataAuthorityReader::new(port));
+        assert_eq!(
+            metadata_probe(&environment, reader)
+                .prove_absent(&context())
+                .unwrap(),
+            InventoryAbsence::Empty
+        );
+        assert_eq!(calls.lock().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn unknown_or_foreign_authority_only_owner_cannot_complete_the_node_snapshot() {
+        for owner_node_id in [None, Some(Id::new("node_b").unwrap())] {
+            let environment = TestEnvironment::new();
+            let (port, _calls) = scripted_metadata_inventory_port([metadata_page(
+                vec![
+                    MetadataAuthorityIndexedRecord {
+                        record: owned_record("vol_orphan", "att_orphan"),
+                        owner_node_id,
+                    },
+                    MetadataAuthorityIndexedRecord {
+                        record: unowned_record("vol_root", 4_294_967_296),
+                        owner_node_id: None,
+                    },
+                ],
+                None,
+            )]);
+            let reader = Arc::new(PagedMetadataAuthorityReader::new(port));
+            assert_eq!(
+                metadata_probe(&environment, reader)
+                    .prove_absent(&assigned_context(true))
+                    .unwrap(),
+                InventoryAbsence::Unavailable
+            );
+        }
+    }
+
+    #[test]
+    fn paged_snapshot_surfaces_node_owned_authority_only_volume() {
+        let environment = TestEnvironment::new();
+        let (port, calls) = scripted_metadata_inventory_port([
+            metadata_page(
+                vec![MetadataAuthorityIndexedRecord {
+                    record: owned_record("vol_orphan", "att_orphan"),
+                    owner_node_id: Some(Id::new("node_a").unwrap()),
+                }],
+                Some("vol_orphan"),
+            ),
+            metadata_page(
+                vec![MetadataAuthorityIndexedRecord {
+                    record: unowned_record("vol_root", 4_294_967_296),
+                    owner_node_id: None,
+                }],
+                None,
+            ),
+        ]);
+        let reader = Arc::new(PagedMetadataAuthorityReader::new(port));
+        let error = metadata_probe(&environment, reader)
+            .prove_absent(&assigned_context(true))
+            .unwrap_err();
+        assert!(format!("{error:#}").contains("Node-owned volume outside scan candidates"));
+
+        let calls = calls.lock().unwrap();
+        assert_eq!(calls.len(), 2);
+        assert_eq!(
+            calls[1].snapshot_read_position,
+            Some(Sequence::new(77).unwrap())
+        );
+        assert_eq!(
+            calls[1].after_volume_id,
+            Some(Id::new("vol_orphan").unwrap())
+        );
+    }
+
+    #[test]
+    fn paged_snapshot_rejects_binding_cursor_and_order_mismatches() {
+        let base_record = MetadataAuthorityIndexedRecord {
+            record: unowned_record("vol_root", 4_294_967_296),
+            owner_node_id: None,
+        };
+        let mut wrong_node = metadata_page(vec![base_record.clone()], None);
+        let MetadataAuthorityPageRead::Page(page) = &mut wrong_node else {
+            unreachable!()
+        };
+        page.node_id = Id::new("node_b").unwrap();
+
+        let mut wrong_desired_position = metadata_page(vec![base_record.clone()], None);
+        let MetadataAuthorityPageRead::Page(page) = &mut wrong_desired_position else {
+            unreachable!()
+        };
+        page.desired_read_position = Sequence::new(13).unwrap();
+
+        let bad_cursor = metadata_page(vec![base_record.clone()], Some("vol_other"));
+        let missing_candidate = metadata_page(Vec::new(), None);
+
+        let mut unowned_with_owner = metadata_page(vec![base_record.clone()], None);
+        let MetadataAuthorityPageRead::Page(page) = &mut unowned_with_owner else {
+            unreachable!()
+        };
+        page.records[0].owner_node_id = Some(Id::new("node_a").unwrap());
+
+        let descending = metadata_page(
+            vec![
+                base_record,
+                MetadataAuthorityIndexedRecord {
+                    record: owned_record("vol_orphan", "att_orphan"),
+                    owner_node_id: Some(Id::new("node_a").unwrap()),
+                },
+            ],
+            None,
+        );
+
+        let first_page = metadata_page(
+            vec![MetadataAuthorityIndexedRecord {
+                record: owned_record("vol_orphan", "att_orphan"),
+                owner_node_id: Some(Id::new("node_a").unwrap()),
+            }],
+            Some("vol_orphan"),
+        );
+        let mut drifted_second_page = metadata_page(
+            vec![MetadataAuthorityIndexedRecord {
+                record: unowned_record("vol_root", 4_294_967_296),
+                owner_node_id: None,
+            }],
+            None,
+        );
+        let MetadataAuthorityPageRead::Page(page) = &mut drifted_second_page else {
+            unreachable!()
+        };
+        page.snapshot_read_position = Sequence::new(78).unwrap();
+
+        for (case, reads) in [
+            ("wrong_node", vec![wrong_node]),
+            ("wrong_desired_position", vec![wrong_desired_position]),
+            ("bad_cursor", vec![bad_cursor]),
+            ("missing_candidate", vec![missing_candidate]),
+            ("unowned_with_owner", vec![unowned_with_owner]),
+            ("descending", vec![descending]),
+            (
+                "snapshot_position_drift",
+                vec![first_page, drifted_second_page],
+            ),
+        ] {
+            let context = assigned_context(true);
+            let candidates = [Id::new("vol_root").unwrap()].into_iter().collect();
+            let (port, _calls) = scripted_metadata_inventory_port(reads);
+            let reader = PagedMetadataAuthorityReader::new(port);
+            assert_eq!(
+                reader
+                    .read_candidates(
+                        &Id::new("node_a").unwrap(),
+                        &candidates,
+                        context.deadline(),
+                        &context,
+                    )
+                    .unwrap(),
+                MetadataAuthorityCandidateInventory::Unavailable,
+                "{case}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_point_reader_cannot_close_a_clean_host() {
         let environment = TestEnvironment::new();
         let (authority, calls) = TestVolumeDataAuthority::missing();
         let reader = Arc::new(VolumeDataAuthorityMetadataReader::start(authority).unwrap());
@@ -2166,7 +2683,7 @@ mod tests {
     }
 
     #[test]
-    fn production_candidate_read_failure_makes_metadata_incomplete() {
+    fn test_point_reader_candidate_failure_makes_metadata_incomplete() {
         let environment = TestEnvironment::new();
         let (authority, calls) = TestVolumeDataAuthority::missing();
         let reader = Arc::new(VolumeDataAuthorityMetadataReader::start(authority).unwrap());
@@ -2183,7 +2700,7 @@ mod tests {
     }
 
     #[test]
-    fn desired_unowned_root_is_a_complete_missing_baseline() {
+    fn test_point_reader_projects_an_exact_desired_unowned_root() {
         let environment = TestEnvironment::new();
         let record = cats_storage::authority::VolumeRecord {
             volume_id: Id::new("vol_root").unwrap(),
@@ -2245,7 +2762,7 @@ mod tests {
     }
 
     #[test]
-    fn exact_acquire_response_loss_is_observed_as_the_desired_owner() {
+    fn test_point_reader_projects_exact_acquire_response_loss() {
         let environment = TestEnvironment::new();
         let unowned = cats_storage::authority::VolumeRecord {
             volume_id: Id::new("vol_root").unwrap(),
@@ -2826,14 +3343,12 @@ mod tests {
     fn installed_factory_derives_checkpoint_evidence_from_the_scanned_dirfd_child() {
         let environment = TestEnvironment::new();
         let state = StateDirectory::unanchored(environment.state.clone());
-        let (volume_data_authority, _calls) = TestVolumeDataAuthority::missing();
         let config = ProbeConfig::installed(InstalledCleanSlateProbeConfig {
             state_directory: state.clone(),
             cloud_hypervisor_binary: environment.ch_binary.clone(),
             blockd_binary: environment.blockd_binary.clone(),
             guest_agent_binary: environment.guest_binary.clone(),
             metering_cgroup_root: None,
-            volume_data_authority,
         })
         .unwrap();
         assert_eq!(
