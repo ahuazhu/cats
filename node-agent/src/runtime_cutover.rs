@@ -1061,7 +1061,9 @@ mod tests {
         clean_slate_scanner_with_volume_authority_and_blob_for_test(
             TestCleanSlateProbeConfig {
                 state_directory: crate::state_directory::StateDirectory::unanchored(
-                    state_path.to_path_buf(),
+                    std::fs::canonicalize(state_path.parent().unwrap())
+                        .unwrap()
+                        .join(state_path.file_name().unwrap()),
                 ),
                 proc_root,
                 systemd_cgroup_root: systemd_root,

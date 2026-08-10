@@ -935,7 +935,7 @@ impl RetainedAuthorizedBlockd {
         );
         let current_root = self
             .state_directory
-            .try_clone_directory()
+            .try_reopen_directory()
             .context("reopen current Node state directory")?;
         anyhow::ensure!(
             verify_retained_state_root(&current_root, self.state_directory.path())?

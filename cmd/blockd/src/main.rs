@@ -469,6 +469,78 @@ impl LocalFileMetadata {
     }
 }
 
+/// Process-local authority for the Runtime-selected data directory.
+///
+/// PID 1 cannot inherit the Node Agent's descriptor table, so Runtime argv
+/// carries the canonical pathname. Once blockd has opened that pathname with a
+/// no-follow traversal, Linux engine I/O is rooted through blockd's own live
+/// descriptor. The trailing `/.` is deliberate: engine startup applies
+/// `O_NOFOLLOW` to the final component, while the trusted procfs magic link is
+/// an intermediate component naming this already-retained descriptor.
+struct RetainedEngineDataDirectory {
+    canonical_path: PathBuf,
+    directory: File,
+    device: u64,
+    inode: u64,
+    lexical_chain: Vec<LocalDirectoryIdentity>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct LocalDirectoryIdentity {
+    device: u64,
+    inode: u64,
+}
+
+impl RetainedEngineDataDirectory {
+    fn open(canonical_path: &Path) -> Result<Self> {
+        let (directory, lexical_chain) = open_private_directory_with_chain(canonical_path)?;
+        let metadata = directory
+            .metadata()
+            .with_context(|| format!("inspect data directory {}", canonical_path.display()))?;
+        Ok(Self {
+            canonical_path: canonical_path.to_path_buf(),
+            directory,
+            device: metadata.dev(),
+            inode: metadata.ino(),
+            lexical_chain,
+        })
+    }
+
+    fn assert_current(&self) -> Result<()> {
+        let retained = self
+            .directory
+            .metadata()
+            .context("reinspect retained engine data directory")?;
+        let (lexical, lexical_chain) = open_private_directory_with_chain(&self.canonical_path)?;
+        let lexical = lexical
+            .metadata()
+            .context("reinspect lexical engine data directory")?;
+        if retained.dev() != self.device
+            || retained.ino() != self.inode
+            || lexical.dev() != self.device
+            || lexical.ino() != self.inode
+            || lexical_chain != self.lexical_chain
+        {
+            bail!("engine data directory ancestor chain changed identity before attach");
+        }
+        Ok(())
+    }
+
+    fn engine_path(&self) -> PathBuf {
+        #[cfg(target_os = "linux")]
+        {
+            PathBuf::from(format!("/proc/self/fd/{}/.", self.directory.as_raw_fd()))
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            // fdescfs on macOS does not support descendant lookup through a
+            // directory fd. Production transient services are Linux-only; the
+            // retained/fresh identity closure still protects portable startup.
+            self.canonical_path.clone()
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 struct ServingHandoffRecordExpectation {
     path: PathBuf,
@@ -944,6 +1016,10 @@ fn read_serving_handoff_authorization(
 }
 
 fn open_private_directory(path: &Path) -> Result<File> {
+    open_private_directory_with_chain(path).map(|(directory, _)| directory)
+}
+
+fn open_private_directory_with_chain(path: &Path) -> Result<(File, Vec<LocalDirectoryIdentity>)> {
     if !path.is_absolute() {
         bail!("serving handoff directory must be absolute");
     }
@@ -954,6 +1030,7 @@ fn open_private_directory(path: &Path) -> Result<File> {
     let mut directory = options
         .open(Path::new("/"))
         .context("open serving handoff filesystem root")?;
+    let mut chain = vec![local_directory_identity(&directory)?];
     for component in path.components() {
         match component {
             std::path::Component::RootDir => {}
@@ -966,6 +1043,7 @@ fn open_private_directory(path: &Path) -> Result<File> {
                         path.display()
                     )
                 })?;
+                chain.push(local_directory_identity(&directory)?);
             }
             std::path::Component::CurDir
             | std::path::Component::ParentDir
@@ -986,7 +1064,21 @@ fn open_private_directory(path: &Path) -> Result<File> {
             path.display()
         );
     }
-    Ok(directory)
+    Ok((directory, chain))
+}
+
+fn local_directory_identity(directory: &File) -> Result<LocalDirectoryIdentity> {
+    let metadata = directory
+        .metadata()
+        .context("inspect serving handoff directory component")?;
+    anyhow::ensure!(
+        metadata.file_type().is_dir() && metadata.ino() != 0,
+        "serving handoff directory component lacks a stable identity"
+    );
+    Ok(LocalDirectoryIdentity {
+        device: metadata.dev(),
+        inode: metadata.ino(),
+    })
 }
 
 fn strict_descendant_path(parent: &Path, child: &Path) -> Option<PathBuf> {
@@ -1347,7 +1439,7 @@ fn main() -> Result<()> {
         },
         other => anyhow::bail!("unknown --durability {other:?}; expected strict or relaxed"),
     };
-    let config = EngineConfig {
+    let mut config = EngineConfig {
         volume_id: volume_id.clone(),
         data_dir,
         attachment_id,
@@ -1357,6 +1449,10 @@ fn main() -> Result<()> {
         max_staged_packs: args.max_staged_packs,
         max_local_bytes: args.max_local_bytes,
     };
+    let retained_engine_data_directory = runtime_process_identity
+        .as_ref()
+        .map(|_| RetainedEngineDataDirectory::open(&config.data_dir))
+        .transpose()?;
     let authorized_serving =
         read_authorized_serving_input(&args, &config, runtime_process_identity.as_ref())?;
     let authorized_serving_mode = authorized_serving.is_some();
@@ -1408,6 +1504,13 @@ fn main() -> Result<()> {
     let expected_target_request = authorized_target_control
         .as_ref()
         .map(|artifact| artifact.request.clone());
+    if let Some(directory) = &retained_engine_data_directory {
+        // Close the pathname-to-descriptor window only after every canonical
+        // authorization input has been parsed, and before the engine can
+        // renew authority or touch local state.
+        directory.assert_current()?;
+        config.data_dir = directory.engine_path();
+    }
     let engine = if args.control_only {
         let authority = PostgresVolumeDataAuthority::open(&metadata_config)
             .context("open target volume authority")?;
@@ -1470,6 +1573,9 @@ fn main() -> Result<()> {
             }
         }
     };
+    // EngineConfig may name blockd's procfs descriptor on Linux. Keep that
+    // descriptor alive until every engine/frontend thread has stopped.
+    let _retained_engine_data_directory = retained_engine_data_directory;
 
     tracing::info!(
         volume = %volume_id,
@@ -2170,6 +2276,63 @@ mod tests {
     const TARGET_VOLUME_ID: &str = "vol_target";
     const TARGET_ATTACHMENT_ID: &str = "att_target";
     const TARGET_TRANSITION: &str = "13579bdf2468ace013579bdf2468ace0";
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn retained_engine_root_survives_a_canonical_directory_replacement() {
+        let temp = tempfile::tempdir().expect("create retained engine root fixture");
+        let parent = temp.path().join("node");
+        let canonical = parent.join("data");
+        std::fs::create_dir_all(&canonical).expect("create canonical data directory");
+        std::fs::set_permissions(&canonical, std::fs::Permissions::from_mode(0o700))
+            .expect("make canonical data directory private");
+        let retained =
+            RetainedEngineDataDirectory::open(&canonical).expect("retain canonical data directory");
+        let engine_path = retained.engine_path();
+        assert!(engine_path.starts_with("/proc/self/fd"));
+        assert_ne!(engine_path, canonical);
+
+        let displaced_parent = temp.path().join("node-displaced");
+        std::fs::rename(&parent, &displaced_parent).expect("displace retained data parent");
+        std::fs::create_dir(&parent).expect("create replacement data parent");
+        std::fs::rename(displaced_parent.join("data"), &canonical)
+            .expect("move exact retained data leaf beneath replacement parent");
+        assert_eq!(
+            std::fs::metadata(&canonical).unwrap().dev(),
+            retained.device
+        );
+        assert_eq!(std::fs::metadata(&canonical).unwrap().ino(), retained.inode);
+        let error = retained
+            .assert_current()
+            .expect_err("replacement ancestor with the exact leaf must fail closed");
+        assert!(error
+            .to_string()
+            .contains("ancestor chain changed identity"));
+
+        std::fs::rename(&canonical, displaced_parent.join("data"))
+            .expect("return retained data leaf to its original parent");
+        std::fs::create_dir(&canonical).expect("create replacement data directory");
+        std::fs::set_permissions(&canonical, std::fs::Permissions::from_mode(0o700))
+            .expect("make replacement data directory private");
+
+        let mut options = std::fs::OpenOptions::new();
+        options.read(true).custom_flags(
+            libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC | libc::O_NONBLOCK,
+        );
+        let reopened = options
+            .open(&engine_path)
+            .expect("engine O_NOFOLLOW startup can reopen retained root");
+        assert_eq!(reopened.metadata().unwrap().dev(), retained.device);
+        assert_eq!(reopened.metadata().unwrap().ino(), retained.inode);
+
+        std::fs::write(engine_path.join("probe"), b"retained")
+            .expect("write through process-local retained root");
+        assert_eq!(
+            std::fs::read(displaced_parent.join("data/probe")).unwrap(),
+            b"retained"
+        );
+        assert!(!canonical.join("probe").exists());
+    }
 
     struct TargetControlFixture {
         _root: tempfile::TempDir,

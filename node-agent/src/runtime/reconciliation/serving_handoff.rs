@@ -3133,8 +3133,11 @@ impl RetainedAttachmentContext {
         verify_retained_state_directory(&root_directory, state_directory.path())?;
         let state_identity = stable_directory_identity(&root_directory, state_directory.path())?;
         verify_private_directory(&attachment_directory, data_directory)?;
+        let lexical_root = state_directory
+            .try_reopen_directory()
+            .context("reopen lexical Node state directory")?;
         let lexical_attachment = open_attachment_directory_from_root(
-            &root_directory,
+            &lexical_root,
             state_directory.path(),
             data_directory,
         )?;
@@ -3214,7 +3217,7 @@ impl RetainedAttachmentContext {
         // no longer names the path a future consumer would open.
         let current_root = self
             .state_directory
-            .try_clone_directory()
+            .try_reopen_directory()
             .context("reopen current Node state directory")?;
         verify_retained_state_directory(&current_root, self.state_directory.path())?;
         assert_directory_identity(&current_root, &self.local_state.state_directory)?;

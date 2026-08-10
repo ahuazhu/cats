@@ -1402,25 +1402,19 @@ mod tests {
         #[cfg(target_os = "linux")]
         {
             let anchored = registration.runtime_state_directory();
-            anchored.ensure_child_inheritance().unwrap();
+            let error = anchored
+                .ensure_child_inheritance()
+                .expect_err("runtime must reject the replacement lexical state path");
+            assert!(
+                error.to_string().contains("canonical Node state directory"),
+                "unexpected lexical-state error: {error:#}"
+            );
             assert!(anchored.inherited_fd().is_some());
-            std::fs::write(anchored.join("runtime-after-replacement"), b"old-inode").unwrap();
-            let child = std::process::Command::new("/bin/sh")
-                .args(["-c", "printf child > \"$1/child-write\"", "sh"])
-                .arg(anchored.path())
-                .status()
-                .unwrap();
-            assert!(child.success());
-            assert_eq!(
-                std::fs::read(displaced.join("runtime-after-replacement")).unwrap(),
-                b"old-inode"
-            );
-            assert_eq!(
-                std::fs::read(displaced.join("child-write")).unwrap(),
-                b"child"
-            );
+            assert!(anchored.try_clone_directory().is_err());
             assert!(!state_path.join("runtime-after-replacement").exists());
             assert!(!state_path.join("child-write").exists());
+            assert!(!displaced.join("runtime-after-replacement").exists());
+            assert!(!displaced.join("child-write").exists());
         }
         // The Host-global lock lives in the retained state root, so replacing
         // the identity-selected child cannot let a second Agent start.

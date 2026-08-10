@@ -1,30 +1,41 @@
 //! Process-lifetime ownership of the identity-selected Node state directory.
 
+use std::ffi::CString;
 use std::fs::{File, OpenOptions};
+use std::io;
 use std::ops::Deref;
-use std::os::fd::AsRawFd as _;
 #[cfg(target_os = "linux")]
-use std::os::fd::{FromRawFd as _, RawFd};
-use std::os::unix::fs::OpenOptionsExt as _;
-use std::path::{Path, PathBuf};
+use std::os::fd::RawFd;
+use std::os::fd::{AsRawFd as _, FromRawFd as _};
+use std::os::unix::ffi::OsStrExt as _;
+use std::os::unix::fs::{MetadataExt as _, OpenOptionsExt as _};
+use std::path::{Component, Path, PathBuf};
 use std::sync::Arc;
 
 #[cfg(target_os = "linux")]
 use anyhow::Context as _;
 
 /// Reserved by the production Node before any runtime worker is constructed.
-/// Child processes receive this exact descriptor number without `CLOEXEC`, so
-/// `/proc/self/fd/198/...` names the retained directory in the Node, blockd,
-/// Guest-agent stand-in, and Cloud Hypervisor processes alike.
+/// The descriptor remains the Agent's descriptor-relative authority. Runtime
+/// paths themselves use the identity-selected canonical pathname so a process
+/// started by the system manager never depends on an Agent-private fd table.
 #[cfg(target_os = "linux")]
 const PRODUCTION_STATE_DIRECTORY_FD: RawFd = 198;
 
-/// An identity-selected state directory whose open descriptor outlives every
-/// runtime path and every child process that may consume one.
+/// An identity-selected state directory retained for the Agent lifetime.
+/// Manager-spawned services receive its canonical path and establish their own
+/// process-local descriptor authority after reopening the same identity.
 #[derive(Clone)]
 pub struct StateDirectory {
     path: PathBuf,
     inherited_directory: Option<Arc<File>>,
+    anchored_lexical_chain: Option<Arc<[DirectoryIdentity]>>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct DirectoryIdentity {
+    device: u64,
+    inode: u64,
 }
 
 impl std::fmt::Debug for StateDirectory {
@@ -39,6 +50,13 @@ impl std::fmt::Debug for StateDirectory {
                     .as_ref()
                     .map(|directory| directory.as_raw_fd()),
             )
+            .field(
+                "anchored_lexical_components",
+                &self
+                    .anchored_lexical_chain
+                    .as_ref()
+                    .map(|chain| chain.len()),
+            )
             .finish()
     }
 }
@@ -50,30 +68,41 @@ impl StateDirectory {
         Self {
             path,
             inherited_directory: None,
+            anchored_lexical_chain: None,
         }
     }
 
-    /// Reserves the one production descriptor and returns its stable procfs
-    /// path. Failing because the descriptor is already occupied is safer than
+    /// Retains the identity-selected directory while exposing only its
+    /// canonical installed pathname to checkpoints and child argv. Failing
+    /// because the reserved descriptor is already occupied is safer than
     /// silently closing an unrelated process resource with `dup2`.
     pub(crate) fn from_installed_directory(
         directory: &File,
-        _canonical_path: &Path,
+        canonical_path: &Path,
     ) -> anyhow::Result<Self> {
         #[cfg(target_os = "linux")]
         {
             let descriptor = duplicate_to_reserved_fd(directory, PRODUCTION_STATE_DIRECTORY_FD)?;
-            Ok(Self {
-                path: PathBuf::from(format!("/proc/self/fd/{}", descriptor.as_raw_fd())),
+            let (lexical, chain) = open_lexical_directory(canonical_path)?;
+            ensure_same_directory(&descriptor, &lexical)?;
+            let state = Self {
+                path: canonical_path.to_path_buf(),
                 inherited_directory: Some(Arc::new(descriptor)),
-            })
+                anchored_lexical_chain: Some(chain.into()),
+            };
+            Ok(state)
         }
         #[cfg(not(target_os = "linux"))]
         {
-            Ok(Self {
-                path: _canonical_path.to_path_buf(),
-                inherited_directory: Some(Arc::new(directory.try_clone()?)),
-            })
+            let retained = directory.try_clone()?;
+            let (lexical, chain) = open_lexical_directory(canonical_path)?;
+            ensure_same_directory(&retained, &lexical)?;
+            let state = Self {
+                path: canonical_path.to_path_buf(),
+                inherited_directory: Some(Arc::new(retained)),
+                anchored_lexical_chain: Some(chain.into()),
+            };
+            Ok(state)
         }
     }
 
@@ -82,13 +111,18 @@ impl StateDirectory {
     #[cfg(target_os = "linux")]
     pub(crate) fn from_test_directory(
         directory: &File,
-        _canonical_path: &Path,
+        canonical_path: &Path,
     ) -> anyhow::Result<Self> {
+        let canonical_path = std::fs::canonicalize(canonical_path)?;
         let descriptor = duplicate_inheritable(directory, PRODUCTION_STATE_DIRECTORY_FD + 1)?;
-        Ok(Self {
-            path: PathBuf::from(format!("/proc/self/fd/{}", descriptor.as_raw_fd())),
+        let (lexical, chain) = open_lexical_directory(&canonical_path)?;
+        ensure_same_directory(&descriptor, &lexical)?;
+        let state = Self {
+            path: canonical_path,
             inherited_directory: Some(Arc::new(descriptor)),
-        })
+            anchored_lexical_chain: Some(chain.into()),
+        };
+        Ok(state)
     }
 
     #[cfg(not(target_os = "linux"))]
@@ -96,39 +130,66 @@ impl StateDirectory {
         directory: &File,
         canonical_path: &Path,
     ) -> anyhow::Result<Self> {
-        Ok(Self {
-            path: canonical_path.to_path_buf(),
-            inherited_directory: Some(Arc::new(directory.try_clone()?)),
-        })
+        let canonical_path = std::fs::canonicalize(canonical_path)?;
+        let retained = directory.try_clone()?;
+        let (lexical, chain) = open_lexical_directory(&canonical_path)?;
+        ensure_same_directory(&retained, &lexical)?;
+        let state = Self {
+            path: canonical_path,
+            inherited_directory: Some(Arc::new(retained)),
+            anchored_lexical_chain: Some(chain.into()),
+        };
+        Ok(state)
     }
 
     pub fn path(&self) -> &Path {
         &self.path
     }
 
-    /// Clones the already-retained identity-selected directory. Explicit
-    /// development configurations still open their path with `O_NOFOLLOW` so
-    /// a sibling subsystem can use the same descriptor-relative discipline.
+    /// Clones the already-retained identity-selected directory after proving
+    /// that a fresh no-follow traversal of the canonical pathname still names
+    /// that directory. Explicit development configurations return the freshly
+    /// opened pathname descriptor.
     pub(crate) fn try_clone_directory(&self) -> std::io::Result<File> {
         match &self.inherited_directory {
-            Some(directory) => directory.try_clone(),
-            None => {
-                let mut options = OpenOptions::new();
-                options.read(true).custom_flags(
-                    libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC | libc::O_NONBLOCK,
-                );
-                options.open(&self.path)
+            Some(directory) => {
+                let retained = directory.try_clone()?;
+                self.try_reopen_directory()?;
+                Ok(retained)
             }
+            None => open_unanchored_directory(&self.path),
         }
     }
 
-    /// Revalidates the contract immediately before runtime construction. The
-    /// descriptor is deliberately not `CLOEXEC`; Rust `Command` therefore
-    /// preserves the same number for all blockd, Guest, and VMM children.
+    /// Freshly reopens the canonical pathname and, for an anchored state
+    /// directory, proves it still names the retained directory. Callers keep
+    /// this descriptor when they need to close a later lexical ABA window.
+    pub(crate) fn try_reopen_directory(&self) -> std::io::Result<File> {
+        if self.anchored_lexical_chain.is_none() {
+            return open_unanchored_directory(&self.path);
+        }
+        let (lexical, chain) = open_lexical_directory(&self.path)?;
+        if let Some(expected) = &self.anchored_lexical_chain {
+            if expected.as_ref() != chain.as_slice() {
+                return Err(io::Error::other(
+                    "canonical Node state directory ancestor chain changed identity",
+                ));
+            }
+        }
+        if let Some(retained) = &self.inherited_directory {
+            ensure_same_directory(retained, &lexical)?;
+        }
+        Ok(lexical)
+    }
+
+    /// Revalidates the canonical/retained identity immediately before runtime
+    /// construction. The descriptor remains non-`CLOEXEC` for legacy direct
+    /// children, but manager-spawned services consume only canonical paths.
     pub fn ensure_child_inheritance(&self) -> anyhow::Result<()> {
         let Some(directory) = &self.inherited_directory else {
             return Ok(());
         };
+        self.try_reopen_directory().map_err(anyhow::Error::from)?;
         #[cfg(target_os = "linux")]
         {
             // SAFETY: `directory` owns a live descriptor and `F_GETFD` has no
@@ -173,6 +234,104 @@ impl From<PathBuf> for StateDirectory {
     }
 }
 
+fn open_unanchored_directory(path: &Path) -> io::Result<File> {
+    let mut options = OpenOptions::new();
+    options
+        .read(true)
+        .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC | libc::O_NONBLOCK);
+    options.open(path)
+}
+
+fn open_lexical_directory(path: &Path) -> io::Result<(File, Vec<DirectoryIdentity>)> {
+    if !path.is_absolute() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "Node state directory path must be absolute",
+        ));
+    }
+    let mut options = OpenOptions::new();
+    options
+        .read(true)
+        .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC | libc::O_NONBLOCK);
+    let mut directory = options.open(Path::new("/"))?;
+    let mut chain = vec![directory_identity(&directory)?];
+    for component in path.components() {
+        match component {
+            Component::RootDir => {}
+            Component::Normal(name) => {
+                let name = CString::new(name.as_bytes()).map_err(|_| {
+                    io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        "Node state directory component contains NUL",
+                    )
+                })?;
+                loop {
+                    // SAFETY: `directory` owns a live directory descriptor and
+                    // `name` remains NUL-terminated for this call. A successful
+                    // descriptor is transferred exactly once into `File`.
+                    let descriptor = unsafe {
+                        libc::openat(
+                            directory.as_raw_fd(),
+                            name.as_ptr(),
+                            libc::O_RDONLY
+                                | libc::O_DIRECTORY
+                                | libc::O_NOFOLLOW
+                                | libc::O_CLOEXEC
+                                | libc::O_NONBLOCK,
+                        )
+                    };
+                    if descriptor >= 0 {
+                        // SAFETY: `openat` returned one fresh owned descriptor.
+                        directory = unsafe { File::from_raw_fd(descriptor) };
+                        chain.push(directory_identity(&directory)?);
+                        break;
+                    }
+                    let source = io::Error::last_os_error();
+                    if source.kind() != io::ErrorKind::Interrupted {
+                        return Err(source);
+                    }
+                }
+            }
+            Component::CurDir | Component::ParentDir | Component::Prefix(_) => {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "Node state directory path is not canonical",
+                ));
+            }
+        }
+    }
+    Ok((directory, chain))
+}
+
+fn directory_identity(directory: &File) -> io::Result<DirectoryIdentity> {
+    let metadata = directory.metadata()?;
+    if !metadata.file_type().is_dir() || metadata.ino() == 0 {
+        return Err(io::Error::other(
+            "Node state directory component is not one stable directory",
+        ));
+    }
+    Ok(DirectoryIdentity {
+        device: metadata.dev(),
+        inode: metadata.ino(),
+    })
+}
+
+fn ensure_same_directory(retained: &File, lexical: &File) -> io::Result<()> {
+    let retained = retained.metadata()?;
+    let lexical = lexical.metadata()?;
+    if retained.file_type().is_dir()
+        && lexical.file_type().is_dir()
+        && retained.dev() == lexical.dev()
+        && retained.ino() == lexical.ino()
+    {
+        Ok(())
+    } else {
+        Err(io::Error::other(
+            "canonical Node state directory no longer names the retained inode",
+        ))
+    }
+}
+
 #[cfg(target_os = "linux")]
 fn duplicate_to_reserved_fd(directory: &File, reserved: RawFd) -> anyhow::Result<File> {
     // `F_DUPFD` atomically claims the lowest unused descriptor at or above the
@@ -200,8 +359,8 @@ fn duplicate_to_reserved_fd(directory: &File, reserved: RawFd) -> anyhow::Result
 
 #[cfg(target_os = "linux")]
 fn duplicate_inheritable(directory: &File, minimum: RawFd) -> anyhow::Result<File> {
-    // `F_DUPFD` intentionally clears `FD_CLOEXEC`; `F_DUPFD_CLOEXEC` would
-    // break every `/proc/self/fd/<fd>` argument after child exec.
+    // Match the production reservation's inheritance invariant while tests
+    // allocate distinct descriptor numbers and run concurrently.
     // SAFETY: the source descriptor is live and the integer minimum is valid.
     let duplicated = unsafe { libc::fcntl(directory.as_raw_fd(), libc::F_DUPFD, minimum) };
     if duplicated < 0 {
@@ -214,11 +373,12 @@ fn duplicate_inheritable(directory: &File, minimum: RawFd) -> anyhow::Result<Fil
 
 #[cfg(all(test, target_os = "linux"))]
 mod tests {
+    use std::fs::File;
     use std::os::fd::AsRawFd as _;
     use std::os::unix::fs::MetadataExt as _;
     use std::sync::{Arc, Barrier, Mutex};
 
-    use super::{duplicate_to_reserved_fd, PRODUCTION_STATE_DIRECTORY_FD};
+    use super::{duplicate_to_reserved_fd, StateDirectory, PRODUCTION_STATE_DIRECTORY_FD};
 
     static RESERVED_DESCRIPTOR_TEST: Mutex<()> = Mutex::new(());
 
@@ -304,5 +464,49 @@ mod tests {
         let flags = unsafe { libc::fcntl(PRODUCTION_STATE_DIRECTORY_FD, libc::F_GETFD) };
         assert!(flags >= 0);
         assert_eq!(flags & libc::FD_CLOEXEC, 0);
+    }
+
+    #[test]
+    fn anchored_runtime_path_is_canonical_and_rejects_an_ancestor_replacement() {
+        let temp = tempfile::tempdir().expect("create anchored state fixture");
+        let parent = temp.path().join("node");
+        let state = parent.join("state-a");
+        std::fs::create_dir_all(&state).expect("create anchored state directory");
+        let source = File::open(&state).expect("open anchored state directory");
+        let anchored = StateDirectory::from_test_directory(&source, &state)
+            .expect("retain anchored state directory");
+        let canonical = std::fs::canonicalize(&state).expect("canonicalize anchored state path");
+
+        assert_eq!(anchored.path(), canonical);
+        assert!(!anchored.path().starts_with("/proc/self/fd"));
+        assert!(same_file(
+            &anchored
+                .try_clone_directory()
+                .expect("clone retained anchored state directory"),
+            &source
+        ));
+
+        let displaced = temp.path().join("node-displaced");
+        std::fs::rename(&parent, &displaced).expect("displace anchored state parent");
+        std::fs::create_dir(&parent).expect("create replacement state parent");
+        std::fs::rename(displaced.join("state-a"), &state)
+            .expect("move exact state leaf beneath replacement parent");
+        let error = anchored
+            .try_clone_directory()
+            .expect_err("replacement ancestor must fail the lexical proof");
+        assert!(error
+            .to_string()
+            .contains("ancestor chain changed identity"));
+
+        std::fs::rename(&state, displaced.join("state-a"))
+            .expect("return state leaf to retained parent");
+        std::fs::remove_dir(&parent).expect("remove replacement parent");
+        std::fs::rename(&displaced, &parent).expect("restore retained parent");
+        assert!(same_file(
+            &anchored
+                .try_reopen_directory()
+                .expect("restored lexical chain names retained state"),
+            &source
+        ));
     }
 }

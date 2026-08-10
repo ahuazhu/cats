@@ -1226,6 +1226,15 @@ fn validate_launch(launch: &TransientServiceLaunch) -> anyhow::Result<()> {
                 == format!("{CGROUP_ROOT}/{SYSTEM_SLICE}/{}", launch.unit_id.as_str()),
         "invalid transient root-provision service identity"
     );
+    let agent_descriptor_root = Path::new("/proc/self/fd");
+    anyhow::ensure!(
+        !launch.executable.starts_with(agent_descriptor_root)
+            && launch
+                .arguments
+                .iter()
+                .all(|argument| !Path::new(argument).starts_with(agent_descriptor_root)),
+        "manager-spawned service cannot consume an Agent-private descriptor path"
+    );
     Ok(())
 }
 
@@ -1438,8 +1447,14 @@ fn parse_systemd_properties(bytes: &[u8]) -> anyhow::Result<SystemdUnitPropertie
             "systemctl show emitted a duplicate property"
         );
     }
+    // systemd 255 accepts an explicit empty `EnvironmentFile=` transient
+    // property but does not expose `EnvironmentFiles` through `show`. Newer
+    // managers do expose it. Absence therefore has the same meaning as an
+    // empty value here; a nonempty exposed value still conflicts, and the
+    // independent `/proc/<pid>/environ` sample rejects every forbidden key.
+    let environment_files = values.remove("EnvironmentFiles").unwrap_or_default();
     anyhow::ensure!(
-        values.len() == 16,
+        values.len() == 15,
         "systemctl show omitted a fixed property"
     );
     let take = |values: &mut BTreeMap<&str, String>, key| {
@@ -1459,7 +1474,7 @@ fn parse_systemd_properties(bytes: &[u8]) -> anyhow::Result<SystemdUnitPropertie
         control_group: take(&mut values, "ControlGroup")?,
         exec_start: take(&mut values, "ExecStart")?,
         environment: take(&mut values, "Environment")?,
-        environment_files: take(&mut values, "EnvironmentFiles")?,
+        environment_files,
         pass_environment: take(&mut values, "PassEnvironment")?,
         unset_environment: take(&mut values, "UnsetEnvironment")?,
         kill_mode: take(&mut values, "KillMode")?,
@@ -1678,6 +1693,7 @@ struct ListenerPathIdentity {
 #[cfg(target_os = "linux")]
 #[derive(Clone)]
 struct RetainedListenerPath {
+    state_directory: StateDirectory,
     root: Arc<std::fs::File>,
     root_identity: ListenerPathIdentity,
     directories: Vec<RetainedListenerDirectory>,
@@ -1811,6 +1827,7 @@ impl RetainedListenerPath {
         }
         let identity = listener_path_identity(&metadata);
         Ok(RetainedListenerPathInspection::Exact(Self {
+            state_directory: state_directory.clone(),
             root,
             root_identity,
             directories,
@@ -1832,6 +1849,18 @@ impl RetainedListenerPath {
                     .context("reinspect retained serving listener state root")?
             ) == self.root_identity,
             "retained serving listener state root identity changed"
+        );
+        let lexical_root = self
+            .state_directory
+            .try_reopen_directory()
+            .context("reopen lexical serving listener state root")?;
+        anyhow::ensure!(
+            listener_path_identity(
+                &lexical_root
+                    .metadata()
+                    .context("reinspect lexical serving listener state root")?
+            ) == self.root_identity,
+            "serving listener lexical state root no longer names the retained directory"
         );
         let mut current = self.root.try_clone()?;
         for directory in &self.directories {
@@ -3095,6 +3124,193 @@ mod tests {
         );
     }
 
+    /// This regression is intentionally ignored by the portable and ordinary
+    /// Linux-container suites: it must be run as root in a container or Host
+    /// whose PID 1 is a real systemd system manager. It exercises the exact
+    /// manager boundary that an in-process/fake systemd port cannot model.
+    #[cfg(target_os = "linux")]
+    #[test]
+    #[ignore = "requires a Linux systemd system manager as PID 1"]
+    fn anchored_state_root_opens_binds_and_adopts_through_pid1_systemd() {
+        use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
+        use std::os::unix::net::UnixStream;
+
+        assert_eq!(
+            std::fs::read_to_string("/proc/1/comm")
+                .expect("read PID 1 command")
+                .trim(),
+            "systemd",
+            "this regression must run beneath a real systemd PID 1"
+        );
+        // SAFETY: `geteuid` has no arguments and cannot fail.
+        let effective_uid = unsafe { libc::geteuid() };
+        assert_eq!(effective_uid, 0, "system service test needs root");
+
+        let root = tempfile::tempdir().expect("create anchored systemd state root");
+        std::fs::set_permissions(root.path(), std::fs::Permissions::from_mode(0o700))
+            .expect("make anchored state root private");
+        let root_file = std::fs::File::open(root.path()).expect("open anchored state root");
+        let state = StateDirectory::from_test_directory(&root_file, root.path())
+            .expect("retain canonical systemd state root");
+        assert!(!state.path().starts_with("/proc/self/fd"));
+
+        let data_directory = state.path().join("systemd-serving");
+        std::fs::create_dir(&data_directory).expect("create systemd serving directory");
+        std::fs::set_permissions(&data_directory, std::fs::Permissions::from_mode(0o700))
+            .expect("make systemd serving directory private");
+        let data_metadata =
+            std::fs::metadata(&data_directory).expect("inspect exact systemd serving directory");
+        let control_socket = data_directory.join("control.sock");
+        let listener_socket = data_directory.join("listener.sock");
+        let ready_path = data_directory.join("ready");
+
+        let python = std::fs::canonicalize("/usr/bin/python3")
+            .expect("real systemd regression requires /usr/bin/python3");
+        let script = r#"
+import os
+import socket
+import sys
+import time
+
+data, control, listener, ready, expected_dev, expected_ino, token_flag, token = sys.argv[1:]
+if token_flag != "--process-identity-token" or len(token) != 32:
+    raise SystemExit(72)
+directory = os.open(data, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+identity = os.fstat(directory)
+if identity.st_dev != int(expected_dev) or identity.st_ino != int(expected_ino):
+    raise SystemExit(71)
+sockets = []
+for path in (control, listener):
+    endpoint = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    endpoint.bind(path)
+    os.chmod(path, 0o700)
+    endpoint.listen(4)
+    sockets.append(endpoint)
+ready_fd = os.open(ready, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+os.write(ready_fd, str(os.getpid()).encode("ascii"))
+os.fsync(ready_fd)
+os.close(ready_fd)
+while True:
+    time.sleep(1)
+"#;
+        let script_path = data_directory.join("service.py");
+        std::fs::write(&script_path, script).expect("write exact systemd test service");
+        std::fs::set_permissions(&script_path, std::fs::Permissions::from_mode(0o600))
+            .expect("make exact systemd test service private");
+        std::fs::File::open(&script_path)
+            .expect("open exact systemd test service")
+            .sync_all()
+            .expect("sync exact systemd test service");
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("system clock predates epoch")
+            .as_nanos();
+        let unit_id = id(&format!(
+            "cats-state-root-test-{}-{nonce}.service",
+            std::process::id()
+        ));
+        let process_identity_token = random('9');
+        let launch = TransientServiceLaunch {
+            cgroup_path: host(&format!("/sys/fs/cgroup/system.slice/{}", unit_id.as_str())),
+            unit_id: unit_id.clone(),
+            executable: python,
+            arguments: [
+                script_path.as_os_str().to_owned(),
+                data_directory.as_os_str().to_owned(),
+                control_socket.as_os_str().to_owned(),
+                listener_socket.as_os_str().to_owned(),
+                ready_path.as_os_str().to_owned(),
+                OsString::from(data_metadata.dev().to_string()),
+                OsString::from(data_metadata.ino().to_string()),
+                OsString::from("--process-identity-token"),
+                OsString::from(process_identity_token.as_str()),
+            ]
+            .into(),
+            process_identity_token,
+        };
+        assert!(
+            launch
+                .expected_command_line()
+                .iter()
+                .all(|argument| !argument.to_string_lossy().contains("/proc/self/fd")),
+            "PID 1 launch must contain only canonical state paths"
+        );
+
+        struct StopTransientUnit(Id);
+        impl Drop for StopTransientUnit {
+            fn drop(&mut self) {
+                let mut command = Command::new(SYSTEMCTL);
+                sanitized_systemd_command(&mut command);
+                let _ = command
+                    .args(["--system", "--no-ask-password", "stop", self.0.as_str()])
+                    .status();
+            }
+        }
+        let _cleanup = StopTransientUnit(unit_id);
+        let systemd = PlatformSystemdTransientService;
+        assert_eq!(
+            systemd
+                .submit(&launch, &context_for(Duration::from_secs(30)))
+                .expect("submit anchored service through PID 1"),
+            SystemdStartSubmission::Submitted
+        );
+
+        let deadline = Instant::now() + Duration::from_secs(20);
+        let proof = loop {
+            if let Ok(bytes) = std::fs::read(&ready_path) {
+                let ready_pid = std::str::from_utf8(&bytes)
+                    .expect("ready PID is UTF-8")
+                    .parse::<u32>()
+                    .expect("ready PID is a u32");
+                match systemd
+                    .inspect(&launch, &context_for(Duration::from_secs(5)))
+                    .expect("inspect anchored systemd service")
+                {
+                    SystemdInspection::Exact(proof) if proof.process_id == ready_pid => {
+                        break proof
+                    }
+                    SystemdInspection::Starting | SystemdInspection::Unavailable => {}
+                    other => panic!("anchored service did not become exact: {other:?}"),
+                }
+            }
+            assert!(
+                Instant::now() < deadline,
+                "anchored systemd service did not publish readiness"
+            );
+            std::thread::sleep(POLL_INTERVAL);
+        };
+
+        state
+            .try_reopen_directory()
+            .expect("canonical state root remains the retained root after launch");
+        UnixStream::connect(&control_socket).expect("connect canonical control socket");
+        let frontend = cats_api::runtime_reconciliation::PrepareDeviceFrontend::KernelNbd {
+            listener_socket_path: host(listener_socket.to_str().expect("listener path is UTF-8")),
+            device_path: host("/dev/nbd0"),
+        };
+        let listener = match platform_listener_peer(
+            &state,
+            &frontend,
+            proof.process_id,
+            &context_for(Duration::from_secs(5)),
+        )
+        .expect("inspect anchored systemd listener")
+        {
+            ListenerPeerInspection::Exact(listener) => listener,
+            other => panic!("anchored listener did not prove exact: {other:?}"),
+        };
+        listener
+            .assert_current(&frontend, &context_for(Duration::from_secs(5)))
+            .expect("anchored listener remains current");
+
+        // A fresh stateless port represents the replacement Agent adopting
+        // the already-running manager-owned service from exact unit/proc facts.
+        let adopted = PlatformSystemdTransientService
+            .inspect(&launch, &context_for(Duration::from_secs(5)))
+            .expect("replacement Agent inspects manager-owned service");
+        assert_eq!(adopted, SystemdInspection::Exact(proof));
+    }
+
     #[cfg(target_os = "linux")]
     #[test]
     fn serving_listener_probe_does_not_consume_the_real_vhost_connection() {
@@ -3341,6 +3557,25 @@ mod tests {
     }
 
     #[test]
+    fn manager_launch_rejects_every_agent_private_descriptor_path() {
+        let mut argument = build_launch(&config(), &expectation()).unwrap();
+        argument
+            .arguments
+            .push(OsString::from("/proc/self/fd/198/runtime/cat-1"));
+        assert!(validate_launch(&argument)
+            .unwrap_err()
+            .to_string()
+            .contains("Agent-private descriptor path"));
+
+        let mut executable = build_launch(&config(), &expectation()).unwrap();
+        executable.executable = PathBuf::from("/proc/self/fd/198/cats-blockd");
+        assert!(validate_launch(&executable)
+            .unwrap_err()
+            .to_string()
+            .contains("Agent-private descriptor path"));
+    }
+
+    #[test]
     fn fixed_systemctl_properties_distinguish_absent_and_exact_running_unit() {
         let absent = parse_systemd_properties(
             b"Id=cats-root.service\nLoadState=not-found\nActiveState=inactive\nSubState=dead\nMainPID=0\nControlGroup=\nExecStart=\nEnvironment=\nEnvironmentFiles=\nPassEnvironment=\nUnsetEnvironment=\nKillMode=control-group\nRestart=no\nUMask=0022\nTimeoutStopUSec=1min 30s\nCollectMode=inactive\n",
@@ -3354,6 +3589,11 @@ mod tests {
         )
         .unwrap();
         assert!(running.is_running(&launch));
+        let systemd_255 = parse_systemd_properties(
+            b"Id=cats-root.service\nLoadState=loaded\nActiveState=active\nSubState=running\nMainPID=4242\nControlGroup=/system.slice/cats-root.service\nExecStart={ path=/usr/bin/cats-blockd ; argv[]=/usr/bin/cats-blockd --process-identity-token 44444444444444444444444444444444 ; }\nEnvironment=\nPassEnvironment=\nUnsetEnvironment=AWS_ACCESS_KEY_ID AWS_SECRET_ACCESS_KEY AWS_SESSION_TOKEN AWS_CONTAINER_CREDENTIALS_FULL_URI AWS_CONTAINER_AUTHORIZATION_TOKEN_FILE CATS_POSTGRES_URL CATS_CRASH_POINT\nKillMode=control-group\nRestart=no\nUMask=0077\nTimeoutStopUSec=2s\nCollectMode=inactive-or-failed\n",
+        )
+        .unwrap();
+        assert!(systemd_255.is_running(&launch));
 
         let wrong_token = parse_systemd_properties(
             b"Id=cats-root.service\nLoadState=loaded\nActiveState=active\nSubState=running\nMainPID=4242\nControlGroup=/system.slice/cats-root.service\nExecStart={ path=/usr/bin/cats-blockd ; argv[]=/usr/bin/cats-blockd --process-identity-token 55555555555555555555555555555555 ; }\nEnvironment=\nEnvironmentFiles=\nPassEnvironment=\nUnsetEnvironment=AWS_ACCESS_KEY_ID AWS_SECRET_ACCESS_KEY AWS_SESSION_TOKEN AWS_CONTAINER_CREDENTIALS_FULL_URI AWS_CONTAINER_AUTHORIZATION_TOKEN_FILE CATS_POSTGRES_URL CATS_CRASH_POINT\nKillMode=control-group\nRestart=no\nUMask=0077\nTimeoutStopUSec=2s\nCollectMode=inactive-or-failed\n",
