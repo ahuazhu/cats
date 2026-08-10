@@ -20,6 +20,10 @@ receipt paths和该composition合同必须同时满足。
 `/v1/nodes/register`兼容路由、shared service/admin bearer fallback、双写、协商、动态receipt catalog或
 provider-principal fallback。
 
+A19 wire和`AgentSession`有意不携带Node transport target。Gateway可达地址只来自A23
+`NodePlacementPolicy.node_transport_target`的fleet/admin apply；Node registration、observation、来源IP、hostname
+或legacy `nodes.agent_url`都不能自报、覆盖或补出该authority。
+
 ## 1. Authority boundary 与固定常量
 
 | 项目 | V1唯一值 |

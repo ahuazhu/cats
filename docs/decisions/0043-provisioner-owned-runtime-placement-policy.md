@@ -19,8 +19,8 @@ Node自报或本地配置，无法阻止Node给自己扩容/uncordon，多Contro
 ## 决策
 
 1. provisioner通过版本化、CAS的`NodePlacementPolicy`唯一声明Node调度状态、allocatable vCPU/bytes、closed
-   production capabilities和Host-local aligned private `/16`。policy与provisioned NodeIdentity一对一绑定；
-   Node credential、heartbeat、observation、legacy row和环境/fixture不能写它。
+   production capabilities、Host-local aligned private `/16`和strict HTTPS Node transport target。policy与provisioned NodeIdentity一对一绑定；
+   Node credential、heartbeat、observation、legacy row（包括`nodes.agent_url`）和环境/fixture不能写它。
 2. 自动化provisioner使用deployment-scoped Ed25519签名，private key只在central IaC；人类变更另可使用
    ADR-0006 admin Organization中current active membership且含exact `cats:fleet:admin` permission的WorkOS身份；
    每次apply都online验证，不信任sealed stale session。两者进入同一个typed principal和apply

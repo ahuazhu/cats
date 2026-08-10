@@ -38,7 +38,9 @@ lookup index 和 Operation 在一个 PostgreSQL transaction 内提交。lookup i
 revision，不是第二份 route authority。
 
 Signer在一个PostgreSQL transaction snapshot中重新闭合Endpoint binding、Running desired、
-placement和current AgentSession。该session必须有fresh `AdmissionInventoryAttestation`；最新
+placement、current provisioned NodeIdentity、A23 policy中的strict HTTPS Node transport target和current AgentSession。
+target只由fleet/admin apply写入，registration/observation与legacy `nodes.agent_url`不能覆盖或fallback。
+该session必须有fresh `AdmissionInventoryAttestation`；最新
 per-Cat accepted observation引用同一inventory epoch，并报告applied revision、runtime incarnation、
 platform Ready、installed Endpoint gate，且active signer `kid`属于`loaded_kids`。两类freshness都使用
 PostgreSQL `accepted_at_unix_ms`。partial heartbeat不能覆盖full attestation。任一事实不成立就不签发；

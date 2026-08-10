@@ -106,22 +106,25 @@ revision，必须走全局close-and-drain；之后重开全部受影响Endpoint�
 
 1. canonical hostname index 与当前 Endpoint binding 指向同一 current desired revision；
 2. desired target 为 Running，placement node/epoch 是当前值；
-3. 当前`AgentSession`精确属于该node、Host/boot/agent instance；
-4. 该session有fresh `AdmissionInventoryAttestation {inventory_epoch, inventory_digest,
+3. current NodeIdentity是provisioned，且A23 current `NodePlacementPolicy.node_id`与identity、desired placement
+   逐字段相同；同一policy给出strict canonical `node_transport_target`。缺policy或JSON/projection不一致是stored
+   corruption；registration/observation与legacy `nodes.agent_url`不能提供fallback；
+4. 当前`AgentSession`精确属于该node、Host/boot/agent instance；
+5. 该session有fresh `AdmissionInventoryAttestation {inventory_epoch, inventory_digest,
    inventory_read_position,
    accepted_at_unix_ms}`；它来自accepted full scan，完整schema与digest算法以
    [Runtime Reconciliation v1](runtime-reconciliation-v1.md) §2/§16为准，
    后续partial observation不能覆盖；fresh精确使用
    [Inventory Spine §7.2](runtime-inventory-observation-v1.md#72-route-signer-freshness)的同一DB-now与
    `accepted_at <= db_now < accepted_at + 60000ms`，右边界相等已过期；
-5. 最新per-Cat accepted observation属于该session、引用同一inventory epoch，且其PostgreSQL
+6. 最新per-Cat accepted observation属于该session、引用同一inventory epoch，且其PostgreSQL
    `accepted_at_unix_ms`满足同一DB-now的
    `accepted_at <= db_now < accepted_at + 30000ms`，右边界相等已过期；freshness只使用数据库时间，
    不信Node上报时钟；
-6. observation 的 applied revision、placement、runtime incarnation、Running/Ready condition 与
+7. observation 的 applied revision、placement、runtime incarnation、Running/Ready condition 与
    desired 完全一致；
-7. observation 报告同Endpoint gate Active、同route epoch/protocol/port；
-8. observation的ring version/digest均非null、按精确`loaded_kids`重算匹配，且当前signer `kid`出现
+8. observation 报告同Endpoint gate Active、同route epoch/protocol/port；
+9. observation的ring version/digest均非null、按精确`loaded_kids`重算匹配，且当前signer `kid`出现
    在该Node原子加载并ACK的`loaded_kids`中；Runtime合同的unavailable或empty-but-valid ring都不签发。
 
 Signer 以同一 snapshot 的数据库时间生成 `iat/nbf/exp`。任何条件不成立都返回
@@ -160,7 +163,7 @@ canonical hostname -> {
 ```
 
 Control Plane 的 authenticated resolve response 显式返回 expiry；Gateway 不解析或改写 claims。
-Node transport target 只是 hint，最终 authority 仍是 Node gate。
+`node_transport_target`逐byte使用A23的canonical HTTPS authority string。它只是hint，最终authority仍是Node gate。
 
 cache 必须是有界状态机：
 

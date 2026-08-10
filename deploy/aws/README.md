@@ -117,6 +117,15 @@ worker name, advertise address and IMDS are not registration identity. The share
 closed layout and manifest defined by the composition contract; Control and worker artifacts must report one
 matching immutable release ID before either can be deployed.
 
+The same central provisioner must put the reviewed private-DNS Node listener into the A23 policy as canonical
+`node_transport_target` (`https://<lowercase-dns-name>:<explicit-port>`). It is generated from fleet/IaC inventory,
+not from worker registration, observation, IMDS, the listener source address, or legacy `nodes.agent_url`.
+Changing it uses an A23 policy revision while the Node is cordoned and has no assigned Desired runtimes; credential
+rotation preserves it, and retirement makes it unavailable to the Route Grant v2 signer.
+This contract moves the exact clean-slate Control Store schema to version 12. An existing version-11 schema is not
+altered in place and refuses startup; provision or recreate an empty version-12 schema before starting any new
+Control replica, with no mixed-version rolling window.
+
 Every Host-side worker mutation runs under the single
 `/run/lock/cats/worker-deployment.lock` descriptor. The Guest activation journal remains durable across binary,
 configuration, unit and seed replacement, candidate start and registration-backed readiness; only then is it

@@ -61,7 +61,8 @@ NodePlacementPolicy {
   allocatable_vcpus: integer 1..=4294967295,
   allocatable_memory_bytes: integer 1..=9223372036854775807,
   capabilities: RuntimePlacementCapabilities,
-  guest_ipv4_pool: GuestIpv4Pool
+  guest_ipv4_pool: GuestIpv4Pool,
+  node_transport_target: NodeTransportTarget
 }
 
 RuntimePlacementCapabilities {
@@ -78,7 +79,15 @@ GuestIpv4Pool {
   network_address: Ipv4Address,
   prefix_length: 16
 }
+
+NodeTransportTarget = canonical string "https://<hostname>:<port>"
 ```
+
+`NodeTransportTarget`是1..=512 ASCII octets的strict HTTPS authority。`hostname`逐byte满足Runtime
+`Hostname`（lowercase ASCII DNS，且不能是canonical或decimal/octal/hex缩写IPv4 number）；`port`必须显式存在、为
+`1..=65535`的canonical十进制且无前导零。userinfo、path（包括`/`）、query、fragment、尾斜杠、默认端口
+省略、IP literal、uppercase scheme/host和任何URL normalization一律拒绝。它只给Gateway定位加密、
+machine-authenticated Node hop；Node本地gate仍是Route authority，TLS/workload identity不编码进这个hint。
 
 `network_address`必须是 prefix `/16` 的 network address，低 16 bit 全零，并且整个 `/16`完全位于
 `10.0.0.0/8`、`172.16.0.0/12`或`192.168.0.0/16`之一。broadcast、link-local、CGNAT、documentation、
@@ -100,9 +109,12 @@ provision原子写两者，provisioned identity缺policy是stored corruption并�
 NodeIdentity的immutable Host/state-path lineage继续以ADR-0040/A19a为权威，policy不能改写它。
 持久logical row就是§1完整`NodePlacementPolicy`，没有另一个mutable capacity/schedulable projection；物理列若
 为查询复制revision/state，Store每次读取必须与closed policy逐字段相等，任何差异使replica unready。
+新增的required transport-target JSON/projection与exact catalog CHECK属于clean-slate authority schema 12；
+version 11不做in-place ALTER，startup必须拒绝并要求operator创建空的version-12 schema。
 
 policy只有本文件§3的node-authority apply transaction能创建或更新。Node的A19 credential、AgentSession、
 Desired/observation handler、heartbeat、legacy admin/service token、部署环境变量和测试fixture都没有写权限。
+特别地，A19 registration/observation不携带或覆盖`node_transport_target`；legacy `nodes.agent_url`不是fallback。
 Node可以报告实际能力不足并让当前 Operation 进入既有 `PlacementRejected`，但报告不能提高capacity、改变
 pool或把自己从`cordoned`变成`schedulable`。
 
@@ -115,7 +127,7 @@ revision规则如下：
    `policy_revision`必须是checked `N+1`。耗尽拒绝，不归零。
 3. `schedulable -> cordoned`可以在仍有assigned Desired时提交；它只停止新placement，不迁移、不停止现有
    Cat。drain仍通过ADR-0040完整Desired revision完成。
-4. `allocatable_*`、`capabilities`或`guest_ipv4_pool`任一变化，只允许current和new policy均为
+4. `allocatable_*`、`capabilities`、`guest_ipv4_pool`或`node_transport_target`任一变化，只允许current和new policy均为
    `cordoned`，并且锁后current assigned Desired集合为空。`cordoned -> schedulable`只允许这些静态字段与
    current policy逐字段相同；它仍要求后续planner独立通过fresh A20 admission。
 5. 相同Node换`guest_ipv4_pool`必须先cordon并drain到assigned set为空。以后任何指向该policy revision的
@@ -1079,12 +1091,12 @@ idempotency envelope；不得默认复用Cat-create key。
 **Policy：**
 
 ```json
-{"allocatable_memory_bytes":17179869184,"allocatable_vcpus":8,"capabilities":{"block_frontend":"kernel_nbd","guest_agent_protocol_version":1,"guest_config_digest":"sha256:78215611e8c3bd683eb542b5696a6316156365a94624c7521446ab5660d067e2","guest_network":"isolated_ipv4","guest_transport":"vsock","vmm":"cloud_hypervisor"},"guest_ipv4_pool":{"kind":"private_ipv4_16","network_address":"10.240.0.0","prefix_length":16},"node_id":"node_a","policy_revision":1,"scheduling_state":"cordoned","version":1}
+{"allocatable_memory_bytes":17179869184,"allocatable_vcpus":8,"capabilities":{"block_frontend":"kernel_nbd","guest_agent_protocol_version":1,"guest_config_digest":"sha256:78215611e8c3bd683eb542b5696a6316156365a94624c7521446ab5660d067e2","guest_network":"isolated_ipv4","guest_transport":"vsock","vmm":"cloud_hypervisor"},"guest_ipv4_pool":{"kind":"private_ipv4_16","network_address":"10.240.0.0","prefix_length":16},"node_id":"node_a","node_transport_target":"https://node-a.internal:7301","policy_revision":1,"scheduling_state":"cordoned","version":1}
 ```
 
 ```text
-policy_octets = 497
-policy_sha256 = sha256:e6f9c7b26334e4728119a96a40579f8f6ba3862c557160eb078cbc97428ab620
+policy_octets = 552
+policy_sha256 = sha256:fdfcf8bb96ab5ba124aeeaff498eb4bbd88eeda2e0afd2cf0ab188778e67464e
 ```
 
 **Provisioner active set 与revisioned trust bundle：**
@@ -1141,15 +1153,15 @@ provisioner_principal_sha256 = sha256:407a741259f6155606c029218830fce0319cd6884e
 **Update-policy apply/result：**
 
 ```json
-{"apply_id":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","mutation":{"expected_policy_revision":1,"kind":"update_policy","placement_policy":{"allocatable_memory_bytes":17179869184,"allocatable_vcpus":8,"capabilities":{"block_frontend":"kernel_nbd","guest_agent_protocol_version":1,"guest_config_digest":"sha256:78215611e8c3bd683eb542b5696a6316156365a94624c7521446ab5660d067e2","guest_network":"isolated_ipv4","guest_transport":"vsock","vmm":"cloud_hypervisor"},"guest_ipv4_pool":{"kind":"private_ipv4_16","network_address":"10.240.0.0","prefix_length":16},"node_id":"node_a","policy_revision":2,"scheduling_state":"schedulable","version":1}},"node_id":"node_a","version":1}
+{"apply_id":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","mutation":{"expected_policy_revision":1,"kind":"update_policy","placement_policy":{"allocatable_memory_bytes":17179869184,"allocatable_vcpus":8,"capabilities":{"block_frontend":"kernel_nbd","guest_agent_protocol_version":1,"guest_config_digest":"sha256:78215611e8c3bd683eb542b5696a6316156365a94624c7521446ab5660d067e2","guest_network":"isolated_ipv4","guest_transport":"vsock","vmm":"cloud_hypervisor"},"guest_ipv4_pool":{"kind":"private_ipv4_16","network_address":"10.240.0.0","prefix_length":16},"node_id":"node_a","node_transport_target":"https://node-a.internal:7301","policy_revision":2,"scheduling_state":"schedulable","version":1}},"node_id":"node_a","version":1}
 ```
 
 ```text
-apply_octets = 663
-apply_sha256 = sha256:1934e94054f59ea3f20de3232a9783448943e76c664f94977d93c490459fa702
-signed_request_octets = 204
-signed_request_sha256 = sha256:3441dcc9b166491330f9b2579919c04779c2842180929cbc3cbef5db23bd05f0
-Cats-Provisioner-Signature = ZqMEaH3fIxcNWG5CExvV4nHOSk7OEQORKctt-z9R_naZm2s0OM64IGOAHr_5hhNdl2SZ1CeUBCKNX1t-O-wyAg
+apply_octets = 718
+apply_sha256 = sha256:b03395b52d23522f5c549493b82c5d00f1b4ee102dbbe27770c475509cf36d21
+signed_request_octets = 259
+signed_request_sha256 = sha256:4c67c5a92e987723f0e64e1468ca77a7ddcac6ea4f06d12c85444e9050fb939e
+Cats-Provisioner-Signature = 2e7RW-nONH8NAPi7tPQeVdiOCRG0fUKI9OMO6MxjwvmPLPdefC2DWPwvDC-lE6BQ2XzFdZEoKcgb4LCo_MBXAA
 ```
 
 signature使用A19 §4.4同一个RFC 8032 test seed；只用于测试，绝不能部署。

@@ -360,7 +360,8 @@ Endpoint 的 Running 数据路径不逐请求访问控制面：
 1. 公网请求只按canonical hostname查Endpoint；Workspace身份用于管理API，不强加给用户应用。
 2. 控制面只为 `Ready/Running` 的精确observation签发短期Route Grant；Ready证明Guest网络、
    runtime和磁盘mount，不要求应用端口已监听。
-3. Gateway把Grant连同Control Plane验证过的Node transport target放入有界per-replica cache；
+3. Gateway把Grant连同Control Plane在同一snapshot从fleet/admin-owned A23 policy验证过的strict HTTPS
+   Node transport target放入有界per-replica cache；registration/observation与legacy `nodes.agent_url`不能覆盖；
    Grant保持不透明，Gateway到Control Plane和Node使用认证且加密的机器连接。
 4. Node验证签名、时间、Workspace/Endpoint/Cat/Node、runtime incarnation、per-Endpoint route
    epoch、hostname、协议和端口。desired revision留在signer current-state snapshot，不进入Grant。

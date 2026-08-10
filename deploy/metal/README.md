@@ -63,6 +63,13 @@ Control additionally requires the provisioner-owned root:root 0644 regular file
 `--runtime-provisioner-trust-file` argument. The unit's 35-second stop timeout
 leaves the fixed 30-second A23 commit-resolution join window intact.
 
+Each initial cordoned A23 policy also carries the operator-reviewed canonical
+`node_transport_target` (`https://<lowercase-dns-name>:<explicit-port>`). The deployment provisioner/admin owns
+that value; `cats-noded`, its observation, source address and legacy `nodes.agent_url` cannot publish or override it.
+Rotate the target only through a successor policy while the Node is cordoned and has no assigned Desired runtimes.
+The matching Control rollout requires exact clean-slate Store schema version 12; version 11 is rejected rather than
+altered in place, so create or recreate the empty version-12 schema before any new Control replica starts.
+
 The installer holds one `/run/lock/cats/worker-deployment.lock` descriptor from Node stop through every installed
 mutation, candidate registration-backed readiness and Guest release commit. An interrupted transaction restores
 the exact previous Guest set but deliberately leaves the Node stopped and its journal retained; rerun the full
