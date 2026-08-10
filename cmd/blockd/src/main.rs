@@ -10,9 +10,14 @@ use std::time::{Duration, Instant};
 
 use anyhow::{bail, Context, Result};
 use cats_api::blockd::{BlockdControlCommand, BlockdControlResponse};
-use cats_api::runtime_reconciliation::{Id, RandomId128};
+use cats_api::runtime_reconciliation::{Id, RandomId128, Sha256Digest};
 use cats_blockd::engine::{ChunkEngine, EngineConfig, ProvisionRootImageEffectError};
 use cats_blockd::nbd;
+use cats_blockd::target_control::{
+    decode_target_control_authorization, target_control_authorization_file_name,
+    StableDirectoryIdentity, StableFileIdentity, TargetControlAuthorizationArtifact,
+    TARGET_CONTROL_AUTHORIZATION_MAX_BYTES,
+};
 use cats_metadata_store_postgres::{PostgresMetadataStoreFactory, PostgresVolumeDataAuthority};
 use cats_metadata_store_sqlite::SqliteMetadataStoreFactory;
 use cats_object_store_aws_s3::AwsS3BlobStoreFactory;
@@ -51,6 +56,28 @@ struct Args {
     /// frontend.
     #[arg(long, value_name = "PATH", requires = "control_only")]
     authorized_control_spec: Option<PathBuf>,
+
+    /// Target-head wrapper for restarting or adopting the exact root-provision
+    /// control process after its generation-one CAS. This is never a serving
+    /// grant and is mutually exclusive with the blank control input.
+    #[arg(long, value_name = "PATH", requires = "control_only")]
+    authorized_target_control_spec: Option<PathBuf>,
+
+    /// Exact provision transition expected inside the target-control wrapper.
+    #[arg(
+        long,
+        value_name = "RANDOM_ID_128",
+        requires = "authorized_target_control_spec"
+    )]
+    provision_transition_id: Option<String>,
+
+    /// Stable RuntimeCheckpoint authorization context expected in the wrapper.
+    #[arg(
+        long,
+        value_name = "SHA256",
+        requires = "authorized_target_control_spec"
+    )]
+    provision_root_authorization_context_digest: Option<String>,
 
     /// Exact transient-unit identity already fsynced by Runtime.
     #[arg(long, value_name = "ID")]
@@ -278,6 +305,204 @@ fn read_authorized_serving_attachment(path: &Path) -> Result<AuthorizedServingAt
     Ok(attachment)
 }
 
+struct TargetControlExpectation<'a> {
+    data_dir: &'a Path,
+    volume_id: &'a str,
+    attachment_id: &'a str,
+    attachment_epoch: i64,
+    provision_transition_id: &'a RandomId128,
+    provision_context_digest: &'a Sha256Digest,
+    runtime_scope_id: &'a Id,
+    control_socket_path: &'a Path,
+}
+
+fn read_target_control_authorization(
+    path: &Path,
+    expected: &TargetControlExpectation<'_>,
+) -> Result<TargetControlAuthorizationArtifact> {
+    let mut file = std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW)
+        .open(path)
+        .with_context(|| format!("open target-control authorization {}", path.display()))?;
+    let before = file
+        .metadata()
+        .with_context(|| format!("inspect target-control authorization {}", path.display()))?;
+    let before_identity = LocalFileMetadata::from_metadata(&before);
+    if !before.file_type().is_file()
+        || before.nlink() != 1
+        || before.uid() != effective_uid()
+        || before.mode() & 0o777 != 0o600
+        || before.len() > TARGET_CONTROL_AUTHORIZATION_MAX_BYTES as u64
+    {
+        bail!(
+            "target-control authorization {} is not one bounded regular file",
+            path.display()
+        );
+    }
+    let mut bytes = Vec::with_capacity(before.len() as usize);
+    std::io::Read::by_ref(&mut file)
+        .take(TARGET_CONTROL_AUTHORIZATION_MAX_BYTES as u64 + 1)
+        .read_to_end(&mut bytes)
+        .with_context(|| format!("read target-control authorization {}", path.display()))?;
+    if bytes.len() > TARGET_CONTROL_AUTHORIZATION_MAX_BYTES {
+        bail!(
+            "target-control authorization exceeds {} bytes",
+            TARGET_CONTROL_AUTHORIZATION_MAX_BYTES
+        );
+    }
+    let after = file
+        .metadata()
+        .with_context(|| format!("reinspect target-control authorization {}", path.display()))?;
+    if before_identity != LocalFileMetadata::from_metadata(&after) {
+        bail!("target-control authorization changed while it was read");
+    }
+    let artifact = decode_target_control_authorization(&bytes)
+        .context("decode target-control authorization")?;
+    let expected_name = target_control_authorization_file_name(expected.provision_transition_id);
+    let expected_epoch = u64::try_from(expected.attachment_epoch)
+        .context("--attachment-epoch is negative for target-control authorization")?;
+    if artifact.provision_transition_id != *expected.provision_transition_id
+        || artifact.provision_context_digest.as_sha256_digest() != expected.provision_context_digest
+        || artifact.runtime_scope_id != *expected.runtime_scope_id
+        || Path::new(artifact.control_socket_path.as_str()) != expected.control_socket_path
+        || path.file_name().and_then(|name| name.to_str()) != Some(expected_name.as_str())
+        || path.parent() != Some(expected.data_dir)
+        || Path::new(artifact.local_state.attachment_directory.path.as_str()) != expected.data_dir
+        || artifact.attachment.identity.volume_id.as_str() != expected.volume_id
+        || artifact.attachment.identity.attachment_id.as_str() != expected.attachment_id
+        || artifact.attachment.identity.attachment_epoch.get() != expected_epoch
+    {
+        bail!(
+            "target-control authorization does not match its transition, stable checkpoint context, process binding, path, or attachment context"
+        );
+    }
+    validate_target_local_directory(&artifact.local_state.state_directory)?;
+    validate_target_local_directory(&artifact.local_state.attachment_directory)?;
+    validate_target_local_file(&artifact.local_state.attachment_identity_file)?;
+    validate_target_local_file(&artifact.local_state.acquire_authorization_file)?;
+    validate_target_local_file(&artifact.local_state.launch_checkpoint_file)?;
+    validate_target_local_directory(&artifact.local_state.state_directory)?;
+    validate_target_local_directory(&artifact.local_state.attachment_directory)?;
+    let rebound = std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW)
+        .open(path)
+        .with_context(|| format!("reopen target-control authorization {}", path.display()))?;
+    let rebound_metadata = rebound
+        .metadata()
+        .with_context(|| format!("reinspect target-control authorization {}", path.display()))?;
+    if before_identity != LocalFileMetadata::from_metadata(&rebound_metadata) {
+        bail!("target-control authorization path changed during validation");
+    }
+    Ok(artifact)
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct LocalFileMetadata {
+    device: u64,
+    inode: u64,
+    length: u64,
+    links: u64,
+    modified_seconds: i64,
+    modified_nanoseconds: i64,
+    changed_seconds: i64,
+    changed_nanoseconds: i64,
+}
+
+impl LocalFileMetadata {
+    fn from_metadata(metadata: &std::fs::Metadata) -> Self {
+        Self {
+            device: metadata.dev(),
+            inode: metadata.ino(),
+            length: metadata.len(),
+            links: metadata.nlink(),
+            modified_seconds: metadata.mtime(),
+            modified_nanoseconds: metadata.mtime_nsec(),
+            changed_seconds: metadata.ctime(),
+            changed_nanoseconds: metadata.ctime_nsec(),
+        }
+    }
+}
+
+fn validate_target_local_directory(identity: &StableDirectoryIdentity) -> Result<()> {
+    let path = Path::new(identity.path.as_str());
+    let mut options = std::fs::OpenOptions::new();
+    options
+        .read(true)
+        .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC | libc::O_NONBLOCK);
+    let directory = options
+        .open(path)
+        .with_context(|| format!("open retained target-control directory {}", path.display()))?;
+    let metadata = directory.metadata().with_context(|| {
+        format!(
+            "inspect retained target-control directory {}",
+            path.display()
+        )
+    })?;
+    if !metadata.file_type().is_dir()
+        || metadata.uid() != effective_uid()
+        || metadata.mode() & 0o777 != 0o700
+        || metadata.dev() != identity.device.get()
+        || metadata.ino() != identity.inode.get()
+    {
+        bail!(
+            "retained target-control directory {} changed identity",
+            path.display()
+        );
+    }
+    Ok(())
+}
+
+fn validate_target_local_file(identity: &StableFileIdentity) -> Result<()> {
+    let path = Path::new(identity.path.as_str());
+    let mut file = std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW | libc::O_NONBLOCK)
+        .open(path)
+        .with_context(|| format!("open retained target-control file {}", path.display()))?;
+    let before = file
+        .metadata()
+        .with_context(|| format!("inspect retained target-control file {}", path.display()))?;
+    let before_identity = LocalFileMetadata::from_metadata(&before);
+    if !before.file_type().is_file()
+        || before.nlink() != 1
+        || before.uid() != effective_uid()
+        || before.mode() & 0o777 != 0o600
+        || before.dev() != identity.device.get()
+        || before.ino() != identity.inode.get()
+        || before.len() != identity.length.get()
+    {
+        bail!(
+            "retained target-control file {} changed identity",
+            path.display()
+        );
+    }
+    let mut bytes = Vec::with_capacity(identity.length.get() as usize);
+    std::io::Read::by_ref(&mut file)
+        .take(identity.length.get().saturating_add(1))
+        .read_to_end(&mut bytes)
+        .with_context(|| format!("read retained target-control file {}", path.display()))?;
+    let after = file
+        .metadata()
+        .with_context(|| format!("reinspect retained target-control file {}", path.display()))?;
+    if before_identity != LocalFileMetadata::from_metadata(&after)
+        || bytes.len() as u64 != identity.length.get()
+        || Sha256Digest::from_bytes(cats_blockd::format::sha256(&bytes)) != identity.content_sha256
+    {
+        bail!(
+            "retained target-control file {} changed bytes or metadata",
+            path.display()
+        );
+    }
+    Ok(())
+}
+
+fn effective_uid() -> u32 {
+    // SAFETY: geteuid has no arguments and does not dereference memory.
+    unsafe { libc::geteuid() }
+}
+
 fn main() -> Result<()> {
     tracing_subscriber::fmt()
         .with_env_filter(
@@ -386,17 +611,59 @@ fn main() -> Result<()> {
         .as_deref()
         .map(read_authorized_serving_attachment)
         .transpose()?;
+    let authorized_target_control =
+        if let Some(path) = args.authorized_target_control_spec.as_deref() {
+            let provision_transition_id = RandomId128::new(
+                args.provision_transition_id
+                    .clone()
+                    .context("process-mode validation requires a provision transition ID")?,
+            )
+            .context("--provision-transition-id is not a valid RandomId128")?;
+            let provision_context_digest = Sha256Digest::new(
+                args.provision_root_authorization_context_digest
+                    .clone()
+                    .context("process-mode validation requires a provision context digest")?,
+            )
+            .context("--provision-root-authorization-context-digest is not a valid Sha256Digest")?;
+            let attachment_epoch = args
+                .attachment_epoch
+                .context("process-mode validation requires an attachment epoch")?;
+            let process_identity = runtime_process_identity
+                .as_ref()
+                .context("process-mode validation requires Runtime process identity")?;
+            let control_socket_path = args
+                .listen_control
+                .as_deref()
+                .context("process-mode validation requires a control socket")?;
+            Some(read_target_control_authorization(
+                path,
+                &TargetControlExpectation {
+                    data_dir: &config.data_dir,
+                    volume_id: &volume_id,
+                    attachment_id: &config.attachment_id,
+                    attachment_epoch,
+                    provision_transition_id: &provision_transition_id,
+                    provision_context_digest: &provision_context_digest,
+                    runtime_scope_id: &process_identity.scope_id,
+                    control_socket_path,
+                },
+            )?)
+        } else {
+            None
+        };
     let engine = if args.control_only {
         let authority = PostgresVolumeDataAuthority::open(&metadata_config)
             .context("open target volume authority")?;
-        let attachment = authorized_control
+        let attachment = authorized_target_control
             .as_ref()
+            .map(|artifact| &artifact.attachment)
+            .or(authorized_control.as_ref())
             .context("process-mode validation requires an authorized control grant")?;
         let presented_epoch = args
             .attachment_epoch
             .context("process-mode validation requires an attachment epoch")?;
         if u64::try_from(presented_epoch).ok() != Some(attachment.identity.attachment_epoch.get()) {
-            bail!("--attachment-epoch does not match --authorized-control-spec");
+            bail!("--attachment-epoch does not match the authorized control input");
         }
         ChunkEngine::attach_authorized_control_only(
             config,
@@ -796,8 +1063,27 @@ fn validate_process_mode(args: &Args) -> Result<()> {
         if args.authorized_serving_spec.is_some() {
             bail!("--control-only conflicts with --authorized-serving-spec");
         }
-        if args.authorized_control_spec.is_none() {
+        if args.authorized_control_spec.is_none() && args.authorized_target_control_spec.is_none() {
             bail!("--control-only requires --authorized-control-spec");
+        }
+        if args.authorized_control_spec.is_some() && args.authorized_target_control_spec.is_some() {
+            bail!("--authorized-control-spec conflicts with --authorized-target-control-spec");
+        }
+        if args.authorized_target_control_spec.is_some()
+            && (args.provision_transition_id.is_none()
+                || args.provision_root_authorization_context_digest.is_none())
+        {
+            bail!(
+                "--authorized-target-control-spec requires --provision-transition-id and --provision-root-authorization-context-digest"
+            );
+        }
+        if args.authorized_control_spec.is_some()
+            && (args.provision_transition_id.is_some()
+                || args.provision_root_authorization_context_digest.is_some())
+        {
+            bail!(
+                "blank --authorized-control-spec forbids target transition and checkpoint expectations"
+            );
         }
         if args.attachment_epoch.is_none() {
             bail!("--control-only requires --attachment-epoch");
@@ -825,8 +1111,8 @@ fn validate_process_mode(args: &Args) -> Result<()> {
             bail!("--control-only requires --metadata-store-adapter postgres");
         }
     } else if args.authorized_serving_spec.is_some() {
-        if args.authorized_control_spec.is_some() {
-            bail!("--authorized-serving-spec conflicts with --authorized-control-spec");
+        if args.authorized_control_spec.is_some() || args.authorized_target_control_spec.is_some() {
+            bail!("--authorized-serving-spec conflicts with authorized control input");
         }
         if args.attachment_epoch.is_some() {
             bail!("--authorized-serving-spec carries its own exact attachment epoch");
@@ -862,8 +1148,14 @@ fn validate_process_mode(args: &Args) -> Result<()> {
         }
     } else if args.attachment_epoch.is_some() {
         bail!("--attachment-epoch is only valid with --control-only");
-    } else if args.authorized_control_spec.is_some() {
-        bail!("--authorized-control-spec is only valid with --control-only");
+    } else if args.authorized_control_spec.is_some()
+        || args.authorized_target_control_spec.is_some()
+    {
+        bail!("authorized control input is only valid with --control-only");
+    } else if args.provision_transition_id.is_some()
+        || args.provision_root_authorization_context_digest.is_some()
+    {
+        bail!("target-control expectations require --authorized-target-control-spec");
     }
     let _ = runtime_process_identity(args)?;
     Ok(())
@@ -986,6 +1278,360 @@ fn serve_vhost_user(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use cats_api::runtime_reconciliation::{
+        AcquireOrigin, AsciiText, ContractVersion, Epoch, FenceEpoch, Generation, HostPath,
+        NormalAcquireRequest, NormalAcquireResult, RemoteHead, Revision, UnixMillis, WireU64,
+    };
+    use cats_blockd::target_control::{
+        encode_target_control_authorization, ProvisionRootAuthorizationContextDigest,
+        TargetControlLocalStateIdentity,
+    };
+    use cats_storage::authority::{AttachmentLineageIdentity, VolumeDurability};
+    use std::os::unix::fs::PermissionsExt as _;
+
+    const TARGET_VOLUME_ID: &str = "vol_target";
+    const TARGET_ATTACHMENT_ID: &str = "att_target";
+    const TARGET_TRANSITION: &str = "13579bdf2468ace013579bdf2468ace0";
+
+    struct TargetControlFixture {
+        _root: tempfile::TempDir,
+        data_dir: PathBuf,
+        path: PathBuf,
+        transition: RandomId128,
+        context_digest: Sha256Digest,
+        runtime_scope_id: Id,
+        control_socket_path: PathBuf,
+        artifact: TargetControlAuthorizationArtifact,
+    }
+
+    impl TargetControlFixture {
+        fn expectation(&self) -> TargetControlExpectation<'_> {
+            TargetControlExpectation {
+                data_dir: &self.data_dir,
+                volume_id: TARGET_VOLUME_ID,
+                attachment_id: TARGET_ATTACHMENT_ID,
+                attachment_epoch: 7,
+                provision_transition_id: &self.transition,
+                provision_context_digest: &self.context_digest,
+                runtime_scope_id: &self.runtime_scope_id,
+                control_socket_path: &self.control_socket_path,
+            }
+        }
+
+        fn parse(&self) -> Result<TargetControlAuthorizationArtifact> {
+            read_target_control_authorization(&self.path, &self.expectation())
+        }
+
+        fn write(&self, bytes: &[u8]) {
+            std::fs::write(&self.path, bytes).unwrap();
+        }
+    }
+
+    fn target_control_fixture() -> TargetControlFixture {
+        let root = tempfile::tempdir().unwrap();
+        let state_dir = root.path().join("state-a");
+        let data_dir = state_dir
+            .join("data")
+            .join("cat-cat_01")
+            .join(format!("volume-{TARGET_VOLUME_ID}"))
+            .join(format!("attachment-{TARGET_ATTACHMENT_ID}"))
+            .join("epoch-7");
+        std::fs::create_dir_all(&data_dir).unwrap();
+        std::fs::set_permissions(&state_dir, std::fs::Permissions::from_mode(0o700)).unwrap();
+        std::fs::set_permissions(&data_dir, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let transition = RandomId128::new(TARGET_TRANSITION).unwrap();
+        let acquire_transition = RandomId128::new("2468ace013579bdf2468ace013579bdf").unwrap();
+        let blank_head = RemoteHead {
+            generation: Generation::new(0).unwrap(),
+            root_hash: None,
+            root_object_id: None,
+        };
+        let target_head = RemoteHead {
+            generation: Generation::new(1).unwrap(),
+            root_hash: Some(Sha256Digest::from_bytes([0x5a; 32])),
+            root_object_id: Some(AsciiText::new("roots/generation-1.node").unwrap()),
+        };
+        let acquire_request = NormalAcquireRequest {
+            volume_id: Id::new(TARGET_VOLUME_ID).unwrap(),
+            transition_id: acquire_transition.clone(),
+            attachment_id: Id::new(TARGET_ATTACHMENT_ID).unwrap(),
+            expected_unowned_epoch: FenceEpoch::new(6).unwrap(),
+            desired_revision: Revision::new(11).unwrap(),
+            placement_epoch: Epoch::new(3).unwrap(),
+            lease_duration_ms: 60_000,
+        };
+        let acquire_result = NormalAcquireResult {
+            volume_id: acquire_request.volume_id.clone(),
+            transition_id: acquire_transition.clone(),
+            attachment_id: acquire_request.attachment_id.clone(),
+            resulting_epoch: FenceEpoch::new(7).unwrap(),
+            resulting_head: blank_head.clone(),
+            lease_expires_at: UnixMillis::new(1_900_000_060_000).unwrap(),
+        };
+        let attachment = AuthorizedServingAttachment {
+            identity: AttachmentLineageIdentity {
+                volume_id: acquire_request.volume_id.clone(),
+                attachment_id: acquire_request.attachment_id.clone(),
+                attachment_epoch: acquire_result.resulting_epoch,
+                acquire_origin: AcquireOrigin::Normal {
+                    transition_id: acquire_transition,
+                },
+                node_id: Id::new("node_a").unwrap(),
+                placement_epoch: acquire_request.placement_epoch,
+            },
+            size_bytes: 4 * 1024 * 1024,
+            durability: VolumeDurability::Strict,
+            head: target_head,
+            lease_expires_at: acquire_result.lease_expires_at,
+            acquire_request,
+            acquire_result,
+        };
+        let identity_path = data_dir.join("identity.json");
+        let blank_path = data_dir.join("authorized-serving.json");
+        let launch_path = data_dir.join("launch-checkpoint.json");
+        let identity_bytes = serde_json::to_vec(&attachment.identity).unwrap();
+        let mut blank_attachment = attachment.clone();
+        blank_attachment.head = blank_head;
+        let blank_bytes = serde_json::to_vec(&blank_attachment).unwrap();
+        let launch_bytes = br#"{"launch":"checkpoint"}"#;
+        std::fs::write(&identity_path, &identity_bytes).unwrap();
+        std::fs::write(&blank_path, &blank_bytes).unwrap();
+        std::fs::write(&launch_path, launch_bytes).unwrap();
+        for path in [&identity_path, &blank_path, &launch_path] {
+            std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        }
+        let context_digest = Sha256Digest::from_bytes([0x6b; 32]);
+        let runtime_scope_id = Id::new("cats-root-fixed.service").unwrap();
+        let control_socket_path = data_dir.join("root-provision.sock");
+        let artifact = TargetControlAuthorizationArtifact {
+            version: ContractVersion::V1,
+            provision_transition_id: transition.clone(),
+            provision_context_digest: ProvisionRootAuthorizationContextDigest::new(
+                context_digest.clone(),
+            ),
+            runtime_scope_id: runtime_scope_id.clone(),
+            control_socket_path: HostPath::new(control_socket_path.to_str().unwrap()).unwrap(),
+            local_state: TargetControlLocalStateIdentity {
+                state_directory: stable_directory(&state_dir),
+                attachment_directory: stable_directory(&data_dir),
+                attachment_identity_file: stable_file(&identity_path, &identity_bytes),
+                acquire_authorization_file: stable_file(&blank_path, &blank_bytes),
+                launch_checkpoint_file: stable_file(&launch_path, launch_bytes),
+            },
+            attachment,
+        };
+        let path = data_dir.join(target_control_authorization_file_name(&transition));
+        std::fs::write(
+            &path,
+            encode_target_control_authorization(&artifact).unwrap(),
+        )
+        .unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        TargetControlFixture {
+            _root: root,
+            data_dir,
+            path,
+            transition,
+            context_digest,
+            runtime_scope_id,
+            control_socket_path,
+            artifact,
+        }
+    }
+
+    fn stable_directory(path: &Path) -> StableDirectoryIdentity {
+        let metadata = std::fs::metadata(path).unwrap();
+        StableDirectoryIdentity {
+            path: HostPath::new(path.to_str().unwrap()).unwrap(),
+            device: WireU64::new(metadata.dev()).unwrap(),
+            inode: WireU64::new(metadata.ino()).unwrap(),
+        }
+    }
+
+    fn stable_file(path: &Path, bytes: &[u8]) -> StableFileIdentity {
+        let metadata = std::fs::metadata(path).unwrap();
+        StableFileIdentity {
+            path: HostPath::new(path.to_str().unwrap()).unwrap(),
+            device: WireU64::new(metadata.dev()).unwrap(),
+            inode: WireU64::new(metadata.ino()).unwrap(),
+            length: WireU64::new(bytes.len() as u64).unwrap(),
+            content_sha256: Sha256Digest::from_bytes(cats_blockd::format::sha256(bytes)),
+        }
+    }
+
+    #[test]
+    fn target_control_parser_accepts_only_the_exact_closed_context() {
+        let fixture = target_control_fixture();
+        assert_eq!(fixture.parse().unwrap(), fixture.artifact);
+
+        let wrong_transition = RandomId128::new("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa").unwrap();
+        let mut expected = fixture.expectation();
+        expected.provision_transition_id = &wrong_transition;
+        assert!(read_target_control_authorization(&fixture.path, &expected).is_err());
+
+        let wrong_digest = Sha256Digest::from_bytes([0x7c; 32]);
+        let mut expected = fixture.expectation();
+        expected.provision_context_digest = &wrong_digest;
+        assert!(read_target_control_authorization(&fixture.path, &expected).is_err());
+
+        let wrong_scope = Id::new("cats-root-foreign.service").unwrap();
+        let mut expected = fixture.expectation();
+        expected.runtime_scope_id = &wrong_scope;
+        assert!(read_target_control_authorization(&fixture.path, &expected).is_err());
+
+        let mut expected = fixture.expectation();
+        expected.control_socket_path = Path::new("/tmp/foreign-root-provision.sock");
+        assert!(read_target_control_authorization(&fixture.path, &expected).is_err());
+
+        let mut expected = fixture.expectation();
+        expected.data_dir = Path::new("/tmp/foreign-root-data");
+        assert!(read_target_control_authorization(&fixture.path, &expected).is_err());
+
+        let mut expected = fixture.expectation();
+        expected.volume_id = "vol_foreign";
+        assert!(read_target_control_authorization(&fixture.path, &expected).is_err());
+    }
+
+    #[test]
+    fn target_control_parser_rejects_bare_blank_and_malformed_inputs() {
+        let bare_blank = target_control_fixture();
+        let blank_path = Path::new(
+            bare_blank
+                .artifact
+                .local_state
+                .acquire_authorization_file
+                .path
+                .as_str(),
+        );
+        assert!(read_target_control_authorization(blank_path, &bare_blank.expectation()).is_err());
+
+        let noncanonical = target_control_fixture();
+        let mut bytes = b" ".to_vec();
+        bytes.extend_from_slice(&std::fs::read(&noncanonical.path).unwrap());
+        noncanonical.write(&bytes);
+        assert!(noncanonical.parse().is_err());
+
+        let unknown = target_control_fixture();
+        let mut bytes = std::fs::read(&unknown.path).unwrap();
+        assert_eq!(bytes.pop(), Some(b'}'));
+        bytes.extend_from_slice(br#","unknown":true}"#);
+        unknown.write(&bytes);
+        assert!(unknown.parse().is_err());
+
+        let oversized = target_control_fixture();
+        oversized.write(&vec![b' '; TARGET_CONTROL_AUTHORIZATION_MAX_BYTES + 1]);
+        assert!(oversized.parse().is_err());
+
+        let blank_head = target_control_fixture();
+        let mut artifact = blank_head.artifact.clone();
+        artifact.attachment.head = artifact.attachment.acquire_result.resulting_head.clone();
+        blank_head.write(&serde_json::to_vec(&artifact).unwrap());
+        assert!(blank_head.parse().is_err());
+
+        let wrong_version = target_control_fixture();
+        let mut value = serde_json::to_value(&wrong_version.artifact).unwrap();
+        value["version"] = serde_json::json!(2);
+        wrong_version.write(&serde_json::to_vec(&value).unwrap());
+        assert!(wrong_version.parse().is_err());
+
+        let changed_local_file = target_control_fixture();
+        std::fs::write(
+            changed_local_file
+                .artifact
+                .local_state
+                .launch_checkpoint_file
+                .path
+                .as_str(),
+            b"changed launch checkpoint",
+        )
+        .unwrap();
+        assert!(changed_local_file.parse().is_err());
+
+        let permissive = target_control_fixture();
+        std::fs::set_permissions(&permissive.path, std::fs::Permissions::from_mode(0o644)).unwrap();
+        assert!(permissive.parse().is_err());
+
+        let hardlinked = target_control_fixture();
+        std::fs::hard_link(&hardlinked.path, hardlinked.path.with_extension("alias")).unwrap();
+        assert!(hardlinked.parse().is_err());
+
+        let symlinked = target_control_fixture();
+        let real_path = symlinked.path.with_extension("real");
+        std::fs::rename(&symlinked.path, &real_path).unwrap();
+        std::os::unix::fs::symlink(&real_path, &symlinked.path).unwrap();
+        assert!(symlinked.parse().is_err());
+    }
+
+    fn parse_target_control_mode(extra: &[&str]) -> Args {
+        let mut arguments = vec![
+            "cats-blockd",
+            "--volume-id",
+            TARGET_VOLUME_ID,
+            "--data-dir",
+            "/runtime/root-data",
+            "--attachment-id",
+            TARGET_ATTACHMENT_ID,
+            "--object-store-adapter",
+            "file",
+            "--metadata-store-adapter",
+            "postgres",
+            "--control-only",
+            "--authorized-target-control-spec",
+            "/runtime/root-data/authorized-target-control-13579bdf2468ace013579bdf2468ace0.json",
+            "--provision-transition-id",
+            TARGET_TRANSITION,
+            "--provision-root-authorization-context-digest",
+            "sha256:6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b",
+            "--attachment-epoch",
+            "7",
+            "--listen-control",
+            "/runtime/root-data/root-provision.sock",
+            "--runtime-scope-id",
+            "cats-root-fixed.service",
+            "--process-identity-token",
+            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        ];
+        arguments.extend_from_slice(extra);
+        Args::try_parse_from(arguments).unwrap()
+    }
+
+    #[test]
+    fn target_control_cli_is_distinct_and_legacy_blank_mode_stays_compatible() {
+        assert!(validate_process_mode(&parse_target_control_mode(&[])).is_ok());
+
+        let legacy_blank = Args::try_parse_from([
+            "cats-blockd",
+            "--volume-id",
+            TARGET_VOLUME_ID,
+            "--data-dir",
+            "/runtime/root-data",
+            "--attachment-id",
+            TARGET_ATTACHMENT_ID,
+            "--object-store-adapter",
+            "file",
+            "--metadata-store-adapter",
+            "postgres",
+            "--control-only",
+            "--authorized-control-spec",
+            "/runtime/root-data/authorized-serving.json",
+            "--attachment-epoch",
+            "7",
+            "--listen-control",
+            "/runtime/root-data/root-provision.sock",
+            "--runtime-scope-id",
+            "cats-root-fixed.service",
+            "--process-identity-token",
+            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        ])
+        .unwrap();
+        assert!(validate_process_mode(&legacy_blank).is_ok());
+
+        let conflicting = parse_target_control_mode(&[
+            "--authorized-control-spec",
+            "/runtime/root-data/authorized-serving.json",
+        ]);
+        assert!(validate_process_mode(&conflicting).is_err());
+    }
 
     fn parse_target(extra: &[&str]) -> Args {
         let mut arguments = vec![
