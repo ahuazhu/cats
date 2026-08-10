@@ -970,7 +970,10 @@ mod linux {
         }
 
         fn launch_path() -> (tempfile::TempDir, PathBuf) {
-            let root = tempfile::tempdir().unwrap();
+            let root = tempfile::Builder::new()
+                .prefix("cats-vmm-launcher-")
+                .tempdir_in("/run")
+                .unwrap();
             let parent = root.path().join("cat/runtime");
             std::fs::create_dir_all(&parent).unwrap();
             (root, parent.join("launch.file"))
