@@ -39,6 +39,31 @@ pub(crate) mod retirement_sealed {
 pub(crate) trait RootProvisionProcessRetirementPort:
     retirement_sealed::Sealed + Send + Sync
 {
+    /// Re-prove one exact live attempt across the same Node-global sweep used
+    /// by full inventory. The default is fail-closed for test/provider ports
+    /// which only implement the later absence proof.
+    fn inspect_exact_after_node_global_sweep(
+        &self,
+        _expected: &RootProvisionProcessExpectation,
+        _context: &dyn RuntimePhysicalReadContext,
+    ) -> anyhow::Result<RootProvisionProcessInspection> {
+        Ok(RootProvisionProcessInspection::Unavailable)
+    }
+
+    /// Prove the exact process absent while permitting only the receipted
+    /// socket basename to remain in the Node-global socket sweep. This is the
+    /// restart path between an exact stop and descriptor-relative unlink of
+    /// that stale inode; implementations must not treat the allowed pathname
+    /// itself as process evidence.
+    fn inspect_absent_allowing_socket_after_node_global_sweep(
+        &self,
+        _expected: &RootProvisionProcessExpectation,
+        _allowed_socket: &HostPath,
+        _context: &dyn RuntimePhysicalReadContext,
+    ) -> anyhow::Result<RootProvisionProcessInspection> {
+        Ok(RootProvisionProcessInspection::Unavailable)
+    }
+
     fn inspect_after_node_global_sweep(
         &self,
         expected: &RootProvisionProcessExpectation,
@@ -572,6 +597,16 @@ pub(crate) enum RootProvisionProcessStart {
     Unavailable,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum RootProvisionProcessStop {
+    /// An exact stop was submitted. Its final result is deliberately resolved
+    /// only by a new complete inventory.
+    Submitted,
+    AlreadyAbsent,
+    Conflict(RootProvisionProcessConflict),
+    Unavailable,
+}
+
 /// Provider-neutral process owner. Production implementations are sealed to
 /// this crate so the legacy naked-`Command` path cannot satisfy the port.
 pub(crate) trait RootProvisionProcessPort: sealed::Sealed + Send + Sync {
@@ -586,6 +621,17 @@ pub(crate) trait RootProvisionProcessPort: sealed::Sealed + Send + Sync {
         checkpointed: CheckpointedRootProvisionProcess<'_>,
         context: &RuntimeDesiredEffectContext,
     ) -> anyhow::Result<RootProvisionProcessStart>;
+
+    /// Stop only the physical incarnation sealed in `exact`. Implementations
+    /// must compare PID/start/unit/cgroup/socket/token again immediately before
+    /// signalling and must never fall back to a unit name or PID alone.
+    fn stop_exact(
+        &self,
+        _exact: ExactRootProvisionProcessProof,
+        _context: &RuntimeDesiredEffectContext,
+    ) -> anyhow::Result<RootProvisionProcessStop> {
+        Ok(RootProvisionProcessStop::Unavailable)
+    }
 }
 
 /// Read and revalidate one exact process identity without creating, stopping,

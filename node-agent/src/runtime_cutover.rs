@@ -27,9 +27,10 @@ use cats_storage::BlobStore;
 use crate::agent_registration::AgentRegistrationConfig;
 use crate::ch::ChConfig;
 use crate::runtime::reconciliation::{
-    installed_clean_slate_scanner, AuthorizedBlockdLaunchConfig, ControlSignedNormalAcquireClient,
-    InstalledCleanSlateProbeConfig, RootProvisionSystemdConfig, RuntimeVolumeTransitionHttpClient,
-    SignedRunningAcquireEffect, SignedRunningEffect, SignedRunningPublicationRecovery,
+    installed_clean_slate_scanner, installed_root_process_retirement_port,
+    AuthorizedBlockdLaunchConfig, ControlSignedNormalAcquireClient, InstalledCleanSlateProbeConfig,
+    RootProvisionSystemdConfig, RuntimeVolumeTransitionHttpClient, SignedRunningAcquireEffect,
+    SignedRunningEffect, SignedRunningPublicationRecovery,
 };
 use crate::runtime_spine::{
     RuntimeInventoryScanner, RuntimeSpineDeadlinePolicy, RuntimeSpineHttpClient,
@@ -213,6 +214,19 @@ async fn spawn_signed_runtime_cutover_with_scanner(
         RootProvisionSystemdConfig::new(config.authorized_blockd_launch.clone())
             .context("compose credentialless root-provision systemd process owner")?;
     let effect_root_provision_systemd = root_provision_systemd.clone();
+    let installed_probe_config = InstalledCleanSlateProbeConfig {
+        state_directory: config.agent_registration.runtime_state_directory(),
+        cloud_hypervisor_binary: config.ch_config.ch_bin.clone(),
+        blockd_binary: config.authorized_blockd_launch.blockd_binary.clone(),
+        guest_agent_binary: config.guest_agent_binary.clone(),
+        metering_cgroup_root: config.metering_cgroup_root.clone(),
+        volume_inventory_authority: Arc::clone(&config.volume_inventory_authority),
+        blob_store: Arc::clone(&config.blob_store),
+        root_provision_systemd,
+    };
+    let effect_root_process_retirement =
+        installed_root_process_retirement_port(installed_probe_config.clone())
+            .context("compose sealed root-process retirement inventory")?;
     let session = config
         .agent_registration
         .register_until_session(&config.control_plane_url)
@@ -237,17 +251,8 @@ async fn spawn_signed_runtime_cutover_with_scanner(
     };
     let scanner = match scanner_override {
         Some(scanner) => scanner,
-        None => installed_clean_slate_scanner(InstalledCleanSlateProbeConfig {
-            state_directory: config.agent_registration.runtime_state_directory(),
-            cloud_hypervisor_binary: config.ch_config.ch_bin.clone(),
-            blockd_binary: config.authorized_blockd_launch.blockd_binary.clone(),
-            guest_agent_binary: config.guest_agent_binary.clone(),
-            metering_cgroup_root: config.metering_cgroup_root.clone(),
-            volume_inventory_authority: Arc::clone(&config.volume_inventory_authority),
-            blob_store: Arc::clone(&config.blob_store),
-            root_provision_systemd,
-        })
-        .context("compose installed clean-slate inventory probes")?,
+        None => installed_clean_slate_scanner(installed_probe_config)
+            .context("compose installed clean-slate inventory probes")?,
     };
     let effect_registration = config.agent_registration.clone();
     let effect_control_plane_url = config.control_plane_url.clone();
@@ -288,9 +293,13 @@ async fn spawn_signed_runtime_cutover_with_scanner(
             Arc::clone(&effect_volume_authority),
             effect_blob_store,
             effect_root_provision_systemd,
+            Arc::clone(&effect_root_process_retirement),
         )
         .context("compose signed Running root provision prefix")?;
-        let recovery = SignedRunningPublicationRecovery::new(Arc::clone(&effect_volume_authority));
+        let recovery = SignedRunningPublicationRecovery::with_root_process_retirement(
+            Arc::clone(&effect_volume_authority),
+            effect_root_process_retirement,
+        );
         RuntimeSpineRunner::new_with_recovery_and_desired_effects(
             effect_state_directory,
             session,

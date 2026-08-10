@@ -115,8 +115,19 @@ impl ProcHandle {
     }
 
     pub(crate) fn signal(&self, sig: i32) {
+        let _ = self.signal_if_same(sig);
+    }
+
+    /// Signal only if the recorded process incarnation still owns its PID.
+    /// The boolean lets an exact-effect caller distinguish a submitted signal
+    /// from a fail-closed PID/start mismatch without weakening the existing
+    /// best-effort `signal` API.
+    pub(crate) fn signal_if_same(&self, sig: i32) -> Result<bool> {
         match self {
-            Self::Owned(child) => signal_pid(child.id(), sig),
+            Self::Owned(child) => {
+                signal_pid_checked(child.id(), sig)?;
+                Ok(true)
+            }
             Self::Adopted { pid, start_ticks } => {
                 if !is_recorded_process(*pid, *start_ticks) {
                     tracing::warn!(
@@ -124,9 +135,10 @@ impl ProcHandle {
                         signal = sig,
                         "not signalling adopted pid: it no longer names the recorded process"
                     );
-                    return;
+                    return Ok(false);
                 }
-                signal_pid(*pid, sig);
+                signal_pid_checked(*pid, sig)?;
+                Ok(true)
             }
         }
     }
@@ -135,14 +147,26 @@ impl ProcHandle {
 /// Best-effort `kill(2)`. A process that has already exited answers `ESRCH`,
 /// which every caller here treats as success.
 fn signal_pid(pid: u32, sig: i32) {
+    let _ = signal_pid_checked(pid, sig);
+}
+
+fn signal_pid_checked(pid: u32, sig: i32) -> Result<()> {
     let Some(pid) = pid_t(pid) else {
-        return;
+        anyhow::bail!("process id is outside the platform pid domain");
     };
     // SAFETY: `kill` copies both scalar arguments and does not retain any
     // borrowed memory.
-    unsafe {
-        libc::kill(pid, sig);
+    let result = unsafe { libc::kill(pid, sig) };
+    if result == 0 {
+        return Ok(());
     }
+    let source = std::io::Error::last_os_error();
+    if source.raw_os_error() == Some(libc::ESRCH) {
+        // The exact incarnation exited between the identity sample and the
+        // signal. For a stop effect, absence is already the intended result.
+        return Ok(());
+    }
+    Err(source).with_context(|| format!("signal process {pid} with {sig}"))
 }
 
 /// Whether `pid` still names the process whose start ticks were recorded.

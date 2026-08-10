@@ -72,7 +72,8 @@ pub(crate) use clean_slate_probes::{
     clean_slate_scanner_with_volume_authority_for_test, TestCleanSlateProbeConfig,
 };
 pub(crate) use clean_slate_probes::{
-    installed_clean_slate_scanner, InstalledCleanSlateProbeConfig,
+    installed_clean_slate_scanner, installed_root_process_retirement_port,
+    InstalledCleanSlateProbeConfig,
 };
 pub use gate_planner::{
     applied_desired_evidence, AppliedDesiredError, GateReconcileError, GateSequencer,
@@ -106,7 +107,7 @@ pub(crate) use root_provision_process::{
     RootProvisionBlockdHandshake, RootProvisionProcessConflict, RootProvisionProcessEnsureResult,
     RootProvisionProcessEvidence, RootProvisionProcessExpectation, RootProvisionProcessInspection,
     RootProvisionProcessOutcome, RootProvisionProcessPort, RootProvisionProcessRetirementPort,
-    RootProvisionProcessStart,
+    RootProvisionProcessStart, RootProvisionProcessStop,
 };
 #[allow(unused_imports)]
 pub(crate) use systemd_root_provision::{

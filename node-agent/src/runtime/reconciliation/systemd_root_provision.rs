@@ -21,15 +21,17 @@ use cats_api::blockd::BlockdControlResponse;
 use cats_api::blockd::DurabilityStatus;
 use cats_api::runtime_reconciliation::{Durability, HostPath, Id, RandomId128, WireU64};
 
+use crate::proc::{ProcHandle, ProcIdentity};
 use crate::runtime_spine::{RuntimeDesiredEffectContext, RuntimePhysicalReadContext};
 
 use super::authorized_blockd::AuthorizedBlockdLaunchConfig;
 #[cfg(test)]
 use super::root_provision_process::RootProvisionProcessPhase;
 use super::root_provision_process::{
-    sealed, CheckpointedRootProvisionProcess, RootProvisionBlockdHandshake,
-    RootProvisionProcessConflict, RootProvisionProcessEvidence, RootProvisionProcessExpectation,
-    RootProvisionProcessInspection, RootProvisionProcessPort, RootProvisionProcessStart,
+    sealed, CheckpointedRootProvisionProcess, ExactRootProvisionProcessProof,
+    RootProvisionBlockdHandshake, RootProvisionProcessConflict, RootProvisionProcessEvidence,
+    RootProvisionProcessExpectation, RootProvisionProcessInspection, RootProvisionProcessPort,
+    RootProvisionProcessStart, RootProvisionProcessStop,
 };
 
 const SYSTEMD_RUN: &str = "/usr/bin/systemd-run";
@@ -115,6 +117,14 @@ enum SystemdStartSubmission {
     DefinitelyNotStarted,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SystemdStopSubmission {
+    Submitted,
+    AlreadyAbsent,
+    Conflict,
+    Unavailable,
+}
+
 trait SystemdTransientServicePort: Send + Sync {
     fn inspect(
         &self,
@@ -127,6 +137,15 @@ trait SystemdTransientServicePort: Send + Sync {
         launch: &TransientServiceLaunch,
         context: &RuntimeDesiredEffectContext,
     ) -> anyhow::Result<SystemdStartSubmission>;
+
+    fn stop_exact(
+        &self,
+        _launch: &TransientServiceLaunch,
+        _evidence: &RootProvisionProcessEvidence,
+        _context: &RuntimeDesiredEffectContext,
+    ) -> anyhow::Result<SystemdStopSubmission> {
+        Ok(SystemdStopSubmission::Unavailable)
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -221,6 +240,44 @@ where
                 }
             }
         }
+    }
+
+    fn stop_exact(
+        &self,
+        exact: ExactRootProvisionProcessProof,
+        context: &RuntimeDesiredEffectContext,
+    ) -> anyhow::Result<RootProvisionProcessStop> {
+        context.check_active()?;
+        let expected = exact.expectation();
+        let launch = self.launch(expected)?;
+        match self.inspect_exact(expected, &launch, context)? {
+            RootProvisionProcessInspection::Exact(current) if *current == *exact.evidence() => {}
+            RootProvisionProcessInspection::Absent => {
+                return Ok(RootProvisionProcessStop::AlreadyAbsent)
+            }
+            RootProvisionProcessInspection::Unavailable => {
+                return Ok(RootProvisionProcessStop::Unavailable)
+            }
+            RootProvisionProcessInspection::Exact(_)
+            | RootProvisionProcessInspection::Conflict(_) => {
+                return Ok(RootProvisionProcessStop::Conflict(
+                    RootProvisionProcessConflict::IdentityMismatch,
+                ))
+            }
+        }
+        Ok(
+            match self
+                .systemd
+                .stop_exact(&launch, exact.evidence(), context)?
+            {
+                SystemdStopSubmission::Submitted => RootProvisionProcessStop::Submitted,
+                SystemdStopSubmission::AlreadyAbsent => RootProvisionProcessStop::AlreadyAbsent,
+                SystemdStopSubmission::Conflict => RootProvisionProcessStop::Conflict(
+                    RootProvisionProcessConflict::IdentityMismatch,
+                ),
+                SystemdStopSubmission::Unavailable => RootProvisionProcessStop::Unavailable,
+            },
+        )
     }
 }
 
@@ -548,6 +605,14 @@ impl RootProvisionProcessPort for PlatformSystemdRootProvisionProcessPort {
     ) -> anyhow::Result<RootProvisionProcessStart> {
         self.inner.start_checkpointed(checkpointed, context)
     }
+
+    fn stop_exact(
+        &self,
+        exact: ExactRootProvisionProcessProof,
+        context: &RuntimeDesiredEffectContext,
+    ) -> anyhow::Result<RootProvisionProcessStop> {
+        self.inner.stop_exact(exact, context)
+    }
 }
 
 impl SystemdTransientServicePort for PlatformSystemdTransientService {
@@ -565,6 +630,15 @@ impl SystemdTransientServicePort for PlatformSystemdTransientService {
         context: &RuntimeDesiredEffectContext,
     ) -> anyhow::Result<SystemdStartSubmission> {
         platform_submit_systemd(launch, context)
+    }
+
+    fn stop_exact(
+        &self,
+        launch: &TransientServiceLaunch,
+        evidence: &RootProvisionProcessEvidence,
+        context: &RuntimeDesiredEffectContext,
+    ) -> anyhow::Result<SystemdStopSubmission> {
+        platform_stop_exact_process(launch, evidence, context)
     }
 }
 
@@ -614,6 +688,65 @@ fn platform_submit_systemd(
         }
         BoundedCommandResult::Exited(_) => Ok(SystemdStartSubmission::OutcomeUnknown),
         BoundedCommandResult::Cancelled => Ok(SystemdStartSubmission::OutcomeUnknown),
+    }
+}
+
+fn platform_stop_exact_process(
+    launch: &TransientServiceLaunch,
+    evidence: &RootProvisionProcessEvidence,
+    context: &RuntimeDesiredEffectContext,
+) -> anyhow::Result<SystemdStopSubmission> {
+    context.check_active()?;
+    if evidence.process_id == 0
+        || evidence.unit_main_process_id != evidence.process_id
+        || evidence.cgroup_process_ids != [evidence.process_id]
+        || evidence.scope_id != launch.unit_id
+        || evidence.cgroup_path != launch.cgroup_path
+        || evidence.executable_path.as_str() != launch.executable.to_string_lossy()
+        || evidence.ownership_token != launch.process_identity_token
+    {
+        return Ok(SystemdStopSubmission::Conflict);
+    }
+    let expected_identity = ProcIdentity {
+        pid: evidence.process_id,
+        start_ticks: Some(evidence.process_start_time_ticks.get()),
+        exe: Some(launch.executable.clone()),
+    };
+    if ProcIdentity::sample(evidence.process_id) != expected_identity {
+        return Ok(SystemdStopSubmission::Conflict);
+    }
+    let mut process = ProcHandle::Adopted {
+        pid: evidence.process_id,
+        start_ticks: expected_identity.start_ticks,
+    };
+    if !process.signal_if_same(libc::SIGTERM)? {
+        return Ok(SystemdStopSubmission::Conflict);
+    }
+
+    let graceful_deadline = (Instant::now() + Duration::from_secs(2)).min(context.deadline());
+    loop {
+        if process.exited()? {
+            return Ok(SystemdStopSubmission::Submitted);
+        }
+        if context.check_active().is_err() {
+            return Ok(SystemdStopSubmission::Submitted);
+        }
+        if Instant::now() >= graceful_deadline {
+            break;
+        }
+        std::thread::sleep(POLL_INTERVAL);
+    }
+    if !process.signal_if_same(libc::SIGKILL)? {
+        return Ok(SystemdStopSubmission::Submitted);
+    }
+    loop {
+        if process.exited()?
+            || context.check_active().is_err()
+            || Instant::now() >= context.deadline()
+        {
+            return Ok(SystemdStopSubmission::Submitted);
+        }
+        std::thread::sleep(POLL_INTERVAL);
     }
 }
 
@@ -1075,6 +1208,8 @@ fn platform_blockd_status(
     if descriptor < 0 {
         return Ok(BlockdHandshakeInspection::Unavailable);
     }
+    // SAFETY: all-zero is a valid initial sockaddr_un; the used family and
+    // pathname bytes are initialized below before connect reads the value.
     let mut address: libc::sockaddr_un = unsafe { std::mem::zeroed() };
     address.sun_family = libc::AF_UNIX as libc::sa_family_t;
     for (target, source) in address.sun_path.iter_mut().zip(path.iter().copied()) {
@@ -1134,6 +1269,8 @@ fn platform_blockd_status(
 
 #[cfg(target_os = "linux")]
 fn peer_process_id(descriptor: std::os::fd::RawFd) -> anyhow::Result<u32> {
+    // SAFETY: all-zero is a valid initial ucred buffer and getsockopt writes
+    // the complete structure before any field is read.
     let mut credentials: libc::ucred = unsafe { std::mem::zeroed() };
     let mut length = std::mem::size_of::<libc::ucred>() as libc::socklen_t;
     // SAFETY: credentials/length point to writable storage for SO_PEERCRED.
@@ -1526,6 +1663,107 @@ mod tests {
                 .count(),
             4
         );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn platform_exact_stop_signals_only_the_recorded_child_and_both_children_are_reaped() {
+        let executable = std::fs::canonicalize("/bin/sleep").unwrap();
+        let (target, target_wait) = spawn_reaping_sleep(&executable);
+        let (foreign, foreign_wait) = spawn_reaping_sleep(&executable);
+        let mut launch = build_launch(&config(), &expectation()).unwrap();
+        launch.executable = executable.clone();
+        let mut exact = evidence();
+        exact.process_id = target.pid;
+        exact.unit_main_process_id = target.pid;
+        exact.process_start_time_ticks = WireU64::new(target.start_ticks.unwrap()).unwrap();
+        exact.executable_path = HostPath::new(executable.to_string_lossy().into_owned()).unwrap();
+        exact.cgroup_process_ids = vec![target.pid];
+        exact.handshake.peer_process_id = target.pid;
+
+        assert_eq!(
+            platform_stop_exact_process(&launch, &exact, &context()).unwrap(),
+            SystemdStopSubmission::Submitted
+        );
+        let target_status = target_wait.join().unwrap();
+        assert!(!target_status.success());
+        assert_ne!(ProcIdentity::sample(target.pid), target);
+        assert_eq!(
+            ProcIdentity::sample(foreign.pid),
+            foreign,
+            "exact stop reached a different live child"
+        );
+
+        let foreign_handle = ProcHandle::Adopted {
+            pid: foreign.pid,
+            start_ticks: foreign.start_ticks,
+        };
+        assert!(foreign_handle.signal_if_same(libc::SIGKILL).unwrap());
+        let foreign_status = foreign_wait.join().unwrap();
+        assert!(!foreign_status.success());
+        assert_ne!(ProcIdentity::sample(foreign.pid), foreign);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn platform_exact_stop_preserves_a_child_when_start_identity_drifts() {
+        let executable = std::fs::canonicalize("/bin/sleep").unwrap();
+        let (target, target_wait) = spawn_reaping_sleep(&executable);
+        let mut launch = build_launch(&config(), &expectation()).unwrap();
+        launch.executable = executable.clone();
+        let mut drifted = evidence();
+        drifted.process_id = target.pid;
+        drifted.unit_main_process_id = target.pid;
+        drifted.process_start_time_ticks =
+            WireU64::new(target.start_ticks.unwrap().checked_add(1).unwrap()).unwrap();
+        drifted.executable_path = HostPath::new(executable.to_string_lossy().into_owned()).unwrap();
+        drifted.cgroup_process_ids = vec![target.pid];
+        drifted.handshake.peer_process_id = target.pid;
+
+        assert_eq!(
+            platform_stop_exact_process(&launch, &drifted, &context()).unwrap(),
+            SystemdStopSubmission::Conflict
+        );
+        assert_eq!(ProcIdentity::sample(target.pid), target);
+        let target_handle = ProcHandle::Adopted {
+            pid: target.pid,
+            start_ticks: target.start_ticks,
+        };
+        assert!(target_handle.signal_if_same(libc::SIGKILL).unwrap());
+        assert!(!target_wait.join().unwrap().success());
+        assert_ne!(ProcIdentity::sample(target.pid), target);
+    }
+
+    #[cfg(target_os = "linux")]
+    fn spawn_reaping_sleep(
+        executable: &Path,
+    ) -> (
+        ProcIdentity,
+        std::thread::JoinHandle<std::process::ExitStatus>,
+    ) {
+        let mut child = Command::new(executable)
+            .arg("60")
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap();
+        let identity = ProcIdentity::sample(child.id());
+        assert!(identity.start_ticks.is_some() && identity.exe.as_deref() == Some(executable));
+        let waiter = std::thread::spawn(move || {
+            let cleanup_deadline = Instant::now() + Duration::from_secs(10);
+            loop {
+                if let Some(status) = child.try_wait().unwrap() {
+                    return status;
+                }
+                if Instant::now() >= cleanup_deadline {
+                    child.kill().unwrap();
+                    return child.wait().unwrap();
+                }
+                std::thread::sleep(POLL_INTERVAL);
+            }
+        });
+        (identity, waiter)
     }
 
     #[test]

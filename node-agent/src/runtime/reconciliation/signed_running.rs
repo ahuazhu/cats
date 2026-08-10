@@ -38,6 +38,7 @@ use crate::runtime_spine::{
     RuntimePreScanRecoveryOutcome,
 };
 
+use super::authorized_blockd::{ExactControlSocketCleanup, StopReceiptSettlement};
 use super::clean_slate_probes::{
     classify_local_publication_recovery, LocalPublicationRecoveryEvidence, CHECKPOINT_NAMESPACE,
 };
@@ -47,7 +48,8 @@ use super::{
     recover_normal_release_from_authority, runtime_checkpoint_path, AuthorizedBlockdStore,
     ControlSignedNormalAcquireClient, FileCheckpointStore, NormalAcquireAcceptedContext,
     NormalAcquireAttempt, NormalAcquireAuthorityRecovery, NormalAcquireClientError,
-    NormalReleaseAttempt, NormalReleaseAuthorityRecovery,
+    NormalReleaseAttempt, NormalReleaseAuthorityRecovery, RootProvisionProcessInspection,
+    RootProvisionProcessRetirementPort,
 };
 
 const MAX_LEASE_DURATION_MS: u64 = i64::MAX as u64;
@@ -125,11 +127,26 @@ pub(crate) struct SignedRunningAcquireEffect {
 /// current point-read authority must prove the persisted request already won.
 pub(crate) struct SignedRunningPublicationRecovery {
     authority: Arc<dyn VolumeDataAuthority>,
+    root_process_retirement: Option<Arc<dyn RootProvisionProcessRetirementPort>>,
 }
 
 impl SignedRunningPublicationRecovery {
+    #[cfg(test)]
     pub(crate) fn new(authority: Arc<dyn VolumeDataAuthority>) -> Self {
-        Self { authority }
+        Self {
+            authority,
+            root_process_retirement: None,
+        }
+    }
+
+    pub(crate) fn with_root_process_retirement(
+        authority: Arc<dyn VolumeDataAuthority>,
+        root_process_retirement: Arc<dyn RootProvisionProcessRetirementPort>,
+    ) -> Self {
+        Self {
+            authority,
+            root_process_retirement: Some(root_process_retirement),
+        }
     }
 
     fn recover_authorized_blockd(
@@ -191,6 +208,114 @@ impl SignedRunningPublicationRecovery {
         Ok(RuntimePreScanRecoveryOutcome::Recovered {
             cat_id: cat_id.clone(),
         })
+    }
+
+    fn recover_root_provision_stop_receipt(
+        &self,
+        context: &RuntimePreScanRecoveryContext,
+        cat_id: &Id,
+    ) -> anyhow::Result<RuntimePreScanRecoveryOutcome> {
+        let checkpoint_directory = context.state_directory().path().join(CHECKPOINT_NAMESPACE);
+        let store =
+            FileCheckpointStore::open_preserving_checkpoint_temp(&checkpoint_directory, cat_id)
+                .context("open root-provision stop recovery checkpoint store")?;
+        let Some(stored) = store
+            .load()
+            .context("load root-provision stop recovery checkpoint")?
+        else {
+            return Ok(RuntimePreScanRecoveryOutcome::NoChange);
+        };
+        let retained = match AuthorizedBlockdStore::new(context.state_directory().clone())
+            .retain_exact_runtime_checkpoint(stored.checkpoint())
+        {
+            Ok(retained) => retained,
+            Err(_) => return Ok(RuntimePreScanRecoveryOutcome::NoChange),
+        };
+        let receipt = match retained
+            .settle_stop_receipt()
+            .context("settle root-provision stop receipt publication")?
+        {
+            StopReceiptSettlement::Absent => return Ok(RuntimePreScanRecoveryOutcome::NoChange),
+            StopReceiptSettlement::Recovered(_) => {
+                return Ok(RuntimePreScanRecoveryOutcome::Recovered {
+                    cat_id: cat_id.clone(),
+                })
+            }
+            StopReceiptSettlement::Stable(receipt) => receipt,
+        };
+        if receipt.checkpoint_content_digest() != stored.content_digest()
+            || receipt
+                .binds_retained_values(stored.checkpoint(), retained.checkpoint())
+                .is_err()
+        {
+            return Ok(RuntimePreScanRecoveryOutcome::NoChange);
+        }
+        context.check_active()?;
+        let current = match self.authority.load_volume(&receipt.authority().volume_id) {
+            Ok(record) => record,
+            Err(AuthorityError::BackendUnknown) => {
+                anyhow::bail!("volume authority unavailable during root-process stop recovery")
+            }
+            Err(_) => return Ok(RuntimePreScanRecoveryOutcome::NoChange),
+        };
+        let expectation = match receipt.expectation_for_current_authority(
+            stored.checkpoint(),
+            retained.checkpoint(),
+            &current,
+        ) {
+            Ok(expectation) => expectation,
+            Err(_) => return Ok(RuntimePreScanRecoveryOutcome::NoChange),
+        };
+        let Some(retirement) = self.root_process_retirement.as_ref() else {
+            return Ok(RuntimePreScanRecoveryOutcome::NoChange);
+        };
+        let inspection = retirement
+            .inspect_absent_allowing_socket_after_node_global_sweep(
+                &expectation,
+                &receipt.process().control_socket_path,
+                &context.inventory_context(),
+            )
+            .context("reinspect stopped root process across the sealed Node-global sweep")?;
+        match inspection {
+            RootProvisionProcessInspection::Exact(evidence)
+                if evidence.as_ref() == receipt.process() =>
+            {
+                // The durable receipt makes replay safe; the Desired effect
+                // owns the next exact stop submission.
+                Ok(RuntimePreScanRecoveryOutcome::NoChange)
+            }
+            RootProvisionProcessInspection::Exact(_)
+            | RootProvisionProcessInspection::Conflict(_)
+            | RootProvisionProcessInspection::Unavailable => {
+                Ok(RuntimePreScanRecoveryOutcome::NoChange)
+            }
+            RootProvisionProcessInspection::Absent => {
+                match retained
+                    .remove_exact_stale_control_socket(receipt.socket())
+                    .context("remove exact stale receipted root-provision socket")?
+                {
+                    ExactControlSocketCleanup::Removed => {
+                        Ok(RuntimePreScanRecoveryOutcome::Recovered {
+                            cat_id: cat_id.clone(),
+                        })
+                    }
+                    ExactControlSocketCleanup::AlreadyAbsent => {
+                        // The unlink may have reached the directory before a
+                        // crash or response loss. `AlreadyAbsent` has just
+                        // repeated the parent-directory fsync, which is a
+                        // physical durability effect: force a new full scan
+                        // instead of consuming that effect and the receipt in
+                        // one reconciliation round.
+                        Ok(RuntimePreScanRecoveryOutcome::Recovered {
+                            cat_id: cat_id.clone(),
+                        })
+                    }
+                    ExactControlSocketCleanup::LiveOrChanged => anyhow::bail!(
+                        "receipted root-provision socket is live or changed; preserve it"
+                    ),
+                }
+            }
+        }
     }
 }
 
@@ -279,6 +404,9 @@ impl RuntimePreScanRecovery for SignedRunningPublicationRecovery {
             }
             LocalPublicationRecoveryEvidence::AuthorizedBlockd { cat_id } => {
                 self.recover_authorized_blockd(&context, &cat_id)
+            }
+            LocalPublicationRecoveryEvidence::RootProvisionStopReceipt { cat_id } => {
+                self.recover_root_provision_stop_receipt(&context, &cat_id)
             }
             LocalPublicationRecoveryEvidence::ServingHandoffTemp {
                 cat_id,

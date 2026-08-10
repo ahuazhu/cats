@@ -949,6 +949,29 @@ provision receipt。Volume head仍是唯一数据authority，checkpoint只是一
 image和size且权威head就是同一target时可把initial provision视为已满足；仅attachment/placement变化仍由
 Volume Authority收敛。current Deleted或已不再引用该volume时保留durable head并走其明确disposition。
 current non-Deleted仍要求同一volume却改了image/size时才Quarantined；所有分支都绝不重新provision已有generation。
+
+若superseded `provision_root_image` checkpoint仍投影一个live control-only blockd，current Desired只决定该
+旧attempt消失后的rebind/release disposition，绝不能用current image/spec/revision重解旧grant，也不能让stale
+planner因`processes`非空直接StopLocal。Node必须按每轮一个physical effect的固定顺序退休旧attempt：先从旧
+Runtime checkpoint和descriptor-retained authorized-serving文件重算完整content digest，以current Volume
+Authority闭合旧owner/epoch/size/durability/head/NormalAcquire marker；在同一accepted full admission下完成
+Node-global systemd/process/socket复验，并把provider-private stop receipt以temp fsync、no-replace rename和父目录
+fsync持久化。receipt只保存两份content digest及必要typed identity，不复制大checkpoint；它还绑定exact
+PID/MainPID/start ticks、executable、unit/scope/cgroup唯一PID、process token、handshake peer、control socket
+path的device/inode/type/uid/gid/mode/nlink，以及session/inventory epoch、digest和read position。receipt durable
+后才允许对该PID/start incarnation提交TERM/KILL并等待其消失；不得按unit名、basename或当前Desired枚举停止。
+
+信号响应丢失或Agent restart后必须重放同一receipt。serialized pre-scan先重验旧checkpoint/authorized digests
+和current authority；合法续租可以只推进`lease_expires_at`，owner/epoch/head/transition marker等任何漂移都零
+删除。随后用sealed Node-global sweep证明旧进程exact absent，并且只临时允许receipt记录的旧socket pathname。
+只有basename仍是receipt的同一device/inode、安全socket metadata且deadline-bound nonblocking connect明确
+`ECONNREFUSED`时，才可descriptor-relative unlink并fsync父目录；pathname absent也必须重做父目录fsync。两种
+结果都立即`RefreshInventory`。新inode、late/可连接peer、foreign/duplicate process、symlink、非socket或
+rename-recreate ABA全部保留为Conflict，绝不再按basename删除。下一次fresh full确认global absent后只删除并
+fsync receipt，再次`RefreshInventory`；只有再下一次fresh full才可委托原stale planner做same-image rebind或
+changed-image release。receipt publication、signal、socket unlink/fsync和receipt cleanup每个crash窗口都按
+上述顺序收敛，不能在一轮跨越两个effect。
+
 authority target确认只完成数据effect；进入`prepare_device`前，control-only blockd还必须从该authoritative
 root重新加载并握手确认同一owner/epoch/target。本地实例无法证明已加载时就停止并以同grant重启加载，不能把
 stale generation-zero cache接到Guest。
