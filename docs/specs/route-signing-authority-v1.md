@@ -45,6 +45,13 @@ filesystem root逐component no-follow打开固定目录，只从保留的directo
 任一owner/mode/type/link/path/read-change不等都 fail startup。production没有任意path、inline JSON、env
 bytes或provider-derived fallback。
 
+一次startup read transaction保留root、每级directory和每个已读file descriptor；成功返回前必须从
+root沿同一fixed lexical path逐级`O_NOFOLLOW`重开，并把fresh descriptor的device/inode、owner、完整mode
+（含special bits）、type、link count及稳定metadata与保留值逐字段比较。descriptor、ring以及active时的
+private basename也必须从fresh final directory重开并重读，identity、metadata或exact bytes任一不等都失败；
+disabled仍重验descriptor/ring但绝不打开private entry。这个闭合只证明一次read transaction，成功返回后
+的版本变化由未来versioned reload/ACK合同处理，reader不宣称持续watch filesystem。
+
 descriptor与ring是无BOM、无前后空白、无结尾LF的canonical JSON。private material是PKCS#8 Ed25519
 PEM；其内容不得进入JSON、argv、environment、log、metric、panic/debug、Terraform state/output、Node、
 Gateway或Guest。`secret_reference_id`可以进入bounded审计，但不能据此从另一个authority猜出secret。

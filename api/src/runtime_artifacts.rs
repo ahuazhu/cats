@@ -296,62 +296,141 @@ fn load_installed_route_grant_v2_signer_platform(
 
 #[cfg(unix)]
 fn load_route_grant_v2_public_key_ring_from(
-    directory: &File,
+    directory: &InstalledDirectoryPath,
     file_contract: InstalledFileContract,
 ) -> Result<InstalledRouteGrantV2PublicKeyRing, RuntimeArtifactError> {
-    let exact_bytes = read_exact_installed_file_at_with_contract(
-        directory,
+    load_route_grant_v2_public_key_ring_from_with_phase(directory, file_contract, |_| {})
+}
+
+#[cfg(unix)]
+fn load_route_grant_v2_public_key_ring_from_with_phase(
+    directory: &InstalledDirectoryPath,
+    file_contract: InstalledFileContract,
+    mut after_read: impl FnMut(RouteGrantV2ArtifactReadPhase),
+) -> Result<InstalledRouteGrantV2PublicKeyRing, RuntimeArtifactError> {
+    let pinned = read_pinned_installed_file_at_with_contract(
+        directory.final_descriptor(),
         "public-key-ring.v1.json",
         Path::new(ROUTE_GRANT_V2_PUBLIC_KEY_RING_PATH),
         ROUTE_GRANT_V2_ARTIFACT_MAX_WIRE_BYTES,
         file_contract,
     )?;
-    let ring = decode_route_grant_v2_public_key_ring(&exact_bytes)
+    after_read(RouteGrantV2ArtifactReadPhase::PublicKeyRing);
+    let fresh_directory = directory.reopen_canonical_path()?;
+    pinned.revalidate_from(
+        &fresh_directory,
+        ROUTE_GRANT_V2_ARTIFACT_MAX_WIRE_BYTES,
+        file_contract,
+    )?;
+    let ring = decode_route_grant_v2_public_key_ring(pinned.exact_bytes())
         .map_err(|_| RuntimeArtifactError::InvalidRouteGrantV2PublicKeyRing)?;
-    Ok(InstalledRouteGrantV2PublicKeyRing { ring, exact_bytes })
+    Ok(InstalledRouteGrantV2PublicKeyRing {
+        ring,
+        exact_bytes: pinned.into_exact_bytes(),
+    })
 }
 
 #[cfg(unix)]
 fn load_route_grant_v2_signer_from(
-    directory: &File,
+    directory: &InstalledDirectoryPath,
     public_file_contract: InstalledFileContract,
     private_file_contract: InstalledFileContract,
 ) -> Result<InstalledRouteGrantV2Signer, RuntimeArtifactError> {
-    let exact_reference_bytes = read_exact_installed_file_at_with_contract(
+    load_route_grant_v2_signer_from_with_phase(
         directory,
+        public_file_contract,
+        private_file_contract,
+        |_| {},
+    )
+}
+
+#[cfg(unix)]
+fn load_route_grant_v2_signer_from_with_phase(
+    directory: &InstalledDirectoryPath,
+    public_file_contract: InstalledFileContract,
+    private_file_contract: InstalledFileContract,
+    mut after_read: impl FnMut(RouteGrantV2ArtifactReadPhase),
+) -> Result<InstalledRouteGrantV2Signer, RuntimeArtifactError> {
+    let reference_file = read_pinned_installed_file_at_with_contract(
+        directory.final_descriptor(),
         "signer.v1.json",
         Path::new(ROUTE_GRANT_V2_SIGNER_REFERENCE_PATH),
         ROUTE_GRANT_V2_ARTIFACT_MAX_WIRE_BYTES,
         public_file_contract,
     )?;
-    let reference = decode_route_grant_v2_signer_reference(&exact_reference_bytes)
+    after_read(RouteGrantV2ArtifactReadPhase::SignerReference);
+    let reference = decode_route_grant_v2_signer_reference(reference_file.exact_bytes())
         .map_err(|_| RuntimeArtifactError::InvalidRouteGrantV2Signer)?;
-    let ring = load_route_grant_v2_public_key_ring_from(directory, public_file_contract)?;
-    reference
-        .validate_ring(ring.ring())
-        .map_err(|_| RuntimeArtifactError::InvalidRouteGrantV2Signer)?;
-    let private_key_pem = match &reference.signer {
+    let ring_file = read_pinned_installed_file_at_with_contract(
+        directory.final_descriptor(),
+        "public-key-ring.v1.json",
+        Path::new(ROUTE_GRANT_V2_PUBLIC_KEY_RING_PATH),
+        ROUTE_GRANT_V2_ARTIFACT_MAX_WIRE_BYTES,
+        public_file_contract,
+    )?;
+    after_read(RouteGrantV2ArtifactReadPhase::PublicKeyRing);
+    let private_key_file = match &reference.signer {
         RouteGrantV2SignerSelection::Disabled => None,
         RouteGrantV2SignerSelection::Active { .. } => {
-            let bytes = read_exact_installed_file_at_with_contract(
-                directory,
+            let file = read_pinned_installed_file_at_with_contract(
+                directory.final_descriptor(),
                 "signer-private-key.pem",
                 Path::new(ROUTE_GRANT_V2_SIGNER_PRIVATE_KEY_PATH),
                 ROUTE_GRANT_V2_ARTIFACT_MAX_WIRE_BYTES,
                 private_file_contract,
             )?;
-            if bytes.is_empty() {
+            if file.exact_bytes().is_empty() {
                 return Err(RuntimeArtifactError::InvalidRouteGrantV2Signer);
             }
-            Some(bytes)
+            after_read(RouteGrantV2ArtifactReadPhase::PrivateKey);
+            Some(file)
         }
     };
+
+    // This closes one startup/read transaction. It deliberately does not
+    // claim to watch the installed path after return; versioned reload and
+    // Node ACK semantics belong to the future rotation slice.
+    let fresh_directory = directory.reopen_canonical_path()?;
+    reference_file.revalidate_from(
+        &fresh_directory,
+        ROUTE_GRANT_V2_ARTIFACT_MAX_WIRE_BYTES,
+        public_file_contract,
+    )?;
+    ring_file.revalidate_from(
+        &fresh_directory,
+        ROUTE_GRANT_V2_ARTIFACT_MAX_WIRE_BYTES,
+        public_file_contract,
+    )?;
+    if let Some(private_key_file) = &private_key_file {
+        private_key_file.revalidate_from(
+            &fresh_directory,
+            ROUTE_GRANT_V2_ARTIFACT_MAX_WIRE_BYTES,
+            private_file_contract,
+        )?;
+    }
+
+    let ring = decode_route_grant_v2_public_key_ring(ring_file.exact_bytes())
+        .map_err(|_| RuntimeArtifactError::InvalidRouteGrantV2Signer)?;
+    reference
+        .validate_ring(&ring)
+        .map_err(|_| RuntimeArtifactError::InvalidRouteGrantV2Signer)?;
     Ok(InstalledRouteGrantV2Signer {
         reference,
-        exact_reference_bytes,
-        ring,
-        private_key_pem,
+        exact_reference_bytes: reference_file.into_exact_bytes(),
+        ring: InstalledRouteGrantV2PublicKeyRing {
+            ring,
+            exact_bytes: ring_file.into_exact_bytes(),
+        },
+        private_key_pem: private_key_file.map(PinnedInstalledFile::into_exact_bytes),
     })
+}
+
+#[cfg(unix)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RouteGrantV2ArtifactReadPhase {
+    SignerReference,
+    PublicKeyRing,
+    PrivateKey,
 }
 
 /// Read and pin the one deployment-provisioner trust bundle before the admin
@@ -375,7 +454,7 @@ fn load_installed_runtime_provisioner_trust_bundle_platform(
         InstalledDirectoryMode::ProvisionerIdentity,
     )?;
     let exact_bytes = read_exact_installed_file_at(
-        &identity_directory,
+        identity_directory.final_descriptor(),
         "runtime-provisioner-trust.v1.json",
         path,
         RUNTIME_PROVISIONER_TRUST_BUNDLE_MAX_WIRE_BYTES,
@@ -414,14 +493,14 @@ fn load_installed_guest_runtime_profile_receipt_platform(
     )?;
     let manifest_path = Path::new(GUEST_RUNTIME_RELEASE_MANIFEST_PATH);
     let exact_manifest_bytes = read_exact_installed_file_at(
-        &release_directory,
+        release_directory.final_descriptor(),
         "guest-runtime-release-manifest.v1.json",
         manifest_path,
         GUEST_RUNTIME_RELEASE_MANIFEST_MAX_BYTES,
     )?;
     let manifest = decode_release_manifest(&exact_manifest_bytes)?;
     let exact_bytes = read_exact_installed_file_at(
-        &release_directory,
+        release_directory.final_descriptor(),
         "guest-runtime-profile.v1.json",
         receipt_path,
         GUEST_RUNTIME_PROFILE_RECEIPT_MAX_WIRE_BYTES,
@@ -467,7 +546,7 @@ pub fn validate_installed_node_guest_runtime(
         InstalledDirectoryMode::Exact(0o755),
     )?;
     let kernel = read_exact_installed_file_at(
-        &guest_directory,
+        guest_directory.final_descriptor(),
         "vmlinuz",
         Path::new(GUEST_KERNEL_PATH),
         GUEST_BOOT_MEMBER_MAX_BYTES,
@@ -481,7 +560,7 @@ pub fn validate_installed_node_guest_runtime(
     match &installed.manifest.initramfs {
         Some(member) => {
             let initramfs = read_exact_installed_file_at(
-                &guest_directory,
+                guest_directory.final_descriptor(),
                 "initramfs.img",
                 Path::new(GUEST_INITRAMFS_PATH),
                 GUEST_BOOT_MEMBER_MAX_BYTES,
@@ -494,7 +573,7 @@ pub fn validate_installed_node_guest_runtime(
             )?;
         }
         None => ensure_entry_absent_at(
-            &guest_directory,
+            guest_directory.final_descriptor(),
             "initramfs.img",
             Path::new(GUEST_INITRAMFS_PATH),
         )?,
@@ -522,7 +601,7 @@ pub fn open_verified_guest_runtime_launch(
         InstalledDirectoryMode::Exact(0o755),
     )?;
     let kernel = open_verified_installed_member_at(
-        &guest_directory,
+        guest_directory.final_descriptor(),
         "vmlinuz",
         kernel_path,
         &contract.kernel,
@@ -531,7 +610,7 @@ pub fn open_verified_guest_runtime_launch(
     )?;
     let initramfs = match (&contract.initramfs, initramfs_path) {
         (Some(member), Some(path)) => Some(open_verified_installed_member_at(
-            &guest_directory,
+            guest_directory.final_descriptor(),
             "initramfs.img",
             path,
             member,
@@ -665,27 +744,153 @@ impl InstalledDirectoryMode {
 }
 
 #[cfg(unix)]
+#[derive(Debug)]
+struct RetainedInstalledDirectory {
+    name: Option<String>,
+    display: PathBuf,
+    descriptor: File,
+    metadata: StableFileMetadata,
+}
+
+#[cfg(unix)]
+#[derive(Debug)]
+struct InstalledDirectoryPath {
+    canonical_root: PathBuf,
+    directories: Vec<RetainedInstalledDirectory>,
+}
+
+#[cfg(unix)]
+impl InstalledDirectoryPath {
+    fn final_descriptor(&self) -> &File {
+        &self
+            .directories
+            .last()
+            .expect("an installed directory path always retains its root")
+            .descriptor
+    }
+
+    /// Reopen the fixed lexical path from its root and prove that every
+    /// retained directory still names the same stable inode. This is the
+    /// final check of one read transaction, not a persistent filesystem watch.
+    fn reopen_canonical_path(&self) -> Result<File, RuntimeArtifactError> {
+        let mut fresh = Vec::with_capacity(self.directories.len());
+        fresh.push(open_directory_path(
+            &self.canonical_root,
+            &self.directories[0].display,
+        )?);
+        for retained in self.directories.iter().skip(1) {
+            let parent = fresh
+                .last()
+                .expect("the fresh path always retains its root");
+            fresh.push(open_directory_at(
+                parent,
+                retained
+                    .name
+                    .as_deref()
+                    .expect("only the retained root has no basename"),
+                &retained.display,
+            )?);
+        }
+
+        for (retained, fresh_descriptor) in self.directories.iter().zip(&fresh) {
+            let retained_metadata = StableFileMetadata::new(
+                &retained
+                    .descriptor
+                    .metadata()
+                    .map_err(|_| filesystem_error(&retained.display))?,
+            );
+            let fresh_metadata = StableFileMetadata::new(
+                &fresh_descriptor
+                    .metadata()
+                    .map_err(|_| filesystem_error(&retained.display))?,
+            );
+            if retained_metadata != retained.metadata
+                || fresh_metadata != retained.metadata
+                || !retained.metadata.is_directory
+            {
+                return Err(filesystem_error(&retained.display));
+            }
+        }
+
+        Ok(fresh.pop().expect("the fresh path always retains its root"))
+    }
+}
+
+#[cfg(unix)]
 fn open_installed_directory(
     components: &[&str],
     final_mode: InstalledDirectoryMode,
-) -> Result<File, RuntimeArtifactError> {
+) -> Result<InstalledDirectoryPath, RuntimeArtifactError> {
+    open_installed_directory_from(
+        Path::new("/"),
+        components,
+        final_mode,
+        InstalledDirectoryOwner::Root,
+    )
+}
+
+#[cfg(unix)]
+#[derive(Clone, Copy)]
+enum InstalledDirectoryOwner {
+    Root,
+    #[cfg(test)]
+    Exact {
+        uid: u32,
+        gid: u32,
+    },
+}
+
+#[cfg(unix)]
+impl InstalledDirectoryOwner {
+    fn accepts(self, uid: u32, gid: u32) -> bool {
+        match self {
+            Self::Root => uid == 0 && gid == 0,
+            #[cfg(test)]
+            Self::Exact {
+                uid: expected_uid,
+                gid: expected_gid,
+            } => uid == expected_uid && gid == expected_gid,
+        }
+    }
+}
+
+#[cfg(unix)]
+fn open_installed_directory_from(
+    canonical_root: &Path,
+    components: &[&str],
+    final_mode: InstalledDirectoryMode,
+    owner: InstalledDirectoryOwner,
+) -> Result<InstalledDirectoryPath, RuntimeArtifactError> {
     use std::os::unix::fs::MetadataExt as _;
 
-    let mut directory = File::open("/").map_err(|_| filesystem_error(Path::new("/")))?;
-    let root_metadata = directory
+    let root_display = canonical_root.to_path_buf();
+    let root = open_directory_path(canonical_root, &root_display)?;
+    let root_metadata = root
         .metadata()
-        .map_err(|_| filesystem_error(Path::new("/")))?;
+        .map_err(|_| filesystem_error(&root_display))?;
     if !root_metadata.file_type().is_dir()
-        || root_metadata.uid() != 0
-        || root_metadata.gid() != 0
+        || !owner.accepts(root_metadata.uid(), root_metadata.gid())
         || root_metadata.mode() & 0o022 != 0
     {
-        return Err(filesystem_error(Path::new("/")));
+        return Err(filesystem_error(&root_display));
     }
-    let mut display = PathBuf::from("/");
+    let mut directories = vec![RetainedInstalledDirectory {
+        name: None,
+        display: root_display.clone(),
+        descriptor: root,
+        metadata: StableFileMetadata::new(&root_metadata),
+    }];
+    let mut display = root_display;
     for (index, component) in components.iter().enumerate() {
         display.push(component);
-        directory = open_directory_at(&directory, component, &display)?;
+        let directory = open_directory_at(
+            &directories
+                .last()
+                .expect("the installed path always retains its root")
+                .descriptor,
+            component,
+            &display,
+        )?;
         let metadata = directory
             .metadata()
             .map_err(|_| filesystem_error(&display))?;
@@ -695,14 +900,42 @@ fn open_installed_directory(
             metadata.mode() & 0o022 == 0
         };
         if !metadata.file_type().is_dir()
-            || metadata.uid() != 0
-            || metadata.gid() != 0
+            || !owner.accepts(metadata.uid(), metadata.gid())
             || !mode_is_valid
         {
             return Err(filesystem_error(&display));
         }
+        directories.push(RetainedInstalledDirectory {
+            name: Some((*component).to_owned()),
+            display: display.clone(),
+            descriptor: directory,
+            metadata: StableFileMetadata::new(&metadata),
+        });
     }
-    Ok(directory)
+    Ok(InstalledDirectoryPath {
+        canonical_root: canonical_root.to_path_buf(),
+        directories,
+    })
+}
+
+#[cfg(unix)]
+fn open_directory_path(path: &Path, display: &Path) -> Result<File, RuntimeArtifactError> {
+    use std::os::unix::ffi::OsStrExt as _;
+
+    let path = CString::new(path.as_os_str().as_bytes()).map_err(|_| filesystem_error(display))?;
+    // SAFETY: `path` is NUL-terminated, and a successful descriptor is
+    // immediately owned by `File`.
+    let descriptor = unsafe {
+        libc::open(
+            path.as_ptr(),
+            libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+        )
+    };
+    if descriptor < 0 {
+        return Err(filesystem_error(display));
+    }
+    // SAFETY: `open` returned a new owned descriptor.
+    Ok(unsafe { File::from_raw_fd(descriptor) })
 }
 
 #[cfg(unix)]
@@ -826,6 +1059,114 @@ fn read_exact_installed_file_at_with_contract(
 }
 
 #[cfg(unix)]
+#[derive(Debug)]
+struct PinnedInstalledFile {
+    basename: &'static str,
+    display: &'static Path,
+    descriptor: File,
+    metadata: StableFileMetadata,
+    exact_bytes: Vec<u8>,
+}
+
+#[cfg(unix)]
+impl PinnedInstalledFile {
+    fn exact_bytes(&self) -> &[u8] {
+        &self.exact_bytes
+    }
+
+    fn into_exact_bytes(self) -> Vec<u8> {
+        self.exact_bytes
+    }
+
+    fn revalidate_from(
+        &self,
+        fresh_directory: &File,
+        cap: usize,
+        contract: InstalledFileContract,
+    ) -> Result<(), RuntimeArtifactError> {
+        let (retained_metadata, retained_bytes) =
+            read_stable_descriptor_bytes(&self.descriptor, self.display, cap, contract)?;
+        let fresh_descriptor = open_file_at(fresh_directory, self.basename, self.display)?;
+        let (fresh_metadata, fresh_bytes) =
+            read_stable_descriptor_bytes(&fresh_descriptor, self.display, cap, contract)?;
+        if retained_metadata != self.metadata
+            || fresh_metadata != self.metadata
+            || retained_bytes != self.exact_bytes
+            || fresh_bytes != self.exact_bytes
+        {
+            return Err(filesystem_error(self.display));
+        }
+        Ok(())
+    }
+}
+
+#[cfg(unix)]
+fn read_pinned_installed_file_at_with_contract(
+    directory: &File,
+    basename: &'static str,
+    display: &'static Path,
+    cap: usize,
+    contract: InstalledFileContract,
+) -> Result<PinnedInstalledFile, RuntimeArtifactError> {
+    let descriptor = open_file_at(directory, basename, display)?;
+    let (metadata, exact_bytes) =
+        read_stable_descriptor_bytes(&descriptor, display, cap, contract)?;
+    Ok(PinnedInstalledFile {
+        basename,
+        display,
+        descriptor,
+        metadata,
+        exact_bytes,
+    })
+}
+
+#[cfg(unix)]
+fn read_stable_descriptor_bytes(
+    descriptor: &File,
+    path: &Path,
+    cap: usize,
+    contract: InstalledFileContract,
+) -> Result<(StableFileMetadata, Vec<u8>), RuntimeArtifactError> {
+    use std::os::unix::fs::FileExt as _;
+
+    let before =
+        StableFileMetadata::new(&descriptor.metadata().map_err(|_| filesystem_error(path))?);
+    if !before.is_exact_installed_file(contract) {
+        return Err(filesystem_error(path));
+    }
+    if before.len > cap as u64 {
+        return Err(RuntimeArtifactError::LimitExceeded);
+    }
+    let mut bytes = vec![0_u8; before.len as usize];
+    let mut offset = 0_usize;
+    while offset < bytes.len() {
+        let count = descriptor
+            .read_at(&mut bytes[offset..], offset as u64)
+            .map_err(|_| filesystem_error(path))?;
+        if count == 0 {
+            return Err(filesystem_error(path));
+        }
+        offset = offset
+            .checked_add(count)
+            .ok_or(RuntimeArtifactError::LimitExceeded)?;
+    }
+    let mut extra = [0_u8; 1];
+    if descriptor
+        .read_at(&mut extra, offset as u64)
+        .map_err(|_| filesystem_error(path))?
+        != 0
+    {
+        return Err(RuntimeArtifactError::LimitExceeded);
+    }
+    let after =
+        StableFileMetadata::new(&descriptor.metadata().map_err(|_| filesystem_error(path))?);
+    if before != after || bytes.len() as u64 != after.len {
+        return Err(filesystem_error(path));
+    }
+    Ok((after, bytes))
+}
+
+#[cfg(unix)]
 fn open_verified_installed_member_at(
     directory: &File,
     name: &str,
@@ -877,6 +1218,7 @@ struct StableFileMetadata {
     dev: u64,
     ino: u64,
     is_file: bool,
+    is_directory: bool,
     mode: u32,
     uid: u32,
     gid: u32,
@@ -897,6 +1239,7 @@ impl StableFileMetadata {
             dev: metadata.dev(),
             ino: metadata.ino(),
             is_file: metadata.file_type().is_file(),
+            is_directory: metadata.file_type().is_dir(),
             mode: metadata.mode(),
             uid: metadata.uid(),
             gid: metadata.gid(),
@@ -934,6 +1277,119 @@ mod tests {
     const ROUTE_SIGNER: &[u8] = br#"{"version":1,"deployment_id":"route_deployment_a","signer_revision":1,"expected_previous":null,"signer":{"state":"active","active_kid":"fd56fed3251463eff0063169a7f8fa9dce585b6eee429581264297c98ec58bcb","secret_reference_id":"route_secret_a"},"public_key_ring_version":1,"public_key_ring_digest":"sha256:4e6fec49756e03044438af279f7bfd9507f06cf065ff0673447bd6377cd07ac0"}"#;
     const ROUTE_PRIVATE_KEY: &[u8] =
         include_bytes!("../../tests/fixtures/route_grant_private_ed25519.pem");
+
+    #[cfg(unix)]
+    fn open_test_route_directory(root: &Path) -> InstalledDirectoryPath {
+        use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
+
+        std::fs::set_permissions(root, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let metadata = std::fs::metadata(root).unwrap();
+        open_installed_directory_from(
+            root,
+            &["route-v2"],
+            InstalledDirectoryMode::Exact(0o700),
+            InstalledDirectoryOwner::Exact {
+                uid: metadata.uid(),
+                gid: metadata.gid(),
+            },
+        )
+        .unwrap()
+    }
+
+    #[cfg(unix)]
+    fn disabled_route_signer_bytes() -> Vec<u8> {
+        let mut disabled = decode_route_grant_v2_signer_reference(ROUTE_SIGNER).unwrap();
+        disabled.signer = RouteGrantV2SignerSelection::Disabled;
+        crate::route_grant_v2::encode_route_grant_v2_signer_reference(&disabled).unwrap()
+    }
+
+    #[cfg(unix)]
+    fn write_test_route_artifacts(directory: &Path, disabled: bool) {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        std::fs::create_dir(directory).unwrap();
+        std::fs::set_permissions(directory, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let reference = if disabled {
+            disabled_route_signer_bytes()
+        } else {
+            ROUTE_SIGNER.to_vec()
+        };
+        let reference_path = directory.join("signer.v1.json");
+        let ring_path = directory.join("public-key-ring.v1.json");
+        std::fs::write(&reference_path, reference).unwrap();
+        std::fs::write(&ring_path, ROUTE_RING).unwrap();
+        std::fs::set_permissions(&reference_path, std::fs::Permissions::from_mode(0o644)).unwrap();
+        std::fs::set_permissions(&ring_path, std::fs::Permissions::from_mode(0o644)).unwrap();
+        if disabled {
+            std::os::unix::fs::symlink(
+                "/definitely/not/a/route/key",
+                directory.join("signer-private-key.pem"),
+            )
+            .unwrap();
+        } else {
+            let private_path = directory.join("signer-private-key.pem");
+            std::fs::write(&private_path, ROUTE_PRIVATE_KEY).unwrap();
+            std::fs::set_permissions(&private_path, std::fs::Permissions::from_mode(0o600))
+                .unwrap();
+        }
+    }
+
+    #[cfg(unix)]
+    fn test_route_contracts(directory: &Path) -> (InstalledFileContract, InstalledFileContract) {
+        use std::os::unix::fs::MetadataExt as _;
+
+        let metadata = std::fs::metadata(directory.join("signer.v1.json")).unwrap();
+        (
+            InstalledFileContract {
+                uid: metadata.uid(),
+                gid: metadata.gid(),
+                mode: 0o644,
+            },
+            InstalledFileContract {
+                uid: metadata.uid(),
+                gid: metadata.gid(),
+                mode: 0o600,
+            },
+        )
+    }
+
+    #[cfg(unix)]
+    fn recreate_route_directory(directory: &Path, disabled: bool) {
+        let displaced = directory.with_file_name("route-v2-displaced");
+        std::fs::rename(directory, displaced).unwrap();
+        write_test_route_artifacts(directory, disabled);
+    }
+
+    #[cfg(unix)]
+    fn recreate_route_basename(
+        directory: &Path,
+        phase: RouteGrantV2ArtifactReadPhase,
+        disabled: bool,
+    ) {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let (basename, bytes, mode) = match phase {
+            RouteGrantV2ArtifactReadPhase::SignerReference => (
+                "signer.v1.json",
+                if disabled {
+                    disabled_route_signer_bytes()
+                } else {
+                    ROUTE_SIGNER.to_vec()
+                },
+                0o644,
+            ),
+            RouteGrantV2ArtifactReadPhase::PublicKeyRing => {
+                ("public-key-ring.v1.json", ROUTE_RING.to_vec(), 0o644)
+            }
+            RouteGrantV2ArtifactReadPhase::PrivateKey => {
+                ("signer-private-key.pem", ROUTE_PRIVATE_KEY.to_vec(), 0o600)
+            }
+        };
+        let path = directory.join(basename);
+        std::fs::rename(&path, directory.join(format!("{basename}.displaced"))).unwrap();
+        std::fs::write(&path, &bytes).unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(mode)).unwrap();
+    }
 
     #[test]
     fn fixed_manifest_vector_and_release_id_are_exact() {
@@ -1050,6 +1506,142 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
+    fn active_route_signer_rejects_directory_rename_recreate_after_every_read_phase() {
+        for target in [
+            RouteGrantV2ArtifactReadPhase::SignerReference,
+            RouteGrantV2ArtifactReadPhase::PublicKeyRing,
+            RouteGrantV2ArtifactReadPhase::PrivateKey,
+        ] {
+            let temp = tempfile::tempdir().unwrap();
+            let directory_path = temp.path().join("route-v2");
+            write_test_route_artifacts(&directory_path, false);
+            let (public_contract, private_contract) = test_route_contracts(&directory_path);
+            let retained = open_test_route_directory(temp.path());
+            let mut replaced = false;
+            let result = load_route_grant_v2_signer_from_with_phase(
+                &retained,
+                public_contract,
+                private_contract,
+                |phase| {
+                    if phase == target {
+                        recreate_route_directory(&directory_path, false);
+                        replaced = true;
+                    }
+                },
+            );
+            assert!(replaced, "read barrier for {target:?} was not reached");
+            assert!(
+                matches!(result, Err(RuntimeArtifactError::Filesystem { .. })),
+                "directory replacement after {target:?} escaped: {result:?}"
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn active_route_signer_rejects_exact_byte_basename_recreate_after_every_read_phase() {
+        for target in [
+            RouteGrantV2ArtifactReadPhase::SignerReference,
+            RouteGrantV2ArtifactReadPhase::PublicKeyRing,
+            RouteGrantV2ArtifactReadPhase::PrivateKey,
+        ] {
+            let temp = tempfile::tempdir().unwrap();
+            let directory_path = temp.path().join("route-v2");
+            write_test_route_artifacts(&directory_path, false);
+            let (public_contract, private_contract) = test_route_contracts(&directory_path);
+            let retained = open_test_route_directory(temp.path());
+            let mut replaced = false;
+            let result = load_route_grant_v2_signer_from_with_phase(
+                &retained,
+                public_contract,
+                private_contract,
+                |phase| {
+                    if phase == target {
+                        recreate_route_basename(&directory_path, target, false);
+                        replaced = true;
+                    }
+                },
+            );
+            assert!(replaced, "read barrier for {target:?} was not reached");
+            assert!(
+                matches!(result, Err(RuntimeArtifactError::Filesystem { .. })),
+                "exact-byte basename replacement after {target:?} escaped: {result:?}"
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn disabled_route_signer_rejects_path_drift_without_opening_private_material() {
+        for replace_directory in [false, true] {
+            for target in [
+                RouteGrantV2ArtifactReadPhase::SignerReference,
+                RouteGrantV2ArtifactReadPhase::PublicKeyRing,
+            ] {
+                let temp = tempfile::tempdir().unwrap();
+                let directory_path = temp.path().join("route-v2");
+                write_test_route_artifacts(&directory_path, true);
+                let (public_contract, private_contract) = test_route_contracts(&directory_path);
+                let retained = open_test_route_directory(temp.path());
+                let mut replaced = false;
+                let result = load_route_grant_v2_signer_from_with_phase(
+                    &retained,
+                    public_contract,
+                    private_contract,
+                    |phase| {
+                        assert_ne!(phase, RouteGrantV2ArtifactReadPhase::PrivateKey);
+                        if phase == target {
+                            if replace_directory {
+                                recreate_route_directory(&directory_path, true);
+                            } else {
+                                recreate_route_basename(&directory_path, target, true);
+                            }
+                            replaced = true;
+                        }
+                    },
+                );
+                assert!(replaced, "read barrier for {target:?} was not reached");
+                assert!(
+                    matches!(result, Err(RuntimeArtifactError::Filesystem { .. })),
+                    "disabled path replacement after {target:?} escaped: {result:?}"
+                );
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn public_route_ring_reader_rejects_directory_and_exact_byte_basename_recreate() {
+        for replace_directory in [false, true] {
+            let temp = tempfile::tempdir().unwrap();
+            let directory_path = temp.path().join("route-v2");
+            write_test_route_artifacts(&directory_path, false);
+            let (public_contract, _) = test_route_contracts(&directory_path);
+            let retained = open_test_route_directory(temp.path());
+            let mut replaced = false;
+            let result = load_route_grant_v2_public_key_ring_from_with_phase(
+                &retained,
+                public_contract,
+                |phase| {
+                    assert_eq!(phase, RouteGrantV2ArtifactReadPhase::PublicKeyRing);
+                    if replace_directory {
+                        recreate_route_directory(&directory_path, false);
+                    } else {
+                        recreate_route_basename(&directory_path, phase, false);
+                    }
+                    replaced = true;
+                },
+            );
+            assert!(replaced, "public-ring read barrier was not reached");
+            assert!(
+                matches!(result, Err(RuntimeArtifactError::Filesystem { .. })),
+                "public-ring path replacement escaped: {result:?}"
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
     fn route_signer_reader_pins_one_closed_set_and_redacts_private_material() {
         use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
 
@@ -1078,7 +1670,7 @@ mod tests {
             gid: metadata.gid(),
             mode: 0o600,
         };
-        let retained = File::open(&directory_path).unwrap();
+        let retained = open_test_route_directory(temp.path());
         let installed =
             load_route_grant_v2_signer_from(&retained, public_contract, private_contract).unwrap();
         assert_eq!(installed.exact_reference_bytes(), ROUTE_SIGNER);
@@ -1135,7 +1727,8 @@ mod tests {
             gid: metadata.gid(),
             mode: 0o644,
         };
-        let retained = File::open(&directory_path).unwrap();
+        std::fs::set_permissions(&directory_path, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let retained = open_test_route_directory(temp.path());
         let installed = load_route_grant_v2_signer_from(
             &retained,
             public_contract,
