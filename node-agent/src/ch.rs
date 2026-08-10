@@ -23,7 +23,7 @@
 //! per-Cat, file-backed memory zone and process_madvise(MADV_PAGEOUT), so it
 //! reclaims Guest RAM without depending on host swap.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::fs::{File, OpenOptions};
 use std::io::{self, BufRead, BufReader, Read, Write};
 use std::net::Ipv4Addr;
@@ -35,10 +35,12 @@ use std::process::{Child, Command, ExitStatus, Stdio};
 use std::time::{Duration, Instant};
 
 use anyhow::{bail, Context, Result};
-use cats_api::runtime_reconciliation::{IsolatedIpv4Kind, NetworkConfig, RandomId128};
+use cats_api::runtime_reconciliation::{
+    IsolatedIpv4Kind, NetworkConfig, RandomId128, RuntimeNetworkIdentity,
+};
 
 use crate::proc::ProcHandle;
-use crate::runtime_spine::RuntimeDesiredEffectContext;
+use crate::runtime_spine::{RuntimeDesiredEffectContext, RuntimePhysicalReadContext};
 
 /// Guest-agent vsock port (must match the guest image's init script).
 pub const GUEST_VSOCK_PORT: u32 = 5000;
@@ -318,6 +320,7 @@ impl TapCreatePort for PlatformTapCreatePort {
 
 enum IpCommandContext<'a> {
     Desired(&'a RuntimeDesiredEffectContext),
+    Physical(&'a dyn RuntimePhysicalReadContext),
     Standalone { deadline: Instant },
 }
 
@@ -325,6 +328,7 @@ impl IpCommandContext<'_> {
     fn deadline(&self) -> Instant {
         match self {
             Self::Desired(context) => context.deadline(),
+            Self::Physical(context) => context.deadline(),
             Self::Standalone { deadline } => *deadline,
         }
     }
@@ -332,6 +336,7 @@ impl IpCommandContext<'_> {
     fn check_active(&self) -> Result<()> {
         match self {
             Self::Desired(context) => context.check_active(),
+            Self::Physical(context) => context.check_active(),
             Self::Standalone { deadline } => {
                 anyhow::ensure!(
                     Instant::now() < *deadline,
@@ -574,6 +579,347 @@ impl Ipv4Cidr {
 struct HostIpv4Address {
     interface: String,
     cidr: Ipv4Cidr,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct HostNetworkLinkSnapshot {
+    ifindex: u32,
+    is_tap: bool,
+    is_up: bool,
+    alias: Option<String>,
+    ipv4: Vec<Ipv4Cidr>,
+}
+
+/// One bounded, stable view of every Host link and IPv4 address relevant to
+/// a checkpoint-first TAP reservation. The fields stay private so a caller
+/// cannot turn a link name or an alias string into provider evidence without
+/// applying the validation methods below.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct HostNetworkSnapshot {
+    links: BTreeMap<String, HostNetworkLinkSnapshot>,
+}
+
+#[derive(serde::Deserialize)]
+struct IpJsonLink {
+    ifindex: u32,
+    ifname: String,
+    flags: Vec<String>,
+    #[serde(default)]
+    ifalias: Option<String>,
+    #[serde(default)]
+    linkinfo: Option<IpJsonLinkInfo>,
+}
+
+#[derive(serde::Deserialize)]
+struct IpJsonLinkInfo {
+    info_kind: String,
+    #[serde(default)]
+    info_data: Option<IpJsonTunInfo>,
+}
+
+#[derive(serde::Deserialize)]
+struct IpJsonTunInfo {
+    #[serde(rename = "type")]
+    interface_type: Option<String>,
+}
+
+#[derive(serde::Deserialize)]
+struct IpJsonAddressLink {
+    ifindex: u32,
+    ifname: String,
+    #[serde(default)]
+    addr_info: Vec<IpJsonAddress>,
+}
+
+#[derive(serde::Deserialize)]
+struct IpJsonAddress {
+    family: String,
+    local: String,
+    prefixlen: u8,
+}
+
+impl HostNetworkSnapshot {
+    fn managed_networks(
+        &self,
+    ) -> Result<BTreeMap<String, (cats_api::runtime_reconciliation::Id, RandomId128, Ipv4Cidr)>>
+    {
+        let mut managed = BTreeMap::new();
+        let mut network_ids = BTreeSet::new();
+        let mut ownership_tokens = BTreeSet::new();
+        for (name, link) in &self.links {
+            let managed_name = is_managed_tap_name(name);
+            let alias = link.alias.as_deref();
+            let cats_alias = alias.is_some_and(|alias| alias.starts_with("cats-network"));
+            anyhow::ensure!(
+                managed_name == cats_alias,
+                "Host link {name} has an incomplete Cats network identity"
+            );
+            if !cats_alias {
+                continue;
+            }
+            let (network_id, ownership_token) =
+                parse_network_alias(alias.expect("cats_alias proves an alias is present"))?;
+            anyhow::ensure!(
+                link.is_tap && link.is_up && link.ipv4.len() == 1,
+                "managed Host network {name} is not one exact up TAP with one IPv4 address"
+            );
+            anyhow::ensure!(
+                network_ids.insert(network_id.clone()),
+                "Host network identity {network_id} is present more than once"
+            );
+            anyhow::ensure!(
+                ownership_tokens.insert(ownership_token.clone()),
+                "Host network ownership token is present more than once"
+            );
+            managed.insert(name.clone(), (network_id, ownership_token, link.ipv4[0]));
+        }
+        Ok(managed)
+    }
+
+    /// Require every physical Cats TAP to be the exact projection of one
+    /// durable network reservation. A reservation may legitimately be absent
+    /// before its later create effect, but a physical managed TAP without a
+    /// checkpoint must never be treated as harmless Host background state.
+    pub(crate) fn ensure_managed_networks_are_reserved<'a>(
+        &self,
+        reserved: impl IntoIterator<Item = &'a RuntimeNetworkIdentity>,
+    ) -> Result<()> {
+        let mut durable = BTreeMap::new();
+        for identity in reserved {
+            let network = ChNetwork {
+                tap: identity.tap_name.as_str().to_owned(),
+                ownership_token: identity.ownership_token.clone(),
+                config: identity.network_config.clone(),
+            };
+            validate_network_plan(&network)?;
+            anyhow::ensure!(
+                durable.insert(network.tap.clone(), network).is_none(),
+                "durable Host network reservations repeat one TAP name"
+            );
+        }
+        for (tap_name, (network_id, ownership_token, address)) in self.managed_networks()? {
+            let expected = durable
+                .get(&tap_name)
+                .context("physical Cats TAP lacks a durable reservation")?;
+            anyhow::ensure!(
+                expected.config.network_id.as_str() == network_id.as_str()
+                    && expected.ownership_token.as_str() == ownership_token.as_str()
+                    && Ipv4Cidr::parse(&host_cidr(expected))? == address,
+                "physical Cats TAP differs from its durable reservation"
+            );
+        }
+        Ok(())
+    }
+
+    /// Prove that a fresh random reservation does not reuse a Host link,
+    /// network identity, ownership token, or overlapping IPv4 range. Existing
+    /// managed links must themselves be well-formed TAPs so a foreign alias
+    /// cannot be ignored merely because the candidate chose another name.
+    pub(crate) fn ensure_candidate_available(&self, network: &ChNetwork) -> Result<()> {
+        validate_network_plan(network)?;
+        let desired = Ipv4Cidr::parse(&host_cidr(network))?;
+        let managed = self.managed_networks()?;
+        for (name, link) in &self.links {
+            if name == &network.tap {
+                anyhow::bail!("checkpointed Host tap name {name} already exists")
+            }
+            if let Some((network_id, ownership_token, _)) = managed.get(name) {
+                anyhow::ensure!(
+                    network_id != &network.config.network_id,
+                    "Host network identity {} is already present on {name}",
+                    network.config.network_id
+                );
+                anyhow::ensure!(
+                    ownership_token != &network.ownership_token,
+                    "Host network ownership token is already present on {name}"
+                );
+            }
+            for address in &link.ipv4 {
+                anyhow::ensure!(
+                    !address.overlaps(desired),
+                    "checkpointed Host network range {} overlaps {} on {name}",
+                    desired.display(),
+                    address.display()
+                );
+            }
+        }
+        Ok(())
+    }
+}
+
+fn is_managed_tap_name(name: &str) -> bool {
+    (4..=15).contains(&name.len())
+        && name.starts_with("cat")
+        && name
+            .bytes()
+            .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit())
+}
+
+fn parse_network_alias(alias: &str) -> Result<(cats_api::runtime_reconciliation::Id, RandomId128)> {
+    let mut fields = alias.split(':');
+    anyhow::ensure!(
+        fields.next() == Some("cats-network"),
+        "Host network alias is outside the Cats namespace"
+    );
+    let network_id = fields
+        .next()
+        .context("Cats Host network alias lacks network ID")?;
+    let ownership_token = fields
+        .next()
+        .context("Cats Host network alias lacks ownership token")?;
+    anyhow::ensure!(
+        fields.next().is_none(),
+        "Cats Host network alias has trailing fields"
+    );
+    Ok((
+        cats_api::runtime_reconciliation::Id::new(network_id.to_owned())
+            .context("Cats Host network alias has invalid network ID")?,
+        RandomId128::new(ownership_token.to_owned())
+            .context("Cats Host network alias has invalid ownership token")?,
+    ))
+}
+
+fn parse_ip_link_snapshot(bytes: &[u8]) -> Result<BTreeMap<String, HostNetworkLinkSnapshot>> {
+    let records: Vec<IpJsonLink> =
+        serde_json::from_slice(bytes).context("decode Host ip JSON link inventory")?;
+    anyhow::ensure!(
+        records.len() <= 131_072,
+        "Host link inventory exceeds the closed entry bound"
+    );
+    let mut links = BTreeMap::new();
+    let mut indexes = BTreeSet::new();
+    for record in records {
+        anyhow::ensure!(record.ifindex > 0, "Host link has zero ifindex");
+        anyhow::ensure!(
+            !record.ifname.is_empty()
+                && record.ifname.len() < libc::IFNAMSIZ
+                && !record.ifname.contains('@'),
+            "Host link inventory has an invalid interface name"
+        );
+        anyhow::ensure!(
+            indexes.insert(record.ifindex),
+            "Host link inventory repeats ifindex {}",
+            record.ifindex
+        );
+        if let Some(alias) = &record.ifalias {
+            anyhow::ensure!(
+                !alias.is_empty() && alias.len() <= 256,
+                "Host link alias is empty or exceeds 256 bytes"
+            );
+        }
+        let is_tap = record.linkinfo.as_ref().is_some_and(|linkinfo| {
+            linkinfo.info_kind == "tun"
+                && linkinfo
+                    .info_data
+                    .as_ref()
+                    .and_then(|data| data.interface_type.as_deref())
+                    == Some("tap")
+        });
+        let is_up = record.flags.iter().any(|flag| flag == "UP");
+        anyhow::ensure!(
+            links
+                .insert(
+                    record.ifname,
+                    HostNetworkLinkSnapshot {
+                        ifindex: record.ifindex,
+                        is_tap,
+                        is_up,
+                        alias: record.ifalias,
+                        ipv4: Vec::new(),
+                    },
+                )
+                .is_none(),
+            "Host link inventory repeats an interface name"
+        );
+    }
+    Ok(links)
+}
+
+fn add_ip_address_snapshot(
+    links: &mut BTreeMap<String, HostNetworkLinkSnapshot>,
+    bytes: &[u8],
+) -> Result<()> {
+    let records: Vec<IpJsonAddressLink> =
+        serde_json::from_slice(bytes).context("decode Host ip JSON IPv4 inventory")?;
+    anyhow::ensure!(
+        records.len() <= 131_072,
+        "Host IPv4 inventory exceeds the closed entry bound"
+    );
+    let mut address_records = BTreeSet::new();
+    for record in records {
+        anyhow::ensure!(
+            address_records.insert((record.ifindex, record.ifname.clone())),
+            "Host IPv4 inventory repeats one interface"
+        );
+        let link = links
+            .get_mut(&record.ifname)
+            .context("Host IPv4 inventory names an absent link")?;
+        anyhow::ensure!(
+            link.ifindex == record.ifindex,
+            "Host IPv4 inventory changed interface identity"
+        );
+        let mut addresses = Vec::new();
+        for address in record.addr_info {
+            anyhow::ensure!(
+                address.family == "inet",
+                "Host IPv4 inventory contains a non-IPv4 address"
+            );
+            addresses.push(Ipv4Cidr::parse(&format!(
+                "{}/{}",
+                address.local, address.prefixlen
+            ))?);
+        }
+        addresses.sort_by_key(|address| (u32::from(address.address), address.prefix_length));
+        anyhow::ensure!(
+            addresses.windows(2).all(|pair| pair[0] != pair[1]),
+            "Host IPv4 inventory repeats one address"
+        );
+        link.ipv4 = addresses;
+    }
+    Ok(())
+}
+
+fn host_network_snapshot_once(
+    ip_bin: &Path,
+    context: &IpCommandContext<'_>,
+) -> Result<HostNetworkSnapshot> {
+    let links = run_ip_command(context, ip_bin, &["-j", "-d", "link", "show"])?;
+    anyhow::ensure!(
+        links.status.success(),
+        "{} JSON link inventory failed: {}",
+        ip_bin.display(),
+        String::from_utf8_lossy(&links.stderr).trim()
+    );
+    let addresses = run_ip_command(context, ip_bin, &["-j", "-4", "address", "show"])?;
+    anyhow::ensure!(
+        addresses.status.success(),
+        "{} JSON IPv4 inventory failed: {}",
+        ip_bin.display(),
+        String::from_utf8_lossy(&addresses.stderr).trim()
+    );
+    let mut links = parse_ip_link_snapshot(&links.stdout)?;
+    add_ip_address_snapshot(&mut links, &addresses.stdout)?;
+    Ok(HostNetworkSnapshot { links })
+}
+
+/// Read the complete Host link/address set twice and accept it only when the
+/// two independent command snapshots are byte-semantically equal. This does
+/// not claim atomicity against arbitrary root mutation; it detects the
+/// ordinary rename/recreate/address windows and is always bracketed by the
+/// Node-global network allocation lock for checkpoint/effect use.
+pub(crate) fn inspect_host_network_snapshot(
+    ip_bin: &Path,
+    context: &dyn RuntimePhysicalReadContext,
+) -> Result<HostNetworkSnapshot> {
+    anyhow::ensure!(ip_bin.is_absolute(), "Host ip binary must be absolute");
+    let context = IpCommandContext::Physical(context);
+    let before = host_network_snapshot_once(ip_bin, &context)?;
+    let after = host_network_snapshot_once(ip_bin, &context)?;
+    anyhow::ensure!(
+        before == after,
+        "Host network inventory changed during the bounded physical scan"
+    );
+    Ok(after)
 }
 
 fn ipv4_addresses(output: &[u8]) -> Result<Vec<HostIpv4Address>> {
@@ -2072,6 +2418,193 @@ mod tests {
             prefix_length: 30,
             gateway_ipv4: Ipv4Address::new("10.240.0.5").unwrap(),
         }
+    }
+
+    fn network_snapshot(
+        links: serde_json::Value,
+        addresses: serde_json::Value,
+    ) -> Result<HostNetworkSnapshot> {
+        let mut links = parse_ip_link_snapshot(&serde_json::to_vec(&links).unwrap())?;
+        add_ip_address_snapshot(&mut links, &serde_json::to_vec(&addresses).unwrap())?;
+        Ok(HostNetworkSnapshot { links })
+    }
+
+    fn incumbent_network() -> RuntimeNetworkIdentity {
+        use cats_api::runtime_reconciliation::{Id, Ipv4Address, MacAddress};
+
+        RuntimeNetworkIdentity {
+            network_config: NetworkConfig {
+                kind: IsolatedIpv4Kind::IsolatedIpv4,
+                network_id: Id::new("net_old").unwrap(),
+                guest_mac: MacAddress::new("02:ca:0a:f0:00:02").unwrap(),
+                guest_ipv4: Ipv4Address::new("10.240.0.2").unwrap(),
+                prefix_length: 30,
+                gateway_ipv4: Ipv4Address::new("10.240.0.1").unwrap(),
+            },
+            tap_name: Id::new("catold000001").unwrap(),
+            ownership_token: RandomId128::new("bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb").unwrap(),
+        }
+    }
+
+    fn incumbent_link_json(alias: &str, address: &str) -> (serde_json::Value, serde_json::Value) {
+        (
+            serde_json::json!([
+                {
+                    "ifindex": 1,
+                    "ifname": "lo",
+                    "flags": ["LOOPBACK", "UP"]
+                },
+                {
+                    "ifindex": 17,
+                    "ifname": "catold000001",
+                    "flags": ["BROADCAST", "UP"],
+                    "ifalias": alias,
+                    "linkinfo": {
+                        "info_kind": "tun",
+                        "info_data": { "type": "tap" }
+                    }
+                }
+            ]),
+            serde_json::json!([
+                {
+                    "ifindex": 1,
+                    "ifname": "lo",
+                    "addr_info": [
+                        { "family": "inet", "local": "127.0.0.1", "prefixlen": 8 }
+                    ]
+                },
+                {
+                    "ifindex": 17,
+                    "ifname": "catold000001",
+                    "addr_info": [
+                        { "family": "inet", "local": address, "prefixlen": 30 }
+                    ]
+                }
+            ]),
+        )
+    }
+
+    #[test]
+    fn host_network_snapshot_closes_managed_aliases_and_candidate_collisions() {
+        let incumbent = incumbent_network();
+        let alias = format!(
+            "cats-network:{}:{}",
+            incumbent.network_config.network_id, incumbent.ownership_token
+        );
+        let (links, addresses) = incumbent_link_json(&alias, "10.240.0.1");
+        let snapshot = network_snapshot(links, addresses).unwrap();
+        snapshot
+            .ensure_managed_networks_are_reserved([&incumbent])
+            .unwrap();
+
+        let candidate = bind_desired_network(
+            &desired_network(),
+            "catnew000001".to_owned(),
+            RandomId128::new("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa").unwrap(),
+        )
+        .unwrap();
+        snapshot.ensure_candidate_available(&candidate).unwrap();
+
+        for conflicting in [
+            ChNetwork {
+                tap: incumbent.tap_name.as_str().to_owned(),
+                ..candidate.clone()
+            },
+            ChNetwork {
+                config: NetworkConfig {
+                    network_id: incumbent.network_config.network_id.clone(),
+                    ..candidate.config.clone()
+                },
+                ..candidate.clone()
+            },
+            ChNetwork {
+                ownership_token: incumbent.ownership_token.clone(),
+                ..candidate.clone()
+            },
+        ] {
+            assert!(snapshot.ensure_candidate_available(&conflicting).is_err());
+        }
+
+        let overlap = bind_desired_network(
+            &NetworkConfig {
+                network_id: cats_api::runtime_reconciliation::Id::new("net_overlap").unwrap(),
+                guest_mac: cats_api::runtime_reconciliation::MacAddress::new("02:ca:0a:f0:00:02")
+                    .unwrap(),
+                guest_ipv4: cats_api::runtime_reconciliation::Ipv4Address::new("10.240.0.2")
+                    .unwrap(),
+                gateway_ipv4: cats_api::runtime_reconciliation::Ipv4Address::new("10.240.0.1")
+                    .unwrap(),
+                ..desired_network()
+            },
+            "catnew000002".to_owned(),
+            RandomId128::new("cccccccccccccccccccccccccccccccc").unwrap(),
+        )
+        .unwrap();
+        assert!(snapshot.ensure_candidate_available(&overlap).is_err());
+    }
+
+    #[test]
+    fn host_network_snapshot_rejects_missing_corrupt_or_unbound_managed_identity() {
+        let incumbent = incumbent_network();
+        let alias = format!(
+            "cats-network:{}:{}",
+            incumbent.network_config.network_id, incumbent.ownership_token
+        );
+
+        let (mut links, addresses) = incumbent_link_json(&alias, "10.240.0.1");
+        links[1].as_object_mut().unwrap().remove("ifalias");
+        let missing = network_snapshot(links, addresses).unwrap();
+        assert!(missing
+            .ensure_candidate_available(&plan_network(&desired_network()).unwrap())
+            .is_err());
+
+        let (mut links, addresses) = incumbent_link_json("cats-network:broken", "10.240.0.1");
+        links[1]["ifname"] = serde_json::json!("catold000001");
+        let corrupt = network_snapshot(links, addresses).unwrap();
+        assert!(corrupt
+            .ensure_candidate_available(&plan_network(&desired_network()).unwrap())
+            .is_err());
+
+        let (links, addresses) = incumbent_link_json(&alias, "10.240.0.1");
+        let unbound = network_snapshot(links, addresses).unwrap();
+        assert!(unbound.ensure_managed_networks_are_reserved([]).is_err());
+
+        let (links, addresses) = incumbent_link_json(&alias, "10.240.0.5");
+        let wrong_address = network_snapshot(links, addresses).unwrap();
+        assert!(wrong_address
+            .ensure_managed_networks_are_reserved([&incumbent])
+            .is_err());
+    }
+
+    #[test]
+    fn host_network_snapshot_rejects_duplicate_managed_network_or_token() {
+        let incumbent = incumbent_network();
+        let alias = format!(
+            "cats-network:{}:{}",
+            incumbent.network_config.network_id, incumbent.ownership_token
+        );
+        let (mut links, mut addresses) = incumbent_link_json(&alias, "10.240.0.1");
+        links.as_array_mut().unwrap().push(serde_json::json!({
+            "ifindex": 18,
+            "ifname": "catold000002",
+            "flags": ["UP"],
+            "ifalias": alias,
+            "linkinfo": {
+                "info_kind": "tun",
+                "info_data": { "type": "tap" }
+            }
+        }));
+        addresses.as_array_mut().unwrap().push(serde_json::json!({
+            "ifindex": 18,
+            "ifname": "catold000002",
+            "addr_info": [
+                { "family": "inet", "local": "10.240.0.9", "prefixlen": 30 }
+            ]
+        }));
+        let duplicate = network_snapshot(links, addresses).unwrap();
+        assert!(duplicate
+            .ensure_candidate_available(&plan_network(&desired_network()).unwrap())
+            .is_err());
     }
 
     fn desired_effect_context(path: &Path) -> RuntimeDesiredEffectContext {
