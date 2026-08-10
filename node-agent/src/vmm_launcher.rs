@@ -290,6 +290,9 @@ mod linux {
         }
         api_parent.assert_current_and_absent()?;
         vsock_parent.assert_current_and_absent()?;
+        memory.assert_current(*memory_bytes)?;
+        serial_log.assert_current(0)?;
+        vmm_log.assert_current(0)?;
 
         install_fixed_fd(&checkpoint_file, CHECKPOINT_FD)?;
         install_fixed_fd(&vmm, VMM_FD)?;
@@ -321,6 +324,15 @@ mod linux {
             .stdout(Stdio::null())
             .stderr(Stdio::from(stderr))
             .current_dir("/");
+        // Bracket descriptor installation and command construction with one
+        // final lexical proof immediately before exec.  The fixed descriptors
+        // remain the launch authority, while these checks ensure the
+        // checkpointed canonical paths still name those same files.
+        api_parent.assert_current_and_absent()?;
+        vsock_parent.assert_current_and_absent()?;
+        memory.assert_current(*memory_bytes)?;
+        serial_log.assert_current(0)?;
+        vmm_log.assert_current(0)?;
         let error = command.exec();
         Err(error).context("exec exact Cloud Hypervisor descriptor")
     }
@@ -363,6 +375,7 @@ mod linux {
                 // SAFETY: systemd transfers ownership of LISTEN_FDS descriptors
                 // beginning at 3 to this process exactly once.
                 let file = unsafe { File::from_raw_fd(fd) };
+                set_close_on_exec(&file)?;
                 anyhow::ensure!(
                     files.insert(name, file).is_none(),
                     "duplicate systemd FD name"
@@ -379,6 +392,26 @@ mod linux {
 
         fn ensure_empty(&self) -> Result<()> {
             anyhow::ensure!(self.files.is_empty(), "systemd passed an unknown open file");
+            Ok(())
+        }
+    }
+
+    fn set_close_on_exec(file: &File) -> Result<()> {
+        // SAFETY: F_GETFD only reads flags from this live owned descriptor.
+        let flags = unsafe { libc::fcntl(file.as_raw_fd(), libc::F_GETFD) };
+        if flags < 0 {
+            return Err(io::Error::last_os_error())
+                .context("read systemd open-file descriptor flags");
+        }
+        // SAFETY: F_SETFD changes only the flags of this live owned
+        // descriptor.  The fixed 64+ launch descriptors are installed later
+        // without CLOEXEC; these original activation descriptors must not
+        // leak through the launcher-to-VMM exec.
+        let result =
+            unsafe { libc::fcntl(file.as_raw_fd(), libc::F_SETFD, flags | libc::FD_CLOEXEC) };
+        if result < 0 {
+            Err(io::Error::last_os_error()).context("set CLOEXEC on systemd open-file descriptor")
+        } else {
             Ok(())
         }
     }
@@ -537,9 +570,8 @@ mod linux {
 
     struct CheckedParent {
         path: PathBuf,
-        descriptor: File,
+        directories: DirectoryChain,
         basename: CString,
-        metadata: DirectoryIdentity,
     }
 
     impl CheckedParent {
@@ -553,38 +585,37 @@ mod linux {
             let parent = path
                 .parent()
                 .context("launch resource path has no parent")?;
-            let descriptor = open_directory_chain(parent)?;
-            let metadata = descriptor
-                .metadata()
-                .context("stat launch resource parent")?;
-            ensure_safe_directory(&metadata)?;
+            let directories = open_directory_chain(parent)?;
             Ok(Self {
                 path: path.to_path_buf(),
-                descriptor,
+                directories,
                 basename,
-                metadata: DirectoryIdentity::from(&metadata),
             })
         }
 
+        fn descriptor(&self) -> &File {
+            self.directories.leaf()
+        }
+
         fn ensure_absent(&self) -> Result<()> {
-            match stat_at(&self.descriptor, &self.basename) {
+            match stat_at(self.descriptor(), &self.basename) {
                 Ok(_) => anyhow::bail!("launch resource already exists: {}", self.path.display()),
                 Err(error) if error.raw_os_error() == Some(libc::ENOENT) => Ok(()),
                 Err(error) => Err(error).context("inspect launch resource path"),
             }
         }
 
-        fn assert_current_and_absent(&self) -> Result<()> {
+        fn assert_current(&self) -> Result<Self> {
             let current = Self::open(&self.path)?;
             anyhow::ensure!(
-                current.metadata == self.metadata,
-                "launch resource parent changed"
+                self.directories.retained_matches(&current.directories)?,
+                "launch resource ancestor chain changed"
             );
-            anyhow::ensure!(
-                current.descriptor.metadata()?.dev() == self.descriptor.metadata()?.dev()
-                    && current.descriptor.metadata()?.ino() == self.descriptor.metadata()?.ino(),
-                "launch resource parent pathname changed"
-            );
+            Ok(current)
+        }
+
+        fn assert_current_and_absent(&self) -> Result<()> {
+            let current = self.assert_current()?;
             self.ensure_absent()?;
             current.ensure_absent()
         }
@@ -606,7 +637,7 @@ mod linux {
             // symlink adoption at the leaf.
             let fd = unsafe {
                 libc::openat(
-                    parent.descriptor.as_raw_fd(),
+                    parent.descriptor().as_raw_fd(),
                     parent.basename.as_ptr(),
                     libc::O_RDWR
                         | libc::O_CREAT
@@ -628,35 +659,68 @@ mod linux {
                 metadata.mode() & 0o7777 == 0o600,
                 "launch file mode changed"
             );
+            let current_parent = CheckedParent::open(path)?;
+            anyhow::ensure!(
+                parent
+                    .directories
+                    .retained_matches_after_leaf_creation(&current_parent.directories)?,
+                "launch resource ancestor changed while its leaf was created"
+            );
+            let current_path = stat_at(current_parent.descriptor(), &current_parent.basename)
+                .context("reopen newly-created VMM launch file")?;
+            anyhow::ensure!(
+                same_stable_file(&metadata, &current_path),
+                "new VMM launch file pathname is not exact"
+            );
             Ok(Self {
-                parent,
+                parent: current_parent,
                 file,
                 device: metadata.dev(),
                 inode: metadata.ino(),
             })
         }
-    }
 
-    impl Drop for OwnedLaunchFile {
-        fn drop(&mut self) {
-            let Ok(metadata) = stat_at(&self.parent.descriptor, &self.parent.basename) else {
-                return;
-            };
-            if metadata.dev() != self.device || metadata.ino() != self.inode {
-                return;
-            }
-            // SAFETY: the retained parent and exact matching basename identify
-            // only the file created by this process. Failure leaves it for the
-            // checkpoint-aware recovery path; it never broadens deletion.
-            let _ = unsafe {
-                libc::unlinkat(
-                    self.parent.descriptor.as_raw_fd(),
-                    self.parent.basename.as_ptr(),
-                    0,
-                )
-            };
+        fn assert_current(&self, expected_length: u64) -> Result<()> {
+            let before = self
+                .file
+                .metadata()
+                .context("stat retained VMM launch file")?;
+            ensure_owned_launch_file(&before, expected_length)?;
+            anyhow::ensure!(
+                before.dev() == self.device && before.ino() == self.inode,
+                "retained VMM launch file identity changed"
+            );
+            let retained_path = stat_at(self.parent.descriptor(), &self.parent.basename)
+                .context("reinspect retained VMM launch file path")?;
+            let current_parent = self.parent.assert_current()?;
+            let current_path = stat_at(current_parent.descriptor(), &current_parent.basename)
+                .context("reopen current VMM launch file path")?;
+            let after = self
+                .file
+                .metadata()
+                .context("re-stat retained VMM launch file")?;
+            anyhow::ensure!(
+                same_stable_file(&before, &after)
+                    && same_stable_file(&before, &retained_path)
+                    && same_stable_file(&before, &current_path),
+                "VMM launch file pathname or contents changed"
+            );
+            Ok(())
         }
     }
+
+    fn ensure_owned_launch_file(metadata: &std::fs::Metadata, expected_length: u64) -> Result<()> {
+        ensure_regular_root_file(metadata, 0o600)?;
+        anyhow::ensure!(
+            metadata.len() == expected_length,
+            "VMM launch file length changed"
+        );
+        Ok(())
+    }
+
+    // Intentionally no Drop unlink: a check-then-unlink cleanup can delete a
+    // foreign pathname replacement.  Any failed or ambiguous launch leaves
+    // its no-replace file for checkpoint-aware fresh-full recovery.
 
     #[derive(Clone, Copy, PartialEq, Eq)]
     struct DirectoryIdentity {
@@ -687,9 +751,88 @@ mod linux {
                 changed_nanoseconds: metadata.ctime_nsec(),
             }
         }
+
+        fn same_node_and_policy(&self, other: &Self) -> bool {
+            self.device == other.device
+                && self.inode == other.inode
+                && self.mode == other.mode
+                && self.uid == other.uid
+                && self.gid == other.gid
+                && self.links == other.links
+        }
     }
 
-    fn open_directory_chain(path: &Path) -> Result<File> {
+    struct RetainedDirectory {
+        descriptor: File,
+        identity: DirectoryIdentity,
+    }
+
+    struct DirectoryChain {
+        directories: Vec<RetainedDirectory>,
+    }
+
+    impl DirectoryChain {
+        fn leaf(&self) -> &File {
+            &self
+                .directories
+                .last()
+                .expect("absolute paths retain at least the root directory")
+                .descriptor
+        }
+
+        fn retained_matches(&self, current: &Self) -> Result<bool> {
+            if self.directories.len() != current.directories.len() {
+                return Ok(false);
+            }
+            for (retained, reopened) in self.directories.iter().zip(&current.directories) {
+                let retained_metadata = retained
+                    .descriptor
+                    .metadata()
+                    .context("reinspect retained launch ancestor")?;
+                ensure_safe_directory(&retained_metadata)?;
+                if DirectoryIdentity::from(&retained_metadata) != retained.identity
+                    || retained.identity != reopened.identity
+                {
+                    return Ok(false);
+                }
+            }
+            Ok(true)
+        }
+
+        fn retained_matches_after_leaf_creation(&self, current: &Self) -> Result<bool> {
+            if self.directories.len() != current.directories.len() {
+                return Ok(false);
+            }
+            let last = self.directories.len().saturating_sub(1);
+            for (index, (retained, reopened)) in self
+                .directories
+                .iter()
+                .zip(&current.directories)
+                .enumerate()
+            {
+                let retained_metadata = retained
+                    .descriptor
+                    .metadata()
+                    .context("reinspect launch ancestor after leaf creation")?;
+                ensure_safe_directory(&retained_metadata)?;
+                let retained_current = DirectoryIdentity::from(&retained_metadata);
+                if index == last {
+                    if !retained_current.same_node_and_policy(&retained.identity)
+                        || retained_current != reopened.identity
+                    {
+                        return Ok(false);
+                    }
+                } else if retained_current != retained.identity
+                    || retained.identity != reopened.identity
+                {
+                    return Ok(false);
+                }
+            }
+            Ok(true)
+        }
+    }
+
+    fn open_directory_chain(path: &Path) -> Result<DirectoryChain> {
         // SAFETY: fixed NUL-terminated path and flags; returned descriptor is
         // immediately owned by File on success.
         let root_fd = unsafe {
@@ -703,6 +846,12 @@ mod linux {
         }
         // SAFETY: successful open returned one owned descriptor.
         let mut current = unsafe { File::from_raw_fd(root_fd) };
+        let root_metadata = current.metadata().context("stat launch root directory")?;
+        ensure_safe_directory(&root_metadata)?;
+        let mut directories = vec![RetainedDirectory {
+            descriptor: current,
+            identity: DirectoryIdentity::from(&root_metadata),
+        }];
         for component in path.components() {
             match component {
                 Component::RootDir => continue,
@@ -713,7 +862,11 @@ mod linux {
                     // checked relative component with no NUL.
                     let fd = unsafe {
                         libc::openat(
-                            current.as_raw_fd(),
+                            directories
+                                .last()
+                                .expect("root is retained")
+                                .descriptor
+                                .as_raw_fd(),
                             name.as_ptr(),
                             libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
                         )
@@ -724,14 +877,21 @@ mod linux {
                     }
                     // SAFETY: successful openat returned one owned descriptor.
                     current = unsafe { File::from_raw_fd(fd) };
-                    ensure_safe_directory(&current.metadata()?)?;
+                    let metadata = current
+                        .metadata()
+                        .context("stat launch directory component")?;
+                    ensure_safe_directory(&metadata)?;
+                    directories.push(RetainedDirectory {
+                        descriptor: current,
+                        identity: DirectoryIdentity::from(&metadata),
+                    });
                 }
                 Component::CurDir | Component::ParentDir | Component::Prefix(_) => {
                     anyhow::bail!("launch resource path is not canonical")
                 }
             }
         }
-        Ok(current)
+        Ok(DirectoryChain { directories })
     }
 
     fn ensure_safe_directory(metadata: &std::fs::Metadata) -> Result<()> {
@@ -771,9 +931,13 @@ mod linux {
         } else {
             // SAFETY: fcntl operates only on this live descriptor.
             let flags = unsafe { libc::fcntl(target, libc::F_GETFD) };
-            if flags < 0
-                || unsafe { libc::fcntl(target, libc::F_SETFD, flags & !libc::FD_CLOEXEC) } < 0
-            {
+            if flags < 0 {
+                return Err(io::Error::last_os_error())
+                    .with_context(|| format!("read VMM descriptor flags {target}"));
+            }
+            // SAFETY: F_SETFD changes only the flags of the live fixed target.
+            let result = unsafe { libc::fcntl(target, libc::F_SETFD, flags & !libc::FD_CLOEXEC) };
+            if result < 0 {
                 return Err(io::Error::last_os_error())
                     .with_context(|| format!("clear CLOEXEC on VMM descriptor {target}"));
             }
@@ -789,6 +953,88 @@ mod linux {
             Err(io::Error::last_os_error()).context("duplicate VMM log descriptor")
         } else {
             Ok(duplicate)
+        }
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use std::io::Write as _;
+        use std::os::fd::AsRawFd as _;
+        use std::os::unix::fs::OpenOptionsExt as _;
+
+        use super::*;
+
+        fn running_as_root() -> bool {
+            // SAFETY: geteuid has no pointer arguments or side effects.
+            unsafe { libc::geteuid() == 0 }
+        }
+
+        fn launch_path() -> (tempfile::TempDir, PathBuf) {
+            let root = tempfile::tempdir().unwrap();
+            let parent = root.path().join("cat/runtime");
+            std::fs::create_dir_all(&parent).unwrap();
+            (root, parent.join("launch.file"))
+        }
+
+        #[test]
+        fn systemd_open_file_descriptors_are_made_close_on_exec() {
+            let file = tempfile::tempfile().unwrap();
+            // SAFETY: F_GETFD reads flags from the live test descriptor.
+            let flags = unsafe { libc::fcntl(file.as_raw_fd(), libc::F_GETFD) };
+            assert!(flags >= 0);
+            // SAFETY: F_SETFD changes only this live test descriptor.
+            assert!(
+                unsafe { libc::fcntl(file.as_raw_fd(), libc::F_SETFD, flags & !libc::FD_CLOEXEC,) }
+                    >= 0
+            );
+
+            set_close_on_exec(&file).unwrap();
+
+            // SAFETY: F_GETFD reads flags from the live test descriptor.
+            let after = unsafe { libc::fcntl(file.as_raw_fd(), libc::F_GETFD) };
+            assert!(after & libc::FD_CLOEXEC != 0);
+        }
+
+        #[test]
+        fn launch_file_rejects_leaf_replacement_and_never_unlinks_it_on_drop() {
+            if !running_as_root() {
+                return;
+            }
+            let (_root, path) = launch_path();
+            let owned = OwnedLaunchFile::create(&path).unwrap();
+            owned.assert_current(0).unwrap();
+            let moved = path.with_extension("moved");
+            std::fs::rename(&path, &moved).unwrap();
+            let mut replacement = std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .mode(0o600)
+                .open(&path)
+                .unwrap();
+            replacement.write_all(b"foreign").unwrap();
+            replacement.sync_all().unwrap();
+
+            assert!(owned.assert_current(0).is_err());
+            drop(owned);
+            assert_eq!(std::fs::read(&path).unwrap(), b"foreign");
+        }
+
+        #[test]
+        fn launch_file_rejects_an_ancestor_move_away_and_back() {
+            if !running_as_root() {
+                return;
+            }
+            let (root, path) = launch_path();
+            let owned = OwnedLaunchFile::create(&path).unwrap();
+            owned.assert_current(0).unwrap();
+            let ancestor = root.path().join("cat");
+            let moved = root.path().join("moved-cat");
+            std::fs::rename(&ancestor, &moved).unwrap();
+            std::fs::write(moved.join("aba-marker"), b"changed").unwrap();
+            std::fs::remove_file(moved.join("aba-marker")).unwrap();
+            std::fs::rename(&moved, &ancestor).unwrap();
+
+            assert!(owned.assert_current(0).is_err());
         }
     }
 }

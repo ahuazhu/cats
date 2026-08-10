@@ -68,6 +68,15 @@ mod systemd_root_provision;
     reason = "fixed VMM launch artifacts are staged before StartRuntime composition"
 )]
 mod vmm_launch_artifacts;
+// This sealed process boundary is staged immediately before the full VMM
+// inventory/adopt composition.  It already consumes the exact checkpoint and
+// pinned artifact descriptors; only that follow-up may mint an accepted-full
+// launch permit.
+#[expect(
+    dead_code,
+    reason = "checkpointed VMM systemd port awaits full-inventory composition"
+)]
+mod vmm_process;
 mod volume_transitions;
 
 pub(crate) mod inventory_probe_sealed {

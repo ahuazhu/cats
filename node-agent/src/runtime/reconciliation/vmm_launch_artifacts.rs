@@ -39,6 +39,30 @@ pub(crate) struct RetainedVmmLaunchArtifacts {
     kernel_cmdline: AsciiText,
 }
 
+/// Borrowed, already-validated descriptors transferred into the fixed VMM
+/// launcher through systemd's `OpenFile=` contract.  Fields stay private so a
+/// caller cannot substitute a pathname or unrelated file after projecting the
+/// checkpoint.
+pub(crate) struct VmmLaunchArtifactDescriptors<'a> {
+    vmm_executable: &'a File,
+    kernel: &'a File,
+    initramfs: Option<&'a File>,
+}
+
+impl VmmLaunchArtifactDescriptors<'_> {
+    pub(crate) fn vmm_executable(&self) -> &File {
+        self.vmm_executable
+    }
+
+    pub(crate) fn kernel(&self) -> &File {
+        self.kernel
+    }
+
+    pub(crate) fn initramfs(&self) -> Option<&File> {
+        self.initramfs
+    }
+}
+
 impl RetainedVmmLaunchArtifacts {
     pub(crate) fn open(paths: &VmmLaunchArtifactPaths) -> Result<Self> {
         Self::open_from(Path::new("/"), paths, InstalledOwner::Root)
@@ -128,6 +152,14 @@ impl RetainedVmmLaunchArtifacts {
                 .context("installed Guest initramfs changed")?;
         }
         Ok(())
+    }
+
+    pub(crate) fn descriptors(&self) -> VmmLaunchArtifactDescriptors<'_> {
+        VmmLaunchArtifactDescriptors {
+            vmm_executable: &self.vmm_executable.descriptor,
+            kernel: &self.kernel.descriptor,
+            initramfs: self.initramfs.as_ref().map(|artifact| &artifact.descriptor),
+        }
     }
 
     #[cfg(test)]

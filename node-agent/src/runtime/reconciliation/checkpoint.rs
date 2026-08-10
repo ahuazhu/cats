@@ -129,6 +129,48 @@ pub(super) struct CurrentCheckpointGuard<'a> {
     _writer: MutexGuard<'a, ()>,
 }
 
+/// Descriptor-retained form of one exact current Runtime checkpoint.
+///
+/// A manager-spawned launcher cannot safely reopen the checkpoint by path: a
+/// pathname replacement between the Agent's final authority check and
+/// `execve` would create a second launch input.  This value keeps the store's
+/// per-Cat writer serialization, the exact decoded checkpoint and the opened
+/// leaf descriptor together across that process boundary.
+pub(super) struct RetainedCurrentCheckpoint<'a> {
+    store: &'a FileCheckpointStore,
+    expected: &'a StoredCheckpoint,
+    _current: CurrentCheckpointGuard<'a>,
+    descriptor: File,
+}
+
+impl RetainedCurrentCheckpoint<'_> {
+    pub(super) fn descriptor(&self) -> &File {
+        &self.descriptor
+    }
+
+    pub(super) fn checkpoint(&self) -> &RuntimeCheckpoint {
+        self.expected.checkpoint()
+    }
+
+    pub(super) fn assert_current(&self) -> Result<(), CheckpointStoreError> {
+        let metadata = self.descriptor.metadata().map_err(|source| {
+            io_error(
+                "reinspect retained runtime checkpoint",
+                &self.store.target_path,
+                source,
+            )
+        })?;
+        verify_regular_single_link(&self.descriptor, &self.store.target_path)?;
+        if FileIdentity::from_metadata(&metadata) != self.expected.file_identity {
+            return Err(CheckpointStoreError::ConcurrentUpdate {
+                path: self.store.target_path.clone(),
+            });
+        }
+        self.store
+            .verify_expected(ExpectedTarget::Exact(self.expected))
+    }
+}
+
 impl FileCheckpointStore {
     /// Opens (and, when absent, creates) the protected checkpoint directory.
     /// The final directory component and the per-Cat lock file must not be
@@ -492,6 +534,48 @@ impl FileCheckpointStore {
         _guard: &CurrentCheckpointGuard<'_>,
     ) -> Result<(), CheckpointStoreError> {
         self.verify_expected(ExpectedTarget::Exact(expected))
+    }
+
+    /// Retain the exact current checkpoint file and the writer guard which
+    /// keeps it current for one bounded external process submission.
+    pub(super) fn retain_current_checkpoint<'a>(
+        &'a self,
+        expected: &'a StoredCheckpoint,
+    ) -> Result<RetainedCurrentCheckpoint<'a>, CheckpointStoreError> {
+        let current = self.assert_current(expected)?;
+        let descriptor = open_at(
+            &self.directory,
+            &self.target_name,
+            libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_CLOEXEC | libc::O_NONBLOCK,
+            0,
+        )
+        .map_err(|source| {
+            map_open_error(
+                "retain current runtime checkpoint",
+                &self.target_path,
+                source,
+            )
+        })?;
+        verify_regular_single_link(&descriptor, &self.target_path)?;
+        let identity = FileIdentity::from_metadata(&descriptor.metadata().map_err(|source| {
+            io_error(
+                "inspect retained runtime checkpoint",
+                &self.target_path,
+                source,
+            )
+        })?);
+        if identity != expected.file_identity {
+            return Err(CheckpointStoreError::ConcurrentUpdate {
+                path: self.target_path.clone(),
+            });
+        }
+        self.revalidate_current(expected, &current)?;
+        Ok(RetainedCurrentCheckpoint {
+            store: self,
+            expected,
+            _current: current,
+            descriptor,
+        })
     }
 
     /// Re-establishes the directory durability barrier after a caller lost a
@@ -1754,5 +1838,47 @@ fn io_error(operation: &'static str, path: &Path, source: io::Error) -> Checkpoi
         operation,
         path: path.to_path_buf(),
         source,
+    }
+}
+
+#[cfg(test)]
+mod retained_checkpoint_tests {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    use cats_api::runtime_reconciliation::decode_runtime_checkpoint;
+
+    use super::*;
+
+    #[test]
+    fn retained_checkpoint_rejects_a_lexical_leaf_replacement() {
+        let checkpoint = decode_runtime_checkpoint(include_bytes!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../testdata/runtime-reconciliation-v1-start-runtime-checkpoint.json"
+        )))
+        .unwrap();
+        let root = tempfile::tempdir().unwrap();
+        let store = FileCheckpointStore::open(root.path(), &checkpoint.cat_id).unwrap();
+        let stored = store.create(&checkpoint).unwrap();
+        let retained = store.retain_current_checkpoint(&stored).unwrap();
+        retained.assert_current().unwrap();
+
+        let moved = root.path().join("moved.checkpoint");
+        std::fs::rename(store.path(), &moved).unwrap();
+        std::fs::write(
+            store.path(),
+            encode_runtime_checkpoint(&checkpoint).unwrap(),
+        )
+        .unwrap();
+        std::fs::set_permissions(store.path(), std::fs::Permissions::from_mode(0o600)).unwrap();
+
+        assert!(matches!(
+            retained.assert_current(),
+            Err(CheckpointStoreError::ConcurrentUpdate { .. })
+        ));
+        assert_eq!(
+            retained.descriptor().metadata().unwrap().ino(),
+            std::fs::metadata(moved).unwrap().ino(),
+            "the retained descriptor still names the original leaf"
+        );
     }
 }

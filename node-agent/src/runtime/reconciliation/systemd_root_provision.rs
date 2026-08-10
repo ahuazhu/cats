@@ -46,7 +46,7 @@ use super::serving_blockd_process::{
     ServingBlockdProcessInspection, ServingBlockdProcessPort, ServingBlockdProcessStart,
 };
 
-const SYSTEMD_RUN: &str = "/usr/bin/systemd-run";
+pub(super) const SYSTEMD_RUN: &str = "/usr/bin/systemd-run";
 const SYSTEMCTL: &str = "/usr/bin/systemctl";
 const SYSTEM_SLICE: &str = "system.slice";
 const CGROUP_ROOT: &str = "/sys/fs/cgroup";
@@ -59,7 +59,7 @@ const AUTHORIZED_CONTROL_SPEC: &str = "authorized-serving.json";
 const STATUS_MAX_BYTES: usize = 64 * 1024;
 const COMMAND_OUTPUT_MAX_BYTES: usize = 32 * 1024;
 const POLL_INTERVAL: Duration = Duration::from_millis(5);
-const UNSET_PROCESS_ENVIRONMENT: [&str; 7] = [
+pub(super) const UNSET_PROCESS_ENVIRONMENT: [&str; 7] = [
     "AWS_ACCESS_KEY_ID",
     "AWS_SECRET_ACCESS_KEY",
     "AWS_SESSION_TOKEN",
@@ -133,7 +133,7 @@ enum SystemdInspection {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum SystemdStartSubmission {
+pub(super) enum SystemdStartSubmission {
     Submitted,
     OutcomeUnknown,
     DefinitelyNotStarted,
@@ -1028,12 +1028,24 @@ fn platform_submit_systemd(
 ) -> anyhow::Result<SystemdStartSubmission> {
     validate_launch(launch)?;
     let command = systemd_run_command(launch);
-    match run_bounded(command, context)? {
-        BoundedCommandResult::Exited(output) if output.status.success() => {
-            Ok(SystemdStartSubmission::Submitted)
+    Ok(submit_fixed_systemd_command(command, context))
+}
+
+/// Run the short-lived fixed `systemd-run` helper without ever exposing an
+/// error after it may have contacted PID 1.  Callers must resolve every
+/// `OutcomeUnknown` from a newly accepted full physical inventory rather than
+/// repeating the same submission in the current batch.
+pub(super) fn submit_fixed_systemd_command(
+    command: Command,
+    context: &RuntimeDesiredEffectContext,
+) -> SystemdStartSubmission {
+    match run_bounded(command, context) {
+        Ok(BoundedCommandResult::Exited(output)) if output.status.success() => {
+            SystemdStartSubmission::Submitted
         }
-        BoundedCommandResult::Exited(_) => Ok(SystemdStartSubmission::OutcomeUnknown),
-        BoundedCommandResult::Cancelled => Ok(SystemdStartSubmission::OutcomeUnknown),
+        Ok(BoundedCommandResult::Exited(_)) | Ok(BoundedCommandResult::Cancelled) | Err(_) => {
+            SystemdStartSubmission::OutcomeUnknown
+        }
     }
 }
 
@@ -1238,7 +1250,7 @@ fn validate_launch(launch: &TransientServiceLaunch) -> anyhow::Result<()> {
     Ok(())
 }
 
-fn sanitized_systemd_command(command: &mut Command) {
+pub(super) fn sanitized_systemd_command(command: &mut Command) {
     command
         .env_clear()
         .env("LANG", "C")
