@@ -63,7 +63,7 @@ use super::root_provision_process::{
     ExactRootProvisionProcessProof, RetainedRootProvisionPhysicalIdentity,
     RetainedRootProvisionProcessAttempt, RootProvisionAuthoritySnapshot,
     RootProvisionBlockdHandshake, RootProvisionProcessEvidence, RootProvisionProcessExpectation,
-    RootProvisionProcessRetirementPort,
+    RootProvisionProcessRetirementPort, TargetControlProcessLaunchIdentity,
 };
 use super::{FileCheckpointStore, StoredCheckpoint};
 
@@ -168,6 +168,14 @@ impl TargetControlAuthorizationIdentity {
 
     pub(crate) fn content_sha256(&self) -> &Sha256Digest {
         &self.content_sha256
+    }
+
+    pub(crate) fn process_launch_identity(&self) -> TargetControlProcessLaunchIdentity {
+        TargetControlProcessLaunchIdentity::new(
+            self.path.clone(),
+            self.artifact.provision_transition_id.clone(),
+            self.artifact.provision_context_digest.clone(),
+        )
     }
 }
 
@@ -393,6 +401,18 @@ pub(crate) struct TargetControlAuthorizationReady {
     retained_target: RetainedFile,
 }
 
+#[derive(Debug)]
+pub(crate) enum ReopenedTargetControlAuthorization {
+    Absent,
+    Exact(Box<TargetControlAuthorizationReady>),
+}
+
+#[derive(Debug)]
+pub(crate) enum ReopenedServingHandoff {
+    Absent(Box<TargetControlAuthorizationReady>),
+    Exact(Box<ServingHandoffReady>),
+}
+
 impl TargetControlAuthorizationReady {
     pub(crate) fn identity(&self) -> &TargetControlAuthorizationIdentity {
         &self.identity
@@ -481,6 +501,129 @@ impl ServingHandoffStore {
             #[cfg(test)]
             mutation_once: Mutex::new(None),
         }
+    }
+
+    /// Reopen the deterministic target artifact through the protected state
+    /// and attachment descriptors. `Exact` retains the attachment flock and
+    /// every predecessor descriptor; a naked path observation is never
+    /// returned to an effect caller.
+    pub(crate) fn reopen_target_control_authorization(
+        &self,
+        stored_checkpoint: &StoredCheckpoint,
+        acquired: &AuthorizedBlockdCheckpoint,
+        authority: &ServingAuthorityTargetEvidence,
+    ) -> Result<ReopenedTargetControlAuthorization> {
+        let candidate = build_target_candidate(
+            &self.state_directory,
+            stored_checkpoint,
+            acquired,
+            authority,
+        )?;
+        let target_name = target_control_file_name(&candidate.provision_transition_id);
+        let temporary_name = target_control_temp_name(&candidate.provision_transition_id);
+        let retained = RetainedAttachmentContext::open_and_lock(
+            self.state_directory.clone(),
+            &candidate.data_directory,
+            acquired,
+            &target_name,
+            &temporary_name,
+        )?;
+        ensure_no_unpublished_handoff_temp(&retained.attachment_directory, &temporary_name)?;
+        let target_name_c = c_string(&target_name)?;
+        if read_optional_bounded(
+            &retained.attachment_directory,
+            &target_name_c,
+            TARGET_AUTHORIZED_SERVING_MAX_BYTES,
+        )?
+        .is_none()
+        {
+            return Ok(ReopenedTargetControlAuthorization::Absent);
+        }
+        let target_path = host_path(
+            &candidate.data_directory.join(&target_name),
+            "reopened target control authorization path",
+        )?;
+        let retained_target = RetainedFile::open_required(
+            &retained.attachment_directory,
+            &target_name,
+            target_path,
+            TARGET_AUTHORIZED_SERVING_MAX_BYTES,
+        )?;
+        let artifact = decode_target_control_authorization(&retained_target.bytes)?;
+        let expected = target_control_artifact(stored_checkpoint, &retained, &candidate)?;
+        anyhow::ensure!(
+            artifact == expected,
+            "reopened target control authorization conflicts with current authority"
+        );
+        let ready = TargetControlAuthorizationReady {
+            identity: target_control_identity(&retained_target, artifact),
+            retained,
+            retained_target,
+        };
+        ready.assert_current(stored_checkpoint)?;
+        Ok(ReopenedTargetControlAuthorization::Exact(Box::new(ready)))
+    }
+
+    /// Reopen a sealed handoff while keeping the exact target and attachment
+    /// descriptors live. `Absent` returns that retained target so the caller
+    /// can perform one global process reinspection and publish without an ABA
+    /// gap.
+    pub(crate) fn reopen_serving_handoff(
+        &self,
+        stored_checkpoint: &StoredCheckpoint,
+        target_ready: TargetControlAuthorizationReady,
+    ) -> Result<ReopenedServingHandoff> {
+        target_ready.assert_current(stored_checkpoint)?;
+        let directory = &target_ready.retained.attachment_directory;
+        ensure_no_unpublished_handoff_temp(
+            directory,
+            &target_control_temp_name(&target_ready.identity.artifact.provision_transition_id),
+        )?;
+        let record_name = c_string(SERVING_HANDOFF_RECORD_FILE)?;
+        if read_optional_bounded(directory, &record_name, SERVING_HANDOFF_RECORD_MAX_BYTES)?
+            .is_none()
+        {
+            return Ok(ReopenedServingHandoff::Absent(Box::new(target_ready)));
+        }
+        let record_path = host_path(
+            &target_ready
+                .retained
+                .data_directory
+                .join(SERVING_HANDOFF_RECORD_FILE),
+            "reopened serving handoff record path",
+        )?;
+        let retained_record = RetainedFile::open_required(
+            directory,
+            SERVING_HANDOFF_RECORD_FILE,
+            record_path.clone(),
+            SERVING_HANDOFF_RECORD_MAX_BYTES,
+        )?;
+        let record = decode_serving_handoff_record(&retained_record.bytes)?;
+        anyhow::ensure!(
+            record.target_control_authorization == target_ready.identity,
+            "reopened handoff record changed target-control identity"
+        );
+        let record_identity = ServingHandoffRecordIdentity {
+            path: record_path,
+            device: retained_record.identity.device,
+            inode: retained_record.identity.inode,
+            length: retained_record.identity.length,
+            content_sha256: retained_record.identity.content_sha256.clone(),
+        };
+        let TargetControlAuthorizationReady {
+            retained,
+            retained_target,
+            ..
+        } = target_ready;
+        let ready = ServingHandoffReady {
+            retained,
+            retained_target,
+            retained_record,
+            record_identity,
+            record,
+        };
+        ready.assert_current(stored_checkpoint)?;
+        Ok(ReopenedServingHandoff::Exact(Box::new(ready)))
     }
 
     /// Serialized pre-scan recovery for one deterministic unpublished temp.
@@ -587,26 +730,7 @@ impl ServingHandoffStore {
             &target_name,
             &temporary_name,
         )?;
-        let ReconcileStep::ProvisionRootImage {
-            scope_id,
-            control_socket_path,
-            ..
-        } = &stored_checkpoint.checkpoint().step
-        else {
-            unreachable!("target candidate accepted only provision_root_image")
-        };
-        let target_artifact = TargetControlAuthorizationArtifact {
-            version: ContractVersion::V1,
-            provision_transition_id: candidate.provision_transition_id.clone(),
-            request: provision_root_image_request(stored_checkpoint.checkpoint())?,
-            provision_context_digest: provision_root_authorization_context_digest(
-                stored_checkpoint.checkpoint(),
-            )?,
-            runtime_scope_id: scope_id.clone(),
-            control_socket_path: control_socket_path.clone(),
-            local_state: retained.local_state.clone(),
-            attachment: candidate.target_attachment,
-        };
+        let target_artifact = target_control_artifact(stored_checkpoint, &retained, &candidate)?;
         let target_bytes = encode_target_control_authorization(&target_artifact)
             .context("encode target-head control authorization")?;
         self.persist_immutable(
@@ -662,6 +786,25 @@ impl ServingHandoffStore {
     ) -> Result<ServingHandoffReady> {
         let target_ready =
             self.seal_target_control_authorization(stored_checkpoint, acquired, authority)?;
+        self.seal_serving_ready_from_target(
+            target_ready,
+            stored_checkpoint,
+            acquired,
+            authority,
+            reloaded_process,
+        )
+    }
+
+    /// Publish/replay the record while consuming the exact retained target
+    /// proof used for the immediately preceding global process reinspection.
+    pub(crate) fn seal_serving_ready_from_target(
+        &self,
+        target_ready: TargetControlAuthorizationReady,
+        stored_checkpoint: &StoredCheckpoint,
+        acquired: &AuthorizedBlockdCheckpoint,
+        authority: &ServingAuthorityTargetEvidence,
+        reloaded_process: &ExactRootProvisionProcessProof,
+    ) -> Result<ServingHandoffReady> {
         target_ready.assert_current(stored_checkpoint)?;
         let checkpoint = stored_checkpoint.checkpoint();
         let candidate = build_target_candidate(
@@ -876,19 +1019,6 @@ impl ServingHandoffStore {
             .assert_current(stored_checkpoint)
             .context("retain exact checkpoint during serving handoff retirement")?;
         retained.assert_current()?;
-        let absence = prove_exact_root_provision_process_absence(
-            checkpoint_store,
-            stored_checkpoint,
-            RootProvisionAuthoritySnapshot {
-                attachment: acquired.attachment.clone(),
-                volume: &authority.volume,
-            },
-            executable_path,
-            process_port,
-            context,
-        )?;
-        validate_absence_for_retirement(&absence, stored_checkpoint, acquired, &candidate)?;
-
         let target_path = host_path(
             &candidate.data_directory.join(&target_name),
             "retained retirement target-control path",
@@ -914,6 +1044,24 @@ impl ServingHandoffStore {
             target_artifact.attachment == candidate.target_attachment,
             "retirement target-control authorization is not the exact authority target"
         );
+        let target_launch = TargetControlProcessLaunchIdentity::new(
+            retained_target.identity.path.clone(),
+            target_artifact.provision_transition_id.clone(),
+            target_artifact.provision_context_digest.clone(),
+        );
+        let absence = prove_exact_root_provision_process_absence(
+            checkpoint_store,
+            stored_checkpoint,
+            RootProvisionAuthoritySnapshot {
+                attachment: acquired.attachment.clone(),
+                volume: &authority.volume,
+            },
+            executable_path,
+            Some(target_launch),
+            process_port,
+            context,
+        )?;
+        validate_absence_for_retirement(&absence, stored_checkpoint, acquired, &candidate)?;
 
         let record_path = host_path(
             &candidate.data_directory.join(SERVING_HANDOFF_RECORD_FILE),
@@ -1119,6 +1267,36 @@ impl ServingHandoffStore {
             &target_temp_name,
         )?;
         retained.assert_current()?;
+        let target_path = host_path(
+            &candidate.data_directory.join(&target_name),
+            "rotation target-control authorization path",
+        )?;
+        anyhow::ensure!(
+            read_optional_bounded(
+                &retained.attachment_directory,
+                &c_string(&target_temp_name)?,
+                TARGET_AUTHORIZED_SERVING_MAX_BYTES,
+            )?
+            .is_none(),
+            "token rotation target-control authorization retained an unpublished temp"
+        );
+        let retained_target = RetainedFile::open_required(
+            &retained.attachment_directory,
+            &target_name,
+            target_path,
+            TARGET_AUTHORIZED_SERVING_MAX_BYTES,
+        )?;
+        let target_artifact = decode_target_control_authorization(&retained_target.bytes)?;
+        validate_target_checkpoint_context(&target_artifact, stored_checkpoint)?;
+        anyhow::ensure!(
+            target_artifact.attachment == candidate.target_attachment,
+            "token rotation target-control authorization is not the exact authority target"
+        );
+        let target_launch = TargetControlProcessLaunchIdentity::new(
+            retained_target.identity.path.clone(),
+            target_artifact.provision_transition_id.clone(),
+            target_artifact.provision_context_digest.clone(),
+        );
         let absence = prove_exact_root_provision_process_absence(
             checkpoint_store,
             stored_checkpoint,
@@ -1127,6 +1305,7 @@ impl ServingHandoffStore {
                 volume: &authority.volume,
             },
             executable_path,
+            Some(target_launch),
             process_port,
             context,
         )?;
@@ -1173,31 +1352,6 @@ impl ServingHandoffStore {
         let receipt = decode_serving_handoff_retirement_receipt(&retained_receipt.bytes)?;
         validate_receipt_for_current_attempt(&receipt, stored_checkpoint, acquired, &candidate)?;
         accepted_full_strictly_succeeds_retirement(&receipt, &absence)?;
-        let target_path = host_path(
-            &candidate.data_directory.join(&target_name),
-            "rotation target-control authorization path",
-        )?;
-        anyhow::ensure!(
-            read_optional_bounded(
-                &retained.attachment_directory,
-                &c_string(&target_temp_name)?,
-                TARGET_AUTHORIZED_SERVING_MAX_BYTES,
-            )?
-            .is_none(),
-            "token rotation target-control authorization retained an unpublished temp"
-        );
-        let retained_target = RetainedFile::open_required(
-            &retained.attachment_directory,
-            &target_name,
-            target_path,
-            TARGET_AUTHORIZED_SERVING_MAX_BYTES,
-        )?;
-        let target_artifact = decode_target_control_authorization(&retained_target.bytes)?;
-        validate_target_checkpoint_context(&target_artifact, stored_checkpoint)?;
-        anyhow::ensure!(
-            target_artifact.attachment == candidate.target_attachment,
-            "token rotation target-control authorization is not the exact authority target"
-        );
         validate_receipt_target_binding(&receipt, &target_artifact, &retained_target)?;
 
         let mut successor = stored_checkpoint.checkpoint().clone();
@@ -1581,6 +1735,33 @@ fn build_target_candidate(
         data_directory: deterministic_directory,
         provision_transition_id: provision_transition_id.clone(),
         target_attachment,
+    })
+}
+
+fn target_control_artifact(
+    stored_checkpoint: &StoredCheckpoint,
+    retained: &RetainedAttachmentContext,
+    candidate: &TargetControlCandidate,
+) -> Result<TargetControlAuthorizationArtifact> {
+    let ReconcileStep::ProvisionRootImage {
+        scope_id,
+        control_socket_path,
+        ..
+    } = &stored_checkpoint.checkpoint().step
+    else {
+        anyhow::bail!("target-control artifact requires provision_root_image")
+    };
+    Ok(TargetControlAuthorizationArtifact {
+        version: ContractVersion::V1,
+        provision_transition_id: candidate.provision_transition_id.clone(),
+        request: provision_root_image_request(stored_checkpoint.checkpoint())?,
+        provision_context_digest: provision_root_authorization_context_digest(
+            stored_checkpoint.checkpoint(),
+        )?,
+        runtime_scope_id: scope_id.clone(),
+        control_socket_path: control_socket_path.clone(),
+        local_state: retained.local_state.clone(),
+        attachment: candidate.target_attachment.clone(),
     })
 }
 
@@ -2168,22 +2349,7 @@ pub(crate) fn validate_scanned_serving_handoff_artifacts(
     retirement: Option<&ScannedServingHandoffArtifact<'_>>,
 ) -> Result<Option<RetainedRootProvisionProcessAttempt>> {
     let checkpoint_digest = checkpoint_content_digest(checkpoint)?;
-    let target_artifact = decode_target_control_authorization(target.bytes)?;
-    validate_scanned_artifact_bytes(target, target.bytes)?;
-    anyhow::ensure!(
-        target_artifact.attachment.identity == acquired.attachment.identity
-            && target.path.as_str()
-                == format!(
-                    "{}/{}",
-                    target_artifact
-                        .local_state
-                        .attachment_directory
-                        .path
-                        .as_str(),
-                    target_control_file_name(&target_artifact.provision_transition_id)
-                ),
-        "scanned target-control artifact is outside its exact authorized lineage"
-    );
+    let target_artifact = validate_scanned_target_control(checkpoint, acquired, target)?;
 
     let decoded_record = record
         .map(|file| {
@@ -2282,6 +2448,11 @@ pub(crate) fn validate_scanned_serving_handoff_artifacts(
                 expected_provisioned_head: decoded.expected_provisioned_head.clone(),
                 attachment: target_artifact.attachment.clone(),
                 executable_path: decoded.expected_control_executable_path.clone(),
+                target_control_launch: TargetControlProcessLaunchIdentity::new(
+                    target.path.clone(),
+                    target_artifact.provision_transition_id.clone(),
+                    target_artifact.provision_context_digest.clone(),
+                ),
                 physical_identity: RetainedRootProvisionPhysicalIdentity {
                     process_id: u32::try_from(decoded.old_control_process.process_id.get())
                         .context("sealed old control process PID exceeds the platform PID domain")?,
@@ -2374,6 +2545,63 @@ pub(crate) fn validate_scanned_serving_handoff_artifacts(
         }
     }
     Ok(retained_process)
+}
+
+/// Provider-private target-wrapper identity from the same canonical bytes and
+/// physical identity already accepted by the full data-directory scan. This
+/// carries no serving proof and cannot authorize a start without reopening
+/// the retained descriptor.
+pub(crate) fn scanned_target_control_process_launch(
+    checkpoint: &RuntimeCheckpoint,
+    acquired: &AuthorizedBlockdCheckpoint,
+    target: &ScannedServingHandoffArtifact<'_>,
+) -> Result<TargetControlProcessLaunchIdentity> {
+    let artifact = validate_scanned_target_control(checkpoint, acquired, target)?;
+    Ok(TargetControlProcessLaunchIdentity::new(
+        target.path.clone(),
+        artifact.provision_transition_id,
+        artifact.provision_context_digest,
+    ))
+}
+
+fn validate_scanned_target_control(
+    checkpoint: &RuntimeCheckpoint,
+    acquired: &AuthorizedBlockdCheckpoint,
+    target: &ScannedServingHandoffArtifact<'_>,
+) -> Result<TargetControlAuthorizationArtifact> {
+    let target_artifact = decode_target_control_authorization(target.bytes)?;
+    validate_scanned_artifact_bytes(target, target.bytes)?;
+    anyhow::ensure!(
+        target_artifact.attachment.identity == acquired.attachment.identity
+            && target.path.as_str()
+                == format!(
+                    "{}/{}",
+                    target_artifact
+                        .local_state
+                        .attachment_directory
+                        .path
+                        .as_str(),
+                    target_control_file_name(&target_artifact.provision_transition_id)
+                ),
+        "scanned target-control artifact is outside its exact authorized lineage"
+    );
+    match &checkpoint.step {
+        ReconcileStep::ProvisionRootImage { .. } => {
+            validate_target_checkpoint_value(&target_artifact, checkpoint)?;
+        }
+        ReconcileStep::PrepareDevice { .. } => {
+            // The complete record/Prepare binding is validated by the caller;
+            // the target itself still has to preserve the same attachment.
+            anyhow::ensure!(
+                target_artifact.attachment.identity == acquired.attachment.identity,
+                "PrepareDevice target-control artifact changed attachment lineage"
+            );
+        }
+        _ => {
+            anyhow::bail!("target-control artifacts require provision_root_image or PrepareDevice")
+        }
+    }
+    Ok(target_artifact)
 }
 
 fn validate_scanned_artifact_bytes(
@@ -2938,6 +3166,26 @@ fn validate_handoff_namespace(
     Ok(())
 }
 
+fn ensure_no_unpublished_handoff_temp(directory: &File, expected_target_temp: &str) -> Result<()> {
+    for (name, maximum) in [
+        (expected_target_temp, TARGET_AUTHORIZED_SERVING_MAX_BYTES),
+        (
+            SERVING_HANDOFF_RECORD_TEMP,
+            SERVING_HANDOFF_RECORD_MAX_BYTES,
+        ),
+        (
+            SERVING_HANDOFF_RETIREMENT_TEMP,
+            SERVING_HANDOFF_RETIREMENT_MAX_BYTES,
+        ),
+    ] {
+        anyhow::ensure!(
+            read_optional_bounded(directory, &c_string(name)?, maximum)?.is_none(),
+            "serving handoff effect requires pre-scan recovery of unpublished temp {name}"
+        );
+    }
+    Ok(())
+}
+
 struct DirectoryStream(*mut libc::DIR);
 
 impl DirectoryStream {
@@ -3259,25 +3507,39 @@ mod tests {
     use std::cell::Cell;
     use std::collections::VecDeque;
     use std::os::unix::fs::{symlink, MetadataExt as _, PermissionsExt as _};
+    use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Arc;
     use std::time::{Duration, Instant};
 
     use cats_api::runtime_reconciliation::{
         spec_digest, AdmissionInventoryAttestation, AgentSession, AppliedDesiredEvidence,
-        AsciiText, AssignedKind, AssignedPlacement, CheckpointEvidence, DiskKind, Generation,
-        GuestDeviceIdentity, GuestTransportEvidence, Ipv4Address, IsolatedIpv4Kind,
+        AsciiText, AssignedKind, AssignedPlacement, CheckpointEvidence, Condition, DiskKind,
+        Generation, GuestDeviceIdentity, GuestTransportEvidence, Ipv4Address, IsolatedIpv4Kind,
         LifecycleAdmission, MacAddress, NetworkConfig, NodeBootId, NodeObservation,
         NormalAcquireRequest, NormalAcquireResult, ObservedRuntimeStatus, PrepareDeviceFrontend,
-        RequireIdleCheckpoint, RuntimeCheckpoint, RuntimeConfig, RuntimeTarget, RuntimeTransition,
-        Sequence, ServingAuthorityProvenance, ServingBlockdIdentity, UnixMillis, VolumeAccess,
-        VolumeAcquire, VolumeAdminState, VolumeAuthorityEvidence, VolumeDisposition, VolumeIntent,
-        WarmSnapshotEvidence,
+        ProgressingReason, RequireIdleCheckpoint, RuntimeCheckpoint, RuntimeConfig, RuntimeTarget,
+        RuntimeTransition, Sequence, ServingAuthorityProvenance, ServingBlockdIdentity, UnixMillis,
+        VolumeAccess, VolumeAcquire, VolumeAdminState, VolumeAuthorityEvidence, VolumeDisposition,
+        VolumeIntent, WarmSnapshotEvidence,
     };
-    use cats_storage::authority::LastVolumeTransition;
+    use cats_storage::authority::{
+        AuthorityError, LastVolumeTransition, RenewLeaseRequest, RenewLeaseResult,
+        VolumeDataAuthority, VolumeHeadCasRequest, VolumeHeadCasResult,
+    };
+    use cats_storage::{
+        encode_image_manifest, BlobError, BlobStore, ImageManifestV1, LowerHexSha256,
+    };
 
     use super::*;
     use crate::runtime::reconciliation::root_provision_process::{
-        retirement_sealed as root_process_retirement_sealed, RootProvisionProcessRetirementPort,
+        global_sealed as root_process_global_sealed,
+        retirement_sealed as root_process_retirement_sealed,
+        target_start_sealed as target_process_start_sealed, CheckpointedTargetControlProcess,
+        RootProvisionProcessGlobalPort, RootProvisionProcessRetirementPort,
+        RootProvisionProcessStart, TargetControlProcessPort,
+    };
+    use crate::runtime::reconciliation::serving_handoff_effect::{
+        ServingHandoffEffect, ServingHandoffEffectProgress,
     };
     use crate::runtime::reconciliation::signed_running::prepared_owned_observed_volume;
     use crate::runtime::reconciliation::{
@@ -3324,6 +3586,168 @@ mod tests {
                 .unwrap()
                 .pop_front()
                 .unwrap_or(RootProvisionProcessInspection::Unavailable))
+        }
+    }
+
+    struct FixedEffectAuthority {
+        record: Mutex<VolumeRecord>,
+        loads: AtomicUsize,
+    }
+
+    impl FixedEffectAuthority {
+        fn new(record: VolumeRecord) -> Self {
+            Self {
+                record: Mutex::new(record),
+                loads: AtomicUsize::new(0),
+            }
+        }
+    }
+
+    impl VolumeDataAuthority for FixedEffectAuthority {
+        fn load_volume(&self, volume_id: &Id) -> std::result::Result<VolumeRecord, AuthorityError> {
+            self.loads.fetch_add(1, Ordering::SeqCst);
+            let record = self.record.lock().unwrap().clone();
+            (record.volume_id == *volume_id)
+                .then_some(record)
+                .ok_or(AuthorityError::NotFound)
+        }
+
+        fn renew_lease(
+            &self,
+            _request: &RenewLeaseRequest,
+        ) -> std::result::Result<RenewLeaseResult, AuthorityError> {
+            unreachable!("serving handoff effect is read-only authority")
+        }
+
+        fn compare_and_swap_head(
+            &self,
+            _request: &VolumeHeadCasRequest,
+        ) -> std::result::Result<VolumeHeadCasResult, AuthorityError> {
+            unreachable!("serving handoff effect never mutates authority")
+        }
+    }
+
+    struct ExactManifestBlob(Vec<u8>);
+
+    impl BlobStore for ExactManifestBlob {
+        fn put_immutable(&self, _key: &str, _data: &[u8]) -> std::result::Result<(), BlobError> {
+            unreachable!("serving handoff effect never writes image objects")
+        }
+
+        fn get(&self, _key: &str) -> std::result::Result<Vec<u8>, BlobError> {
+            Ok(self.0.clone())
+        }
+
+        fn exists(&self, _key: &str) -> std::result::Result<bool, BlobError> {
+            unreachable!()
+        }
+
+        fn delete(&self, _key: &str) -> std::result::Result<(), BlobError> {
+            unreachable!()
+        }
+
+        fn list(&self, _prefix: &str) -> std::result::Result<Vec<String>, BlobError> {
+            unreachable!()
+        }
+    }
+
+    struct EffectGlobalProcessPort {
+        inspections: Mutex<VecDeque<RootProvisionProcessInspection>>,
+        calls: AtomicUsize,
+    }
+
+    impl root_process_global_sealed::Sealed for EffectGlobalProcessPort {}
+
+    impl RootProvisionProcessGlobalPort for EffectGlobalProcessPort {
+        fn inspect_exact_or_absent_after_node_global_sweep(
+            &self,
+            _expected: &RootProvisionProcessExpectation,
+            context: &dyn RuntimePhysicalReadContext,
+        ) -> Result<RootProvisionProcessInspection> {
+            context.check_active()?;
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            Ok(self
+                .inspections
+                .lock()
+                .unwrap()
+                .pop_front()
+                .unwrap_or(RootProvisionProcessInspection::Unavailable))
+        }
+    }
+
+    #[derive(Clone, Copy)]
+    enum AuthorityDrift {
+        BackToBlank,
+        ForeignOwner,
+    }
+
+    struct AuthorityDriftingGlobalPort {
+        authority: Arc<FixedEffectAuthority>,
+        drift: AuthorityDrift,
+    }
+
+    impl root_process_global_sealed::Sealed for AuthorityDriftingGlobalPort {}
+
+    impl RootProvisionProcessGlobalPort for AuthorityDriftingGlobalPort {
+        fn inspect_exact_or_absent_after_node_global_sweep(
+            &self,
+            _expected: &RootProvisionProcessExpectation,
+            context: &dyn RuntimePhysicalReadContext,
+        ) -> Result<RootProvisionProcessInspection> {
+            context.check_active()?;
+            let mut record = self.authority.record.lock().unwrap();
+            match self.drift {
+                AuthorityDrift::BackToBlank => record.head = blank_head(),
+                AuthorityDrift::ForeignOwner => {
+                    record.lease_owner = Some(id("att_foreign"));
+                }
+            }
+            Ok(RootProvisionProcessInspection::Absent)
+        }
+    }
+
+    struct EffectTargetProcessPort {
+        starts: AtomicUsize,
+        evidence: RootProvisionProcessEvidence,
+        outcome: EffectTargetProcessOutcome,
+    }
+
+    #[derive(Clone, Copy)]
+    enum EffectTargetProcessOutcome {
+        Started,
+        ResponseLost,
+        CancelledClean,
+    }
+
+    impl target_process_start_sealed::Sealed for EffectTargetProcessPort {}
+
+    impl TargetControlProcessPort for EffectTargetProcessPort {
+        fn start_target_checkpointed(
+            &self,
+            checkpointed: CheckpointedTargetControlProcess<'_>,
+            context: &RuntimeDesiredEffectContext,
+        ) -> Result<RootProvisionProcessStart> {
+            context.check_active()?;
+            checkpointed.assert_current()?;
+            self.starts.fetch_add(1, Ordering::SeqCst);
+            anyhow::ensure!(
+                self.evidence.exactly_matches(checkpointed.expected()),
+                "fake target process evidence is not exact"
+            );
+            match self.outcome {
+                EffectTargetProcessOutcome::ResponseLost => {
+                    return Ok(RootProvisionProcessStart::Ambiguous)
+                }
+                EffectTargetProcessOutcome::CancelledClean => {
+                    context.cancel_for_test();
+                    return Ok(RootProvisionProcessStart::CancelledClean);
+                }
+                EffectTargetProcessOutcome::Started => {}
+            }
+            checkpointed.assert_current()?;
+            Ok(RootProvisionProcessStart::Started(Box::new(
+                self.evidence.clone(),
+            )))
         }
     }
 
@@ -3442,6 +3866,19 @@ mod tests {
             inventory_read_position: Sequence::new(12).unwrap(),
             accepted_at_unix_ms: UnixMillis::new(1_900_000_000_000).unwrap(),
         };
+        let mut observed_volumes = checkpoint.volumes.clone();
+        let [observed_volume] = observed_volumes.as_mut_slice() else {
+            panic!("fixture checkpoint must carry one Root Volume")
+        };
+        observed_volume.authority = VolumeAuthorityEvidence::Owned {
+            attachment_id: fixture.acquired.attachment.identity.attachment_id.clone(),
+            attachment_epoch: fixture.acquired.attachment.identity.attachment_epoch,
+            head: fixture.authority.volume.head.clone(),
+        };
+        for lineage in &mut observed_volume.local_lineages {
+            lineage.local_durable_generation = fixture.authority.volume.head.generation;
+            lineage.remote_durable_generation = fixture.authority.volume.head.generation;
+        }
         let runtime = ObservedRuntimeStatus {
             cat_id: checkpoint.cat_id.clone(),
             applied_desired: Some(AppliedDesiredEvidence {
@@ -3476,7 +3913,7 @@ mod tests {
                 updated_at_unix_ms: checkpoint.updated_at_unix_ms,
             },
             processes,
-            volumes: checkpoint.volumes.clone(),
+            volumes: observed_volumes,
             mounts: checkpoint.mounts.clone(),
             networks: checkpoint.networks.clone(),
             guest_transport: checkpoint.guest_transport.clone(),
@@ -3484,7 +3921,11 @@ mod tests {
             lifecycle_admission: checkpoint.lifecycle_admission,
             routes: Vec::new(),
             platform_guards: 0,
-            conditions: Vec::new(),
+            conditions: vec![Condition::Progressing {
+                reason: ProgressingReason::ReconcileStep {
+                    step: checkpoint.step.clone(),
+                },
+            }],
         };
         let observation = NodeObservation {
             version: ContractVersion::V1,
@@ -3780,7 +4221,9 @@ mod tests {
             updated_at_unix_ms: UnixMillis::new(1_720_000_000_000).unwrap(),
         };
         encode_runtime_checkpoint(&checkpoint).expect("fixture checkpoint is valid");
-        let checkpoint_directory = root.path().join("runtime-checkpoints");
+        let checkpoint_directory = root
+            .path()
+            .join(super::super::clean_slate_probes::CHECKPOINT_NAMESPACE);
         let checkpoint_store =
             FileCheckpointStore::open(&checkpoint_directory, &checkpoint.cat_id).unwrap();
         let stored_checkpoint = checkpoint_store.create(&checkpoint).unwrap();
@@ -3917,8 +4360,25 @@ mod tests {
             .expect("target-control proof remains current");
         drop(control);
 
+        let ReopenedTargetControlAuthorization::Exact(reopened) = store
+            .reopen_target_control_authorization(
+                &fixture.stored_checkpoint,
+                &fixture.acquired,
+                &fixture.authority,
+            )
+            .expect("reopen exact target control recovery grant")
+        else {
+            panic!("published target authorization must reopen exact")
+        };
+        let ReopenedServingHandoff::Absent(reopened) = store
+            .reopen_serving_handoff(&fixture.stored_checkpoint, *reopened)
+            .expect("classify absent handoff record under retained target")
+        else {
+            panic!("record must be absent before the seal effect")
+        };
         let ready = store
-            .seal_serving_ready(
+            .seal_serving_ready_from_target(
+                *reopened,
                 &fixture.stored_checkpoint,
                 &fixture.acquired,
                 &fixture.authority,
@@ -3941,6 +4401,25 @@ mod tests {
             decode_serving_handoff_record(&std::fs::read(fixture.record_path()).unwrap()).unwrap(),
             *ready.record()
         );
+        drop(ready);
+
+        let ReopenedTargetControlAuthorization::Exact(reopened) = store
+            .reopen_target_control_authorization(
+                &fixture.stored_checkpoint,
+                &fixture.acquired,
+                &fixture.authority,
+            )
+            .unwrap()
+        else {
+            panic!("target must remain exact")
+        };
+        let ReopenedServingHandoff::Exact(ready) = store
+            .reopen_serving_handoff(&fixture.stored_checkpoint, *reopened)
+            .expect("reopen exact sealed handoff")
+        else {
+            panic!("sealed handoff must reopen Ready")
+        };
+        ready.assert_current(&fixture.stored_checkpoint).unwrap();
 
         assert_eq!(
             std::fs::read(&fixture.blank_authorization_path).unwrap(),
@@ -4014,6 +4493,422 @@ mod tests {
             current.checkpoint().step,
             ReconcileStep::PrepareDevice { .. }
         ));
+    }
+
+    #[test]
+    fn serving_handoff_effect_converges_one_effect_per_fresh_full_without_repeating_start() {
+        let fixture = fixture();
+        let blank_bytes = std::fs::read(&fixture.blank_authorization_path).unwrap();
+        let blank_inode = std::fs::metadata(&fixture.blank_authorization_path)
+            .unwrap()
+            .ino();
+        let authority = Arc::new(FixedEffectAuthority::new(fixture.authority.volume.clone()));
+        let blob = Arc::new(exact_manifest_blob(&fixture));
+        let exact = fixture.process.clone();
+        let global = Arc::new(EffectGlobalProcessPort {
+            inspections: Mutex::new(
+                [
+                    RootProvisionProcessInspection::Absent,
+                    RootProvisionProcessInspection::Exact(Box::new(exact.clone())),
+                    RootProvisionProcessInspection::Exact(Box::new(exact.clone())),
+                    RootProvisionProcessInspection::Exact(Box::new(exact)),
+                ]
+                .into(),
+            ),
+            calls: AtomicUsize::new(0),
+        });
+        let target_process = Arc::new(EffectTargetProcessPort {
+            starts: AtomicUsize::new(0),
+            evidence: fixture.process.clone(),
+            outcome: EffectTargetProcessOutcome::ResponseLost,
+        });
+        let effect = ServingHandoffEffect::new(
+            authority.clone(),
+            blob,
+            global.clone(),
+            target_process.clone(),
+            fixture.expected_executable_path.clone(),
+        )
+        .unwrap();
+
+        assert!(matches!(
+            effect
+                .try_apply(&absent_effect_context(&fixture), &fixture.acquired.desired)
+                .unwrap(),
+            ServingHandoffEffectProgress::RefreshInventory
+        ));
+        assert!(fixture.target_path().exists());
+        assert!(!fixture.record_path().exists());
+        assert_eq!(target_process.starts.load(Ordering::SeqCst), 0);
+        let target_inode = std::fs::metadata(fixture.target_path()).unwrap().ino();
+
+        assert!(matches!(
+            effect
+                .try_apply(
+                    &successor_absent_effect_context(&fixture),
+                    &fixture.acquired.desired,
+                )
+                .unwrap(),
+            ServingHandoffEffectProgress::RefreshInventory
+        ));
+        assert_eq!(target_process.starts.load(Ordering::SeqCst), 1);
+        assert!(!fixture.record_path().exists());
+
+        // A late exact process after an ambiguous response makes the accepted
+        // empty vector stale. It refreshes and never submits the unit again.
+        assert!(matches!(
+            effect
+                .try_apply(
+                    &restarted_absent_effect_context(&fixture),
+                    &fixture.acquired.desired,
+                )
+                .unwrap(),
+            ServingHandoffEffectProgress::RefreshInventory
+        ));
+        assert_eq!(target_process.starts.load(Ordering::SeqCst), 1);
+        assert!(!fixture.record_path().exists());
+
+        let accepted_process = fixture
+            .exact_process_proof()
+            .unwrap()
+            .into_process_evidence();
+        assert!(matches!(
+            effect
+                .try_apply(
+                    &effect_context_with_processes(&fixture, vec![accepted_process.clone()]),
+                    &fixture.acquired.desired,
+                )
+                .unwrap(),
+            ServingHandoffEffectProgress::RefreshInventory
+        ));
+        assert!(fixture.record_path().exists());
+        let record_inode = std::fs::metadata(fixture.record_path()).unwrap().ino();
+
+        let ready = effect
+            .try_apply(
+                &effect_context_with_processes(&fixture, vec![accepted_process]),
+                &fixture.acquired.desired,
+            )
+            .unwrap();
+        let ServingHandoffEffectProgress::Ready(ready) = ready else {
+            panic!("fresh exact scan must reopen the sealed handoff Ready")
+        };
+        ready.assert_current(&fixture.stored_checkpoint).unwrap();
+        assert_eq!(target_process.starts.load(Ordering::SeqCst), 1);
+        assert_eq!(global.calls.load(Ordering::SeqCst), 4);
+        assert_eq!(
+            std::fs::metadata(fixture.target_path()).unwrap().ino(),
+            target_inode
+        );
+        assert_eq!(
+            std::fs::metadata(fixture.record_path()).unwrap().ino(),
+            record_inode
+        );
+        assert_eq!(
+            std::fs::read(&fixture.blank_authorization_path).unwrap(),
+            blank_bytes
+        );
+        assert_eq!(
+            std::fs::metadata(&fixture.blank_authorization_path)
+                .unwrap()
+                .ino(),
+            blank_inode
+        );
+        assert_eq!(authority.loads.load(Ordering::SeqCst), 8);
+    }
+
+    #[test]
+    fn serving_handoff_effect_rejects_global_duplicate_before_start() {
+        let fixture = fixture();
+        let authority = Arc::new(FixedEffectAuthority::new(fixture.authority.volume.clone()));
+        let global = Arc::new(EffectGlobalProcessPort {
+            inspections: Mutex::new(
+                [RootProvisionProcessInspection::Conflict(
+                    RootProvisionProcessConflict::DuplicateIdentity,
+                )]
+                .into(),
+            ),
+            calls: AtomicUsize::new(0),
+        });
+        let target_process = Arc::new(EffectTargetProcessPort {
+            starts: AtomicUsize::new(0),
+            evidence: fixture.process.clone(),
+            outcome: EffectTargetProcessOutcome::Started,
+        });
+        let effect = ServingHandoffEffect::new(
+            authority,
+            Arc::new(exact_manifest_blob(&fixture)),
+            global,
+            target_process.clone(),
+            fixture.expected_executable_path.clone(),
+        )
+        .unwrap();
+        effect
+            .try_apply(&absent_effect_context(&fixture), &fixture.acquired.desired)
+            .unwrap();
+        assert!(effect
+            .try_apply(
+                &successor_absent_effect_context(&fixture),
+                &fixture.acquired.desired,
+            )
+            .is_err());
+        assert_eq!(target_process.starts.load(Ordering::SeqCst), 0);
+        assert!(!fixture.record_path().exists());
+    }
+
+    #[test]
+    fn target_or_owner_drift_after_global_reinspection_has_zero_start_effect() {
+        for drift in [AuthorityDrift::BackToBlank, AuthorityDrift::ForeignOwner] {
+            let fixture = fixture();
+            drop(
+                fixture
+                    .store()
+                    .seal_target_control_authorization(
+                        &fixture.stored_checkpoint,
+                        &fixture.acquired,
+                        &fixture.authority,
+                    )
+                    .unwrap(),
+            );
+            let authority = Arc::new(FixedEffectAuthority::new(fixture.authority.volume.clone()));
+            let global = Arc::new(AuthorityDriftingGlobalPort {
+                authority: authority.clone(),
+                drift,
+            });
+            let target_process = Arc::new(EffectTargetProcessPort {
+                starts: AtomicUsize::new(0),
+                evidence: fixture.process.clone(),
+                outcome: EffectTargetProcessOutcome::Started,
+            });
+            let effect = ServingHandoffEffect::new(
+                authority.clone(),
+                Arc::new(exact_manifest_blob(&fixture)),
+                global,
+                target_process.clone(),
+                fixture.expected_executable_path.clone(),
+            )
+            .unwrap();
+
+            assert!(effect
+                .try_apply(&absent_effect_context(&fixture), &fixture.acquired.desired)
+                .is_err());
+            assert_eq!(authority.loads.load(Ordering::SeqCst), 2);
+            assert_eq!(target_process.starts.load(Ordering::SeqCst), 0);
+            assert!(!fixture.record_path().exists());
+        }
+    }
+
+    #[test]
+    fn serving_handoff_effect_leaves_unpublished_temp_for_prescan_recovery() {
+        let fixture = fixture();
+        std::fs::write(fixture.target_temp_path(), b"partial").unwrap();
+        std::fs::set_permissions(
+            fixture.target_temp_path(),
+            std::fs::Permissions::from_mode(0o600),
+        )
+        .unwrap();
+        let global = Arc::new(EffectGlobalProcessPort {
+            inspections: Mutex::new(VecDeque::new()),
+            calls: AtomicUsize::new(0),
+        });
+        let target_process = Arc::new(EffectTargetProcessPort {
+            starts: AtomicUsize::new(0),
+            evidence: fixture.process.clone(),
+            outcome: EffectTargetProcessOutcome::Started,
+        });
+        let effect = ServingHandoffEffect::new(
+            Arc::new(FixedEffectAuthority::new(fixture.authority.volume.clone())),
+            Arc::new(exact_manifest_blob(&fixture)),
+            global.clone(),
+            target_process.clone(),
+            fixture.expected_executable_path.clone(),
+        )
+        .unwrap();
+
+        assert!(effect
+            .try_apply(&absent_effect_context(&fixture), &fixture.acquired.desired)
+            .is_err());
+        assert!(fixture.target_temp_path().exists());
+        assert!(!fixture.target_path().exists());
+        assert_eq!(global.calls.load(Ordering::SeqCst), 0);
+        assert_eq!(target_process.starts.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn serving_handoff_effect_never_consumes_a_late_checkpoint_temp() {
+        let fixture = fixture();
+        let checkpoint_temp = fixture.checkpoint_directory.join(format!(
+            ".cat-{}.checkpoint.tmp",
+            fixture.stored_checkpoint.checkpoint().cat_id
+        ));
+        std::fs::write(&checkpoint_temp, b"partial").unwrap();
+        std::fs::set_permissions(&checkpoint_temp, std::fs::Permissions::from_mode(0o600)).unwrap();
+        let authority = Arc::new(FixedEffectAuthority::new(fixture.authority.volume.clone()));
+        let global = Arc::new(EffectGlobalProcessPort {
+            inspections: Mutex::new(VecDeque::new()),
+            calls: AtomicUsize::new(0),
+        });
+        let target_process = Arc::new(EffectTargetProcessPort {
+            starts: AtomicUsize::new(0),
+            evidence: fixture.process.clone(),
+            outcome: EffectTargetProcessOutcome::Started,
+        });
+        let effect = ServingHandoffEffect::new(
+            authority.clone(),
+            Arc::new(exact_manifest_blob(&fixture)),
+            global.clone(),
+            target_process.clone(),
+            fixture.expected_executable_path.clone(),
+        )
+        .unwrap();
+
+        assert!(effect
+            .try_apply(&absent_effect_context(&fixture), &fixture.acquired.desired)
+            .is_err());
+        assert!(checkpoint_temp.exists());
+        assert!(!fixture.target_path().exists());
+        assert_eq!(authority.loads.load(Ordering::SeqCst), 0);
+        assert_eq!(global.calls.load(Ordering::SeqCst), 0);
+        assert_eq!(target_process.starts.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn cancelled_clean_target_start_keeps_only_the_replayable_artifact() {
+        let fixture = fixture();
+        let authority = Arc::new(FixedEffectAuthority::new(fixture.authority.volume.clone()));
+        let global = Arc::new(EffectGlobalProcessPort {
+            inspections: Mutex::new([RootProvisionProcessInspection::Absent].into()),
+            calls: AtomicUsize::new(0),
+        });
+        let target_process = Arc::new(EffectTargetProcessPort {
+            starts: AtomicUsize::new(0),
+            evidence: fixture.process.clone(),
+            outcome: EffectTargetProcessOutcome::CancelledClean,
+        });
+        let effect = ServingHandoffEffect::new(
+            authority.clone(),
+            Arc::new(exact_manifest_blob(&fixture)),
+            global,
+            target_process.clone(),
+            fixture.expected_executable_path.clone(),
+        )
+        .unwrap();
+
+        assert!(matches!(
+            effect
+                .try_apply(&absent_effect_context(&fixture), &fixture.acquired.desired)
+                .unwrap(),
+            ServingHandoffEffectProgress::RefreshInventory
+        ));
+        assert!(effect
+            .try_apply(
+                &successor_absent_effect_context(&fixture),
+                &fixture.acquired.desired,
+            )
+            .is_err());
+        assert!(fixture.target_path().exists());
+        assert!(!fixture.record_path().exists());
+        assert_eq!(target_process.starts.load(Ordering::SeqCst), 1);
+        assert_eq!(authority.loads.load(Ordering::SeqCst), 3);
+    }
+
+    #[test]
+    fn target_start_permit_rechecks_artifact_and_state_root_aba_at_submit_barrier() {
+        {
+            let fixture = fixture();
+            let store = fixture.store();
+            let target = store
+                .seal_target_control_authorization(
+                    &fixture.stored_checkpoint,
+                    &fixture.acquired,
+                    &fixture.authority,
+                )
+                .unwrap();
+            let expectation = RootProvisionProcessExpectation::from_checkpoint(
+                fixture.stored_checkpoint.checkpoint(),
+                RootProvisionAuthoritySnapshot {
+                    attachment: fixture.acquired.attachment.clone(),
+                    volume: &fixture.authority.volume,
+                },
+                fixture.expected_executable_path.clone(),
+            )
+            .unwrap()
+            .with_target_control_launch(target.identity().process_launch_identity())
+            .unwrap();
+            let checkpoint_store = FileCheckpointStore::open(
+                &fixture.checkpoint_directory,
+                &fixture.stored_checkpoint.checkpoint().cat_id,
+            )
+            .unwrap();
+            let current = checkpoint_store.load().unwrap().unwrap();
+            let permit = super::super::root_provision_process::retain_target_control_process_start(
+                &checkpoint_store,
+                &current,
+                &expectation,
+                &target,
+            )
+            .unwrap();
+
+            let bytes = std::fs::read(fixture.target_path()).unwrap();
+            let displaced = fixture.data_directory.join("displaced-target");
+            std::fs::rename(fixture.target_path(), &displaced).unwrap();
+            std::fs::write(fixture.target_path(), bytes).unwrap();
+            std::fs::set_permissions(
+                fixture.target_path(),
+                std::fs::Permissions::from_mode(0o600),
+            )
+            .unwrap();
+
+            assert!(permit.assert_current().is_err());
+            assert!(target.assert_current(&current).is_err());
+        }
+
+        let root_fixture = fixture();
+        let root_store = root_fixture.store();
+        let root_target = root_store
+            .seal_target_control_authorization(
+                &root_fixture.stored_checkpoint,
+                &root_fixture.acquired,
+                &root_fixture.authority,
+            )
+            .unwrap();
+        let root_expectation = RootProvisionProcessExpectation::from_checkpoint(
+            root_fixture.stored_checkpoint.checkpoint(),
+            RootProvisionAuthoritySnapshot {
+                attachment: root_fixture.acquired.attachment.clone(),
+                volume: &root_fixture.authority.volume,
+            },
+            root_fixture.expected_executable_path.clone(),
+        )
+        .unwrap()
+        .with_target_control_launch(root_target.identity().process_launch_identity())
+        .unwrap();
+        let root_checkpoint_store = FileCheckpointStore::open(
+            &root_fixture.checkpoint_directory,
+            &root_fixture.stored_checkpoint.checkpoint().cat_id,
+        )
+        .unwrap();
+        let root_current = root_checkpoint_store.load().unwrap().unwrap();
+        let root_permit =
+            super::super::root_provision_process::retain_target_control_process_start(
+                &root_checkpoint_store,
+                &root_current,
+                &root_expectation,
+                &root_target,
+            )
+            .unwrap();
+
+        let root_path = root_fixture.state_directory.path().to_path_buf();
+        let displaced_root = root_path.with_extension("submit-barrier-old");
+        std::fs::rename(&root_path, &displaced_root).unwrap();
+        std::fs::create_dir(&root_path).unwrap();
+        std::fs::set_permissions(&root_path, std::fs::Permissions::from_mode(0o700)).unwrap();
+
+        assert!(root_permit.assert_current().is_err());
+        assert!(root_target.assert_current(&root_current).is_err());
+        drop(root_permit);
+        std::fs::remove_dir(&root_path).unwrap();
+        std::fs::rename(displaced_root, root_path).unwrap();
     }
 
     #[test]
@@ -5726,11 +6621,32 @@ mod tests {
         }
     }
 
+    fn exact_manifest_blob(fixture: &Fixture) -> ExactManifestBlob {
+        let manifest = ImageManifestV1 {
+            version: 1,
+            image_id: LowerHexSha256::from_digest(
+                &fixture.acquired.desired.runtime.boot_image_digest,
+            ),
+            size_bytes: fixture.acquired.volume.size_bytes,
+            chunks: Vec::new(),
+        };
+        ExactManifestBlob(encode_image_manifest(&manifest).unwrap())
+    }
+
     fn target_head() -> RemoteHead {
+        let manifest = ImageManifestV1 {
+            version: 1,
+            image_id: LowerHexSha256::from_digest(&digest('a')),
+            size_bytes: cats_api::chunk::CHUNK_SIZE as u64,
+            chunks: Vec::new(),
+        };
+        let identity =
+            cats_blockd::format::image_root_identity(&manifest, cats_api::chunk::CHUNK_SIZE as u64)
+                .unwrap();
         RemoteHead {
             generation: Generation::new(1).unwrap(),
-            root_hash: Some(digest('d')),
-            root_object_id: Some(AsciiText::new("roots/generation-1.node").unwrap()),
+            root_hash: Some(Sha256Digest::from_bytes(identity.root_hash)),
+            root_object_id: Some(AsciiText::new(identity.root_object_id).unwrap()),
         }
     }
 }

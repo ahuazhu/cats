@@ -68,9 +68,10 @@ use super::inventory::{
 };
 use super::root_provision_process::inspect_exact_root_provision_process;
 use super::serving_handoff::{
-    validate_scanned_serving_handoff_artifacts, ScannedServingHandoffArtifact,
-    ServingHandoffTempKind, SERVING_HANDOFF_RECORD_FILE, SERVING_HANDOFF_RECORD_MAX_BYTES,
-    SERVING_HANDOFF_RETIREMENT_FILE, SERVING_HANDOFF_RETIREMENT_MAX_BYTES,
+    scanned_target_control_process_launch, validate_scanned_serving_handoff_artifacts,
+    ScannedServingHandoffArtifact, ServingHandoffTempKind, SERVING_HANDOFF_RECORD_FILE,
+    SERVING_HANDOFF_RECORD_MAX_BYTES, SERVING_HANDOFF_RETIREMENT_FILE,
+    SERVING_HANDOFF_RETIREMENT_MAX_BYTES,
 };
 use super::{
     inventory::{
@@ -79,8 +80,9 @@ use super::{
     },
     AuthorizedBlockdCheckpoint, CleanSlateInventoryScanner, InventoryAbsence,
     InventoryAbsenceProbe, PlatformSystemdRootProvisionProcessPort, RootProvisionProcessConflict,
-    RootProvisionProcessExpectation, RootProvisionProcessInspection, RootProvisionProcessPort,
-    RootProvisionProcessRetirementPort, RootProvisionSystemdConfig,
+    RootProvisionProcessExpectation, RootProvisionProcessGlobalPort,
+    RootProvisionProcessInspection, RootProvisionProcessPort, RootProvisionProcessRetirementPort,
+    RootProvisionSystemdConfig,
 };
 
 pub(crate) const CHECKPOINT_NAMESPACE: &str = "checkpoints";
@@ -2301,6 +2303,7 @@ fn scan_authorized_blockd_data(
         )
         .context("authorized blockd data directory is not a HostPath")?;
         let mut retained_root_process = None;
+        let mut target_control_launch = None;
         if !has_unvalidated_handoff_artifact {
             if let Some(runtime_checkpoint) = checkpoint_snapshot
                 .as_ref()
@@ -2499,6 +2502,11 @@ fn scan_authorized_blockd_data(
                 record.as_ref(),
                 retirement.as_ref(),
             )?;
+            target_control_launch = Some(scanned_target_control_process_launch(
+                &runtime_checkpoint,
+                &checkpoint,
+                &target,
+            )?);
         }
         scan.candidate_volume_ids.insert(identity.volume_id.clone());
         anyhow::ensure!(
@@ -2511,6 +2519,7 @@ fn scan_authorized_blockd_data(
                         binding,
                         control_state,
                         retained_root_process,
+                        target_control_launch,
                     },
                 )
                 .is_none(),
@@ -2868,6 +2877,69 @@ impl RootProcessInventoryBridge for PlatformRootProcessInventoryBridge {
 impl super::root_provision_process::retirement_sealed::Sealed
     for PlatformRootProcessInventoryBridge
 {
+}
+
+impl super::root_provision_process::global_sealed::Sealed for PlatformRootProcessInventoryBridge {}
+
+impl RootProvisionProcessGlobalPort for PlatformRootProcessInventoryBridge {
+    fn inspect_exact_or_absent_after_node_global_sweep(
+        &self,
+        expected: &RootProvisionProcessExpectation,
+        context: &dyn RuntimePhysicalReadContext,
+    ) -> anyhow::Result<RootProvisionProcessInspection> {
+        let first =
+            match inspect_exact_root_provision_process(self.port.as_ref(), expected, context)? {
+                inspection @ (RootProvisionProcessInspection::Absent
+                | RootProvisionProcessInspection::Exact(_)) => inspection,
+                other => return Ok(other),
+            };
+        let mut allowed_units = BTreeSet::new();
+        let mut allowed_pids = BTreeSet::new();
+        let mut allowed_sockets = BTreeSet::new();
+        if let RootProvisionProcessInspection::Exact(evidence) = &first {
+            allowed_units.insert(evidence.scope_id.clone());
+            allowed_pids.insert(evidence.process_id);
+            allowed_sockets.insert(PathBuf::from(evidence.control_socket_path.as_str()));
+        }
+        let sweep = match self.sweep_node_global_inventory(
+            &allowed_units,
+            &allowed_pids,
+            &allowed_sockets,
+            context,
+        ) {
+            Ok(sweep) => sweep,
+            Err(_) => {
+                context.check_active()?;
+                return Ok(RootProvisionProcessInspection::Conflict(
+                    RootProvisionProcessConflict::DuplicateIdentity,
+                ));
+            }
+        };
+        match sweep {
+            ProbeFact::Present => {
+                return Ok(RootProvisionProcessInspection::Conflict(
+                    RootProvisionProcessConflict::DuplicateIdentity,
+                ));
+            }
+            ProbeFact::Unavailable => return Ok(RootProvisionProcessInspection::Unavailable),
+            ProbeFact::Empty => {}
+        }
+        let second = inspect_exact_root_provision_process(self.port.as_ref(), expected, context)?;
+        Ok(match (&first, &second) {
+            (RootProvisionProcessInspection::Absent, RootProvisionProcessInspection::Absent)
+            | (
+                RootProvisionProcessInspection::Exact(_),
+                RootProvisionProcessInspection::Exact(_),
+            ) if first == second => second,
+            (RootProvisionProcessInspection::Unavailable, _)
+            | (_, RootProvisionProcessInspection::Unavailable) => {
+                RootProvisionProcessInspection::Unavailable
+            }
+            _ => RootProvisionProcessInspection::Conflict(
+                RootProvisionProcessConflict::IdentityMismatch,
+            ),
+        })
+    }
 }
 
 impl RootProvisionProcessRetirementPort for PlatformRootProcessInventoryBridge {
@@ -8944,6 +9016,85 @@ mod tests {
             )
         ));
         assert!(foreign_socket_path.exists());
+    }
+
+    #[test]
+    fn effect_global_port_brackets_exact_and_absent_and_rejects_late_duplicate() {
+        let environment = TestEnvironment::new();
+        let (expected, _) = root_process_expectation(&environment);
+        let bridge = root_process_bridge(
+            &environment,
+            [
+                RootProvisionProcessInspection::Absent,
+                RootProvisionProcessInspection::Absent,
+            ],
+        );
+        assert_eq!(
+            bridge
+                .inspect_exact_or_absent_after_node_global_sweep(
+                    &expected,
+                    &assigned_context(true),
+                )
+                .unwrap(),
+            RootProvisionProcessInspection::Absent
+        );
+
+        let environment = TestEnvironment::new();
+        let (expected, _) = root_process_expectation(&environment);
+        let exact = exact_process_evidence(&expected, 76);
+        let _socket = install_exact_process_fixture(&environment, &expected, exact.process_id);
+        let bridge = root_process_bridge(
+            &environment,
+            [
+                RootProvisionProcessInspection::Exact(Box::new(exact.clone())),
+                RootProvisionProcessInspection::Exact(Box::new(exact.clone())),
+            ],
+        );
+        assert_eq!(
+            bridge
+                .inspect_exact_or_absent_after_node_global_sweep(
+                    &expected,
+                    &assigned_context(true),
+                )
+                .unwrap(),
+            RootProvisionProcessInspection::Exact(Box::new(exact))
+        );
+
+        // Even one allowed exact launch cannot hide a second managed
+        // blank/wrapper incarnation elsewhere in the Node-global namespace.
+        std::fs::create_dir(environment.systemd_root.join("cats-second.service")).unwrap();
+        let exact = exact_process_evidence(&expected, 76);
+        let bridge = root_process_bridge(
+            &environment,
+            [RootProvisionProcessInspection::Exact(Box::new(exact))],
+        );
+        assert!(matches!(
+            bridge
+                .inspect_exact_or_absent_after_node_global_sweep(
+                    &expected,
+                    &assigned_context(true),
+                )
+                .unwrap(),
+            RootProvisionProcessInspection::Conflict(
+                RootProvisionProcessConflict::DuplicateIdentity
+            )
+        ));
+
+        let environment = TestEnvironment::new();
+        let (expected, _) = root_process_expectation(&environment);
+        std::fs::create_dir(environment.systemd_root.join("cats-late.service")).unwrap();
+        let bridge = root_process_bridge(&environment, [RootProvisionProcessInspection::Absent]);
+        assert!(matches!(
+            bridge
+                .inspect_exact_or_absent_after_node_global_sweep(
+                    &expected,
+                    &assigned_context(true),
+                )
+                .unwrap(),
+            RootProvisionProcessInspection::Conflict(
+                RootProvisionProcessConflict::DuplicateIdentity
+            )
+        ));
     }
 
     #[test]

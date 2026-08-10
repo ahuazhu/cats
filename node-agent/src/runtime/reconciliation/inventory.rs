@@ -40,6 +40,7 @@ use super::{
     root_provision_process::{
         ExactRootProvisionProcessProof, RetainedRootProvisionProcessAttempt,
         RootProvisionAuthoritySnapshot, RootProvisionProcessExpectation,
+        TargetControlProcessLaunchIdentity,
     },
     runtime_checkpoint_path,
     signed_running::{
@@ -118,6 +119,11 @@ pub struct AuthorizedBlockdInventoryEvidence {
     /// `PrepareDevice.after_root_provision` handoff. This keeps the live old
     /// process in the Node-global allowlist until a later one-effect stop.
     pub(crate) retained_root_process: Option<RetainedRootProvisionProcessAttempt>,
+    /// Present only when the full scanner validated the exact immutable
+    /// target-control artifact. It expands target-phase inspection to the
+    /// closed blank-or-wrapper argv union without projecting that private
+    /// artifact onto the public Runtime wire.
+    pub(crate) target_control_launch: Option<TargetControlProcessLaunchIdentity>,
 }
 
 /// Provider-private authority evidence retained until the local attachment
@@ -618,6 +624,10 @@ fn root_process_expectations(
                 retained,
             )?;
             anyhow::ensure!(
+                blockd.target_control_launch.as_ref() == Some(&retained.target_control_launch),
+                "retained Root process changed its target-control launch identity"
+            );
+            anyhow::ensure!(
                 expected
                     .insert(desired.cat_id.clone(), expectation)
                     .is_none(),
@@ -640,7 +650,7 @@ fn root_process_expectations(
                     .find(|volume| volume.record.volume_id == attachment.identity.volume_id)
             })
             .context("root-provision process lacks its raw authority VolumeRecord")?;
-        let expectation = RootProvisionProcessExpectation::from_checkpoint(
+        let mut expectation = RootProvisionProcessExpectation::from_checkpoint(
             &checkpoint.checkpoint,
             RootProvisionAuthoritySnapshot {
                 attachment,
@@ -648,6 +658,9 @@ fn root_process_expectations(
             },
             executable_path.clone(),
         )?;
+        if let Some(target) = &blockd.target_control_launch {
+            expectation = expectation.with_target_control_launch(target.clone())?;
+        }
         anyhow::ensure!(
             expected
                 .insert(desired.cat_id.clone(), expectation)

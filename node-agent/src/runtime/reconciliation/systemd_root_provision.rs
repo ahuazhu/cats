@@ -31,10 +31,11 @@ use super::authorized_blockd::AuthorizedBlockdLaunchConfig;
 #[cfg(test)]
 use super::root_provision_process::RootProvisionProcessPhase;
 use super::root_provision_process::{
-    sealed, CheckpointedRootProvisionProcess, ExactRootProvisionProcessProof,
-    RootProvisionBlockdHandshake, RootProvisionProcessConflict, RootProvisionProcessEvidence,
-    RootProvisionProcessExpectation, RootProvisionProcessInspection, RootProvisionProcessPort,
-    RootProvisionProcessStart, RootProvisionProcessStop,
+    sealed, target_start_sealed, CheckpointedRootProvisionProcess,
+    CheckpointedTargetControlProcess, ExactRootProvisionProcessProof, RootProvisionBlockdHandshake,
+    RootProvisionProcessConflict, RootProvisionProcessEvidence, RootProvisionProcessExpectation,
+    RootProvisionProcessInspection, RootProvisionProcessPort, RootProvisionProcessStart,
+    RootProvisionProcessStop, TargetControlProcessLaunchIdentity, TargetControlProcessPort,
 };
 
 const SYSTEMD_RUN: &str = "/usr/bin/systemd-run";
@@ -191,6 +192,14 @@ impl<H, S> SystemdRootProvisionProcessPort<H, S> {
     ) -> anyhow::Result<TransientServiceLaunch> {
         build_launch(&self.config, expected)
     }
+
+    fn target_launch(
+        &self,
+        expected: &RootProvisionProcessExpectation,
+        target: &TargetControlProcessLaunchIdentity,
+    ) -> anyhow::Result<TransientServiceLaunch> {
+        build_target_launch(&self.config, expected, target)
+    }
 }
 
 impl<H, S> sealed::Sealed for SystemdRootProvisionProcessPort<H, S>
@@ -210,8 +219,15 @@ where
         expected: &RootProvisionProcessExpectation,
         context: &dyn RuntimePhysicalReadContext,
     ) -> anyhow::Result<RootProvisionProcessInspection> {
-        let launch = self.launch(expected)?;
-        self.inspect_exact(expected, &launch, context)
+        let blank = self.launch(expected)?;
+        let target = expected
+            .target_control_launch()
+            .map(|target| self.target_launch(expected, target))
+            .transpose()?;
+        if target.is_none() {
+            return self.inspect_exact(expected, &blank, context);
+        }
+        self.inspect_allowed_launches(expected, &blank, target.as_ref(), context)
     }
 
     fn start_checkpointed(
@@ -285,11 +301,98 @@ where
     }
 }
 
+impl<H, S> target_start_sealed::Sealed for SystemdRootProvisionProcessPort<H, S>
+where
+    H: SystemdTransientServicePort,
+    S: BlockdHandshakePort,
+{
+}
+
+impl<H, S> TargetControlProcessPort for SystemdRootProvisionProcessPort<H, S>
+where
+    H: SystemdTransientServicePort,
+    S: BlockdHandshakePort,
+{
+    fn start_target_checkpointed(
+        &self,
+        checkpointed: CheckpointedTargetControlProcess<'_>,
+        context: &RuntimeDesiredEffectContext,
+    ) -> anyhow::Result<RootProvisionProcessStart> {
+        let expected = checkpointed.expected();
+        checkpointed.assert_current()?;
+        let target = expected
+            .target_control_launch()
+            .context("target-control start lacks strict wrapper identity")?;
+        let launch = self.target_launch(expected, target)?;
+        checkpointed.assert_current()?;
+        match self.systemd.submit(&launch, context)? {
+            SystemdStartSubmission::DefinitelyNotStarted => {
+                return Ok(RootProvisionProcessStart::Unavailable)
+            }
+            SystemdStartSubmission::Submitted | SystemdStartSubmission::OutcomeUnknown => {}
+        }
+        loop {
+            context.check_active()?;
+            match self.inspect_exact(expected, &launch, context)? {
+                RootProvisionProcessInspection::Exact(evidence) => {
+                    checkpointed.assert_current()?;
+                    return Ok(RootProvisionProcessStart::Started(evidence));
+                }
+                RootProvisionProcessInspection::Conflict(problem) => {
+                    return Ok(RootProvisionProcessStart::Conflict(problem))
+                }
+                RootProvisionProcessInspection::Absent
+                | RootProvisionProcessInspection::Unavailable => {
+                    let remaining = context.deadline().saturating_duration_since(Instant::now());
+                    std::thread::sleep(POLL_INTERVAL.min(remaining));
+                }
+            }
+        }
+    }
+}
+
 impl<H, S> SystemdRootProvisionProcessPort<H, S>
 where
     H: SystemdTransientServicePort,
     S: BlockdHandshakePort,
 {
+    fn inspect_allowed_launches(
+        &self,
+        expected: &RootProvisionProcessExpectation,
+        blank: &TransientServiceLaunch,
+        target: Option<&TransientServiceLaunch>,
+        context: &dyn RuntimePhysicalReadContext,
+    ) -> anyhow::Result<RootProvisionProcessInspection> {
+        let mut absent_count = 0_usize;
+        let mut saw_unavailable = false;
+        let mut saw_conflict = false;
+        let launch_count = usize::from(target.is_some()) + 1;
+        for launch in std::iter::once(blank).chain(target) {
+            match self.systemd.inspect(launch, context)? {
+                SystemdInspection::Exact(_) => {
+                    return self.inspect_exact(expected, launch, context)
+                }
+                SystemdInspection::Absent => absent_count += 1,
+                SystemdInspection::Starting | SystemdInspection::Unavailable => {
+                    saw_unavailable = true
+                }
+                SystemdInspection::Conflict => saw_conflict = true,
+            }
+        }
+        Ok(if saw_unavailable {
+            RootProvisionProcessInspection::Unavailable
+        } else if absent_count == launch_count {
+            RootProvisionProcessInspection::Absent
+        } else if absent_count > 0 || saw_conflict {
+            // Both launches name the same unit. One variant seeing an absent
+            // unit while the other sees an argv conflict is an unstable read,
+            // not global absence.
+            RootProvisionProcessInspection::Conflict(RootProvisionProcessConflict::IdentityMismatch)
+        } else {
+            RootProvisionProcessInspection::Conflict(RootProvisionProcessConflict::IdentityMismatch)
+        })
+    }
+
     fn inspect_exact(
         &self,
         expected: &RootProvisionProcessExpectation,
@@ -421,6 +524,28 @@ fn build_launch(
     config: &RootProvisionSystemdConfig,
     expected: &RootProvisionProcessExpectation,
 ) -> anyhow::Result<TransientServiceLaunch> {
+    build_launch_with_authorization(config, expected, ControlAuthorization::Blank)
+}
+
+fn build_target_launch(
+    config: &RootProvisionSystemdConfig,
+    expected: &RootProvisionProcessExpectation,
+    target: &TargetControlProcessLaunchIdentity,
+) -> anyhow::Result<TransientServiceLaunch> {
+    build_launch_with_authorization(config, expected, ControlAuthorization::Target(target))
+}
+
+#[derive(Debug, Clone, Copy)]
+enum ControlAuthorization<'a> {
+    Blank,
+    Target(&'a TargetControlProcessLaunchIdentity),
+}
+
+fn build_launch_with_authorization(
+    config: &RootProvisionSystemdConfig,
+    expected: &RootProvisionProcessExpectation,
+    authorization: ControlAuthorization<'_>,
+) -> anyhow::Result<TransientServiceLaunch> {
     validate_credentialless_blockd_config(&config.blockd)?;
     anyhow::ensure!(
         config.blockd.blockd_binary.is_absolute()
@@ -438,7 +563,6 @@ fn build_launch(
         "root-provision blockd resource limits must be positive"
     );
     let data_directory = Path::new(expected.data_directory.as_str());
-    let authorized_control_spec = data_directory.join(AUTHORIZED_CONTROL_SPEC);
     let mut arguments = vec![
         OsString::from("--volume-id"),
         OsString::from(expected.volume_id.as_str()),
@@ -449,8 +573,28 @@ fn build_launch(
         OsString::from("--attachment-epoch"),
         OsString::from(expected.attachment_epoch.get().to_string()),
         OsString::from("--control-only"),
-        OsString::from("--authorized-control-spec"),
-        authorized_control_spec.into_os_string(),
+    ];
+    match authorization {
+        ControlAuthorization::Blank => {
+            arguments.push(OsString::from("--authorized-control-spec"));
+            arguments.push(
+                data_directory
+                    .join(AUTHORIZED_CONTROL_SPEC)
+                    .into_os_string(),
+            );
+        }
+        ControlAuthorization::Target(target) => {
+            arguments.push(OsString::from("--authorized-target-control-spec"));
+            arguments.push(OsString::from(target.authorization_path().as_str()));
+            arguments.push(OsString::from("--provision-transition-id"));
+            arguments.push(OsString::from(target.provision_transition_id().as_str()));
+            arguments.push(OsString::from(
+                "--provision-root-authorization-context-digest",
+            ));
+            arguments.push(OsString::from(target.provision_context_digest().as_str()));
+        }
+    }
+    arguments.extend([
         OsString::from("--runtime-scope-id"),
         OsString::from(expected.scope_id.as_str()),
         OsString::from("--process-identity-token"),
@@ -480,7 +624,7 @@ fn build_launch(
         }),
         OsString::from("--listen-control"),
         OsString::from(expected.control_socket_path.as_str()),
-    ];
+    ]);
     for option in config.blockd.metadata_store.config.to_cli() {
         arguments.push(OsString::from("--metadata-store-option"));
         arguments.push(option.into());
@@ -592,6 +736,7 @@ impl PlatformSystemdRootProvisionProcessPort {
 }
 
 impl sealed::Sealed for PlatformSystemdRootProvisionProcessPort {}
+impl target_start_sealed::Sealed for PlatformSystemdRootProvisionProcessPort {}
 
 impl RootProvisionProcessPort for PlatformSystemdRootProvisionProcessPort {
     fn inspect(
@@ -616,6 +761,16 @@ impl RootProvisionProcessPort for PlatformSystemdRootProvisionProcessPort {
         context: &RuntimeDesiredEffectContext,
     ) -> anyhow::Result<RootProvisionProcessStop> {
         self.inner.stop_exact(exact, context)
+    }
+}
+
+impl TargetControlProcessPort for PlatformSystemdRootProvisionProcessPort {
+    fn start_target_checkpointed(
+        &self,
+        checkpointed: CheckpointedTargetControlProcess<'_>,
+        context: &RuntimeDesiredEffectContext,
+    ) -> anyhow::Result<RootProvisionProcessStart> {
+        self.inner.start_target_checkpointed(checkpointed, context)
     }
 }
 
@@ -1556,6 +1711,76 @@ mod tests {
     }
 
     #[test]
+    fn target_phase_seal_inspection_accepts_blank_live_or_wrapper_restart_only() {
+        for wrapper_live in [false, true] {
+            let expected = target_expectation();
+            let proof = proof();
+            let systemd = Arc::new(FakeSystemd::default());
+            if wrapper_live {
+                systemd.inspections.lock().unwrap().extend([
+                    SystemdInspection::Conflict,
+                    SystemdInspection::Exact(proof.clone()),
+                    SystemdInspection::Exact(proof.clone()),
+                    SystemdInspection::Exact(proof),
+                ]);
+            } else {
+                systemd.inspections.lock().unwrap().extend([
+                    SystemdInspection::Exact(proof.clone()),
+                    SystemdInspection::Exact(proof.clone()),
+                    SystemdInspection::Exact(proof),
+                ]);
+            }
+            let handshake = Arc::new(FakeHandshake::default());
+            handshake
+                .inspections
+                .lock()
+                .unwrap()
+                .push_back(target_verified_handshake());
+            let port = SystemdRootProvisionProcessPort::new(config(), systemd.clone(), handshake);
+            // The blank branch is the original CLI after its target reload;
+            // the wrapper branch is the strict restart CLI. Either produces
+            // the same exact target-handshake evidence consumed by sealing.
+            assert!(matches!(
+                port.inspect(&expected, &context()).unwrap(),
+                RootProvisionProcessInspection::Exact(_)
+            ));
+            let launches = systemd.launches.lock().unwrap();
+            let inspected = launches.last().unwrap();
+            assert_eq!(
+                inspected
+                    .arguments
+                    .contains(&OsString::from("--authorized-target-control-spec")),
+                wrapper_live
+            );
+            assert_eq!(
+                inspected
+                    .arguments
+                    .contains(&OsString::from("--authorized-control-spec")),
+                !wrapper_live
+            );
+        }
+
+        let expected = target_expectation();
+        let systemd = Arc::new(FakeSystemd::default());
+        systemd
+            .inspections
+            .lock()
+            .unwrap()
+            .extend([SystemdInspection::Conflict, SystemdInspection::Conflict]);
+        let port = SystemdRootProvisionProcessPort::new(
+            config(),
+            systemd,
+            Arc::new(FakeHandshake::default()),
+        );
+        assert!(matches!(
+            port.inspect(&expected, &context()).unwrap(),
+            RootProvisionProcessInspection::Conflict(
+                RootProvisionProcessConflict::IdentityMismatch
+            )
+        ));
+    }
+
+    #[test]
     fn generation_only_or_different_remote_head_is_not_an_exact_handshake() {
         let expected = expectation();
         let proof = proof();
@@ -1840,6 +2065,36 @@ mod tests {
             }
         });
         (identity, waiter)
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn real_unix_status_round_trip_binds_the_serial_socket_peer() {
+        use std::io::{Read as _, Write as _};
+
+        let directory = tempfile::tempdir().unwrap();
+        let socket = directory.path().join("blockd-control.sock");
+        let listener = std::os::unix::net::UnixListener::bind(&socket).unwrap();
+        let expected_status = status();
+        let response = format!("OK {}\n", serde_json::to_string(&expected_status).unwrap());
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut request = [0_u8; 7];
+            stream.read_exact(&mut request).unwrap();
+            assert_eq!(&request, b"status\n");
+            stream.write_all(response.as_bytes()).unwrap();
+        });
+
+        let inspected =
+            platform_blockd_status(&host(socket.to_str().unwrap()), &context()).unwrap();
+        server.join().unwrap();
+        assert_eq!(
+            inspected,
+            BlockdHandshakeInspection::Verified {
+                peer_process_id: std::process::id(),
+                status: Box::new(expected_status),
+            }
+        );
     }
 
     #[test]
@@ -2174,8 +2429,37 @@ mod tests {
             attachment,
             phase,
             executable_path: host("/usr/bin/cats-blockd"),
+            target_control_launch: None,
             retained_physical_identity: None,
         }
+    }
+
+    fn target_expectation() -> RootProvisionProcessExpectation {
+        let target = RemoteHead {
+            generation: Generation::new(1).unwrap(),
+            root_hash: Some(Sha256Digest::from_bytes([2; 32])),
+            root_object_id: Some(
+                cats_api::runtime_reconciliation::AsciiText::new("roots/root-1").unwrap(),
+            ),
+        };
+        let expected = expectation().with_provisioned_head_for_test(target);
+        let path = host(&format!(
+            "{}/{}",
+            expected.data_directory,
+            cats_blockd::target_control::target_control_authorization_file_name(
+                &expected.provision_transition_id
+            )
+        ));
+        let transition = expected.provision_transition_id.clone();
+        expected
+            .with_target_control_launch(TargetControlProcessLaunchIdentity::new(
+                path,
+                transition,
+                cats_blockd::target_control::ProvisionRootAuthorizationContextDigest::new(digest(
+                    'a',
+                )),
+            ))
+            .unwrap()
     }
 
     fn proof() -> SystemdProcessProof {
@@ -2211,6 +2495,17 @@ mod tests {
         BlockdHandshakeInspection::Verified {
             peer_process_id,
             status: Box::new(status()),
+        }
+    }
+
+    fn target_verified_handshake() -> BlockdHandshakeInspection {
+        let mut target_status = status();
+        target_status.remote_head = Some(target_expectation().expected_remote_head().clone());
+        target_status.local_durable_generation = 1;
+        target_status.remote_durable_generation = 1;
+        BlockdHandshakeInspection::Verified {
+            peer_process_id: 4242,
+            status: Box::new(target_status),
         }
     }
 

@@ -7,12 +7,17 @@
 //! is resolved by inspection; it is never retried in the same reconciliation
 //! unit and a mismatching process is never stopped by name.
 
+use std::path::Path;
+
 use anyhow::Context as _;
 use cats_api::runtime_reconciliation::{
     CheckpointEvidence, ControlHandshakeEvidence, DesiredRuntimeSpec, Durability, Epoch,
     FenceEpoch, HostPath, Id, NodeBootId, OwnershipTokenEvidence, ProcessEvidence, ProcessRole,
     ProcessState, RandomId128, ReconcileStep, RemoteHead, Revision, RuntimeCheckpoint, Sequence,
     Sha256Digest, WireU64,
+};
+use cats_blockd::target_control::{
+    target_control_authorization_file_name, ProvisionRootAuthorizationContextDigest,
 };
 use cats_storage::authority::{
     validate_authorized_serving_attachment, validate_volume_record, AttachmentLineageIdentity,
@@ -21,6 +26,8 @@ use cats_storage::authority::{
 
 use crate::runtime_spine::{RuntimeDesiredEffectContext, RuntimePhysicalReadContext};
 
+use super::checkpoint::CurrentCheckpointGuard;
+use super::serving_handoff::TargetControlAuthorizationReady;
 use super::{FileCheckpointStore, StoredCheckpoint};
 
 pub(crate) mod sealed {
@@ -34,6 +41,38 @@ pub(crate) mod sealed {
 /// naked `systemctl show <expected-unit>` lookup for global absence.
 pub(crate) mod retirement_sealed {
     pub(crate) trait Sealed {}
+}
+
+/// Sealed read boundary for an effect-time exact-or-absent decision. Unlike a
+/// lookup of the expected unit, implementations must bracket the same
+/// Node-global unit/cgroup, `/proc`, and managed-socket sweep as the full
+/// inventory scanner.
+pub(crate) mod global_sealed {
+    pub(crate) trait Sealed {}
+}
+
+pub(crate) mod target_start_sealed {
+    pub(crate) trait Sealed {}
+}
+
+pub(crate) trait RootProvisionProcessGlobalPort:
+    global_sealed::Sealed + Send + Sync
+{
+    fn inspect_exact_or_absent_after_node_global_sweep(
+        &self,
+        expected: &RootProvisionProcessExpectation,
+        context: &dyn RuntimePhysicalReadContext,
+    ) -> anyhow::Result<RootProvisionProcessInspection>;
+}
+
+pub(crate) trait TargetControlProcessPort:
+    target_start_sealed::Sealed + Send + Sync
+{
+    fn start_target_checkpointed(
+        &self,
+        checkpointed: CheckpointedTargetControlProcess<'_>,
+        context: &RuntimeDesiredEffectContext,
+    ) -> anyhow::Result<RootProvisionProcessStart>;
 }
 
 pub(crate) trait RootProvisionProcessRetirementPort:
@@ -123,11 +162,53 @@ pub(crate) struct RootProvisionProcessExpectation {
     pub attachment: AuthorizedServingAttachment,
     pub(super) phase: RootProvisionProcessPhase,
     pub executable_path: HostPath,
+    /// Provider-private launch identity decoded from the scanner-validated
+    /// immutable target-control artifact. Inspection may accept the original
+    /// blank-grant process or this strict replacement; creation may use only
+    /// this target form.
+    pub(super) target_control_launch: Option<TargetControlProcessLaunchIdentity>,
     /// A sealed handoff fixes the old control process to one physical
     /// incarnation. A live process retained across the PrepareDevice CAS may
     /// not be rebound to a later process which happens to reuse its logical
     /// unit, token and socket identity.
     pub(crate) retained_physical_identity: Option<RetainedRootProvisionPhysicalIdentity>,
+}
+
+/// Exact wrapper arguments which distinguish a target-head recovery process
+/// from the original blank-head control process. The physical file identity
+/// remains retained by `TargetControlAuthorizationReady`; this value alone is
+/// intentionally insufficient to authorize a start.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct TargetControlProcessLaunchIdentity {
+    authorization_path: HostPath,
+    provision_transition_id: RandomId128,
+    provision_context_digest: ProvisionRootAuthorizationContextDigest,
+}
+
+impl TargetControlProcessLaunchIdentity {
+    pub(crate) fn new(
+        authorization_path: HostPath,
+        provision_transition_id: RandomId128,
+        provision_context_digest: ProvisionRootAuthorizationContextDigest,
+    ) -> Self {
+        Self {
+            authorization_path,
+            provision_transition_id,
+            provision_context_digest,
+        }
+    }
+
+    pub(crate) fn authorization_path(&self) -> &HostPath {
+        &self.authorization_path
+    }
+
+    pub(crate) fn provision_transition_id(&self) -> &RandomId128 {
+        &self.provision_transition_id
+    }
+
+    pub(crate) fn provision_context_digest(&self) -> &Sha256Digest {
+        self.provision_context_digest.as_sha256_digest()
+    }
 }
 
 /// Exact OS/process identity captured in the immutable serving-handoff
@@ -167,6 +248,7 @@ pub(crate) struct RetainedRootProvisionProcessAttempt {
     pub expected_provisioned_head: RemoteHead,
     pub attachment: AuthorizedServingAttachment,
     pub executable_path: HostPath,
+    pub target_control_launch: TargetControlProcessLaunchIdentity,
     pub physical_identity: RetainedRootProvisionPhysicalIdentity,
 }
 
@@ -257,6 +339,7 @@ impl RootProvisionProcessExpectation {
             attachment,
             phase,
             executable_path,
+            target_control_launch: None,
             retained_physical_identity: None,
         })
     }
@@ -319,7 +402,7 @@ impl RootProvisionProcessExpectation {
                     == format!("/sys/fs/cgroup/system.slice/{}", attempt.scope_id.as_str()),
             "retained Root process attempt has a noncanonical physical owner"
         );
-        Ok(Self {
+        let mut expectation = Self {
             cat_id: attempt.cat_id.clone(),
             node_id: attempt.node_id.clone(),
             placement_epoch: attempt.placement_epoch,
@@ -341,12 +424,43 @@ impl RootProvisionProcessExpectation {
                 expected_provisioned_head: attempt.expected_provisioned_head.clone(),
             },
             executable_path: attempt.executable_path.clone(),
+            target_control_launch: None,
             retained_physical_identity: Some(attempt.physical_identity.clone()),
-        })
+        };
+        expectation =
+            expectation.with_target_control_launch(attempt.target_control_launch.clone())?;
+        Ok(expectation)
     }
 
     pub(crate) fn expected_remote_head(&self) -> &RemoteHead {
         self.phase.expected_remote_head()
+    }
+
+    pub(crate) fn with_target_control_launch(
+        mut self,
+        launch: TargetControlProcessLaunchIdentity,
+    ) -> anyhow::Result<Self> {
+        anyhow::ensure!(
+            matches!(self.phase, RootProvisionProcessPhase::Provisioned { .. })
+                && launch.provision_transition_id == self.provision_transition_id
+                && Path::new(launch.authorization_path.as_str()).is_absolute()
+                && Path::new(launch.authorization_path.as_str()).parent()
+                    == Some(Path::new(self.data_directory.as_str()))
+                && Path::new(launch.authorization_path.as_str())
+                    .file_name()
+                    .and_then(|name| name.to_str())
+                    == Some(
+                        target_control_authorization_file_name(&self.provision_transition_id)
+                            .as_str(),
+                    ),
+            "target-control process launch is not bound to the provisioned checkpoint"
+        );
+        self.target_control_launch = Some(launch);
+        Ok(self)
+    }
+
+    pub(crate) fn target_control_launch(&self) -> Option<&TargetControlProcessLaunchIdentity> {
+        self.target_control_launch.as_ref()
     }
 
     #[cfg(test)]
@@ -665,6 +779,7 @@ pub(crate) fn prove_exact_root_provision_process_absence<P>(
     stored_checkpoint: &StoredCheckpoint,
     authority: RootProvisionAuthoritySnapshot<'_>,
     executable_path: HostPath,
+    target_control_launch: Option<TargetControlProcessLaunchIdentity>,
     port: &P,
     context: &RuntimeDesiredEffectContext,
 ) -> anyhow::Result<ExactRootProvisionProcessAbsenceProof>
@@ -674,11 +789,14 @@ where
     context.check_active()?;
     let admission =
         accepted_full_proves_exact_process_absence(context, checkpoint_store, stored_checkpoint)?;
-    let expectation = RootProvisionProcessExpectation::from_checkpoint(
+    let mut expectation = RootProvisionProcessExpectation::from_checkpoint(
         stored_checkpoint.checkpoint(),
         authority,
         executable_path,
     )?;
+    if let Some(target_control_launch) = target_control_launch {
+        expectation = expectation.with_target_control_launch(target_control_launch)?;
+    }
     match port
         .inspect_after_node_global_sweep(&expectation, context)
         .context("reinspect sealed Node-global root-provision inventory before record retirement")?
@@ -794,6 +912,49 @@ fn accepted_full_proves_exact_process_absence(
 /// crossed the checkpoint directory durability barrier.
 pub(crate) struct CheckpointedRootProvisionProcess<'a> {
     expected: &'a RootProvisionProcessExpectation,
+}
+
+/// Retains both the exact target artifact and current checkpoint writer guard
+/// across the one strict wrapper submission/adoption attempt.
+pub(crate) struct CheckpointedTargetControlProcess<'a> {
+    expected: &'a RootProvisionProcessExpectation,
+    authorization: &'a TargetControlAuthorizationReady,
+    stored: &'a StoredCheckpoint,
+    _current_checkpoint: CurrentCheckpointGuard<'a>,
+}
+
+impl<'a> CheckpointedTargetControlProcess<'a> {
+    pub(crate) fn expected(&self) -> &'a RootProvisionProcessExpectation {
+        self.expected
+    }
+
+    pub(crate) fn assert_current(&self) -> anyhow::Result<()> {
+        self.authorization.assert_current(self.stored)
+    }
+}
+
+pub(crate) fn retain_target_control_process_start<'a>(
+    store: &'a FileCheckpointStore,
+    stored: &'a StoredCheckpoint,
+    expected: &'a RootProvisionProcessExpectation,
+    authorization: &'a TargetControlAuthorizationReady,
+) -> anyhow::Result<CheckpointedTargetControlProcess<'a>> {
+    authorization.assert_current(stored)?;
+    anyhow::ensure!(
+        expected.target_control_launch()
+            == Some(&authorization.identity().process_launch_identity()),
+        "target-control start authorization changed launch identity"
+    );
+    let current = store
+        .assert_current(stored)
+        .context("retain current checkpoint across target-control start")?;
+    authorization.assert_current(stored)?;
+    Ok(CheckpointedTargetControlProcess {
+        expected,
+        authorization,
+        stored,
+        _current_checkpoint: current,
+    })
 }
 
 impl<'a> CheckpointedRootProvisionProcess<'a> {

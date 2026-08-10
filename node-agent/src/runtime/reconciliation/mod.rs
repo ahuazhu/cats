@@ -24,6 +24,16 @@ mod normal_acquire;
 mod root_provision;
 mod signed_root_provision;
 mod signed_running;
+// This typed slice stops at `ServingHandoffReady`; production composition and
+// the PrepareDevice CAS intentionally land later.
+#[cfg_attr(
+    not(test),
+    expect(
+        dead_code,
+        reason = "serving handoff effect is staged before final Runtime composition"
+    )
+)]
+mod serving_handoff_effect;
 // The immutable proof seam is consumed by the expanded PrepareDevice
 // provenance while retained descriptors close the publication/replace ABA
 // window. Full process/device composition remains a later effect slice.
@@ -105,9 +115,10 @@ pub(crate) use root_provision_process::{
     ensure_root_provision_process_after_checkpoint,
     ensure_root_provision_process_from_persisted_checkpoint, RootProvisionAuthoritySnapshot,
     RootProvisionBlockdHandshake, RootProvisionProcessConflict, RootProvisionProcessEnsureResult,
-    RootProvisionProcessEvidence, RootProvisionProcessExpectation, RootProvisionProcessInspection,
-    RootProvisionProcessOutcome, RootProvisionProcessPort, RootProvisionProcessRetirementPort,
-    RootProvisionProcessStart, RootProvisionProcessStop,
+    RootProvisionProcessEvidence, RootProvisionProcessExpectation, RootProvisionProcessGlobalPort,
+    RootProvisionProcessInspection, RootProvisionProcessOutcome, RootProvisionProcessPort,
+    RootProvisionProcessRetirementPort, RootProvisionProcessStart, RootProvisionProcessStop,
+    TargetControlProcessLaunchIdentity, TargetControlProcessPort,
 };
 #[allow(unused_imports)]
 pub(crate) use systemd_root_provision::{
