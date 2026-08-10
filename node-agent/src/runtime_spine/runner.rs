@@ -592,6 +592,11 @@ impl CompleteRuntimeInventory {
     pub(crate) fn residue(&self) -> &[NodeResidue] {
         &self.residue
     }
+
+    #[cfg(test)]
+    pub(crate) fn key_ring(&self) -> &RuntimeInventoryKeyRing {
+        &self.key_ring
+    }
 }
 
 /// Opaque proof that each member of Runtime's closed inventory-source set was
@@ -3761,6 +3766,50 @@ mod tests {
             ),
         )
         .unwrap()
+    }
+
+    #[test]
+    fn full_observation_projects_the_exact_loaded_route_key_ring() {
+        let registered = decode_agent_session(SESSION).unwrap();
+        let desired = decode_desired_read_snapshot(SNAPSHOT).unwrap();
+        let version = Epoch::new(7).unwrap();
+        let kids = vec![
+            KeyId::new("a".repeat(64)).unwrap(),
+            KeyId::new("b".repeat(64)).unwrap(),
+        ];
+        let digest = cats_api::runtime_reconciliation::key_ring_digest(version, &kids).unwrap();
+        let observation = build_full_observation(
+            RuntimeSpineFullScan {
+                session: SessionBinding {
+                    node_id: registered.node_id,
+                    node_boot_id: registered.node_boot_id,
+                    agent_instance_id: registered.agent_instance_id,
+                    agent_session_epoch: registered.agent_session_epoch,
+                },
+                heartbeat_sequence: Sequence::new(1).unwrap(),
+                inventory_epoch: Epoch::new(1).unwrap(),
+                desired,
+            },
+            CompleteRuntimeInventory::for_test(
+                UnixMillis::new(1_720_000_004_000).unwrap(),
+                RuntimeInventoryKeyRing::Loaded {
+                    version,
+                    digest: digest.clone(),
+                    kids: kids.clone(),
+                },
+                Vec::new(),
+                Vec::new(),
+            ),
+        )
+        .unwrap();
+
+        assert_eq!(observation.key_ring_version, Some(version));
+        assert_eq!(observation.key_ring_digest, Some(digest));
+        assert_eq!(observation.loaded_kids, kids);
+        assert_eq!(
+            observation.inventory_digest,
+            Some(inventory_digest(&observation).unwrap())
+        );
     }
 
     #[test]

@@ -11,6 +11,9 @@ use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::Context as _;
+use cats_api::runtime_artifacts::{
+    inspect_installed_route_grant_v2_public_key_ring, InstalledRouteGrantV2PublicKeyRingState,
+};
 use cats_api::runtime_reconciliation::{
     checkpoint_content_digest, AppliedDesiredEvidence, CheckpointEvidence, Condition,
     DesiredRuntimeSpec, GuestTransportEvidence, HostPath, Id, InventorySource, LifecycleAdmission,
@@ -27,6 +30,7 @@ use cats_storage::{
 };
 use thiserror::Error;
 
+use crate::route_grant_v2::RouteGrantV2KeyRing;
 use crate::runtime_spine::{
     CompleteRuntimeInventory, InventoryCoverageAggregator, RuntimeInventoryKeyRing,
     RuntimeInventoryScanContext, RuntimeInventoryScanOutcome, RuntimeInventoryScanner,
@@ -161,6 +165,53 @@ pub(crate) trait RootProcessInventoryBridge:
     ) -> anyhow::Result<RootProcessInventoryBridgeOutcome>;
 }
 
+pub(crate) mod runtime_inventory_key_ring_reader_sealed {
+    pub(crate) trait Sealed {}
+}
+
+/// One bounded read of the Node's installed Route v2 verifier ring. The
+/// scanner calls this port at most once per full scan and never retains a
+/// successful result for a later scan.
+pub(crate) trait RuntimeInventoryKeyRingReader:
+    runtime_inventory_key_ring_reader_sealed::Sealed + Send + Sync + 'static
+{
+    fn read(
+        &self,
+        context: &RuntimeInventoryScanContext,
+    ) -> anyhow::Result<RuntimeInventoryKeyRing>;
+}
+
+#[derive(Debug)]
+pub(crate) struct InstalledRuntimeInventoryKeyRingReader;
+
+impl runtime_inventory_key_ring_reader_sealed::Sealed for InstalledRuntimeInventoryKeyRingReader {}
+
+impl RuntimeInventoryKeyRingReader for InstalledRuntimeInventoryKeyRingReader {
+    fn read(
+        &self,
+        context: &RuntimeInventoryScanContext,
+    ) -> anyhow::Result<RuntimeInventoryKeyRing> {
+        context.check_active()?;
+        let installed = inspect_installed_route_grant_v2_public_key_ring()
+            .context("inspect the fixed installed Route Grant v2 public-key ring")?;
+        context.check_active()?;
+        match installed {
+            InstalledRouteGrantV2PublicKeyRingState::Unavailable => {
+                Ok(RuntimeInventoryKeyRing::Unavailable)
+            }
+            InstalledRouteGrantV2PublicKeyRingState::Loaded(installed) => {
+                let ring = RouteGrantV2KeyRing::from_artifact(installed.ring())
+                    .context("construct the installed Route Grant v2 verifier ring")?;
+                Ok(RuntimeInventoryKeyRing::Loaded {
+                    version: ring.version(),
+                    digest: ring.digest().clone(),
+                    kids: ring.loaded_kids().to_vec(),
+                })
+            }
+        }
+    }
+}
+
 #[derive(Debug, Error, PartialEq, Eq)]
 pub enum InventoryProbeSetError {
     #[error("inventory absence probe is duplicated for {0:?}")]
@@ -174,6 +225,7 @@ pub struct CleanSlateInventoryScanner {
     probes: Vec<Arc<dyn InventoryAbsenceProbe>>,
     blob: Option<Arc<dyn BlobStore>>,
     root_process_bridge: Option<Arc<dyn RootProcessInventoryBridge>>,
+    key_ring_reader: Option<Arc<dyn RuntimeInventoryKeyRingReader>>,
 }
 
 impl crate::runtime_spine::inventory_scanner_sealed::Sealed for CleanSlateInventoryScanner {}
@@ -217,6 +269,7 @@ impl CleanSlateInventoryScanner {
             probes,
             blob: None,
             root_process_bridge: None,
+            key_ring_reader: None,
         })
     }
 
@@ -239,6 +292,14 @@ impl CleanSlateInventoryScanner {
         let mut scanner = Self::new_with_blob(checkpoint_directory, probes, blob)?;
         scanner.root_process_bridge = Some(bridge);
         Ok(scanner)
+    }
+
+    pub(crate) fn with_key_ring_reader(
+        mut self,
+        reader: Arc<dyn RuntimeInventoryKeyRingReader>,
+    ) -> Self {
+        self.key_ring_reader = Some(reader);
+        self
     }
 }
 
@@ -433,6 +494,11 @@ impl RuntimeInventoryScanner for CleanSlateInventoryScanner {
             });
         }
 
+        let key_ring = match &self.key_ring_reader {
+            Some(reader) => reader.read(&context)?,
+            None => RuntimeInventoryKeyRing::Unavailable,
+        };
+        context.check_active()?;
         let observed_at_unix_ms = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .context("system time precedes the Unix epoch")?
@@ -480,7 +546,7 @@ impl RuntimeInventoryScanner for CleanSlateInventoryScanner {
             CompleteRuntimeInventory::from_validated_coverage(
                 coverage,
                 observed_at_unix_ms,
-                RuntimeInventoryKeyRing::Unavailable,
+                key_ring,
                 runtimes,
                 Vec::new(),
             ),
@@ -1218,9 +1284,9 @@ mod tests {
     use cats_api::runtime_reconciliation::{
         decode_desired_read_snapshot, encode_node_observation, inventory_digest, spec_digest,
         AssignedKind, AssignedPlacement, ContractVersion, DesiredRuntimeSpec, Epoch, Id,
-        InventorySource, Ipv4Address, IsolatedIpv4Kind, MacAddress, NetworkConfig, NodeObservation,
-        RandomId128, Revision, RuntimeConfig, RuntimeTarget, RuntimeTransition, SessionBinding,
-        Sha256Digest,
+        InventorySource, Ipv4Address, IsolatedIpv4Kind, KeyId, MacAddress, NetworkConfig,
+        NodeObservation, RandomId128, Revision, RuntimeConfig, RuntimeTarget, RuntimeTransition,
+        SessionBinding, Sha256Digest,
     };
 
     use super::*;
@@ -1231,6 +1297,29 @@ mod tests {
         source: InventorySource,
         result: InventoryAbsence,
         calls: Arc<AtomicUsize>,
+    }
+
+    struct KeyRingReader {
+        calls: Arc<AtomicUsize>,
+        value: RuntimeInventoryKeyRing,
+        fail: bool,
+        cancel_before_return: bool,
+    }
+
+    impl runtime_inventory_key_ring_reader_sealed::Sealed for KeyRingReader {}
+
+    impl RuntimeInventoryKeyRingReader for KeyRingReader {
+        fn read(
+            &self,
+            context: &RuntimeInventoryScanContext,
+        ) -> anyhow::Result<RuntimeInventoryKeyRing> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            if self.cancel_before_return {
+                context.cancel_for_test();
+            }
+            anyhow::ensure!(!self.fail, "injected installed ring read failure");
+            Ok(self.value.clone())
+        }
     }
 
     impl super::super::inventory_probe_sealed::Sealed for Probe {}
@@ -1374,6 +1463,89 @@ mod tests {
             RuntimeInventoryScanOutcome::Incomplete { unavailable_sources }
                 if unavailable_sources == [InventorySource::MetadataStore]
         ));
+    }
+
+    #[test]
+    fn installed_ring_is_read_once_and_projected_without_blocking_absence() {
+        let probe_calls = Arc::new(AtomicUsize::new(0));
+        let reader_calls = Arc::new(AtomicUsize::new(0));
+        let kid = KeyId::new("a".repeat(64)).unwrap();
+        let version = Epoch::new(7).unwrap();
+        let digest =
+            cats_api::runtime_reconciliation::key_ring_digest(version, std::slice::from_ref(&kid))
+                .unwrap();
+        let scanner = CleanSlateInventoryScanner::new(
+            PathBuf::from("/checkpoints"),
+            probes(None, &probe_calls),
+        )
+        .unwrap()
+        .with_key_ring_reader(Arc::new(KeyRingReader {
+            calls: Arc::clone(&reader_calls),
+            value: RuntimeInventoryKeyRing::Loaded {
+                version,
+                digest: digest.clone(),
+                kids: vec![kid.clone()],
+            },
+            fail: false,
+            cancel_before_return: false,
+        }));
+        let RuntimeInventoryScanOutcome::Complete(inventory) =
+            scanner.scan_complete(context()).unwrap()
+        else {
+            panic!("valid installed ring must preserve the complete inventory")
+        };
+        assert_eq!(
+            inventory.key_ring(),
+            &RuntimeInventoryKeyRing::Loaded {
+                version,
+                digest,
+                kids: vec![kid],
+            }
+        );
+        assert_eq!(reader_calls.load(Ordering::SeqCst), 1);
+
+        let absent_calls = Arc::new(AtomicUsize::new(0));
+        let absent = CleanSlateInventoryScanner::new(
+            PathBuf::from("/checkpoints"),
+            probes(None, &probe_calls),
+        )
+        .unwrap()
+        .with_key_ring_reader(Arc::new(KeyRingReader {
+            calls: Arc::clone(&absent_calls),
+            value: RuntimeInventoryKeyRing::Unavailable,
+            fail: false,
+            cancel_before_return: false,
+        }));
+        let RuntimeInventoryScanOutcome::Complete(inventory) =
+            absent.scan_complete(context()).unwrap()
+        else {
+            panic!("an absent ring must not make a non-Route inventory incomplete")
+        };
+        assert_eq!(inventory.key_ring(), &RuntimeInventoryKeyRing::Unavailable);
+        assert_eq!(absent_calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn failed_or_cancelled_ring_read_never_returns_or_caches_a_complete_scan() {
+        for (fail, cancel_before_return) in [(true, false), (false, true)] {
+            let probe_calls = Arc::new(AtomicUsize::new(0));
+            let reader_calls = Arc::new(AtomicUsize::new(0));
+            let scanner = CleanSlateInventoryScanner::new(
+                PathBuf::from("/checkpoints"),
+                probes(None, &probe_calls),
+            )
+            .unwrap()
+            .with_key_ring_reader(Arc::new(KeyRingReader {
+                calls: Arc::clone(&reader_calls),
+                value: RuntimeInventoryKeyRing::Unavailable,
+                fail,
+                cancel_before_return,
+            }));
+            assert!(scanner.scan_complete(context()).is_err());
+            assert_eq!(reader_calls.load(Ordering::SeqCst), 1);
+            assert!(scanner.scan_complete(context()).is_err());
+            assert_eq!(reader_calls.load(Ordering::SeqCst), 2);
+        }
     }
 
     #[test]

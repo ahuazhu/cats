@@ -62,8 +62,8 @@ use super::inventory::{
 use super::root_provision_process::inspect_exact_root_provision_process;
 use super::{
     inventory::{
-        root_process_inventory_bridge_sealed, RootProcessInventoryBridge,
-        RootProcessInventoryBridgeOutcome,
+        root_process_inventory_bridge_sealed, InstalledRuntimeInventoryKeyRingReader,
+        RootProcessInventoryBridge, RootProcessInventoryBridgeOutcome,
     },
     AuthorizedBlockdCheckpoint, CleanSlateInventoryScanner, InventoryAbsence,
     InventoryAbsenceProbe, PlatformSystemdRootProvisionProcessPort, RootProvisionProcessConflict,
@@ -936,7 +936,8 @@ pub(crate) fn installed_clean_slate_scanner(
     let blob_store = Arc::clone(&config.blob_store);
     let config = ProbeConfig::installed(config)?;
     let scanner =
-        scanner_with_metadata_authority_and_blob(config, metadata_authority, Some(blob_store))?;
+        scanner_with_metadata_authority_and_blob(config, metadata_authority, Some(blob_store))?
+            .with_key_ring_reader(Arc::new(InstalledRuntimeInventoryKeyRingReader));
     Ok(Arc::new(scanner))
 }
 

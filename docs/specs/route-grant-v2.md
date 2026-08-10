@@ -178,7 +178,8 @@ handler在读取body、取得admission permit或访问PostgreSQL前要求该prin
 
 当前repository尚无能满足本节的Gateway workload credential authority。[ADR-0044](../decisions/0044-independent-route-v2-signing-authority.md)
 与[Route v2 Signing Authority v1](route-signing-authority-v1.md)已经冻结独立Route v2 signer secret
-reference/public-ring artifact与rotation边界，但持久writer、Node ACK消费和production composition尚未完成；
+reference/public-ring artifact与rotation边界；Node production full inventory已只读投影fixed installed ring，
+Control signer snapshot也会消费其exact ACK，但installer、持久rotation writer和production composition尚未完成；
 v2绝不借legacy V1 signer/key作为fallback。因此production listener不会
 构造typed principal，普通Control组合固定在pre-body/pre-PG `401`；即使未来误注入principal但尚无独立
 v2 signer，也在body/admission/PG前返回`503`。后续Accepted authority必须至少冻结：

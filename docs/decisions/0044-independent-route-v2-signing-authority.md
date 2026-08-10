@@ -39,10 +39,12 @@ provisioner key。这三者都拥有不同 principal、签名 domain、轮换和
 
 ## 当前实现边界
 
-首个可合入 slice 只实现 canonical artifact codecs、固定路径/metadata reader 和 private/public
-pair check。它不实现 PostgreSQL writer、rotation transaction、ACK 消费、Gateway principal、Control/Node
-TLS listener 或 proxy。上述生产组合缺任一项时仍保持关闭，不能用测试 constructor 或旧 authority
-补齐。
+当前实现包含 canonical artifact codecs、固定路径/metadata reader、private/public pair check，以及 Node
+production full-inventory 对已安装 public ring 的只读 exact observation。Control 的 signer snapshot 会消费
+该 observation 中的 exact version/digest/sorted kids；artifact 缺席保持 unavailable，存在但无法完整验证时
+不接受该轮 full inventory。它仍不实现 public-ring installer、PostgreSQL rotation writer/transaction、
+schedulable 全量 ACK rollout、Gateway principal、Control/Node TLS listener 或 proxy。上述生产组合缺任一项时
+仍保持关闭，不能用测试 constructor 或旧 authority 补齐。
 
 ## 后果
 

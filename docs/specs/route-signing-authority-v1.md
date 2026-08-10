@@ -1,13 +1,14 @@
 # Route v2 Signing Authority v1
 
-- 状态：Frozen target contract；artifact codecs/readers 是首个 slice，持久 rotation/ACK composition 尚未实现
+- 状态：Frozen target contract；artifact codecs/readers 与 Node installed-ring observation 已实现，installer 和持久 rotation rollout 尚未实现
 - 决策：[ADR-0044](../decisions/0044-independent-route-v2-signing-authority.md)
 - Grant 与 admission：[Route Grant v2](route-grant-v2.md)
 - Node observation：[Runtime Inventory and Observation Spine v1](runtime-inventory-observation-v1.md)
 
-本文只冻结 Route v2 private signer、public-key ring、rotation/revocation 与部署 artifact。它不定义
-Gateway workload principal、Control/Node TLS transport、public listener、Node proxy 或 Runtime scanner。
-这些边界未闭合时 production Route v2 必须继续关闭。
+本文只冻结 Route v2 private signer、public-key ring、rotation/revocation、部署 artifact，以及 Runtime
+scanner 对 fixed installed ring 的 exact observation。它不定义其他 physical inventory source、Gateway
+workload principal、Control/Node TLS transport、public listener或Node proxy。这些边界未闭合时 production
+Route v2 必须继续关闭。
 
 ## 1. Authority separation
 
@@ -87,7 +88,10 @@ ring继续有效。空ring是合法加载结果但不接受任何Grant；它与a
 Node installer必须先在同filesystem temporary file完整验证candidate和expected-previous，再fsync file、
 atomic rename到fixed path并fsync parent，最后才原子swap进程内整环。crash在rename前保留old；rename后restart
 只加载new。ACK只有在新环已durable且进程内swap完成后才可随下一次complete inventory提交，exact值为
-`ring_version`、`key_ring_digest`和sorted `loaded_kids`。本slice不实现installer或scanner ACK。
+`ring_version`、`key_ring_digest`和sorted `loaded_kids`。production scanner 现已从固定路径每轮只读一次，
+把artifact构造成完整in-process verifier replacement后投影该exact observation；artifact缺席只投影
+unavailable，存在但partial/corrupt/unsafe/读取不稳定时
+整轮不提交 full observation，且 deadline/cancel 后的 late result 不缓存。installer 仍未实现。
 
 ## 4. Control signer descriptor
 

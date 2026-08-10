@@ -73,6 +73,18 @@ pub struct InstalledRouteGrantV2PublicKeyRing {
     exact_bytes: Vec<u8>,
 }
 
+/// Read-only state of the one fixed Node public-ring artifact.
+///
+/// An absent fixed path is an ordinary unavailable observation. Once any
+/// member of the installed path exists, however, ownership, mode, link,
+/// canonical-wire or stable-read failures remain errors and cannot be
+/// translated back into absence.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum InstalledRouteGrantV2PublicKeyRingState {
+    Unavailable,
+    Loaded(InstalledRouteGrantV2PublicKeyRing),
+}
+
 impl InstalledRouteGrantV2PublicKeyRing {
     pub fn ring(&self) -> &RouteGrantV2PublicKeyRingArtifact {
         &self.ring
@@ -241,6 +253,14 @@ pub fn load_installed_route_grant_v2_public_key_ring(
     load_installed_route_grant_v2_public_key_ring_platform()
 }
 
+/// Inspect the exact production Node public-ring path without accepting a
+/// caller-selected alternate or treating an invalid installed artifact as
+/// unavailable.
+pub fn inspect_installed_route_grant_v2_public_key_ring(
+) -> Result<InstalledRouteGrantV2PublicKeyRingState, RuntimeArtifactError> {
+    inspect_installed_route_grant_v2_public_key_ring_platform()
+}
+
 #[cfg(unix)]
 fn load_installed_route_grant_v2_public_key_ring_platform(
 ) -> Result<InstalledRouteGrantV2PublicKeyRing, RuntimeArtifactError> {
@@ -251,9 +271,28 @@ fn load_installed_route_grant_v2_public_key_ring_platform(
     load_route_grant_v2_public_key_ring_from(&directory, InstalledFileContract::root(0o644))
 }
 
+#[cfg(unix)]
+fn inspect_installed_route_grant_v2_public_key_ring_platform(
+) -> Result<InstalledRouteGrantV2PublicKeyRingState, RuntimeArtifactError> {
+    let Some(directory) = open_installed_directory_if_present(
+        &["etc", "cats", "route-v2"],
+        InstalledDirectoryMode::Exact(0o700),
+    )?
+    else {
+        return Ok(InstalledRouteGrantV2PublicKeyRingState::Unavailable);
+    };
+    inspect_route_grant_v2_public_key_ring_from(&directory, InstalledFileContract::root(0o644))
+}
+
 #[cfg(not(unix))]
 fn load_installed_route_grant_v2_public_key_ring_platform(
 ) -> Result<InstalledRouteGrantV2PublicKeyRing, RuntimeArtifactError> {
+    Err(RuntimeArtifactError::UnsupportedPlatform)
+}
+
+#[cfg(not(unix))]
+fn inspect_installed_route_grant_v2_public_key_ring_platform(
+) -> Result<InstalledRouteGrantV2PublicKeyRingState, RuntimeArtifactError> {
     Err(RuntimeArtifactError::UnsupportedPlatform)
 }
 
@@ -328,6 +367,53 @@ fn load_route_grant_v2_public_key_ring_from_with_phase(
         ring,
         exact_bytes: pinned.into_exact_bytes(),
     })
+}
+
+#[cfg(unix)]
+fn inspect_route_grant_v2_public_key_ring_from(
+    directory: &InstalledDirectoryPath,
+    file_contract: InstalledFileContract,
+) -> Result<InstalledRouteGrantV2PublicKeyRingState, RuntimeArtifactError> {
+    inspect_route_grant_v2_public_key_ring_from_with_phase(directory, file_contract, |_| {})
+}
+
+#[cfg(unix)]
+fn inspect_route_grant_v2_public_key_ring_from_with_phase(
+    directory: &InstalledDirectoryPath,
+    file_contract: InstalledFileContract,
+    mut after_read: impl FnMut(RouteGrantV2ArtifactReadPhase),
+) -> Result<InstalledRouteGrantV2PublicKeyRingState, RuntimeArtifactError> {
+    let pinned = read_pinned_installed_file_at_with_contract_if_present(
+        directory.final_descriptor(),
+        "public-key-ring.v1.json",
+        Path::new(ROUTE_GRANT_V2_PUBLIC_KEY_RING_PATH),
+        ROUTE_GRANT_V2_ARTIFACT_MAX_WIRE_BYTES,
+        file_contract,
+    )?;
+    after_read(RouteGrantV2ArtifactReadPhase::PublicKeyRing);
+    let Some(pinned) = pinned else {
+        let fresh_directory = directory.reopen_canonical_path()?;
+        ensure_entry_absent_at(
+            &fresh_directory,
+            "public-key-ring.v1.json",
+            Path::new(ROUTE_GRANT_V2_PUBLIC_KEY_RING_PATH),
+        )?;
+        return Ok(InstalledRouteGrantV2PublicKeyRingState::Unavailable);
+    };
+    let fresh_directory = directory.reopen_canonical_path()?;
+    pinned.revalidate_from(
+        &fresh_directory,
+        ROUTE_GRANT_V2_ARTIFACT_MAX_WIRE_BYTES,
+        file_contract,
+    )?;
+    let ring = decode_route_grant_v2_public_key_ring(pinned.exact_bytes())
+        .map_err(|_| RuntimeArtifactError::InvalidRouteGrantV2PublicKeyRing)?;
+    Ok(InstalledRouteGrantV2PublicKeyRingState::Loaded(
+        InstalledRouteGrantV2PublicKeyRing {
+            ring,
+            exact_bytes: pinned.into_exact_bytes(),
+        },
+    ))
 }
 
 #[cfg(unix)]
@@ -939,11 +1025,124 @@ fn open_directory_path(path: &Path, display: &Path) -> Result<File, RuntimeArtif
 }
 
 #[cfg(unix)]
+fn open_installed_directory_if_present(
+    components: &[&str],
+    final_mode: InstalledDirectoryMode,
+) -> Result<Option<InstalledDirectoryPath>, RuntimeArtifactError> {
+    open_installed_directory_if_present_from(
+        Path::new("/"),
+        components,
+        final_mode,
+        InstalledDirectoryOwner::Root,
+    )
+}
+
+#[cfg(unix)]
+fn open_installed_directory_if_present_from(
+    canonical_root: &Path,
+    components: &[&str],
+    final_mode: InstalledDirectoryMode,
+    owner: InstalledDirectoryOwner,
+) -> Result<Option<InstalledDirectoryPath>, RuntimeArtifactError> {
+    open_installed_directory_if_present_from_with_phase(
+        canonical_root,
+        components,
+        final_mode,
+        owner,
+        |_| {},
+    )
+}
+
+#[cfg(unix)]
+fn open_installed_directory_if_present_from_with_phase(
+    canonical_root: &Path,
+    components: &[&str],
+    final_mode: InstalledDirectoryMode,
+    owner: InstalledDirectoryOwner,
+    mut after_absent_lookup: impl FnMut(&Path),
+) -> Result<Option<InstalledDirectoryPath>, RuntimeArtifactError> {
+    use std::os::unix::fs::MetadataExt as _;
+
+    let root_display = canonical_root.to_path_buf();
+    let root = open_directory_path(canonical_root, &root_display)?;
+    let root_metadata = root
+        .metadata()
+        .map_err(|_| filesystem_error(&root_display))?;
+    if !root_metadata.file_type().is_dir()
+        || !owner.accepts(root_metadata.uid(), root_metadata.gid())
+        || root_metadata.mode() & 0o022 != 0
+    {
+        return Err(filesystem_error(&root_display));
+    }
+    let mut directories = vec![RetainedInstalledDirectory {
+        name: None,
+        display: root_display.clone(),
+        descriptor: root,
+        metadata: StableFileMetadata::new(&root_metadata),
+    }];
+    let mut display = root_display;
+    for (index, component) in components.iter().enumerate() {
+        display.push(component);
+        let Some(directory) = try_open_directory_at(
+            &directories
+                .last()
+                .expect("the installed path always retains its root")
+                .descriptor,
+            component,
+            &display,
+        )?
+        else {
+            let retained = InstalledDirectoryPath {
+                canonical_root: canonical_root.to_path_buf(),
+                directories,
+            };
+            after_absent_lookup(&display);
+            let fresh_parent = retained.reopen_canonical_path()?;
+            ensure_directory_entry_absent_at(&fresh_parent, component, &display)?;
+            return Ok(None);
+        };
+        let metadata = directory
+            .metadata()
+            .map_err(|_| filesystem_error(&display))?;
+        let mode_is_valid = if index + 1 == components.len() {
+            final_mode.accepts(metadata.mode())
+        } else {
+            metadata.mode() & 0o022 == 0
+        };
+        if !metadata.file_type().is_dir()
+            || !owner.accepts(metadata.uid(), metadata.gid())
+            || !mode_is_valid
+        {
+            return Err(filesystem_error(&display));
+        }
+        directories.push(RetainedInstalledDirectory {
+            name: Some((*component).to_owned()),
+            display: display.clone(),
+            descriptor: directory,
+            metadata: StableFileMetadata::new(&metadata),
+        });
+    }
+    Ok(Some(InstalledDirectoryPath {
+        canonical_root: canonical_root.to_path_buf(),
+        directories,
+    }))
+}
+
+#[cfg(unix)]
 fn open_directory_at(
     parent: &File,
     name: &str,
     display: &Path,
 ) -> Result<File, RuntimeArtifactError> {
+    try_open_directory_at(parent, name, display)?.ok_or_else(|| filesystem_error(display))
+}
+
+#[cfg(unix)]
+fn try_open_directory_at(
+    parent: &File,
+    name: &str,
+    display: &Path,
+) -> Result<Option<File>, RuntimeArtifactError> {
     let name = CString::new(name).map_err(|_| filesystem_error(display))?;
     // SAFETY: `parent` remains open for the call, `name` is NUL-terminated,
     // and a successful descriptor is immediately owned by `File`.
@@ -955,10 +1154,27 @@ fn open_directory_at(
         )
     };
     if descriptor < 0 {
-        return Err(filesystem_error(display));
+        return if std::io::Error::last_os_error().kind() == std::io::ErrorKind::NotFound {
+            Ok(None)
+        } else {
+            Err(filesystem_error(display))
+        };
     }
     // SAFETY: `openat` returned a new owned descriptor.
-    Ok(unsafe { File::from_raw_fd(descriptor) })
+    Ok(Some(unsafe { File::from_raw_fd(descriptor) }))
+}
+
+#[cfg(unix)]
+fn ensure_directory_entry_absent_at(
+    parent: &File,
+    name: &str,
+    display: &Path,
+) -> Result<(), RuntimeArtifactError> {
+    if try_open_directory_at(parent, name, display)?.is_some() {
+        Err(filesystem_error(display))
+    } else {
+        Ok(())
+    }
 }
 
 #[cfg(unix)]
@@ -967,6 +1183,15 @@ fn open_file_at(
     name: &str,
     display: &Path,
 ) -> Result<File, RuntimeArtifactError> {
+    try_open_file_at(directory, name, display)?.ok_or_else(|| filesystem_error(display))
+}
+
+#[cfg(unix)]
+fn try_open_file_at(
+    directory: &File,
+    name: &str,
+    display: &Path,
+) -> Result<Option<File>, RuntimeArtifactError> {
     let name = CString::new(name).map_err(|_| filesystem_error(display))?;
     // SAFETY: `directory` remains open for the call, `name` is
     // NUL-terminated, and a successful descriptor is immediately owned.
@@ -981,10 +1206,14 @@ fn open_file_at(
         )
     };
     if descriptor < 0 {
-        return Err(filesystem_error(display));
+        return if std::io::Error::last_os_error().kind() == std::io::ErrorKind::NotFound {
+            Ok(None)
+        } else {
+            Err(filesystem_error(display))
+        };
     }
     // SAFETY: `openat` returned a new owned descriptor.
-    Ok(unsafe { File::from_raw_fd(descriptor) })
+    Ok(Some(unsafe { File::from_raw_fd(descriptor) }))
 }
 
 #[cfg(unix)]
@@ -993,26 +1222,10 @@ fn ensure_entry_absent_at(
     name: &str,
     display: &Path,
 ) -> Result<(), RuntimeArtifactError> {
-    let name = CString::new(name).map_err(|_| filesystem_error(display))?;
-    // SAFETY: arguments satisfy `openat`; no descriptor is retained on error.
-    // `O_NONBLOCK` also keeps an unexpected FIFO from hanging this absence
-    // probe before it can reject the existing entry.
-    let descriptor = unsafe {
-        libc::openat(
-            directory.as_raw_fd(),
-            name.as_ptr(),
-            libc::O_RDONLY | libc::O_NONBLOCK | libc::O_NOFOLLOW | libc::O_CLOEXEC,
-        )
-    };
-    if descriptor >= 0 {
-        // SAFETY: this branch owns the descriptor returned by `openat`.
-        drop(unsafe { File::from_raw_fd(descriptor) });
-        return Err(filesystem_error(display));
-    }
-    if std::io::Error::last_os_error().kind() == std::io::ErrorKind::NotFound {
-        Ok(())
-    } else {
+    if try_open_file_at(directory, name, display)?.is_some() {
         Err(filesystem_error(display))
+    } else {
+        Ok(())
     }
 }
 
@@ -1125,16 +1338,32 @@ fn read_pinned_installed_file_at_with_contract(
     cap: usize,
     contract: InstalledFileContract,
 ) -> Result<PinnedInstalledFile, RuntimeArtifactError> {
-    let descriptor = open_file_at(directory, basename, display)?;
+    read_pinned_installed_file_at_with_contract_if_present(
+        directory, basename, display, cap, contract,
+    )?
+    .ok_or_else(|| filesystem_error(display))
+}
+
+#[cfg(unix)]
+fn read_pinned_installed_file_at_with_contract_if_present(
+    directory: &File,
+    basename: &'static str,
+    display: &'static Path,
+    cap: usize,
+    contract: InstalledFileContract,
+) -> Result<Option<PinnedInstalledFile>, RuntimeArtifactError> {
+    let Some(descriptor) = try_open_file_at(directory, basename, display)? else {
+        return Ok(None);
+    };
     let (metadata, exact_bytes) =
         read_stable_descriptor_bytes(&descriptor, display, cap, contract)?;
-    Ok(PinnedInstalledFile {
+    Ok(Some(PinnedInstalledFile {
         basename,
         display,
         descriptor,
         metadata,
         exact_bytes,
-    })
+    }))
 }
 
 #[cfg(unix)]
@@ -1747,6 +1976,64 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
+    fn optional_route_ring_reader_rejects_absence_and_loaded_path_aba() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        for replace_directory in [false, true] {
+            let temp = tempfile::tempdir().unwrap();
+            let directory_path = temp.path().join("route-v2");
+            write_test_route_artifacts(&directory_path, false);
+            let (public_contract, _) = test_route_contracts(&directory_path);
+            let retained = open_test_route_directory(temp.path());
+            let result = inspect_route_grant_v2_public_key_ring_from_with_phase(
+                &retained,
+                public_contract,
+                |phase| {
+                    assert_eq!(phase, RouteGrantV2ArtifactReadPhase::PublicKeyRing);
+                    if replace_directory {
+                        recreate_route_directory(&directory_path, false);
+                    } else {
+                        recreate_route_basename(&directory_path, phase, false);
+                    }
+                },
+            );
+            assert!(
+                matches!(result, Err(RuntimeArtifactError::Filesystem { .. })),
+                "optional loaded-ring path replacement escaped: {result:?}"
+            );
+        }
+
+        let temp = tempfile::tempdir().unwrap();
+        let directory_path = temp.path().join("route-v2");
+        std::fs::create_dir(&directory_path).unwrap();
+        std::fs::set_permissions(&directory_path, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let retained = open_test_route_directory(temp.path());
+        let (uid, gid) = {
+            use std::os::unix::fs::MetadataExt as _;
+            let metadata = std::fs::metadata(&directory_path).unwrap();
+            (metadata.uid(), metadata.gid())
+        };
+        let result = inspect_route_grant_v2_public_key_ring_from_with_phase(
+            &retained,
+            InstalledFileContract {
+                uid,
+                gid,
+                mode: 0o644,
+            },
+            |_| {
+                let path = directory_path.join("public-key-ring.v1.json");
+                std::fs::write(&path, ROUTE_RING).unwrap();
+                std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+            },
+        );
+        assert!(
+            matches!(result, Err(RuntimeArtifactError::Filesystem { .. })),
+            "a ring created after the absent lookup escaped: {result:?}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
     fn pinned_private_file_debug_never_contains_exact_bytes() {
         let temp = tempfile::tempdir().unwrap();
         let directory_path = temp.path().join("route-v2");
@@ -1767,6 +2054,43 @@ mod tests {
         assert!(debug.contains("signer-private-key.pem"));
         assert!(!debug.contains("BEGIN PRIVATE KEY"));
         assert!(!debug.contains(&format!("{:?}", ROUTE_PRIVATE_KEY)));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn optional_installed_directory_absence_is_revalidated_on_the_retained_chain() {
+        use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
+
+        let temp = tempfile::tempdir().unwrap();
+        std::fs::set_permissions(temp.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+        let metadata = std::fs::metadata(temp.path()).unwrap();
+        let owner = InstalledDirectoryOwner::Exact {
+            uid: metadata.uid(),
+            gid: metadata.gid(),
+        };
+        assert!(open_installed_directory_if_present_from(
+            temp.path(),
+            &["route-v2"],
+            InstalledDirectoryMode::Exact(0o700),
+            owner,
+        )
+        .unwrap()
+        .is_none());
+
+        let result = open_installed_directory_if_present_from_with_phase(
+            temp.path(),
+            &["route-v2"],
+            InstalledDirectoryMode::Exact(0o700),
+            owner,
+            |missing| {
+                std::fs::create_dir(missing).unwrap();
+                std::fs::set_permissions(missing, std::fs::Permissions::from_mode(0o700)).unwrap();
+            },
+        );
+        assert!(
+            matches!(result, Err(RuntimeArtifactError::Filesystem { .. })),
+            "a directory created after the absent lookup escaped: {result:?}"
+        );
     }
 
     #[cfg(unix)]
@@ -1822,6 +2146,48 @@ mod tests {
         assert!(
             load_route_grant_v2_signer_from(&retained, public_contract, private_contract).is_err()
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn route_ring_inspection_distinguishes_absence_from_invalid_installed_bytes() {
+        use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
+
+        let temp = tempfile::tempdir().unwrap();
+        let directory_path = temp.path().join("route-v2");
+        std::fs::create_dir(&directory_path).unwrap();
+        std::fs::set_permissions(&directory_path, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let metadata = std::fs::metadata(&directory_path).unwrap();
+        let contract = InstalledFileContract {
+            uid: metadata.uid(),
+            gid: metadata.gid(),
+            mode: 0o644,
+        };
+        let retained = open_test_route_directory(temp.path());
+
+        assert!(matches!(
+            inspect_route_grant_v2_public_key_ring_from(&retained, contract).unwrap(),
+            InstalledRouteGrantV2PublicKeyRingState::Unavailable
+        ));
+
+        let ring_path = directory_path.join("public-key-ring.v1.json");
+        std::fs::write(&ring_path, ROUTE_RING).unwrap();
+        std::fs::set_permissions(&ring_path, std::fs::Permissions::from_mode(0o644)).unwrap();
+        let retained = open_test_route_directory(temp.path());
+        let InstalledRouteGrantV2PublicKeyRingState::Loaded(installed) =
+            inspect_route_grant_v2_public_key_ring_from(&retained, contract).unwrap()
+        else {
+            panic!("canonical installed ring was reported unavailable")
+        };
+        assert_eq!(installed.exact_bytes(), ROUTE_RING);
+        assert_eq!(installed.ring().ring_version.get(), 1);
+
+        std::fs::write(&ring_path, b"{}").unwrap();
+        let retained = open_test_route_directory(temp.path());
+        assert!(matches!(
+            inspect_route_grant_v2_public_key_ring_from(&retained, contract),
+            Err(RuntimeArtifactError::InvalidRouteGrantV2PublicKeyRing)
+        ));
     }
 
     #[cfg(unix)]
