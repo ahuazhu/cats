@@ -16,6 +16,7 @@ use cats_api::runtime_reconciliation::{
     PROVISION_ROOT_IMAGE_ERROR_MAX_WIRE_BYTES, PROVISION_ROOT_IMAGE_RESULT_MAX_WIRE_BYTES,
 };
 
+use crate::proc::ProcIdentity;
 use crate::runtime_spine::RuntimePhysicalReadContext;
 
 const COMMAND_PREFIX: &[u8] = b"provision_root_image ";
@@ -70,6 +71,23 @@ pub trait RootProvisionControlPort: Send + Sync {
     ) -> Result<AuthorityRereadRequired, RootProvisionClientError>;
 }
 
+/// Read-only process identity probe used while the connected provision
+/// stream pins its Unix peer. Implementations must not open the blockd control
+/// socket: that listener handles one connection at a time, so a nested status
+/// request would deadlock behind the retained provision stream.
+pub(crate) trait RootProvisionProcessIdentityPort: Send + Sync {
+    fn sample(&self, process_id: u32) -> ProcIdentity;
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+pub(crate) struct PlatformRootProvisionProcessIdentityPort;
+
+impl RootProvisionProcessIdentityPort for PlatformRootProvisionProcessIdentityPort {
+    fn sample(&self, process_id: u32) -> ProcIdentity {
+        ProcIdentity::sample(process_id)
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct UnixRootProvisionClient {
     socket_path: PathBuf,
@@ -95,20 +113,21 @@ impl UnixRootProvisionClient {
     }
 
     /// Execute only when the connected Unix peer is the process which the
-    /// caller revalidated immediately before this transport effect. The peer
-    /// check happens before the first request byte is written.
+    /// caller fully revalidated before opening this transport. The retained
+    /// connection binds the peer PID, then a socket-free identity sample binds
+    /// the same start time and executable before the first request byte.
     pub(crate) fn execute_with_context_for_peer(
         &self,
         request: &ProvisionRootImageRequest,
-        expected_peer_process_id: u32,
-        validate_current_process: &mut dyn FnMut() -> bool,
+        expected_peer_process: &ProcIdentity,
+        process_identity: &dyn RootProvisionProcessIdentityPort,
         context: &dyn RuntimePhysicalReadContext,
     ) -> Result<AuthorityRereadRequired, RootProvisionClientError> {
         self.execute_bounded(
             request,
             Some(context),
-            Some(expected_peer_process_id),
-            Some(validate_current_process),
+            Some(expected_peer_process),
+            Some(process_identity),
         )
     }
 
@@ -116,8 +135,8 @@ impl UnixRootProvisionClient {
         &self,
         request: &ProvisionRootImageRequest,
         context: Option<&dyn RuntimePhysicalReadContext>,
-        expected_peer_process_id: Option<u32>,
-        mut validate_current_process: Option<&mut dyn FnMut() -> bool>,
+        expected_peer_process: Option<&ProcIdentity>,
+        process_identity: Option<&dyn RootProvisionProcessIdentityPort>,
     ) -> Result<AuthorityRereadRequired, RootProvisionClientError> {
         let payload = encode_provision_root_image_request(request)?;
         let write_deadline = phase_deadline(self.write_timeout, context);
@@ -125,16 +144,18 @@ impl UnixRootProvisionClient {
             Ok(stream) => stream,
             Err(reason) => return Ok(unknown(reason)),
         };
-        if expected_peer_process_id.is_some_and(|expected| {
-            connected_peer_process_id(&stream).is_none_or(|actual| actual != expected)
-        }) {
-            return Ok(unknown(RootProvisionUnknownReason::MismatchedIdentity));
-        }
-        if validate_current_process
-            .as_mut()
-            .is_some_and(|validate| !validate())
-        {
-            return Ok(unknown(RootProvisionUnknownReason::MismatchedIdentity));
+        if let Some(expected) = expected_peer_process {
+            let Some(actual_process_id) = connected_peer_process_id(&stream) else {
+                return Ok(unknown(RootProvisionUnknownReason::MismatchedIdentity));
+            };
+            if actual_process_id != expected.pid
+                || process_identity
+                    .map(|identity| identity.sample(actual_process_id))
+                    .as_ref()
+                    != Some(expected)
+            {
+                return Ok(unknown(RootProvisionUnknownReason::MismatchedIdentity));
+            }
         }
         let mut frame = Vec::with_capacity(COMMAND_PREFIX.len() + payload.len() + 1);
         frame.extend_from_slice(COMMAND_PREFIX);
@@ -573,6 +594,16 @@ mod tests {
         Sha256Digest,
     };
 
+    #[derive(Clone)]
+    struct FixedProcessIdentity(ProcIdentity);
+
+    impl RootProvisionProcessIdentityPort for FixedProcessIdentity {
+        fn sample(&self, process_id: u32) -> ProcIdentity {
+            assert_eq!(process_id, self.0.pid);
+            self.0.clone()
+        }
+    }
+
     fn request() -> ProvisionRootImageRequest {
         ProvisionRootImageRequest {
             provision_transition_id: RandomId128::new("13579bdf2468ace013579bdf2468ace0").unwrap(),
@@ -862,12 +893,12 @@ mod tests {
         let client = server.client(Duration::from_secs(1));
         let worker_context = Arc::clone(&context);
         let worker = std::thread::spawn(move || {
-            let mut validate = || true;
+            let expected = ProcIdentity::sample(std::process::id());
             client
                 .execute_with_context_for_peer(
                     &request,
-                    std::process::id(),
-                    &mut validate,
+                    &expected,
+                    &PlatformRootProvisionProcessIdentityPort,
                     worker_context.as_ref(),
                 )
                 .unwrap()
@@ -901,10 +932,16 @@ mod tests {
             Instant::now() + Duration::from_secs(2),
         );
         let wrong_pid = std::process::id().checked_add(1).unwrap();
-        let mut validate = || true;
+        let mut expected = ProcIdentity::sample(std::process::id());
+        expected.pid = wrong_pid;
         let observed =
             UnixRootProvisionClient::new(&path, Duration::from_secs(1), Duration::from_secs(1))
-                .execute_with_context_for_peer(&request(), wrong_pid, &mut validate, &context)
+                .execute_with_context_for_peer(
+                    &request(),
+                    &expected,
+                    &PlatformRootProvisionProcessIdentityPort,
+                    &context,
+                )
                 .unwrap();
         assert_eq!(
             observed.hint(),
@@ -926,14 +963,75 @@ mod tests {
             crate::state_directory::StateDirectory::unanchored(state.path().to_path_buf()),
             Instant::now() + Duration::from_secs(2),
         );
+        let expected = ProcIdentity::sample(std::process::id());
         let observed = server
             .client(Duration::from_secs(1))
-            .execute_with_context_for_peer(&request, std::process::id(), &mut || true, &context)
+            .execute_with_context_for_peer(
+                &request,
+                &expected,
+                &PlatformRootProvisionProcessIdentityPort,
+                &context,
+            )
             .unwrap();
         server.wait_for_request();
         assert_eq!(
             observed.hint(),
             &RootProvisionResponseHint::Ok(result(&request))
         );
+    }
+
+    #[test]
+    fn connected_peer_start_or_executable_drift_receives_zero_request_bytes() {
+        let expected = ProcIdentity {
+            pid: std::process::id(),
+            start_ticks: Some(42),
+            exe: Some(PathBuf::from("/usr/bin/cats-blockd")),
+        };
+        let drifted = [
+            ProcIdentity {
+                start_ticks: Some(43),
+                ..expected.clone()
+            },
+            ProcIdentity {
+                exe: Some(PathBuf::from("/usr/bin/not-cats-blockd")),
+                ..expected.clone()
+            },
+        ];
+
+        for actual in drifted {
+            let directory = tempfile::tempdir().unwrap();
+            let path = directory.path().join("identity-drift.sock");
+            let listener = UnixListener::bind(&path).unwrap();
+            let (sent, received) = mpsc::channel();
+            let server = std::thread::spawn(move || {
+                let (mut stream, _) = listener.accept().unwrap();
+                let mut bytes = Vec::new();
+                stream.read_to_end(&mut bytes).unwrap();
+                sent.send(bytes).unwrap();
+            });
+            let state = tempfile::tempdir().unwrap();
+            let context = RuntimeDesiredEffectContext::for_test(
+                crate::state_directory::StateDirectory::unanchored(state.path().to_path_buf()),
+                Instant::now() + Duration::from_secs(2),
+            );
+            let observed =
+                UnixRootProvisionClient::new(&path, Duration::from_secs(1), Duration::from_secs(1))
+                    .execute_with_context_for_peer(
+                        &request(),
+                        &expected,
+                        &FixedProcessIdentity(actual),
+                        &context,
+                    )
+                    .unwrap();
+            assert_eq!(
+                observed.hint(),
+                &RootProvisionResponseHint::Unknown(RootProvisionUnknownReason::MismatchedIdentity)
+            );
+            assert_eq!(
+                received.recv_timeout(Duration::from_secs(2)).unwrap(),
+                Vec::<u8>::new()
+            );
+            server.join().unwrap();
+        }
     }
 }

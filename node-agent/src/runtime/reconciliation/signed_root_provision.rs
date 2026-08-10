@@ -23,6 +23,7 @@ use cats_blockd::target_control::provision_root_image_request;
 use cats_storage::authority::{AttachmentLineageIdentity, VolumeDataAuthority, VolumeRecord};
 use cats_storage::BlobStore;
 
+use crate::proc::ProcIdentity;
 use crate::runtime_spine::{
     RuntimeDesiredEffect, RuntimeDesiredEffectContext, RuntimeDesiredEffectOutcome,
     RuntimeDesiredEffectStopReason,
@@ -36,7 +37,8 @@ use super::signed_running::{
 use super::SignedRunningAcquireEffect;
 use super::{
     ensure_root_provision_process_from_persisted_checkpoint, AuthorizedBlockdStore,
-    FileCheckpointStore, PlatformSystemdRootProvisionProcessPort, RootProvisionProcessConflict,
+    FileCheckpointStore, PlatformRootProvisionProcessIdentityPort,
+    PlatformSystemdRootProvisionProcessPort, RootProvisionProcessConflict,
     RootProvisionProcessInspection, RootProvisionProcessOutcome, RootProvisionProcessPort,
     RootProvisionResponseHint, RootProvisionSystemdConfig, UnixRootProvisionClient,
 };
@@ -49,8 +51,7 @@ trait RootProvisionRequestPort: request_sealed::Sealed + Send + Sync {
     fn execute(
         &self,
         socket_path: &HostPath,
-        expected_peer_process_id: u32,
-        validate_current_process: &mut dyn FnMut() -> bool,
+        expected_peer_process: &ProcIdentity,
         request: &cats_api::runtime_reconciliation::ProvisionRootImageRequest,
         context: &RuntimeDesiredEffectContext,
     ) -> anyhow::Result<RootProvisionResponseHint>;
@@ -65,8 +66,7 @@ impl RootProvisionRequestPort for PlatformRootProvisionRequestPort {
     fn execute(
         &self,
         socket_path: &HostPath,
-        expected_peer_process_id: u32,
-        validate_current_process: &mut dyn FnMut() -> bool,
+        expected_peer_process: &ProcIdentity,
         request: &cats_api::runtime_reconciliation::ProvisionRootImageRequest,
         context: &RuntimeDesiredEffectContext,
     ) -> anyhow::Result<RootProvisionResponseHint> {
@@ -80,8 +80,8 @@ impl RootProvisionRequestPort for PlatformRootProvisionRequestPort {
         let reread = client
             .execute_with_context_for_peer(
                 request,
-                expected_peer_process_id,
-                validate_current_process,
+                expected_peer_process,
+                &PlatformRootProvisionProcessIdentityPort,
                 context,
             )
             .context("send exact root provision request")?;
@@ -325,60 +325,50 @@ impl SignedRootProvisionEffect {
         let request = provision_root_image_request(stored.checkpoint())
             .context("project exact root provision request")?;
         context.check_active()?;
-        let [accepted_process] = runtime.processes.as_slice() else {
+        let [_accepted_process] = runtime.processes.as_slice() else {
             return Ok(Some(stop_local()));
         };
-        let mut reinspection = None;
-        let hint = {
-            let mut validate_current_process = || {
-                let result = inspect_exact_root_provision_process(
-                    self.process.as_ref(),
-                    &expectation,
-                    context,
-                );
-                let exact = matches!(
-                    &result,
-                    Ok(RootProvisionProcessInspection::Exact(evidence))
-                        if accepted_process_matches_reinspection(runtime, evidence)
-                );
-                reinspection = Some(result);
-                exact
-            };
-            self.request.execute(
-                &expectation.control_socket_path,
-                accepted_process.process_id,
-                &mut validate_current_process,
-                &request,
-                context,
-            )?
-        };
-        let Some(reinspection) = reinspection else {
-            // Connect/timeout failures happen before a peer can be retained
-            // and are retried from a fresh full scan. A connected peer with
-            // the wrong PID is a local identity conflict; neither case sends
-            // a request byte or invokes the process revalidation callback.
-            return Ok(Some(
-                if matches!(
-                    hint,
-                    RootProvisionResponseHint::Unknown(
-                        super::RootProvisionUnknownReason::MismatchedIdentity
-                    )
-                ) {
-                    stop_local()
-                } else {
-                    RuntimeDesiredEffectOutcome::RefreshInventory
-                },
-            ));
-        };
-        match reinspection.context("reinspect exact root-provision process before request")? {
+        // Complete status/socket/systemd reinspection happens before the
+        // provision connection is opened. The production control listener is
+        // serial, so retaining the request stream while opening a second
+        // status stream would deadlock both sides.
+        let exact_process = match inspect_exact_root_provision_process(
+            self.process.as_ref(),
+            &expectation,
+            context,
+        )
+        .context("reinspect exact root-provision process before request connect")?
+        {
             RootProvisionProcessInspection::Exact(evidence)
-                if accepted_process_matches_reinspection(runtime, &evidence) => {}
+                if accepted_process_matches_reinspection(runtime, &evidence) =>
+            {
+                evidence
+            }
             RootProvisionProcessInspection::Exact(_)
             | RootProvisionProcessInspection::Conflict(_) => return Ok(Some(stop_local())),
             RootProvisionProcessInspection::Absent
             | RootProvisionProcessInspection::Unavailable => {
                 return Ok(Some(RuntimeDesiredEffectOutcome::RefreshInventory))
             }
+        };
+        let expected_peer_process = ProcIdentity {
+            pid: exact_process.process_id,
+            start_ticks: Some(exact_process.process_start_time_ticks.get()),
+            exe: Some(Path::new(exact_process.executable_path.as_str()).to_path_buf()),
+        };
+        let hint = self.request.execute(
+            &expectation.control_socket_path,
+            &expected_peer_process,
+            &request,
+            context,
+        )?;
+        if matches!(
+            hint,
+            RootProvisionResponseHint::Unknown(
+                super::RootProvisionUnknownReason::MismatchedIdentity
+            )
+        ) {
+            return Ok(Some(stop_local()));
         }
         context.check_active()?;
         let current = match self.authority.load_volume(&volume.volume_id) {
@@ -586,18 +576,23 @@ fn stop_local() -> RuntimeDesiredEffectOutcome {
 
 #[cfg(test)]
 mod tests {
+    use std::io::{BufRead as _, BufReader, Read as _, Write as _};
+    use std::os::unix::net::{UnixListener, UnixStream};
+    use std::path::PathBuf;
     use std::sync::atomic::{AtomicUsize, Ordering};
-    use std::sync::Mutex;
+    use std::sync::{mpsc, Mutex};
     use std::time::Duration;
 
     use cats_api::runtime_reconciliation::{
-        checkpoint_content_digest, inventory_digest, spec_digest, AcquireOrigin,
+        checkpoint_content_digest, encode_provision_root_image_request,
+        encode_provision_root_image_result, inventory_digest, spec_digest, AcquireOrigin,
         AdmissionInventoryAttestation, AgentSession, AssignedKind, AssignedPlacement, Durability,
         Epoch, FenceEpoch, GuestDeviceIdentity, Id, Ipv4Address, IsolatedIpv4Kind,
         LocalVolumeLineage, MacAddress, NetworkConfig, NodeBootId, NodeObservation,
         NormalAcquireRequest, NormalAcquireResult, ObservedRuntimeStatus, ObservedVolume,
-        ProcessEvidence, RandomId128, RemoteHead, Revision, RuntimeCheckpoint, RuntimeConfig,
-        RuntimeVolumeTransitionRequest, Sequence, Sha256Digest, UnixMillis, VolumeRecord, WireU64,
+        ProcessEvidence, ProvisionRootImageResult, RandomId128, RemoteHead, Revision,
+        RuntimeCheckpoint, RuntimeConfig, RuntimeVolumeTransitionRequest, Sequence, Sha256Digest,
+        UnixMillis, VolumeRecord, WireU64,
     };
     use cats_storage::authority::{
         AuthorityError, AuthorizedServingAttachment, LastVolumeTransition, RenewLeaseRequest,
@@ -611,6 +606,7 @@ mod tests {
     use crate::state_directory::StateDirectory;
 
     use super::super::authorized_blockd::authorized_blockd_data_directory;
+    use super::super::root_provision::RootProvisionProcessIdentityPort;
     use super::super::root_provision_process::{
         CheckpointedRootProvisionProcess, RootProvisionBlockdHandshake,
         RootProvisionProcessEvidence, RootProvisionProcessInspection, RootProvisionProcessStart,
@@ -889,6 +885,7 @@ mod tests {
         conflict: bool,
         mutate_owner: bool,
         connect_failure: bool,
+        identity_mismatch: bool,
     }
 
     #[derive(Default)]
@@ -927,19 +924,25 @@ mod tests {
         fn execute(
             &self,
             _socket_path: &HostPath,
-            expected_peer_process_id: u32,
-            validate_current_process: &mut dyn FnMut() -> bool,
+            expected_peer_process: &ProcIdentity,
             request: &cats_api::runtime_reconciliation::ProvisionRootImageRequest,
             context: &RuntimeDesiredEffectContext,
         ) -> anyhow::Result<RootProvisionResponseHint> {
             context.check_active()?;
-            assert_eq!(expected_peer_process_id, 41);
+            assert_eq!(
+                expected_peer_process,
+                &ProcIdentity {
+                    pid: 41,
+                    start_ticks: Some(42),
+                    exe: Some(Path::new("/usr/bin/cats-blockd").to_path_buf()),
+                }
+            );
             if self.connect_failure {
                 return Ok(RootProvisionResponseHint::Unknown(
                     super::super::RootProvisionUnknownReason::Connect,
                 ));
             }
-            if !validate_current_process() {
+            if self.identity_mismatch {
                 return Ok(RootProvisionResponseHint::Unknown(
                     super::super::RootProvisionUnknownReason::MismatchedIdentity,
                 ));
@@ -964,6 +967,108 @@ mod tests {
             Ok(RootProvisionResponseHint::Unknown(
                 super::super::RootProvisionUnknownReason::Eof,
             ))
+        }
+    }
+
+    struct SerialStatusProcessPort {
+        inspections: AtomicUsize,
+        process_id: u32,
+        start_time_ticks: u64,
+        socket_path: PathBuf,
+    }
+
+    impl super::super::root_provision_process::sealed::Sealed for SerialStatusProcessPort {}
+
+    impl RootProvisionProcessPort for SerialStatusProcessPort {
+        fn inspect(
+            &self,
+            expected: &super::super::RootProvisionProcessExpectation,
+            context: &dyn crate::runtime_spine::RuntimePhysicalReadContext,
+        ) -> anyhow::Result<RootProvisionProcessInspection> {
+            context.check_active()?;
+            self.inspections.fetch_add(1, Ordering::SeqCst);
+            let mut stream = UnixStream::connect(&self.socket_path)?;
+            stream.set_read_timeout(Some(Duration::from_secs(2)))?;
+            stream.set_write_timeout(Some(Duration::from_secs(2)))?;
+            stream.write_all(b"status\n")?;
+            let mut response = [0_u8; 10];
+            stream.read_exact(&mut response)?;
+            anyhow::ensure!(
+                &response == b"status-ok\n",
+                "serial status calibration failed"
+            );
+
+            let mut evidence = exact_process(expected);
+            evidence.process_id = self.process_id;
+            evidence.unit_main_process_id = self.process_id;
+            evidence.process_start_time_ticks = WireU64::new(self.start_time_ticks).unwrap();
+            evidence.cgroup_process_ids = vec![self.process_id];
+            evidence.handshake.peer_process_id = self.process_id;
+            Ok(RootProvisionProcessInspection::Exact(Box::new(evidence)))
+        }
+
+        fn start_checkpointed(
+            &self,
+            _checkpointed: CheckpointedRootProvisionProcess<'_>,
+            _context: &RuntimeDesiredEffectContext,
+        ) -> anyhow::Result<RootProvisionProcessStart> {
+            unreachable!("serial-listener regression starts with an accepted live process")
+        }
+    }
+
+    #[derive(Clone)]
+    struct FixedProcessIdentity(ProcIdentity);
+
+    impl RootProvisionProcessIdentityPort for FixedProcessIdentity {
+        fn sample(&self, process_id: u32) -> ProcIdentity {
+            assert_eq!(process_id, self.0.pid);
+            self.0.clone()
+        }
+    }
+
+    struct SerialRequestPort {
+        process_identity: FixedProcessIdentity,
+        socket_path: PathBuf,
+    }
+
+    impl request_sealed::Sealed for SerialRequestPort {}
+
+    impl RootProvisionRequestPort for SerialRequestPort {
+        fn execute(
+            &self,
+            _socket_path: &HostPath,
+            expected_peer_process: &ProcIdentity,
+            request: &cats_api::runtime_reconciliation::ProvisionRootImageRequest,
+            context: &RuntimeDesiredEffectContext,
+        ) -> anyhow::Result<RootProvisionResponseHint> {
+            let remaining = context.deadline().saturating_duration_since(Instant::now());
+            Ok(
+                UnixRootProvisionClient::new(&self.socket_path, remaining, remaining)
+                    .execute_with_context_for_peer(
+                        request,
+                        expected_peer_process,
+                        &self.process_identity,
+                        context,
+                    )?
+                    .hint()
+                    .clone(),
+            )
+        }
+    }
+
+    fn accept_before(listener: &UnixListener, deadline: Instant) -> UnixStream {
+        loop {
+            match listener.accept() {
+                Ok((stream, _)) => return stream,
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                    assert!(
+                        Instant::now() < deadline,
+                        "serial listener accept timed out"
+                    );
+                    std::thread::sleep(Duration::from_millis(5));
+                }
+                Err(error) => panic!("serial listener accept failed: {error}"),
+            }
         }
     }
 
@@ -1380,6 +1485,7 @@ mod tests {
             conflict: false,
             mutate_owner: false,
             connect_failure: false,
+            identity_mismatch: false,
         });
         let effect = fixture.effect(Arc::clone(&process), Arc::clone(&request));
         let outcome = effect
@@ -1401,6 +1507,7 @@ mod tests {
             conflict: false,
             mutate_owner: false,
             connect_failure: false,
+            identity_mismatch: false,
         });
         let effect = fixture.effect(Arc::clone(&process), Arc::clone(&request));
         let outcome = effect
@@ -1427,6 +1534,117 @@ mod tests {
     }
 
     #[test]
+    fn serial_control_listener_completes_status_before_receiving_provision_request() {
+        let fixture = Fixture::new();
+        let ReconcileStep::ProvisionRootImage {
+            expected_provisioned_head,
+            ..
+        } = &fixture.checkpoint.step
+        else {
+            unreachable!()
+        };
+        let socket_root = tempfile::Builder::new()
+            .prefix("cats-rp-")
+            .tempdir_in("/tmp")
+            .unwrap();
+        let socket_path = socket_root.path().join("control.sock");
+        let listener = UnixListener::bind(&socket_path).unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let expected_request = provision_root_image_request(&fixture.checkpoint).unwrap();
+        let mut expected_request_frame = b"provision_root_image ".to_vec();
+        expected_request_frame
+            .extend(encode_provision_root_image_request(&expected_request).unwrap());
+        expected_request_frame.push(b'\n');
+        let result = ProvisionRootImageResult {
+            provision_transition_id: expected_request.provision_transition_id.clone(),
+            volume_id: expected_request.volume_id.clone(),
+            attachment_id: expected_request.attachment_id.clone(),
+            attachment_epoch: expected_request.attachment_epoch,
+            resulting_head: expected_request.expected_provisioned_head.clone(),
+        };
+        let mut response = b"OK ".to_vec();
+        response.extend(encode_provision_root_image_result(&result).unwrap());
+        response.push(b'\n');
+        let authority = Arc::clone(&fixture.authority);
+        let target = expected_provisioned_head.clone();
+        let (events_tx, events_rx) = mpsc::channel();
+        let server = std::thread::spawn(move || {
+            let deadline = Instant::now() + Duration::from_secs(3);
+            let mut status = accept_before(&listener, deadline);
+            status
+                .set_read_timeout(Some(Duration::from_secs(1)))
+                .unwrap();
+            let mut status_line = Vec::new();
+            BufReader::new(&mut status)
+                .read_until(b'\n', &mut status_line)
+                .unwrap();
+            events_tx.send(status_line).unwrap();
+            status.write_all(b"status-ok\n").unwrap();
+            drop(status);
+
+            let mut provision = accept_before(&listener, deadline);
+            provision
+                .set_read_timeout(Some(Duration::from_secs(1)))
+                .unwrap();
+            let mut provision_line = Vec::new();
+            BufReader::new(&mut provision)
+                .read_until(b'\n', &mut provision_line)
+                .unwrap();
+            events_tx.send(provision_line).unwrap();
+            authority.set_head(target);
+            provision.write_all(&response).unwrap();
+        });
+
+        let process_id = std::process::id();
+        let start_time_ticks = 42;
+        let expected_identity = ProcIdentity {
+            pid: process_id,
+            start_ticks: Some(start_time_ticks),
+            exe: Some(Path::new("/usr/bin/cats-blockd").to_path_buf()),
+        };
+        let process = Arc::new(SerialStatusProcessPort {
+            inspections: AtomicUsize::new(0),
+            process_id,
+            start_time_ticks,
+            socket_path: socket_path.clone(),
+        });
+        let request = Arc::new(SerialRequestPort {
+            process_identity: FixedProcessIdentity(expected_identity),
+            socket_path,
+        });
+        let effect = SignedRootProvisionEffect::for_test(
+            Arc::clone(&fixture.authority) as Arc<dyn VolumeDataAuthority>,
+            Arc::clone(&fixture.blob) as Arc<dyn BlobStore>,
+            Arc::clone(&process) as Arc<dyn RootProvisionProcessPort>,
+            request,
+            HostPath::new("/usr/bin/cats-blockd".to_owned()).unwrap(),
+        );
+        let mut accepted_process = fixture.public_process();
+        accepted_process.process_id = process_id;
+        accepted_process.process_start_time_ticks = WireU64::new(start_time_ticks).unwrap();
+        assert_eq!(
+            effect
+                .try_apply(&fixture.context(vec![accepted_process]), &fixture.desired)
+                .unwrap(),
+            Some(RuntimeDesiredEffectOutcome::RefreshInventory)
+        );
+
+        assert_eq!(
+            events_rx.recv_timeout(Duration::from_secs(2)).unwrap(),
+            b"status\n",
+            "positive calibration: the full status reinspection reached the serial listener"
+        );
+        assert_eq!(
+            events_rx.recv_timeout(Duration::from_secs(2)).unwrap(),
+            expected_request_frame,
+            "the provision request must reach the same one-at-a-time listener after status closes"
+        );
+        server.join().unwrap();
+        assert_eq!(process.inspections.load(Ordering::SeqCst), 1);
+        assert_eq!(fixture.authority.record().head, result.resulting_head);
+    }
+
+    #[test]
     fn exact_closed_conflict_with_blank_authority_stops_without_retry() {
         let fixture = Fixture::new();
         let process = Arc::new(FakeProcessPort::exact(41, 42));
@@ -1436,6 +1654,7 @@ mod tests {
             conflict: true,
             mutate_owner: false,
             connect_failure: false,
+            identity_mismatch: false,
         });
         let effect = fixture.effect(process, Arc::clone(&request));
         let outcome = effect
@@ -1459,6 +1678,7 @@ mod tests {
             conflict: false,
             mutate_owner: false,
             connect_failure: false,
+            identity_mismatch: false,
         });
         let effect = fixture.effect(Arc::clone(&process), Arc::clone(&request));
         let context = fixture.context_with_lineage_path(
@@ -1484,6 +1704,7 @@ mod tests {
             conflict: false,
             mutate_owner: true,
             connect_failure: false,
+            identity_mismatch: false,
         });
         let effect = fixture.effect(process, Arc::clone(&request));
         assert_eq!(
@@ -1508,6 +1729,7 @@ mod tests {
             conflict: false,
             mutate_owner: false,
             connect_failure: false,
+            identity_mismatch: false,
         });
         let effect = fixture.effect(Arc::clone(&process), Arc::clone(&request));
         assert_eq!(
@@ -1529,7 +1751,34 @@ mod tests {
     }
 
     #[test]
-    fn unavailable_connection_refreshes_before_process_reinspection_or_request() {
+    fn connected_process_identity_drift_stops_without_request_bytes() {
+        let fixture = Fixture::new();
+        let process = Arc::new(FakeProcessPort::exact(41, 42));
+        let request = Arc::new(FakeRequestPort {
+            authority: Arc::clone(&fixture.authority),
+            calls: AtomicUsize::new(0),
+            conflict: false,
+            mutate_owner: false,
+            connect_failure: false,
+            identity_mismatch: true,
+        });
+        let effect = fixture.effect(Arc::clone(&process), Arc::clone(&request));
+        assert_eq!(
+            effect
+                .try_apply(
+                    &fixture.context(vec![fixture.public_process()]),
+                    &fixture.desired,
+                )
+                .unwrap(),
+            Some(stop_local())
+        );
+        assert_eq!(process.inspections.load(Ordering::SeqCst), 1);
+        assert_eq!(request.calls.load(Ordering::SeqCst), 0);
+        assert_eq!(fixture.authority.record().head, fixture.attachment.head);
+    }
+
+    #[test]
+    fn unavailable_connection_refreshes_after_full_process_reinspection() {
         let fixture = Fixture::new();
         let process = Arc::new(FakeProcessPort::exact(41, 42));
         let request = Arc::new(FakeRequestPort {
@@ -1538,6 +1787,7 @@ mod tests {
             conflict: false,
             mutate_owner: false,
             connect_failure: true,
+            identity_mismatch: false,
         });
         let effect = fixture.effect(Arc::clone(&process), Arc::clone(&request));
         assert_eq!(
@@ -1549,7 +1799,7 @@ mod tests {
                 .unwrap(),
             Some(RuntimeDesiredEffectOutcome::RefreshInventory)
         );
-        assert_eq!(process.inspections.load(Ordering::SeqCst), 0);
+        assert_eq!(process.inspections.load(Ordering::SeqCst), 1);
         assert_eq!(request.calls.load(Ordering::SeqCst), 0);
         assert_eq!(fixture.authority.record().head, fixture.attachment.head);
     }
@@ -1568,6 +1818,7 @@ mod tests {
             conflict: false,
             mutate_owner: false,
             connect_failure: false,
+            identity_mismatch: false,
         });
         let effect = fixture.effect(Arc::clone(&process), Arc::clone(&request));
         assert_eq!(
@@ -1595,6 +1846,7 @@ mod tests {
             conflict: false,
             mutate_owner: false,
             connect_failure: false,
+            identity_mismatch: false,
         });
         let mutations = Arc::new(NoSignedMutationPort::default());
         let dispatcher = fixture.dispatcher(
@@ -1653,6 +1905,7 @@ mod tests {
             conflict: false,
             mutate_owner: false,
             connect_failure: false,
+            identity_mismatch: false,
         });
         let mutations = Arc::new(NoSignedMutationPort::default());
         let dispatcher = fixture.dispatcher(

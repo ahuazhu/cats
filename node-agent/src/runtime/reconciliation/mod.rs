@@ -89,6 +89,7 @@ pub use normal_acquire::{
     RuntimeVolumeTransitionHttpClient, SignedVolumeTransitionResponse,
     VolumeTransitionTransportFailure,
 };
+pub(crate) use root_provision::PlatformRootProvisionProcessIdentityPort;
 pub use root_provision::{
     AuthorityRereadRequired, RootProvisionClientError, RootProvisionControlPort,
     RootProvisionResponseHint, RootProvisionUnknownReason, UnixRootProvisionClient,
