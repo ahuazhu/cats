@@ -245,11 +245,21 @@ impl RouteGrantV2SigningInput {
         self,
         signature: &[u8; ED25519_SIGNATURE_BYTES],
     ) -> Result<String, RouteGrantV2Error> {
-        let token = format!(
-            "{}.{}",
-            self.compact_prefix,
-            URL_SAFE_NO_PAD.encode(signature)
-        );
+        self.finish_encoded_signature(&URL_SAFE_NO_PAD.encode(signature))
+    }
+
+    /// Finishes a compact token from a cryptographic provider's canonical
+    /// base64url-no-pad Ed25519 signature output.
+    pub fn finish_encoded_signature(
+        self,
+        encoded_signature: &str,
+    ) -> Result<String, RouteGrantV2Error> {
+        if encoded_signature.len() != ED25519_SIGNATURE_SEGMENT_BYTES
+            || decode_canonical_segment(encoded_signature)?.len() != ED25519_SIGNATURE_BYTES
+        {
+            return Err(RouteGrantV2Error::InvalidCompact);
+        }
+        let token = format!("{}.{}", self.compact_prefix, encoded_signature);
         if token.len() > MAX_ROUTE_GRANT_V2_COMPACT_BYTES {
             return Err(RouteGrantV2Error::InvalidCompact);
         }

@@ -9,20 +9,26 @@ use cats_api::error::ErrorCode;
 use cats_api::runtime_reconciliation::{
     decode_operation, encode_admission_inventory_attestation, encode_agent_session,
     encode_desired_read_snapshot, encode_node_observation, guest_config_digest, inventory_digest,
-    spec_digest, AgentRegistrationAttempt, AgentSession, AppliedDesiredEvidence, AsciiText,
-    AssignedKind, AssignedPlacement, BlockedReason, CheckpointEvidence, Condition,
-    ContractErrorDetail, ContractVersion, CredentialBinding, DesiredRuntimeSpec, Epoch,
-    GuestRuntimeProfileReceipt, GuestTransportEvidence, Id, InventorySource, Ipv4Address,
-    IsolatedIpv4Kind, LifecycleAdmission, MacAddress, NetworkConfig, NodeBootId, NodeIdentity,
-    NodeIdentityState, NodeObservation, ObservationInventoryAcceptance, ObservedRuntimeStatus,
-    Operation, OperationFailure, OperationPhase, OperationTerminal, PlacementRejectionReason,
-    PreconditionFailureReason, QuarantineReason, RandomId128, ReadyReason, ReconcileStep, Revision,
-    RuntimeConfig, RuntimeTarget, RuntimeTransition, Sequence, SessionBinding, Sha256Digest,
-    StableState, UnixMillis, WarmSnapshotEvidence,
+    key_ring_digest, spec_digest, AgentRegistrationAttempt, AgentSession, AppliedDesiredEvidence,
+    AsciiText, AssignedKind, AssignedPlacement, BlockedReason, CheckpointEvidence, Condition,
+    ContractErrorDetail, ContractVersion, ControlHandshakeEvidence, CredentialBinding,
+    DesiredRuntimeSpec, EndpointIntent, Epoch, GuestBootId, GuestRuntimeProfileReceipt,
+    GuestTransportEvidence, HostPath, Hostname, HttpProtocol, Id, InventorySource, Ipv4Address,
+    IsolatedIpv4Kind, KeyId, LifecycleAdmission, MacAddress, NetworkConfig, NodeBootId,
+    NodeIdentity, NodeIdentityState, NodeObservation, ObservationInventoryAcceptance,
+    ObservedNetwork, ObservedRouteGate, ObservedRuntimeStatus, ObservedVmShape, Operation,
+    OperationFailure, OperationPhase, OperationTerminal, OwnershipTokenEvidence,
+    PlacementRejectionReason, PreconditionFailureReason, ProcessEvidence, ProcessRole,
+    ProcessState, QuarantineReason, RandomId128, ReadyReason, ReconcileStep, Revision,
+    RouteGateBinding, RouteGateState, RuntimeConfig, RuntimeTarget, RuntimeTransition, Sequence,
+    SessionBinding, Sha256Digest, StableState, UnixMillis, WarmSnapshotEvidence, WireU64,
 };
 
-use super::product::CatRecord;
-use super::product_rows::{insert_cat, insert_desired, insert_operation};
+use super::product::{CatRecord, EndpointRecord, HostnameDesiredLookup};
+use super::product_rows::{
+    insert_cat, insert_desired, insert_endpoint, insert_hostname_lookup, insert_operation,
+};
+use super::route_signer::{RouteGrantV2AuthorityLoad, RouteGrantV2AuthorityRejection};
 use super::rows::database_now;
 use super::runtime_spine::{
     lock_placement_admission_for_desired_mutation, PlacementAdmissionLoad,
@@ -2799,4 +2805,223 @@ async fn cancelled_active_submission_is_recovered_by_exact_response_loss_replay(
         })
         .unwrap();
     assert_eq!(after_replay, (1, 1, committed_deadline));
+}
+
+fn route_ready_runtime(desired: &DesiredRuntimeSpec) -> ObservedRuntimeStatus {
+    let endpoint = desired.endpoints.first().unwrap();
+    let incarnation = random(0x5151);
+    let step = ReconcileStep::Stable {
+        state: StableState::Running,
+    };
+    ObservedRuntimeStatus {
+        cat_id: desired.cat_id.clone(),
+        applied_desired: Some(AppliedDesiredEvidence {
+            desired_revision: desired.desired_revision,
+            spec_digest: desired.spec_digest.clone(),
+            placement: desired.placement.clone(),
+            target: RuntimeTarget::Running,
+        }),
+        runtime_incarnation: Some(incarnation.clone()),
+        stable_state: Some(StableState::Running),
+        step: step.clone(),
+        checkpoint: CheckpointEvidence::Valid {
+            checkpoint_path: HostPath::new("/var/lib/cats/checkpoints/cat_route.json").unwrap(),
+            content_digest: digest(0x51),
+            version: ContractVersion::V1,
+            cat_id: desired.cat_id.clone(),
+            node_id: desired.placement.node_id.clone(),
+            desired_revision: desired.desired_revision,
+            spec_digest: desired.spec_digest.clone(),
+            placement_epoch: desired.placement.placement_epoch,
+            runtime_incarnation: Some(incarnation.clone()),
+            stable_state: Some(StableState::Running),
+            step: Box::new(step),
+            require_idle: Box::new(
+                cats_api::runtime_reconciliation::RequireIdleCheckpoint::NotApplicable,
+            ),
+            updated_at_unix_ms: UnixMillis::new(1).unwrap(),
+        },
+        processes: vec![ProcessEvidence {
+            role: ProcessRole::Vmm {
+                runtime_incarnation: incarnation.clone(),
+            },
+            process_id: 101,
+            process_start_time_ticks: WireU64::new(1).unwrap(),
+            executable_path: HostPath::new("/usr/bin/cloud-hypervisor").unwrap(),
+            scope_id: id("cats-route.service"),
+            control_socket_path: HostPath::new("/run/cats/route/vmm.sock").unwrap(),
+            state: ProcessState::Running,
+            ownership_token: OwnershipTokenEvidence::Valid {
+                ownership_token: random(0x5152),
+            },
+            control_handshake: ControlHandshakeEvidence::Verified,
+            observed_vm_shape: Some(ObservedVmShape {
+                vcpus: desired.runtime.vcpus,
+                memory_bytes: desired.runtime.memory_bytes,
+                boot_image_digest: desired.runtime.boot_image_digest.clone(),
+                guest_config_digest: desired.runtime.guest_config_digest.clone(),
+            }),
+        }],
+        volumes: Vec::new(),
+        mounts: Vec::new(),
+        networks: vec![ObservedNetwork {
+            kind: desired.runtime.network_config.kind,
+            network_id: desired.runtime.network_config.network_id.clone(),
+            guest_mac: desired.runtime.network_config.guest_mac.clone(),
+            guest_ipv4: desired.runtime.network_config.guest_ipv4.clone(),
+            prefix_length: desired.runtime.network_config.prefix_length,
+            gateway_ipv4: desired.runtime.network_config.gateway_ipv4.clone(),
+            tap_name: id("tap-route"),
+            ownership_token: OwnershipTokenEvidence::Valid {
+                ownership_token: random(0x5153),
+            },
+        }],
+        guest_transport: GuestTransportEvidence::VsockReady {
+            runtime_incarnation: incarnation.clone(),
+            guest_cid: 3,
+            guest_port: 5000,
+            guest_agent_protocol_version: ContractVersion::V1,
+            guest_boot_id: GuestBootId::new("51515151515151515151515151515151").unwrap(),
+        },
+        warm_snapshot: WarmSnapshotEvidence::Absent,
+        lifecycle_admission: LifecycleAdmission::Open,
+        routes: vec![ObservedRouteGate {
+            binding: RouteGateBinding {
+                workspace_id: desired.workspace_id.clone(),
+                endpoint_id: endpoint.endpoint_id.clone(),
+                hostname: endpoint.hostname.clone(),
+                cat_id: desired.cat_id.clone(),
+                node_id: desired.placement.node_id.clone(),
+                runtime_incarnation: incarnation,
+                route_epoch: endpoint.route_epoch,
+                protocol: endpoint.protocol,
+                target_port: endpoint.target_port,
+            },
+            gate: RouteGateState::Active,
+            active_guards: 0,
+            cancellation_pending: false,
+            instance_count: 1,
+        }],
+        platform_guards: 0,
+        conditions: vec![Condition::Ready {
+            reason: ReadyReason::PostconditionSatisfied {
+                target: RuntimeTarget::Running,
+            },
+        }],
+    }
+}
+
+#[test]
+fn route_signer_snapshot_closes_hostname_runtime_and_ring_in_one_authority_read() {
+    let (store, identity, authenticated, policy, session) = fixture();
+    let workspace = bootstrap_workspace(&store, "route-v2-snapshot");
+    let endpoint_id = id("ep_route");
+    let hostname = Hostname::new("route.cats.run").unwrap();
+    let mut desired = current_desired(&workspace, &identity.node_id);
+    desired.runtime.guest_config_digest = policy.approved_guest_config_digest().clone();
+    desired.endpoints = vec![EndpointIntent {
+        endpoint_id: endpoint_id.clone(),
+        hostname: hostname.clone(),
+        route_epoch: Epoch::new(7).unwrap(),
+        protocol: HttpProtocol::Http,
+        target_port: 8080,
+    }];
+    desired.spec_digest = spec_digest(&desired).unwrap();
+    store
+        .authority_transaction(|transaction| {
+            let now = database_now(transaction)?;
+            insert_cat(
+                transaction,
+                &CatRecord {
+                    cat_id: desired.cat_id.clone(),
+                    workspace_id: workspace.clone(),
+                    name: id("route-cat"),
+                    created_at: now,
+                },
+            )?;
+            insert_endpoint(
+                transaction,
+                &EndpointRecord {
+                    endpoint_id: endpoint_id.clone(),
+                    workspace_id: workspace.clone(),
+                    cat_id: desired.cat_id.clone(),
+                    name: id("web"),
+                    created_at: now,
+                },
+            )?;
+            insert_desired(transaction, &desired)?;
+            insert_hostname_lookup(
+                transaction,
+                &HostnameDesiredLookup {
+                    hostname: hostname.clone(),
+                    workspace_id: workspace.clone(),
+                    cat_id: desired.cat_id.clone(),
+                    endpoint_id: endpoint_id.clone(),
+                    desired_revision: desired.desired_revision,
+                },
+            )
+        })
+        .unwrap();
+
+    let request = cats_api::runtime_reconciliation::DesiredReadRequest {
+        version: ContractVersion::V1,
+        session: binding(&session),
+        request_sequence: Sequence::new(1).unwrap(),
+    };
+    let desired_snapshot = accepted(
+        store
+            .runtime_desired_read(&authenticated, &request)
+            .unwrap(),
+    );
+    let active_kid = KeyId::new("a".repeat(64)).unwrap();
+    let ring_version = Epoch::new(3).unwrap();
+    let mut full = observation(
+        &store,
+        &session,
+        1,
+        1,
+        true,
+        Some(desired_snapshot.read_position),
+        vec![route_ready_runtime(&desired)],
+    );
+    full.key_ring_version = Some(ring_version);
+    full.loaded_kids = vec![active_kid.clone()];
+    full.key_ring_digest = Some(key_ring_digest(ring_version, &full.loaded_kids).unwrap());
+    full.inventory_digest = Some(inventory_digest(&full).unwrap());
+    accepted(
+        store
+            .runtime_accept_observation(&authenticated, &full)
+            .unwrap(),
+    );
+
+    let snapshot = match store
+        .load_route_grant_v2_authority(
+            &hostname,
+            &active_kid,
+            policy.approved_guest_config_digest(),
+        )
+        .unwrap()
+    {
+        RouteGrantV2AuthorityLoad::Ready(snapshot) => *snapshot,
+        rejection => panic!("route snapshot unexpectedly rejected: {rejection:?}"),
+    };
+    assert_eq!(snapshot.workspace_id, workspace);
+    assert_eq!(snapshot.endpoint_id, endpoint_id);
+    assert_eq!(snapshot.cat_id, desired.cat_id);
+    assert_eq!(snapshot.node_id, identity.node_id);
+    assert_eq!(snapshot.route_epoch.get(), 7);
+    assert_eq!(snapshot.target_port, 8080);
+    assert!(snapshot.evaluated_at_unix_ms.get() > 0);
+
+    let unknown = KeyId::new("b".repeat(64)).unwrap();
+    assert_eq!(
+        store
+            .load_route_grant_v2_authority(
+                &hostname,
+                &unknown,
+                policy.approved_guest_config_digest(),
+            )
+            .unwrap(),
+        RouteGrantV2AuthorityLoad::Rejected(RouteGrantV2AuthorityRejection::Unavailable)
+    );
 }

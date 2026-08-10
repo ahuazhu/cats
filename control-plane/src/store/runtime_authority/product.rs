@@ -1290,7 +1290,7 @@ fn validate_candidate(request: &CoveredCatCreateRequest) -> Result<()> {
     Ok(())
 }
 
-fn validate_endpoint_lookup(
+pub(super) fn validate_endpoint_lookup(
     endpoint: &EndpointRecord,
     lookup: &HostnameDesiredLookup,
     desired: &DesiredRuntimeSpec,

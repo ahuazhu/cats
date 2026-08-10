@@ -15,6 +15,11 @@ pub(crate) mod placement_planner;
 pub(crate) mod placement_policy;
 mod product;
 mod product_rows;
+#[allow(
+    dead_code,
+    reason = "the closed snapshot loader is composed with the Route Grant v2 resolve service after the Node transport target authority lands"
+)]
+pub(crate) mod route_signer;
 pub(super) mod rows;
 #[allow(
     dead_code,

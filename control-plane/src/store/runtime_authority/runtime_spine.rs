@@ -675,7 +675,7 @@ struct CurrentCatObservation {
     source_kind: ObservationSourceKind,
 }
 
-fn load_route_runtime_in(
+pub(super) fn load_route_runtime_in(
     transaction: &mut Transaction<'_>,
     node_id: &Id,
     cat_id: &Id,
