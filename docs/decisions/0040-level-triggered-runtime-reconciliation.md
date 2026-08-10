@@ -190,6 +190,11 @@ identity；`PrepareNetwork`与`StartRuntime`都逐字段复制按Guest slot排�
 出现时只能是逐项exact projection且不得有extra/duplicate，top-level `ObservedVolume`的logical IDs、kind、
 authority和唯一active lineage始终必须exact，不能从当前Desired或公开path反向补齐。
 
+整条chain只能服务同一个current `target=Running` Desired；revision/spec/Node/placement从PrepareDevice到
+StartRuntime逐字段不变，不能在同revision把Cold或不同Guest profile换成另一digest继续启动。Cold→Running必须
+先由新Running revision和fresh full建立current-exact predecessor；superseded PrepareNetwork/StartRuntime没有
+重解释旧reservation的authority，必须fail closed。
+
 `PrepareNetwork`的checkpoint replace是该轮唯一effect：它持久完整`NetworkConfig`、Linux IFNAMSIZ范围内的随机
 `tap_name`及独立`ownership_token`，fsync后必须先取得新的accepted full inventory；只有其中证明tap
 absent或逐字段exact present时，下一轮才可create/adopt，一次模糊结果后也只能再读fresh full。再次得到

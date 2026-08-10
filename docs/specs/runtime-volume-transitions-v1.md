@@ -541,24 +541,24 @@ request，valid 409先重读Desired/full inventory/Volume并按Runtime选择Bloc
 **Normal acquire request**（exact 624 octets）：
 
 ```json
-{"cat_id":"cat_01","desired_revision":7,"placement":{"kind":"assigned","node_id":"node_a","placement_epoch":3},"session":{"agent_instance_id":"44444444444444444444444444444444","agent_session_epoch":2,"node_boot_id":"33333333333333333333333333333333","node_id":"node_a"},"spec_digest":"sha256:529c32e8600910283f99bf949af5c31fdadcf3757463eb6c4811c61673ed9409","transition":{"kind":"acquire","request":{"attachment_id":"att_01","desired_revision":7,"expected_unowned_epoch":0,"kind":"normal","lease_duration_ms":60000,"placement_epoch":3,"transition_id":"22222222222222222222222222222222","volume_id":"vol_root"}},"version":1}
+{"cat_id":"cat_01","desired_revision":7,"placement":{"kind":"assigned","node_id":"node_a","placement_epoch":3},"session":{"agent_instance_id":"44444444444444444444444444444444","agent_session_epoch":2,"node_boot_id":"33333333333333333333333333333333","node_id":"node_a"},"spec_digest":"sha256:d1dc4a8ff5e5d2fa4239eb14a6ac3e825a5070bd0d646762f723507f11ec54ad","transition":{"kind":"acquire","request":{"attachment_id":"att_01","desired_revision":7,"expected_unowned_epoch":0,"kind":"normal","lease_duration_ms":60000,"placement_epoch":3,"transition_id":"22222222222222222222222222222222","volume_id":"vol_root"}},"version":1}
 ```
 
 ```text
-SHA-256(exact request bytes) = f8b0e2c8fbb23f456aadf2cae9e2ae7422ee8d35938edcc96ab83a97cce5f473
+SHA-256(exact request bytes) = 483155985a5ba66c732593f912fa0f2b4560a61d17d10323455d71c6609ccce6
 signed_request_length = 228
-SHA-256(signed_request) = 15269284739a36f17639042b66c00be04f13d99d4d03d788052ab0cbdfed206a
-Cats-Node-Signature = 8N562xDOzm7X1Vd-nZFaGT82qOm3Zoauot5l-j7iwOLO2eRs2-HA_S7j1AWKWZOo-VZl8mMb2ATyO5M8HdrjCQ
+SHA-256(signed_request) = dcd24abef5ca2cbeab1f7cb6cdda5de521311e915efaebf0ceee874b8f572426
+Cats-Node-Signature = X-5PTXwKB808ndTKBhwHyjGShb4MXU9MWPW1sIx-j5pedhvyUpl96lvUVwoF-yvu_Z3nbGoGnYKQClnPXpH3Aw
 ```
 
 **Lease-granted success**（exact 713 octets）：
 
 ```json
-{"cat_id":"cat_01","desired_revision":7,"outcome":{"grant":{"acquire_origin":{"kind":"normal","transition_id":"22222222222222222222222222222222"},"attachment_epoch":1,"attachment_id":"att_01","durability":"strict","head":{"generation":0,"root_hash":null,"root_object_id":null},"lease_expires_at":1720000060000,"size_bytes":4294967296,"volume_id":"vol_root"},"kind":"lease_granted"},"placement":{"kind":"assigned","node_id":"node_a","placement_epoch":3},"session":{"agent_instance_id":"44444444444444444444444444444444","agent_session_epoch":2,"node_boot_id":"33333333333333333333333333333333","node_id":"node_a"},"spec_digest":"sha256:529c32e8600910283f99bf949af5c31fdadcf3757463eb6c4811c61673ed9409","version":1}
+{"cat_id":"cat_01","desired_revision":7,"outcome":{"grant":{"acquire_origin":{"kind":"normal","transition_id":"22222222222222222222222222222222"},"attachment_epoch":1,"attachment_id":"att_01","durability":"strict","head":{"generation":0,"root_hash":null,"root_object_id":null},"lease_expires_at":1720000060000,"size_bytes":4294967296,"volume_id":"vol_root"},"kind":"lease_granted"},"placement":{"kind":"assigned","node_id":"node_a","placement_epoch":3},"session":{"agent_instance_id":"44444444444444444444444444444444","agent_session_epoch":2,"node_boot_id":"33333333333333333333333333333333","node_id":"node_a"},"spec_digest":"sha256:d1dc4a8ff5e5d2fa4239eb14a6ac3e825a5070bd0d646762f723507f11ec54ad","version":1}
 ```
 
 ```text
-SHA-256(exact success bytes) = a823cbaa5fa2819e9a560753ce0428312bc59faeb219fb258aad1aba4ca10ef4
+SHA-256(exact success bytes) = aec50eb85afc8ce4d9b2410189d1c2bb76461aae47a78561c10d7915a50edff1
 ```
 
 **Inventory-stale error**（exact 149 octets）：

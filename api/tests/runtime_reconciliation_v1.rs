@@ -11,19 +11,17 @@ const GUEST_CONFIG_DIGEST: &str =
 const GUEST_RUNTIME_PROFILE_RECEIPT_WIRE: &str = r#"{"guest_agent_protocol_version":1,"initramfs_digest":"sha256:1111111111111111111111111111111111111111111111111111111111111111","kernel_cmdline":"console=ttyS0 root=/dev/vda rw clocksource=kvm-clock","kernel_digest":"sha256:0000000000000000000000000000000000000000000000000000000000000000","version":1}"#;
 const AGENT_REGISTRATION_ATTEMPT_WIRE: &str = r#"{"agent_instance_id":"44444444444444444444444444444444","expected_agent_session_epoch":null,"guest_config_digest":"sha256:78215611e8c3bd683eb542b5696a6316156365a94624c7521446ab5660d067e2","immutable_host_id":"host_a","node_boot_id":"33333333333333333333333333333333","node_id":"node_a","registration_attempt_id":"55555555555555555555555555555555","version":1}"#;
 const AGENT_SESSION_WIRE: &str = r#"{"agent_instance_id":"44444444444444444444444444444444","agent_session_epoch":2,"guest_config_digest":"sha256:78215611e8c3bd683eb542b5696a6316156365a94624c7521446ab5660d067e2","immutable_host_id":"host_a","lease_deadline_unix_ms":1720000060000,"node_boot_id":"33333333333333333333333333333333","node_id":"node_a","registration_attempt_id":"55555555555555555555555555555555","version":1}"#;
-const SPEC_DIGEST: &str = "sha256:529c32e8600910283f99bf949af5c31fdadcf3757463eb6c4811c61673ed9409";
+const SPEC_DIGEST: &str = "sha256:d1dc4a8ff5e5d2fa4239eb14a6ac3e825a5070bd0d646762f723507f11ec54ad";
 const CHECKPOINT_DIGEST: &str =
-    "sha256:602bd0f3a0f1a29f269fa2946fa1a52ea154ba1623b5ca2de18e657cad3753fb";
+    "sha256:dbd1902cb7b05af6747ad82ed96711b98088374f98cfe961d1d4c9c6ffd2b6e4";
 const PROVISION_ROOT_CHECKPOINT_DIGEST: &str =
-    "sha256:f4f5073559b8918c500ac706bb395afa9958f309ae8783ff96f980be60d37f2e";
+    "sha256:84fd43db1740c036fa869eda7be65826748df181aa9ac098c85eaa968e43aa1d";
 const PREPARE_DEVICE_CHECKPOINT_DIGEST: &str =
-    "sha256:c9c0fe2ac27ac10391779def77f17033f4f72c1de5d1de1cd19d25120d8c0167";
+    "sha256:b2d3fa1ff074bea7c1893b4620f55a3baeac1c51406b18f681f95693399b9ee7";
 const PREPARE_NETWORK_CHECKPOINT_DIGEST: &str =
-    "sha256:44d7e56d7af5de6ef4afa6232a673a5c068c8db9fc4558e8f937ccb0a6ea6de9";
-const START_RUNTIME_SPEC_DIGEST: &str =
-    "sha256:aad5d63a496f538b00b9eb27bbe1133ec83f5b238b14cb4e19d604fdcd99a6f8";
+    "sha256:e2682ee086127d872bc697219d8c1e613e3797663fd7acb2190f0ab64c74c6e4";
 const START_RUNTIME_CHECKPOINT_DIGEST: &str =
-    "sha256:9d0d04db3378a41897252da5b9671b4685d9e94961d8384b45c76d7dafe24fa4";
+    "sha256:9d9259231897f625b71ec85aeb2a7032b4d8e90037b24b3764e93746fb0182f2";
 const SHARED_DESIRED_WIRE: &str =
     include_str!("../../testdata/runtime-reconciliation-v1-desired.json");
 const SHARED_PROVISION_ROOT_CHECKPOINT_WIRE: &str =
@@ -35,9 +33,9 @@ const SHARED_PREPARE_NETWORK_CHECKPOINT_WIRE: &str =
 const SHARED_START_RUNTIME_CHECKPOINT_WIRE: &str =
     include_str!("../../testdata/runtime-reconciliation-v1-start-runtime-checkpoint.json");
 
-const DESIRED_DIGEST_INPUT: &str = r#"{"cat_id":"cat_01","desired_revision":7,"endpoints":[{"endpoint_id":"ep_01","hostname":"app.example.test","protocol":"http","route_epoch":9,"target_port":8080}],"placement":{"kind":"assigned","node_id":"node_a","placement_epoch":3},"runtime":{"boot_image_digest":"sha256:0000000000000000000000000000000000000000000000000000000000000000","guest_config_digest":"sha256:1111111111111111111111111111111111111111111111111111111111111111","memory_bytes":2147483648,"network_config":{"gateway_ipv4":"10.240.0.5","guest_ipv4":"10.240.0.6","guest_mac":"02:ca:0a:f0:00:06","kind":"isolated_ipv4","network_id":"net_01","prefix_length":30},"vcpus":2},"target":"cold","transition":{"kind":"cancel_and_drain"},"version":1,"volumes":[{"access":"read_write_once","acquire":{"expected_unowned_epoch":0,"kind":"normal","transition_id":"22222222222222222222222222222222"},"attachment_id":"att_01","disk_id":"disk_root","disk_kind":"root","disposition":{"kind":"retain"},"durability":"strict","guest_device":{"serial":"cats-root","slot":0},"mount":null,"size_bytes":4294967296,"volume_id":"vol_root","volume_intent_id":"vint_root"}],"workspace_id":"ws_01"}"#;
+const DESIRED_DIGEST_INPUT: &str = r#"{"cat_id":"cat_01","desired_revision":7,"endpoints":[{"endpoint_id":"ep_01","hostname":"app.example.test","protocol":"http","route_epoch":9,"target_port":8080}],"placement":{"kind":"assigned","node_id":"node_a","placement_epoch":3},"runtime":{"boot_image_digest":"sha256:0000000000000000000000000000000000000000000000000000000000000000","guest_config_digest":"sha256:78215611e8c3bd683eb542b5696a6316156365a94624c7521446ab5660d067e2","memory_bytes":2147483648,"network_config":{"gateway_ipv4":"10.240.0.5","guest_ipv4":"10.240.0.6","guest_mac":"02:ca:0a:f0:00:06","kind":"isolated_ipv4","network_id":"net_01","prefix_length":30},"vcpus":2},"target":"running","transition":{"kind":"cancel_and_drain"},"version":1,"volumes":[{"access":"read_write_once","acquire":{"expected_unowned_epoch":0,"kind":"normal","transition_id":"22222222222222222222222222222222"},"attachment_id":"att_01","disk_id":"disk_root","disk_kind":"root","disposition":{"kind":"retain"},"durability":"strict","guest_device":{"serial":"cats-root","slot":0},"mount":null,"size_bytes":4294967296,"volume_id":"vol_root","volume_intent_id":"vint_root"}],"workspace_id":"ws_01"}"#;
 
-const CHECKPOINT_WIRE: &str = r#"{"cat_id":"cat_01","desired_revision":7,"guest_transport":{"kind":"unavailable"},"lifecycle_admission":"closed","mounts":[],"networks":[],"node_id":"node_a","placement_epoch":3,"processes":[],"require_idle":{"kind":"not_applicable"},"route_gates":[],"runtime_incarnation":null,"spec_digest":"sha256:529c32e8600910283f99bf949af5c31fdadcf3757463eb6c4811c61673ed9409","stable_state":null,"step":{"inventory_epoch":4,"kind":"inspect_inventory"},"updated_at_unix_ms":1720000000000,"version":1,"volumes":[],"warm_snapshot":{"kind":"absent"}}"#;
+const CHECKPOINT_WIRE: &str = r#"{"cat_id":"cat_01","desired_revision":7,"guest_transport":{"kind":"unavailable"},"lifecycle_admission":"closed","mounts":[],"networks":[],"node_id":"node_a","placement_epoch":3,"processes":[],"require_idle":{"kind":"not_applicable"},"route_gates":[],"runtime_incarnation":null,"spec_digest":"sha256:d1dc4a8ff5e5d2fa4239eb14a6ac3e825a5070bd0d646762f723507f11ec54ad","stable_state":null,"step":{"inventory_epoch":4,"kind":"inspect_inventory"},"updated_at_unix_ms":1720000000000,"version":1,"volumes":[],"warm_snapshot":{"kind":"absent"}}"#;
 static PROVISION_ROOT_CHECKPOINT_WIRE: LazyLock<&'static str> = LazyLock::new(|| {
     SHARED_PROVISION_ROOT_CHECKPOINT_WIRE
         .strip_suffix('\n')
@@ -61,11 +59,11 @@ static START_RUNTIME_CHECKPOINT_WIRE: LazyLock<&'static str> = LazyLock::new(|| 
 
 const EMPTY_INVENTORY_INPUT: &str = r#"{"agent_instance_id":"44444444444444444444444444444444","agent_session_epoch":2,"inventory_epoch":4,"inventory_read_position":12,"node_boot_id":"33333333333333333333333333333333","node_id":"node_a","residue":[],"runtimes":[],"version":1}"#;
 
-const UNEXPECTED_INVENTORY_INPUT: &str = r#"{"agent_instance_id":"44444444444444444444444444444444","agent_session_epoch":2,"inventory_epoch":5,"inventory_read_position":13,"node_boot_id":"33333333333333333333333333333333","node_id":"node_a","residue":[{"kind":"control_socket","ownership_token":{"kind":"valid","ownership_token":"abababababababababababababababab"},"role_hint":null,"socket_path":"/run/cats/orphan/valid.sock"},{"checkpoint_path":"/var/lib/cats/checkpoints/cat_01.json","evidence":{"cat_id":"cat_01","content_digest":"sha256:602bd0f3a0f1a29f269fa2946fa1a52ea154ba1623b5ca2de18e657cad3753fb","desired_revision":7,"kind":"valid","node_id":"node_a","placement_epoch":3,"runtime_incarnation":null,"spec_digest":"sha256:529c32e8600910283f99bf949af5c31fdadcf3757463eb6c4811c61673ed9409","version":1},"kind":"checkpoint_file"}],"runtimes":[],"version":1}"#;
+const UNEXPECTED_INVENTORY_INPUT: &str = r#"{"agent_instance_id":"44444444444444444444444444444444","agent_session_epoch":2,"inventory_epoch":5,"inventory_read_position":13,"node_boot_id":"33333333333333333333333333333333","node_id":"node_a","residue":[{"kind":"control_socket","ownership_token":{"kind":"valid","ownership_token":"abababababababababababababababab"},"role_hint":null,"socket_path":"/run/cats/orphan/valid.sock"},{"checkpoint_path":"/var/lib/cats/checkpoints/cat_01.json","evidence":{"cat_id":"cat_01","content_digest":"sha256:dbd1902cb7b05af6747ad82ed96711b98088374f98cfe961d1d4c9c6ffd2b6e4","desired_revision":7,"kind":"valid","node_id":"node_a","placement_epoch":3,"runtime_incarnation":null,"spec_digest":"sha256:d1dc4a8ff5e5d2fa4239eb14a6ac3e825a5070bd0d646762f723507f11ec54ad","version":1},"kind":"checkpoint_file"}],"runtimes":[],"version":1}"#;
 
-const NONEMPTY_INVENTORY_INPUT: &str = r#"{"agent_instance_id":"44444444444444444444444444444444","agent_session_epoch":2,"inventory_epoch":4,"inventory_read_position":12,"node_boot_id":"33333333333333333333333333333333","node_id":"node_a","residue":[{"cgroup_path":"/sys/fs/cgroup/system.slice/cats-orphan.scope","kind":"systemd_scope","ownership_token":{"kind":"valid","ownership_token":"dddddddddddddddddddddddddddddddd"},"scope_id":"cats-orphan.scope"},{"kind":"control_socket","ownership_token":{"kind":"missing"},"role_hint":null,"socket_path":"/run/cats/orphan/control.sock"},{"checkpoint_path":"/var/lib/cats/checkpoints/orphan.json","evidence":{"kind":"corrupt","raw_content_digest":"sha256:eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee"},"kind":"checkpoint_file"},{"data_directory":"/var/lib/cats/orphan-vol","kind":"data_directory","lineage":{"attachment_epoch_hint":4,"attachment_id_hint":"att_orphan","fenced":false,"kind":"readable","local_durable_generation":6,"pending_pack_count":2,"remote_durable_generation":5},"ownership_token":{"kind":"corrupt","raw_content_digest":"sha256:ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff"},"volume_id_hint":null}],"runtimes":[{"applied_desired":{"desired_revision":7,"placement":{"kind":"assigned","node_id":"node_a","placement_epoch":3},"spec_digest":"sha256:529c32e8600910283f99bf949af5c31fdadcf3757463eb6c4811c61673ed9409","target":"running"},"cat_id":"cat_01","checkpoint":{"cat_id":"cat_01","checkpoint_path":"/var/lib/cats/checkpoints/cat_01.json","content_digest":"sha256:602bd0f3a0f1a29f269fa2946fa1a52ea154ba1623b5ca2de18e657cad3753fb","desired_revision":7,"kind":"valid","node_id":"node_a","placement_epoch":3,"require_idle":{"kind":"not_applicable"},"runtime_incarnation":null,"spec_digest":"sha256:529c32e8600910283f99bf949af5c31fdadcf3757463eb6c4811c61673ed9409","stable_state":null,"step":{"inventory_epoch":4,"kind":"inspect_inventory"},"updated_at_unix_ms":1720000000000,"version":1},"guest_transport":{"guest_agent_protocol_version":1,"guest_boot_id":"cccccccccccccccccccccccccccccccc","guest_cid":3,"guest_port":5000,"kind":"vsock_ready","runtime_incarnation":"55555555555555555555555555555555"},"lifecycle_admission":"closed","mounts":[{"access":"read_write","filesystem_uuid":"99999999999999999999999999999999","guest_device":{"serial":"cats-root","slot":0},"instance_count":1,"mount_path":"/","source_path":"/dev/nbd0","volume_id":"vol_root"}],"networks":[{"gateway_ipv4":"10.240.0.5","guest_ipv4":"10.240.0.6","guest_mac":"02:ca:0a:f0:00:06","kind":"isolated_ipv4","network_id":"net_01","ownership_token":{"kind":"valid","ownership_token":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"},"prefix_length":30,"tap_name":"tap0"},{"gateway_ipv4":"10.240.0.5","guest_ipv4":"10.240.0.6","guest_mac":"02:ca:0a:f0:00:06","kind":"isolated_ipv4","network_id":"net_01","ownership_token":{"kind":"corrupt","raw_content_digest":"sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"},"prefix_length":30,"tap_name":"tap1"}],"platform_guards":0,"processes":[{"control_handshake":{"kind":"verified"},"control_socket_path":"/run/cats/cat_01/vmm.sock","executable_path":"/usr/bin/cloud-hypervisor","observed_vm_shape":{"boot_image_digest":"sha256:0000000000000000000000000000000000000000000000000000000000000000","guest_config_digest":"sha256:1111111111111111111111111111111111111111111111111111111111111111","memory_bytes":2147483648,"vcpus":2},"ownership_token":{"kind":"valid","ownership_token":"66666666666666666666666666666666"},"process_id":1001,"process_start_time_ticks":9001,"role":{"kind":"vmm","runtime_incarnation":"55555555555555555555555555555555"},"scope_id":"cats-cat_01","state":"running"},{"control_handshake":{"kind":"verified"},"control_socket_path":"/run/cats/cat_01/blockd-root.sock","executable_path":"/usr/bin/cats-blockd","observed_vm_shape":null,"ownership_token":{"kind":"valid","ownership_token":"77777777777777777777777777777777"},"process_id":1002,"process_start_time_ticks":9002,"role":{"attachment_epoch":8,"attachment_id":"att_01","kind":"blockd","volume_id":"vol_root"},"scope_id":"cats-cat_01","state":"running"}],"routes":[{"active_guards":0,"binding":{"cat_id":"cat_01","endpoint_id":"ep_01","hostname":"app.example.test","node_id":"node_a","protocol":"http","route_epoch":9,"runtime_incarnation":"55555555555555555555555555555555","target_port":8080,"workspace_id":"ws_01"},"cancellation_pending":false,"gate":"closed","instance_count":2},{"active_guards":0,"binding":{"cat_id":"cat_01","endpoint_id":"ep_01","hostname":"app.example.test","node_id":"node_a","protocol":"http","route_epoch":10,"runtime_incarnation":"55555555555555555555555555555555","target_port":8080,"workspace_id":"ws_01"},"cancellation_pending":false,"gate":"closed","instance_count":1}],"runtime_incarnation":"55555555555555555555555555555555","stable_state":null,"step":{"inventory_epoch":4,"kind":"inspect_inventory"},"volumes":[{"authority":{"attachment_epoch":8,"attachment_id":"att_01","head":{"generation":4,"root_hash":"sha256:2222222222222222222222222222222222222222222222222222222222222222","root_object_id":"volumes/vol_root/roots/4"},"kind":"owned"},"devices":[{"device_path":"/dev/nbd0","guest_device":{"serial":"cats-root","slot":0},"kind":"kernel_nbd","ownership_token":{"kind":"valid","ownership_token":"88888888888888888888888888888888"}},{"guest_device":{"serial":"cats-root","slot":0},"kind":"vhost_user_blk","ownership_token":{"kind":"missing"},"socket_path":"/run/cats/cat_01/root.sock"}],"disk_id":"disk_root","disk_kind":"root","durability":"strict","local_lineages":[{"acquire_origin":{"kind":"normal","transition_id":"13579bdf2468ace013579bdf2468ace0"},"attachment_epoch":8,"attachment_id":"att_01","data_directory":"/var/lib/cats/vol_root","fenced":false,"local_durable_generation":5,"node_id":"node_a","pending_pack_count":1,"placement_epoch":3,"remote_durable_generation":4,"state":"active"}],"size_bytes":4294967296,"volume_id":"vol_root","volume_intent_id":"vint_root"}],"warm_snapshot":{"kind":"absent"}}],"version":1}"#;
+const NONEMPTY_INVENTORY_INPUT: &str = r#"{"agent_instance_id":"44444444444444444444444444444444","agent_session_epoch":2,"inventory_epoch":4,"inventory_read_position":12,"node_boot_id":"33333333333333333333333333333333","node_id":"node_a","residue":[{"cgroup_path":"/sys/fs/cgroup/system.slice/cats-orphan.scope","kind":"systemd_scope","ownership_token":{"kind":"valid","ownership_token":"dddddddddddddddddddddddddddddddd"},"scope_id":"cats-orphan.scope"},{"kind":"control_socket","ownership_token":{"kind":"missing"},"role_hint":null,"socket_path":"/run/cats/orphan/control.sock"},{"checkpoint_path":"/var/lib/cats/checkpoints/orphan.json","evidence":{"kind":"corrupt","raw_content_digest":"sha256:eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee"},"kind":"checkpoint_file"},{"data_directory":"/var/lib/cats/orphan-vol","kind":"data_directory","lineage":{"attachment_epoch_hint":4,"attachment_id_hint":"att_orphan","fenced":false,"kind":"readable","local_durable_generation":6,"pending_pack_count":2,"remote_durable_generation":5},"ownership_token":{"kind":"corrupt","raw_content_digest":"sha256:ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff"},"volume_id_hint":null}],"runtimes":[{"applied_desired":{"desired_revision":7,"placement":{"kind":"assigned","node_id":"node_a","placement_epoch":3},"spec_digest":"sha256:d1dc4a8ff5e5d2fa4239eb14a6ac3e825a5070bd0d646762f723507f11ec54ad","target":"running"},"cat_id":"cat_01","checkpoint":{"cat_id":"cat_01","checkpoint_path":"/var/lib/cats/checkpoints/cat_01.json","content_digest":"sha256:dbd1902cb7b05af6747ad82ed96711b98088374f98cfe961d1d4c9c6ffd2b6e4","desired_revision":7,"kind":"valid","node_id":"node_a","placement_epoch":3,"require_idle":{"kind":"not_applicable"},"runtime_incarnation":null,"spec_digest":"sha256:d1dc4a8ff5e5d2fa4239eb14a6ac3e825a5070bd0d646762f723507f11ec54ad","stable_state":null,"step":{"inventory_epoch":4,"kind":"inspect_inventory"},"updated_at_unix_ms":1720000000000,"version":1},"guest_transport":{"guest_agent_protocol_version":1,"guest_boot_id":"cccccccccccccccccccccccccccccccc","guest_cid":3,"guest_port":5000,"kind":"vsock_ready","runtime_incarnation":"55555555555555555555555555555555"},"lifecycle_admission":"closed","mounts":[{"access":"read_write","filesystem_uuid":"99999999999999999999999999999999","guest_device":{"serial":"cats-root","slot":0},"instance_count":1,"mount_path":"/","source_path":"/dev/nbd0","volume_id":"vol_root"}],"networks":[{"gateway_ipv4":"10.240.0.5","guest_ipv4":"10.240.0.6","guest_mac":"02:ca:0a:f0:00:06","kind":"isolated_ipv4","network_id":"net_01","ownership_token":{"kind":"valid","ownership_token":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"},"prefix_length":30,"tap_name":"tap0"},{"gateway_ipv4":"10.240.0.5","guest_ipv4":"10.240.0.6","guest_mac":"02:ca:0a:f0:00:06","kind":"isolated_ipv4","network_id":"net_01","ownership_token":{"kind":"corrupt","raw_content_digest":"sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"},"prefix_length":30,"tap_name":"tap1"}],"platform_guards":0,"processes":[{"control_handshake":{"kind":"verified"},"control_socket_path":"/run/cats/cat_01/vmm.sock","executable_path":"/usr/bin/cloud-hypervisor","observed_vm_shape":{"boot_image_digest":"sha256:0000000000000000000000000000000000000000000000000000000000000000","guest_config_digest":"sha256:78215611e8c3bd683eb542b5696a6316156365a94624c7521446ab5660d067e2","memory_bytes":2147483648,"vcpus":2},"ownership_token":{"kind":"valid","ownership_token":"66666666666666666666666666666666"},"process_id":1001,"process_start_time_ticks":9001,"role":{"kind":"vmm","runtime_incarnation":"55555555555555555555555555555555"},"scope_id":"cats-cat_01","state":"running"},{"control_handshake":{"kind":"verified"},"control_socket_path":"/run/cats/cat_01/blockd-root.sock","executable_path":"/usr/bin/cats-blockd","observed_vm_shape":null,"ownership_token":{"kind":"valid","ownership_token":"77777777777777777777777777777777"},"process_id":1002,"process_start_time_ticks":9002,"role":{"attachment_epoch":8,"attachment_id":"att_01","kind":"blockd","volume_id":"vol_root"},"scope_id":"cats-cat_01","state":"running"}],"routes":[{"active_guards":0,"binding":{"cat_id":"cat_01","endpoint_id":"ep_01","hostname":"app.example.test","node_id":"node_a","protocol":"http","route_epoch":9,"runtime_incarnation":"55555555555555555555555555555555","target_port":8080,"workspace_id":"ws_01"},"cancellation_pending":false,"gate":"closed","instance_count":2},{"active_guards":0,"binding":{"cat_id":"cat_01","endpoint_id":"ep_01","hostname":"app.example.test","node_id":"node_a","protocol":"http","route_epoch":10,"runtime_incarnation":"55555555555555555555555555555555","target_port":8080,"workspace_id":"ws_01"},"cancellation_pending":false,"gate":"closed","instance_count":1}],"runtime_incarnation":"55555555555555555555555555555555","stable_state":null,"step":{"inventory_epoch":4,"kind":"inspect_inventory"},"volumes":[{"authority":{"attachment_epoch":8,"attachment_id":"att_01","head":{"generation":4,"root_hash":"sha256:2222222222222222222222222222222222222222222222222222222222222222","root_object_id":"volumes/vol_root/roots/4"},"kind":"owned"},"devices":[{"device_path":"/dev/nbd0","guest_device":{"serial":"cats-root","slot":0},"kind":"kernel_nbd","ownership_token":{"kind":"valid","ownership_token":"88888888888888888888888888888888"}},{"guest_device":{"serial":"cats-root","slot":0},"kind":"vhost_user_blk","ownership_token":{"kind":"missing"},"socket_path":"/run/cats/cat_01/root.sock"}],"disk_id":"disk_root","disk_kind":"root","durability":"strict","local_lineages":[{"acquire_origin":{"kind":"normal","transition_id":"13579bdf2468ace013579bdf2468ace0"},"attachment_epoch":8,"attachment_id":"att_01","data_directory":"/var/lib/cats/vol_root","fenced":false,"local_durable_generation":5,"node_id":"node_a","pending_pack_count":1,"placement_epoch":3,"remote_durable_generation":4,"state":"active"}],"size_bytes":4294967296,"volume_id":"vol_root","volume_intent_id":"vint_root"}],"warm_snapshot":{"kind":"absent"}}],"version":1}"#;
 
-const NODE_CLEANUP_WIRE: &str = r#"{"cleanup":{"desired_read_position":15,"inventory_epoch":4,"inventory_read_position":12,"inventory_session":{"agent_instance_id":"44444444444444444444444444444444","agent_session_epoch":2,"node_boot_id":"33333333333333333333333333333333","node_id":"node_a"},"target":{"cat_id":"cat_01","checkpoint_path":"/var/lib/cats/checkpoints/cat_01.json","content_digest":"sha256:602bd0f3a0f1a29f269fa2946fa1a52ea154ba1623b5ca2de18e657cad3753fb","desired_revision":7,"kind":"checkpoint_file","node_id":"node_a","placement_epoch":3},"volume_release":null},"node_id":"node_a","version":1}"#;
+const NODE_CLEANUP_WIRE: &str = r#"{"cleanup":{"desired_read_position":15,"inventory_epoch":4,"inventory_read_position":12,"inventory_session":{"agent_instance_id":"44444444444444444444444444444444","agent_session_epoch":2,"node_boot_id":"33333333333333333333333333333333","node_id":"node_a"},"target":{"cat_id":"cat_01","checkpoint_path":"/var/lib/cats/checkpoints/cat_01.json","content_digest":"sha256:dbd1902cb7b05af6747ad82ed96711b98088374f98cfe961d1d4c9c6ffd2b6e4","desired_revision":7,"kind":"checkpoint_file","node_id":"node_a","placement_epoch":3},"volume_release":null},"node_id":"node_a","version":1}"#;
 
 const VOLUME_CLEANUP_WIRE: &str = r#"{"desired_read_position":15,"inventory_epoch":5,"inventory_read_position":13,"inventory_session":{"agent_instance_id":"44444444444444444444444444444444","agent_session_epoch":2,"node_boot_id":"33333333333333333333333333333333","node_id":"node_a"},"target":{"attachment_epoch":8,"attachment_id":"att_01","kind":"volume","volume_id":"vol_root"},"volume_release":{"disposition":{"kind":"detach_retained"},"generation":5,"release_transition_id":"acacacacacacacacacacacacacacacac"}}"#;
 
@@ -73,8 +71,8 @@ const CONTRACT_ERROR_WIRE: &str = r#"{"error":{"accepted_observation_id":"101010
 const DESIRED_READ_REQUEST_WIRE: &str = r#"{"request_sequence":1,"session":{"agent_instance_id":"44444444444444444444444444444444","agent_session_epoch":2,"node_boot_id":"33333333333333333333333333333333","node_id":"node_a"},"version":1}"#;
 const EMPTY_DESIRED_READ_SNAPSHOT_WIRE: &str = r#"{"desired_specs":[],"expires_at_unix_ms":1720000030000,"issued_at_unix_ms":1720000000000,"read_position":12,"request_sequence":1,"session":{"agent_instance_id":"44444444444444444444444444444444","agent_session_epoch":2,"node_boot_id":"33333333333333333333333333333333","node_id":"node_a"},"version":1}"#;
 const OBSERVATION_ACCEPTANCE_WIRE: &str = r#"{"accepted_at_unix_ms":1720000005000,"heartbeat_sequence":9,"inventory":{"attestation":{"accepted_at_unix_ms":1720000005000,"agent_session_epoch":2,"inventory_digest":"sha256:12c19ac927b853c8f66f6dac52d448d6f2e797925527a0c606c7692b6f714e05","inventory_epoch":4,"inventory_read_position":12,"node_id":"node_a","version":1},"kind":"full"},"lease_deadline_unix_ms":1720000065000,"observation_id":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","session":{"agent_instance_id":"44444444444444444444444444444444","agent_session_epoch":2,"node_boot_id":"33333333333333333333333333333333","node_id":"node_a"},"version":1}"#;
-const VOLUME_TRANSITION_NORMAL_REQUEST_WIRE: &str = r#"{"cat_id":"cat_01","desired_revision":7,"placement":{"kind":"assigned","node_id":"node_a","placement_epoch":3},"session":{"agent_instance_id":"44444444444444444444444444444444","agent_session_epoch":2,"node_boot_id":"33333333333333333333333333333333","node_id":"node_a"},"spec_digest":"sha256:529c32e8600910283f99bf949af5c31fdadcf3757463eb6c4811c61673ed9409","transition":{"kind":"acquire","request":{"attachment_id":"att_01","desired_revision":7,"expected_unowned_epoch":0,"kind":"normal","lease_duration_ms":60000,"placement_epoch":3,"transition_id":"22222222222222222222222222222222","volume_id":"vol_root"}},"version":1}"#;
-const VOLUME_TRANSITION_LEASE_GRANTED_WIRE: &str = r#"{"cat_id":"cat_01","desired_revision":7,"outcome":{"grant":{"acquire_origin":{"kind":"normal","transition_id":"22222222222222222222222222222222"},"attachment_epoch":1,"attachment_id":"att_01","durability":"strict","head":{"generation":0,"root_hash":null,"root_object_id":null},"lease_expires_at":1720000060000,"size_bytes":4294967296,"volume_id":"vol_root"},"kind":"lease_granted"},"placement":{"kind":"assigned","node_id":"node_a","placement_epoch":3},"session":{"agent_instance_id":"44444444444444444444444444444444","agent_session_epoch":2,"node_boot_id":"33333333333333333333333333333333","node_id":"node_a"},"spec_digest":"sha256:529c32e8600910283f99bf949af5c31fdadcf3757463eb6c4811c61673ed9409","version":1}"#;
+const VOLUME_TRANSITION_NORMAL_REQUEST_WIRE: &str = r#"{"cat_id":"cat_01","desired_revision":7,"placement":{"kind":"assigned","node_id":"node_a","placement_epoch":3},"session":{"agent_instance_id":"44444444444444444444444444444444","agent_session_epoch":2,"node_boot_id":"33333333333333333333333333333333","node_id":"node_a"},"spec_digest":"sha256:d1dc4a8ff5e5d2fa4239eb14a6ac3e825a5070bd0d646762f723507f11ec54ad","transition":{"kind":"acquire","request":{"attachment_id":"att_01","desired_revision":7,"expected_unowned_epoch":0,"kind":"normal","lease_duration_ms":60000,"placement_epoch":3,"transition_id":"22222222222222222222222222222222","volume_id":"vol_root"}},"version":1}"#;
+const VOLUME_TRANSITION_LEASE_GRANTED_WIRE: &str = r#"{"cat_id":"cat_01","desired_revision":7,"outcome":{"grant":{"acquire_origin":{"kind":"normal","transition_id":"22222222222222222222222222222222"},"attachment_epoch":1,"attachment_id":"att_01","durability":"strict","head":{"generation":0,"root_hash":null,"root_object_id":null},"lease_expires_at":1720000060000,"size_bytes":4294967296,"volume_id":"vol_root"},"kind":"lease_granted"},"placement":{"kind":"assigned","node_id":"node_a","placement_epoch":3},"session":{"agent_instance_id":"44444444444444444444444444444444","agent_session_epoch":2,"node_boot_id":"33333333333333333333333333333333","node_id":"node_a"},"spec_digest":"sha256:d1dc4a8ff5e5d2fa4239eb14a6ac3e825a5070bd0d646762f723507f11ec54ad","version":1}"#;
 const VOLUME_TRANSITION_INVENTORY_STALE_WIRE: &str = r#"{"error":{"cat_id":"cat_01","code":"transition_precondition_failed","problem":"inventory_stale"},"message":"complete inventory is stale","version":1}"#;
 const VOLUME_TRANSITION_EVIDENCE_REQUEST_WIRE: &str = r#"{"authorization_id":"auth_01","session":{"agent_instance_id":"44444444444444444444444444444444","agent_session_epoch":2,"node_boot_id":"33333333333333333333333333333333","node_id":"node_a"},"version":1}"#;
 const CONSUMED_TAKEOVER_EVIDENCE_SUCCESS_WIRE: &str = r#"{"authorization":{"authorization":{"authorization_id":"auth_01","authorized_node_id":"node_a","desired_revision":8,"expected_attachment_id":"att_old","expected_epoch":3,"host_fence_event_id":"fence_01","kind":"takeover","lease_duration_ms":60000,"new_attachment_id":"att_new","new_placement_epoch":4,"not_after":1720000030000,"volume_id":"vol_root"},"state":{"kind":"consumed","receipt":{"authorization_id":"auth_01","consumed_at":1720000000000,"host_fence_event_id":"fence_01","kind":"takeover","new_attachment_id":"att_new","resulting_epoch":4,"resulting_head":{"generation":0,"root_hash":null,"root_object_id":null},"volume_id":"vol_root"}}},"authorization_id":"auth_01","current_volume":{"admin_state":{"kind":"active"},"durability":"strict","head":{"generation":0,"root_hash":null,"root_object_id":null},"last_transition":{"authorization_id":"auth_01","kind":"takeover"},"lease_epoch":4,"lease_expires_at":1720000060000,"lease_owner":"att_new","size_bytes":4294967296,"volume_id":"vol_root"},"delete_completion":null,"direct_successor_authorization":null,"session":{"agent_instance_id":"44444444444444444444444444444444","agent_session_epoch":2,"node_boot_id":"33333333333333333333333333333333","node_id":"node_a"},"version":1}"#;
@@ -508,7 +506,6 @@ fn observed_exact_vmm() -> serde_json::Value {
 fn start_runtime_checkpoint_value() -> serde_json::Value {
     let mut checkpoint: serde_json::Value = serde_json::from_str(CHECKPOINT_WIRE).unwrap();
     checkpoint["runtime_incarnation"] = "55555555555555555555555555555555".into();
-    checkpoint["spec_digest"] = START_RUNTIME_SPEC_DIGEST.into();
     checkpoint["networks"] = serde_json::json!([observed_runtime_network()]);
     checkpoint["volumes"] = serde_json::json!([observed_prepared_volume(false)]);
     checkpoint["step"] = start_runtime_step();
@@ -766,7 +763,7 @@ fn complete_observation_wire(projection: &str, claim: &str) -> Vec<u8> {
 fn nonempty_observation_value() -> serde_json::Value {
     serde_json::from_slice(&complete_observation_wire(
         NONEMPTY_INVENTORY_INPUT,
-        "sha256:41afca078d66aa835e402fe2a408a528e989c18ba25e5d7f4cc3ce4124df7dfe",
+        "sha256:749a8d16193a75a0bddb7d73788c78f416c4731c76d18ba66f085c6d9e2c98ec",
     ))
     .unwrap()
 }
@@ -1014,16 +1011,6 @@ fn fixed_desired_and_checkpoint_digests_match() {
     assert_eq!(
         handoff.predecessor_checkpoint_content_digest,
         checkpoint_content_digest(&provision).unwrap()
-    );
-
-    let mut start_desired: serde_json::Value = serde_json::from_str(DESIRED_DIGEST_INPUT).unwrap();
-    start_desired["runtime"]["guest_config_digest"] = GUEST_CONFIG_DIGEST.into();
-    start_desired["spec_digest"] = START_RUNTIME_SPEC_DIGEST.into();
-    let start_desired =
-        decode_desired_runtime_spec(&serde_json::to_vec(&start_desired).unwrap()).unwrap();
-    assert_eq!(
-        spec_digest(&start_desired).unwrap().as_str(),
-        START_RUNTIME_SPEC_DIGEST
     );
 
     for (name, shared, wire, expected_digest) in [
@@ -1342,7 +1329,7 @@ fn fixed_empty_inventory_digest_matches() {
 
 #[test]
 fn fixed_unexpected_inventory_digest_matches() {
-    let expected = "sha256:cfa4e65423289e7f61f400f00f1c9a11d1fb27c20d76a2c5653da1b125055f8f";
+    let expected = "sha256:19e506f92f1ae4fffed5951e2fdc6090e9c2398f2d8936bda414d911f79515f9";
     let observation = decode_node_observation(&complete_observation_wire(
         UNEXPECTED_INVENTORY_INPUT,
         expected,
@@ -1357,7 +1344,7 @@ fn fixed_unexpected_inventory_digest_matches() {
 
 #[test]
 fn fixed_nonempty_inventory_digest_matches() {
-    let expected = "sha256:41afca078d66aa835e402fe2a408a528e989c18ba25e5d7f4cc3ce4124df7dfe";
+    let expected = "sha256:749a8d16193a75a0bddb7d73788c78f416c4731c76d18ba66f085c6d9e2c98ec";
     let observation = decode_node_observation(&complete_observation_wire(
         NONEMPTY_INVENTORY_INPUT,
         expected,
@@ -1465,12 +1452,13 @@ fn a22_authorization_evidence_fixed_vectors_round_trip_exactly() {
 
 #[test]
 fn a22_mutation_fixed_vectors_round_trip_exactly() {
+    use cats_api::agent_registration::Ed25519RequestSigner;
     use sha2::{Digest, Sha256};
 
     assert_eq!(VOLUME_TRANSITION_NORMAL_REQUEST_WIRE.len(), 624);
     assert_eq!(
         hex::encode(Sha256::digest(VOLUME_TRANSITION_NORMAL_REQUEST_WIRE)),
-        "f8b0e2c8fbb23f456aadf2cae9e2ae7422ee8d35938edcc96ab83a97cce5f473"
+        "483155985a5ba66c732593f912fa0f2b4560a61d17d10323455d71c6609ccce6"
     );
     let request =
         decode_runtime_volume_transition_request(VOLUME_TRANSITION_NORMAL_REQUEST_WIRE.as_bytes())
@@ -1480,10 +1468,46 @@ fn a22_mutation_fixed_vectors_round_trip_exactly() {
         VOLUME_TRANSITION_NORMAL_REQUEST_WIRE.as_bytes()
     );
 
+    let mut private_key_der = hex::decode("302e020100300506032b657004220420").unwrap();
+    private_key_der.extend_from_slice(
+        &hex::decode("9d61b19deffd5a60ba844af492ec2cc44449c5697b326919703bac031cae7f60").unwrap(),
+    );
+    let signer =
+        Ed25519RequestSigner::from_pkcs8_der(Id::new("credential_a").unwrap(), &private_key_der)
+            .unwrap();
+    let proof = signer.sign(
+        RUNTIME_SPINE_METHOD,
+        RUNTIME_VOLUME_TRANSITION_PATH,
+        VOLUME_TRANSITION_NORMAL_REQUEST_WIRE.as_bytes(),
+    );
+    let mut signed_request = b"cats.internal-runtime.request.v1\0".to_vec();
+    for value in [
+        RUNTIME_SPINE_METHOD.as_bytes(),
+        RUNTIME_VOLUME_TRANSITION_PATH.as_bytes(),
+        cats_api::agent_registration::JSON_CONTENT_TYPE.as_bytes(),
+        b"credential_a",
+        signer.public_key_spki_der(),
+    ] {
+        signed_request.extend_from_slice(&(value.len() as u64).to_be_bytes());
+        signed_request.extend_from_slice(value);
+    }
+    signed_request
+        .extend_from_slice(&(VOLUME_TRANSITION_NORMAL_REQUEST_WIRE.len() as u64).to_be_bytes());
+    signed_request.extend_from_slice(&Sha256::digest(VOLUME_TRANSITION_NORMAL_REQUEST_WIRE));
+    assert_eq!(signed_request.len(), 228);
+    assert_eq!(
+        hex::encode(Sha256::digest(&signed_request)),
+        "dcd24abef5ca2cbeab1f7cb6cdda5de521311e915efaebf0ceee874b8f572426"
+    );
+    assert_eq!(
+        proof.signature,
+        "X-5PTXwKB808ndTKBhwHyjGShb4MXU9MWPW1sIx-j5pedhvyUpl96lvUVwoF-yvu_Z3nbGoGnYKQClnPXpH3Aw"
+    );
+
     assert_eq!(VOLUME_TRANSITION_LEASE_GRANTED_WIRE.len(), 713);
     assert_eq!(
         hex::encode(Sha256::digest(VOLUME_TRANSITION_LEASE_GRANTED_WIRE)),
-        "a823cbaa5fa2819e9a560753ce0428312bc59faeb219fb258aad1aba4ca10ef4"
+        "aec50eb85afc8ce4d9b2410189d1c2bb76461aae47a78561c10d7915a50edff1"
     );
     let success =
         decode_runtime_volume_transition_success(VOLUME_TRANSITION_LEASE_GRANTED_WIRE.as_bytes())
@@ -2017,7 +2041,7 @@ fn canonical_digests_ignore_member_order_and_bind_exact_projections() {
         checkpoint_content_digest(&changed_checkpoint).unwrap()
     );
 
-    let claim = "sha256:41afca078d66aa835e402fe2a408a528e989c18ba25e5d7f4cc3ce4124df7dfe";
+    let claim = "sha256:749a8d16193a75a0bddb7d73788c78f416c4731c76d18ba66f085c6d9e2c98ec";
     let observation =
         decode_node_observation(&complete_observation_wire(NONEMPTY_INVENTORY_INPUT, claim))
             .unwrap();
@@ -2629,7 +2653,7 @@ fn cleanup_release_intrinsic_constraints_are_bidirectional() {
 
 #[test]
 fn partial_observation_requires_applied_desired_for_every_reported_runtime() {
-    let claim = "sha256:41afca078d66aa835e402fe2a408a528e989c18ba25e5d7f4cc3ce4124df7dfe";
+    let claim = "sha256:749a8d16193a75a0bddb7d73788c78f416c4731c76d18ba66f085c6d9e2c98ec";
     let mut observation: serde_json::Value =
         serde_json::from_slice(&complete_observation_wire(NONEMPTY_INVENTORY_INPUT, claim))
             .unwrap();
@@ -2660,7 +2684,7 @@ fn every_reconcile_step_host_reuses_the_same_cross_field_validator() {
     let mut checkpoint: serde_json::Value = serde_json::from_str(CHECKPOINT_WIRE).unwrap();
     checkpoint["step"] = invalid_step.clone();
 
-    let claim = "sha256:41afca078d66aa835e402fe2a408a528e989c18ba25e5d7f4cc3ce4124df7dfe";
+    let claim = "sha256:749a8d16193a75a0bddb7d73788c78f416c4731c76d18ba66f085c6d9e2c98ec";
     let observation: serde_json::Value =
         serde_json::from_slice(&complete_observation_wire(NONEMPTY_INVENTORY_INPUT, claim))
             .unwrap();
@@ -2855,24 +2879,77 @@ fn prepare_network_and_start_runtime_round_trip_with_closed_inputs() {
 }
 
 #[test]
-fn prepared_device_authority_survives_prepare_network_redecode_into_start_runtime() {
-    let mut prepare_device: serde_json::Value = serde_json::from_str(CHECKPOINT_WIRE).unwrap();
-    prepare_device["step"] = prepare_device_step();
+fn fixed_running_launch_chain_preserves_desired_binding_and_prepared_authority() {
+    let desired = decode_desired_runtime_spec(SHARED_DESIRED_WIRE.as_bytes()).unwrap();
+    assert_eq!(desired.target, RuntimeTarget::Running);
+    assert_eq!(
+        desired.runtime.guest_config_digest.as_str(),
+        GUEST_CONFIG_DIGEST
+    );
+
+    let provision = decode_runtime_checkpoint(PROVISION_ROOT_CHECKPOINT_WIRE.as_bytes()).unwrap();
     let prepare_device =
-        decode_runtime_checkpoint(&serde_json::to_vec(&prepare_device).unwrap()).unwrap();
+        decode_runtime_checkpoint(PREPARE_DEVICE_CHECKPOINT_WIRE.as_bytes()).unwrap();
+    let prepare_network =
+        decode_runtime_checkpoint(PREPARE_NETWORK_CHECKPOINT_WIRE.as_bytes()).unwrap();
+    let start_runtime =
+        decode_runtime_checkpoint(START_RUNTIME_CHECKPOINT_WIRE.as_bytes()).unwrap();
+    for (name, checkpoint) in [
+        ("provision_root_image", &provision),
+        ("prepare_device", &prepare_device),
+        ("prepare_network", &prepare_network),
+        ("start_runtime", &start_runtime),
+    ] {
+        assert_eq!(checkpoint.cat_id, desired.cat_id, "{name}/cat_id");
+        assert_eq!(
+            checkpoint.desired_revision, desired.desired_revision,
+            "{name}/desired_revision",
+        );
+        assert_eq!(
+            checkpoint.spec_digest, desired.spec_digest,
+            "{name}/spec_digest",
+        );
+        assert_eq!(
+            checkpoint.node_id, desired.placement.node_id,
+            "{name}/node_id"
+        );
+        assert_eq!(
+            checkpoint.placement_epoch, desired.placement.placement_epoch,
+            "{name}/placement_epoch",
+        );
+    }
+
+    // A same-revision Cold Desired is a different spec and cannot authorize
+    // any member of this current-Running launch chain.
+    let mut cold = desired.clone();
+    cold.target = RuntimeTarget::Cold;
+    cold.spec_digest = spec_digest(&cold).unwrap();
+    assert_eq!(cold.desired_revision, desired.desired_revision);
+    assert_ne!(cold.spec_digest, desired.spec_digest);
+    assert_ne!(cold.spec_digest, start_runtime.spec_digest);
+
     let prepare_device: serde_json::Value =
         serde_json::from_slice(&encode_runtime_checkpoint(&prepare_device).unwrap()).unwrap();
+    let fixed_prepare_network: serde_json::Value =
+        serde_json::from_str(PREPARE_NETWORK_CHECKPOINT_WIRE.as_ref()).unwrap();
+    let fixed_start_runtime: serde_json::Value =
+        serde_json::from_str(START_RUNTIME_CHECKPOINT_WIRE.as_ref()).unwrap();
     let mut retained = prepare_device["step"].clone();
     retained.as_object_mut().unwrap().remove("kind");
 
-    let mut prepare_network = prepare_network_checkpoint_value();
-    prepare_network["step"]["devices"] = serde_json::json!([retained.clone()]);
+    // Construct the successor from the full predecessor, replacing only the
+    // step. This catches a fixture that silently changes revision/spec or
+    // placement while copying only the nested device authority.
+    let mut prepare_network_successor = prepare_device.clone();
+    prepare_network_successor["step"] = fixed_prepare_network["step"].clone();
     let prepare_network =
-        decode_runtime_checkpoint(&serde_json::to_vec(&prepare_network).unwrap()).unwrap();
+        decode_runtime_checkpoint(&serde_json::to_vec(&prepare_network_successor).unwrap())
+            .unwrap();
     let prepare_network_wire = encode_runtime_checkpoint(&prepare_network).unwrap();
     let prepare_network = decode_runtime_checkpoint(&prepare_network_wire).unwrap();
     let prepare_network: serde_json::Value =
         serde_json::from_slice(&encode_runtime_checkpoint(&prepare_network).unwrap()).unwrap();
+    assert_eq!(prepare_network, fixed_prepare_network);
     let retained_after_restart = prepare_network["step"]["devices"][0].clone();
 
     assert_eq!(retained_after_restart, retained);
@@ -2910,9 +2987,22 @@ fn prepared_device_authority_survives_prepare_network_redecode_into_start_runtim
         })
     );
 
-    let mut start = start_runtime_checkpoint_value();
-    start["step"]["devices"] = serde_json::json!([retained_after_restart]);
-    decode_runtime_checkpoint(&serde_json::to_vec(&start).unwrap()).unwrap();
+    // The next CAS starts from the complete PrepareNetwork predecessor. Only
+    // the accepted exact tap, the freshly reserved incarnation and the
+    // StartRuntime step are new; the current Desired binding remains exact.
+    let mut start_successor = prepare_network;
+    start_successor["runtime_incarnation"] = fixed_start_runtime["runtime_incarnation"].clone();
+    start_successor["networks"] = fixed_start_runtime["networks"].clone();
+    start_successor["step"] = fixed_start_runtime["step"].clone();
+    assert_eq!(
+        start_successor["step"]["devices"][0],
+        retained_after_restart,
+    );
+    let start_runtime =
+        decode_runtime_checkpoint(&serde_json::to_vec(&start_successor).unwrap()).unwrap();
+    let start_runtime: serde_json::Value =
+        serde_json::from_slice(&encode_runtime_checkpoint(&start_runtime).unwrap()).unwrap();
+    assert_eq!(start_runtime, fixed_start_runtime);
 }
 
 #[test]
@@ -4683,7 +4773,7 @@ fn close_gate_is_one_exact_narrow_step_in_every_wire_host() {
 
     let observation: serde_json::Value = serde_json::from_slice(&complete_observation_wire(
         NONEMPTY_INVENTORY_INPUT,
-        "sha256:41afca078d66aa835e402fe2a408a528e989c18ba25e5d7f4cc3ce4124df7dfe",
+        "sha256:749a8d16193a75a0bddb7d73788c78f416c4731c76d18ba66f085c6d9e2c98ec",
     ))
     .unwrap();
     let mut observed_runtime_and_checkpoint = observation.clone();
@@ -4974,7 +5064,7 @@ fn every_remote_head_host_reuses_the_same_validator() {
 
     let observation: serde_json::Value = serde_json::from_slice(&complete_observation_wire(
         NONEMPTY_INVENTORY_INPUT,
-        "sha256:41afca078d66aa835e402fe2a408a528e989c18ba25e5d7f4cc3ce4124df7dfe",
+        "sha256:749a8d16193a75a0bddb7d73788c78f416c4731c76d18ba66f085c6d9e2c98ec",
     ))
     .unwrap();
 
@@ -5344,7 +5434,7 @@ fn every_readable_residue_lineage_host_reuses_the_same_validator() {
     reversed_generations["lineage"]["remote_durable_generation"] = 5.into();
     invalid_lineages.push(("reversed_generations", reversed_generations));
 
-    let claim = "sha256:41afca078d66aa835e402fe2a408a528e989c18ba25e5d7f4cc3ce4124df7dfe";
+    let claim = "sha256:749a8d16193a75a0bddb7d73788c78f416c4731c76d18ba66f085c6d9e2c98ec";
     for (invariant, residue) in invalid_lineages {
         let observation: serde_json::Value =
             serde_json::from_slice(&complete_observation_wire(NONEMPTY_INVENTORY_INPUT, claim))
@@ -5449,7 +5539,7 @@ fn runtime_condition_fact_conflicts_point_to_the_runtime_common_object() {
         }),
     ];
 
-    let claim = "sha256:41afca078d66aa835e402fe2a408a528e989c18ba25e5d7f4cc3ce4124df7dfe";
+    let claim = "sha256:749a8d16193a75a0bddb7d73788c78f416c4731c76d18ba66f085c6d9e2c98ec";
     for condition in reasons {
         let mut observation: serde_json::Value =
             serde_json::from_slice(&complete_observation_wire(NONEMPTY_INVENTORY_INPUT, claim))
@@ -5673,7 +5763,7 @@ fn array_identity_order_and_numeric_indices_are_deterministic() {
 
 #[test]
 fn multiplicity_facts_cannot_be_split_across_duplicate_items() {
-    let claim = "sha256:41afca078d66aa835e402fe2a408a528e989c18ba25e5d7f4cc3ce4124df7dfe";
+    let claim = "sha256:749a8d16193a75a0bddb7d73788c78f416c4731c76d18ba66f085c6d9e2c98ec";
     let base: serde_json::Value =
         serde_json::from_slice(&complete_observation_wire(NONEMPTY_INVENTORY_INPUT, claim))
             .unwrap();
@@ -6088,7 +6178,7 @@ fn operation_terminal_bindings_and_removed_tag_fail_closed() {
 
 #[test]
 fn removed_contract_error_condition_tag_is_not_a_compatibility_surface() {
-    let claim = "sha256:41afca078d66aa835e402fe2a408a528e989c18ba25e5d7f4cc3ce4124df7dfe";
+    let claim = "sha256:749a8d16193a75a0bddb7d73788c78f416c4731c76d18ba66f085c6d9e2c98ec";
     let mut observation: serde_json::Value =
         serde_json::from_slice(&complete_observation_wire(NONEMPTY_INVENTORY_INPUT, claim))
             .unwrap();
