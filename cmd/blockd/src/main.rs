@@ -15,7 +15,7 @@ use std::time::{Duration, Instant};
 use anyhow::{bail, Context, Result};
 use cats_api::blockd::{BlockdControlCommand, BlockdControlResponse};
 use cats_api::runtime_reconciliation::{
-    Id, ProvisionRootImageDefiniteConflictProblem, ProvisionRootImageError,
+    HostPath, Id, ProvisionRootImageDefiniteConflictProblem, ProvisionRootImageError,
     ProvisionRootImageRequest, ProvisionRootImageResult, RandomId128, Sha256Digest,
 };
 use cats_blockd::engine::{ChunkEngine, EngineConfig, ProvisionRootImageEffectError};
@@ -1845,6 +1845,16 @@ fn ensure_before(deadline: Instant) -> Option<()> {
         .map(|_| ())
 }
 
+fn validate_handoff_listener_path(path: &Path, label: &str) -> Result<()> {
+    let wire = path
+        .to_str()
+        .with_context(|| format!("serving-from-handoff {label} path is not UTF-8"))?;
+    HostPath::new(wire.to_owned()).with_context(|| {
+        format!("serving-from-handoff {label} path is not one canonical absolute HostPath")
+    })?;
+    Ok(())
+}
+
 fn validate_process_mode(args: &Args) -> Result<()> {
     let direct_serving = args.authorized_serving_spec.is_some();
     let handoff_serving = args.authorized_serving_handoff_record.is_some();
@@ -1955,6 +1965,15 @@ fn validate_process_mode(args: &Args) -> Result<()> {
             (true, false) | (false, true)
         ) {
             bail!("authorized serving input requires exactly one NBD or vhost-user frontend");
+        }
+        if handoff_serving {
+            validate_handoff_listener_path(control, "control listener")?;
+            let frontend = args
+                .listen_unix
+                .as_deref()
+                .or(args.listen_vhost_user.as_deref())
+                .context("serving-from-handoff requires one active frontend")?;
+            validate_handoff_listener_path(frontend, "Guest frontend")?;
         }
         if args.listen_unix.as_ref() == Some(control)
             || args.listen_vhost_user.as_ref() == Some(control)
@@ -2141,6 +2160,8 @@ mod tests {
         TargetControlLocalStateIdentity,
     };
     use cats_storage::authority::{AttachmentLineageIdentity, VolumeDurability};
+    use std::ffi::OsString;
+    use std::os::unix::ffi::OsStringExt as _;
     use std::os::unix::fs::{symlink, PermissionsExt as _};
 
     const TARGET_VOLUME_ID: &str = "vol_target";
@@ -3361,6 +3382,35 @@ mod tests {
 
         let same_name = parse_target(&["--listen-unix", "/runtime/control.sock"]);
         assert!(validate_process_mode(&same_name).is_err());
+    }
+
+    #[test]
+    fn serving_from_handoff_rejects_noncanonical_active_listener_paths_before_effect() {
+        let invalid_paths = [
+            PathBuf::from("relative.sock"),
+            PathBuf::from("/runtime/./listener.sock"),
+            PathBuf::from("/runtime/child/../listener.sock"),
+            PathBuf::from("/runtime//listener.sock"),
+            PathBuf::from("/runtime/listener.sock/"),
+            PathBuf::from(OsString::from_vec(b"/runtime/non-utf8-\xff.sock".to_vec())),
+        ];
+        for invalid in invalid_paths {
+            let control = serving_handoff_fixture();
+            let mut args = control.args();
+            args.listen_control = Some(invalid.clone());
+            assert_authorized_serving_rejected(&args);
+
+            let kernel_nbd = serving_handoff_fixture();
+            let mut args = kernel_nbd.args();
+            args.listen_unix = Some(invalid.clone());
+            assert_authorized_serving_rejected(&args);
+
+            let vhost_user = serving_handoff_fixture();
+            let mut args = vhost_user.args();
+            args.listen_unix = None;
+            args.listen_vhost_user = Some(invalid);
+            assert_authorized_serving_rejected(&args);
+        }
     }
 
     #[test]
