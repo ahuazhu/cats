@@ -1982,6 +1982,7 @@ fn errno() -> libc::c_int {
 #[cfg(test)]
 mod tests {
     use std::collections::VecDeque;
+    use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Mutex;
     use std::time::{Duration, Instant};
 
@@ -2135,6 +2136,12 @@ mod tests {
         calls: Arc<Mutex<Vec<MetadataAuthorityPageRequest>>>,
     }
 
+    #[derive(Debug)]
+    struct BoundaryMetadataAuthorityInventoryPort {
+        total_records: usize,
+        calls: Arc<AtomicUsize>,
+    }
+
     impl metadata_authority_reader_sealed::Sealed for ScriptedMetadataAuthorityInventoryPort {}
 
     impl MetadataAuthorityInventoryPort for ScriptedMetadataAuthorityInventoryPort {
@@ -2154,6 +2161,70 @@ mod tests {
                 .pop_front()
                 .unwrap_or(MetadataAuthorityPageRead::Unavailable))
         }
+    }
+
+    impl metadata_authority_reader_sealed::Sealed for BoundaryMetadataAuthorityInventoryPort {}
+
+    impl MetadataAuthorityInventoryPort for BoundaryMetadataAuthorityInventoryPort {
+        fn read_page(
+            &self,
+            request: &MetadataAuthorityPageRequest,
+            deadline: Instant,
+            context: &RuntimeInventoryScanContext,
+        ) -> anyhow::Result<MetadataAuthorityPageRead> {
+            assert_eq!(deadline, context.deadline());
+            context.check_active()?;
+            assert_eq!(request.limit, METADATA_AUTHORITY_PAGE_LIMIT);
+            let start = request.after_volume_id.as_ref().map_or(0, |volume_id| {
+                volume_id
+                    .as_str()
+                    .strip_prefix("vol_")
+                    .unwrap()
+                    .parse::<usize>()
+                    .unwrap()
+                    + 1
+            });
+            let end = start.saturating_add(request.limit).min(self.total_records);
+            let records = (start..end)
+                .map(|index| MetadataAuthorityIndexedRecord {
+                    record: unowned_record(&boundary_volume_id(index), 4_096),
+                    owner_node_id: None,
+                })
+                .collect::<Vec<_>>();
+            let next_after_volume_id =
+                (end < self.total_records).then(|| Id::new(boundary_volume_id(end - 1)).unwrap());
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            Ok(MetadataAuthorityPageRead::Page(MetadataAuthorityPage {
+                node_id: request.node_id.clone(),
+                desired_read_position: request.desired_read_position,
+                snapshot_read_position: Sequence::new(77).unwrap(),
+                records,
+                next_after_volume_id,
+            }))
+        }
+    }
+
+    fn boundary_volume_id(index: usize) -> String {
+        format!("vol_{index:05}")
+    }
+
+    fn boundary_volume_ids(count: usize) -> BTreeSet<Id> {
+        (0..count)
+            .map(|index| Id::new(boundary_volume_id(index)).unwrap())
+            .collect()
+    }
+
+    fn boundary_metadata_inventory_port(
+        total_records: usize,
+    ) -> (Arc<dyn MetadataAuthorityInventoryPort>, Arc<AtomicUsize>) {
+        let calls = Arc::new(AtomicUsize::new(0));
+        (
+            Arc::new(BoundaryMetadataAuthorityInventoryPort {
+                total_records,
+                calls: calls.clone(),
+            }),
+            calls,
+        )
     }
 
     fn scripted_metadata_inventory_port(
@@ -2676,6 +2747,54 @@ mod tests {
                 "{case}"
             );
         }
+    }
+
+    #[test]
+    fn paged_node_snapshot_accepts_exact_maximum_record_count() {
+        let context = context_until(Instant::now() + Duration::from_secs(30));
+        let candidates = boundary_volume_ids(METADATA_AUTHORITY_MAX_RECORDS);
+        let (port, calls) = boundary_metadata_inventory_port(METADATA_AUTHORITY_MAX_RECORDS);
+        let reader = PagedMetadataAuthorityReader::new(port);
+
+        let MetadataAuthorityCandidateInventory::Records(records) = reader
+            .read_candidates(
+                &Id::new("node_a").unwrap(),
+                &candidates,
+                context.deadline(),
+                &context,
+            )
+            .unwrap()
+        else {
+            panic!("the exact frozen Node-owned volume bound must be accepted")
+        };
+
+        assert_eq!(records.len(), METADATA_AUTHORITY_MAX_RECORDS);
+        assert!(records.keys().eq(candidates.iter()));
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            METADATA_AUTHORITY_MAX_RECORDS.div_ceil(METADATA_AUTHORITY_PAGE_LIMIT)
+        );
+    }
+
+    #[test]
+    fn paged_node_snapshot_rejects_maximum_plus_one_before_reading_authority() {
+        let context = context_until(Instant::now() + Duration::from_secs(30));
+        let candidates = boundary_volume_ids(METADATA_AUTHORITY_MAX_RECORDS + 1);
+        let (port, calls) = boundary_metadata_inventory_port(METADATA_AUTHORITY_MAX_RECORDS + 1);
+        let reader = PagedMetadataAuthorityReader::new(port);
+
+        assert_eq!(
+            reader
+                .read_candidates(
+                    &Id::new("node_a").unwrap(),
+                    &candidates,
+                    context.deadline(),
+                    &context,
+                )
+                .unwrap(),
+            MetadataAuthorityCandidateInventory::Unavailable
+        );
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
     }
 
     #[test]
