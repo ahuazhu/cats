@@ -16,12 +16,22 @@ const PROVISION_ROOT_CHECKPOINT_DIGEST: &str =
     "sha256:f4f5073559b8918c500ac706bb395afa9958f309ae8783ff96f980be60d37f2e";
 const PREPARE_DEVICE_CHECKPOINT_DIGEST: &str =
     "sha256:7ea5745da9320827d9e7370a03e1d8743c53bcd7ee88fa86c701ec5d98ed9ed8";
+const PREPARE_NETWORK_CHECKPOINT_DIGEST: &str =
+    "sha256:ab1b7e329ae084752c635224a9c60db7284d2b405a9d58f45a9ba693a21c5256";
+const START_RUNTIME_SPEC_DIGEST: &str =
+    "sha256:aad5d63a496f538b00b9eb27bbe1133ec83f5b238b14cb4e19d604fdcd99a6f8";
+const START_RUNTIME_CHECKPOINT_DIGEST: &str =
+    "sha256:47485c632e606032e9b866cded68152f0b6ccc265a2b649a3b77dd329e5b12c2";
 const SHARED_DESIRED_WIRE: &str =
     include_str!("../../testdata/runtime-reconciliation-v1-desired.json");
 const SHARED_PROVISION_ROOT_CHECKPOINT_WIRE: &str =
     include_str!("../../testdata/runtime-reconciliation-v1-provision-checkpoint.json");
 const SHARED_PREPARE_DEVICE_CHECKPOINT_WIRE: &str =
     include_str!("../../testdata/runtime-reconciliation-v1-prepare-device-checkpoint.json");
+const SHARED_PREPARE_NETWORK_CHECKPOINT_WIRE: &str =
+    include_str!("../../testdata/runtime-reconciliation-v1-prepare-network-checkpoint.json");
+const SHARED_START_RUNTIME_CHECKPOINT_WIRE: &str =
+    include_str!("../../testdata/runtime-reconciliation-v1-start-runtime-checkpoint.json");
 
 const DESIRED_DIGEST_INPUT: &str = r#"{"cat_id":"cat_01","desired_revision":7,"endpoints":[{"endpoint_id":"ep_01","hostname":"app.example.test","protocol":"http","route_epoch":9,"target_port":8080}],"placement":{"kind":"assigned","node_id":"node_a","placement_epoch":3},"runtime":{"boot_image_digest":"sha256:0000000000000000000000000000000000000000000000000000000000000000","guest_config_digest":"sha256:1111111111111111111111111111111111111111111111111111111111111111","memory_bytes":2147483648,"network_config":{"gateway_ipv4":"10.240.0.5","guest_ipv4":"10.240.0.6","guest_mac":"02:ca:0a:f0:00:06","kind":"isolated_ipv4","network_id":"net_01","prefix_length":30},"vcpus":2},"target":"cold","transition":{"kind":"cancel_and_drain"},"version":1,"volumes":[{"access":"read_write_once","acquire":{"expected_unowned_epoch":0,"kind":"normal","transition_id":"22222222222222222222222222222222"},"attachment_id":"att_01","disk_id":"disk_root","disk_kind":"root","disposition":{"kind":"retain"},"durability":"strict","guest_device":{"serial":"cats-root","slot":0},"mount":null,"size_bytes":4294967296,"volume_id":"vol_root","volume_intent_id":"vint_root"}],"workspace_id":"ws_01"}"#;
 
@@ -35,6 +45,16 @@ static PREPARE_DEVICE_CHECKPOINT_WIRE: LazyLock<&'static str> = LazyLock::new(||
     SHARED_PREPARE_DEVICE_CHECKPOINT_WIRE
         .strip_suffix('\n')
         .unwrap_or(SHARED_PREPARE_DEVICE_CHECKPOINT_WIRE)
+});
+static PREPARE_NETWORK_CHECKPOINT_WIRE: LazyLock<&'static str> = LazyLock::new(|| {
+    SHARED_PREPARE_NETWORK_CHECKPOINT_WIRE
+        .strip_suffix('\n')
+        .unwrap_or(SHARED_PREPARE_NETWORK_CHECKPOINT_WIRE)
+});
+static START_RUNTIME_CHECKPOINT_WIRE: LazyLock<&'static str> = LazyLock::new(|| {
+    SHARED_START_RUNTIME_CHECKPOINT_WIRE
+        .strip_suffix('\n')
+        .unwrap_or(SHARED_START_RUNTIME_CHECKPOINT_WIRE)
 });
 
 const EMPTY_INVENTORY_INPUT: &str = r#"{"agent_instance_id":"44444444444444444444444444444444","agent_session_epoch":2,"inventory_epoch":4,"inventory_read_position":12,"node_boot_id":"33333333333333333333333333333333","node_id":"node_a","residue":[],"runtimes":[],"version":1}"#;
@@ -212,6 +232,160 @@ fn prepare_device_step() -> serde_json::Value {
             "queue_size": 256,
         },
     })
+}
+
+fn runtime_network_identity() -> serde_json::Value {
+    serde_json::json!({
+        "network_config": {
+            "kind": "isolated_ipv4",
+            "network_id": "net_01",
+            "guest_mac": "02:ca:0a:f0:00:06",
+            "guest_ipv4": "10.240.0.6",
+            "prefix_length": 30,
+            "gateway_ipv4": "10.240.0.5",
+        },
+        "tap_name": "cats0001",
+        "ownership_token": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    })
+}
+
+fn runtime_launch_artifact(path: &str, length: u64, content_sha256: &str) -> serde_json::Value {
+    serde_json::json!({
+        "path": path,
+        "length": length,
+        "content_sha256": content_sha256,
+    })
+}
+
+fn bind_start_runtime_guest_profile(step: &mut serde_json::Value) {
+    let kernel_digest = step["boot"]["kernel"]["content_sha256"].as_str().unwrap();
+    let initramfs_digest = step["boot"]["initramfs"]
+        .as_object()
+        .map(|artifact| artifact["content_sha256"].as_str().unwrap());
+    let kernel_cmdline = step["boot"]["kernel_cmdline"].as_str().unwrap();
+    let profile = GuestRuntimeProfileReceipt {
+        version: ContractVersion::V1,
+        kernel_digest: Sha256Digest::new(kernel_digest).unwrap(),
+        initramfs_digest: initramfs_digest.map(|digest| Sha256Digest::new(digest).unwrap()),
+        kernel_cmdline: AsciiText::new(kernel_cmdline).unwrap(),
+        guest_agent_protocol_version: ContractVersion::V1,
+    };
+    step["guest_config_digest"] = guest_config_digest(&profile).unwrap().as_str().into();
+}
+
+fn start_runtime_step() -> serde_json::Value {
+    let mut step = serde_json::json!({
+        "kind": "start_runtime",
+        "runtime_incarnation": "55555555555555555555555555555555",
+        "scope_id": "cats-vmm-55555555555555555555555555555555.service",
+        "launcher_executable": runtime_launch_artifact(
+            "/usr/libexec/cats-vmm-launcher",
+            1_048_576,
+            "sha256:3333333333333333333333333333333333333333333333333333333333333333",
+        ),
+        "boot": {
+            "vmm_executable": runtime_launch_artifact(
+                "/usr/bin/cloud-hypervisor",
+                33_554_432,
+                "sha256:4444444444444444444444444444444444444444444444444444444444444444",
+            ),
+            "kernel": runtime_launch_artifact(
+                "/opt/cats/guest/vmlinuz",
+                16_777_216,
+                ZERO_DIGEST,
+            ),
+            "initramfs": runtime_launch_artifact(
+                "/opt/cats/guest/initramfs.img",
+                8_388_608,
+                "sha256:1111111111111111111111111111111111111111111111111111111111111111",
+            ),
+            "kernel_cmdline": "console=ttyS0 root=/dev/vda rw clocksource=kvm-clock",
+        },
+        "process_identity_token": "66666666666666666666666666666666",
+        "vcpus": 2,
+        "memory_bytes": 2_147_483_648_u64,
+        "boot_image_digest": ZERO_DIGEST,
+        "guest_config_digest": ZERO_DIGEST,
+        "api_socket_path": "/run/cats/cat_01/vmm-api.sock",
+        "vsock_socket_path": "/run/cats/cat_01/vmm-vsock.sock",
+        "guest_cid": 3,
+        "memory_file_path": "/var/lib/cats/cat_01/memory.bin",
+        "serial_log_path": "/var/log/cats/cat_01/serial.log",
+        "vmm_log_path": "/var/log/cats/cat_01/vmm.log",
+        "network": runtime_network_identity(),
+        "devices": [{
+            "kind": "vhost_user_blk",
+            "volume_id": "vol_root",
+            "guest_device": {
+                "serial": "cats-root",
+                "slot": 0,
+            },
+            "socket_path": "/run/cats/cat_01/root-vhost.sock",
+            "ownership_token": "88888888888888888888888888888888",
+            "queues": 2,
+            "queue_size": 256,
+        }],
+    });
+    bind_start_runtime_guest_profile(&mut step);
+    step
+}
+
+fn observed_runtime_network() -> serde_json::Value {
+    let network = runtime_network_identity();
+    serde_json::json!({
+        "kind": network["network_config"]["kind"],
+        "network_id": network["network_config"]["network_id"],
+        "guest_mac": network["network_config"]["guest_mac"],
+        "guest_ipv4": network["network_config"]["guest_ipv4"],
+        "prefix_length": network["network_config"]["prefix_length"],
+        "gateway_ipv4": network["network_config"]["gateway_ipv4"],
+        "tap_name": network["tap_name"],
+        "ownership_token": {
+            "kind": "valid",
+            "ownership_token": network["ownership_token"],
+        },
+    })
+}
+
+fn start_runtime_checkpoint_value() -> serde_json::Value {
+    let mut checkpoint: serde_json::Value = serde_json::from_str(CHECKPOINT_WIRE).unwrap();
+    let projection: serde_json::Value = serde_json::from_str(NONEMPTY_INVENTORY_INPUT).unwrap();
+    let mut volume = projection["runtimes"][0]["volumes"][0].clone();
+    volume["devices"] = serde_json::json!([{
+        "kind": "vhost_user_blk",
+        "guest_device": {"serial": "cats-root", "slot": 0},
+        "socket_path": "/run/cats/cat_01/root-vhost.sock",
+        "ownership_token": {
+            "kind": "valid",
+            "ownership_token": "88888888888888888888888888888888",
+        },
+    }]);
+    checkpoint["runtime_incarnation"] = "55555555555555555555555555555555".into();
+    checkpoint["spec_digest"] = START_RUNTIME_SPEC_DIGEST.into();
+    checkpoint["networks"] = serde_json::json!([observed_runtime_network()]);
+    checkpoint["volumes"] = serde_json::json!([volume]);
+    checkpoint["step"] = start_runtime_step();
+    checkpoint
+}
+
+fn set_start_runtime_kernel_device_path(checkpoint: &mut serde_json::Value, device_path: &str) {
+    checkpoint["step"]["devices"] = serde_json::json!([{
+        "kind": "kernel_nbd",
+        "volume_id": "vol_root",
+        "guest_device": {"serial": "cats-root", "slot": 0},
+        "device_path": device_path,
+        "ownership_token": "88888888888888888888888888888888",
+        "direct": true,
+    }]);
+    checkpoint["volumes"][0]["devices"] = serde_json::json!([{
+        "kind": "kernel_nbd",
+        "guest_device": {"serial": "cats-root", "slot": 0},
+        "device_path": device_path,
+        "ownership_token": {
+            "kind": "valid",
+            "ownership_token": "88888888888888888888888888888888",
+        },
+    }]);
 }
 
 fn direct_prepare_device_step(purpose: &str, head: serde_json::Value) -> serde_json::Value {
@@ -685,6 +859,46 @@ fn fixed_desired_and_checkpoint_digests_match() {
         handoff.predecessor_checkpoint_content_digest,
         checkpoint_content_digest(&provision).unwrap()
     );
+
+    let mut start_desired: serde_json::Value = serde_json::from_str(DESIRED_DIGEST_INPUT).unwrap();
+    start_desired["runtime"]["guest_config_digest"] = GUEST_CONFIG_DIGEST.into();
+    start_desired["spec_digest"] = START_RUNTIME_SPEC_DIGEST.into();
+    let start_desired =
+        decode_desired_runtime_spec(&serde_json::to_vec(&start_desired).unwrap()).unwrap();
+    assert_eq!(
+        spec_digest(&start_desired).unwrap().as_str(),
+        START_RUNTIME_SPEC_DIGEST
+    );
+
+    for (name, shared, wire, expected_digest) in [
+        (
+            "prepare_network",
+            SHARED_PREPARE_NETWORK_CHECKPOINT_WIRE,
+            *PREPARE_NETWORK_CHECKPOINT_WIRE,
+            PREPARE_NETWORK_CHECKPOINT_DIGEST,
+        ),
+        (
+            "start_runtime",
+            SHARED_START_RUNTIME_CHECKPOINT_WIRE,
+            *START_RUNTIME_CHECKPOINT_WIRE,
+            START_RUNTIME_CHECKPOINT_DIGEST,
+        ),
+    ] {
+        assert_eq!(wire.as_bytes(), literal_file_bytes(shared), "{name}");
+        let checkpoint = decode_runtime_checkpoint(wire.as_bytes())
+            .unwrap_or_else(|error| panic!("{name}: {error:?}"));
+        assert_eq!(canonical_json(&checkpoint), wire.as_bytes(), "{name}");
+        assert_eq!(
+            encode_runtime_checkpoint(&checkpoint).unwrap(),
+            wire.as_bytes(),
+            "{name}",
+        );
+        assert_eq!(
+            checkpoint_content_digest(&checkpoint).unwrap().as_str(),
+            expected_digest,
+            "{name}",
+        );
+    }
 }
 
 #[test]
@@ -2428,6 +2642,669 @@ fn volume_and_gate_reconcile_steps_round_trip_without_copied_authority_payloads(
             "{name}",
         );
     }
+}
+
+#[test]
+fn prepare_network_and_start_runtime_round_trip_with_closed_inputs() {
+    let mut prepare: serde_json::Value = serde_json::from_str(CHECKPOINT_WIRE).unwrap();
+    prepare["step"] = serde_json::json!({
+        "kind": "prepare_network",
+        "network": runtime_network_identity(),
+    });
+    let decoded = decode_runtime_checkpoint(&serde_json::to_vec(&prepare).unwrap()).unwrap();
+    assert!(matches!(decoded.step, ReconcileStep::PrepareNetwork { .. }));
+    assert_eq!(
+        serde_json::from_slice::<serde_json::Value>(&encode_runtime_checkpoint(&decoded).unwrap())
+            .unwrap(),
+        prepare,
+    );
+
+    // The same checkpoint is also a valid idempotent adoption reservation once
+    // a fresh full inventory projects the exact tap.
+    prepare["networks"] = serde_json::json!([observed_runtime_network()]);
+    decode_runtime_checkpoint(&serde_json::to_vec(&prepare).unwrap()).unwrap();
+
+    let start = start_runtime_checkpoint_value();
+    let decoded = decode_runtime_checkpoint(&serde_json::to_vec(&start).unwrap()).unwrap();
+    assert!(matches!(
+        decoded.step,
+        ReconcileStep::StartRuntime {
+            guest_cid: 3,
+            vcpus: 2,
+            memory_bytes: 2_147_483_648,
+            ref boot,
+            ref devices,
+            ..
+        } if boot.initramfs.is_some()
+            && boot.vmm_executable.path.as_str() == "/usr/bin/cloud-hypervisor"
+            && devices.len() == 1
+    ));
+    assert_eq!(
+        serde_json::from_slice::<serde_json::Value>(&encode_runtime_checkpoint(&decoded).unwrap())
+            .unwrap(),
+        start,
+    );
+
+    let mut kernel = start_runtime_checkpoint_value();
+    set_start_runtime_kernel_device_path(&mut kernel, "/dev/nbd0");
+    kernel["step"]["boot"]["initramfs"] = serde_json::Value::Null;
+    bind_start_runtime_guest_profile(&mut kernel["step"]);
+    decode_runtime_checkpoint(&serde_json::to_vec(&kernel).unwrap()).unwrap();
+}
+
+#[test]
+fn prepare_network_rejects_non_exact_or_unsafe_identity() {
+    let cases = [
+        ("tap_too_long", "tap_name", "abcdefghijklmnop"),
+        ("tap_unsafe", "tap_name", "cats/tap"),
+        ("wrong_subnet", "guest_ipv4", "10.240.0.10"),
+        ("multicast_mac", "guest_mac", "03:ca:0a:f0:00:06"),
+    ];
+    for (name, field, value) in cases {
+        let mut checkpoint: serde_json::Value = serde_json::from_str(CHECKPOINT_WIRE).unwrap();
+        checkpoint["step"] = serde_json::json!({
+            "kind": "prepare_network",
+            "network": runtime_network_identity(),
+        });
+        if field == "tap_name" {
+            checkpoint["step"]["network"][field] = value.into();
+        } else {
+            checkpoint["step"]["network"]["network_config"][field] = value.into();
+        }
+        let error = reject_checkpoint(&serde_json::to_vec(&checkpoint).unwrap());
+        let expected = match field {
+            "tap_name" => "/step/network/tap_name",
+            "guest_mac" => "/step/network/network_config/guest_mac",
+            _ => "/step/network/network_config",
+        };
+        assert_eq!(malformed(&error).0.as_str(), expected, "{name}");
+        assert_eq!(
+            malformed(&error).1,
+            MalformedProblem::InvalidValue,
+            "{name}"
+        );
+    }
+
+    let mut mismatch: serde_json::Value = serde_json::from_str(CHECKPOINT_WIRE).unwrap();
+    mismatch["step"] = serde_json::json!({
+        "kind": "prepare_network",
+        "network": runtime_network_identity(),
+    });
+    mismatch["networks"] = serde_json::json!([observed_runtime_network()]);
+    mismatch["networks"][0]["tap_name"] = "foreign0".into();
+    let error = reject_checkpoint(&serde_json::to_vec(&mismatch).unwrap());
+    assert_eq!(malformed(&error).0.as_str(), "/networks");
+    assert_eq!(malformed(&error).1, MalformedProblem::InvalidValue);
+
+    let mut missing = mismatch;
+    missing["networks"] = serde_json::json!([]);
+    missing["step"]["network"]
+        .as_object_mut()
+        .unwrap()
+        .remove("ownership_token");
+    let error = reject_checkpoint(&serde_json::to_vec(&missing).unwrap());
+    assert_eq!(
+        malformed(&error).0.as_str(),
+        "/step/network/ownership_token"
+    );
+    assert_eq!(malformed(&error).1, MalformedProblem::MissingField);
+
+    let mut prepare: serde_json::Value = serde_json::from_str(CHECKPOINT_WIRE).unwrap();
+    prepare["step"] = serde_json::json!({
+        "kind": "prepare_network",
+        "network": runtime_network_identity(),
+    });
+    let projection: serde_json::Value = serde_json::from_str(NONEMPTY_INVENTORY_INPUT).unwrap();
+    let mut vmm = prepare.clone();
+    vmm["networks"] = serde_json::json!([]);
+    vmm["processes"] = serde_json::json!([projection["runtimes"][0]["processes"][0].clone()]);
+    let error = reject_checkpoint(&serde_json::to_vec(&vmm).unwrap());
+    assert_eq!(malformed(&error).0.as_str(), "/processes");
+    assert_eq!(malformed(&error).1, MalformedProblem::InvalidValue);
+
+    let mut process_alias = prepare.clone();
+    process_alias["networks"] = serde_json::json!([]);
+    process_alias["processes"] =
+        serde_json::json!([projection["runtimes"][0]["processes"][1].clone()]);
+    process_alias["step"]["network"]["ownership_token"] = "77777777777777777777777777777777".into();
+    let error = reject_checkpoint(&serde_json::to_vec(&process_alias).unwrap());
+    assert_eq!(
+        malformed(&error).0.as_str(),
+        "/step/network/ownership_token"
+    );
+    assert_eq!(malformed(&error).1, MalformedProblem::InvalidValue);
+
+    let mut device_alias = start_runtime_checkpoint_value();
+    device_alias["runtime_incarnation"] = serde_json::Value::Null;
+    device_alias["networks"] = serde_json::json!([]);
+    device_alias["step"] = serde_json::json!({
+        "kind": "prepare_network",
+        "network": runtime_network_identity(),
+    });
+    device_alias["step"]["network"]["ownership_token"] = "88888888888888888888888888888888".into();
+    let error = reject_checkpoint(&serde_json::to_vec(&device_alias).unwrap());
+    assert_eq!(
+        malformed(&error).0.as_str(),
+        "/step/network/ownership_token"
+    );
+    assert_eq!(malformed(&error).1, MalformedProblem::InvalidValue);
+
+    let mut incarnation = prepare;
+    incarnation["networks"] = serde_json::json!([]);
+    incarnation["runtime_incarnation"] = "12121212121212121212121212121212".into();
+    let error = reject_checkpoint(&serde_json::to_vec(&incarnation).unwrap());
+    assert_eq!(malformed(&error).0.as_str(), "/runtime_incarnation");
+    assert_eq!(malformed(&error).1, MalformedProblem::InvalidValue);
+}
+
+#[test]
+fn start_runtime_closes_cid_artifact_shape_tokens_paths_and_devices() {
+    for guest_cid in [3_u64, u64::from(u32::MAX - 1)] {
+        let mut checkpoint = start_runtime_checkpoint_value();
+        checkpoint["step"]["guest_cid"] = guest_cid.into();
+        decode_runtime_checkpoint(&serde_json::to_vec(&checkpoint).unwrap()).unwrap();
+    }
+    for guest_cid in [2_u64, u64::from(u32::MAX)] {
+        let mut checkpoint = start_runtime_checkpoint_value();
+        checkpoint["step"]["guest_cid"] = guest_cid.into();
+        let error = reject_checkpoint(&serde_json::to_vec(&checkpoint).unwrap());
+        assert_eq!(malformed(&error).0.as_str(), "/step/guest_cid");
+        assert_eq!(malformed(&error).1, MalformedProblem::InvalidValue);
+    }
+
+    let mut cases = Vec::new();
+
+    for (name, scope_id) in [
+        ("foreign_unit", "dbus.service"),
+        ("empty_managed_body", "cats-.service"),
+        (
+            "ambiguous_managed_body",
+            "cats-vmm-55555555555555555555555555555555-.service",
+        ),
+    ] {
+        let mut invalid_scope = start_runtime_checkpoint_value();
+        invalid_scope["step"]["scope_id"] = scope_id.into();
+        cases.push((
+            name,
+            invalid_scope,
+            "/step/scope_id",
+            MalformedProblem::InvalidValue,
+        ));
+    }
+
+    let mut missing_artifact = start_runtime_checkpoint_value();
+    missing_artifact["step"]["boot"]["kernel"]
+        .as_object_mut()
+        .unwrap()
+        .remove("content_sha256");
+    cases.push((
+        "missing_artifact_digest",
+        missing_artifact,
+        "/step/boot/kernel/content_sha256",
+        MalformedProblem::MissingField,
+    ));
+
+    let mut zero_artifact = start_runtime_checkpoint_value();
+    zero_artifact["step"]["boot"]["kernel"]["length"] = 0.into();
+    cases.push((
+        "zero_artifact_length",
+        zero_artifact,
+        "/step/boot/kernel/length",
+        MalformedProblem::InvalidValue,
+    ));
+
+    let mut kernel_digest_drift = start_runtime_checkpoint_value();
+    kernel_digest_drift["step"]["boot"]["kernel"]["content_sha256"] =
+        "sha256:2222222222222222222222222222222222222222222222222222222222222222".into();
+    cases.push((
+        "kernel_digest_guest_profile_drift",
+        kernel_digest_drift,
+        "/step/guest_config_digest",
+        MalformedProblem::InvalidValue,
+    ));
+
+    let mut initramfs_digest_drift = start_runtime_checkpoint_value();
+    initramfs_digest_drift["step"]["boot"]["initramfs"]["content_sha256"] =
+        "sha256:2222222222222222222222222222222222222222222222222222222222222222".into();
+    cases.push((
+        "initramfs_digest_guest_profile_drift",
+        initramfs_digest_drift,
+        "/step/guest_config_digest",
+        MalformedProblem::InvalidValue,
+    ));
+
+    let mut cmdline_drift = start_runtime_checkpoint_value();
+    cmdline_drift["step"]["boot"]["kernel_cmdline"] =
+        "console=ttyS0 root=/dev/vda ro clocksource=kvm-clock".into();
+    cases.push((
+        "cmdline_guest_profile_drift",
+        cmdline_drift,
+        "/step/guest_config_digest",
+        MalformedProblem::InvalidValue,
+    ));
+
+    let mut empty_cmdline = start_runtime_checkpoint_value();
+    empty_cmdline["step"]["boot"]["kernel_cmdline"] = "".into();
+    cases.push((
+        "empty_cmdline",
+        empty_cmdline,
+        "/step/boot/kernel_cmdline",
+        MalformedProblem::InvalidValue,
+    ));
+
+    let mut low_memory = start_runtime_checkpoint_value();
+    low_memory["step"]["memory_bytes"] = 127_926_272_u64.into();
+    cases.push((
+        "low_memory",
+        low_memory,
+        "/step/memory_bytes",
+        MalformedProblem::InvalidValue,
+    ));
+
+    let mut unaligned_memory = start_runtime_checkpoint_value();
+    unaligned_memory["step"]["memory_bytes"] = 134_217_729_u64.into();
+    cases.push((
+        "unaligned_memory",
+        unaligned_memory,
+        "/step/memory_bytes",
+        MalformedProblem::InvalidValue,
+    ));
+
+    let mut process_alias = start_runtime_checkpoint_value();
+    process_alias["step"]["process_identity_token"] =
+        process_alias["step"]["runtime_incarnation"].clone();
+    cases.push((
+        "process_incarnation_alias",
+        process_alias,
+        "/step/process_identity_token",
+        MalformedProblem::InvalidValue,
+    ));
+
+    let mut network_alias = start_runtime_checkpoint_value();
+    network_alias["step"]["network"]["ownership_token"] =
+        network_alias["step"]["runtime_incarnation"].clone();
+    network_alias["networks"][0]["ownership_token"]["ownership_token"] =
+        network_alias["step"]["runtime_incarnation"].clone();
+    cases.push((
+        "network_incarnation_alias",
+        network_alias,
+        "/step/network/ownership_token",
+        MalformedProblem::InvalidValue,
+    ));
+
+    let mut device_alias = start_runtime_checkpoint_value();
+    device_alias["step"]["devices"][0]["ownership_token"] =
+        device_alias["step"]["runtime_incarnation"].clone();
+    device_alias["volumes"][0]["devices"][0]["ownership_token"]["ownership_token"] =
+        device_alias["step"]["runtime_incarnation"].clone();
+    cases.push((
+        "device_incarnation_alias",
+        device_alias,
+        "/step/devices",
+        MalformedProblem::InvalidValue,
+    ));
+
+    let mut launch_path_alias = start_runtime_checkpoint_value();
+    launch_path_alias["step"]["vmm_log_path"] =
+        launch_path_alias["step"]["serial_log_path"].clone();
+    cases.push((
+        "launch_path_alias",
+        launch_path_alias,
+        "/step",
+        MalformedProblem::InvalidValue,
+    ));
+
+    let mut empty_devices = start_runtime_checkpoint_value();
+    empty_devices["step"]["devices"] = serde_json::json!([]);
+    empty_devices["volumes"] = serde_json::json!([]);
+    cases.push((
+        "empty_devices",
+        empty_devices,
+        "/step/devices",
+        MalformedProblem::InvalidValue,
+    ));
+
+    let mut gapped_device = start_runtime_checkpoint_value();
+    gapped_device["step"]["devices"][0]["guest_device"]["slot"] = 1.into();
+    gapped_device["volumes"][0]["devices"][0]["guest_device"]["slot"] = 1.into();
+    cases.push((
+        "gapped_device",
+        gapped_device,
+        "/step/devices",
+        MalformedProblem::InvalidValue,
+    ));
+
+    let mut bad_queue_size = start_runtime_checkpoint_value();
+    bad_queue_size["step"]["devices"][0]["queue_size"] = 3.into();
+    cases.push((
+        "bad_queue_size",
+        bad_queue_size,
+        "/step/devices",
+        MalformedProblem::InvalidValue,
+    ));
+
+    let mut too_many_queues = start_runtime_checkpoint_value();
+    too_many_queues["step"]["devices"][0]["queues"] = 3.into();
+    cases.push((
+        "queues_exceed_vcpus",
+        too_many_queues,
+        "/step/devices",
+        MalformedProblem::InvalidValue,
+    ));
+
+    let mut device_path_alias = start_runtime_checkpoint_value();
+    device_path_alias["step"]["devices"][0]["socket_path"] =
+        device_path_alias["step"]["api_socket_path"].clone();
+    device_path_alias["volumes"][0]["devices"][0]["socket_path"] =
+        device_path_alias["step"]["api_socket_path"].clone();
+    cases.push((
+        "device_launch_path_alias",
+        device_path_alias,
+        "/step/devices",
+        MalformedProblem::InvalidValue,
+    ));
+
+    for (name, checkpoint, pointer, problem) in cases {
+        let error = reject_checkpoint(&serde_json::to_vec(&checkpoint).unwrap());
+        assert_eq!(malformed(&error).0.as_str(), pointer, "{name}");
+        assert_eq!(malformed(&error).1, problem, "{name}");
+    }
+}
+
+#[test]
+fn start_runtime_checkpoint_requires_exact_projected_reservations() {
+    let mut cases = Vec::new();
+
+    let mut incarnation = start_runtime_checkpoint_value();
+    incarnation["runtime_incarnation"] = "12121212121212121212121212121212".into();
+    cases.push(("incarnation", incarnation, "/runtime_incarnation"));
+
+    let mut network = start_runtime_checkpoint_value();
+    network["networks"][0]["tap_name"] = "foreign0".into();
+    cases.push(("network", network, "/networks"));
+
+    let mut device = start_runtime_checkpoint_value();
+    device["volumes"][0]["devices"][0]["ownership_token"]["ownership_token"] =
+        "99999999999999999999999999999999".into();
+    cases.push(("device", device, "/volumes"));
+
+    let mut missing_volume = start_runtime_checkpoint_value();
+    missing_volume["volumes"] = serde_json::json!([]);
+    cases.push(("missing_volume", missing_volume, "/volumes"));
+
+    for (name, checkpoint, pointer) in cases {
+        let error = reject_checkpoint(&serde_json::to_vec(&checkpoint).unwrap());
+        assert_eq!(malformed(&error).0.as_str(), pointer, "{name}");
+        assert_eq!(
+            malformed(&error).1,
+            MalformedProblem::InvalidValue,
+            "{name}"
+        );
+    }
+
+    let mut missing = start_runtime_checkpoint_value();
+    missing["step"].as_object_mut().unwrap().remove("boot");
+    let error = reject_checkpoint(&serde_json::to_vec(&missing).unwrap());
+    assert_eq!(malformed(&error).0.as_str(), "/step/boot");
+    assert_eq!(malformed(&error).1, MalformedProblem::MissingField);
+
+    let old_shape = serde_json::json!({
+        "kind": "start_runtime",
+        "runtime_incarnation": "55555555555555555555555555555555",
+        "scope_id": "cats-vmm-55555555555555555555555555555555.service",
+        "process_identity_token": "66666666666666666666666666666666",
+    });
+    let mut old = start_runtime_checkpoint_value();
+    old["step"] = old_shape;
+    let error = reject_checkpoint(&serde_json::to_vec(&old).unwrap());
+    assert_eq!(malformed(&error).1, MalformedProblem::MissingField);
+}
+
+#[test]
+fn start_runtime_requires_one_root_at_slot_zero_and_only_persistent_followers() {
+    let mut wrong_root = start_runtime_checkpoint_value();
+    wrong_root["volumes"][0]["disk_kind"] = "persistent".into();
+    let error = reject_checkpoint(&serde_json::to_vec(&wrong_root).unwrap());
+    assert_eq!(malformed(&error).0.as_str(), "/volumes");
+    assert_eq!(malformed(&error).1, MalformedProblem::InvalidValue);
+
+    let mut two_devices = start_runtime_checkpoint_value();
+    two_devices["step"]["devices"]
+        .as_array_mut()
+        .unwrap()
+        .push(serde_json::json!({
+            "kind": "vhost_user_blk",
+            "volume_id": "vol_zdata",
+            "guest_device": {"serial": "cats-data", "slot": 1},
+            "socket_path": "/run/cats/cat_01/data-vhost.sock",
+            "ownership_token": "99999999999999999999999999999999",
+            "queues": 2,
+            "queue_size": 256,
+        }));
+    let mut follower = two_devices["volumes"][0].clone();
+    follower["volume_intent_id"] = "vint_zdata".into();
+    follower["disk_id"] = "disk_zdata".into();
+    follower["volume_id"] = "vol_zdata".into();
+    follower["disk_kind"] = "persistent".into();
+    follower["local_lineages"][0]["data_directory"] = "/var/lib/cats/vol_zdata".into();
+    follower["devices"] = serde_json::json!([{
+        "kind": "vhost_user_blk",
+        "guest_device": {"serial": "cats-data", "slot": 1},
+        "socket_path": "/run/cats/cat_01/data-vhost.sock",
+        "ownership_token": {
+            "kind": "valid",
+            "ownership_token": "99999999999999999999999999999999",
+        },
+    }]);
+    two_devices["volumes"]
+        .as_array_mut()
+        .unwrap()
+        .push(follower);
+    decode_runtime_checkpoint(&serde_json::to_vec(&two_devices).unwrap()).unwrap();
+
+    two_devices["volumes"][1]["disk_kind"] = "root".into();
+    let error = reject_checkpoint(&serde_json::to_vec(&two_devices).unwrap());
+    assert_eq!(malformed(&error).0.as_str(), "/volumes");
+    assert_eq!(malformed(&error).1, MalformedProblem::InvalidValue);
+}
+
+#[test]
+fn start_runtime_launch_paths_do_not_alias_checkpoint_resources() {
+    let projection: serde_json::Value = serde_json::from_str(NONEMPTY_INVENTORY_INPUT).unwrap();
+    let blockd = projection["runtimes"][0]["processes"][1].clone();
+    let mount = projection["runtimes"][0]["mounts"][0].clone();
+
+    let mut process_alias = start_runtime_checkpoint_value();
+    process_alias["processes"] = serde_json::json!([blockd.clone()]);
+    process_alias["step"]["api_socket_path"] =
+        process_alias["processes"][0]["control_socket_path"].clone();
+
+    let mut vhost_control_alias = start_runtime_checkpoint_value();
+    vhost_control_alias["processes"] = serde_json::json!([blockd.clone()]);
+    let blockd_control_path = vhost_control_alias["processes"][0]["control_socket_path"].clone();
+    vhost_control_alias["step"]["devices"][0]["socket_path"] = blockd_control_path.clone();
+    vhost_control_alias["volumes"][0]["devices"][0]["socket_path"] = blockd_control_path;
+
+    let mut process_token_alias = start_runtime_checkpoint_value();
+    process_token_alias["processes"] = serde_json::json!([blockd.clone()]);
+    process_token_alias["step"]["process_identity_token"] =
+        "77777777777777777777777777777777".into();
+
+    let mut network_token_alias = start_runtime_checkpoint_value();
+    network_token_alias["processes"] = serde_json::json!([blockd.clone()]);
+    network_token_alias["step"]["network"]["ownership_token"] =
+        "77777777777777777777777777777777".into();
+    network_token_alias["networks"][0]["ownership_token"]["ownership_token"] =
+        "77777777777777777777777777777777".into();
+
+    let mut device_token_alias = start_runtime_checkpoint_value();
+    device_token_alias["processes"] = serde_json::json!([blockd.clone()]);
+    device_token_alias["step"]["devices"][0]["ownership_token"] =
+        "77777777777777777777777777777777".into();
+    device_token_alias["volumes"][0]["devices"][0]["ownership_token"]["ownership_token"] =
+        "77777777777777777777777777777777".into();
+
+    let mut incarnation_token_alias = start_runtime_checkpoint_value();
+    incarnation_token_alias["processes"] = serde_json::json!([blockd.clone()]);
+    incarnation_token_alias["runtime_incarnation"] = "77777777777777777777777777777777".into();
+    incarnation_token_alias["step"]["runtime_incarnation"] =
+        "77777777777777777777777777777777".into();
+    incarnation_token_alias["step"]["scope_id"] =
+        "cats-vmm-77777777777777777777777777777777.service".into();
+
+    let mut scope_alias = start_runtime_checkpoint_value();
+    scope_alias["processes"] = serde_json::json!([blockd]);
+    scope_alias["processes"][0]["scope_id"] = scope_alias["step"]["scope_id"].clone();
+
+    let mut lineage_alias = start_runtime_checkpoint_value();
+    lineage_alias["step"]["memory_file_path"] =
+        lineage_alias["volumes"][0]["local_lineages"][0]["data_directory"].clone();
+
+    let mut nbd_lineage_alias = start_runtime_checkpoint_value();
+    let lineage_path = nbd_lineage_alias["volumes"][0]["local_lineages"][0]["data_directory"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    set_start_runtime_kernel_device_path(&mut nbd_lineage_alias, &lineage_path);
+
+    let mut mount_source_alias = start_runtime_checkpoint_value();
+    mount_source_alias["mounts"] = serde_json::json!([mount.clone()]);
+    mount_source_alias["step"]["serial_log_path"] = mount["source_path"].clone();
+
+    let mut nbd_mount_source_alias = start_runtime_checkpoint_value();
+    nbd_mount_source_alias["mounts"] = serde_json::json!([mount.clone()]);
+    set_start_runtime_kernel_device_path(
+        &mut nbd_mount_source_alias,
+        mount["source_path"].as_str().unwrap(),
+    );
+
+    let mut mount_target_alias = start_runtime_checkpoint_value();
+    mount_target_alias["mounts"] = serde_json::json!([mount.clone()]);
+    mount_target_alias["step"]["vmm_log_path"] = mount["mount_path"].clone();
+
+    let mut nbd_mount_target_alias = start_runtime_checkpoint_value();
+    nbd_mount_target_alias["mounts"] = serde_json::json!([mount.clone()]);
+    set_start_runtime_kernel_device_path(
+        &mut nbd_mount_target_alias,
+        mount["mount_path"].as_str().unwrap(),
+    );
+
+    for (name, checkpoint) in [
+        ("blockd_control_socket", process_alias),
+        ("vhost_blockd_control_socket", vhost_control_alias),
+        ("blockd_process_token", process_token_alias),
+        ("blockd_network_token", network_token_alias),
+        ("blockd_device_token", device_token_alias),
+        ("blockd_incarnation_token", incarnation_token_alias),
+        ("blockd_scope", scope_alias),
+        ("lineage_data_directory", lineage_alias),
+        ("nbd_lineage_data_directory", nbd_lineage_alias),
+        ("mount_source", mount_source_alias),
+        ("nbd_mount_source", nbd_mount_source_alias),
+        ("mount_target", mount_target_alias),
+        ("nbd_mount_target", nbd_mount_target_alias),
+    ] {
+        let error = reject_checkpoint(&serde_json::to_vec(&checkpoint).unwrap());
+        assert_eq!(malformed(&error).0.as_str(), "/step", "{name}");
+        assert_eq!(
+            malformed(&error).1,
+            MalformedProblem::InvalidValue,
+            "{name}"
+        );
+    }
+}
+
+#[test]
+fn start_runtime_allows_only_an_exact_already_started_vmm() {
+    let mut checkpoint = start_runtime_checkpoint_value();
+    checkpoint["processes"] = serde_json::json!([{
+        "role": {
+            "kind": "vmm",
+            "runtime_incarnation": "55555555555555555555555555555555",
+        },
+        "process_id": 1001,
+        "process_start_time_ticks": 9001,
+        "executable_path": "/usr/bin/cloud-hypervisor",
+        "scope_id": "cats-vmm-55555555555555555555555555555555.service",
+        "control_socket_path": "/run/cats/cat_01/vmm-api.sock",
+        "state": "running",
+        "ownership_token": {
+            "kind": "valid",
+            "ownership_token": "66666666666666666666666666666666",
+        },
+        "control_handshake": {"kind": "verified"},
+        "observed_vm_shape": {
+            "vcpus": 2,
+            "memory_bytes": 2_147_483_648_u64,
+            "boot_image_digest": ZERO_DIGEST,
+            "guest_config_digest": GUEST_CONFIG_DIGEST,
+        },
+    }]);
+    decode_runtime_checkpoint(&serde_json::to_vec(&checkpoint).unwrap()).unwrap();
+
+    let mutations = [
+        ("process_token", "ownership_token"),
+        ("executable", "executable_path"),
+        ("control_socket", "control_socket_path"),
+        ("shape", "observed_vm_shape"),
+    ];
+    for (name, mutation) in mutations {
+        let mut foreign = checkpoint.clone();
+        match mutation {
+            "ownership_token" => {
+                foreign["processes"][0]["ownership_token"]["ownership_token"] =
+                    "99999999999999999999999999999999".into()
+            }
+            "executable_path" => {
+                foreign["processes"][0]["executable_path"] = "/usr/bin/foreign-vmm".into()
+            }
+            "control_socket_path" => {
+                foreign["processes"][0]["control_socket_path"] =
+                    "/run/cats/cat_01/foreign.sock".into()
+            }
+            "observed_vm_shape" => foreign["processes"][0]["observed_vm_shape"]["vcpus"] = 1.into(),
+            _ => unreachable!(),
+        }
+        let error = reject_checkpoint(&serde_json::to_vec(&foreign).unwrap());
+        assert_eq!(malformed(&error).0.as_str(), "/processes", "{name}");
+        assert_eq!(
+            malformed(&error).1,
+            MalformedProblem::InvalidValue,
+            "{name}"
+        );
+    }
+}
+
+#[test]
+fn v1_guest_transport_uses_the_checkpointed_cid_and_fixed_port() {
+    let mut checkpoint = start_runtime_checkpoint_value();
+    checkpoint["guest_transport"] = serde_json::json!({
+        "kind": "vsock_ready",
+        "runtime_incarnation": "55555555555555555555555555555555",
+        "guest_cid": 3,
+        "guest_port": GUEST_AGENT_VSOCK_PORT_V1,
+        "guest_agent_protocol_version": 1,
+        "guest_boot_id": "cccccccccccccccccccccccccccccccc",
+    });
+    decode_runtime_checkpoint(&serde_json::to_vec(&checkpoint).unwrap()).unwrap();
+
+    let mut wrong_cid = checkpoint.clone();
+    wrong_cid["guest_transport"]["guest_cid"] = 4.into();
+    let error = reject_checkpoint(&serde_json::to_vec(&wrong_cid).unwrap());
+    assert_eq!(malformed(&error).0.as_str(), "/guest_transport");
+    assert_eq!(malformed(&error).1, MalformedProblem::InvalidValue);
+
+    let mut any_cid = checkpoint.clone();
+    any_cid["guest_transport"]["guest_cid"] = u64::from(u32::MAX).into();
+    let error = reject_checkpoint(&serde_json::to_vec(&any_cid).unwrap());
+    assert_eq!(malformed(&error).0.as_str(), "/guest_transport/guest_cid");
+    assert_eq!(malformed(&error).1, MalformedProblem::InvalidValue);
+
+    let mut wrong_port = checkpoint;
+    wrong_port["guest_transport"]["guest_port"] = 5_001.into();
+    let error = reject_checkpoint(&serde_json::to_vec(&wrong_port).unwrap());
+    assert_eq!(malformed(&error).0.as_str(), "/guest_transport/guest_port");
+    assert_eq!(malformed(&error).1, MalformedProblem::InvalidValue);
 }
 
 #[test]

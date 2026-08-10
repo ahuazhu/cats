@@ -7,6 +7,9 @@ use serde::{Deserialize, Deserializer, Serialize};
 
 pub(crate) const MAX_WIRE_INTEGER: u64 = i64::MAX as u64;
 
+/// Fixed Guest Agent AF_VSOCK port for the clean-slate V1 runtime contract.
+pub const GUEST_AGENT_VSOCK_PORT_V1: u16 = 5_000;
+
 macro_rules! integer_newtype {
     ($name:ident, $minimum:expr) => {
         #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize)]
@@ -1080,6 +1083,74 @@ pub enum PrepareDeviceFrontend {
     },
 }
 
+/// The durable identity reserved before creating or adopting one Host tap.
+///
+/// The ownership token is independent from the logical network ID and from
+/// every process/device token.  The full network configuration is retained so
+/// a later VMM launch never has to reconstruct Guest addressing from a tap
+/// name or from Node-local defaults.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RuntimeNetworkIdentity {
+    pub network_config: NetworkConfig,
+    pub tap_name: Id,
+    pub ownership_token: RandomId128,
+}
+
+/// Immutable identity of one Host file consumed by a VMM launch.
+///
+/// The path is the canonical installed path selected by the Node's runtime
+/// configuration.  Length and content digest make the checkpoint usable after
+/// an Agent restart without treating that mutable path as sufficient proof.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RuntimeLaunchArtifact {
+    pub path: HostPath,
+    pub length: WireU64,
+    pub content_sha256: Sha256Digest,
+}
+
+/// Exact executable and Guest boot bytes selected for one fresh VMM boot.
+///
+/// This is deliberately independent of any particular installer or release
+/// manifest.  The producer records the files actually selected by its
+/// installed runtime configuration and a fixed safe reader must re-open and
+/// compare all members before launch or adoption.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct VmmBootProvenance {
+    pub vmm_executable: RuntimeLaunchArtifact,
+    pub kernel: RuntimeLaunchArtifact,
+    pub initramfs: Option<RuntimeLaunchArtifact>,
+    pub kernel_cmdline: AsciiText,
+}
+
+/// One exact, already prepared block frontend consumed by a VMM launch.
+///
+/// This deliberately retains the frontend parameters that are present in the
+/// preceding `prepare_device` step but are not part of public
+/// `ObservedDevice` evidence.  A StartRuntime checkpoint therefore remains
+/// independently interpretable after an Agent restart.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+pub enum VmmDeviceInput {
+    KernelNbd {
+        volume_id: Id,
+        guest_device: GuestDeviceIdentity,
+        device_path: HostPath,
+        ownership_token: RandomId128,
+        direct: bool,
+    },
+    VhostUserBlk {
+        volume_id: Id,
+        guest_device: GuestDeviceIdentity,
+        socket_path: HostPath,
+        ownership_token: RandomId128,
+        queues: u16,
+        queue_size: u16,
+    },
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 pub enum ReconcileStep {
@@ -1131,6 +1202,9 @@ pub enum ReconcileStep {
         serving_process: ServingBlockdIdentity,
         frontend: PrepareDeviceFrontend,
     },
+    PrepareNetwork {
+        network: RuntimeNetworkIdentity,
+    },
     FormatFilesystem {
         volume_id: Id,
         attachment_id: Id,
@@ -1159,7 +1233,23 @@ pub enum ReconcileStep {
     StartRuntime {
         runtime_incarnation: RandomId128,
         scope_id: Id,
+        /// Boxed only to keep the closed ReconcileStep/Condition enums bounded;
+        /// serde still emits the exact nested object defined by the wire spec.
+        launcher_executable: Box<RuntimeLaunchArtifact>,
+        boot: Box<VmmBootProvenance>,
         process_identity_token: RandomId128,
+        vcpus: u32,
+        memory_bytes: u64,
+        boot_image_digest: Sha256Digest,
+        guest_config_digest: Sha256Digest,
+        api_socket_path: HostPath,
+        vsock_socket_path: HostPath,
+        guest_cid: u32,
+        memory_file_path: HostPath,
+        serial_log_path: HostPath,
+        vmm_log_path: HostPath,
+        network: Box<RuntimeNetworkIdentity>,
+        devices: Vec<VmmDeviceInput>,
     },
     DrainPublish {
         volume_id: Id,

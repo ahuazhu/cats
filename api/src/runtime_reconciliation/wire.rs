@@ -6,7 +6,8 @@ use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
 use serde::{de::DeserializeOwned, Serialize};
 
 use super::canonical::{
-    unchecked_inventory_digest, unchecked_key_ring_digest, unchecked_spec_digest, value_bytes,
+    guest_config_digest, unchecked_inventory_digest, unchecked_key_ring_digest,
+    unchecked_spec_digest, value_bytes,
 };
 use super::types::*;
 
@@ -38,6 +39,8 @@ pub const RUNTIME_NODE_AUTHORITY_APPLY_MAX_WIRE_BYTES: usize = 65_536;
 pub const RUNTIME_NODE_AUTHORITY_APPLY_RESULT_MAX_WIRE_BYTES: usize = 16_384;
 pub const RUNTIME_PROVISIONER_TRUST_BUNDLE_MAX_WIRE_BYTES: usize = 16_384;
 pub const RUNTIME_PROVISIONER_ACTIVE_SET_MAX_WIRE_BYTES: usize = 16_384;
+
+const MEBIBYTE: u64 = 1_048_576;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum PathSegment {
@@ -1737,6 +1740,17 @@ fn guest_device_schema() -> Schema {
     ])
 }
 
+fn network_config_schema() -> Schema {
+    object(vec![
+        field("kind", closed(&["isolated_ipv4"])),
+        field("network_id", id()),
+        field("guest_mac", string(StringRule::Mac)),
+        field("guest_ipv4", string(StringRule::Ipv4)),
+        field("prefix_length", literal_number(30)),
+        field("gateway_ipv4", string(StringRule::Ipv4)),
+    ])
+}
+
 fn volume_acquire_schema() -> Schema {
     union(
         "kind",
@@ -1851,17 +1865,7 @@ fn desired_runtime_spec_schema() -> Schema {
                 field("memory_bytes", number(1, MAX_WIRE_INTEGER)),
                 field("boot_image_digest", digest()),
                 field("guest_config_digest", digest()),
-                field(
-                    "network_config",
-                    object(vec![
-                        field("kind", closed(&["isolated_ipv4"])),
-                        field("network_id", id()),
-                        field("guest_mac", string(StringRule::Mac)),
-                        field("guest_ipv4", string(StringRule::Ipv4)),
-                        field("prefix_length", literal_number(30)),
-                        field("gateway_ipv4", string(StringRule::Ipv4)),
-                    ]),
-                ),
+                field("network_config", network_config_schema()),
             ]),
         ),
         field("volumes", array(volume_intent_schema(), 64)),
@@ -2664,6 +2668,60 @@ fn prepare_device_frontend_schema() -> Schema {
     )
 }
 
+fn runtime_network_identity_schema() -> Schema {
+    object(vec![
+        field("network_config", network_config_schema()),
+        field("tap_name", id()),
+        field("ownership_token", random_id()),
+    ])
+}
+
+fn runtime_launch_artifact_schema() -> Schema {
+    object(vec![
+        field("path", string(StringRule::HostPath)),
+        field("length", number(1, MAX_WIRE_INTEGER)),
+        field("content_sha256", digest()),
+    ])
+}
+
+fn vmm_boot_provenance_schema() -> Schema {
+    object(vec![
+        field("vmm_executable", runtime_launch_artifact_schema()),
+        field("kernel", runtime_launch_artifact_schema()),
+        field("initramfs", nullable(runtime_launch_artifact_schema())),
+        field("kernel_cmdline", string(StringRule::AsciiText)),
+    ])
+}
+
+fn vmm_device_input_schema() -> Schema {
+    union(
+        "kind",
+        vec![
+            variant(
+                "kernel_nbd",
+                vec![
+                    field("volume_id", id()),
+                    field("guest_device", guest_device_schema()),
+                    field("device_path", string(StringRule::HostPath)),
+                    field("ownership_token", random_id()),
+                    field("direct", Schema::Bool),
+                ],
+            ),
+            variant(
+                "vhost_user_blk",
+                vec![
+                    field("volume_id", id()),
+                    field("guest_device", guest_device_schema()),
+                    field("socket_path", string(StringRule::HostPath)),
+                    field("ownership_token", random_id()),
+                    field("queues", number(1, 64)),
+                    field("queue_size", number(2, 32_768)),
+                ],
+            ),
+        ],
+    )
+}
+
 fn reconcile_step_schema() -> Schema {
     union(
         "kind",
@@ -2717,6 +2775,10 @@ fn reconcile_step_schema() -> Schema {
                 ],
             ),
             variant(
+                "prepare_network",
+                vec![field("network", runtime_network_identity_schema())],
+            ),
+            variant(
                 "format_filesystem",
                 vec![
                     field("volume_id", id()),
@@ -2758,7 +2820,21 @@ fn reconcile_step_schema() -> Schema {
                 vec![
                     field("runtime_incarnation", random_id()),
                     field("scope_id", id()),
+                    field("launcher_executable", runtime_launch_artifact_schema()),
+                    field("boot", vmm_boot_provenance_schema()),
                     field("process_identity_token", random_id()),
+                    field("vcpus", number(1, u64::from(u32::MAX))),
+                    field("memory_bytes", number(1, MAX_WIRE_INTEGER)),
+                    field("boot_image_digest", digest()),
+                    field("guest_config_digest", digest()),
+                    field("api_socket_path", string(StringRule::HostPath)),
+                    field("vsock_socket_path", string(StringRule::HostPath)),
+                    field("guest_cid", number(3, u64::from(u32::MAX - 1))),
+                    field("memory_file_path", string(StringRule::HostPath)),
+                    field("serial_log_path", string(StringRule::HostPath)),
+                    field("vmm_log_path", string(StringRule::HostPath)),
+                    field("network", runtime_network_identity_schema()),
+                    field("devices", array(vmm_device_input_schema(), 64)),
                 ],
             ),
             variant(
@@ -2884,8 +2960,11 @@ fn guest_transport_schema() -> Schema {
                 "vsock_ready",
                 vec![
                     field("runtime_incarnation", random_id()),
-                    field("guest_cid", number(3, u64::from(u32::MAX))),
-                    field("guest_port", number(1, u64::from(u16::MAX))),
+                    field("guest_cid", number(3, u64::from(u32::MAX - 1))),
+                    field(
+                        "guest_port",
+                        literal_number(u64::from(GUEST_AGENT_VSOCK_PORT_V1)),
+                    ),
                     field("guest_agent_protocol_version", literal_number(1)),
                     field("guest_boot_id", random_id()),
                 ],
@@ -6298,31 +6377,11 @@ fn validate_desired_runtime_spec(
     }
 
     let mut cross = Vec::new();
-    let network = &spec.runtime.network_config;
-    let guest = ipv4_integer(&network.guest_ipv4);
-    let gateway = ipv4_integer(&network.gateway_ipv4);
-    let same_subnet = guest & !3 == gateway & !3;
-    let guest_host = guest & 3;
-    let gateway_host = gateway & 3;
-    if !same_subnet
-        || guest == gateway
-        || matches!(guest_host, 0 | 3)
-        || matches!(gateway_host, 0 | 3)
-    {
-        cross.push(Candidate::at(
-            &path(&["runtime", "network_config"]),
-            MalformedProblem::InvalidValue,
-        ));
-    }
-    let first_mac_octet = u8::from_str_radix(&network.guest_mac.as_str()[..2], 16)
-        .expect("validated MacAddress has a first octet");
-    if first_mac_octet & 0x03 != 0x02 {
-        cross.push(Candidate::field(
-            &path(&["runtime", "network_config"]),
-            "guest_mac",
-            MalformedProblem::InvalidValue,
-        ));
-    }
+    collect_network_config_cross(
+        &spec.runtime.network_config,
+        &path(&["runtime", "network_config"]),
+        &mut cross,
+    );
     for (index, volume) in spec.volumes.iter().enumerate() {
         let volume_path = indexed(&volumes_path, index);
         let disposition_valid = match spec.target {
@@ -6398,6 +6457,34 @@ fn validate_desired_runtime_spec(
     Ok(())
 }
 
+fn collect_network_config_cross(
+    network: &NetworkConfig,
+    network_path: &[PathSegment],
+    output: &mut Vec<Candidate>,
+) {
+    let guest = ipv4_integer(&network.guest_ipv4);
+    let gateway = ipv4_integer(&network.gateway_ipv4);
+    let same_subnet = guest & !3 == gateway & !3;
+    let guest_host = guest & 3;
+    let gateway_host = gateway & 3;
+    if !same_subnet
+        || guest == gateway
+        || matches!(guest_host, 0 | 3)
+        || matches!(gateway_host, 0 | 3)
+    {
+        output.push(Candidate::at(network_path, MalformedProblem::InvalidValue));
+    }
+    let first_mac_octet = u8::from_str_radix(&network.guest_mac.as_str()[..2], 16)
+        .expect("validated MacAddress has a first octet");
+    if first_mac_octet & 0x03 != 0x02 {
+        output.push(Candidate::field(
+            network_path,
+            "guest_mac",
+            MalformedProblem::InvalidValue,
+        ));
+    }
+}
+
 fn validate_runtime_checkpoint(checkpoint: &RuntimeCheckpoint) -> Result<(), ContractError> {
     if let Some(candidate) = choose(collect_checkpoint_arrays(checkpoint)) {
         return Err(malformed(ContractName::RuntimeCheckpoint, candidate));
@@ -6406,6 +6493,7 @@ fn validate_runtime_checkpoint(checkpoint: &RuntimeCheckpoint) -> Result<(), Con
     collect_physical_cross(&checkpoint.processes, &checkpoint.volumes, &[], &mut cross);
     collect_reconcile_step_cross(&checkpoint.step, &path(&["step"]), false, &mut cross);
     collect_close_gate_checkpoint_cross(checkpoint, &mut cross);
+    collect_runtime_resource_checkpoint_cross(checkpoint, &mut cross);
     collect_warm_snapshot_cross(
         &checkpoint.warm_snapshot,
         &path(&["warm_snapshot"]),
@@ -6421,6 +6509,330 @@ fn validate_runtime_checkpoint(checkpoint: &RuntimeCheckpoint) -> Result<(), Con
         return Err(malformed(ContractName::RuntimeCheckpoint, candidate));
     }
     Ok(())
+}
+
+fn collect_runtime_resource_checkpoint_cross(
+    checkpoint: &RuntimeCheckpoint,
+    output: &mut Vec<Candidate>,
+) {
+    match &checkpoint.step {
+        ReconcileStep::PrepareNetwork { network } => {
+            if !checkpoint.networks.is_empty() && !checkpoint_network_is_exact(checkpoint, network)
+            {
+                output.push(Candidate::at(
+                    &path(&["networks"]),
+                    MalformedProblem::InvalidValue,
+                ));
+            }
+            if checkpoint.runtime_incarnation.is_some() {
+                output.push(Candidate::field(
+                    &[],
+                    "runtime_incarnation",
+                    MalformedProblem::InvalidValue,
+                ));
+            }
+            if !matches!(
+                checkpoint.guest_transport,
+                GuestTransportEvidence::Unavailable
+            ) {
+                output.push(Candidate::at(
+                    &path(&["guest_transport"]),
+                    MalformedProblem::InvalidValue,
+                ));
+            }
+            if checkpoint
+                .processes
+                .iter()
+                .any(|process| matches!(process.role, ProcessRole::Vmm { .. }))
+            {
+                output.push(Candidate::at(
+                    &path(&["processes"]),
+                    MalformedProblem::InvalidValue,
+                ));
+            }
+            let token_aliases_process = checkpoint.processes.iter().any(|process| {
+                ownership_token_is(&process.ownership_token, &network.ownership_token)
+            });
+            let token_aliases_device = checkpoint.volumes.iter().any(|volume| {
+                volume.devices.iter().any(|device| {
+                    ownership_token_is(
+                        observed_device_ownership_token(device),
+                        &network.ownership_token,
+                    )
+                })
+            });
+            if token_aliases_process || token_aliases_device {
+                output.push(Candidate::field(
+                    &path(&["step", "network"]),
+                    "ownership_token",
+                    MalformedProblem::InvalidValue,
+                ));
+            }
+        }
+        ReconcileStep::StartRuntime {
+            runtime_incarnation,
+            scope_id,
+            launcher_executable,
+            boot,
+            process_identity_token,
+            vcpus,
+            memory_bytes,
+            boot_image_digest,
+            guest_config_digest: expected_guest_config_digest,
+            api_socket_path,
+            vsock_socket_path,
+            memory_file_path,
+            serial_log_path,
+            vmm_log_path,
+            guest_cid,
+            network,
+            devices,
+            ..
+        } => {
+            if checkpoint.runtime_incarnation.as_ref() != Some(runtime_incarnation) {
+                output.push(Candidate::field(
+                    &[],
+                    "runtime_incarnation",
+                    MalformedProblem::InvalidValue,
+                ));
+            }
+            if !checkpoint_network_is_exact(checkpoint, network) {
+                output.push(Candidate::at(
+                    &path(&["networks"]),
+                    MalformedProblem::InvalidValue,
+                ));
+            }
+            if checkpoint.volumes.len() != devices.len()
+                || devices.iter().any(|input| {
+                    let matching = checkpoint
+                        .volumes
+                        .iter()
+                        .filter(|volume| volume.volume_id == *vmm_device_volume_id(input))
+                        .collect::<Vec<_>>();
+                    matching.len() != 1
+                        || matching[0].devices.len() != 1
+                        || !vmm_device_matches_observed(input, &matching[0].devices[0])
+                        || match vmm_device_guest_device(input).slot {
+                            0 => matching[0].disk_kind != ObservedDiskKind::Root,
+                            _ => matching[0].disk_kind != ObservedDiskKind::Persistent,
+                        }
+                })
+            {
+                output.push(Candidate::at(
+                    &path(&["volumes"]),
+                    MalformedProblem::InvalidValue,
+                ));
+            }
+
+            let vmm_is_exact = |process: &ProcessEvidence| {
+                matches!(
+                    &process.role,
+                    ProcessRole::Vmm {
+                        runtime_incarnation: observed_incarnation,
+                    } if observed_incarnation == runtime_incarnation
+                ) && process.scope_id == *scope_id
+                    && process.executable_path == boot.vmm_executable.path
+                    && process.control_socket_path == *api_socket_path
+                    && process.state == ProcessState::Running
+                    && process.ownership_token
+                        == OwnershipTokenEvidence::Valid {
+                            ownership_token: process_identity_token.clone(),
+                        }
+                    && process.control_handshake == ControlHandshakeEvidence::Verified
+                    && process.observed_vm_shape.as_ref().is_some_and(|shape| {
+                        shape.vcpus == *vcpus
+                            && shape.memory_bytes == *memory_bytes
+                            && shape.boot_image_digest == *boot_image_digest
+                            && shape.guest_config_digest == *expected_guest_config_digest
+                    })
+            };
+            let exact_vmm_count = checkpoint
+                .processes
+                .iter()
+                .filter(|process| matches!(process.role, ProcessRole::Vmm { .. }))
+                .filter(|process| vmm_is_exact(process))
+                .count();
+            let observed_vmm_count = checkpoint
+                .processes
+                .iter()
+                .filter(|process| matches!(process.role, ProcessRole::Vmm { .. }))
+                .count();
+            if observed_vmm_count > 1 || exact_vmm_count != observed_vmm_count {
+                output.push(Candidate::at(
+                    &path(&["processes"]),
+                    MalformedProblem::InvalidValue,
+                ));
+            }
+
+            if let GuestTransportEvidence::VsockReady {
+                runtime_incarnation: observed_incarnation,
+                guest_cid: observed_cid,
+                guest_port,
+                ..
+            } = &checkpoint.guest_transport
+            {
+                if observed_incarnation != runtime_incarnation
+                    || observed_cid != guest_cid
+                    || *guest_port != GUEST_AGENT_VSOCK_PORT_V1
+                {
+                    output.push(Candidate::at(
+                        &path(&["guest_transport"]),
+                        MalformedProblem::InvalidValue,
+                    ));
+                }
+            }
+
+            let launch_paths = [
+                &launcher_executable.path,
+                &boot.vmm_executable.path,
+                &boot.kernel.path,
+                api_socket_path,
+                vsock_socket_path,
+                memory_file_path,
+                serial_log_path,
+                vmm_log_path,
+            ];
+            let conflicts_with_planned_path = |candidate: &HostPath| {
+                launch_paths
+                    .iter()
+                    .copied()
+                    .chain(boot.initramfs.as_ref().map(|artifact| &artifact.path))
+                    .chain(devices.iter().map(vmm_device_physical_path))
+                    .any(|planned_path| planned_path == candidate)
+            };
+            let process_path_conflict = checkpoint.processes.iter().any(|process| {
+                matches!(process.role, ProcessRole::Blockd { .. })
+                    && conflicts_with_planned_path(&process.control_socket_path)
+            });
+            let planned_tokens = std::iter::once(runtime_incarnation.as_str())
+                .chain(std::iter::once(process_identity_token.as_str()))
+                .chain(std::iter::once(network.ownership_token.as_str()))
+                .chain(
+                    devices
+                        .iter()
+                        .map(|device| vmm_device_ownership_token(device).as_str()),
+                )
+                .collect::<BTreeSet<_>>();
+            let blockd_identity_conflict = checkpoint.processes.iter().any(|process| {
+                if !matches!(process.role, ProcessRole::Blockd { .. }) {
+                    return false;
+                }
+                process.scope_id == *scope_id
+                    || match &process.ownership_token {
+                        OwnershipTokenEvidence::Valid { ownership_token } => {
+                            planned_tokens.contains(ownership_token.as_str())
+                        }
+                        OwnershipTokenEvidence::Missing
+                        | OwnershipTokenEvidence::Corrupt { .. } => false,
+                    }
+            });
+            let lineage_path_conflict = checkpoint.volumes.iter().any(|volume| {
+                volume
+                    .local_lineages
+                    .iter()
+                    .any(|lineage| conflicts_with_planned_path(&lineage.data_directory))
+            });
+            let mount_path_conflict = checkpoint.mounts.iter().any(|mount| {
+                conflicts_with_planned_path(&mount.source_path)
+                    || conflicts_with_planned_path(&mount.mount_path)
+            });
+            if process_path_conflict
+                || blockd_identity_conflict
+                || lineage_path_conflict
+                || mount_path_conflict
+            {
+                output.push(Candidate::at(
+                    &path(&["step"]),
+                    MalformedProblem::InvalidValue,
+                ));
+            }
+        }
+        _ => {}
+    }
+}
+
+fn checkpoint_network_is_exact(
+    checkpoint: &RuntimeCheckpoint,
+    expected: &RuntimeNetworkIdentity,
+) -> bool {
+    let [observed] = checkpoint.networks.as_slice() else {
+        return false;
+    };
+    observed.kind == expected.network_config.kind
+        && observed.network_id == expected.network_config.network_id
+        && observed.guest_mac == expected.network_config.guest_mac
+        && observed.guest_ipv4 == expected.network_config.guest_ipv4
+        && observed.prefix_length == expected.network_config.prefix_length
+        && observed.gateway_ipv4 == expected.network_config.gateway_ipv4
+        && observed.tap_name == expected.tap_name
+        && observed.ownership_token
+            == OwnershipTokenEvidence::Valid {
+                ownership_token: expected.ownership_token.clone(),
+            }
+}
+
+fn vmm_device_matches_observed(input: &VmmDeviceInput, observed: &ObservedDevice) -> bool {
+    match (input, observed) {
+        (
+            VmmDeviceInput::KernelNbd {
+                guest_device,
+                device_path,
+                ownership_token,
+                ..
+            },
+            ObservedDevice::KernelNbd {
+                guest_device: observed_guest_device,
+                device_path: observed_device_path,
+                ownership_token: observed_token,
+            },
+        ) => {
+            guest_device == observed_guest_device
+                && device_path == observed_device_path
+                && observed_token
+                    == &OwnershipTokenEvidence::Valid {
+                        ownership_token: ownership_token.clone(),
+                    }
+        }
+        (
+            VmmDeviceInput::VhostUserBlk {
+                guest_device,
+                socket_path,
+                ownership_token,
+                ..
+            },
+            ObservedDevice::VhostUserBlk {
+                guest_device: observed_guest_device,
+                socket_path: observed_socket_path,
+                ownership_token: observed_token,
+            },
+        ) => {
+            guest_device == observed_guest_device
+                && socket_path == observed_socket_path
+                && observed_token
+                    == &OwnershipTokenEvidence::Valid {
+                        ownership_token: ownership_token.clone(),
+                    }
+        }
+        _ => false,
+    }
+}
+
+fn observed_device_ownership_token(device: &ObservedDevice) -> &OwnershipTokenEvidence {
+    match device {
+        ObservedDevice::KernelNbd {
+            ownership_token, ..
+        }
+        | ObservedDevice::VhostUserBlk {
+            ownership_token, ..
+        } => ownership_token,
+    }
+}
+
+fn ownership_token_is(evidence: &OwnershipTokenEvidence, expected: &RandomId128) -> bool {
+    matches!(
+        evidence,
+        OwnershipTokenEvidence::Valid { ownership_token } if ownership_token == expected
+    )
 }
 
 fn collect_close_gate_checkpoint_cross(
@@ -7125,13 +7537,77 @@ fn collect_require_idle_arrays(
 }
 
 fn collect_step_arrays(step: &ReconcileStep, path: &[PathSegment], output: &mut Vec<Candidate>) {
-    if let ReconcileStep::SnapshotWarmRuntime { source_heads, .. } = step {
-        collect_unique_order(
+    match step {
+        ReconcileStep::SnapshotWarmRuntime { source_heads, .. } => collect_unique_order(
             source_heads,
             &child(path, "source_heads"),
             |head| head.volume_id.as_str().as_bytes().to_vec(),
             output,
-        );
+        ),
+        ReconcileStep::StartRuntime { devices, .. } => {
+            let devices_path = child(path, "devices");
+            collect_unique_order(
+                devices,
+                &devices_path,
+                |device| vmm_device_guest_device(device).slot,
+                output,
+            );
+            if has_duplicate(
+                devices
+                    .iter()
+                    .map(|device| vmm_device_volume_id(device).as_str()),
+            ) || has_duplicate(
+                devices
+                    .iter()
+                    .map(|device| vmm_device_guest_device(device).serial.as_str()),
+            ) || has_duplicate(
+                devices
+                    .iter()
+                    .map(|device| vmm_device_physical_path(device).as_str()),
+            ) || has_duplicate(
+                devices
+                    .iter()
+                    .map(|device| vmm_device_ownership_token(device).as_str()),
+            ) {
+                output.push(Candidate::at(
+                    &devices_path,
+                    MalformedProblem::DuplicateIdentity,
+                ));
+            }
+        }
+        _ => {}
+    }
+}
+
+fn vmm_device_volume_id(device: &VmmDeviceInput) -> &Id {
+    match device {
+        VmmDeviceInput::KernelNbd { volume_id, .. }
+        | VmmDeviceInput::VhostUserBlk { volume_id, .. } => volume_id,
+    }
+}
+
+fn vmm_device_guest_device(device: &VmmDeviceInput) -> &GuestDeviceIdentity {
+    match device {
+        VmmDeviceInput::KernelNbd { guest_device, .. }
+        | VmmDeviceInput::VhostUserBlk { guest_device, .. } => guest_device,
+    }
+}
+
+fn vmm_device_physical_path(device: &VmmDeviceInput) -> &HostPath {
+    match device {
+        VmmDeviceInput::KernelNbd { device_path, .. } => device_path,
+        VmmDeviceInput::VhostUserBlk { socket_path, .. } => socket_path,
+    }
+}
+
+fn vmm_device_ownership_token(device: &VmmDeviceInput) -> &RandomId128 {
+    match device {
+        VmmDeviceInput::KernelNbd {
+            ownership_token, ..
+        }
+        | VmmDeviceInput::VhostUserBlk {
+            ownership_token, ..
+        } => ownership_token,
     }
 }
 
@@ -7737,6 +8213,174 @@ fn collect_reconcile_step_cross(
                 ));
             }
         }
+        ReconcileStep::PrepareNetwork { network } => {
+            let network_path = child(path, "network");
+            collect_network_config_cross(
+                &network.network_config,
+                &child(&network_path, "network_config"),
+                output,
+            );
+            if !valid_runtime_tap_name(&network.tap_name) {
+                output.push(Candidate::field(
+                    &network_path,
+                    "tap_name",
+                    MalformedProblem::InvalidValue,
+                ));
+            }
+        }
+        ReconcileStep::StartRuntime {
+            runtime_incarnation,
+            scope_id,
+            launcher_executable,
+            boot,
+            process_identity_token,
+            vcpus,
+            memory_bytes,
+            guest_config_digest: expected_guest_config_digest,
+            api_socket_path,
+            vsock_socket_path,
+            memory_file_path,
+            serial_log_path,
+            vmm_log_path,
+            network,
+            devices,
+            ..
+        } => {
+            let network_path = child(path, "network");
+            collect_network_config_cross(
+                &network.network_config,
+                &child(&network_path, "network_config"),
+                output,
+            );
+            if !valid_runtime_tap_name(&network.tap_name) {
+                output.push(Candidate::field(
+                    &network_path,
+                    "tap_name",
+                    MalformedProblem::InvalidValue,
+                ));
+            }
+            if !valid_vmm_service_id(scope_id, runtime_incarnation) {
+                output.push(Candidate::field(
+                    path,
+                    "scope_id",
+                    MalformedProblem::InvalidValue,
+                ));
+            }
+            if process_identity_token == runtime_incarnation
+                || process_identity_token == &network.ownership_token
+            {
+                output.push(Candidate::field(
+                    path,
+                    "process_identity_token",
+                    MalformedProblem::InvalidValue,
+                ));
+            }
+
+            if *memory_bytes < 128 * MEBIBYTE || *memory_bytes % MEBIBYTE != 0 {
+                output.push(Candidate::field(
+                    path,
+                    "memory_bytes",
+                    MalformedProblem::InvalidValue,
+                ));
+            }
+
+            let profile = GuestRuntimeProfileReceipt {
+                version: ContractVersion::V1,
+                kernel_digest: boot.kernel.content_sha256.clone(),
+                initramfs_digest: boot
+                    .initramfs
+                    .as_ref()
+                    .map(|artifact| artifact.content_sha256.clone()),
+                kernel_cmdline: boot.kernel_cmdline.clone(),
+                guest_agent_protocol_version: ContractVersion::V1,
+            };
+            if guest_config_digest(&profile).as_ref() != Ok(expected_guest_config_digest) {
+                output.push(Candidate::field(
+                    path,
+                    "guest_config_digest",
+                    MalformedProblem::InvalidValue,
+                ));
+            }
+
+            let launch_paths = [
+                &launcher_executable.path,
+                &boot.vmm_executable.path,
+                &boot.kernel.path,
+                api_socket_path,
+                vsock_socket_path,
+                memory_file_path,
+                serial_log_path,
+                vmm_log_path,
+            ];
+            let initramfs_path = boot.initramfs.as_ref().map(|artifact| &artifact.path);
+            if has_duplicate(launch_paths.iter().copied().chain(initramfs_path)) {
+                output.push(Candidate::at(path, MalformedProblem::InvalidValue));
+            }
+
+            let devices_path = child(path, "devices");
+            if devices.is_empty()
+                || devices.iter().enumerate().any(|(index, device)| {
+                    usize::from(vmm_device_guest_device(device).slot) != index
+                })
+            {
+                output.push(Candidate::at(&devices_path, MalformedProblem::InvalidValue));
+            }
+            if devices.iter().any(|device| {
+                vmm_device_ownership_token(device) == process_identity_token
+                    || vmm_device_ownership_token(device) == &network.ownership_token
+                    || vmm_device_ownership_token(device) == runtime_incarnation
+                    || launch_paths
+                        .iter()
+                        .copied()
+                        .chain(initramfs_path)
+                        .any(|path| path == vmm_device_physical_path(device))
+            }) {
+                output.push(Candidate::at(&devices_path, MalformedProblem::InvalidValue));
+            }
+            if network.ownership_token == *runtime_incarnation {
+                output.push(Candidate::field(
+                    &network_path,
+                    "ownership_token",
+                    MalformedProblem::InvalidValue,
+                ));
+            }
+
+            let kernel = devices
+                .iter()
+                .filter_map(|device| match device {
+                    VmmDeviceInput::KernelNbd { direct, .. } => Some(*direct),
+                    VmmDeviceInput::VhostUserBlk { .. } => None,
+                })
+                .collect::<Vec<_>>();
+            let vhost = devices
+                .iter()
+                .filter_map(|device| match device {
+                    VmmDeviceInput::KernelNbd { .. } => None,
+                    VmmDeviceInput::VhostUserBlk {
+                        queues, queue_size, ..
+                    } => Some((*queues, *queue_size)),
+                })
+                .collect::<Vec<_>>();
+            let mixed_frontends = !kernel.is_empty() && !vhost.is_empty();
+            let inconsistent_kernel = kernel
+                .first()
+                .is_some_and(|first| kernel.iter().any(|direct| direct != first));
+            let inconsistent_vhost = vhost
+                .first()
+                .is_some_and(|first| vhost.iter().any(|parameters| parameters != first));
+            let invalid_queue_size = vhost
+                .iter()
+                .any(|(_, queue_size)| !queue_size.is_power_of_two());
+            let too_many_queues = vhost.iter().any(|(queues, _)| u32::from(*queues) > *vcpus);
+            if mixed_frontends
+                || inconsistent_kernel
+                || inconsistent_vhost
+                || invalid_queue_size
+                || too_many_queues
+            {
+                output.push(Candidate::at(&devices_path, MalformedProblem::InvalidValue));
+            }
+        }
         ReconcileStep::FormatFilesystem {
             expected_blank_head,
             ..
@@ -7798,6 +8442,23 @@ fn collect_reconcile_step_cross(
         }
         _ => {}
     }
+}
+
+fn valid_runtime_tap_name(tap_name: &Id) -> bool {
+    let value = tap_name.as_str();
+    !matches!(value, "." | "..")
+        && value.len() <= 15
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || b"_.-".contains(&byte))
+}
+
+fn valid_vmm_service_id(scope_id: &Id, runtime_incarnation: &RandomId128) -> bool {
+    scope_id
+        .as_str()
+        .strip_prefix("cats-vmm-")
+        .and_then(|body| body.strip_suffix(".service"))
+        == Some(runtime_incarnation.as_str())
 }
 
 fn collect_volume_heads_cross(

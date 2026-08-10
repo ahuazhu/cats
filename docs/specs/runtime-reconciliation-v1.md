@@ -93,8 +93,9 @@ V1的值只能是`1`；顶层不存在`format_version`或按合同名变化的ve
 `unsupported_version`规则适用于全部顶层合同，包括`RuntimeCheckpoint`和`ContractError`；
 为拒绝非V1输入而返回的`ContractError`自身仍必须编码`version: 1`。
 
-`prepare_device`在首次clean-slate vertical cutover前以本规格的完整字段集合锁步替换旧三字段开发形态，
-`ContractVersion`仍为`1`；旧形态缺少handoff/process/frontend authority，必须按missing fields严格拒绝，
+`prepare_device`、新`prepare_network`和扩展后的`start_runtime`在首次clean-slate vertical cutover前以
+本规格的完整字段集合锁步替换旧开发形态，`ContractVersion`仍为`1`；旧形态缺少handoff/process/frontend、
+network reservation、boot artifact、CID和exact device authority，必须按missing/unknown fields严格拒绝，
 不能以optional/default/compatibility alias接受。Node、Control和所有wire fixture必须同时升级，组件不匹配按
 ADR-0040启动失败，不存在与旧开发checkpoint混跑的兼容期。
 
@@ -868,11 +869,12 @@ unit。Inspect、Verify 和 Quarantine 本身不产生外部 effect。
 | AcquireVolume | normal时完整`VolumeAcquireRequest`（含positive lease duration），takeover时只有authorization id | 只通过Runtime Volume Transitions签名mutation route交给Control的单一PostgreSQL事务；authorization首次消费还要求Active event并原子写`AuthorizationConsumedReceipt`，结果不明只经同规格signed evidence read闭合；只有完整typed request或同authorization可adopt，或在 `R == L` 后精确release |
 | ProvisionRootImage | 完整`provision_root_image` step（包含不与provision transition混用的control-only blockd物理身份）、checkpoint top-level revision/spec/placement和该attachment的现有process/volume evidence | 只允许current non-Deleted Desired的唯一Root；step必须先fsync再spawn/adopt精确blockd实例，并以已持久transition ID发送显式typed request，把exact blank head CAS为纯确定计算的generation-1 target。响应不明只读权威head；closed retryable/conflict按§7.1处理。成功前不得创建Guest device或VMM |
 | PrepareDevice | 完整attachment lineage/origin/head/size/durability、closed serving-authority provenance、serving blockd scope/socket/data/executable/process token、closed frontend plan、Guest device及device-only ownership token | 首次Root使用ProvisionRootImage完成的sealed handoff；已有Root及Persistent使用descriptor-stable exact direct authorization，绝不伪造Root handoff。每轮fresh full inventory后只执行该frontend定义的一个bounded effect；晚到资源只按各自独立token和完整物理证据adopt |
+| PrepareNetwork | 完整`NetworkConfig`、Linux IFNAMSIZ内的fresh random tap name和独立network ownership token；top-level runtime incarnation必须null且不得有VMM/Guest transport evidence | checkpoint replace是该轮唯一effect；下一轮accepted fresh full证明exact absent/present后才create/adopt tap，模糊结果再读fresh full。exact tap被新full接受后，后续另一轮才可CAS `StartRuntime`；foreign/duplicate/address collision/ABA零修改并fail closed |
 | FormatFilesystem | attachment、device、filesystem UUID、initialization token、blank predecessor | Guest Agent 只按精确 predecessor 格式化；晚到结果按 UUID probe/adopt，冲突立即 quarantine |
 | DrainInitialization | attachment epoch、local/remote root generation | device flush 后只向精确 owner/epoch publish，直到 `R == L` |
 | CommitInitialized | token、blank predecessor exact RemoteHead、UUID、新exact RemoteHead | Control Store 精确 CAS；相同结果幂等，冲突 quarantine |
 | MountFilesystem | attachment、device、UUID、mount path | 只 mount 精确 device/UUID；晚到 mount 不产生 route authority，stale 时按精确 identity unmount |
-| StartRuntime | runtime incarnation、scope/socket 名、process identity token | create-if-absent 后握手；晚到进程不开放 route，当前 spec 不再需要时按精确身份停止 |
+| StartRuntime | runtime incarnation、exact reserved unit、launcher/VMM/kernel/initramfs file provenance、cmdline、VM shape digests、全部socket/RAM/log path、Node-global Guest CID、exact network、按slot排序的closed device inputs及独立process token | 只在accepted fresh full逐字段证明PrepareDevice/PrepareNetwork exact postcondition后no-replace create；fixed launcher验证descriptor并exec VMM。结果不明只做fresh full exact inspect；公共ProcessEvidence本身不授权adopt。late/foreign/duplicate/ABA不覆写、不unlink、不启第二实例，stale结果不开route |
 | DrainPublish | attachment epoch、local/remote root generation | 只向精确 owner/epoch CAS publish；晚到成功可安全 adopt，旧 epoch 不能写新 root |
 | PauseRuntime | runtime incarnation、process start time | 只 pause 该 incarnation；晚到 pause 可发生，当前 revision 负责 resume 或重建 |
 | SnapshotWarmRuntime | runtime incarnation、snapshot temp id、source root/epoch | 验证VMM postcondition与durable rename；晚到文件不覆盖其他WarmRuntimeSnapshot |
@@ -1091,6 +1093,110 @@ provider-private exact process/CLI/socket evidence后才能投影为满足step�
 missing/corrupt/不同token的实例是identity conflict，必须Quarantine，不得覆写token、
 adopt或按名删除。
 
+### 7.2 Network reservation 与 exact VMM start
+
+fresh boot进入VMM前的固定顺序是`prepare_device -> prepare_network -> start_runtime`。三个checkpoint
+replace与其物理effect不得合并；每轮最多发生其中一个。`prepare_network`必须在current Desired、accepted
+fresh full、全部expected volume/device和provider-private serving proof仍逐字段相同后构造。它持久完整
+`NetworkConfig`、随机tap name及新的network-only ownership token。该token不得从Cat、network ID/MAC、tap
+name、runtime incarnation或任一process/device token推导，也不得等于checkpoint内任一valid process/device
+token。此step要求top-level `runtime_incarnation=null`、`guest_transport=unavailable`且VMM process count为0；
+已有VMM、旧Guest transport或任一foreign/duplicate process都不能成为network create的前置。
+
+首次写`prepare_network`时只执行checkpoint CAS+file/parent fsync。该CAS是本轮唯一effect，不创建tap、不生成
+runtime incarnation，也不顺带CAS `start_runtime`。tap name须为1..=15 bytes且只含`[A-Za-z0-9_.-]`，不得为
+`.`/`..`；它由CSPRNG独立选择，不按Cat/network散列。CAS持有Node-global network allocation flock，严格有界
+枚举整个checkpoint namespace、全部Host tap/address和current reservation；同名、重叠IPv4、重复token、
+missing/corrupt evidence、scan变化或无法完成full union时不写reservation。
+
+下一轮必须先取得并发布新的accepted full inventory。若tap exact absent，effect在同一allocation flock下重验
+current checkpoint guard、Desired和全局absence/address不冲突，然后只create一个nonpersistent tap，并以
+provider-private alias/xattr等sealed token projection逐字段设置checkpoint的name/token/address/up状态。若exact
+present，只能adopt；same-name different/missing/corrupt token、额外地址、down/foreign flags、duplicate tap或
+rename/recreate ABA全部保留原物并Quarantine。create/adopt返回、EOF或timeout后不依据返回推进，必须再次完成
+fresh full；只有其中恰好一个`ObservedNetwork`逐字段exact且provider-private proof也闭合才满足postcondition。
+这次accepted full之后，后续独立一轮才允许把checkpoint CAS到`start_runtime`。
+
+`start_runtime`从该accepted full和current `prepare_device` proof冻结全部VMM输入。`devices`必须与checkpoint
+volumes一一对应、slot从0连续递增且Root必须且只在slot 0；其余只能是Persistent。所有输入使用同一种frontend；
+kernel-NBD保留每盘path/token/`direct`，vhost-user保留每盘socket/token及全局一致的`queues/queue_size`，queues
+不得超过vCPU。public `ObservedDevice`只有path/socket、Guest slot和device token，不能证明serving blockd的
+exact executable/argv/handshake、attachment/head或vhost queue配置；scanner必须先把同一个accepted full与
+provider-private exact process、CLI、socket和authorized-serving proof join，任一缺失/冲突都不能构造或adopt
+`start_runtime`。
+
+启动shape还冻结Desired的`vcpus`、`memory_bytes`、`boot_image_digest`和`guest_config_digest`；V1 fresh CH
+memory必须至少128 MiB且是1 MiB整倍数。`RuntimeLaunchArtifact`保存canonical installed HostPath、positive
+wire length和content SHA-256；`launcher_executable`、`boot.vmm_executable`、`boot.kernel`以及optional
+`boot.initramfs`各自使用该结构，`boot.kernel_cmdline`保存exact printable ASCII cmdline。producer只能从实际
+installed ChConfig和固定safe reader选择这些bytes；本合同不假设另一份release installer、manifest、receipt或
+内存对象为authority。checkpoint CAS前及每次restart/start/adopt时，reader必须descriptor-relative、no-follow
+打开regular/single-link文件，前后核对canonical path/metadata，流式重算length/digest，并保留同一descriptor到
+launch inspection完成。pathname替换、symlink、short/changed read或任一byte漂移都fail closed。
+
+step内的`guest_config_digest`不是独立输入；wire必须按§2既有domain重算并要求：
+
+```text
+guest_config_digest == guest_config_digest(GuestRuntimeProfileReceipt {
+  version: 1,
+  kernel_digest: boot.kernel.content_sha256,
+  initramfs_digest: boot.initramfs?.content_sha256,
+  kernel_cmdline: boot.kernel_cmdline,
+  guest_agent_protocol_version: 1
+})
+```
+
+planner再要求该值逐字段等于current Desired的approved `runtime.guest_config_digest`。因此替换kernel/initramfs
+bytes或cmdline而只保留旧digest，在Guest启动或回显前已经fail closed。
+
+`runtime_incarnation`和process token分别fresh且互不相等；systemd unit只接受精确
+`cats-vmm-<runtime_incarnation>.service`，从而与Node-global scanner的reserved `cats-` namespace闭合，禁止
+`dbus.service`、`.service`、空body、额外dot/dash或调用方自选managed name。API/vsock socket、RAM backing、
+serial log及VMM log均为absolute HostPath，并与launcher/VMM/kernel/initramfs、全部device path以及checkpoint
+现有blockd control socket、local-lineage data directory、mount source/target两两不alias。launcher用
+`O_CREAT|O_EXCL`/descriptor方式创建RAM和log；API/vsock只允许CH在已证明absent的locked managed namespace
+no-replace bind。任何路径都不得预先unlink、truncate或rename foreign entry。
+
+Guest CID是Node-global checkpoint reservation，合法范围`3..=4294967294`；`0..=2`为保留值，
+`4294967295`是`VMADDR_CID_ANY`，均不得持久。写`start_runtime` CAS前取得descriptor-relative、regular、
+single-link、exact `0600`的Node-global VMM allocation flock，并重新严格枚举全部checkpoint及live VMM：所有
+`start_runtime.guest_cid`和provider-private exact live argv/API CID都是occupied；重复CID、无checkpoint live CID、
+malformed/foreign VMM或不完整scan拒绝。本Node assigned Cat上限为1024；若validated occupied count为N，allocator
+从3开始只检查N+1个连续candidate（checked increment，至多1025次），首个free写入step。该轮只CAS+fsync
+reservation，不创建文件、unit或VMM；不得线性扫描整个u32空间。所有新增/移除CID reservation的checkpoint
+replace使用同一flock。V1 Guest Agent AF_VSOCK port固定5000，不在step复制；`vsock_ready`必须回显同incarnation、
+checkpoint CID、port 5000和protocol v1。
+
+provider-private launcher的systemd ExecStart、launcher argv builder和CH argv builder必须是一个closed版本，
+scanner复用同一builder逐byte比较，不能从basename或部分flag采用。launcher重验上述descriptors后，使
+kernel/initramfs/RAM/log descriptor可继承，并以descriptor-stable executable执行CH；成功`exec`后MainPID即
+VMM。fresh boot的CH argv顺序固定为API socket、kernel descriptor、optional initramfs descriptor、exact
+cmdline、`cpus=boot=<vcpus>`、file-backed shared memory、checkpoint CID/vsock、exact tap/MAC、按slot顺序的
+全部disk、serial descriptor和console-off。kernel disk argument固定
+`path=<path>,image_type=raw,direct=on|off`；vhost argument固定
+`vhost_user=on,socket=<path>,num_queues=<queues>,queue_size=<queue_size>`。不得继续使用硬编码CID 3、丢弃
+`direct`/queue参数、按map顺序生成disk或从current ChConfig重新选择不同boot bytes。
+
+transient service固定`Type=exec`、`--collect`、`CollectMode=inactive-or-failed`、`Restart=no`、
+`KillMode=control-group`、`UMask=0077`及contract版本冻结的stop timeout；cgroup必须精确
+`/system.slice/<scope_id>`且只有一个PID。VMM exec前`clearenv`，随后环境必须恰好包含非secret
+`CATS_VMM_PROCESS_IDENTITY_TOKEN=<token>`与`CATS_RUNTIME_INCARNATION=<incarnation>`；unit不得使用
+EnvironmentFile/PassEnvironment或继承cloud/object-store/database credentials。
+
+start effect前重新验证current Desired/revision/spec/placement、current checkpoint guard、accepted fresh full、
+artifact descriptors、CID allocation和全部network/device proof。create-if-absent只可调用一次。返回成功或结果
+不明后都必须做一次新的full inspection；adopt要求恰好一个unit/cgroup/MainPID，PID/start ticks、`/proc/exe`、
+完整argv/env、open descriptors、API socket inode/metadata及`SO_PEERCRED` peer、`vmm.ping`/`vm.info`的shape、CID、
+network和devices全部逐字段exact。公共`ProcessEvidence`的role/path/token/shape只是该完整proof的projection，
+不能单独授权adopt。zero exact实例可有界重试同一checkpoint attempt；different/duplicate/late/foreign/ABA实例
+一律不stop、不覆盖、不unlink、不创建第二unit，并保持gate Closed。
+
+取消若发生在本地linearization前，只能清理本attempt已exclusive-create且仍由同descriptor/token拥有的未发布
+RAM/log；socket/name处foreign entry不删。systemd create结果模糊或已经linearize后必须先按上述fresh full
+inspection把同attempt分类为exact present/absent/conflict，不能把cancel当rollback。exact late VMM仍绑定旧
+incarnation且永不开route，由后继revision另写checkpoint-first stop effect；PID、start、unit、token、argv、
+executable或socket任一ABA变化时旧effect零signal、零cleanup。
+
 volume `CleanupRelease`必须先持久化，再以`target.volume_id`、`target.attachment_id`、
 `target.attachment_epoch`和`volume_release.release_transition_id`构造Volume Authority的exact
 release request；`generation`和`disposition`是Runtime的决策/前置绑定，不增加第二个
@@ -1113,8 +1219,11 @@ Quarantine，暂时无法读取则Blocked。Control Plane在该release结果确�
   重放同一 `transition_id` 才返回原 LeaseGrant。
 - Volume publish/release：publish携带expected owner/epoch/exact RemoteHead；release携带已持久的唯一
   `release_transition_id`和expected owner/epoch，并按§7解析重放；PersistentDisk release前`R == L`。
-- VMM/blockd/systemd：名称含 Cat/incarnation，使用 process start time 和 socket handshake。
-- NBD slot、tap 等共享资源：完整 inventory 后分配，checkpoint 先写 ownership token。
+- VMM/systemd：只使用§7.2的reserved unit、artifact/argv/env/cgroup/PID-start/API exact proof；公共
+  `ProcessEvidence`不得单独授权adopt。
+- blockd：使用attachment/serving provenance、process start time、exact CLI和socket handshake。
+- NBD slot、tap和Guest CID等共享资源：Node-global flock内用完整checkpoint namespace+full physical
+  inventory分配，checkpoint先写独立reservation/token；不得从逻辑ID或常量推导。
 - WarmRuntimeSnapshot：先写temp identity；成功要求VMM postcondition、文件metadata和durable
   rename。产品DiskSnapshot不走Runtime planner，只能按Volume Authority在stable Cold/unowned时
   使用§3.3 covered API key reservation，再锁VolumeRecord、重验认证Workspace拥有Disk及精确tuple，并在一个
@@ -1389,6 +1498,10 @@ ReconcileStep =
     frontend: PrepareDeviceFrontend
   }
 | {
+    kind: "prepare_network",
+    network: RuntimeNetworkIdentity
+  }
+| {
     kind: "format_filesystem",
     volume_id: Id,
     attachment_id: Id,
@@ -1421,7 +1534,21 @@ ReconcileStep =
     kind: "start_runtime",
     runtime_incarnation: RandomId128,
     scope_id: Id,
-    process_identity_token: RandomId128
+    launcher_executable: RuntimeLaunchArtifact,
+    boot: VmmBootProvenance,
+    process_identity_token: RandomId128,
+    vcpus: integer 1..=4294967295,
+    memory_bytes: integer 134217728..=9223372036854775807 and multiple-of-1048576,
+    boot_image_digest: Sha256Digest,
+    guest_config_digest: Sha256Digest,
+    api_socket_path: HostPath,
+    vsock_socket_path: HostPath,
+    guest_cid: integer 3..=4294967294,
+    memory_file_path: HostPath,
+    serial_log_path: HostPath,
+    vmm_log_path: HostPath,
+    network: RuntimeNetworkIdentity,
+    devices: [VmmDeviceInput]
   }
 | {
     kind: "drain_publish",
@@ -1568,6 +1695,44 @@ PrepareDeviceFrontend =
     queues: integer 1..=64,
     queue_size: integer 2..=32768 and power-of-two
   }
+
+RuntimeNetworkIdentity {
+  network_config: NetworkConfig,
+  tap_name: Id,
+  ownership_token: RandomId128
+}
+
+RuntimeLaunchArtifact {
+  path: HostPath,
+  length: WireU64 greater-than-zero,
+  content_sha256: Sha256Digest
+}
+
+VmmBootProvenance {
+  vmm_executable: RuntimeLaunchArtifact,
+  kernel: RuntimeLaunchArtifact,
+  initramfs: RuntimeLaunchArtifact | null,
+  kernel_cmdline: AsciiText
+}
+
+VmmDeviceInput =
+  {
+    kind: "kernel_nbd",
+    volume_id: Id,
+    guest_device: GuestDeviceIdentity,
+    device_path: HostPath,
+    ownership_token: RandomId128,
+    direct: boolean
+  }
+| {
+    kind: "vhost_user_blk",
+    volume_id: Id,
+    guest_device: GuestDeviceIdentity,
+    socket_path: HostPath,
+    ownership_token: RandomId128,
+    queues: integer 1..=64,
+    queue_size: integer 2..=32768 and power-of-two
+  }
 ```
 
 `source_heads`按`volume_id`升序且无重复。`ObservedRuntimeStatus.step`与valid checkpoint中的`step`必须
@@ -1587,6 +1752,21 @@ attachment epoch、零inode、零size、空/仅path authorization、authorizatio
 kernel listener/device alias、vhost queue越界或非二次幂都在wire intrinsic validation阶段拒绝。handoff record或
 direct authorization内容与checkpoint、current Desired/placement及authority的逐字段关联仍是planner/scanner
 context validation，不能由wire decoder凭digest字符串猜测。
+
+`prepare_network.network`必须满足§3的同一isolated `/30`/locally-administered unicast MAC规则；tap name另按
+§7.2限制为安全的1..=15 bytes。checkpoint在该step时只允许`networks=[]`或恰好一个逐字段exact且token为valid
+的projection；top-level incarnation必须null、Guest transport unavailable且VMM count为0。network token不得
+等于checkpoint中任一valid process/device token。
+
+`start_runtime.scope_id`必须逐byte等于
+`cats-vmm-<runtime_incarnation>.service`。checkpoint top-level incarnation、恰好一个exact network、全部
+volume/device projection必须与step逐字段相同；devices从slot 0连续排序、volume/serial/path/token分别唯一，
+Root必须且只在slot 0，其余volume必须为Persistent。frontend不得混用且参数必须一致；vhost queues不得超过
+vCPU。zero或one VMM process合法：one只有在role/incarnation、reserved unit、VMM executable path、API path、
+valid process token、Running/verified handshake和完整VM shape全等时合法；任何foreign或duplicate VMM拒绝。
+launch/artifact路径彼此不同，也不得alias device physical path、existing blockd control socket、local-lineage
+data directory或checkpoint mount source/target。`runtime_incarnation`、process/network/device tokens分别不同。
+这些planned token也都不得等于checkpoint中任一existing Blockd process的valid ownership token。
 
 `CleanupRelease`持久化的`inventory_session`/epoch/read position必须逐字段等于用于
 规划该step的已接受`AdmissionInventoryAttestation`及其当前`SessionBinding`；
@@ -1704,8 +1884,8 @@ GuestTransportEvidence =
 | {
     kind: "vsock_ready",
     runtime_incarnation: RandomId128,
-    guest_cid: integer 3..=4294967295,
-    guest_port: integer 1..=65535,
+    guest_cid: integer 3..=4294967294,
+    guest_port: 5000,
     guest_agent_protocol_version: 1,
     guest_boot_id: GuestBootId
   }
@@ -2255,6 +2435,7 @@ Conditions可并存，但`kind="ready"`每个runtime至多一个，其他Conditi
 | `volumes` | 64 | `(volume_id)`；`volume_id`唯一 |
 | `ObservedVolume.local_lineages` | 8 | `(attachment_epoch, attachment_id, data_directory, CJ(item))`；`data_directory`唯一 |
 | `ObservedVolume.devices` | 16 | `(kind rank, physical_path, guest_device.serial, guest_device.slot, CJ(item))`；kernel NBD的`physical_path=device_path`，vhost-user的`physical_path=socket_path`，physical path唯一 |
+| `ReconcileStep.start_runtime.devices` | 64 | `(guest_device.slot)`；slot从0连续、`volume_id`/`guest_device.serial`/physical path/ownership token分别唯一，Root只在slot 0 |
 | `mounts` | 64 | `(volume_id, mount_path, source_path, guest_device.serial, guest_device.slot, access rank, CJ(item))`；physical identity为`(mount_path, source_path)`；完全相同的mount事实合并并累计`instance_count` |
 | `networks` | 16 | `(network_id, tap_name, guest_mac, guest_ipv4, gateway_ipv4, CJ(item))`；`tap_name`唯一 |
 | `RequireIdleCheckpoint.endpoint_guards`、`BlockedReason.active_guards.endpoint_guards`、`PreconditionFailureReason.busy.endpoint_guards` | 256 | `(endpoint_id)`；`endpoint_id`唯一 |
@@ -2292,7 +2473,8 @@ control socket的`socket_path`、checkpoint file的`checkpoint_path`、kernel NB
 
 - **Running**：恰好一个匹配incarnation的VMM process，control handshake verified且state为Running；
   `observed_vm_shape`逐字段匹配vCPU、memory、boot image和guest config；`guest_transport`为绑定同一
-  incarnation的`vsock_ready`。每个Desired volume的size/durability、authority owner/epoch、唯一frontend
+  incarnation、checkpoint CID、fixed port 5000和protocol v1的`vsock_ready`。provider-private inspection还须
+  保持§7.2的artifact/argv/env/unit/cgroup/PID-start/API exact proof；公共projection单独不够。每个Desired volume的size/durability、authority owner/epoch、唯一frontend
   device、Guest serial/slot及要求的UUID/read-write mount逐字段匹配，且无额外volume/device/mount。
   Root不得仍为blank；若本attachment曾执行`provision_root_image`，其generation-1边界必须由exact target
   确认后才允许出现任何device/VMM，后续head只能由同owner/epoch的合法commit单调前进。
@@ -2545,6 +2727,14 @@ Rejoined；`host_destroyed`永不Rejoined，因此在没有tombstone、其他Hos
 | Root provision顺序 | acquire后可有control-only blockd，但exact target确认前NBD/vhost-user device与VMM均不得出现；Persistent initialization不得产生或消费该step |
 | PrepareDevice serving provenance wire | 首次Root的target-control exact handshake及sealed record仍在ProvisionRootImage完成；已有Root/Persistent只使用descriptor-stable direct authorized attachment及closed purpose。只有persistent_uninitialized接受exact blank；其他分支必须nonblank。fixed vectors逐byte绑定provenance、attachment/origin/head/size/durability、独立process/device token及closed frontend；旧三字段、path-only/opaque proof、token/path alias、错误head state及非法vhost queue全部拒绝 |
 | PrepareDevice inventory projection | `ObservedDevice`仅凭path/socket+device token不能证明serving CLI、handshake或vhost queue参数；scanner必须从provider-private exact process/CLI/socket evidence闭合，任何缺失/冲突保持fail closed |
+| PrepareNetwork checkpoint CAS / crash | 首次CAS只持久exact config/name/token且是该轮唯一effect；runtime incarnation null、Guest transport unavailable、VMM count 0。CAS前kill无reservation；file/parent fsync任一点kill按同一step恢复，不创建tap或StartRuntime |
+| PrepareNetwork token/physical冲突 | network token与任一valid serving process/device token相同、same-name foreign/missing/corrupt token、duplicate tap、重叠IPv4或ABA都拒绝且零修改；logical Cat/network/MAC不能推导token/name |
+| PrepareNetwork create response loss | checkpoint accepted full absent后才create/adopt；EOF/timeout后只靠新的full inventory exact projection+provider proof结算。exact present被接受后的下一轮才CAS StartRuntime，不能一轮跨两个effect |
+| StartRuntime wire/fixed vector | 冻结launcher/VMM/kernel/initramfs path+positive length+SHA、exact cmdline/shape/digests、CID、全部paths/network/devices，并从kernel/initramfs/cmdline+protocol v1重算`guest_config_digest`。Root必须slot0且其余Persistent；旧三字段、CID ANY、mixed frontend、queue>vCPU、artifact缺失/零length、boot profile drift、token/path alias与非exact `cats-vmm-<inc>.service`均F0拒绝 |
+| Node-global Guest CID allocation | global flock内完整checkpoint/live-VMM scan；N个validated occupied只检查N+1个candidate且排除0..2/ANY。CAS轮只写reservation；duplicate/uncheckpointed live CID或scanner unavailable不启动VMM |
+| StartRuntime artifact/path replacement | checkpoint后替换任一installed byte/path、symlink/rename ABA、API/vsock/RAM/log预存在、launch path与blockd control/lineage/mount alias都零unlink/零truncate/零spawn并fail closed |
+| StartRuntime create response loss | 新full inspection逐字段闭合unit/cgroup/MainPID/start/exe/argv/env/fds/API peer+handshake/network/devices/CID后才adopt；公共ProcessEvidence alone、basename或unit name不够。zero exact才重试同attempt；foreign/duplicate/late不stop、不覆盖、不启第二实例 |
+| StartRuntime cancel/late linearization | linearization前只清同attempt exclusive unpublished file；模糊或已linearize先fresh inspect。exact late旧incarnation不开route并由后继独立stop step处理；PID/start/socket/unit ABA使旧cleanup零signal/零unlink |
 | 新物理实例遇到旧token | 每个新create attempt使用新token；名称/path已有不同token时Quarantine，不覆写/adopt/删除 |
 | Running 改盘/shape | 请求先 PreconditionFailed(MustBeCold)；Cold 成功后的新请求才改完整 spec |
 | `R < L` + remote down | Suspend 可完成；Warm/Cold/detach/migrate 阻塞且唯一数据保留 |
@@ -2741,6 +2931,28 @@ checkpoint_content_digest = sha256:f4f5073559b8918c500ac706bb395afa9958f309ae878
 
 ```text
 checkpoint_content_digest = sha256:7ea5745da9320827d9e7370a03e1d8743c53bcd7ee88fa86c701ec5d98ed9ed8
+```
+
+**PrepareNetwork checkpoint vector**使用同一个checkpoint-content domain。它刻意只持久network
+reservation，top-level network projection仍为空，证明CAS轮没有顺带创建tap：
+
+```json
+{"cat_id":"cat_01","desired_revision":7,"guest_transport":{"kind":"unavailable"},"lifecycle_admission":"closed","mounts":[],"networks":[],"node_id":"node_a","placement_epoch":3,"processes":[],"require_idle":{"kind":"not_applicable"},"route_gates":[],"runtime_incarnation":null,"spec_digest":"sha256:529c32e8600910283f99bf949af5c31fdadcf3757463eb6c4811c61673ed9409","stable_state":null,"step":{"kind":"prepare_network","network":{"network_config":{"gateway_ipv4":"10.240.0.5","guest_ipv4":"10.240.0.6","guest_mac":"02:ca:0a:f0:00:06","kind":"isolated_ipv4","network_id":"net_01","prefix_length":30},"ownership_token":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","tap_name":"cats0001"}},"updated_at_unix_ms":1720000000000,"version":1,"volumes":[],"warm_snapshot":{"kind":"absent"}}
+```
+
+```text
+checkpoint_content_digest = sha256:ab1b7e329ae084752c635224a9c60db7284d2b405a9d58f45a9ba693a21c5256
+```
+
+**StartRuntime checkpoint vector**使用同一个checkpoint-content domain。它冻结accepted exact tap、Root
+slot 0 frontend、boot artifacts/shape/CID及全部launch path；`processes=[]`表示物理create尚未发生：
+
+```json
+{"cat_id":"cat_01","desired_revision":7,"guest_transport":{"kind":"unavailable"},"lifecycle_admission":"closed","mounts":[],"networks":[{"gateway_ipv4":"10.240.0.5","guest_ipv4":"10.240.0.6","guest_mac":"02:ca:0a:f0:00:06","kind":"isolated_ipv4","network_id":"net_01","ownership_token":{"kind":"valid","ownership_token":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"},"prefix_length":30,"tap_name":"cats0001"}],"node_id":"node_a","placement_epoch":3,"processes":[],"require_idle":{"kind":"not_applicable"},"route_gates":[],"runtime_incarnation":"55555555555555555555555555555555","spec_digest":"sha256:aad5d63a496f538b00b9eb27bbe1133ec83f5b238b14cb4e19d604fdcd99a6f8","stable_state":null,"step":{"api_socket_path":"/run/cats/cat_01/vmm-api.sock","boot":{"initramfs":{"content_sha256":"sha256:1111111111111111111111111111111111111111111111111111111111111111","length":8388608,"path":"/opt/cats/guest/initramfs.img"},"kernel":{"content_sha256":"sha256:0000000000000000000000000000000000000000000000000000000000000000","length":16777216,"path":"/opt/cats/guest/vmlinuz"},"kernel_cmdline":"console=ttyS0 root=/dev/vda rw clocksource=kvm-clock","vmm_executable":{"content_sha256":"sha256:4444444444444444444444444444444444444444444444444444444444444444","length":33554432,"path":"/usr/bin/cloud-hypervisor"}},"boot_image_digest":"sha256:0000000000000000000000000000000000000000000000000000000000000000","devices":[{"guest_device":{"serial":"cats-root","slot":0},"kind":"vhost_user_blk","ownership_token":"88888888888888888888888888888888","queue_size":256,"queues":2,"socket_path":"/run/cats/cat_01/root-vhost.sock","volume_id":"vol_root"}],"guest_cid":3,"guest_config_digest":"sha256:78215611e8c3bd683eb542b5696a6316156365a94624c7521446ab5660d067e2","kind":"start_runtime","launcher_executable":{"content_sha256":"sha256:3333333333333333333333333333333333333333333333333333333333333333","length":1048576,"path":"/usr/libexec/cats-vmm-launcher"},"memory_bytes":2147483648,"memory_file_path":"/var/lib/cats/cat_01/memory.bin","network":{"network_config":{"gateway_ipv4":"10.240.0.5","guest_ipv4":"10.240.0.6","guest_mac":"02:ca:0a:f0:00:06","kind":"isolated_ipv4","network_id":"net_01","prefix_length":30},"ownership_token":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","tap_name":"cats0001"},"process_identity_token":"66666666666666666666666666666666","runtime_incarnation":"55555555555555555555555555555555","scope_id":"cats-vmm-55555555555555555555555555555555.service","serial_log_path":"/var/log/cats/cat_01/serial.log","vcpus":2,"vmm_log_path":"/var/log/cats/cat_01/vmm.log","vsock_socket_path":"/run/cats/cat_01/vmm-vsock.sock"},"updated_at_unix_ms":1720000000000,"version":1,"volumes":[{"authority":{"attachment_epoch":8,"attachment_id":"att_01","head":{"generation":4,"root_hash":"sha256:2222222222222222222222222222222222222222222222222222222222222222","root_object_id":"volumes/vol_root/roots/4"},"kind":"owned"},"devices":[{"guest_device":{"serial":"cats-root","slot":0},"kind":"vhost_user_blk","ownership_token":{"kind":"valid","ownership_token":"88888888888888888888888888888888"},"socket_path":"/run/cats/cat_01/root-vhost.sock"}],"disk_id":"disk_root","disk_kind":"root","durability":"strict","local_lineages":[{"acquire_origin":{"kind":"normal","transition_id":"13579bdf2468ace013579bdf2468ace0"},"attachment_epoch":8,"attachment_id":"att_01","data_directory":"/var/lib/cats/vol_root","fenced":false,"local_durable_generation":5,"node_id":"node_a","pending_pack_count":1,"placement_epoch":3,"remote_durable_generation":4,"state":"active"}],"size_bytes":4294967296,"volume_id":"vol_root","volume_intent_id":"vint_root"}],"warm_snapshot":{"kind":"absent"}}
+```
+
+```text
+checkpoint_content_digest = sha256:47485c632e606032e9b866cded68152f0b6ccc265a2b649a3b77dd329e5b12c2
 ```
 
 **Non-empty full inventory vector**使用同一个inventory domain。它刻意包含两个frontend、两个tap、

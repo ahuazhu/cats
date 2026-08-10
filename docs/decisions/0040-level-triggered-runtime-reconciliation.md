@@ -172,14 +172,46 @@ placement authority；晚到的本地结果绑定精确 incarnation，由下一�
 - 新Root image provision同样只用现有checkpoint和head CAS：`acquire_volume -> provision_root_image ->
   prepare_device`，step绑定image、size、attachment、blank和纯确定target；模糊结果只认exact target或exact
   blank，不把任意非零generation当成功，也不增加receipt；
-- process/scope/socket 使用 runtime incarnation、start time 和 handshake；
-- NBD/tap 使用完整 inventory 与 checkpoint ownership token；
+- process/scope/socket 使用 runtime incarnation、start time、exact executable/argv/env/cgroup和handshake；
+- NBD使用完整inventory与checkpoint ownership token；tap另有独立的`PrepareNetwork` reservation，不能从
+  Cat、logical network或其他token推导名称或token；
 - WarmRuntimeSnapshot使用temp identity、文件metadata和VMM postcondition；DiskSnapshot走Volume
   Authority的单一`DiskSnapshotRecord`；
 - route使用AdmissionCell中的runtime incarnation/per-Endpoint route epoch compare-and-guard；全局
   desired revision仍用于reconcile和signer snapshot，不进入Grant serving binding。
 
 planner 的逐步 token、条件和晚到结果处理以 Runtime Reconciliation spec 的表格为准。
+
+V1启动链固定为`PrepareDevice -> PrepareNetwork -> StartRuntime`，三个step不能合并。`PrepareNetwork`
+的checkpoint replace是该轮唯一effect：它持久完整`NetworkConfig`、Linux IFNAMSIZ范围内的随机
+`tap_name`及独立`ownership_token`，fsync后必须先取得新的accepted full inventory；只有其中证明tap
+absent或逐字段exact present时，下一轮才可create/adopt，一次模糊结果后也只能再读fresh full。再次得到
+exact present的accepted full后，后续另一轮才能CAS到`StartRuntime`。同名foreign/missing/corrupt token、
+重复tap、地址冲突或ABA均保持原物并fail closed，不能由旧`RuntimeLaunchPort`或一次旧inventory旁路。
+
+`StartRuntime`是可独立重启解释的完整launch expectation，而不是三字段提示。它冻结runtime incarnation、
+transient service、独立process token，actual installed runtime configuration选择的launcher/VMM/kernel/
+optional initramfs canonical HostPath、length与content SHA-256，exact kernel cmdline，vCPU/memory及
+boot/Guest-config digest，API/vsock/memory/serial/VMM-log路径，一个exact network和按Guest slot排序的全部
+exact device inputs。Root必须且只在slot 0，其余只能是Persistent；frontend的`direct`或vhost
+queues/queue-size不得丢失。该provenance不假设新的release installer、manifest或receipt authority；Node用
+固定safe reader从实际ChConfig选择构造，并在restart/start/adopt前descriptor-stable重开、重算和逐字段比较。
+`guest_config_digest`还必须由checkpoint kernel digest、optional initramfs digest、exact cmdline及Guest Agent
+protocol v1按既有`GuestRuntimeProfileReceipt` domain重算，且等于current Desired选择的approved digest；不能让
+Guest回显一个与实际boot bytes无关的digest。
+
+Guest CID是Node-global持久reservation，范围固定`3..=u32::MAX-1`（排除`VMADDR_CID_ANY`）。分配持有同一
+Node-global allocation flock，在一次严格有界的checkpoint namespace/full live-VMM scan中闭合所有reservation；
+若validated occupied count为N，只检查N+1个连续candidate（每Node assigned上限使其至多1025），选中后只做
+checkpoint replace并fsync。V1 Guest Agent vsock port固定为5000，因此不在step复制第二份authority；inventory
+中的任何Ready transport必须回显checkpoint CID、同incarnation、port 5000和protocol v1。
+
+启动端只允许no-replace创建全部socket/RAM/log路径和exact transient service，不预先unlink或truncate。
+launcher以已验证descriptor启动并`exec`成checkpointed VMM；inspection必须同时闭合systemd ExecStart、唯一
+MainPID/PID start/executable/cgroup、完整argv/env、API peer与VMM handshake。create响应丢失只允许一次fresh
+full inspection并adopt exact instance；duplicate/foreign/late/ABA一律不stop、不覆盖、不重启第二实例。取消在
+本地linearization前只清理同token未发布资源；linearization后先按同一exact inspection结算，再由后继revision
+以独立checkpoint-first effect收敛。
 
 standalone scope/socket只在token/path唯一匹配某个Cat checkpoint且当前Desired/tombstone
 仍证实该归属时，才进入该Cat的cleanup step。删除checkpoint文件自身不能由该文件
