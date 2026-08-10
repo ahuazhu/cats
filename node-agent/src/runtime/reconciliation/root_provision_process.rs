@@ -7,6 +7,7 @@
 //! is resolved by inspection; it is never retried in the same reconciliation
 //! unit and a mismatching process is never stopped by name.
 
+use std::cmp::Ordering;
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
 
@@ -612,13 +613,16 @@ pub(crate) enum NodeGlobalManagedProcessExpectation {
         expectation: Box<super::serving_blockd_process::ServingBlockdExpectation>,
         exact: Option<Box<super::serving_blockd_process::ExactServingBlockdProcessProof>>,
     },
+    Vmm {
+        expectation: Box<super::vmm_process::VmmProcessExpectation>,
+        exact: Option<Box<super::vmm_process::ExactVmmProcessProof>>,
+    },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub(crate) enum NodeGlobalManagedProcessRole {
     RootControl,
     ServingBlockd,
-    #[allow(dead_code)] // Filled by the VMM scanner stage.
     Vmm,
 }
 
@@ -693,6 +697,10 @@ impl NodeGlobalManagedProcessExpectation {
                 cat_id: expectation.cat_id().clone(),
                 role: NodeGlobalManagedProcessRole::ServingBlockd,
             },
+            Self::Vmm { expectation, .. } => NodeGlobalManagedProcessKey {
+                cat_id: expectation.cat_id().clone(),
+                role: NodeGlobalManagedProcessRole::Vmm,
+            },
         }
     }
 }
@@ -740,7 +748,14 @@ impl NodeGlobalManagedProcessScanAdmission {
                         .or_default()
                         .extend(exact.clone().map(|proof| proof.into_process_evidence()))
                 }
+                NodeGlobalManagedProcessExpectation::Vmm { expectation, exact } => projections
+                    .entry(expectation.cat_id().clone())
+                    .or_default()
+                    .extend(exact.clone().map(|proof| proof.into_process_evidence())),
             }
+        }
+        for processes in projections.values_mut() {
+            processes.sort_by(compare_process_evidence);
         }
         projections.retain(|_, processes| !processes.is_empty());
         projections
@@ -886,6 +901,16 @@ impl NodeGlobalManagedProcessScanAdmission {
                                 "stop receipt socket aliases a ServingBlockd owner"
                             );
                         }
+                        NodeGlobalManagedProcessExpectation::Vmm {
+                            expectation,
+                            exact: Some(_),
+                        } => {
+                            anyhow::ensure!(
+                                path != expectation.api_socket_path()
+                                    && path != expectation.vsock_socket_path(),
+                                "stop receipt socket aliases a VMM owner"
+                            );
+                        }
                         _ => {}
                     }
                 }
@@ -910,6 +935,9 @@ impl NodeGlobalManagedProcessScanAdmission {
                 NodeGlobalManagedProcessExpectation::ServingBlockd {
                     exact: Some(proof), ..
                 } => Some(proof.evidence().unit_id().clone()),
+                NodeGlobalManagedProcessExpectation::Vmm {
+                    exact: Some(proof), ..
+                } => Some(proof.evidence().unit_id().clone()),
                 _ => None,
             })
             .collect::<BTreeSet<_>>();
@@ -923,22 +951,35 @@ impl NodeGlobalManagedProcessScanAdmission {
                 NodeGlobalManagedProcessExpectation::ServingBlockd {
                     exact: Some(proof), ..
                 } => Some(proof.evidence().process_id()),
+                NodeGlobalManagedProcessExpectation::Vmm {
+                    exact: Some(proof), ..
+                } => Some(proof.evidence().process_id()),
                 _ => None,
             })
             .collect::<BTreeSet<_>>();
-        let mut sockets = self
-            .entries
-            .iter()
-            .filter_map(|entry| match entry {
+        let mut sockets = BTreeSet::new();
+        for entry in &self.entries {
+            match entry {
                 NodeGlobalManagedProcessExpectation::RootControl {
                     exact: Some(proof), ..
-                } => Some(proof.evidence().control_socket_path.clone()),
+                } => {
+                    sockets.insert(proof.evidence().control_socket_path.clone());
+                }
                 NodeGlobalManagedProcessExpectation::ServingBlockd {
                     exact: Some(proof), ..
-                } => Some(proof.evidence().control_socket_path().clone()),
-                _ => None,
-            })
-            .collect::<BTreeSet<_>>();
+                } => {
+                    sockets.insert(proof.evidence().control_socket_path().clone());
+                    sockets.insert(proof.evidence().listener_path().clone());
+                }
+                NodeGlobalManagedProcessExpectation::Vmm {
+                    exact: Some(proof), ..
+                } => {
+                    sockets.insert(proof.evidence().api_socket_path().clone());
+                    sockets.insert(proof.evidence().vsock_socket_path().clone());
+                }
+                _ => {}
+            }
+        }
         let mut keys = self
             .entries
             .iter()
@@ -959,7 +1000,8 @@ impl NodeGlobalManagedProcessScanAdmission {
                 anyhow::ensure!(
                     units.insert(evidence.unit_id().clone())
                         && pids.insert(evidence.process_id())
-                        && sockets.insert(evidence.control_socket_path().clone()),
+                        && sockets.insert(evidence.control_socket_path().clone())
+                        && sockets.insert(evidence.listener_path().clone()),
                     "Node-global serving proof duplicates a physical identity"
                 );
             }
@@ -990,6 +1032,7 @@ impl NodeGlobalManagedProcessScanAdmission {
                 } => Some((expectation.cat_id.clone(), (**proof).clone())),
                 NodeGlobalManagedProcessExpectation::RootControl { exact: None, .. } => None,
                 NodeGlobalManagedProcessExpectation::ServingBlockd { .. } => None,
+                NodeGlobalManagedProcessExpectation::Vmm { .. } => None,
             })
             .collect()
     }
@@ -1001,6 +1044,121 @@ impl NodeGlobalManagedProcessScanAdmission {
             .iter()
             .filter_map(|entry| match entry {
                 NodeGlobalManagedProcessExpectation::ServingBlockd {
+                    expectation,
+                    exact: Some(proof),
+                } => Some((expectation.cat_id().clone(), (**proof).clone())),
+                _ => None,
+            })
+            .collect()
+    }
+
+    pub(crate) fn with_vmms(
+        mut self,
+        expected: BTreeMap<Id, super::vmm_process::VmmProcessExpectation>,
+        mut exact: BTreeMap<Id, super::vmm_process::ExactVmmProcessProof>,
+    ) -> anyhow::Result<Self> {
+        let mut units = self
+            .entries
+            .iter()
+            .filter_map(|entry| match entry {
+                NodeGlobalManagedProcessExpectation::RootControl {
+                    exact: Some(proof), ..
+                } => Some(proof.evidence().scope_id.clone()),
+                NodeGlobalManagedProcessExpectation::ServingBlockd {
+                    exact: Some(proof), ..
+                } => Some(proof.evidence().unit_id().clone()),
+                NodeGlobalManagedProcessExpectation::Vmm {
+                    exact: Some(proof), ..
+                } => Some(proof.evidence().unit_id().clone()),
+                _ => None,
+            })
+            .collect::<BTreeSet<_>>();
+        let mut pids = self
+            .entries
+            .iter()
+            .filter_map(|entry| match entry {
+                NodeGlobalManagedProcessExpectation::RootControl {
+                    exact: Some(proof), ..
+                } => Some(proof.evidence().process_id),
+                NodeGlobalManagedProcessExpectation::ServingBlockd {
+                    exact: Some(proof), ..
+                } => Some(proof.evidence().process_id()),
+                NodeGlobalManagedProcessExpectation::Vmm {
+                    exact: Some(proof), ..
+                } => Some(proof.evidence().process_id()),
+                _ => None,
+            })
+            .collect::<BTreeSet<_>>();
+        let mut sockets = BTreeSet::new();
+        for entry in &self.entries {
+            match entry {
+                NodeGlobalManagedProcessExpectation::RootControl {
+                    exact: Some(proof), ..
+                } => {
+                    sockets.insert(proof.evidence().control_socket_path.clone());
+                }
+                NodeGlobalManagedProcessExpectation::ServingBlockd {
+                    exact: Some(proof), ..
+                } => {
+                    sockets.insert(proof.evidence().control_socket_path().clone());
+                    sockets.insert(proof.evidence().listener_path().clone());
+                }
+                NodeGlobalManagedProcessExpectation::Vmm {
+                    exact: Some(proof), ..
+                } => {
+                    sockets.insert(proof.evidence().api_socket_path().clone());
+                    sockets.insert(proof.evidence().vsock_socket_path().clone());
+                }
+                _ => {}
+            }
+        }
+        let mut keys = self
+            .entries
+            .iter()
+            .map(NodeGlobalManagedProcessExpectation::key)
+            .collect::<BTreeSet<_>>();
+        for (cat_id, expectation) in expected {
+            anyhow::ensure!(
+                expectation.cat_id() == &cat_id,
+                "Node-global VMM expectation is indexed by another Cat"
+            );
+            let proof = exact.remove(&cat_id);
+            if let Some(proof) = &proof {
+                anyhow::ensure!(
+                    proof.expectation() == &expectation,
+                    "Node-global VMM proof changed its full expectation"
+                );
+                let evidence = proof.evidence();
+                anyhow::ensure!(
+                    units.insert(evidence.unit_id().clone())
+                        && pids.insert(evidence.process_id())
+                        && sockets.insert(evidence.api_socket_path().clone())
+                        && sockets.insert(evidence.vsock_socket_path().clone()),
+                    "Node-global VMM proof duplicates a physical identity"
+                );
+            }
+            let entry = NodeGlobalManagedProcessExpectation::Vmm {
+                expectation: Box::new(expectation),
+                exact: proof.map(Box::new),
+            };
+            anyhow::ensure!(
+                keys.insert(entry.key()),
+                "Node-global managed-process admission duplicates one typed key"
+            );
+            self.entries.push(entry);
+        }
+        anyhow::ensure!(
+            exact.is_empty(),
+            "Node-global VMM proof lacks an authoritative expectation"
+        );
+        Ok(self)
+    }
+
+    pub(crate) fn vmm_proofs(&self) -> BTreeMap<Id, super::vmm_process::ExactVmmProcessProof> {
+        self.entries
+            .iter()
+            .filter_map(|entry| match entry {
+                NodeGlobalManagedProcessExpectation::Vmm {
                     expectation,
                     exact: Some(proof),
                 } => Some((expectation.cat_id().clone(), (**proof).clone())),
@@ -1039,7 +1197,16 @@ impl NodeGlobalManagedProcessScanAdmission {
                         .or_insert_with(Vec::new)
                         .extend(exact.clone().map(|proof| proof.into_process_evidence()));
                 }
+                NodeGlobalManagedProcessExpectation::Vmm { expectation, exact } => {
+                    admitted_processes
+                        .entry(expectation.cat_id().clone())
+                        .or_insert_with(Vec::new)
+                        .extend(exact.clone().map(|proof| proof.into_process_evidence()));
+                }
             }
+        }
+        for processes in admitted_processes.values_mut() {
+            processes.sort_by(compare_process_evidence);
         }
         for runtime in &observation.runtimes {
             let expected = admitted_processes.remove(&runtime.cat_id);
@@ -1104,6 +1271,51 @@ impl NodeGlobalManagedProcessScanAdmission {
     }
 }
 
+fn compare_process_evidence(left: &ProcessEvidence, right: &ProcessEvidence) -> Ordering {
+    match (&left.role, &right.role) {
+        (
+            ProcessRole::Vmm {
+                runtime_incarnation: left_incarnation,
+            },
+            ProcessRole::Vmm {
+                runtime_incarnation: right_incarnation,
+            },
+        ) => left_incarnation
+            .as_str()
+            .cmp(right_incarnation.as_str())
+            .then_with(|| {
+                left.process_start_time_ticks
+                    .get()
+                    .cmp(&right.process_start_time_ticks.get())
+            })
+            .then_with(|| left.process_id.cmp(&right.process_id)),
+        (ProcessRole::Vmm { .. }, ProcessRole::Blockd { .. }) => Ordering::Less,
+        (ProcessRole::Blockd { .. }, ProcessRole::Vmm { .. }) => Ordering::Greater,
+        (
+            ProcessRole::Blockd {
+                volume_id: left_volume,
+                attachment_id: left_attachment,
+                attachment_epoch: left_epoch,
+            },
+            ProcessRole::Blockd {
+                volume_id: right_volume,
+                attachment_id: right_attachment,
+                attachment_epoch: right_epoch,
+            },
+        ) => left_volume
+            .as_str()
+            .cmp(right_volume.as_str())
+            .then_with(|| left_epoch.get().cmp(&right_epoch.get()))
+            .then_with(|| left_attachment.as_str().cmp(right_attachment.as_str()))
+            .then_with(|| {
+                left.process_start_time_ticks
+                    .get()
+                    .cmp(&right.process_start_time_ticks.get())
+            })
+            .then_with(|| left.process_id.cmp(&right.process_id)),
+    }
+}
+
 impl NodeGlobalManagedProcessAdmission {
     pub(crate) fn stop_receipt_socket(&self, cat_id: &Id) -> Option<&StopReceiptSocketAdmission> {
         self.stop_receipt_sockets.get(cat_id)
@@ -1151,7 +1363,8 @@ impl NodeGlobalManagedProcessAdmission {
                             }),
                     );
                 }
-                NodeGlobalManagedProcessExpectation::ServingBlockd { .. } => {}
+                NodeGlobalManagedProcessExpectation::ServingBlockd { .. }
+                | NodeGlobalManagedProcessExpectation::Vmm { .. } => {}
             }
         }
         (expected, admitted)
@@ -1185,6 +1398,33 @@ impl NodeGlobalManagedProcessAdmission {
         (expected, admitted)
     }
 
+    pub(crate) fn vmm_state(
+        &self,
+    ) -> (
+        BTreeMap<Id, super::vmm_process::VmmProcessExpectation>,
+        BTreeMap<Id, super::vmm_process::VmmProcessInspection>,
+    ) {
+        let mut expected = BTreeMap::new();
+        let mut admitted = BTreeMap::new();
+        for entry in &self.entries {
+            if let NodeGlobalManagedProcessExpectation::Vmm { expectation, exact } = entry {
+                expected.insert(expectation.cat_id().clone(), (**expectation).clone());
+                admitted.insert(
+                    expectation.cat_id().clone(),
+                    exact.as_ref().map_or(
+                        super::vmm_process::VmmProcessInspection::Absent,
+                        |proof| {
+                            super::vmm_process::VmmProcessInspection::Exact(Box::new(
+                                proof.evidence().clone(),
+                            ))
+                        },
+                    ),
+                );
+            }
+        }
+        (expected, admitted)
+    }
+
     pub(crate) fn root_control(
         &self,
         cat_id: &Id,
@@ -1199,7 +1439,8 @@ impl NodeGlobalManagedProcessAdmission {
                 Some((expectation.as_ref(), exact.as_deref()))
             }
             NodeGlobalManagedProcessExpectation::RootControl { .. } => None,
-            NodeGlobalManagedProcessExpectation::ServingBlockd { .. } => None,
+            NodeGlobalManagedProcessExpectation::ServingBlockd { .. }
+            | NodeGlobalManagedProcessExpectation::Vmm { .. } => None,
         })
     }
 
@@ -1212,6 +1453,23 @@ impl NodeGlobalManagedProcessAdmission {
     )> {
         self.entries.iter().find_map(|entry| match entry {
             NodeGlobalManagedProcessExpectation::ServingBlockd { expectation, exact }
+                if expectation.cat_id() == cat_id =>
+            {
+                Some((expectation.as_ref(), exact.as_deref()))
+            }
+            _ => None,
+        })
+    }
+
+    pub(crate) fn vmm(
+        &self,
+        cat_id: &Id,
+    ) -> Option<(
+        &super::vmm_process::VmmProcessExpectation,
+        Option<&super::vmm_process::ExactVmmProcessProof>,
+    )> {
+        self.entries.iter().find_map(|entry| match entry {
+            NodeGlobalManagedProcessExpectation::Vmm { expectation, exact }
                 if expectation.cat_id() == cat_id =>
             {
                 Some((expectation.as_ref(), exact.as_deref()))
