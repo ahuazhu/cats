@@ -64,6 +64,10 @@ pub(crate) struct KernelNbdInventoryConfig {
     sys_block_root: PathBuf,
     proc_root: PathBuf,
     nbd_client_binary: PathBuf,
+    // `nbd-client` inherits this Node process identity. Freeze it with the
+    // rest of the installed scanner configuration instead of reinterpreting a
+    // later effective-uid change as exact provider evidence.
+    client_process_user_id: u32,
     device_count: u32,
 }
 
@@ -93,6 +97,7 @@ impl KernelNbdInventoryConfig {
             sys_block_root: PathBuf::from("/sys/block"),
             proc_root: PathBuf::from("/proc"),
             nbd_client_binary,
+            client_process_user_id: effective_user_id(),
             device_count,
         })
     }
@@ -110,6 +115,7 @@ impl KernelNbdInventoryConfig {
             sys_block_root,
             proc_root,
             nbd_client_binary,
+            client_process_user_id: effective_user_id(),
             device_count,
         }
     }
@@ -1242,6 +1248,65 @@ struct KernelTuple {
     size_sectors: u64,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct KernelNbdProcessCoordinate {
+    device: u64,
+    inode: u64,
+    mode: u32,
+    user_id: u32,
+}
+
+impl KernelNbdProcessCoordinate {
+    fn from_metadata(metadata: &Metadata) -> Self {
+        Self {
+            device: metadata.dev(),
+            inode: metadata.ino(),
+            mode: metadata.mode(),
+            user_id: metadata.uid(),
+        }
+    }
+}
+
+/// One bounded `/proc/<pid>` sample. Stable negative identity evidence is a
+/// non-allocatable slot state, not an unavailable read of every other device
+/// in the pool. Retaining the sampled coordinates lets `inspect_slot` reject
+/// a changed process coordinate, start time, executable or argv between its
+/// two samples.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum KernelNbdClientSample {
+    Exact {
+        process: KernelNbdProcessCoordinate,
+        identity: KernelNbdClientIdentity,
+    },
+    NonExact(KernelNbdNonExactClientSample),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum KernelNbdNonExactClientSample {
+    ProcessAbsent,
+    NotDirectory(KernelNbdProcessCoordinate),
+    StatAbsent(KernelNbdProcessCoordinate),
+    ForeignOwner {
+        process: KernelNbdProcessCoordinate,
+        start_time_ticks: WireU64,
+    },
+    ExecutableAbsent {
+        process: KernelNbdProcessCoordinate,
+        start_time_ticks: WireU64,
+    },
+    ForeignExecutable {
+        process: KernelNbdProcessCoordinate,
+        start_time_ticks: WireU64,
+        executable: PathBuf,
+    },
+    ForeignArguments {
+        process: KernelNbdProcessCoordinate,
+        start_time_ticks: WireU64,
+        executable: PathBuf,
+        arguments: Vec<OsString>,
+    },
+}
+
 fn inspect_slot(
     config: &KernelNbdInventoryConfig,
     index: u32,
@@ -1250,50 +1315,55 @@ fn inspect_slot(
 ) -> Result<KernelNbdSlotState> {
     let slot = config.sys_block_root.join(format!("nbd{index}"));
     let before = read_kernel_tuple(&slot, context)?;
-    let state = match before {
+    let client_sample = match before {
+        KernelTuple {
+            process_id: Some(process_id),
+            size_sectors,
+        } if size_sectors > 0 => Some((
+            process_id,
+            sample_exact_client(config, process_id, device_path, size_sectors, context)?,
+        )),
+        KernelTuple {
+            process_id: Some(_),
+            size_sectors: 0,
+        } => anyhow::bail!("kernel-NBD slot has a client pid but zero capacity"),
+        _ => None,
+    };
+    context.check_active()?;
+    let after = read_kernel_tuple(&slot, context)?;
+    anyhow::ensure!(before == after, "kernel-NBD slot changed during inspection");
+    if let Some((process_id, sample)) = client_sample {
+        let repeated = sample_exact_client(
+            config,
+            process_id,
+            device_path,
+            before.size_sectors,
+            context,
+        )?;
+        anyhow::ensure!(
+            repeated == sample,
+            "kernel-NBD client changed during inspection"
+        );
+        return Ok(match sample {
+            KernelNbdClientSample::Exact { identity, .. } => KernelNbdSlotState::Serving(identity),
+            KernelNbdClientSample::NonExact(_) => KernelNbdSlotState::Leaked {
+                recorded_process_id: Some(process_id),
+            },
+        });
+    }
+    Ok(match before {
         KernelTuple {
             process_id: None,
             size_sectors: 0,
         } => KernelNbdSlotState::Free,
         KernelTuple {
-            process_id,
+            process_id: None,
             size_sectors,
-        } if size_sectors > 0 => match process_id {
-            Some(process_id) => {
-                match sample_exact_client(config, process_id, device_path, size_sectors, context)? {
-                    Some(identity) => KernelNbdSlotState::Serving(identity),
-                    None => KernelNbdSlotState::Leaked {
-                        recorded_process_id: Some(process_id),
-                    },
-                }
-            }
-            None => KernelNbdSlotState::Leaked {
-                recorded_process_id: None,
-            },
+        } if size_sectors > 0 => KernelNbdSlotState::Leaked {
+            recorded_process_id: None,
         },
-        KernelTuple {
-            process_id: Some(_),
-            size_sectors: 0,
-        } => anyhow::bail!("kernel-NBD slot has a client pid but zero capacity"),
-        _ => unreachable!("kernel-NBD size cases are exhaustive"),
-    };
-    context.check_active()?;
-    let after = read_kernel_tuple(&slot, context)?;
-    anyhow::ensure!(before == after, "kernel-NBD slot changed during inspection");
-    if let KernelNbdSlotState::Serving(identity) = &state {
-        let repeated = sample_exact_client(
-            config,
-            identity.process_id,
-            device_path,
-            identity.size_sectors.get(),
-            context,
-        )?;
-        anyhow::ensure!(
-            repeated.as_ref() == Some(identity),
-            "kernel-NBD client changed during inspection"
-        );
-    }
-    Ok(state)
+        _ => unreachable!("kernel-NBD tuple cases are exhaustive"),
+    })
 }
 
 fn read_kernel_tuple(slot: &Path, context: &dyn RuntimePhysicalReadContext) -> Result<KernelTuple> {
@@ -1327,23 +1397,33 @@ fn sample_exact_client(
     device_path: &HostPath,
     size_sectors: u64,
     context: &dyn RuntimePhysicalReadContext,
-) -> Result<Option<KernelNbdClientIdentity>> {
+) -> Result<KernelNbdClientSample> {
     let size_sectors = WireU64::new(size_sectors)
         .filter(|sectors| sectors.get() > 0)
         .context("kernel-NBD client has no representable positive sector capacity")?;
     let process = config.proc_root.join(process_id.to_string());
     let process_metadata = match std::fs::metadata(&process) {
         Ok(metadata) => metadata,
-        Err(source) if source.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(source) if source.kind() == io::ErrorKind::NotFound => {
+            return Ok(KernelNbdClientSample::NonExact(
+                KernelNbdNonExactClientSample::ProcessAbsent,
+            ));
+        }
         Err(source) => return Err(source).context("inspect kernel-NBD client process"),
     };
-    anyhow::ensure!(
-        process_metadata.is_dir() && process_metadata.uid() == effective_user_id(),
-        "kernel-NBD slot is served by a foreign process owner"
-    );
+    let process_coordinate = KernelNbdProcessCoordinate::from_metadata(&process_metadata);
+    if !process_metadata.is_dir() {
+        return Ok(KernelNbdClientSample::NonExact(
+            KernelNbdNonExactClientSample::NotDirectory(process_coordinate),
+        ));
+    }
     let stat = match read_optional_bounded(&process.join("stat"), MAX_PROC_STAT_BYTES, context)? {
         Some(stat) => stat,
-        None => return Ok(None),
+        None => {
+            return Ok(KernelNbdClientSample::NonExact(
+                KernelNbdNonExactClientSample::StatAbsent(process_coordinate),
+            ));
+        }
     };
     let stat = std::str::from_utf8(&stat).context("kernel-NBD client stat is not UTF-8")?;
     let (_, after_comm) = stat
@@ -1358,40 +1438,79 @@ fn sample_exact_client(
     let start_time_ticks = WireU64::new(start_time_ticks)
         .filter(|value| value.get() > 0)
         .context("kernel-NBD client start time is zero")?;
+    if process_metadata.uid() != config.client_process_user_id {
+        return Ok(KernelNbdClientSample::NonExact(
+            KernelNbdNonExactClientSample::ForeignOwner {
+                process: process_coordinate,
+                start_time_ticks,
+            },
+        ));
+    }
     context.check_active()?;
     let executable = match std::fs::read_link(process.join("exe")) {
         Ok(executable) => executable,
-        Err(source) if source.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(source) if source.kind() == io::ErrorKind::NotFound => {
+            return Ok(KernelNbdClientSample::NonExact(
+                KernelNbdNonExactClientSample::ExecutableAbsent {
+                    process: process_coordinate,
+                    start_time_ticks,
+                },
+            ));
+        }
         Err(source) => return Err(source).context("read kernel-NBD client executable"),
     };
-    anyhow::ensure!(
-        executable == config.nbd_client_binary,
-        "kernel-NBD slot is served by a foreign executable"
-    );
+    if executable != config.nbd_client_binary {
+        return Ok(KernelNbdClientSample::NonExact(
+            KernelNbdNonExactClientSample::ForeignExecutable {
+                process: process_coordinate,
+                start_time_ticks,
+                executable,
+            },
+        ));
+    }
     let command_line =
         read_required_bounded(&process.join("cmdline"), MAX_PROC_CMDLINE_BYTES, context)?;
     let arguments = parse_nul_arguments(&command_line)?;
     let expected_device = OsString::from(device_path.as_str());
-    anyhow::ensure!(
-        arguments.len() == 9
-            && Path::new(&arguments[0]) == config.nbd_client_binary
-            && arguments[1] == NBD_IOCTL_MODE
-            && arguments[2] == "-unix"
-            && arguments[4] == expected_device
-            && arguments[5] == "-b"
-            && arguments[6] == "512"
-            && arguments[7] == "-N"
-            && arguments[8].is_empty(),
-        "kernel-NBD client argv is not the frozen ioctl invocation"
-    );
-    let socket = Path::new(&arguments[3]);
-    let listener_socket_path = HostPath::new(
-        socket
-            .to_str()
-            .context("kernel-NBD listener socket path is not UTF-8")?
-            .to_owned(),
-    )
-    .context("kernel-NBD listener socket is not a canonical HostPath")?;
+    if !(arguments.len() == 9
+        && Path::new(&arguments[0]) == config.nbd_client_binary
+        && arguments[1] == NBD_IOCTL_MODE
+        && arguments[2] == "-unix"
+        && arguments[4] == expected_device
+        && arguments[5] == "-b"
+        && arguments[6] == "512"
+        && arguments[7] == "-N"
+        && arguments[8].is_empty())
+    {
+        return Ok(KernelNbdClientSample::NonExact(
+            KernelNbdNonExactClientSample::ForeignArguments {
+                process: process_coordinate,
+                start_time_ticks,
+                executable,
+                arguments,
+            },
+        ));
+    }
+    let Some(listener_socket_text) = Path::new(&arguments[3]).to_str() else {
+        return Ok(KernelNbdClientSample::NonExact(
+            KernelNbdNonExactClientSample::ForeignArguments {
+                process: process_coordinate,
+                start_time_ticks,
+                executable,
+                arguments,
+            },
+        ));
+    };
+    let Some(listener_socket_path) = HostPath::new(listener_socket_text.to_owned()) else {
+        return Ok(KernelNbdClientSample::NonExact(
+            KernelNbdNonExactClientSample::ForeignArguments {
+                process: process_coordinate,
+                start_time_ticks,
+                executable,
+                arguments,
+            },
+        ));
+    };
     let executable_path = HostPath::new(
         executable
             .to_str()
@@ -1399,14 +1518,17 @@ fn sample_exact_client(
             .to_owned(),
     )
     .context("kernel-NBD executable is not a canonical HostPath")?;
-    Ok(Some(KernelNbdClientIdentity {
-        process_id,
-        process_start_time_ticks: start_time_ticks,
-        executable_path,
-        listener_socket_path,
-        device_path: device_path.clone(),
-        size_sectors,
-    }))
+    Ok(KernelNbdClientSample::Exact {
+        process: process_coordinate,
+        identity: KernelNbdClientIdentity {
+            process_id,
+            process_start_time_ticks: start_time_ticks,
+            executable_path,
+            listener_socket_path,
+            device_path: device_path.clone(),
+            size_sectors,
+        },
+    })
 }
 
 const NBD_IOCTL_MODE: &str = "-nonetlink";
@@ -1694,7 +1816,7 @@ mod tests {
         )
         .unwrap();
         symlink(client, process.join("exe")).unwrap();
-        let argv = [
+        let argv: [&[u8]; 9] = [
             client.as_os_str().as_bytes(),
             b"-nonetlink",
             b"-unix",
@@ -1705,12 +1827,16 @@ mod tests {
             b"-N",
             b"",
         ];
+        write_nul_arguments(&process.join("cmdline"), &argv);
+    }
+
+    fn write_nul_arguments(path: &Path, arguments: &[&[u8]]) {
         let mut bytes = Vec::new();
-        for argument in argv {
+        for argument in arguments {
             bytes.extend_from_slice(argument);
             bytes.push(0);
         }
-        fs::write(process.join("cmdline"), bytes).unwrap();
+        fs::write(path, bytes).unwrap();
     }
 
     type SubmitAction = dyn Fn(
@@ -2481,16 +2607,120 @@ mod tests {
     }
 
     #[test]
-    fn malformed_or_foreign_serving_identity_fails_closed() {
-        let fixture = Fixture::new(1);
-        fixture.serving(0, 42, "/run/cats/a.sock");
-        fs::write(fixture.proc.join("42/cmdline"), b"foreign\0").unwrap();
-        let port = KernelNbdInventoryPort::new(fixture.config(1));
-        assert!(port.lock_and_inspect(&TestContext::active()).is_err());
+    fn stable_foreign_clients_are_leaked_without_hiding_a_later_free_slot() {
+        #[derive(Debug, Clone, Copy)]
+        enum ForeignClient {
+            Owner,
+            NonDirectory,
+            Executable,
+            Arguments,
+            RelativeListener,
+            NonUtf8Listener,
+        }
 
-        fs::write(fixture.sys.join("nbd0/pid"), b"42\n").unwrap();
-        fs::write(fixture.sys.join("nbd0/size"), b"0\n").unwrap();
-        assert!(port.lock_and_inspect(&TestContext::active()).is_err());
+        for foreign in [
+            ForeignClient::Owner,
+            ForeignClient::NonDirectory,
+            ForeignClient::Executable,
+            ForeignClient::Arguments,
+            ForeignClient::RelativeListener,
+            ForeignClient::NonUtf8Listener,
+        ] {
+            let fixture = Fixture::new(3);
+            fixture.serving(0, 42, "/run/cats/a.sock");
+            let process = fixture.proc.join("42");
+            match foreign {
+                ForeignClient::Owner => {}
+                ForeignClient::NonDirectory => {
+                    fs::remove_dir_all(&process).unwrap();
+                    fs::write(&process, b"not a proc directory").unwrap();
+                }
+                ForeignClient::Executable => {
+                    let foreign_executable = fixture.state.join("foreign-nbd-client");
+                    fs::write(&foreign_executable, b"foreign").unwrap();
+                    fs::remove_file(process.join("exe")).unwrap();
+                    symlink(foreign_executable, process.join("exe")).unwrap();
+                }
+                ForeignClient::Arguments => {
+                    let arguments: [&[u8]; 9] = [
+                        fixture.client.as_os_str().as_bytes(),
+                        b"-nonetlink",
+                        b"-unix",
+                        b"/run/cats/a.sock",
+                        b"/dev/nbd0",
+                        b"-b",
+                        b"4096",
+                        b"-N",
+                        b"",
+                    ];
+                    write_nul_arguments(&process.join("cmdline"), &arguments);
+                }
+                ForeignClient::RelativeListener | ForeignClient::NonUtf8Listener => {
+                    let listener: &[u8] = match foreign {
+                        ForeignClient::RelativeListener => b"relative.sock",
+                        ForeignClient::NonUtf8Listener => b"/run/cats/\xff.sock",
+                        _ => unreachable!(),
+                    };
+                    let arguments: [&[u8]; 9] = [
+                        fixture.client.as_os_str().as_bytes(),
+                        b"-nonetlink",
+                        b"-unix",
+                        listener,
+                        b"/dev/nbd0",
+                        b"-b",
+                        b"512",
+                        b"-N",
+                        b"",
+                    ];
+                    write_nul_arguments(&process.join("cmdline"), &arguments);
+                }
+            }
+
+            let mut config = fixture.config(3);
+            if matches!(foreign, ForeignClient::Owner) {
+                config.client_process_user_id = if effective_user_id() == 0 { 1 } else { 0 };
+            }
+            let port = KernelNbdInventoryPort::new(config);
+            let permit = port.lock_and_inspect(&TestContext::active()).unwrap();
+            assert_eq!(
+                permit.snapshot().state(&host("/dev/nbd0")),
+                Some(&KernelNbdSlotState::Leaked {
+                    recorded_process_id: Some(42),
+                }),
+                "{foreign:?}"
+            );
+            assert_eq!(
+                permit
+                    .select_free(&KernelNbdReservations::default())
+                    .unwrap(),
+                host("/dev/nbd1"),
+                "{foreign:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn malformed_unavailable_or_half_configured_inputs_still_fail_the_pool_scan() {
+        let cases: [fn(&Fixture); 4] = [
+            |fixture| fs::write(fixture.sys.join("nbd0/size"), b"not-a-number\n").unwrap(),
+            |fixture| fs::write(fixture.sys.join("nbd0/size"), vec![b'1'; 65]).unwrap(),
+            |fixture| {
+                fs::write(fixture.sys.join("nbd0/pid"), b"42\n").unwrap();
+                fs::write(fixture.sys.join("nbd0/size"), b"0\n").unwrap();
+            },
+            |fixture| {
+                fixture.serving(0, 42, "/run/cats/a.sock");
+                let stat = fixture.proc.join("42/stat");
+                fs::remove_file(&stat).unwrap();
+                fs::create_dir(&stat).unwrap();
+            },
+        ];
+        for arrange in cases {
+            let fixture = Fixture::new(3);
+            arrange(&fixture);
+            let port = KernelNbdInventoryPort::new(fixture.config(3));
+            assert!(port.lock_and_inspect(&TestContext::active()).is_err());
+        }
     }
 
     #[test]
@@ -2803,7 +3033,12 @@ mod tests {
                         recorded_process_id: None,
                     },
                 ),
-                Drift::Device | Drift::Half => KernelNbdAttachResult::OutcomeUnknown,
+                Drift::Device => KernelNbdAttachResult::ConflictAfterSubmit(
+                    KernelNbdAttachConflict::LeakedOrIncompleteAttachment {
+                        recorded_process_id: Some(47),
+                    },
+                ),
+                Drift::Half => KernelNbdAttachResult::OutcomeUnknown,
             };
             assert_eq!(result, expected);
         }
