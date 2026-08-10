@@ -984,7 +984,8 @@ listener是不可拆分的一个bounded effect，不存在下一轮单独“crea
 CLI/handshake或frontend参数全部fail closed。
 
 serving blockd CLI必须从同一个已fsync的`prepare_device` step取得process token及独立device token；严格parser
-拒绝缺失、非canonical、相同token或control-only携device token。authorized-serving status handshake必须逐字段
+拒绝缺失、非canonical、相同token或control-only携device token，并要求恰好一种与closed frontend plan一致的
+NBD/vhost listener；零个或同时两种都必须在构造engine/listener effect前拒绝。authorized-serving status handshake必须逐字段
 回显二者、`control_only=false`和Guest-I/O-open；wrong/missing token均不可adopt。public `ObservedDevice`只证明
 device path/socket、Guest slot和device token；vhost queue参数、serving CLI及handshake必须由scanner读取
 provider-private exact process/CLI/socket evidence后才能投影为满足step，不能从`ObservedDevice`猜测。

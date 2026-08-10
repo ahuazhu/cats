@@ -322,6 +322,7 @@ fn exact_handshake(
         && status.size_bytes == Some(expected.size_bytes)
         && status.scope_id.as_ref() == Some(&expected.scope_id)
         && status.process_identity_token.as_ref() == Some(&expected.process_identity_token)
+        && status.device_ownership_token.is_none()
         && status.control_only == Some(true)
         && status.remote_head.as_ref() == Some(expected.expected_remote_head())
         && status.guest_io_enabled == Some(false)
@@ -1394,6 +1395,39 @@ mod tests {
                 )
             ));
         }
+    }
+
+    #[test]
+    fn control_only_handshake_rejects_any_device_ownership_token() {
+        let expected = expectation();
+        assert!(exact_handshake(&expected, 4242, &status()).is_some());
+
+        let mut serving_contaminated = status();
+        serving_contaminated.device_ownership_token = Some(random('9'));
+        assert!(exact_handshake(&expected, 4242, &serving_contaminated).is_none());
+
+        let proof = proof();
+        let systemd = Arc::new(FakeSystemd::default());
+        systemd.inspections.lock().unwrap().extend([
+            SystemdInspection::Exact(proof.clone()),
+            SystemdInspection::Exact(proof),
+        ]);
+        let handshake = Arc::new(FakeHandshake::default());
+        handshake
+            .inspections
+            .lock()
+            .unwrap()
+            .push_back(BlockdHandshakeInspection::Verified {
+                peer_process_id: 4242,
+                status: Box::new(serving_contaminated),
+            });
+        let port = SystemdRootProvisionProcessPort::new(config(), systemd, handshake);
+        assert!(matches!(
+            port.inspect(&expected, &context()).unwrap(),
+            RootProvisionProcessInspection::Conflict(
+                RootProvisionProcessConflict::IdentityMismatch
+            )
+        ));
     }
 
     #[test]

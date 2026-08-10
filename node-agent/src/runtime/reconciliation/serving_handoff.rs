@@ -2047,15 +2047,17 @@ impl PublicationStage {
 
 #[cfg(test)]
 mod tests {
+    use std::cell::Cell;
     use std::os::unix::fs::{symlink, MetadataExt as _, PermissionsExt as _};
 
     use cats_api::runtime_reconciliation::{
         spec_digest, AsciiText, AssignedKind, AssignedPlacement, DiskKind, Generation,
         GuestDeviceIdentity, GuestTransportEvidence, Ipv4Address, IsolatedIpv4Kind,
         LifecycleAdmission, MacAddress, NetworkConfig, NormalAcquireRequest, NormalAcquireResult,
-        RequireIdleCheckpoint, RuntimeCheckpoint, RuntimeConfig, RuntimeTarget, RuntimeTransition,
-        UnixMillis, VolumeAccess, VolumeAcquire, VolumeAdminState, VolumeDisposition, VolumeIntent,
-        WarmSnapshotEvidence,
+        PrepareDeviceFrontend, RequireIdleCheckpoint, RuntimeCheckpoint, RuntimeConfig,
+        RuntimeTarget, RuntimeTransition, ServingAuthorityProvenance, ServingBlockdIdentity,
+        UnixMillis, VolumeAccess, VolumeAcquire, VolumeAdminState, VolumeAuthorityEvidence,
+        VolumeDisposition, VolumeIntent, WarmSnapshotEvidence,
     };
     use cats_storage::authority::LastVolumeTransition;
 
@@ -2129,6 +2131,67 @@ mod tests {
             let current = store.load().unwrap().unwrap();
             self.stored_checkpoint = store.replace(&current, &checkpoint).unwrap();
         }
+    }
+
+    fn prepare_device_successor(
+        fixture: &Fixture,
+        handoff: RootServingHandoff,
+    ) -> RuntimeCheckpoint {
+        let mut checkpoint = fixture.stored_checkpoint.checkpoint().clone();
+        let attachment = &fixture.acquired.attachment;
+        let volume = &fixture.acquired.volume;
+        let process_identity_token = random('7');
+        let ownership_token = random('8');
+        let data_directory = host(fixture.data_directory.to_str().unwrap());
+        checkpoint.step = ReconcileStep::PrepareDevice {
+            volume_id: volume.volume_id.clone(),
+            attachment_id: attachment.identity.attachment_id.clone(),
+            attachment_epoch: attachment.identity.attachment_epoch,
+            acquire_origin: attachment.identity.acquire_origin.clone(),
+            expected_head: fixture.authority.volume.head.clone(),
+            size_bytes: attachment.size_bytes,
+            durability: attachment.durability,
+            guest_device: volume.guest_device.clone(),
+            ownership_token,
+            serving_authority: Box::new(ServingAuthorityProvenance::AfterRootProvision { handoff }),
+            serving_process: ServingBlockdIdentity {
+                scope_id: id(&format!(
+                    "cats-serving-{}.service",
+                    process_identity_token.as_str()
+                )),
+                control_socket_path: host(&format!(
+                    "{}/serving-control.sock",
+                    fixture.data_directory.display()
+                )),
+                data_directory,
+                executable_path: fixture.expected_executable_path.clone(),
+                process_identity_token,
+            },
+            frontend: PrepareDeviceFrontend::VhostUserBlk {
+                socket_path: host(&format!(
+                    "{}/serving-vhost.sock",
+                    fixture.data_directory.display()
+                )),
+                queues: 2,
+                queue_size: 256,
+            },
+        };
+        let observed = checkpoint
+            .volumes
+            .first_mut()
+            .expect("production predecessor carries one Owned volume");
+        observed.authority = VolumeAuthorityEvidence::Owned {
+            attachment_id: attachment.identity.attachment_id.clone(),
+            attachment_epoch: attachment.identity.attachment_epoch,
+            head: fixture.authority.volume.head.clone(),
+        };
+        for lineage in &mut observed.local_lineages {
+            lineage.local_durable_generation = fixture.authority.volume.head.generation;
+            lineage.remote_durable_generation = fixture.authority.volume.head.generation;
+        }
+        checkpoint.updated_at_unix_ms = UnixMillis::new(1_720_000_000_001).unwrap();
+        encode_runtime_checkpoint(&checkpoint).expect("PrepareDevice successor is canonical V1");
+        checkpoint
     }
 
     fn fixture() -> Fixture {
@@ -2459,21 +2522,6 @@ mod tests {
         ready
             .assert_current(&fixture.stored_checkpoint)
             .expect("serving proof remains current before consume");
-        let consumed = ready
-            .consume_for_prepare_device(&fixture.stored_checkpoint, Ok)
-            .expect("consume exact handoff into PrepareDevice provenance");
-        assert_eq!(
-            &consumed.predecessor_checkpoint_content_digest,
-            fixture.stored_checkpoint.content_digest()
-        );
-        assert_eq!(&consumed.record.path, ready.record_path());
-        assert_eq!(consumed.record.device, ready.record_identity().device());
-        assert_eq!(consumed.record.inode, ready.record_identity().inode());
-        assert_eq!(consumed.record.length, ready.record_identity().length());
-        assert_eq!(
-            &consumed.record.content_sha256,
-            ready.record_identity().content_sha256()
-        );
         let ready_record = ready.record().clone();
         drop(ready);
         let replay = store
@@ -2493,6 +2541,73 @@ mod tests {
             std::fs::metadata(fixture.record_path()).unwrap().ino(),
             record_inode
         );
+
+        let checkpoint_store = FileCheckpointStore::open(
+            &fixture.checkpoint_directory,
+            &fixture.acquired.desired.cat_id,
+        )
+        .unwrap();
+        let expected_record_identity = replay.record_identity().clone();
+        let (replaced, successor) = replay
+            .consume_for_prepare_device(&fixture.stored_checkpoint, |handoff| {
+                assert_eq!(
+                    &handoff.predecessor_checkpoint_content_digest,
+                    fixture.stored_checkpoint.content_digest()
+                );
+                assert_eq!(&handoff.record.path, expected_record_identity.path());
+                assert_eq!(handoff.record.device, expected_record_identity.device());
+                assert_eq!(handoff.record.inode, expected_record_identity.inode());
+                assert_eq!(handoff.record.length, expected_record_identity.length());
+                assert_eq!(
+                    &handoff.record.content_sha256,
+                    expected_record_identity.content_sha256()
+                );
+                let successor = prepare_device_successor(&fixture, handoff);
+                let replaced = checkpoint_store
+                    .replace(&fixture.stored_checkpoint, &successor)
+                    .context("atomically replace predecessor with PrepareDevice")?;
+                assert_eq!(replaced.checkpoint(), &successor);
+                assert!(fixture.record_path().exists());
+                Ok((replaced, successor))
+            })
+            .expect("consume exact handoff with atomic PrepareDevice replace");
+        let current = checkpoint_store.load().unwrap().unwrap();
+        assert_eq!(current.content_digest(), replaced.content_digest());
+        assert_eq!(current.checkpoint(), &successor);
+        assert!(matches!(
+            current.checkpoint().step,
+            ReconcileStep::PrepareDevice { .. }
+        ));
+    }
+
+    #[test]
+    fn failed_consume_closure_leaves_the_exact_predecessor_current() {
+        let fixture = fixture();
+        let ready = fixture
+            .store()
+            .seal_serving_ready(
+                &fixture.stored_checkpoint,
+                &fixture.acquired,
+                &fixture.authority,
+                &fixture.exact_process_proof().unwrap(),
+            )
+            .unwrap();
+        let checkpoint_store = FileCheckpointStore::open(
+            &fixture.checkpoint_directory,
+            &fixture.acquired.desired.cat_id,
+        )
+        .unwrap();
+        let result: anyhow::Result<()> = ready
+            .consume_for_prepare_device(&fixture.stored_checkpoint, |_handoff| {
+                anyhow::bail!("injected failure before checkpoint replace")
+            });
+        assert!(result.unwrap_err().to_string().contains("injected failure"));
+        let current = checkpoint_store.load().unwrap().unwrap();
+        assert_eq!(
+            current.content_digest(),
+            fixture.stored_checkpoint.content_digest()
+        );
+        assert_eq!(current.checkpoint(), fixture.stored_checkpoint.checkpoint());
     }
 
     #[test]
@@ -2833,10 +2948,33 @@ mod tests {
                 &consume_aba.exact_process_proof().unwrap(),
             )
             .unwrap();
+        let checkpoint_store = FileCheckpointStore::open(
+            &consume_aba.checkpoint_directory,
+            &consume_aba.acquired.desired.cat_id,
+        )
+        .unwrap();
         swap_same_bytes(&consume_aba.record_path(), "consume");
-        assert!(ready
-            .assert_current(&consume_aba.stored_checkpoint)
-            .is_err());
+        let invoked = Cell::new(false);
+        let result = ready.consume_for_prepare_device(
+            &consume_aba.stored_checkpoint,
+            |handoff| -> anyhow::Result<()> {
+                invoked.set(true);
+                let successor = prepare_device_successor(&consume_aba, handoff);
+                checkpoint_store.replace(&consume_aba.stored_checkpoint, &successor)?;
+                Ok(())
+            },
+        );
+        assert!(result.is_err());
+        assert!(!invoked.get());
+        let current = checkpoint_store.load().unwrap().unwrap();
+        assert_eq!(
+            current.content_digest(),
+            consume_aba.stored_checkpoint.content_digest()
+        );
+        assert_eq!(
+            current.checkpoint(),
+            consume_aba.stored_checkpoint.checkpoint()
+        );
     }
 
     #[test]

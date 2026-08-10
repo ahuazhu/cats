@@ -1177,6 +1177,12 @@ fn validate_process_mode(args: &Args) -> Result<()> {
             .listen_control
             .as_ref()
             .context("--authorized-serving-spec requires --listen-control for exact handshake")?;
+        if !matches!(
+            (args.listen_unix.is_some(), args.listen_vhost_user.is_some()),
+            (true, false) | (false, true)
+        ) {
+            bail!("--authorized-serving-spec requires exactly one NBD or vhost-user frontend");
+        }
         if args.listen_unix.as_ref() == Some(control)
             || args.listen_vhost_user.as_ref() == Some(control)
             || matches!(
@@ -1848,6 +1854,19 @@ mod tests {
         assert!(
             validate_process_mode(&parse_target(&["--listen-unix", "/runtime/block.sock"])).is_ok()
         );
+        assert!(validate_process_mode(&parse_target(&[
+            "--listen-vhost-user",
+            "/runtime/vhost.sock",
+        ]))
+        .is_ok());
+        assert!(validate_process_mode(&parse_target(&[])).is_err());
+        assert!(validate_process_mode(&parse_target(&[
+            "--listen-unix",
+            "/runtime/block.sock",
+            "--listen-vhost-user",
+            "/runtime/vhost.sock",
+        ]))
+        .is_err());
 
         for forbidden in [
             vec!["--listen-tcp", "127.0.0.1:10809"],
