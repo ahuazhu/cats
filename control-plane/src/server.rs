@@ -1034,28 +1034,41 @@ async fn spawn_inner(
     let gateway_machine_listener = if let Some(machine) = gateway_machine {
         let signer = machine.signing_authority.signer().cloned().map(Arc::new);
         let binding = Arc::new(machine.signing_authority.binding().clone());
-        let service = Arc::new(
-            crate::api::route_resolve_v2::RouteResolveV2Service::for_gateway_machine(
-                Arc::clone(&state.store),
-                signer,
-                binding,
-                state
-                    .agent_session_registration_policy
-                    .approved_guest_config_digest()
-                    .clone(),
-                GATEWAY_AUTHENTICATION_GLOBAL_IN_FLIGHT,
-                ROUTE_RESOLVE_V2_GLOBAL_IN_FLIGHT,
-            ),
-        );
-        Some(
-            crate::gateway_machine::GatewayMachineListener::spawn(
-                &machine.listen,
-                machine.tls_config,
-                service,
-                Arc::clone(&state.readiness),
+        if gateway_machine_signer_may_serve_at_startup(&state.readiness, signer.is_some()) {
+            let control = Arc::new(
+                crate::api::route_resolve_v2::RouteResolveV2MachineControl::new(Arc::clone(
+                    &state.readiness,
+                )),
+            );
+            let service = Arc::new(
+                crate::api::route_resolve_v2::RouteResolveV2Service::for_gateway_machine(
+                    Arc::clone(&state.store),
+                    signer,
+                    binding,
+                    state
+                        .agent_session_registration_policy
+                        .approved_guest_config_digest()
+                        .clone(),
+                    GATEWAY_AUTHENTICATION_GLOBAL_IN_FLIGHT,
+                    ROUTE_RESOLVE_V2_GLOBAL_IN_FLIGHT,
+                    Arc::clone(&control),
+                ),
+            );
+            Some(
+                crate::gateway_machine::GatewayMachineListener::spawn(
+                    &machine.listen,
+                    machine.tls_config,
+                    service,
+                    control,
+                )
+                .await?,
             )
-            .await?,
-        )
+        } else {
+            tracing::error!(
+                "Route Grant v2 signer is disabled; Gateway machine serving and readiness remain closed until process restart after installing an active authority"
+            );
+            None
+        }
     } else {
         None
     };
@@ -1139,9 +1152,23 @@ fn ensure_route_signing_keys_are_separate(
     Ok(())
 }
 
+fn gateway_machine_signer_may_serve_at_startup(
+    readiness: &ReadinessLatch,
+    signer_present: bool,
+) -> bool {
+    if !signer_present {
+        readiness.poison();
+        return false;
+    }
+    readiness.is_ready()
+}
+
 #[cfg(test)]
 mod route_signing_key_separation_tests {
-    use super::ensure_route_signing_keys_are_separate;
+    use super::{
+        ensure_route_signing_keys_are_separate, gateway_machine_signer_may_serve_at_startup,
+        ReadinessLatch,
+    };
     use cats_api::runtime_reconciliation::KeyId;
 
     #[test]
@@ -1154,5 +1181,25 @@ mod route_signing_key_separation_tests {
             KeyId::new("2281a02a7f42d92fa9caa5b7907b29c2f060cb00196be280af33fb7bc8e27e99").unwrap();
         ensure_route_signing_keys_are_separate(legacy, Some(&independent)).unwrap();
         ensure_route_signing_keys_are_separate(legacy, None).unwrap();
+    }
+
+    #[test]
+    fn disabled_v2_signer_closes_startup_readiness_and_machine_bind() {
+        let readiness = ReadinessLatch::new();
+        assert!(!gateway_machine_signer_may_serve_at_startup(
+            &readiness, false
+        ));
+        assert_eq!(
+            crate::api::readiness_status(&readiness),
+            axum::http::StatusCode::SERVICE_UNAVAILABLE
+        );
+
+        // The latch and composition decision are intentionally one-way. A
+        // corrected artifact/PG current is recovered by restart; runtime reload
+        // remains future work.
+        assert!(!gateway_machine_signer_may_serve_at_startup(
+            &readiness, true
+        ));
+        assert!(!readiness.is_ready());
     }
 }

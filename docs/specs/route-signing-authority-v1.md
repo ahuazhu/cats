@@ -145,6 +145,9 @@ secret-reference/kid lineage；same exact revision replay零写，same revision�
 active kid/secret reference`与current persisted state。旧replica即使仍能访问旧private file也只能返回503。
 这项compare与rotation writer共享singleton lock；snapshot的DB now产生Grant `iat`，writer切key时同一DB now
 作为`last_old_issue_at`上界。PG current compare、共享lock及machine listener内的最终同snapshot组合均已实现。
+startup读取到`disabled`时不bind machine listener并把`/healthz`保持为503；运行中发现PG current
+disabled、stale或投影损坏时，触发请求返回503，同时永久关闭本进程readiness、请求admission与listener。
+恢复方式是以正确fixed artifact/PG current重启；安全的在线reload仍是future work，当前进程不会自行恢复接流量。
 
 ## 5. Rotation, retirement and revocation
 

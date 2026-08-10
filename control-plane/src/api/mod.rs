@@ -116,10 +116,18 @@ fn require_retired_product_authority_for_tests(state: &AppState) -> ApiResult<()
 }
 
 async fn readiness(State(state): State<AppState>) -> Response {
-    if state.readiness.is_ready() {
+    if readiness_status(&state.readiness) == StatusCode::OK {
         (StatusCode::OK, "ok").into_response()
     } else {
         (StatusCode::SERVICE_UNAVAILABLE, "unready").into_response()
+    }
+}
+
+pub(crate) fn readiness_status(readiness: &crate::server::ReadinessLatch) -> StatusCode {
+    if readiness.is_ready() {
+        StatusCode::OK
+    } else {
+        StatusCode::SERVICE_UNAVAILABLE
     }
 }
 

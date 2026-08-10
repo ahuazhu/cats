@@ -25,8 +25,9 @@ use tokio::net::{TcpListener, TcpStream};
 use tokio::task::JoinSet;
 use tokio_rustls::TlsAcceptor;
 
-use crate::api::route_resolve_v2::{self, RouteResolveV2Service, VerifiedGatewayTlsPeer};
-use crate::server::ReadinessLatch;
+use crate::api::route_resolve_v2::{
+    self, RouteResolveV2MachineControl, RouteResolveV2Service, VerifiedGatewayTlsPeer,
+};
 
 const TLS_HANDSHAKE_DEADLINE: Duration = Duration::from_secs(5);
 const REQUEST_HEADER_DEADLINE: Duration = Duration::from_secs(5);
@@ -42,7 +43,7 @@ const ED25519_SPKI_LEN: usize = ED25519_SPKI_PREFIX.len() + 32;
 pub(crate) struct GatewayMachineListener {
     addr: SocketAddr,
     service: Arc<RouteResolveV2Service>,
-    shutdown: Mutex<Option<tokio::sync::oneshot::Sender<()>>>,
+    control: Arc<RouteResolveV2MachineControl>,
     task: Mutex<Option<tokio::task::JoinHandle<()>>>,
 }
 
@@ -75,25 +76,27 @@ impl GatewayMachineListener {
         listen: &str,
         tls_config: GatewayMachineTlsConfig,
         service: Arc<RouteResolveV2Service>,
-        readiness: Arc<ReadinessLatch>,
+        control: Arc<RouteResolveV2MachineControl>,
     ) -> anyhow::Result<Self> {
         let listener = TcpListener::bind(listen)
             .await
             .with_context(|| format!("bind Gateway machine listener {listen}"))?;
         let addr = listener.local_addr()?;
-        let (shutdown, shutdown_rx) = tokio::sync::oneshot::channel();
         let run_service = Arc::clone(&service);
+        let shutdown = control.subscribe();
+        let failure_service = Arc::clone(&service);
+        let failure_control = Arc::clone(&control);
         let task = tokio::spawn(async move {
-            if let Err(error) = run_listener(listener, tls_config.0, run_service, shutdown_rx).await
-            {
-                readiness.poison();
+            if let Err(error) = run_listener(listener, tls_config.0, run_service, shutdown).await {
+                failure_service.begin_shutdown();
+                failure_control.fail_closed();
                 tracing::error!(%error, "Gateway machine listener exited unexpectedly");
             }
         });
         Ok(Self {
             addr,
             service,
-            shutdown: Mutex::new(Some(shutdown)),
+            control,
             task: Mutex::new(Some(task)),
         })
     }
@@ -103,14 +106,7 @@ impl GatewayMachineListener {
     }
 
     pub(crate) fn begin_shutdown(&self) {
-        if let Some(shutdown) = self
-            .shutdown
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .take()
-        {
-            let _ = shutdown.send(());
-        }
+        self.control.begin_shutdown();
         // The service closes authentication first and resolve second.
         self.service.begin_shutdown();
     }
@@ -143,6 +139,26 @@ impl GatewayMachineListener {
         let (service, listener) = tokio::join!(service_shutdown, listener_shutdown);
         service?;
         listener
+    }
+
+    #[cfg(test)]
+    pub(crate) async fn wait_until_stopped_for_test(&self) {
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                let stopped = self
+                    .task
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .as_ref()
+                    .is_none_or(tokio::task::JoinHandle::is_finished);
+                if stopped {
+                    return;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("Gateway machine listener did not stop after fatal signer drift");
     }
 }
 
@@ -303,7 +319,7 @@ async fn run_listener(
     listener: TcpListener,
     tls_config: Arc<ServerConfig>,
     service: Arc<RouteResolveV2Service>,
-    mut shutdown: tokio::sync::oneshot::Receiver<()>,
+    mut shutdown: tokio::sync::watch::Receiver<bool>,
 ) -> anyhow::Result<()> {
     let tls_acceptor = TlsAcceptor::from(tls_config);
     let connection_permits = Arc::new(tokio::sync::Semaphore::new(MACHINE_CONNECTION_LIMIT));
@@ -311,8 +327,15 @@ async fn run_listener(
     let mut connections = JoinSet::new();
 
     loop {
+        if *shutdown.borrow() {
+            break;
+        }
         tokio::select! {
-            _ = &mut shutdown => break,
+            changed = shutdown.changed() => {
+                if changed.is_err() || *shutdown.borrow() {
+                    break;
+                }
+            },
             Some(joined) = connections.join_next(), if !connections.is_empty() => {
                 if let Err(error) = joined {
                     tracing::warn!(%error, "Gateway machine connection task panicked");

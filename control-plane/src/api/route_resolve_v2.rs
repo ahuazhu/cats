@@ -77,10 +77,40 @@ pub(crate) struct RouteResolveV2Service {
     active_guest_digest: cats_api::runtime_reconciliation::Sha256Digest,
     authentication_admission: Arc<RouteResolveV2Admission>,
     admission: Arc<RouteResolveV2Admission>,
+    machine_control: Option<Arc<RouteResolveV2MachineControl>>,
     #[cfg(test)]
     test_authentication_bypass: bool,
     #[cfg(test)]
     store_pause: Mutex<Option<RouteResolveV2StorePause>>,
+}
+
+/// One-way lifecycle control shared by the machine handler and its listener.
+/// A stale, disabled or corrupt persisted signer is fatal for this process:
+/// readiness stays closed and serving can recover only through a restart (or
+/// a future explicit reload design that replaces this whole composition).
+pub(crate) struct RouteResolveV2MachineControl {
+    readiness: Arc<crate::server::ReadinessLatch>,
+    stop: tokio::sync::watch::Sender<bool>,
+}
+
+impl RouteResolveV2MachineControl {
+    pub(crate) fn new(readiness: Arc<crate::server::ReadinessLatch>) -> Self {
+        let (stop, _) = tokio::sync::watch::channel(false);
+        Self { readiness, stop }
+    }
+
+    pub(crate) fn subscribe(&self) -> tokio::sync::watch::Receiver<bool> {
+        self.stop.subscribe()
+    }
+
+    pub(crate) fn begin_shutdown(&self) {
+        self.stop.send_replace(true);
+    }
+
+    pub(crate) fn fail_closed(&self) {
+        self.readiness.poison();
+        self.begin_shutdown();
+    }
 }
 
 /// Owns admitted Route v2 reads until both the handler and any Store closure
@@ -211,6 +241,7 @@ impl RouteResolveV2Service {
                 .clone(),
             authentication_admission: Arc::new(RouteResolveV2Admission::new(32)),
             admission: Arc::clone(&state.route_resolve_admission),
+            machine_control: None,
             #[cfg(test)]
             test_authentication_bypass: false,
             #[cfg(test)]
@@ -225,6 +256,7 @@ impl RouteResolveV2Service {
         active_guest_digest: cats_api::runtime_reconciliation::Sha256Digest,
         authentication_limit: usize,
         resolve_limit: usize,
+        machine_control: Arc<RouteResolveV2MachineControl>,
     ) -> Self {
         Self {
             store,
@@ -233,6 +265,7 @@ impl RouteResolveV2Service {
             active_guest_digest,
             authentication_admission: Arc::new(RouteResolveV2Admission::new(authentication_limit)),
             admission: Arc::new(RouteResolveV2Admission::new(resolve_limit)),
+            machine_control: Some(machine_control),
             #[cfg(test)]
             test_authentication_bypass: false,
             #[cfg(test)]
@@ -253,6 +286,7 @@ impl RouteResolveV2Service {
             active_guest_digest,
             authentication_admission: Arc::new(RouteResolveV2Admission::new(32)),
             admission: Arc::new(RouteResolveV2Admission::new(32)),
+            machine_control: None,
             test_authentication_bypass: true,
             store_pause: Mutex::new(None),
         }
@@ -270,6 +304,7 @@ impl RouteResolveV2Service {
             active_guest_digest,
             authentication_admission: Arc::new(RouteResolveV2Admission::new(32)),
             admission: Arc::new(RouteResolveV2Admission::new(32)),
+            machine_control: None,
             test_authentication_bypass: true,
             store_pause: Mutex::new(None),
         }
@@ -306,6 +341,13 @@ impl RouteResolveV2Service {
     pub(crate) fn begin_shutdown(&self) {
         self.authentication_admission.begin_shutdown();
         self.admission.begin_shutdown();
+    }
+
+    fn fail_machine_signer(&self) {
+        if let Some(control) = &self.machine_control {
+            control.fail_closed();
+            self.begin_shutdown();
+        }
     }
 
     pub(crate) async fn shutdown(&self) -> anyhow::Result<()> {
@@ -426,10 +468,12 @@ pub(crate) async fn resolve(
     let Some(route_grant_signer) = service.route_grant_signer.as_ref().cloned() else {
         // A current principal cannot activate body reads when signer private
         // material is disabled or otherwise absent.
+        service.fail_machine_signer();
         return unavailable_response();
     };
     let route_grant_signer_binding = service.route_grant_signer_binding.as_ref().cloned();
     if authenticated_principal.is_some() && route_grant_signer_binding.is_none() {
+        service.fail_machine_signer();
         return unavailable_response();
     }
 
@@ -590,6 +634,7 @@ pub(crate) async fn resolve(
             );
         }
         Ok(Ok(RouteGrantV2MachineAuthorityLoad::SignerUnavailable)) => {
+            service.fail_machine_signer();
             return unavailable_response();
         }
         Ok(Ok(RouteGrantV2MachineAuthorityLoad::Rejected(rejection))) => {

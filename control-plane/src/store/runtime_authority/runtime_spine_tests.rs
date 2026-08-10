@@ -3043,7 +3043,8 @@ fn gateway_test_http_status(response: &[u8]) -> u16 {
 
 #[test]
 fn route_signer_snapshot_closes_hostname_runtime_and_ring_in_one_authority_read() {
-    let (store, identity, authenticated, policy, session) = fixture();
+    let url = crate::testsupport::isolated_control_store_url();
+    let (store, identity, authenticated, policy, session) = fixture_at(&url);
     let store = Arc::new(store);
     insert_policy_on_store_for_test(
         &store,
@@ -3512,6 +3513,12 @@ fn route_signer_snapshot_closes_hostname_runtime_and_ring_in_one_authority_read(
             .unwrap();
         assert_eq!(service.active_requests_for_test(), 0);
 
+        let signerless_readiness = Arc::new(crate::server::ReadinessLatch::new());
+        let signerless_control = Arc::new(
+            crate::api::route_resolve_v2::RouteResolveV2MachineControl::new(Arc::clone(
+                &signerless_readiness,
+            )),
+        );
         let production_signerless = Arc::new(
             crate::api::route_resolve_v2::RouteResolveV2Service::for_gateway_machine(
                 Arc::clone(&store),
@@ -3520,6 +3527,7 @@ fn route_signer_snapshot_closes_hostname_runtime_and_ring_in_one_authority_read(
                 policy.approved_guest_config_digest().clone(),
                 8,
                 8,
+                signerless_control,
             ),
         );
         let mut signerless_request = axum::http::Request::builder()
@@ -3546,10 +3554,18 @@ fn route_signer_snapshot_closes_hostname_runtime_and_ring_in_one_authority_read(
             signerless_response.status(),
             axum::http::StatusCode::SERVICE_UNAVAILABLE
         );
+        assert_eq!(
+            crate::api::readiness_status(&signerless_readiness),
+            axum::http::StatusCode::SERVICE_UNAVAILABLE
+        );
         production_signerless.shutdown().await.unwrap();
 
         // Compose the production machine service and real TLS/h1 listener over
         // the same real-PG authority. This is not the test-principal bypass.
+        let readiness = Arc::new(crate::server::ReadinessLatch::new());
+        let machine_control = Arc::new(
+            crate::api::route_resolve_v2::RouteResolveV2MachineControl::new(Arc::clone(&readiness)),
+        );
         let machine_service = Arc::new(
             crate::api::route_resolve_v2::RouteResolveV2Service::for_gateway_machine(
                 Arc::clone(&store),
@@ -3558,6 +3574,7 @@ fn route_signer_snapshot_closes_hostname_runtime_and_ring_in_one_authority_read(
                 policy.approved_guest_config_digest().clone(),
                 8,
                 8,
+                Arc::clone(&machine_control),
             ),
         );
         let machine_tls = crate::gateway_machine::GatewayMachineTlsConfig::from_pem_for_test(
@@ -3566,12 +3583,11 @@ fn route_signer_snapshot_closes_hostname_runtime_and_ring_in_one_authority_read(
             include_bytes!("../../../tests/fixtures/gateway_machine_server_private_key.pem"),
         )
         .unwrap();
-        let readiness = Arc::new(crate::server::ReadinessLatch::new());
         let machine_listener = crate::gateway_machine::GatewayMachineListener::spawn(
             "127.0.0.1:0",
             machine_tls,
             Arc::clone(&machine_service),
-            Arc::clone(&readiness),
+            machine_control,
         )
         .await
         .unwrap();
@@ -3613,6 +3629,12 @@ fn route_signer_snapshot_closes_hostname_runtime_and_ring_in_one_authority_read(
             )
             .unwrap(),
         );
+        let stale_readiness = Arc::new(crate::server::ReadinessLatch::new());
+        let stale_control = Arc::new(
+            crate::api::route_resolve_v2::RouteResolveV2MachineControl::new(Arc::clone(
+                &stale_readiness,
+            )),
+        );
         let stale_service = Arc::new(
             crate::api::route_resolve_v2::RouteResolveV2Service::for_gateway_machine(
                 Arc::clone(&store),
@@ -3621,34 +3643,41 @@ fn route_signer_snapshot_closes_hostname_runtime_and_ring_in_one_authority_read(
                 policy.approved_guest_config_digest().clone(),
                 8,
                 8,
+                Arc::clone(&stale_control),
             ),
         );
-        let mut stale_request = axum::http::Request::builder()
-            .method("POST")
-            .uri(ROUTE_RESOLVE_V2_PATH)
-            .header(axum::http::header::CONTENT_TYPE, ROUTE_V2_JSON_CONTENT_TYPE)
-            .header(axum::http::header::ACCEPT, ROUTE_V2_JSON_CONTENT_TYPE)
-            .body(axum::body::Body::from(machine_body.clone()))
-            .unwrap();
-        stale_request.extensions_mut().insert(
-            crate::api::route_resolve_v2::VerifiedGatewayTlsPeer::from_verified_spki_sha256(
-                gateway_peer_digest.clone(),
-            ),
-        );
-        let stale_response = crate::api::route_resolve_v2::resolve(
-            Extension(Arc::clone(&stale_service)),
-            stale_request,
+        let stale_tls = crate::gateway_machine::GatewayMachineTlsConfig::from_pem_for_test(
+            include_bytes!("../../../tests/fixtures/gateway_machine_ca_certificate.pem"),
+            include_bytes!("../../../tests/fixtures/gateway_machine_server_certificate.pem"),
+            include_bytes!("../../../tests/fixtures/gateway_machine_server_private_key.pem"),
+        )
+        .unwrap();
+        let stale_listener = crate::gateway_machine::GatewayMachineListener::spawn(
+            "127.0.0.1:0",
+            stale_tls,
+            Arc::clone(&stale_service),
+            stale_control,
         )
         .await;
+        let stale_listener = stale_listener.unwrap();
+        let stale_addr = stale_listener.addr();
+        let mut stale_stream = gateway_test_tls_stream(stale_addr).await;
+        let stale_response =
+            gateway_test_http_request(&mut stale_stream, machine_request.as_bytes()).await;
+        assert_eq!(gateway_test_http_status(&stale_response), 503);
         assert_eq!(
-            stale_response.status(),
+            crate::api::readiness_status(&stale_readiness),
             axum::http::StatusCode::SERVICE_UNAVAILABLE
         );
-        stale_service.shutdown().await.unwrap();
+        stale_listener.wait_until_stopped_for_test().await;
+        assert!(tokio::net::TcpStream::connect(stale_addr).await.is_err());
+        stale_listener.shutdown().await.unwrap();
 
-        // Scope shrink is observed by the next request on the same TLS
-        // keepalive connection. Pre-body auth still succeeds, but the
-        // hostname-derived Workspace check in the final snapshot returns 401.
+        // Hold the final Store call after pre-body authentication, then let a
+        // writer take the exclusive PG barrier and finish every scope-shrink
+        // write before that final reader starts. The reader must wait, acquire
+        // its shared session barrier only after commit, and return 401 rather
+        // than issue from the old repeatable-read snapshot.
         let mut scoped_gateway_authority = initial_gateway_authority.clone();
         scoped_gateway_authority.policy_revision = Epoch::new(2).unwrap();
         scoped_gateway_authority.expected_previous = Some(
@@ -3661,31 +3690,78 @@ fn route_signer_snapshot_closes_hostname_runtime_and_ring_in_one_authority_read(
             cats_api::gateway_workload_identity::GatewayWorkloadCredentialScope::Workspaces {
                 workspace_ids: vec![id("workspace_not_route")],
             };
-        let scoped_install = scoped_gateway_authority.clone();
-        store
-            .execute(move |store| {
-                store.install_gateway_workload_identity_authority(&scoped_install)
-            })
+        let final_reader_entered = Arc::new(Barrier::new(2));
+        let release_final_reader = Arc::new(Barrier::new(2));
+        machine_service.pause_store_after_start_for_test(
+            Arc::clone(&final_reader_entered),
+            Arc::clone(&release_final_reader),
+        );
+        let race_addr = machine_listener.addr();
+        let race_request = machine_request.clone();
+        let raced_resolve = tokio::spawn(async move {
+            let mut stream = gateway_test_tls_stream(race_addr).await;
+            gateway_test_http_request(&mut stream, race_request.as_bytes()).await
+        });
+        tokio::task::spawn_blocking(move || final_reader_entered.wait())
             .await
             .unwrap();
+
+        let writer_entered = Arc::new(Barrier::new(2));
+        let release_writer = Arc::new(Barrier::new(2));
+        let writer = {
+            let url = url.clone();
+            let scoped_install = scoped_gateway_authority.clone();
+            let writer_entered = Arc::clone(&writer_entered);
+            let release_writer = Arc::clone(&release_writer);
+            tokio::task::spawn_blocking(move || {
+                Store::connect(&url, None)
+                    .unwrap()
+                    .install_gateway_authority_paused_before_commit_for_test(
+                        &scoped_install,
+                        writer_entered,
+                        release_writer,
+                    )
+            })
+        };
+        tokio::task::spawn_blocking(move || writer_entered.wait())
+            .await
+            .unwrap();
+        tokio::task::spawn_blocking(move || release_final_reader.wait())
+            .await
+            .unwrap();
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert!(
+            !raced_resolve.is_finished(),
+            "final reader did not wait behind the writer-first PG barrier"
+        );
+        tokio::task::spawn_blocking(move || release_writer.wait())
+            .await
+            .unwrap();
+        writer.await.unwrap().unwrap();
+        let raced_response = raced_resolve.await.unwrap();
+        assert_eq!(gateway_test_http_status(&raced_response), 401);
+
+        // The next request on the original TLS keepalive connection observes
+        // the same committed scope shrink.
         let scoped_response =
             gateway_test_http_request(&mut machine_stream, machine_request.as_bytes()).await;
         assert_eq!(gateway_test_http_status(&scoped_response), 401);
 
         // Once the authoritative hostname Workspace is outside this principal,
         // no signer, Desired, lifecycle, runtime, availability or stored
-        // corruption classification may replace the uniform 401. Corrupt a
-        // downstream projection to make any accidental read observable.
+        // corruption classification may replace the uniform 401. Corrupt the
+        // full hostname record while retaining its authoritative Workspace
+        // projection to make decoding before scope immediately observable.
+        let corrupt_hostname = hostname.clone();
         store
-            .execute(|store| {
+            .execute(move |store| {
                 store.with(|client| {
                     client
                         .execute(
-                            "UPDATE runtime_node_placement_policies
-                                SET record=jsonb_set(record, '{policy_revision}', '2'::jsonb),
-                                    policy_revision=2,
-                                    node_transport_target='https://node-b.internal:7301'",
-                            &[],
+                            "UPDATE hostname_desired_lookups
+                                SET record='{}'::jsonb
+                              WHERE hostname=$1",
+                            &[&corrupt_hostname.as_str()],
                         )
                         .map(|_| ())
                 })

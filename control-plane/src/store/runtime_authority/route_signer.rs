@@ -11,6 +11,7 @@ use cats_api::runtime_reconciliation::{
     key_ring_digest, Condition, Hostname, Id, KeyId, LifecycleAdmission, NodeIdentityState,
     NodeTransportTarget, ReadyReason, RouteGateState, RuntimeTarget, UnixMillis,
 };
+use cats_storage::authority::AuthorityError;
 
 use super::placement_policy::load_policy_unlocked;
 use super::product::{validate_endpoint_lookup, EndpointRecord, HostnameDesiredLookup};
@@ -76,6 +77,11 @@ struct RouteGrantV2AuthorityLocator {
     endpoint: EndpointRecord,
 }
 
+struct RouteGrantV2HostnameScopeLocator {
+    workspace_id: Id,
+    endpoint_id: Id,
+}
+
 impl Store {
     pub(crate) fn load_route_grant_v2_authority(
         &self,
@@ -111,23 +117,47 @@ impl Store {
             else {
                 return Ok(RouteGrantV2MachineAuthorityLoad::AuthenticationFailed);
             };
-            let Some(lookup) = load_hostname_lookup_unlocked(transaction, hostname)? else {
+            let Some(locator) = load_hostname_scope_locator_in(transaction, hostname)? else {
                 return Ok(RouteGrantV2MachineAuthorityLoad::Rejected(
                     RouteGrantV2AuthorityRejection::NotFound,
                 ));
             };
-            if !scope.authorizes_workspace(&lookup.workspace_id) {
+            if !scope.authorizes_workspace(&locator.workspace_id) {
                 return Ok(RouteGrantV2MachineAuthorityLoad::AuthenticationFailed);
             }
-            let endpoint = load_endpoint_by_id_unlocked(transaction, &lookup.endpoint_id)?
-                .ok_or_else(corrupt)?;
-            if !scope.authorizes_workspace(&endpoint.workspace_id) {
+            let endpoint_workspace_id =
+                load_endpoint_scope_workspace_in(transaction, &locator.endpoint_id)?
+                    .ok_or_else(corrupt)?;
+            if !scope.authorizes_workspace(&endpoint_workspace_id) {
                 return Ok(RouteGrantV2MachineAuthorityLoad::AuthenticationFailed);
+            }
+            // Full exact-row decoding and cross-projection validation are
+            // intentionally delayed until both authoritative Workspace
+            // projections have passed scope. Thus an outside-scope caller
+            // cannot distinguish any corruption in those records or later
+            // Desired/runtime/signer facts from the uniform 401.
+            let lookup =
+                load_hostname_lookup_unlocked(transaction, hostname)?.ok_or_else(corrupt)?;
+            let endpoint = load_endpoint_by_id_unlocked(transaction, &locator.endpoint_id)?
+                .ok_or_else(corrupt)?;
+            if lookup.workspace_id != locator.workspace_id
+                || lookup.endpoint_id != locator.endpoint_id
+                || endpoint.workspace_id != endpoint_workspace_id
+            {
+                return Err(corrupt());
             }
             if signer_binding.active_kid() != Some(signer.kid()) {
                 return Ok(RouteGrantV2MachineAuthorityLoad::SignerUnavailable);
             }
-            if !route_grant_v2_signer_is_current_in(transaction, signer_binding)? {
+            let signer_is_current =
+                match route_grant_v2_signer_is_current_in(transaction, signer_binding) {
+                    Ok(current) => current,
+                    Err(AuthorityTransactionError::Domain(AuthorityError::BackendUnknown)) => {
+                        return Ok(RouteGrantV2MachineAuthorityLoad::SignerUnavailable);
+                    }
+                    Err(error) => return Err(error),
+                };
+            if !signer_is_current {
                 return Ok(RouteGrantV2MachineAuthorityLoad::SignerUnavailable);
             }
             let snapshot = match load_route_grant_v2_authority_from_locator_in(
@@ -150,6 +180,41 @@ impl Store {
             Ok(RouteGrantV2MachineAuthorityLoad::Ready { snapshot, issued })
         })
     }
+}
+
+fn load_hostname_scope_locator_in(
+    transaction: &mut postgres::Transaction<'_>,
+    hostname: &Hostname,
+) -> AuthorityTxResult<Option<RouteGrantV2HostnameScopeLocator>> {
+    transaction
+        .query_opt(
+            "SELECT workspace_id, endpoint_id
+               FROM hostname_desired_lookups
+              WHERE hostname=$1",
+            &[&hostname.as_str()],
+        )?
+        .map(|row| {
+            Ok(RouteGrantV2HostnameScopeLocator {
+                workspace_id: Id::new(row.try_get::<_, String>("workspace_id")?)
+                    .ok_or_else(corrupt)?,
+                endpoint_id: Id::new(row.try_get::<_, String>("endpoint_id")?)
+                    .ok_or_else(corrupt)?,
+            })
+        })
+        .transpose()
+}
+
+fn load_endpoint_scope_workspace_in(
+    transaction: &mut postgres::Transaction<'_>,
+    endpoint_id: &Id,
+) -> AuthorityTxResult<Option<Id>> {
+    transaction
+        .query_opt(
+            "SELECT workspace_id FROM endpoint_records WHERE endpoint_id=$1",
+            &[&endpoint_id.as_str()],
+        )?
+        .map(|row| Id::new(row.try_get::<_, String>("workspace_id")?).ok_or_else(corrupt))
+        .transpose()
 }
 
 fn load_route_grant_v2_authority_in(
