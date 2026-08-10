@@ -3211,6 +3211,17 @@ fn route_signer_snapshot_closes_hostname_runtime_and_ring_in_one_authority_read(
         "https://node-a.internal:7301"
     );
     assert!(snapshot.evaluated_at_unix_ms.get() > 0);
+    let unknown = KeyId::new("b".repeat(64)).unwrap();
+    assert_eq!(
+        store
+            .load_route_grant_v2_authority(
+                &hostname,
+                &unknown,
+                policy.approved_guest_config_digest(),
+            )
+            .unwrap(),
+        RouteGrantV2AuthorityLoad::Rejected(RouteGrantV2AuthorityRejection::Unavailable)
+    );
 
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
@@ -3661,6 +3672,33 @@ fn route_signer_snapshot_closes_hostname_runtime_and_ring_in_one_authority_read(
             gateway_test_http_request(&mut machine_stream, machine_request.as_bytes()).await;
         assert_eq!(gateway_test_http_status(&scoped_response), 401);
 
+        // Once the authoritative hostname Workspace is outside this principal,
+        // no signer, Desired, lifecycle, runtime, availability or stored
+        // corruption classification may replace the uniform 401. Corrupt a
+        // downstream projection to make any accidental read observable.
+        store
+            .execute(|store| {
+                store.with(|client| {
+                    client
+                        .execute(
+                            "UPDATE runtime_node_placement_policies
+                                SET record=jsonb_set(record, '{policy_revision}', '2'::jsonb),
+                                    policy_revision=2,
+                                    node_transport_target='https://node-b.internal:7301'",
+                            &[],
+                        )
+                        .map(|_| ())
+                })
+            })
+            .await
+            .unwrap();
+        let corrupt_outside_scope_response =
+            gateway_test_http_request(&mut machine_stream, machine_request.as_bytes()).await;
+        assert_eq!(
+            gateway_test_http_status(&corrupt_outside_scope_response),
+            401
+        );
+
         // Durable empty-set revocation is checked again before body read on
         // that same TLS connection; declaring but withholding a body must not
         // delay the authentication failure.
@@ -3694,31 +3732,6 @@ fn route_signer_snapshot_closes_hostname_runtime_and_ring_in_one_authority_read(
         let _ = server.await;
     });
 
-    let unknown = KeyId::new("b".repeat(64)).unwrap();
-    assert_eq!(
-        store
-            .load_route_grant_v2_authority(
-                &hostname,
-                &unknown,
-                policy.approved_guest_config_digest(),
-            )
-            .unwrap(),
-        RouteGrantV2AuthorityLoad::Rejected(RouteGrantV2AuthorityRejection::Unavailable)
-    );
-
-    store
-        .with(|client| {
-            client
-                .execute(
-                    "UPDATE runtime_node_placement_policies
-                        SET record=jsonb_set(record, '{policy_revision}', '2'::jsonb),
-                            policy_revision=2,
-                            node_transport_target='https://node-b.internal:7301'",
-                    &[],
-                )
-                .map(|_| ())
-        })
-        .unwrap();
     assert!(store
         .load_route_grant_v2_authority(
             &hostname,

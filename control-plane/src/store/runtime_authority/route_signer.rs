@@ -13,7 +13,7 @@ use cats_api::runtime_reconciliation::{
 };
 
 use super::placement_policy::load_policy_unlocked;
-use super::product::validate_endpoint_lookup;
+use super::product::{validate_endpoint_lookup, EndpointRecord, HostnameDesiredLookup};
 use super::product_rows::{
     load_desired_unlocked, load_endpoint_by_id_unlocked, load_hostname_lookup_unlocked,
 };
@@ -71,6 +71,11 @@ pub(crate) enum RouteGrantV2MachineAuthorityLoad {
     Rejected(RouteGrantV2AuthorityRejection),
 }
 
+struct RouteGrantV2AuthorityLocator {
+    lookup: HostnameDesiredLookup,
+    endpoint: EndpointRecord,
+}
+
 impl Store {
     pub(crate) fn load_route_grant_v2_authority(
         &self,
@@ -106,26 +111,37 @@ impl Store {
             else {
                 return Ok(RouteGrantV2MachineAuthorityLoad::AuthenticationFailed);
             };
+            let Some(lookup) = load_hostname_lookup_unlocked(transaction, hostname)? else {
+                return Ok(RouteGrantV2MachineAuthorityLoad::Rejected(
+                    RouteGrantV2AuthorityRejection::NotFound,
+                ));
+            };
+            if !scope.authorizes_workspace(&lookup.workspace_id) {
+                return Ok(RouteGrantV2MachineAuthorityLoad::AuthenticationFailed);
+            }
+            let endpoint = load_endpoint_by_id_unlocked(transaction, &lookup.endpoint_id)?
+                .ok_or_else(corrupt)?;
+            if !scope.authorizes_workspace(&endpoint.workspace_id) {
+                return Ok(RouteGrantV2MachineAuthorityLoad::AuthenticationFailed);
+            }
             if signer_binding.active_kid() != Some(signer.kid()) {
                 return Ok(RouteGrantV2MachineAuthorityLoad::SignerUnavailable);
             }
             if !route_grant_v2_signer_is_current_in(transaction, signer_binding)? {
                 return Ok(RouteGrantV2MachineAuthorityLoad::SignerUnavailable);
             }
-            let snapshot = match load_route_grant_v2_authority_in(
+            let snapshot = match load_route_grant_v2_authority_from_locator_in(
                 transaction,
                 hostname,
                 signer.kid(),
                 active_guest_digest,
+                RouteGrantV2AuthorityLocator { lookup, endpoint },
             )? {
                 RouteGrantV2AuthorityLoad::Ready(snapshot) => snapshot,
                 RouteGrantV2AuthorityLoad::Rejected(rejection) => {
                     return Ok(RouteGrantV2MachineAuthorityLoad::Rejected(rejection));
                 }
             };
-            if !scope.authorizes_workspace(&snapshot.workspace_id) {
-                return Ok(RouteGrantV2MachineAuthorityLoad::AuthenticationFailed);
-            }
             let issued = signer.issue(&snapshot).map_err(|_| {
                 AuthorityTransactionError::Application(ApiError::unavailable(
                     "Route Grant v2 signer could not issue from the current snapshot",
@@ -149,6 +165,23 @@ fn load_route_grant_v2_authority_in(
     };
     let endpoint =
         load_endpoint_by_id_unlocked(transaction, &lookup.endpoint_id)?.ok_or_else(corrupt)?;
+    load_route_grant_v2_authority_from_locator_in(
+        transaction,
+        hostname,
+        active_signer_kid,
+        active_guest_digest,
+        RouteGrantV2AuthorityLocator { lookup, endpoint },
+    )
+}
+
+fn load_route_grant_v2_authority_from_locator_in(
+    transaction: &mut postgres::Transaction<'_>,
+    hostname: &Hostname,
+    active_signer_kid: &KeyId,
+    active_guest_digest: &cats_api::runtime_reconciliation::Sha256Digest,
+    locator: RouteGrantV2AuthorityLocator,
+) -> AuthorityTxResult<RouteGrantV2AuthorityLoad> {
+    let RouteGrantV2AuthorityLocator { lookup, endpoint } = locator;
     let desired = load_desired_unlocked(transaction, &lookup.cat_id)?.ok_or_else(corrupt)?;
     validate_endpoint_lookup(&endpoint, &lookup, &desired)?;
 
