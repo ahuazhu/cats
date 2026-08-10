@@ -176,18 +176,17 @@ handler在读取body、取得admission permit或访问PostgreSQL前要求该prin
   graceful shutdown先关闭新admission，再等待所有active owner归零。client取消不会产生durable route
   workflow；签名response丢失后普通重试重新闭合当前snapshot，不复用丢失token。
 
-当前repository尚无能满足本节的Gateway workload credential authority。[ADR-0044](../decisions/0044-independent-route-v2-signing-authority.md)
-与[Route v2 Signing Authority v1](route-signing-authority-v1.md)已经冻结独立Route v2 signer secret
-reference/public-ring artifact与rotation边界；Node production full inventory已只读投影fixed installed ring，
-Control signer snapshot也会消费其exact ACK，但installer、持久rotation writer和production composition尚未完成；
-v2绝不借legacy V1 signer/key作为fallback。因此production listener不会
-构造typed principal，普通Control组合固定在pre-body/pre-PG `401`；即使未来误注入principal但尚无独立
-v2 signer，也在body/admission/PG前返回`503`。后续Accepted authority必须至少冻结：
+Gateway到Control的独立identity由[ADR-0045](../decisions/0045-independent-gateway-workload-identity.md)
+与[Gateway Workload Identity Authority v1](gateway-workload-identity-v1.md)冻结：固定CA先验证TLS chain，
+verified leaf canonical SPKI再映射PG current credential；每个keepalive request都重验，Workspace scope只使用
+hostname在同一authority snapshot解出的current Workspace。PG exact revision/current pointer是唯一运行时
+authority，filesystem JSON只做install candidate。它不借legacy或HTTP header principal。
 
-1. 独立Gateway workload ID、不可复用credential ID、credential lineage与current/revoked状态；
-2. Control与Node各自的current allow policy，以及TLS peer proof到该精确credential的绑定；
-3. verifier-first rotation overlap、撤销、重启加载失败和credential丢失的fail-closed行为；
-4. Control与Node encrypted listener的trust root、部署artifact固定路径/权限以及rotation ACK证据。
+[ADR-0044](../decisions/0044-independent-route-v2-signing-authority.md)与
+[Route v2 Signing Authority v1](route-signing-authority-v1.md)另行冻结独立Route v2 signer。production success
+只有在machine listener的Gateway credential和进程内fixed signer分别等于同一PG snapshot的current binding时
+开放；无machine配置仍pre-body/pre-PG `401`，principal已认证但signer未组成则pre-body/pre-PG `503`，不存在
+legacy V1 signer/key fallback。Gateway到Node的credential/listener/proxy仍按§4.2保持关闭。
 
 A19只授权Node到Control，A23只授权deployment provisioner写placement policy；两者都不能授权Gateway。
 legacy shared bearer、`nodes.agent_url`、HTTP header自报principal、推测的SPIFFE/SAN或云IAM映射都不是

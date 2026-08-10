@@ -20,6 +20,7 @@ pub mod blockd;
 pub mod cat_create;
 pub mod chunk;
 pub mod error;
+pub mod gateway_workload_identity;
 pub mod guest;
 pub mod ids;
 pub mod metering;
