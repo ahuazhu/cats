@@ -19,9 +19,9 @@ use std::sync::Arc;
 
 use anyhow::Context as _;
 use cats_api::runtime_reconciliation::{
-    encode_runtime_checkpoint, ControlHandshakeEvidence, HostPath, Id, ObservedVmShape,
-    OwnershipTokenEvidence, PreparedDeviceInput, ProcessEvidence, ProcessRole, ProcessState,
-    RandomId128, RuntimeCheckpoint, RuntimeLaunchArtifact, RuntimeLaunchIdentity,
+    encode_runtime_checkpoint, ControlHandshakeEvidence, DesiredRuntimeSpec, HostPath, Id,
+    ObservedVmShape, OwnershipTokenEvidence, PreparedDeviceInput, ProcessEvidence, ProcessRole,
+    ProcessState, RandomId128, RuntimeCheckpoint, RuntimeLaunchArtifact, RuntimeLaunchIdentity,
     RuntimeNetworkIdentity, WireU64,
 };
 
@@ -31,6 +31,7 @@ use crate::vmm_launcher::{
     VMM_LAUNCHER_CONTRACT_ARGUMENT, VMM_PROCESS_TOKEN_ENVIRONMENT,
 };
 
+use super::authorized_blockd::validate_running_endpoint_only_desired_successor;
 use super::checkpoint::{FileCheckpointStore, RetainedCurrentCheckpoint, StoredCheckpoint};
 use super::retained_runtime_launch::RetainedRuntimeLaunchAuthority;
 #[cfg(any(test, target_os = "linux"))]
@@ -140,6 +141,19 @@ pub(crate) trait VmmProcessGlobalPort:
         expected: &VmmProcessExpectation,
         context: &RuntimeDesiredEffectContext,
     ) -> anyhow::Result<VmmProcessGlobalInspection>;
+
+    /// Reinspect the accepted complete managed-process set while replacing
+    /// exactly one VMM's logical checkpoint expectation with a proven
+    /// gate-only successor. Platform implementations override this to run the
+    /// same first/sweep/second closed set with the successor pathname bytes;
+    /// the default keeps sealed test providers honest without widening the
+    /// ordinary exact-expectation API.
+    fn inspect_vmm_gate_successor_exact_after_node_global_sweep(
+        &self,
+        admitted_predecessor: &ExactVmmProcessProof,
+        successor: &VmmGateSuccessorProof,
+        context: &RuntimeDesiredEffectContext,
+    ) -> anyhow::Result<VmmProcessGlobalInspection>;
 }
 
 /// Restart-only absence boundary for retiring one previous-kernel-boot VMM
@@ -191,6 +205,97 @@ pub(crate) struct VmmProcessExpectation {
     /// but it cannot authorize adoption because fixed fd 64 must be joined to
     /// the exact current checkpoint pathname.
     checkpoint_path: Option<HostPath>,
+}
+
+/// Opaque proof that one accepted VMM expectation has exactly one permitted
+/// logical gate successor.  The provider boundary accepts this type instead
+/// of a raw expectation so an Endpoint-only revision cannot be confused with
+/// an arbitrary checkpoint substitution.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct VmmGateSuccessorProof {
+    predecessor: VmmProcessExpectation,
+    successor: VmmProcessExpectation,
+    kind: VmmGateSuccessorKind,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum VmmGateSuccessorKind {
+    SameRevision,
+    EndpointOnly {
+        predecessor_desired: Box<DesiredRuntimeSpec>,
+        successor_desired: Box<DesiredRuntimeSpec>,
+    },
+}
+
+impl VmmGateSuccessorProof {
+    pub(crate) fn same_revision(
+        admitted_predecessor: &ExactVmmProcessProof,
+        successor_checkpoint: &RuntimeCheckpoint,
+    ) -> anyhow::Result<Self> {
+        let predecessor = admitted_predecessor.expectation().clone();
+        let successor = predecessor.gate_only_successor(successor_checkpoint)?;
+        Ok(Self {
+            predecessor,
+            successor,
+            kind: VmmGateSuccessorKind::SameRevision,
+        })
+    }
+
+    pub(crate) fn endpoint_only(
+        admitted_predecessor: &ExactVmmProcessProof,
+        predecessor_desired: &DesiredRuntimeSpec,
+        successor_desired: &DesiredRuntimeSpec,
+        successor_checkpoint: &RuntimeCheckpoint,
+    ) -> anyhow::Result<Self> {
+        let predecessor = admitted_predecessor.expectation().clone();
+        let successor = predecessor.endpoint_only_gate_successor(
+            predecessor_desired,
+            successor_desired,
+            successor_checkpoint,
+        )?;
+        Ok(Self {
+            predecessor,
+            successor,
+            kind: VmmGateSuccessorKind::EndpointOnly {
+                predecessor_desired: Box::new(predecessor_desired.clone()),
+                successor_desired: Box::new(successor_desired.clone()),
+            },
+        })
+    }
+
+    /// Re-run the closed constructor against the exact proof passed to the
+    /// provider and return the successor only when the binding is unchanged.
+    pub(crate) fn validate_for<'a>(
+        &'a self,
+        admitted_predecessor: &ExactVmmProcessProof,
+    ) -> anyhow::Result<&'a VmmProcessExpectation> {
+        anyhow::ensure!(
+            admitted_predecessor.expectation() == &self.predecessor,
+            "VMM gate successor proof is bound to another admitted predecessor"
+        );
+        let reminted = match &self.kind {
+            VmmGateSuccessorKind::SameRevision => self
+                .predecessor
+                .gate_only_successor(self.successor.checkpoint())?,
+            VmmGateSuccessorKind::EndpointOnly {
+                predecessor_desired,
+                successor_desired,
+            } => self.predecessor.endpoint_only_gate_successor(
+                predecessor_desired,
+                successor_desired,
+                self.successor.checkpoint(),
+            )?,
+        };
+        anyhow::ensure!(
+            reminted == self.successor,
+            "VMM gate successor proof no longer matches its closed constructor"
+        );
+        Ok(&self.successor)
+    }
+
+    pub(crate) fn successor(&self) -> &VmmProcessExpectation {
+        &self.successor
+    }
 }
 
 impl VmmProcessExpectation {
@@ -289,6 +394,91 @@ impl VmmProcessExpectation {
 
     pub(crate) fn checkpoint_path(&self) -> Option<&HostPath> {
         self.checkpoint_path.as_ref()
+    }
+
+    /// Produces the exact successor expectation only when every field outside
+    /// the admission/gate journal is byte-for-byte unchanged. The Running
+    /// gate planner separately proves the narrower legal route transition;
+    /// this VMM boundary independently prevents a gate CAS from reinterpreting
+    /// launch, device, network, Desired or placement authority.
+    pub(crate) fn gate_only_successor(
+        &self,
+        successor: &RuntimeCheckpoint,
+    ) -> anyhow::Result<Self> {
+        let mut normalized = successor.clone();
+        normalized.stable_state = self.checkpoint.stable_state;
+        normalized.step = self.checkpoint.step.clone();
+        normalized.lifecycle_admission = self.checkpoint.lifecycle_admission;
+        normalized.route_gates = self.checkpoint.route_gates.clone();
+        normalized.require_idle = self.checkpoint.require_idle.clone();
+        normalized.updated_at_unix_ms = self.checkpoint.updated_at_unix_ms;
+        anyhow::ensure!(
+            normalized == self.checkpoint,
+            "VMM gate successor changed non-gate launch authority"
+        );
+        let mut expected = Self::from_checkpoint(successor.clone())?;
+        expected.checkpoint_path = self.checkpoint_path.clone();
+        anyhow::ensure!(
+            expected.launch == self.launch
+                && expected.unit_id == self.unit_id
+                && expected.cgroup_path == self.cgroup_path
+                && expected.launcher_command_line == self.launcher_command_line
+                && expected.vmm_command_line == self.vmm_command_line
+                && expected.checkpoint_path == self.checkpoint_path,
+            "VMM gate successor changed the retained physical launch identity"
+        );
+        Ok(expected)
+    }
+
+    /// Endpoint-only form of [`Self::gate_only_successor`]. The accepted VMM
+    /// remains the same physical launch, while the checkpoint top advances
+    /// from one sealed live-gate Desired to its closed Endpoint-only
+    /// successor. No caller may request a raw revision/digest substitution.
+    pub(crate) fn endpoint_only_gate_successor(
+        &self,
+        predecessor_desired: &DesiredRuntimeSpec,
+        successor_desired: &DesiredRuntimeSpec,
+        successor: &RuntimeCheckpoint,
+    ) -> anyhow::Result<Self> {
+        validate_running_endpoint_only_desired_successor(predecessor_desired, successor_desired)?;
+        anyhow::ensure!(
+            self.checkpoint.cat_id == predecessor_desired.cat_id
+                && self.checkpoint.node_id == predecessor_desired.placement.node_id
+                && self.checkpoint.placement_epoch == predecessor_desired.placement.placement_epoch
+                && self.checkpoint.desired_revision == predecessor_desired.desired_revision
+                && self.checkpoint.spec_digest == predecessor_desired.spec_digest
+                && successor.cat_id == successor_desired.cat_id
+                && successor.node_id == successor_desired.placement.node_id
+                && successor.placement_epoch == successor_desired.placement.placement_epoch
+                && successor.desired_revision == successor_desired.desired_revision
+                && successor.spec_digest == successor_desired.spec_digest,
+            "VMM Endpoint-only gate successor changed a Desired checkpoint coordinate"
+        );
+        let mut normalized = successor.clone();
+        normalized.desired_revision = self.checkpoint.desired_revision;
+        normalized.spec_digest = self.checkpoint.spec_digest.clone();
+        normalized.stable_state = self.checkpoint.stable_state;
+        normalized.step = self.checkpoint.step.clone();
+        normalized.lifecycle_admission = self.checkpoint.lifecycle_admission;
+        normalized.route_gates = self.checkpoint.route_gates.clone();
+        normalized.require_idle = self.checkpoint.require_idle.clone();
+        normalized.updated_at_unix_ms = self.checkpoint.updated_at_unix_ms;
+        anyhow::ensure!(
+            normalized == self.checkpoint,
+            "VMM Endpoint-only gate successor changed non-gate launch authority"
+        );
+        let mut expected = Self::from_checkpoint(successor.clone())?;
+        expected.checkpoint_path = self.checkpoint_path.clone();
+        anyhow::ensure!(
+            expected.launch == self.launch
+                && expected.unit_id == self.unit_id
+                && expected.cgroup_path == self.cgroup_path
+                && expected.launcher_command_line == self.launcher_command_line
+                && expected.vmm_command_line == self.vmm_command_line
+                && expected.checkpoint_path == self.checkpoint_path,
+            "VMM Endpoint-only gate successor changed the retained physical launch identity"
+        );
+        Ok(expected)
     }
 
     pub(crate) fn api_socket_path(&self) -> &HostPath {
@@ -1372,7 +1562,8 @@ mod tests {
     use std::collections::BTreeMap;
 
     use cats_api::runtime_reconciliation::{
-        decode_runtime_checkpoint, encode_runtime_checkpoint, Epoch, Id, ReconcileStep, StableState,
+        decode_desired_runtime_spec, decode_runtime_checkpoint, encode_runtime_checkpoint,
+        spec_digest, Epoch, Id, ReconcileStep, Revision, StableState,
     };
 
     use super::*;
@@ -1445,6 +1636,67 @@ mod tests {
             );
             assert_eq!(retained.vmm_command_line(), launch.vmm_command_line());
         }
+    }
+
+    #[test]
+    fn endpoint_only_gate_successor_supports_two_revisions_without_reinterpreting_launch() {
+        let predecessor = decode_desired_runtime_spec(include_bytes!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../testdata/runtime-reconciliation-v1-desired.json"
+        )))
+        .unwrap();
+        let checkpoint = decode_runtime_checkpoint(include_bytes!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../testdata/runtime-reconciliation-v1-start-runtime-checkpoint.json"
+        )))
+        .unwrap();
+        assert_eq!(checkpoint.desired_revision, predecessor.desired_revision);
+        assert_eq!(checkpoint.spec_digest, predecessor.spec_digest);
+        let launch = VmmProcessExpectation::from_checkpoint(checkpoint.clone()).unwrap();
+
+        let mut first_desired = predecessor.clone();
+        first_desired.desired_revision =
+            Revision::new(predecessor.desired_revision.get() + 1).unwrap();
+        first_desired.endpoints[0].route_epoch =
+            Epoch::new(predecessor.endpoints[0].route_epoch.get() + 1).unwrap();
+        first_desired.spec_digest = spec_digest(&first_desired).unwrap();
+        let mut first_checkpoint = running_tail_checkpoint(&checkpoint, RunningTail::InstallGate);
+        first_checkpoint.desired_revision = first_desired.desired_revision;
+        first_checkpoint.spec_digest = first_desired.spec_digest.clone();
+        let first = launch
+            .endpoint_only_gate_successor(&predecessor, &first_desired, &first_checkpoint)
+            .unwrap();
+        assert_eq!(first.launch_identity(), launch.launch_identity());
+
+        let mut second_desired = first_desired.clone();
+        second_desired.desired_revision =
+            Revision::new(first_desired.desired_revision.get() + 1).unwrap();
+        second_desired.endpoints[0].route_epoch =
+            Epoch::new(first_desired.endpoints[0].route_epoch.get() + 1).unwrap();
+        second_desired.spec_digest = spec_digest(&second_desired).unwrap();
+        let mut second_checkpoint = first_checkpoint.clone();
+        second_checkpoint.desired_revision = second_desired.desired_revision;
+        second_checkpoint.spec_digest = second_desired.spec_digest.clone();
+        second_checkpoint.updated_at_unix_ms = cats_api::runtime_reconciliation::UnixMillis::new(
+            first_checkpoint.updated_at_unix_ms.get() + 1,
+        )
+        .unwrap();
+        let second = first
+            .endpoint_only_gate_successor(&first_desired, &second_desired, &second_checkpoint)
+            .unwrap();
+        assert_eq!(second.launch_identity(), launch.launch_identity());
+
+        let mut changed_runtime = second_desired.clone();
+        changed_runtime.desired_revision =
+            Revision::new(changed_runtime.desired_revision.get() + 1).unwrap();
+        changed_runtime.runtime.memory_bytes += 4096;
+        changed_runtime.spec_digest = spec_digest(&changed_runtime).unwrap();
+        let mut invalid_checkpoint = second_checkpoint;
+        invalid_checkpoint.desired_revision = changed_runtime.desired_revision;
+        invalid_checkpoint.spec_digest = changed_runtime.spec_digest.clone();
+        assert!(second
+            .endpoint_only_gate_successor(&second_desired, &changed_runtime, &invalid_checkpoint,)
+            .is_err());
     }
 
     fn exact_manager_properties(

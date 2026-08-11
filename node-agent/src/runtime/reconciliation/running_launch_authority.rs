@@ -19,6 +19,9 @@ use cats_storage::authority::{VolumeDataAuthority, VolumeRecord};
 use crate::runtime_spine::RuntimeDesiredEffectContext;
 use crate::state_directory::StateDirectory;
 
+use super::authorized_blockd::{
+    validate_running_endpoint_only_desired_successor, validate_running_physical_desired_successor,
+};
 use super::checkpoint::{FileCheckpointStore, StoredCheckpoint};
 use super::inventory::AuthorityVolumeInventoryEvidence;
 use super::kernel_nbd::{
@@ -42,7 +45,8 @@ use super::serving_blockd_process::{
 };
 use super::systemd_root_provision::RootProvisionSystemdConfig;
 use super::vmm_process::{
-    ExactVmmProcessProof, VmmProcessExpectation, VmmProcessGlobalInspection, VmmProcessGlobalPort,
+    ExactVmmProcessProof, VmmGateSuccessorProof, VmmProcessExpectation, VmmProcessGlobalInspection,
+    VmmProcessGlobalPort,
 };
 
 enum ProcessProofSet<'a> {
@@ -313,6 +317,125 @@ impl RunningLaunchAuthorityRevalidator {
         stored: &StoredCheckpoint,
         admitted_vmm: &ExactVmmProcessProof,
     ) -> Result<()> {
+        self.revalidate_exact_retained_running_gate_successor(
+            context,
+            desired,
+            store,
+            stored,
+            stored,
+            admitted_vmm,
+        )
+        .map(|_| ())
+    }
+
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "the gate barrier closes one accepted physical predecessor and its durable successor"
+    )]
+    pub(crate) fn revalidate_exact_retained_running_gate_successor(
+        &self,
+        context: &RuntimeDesiredEffectContext,
+        desired: &DesiredRuntimeSpec,
+        store: &FileCheckpointStore,
+        accepted_checkpoint: &StoredCheckpoint,
+        durable_successor: &StoredCheckpoint,
+        admitted_vmm: &ExactVmmProcessProof,
+    ) -> Result<ExactVmmProcessProof> {
+        self.revalidate_exact_retained_running_gate_chain(
+            context,
+            desired,
+            desired,
+            desired,
+            false,
+            store,
+            accepted_checkpoint,
+            durable_successor,
+            admitted_vmm,
+        )
+    }
+
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "the Endpoint-only barrier closes immutable launch, live-gate predecessor, and durable successor separately"
+    )]
+    #[expect(
+        dead_code,
+        reason = "the route-retirement integration consumes this closed three-Desired seam"
+    )]
+    pub(crate) fn revalidate_exact_retained_running_endpoint_successor(
+        &self,
+        context: &RuntimeDesiredEffectContext,
+        physical_launch_desired: &DesiredRuntimeSpec,
+        live_gate_predecessor: &DesiredRuntimeSpec,
+        gate_successor: &DesiredRuntimeSpec,
+        store: &FileCheckpointStore,
+        accepted_checkpoint: &StoredCheckpoint,
+        durable_successor: &StoredCheckpoint,
+        admitted_vmm: &ExactVmmProcessProof,
+    ) -> Result<ExactVmmProcessProof> {
+        self.revalidate_exact_retained_running_gate_chain(
+            context,
+            physical_launch_desired,
+            live_gate_predecessor,
+            gate_successor,
+            true,
+            store,
+            accepted_checkpoint,
+            durable_successor,
+            admitted_vmm,
+        )
+    }
+
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "the closed gate chain keeps three Desired authorities and two durable checkpoints distinct"
+    )]
+    fn revalidate_exact_retained_running_gate_chain(
+        &self,
+        context: &RuntimeDesiredEffectContext,
+        physical_launch_desired: &DesiredRuntimeSpec,
+        live_gate_predecessor: &DesiredRuntimeSpec,
+        gate_successor: &DesiredRuntimeSpec,
+        endpoint_only: bool,
+        store: &FileCheckpointStore,
+        accepted_checkpoint: &StoredCheckpoint,
+        durable_successor: &StoredCheckpoint,
+        admitted_vmm: &ExactVmmProcessProof,
+    ) -> Result<ExactVmmProcessProof> {
+        validate_running_physical_desired_successor(
+            physical_launch_desired,
+            live_gate_predecessor,
+        )?;
+        if endpoint_only {
+            validate_running_endpoint_only_desired_successor(
+                live_gate_predecessor,
+                gate_successor,
+            )?;
+        } else {
+            anyhow::ensure!(
+                live_gate_predecessor == gate_successor,
+                "same-revision gate barrier received another Desired"
+            );
+        }
+        anyhow::ensure!(
+            accepted_checkpoint.checkpoint().cat_id == live_gate_predecessor.cat_id
+                && accepted_checkpoint.checkpoint().node_id
+                    == live_gate_predecessor.placement.node_id
+                && accepted_checkpoint.checkpoint().placement_epoch
+                    == live_gate_predecessor.placement.placement_epoch
+                && accepted_checkpoint.checkpoint().desired_revision
+                    == live_gate_predecessor.desired_revision
+                && accepted_checkpoint.checkpoint().spec_digest
+                    == live_gate_predecessor.spec_digest
+                && durable_successor.checkpoint().cat_id == gate_successor.cat_id
+                && durable_successor.checkpoint().node_id == gate_successor.placement.node_id
+                && durable_successor.checkpoint().placement_epoch
+                    == gate_successor.placement.placement_epoch
+                && durable_successor.checkpoint().desired_revision
+                    == gate_successor.desired_revision
+                && durable_successor.checkpoint().spec_digest == gate_successor.spec_digest,
+            "Running gate chain does not bind its live predecessor and durable successor"
+        );
         context.check_active()?;
         anyhow::ensure!(
             context.state_directory().path() == self.state_directory.path(),
@@ -337,12 +460,12 @@ impl RunningLaunchAuthorityRevalidator {
             .context("reread Running checkpoint before authority validation")?
             .context("Running checkpoint disappeared before authority validation")?;
         anyhow::ensure!(
-            current.content_digest() == stored.content_digest()
-                && current.checkpoint() == stored.checkpoint(),
-            "Running checkpoint changed before authority validation"
+            current.content_digest() == durable_successor.content_digest()
+                && current.checkpoint() == durable_successor.checkpoint(),
+            "Running durable gate successor changed before authority validation"
         );
-        let checkpoint_guard = store.assert_current(stored)?;
-        let devices = prepared_device_inputs(stored.checkpoint())?;
+        let checkpoint_guard = store.assert_current(durable_successor)?;
+        let devices = prepared_device_inputs(accepted_checkpoint.checkpoint())?;
         let mut first_authorities = Vec::with_capacity(devices.len());
         for device in &devices {
             let record = self
@@ -365,8 +488,8 @@ impl RunningLaunchAuthorityRevalidator {
             .optional_kernel_nbd_pool()
             .map(KernelNbdProofSet::Accepted);
         let validated_vmm = validate_running_exact_set(
-            desired,
-            stored.checkpoint(),
+            live_gate_predecessor,
+            accepted_checkpoint.checkpoint(),
             &records,
             ProcessProofSet::Accepted(process_admission),
             NetworkProofSet::Accepted(network_admission),
@@ -380,29 +503,34 @@ impl RunningLaunchAuthorityRevalidator {
         let mut retained_devices = Vec::with_capacity(devices.len());
         for (device, first_authority) in devices.iter().zip(first_authorities) {
             let (expectation, Some(serving)) = process_admission
-                .serving_blockd(&desired.cat_id, &device.volume_id)
+                .serving_blockd(&live_gate_predecessor.cat_id, &device.volume_id)
                 .context("Running retained device lacks its serving process sidecar")?
             else {
                 anyhow::bail!("Running retained device lacks an exact serving process")
             };
-            let retained = RetainedServingBlockdAuthority::reopen(
+            let retained = RetainedServingBlockdAuthority::reopen_running(
                 &self.state_directory,
-                stored.checkpoint(),
-                desired,
+                accepted_checkpoint.checkpoint(),
+                physical_launch_desired,
+                live_gate_predecessor,
                 device,
                 &first_authority,
             )
             .context("reopen retained Running AuthorizedBlockd authority")?;
             anyhow::ensure!(
-                retained.expectation(&self.systemd, desired, &first_authority)? == *expectation,
+                retained.expectation_running(
+                    &self.systemd,
+                    physical_launch_desired,
+                    &first_authority,
+                )? == *expectation,
                 "retained Running AuthorizedBlockd authority changed its process expectation"
             );
             let first_lease_expiry = first_authority
                 .lease_expires_at
                 .context("Running Volume authority lacks a serving lease")?;
-            let kernel_nbd = context
-                .optional_kernel_nbd_pool()
-                .and_then(|pool| pool.exact_device(&desired.cat_id, &device.volume_id));
+            let kernel_nbd = context.optional_kernel_nbd_pool().and_then(|pool| {
+                pool.exact_device(&live_gate_predecessor.cat_id, &device.volume_id)
+            });
             retained_devices.push(RetainedRunningDevice {
                 expectation,
                 serving,
@@ -414,7 +542,7 @@ impl RunningLaunchAuthorityRevalidator {
         }
 
         self.network
-            .revalidate_exact_reserved(context, store, stored)
+            .revalidate_exact_reserved(context, store, durable_successor)
             .context("revalidate retained Running network")?;
         for retained in &retained_devices {
             let current_process = match self
@@ -450,27 +578,42 @@ impl RunningLaunchAuthorityRevalidator {
                 ),
                 "retained Running Volume authority changed"
             );
-            retained.retained.assert_current(
-                stored.checkpoint(),
-                desired,
+            retained.retained.assert_running_current(
+                accepted_checkpoint.checkpoint(),
+                physical_launch_desired,
+                live_gate_predecessor,
                 &current_authority,
                 retained.expectation,
             )?;
             match (retained.kernel_nbd, &self.kernel_nbd) {
-                (Some(admitted), Some(inventory)) => {
-                    inventory.revalidate_exact_device(context, store, stored, admitted)?
-                }
+                (Some(admitted), Some(inventory)) => inventory.revalidate_exact_device(
+                    context,
+                    store,
+                    durable_successor,
+                    admitted,
+                )?,
                 (None, _) => {}
                 (Some(_), None) => anyhow::bail!(
                     "retained Running kernel-NBD device lacks a production inventory port"
                 ),
             }
         }
-        store.revalidate_current(stored, &checkpoint_guard)?;
+        store.revalidate_current(durable_successor, &checkpoint_guard)?;
+        let successor = if endpoint_only {
+            VmmGateSuccessorProof::endpoint_only(
+                admitted_vmm,
+                live_gate_predecessor,
+                gate_successor,
+                durable_successor.checkpoint(),
+            )?
+        } else {
+            VmmGateSuccessorProof::same_revision(admitted_vmm, durable_successor.checkpoint())?
+        };
         let current_vmm = match self
             .vmm_process
-            .inspect_vmm_exact_or_absent_after_node_global_sweep(
-                admitted_vmm.expectation(),
+            .inspect_vmm_gate_successor_exact_after_node_global_sweep(
+                admitted_vmm,
+                &successor,
                 context,
             )
             .context("fresh-scan retained Running VMM")?
@@ -483,12 +626,14 @@ impl RunningLaunchAuthorityRevalidator {
             }
         };
         anyhow::ensure!(
-            current_vmm.as_ref() == admitted_vmm,
-            "retained Running VMM changed after accepted full inventory"
+            current_vmm.expectation() == successor.successor()
+                && current_vmm.evidence() == admitted_vmm.evidence(),
+            "retained Running VMM changed across the gate-only successor sweep"
         );
         current_vmm.assert_current(context)?;
-        store.revalidate_current(stored, &checkpoint_guard)?;
-        context.check_active()
+        store.revalidate_current(durable_successor, &checkpoint_guard)?;
+        context.check_active()?;
+        Ok(*current_vmm)
     }
 }
 

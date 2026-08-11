@@ -601,6 +601,19 @@ impl AuthorizedBlockdStore {
         desired: &DesiredRuntimeSpec,
         prepared: &cats_api::runtime_reconciliation::PreparedDeviceInput,
     ) -> Result<RetainedAuthorizedBlockd> {
+        self.retain_running_prepared_device(runtime, desired, desired, prepared)
+    }
+
+    /// Descriptor-retained Running reopen with an immutable physical-launch
+    /// Desired and a potentially later live-gate Desired kept distinct.
+    pub(crate) fn retain_running_prepared_device(
+        &self,
+        runtime: &RuntimeCheckpoint,
+        physical_desired: &DesiredRuntimeSpec,
+        gate_desired: &DesiredRuntimeSpec,
+        prepared: &cats_api::runtime_reconciliation::PreparedDeviceInput,
+    ) -> Result<RetainedAuthorizedBlockd> {
+        validate_running_physical_desired_successor(physical_desired, gate_desired)?;
         let components = [
             DATA_DIRECTORY.to_owned(),
             format!("cat-{}", runtime.cat_id),
@@ -682,22 +695,28 @@ impl AuthorizedBlockdStore {
                 &root_identity,
             )?;
         validate_authorized_blockd_checkpoint(&checkpoint)?;
-        let desired_volume = desired
+        let physical_volume = physical_desired
             .volumes
             .iter()
             .find(|volume| volume.volume_id == prepared.volume_id)
-            .context("prepared device lacks its exact Desired volume")?;
+            .context("prepared device lacks its physical-launch Desired volume")?;
+        let gate_volume = gate_desired
+            .volumes
+            .iter()
+            .find(|volume| volume.volume_id == prepared.volume_id)
+            .context("prepared device lacks its live-gate Desired volume")?;
         anyhow::ensure!(
             identity == attachment.identity
                 && attachment == checkpoint.attachment
-                && checkpoint.desired == *desired
-                && checkpoint.volume == *desired_volume
-                && runtime.cat_id == desired.cat_id
-                && runtime.node_id == desired.placement.node_id
-                && runtime.placement_epoch == desired.placement.placement_epoch
-                && runtime.desired_revision == desired.desired_revision
-                && runtime.spec_digest == desired.spec_digest
-                && prepared.volume_id == desired_volume.volume_id
+                && checkpoint.desired == *physical_desired
+                && checkpoint.volume == *physical_volume
+                && physical_volume == gate_volume
+                && runtime.cat_id == gate_desired.cat_id
+                && runtime.node_id == gate_desired.placement.node_id
+                && runtime.placement_epoch == gate_desired.placement.placement_epoch
+                && runtime.desired_revision == gate_desired.desired_revision
+                && runtime.spec_digest == gate_desired.spec_digest
+                && prepared.volume_id == physical_volume.volume_id
                 && prepared.volume_id == identity.volume_id
                 && prepared.attachment_id == identity.attachment_id
                 && prepared.attachment_epoch == identity.attachment_epoch
@@ -2015,6 +2034,66 @@ pub(crate) fn validate_authorized_blockd_checkpoint(
     })
 }
 
+/// Proves that a later live-gate Desired reuses one immutable Running launch
+/// without reinterpreting any physical/runtime/volume authority. Endpoint
+/// bindings and their revision/digest may advance; every other Desired field
+/// is exact. Equal revisions are accepted only as the identical full value.
+pub(crate) fn validate_running_physical_desired_successor(
+    physical: &DesiredRuntimeSpec,
+    gate: &DesiredRuntimeSpec,
+) -> Result<()> {
+    encode_desired_runtime_spec(physical).context("validate physical-launch Desired")?;
+    encode_desired_runtime_spec(gate).context("validate live-gate Desired")?;
+    anyhow::ensure!(
+        physical.target == RuntimeTarget::Running
+            && gate.target == RuntimeTarget::Running
+            && physical.desired_revision <= gate.desired_revision,
+        "live-gate Desired is not a monotonic Running launch successor"
+    );
+    if physical.desired_revision == gate.desired_revision {
+        anyhow::ensure!(physical == gate, "same-revision Running Desired changed");
+        return Ok(());
+    }
+    let mut normalized = gate.clone();
+    normalized.desired_revision = physical.desired_revision;
+    normalized.spec_digest = physical.spec_digest.clone();
+    normalized.endpoints = physical.endpoints.clone();
+    anyhow::ensure!(
+        normalized == *physical,
+        "live-gate Desired changed non-Endpoint physical launch authority"
+    );
+    Ok(())
+}
+
+/// Closed Desired transition used by the gate C barrier. It proves a strict
+/// revision successor whose only semantic change is the Endpoint set; every
+/// changed retained Endpoint must burn a strictly higher route epoch.
+pub(crate) fn validate_running_endpoint_only_desired_successor(
+    predecessor: &DesiredRuntimeSpec,
+    successor: &DesiredRuntimeSpec,
+) -> Result<()> {
+    validate_running_physical_desired_successor(predecessor, successor)?;
+    anyhow::ensure!(
+        predecessor.desired_revision < successor.desired_revision
+            && predecessor.spec_digest != successor.spec_digest
+            && predecessor.endpoints != successor.endpoints,
+        "Endpoint-only gate Desired is not a strict changed revision"
+    );
+    for current in &successor.endpoints {
+        if let Some(previous) = predecessor
+            .endpoints
+            .iter()
+            .find(|endpoint| endpoint.endpoint_id == current.endpoint_id)
+        {
+            anyhow::ensure!(
+                previous == current || current.route_epoch > previous.route_epoch,
+                "changed Endpoint did not advance its route epoch"
+            );
+        }
+    }
+    Ok(())
+}
+
 fn directory_components(
     desired: &DesiredRuntimeSpec,
     identity: &AttachmentLineageIdentity,
@@ -2955,6 +3034,25 @@ mod tests {
             },
         };
         (desired, volume, attachment)
+    }
+
+    #[test]
+    fn running_physical_desired_successor_changes_only_endpoint_coordinates() {
+        let (physical, _, _) = fixture();
+        let mut gate = physical.clone();
+        gate.desired_revision = Revision::new(physical.desired_revision.get() + 1).unwrap();
+        gate.spec_digest = spec_digest(&gate).unwrap();
+        validate_running_physical_desired_successor(&physical, &gate).unwrap();
+
+        let mut changed_runtime = gate.clone();
+        changed_runtime.runtime.memory_bytes += 4096;
+        changed_runtime.spec_digest = spec_digest(&changed_runtime).unwrap();
+        assert!(validate_running_physical_desired_successor(&physical, &changed_runtime).is_err());
+
+        let mut same_revision = physical.clone();
+        same_revision.runtime.memory_bytes += 4096;
+        same_revision.spec_digest = spec_digest(&same_revision).unwrap();
+        assert!(validate_running_physical_desired_successor(&physical, &same_revision).is_err());
     }
 
     fn final_directory(root: &Path) -> PathBuf {

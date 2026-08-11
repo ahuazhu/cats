@@ -96,8 +96,9 @@ use super::vmm_cid::{
 };
 use super::vmm_process::{
     global_sealed as vmm_global_sealed, sealed as vmm_process_sealed,
-    PlatformSystemdVmmProcessPort, VmmProcessConflict, VmmProcessExpectation,
-    VmmProcessGlobalInspection, VmmProcessGlobalPort, VmmProcessInspection, VmmProcessPort,
+    PlatformSystemdVmmProcessPort, VmmGateSuccessorProof, VmmProcessConflict,
+    VmmProcessExpectation, VmmProcessGlobalInspection, VmmProcessGlobalPort, VmmProcessInspection,
+    VmmProcessPort,
 };
 #[cfg(target_os = "linux")]
 use super::vmm_process::{
@@ -3819,9 +3820,30 @@ impl PlatformRootProcessInventoryBridge {
         admission: &super::root_provision_process::NodeGlobalManagedProcessAdmission,
         context: &dyn RuntimePhysicalReadContext,
     ) -> anyhow::Result<AdmittedManagedProcessInspection> {
+        self.inspect_admitted_managed_processes_with_vmm_successor(admission, None, context)
+    }
+
+    fn inspect_admitted_managed_processes_with_vmm_successor(
+        &self,
+        admission: &super::root_provision_process::NodeGlobalManagedProcessAdmission,
+        vmm_successor: Option<&VmmGateSuccessorProof>,
+        context: &dyn RuntimePhysicalReadContext,
+    ) -> anyhow::Result<AdmittedManagedProcessInspection> {
         let (root_expected, root_admitted) = admission.root_control_state();
         let (serving_expected, serving_admitted) = admission.serving_blockd_state();
-        let (vmm_expected, vmm_admitted) = admission.vmm_state();
+        let (mut vmm_expected, vmm_admitted) = admission.vmm_state();
+        if let Some(successor_proof) = vmm_successor {
+            let successor = successor_proof.successor();
+            let Some((accepted, Some(admitted_exact))) = admission.vmm(successor.cat_id()) else {
+                return Ok(AdmittedManagedProcessInspection::IdentityMismatch);
+            };
+            if accepted != admitted_exact.expectation()
+                || successor_proof.validate_for(admitted_exact)? != successor
+            {
+                return Ok(AdmittedManagedProcessInspection::IdentityMismatch);
+            }
+            vmm_expected.insert(successor.cat_id().clone(), successor.clone());
+        }
         let Some(root_first) =
             inspect_root_process_set(self.port.as_ref(), &root_expected, context)?
         else {
@@ -4337,6 +4359,68 @@ impl VmmProcessGlobalPort for PlatformRootProcessInventoryBridge {
                     }
                 }
             }
+            AdmittedManagedProcessInspection::Unavailable => {
+                Ok(VmmProcessGlobalInspection::Unavailable)
+            }
+            AdmittedManagedProcessInspection::IdentityMismatch => Ok(
+                VmmProcessGlobalInspection::Conflict(VmmProcessConflict::IdentityMismatch),
+            ),
+            AdmittedManagedProcessInspection::DuplicateIdentity => Ok(
+                VmmProcessGlobalInspection::Conflict(VmmProcessConflict::DuplicateIdentity),
+            ),
+        }
+    }
+
+    fn inspect_vmm_gate_successor_exact_after_node_global_sweep(
+        &self,
+        admitted_predecessor: &super::vmm_process::ExactVmmProcessProof,
+        successor_proof: &VmmGateSuccessorProof,
+        context: &crate::runtime_spine::RuntimeDesiredEffectContext,
+    ) -> anyhow::Result<VmmProcessGlobalInspection> {
+        let successor = successor_proof.validate_for(admitted_predecessor)?;
+        let admission = context.node_global_process()?;
+        let Some((admitted_target, admitted_exact)) =
+            admission.vmm(admitted_predecessor.expectation().cat_id())
+        else {
+            return Ok(VmmProcessGlobalInspection::Conflict(
+                VmmProcessConflict::IdentityMismatch,
+            ));
+        };
+        if admitted_target != admitted_predecessor.expectation()
+            || admitted_exact != Some(admitted_predecessor)
+        {
+            return Ok(VmmProcessGlobalInspection::Conflict(
+                VmmProcessConflict::IdentityMismatch,
+            ));
+        }
+        match self.inspect_admitted_managed_processes_with_vmm_successor(
+            admission,
+            Some(successor_proof),
+            context,
+        )? {
+            AdmittedManagedProcessInspection::Exact { mut vmm, .. } => match vmm
+                .remove(successor.cat_id())
+                .expect("successor VMM expectation was retained in the closed set")
+            {
+                VmmProcessInspection::Exact(evidence) => {
+                    let proof = successor.clone().prove_exact_process(*evidence)?;
+                    if proof.evidence() != admitted_predecessor.evidence() {
+                        return Ok(VmmProcessGlobalInspection::Conflict(
+                            VmmProcessConflict::IdentityMismatch,
+                        ));
+                    }
+                    Ok(VmmProcessGlobalInspection::Exact(Box::new(proof)))
+                }
+                VmmProcessInspection::Absent => Ok(VmmProcessGlobalInspection::Absent(Box::new(
+                    super::vmm_process::ExactVmmProcessAbsenceProof::for_expectation(
+                        successor.clone(),
+                    ),
+                ))),
+                VmmProcessInspection::Conflict(problem) => {
+                    Ok(VmmProcessGlobalInspection::Conflict(problem))
+                }
+                VmmProcessInspection::Unavailable => Ok(VmmProcessGlobalInspection::Unavailable),
+            },
             AdmittedManagedProcessInspection::Unavailable => {
                 Ok(VmmProcessGlobalInspection::Unavailable)
             }
@@ -7314,6 +7398,106 @@ mod tests {
             Some(stale_receipt)
         );
         drop(current_attempt);
+    }
+
+    #[test]
+    fn platform_sweep_accepts_only_the_typed_second_endpoint_revision_successor() {
+        let environment = TestEnvironment::new();
+        let physical =
+            cats_api::runtime_reconciliation::decode_desired_runtime_spec(include_bytes!(concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/../testdata/runtime-reconciliation-v1-desired.json"
+            )))
+            .unwrap();
+        let launch_checkpoint = decode_runtime_checkpoint(include_bytes!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../testdata/runtime-reconciliation-v1-start-runtime-checkpoint.json"
+        )))
+        .unwrap();
+
+        let mut live_gate = physical.clone();
+        live_gate.desired_revision = Revision::new(physical.desired_revision.get() + 1).unwrap();
+        live_gate.endpoints[0].route_epoch =
+            Epoch::new(physical.endpoints[0].route_epoch.get() + 1).unwrap();
+        live_gate.spec_digest = spec_digest(&live_gate).unwrap();
+        super::super::authorized_blockd::validate_running_physical_desired_successor(
+            &physical, &live_gate,
+        )
+        .unwrap();
+        let mut accepted_checkpoint = launch_checkpoint;
+        accepted_checkpoint.desired_revision = live_gate.desired_revision;
+        accepted_checkpoint.spec_digest = live_gate.spec_digest.clone();
+        let accepted = VmmProcessExpectation::from_checkpoint(accepted_checkpoint.clone())
+            .unwrap()
+            .with_checkpoint_path(
+                HostPath::new("/var/lib/cats/checkpoints/cat-cat_01.checkpoint.json").unwrap(),
+            )
+            .unwrap();
+        let accepted_exact = accepted
+            .clone()
+            .prove_exact_process(accepted.exact_evidence_for_test(71))
+            .unwrap();
+
+        let mut successor_desired = live_gate.clone();
+        successor_desired.desired_revision =
+            Revision::new(live_gate.desired_revision.get() + 1).unwrap();
+        successor_desired.endpoints[0].route_epoch =
+            Epoch::new(live_gate.endpoints[0].route_epoch.get() + 1).unwrap();
+        successor_desired.spec_digest = spec_digest(&successor_desired).unwrap();
+        let mut successor_checkpoint = accepted_checkpoint;
+        successor_checkpoint.desired_revision = successor_desired.desired_revision;
+        successor_checkpoint.spec_digest = successor_desired.spec_digest.clone();
+        successor_checkpoint.updated_at_unix_ms =
+            UnixMillis::new(successor_checkpoint.updated_at_unix_ms.get() + 1).unwrap();
+        let successor = VmmGateSuccessorProof::endpoint_only(
+            &accepted_exact,
+            &live_gate,
+            &successor_desired,
+            &successor_checkpoint,
+        )
+        .unwrap();
+
+        let admission = NodeGlobalManagedProcessScanAdmission::from_root_controls(
+            BTreeMap::new(),
+            BTreeMap::new(),
+        )
+        .unwrap()
+        .with_vmms(
+            BTreeMap::from([(accepted.cat_id().clone(), accepted.clone())]),
+            BTreeMap::from([(accepted.cat_id().clone(), accepted_exact.clone())]),
+        )
+        .unwrap()
+        .into_admission_for_test();
+        let context = RuntimeDesiredEffectContext::for_test_with_node_global_process(
+            StateDirectory::unanchored(environment.state.clone()),
+            Instant::now() + Duration::from_secs(5),
+            admission,
+        );
+        let bridge = root_process_bridge_with_all_ports(
+            &environment,
+            Arc::new(FakeRootProcessPort {
+                inspections: Mutex::new(VecDeque::new()),
+            }),
+            Arc::new(FakeServingProcessPort {
+                process_ids: Mutex::new(VecDeque::new()),
+            }),
+            Arc::new(FakeVmmProcessPort {
+                process_ids: Mutex::new(VecDeque::from([Some(71), Some(71)])),
+            }),
+        );
+
+        let VmmProcessGlobalInspection::Exact(current) = bridge
+            .inspect_vmm_gate_successor_exact_after_node_global_sweep(
+                &accepted_exact,
+                &successor,
+                &context,
+            )
+            .unwrap()
+        else {
+            panic!("typed Endpoint-only successor must retain the exact physical VMM")
+        };
+        assert_eq!(current.expectation(), successor.successor());
+        assert_eq!(current.evidence(), accepted_exact.evidence());
     }
 
     #[test]

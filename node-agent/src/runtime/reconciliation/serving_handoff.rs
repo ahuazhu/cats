@@ -5219,6 +5219,26 @@ mod tests {
                 }
             })
         }
+
+        fn inspect_vmm_gate_successor_exact_after_node_global_sweep(
+            &self,
+            admitted_predecessor: &super::super::vmm_process::ExactVmmProcessProof,
+            successor_proof: &super::super::vmm_process::VmmGateSuccessorProof,
+            _context: &RuntimeDesiredEffectContext,
+        ) -> Result<VmmProcessGlobalInspection> {
+            let successor = successor_proof.validate_for(admitted_predecessor)?;
+            Ok(match self.inspect_one(successor) {
+                VmmProcessInspection::Exact(evidence) => VmmProcessGlobalInspection::Exact(
+                    Box::new(successor.clone().prove_exact_process(*evidence)?),
+                ),
+                VmmProcessInspection::Conflict(problem) => {
+                    VmmProcessGlobalInspection::Conflict(problem)
+                }
+                VmmProcessInspection::Absent | VmmProcessInspection::Unavailable => {
+                    unreachable!("fake Running VMM returns only exact or conflict")
+                }
+            })
+        }
     }
 
     #[cfg(target_os = "linux")]
@@ -5326,6 +5346,29 @@ mod tests {
                 )),
                 VmmProcessInspection::Exact(evidence) => VmmProcessGlobalInspection::Exact(
                     Box::new(expected.clone().prove_exact_process(*evidence)?),
+                ),
+                VmmProcessInspection::Conflict(problem) => {
+                    VmmProcessGlobalInspection::Conflict(problem)
+                }
+                VmmProcessInspection::Unavailable => VmmProcessGlobalInspection::Unavailable,
+            })
+        }
+
+        fn inspect_vmm_gate_successor_exact_after_node_global_sweep(
+            &self,
+            admitted_predecessor: &super::super::vmm_process::ExactVmmProcessProof,
+            successor_proof: &super::super::vmm_process::VmmGateSuccessorProof,
+            _context: &RuntimeDesiredEffectContext,
+        ) -> Result<VmmProcessGlobalInspection> {
+            let successor = successor_proof.validate_for(admitted_predecessor)?;
+            Ok(match self.next(successor) {
+                VmmProcessInspection::Absent => VmmProcessGlobalInspection::Absent(Box::new(
+                    super::super::vmm_process::ExactVmmProcessAbsenceProof::for_expectation(
+                        successor.clone(),
+                    ),
+                )),
+                VmmProcessInspection::Exact(evidence) => VmmProcessGlobalInspection::Exact(
+                    Box::new(successor.clone().prove_exact_process(*evidence)?),
                 ),
                 VmmProcessInspection::Conflict(problem) => {
                     VmmProcessGlobalInspection::Conflict(problem)

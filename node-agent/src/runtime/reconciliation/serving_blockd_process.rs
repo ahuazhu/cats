@@ -30,7 +30,7 @@ use crate::state_directory::StateDirectory;
 
 use super::authorized_blockd::{
     authorized_blockd_status_is_bound_to_head, retained_authorized_blockd_command,
-    AuthorizedBlockFrontend, RetainedAuthorizedBlockd,
+    validate_running_physical_desired_successor, AuthorizedBlockFrontend, RetainedAuthorizedBlockd,
 };
 use super::checkpoint::CurrentCheckpointGuard;
 use super::clean_slate_probes::CHECKPOINT_NAMESPACE;
@@ -147,8 +147,36 @@ impl ServingBlockdExpectation {
         evidence: &AuthorizedBlockdInventoryEvidence,
         authority: &VolumeRecord,
     ) -> anyhow::Result<Self> {
+        Self::from_inventory_running(
+            state_directory,
+            systemd,
+            checkpoint,
+            desired,
+            desired,
+            prepared,
+            evidence,
+            authority,
+        )
+    }
+
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "Running inventory keeps immutable launch and live gate Desired authorities distinct"
+    )]
+    pub(crate) fn from_inventory_running(
+        state_directory: &StateDirectory,
+        systemd: &RootProvisionSystemdConfig,
+        checkpoint: &cats_api::runtime_reconciliation::RuntimeCheckpoint,
+        physical_desired: &DesiredRuntimeSpec,
+        gate_desired: &DesiredRuntimeSpec,
+        prepared: &PreparedDeviceInput,
+        evidence: &AuthorizedBlockdInventoryEvidence,
+        authority: &VolumeRecord,
+    ) -> anyhow::Result<Self> {
+        validate_running_physical_desired_successor(physical_desired, gate_desired)?;
         anyhow::ensure!(
-            evidence.checkpoint.desired.cat_id == desired.cat_id
+            evidence.checkpoint.desired == *physical_desired
+                && evidence.checkpoint.desired.cat_id == gate_desired.cat_id
                 && evidence.checkpoint.attachment.identity.volume_id == prepared.volume_id
                 && evidence.data_directory == prepared.serving_process.data_directory,
             "serving expectation inventory changed its Cat, Volume, or data directory"
@@ -158,13 +186,15 @@ impl ServingBlockdExpectation {
             cats_api::runtime_reconciliation::ServingAuthorityProvenance::AfterRootProvision {
                 ..
             } => {
-                let prepared_checkpoint = prepare_device_checkpoint_view(checkpoint)?;
+                let mut prepared_checkpoint = prepare_device_checkpoint_view(checkpoint)?;
+                prepared_checkpoint.desired_revision = physical_desired.desired_revision;
+                prepared_checkpoint.spec_digest = physical_desired.spec_digest.clone();
                 anyhow::ensure!(
                     prepared_device_input(&prepared_checkpoint)? == *prepared,
                     "Root serving expectation selected another prepared device"
                 );
-                let retained =
-                    store.retain_prepare_device_handoff(&prepared_checkpoint, desired)?;
+                let retained = store
+                    .retain_prepare_device_handoff(&prepared_checkpoint, physical_desired)?;
                 anyhow::ensure!(
                     retained.checkpoint() == &evidence.checkpoint,
                     "Root serving expectation reopened another authorized checkpoint"
@@ -172,7 +202,7 @@ impl ServingBlockdExpectation {
                 let ready = ServingHandoffStore::new(state_directory.clone())
                     .reopen_prepare_device_handoff(
                         &prepared_checkpoint,
-                        desired,
+                        physical_desired,
                         authority,
                         retained,
                     )?;
@@ -180,14 +210,19 @@ impl ServingBlockdExpectation {
                     &ready,
                     systemd,
                     &prepared_checkpoint,
-                    desired,
+                    physical_desired,
                     authority,
                 )
             }
             cats_api::runtime_reconciliation::ServingAuthorityProvenance::DirectAuthorizedAttachment {
                 ..
             } => {
-                let retained = store.retain_prepared_device(checkpoint, desired, prepared)?;
+                let retained = store.retain_running_prepared_device(
+                    checkpoint,
+                    physical_desired,
+                    gate_desired,
+                    prepared,
+                )?;
                 anyhow::ensure!(
                     retained.checkpoint() == &evidence.checkpoint
                         && Path::new(evidence.data_directory.as_str())
@@ -990,20 +1025,41 @@ impl RetainedServingBlockdAuthority {
         prepared: &PreparedDeviceInput,
         authority: &VolumeRecord,
     ) -> anyhow::Result<Self> {
+        Self::reopen_running(
+            state_directory,
+            checkpoint,
+            desired,
+            desired,
+            prepared,
+            authority,
+        )
+    }
+
+    pub(crate) fn reopen_running(
+        state_directory: &StateDirectory,
+        checkpoint: &RuntimeCheckpoint,
+        physical_desired: &DesiredRuntimeSpec,
+        gate_desired: &DesiredRuntimeSpec,
+        prepared: &PreparedDeviceInput,
+        authority: &VolumeRecord,
+    ) -> anyhow::Result<Self> {
+        validate_running_physical_desired_successor(physical_desired, gate_desired)?;
         let store = AuthorizedBlockdStore::new(state_directory.clone());
         match prepared.serving_authority.as_ref() {
             ServingAuthorityProvenance::AfterRootProvision { .. } => {
-                let prepared_checkpoint = prepare_device_checkpoint_view(checkpoint)?;
+                let mut prepared_checkpoint = prepare_device_checkpoint_view(checkpoint)?;
+                prepared_checkpoint.desired_revision = physical_desired.desired_revision;
+                prepared_checkpoint.spec_digest = physical_desired.spec_digest.clone();
                 anyhow::ensure!(
                     prepared_device_input(&prepared_checkpoint)? == *prepared,
                     "Root serving authority selected another prepared device"
                 );
                 let retained =
-                    store.retain_prepare_device_handoff(&prepared_checkpoint, desired)?;
+                    store.retain_prepare_device_handoff(&prepared_checkpoint, physical_desired)?;
                 let ready = ServingHandoffStore::new(state_directory.clone())
                     .reopen_prepare_device_handoff(
                         &prepared_checkpoint,
-                        desired,
+                        physical_desired,
                         authority,
                         retained,
                     )?;
@@ -1014,7 +1070,12 @@ impl RetainedServingBlockdAuthority {
                 })
             }
             ServingAuthorityProvenance::DirectAuthorizedAttachment { .. } => {
-                let retained = store.retain_prepared_device(checkpoint, desired, prepared)?;
+                let retained = store.retain_running_prepared_device(
+                    checkpoint,
+                    physical_desired,
+                    gate_desired,
+                    prepared,
+                )?;
                 Ok(Self::Direct {
                     prepared: prepared.clone(),
                     retained: Box::new(retained),
@@ -1029,6 +1090,15 @@ impl RetainedServingBlockdAuthority {
         desired: &DesiredRuntimeSpec,
         authority: &VolumeRecord,
     ) -> anyhow::Result<ServingBlockdExpectation> {
+        self.expectation_running(systemd, desired, authority)
+    }
+
+    pub(crate) fn expectation_running(
+        &self,
+        systemd: &RootProvisionSystemdConfig,
+        physical_desired: &DesiredRuntimeSpec,
+        authority: &VolumeRecord,
+    ) -> anyhow::Result<ServingBlockdExpectation> {
         let expected = match self {
             Self::Root {
                 prepared_checkpoint,
@@ -1038,7 +1108,7 @@ impl RetainedServingBlockdAuthority {
                 ready,
                 systemd,
                 prepared_checkpoint,
-                desired,
+                physical_desired,
                 authority,
             )?,
             Self::Direct { prepared, retained } => {
@@ -1087,12 +1157,24 @@ impl RetainedServingBlockdAuthority {
         authority: &VolumeRecord,
         expected: &ServingBlockdExpectation,
     ) -> anyhow::Result<()> {
+        self.assert_running_current(checkpoint, desired, desired, authority, expected)
+    }
+
+    pub(crate) fn assert_running_current(
+        &self,
+        checkpoint: &RuntimeCheckpoint,
+        physical_desired: &DesiredRuntimeSpec,
+        gate_desired: &DesiredRuntimeSpec,
+        authority: &VolumeRecord,
+        expected: &ServingBlockdExpectation,
+    ) -> anyhow::Result<()> {
+        validate_running_physical_desired_successor(physical_desired, gate_desired)?;
         anyhow::ensure!(
-            checkpoint.cat_id == desired.cat_id
-                && checkpoint.node_id == desired.placement.node_id
-                && checkpoint.placement_epoch == desired.placement.placement_epoch
-                && checkpoint.desired_revision == desired.desired_revision
-                && checkpoint.spec_digest == desired.spec_digest,
+            checkpoint.cat_id == gate_desired.cat_id
+                && checkpoint.node_id == gate_desired.placement.node_id
+                && checkpoint.placement_epoch == gate_desired.placement.placement_epoch
+                && checkpoint.desired_revision == gate_desired.desired_revision
+                && checkpoint.spec_digest == gate_desired.spec_digest,
             "retained serving authority changed its current checkpoint coordinate"
         );
         let prepared = match self {
@@ -1113,7 +1195,7 @@ impl RetainedServingBlockdAuthority {
                 prepared_checkpoint,
                 ready,
                 ..
-            } => ready.assert_current(prepared_checkpoint, desired, authority),
+            } => ready.assert_current(prepared_checkpoint, physical_desired, authority),
             Self::Direct { prepared, retained } => {
                 retained.assert_current()?;
                 retained.assert_prepared_authority(prepared)
