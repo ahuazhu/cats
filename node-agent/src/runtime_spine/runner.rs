@@ -3040,9 +3040,17 @@ mod tests {
         fail: AtomicBool,
     }
 
-    struct ReplanRecovery {
+    struct OrderedPreScanAdmission {
+        calls: AtomicUsize,
+        cell_open: Arc<AtomicBool>,
+        order: Arc<Mutex<Vec<&'static str>>>,
+    }
+
+    struct OrderedReplanRecovery {
         calls: AtomicUsize,
         cat_id: Id,
+        cell_open: Arc<AtomicBool>,
+        order: Arc<Mutex<Vec<&'static str>>>,
     }
 
     struct TestEffectResourceOwner {
@@ -3153,13 +3161,32 @@ mod tests {
         }
     }
 
-    impl RuntimePreScanRecovery for ReplanRecovery {
+    impl RuntimePreScanAdmission for OrderedPreScanAdmission {
+        fn reconcile(&self, context: RuntimePreScanAdmissionContext) -> anyhow::Result<()> {
+            context.check_active()?;
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            self.cell_open.store(false, Ordering::SeqCst);
+            self.order.lock().unwrap().push("admission");
+            Ok(())
+        }
+
+        fn fail_close_all(&self) {
+            self.cell_open.store(false, Ordering::SeqCst);
+        }
+    }
+
+    impl RuntimePreScanRecovery for OrderedReplanRecovery {
         fn recover_one(
             &self,
             context: RuntimePreScanRecoveryContext,
         ) -> anyhow::Result<RuntimePreScanRecoveryOutcome> {
             context.check_active()?;
+            anyhow::ensure!(
+                !self.cell_open.load(Ordering::SeqCst),
+                "publication recovery ran before mandatory admission closed the cell"
+            );
             self.calls.fetch_add(1, Ordering::SeqCst);
+            self.order.lock().unwrap().push("recovery");
             Ok(RuntimePreScanRecoveryOutcome::ReplanDesired {
                 cat_id: self.cat_id.clone(),
             })
@@ -4476,9 +4503,19 @@ mod tests {
         let effect = Arc::new(CountingEffect {
             calls: AtomicUsize::new(0),
         });
-        let recovery = Arc::new(ReplanRecovery {
+        let cell_open = Arc::new(AtomicBool::new(true));
+        let order = Arc::new(Mutex::new(Vec::new()));
+        let admission = Arc::new(OrderedPreScanAdmission {
+            calls: AtomicUsize::new(0),
+            cell_open: Arc::clone(&cell_open),
+            order: Arc::clone(&order),
+        });
+        let admission_port: Arc<dyn RuntimePreScanAdmission> = admission.clone();
+        let recovery = Arc::new(OrderedReplanRecovery {
             calls: AtomicUsize::new(0),
             cat_id: Id::new("cat_closed_takeover").unwrap(),
+            cell_open: Arc::clone(&cell_open),
+            order: Arc::clone(&order),
         });
         let recovery_port: Arc<dyn RuntimePreScanRecovery> = recovery.clone();
         let mut runner = RuntimeSpineRunner::new_inner(
@@ -4487,7 +4524,7 @@ mod tests {
             RuntimeSpineHttpClient::for_loopback_test("http://127.0.0.1:1/", signer()).unwrap(),
             scanner.clone(),
             Some(effect.clone()),
-            None,
+            Some(admission_port),
             Some(recovery_port),
             None,
         )
@@ -4504,7 +4541,10 @@ mod tests {
             RuntimeSpineRunStep::EffectReplanDesired { cat_id }
                 if cat_id == Id::new("cat_closed_takeover").unwrap()
         ));
+        assert_eq!(admission.calls.load(Ordering::SeqCst), 1);
         assert_eq!(recovery.calls.load(Ordering::SeqCst), 1);
+        assert!(!cell_open.load(Ordering::SeqCst));
+        assert_eq!(*order.lock().unwrap(), ["admission", "recovery"]);
         assert_eq!(scanner.calls.load(Ordering::SeqCst), 0);
         assert_eq!(effect.calls.load(Ordering::SeqCst), 0);
         assert!(runner.pending_effects.is_empty());
