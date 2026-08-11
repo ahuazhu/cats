@@ -221,6 +221,10 @@ impl AdmittedRouteV2 {
         &self.guest_ipv4
     }
 
+    pub(crate) async fn cancelled(&mut self) {
+        self.guard.cancelled().await;
+    }
+
     pub fn into_parts(
         self,
     ) -> (

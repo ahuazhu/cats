@@ -15,6 +15,7 @@ use cats_api::runtime_reconciliation::{
     CheckpointRouteGate, EndpointGuardCount, Id, Ipv4Address, LifecycleAdmission, RouteGateState,
 };
 use thiserror::Error;
+use tokio::sync::watch;
 
 use super::admission_port::{AdmissionGatePort, AdmissionSnapshot, GatePortError, IdleCloseResult};
 
@@ -52,6 +53,7 @@ pub struct AdmissionGuardCounts {
 pub(crate) struct AdmissionCellObservation {
     snapshot: AdmissionSnapshot,
     guards: AdmissionGuardCounts,
+    endpoint_revocations: Vec<Id>,
 }
 
 impl AdmissionCellObservation {
@@ -61,6 +63,10 @@ impl AdmissionCellObservation {
 
     pub(crate) fn guards(&self) -> &AdmissionGuardCounts {
         &self.guards
+    }
+
+    pub(crate) fn endpoint_is_revoked(&self, endpoint_id: &Id) -> bool {
+        self.endpoint_revocations.binary_search(endpoint_id).is_ok()
     }
 }
 
@@ -79,6 +85,8 @@ struct CellState {
     snapshot: AdmissionSnapshot,
     platform_guards: u32,
     endpoint_guards: BTreeMap<Id, u32>,
+    endpoint_cancellations: BTreeMap<Id, watch::Sender<bool>>,
+    endpoint_revocations: BTreeSet<Id>,
 }
 
 /// One Cat's live admission state.
@@ -99,11 +107,21 @@ impl AdmissionCell {
             .iter()
             .map(|route| (route.binding.endpoint_id.clone(), 0))
             .collect();
+        let endpoint_cancellations = snapshot
+            .endpoints()
+            .iter()
+            .map(|route| {
+                let (cancellation, _) = watch::channel(false);
+                (route.binding.endpoint_id.clone(), cancellation)
+            })
+            .collect();
         Ok(Arc::new(Self {
             state: Mutex::new(CellState {
                 snapshot,
                 platform_guards: 0,
                 endpoint_guards,
+                endpoint_cancellations,
+                endpoint_revocations: BTreeSet::new(),
             }),
         }))
     }
@@ -134,6 +152,7 @@ impl AdmissionCell {
                 platform_guards: state.platform_guards,
                 endpoint_guards: nonzero_endpoint_guards(&state.endpoint_guards),
             },
+            endpoint_revocations: state.endpoint_revocations.iter().cloned().collect(),
         }
     }
 
@@ -152,7 +171,41 @@ impl AdmissionCell {
             .state
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        state.snapshot = state.snapshot.fail_closed();
+        fail_closed(&mut state);
+    }
+
+    /// Process-local safety latch used before fallible physical inventory.
+    /// It leaves the canonical AdmissionSnapshot/checkpoint journal untouched
+    /// so the durable GateSequencer can still retire endpoints one at a time
+    /// in ID order, while immediately rejecting new guards and cancelling all
+    /// already admitted streams for the complete changed/removed set.
+    pub(crate) fn latch_endpoint_revocations(
+        &self,
+        expected: &AdmissionSnapshot,
+        endpoint_ids: &[Id],
+    ) -> Result<(), GatePortError> {
+        let mut state = self.state.lock().map_err(|_| GatePortError::Unavailable)?;
+        if &state.snapshot != expected {
+            fail_closed(&mut state);
+            return Err(GatePortError::StateMismatch);
+        }
+        if endpoint_ids.windows(2).any(|pair| pair[0] >= pair[1])
+            || endpoint_ids.iter().any(|endpoint_id| {
+                !state
+                    .snapshot
+                    .endpoints()
+                    .iter()
+                    .any(|route| &route.binding.endpoint_id == endpoint_id)
+            })
+        {
+            fail_closed(&mut state);
+            return Err(GatePortError::Unavailable);
+        }
+        for endpoint_id in endpoint_ids {
+            state.endpoint_revocations.insert(endpoint_id.clone());
+            cancel_endpoint(&state, endpoint_id);
+        }
+        Ok(())
     }
 
     /// Acquires a platform-wide guard for a future control/exec consumer.
@@ -205,6 +258,7 @@ impl AdmissionCell {
         }
         if state.snapshot.lifecycle_admission() != LifecycleAdmission::Open
             || route.gate == RouteGateState::Closed
+            || state.endpoint_revocations.contains(&claims.endpoint_id)
         {
             return Err(RouteAdmissionV2Reason::GateClosed);
         }
@@ -227,10 +281,16 @@ impl AdmissionCell {
         *count = count
             .checked_add(1)
             .ok_or(RouteAdmissionV2Reason::RuntimeNotReady)?;
+        let cancellation = state
+            .endpoint_cancellations
+            .get(&claims.endpoint_id)
+            .ok_or(RouteAdmissionV2Reason::RuntimeNotReady)?
+            .subscribe();
         Ok((
             RouteAdmissionGuard {
                 cell: Arc::clone(self),
                 endpoint_id: claims.endpoint_id.clone(),
+                cancellation,
             },
             guest_ipv4,
         ))
@@ -247,7 +307,7 @@ impl AdmissionCell {
             Ok(state) => state,
             Err(poisoned) => {
                 let mut state = poisoned.into_inner();
-                state.snapshot = state.snapshot.fail_closed();
+                fail_closed(&mut state);
                 state
             }
         }
@@ -260,12 +320,12 @@ impl AdmissionCell {
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         if let Some(count) = state.endpoint_guards.get_mut(endpoint_id) {
             if *count == 0 {
-                state.snapshot = state.snapshot.fail_closed();
+                fail_closed(&mut state);
             } else {
                 *count -= 1;
             }
         } else {
-            state.snapshot = state.snapshot.fail_closed();
+            fail_closed(&mut state);
         }
     }
 
@@ -275,7 +335,7 @@ impl AdmissionCell {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         if state.platform_guards == 0 {
-            state.snapshot = state.snapshot.fail_closed();
+            fail_closed(&mut state);
         } else {
             state.platform_guards -= 1;
         }
@@ -287,11 +347,22 @@ impl AdmissionCell {
 pub struct RouteAdmissionGuard {
     cell: Arc<AdmissionCell>,
     endpoint_id: Id,
+    cancellation: watch::Receiver<bool>,
 }
 
 impl RouteAdmissionGuard {
     pub fn endpoint_id(&self) -> &Id {
         &self.endpoint_id
+    }
+
+    /// Completes once reconciliation closes this exact Endpoint gate (or the
+    /// complete lifecycle cell). The machine tunnel holds the guard while it
+    /// waits, so a Closed gate cannot be removed before the tunnel exits.
+    pub(crate) async fn cancelled(&mut self) {
+        if *self.cancellation.borrow() {
+            return;
+        }
+        let _ = self.cancellation.changed().await;
     }
 }
 
@@ -326,7 +397,7 @@ impl AdmissionCellPort {
             Ok(state) => Ok(state),
             Err(poisoned) => {
                 let mut state = poisoned.into_inner();
-                state.snapshot = state.snapshot.fail_closed();
+                fail_closed(&mut state);
                 Err(GatePortError::Unavailable)
             }
         }
@@ -400,6 +471,10 @@ impl AdmissionGatePort for AdmissionCellPort {
         {
             return Err(GatePortError::Unavailable);
         }
+        if changed_binding {
+            state.endpoint_cancellations.remove(endpoint_id);
+            state.endpoint_revocations.remove(endpoint_id);
+        }
         state.snapshot = replacement.clone();
         reconcile_guard_keys(&mut state);
         Ok(())
@@ -428,6 +503,7 @@ impl AdmissionGatePort for AdmissionCellPort {
             return Err(GatePortError::StateMismatch);
         }
         state.snapshot = replacement.clone();
+        cancel_endpoint(&state, endpoint_id);
         Ok(())
     }
 
@@ -463,6 +539,8 @@ impl AdmissionGatePort for AdmissionCellPort {
         }
         state.snapshot = replacement.clone();
         state.endpoint_guards.remove(endpoint_id);
+        state.endpoint_cancellations.remove(endpoint_id);
+        state.endpoint_revocations.remove(endpoint_id);
         Ok(())
     }
 
@@ -477,10 +555,11 @@ impl AdmissionGatePort for AdmissionCellPort {
             return Ok(());
         }
         if &state.snapshot != expected {
-            state.snapshot = state.snapshot.fail_closed();
+            fail_closed(&mut state);
             return Err(GatePortError::StateMismatch);
         }
         state.snapshot = replacement.clone();
+        cancel_all_endpoints(&state);
         Ok(())
     }
 
@@ -495,7 +574,7 @@ impl AdmissionGatePort for AdmissionCellPort {
             return Ok(IdleCloseResult::Closed);
         }
         if &state.snapshot != expected {
-            state.snapshot = state.snapshot.fail_closed();
+            fail_closed(&mut state);
             return Err(GatePortError::StateMismatch);
         }
         let endpoint_guards = nonzero_endpoint_guards(&state.endpoint_guards);
@@ -506,7 +585,53 @@ impl AdmissionGatePort for AdmissionCellPort {
             });
         }
         state.snapshot = replacement.clone();
+        cancel_all_endpoints(&state);
         Ok(IdleCloseResult::Closed)
+    }
+
+    fn advance_closed(
+        &mut self,
+        expected: &AdmissionSnapshot,
+        replacement: &AdmissionSnapshot,
+    ) -> Result<(), GatePortError> {
+        validate_snapshot(expected).map_err(|_| GatePortError::Unavailable)?;
+        validate_snapshot(replacement).map_err(|_| GatePortError::Unavailable)?;
+        if expected.lifecycle_admission() != LifecycleAdmission::Closed
+            || replacement.lifecycle_admission() != LifecycleAdmission::Closed
+            || expected
+                .endpoints()
+                .iter()
+                .any(|route| route.gate != RouteGateState::Closed)
+            || replacement
+                .endpoints()
+                .iter()
+                .any(|route| route.gate != RouteGateState::Closed)
+            || expected.placement() != replacement.placement()
+            || expected.runtime_incarnation() != replacement.runtime_incarnation()
+            || expected.guest_ipv4() != replacement.guest_ipv4()
+            || replacement.applied_desired_revision() < expected.applied_desired_revision()
+            || (replacement.applied_desired_revision() == expected.applied_desired_revision()
+                && replacement.spec_digest() != expected.spec_digest())
+            || expected.endpoints().len() != replacement.endpoints().len()
+            || expected
+                .endpoints()
+                .iter()
+                .zip(replacement.endpoints())
+                .any(|(current, next)| current.binding != next.binding)
+        {
+            return Err(GatePortError::Unavailable);
+        }
+        let mut state = self.lock_mutating()?;
+        if &state.snapshot == replacement {
+            return Ok(());
+        }
+        if &state.snapshot != expected {
+            fail_closed(&mut state);
+            return Err(GatePortError::StateMismatch);
+        }
+        state.snapshot = replacement.clone();
+        cancel_all_endpoints(&state);
+        Ok(())
     }
 }
 
@@ -677,12 +802,41 @@ fn reconcile_guard_keys(state: &mut CellState) {
             .iter()
             .any(|route| &route.binding.endpoint_id == endpoint_id)
     });
+    state.endpoint_revocations.retain(|endpoint_id| {
+        state
+            .snapshot
+            .endpoints()
+            .iter()
+            .any(|route| &route.binding.endpoint_id == endpoint_id)
+    });
     for route in state.snapshot.endpoints() {
+        let endpoint_id = route.binding.endpoint_id.clone();
         state
             .endpoint_guards
-            .entry(route.binding.endpoint_id.clone())
+            .entry(endpoint_id.clone())
             .or_insert(0);
+        state
+            .endpoint_cancellations
+            .entry(endpoint_id)
+            .or_insert_with(|| watch::channel(false).0);
     }
+}
+
+fn cancel_endpoint(state: &CellState, endpoint_id: &Id) {
+    if let Some(cancellation) = state.endpoint_cancellations.get(endpoint_id) {
+        cancellation.send_replace(true);
+    }
+}
+
+fn cancel_all_endpoints(state: &CellState) {
+    for cancellation in state.endpoint_cancellations.values() {
+        cancellation.send_replace(true);
+    }
+}
+
+fn fail_closed(state: &mut CellState) {
+    state.snapshot = state.snapshot.fail_closed();
+    cancel_all_endpoints(state);
 }
 
 fn nonzero_endpoint_guards(counts: &BTreeMap<Id, u32>) -> Vec<EndpointGuardCount> {

@@ -204,6 +204,15 @@ pub trait AdmissionGatePort {
         expected: &AdmissionSnapshot,
         replacement: &AdmissionSnapshot,
     ) -> Result<IdleCloseResult, GatePortError>;
+
+    /// Advances only the metadata tuple of an already globally Closed cell.
+    /// Both snapshots must contain the same bindings with every gate Closed;
+    /// this recovery edge can never admit work or recreate a route epoch.
+    fn advance_closed(
+        &mut self,
+        expected: &AdmissionSnapshot,
+        replacement: &AdmissionSnapshot,
+    ) -> Result<(), GatePortError>;
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Error)]

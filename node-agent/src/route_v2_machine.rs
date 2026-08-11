@@ -628,7 +628,7 @@ async fn run_tunnel(job: TunnelJob, mut shutdown: watch::Receiver<bool>) {
     let TunnelJob {
         on_upgrade,
         upstream,
-        admitted,
+        mut admitted,
         _permit,
     } = job;
     let upgraded = tokio::select! {
@@ -637,12 +637,14 @@ async fn run_tunnel(job: TunnelJob, mut shutdown: watch::Receiver<bool>) {
             Err(_) => return,
         },
         _ = shutdown.changed() => return,
+        _ = admitted.cancelled() => return,
     };
     let mut downstream = TokioIo::new(upgraded);
     let mut upstream = upstream;
     tokio::select! {
         _ = tokio::io::copy_bidirectional(&mut downstream, &mut upstream) => {}
         _ = shutdown.changed() => {}
+        _ = admitted.cancelled() => {}
     }
     drop(admitted);
     drop(_permit);
@@ -774,7 +776,9 @@ mod tests {
     use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
     use tokio_rustls::TlsConnector;
 
-    use crate::runtime::reconciliation::{AdmissionCell, AdmissionSnapshot};
+    use crate::runtime::reconciliation::{
+        AdmissionCell, AdmissionGatePort as _, AdmissionSnapshot,
+    };
 
     const CA_CERTIFICATE: &[u8] =
         include_bytes!("../../control-plane/tests/fixtures/gateway_machine_ca_certificate.pem");
@@ -1084,6 +1088,137 @@ mod tests {
         });
         assert_eq!(active.active_guards(&claims.endpoint_id), Some(0));
         guest_task.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn closing_one_gate_cancels_only_that_live_machine_tunnel() {
+        let guest_a = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let guest_b = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let claims_a = claims("cat_pair", "ep_a", guest_a.local_addr().unwrap().port());
+        let claims_b = claims("cat_pair", "ep_b", guest_b.local_addr().unwrap().port());
+        let guest_a_task = tokio::spawn(async move {
+            let (mut stream, _) = guest_a.accept().await.unwrap();
+            let mut byte = [0_u8; 1];
+            assert_eq!(stream.read(&mut byte).await.unwrap(), 0);
+        });
+        let guest_b_task = tokio::spawn(async move {
+            let (mut stream, _) = guest_b.accept().await.unwrap();
+            let mut bytes = [0_u8; 4];
+            stream.read_exact(&mut bytes).await.unwrap();
+            assert_eq!(&bytes, b"ping");
+            stream.write_all(b"pong").await.unwrap();
+            let mut tail = [0_u8; 1];
+            assert_eq!(stream.read(&mut tail).await.unwrap(), 0);
+        });
+        let routes = [&claims_a, &claims_b]
+            .into_iter()
+            .map(|claims| CheckpointRouteGate {
+                binding: RouteGateBinding {
+                    workspace_id: claims.workspace_id.clone(),
+                    endpoint_id: claims.endpoint_id.clone(),
+                    hostname: claims.hostname.clone(),
+                    cat_id: claims.cat_id.clone(),
+                    node_id: claims.node_id.clone(),
+                    runtime_incarnation: claims.runtime_incarnation.clone(),
+                    route_epoch: claims.route_epoch,
+                    protocol: claims.protocol,
+                    target_port: claims.target_port,
+                },
+                gate: RouteGateState::Active,
+            })
+            .collect();
+        let snapshot = AdmissionSnapshot::new(
+            Revision::new(11).unwrap(),
+            Sha256Digest::from_bytes([0x11; 32]),
+            AssignedPlacement {
+                kind: AssignedKind::Assigned,
+                node_id: claims_a.node_id.clone(),
+                placement_epoch: Epoch::new(3).unwrap(),
+            },
+            Some(claims_a.runtime_incarnation.clone()),
+            LifecycleAdmission::Open,
+            routes,
+        )
+        .with_guest_ipv4(Ipv4Address::new("127.0.0.1").unwrap());
+        let active = AdmissionCell::new(snapshot).unwrap();
+        let keys = keys();
+        let temp = TempDir::new().unwrap();
+        let registry = AdmissionCellRegistry::new(temp.path().join("checkpoints"));
+        registry
+            .insert_cell_for_machine_test(claims_a.cat_id.clone(), Arc::clone(&active))
+            .unwrap();
+        let mut listener = listener(&keys, registry).await;
+        let mut tunnel_a = match exchange(
+            listener.addr(),
+            &frame(&claims_a, sign(&keys, &claims_a)),
+            CLIENT_CERTIFICATE,
+            CLIENT_PRIVATE_KEY,
+        )
+        .await
+        .unwrap()
+        {
+            Exchange::Upgraded(tunnel) => tunnel,
+            Exchange::Rejected(status, _) => panic!("A was rejected with {status}"),
+        };
+        let mut tunnel_b = match exchange(
+            listener.addr(),
+            &frame(&claims_b, sign(&keys, &claims_b)),
+            CLIENT_CERTIFICATE,
+            CLIENT_PRIVATE_KEY,
+        )
+        .await
+        .unwrap()
+        {
+            Exchange::Upgraded(tunnel) => tunnel,
+            Exchange::Rejected(status, _) => panic!("B was rejected with {status}"),
+        };
+        assert_eq!(active.active_guards(&claims_a.endpoint_id), Some(1));
+        assert_eq!(active.active_guards(&claims_b.endpoint_id), Some(1));
+
+        let expected = active.snapshot();
+        let mut closed_routes = expected.endpoints().to_vec();
+        closed_routes[0].gate = RouteGateState::Closed;
+        let closed_a = AdmissionSnapshot::new(
+            expected.applied_desired_revision(),
+            expected.spec_digest().clone(),
+            expected.placement().clone(),
+            expected.runtime_incarnation().cloned(),
+            expected.lifecycle_admission(),
+            closed_routes,
+        )
+        .with_guest_ipv4(expected.guest_ipv4().cloned().unwrap());
+        active
+            .port()
+            .close_gate(&expected, &closed_a, &claims_a.endpoint_id)
+            .unwrap();
+
+        let mut tail = [0_u8; 1];
+        let a_closed = tokio::time::timeout(Duration::from_secs(2), tunnel_a.read(&mut tail))
+            .await
+            .expect("A tunnel must be cancelled");
+        assert!(matches!(a_closed, Ok(0) | Err(_)));
+        assert_eq!(active.active_guards(&claims_a.endpoint_id), Some(0));
+        assert_eq!(active.active_guards(&claims_b.endpoint_id), Some(1));
+        tunnel_b.write_all(b"ping").await.unwrap();
+        let mut pong = [0_u8; 4];
+        tunnel_b.read_exact(&mut pong).await.unwrap();
+        assert_eq!(&pong, b"pong");
+
+        let (status, failure) = rejection(
+            exchange(
+                listener.addr(),
+                &frame(&claims_a, sign(&keys, &claims_a)),
+                CLIENT_CERTIFICATE,
+                CLIENT_PRIVATE_KEY,
+            )
+            .await
+            .unwrap(),
+        );
+        assert_eq!(status, StatusCode::CONFLICT);
+        assert_eq!(failure.reason, RouteAdmissionV2Reason::GateClosed);
+        listener.shutdown().await.unwrap();
+        guest_a_task.await.unwrap();
+        guest_b_task.await.unwrap();
     }
 
     #[tokio::test]

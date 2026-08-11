@@ -4512,4 +4512,12 @@ impl AdmissionGatePort for FakePort {
         }
         result
     }
+
+    fn advance_closed(
+        &mut self,
+        expected: &AdmissionSnapshot,
+        replacement: &AdmissionSnapshot,
+    ) -> Result<(), GatePortError> {
+        self.apply_endpoint_result(expected, replacement)
+    }
 }
