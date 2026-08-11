@@ -40,6 +40,11 @@ use cats_api::cat_create::{
 use cats_api::persistent_disk::{
     PersistentDiskCreateV1Request, PERSISTENT_DISK_NAME_CONFLICT_BODY,
 };
+use cats_api::runtime_reconciliation::{
+    decode_operation as decode_runtime_operation, encode_operation as encode_runtime_operation,
+    Id as RuntimeId, Operation as RuntimeOperation, OperationPhase as RuntimeOperationPhase,
+    OperationTerminal as RuntimeOperationTerminal, OPERATION_MAX_WIRE_BYTES,
+};
 use clap::{Args, Parser, Subcommand};
 use serde_json::json;
 
@@ -247,7 +252,6 @@ pub enum Command {
         cmd: EndpointCommand,
     },
     /// Inspect an operation.
-    #[command(hide = true)]
     Operation {
         #[command(subcommand)]
         cmd: OperationCommand,
@@ -327,9 +331,14 @@ pub enum EndpointCommand {
 
 #[derive(Subcommand, Debug)]
 pub enum OperationCommand {
+    #[command(hide = true)]
     Ls,
-    Get { id: String },
-    Wait { id: String },
+    Get {
+        id: String,
+    },
+    Wait {
+        id: String,
+    },
 }
 
 #[derive(Subcommand, Debug)]
@@ -485,6 +494,10 @@ impl Client {
             let http = reqwest::blocking::Client::builder()
                 .timeout(Duration::from_secs(120))
                 .redirect(reqwest::redirect::Policy::none())
+                .no_gzip()
+                .no_brotli()
+                .no_deflate()
+                .no_zstd()
                 .build()?;
             let base = cat_create_pending::canonical_api_origin(&auth::configured_api_url(
                 cli.api_url.as_deref(),
@@ -508,6 +521,10 @@ impl Client {
             http: reqwest::blocking::Client::builder()
                 .timeout(Duration::from_secs(120))
                 .redirect(reqwest::redirect::Policy::none())
+                .no_gzip()
+                .no_brotli()
+                .no_deflate()
+                .no_zstd()
                 .build()?,
             base: cat_create_pending::canonical_api_origin(&session.api_url)?,
             token: session.access_token,
@@ -696,6 +713,111 @@ impl Client {
             std::thread::sleep(Duration::from_millis(150));
         }
     }
+
+    fn get_runtime_operation(&self, operation_id: &str) -> Result<RuntimeOperation> {
+        let workspace_id = RuntimeId::new(self.workspace_id.clone())
+            .ok_or_else(|| anyhow!("selected workspace ID is not valid for runtime operations"))?;
+        let operation_id = RuntimeId::new(operation_id.to_owned())
+            .ok_or_else(|| anyhow!("invalid runtime operation ID"))?;
+        let exact_url = self.url(&format!("/operations/{operation_id}"));
+        let response = self
+            .http
+            .get(&exact_url)
+            .bearer_auth(&self.token)
+            .header(reqwest::header::ACCEPT, "application/json")
+            .header(reqwest::header::ACCEPT_ENCODING, "identity")
+            .send()
+            .context("control plane unreachable")?;
+        anyhow::ensure!(
+            response.url().as_str() == exact_url,
+            "Operation request did not remain on its exact canonical URL"
+        );
+        let status = response.status();
+        let content_types: Vec<Vec<u8>> = response
+            .headers()
+            .get_all(reqwest::header::CONTENT_TYPE)
+            .iter()
+            .map(|value| value.as_bytes().to_vec())
+            .collect();
+        let content_encodings: Vec<Vec<u8>> = response
+            .headers()
+            .get_all(reqwest::header::CONTENT_ENCODING)
+            .iter()
+            .map(|value| value.as_bytes().to_vec())
+            .collect();
+        let mut body = Vec::new();
+        response
+            .take(OPERATION_MAX_WIRE_BYTES.saturating_add(1) as u64)
+            .read_to_end(&mut body)
+            .context("read Operation response")?;
+        anyhow::ensure!(
+            body.len() <= OPERATION_MAX_WIRE_BYTES,
+            "Operation response exceeds its closed byte limit"
+        );
+        if status != reqwest::StatusCode::OK {
+            if let Ok(error) = serde_json::from_slice::<cats_api::error::ErrorBody>(&body) {
+                bail!("{} ({:?})", error.message, error.code);
+            }
+            bail!("HTTP {status}: {}", String::from_utf8_lossy(&body));
+        }
+        anyhow::ensure!(
+            content_types.as_slice() == [b"application/json"],
+            "Operation response must have exactly Content-Type: application/json"
+        );
+        anyhow::ensure!(
+            content_encodings.is_empty(),
+            "Operation response must not have Content-Encoding"
+        );
+        let operation = decode_runtime_operation(&body).context("invalid Operation response")?;
+        anyhow::ensure!(
+            encode_runtime_operation(&operation).context("invalid decoded Operation response")?
+                == body,
+            "Operation response is not canonical"
+        );
+        anyhow::ensure!(
+            operation.workspace_id == workspace_id && operation.operation_id == operation_id,
+            "Operation response identity does not match the request"
+        );
+        Ok(operation)
+    }
+
+    fn wait_runtime_operation(&self, operation_id: &str) -> Result<RuntimeOperation> {
+        let deadline = Instant::now() + Duration::from_secs(120);
+        loop {
+            let operation = self.get_runtime_operation(operation_id)?;
+            match operation.phase {
+                RuntimeOperationPhase::Pending => {
+                    if Instant::now() > deadline {
+                        bail!("operation {operation_id} did not finish in time");
+                    }
+                    std::thread::sleep(Duration::from_millis(150));
+                }
+                RuntimeOperationPhase::Succeeded => return Ok(operation),
+                RuntimeOperationPhase::Failed => {
+                    let Some(RuntimeOperationTerminal::Failed { error, .. }) = &operation.terminal
+                    else {
+                        bail!("operation {operation_id} returned an invalid failed state");
+                    };
+                    bail!("operation {operation_id} failed: {error:?}");
+                }
+                RuntimeOperationPhase::Superseded => {
+                    let Some(RuntimeOperationTerminal::Superseded {
+                        superseded_by_revision,
+                        superseded_by_operation_id,
+                        ..
+                    }) = &operation.terminal
+                    else {
+                        bail!("operation {operation_id} returned an invalid superseded state");
+                    };
+                    bail!(
+                        "operation {operation_id} was superseded by operation \
+                         {superseded_by_operation_id} at revision {}",
+                        superseded_by_revision.get()
+                    );
+                }
+            }
+        }
+    }
 }
 
 fn workspace_override(cli: &Cli) -> Option<String> {
@@ -817,7 +939,12 @@ fn runtime_cutover_unsupported(command: &Command) -> Option<&'static str> {
             Some("PersistentDisk")
         }
         Command::Expose { .. } | Command::Endpoint { .. } => Some("Endpoint"),
-        Command::Operation { .. } => Some("Operation"),
+        Command::Operation {
+            cmd: OperationCommand::Ls,
+        } => Some("Operation list"),
+        Command::Operation {
+            cmd: OperationCommand::Get { .. } | OperationCommand::Wait { .. },
+        } => None,
         Command::Admin {
             cmd: AdminCommand::Monitoring | AdminCommand::Nodes | AdminCommand::Node { .. },
         } => Some("legacy fleet administration"),
@@ -1410,36 +1537,19 @@ pub fn run(cli: Cli) -> Result<()> {
             }
         },
         Command::Operation { cmd } => match cmd {
-            OperationCommand::Ls => {
-                let v = client.get("/operations")?;
-                let list: ListResponse<Operation> = serde_json::from_value(v)?;
-                if cli.json {
-                    println!("{}", serde_json::to_string_pretty(&list.items).unwrap());
-                } else {
-                    for operation in list.items {
-                        println!(
-                            "{:<18} {:<18} phase={:<10} resource={}",
-                            operation.id,
-                            operation.kind,
-                            format!("{:?}", operation.phase).to_lowercase(),
-                            operation.resource_id
-                        );
-                    }
-                }
-                Ok(())
-            }
+            OperationCommand::Ls => bail!("Operation list {RUNTIME_CUTOVER_UNSUPPORTED}"),
             OperationCommand::Get { id } => {
-                let v = client.send(
-                    client
-                        .http
-                        .get(format!("{}/v1/operations/{id}", client.base)),
-                )?;
-                println!("{}", serde_json::to_string_pretty(&v).unwrap());
+                let operation = client.get_runtime_operation(id)?;
+                println!("{}", serde_json::to_string_pretty(&operation)?);
                 Ok(())
             }
             OperationCommand::Wait { id } => {
-                let op = client.wait_operation(id)?;
-                println!("{:?}", op.phase);
+                let operation = client.wait_runtime_operation(id)?;
+                if cli.json {
+                    println!("{}", serde_json::to_string_pretty(&operation)?);
+                } else {
+                    println!("succeeded");
+                }
                 Ok(())
             }
         },
@@ -2235,7 +2345,7 @@ mod tests {
                 name.eq_ignore_ascii_case("content-length")
                     .then(|| value.trim().parse::<usize>().unwrap())
             })
-            .expect("JSON request has Content-Length");
+            .unwrap_or(0);
         while bytes.len() - header_end < content_length {
             let mut chunk = [0_u8; 1024];
             let count = stream.read(&mut chunk).unwrap();
@@ -2257,6 +2367,240 @@ mod tests {
                     .then(|| value.trim().to_owned())
             })
             .unwrap_or_else(|| panic!("missing request header {expected_name}"))
+    }
+
+    fn pending_runtime_operation() -> RuntimeOperation {
+        use cats_api::runtime_reconciliation::{
+            AssignedKind, AssignedPlacement, ContractVersion, Epoch, OperationPhase, Revision,
+            RuntimeTarget, Sha256Digest, UnixMillis,
+        };
+
+        RuntimeOperation {
+            version: ContractVersion::V1,
+            operation_id: RuntimeId::new("op_01").unwrap(),
+            workspace_id: RuntimeId::new("ws_01").unwrap(),
+            cat_id: RuntimeId::new("cat_01").unwrap(),
+            desired_revision: Revision::new(1).unwrap(),
+            desired_spec_digest: Sha256Digest::from_bytes([7; 32]),
+            placement: AssignedPlacement {
+                kind: AssignedKind::Assigned,
+                node_id: RuntimeId::new("node_01").unwrap(),
+                placement_epoch: Epoch::new(1).unwrap(),
+            },
+            target: RuntimeTarget::Running,
+            phase: OperationPhase::Pending,
+            terminal: None,
+            created_at_unix_ms: UnixMillis::new(1).unwrap(),
+            updated_at_unix_ms: UnixMillis::new(1).unwrap(),
+        }
+    }
+
+    fn succeeded_runtime_operation() -> RuntimeOperation {
+        use cats_api::runtime_reconciliation::{
+            Epoch, OperationPhase, OperationSuccess, OperationTerminal, RandomId128, Sequence,
+            UnixMillis,
+        };
+
+        let mut operation = pending_runtime_operation();
+        let completed_at = UnixMillis::new(2).unwrap();
+        operation.phase = OperationPhase::Succeeded;
+        operation.updated_at_unix_ms = completed_at;
+        operation.terminal = Some(OperationTerminal::Succeeded {
+            result: OperationSuccess {
+                observation_id: RandomId128::new("11111111111111111111111111111111").unwrap(),
+                node_id: operation.placement.node_id.clone(),
+                agent_session_epoch: Epoch::new(1).unwrap(),
+                heartbeat_sequence: Sequence::new(1).unwrap(),
+                observed_target: operation.target,
+                runtime_incarnation: Some(
+                    RandomId128::new("22222222222222222222222222222222").unwrap(),
+                ),
+            },
+            completed_at_unix_ms: completed_at,
+        });
+        operation
+    }
+
+    fn failed_runtime_operation() -> RuntimeOperation {
+        use cats_api::runtime_reconciliation::{
+            Epoch, OperationFailure, OperationPhase, OperationTerminal, UnixMillis,
+        };
+
+        let mut operation = pending_runtime_operation();
+        let completed_at = UnixMillis::new(2).unwrap();
+        operation.phase = OperationPhase::Failed;
+        operation.updated_at_unix_ms = completed_at;
+        operation.terminal = Some(OperationTerminal::Failed {
+            error: Box::new(OperationFailure::HostLost {
+                node_id: operation.placement.node_id.clone(),
+                agent_session_epoch: Epoch::new(1).unwrap(),
+                host_fence_event_id: RuntimeId::new("fence_01").unwrap(),
+            }),
+            completed_at_unix_ms: completed_at,
+        });
+        operation
+    }
+
+    fn superseded_runtime_operation() -> RuntimeOperation {
+        use cats_api::runtime_reconciliation::{
+            OperationPhase, OperationTerminal, Revision, UnixMillis,
+        };
+
+        let mut operation = pending_runtime_operation();
+        let completed_at = UnixMillis::new(2).unwrap();
+        operation.phase = OperationPhase::Superseded;
+        operation.updated_at_unix_ms = completed_at;
+        operation.terminal = Some(OperationTerminal::Superseded {
+            superseded_by_revision: Revision::new(2).unwrap(),
+            superseded_by_operation_id: RuntimeId::new("op_02").unwrap(),
+            completed_at_unix_ms: completed_at,
+        });
+        operation
+    }
+
+    fn runtime_test_client(base: String) -> Client {
+        Client {
+            http: reqwest::blocking::Client::builder()
+                .redirect(reqwest::redirect::Policy::none())
+                .no_gzip()
+                .no_brotli()
+                .no_deflate()
+                .no_zstd()
+                .build()
+                .unwrap(),
+            base,
+            token: "test-token".to_owned(),
+            workspace_id: "ws_01".to_owned(),
+        }
+    }
+
+    fn write_runtime_operation_response(
+        stream: &mut std::net::TcpStream,
+        body: &[u8],
+        content_encoding: Option<&str>,
+    ) {
+        use std::io::Write as _;
+
+        write!(
+            stream,
+            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nCache-Control: no-store\r\n"
+        )
+        .unwrap();
+        if let Some(content_encoding) = content_encoding {
+            write!(stream, "Content-Encoding: {content_encoding}\r\n").unwrap();
+        }
+        write!(
+            stream,
+            "Content-Length: {}\r\nConnection: close\r\n\r\n",
+            body.len()
+        )
+        .unwrap();
+        stream.write_all(body).unwrap();
+        stream.flush().unwrap();
+    }
+
+    #[test]
+    fn runtime_operation_get_uses_workspace_path_and_strict_canonical_decoder() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        let expected = pending_runtime_operation();
+        let body = encode_runtime_operation(&expected).unwrap();
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let (headers, request_body) = read_request(&mut stream);
+            assert!(request_body.is_empty());
+            assert_eq!(
+                headers.lines().next().unwrap(),
+                "GET /v1/workspaces/ws_01/operations/op_01 HTTP/1.1"
+            );
+            assert_eq!(
+                request_header(&headers, "authorization"),
+                "Bearer test-token"
+            );
+            assert_eq!(request_header(&headers, "accept"), "application/json");
+            assert_eq!(request_header(&headers, "accept-encoding"), "identity");
+            write_runtime_operation_response(&mut stream, &body, None);
+        });
+
+        let operation = runtime_test_client(base)
+            .get_runtime_operation("op_01")
+            .unwrap();
+        assert_eq!(operation, expected);
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn runtime_operation_get_rejects_encoded_response_without_auto_decompression() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        let body = encode_runtime_operation(&pending_runtime_operation()).unwrap();
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let (headers, _) = read_request(&mut stream);
+            assert_eq!(request_header(&headers, "accept-encoding"), "identity");
+            write_runtime_operation_response(&mut stream, &body, Some("gzip"));
+        });
+
+        let error = runtime_test_client(base)
+            .get_runtime_operation("op_01")
+            .unwrap_err();
+        assert!(error.to_string().contains("must not have Content-Encoding"));
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn runtime_operation_wait_polls_pending_until_succeeded() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        let pending = encode_runtime_operation(&pending_runtime_operation()).unwrap();
+        let succeeded = succeeded_runtime_operation();
+        let succeeded_body = encode_runtime_operation(&succeeded).unwrap();
+        let server = std::thread::spawn(move || {
+            for body in [&pending, &succeeded_body] {
+                let (mut stream, _) = listener.accept().unwrap();
+                let (headers, _) = read_request(&mut stream);
+                assert_eq!(
+                    headers.lines().next().unwrap(),
+                    "GET /v1/workspaces/ws_01/operations/op_01 HTTP/1.1"
+                );
+                write_runtime_operation_response(&mut stream, body, None);
+            }
+        });
+
+        let operation = runtime_test_client(base)
+            .wait_runtime_operation("op_01")
+            .unwrap();
+        assert_eq!(operation, succeeded);
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn runtime_operation_wait_reports_failed_and_superseded_terminals() {
+        for (operation, expected_error) in [
+            (failed_runtime_operation(), "failed: HostLost"),
+            (
+                superseded_runtime_operation(),
+                "superseded by operation op_02 at revision 2",
+            ),
+        ] {
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            let base = format!("http://{}", listener.local_addr().unwrap());
+            let body = encode_runtime_operation(&operation).unwrap();
+            let server = std::thread::spawn(move || {
+                let (mut stream, _) = listener.accept().unwrap();
+                let _ = read_request(&mut stream);
+                write_runtime_operation_response(&mut stream, &body, None);
+            });
+
+            let error = runtime_test_client(base)
+                .wait_runtime_operation("op_01")
+                .unwrap_err();
+            assert!(
+                error.to_string().contains(expected_error),
+                "unexpected terminal error: {error}"
+            );
+            server.join().unwrap();
+        }
     }
 
     #[cfg(unix)]
@@ -2867,8 +3211,6 @@ mod tests {
             &["expose", "app", "8080"],
             &["endpoint", "ls", "app"],
             &["operation", "ls"],
-            &["operation", "get", "op_01"],
-            &["operation", "wait", "op_01"],
             &["admin", "monitoring"],
             &["admin", "nodes"],
             &["admin", "node", "get", "node_01"],
@@ -2917,33 +3259,25 @@ mod tests {
         let mut root = Cli::command();
         let root_help = root.render_long_help().to_string();
         for command in [
-            "ls",
-            "get",
-            "start",
-            "stop",
-            "suspend",
-            "resume",
-            "warm",
-            "sync",
-            "destroy",
-            "exec",
-            "deploy",
-            "shell",
-            "sleep",
-            "expiry",
-            "disk",
-            "mount",
-            "unmount",
-            "expose",
-            "endpoint",
-            "operation",
+            "ls", "get", "start", "stop", "suspend", "resume", "warm", "sync", "destroy", "exec",
+            "deploy", "shell", "sleep", "expiry", "disk", "mount", "unmount", "expose", "endpoint",
         ] {
             assert!(
                 !root_help.contains(&format!("\n  {command} ")),
                 "retired command {command:?} remains visible in root help"
             );
         }
+        assert!(root_help.contains("\n  operation "));
         assert!(!root_help.contains("--no-wait"));
+
+        let mut operation = Cli::command()
+            .find_subcommand("operation")
+            .expect("Operation command")
+            .clone();
+        let operation_help = operation.render_long_help().to_string();
+        assert!(operation_help.contains("\n  get "));
+        assert!(operation_help.contains("\n  wait "));
+        assert!(!operation_help.contains("\n  ls "));
 
         let mut create = Cli::command()
             .find_subcommand("create")
