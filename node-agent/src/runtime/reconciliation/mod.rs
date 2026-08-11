@@ -174,9 +174,12 @@ pub(crate) use vmm_cid::{VmmCidAllocationPort, VmmCidInventoryPort};
 pub(crate) use vmm_launch_artifacts::VmmLaunchArtifactPaths;
 #[allow(unused_imports)]
 pub(crate) use vmm_runtime_paths::ManagedVmmLaunchFilePaths;
+#[cfg(target_os = "linux")]
+pub(crate) use vmm_socket_namespace::ManagedVmmSocketPreparation;
 #[allow(unused_imports)]
 pub(crate) use vmm_socket_namespace::{
-    ManagedVmmSocketPaths, ManagedVmmSocketRoot, INSTALLED_VMM_SOCKET_ROOT,
+    vmm_state_directory_from_checkpoint, ManagedVmmSocketPaths, ManagedVmmSocketRoot,
+    RetainedManagedVmmSocketRoot, VmmSocketReceiptStore, INSTALLED_VMM_SOCKET_ROOT,
 };
 // This crate-private seam is landed before the systemd composition that
 // consumes it; keeping the re-export here prevents feature code from reaching

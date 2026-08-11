@@ -21,6 +21,12 @@ pub const VMM_LAUNCHER_CONTRACT_ARGUMENT: &str = "--contract-version=1";
 pub const VMM_PROCESS_TOKEN_ENVIRONMENT: &str = "CATS_VMM_PROCESS_IDENTITY_TOKEN";
 pub const RUNTIME_INCARNATION_ENVIRONMENT: &str = "CATS_RUNTIME_INCARNATION";
 
+/// Provider-private Cloud Hypervisor API listener descriptor.  It is outside
+/// systemd's activation range and the frozen artifact/RAM/log descriptor set.
+/// The VMM inspector treats `/proc/<MainPID>/fd/71` as part of exact process
+/// identity; this number is not a Runtime wire field.
+pub const VMM_API_LISTENER_FD: i32 = 71;
+
 const MIB: u64 = 1024 * 1024;
 #[cfg(target_os = "linux")]
 const CHECKPOINT_FD_NAME: &str = "cats-checkpoint-v1";
@@ -58,7 +64,7 @@ impl VmmLauncherPlan {
             process_identity_token,
             vcpus,
             memory_bytes,
-            api_socket_path,
+            api_socket_path: _,
             vsock_socket_path,
             guest_cid,
             memory_file_path,
@@ -103,7 +109,7 @@ impl VmmLauncherPlan {
 
         let mut arguments = vec![
             OsString::from("--api-socket"),
-            OsString::from(api_socket_path.as_str()),
+            OsString::from(format!("fd={VMM_API_LISTENER_FD}")),
             OsString::from("--kernel"),
             fixed_fd_path(KERNEL_FD),
         ];
@@ -240,10 +246,16 @@ mod linux {
     };
     use sha2::{Digest as _, Sha256};
 
+    use crate::runtime::reconciliation::{
+        vmm_state_directory_from_checkpoint, ManagedVmmSocketPreparation,
+        RetainedManagedVmmSocketRoot, VmmSocketReceiptStore,
+    };
+
     use super::{
         fixed_fd_path, VmmLauncherPlan, CHECKPOINT_FD, CHECKPOINT_FD_NAME, INITRAMFS_FD,
         INITRAMFS_FD_NAME, KERNEL_FD, KERNEL_FD_NAME, MEMORY_FD, RUNTIME_INCARNATION_ENVIRONMENT,
-        SERIAL_LOG_FD, VMM_FD, VMM_FD_NAME, VMM_LOG_FD, VMM_PROCESS_TOKEN_ENVIRONMENT,
+        SERIAL_LOG_FD, VMM_API_LISTENER_FD, VMM_FD, VMM_FD_NAME, VMM_LOG_FD,
+        VMM_PROCESS_TOKEN_ENVIRONMENT,
     };
 
     const HASH_BUFFER_BYTES: usize = 1024 * 1024;
@@ -270,7 +282,7 @@ mod linux {
             runtime_incarnation,
             process_identity_token,
             memory_bytes,
-            api_socket_path,
+            api_socket_path: _,
             vsock_socket_path,
             memory_file_path,
             serial_log_path,
@@ -300,8 +312,21 @@ mod linux {
         };
         open_files.ensure_empty()?;
 
-        let api_parent = CheckedParent::open(Path::new(api_socket_path.as_str()))?;
-        api_parent.ensure_absent()?;
+        let state_directory = vmm_state_directory_from_checkpoint(plan.checkpoint())?;
+        let managed_socket_root = RetainedManagedVmmSocketRoot::open_installed()
+            .context("open installed VMM socket root")?;
+        let socket_receipts = VmmSocketReceiptStore::open_existing(state_directory)
+            .context("open installed VMM socket receipt namespace")?;
+        let api_listener = match managed_socket_root
+            .prepare_existing_receipt(plan.checkpoint(), &socket_receipts)
+            .context("prepare checkpointed VMM socket namespace")?
+        {
+            ManagedVmmSocketPreparation::Prepared(prepared) => prepared,
+            ManagedVmmSocketPreparation::ExistingLive => {
+                anyhow::bail!("checkpointed VMM socket namespace already has a live holder")
+            }
+        };
+
         let vsock_parent = CheckedParent::open(Path::new(vsock_socket_path.as_str()))?;
         vsock_parent.ensure_absent()?;
         let [memory, serial_log, vmm_log] = OwnedLaunchFile::create_batch([
@@ -318,7 +343,7 @@ mod linux {
         if let (Some(file), Some(expected)) = (&initramfs, &boot.initramfs) {
             validate_artifact(file, expected, 0o644)?;
         }
-        api_parent.assert_current_and_absent()?;
+        api_listener.assert_current()?;
         vsock_parent.assert_current_and_absent()?;
         memory.assert_current(*memory_bytes)?;
         serial_log.assert_current(0)?;
@@ -333,6 +358,7 @@ mod linux {
         install_fixed_fd(&memory.file, MEMORY_FD)?;
         install_fixed_fd(&serial_log.file, SERIAL_LOG_FD)?;
         install_fixed_fd(&vmm_log.file, VMM_LOG_FD)?;
+        install_fixed_fd(api_listener.api_listener(), VMM_API_LISTENER_FD)?;
 
         let stderr_fd = duplicate_fd(VMM_LOG_FD)?;
         // SAFETY: `duplicate_fd` returned a new descriptor owned by this File.
@@ -358,7 +384,7 @@ mod linux {
         // final lexical proof immediately before exec.  The fixed descriptors
         // remain the launch authority, while these checks ensure the
         // checkpointed canonical paths still name those same files.
-        api_parent.assert_current_and_absent()?;
+        api_listener.assert_current()?;
         vsock_parent.assert_current_and_absent()?;
         memory.assert_current(*memory_bytes)?;
         serial_log.assert_current(0)?;
@@ -1268,12 +1294,7 @@ mod tests {
             .collect::<Vec<_>>();
         assert_eq!(
             arguments[0..4],
-            [
-                "--api-socket",
-                "/run/cats/cat_01/vmm-api.sock",
-                "--kernel",
-                "/proc/self/fd/66"
-            ]
+            ["--api-socket", "fd=71", "--kernel", "/proc/self/fd/66"]
         );
         assert!(arguments
             .windows(2)

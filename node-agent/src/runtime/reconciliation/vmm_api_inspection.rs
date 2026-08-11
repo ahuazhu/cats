@@ -16,6 +16,8 @@ use cats_api::runtime_reconciliation::{
 use serde::Deserialize;
 
 use crate::runtime_spine::RuntimePhysicalReadContext;
+#[cfg(target_os = "linux")]
+use crate::vmm_launcher::VMM_API_LISTENER_FD;
 
 const MAX_HTTP_HEADER_BYTES: usize = 64 * 1024;
 const MAX_HTTP_BODY_BYTES: usize = 2 * 1024 * 1024;
@@ -935,21 +937,19 @@ mod linux {
         if api_path.identity == vsock_path.identity {
             return Ok(VmmApiInspection::Conflict(VmmApiConflict::SocketIdentity));
         }
-        let before = match inspect_listener_pair(
-            [&expected.api_socket_path, &expected.vsock_socket_path],
-            expected.process_id,
-            context,
-        )? {
-            PairInspection::Exact(pair) => pair,
-            PairInspection::Unavailable => {
-                return Ok(VmmApiInspection::Unavailable(
-                    VmmApiUnavailable::ProcessTableUnreadable,
-                ))
-            }
-            PairInspection::Conflict => {
-                return Ok(VmmApiInspection::Conflict(VmmApiConflict::SocketOwnership))
-            }
-        };
+        let before =
+            match inspect_listener_pair(&expected.vsock_socket_path, expected.process_id, context)?
+            {
+                PairInspection::Exact(pair) => pair,
+                PairInspection::Unavailable => {
+                    return Ok(VmmApiInspection::Unavailable(
+                        VmmApiUnavailable::ProcessTableUnreadable,
+                    ))
+                }
+                PairInspection::Conflict => {
+                    return Ok(VmmApiInspection::Conflict(VmmApiConflict::SocketOwnership))
+                }
+            };
 
         let ping_body = match get_api_json(
             &expected.api_socket_path,
@@ -996,21 +996,19 @@ mod linux {
         if api_path.assert_current().is_err() || vsock_path.assert_current().is_err() {
             return Ok(VmmApiInspection::Conflict(VmmApiConflict::SocketIdentity));
         }
-        let after = match inspect_listener_pair(
-            [&expected.api_socket_path, &expected.vsock_socket_path],
-            expected.process_id,
-            context,
-        )? {
-            PairInspection::Exact(pair) => pair,
-            PairInspection::Unavailable => {
-                return Ok(VmmApiInspection::Unavailable(
-                    VmmApiUnavailable::ProcessTableUnreadable,
-                ))
-            }
-            PairInspection::Conflict => {
-                return Ok(VmmApiInspection::Conflict(VmmApiConflict::SocketOwnership))
-            }
-        };
+        let after =
+            match inspect_listener_pair(&expected.vsock_socket_path, expected.process_id, context)?
+            {
+                PairInspection::Exact(pair) => pair,
+                PairInspection::Unavailable => {
+                    return Ok(VmmApiInspection::Unavailable(
+                        VmmApiUnavailable::ProcessTableUnreadable,
+                    ))
+                }
+                PairInspection::Conflict => {
+                    return Ok(VmmApiInspection::Conflict(VmmApiConflict::SocketOwnership))
+                }
+            };
         if before != after {
             return Ok(VmmApiInspection::Conflict(VmmApiConflict::SocketIdentity));
         }
@@ -1337,18 +1335,23 @@ mod linux {
         }
     }
 
-    enum PairInspection {
+    pub(super) enum PairInspection {
         Exact([u64; 2]),
         Unavailable,
         Conflict,
     }
 
-    fn inspect_listener_pair(
-        paths: [&HostPath; 2],
+    pub(super) fn inspect_listener_pair(
+        vsock_path: &HostPath,
         expected_process_id: u32,
         context: &dyn RuntimePhysicalReadContext,
     ) -> anyhow::Result<PairInspection> {
         context.check_active()?;
+        let api_inode = match inspect_api_listener_descriptor(expected_process_id)? {
+            DescriptorInspection::Exact(inode) => inode,
+            DescriptorInspection::Unavailable => return Ok(PairInspection::Unavailable),
+            DescriptorInspection::Conflict => return Ok(PairInspection::Conflict),
+        };
         let file = match File::open("/proc/net/unix") {
             Ok(file) => file,
             Err(_) => return Ok(PairInspection::Unavailable),
@@ -1365,24 +1368,30 @@ mod linux {
             Ok(text) => text,
             Err(_) => return Ok(PairInspection::Conflict),
         };
-        let mut matching = [Vec::new(), Vec::new()];
+        let mut matching_api = Vec::new();
+        let mut matching_vsock = Vec::new();
         for line in text.lines().skip(1) {
             let Some(fields) = parse_proc_net_unix_line(line) else {
                 continue;
             };
-            for (index, path) in paths.iter().enumerate() {
-                if fields.path == path.as_str() {
-                    if fields.flags != "00010000"
-                        || fields.socket_type != "0001"
-                        || fields.state != "01"
-                    {
-                        return Ok(PairInspection::Conflict);
-                    }
-                    matching[index].push(fields.inode);
+            let is_api = fields.inode == api_inode;
+            let is_vsock = fields.path == Some(vsock_path.as_str());
+            if is_api || is_vsock {
+                if fields.flags != "00010000"
+                    || fields.socket_type != "0001"
+                    || fields.state != "01"
+                {
+                    return Ok(PairInspection::Conflict);
+                }
+                if is_api {
+                    matching_api.push(fields.inode);
+                }
+                if is_vsock {
+                    matching_vsock.push(fields.inode);
                 }
             }
         }
-        let pair = match (matching[0].as_slice(), matching[1].as_slice()) {
+        let pair = match (matching_api.as_slice(), matching_vsock.as_slice()) {
             ([api], [vsock]) if api != vsock => [*api, *vsock],
             ([], _) | (_, []) => return Ok(PairInspection::Unavailable),
             _ => return Ok(PairInspection::Conflict),
@@ -1394,12 +1403,50 @@ mod linux {
         }
     }
 
+    enum DescriptorInspection {
+        Exact(u64),
+        Unavailable,
+        Conflict,
+    }
+
+    fn inspect_api_listener_descriptor(
+        expected_process_id: u32,
+    ) -> anyhow::Result<DescriptorInspection> {
+        let descriptor_path = format!("/proc/{expected_process_id}/fd/{VMM_API_LISTENER_FD}");
+        let target = match std::fs::read_link(&descriptor_path) {
+            Ok(target) => target,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                return Ok(DescriptorInspection::Unavailable)
+            }
+            Err(error) if error.kind() == io::ErrorKind::PermissionDenied => {
+                return Ok(DescriptorInspection::Unavailable)
+            }
+            Err(_) => return Ok(DescriptorInspection::Conflict),
+        };
+        let bytes = target.as_os_str().as_bytes();
+        let Some(payload) = bytes
+            .strip_prefix(b"socket:[")
+            .and_then(|bytes| bytes.strip_suffix(b"]"))
+        else {
+            return Ok(DescriptorInspection::Conflict);
+        };
+        let inode = match std::str::from_utf8(payload)
+            .ok()
+            .and_then(|value| value.parse::<u64>().ok())
+            .filter(|inode| *inode > 0)
+        {
+            Some(inode) => inode,
+            None => return Ok(DescriptorInspection::Conflict),
+        };
+        Ok(DescriptorInspection::Exact(inode))
+    }
+
     struct ProcNetUnixLine<'a> {
         flags: &'a str,
         socket_type: &'a str,
         state: &'a str,
         inode: u64,
-        path: &'a str,
+        path: Option<&'a str>,
     }
 
     fn parse_proc_net_unix_line(line: &str) -> Option<ProcNetUnixLine<'_>> {
@@ -1437,8 +1484,8 @@ mod linux {
         {
             offset += 1;
         }
-        let path = line.get(offset..)?;
-        (!path.is_empty()).then_some(ProcNetUnixLine {
+        let path = line.get(offset..).filter(|path| !path.is_empty());
+        Some(ProcNetUnixLine {
             flags,
             socket_type,
             state,
@@ -1510,11 +1557,22 @@ mod linux {
                     Ok(descriptor) => descriptor,
                     Err(_) => return Ok(OwnerInspection::Unavailable),
                 };
+                let descriptor_number = match descriptor
+                    .file_name()
+                    .to_str()
+                    .and_then(|name| name.parse::<i32>().ok())
+                    .filter(|descriptor| *descriptor >= 0)
+                {
+                    Some(descriptor) => descriptor,
+                    None => return Ok(OwnerInspection::Conflict),
+                };
                 match std::fs::read_link(descriptor.path()) {
                     Ok(target) => {
                         for (index, expected) in targets.iter().enumerate() {
                             if target.as_os_str() == expected {
-                                if process_id == expected_process_id {
+                                let exact_owner = process_id == expected_process_id
+                                    && (index != 0 || descriptor_number == VMM_API_LISTENER_FD);
+                                if exact_owner {
                                     expected_counts[index] =
                                         expected_counts[index].saturating_add(1);
                                 } else {
@@ -1840,6 +1898,19 @@ use linux::RetainedVmmSocket;
 
 #[cfg(test)]
 mod tests {
+    #[cfg(target_os = "linux")]
+    use std::fs::File;
+    #[cfg(target_os = "linux")]
+    use std::io::Read as _;
+    #[cfg(target_os = "linux")]
+    use std::os::fd::{AsRawFd as _, FromRawFd as _};
+    #[cfg(target_os = "linux")]
+    use std::os::unix::fs::PermissionsExt as _;
+    #[cfg(target_os = "linux")]
+    use std::os::unix::net::UnixListener;
+    #[cfg(target_os = "linux")]
+    use std::time::{Duration, Instant};
+
     use cats_api::runtime_reconciliation::decode_runtime_checkpoint;
 
     use super::*;
@@ -1934,5 +2005,143 @@ mod tests {
             .unwrap()
             .exact(4242)
             .is_none());
+    }
+
+    #[cfg(target_os = "linux")]
+    struct TestPhysicalContext {
+        deadline: Instant,
+    }
+
+    #[cfg(target_os = "linux")]
+    impl RuntimePhysicalReadContext for TestPhysicalContext {
+        fn deadline(&self) -> Instant {
+            self.deadline
+        }
+
+        fn check_active(&self) -> anyhow::Result<()> {
+            anyhow::ensure!(Instant::now() < self.deadline, "test deadline expired");
+            Ok(())
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn fd71_and_sole_holder_are_both_required_for_api_identity() {
+        for duplicate_api_holder in [false, true] {
+            let temporary = tempfile::tempdir().unwrap();
+            let api_path = temporary.path().join("api.sock");
+            let vsock_path = temporary.path().join("vsock.sock");
+            let api = UnixListener::bind(&api_path).unwrap();
+            let vsock = UnixListener::bind(&vsock_path).unwrap();
+            std::fs::set_permissions(&api_path, std::fs::Permissions::from_mode(0o700)).unwrap();
+            std::fs::set_permissions(&vsock_path, std::fs::Permissions::from_mode(0o700)).unwrap();
+
+            let mut ready = [0_i32; 2];
+            let mut stop = [0_i32; 2];
+            assert_eq!(
+                // SAFETY: the array provides storage for exactly two fresh pipe
+                // descriptors. Each endpoint is transferred or closed once below.
+                unsafe { libc::pipe2(ready.as_mut_ptr(), libc::O_CLOEXEC) },
+                0
+            );
+            assert_eq!(
+                // SAFETY: same invariant as the ready pipe.
+                unsafe { libc::pipe2(stop.as_mut_ptr(), libc::O_CLOEXEC) },
+                0
+            );
+            // SAFETY: the child branch uses only inherited descriptors and
+            // async-signal-safe syscalls, then exits without running Rust
+            // destructors. The parent owns normal Rust cleanup.
+            let child = unsafe { libc::fork() };
+            assert!(child >= 0);
+            if child == 0 {
+                // SAFETY: these are the unused inherited pipe endpoints.
+                unsafe {
+                    libc::close(ready[0]);
+                    libc::close(stop[1]);
+                }
+                let api_source = api.as_raw_fd();
+                if api_source != VMM_API_LISTENER_FD
+                    // SAFETY: dup3 atomically installs the inherited listener
+                    // at the frozen provider-private descriptor number.
+                    && unsafe { libc::dup3(api_source, VMM_API_LISTENER_FD, 0) } < 0
+                {
+                    // SAFETY: the child cannot safely unwind after fork.
+                    unsafe { libc::_exit(91) };
+                }
+                if api_source != VMM_API_LISTENER_FD {
+                    // SAFETY: fd71 now owns the only required API reference.
+                    unsafe { libc::close(api_source) };
+                }
+                if duplicate_api_holder {
+                    // SAFETY: this intentionally creates a second holder for
+                    // the negative half of the test.
+                    if unsafe { libc::fcntl(VMM_API_LISTENER_FD, libc::F_DUPFD_CLOEXEC, 100) } < 0 {
+                        // SAFETY: the child cannot safely unwind after fork.
+                        unsafe { libc::_exit(92) };
+                    }
+                }
+                let byte = [1_u8];
+                // SAFETY: the pipe endpoints and one-byte buffers are valid.
+                if unsafe { libc::write(ready[1], byte.as_ptr().cast(), 1) } != 1 {
+                    // SAFETY: the child cannot safely unwind after fork.
+                    unsafe { libc::_exit(93) };
+                }
+                let mut command = [0_u8];
+                // SAFETY: block until the parent completes the bounded scan.
+                let _ = unsafe { libc::read(stop[0], command.as_mut_ptr().cast(), 1) };
+                // SAFETY: the child must exit without running inherited Rust
+                // destructors after fork.
+                unsafe { libc::_exit(0) };
+            }
+
+            // SAFETY: these are the unused parent endpoints.
+            unsafe {
+                libc::close(ready[1]);
+                libc::close(stop[0]);
+            }
+            drop(api);
+            drop(vsock);
+            // SAFETY: ownership of the two retained parent pipe endpoints is
+            // transferred exactly once to File.
+            let mut ready_reader = unsafe { File::from_raw_fd(ready[0]) };
+            // SAFETY: this is the other retained parent endpoint and is
+            // transferred exactly once to File.
+            let stop_writer = unsafe { File::from_raw_fd(stop[1]) };
+            let mut byte = [0_u8];
+            ready_reader.read_exact(&mut byte).unwrap();
+
+            let context = TestPhysicalContext {
+                deadline: Instant::now() + Duration::from_secs(5),
+            };
+            let inspection = linux::inspect_listener_pair(
+                &HostPath::new(vsock_path.to_string_lossy().into_owned()).unwrap(),
+                child as u32,
+                &context,
+            )
+            .unwrap();
+
+            assert_eq!(
+                // SAFETY: the descriptor and one-byte buffer are valid; this
+                // write releases the exact child.
+                unsafe { libc::write(stop_writer.as_raw_fd(), byte.as_ptr().cast(), 1) },
+                1
+            );
+            let mut status = 0_i32;
+            assert_eq!(
+                // SAFETY: `child` is the exact live fork result and `status`
+                // is writable for the complete waitpid call.
+                unsafe { libc::waitpid(child, &raw mut status, 0) },
+                child
+            );
+            assert!(libc::WIFEXITED(status));
+            assert_eq!(libc::WEXITSTATUS(status), 0);
+
+            if duplicate_api_holder {
+                assert!(matches!(inspection, linux::PairInspection::Conflict));
+            } else {
+                assert!(matches!(inspection, linux::PairInspection::Exact(_)));
+            }
+        }
     }
 }
