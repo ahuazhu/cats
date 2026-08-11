@@ -1493,6 +1493,34 @@ mod tests {
             GuestResponseBody::Error { .. }
         ));
 
+        let vm_agent = GuestAgent::with_mode(GuestMode::Vm, map_path.clone(), None);
+        let rejected = vm_agent.handle_on_transport(
+            GuestRequestBody::RuntimeReady {
+                ready: cats_api::guest::RuntimeReadyRequestV1 {
+                    version: 1,
+                    challenge: cats_api::runtime_reconciliation::RandomId128::new(
+                        "11111111111111111111111111111111",
+                    )
+                    .unwrap(),
+                    runtime_incarnation: cats_api::runtime_reconciliation::RandomId128::new(
+                        "22222222222222222222222222222222",
+                    )
+                    .unwrap(),
+                    expected_guest_cid: 3,
+                    expected_guest_port: 5_000,
+                    expected_guest_agent_protocol_version: 1,
+                },
+            },
+            Some(VsockLocalEndpoint {
+                cid: 4,
+                port: 5_000,
+            }),
+        );
+        let GuestResponseBody::Error { message } = rejected else {
+            panic!("mismatched accepted AF_VSOCK endpoint was accepted")
+        };
+        assert!(message.contains("accepted AF_VSOCK"), "{message}");
+
         match agent.handle(GuestRequestBody::Health) {
             GuestResponseBody::Health {
                 boot_id: b, disks, ..
