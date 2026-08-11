@@ -715,19 +715,29 @@ impl Client {
     }
 
     fn get_runtime_operation(&self, operation_id: &str) -> Result<RuntimeOperation> {
+        self.get_runtime_operation_with_timeout(operation_id, None)
+    }
+
+    fn get_runtime_operation_with_timeout(
+        &self,
+        operation_id: &str,
+        request_timeout: Option<Duration>,
+    ) -> Result<RuntimeOperation> {
         let workspace_id = RuntimeId::new(self.workspace_id.clone())
             .ok_or_else(|| anyhow!("selected workspace ID is not valid for runtime operations"))?;
         let operation_id = RuntimeId::new(operation_id.to_owned())
             .ok_or_else(|| anyhow!("invalid runtime operation ID"))?;
         let exact_url = self.url(&format!("/operations/{operation_id}"));
-        let response = self
+        let mut request = self
             .http
             .get(&exact_url)
             .bearer_auth(&self.token)
             .header(reqwest::header::ACCEPT, "application/json")
-            .header(reqwest::header::ACCEPT_ENCODING, "identity")
-            .send()
-            .context("control plane unreachable")?;
+            .header(reqwest::header::ACCEPT_ENCODING, "identity");
+        if let Some(request_timeout) = request_timeout {
+            request = request.timeout(request_timeout);
+        }
+        let response = request.send().context("control plane unreachable")?;
         anyhow::ensure!(
             response.url().as_str() == exact_url,
             "Operation request did not remain on its exact canonical URL"
@@ -782,15 +792,44 @@ impl Client {
     }
 
     fn wait_runtime_operation(&self, operation_id: &str) -> Result<RuntimeOperation> {
-        let deadline = Instant::now() + Duration::from_secs(120);
+        self.wait_runtime_operation_for(operation_id, Duration::from_secs(120))
+    }
+
+    fn wait_runtime_operation_for(
+        &self,
+        operation_id: &str,
+        wait_timeout: Duration,
+    ) -> Result<RuntimeOperation> {
+        let deadline = Instant::now() + wait_timeout;
         loop {
-            let operation = self.get_runtime_operation(operation_id)?;
-            match operation.phase {
-                RuntimeOperationPhase::Pending => {
-                    if Instant::now() > deadline {
+            let Some(remaining) = deadline.checked_duration_since(Instant::now()) else {
+                bail!("operation {operation_id} did not finish in time");
+            };
+            if remaining.is_zero() {
+                bail!("operation {operation_id} did not finish in time");
+            }
+            let operation =
+                match self.get_runtime_operation_with_timeout(operation_id, Some(remaining)) {
+                    Ok(operation) => operation,
+                    Err(error)
+                        if Instant::now() >= deadline
+                            || error
+                                .downcast_ref::<reqwest::Error>()
+                                .is_some_and(reqwest::Error::is_timeout) =>
+                    {
                         bail!("operation {operation_id} did not finish in time");
                     }
-                    std::thread::sleep(Duration::from_millis(150));
+                    Err(error) => return Err(error),
+                };
+            match operation.phase {
+                RuntimeOperationPhase::Pending => {
+                    let Some(remaining) = deadline.checked_duration_since(Instant::now()) else {
+                        bail!("operation {operation_id} did not finish in time");
+                    };
+                    if remaining.is_zero() {
+                        bail!("operation {operation_id} did not finish in time");
+                    }
+                    std::thread::sleep(remaining.min(Duration::from_millis(150)));
                 }
                 RuntimeOperationPhase::Succeeded => return Ok(operation),
                 RuntimeOperationPhase::Failed => {
@@ -2571,6 +2610,51 @@ mod tests {
             .wait_runtime_operation("op_01")
             .unwrap();
         assert_eq!(operation, succeeded);
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn runtime_operation_wait_bounds_slow_second_response_by_absolute_deadline() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        let pending = encode_runtime_operation(&pending_runtime_operation()).unwrap();
+        let (second_request_tx, second_request_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let server = std::thread::spawn(move || {
+            let (mut first, _) = listener.accept().unwrap();
+            let _ = read_request(&mut first);
+            write_runtime_operation_response(&mut first, &pending, None);
+
+            let (mut second, _) = listener.accept().unwrap();
+            let _ = read_request(&mut second);
+            second_request_tx.send(()).unwrap();
+            // Keep the response open longer than the client's total wait
+            // budget. The test releases this promptly once the bounded wait
+            // returns; an unbounded second GET instead stalls here.
+            let _ = release_rx.recv_timeout(Duration::from_secs(3));
+        });
+
+        let started = Instant::now();
+        let error = runtime_test_client(base)
+            .wait_runtime_operation_for("op_01", Duration::from_millis(400))
+            .unwrap_err();
+        let elapsed = started.elapsed();
+        let _ = release_tx.send(());
+
+        assert!(
+            second_request_rx
+                .recv_timeout(Duration::from_secs(1))
+                .is_ok(),
+            "wait did not issue the expected second GET"
+        );
+        assert!(
+            error.to_string().contains("did not finish in time"),
+            "unexpected timeout error: {error}"
+        );
+        assert!(
+            elapsed < Duration::from_millis(1_500),
+            "wait exceeded its absolute deadline by too much: {elapsed:?}"
+        );
         server.join().unwrap();
     }
 
