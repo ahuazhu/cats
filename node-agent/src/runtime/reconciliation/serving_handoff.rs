@@ -4459,10 +4459,36 @@ mod tests {
         effect_context_with_processes_and_observation(fixture, processes, random('4'))
     }
 
+    fn effect_context_without_node_global_process(
+        fixture: &Fixture,
+        processes: Vec<cats_api::runtime_reconciliation::ProcessEvidence>,
+    ) -> RuntimeDesiredEffectContext {
+        effect_context_with_processes_and_observation_binding(
+            fixture,
+            processes,
+            random('4'),
+            false,
+        )
+    }
+
     fn effect_context_with_processes_and_observation(
         fixture: &Fixture,
         processes: Vec<cats_api::runtime_reconciliation::ProcessEvidence>,
         observation_id: RandomId128,
+    ) -> RuntimeDesiredEffectContext {
+        effect_context_with_processes_and_observation_binding(
+            fixture,
+            processes,
+            observation_id,
+            true,
+        )
+    }
+
+    fn effect_context_with_processes_and_observation_binding(
+        fixture: &Fixture,
+        processes: Vec<cats_api::runtime_reconciliation::ProcessEvidence>,
+        observation_id: RandomId128,
+        bind_node_global_process: bool,
     ) -> RuntimeDesiredEffectContext {
         let checkpoint = fixture.stored_checkpoint.checkpoint();
         let desired = &fixture.acquired.desired;
@@ -4505,12 +4531,13 @@ mod tests {
             lineage.local_durable_generation = fixture.authority.volume.head.generation;
             lineage.remote_durable_generation = fixture.authority.volume.head.generation;
         }
-        let node_global_process = if matches!(
-            checkpoint.step,
-            ReconcileStep::PrepareDevice { .. }
-                | ReconcileStep::PrepareNetwork { .. }
-                | ReconcileStep::StartRuntime { .. }
-        ) {
+        let node_global_process = if bind_node_global_process
+            && matches!(
+                checkpoint.step,
+                ReconcileStep::PrepareDevice { .. }
+                    | ReconcileStep::PrepareNetwork { .. }
+                    | ReconcileStep::StartRuntime { .. }
+            ) {
             let retained = AuthorizedBlockdStore::new(fixture.state_directory.clone())
                 .retain_prepare_device_handoff(checkpoint, desired)
                 .unwrap();
@@ -8501,7 +8528,10 @@ mod tests {
             assert_eq!(
                 effect
                     .try_apply(
-                        &effect_context_with_processes(&fixture, vec![accepted_process]),
+                        &effect_context_without_node_global_process(
+                            &fixture,
+                            vec![accepted_process],
+                        ),
                         &fixture.acquired.desired,
                     )
                     .unwrap(),
@@ -8510,10 +8540,7 @@ mod tests {
                 )),
                 "accepted {field} mismatch was not rejected",
             );
-            assert_eq!(
-                global.calls.load(Ordering::SeqCst),
-                usize::from(matches!(field, "pid" | "start")),
-            );
+            assert_eq!(global.calls.load(Ordering::SeqCst), 0);
             assert!(process.stopped().is_empty());
         }
     }

@@ -166,7 +166,10 @@ impl PrepareDeviceTargetRetirementEffect {
             Ok(expectation) => expectation,
             Err(_) => return Ok(Some(stop_local())),
         };
-        let admission = context.node_global_process()?;
+        let admission = match context.node_global_process() {
+            Ok(admission) => admission,
+            Err(_) => return Ok(Some(stop_local())),
+        };
         let Some((_, admitted_serving)) = admission.serving_blockd(
             &desired.cat_id,
             &ready.attempt().attachment.identity.volume_id,

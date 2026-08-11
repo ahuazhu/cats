@@ -1233,6 +1233,11 @@ impl ServingBlockdStartEffect {
                 (_, ServingBlockdProcessInspection::Conflict(_)) => {
                     return Ok(Some(stop_local()));
                 }
+                (_, ServingBlockdProcessInspection::Exact(evidence))
+                    if !evidence.exactly_matches(&entry.expected) =>
+                {
+                    return Ok(Some(stop_local()));
+                }
                 (_, ServingBlockdProcessInspection::Unavailable)
                 | (None, ServingBlockdProcessInspection::Exact(_))
                 | (Some(_), ServingBlockdProcessInspection::Absent)
