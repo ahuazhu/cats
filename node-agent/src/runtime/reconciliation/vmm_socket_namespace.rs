@@ -597,6 +597,19 @@ struct ScannedManagedAttempt {
     vsock_identity: Option<StableSocketLeafIdentity>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ScannedReceipt {
+    identity: StableFileIdentity,
+    bytes: Vec<u8>,
+}
+
+#[cfg(target_os = "linux")]
+enum ReceiptNamespaceSnapshot {
+    Exact(std::collections::BTreeMap<String, ScannedReceipt>),
+    Residue,
+    Unavailable,
+}
+
 #[cfg(target_os = "linux")]
 fn scan_managed_vmm_socket_root_linux(
     root: &RetainedManagedVmmSocketRoot,
@@ -611,6 +624,15 @@ fn scan_managed_vmm_socket_root_linux(
     {
         return Ok(ManagedVmmSocketRootScan::Residue);
     }
+
+    let first_receipts =
+        match scan_receipt_namespace_snapshot(root, receipts, expected_checkpoints, context)? {
+            ReceiptNamespaceSnapshot::Exact(snapshot) => snapshot,
+            ReceiptNamespaceSnapshot::Residue => return Ok(ManagedVmmSocketRootScan::Residue),
+            ReceiptNamespaceSnapshot::Unavailable => {
+                return Ok(ManagedVmmSocketRootScan::Unavailable)
+            }
+        };
 
     let mut expected_names = std::collections::BTreeMap::new();
     for checkpoint in expected_checkpoints {
@@ -786,8 +808,97 @@ fn scan_managed_vmm_socket_root_linux(
             return Ok(ManagedVmmSocketRootScan::Residue);
         }
     }
+    let second_receipts =
+        match scan_receipt_namespace_snapshot(root, receipts, expected_checkpoints, context)? {
+            ReceiptNamespaceSnapshot::Exact(snapshot) => snapshot,
+            ReceiptNamespaceSnapshot::Residue => return Ok(ManagedVmmSocketRootScan::Residue),
+            ReceiptNamespaceSnapshot::Unavailable => {
+                return Ok(ManagedVmmSocketRootScan::Unavailable)
+            }
+        };
+    if first_receipts != second_receipts {
+        return Ok(ManagedVmmSocketRootScan::Residue);
+    }
     context.check_active()?;
     Ok(ManagedVmmSocketRootScan::Accounted)
+}
+
+#[cfg(target_os = "linux")]
+fn scan_receipt_namespace_snapshot(
+    root: &RetainedManagedVmmSocketRoot,
+    receipts: &VmmSocketReceiptStore,
+    expected_checkpoints: &[&RuntimeCheckpoint],
+    context: &dyn crate::runtime_spine::RuntimePhysicalReadContext,
+) -> anyhow::Result<ReceiptNamespaceSnapshot> {
+    context.check_active()?;
+    if root.assert_current().is_err() || receipts.assert_current().is_err() {
+        return Ok(ReceiptNamespaceSnapshot::Residue);
+    }
+    let mut expected = std::collections::BTreeMap::new();
+    for checkpoint in expected_checkpoints {
+        let ReconcileStep::StartRuntime {
+            runtime_incarnation,
+            ..
+        } = &checkpoint.step
+        else {
+            return Ok(ReceiptNamespaceSnapshot::Residue);
+        };
+        let name = receipt_file_name(runtime_incarnation)?
+            .into_string()
+            .map_err(|_| anyhow::anyhow!("VMM receipt filename is not UTF-8"))?;
+        if expected.insert(name, *checkpoint).is_some() {
+            return Ok(ReceiptNamespaceSnapshot::Residue);
+        }
+    }
+
+    let entries =
+        match std::fs::read_dir(format!("/proc/self/fd/{}", receipts.directory.as_raw_fd())) {
+            Ok(entries) => entries,
+            Err(_) => return Ok(ReceiptNamespaceSnapshot::Unavailable),
+        };
+    let mut snapshot = std::collections::BTreeMap::new();
+    for entry in entries {
+        context.check_active()?;
+        let entry = match entry {
+            Ok(entry) => entry,
+            Err(_) => return Ok(ReceiptNamespaceSnapshot::Unavailable),
+        };
+        let name = match entry.file_name().into_string() {
+            Ok(name) => name,
+            Err(_) => return Ok(ReceiptNamespaceSnapshot::Residue),
+        };
+        if snapshot.len() >= 1024 || snapshot.contains_key(&name) {
+            return Ok(ReceiptNamespaceSnapshot::Residue);
+        }
+        let Some(checkpoint) = expected.get(&name) else {
+            return Ok(ReceiptNamespaceSnapshot::Residue);
+        };
+        let name_c = match CString::new(name.as_bytes()) {
+            Ok(name) => name,
+            Err(_) => return Ok(ReceiptNamespaceSnapshot::Residue),
+        };
+        let scanned = match read_optional_receipt_snapshot(&receipts.directory, &name_c) {
+            Ok(Some(scanned)) => scanned,
+            Ok(None) => return Ok(ReceiptNamespaceSnapshot::Residue),
+            Err(_) => return Ok(ReceiptNamespaceSnapshot::Residue),
+        };
+        let receipt = match decode_receipt(&scanned.bytes) {
+            Ok(receipt) => receipt,
+            Err(_) => return Ok(ReceiptNamespaceSnapshot::Residue),
+        };
+        if receipt
+            .validate_against(checkpoint, receipts.state_directory(), root)
+            .is_err()
+        {
+            return Ok(ReceiptNamespaceSnapshot::Residue);
+        }
+        snapshot.insert(name, scanned);
+    }
+    if receipts.assert_current().is_err() {
+        return Ok(ReceiptNamespaceSnapshot::Residue);
+    }
+    context.check_active()?;
+    Ok(ReceiptNamespaceSnapshot::Exact(snapshot))
 }
 
 #[cfg(target_os = "linux")]
@@ -2042,6 +2153,13 @@ fn receipt_file_name(incarnation: &RandomId128) -> anyhow::Result<CString> {
 }
 
 fn read_optional_receipt(directory: &File, name: &CStr) -> anyhow::Result<Option<Vec<u8>>> {
+    Ok(read_optional_receipt_snapshot(directory, name)?.map(|scanned| scanned.bytes))
+}
+
+fn read_optional_receipt_snapshot(
+    directory: &File,
+    name: &CStr,
+) -> anyhow::Result<Option<ScannedReceipt>> {
     let mut file = match open_at(
         directory,
         name,
@@ -2076,7 +2194,10 @@ fn read_optional_receipt(directory: &File, name: &CStr) -> anyhow::Result<Option
         stable_file_identity(&before) == stable_file_identity(&after),
         "VMM socket ownership receipt changed while read"
     );
-    Ok(Some(bytes))
+    Ok(Some(ScannedReceipt {
+        identity: stable_file_identity(&after),
+        bytes,
+    }))
 }
 
 fn open_directory_chain(path: &Path) -> anyhow::Result<Vec<RetainedPathDirectory>> {
@@ -3012,6 +3133,13 @@ mod tests {
             ManagedVmmSocketRootScan::Accounted
         );
         store.publish(&receipt).unwrap();
+        // The durable WAL may legitimately be the only published resource
+        // after a crash. It must be enumerated and bound to this exact current
+        // StartRuntime even while the boot-local root remains empty.
+        assert_eq!(
+            scan_managed_vmm_socket_root(&root, &store, &[&checkpoint], &scan_context()).unwrap(),
+            ManagedVmmSocketRootScan::Accounted
+        );
         drop(expect_prepared(
             root.prepare_existing_receipt(&checkpoint, &store).unwrap(),
         ));
@@ -3027,6 +3155,60 @@ mod tests {
             ManagedVmmSocketRootScan::Residue
         );
         assert_eq!(std::fs::read(foreign).unwrap(), b"foreign");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn receipt_namespace_rejects_foreign_corrupt_unassigned_and_aba_entries() {
+        let (temporary, root, checkpoint, store, _receipt) = receipt_fixture();
+        let namespace = receipt_namespace_path(&temporary);
+        write_foreign(&namespace.join("foreign.receipt.json"), b"foreign");
+        assert_eq!(
+            scan_managed_vmm_socket_root(&root, &store, &[&checkpoint], &scan_context()).unwrap(),
+            ManagedVmmSocketRootScan::Residue
+        );
+        assert_eq!(
+            std::fs::read(namespace.join("foreign.receipt.json")).unwrap(),
+            b"foreign"
+        );
+
+        let (temporary, root, checkpoint, store, receipt) = receipt_fixture();
+        let exact_name = receipt_file_name(receipt.runtime_incarnation()).unwrap();
+        let exact_path = receipt_namespace_path(&temporary)
+            .join(std::ffi::OsStr::from_bytes(exact_name.to_bytes()));
+        write_foreign(&exact_path, b"{\"version\":1}");
+        assert_eq!(
+            scan_managed_vmm_socket_root(&root, &store, &[&checkpoint], &scan_context()).unwrap(),
+            ManagedVmmSocketRootScan::Residue
+        );
+        assert_eq!(std::fs::read(exact_path).unwrap(), b"{\"version\":1}");
+
+        let (_temporary, root, _checkpoint, store, receipt) = receipt_fixture();
+        store.publish(&receipt).unwrap();
+        assert_eq!(
+            scan_managed_vmm_socket_root(&root, &store, &[], &scan_context()).unwrap(),
+            ManagedVmmSocketRootScan::Residue
+        );
+
+        let (temporary, root, checkpoint, store, receipt) = receipt_fixture();
+        store.publish(&receipt).unwrap();
+        let name = receipt_file_name(receipt.runtime_incarnation()).unwrap();
+        let original = std::fs::read(
+            receipt_namespace_path(&temporary).join(std::ffi::OsStr::from_bytes(name.to_bytes())),
+        )
+        .unwrap();
+        let (old, new) = replace_receipt_namespace(&temporary, Some((&name, &original)));
+        assert_eq!(
+            scan_managed_vmm_socket_root(&root, &store, &[&checkpoint], &scan_context()).unwrap(),
+            ManagedVmmSocketRootScan::Residue
+        );
+        assert_eq!(
+            std::fs::read(old.join(std::ffi::OsStr::from_bytes(name.to_bytes()))).unwrap(),
+            original
+        );
+        assert!(new
+            .join(std::ffi::OsStr::from_bytes(name.to_bytes()))
+            .is_file());
     }
 
     #[cfg(target_os = "linux")]
