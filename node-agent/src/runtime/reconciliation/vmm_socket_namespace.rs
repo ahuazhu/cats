@@ -339,8 +339,6 @@ impl VmmSocketOwnershipReceiptV1 {
         anyhow::ensure!(
             self.node_id == checkpoint.node_id
                 && self.cat_id == checkpoint.cat_id
-                && self.desired_revision == checkpoint.desired_revision
-                && self.spec_digest == checkpoint.spec_digest
                 && self.placement_epoch == checkpoint.placement_epoch
                 && self.runtime_launch_content_digest == authority.identity_content_digest()?
                 && self.original_checkpoint_digest_matches_if_current_start(checkpoint)?
@@ -401,8 +399,6 @@ impl VmmSocketOwnershipReceiptV1 {
         anyhow::ensure!(
             self.node_id == checkpoint.node_id
                 && self.cat_id == checkpoint.cat_id
-                && self.desired_revision == checkpoint.desired_revision
-                && self.spec_digest == checkpoint.spec_digest
                 && self.placement_epoch == checkpoint.placement_epoch
                 && self.runtime_launch_content_digest == authority.identity_content_digest()?
                 && self.original_checkpoint_digest_matches_if_current_start(checkpoint)?
@@ -422,10 +418,45 @@ impl VmmSocketOwnershipReceiptV1 {
         checkpoint: &RuntimeCheckpoint,
     ) -> anyhow::Result<bool> {
         if checkpoint.step.start_runtime_launch_identity().is_some() {
-            Ok(self.checkpoint_content_digest == checkpoint_content_digest(checkpoint)?)
+            Ok(self.validate_original_launch_checkpoint(checkpoint).is_ok())
         } else {
             Ok(true)
         }
+    }
+
+    /// Bind the immutable receipt fields to the exact StartRuntime bytes
+    /// inherited by the VMM at fd64. Later checkpoint pathnames may advance
+    /// their Desired revision while retaining the same live launch identity;
+    /// those current coordinates are deliberately validated separately by
+    /// `validate_against`.
+    pub(crate) fn validate_original_launch_checkpoint(
+        &self,
+        checkpoint: &RuntimeCheckpoint,
+    ) -> anyhow::Result<()> {
+        let authority = RetainedRuntimeLaunchAuthority::from_start_runtime_checkpoint(checkpoint)?;
+        anyhow::ensure!(
+            self.node_id == checkpoint.node_id
+                && self.cat_id == checkpoint.cat_id
+                && self.desired_revision == checkpoint.desired_revision
+                && self.spec_digest == checkpoint.spec_digest
+                && self.placement_epoch == checkpoint.placement_epoch
+                && self.checkpoint_content_digest == checkpoint_content_digest(checkpoint)?
+                && self.runtime_launch_content_digest == authority.identity_content_digest()?,
+            "VMM socket ownership receipt is not original StartRuntime-exact"
+        );
+        Ok(())
+    }
+
+    pub(crate) fn original_desired_revision(&self) -> Revision {
+        self.desired_revision
+    }
+
+    pub(crate) fn original_spec_digest(&self) -> &Sha256Digest {
+        &self.spec_digest
+    }
+
+    pub(crate) fn original_placement_epoch(&self) -> Epoch {
+        self.placement_epoch
     }
 
     pub(crate) fn encoded_bytes(&self) -> anyhow::Result<Vec<u8>> {
@@ -2510,6 +2541,8 @@ mod tests {
     use std::time::{Duration, Instant};
 
     use cats_api::runtime_reconciliation::{decode_runtime_checkpoint, RuntimeLaunch};
+    #[cfg(target_os = "linux")]
+    use cats_api::runtime_reconciliation::{encode_runtime_checkpoint, StableState};
 
     use super::*;
 
@@ -2849,6 +2882,46 @@ mod tests {
         *vmm_log_path = HostPath::new("/var/log/cats/foreign.log").unwrap();
         assert!(receipt
             .validate_against(&changed_checkpoint, &store.state_directory, &managed_root,)
+            .is_err());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn retained_receipt_accepts_a_higher_revision_running_tail_but_not_launch_drift() {
+        let (_temporary, managed_root, original, store, receipt) = receipt_fixture();
+        assert_eq!(
+            store.publish(&receipt).unwrap(),
+            VmmSocketReceiptPublication::Published
+        );
+
+        let mut current = original.clone();
+        current.desired_revision = Revision::new(original.desired_revision.get() + 1).unwrap();
+        current.spec_digest = Sha256Digest::from_bytes([0x91; 32]);
+        current.stable_state = Some(StableState::Running);
+        current.step = ReconcileStep::Stable {
+            state: StableState::Running,
+        };
+        encode_runtime_checkpoint(&current).unwrap();
+
+        receipt
+            .validate_original_launch_checkpoint(&original)
+            .unwrap();
+        receipt
+            .validate_against(&current, store.state_directory(), &managed_root)
+            .unwrap();
+        assert_eq!(
+            scan_managed_vmm_socket_root(&managed_root, &store, &[&current], &scan_context(),)
+                .unwrap(),
+            ManagedVmmSocketRootScan::Accounted
+        );
+
+        let RuntimeLaunch::Present(identity) = &mut current.runtime_launch else {
+            unreachable!()
+        };
+        identity.process_identity_token =
+            RandomId128::new("cccccccccccccccccccccccccccccccc").unwrap();
+        assert!(receipt
+            .validate_against(&current, store.state_directory(), &managed_root)
             .is_err());
     }
 

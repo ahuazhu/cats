@@ -52,9 +52,10 @@ use super::vmm_api_inspection::{
 use super::vmm_launch_artifacts::{
     RetainedVmmLaunchArtifacts, VmmLaunchArtifactDescriptors, VmmLaunchArtifactPaths,
 };
-use super::vmm_runtime_paths::VmmRuntimePathRequirements;
 #[cfg(target_os = "linux")]
-use super::vmm_runtime_paths::{RetainedVmmRuntimePaths, VmmRuntimePathInspection};
+use super::vmm_runtime_paths::{
+    RetainedVmmRuntimePaths, VmmRuntimePathInspection, VmmRuntimePathRequirements,
+};
 #[cfg(target_os = "linux")]
 use super::vmm_socket_namespace::{
     vmm_state_directory_from_checkpoint, RetainedManagedVmmSocketRoot, VmmSocketOwnershipReceiptV1,
@@ -294,9 +295,10 @@ impl VmmProcessExpectation {
         }
     }
 
+    #[cfg(target_os = "linux")]
     fn runtime_path_requirements(
         &self,
-        original_checkpoint_content_digest: cats_api::runtime_reconciliation::Sha256Digest,
+        receipt: &VmmSocketOwnershipReceiptV1,
     ) -> anyhow::Result<VmmRuntimePathRequirements> {
         let checkpoint_path = self
             .checkpoint_path
@@ -305,7 +307,10 @@ impl VmmProcessExpectation {
         Ok(VmmRuntimePathRequirements {
             checkpoint_path,
             checkpoint: self.checkpoint.clone(),
-            original_checkpoint_content_digest,
+            original_checkpoint_content_digest: receipt.checkpoint_content_digest().clone(),
+            original_desired_revision: receipt.original_desired_revision(),
+            original_spec_digest: receipt.original_spec_digest().clone(),
+            original_placement_epoch: receipt.original_placement_epoch(),
             memory_file_path: self.memory_file_path().clone(),
             memory_bytes: self.launch.memory_bytes,
             serial_log_path: self.serial_log_path().clone(),
@@ -1005,8 +1010,7 @@ fn inspect_vmm_descriptor_authority(
     {
         return Ok(VmmDescriptorInspection::Conflict);
     }
-    let requirements =
-        expected.runtime_path_requirements(receipt.checkpoint_content_digest().clone())?;
+    let requirements = expected.runtime_path_requirements(&receipt)?;
     let runtime = match RetainedVmmRuntimePaths::open(&requirements, process_id)? {
         VmmRuntimePathInspection::Exact(runtime) => runtime,
         VmmRuntimePathInspection::Conflict => return Ok(VmmDescriptorInspection::Conflict),

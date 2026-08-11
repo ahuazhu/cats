@@ -1406,6 +1406,9 @@ pub(crate) struct VmmRuntimePathRequirements {
     pub(crate) checkpoint_path: HostPath,
     pub(crate) checkpoint: RuntimeCheckpoint,
     pub(crate) original_checkpoint_content_digest: Sha256Digest,
+    pub(crate) original_desired_revision: cats_api::runtime_reconciliation::Revision,
+    pub(crate) original_spec_digest: Sha256Digest,
+    pub(crate) original_placement_epoch: cats_api::runtime_reconciliation::Epoch,
     pub(crate) memory_file_path: HostPath,
     pub(crate) memory_bytes: u64,
     pub(crate) serial_log_path: HostPath,
@@ -1679,6 +1682,18 @@ impl PinnedRuntimeDescriptor {
             checkpoint_content_digest(&checkpoint)?
                 == requirements.original_checkpoint_content_digest,
             "inherited StartRuntime checkpoint digest differs from durable receipt"
+        );
+        anyhow::ensure!(
+            checkpoint.desired_revision == requirements.original_desired_revision,
+            "inherited StartRuntime revision differs from durable receipt"
+        );
+        anyhow::ensure!(
+            checkpoint.spec_digest == requirements.original_spec_digest,
+            "inherited StartRuntime spec digest differs from durable receipt"
+        );
+        anyhow::ensure!(
+            checkpoint.placement_epoch == requirements.original_placement_epoch,
+            "inherited StartRuntime placement differs from durable receipt"
         );
         let current = RetainedRuntimeLaunchAuthority::from_checkpoint(&requirements.checkpoint)?;
         anyhow::ensure!(
@@ -2105,7 +2120,7 @@ mod tests {
     };
     #[cfg(target_os = "linux")]
     use cats_api::runtime_reconciliation::{
-        encode_runtime_checkpoint, Epoch, Generation, Id, RemoteHead, StableState,
+        encode_runtime_checkpoint, Epoch, Generation, Id, RemoteHead, Revision, StableState,
     };
     use std::io::Write as _;
     use std::os::unix::fs::{MetadataExt as _, OpenOptionsExt as _};
@@ -2146,6 +2161,9 @@ mod tests {
         tail: RunningTail,
     ) -> RuntimeCheckpoint {
         let mut checkpoint = launch_checkpoint.clone();
+        checkpoint.desired_revision =
+            Revision::new(launch_checkpoint.desired_revision.get() + 1).unwrap();
+        checkpoint.spec_digest = Sha256Digest::from_bytes([0x92; 32]);
         checkpoint.step = match tail {
             RunningTail::Format => ReconcileStep::FormatFilesystem {
                 volume_id: Id::new("vol_root").unwrap(),
@@ -2289,6 +2307,9 @@ mod tests {
             checkpoint_path: HostPath::new(checkpoint_path.to_str().unwrap().to_owned()).unwrap(),
             checkpoint: current,
             original_checkpoint_content_digest: receipt_digest,
+            original_desired_revision: original.desired_revision,
+            original_spec_digest: original.spec_digest.clone(),
+            original_placement_epoch: original.placement_epoch,
             memory_file_path,
             memory_bytes,
             serial_log_path,
