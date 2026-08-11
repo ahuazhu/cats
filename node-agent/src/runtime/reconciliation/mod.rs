@@ -76,6 +76,14 @@ mod vmm_launch_artifacts;
     reason = "retained VMM runtime paths are staged before exact process composition"
 )]
 mod vmm_runtime_paths;
+// A StartRuntime attempt must own its API/vsock namespace before the fixed
+// launcher or PID 1 can create anything.  This provider-private WAL and
+// descriptor-rooted namespace land before the production effect consumes it.
+#[expect(
+    dead_code,
+    reason = "managed VMM socket ownership awaits StartRuntime effect composition"
+)]
+mod vmm_socket_namespace;
 // Cloud Hypervisor v53 exposes its live shape through a local HTTP API.  This
 // provider-private adapter freezes the exact wire schema, socket ownership,
 // SO_PEERCRED and deadline bounds before the process scanner composes it into
@@ -162,6 +170,10 @@ pub(crate) use signed_root_provision::{
     SignedRunningEffect, SignedRunningHostConfig, SignedRunningProcessPorts,
 };
 pub(crate) use signed_running::{SignedRunningAcquireEffect, SignedRunningPublicationRecovery};
+#[allow(unused_imports)]
+pub(crate) use vmm_socket_namespace::{
+    ManagedVmmSocketPaths, ManagedVmmSocketRoot, INSTALLED_VMM_SOCKET_ROOT,
+};
 // This crate-private seam is landed before the systemd composition that
 // consumes it; keeping the re-export here prevents feature code from reaching
 // through the module path while preserving the sealed boundary.
