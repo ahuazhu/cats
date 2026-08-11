@@ -6901,8 +6901,10 @@ fn errno() -> libc::c_int {
 #[cfg(test)]
 mod tests {
     use std::collections::VecDeque;
+    use std::os::unix::ffi::OsStrExt as _;
     use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
-    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::os::unix::io::AsRawFd as _;
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::sync::Mutex;
     use std::time::{Duration, Instant};
 
@@ -6934,9 +6936,10 @@ mod tests {
     use tempfile::TempDir;
 
     use crate::runtime_spine::{
-        RuntimeDesiredEffectAdmission, RuntimeDesiredEffectContext, RuntimeInventoryScanOutcome,
-        RuntimeInventoryScanner, RuntimePhysicalReadContext, RuntimePreScanRecovery,
-        RuntimePreScanRecoveryContext, RuntimePreScanRecoveryOutcome, RuntimeSpineFullScan,
+        RuntimeDesiredEffectAdmission, RuntimeDesiredEffectContext, RuntimeDesiredEffectOutcome,
+        RuntimeInventoryScanOutcome, RuntimeInventoryScanner, RuntimePhysicalReadContext,
+        RuntimePreScanRecovery, RuntimePreScanRecoveryContext, RuntimePreScanRecoveryOutcome,
+        RuntimeSpineFullScan,
     };
 
     use super::super::inventory::{
@@ -6948,8 +6951,8 @@ mod tests {
         ProvisionHeadRead, SignedRunningPublicationRecovery,
     };
     use super::super::{
-        AuthorizedBlockdStore, FileCheckpointStore, NodeGlobalManagedProcessScanAdmission,
-        NodeGlobalNetworkScanAdmission, StoredCheckpoint,
+        runtime_checkpoint_path, AuthorizedBlockdStore, FileCheckpointStore,
+        NodeGlobalManagedProcessScanAdmission, NodeGlobalNetworkScanAdmission, StoredCheckpoint,
     };
     #[cfg(target_os = "linux")]
     use super::super::{ManagedVmmLaunchFilePaths, VmmSocketOwnershipReceiptV1};
@@ -7444,6 +7447,36 @@ mod tests {
         exact_record: Option<cats_storage::authority::VolumeRecord>,
         delay: Duration,
         calls: Arc<Mutex<Vec<Id>>>,
+    }
+
+    struct ExactVolumeSetDataAuthority {
+        records: BTreeMap<Id, VolumeRecord>,
+    }
+
+    impl VolumeDataAuthority for ExactVolumeSetDataAuthority {
+        fn load_volume(
+            &self,
+            volume_id: &Id,
+        ) -> cats_storage::authority::Result<cats_storage::authority::VolumeRecord> {
+            self.records
+                .get(volume_id)
+                .cloned()
+                .ok_or(cats_storage::authority::AuthorityError::NotFound)
+        }
+
+        fn renew_lease(
+            &self,
+            _request: &cats_storage::authority::RenewLeaseRequest,
+        ) -> cats_storage::authority::Result<cats_storage::authority::RenewLeaseResult> {
+            Err(cats_storage::authority::AuthorityError::BackendUnknown)
+        }
+
+        fn compare_and_swap_head(
+            &self,
+            _request: &cats_storage::authority::VolumeHeadCasRequest,
+        ) -> cats_storage::authority::Result<cats_storage::authority::VolumeHeadCasResult> {
+            Err(cats_storage::authority::AuthorityError::BackendUnknown)
+        }
     }
 
     impl TestVolumeDataAuthority {
@@ -8311,6 +8344,15 @@ mod tests {
 
     struct ExactRunningGuestReadyPort {
         calls: Arc<AtomicUsize>,
+        fault: RunningGuestReadyFault,
+    }
+
+    #[derive(Debug, Clone, Copy)]
+    enum RunningGuestReadyFault {
+        Exact,
+        MissingPersistent,
+        DuplicateRootMount,
+        ForeignPersistentUuid,
     }
 
     impl super::super::GuestReadyTransportPort for ExactRunningGuestReadyPort {
@@ -8321,8 +8363,6 @@ mod tests {
             request: RuntimeReadyRequestV1,
         ) -> anyhow::Result<RuntimeReadyResponseV1> {
             self.calls.fetch_add(1, Ordering::SeqCst);
-            let filesystem_uuid = RandomId128::new("eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee")
-                .context("test filesystem UUID")?;
             let devices = launch
                 .devices
                 .iter()
@@ -8337,7 +8377,12 @@ mod tests {
                         device_major: 252,
                         device_minor: u32::from(prepared.guest_device.slot),
                         size_bytes: prepared.size_bytes,
-                        filesystem_uuid: filesystem_uuid.clone(),
+                        filesystem_uuid: RandomId128::new(if prepared.guest_device.slot == 0 {
+                            "dddddddddddddddddddddddddddddddd"
+                        } else {
+                            "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee"
+                        })
+                        .context("test filesystem UUID")?,
                     })
                 })
                 .collect::<anyhow::Result<Vec<_>>>()?;
@@ -8359,7 +8404,7 @@ mod tests {
                     access: MountAccess::ReadWrite,
                 })
                 .collect();
-            Ok(RuntimeReadyResponseV1 {
+            let mut response = RuntimeReadyResponseV1 {
                 version: request.version,
                 challenge: request.challenge,
                 runtime_incarnation: request.runtime_incarnation,
@@ -8374,7 +8419,57 @@ mod tests {
                     .context("test Guest boot ID")?,
                 devices,
                 mounts,
-            })
+            };
+            match self.fault {
+                RunningGuestReadyFault::Exact => {}
+                RunningGuestReadyFault::MissingPersistent => {
+                    anyhow::ensure!(response.mounts.len() > 1, "fault needs Persistent mount");
+                    response.mounts.pop();
+                }
+                RunningGuestReadyFault::DuplicateRootMount => {
+                    anyhow::ensure!(response.mounts.len() > 1, "fault needs Persistent mount");
+                    response.mounts[1] = response.mounts[0].clone();
+                }
+                RunningGuestReadyFault::ForeignPersistentUuid => {
+                    anyhow::ensure!(response.mounts.len() > 1, "fault needs Persistent mount");
+                    let foreign = RandomId128::new("ffffffffffffffffffffffffffffffff")
+                        .context("foreign test filesystem UUID")?;
+                    response.devices[1].filesystem_uuid = foreign.clone();
+                    response.mounts[1].filesystem_uuid = foreign;
+                }
+            }
+            Ok(response)
+        }
+    }
+
+    struct LaunchOrderedGuestReadyPort {
+        launch_revalidated: Arc<AtomicBool>,
+        prepared_checkpoint_path: PathBuf,
+        inner: ExactRunningGuestReadyPort,
+    }
+
+    impl super::super::GuestReadyTransportPort for LaunchOrderedGuestReadyPort {
+        fn challenge(
+            &self,
+            context: &dyn RuntimePhysicalReadContext,
+            launch: &cats_api::runtime_reconciliation::RuntimeLaunchIdentity,
+            request: RuntimeReadyRequestV1,
+        ) -> anyhow::Result<RuntimeReadyResponseV1> {
+            anyhow::ensure!(
+                self.launch_revalidated.load(Ordering::SeqCst),
+                "Guest mounted-set challenge preceded Host authority revalidation"
+            );
+            let prepared = decode_runtime_checkpoint(
+                &std::fs::read(&self.prepared_checkpoint_path)
+                    .context("read prepared admission checkpoint")?,
+            )
+            .context("decode prepared admission checkpoint")?;
+            anyhow::ensure!(
+                matches!(prepared.step, ReconcileStep::OpenAdmission { .. })
+                    && prepared.lifecycle_admission == LifecycleAdmission::Closed,
+                "Guest mounted-set challenge preceded durable gate preparation"
+            );
+            self.inner.challenge(context, launch, request)
         }
     }
 
@@ -9579,16 +9674,10 @@ mod tests {
         enum Drift {
             Owner,
             Head,
-            LeaseExpiry,
             AcquireMarker,
         }
 
-        for drift in [
-            Drift::Owner,
-            Drift::Head,
-            Drift::LeaseExpiry,
-            Drift::AcquireMarker,
-        ] {
+        for drift in [Drift::Owner, Drift::Head, Drift::AcquireMarker] {
             let environment = TestEnvironment::new();
             let scan_context = assigned_context(true);
             let desired = scan_context.coordinates().desired.desired_specs[0].clone();
@@ -9605,14 +9694,6 @@ mod tests {
                         root_hash: Some(Sha256Digest::from_bytes([3; 32])),
                         root_object_id: Some(AsciiText::new("roots/drift").unwrap()),
                     };
-                }
-                Drift::LeaseExpiry => {
-                    record.lease_expires_at = Some(
-                        cats_storage::authority::UnixMillis::new(
-                            attachment.lease_expires_at.get() + 1,
-                        )
-                        .unwrap(),
-                    );
                 }
                 Drift::AcquireMarker => {
                     let Some(cats_storage::authority::LastVolumeTransition::NormalAcquire {
@@ -11957,6 +12038,7 @@ mod tests {
                 registry,
                 Arc::new(ExactRunningGuestReadyPort {
                     calls: Arc::clone(&guest_calls),
+                    fault: RunningGuestReadyFault::Exact,
                 }),
             );
         let coordinates = fixture.scan_context.coordinates().clone();
@@ -12019,6 +12101,7 @@ mod tests {
                 absent_registry,
                 Arc::new(ExactRunningGuestReadyPort {
                     calls: Arc::clone(&absent_guest_calls),
+                    fault: RunningGuestReadyFault::Exact,
                 }),
             );
         let RuntimeInventoryScanOutcome::Complete(mut absent_inventory) = absent_scanner
@@ -12033,6 +12116,557 @@ mod tests {
             cats_api::runtime_reconciliation::GuestTransportEvidence::Unavailable
         ));
         assert!(absent_inventory.take_running_tail_admission().is_none());
+    }
+
+    #[derive(Debug, Clone, Copy)]
+    enum RunningFrontendFixture {
+        VhostUserBlk,
+        KernelNbd,
+    }
+
+    #[test]
+    fn full_scanner_seals_exact_root_and_persistent_vhost_mount_set() {
+        assert_full_scanner_seals_exact_root_and_persistent_mount_set(
+            RunningFrontendFixture::VhostUserBlk,
+        );
+    }
+
+    #[test]
+    fn full_scanner_seals_exact_root_and_persistent_kernel_nbd_mount_set() {
+        assert_full_scanner_seals_exact_root_and_persistent_mount_set(
+            RunningFrontendFixture::KernelNbd,
+        );
+    }
+
+    fn assert_full_scanner_seals_exact_root_and_persistent_mount_set(
+        frontend_fixture: RunningFrontendFixture,
+    ) {
+        let environment = TestEnvironment::new();
+        let template = decode_runtime_checkpoint(include_bytes!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../testdata/runtime-reconciliation-v1-start-runtime-checkpoint.json"
+        )))
+        .unwrap();
+        let ReconcileStep::StartRuntime {
+            guest_config_digest,
+            ..
+        } = &template.step
+        else {
+            panic!("StartRuntime template")
+        };
+        let mut scan_context = assigned_context_with_root_and_persistent();
+        let desired = &mut scan_context.coordinates_mut().desired.desired_specs[0];
+        desired.cat_id = Id::new("c1").unwrap();
+        for (volume, ids) in desired.volumes.iter_mut().zip([
+            ("via", "dr", "vr", "ar", "root"),
+            ("viz", "dp", "vp", "ap", "data"),
+        ]) {
+            volume.volume_intent_id = Id::new(ids.0).unwrap();
+            volume.disk_id = Id::new(ids.1).unwrap();
+            volume.volume_id = Id::new(ids.2).unwrap();
+            volume.attachment_id = Id::new(ids.3).unwrap();
+            volume.guest_device.serial = Id::new(ids.4).unwrap();
+        }
+        desired.runtime.guest_config_digest = guest_config_digest.clone();
+        desired.spec_digest = spec_digest(desired).unwrap();
+        let desired = desired.clone();
+        let kernel_nbd_client =
+            matches!(frontend_fixture, RunningFrontendFixture::KernelNbd).then(|| {
+                let path = environment.state.parent().unwrap().join("nbd-client");
+                std::fs::write(&path, b"fixture").unwrap();
+                std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+                let allocation_lock = environment.state.join("kernel-nbd-allocation.lock");
+                std::fs::write(&allocation_lock, []).unwrap();
+                std::fs::set_permissions(&allocation_lock, std::fs::Permissions::from_mode(0o600))
+                    .unwrap();
+                let allocation_lock_file = std::fs::OpenOptions::new()
+                    .read(true)
+                    .write(true)
+                    .open(&allocation_lock)
+                    .unwrap();
+                // SAFETY: these calls only read the current process credentials.
+                let effective_user_id = unsafe { libc::geteuid() };
+                // SAFETY: these calls only read the current process credentials.
+                let effective_group_id = unsafe { libc::getegid() };
+                // SAFETY: the fixture owns this live descriptor and -1 keeps
+                // its uid unchanged while aligning gid with this process.
+                let chown_result = unsafe {
+                    libc::fchown(
+                        allocation_lock_file.as_raw_fd(),
+                        libc::uid_t::MAX,
+                        effective_group_id,
+                    )
+                };
+                assert_eq!(chown_result, 0);
+                let metadata = std::fs::metadata(&allocation_lock).unwrap();
+                assert_eq!(
+                    (
+                        metadata.nlink(),
+                        metadata.mode() & 0o7777,
+                        metadata.uid(),
+                        metadata.gid(),
+                        metadata.len(),
+                    ),
+                    (1, 0o600, effective_user_id, effective_group_id, 0),
+                    "kernel-NBD fixture allocation lock metadata",
+                );
+                path
+            });
+
+        let mut records = BTreeMap::new();
+        let mut attachments = Vec::new();
+        let mut devices = Vec::new();
+        let mut listeners = Vec::new();
+        for index in 0..desired.volumes.len() {
+            let (mut record, mut attachment) =
+                exact_owned_record_and_attachment_for(&desired, index);
+            let head = RemoteHead {
+                generation: Generation::new(1).unwrap(),
+                root_hash: Some(Sha256Digest::from_bytes(
+                    [u8::try_from(index + 1).unwrap(); 32],
+                )),
+                root_object_id: Some(
+                    AsciiText::new(format!(
+                        "roots/{}",
+                        desired.volumes[index].volume_id.as_str()
+                    ))
+                    .unwrap(),
+                ),
+            };
+            record.head = head.clone();
+            attachment.head = head;
+            let data = prepare_exact_lineage_for(&environment, &desired, index, &attachment);
+            install_exact_control_only_files(&data, attachment.size_bytes);
+            let mut device =
+                direct_vhost_prepared_device(&environment, &desired, index, &attachment, &data);
+            if matches!(frontend_fixture, RunningFrontendFixture::KernelNbd) {
+                device.frontend = PrepareDeviceFrontend::KernelNbd {
+                    listener_socket_path: HostPath::new(
+                        data.join("serving-nbd.sock").to_string_lossy().into_owned(),
+                    )
+                    .unwrap(),
+                    device_path: HostPath::new(format!("/dev/nbd{index}")).unwrap(),
+                    direct: false,
+                };
+            }
+            let control = std::os::unix::net::UnixListener::bind(
+                device.serving_process.control_socket_path.as_str(),
+            )
+            .unwrap();
+            let frontend_path = match &device.frontend {
+                PrepareDeviceFrontend::VhostUserBlk { socket_path, .. } => socket_path,
+                PrepareDeviceFrontend::KernelNbd {
+                    listener_socket_path,
+                    ..
+                } => listener_socket_path,
+            };
+            let frontend = std::os::unix::net::UnixListener::bind(frontend_path.as_str()).unwrap();
+            for path in [
+                device.serving_process.control_socket_path.as_str(),
+                frontend_path.as_str(),
+            ] {
+                std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700)).unwrap();
+            }
+            if let (RunningFrontendFixture::KernelNbd, Some(client)) =
+                (frontend_fixture, kernel_nbd_client.as_ref())
+            {
+                let pid = 201_u32 + u32::try_from(index).unwrap();
+                let slot = environment.block_root.join(format!("nbd{index}"));
+                std::fs::create_dir(&slot).unwrap();
+                std::fs::write(slot.join("pid"), format!("{pid}\n")).unwrap();
+                std::fs::write(
+                    slot.join("size"),
+                    format!("{}\n", attachment.size_bytes / 512),
+                )
+                .unwrap();
+                let process = environment.proc_root.join(pid.to_string());
+                std::fs::create_dir(&process).unwrap();
+                let mut fields = vec!["S".to_owned()];
+                fields.extend((0..18).map(|_| "0".to_owned()));
+                fields.push((700_u64 + u64::from(pid)).to_string());
+                fields.extend((0..4).map(|_| "0".to_owned()));
+                std::fs::write(
+                    process.join("stat"),
+                    format!("{pid} (nbd-client) {}\n", fields.join(" ")),
+                )
+                .unwrap();
+                std::os::unix::fs::symlink(client, process.join("exe")).unwrap();
+                let PrepareDeviceFrontend::KernelNbd {
+                    listener_socket_path,
+                    device_path,
+                    ..
+                } = &device.frontend
+                else {
+                    unreachable!()
+                };
+                let arguments: [&[u8]; 9] = [
+                    client.as_os_str().as_bytes(),
+                    b"-nonetlink",
+                    b"-unix",
+                    listener_socket_path.as_str().as_bytes(),
+                    device_path.as_str().as_bytes(),
+                    b"-b",
+                    b"512",
+                    b"-N",
+                    b"",
+                ];
+                let mut command_line = Vec::new();
+                for argument in arguments {
+                    command_line.extend_from_slice(argument);
+                    command_line.push(0);
+                }
+                std::fs::write(process.join("cmdline"), command_line).unwrap();
+            }
+            records.insert(record.volume_id.clone(), record);
+            attachments.push(attachment);
+            devices.push(device);
+            listeners.extend([control, frontend]);
+        }
+
+        let planned = crate::ch::plan_network(&desired.runtime.network_config).unwrap();
+        let network = RuntimeNetworkIdentity {
+            network_config: planned.config,
+            tap_name: Id::new(planned.tap).unwrap(),
+            ownership_token: planned.ownership_token,
+        };
+        let mut predecessor = acquire_checkpoint(
+            &desired,
+            &desired.volumes[0],
+            RuntimeVolumeTransition::Acquire {
+                request: attachments[0].checkpoint_acquire_request(),
+            },
+            UnixMillis::new(9_000).unwrap(),
+        );
+        predecessor.step = ReconcileStep::PrepareNetwork {
+            network: network.clone(),
+            devices: devices.clone(),
+        };
+        predecessor.volumes = devices
+            .iter()
+            .zip(&attachments)
+            .enumerate()
+            .map(|(index, (device, attachment))| {
+                prepared_owned_observed_volume(
+                    &desired.volumes[index],
+                    attachment,
+                    device.serving_process.data_directory.clone(),
+                )
+            })
+            .collect();
+        predecessor
+            .volumes
+            .sort_by(|left, right| left.volume_id.cmp(&right.volume_id));
+        let checkpoint_store = FileCheckpointStore::open(
+            &environment.state.join(CHECKPOINT_NAMESPACE),
+            &desired.cat_id,
+        )
+        .unwrap();
+        let stored_predecessor = checkpoint_store.create(&predecessor).unwrap();
+
+        let ReconcileStep::StartRuntime {
+            launcher_executable,
+            boot,
+            ..
+        } = template.step
+        else {
+            panic!("StartRuntime template")
+        };
+        let runtime_incarnation = RandomId128::new("55555555555555555555555555555555").unwrap();
+        let socket_paths = super::super::ManagedVmmSocketRoot::installed()
+            .paths_for(&runtime_incarnation)
+            .unwrap();
+        let state_directory = StateDirectory::unanchored(environment.state.clone());
+        let launch_file_paths = super::super::ManagedVmmLaunchFilePaths::for_incarnation(
+            &state_directory,
+            &runtime_incarnation,
+        )
+        .unwrap();
+        let network_projection = ObservedNetwork {
+            kind: network.network_config.kind,
+            network_id: network.network_config.network_id.clone(),
+            guest_mac: network.network_config.guest_mac.clone(),
+            guest_ipv4: network.network_config.guest_ipv4.clone(),
+            prefix_length: network.network_config.prefix_length,
+            gateway_ipv4: network.network_config.gateway_ipv4.clone(),
+            tap_name: network.tap_name.clone(),
+            ownership_token: OwnershipTokenEvidence::Valid {
+                ownership_token: network.ownership_token.clone(),
+            },
+        };
+        let start = super::super::vmm_start_runtime::build_start_runtime_successor(
+            &predecessor,
+            &desired,
+            runtime_incarnation,
+            RandomId128::new("66666666666666666666666666666666").unwrap(),
+            3,
+            super::super::vmm_start_runtime::StartRuntimeCheckpointAuthority {
+                launcher_executable: *launcher_executable,
+                boot: *boot,
+                network_projection,
+                socket_paths: &socket_paths,
+                launch_file_paths: &launch_file_paths,
+            },
+            UnixMillis::new(predecessor.updated_at_unix_ms.get() + 1).unwrap(),
+        )
+        .unwrap();
+        checkpoint_store
+            .replace(&stored_predecessor, &start)
+            .unwrap();
+        drop(checkpoint_store);
+
+        let registry = AdmissionCellRegistry::for_state_directory(&state_directory);
+        let guest_calls = Arc::new(AtomicUsize::new(0));
+        let build_scanner = |fault| {
+            let authority: Arc<dyn VolumeDataAuthority> = Arc::new(ExactVolumeSetDataAuthority {
+                records: records.clone(),
+            });
+            let bridge = Arc::new(ExactRunningProcessBridge {
+                state_directory: state_directory.clone(),
+                systemd: test_root_provision_systemd(&environment.blockd_binary),
+                executable_path: HostPath::new(
+                    environment.blockd_binary.to_string_lossy().into_owned(),
+                )
+                .unwrap(),
+                exact_vmms: true,
+            });
+            let mut config = environment.config();
+            if let Some(client) = &kernel_nbd_client {
+                config.kernel_nbd_inventory_port = Some(KernelNbdInventoryPort::new(
+                    KernelNbdInventoryConfig::fixture(
+                        state_directory.clone(),
+                        environment.block_root.clone(),
+                        environment.proc_root.clone(),
+                        client.clone(),
+                        u32::try_from(desired.volumes.len()).unwrap(),
+                    ),
+                ));
+            }
+            scanner_with_metadata_authority_and_blob(
+                config,
+                Arc::new(VolumeDataAuthorityMetadataReader::start(authority).unwrap()),
+                None,
+            )
+            .unwrap()
+            .with_root_process_bridge_for_test(bridge)
+            .with_network_bridge(Arc::new(ExactRunningNetworkBridge))
+            .with_running_tail_transport_for_test(
+                Arc::clone(&registry),
+                Arc::new(ExactRunningGuestReadyPort {
+                    calls: Arc::clone(&guest_calls),
+                    fault,
+                }),
+            )
+        };
+
+        let RuntimeInventoryScanOutcome::Complete(mut inventory) =
+            build_scanner(RunningGuestReadyFault::Exact)
+                .scan_complete(scan_context.clone())
+                .unwrap()
+        else {
+            panic!("exact Root + Persistent physical set must complete")
+        };
+        assert_eq!(guest_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(inventory.runtimes()[0].volumes.len(), 2);
+        assert_eq!(inventory.runtimes()[0].mounts.len(), 2);
+        assert_eq!(inventory.runtimes()[0].processes.len(), 3);
+        let bind_inventory = |inventory: &mut crate::runtime_spine::CompleteRuntimeInventory| {
+            let process_scan = inventory
+                .take_node_global_process_admission()
+                .expect("full Running scan process authority");
+            let network_scan = inventory
+                .take_node_global_network_admission()
+                .expect("full Running scan network authority");
+            let tail_scan = inventory
+                .take_running_tail_admission()
+                .expect("full Running scan mounted-set authority");
+            let coordinates = scan_context.coordinates().clone();
+            let mut observation = NodeObservation {
+                version: ContractVersion::V1,
+                observation_id: RandomId128::new("abababababababababababababababab").unwrap(),
+                node_id: coordinates.session.node_id.clone(),
+                node_boot_id: coordinates.session.node_boot_id.clone(),
+                agent_instance_id: coordinates.session.agent_instance_id.clone(),
+                agent_session_epoch: coordinates.session.agent_session_epoch,
+                heartbeat_sequence: coordinates.heartbeat_sequence,
+                observed_at_unix_ms: inventory.observed_at_unix_ms(),
+                complete_inventory: true,
+                inventory_epoch: coordinates.inventory_epoch,
+                inventory_digest: Some(Sha256Digest::from_bytes([0; 32])),
+                inventory_read_position: Some(coordinates.desired.read_position),
+                key_ring_version: None,
+                key_ring_digest: None,
+                loaded_kids: Vec::new(),
+                runtimes: inventory.runtimes().to_vec(),
+                residue: inventory.residue().to_vec(),
+            };
+            observation.inventory_digest = Some(inventory_digest(&observation).unwrap());
+            let process = process_scan.bind(&observation).unwrap();
+            let network = network_scan.bind(&observation).unwrap();
+            let tail = tail_scan.bind(&observation).unwrap();
+            let session = AgentSession {
+                version: ContractVersion::V1,
+                node_id: observation.node_id.clone(),
+                immutable_host_id: Id::new("host_test").unwrap(),
+                node_boot_id: observation.node_boot_id.clone(),
+                agent_instance_id: observation.agent_instance_id.clone(),
+                agent_session_epoch: observation.agent_session_epoch,
+                registration_attempt_id: RandomId128::new("cdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcd")
+                    .unwrap(),
+                guest_config_digest: desired.runtime.guest_config_digest.clone(),
+                lease_deadline_unix_ms: UnixMillis::new(
+                    observation.observed_at_unix_ms.get() + 60_000,
+                )
+                .unwrap(),
+            };
+            let attestation = AdmissionInventoryAttestation {
+                version: ContractVersion::V1,
+                node_id: observation.node_id.clone(),
+                agent_session_epoch: observation.agent_session_epoch,
+                inventory_epoch: observation.inventory_epoch,
+                inventory_digest: observation.inventory_digest.clone().unwrap(),
+                inventory_read_position: observation.inventory_read_position.unwrap(),
+                accepted_at_unix_ms: UnixMillis::new(observation.observed_at_unix_ms.get() + 1)
+                    .unwrap(),
+            };
+            let admission =
+                RuntimeDesiredEffectAdmission::for_test(session, observation.clone(), attestation)
+                    .bind_assigned_cats_for_test(&coordinates.desired)
+                    .with_running_tail_for_test(tail);
+            RuntimeDesiredEffectContext::for_test_with_admission(
+                state_directory.clone(),
+                Instant::now() + Duration::from_secs(5),
+                admission,
+            )
+            .with_node_global_process_for_test(process)
+            .with_node_global_network_for_test(network)
+        };
+        if matches!(frontend_fixture, RunningFrontendFixture::VhostUserBlk) {
+            let context = bind_inventory(&mut inventory);
+            let launch_revalidated = Arc::new(AtomicBool::new(false));
+            let launch_hook_flag = Arc::clone(&launch_revalidated);
+            let fresh_guest_calls = Arc::new(AtomicUsize::new(0));
+            let checkpoint_path = runtime_checkpoint_path(
+                &environment.state.join(CHECKPOINT_NAMESPACE),
+                &desired.cat_id,
+            );
+            let fresh_guest = Arc::new(LaunchOrderedGuestReadyPort {
+                launch_revalidated: Arc::clone(&launch_revalidated),
+                prepared_checkpoint_path: checkpoint_path.clone(),
+                inner: ExactRunningGuestReadyPort {
+                    calls: Arc::clone(&fresh_guest_calls),
+                    fault: RunningGuestReadyFault::ForeignPersistentUuid,
+                },
+            });
+            let before = std::fs::read(&checkpoint_path).unwrap();
+            let effect = super::super::RunningAdmissionEffect::new(Arc::clone(&registry))
+                .with_physical_revalidation_for_test(
+                    fresh_guest,
+                    Arc::new(move |_, _, _, _, _| {
+                        launch_hook_flag.store(true, Ordering::SeqCst);
+                        Ok(())
+                    }),
+                );
+            let error = effect
+                .try_apply(&context, &desired)
+                .expect_err("changed Persistent UUID opened Running admission");
+            let error_chain = format!("{error:#}");
+            assert!(
+                error_chain.contains("Persistent mount differs"),
+                "{error_chain}"
+            );
+            assert_eq!(fresh_guest_calls.load(Ordering::SeqCst), 1);
+            assert!(launch_revalidated.load(Ordering::SeqCst));
+            assert_eq!(
+                registry
+                    .get(&desired.cat_id)
+                    .expect("effect creates one fail-closed cell")
+                    .snapshot()
+                    .lifecycle_admission(),
+                LifecycleAdmission::Closed,
+            );
+            let after = std::fs::read(&checkpoint_path).unwrap();
+            assert_ne!(after, before);
+            let prepared = decode_runtime_checkpoint(&after).unwrap();
+            assert!(matches!(prepared.step, ReconcileStep::OpenAdmission { .. }));
+            assert_eq!(prepared.lifecycle_admission, LifecycleAdmission::Closed);
+        }
+
+        let mut success_inventory =
+            if matches!(frontend_fixture, RunningFrontendFixture::VhostUserBlk) {
+                let RuntimeInventoryScanOutcome::Complete(inventory) =
+                    build_scanner(RunningGuestReadyFault::Exact)
+                        .scan_complete(scan_context.clone())
+                        .unwrap()
+                else {
+                    panic!("prepared vhost admission did not rescan exactly")
+                };
+                inventory
+            } else {
+                inventory
+            };
+        let success_context = bind_inventory(&mut success_inventory);
+        let success_launch_revalidated = Arc::new(AtomicBool::new(false));
+        let success_launch_hook = Arc::clone(&success_launch_revalidated);
+        let success_guest_calls = Arc::new(AtomicUsize::new(0));
+        let checkpoint_path = runtime_checkpoint_path(
+            &environment.state.join(CHECKPOINT_NAMESPACE),
+            &desired.cat_id,
+        );
+        let success_guest = Arc::new(LaunchOrderedGuestReadyPort {
+            launch_revalidated: Arc::clone(&success_launch_revalidated),
+            prepared_checkpoint_path: checkpoint_path.clone(),
+            inner: ExactRunningGuestReadyPort {
+                calls: Arc::clone(&success_guest_calls),
+                fault: RunningGuestReadyFault::Exact,
+            },
+        });
+        let success_effect = super::super::RunningAdmissionEffect::new(Arc::clone(&registry))
+            .with_physical_revalidation_for_test(
+                success_guest,
+                Arc::new(move |_, _, _, _, _| {
+                    success_launch_hook.store(true, Ordering::SeqCst);
+                    Ok(())
+                }),
+            );
+        assert!(matches!(
+            success_effect
+                .try_apply(&success_context, &desired)
+                .unwrap(),
+            Some(RuntimeDesiredEffectOutcome::RefreshInventory)
+        ));
+        assert_eq!(success_guest_calls.load(Ordering::SeqCst), 1);
+        assert!(success_launch_revalidated.load(Ordering::SeqCst));
+        assert_eq!(
+            registry
+                .get(&desired.cat_id)
+                .expect("exact mounted set opens one admission cell")
+                .snapshot()
+                .lifecycle_admission(),
+            LifecycleAdmission::Open,
+        );
+        let stable = decode_runtime_checkpoint(&std::fs::read(checkpoint_path).unwrap()).unwrap();
+        assert!(matches!(
+            stable.step,
+            ReconcileStep::Stable {
+                state: cats_api::runtime_reconciliation::StableState::Running
+            }
+        ));
+
+        for fault in [
+            RunningGuestReadyFault::MissingPersistent,
+            RunningGuestReadyFault::DuplicateRootMount,
+            RunningGuestReadyFault::ForeignPersistentUuid,
+        ] {
+            let RuntimeInventoryScanOutcome::Complete(mut inventory) = build_scanner(fault)
+                .scan_complete(scan_context.clone())
+                .unwrap()
+            else {
+                panic!("invalid Guest mount set is exact closed progress")
+            };
+            assert!(inventory.runtimes()[0].mounts.is_empty());
+            assert!(inventory.take_running_tail_admission().is_none());
+        }
+        drop(listeners);
     }
 
     #[test]

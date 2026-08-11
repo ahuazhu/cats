@@ -149,6 +149,8 @@ pub enum GateReconcileError {
     Snapshot(#[from] SnapshotError),
     #[error("AdmissionGatePort failed after the checkpoint was durable: {0}")]
     Port(#[from] GatePortError),
+    #[error("final admission authority barrier failed")]
+    AdmissionBarrier(#[source] anyhow::Error),
     #[error("checkpoint does not hold the expected RequireIdle state")]
     WrongRequireIdleCheckpoint,
     #[error("post-close Busy can only be recorded while every gate is closed")]
@@ -291,6 +293,19 @@ impl<'a, P: AdmissionGatePort> GateSequencer<'a, P> {
         desired: &DesiredRuntimeSpec,
         times: PersistTimes,
     ) -> Result<GateTransitionResult, GateReconcileError> {
+        self.open_admission_with_barrier(current, desired, times, || Ok(()))
+    }
+
+    pub(crate) fn open_admission_with_barrier<F>(
+        &mut self,
+        current: &StoredCheckpoint,
+        desired: &DesiredRuntimeSpec,
+        times: PersistTimes,
+        final_authority_barrier: F,
+    ) -> Result<GateTransitionResult, GateReconcileError>
+    where
+        F: FnOnce() -> anyhow::Result<()>,
+    {
         validate_times(times)?;
         encode_desired_runtime_spec(desired).map_err(AppliedDesiredError::from)?;
         if desired.target != RuntimeTarget::Running
@@ -363,6 +378,11 @@ impl<'a, P: AdmissionGatePort> GateSequencer<'a, P> {
         } else {
             self.store.replace(current, &prepared_checkpoint)?
         };
+        // All checkpoint-first storage work is now durable. Revalidate the
+        // provider-private physical authority at this final boundary so no
+        // blocking preparation can create a stale-proof window before the
+        // AdmissionCell compare-open.
+        final_authority_barrier().map_err(GateReconcileError::AdmissionBarrier)?;
         let live = self.port.snapshot();
         let mut port_error = None;
         if live != replacement {
@@ -400,6 +420,20 @@ impl<'a, P: AdmissionGatePort> GateSequencer<'a, P> {
         endpoint_id: &Id,
         times: PersistTimes,
     ) -> Result<GateTransitionResult, GateReconcileError> {
+        self.install_gate_with_barrier(current, desired, endpoint_id, times, || Ok(()))
+    }
+
+    pub(crate) fn install_gate_with_barrier<F>(
+        &mut self,
+        current: &StoredCheckpoint,
+        desired: &DesiredRuntimeSpec,
+        endpoint_id: &Id,
+        times: PersistTimes,
+        final_authority_barrier: F,
+    ) -> Result<GateTransitionResult, GateReconcileError>
+    where
+        F: FnOnce() -> anyhow::Result<()>,
+    {
         validate_times(times)?;
         if desired.target != RuntimeTarget::Running {
             return Err(GateReconcileError::RuntimeNotInstallable);
@@ -528,6 +562,10 @@ impl<'a, P: AdmissionGatePort> GateSequencer<'a, P> {
         } else {
             self.store.replace(&prepared, &active_checkpoint)?
         };
+        // The prepared endpoint transition and active checkpoint token are
+        // durable. Nothing blocking may run between this fresh authority
+        // barrier and the AdmissionCell compare-install below.
+        final_authority_barrier().map_err(GateReconcileError::AdmissionBarrier)?;
         if live != replacement {
             let result = self.port.install_gate(&live, &replacement, endpoint_id);
             let after = self.port.snapshot();

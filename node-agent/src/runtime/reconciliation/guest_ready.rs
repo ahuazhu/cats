@@ -25,19 +25,19 @@ use crate::runtime_spine::RuntimePhysicalReadContext;
 
 use super::vmm_process::ExactVmmProcessProof;
 
-/// Stable facts from one challenge, excluding the fresh challenge itself.
+/// Provider-private proof of the exact mounted Root + Persistent device set.
 ///
 /// Device major/minor values remain provider-private. They make a later fresh
 /// challenge compare the complete Guest physical view rather than only the
 /// smaller public `ObservedMount` projection.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct GuestReadyEvidence {
+pub(crate) struct ExactGuestMountedSetProof {
     response: RuntimeReadyResponseV1,
     guest_transport: GuestTransportEvidence,
     mounts: Vec<ObservedMount>,
 }
 
-impl GuestReadyEvidence {
+impl ExactGuestMountedSetProof {
     pub(crate) fn guest_transport(&self) -> &GuestTransportEvidence {
         &self.guest_transport
     }
@@ -46,12 +46,36 @@ impl GuestReadyEvidence {
         &self.mounts
     }
 
-    pub(crate) fn same_physical_facts(&self, other: &Self) -> bool {
+    fn same_physical_facts(&self, other: &Self) -> bool {
         self.guest_transport == other.guest_transport
             && self.mounts == other.mounts
             && self.response.guest_boot_id == other.response.guest_boot_id
             && self.response.devices == other.response.devices
             && self.response.mounts == other.response.mounts
+    }
+
+    fn ensure_same_physical_facts(&self, other: &Self) -> anyhow::Result<()> {
+        anyhow::ensure!(
+            self.same_physical_facts(other),
+            "exact Guest mounted set changed before admission"
+        );
+        Ok(())
+    }
+
+    /// Repeat the complete challenge while the retained VMM stays exact and
+    /// require the private device/mount set to be byte-for-byte unchanged.
+    /// This is shared by the scanner-minted proof and the final gate barrier;
+    /// public `ObservedMount` values are never accepted as authority here.
+    pub(crate) fn revalidate(
+        &self,
+        port: &dyn GuestReadyTransportPort,
+        context: &dyn RuntimePhysicalReadContext,
+        desired: &DesiredRuntimeSpec,
+        checkpoint: &RuntimeCheckpoint,
+        vmm: &ExactVmmProcessProof,
+    ) -> anyhow::Result<()> {
+        let fresh = probe_exact_guest_mounted_set(port, context, desired, checkpoint, vmm)?;
+        self.ensure_same_physical_facts(&fresh)
     }
 
     fn from_response(
@@ -266,13 +290,13 @@ impl GuestReadyTransportPort for PlatformGuestReadyTransportPort {
 }
 
 /// Mint one opaque Guest proof while the exact live VMM remains unchanged.
-pub(crate) fn probe_exact_guest_ready(
+pub(crate) fn probe_exact_guest_mounted_set(
     port: &dyn GuestReadyTransportPort,
     context: &dyn RuntimePhysicalReadContext,
     desired: &DesiredRuntimeSpec,
     checkpoint: &RuntimeCheckpoint,
     vmm: &ExactVmmProcessProof,
-) -> anyhow::Result<GuestReadyEvidence> {
+) -> anyhow::Result<ExactGuestMountedSetProof> {
     let launch = checkpoint
         .runtime_launch
         .identity()
@@ -294,7 +318,7 @@ pub(crate) fn probe_exact_guest_ready(
         expected_guest_agent_protocol_version: GUEST_HOST_CONTROL_PROTOCOL_VERSION_V1,
     };
     let response = port.challenge(context, launch, request.clone())?;
-    let evidence = GuestReadyEvidence::from_response(desired, launch, &request, response)?;
+    let evidence = ExactGuestMountedSetProof::from_response(desired, launch, &request, response)?;
     context.check_active()?;
     vmm.assert_current(context)?;
     context.check_active()?;
@@ -434,7 +458,8 @@ mod tests {
         let (mut desired, mut launch, request, mut response) = fixture();
         add_persistent(&mut desired, &mut launch, &mut response);
         let evidence =
-            GuestReadyEvidence::from_response(&desired, &launch, &request, response).unwrap();
+            ExactGuestMountedSetProof::from_response(&desired, &launch, &request, response)
+                .unwrap();
         assert_eq!(evidence.mounts().len(), 2);
         assert_eq!(evidence.mounts()[0].volume_id.as_str(), "vol_data");
         assert_eq!(evidence.mounts()[0].mount_path.as_str(), "/data");
@@ -480,24 +505,43 @@ mod tests {
 
         for changed in cases {
             assert!(
-                GuestReadyEvidence::from_response(&desired, &launch, &request, changed).is_err()
+                ExactGuestMountedSetProof::from_response(&desired, &launch, &request, changed)
+                    .is_err()
             );
         }
     }
 
     #[test]
     fn a_fresh_challenge_may_revalidate_the_same_physical_facts() {
-        let (desired, launch, request, response) = fixture();
+        let (mut desired, mut launch, request, mut response) = fixture();
+        add_persistent(&mut desired, &mut launch, &mut response);
         let first =
-            GuestReadyEvidence::from_response(&desired, &launch, &request, response.clone())
+            ExactGuestMountedSetProof::from_response(&desired, &launch, &request, response.clone())
                 .unwrap();
         let mut second_request = request;
         second_request.challenge = random('f');
         let mut second_response = response;
         second_response.challenge = second_request.challenge.clone();
-        let second =
-            GuestReadyEvidence::from_response(&desired, &launch, &second_request, second_response)
-                .unwrap();
+        let second = ExactGuestMountedSetProof::from_response(
+            &desired,
+            &launch,
+            &second_request,
+            second_response,
+        )
+        .unwrap();
         assert!(first.same_physical_facts(&second));
+        let mut changed = second.response.clone();
+        changed.devices[1].device_major = 253;
+        changed.devices[1].device_minor = 7;
+        changed.mounts[1].device_major = 253;
+        changed.mounts[1].device_minor = 7;
+        let changed =
+            ExactGuestMountedSetProof::from_response(&desired, &launch, &second_request, changed)
+                .unwrap();
+        assert_eq!(first.mounts(), changed.mounts());
+        let error = first
+            .ensure_same_physical_facts(&changed)
+            .expect_err("changed private major/minor mapping reached admission");
+        assert!(error.to_string().contains("mounted set changed"));
     }
 }

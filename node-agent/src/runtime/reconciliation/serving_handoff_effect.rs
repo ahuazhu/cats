@@ -320,12 +320,29 @@ impl ServingPrepareDeviceEffect {
             || !base_admission_is_exact(accepted, desired, runtime)
             || !runtime.processes.is_empty()
             || runtime.volumes.len() != desired.volumes.len()
-            || runtime.volumes.iter().any(|volume| {
-                !volume.devices.is_empty()
-                    || volume.local_lineages.len() != 1
-                    || !matches!(volume.authority, VolumeAuthorityEvidence::Owned { .. })
-            })
         {
+            return Ok(Some(RuntimeDesiredEffectOutcome::Stop(
+                RuntimeDesiredEffectStopReason::LocalContract,
+            )));
+        }
+        if runtime.volumes.iter().any(|volume| {
+            volume.devices.is_empty()
+                && (volume.local_lineages.is_empty()
+                    || !matches!(volume.authority, VolumeAuthorityEvidence::Owned { .. }))
+        }) {
+            // `AcquireVolume` is also the durable bridge for the sequential
+            // authorization producer. An unowned volume, or an owned volume
+            // whose artifact publication was interrupted, remains the
+            // acquire effect's responsibility. The direct existing-Root
+            // producer becomes applicable only after the scanner projects
+            // one retained lineage for every Desired volume.
+            return Ok(None);
+        }
+        if runtime.volumes.iter().any(|volume| {
+            !volume.devices.is_empty()
+                || volume.local_lineages.len() != 1
+                || !matches!(volume.authority, VolumeAuthorityEvidence::Owned { .. })
+        }) {
             return Ok(Some(RuntimeDesiredEffectOutcome::Stop(
                 RuntimeDesiredEffectStopReason::LocalContract,
             )));

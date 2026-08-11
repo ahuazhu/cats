@@ -41,7 +41,7 @@ use super::{
         prepare_device_checkpoint_view, prepared_device_inputs, NodeGlobalNetworkScanAdmission,
     },
     prepare_device_retirement::prepared_device_input_is_exact,
-    probe_exact_guest_ready,
+    probe_exact_guest_mounted_set,
     retained_runtime_launch::RetainedRuntimeLaunchAuthority,
     root_provision_process::{
         ManagedServingKey, NodeGlobalManagedProcessScanAdmission,
@@ -750,7 +750,7 @@ impl RuntimeInventoryScanner for CleanSlateInventoryScanner {
                     continue;
                 };
                 let vmm = vmm.clone();
-                let guest_ready = match probe_exact_guest_ready(
+                let guest_ready = match probe_exact_guest_mounted_set(
                     guest_ready.as_ref(),
                     &context,
                     desired,
@@ -1290,13 +1290,31 @@ fn runtime_from_inventory(
                         )
                 })
             }
-            (ReconcileStep::StartRuntime { .. }, VolumeAuthorityEvidence::Owned { head, .. }) => {
-                head == &attachment.head
-            }
             (_, VolumeAuthorityEvidence::Owned { head, .. })
                 if runtime_checkpoint.runtime_launch.identity().is_some() =>
             {
-                remote_head_is_same_or_later(head, &attachment.head)
+                runtime_checkpoint
+                    .runtime_launch
+                    .identity()
+                    .and_then(|launch| {
+                        launch
+                            .devices
+                            .iter()
+                            .find(|device| device.volume_id == volume.volume_id)
+                    })
+                    .is_some_and(|device| {
+                        // Root provisioning deliberately leaves the immutable
+                        // acquire artifact at its blank head.  The retained
+                        // launch vector is the first authority that binds the
+                        // provisioned Root head and every Persistent head. A
+                        // later durable write may advance that head, while a
+                        // same-generation tuple must remain byte-exact.
+                        launched_head_chain_is_monotonic(
+                            &attachment.head,
+                            &device.expected_head,
+                            head,
+                        )
+                    })
             }
             (_, VolumeAuthorityEvidence::Owned { head, .. }) => head == &attachment.head,
             (
@@ -1559,7 +1577,18 @@ fn authority_record_matches_local_attachment(
         && record
             .lease_expires_at
             .is_some_and(|expiry| expiry >= attachment.lease_expires_at)
+        && remote_head_is_same_or_later(&record.head, &attachment.head)
         && record.last_transition == Some(attachment.expected_last_transition())
+}
+
+fn launched_head_chain_is_monotonic(
+    attachment_head: &cats_api::runtime_reconciliation::RemoteHead,
+    launch_head: &cats_api::runtime_reconciliation::RemoteHead,
+    current_head: &cats_api::runtime_reconciliation::RemoteHead,
+) -> bool {
+    remote_head_is_same_or_later(launch_head, attachment_head)
+        && remote_head_is_same_or_later(current_head, launch_head)
+        && remote_head_is_same_or_later(current_head, attachment_head)
 }
 
 fn current_checkpoint_adopts_blockd(
@@ -2129,6 +2158,7 @@ fn validate_current_prepared_checkpoint(
                 && device.acquire_origin == attachment.identity.acquire_origin
                 && device.size_bytes == attachment.size_bytes
                 && device.durability == attachment.durability
+                && remote_head_is_same_or_later(&device.expected_head, &attachment.head)
                 && device.serving_process.data_directory == blockd.data_directory
                 && (!requires_retained_root_process
                     || !is_root_handoff
@@ -2505,6 +2535,33 @@ mod tests {
         )
         .unwrap()
         .is_empty());
+    }
+
+    #[test]
+    fn launched_head_chain_rejects_rollback_and_same_generation_conflicts() {
+        let head = |generation, byte| cats_api::runtime_reconciliation::RemoteHead {
+            generation: cats_api::runtime_reconciliation::Generation::new(generation).unwrap(),
+            root_hash: (generation > 0).then(|| Sha256Digest::from_bytes([byte; 32])),
+            root_object_id: (generation > 0).then(|| {
+                cats_api::runtime_reconciliation::AsciiText::new(format!(
+                    "roots/{generation}-{byte}"
+                ))
+                .unwrap()
+            }),
+        };
+        let blank = head(0, 0);
+        let launch = head(1, 1);
+        let current = head(2, 2);
+        assert!(launched_head_chain_is_monotonic(&blank, &launch, &current));
+        assert!(!launched_head_chain_is_monotonic(
+            &current, &launch, &current
+        ));
+        assert!(!launched_head_chain_is_monotonic(&blank, &current, &launch));
+        assert!(!launched_head_chain_is_monotonic(
+            &blank,
+            &launch,
+            &head(1, 9),
+        ));
     }
 
     struct Probe {

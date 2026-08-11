@@ -997,7 +997,7 @@ fn read_serving_handoff_authorization(
         || attachment.identity.attachment_id.as_str() != config.attachment_id
         || attachment.identity != old_process.handshake.identity
         || attachment.head != decoded.expected_provisioned_head
-        || attachment.acquire_request.lease_duration_ms != lease_ttl_ms
+        || attachment.lease_duration_ms() != lease_ttl_ms
         || !durability_matches
         || process_identity.control_only
         || process_identity.process_identity_token == old_process.ownership_token
@@ -2477,8 +2477,10 @@ mod tests {
             durability: VolumeDurability::Strict,
             head: target_head,
             lease_expires_at: acquire_result.lease_expires_at,
-            acquire_request,
-            acquire_result,
+            acquire: cats_storage::authority::AuthorizedServingAcquire::Normal {
+                request: acquire_request,
+                result: acquire_result,
+            },
         };
         let identity_path = data_dir.join("identity.json");
         let blank_path = data_dir.join("authorized-serving.json");
@@ -2504,7 +2506,7 @@ mod tests {
             attachment_epoch: attachment.identity.attachment_epoch,
             size_bytes: attachment.size_bytes,
             boot_image_digest: Sha256Digest::from_bytes([0x4a; 32]),
-            expected_blank_head: attachment.acquire_result.resulting_head.clone(),
+            expected_blank_head: attachment.initial_head().clone(),
             expected_provisioned_head: attachment.head.clone(),
         };
         let artifact = TargetControlAuthorizationArtifact {
@@ -3252,7 +3254,7 @@ mod tests {
 
         let blank_head = target_control_fixture();
         let mut artifact = blank_head.artifact.clone();
-        artifact.attachment.head = artifact.attachment.acquire_result.resulting_head.clone();
+        artifact.attachment.head = artifact.attachment.initial_head().clone();
         blank_head.write(&serde_json::to_vec(&artifact).unwrap());
         assert!(blank_head.parse().is_err());
 

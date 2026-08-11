@@ -158,7 +158,7 @@ pub use gate_planner::{
     GateTransitionResult, PersistTimes,
 };
 pub(crate) use guest_ready::{
-    probe_exact_guest_ready, GuestReadyEvidence, GuestReadyTransportPort,
+    probe_exact_guest_mounted_set, ExactGuestMountedSetProof, GuestReadyTransportPort,
     PlatformGuestReadyTransportPort,
 };
 pub use inventory::{

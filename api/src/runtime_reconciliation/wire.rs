@@ -6617,7 +6617,13 @@ fn validate_desired_runtime_spec(
             }
         }
     }
-    if spec.volumes.is_empty() || spec.volumes.len() > 64 {
+    // DesiredRuntimeSpec remains usable by the non-storage lifecycle and gate
+    // contracts before a Root volume has been assigned.  The production
+    // storage reconciliation prefix independently requires one canonical Root
+    // followed by zero or more Persistent volumes before it can mutate host
+    // state; imposing that stronger precondition on this shared wire type
+    // would invalidate otherwise closed endpoint-only Desired snapshots.
+    if spec.volumes.len() > 64 {
         cross.push(Candidate::at(&volumes_path, MalformedProblem::InvalidValue));
     }
     if let RuntimeTransition::RequireIdle {

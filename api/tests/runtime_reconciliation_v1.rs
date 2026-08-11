@@ -6424,6 +6424,23 @@ fn array_limit_precedes_intrinsic_but_not_schema() {
 }
 
 #[test]
+fn desired_without_a_storage_assignment_remains_canonical() {
+    let mut value = desired_value();
+    value["volumes"] = serde_json::json!([]);
+    refresh_spec_digest(&mut value);
+
+    let decoded = decode_desired_runtime_spec(&serde_json::to_vec(&value).unwrap()).unwrap();
+    assert!(decoded.volumes.is_empty());
+    assert_eq!(
+        serde_json::from_slice::<serde_json::Value>(
+            &encode_desired_runtime_spec(&decoded).unwrap()
+        )
+        .unwrap(),
+        value,
+    );
+}
+
+#[test]
 fn guest_device_serial_bound_is_uniform_across_v1_carriers() {
     const BOUNDARY: &str = "12345678901234567890";
     const TOO_LONG: &str = "123456789012345678901";

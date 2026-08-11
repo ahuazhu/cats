@@ -107,7 +107,7 @@ pub enum TakeoverAcquireAttempt {
 /// is retried and Control's Disk tuple provides idempotence.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum CommitInitializedAttempt {
-    Committed(PersistentInitializationReceipt),
+    Committed(Box<PersistentInitializationReceipt>),
     RetryExact,
     RefreshInventory,
     ReplanDesired,
@@ -369,7 +369,7 @@ where
                 else {
                     return Ok(CommitInitializedAttempt::Ambiguous);
                 };
-                Ok(CommitInitializedAttempt::Committed(receipt))
+                Ok(CommitInitializedAttempt::Committed(Box::new(receipt)))
             }
             SignedVolumeTransitionResponse::ClosedError { status, body } => {
                 let Ok(error) = decode_runtime_volume_transition_error(&body) else {

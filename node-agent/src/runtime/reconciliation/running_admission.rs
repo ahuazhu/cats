@@ -22,16 +22,29 @@ use cats_api::runtime_reconciliation::{
 use crate::runtime_spine::{RuntimeDesiredEffectContext, RuntimeDesiredEffectOutcome};
 
 use super::gate_planner::next_install_gate;
-use super::{probe_exact_guest_ready, vmm_process::ExactVmmProcessProof};
+use super::vmm_process::ExactVmmProcessProof;
 use super::{
     AdmissionCell, AdmissionCellObservation, AdmissionCellRegistry, AdmissionCellSession,
-    AdmissionCellSessionLookup, AdmissionSnapshot, FileCheckpointStore, GateSequencer,
-    GuestReadyEvidence, GuestReadyTransportPort, PersistTimes, PlatformGuestReadyTransportPort,
+    AdmissionCellSessionLookup, AdmissionSnapshot, ExactGuestMountedSetProof, FileCheckpointStore,
+    GateSequencer, GuestReadyTransportPort, PersistTimes, PlatformGuestReadyTransportPort,
     RunningLaunchAuthorityRevalidator, StoredCheckpoint,
 };
 
 #[cfg(test)]
 type AfterRegistryHook = Arc<dyn Fn(&RuntimeDesiredEffectContext) + Send + Sync>;
+
+#[cfg(test)]
+pub(crate) type LaunchRevalidationHook = Arc<
+    dyn Fn(
+            &RuntimeDesiredEffectContext,
+            &DesiredRuntimeSpec,
+            &FileCheckpointStore,
+            &StoredCheckpoint,
+            &ExactVmmProcessProof,
+        ) -> anyhow::Result<()>
+        + Send
+        + Sync,
+>;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct RunningTailReadyExpectation {
@@ -57,7 +70,7 @@ struct RunningTailReadyExpectation {
 enum RunningTailPhysicalAuthority {
     Exact {
         vmm: Box<ExactVmmProcessProof>,
-        guest_ready: Box<GuestReadyEvidence>,
+        mounted_set: Box<ExactGuestMountedSetProof>,
     },
     #[cfg(test)]
     Test,
@@ -113,7 +126,7 @@ impl RunningTailScanAdmission {
         checkpoint: &RuntimeCheckpoint,
         checkpoint_content_digest: Sha256Digest,
         vmm: ExactVmmProcessProof,
-        guest_ready: GuestReadyEvidence,
+        mounted_set: ExactGuestMountedSetProof,
         observed_cell: Option<AdmissionCellObservation>,
     ) -> anyhow::Result<()> {
         let runtime_incarnation = checkpoint
@@ -135,7 +148,7 @@ impl RunningTailScanAdmission {
                 && vmm.expectation().checkpoint() == checkpoint
                 && vmm.expectation().launch_identity() == launch
                 && matches!(
-                    guest_ready.guest_transport(),
+                    mounted_set.guest_transport(),
                     GuestTransportEvidence::VsockReady {
                         runtime_incarnation: ready_incarnation,
                         guest_cid,
@@ -170,14 +183,14 @@ impl RunningTailScanAdmission {
             runtime_incarnation,
             checkpoint_content_digest,
             checkpoint: checkpoint.clone(),
-            guest_transport: guest_ready.guest_transport().clone(),
-            mounts: guest_ready.mounts().to_vec(),
+            guest_transport: mounted_set.guest_transport().clone(),
+            mounts: mounted_set.mounts().to_vec(),
             cell_presence,
             cell,
             routes,
             physical: RunningTailPhysicalAuthority::Exact {
                 vmm: Box::new(vmm),
-                guest_ready: Box::new(guest_ready),
+                mounted_set: Box::new(mounted_set),
             },
         };
         anyhow::ensure!(
@@ -502,6 +515,8 @@ pub(crate) struct RunningAdmissionEffect {
     launch_authority: Option<Arc<RunningLaunchAuthorityRevalidator>>,
     #[cfg(test)]
     after_registry: Option<AfterRegistryHook>,
+    #[cfg(test)]
+    launch_revalidation: Option<LaunchRevalidationHook>,
 }
 
 impl RunningAdmissionEffect {
@@ -513,6 +528,8 @@ impl RunningAdmissionEffect {
             launch_authority: None,
             #[cfg(test)]
             after_registry: None,
+            #[cfg(test)]
+            launch_revalidation: None,
         }
     }
 
@@ -526,12 +543,25 @@ impl RunningAdmissionEffect {
             launch_authority: Some(launch_authority),
             #[cfg(test)]
             after_registry: None,
+            #[cfg(test)]
+            launch_revalidation: None,
         }
     }
 
     #[cfg(test)]
     fn with_after_registry(mut self, hook: AfterRegistryHook) -> Self {
         self.after_registry = Some(hook);
+        self
+    }
+
+    #[cfg(test)]
+    pub(crate) fn with_physical_revalidation_for_test(
+        mut self,
+        guest_ready: Arc<dyn GuestReadyTransportPort>,
+        launch_revalidation: LaunchRevalidationHook,
+    ) -> Self {
+        self.guest_ready = guest_ready;
+        self.launch_revalidation = Some(launch_revalidation);
         self
     }
 
@@ -567,18 +597,6 @@ impl RunningAdmissionEffect {
         let Some(action) = plan_running_tail_action(ready, desired, &stored)? else {
             return Ok(None);
         };
-        // This is the last blocking inspection before GateSequencer's
-        // checkpoint-first local linearization. Public Guest/mount fields and
-        // a previously accepted scan can never authorize the cell by
-        // themselves.
-        ready.revalidate_physical(
-            self.guest_ready.as_ref(),
-            self.launch_authority.as_deref(),
-            context,
-            desired,
-            session.checkpoint_store(),
-            &stored,
-        )?;
         context.check_active()?;
         let mut port = session.cell().port();
         let result = match action {
@@ -586,18 +604,30 @@ impl RunningAdmissionEffect {
                 let times = next_persist_times(&stored)?;
                 Some(
                     GateSequencer::new(session.checkpoint_store(), &mut port)
-                        .open_admission(&stored, desired, times)?,
+                        .open_admission_with_barrier(&stored, desired, times, || {
+                            ready.revalidate_physical(
+                                self,
+                                context,
+                                desired,
+                                session.checkpoint_store(),
+                                &stored,
+                            )
+                        })?,
                 )
             }
             RunningTailAction::InstallGate(endpoint_id) => {
                 let times = next_persist_times(&stored)?;
                 Some(
-                    GateSequencer::new(session.checkpoint_store(), &mut port).install_gate(
-                        &stored,
-                        desired,
-                        &endpoint_id,
-                        times,
-                    )?,
+                    GateSequencer::new(session.checkpoint_store(), &mut port)
+                        .install_gate_with_barrier(&stored, desired, &endpoint_id, times, || {
+                            ready.revalidate_physical(
+                                self,
+                                context,
+                                desired,
+                                session.checkpoint_store(),
+                                &stored,
+                            )
+                        })?,
                 )
             }
         };
@@ -618,24 +648,42 @@ impl RunningAdmissionEffect {
 impl RunningTailReadyAdmission {
     fn revalidate_physical(
         &self,
-        port: &dyn GuestReadyTransportPort,
-        launch_authority: Option<&RunningLaunchAuthorityRevalidator>,
+        effect: &RunningAdmissionEffect,
         context: &RuntimeDesiredEffectContext,
         desired: &DesiredRuntimeSpec,
         store: &FileCheckpointStore,
         stored: &StoredCheckpoint,
     ) -> anyhow::Result<()> {
         match &self.expectation.physical {
-            RunningTailPhysicalAuthority::Exact { vmm, guest_ready } => {
-                let fresh =
-                    probe_exact_guest_ready(port, context, desired, stored.checkpoint(), vmm)?;
-                anyhow::ensure!(
-                    guest_ready.same_physical_facts(&fresh),
-                    "Running-tail Guest Ready facts changed before admission"
-                );
-                launch_authority
-                    .context("production Running-tail effect lacks launch revalidation authority")?
-                    .revalidate_exact_retained_running(context, desired, store, stored, vmm)?;
+            RunningTailPhysicalAuthority::Exact { vmm, mounted_set } => {
+                // First close every retained Host-side authority. The fresh
+                // mounted-set challenge is deliberately last so no earlier
+                // public observation, or slower Host inspection, can stand in
+                // for the immediate pre-gate Guest physical barrier.
+                if let Some(launch_authority) = effect.launch_authority.as_deref() {
+                    launch_authority
+                        .revalidate_exact_retained_running(context, desired, store, stored, vmm)?;
+                } else {
+                    #[cfg(test)]
+                    if let Some(revalidate) = effect.launch_revalidation.as_ref() {
+                        revalidate(context, desired, store, stored, vmm)?;
+                    } else {
+                        anyhow::bail!(
+                            "production Running-tail effect lacks launch revalidation authority"
+                        );
+                    }
+                    #[cfg(not(test))]
+                    anyhow::bail!(
+                        "production Running-tail effect lacks launch revalidation authority"
+                    );
+                }
+                mounted_set.revalidate(
+                    effect.guest_ready.as_ref(),
+                    context,
+                    desired,
+                    stored.checkpoint(),
+                    vmm,
+                )?;
                 Ok(())
             }
             #[cfg(test)]

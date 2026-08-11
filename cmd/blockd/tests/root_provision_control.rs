@@ -21,9 +21,9 @@ use cats_control_plane::store::Store;
 use cats_metadata_store_postgres::PostgresVolumeDataAuthority;
 use cats_object_store_file::FileBlobStore;
 use cats_storage::authority::{
-    project_volume_record, AttachmentLineageIdentity, AuthorizedServingAttachment,
-    LastVolumeTransition, UnixMillis, VolumeAdminState, VolumeDataAuthority, VolumeDurability,
-    VolumeOwnerBinding, VolumeRecord,
+    project_volume_record, AttachmentLineageIdentity, AuthorizedServingAcquire,
+    AuthorizedServingAttachment, LastVolumeTransition, UnixMillis, VolumeAdminState,
+    VolumeDataAuthority, VolumeDurability, VolumeOwnerBinding, VolumeRecord,
 };
 use cats_storage::BlobStore;
 use postgres::{Client, NoTls};
@@ -230,8 +230,10 @@ fn authorized_attachment(epoch: i64) -> AuthorizedServingAttachment {
         durability: VolumeDurability::Strict,
         head: blank_head(),
         lease_expires_at: acquire_result.lease_expires_at,
-        acquire_request,
-        acquire_result,
+        acquire: AuthorizedServingAcquire::Normal {
+            request: acquire_request,
+            result: acquire_result,
+        },
     }
 }
 

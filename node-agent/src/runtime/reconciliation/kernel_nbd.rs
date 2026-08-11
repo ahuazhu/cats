@@ -126,7 +126,7 @@ impl KernelNbdInventoryConfig {
     }
 
     #[cfg(test)]
-    fn fixture(
+    pub(crate) fn fixture(
         state_directory: StateDirectory,
         sys_block_root: PathBuf,
         proc_root: PathBuf,
@@ -222,6 +222,7 @@ pub(crate) struct KernelNbdAttachRequest {
 }
 
 impl KernelNbdAttachRequest {
+    #[cfg(test)]
     pub(crate) fn from_checkpoint(stored: &StoredCheckpoint) -> Result<Self> {
         let devices = prepared_device_inputs(stored.checkpoint())?;
         let [prepared] = devices.as_slice() else {
@@ -3673,7 +3674,7 @@ mod tests {
         };
         root.guest_device.serial = id(&format!("cats-{volume_prefix}-0"));
         root.ownership_token = random(if alternate_namespace { '7' } else { '6' });
-        root.serving_authority = Box::new(ServingAuthorityProvenance::DirectAuthorizedAttachment {
+        *root.serving_authority = ServingAuthorityProvenance::DirectAuthorizedAttachment {
             authorization: cats_api::runtime_reconciliation::DirectAuthorizedAttachmentIdentity {
                 path: host(&format!(
                     "/var/lib/cats/{volume_prefix}/0/authorized-serving.json"
@@ -3687,7 +3688,7 @@ mod tests {
             },
             purpose:
                 cats_api::runtime_reconciliation::DirectAuthorizedAttachmentPurpose::ExistingRoot,
-        });
+        };
         root.serving_process = ServingBlockdIdentity {
             scope_id: id(&format!("cats-serving-{volume_prefix}-0.service")),
             control_socket_path: host(&format!("/run/cats/{volume_prefix}/0/control.sock")),
@@ -5825,7 +5826,11 @@ exit 0
         let cancel_pid_file = pid_file.clone();
         let canceller = std::thread::spawn(move || {
             let deadline = Instant::now() + Duration::from_secs(1);
-            while !cancel_pid_file.exists() {
+            while fs::read_to_string(&cancel_pid_file)
+                .ok()
+                .and_then(|contents| contents.parse::<libc::pid_t>().ok())
+                .is_none()
+            {
                 assert!(Instant::now() < deadline, "kernel-NBD client did not start");
                 std::thread::sleep(Duration::from_millis(2));
             }

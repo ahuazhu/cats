@@ -1756,10 +1756,20 @@ mod tests {
                     break bytes;
                 }
             }
-            assert!(
-                Instant::now() < deadline,
-                "composition did not reach ProvisionRootImage"
-            );
+            if Instant::now() >= deadline {
+                let checkpoint = std::fs::read(&checkpoint_path)
+                    .ok()
+                    .and_then(|bytes| decode_runtime_checkpoint(&bytes).ok())
+                    .map(|checkpoint| checkpoint.step);
+                panic!(
+                    "composition did not reach ProvisionRootImage: checkpoint={checkpoint:?}, \
+                     desired_reads={}, observations={}, a22_calls={}, authority_mutations={}",
+                    control.desired_reads.load(Ordering::SeqCst),
+                    control.observations.load(Ordering::SeqCst),
+                    control.a22_calls.load(Ordering::SeqCst),
+                    authority.mutations.load(Ordering::SeqCst),
+                );
+            }
             tokio::time::sleep(Duration::from_millis(20)).await;
         };
         assert_eq!(control.a22_calls.load(Ordering::SeqCst), 1);
