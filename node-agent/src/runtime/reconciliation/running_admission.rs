@@ -25,8 +25,9 @@ use super::gate_planner::next_install_gate;
 use super::{probe_exact_guest_ready, vmm_process::ExactVmmProcessProof};
 use super::{
     AdmissionCell, AdmissionCellObservation, AdmissionCellRegistry, AdmissionCellSession,
-    AdmissionCellSessionLookup, AdmissionSnapshot, GateSequencer, GuestReadyEvidence,
-    GuestReadyTransportPort, PersistTimes, PlatformGuestReadyTransportPort, StoredCheckpoint,
+    AdmissionCellSessionLookup, AdmissionSnapshot, FileCheckpointStore, GateSequencer,
+    GuestReadyEvidence, GuestReadyTransportPort, PersistTimes, PlatformGuestReadyTransportPort,
+    RunningLaunchAuthorityRevalidator, StoredCheckpoint,
 };
 
 #[cfg(test)]
@@ -498,15 +499,31 @@ impl RunningTailReadyAdmission {
 pub(crate) struct RunningAdmissionEffect {
     registry: Arc<AdmissionCellRegistry>,
     guest_ready: Arc<dyn GuestReadyTransportPort>,
+    launch_authority: Option<RunningLaunchAuthorityRevalidator>,
     #[cfg(test)]
     after_registry: Option<AfterRegistryHook>,
 }
 
 impl RunningAdmissionEffect {
+    #[cfg(test)]
     pub(crate) fn new(registry: Arc<AdmissionCellRegistry>) -> Self {
         Self {
             registry,
             guest_ready: Arc::new(PlatformGuestReadyTransportPort),
+            launch_authority: None,
+            #[cfg(test)]
+            after_registry: None,
+        }
+    }
+
+    pub(crate) fn with_launch_authority(
+        registry: Arc<AdmissionCellRegistry>,
+        launch_authority: RunningLaunchAuthorityRevalidator,
+    ) -> Self {
+        Self {
+            registry,
+            guest_ready: Arc::new(PlatformGuestReadyTransportPort),
+            launch_authority: Some(launch_authority),
             #[cfg(test)]
             after_registry: None,
         }
@@ -554,7 +571,14 @@ impl RunningAdmissionEffect {
         // checkpoint-first local linearization. Public Guest/mount fields and
         // a previously accepted scan can never authorize the cell by
         // themselves.
-        ready.revalidate_physical(self.guest_ready.as_ref(), context, desired, &stored)?;
+        ready.revalidate_physical(
+            self.guest_ready.as_ref(),
+            self.launch_authority.as_ref(),
+            context,
+            desired,
+            session.checkpoint_store(),
+            &stored,
+        )?;
         context.check_active()?;
         let mut port = session.cell().port();
         let result = match action {
@@ -595,8 +619,10 @@ impl RunningTailReadyAdmission {
     fn revalidate_physical(
         &self,
         port: &dyn GuestReadyTransportPort,
+        launch_authority: Option<&RunningLaunchAuthorityRevalidator>,
         context: &RuntimeDesiredEffectContext,
         desired: &DesiredRuntimeSpec,
+        store: &FileCheckpointStore,
         stored: &StoredCheckpoint,
     ) -> anyhow::Result<()> {
         match &self.expectation.physical {
@@ -607,6 +633,9 @@ impl RunningTailReadyAdmission {
                     guest_ready.same_physical_facts(&fresh),
                     "Running-tail Guest Ready facts changed before admission"
                 );
+                launch_authority
+                    .context("production Running-tail effect lacks launch revalidation authority")?
+                    .revalidate_exact_retained_running(context, desired, store, stored, vmm)?;
                 Ok(())
             }
             #[cfg(test)]

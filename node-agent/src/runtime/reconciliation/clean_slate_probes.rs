@@ -6087,20 +6087,24 @@ mod tests {
     use std::sync::Mutex;
     use std::time::{Duration, Instant};
 
+    use cats_api::guest::{
+        RuntimeReadyDeviceV1, RuntimeReadyMountV1, RuntimeReadyRequestV1, RuntimeReadyResponseV1,
+    };
     use cats_api::runtime_reconciliation::{
         decode_desired_read_snapshot, decode_runtime_checkpoint, inventory_digest, spec_digest,
         AcquireOrigin, AdmissionInventoryAttestation, AgentSession, AsciiText, AssignedKind,
         AssignedPlacement, CheckpointEvidence, CleanupRelease, CleanupTarget, ContractVersion,
         DesiredRuntimeSpec, DirectAuthorizedAttachmentIdentity, DirectAuthorizedAttachmentPurpose,
         DiskKind, Durability, Epoch, Ext4MountIntent, FenceEpoch, FilesystemInitialization,
-        Generation, GuestDeviceIdentity, HostPath, Id, Ipv4Address, IsolatedIpv4Kind,
-        LifecycleAdmission, MacAddress, NetworkConfig, NodeBootId, NodeObservation,
-        NormalAcquireRequest, PrepareDeviceFrontend, PreparedDeviceInput, RandomId128,
-        ReconcileStep, RemoteHead, Revision, RuntimeConfig, RuntimeNetworkIdentity, RuntimeTarget,
-        RuntimeTransition, RuntimeVolumeTransition, RuntimeVolumeTransitionPreconditionProblem,
-        RuntimeVolumeTransitionRequest, ServingAuthorityProvenance, ServingBlockdIdentity,
-        SessionBinding, Sha256Digest, UnixMillis, VolumeAccess, VolumeAcquire,
-        VolumeAcquireRequest, VolumeDisposition, VolumeIntent, VolumeReleaseReplay, WireU64,
+        Generation, GuestBootId, GuestDeviceIdentity, HostPath, Id, Ipv4Address, IsolatedIpv4Kind,
+        LifecycleAdmission, MacAddress, MountAccess, NetworkConfig, NodeBootId, NodeObservation,
+        NormalAcquireRequest, ObservedNetwork, OwnershipTokenEvidence, PrepareDeviceFrontend,
+        PreparedDeviceInput, RandomId128, ReconcileStep, RemoteHead, Revision, RuntimeConfig,
+        RuntimeNetworkIdentity, RuntimeTarget, RuntimeTransition, RuntimeVolumeTransition,
+        RuntimeVolumeTransitionPreconditionProblem, RuntimeVolumeTransitionRequest,
+        ServingAuthorityProvenance, ServingBlockdIdentity, SessionBinding, Sha256Digest,
+        UnixMillis, VolumeAccess, VolumeAcquire, VolumeAcquireRequest, VolumeDisposition,
+        VolumeIntent, VolumeReleaseReplay, WireU64,
     };
     use cats_storage::{
         encode_image_manifest, AdapterConfig, AdapterSelection, BlobError, ImageManifestV1,
@@ -6110,16 +6114,22 @@ mod tests {
 
     use crate::runtime_spine::{
         RuntimeDesiredEffectAdmission, RuntimeDesiredEffectContext, RuntimeInventoryScanOutcome,
-        RuntimeInventoryScanner, RuntimePreScanRecovery, RuntimePreScanRecoveryContext,
-        RuntimePreScanRecoveryOutcome, RuntimeSpineFullScan,
+        RuntimeInventoryScanner, RuntimePhysicalReadContext, RuntimePreScanRecovery,
+        RuntimePreScanRecoveryContext, RuntimePreScanRecoveryOutcome, RuntimeSpineFullScan,
     };
 
+    use super::super::inventory::{
+        network_inventory_bridge_sealed, NetworkInventoryBridge, NetworkInventoryBridgeOutcome,
+    };
     use super::super::serving_blockd_process::RetainedServingBlockdAuthority;
     use super::super::signed_running::{
         acquire_checkpoint, expected_provision_heads, prepared_owned_observed_volume,
         ProvisionHeadRead, SignedRunningPublicationRecovery,
     };
-    use super::super::{AuthorizedBlockdStore, FileCheckpointStore, StoredCheckpoint};
+    use super::super::{
+        AuthorizedBlockdStore, FileCheckpointStore, NodeGlobalManagedProcessScanAdmission,
+        NodeGlobalNetworkScanAdmission, StoredCheckpoint,
+    };
 
     use super::*;
 
@@ -7053,6 +7063,187 @@ mod tests {
             _context: &RuntimeDesiredEffectContext,
         ) -> anyhow::Result<super::super::vmm_process::VmmProcessStart> {
             unreachable!("inventory fake is read-only")
+        }
+    }
+
+    struct ExactRunningProcessBridge {
+        state_directory: StateDirectory,
+        systemd: RootProvisionSystemdConfig,
+        executable_path: HostPath,
+        exact_vmms: bool,
+    }
+
+    impl root_process_inventory_bridge_sealed::Sealed for ExactRunningProcessBridge {}
+
+    impl RootProcessInventoryBridge for ExactRunningProcessBridge {
+        fn executable_path(&self) -> &HostPath {
+            &self.executable_path
+        }
+
+        fn serving_expectation(
+            &self,
+            checkpoint: &RuntimeCheckpoint,
+            desired: &DesiredRuntimeSpec,
+            prepared: &PreparedDeviceInput,
+            blockd: &AuthorizedBlockdInventoryEvidence,
+            authority: &VolumeRecord,
+        ) -> anyhow::Result<ServingBlockdExpectation> {
+            ServingBlockdExpectation::from_inventory(
+                &self.state_directory,
+                &self.systemd,
+                checkpoint,
+                desired,
+                prepared,
+                blockd,
+                authority,
+            )
+        }
+
+        fn inspect_all(
+            &self,
+            root_expected: BTreeMap<Id, RootProvisionProcessExpectation>,
+            serving_expected: BTreeMap<ManagedServingKey, ServingBlockdExpectation>,
+            vmm_expected: BTreeMap<Id, VmmProcessExpectation>,
+            stop_receipt_sockets: BTreeMap<Id, StopReceiptSocketAdmission>,
+            _context: &RuntimeInventoryScanContext,
+        ) -> anyhow::Result<RootProcessInventoryBridgeOutcome> {
+            let serving_exact = serving_expected
+                .iter()
+                .enumerate()
+                .map(|(index, (key, expectation))| {
+                    let process_id = u32::try_from(index)
+                        .ok()
+                        .and_then(|index| 81_u32.checked_add(index))
+                        .context("test serving process ID overflow")?;
+                    Ok((
+                        key.clone(),
+                        expectation
+                            .clone()
+                            .prove_exact_process(expectation.exact_evidence_for_test(process_id))?,
+                    ))
+                })
+                .collect::<anyhow::Result<BTreeMap<_, _>>>()?;
+            let vmm_exact = if self.exact_vmms {
+                vmm_expected
+                    .iter()
+                    .enumerate()
+                    .map(|(index, (cat_id, expectation))| {
+                        let process_id = u32::try_from(index)
+                            .ok()
+                            .and_then(|index| 101_u32.checked_add(index))
+                            .context("test VMM process ID overflow")?;
+                        Ok((
+                            cat_id.clone(),
+                            expectation.clone().prove_exact_process(
+                                expectation.exact_evidence_for_test(process_id),
+                            )?,
+                        ))
+                    })
+                    .collect::<anyhow::Result<BTreeMap<_, _>>>()?
+            } else {
+                BTreeMap::new()
+            };
+            let admission = NodeGlobalManagedProcessScanAdmission::from_root_controls(
+                root_expected,
+                BTreeMap::new(),
+            )?
+            .with_serving_blockds(serving_expected, serving_exact)?
+            .with_vmms(vmm_expected, vmm_exact)?
+            .with_stop_receipt_sockets(stop_receipt_sockets)?;
+            Ok(RootProcessInventoryBridgeOutcome::Complete(admission))
+        }
+    }
+
+    struct ExactRunningNetworkBridge;
+
+    impl network_inventory_bridge_sealed::Sealed for ExactRunningNetworkBridge {}
+
+    impl NetworkInventoryBridge for ExactRunningNetworkBridge {
+        fn inspect_all(
+            &self,
+            checkpoints: &BTreeMap<Id, RuntimeCheckpointInventoryEvidence>,
+            _context: &RuntimeInventoryScanContext,
+        ) -> anyhow::Result<NetworkInventoryBridgeOutcome> {
+            anyhow::ensure!(
+                checkpoints.len() == 1,
+                "test network bridge requires one checkpoint"
+            );
+            let checkpoint = checkpoints
+                .values()
+                .next()
+                .context("test network bridge checkpoint disappeared")?;
+            Ok(NetworkInventoryBridgeOutcome::Complete(
+                NodeGlobalNetworkScanAdmission::exact_checkpoint_for_test(&checkpoint.checkpoint)?,
+            ))
+        }
+    }
+
+    struct ExactRunningGuestReadyPort {
+        calls: Arc<AtomicUsize>,
+    }
+
+    impl super::super::GuestReadyTransportPort for ExactRunningGuestReadyPort {
+        fn challenge(
+            &self,
+            _context: &dyn RuntimePhysicalReadContext,
+            launch: &cats_api::runtime_reconciliation::RuntimeLaunchIdentity,
+            request: RuntimeReadyRequestV1,
+        ) -> anyhow::Result<RuntimeReadyResponseV1> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            let filesystem_uuid = RandomId128::new("eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee")
+                .context("test filesystem UUID")?;
+            let devices = launch
+                .devices
+                .iter()
+                .map(|prepared| {
+                    let suffix =
+                        char::from_u32(u32::from(b'a') + u32::from(prepared.guest_device.slot))
+                            .context("test Guest slot does not form a device suffix")?;
+                    Ok(RuntimeReadyDeviceV1 {
+                        guest_device: prepared.guest_device.clone(),
+                        device_path: HostPath::new(format!("/dev/vd{suffix}"))
+                            .context("test Guest device path")?,
+                        device_major: 252,
+                        device_minor: u32::from(prepared.guest_device.slot),
+                        size_bytes: prepared.size_bytes,
+                        filesystem_uuid: filesystem_uuid.clone(),
+                    })
+                })
+                .collect::<anyhow::Result<Vec<_>>>()?;
+            let mounts = devices
+                .iter()
+                .map(|device| RuntimeReadyMountV1 {
+                    device_major: device.device_major,
+                    device_minor: device.device_minor,
+                    source_path: device.device_path.clone(),
+                    filesystem_uuid: device.filesystem_uuid.clone(),
+                    mount_root: HostPath::new("/").expect("canonical mount root"),
+                    mount_path: HostPath::new(if device.guest_device.slot == 0 {
+                        "/"
+                    } else {
+                        "/data"
+                    })
+                    .expect("canonical test mount path"),
+                    filesystem_type: Id::new("ext4").expect("filesystem ID"),
+                    access: MountAccess::ReadWrite,
+                })
+                .collect();
+            Ok(RuntimeReadyResponseV1 {
+                version: request.version,
+                challenge: request.challenge,
+                runtime_incarnation: request.runtime_incarnation,
+                expected_guest_cid: request.expected_guest_cid,
+                expected_guest_port: request.expected_guest_port,
+                expected_guest_agent_protocol_version: request
+                    .expected_guest_agent_protocol_version,
+                actual_guest_cid: launch.guest_cid,
+                actual_guest_port: request.expected_guest_port,
+                actual_guest_agent_protocol_version: request.expected_guest_agent_protocol_version,
+                guest_boot_id: GuestBootId::new("11111111222233334444555555555555")
+                    .context("test Guest boot ID")?,
+                devices,
+                mounts,
+            })
         }
     }
 
@@ -9776,7 +9967,13 @@ mod tests {
     }
 
     fn full_root_scanner_fixture(environment: &TestEnvironment) -> FullRootScannerFixture {
-        let scan_context = assigned_context(true);
+        full_root_scanner_fixture_with_context(environment, assigned_context(true))
+    }
+
+    fn full_root_scanner_fixture_with_context(
+        environment: &TestEnvironment,
+        scan_context: RuntimeInventoryScanContext,
+    ) -> FullRootScannerFixture {
         let desired = scan_context.coordinates().desired.desired_specs[0].clone();
         let (mut record, attachment) = exact_owned_record_and_attachment(&desired);
         let data_directory = prepare_exact_lineage(environment, &desired, &attachment);
@@ -10554,6 +10751,206 @@ mod tests {
         let network_admission = network_scan.bind(&observation).unwrap();
         assert!(process_admission.matches_observation(&observation));
         assert!(network_admission.matches_observation(&observation));
+    }
+
+    #[test]
+    fn full_scanner_mints_running_tail_only_from_one_exact_physical_pass() {
+        let environment = TestEnvironment::new();
+        let template = decode_runtime_checkpoint(include_bytes!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../testdata/runtime-reconciliation-v1-start-runtime-checkpoint.json"
+        )))
+        .unwrap();
+        let ReconcileStep::StartRuntime {
+            guest_config_digest,
+            ..
+        } = &template.step
+        else {
+            panic!("StartRuntime template")
+        };
+        let mut scan_context = assigned_context(true);
+        let desired = &mut scan_context.coordinates_mut().desired.desired_specs[0];
+        desired.runtime.guest_config_digest = guest_config_digest.clone();
+        desired.spec_digest = spec_digest(desired).unwrap();
+        let fixture = full_root_scanner_fixture_with_context(&environment, scan_context);
+        let live = install_live_prepare_device_fixture(&environment, &fixture);
+        let desired = &fixture.acquired.desired;
+        let planned = crate::ch::plan_network(&desired.runtime.network_config).unwrap();
+        let network = RuntimeNetworkIdentity {
+            network_config: planned.config,
+            tap_name: Id::new(planned.tap).unwrap(),
+            ownership_token: planned.ownership_token,
+        };
+        let device = super::super::network::prepared_device_input(live.stored.checkpoint())
+            .expect("retained prepared device");
+        let mut predecessor = live.stored.checkpoint().clone();
+        let PrepareDeviceFrontend::VhostUserBlk { socket_path, .. } = &device.frontend else {
+            panic!("Running scanner fixture uses the vhost frontend")
+        };
+        predecessor.volumes[0].devices = vec![
+            cats_api::runtime_reconciliation::ObservedDevice::VhostUserBlk {
+                guest_device: device.guest_device.clone(),
+                socket_path: socket_path.clone(),
+                ownership_token: OwnershipTokenEvidence::Valid {
+                    ownership_token: device.ownership_token.clone(),
+                },
+            },
+        ];
+        predecessor.step = ReconcileStep::PrepareNetwork {
+            network: network.clone(),
+            devices: vec![device],
+        };
+        predecessor.updated_at_unix_ms =
+            UnixMillis::new(live.stored.checkpoint().updated_at_unix_ms.get() + 1).unwrap();
+
+        let ReconcileStep::StartRuntime {
+            launcher_executable,
+            boot,
+            ..
+        } = template.step
+        else {
+            panic!("StartRuntime template")
+        };
+        let runtime_incarnation = RandomId128::new("55555555555555555555555555555555").unwrap();
+        let socket_paths = super::super::ManagedVmmSocketRoot::installed()
+            .paths_for(&runtime_incarnation)
+            .unwrap();
+        let state_directory = StateDirectory::unanchored(environment.state.clone());
+        let launch_file_paths = super::super::ManagedVmmLaunchFilePaths::for_incarnation(
+            &state_directory,
+            &runtime_incarnation,
+        )
+        .unwrap();
+        let network_projection = ObservedNetwork {
+            kind: network.network_config.kind,
+            network_id: network.network_config.network_id.clone(),
+            guest_mac: network.network_config.guest_mac.clone(),
+            guest_ipv4: network.network_config.guest_ipv4.clone(),
+            prefix_length: network.network_config.prefix_length,
+            gateway_ipv4: network.network_config.gateway_ipv4.clone(),
+            tap_name: network.tap_name.clone(),
+            ownership_token: OwnershipTokenEvidence::Valid {
+                ownership_token: network.ownership_token.clone(),
+            },
+        };
+        let start = super::super::vmm_start_runtime::build_start_runtime_successor(
+            &predecessor,
+            desired,
+            runtime_incarnation,
+            RandomId128::new("66666666666666666666666666666666").unwrap(),
+            3,
+            super::super::vmm_start_runtime::StartRuntimeCheckpointAuthority {
+                launcher_executable: *launcher_executable,
+                boot: *boot,
+                network_projection,
+                socket_paths: &socket_paths,
+                launch_file_paths: &launch_file_paths,
+            },
+            UnixMillis::new(predecessor.updated_at_unix_ms.get() + 1).unwrap(),
+        )
+        .unwrap();
+        FileCheckpointStore::open(
+            &environment.state.join(CHECKPOINT_NAMESPACE),
+            &desired.cat_id,
+        )
+        .unwrap()
+        .replace(&live.stored, &start)
+        .unwrap();
+
+        let bridge = Arc::new(ExactRunningProcessBridge {
+            state_directory: state_directory.clone(),
+            systemd: test_root_provision_systemd(&environment.blockd_binary),
+            executable_path: HostPath::new(
+                environment.blockd_binary.to_string_lossy().into_owned(),
+            )
+            .unwrap(),
+            exact_vmms: true,
+        });
+        let registry = AdmissionCellRegistry::for_state_directory(&state_directory);
+        let guest_calls = Arc::new(AtomicUsize::new(0));
+        let scanner = full_root_scanner(&fixture, [])
+            .with_root_process_bridge_for_test(bridge)
+            .with_network_bridge(Arc::new(ExactRunningNetworkBridge))
+            .with_running_tail_transport_for_test(
+                registry,
+                Arc::new(ExactRunningGuestReadyPort {
+                    calls: Arc::clone(&guest_calls),
+                }),
+            );
+        let coordinates = fixture.scan_context.coordinates().clone();
+        let RuntimeInventoryScanOutcome::Complete(mut inventory) =
+            scanner.scan_complete(fixture.scan_context.clone()).unwrap()
+        else {
+            panic!("one exact Running physical pass must complete")
+        };
+        assert_eq!(guest_calls.load(Ordering::SeqCst), 1);
+        let runtime = &inventory.runtimes()[0];
+        assert!(matches!(
+            runtime.guest_transport,
+            cats_api::runtime_reconciliation::GuestTransportEvidence::VsockReady {
+                guest_cid: 3,
+                ..
+            }
+        ));
+        assert_eq!(runtime.mounts.len(), 1);
+        assert_eq!(runtime.mounts[0].mount_path.as_str(), "/");
+        let tail = inventory
+            .take_running_tail_admission()
+            .expect("exact scan must retain a private Running-tail admission");
+        let mut observation = NodeObservation {
+            version: ContractVersion::V1,
+            observation_id: RandomId128::new("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa").unwrap(),
+            node_id: coordinates.session.node_id,
+            node_boot_id: coordinates.session.node_boot_id,
+            agent_instance_id: coordinates.session.agent_instance_id,
+            agent_session_epoch: coordinates.session.agent_session_epoch,
+            heartbeat_sequence: coordinates.heartbeat_sequence,
+            observed_at_unix_ms: inventory.observed_at_unix_ms(),
+            complete_inventory: true,
+            inventory_epoch: coordinates.inventory_epoch,
+            inventory_digest: Some(Sha256Digest::from_bytes([0; 32])),
+            inventory_read_position: Some(coordinates.desired.read_position),
+            key_ring_version: None,
+            key_ring_digest: None,
+            loaded_kids: Vec::new(),
+            runtimes: inventory.runtimes().to_vec(),
+            residue: inventory.residue().to_vec(),
+        };
+        observation.inventory_digest = Some(inventory_digest(&observation).unwrap());
+        assert!(tail.bind(&observation).is_ok());
+
+        let absent_guest_calls = Arc::new(AtomicUsize::new(0));
+        let absent_bridge = Arc::new(ExactRunningProcessBridge {
+            state_directory: state_directory.clone(),
+            systemd: test_root_provision_systemd(&environment.blockd_binary),
+            executable_path: HostPath::new(
+                environment.blockd_binary.to_string_lossy().into_owned(),
+            )
+            .unwrap(),
+            exact_vmms: false,
+        });
+        let absent_registry = AdmissionCellRegistry::for_state_directory(&state_directory);
+        let absent_scanner = full_root_scanner(&fixture, [])
+            .with_root_process_bridge_for_test(absent_bridge)
+            .with_network_bridge(Arc::new(ExactRunningNetworkBridge))
+            .with_running_tail_transport_for_test(
+                absent_registry,
+                Arc::new(ExactRunningGuestReadyPort {
+                    calls: Arc::clone(&absent_guest_calls),
+                }),
+            );
+        let RuntimeInventoryScanOutcome::Complete(mut absent_inventory) = absent_scanner
+            .scan_complete(fixture.scan_context.clone())
+            .unwrap()
+        else {
+            panic!("an absent expected VMM is a complete Progressing observation")
+        };
+        assert_eq!(absent_guest_calls.load(Ordering::SeqCst), 0);
+        assert!(matches!(
+            absent_inventory.runtimes()[0].guest_transport,
+            cats_api::runtime_reconciliation::GuestTransportEvidence::Unavailable
+        ));
+        assert!(absent_inventory.take_running_tail_admission().is_none());
     }
 
     #[test]

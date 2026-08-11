@@ -189,27 +189,6 @@ impl SignedRunningHostConfig {
             vmm_launch_artifacts,
         }
     }
-
-    #[expect(
-        dead_code,
-        reason = "the integrated Running-tail effect consumes this provider-private constructor"
-    )]
-    pub(crate) fn running_launch_authority_revalidator(
-        &self,
-        network: Arc<PrepareNetworkReservationEffect>,
-        authority: Arc<dyn VolumeDataAuthority>,
-        process_ports: &SignedRunningProcessPorts,
-    ) -> RunningLaunchAuthorityRevalidator {
-        RunningLaunchAuthorityRevalidator::platform_parts(
-            self.state_directory.clone(),
-            self.systemd.clone(),
-            network,
-            authority,
-            Arc::clone(&process_ports.serving_global),
-            Arc::clone(&process_ports.vmm_global),
-            self.kernel_nbd_inventory.clone(),
-        )
-    }
 }
 
 impl SignedRunningProcessPorts {
@@ -280,7 +259,19 @@ impl SignedRunningEffect {
             Arc::clone(&authority),
             Arc::clone(&process_ports.serving_global),
         )?);
-        let running_admission = RunningAdmissionEffect::new(admission_registry);
+        let running_launch_authority = RunningLaunchAuthorityRevalidator::platform_parts(
+            state_directory.clone(),
+            systemd.clone(),
+            Arc::clone(&prepare_network),
+            Arc::clone(&authority),
+            Arc::clone(&process_ports.serving_global),
+            Arc::clone(&process_ports.vmm_global),
+            kernel_nbd_inventory.clone(),
+        );
+        let running_admission = RunningAdmissionEffect::with_launch_authority(
+            admission_registry,
+            running_launch_authority,
+        );
         let start_runtime = StartRuntimeReservationEffect::platform(
             state_directory.clone(),
             vmm_launch_artifacts.clone(),

@@ -40,10 +40,6 @@ mod prepare_device_retirement;
 mod retained_runtime_launch;
 mod root_provision;
 mod running_admission;
-#[expect(
-    dead_code,
-    reason = "the scanner and Running-tail effect consume this authority together in the integration slice"
-)]
 mod running_launch_authority;
 // The sealed serving-process foundation is composed with the Node-global
 // managed-process admission port in the following integration slice.  Its

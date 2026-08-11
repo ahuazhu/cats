@@ -605,6 +605,13 @@ impl ExactVmmProcessProof {
         &self,
         context: &dyn crate::runtime_spine::RuntimePhysicalReadContext,
     ) -> anyhow::Result<()> {
+        #[cfg(test)]
+        if matches!(self.evidence.authority, VmmPhysicalAuthority::Test) {
+            // Test providers mint this closed proof directly from the exact
+            // expectation. Keep that provider seam portable instead of
+            // accidentally consulting the test runner's real PID 1 on Linux.
+            return self.evidence.assert_current(context);
+        }
         #[cfg(not(target_os = "linux"))]
         {
             self.evidence.assert_current(context)

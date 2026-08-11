@@ -19,7 +19,8 @@ use cats_api::runtime_reconciliation::{
     DesiredRuntimeSpec, GuestTransportEvidence, HostPath, Id, InventorySource, LifecycleAdmission,
     LocalLineageState, LocalVolumeLineage, ObservedDevice, ObservedRuntimeStatus, ObservedVolume,
     ProcessEvidence, ProgressingReason, ReconcileStep, RequireIdleCheckpoint, RuntimeCheckpoint,
-    RuntimeTarget, UnixMillis, VolumeAuthorityEvidence, WarmSnapshotEvidence, WireU64,
+    RuntimeLaunch, RuntimeTarget, UnixMillis, VolumeAuthorityEvidence, WarmSnapshotEvidence,
+    WireU64,
 };
 use cats_storage::{
     authority::{
@@ -53,6 +54,7 @@ use super::{
         TargetControlProcessLaunchIdentity,
     },
     running_admission::RunningTailScanAdmission,
+    running_launch_authority::validate_retained_running_scan_exact_set,
     runtime_checkpoint_path,
     signed_running::{
         expected_provision_heads, provision_checkpoint_is_bound, request_matches_volume,
@@ -377,6 +379,15 @@ impl CleanSlateInventoryScanner {
         self
     }
 
+    #[cfg(test)]
+    pub(crate) fn with_root_process_bridge_for_test(
+        mut self,
+        bridge: Arc<dyn RootProcessInventoryBridge>,
+    ) -> Self {
+        self.root_process_bridge = Some(bridge);
+        self
+    }
+
     pub(crate) fn with_kernel_nbd_pool(mut self, port: KernelNbdInventoryPort) -> Self {
         self.kernel_nbd_port = Some(port);
         self
@@ -698,8 +709,6 @@ impl RuntimeInventoryScanner for CleanSlateInventoryScanner {
             node_global_network_admission.as_ref(),
         ) {
             let mut tail = RunningTailScanAdmission::empty();
-            let mut vmm_proofs = processes.vmm_proofs();
-            let serving_proofs = processes.serving_blockd_proofs();
             for desired in &context.coordinates().desired.desired_specs {
                 if desired.target != RuntimeTarget::Running {
                     continue;
@@ -727,36 +736,21 @@ impl RuntimeInventoryScanner for CleanSlateInventoryScanner {
                     self.blob.as_deref(),
                     context.deadline(),
                 )?;
-                let launch = checkpoint
-                    .runtime_launch
-                    .identity()
-                    .expect("retained launch presence was checked above");
-                let prepared = prepared_device_inputs(checkpoint)?;
-                let projected_devices = serving_devices_by_cat
-                    .get(&desired.cat_id)
-                    .cloned()
-                    .unwrap_or_default();
-                let exact_device_set = prepared.len() == projected_devices.len()
-                    && prepared.iter().all(|device| {
-                        let key = ManagedServingKey::new(
-                            desired.cat_id.clone(),
-                            device.volume_id.clone(),
-                        );
-                        serving_proofs.get(&key).is_some_and(|proof| {
-                            proof
-                                .expectation()
-                                .matches_device_contract(&desired.cat_id, device)
-                                && projected_devices.contains_key(&device.volume_id)
-                        })
-                    });
-                if !exact_device_set
-                    || !networks.has_exact_network(&desired.cat_id, launch.network.as_ref())
-                {
-                    continue;
-                }
-                let Some(vmm) = vmm_proofs.remove(&desired.cat_id) else {
+                let Some(vmm) = validate_retained_running_scan_exact_set(
+                    desired,
+                    checkpoint,
+                    aggregate
+                        .volumes_by_cat
+                        .get(&desired.cat_id)
+                        .map_or(&[], Vec::as_slice),
+                    processes,
+                    networks,
+                    kernel_nbd_pool_admission.as_ref(),
+                )?
+                else {
                     continue;
                 };
+                let vmm = vmm.clone();
                 let guest_ready = match probe_exact_guest_ready(
                     guest_ready.as_ref(),
                     &context,
@@ -1176,13 +1170,25 @@ fn runtime_from_inventory(
                 runtime_checkpoint.volumes.iter().any(|checkpoint_volume| {
                     checkpoint_volume.volume_id == volume.volume_id
                         && matches!(
-                            &checkpoint_volume.authority,
-                            VolumeAuthorityEvidence::Owned {
-                                head: checkpoint_head,
-                                ..
-                            } if checkpoint_head == head
+                                &checkpoint_volume.authority,
+                                VolumeAuthorityEvidence::Owned {
+                                    head: checkpoint_head,
+                                    ..
+                                } if checkpoint_head == head
                         )
                 })
+            }
+            (_, VolumeAuthorityEvidence::Owned { head, .. })
+                if matches!(runtime_checkpoint.runtime_launch, RuntimeLaunch::Present(_)) =>
+            {
+                let RuntimeLaunch::Present(launch) = &runtime_checkpoint.runtime_launch else {
+                    unreachable!("the match guard proved a retained launch")
+                };
+                launch
+                    .devices
+                    .iter()
+                    .find(|device| device.volume_id == volume.volume_id)
+                    .is_some_and(|device| &device.expected_head == head)
             }
             (_, VolumeAuthorityEvidence::Owned { head, .. }) => head == &attachment.head,
             (
