@@ -1434,6 +1434,14 @@ mod tests {
             &expected,
             &properties.control_group
         ));
+        assert_eq!(
+            exact_vmm_process_sample(
+                LinuxProcessSampleInspection::Exact(extra_live_environment),
+                &expected,
+                &properties.control_group,
+            ),
+            Err(VmmProcessSampleFailure::IdentityMismatch)
+        );
 
         let mut wrong_live_argv = process;
         wrong_live_argv
@@ -1444,6 +1452,14 @@ mod tests {
             &expected,
             &properties.control_group
         ));
+        assert_eq!(
+            exact_vmm_process_sample(
+                LinuxProcessSampleInspection::Exact(wrong_live_argv),
+                &expected,
+                &properties.control_group,
+            ),
+            Err(VmmProcessSampleFailure::IdentityMismatch)
+        );
     }
 
     #[test]

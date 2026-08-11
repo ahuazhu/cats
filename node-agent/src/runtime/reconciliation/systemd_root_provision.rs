@@ -1644,63 +1644,125 @@ pub(super) struct LinuxProcessSample {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(super) enum LinuxProcessSampleInspection {
     Exact(LinuxProcessSample),
-    /// At least one procfs leaf could not be read; exit/PID churn is not
-    /// distinguishable from a transient host read failure at this boundary.
+    /// At least one procfs leaf could not be read, or the two complete reads
+    /// were not anchored to the same live PID/start-tick identity. Exit, exec
+    /// and PID reuse therefore remain retryable rather than becoming evidence
+    /// against either the old or the replacement process.
     Unavailable,
-    /// Every procfs leaf was read, but its start ticks, argv, cgroup or
-    /// environment was structurally invalid or carried a forbidden credential
-    /// key.
+    /// Two PID/start-tick-anchored reads reproduced the same leaf values, but
+    /// those values were structurally invalid or carried a forbidden
+    /// credential key.
     Conflict,
 }
 
 #[cfg(any(test, target_os = "linux"))]
+#[derive(Debug, Clone, PartialEq, Eq)]
 struct RawLinuxProcessSample {
-    stat: String,
+    stat_before: String,
     executable_path: PathBuf,
     command_line: Vec<u8>,
     cgroup: String,
     environment: Vec<u8>,
+    stat_after: String,
+}
+
+#[cfg(any(test, target_os = "linux"))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct LinuxProcessAnchor {
+    process_id: u32,
+    start_time_ticks: u64,
 }
 
 #[cfg(target_os = "linux")]
 pub(super) fn sample_linux_process(process_id: u32) -> LinuxProcessSampleInspection {
-    let raw = (|| {
+    fn read_one(process_id: u32) -> Option<RawLinuxProcessSample> {
         Some(RawLinuxProcessSample {
-            stat: std::fs::read_to_string(format!("/proc/{process_id}/stat")).ok()?,
+            stat_before: std::fs::read_to_string(format!("/proc/{process_id}/stat")).ok()?,
             executable_path: std::fs::read_link(format!("/proc/{process_id}/exe")).ok()?,
             command_line: std::fs::read(format!("/proc/{process_id}/cmdline")).ok()?,
             cgroup: std::fs::read_to_string(format!("/proc/{process_id}/cgroup")).ok()?,
             environment: std::fs::read(format!("/proc/{process_id}/environ")).ok()?,
+            stat_after: std::fs::read_to_string(format!("/proc/{process_id}/stat")).ok()?,
         })
-    })();
-    let Some(raw) = raw else {
-        return inspect_linux_process_snapshot(None);
-    };
-    inspect_linux_process_snapshot(Some(raw))
+    }
+
+    let first = read_one(process_id);
+    let second = read_one(process_id);
+    inspect_linux_process_snapshots(process_id, first, second)
 }
 
 #[cfg(any(test, target_os = "linux"))]
-fn inspect_linux_process_snapshot(
-    raw: Option<RawLinuxProcessSample>,
+fn inspect_linux_process_snapshots(
+    expected_process_id: u32,
+    first: Option<RawLinuxProcessSample>,
+    second: Option<RawLinuxProcessSample>,
 ) -> LinuxProcessSampleInspection {
-    let Some(raw) = raw else {
+    let (Some(first), Some(second)) = (first, second) else {
         return LinuxProcessSampleInspection::Unavailable;
     };
-    match parse_linux_process_sample(raw) {
+    let Some(first_anchor) = stable_linux_process_anchor(expected_process_id, &first) else {
+        return LinuxProcessSampleInspection::Unavailable;
+    };
+    let Some(second_anchor) = stable_linux_process_anchor(expected_process_id, &second) else {
+        return LinuxProcessSampleInspection::Unavailable;
+    };
+    if first_anchor != second_anchor || !same_linux_process_payload(&first, &second) {
+        return LinuxProcessSampleInspection::Unavailable;
+    }
+    match parse_linux_process_sample(&second, second_anchor.start_time_ticks) {
         Some(sample) => LinuxProcessSampleInspection::Exact(sample),
         None => LinuxProcessSampleInspection::Conflict,
     }
 }
 
 #[cfg(any(test, target_os = "linux"))]
-fn parse_linux_process_sample(raw: RawLinuxProcessSample) -> Option<LinuxProcessSample> {
-    use std::os::unix::ffi::OsStringExt as _;
+fn stable_linux_process_anchor(
+    expected_process_id: u32,
+    raw: &RawLinuxProcessSample,
+) -> Option<LinuxProcessAnchor> {
+    let before = parse_linux_process_anchor(&raw.stat_before)?;
+    let after = parse_linux_process_anchor(&raw.stat_after)?;
+    (before == after && before.process_id == expected_process_id).then_some(before)
+}
 
-    let (_, after_comm) = raw.stat.rsplit_once(')')?;
-    let start_time_ticks = after_comm.split_whitespace().nth(19)?.parse().ok()?;
+#[cfg(any(test, target_os = "linux"))]
+fn parse_linux_process_anchor(stat: &str) -> Option<LinuxProcessAnchor> {
+    let (before_comm, after_comm) = stat.rsplit_once(')')?;
+    let (process_id, _) = before_comm.split_once(" (")?;
+    let process_id = process_id.parse().ok()?;
+    let mut fields = after_comm.split_whitespace();
+    let state = fields.next()?.as_bytes();
+    if state.len() != 1 || matches!(state[0], b'Z' | b'X') {
+        return None;
+    }
+    let start_time_ticks = fields.nth(18)?.parse().ok()?;
     if start_time_ticks == 0 {
         return None;
     }
+    Some(LinuxProcessAnchor {
+        process_id,
+        start_time_ticks,
+    })
+}
+
+#[cfg(any(test, target_os = "linux"))]
+fn same_linux_process_payload(
+    first: &RawLinuxProcessSample,
+    second: &RawLinuxProcessSample,
+) -> bool {
+    first.executable_path == second.executable_path
+        && first.command_line == second.command_line
+        && first.cgroup == second.cgroup
+        && first.environment == second.environment
+}
+
+#[cfg(any(test, target_os = "linux"))]
+fn parse_linux_process_sample(
+    raw: &RawLinuxProcessSample,
+    start_time_ticks: u64,
+) -> Option<LinuxProcessSample> {
+    use std::os::unix::ffi::OsStringExt as _;
+
     let command_line = if raw.command_line.is_empty() {
         Vec::new()
     } else {
@@ -1724,7 +1786,7 @@ fn parse_linux_process_sample(raw: RawLinuxProcessSample) -> Option<LinuxProcess
     }
     Some(LinuxProcessSample {
         start_time_ticks,
-        executable_path: raw.executable_path,
+        executable_path: raw.executable_path.clone(),
         command_line,
         control_group,
         environment: environment
@@ -3949,33 +4011,82 @@ while True:
         }
     }
 
-    fn raw_linux_process_sample(start_time_ticks: &str) -> RawLinuxProcessSample {
+    fn linux_process_stat(process_id: u32, state: &str, start_time_ticks: &str) -> String {
         let mut stat_fields = vec!["0"; 20];
-        stat_fields[0] = "S";
+        stat_fields[0] = state;
         stat_fields[19] = start_time_ticks;
+        format!(
+            "{process_id} (cloud hypervisor worker) {}",
+            stat_fields.join(" ")
+        )
+    }
+
+    fn raw_linux_process_sample(start_time_ticks: &str) -> RawLinuxProcessSample {
+        let stat = linux_process_stat(4242, "S", start_time_ticks);
         RawLinuxProcessSample {
-            stat: format!("4242 (cloud hypervisor worker) {}", stat_fields.join(" ")),
+            stat_before: stat.clone(),
             executable_path: PathBuf::from("/usr/bin/cloud-hypervisor"),
             command_line: b"/usr/bin/cloud-hypervisor\0--cpus\0boot=2\0".to_vec(),
             cgroup: "0::/system.slice/cats-vmm.service\n".to_owned(),
             environment: b"CATS_RUNTIME_INCARNATION=11111111111111111111111111111111\0".to_vec(),
+            stat_after: stat,
         }
     }
 
     #[test]
-    fn linux_process_snapshot_distinguishes_unreadable_from_definite_identity_conflict() {
+    fn linux_process_snapshot_requires_two_stable_non_zombie_pid_anchors() {
         assert_eq!(
-            inspect_linux_process_snapshot(None),
+            inspect_linux_process_snapshots(4242, None, None),
             LinuxProcessSampleInspection::Unavailable
         );
+        let exact = raw_linux_process_sample("1234");
         assert!(matches!(
-            inspect_linux_process_snapshot(Some(raw_linux_process_sample("1234"))),
+            inspect_linux_process_snapshots(4242, Some(exact.clone()), Some(exact.clone())),
             LinuxProcessSampleInspection::Exact(LinuxProcessSample {
                 start_time_ticks: 1234,
                 ..
             })
         ));
 
+        let mut exited = exact.clone();
+        exited.stat_after = linux_process_stat(4242, "Z", "1234");
+        let mut reused_between_anchors = exact.clone();
+        reused_between_anchors.stat_after = linux_process_stat(4242, "S", "1235");
+        let mut reused_between_samples = exact.clone();
+        reused_between_samples.stat_before = linux_process_stat(4242, "S", "1235");
+        reused_between_samples.stat_after = reused_between_samples.stat_before.clone();
+        let mut wrong_pid = exact.clone();
+        wrong_pid.stat_before = linux_process_stat(4243, "S", "1234");
+        wrong_pid.stat_after = wrong_pid.stat_before.clone();
+        let mut exec_churn = exact.clone();
+        exec_churn.executable_path = PathBuf::from("/usr/bin/foreign-vmm");
+        let mut argv_churn = exact.clone();
+        argv_churn.command_line.push(b'x');
+        let mut environment_churn = exact.clone();
+        environment_churn.environment = b"LANG=C\0".to_vec();
+
+        for (first, second) in [
+            (exact.clone(), exited),
+            (exact.clone(), reused_between_anchors),
+            (exact.clone(), reused_between_samples),
+            (wrong_pid.clone(), wrong_pid),
+            (exact.clone(), exec_churn),
+            (exact.clone(), argv_churn),
+            (exact.clone(), environment_churn),
+        ] {
+            assert_eq!(
+                inspect_linux_process_snapshots(4242, Some(first), Some(second)),
+                LinuxProcessSampleInspection::Unavailable
+            );
+        }
+        assert_eq!(
+            inspect_linux_process_snapshots(4242, Some(exact), None),
+            LinuxProcessSampleInspection::Unavailable
+        );
+    }
+
+    #[test]
+    fn linux_process_snapshot_reports_only_stably_reproduced_invalid_input_as_conflict() {
         let mut malformed_cgroup = raw_linux_process_sample("1234");
         malformed_cgroup.cgroup = "0::relative\n".to_owned();
         let mut duplicate_cgroup = raw_linux_process_sample("1234");
@@ -3987,9 +4098,21 @@ while True:
         let mut forbidden_environment = raw_linux_process_sample("1234");
         forbidden_environment.environment = b"AWS_ACCESS_KEY_ID=credential\0".to_vec();
 
-        for definite_conflict in [
+        for unstable_anchor in [
             raw_linux_process_sample("0"),
             raw_linux_process_sample("not-a-tick-count"),
+        ] {
+            assert_eq!(
+                inspect_linux_process_snapshots(
+                    4242,
+                    Some(unstable_anchor.clone()),
+                    Some(unstable_anchor),
+                ),
+                LinuxProcessSampleInspection::Unavailable
+            );
+        }
+
+        for definite_conflict in [
             malformed_cgroup,
             duplicate_cgroup,
             malformed_command_line,
@@ -3997,10 +4120,26 @@ while True:
             forbidden_environment,
         ] {
             assert_eq!(
-                inspect_linux_process_snapshot(Some(definite_conflict)),
+                inspect_linux_process_snapshots(
+                    4242,
+                    Some(definite_conflict.clone()),
+                    Some(definite_conflict),
+                ),
                 LinuxProcessSampleInspection::Conflict
             );
         }
+
+        let mut stable_wrong_argv = raw_linux_process_sample("1234");
+        stable_wrong_argv.command_line = b"/usr/bin/foreign-vmm\0".to_vec();
+        assert!(matches!(
+            inspect_linux_process_snapshots(
+                4242,
+                Some(stable_wrong_argv.clone()),
+                Some(stable_wrong_argv),
+            ),
+            LinuxProcessSampleInspection::Exact(LinuxProcessSample { command_line, .. })
+                if command_line == [OsString::from("/usr/bin/foreign-vmm")]
+        ));
     }
 
     #[test]
