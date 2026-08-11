@@ -209,6 +209,111 @@ pub async fn runtime_spine_state_fingerprint(
         .expect("fingerprint runtime spine state")
 }
 
+/// Persisted facts used by the cross-router runtime cutover acceptance test.
+///
+/// The test drives only public/machine HTTP routes. This final projection is
+/// deliberately read-only: it proves that replay barriers produced one
+/// authority graph, that Cat-create did not fall back to the retired product
+/// tables, and that observation renewed only the mutable current session.
+#[derive(Debug, PartialEq, Eq)]
+pub struct RuntimeCutoverAcceptanceFacts {
+    pub node_identity_count: i64,
+    pub node_credential_lineage_count: i64,
+    pub node_policy_count: i64,
+    pub node_authority_apply_count: i64,
+    pub registration_attempt_count: i64,
+    pub current_session_count: i64,
+    pub desired_read_state_count: i64,
+    pub observation_receive_state_count: i64,
+    pub admission_inventory_state_count: i64,
+    pub current_cat_observation_count: i64,
+    pub cat_record_count: i64,
+    pub disk_record_count: i64,
+    pub volume_record_count: i64,
+    pub desired_spec_count: i64,
+    pub endpoint_record_count: i64,
+    pub hostname_lookup_count: i64,
+    pub runtime_operation_count: i64,
+    pub api_result_count: i64,
+    pub retired_node_count: i64,
+    pub retired_cat_count: i64,
+    pub registration_attempt_lease_deadline_unix_ms: Option<i64>,
+    pub current_session_lease_deadline_unix_ms: Option<i64>,
+    pub desired_read_last_request_sequence: Option<i64>,
+    pub stored_api_response_body: Option<Vec<u8>>,
+}
+
+pub async fn runtime_cutover_acceptance_facts(
+    store: &Arc<crate::store::Store>,
+    node_id: cats_api::runtime_reconciliation::Id,
+) -> RuntimeCutoverAcceptanceFacts {
+    store
+        .execute(move |store| {
+            store.with(|client| {
+                client
+                    .query_one(
+                        "SELECT
+                            (SELECT count(*) FROM node_identities),
+                            (SELECT count(*) FROM runtime_node_credential_lineage),
+                            (SELECT count(*) FROM runtime_node_placement_policies),
+                            (SELECT count(*) FROM runtime_node_authority_apply_records),
+                            (SELECT count(*) FROM agent_registration_attempts),
+                            (SELECT count(*) FROM current_agent_sessions),
+                            (SELECT count(*) FROM runtime_desired_read_states),
+                            (SELECT count(*) FROM runtime_observation_receive_states),
+                            (SELECT count(*) FROM runtime_admission_inventory_states),
+                            (SELECT count(*) FROM runtime_current_cat_observations),
+                            (SELECT count(*) FROM cat_records),
+                            (SELECT count(*) FROM disk_records),
+                            (SELECT count(*) FROM volume_records),
+                            (SELECT count(*) FROM desired_runtime_specs),
+                            (SELECT count(*) FROM endpoint_records),
+                            (SELECT count(*) FROM hostname_desired_lookups),
+                            (SELECT count(*) FROM runtime_operations),
+                            (SELECT count(*) FROM api_idempotency_results),
+                            (SELECT count(*) FROM nodes),
+                            (SELECT count(*) FROM cats),
+                            (SELECT lease_deadline_unix_ms
+                               FROM agent_registration_attempts WHERE node_id=$1),
+                            (SELECT lease_deadline_unix_ms
+                               FROM current_agent_sessions WHERE node_id=$1),
+                            (SELECT last_request_sequence
+                               FROM runtime_desired_read_states WHERE node_id=$1),
+                            (SELECT response_body FROM api_idempotency_results LIMIT 1)",
+                        &[&node_id.as_str()],
+                    )
+                    .map(|row| RuntimeCutoverAcceptanceFacts {
+                        node_identity_count: row.get(0),
+                        node_credential_lineage_count: row.get(1),
+                        node_policy_count: row.get(2),
+                        node_authority_apply_count: row.get(3),
+                        registration_attempt_count: row.get(4),
+                        current_session_count: row.get(5),
+                        desired_read_state_count: row.get(6),
+                        observation_receive_state_count: row.get(7),
+                        admission_inventory_state_count: row.get(8),
+                        current_cat_observation_count: row.get(9),
+                        cat_record_count: row.get(10),
+                        disk_record_count: row.get(11),
+                        volume_record_count: row.get(12),
+                        desired_spec_count: row.get(13),
+                        endpoint_record_count: row.get(14),
+                        hostname_lookup_count: row.get(15),
+                        runtime_operation_count: row.get(16),
+                        api_result_count: row.get(17),
+                        retired_node_count: row.get(18),
+                        retired_cat_count: row.get(19),
+                        registration_attempt_lease_deadline_unix_ms: row.get(20),
+                        current_session_lease_deadline_unix_ms: row.get(21),
+                        desired_read_last_request_sequence: row.get(22),
+                        stored_api_response_body: row.get(23),
+                    })
+            })
+        })
+        .await
+        .expect("load runtime cutover acceptance facts")
+}
+
 /// Expire one isolated test session while preserving every JSON/projection
 /// invariant. The immutable-attempt trigger is disabled only inside this
 /// disposable-schema transaction and is restored before commit.
