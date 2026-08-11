@@ -2040,8 +2040,10 @@ mod tests {
                 durability: volume.durability,
                 head: blank.clone(),
                 lease_expires_at: result.lease_expires_at,
-                acquire_request: request.clone(),
-                acquire_result: result.clone(),
+                acquire: cats_storage::authority::AuthorizedServingAcquire::Normal {
+                    request: request.clone(),
+                    result: result.clone(),
+                },
             };
             drop(
                 AuthorizedBlockdStore::new(state.clone())

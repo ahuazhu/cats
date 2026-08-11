@@ -23,7 +23,7 @@ use cats_blockd::target_control::{
 };
 use cats_storage::authority::{
     validate_authorized_serving_attachment, validate_volume_record, AttachmentLineageIdentity,
-    AuthorizedServingAttachment, LastVolumeTransition, VolumeAdminState, VolumeRecord,
+    AuthorizedServingAttachment, VolumeAdminState, VolumeRecord,
 };
 
 use crate::runtime_spine::{RuntimeDesiredEffectContext, RuntimePhysicalReadContext};
@@ -488,11 +488,12 @@ fn phase_from_exact_authority(
     validate_authorized_serving_attachment(attachment)
         .context("root-provision authorized grant is not closed")?;
     validate_volume_record(authority).context("root-provision authority record is not closed")?;
-    let exact_acquire_marker = matches!(
-        &authority.last_transition,
-        Some(LastVolumeTransition::NormalAcquire { request, result })
-            if request == &attachment.acquire_request && result == &attachment.acquire_result
+    anyhow::ensure!(
+        attachment.normal_acquire().is_some(),
+        "root provisioning cannot consume a takeover attachment"
     );
+    let exact_acquire_marker =
+        authority.last_transition == Some(attachment.expected_last_transition());
     anyhow::ensure!(
         authority.volume_id == attachment.identity.volume_id
             && authority.size_bytes == attachment.size_bytes
@@ -2646,7 +2647,7 @@ mod tests {
         let fake = restarted_port.state.lock().unwrap();
         assert_eq!((fake.inspect_calls, fake.start_calls), (1, 0));
         assert_eq!(attachment.head, blank_head());
-        assert_eq!(attachment.acquire_result.resulting_head, blank_head());
+        assert_eq!(attachment.initial_head(), &blank_head());
     }
 
     #[test]
@@ -3124,15 +3125,17 @@ mod tests {
             durability: Durability::Strict,
             head: blank_head(),
             lease_expires_at: UnixMillis::new(1_900_000_060_000).unwrap(),
-            acquire_result: NormalAcquireResult {
-                volume_id: request.volume_id.clone(),
-                transition_id: request.transition_id.clone(),
-                attachment_id: request.attachment_id.clone(),
-                resulting_epoch: fence(7),
-                resulting_head: blank_head(),
-                lease_expires_at: UnixMillis::new(1_900_000_060_000).unwrap(),
+            acquire: cats_storage::authority::AuthorizedServingAcquire::Normal {
+                result: NormalAcquireResult {
+                    volume_id: request.volume_id.clone(),
+                    transition_id: request.transition_id.clone(),
+                    attachment_id: request.attachment_id.clone(),
+                    resulting_epoch: fence(7),
+                    resulting_head: blank_head(),
+                    lease_expires_at: UnixMillis::new(1_900_000_060_000).unwrap(),
+                },
+                request,
             },
-            acquire_request: request,
         }
     }
 
@@ -3149,10 +3152,7 @@ mod tests {
             lease_owner: Some(attachment.identity.attachment_id.clone()),
             lease_epoch: attachment.identity.attachment_epoch,
             lease_expires_at: Some(attachment.lease_expires_at),
-            last_transition: Some(LastVolumeTransition::NormalAcquire {
-                request: attachment.acquire_request.clone(),
-                result: attachment.acquire_result.clone(),
-            }),
+            last_transition: Some(attachment.expected_last_transition()),
         }
     }
 

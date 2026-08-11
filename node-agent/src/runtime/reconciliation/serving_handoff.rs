@@ -296,7 +296,7 @@ impl PrepareDeviceHandoffReady {
             .arg("--object-store-adapter")
             .arg(&config.object_store.name)
             .arg("--lease-ttl-ms")
-            .arg(attachment.acquire_request.lease_duration_ms.to_string())
+            .arg(attachment.lease_duration_ms().to_string())
             .arg("--max-staged-bytes")
             .arg(config.max_staged_bytes.to_string())
             .arg("--max-staged-packs")
@@ -2002,9 +2002,12 @@ fn build_target_candidate(
             && data_directory == &deterministic_host_path,
         "serving handoff provision step is not the exact acquired root lineage"
     );
+    let Some((_, blank_acquire_result)) = blank_attachment.normal_acquire() else {
+        anyhow::bail!("root provisioning requires an exact Normal acquire predecessor")
+    };
     anyhow::ensure!(
         blank_attachment.head == *expected_blank_head
-            && blank_attachment.acquire_result.resulting_head == *expected_blank_head
+            && blank_acquire_result.resulting_head == *expected_blank_head
             && exact_blank_head(expected_blank_head),
         "serving handoff acquire-time grant is not the exact blank predecessor"
     );
@@ -2484,7 +2487,7 @@ fn validate_target_checkpoint_value(
             && artifact.provision_transition_id == *provision_transition_id
             && checkpoint.node_id == attachment.identity.node_id
             && checkpoint.placement_epoch == attachment.identity.placement_epoch
-            && checkpoint.desired_revision == attachment.acquire_request.desired_revision
+            && checkpoint.desired_revision == attachment.acquire_desired_revision()
             && *volume_id == attachment.identity.volume_id
             && *attachment_id == attachment.identity.attachment_id
             && *attachment_epoch == attachment.identity.attachment_epoch
@@ -2687,8 +2690,7 @@ pub(crate) fn validate_scanned_serving_handoff_artifacts(
                     && decoded.expected_provisioned_head == device.expected_head
                     && decoded.expected_provisioned_head == target_artifact.attachment.head
                     && target_artifact.attachment.identity == acquired.attachment.identity
-                    && target_artifact.attachment.acquire_request
-                        == acquired.attachment.acquire_request
+                    && target_artifact.attachment.acquire == acquired.attachment.acquire
                     && target_artifact.attachment.size_bytes
                         == acquired.attachment.size_bytes
                     && target_artifact.attachment.durability
@@ -6135,8 +6137,10 @@ mod tests {
             durability: volume.durability,
             head: blank_head(),
             lease_expires_at: acquire_result.lease_expires_at,
-            acquire_request: acquire_request.clone(),
-            acquire_result: acquire_result.clone(),
+            acquire: cats_storage::authority::AuthorizedServingAcquire::Normal {
+                request: acquire_request.clone(),
+                result: acquire_result.clone(),
+            },
         };
         let prepared = AuthorizedBlockdStore::new(state_directory.clone())
             .prepare(&desired, &volume, &blank_attachment)

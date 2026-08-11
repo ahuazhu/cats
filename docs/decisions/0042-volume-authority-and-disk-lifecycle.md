@@ -73,6 +73,11 @@ target、full-inventory/Desired读取位置、唯一transition ID、generation�
 data-dir和pending pack绑定volume、attachment、epoch和closed
 `AcquireOrigin = normal {transition_id} | takeover {authorization_id}`。即使ID文本相同，variant不同也不是
 同一lineage；只有identity/pack/runtime evidence逐字段相同才可恢复，其他情况只能quarantine。
+attachment专属`authorized-serving`文件使用closed tagged grant：normal保存完整request/result；takeover
+保存Control-signed evidence返回的完整immutable `VolumeTakeoverAuthorization + TakeoverConsumedReceipt`，
+绝不把A22的薄LeaseGrant或Node自构字段当成授权。takeover首次absolute expiry只能由
+`checked_add(receipt.consumed_at, authorization.lease_duration_ms)`得到；current Volume必须保留exact
+takeover marker、owner/epoch并与artifact head精确相等，artifact head只允许相对receipt head合法单调推进。
 
 ### 4. 磁盘管理先保持Cold-only
 

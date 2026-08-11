@@ -727,6 +727,12 @@ Node 是 lease transition 的执行者。顺序固定：
 5. 启动 blockd，传入 volume、attachment、epoch 和既有的closed acquire origin。
 6. blockd 从 MetadataStore 验证精确 owner/epoch后开始 renew和服务。
 
+第3步的durable serving artifact不是薄grant的复制。它是closed
+`Normal {request,result} | Takeover {authorization,receipt}`：Takeover必须来自§5.1同一签名snapshot中的
+完整consumed authorization record，且首次expiry精确等于
+`checked_add(receipt.consumed_at, authorization.lease_duration_ms)`。artifact与current Volume按
+origin/owner/epoch/marker/exact head闭合后才可创建data-dir或启动blockd。
+
 blockd 启动不得调用 acquire、takeover或增加 epoch。它只可以 renew、以精确 owner/epoch发布 Root，
 以及报告 status。Cold detach 时 Node 先 drain、停止 blockd，再执行 release。
 

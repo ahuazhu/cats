@@ -502,7 +502,7 @@ fn validate_authorized_serving_config(
     let lease_ttl_ms = u64::try_from(cfg.lease_ttl_ms).map_err(|_| {
         EngineError::InvalidConfig("lease_ttl_ms must fit the target authority range".into())
     })?;
-    if lease_ttl_ms != attachment.acquire_request.lease_duration_ms {
+    if lease_ttl_ms != attachment.lease_duration_ms() {
         return Err(EngineError::InvalidConfig(
             "lease_ttl_ms does not match the exact acquire receipt".into(),
         ));
@@ -546,7 +546,7 @@ fn preflight_authorized_serving(
             volume_id: attachment.identity.volume_id.clone(),
             attachment_id: attachment.identity.attachment_id.clone(),
             expected_epoch: attachment.identity.attachment_epoch,
-            lease_duration_ms: attachment.acquire_request.lease_duration_ms,
+            lease_duration_ms: attachment.lease_duration_ms(),
         })
         .map_err(|error| {
             EngineError::Meta(map_target_error(

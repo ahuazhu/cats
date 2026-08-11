@@ -208,7 +208,12 @@ pub fn validate_serving_handoff_record(
     let target_bytes = encode_target_control_authorization(target_artifact)?;
     let target_digest = Sha256Digest::from_bytes(Sha256::digest(&target_bytes).into());
     let identity = &attachment.identity;
-    let acquire_request = &attachment.acquire_request;
+    let Some((acquire_request, _)) = attachment.normal_acquire() else {
+        return Err(ServingHandoffCodecError::Invalid {
+            artifact: ARTIFACT,
+            reason: "root serving handoff requires one normal acquire",
+        });
+    };
     let process = &record.old_control_process;
     let handshake = &process.handshake;
     let expected_cgroup = format!("/sys/fs/cgroup/system.slice/{}", process.scope_id.as_str());

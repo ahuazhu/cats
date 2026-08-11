@@ -19,7 +19,7 @@ use cats_api::runtime_reconciliation::{
 };
 use cats_storage::authority::{
     remote_head_is_same_or_later, validate_authorized_serving_attachment, validate_volume_record,
-    LastVolumeTransition, VolumeDataAuthority, VolumeRecord,
+    VolumeDataAuthority, VolumeRecord,
 };
 
 use crate::runtime_spine::{
@@ -322,11 +322,7 @@ impl ServingBlockdExpectation {
                 && authority
                     .lease_expires_at
                     .is_some_and(|expiry| expiry >= attachment.lease_expires_at)
-                && authority.last_transition
-                    == Some(LastVolumeTransition::NormalAcquire {
-                        request: attachment.acquire_request.clone(),
-                        result: attachment.acquire_result.clone(),
-                    })
+                && authority.last_transition == Some(attachment.expected_last_transition())
                 && remote_head_is_same_or_later(&authority.head, &attachment.head),
             "serving process current authority changed its retained attachment"
         );
@@ -423,11 +419,7 @@ impl ServingBlockdExpectation {
                 .lease_expires_at
                 .is_some_and(|expiry| expiry >= self.authority_lease_expires_at)
             && current.head == self.expected_remote_head
-            && current.last_transition
-                == Some(LastVolumeTransition::NormalAcquire {
-                    request: attachment.acquire_request.clone(),
-                    result: attachment.acquire_result.clone(),
-                })
+            && current.last_transition == Some(attachment.expected_last_transition())
     }
 
     pub(super) fn unit_id(&self) -> &Id {
@@ -514,8 +506,15 @@ impl ServingBlockdExpectation {
         peer.volume.volume = intent.clone();
         peer.volume.attachment.identity.volume_id = volume_id.clone();
         peer.volume.attachment.identity.attachment_id = attachment_id.clone();
-        peer.volume.attachment.acquire_request.volume_id = volume_id.clone();
-        peer.volume.attachment.acquire_request.attachment_id = attachment_id.clone();
+        let (request, result) = peer
+            .volume
+            .attachment
+            .normal_acquire_mut()
+            .expect("test fixture carries Normal authority");
+        request.volume_id = volume_id.clone();
+        request.attachment_id = attachment_id.clone();
+        result.volume_id = volume_id.clone();
+        result.attachment_id = attachment_id.clone();
         peer.prepared_device.volume_intent_id = volume_intent_id;
         peer.prepared_device.disk_id = disk_id;
         peer.prepared_device.volume_id = volume_id;

@@ -4185,12 +4185,9 @@ impl InventoryAbsenceProbe for MetadataStoreProbe {
                     candidate_volume_ids.extend(data.candidate_volume_ids);
                     for (cat_id, by_volume) in &data.evidence {
                         for evidence in by_volume.values() {
-                            let carries_superseded_receipt = evidence
-                                .checkpoint
-                                .attachment
-                                .acquire_request
-                                .desired_revision
-                                < evidence.checkpoint.desired.desired_revision;
+                            let carries_superseded_receipt =
+                                evidence.checkpoint.attachment.acquire_desired_revision()
+                                    < evidence.checkpoint.desired.desired_revision;
                             if evidence.binding != DesiredCheckpointBinding::Superseded
                                 && !carries_superseded_receipt
                             {
@@ -4217,15 +4214,10 @@ impl InventoryAbsenceProbe for MetadataStoreProbe {
                                     devices: Vec::new(),
                                 },
                                 acquire_request: Some(
-                                    cats_api::runtime_reconciliation::VolumeAcquireRequest::Normal {
-                                        volume_id: evidence.checkpoint.attachment.acquire_request.volume_id.clone(),
-                                        transition_id: evidence.checkpoint.attachment.acquire_request.transition_id.clone(),
-                                        attachment_id: evidence.checkpoint.attachment.acquire_request.attachment_id.clone(),
-                                        expected_unowned_epoch: evidence.checkpoint.attachment.acquire_request.expected_unowned_epoch,
-                                        desired_revision: evidence.checkpoint.attachment.acquire_request.desired_revision,
-                                        placement_epoch: evidence.checkpoint.attachment.acquire_request.placement_epoch,
-                                        lease_duration_ms: evidence.checkpoint.attachment.acquire_request.lease_duration_ms,
-                                    },
+                                    evidence
+                                        .checkpoint
+                                        .attachment
+                                        .checkpoint_acquire_request(),
                                 ),
                             },
                         )?;
@@ -6932,8 +6924,7 @@ mod tests {
             durability: volume.durability,
             head: record.head.clone(),
             lease_expires_at: result.lease_expires_at,
-            acquire_request: request,
-            acquire_result: result,
+            acquire: cats_storage::authority::AuthorizedServingAcquire::Normal { request, result },
         };
         (record, attachment)
     }
@@ -7383,15 +7374,7 @@ mod tests {
             desired,
             &desired.volumes[0],
             RuntimeVolumeTransition::Acquire {
-                request: VolumeAcquireRequest::Normal {
-                    volume_id: attachment.acquire_request.volume_id.clone(),
-                    transition_id: attachment.acquire_request.transition_id.clone(),
-                    attachment_id: attachment.acquire_request.attachment_id.clone(),
-                    expected_unowned_epoch: attachment.acquire_request.expected_unowned_epoch,
-                    desired_revision: attachment.acquire_request.desired_revision,
-                    placement_epoch: attachment.acquire_request.placement_epoch,
-                    lease_duration_ms: attachment.acquire_request.lease_duration_ms,
-                },
+                request: attachment.checkpoint_acquire_request(),
             },
             cats_api::runtime_reconciliation::UnixMillis::new(9_000).unwrap(),
         );
@@ -7739,20 +7722,11 @@ mod tests {
         desired: &DesiredRuntimeSpec,
         attachment: &AuthorizedServingAttachment,
     ) {
-        let request = &attachment.acquire_request;
         let checkpoint = acquire_checkpoint(
             desired,
             &desired.volumes[0],
             RuntimeVolumeTransition::Acquire {
-                request: VolumeAcquireRequest::Normal {
-                    volume_id: request.volume_id.clone(),
-                    transition_id: request.transition_id.clone(),
-                    attachment_id: request.attachment_id.clone(),
-                    expected_unowned_epoch: request.expected_unowned_epoch,
-                    desired_revision: request.desired_revision,
-                    placement_epoch: request.placement_epoch,
-                    lease_duration_ms: request.lease_duration_ms,
-                },
+                request: attachment.checkpoint_acquire_request(),
             },
             cats_api::runtime_reconciliation::UnixMillis::new(9_000).unwrap(),
         );
@@ -7904,15 +7878,7 @@ mod tests {
             desired,
             &desired.volumes[0],
             RuntimeVolumeTransition::Acquire {
-                request: VolumeAcquireRequest::Normal {
-                    volume_id: root_attachment.acquire_request.volume_id.clone(),
-                    transition_id: root_attachment.acquire_request.transition_id.clone(),
-                    attachment_id: root_attachment.acquire_request.attachment_id.clone(),
-                    expected_unowned_epoch: root_attachment.acquire_request.expected_unowned_epoch,
-                    desired_revision: root_attachment.acquire_request.desired_revision,
-                    placement_epoch: root_attachment.acquire_request.placement_epoch,
-                    lease_duration_ms: root_attachment.acquire_request.lease_duration_ms,
-                },
+                request: root_attachment.checkpoint_acquire_request(),
             },
             UnixMillis::new(9_000).unwrap(),
         );
@@ -8057,15 +8023,7 @@ mod tests {
             desired,
             &desired.volumes[0],
             RuntimeVolumeTransition::Acquire {
-                request: VolumeAcquireRequest::Normal {
-                    volume_id: root_attachment.acquire_request.volume_id.clone(),
-                    transition_id: root_attachment.acquire_request.transition_id.clone(),
-                    attachment_id: root_attachment.acquire_request.attachment_id.clone(),
-                    expected_unowned_epoch: root_attachment.acquire_request.expected_unowned_epoch,
-                    desired_revision: root_attachment.acquire_request.desired_revision,
-                    placement_epoch: root_attachment.acquire_request.placement_epoch,
-                    lease_duration_ms: root_attachment.acquire_request.lease_duration_ms,
-                },
+                request: root_attachment.checkpoint_acquire_request(),
             },
             UnixMillis::new(9_000).unwrap(),
         );
@@ -10012,15 +9970,7 @@ mod tests {
             &desired,
             &desired.volumes[0],
             RuntimeVolumeTransition::Acquire {
-                request: VolumeAcquireRequest::Normal {
-                    volume_id: attachment.acquire_request.volume_id.clone(),
-                    transition_id: attachment.acquire_request.transition_id.clone(),
-                    attachment_id: attachment.acquire_request.attachment_id.clone(),
-                    expected_unowned_epoch: attachment.acquire_request.expected_unowned_epoch,
-                    desired_revision: attachment.acquire_request.desired_revision,
-                    placement_epoch: attachment.acquire_request.placement_epoch,
-                    lease_duration_ms: attachment.acquire_request.lease_duration_ms,
-                },
+                request: attachment.checkpoint_acquire_request(),
             },
             cats_api::runtime_reconciliation::UnixMillis::new(9_000).unwrap(),
         );
@@ -10192,17 +10142,7 @@ mod tests {
             &second_desired,
             &second_desired.volumes[0],
             RuntimeVolumeTransition::Acquire {
-                request: VolumeAcquireRequest::Normal {
-                    volume_id: second_attachment.acquire_request.volume_id.clone(),
-                    transition_id: second_attachment.acquire_request.transition_id.clone(),
-                    attachment_id: second_attachment.acquire_request.attachment_id.clone(),
-                    expected_unowned_epoch: second_attachment
-                        .acquire_request
-                        .expected_unowned_epoch,
-                    desired_revision: second_attachment.acquire_request.desired_revision,
-                    placement_epoch: second_attachment.acquire_request.placement_epoch,
-                    lease_duration_ms: second_attachment.acquire_request.lease_duration_ms,
-                },
+                request: second_attachment.checkpoint_acquire_request(),
             },
             UnixMillis::new(9_001).unwrap(),
         );
@@ -11571,15 +11511,7 @@ mod tests {
                 desired,
                 &desired.volumes[0],
                 RuntimeVolumeTransition::Acquire {
-                    request: VolumeAcquireRequest::Normal {
-                        volume_id: attachment.acquire_request.volume_id.clone(),
-                        transition_id: attachment.acquire_request.transition_id.clone(),
-                        attachment_id: attachment.acquire_request.attachment_id.clone(),
-                        expected_unowned_epoch: attachment.acquire_request.expected_unowned_epoch,
-                        desired_revision: attachment.acquire_request.desired_revision,
-                        placement_epoch: attachment.acquire_request.placement_epoch,
-                        lease_duration_ms: attachment.acquire_request.lease_duration_ms,
-                    },
+                    request: attachment.checkpoint_acquire_request(),
                 },
                 UnixMillis::new(10_000 + index as u64).unwrap(),
             );

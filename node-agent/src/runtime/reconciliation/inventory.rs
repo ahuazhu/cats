@@ -24,7 +24,7 @@ use cats_api::runtime_reconciliation::{
 use cats_storage::{
     authority::{
         remote_head_is_same_or_later, validate_authorized_serving_attachment,
-        validate_volume_record, LastVolumeTransition, VolumeRecord,
+        validate_volume_record, VolumeRecord,
     },
     BlobStore,
 };
@@ -1444,11 +1444,7 @@ fn authority_record_matches_local_attachment(
         && record
             .lease_expires_at
             .is_some_and(|expiry| expiry >= attachment.lease_expires_at)
-        && record.last_transition
-            == Some(LastVolumeTransition::NormalAcquire {
-                request: attachment.acquire_request.clone(),
-                result: attachment.acquire_result.clone(),
-            })
+        && record.last_transition == Some(attachment.expected_last_transition())
 }
 
 fn current_checkpoint_adopts_blockd(

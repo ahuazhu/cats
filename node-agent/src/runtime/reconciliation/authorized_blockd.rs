@@ -1766,7 +1766,7 @@ fn build_authorized_blockd_command(
         .arg("--object-store-adapter")
         .arg(&config.object_store.name)
         .arg("--lease-ttl-ms")
-        .arg(attachment.acquire_request.lease_duration_ms.to_string())
+        .arg(attachment.lease_duration_ms().to_string())
         .arg("--max-staged-bytes")
         .arg(config.max_staged_bytes.to_string())
         .arg("--max-staged-packs")
@@ -1895,15 +1895,30 @@ fn validate_checkpoint_inputs(
             && matches!(volume.disposition, VolumeDisposition::Retain),
         "authorized blockd first slice supports only an unmounted retained RWO volume"
     );
-    let VolumeAcquire::Normal {
-        transition_id,
-        expected_unowned_epoch,
-    } = &volume.acquire
-    else {
-        anyhow::bail!("authorized blockd first slice requires a Normal acquire");
-    };
     let identity = &attachment.identity;
-    let request = &attachment.acquire_request;
+    let acquire_matches = match (&volume.acquire, &attachment.acquire) {
+        (
+            VolumeAcquire::Normal {
+                transition_id,
+                expected_unowned_epoch,
+            },
+            cats_storage::authority::AuthorizedServingAcquire::Normal { request, .. },
+        ) => {
+            request.transition_id == *transition_id
+                && request.expected_unowned_epoch == *expected_unowned_epoch
+                && request.desired_revision == desired.desired_revision
+                && request.placement_epoch == desired.placement.placement_epoch
+        }
+        (
+            VolumeAcquire::Takeover { authorization_id },
+            cats_storage::authority::AuthorizedServingAcquire::Takeover { authorization, .. },
+        ) => {
+            authorization.authorization_id == *authorization_id
+                && authorization.desired_revision == desired.desired_revision
+                && authorization.new_placement_epoch == desired.placement.placement_epoch
+        }
+        _ => false,
+    };
     anyhow::ensure!(
         volume.volume_id == identity.volume_id
             && volume.attachment_id == identity.attachment_id
@@ -1911,10 +1926,7 @@ fn validate_checkpoint_inputs(
             && volume.durability == attachment.durability
             && desired.placement.node_id == identity.node_id
             && desired.placement.placement_epoch == identity.placement_epoch
-            && request.transition_id == *transition_id
-            && request.expected_unowned_epoch == *expected_unowned_epoch
-            && request.desired_revision == desired.desired_revision
-            && request.placement_epoch == desired.placement.placement_epoch,
+            && acquire_matches,
         "Desired, VolumeIntent and authorized grant do not form one exact lineage"
     );
     Ok(())
@@ -1941,15 +1953,34 @@ fn validate_adopted_checkpoint_inputs(
             && matches!(volume.disposition, VolumeDisposition::Retain),
         "authorized blockd adoption requires one retained RWO Running volume"
     );
-    let VolumeAcquire::Normal {
-        transition_id,
-        expected_unowned_epoch,
-    } = &volume.acquire
-    else {
-        anyhow::bail!("authorized blockd adoption requires a Normal acquire")
-    };
     let identity = &attachment.identity;
-    let request = &attachment.acquire_request;
+    let acquire_matches = match (&volume.acquire, &attachment.acquire) {
+        (
+            VolumeAcquire::Normal {
+                transition_id,
+                expected_unowned_epoch,
+            },
+            cats_storage::authority::AuthorizedServingAcquire::Normal { request, .. },
+        ) => {
+            request.transition_id == *transition_id
+                && request.expected_unowned_epoch == *expected_unowned_epoch
+                && request.volume_id == volume.volume_id
+                && request.attachment_id == volume.attachment_id
+                && request.desired_revision <= desired.desired_revision
+                && request.placement_epoch == desired.placement.placement_epoch
+        }
+        (
+            VolumeAcquire::Takeover { authorization_id },
+            cats_storage::authority::AuthorizedServingAcquire::Takeover { authorization, .. },
+        ) => {
+            authorization.authorization_id == *authorization_id
+                && authorization.volume_id == volume.volume_id
+                && authorization.new_attachment_id == volume.attachment_id
+                && authorization.desired_revision <= desired.desired_revision
+                && authorization.new_placement_epoch == desired.placement.placement_epoch
+        }
+        _ => false,
+    };
     anyhow::ensure!(
         volume.volume_id == identity.volume_id
             && volume.attachment_id == identity.attachment_id
@@ -1957,12 +1988,7 @@ fn validate_adopted_checkpoint_inputs(
             && volume.durability == attachment.durability
             && desired.placement.node_id == identity.node_id
             && desired.placement.placement_epoch == identity.placement_epoch
-            && request.transition_id == *transition_id
-            && request.expected_unowned_epoch == *expected_unowned_epoch
-            && request.volume_id == volume.volume_id
-            && request.attachment_id == volume.attachment_id
-            && request.desired_revision <= desired.desired_revision
-            && request.placement_epoch == desired.placement.placement_epoch,
+            && acquire_matches,
         "current Desired and superseded authorized grant are not one adoptable lineage"
     );
     Ok(())
@@ -2796,10 +2822,10 @@ mod tests {
 
     use cats_api::runtime_reconciliation::{
         spec_digest, AcquireOrigin, AsciiText, AssignedKind, AssignedPlacement, Epoch, FenceEpoch,
-        Generation, GuestDeviceIdentity, HostPath, Id, Ipv4Address, IsolatedIpv4Kind,
-        LastVolumeTransition, MacAddress, NetworkConfig, NodeBootId, NormalAcquireRequest,
-        NormalAcquireResult, RandomId128, RemoteHead, Revision, RuntimeConfig, RuntimeTransition,
-        Sequence, Sha256Digest, UnixMillis, VolumeAdminState, WireU64,
+        Generation, GuestDeviceIdentity, HostPath, Id, Ipv4Address, IsolatedIpv4Kind, MacAddress,
+        NetworkConfig, NodeBootId, NormalAcquireRequest, NormalAcquireResult, RandomId128,
+        RemoteHead, Revision, RuntimeConfig, RuntimeTransition, Sequence, Sha256Digest, UnixMillis,
+        VolumeAdminState, WireU64,
     };
     use cats_storage::authority::AttachmentLineageIdentity;
     use cats_storage::AdapterConfig;
@@ -2923,8 +2949,10 @@ mod tests {
             // Root provision may have advanced the head after acquire.
             head: provisioned_head(),
             lease_expires_at: acquire_result.lease_expires_at,
-            acquire_request,
-            acquire_result,
+            acquire: cats_storage::authority::AuthorizedServingAcquire::Normal {
+                request: acquire_request,
+                result: acquire_result,
+            },
         };
         (desired, volume, attachment)
     }
@@ -2996,10 +3024,7 @@ mod tests {
             lease_owner: Some(attachment.identity.attachment_id.clone()),
             lease_epoch: attachment.identity.attachment_epoch,
             lease_expires_at: Some(attachment.lease_expires_at),
-            last_transition: Some(LastVolumeTransition::NormalAcquire {
-                request: attachment.acquire_request.clone(),
-                result: attachment.acquire_result.clone(),
-            }),
+            last_transition: Some(attachment.expected_last_transition()),
         };
         let executable_path = maximally_escaped_host_path(4096);
         let cgroup_path = maximally_escaped_host_path(4096);

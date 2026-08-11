@@ -13,7 +13,7 @@ pub use cats_api::runtime_reconciliation::{
     DisposableRootDeleteAuthorization, Epoch, FenceEpoch, Generation, Id, LastVolumeTransition,
     NodeBootId, NormalAcquireRequest, NormalAcquireResult, RandomId128, ReleaseRequest,
     ReleaseResult, RemoteHead, Revision, Sha256Digest, TakeoverConsumedReceipt, UnixMillis,
-    VolumeAdminState, VolumeAuthorization, VolumeDurability, VolumeRecord,
+    VolumeAcquireRequest, VolumeAdminState, VolumeAuthorization, VolumeDurability, VolumeRecord,
     VolumeTakeoverAuthorization,
 };
 use serde::{Deserialize, Serialize};
@@ -47,8 +47,113 @@ pub struct AuthorizedServingAttachment {
     pub durability: VolumeDurability,
     pub head: RemoteHead,
     pub lease_expires_at: UnixMillis,
-    pub acquire_request: NormalAcquireRequest,
-    pub acquire_result: NormalAcquireResult,
+    pub acquire: AuthorizedServingAcquire,
+}
+
+/// Immutable, thick authority that created one serving attachment.  Normal
+/// acquire keeps its exact request/result pair; takeover keeps the complete
+/// consumed authorization and receipt rather than a lossy result projection.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+pub enum AuthorizedServingAcquire {
+    Normal {
+        request: NormalAcquireRequest,
+        result: NormalAcquireResult,
+    },
+    Takeover {
+        authorization: VolumeTakeoverAuthorization,
+        receipt: TakeoverConsumedReceipt,
+    },
+}
+
+impl AuthorizedServingAttachment {
+    pub fn lease_duration_ms(&self) -> u64 {
+        match &self.acquire {
+            AuthorizedServingAcquire::Normal { request, .. } => request.lease_duration_ms,
+            AuthorizedServingAcquire::Takeover { authorization, .. } => {
+                authorization.lease_duration_ms
+            }
+        }
+    }
+
+    pub fn initial_head(&self) -> &RemoteHead {
+        match &self.acquire {
+            AuthorizedServingAcquire::Normal { result, .. } => &result.resulting_head,
+            AuthorizedServingAcquire::Takeover { receipt, .. } => &receipt.resulting_head,
+        }
+    }
+
+    pub fn normal_acquire(&self) -> Option<(&NormalAcquireRequest, &NormalAcquireResult)> {
+        match &self.acquire {
+            AuthorizedServingAcquire::Normal { request, result } => Some((request, result)),
+            AuthorizedServingAcquire::Takeover { .. } => None,
+        }
+    }
+
+    pub fn normal_acquire_mut(
+        &mut self,
+    ) -> Option<(&mut NormalAcquireRequest, &mut NormalAcquireResult)> {
+        match &mut self.acquire {
+            AuthorizedServingAcquire::Normal { request, result } => Some((request, result)),
+            AuthorizedServingAcquire::Takeover { .. } => None,
+        }
+    }
+
+    pub fn acquire_desired_revision(&self) -> Revision {
+        match &self.acquire {
+            AuthorizedServingAcquire::Normal { request, .. } => request.desired_revision,
+            AuthorizedServingAcquire::Takeover { authorization, .. } => {
+                authorization.desired_revision
+            }
+        }
+    }
+
+    pub fn acquire_placement_epoch(&self) -> Epoch {
+        match &self.acquire {
+            AuthorizedServingAcquire::Normal { request, .. } => request.placement_epoch,
+            AuthorizedServingAcquire::Takeover { authorization, .. } => {
+                authorization.new_placement_epoch
+            }
+        }
+    }
+
+    pub fn expected_last_transition(&self) -> LastVolumeTransition {
+        match &self.acquire {
+            AuthorizedServingAcquire::Normal { request, result } => {
+                LastVolumeTransition::NormalAcquire {
+                    request: request.clone(),
+                    result: result.clone(),
+                }
+            }
+            AuthorizedServingAcquire::Takeover { authorization, .. } => {
+                LastVolumeTransition::Takeover {
+                    authorization_id: authorization.authorization_id.clone(),
+                }
+            }
+        }
+    }
+
+    /// Lossless projection used by runtime checkpoints.  The takeover arm
+    /// deliberately carries only the authorization identifier because the
+    /// complete consumed authorization remains sealed in this artifact.
+    pub fn checkpoint_acquire_request(&self) -> VolumeAcquireRequest {
+        match &self.acquire {
+            AuthorizedServingAcquire::Normal { request, .. } => VolumeAcquireRequest::Normal {
+                volume_id: request.volume_id.clone(),
+                transition_id: request.transition_id.clone(),
+                attachment_id: request.attachment_id.clone(),
+                expected_unowned_epoch: request.expected_unowned_epoch,
+                desired_revision: request.desired_revision,
+                placement_epoch: request.placement_epoch,
+                lease_duration_ms: request.lease_duration_ms,
+            },
+            AuthorizedServingAcquire::Takeover { authorization, .. } => {
+                VolumeAcquireRequest::Takeover {
+                    authorization_id: authorization.authorization_id.clone(),
+                }
+            }
+        }
+    }
 }
 
 /// Validate the internally closed serving input before any authority or local
@@ -58,28 +163,55 @@ pub fn validate_authorized_serving_attachment(
     attachment: &AuthorizedServingAttachment,
 ) -> Result<()> {
     let identity = &attachment.identity;
-    let AcquireOrigin::Normal { transition_id } = &identity.acquire_origin else {
-        return Err(AuthorityError::BackendUnknown);
-    };
-    validate_normal_acquire_pair(&attachment.acquire_request, &attachment.acquire_result)?;
     if !(1..=MAX_INTEGER).contains(&attachment.size_bytes)
         || !remote_head_is_valid(&attachment.head)
         || attachment.lease_expires_at.get() == 0
-        || attachment.acquire_request.volume_id != identity.volume_id
-        || attachment.acquire_request.transition_id != *transition_id
-        || attachment.acquire_request.attachment_id != identity.attachment_id
-        || attachment.acquire_request.placement_epoch != identity.placement_epoch
-        || attachment.acquire_result.volume_id != identity.volume_id
-        || attachment.acquire_result.transition_id != *transition_id
-        || attachment.acquire_result.attachment_id != identity.attachment_id
-        || attachment.acquire_result.resulting_epoch != identity.attachment_epoch
-        || attachment.acquire_result.lease_expires_at != attachment.lease_expires_at
-        || !remote_head_is_same_or_later(
-            &attachment.head,
-            &attachment.acquire_result.resulting_head,
-        )
     {
         return Err(AuthorityError::BackendUnknown);
+    }
+    match (&identity.acquire_origin, &attachment.acquire) {
+        (
+            AcquireOrigin::Normal { transition_id },
+            AuthorizedServingAcquire::Normal { request, result },
+        ) => {
+            validate_normal_acquire_pair(request, result)?;
+            if request.volume_id != identity.volume_id
+                || request.transition_id != *transition_id
+                || request.attachment_id != identity.attachment_id
+                || request.placement_epoch != identity.placement_epoch
+                || result.volume_id != identity.volume_id
+                || result.transition_id != *transition_id
+                || result.attachment_id != identity.attachment_id
+                || result.resulting_epoch != identity.attachment_epoch
+                || result.lease_expires_at != attachment.lease_expires_at
+                || !remote_head_is_same_or_later(&attachment.head, &result.resulting_head)
+            {
+                return Err(AuthorityError::BackendUnknown);
+            }
+        }
+        (
+            AcquireOrigin::Takeover { authorization_id },
+            AuthorizedServingAcquire::Takeover {
+                authorization,
+                receipt,
+            },
+        ) => {
+            validate_takeover_receipt(authorization, receipt)?;
+            let initial_expiry =
+                checked_expiry(receipt.consumed_at, authorization.lease_duration_ms)?;
+            if authorization.authorization_id != *authorization_id
+                || authorization.authorized_node_id != identity.node_id
+                || authorization.volume_id != identity.volume_id
+                || authorization.new_attachment_id != identity.attachment_id
+                || authorization.new_placement_epoch != identity.placement_epoch
+                || receipt.resulting_epoch != identity.attachment_epoch
+                || initial_expiry != attachment.lease_expires_at
+                || !remote_head_is_same_or_later(&attachment.head, &receipt.resulting_head)
+            {
+                return Err(AuthorityError::BackendUnknown);
+            }
+        }
+        _ => return Err(AuthorityError::BackendUnknown),
     }
     Ok(())
 }
@@ -103,12 +235,24 @@ pub fn validate_authorized_serving_record(
         || record.lease_owner.as_ref() != Some(&attachment.identity.attachment_id)
         || record.lease_epoch != attachment.identity.attachment_epoch
         || expected_expiry.is_some_and(|expiry| record.lease_expires_at != Some(expiry))
-        || record.last_transition
-            != Some(LastVolumeTransition::NormalAcquire {
-                request: attachment.acquire_request.clone(),
-                result: attachment.acquire_result.clone(),
-            })
     {
+        return Err(AuthorityError::BackendUnknown);
+    }
+    let marker_matches = match &attachment.acquire {
+        AuthorizedServingAcquire::Normal { request, result } => {
+            record.last_transition
+                == Some(LastVolumeTransition::NormalAcquire {
+                    request: request.clone(),
+                    result: result.clone(),
+                })
+        }
+        AuthorizedServingAcquire::Takeover { authorization, .. } => matches!(
+            &record.last_transition,
+            Some(LastVolumeTransition::Takeover { authorization_id })
+                if authorization_id == &authorization.authorization_id
+        ),
+    };
+    if !marker_matches {
         return Err(AuthorityError::BackendUnknown);
     }
     Ok(())

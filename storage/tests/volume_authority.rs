@@ -105,8 +105,7 @@ fn authorized_serving_attachment() -> (AuthorizedServingAttachment, VolumeRecord
             durability: record.durability,
             head: record.head.clone(),
             lease_expires_at: record.lease_expires_at.unwrap(),
-            acquire_request: request,
-            acquire_result: result,
+            acquire: AuthorizedServingAcquire::Normal { request, result },
         },
         record,
     )
@@ -179,6 +178,103 @@ fn takeover_authorization(volume: &VolumeRecord) -> AuthorizationRecord {
         }),
         state: AuthorizationState::Unconsumed,
     }
+}
+
+fn authorized_takeover_attachment() -> (AuthorizedServingAttachment, VolumeRecord) {
+    let owned = acquired_volume();
+    let event = host_fence_event(HostFenceEventState::Active);
+    let authorization_record = takeover_authorization(&owned);
+    let (record, consumed, result) = consume_takeover(
+        &owned,
+        &event,
+        &authorization_record,
+        &id("takeover-auth-1"),
+        time(20_000),
+    )
+    .unwrap();
+    let VolumeAuthorization::Takeover(authorization) = consumed.authorization else {
+        unreachable!()
+    };
+    let AuthorizationState::Consumed(receipt) = consumed.state else {
+        unreachable!()
+    };
+    let AuthorizationConsumedReceipt::Takeover(receipt) = *receipt else {
+        unreachable!()
+    };
+    (
+        AuthorizedServingAttachment {
+            identity: AttachmentLineageIdentity {
+                volume_id: record.volume_id.clone(),
+                attachment_id: result.attachment_id,
+                attachment_epoch: result.resulting_epoch,
+                acquire_origin: AcquireOrigin::Takeover {
+                    authorization_id: authorization.authorization_id.clone(),
+                },
+                node_id: authorization.authorized_node_id.clone(),
+                placement_epoch: authorization.new_placement_epoch,
+            },
+            size_bytes: record.size_bytes,
+            durability: record.durability,
+            head: record.head.clone(),
+            lease_expires_at: result.lease_expires_at,
+            acquire: AuthorizedServingAcquire::Takeover {
+                authorization,
+                receipt,
+            },
+        },
+        record,
+    )
+}
+
+#[test]
+fn authorized_takeover_binds_consumed_thick_proof_and_current_marker() {
+    let (attachment, record) = authorized_takeover_attachment();
+    validate_authorized_serving_attachment(&attachment).unwrap();
+    validate_authorized_serving_record(&record, &attachment, Some(time(26_000))).unwrap();
+    assert_eq!(attachment.lease_duration_ms(), 6_000);
+    assert_eq!(attachment.initial_head(), &head(4));
+    assert_eq!(
+        attachment.checkpoint_acquire_request(),
+        VolumeAcquireRequest::Takeover {
+            authorization_id: id("takeover-auth-1")
+        }
+    );
+
+    let mut advanced_attachment = attachment.clone();
+    advanced_attachment.head = head(5);
+    let mut advanced_record = record.clone();
+    advanced_record.head = head(5);
+    validate_authorized_serving_attachment(&advanced_attachment).unwrap();
+    validate_authorized_serving_record(&advanced_record, &advanced_attachment, Some(time(26_000)))
+        .unwrap();
+
+    let mut wrong_consumed_at = attachment.clone();
+    let AuthorizedServingAcquire::Takeover { receipt, .. } = &mut wrong_consumed_at.acquire else {
+        unreachable!()
+    };
+    receipt.consumed_at = time(20_001);
+    assert_eq!(
+        validate_authorized_serving_attachment(&wrong_consumed_at),
+        Err(AuthorityError::BackendUnknown)
+    );
+
+    let mut wrong_marker = record.clone();
+    wrong_marker.last_transition = Some(LastVolumeTransition::Takeover {
+        authorization_id: id("normal-looking-same-text"),
+    });
+    assert_eq!(
+        validate_authorized_serving_record(&wrong_marker, &attachment, None),
+        Err(AuthorityError::BackendUnknown)
+    );
+
+    let mut crossed_variant = attachment;
+    crossed_variant.identity.acquire_origin = AcquireOrigin::Normal {
+        transition_id: random_id(1),
+    };
+    assert_eq!(
+        validate_authorized_serving_attachment(&crossed_variant),
+        Err(AuthorityError::BackendUnknown)
+    );
 }
 
 fn disposable_authorization(

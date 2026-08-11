@@ -30,7 +30,8 @@ use cats_api::runtime_reconciliation::{
 };
 use cats_storage::authority::{
     validate_authorized_serving_attachment, validate_authorized_serving_record,
-    validate_volume_record, AttachmentLineageIdentity, AuthorizedServingAttachment,
+    validate_volume_record, AttachmentLineageIdentity, AuthorizedServingAcquire,
+    AuthorizedServingAttachment,
 };
 
 const RESPONSE_TIMEOUT: Duration = Duration::from_secs(15);
@@ -462,8 +463,10 @@ pub fn recover_normal_acquire_from_authority(
         // Preserve the first grant. A later successful renew may advance the
         // current expiry but cannot rewrite the acquire receipt.
         lease_expires_at: stored_result.lease_expires_at,
-        acquire_request: stored_request.clone(),
-        acquire_result: stored_result.clone(),
+        acquire: AuthorizedServingAcquire::Normal {
+            request: stored_request.clone(),
+            result: stored_result.clone(),
+        },
     };
     if validate_authorized_serving_record(record, &attachment, None).is_err() {
         return Ok(NormalAcquireAuthorityRecovery::Blocked);
@@ -700,8 +703,10 @@ fn exact_success_attachment(
         durability: grant.durability,
         head: grant.head,
         lease_expires_at: grant.lease_expires_at,
-        acquire_request,
-        acquire_result,
+        acquire: AuthorizedServingAcquire::Normal {
+            request: acquire_request,
+            result: acquire_result,
+        },
     };
     validate_authorized_serving_attachment(&attachment)
         .is_ok()
@@ -1458,8 +1463,7 @@ mod tests {
     use cats_api::runtime_reconciliation::{
         decode_runtime_volume_transition_request, encode_runtime_volume_transition_error,
         ContractError, ContractVersion, Durability, Generation, GuestDeviceIdentity, Id,
-        LastVolumeTransition, RemoteHead, Revision, RuntimeVolumeTransitionPreconditionProblem,
-        Sha256Digest, UnixMillis,
+        RemoteHead, Revision, RuntimeVolumeTransitionPreconditionProblem, Sha256Digest, UnixMillis,
     };
 
     use super::*;
@@ -1612,8 +1616,9 @@ mod tests {
         assert_eq!(attachment.identity.attachment_id.as_str(), "att_01");
         assert_eq!(attachment.identity.attachment_epoch.get(), 1);
         assert_eq!(attachment.identity.node_id.as_str(), "node_a");
-        assert_eq!(attachment.acquire_request.lease_duration_ms, 60_000);
-        assert_eq!(attachment.acquire_result.resulting_head, attachment.head);
+        let (acquire_request, acquire_result) = attachment.normal_acquire().unwrap();
+        assert_eq!(acquire_request.lease_duration_ms, 60_000);
+        assert_eq!(acquire_result.resulting_head, attachment.head);
         let seen = client.transport().seen.lock().unwrap();
         assert_eq!(
             seen.as_slice(),
@@ -2117,10 +2122,7 @@ mod tests {
             // Model a renew whose response was also lost. Recovery retains
             // the original grant expiry while proving the current owner.
             lease_expires_at: Some(UnixMillis::new(1_720_000_120_000).unwrap()),
-            last_transition: Some(LastVolumeTransition::NormalAcquire {
-                request: attachment.acquire_request.clone(),
-                result: attachment.acquire_result.clone(),
-            }),
+            last_transition: Some(attachment.expected_last_transition()),
         };
         let recovered = recover_normal_acquire_from_authority(&request, &volume, &record).unwrap();
         let NormalAcquireAuthorityRecovery::Granted(recovered) = recovered else {
@@ -2140,17 +2142,14 @@ mod tests {
             panic!("later exact head was not adopted")
         };
         assert_eq!(recovered.head, record.head);
-        assert_eq!(
-            recovered.acquire_result.resulting_head,
-            attachment.acquire_result.resulting_head
-        );
+        assert_eq!(recovered.initial_head(), attachment.initial_head());
 
         let predecessor = VolumeRecord {
             volume_id: volume.volume_id.clone(),
             size_bytes: volume.size_bytes,
             durability: volume.durability,
             admin_state: VolumeAdminState::Active,
-            head: attachment.acquire_result.resulting_head.clone(),
+            head: attachment.initial_head().clone(),
             lease_owner: None,
             lease_epoch: cats_api::runtime_reconciliation::FenceEpoch::new(0).unwrap(),
             lease_expires_at: None,

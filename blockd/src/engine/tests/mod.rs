@@ -268,8 +268,7 @@ fn serving_fixture(durability: VolumeDurability) -> ServingFixture {
         durability: record.durability,
         head: record.head.clone(),
         lease_expires_at: result.lease_expires_at,
-        acquire_request: request,
-        acquire_result: result,
+        acquire: cats_storage::authority::AuthorizedServingAcquire::Normal { request, result },
     };
     let data_dir = dir.path().join("serving-data");
     let mut config = EngineConfig::new(VOL, &data_dir, "attA");

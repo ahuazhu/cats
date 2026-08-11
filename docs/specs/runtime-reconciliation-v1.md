@@ -991,6 +991,13 @@ basename或当前Desired枚举停止。该transient service必须以`systemd-run
 `CollectMode=inactive-or-failed`；即使进程忽略TERM并由pidfd KILL，unit也必须最终成为`LoadState=not-found`，不能
 让failed unit永久阻塞fresh global absence。
 
+`authorized-serving`的acquire authority是strict tagged closed enum：`normal {request,result}`或
+`takeover {authorization,receipt}`。takeover arm必须保留Control-signed evidence中的完整consumed
+`VolumeTakeoverAuthorization + TakeoverConsumedReceipt`；薄LeaseGrant不能替代它。validator逐字段绑定
+AcquireOrigin、authorized Node、volume/new attachment、placement、receipt event/epoch/head，并用
+`consumed_at + lease_duration_ms` checked-add得到唯一首次expiry。后续合法写入可推进artifact/current Volume
+head，但同generation必须整tuple exact；current Volume仍须保留同一takeover marker、owner和epoch。
+
 信号响应丢失或Agent restart后必须重放同一receipt。serialized pre-scan先重验旧checkpoint/authorized digests
 和current authority；`lease_expires_at`必须不早于retained launch artifact，重放时还不得早于receipt记录值，
 合法续租只能单调推进；回退或owner/epoch/head/transition marker等任何漂移都零retirement、零cleanup。随后用

@@ -648,13 +648,7 @@ fn build_launch_with_authorization(
         OsString::from("--object-store-adapter"),
         OsString::from(&config.blockd.object_store.name),
         OsString::from("--lease-ttl-ms"),
-        OsString::from(
-            expected
-                .attachment
-                .acquire_request
-                .lease_duration_ms
-                .to_string(),
-        ),
+        OsString::from(expected.attachment.lease_duration_ms().to_string()),
         OsString::from("--max-staged-bytes"),
         OsString::from(config.blockd.max_staged_bytes.to_string()),
         OsString::from("--max-staged-packs"),
@@ -4474,15 +4468,17 @@ while True:
             durability: Durability::Strict,
             head: head.clone(),
             lease_expires_at: UnixMillis::new(1_900_000_060_000).unwrap(),
-            acquire_result: NormalAcquireResult {
-                volume_id: request.volume_id.clone(),
-                transition_id: request.transition_id.clone(),
-                attachment_id: request.attachment_id.clone(),
-                resulting_epoch: FenceEpoch::new(7).unwrap(),
-                resulting_head: head,
-                lease_expires_at: UnixMillis::new(1_900_000_060_000).unwrap(),
+            acquire: cats_storage::authority::AuthorizedServingAcquire::Normal {
+                result: NormalAcquireResult {
+                    volume_id: request.volume_id.clone(),
+                    transition_id: request.transition_id.clone(),
+                    attachment_id: request.attachment_id.clone(),
+                    resulting_epoch: FenceEpoch::new(7).unwrap(),
+                    resulting_head: head,
+                    lease_expires_at: UnixMillis::new(1_900_000_060_000).unwrap(),
+                },
+                request,
             },
-            acquire_request: request,
         }
     }
 

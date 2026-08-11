@@ -27,8 +27,8 @@ use cats_api::runtime_reconciliation::{
 };
 use cats_storage::authority::{
     validate_authorized_serving_attachment, validate_authorized_serving_record,
-    validate_volume_record, AttachmentLineageIdentity, AuthorityError, AuthorizedServingAttachment,
-    VolumeDataAuthority,
+    validate_volume_record, AttachmentLineageIdentity, AuthorityError, AuthorizedServingAcquire,
+    AuthorizedServingAttachment, VolumeDataAuthority,
 };
 use cats_storage::{read_image_manifest_until, BlobStore, ImageManifestReadError};
 
@@ -2358,8 +2358,10 @@ fn attachment_from_checkpoint_acquire(
         durability: record.durability,
         head: result.resulting_head.clone(),
         lease_expires_at: result.lease_expires_at,
-        acquire_request: stored_request.clone(),
-        acquire_result: result.clone(),
+        acquire: AuthorizedServingAcquire::Normal {
+            request: stored_request.clone(),
+            result: result.clone(),
+        },
     };
     (validate_authorized_serving_attachment(&attachment).is_ok()
         && validate_authorized_serving_record(record, &attachment, None).is_ok())
@@ -2417,8 +2419,10 @@ fn attachment_from_current_desired(
         durability: record.durability,
         head: result.resulting_head.clone(),
         lease_expires_at: result.lease_expires_at,
-        acquire_request: request.clone(),
-        acquire_result: result.clone(),
+        acquire: AuthorizedServingAcquire::Normal {
+            request: request.clone(),
+            result: result.clone(),
+        },
     };
     (validate_authorized_serving_attachment(&attachment).is_ok()
         && validate_authorized_serving_record(record, &attachment, None).is_ok())
@@ -2431,6 +2435,9 @@ fn attachment_is_adoptable(
     observed: &ObservedVolume,
     attachment: &AuthorizedServingAttachment,
 ) -> bool {
+    let Some((request, _)) = attachment.normal_acquire() else {
+        return false;
+    };
     let VolumeAcquire::Normal {
         transition_id,
         expected_unowned_epoch,
@@ -2449,8 +2456,8 @@ fn attachment_is_adoptable(
         && attachment.identity.placement_epoch == desired.placement.placement_epoch
         && attachment.size_bytes == volume.size_bytes
         && attachment.durability == volume.durability
-        && attachment.acquire_request.expected_unowned_epoch == *expected_unowned_epoch
-        && attachment.acquire_request.desired_revision <= desired.desired_revision
+        && request.expected_unowned_epoch == *expected_unowned_epoch
+        && request.desired_revision <= desired.desired_revision
 }
 
 fn observed_authority_matches_attachment(
@@ -2465,7 +2472,10 @@ fn observed_authority_matches_attachment(
             head,
         } if attachment_id == &attachment.identity.attachment_id
             && *attachment_epoch == attachment.identity.attachment_epoch
-            && head.generation >= attachment.acquire_result.resulting_head.generation
+            && cats_storage::authority::remote_head_is_same_or_later(
+                head,
+                attachment.initial_head(),
+            )
     )
 }
 
@@ -2481,12 +2491,11 @@ fn record_matches_attachment_lineage(
         && matches!(record.admin_state, VolumeAdminState::Active)
         && record.lease_owner.as_ref() == Some(&attachment.identity.attachment_id)
         && record.lease_epoch == attachment.identity.attachment_epoch
-        && record.last_transition
-            == Some(LastVolumeTransition::NormalAcquire {
-                request: attachment.acquire_request.clone(),
-                result: attachment.acquire_result.clone(),
-            })
-        && record.head.generation >= attachment.acquire_result.resulting_head.generation
+        && record.last_transition == Some(attachment.expected_last_transition())
+        && cats_storage::authority::remote_head_is_same_or_later(
+            &record.head,
+            attachment.initial_head(),
+        )
 }
 
 fn local_lineage_is_absent_or_exact(
@@ -4293,20 +4302,11 @@ mod tests {
     fn acquire_checkpoint_restart_identity_ignores_only_observation_time() {
         let desired = desired();
         let attachment = attachment(&desired);
-        let request = &attachment.acquire_request;
         let stored = acquire_checkpoint(
             &desired,
             &desired.volumes[0],
             RuntimeVolumeTransition::Acquire {
-                request: VolumeAcquireRequest::Normal {
-                    volume_id: request.volume_id.clone(),
-                    transition_id: request.transition_id.clone(),
-                    attachment_id: request.attachment_id.clone(),
-                    expected_unowned_epoch: request.expected_unowned_epoch,
-                    desired_revision: request.desired_revision,
-                    placement_epoch: request.placement_epoch,
-                    lease_duration_ms: request.lease_duration_ms,
-                },
+                request: attachment.checkpoint_acquire_request(),
             },
             unix_ms(1_900_000_000_000),
         );
@@ -6738,8 +6738,7 @@ mod tests {
             durability: volume.durability,
             head: blank_head(),
             lease_expires_at: result.lease_expires_at,
-            acquire_request: request,
-            acquire_result: result,
+            acquire: AuthorizedServingAcquire::Normal { request, result },
         }
     }
 
@@ -6747,20 +6746,11 @@ mod tests {
         desired: &DesiredRuntimeSpec,
         attachment: &AuthorizedServingAttachment,
     ) -> RuntimeCheckpoint {
-        let request = &attachment.acquire_request;
         acquire_checkpoint(
             desired,
             &desired.volumes[0],
             RuntimeVolumeTransition::Acquire {
-                request: VolumeAcquireRequest::Normal {
-                    volume_id: request.volume_id.clone(),
-                    transition_id: request.transition_id.clone(),
-                    attachment_id: request.attachment_id.clone(),
-                    expected_unowned_epoch: request.expected_unowned_epoch,
-                    desired_revision: request.desired_revision,
-                    placement_epoch: request.placement_epoch,
-                    lease_duration_ms: request.lease_duration_ms,
-                },
+                request: attachment.checkpoint_acquire_request(),
             },
             unix_ms(1_900_000_000_000),
         )
@@ -6807,10 +6797,7 @@ mod tests {
             lease_owner: Some(attachment.identity.attachment_id.clone()),
             lease_epoch: attachment.identity.attachment_epoch,
             lease_expires_at: Some(attachment.lease_expires_at),
-            last_transition: Some(LastVolumeTransition::NormalAcquire {
-                request: attachment.acquire_request.clone(),
-                result: attachment.acquire_result.clone(),
-            }),
+            last_transition: Some(attachment.expected_last_transition()),
         }
     }
 
