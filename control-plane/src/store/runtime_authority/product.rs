@@ -213,7 +213,6 @@ pub(crate) struct ExactHttpResponse {
 impl ExactHttpResponse {
     // The HTTP/service boundary constructs these envelopes after its own
     // media-envelope validation; F2a only consumes them in the Store.
-    #[allow(dead_code, reason = "consumed by the later HTTP/service cutover")]
     pub(crate) fn new(
         http_status: u16,
         content_type: Option<ExactContentType>,
@@ -247,7 +246,6 @@ pub(crate) struct CatCreateEnvelopes {
 }
 
 impl CatCreateEnvelopes {
-    #[allow(dead_code, reason = "consumed by the later HTTP/service cutover")]
     pub(crate) fn new(
         accepted_response: ExactHttpResponse,
         accepted_cat_id: Id,
@@ -310,10 +308,17 @@ pub(crate) enum CandidateCollision {
 }
 
 #[derive(Debug)]
-// F2a exposes this typed boundary before the service cutover consumes it.
-#[allow(dead_code, reason = "consumed by the later HTTP/service cutover")]
 pub(crate) enum CoveredCatCreateError {
-    CandidateCollision(CandidateCollision),
+    CandidateCollision(
+        #[cfg_attr(
+            not(test),
+            allow(
+                dead_code,
+                reason = "production retries every candidate collision; tests assert the typed cause"
+            )
+        )]
+        CandidateCollision,
+    ),
     PlacementStale,
     Store(ApiError),
 }
@@ -522,16 +527,21 @@ impl From<postgres::Error> for CreateCatTransactionError {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[allow(dead_code, reason = "consumed by the later HTTP fingerprint cutover")]
 pub(crate) enum IfMatchFingerprint {
     Absent,
+    #[cfg_attr(
+        not(test),
+        allow(
+            dead_code,
+            reason = "Cat-create has no If-Match; later product mutations use the generation arm"
+        )
+    )]
     Generation(Generation),
 }
 
 /// Computes the one byte-level request fingerprint shared by every covered
 /// Workspace product mutation. Envelope validation happens before this
 /// boundary; this function deliberately does no JSON/path normalization.
-#[allow(dead_code, reason = "consumed by the later HTTP fingerprint cutover")]
 pub(crate) fn api_request_fingerprint(
     authenticated_workspace_id: &Id,
     canonical_route: &AsciiText,
@@ -574,7 +584,6 @@ pub(crate) fn encode_cat_create_accepted_response(
         .map_err(internal)
 }
 
-#[allow(dead_code, reason = "consumed by the later HTTP/service cutover")]
 pub(crate) fn encode_cat_name_conflict_response() -> Vec<u8> {
     CAT_NAME_CONFLICT_BODY.to_vec()
 }
@@ -582,7 +591,6 @@ pub(crate) fn encode_cat_name_conflict_response() -> Vec<u8> {
 impl Store {
     /// Optional preflight optimization. It never reserves the key and never
     /// reads a resource; the create transaction below always rechecks.
-    #[allow(dead_code, reason = "consumed by the later HTTP/service cutover")]
     pub(crate) fn cat_create_result_fast_lookup(
         &self,
         request: &ApiIdempotencyRequest,
@@ -639,7 +647,7 @@ impl Store {
         })
     }
 
-    #[allow(dead_code, reason = "consumed by the later HTTP/service cutover")]
+    #[cfg(test)]
     pub(crate) fn create_cat_covered_with_admission(
         &self,
         request: &CoveredCatCreateRequest,

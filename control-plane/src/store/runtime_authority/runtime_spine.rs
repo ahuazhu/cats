@@ -54,6 +54,7 @@ pub(crate) const MAX_ASSIGNED_SPECS: usize = 1024;
 
 /// One process-local planner page. The page size bounds each authority read;
 /// it is not a fleet-size, persisted, or wire-protocol limit.
+#[cfg(test)]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct ProvisionedNodeIdPage {
     pub(crate) node_ids: Vec<Id>,
@@ -256,6 +257,7 @@ impl Store {
     /// placement admission snapshot for every returned id. A change between
     /// pages merely invalidates that plan; the selected NodeIdentity remains
     /// the unique assigned-set coordination lock at Desired commit time.
+    #[cfg(test)]
     pub(crate) fn list_provisioned_node_ids_after(
         &self,
         after: Option<&Id>,
@@ -321,6 +323,7 @@ impl Store {
         })
     }
 
+    #[cfg(test)]
     pub(crate) fn runtime_desired_read(
         &self,
         authenticated: &AuthenticatedNodeCredential,
@@ -348,6 +351,7 @@ impl Store {
         })
     }
 
+    #[cfg(test)]
     pub(crate) fn runtime_accept_observation(
         &self,
         authenticated: &AuthenticatedNodeCredential,
@@ -375,6 +379,7 @@ impl Store {
         })
     }
 
+    #[cfg(test)]
     pub(crate) fn load_placement_admission_snapshot(
         &self,
         node_id: &Id,
@@ -386,6 +391,7 @@ impl Store {
         })
     }
 
+    #[cfg(test)]
     pub(crate) fn load_route_runtime_snapshot(
         &self,
         node_id: &Id,
@@ -1332,7 +1338,6 @@ fn accept_observation_in(
 enum ValidatedInventory {
     Full {
         desired_state: DesiredReadState,
-        current_desired: Vec<DesiredRuntimeSpec>,
     },
     Partial {
         inventory: Box<AdmissionInventoryState>,
@@ -1456,10 +1461,7 @@ fn accept_observation_core(
     encode_observation_acceptance(&acceptance).map_err(corrupt)?;
 
     match inventory {
-        ValidatedInventory::Full {
-            mut desired_state,
-            current_desired: _,
-        } => {
+        ValidatedInventory::Full { mut desired_state } => {
             let attestation = match &acceptance.inventory {
                 ObservationInventoryAcceptance::Full { attestation } => attestation.clone(),
                 ObservationInventoryAcceptance::Partial { .. } => {
@@ -1625,10 +1627,7 @@ fn validate_inventory(
                 )));
             }
         }
-        Ok(Ok(ValidatedInventory::Full {
-            desired_state,
-            current_desired,
-        }))
+        Ok(Ok(ValidatedInventory::Full { desired_state }))
     } else {
         let inventory_state =
             load_admission_inventory_state_for_update(transaction, &session.node_id)?;

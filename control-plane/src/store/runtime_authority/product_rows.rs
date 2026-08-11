@@ -859,7 +859,6 @@ pub(super) fn decode_desired(row: &Row) -> AuthorityTxResult<DesiredRuntimeSpec>
     Ok(record)
 }
 
-#[allow(dead_code, reason = "consumed by the F3c Desired/inventory spine")]
 pub(super) fn load_assigned_desired_for_update(
     transaction: &mut Transaction<'_>,
     node_id: &Id,
@@ -876,7 +875,6 @@ pub(super) fn load_assigned_desired_for_update(
         .collect()
 }
 
-#[allow(dead_code, reason = "consumed by the F3c admission snapshot loader")]
 pub(super) fn load_assigned_desired_unlocked(
     transaction: &mut Transaction<'_>,
     node_id: &Id,
@@ -1034,7 +1032,6 @@ pub(super) fn load_operation_by_cat_revision_unlocked(
         .transpose()
 }
 
-#[allow(dead_code, reason = "consumed by the F3c observation transaction")]
 pub(super) fn load_pending_operation_by_cat_for_update(
     transaction: &mut Transaction<'_>,
     cat_id: &Id,
@@ -1049,7 +1046,6 @@ pub(super) fn load_pending_operation_by_cat_for_update(
         .transpose()
 }
 
-#[allow(dead_code, reason = "consumed by the F3c observation transaction")]
 pub(super) fn update_operation(
     transaction: &mut Transaction<'_>,
     record: &Operation,

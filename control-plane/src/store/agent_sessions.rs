@@ -41,12 +41,10 @@ const PROVISIONED_NODE_ID_QUERY_LIMIT: i64 = PROVISIONED_NODE_ID_PAGE_SIZE as i6
 /// Process-lifetime registration policy derived from one validated release
 /// artifact. The lease is the fixed V1 protocol constant, not configuration.
 #[derive(Debug, Clone, PartialEq, Eq)]
-#[allow(dead_code, reason = "consumed by the Node registration service slice")]
 pub(crate) struct AgentSessionRegistrationPolicy {
     approved_guest_config_digest: Sha256Digest,
 }
 
-#[allow(dead_code, reason = "consumed by the Node registration service slice")]
 impl AgentSessionRegistrationPolicy {
     pub(crate) fn from_release_receipt(receipt: &GuestRuntimeProfileReceipt) -> Result<Self> {
         let approved_guest_config_digest = guest_config_digest(receipt).map_err(|error| {
@@ -69,7 +67,6 @@ impl AgentSessionRegistrationPolicy {
 /// before exposing it; it must not turn these values into a fabricated
 /// `ContractError`.
 #[derive(Debug, Clone, PartialEq, Eq)]
-#[allow(dead_code, reason = "consumed by the Node registration service slice")]
 pub(crate) enum AgentRegistrationRejection {
     IdentityNotEligible,
     SessionEpochMismatch {
@@ -80,7 +77,6 @@ pub(crate) enum AgentRegistrationRejection {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-#[allow(dead_code, reason = "consumed by the Node registration service slice")]
 pub(crate) enum AgentRegistrationOutcome {
     Registered(AgentSession),
     Rejected(AgentRegistrationRejection),
@@ -328,7 +324,6 @@ impl Store {
     /// Exact attempt replay returns the first committed session, including its
     /// original deadline. A new attempt allocates epoch and deadline only
     /// after identity, replay, active-release and expected-epoch validation.
-    #[allow(dead_code, reason = "consumed by the Node registration service slice")]
     pub(crate) fn register_agent_session(
         &self,
         authenticated: &AuthenticatedNodeCredential,
@@ -728,7 +723,6 @@ pub(super) fn load_identity_by_node_for_update(
         .transpose()
 }
 
-#[allow(dead_code, reason = "consumed by the F3c admission snapshot loader")]
 pub(super) fn load_identity_by_node_unlocked(
     transaction: &mut Transaction<'_>,
     node_id: &Id,
@@ -894,7 +888,6 @@ fn load_current_session_locked(
     Ok(Some(session))
 }
 
-#[allow(dead_code, reason = "consumed by the F3c admission snapshot loader")]
 pub(super) fn load_current_session_unlocked(
     transaction: &mut Transaction<'_>,
     node_id: &Id,
@@ -1061,7 +1054,6 @@ fn replace_current_session(
     exactly_one(changed)
 }
 
-#[allow(dead_code, reason = "consumed by the F3c observation transaction")]
 pub(super) fn renew_current_session_deadline(
     transaction: &mut Transaction<'_>,
     current: &AgentSession,

@@ -364,10 +364,6 @@ enum AttemptFailure {
 }
 
 #[derive(Clone, Copy)]
-#[allow(
-    dead_code,
-    reason = "read-only variant is consumed by the F3c composition"
-)]
 enum AuthorityTransactionMode {
     ReadWrite,
     RepeatableRead,
@@ -462,7 +458,6 @@ impl Store {
     /// Consumers must receive either the complete mutually-consistent fact set
     /// or no fact set at all, so this deliberately shares the retry and
     /// fail-closed error policy of mutation transactions.
-    #[allow(dead_code, reason = "consumed by F3c planner/signer facts loaders")]
     pub(super) fn authority_read_snapshot<T: Send>(
         &self,
         operation: impl FnMut(&mut postgres::Transaction<'_>) -> AuthorityTxResult<T> + Send,
