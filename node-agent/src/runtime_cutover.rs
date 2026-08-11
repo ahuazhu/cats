@@ -623,6 +623,9 @@ fn apply_readiness_policy(
 }
 
 #[cfg(test)]
+mod cross_component_e2e;
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use axum::body::{Body, Bytes};
