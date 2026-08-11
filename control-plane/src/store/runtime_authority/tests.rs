@@ -2554,10 +2554,10 @@ fn a22_commit_initialized_is_atomic_idempotent_and_conflict_closed() {
         )
     ));
 
-    // Once the Disk CAS has committed, the old Initialize Desired cannot be
-    // reused to enter another storage mutation. Control must project a fresh
-    // Existing Desired first.
-    let stale_acquire = transition_request(
+    // Initialize is the durable intent spanning its one-time Disk CAS. The
+    // same current Desired remains valid for the later Mount/Ready tail; an
+    // exact lease replay therefore stays idempotent after initialization.
+    let post_commit_acquire_replay = transition_request(
         &node,
         &desired,
         RuntimeVolumeTransition::Acquire {
@@ -2573,14 +2573,14 @@ fn a22_commit_initialized_is_atomic_idempotent_and_conflict_closed() {
         },
     );
     let before = stored_volume_row(&store, &volume.volume_id);
+    let VolumeTransitionStoreOutcome::Accepted(success) =
+        execute_transition(&store, &node, &post_commit_acquire_replay).unwrap()
+    else {
+        panic!("post-initialization lease replay rejected its current Initialize Desired")
+    };
     assert!(matches!(
-        execute_transition(&store, &node, &stale_acquire).unwrap(),
-        VolumeTransitionStoreOutcome::Rejected(
-            VolumeTransitionStoreRejection::TransitionPreconditionFailed {
-                problem: RuntimeVolumeTransitionPreconditionProblem::VolumeIntentMismatch,
-                ..
-            }
-        )
+        success.outcome,
+        RuntimeVolumeTransitionOutcome::LeaseGranted { .. }
     ));
     assert_eq!(stored_volume_row(&store, &volume.volume_id), before);
 }

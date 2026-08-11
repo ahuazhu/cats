@@ -901,9 +901,9 @@ fn persistent_initialization_f0_closes_desired_variant_and_head_drift() {
     ));
 
     let initialized_state = PersistentDiskInitialization::Initialized {
-        initialization_token: token,
+        initialization_token: token.clone(),
         filesystem_uuid: filesystem_uuid.clone(),
-        expected_blank_head: blank,
+        expected_blank_head: blank.clone(),
         initialized_head: initialized.clone(),
         initialized_at: unix_millis(7_103),
     };
@@ -915,6 +915,11 @@ fn persistent_initialization_f0_closes_desired_variant_and_head_drift() {
     assert!(persistent_initialization_matches_mount(
         &initialized_state,
         &initialized,
+        Some(&initialize_mount),
+    ));
+    assert!(persistent_initialization_matches_mount(
+        &initialized_state,
+        &initialized,
         Some(&existing_mount),
     ));
     let advanced = RemoteHead {
@@ -922,6 +927,11 @@ fn persistent_initialization_f0_closes_desired_variant_and_head_drift() {
         root_hash: Some(Sha256Digest::from_bytes([9; 32])),
         root_object_id: Some(AsciiText::new("roots/2").unwrap()),
     };
+    assert!(persistent_initialization_matches_mount(
+        &initialized_state,
+        &advanced,
+        Some(&initialize_mount),
+    ));
     assert!(persistent_initialization_matches_mount(
         &initialized_state,
         &advanced,
@@ -939,8 +949,18 @@ fn persistent_initialization_f0_closes_desired_variant_and_head_drift() {
     ));
     assert!(!persistent_initialization_matches_mount(
         &initialized_state,
-        &advanced,
+        &same_generation_foreign,
         Some(&initialize_mount),
+    ));
+    let mut wrong_initialize_mount = initialize_mount;
+    wrong_initialize_mount.initialization = FilesystemInitialization::Initialize {
+        initialization_token: random_id(7_104),
+        expected_blank_head: blank,
+    };
+    assert!(!persistent_initialization_matches_mount(
+        &initialized_state,
+        &advanced,
+        Some(&wrong_initialize_mount),
     ));
 }
 

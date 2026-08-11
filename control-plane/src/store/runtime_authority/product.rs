@@ -185,6 +185,26 @@ pub(super) fn persistent_initialization_matches_mount(
         }
         (
             PersistentDiskInitialization::Initialized {
+                initialization_token,
+                filesystem_uuid,
+                expected_blank_head,
+                initialized_head,
+                ..
+            },
+            FilesystemInitialization::Initialize {
+                initialization_token: desired_token,
+                expected_blank_head: desired_blank_head,
+            },
+        ) => {
+            mount.filesystem_uuid == *filesystem_uuid
+                && desired_token == initialization_token
+                && desired_blank_head == expected_blank_head
+                && initialized_head.generation.get() > 0
+                && (current_head.generation.get() > initialized_head.generation.get()
+                    || current_head == initialized_head)
+        }
+        (
+            PersistentDiskInitialization::Initialized {
                 filesystem_uuid,
                 initialized_head,
                 ..
@@ -192,6 +212,7 @@ pub(super) fn persistent_initialization_matches_mount(
             FilesystemInitialization::Existing,
         ) => {
             mount.filesystem_uuid == *filesystem_uuid
+                && initialized_head.generation.get() > 0
                 && (current_head.generation.get() > initialized_head.generation.get()
                     || current_head == initialized_head)
         }
