@@ -3540,12 +3540,6 @@ async fn production_signed_cutover_never_runs_or_enters_the_legacy_node_runtime(
             "invalid-before-cutover-gate",
         ),
         (
-            reqwest::Method::POST,
-            format!("{workspace_base}/disks"),
-            Some(serde_json::json!({"name": "must-not-create"})),
-            "invalid-before-cutover-gate",
-        ),
-        (
             reqwest::Method::GET,
             format!("{workspace_base}/disks"),
             None,
@@ -3712,6 +3706,21 @@ async fn production_signed_cutover_never_runs_or_enters_the_legacy_node_runtime(
             "legacy runtime entry point stayed reachable: {url}",
         );
     }
+
+    let strict_disk_create = client
+        .post(format!("{workspace_base}/disks"))
+        .bearer_auth("dev-admin-token")
+        .header(reqwest::header::CONTENT_TYPE, "application/json")
+        .header("Idempotency-Key", "reject-legacy-disk-create-shape")
+        .json(&serde_json::json!({"name": "must-not-create"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        strict_disk_create.status(),
+        StatusCode::BAD_REQUEST,
+        "the covered PersistentDisk route accepted the retired create shape",
+    );
 
     let metrics = client
         .get(format!("{}/metrics", production.base_url()))

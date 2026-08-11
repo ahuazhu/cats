@@ -36,7 +36,7 @@ Control Store 与 MetadataStore 是逻辑边界，不是两套提交authority。
 pure-domain/data-row fixture，不提供Control cross-row authority。首次消费授权与`Active -> Rejoined`
 都通过唯一PG事务域的固定锁序完成。
 
-全局锁DAG是`ApiIdempotencyResult key reservation -> CatNameLock -> NodeIdentity（写old/new assigned
+全局锁DAG是`ApiIdempotencyResult key reservation -> CatNameLock -> DiskNameLock -> NodeIdentity（写old/new assigned
 current Desired任一字段或消费current Node evidence时）-> current credential lineage（A19 auth适用时）
 -> AgentSession -> observation receive/cursor rows（适用时）
 -> HostFenceEvent -> AuthorizationRecord -> VolumeRecord -> Control Cat/Disk/Desired/Endpoint rows ->
@@ -48,7 +48,9 @@ mutation或begin-delete仍只能有一方先提交。production Runtime HTTP own
 [Runtime Volume Transitions v1](runtime-volume-transitions-v1.md)取得NodeIdentity、exact active credential lineage、
 current AgentSession和accepted inventory锁前缀，然后才进入本文的event/authorization/Volume后缀。HostFenceEvent来源的内部恢复没有API前缀；
 改变event eligibility或创建placement时从NodeIdentity开始，只消费已有authorization且不再读Node时从event开始。
-`CatNameLock`不是row或authority；只有会插入新Cat identity的create事务使用它。Cat create固定在API key之后
+`CatNameLock`和`DiskNameLock`都不是row或authority。只有会插入新Cat identity的create事务使用前者；
+Root Disk与PersistentDisk共享同一Workspace内的产品名称空间，因此两种create都在API key之后、任何Node/
+Volume/candidate identity锁之前取得后者。Cat create固定在API key之后
 取得它并先闭合名称分支：合法existing Cat按既有Volume→Cat→Disk→Desired→Endpoint/lookup→Operation锁序
 闭合existing graph后只写exact 409 result，不读取或锁定candidate plan/NodeIdentity；name free且将插入新Desired时，
 才在任何candidate Volume/Cat/Disk row或candidate-ID lock之前锁定并重验candidate `NodeIdentity`。删除已有Cat由
@@ -976,8 +978,8 @@ candidate资源锁前，Store直接丢弃本次bundle/envelope并逐字节返回
 `pg_advisory_xact_lock(hashtextextended(current_schema() || ':cat-name:' || $1 || ':' || $2,
 0::BIGINT))`，其中`$1=workspace_id`、`$2=name`。
 `Id`中的冒号或64-bit hash碰撞最多让不同名称额外串行，不会让相同tuple得到不同lock。持锁后读取并验证
-`CatRecord`：合法existing row按上述existing graph锁序闭合后选择409，并且不消费可失效的placement plan；absent才按
-NodeIdentity（锁内按A23统一顺序重验完整policy/admission、无Active HostFenceEvent、
+`CatRecord`：合法existing row按上述existing graph锁序闭合后选择409，并且不消费可失效的placement plan；absent先取得并
+闭合Root `DiskNameLock(workspace_id, disk_id)`，再按NodeIdentity（锁内按A23统一顺序重验完整policy/admission、无Active HostFenceEvent、
 post-mutation assigned count <= 1024、capacity与network probe）→Volume→Cat→Disk→Desired→EndpointRecord/
 hostname lookup→Operation锁/插入；corrupt row
 返回BackendUnknown。唯一约束只作invariant backstop，意外constraint error整体回滚，不能事后翻译成409。
@@ -1018,7 +1020,10 @@ key reservation通过后，result miss的唯一PostgreSQL事务由server分配�
 
 三者全部commit或全部不存在；连接/commit结果不明不能留下无result的单边Disk/Volume。同key重放只返回
 原201 bytes，不读resource；同key异fingerprint冲突。该路径不创建Operation、initialization job或transition
-ledger。
+ledger。result miss先取得`DiskNameLock(workspace_id, name)`并重验名称；命中合法existing Disk只写exact 409
+result，名称free才按Volume、Disk、initialization token、filesystem UUID的稳定candidate锁序插入。它不得先锁
+Volume或Disk再反向取得名称锁；与Cat Root create并发时，持同一名称锁的一方提交后，另一方只能得到typed 409
+或typed whole-bundle candidate collision，数据库unique constraint只作不可达invariant backstop。
 
 ### 8.2 Initialization CAS
 

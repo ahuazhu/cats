@@ -17,6 +17,8 @@ use crate::store::transaction::AuthorityTxResult;
 const PRE_COMMIT: u8 = 0;
 const COMMIT_SENT: u8 = 1;
 const CANCELLED: u8 = 2;
+const RESOLUTION_REGISTRY_CLOSED: usize = 1_usize << (usize::BITS - 1);
+const RESOLUTION_REGISTRY_COUNT_MASK: usize = !RESOLUTION_REGISTRY_CLOSED;
 
 struct CommitShared {
     phase: AtomicU8,
@@ -208,22 +210,49 @@ impl CoveredCommitState {
 
 #[derive(Default)]
 pub(super) struct CommitResolutionRegistry {
-    active: AtomicUsize,
+    state: AtomicUsize,
     changed: tokio::sync::Notify,
 }
 
 pub(super) struct ActiveCommitResolution(Arc<CommitResolutionRegistry>);
 
 impl CommitResolutionRegistry {
-    pub(super) fn begin(self: &Arc<Self>) -> ActiveCommitResolution {
-        self.active.fetch_add(1, Ordering::AcqRel);
-        ActiveCommitResolution(Arc::clone(self))
+    /// Registers one owner unless shutdown has already closed admission.
+    ///
+    /// The closed bit and active count share one atomic word so either this
+    /// increment linearizes before `close` (and shutdown must wait for it) or
+    /// it observes the closed bit and no late owner can appear.
+    pub(super) fn begin(self: &Arc<Self>) -> Option<ActiveCommitResolution> {
+        let mut state = self.state.load(Ordering::Acquire);
+        loop {
+            if state & RESOLUTION_REGISTRY_CLOSED != 0 {
+                return None;
+            }
+            if state & RESOLUTION_REGISTRY_COUNT_MASK == RESOLUTION_REGISTRY_COUNT_MASK {
+                return None;
+            }
+            match self.state.compare_exchange_weak(
+                state,
+                state + 1,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => return Some(ActiveCommitResolution(Arc::clone(self))),
+                Err(current) => state = current,
+            }
+        }
+    }
+
+    pub(super) fn close(&self) {
+        self.state
+            .fetch_or(RESOLUTION_REGISTRY_CLOSED, Ordering::AcqRel);
+        self.changed.notify_waiters();
     }
 
     pub(super) async fn wait_empty(&self) {
         loop {
             let changed = self.changed.notified();
-            if self.active.load(Ordering::Acquire) == 0 {
+            if self.active() == 0 {
                 return;
             }
             changed.await;
@@ -231,13 +260,13 @@ impl CommitResolutionRegistry {
     }
 
     pub(super) fn active(&self) -> usize {
-        self.active.load(Ordering::Acquire)
+        self.state.load(Ordering::Acquire) & RESOLUTION_REGISTRY_COUNT_MASK
     }
 }
 
 impl Drop for ActiveCommitResolution {
     fn drop(&mut self) {
-        self.0.active.fetch_sub(1, Ordering::AcqRel);
+        self.0.state.fetch_sub(1, Ordering::AcqRel);
         self.0.changed.notify_waiters();
     }
 }

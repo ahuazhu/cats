@@ -843,7 +843,7 @@ async fn run_reconciler_role(controller: Arc<Controller>, store: Arc<Store>, int
 
 /// Start the control plane inside the current tokio runtime.
 pub async fn spawn(cfg: Config) -> anyhow::Result<Handle> {
-    spawn_inner(cfg, false, None).await
+    spawn_inner(cfg, false, false, None).await
 }
 
 /// Start the public control plane plus the isolated mTLS Gateway machine
@@ -853,7 +853,7 @@ pub async fn spawn_with_gateway_machine(
     cfg: Config,
     gateway_machine: GatewayMachineConfig,
 ) -> anyhow::Result<Handle> {
-    spawn_inner(cfg, false, Some(gateway_machine)).await
+    spawn_inner(cfg, false, false, Some(gateway_machine)).await
 }
 
 /// Retired product/controller harness. It uses the exact production Node
@@ -861,12 +861,21 @@ pub async fn spawn_with_gateway_machine(
 /// registration, or work-status compatibility routes.
 #[doc(hidden)]
 pub async fn spawn_for_retired_product_tests(cfg: Config) -> anyhow::Result<Handle> {
-    spawn_inner(cfg, true, None).await
+    spawn_inner(cfg, true, false, None).await
+}
+
+/// Production runtime-authority router with mutable billing enabled solely for
+/// cross-router acceptance. Unlike `spawn_for_retired_product_tests`, this
+/// does not install or run any retired product/controller authority.
+#[doc(hidden)]
+pub async fn spawn_runtime_authority_with_billing_for_tests(cfg: Config) -> anyhow::Result<Handle> {
+    spawn_inner(cfg, false, true, None).await
 }
 
 async fn spawn_inner(
     cfg: Config,
     retired_product_authority_for_tests: bool,
+    runtime_billing_for_tests: bool,
     gateway_machine: Option<GatewayMachineConfig>,
 ) -> anyhow::Result<Handle> {
     anyhow::ensure!(
@@ -879,7 +888,9 @@ async fn spawn_inner(
         "service and admin tokens must be different"
     );
     anyhow::ensure!(
-        retired_product_authority_for_tests || !cfg.billing_enforcement_enabled,
+        retired_product_authority_for_tests
+            || runtime_billing_for_tests
+            || !cfg.billing_enforcement_enabled,
         "legacy Cat billing enforcement is unavailable during the signed runtime cutover"
     );
     ensure_route_signing_keys_are_separate(

@@ -5,7 +5,7 @@
 //! configured authorities. Direct Store access is reserved for the final
 //! read-only cardinality/lease projection.
 
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Instant;
 
@@ -36,11 +36,16 @@ use cats_api::runtime_reconciliation::{
     SessionBinding, Sha256Digest, UnixMillis, DESIRED_READ_PATH, OBSERVATION_PATH,
 };
 use cats_control_plane::controller::AutoTierPolicy;
-use cats_control_plane::server::{spawn, Config, Handle};
+use cats_control_plane::server::{
+    spawn, spawn_runtime_authority_with_billing_for_tests, Config, Handle,
+};
 use cats_control_plane::store::DsnSource;
 use cats_control_plane::testsupport::RuntimeCutoverAcceptanceFacts;
 use cats_metadata_store_sqlite::SqliteMetadataStore;
-use cats_metering::SqliteUsageStore;
+use cats_metering::{
+    CheckoutIntent, CheckoutPayment, CheckoutRefund, CreditApplyOutcome, CreditStore,
+    CreditStoreFuture, CreditSummary, SqliteUsageStore,
+};
 use cats_storage::{
     encode_image_manifest, image_manifest_key, BlobError, BlobStore, ImageManifestV1,
     LowerHexSha256, MetadataStore, IMAGE_MANIFEST_MAX_BYTES,
@@ -62,6 +67,93 @@ const RFC8032_TEST_SEED: [u8; 32] = [
     0x9d, 0x61, 0xb1, 0x9d, 0xef, 0xfd, 0x5a, 0x60, 0xba, 0x84, 0x4a, 0xf4, 0x92, 0xec, 0x2c, 0xc4,
     0x44, 0x49, 0xc5, 0x69, 0x7b, 0x32, 0x69, 0x19, 0x70, 0x3b, 0xac, 0x03, 0x1c, 0xae, 0x7f, 0x60,
 ];
+
+struct ToggleCreditStore {
+    inner: Arc<SqliteUsageStore>,
+    funded: AtomicBool,
+}
+
+impl ToggleCreditStore {
+    fn new(inner: Arc<SqliteUsageStore>) -> Self {
+        Self {
+            inner,
+            funded: AtomicBool::new(true),
+        }
+    }
+
+    fn set_funded(&self, funded: bool) {
+        self.funded.store(funded, Ordering::SeqCst);
+    }
+}
+
+impl CreditStore for ToggleCreditStore {
+    fn ensure_account<'a>(
+        &'a self,
+        billing_account_id: &'a str,
+        account_id: &'a str,
+        currency: &'a str,
+        signup_credit_nanos: i128,
+        created_at_unix_ms: i64,
+    ) -> CreditStoreFuture<'a, CreditSummary> {
+        let funded = &self.funded;
+        let future = CreditStore::ensure_account(
+            self.inner.as_ref(),
+            billing_account_id,
+            account_id,
+            currency,
+            signup_credit_nanos,
+            created_at_unix_ms,
+        );
+        Box::pin(async move {
+            let mut summary = future.await?;
+            summary.credit_nanos = if funded.load(Ordering::SeqCst) {
+                10_000_000_000
+            } else {
+                0
+            };
+            Ok(summary)
+        })
+    }
+
+    fn summary<'a>(&'a self, billing_account_id: &'a str) -> CreditStoreFuture<'a, CreditSummary> {
+        CreditStore::summary(self.inner.as_ref(), billing_account_id)
+    }
+
+    fn create_checkout_intent<'a>(
+        &'a self,
+        intent: &'a CheckoutIntent,
+    ) -> CreditStoreFuture<'a, CheckoutIntent> {
+        CreditStore::create_checkout_intent(self.inner.as_ref(), intent)
+    }
+
+    fn attach_checkout_session<'a>(
+        &'a self,
+        intent_id: &'a str,
+        stripe_session_id: &'a str,
+        checkout_url: &'a str,
+    ) -> CreditStoreFuture<'a, CheckoutIntent> {
+        CreditStore::attach_checkout_session(
+            self.inner.as_ref(),
+            intent_id,
+            stripe_session_id,
+            checkout_url,
+        )
+    }
+
+    fn apply_checkout_payment<'a>(
+        &'a self,
+        payment: &'a CheckoutPayment,
+    ) -> CreditStoreFuture<'a, CreditApplyOutcome> {
+        CreditStore::apply_checkout_payment(self.inner.as_ref(), payment)
+    }
+
+    fn apply_checkout_refund<'a>(
+        &'a self,
+        refund: &'a CheckoutRefund,
+    ) -> CreditStoreFuture<'a, CreditApplyOutcome> {
+        CreditStore::apply_checkout_refund(self.inner.as_ref(), refund)
+    }
+}
 
 struct FixedImageBlob {
     key: String,
@@ -136,6 +228,8 @@ struct Context {
     provisioner_signer: Ed25519KeyPair,
     release: cats_api::runtime_reconciliation::GuestRuntimeProfileReceipt,
     image_blob: Arc<FixedImageBlob>,
+    config: Config,
+    credits: Arc<ToggleCreditStore>,
 }
 
 impl Context {
@@ -157,6 +251,7 @@ impl Context {
             body: encode_image_manifest(&manifest).unwrap(),
             reads: AtomicUsize::new(0),
         });
+        let credits = Arc::new(ToggleCreditStore::new(usage.clone()));
         let config = Config {
             listen: "127.0.0.1:0".into(),
             control_store_dsn: DsnSource::Literal(
@@ -164,7 +259,7 @@ impl Context {
             ),
             control_store_ca_file: None,
             usage_store: usage.clone(),
-            credit_store: usage,
+            credit_store: credits.clone(),
             storage_meta,
             image_blob: image_blob.clone(),
             auth_token: SERVICE_TOKEN.into(),
@@ -182,7 +277,7 @@ impl Context {
             oci_deploy_sync_wait_ms: 5_000,
         };
         let first = spawn(config.clone()).await.unwrap();
-        let second = spawn(config).await.unwrap();
+        let second = spawn(config.clone()).await.unwrap();
         let node_signer = Ed25519RequestSigner::from_pkcs8_pem(
             id("credential_cutover_a"),
             include_bytes!("../../tests/fixtures/route_grant_private_ed25519.pem"),
@@ -201,6 +296,8 @@ impl Context {
             provisioner_signer,
             release,
             image_blob,
+            config,
+            credits,
         }
     }
 
@@ -689,6 +786,72 @@ async fn production_replicas_share_registration_observation_and_cat_create_autho
         }
     );
 
+    context.first.shutdown().await.unwrap();
+    context.second.shutdown().await.unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn persistent_disk_exact_replay_precedes_mutable_funding_admission() {
+    let context = Context::new().await;
+    let mut billed_config = context.config.clone();
+    billed_config.billing_enforcement_enabled = true;
+    let billed = spawn_runtime_authority_with_billing_for_tests(billed_config)
+        .await
+        .unwrap();
+    let workspaces = context
+        .http
+        .get(format!("{}/v1/admin/workspaces", billed.base_url()))
+        .bearer_auth(ADMIN_TOKEN)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(workspaces.status(), StatusCode::OK);
+    let workspaces: ListResponse<cats_api::auth::Workspace> =
+        serde_json::from_slice(&workspaces.bytes().await.unwrap()).unwrap();
+    let workspace_id = workspaces
+        .items
+        .into_iter()
+        .find(|workspace| workspace.is_default)
+        .expect("bootstrap account has one default Workspace")
+        .id;
+
+    let key = "funding-change-replay";
+    let first = context
+        .persistent_disk_create_request(&billed, &workspace_id, key)
+        .send()
+        .await
+        .unwrap();
+    let first_body = json_body(first, StatusCode::CREATED).await;
+    context.credits.set_funded(false);
+
+    let replay = context
+        .persistent_disk_create_request(&billed, &workspace_id, key)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(json_body(replay, StatusCode::CREATED).await, first_body);
+    let fresh = context
+        .persistent_disk_create_request(&billed, &workspace_id, "unfunded-fresh-key")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(fresh.status(), StatusCode::PAYMENT_REQUIRED);
+
+    let facts = cats_control_plane::testsupport::runtime_cutover_acceptance_facts(
+        &billed.state.store,
+        id("node_no_runtime_rows"),
+    )
+    .await;
+    assert_eq!(
+        (
+            facts.volume_record_count,
+            facts.disk_record_count,
+            facts.api_result_count,
+        ),
+        (1, 1, 1)
+    );
+
+    billed.shutdown().await.unwrap();
     context.first.shutdown().await.unwrap();
     context.second.shutdown().await.unwrap();
 }

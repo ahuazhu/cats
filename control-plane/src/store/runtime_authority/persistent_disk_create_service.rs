@@ -60,6 +60,14 @@ pub(crate) struct AuthorizedPersistentDiskCreateIngress {
 }
 
 impl AuthorizedPersistentDiskCreateIngress {
+    pub(crate) fn authenticated_workspace_id(&self) -> &Id {
+        &self.idempotency.authenticated_workspace_id
+    }
+
+    pub(crate) fn absolute_deadline(&self) -> Instant {
+        self.absolute_deadline
+    }
+
     #[cfg(test)]
     pub(super) fn idempotency(&self) -> &ApiIdempotencyRequest {
         &self.idempotency
@@ -275,16 +283,8 @@ impl PersistentDiskCreateService {
             return Err(PersistentDiskCreateServiceError::TemporarilyUnavailable);
         }
         let absolute_deadline = ingress.absolute_deadline;
-        let fast_request = ingress.idempotency.clone();
-        if let Some(result) = await_before_deadline(
-            absolute_deadline,
-            self.store
-                .execute(move |store| store.covered_api_result_fast_lookup(&fast_request)),
-        )
-        .await
-        .map_err(PersistentDiskCreateServiceError::from_api)?
-        {
-            return Ok(http_result(result));
+        if let Some(result) = self.fast_replay(&ingress).await? {
+            return Ok(result);
         }
 
         let mut shutdown = shutdown;
@@ -313,6 +313,37 @@ impl PersistentDiskCreateService {
         Err(PersistentDiskCreateServiceError::TemporarilyUnavailable)
     }
 
+    /// Reads an authenticated request's exact durable result without any
+    /// mutable create admission. This is the response-loss recovery boundary:
+    /// billing may change after the original atomic commit, but it cannot hide
+    /// the already-covered result from the same Workspace/key/fingerprint.
+    pub(crate) async fn replay(
+        &self,
+        ingress: &AuthorizedPersistentDiskCreateIngress,
+    ) -> std::result::Result<Option<PersistentDiskCreateHttpResult>, PersistentDiskCreateServiceError>
+    {
+        if !*self.admission.borrow() {
+            return Err(PersistentDiskCreateServiceError::TemporarilyUnavailable);
+        }
+        self.fast_replay(ingress).await
+    }
+
+    async fn fast_replay(
+        &self,
+        ingress: &AuthorizedPersistentDiskCreateIngress,
+    ) -> std::result::Result<Option<PersistentDiskCreateHttpResult>, PersistentDiskCreateServiceError>
+    {
+        let fast_request = ingress.idempotency.clone();
+        await_before_deadline(
+            ingress.absolute_deadline,
+            self.store
+                .execute(move |store| store.covered_api_result_fast_lookup(&fast_request)),
+        )
+        .await
+        .map(|result| result.map(http_result))
+        .map_err(PersistentDiskCreateServiceError::from_api)
+    }
+
     async fn commit_candidate(
         &self,
         covered: CoveredPersistentDiskCreateRequest,
@@ -325,7 +356,9 @@ impl PersistentDiskCreateService {
         let commit_observer = commit_state.clone();
         let cancellation_observer = commit_state.clone();
         let store = Arc::clone(&self.store);
-        let active = self.commit_resolutions.begin();
+        let Some(active) = self.commit_resolutions.begin() else {
+            return Err(PersistentDiskCreateServiceError::TemporarilyUnavailable);
+        };
         let (result_tx, mut result_rx) = tokio::sync::oneshot::channel();
         tokio::spawn(async move {
             let execution_store = Arc::clone(&store);
@@ -393,6 +426,7 @@ impl PersistentDiskCreateService {
     }
 
     pub(crate) fn begin_shutdown(&self) {
+        self.commit_resolutions.close();
         self.admission.send_replace(false);
     }
 

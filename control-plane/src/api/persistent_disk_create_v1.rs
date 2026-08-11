@@ -44,15 +44,44 @@ pub(crate) async fn create_persistent_disk_v1(
             ));
         }
     };
+    match state.persistent_disk_create.replay(&ingress).await {
+        Ok(Some(result)) => return http_response(result),
+        Ok(None) => {}
+        Err(error) => return service_error_response(&state, error),
+    }
+    match tokio::time::timeout_at(
+        tokio::time::Instant::from_std(ingress.absolute_deadline()),
+        require_funded(&state, ingress.authenticated_workspace_id().as_str()),
+    )
+    .await
+    {
+        Ok(result) => result?,
+        Err(_) => {
+            return Ok(closed_response(
+                StatusCode::SERVICE_UNAVAILABLE,
+                TEMPORARILY_UNAVAILABLE_BODY,
+                true,
+            ));
+        }
+    }
     match state.persistent_disk_create.create(ingress).await {
         Ok(result) => http_response(result),
-        Err(PersistentDiskCreateServiceError::Request(error)) => Err(Failure(error)),
-        Err(PersistentDiskCreateServiceError::TemporarilyUnavailable) => Ok(closed_response(
+        Err(error) => service_error_response(&state, error),
+    }
+}
+
+fn service_error_response(
+    state: &AppState,
+    error: PersistentDiskCreateServiceError,
+) -> ApiResult<Response> {
+    match error {
+        PersistentDiskCreateServiceError::Request(error) => Err(Failure(error)),
+        PersistentDiskCreateServiceError::TemporarilyUnavailable => Ok(closed_response(
             StatusCode::SERVICE_UNAVAILABLE,
             TEMPORARILY_UNAVAILABLE_BODY,
             true,
         )),
-        Err(PersistentDiskCreateServiceError::Fatal(error)) => {
+        PersistentDiskCreateServiceError::Fatal(error) => {
             tracing::error!(error = %error, "PersistentDisk create encountered fatal stored authority corruption");
             state.readiness.poison();
             Ok(closed_response(
@@ -71,7 +100,6 @@ async fn authorized_ingress(
     request: Request<Body>,
 ) -> ApiResult<AuthorizedPersistentDiskCreateIngress> {
     let scope = check_workspace_auth(state, request.headers(), workspace).await?;
-    require_funded(state, &scope.workspace.id).await?;
 
     let authenticated_workspace_id =
         cats_api::runtime_reconciliation::Id::new(scope.workspace.id.clone())

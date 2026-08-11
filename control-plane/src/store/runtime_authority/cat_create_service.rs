@@ -497,7 +497,9 @@ impl CatCreateService {
         // worker outcome and resolves any ambiguous commit while shutdown can
         // account for it.
         let store = Arc::clone(&self.store);
-        let active = self.commit_resolutions.begin();
+        let Some(active) = self.commit_resolutions.begin() else {
+            return Err(CatCreateServiceError::TemporarilyUnavailable);
+        };
         let (result_tx, mut result_rx) = tokio::sync::oneshot::channel();
         tokio::spawn(async move {
             let execution_store = Arc::clone(&store);
@@ -583,6 +585,7 @@ impl CatCreateService {
     }
 
     pub(crate) fn begin_shutdown(&self) {
+        self.commit_resolutions.close();
         self.admission.send_replace(false);
     }
 

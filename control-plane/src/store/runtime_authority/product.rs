@@ -887,6 +887,18 @@ fn create_cat_in(
         return Ok(result);
     }
 
+    // Root and Persistent disks share one Workspace-scoped product name
+    // namespace. Take that coordination point before any placement/Node lock
+    // so the global order remains API key -> Cat name -> Disk name -> Node ->
+    // Network -> Volume -> candidate IDs. A concurrent Persistent create then
+    // either publishes first and becomes a typed Cat candidate collision, or
+    // observes this Root after the same lock and publishes its durable 409.
+    checkpoint_cat_create(transaction, commit_state)?;
+    lock_disk_name(
+        transaction,
+        &request.candidate.root_disk.workspace_id,
+        &request.candidate.root_disk.name,
+    )?;
     checkpoint_cat_create(transaction, commit_state)?;
     if let Some((planned, planned_mutation, active_guest_digest)) = placement {
         if request.candidate.desired.placement.node_id != planned.admission.node_identity.node_id
