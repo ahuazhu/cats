@@ -2217,16 +2217,16 @@ struct PathIdentity {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct DirectoryIdentity {
+    // Ancestors are shared namespaces: another Cat may add or remove a
+    // sibling while this proof is retained. Pin the directory object and its
+    // safety attributes; `ensure_safe_directory` separately requires a live
+    // link at every sample. Child-dependent link counts and timestamps are
+    // deliberately not identity.
     device: u64,
     inode: u64,
     mode: u32,
     user: u32,
     group: u32,
-    links: u64,
-    modified_seconds: i64,
-    modified_nanoseconds: i64,
-    changed_seconds: i64,
-    changed_nanoseconds: i64,
 }
 
 impl DirectoryIdentity {
@@ -2237,11 +2237,6 @@ impl DirectoryIdentity {
             mode: metadata.mode(),
             user: metadata.uid(),
             group: metadata.gid(),
-            links: metadata.nlink(),
-            modified_seconds: metadata.mtime(),
-            modified_nanoseconds: metadata.mtime_nsec(),
-            changed_seconds: metadata.ctime(),
-            changed_nanoseconds: metadata.ctime_nsec(),
         }
     }
 }
@@ -2678,6 +2673,79 @@ mod tests {
             inspect_after_checkpoint_cas(RunningTail::OpenAdmission, false, true, false),
             VmmRuntimePathInspection::Conflict
         ));
+    }
+
+    #[cfg(target_os = "linux")]
+    fn pinned_runtime_path_fixture() -> (tempfile::TempDir, PathBuf, PinnedRuntimePath) {
+        let temporary = tempfile::Builder::new()
+            .prefix("cats-runtime-path-")
+            .tempdir_in("/var/lib")
+            .unwrap();
+        let ancestor = temporary.path().join("runtime");
+        std::fs::create_dir(&ancestor).unwrap();
+        std::fs::set_permissions(
+            &ancestor,
+            std::os::unix::fs::PermissionsExt::from_mode(0o700),
+        )
+        .unwrap();
+        let leaf = ancestor.join("checkpoint.json");
+        create_mode_600(&leaf, b"exact-checkpoint");
+        let path = HostPath::new(leaf.to_str().unwrap().to_owned()).unwrap();
+        let retained = PinnedRuntimePath::open(
+            &path,
+            LeafRule::ImmutableRegular {
+                mode: 0o600,
+                bytes: b"exact-checkpoint".to_vec(),
+            },
+        )
+        .unwrap()
+        .unwrap();
+        (temporary, ancestor, retained)
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn retained_runtime_path_allows_sibling_children_in_the_same_live_ancestor() {
+        let (_temporary, ancestor, retained) = pinned_runtime_path_fixture();
+        let original = ancestor.metadata().unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(2));
+        let sibling = ancestor.join("another-cat");
+        std::fs::create_dir(&sibling).unwrap();
+        std::fs::set_permissions(
+            &sibling,
+            std::os::unix::fs::PermissionsExt::from_mode(0o700),
+        )
+        .unwrap();
+        let with_sibling = ancestor.metadata().unwrap();
+        assert!(
+            original.nlink() != with_sibling.nlink()
+                || original.mtime() != with_sibling.mtime()
+                || original.mtime_nsec() != with_sibling.mtime_nsec()
+                || original.ctime() != with_sibling.ctime()
+                || original.ctime_nsec() != with_sibling.ctime_nsec(),
+            "fixture did not change mutable ancestor metadata"
+        );
+        retained.assert_current().unwrap();
+
+        std::fs::remove_dir(&sibling).unwrap();
+        retained.assert_current().unwrap();
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn retained_runtime_path_rejects_an_ancestor_pathname_replacement() {
+        let (_temporary, ancestor, retained) = pinned_runtime_path_fixture();
+        let saved = ancestor.with_extension("saved");
+        std::fs::rename(&ancestor, &saved).unwrap();
+        std::fs::create_dir(&ancestor).unwrap();
+        std::fs::set_permissions(
+            &ancestor,
+            std::os::unix::fs::PermissionsExt::from_mode(0o700),
+        )
+        .unwrap();
+        create_mode_600(&ancestor.join("checkpoint.json"), b"exact-checkpoint");
+
+        assert!(retained.assert_current().is_err());
     }
 
     #[cfg(target_os = "linux")]
