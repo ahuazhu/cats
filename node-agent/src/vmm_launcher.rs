@@ -747,7 +747,7 @@ mod linux {
             before_freeze()?;
 
             let mut owned = Vec::with_capacity(N);
-            for (parent, file, baseline, expected_length) in created {
+            for (parent, file, baseline, _expected_length) in created {
                 let current_parent = parent.freeze_after_batch()?;
                 let retained_path = stat_at(parent.descriptor(), &parent.basename)
                     .context("reinspect newly-created VMM launch file")?;

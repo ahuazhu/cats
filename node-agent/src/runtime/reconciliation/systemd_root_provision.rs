@@ -3447,7 +3447,7 @@ while True:
                     .status();
             }
         }
-        let _cleanup = StopTransientUnit(unit_id);
+        let _cleanup = StopTransientUnit(unit_id.clone());
         let systemd = PlatformSystemdTransientService;
         assert_eq!(
             systemd

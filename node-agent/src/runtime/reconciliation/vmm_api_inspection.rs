@@ -859,7 +859,6 @@ fn canonical_mac(mac: &str) -> bool {
 
 #[cfg(target_os = "linux")]
 mod linux {
-    use std::collections::BTreeMap;
     use std::ffi::{CString, OsString};
     use std::fs::File;
     use std::io::{self, Read as _, Write as _};
