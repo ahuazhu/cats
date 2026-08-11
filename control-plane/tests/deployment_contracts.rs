@@ -581,8 +581,22 @@ fn linux_quality_gate_installs_the_postgres_probe_runtime() {
         );
     }
     assert!(linux_gate.contains("--ulimit nofile=65536:65536"));
-    assert!(linux_gate
-        .contains("cargo test --workspace --locked --target-dir /target -- --test-threads=4"));
+    assert!(linux_gate.contains(
+        "target_namespace=\"$(printf '%s\\0' \"$SOURCE_PROVENANCE_ROOT\" | source_git hash-object --stdin)\""
+    ));
+    assert!(linux_gate.contains("target_directory=\"/target/worktrees/$target_namespace\""));
+    assert!(
+        linux_gate.contains("-e CATS_LINUX_TARGET_DIRECTORY=\"$target_directory\""),
+        "the Linux gate must pass its worktree-isolated target root into the container"
+    );
+    assert_eq!(
+        linux_gate
+            .matches("--target-dir \"$CATS_LINUX_TARGET_DIRECTORY\"")
+            .count(),
+        5,
+        "check, build, Clippy, tests and rustdoc must share the isolated target root"
+    );
+    assert!(!linux_gate.contains("--target-dir /target"));
 }
 
 #[cfg(unix)]

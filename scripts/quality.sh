@@ -313,6 +313,15 @@ run_linux() {
   local platform="${CATS_LINUX_PLATFORM:-linux/arm64}"
   local target_volume="${CATS_LINUX_TARGET_VOLUME:-cats-target-linux}"
   local jobs="${CATS_LINUX_JOBS:-2}"
+  local target_namespace
+  local target_directory
+
+  # Every host worktree is mounted at /work inside the container. Reusing one
+  # target root across those otherwise different source trees can therefore
+  # make Cargo accept stale dependency metadata when checkout mtimes overlap.
+  # Keep the shared Docker volume, but give each worktree its own target root.
+  target_namespace="$(printf '%s\0' "$SOURCE_PROVENANCE_ROOT" | source_git hash-object --stdin)"
+  target_directory="/target/worktrees/$target_namespace"
 
   # The tests need PostgreSQL and the build container cannot run docker
   # itself, so the server rides alongside on a private network.
@@ -331,6 +340,7 @@ run_linux() {
     -e CATS_SOURCE_PROVENANCE_HEAD="$SOURCE_PROVENANCE_HEAD" \
     -e CATS_SOURCE_PROVENANCE_DIRTY="$SOURCE_PROVENANCE_DIRTY" \
     -e CATS_SOURCE_PROVENANCE_FINGERPRINT="$SOURCE_PROVENANCE_FINGERPRINT" \
+    -e CATS_LINUX_TARGET_DIRECTORY="$target_directory" \
     --network "$network" \
     -v "$REPO_ROOT:/work" -w /work \
     -v cats-cargo-registry:/usr/local/cargo/registry \
@@ -341,11 +351,11 @@ run_linux() {
            rustup component add clippy rustfmt &&
            ./scripts/quality.sh skills &&
            cargo fmt --all -- --check &&
-           cargo check --workspace --all-targets --locked --target-dir /target &&
-           cargo build --workspace --locked --target-dir /target &&
-           cargo clippy --workspace --all-targets --locked --target-dir /target -- -D warnings &&
-           cargo test --workspace --locked --target-dir /target -- --test-threads=4 &&
-           RUSTDOCFLAGS="-D warnings" cargo doc --workspace --no-deps --locked --target-dir /target' || status=$?
+           cargo check --workspace --all-targets --locked --target-dir "$CATS_LINUX_TARGET_DIRECTORY" &&
+           cargo build --workspace --locked --target-dir "$CATS_LINUX_TARGET_DIRECTORY" &&
+           cargo clippy --workspace --all-targets --locked --target-dir "$CATS_LINUX_TARGET_DIRECTORY" -- -D warnings &&
+           cargo test --workspace --locked --target-dir "$CATS_LINUX_TARGET_DIRECTORY" -- --test-threads=4 &&
+           RUSTDOCFLAGS="-D warnings" cargo doc --workspace --no-deps --locked --target-dir "$CATS_LINUX_TARGET_DIRECTORY"' || status=$?
 
   docker rm -f "$pg" >/dev/null 2>&1 || true
   docker network rm "$network" >/dev/null 2>&1 || true
