@@ -414,7 +414,7 @@ enum VmmPhysicalAuthority {
     #[cfg(target_os = "linux")]
     Platform {
         descriptors: VmmDescriptorAuthority,
-        api: ExactVmmApiProof,
+        api: Box<ExactVmmApiProof>,
     },
     #[cfg(test)]
     Test,
@@ -607,7 +607,7 @@ impl ExactVmmProcessProof {
                 VmmManagerProcessInspection::Exact(identity)
                     if self.evidence.matches_manager_identity(&identity) =>
                 {
-                    identity
+                    *identity
                 }
                 VmmManagerProcessInspection::Absent
                 | VmmManagerProcessInspection::Exact(_)
@@ -618,7 +618,7 @@ impl ExactVmmProcessProof {
             };
             self.evidence.assert_current(context)?;
             match inspect_vmm_manager_process(&self.expectation, context)? {
-                VmmManagerProcessInspection::Exact(identity) if identity == first => {}
+                VmmManagerProcessInspection::Exact(identity) if *identity == first => {}
                 VmmManagerProcessInspection::Absent
                 | VmmManagerProcessInspection::Exact(_)
                 | VmmManagerProcessInspection::Conflict
@@ -727,6 +727,7 @@ impl VmmProcessPort for PlatformSystemdVmmProcessPort {
                 )),
                 VmmManagerProcessInspection::Unavailable => Ok(VmmProcessInspection::Unavailable),
                 VmmManagerProcessInspection::Exact(identity) => {
+                    let identity = *identity;
                     let descriptor_authority =
                         match inspect_vmm_descriptor_authority(expected, identity.process_id())? {
                             VmmDescriptorInspection::Exact(authority) => authority,
@@ -737,7 +738,7 @@ impl VmmProcessPort for PlatformSystemdVmmProcessPort {
                             }
                         };
                     match inspect_vmm_manager_process(expected, context)? {
-                        VmmManagerProcessInspection::Exact(current) if current == identity => {}
+                        VmmManagerProcessInspection::Exact(current) if *current == identity => {}
                         VmmManagerProcessInspection::Unavailable => {
                             return Ok(VmmProcessInspection::Unavailable)
                         }
@@ -769,7 +770,7 @@ impl VmmProcessPort for PlatformSystemdVmmProcessPort {
                         }
                     };
                     match inspect_vmm_manager_process(expected, context)? {
-                        VmmManagerProcessInspection::Exact(current) if current == identity => {}
+                        VmmManagerProcessInspection::Exact(current) if *current == identity => {}
                         VmmManagerProcessInspection::Unavailable => {
                             return Ok(VmmProcessInspection::Unavailable)
                         }
@@ -784,7 +785,7 @@ impl VmmProcessPort for PlatformSystemdVmmProcessPort {
                     context.check_active()?;
                     let physical_authority = VmmPhysicalAuthority::Platform {
                         descriptors: descriptor_authority,
-                        api: api_authority,
+                        api: Box::new(api_authority),
                     };
                     if physical_authority
                         .assert_current(identity.process_id(), context)
@@ -795,7 +796,7 @@ impl VmmProcessPort for PlatformSystemdVmmProcessPort {
                         ));
                     }
                     match inspect_vmm_manager_process(expected, context)? {
-                        VmmManagerProcessInspection::Exact(current) if current == identity => {}
+                        VmmManagerProcessInspection::Exact(current) if *current == identity => {}
                         VmmManagerProcessInspection::Unavailable => {
                             return Ok(VmmProcessInspection::Unavailable)
                         }
@@ -966,7 +967,7 @@ fn inspect_vmm_descriptor_authority(
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum VmmManagerProcessInspection {
     Absent,
-    Exact(VmmManagerProcessIdentity),
+    Exact(Box<VmmManagerProcessIdentity>),
     Conflict,
     Unavailable,
 }
@@ -1043,13 +1044,13 @@ fn inspect_vmm_manager_process(
         return Ok(VmmManagerProcessInspection::Conflict);
     }
     context.check_active()?;
-    Ok(VmmManagerProcessInspection::Exact(
+    Ok(VmmManagerProcessInspection::Exact(Box::new(
         VmmManagerProcessIdentity {
             properties: second_properties,
             process: second_process,
             cgroup_process_ids,
         },
-    ))
+    )))
 }
 
 #[cfg(any(test, target_os = "linux"))]

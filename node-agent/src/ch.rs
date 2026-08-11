@@ -273,10 +273,10 @@ struct LinuxNetworkNamespaceIdentity {
 #[cfg(target_os = "linux")]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum LinuxTapConfigurationBoundary {
-    BeforeAlias,
-    BeforeAddress,
-    BeforeLinkUp,
-    BeforePublish,
+    Alias,
+    Address,
+    LinkUp,
+    Publish,
 }
 
 #[cfg(target_os = "linux")]
@@ -500,13 +500,13 @@ impl LinuxPendingTap {
             .parse::<Ipv4Addr>()
             .context("parse checkpointed Host gateway IPv4")?;
 
-        boundary(LinuxTapConfigurationBoundary::BeforeAlias)?;
+        boundary(LinuxTapConfigurationBoundary::Alias)?;
         self.change_link_alias(&network_alias(network), context)?;
-        boundary(LinuxTapConfigurationBoundary::BeforeAddress)?;
+        boundary(LinuxTapConfigurationBoundary::Address)?;
         self.add_ipv4_address(gateway, network.config.prefix_length, context)?;
-        boundary(LinuxTapConfigurationBoundary::BeforeLinkUp)?;
+        boundary(LinuxTapConfigurationBoundary::LinkUp)?;
         self.change_link_up(context)?;
-        boundary(LinuxTapConfigurationBoundary::BeforePublish)?;
+        boundary(LinuxTapConfigurationBoundary::Publish)?;
         self.assert_stable_identity()
             .context("revalidate configured unpublished Linux TAP")
     }
@@ -3651,10 +3651,10 @@ exit 0\n",
         let state = tempfile::tempdir().unwrap();
         let context = desired_effect_context(state.path());
         for (index, injection) in [
-            LinuxTapConfigurationBoundary::BeforeAlias,
-            LinuxTapConfigurationBoundary::BeforeAddress,
-            LinuxTapConfigurationBoundary::BeforeLinkUp,
-            LinuxTapConfigurationBoundary::BeforePublish,
+            LinuxTapConfigurationBoundary::Alias,
+            LinuxTapConfigurationBoundary::Address,
+            LinuxTapConfigurationBoundary::LinkUp,
+            LinuxTapConfigurationBoundary::Publish,
         ]
         .into_iter()
         .enumerate()

@@ -1633,7 +1633,7 @@ mod linux {
             )
         };
         (result == 0 && length as usize == size_of::<libc::ucred>() && credentials.pid > 0)
-            .then(|| credentials.pid as u32)
+            .then_some(credentials.pid as u32)
     }
 
     fn socket_error(descriptor: i32) -> Option<i32> {

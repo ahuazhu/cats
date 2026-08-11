@@ -5000,7 +5000,7 @@ fn read_release_rejection_publication_at(
         before.is_file()
             && raw_device_to_u64(entry.metadata.st_dev) == Some(before.dev())
             && before.ino() == entry.metadata.st_ino
-            && before.nlink() == u64::from(entry.metadata.st_nlink),
+            && u128::from(before.nlink()) == u128::from(entry.metadata.st_nlink),
         "release rejection temp identity changed before read"
     );
     let mut bytes = Vec::new();
