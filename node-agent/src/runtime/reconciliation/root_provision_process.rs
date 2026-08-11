@@ -1477,6 +1477,25 @@ impl NodeGlobalManagedProcessAdmission {
             _ => None,
         })
     }
+
+    /// Exact live VMM proofs retained by this accepted complete inventory.
+    ///
+    /// Entries whose same-pass physical inspection proved absence are
+    /// deliberately omitted. Callers may consume this iterator only because
+    /// the admission itself also sealed the complete Node-global absence /
+    /// foreign-residue sweep; a naked empty iterator is not such a proof.
+    pub(crate) fn exact_vmm_proofs(
+        &self,
+    ) -> impl Iterator<Item = &super::vmm_process::ExactVmmProcessProof> {
+        self.entries.iter().filter_map(|entry| match entry {
+            NodeGlobalManagedProcessExpectation::Vmm {
+                exact: Some(proof), ..
+            } => Some(proof.as_ref()),
+            NodeGlobalManagedProcessExpectation::RootControl { .. }
+            | NodeGlobalManagedProcessExpectation::ServingBlockd { .. }
+            | NodeGlobalManagedProcessExpectation::Vmm { exact: None, .. } => None,
+        })
+    }
 }
 
 /// One current-process proof that the accepted complete inventory and the

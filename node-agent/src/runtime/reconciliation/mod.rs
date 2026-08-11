@@ -182,6 +182,8 @@ pub(crate) use signed_root_provision::{
 };
 pub(crate) use signed_running::{SignedRunningAcquireEffect, SignedRunningPublicationRecovery};
 #[allow(unused_imports)]
+pub(crate) use vmm_cid::{PlatformExactVmmCidInventoryPort, VmmCidAllocationPort};
+#[allow(unused_imports)]
 pub(crate) use vmm_runtime_paths::ManagedVmmLaunchFilePaths;
 #[allow(unused_imports)]
 pub(crate) use vmm_socket_namespace::{

@@ -575,6 +575,23 @@ impl ExactVmmProcessProof {
         &self.evidence
     }
 
+    /// The Node-global Guest CID identity proven by this exact physical VMM.
+    ///
+    /// Keeping this projection on the unforgeable proof prevents the CID
+    /// allocator from rebuilding a live owner from public `ProcessEvidence`
+    /// or from an independently reopened checkpoint.
+    pub(crate) fn guest_cid_identity(&self) -> (&Id, &RandomId128, u32) {
+        let ReconcileStep::StartRuntime { guest_cid, .. } = &self.expectation.checkpoint.step
+        else {
+            unreachable!("exact VMM proof was minted only from StartRuntime")
+        };
+        (
+            self.expectation.cat_id(),
+            self.expectation.runtime_incarnation(),
+            *guest_cid,
+        )
+    }
+
     pub(crate) fn assert_current(
         &self,
         context: &dyn crate::runtime_spine::RuntimePhysicalReadContext,

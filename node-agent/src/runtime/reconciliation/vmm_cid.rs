@@ -111,7 +111,46 @@ pub(crate) mod inventory_port_sealed {
 }
 
 pub(crate) trait VmmCidInventoryPort: inventory_port_sealed::Sealed + Send + Sync {
-    fn inspect(&self, context: &dyn RuntimePhysicalReadContext) -> Result<VmmCidInventorySnapshot>;
+    fn inspect(&self, context: &RuntimeDesiredEffectContext) -> Result<VmmCidInventorySnapshot>;
+}
+
+/// Production live-CID projection from the exact accepted full-inventory
+/// admission that opened this Desired effect batch.
+///
+/// The complete clean-slate scanner already rejected unavailable, malformed,
+/// conflicting, duplicate and foreign managed processes before it could mint
+/// `NodeGlobalManagedProcessAdmission`. Reopening `/proc`, systemd or public
+/// process projections here would create a second, weaker scan. This port
+/// therefore projects only the unforgeable exact VMM proofs retained by that
+/// same admission. A legitimately absent VMM contributes no live CID; a
+/// missing admission fails rather than becoming an unproven empty inventory.
+#[derive(Debug, Default, Clone, Copy)]
+pub(crate) struct PlatformExactVmmCidInventoryPort;
+
+impl inventory_port_sealed::Sealed for PlatformExactVmmCidInventoryPort {}
+
+impl VmmCidInventoryPort for PlatformExactVmmCidInventoryPort {
+    fn inspect(&self, context: &RuntimeDesiredEffectContext) -> Result<VmmCidInventorySnapshot> {
+        context.check_active()?;
+        let accepted = context.accepted_full()?;
+        let admission = context.node_global_process()?;
+        anyhow::ensure!(
+            admission.matches_observation(accepted.observation()),
+            "VMM CID inventory admission is not bound to the accepted full observation"
+        );
+        let exact = admission
+            .exact_vmm_proofs()
+            .map(|proof| {
+                let (cat_id, runtime_incarnation, guest_cid) = proof.guest_cid_identity();
+                ExactLiveVmmCid::new(
+                    VmmCidOwner::new(cat_id.clone(), runtime_incarnation.clone()),
+                    guest_cid,
+                )
+            })
+            .collect::<Result<Vec<_>>>()?;
+        context.check_active()?;
+        VmmCidInventorySnapshot::try_new(exact)
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -612,8 +651,8 @@ mod tests {
 
     use cats_api::runtime_reconciliation::{
         decode_desired_runtime_spec, decode_runtime_checkpoint, AdmissionInventoryAttestation,
-        AgentSession, ContractVersion, DesiredReadSnapshot, Epoch, GuestBootId, NodeBootId,
-        NodeObservation, Sequence, SessionBinding, Sha256Digest, UnixMillis,
+        AgentSession, ContractVersion, DesiredReadSnapshot, Epoch, GuestBootId, HostPath,
+        NodeBootId, NodeObservation, Sequence, SessionBinding, Sha256Digest, UnixMillis,
     };
     use tempfile::TempDir;
 
@@ -647,6 +686,35 @@ mod tests {
         checkpoint.updated_at_unix_ms =
             UnixMillis::new(checkpoint.updated_at_unix_ms.get() + 1).unwrap();
         checkpoint
+    }
+
+    fn start_runtime_variant(
+        cat_id: &str,
+        incarnation_digit: char,
+        process_token_digit: char,
+        guest_cid: u32,
+    ) -> RuntimeCheckpoint {
+        let source = std::str::from_utf8(START_RUNTIME).unwrap();
+        let source = source
+            .replace("cat_01", cat_id)
+            .replace(&"5".repeat(32), &incarnation_digit.to_string().repeat(32))
+            .replace(&"6".repeat(32), &process_token_digit.to_string().repeat(32))
+            .replace("\"guest_cid\":3", &format!("\"guest_cid\":{guest_cid}"));
+        decode_runtime_checkpoint(source.as_bytes()).unwrap()
+    }
+
+    fn vmm_expectation(
+        checkpoint: RuntimeCheckpoint,
+    ) -> super::super::vmm_process::VmmProcessExpectation {
+        let checkpoint_path = HostPath::new(format!(
+            "/var/lib/cats/node/checkpoints/{}.json",
+            checkpoint.cat_id.as_str()
+        ))
+        .unwrap();
+        super::super::vmm_process::VmmProcessExpectation::from_checkpoint(checkpoint)
+            .unwrap()
+            .with_checkpoint_path(checkpoint_path)
+            .unwrap()
     }
 
     fn context(state: &Path, cats: &[Id]) -> RuntimeDesiredEffectContext {
@@ -723,6 +791,85 @@ mod tests {
         )
     }
 
+    fn platform_context(
+        state: &Path,
+        cats: &[Id],
+        managed: super::super::root_provision_process::NodeGlobalManagedProcessAdmission,
+    ) -> RuntimeDesiredEffectContext {
+        let node_boot_id = NodeBootId::new("2".repeat(32)).unwrap();
+        let agent_instance_id = random('3');
+        let session = AgentSession {
+            version: ContractVersion::V1,
+            node_id: Id::new("node_test").unwrap(),
+            immutable_host_id: Id::new("host_test").unwrap(),
+            node_boot_id: node_boot_id.clone(),
+            agent_instance_id: agent_instance_id.clone(),
+            agent_session_epoch: Epoch::new(1).unwrap(),
+            registration_attempt_id: random('e'),
+            guest_config_digest: Sha256Digest::from_bytes([6; 32]),
+            lease_deadline_unix_ms: UnixMillis::new(2_000).unwrap(),
+        };
+        let binding = SessionBinding {
+            node_id: session.node_id.clone(),
+            node_boot_id: node_boot_id.clone(),
+            agent_instance_id: agent_instance_id.clone(),
+            agent_session_epoch: session.agent_session_epoch,
+        };
+        let read_position = Sequence::new(1).unwrap();
+        let desired = DesiredReadSnapshot {
+            version: ContractVersion::V1,
+            session: binding,
+            request_sequence: Sequence::new(1).unwrap(),
+            read_position,
+            issued_at_unix_ms: UnixMillis::new(1_000).unwrap(),
+            expires_at_unix_ms: UnixMillis::new(2_000).unwrap(),
+            desired_specs: cats
+                .iter()
+                .map(|cat_id| {
+                    let mut desired = decode_desired_runtime_spec(DESIRED).unwrap();
+                    desired.cat_id = cat_id.clone();
+                    desired
+                })
+                .collect(),
+        };
+        let observation = NodeObservation {
+            version: ContractVersion::V1,
+            observation_id: random('1'),
+            node_id: session.node_id.clone(),
+            node_boot_id,
+            agent_instance_id,
+            agent_session_epoch: session.agent_session_epoch,
+            heartbeat_sequence: Sequence::new(1).unwrap(),
+            observed_at_unix_ms: UnixMillis::new(1_000).unwrap(),
+            complete_inventory: true,
+            inventory_epoch: Epoch::new(1).unwrap(),
+            inventory_digest: Some(Sha256Digest::from_bytes([4; 32])),
+            inventory_read_position: Some(read_position),
+            key_ring_version: None,
+            key_ring_digest: None,
+            loaded_kids: Vec::new(),
+            runtimes: Vec::new(),
+            residue: Vec::new(),
+        };
+        let attestation = AdmissionInventoryAttestation {
+            version: ContractVersion::V1,
+            node_id: session.node_id.clone(),
+            agent_session_epoch: session.agent_session_epoch,
+            inventory_epoch: Epoch::new(1).unwrap(),
+            inventory_digest: Sha256Digest::from_bytes([4; 32]),
+            inventory_read_position: read_position,
+            accepted_at_unix_ms: UnixMillis::new(1_100).unwrap(),
+        };
+        let admission = RuntimeDesiredEffectAdmission::for_test(session, observation, attestation)
+            .bind_assigned_cats_for_test(&desired);
+        RuntimeDesiredEffectContext::for_test_with_admission(
+            StateDirectory::unanchored(state.to_path_buf()),
+            Instant::now() + Duration::from_secs(10),
+            admission,
+        )
+        .with_node_global_process_for_test(managed)
+    }
+
     #[derive(Debug)]
     struct FakeInventory {
         snapshots: Mutex<VecDeque<VmmCidInventorySnapshot>>,
@@ -747,7 +894,7 @@ mod tests {
     impl VmmCidInventoryPort for FakeInventory {
         fn inspect(
             &self,
-            context: &dyn RuntimePhysicalReadContext,
+            context: &RuntimeDesiredEffectContext,
         ) -> Result<VmmCidInventorySnapshot> {
             context.check_active()?;
             let mut snapshots = self.snapshots.lock().unwrap();
@@ -759,6 +906,90 @@ mod tests {
                 .cloned()
                 .context("fake VMM CID inventory is exhausted")
         }
+    }
+
+    #[test]
+    fn platform_inventory_projects_sorted_exact_vmm_cids_from_one_admission() {
+        let fixture = Fixture::new();
+        let expected_b = vmm_expectation(start_runtime_variant("cat_02", 'e', 'f', 4));
+        let expected_a = vmm_expectation(start_runtime_variant("cat_01", '5', '6', 3));
+        let cat_b = expected_b.cat_id().clone();
+        let cat_a = expected_a.cat_id().clone();
+        let proof_b = expected_b
+            .clone()
+            .prove_exact_process(expected_b.exact_evidence_for_test(4_202))
+            .unwrap();
+        let proof_a = expected_a
+            .clone()
+            .prove_exact_process(expected_a.exact_evidence_for_test(4_201))
+            .unwrap();
+        let managed = super::super::root_provision_process::NodeGlobalManagedProcessScanAdmission::from_root_controls(
+            BTreeMap::new(),
+            BTreeMap::new(),
+        )
+        .unwrap()
+        .with_vmms(
+            BTreeMap::from([
+                (cat_b.clone(), expected_b),
+                (cat_a.clone(), expected_a),
+            ]),
+            BTreeMap::from([(cat_b.clone(), proof_b), (cat_a.clone(), proof_a)]),
+        )
+        .unwrap()
+        .into_admission_for_test();
+        let context = platform_context(&fixture.state, &[cat_b, cat_a], managed);
+
+        let snapshot = PlatformExactVmmCidInventoryPort.inspect(&context).unwrap();
+
+        assert_eq!(snapshot.exact.len(), 2);
+        assert_eq!(snapshot.exact[0].owner.cat_id.as_str(), "cat_01");
+        assert_eq!(
+            snapshot.exact[0].owner.runtime_incarnation.as_str(),
+            &"5".repeat(32)
+        );
+        assert_eq!(snapshot.exact[0].guest_cid, 3);
+        assert_eq!(snapshot.exact[1].owner.cat_id.as_str(), "cat_02");
+        assert_eq!(
+            snapshot.exact[1].owner.runtime_incarnation.as_str(),
+            &"e".repeat(32)
+        );
+        assert_eq!(snapshot.exact[1].guest_cid, 4);
+    }
+
+    #[test]
+    fn platform_inventory_accepts_empty_only_from_scanner_sealed_absence() {
+        let fixture = Fixture::new();
+        let expected = vmm_expectation(start_runtime_variant("cat_01", '5', '6', 3));
+        let cat_id = expected.cat_id().clone();
+        let managed = super::super::root_provision_process::NodeGlobalManagedProcessScanAdmission::from_root_controls(
+            BTreeMap::new(),
+            BTreeMap::new(),
+        )
+        .unwrap()
+        .with_vmms(BTreeMap::from([(cat_id.clone(), expected)]), BTreeMap::new())
+        .unwrap()
+        .into_admission_for_test();
+        let context = platform_context(&fixture.state, &[cat_id], managed);
+
+        let snapshot = PlatformExactVmmCidInventoryPort.inspect(&context).unwrap();
+
+        assert!(snapshot.exact.is_empty());
+    }
+
+    #[test]
+    fn platform_inventory_rejects_missing_or_unbound_global_admission() {
+        let fixture = Fixture::new();
+        let context = context(&fixture.state, &[]);
+        assert!(PlatformExactVmmCidInventoryPort.inspect(&context).is_err());
+
+        let managed = super::super::root_provision_process::NodeGlobalManagedProcessScanAdmission::from_root_controls(
+            BTreeMap::new(),
+            BTreeMap::new(),
+        )
+        .unwrap()
+        .into_admission_for_test();
+        let context = context.with_node_global_process_for_test(managed);
+        assert!(PlatformExactVmmCidInventoryPort.inspect(&context).is_err());
     }
 
     struct Fixture {
