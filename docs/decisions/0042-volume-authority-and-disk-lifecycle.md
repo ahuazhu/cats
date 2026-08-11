@@ -97,7 +97,11 @@ product path中的`{disk}`只接受不可变disk ID；name只用于展示或显�
 
 Persistent create在一个PG事务原子写empty exact Volume、Uninitialized Disk和201
 `ApiIdempotencyResult`，同步完成且不创建Operation。Guest Agent执行唯一一次mkfs并probe结果；Node在
-Control Store写Initialized前必须再次probe exact UUID并使blockd达到`R == L`。初始化事务不接收bool/
+发出mkfs前还必须在最终retained-launch barrier后fresh确认同attachment/epoch的MetadataStore head仍逐字段
+等于blank predecessor；Relaxed drain允许head前进，但post-drain fresh authority必须逐字段等于blockd的
+fully-drained `R == L` status。Control Store写Initialized前必须再次probe exact UUID并使blockd达到`R == L`。
+Mount每轮使用fresh current head，实际mount前在最终barrier后再读一次并拒绝lineage回退或同generation不同
+root；只有完整Persistent mounted-set闭合才可打开admission。初始化事务不接收bool/
 proof；它先锁current NodeIdentity，再锁AgentSession及highest accepted-observation receive-state，再按Volume→Disk→current
 Desired→immutable observation锁序复用已接受的完整`NodeObservation` row，逐字段绑定observation ID、revision/placement、valid checkpoint的
 `commit_initialized`、ObservedVolume owner/epoch/non-empty head与`R == L`lineage，再只更新Disk的closed

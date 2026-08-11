@@ -1038,12 +1038,16 @@ Volume或Disk再反向取得名称锁；与Cat Root create并发时，持同一�
 1. 取得精确 LeaseGrant，确认 MetadataStore head仍等于 blank predecessor。
 2. checkpoint 写 `FormatStarted(token, attachment, epoch, blank_head)` 并 fsync。
 3. Guest Agent按稳定virtio device identity probe。看到期望UUID就采用；确认全盘blank且没有部分
-   格式痕迹时，按同一token执行`mkfs.ext4 -U <filesystem_uuid>`；其他UUID或部分格式直接
+   格式痕迹时，Node仍须在最终retained-launch authority barrier之后fresh重读VolumeRecord，只有完整
+   attachment/epoch未变且head逐字段仍等于blank predecessor，才按同一token执行
+   `mkfs.ext4 -U <filesystem_uuid>`；head前进、epoch/attachment替换、其他UUID或部分格式都零mkfs并
    quarantine。
 4. RPC模糊或Agent crash后重新probe。期望UUID继续采用；仍严格blank可用同一token重试；任何
    其他结果quarantine。`Initialized`之后永不进入mkfs路径。
 5. 磁盘尚未 mount，没有业务写入。Guest Agent执行设备 flush，Node要求 blockd drain到
-   `R == L`，并记录新的exact RemoteHead。
+   `R == L`，并记录新的exact RemoteHead。Relaxed drain可以把head推进为同attachment/epoch的合法
+   successor；post-drain必须fresh验证完整owner/size/durability/admin/transition、lease单调且权威head
+   逐字段等于blockd返回的fully-drained status，不能要求它仍等于pre-drain sidecar head。
 6. `commit_initialized` step只能在Guest probe再次读到Desired的exact UUID、device flush完成且Node已观察
    `R == L`后写入valid checkpoint；错UUID或模糊probe不能进入该step。step中的`new_remote_head`必须是
    generation严格大于blank generation 0的合法非空`RemoteHead`。
@@ -1062,8 +1066,11 @@ Volume或Disk再反向取得名称锁；与Cat Root create并发时，持同一�
    token/UUID/blank head，Disk/Volume/Desired的size/durability及Desired initialize tuple全部一致。
    通过后以本事务DB now原子改为
    `Initialized {same token, uuid, blank head, initialized_head, initialized_at}`。
-8. Guest Agent mount并回报 device identity、UUID、mount path、read/write状态。只有全部匹配后
-   Running 才 Ready并打开 route admission。
+8. Guest Agent mount并回报 device identity、UUID、mount path、read/write状态。每轮probe使用fresh
+   current Volume head，并要求它是launch checkpoint head的同attachment/epoch合法successor；实际Mount前在
+   最终launch barrier后再fresh读取，要求相对launch lower bound和首次读取都不回退、same-generation root不
+   冲突，并把第二次current head发送给Guest。只有全部Persistent按slot完成且完整mounted-set匹配后Running才
+   Ready并打开 route admission；late/manual mount不能提前生成route authority。
 
 初始化阶段即使是 Relaxed volume也必须先达到 `R == L`。否则 Host 丢失后 Control Store 会记得
 UUID，而远端盘仍是空白。第6步响应不明时，已是Initialized且token、UUID、blank head和initialized head

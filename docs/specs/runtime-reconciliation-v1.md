@@ -840,6 +840,19 @@ candidate缺失、unknown extra、cursor/read-position变化、乱序/重复、p
 `metadata_store`为Unavailable，不能把point-read成功或空候选误报为complete。只有读到显式final empty page且
 全集闭合，才可证明该Node的MetadataStore来源完成。
 
+full scanner之前必须先运行与checkpoint effect lane串行的mandatory admission pre-scan。它读取fresh
+Desired、当前本地checkpoint和同一process-owned AdmissionCell session，但不把公共observation当authority。
+session只保存由accepted Ready effect或complete scan确认的最后一个exact Running gate Desired；它可在
+StartRuntime/final Mount建立，不要求checkpoint已经Stable。若current Desired是其strict Endpoint-only
+successor，pre-scan在一个cell临界区内先latch并取消所有changed/removed Endpoint的现有tunnel，未变Endpoint
+保持gate、guard和stream；durable `CloseGate`/drain/remove仍按Endpoint ID一次完成一个。pre-scan内部只在
+exact current Stable/cell、previous exact Stable + strict Endpoint successor的完整latch、exact RequireIdle
+Busy/Open source，或current checkpoint与retained effect edge结算之一成立时，才允许Open gate继续存活；
+前两类可概念化为exact-retained/endpoint-latched状态，但不是返回值或新增wire。已经Closed/untrusted的
+session可先fail-close后正常返回。pre-scan本身超时、取消、队列/worker失败或任何歧义必须先全局fail-close并
+取消tunnel；通过上述保留条件后的scanner Incomplete/deadline按Degraded保留上述已证明gate，scanner
+显式corrupt/conflict/foreign错误仍全局关闭。
+
 以下场景必须先完成一次有边界的全量扫描，期间所有 AdmissionCell 保持 Closed：
 
 - Agent 启动或 Host rejoin；
@@ -892,10 +905,10 @@ unit。Inspect、Verify 和 Quarantine 本身不产生外部 effect。
 | ProvisionRootImage | 完整`provision_root_image` step（包含不与provision transition混用的control-only blockd物理身份）、checkpoint top-level revision/spec/placement和该attachment的现有process/volume evidence | 只允许current non-Deleted Desired的唯一Root；step必须先fsync再spawn/adopt精确blockd实例，并以已持久transition ID发送显式typed request，把exact blank head CAS为纯确定计算的generation-1 target。响应不明只读权威head；closed retryable/conflict按§7.1处理。成功前不得创建Guest device或VMM |
 | PrepareDevice | 完整logical disk IDs/kind、attachment lineage/origin/head/size/durability、closed serving-authority provenance、serving blockd scope/socket/data/executable/process token、closed frontend plan、Guest device及device-only ownership token | 首次Root使用ProvisionRootImage完成的sealed handoff；已有Root及Persistent使用descriptor-stable exact direct authorization，绝不伪造Root handoff。每轮fresh full inventory后只执行该frontend定义的一个bounded effect；晚到资源只按各自独立token和完整物理证据adopt |
 | PrepareNetwork | 完整`NetworkConfig`、Linux IFNAMSIZ内的fresh random tap name、独立network ownership token及全量sorted `PreparedDeviceInput`；top-level stable state null、admission Closed、route gates empty、runtime incarnation null且不得有VMM/Guest transport evidence | checkpoint replace是该轮唯一effect；下一轮accepted fresh full证明exact absent/present后才create/adopt tap，模糊结果再读fresh full。exact tap被新full接受后，后续另一轮才可CAS `StartRuntime`；foreign/duplicate/address collision/ABA零修改并fail closed |
-| FormatFilesystem | attachment、device、filesystem UUID、initialization token、blank predecessor | Guest Agent 只按精确 predecessor 格式化；晚到结果按 UUID probe/adopt，冲突立即 quarantine |
-| DrainInitialization | attachment epoch、local/remote root generation | device flush 后只向精确 owner/epoch publish，直到 `R == L` |
+| FormatFilesystem | attachment、device、filesystem UUID、initialization token、blank predecessor | Guest Agent 只按精确 predecessor 格式化；Guest probe为Blank后、最终launch authority barrier之后仍须fresh读取同一attachment/epoch且MetadataStore head逐字段等于exact blank predecessor，才可发一次Format。head前进、epoch/attachment变化都零mkfs并fail closed；晚到结果按 UUID probe/adopt，冲突立即 quarantine |
+| DrainInitialization | attachment epoch、pre-drain local/remote head lower bound | device flush 后只向精确 owner/epoch publish。Relaxed允许drain把权威head推进为同attachment/epoch的合法successor；post-drain必须fresh验证完整attachment/owner/size/durability/admin/transition、lease单调，且权威head逐字段等于blockd返回的fully-drained `R == L` status。不能拿pre-drain sidecar head要求post-drain仍exact不变 |
 | CommitInitialized | token、blank predecessor exact RemoteHead、UUID、新exact RemoteHead | Control Store 精确 CAS；相同结果幂等，冲突 quarantine |
-| MountFilesystem | attachment、device、UUID、mount path | 只 mount 精确 device/UUID；晚到 mount 不产生 route authority，stale 时按精确 identity unmount |
+| MountFilesystem | attachment、device、UUID、mount path及launch head lower bound | 每轮Probe前fresh读取同一attachment/epoch的current head，要求它是launch lower bound的合法同lineage successor，并把current head发给Guest；实际Mount前在最终launch barrier后再次读取，要求相对lower bound与首次读取都不回退且same-generation root不冲突，再把第二次current head发给Guest。晚到 mount 不产生 route authority，stale 时按精确 identity unmount |
 | StartRuntime | runtime incarnation、exact reserved unit、launcher/VMM/kernel/initramfs file provenance、cmdline、VM shape digests、全部socket/RAM/log path、Node-global Guest CID、exact network、按slot排序的全量`PreparedDeviceInput`及独立process token；stable state null、admission Closed、route gates empty | 只在accepted fresh full逐字段证明PrepareDevice/PrepareNetwork exact postcondition后no-replace create；fixed launcher验证descriptor并exec VMM。结果不明只做fresh full exact inspect；公共process/device evidence可缺失且本身不授权adopt，present必须exact无extra/duplicate。late/foreign/duplicate/ABA不覆写、不unlink、不启第二实例，stale结果不开route |
 | DrainPublish | attachment epoch、local/remote root generation | 只向精确 owner/epoch CAS publish；晚到成功可安全 adopt，旧 epoch 不能写新 root |
 | PauseRuntime | runtime incarnation、process start time | 只 pause 该 incarnation；晚到 pause 可发生，当前 revision 负责 resume 或重建 |
@@ -903,8 +916,14 @@ unit。Inspect、Verify 和 Quarantine 本身不产生外部 effect。
 | StopRuntime | runtime incarnation、process start time、scope id | 只 stop 该 incarnation；晚到 stop 可发生，当前 revision 负责重建 |
 | CleanupRelease | 完整`CleanupRelease`：物理target、inventory session/epoch/read position、Desired/tombstone read position，volume还有release transition/generation/disposition | 只删匹配资源、只 release 精确 owner/epoch；`orphan_scope`重读token/cgroup并证明无live PID/process，`control_socket`重读token并证明无live owner，`checkpoint_file`只由Node单槽重读并重算digest/完整identity且由当前Deleted tombstone证明不再需要；重建或身份变化后的stale cleanup必须拒绝 |
 | DeleteDisposableRoot | authorization ID；payload与direct result只读服务器端AuthorizationRecord | 只用于仍Owned的authorization分支；可达Host要求精确stop且`R < L`，Active HostFenceEvent允许最后`R == L`或L未知。无live DiskSnapshotRecord且Guest/VMM/blockd已停/隔离后，按event/auth/volume/control锁序原子写Consumed receipt及两边Deleting；结果不明只经signed evidence read闭合，Node从closed receipt取得精确lineage，成功后才删该lineage及可能存在的tail。可达R==L normal分支不生成该step |
-| OpenAdmission | exact runtime incarnation及原样retained `runtime_launch`; `stable_state=null`、lifecycle Closed、routes empty | 只用于current完整Desired的`endpoints=[]`。checkpoint-first后compare-and-open同一incarnation的lifecycle；结果不明只确认exact cell postcondition，再CAS Stable Running。Desired有任一Endpoint时禁止，改由第一条InstallGate打开lifecycle |
-| InstallGate | desired checkpoint、spec digest、placement、runtime incarnation、endpoint/route epoch | cell只接受一个serving epoch；任何已close gate必须由更大epoch重开 |
+| OpenAdmission | exact runtime incarnation及原样retained `runtime_launch`; 先持久`stable_state=null`/lifecycle Closed/routes empty的prepared token，再持久完整Stable/Open successor | 只用于current完整Desired的`endpoints=[]`。最后一次checkpoint fsync后，以accepted physical predecessor与durable Stable/Open successor做sealed Host sweep和Guest mounted-set challenge，随后才compare-and-open同一incarnation；cell后无post-CAS。crash在cell前保留Closed并重新barrier，结果不明只确认exact cell postcondition。Desired有任一Endpoint时禁止，改由第一条InstallGate打开lifecycle |
+| InstallGate | desired checkpoint、spec digest、placement、runtime incarnation、endpoint/route epoch；先持久Closed prepared token+同进程edge，再持久Active token | 以immutable launch Desired、live gate predecessor和current Endpoint successor三层authority，在Active fsync后做sealed Host/Guest barrier，随后才compare-and-install cell并持久completed postcondition。prepared只可由同进程exact edge重放；Active可由该edge继续，或在cell已等于exact postcondition时只完成持久结算。重启默认Closed并烧掉Active/结果不明epoch。cell只接受一个serving epoch；任何已close gate必须由更大epoch重开 |
+
+Running-tail private admission不能仅因Guest已经出现预期mount就提前mint。无Persistent卷时只允许合法
+StartRuntime/Running tail；有Persistent卷时，Format、Drain、Commit及非最后一个Persistent的
+MountFilesystem都保持Closed。只有按canonical slot排序的最后一个Persistent处于MountFilesystem，或已经进入
+后续OpenAdmission/InstallGate/Stable/合法retirement phase，并且完整Host+Guest exact set同轮闭合，才可生成
+Running-tail sidecar。late/manual mount永远不能绕过初始化CAS、`R == L`和前序卷状态。
 
 每步都可被 kill。重启后只能确认 postcondition、重试同一 token、继续或 quarantine，不能先
 teardown 再重做。不建立通用 effect workflow。
