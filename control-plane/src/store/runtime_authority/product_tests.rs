@@ -1777,7 +1777,7 @@ fn every_self_consistent_wrong_initial_projection_rolls_back() {
 
     let mut wrong_slot = request(&workspace, "wrong-slot", 45, "projection-slot");
     wrong_slot.candidate.desired.volumes[0].guest_device.slot = 1;
-    refresh_candidate_contract(&mut wrong_slot);
+    assert!(spec_digest(&wrong_slot.candidate.desired).is_err());
 
     let mut wrong_hostname = request(&workspace, "wrong-hostname", 46, "projection-hostname");
     let self_consistent_wrong_hostname =
@@ -1804,7 +1804,6 @@ fn every_self_consistent_wrong_initial_projection_rolls_back() {
         ("placement epoch", &wrong_placement),
         ("transition", &wrong_transition),
         ("Root serial", &wrong_serial),
-        ("Root slot", &wrong_slot),
         ("hostname projection", &wrong_hostname),
         ("Endpoint suffix", &wrong_endpoint_id),
     ] {
