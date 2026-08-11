@@ -50,7 +50,8 @@ use super::inventory::{
 };
 use super::prepare_device_retirement::{
     prepare_device_base_admission_is_exact, prepared_device_input_from_step,
-    prepared_device_input_is_exact, retirement_authority_lease_is_monotonic, unique_runtime,
+    prepared_device_input_is_exact, prepared_device_inputs_from_step,
+    retirement_authority_lease_is_monotonic, unique_runtime,
 };
 use super::retained_runtime_launch::RetainedRuntimeLaunchAuthority;
 use super::serving_blockd_process::{
@@ -917,6 +918,13 @@ pub(crate) struct PrepareNetworkReservationEffect {
     tap_create: Arc<dyn TapCreatePort>,
 }
 
+struct AdmittedNetworkServing<'a> {
+    expectation: &'a ServingBlockdExpectation,
+    serving: &'a ExactServingBlockdProcessProof,
+    first_authority: VolumeRecord,
+    first_lease_expiry: UnixMillis,
+}
+
 impl PrepareNetworkReservationEffect {
     pub(crate) fn new(
         state_directory: StateDirectory,
@@ -998,9 +1006,10 @@ impl PrepareNetworkReservationEffect {
         if !prepare_device_base_admission_is_exact(accepted, desired, runtime) {
             return Ok(Some(local_contract_stop()));
         }
+        let prepared = prepared_device_input_from_step(&runtime.step)?;
         let Some((expectation, Some(serving))) = context
             .node_global_process()?
-            .serving_blockd(&desired.cat_id)
+            .serving_blockd(&desired.cat_id, &prepared.volume_id)
         else {
             anyhow::bail!("PrepareNetwork lacks exact provider-private serving proof")
         };
@@ -1099,9 +1108,9 @@ impl PrepareNetworkReservationEffect {
         let ReconcileStep::PrepareNetwork { network, devices } = &runtime.step else {
             unreachable!("caller selected PrepareNetwork")
         };
-        let [device] = devices.as_slice() else {
+        if devices.is_empty() || !prepared_device_set_is_exact(desired, devices) {
             return Ok(Some(local_contract_stop()));
-        };
+        }
         let network_admission = context.node_global_network()?;
         let Some(expected_networks) = network_admission.expected_networks(&desired.cat_id, network)
         else {
@@ -1116,58 +1125,80 @@ impl PrepareNetworkReservationEffect {
         {
             return Ok(Some(local_contract_stop()));
         }
-        let Some((expectation, Some(serving))) = context
-            .node_global_process()?
-            .serving_blockd(&desired.cat_id)
-        else {
+        let process_admission = context.node_global_process()?;
+        if process_admission.serving_blockd_count(&desired.cat_id) != devices.len() {
             return Ok(Some(RuntimeDesiredEffectOutcome::RefreshInventory));
-        };
-        if !expectation.matches_device_contract(&desired.cat_id, device) {
-            return Ok(Some(local_contract_stop()));
         }
-        let (volume_id, observed_device) = match &device.frontend {
-            PrepareDeviceFrontend::VhostUserBlk { .. } => {
-                let Some(projection) = serving.vhost_device_projection() else {
-                    return Ok(Some(local_contract_stop()));
-                };
-                projection
+        let mut serving_devices = Vec::with_capacity(devices.len());
+        for device in devices {
+            let Some((expectation, Some(serving))) =
+                process_admission.serving_blockd(&desired.cat_id, &device.volume_id)
+            else {
+                return Ok(Some(RuntimeDesiredEffectOutcome::RefreshInventory));
+            };
+            if !expectation.matches_device_contract(&desired.cat_id, device) {
+                return Ok(Some(local_contract_stop()));
             }
-            PrepareDeviceFrontend::KernelNbd { .. } => {
-                let exact = context
-                    .kernel_nbd_pool()?
-                    .exact_device(&desired.cat_id)
-                    .context("PrepareNetwork lacks exact kernel-NBD client proof")?;
-                if exact.listener().expectation() != expectation
-                    || !exact.matches_prepared_device(&desired.cat_id, device)
-                {
-                    return Ok(Some(local_contract_stop()));
+            let (volume_id, observed_device) = match &device.frontend {
+                PrepareDeviceFrontend::VhostUserBlk { .. } => {
+                    let Some(projection) = serving.vhost_device_projection() else {
+                        return Ok(Some(local_contract_stop()));
+                    };
+                    projection
                 }
-                exact.projection()
+                PrepareDeviceFrontend::KernelNbd { .. } => {
+                    let exact = context
+                        .kernel_nbd_pool()?
+                        .exact_device(&desired.cat_id)
+                        .context("PrepareNetwork lacks exact kernel-NBD client proof")?;
+                    if exact.listener().expectation() != expectation
+                        || !exact.matches_prepared_device(&desired.cat_id, device)
+                    {
+                        return Ok(Some(local_contract_stop()));
+                    }
+                    let projection = exact.projection();
+                    projection
+                }
+            };
+            if !prepare_network_volume_admission_is_exact(
+                desired,
+                runtime,
+                device,
+                &volume_id,
+                Some(&observed_device),
+            ) {
+                return Ok(Some(local_contract_stop()));
             }
-        };
-        if !prepare_network_volume_admission_is_exact(
-            desired,
-            runtime,
-            device,
-            &volume_id,
-            Some(&observed_device),
-        ) || !matches!(
-            runtime.processes.as_slice(),
-            [process] if serving.matches_public_process(process)
-        ) {
+            let first_authority = self
+                .authority
+                .load_volume(expectation.volume_id())
+                .context("load TAP effect Volume authority")?;
+            anyhow::ensure!(
+                expectation.matches_current_authority(&first_authority),
+                "TAP effect Volume authority conflicts with serving admission"
+            );
+            let first_lease_expiry = first_authority
+                .lease_expires_at
+                .context("TAP effect Volume authority lacks a serving lease")?;
+            serving_devices.push(AdmittedNetworkServing {
+                expectation,
+                serving,
+                first_authority,
+                first_lease_expiry,
+            });
+        }
+        if runtime.processes.len() != serving_devices.len()
+            || !serving_devices.iter().all(|admitted| {
+                runtime
+                    .processes
+                    .iter()
+                    .filter(|process| admitted.serving.matches_public_process(process))
+                    .count()
+                    == 1
+            })
+        {
             return Ok(Some(local_contract_stop()));
         }
-        let first_authority = self
-            .authority
-            .load_volume(expectation.volume_id())
-            .context("load TAP effect Volume authority")?;
-        anyhow::ensure!(
-            expectation.matches_current_authority(&first_authority),
-            "TAP effect Volume authority conflicts with serving admission"
-        );
-        let first_lease_expiry = first_authority
-            .lease_expires_at
-            .context("TAP effect Volume authority lacks a serving lease")?;
 
         let CheckpointEvidence::Valid {
             checkpoint_path,
@@ -1197,15 +1228,7 @@ impl PrepareNetworkReservationEffect {
             &store,
             &stored,
             self.tap_create.as_ref(),
-            || {
-                self.revalidate_serving_authority(
-                    context,
-                    expectation,
-                    serving,
-                    &first_authority,
-                    first_lease_expiry,
-                )
-            },
+            || self.revalidate_serving_authorities(context, &serving_devices),
         )?;
         Ok(match round {
             // Exact TAP adoption is a read-only proof. Let the independent
@@ -1253,6 +1276,23 @@ impl PrepareNetworkReservationEffect {
         );
         context.check_active()
     }
+
+    fn revalidate_serving_authorities(
+        &self,
+        context: &RuntimeDesiredEffectContext,
+        admitted: &[AdmittedNetworkServing<'_>],
+    ) -> Result<()> {
+        for entry in admitted {
+            self.revalidate_serving_authority(
+                context,
+                entry.expectation,
+                entry.serving,
+                &entry.first_authority,
+                entry.first_lease_expiry,
+            )?;
+        }
+        Ok(())
+    }
 }
 
 pub(super) fn prepare_network_volume_admission_is_exact(
@@ -1262,10 +1302,18 @@ pub(super) fn prepare_network_volume_admission_is_exact(
     volume_id: &Id,
     observed_device: Option<&ObservedDevice>,
 ) -> bool {
-    let [desired_volume] = desired.volumes.as_slice() else {
+    let Some(desired_volume) = desired
+        .volumes
+        .iter()
+        .find(|intent| intent.volume_id == device.volume_id)
+    else {
         return false;
     };
-    let [observed_volume] = runtime.volumes.as_slice() else {
+    let Some(observed_volume) = runtime
+        .volumes
+        .iter()
+        .find(|volume| volume.volume_id == device.volume_id)
+    else {
         return false;
     };
     let [lineage] = observed_volume.local_lineages.as_slice() else {
@@ -1282,11 +1330,9 @@ pub(super) fn prepare_network_volume_admission_is_exact(
     prepared_device_input_is_exact(device, desired, observed_volume)
         && desired.target == RuntimeTarget::Running
         && matches!(desired.transition, RuntimeTransition::CancelAndDrain)
-        && desired_volume.disk_kind == DiskKind::Root
         && desired_volume.access == VolumeAccess::ReadWriteOnce
         && matches!(desired_volume.acquire, VolumeAcquire::Normal { .. })
         && matches!(desired_volume.disposition, VolumeDisposition::Retain)
-        && desired_volume.mount.is_none()
         && device.volume_intent_id == desired_volume.volume_intent_id
         && device.disk_id == desired_volume.disk_id
         && device.volume_id == desired_volume.volume_id
@@ -1300,7 +1346,11 @@ pub(super) fn prepare_network_volume_admission_is_exact(
         && observed_volume.volume_intent_id.as_ref() == Some(&desired_volume.volume_intent_id)
         && observed_volume.disk_id.as_ref() == Some(&desired_volume.disk_id)
         && observed_volume.volume_id == desired_volume.volume_id
-        && observed_volume.disk_kind == ObservedDiskKind::Root
+        && observed_volume.disk_kind
+            == match desired_volume.disk_kind {
+                DiskKind::Root => ObservedDiskKind::Root,
+                DiskKind::Persistent => ObservedDiskKind::Persistent,
+            }
         && observed_volume.size_bytes == Some(desired_volume.size_bytes)
         && observed_volume.durability == Some(desired_volume.durability)
         && observed_volume.devices.as_slice()
@@ -1323,23 +1373,62 @@ fn local_contract_stop() -> RuntimeDesiredEffectOutcome {
 }
 
 pub(super) fn prepared_device_input(checkpoint: &RuntimeCheckpoint) -> Result<PreparedDeviceInput> {
+    let devices = prepared_device_inputs(checkpoint)?;
+    let [device] = devices.as_slice() else {
+        anyhow::bail!("prepared-device projection requires exactly one device")
+    };
+    Ok(device.clone())
+}
+
+pub(super) fn prepared_device_inputs(
+    checkpoint: &RuntimeCheckpoint,
+) -> Result<Vec<PreparedDeviceInput>> {
     if let Some(identity) = checkpoint.runtime_launch.identity() {
         anyhow::ensure!(
             checkpoint.runtime_incarnation.as_ref() == Some(&identity.runtime_incarnation),
             "retained Runtime launch incarnation is not top-level exact"
         );
-        let [device] = identity.devices.as_slice() else {
-            anyhow::bail!("retained Runtime launch must carry exactly one prepared device")
-        };
-        return Ok(device.clone());
+        anyhow::ensure!(
+            !identity.devices.is_empty(),
+            "retained Runtime launch must carry at least one prepared device"
+        );
+        return Ok(identity.devices.clone());
     }
-    prepared_device_input_from_step(&checkpoint.step)
+    prepared_device_inputs_from_step(&checkpoint.step)
+}
+
+pub(super) fn prepared_device_set_is_exact(
+    desired: &DesiredRuntimeSpec,
+    devices: &[PreparedDeviceInput],
+) -> bool {
+    desired.volumes.len() == devices.len()
+        && desired.volumes.iter().all(|volume| {
+            devices
+                .iter()
+                .filter(|device| device.volume_id == volume.volume_id)
+                .count()
+                == 1
+        })
 }
 
 pub(super) fn prepare_device_checkpoint_view(
     checkpoint: &RuntimeCheckpoint,
 ) -> Result<RuntimeCheckpoint> {
-    let device = prepared_device_input(checkpoint)?;
+    let devices = prepared_device_inputs(checkpoint)?;
+    let mut root_handoff = devices.iter().filter(|device| {
+        matches!(
+            device.serving_authority.as_ref(),
+            cats_api::runtime_reconciliation::ServingAuthorityProvenance::AfterRootProvision { .. }
+        )
+    });
+    let device = root_handoff
+        .next()
+        .context("prepared-device projection lacks its Root handoff device")?;
+    anyhow::ensure!(
+        root_handoff.next().is_none(),
+        "prepared-device projection contains duplicate Root handoff devices"
+    );
+    let device = device.clone();
     let mut prepared = checkpoint.clone();
     prepared.step = ReconcileStep::PrepareDevice {
         volume_intent_id: device.volume_intent_id,
@@ -1642,6 +1731,30 @@ mod tests {
             Instant::now() + Duration::from_secs(10),
             admission,
         )
+    }
+
+    #[test]
+    fn prepared_device_set_rejects_a_missing_desired_volume_and_duplicate_device() {
+        let checkpoint = fixed_predecessor();
+        let prepared = prepared_device_input(&checkpoint).unwrap();
+        let desired = desired_for(&checkpoint.cat_id);
+        assert!(prepared_device_set_is_exact(
+            &desired,
+            std::slice::from_ref(&prepared)
+        ));
+
+        let mut desired_with_extra = desired.clone();
+        let mut extra = desired_with_extra.volumes[0].clone();
+        extra.volume_id = Id::new("vol_extra").unwrap();
+        desired_with_extra.volumes.push(extra);
+        assert!(!prepared_device_set_is_exact(
+            &desired_with_extra,
+            std::slice::from_ref(&prepared)
+        ));
+        assert!(!prepared_device_set_is_exact(
+            &desired,
+            &[prepared.clone(), prepared]
+        ));
     }
 
     struct Fixture {

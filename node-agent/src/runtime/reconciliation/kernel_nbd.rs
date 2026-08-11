@@ -1296,14 +1296,15 @@ impl KernelNbdInventoryPort {
                     "kernel-NBD reservation and persisted device expectation conflict"
                 );
 
-                let listener = match managed_processes.serving_blockd(&expected.cat_id) {
-                    Some((_serving_expected, Some(proof))) => {
-                        let listener = proof.listener_proof();
-                        expected.assert_serving_listener(&listener)?;
-                        Some(listener)
-                    }
-                    Some((_, None)) | None => None,
-                };
+                let listener =
+                    match managed_processes.serving_blockd(&expected.cat_id, &expected.volume_id) {
+                        Some((_serving_expected, Some(proof))) => {
+                            let listener = proof.listener_proof();
+                            expected.assert_serving_listener(&listener)?;
+                            Some(listener)
+                        }
+                        Some((_, None)) | None => None,
+                    };
                 let state = match (slot, listener) {
                     (KernelNbdSlotState::Free, listener) => KernelNbdDeviceScanState::Absent {
                         expected: expected.clone(),

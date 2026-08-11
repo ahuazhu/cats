@@ -588,6 +588,18 @@ impl AuthorizedBlockdStore {
             ),
             "exact authorized blockd handoff reopen requires Root serving provenance"
         );
+        self.retain_prepared_device(runtime, desired, &prepared)
+    }
+
+    /// Reopen one exact immutable attachment selected by an explicit prepared
+    /// device. This is the multi-device read-only foundation used by the full
+    /// inventory scanner; it never creates or repairs a missing input.
+    pub(crate) fn retain_prepared_device(
+        &self,
+        runtime: &RuntimeCheckpoint,
+        desired: &DesiredRuntimeSpec,
+        prepared: &cats_api::runtime_reconciliation::PreparedDeviceInput,
+    ) -> Result<RetainedAuthorizedBlockd> {
         let components = [
             DATA_DIRECTORY.to_owned(),
             format!("cat-{}", runtime.cat_id),
@@ -669,9 +681,11 @@ impl AuthorizedBlockdStore {
                 &root_identity,
             )?;
         validate_authorized_blockd_checkpoint(&checkpoint)?;
-        let [desired_volume] = desired.volumes.as_slice() else {
-            anyhow::bail!("Root PrepareDevice handoff requires one Desired volume")
-        };
+        let desired_volume = desired
+            .volumes
+            .iter()
+            .find(|volume| volume.volume_id == prepared.volume_id)
+            .context("prepared device lacks its exact Desired volume")?;
         anyhow::ensure!(
             identity == attachment.identity
                 && attachment == checkpoint.attachment
@@ -689,9 +703,23 @@ impl AuthorizedBlockdStore {
                 && prepared.acquire_origin == identity.acquire_origin
                 && prepared.size_bytes == attachment.size_bytes
                 && prepared.durability == attachment.durability
-                && prepared.expected_head.generation.get() > 0
-                && prepared.expected_head.root_hash.is_some()
-                && prepared.expected_head.root_object_id.is_some(),
+                && match prepared.serving_authority.as_ref() {
+                    cats_api::runtime_reconciliation::ServingAuthorityProvenance::AfterRootProvision { .. } => {
+                        prepared.disk_kind == DiskKind::Root
+                            && prepared.expected_head.generation.get() > 0
+                            && prepared.expected_head.root_hash.is_some()
+                            && prepared.expected_head.root_object_id.is_some()
+                    }
+                    cats_api::runtime_reconciliation::ServingAuthorityProvenance::DirectAuthorizedAttachment { purpose, .. } => {
+                        prepared.expected_head == attachment.head
+                            && matches!(
+                                (prepared.disk_kind, purpose),
+                                (DiskKind::Root, cats_api::runtime_reconciliation::DirectAuthorizedAttachmentPurpose::ExistingRoot)
+                                    | (DiskKind::Persistent, cats_api::runtime_reconciliation::DirectAuthorizedAttachmentPurpose::PersistentInitialized)
+                                    | (DiskKind::Persistent, cats_api::runtime_reconciliation::DirectAuthorizedAttachmentPurpose::PersistentUninitialized)
+                            )
+                    }
+                },
             "PrepareDevice checkpoint and immutable authorized blockd inputs conflict"
         );
 
@@ -707,6 +735,7 @@ impl AuthorizedBlockdStore {
             files: [identity_file, attachment_file, checkpoint_file],
         };
         retained.assert_current()?;
+        retained.assert_prepared_authority(prepared)?;
         Ok(retained)
     }
 
@@ -953,6 +982,36 @@ impl RetainedAuthorizedBlockd {
         for retained in &self.files {
             retained.assert_current(&current, &self.root_identity, &self.data_directory)?;
         }
+        Ok(())
+    }
+
+    pub(crate) fn assert_prepared_authority(
+        &self,
+        prepared: &cats_api::runtime_reconciliation::PreparedDeviceInput,
+    ) -> Result<()> {
+        self.assert_current()?;
+        let cats_api::runtime_reconciliation::ServingAuthorityProvenance::DirectAuthorizedAttachment {
+            authorization,
+            ..
+        } = prepared.serving_authority.as_ref()
+        else {
+            return Ok(());
+        };
+        let retained = self
+            .files
+            .iter()
+            .find(|file| file.name == AUTHORIZED_SERVING_FILE)
+            .context("retained authorized blockd lacks its serving artifact")?;
+        let expected_path = self.data_directory.join(AUTHORIZED_SERVING_FILE);
+        anyhow::ensure!(
+            Path::new(authorization.path.as_str()) == expected_path
+                && authorization.device.get() == retained.identity.device
+                && authorization.inode.get() == retained.identity.inode
+                && authorization.length.get() == retained.identity.length
+                && authorization.content_sha256
+                    == Sha256Digest::from_bytes(Sha256::digest(&retained.bytes).into()),
+            "direct serving authorization changed its descriptor-stable artifact"
+        );
         Ok(())
     }
 
@@ -1512,6 +1571,73 @@ pub fn authorized_blockd_command(
     control_socket: &Path,
     frontend: &AuthorizedBlockFrontend,
 ) -> Result<Command> {
+    build_authorized_blockd_command(
+        config,
+        prepared.checkpoint(),
+        &prepared.state_directory,
+        prepared.data_directory(),
+        prepared.authorized_serving_path(),
+        scope_id,
+        process_identity_token,
+        device_ownership_token,
+        control_socket,
+        frontend,
+    )
+}
+
+/// Build the direct-authorized serving CLI from descriptor-retained immutable
+/// inputs. The retained owner must remain alive while the resulting
+/// expectation is consumed; this helper performs no Host mutation.
+pub(crate) fn retained_authorized_blockd_command(
+    config: &AuthorizedBlockdLaunchConfig,
+    retained: &RetainedAuthorizedBlockd,
+    prepared: &cats_api::runtime_reconciliation::PreparedDeviceInput,
+    frontend: &AuthorizedBlockFrontend,
+) -> Result<Command> {
+    retained.assert_prepared_authority(prepared)?;
+    let checkpoint = retained.checkpoint();
+    anyhow::ensure!(
+        checkpoint.attachment.identity.volume_id == prepared.volume_id
+            && checkpoint.attachment.identity.attachment_id == prepared.attachment_id
+            && checkpoint.attachment.identity.attachment_epoch == prepared.attachment_epoch
+            && checkpoint.attachment.identity.acquire_origin == prepared.acquire_origin
+            && checkpoint.attachment.head == prepared.expected_head
+            && checkpoint.attachment.size_bytes == prepared.size_bytes
+            && checkpoint.attachment.durability == prepared.durability
+            && Path::new(prepared.serving_process.data_directory.as_str())
+                == retained.data_directory(),
+        "retained direct serving input changed its prepared-device contract"
+    );
+    build_authorized_blockd_command(
+        config,
+        checkpoint,
+        retained.state_directory_path(),
+        retained.data_directory(),
+        &retained.data_directory().join(AUTHORIZED_SERVING_FILE),
+        &prepared.serving_process.scope_id,
+        &prepared.serving_process.process_identity_token,
+        &prepared.ownership_token,
+        Path::new(prepared.serving_process.control_socket_path.as_str()),
+        frontend,
+    )
+}
+
+#[allow(
+    clippy::too_many_arguments,
+    reason = "the command builder consumes one closed checkpointed serving identity"
+)]
+fn build_authorized_blockd_command(
+    config: &AuthorizedBlockdLaunchConfig,
+    checkpoint: &AuthorizedBlockdCheckpoint,
+    state_directory: &Path,
+    data_directory: &Path,
+    authorized_serving_path: &Path,
+    scope_id: &Id,
+    process_identity_token: &RandomId128,
+    device_ownership_token: &RandomId128,
+    control_socket: &Path,
+    frontend: &AuthorizedBlockFrontend,
+) -> Result<Command> {
     anyhow::ensure!(
         config.blockd_binary.is_absolute(),
         "authorized blockd binary must be absolute"
@@ -1524,16 +1650,12 @@ pub fn authorized_blockd_command(
         config.max_staged_bytes > 0 && config.max_staged_packs > 0 && config.max_local_bytes > 0,
         "authorized blockd resource limits must be positive"
     );
-    validate_descendant(&prepared.state_directory, control_socket, "control socket")?;
+    validate_descendant(state_directory, control_socket, "control socket")?;
     let frontend_socket = match frontend {
         AuthorizedBlockFrontend::NbdUnix { socket }
         | AuthorizedBlockFrontend::VhostUser { socket, .. } => socket,
     };
-    validate_descendant(
-        &prepared.state_directory,
-        frontend_socket,
-        "block frontend socket",
-    )?;
+    validate_descendant(state_directory, frontend_socket, "block frontend socket")?;
     anyhow::ensure!(
         control_socket != frontend_socket,
         "authorized blockd control and frontend sockets must differ"
@@ -1550,18 +1672,17 @@ pub fn authorized_blockd_command(
             .context("authorized-serving vhost-user shape is outside the frozen contract")?;
     }
 
-    let checkpoint = prepared.checkpoint();
     let attachment = &checkpoint.attachment;
     let mut command = Command::new(&config.blockd_binary);
     command
         .arg("--volume-id")
         .arg(attachment.identity.volume_id.as_str())
         .arg("--data-dir")
-        .arg(prepared.data_directory())
+        .arg(data_directory)
         .arg("--attachment-id")
         .arg(attachment.identity.attachment_id.as_str())
         .arg("--authorized-serving-spec")
-        .arg(prepared.authorized_serving_path())
+        .arg(authorized_serving_path)
         .arg("--runtime-scope-id")
         .arg(scope_id.as_str())
         .arg("--process-identity-token")
@@ -1668,15 +1789,18 @@ fn validate_checkpoint_inputs(
         "authorized blockd supports only Runtime Reconciliation v1 Running"
     );
     anyhow::ensure!(
-        desired.volumes.len() == 1 && desired.volumes.first() == Some(volume),
-        "authorized blockd requires exactly the supplied root volume"
+        desired
+            .volumes
+            .iter()
+            .filter(|candidate| candidate.volume_id == volume.volume_id)
+            .eq([volume]),
+        "authorized blockd requires exactly the supplied Desired volume"
     );
     anyhow::ensure!(
-        volume.disk_kind == DiskKind::Root
-            && volume.access == VolumeAccess::ReadWriteOnce
-            && volume.mount.is_none()
+        volume.access == VolumeAccess::ReadWriteOnce
+            && (volume.disk_kind == DiskKind::Persistent || volume.mount.is_none())
             && matches!(volume.disposition, VolumeDisposition::Retain),
-        "authorized blockd first slice supports only an unmounted retained RWO root"
+        "authorized blockd first slice supports only an unmounted retained RWO volume"
     );
     let VolumeAcquire::Normal {
         transition_id,
@@ -1698,7 +1822,7 @@ fn validate_checkpoint_inputs(
             && request.expected_unowned_epoch == *expected_unowned_epoch
             && request.desired_revision == desired.desired_revision
             && request.placement_epoch == desired.placement.placement_epoch,
-        "Desired, root VolumeIntent and authorized grant do not form one exact lineage"
+        "Desired, VolumeIntent and authorized grant do not form one exact lineage"
     );
     Ok(())
 }
@@ -1714,13 +1838,15 @@ fn validate_adopted_checkpoint_inputs(
     anyhow::ensure!(
         desired.version == ContractVersion::V1
             && desired.target == RuntimeTarget::Running
-            && desired.volumes.len() == 1
-            && desired.volumes.first() == Some(volume)
-            && volume.disk_kind == DiskKind::Root
+            && desired
+                .volumes
+                .iter()
+                .filter(|candidate| candidate.volume_id == volume.volume_id)
+                .eq([volume])
             && volume.access == VolumeAccess::ReadWriteOnce
-            && volume.mount.is_none()
+            && (volume.disk_kind == DiskKind::Persistent || volume.mount.is_none())
             && matches!(volume.disposition, VolumeDisposition::Retain),
-        "authorized blockd adoption requires one retained RWO Running root"
+        "authorized blockd adoption requires one retained RWO Running volume"
     );
     let VolumeAcquire::Normal {
         transition_id,

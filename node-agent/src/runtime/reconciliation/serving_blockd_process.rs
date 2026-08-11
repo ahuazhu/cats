@@ -25,10 +25,16 @@ use crate::runtime_spine::{
     RuntimeDesiredEffectContext, RuntimeDesiredEffectOutcome, RuntimeDesiredEffectStopReason,
     RuntimePhysicalReadContext,
 };
+use crate::state_directory::StateDirectory;
 
+use super::authorized_blockd::{retained_authorized_blockd_command, AuthorizedBlockFrontend};
 use super::checkpoint::CurrentCheckpointGuard;
 use super::clean_slate_probes::CHECKPOINT_NAMESPACE;
-use super::network::{prepare_network_volume_admission_is_exact, prepared_device_input};
+use super::inventory::AuthorizedBlockdInventoryEvidence;
+use super::network::{
+    prepare_device_checkpoint_view, prepare_network_volume_admission_is_exact,
+    prepared_device_input,
+};
 use super::prepare_device_retirement::{
     prepare_device_base_admission_is_exact, retirement_authority_lease_is_monotonic, unique_runtime,
 };
@@ -122,6 +128,99 @@ pub(crate) struct ServingBlockdExpectation {
 }
 
 impl ServingBlockdExpectation {
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "inventory closes one prepared device across immutable storage, Desired, authority, and installed process config"
+    )]
+    pub(crate) fn from_inventory(
+        state_directory: &StateDirectory,
+        systemd: &RootProvisionSystemdConfig,
+        checkpoint: &cats_api::runtime_reconciliation::RuntimeCheckpoint,
+        desired: &DesiredRuntimeSpec,
+        prepared: &PreparedDeviceInput,
+        evidence: &AuthorizedBlockdInventoryEvidence,
+        authority: &VolumeRecord,
+    ) -> anyhow::Result<Self> {
+        anyhow::ensure!(
+            evidence.checkpoint.desired.cat_id == desired.cat_id
+                && evidence.checkpoint.attachment.identity.volume_id == prepared.volume_id
+                && evidence.data_directory == prepared.serving_process.data_directory,
+            "serving expectation inventory changed its Cat, Volume, or data directory"
+        );
+        let store = AuthorizedBlockdStore::new(state_directory.clone());
+        match prepared.serving_authority.as_ref() {
+            cats_api::runtime_reconciliation::ServingAuthorityProvenance::AfterRootProvision {
+                ..
+            } => {
+                let prepared_checkpoint = prepare_device_checkpoint_view(checkpoint)?;
+                anyhow::ensure!(
+                    prepared_device_input(&prepared_checkpoint)? == *prepared,
+                    "Root serving expectation selected another prepared device"
+                );
+                let retained =
+                    store.retain_prepare_device_handoff(&prepared_checkpoint, desired)?;
+                anyhow::ensure!(
+                    retained.checkpoint() == &evidence.checkpoint,
+                    "Root serving expectation reopened another authorized checkpoint"
+                );
+                let ready = ServingHandoffStore::new(state_directory.clone())
+                    .reopen_prepare_device_handoff(
+                        &prepared_checkpoint,
+                        desired,
+                        authority,
+                        retained,
+                    )?;
+                Self::from_handoff(
+                    &ready,
+                    systemd,
+                    &prepared_checkpoint,
+                    desired,
+                    authority,
+                )
+            }
+            cats_api::runtime_reconciliation::ServingAuthorityProvenance::DirectAuthorizedAttachment {
+                ..
+            } => {
+                let retained = store.retain_prepared_device(checkpoint, desired, prepared)?;
+                anyhow::ensure!(
+                    retained.checkpoint() == &evidence.checkpoint
+                        && Path::new(evidence.data_directory.as_str())
+                            == retained.data_directory(),
+                    "direct serving expectation reopened another authorized checkpoint"
+                );
+                let frontend = match &prepared.frontend {
+                    PrepareDeviceFrontend::KernelNbd {
+                        listener_socket_path,
+                        ..
+                    } => AuthorizedBlockFrontend::NbdUnix {
+                        socket: Path::new(listener_socket_path.as_str()).to_path_buf(),
+                    },
+                    PrepareDeviceFrontend::VhostUserBlk {
+                        socket_path,
+                        queues,
+                        queue_size,
+                    } => AuthorizedBlockFrontend::VhostUser {
+                        socket: Path::new(socket_path.as_str()).to_path_buf(),
+                        queues: usize::try_from(*queues)
+                            .context("prepared vhost queue count does not fit usize")?,
+                        queue_size: *queue_size,
+                    },
+                };
+                let command = retained_authorized_blockd_command(
+                    systemd.validated_blockd(),
+                    &retained,
+                    prepared,
+                    &frontend,
+                )?;
+                Self::from_command(
+                    retained.checkpoint().clone(),
+                    command,
+                    prepared.clone(),
+                )
+            }
+        }
+    }
+
     pub(crate) fn from_handoff(
         ready: &PrepareDeviceHandoffReady,
         systemd: &RootProvisionSystemdConfig,
@@ -137,6 +236,20 @@ impl ServingBlockdExpectation {
         )?;
         let prepared = prepared_device_input(checkpoint)
             .context("serving blockd expectation requires a prepared device")?;
+        let mut volume = ready.authorized_checkpoint().clone();
+        // The acquire-time file deliberately remains immutable at the blank
+        // head.  Root provisioning advances that same attachment before the
+        // handoff, so serving status and later authority revalidation must be
+        // bound to the descriptor-retained target attachment instead.
+        volume.attachment = ready.attempt().attachment.clone();
+        Self::from_command(volume, command, prepared)
+    }
+
+    fn from_command(
+        volume: AuthorizedBlockdCheckpoint,
+        command: std::process::Command,
+        prepared: PreparedDeviceInput,
+    ) -> anyhow::Result<Self> {
         let serving_process = &prepared.serving_process;
         let executable_path = HostPath::new(command.get_program().to_string_lossy().into_owned())
             .context("serving blockd executable is not a canonical HostPath")?;
@@ -164,12 +277,6 @@ impl ServingBlockdExpectation {
                 .any(|(name, value)| name == "CATS_CRASH_POINT" && value.is_none()),
             "serving blockd command did not clear crash injection"
         );
-        let mut volume = ready.authorized_checkpoint().clone();
-        // The acquire-time file deliberately remains immutable at the blank
-        // head.  Root provisioning advances that same attachment before the
-        // handoff, so serving status and later authority revalidation must be
-        // bound to the descriptor-retained target attachment instead.
-        volume.attachment = ready.attempt().attachment.clone();
         Ok(Self {
             volume,
             unit_id: serving_process.scope_id.clone(),
@@ -310,6 +417,67 @@ impl ServingBlockdExpectation {
             expectation: self,
             evidence,
         })
+    }
+
+    #[cfg(test)]
+    pub(crate) fn persistent_vhost_peer_for_test(&self, unique_physical: bool) -> Self {
+        let mut peer = self.clone();
+        let volume_id = Id::new("vol_persistent").unwrap();
+        let attachment_id = Id::new("att_persistent").unwrap();
+        let volume_intent_id = Id::new("vint_persistent").unwrap();
+        let disk_id = Id::new("disk_persistent").unwrap();
+        let guest_serial = Id::new("cats-persistent").unwrap();
+        let intent = peer
+            .volume
+            .desired
+            .volumes
+            .first_mut()
+            .expect("test serving expectation has one Volume intent");
+        intent.volume_intent_id = volume_intent_id.clone();
+        intent.disk_id = disk_id.clone();
+        intent.volume_id = volume_id.clone();
+        intent.attachment_id = attachment_id.clone();
+        intent.disk_kind = cats_api::runtime_reconciliation::DiskKind::Persistent;
+        intent.guest_device.serial = guest_serial.clone();
+        intent.guest_device.slot = 1;
+        peer.volume.volume = intent.clone();
+        peer.volume.attachment.identity.volume_id = volume_id.clone();
+        peer.volume.attachment.identity.attachment_id = attachment_id.clone();
+        peer.volume.attachment.acquire_request.volume_id = volume_id.clone();
+        peer.volume.attachment.acquire_request.attachment_id = attachment_id.clone();
+        peer.prepared_device.volume_intent_id = volume_intent_id;
+        peer.prepared_device.disk_id = disk_id;
+        peer.prepared_device.volume_id = volume_id;
+        peer.prepared_device.disk_kind = cats_api::runtime_reconciliation::DiskKind::Persistent;
+        peer.prepared_device.attachment_id = attachment_id;
+        peer.prepared_device.guest_device.serial = guest_serial;
+        peer.prepared_device.guest_device.slot = 1;
+        if unique_physical {
+            peer.unit_id = Id::new("cats-blockd-persistent.service").unwrap();
+            peer.cgroup_path =
+                HostPath::new("/sys/fs/cgroup/system.slice/cats-blockd-persistent.service")
+                    .unwrap();
+            peer.control_socket_path =
+                HostPath::new("/run/cats/cat_01/persistent-control.sock").unwrap();
+            peer.data_directory = HostPath::new("/var/lib/cats/cat_01/persistent").unwrap();
+            peer.process_identity_token =
+                RandomId128::new("eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee").unwrap();
+            peer.device_ownership_token =
+                RandomId128::new("ffffffffffffffffffffffffffffffff").unwrap();
+            peer.prepared_device.serving_process.scope_id = peer.unit_id.clone();
+            peer.prepared_device.serving_process.control_socket_path =
+                peer.control_socket_path.clone();
+            peer.prepared_device.serving_process.data_directory = peer.data_directory.clone();
+            peer.prepared_device.serving_process.process_identity_token =
+                peer.process_identity_token.clone();
+            peer.prepared_device.ownership_token = peer.device_ownership_token.clone();
+            let PrepareDeviceFrontend::VhostUserBlk { socket_path, .. } = &mut peer.frontend else {
+                panic!("test serving expectation is vhost-user")
+            };
+            *socket_path = HostPath::new("/run/cats/cat_01/persistent-vhost.sock").unwrap();
+            peer.prepared_device.frontend = peer.frontend.clone();
+        }
+        peer
     }
 
     #[cfg(test)]
@@ -795,7 +963,8 @@ impl ServingBlockdStartEffect {
             &first_authority,
         )?;
         let admission = context.node_global_process()?;
-        let Some((admitted_expected, admitted_exact)) = admission.serving_blockd(&desired.cat_id)
+        let Some((admitted_expected, admitted_exact)) =
+            admission.serving_blockd(&desired.cat_id, expected.volume_id())
         else {
             return Ok(Some(stop_local()));
         };

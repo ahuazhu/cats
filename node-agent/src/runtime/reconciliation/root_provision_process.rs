@@ -619,17 +619,31 @@ pub(crate) enum NodeGlobalManagedProcessExpectation {
     },
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
-pub(crate) enum NodeGlobalManagedProcessRole {
-    RootControl,
-    ServingBlockd,
-    Vmm,
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+pub(crate) struct ManagedServingKey {
+    cat_id: Id,
+    volume_id: Id,
+}
+
+impl ManagedServingKey {
+    pub(crate) fn new(cat_id: Id, volume_id: Id) -> Self {
+        Self { cat_id, volume_id }
+    }
+
+    pub(crate) fn cat_id(&self) -> &Id {
+        &self.cat_id
+    }
+
+    pub(crate) fn volume_id(&self) -> &Id {
+        &self.volume_id
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
-pub(crate) struct NodeGlobalManagedProcessKey {
-    cat_id: Id,
-    role: NodeGlobalManagedProcessRole,
+pub(crate) enum NodeGlobalManagedProcessKey {
+    RootControl(Id),
+    ServingBlockd(ManagedServingKey),
+    Vmm(Id),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -689,18 +703,18 @@ impl StopReceiptSocketAdmission {
 impl NodeGlobalManagedProcessExpectation {
     pub(crate) fn key(&self) -> NodeGlobalManagedProcessKey {
         match self {
-            Self::RootControl { expectation, .. } => NodeGlobalManagedProcessKey {
-                cat_id: expectation.cat_id.clone(),
-                role: NodeGlobalManagedProcessRole::RootControl,
-            },
-            Self::ServingBlockd { expectation, .. } => NodeGlobalManagedProcessKey {
-                cat_id: expectation.cat_id().clone(),
-                role: NodeGlobalManagedProcessRole::ServingBlockd,
-            },
-            Self::Vmm { expectation, .. } => NodeGlobalManagedProcessKey {
-                cat_id: expectation.cat_id().clone(),
-                role: NodeGlobalManagedProcessRole::Vmm,
-            },
+            Self::RootControl { expectation, .. } => {
+                NodeGlobalManagedProcessKey::RootControl(expectation.cat_id.clone())
+            }
+            Self::ServingBlockd { expectation, .. } => {
+                NodeGlobalManagedProcessKey::ServingBlockd(ManagedServingKey::new(
+                    expectation.cat_id().clone(),
+                    expectation.volume_id().clone(),
+                ))
+            }
+            Self::Vmm { expectation, .. } => {
+                NodeGlobalManagedProcessKey::Vmm(expectation.cat_id().clone())
+            }
         }
     }
 }
@@ -761,10 +775,10 @@ impl NodeGlobalManagedProcessScanAdmission {
         projections
     }
 
-    pub(crate) fn vhost_device_projections(&self) -> BTreeMap<Id, (Id, ObservedDevice)> {
-        self.entries
-            .iter()
-            .filter_map(|entry| match entry {
+    pub(crate) fn vhost_device_projections(&self) -> BTreeMap<Id, BTreeMap<Id, ObservedDevice>> {
+        let mut projections = BTreeMap::<Id, BTreeMap<Id, ObservedDevice>>::new();
+        for entry in &self.entries {
+            let projection = match entry {
                 NodeGlobalManagedProcessExpectation::ServingBlockd {
                     expectation,
                     exact: Some(proof),
@@ -772,8 +786,16 @@ impl NodeGlobalManagedProcessScanAdmission {
                     .vhost_device_projection()
                     .map(|device| (expectation.cat_id().clone(), device)),
                 _ => None,
-            })
-            .collect()
+            };
+            if let Some((cat_id, (volume_id, device))) = projection {
+                let previous = projections
+                    .entry(cat_id)
+                    .or_default()
+                    .insert(volume_id, device);
+                debug_assert!(previous.is_none(), "typed serving keys are unique");
+            }
+        }
+        projections
     }
 
     /// Provider-private serving proof retained by the same complete scanner
@@ -783,11 +805,35 @@ impl NodeGlobalManagedProcessScanAdmission {
     pub(crate) fn serving_blockd(
         &self,
         cat_id: &Id,
+        volume_id: &Id,
     ) -> Option<(
         &super::serving_blockd_process::ServingBlockdExpectation,
         Option<&super::serving_blockd_process::ExactServingBlockdProcessProof>,
     )> {
         self.entries.iter().find_map(|entry| match entry {
+            NodeGlobalManagedProcessExpectation::ServingBlockd { expectation, exact }
+                if expectation.cat_id() == cat_id && expectation.volume_id() == volume_id =>
+            {
+                Some((expectation.as_ref(), exact.as_deref()))
+            }
+            _ => None,
+        })
+    }
+
+    pub(crate) fn serving_blockd_count(&self, cat_id: &Id) -> usize {
+        self.serving_blockds(cat_id).count()
+    }
+
+    pub(crate) fn serving_blockds<'a>(
+        &'a self,
+        cat_id: &'a Id,
+    ) -> impl Iterator<
+        Item = (
+            &'a super::serving_blockd_process::ServingBlockdExpectation,
+            Option<&'a super::serving_blockd_process::ExactServingBlockdProcessProof>,
+        ),
+    > + 'a {
+        self.entries.iter().filter_map(move |entry| match entry {
             NodeGlobalManagedProcessExpectation::ServingBlockd { expectation, exact }
                 if expectation.cat_id() == cat_id =>
             {
@@ -922,8 +968,14 @@ impl NodeGlobalManagedProcessScanAdmission {
 
     pub(crate) fn with_serving_blockds(
         mut self,
-        expected: BTreeMap<Id, super::serving_blockd_process::ServingBlockdExpectation>,
-        mut exact: BTreeMap<Id, super::serving_blockd_process::ExactServingBlockdProcessProof>,
+        expected: BTreeMap<
+            ManagedServingKey,
+            super::serving_blockd_process::ServingBlockdExpectation,
+        >,
+        mut exact: BTreeMap<
+            ManagedServingKey,
+            super::serving_blockd_process::ExactServingBlockdProcessProof,
+        >,
     ) -> anyhow::Result<Self> {
         let mut units = self
             .entries
@@ -985,12 +1037,12 @@ impl NodeGlobalManagedProcessScanAdmission {
             .iter()
             .map(NodeGlobalManagedProcessExpectation::key)
             .collect::<BTreeSet<_>>();
-        for (cat_id, expectation) in expected {
+        for (key, expectation) in expected {
             anyhow::ensure!(
-                expectation.cat_id() == &cat_id,
-                "Node-global serving expectation is indexed by another Cat"
+                expectation.cat_id() == key.cat_id() && expectation.volume_id() == key.volume_id(),
+                "Node-global serving expectation is indexed by another Cat or Volume"
             );
-            let proof = exact.remove(&cat_id);
+            let proof = exact.remove(&key);
             if let Some(proof) = &proof {
                 anyhow::ensure!(
                     proof.expectation() == &expectation,
@@ -1039,14 +1091,21 @@ impl NodeGlobalManagedProcessScanAdmission {
 
     pub(crate) fn serving_blockd_proofs(
         &self,
-    ) -> BTreeMap<Id, super::serving_blockd_process::ExactServingBlockdProcessProof> {
+    ) -> BTreeMap<ManagedServingKey, super::serving_blockd_process::ExactServingBlockdProcessProof>
+    {
         self.entries
             .iter()
             .filter_map(|entry| match entry {
                 NodeGlobalManagedProcessExpectation::ServingBlockd {
                     expectation,
                     exact: Some(proof),
-                } => Some((expectation.cat_id().clone(), (**proof).clone())),
+                } => Some((
+                    ManagedServingKey::new(
+                        expectation.cat_id().clone(),
+                        expectation.volume_id().clone(),
+                    ),
+                    (**proof).clone(),
+                )),
                 _ => None,
             })
             .collect()
@@ -1208,6 +1267,27 @@ impl NodeGlobalManagedProcessScanAdmission {
         for processes in admitted_processes.values_mut() {
             processes.sort_by(compare_process_evidence);
         }
+        let mut admitted_vhost_devices = BTreeMap::<Id, BTreeMap<Id, ObservedDevice>>::new();
+        for entry in &self.entries {
+            let NodeGlobalManagedProcessExpectation::ServingBlockd {
+                expectation,
+                exact: Some(proof),
+            } = entry
+            else {
+                continue;
+            };
+            let Some((volume_id, device)) = proof.vhost_device_projection() else {
+                continue;
+            };
+            anyhow::ensure!(
+                admitted_vhost_devices
+                    .entry(expectation.cat_id().clone())
+                    .or_default()
+                    .insert(volume_id, device)
+                    .is_none(),
+                "Node-global serving proofs duplicate one vhost Volume projection"
+            );
+        }
         for runtime in &observation.runtimes {
             let expected = admitted_processes.remove(&runtime.cat_id);
             match expected {
@@ -1220,25 +1300,37 @@ impl NodeGlobalManagedProcessScanAdmission {
                     "public process projection lacks a provider-private global expectation"
                 ),
             }
-            let expected_device = self.entries.iter().find_map(|entry| match entry {
-                NodeGlobalManagedProcessExpectation::ServingBlockd {
-                    expectation,
-                    exact: Some(proof),
-                } if expectation.cat_id() == &runtime.cat_id => proof.vhost_device_projection(),
-                _ => None,
-            });
-            if let Some((volume_id, device)) = expected_device {
+            let expected_devices = admitted_vhost_devices
+                .remove(&runtime.cat_id)
+                .unwrap_or_default();
+            let actual_devices = runtime
+                .volumes
+                .iter()
+                .filter_map(|volume| match volume.devices.as_slice() {
+                    [device @ ObservedDevice::VhostUserBlk { .. }] => {
+                        Some((volume.volume_id.clone(), device.clone()))
+                    }
+                    _ => None,
+                })
+                .collect::<BTreeMap<_, _>>();
+            anyhow::ensure!(
+                actual_devices == expected_devices,
+                "serving vhost proofs conflict with the exact public device projection"
+            );
+            for volume in &runtime.volumes {
                 anyhow::ensure!(
-                    runtime.volumes.iter().any(|volume| {
-                        volume.volume_id == volume_id && volume.devices == [device.clone()]
-                    }),
-                    "serving vhost proof conflicts with public device projection"
+                    volume.devices.len() <= 1,
+                    "public Volume projects duplicate managed frontend devices"
                 );
             }
         }
         anyhow::ensure!(
             admitted_processes.is_empty(),
             "Node-global managed-process admission names a Cat absent from inventory"
+        );
+        anyhow::ensure!(
+            admitted_vhost_devices.is_empty(),
+            "Node-global serving admission names a Cat absent from inventory"
         );
         Ok(NodeGlobalManagedProcessAdmission {
             observation_id: observation.observation_id.clone(),
@@ -1382,17 +1474,21 @@ impl NodeGlobalManagedProcessAdmission {
     pub(crate) fn serving_blockd_state(
         &self,
     ) -> (
-        BTreeMap<Id, super::serving_blockd_process::ServingBlockdExpectation>,
-        BTreeMap<Id, super::serving_blockd_process::ServingBlockdProcessInspection>,
+        BTreeMap<ManagedServingKey, super::serving_blockd_process::ServingBlockdExpectation>,
+        BTreeMap<ManagedServingKey, super::serving_blockd_process::ServingBlockdProcessInspection>,
     ) {
         let mut expected = BTreeMap::new();
         let mut admitted = BTreeMap::new();
         for entry in &self.entries {
             if let NodeGlobalManagedProcessExpectation::ServingBlockd { expectation, exact } = entry
             {
-                expected.insert(expectation.cat_id().clone(), (**expectation).clone());
-                admitted.insert(
+                let key = ManagedServingKey::new(
                     expectation.cat_id().clone(),
+                    expectation.volume_id().clone(),
+                );
+                expected.insert(key.clone(), (**expectation).clone());
+                admitted.insert(
+                    key,
                     exact.as_ref().map_or(
                         super::serving_blockd_process::ServingBlockdProcessInspection::Absent,
                         |proof| {
@@ -1456,11 +1552,35 @@ impl NodeGlobalManagedProcessAdmission {
     pub(crate) fn serving_blockd(
         &self,
         cat_id: &Id,
+        volume_id: &Id,
     ) -> Option<(
         &super::serving_blockd_process::ServingBlockdExpectation,
         Option<&super::serving_blockd_process::ExactServingBlockdProcessProof>,
     )> {
         self.entries.iter().find_map(|entry| match entry {
+            NodeGlobalManagedProcessExpectation::ServingBlockd { expectation, exact }
+                if expectation.cat_id() == cat_id && expectation.volume_id() == volume_id =>
+            {
+                Some((expectation.as_ref(), exact.as_deref()))
+            }
+            _ => None,
+        })
+    }
+
+    pub(crate) fn serving_blockd_count(&self, cat_id: &Id) -> usize {
+        self.serving_blockds(cat_id).count()
+    }
+
+    pub(crate) fn serving_blockds<'a>(
+        &'a self,
+        cat_id: &'a Id,
+    ) -> impl Iterator<
+        Item = (
+            &'a super::serving_blockd_process::ServingBlockdExpectation,
+            Option<&'a super::serving_blockd_process::ExactServingBlockdProcessProof>,
+        ),
+    > + 'a {
+        self.entries.iter().filter_map(move |entry| match entry {
             NodeGlobalManagedProcessExpectation::ServingBlockd { expectation, exact }
                 if expectation.cat_id() == cat_id =>
             {

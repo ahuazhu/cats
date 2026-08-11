@@ -49,7 +49,6 @@ use crate::runtime_spine::{
 };
 use crate::state_directory::StateDirectory;
 
-use super::authorized_blockd::AuthorizedBlockdStore;
 use super::authorized_blockd::{
     decode_root_provision_stop_receipt, validate_authorized_blockd_checkpoint,
     AUTHORIZED_SERVING_FILE, AUTHORIZED_SERVING_TEMP, IDENTITY_FILE, IDENTITY_TEMP,
@@ -62,14 +61,19 @@ use super::checkpoint::{
     decode_definite_release_rejection, validate_definite_release_rejection,
     DefiniteReleaseRejection, RELEASE_REJECTION_MAX_BYTES,
 };
+#[cfg(test)]
+use super::inventory::serving_process_expectations;
 use super::inventory::{
     AuthorityVolumeInventoryEvidence, AuthorizedBlockdControlState,
     AuthorizedBlockdInventoryEvidence, DesiredCheckpointBinding,
     RuntimeCheckpointInventoryEvidence,
 };
 use super::kernel_nbd::{KernelNbdInventoryConfig, KernelNbdInventoryPort};
-use super::network::{prepare_device_checkpoint_view, NetworkAllocationPort};
+use super::network::{
+    prepare_device_checkpoint_view, prepared_device_inputs, NetworkAllocationPort,
+};
 use super::root_provision_process::inspect_exact_root_provision_process;
+use super::root_provision_process::ManagedServingKey;
 use super::root_provision_process::StopReceiptSocketAdmission;
 use super::serving_blockd_process::{
     global_sealed as serving_global_sealed, process_sealed as serving_process_sealed,
@@ -78,8 +82,8 @@ use super::serving_blockd_process::{
 };
 use super::serving_handoff::{
     scanned_target_control_process_launch, validate_scanned_serving_handoff_artifacts,
-    ScannedServingHandoffArtifact, ServingHandoffStore, ServingHandoffTempKind,
-    SERVING_HANDOFF_RECORD_FILE, SERVING_HANDOFF_RECORD_MAX_BYTES, SERVING_HANDOFF_RETIREMENT_FILE,
+    ScannedServingHandoffArtifact, ServingHandoffTempKind, SERVING_HANDOFF_RECORD_FILE,
+    SERVING_HANDOFF_RECORD_MAX_BYTES, SERVING_HANDOFF_RETIREMENT_FILE,
     SERVING_HANDOFF_RETIREMENT_MAX_BYTES,
 };
 use super::serving_handoff_effect::{
@@ -1887,7 +1891,7 @@ pub(crate) fn classify_local_publication_recovery(
         ProbeLimits::default(),
     )?;
     if data.handoff_temps.len() == 1
-        && data.evidence.len() + data.handoff_temps.len() == data.leaf_count
+        && data.evidence_count() + data.handoff_temps.len() == data.leaf_count
     {
         let (cat_id, kind, authorized) = data.handoff_temps[0].clone();
         return Ok(LocalPublicationRecoveryEvidence::ServingHandoffTemp {
@@ -1900,7 +1904,7 @@ pub(crate) fn classify_local_publication_recovery(
         return Ok(LocalPublicationRecoveryEvidence::None);
     }
     if !data.recoverable_stop_receipts.is_empty() || !data.stable_stop_receipts.is_empty() {
-        if data.evidence.len() != data.leaf_count {
+        if data.evidence_count() != data.leaf_count {
             return Ok(LocalPublicationRecoveryEvidence::None);
         }
         return Ok(next_stop_receipt_recovery(
@@ -1986,13 +1990,19 @@ impl InventoryAbsenceProbe for AuthorizedBlockdDataProbe {
 }
 
 struct AuthorizedBlockdDataScan {
-    evidence: BTreeMap<Id, AuthorizedBlockdInventoryEvidence>,
+    evidence: BTreeMap<Id, BTreeMap<Id, AuthorizedBlockdInventoryEvidence>>,
     candidate_volume_ids: BTreeSet<Id>,
     leaf_count: usize,
     complete: bool,
     handoff_temps: Vec<(Id, ServingHandoffTempKind, AuthorizedBlockdCheckpoint)>,
     stable_stop_receipts: Vec<Id>,
     recoverable_stop_receipts: Vec<Id>,
+}
+
+impl AuthorizedBlockdDataScan {
+    fn evidence_count(&self) -> usize {
+        self.evidence.values().map(BTreeMap::len).sum()
+    }
 }
 
 /// One immutable checkpoint-namespace join for the whole data-directory
@@ -2226,387 +2236,408 @@ fn scan_authorized_blockd_data(
         let Some(desired) = desired_by_directory.get(cat_name) else {
             bail!("authorized blockd data namespace retains foreign Cat {cat_name}")
         };
-        scan.leaf_count += 1;
-
         let Some(cat_directory) =
             open_exact_only_child_directory(&directory, &cat_entry, root, context)?
         else {
             scan.complete = false;
             continue;
         };
-        let Some((volume_name, volume_directory)) =
-            descend_only_directory(&cat_directory, root, &mut budget, context, "volume")?
+        let Some(volume_entries) = strict_directory_entries(&cat_directory, &mut budget, context)?
         else {
             scan.complete = false;
             continue;
         };
-        let Some((attachment_name, attachment_directory)) =
-            descend_only_directory(&volume_directory, root, &mut budget, context, "attachment")?
-        else {
-            scan.complete = false;
-            continue;
-        };
-        let Some((epoch_name, epoch_directory)) =
-            descend_only_directory(&attachment_directory, root, &mut budget, context, "epoch")?
-        else {
-            scan.complete = false;
-            continue;
-        };
-        let Some(leaf_entries) = strict_directory_entries(&epoch_directory, &mut budget, context)?
-        else {
-            scan.complete = false;
-            continue;
-        };
-        let by_name = leaf_entries
-            .into_iter()
-            .map(|entry| {
-                let name = entry
-                    .name
-                    .to_str()
-                    .context("authorized blockd leaf contains non-UTF-8 entry")?
-                    .to_owned();
-                Ok((name, entry))
-            })
-            .collect::<anyhow::Result<BTreeMap<_, _>>>()?;
-        let has_unvalidated_handoff_artifact = by_name
-            .keys()
-            .any(|name| is_serving_handoff_artifact_name(name));
-        let allowed = [
-            IDENTITY_FILE,
-            IDENTITY_TEMP,
-            AUTHORIZED_SERVING_FILE,
-            AUTHORIZED_SERVING_TEMP,
-            LAUNCH_CHECKPOINT_FILE,
-            LAUNCH_CHECKPOINT_TEMP,
-            ROOT_PROVISION_STOP_RECEIPT_FILE,
-            ROOT_PROVISION_STOP_RECEIPT_TEMP,
-            ROOT_PROVISION_STOP_SOCKET_QUARANTINE,
-            "root-provision.sock",
-            SERVING_CONTROL_SOCKET_BASENAME,
-            SERVING_NBD_SOCKET_BASENAME,
-            SERVING_VHOST_SOCKET_BASENAME,
-            "cache.data",
-            ".cache.data.init",
-            "dirty.bitmap",
-            ".dirty.bitmap.init",
-            "pending-packs",
-        ];
-        if let Some(foreign) = by_name.keys().find(|name| {
-            !allowed.contains(&name.as_str()) && !is_serving_handoff_artifact_name(name)
-        }) {
-            bail!("authorized blockd leaf retains foreign entry {foreign}")
-        }
-        if [
-            IDENTITY_TEMP,
-            AUTHORIZED_SERVING_TEMP,
-            LAUNCH_CHECKPOINT_TEMP,
-            ".cache.data.init",
-            ".dirty.bitmap.init",
-        ]
-        .into_iter()
-        .any(|name| by_name.contains_key(name))
-            || [
-                IDENTITY_FILE,
-                AUTHORIZED_SERVING_FILE,
-                LAUNCH_CHECKPOINT_FILE,
-            ]
-            .into_iter()
-            .any(|name| !by_name.contains_key(name))
-        {
+        if volume_entries.is_empty() {
             scan.complete = false;
             continue;
         }
-        let root_metadata = root.metadata().context("inspect retained state root")?;
-        for socket_name in [
-            "root-provision.sock",
-            ROOT_PROVISION_STOP_SOCKET_QUARANTINE,
-            SERVING_CONTROL_SOCKET_BASENAME,
-            SERVING_NBD_SOCKET_BASENAME,
-            SERVING_VHOST_SOCKET_BASENAME,
-        ] {
-            let Some(socket) = by_name.get(socket_name) else {
-                continue;
-            };
-            anyhow::ensure!(
-                socket.metadata.st_mode & libc::S_IFMT == libc::S_IFSOCK
-                    && socket.metadata.st_nlink == 1
-                    && socket.metadata.st_uid == root_metadata.uid()
-                    && socket.metadata.st_gid == root_metadata.gid()
-                    && socket.metadata.st_mode & 0o7777 == 0o700,
-                "root-provision control socket has unsafe type or identity"
-            );
-        }
-
-        let Some(identity_bytes) = read_strict_regular_at(
-            &epoch_directory,
-            &by_name[IDENTITY_FILE],
-            root,
-            MAX_IDENTITY_BYTES,
-            context,
-        )?
-        else {
-            scan.complete = false;
-            continue;
-        };
-        let Some(attachment_bytes) = read_strict_regular_at(
-            &epoch_directory,
-            &by_name[AUTHORIZED_SERVING_FILE],
-            root,
-            MAX_AUTHORIZED_SERVING_BYTES,
-            context,
-        )?
-        else {
-            scan.complete = false;
-            continue;
-        };
-        let Some(checkpoint_bytes) = read_strict_regular_at(
-            &epoch_directory,
-            &by_name[LAUNCH_CHECKPOINT_FILE],
-            root,
-            MAX_LAUNCH_CHECKPOINT_BYTES,
-            context,
-        )?
-        else {
-            scan.complete = false;
-            continue;
-        };
-
-        let identity: AttachmentLineageIdentity =
-            decode_exact_json(&identity_bytes, "attachment identity")?;
-        let attachment: AuthorizedServingAttachment =
-            decode_exact_json(&attachment_bytes, "authorized serving attachment")?;
-        let checkpoint: AuthorizedBlockdCheckpoint =
-            decode_exact_json(&checkpoint_bytes, "authorized blockd checkpoint")?;
-        validate_authorized_blockd_checkpoint(&checkpoint)?;
-        anyhow::ensure!(
-            identity == attachment.identity && attachment == checkpoint.attachment,
-            "authorized blockd files do not form one exact lineage"
-        );
-        let stop_target = if let Some(entry) = by_name.get(ROOT_PROVISION_STOP_RECEIPT_FILE) {
-            read_strict_regular_at(
-                &epoch_directory,
-                entry,
-                root,
-                ROOT_PROVISION_STOP_RECEIPT_MAX_BYTES,
-                context,
-            )?
-        } else {
-            None
-        };
-        let stop_temp = if let Some(entry) = by_name.get(ROOT_PROVISION_STOP_RECEIPT_TEMP) {
-            read_strict_regular_at(
-                &epoch_directory,
-                entry,
-                root,
-                ROOT_PROVISION_STOP_RECEIPT_MAX_BYTES,
-                context,
-            )?
-        } else {
-            None
-        };
-        if by_name.contains_key(ROOT_PROVISION_STOP_RECEIPT_FILE) && stop_target.is_none()
-            || by_name.contains_key(ROOT_PROVISION_STOP_RECEIPT_TEMP) && stop_temp.is_none()
-        {
-            scan.complete = false;
-            continue;
-        }
-        let mut stop_receipt_socket = None;
-        if let Some(bytes) = stop_target.as_ref().or(stop_temp.as_ref()) {
-            if let (Some(target), Some(temporary)) = (&stop_target, &stop_temp) {
-                anyhow::ensure!(
-                    target == temporary,
-                    "root-provision stop receipt target and temp conflict"
-                );
-            }
-            let receipt = decode_root_provision_stop_receipt(bytes)?;
-            let Some(runtime_checkpoint) = checkpoint_snapshot
-                .as_ref()
-                .and_then(|snapshot| snapshot.get(&desired.cat_id))
+        for volume_entry in volume_entries {
+            scan.leaf_count += 1;
+            let volume_name = volume_entry
+                .name
+                .to_str()
+                .context("authorized blockd volume path is not UTF-8")?
+                .to_owned();
+            let Some(volume_directory) =
+                open_strict_child_directory(&cat_directory, &volume_entry, root)?
             else {
                 scan.complete = false;
                 continue;
             };
+            let Some((attachment_name, attachment_directory)) = descend_only_directory(
+                &volume_directory,
+                root,
+                &mut budget,
+                context,
+                "attachment",
+            )?
+            else {
+                scan.complete = false;
+                continue;
+            };
+            let Some((epoch_name, epoch_directory)) =
+                descend_only_directory(&attachment_directory, root, &mut budget, context, "epoch")?
+            else {
+                scan.complete = false;
+                continue;
+            };
+            let Some(leaf_entries) =
+                strict_directory_entries(&epoch_directory, &mut budget, context)?
+            else {
+                scan.complete = false;
+                continue;
+            };
+            let by_name = leaf_entries
+                .into_iter()
+                .map(|entry| {
+                    let name = entry
+                        .name
+                        .to_str()
+                        .context("authorized blockd leaf contains non-UTF-8 entry")?
+                        .to_owned();
+                    Ok((name, entry))
+                })
+                .collect::<anyhow::Result<BTreeMap<_, _>>>()?;
+            let has_unvalidated_handoff_artifact = by_name
+                .keys()
+                .any(|name| is_serving_handoff_artifact_name(name));
+            let allowed = [
+                IDENTITY_FILE,
+                IDENTITY_TEMP,
+                AUTHORIZED_SERVING_FILE,
+                AUTHORIZED_SERVING_TEMP,
+                LAUNCH_CHECKPOINT_FILE,
+                LAUNCH_CHECKPOINT_TEMP,
+                ROOT_PROVISION_STOP_RECEIPT_FILE,
+                ROOT_PROVISION_STOP_RECEIPT_TEMP,
+                ROOT_PROVISION_STOP_SOCKET_QUARANTINE,
+                "root-provision.sock",
+                SERVING_CONTROL_SOCKET_BASENAME,
+                SERVING_NBD_SOCKET_BASENAME,
+                SERVING_VHOST_SOCKET_BASENAME,
+                "cache.data",
+                ".cache.data.init",
+                "dirty.bitmap",
+                ".dirty.bitmap.init",
+                "pending-packs",
+            ];
+            if let Some(foreign) = by_name.keys().find(|name| {
+                !allowed.contains(&name.as_str()) && !is_serving_handoff_artifact_name(name)
+            }) {
+                bail!("authorized blockd leaf retains foreign entry {foreign}")
+            }
+            if [
+                IDENTITY_TEMP,
+                AUTHORIZED_SERVING_TEMP,
+                LAUNCH_CHECKPOINT_TEMP,
+                ".cache.data.init",
+                ".dirty.bitmap.init",
+            ]
+            .into_iter()
+            .any(|name| by_name.contains_key(name))
+                || [
+                    IDENTITY_FILE,
+                    AUTHORIZED_SERVING_FILE,
+                    LAUNCH_CHECKPOINT_FILE,
+                ]
+                .into_iter()
+                .any(|name| !by_name.contains_key(name))
+            {
+                scan.complete = false;
+                continue;
+            }
+            let root_metadata = root.metadata().context("inspect retained state root")?;
+            for socket_name in [
+                "root-provision.sock",
+                ROOT_PROVISION_STOP_SOCKET_QUARANTINE,
+                SERVING_CONTROL_SOCKET_BASENAME,
+                SERVING_NBD_SOCKET_BASENAME,
+                SERVING_VHOST_SOCKET_BASENAME,
+            ] {
+                let Some(socket) = by_name.get(socket_name) else {
+                    continue;
+                };
+                anyhow::ensure!(
+                    socket.metadata.st_mode & libc::S_IFMT == libc::S_IFSOCK
+                        && socket.metadata.st_nlink == 1
+                        && socket.metadata.st_uid == root_metadata.uid()
+                        && socket.metadata.st_gid == root_metadata.gid()
+                        && socket.metadata.st_mode & 0o7777 == 0o700,
+                    "root-provision control socket has unsafe type or identity"
+                );
+            }
+
+            let Some(identity_bytes) = read_strict_regular_at(
+                &epoch_directory,
+                &by_name[IDENTITY_FILE],
+                root,
+                MAX_IDENTITY_BYTES,
+                context,
+            )?
+            else {
+                scan.complete = false;
+                continue;
+            };
+            let Some(attachment_bytes) = read_strict_regular_at(
+                &epoch_directory,
+                &by_name[AUTHORIZED_SERVING_FILE],
+                root,
+                MAX_AUTHORIZED_SERVING_BYTES,
+                context,
+            )?
+            else {
+                scan.complete = false;
+                continue;
+            };
+            let Some(checkpoint_bytes) = read_strict_regular_at(
+                &epoch_directory,
+                &by_name[LAUNCH_CHECKPOINT_FILE],
+                root,
+                MAX_LAUNCH_CHECKPOINT_BYTES,
+                context,
+            )?
+            else {
+                scan.complete = false;
+                continue;
+            };
+
+            let identity: AttachmentLineageIdentity =
+                decode_exact_json(&identity_bytes, "attachment identity")?;
+            let attachment: AuthorizedServingAttachment =
+                decode_exact_json(&attachment_bytes, "authorized serving attachment")?;
+            let checkpoint: AuthorizedBlockdCheckpoint =
+                decode_exact_json(&checkpoint_bytes, "authorized blockd checkpoint")?;
+            validate_authorized_blockd_checkpoint(&checkpoint)?;
             anyhow::ensure!(
+                identity == attachment.identity && attachment == checkpoint.attachment,
+                "authorized blockd files do not form one exact lineage"
+            );
+            let stop_target = if let Some(entry) = by_name.get(ROOT_PROVISION_STOP_RECEIPT_FILE) {
+                read_strict_regular_at(
+                    &epoch_directory,
+                    entry,
+                    root,
+                    ROOT_PROVISION_STOP_RECEIPT_MAX_BYTES,
+                    context,
+                )?
+            } else {
+                None
+            };
+            let stop_temp = if let Some(entry) = by_name.get(ROOT_PROVISION_STOP_RECEIPT_TEMP) {
+                read_strict_regular_at(
+                    &epoch_directory,
+                    entry,
+                    root,
+                    ROOT_PROVISION_STOP_RECEIPT_MAX_BYTES,
+                    context,
+                )?
+            } else {
+                None
+            };
+            if by_name.contains_key(ROOT_PROVISION_STOP_RECEIPT_FILE) && stop_target.is_none()
+                || by_name.contains_key(ROOT_PROVISION_STOP_RECEIPT_TEMP) && stop_temp.is_none()
+            {
+                scan.complete = false;
+                continue;
+            }
+            let mut stop_receipt_socket = None;
+            if let Some(bytes) = stop_target.as_ref().or(stop_temp.as_ref()) {
+                if let (Some(target), Some(temporary)) = (&stop_target, &stop_temp) {
+                    anyhow::ensure!(
+                        target == temporary,
+                        "root-provision stop receipt target and temp conflict"
+                    );
+                }
+                let receipt = decode_root_provision_stop_receipt(bytes)?;
+                let Some(runtime_checkpoint) = checkpoint_snapshot
+                    .as_ref()
+                    .and_then(|snapshot| snapshot.get(&desired.cat_id))
+                else {
+                    scan.complete = false;
+                    continue;
+                };
+                anyhow::ensure!(
                 checkpoint_content_digest(runtime_checkpoint)?
                     == *receipt.checkpoint_content_digest()
                     && runtime_checkpoint.cat_id == desired.cat_id
                     && !has_unvalidated_handoff_artifact,
                 "root-provision stop receipt conflicts with its checkpoint, launch grant, or handoff"
             );
-            receipt.binds_authorized_checkpoint(&checkpoint)?;
-            let receipt_path = receipt.process().control_socket_path.clone();
-            let mut physical_paths = BTreeSet::new();
-            for (name, path) in [
-                ("root-provision.sock", receipt_path.clone()),
-                (
-                    ROOT_PROVISION_STOP_SOCKET_QUARANTINE,
-                    HostPath::new(
-                        Path::new(receipt_path.as_str())
-                            .parent()
-                            .context("root-provision stop receipt socket has no parent")?
-                            .join(ROOT_PROVISION_STOP_SOCKET_QUARANTINE)
-                            .to_string_lossy()
-                            .into_owned(),
-                    )
-                    .context("root-provision quarantine path is not canonical")?,
-                ),
-            ] {
-                if let Some(entry) = by_name.get(name) {
-                    anyhow::ensure!(
-                        receipt.socket_matches_scanned_stat(&entry.metadata),
-                        "root-provision stop socket changed from its durable receipt"
-                    );
-                    physical_paths.insert(path);
+                receipt.binds_authorized_checkpoint(&checkpoint)?;
+                let receipt_path = receipt.process().control_socket_path.clone();
+                let mut physical_paths = BTreeSet::new();
+                for (name, path) in [
+                    ("root-provision.sock", receipt_path.clone()),
+                    (
+                        ROOT_PROVISION_STOP_SOCKET_QUARANTINE,
+                        HostPath::new(
+                            Path::new(receipt_path.as_str())
+                                .parent()
+                                .context("root-provision stop receipt socket has no parent")?
+                                .join(ROOT_PROVISION_STOP_SOCKET_QUARANTINE)
+                                .to_string_lossy()
+                                .into_owned(),
+                        )
+                        .context("root-provision quarantine path is not canonical")?,
+                    ),
+                ] {
+                    if let Some(entry) = by_name.get(name) {
+                        anyhow::ensure!(
+                            receipt.socket_matches_scanned_stat(&entry.metadata),
+                            "root-provision stop socket changed from its durable receipt"
+                        );
+                        physical_paths.insert(path);
+                    }
+                }
+                anyhow::ensure!(
+                    physical_paths.len() <= 1,
+                    "root-provision stop socket retains both public and quarantine names"
+                );
+                stop_receipt_socket = Some(StopReceiptSocketAdmission::new(
+                    receipt_path,
+                    physical_paths,
+                )?);
+                if stop_temp.is_some() {
+                    scan.recoverable_stop_receipts.push(desired.cat_id.clone());
+                    scan.complete = false;
+                } else {
+                    scan.stable_stop_receipts.push(desired.cat_id.clone());
                 }
             }
-            anyhow::ensure!(
-                physical_paths.len() <= 1,
-                "root-provision stop socket retains both public and quarantine names"
-            );
-            stop_receipt_socket = Some(StopReceiptSocketAdmission::new(
-                receipt_path,
-                physical_paths,
-            )?);
-            if stop_temp.is_some() {
-                scan.recoverable_stop_receipts.push(desired.cat_id.clone());
-                scan.complete = false;
-            } else {
-                scan.stable_stop_receipts.push(desired.cat_id.clone());
-            }
-        }
-        if by_name.contains_key(ROOT_PROVISION_STOP_SOCKET_QUARANTINE) {
-            anyhow::ensure!(
-                stop_target.is_some() || stop_temp.is_some(),
-                "root-provision socket quarantine lacks its durable stop receipt"
-            );
-            anyhow::ensure!(
-                stop_target.is_some() && stop_temp.is_none(),
-                "root-provision socket quarantine lacks one stable stop receipt"
-            );
-        }
-        let control_files = ["cache.data", "dirty.bitmap", "pending-packs"];
-        let present_control_files = control_files
-            .into_iter()
-            .filter(|name| by_name.contains_key(*name))
-            .count();
-        let control_state = if present_control_files == 0 {
-            AuthorizedBlockdControlState::NotStarted
-        } else if present_control_files == control_files.len() {
-            let root_metadata = root.metadata().context("inspect retained state root")?;
-            let cache = &by_name["cache.data"].metadata;
-            anyhow::ensure!(
-                cache.st_mode & libc::S_IFMT == libc::S_IFREG
-                    && cache.st_nlink == 1
-                    && cache.st_uid == root_metadata.uid()
-                    && cache.st_mode & 0o777 == 0o600
-                    && u64::try_from(cache.st_size).ok() == Some(attachment.size_bytes),
-                "root-provision control-only cache has unsafe identity or size"
-            );
-            if inspect_empty_dirty_bitmap_at(
-                &epoch_directory,
-                &by_name["dirty.bitmap"],
-                root,
-                attachment.size_bytes,
-                context,
-            )?
-            .is_none()
-            {
-                scan.complete = false;
-                continue;
-            }
-            let Some(pending) =
-                open_strict_child_directory(&epoch_directory, &by_name["pending-packs"], root)?
-            else {
-                scan.complete = false;
-                continue;
-            };
-            let Some(pending_entries) = strict_directory_entries(&pending, &mut budget, context)?
-            else {
-                scan.complete = false;
-                continue;
-            };
-            anyhow::ensure!(
-                pending_entries.is_empty(),
-                "root-provision control-only blockd retains a pending pack"
-            );
-            AuthorizedBlockdControlState::ExactControlOnlyEmpty
-        } else {
-            scan.complete = false;
-            continue;
-        };
-        let binding = authorized_blockd_binding(desired, &checkpoint)?;
-        anyhow::ensure!(
-            cat_name == format!("cat-{}", checkpoint.desired.cat_id)
-                && volume_name == format!("volume-{}", identity.volume_id)
-                && attachment_name == format!("attachment-{}", identity.attachment_id)
-                && epoch_name == format!("epoch-{}", identity.attachment_epoch.get()),
-            "authorized blockd physical path and checkpoint identity disagree"
-        );
-        let data_directory_path = state_path
-            .join(DATA_NAMESPACE)
-            .join(cat_name)
-            .join(&volume_name)
-            .join(&attachment_name)
-            .join(&epoch_name);
-        let data_directory = HostPath::new(
-            data_directory_path
-                .to_str()
-                .context("authorized blockd data directory is not UTF-8")?
-                .to_owned(),
-        )
-        .context("authorized blockd data directory is not a HostPath")?;
-        let mut retained_root_process = None;
-        let mut target_control_launch = None;
-        if !has_unvalidated_handoff_artifact {
-            if let Some(runtime_checkpoint) = checkpoint_snapshot
-                .as_ref()
-                .and_then(|snapshot| snapshot.get(&desired.cat_id))
-            {
-                let prepared_checkpoint;
-                let handoff_checkpoint = if matches!(
-                    runtime_checkpoint.step,
-                    ReconcileStep::PrepareNetwork { .. }
-                ) {
-                    prepared_checkpoint = prepare_device_checkpoint_view(runtime_checkpoint)?;
-                    &prepared_checkpoint
-                } else {
-                    runtime_checkpoint
-                };
+            if by_name.contains_key(ROOT_PROVISION_STOP_SOCKET_QUARANTINE) {
                 anyhow::ensure!(
-                    !matches!(
-                        &handoff_checkpoint.step,
-                        ReconcileStep::PrepareDevice {
-                            serving_authority,
-                            ..
-                        } if matches!(
-                            serving_authority.as_ref(),
-                            cats_api::runtime_reconciliation::ServingAuthorityProvenance::AfterRootProvision { .. }
-                        )
-                    ),
-                    "after-root-provision checkpoint lacks its durable handoff artifacts"
+                    stop_target.is_some() || stop_temp.is_some(),
+                    "root-provision socket quarantine lacks its durable stop receipt"
+                );
+                anyhow::ensure!(
+                    stop_target.is_some() && stop_temp.is_none(),
+                    "root-provision socket quarantine lacks one stable stop receipt"
                 );
             }
-        }
-        if has_unvalidated_handoff_artifact {
-            let Some(runtime_checkpoint) = checkpoint_snapshot
-                .as_ref()
-                .and_then(|snapshot| snapshot.get(&desired.cat_id))
-                .cloned()
-            else {
+            let control_files = ["cache.data", "dirty.bitmap", "pending-packs"];
+            let present_control_files = control_files
+                .into_iter()
+                .filter(|name| by_name.contains_key(*name))
+                .count();
+            let control_state = if present_control_files == 0 {
+                AuthorizedBlockdControlState::NotStarted
+            } else if present_control_files == control_files.len() {
+                let root_metadata = root.metadata().context("inspect retained state root")?;
+                let cache = &by_name["cache.data"].metadata;
+                anyhow::ensure!(
+                    cache.st_mode & libc::S_IFMT == libc::S_IFREG
+                        && cache.st_nlink == 1
+                        && cache.st_uid == root_metadata.uid()
+                        && cache.st_mode & 0o777 == 0o600
+                        && u64::try_from(cache.st_size).ok() == Some(attachment.size_bytes),
+                    "root-provision control-only cache has unsafe identity or size"
+                );
+                if inspect_empty_dirty_bitmap_at(
+                    &epoch_directory,
+                    &by_name["dirty.bitmap"],
+                    root,
+                    attachment.size_bytes,
+                    context,
+                )?
+                .is_none()
+                {
+                    scan.complete = false;
+                    continue;
+                }
+                let Some(pending) =
+                    open_strict_child_directory(&epoch_directory, &by_name["pending-packs"], root)?
+                else {
+                    scan.complete = false;
+                    continue;
+                };
+                let Some(pending_entries) =
+                    strict_directory_entries(&pending, &mut budget, context)?
+                else {
+                    scan.complete = false;
+                    continue;
+                };
+                anyhow::ensure!(
+                    pending_entries.is_empty(),
+                    "root-provision control-only blockd retains a pending pack"
+                );
+                AuthorizedBlockdControlState::ExactControlOnlyEmpty
+            } else {
                 scan.complete = false;
                 continue;
             };
-            let prepared_checkpoint;
-            let handoff_checkpoint = if matches!(
-                runtime_checkpoint.step,
-                ReconcileStep::PrepareNetwork { .. }
-            ) {
-                prepared_checkpoint = prepare_device_checkpoint_view(&runtime_checkpoint)?;
-                &prepared_checkpoint
-            } else {
-                &runtime_checkpoint
-            };
-            let provision_transition_id = match &handoff_checkpoint.step {
+            let binding = authorized_blockd_binding(desired, &checkpoint)?;
+            anyhow::ensure!(
+                cat_name == format!("cat-{}", checkpoint.desired.cat_id)
+                    && volume_name == format!("volume-{}", identity.volume_id)
+                    && attachment_name == format!("attachment-{}", identity.attachment_id)
+                    && epoch_name == format!("epoch-{}", identity.attachment_epoch.get()),
+                "authorized blockd physical path and checkpoint identity disagree"
+            );
+            let data_directory_path = state_path
+                .join(DATA_NAMESPACE)
+                .join(cat_name)
+                .join(&volume_name)
+                .join(&attachment_name)
+                .join(&epoch_name);
+            let data_directory = HostPath::new(
+                data_directory_path
+                    .to_str()
+                    .context("authorized blockd data directory is not UTF-8")?
+                    .to_owned(),
+            )
+            .context("authorized blockd data directory is not a HostPath")?;
+            let mut retained_root_process = None;
+            let mut target_control_launch = None;
+            if !has_unvalidated_handoff_artifact {
+                if let Some(runtime_checkpoint) = checkpoint_snapshot
+                    .as_ref()
+                    .and_then(|snapshot| snapshot.get(&desired.cat_id))
+                {
+                    if matches!(
+                        runtime_checkpoint.step,
+                        ReconcileStep::PrepareDevice { .. }
+                            | ReconcileStep::PrepareNetwork { .. }
+                            | ReconcileStep::StartRuntime { .. }
+                    ) || runtime_checkpoint.runtime_launch.identity().is_some()
+                    {
+                        let prepared = prepared_device_inputs(runtime_checkpoint)?
+                        .into_iter()
+                        .find(|device| device.volume_id == identity.volume_id)
+                        .context(
+                            "authorized blockd lineage lacks its prepared-device checkpoint entry",
+                        )?;
+                        anyhow::ensure!(
+                        !matches!(
+                            prepared.serving_authority.as_ref(),
+                            cats_api::runtime_reconciliation::ServingAuthorityProvenance::AfterRootProvision { .. }
+                        ),
+                        "after-root-provision checkpoint lacks its durable handoff artifacts"
+                    );
+                    }
+                }
+            }
+            if has_unvalidated_handoff_artifact {
+                let Some(runtime_checkpoint) = checkpoint_snapshot
+                    .as_ref()
+                    .and_then(|snapshot| snapshot.get(&desired.cat_id))
+                    .cloned()
+                else {
+                    scan.complete = false;
+                    continue;
+                };
+                let prepared_checkpoint;
+                let handoff_checkpoint =
+                    if matches!(
+                        runtime_checkpoint.step,
+                        ReconcileStep::PrepareNetwork { .. } | ReconcileStep::StartRuntime { .. }
+                    ) || runtime_checkpoint.runtime_launch.identity().is_some()
+                    {
+                        prepared_checkpoint = prepare_device_checkpoint_view(&runtime_checkpoint)?;
+                        &prepared_checkpoint
+                    } else {
+                        &runtime_checkpoint
+                    };
+                let provision_transition_id = match &handoff_checkpoint.step {
                 ReconcileStep::ProvisionRootImage {
                     provision_transition_id,
                     ..
@@ -2655,150 +2686,156 @@ fn scan_authorized_blockd_data(
                     "serving handoff artifacts require provision_root_image or an after-root-provision prepared-device phase"
                 ),
             };
-            let target_name = format!(
-                "authorized-target-control-{}.json",
-                provision_transition_id.as_str()
-            );
-            let target_temp = format!(".{target_name}.tmp");
-            let expected_reserved = [
-                target_name.as_str(),
-                target_temp.as_str(),
-                SERVING_HANDOFF_RECORD_FILE,
-                ".serving-handoff.json.tmp",
-                SERVING_HANDOFF_RETIREMENT_FILE,
-                ".serving-handoff-retirement.json.tmp",
-            ];
-            if let Some(foreign) = by_name.keys().find(|name| {
-                is_serving_handoff_artifact_name(name)
-                    && !expected_reserved.contains(&name.as_str())
-            }) {
-                bail!("authorized blockd leaf retains foreign handoff artifact {foreign}")
-            }
-            let present_temps = [
-                (
+                let target_name = format!(
+                    "authorized-target-control-{}.json",
+                    provision_transition_id.as_str()
+                );
+                let target_temp = format!(".{target_name}.tmp");
+                let expected_reserved = [
+                    target_name.as_str(),
                     target_temp.as_str(),
-                    ServingHandoffTempKind::TargetAuthorization,
-                    TARGET_CONTROL_AUTHORIZATION_MAX_BYTES,
-                ),
-                (
+                    SERVING_HANDOFF_RECORD_FILE,
                     ".serving-handoff.json.tmp",
-                    ServingHandoffTempKind::Record,
-                    SERVING_HANDOFF_RECORD_MAX_BYTES,
-                ),
-                (
+                    SERVING_HANDOFF_RETIREMENT_FILE,
                     ".serving-handoff-retirement.json.tmp",
-                    ServingHandoffTempKind::RetirementReceipt,
-                    SERVING_HANDOFF_RETIREMENT_MAX_BYTES,
-                ),
-            ]
-            .into_iter()
-            .filter(|(name, _, _)| by_name.contains_key(*name))
-            .collect::<Vec<_>>();
-            if !present_temps.is_empty() {
-                if present_temps.len() == 1 {
-                    let (name, kind, maximum) = present_temps[0];
-                    if read_scanned_handoff_artifact(
+                ];
+                if let Some(foreign) = by_name.keys().find(|name| {
+                    is_serving_handoff_artifact_name(name)
+                        && !expected_reserved.contains(&name.as_str())
+                }) {
+                    bail!("authorized blockd leaf retains foreign handoff artifact {foreign}")
+                }
+                let present_temps = [
+                    (
+                        target_temp.as_str(),
+                        ServingHandoffTempKind::TargetAuthorization,
+                        TARGET_CONTROL_AUTHORIZATION_MAX_BYTES,
+                    ),
+                    (
+                        ".serving-handoff.json.tmp",
+                        ServingHandoffTempKind::Record,
+                        SERVING_HANDOFF_RECORD_MAX_BYTES,
+                    ),
+                    (
+                        ".serving-handoff-retirement.json.tmp",
+                        ServingHandoffTempKind::RetirementReceipt,
+                        SERVING_HANDOFF_RETIREMENT_MAX_BYTES,
+                    ),
+                ]
+                .into_iter()
+                .filter(|(name, _, _)| by_name.contains_key(*name))
+                .collect::<Vec<_>>();
+                if !present_temps.is_empty() {
+                    if present_temps.len() == 1 {
+                        let (name, kind, maximum) = present_temps[0];
+                        if read_scanned_handoff_artifact(
+                            &epoch_directory,
+                            &by_name[name],
+                            root,
+                            data_directory_path.join(name),
+                            maximum,
+                            context,
+                        )?
+                        .is_some()
+                        {
+                            scan.handoff_temps.push((
+                                desired.cat_id.clone(),
+                                kind,
+                                checkpoint.clone(),
+                            ));
+                        }
+                    }
+                    scan.complete = false;
+                    continue;
+                }
+                let Some(target_entry) = by_name.get(&target_name) else {
+                    bail!("serving handoff artifact set lacks target-control authority")
+                };
+                let Some(target) = read_scanned_handoff_artifact(
+                    &epoch_directory,
+                    target_entry,
+                    root,
+                    data_directory_path.join(&target_name),
+                    TARGET_CONTROL_AUTHORIZATION_MAX_BYTES,
+                    context,
+                )?
+                else {
+                    scan.complete = false;
+                    continue;
+                };
+                let record = if let Some(entry) = by_name.get(SERVING_HANDOFF_RECORD_FILE) {
+                    let Some(record) = read_scanned_handoff_artifact(
                         &epoch_directory,
-                        &by_name[name],
+                        entry,
                         root,
-                        data_directory_path.join(name),
-                        maximum,
+                        data_directory_path.join(SERVING_HANDOFF_RECORD_FILE),
+                        SERVING_HANDOFF_RECORD_MAX_BYTES,
                         context,
                     )?
-                    .is_some()
-                    {
-                        scan.handoff_temps
-                            .push((desired.cat_id.clone(), kind, checkpoint.clone()));
-                    }
-                }
-                scan.complete = false;
-                continue;
+                    else {
+                        scan.complete = false;
+                        continue;
+                    };
+                    Some(record)
+                } else {
+                    None
+                };
+                let retirement = if let Some(entry) = by_name.get(SERVING_HANDOFF_RETIREMENT_FILE) {
+                    let Some(retirement) = read_scanned_handoff_artifact(
+                        &epoch_directory,
+                        entry,
+                        root,
+                        data_directory_path.join(SERVING_HANDOFF_RETIREMENT_FILE),
+                        SERVING_HANDOFF_RETIREMENT_MAX_BYTES,
+                        context,
+                    )?
+                    else {
+                        scan.complete = false;
+                        continue;
+                    };
+                    Some(retirement)
+                } else {
+                    None
+                };
+                let target = target.borrowed();
+                let record = record.as_ref().map(OwnedScannedHandoffArtifact::borrowed);
+                let retirement = retirement
+                    .as_ref()
+                    .map(OwnedScannedHandoffArtifact::borrowed);
+                retained_root_process = validate_scanned_serving_handoff_artifacts(
+                    &runtime_checkpoint,
+                    &checkpoint,
+                    &target,
+                    record.as_ref(),
+                    retirement.as_ref(),
+                )?;
+                target_control_launch = Some(scanned_target_control_process_launch(
+                    &runtime_checkpoint,
+                    &checkpoint,
+                    &target,
+                )?);
             }
-            let Some(target_entry) = by_name.get(&target_name) else {
-                bail!("serving handoff artifact set lacks target-control authority")
-            };
-            let Some(target) = read_scanned_handoff_artifact(
-                &epoch_directory,
-                target_entry,
-                root,
-                data_directory_path.join(&target_name),
-                TARGET_CONTROL_AUTHORIZATION_MAX_BYTES,
-                context,
-            )?
-            else {
-                scan.complete = false;
-                continue;
-            };
-            let record = if let Some(entry) = by_name.get(SERVING_HANDOFF_RECORD_FILE) {
-                let Some(record) = read_scanned_handoff_artifact(
-                    &epoch_directory,
-                    entry,
-                    root,
-                    data_directory_path.join(SERVING_HANDOFF_RECORD_FILE),
-                    SERVING_HANDOFF_RECORD_MAX_BYTES,
-                    context,
-                )?
-                else {
-                    scan.complete = false;
-                    continue;
-                };
-                Some(record)
-            } else {
-                None
-            };
-            let retirement = if let Some(entry) = by_name.get(SERVING_HANDOFF_RETIREMENT_FILE) {
-                let Some(retirement) = read_scanned_handoff_artifact(
-                    &epoch_directory,
-                    entry,
-                    root,
-                    data_directory_path.join(SERVING_HANDOFF_RETIREMENT_FILE),
-                    SERVING_HANDOFF_RETIREMENT_MAX_BYTES,
-                    context,
-                )?
-                else {
-                    scan.complete = false;
-                    continue;
-                };
-                Some(retirement)
-            } else {
-                None
-            };
-            let target = target.borrowed();
-            let record = record.as_ref().map(OwnedScannedHandoffArtifact::borrowed);
-            let retirement = retirement
-                .as_ref()
-                .map(OwnedScannedHandoffArtifact::borrowed);
-            retained_root_process = validate_scanned_serving_handoff_artifacts(
-                &runtime_checkpoint,
-                &checkpoint,
-                &target,
-                record.as_ref(),
-                retirement.as_ref(),
-            )?;
-            target_control_launch = Some(scanned_target_control_process_launch(
-                &runtime_checkpoint,
-                &checkpoint,
-                &target,
-            )?);
+            scan.candidate_volume_ids.insert(identity.volume_id.clone());
+            anyhow::ensure!(
+                scan.evidence
+                    .entry(desired.cat_id.clone())
+                    .or_default()
+                    .insert(
+                        identity.volume_id.clone(),
+                        AuthorizedBlockdInventoryEvidence {
+                            data_directory,
+                            checkpoint,
+                            binding,
+                            control_state,
+                            retained_root_process,
+                            target_control_launch,
+                            stop_receipt_socket,
+                        },
+                    )
+                    .is_none(),
+                "authorized blockd inventory duplicated one Cat/Volume"
+            );
         }
-        scan.candidate_volume_ids.insert(identity.volume_id.clone());
-        anyhow::ensure!(
-            scan.evidence
-                .insert(
-                    desired.cat_id.clone(),
-                    AuthorizedBlockdInventoryEvidence {
-                        data_directory,
-                        checkpoint,
-                        binding,
-                        control_state,
-                        retained_root_process,
-                        target_control_launch,
-                        stop_receipt_socket,
-                    },
-                )
-                .is_none(),
-            "authorized blockd inventory duplicated one Cat"
-        );
     }
     Ok(scan)
 }
@@ -2970,7 +3007,7 @@ struct PlatformRootProcessInventoryBridge {
 enum AdmittedManagedProcessInspection {
     Exact {
         root: BTreeMap<Id, RootProvisionProcessInspection>,
-        serving: BTreeMap<Id, ServingBlockdProcessInspection>,
+        serving: BTreeMap<ManagedServingKey, ServingBlockdProcessInspection>,
         vmm: BTreeMap<Id, VmmProcessInspection>,
     },
     Unavailable,
@@ -3292,17 +3329,17 @@ impl RootProcessInventoryBridge for PlatformRootProcessInventoryBridge {
         &self,
         checkpoint: &RuntimeCheckpoint,
         desired: &DesiredRuntimeSpec,
+        prepared: &cats_api::runtime_reconciliation::PreparedDeviceInput,
+        blockd: &AuthorizedBlockdInventoryEvidence,
         authority: &VolumeRecord,
     ) -> anyhow::Result<ServingBlockdExpectation> {
-        let retained = AuthorizedBlockdStore::new(self.state_directory.clone())
-            .retain_prepare_device_handoff(checkpoint, desired)?;
-        let ready = ServingHandoffStore::new(self.state_directory.clone())
-            .reopen_prepare_device_handoff(checkpoint, desired, authority, retained)?;
-        ServingBlockdExpectation::from_handoff(
-            &ready,
+        ServingBlockdExpectation::from_inventory(
+            &self.state_directory,
             &self.root_provision_systemd,
             checkpoint,
             desired,
+            prepared,
+            blockd,
             authority,
         )
     }
@@ -3310,7 +3347,7 @@ impl RootProcessInventoryBridge for PlatformRootProcessInventoryBridge {
     fn inspect_all(
         &self,
         root_expected: BTreeMap<Id, RootProvisionProcessExpectation>,
-        serving_expected: BTreeMap<Id, ServingBlockdExpectation>,
+        serving_expected: BTreeMap<ManagedServingKey, ServingBlockdExpectation>,
         vmm_expected: BTreeMap<Id, VmmProcessExpectation>,
         stop_receipt_sockets: BTreeMap<Id, StopReceiptSocketAdmission>,
         context: &RuntimeInventoryScanContext,
@@ -3456,13 +3493,13 @@ impl RootProcessInventoryBridge for PlatformRootProcessInventoryBridge {
             }
         }
         let mut serving_proofs = BTreeMap::new();
-        for (cat_id, inspection) in serving_second {
+        for (key, inspection) in serving_second {
             if let ServingBlockdProcessInspection::Exact(evidence) = inspection {
                 let expectation = serving_expected
-                    .get(&cat_id)
+                    .get(&key)
                     .expect("inspection keys originate from expectations")
                     .clone();
-                serving_proofs.insert(cat_id, expectation.prove_exact_process(*evidence)?);
+                serving_proofs.insert(key, expectation.prove_exact_process(*evidence)?);
             }
         }
         let mut vmm_proofs = BTreeMap::new();
@@ -3532,7 +3569,9 @@ impl ServingBlockdProcessGlobalPort for PlatformRootProcessInventoryBridge {
         context: &crate::runtime_spine::RuntimeDesiredEffectContext,
     ) -> anyhow::Result<ServingBlockdProcessInspection> {
         let admission = context.node_global_process()?;
-        let Some((admitted_target, _)) = admission.serving_blockd(expected.cat_id()) else {
+        let Some((admitted_target, _)) =
+            admission.serving_blockd(expected.cat_id(), expected.volume_id())
+        else {
             return Ok(ServingBlockdProcessInspection::Conflict(
                 ServingBlockdProcessConflict::IdentityMismatch,
             ));
@@ -3544,7 +3583,10 @@ impl ServingBlockdProcessGlobalPort for PlatformRootProcessInventoryBridge {
         }
         match self.inspect_admitted_managed_processes(admission, context)? {
             AdmittedManagedProcessInspection::Exact { serving, .. } => Ok(serving
-                .get(expected.cat_id())
+                .get(&ManagedServingKey::new(
+                    expected.cat_id().clone(),
+                    expected.volume_id().clone(),
+                ))
                 .expect("target serving expectation was retained in the closed set")
                 .clone()),
             AdmittedManagedProcessInspection::Unavailable => {
@@ -3733,20 +3775,24 @@ fn inspect_root_process_set(
 
 fn inspect_serving_process_set(
     port: &dyn ServingBlockdProcessPort,
-    expected: &BTreeMap<Id, ServingBlockdExpectation>,
+    expected: &BTreeMap<ManagedServingKey, ServingBlockdExpectation>,
     context: &dyn RuntimePhysicalReadContext,
-) -> anyhow::Result<Option<BTreeMap<Id, ServingBlockdProcessInspection>>> {
+) -> anyhow::Result<Option<BTreeMap<ManagedServingKey, ServingBlockdProcessInspection>>> {
     let mut inspected = BTreeMap::new();
-    for (cat_id, expectation) in expected {
+    for (key, expectation) in expected {
         let inspection = port.inspect(expectation, context)?;
         match inspection {
             ServingBlockdProcessInspection::Absent | ServingBlockdProcessInspection::Exact(_) => {}
             ServingBlockdProcessInspection::Unavailable => return Ok(None),
             ServingBlockdProcessInspection::Conflict(_) => {
-                bail!("serving blockd process conflict for {cat_id}")
+                bail!(
+                    "serving blockd process conflict for Cat {} Volume {}",
+                    key.cat_id(),
+                    key.volume_id()
+                )
             }
         }
-        inspected.insert(cat_id.clone(), inspection);
+        inspected.insert(key.clone(), inspection);
     }
     Ok(Some(inspected))
 }
@@ -4127,20 +4173,21 @@ impl InventoryAbsenceProbe for MetadataStoreProbe {
             ) {
                 Ok(data) => {
                     candidate_volume_ids.extend(data.candidate_volume_ids);
-                    for (cat_id, evidence) in &data.evidence {
-                        let carries_superseded_receipt = evidence
-                            .checkpoint
-                            .attachment
-                            .acquire_request
-                            .desired_revision
-                            < evidence.checkpoint.desired.desired_revision;
-                        if evidence.binding != DesiredCheckpointBinding::Superseded
-                            && !carries_superseded_receipt
-                        {
-                            continue;
-                        }
-                        let volume = &evidence.checkpoint.volume;
-                        insert_stale_volume_projection(
+                    for (cat_id, by_volume) in &data.evidence {
+                        for evidence in by_volume.values() {
+                            let carries_superseded_receipt = evidence
+                                .checkpoint
+                                .attachment
+                                .acquire_request
+                                .desired_revision
+                                < evidence.checkpoint.desired.desired_revision;
+                            if evidence.binding != DesiredCheckpointBinding::Superseded
+                                && !carries_superseded_receipt
+                            {
+                                continue;
+                            }
+                            let volume = &evidence.checkpoint.volume;
+                            insert_stale_volume_projection(
                             &mut stale_volumes,
                             StaleVolumeProjection {
                                 cat_id: cat_id.clone(),
@@ -4149,7 +4196,10 @@ impl InventoryAbsenceProbe for MetadataStoreProbe {
                                     volume_intent_id: Some(volume.volume_intent_id.clone()),
                                     disk_id: Some(volume.disk_id.clone()),
                                     volume_id: volume.volume_id.clone(),
-                                    disk_kind: cats_api::runtime_reconciliation::ObservedDiskKind::Root,
+                                    disk_kind: match volume.disk_kind {
+                                        cats_api::runtime_reconciliation::DiskKind::Root => cats_api::runtime_reconciliation::ObservedDiskKind::Root,
+                                        cats_api::runtime_reconciliation::DiskKind::Persistent => cats_api::runtime_reconciliation::ObservedDiskKind::Persistent,
+                                    },
                                     size_bytes: Some(volume.size_bytes),
                                     durability: Some(volume.durability),
                                     authority: VolumeAuthorityEvidence::Unavailable,
@@ -4169,6 +4219,7 @@ impl InventoryAbsenceProbe for MetadataStoreProbe {
                                 ),
                             },
                         )?;
+                        }
                     }
                     local_candidates_complete &= data.complete;
                 }
@@ -6029,7 +6080,7 @@ fn errno() -> libc::c_int {
 #[cfg(test)]
 mod tests {
     use std::collections::VecDeque;
-    use std::os::unix::fs::PermissionsExt as _;
+    use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Mutex;
     use std::time::{Duration, Instant};
@@ -6039,10 +6090,11 @@ mod tests {
         AcquireOrigin, AdmissionInventoryAttestation, AgentSession, AsciiText, AssignedKind,
         AssignedPlacement, CheckpointEvidence, CleanupRelease, CleanupTarget, ContractVersion,
         DesiredRuntimeSpec, DirectAuthorizedAttachmentIdentity, DirectAuthorizedAttachmentPurpose,
-        DiskKind, Durability, Epoch, FenceEpoch, Generation, GuestDeviceIdentity, HostPath, Id,
-        Ipv4Address, IsolatedIpv4Kind, LifecycleAdmission, MacAddress, NetworkConfig, NodeBootId,
-        NodeObservation, NormalAcquireRequest, PrepareDeviceFrontend, RandomId128, ReconcileStep,
-        RemoteHead, Revision, RuntimeConfig, RuntimeNetworkIdentity, RuntimeTarget,
+        DiskKind, Durability, Epoch, Ext4MountIntent, FenceEpoch, FilesystemInitialization,
+        Generation, GuestDeviceIdentity, HostPath, Id, Ipv4Address, IsolatedIpv4Kind,
+        LifecycleAdmission, MacAddress, NetworkConfig, NodeBootId, NodeObservation,
+        NormalAcquireRequest, PrepareDeviceFrontend, PreparedDeviceInput, RandomId128,
+        ReconcileStep, RemoteHead, Revision, RuntimeConfig, RuntimeNetworkIdentity, RuntimeTarget,
         RuntimeTransition, RuntimeVolumeTransition, RuntimeVolumeTransitionPreconditionProblem,
         RuntimeVolumeTransitionRequest, ServingAuthorityProvenance, ServingBlockdIdentity,
         SessionBinding, Sha256Digest, UnixMillis, VolumeAccess, VolumeAcquire,
@@ -6749,6 +6801,37 @@ mod tests {
         context
     }
 
+    fn assigned_context_with_root_and_persistent() -> RuntimeInventoryScanContext {
+        let mut context = assigned_context(true);
+        let desired = &mut context.coordinates_mut().desired.desired_specs[0];
+        desired.volumes.push(VolumeIntent {
+            volume_intent_id: Id::new("vint_z_persistent").unwrap(),
+            disk_id: Id::new("disk_persistent").unwrap(),
+            volume_id: Id::new("vol_persistent").unwrap(),
+            attachment_id: Id::new("att_persistent").unwrap(),
+            size_bytes: 8_589_934_592,
+            disk_kind: DiskKind::Persistent,
+            access: VolumeAccess::ReadWriteOnce,
+            durability: Durability::Strict,
+            guest_device: GuestDeviceIdentity {
+                serial: Id::new("cats-persistent").unwrap(),
+                slot: 1,
+            },
+            acquire: VolumeAcquire::Normal {
+                transition_id: RandomId128::new("22222222222222222222222222222222").unwrap(),
+                expected_unowned_epoch: FenceEpoch::new(0).unwrap(),
+            },
+            disposition: VolumeDisposition::Retain,
+            mount: Some(Ext4MountIntent {
+                filesystem_uuid: RandomId128::new("eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee").unwrap(),
+                mount_path: HostPath::new("/data").unwrap(),
+                initialization: FilesystemInitialization::Existing,
+            }),
+        });
+        desired.spec_digest = spec_digest(desired).unwrap();
+        context
+    }
+
     fn unowned_record(volume_id: &str, size_bytes: u64) -> VolumeRecord {
         VolumeRecord {
             volume_id: Id::new(volume_id).unwrap(),
@@ -6770,7 +6853,14 @@ mod tests {
     fn exact_owned_record_and_attachment(
         desired: &DesiredRuntimeSpec,
     ) -> (VolumeRecord, AuthorizedServingAttachment) {
-        let volume = &desired.volumes[0];
+        exact_owned_record_and_attachment_for(desired, 0)
+    }
+
+    fn exact_owned_record_and_attachment_for(
+        desired: &DesiredRuntimeSpec,
+        index: usize,
+    ) -> (VolumeRecord, AuthorizedServingAttachment) {
+        let volume = &desired.volumes[index];
         let VolumeAcquire::Normal {
             transition_id,
             expected_unowned_epoch,
@@ -6819,11 +6909,103 @@ mod tests {
         desired: &DesiredRuntimeSpec,
         attachment: &AuthorizedServingAttachment,
     ) -> PathBuf {
+        prepare_exact_lineage_for(environment, desired, 0, attachment)
+    }
+
+    fn prepare_exact_lineage_for(
+        environment: &TestEnvironment,
+        desired: &DesiredRuntimeSpec,
+        index: usize,
+        attachment: &AuthorizedServingAttachment,
+    ) -> PathBuf {
         let prepared =
             AuthorizedBlockdStore::new(StateDirectory::unanchored(environment.state.clone()))
-                .prepare(desired, &desired.volumes[0], attachment)
+                .prepare(desired, &desired.volumes[index], attachment)
                 .unwrap();
         prepared.data_directory().to_path_buf()
+    }
+
+    fn direct_vhost_prepared_device(
+        environment: &TestEnvironment,
+        desired: &DesiredRuntimeSpec,
+        index: usize,
+        attachment: &AuthorizedServingAttachment,
+        data_directory: &Path,
+    ) -> PreparedDeviceInput {
+        let volume = &desired.volumes[index];
+        let authorization_path = data_directory.join(AUTHORIZED_SERVING_FILE);
+        let authorization_bytes = std::fs::read(&authorization_path).unwrap();
+        let authorization_metadata = std::fs::metadata(&authorization_path).unwrap();
+        let suffix = if index == 0 { "root" } else { "persistent" };
+        PreparedDeviceInput {
+            volume_intent_id: volume.volume_intent_id.clone(),
+            disk_id: volume.disk_id.clone(),
+            volume_id: volume.volume_id.clone(),
+            disk_kind: volume.disk_kind,
+            attachment_id: attachment.identity.attachment_id.clone(),
+            attachment_epoch: attachment.identity.attachment_epoch,
+            acquire_origin: attachment.identity.acquire_origin.clone(),
+            expected_head: attachment.head.clone(),
+            size_bytes: attachment.size_bytes,
+            durability: attachment.durability,
+            guest_device: volume.guest_device.clone(),
+            ownership_token: RandomId128::new(if index == 0 {
+                "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa1"
+            } else {
+                "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa2"
+            })
+            .unwrap(),
+            serving_authority: Box::new(ServingAuthorityProvenance::DirectAuthorizedAttachment {
+                authorization: DirectAuthorizedAttachmentIdentity {
+                    path: HostPath::new(authorization_path.to_string_lossy().into_owned()).unwrap(),
+                    device: WireU64::new(authorization_metadata.dev()).unwrap(),
+                    inode: WireU64::new(authorization_metadata.ino()).unwrap(),
+                    length: WireU64::new(authorization_metadata.len()).unwrap(),
+                    content_sha256: Sha256Digest::from_bytes(
+                        Sha256::digest(authorization_bytes).into(),
+                    ),
+                },
+                purpose: match volume.disk_kind {
+                    DiskKind::Root => DirectAuthorizedAttachmentPurpose::ExistingRoot,
+                    DiskKind::Persistent => {
+                        DirectAuthorizedAttachmentPurpose::PersistentInitialized
+                    }
+                },
+            }),
+            serving_process: ServingBlockdIdentity {
+                scope_id: Id::new(format!("cats-blockd-{suffix}.service")).unwrap(),
+                control_socket_path: HostPath::new(
+                    data_directory
+                        .join("serving-control.sock")
+                        .to_string_lossy()
+                        .into_owned(),
+                )
+                .unwrap(),
+                data_directory: HostPath::new(data_directory.to_string_lossy().into_owned())
+                    .unwrap(),
+                executable_path: HostPath::new(
+                    environment.blockd_binary.to_string_lossy().into_owned(),
+                )
+                .unwrap(),
+                process_identity_token: RandomId128::new(if index == 0 {
+                    "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb1"
+                } else {
+                    "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb2"
+                })
+                .unwrap(),
+            },
+            frontend: PrepareDeviceFrontend::VhostUserBlk {
+                socket_path: HostPath::new(
+                    data_directory
+                        .join("serving-vhost.sock")
+                        .to_string_lossy()
+                        .into_owned(),
+                )
+                .unwrap(),
+                queues: 1,
+                queue_size: 256,
+            },
+        }
     }
 
     struct FakeRootProcessPort {
@@ -7245,17 +7427,20 @@ mod tests {
         let mut serving_expected = BTreeMap::new();
         let mut serving_exact = BTreeMap::new();
         for (expectation, process_id) in serving_entries {
-            let cat_id = expectation.cat_id().clone();
+            let key = ManagedServingKey::new(
+                expectation.cat_id().clone(),
+                expectation.volume_id().clone(),
+            );
             if let Some(process_id) = process_id {
                 serving_exact.insert(
-                    cat_id.clone(),
+                    key.clone(),
                     expectation
                         .clone()
                         .prove_exact_process(expectation.exact_evidence_for_test(process_id))
                         .unwrap(),
                 );
             }
-            serving_expected.insert(cat_id, expectation);
+            serving_expected.insert(key, expectation);
         }
         let admission = super::super::root_provision_process::NodeGlobalManagedProcessScanAdmission::from_root_controls(
             root_expected,
@@ -7430,10 +7615,207 @@ mod tests {
                 .unwrap(),
             InventoryAbsence::AuthorizedBlockd(evidence)
                 if matches!(
-                    evidence.get(&desired.cat_id).map(|item| &item.control_state),
+                    evidence
+                        .get(&desired.cat_id)
+                        .and_then(|items| items.get(&desired.volumes[0].volume_id))
+                        .map(|item| &item.control_state),
                     Some(AuthorizedBlockdControlState::ExactControlOnlyEmpty)
                 )
         ));
+    }
+
+    #[test]
+    fn authorized_data_probe_enumerates_root_and_persistent_lineages_in_volume_order() {
+        let environment = TestEnvironment::new();
+        let scan_context = assigned_context_with_root_and_persistent();
+        let desired = &scan_context.coordinates().desired.desired_specs[0];
+        let (_, root_attachment) = exact_owned_record_and_attachment_for(desired, 0);
+        let (_, persistent_attachment) = exact_owned_record_and_attachment_for(desired, 1);
+        prepare_exact_lineage_for(&environment, desired, 0, &root_attachment);
+        prepare_exact_lineage_for(&environment, desired, 1, &persistent_attachment);
+
+        let InventoryAbsence::AuthorizedBlockd(evidence) = authorized_data_probe(&environment)
+            .prove_absent(&scan_context)
+            .unwrap()
+        else {
+            panic!("two exact lineages must form one complete data inventory")
+        };
+        let by_volume = &evidence[&desired.cat_id];
+        assert_eq!(by_volume.len(), 2);
+        assert_eq!(
+            by_volume.keys().cloned().collect::<Vec<_>>(),
+            [
+                desired.volumes[1].volume_id.clone(),
+                desired.volumes[0].volume_id.clone(),
+            ]
+        );
+        assert_eq!(
+            by_volume[&desired.volumes[0].volume_id]
+                .checkpoint
+                .volume
+                .disk_kind,
+            DiskKind::Root
+        );
+        assert_eq!(
+            by_volume[&desired.volumes[1].volume_id]
+                .checkpoint
+                .volume
+                .disk_kind,
+            DiskKind::Persistent
+        );
+    }
+
+    #[test]
+    fn serving_expectations_require_exact_root_and_persistent_direct_vhost_set() {
+        let environment = TestEnvironment::new();
+        let scan_context = assigned_context_with_root_and_persistent();
+        let desired = &scan_context.coordinates().desired.desired_specs[0];
+        let (root_record, root_attachment) = exact_owned_record_and_attachment_for(desired, 0);
+        let (persistent_record, persistent_attachment) =
+            exact_owned_record_and_attachment_for(desired, 1);
+        let root_data = prepare_exact_lineage_for(&environment, desired, 0, &root_attachment);
+        let persistent_data =
+            prepare_exact_lineage_for(&environment, desired, 1, &persistent_attachment);
+        let root_device =
+            direct_vhost_prepared_device(&environment, desired, 0, &root_attachment, &root_data);
+        let persistent_device = direct_vhost_prepared_device(
+            &environment,
+            desired,
+            1,
+            &persistent_attachment,
+            &persistent_data,
+        );
+        let mut checkpoint = acquire_checkpoint(
+            desired,
+            &desired.volumes[0],
+            RuntimeVolumeTransition::Acquire {
+                request: VolumeAcquireRequest::Normal {
+                    volume_id: root_attachment.acquire_request.volume_id.clone(),
+                    transition_id: root_attachment.acquire_request.transition_id.clone(),
+                    attachment_id: root_attachment.acquire_request.attachment_id.clone(),
+                    expected_unowned_epoch: root_attachment.acquire_request.expected_unowned_epoch,
+                    desired_revision: root_attachment.acquire_request.desired_revision,
+                    placement_epoch: root_attachment.acquire_request.placement_epoch,
+                    lease_duration_ms: root_attachment.acquire_request.lease_duration_ms,
+                },
+            },
+            UnixMillis::new(9_000).unwrap(),
+        );
+        checkpoint.step = ReconcileStep::PrepareNetwork {
+            network: RuntimeNetworkIdentity {
+                network_config: desired.runtime.network_config.clone(),
+                tap_name: Id::new("tap_multi").unwrap(),
+                ownership_token: RandomId128::new("cccccccccccccccccccccccccccccccc").unwrap(),
+            },
+            devices: vec![root_device.clone(), persistent_device.clone()],
+        };
+        checkpoint.volumes = vec![
+            prepared_owned_observed_volume(
+                &desired.volumes[0],
+                &root_attachment,
+                root_device.serving_process.data_directory.clone(),
+            ),
+            prepared_owned_observed_volume(
+                &desired.volumes[1],
+                &persistent_attachment,
+                persistent_device.serving_process.data_directory.clone(),
+            ),
+        ];
+        let InventoryAbsence::AuthorizedBlockd(blockds) = authorized_data_probe(&environment)
+            .prove_absent(&scan_context)
+            .unwrap()
+        else {
+            panic!("direct vhost fixtures must produce exact authorized inventory")
+        };
+        let checkpoints = BTreeMap::from([(
+            desired.cat_id.clone(),
+            RuntimeCheckpointInventoryEvidence {
+                checkpoint: checkpoint.clone(),
+                binding: DesiredCheckpointBinding::Current,
+                definite_release_rejected: false,
+            },
+        )]);
+        let volumes = BTreeMap::from([(
+            desired.cat_id.clone(),
+            vec![
+                AuthorityVolumeInventoryEvidence {
+                    observed: checkpoint.volumes[0].clone(),
+                    record: root_record,
+                },
+                AuthorityVolumeInventoryEvidence {
+                    observed: checkpoint.volumes[1].clone(),
+                    record: persistent_record,
+                },
+            ],
+        )]);
+        let bridge = root_process_bridge_with_all_ports(
+            &environment,
+            Arc::new(FakeRootProcessPort {
+                inspections: Mutex::new(VecDeque::new()),
+            }),
+            Arc::new(FakeServingProcessPort {
+                process_ids: Mutex::new(VecDeque::new()),
+            }),
+            Arc::new(FakeVmmProcessPort {
+                process_ids: Mutex::new(VecDeque::new()),
+            }),
+        );
+        let expected =
+            serving_process_expectations(&scan_context, &bridge, &checkpoints, &blockds, &volumes)
+                .unwrap();
+        assert_eq!(expected.len(), 2);
+        assert!(expected.contains_key(&ManagedServingKey::new(
+            desired.cat_id.clone(),
+            root_device.volume_id.clone(),
+        )));
+        assert!(expected.contains_key(&ManagedServingKey::new(
+            desired.cat_id.clone(),
+            persistent_device.volume_id.clone(),
+        )));
+
+        let mut missing = blockds.clone();
+        missing
+            .get_mut(&desired.cat_id)
+            .unwrap()
+            .remove(&persistent_device.volume_id);
+        assert!(serving_process_expectations(
+            &scan_context,
+            &bridge,
+            &checkpoints,
+            &missing,
+            &volumes,
+        )
+        .is_err());
+
+        let mut extra = blockds.clone();
+        let extra_evidence = extra[&desired.cat_id][&persistent_device.volume_id].clone();
+        extra
+            .get_mut(&desired.cat_id)
+            .unwrap()
+            .insert(Id::new("vol_extra").unwrap(), extra_evidence);
+        assert!(serving_process_expectations(
+            &scan_context,
+            &bridge,
+            &checkpoints,
+            &extra,
+            &volumes,
+        )
+        .is_err());
+
+        let mut duplicate_checkpoint = checkpoints.clone();
+        let entry = duplicate_checkpoint.get_mut(&desired.cat_id).unwrap();
+        let ReconcileStep::PrepareNetwork { devices, .. } = &mut entry.checkpoint.step else {
+            unreachable!()
+        };
+        devices[1] = devices[0].clone();
+        assert!(serving_process_expectations(
+            &scan_context,
+            &bridge,
+            &duplicate_checkpoint,
+            &blockds,
+            &volumes,
+        )
+        .is_err());
     }
 
     #[test]
@@ -7726,7 +8108,12 @@ mod tests {
                 panic!("exact writer recovery must close partial window {window:?}")
             };
             assert_eq!(evidence.len(), 1);
-            assert_eq!(evidence[&desired.cat_id].checkpoint.attachment, attachment);
+            assert_eq!(
+                evidence[&desired.cat_id][&desired.volumes[0].volume_id]
+                    .checkpoint
+                    .attachment,
+                attachment
+            );
         }
     }
 
@@ -10156,7 +10543,10 @@ mod tests {
         assert!(old_only_admission.serving_blockd_proofs().is_empty());
         assert!(old_only_admission
             .into_admission_for_test()
-            .serving_blockd(&fixture.acquired.desired.cat_id)
+            .serving_blockd(
+                &fixture.acquired.desired.cat_id,
+                &fixture.acquired.desired.volumes[0].volume_id,
+            )
             .is_some());
 
         let retained =
@@ -10246,7 +10636,10 @@ mod tests {
             .contains_key(&fixture.acquired.desired.cat_id));
         assert!(admission
             .serving_blockd_proofs()
-            .contains_key(&fixture.acquired.desired.cat_id));
+            .contains_key(&ManagedServingKey::new(
+                fixture.acquired.desired.cat_id.clone(),
+                fixture.acquired.desired.volumes[0].volume_id.clone(),
+            )));
 
         // A Root-control effect must revalidate the same complete admitted
         // role set. The exact serving process is legitimate residue even when
@@ -10964,6 +11357,9 @@ mod tests {
                 if matches!(
                     evidence
                         .get(&fixture.expected.cat_id)
+                        .and_then(|items| {
+                            items.get(&fixture.acquired.desired.volumes[0].volume_id)
+                        })
                         .map(|item| &item.control_state),
                     Some(AuthorizedBlockdControlState::NotStarted)
                 )

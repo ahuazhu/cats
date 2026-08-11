@@ -167,7 +167,10 @@ impl PrepareDeviceTargetRetirementEffect {
             Err(_) => return Ok(Some(stop_local())),
         };
         let admission = context.node_global_process()?;
-        let Some((_, admitted_serving)) = admission.serving_blockd(&desired.cat_id) else {
+        let Some((_, admitted_serving)) = admission.serving_blockd(
+            &desired.cat_id,
+            &ready.attempt().attachment.identity.volume_id,
+        ) else {
             return Ok(Some(stop_local()));
         };
         enum AcceptedProcess<'a> {
@@ -344,6 +347,21 @@ pub(super) fn prepared_device_input_from_step(
     })
 }
 
+pub(super) fn prepared_device_inputs_from_step(
+    step: &ReconcileStep,
+) -> anyhow::Result<Vec<PreparedDeviceInput>> {
+    if let ReconcileStep::PrepareNetwork { devices, .. }
+    | ReconcileStep::StartRuntime { devices, .. } = step
+    {
+        anyhow::ensure!(
+            !devices.is_empty(),
+            "prepared-device phase must retain at least one device"
+        );
+        return Ok(devices.clone());
+    }
+    Ok(vec![prepared_device_input_from_step(step)?])
+}
+
 /// Close the public and durable projections of one prepared device against
 /// the exact Desired volume. Later launch phases copy this object verbatim, so
 /// a pair of internally-consistent but foreign IDs must fail at every scanner
@@ -353,7 +371,11 @@ pub(super) fn prepared_device_input_is_exact(
     desired: &DesiredRuntimeSpec,
     observed: &ObservedVolume,
 ) -> bool {
-    let [intent] = desired.volumes.as_slice() else {
+    let Some(intent) = desired
+        .volumes
+        .iter()
+        .find(|intent| intent.volume_id == device.volume_id)
+    else {
         return false;
     };
     let [lineage] = observed.local_lineages.as_slice() else {

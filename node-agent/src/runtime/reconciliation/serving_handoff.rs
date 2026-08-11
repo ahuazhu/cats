@@ -4553,6 +4553,10 @@ mod tests {
                 .iter()
                 .any(|process| process == &serving_public)
                 .then_some(serving_proof);
+            let serving_key = super::super::root_provision_process::ManagedServingKey::new(
+                desired.cat_id.clone(),
+                serving_expectation.volume_id().clone(),
+            );
             if let Some((_, device)) = serving_exact
                 .as_ref()
                 .and_then(|proof| proof.vhost_device_projection())
@@ -4568,9 +4572,9 @@ mod tests {
                 )
                 .unwrap()
                 .with_serving_blockds(
-                    BTreeMap::from([(desired.cat_id.clone(), serving_expectation)]),
+                    BTreeMap::from([(serving_key.clone(), serving_expectation)]),
                     serving_exact
-                        .map(|proof| BTreeMap::from([(desired.cat_id.clone(), proof)]))
+                        .map(|proof| BTreeMap::from([(serving_key, proof)]))
                         .unwrap_or_default(),
                 )
                 .unwrap();
@@ -7867,17 +7871,18 @@ mod tests {
             .clone()
             .prove_exact_process(serving_expectation.exact_evidence_for_test(51))
             .unwrap();
+        let serving_key = super::super::root_provision_process::ManagedServingKey::new(
+            fixture.acquired.desired.cat_id.clone(),
+            serving_expectation.volume_id().clone(),
+        );
         let admission = super::super::root_provision_process::NodeGlobalManagedProcessScanAdmission::from_root_controls(
             BTreeMap::from([(fixture.acquired.desired.cat_id.clone(), root_expectation)]),
             BTreeMap::from([(fixture.acquired.desired.cat_id.clone(), root)]),
         )
         .unwrap()
         .with_serving_blockds(
-            BTreeMap::from([(
-                fixture.acquired.desired.cat_id.clone(),
-                serving_expectation,
-            )]),
-            BTreeMap::from([(fixture.acquired.desired.cat_id.clone(), serving)]),
+            BTreeMap::from([(serving_key.clone(), serving_expectation)]),
+            BTreeMap::from([(serving_key, serving)]),
         )
         .unwrap();
         assert_eq!(
@@ -7891,6 +7896,116 @@ mod tests {
         assert!(admission
             .vhost_device_projections()
             .contains_key(&fixture.acquired.desired.cat_id));
+    }
+
+    #[test]
+    fn node_global_admission_closes_root_and_persistent_vhost_as_an_exact_set() {
+        let mut fixture = fixture();
+        complete_old_process_retirement(&mut fixture);
+        let root = serving_expectation(&fixture);
+        let persistent = root.persistent_vhost_peer_for_test(true);
+        let root_key = super::super::root_provision_process::ManagedServingKey::new(
+            root.cat_id().clone(),
+            root.volume_id().clone(),
+        );
+        let persistent_key = super::super::root_provision_process::ManagedServingKey::new(
+            persistent.cat_id().clone(),
+            persistent.volume_id().clone(),
+        );
+        let root_proof = root
+            .clone()
+            .prove_exact_process(root.exact_evidence_for_test(51))
+            .unwrap();
+        let persistent_proof = persistent
+            .clone()
+            .prove_exact_process(persistent.exact_evidence_for_test(52))
+            .unwrap();
+        let admission = super::super::root_provision_process::NodeGlobalManagedProcessScanAdmission::from_root_controls(
+            BTreeMap::new(),
+            BTreeMap::new(),
+        )
+        .unwrap()
+        .with_serving_blockds(
+            BTreeMap::from([
+                (root_key.clone(), root.clone()),
+                (persistent_key.clone(), persistent.clone()),
+            ]),
+            BTreeMap::from([
+                (root_key.clone(), root_proof.clone()),
+                (persistent_key.clone(), persistent_proof.clone()),
+            ]),
+        )
+        .unwrap();
+        assert_eq!(admission.serving_blockd_count(root.cat_id()), 2);
+        assert!(admission
+            .serving_blockd(root.cat_id(), root.volume_id())
+            .is_some_and(|(_, proof)| proof.is_some()));
+        assert!(admission
+            .serving_blockd(persistent.cat_id(), persistent.volume_id())
+            .is_some_and(|(_, proof)| proof.is_some()));
+        assert_eq!(admission.vhost_device_projections()[root.cat_id()].len(), 2);
+        assert_eq!(admission.process_projections()[root.cat_id()].len(), 2);
+
+        let missing = super::super::root_provision_process::NodeGlobalManagedProcessScanAdmission::from_root_controls(
+            BTreeMap::new(),
+            BTreeMap::new(),
+        )
+        .unwrap()
+        .with_serving_blockds(
+            BTreeMap::from([
+                (root_key.clone(), root.clone()),
+                (persistent_key.clone(), persistent.clone()),
+            ]),
+            BTreeMap::from([(root_key.clone(), root_proof.clone())]),
+        )
+        .unwrap();
+        assert!(missing
+            .serving_blockd(persistent.cat_id(), persistent.volume_id())
+            .is_some_and(|(_, proof)| proof.is_none()));
+        assert_eq!(missing.vhost_device_projections()[root.cat_id()].len(), 1);
+
+        assert!(super::super::root_provision_process::NodeGlobalManagedProcessScanAdmission::from_root_controls(
+            BTreeMap::new(),
+            BTreeMap::new(),
+        )
+        .unwrap()
+        .with_serving_blockds(
+            BTreeMap::from([(root_key.clone(), root.clone())]),
+            BTreeMap::from([
+                (root_key.clone(), root_proof),
+                (persistent_key.clone(), persistent_proof),
+            ]),
+        )
+        .is_err());
+
+        let duplicate = root.persistent_vhost_peer_for_test(false);
+        let duplicate_key = super::super::root_provision_process::ManagedServingKey::new(
+            duplicate.cat_id().clone(),
+            duplicate.volume_id().clone(),
+        );
+        let duplicate_proof = duplicate
+            .clone()
+            .prove_exact_process(duplicate.exact_evidence_for_test(52))
+            .unwrap();
+        assert!(super::super::root_provision_process::NodeGlobalManagedProcessScanAdmission::from_root_controls(
+            BTreeMap::new(),
+            BTreeMap::new(),
+        )
+        .unwrap()
+        .with_serving_blockds(
+            BTreeMap::from([(root_key.clone(), root), (duplicate_key.clone(), duplicate)]),
+            BTreeMap::from([
+                (
+                    root_key,
+                    serving_expectation(&fixture)
+                        .clone()
+                        .prove_exact_process(serving_expectation(&fixture).exact_evidence_for_test(51))
+                        .unwrap(),
+                ),
+                (duplicate_key, duplicate_proof),
+            ]),
+        )
+        .is_err());
     }
 
     #[test]

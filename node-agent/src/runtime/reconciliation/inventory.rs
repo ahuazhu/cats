@@ -39,14 +39,15 @@ use crate::runtime_spine::{
 use super::{
     kernel_nbd::{KernelNbdInventoryPort, KernelNbdPoolScanOutcome},
     network::{
-        prepare_device_checkpoint_view, prepared_device_input, NodeGlobalNetworkScanAdmission,
+        prepare_device_checkpoint_view, prepared_device_inputs, NodeGlobalNetworkScanAdmission,
     },
     prepare_device_retirement::prepared_device_input_is_exact,
     retained_runtime_launch::RetainedRuntimeLaunchAuthority,
     root_provision_process::{
-        NodeGlobalManagedProcessScanAdmission, RetainedRootProvisionProcessAttempt,
-        RootProvisionAuthoritySnapshot, RootProvisionProcessExpectation,
-        StopReceiptSocketAdmission, TargetControlProcessLaunchIdentity,
+        ManagedServingKey, NodeGlobalManagedProcessScanAdmission,
+        RetainedRootProvisionProcessAttempt, RootProvisionAuthoritySnapshot,
+        RootProvisionProcessExpectation, StopReceiptSocketAdmission,
+        TargetControlProcessLaunchIdentity,
     },
     runtime_checkpoint_path,
     signed_running::{
@@ -74,7 +75,7 @@ const REQUIRED_SOURCES: [InventorySource; 11] = [
 pub enum InventoryAbsence {
     Empty,
     RuntimeCheckpoints(BTreeMap<Id, RuntimeCheckpointInventoryEvidence>),
-    AuthorizedBlockd(BTreeMap<Id, AuthorizedBlockdInventoryEvidence>),
+    AuthorizedBlockd(BTreeMap<Id, BTreeMap<Id, AuthorizedBlockdInventoryEvidence>>),
     /// The metadata source contains exactly the Desired-bound volume facts
     /// supplied here and no discovered local-only candidate. These are not
     /// physical residue: a newly assigned Cat must be able to report its
@@ -182,13 +183,18 @@ pub(crate) trait RootProcessInventoryBridge:
         &self,
         checkpoint: &RuntimeCheckpoint,
         desired: &DesiredRuntimeSpec,
+        prepared: &cats_api::runtime_reconciliation::PreparedDeviceInput,
+        blockd: &AuthorizedBlockdInventoryEvidence,
         authority: &VolumeRecord,
     ) -> anyhow::Result<super::serving_blockd_process::ServingBlockdExpectation>;
 
     fn inspect_all(
         &self,
         root_expected: BTreeMap<Id, RootProvisionProcessExpectation>,
-        serving_expected: BTreeMap<Id, super::serving_blockd_process::ServingBlockdExpectation>,
+        serving_expected: BTreeMap<
+            ManagedServingKey,
+            super::serving_blockd_process::ServingBlockdExpectation,
+        >,
         vmm_expected: BTreeMap<Id, super::vmm_process::VmmProcessExpectation>,
         stop_receipt_sockets: BTreeMap<Id, StopReceiptSocketAdmission>,
         context: &RuntimeInventoryScanContext,
@@ -373,7 +379,7 @@ struct InventoryProbeAggregation {
     unavailable_sources: Vec<InventorySource>,
     volumes_by_cat: BTreeMap<Id, Vec<AuthorityVolumeInventoryEvidence>>,
     checkpoints_by_cat: BTreeMap<Id, RuntimeCheckpointInventoryEvidence>,
-    blockd_by_cat: BTreeMap<Id, AuthorizedBlockdInventoryEvidence>,
+    blockd_by_cat: BTreeMap<Id, BTreeMap<Id, AuthorizedBlockdInventoryEvidence>>,
     coverage: InventoryCoverageAggregator,
 }
 
@@ -422,11 +428,19 @@ fn inspect_inventory_probe(
                 probe.source() == InventorySource::DataDirectory,
                 "only the data-directory source may report authorized blockd lineage"
             );
-            for (cat_id, blockd) in blockds {
-                anyhow::ensure!(
-                    aggregate.blockd_by_cat.insert(cat_id, blockd).is_none(),
-                    "data-directory inventory duplicated one Cat"
-                );
+            for (cat_id, by_volume) in blockds {
+                let target = aggregate.blockd_by_cat.entry(cat_id.clone()).or_default();
+                for (volume_id, blockd) in by_volume {
+                    anyhow::ensure!(
+                        blockd.checkpoint.desired.cat_id == cat_id
+                            && blockd.checkpoint.attachment.identity.volume_id == volume_id,
+                        "data-directory inventory is indexed by another Cat or Volume"
+                    );
+                    anyhow::ensure!(
+                        target.insert(volume_id, blockd).is_none(),
+                        "data-directory inventory duplicated one Cat/Volume"
+                    );
+                }
             }
         }
         InventoryAbsence::DesiredVolumes(observed) => {
@@ -504,16 +518,20 @@ impl RuntimeInventoryScanner for CleanSlateInventoryScanner {
                 &self.checkpoint_directory,
                 &aggregate.checkpoints_by_cat,
             )?;
-            let stop_receipt_sockets = aggregate
-                .blockd_by_cat
-                .iter()
-                .filter_map(|(cat_id, evidence)| {
-                    evidence
-                        .stop_receipt_socket
-                        .clone()
-                        .map(|socket| (cat_id.clone(), socket))
-                })
-                .collect();
+            let stop_receipt_sockets = aggregate.blockd_by_cat.iter().try_fold(
+                BTreeMap::new(),
+                |mut sockets, (cat_id, by_volume)| {
+                    for evidence in by_volume.values() {
+                        if let Some(socket) = evidence.stop_receipt_socket.clone() {
+                            anyhow::ensure!(
+                                sockets.insert(cat_id.clone(), socket).is_none(),
+                                "one Cat retains duplicate Root stop-receipt sockets"
+                            );
+                        }
+                    }
+                    Ok::<_, anyhow::Error>(sockets)
+                },
+            )?;
             context
                 .remaining()
                 .context("root-process inventory bridge deadline expired before inspection")?;
@@ -552,9 +570,14 @@ impl RuntimeInventoryScanner for CleanSlateInventoryScanner {
                                 .push(InventorySource::BlockFrontend);
                         }
                         for (cat_id, projection) in admission.device_projections() {
+                            let (volume_id, device) = projection;
                             anyhow::ensure!(
-                                serving_devices_by_cat.insert(cat_id, projection).is_none(),
-                                "managed frontend scan projects two devices for one V1 Cat"
+                                serving_devices_by_cat
+                                    .entry(cat_id)
+                                    .or_default()
+                                    .insert(volume_id, device)
+                                    .is_none(),
+                                "managed frontend scan projects two devices for one Volume"
                             );
                         }
                         kernel_nbd_pool_admission = Some(admission);
@@ -571,8 +594,12 @@ impl RuntimeInventoryScanner for CleanSlateInventoryScanner {
                     aggregate
                         .blockd_by_cat
                         .get(cat_id)
-                        .map(|blockd| &blockd.control_state),
-                    Some(AuthorizedBlockdControlState::ExactControlOnlyEmpty)
+                        .filter(|by_volume| !by_volume.is_empty())
+                        .map(|by_volume| by_volume.values().all(|blockd| {
+                            blockd.control_state
+                                == AuthorizedBlockdControlState::ExactControlOnlyEmpty
+                        })),
+                    Some(true)
                 )
             }) {
                 // A verified process is one half of a joint physical fact. If
@@ -672,10 +699,15 @@ impl RuntimeInventoryScanner for CleanSlateInventoryScanner {
                         .remove(&desired.cat_id)
                         .unwrap_or_default(),
                     aggregate.checkpoints_by_cat.remove(&desired.cat_id),
-                    aggregate.blockd_by_cat.remove(&desired.cat_id),
+                    aggregate
+                        .blockd_by_cat
+                        .remove(&desired.cat_id)
+                        .unwrap_or_default(),
                     RuntimeManagedProjection {
                         processes: processes_by_cat.remove(&desired.cat_id).unwrap_or_default(),
-                        serving_device: serving_devices_by_cat.remove(&desired.cat_id),
+                        serving_devices: serving_devices_by_cat
+                            .remove(&desired.cat_id)
+                            .unwrap_or_default(),
                         networks: networks_by_cat.remove(&desired.cat_id).unwrap_or_default(),
                     },
                 )
@@ -741,7 +773,7 @@ fn root_process_expectations(
     blob: Option<&dyn BlobStore>,
     executable_path: &HostPath,
     checkpoints_by_cat: &BTreeMap<Id, RuntimeCheckpointInventoryEvidence>,
-    blockd_by_cat: &BTreeMap<Id, AuthorizedBlockdInventoryEvidence>,
+    blockd_by_cat: &BTreeMap<Id, BTreeMap<Id, AuthorizedBlockdInventoryEvidence>>,
     volumes_by_cat: &BTreeMap<Id, Vec<AuthorityVolumeInventoryEvidence>>,
 ) -> anyhow::Result<BTreeMap<Id, RootProvisionProcessExpectation>> {
     let mut expected = BTreeMap::new();
@@ -766,9 +798,19 @@ fn root_process_expectations(
         if !needs_root_process_bridge {
             continue;
         }
-        let blockd = blockd_by_cat
+        let blockds = blockd_by_cat
             .get(&desired.cat_id)
             .context("current root-provision checkpoint lacks AuthorizedBlockd lineage")?;
+        let mut roots = blockds.values().filter(|blockd| {
+            blockd.checkpoint.volume.disk_kind == cats_api::runtime_reconciliation::DiskKind::Root
+        });
+        let blockd = roots
+            .next()
+            .context("current root-provision checkpoint lacks Root AuthorizedBlockd lineage")?;
+        anyhow::ensure!(
+            roots.next().is_none(),
+            "current root-provision checkpoint has duplicate Root AuthorizedBlockd lineage"
+        );
         anyhow::ensure!(
             blockd.binding == DesiredCheckpointBinding::Current,
             "current root-provision checkpoint has superseded AuthorizedBlockd lineage"
@@ -777,7 +819,7 @@ fn root_process_expectations(
             desired,
             &checkpoint.checkpoint,
             checkpoint.binding,
-            Some(blockd),
+            Some(blockds),
             checkpoint_directory,
             blob,
             context.deadline(),
@@ -844,23 +886,21 @@ fn root_process_expectations(
     Ok(expected)
 }
 
-fn serving_process_expectations(
+pub(super) fn serving_process_expectations(
     context: &RuntimeInventoryScanContext,
     bridge: &dyn RootProcessInventoryBridge,
     checkpoints_by_cat: &BTreeMap<Id, RuntimeCheckpointInventoryEvidence>,
-    blockd_by_cat: &BTreeMap<Id, AuthorizedBlockdInventoryEvidence>,
+    blockd_by_cat: &BTreeMap<Id, BTreeMap<Id, AuthorizedBlockdInventoryEvidence>>,
     volumes_by_cat: &BTreeMap<Id, Vec<AuthorityVolumeInventoryEvidence>>,
-) -> anyhow::Result<BTreeMap<Id, super::serving_blockd_process::ServingBlockdExpectation>> {
+) -> anyhow::Result<
+    BTreeMap<ManagedServingKey, super::serving_blockd_process::ServingBlockdExpectation>,
+> {
     let mut expected = BTreeMap::new();
     for desired in &context.coordinates().desired.desired_specs {
         let Some(checkpoint) = checkpoints_by_cat.get(&desired.cat_id) else {
             continue;
         };
-        let Some(blockd) = blockd_by_cat.get(&desired.cat_id) else {
-            continue;
-        };
         if checkpoint.binding != DesiredCheckpointBinding::Current
-            || blockd.binding != DesiredCheckpointBinding::Current
             || !(matches!(
                 checkpoint.checkpoint.step,
                 ReconcileStep::PrepareDevice { .. } | ReconcileStep::PrepareNetwork { .. }
@@ -868,22 +908,47 @@ fn serving_process_expectations(
         {
             continue;
         }
-        let authority = volumes_by_cat
-            .get(&desired.cat_id)
-            .and_then(|volumes| {
-                volumes.iter().find(|volume| {
-                    volume.record.volume_id == blockd.checkpoint.attachment.identity.volume_id
-                })
-            })
-            .context("serving blockd process lacks its raw authority VolumeRecord")?;
-        let expectation =
-            bridge.serving_expectation(&checkpoint.checkpoint, desired, &authority.record)?;
+        let devices = prepared_device_inputs(&checkpoint.checkpoint)?;
         anyhow::ensure!(
-            expected
-                .insert(desired.cat_id.clone(), expectation)
-                .is_none(),
-            "serving blockd process expectation duplicated one Cat"
+            super::network::prepared_device_set_is_exact(desired, &devices),
+            "prepared-device checkpoint does not cover the exact Desired Volume set"
         );
+        let blockds = blockd_by_cat
+            .get(&desired.cat_id)
+            .context("prepared-device checkpoint lacks AuthorizedBlockd inventory")?;
+        anyhow::ensure!(
+            blockds.len() == devices.len(),
+            "prepared-device checkpoint and AuthorizedBlockd inventory differ in exact size"
+        );
+        for prepared in devices {
+            let blockd = blockds
+                .get(&prepared.volume_id)
+                .context("prepared device lacks its AuthorizedBlockd lineage")?;
+            anyhow::ensure!(
+                blockd.binding == DesiredCheckpointBinding::Current,
+                "current prepared device has superseded AuthorizedBlockd lineage"
+            );
+            let authority = volumes_by_cat
+                .get(&desired.cat_id)
+                .and_then(|volumes| {
+                    volumes
+                        .iter()
+                        .find(|volume| volume.record.volume_id == prepared.volume_id)
+                })
+                .context("serving blockd process lacks its raw authority VolumeRecord")?;
+            let expectation = bridge.serving_expectation(
+                &checkpoint.checkpoint,
+                desired,
+                &prepared,
+                blockd,
+                &authority.record,
+            )?;
+            let key = ManagedServingKey::new(desired.cat_id.clone(), prepared.volume_id.clone());
+            anyhow::ensure!(
+                expected.insert(key, expectation).is_none(),
+                "serving blockd process expectation duplicated one Cat/Volume"
+            );
+        }
     }
     Ok(expected)
 }
@@ -896,7 +961,7 @@ struct InventoryProjectionContext<'a> {
 
 struct RuntimeManagedProjection {
     processes: Vec<ProcessEvidence>,
-    serving_device: Option<(Id, ObservedDevice)>,
+    serving_devices: BTreeMap<Id, ObservedDevice>,
     networks: Vec<cats_api::runtime_reconciliation::ObservedNetwork>,
 }
 
@@ -906,7 +971,7 @@ fn runtime_from_inventory(
     projection: &InventoryProjectionContext<'_>,
     mut volume_evidence: Vec<AuthorityVolumeInventoryEvidence>,
     checkpoint: Option<RuntimeCheckpointInventoryEvidence>,
-    blockd: Option<AuthorizedBlockdInventoryEvidence>,
+    blockds: BTreeMap<Id, AuthorizedBlockdInventoryEvidence>,
     managed: RuntimeManagedProjection,
 ) -> anyhow::Result<ObservedRuntimeStatus> {
     let checkpoint_path = runtime_checkpoint_path(projection.checkpoint_directory, &desired.cat_id);
@@ -918,7 +983,7 @@ fn runtime_from_inventory(
     )
     .ok_or_else(|| anyhow::anyhow!("checkpoint path is not a valid HostPath"))?;
 
-    if let Some(blockd) = &blockd {
+    for blockd in blockds.values() {
         anyhow::ensure!(
             checkpoint.is_some(),
             "authorized blockd lineage lacks its Runtime checkpoint"
@@ -968,11 +1033,10 @@ fn runtime_from_inventory(
             (
                 ReconcileStep::PrepareNetwork { devices, .. },
                 VolumeAuthorityEvidence::Owned { head, .. },
-            ) => matches!(
-                devices.as_slice(),
-                [device]
-                    if device.volume_id == volume.volume_id && &device.expected_head == head
-            ),
+            ) => devices
+                .iter()
+                .find(|device| device.volume_id == volume.volume_id)
+                .is_some_and(|device| &device.expected_head == head),
             (ReconcileStep::Quarantined, VolumeAuthorityEvidence::Owned { head, .. }) => {
                 runtime_checkpoint.volumes.iter().any(|checkpoint_volume| {
                     checkpoint_volume.volume_id == volume.volume_id
@@ -1057,7 +1121,7 @@ fn runtime_from_inventory(
         .into_iter()
         .map(|evidence| evidence.observed)
         .collect();
-    if let Some((volume_id, device)) = managed.serving_device {
+    for (volume_id, device) in managed.serving_devices {
         let volume = volumes
             .iter_mut()
             .find(|volume| volume.volume_id == volume_id)
@@ -1084,7 +1148,7 @@ fn runtime_from_inventory(
                     desired,
                     &checkpoint,
                     inventory_checkpoint.binding,
-                    blockd.as_ref(),
+                    (!blockds.is_empty()).then_some(&blockds),
                     projection.checkpoint_directory,
                     projection.blob,
                     projection.deadline,
@@ -1116,7 +1180,7 @@ fn runtime_from_inventory(
             }
             None => {
                 anyhow::ensure!(
-                    blockd.is_none(),
+                    blockds.is_empty(),
                     "local lineage cannot exist without a Runtime checkpoint"
                 );
                 let step = ReconcileStep::InspectInventory { inventory_epoch };
@@ -1320,7 +1384,7 @@ fn validate_scanned_checkpoint(
     desired: &DesiredRuntimeSpec,
     checkpoint: &RuntimeCheckpoint,
     binding: DesiredCheckpointBinding,
-    blockd: Option<&AuthorizedBlockdInventoryEvidence>,
+    blockds: Option<&BTreeMap<Id, AuthorizedBlockdInventoryEvidence>>,
     checkpoint_directory: &std::path::Path,
     blob: Option<&dyn BlobStore>,
     deadline: std::time::Instant,
@@ -1368,7 +1432,11 @@ fn validate_scanned_checkpoint(
                 anyhow::ensure!(
                     request_matches_volume(request, desired, intent)
                         && (checkpoint.volumes == [unowned_observed_volume(intent)]
-                            || current_acquire_adoption_is_closed(checkpoint, intent, blockd,)),
+                            || current_acquire_adoption_is_closed(
+                                checkpoint,
+                                intent,
+                                blockds.and_then(|blockds| blockds.get(&intent.volume_id)),
+                            )),
                     "Acquire checkpoint does not bind the exact Desired root"
                 );
             }
@@ -1386,7 +1454,7 @@ fn validate_scanned_checkpoint(
             expected_blank_head,
             ..
         } => {
-            let Some(blockd) = blockd else {
+            let Some(blockd) = blockds.and_then(|blockds| blockds.get(volume_id)) else {
                 anyhow::bail!("provision checkpoint lacks authorized blockd lineage")
             };
             let attachment = &blockd.checkpoint.attachment;
@@ -1441,7 +1509,7 @@ fn validate_scanned_checkpoint(
                 cats_api::runtime_reconciliation::ServingAuthorityProvenance::AfterRootProvision { .. }
             ) =>
         {
-            validate_current_prepared_checkpoint(desired, checkpoint, blockd, true)?
+            validate_current_prepared_checkpoint(desired, checkpoint, blockds, true)?
         }
         ReconcileStep::PrepareNetwork { network, .. }
             if binding == DesiredCheckpointBinding::Current =>
@@ -1456,17 +1524,17 @@ fn validate_scanned_checkpoint(
                 config: network.network_config.clone(),
             })
             .context("validate checkpointed PrepareNetwork identity")?;
-            validate_current_prepared_checkpoint(desired, checkpoint, blockd, false)?;
+            validate_current_prepared_checkpoint(desired, checkpoint, blockds, false)?;
         }
         _ if binding == DesiredCheckpointBinding::Current
             && checkpoint.runtime_launch.identity().is_some() =>
         {
-            validate_current_launched_checkpoint(desired, checkpoint, blockd)?;
+            validate_current_launched_checkpoint(desired, checkpoint, blockds)?;
         }
         ReconcileStep::CleanupRelease { cleanup }
             if binding == DesiredCheckpointBinding::Current =>
         {
-            validate_current_cleanup_checkpoint(desired, checkpoint, cleanup, blockd)?;
+            validate_current_cleanup_checkpoint(desired, checkpoint, cleanup, blockds)?;
         }
         ReconcileStep::Quarantined if binding == DesiredCheckpointBinding::Current => {
             anyhow::ensure!(
@@ -1485,40 +1553,57 @@ fn validate_scanned_checkpoint(
 fn validate_current_prepared_checkpoint(
     desired: &DesiredRuntimeSpec,
     checkpoint: &RuntimeCheckpoint,
-    blockd: Option<&AuthorizedBlockdInventoryEvidence>,
+    blockds: Option<&BTreeMap<Id, AuthorizedBlockdInventoryEvidence>>,
     requires_retained_root_process: bool,
 ) -> anyhow::Result<()> {
-    let Some(blockd) = blockd else {
+    let Some(blockds) = blockds else {
         anyhow::bail!("prepared-device checkpoint lacks authorized blockd lineage")
     };
-    let device = prepared_device_input(checkpoint)?;
-    let [checkpoint_volume] = checkpoint.volumes.as_slice() else {
-        anyhow::bail!("prepared-device checkpoint requires one observed root Volume")
-    };
-    let attachment = &blockd.checkpoint.attachment;
     anyhow::ensure!(
-        prepared_device_input_is_exact(&device, desired, checkpoint_volume)
-            && device.volume_id == attachment.identity.volume_id
-            && device.attachment_id == attachment.identity.attachment_id
-            && device.attachment_epoch == attachment.identity.attachment_epoch
-            && device.acquire_origin == attachment.identity.acquire_origin
-            && device.size_bytes == attachment.size_bytes
-            && device.durability == attachment.durability
-            && device.serving_process.data_directory == blockd.data_directory
-            && (!requires_retained_root_process || blockd.retained_root_process.is_some())
-            && matches!(
-                device.serving_authority.as_ref(),
-                cats_api::runtime_reconciliation::ServingAuthorityProvenance::AfterRootProvision { .. }
-            ),
-        "prepared-device checkpoint does not bind authorized root handoff lineage"
+        blockds.len() == checkpoint.volumes.len(),
+        "prepared-device checkpoint and authorized blockd inventory differ in exact size"
     );
+    let devices = prepared_device_inputs(checkpoint)?;
+    anyhow::ensure!(
+        devices.len() == blockds.len(),
+        "prepared-device checkpoint and authorized blockd inventory differ in exact size"
+    );
+    for device in devices {
+        let checkpoint_volume = checkpoint
+            .volumes
+            .iter()
+            .find(|volume| volume.volume_id == device.volume_id)
+            .context("prepared device lacks its observed Volume")?;
+        let blockd = blockds
+            .get(&device.volume_id)
+            .context("prepared device lacks its authorized blockd lineage")?;
+        let attachment = &blockd.checkpoint.attachment;
+        let is_root_handoff = matches!(
+            device.serving_authority.as_ref(),
+            cats_api::runtime_reconciliation::ServingAuthorityProvenance::AfterRootProvision { .. }
+        );
+        anyhow::ensure!(
+            prepared_device_input_is_exact(&device, desired, checkpoint_volume)
+                && device.volume_id == attachment.identity.volume_id
+                && device.attachment_id == attachment.identity.attachment_id
+                && device.attachment_epoch == attachment.identity.attachment_epoch
+                && device.acquire_origin == attachment.identity.acquire_origin
+                && device.size_bytes == attachment.size_bytes
+                && device.durability == attachment.durability
+                && device.serving_process.data_directory == blockd.data_directory
+                && (!requires_retained_root_process
+                    || !is_root_handoff
+                    || blockd.retained_root_process.is_some()),
+            "prepared-device checkpoint does not bind its authorized blockd lineage"
+        );
+    }
     Ok(())
 }
 
 fn validate_current_launched_checkpoint(
     desired: &DesiredRuntimeSpec,
     checkpoint: &RuntimeCheckpoint,
-    blockd: Option<&AuthorizedBlockdInventoryEvidence>,
+    blockds: Option<&BTreeMap<Id, AuthorizedBlockdInventoryEvidence>>,
 ) -> anyhow::Result<()> {
     let authority = RetainedRuntimeLaunchAuthority::from_checkpoint(checkpoint)
         .context("validate current retained VMM launch authority")?;
@@ -1532,7 +1617,7 @@ fn validate_current_launched_checkpoint(
             && launch.network.network_config == desired.runtime.network_config,
         "retained VMM launch does not bind the exact current Desired runtime"
     );
-    validate_current_prepared_checkpoint(desired, checkpoint, blockd, false)
+    validate_current_prepared_checkpoint(desired, checkpoint, blockds, false)
 }
 
 fn current_acquire_adoption_is_closed(
@@ -1583,7 +1668,7 @@ fn validate_current_cleanup_checkpoint(
     desired: &DesiredRuntimeSpec,
     checkpoint: &RuntimeCheckpoint,
     cleanup: &cats_api::runtime_reconciliation::CleanupRelease,
-    blockd: Option<&AuthorizedBlockdInventoryEvidence>,
+    blockds: Option<&BTreeMap<Id, AuthorizedBlockdInventoryEvidence>>,
 ) -> anyhow::Result<()> {
     let [intent] = desired.volumes.as_slice() else {
         anyhow::bail!("current cleanup requires one root intent")
@@ -1614,10 +1699,13 @@ fn validate_current_cleanup_checkpoint(
             && observed.size_bytes == Some(intent.size_bytes)
             && observed.durability == Some(intent.durability)
             && observed.devices.is_empty()
-            && blockd.is_some_and(|blockd| {
-                blockd.checkpoint.attachment.identity.attachment_id == *attachment_id
-                    && blockd.checkpoint.attachment.identity.attachment_epoch == *attachment_epoch
-            }),
+            && blockds
+                .and_then(|blockds| blockds.get(volume_id))
+                .is_some_and(|blockd| {
+                    blockd.checkpoint.attachment.identity.attachment_id == *attachment_id
+                        && blockd.checkpoint.attachment.identity.attachment_epoch
+                            == *attachment_epoch
+                }),
         "current cleanup checkpoint does not bind the exact stale lineage"
     );
     Ok(())

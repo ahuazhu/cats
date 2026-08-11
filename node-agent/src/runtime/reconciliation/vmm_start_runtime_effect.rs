@@ -31,7 +31,10 @@ use super::clean_slate_probes::CHECKPOINT_NAMESPACE;
 use super::kernel_nbd::{
     ExactKernelNbdDeviceProof, KernelNbdInventoryConfig, KernelNbdInventoryPort,
 };
-use super::network::{prepare_network_volume_admission_is_exact, PrepareNetworkReservationEffect};
+use super::network::{
+    prepare_network_volume_admission_is_exact, prepared_device_set_is_exact,
+    PrepareNetworkReservationEffect,
+};
 use super::prepare_device_retirement::{
     prepared_device_input_is_exact, retirement_authority_lease_is_monotonic, unique_runtime,
 };
@@ -141,6 +144,14 @@ pub(crate) struct StartRuntimePhysicalEffect {
     submitted_admission: Mutex<Option<RandomId128>>,
 }
 
+struct AdmittedServingDevice<'a> {
+    expectation: &'a ServingBlockdExpectation,
+    serving: &'a ExactServingBlockdProcessProof,
+    kernel_nbd: Option<&'a ExactKernelNbdDeviceProof>,
+    first_authority: VolumeRecord,
+    first_lease_expiry: UnixMillis,
+}
+
 impl StartRuntimeReservationEffect {
     pub(crate) fn platform(
         state_directory: StateDirectory,
@@ -216,9 +227,9 @@ impl StartRuntimeReservationEffect {
         let ReconcileStep::PrepareNetwork { network, devices } = &runtime.step else {
             return Ok(None);
         };
-        let [device] = devices.as_slice() else {
+        if devices.is_empty() || !prepared_device_set_is_exact(desired, devices) {
             return Ok(Some(local_contract_stop()));
-        };
+        }
         let network_admission = context.node_global_network()?;
         let Some(expected_networks) = network_admission.expected_networks(&desired.cat_id, network)
         else {
@@ -229,16 +240,20 @@ impl StartRuntimeReservationEffect {
             // effect and must force another accepted full scan.
             return Ok(Some(RuntimeDesiredEffectOutcome::RefreshInventory));
         };
-        let [observed_volume] = runtime.volumes.as_slice() else {
-            return Ok(Some(local_contract_stop()));
-        };
         if !signed_inventory_admission_is_exact_with_networks(
             accepted,
             desired,
             runtime,
             &expected_networks,
         ) || !checkpoint_is_current_exact(desired, runtime)
-            || !prepared_device_input_is_exact(device, desired, observed_volume)
+            || runtime.volumes.len() != devices.len()
+            || !devices.iter().all(|device| {
+                runtime
+                    .volumes
+                    .iter()
+                    .find(|volume| volume.volume_id == device.volume_id)
+                    .is_some_and(|volume| prepared_device_input_is_exact(device, desired, volume))
+            })
         {
             return Ok(Some(local_contract_stop()));
         }
@@ -247,62 +262,84 @@ impl StartRuntimeReservationEffect {
             process_admission.matches_observation(accepted.observation()),
             "StartRuntime process admission is not bound to the accepted full observation"
         );
-        let Some((expectation, Some(serving))) = process_admission.serving_blockd(&desired.cat_id)
-        else {
+        if process_admission.serving_blockd_count(&desired.cat_id) != devices.len() {
             return Ok(Some(RuntimeDesiredEffectOutcome::RefreshInventory));
-        };
-        if !expectation.matches_device_contract(&desired.cat_id, device) {
-            return Ok(Some(local_contract_stop()));
         }
-        let (volume_id, observed_device, kernel_nbd_proof) = match &device.frontend {
-            PrepareDeviceFrontend::VhostUserBlk { .. } => {
-                let Some((volume_id, observed)) = serving.vhost_device_projection() else {
-                    return Ok(Some(local_contract_stop()));
-                };
-                (volume_id, observed, None)
+        let mut serving_devices = Vec::with_capacity(devices.len());
+        for device in devices {
+            let Some((expectation, Some(serving))) =
+                process_admission.serving_blockd(&desired.cat_id, &device.volume_id)
+            else {
+                return Ok(Some(RuntimeDesiredEffectOutcome::RefreshInventory));
+            };
+            if !expectation.matches_device_contract(&desired.cat_id, device) {
+                return Ok(Some(local_contract_stop()));
             }
-            PrepareDeviceFrontend::KernelNbd { .. } => {
-                let pool = context.kernel_nbd_pool()?;
-                anyhow::ensure!(
+            let (volume_id, observed_device, kernel_nbd_proof) = match &device.frontend {
+                PrepareDeviceFrontend::VhostUserBlk { .. } => {
+                    let Some((volume_id, observed)) = serving.vhost_device_projection() else {
+                        return Ok(Some(local_contract_stop()));
+                    };
+                    (volume_id, observed, None)
+                }
+                PrepareDeviceFrontend::KernelNbd { .. } => {
+                    let pool = context.kernel_nbd_pool()?;
+                    anyhow::ensure!(
                         pool.matches_observation(accepted.observation()),
                         "StartRuntime kernel-NBD admission is not bound to the accepted full observation"
                     );
-                let exact = pool
-                    .exact_device(&desired.cat_id)
-                    .context("StartRuntime lacks an exact kernel-NBD device proof")?;
-                if exact.listener().expectation() != expectation
-                    || !exact.matches_prepared_device(&desired.cat_id, device)
-                {
-                    return Ok(Some(local_contract_stop()));
+                    let exact = pool
+                        .exact_device(&desired.cat_id)
+                        .context("StartRuntime lacks an exact kernel-NBD device proof")?;
+                    if exact.listener().expectation() != expectation
+                        || !exact.matches_prepared_device(&desired.cat_id, device)
+                    {
+                        return Ok(Some(local_contract_stop()));
+                    }
+                    let (volume_id, observed) = exact.projection();
+                    (volume_id, observed, Some(exact))
                 }
-                let (volume_id, observed) = exact.projection();
-                (volume_id, observed, Some(exact))
+            };
+            if !prepare_network_volume_admission_is_exact(
+                desired,
+                runtime,
+                device,
+                &volume_id,
+                Some(&observed_device),
+            ) {
+                return Ok(Some(local_contract_stop()));
             }
-        };
-        if !prepare_network_volume_admission_is_exact(
-            desired,
-            runtime,
-            device,
-            &volume_id,
-            Some(&observed_device),
-        ) || !matches!(
-            runtime.processes.as_slice(),
-            [process] if serving.matches_public_process(process)
-        ) {
+            let first_authority = self
+                .authority
+                .load_volume(expectation.volume_id())
+                .context("load StartRuntime Volume authority")?;
+            anyhow::ensure!(
+                expectation.matches_current_authority(&first_authority),
+                "StartRuntime Volume authority conflicts with serving admission"
+            );
+            let first_lease_expiry = first_authority
+                .lease_expires_at
+                .context("StartRuntime Volume authority lacks a serving lease")?;
+            serving_devices.push(AdmittedServingDevice {
+                expectation,
+                serving,
+                kernel_nbd: kernel_nbd_proof,
+                first_authority,
+                first_lease_expiry,
+            });
+        }
+        if runtime.processes.len() != serving_devices.len()
+            || !serving_devices.iter().all(|admitted| {
+                runtime
+                    .processes
+                    .iter()
+                    .filter(|process| admitted.serving.matches_public_process(process))
+                    .count()
+                    == 1
+            })
+        {
             return Ok(Some(local_contract_stop()));
         }
-
-        let first_authority = self
-            .authority
-            .load_volume(expectation.volume_id())
-            .context("load StartRuntime Volume authority")?;
-        anyhow::ensure!(
-            expectation.matches_current_authority(&first_authority),
-            "StartRuntime Volume authority conflicts with serving admission"
-        );
-        let first_lease_expiry = first_authority
-            .lease_expires_at
-            .context("StartRuntime Volume authority lacks a serving lease")?;
         let CheckpointEvidence::Valid {
             checkpoint_path,
             content_digest,
@@ -337,7 +374,7 @@ impl StartRuntimeReservationEffect {
         };
         retained_artifacts.assert_current()?;
         let (runtime_incarnation, process_identity_token) =
-            fresh_runtime_identities(network, device)?;
+            fresh_runtime_identities(network, devices)?;
         let socket_paths = self.socket_root.paths_for(&runtime_incarnation)?;
         let launch_file_paths = ManagedVmmLaunchFilePaths::for_incarnation(
             &self.state_directory,
@@ -357,11 +394,7 @@ impl StartRuntimeReservationEffect {
                     context,
                     &store,
                     &stored,
-                    expectation,
-                    serving,
-                    kernel_nbd_proof,
-                    &first_authority,
-                    first_lease_expiry,
+                    &serving_devices,
                     retained_artifacts.as_ref(),
                 )
             },
@@ -395,54 +428,57 @@ impl StartRuntimeReservationEffect {
         context: &RuntimeDesiredEffectContext,
         store: &FileCheckpointStore,
         stored: &StoredCheckpoint,
-        expectation: &ServingBlockdExpectation,
-        admitted_serving: &ExactServingBlockdProcessProof,
-        admitted_kernel_nbd: Option<&ExactKernelNbdDeviceProof>,
-        first_authority: &VolumeRecord,
-        first_lease_expiry: UnixMillis,
+        serving_devices: &[AdmittedServingDevice<'_>],
         artifacts: &dyn RetainedLaunchArtifactAuthority,
     ) -> Result<()> {
         context.check_active()?;
         self.network
             .revalidate_exact_reserved(context, store, stored)?;
-        let current_process = match self
-            .serving_process
-            .inspect_serving_exact_or_absent_after_node_global_sweep(expectation, context)
-            .context("reinspect StartRuntime serving authority")?
-        {
-            ServingBlockdProcessInspection::Exact(evidence) => evidence,
-            ServingBlockdProcessInspection::Absent
-            | ServingBlockdProcessInspection::Conflict(_)
-            | ServingBlockdProcessInspection::Unavailable => {
-                anyhow::bail!("StartRuntime serving authority is no longer exact")
-            }
-        };
-        anyhow::ensure!(
-            current_process.exactly_matches(expectation)
-                && current_process.as_ref() == admitted_serving.evidence(),
-            "StartRuntime serving process/status authority drifted"
-        );
-        let current_authority = self
-            .authority
-            .load_volume(expectation.volume_id())
-            .context("reread StartRuntime Volume authority")?;
-        anyhow::ensure!(
-            expectation.matches_current_authority(&current_authority)
-                && retirement_authority_lease_is_monotonic(
-                    first_authority,
-                    &current_authority,
-                    first_lease_expiry,
+        for admitted in serving_devices {
+            let current_process = match self
+                .serving_process
+                .inspect_serving_exact_or_absent_after_node_global_sweep(
+                    admitted.expectation,
+                    context,
+                )
+                .context("reinspect StartRuntime serving authority")?
+            {
+                ServingBlockdProcessInspection::Exact(evidence) => evidence,
+                ServingBlockdProcessInspection::Absent
+                | ServingBlockdProcessInspection::Conflict(_)
+                | ServingBlockdProcessInspection::Unavailable => {
+                    anyhow::bail!("StartRuntime serving authority is no longer exact")
+                }
+            };
+            anyhow::ensure!(
+                current_process.exactly_matches(admitted.expectation)
+                    && current_process.as_ref() == admitted.serving.evidence(),
+                "StartRuntime serving process/status authority drifted"
+            );
+            let current_authority = self
+                .authority
+                .load_volume(admitted.expectation.volume_id())
+                .context("reread StartRuntime Volume authority")?;
+            anyhow::ensure!(
+                admitted
+                    .expectation
+                    .matches_current_authority(&current_authority)
+                    && retirement_authority_lease_is_monotonic(
+                        &admitted.first_authority,
+                        &current_authority,
+                        admitted.first_lease_expiry,
+                    ),
+                "StartRuntime Volume authority changed before CID publication"
+            );
+            match (admitted.kernel_nbd, &self.kernel_nbd) {
+                (Some(admitted), Some(inventory)) => {
+                    inventory.revalidate_exact_device(context, store, stored, admitted)?
+                }
+                (None, _) => {}
+                (Some(_), None) => anyhow::bail!(
+                    "StartRuntime kernel-NBD checkpoint lacks a production inventory port"
                 ),
-            "StartRuntime Volume authority changed before CID publication"
-        );
-        match (admitted_kernel_nbd, &self.kernel_nbd) {
-            (Some(admitted), Some(inventory)) => {
-                inventory.revalidate_exact_device(context, store, stored, admitted)?
             }
-            (None, _) => {}
-            (Some(_), None) => anyhow::bail!(
-                "StartRuntime kernel-NBD checkpoint lacks a production inventory port"
-            ),
         }
         artifacts
             .assert_current()
@@ -580,9 +616,9 @@ impl StartRuntimePhysicalEffect {
         else {
             unreachable!("caller selected StartRuntime")
         };
-        let [device] = devices.as_slice() else {
+        if devices.is_empty() || !prepared_device_set_is_exact(desired, devices) {
             return Ok(Some(local_contract_stop()));
-        };
+        }
         let CheckpointEvidence::Valid {
             checkpoint_path,
             content_digest,
@@ -663,62 +699,84 @@ impl StartRuntimePhysicalEffect {
         ) {
             return Ok(Some(local_contract_stop()));
         }
-        let Some((serving_expectation, Some(serving))) =
-            process_admission.serving_blockd(&desired.cat_id)
-        else {
+        if process_admission.serving_blockd_count(&desired.cat_id) != devices.len() {
             return Ok(Some(RuntimeDesiredEffectOutcome::RefreshInventory));
-        };
-        if !serving_expectation.matches_device_contract(&desired.cat_id, device) {
-            return Ok(Some(local_contract_stop()));
         }
-        let (volume_id, observed_device, kernel_nbd_proof) = match &device.frontend {
-            PrepareDeviceFrontend::VhostUserBlk { .. } => {
-                let Some((volume_id, observed)) = serving.vhost_device_projection() else {
-                    return Ok(Some(local_contract_stop()));
-                };
-                (volume_id, observed, None)
+        let mut serving_devices = Vec::with_capacity(devices.len());
+        for device in devices {
+            let Some((serving_expectation, Some(serving))) =
+                process_admission.serving_blockd(&desired.cat_id, &device.volume_id)
+            else {
+                return Ok(Some(RuntimeDesiredEffectOutcome::RefreshInventory));
+            };
+            if !serving_expectation.matches_device_contract(&desired.cat_id, device) {
+                return Ok(Some(local_contract_stop()));
             }
-            PrepareDeviceFrontend::KernelNbd { .. } => {
-                let pool = context.kernel_nbd_pool()?;
-                anyhow::ensure!(
-                    pool.matches_observation(accepted.observation()),
-                    "physical StartRuntime kernel-NBD proof is not admission-bound"
-                );
-                let exact = pool
-                    .exact_device(&desired.cat_id)
-                    .context("physical StartRuntime lacks exact kernel-NBD device")?;
-                if exact.listener().expectation() != serving_expectation
-                    || !exact.matches_prepared_device(&desired.cat_id, device)
-                {
-                    return Ok(Some(local_contract_stop()));
+            let (volume_id, observed_device, kernel_nbd_proof) = match &device.frontend {
+                PrepareDeviceFrontend::VhostUserBlk { .. } => {
+                    let Some((volume_id, observed)) = serving.vhost_device_projection() else {
+                        return Ok(Some(local_contract_stop()));
+                    };
+                    (volume_id, observed, None)
                 }
-                let (volume_id, observed) = exact.projection();
-                (volume_id, observed, Some(exact))
+                PrepareDeviceFrontend::KernelNbd { .. } => {
+                    let pool = context.kernel_nbd_pool()?;
+                    anyhow::ensure!(
+                        pool.matches_observation(accepted.observation()),
+                        "physical StartRuntime kernel-NBD proof is not admission-bound"
+                    );
+                    let exact = pool
+                        .exact_device(&desired.cat_id)
+                        .context("physical StartRuntime lacks exact kernel-NBD device")?;
+                    if exact.listener().expectation() != serving_expectation
+                        || !exact.matches_prepared_device(&desired.cat_id, device)
+                    {
+                        return Ok(Some(local_contract_stop()));
+                    }
+                    let (volume_id, observed) = exact.projection();
+                    (volume_id, observed, Some(exact))
+                }
+            };
+            if !prepare_network_volume_admission_is_exact(
+                desired,
+                runtime,
+                device,
+                &volume_id,
+                Some(&observed_device),
+            ) {
+                return Ok(Some(local_contract_stop()));
             }
-        };
-        if !prepare_network_volume_admission_is_exact(
-            desired,
-            runtime,
-            device,
-            &volume_id,
-            Some(&observed_device),
-        ) || !matches!(
-            runtime.processes.as_slice(),
-            [process] if serving.matches_public_process(process)
-        ) {
+            let first_authority = self
+                .authority
+                .load_volume(serving_expectation.volume_id())
+                .context("load physical StartRuntime Volume authority")?;
+            anyhow::ensure!(
+                serving_expectation.matches_current_authority(&first_authority),
+                "physical StartRuntime Volume authority conflicts with admission"
+            );
+            let first_lease_expiry = first_authority
+                .lease_expires_at
+                .context("physical StartRuntime Volume authority lacks serving lease")?;
+            serving_devices.push(AdmittedServingDevice {
+                expectation: serving_expectation,
+                serving,
+                kernel_nbd: kernel_nbd_proof,
+                first_authority,
+                first_lease_expiry,
+            });
+        }
+        if runtime.processes.len() != serving_devices.len()
+            || !serving_devices.iter().all(|admitted| {
+                runtime
+                    .processes
+                    .iter()
+                    .filter(|process| admitted.serving.matches_public_process(process))
+                    .count()
+                    == 1
+            })
+        {
             return Ok(Some(local_contract_stop()));
         }
-        let first_authority = self
-            .authority
-            .load_volume(serving_expectation.volume_id())
-            .context("load physical StartRuntime Volume authority")?;
-        anyhow::ensure!(
-            serving_expectation.matches_current_authority(&first_authority),
-            "physical StartRuntime Volume authority conflicts with admission"
-        );
-        let first_lease_expiry = first_authority
-            .lease_expires_at
-            .context("physical StartRuntime Volume authority lacks serving lease")?;
         let artifacts = self
             .retain_physical_artifacts()
             .context("retain physical StartRuntime launch artifacts")?;
@@ -752,11 +810,7 @@ impl StartRuntimePhysicalEffect {
                 &store,
                 &stored,
                 &expectation,
-                serving_expectation,
-                serving,
-                kernel_nbd_proof,
-                &first_authority,
-                first_lease_expiry,
+                &serving_devices,
                 &artifacts,
             )?,
             stored.checkpoint(),
@@ -773,7 +827,7 @@ impl StartRuntimePhysicalEffect {
             }
             None => {
                 let nonce =
-                    fresh_receipt_nonce(runtime_incarnation, process_identity_token, device)?;
+                    fresh_receipt_nonce(runtime_incarnation, process_identity_token, devices)?;
                 let receipt = VmmSocketOwnershipReceiptV1::from_checkpoint(
                     stored.checkpoint(),
                     &self.state_directory,
@@ -788,11 +842,7 @@ impl StartRuntimePhysicalEffect {
                         &store,
                         &stored,
                         &expectation,
-                        serving_expectation,
-                        serving,
-                        kernel_nbd_proof,
-                        &first_authority,
-                        first_lease_expiry,
+                        &serving_devices,
                         &artifacts,
                     )?,
                     stored.checkpoint(),
@@ -816,11 +866,7 @@ impl StartRuntimePhysicalEffect {
                 &store,
                 &stored,
                 &expectation,
-                serving_expectation,
-                serving,
-                kernel_nbd_proof,
-                &first_authority,
-                first_lease_expiry,
+                &serving_devices,
                 &artifacts,
             )?,
             stored.checkpoint(),
@@ -842,11 +888,7 @@ impl StartRuntimePhysicalEffect {
                         &store,
                         &stored,
                         &expectation,
-                        serving_expectation,
-                        serving,
-                        kernel_nbd_proof,
-                        &first_authority,
-                        first_lease_expiry,
+                        &serving_devices,
                         &artifacts,
                     )?,
                     stored.checkpoint(),
@@ -870,11 +912,7 @@ impl StartRuntimePhysicalEffect {
                         &store,
                         &stored,
                         &expectation,
-                        serving_expectation,
-                        serving,
-                        kernel_nbd_proof,
-                        &first_authority,
-                        first_lease_expiry,
+                        &serving_devices,
                         &artifacts,
                     )?,
                     stored.checkpoint(),
@@ -891,11 +929,7 @@ impl StartRuntimePhysicalEffect {
                 &store,
                 &stored,
                 &expectation,
-                serving_expectation,
-                serving,
-                kernel_nbd_proof,
-                &first_authority,
-                first_lease_expiry,
+                &serving_devices,
                 &artifacts,
             )?,
             stored.checkpoint(),
@@ -911,11 +945,7 @@ impl StartRuntimePhysicalEffect {
             context,
             &store,
             &stored,
-            serving_expectation,
-            serving,
-            kernel_nbd_proof,
-            &first_authority,
-            first_lease_expiry,
+            &serving_devices,
             &artifacts,
         )?;
         ready.assert_ready()?;
@@ -960,24 +990,10 @@ impl StartRuntimePhysicalEffect {
         store: &FileCheckpointStore,
         stored: &StoredCheckpoint,
         expectation: &super::vmm_process::VmmProcessExpectation,
-        serving_expectation: &ServingBlockdExpectation,
-        admitted_serving: &ExactServingBlockdProcessProof,
-        admitted_kernel_nbd: Option<&ExactKernelNbdDeviceProof>,
-        first_authority: &VolumeRecord,
-        first_lease_expiry: UnixMillis,
+        serving_devices: &[AdmittedServingDevice<'_>],
         artifacts: &RetainedVmmLaunchArtifacts,
     ) -> Result<super::vmm_process::ExactVmmProcessAbsenceProof> {
-        self.revalidate_physical_dependencies(
-            context,
-            store,
-            stored,
-            serving_expectation,
-            admitted_serving,
-            admitted_kernel_nbd,
-            first_authority,
-            first_lease_expiry,
-            artifacts,
-        )?;
+        self.revalidate_physical_dependencies(context, store, stored, serving_devices, artifacts)?;
         match self
             .vmm_process
             .inspect_vmm_exact_or_absent_after_node_global_sweep(expectation, context)?
@@ -1005,11 +1021,7 @@ impl StartRuntimePhysicalEffect {
         context: &RuntimeDesiredEffectContext,
         store: &FileCheckpointStore,
         stored: &StoredCheckpoint,
-        serving_expectation: &ServingBlockdExpectation,
-        admitted_serving: &ExactServingBlockdProcessProof,
-        admitted_kernel_nbd: Option<&ExactKernelNbdDeviceProof>,
-        first_authority: &VolumeRecord,
-        first_lease_expiry: UnixMillis,
+        serving_devices: &[AdmittedServingDevice<'_>],
         artifacts: &RetainedVmmLaunchArtifacts,
     ) -> Result<()> {
         context.check_active()?;
@@ -1024,42 +1036,48 @@ impl StartRuntimePhysicalEffect {
         );
         self.network
             .revalidate_exact_reserved(context, store, stored)?;
-        let current_serving = match self
-            .serving_process
-            .inspect_serving_exact_or_absent_after_node_global_sweep(serving_expectation, context)?
-        {
-            ServingBlockdProcessInspection::Exact(evidence) => evidence,
-            ServingBlockdProcessInspection::Absent
-            | ServingBlockdProcessInspection::Conflict(_)
-            | ServingBlockdProcessInspection::Unavailable => {
-                anyhow::bail!("physical StartRuntime serving authority is no longer exact")
-            }
-        };
-        anyhow::ensure!(
-            current_serving.as_ref() == admitted_serving.evidence()
-                && current_serving.exactly_matches(serving_expectation),
-            "physical StartRuntime serving authority drifted"
-        );
-        let current_authority = self
-            .authority
-            .load_volume(serving_expectation.volume_id())?;
-        anyhow::ensure!(
-            serving_expectation.matches_current_authority(&current_authority)
-                && retirement_authority_lease_is_monotonic(
-                    first_authority,
-                    &current_authority,
-                    first_lease_expiry,
+        for admitted in serving_devices {
+            let current_serving = match self
+                .serving_process
+                .inspect_serving_exact_or_absent_after_node_global_sweep(
+                    admitted.expectation,
+                    context,
+                )? {
+                ServingBlockdProcessInspection::Exact(evidence) => evidence,
+                ServingBlockdProcessInspection::Absent
+                | ServingBlockdProcessInspection::Conflict(_)
+                | ServingBlockdProcessInspection::Unavailable => {
+                    anyhow::bail!("physical StartRuntime serving authority is no longer exact")
+                }
+            };
+            anyhow::ensure!(
+                current_serving.as_ref() == admitted.serving.evidence()
+                    && current_serving.exactly_matches(admitted.expectation),
+                "physical StartRuntime serving authority drifted"
+            );
+            let current_authority = self
+                .authority
+                .load_volume(admitted.expectation.volume_id())?;
+            anyhow::ensure!(
+                admitted
+                    .expectation
+                    .matches_current_authority(&current_authority)
+                    && retirement_authority_lease_is_monotonic(
+                        &admitted.first_authority,
+                        &current_authority,
+                        admitted.first_lease_expiry,
+                    ),
+                "physical StartRuntime Volume authority changed"
+            );
+            match (admitted.kernel_nbd, &self.kernel_nbd) {
+                (Some(admitted), Some(inventory)) => {
+                    inventory.revalidate_exact_device(context, store, stored, admitted)?
+                }
+                (None, _) => {}
+                (Some(_), None) => anyhow::bail!(
+                    "physical StartRuntime kernel-NBD checkpoint lacks production inventory"
                 ),
-            "physical StartRuntime Volume authority changed"
-        );
-        match (admitted_kernel_nbd, &self.kernel_nbd) {
-            (Some(admitted), Some(inventory)) => {
-                inventory.revalidate_exact_device(context, store, stored, admitted)?
             }
-            (None, _) => {}
-            (Some(_), None) => anyhow::bail!(
-                "physical StartRuntime kernel-NBD checkpoint lacks production inventory"
-            ),
         }
         artifacts.assert_current()?;
         self.socket_root.assert_current()?;
@@ -1141,26 +1159,26 @@ fn physical_start_runtime_checkpoint_evidence_is_exact(
 fn fresh_receipt_nonce(
     runtime_incarnation: &RandomId128,
     process_identity_token: &RandomId128,
-    device: &cats_api::runtime_reconciliation::PreparedDeviceInput,
+    devices: &[cats_api::runtime_reconciliation::PreparedDeviceInput],
 ) -> Result<RandomId128> {
-    let occupied = BTreeSet::from([
-        runtime_incarnation.clone(),
-        process_identity_token.clone(),
-        device.ownership_token.clone(),
-        device.serving_process.process_identity_token.clone(),
-    ]);
+    let mut occupied =
+        BTreeSet::from([runtime_incarnation.clone(), process_identity_token.clone()]);
+    for device in devices {
+        occupied.insert(device.ownership_token.clone());
+        occupied.insert(device.serving_process.process_identity_token.clone());
+    }
     fresh_random_id(&occupied)
 }
 
 fn fresh_runtime_identities(
     network: &cats_api::runtime_reconciliation::RuntimeNetworkIdentity,
-    device: &cats_api::runtime_reconciliation::PreparedDeviceInput,
+    devices: &[cats_api::runtime_reconciliation::PreparedDeviceInput],
 ) -> Result<(RandomId128, RandomId128)> {
-    let mut occupied = BTreeSet::from([
-        network.ownership_token.clone(),
-        device.ownership_token.clone(),
-        device.serving_process.process_identity_token.clone(),
-    ]);
+    let mut occupied = BTreeSet::from([network.ownership_token.clone()]);
+    for device in devices {
+        occupied.insert(device.ownership_token.clone());
+        occupied.insert(device.serving_process.process_identity_token.clone());
+    }
     let runtime_incarnation = fresh_random_id(&occupied)?;
     occupied.insert(runtime_incarnation.clone());
     let process_identity_token = fresh_random_id(&occupied)?;
