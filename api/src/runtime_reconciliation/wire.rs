@@ -729,6 +729,7 @@ impl Schema {
 #[derive(Debug, Clone, Copy)]
 enum StringRule {
     Id,
+    GuestDeviceSerial,
     AsciiText,
     JsonPointer,
     RandomId,
@@ -1382,6 +1383,7 @@ fn collect_scalars(
 fn valid_string(rule: StringRule, value: &str) -> bool {
     match rule {
         StringRule::Id => valid_id(value),
+        StringRule::GuestDeviceSerial => valid_guest_device_serial(value),
         StringRule::AsciiText => valid_ascii_text(value),
         StringRule::JsonPointer => valid_json_pointer(value),
         StringRule::RandomId => valid_random_id(value),
@@ -1755,7 +1757,7 @@ fn stable_state_schema() -> Schema {
 
 fn guest_device_schema() -> Schema {
     object(vec![
-        field("serial", id()),
+        field("serial", string(StringRule::GuestDeviceSerial)),
         field("slot", number(0, u64::from(u16::MAX))),
     ])
 }

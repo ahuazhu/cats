@@ -213,6 +213,9 @@ boot/Guest-config digest，API/vsock/memory/serial/VMM-log路径，一个exact n
 exact device inputs。Root必须且只在slot 0，其余只能是Persistent；frontend的`direct`或vhost
 queues/queue-size不得丢失。该provenance不假设新的release installer、manifest或receipt authority；Node用
 固定safe reader从实际ChConfig选择构造，并在restart/start/adopt前descriptor-stable重开、重算和逐字段比较。
+`GuestDeviceIdentity.serial`保持`Id`的wire/type形态，但因production唯一目标Cloud Hypervisor v53的
+`VIRTIO_BLK_ID_BYTES`限制，所有Desired、checkpoint nested input、Observed和Guest Ready承载点都必须在
+F0/strict ABI统一拒绝UTF-8 byte length不在1..=20的值；launcher不得截断或成为首次拒绝边界。
 `guest_config_digest`还必须由checkpoint kernel digest、optional initramfs digest、exact cmdline及Guest Agent
 protocol v1按既有`GuestRuntimeProfileReceipt` domain重算，且等于current Desired选择的approved digest；不能让
 Guest回显一个与实际boot bytes无关的digest。
@@ -232,6 +235,14 @@ checkpoint replace并fsync。V1 Guest Agent vsock port固定为5000，因此不�
 `StartRuntime`允许VMM尚不存在时仅报告Guest transport Unavailable；Malformed或VsockReady都要求恰好一个
 逐字段exact VMM，Ready还必须精确匹配incarnation/CID/5000/protocol v1。公开VMM process只是一致性投影，
 provider-private exact argv/env/cgroup/unit/PID/start/executable/file/tap/device proof才可授权adopt。
+Ready不得继续使用legacy `Health {boot_id, disks}`或宽松hybrid-vsock prefix。每次fresh scan使用fresh random
+challenge并绑定retained launch的incarnation/CID/fixed port/protocol；Guest exact echo，同时以accepted AF_VSOCK
+stream的`getsockname`报告actual CID/port、canonical boot ID及同pass的bounded/sorted device/ext4/mountinfo
+事实。request/response分别使用独立4 KiB/4 MiB frame cap，Node在body allocation前拒绝oversized length；
+unknown/duplicate/missing/malformed字段以及非exact `OK <assigned>\n` CH handshake全部fail closed。Guest projection
+只能夹在前后两次exact VMM/systemd/process/API/socket/volume proof之间，不能成为任何一项authority。Root UUID
+若不能由image/launch authority导出，只记录same-pass nonzero物理事实和validation gap，不作首次观察采用；
+Persistent/Format/Mount未实现语义继续fail closed。
 
 启动端只允许no-replace创建全部socket/RAM/log路径和exact transient service，不预先unlink或truncate。
 launcher以已验证descriptor启动并`exec`成checkpointed VMM；inspection必须同时闭合systemd ExecStart、唯一

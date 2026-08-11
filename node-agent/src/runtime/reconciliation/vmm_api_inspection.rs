@@ -75,11 +75,13 @@ enum VmmApiDiskExpectation {
     KernelNbd {
         path: String,
         direct: bool,
+        serial: String,
     },
     VhostUserBlk {
         socket: String,
         queues: usize,
         queue_size: u16,
+        serial: String,
     },
 }
 
@@ -115,6 +117,7 @@ impl VmmApiExpectation {
                 } => VmmApiDiskExpectation::KernelNbd {
                     path: device_path.as_str().to_owned(),
                     direct: *direct,
+                    serial: device.guest_device.serial.as_str().to_owned(),
                 },
                 PrepareDeviceFrontend::VhostUserBlk {
                     socket_path,
@@ -124,6 +127,7 @@ impl VmmApiExpectation {
                     socket: socket_path.as_str().to_owned(),
                     queues: usize::from(*queues),
                     queue_size: *queue_size,
+                    serial: device.guest_device.serial.as_str().to_owned(),
                 },
             })
             .collect();
@@ -494,16 +498,20 @@ impl DiskConfigWire {
             && self.rate_limiter_config.is_none()
             && !self.disable_io_uring
             && !self.disable_aio
-            && self.serial.is_none()
             && self.queue_affinity.is_none()
             && !self.backing_files
             && self.sparse
             && self.lock_granularity == "ByteRange";
         common
             && match expected {
-                VmmApiDiskExpectation::KernelNbd { path, direct } => {
+                VmmApiDiskExpectation::KernelNbd {
+                    path,
+                    direct,
+                    serial,
+                } => {
                     self.path.as_deref() == Some(path)
                         && self.direct == *direct
+                        && self.serial.as_deref() == Some(serial)
                         && self.num_queues == 1
                         && self.queue_size == 128
                         && !self.vhost_user
@@ -514,9 +522,11 @@ impl DiskConfigWire {
                     socket,
                     queues,
                     queue_size,
+                    serial,
                 } => {
                     self.path.is_none()
                         && !self.direct
+                        && self.serial.as_deref() == Some(serial)
                         && self.num_queues == *queues
                         && self.queue_size == *queue_size
                         && self.vhost_user
@@ -1934,7 +1944,7 @@ mod tests {
             "cpus": {"boot_vcpus":2,"max_vcpus":2,"kvm_hyperv":false,"max_phys_bits":46,"features":{"amx":false},"nested":true,"core_scheduling":"Vm","profile":"Host"},
             "memory": {"size":0,"mergeable":false,"hotplug_method":"Acpi","shared":false,"hugepages":false,"prefault":false,"reserve":false,"zones":[{"id":"cat-ram","size":2147483648,"file":"/proc/self/fd/68","shared":true,"hugepages":false,"prefault":false,"reserve":false,"mergeable":false}],"thp":true},
             "payload": {"kernel":"/proc/self/fd/66","cmdline":"console=ttyS0 root=/dev/vda rw clocksource=kvm-clock","initramfs":"/proc/self/fd/67"},
-            "disks": [{"id":"_disk0","pci_segment":0,"readonly":false,"direct":false,"num_queues":2,"queue_size":256,"vhost_user":true,"vhost_socket":"/run/cats/cat_01/root-vhost.sock","disable_io_uring":false,"disable_aio":false,"backing_files":false,"sparse":true,"image_type":"Unknown","lock_granularity":"ByteRange"}],
+            "disks": [{"id":"_disk0","pci_segment":0,"readonly":false,"direct":false,"num_queues":2,"queue_size":256,"vhost_user":true,"vhost_socket":"/run/cats/cat_01/root-vhost.sock","disable_io_uring":false,"disable_aio":false,"serial":"cats-root","backing_files":false,"sparse":true,"image_type":"Unknown","lock_granularity":"ByteRange"}],
             "net": [{"id":"_net1","pci_segment":0,"tap":"cats0001","mac":"02:ca:0a:f0:00:06","host_mac":"02:00:00:00:00:01","num_queues":2,"queue_size":256,"vhost_user":false,"vhost_mode":"Client","offload_tso":true,"offload_ufo":true,"offload_csum":true}],
             "rng": {"pci_segment":0,"src":"/dev/urandom"},
             "serial": {"file":"/proc/self/fd/69","mode":"File"},
@@ -1969,6 +1979,25 @@ mod tests {
         let mut wrong = serde_json::from_slice::<serde_json::Value>(&exact_vm_info()).unwrap();
         wrong["config"]["vsock"]["cid"] = serde_json::json!(4);
         assert!(serde_json::from_value::<VmInfoWire>(wrong)
+            .unwrap()
+            .exact(&expected)
+            .is_none());
+
+        let mut wrong_serial =
+            serde_json::from_slice::<serde_json::Value>(&exact_vm_info()).unwrap();
+        wrong_serial["config"]["disks"][0]["serial"] = serde_json::json!("foreign-root");
+        assert!(serde_json::from_value::<VmInfoWire>(wrong_serial)
+            .unwrap()
+            .exact(&expected)
+            .is_none());
+
+        let mut missing_serial =
+            serde_json::from_slice::<serde_json::Value>(&exact_vm_info()).unwrap();
+        missing_serial["config"]["disks"][0]
+            .as_object_mut()
+            .unwrap()
+            .remove("serial");
+        assert!(serde_json::from_value::<VmInfoWire>(missing_serial)
             .unwrap()
             .exact(&expected)
             .is_none());

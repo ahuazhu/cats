@@ -41,6 +41,7 @@ use std::time::{Duration, Instant};
 use anyhow::{bail, Context, Result};
 use cats_api::runtime_reconciliation::{
     IsolatedIpv4Kind, NetworkConfig, RandomId128, RuntimeNetworkIdentity,
+    GUEST_DEVICE_SERIAL_MAX_BYTES_V1,
 };
 
 use crate::proc::ProcHandle;
@@ -2319,6 +2320,15 @@ pub fn file_disk_arg(path: &str, direct: bool) -> String {
     format!("path={path},image_type=raw,direct={direct}")
 }
 
+/// Checkpoint-bound variant used by Runtime Reconciliation V1. Cloud
+/// Hypervisor v53 exposes this value through virtio-blk and `vm.info`; omitting
+/// it would leave the Guest-reported serial unbound to the launch authority.
+pub(crate) fn file_disk_arg_with_serial(path: &str, direct: bool, serial: &str) -> Result<String> {
+    validate_virtio_blk_serial(serial)?;
+    anyhow::ensure!(!path.contains(','), "disk path cannot contain a comma");
+    Ok(format!("{},serial={serial}", file_disk_arg(path, direct)))
+}
+
 /// Effective virtio-blk queue count for one Cat.
 ///
 /// Cloud Hypervisor validates `num_queues <= boot vCPUs` and refuses to start
@@ -2351,6 +2361,31 @@ pub fn vhost_user_disk_arg(socket: &Path, num_queues: usize, queue_size: u16) ->
     Ok(format!(
         "vhost_user=on,socket={socket},num_queues={num_queues},queue_size={queue_size}"
     ))
+}
+
+pub(crate) fn vhost_user_disk_arg_with_serial(
+    socket: &Path,
+    num_queues: usize,
+    queue_size: u16,
+    serial: &str,
+) -> Result<String> {
+    validate_virtio_blk_serial(serial)?;
+    Ok(format!(
+        "{},serial={serial}",
+        vhost_user_disk_arg(socket, num_queues, queue_size)?
+    ))
+}
+
+fn validate_virtio_blk_serial(serial: &str) -> Result<()> {
+    // Restrict the unescaped CLI value to the shared Id alphabet as well.
+    anyhow::ensure!(
+        (1..=GUEST_DEVICE_SERIAL_MAX_BYTES_V1).contains(&serial.len())
+            && serial.bytes().all(|byte| {
+                byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b':' | b'-')
+            }),
+        "virtio-blk serial is not a 1..=20 byte canonical Id"
+    );
+    Ok(())
 }
 
 pub struct ChSpawn<'a> {
@@ -3106,6 +3141,23 @@ mod tests {
         );
         // A comma would silently split into another CH disk option.
         assert!(vhost_user_disk_arg(Path::new("/tmp/a,b.sock"), 1, 256).is_err());
+        assert_eq!(
+            file_disk_arg_with_serial("/dev/nbd3", true, "cats-root").unwrap(),
+            "path=/dev/nbd3,image_type=raw,direct=on,serial=cats-root"
+        );
+        assert_eq!(
+            vhost_user_disk_arg_with_serial(
+                Path::new("/tmp/cats-sock/abc.sock"),
+                4,
+                256,
+                "cats-root"
+            )
+            .unwrap(),
+            "vhost_user=on,socket=/tmp/cats-sock/abc.sock,num_queues=4,queue_size=256,serial=cats-root"
+        );
+        assert!(file_disk_arg_with_serial("/dev/nbd3", true, "").is_err());
+        assert!(file_disk_arg_with_serial("/dev/nbd3", true, "12345678901234567890").is_ok());
+        assert!(file_disk_arg_with_serial("/dev/nbd3", true, "123456789012345678901").is_err());
     }
 
     fn desired_network() -> NetworkConfig {

@@ -9,6 +9,11 @@ pub(crate) const MAX_WIRE_INTEGER: u64 = i64::MAX as u64;
 
 /// Fixed Guest Agent AF_VSOCK port for the clean-slate V1 runtime contract.
 pub const GUEST_AGENT_VSOCK_PORT_V1: u16 = 5_000;
+/// Cloud Hypervisor v53 copies at most `VIRTIO_BLK_ID_BYTES` bytes into the
+/// Guest-visible virtio-blk serial. Every Runtime Reconciliation V1 carrier of
+/// `GuestDeviceIdentity` therefore shares this stricter bound than a general
+/// `Id`.
+pub const GUEST_DEVICE_SERIAL_MAX_BYTES_V1: usize = 20;
 
 macro_rules! integer_newtype {
     ($name:ident, $minimum:expr) => {
@@ -118,6 +123,10 @@ pub(crate) fn valid_id(value: &str) -> bool {
         && value
             .bytes()
             .all(|byte| byte.is_ascii_alphanumeric() || b"._:-".contains(&byte))
+}
+
+pub(crate) fn valid_guest_device_serial(value: &str) -> bool {
+    valid_id(value) && value.len() <= GUEST_DEVICE_SERIAL_MAX_BYTES_V1
 }
 
 pub(crate) fn valid_ascii_text(value: &str) -> bool {

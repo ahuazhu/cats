@@ -374,6 +374,18 @@ mod tests {
         }
     }
 
+    fn virtio_block_name(slot: usize) -> String {
+        let mut ordinal = slot + 1;
+        let mut suffix = Vec::new();
+        while ordinal > 0 {
+            ordinal -= 1;
+            suffix.push(char::from(b'a' + u8::try_from(ordinal % 26).unwrap()));
+            ordinal /= 26;
+        }
+        suffix.reverse();
+        format!("vd{}", suffix.into_iter().collect::<String>())
+    }
+
     #[test]
     fn collector_reports_sorted_exact_device_and_mountinfo_facts() {
         let root = tempfile::tempdir().unwrap();
@@ -458,6 +470,8 @@ mod tests {
 
     #[test]
     fn collector_rejects_duplicate_mounts_and_oversized_inventory() {
+        assert_eq!(RUNTIME_READY_MAX_DEVICES_V1, 64);
+        assert_eq!(RUNTIME_READY_MAX_MOUNTS_V1, 64);
         let root = tempfile::tempdir().unwrap();
         std::fs::create_dir_all(root.path().join("dev")).unwrap();
         write_device(root.path(), "vda", "cats-root", "252:0", [0xaa; 16]);
@@ -485,13 +499,9 @@ mod tests {
             .to_string()
             .contains("duplicate mount"));
 
-        for suffix in b'b'..=b'q' {
-            std::fs::create_dir_all(
-                root.path()
-                    .join("sys/block")
-                    .join(format!("vd{}", char::from(suffix))),
-            )
-            .unwrap();
+        for slot in 1..=RUNTIME_READY_MAX_DEVICES_V1 {
+            std::fs::create_dir_all(root.path().join("sys/block").join(virtio_block_name(slot)))
+                .unwrap();
         }
         assert!(collector
             .collect(

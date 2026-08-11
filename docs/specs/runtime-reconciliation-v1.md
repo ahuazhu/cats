@@ -385,7 +385,7 @@ VolumeIntent {
 }
 
 GuestDeviceIdentity {
-  serial: Id,
+  serial: Id with UTF-8 byte length 1..=20,
   slot: integer 0..=65535
 }
 
@@ -445,6 +445,10 @@ RootDisk的`mount`必须为`null`；PersistentDisk的`mount`必须是`Ext4MountI
 `disk_id`、`volume_id`、`attachment_id`、Guest `serial`和`slot`也分别唯一。`filesystem_uuid`在wire
 上使用无连字符的canonical 128-bit文本；`mount_path`不能是`/`。`volume_intent_id`标识该Cat磁盘集合中
 一次逻辑成员关系，创建后不复用；detach后再次加入必须使用新intent和新attachment ID。
+`GuestDeviceIdentity.serial`保持通用`Id`的JSON/type形态，但额外统一限制为1..=20 UTF-8 bytes，等于
+production唯一目标Cloud Hypervisor v53的`VIRTIO_BLK_ID_BYTES`。Desired、PrepareDevice、nested
+`PreparedDeviceInput`/StartRuntime、Observed device/mount及Guest RuntimeReady都在各自F0或strict ABI
+validation拒绝21-byte值；不能把更长Control identity交给launcher后再截断或晚拒。
 
 Control Store还必须执行[Volume Authority](volume-authority.md)的产品约束：`DiskRecord.volume_id`全局
 一对一；Root与Cat同Workspace且每Cat恰好一个Root；任一PersistentDisk同时最多被一个current完整
@@ -1227,8 +1231,9 @@ kernel/initramfs/RAM/log descriptor可继承，并以descriptor-stable executabl
 VMM。fresh boot的CH argv顺序固定为API socket、kernel descriptor、optional initramfs descriptor、exact
 cmdline、`cpus=boot=<vcpus>`、file-backed shared memory、checkpoint CID/vsock、exact tap/MAC、按slot顺序的
 全部disk、serial descriptor和console-off。kernel disk argument固定
-`path=<path>,image_type=raw,direct=on|off`；vhost argument固定
-`vhost_user=on,socket=<path>,num_queues=<queues>,queue_size=<queue_size>`。不得继续使用硬编码CID 3、丢弃
+`path=<path>,image_type=raw,direct=on|off,serial=<guest_device.serial>`；vhost argument固定
+`vhost_user=on,socket=<path>,num_queues=<queues>,queue_size=<queue_size>,serial=<guest_device.serial>`。
+`vm.info.config.disks[*].serial`必须按slot顺序逐项等于同一checkpoint identity。不得继续使用硬编码CID 3、丢弃
 `direct`/queue参数、按map顺序生成disk或从current ChConfig重新选择不同boot bytes。
 
 transient service固定`Type=exec`、`--collect`、`CollectMode=inactive-or-failed`、`Restart=no`、
@@ -2238,6 +2243,73 @@ ResidueCheckpointFileEvidence =
     runtime_incarnation: RandomId128 | null
   }
 ```
+
+Guest host-control的production Ready探针另冻结为`RuntimeReady V1`，不复用legacy `Health
+{boot_id, disks}`。Node每次fresh scan生成新的nonzero `RandomId128 challenge`，并只从retained launch
+authority填入runtime incarnation、expected CID、fixed port 5000和protocol 1：
+
+```text
+RuntimeReadyRequestV1 {
+  version: 1,
+  challenge: RandomId128,
+  runtime_incarnation: RandomId128,
+  expected_guest_cid: integer 3..=4294967294,
+  expected_guest_port: 5000,
+  expected_guest_agent_protocol_version: 1
+}
+
+RuntimeReadyResponseV1 {
+  version: 1,
+  challenge: RandomId128,
+  runtime_incarnation: RandomId128,
+  expected_guest_cid: integer 3..=4294967294,
+  expected_guest_port: 5000,
+  expected_guest_agent_protocol_version: 1,
+  actual_guest_cid: integer 3..=4294967294,
+  actual_guest_port: 5000,
+  actual_guest_agent_protocol_version: 1,
+  guest_boot_id: GuestBootId,
+  devices: [RuntimeReadyDeviceV1; maximum 64],
+  mounts: [RuntimeReadyMountV1; maximum 64]
+}
+
+RuntimeReadyDeviceV1 {
+  guest_device: GuestDeviceIdentity,
+  device_path: HostPath,
+  device_major: integer 0..=4294967295,
+  device_minor: integer 0..=4294967295,
+  size_bytes: integer 1..=18446744073709551615,
+  filesystem_uuid: RandomId128
+}
+
+RuntimeReadyMountV1 {
+  device_major: integer 0..=4294967295,
+  device_minor: integer 0..=4294967295,
+  source_path: HostPath,
+  filesystem_uuid: RandomId128,
+  mount_root: HostPath,
+  mount_path: HostPath,
+  filesystem_type: Id,
+  access: "read_only" | "read_write"
+}
+```
+
+两方向都使用`u32` big-endian length + canonical JSON body。request独立cap为4 KiB，response独立cap为
+4 MiB；后者覆盖64 devices + 64 mounts且每个字段取合法最大HostPath并作JSON escape的实际canonical
+encoding，仍不允许退回generic 16 MiB reader。Node在分配body前先读并检查length prefix，`cap+1`立即
+拒绝。所有nested/top-level object deny unknown，duplicate/missing/malformed字段拒绝；response必须exact
+echo challenge/incarnation/expected transport。device按`(slot, serial)`严格排序，slot、serial、path、kernel
+device number及UUID分别唯一；mount按`(mount_path, source_path)`严格排序且mount path唯一，并由device
+number、source path和UUID exact join恰好一个同轮device。
+
+Guest只在real VM的accepted AF_VSOCK stream服务该op，并用`getsockname`取得actual local CID/port；Guest自报
+不能替代VMM authority。Node连接CH hybrid-vsock时只接受最多32 bytes的exact canonical
+`OK <assigned>\n`，逐byte读到首个LF而不吞后续Guest frame；prefix、trailing、CRLF、多行、leading-zero、0、
+`u32::MAX`及无LF都拒绝。Guest在同一pass从sysfs、ext4 superblock和`/proc/self/mountinfo`收集事实；Root UUID
+仅是该pass的nonzero physical fact，不能“首次观察即authority”持久或采用。若launch/image authority不能导出
+expected Root UUID，validation必须明确保留该gap，只能要求same fresh proof内device/ext4/mount join闭合，不能
+声称Control UUID匹配。Persistent未格式化或mount语义未实现时RuntimeReady fail closed；本ABI结果不得复用为
+未来Format前filesystem probe，也不虚构Format/Mount/Gate effect。
 
 这里的`AcquireOrigin`与[Volume Authority §6](volume-authority.md#6-本地-attachment-lineage)是同一个closed
 wire union，不是第二套identity定义。`LocalVolumeLineage.acquire_origin`是data-dir `identity.json`中该值的

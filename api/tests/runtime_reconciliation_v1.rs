@@ -6335,6 +6335,74 @@ fn array_limit_precedes_intrinsic_but_not_schema() {
 }
 
 #[test]
+fn guest_device_serial_bound_is_uniform_across_v1_carriers() {
+    const BOUNDARY: &str = "12345678901234567890";
+    const TOO_LONG: &str = "123456789012345678901";
+    assert_eq!(BOUNDARY.len(), GUEST_DEVICE_SERIAL_MAX_BYTES_V1);
+    assert_eq!(TOO_LONG.len(), GUEST_DEVICE_SERIAL_MAX_BYTES_V1 + 1);
+
+    let mut desired = desired_value();
+    desired["volumes"][0]["guest_device"]["serial"] = BOUNDARY.into();
+    refresh_spec_digest(&mut desired);
+    decode_desired_runtime_spec(&serde_json::to_vec(&desired).unwrap()).unwrap();
+    desired["volumes"][0]["guest_device"]["serial"] = TOO_LONG.into();
+    let error = decode_desired_runtime_spec(&serde_json::to_vec(&desired).unwrap()).unwrap_err();
+    assert_eq!(
+        malformed(&error).0.as_str(),
+        "/volumes/0/guest_device/serial"
+    );
+    assert_eq!(malformed(&error).1, MalformedProblem::InvalidValue);
+
+    for (name, mut checkpoint) in [
+        ("prepare_network", prepare_network_checkpoint_value()),
+        ("start_runtime", start_runtime_checkpoint_value()),
+    ] {
+        checkpoint["step"]["devices"][0]["guest_device"]["serial"] = BOUNDARY.into();
+        decode_runtime_checkpoint(&serde_json::to_vec(&checkpoint).unwrap())
+            .unwrap_or_else(|error| panic!("{name} rejected 20-byte serial: {error:?}"));
+
+        checkpoint["step"]["devices"][0]["guest_device"]["serial"] = TOO_LONG.into();
+        let error =
+            decode_runtime_checkpoint(&serde_json::to_vec(&checkpoint).unwrap()).unwrap_err();
+        assert_eq!(
+            malformed(&error).0.as_str(),
+            "/step/devices/0/guest_device/serial",
+            "{name}"
+        );
+        assert_eq!(
+            malformed(&error).1,
+            MalformedProblem::InvalidValue,
+            "{name}"
+        );
+    }
+
+    let mut observation = nonempty_observation_value();
+    observation["runtimes"][0]["mounts"][0]["guest_device"]["serial"] = BOUNDARY.into();
+    observation["runtimes"][0]["volumes"][0]["devices"][0]["guest_device"]["serial"] =
+        BOUNDARY.into();
+    observation["runtimes"][0]["volumes"][0]["devices"][1]["guest_device"]["serial"] =
+        BOUNDARY.into();
+    refresh_inventory_digest(&mut observation);
+    decode_node_observation(&serde_json::to_vec(&observation).unwrap()).unwrap();
+
+    for pointer in [
+        "/runtimes/0/mounts/0/guest_device/serial",
+        "/runtimes/0/volumes/0/devices/0/guest_device/serial",
+    ] {
+        let mut invalid = observation.clone();
+        if pointer.contains("mounts") {
+            invalid["runtimes"][0]["mounts"][0]["guest_device"]["serial"] = TOO_LONG.into();
+        } else {
+            invalid["runtimes"][0]["volumes"][0]["devices"][0]["guest_device"]["serial"] =
+                TOO_LONG.into();
+        }
+        let error = decode_node_observation(&serde_json::to_vec(&invalid).unwrap()).unwrap_err();
+        assert_eq!(malformed(&error).0.as_str(), pointer);
+        assert_eq!(malformed(&error).1, MalformedProblem::InvalidValue);
+    }
+}
+
+#[test]
 fn array_identity_order_and_numeric_indices_are_deterministic() {
     let mut value = desired_value();
     let first = value["volumes"][0].clone();

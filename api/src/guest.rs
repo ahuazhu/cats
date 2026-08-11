@@ -14,6 +14,7 @@ use std::path::PathBuf;
 use crate::oci::{DeployOciRequest, OciDeployment};
 use crate::runtime_reconciliation::{
     GuestBootId, GuestDeviceIdentity, HostPath, Id, MountAccess, RandomId128,
+    GUEST_DEVICE_SERIAL_MAX_BYTES_V1,
 };
 
 pub const MAX_FRAME_BYTES: u32 = 16 * 1024 * 1024;
@@ -25,7 +26,10 @@ pub const GUEST_HOST_CONTROL_VSOCK_PORT_V1: u32 = 5_000;
 /// RuntimeReady is deliberately much smaller than exec/deploy traffic.  Both
 /// peers reject the length prefix before allocating the JSON body.
 pub const RUNTIME_READY_REQUEST_MAX_FRAME_BYTES_V1: u32 = 4 * 1024;
-pub const RUNTIME_READY_RESPONSE_MAX_FRAME_BYTES_V1: u32 = 64 * 1024;
+/// Covers the frozen 64-device/64-mount shape even when each observed path is
+/// at the shared HostPath boundary and needs JSON escaping, while remaining an
+/// independent quarter of the generic Guest control allocation ceiling.
+pub const RUNTIME_READY_RESPONSE_MAX_FRAME_BYTES_V1: u32 = 4 * 1024 * 1024;
 /// Matches the frozen Runtime Reconciliation V1 maximum of Root plus 63
 /// Persistent volumes. RuntimeReady must not narrow an otherwise legal
 /// Desired/StartRuntime device set.
@@ -383,6 +387,8 @@ impl RuntimeReadyResponseV1 {
         let mut device_paths = BTreeSet::new();
         let mut device_numbers = BTreeSet::new();
         let mut device_uuids = BTreeSet::new();
+        let mut device_slots = BTreeSet::new();
+        let mut device_serials = BTreeSet::new();
         let mut previous_device: Option<(u16, &str)> = None;
         for device in &self.devices {
             let key = (
@@ -393,7 +399,10 @@ impl RuntimeReadyResponseV1 {
                 return Err(RuntimeReadyContractError::DeviceOrder);
             }
             previous_device = Some(key);
-            if device.size_bytes == 0
+            if device.guest_device.serial.as_str().len() > GUEST_DEVICE_SERIAL_MAX_BYTES_V1
+                || device.size_bytes == 0
+                || !device_slots.insert(device.guest_device.slot)
+                || !device_serials.insert(device.guest_device.serial.as_str())
                 || !device_paths.insert(device.device_path.as_str())
                 || !device_numbers.insert((device.device_major, device.device_minor))
                 || !device_uuids.insert(device.filesystem_uuid.as_str())
@@ -565,12 +574,50 @@ mod tests {
             Err(RuntimeReadyContractError::DeviceOrder)
         );
 
+        let mut duplicate_slot = response.clone();
+        let mut second = duplicate_slot.devices[0].clone();
+        second.guest_device.serial = Id::new("cats-second").unwrap();
+        second.device_path = HostPath::new("/dev/vdb").unwrap();
+        second.device_minor = 16;
+        second.filesystem_uuid = RandomId128::new("55555555555555555555555555555555").unwrap();
+        duplicate_slot.devices.push(second);
+        assert_eq!(
+            duplicate_slot.validate_against(&request),
+            Err(RuntimeReadyContractError::DeviceFact)
+        );
+
+        let mut duplicate_serial = response.clone();
+        let mut second = duplicate_serial.devices[0].clone();
+        second.guest_device.slot = 1;
+        second.device_path = HostPath::new("/dev/vdb").unwrap();
+        second.device_minor = 16;
+        second.filesystem_uuid = RandomId128::new("55555555555555555555555555555555").unwrap();
+        duplicate_serial.devices.push(second);
+        assert_eq!(
+            duplicate_serial.validate_against(&request),
+            Err(RuntimeReadyContractError::DeviceFact)
+        );
+
         let mut drifted_mount = response;
         drifted_mount.mounts[0].filesystem_uuid =
             RandomId128::new("55555555555555555555555555555555").unwrap();
         assert_eq!(
             drifted_mount.validate_against(&request),
             Err(RuntimeReadyContractError::MountDevice)
+        );
+    }
+
+    #[test]
+    fn runtime_ready_v1_enforces_cloud_hypervisor_serial_bound() {
+        let request = ready_request();
+        let mut response = ready_response(&request);
+        response.devices[0].guest_device.serial = Id::new("12345678901234567890").unwrap();
+        response.validate_against(&request).unwrap();
+
+        response.devices[0].guest_device.serial = Id::new("123456789012345678901").unwrap();
+        assert_eq!(
+            response.validate_against(&request),
+            Err(RuntimeReadyContractError::DeviceFact)
         );
     }
 
@@ -605,6 +652,63 @@ mod tests {
         )
         .unwrap_err();
         assert_eq!(error.to_string(), "oversized frame");
+    }
+
+    #[test]
+    fn runtime_ready_response_cap_covers_the_maximum_legal_path_shape() {
+        fn maximum_path(index: usize) -> HostPath {
+            let suffix = format!("{index:02}");
+            let body = format!("{}{}", "\\".repeat(4_096 - 1 - suffix.len()), suffix);
+            HostPath::new(format!("/{body}")).unwrap()
+        }
+
+        let request = ready_request();
+        let mut response = ready_response(&request);
+        response.devices.clear();
+        response.mounts.clear();
+        for index in 0..RUNTIME_READY_MAX_DEVICES_V1 {
+            let filesystem_uuid = RandomId128::new(format!("{:032x}", index + 1)).unwrap();
+            let source_path = maximum_path(index);
+            let device_major = u32::MAX;
+            let device_minor = u32::MAX - u32::try_from(index).unwrap();
+            response.devices.push(RuntimeReadyDeviceV1 {
+                guest_device: GuestDeviceIdentity {
+                    serial: Id::new(format!("serial{index:014}")).unwrap(),
+                    slot: u16::MAX
+                        - u16::try_from(RUNTIME_READY_MAX_DEVICES_V1 - 1 - index).unwrap(),
+                },
+                device_path: source_path.clone(),
+                device_major,
+                device_minor,
+                size_bytes: u64::MAX,
+                filesystem_uuid: filesystem_uuid.clone(),
+            });
+            response.mounts.push(RuntimeReadyMountV1 {
+                device_major,
+                device_minor,
+                source_path,
+                filesystem_uuid,
+                mount_root: maximum_path(index),
+                mount_path: maximum_path(index),
+                filesystem_type: Id::new("x".repeat(128)).unwrap(),
+                access: MountAccess::ReadWrite,
+            });
+        }
+        response.validate_against(&request).unwrap();
+
+        let envelope = GuestResponse {
+            id: 1,
+            body: GuestResponseBody::RuntimeReady { ready: response },
+        };
+        let body = serde_json::to_vec(&envelope).unwrap();
+        assert!(body.len() > 64 * 1024);
+        assert!(body.len() <= RUNTIME_READY_RESPONSE_MAX_FRAME_BYTES_V1 as usize);
+        write_frame_with_limit(
+            &mut Vec::new(),
+            &envelope,
+            RUNTIME_READY_RESPONSE_MAX_FRAME_BYTES_V1,
+        )
+        .unwrap();
     }
 
     #[test]

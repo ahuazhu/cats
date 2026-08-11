@@ -15,7 +15,7 @@ use cats_api::runtime_reconciliation::{
     PrepareDeviceFrontend, ReconcileStep, RuntimeCheckpoint, RuntimeLaunchArtifact,
 };
 
-use crate::ch::{file_disk_arg, vhost_user_disk_arg};
+use crate::ch::{file_disk_arg_with_serial, vhost_user_disk_arg_with_serial};
 
 pub const VMM_LAUNCHER_CONTRACT_ARGUMENT: &str = "--contract-version=1";
 pub const VMM_PROCESS_TOKEN_ENVIRONMENT: &str = "CATS_VMM_PROCESS_IDENTITY_TOKEN";
@@ -153,16 +153,21 @@ impl VmmLauncherPlan {
                         !device_path.as_str().contains(','),
                         "kernel-NBD device path contains a Cloud Hypervisor separator"
                     );
-                    file_disk_arg(device_path.as_str(), *direct)
+                    file_disk_arg_with_serial(
+                        device_path.as_str(),
+                        *direct,
+                        device.guest_device.serial.as_str(),
+                    )?
                 }
                 PrepareDeviceFrontend::VhostUserBlk {
                     socket_path,
                     queues,
                     queue_size,
-                } => vhost_user_disk_arg(
+                } => vhost_user_disk_arg_with_serial(
                     Path::new(socket_path.as_str()),
                     usize::from(*queues),
                     *queue_size,
+                    device.guest_device.serial.as_str(),
                 )?,
             };
             arguments.push(OsString::from("--disk"));
@@ -1316,7 +1321,7 @@ mod tests {
         assert!(arguments.windows(2).any(|pair| pair
             == [
                 "--disk",
-                "vhost_user=on,socket=/run/cats/cat_01/root-vhost.sock,num_queues=2,queue_size=256"
+                "vhost_user=on,socket=/run/cats/cat_01/root-vhost.sock,num_queues=2,queue_size=256,serial=cats-root"
             ]));
         assert_eq!(
             &arguments[arguments.len() - 4..],
@@ -1355,9 +1360,11 @@ mod tests {
             .iter()
             .map(|value| value.to_str().unwrap())
             .collect::<Vec<_>>();
-        assert!(arguments
-            .windows(2)
-            .any(|pair| pair == ["--disk", "path=/dev/nbd7,image_type=raw,direct=on"]));
+        assert!(arguments.windows(2).any(|pair| pair
+            == [
+                "--disk",
+                "path=/dev/nbd7,image_type=raw,direct=on,serial=cats-root"
+            ]));
     }
 
     #[test]
