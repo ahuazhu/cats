@@ -686,6 +686,7 @@ mod tests {
     #[derive(Default)]
     struct TapCalls {
         created: Vec<String>,
+        configured: Vec<ChNetwork>,
         published: Vec<String>,
     }
 
@@ -703,10 +704,12 @@ mod tests {
         fn configure(
             &mut self,
             _ip_bin: &Path,
-            _network: &ChNetwork,
+            network: &ChNetwork,
             effect_context: &RuntimeDesiredEffectContext,
         ) -> anyhow::Result<()> {
-            effect_context.check_active()
+            effect_context.check_active()?;
+            self.calls.lock().unwrap().configured.push(network.clone());
+            Ok(())
         }
 
         fn publish(self: Box<Self>) -> anyhow::Result<()> {
@@ -1466,6 +1469,7 @@ mod tests {
         );
         let tap_calls = tap_calls.lock().unwrap();
         assert_eq!(tap_calls.created, vec![network.tap.clone()]);
+        assert_eq!(tap_calls.configured, vec![network.clone()]);
         assert_eq!(tap_calls.published, vec![network.tap.clone()]);
         drop(tap_calls);
         let ip_calls = std::fs::read_to_string(ip_log).unwrap();
@@ -1473,12 +1477,10 @@ mod tests {
             !ip_calls.contains("tuntap"),
             "production adapter fell back to command-line TAP creation"
         );
-        assert!(ip_calls.contains(&format!(
-            "addr add {}/{} dev {}",
-            network.config.gateway_ipv4.as_str(),
-            network.config.prefix_length,
-            network.tap
-        )));
+        assert!(
+            !ip_calls.contains("addr add") && !ip_calls.contains("link set"),
+            "production adapter fell back to name-based command-line TAP configuration"
+        );
 
         let outcome = effect
             .apply(launch_context(root.path(), &desired, &network), &desired)
