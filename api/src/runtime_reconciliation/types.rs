@@ -1272,25 +1272,11 @@ pub enum ReconcileStep {
         expected_provisioned_head: RemoteHead,
     },
     PrepareDevice {
-        volume_intent_id: Id,
-        disk_id: Id,
-        volume_id: Id,
-        disk_kind: DiskKind,
-        attachment_id: Id,
-        attachment_epoch: FenceEpoch,
-        acquire_origin: AcquireOrigin,
-        expected_head: RemoteHead,
-        size_bytes: u64,
-        durability: Durability,
-        guest_device: GuestDeviceIdentity,
-        /// This token belongs only to the Guest-visible device. It must never
-        /// be reused as the serving process identity token.
-        ownership_token: RandomId128,
-        /// Boxed only to keep the closed ReconcileStep/Condition enums bounded;
-        /// serde still emits the exact tagged union defined by the wire spec.
-        serving_authority: Box<ServingAuthorityProvenance>,
-        serving_process: ServingBlockdIdentity,
-        frontend: PrepareDeviceFrontend,
+        /// The complete canonical Guest device set.  The first
+        /// PrepareDevice checkpoint publishes this vector atomically after
+        /// every Desired volume has exact retained serving authorization; it
+        /// is never an append-only progress accumulator.
+        devices: Vec<PreparedDeviceInput>,
     },
     PrepareNetwork {
         network: RuntimeNetworkIdentity,

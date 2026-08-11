@@ -1079,8 +1079,8 @@ inode，并由前后有界的Node-global `/proc/[0-9]+/fd`枚举证明该MainPID
 inode holder。NBD与vhost listener都是
 单会话数据面；scanner不得以探测连接消费本应留给kernel client或VMM的会话。
 
-kernel-NBD的Host全局预留不是从一次旧inventory中挑一个看似空闲的path。planner在把
-`prepare_device.frontend.device_path`首次写入checkpoint时，必须取得一个descriptor-relative、regular、
+kernel-NBD的Host全局预留不是从一次旧inventory中逐盘挑看似空闲的path。planner在把完整
+`prepare_device.devices[*].frontend.device_path`首次写入checkpoint时，必须取得一个descriptor-relative、regular、
 single-link、exact `0600`的Node全局allocation flock；持锁期间重新完成以下闭合并把锁保持到checkpoint file及
 父目录fsync返回：
 
@@ -1095,14 +1095,21 @@ single-link、exact `0600`的Node全局allocation flock；持锁期间重新完�
    `-nonetlink -unix <persisted-listener> /dev/nbdN -b 512 -N ""` argv都闭合时才可成为provider-private
    `Serving` evidence；public device token仍必须来自同一serving blockd的exact authorized-serving handshake，
    不能从path、PID或argv猜出；
-4. 从`Free - durable reservations`按device index稳定选择一个path，只做一次checkpoint replace；同一轮不启动
-   blockd、不运行`nbd-client`。下一次accepted fresh full后，attach effect在同一allocation flock下重验current
-   checkpoint、exact listener及该slot仍Free，response loss后只靠新的full inventory采用exact Serving。
+4. 从同一个pool snapshot的`Free - durable reservations`按Guest slot/device index稳定选择完整path集合，验证
+   current+prospective集合全range、无重复、无foreign后只做一次checkpoint replace；pool不足或任一ABA均零CAS，
+   绝不逐盘CAS或跨锁拼装。同一轮不启动blockd、不运行`nbd-client`。下一次accepted fresh full后，attach effect
+   每轮只选择first-missing，并在同一allocation flock下重验current checkpoint、exact listener及该slot仍Free，
+   response loss后只靠新的full inventory采用exact Serving。
 
 所有会新增、迁移或移除kernel-NBD reservation的Runtime checkpoint replace都必须使用同一个allocation flock；
 旧product allocator不得与该切换composition并存。外部/晚到client即使绕过flock，也只能让后续scan产生Conflict，
 不能使Node把busy device交给第二个Cat。leaked device的disconnect、serving device的detach及token retirement分别
 使用checkpoint-first cleanup effect，不能夹在reserve或attach中。
+
+无论vhost还是kernel-NBD，完整PrepareDevice successor构造时可先按slot保留每卷descriptor-stable授权，但在最终
+checkpoint CAS（kernel-NBD为上述allocation-flock callback）内必须再次从同一retained目录复验canonical artifact
+bytes/inode，并fresh读取每个current `VolumeRecord`的owner/epoch/head/transition。任一第N卷漂移都必须在
+checkpoint publication前使整批失败，保持零reservation/零CAS；公开`ObservedVolume`不能替代这次private复验。
 
 serving blockd CLI必须从同一个已fsync的`prepare_device` step取得process token及独立device token；严格parser
 拒绝缺失、非canonical、相同token或control-only携device token，并要求恰好一种与closed frontend plan一致的
@@ -1555,21 +1562,7 @@ ReconcileStep =
   }
 | {
     kind: "prepare_device",
-    volume_intent_id: Id,
-    disk_id: Id,
-    volume_id: Id,
-    disk_kind: "root" | "persistent",
-    attachment_id: Id,
-    attachment_epoch: FenceEpoch,
-    acquire_origin: AcquireOrigin,
-    expected_head: RemoteHead,
-    size_bytes: integer 1..=9223372036854775807,
-    durability: "strict" | "relaxed",
-    guest_device: GuestDeviceIdentity,
-    ownership_token: RandomId128,
-    serving_authority: ServingAuthorityProvenance,
-    serving_process: ServingBlockdIdentity,
-    frontend: PrepareDeviceFrontend
+    devices: [PreparedDeviceInput; 1..=64]
   }
 | {
     kind: "prepare_network",
@@ -1841,8 +1834,10 @@ PreparedDeviceInput {
 `ownership_token`的target还要求full inventory中该token只出现一次且evidence为valid；
 missing/corrupt或同token出现在多个实例上都不得自动cleanup。
 
-`prepare_device`必须显式冻结`volume_intent_id`、`disk_id`、`volume_id`和`disk_kind`；Root必须绑定slot 0，
-Persistent不得绑定slot 0。`ownership_token`只属于最终Guest device；它不得等于
+`prepare_device.devices`必须在首个checkpoint中一次携带完整Desired卷集合，长度1..=64、slot严格从0连续、
+Root仅且必须为slot 0、其余全为Persistent；partial/missing/extra/reordered vector一律F0拒绝，不存在逐轮append
+或current-index accumulator。每项必须显式冻结`volume_intent_id`、`disk_id`、`volume_id`和`disk_kind`。
+`ownership_token`只属于最终Guest device；它不得等于
 `serving_process.process_identity_token`。`after_root_provision`、`existing_root`和`persistent_initialized`的
 `expected_head`必须是完整nonblank `RemoteHead`；只有`persistent_uninitialized`必须是exact blank head。磁盘
 类型与provenance/purpose同时closed：Root仅接受`after_root_provision|existing_root`，Persistent仅接受
@@ -3137,11 +3132,11 @@ checkpoint_content_digest = sha256:f1df3e1cfe83fdd0b4a4a5ead32f1ba71533cddbb38e2
 serving provenance、完整attachment lineage、彼此不同的process/device token及vhost frontend参数：
 
 ```json
-{"cat_id":"cat_01","desired_revision":7,"guest_transport":{"kind":"unavailable"},"lifecycle_admission":"closed","mounts":[],"networks":[],"node_id":"node_a","placement_epoch":3,"processes":[],"require_idle":{"kind":"not_applicable"},"route_gates":[],"runtime_incarnation":null,"runtime_launch":{"kind":"absent"},"spec_digest":"sha256:d1dc4a8ff5e5d2fa4239eb14a6ac3e825a5070bd0d646762f723507f11ec54ad","stable_state":null,"step":{"acquire_origin":{"kind":"normal","transition_id":"22222222222222222222222222222222"},"attachment_epoch":1,"attachment_id":"att_01","disk_id":"disk_root","disk_kind":"root","durability":"strict","expected_head":{"generation":1,"root_hash":"sha256:0000000000000000000000000000000000000000000000000000000000000000","root_object_id":"volumes/vol_root/roots/1"},"frontend":{"kind":"vhost_user_blk","queue_size":256,"queues":2,"socket_path":"/run/cats/cat_01/root-vhost.sock"},"guest_device":{"serial":"cats-root","slot":0},"kind":"prepare_device","ownership_token":"88888888888888888888888888888888","serving_authority":{"handoff":{"predecessor_checkpoint_content_digest":"sha256:f1df3e1cfe83fdd0b4a4a5ead32f1ba71533cddbb38e2dc354e0a277a92addcb","record":{"content_sha256":"sha256:3333333333333333333333333333333333333333333333333333333333333333","device":16777217,"inode":42,"length":1024,"path":"/var/lib/cats/handoffs/cat_01/root-serving.json"}},"kind":"after_root_provision"},"serving_process":{"control_socket_path":"/var/lib/cats/data/cat-cat_01/volume-vol_root/attachment-att_01/epoch-1/serving-control.sock","data_directory":"/var/lib/cats/data/cat-cat_01/volume-vol_root/attachment-att_01/epoch-1","executable_path":"/usr/bin/cats-blockd","process_identity_token":"77777777777777777777777777777777","scope_id":"cats-serving-77777777777777777777777777777777.service"},"size_bytes":4294967296,"volume_id":"vol_root","volume_intent_id":"vint_root"},"updated_at_unix_ms":1720000000000,"version":1,"volumes":[{"authority":{"attachment_epoch":1,"attachment_id":"att_01","head":{"generation":1,"root_hash":"sha256:0000000000000000000000000000000000000000000000000000000000000000","root_object_id":"volumes/vol_root/roots/1"},"kind":"owned"},"devices":[],"disk_id":"disk_root","disk_kind":"root","durability":"strict","local_lineages":[{"acquire_origin":{"kind":"normal","transition_id":"22222222222222222222222222222222"},"attachment_epoch":1,"attachment_id":"att_01","data_directory":"/var/lib/cats/data/cat-cat_01/volume-vol_root/attachment-att_01/epoch-1","fenced":false,"local_durable_generation":1,"node_id":"node_a","pending_pack_count":0,"placement_epoch":3,"remote_durable_generation":1,"state":"active"}],"size_bytes":4294967296,"volume_id":"vol_root","volume_intent_id":"vint_root"}],"warm_snapshot":{"kind":"absent"}}
+{"cat_id":"cat_01","desired_revision":7,"guest_transport":{"kind":"unavailable"},"lifecycle_admission":"closed","mounts":[],"networks":[],"node_id":"node_a","placement_epoch":3,"processes":[],"require_idle":{"kind":"not_applicable"},"route_gates":[],"runtime_incarnation":null,"runtime_launch":{"kind":"absent"},"spec_digest":"sha256:d1dc4a8ff5e5d2fa4239eb14a6ac3e825a5070bd0d646762f723507f11ec54ad","stable_state":null,"step":{"devices":[{"acquire_origin":{"kind":"normal","transition_id":"22222222222222222222222222222222"},"attachment_epoch":1,"attachment_id":"att_01","disk_id":"disk_root","disk_kind":"root","durability":"strict","expected_head":{"generation":1,"root_hash":"sha256:0000000000000000000000000000000000000000000000000000000000000000","root_object_id":"volumes/vol_root/roots/1"},"frontend":{"kind":"vhost_user_blk","queue_size":256,"queues":2,"socket_path":"/run/cats/cat_01/root-vhost.sock"},"guest_device":{"serial":"cats-root","slot":0},"ownership_token":"88888888888888888888888888888888","serving_authority":{"handoff":{"predecessor_checkpoint_content_digest":"sha256:f1df3e1cfe83fdd0b4a4a5ead32f1ba71533cddbb38e2dc354e0a277a92addcb","record":{"content_sha256":"sha256:3333333333333333333333333333333333333333333333333333333333333333","device":16777217,"inode":42,"length":1024,"path":"/var/lib/cats/handoffs/cat_01/root-serving.json"}},"kind":"after_root_provision"},"serving_process":{"control_socket_path":"/var/lib/cats/data/cat-cat_01/volume-vol_root/attachment-att_01/epoch-1/serving-control.sock","data_directory":"/var/lib/cats/data/cat-cat_01/volume-vol_root/attachment-att_01/epoch-1","executable_path":"/usr/bin/cats-blockd","process_identity_token":"77777777777777777777777777777777","scope_id":"cats-serving-77777777777777777777777777777777.service"},"size_bytes":4294967296,"volume_id":"vol_root","volume_intent_id":"vint_root"}],"kind":"prepare_device"},"updated_at_unix_ms":1720000000000,"version":1,"volumes":[{"authority":{"attachment_epoch":1,"attachment_id":"att_01","head":{"generation":1,"root_hash":"sha256:0000000000000000000000000000000000000000000000000000000000000000","root_object_id":"volumes/vol_root/roots/1"},"kind":"owned"},"devices":[],"disk_id":"disk_root","disk_kind":"root","durability":"strict","local_lineages":[{"acquire_origin":{"kind":"normal","transition_id":"22222222222222222222222222222222"},"attachment_epoch":1,"attachment_id":"att_01","data_directory":"/var/lib/cats/data/cat-cat_01/volume-vol_root/attachment-att_01/epoch-1","fenced":false,"local_durable_generation":1,"node_id":"node_a","pending_pack_count":0,"placement_epoch":3,"remote_durable_generation":1,"state":"active"}],"size_bytes":4294967296,"volume_id":"vol_root","volume_intent_id":"vint_root"}],"warm_snapshot":{"kind":"absent"}}
 ```
 
 ```text
-checkpoint_content_digest = sha256:b4e9dede555012beda172cea554c354c318ee9ab0fa750121d28f98075615244
+checkpoint_content_digest = sha256:393a4a5b06a3233cd2fdf01c84a062c083fd58b98711f5f168c397b4fa827cc2
 ```
 
 **PrepareNetwork checkpoint vector**使用同一个checkpoint-content domain。它持久network reservation和

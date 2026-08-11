@@ -353,25 +353,25 @@ impl RootProvisionProcessExpectation {
         desired: &DesiredRuntimeSpec,
         attempt: &RetainedRootProvisionProcessAttempt,
     ) -> anyhow::Result<Self> {
-        let ReconcileStep::PrepareDevice {
-            volume_id,
-            attachment_id,
-            attachment_epoch,
-            acquire_origin,
-            expected_head,
-            size_bytes,
-            durability,
-            serving_authority,
-            ..
-        } = &checkpoint.step
-        else {
+        let ReconcileStep::PrepareDevice { devices } = &checkpoint.step else {
             anyhow::bail!("retained Root handoff requires prepare_device")
         };
+        let mut roots =
+            devices.iter().filter(|device| {
+                matches!(
+            device.serving_authority.as_ref(),
+            cats_api::runtime_reconciliation::ServingAuthorityProvenance::AfterRootProvision { .. }
+        )
+            });
+        let device = roots
+            .next()
+            .context("retained Root handoff lacks its prepared device")?;
         anyhow::ensure!(
-            matches!(
-                serving_authority.as_ref(),
-                cats_api::runtime_reconciliation::ServingAuthorityProvenance::AfterRootProvision { .. }
-            ) && desired.cat_id == checkpoint.cat_id
+            roots.next().is_none(),
+            "retained Root handoff duplicates its prepared device"
+        );
+        anyhow::ensure!(
+            desired.cat_id == checkpoint.cat_id
                 && desired.placement.node_id == checkpoint.node_id
                 && desired.placement.placement_epoch == checkpoint.placement_epoch
                 && desired.desired_revision == checkpoint.desired_revision
@@ -381,17 +381,17 @@ impl RootProvisionProcessExpectation {
                 && attempt.placement_epoch == checkpoint.placement_epoch
                 && attempt.desired_revision == checkpoint.desired_revision
                 && attempt.spec_digest == checkpoint.spec_digest
-                && attempt.volume_id == *volume_id
-                && attempt.attachment_id == *attachment_id
-                && attempt.attachment_epoch == *attachment_epoch
-                && attempt.attachment.identity.volume_id == *volume_id
-                && attempt.attachment.identity.attachment_id == *attachment_id
-                && attempt.attachment.identity.attachment_epoch == *attachment_epoch
-                && attempt.attachment.identity.acquire_origin == *acquire_origin
-                && attempt.expected_provisioned_head == *expected_head
-                && attempt.attachment.head == *expected_head
-                && attempt.attachment.size_bytes == *size_bytes
-                && attempt.attachment.durability == *durability,
+                && attempt.volume_id == device.volume_id
+                && attempt.attachment_id == device.attachment_id
+                && attempt.attachment_epoch == device.attachment_epoch
+                && attempt.attachment.identity.volume_id == device.volume_id
+                && attempt.attachment.identity.attachment_id == device.attachment_id
+                && attempt.attachment.identity.attachment_epoch == device.attachment_epoch
+                && attempt.attachment.identity.acquire_origin == device.acquire_origin
+                && attempt.expected_provisioned_head == device.expected_head
+                && attempt.attachment.head == device.expected_head
+                && attempt.attachment.size_bytes == device.size_bytes
+                && attempt.attachment.durability == device.durability,
             "retained Root process attempt conflicts with current PrepareDevice authority"
         );
         anyhow::ensure!(

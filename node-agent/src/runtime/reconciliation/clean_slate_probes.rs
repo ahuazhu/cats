@@ -26,10 +26,11 @@ use std::time::{Duration, Instant};
 use anyhow::{bail, Context as _};
 use cats_api::chunk;
 use cats_api::runtime_reconciliation::{
-    checkpoint_content_digest, decode_runtime_checkpoint, DesiredRuntimeSpec, DiskKind, HostPath,
-    Id, InventorySource, ObservedDiskKind, ObservedVolume, ReconcileStep, RuntimeCheckpoint,
-    Sequence, Sha256Digest, VolumeAcquire, VolumeAdminState, VolumeAuthorityEvidence, VolumeIntent,
-    WireU64, RUNTIME_CHECKPOINT_MAX_WIRE_BYTES,
+    checkpoint_content_digest, decode_runtime_checkpoint, encode_desired_runtime_spec,
+    DesiredRuntimeSpec, DiskKind, HostPath, Id, InventorySource, ObservedDiskKind, ObservedVolume,
+    ReconcileStep, RuntimeCheckpoint, Sequence, Sha256Digest, VolumeAccess, VolumeAcquire,
+    VolumeAdminState, VolumeAuthorityEvidence, VolumeDisposition, VolumeIntent, WireU64,
+    RUNTIME_CHECKPOINT_MAX_WIRE_BYTES,
 };
 use cats_blockd::format::{decode_bitmap_header, BITMAP_HEADER_LEN};
 use cats_blockd::target_control::TARGET_CONTROL_AUTHORIZATION_MAX_BYTES;
@@ -2644,16 +2645,23 @@ fn scan_authorized_blockd_data(
                     provision_transition_id,
                     ..
                 } => provision_transition_id.clone(),
-                ReconcileStep::PrepareDevice {
-                    serving_authority, ..
-                } => {
+                ReconcileStep::PrepareDevice { devices } => {
+                    let mut roots = devices.iter().filter(|device| matches!(
+                        device.serving_authority.as_ref(),
+                        cats_api::runtime_reconciliation::ServingAuthorityProvenance::AfterRootProvision { .. }
+                    ));
+                    let root_device = roots.next().context(
+                        "PrepareDevice handoff artifacts lack their Root device",
+                    )?;
+                    anyhow::ensure!(
+                        roots.next().is_none(),
+                        "PrepareDevice handoff artifacts have duplicate Root devices"
+                    );
                     let cats_api::runtime_reconciliation::ServingAuthorityProvenance::AfterRootProvision {
                         handoff,
-                    } = serving_authority.as_ref()
+                    } = root_device.serving_authority.as_ref()
                     else {
-                        bail!(
-                            "direct authorized attachment cannot retain root-provision handoff artifacts"
-                        )
+                        unreachable!("root filter selected after-root-provision authority")
                     };
                     let Some(entry) = by_name.get(SERVING_HANDOFF_RECORD_FILE) else {
                         bail!("after-root-provision checkpoint lacks its sealed handoff record")
@@ -4392,28 +4400,32 @@ fn supported_desired_volumes(
 ) -> anyhow::Result<Option<BTreeMap<Id, (&DesiredRuntimeSpec, &VolumeIntent)>>> {
     let mut volumes = BTreeMap::new();
     for desired in &context.coordinates().desired.desired_specs {
-        if desired.target != cats_api::runtime_reconciliation::RuntimeTarget::Running {
-            return Ok(None);
-        }
-        if desired.volumes.is_empty() {
-            continue;
-        }
-        if desired.volumes.len() != 1 {
-            return Ok(None);
-        }
-        let intent = &desired.volumes[0];
-        if intent.disk_kind != DiskKind::Root
-            || intent.mount.is_some()
-            || !matches!(intent.acquire, VolumeAcquire::Normal { .. })
+        if desired.target != cats_api::runtime_reconciliation::RuntimeTarget::Running
+            || encode_desired_runtime_spec(desired).is_err()
         {
             return Ok(None);
         }
-        anyhow::ensure!(
-            volumes
-                .insert(intent.volume_id.clone(), (desired, intent))
-                .is_none(),
-            "one authority Volume is referenced by multiple Desired Runtimes"
-        );
+        if desired.volumes.is_empty() || desired.volumes.len() > 64 {
+            return Ok(None);
+        }
+        for (index, intent) in desired.volumes.iter().enumerate() {
+            let shape_is_exact = usize::from(intent.guest_device.slot) == index
+                && intent.access == VolumeAccess::ReadWriteOnce
+                && matches!(intent.disposition, VolumeDisposition::Retain)
+                && match index {
+                    0 => intent.disk_kind == DiskKind::Root && intent.mount.is_none(),
+                    _ => intent.disk_kind == DiskKind::Persistent && intent.mount.is_some(),
+                };
+            if !shape_is_exact {
+                return Ok(None);
+            }
+            anyhow::ensure!(
+                volumes
+                    .insert(intent.volume_id.clone(), (desired, intent))
+                    .is_none(),
+                "one authority Volume is referenced by multiple Desired Runtimes"
+            );
+        }
     }
     Ok(Some(volumes))
 }
@@ -4455,30 +4467,36 @@ fn observe_desired_volume(
                 "Desired Volume is owned by an untyped foreign attachment"
             );
         } else {
-            let VolumeAcquire::Normal {
-                transition_id,
-                expected_unowned_epoch,
-            } = &intent.acquire
-            else {
-                anyhow::bail!("the first Running slice supports only normal acquire")
+            let current_marker_matches = match (&intent.acquire, &record.last_transition) {
+                (
+                    VolumeAcquire::Normal {
+                        transition_id,
+                        expected_unowned_epoch,
+                    },
+                    Some(cats_api::runtime_reconciliation::LastVolumeTransition::NormalAcquire {
+                        request,
+                        result,
+                    }),
+                ) => {
+                    request.volume_id == intent.volume_id
+                        && request.transition_id == *transition_id
+                        && request.attachment_id == intent.attachment_id
+                        && request.expected_unowned_epoch == *expected_unowned_epoch
+                        && request.desired_revision == desired.desired_revision
+                        && request.placement_epoch == desired.placement.placement_epoch
+                        && result.volume_id == intent.volume_id
+                        && result.transition_id == *transition_id
+                        && result.attachment_id == intent.attachment_id
+                        && result.resulting_epoch == record.lease_epoch
+                }
+                (
+                    VolumeAcquire::Takeover { authorization_id },
+                    Some(cats_api::runtime_reconciliation::LastVolumeTransition::Takeover {
+                        authorization_id: observed,
+                    }),
+                ) => observed == authorization_id,
+                _ => false,
             };
-            let Some(cats_api::runtime_reconciliation::LastVolumeTransition::NormalAcquire {
-                request,
-                result,
-            }) = &record.last_transition
-            else {
-                anyhow::bail!("Desired attachment owner lacks its exact normal-acquire receipt")
-            };
-            let current_marker_matches = request.volume_id == intent.volume_id
-                && request.transition_id == *transition_id
-                && request.attachment_id == intent.attachment_id
-                && request.expected_unowned_epoch == *expected_unowned_epoch
-                && request.desired_revision == desired.desired_revision
-                && request.placement_epoch == desired.placement.placement_epoch
-                && result.volume_id == intent.volume_id
-                && result.transition_id == *transition_id
-                && result.attachment_id == intent.attachment_id
-                && result.resulting_epoch == record.lease_epoch;
             let stale_marker_matches =
                 stale_request.is_some_and(|stale| stale_normal_marker_matches(record, stale));
             anyhow::ensure!(
@@ -4510,7 +4528,10 @@ fn observe_desired_volume(
         volume_intent_id: Some(intent.volume_intent_id.clone()),
         disk_id: Some(intent.disk_id.clone()),
         volume_id: intent.volume_id.clone(),
-        disk_kind: ObservedDiskKind::Root,
+        disk_kind: match intent.disk_kind {
+            DiskKind::Root => ObservedDiskKind::Root,
+            DiskKind::Persistent => ObservedDiskKind::Persistent,
+        },
         size_bytes: Some(record.size_bytes),
         durability: Some(record.durability),
         authority,
@@ -10401,46 +10422,51 @@ mod tests {
         let data_directory =
             HostPath::new(fixture.data_directory.to_string_lossy().into_owned()).unwrap();
         checkpoint.step = ReconcileStep::PrepareDevice {
-            volume_intent_id: volume.volume_intent_id.clone(),
-            disk_id: volume.disk_id.clone(),
-            volume_id: volume.volume_id.clone(),
-            disk_kind: volume.disk_kind,
-            attachment_id: attachment.identity.attachment_id.clone(),
-            attachment_epoch: attachment.identity.attachment_epoch,
-            acquire_origin: attachment.identity.acquire_origin.clone(),
-            expected_head: fixture.record.head.clone(),
-            size_bytes: attachment.size_bytes,
-            durability: attachment.durability,
-            guest_device: volume.guest_device.clone(),
-            ownership_token: RandomId128::new("cccccccccccccccccccccccccccccccc").unwrap(),
-            serving_authority: Box::new(ServingAuthorityProvenance::AfterRootProvision { handoff }),
-            serving_process: ServingBlockdIdentity {
-                scope_id: Id::new("cats-serving-dddddddddddddddddddddddddddddddd.service").unwrap(),
-                control_socket_path: HostPath::new(
-                    fixture
-                        .data_directory
-                        .join("serving-control.sock")
-                        .to_string_lossy()
-                        .into_owned(),
-                )
-                .unwrap(),
-                data_directory,
-                executable_path: fixture.expected.executable_path.clone(),
-                process_identity_token: RandomId128::new("dddddddddddddddddddddddddddddddd")
+            devices: vec![PreparedDeviceInput {
+                volume_intent_id: volume.volume_intent_id.clone(),
+                disk_id: volume.disk_id.clone(),
+                volume_id: volume.volume_id.clone(),
+                disk_kind: volume.disk_kind,
+                attachment_id: attachment.identity.attachment_id.clone(),
+                attachment_epoch: attachment.identity.attachment_epoch,
+                acquire_origin: attachment.identity.acquire_origin.clone(),
+                expected_head: fixture.record.head.clone(),
+                size_bytes: attachment.size_bytes,
+                durability: attachment.durability,
+                guest_device: volume.guest_device.clone(),
+                ownership_token: RandomId128::new("cccccccccccccccccccccccccccccccc").unwrap(),
+                serving_authority: Box::new(ServingAuthorityProvenance::AfterRootProvision {
+                    handoff,
+                }),
+                serving_process: ServingBlockdIdentity {
+                    scope_id: Id::new("cats-serving-dddddddddddddddddddddddddddddddd.service")
+                        .unwrap(),
+                    control_socket_path: HostPath::new(
+                        fixture
+                            .data_directory
+                            .join("serving-control.sock")
+                            .to_string_lossy()
+                            .into_owned(),
+                    )
                     .unwrap(),
-            },
-            frontend: PrepareDeviceFrontend::VhostUserBlk {
-                socket_path: HostPath::new(
-                    fixture
-                        .data_directory
-                        .join("serving-vhost.sock")
-                        .to_string_lossy()
-                        .into_owned(),
-                )
-                .unwrap(),
-                queues: 2,
-                queue_size: 256,
-            },
+                    data_directory,
+                    executable_path: fixture.expected.executable_path.clone(),
+                    process_identity_token: RandomId128::new("dddddddddddddddddddddddddddddddd")
+                        .unwrap(),
+                },
+                frontend: PrepareDeviceFrontend::VhostUserBlk {
+                    socket_path: HostPath::new(
+                        fixture
+                            .data_directory
+                            .join("serving-vhost.sock")
+                            .to_string_lossy()
+                            .into_owned(),
+                    )
+                    .unwrap(),
+                    queues: 2,
+                    queue_size: 256,
+                },
+            }],
         };
         let observed = checkpoint.volumes.first_mut().unwrap();
         observed.authority = VolumeAuthorityEvidence::Owned {
@@ -10609,19 +10635,14 @@ mod tests {
             let mut poisoned = live.stored.checkpoint().clone();
             let observed = poisoned.volumes.first_mut().unwrap();
             match (&mut poisoned.step, field) {
-                (
-                    ReconcileStep::PrepareDevice {
-                        volume_intent_id, ..
-                    },
-                    "volume_intent_id",
-                ) => {
+                (ReconcileStep::PrepareDevice { devices }, "volume_intent_id") => {
                     let foreign = Id::new("vint_foreign").unwrap();
-                    *volume_intent_id = foreign.clone();
+                    devices[0].volume_intent_id = foreign.clone();
                     observed.volume_intent_id = Some(foreign);
                 }
-                (ReconcileStep::PrepareDevice { disk_id, .. }, "disk_id") => {
+                (ReconcileStep::PrepareDevice { devices }, "disk_id") => {
                     let foreign = Id::new("disk_foreign").unwrap();
-                    *disk_id = foreign.clone();
+                    devices[0].disk_id = foreign.clone();
                     observed.disk_id = Some(foreign);
                 }
                 _ => panic!("unexpected prepared-device fixture or mutation field"),
@@ -11339,13 +11360,10 @@ mod tests {
 
         let current = checkpoint_store.load().unwrap().unwrap();
         let mut drifted = successor.clone();
-        let ReconcileStep::PrepareDevice {
-            serving_process, ..
-        } = &mut drifted.step
-        else {
+        let ReconcileStep::PrepareDevice { devices } = &mut drifted.step else {
             unreachable!()
         };
-        serving_process.data_directory = HostPath::new(
+        devices[0].serving_process.data_directory = HostPath::new(
             fixture
                 .data_directory
                 .join("drifted")
@@ -11364,13 +11382,10 @@ mod tests {
         let authorization_path = fixture.data_directory.join(AUTHORIZED_SERVING_FILE);
         let authorization_bytes = std::fs::read(&authorization_path).unwrap();
         let metadata = std::fs::metadata(&authorization_path).unwrap();
-        let ReconcileStep::PrepareDevice {
-            serving_authority, ..
-        } = &mut direct.step
-        else {
+        let ReconcileStep::PrepareDevice { devices } = &mut direct.step else {
             unreachable!()
         };
-        **serving_authority = ServingAuthorityProvenance::DirectAuthorizedAttachment {
+        *devices[0].serving_authority = ServingAuthorityProvenance::DirectAuthorizedAttachment {
             authorization: DirectAuthorizedAttachmentIdentity {
                 path: HostPath::new(authorization_path.to_string_lossy().into_owned()).unwrap(),
                 device: WireU64::new(metadata.dev()).unwrap(),

@@ -19,8 +19,8 @@ use cats_api::runtime_reconciliation::{
     GuestTransportEvidence, LifecycleAdmission, ObservedDevice, ObservedDiskKind,
     ObservedRuntimeStatus, ObservedVolume, OwnershipTokenEvidence, PrepareDeviceFrontend,
     PreparedDeviceInput, ProcessRole, ProcessState, ProgressingReason, ReconcileStep,
-    RuntimeTarget, RuntimeTransition, ServingAuthorityProvenance, VolumeAccess, VolumeAcquire,
-    VolumeAuthorityEvidence, VolumeDisposition, WarmSnapshotEvidence,
+    RuntimeTarget, RuntimeTransition, ServingAuthorityProvenance, VolumeAcquire,
+    VolumeAuthorityEvidence, WarmSnapshotEvidence,
 };
 use cats_storage::authority::{VolumeDataAuthority, VolumeRecord};
 
@@ -86,16 +86,20 @@ impl PrepareDeviceTargetRetirementEffect {
         let Some(runtime) = unique_runtime(&accepted.observation().runtimes, desired)? else {
             return Ok(None);
         };
-        if !matches!(
-            &runtime.step,
-            ReconcileStep::PrepareDevice {
-                serving_authority,
-                ..
-            } if matches!(
-                serving_authority.as_ref(),
-                ServingAuthorityProvenance::AfterRootProvision { .. }
-            )
-        ) {
+        let ReconcileStep::PrepareDevice { devices } = &runtime.step else {
+            return Ok(None);
+        };
+        if devices
+            .iter()
+            .filter(|device| {
+                matches!(
+                    device.serving_authority.as_ref(),
+                    ServingAuthorityProvenance::AfterRootProvision { .. }
+                )
+            })
+            .count()
+            != 1
+        {
             return Ok(None);
         }
         if !prepare_device_base_admission_is_exact(accepted, desired, runtime) {
@@ -133,7 +137,11 @@ impl PrepareDeviceTargetRetirementEffect {
             .assert_current(&stored)
             .context("retain current PrepareDevice checkpoint through exact stop")?;
 
-        let [desired_volume] = desired.volumes.as_slice() else {
+        let Some(desired_volume) = desired
+            .volumes
+            .iter()
+            .find(|volume| volume.disk_kind == DiskKind::Root)
+        else {
             return Ok(Some(stop_local()));
         };
         let authority = match self.authority.load_volume(&desired_volume.volume_id) {
@@ -194,7 +202,11 @@ impl PrepareDeviceTargetRetirementEffect {
             _ => return Ok(Some(stop_local())),
         };
         if !matches!(accepted_process, AcceptedProcess::Serving)
-            && !runtime.volumes[0].devices.is_empty()
+            && runtime
+                .volumes
+                .iter()
+                .find(|volume| volume.volume_id == desired_volume.volume_id)
+                .is_none_or(|volume| !volume.devices.is_empty())
         {
             return Ok(Some(stop_local()));
         }
@@ -302,58 +314,11 @@ pub(super) fn unique_runtime<'a>(
     Ok(Some(runtime))
 }
 
-pub(super) fn prepared_device_input_from_step(
-    step: &ReconcileStep,
-) -> anyhow::Result<PreparedDeviceInput> {
-    if let ReconcileStep::PrepareNetwork { devices, .. } = step {
-        let [device] = devices.as_slice() else {
-            anyhow::bail!("PrepareNetwork must retain exactly one prepared device")
-        };
-        return Ok(device.clone());
-    }
-    let ReconcileStep::PrepareDevice {
-        volume_intent_id,
-        disk_id,
-        volume_id,
-        disk_kind,
-        attachment_id,
-        attachment_epoch,
-        acquire_origin,
-        expected_head,
-        size_bytes,
-        durability,
-        guest_device,
-        ownership_token,
-        serving_authority,
-        serving_process,
-        frontend,
-    } = step
-    else {
-        anyhow::bail!("prepared-device projection requires PrepareDevice or PrepareNetwork")
-    };
-    Ok(PreparedDeviceInput {
-        volume_intent_id: volume_intent_id.clone(),
-        disk_id: disk_id.clone(),
-        volume_id: volume_id.clone(),
-        disk_kind: *disk_kind,
-        attachment_id: attachment_id.clone(),
-        attachment_epoch: *attachment_epoch,
-        acquire_origin: acquire_origin.clone(),
-        expected_head: expected_head.clone(),
-        size_bytes: *size_bytes,
-        durability: *durability,
-        guest_device: guest_device.clone(),
-        ownership_token: ownership_token.clone(),
-        serving_authority: serving_authority.clone(),
-        serving_process: serving_process.clone(),
-        frontend: frontend.clone(),
-    })
-}
-
 pub(super) fn prepared_device_inputs_from_step(
     step: &ReconcileStep,
 ) -> anyhow::Result<Vec<PreparedDeviceInput>> {
-    if let ReconcileStep::PrepareNetwork { devices, .. }
+    if let ReconcileStep::PrepareDevice { devices }
+    | ReconcileStep::PrepareNetwork { devices, .. }
     | ReconcileStep::StartRuntime { devices, .. } = step
     {
         anyhow::ensure!(
@@ -362,7 +327,45 @@ pub(super) fn prepared_device_inputs_from_step(
         );
         return Ok(devices.clone());
     }
-    Ok(vec![prepared_device_input_from_step(step)?])
+    anyhow::bail!("prepared-device projection requires a prepared-device phase")
+}
+
+pub(super) fn prepared_device_set_is_exact(
+    desired: &DesiredRuntimeSpec,
+    devices: &[PreparedDeviceInput],
+) -> bool {
+    desired.volumes.len() == devices.len()
+        && desired
+            .volumes
+            .iter()
+            .zip(devices)
+            .enumerate()
+            .all(|(index, (intent, device))| {
+                usize::from(intent.guest_device.slot) == index
+                    && intent.volume_intent_id == device.volume_intent_id
+                    && intent.disk_id == device.disk_id
+                    && intent.volume_id == device.volume_id
+                    && intent.disk_kind == device.disk_kind
+                    && intent.attachment_id == device.attachment_id
+                    && intent.size_bytes == device.size_bytes
+                    && intent.durability == device.durability
+                    && intent.guest_device == device.guest_device
+                    && match (&intent.acquire, &device.acquire_origin) {
+                        (
+                            VolumeAcquire::Normal { transition_id, .. },
+                            AcquireOrigin::Normal {
+                                transition_id: observed,
+                            },
+                        ) => transition_id == observed,
+                        (
+                            VolumeAcquire::Takeover { authorization_id },
+                            AcquireOrigin::Takeover {
+                                authorization_id: observed,
+                            },
+                        ) => authorization_id == observed,
+                        _ => false,
+                    }
+            })
 }
 
 /// Close the public and durable projections of one prepared device against
@@ -482,32 +485,7 @@ pub(super) fn prepare_device_base_admission_is_exact(
         placement: desired.placement.clone(),
         target: desired.target,
     };
-    let ReconcileStep::PrepareDevice {
-        serving_authority,
-        serving_process,
-        ..
-    } = &runtime.step
-    else {
-        return false;
-    };
-    let Ok(prepared_device) = prepared_device_input_from_step(&runtime.step) else {
-        return false;
-    };
-    let [desired_volume] = desired.volumes.as_slice() else {
-        return false;
-    };
-    let [observed_volume] = runtime.volumes.as_slice() else {
-        return false;
-    };
-    let [lineage] = observed_volume.local_lineages.as_slice() else {
-        return false;
-    };
-    let VolumeAuthorityEvidence::Owned {
-        attachment_id: observed_attachment,
-        attachment_epoch: observed_epoch,
-        head: observed_head,
-    } = &observed_volume.authority
-    else {
+    let ReconcileStep::PrepareDevice { devices } = &runtime.step else {
         return false;
     };
     encode_desired_runtime_spec(desired).is_ok()
@@ -516,16 +494,15 @@ pub(super) fn prepare_device_base_admission_is_exact(
         && desired.target == RuntimeTarget::Running
         && matches!(desired.transition, RuntimeTransition::CancelAndDrain)
         && desired.placement.node_id == accepted.session().node_id
-        && desired_volume.disk_kind == DiskKind::Root
-        && desired_volume.access == VolumeAccess::ReadWriteOnce
-        && matches!(desired_volume.acquire, VolumeAcquire::Normal { .. })
-        && matches!(desired_volume.disposition, VolumeDisposition::Retain)
-        && desired_volume.mount.is_none()
-        && matches!(
-            serving_authority.as_ref(),
-            ServingAuthorityProvenance::AfterRootProvision { .. }
-        )
-        && serving_process.data_directory == lineage.data_directory
+        && prepared_device_set_is_exact(desired, devices)
+        && runtime.volumes.len() == devices.len()
+        && devices.iter().all(|device| {
+            runtime
+                .volumes
+                .iter()
+                .find(|observed| observed.volume_id == device.volume_id)
+                .is_some_and(|observed| prepared_device_input_is_exact(device, desired, observed))
+        })
         && observation.complete_inventory
         && observation.node_id == accepted.session().node_id
         && observation.node_boot_id == accepted.session().node_boot_id
@@ -541,7 +518,7 @@ pub(super) fn prepare_device_base_admission_is_exact(
         && runtime.applied_desired.as_ref() == Some(&expected_applied)
         && runtime.runtime_incarnation.is_none()
         && runtime.stable_state.is_none()
-        && runtime.processes.len() <= 1
+        && runtime.processes.len() <= devices.len()
         && runtime.mounts.is_empty()
         && runtime.networks.is_empty()
         && matches!(runtime.guest_transport, GuestTransportEvidence::Unavailable)
@@ -555,12 +532,6 @@ pub(super) fn prepare_device_base_admission_is_exact(
                     step: runtime.step.clone(),
                 },
             }]
-        && prepared_device_input_is_exact(&prepared_device, desired, observed_volume)
-        && *observed_attachment == prepared_device.attachment_id
-        && *observed_epoch == prepared_device.attachment_epoch
-        && *observed_head == prepared_device.expected_head
-        && lineage.attachment_id == prepared_device.attachment_id
-        && lineage.attachment_epoch == prepared_device.attachment_epoch
 }
 
 fn public_process_matches_expectation(
@@ -615,7 +586,10 @@ mod tests {
     fn prepared_device_exactness_rejects_paired_foreign_logical_ids() {
         let desired = decode_desired_runtime_spec(DESIRED).unwrap();
         let checkpoint = decode_runtime_checkpoint(PREPARE_DEVICE).unwrap();
-        let device = prepared_device_input_from_step(&checkpoint.step).unwrap();
+        let [device] = prepared_device_inputs_from_step(&checkpoint.step)
+            .unwrap()
+            .try_into()
+            .unwrap();
         let observed = checkpoint.volumes.first().unwrap();
         assert!(prepared_device_input_is_exact(&device, &desired, observed));
 

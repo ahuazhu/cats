@@ -920,12 +920,10 @@ fn root_process_expectations(
         }
         let needs_root_process_bridge = match &checkpoint.checkpoint.step {
             ReconcileStep::ProvisionRootImage { .. } => true,
-            ReconcileStep::PrepareDevice {
-                serving_authority, ..
-            } => matches!(
-                serving_authority.as_ref(),
+            ReconcileStep::PrepareDevice { devices } => devices.iter().any(|device| matches!(
+                device.serving_authority.as_ref(),
                 cats_api::runtime_reconciliation::ServingAuthorityProvenance::AfterRootProvision { .. }
-            ),
+            )),
             ReconcileStep::PrepareNetwork { .. } => true,
             _ => false,
         };
@@ -1152,19 +1150,12 @@ fn runtime_from_inventory(
                 .as_ref()
                 .is_some_and(|release| release.generation == head.generation),
             (
-                ReconcileStep::PrepareDevice {
-                    expected_head,
-                    serving_authority,
-                    ..
-                },
+                ReconcileStep::PrepareDevice { devices },
                 VolumeAuthorityEvidence::Owned { head, .. },
-            ) if matches!(
-                serving_authority.as_ref(),
-                cats_api::runtime_reconciliation::ServingAuthorityProvenance::AfterRootProvision { .. }
-            ) =>
-            {
-                head == expected_head
-            }
+            ) => devices
+                .iter()
+                .find(|device| device.volume_id == volume.volume_id)
+                .is_some_and(|device| &device.expected_head == head),
             (
                 ReconcileStep::PrepareNetwork { devices, .. },
                 VolumeAuthorityEvidence::Owned { head, .. },
@@ -1681,13 +1672,12 @@ fn validate_scanned_checkpoint(
                 );
             }
         }
-        ReconcileStep::PrepareDevice {
-            serving_authority, ..
-        } if binding == DesiredCheckpointBinding::Current
-            && matches!(
-                serving_authority.as_ref(),
-                cats_api::runtime_reconciliation::ServingAuthorityProvenance::AfterRootProvision { .. }
-            ) =>
+        ReconcileStep::PrepareDevice { devices }
+            if binding == DesiredCheckpointBinding::Current
+                && devices.iter().any(|device| matches!(
+                    device.serving_authority.as_ref(),
+                    cats_api::runtime_reconciliation::ServingAuthorityProvenance::AfterRootProvision { .. }
+                )) =>
         {
             validate_current_prepared_checkpoint(desired, checkpoint, blockds, true)?
         }

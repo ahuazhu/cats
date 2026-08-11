@@ -312,7 +312,8 @@ impl SignedRunningEffect {
                 target_process,
                 executable_path.clone(),
             )?,
-            prepare_device: ServingPrepareDeviceEffect::new(prepare_frontend, executable_path)?,
+            prepare_device: ServingPrepareDeviceEffect::new(prepare_frontend, executable_path)?
+                .with_volume_authority(Arc::clone(&authority)),
             prepare_device_retirement: Some(prepare_device_retirement),
             serving_process: Some(serving_process_effect),
             kernel_nbd_attach,
@@ -369,6 +370,12 @@ impl RuntimeDesiredEffect for SignedRunningEffect {
             if let Some(outcome) = physical_start_runtime.try_apply(&context, desired)? {
                 return Ok(outcome);
             }
+        }
+        if let Some(outcome) = self
+            .prepare_device
+            .try_persist_direct_existing(&context, desired)?
+        {
+            return Ok(outcome);
         }
         match self.handoff.try_apply(&context, desired)? {
             ServingHandoffEffectProgress::NotApplicable => {}
@@ -524,7 +531,11 @@ impl SignedRootProvisionEffect {
             return Ok(Some(stop_local()));
         }
 
-        let [volume] = desired.volumes.as_slice() else {
+        let Some(volume) = desired
+            .volumes
+            .first()
+            .filter(|volume| volume.disk_kind == DiskKind::Root && volume.guest_device.slot == 0)
+        else {
             return Ok(Some(stop_local()));
         };
         let (blank, target) =
@@ -1138,16 +1149,19 @@ fn current_provision_admission_is_exact(
 ) -> bool {
     desired.target == RuntimeTarget::Running
         && matches!(desired.transition, RuntimeTransition::CancelAndDrain)
-        && desired.volumes.len() == 1
-        && desired.volumes.iter().all(|volume| {
+        && (1..=64).contains(&desired.volumes.len())
+        && desired.volumes.iter().enumerate().all(|(index, volume)| {
             matches!(volume.acquire, VolumeAcquire::Normal { .. })
-                && volume.disk_kind == DiskKind::Root
                 && volume.access == VolumeAccess::ReadWriteOnce
-                && volume.mount.is_none()
                 && matches!(volume.disposition, VolumeDisposition::Retain)
+                && usize::from(volume.guest_device.slot) == index
+                && match index {
+                    0 => volume.disk_kind == DiskKind::Root && volume.mount.is_none(),
+                    _ => volume.disk_kind == DiskKind::Persistent && volume.mount.is_some(),
+                }
         })
         && runtime.processes.len() <= 1
-        && runtime.volumes.len() == 1
+        && runtime.volumes.len() == desired.volumes.len()
 }
 
 fn observed_lineage(
@@ -1158,9 +1172,10 @@ fn observed_lineage(
     AttachmentLineageIdentity,
     cats_api::runtime_reconciliation::RemoteHead,
 )> {
-    let [observed] = runtime.volumes.as_slice() else {
-        return None;
-    };
+    let observed = runtime
+        .volumes
+        .iter()
+        .find(|observed| observed.volume_id == volume.volume_id)?;
     let [lineage] = observed.local_lineages.as_slice() else {
         return None;
     };
@@ -2223,9 +2238,9 @@ mod tests {
                     &self.authority.record().head,
                     match &self.checkpoint.step {
                         ReconcileStep::ProvisionRootImage { data_directory, .. } => data_directory,
-                        ReconcileStep::PrepareDevice {
-                            serving_process, ..
-                        } => &serving_process.data_directory,
+                        ReconcileStep::PrepareDevice { devices } => {
+                            &devices[0].serving_process.data_directory
+                        }
                         _ => unreachable!(),
                     },
                 )],
@@ -2726,26 +2741,25 @@ mod tests {
         .load()
         .unwrap()
         .unwrap();
-        let ReconcileStep::PrepareDevice {
-            ownership_token,
-            serving_process,
-            serving_authority,
-            frontend,
-            ..
-        } = &prepared.checkpoint().step
-        else {
+        let ReconcileStep::PrepareDevice { devices } = &prepared.checkpoint().step else {
             panic!("third fresh target admission must perform only the Ready CAS")
         };
-        assert_ne!(ownership_token, &serving_process.process_identity_token);
+        let [device] = devices.as_slice() else {
+            panic!("single-Root fixture must prepare one device")
+        };
+        assert_ne!(
+            &device.ownership_token,
+            &device.serving_process.process_identity_token
+        );
         assert!(matches!(
-            serving_authority.as_ref(),
+            device.serving_authority.as_ref(),
             cats_api::runtime_reconciliation::ServingAuthorityProvenance::AfterRootProvision { .. }
         ));
         let cats_api::runtime_reconciliation::PrepareDeviceFrontend::VhostUserBlk {
             queues,
             queue_size,
             ..
-        } = frontend
+        } = &device.frontend
         else {
             panic!("production PrepareDevice must select vhost-user-blk")
         };

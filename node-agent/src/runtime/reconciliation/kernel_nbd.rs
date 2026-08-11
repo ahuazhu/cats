@@ -822,22 +822,16 @@ struct KernelNbdReservationIdentity {
     ownership_token: RandomId128,
 }
 
-fn reservation_from_prepare_device(checkpoint: &RuntimeCheckpoint) -> Result<KernelNbdReservation> {
-    let ReconcileStep::PrepareDevice {
-        volume_id,
-        ownership_token,
-        frontend: PrepareDeviceFrontend::KernelNbd { device_path, .. },
-        ..
-    } = &checkpoint.step
-    else {
+fn reservations_from_prepare_device(
+    checkpoint: &RuntimeCheckpoint,
+) -> Result<Vec<KernelNbdReservation>> {
+    let ReconcileStep::PrepareDevice { devices } = &checkpoint.step else {
         anyhow::bail!("checkpoint is not a kernel-NBD PrepareDevice reservation");
     };
-    Ok(KernelNbdReservation {
-        cat_id: checkpoint.cat_id.clone(),
-        volume_id: volume_id.clone(),
-        device_path: device_path.clone(),
-        ownership_token: ownership_token.clone(),
-    })
+    Ok(devices
+        .iter()
+        .filter_map(|device| reservation_from_prepared_device(&checkpoint.cat_id, device))
+        .collect())
 }
 
 fn reservation_from_prepared_device(
@@ -905,19 +899,10 @@ impl KernelNbdReservations {
     }
 
     fn insert_checkpoint(&mut self, checkpoint: &RuntimeCheckpoint) -> Result<()> {
-        if let ReconcileStep::PrepareDevice {
-            volume_id,
-            ownership_token,
-            frontend: PrepareDeviceFrontend::KernelNbd { device_path, .. },
-            ..
-        } = &checkpoint.step
-        {
-            self.insert(KernelNbdReservation {
-                cat_id: checkpoint.cat_id.clone(),
-                volume_id: volume_id.clone(),
-                device_path: device_path.clone(),
-                ownership_token: ownership_token.clone(),
-            })?;
+        if matches!(checkpoint.step, ReconcileStep::PrepareDevice { .. }) {
+            for reservation in reservations_from_prepare_device(checkpoint)? {
+                self.insert(reservation)?;
+            }
         }
         let retained_devices = if checkpoint.runtime_launch.identity().is_some()
             || matches!(
@@ -1060,12 +1045,23 @@ impl KernelNbdAllocationPermit {
     /// named by any durable checkpoint. The caller must fsync its new
     /// `PrepareDevice` checkpoint before this permit is dropped.
     fn select_free(&self, reservations: &KernelNbdReservations) -> Result<HostPath> {
+        let mut selected = self.select_free_set(reservations, 1)?;
+        Ok(selected.remove(0))
+    }
+
+    fn select_free_set(
+        &self,
+        reservations: &KernelNbdReservations,
+        count: usize,
+    ) -> Result<Vec<HostPath>> {
+        anyhow::ensure!(count > 0, "kernel-NBD reservation set must not be empty");
         for path in reservations.by_device.keys() {
             anyhow::ensure!(
                 self.snapshot.slots.contains_key(path),
                 "durable kernel-NBD reservation names a device outside the configured pool"
             );
         }
+        let mut selected = Vec::with_capacity(count);
         for path in &self.snapshot.ordered_paths {
             let state = self
                 .snapshot
@@ -1074,10 +1070,13 @@ impl KernelNbdAllocationPermit {
             if matches!(state, KernelNbdSlotState::Free)
                 && !reservations.by_device.contains_key(path)
             {
-                return Ok(path.clone());
+                selected.push(path.clone());
+                if selected.len() == count {
+                    return Ok(selected);
+                }
             }
         }
-        anyhow::bail!("no physically free, unreserved kernel-NBD device remains")
+        anyhow::bail!("insufficient physically free, unreserved kernel-NBD devices remain")
     }
 
     fn assert_current_allocation_lock(&self) -> Result<()> {
@@ -1451,6 +1450,34 @@ impl KernelNbdInventoryPort {
         predecessor: &StoredCheckpoint,
         build_checkpoint: impl FnOnce(HostPath) -> Result<RuntimeCheckpoint>,
     ) -> Result<StoredCheckpoint> {
+        self.reserve_set_and_replace(
+            context,
+            store,
+            predecessor,
+            1,
+            |mut selected| {
+                let selected = selected
+                    .pop()
+                    .context("single kernel-NBD reservation omitted its selected path")?;
+                build_checkpoint(selected)
+            },
+            || Ok(()),
+        )
+    }
+
+    /// Atomically reserve the complete canonical kernel-NBD path set for one
+    /// future PrepareDevice vector.  Selection, prospective conflict checks
+    /// and the single checkpoint CAS all remain under one allocation flock
+    /// and one descriptor-stable pool/namespace snapshot.
+    pub(crate) fn reserve_set_and_replace(
+        &self,
+        context: &RuntimeDesiredEffectContext,
+        store: &FileCheckpointStore,
+        predecessor: &StoredCheckpoint,
+        count: usize,
+        build_checkpoint: impl FnOnce(Vec<HostPath>) -> Result<RuntimeCheckpoint>,
+        revalidate_authority: impl FnOnce() -> Result<()>,
+    ) -> Result<StoredCheckpoint> {
         let permit = self.lock_and_inspect(context)?;
         context.check_active()?;
         let context_state_root = context
@@ -1477,23 +1504,34 @@ impl KernelNbdInventoryPort {
         );
         let reservations = KernelNbdReservations::from_snapshot(&snapshot)?;
         context.check_active()?;
-        let selected = permit.select_free(&reservations)?;
+        let selected = permit.select_free_set(&reservations, count)?;
         let replacement = build_checkpoint(selected.clone())?;
-        let replacement_reservation = reservation_from_prepare_device(&replacement)
-            .context("kernel-NBD replacement is not one exact PrepareDevice reservation")?;
+        let replacement_reservations = reservations_from_prepare_device(&replacement)?;
         anyhow::ensure!(
-            replacement_reservation.device_path == selected,
-            "kernel-NBD replacement ignored the allocator-selected device"
+            replacement_reservations.len() == count,
+            "kernel-NBD replacement changed the reserved device count"
+        );
+        anyhow::ensure!(
+            replacement_reservations
+                .iter()
+                .map(|reservation| &reservation.device_path)
+                .eq(selected.iter()),
+            "kernel-NBD replacement ignored or reordered allocator-selected devices"
         );
         let prospective = KernelNbdReservations::after_replacing(
             &snapshot,
             predecessor.checkpoint(),
             &replacement,
         )?;
-        prospective.assert_contains(
-            &replacement_reservation,
-            "kernel-NBD replacement is not its exact prospective reservation",
-        )?;
+        for replacement_reservation in &replacement_reservations {
+            prospective.assert_contains(
+                replacement_reservation,
+                "kernel-NBD replacement is not its exact prospective reservation",
+            )?;
+        }
+        context.check_active()?;
+        revalidate_authority()
+            .context("kernel-NBD full reservation authority changed before checkpoint CAS")?;
         context.check_active()?;
         // The flock and namespace snapshots are descriptor-stable, but the
         // current state-root basenames could otherwise be renamed away and
@@ -1532,23 +1570,22 @@ fn device_expectations_from_namespace(
         let prepared = if checkpoint.runtime_launch.identity().is_some()
             || matches!(
                 checkpoint.step,
-                ReconcileStep::PrepareNetwork { .. } | ReconcileStep::StartRuntime { .. }
+                ReconcileStep::PrepareDevice { .. }
+                    | ReconcileStep::PrepareNetwork { .. }
+                    | ReconcileStep::StartRuntime { .. }
             ) {
             prepared_device_inputs(checkpoint)?
         } else {
             Vec::new()
         };
-        let direct = KernelNbdDeviceExpectation::from_prepare_device(checkpoint)?;
-        let candidates = direct.into_iter().chain(
-            prepared
-                .iter()
-                .map(|device| {
-                    KernelNbdDeviceExpectation::from_prepared_device(&checkpoint.cat_id, device)
-                })
-                .collect::<Result<Vec<_>>>()?
-                .into_iter()
-                .flatten(),
-        );
+        let candidates = prepared
+            .iter()
+            .map(|device| {
+                KernelNbdDeviceExpectation::from_prepared_device(&checkpoint.cat_id, device)
+            })
+            .collect::<Result<Vec<_>>>()?
+            .into_iter()
+            .flatten();
         for expected in candidates {
             let device_path = expected.device_path.clone();
             anyhow::ensure!(
@@ -2145,10 +2182,11 @@ impl KernelNbdAttachEffect {
             "kernel-NBD admission duplicates one Cat"
         );
         let observed_devices = match &runtime.step {
-            ReconcileStep::PrepareDevice {
-                frontend: PrepareDeviceFrontend::KernelNbd { .. },
-                ..
-            } => {
+            ReconcileStep::PrepareDevice { devices }
+                if devices.iter().any(|device| {
+                    matches!(device.frontend, PrepareDeviceFrontend::KernelNbd { .. })
+                }) =>
+            {
                 if !prepare_device_base_admission_is_exact(accepted, desired, runtime) {
                     return Ok(Some(RuntimeDesiredEffectOutcome::Stop(
                         RuntimeDesiredEffectStopReason::LocalContract,
@@ -3469,62 +3507,64 @@ mod tests {
             runtime_launch: cats_api::runtime_reconciliation::RuntimeLaunch::Absent,
             stable_state: None,
             step: ReconcileStep::PrepareDevice {
-                volume_intent_id: id(&format!("intent_{volume}")),
-                disk_id: id(&format!("disk_{volume}")),
-                volume_id: id(volume),
-                disk_kind: DiskKind::Root,
-                attachment_id: id("att_a"),
-                attachment_epoch: FenceEpoch::new(1).unwrap(),
-                acquire_origin: AcquireOrigin::Normal {
-                    transition_id: random('2'),
-                },
-                expected_head: RemoteHead {
-                    generation: Generation::new(1).unwrap(),
-                    root_hash: Some(
-                        cats_api::runtime_reconciliation::Sha256Digest::new(format!(
-                            "sha256:{}",
-                            "3".repeat(64)
-                        ))
-                        .unwrap(),
-                    ),
-                    root_object_id: Some(
-                        cats_api::runtime_reconciliation::AsciiText::new("root/1").unwrap(),
-                    ),
-                },
-                size_bytes: 4096,
-                durability: Durability::Strict,
-                guest_device: GuestDeviceIdentity {
-                    serial: id("cats-root"),
-                    slot: 0,
-                },
-                ownership_token: random(token),
-                serving_authority: Box::new(
-                    ServingAuthorityProvenance::DirectAuthorizedAttachment {
-                        authorization: cats_api::runtime_reconciliation::DirectAuthorizedAttachmentIdentity {
-                            path: host("/var/lib/cats/authorized-serving.json"),
-                            device: WireU64::new(1).unwrap(),
-                            inode: WireU64::new(2).unwrap(),
-                            length: WireU64::new(3).unwrap(),
-                            content_sha256: cats_api::runtime_reconciliation::Sha256Digest::new(
-                                format!("sha256:{}", "4".repeat(64)),
-                            )
-                            .unwrap(),
-                        },
-                        purpose: cats_api::runtime_reconciliation::DirectAuthorizedAttachmentPurpose::ExistingRoot,
+                devices: vec![PreparedDeviceInput {
+                    volume_intent_id: id(&format!("intent_{volume}")),
+                    disk_id: id(&format!("disk_{volume}")),
+                    volume_id: id(volume),
+                    disk_kind: DiskKind::Root,
+                    attachment_id: id("att_a"),
+                    attachment_epoch: FenceEpoch::new(1).unwrap(),
+                    acquire_origin: AcquireOrigin::Normal {
+                        transition_id: random('2'),
                     },
-                ),
-                serving_process: ServingBlockdIdentity {
-                    scope_id: id("cats-serving.service"),
-                    control_socket_path: host("/run/cats/control.sock"),
-                    data_directory: host("/var/lib/cats/data"),
-                    executable_path: host("/usr/bin/cats-blockd"),
-                    process_identity_token: random('5'),
-                },
-                frontend: PrepareDeviceFrontend::KernelNbd {
-                    listener_socket_path: host("/run/cats/nbd.sock"),
-                    device_path: host(device),
-                    direct: false,
-                },
+                    expected_head: RemoteHead {
+                        generation: Generation::new(1).unwrap(),
+                        root_hash: Some(
+                            cats_api::runtime_reconciliation::Sha256Digest::new(format!(
+                                "sha256:{}",
+                                "3".repeat(64)
+                            ))
+                            .unwrap(),
+                        ),
+                        root_object_id: Some(
+                            cats_api::runtime_reconciliation::AsciiText::new("root/1").unwrap(),
+                        ),
+                    },
+                    size_bytes: 4096,
+                    durability: Durability::Strict,
+                    guest_device: GuestDeviceIdentity {
+                        serial: id("cats-root"),
+                        slot: 0,
+                    },
+                    ownership_token: random(token),
+                    serving_authority: Box::new(
+                        ServingAuthorityProvenance::DirectAuthorizedAttachment {
+                            authorization: cats_api::runtime_reconciliation::DirectAuthorizedAttachmentIdentity {
+                                path: host("/var/lib/cats/authorized-serving.json"),
+                                device: WireU64::new(1).unwrap(),
+                                inode: WireU64::new(2).unwrap(),
+                                length: WireU64::new(3).unwrap(),
+                                content_sha256: cats_api::runtime_reconciliation::Sha256Digest::new(
+                                    format!("sha256:{}", "4".repeat(64)),
+                                )
+                                .unwrap(),
+                            },
+                            purpose: cats_api::runtime_reconciliation::DirectAuthorizedAttachmentPurpose::ExistingRoot,
+                        },
+                    ),
+                    serving_process: ServingBlockdIdentity {
+                        scope_id: id("cats-serving.service"),
+                        control_socket_path: host("/run/cats/control.sock"),
+                        data_directory: host("/var/lib/cats/data"),
+                        executable_path: host("/usr/bin/cats-blockd"),
+                        process_identity_token: random('5'),
+                    },
+                    frontend: PrepareDeviceFrontend::KernelNbd {
+                        listener_socket_path: host("/run/cats/nbd.sock"),
+                        device_path: host(device),
+                        direct: false,
+                    },
+                }],
             },
             require_idle: RequireIdleCheckpoint::NotApplicable,
             updated_at_unix_ms: cats_api::runtime_reconciliation::UnixMillis::new(1).unwrap(),
@@ -3537,6 +3577,44 @@ mod tests {
             lifecycle_admission: LifecycleAdmission::Closed,
             route_gates: Vec::new(),
         }
+    }
+
+    fn single_prepared_device(checkpoint: &RuntimeCheckpoint) -> &PreparedDeviceInput {
+        let ReconcileStep::PrepareDevice { devices } = &checkpoint.step else {
+            panic!("fixture must be a PrepareDevice checkpoint")
+        };
+        let [device] = devices.as_slice() else {
+            panic!("fixture must contain one prepared device")
+        };
+        device
+    }
+
+    fn single_prepared_device_mut(checkpoint: &mut RuntimeCheckpoint) -> &mut PreparedDeviceInput {
+        let ReconcileStep::PrepareDevice { devices } = &mut checkpoint.step else {
+            panic!("fixture must be a PrepareDevice checkpoint")
+        };
+        let [device] = devices.as_mut_slice() else {
+            panic!("fixture must contain one prepared device")
+        };
+        device
+    }
+
+    fn kernel_frontend_mut(checkpoint: &mut RuntimeCheckpoint) -> &mut PrepareDeviceFrontend {
+        let device = single_prepared_device_mut(checkpoint);
+        assert!(
+            matches!(device.frontend, PrepareDeviceFrontend::KernelNbd { .. }),
+            "fixture must use kernel-NBD"
+        );
+        &mut device.frontend
+    }
+
+    fn kernel_frontend(checkpoint: &RuntimeCheckpoint) -> &PrepareDeviceFrontend {
+        let device = single_prepared_device(checkpoint);
+        assert!(matches!(
+            device.frontend,
+            PrepareDeviceFrontend::KernelNbd { .. }
+        ));
+        &device.frontend
     }
 
     fn observed_prepared_volume(device: &PreparedDeviceInput) -> ObservedVolume {
@@ -3819,7 +3897,8 @@ mod tests {
     #[test]
     fn prepare_network_step_devices_remain_durable_reservations() {
         let source = checkpoint("cat_a", "vol_a", "/dev/nbd0", '6');
-        let expected = reservation_from_prepare_device(&source).unwrap();
+        let prepared = prepared_device_inputs(&source).unwrap();
+        let expected = reservation_from_prepared_device(&source.cat_id, &prepared[0]).unwrap();
         let mut successor = source.clone();
         successor.step = ReconcileStep::PrepareNetwork {
             network: cats_api::runtime_reconciliation::RuntimeNetworkIdentity {
@@ -3892,43 +3971,33 @@ mod tests {
         let fixture = Fixture::new(2);
         let root = checkpoint("cat_a", "vol_root", "/dev/nbd0", '6');
         let mut persistent = checkpoint("cat_a", "vol_persistent", "/dev/nbd1", '7');
-        let ReconcileStep::PrepareDevice {
-            volume_intent_id,
-            disk_id,
-            disk_kind,
-            attachment_id,
-            guest_device,
-            serving_authority,
-            serving_process,
-            frontend,
-            ..
-        } = &mut persistent.step
-        else {
+        let ReconcileStep::PrepareDevice { devices } = &mut persistent.step else {
             unreachable!()
         };
-        *volume_intent_id = id("intent_persistent");
-        *disk_id = id("disk_persistent");
-        *disk_kind = DiskKind::Persistent;
-        *attachment_id = id("att_persistent");
-        guest_device.serial = id("cats-persistent");
-        guest_device.slot = 1;
+        let device = &mut devices[0];
+        device.volume_intent_id = id("intent_persistent");
+        device.disk_id = id("disk_persistent");
+        device.disk_kind = DiskKind::Persistent;
+        device.attachment_id = id("att_persistent");
+        device.guest_device.serial = id("cats-persistent");
+        device.guest_device.slot = 1;
         let ServingAuthorityProvenance::DirectAuthorizedAttachment {
             authorization,
             purpose,
-        } = serving_authority.as_mut()
+        } = device.serving_authority.as_mut()
         else {
             unreachable!()
         };
         authorization.path = host("/var/lib/cats/persistent-authorized-serving.json");
         *purpose = cats_api::runtime_reconciliation::DirectAuthorizedAttachmentPurpose::PersistentInitialized;
-        serving_process.scope_id = id("cats-serving-persistent.service");
-        serving_process.control_socket_path = host("/run/cats/persistent-control.sock");
-        serving_process.data_directory = host("/var/lib/cats/persistent-data");
-        serving_process.process_identity_token = random('8');
+        device.serving_process.scope_id = id("cats-serving-persistent.service");
+        device.serving_process.control_socket_path = host("/run/cats/persistent-control.sock");
+        device.serving_process.data_directory = host("/var/lib/cats/persistent-data");
+        device.serving_process.process_identity_token = random('8');
         let PrepareDeviceFrontend::KernelNbd {
             listener_socket_path,
             ..
-        } = frontend
+        } = &mut device.frontend
         else {
             unreachable!()
         };
@@ -3984,14 +4053,13 @@ mod tests {
     fn persisted_device_expectation_binds_kernel_direct_mode() {
         let buffered = checkpoint("cat_a", "vol_a", "/dev/nbd0", '6');
         let mut direct_checkpoint = buffered.clone();
-        let ReconcileStep::PrepareDevice {
-            frontend:
-                PrepareDeviceFrontend::KernelNbd {
-                    direct: direct_mode,
-                    ..
-                },
+        let ReconcileStep::PrepareDevice { devices } = &mut direct_checkpoint.step else {
+            unreachable!()
+        };
+        let PrepareDeviceFrontend::KernelNbd {
+            direct: direct_mode,
             ..
-        } = &mut direct_checkpoint.step
+        } = &mut devices[0].frontend
         else {
             unreachable!()
         };
@@ -4024,10 +4092,8 @@ mod tests {
                 let error = second.lock_and_inspect(&TestContext::active()).unwrap_err();
                 assert!(error.to_string().contains("already active"), "{error:#}");
                 let mut replacement = predecessor.checkpoint().clone();
-                let ReconcileStep::PrepareDevice {
-                    frontend: PrepareDeviceFrontend::KernelNbd { device_path, .. },
-                    ..
-                } = &mut replacement.step
+                let PrepareDeviceFrontend::KernelNbd { device_path, .. } =
+                    kernel_frontend_mut(&mut replacement)
                 else {
                     panic!("fixture must be a kernel-NBD PrepareDevice checkpoint")
                 };
@@ -4035,10 +4101,8 @@ mod tests {
                 Ok(replacement)
             })
             .unwrap();
-        let ReconcileStep::PrepareDevice {
-            frontend: PrepareDeviceFrontend::KernelNbd { device_path, .. },
-            ..
-        } = &persisted.checkpoint().step
+        let PrepareDeviceFrontend::KernelNbd { device_path, .. } =
+            kernel_frontend(persisted.checkpoint())
         else {
             panic!("persisted checkpoint must remain PrepareDevice")
         };
@@ -4109,7 +4173,9 @@ mod tests {
             })
             .unwrap_err();
         assert!(
-            error.to_string().contains("ignored the allocator-selected"),
+            error
+                .to_string()
+                .contains("ignored or reordered allocator-selected devices"),
             "{error:#}"
         );
         assert_eq!(
@@ -4120,19 +4186,17 @@ mod tests {
         let error = port
             .reserve_and_replace(&context, &store, &predecessor, |_| {
                 let mut replacement = predecessor.checkpoint().clone();
-                let ReconcileStep::PrepareDevice { frontend, .. } = &mut replacement.step else {
-                    panic!("fixture must be a PrepareDevice checkpoint")
-                };
-                *frontend = PrepareDeviceFrontend::VhostUserBlk {
-                    socket_path: host("/run/cats/vhost.sock"),
-                    queues: 1,
-                    queue_size: 128,
-                };
+                single_prepared_device_mut(&mut replacement).frontend =
+                    PrepareDeviceFrontend::VhostUserBlk {
+                        socket_path: host("/run/cats/vhost.sock"),
+                        queues: 1,
+                        queue_size: 128,
+                    };
                 Ok(replacement)
             })
             .unwrap_err();
         assert!(
-            format!("{error:#}").contains("not a kernel-NBD PrepareDevice reservation"),
+            format!("{error:#}").contains("changed the reserved device count"),
             "{error:#}"
         );
         assert_eq!(
@@ -4158,15 +4222,12 @@ mod tests {
         let error = port
             .reserve_and_replace(&context, &store, &predecessor, |selected| {
                 let mut replacement = predecessor.checkpoint().clone();
-                let ReconcileStep::PrepareDevice {
-                    ownership_token,
-                    frontend: PrepareDeviceFrontend::KernelNbd { device_path, .. },
-                    ..
-                } = &mut replacement.step
+                let device = single_prepared_device_mut(&mut replacement);
+                device.ownership_token = random('7');
+                let PrepareDeviceFrontend::KernelNbd { device_path, .. } = &mut device.frontend
                 else {
                     panic!("fixture must be a kernel-NBD PrepareDevice checkpoint")
                 };
-                *ownership_token = random('7');
                 *device_path = selected;
                 Ok(replacement)
             })
@@ -4200,10 +4261,8 @@ mod tests {
                 fs::rename(&checkpoint_directory, &detached_directory).unwrap();
                 fs::create_dir(&checkpoint_directory).unwrap();
                 let mut replacement = predecessor.checkpoint().clone();
-                let ReconcileStep::PrepareDevice {
-                    frontend: PrepareDeviceFrontend::KernelNbd { device_path, .. },
-                    ..
-                } = &mut replacement.step
+                let PrepareDeviceFrontend::KernelNbd { device_path, .. } =
+                    kernel_frontend_mut(&mut replacement)
                 else {
                     panic!("fixture must be a kernel-NBD PrepareDevice checkpoint")
                 };
@@ -4245,10 +4304,8 @@ mod tests {
         let error = port
             .reserve_and_replace(&context, &store, &predecessor, |selected| {
                 let mut replacement = predecessor.checkpoint().clone();
-                let ReconcileStep::PrepareDevice {
-                    frontend: PrepareDeviceFrontend::KernelNbd { device_path, .. },
-                    ..
-                } = &mut replacement.step
+                let PrepareDeviceFrontend::KernelNbd { device_path, .. } =
+                    kernel_frontend_mut(&mut replacement)
                 else {
                     panic!("fixture must be a kernel-NBD PrepareDevice checkpoint")
                 };
@@ -4260,10 +4317,8 @@ mod tests {
         assert!(error.to_string().contains("pathname changed"), "{error:#}");
         assert!(!checkpoint_directory.join(&target_name).exists());
         let detached = store.load().unwrap().unwrap();
-        let ReconcileStep::PrepareDevice {
-            frontend: PrepareDeviceFrontend::KernelNbd { device_path, .. },
-            ..
-        } = &detached.checkpoint().step
+        let PrepareDeviceFrontend::KernelNbd { device_path, .. } =
+            kernel_frontend(detached.checkpoint())
         else {
             panic!("detached publication must remain PrepareDevice")
         };
@@ -4286,10 +4341,8 @@ mod tests {
         let error = port
             .reserve_and_replace(&context, &store, &predecessor, |selected| {
                 let mut replacement = predecessor.checkpoint().clone();
-                let ReconcileStep::PrepareDevice {
-                    frontend: PrepareDeviceFrontend::KernelNbd { device_path, .. },
-                    ..
-                } = &mut replacement.step
+                let PrepareDeviceFrontend::KernelNbd { device_path, .. } =
+                    kernel_frontend_mut(&mut replacement)
                 else {
                     panic!("fixture must be a kernel-NBD PrepareDevice checkpoint")
                 };
@@ -4300,10 +4353,8 @@ mod tests {
 
         assert!(error.to_string().contains("cancelled"), "{error:#}");
         let persisted = store.load().unwrap().unwrap();
-        let ReconcileStep::PrepareDevice {
-            frontend: PrepareDeviceFrontend::KernelNbd { device_path, .. },
-            ..
-        } = &persisted.checkpoint().step
+        let PrepareDeviceFrontend::KernelNbd { device_path, .. } =
+            kernel_frontend(persisted.checkpoint())
         else {
             panic!("durable cancellation recovery must remain PrepareDevice")
         };
@@ -4329,10 +4380,8 @@ mod tests {
                 fs::set_permissions(&lock_path, fs::Permissions::from_mode(0o600)).unwrap();
                 let replacement_identity = fs::metadata(&lock_path).unwrap();
                 let mut replacement = predecessor.checkpoint().clone();
-                let ReconcileStep::PrepareDevice {
-                    frontend: PrepareDeviceFrontend::KernelNbd { device_path, .. },
-                    ..
-                } = &mut replacement.step
+                let PrepareDeviceFrontend::KernelNbd { device_path, .. } =
+                    kernel_frontend_mut(&mut replacement)
                 else {
                     panic!("fixture must be a kernel-NBD PrepareDevice checkpoint")
                 };
@@ -4383,10 +4432,8 @@ mod tests {
         let error = port
             .reserve_and_replace(&context, &store, &predecessor, |selected| {
                 let mut replacement = predecessor.checkpoint().clone();
-                let ReconcileStep::PrepareDevice {
-                    frontend: PrepareDeviceFrontend::KernelNbd { device_path, .. },
-                    ..
-                } = &mut replacement.step
+                let PrepareDeviceFrontend::KernelNbd { device_path, .. } =
+                    kernel_frontend_mut(&mut replacement)
                 else {
                     panic!("fixture must be a kernel-NBD PrepareDevice checkpoint")
                 };
@@ -4404,10 +4451,8 @@ mod tests {
         assert!(detached_lock_path.exists());
         assert_eq!(fs::read(&lock_path).unwrap(), b"");
         let persisted = store.load().unwrap().unwrap();
-        let ReconcileStep::PrepareDevice {
-            frontend: PrepareDeviceFrontend::KernelNbd { device_path, .. },
-            ..
-        } = &persisted.checkpoint().step
+        let PrepareDeviceFrontend::KernelNbd { device_path, .. } =
+            kernel_frontend(persisted.checkpoint())
         else {
             panic!("detached allocation domain publication must remain PrepareDevice")
         };
@@ -4963,10 +5008,7 @@ mod tests {
     fn attach_rejects_unaligned_checkpoint_capacity_before_any_physical_read() {
         let fixture = Fixture::new(1);
         let mut source = checkpoint("cat_a", "vol_a", "/dev/nbd0", '6');
-        let ReconcileStep::PrepareDevice { size_bytes, .. } = &mut source.step else {
-            unreachable!()
-        };
-        *size_bytes = 513;
+        single_prepared_device_mut(&mut source).size_bytes = 513;
         let store =
             FileCheckpointStore::open(&fixture.state.join(CHECKPOINT_NAMESPACE), &source.cat_id)
                 .unwrap();
@@ -5077,14 +5119,10 @@ mod tests {
                 match drift {
                     Drift::CheckpointValue => {
                         let mut changed = source_for_hook.clone();
-                        let ReconcileStep::PrepareDevice {
-                            frontend:
-                                PrepareDeviceFrontend::KernelNbd {
-                                    listener_socket_path,
-                                    ..
-                                },
+                        let PrepareDeviceFrontend::KernelNbd {
+                            listener_socket_path,
                             ..
-                        } = &mut changed.step
+                        } = kernel_frontend_mut(&mut changed)
                         else {
                             unreachable!()
                         };

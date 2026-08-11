@@ -9,21 +9,21 @@
 //! device, network or VMM port is reachable from this module.
 
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::Context as _;
 use cats_api::runtime_reconciliation::{
-    encode_desired_runtime_spec, AcquireOrigin, AgentSession, AppliedDesiredEvidence, AsciiText,
-    CheckpointEvidence, CleanupRelease, CleanupTarget, Condition, ContractVersion,
-    DesiredRuntimeSpec, DiskKind, FenceEpoch, Generation, GuestTransportEvidence, HostPath, Id,
-    LastVolumeTransition, LifecycleAdmission, LocalLineageState, LocalVolumeLineage,
-    NormalAcquireRequest, ObservedDiskKind, ObservedRuntimeStatus, ObservedVolume,
-    ProgressingReason, RandomId128, ReconcileStep, RemoteHead, RequireIdleCheckpoint,
-    RuntimeCheckpoint, RuntimeLaunch, RuntimeTarget, RuntimeTransition, RuntimeVolumeTransition,
-    RuntimeVolumeTransitionRequest, SessionBinding, Sha256Digest, UnixMillis, VolumeAccess,
-    VolumeAcquire, VolumeAcquireRequest, VolumeAdminState, VolumeAuthorityEvidence,
-    VolumeDisposition, VolumeIntent, VolumeRecord, VolumeReleaseReplay, WarmSnapshotEvidence,
-    WireU64,
+    encode_desired_runtime_spec, encode_runtime_checkpoint, AcquireOrigin, AgentSession,
+    AppliedDesiredEvidence, AsciiText, CheckpointEvidence, CleanupRelease, CleanupTarget,
+    Condition, ContractVersion, DesiredRuntimeSpec, DiskKind, FenceEpoch, Generation,
+    GuestTransportEvidence, HostPath, Id, LastVolumeTransition, LifecycleAdmission,
+    LocalLineageState, LocalVolumeLineage, NormalAcquireRequest, ObservedDiskKind,
+    ObservedRuntimeStatus, ObservedVolume, ProgressingReason, RandomId128, ReconcileStep,
+    RemoteHead, RequireIdleCheckpoint, RuntimeCheckpoint, RuntimeLaunch, RuntimeTarget,
+    RuntimeTransition, RuntimeVolumeTransition, RuntimeVolumeTransitionRequest, SessionBinding,
+    Sha256Digest, UnixMillis, VolumeAccess, VolumeAcquire, VolumeAcquireRequest, VolumeAdminState,
+    VolumeAuthorityEvidence, VolumeDisposition, VolumeIntent, VolumeRecord, VolumeReleaseReplay,
+    WarmSnapshotEvidence, WireU64,
 };
 use cats_storage::authority::{
     validate_authorized_serving_attachment, validate_authorized_serving_record,
@@ -50,7 +50,7 @@ use super::{
     recover_normal_release_from_authority, runtime_checkpoint_path, AuthorizedBlockdStore,
     ControlSignedNormalAcquireClient, FileCheckpointStore, NormalAcquireAcceptedContext,
     NormalAcquireAttempt, NormalAcquireAuthorityRecovery, NormalAcquireClientError,
-    NormalReleaseAttempt, NormalReleaseAuthorityRecovery,
+    NormalReleaseAttempt, NormalReleaseAuthorityRecovery, StoredCheckpoint,
 };
 
 const MAX_LEASE_DURATION_MS: u64 = i64::MAX as u64;
@@ -1434,6 +1434,290 @@ impl SignedRunningAcquireEffect {
         )
     }
 
+    /// Clean-slate multi-volume acquisition.  `AcquireVolume` names only the
+    /// one A22 mutation currently checkpointed; `checkpoint.volumes` retains
+    /// every earlier exact grant/lineage.  After the final grant, one CAS
+    /// advances the unchanged complete set to Root provisioning.
+    fn apply_multi_acquire(
+        &self,
+        context: &RuntimeDesiredEffectContext,
+        desired: &DesiredRuntimeSpec,
+    ) -> anyhow::Result<RuntimeDesiredEffectOutcome> {
+        let accepted = context.accepted_full()?;
+        let runtime = match validate_multi_acquire_admission(
+            desired,
+            accepted,
+            context.state_directory().path(),
+        ) {
+            MultiAcquireAdmission::Exact(runtime) => runtime,
+            MultiAcquireAdmission::RefreshInventory => {
+                return Ok(RuntimeDesiredEffectOutcome::RefreshInventory)
+            }
+            MultiAcquireAdmission::StopLocal => return Ok(stop_local()),
+        };
+        let volume = match &runtime.step {
+            ReconcileStep::InspectInventory { .. } => &desired.volumes[0],
+            ReconcileStep::AcquireVolume { request } => desired
+                .volumes
+                .iter()
+                .find(|volume| request_matches_volume(request, desired, volume))
+                .context("multi-volume acquire checkpoint names no Desired volume")?,
+            ReconcileStep::ProvisionRootImage { .. } => {
+                return Ok(RuntimeDesiredEffectOutcome::Applied)
+            }
+            _ => return Ok(stop_local()),
+        };
+        let VolumeAcquire::Normal { .. } = volume.acquire else {
+            // Takeover uses its own thick signed-evidence path; never coerce
+            // its authorization ID into the normal immutable grant artifact.
+            return Ok(stop_local());
+        };
+
+        let root = &desired.volumes[0];
+
+        let request =
+            normal_acquire_request(desired, volume, accepted.session(), self.lease_duration_ms);
+        let RuntimeVolumeTransition::Acquire {
+            request: request_payload,
+        } = &request.transition
+        else {
+            unreachable!("normal acquire builder returns Acquire")
+        };
+        let checkpoint_directory = context.state_directory().path().join(CHECKPOINT_NAMESPACE);
+        let store = FileCheckpointStore::open(&checkpoint_directory, &desired.cat_id)
+            .context("open multi-volume acquire checkpoint store")?;
+        let predecessor = match store
+            .load()
+            .context("load multi-volume acquire checkpoint")?
+        {
+            None => {
+                if !matches!(runtime.checkpoint, CheckpointEvidence::Missing { .. }) {
+                    return Ok(RuntimeDesiredEffectOutcome::RefreshInventory);
+                }
+                let checkpoint = closed_checkpoint(
+                    desired,
+                    ReconcileStep::AcquireVolume {
+                        request: request_payload.clone(),
+                    },
+                    runtime.volumes.clone(),
+                    accepted.attestation().accepted_at_unix_ms,
+                );
+                store
+                    .create(&checkpoint)
+                    .context("persist first multi-volume acquire request")?;
+                // Checkpoint publication is this accepted-full round's sole
+                // durable effect. A22 is unreachable until a new full scan
+                // proves these exact bytes current.
+                return Ok(RuntimeDesiredEffectOutcome::RefreshInventory);
+            }
+            Some(stored) => {
+                let CheckpointEvidence::Valid {
+                    checkpoint_path,
+                    content_digest,
+                    ..
+                } = &runtime.checkpoint
+                else {
+                    return Ok(RuntimeDesiredEffectOutcome::RefreshInventory);
+                };
+                if !path_matches(checkpoint_path, store.path())
+                    || stored.content_digest() != content_digest
+                    || stored.checkpoint().step != runtime.step
+                    || stored.checkpoint().cat_id != desired.cat_id
+                    || stored.checkpoint().node_id != desired.placement.node_id
+                    || stored.checkpoint().placement_epoch != desired.placement.placement_epoch
+                    || stored.checkpoint().desired_revision != desired.desired_revision
+                    || stored.checkpoint().spec_digest != desired.spec_digest
+                    || !matches!(
+                        &stored.checkpoint().step,
+                        ReconcileStep::AcquireVolume { request: persisted }
+                            if persisted == request_payload
+                    )
+                {
+                    return Ok(RuntimeDesiredEffectOutcome::RefreshInventory);
+                }
+                stored
+            }
+        };
+
+        let accepted_context = NormalAcquireAcceptedContext {
+            session: accepted.session().clone(),
+            inventory_attestation: accepted.attestation().clone(),
+        };
+        context.check_active()?;
+        let attempt = self
+            .volume_transition
+            .acquire(&request, volume, &accepted_context, context.deadline())
+            .map_err(|error| anyhow::anyhow!("submit signed multi-volume acquire: {error}"))?;
+        let attachment = match attempt {
+            NormalAcquireAttempt::Granted(attachment) => attachment,
+            NormalAcquireAttempt::RetryExact => return Ok(RuntimeDesiredEffectOutcome::RetryExact),
+            NormalAcquireAttempt::RefreshInventory => {
+                return Ok(RuntimeDesiredEffectOutcome::RefreshInventory)
+            }
+            NormalAcquireAttempt::ReplanDesired => {
+                return Ok(RuntimeDesiredEffectOutcome::ReplanDesired)
+            }
+            NormalAcquireAttempt::SessionReplacementRequired => {
+                return Ok(RuntimeDesiredEffectOutcome::SessionReplacementRequired)
+            }
+            NormalAcquireAttempt::IdentityRepairRequired => {
+                return Ok(RuntimeDesiredEffectOutcome::IdentityRepairRequired)
+            }
+            NormalAcquireAttempt::AuthorityRejected(reason) => {
+                return Ok(RuntimeDesiredEffectOutcome::Stop(
+                    RuntimeDesiredEffectStopReason::AuthorityRejected(reason),
+                ))
+            }
+            NormalAcquireAttempt::StopForLocalContract => return Ok(stop_local()),
+            NormalAcquireAttempt::StopForDeploymentMismatch => {
+                return Ok(RuntimeDesiredEffectOutcome::Stop(
+                    RuntimeDesiredEffectStopReason::DeploymentMismatch,
+                ))
+            }
+            NormalAcquireAttempt::Ambiguous => {
+                context.check_active()?;
+                let record = match self.authority.load_volume(&volume.volume_id) {
+                    Ok(record) => record,
+                    Err(AuthorityError::BackendUnknown) => {
+                        return Ok(RuntimeDesiredEffectOutcome::RetryExact)
+                    }
+                    Err(_) => return Ok(RuntimeDesiredEffectOutcome::RefreshInventory),
+                };
+                match recover_normal_acquire_from_authority(&request, volume, &record) {
+                    Ok(NormalAcquireAuthorityRecovery::Granted(attachment)) => attachment,
+                    Ok(NormalAcquireAuthorityRecovery::RetryExact) => {
+                        return Ok(RuntimeDesiredEffectOutcome::RetryExact)
+                    }
+                    Ok(NormalAcquireAuthorityRecovery::Blocked) | Err(_) => return Ok(stop_local()),
+                }
+            }
+        };
+        let prepared = AuthorizedBlockdStore::new(context.state_directory().clone())
+            .prepare(desired, volume, &attachment)
+            .context("persist exact multi-volume authorized blockd grant")?;
+        context.check_active()?;
+
+        let data_directory = host_path(
+            prepared.data_directory(),
+            "multi-volume authorized blockd data directory",
+        )?;
+        let mut successor = predecessor.checkpoint().clone();
+        let observed = successor
+            .volumes
+            .iter_mut()
+            .find(|observed| observed.volume_id == volume.volume_id)
+            .context("multi-volume checkpoint omitted its acquired Volume")?;
+        *observed = prepared_owned_observed_volume(volume, &attachment, data_directory.clone());
+        successor.updated_at_unix_ms = next_multi_checkpoint_time(&predecessor)?;
+
+        let next = desired.volumes.iter().find(|candidate| {
+            successor
+                .volumes
+                .iter()
+                .find(|observed| observed.volume_id == candidate.volume_id)
+                .is_none_or(|observed| observed.local_lineages.is_empty())
+        });
+        if let Some(next) = next {
+            let VolumeAcquire::Normal { .. } = next.acquire else {
+                return Ok(stop_local());
+            };
+            let next_request =
+                normal_acquire_request(desired, next, accepted.session(), self.lease_duration_ms);
+            let RuntimeVolumeTransition::Acquire {
+                request: next_payload,
+            } = next_request.transition
+            else {
+                unreachable!("normal acquire builder returns Acquire")
+            };
+            successor.step = ReconcileStep::AcquireVolume {
+                request: next_payload,
+            };
+        } else {
+            let root_observed = successor
+                .volumes
+                .iter()
+                .find(|observed| observed.volume_id == root.volume_id)
+                .context("multi-volume checkpoint omitted Root")?;
+            let [root_lineage] = root_observed.local_lineages.as_slice() else {
+                return Ok(stop_local());
+            };
+            let root_identity = AttachmentLineageIdentity {
+                volume_id: root.volume_id.clone(),
+                attachment_id: root_lineage.attachment_id.clone(),
+                attachment_epoch: root_lineage.attachment_epoch,
+                acquire_origin: root_lineage.acquire_origin.clone(),
+                node_id: root_lineage.node_id.clone(),
+                placement_epoch: root_lineage.placement_epoch,
+            };
+            let root_prepared = AuthorizedBlockdStore::new(context.state_directory().clone())
+                .reopen_adopted(desired, root, &root_identity)
+                .context("reopen exact Root authorization after all volume acquires")?;
+            let root_attachment = &root_prepared.checkpoint().attachment;
+            if root_attachment.head.generation.get() > 0 {
+                // Existing Root never depends on the image BlobStore and is
+                // prepared by the direct full-vector effect after the next
+                // accepted scan. Keep the last exact Acquire checkpoint as
+                // the durable bridge; its artifact publication is already
+                // this round's effect.
+                encode_runtime_checkpoint(&successor)
+                    .context("constructed existing-Root acquire bridge is not canonical V1")?;
+                store
+                    .replace(&predecessor, &successor)
+                    .context("publish complete existing-Root authorization set")?;
+                return Ok(RuntimeDesiredEffectOutcome::RefreshInventory);
+            }
+            let (expected_blank_head, expected_provisioned_head) = match expected_provision_heads(
+                self.blob.as_ref(),
+                desired,
+                root,
+                context.deadline(),
+            ) {
+                ProvisionHeadRead::Ready { blank, target } => (blank, target),
+                ProvisionHeadRead::Retry => return Ok(RuntimeDesiredEffectOutcome::RetryExact),
+                ProvisionHeadRead::Invalid => return Ok(stop_local()),
+            };
+            anyhow::ensure!(
+                root_attachment.head == expected_blank_head,
+                "blank Root authority disagrees with the provision predecessor"
+            );
+            let root_data_directory = host_path(
+                root_prepared.data_directory(),
+                "multi-volume Root blockd data directory",
+            )?;
+            let process_identity_token = random_id();
+            let scope_id = Id::new(format!(
+                "cats-root-{}.service",
+                process_identity_token.as_str()
+            ))
+            .context("Root provision process token does not form a service ID")?;
+            successor.step = ReconcileStep::ProvisionRootImage {
+                provision_transition_id: random_id(),
+                volume_id: root.volume_id.clone(),
+                attachment_id: root_attachment.identity.attachment_id.clone(),
+                attachment_epoch: root_attachment.identity.attachment_epoch,
+                scope_id,
+                control_socket_path: HostPath::new(format!(
+                    "{}/{}",
+                    root_data_directory.as_str(),
+                    ROOT_PROVISION_SOCKET
+                ))
+                .context("Root provision control socket is not canonical")?,
+                data_directory: root_data_directory,
+                process_identity_token,
+                size_bytes: root.size_bytes,
+                boot_image_digest: desired.runtime.boot_image_digest.clone(),
+                expected_blank_head,
+                expected_provisioned_head,
+            };
+        }
+        encode_runtime_checkpoint(&successor)
+            .context("constructed multi-volume successor is not canonical V1")?;
+        store
+            .replace(&predecessor, &successor)
+            .context("advance one checkpointed multi-volume acquire")?;
+        Ok(RuntimeDesiredEffectOutcome::RefreshInventory)
+    }
+
     #[allow(clippy::too_many_arguments)]
     fn persist_provision_step(
         &self,
@@ -1535,11 +1819,251 @@ impl RuntimeDesiredEffect for SignedRunningAcquireEffect {
         desired: &DesiredRuntimeSpec,
     ) -> anyhow::Result<RuntimeDesiredEffectOutcome> {
         context.check_active()?;
+        if desired.volumes.len() > 1 {
+            return self.apply_multi_acquire(&context, desired);
+        }
         if let Some(outcome) = self.apply_checkpoint_replan(&context, desired)? {
             return Ok(outcome);
         }
         self.apply_acquire(&context, desired)
     }
+}
+
+enum MultiAcquireAdmission<'a> {
+    Exact(&'a ObservedRuntimeStatus),
+    RefreshInventory,
+    StopLocal,
+}
+
+fn validate_multi_acquire_admission<'a>(
+    desired: &'a DesiredRuntimeSpec,
+    accepted: &'a crate::runtime_spine::RuntimeDesiredEffectAdmission,
+    state_directory: &std::path::Path,
+) -> MultiAcquireAdmission<'a> {
+    if encode_desired_runtime_spec(desired).is_err()
+        || desired.version != ContractVersion::V1
+        || desired.target != RuntimeTarget::Running
+        || !matches!(desired.transition, RuntimeTransition::CancelAndDrain)
+        || !(2..=64).contains(&desired.volumes.len())
+        || desired.placement.node_id != accepted.session().node_id
+        || desired
+            .volumes
+            .iter()
+            .any(|volume| !matches!(volume.acquire, VolumeAcquire::Normal { .. }))
+    {
+        return MultiAcquireAdmission::StopLocal;
+    }
+    let observation = accepted.observation();
+    if !observation.complete_inventory
+        || observation.node_id != accepted.session().node_id
+        || observation.node_boot_id != accepted.session().node_boot_id
+        || observation.agent_instance_id != accepted.session().agent_instance_id
+        || observation.agent_session_epoch != accepted.session().agent_session_epoch
+        || observation.inventory_epoch != accepted.attestation().inventory_epoch
+        || observation.inventory_digest.as_ref() != Some(&accepted.attestation().inventory_digest)
+        || observation.inventory_read_position
+            != Some(accepted.attestation().inventory_read_position)
+        || accepted.attestation().node_id != accepted.session().node_id
+        || accepted.attestation().agent_session_epoch != accepted.session().agent_session_epoch
+        || accepted.attestation().accepted_at_unix_ms >= accepted.session().lease_deadline_unix_ms
+    {
+        return MultiAcquireAdmission::StopLocal;
+    }
+    let mut matching = observation
+        .runtimes
+        .iter()
+        .filter(|runtime| runtime.cat_id == desired.cat_id);
+    let Some(runtime) = matching.next() else {
+        return MultiAcquireAdmission::RefreshInventory;
+    };
+    if matching.next().is_some() {
+        return MultiAcquireAdmission::StopLocal;
+    }
+    let expected_applied = AppliedDesiredEvidence {
+        desired_revision: desired.desired_revision,
+        spec_digest: desired.spec_digest.clone(),
+        placement: desired.placement.clone(),
+        target: desired.target,
+    };
+    if runtime.applied_desired.as_ref() != Some(&expected_applied)
+        || runtime.runtime_incarnation.is_some()
+        || runtime.stable_state.is_some()
+        || !runtime.processes.is_empty()
+        || runtime.volumes.len() != desired.volumes.len()
+        || !runtime.mounts.is_empty()
+        || !runtime.networks.is_empty()
+        || !matches!(runtime.guest_transport, GuestTransportEvidence::Unavailable)
+        || !matches!(runtime.warm_snapshot, WarmSnapshotEvidence::Absent)
+        || runtime.lifecycle_admission != LifecycleAdmission::Closed
+        || !runtime.routes.is_empty()
+        || runtime.platform_guards != 0
+        || runtime.conditions
+            != [Condition::Progressing {
+                reason: ProgressingReason::ReconcileStep {
+                    step: runtime.step.clone(),
+                },
+            }]
+    {
+        return MultiAcquireAdmission::StopLocal;
+    }
+    for intent in &desired.volumes {
+        let Some(observed) = runtime
+            .volumes
+            .iter()
+            .find(|observed| observed.volume_id == intent.volume_id)
+        else {
+            return MultiAcquireAdmission::StopLocal;
+        };
+        let VolumeAcquire::Normal {
+            expected_unowned_epoch,
+            ..
+        } = &intent.acquire
+        else {
+            return MultiAcquireAdmission::StopLocal;
+        };
+        let Some(identity) = expected_attachment_identity(desired, intent, *expected_unowned_epoch)
+        else {
+            return MultiAcquireAdmission::StopLocal;
+        };
+        let Ok(data_directory) = host_path(
+            &authorized_blockd_data_directory(state_directory, desired, &identity),
+            "multi-volume expected blockd data directory",
+        ) else {
+            return MultiAcquireAdmission::StopLocal;
+        };
+        let disk_kind = match intent.disk_kind {
+            DiskKind::Root => ObservedDiskKind::Root,
+            DiskKind::Persistent => ObservedDiskKind::Persistent,
+        };
+        if observed.volume_intent_id.as_ref() != Some(&intent.volume_intent_id)
+            || observed.disk_id.as_ref() != Some(&intent.disk_id)
+            || observed.disk_kind != disk_kind
+            || observed.size_bytes != Some(intent.size_bytes)
+            || observed.durability != Some(intent.durability)
+            || !observed.devices.is_empty()
+            || !observed_authority_head(observed)
+                .is_some_and(|head| multi_acquire_head_matches_intent(intent, head))
+        {
+            return MultiAcquireAdmission::StopLocal;
+        }
+        match &observed.authority {
+            VolumeAuthorityEvidence::Unowned {
+                attachment_epoch, ..
+            } if attachment_epoch == expected_unowned_epoch
+                && observed.local_lineages.is_empty() => {}
+            VolumeAuthorityEvidence::Owned {
+                attachment_id,
+                attachment_epoch,
+                head,
+            } if attachment_id == &intent.attachment_id
+                && *attachment_epoch == identity.attachment_epoch
+                && (observed.local_lineages.is_empty()
+                    || observed.local_lineages
+                        == [expected_local_lineage_at_head(
+                            &identity,
+                            &data_directory,
+                            head,
+                        )]) => {}
+            _ => return MultiAcquireAdmission::StopLocal,
+        }
+    }
+    let checkpoint_path =
+        runtime_checkpoint_path(&state_directory.join(CHECKPOINT_NAMESPACE), &desired.cat_id);
+    let phase_is_exact = match (&runtime.step, &runtime.checkpoint) {
+        (
+            ReconcileStep::InspectInventory { inventory_epoch },
+            CheckpointEvidence::Missing {
+                checkpoint_path: observed,
+            },
+        ) => {
+            *inventory_epoch == observation.inventory_epoch
+                && path_matches(observed, &checkpoint_path)
+                && runtime
+                    .volumes
+                    .iter()
+                    .all(|volume| volume.local_lineages.is_empty())
+        }
+        (
+            ReconcileStep::AcquireVolume { request },
+            CheckpointEvidence::Valid {
+                cat_id,
+                node_id,
+                placement_epoch,
+                desired_revision,
+                spec_digest,
+                runtime_incarnation,
+                stable_state,
+                step,
+                checkpoint_path: observed,
+                ..
+            },
+        ) => {
+            cat_id == &desired.cat_id
+                && node_id == &desired.placement.node_id
+                && *placement_epoch == desired.placement.placement_epoch
+                && *desired_revision == desired.desired_revision
+                && spec_digest == &desired.spec_digest
+                && runtime_incarnation.is_none()
+                && stable_state.is_none()
+                && step.as_ref() == &runtime.step
+                && path_matches(observed, &checkpoint_path)
+                && desired
+                    .volumes
+                    .iter()
+                    .any(|volume| request_matches_volume(request, desired, volume))
+        }
+        (ReconcileStep::ProvisionRootImage { .. }, CheckpointEvidence::Valid { step, .. }) => {
+            step.as_ref() == &runtime.step
+        }
+        _ => false,
+    };
+    if phase_is_exact {
+        MultiAcquireAdmission::Exact(runtime)
+    } else {
+        MultiAcquireAdmission::StopLocal
+    }
+}
+
+fn multi_acquire_head_matches_intent(intent: &VolumeIntent, head: &RemoteHead) -> bool {
+    match (intent.disk_kind, intent.mount.as_ref()) {
+        (DiskKind::Root, None) => true,
+        (DiskKind::Persistent, Some(mount)) => match &mount.initialization {
+            cats_api::runtime_reconciliation::FilesystemInitialization::Initialize {
+                expected_blank_head,
+                ..
+            } => head == expected_blank_head,
+            cats_api::runtime_reconciliation::FilesystemInitialization::Existing => {
+                head.generation.get() > 0
+            }
+        },
+        _ => false,
+    }
+}
+
+fn expected_local_lineage_at_head(
+    identity: &AttachmentLineageIdentity,
+    data_directory: &HostPath,
+    head: &RemoteHead,
+) -> LocalVolumeLineage {
+    let mut lineage = expected_local_lineage(identity, data_directory);
+    lineage.local_durable_generation = head.generation;
+    lineage.remote_durable_generation = head.generation;
+    lineage
+}
+
+fn next_multi_checkpoint_time(stored: &StoredCheckpoint) -> anyhow::Result<UnixMillis> {
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .context("system clock precedes Unix epoch")?
+        .as_millis();
+    let now = u64::try_from(now).context("system time exceeds wire range")?;
+    let minimum = stored
+        .checkpoint()
+        .updated_at_unix_ms
+        .get()
+        .checked_add(1)
+        .context("multi-volume checkpoint timestamp exhausted")?;
+    UnixMillis::new(now.max(minimum)).context("multi-volume checkpoint timestamp is invalid")
 }
 
 enum ImageHeadDecision {
@@ -2773,7 +3297,10 @@ fn owned_observed_volume(
         volume_intent_id: Some(volume.volume_intent_id.clone()),
         disk_id: Some(volume.disk_id.clone()),
         volume_id: volume.volume_id.clone(),
-        disk_kind: ObservedDiskKind::Root,
+        disk_kind: match volume.disk_kind {
+            DiskKind::Root => ObservedDiskKind::Root,
+            DiskKind::Persistent => ObservedDiskKind::Persistent,
+        },
         size_bytes: Some(volume.size_bytes),
         durability: Some(volume.durability),
         authority: VolumeAuthorityEvidence::Owned {
@@ -2792,9 +3319,10 @@ pub(super) fn prepared_owned_observed_volume(
     data_directory: HostPath,
 ) -> ObservedVolume {
     let mut observed = owned_observed_volume(volume, attachment);
-    observed.local_lineages.push(expected_local_lineage(
+    observed.local_lineages.push(expected_local_lineage_at_head(
         &attachment.identity,
         &data_directory,
+        &attachment.head,
     ));
     observed
 }
@@ -2838,7 +3366,11 @@ pub(super) fn provision_checkpoint_is_bound(
     };
     let expected_data_directory =
         authorized_blockd_data_directory(state_directory, desired, &expected_identity);
-    let [observed_volume] = checkpoint.volumes.as_slice() else {
+    let Some(observed_volume) = checkpoint
+        .volumes
+        .iter()
+        .find(|observed| observed.volume_id == volume.volume_id)
+    else {
         return false;
     };
     let observed_head = match &observed_volume.authority {
@@ -2875,6 +3407,17 @@ pub(super) fn provision_checkpoint_is_bound(
         && checkpoint.runtime_incarnation.is_none()
         && checkpoint.stable_state.is_none()
         && checkpoint.processes.is_empty()
+        && checkpoint.volumes.len() == desired.volumes.len()
+        && desired.volumes.iter().all(|intent| {
+            checkpoint.volumes.iter().find(|observed| {
+                observed.volume_id == intent.volume_id
+            }).is_some_and(|observed| {
+                if intent.volume_id == volume.volume_id {
+                    return true;
+                }
+                prepared_observed_volume_is_exact(desired, intent, observed, state_directory)
+            })
+        })
         && observed_volume_matches
         && checkpoint.mounts.is_empty()
         && checkpoint.networks.is_empty()
@@ -2905,6 +3448,61 @@ pub(super) fn provision_checkpoint_is_bound(
         && !process_identity_token.as_str().is_empty()
         && control_socket_path.as_str()
             == format!("{}/{}", data_directory.as_str(), ROOT_PROVISION_SOCKET)
+}
+
+fn prepared_observed_volume_is_exact(
+    desired: &DesiredRuntimeSpec,
+    intent: &VolumeIntent,
+    observed: &ObservedVolume,
+    state_directory: &std::path::Path,
+) -> bool {
+    let VolumeAcquire::Normal {
+        expected_unowned_epoch,
+        ..
+    } = intent.acquire
+    else {
+        return false;
+    };
+    let Some(identity) = expected_attachment_identity(desired, intent, expected_unowned_epoch)
+    else {
+        return false;
+    };
+    let expected_data_directory =
+        authorized_blockd_data_directory(state_directory, desired, &identity);
+    let Ok(expected_data_directory) = host_path(
+        &expected_data_directory,
+        "prepared observed Volume data directory",
+    ) else {
+        return false;
+    };
+    let VolumeAuthorityEvidence::Owned {
+        attachment_id,
+        attachment_epoch,
+        head,
+    } = &observed.authority
+    else {
+        return false;
+    };
+    observed.volume_intent_id.as_ref() == Some(&intent.volume_intent_id)
+        && observed.disk_id.as_ref() == Some(&intent.disk_id)
+        && observed.volume_id == intent.volume_id
+        && observed.disk_kind
+            == match intent.disk_kind {
+                DiskKind::Root => ObservedDiskKind::Root,
+                DiskKind::Persistent => ObservedDiskKind::Persistent,
+            }
+        && observed.size_bytes == Some(intent.size_bytes)
+        && observed.durability == Some(intent.durability)
+        && observed.devices.is_empty()
+        && attachment_id == &intent.attachment_id
+        && *attachment_epoch == identity.attachment_epoch
+        && multi_acquire_head_matches_intent(intent, head)
+        && observed.local_lineages
+            == [expected_local_lineage_at_head(
+                &identity,
+                &expected_data_directory,
+                head,
+            )]
 }
 
 fn root_provision_scope_id_is_canonical(scope_id: &Id) -> bool {

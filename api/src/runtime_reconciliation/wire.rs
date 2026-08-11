@@ -2850,23 +2850,7 @@ fn reconcile_step_schema() -> Schema {
             ),
             variant(
                 "prepare_device",
-                vec![
-                    field("volume_intent_id", id()),
-                    field("disk_id", id()),
-                    field("volume_id", id()),
-                    field("disk_kind", closed(&["root", "persistent"])),
-                    field("attachment_id", id()),
-                    field("attachment_epoch", number(1, MAX_WIRE_INTEGER)),
-                    field("acquire_origin", acquire_origin_schema()),
-                    field("expected_head", remote_head_schema()),
-                    field("size_bytes", number(1, MAX_WIRE_INTEGER)),
-                    field("durability", closed(&["strict", "relaxed"])),
-                    field("guest_device", guest_device_schema()),
-                    field("ownership_token", random_id()),
-                    field("serving_authority", serving_authority_provenance_schema()),
-                    field("serving_process", serving_blockd_identity_schema()),
-                    field("frontend", prepare_device_frontend_schema()),
-                ],
+                vec![field("devices", array(prepared_device_input_schema(), 64))],
             ),
             variant(
                 "prepare_network",
@@ -6315,6 +6299,36 @@ fn validate_desired_read_snapshot(snapshot: &DesiredReadSnapshot) -> Result<(), 
         |spec| spec.cat_id.as_str().as_bytes().to_vec(),
         &mut candidates,
     );
+    let all_volumes = snapshot
+        .desired_specs
+        .iter()
+        .flat_map(|spec| spec.volumes.iter())
+        .collect::<Vec<_>>();
+    if has_duplicate(all_volumes.iter().map(|volume| &volume.volume_intent_id))
+        || has_duplicate(all_volumes.iter().map(|volume| &volume.disk_id))
+        || has_duplicate(all_volumes.iter().map(|volume| &volume.volume_id))
+        || has_duplicate(all_volumes.iter().map(|volume| &volume.attachment_id))
+        || has_duplicate(
+            all_volumes
+                .iter()
+                .filter_map(|volume| volume.mount.as_ref().map(|mount| &mount.filesystem_uuid)),
+        )
+        || has_duplicate(all_volumes.iter().filter_map(|volume| {
+            let FilesystemInitialization::Initialize {
+                initialization_token,
+                ..
+            } = &volume.mount.as_ref()?.initialization
+            else {
+                return None;
+            };
+            Some(initialization_token)
+        }))
+    {
+        candidates.push(Candidate::at(
+            &specs_path,
+            MalformedProblem::DuplicateIdentity,
+        ));
+    }
     for (index, spec) in snapshot.desired_specs.iter().enumerate() {
         if let Err(error) = validate_desired_runtime_spec(spec, true) {
             candidates.push(rebase_contract_candidate(
@@ -6469,6 +6483,29 @@ fn validate_desired_runtime_spec(
             MalformedProblem::DuplicateIdentity,
         ));
     }
+    if has_duplicate(
+        spec.volumes
+            .iter()
+            .filter_map(|volume| volume.mount.as_ref().map(|mount| &mount.filesystem_uuid)),
+    ) || has_duplicate(
+        spec.volumes
+            .iter()
+            .filter_map(|volume| volume.mount.as_ref().map(|mount| &mount.mount_path)),
+    ) || has_duplicate(spec.volumes.iter().filter_map(|volume| {
+        let FilesystemInitialization::Initialize {
+            initialization_token,
+            ..
+        } = &volume.mount.as_ref()?.initialization
+        else {
+            return None;
+        };
+        Some(initialization_token)
+    })) {
+        arrays.push(Candidate::at(
+            &volumes_path,
+            MalformedProblem::DuplicateIdentity,
+        ));
+    }
     collect_unique_order(
         &spec.endpoints,
         &endpoints_path,
@@ -6497,6 +6534,14 @@ fn validate_desired_runtime_spec(
     );
     for (index, volume) in spec.volumes.iter().enumerate() {
         let volume_path = indexed(&volumes_path, index);
+        if usize::from(volume.guest_device.slot) != index
+            || match index {
+                0 => volume.disk_kind != DiskKind::Root,
+                _ => volume.disk_kind != DiskKind::Persistent,
+            }
+        {
+            cross.push(Candidate::at(&volume_path, MalformedProblem::InvalidValue));
+        }
         let disposition_valid = match spec.target {
             RuntimeTarget::Deleted => !matches!(volume.disposition, VolumeDisposition::Retain),
             _ => matches!(volume.disposition, VolumeDisposition::Retain),
@@ -6530,10 +6575,11 @@ fn validate_desired_runtime_spec(
             ));
         }
         if let Some(Ext4MountIntent {
+            filesystem_uuid,
             initialization:
                 FilesystemInitialization::Initialize {
+                    initialization_token,
                     expected_blank_head,
-                    ..
                 },
             ..
         }) = &volume.mount
@@ -6546,7 +6592,20 @@ fn validate_desired_runtime_spec(
                 ),
                 &mut cross,
             );
+            if expected_blank_head.generation.get() != 0 || initialization_token == filesystem_uuid
+            {
+                cross.push(Candidate::at(
+                    &child(
+                        &child(&child(&volume_path, "mount"), "initialization"),
+                        "expected_blank_head",
+                    ),
+                    MalformedProblem::InvalidValue,
+                ));
+            }
         }
+    }
+    if spec.volumes.is_empty() || spec.volumes.len() > 64 {
+        cross.push(Candidate::at(&volumes_path, MalformedProblem::InvalidValue));
     }
     if let RuntimeTransition::RequireIdle {
         source_revision, ..
@@ -8107,7 +8166,8 @@ fn collect_step_arrays(step: &ReconcileStep, path: &[PathSegment], output: &mut 
             |head| head.volume_id.as_str().as_bytes().to_vec(),
             output,
         ),
-        ReconcileStep::PrepareNetwork { devices, .. }
+        ReconcileStep::PrepareDevice { devices }
+        | ReconcileStep::PrepareNetwork { devices, .. }
         | ReconcileStep::StartRuntime { devices, .. } => {
             collect_prepared_device_arrays(devices, &child(path, "devices"), output);
         }
@@ -8919,29 +8979,8 @@ fn collect_reconcile_step_cross(
     output: &mut Vec<Candidate>,
 ) {
     match step {
-        ReconcileStep::PrepareDevice {
-            disk_kind,
-            guest_device,
-            expected_head,
-            ownership_token,
-            serving_authority,
-            serving_process,
-            frontend,
-            ..
-        } => {
-            collect_device_kind_authority_cross(*disk_kind, serving_authority, path, output);
-            collect_prepared_device_cross(
-                expected_head,
-                ownership_token,
-                serving_authority,
-                serving_process,
-                frontend,
-                path,
-                output,
-            );
-            if matches!(disk_kind, DiskKind::Root) != (guest_device.slot == 0) {
-                output.push(Candidate::at(path, MalformedProblem::InvalidValue));
-            }
+        ReconcileStep::PrepareDevice { devices } => {
+            collect_prepared_devices_cross(devices, &child(path, "devices"), None, output)
         }
         ReconcileStep::PrepareNetwork { network, devices } => {
             let network_path = child(path, "network");

@@ -17,7 +17,7 @@ const CHECKPOINT_DIGEST: &str =
 const PROVISION_ROOT_CHECKPOINT_DIGEST: &str =
     "sha256:f1df3e1cfe83fdd0b4a4a5ead32f1ba71533cddbb38e2dc354e0a277a92addcb";
 const PREPARE_DEVICE_CHECKPOINT_DIGEST: &str =
-    "sha256:b4e9dede555012beda172cea554c354c318ee9ab0fa750121d28f98075615244";
+    "sha256:393a4a5b06a3233cd2fdf01c84a062c083fd58b98711f5f168c397b4fa827cc2";
 const PREPARE_NETWORK_CHECKPOINT_DIGEST: &str =
     "sha256:552b431b1440c0f8fb6fa9656b8846f7ec7d959703884be4d3b5894f45d4a4f6";
 const START_RUNTIME_CHECKPOINT_DIGEST: &str =
@@ -96,6 +96,30 @@ fn literal_file_bytes(value: &'static str) -> &'static [u8] {
 
 fn desired_value() -> serde_json::Value {
     serde_json::from_slice(&desired_wire(SPEC_DIGEST)).unwrap()
+}
+
+fn append_initializing_persistent_volume(
+    desired: &mut serde_json::Value,
+    expected_blank_head: serde_json::Value,
+) {
+    let mut volume = desired["volumes"][0].clone();
+    volume["volume_intent_id"] = "vint_zdata".into();
+    volume["disk_id"] = "disk_zdata".into();
+    volume["volume_id"] = "vol_zdata".into();
+    volume["disk_kind"] = "persistent".into();
+    volume["attachment_id"] = "att_zdata".into();
+    volume["acquire"]["transition_id"] = "33333333333333333333333333333333".into();
+    volume["guest_device"] = serde_json::json!({"serial": "cats-data", "slot": 1});
+    volume["mount"] = serde_json::json!({
+        "filesystem_uuid": "99999999999999999999999999999999",
+        "mount_path": "/data",
+        "initialization": {
+            "kind": "initialize",
+            "initialization_token": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "expected_blank_head": expected_blank_head,
+        },
+    });
+    desired["volumes"].as_array_mut().unwrap().push(volume);
 }
 
 fn zero_remote_head() -> serde_json::Value {
@@ -190,6 +214,12 @@ fn provision_root_image_step(size_bytes: u64) -> serde_json::Value {
 fn prepare_device_step() -> serde_json::Value {
     serde_json::json!({
         "kind": "prepare_device",
+        "devices": [prepared_device_input()],
+    })
+}
+
+fn prepared_device_input() -> serde_json::Value {
+    serde_json::json!({
         "volume_intent_id": "vint_root",
         "disk_id": "disk_root",
         "volume_id": "vol_root",
@@ -235,12 +265,6 @@ fn prepare_device_step() -> serde_json::Value {
             "queue_size": 256,
         },
     })
-}
-
-fn prepared_device_input() -> serde_json::Value {
-    let mut input = prepare_device_step();
-    input.as_object_mut().unwrap().remove("kind");
-    input
 }
 
 fn observed_prepared_volume(device_present: bool) -> serde_json::Value {
@@ -672,8 +696,8 @@ fn set_start_runtime_kernel_device_path(checkpoint: &mut serde_json::Value, devi
 
 fn direct_prepare_device_step(purpose: &str, head: serde_json::Value) -> serde_json::Value {
     let mut step = prepare_device_step();
-    step["expected_head"] = head;
-    step["serving_authority"] = serde_json::json!({
+    step["devices"][0]["expected_head"] = head;
+    step["devices"][0]["serving_authority"] = serde_json::json!({
         "kind": "direct_authorized_attachment",
         "authorization": {
             "path": "/var/lib/cats/attachments/cat_01/authorized-serving.json",
@@ -688,9 +712,11 @@ fn direct_prepare_device_step(purpose: &str, head: serde_json::Value) -> serde_j
 }
 
 fn persistent_prepare_device_step(purpose: &str, head: serde_json::Value) -> serde_json::Value {
-    let mut step = direct_prepare_device_step(purpose, head);
-    step["disk_kind"] = "persistent".into();
-    step["guest_device"] = serde_json::json!({"serial": "cats-data", "slot": 1});
+    let mut step = prepare_device_step();
+    let mut persistent = prepared_follower_input();
+    persistent["expected_head"] = head;
+    persistent["serving_authority"]["purpose"] = purpose.into();
+    step["devices"].as_array_mut().unwrap().push(persistent);
     step
 }
 
@@ -1134,13 +1160,14 @@ fn fixed_desired_and_checkpoint_digests_match() {
         checkpoint_content_digest(&prepare).unwrap().as_str(),
         PREPARE_DEVICE_CHECKPOINT_DIGEST
     );
-    let ReconcileStep::PrepareDevice {
-        serving_authority, ..
-    } = &prepare.step
-    else {
+    let ReconcileStep::PrepareDevice { devices } = &prepare.step else {
         panic!("fixed PrepareDevice vector changed step kind")
     };
-    let ServingAuthorityProvenance::AfterRootProvision { handoff } = serving_authority.as_ref()
+    let [device] = devices.as_slice() else {
+        panic!("fixed PrepareDevice vector changed device count")
+    };
+    let ServingAuthorityProvenance::AfterRootProvision { handoff } =
+        device.serving_authority.as_ref()
     else {
         panic!("fixed PrepareDevice vector lost root handoff provenance")
     };
@@ -3164,8 +3191,7 @@ fn fixed_running_launch_chain_preserves_desired_binding_and_prepared_authority()
         serde_json::from_str(PREPARE_NETWORK_CHECKPOINT_WIRE.as_ref()).unwrap();
     let fixed_start_runtime: serde_json::Value =
         serde_json::from_str(START_RUNTIME_CHECKPOINT_WIRE.as_ref()).unwrap();
-    let mut retained = prepare_device["step"].clone();
-    retained.as_object_mut().unwrap().remove("kind");
+    let retained = prepare_device["step"]["devices"][0].clone();
 
     // Construct the successor from the full predecessor, replacing only the
     // step. This catches a fixture that silently changes revision/spec or
@@ -4586,16 +4612,14 @@ fn prepare_device_step_is_shared_by_every_wire_host() {
     let decoded = decode_runtime_checkpoint(&serde_json::to_vec(&checkpoint).unwrap()).unwrap();
     assert!(matches!(
         decoded.step,
-        ReconcileStep::PrepareDevice {
-            attachment_epoch,
-            size_bytes: 4_294_967_296,
-            ref ownership_token,
-            ref serving_process,
-            ..
-        } if attachment_epoch.get() == 8
-            && ownership_token.as_str() == "88888888888888888888888888888888"
-            && serving_process.process_identity_token.as_str()
+        ReconcileStep::PrepareDevice { ref devices }
+        if matches!(devices.as_slice(), [device]
+            if device.attachment_epoch.get() == 8
+            && device.size_bytes == 4_294_967_296
+            && device.ownership_token.as_str() == "88888888888888888888888888888888"
+            && device.serving_process.process_identity_token.as_str()
                 == "77777777777777777777777777777777"
+        )
     ));
     assert_eq!(
         serde_json::from_slice::<serde_json::Value>(&encode_runtime_checkpoint(&decoded).unwrap())
@@ -4622,25 +4646,32 @@ fn prepare_device_head_and_disk_kind_are_closed_by_authority_in_every_wire_host(
     type Reject = fn(&[u8]) -> ContractError;
 
     let invalid_steps = [
-        ("root_handoff_blank", {
-            let mut step = prepare_device_step();
-            step["expected_head"] = zero_remote_head();
-            step
-        }),
+        (
+            "root_handoff_blank",
+            {
+                let mut step = prepare_device_step();
+                step["devices"][0]["expected_head"] = zero_remote_head();
+                step
+            },
+            0,
+        ),
         (
             "existing_root_blank",
             direct_prepare_device_step("existing_root", zero_remote_head()),
+            0,
         ),
         (
             "persistent_initialized_blank",
-            direct_prepare_device_step("persistent_initialized", zero_remote_head()),
+            persistent_prepare_device_step("persistent_initialized", zero_remote_head()),
+            1,
         ),
         (
             "persistent_uninitialized_nonblank",
-            direct_prepare_device_step("persistent_uninitialized", nonzero_remote_head()),
+            persistent_prepare_device_step("persistent_uninitialized", nonzero_remote_head()),
+            1,
         ),
     ];
-    for (name, invalid_step) in invalid_steps {
+    for (name, invalid_step, device_index) in invalid_steps {
         let mut checkpoint: serde_json::Value = serde_json::from_str(CHECKPOINT_WIRE).unwrap();
         checkpoint["step"] = invalid_step.clone();
 
@@ -4654,24 +4685,26 @@ fn prepare_device_head_and_disk_kind_are_closed_by_authority_in_every_wire_host(
             "reason": {"kind": "reconcile_step", "step": invalid_step},
         }]);
 
-        let cases: Vec<(&str, serde_json::Value, Reject, &str)> = vec![
+        let cases: Vec<(&str, serde_json::Value, Reject, String)> = vec![
             (
                 "runtime_checkpoint",
                 checkpoint,
                 reject_checkpoint,
-                "/step/expected_head",
+                format!("/step/devices/{device_index}/expected_head"),
             ),
             (
                 "observation_runtime_and_checkpoint",
                 observation,
                 reject_observation,
-                "/runtimes/0/checkpoint/step/expected_head",
+                format!("/runtimes/0/checkpoint/step/devices/{device_index}/expected_head"),
             ),
             (
                 "progressing_condition",
                 condition_host,
                 reject_observation,
-                "/runtimes/0/conditions/0/reason/step/expected_head",
+                format!(
+                    "/runtimes/0/conditions/0/reason/step/devices/{device_index}/expected_head"
+                ),
             ),
         ];
 
@@ -4711,23 +4744,37 @@ fn prepare_device_head_and_disk_kind_are_closed_by_authority_in_every_wire_host(
         (
             "root_persistent_initialized",
             direct_prepare_device_step("persistent_initialized", nonzero_remote_head()),
+            0,
         ),
         (
             "root_persistent_uninitialized",
             direct_prepare_device_step("persistent_uninitialized", zero_remote_head()),
+            0,
         ),
-        ("persistent_root_handoff", {
-            let mut step = prepare_device_step();
-            step["disk_kind"] = "persistent".into();
-            step["guest_device"] = serde_json::json!({"serial": "cats-data", "slot": 1});
-            step
-        }),
+        (
+            "persistent_root_handoff",
+            {
+                let mut step =
+                    persistent_prepare_device_step("persistent_initialized", nonzero_remote_head());
+                step["devices"][1]["serving_authority"] =
+                    step["devices"][0]["serving_authority"].clone();
+                step["devices"][1]["serving_authority"]["handoff"]["record"]["path"] =
+                    "/var/lib/cats/handoffs/cat_01/data-root-serving.json".into();
+                step["devices"][1]["serving_authority"]["handoff"]["record"]["inode"] = 44.into();
+                step["devices"][1]["serving_authority"]["handoff"]["record"]["content_sha256"] =
+                    "sha256:5555555555555555555555555555555555555555555555555555555555555555"
+                        .into();
+                step
+            },
+            1,
+        ),
         (
             "persistent_existing_root",
             persistent_prepare_device_step("existing_root", nonzero_remote_head()),
+            1,
         ),
     ];
-    for (name, invalid_step) in invalid_kind_steps {
+    for (name, invalid_step, device_index) in invalid_kind_steps {
         let mut checkpoint: serde_json::Value = serde_json::from_str(CHECKPOINT_WIRE).unwrap();
         checkpoint["step"] = invalid_step.clone();
 
@@ -4746,19 +4793,21 @@ fn prepare_device_head_and_disk_kind_are_closed_by_authority_in_every_wire_host(
                 "runtime_checkpoint",
                 checkpoint,
                 reject_checkpoint as Reject,
-                "/step/serving_authority",
+                format!("/step/devices/{device_index}/serving_authority"),
             ),
             (
                 "observation_runtime_and_checkpoint",
                 observation,
                 reject_observation as Reject,
-                "/runtimes/0/checkpoint/step/serving_authority",
+                format!("/runtimes/0/checkpoint/step/devices/{device_index}/serving_authority"),
             ),
             (
                 "progressing_condition",
                 condition_host,
                 reject_observation as Reject,
-                "/runtimes/0/conditions/0/reason/step/serving_authority",
+                format!(
+                    "/runtimes/0/conditions/0/reason/step/devices/{device_index}/serving_authority"
+                ),
             ),
         ] {
             let error = reject(&serde_json::to_vec(&value).unwrap());
@@ -4798,7 +4847,7 @@ fn launch_steps_close_nested_device_kind_and_authority_purpose() {
     }
 
     let root_persistent_authority =
-        direct_prepare_device_step("persistent_initialized", nonzero_remote_head())
+        direct_prepare_device_step("persistent_initialized", nonzero_remote_head())["devices"][0]
             ["serving_authority"]
             .clone();
     let mut prepare_network = prepare_network_checkpoint_value();
@@ -4835,21 +4884,24 @@ fn prepare_device_numeric_boundaries_and_frontends_are_closed() {
     for value in [1_u64, i64::MAX as u64] {
         let mut checkpoint: serde_json::Value = serde_json::from_str(CHECKPOINT_WIRE).unwrap();
         checkpoint["step"] = prepare_device_step();
-        checkpoint["step"]["attachment_epoch"] = value.into();
-        checkpoint["step"]["size_bytes"] = value.into();
-        checkpoint["step"]["serving_authority"]["handoff"]["record"]["length"] = value.into();
+        checkpoint["step"]["devices"][0]["attachment_epoch"] = value.into();
+        checkpoint["step"]["devices"][0]["size_bytes"] = value.into();
+        checkpoint["step"]["devices"][0]["serving_authority"]["handoff"]["record"]["length"] =
+            value.into();
         decode_runtime_checkpoint(&serde_json::to_vec(&checkpoint).unwrap()).unwrap();
     }
     for value in [0_u64, i64::MAX as u64] {
         let mut checkpoint: serde_json::Value = serde_json::from_str(CHECKPOINT_WIRE).unwrap();
         checkpoint["step"] = prepare_device_step();
-        checkpoint["step"]["serving_authority"]["handoff"]["record"]["device"] = value.into();
+        checkpoint["step"]["devices"][0]["serving_authority"]["handoff"]["record"]["device"] =
+            value.into();
         decode_runtime_checkpoint(&serde_json::to_vec(&checkpoint).unwrap()).unwrap();
     }
     for value in [1_u64, i64::MAX as u64] {
         let mut checkpoint: serde_json::Value = serde_json::from_str(CHECKPOINT_WIRE).unwrap();
         checkpoint["step"] = prepare_device_step();
-        checkpoint["step"]["serving_authority"]["handoff"]["record"]["inode"] = value.into();
+        checkpoint["step"]["devices"][0]["serving_authority"]["handoff"]["record"]["inode"] =
+            value.into();
         decode_runtime_checkpoint(&serde_json::to_vec(&checkpoint).unwrap()).unwrap();
     }
 
@@ -4857,47 +4909,51 @@ fn prepare_device_numeric_boundaries_and_frontends_are_closed() {
     for (queues, queue_size) in valid_vhost {
         let mut checkpoint: serde_json::Value = serde_json::from_str(CHECKPOINT_WIRE).unwrap();
         checkpoint["step"] = prepare_device_step();
-        checkpoint["step"]["frontend"]["queues"] = queues.into();
-        checkpoint["step"]["frontend"]["queue_size"] = queue_size.into();
+        checkpoint["step"]["devices"][0]["frontend"]["queues"] = queues.into();
+        checkpoint["step"]["devices"][0]["frontend"]["queue_size"] = queue_size.into();
         decode_runtime_checkpoint(&serde_json::to_vec(&checkpoint).unwrap()).unwrap();
     }
 
     for (pointer, value) in [
-        ("/step/attachment_epoch", 0_u64),
-        ("/step/attachment_epoch", i64::MAX as u64 + 1),
-        ("/step/size_bytes", 0),
-        ("/step/size_bytes", i64::MAX as u64 + 1),
-        ("/step/serving_authority/handoff/record/length", 0),
+        ("/step/devices/0/attachment_epoch", 0_u64),
+        ("/step/devices/0/attachment_epoch", i64::MAX as u64 + 1),
+        ("/step/devices/0/size_bytes", 0),
+        ("/step/devices/0/size_bytes", i64::MAX as u64 + 1),
+        ("/step/devices/0/serving_authority/handoff/record/length", 0),
         (
-            "/step/serving_authority/handoff/record/length",
+            "/step/devices/0/serving_authority/handoff/record/length",
             i64::MAX as u64 + 1,
         ),
         (
-            "/step/serving_authority/handoff/record/device",
+            "/step/devices/0/serving_authority/handoff/record/device",
             i64::MAX as u64 + 1,
         ),
-        ("/step/serving_authority/handoff/record/inode", 0),
+        ("/step/devices/0/serving_authority/handoff/record/inode", 0),
         (
-            "/step/serving_authority/handoff/record/inode",
+            "/step/devices/0/serving_authority/handoff/record/inode",
             i64::MAX as u64 + 1,
         ),
     ] {
         let mut checkpoint: serde_json::Value = serde_json::from_str(CHECKPOINT_WIRE).unwrap();
         checkpoint["step"] = prepare_device_step();
         match pointer {
-            "/step/attachment_epoch" => checkpoint["step"]["attachment_epoch"] = value.into(),
-            "/step/size_bytes" => checkpoint["step"]["size_bytes"] = value.into(),
-            "/step/serving_authority/handoff/record/length" => {
-                checkpoint["step"]["serving_authority"]["handoff"]["record"]["length"] =
-                    value.into();
+            "/step/devices/0/attachment_epoch" => {
+                checkpoint["step"]["devices"][0]["attachment_epoch"] = value.into()
             }
-            "/step/serving_authority/handoff/record/device" => {
-                checkpoint["step"]["serving_authority"]["handoff"]["record"]["device"] =
-                    value.into();
+            "/step/devices/0/size_bytes" => {
+                checkpoint["step"]["devices"][0]["size_bytes"] = value.into()
             }
-            "/step/serving_authority/handoff/record/inode" => {
-                checkpoint["step"]["serving_authority"]["handoff"]["record"]["inode"] =
-                    value.into();
+            "/step/devices/0/serving_authority/handoff/record/length" => {
+                checkpoint["step"]["devices"][0]["serving_authority"]["handoff"]["record"]
+                    ["length"] = value.into();
+            }
+            "/step/devices/0/serving_authority/handoff/record/device" => {
+                checkpoint["step"]["devices"][0]["serving_authority"]["handoff"]["record"]
+                    ["device"] = value.into();
+            }
+            "/step/devices/0/serving_authority/handoff/record/inode" => {
+                checkpoint["step"]["devices"][0]["serving_authority"]["handoff"]["record"]
+                    ["inode"] = value.into();
             }
             _ => unreachable!(),
         }
@@ -4907,22 +4963,22 @@ fn prepare_device_numeric_boundaries_and_frontends_are_closed() {
     }
 
     for (field, value, pointer) in [
-        ("queues", 0_u64, "/step/frontend/queues"),
-        ("queues", 65, "/step/frontend/queues"),
-        ("queue_size", 1, "/step/frontend/queue_size"),
-        ("queue_size", 3, "/step/frontend/queue_size"),
-        ("queue_size", 32_769, "/step/frontend/queue_size"),
+        ("queues", 0_u64, "/step/devices/0/frontend/queues"),
+        ("queues", 65, "/step/devices/0/frontend/queues"),
+        ("queue_size", 1, "/step/devices/0/frontend/queue_size"),
+        ("queue_size", 3, "/step/devices/0/frontend/queue_size"),
+        ("queue_size", 32_769, "/step/devices/0/frontend/queue_size"),
     ] {
         let mut checkpoint: serde_json::Value = serde_json::from_str(CHECKPOINT_WIRE).unwrap();
         checkpoint["step"] = prepare_device_step();
-        checkpoint["step"]["frontend"][field] = value.into();
+        checkpoint["step"]["devices"][0]["frontend"][field] = value.into();
         let error = reject_checkpoint(&serde_json::to_vec(&checkpoint).unwrap());
         assert_eq!(malformed(&error).0.as_str(), pointer);
         assert_eq!(malformed(&error).1, MalformedProblem::InvalidValue);
     }
 
     let mut kernel = prepare_device_step();
-    kernel["frontend"] = serde_json::json!({
+    kernel["devices"][0]["frontend"] = serde_json::json!({
         "kind": "kernel_nbd",
         "listener_socket_path": "/run/cats/cat_01/root-nbd.sock",
         "device_path": "/dev/nbd0",
@@ -4933,7 +4989,7 @@ fn prepare_device_numeric_boundaries_and_frontends_are_closed() {
     decode_runtime_checkpoint(&serde_json::to_vec(&checkpoint).unwrap()).unwrap();
 
     let mut takeover = prepare_device_step();
-    takeover["acquire_origin"] = serde_json::json!({
+    takeover["devices"][0]["acquire_origin"] = serde_json::json!({
         "kind": "takeover",
         "authorization_id": "auth_01",
     });
@@ -4941,38 +4997,42 @@ fn prepare_device_numeric_boundaries_and_frontends_are_closed() {
     decode_runtime_checkpoint(&serde_json::to_vec(&checkpoint).unwrap()).unwrap();
 
     let mut unknown = prepare_device_step();
-    unknown["frontend"] = serde_json::json!({
+    unknown["devices"][0]["frontend"] = serde_json::json!({
         "kind": "io_uring",
     });
     checkpoint["step"] = unknown;
     let error = reject_checkpoint(&serde_json::to_vec(&checkpoint).unwrap());
-    assert_eq!(malformed(&error).0.as_str(), "/step/frontend/kind");
+    assert_eq!(
+        malformed(&error).0.as_str(),
+        "/step/devices/0/frontend/kind"
+    );
     assert_eq!(malformed(&error).1, MalformedProblem::InvalidValue);
 }
 
 #[test]
 fn prepare_device_rejects_token_and_path_aliases() {
     let cases = [
-        ("device_process_token", "/step/ownership_token", "token"),
-        ("control_frontend_socket", "/step/frontend", "control"),
-        ("kernel_listener_device", "/step/frontend", "kernel"),
-        ("record_control_path", "/step/serving_authority", "record"),
-        ("process_path_alias", "/step/serving_process", "process"),
-        ("frontend_data_path", "/step/frontend", "frontend_data"),
-        ("device_record_path", "/step/frontend", "device_record"),
+        ("device_process_token", "token"),
+        ("control_frontend_socket", "control"),
+        ("kernel_listener_device", "kernel"),
+        ("record_control_path", "record"),
+        ("process_path_alias", "process"),
+        ("frontend_data_path", "frontend_data"),
+        ("device_record_path", "device_record"),
     ];
-    for (name, pointer, mutation) in cases {
+    for (name, mutation) in cases {
         let mut step = prepare_device_step();
         match mutation {
             "token" => {
-                step["ownership_token"] = step["serving_process"]["process_identity_token"].clone()
+                step["devices"][0]["ownership_token"] =
+                    step["devices"][0]["serving_process"]["process_identity_token"].clone()
             }
             "control" => {
-                step["frontend"]["socket_path"] =
-                    step["serving_process"]["control_socket_path"].clone()
+                step["devices"][0]["frontend"]["socket_path"] =
+                    step["devices"][0]["serving_process"]["control_socket_path"].clone()
             }
             "kernel" => {
-                step["frontend"] = serde_json::json!({
+                step["devices"][0]["frontend"] = serde_json::json!({
                     "kind": "kernel_nbd",
                     "listener_socket_path": "/dev/nbd0",
                     "device_path": "/dev/nbd0",
@@ -4980,21 +5040,22 @@ fn prepare_device_rejects_token_and_path_aliases() {
                 })
             }
             "record" => {
-                step["serving_authority"]["handoff"]["record"]["path"] =
-                    step["serving_process"]["control_socket_path"].clone()
+                step["devices"][0]["serving_authority"]["handoff"]["record"]["path"] =
+                    step["devices"][0]["serving_process"]["control_socket_path"].clone()
             }
             "process" => {
-                step["serving_process"]["data_directory"] =
-                    step["serving_process"]["control_socket_path"].clone()
+                step["devices"][0]["serving_process"]["data_directory"] =
+                    step["devices"][0]["serving_process"]["control_socket_path"].clone()
             }
             "frontend_data" => {
-                step["frontend"]["socket_path"] = step["serving_process"]["data_directory"].clone()
+                step["devices"][0]["frontend"]["socket_path"] =
+                    step["devices"][0]["serving_process"]["data_directory"].clone()
             }
             "device_record" => {
-                step["frontend"] = serde_json::json!({
+                step["devices"][0]["frontend"] = serde_json::json!({
                     "kind": "kernel_nbd",
                     "listener_socket_path": "/run/cats/cat_01/root-nbd.sock",
-                    "device_path": step["serving_authority"]["handoff"]["record"]["path"].clone(),
+                    "device_path": step["devices"][0]["serving_authority"]["handoff"]["record"]["path"].clone(),
                     "direct": true,
                 })
             }
@@ -5003,10 +5064,10 @@ fn prepare_device_rejects_token_and_path_aliases() {
         let mut checkpoint: serde_json::Value = serde_json::from_str(CHECKPOINT_WIRE).unwrap();
         checkpoint["step"] = step;
         let error = reject_checkpoint(&serde_json::to_vec(&checkpoint).unwrap());
-        assert_eq!(malformed(&error).0.as_str(), pointer, "{name}");
+        assert_eq!(malformed(&error).0.as_str(), "/step/devices", "{name}");
         assert_eq!(
             malformed(&error).1,
-            MalformedProblem::InvalidValue,
+            MalformedProblem::DuplicateIdentity,
             "{name}"
         );
     }
@@ -5021,52 +5082,55 @@ fn prepare_device_rejects_missing_unknown_and_path_only_handoff_proof() {
         "ownership_token": "88888888888888888888888888888888",
     });
     let mut missing = prepare_device_step();
-    missing.as_object_mut().unwrap().remove("serving_authority");
+    missing["devices"][0]
+        .as_object_mut()
+        .unwrap()
+        .remove("serving_authority");
     let mut expanded = prepare_device_step();
     expanded
         .as_object_mut()
         .unwrap()
         .insert("opaque_handoff".to_owned(), serde_json::json!({}));
     let mut path_only = prepare_device_step();
-    path_only["serving_authority"]["handoff"]["record"] = serde_json::json!({
+    path_only["devices"][0]["serving_authority"]["handoff"]["record"] = serde_json::json!({
         "path": "/var/lib/cats/handoffs/cat_01/root-serving.json",
     });
     let mut missing_predecessor = prepare_device_step();
-    missing_predecessor["serving_authority"]["handoff"]
+    missing_predecessor["devices"][0]["serving_authority"]["handoff"]
         .as_object_mut()
         .unwrap()
         .remove("predecessor_checkpoint_content_digest");
     let mut missing_process_token = prepare_device_step();
-    missing_process_token["serving_process"]
+    missing_process_token["devices"][0]["serving_process"]
         .as_object_mut()
         .unwrap()
         .remove("process_identity_token");
     let mut unknown_record = prepare_device_step();
-    unknown_record["serving_authority"]["handoff"]["record"]
+    unknown_record["devices"][0]["serving_authority"]["handoff"]["record"]
         .as_object_mut()
         .unwrap()
         .insert("path_digest".to_owned(), ZERO_DIGEST.into());
     let mut unknown_process = prepare_device_step();
-    unknown_process["serving_process"]
+    unknown_process["devices"][0]["serving_process"]
         .as_object_mut()
         .unwrap()
         .insert("process_id".to_owned(), 1.into());
     let mut unknown_frontend = prepare_device_step();
-    unknown_frontend["frontend"]
+    unknown_frontend["devices"][0]["frontend"]
         .as_object_mut()
         .unwrap()
         .insert("device_path".to_owned(), "/dev/vhost-root".into());
     let mut unknown_direct_purpose =
         direct_prepare_device_step("persistent_initialized", nonzero_remote_head());
-    unknown_direct_purpose["serving_authority"]["purpose"] = "persistent".into();
+    unknown_direct_purpose["devices"][0]["serving_authority"]["purpose"] = "persistent".into();
     let mut path_only_direct =
         direct_prepare_device_step("persistent_initialized", nonzero_remote_head());
-    path_only_direct["serving_authority"]["authorization"] = serde_json::json!({
+    path_only_direct["devices"][0]["serving_authority"]["authorization"] = serde_json::json!({
         "path": "/var/lib/cats/attachments/cat_01/authorized-serving.json",
     });
     let mut unknown_direct_field =
         direct_prepare_device_step("persistent_initialized", nonzero_remote_head());
-    unknown_direct_field["serving_authority"]["authorization"]
+    unknown_direct_field["devices"][0]["serving_authority"]["authorization"]
         .as_object_mut()
         .unwrap()
         .insert("attachment_id".to_owned(), "att_01".into());
@@ -5074,13 +5138,13 @@ fn prepare_device_rejects_missing_unknown_and_path_only_handoff_proof() {
         (
             "old_three_field_shape",
             old_three_field,
-            "/step/acquire_origin",
-            MalformedProblem::MissingField,
+            "/step/guest_device",
+            MalformedProblem::UnknownField,
         ),
         (
             "missing_handoff",
             missing,
-            "/step/serving_authority",
+            "/step/devices/0/serving_authority",
             MalformedProblem::MissingField,
         ),
         (
@@ -5092,55 +5156,55 @@ fn prepare_device_rejects_missing_unknown_and_path_only_handoff_proof() {
         (
             "path_only_handoff",
             path_only,
-            "/step/serving_authority/handoff/record/content_sha256",
+            "/step/devices/0/serving_authority/handoff/record/content_sha256",
             MalformedProblem::MissingField,
         ),
         (
             "missing_predecessor_digest",
             missing_predecessor,
-            "/step/serving_authority/handoff/predecessor_checkpoint_content_digest",
+            "/step/devices/0/serving_authority/handoff/predecessor_checkpoint_content_digest",
             MalformedProblem::MissingField,
         ),
         (
             "missing_process_token",
             missing_process_token,
-            "/step/serving_process/process_identity_token",
+            "/step/devices/0/serving_process/process_identity_token",
             MalformedProblem::MissingField,
         ),
         (
             "unknown_record_field",
             unknown_record,
-            "/step/serving_authority/handoff/record/path_digest",
+            "/step/devices/0/serving_authority/handoff/record/path_digest",
             MalformedProblem::UnknownField,
         ),
         (
             "unknown_process_field",
             unknown_process,
-            "/step/serving_process/process_id",
+            "/step/devices/0/serving_process/process_id",
             MalformedProblem::UnknownField,
         ),
         (
             "unknown_frontend_field",
             unknown_frontend,
-            "/step/frontend/device_path",
+            "/step/devices/0/frontend/device_path",
             MalformedProblem::UnknownField,
         ),
         (
             "unknown_direct_purpose",
             unknown_direct_purpose,
-            "/step/serving_authority/purpose",
+            "/step/devices/0/serving_authority/purpose",
             MalformedProblem::InvalidValue,
         ),
         (
             "path_only_direct_authorization",
             path_only_direct,
-            "/step/serving_authority/authorization/content_sha256",
+            "/step/devices/0/serving_authority/authorization/content_sha256",
             MalformedProblem::MissingField,
         ),
         (
             "unknown_direct_authorization_field",
             unknown_direct_field,
-            "/step/serving_authority/authorization/attachment_id",
+            "/step/devices/0/serving_authority/authorization/attachment_id",
             MalformedProblem::UnknownField,
         ),
     ];
@@ -5573,16 +5637,7 @@ fn close_gate_rejects_old_generic_and_expanded_payload_shapes() {
 #[test]
 fn desired_filesystem_initialization_round_trips_one_remote_head() {
     let mut desired = desired_value();
-    desired["volumes"][0]["disk_kind"] = "persistent".into();
-    desired["volumes"][0]["mount"] = serde_json::json!({
-        "filesystem_uuid": "99999999999999999999999999999999",
-        "mount_path": "/data",
-        "initialization": {
-            "kind": "initialize",
-            "initialization_token": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
-            "expected_blank_head": zero_remote_head(),
-        },
-    });
+    append_initializing_persistent_volume(&mut desired, zero_remote_head());
     refresh_spec_digest(&mut desired);
 
     let decoded = decode_desired_runtime_spec(&serde_json::to_vec(&desired).unwrap()).unwrap();
@@ -5672,16 +5727,7 @@ fn every_remote_head_host_reuses_the_same_validator() {
     });
 
     let mut desired = desired_value();
-    desired["volumes"][0]["disk_kind"] = "persistent".into();
-    desired["volumes"][0]["mount"] = serde_json::json!({
-        "filesystem_uuid": "99999999999999999999999999999999",
-        "mount_path": "/data",
-        "initialization": {
-            "kind": "initialize",
-            "initialization_token": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
-            "expected_blank_head": invalid_head,
-        },
-    });
+    append_initializing_persistent_volume(&mut desired, invalid_head.clone());
 
     let mut checkpoint_step: serde_json::Value = serde_json::from_str(CHECKPOINT_WIRE).unwrap();
     checkpoint_step["step"] = invalid_step.clone();
@@ -5743,7 +5789,7 @@ fn every_remote_head_host_reuses_the_same_validator() {
             "desired_initialization",
             desired,
             reject_desired,
-            "/volumes/0/mount/initialization/expected_blank_head",
+            "/volumes/1/mount/initialization/expected_blank_head",
         ),
         (
             "runtime_checkpoint_step",

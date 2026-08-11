@@ -48,10 +48,10 @@ use super::inventory::{
     network_inventory_bridge_sealed, NetworkInventoryBridge, NetworkInventoryBridgeOutcome,
     RuntimeCheckpointInventoryEvidence,
 };
+pub(super) use super::prepare_device_retirement::prepared_device_set_is_exact;
 use super::prepare_device_retirement::{
-    prepare_device_base_admission_is_exact, prepared_device_input_from_step,
-    prepared_device_input_is_exact, prepared_device_inputs_from_step,
-    retirement_authority_lease_is_monotonic, unique_runtime,
+    prepare_device_base_admission_is_exact, prepared_device_input_is_exact,
+    prepared_device_inputs_from_step, retirement_authority_lease_is_monotonic, unique_runtime,
 };
 use super::retained_runtime_launch::RetainedRuntimeLaunchAuthority;
 use super::serving_blockd_process::{
@@ -370,13 +370,11 @@ impl NetworkReservations {
             }
         } else {
             match &checkpoint.step {
-                ReconcileStep::PrepareDevice {
-                    ownership_token,
-                    serving_process,
-                    ..
-                } => {
-                    record(ownership_token)?;
-                    record(&serving_process.process_identity_token)?;
+                ReconcileStep::PrepareDevice { devices } => {
+                    for device in devices {
+                        record(&device.ownership_token)?;
+                        record(&device.serving_process.process_identity_token)?;
+                    }
                 }
                 ReconcileStep::PrepareNetwork { network, devices } => {
                     record(&network.ownership_token)?;
@@ -1030,59 +1028,82 @@ impl PrepareNetworkReservationEffect {
         if matches!(runtime.step, ReconcileStep::PrepareNetwork { .. }) {
             return self.try_apply_physical(context, desired, runtime);
         }
-        let ReconcileStep::PrepareDevice { frontend, .. } = &runtime.step else {
+        let ReconcileStep::PrepareDevice { devices } = &runtime.step else {
             return Ok(None);
         };
         if !prepare_device_base_admission_is_exact(accepted, desired, runtime) {
             return Ok(Some(local_contract_stop()));
         }
-        let prepared = prepared_device_input_from_step(&runtime.step)?;
-        let Some((expectation, Some(serving))) = context
-            .node_global_process()?
-            .serving_blockd(&desired.cat_id, &prepared.volume_id)
-        else {
-            anyhow::bail!("PrepareNetwork lacks exact provider-private serving proof")
-        };
-        let (volume_id, device) = match frontend {
-            PrepareDeviceFrontend::VhostUserBlk { .. } => serving
-                .vhost_device_projection()
-                .context("PrepareNetwork serving proof is not vhost-user")?,
-            PrepareDeviceFrontend::KernelNbd { .. } => {
-                let exact = context
-                    .kernel_nbd_pool()?
-                    .exact_device(&desired.cat_id, &prepared.volume_id)
-                    .context("PrepareNetwork lacks exact kernel-NBD client proof")?;
-                anyhow::ensure!(
-                    exact.listener().expectation() == expectation,
-                    "PrepareNetwork kernel-NBD and serving proofs disagree"
-                );
-                exact.projection()
+        let process_admission = context.node_global_process()?;
+        if process_admission.serving_blockd_count(&desired.cat_id) != devices.len() {
+            return Ok(Some(RuntimeDesiredEffectOutcome::RefreshInventory));
+        }
+        let mut admitted = Vec::with_capacity(devices.len());
+        for prepared in devices {
+            let Some((expectation, Some(serving))) =
+                process_admission.serving_blockd(&desired.cat_id, &prepared.volume_id)
+            else {
+                return Ok(Some(RuntimeDesiredEffectOutcome::RefreshInventory));
+            };
+            if !expectation.matches_device_contract(&desired.cat_id, prepared) {
+                return Ok(Some(local_contract_stop()));
             }
-        };
-        anyhow::ensure!(
-            runtime.volumes.iter().any(|volume| {
-                volume.volume_id == volume_id && volume.devices == [device.clone()]
-            }),
-            "PrepareNetwork public device projection changed after provider proof"
-        );
-        let [desired_volume] = desired.volumes.as_slice() else {
+            let (volume_id, observed_device) = match &prepared.frontend {
+                PrepareDeviceFrontend::VhostUserBlk { .. } => serving
+                    .vhost_device_projection()
+                    .context("PrepareNetwork serving proof is not vhost-user")?,
+                PrepareDeviceFrontend::KernelNbd { .. } => {
+                    let exact = context
+                        .kernel_nbd_pool()?
+                        .exact_device(&desired.cat_id, &prepared.volume_id)
+                        .context("PrepareNetwork lacks exact kernel-NBD client proof")?;
+                    anyhow::ensure!(
+                        exact.listener().expectation() == expectation
+                            && exact.matches_prepared_device(&desired.cat_id, prepared),
+                        "PrepareNetwork kernel-NBD and serving proofs disagree"
+                    );
+                    exact.projection()
+                }
+            };
+            if !prepare_network_volume_admission_is_exact(
+                desired,
+                runtime,
+                prepared,
+                &volume_id,
+                Some(&observed_device),
+            ) {
+                return Ok(Some(local_contract_stop()));
+            }
+            let first_authority = self
+                .authority
+                .load_volume(expectation.volume_id())
+                .context("load PrepareNetwork Volume authority")?;
+            anyhow::ensure!(
+                expectation.matches_current_authority(&first_authority),
+                "PrepareNetwork Volume authority conflicts with serving admission"
+            );
+            let first_lease_expiry = first_authority
+                .lease_expires_at
+                .context("PrepareNetwork Volume authority lacks a serving lease")?;
+            admitted.push(AdmittedNetworkServing {
+                expectation,
+                serving,
+                first_authority,
+                first_lease_expiry,
+            });
+        }
+        if runtime.processes.len() != admitted.len()
+            || !admitted.iter().all(|entry| {
+                runtime
+                    .processes
+                    .iter()
+                    .filter(|process| entry.serving.matches_public_process(process))
+                    .count()
+                    == 1
+            })
+        {
             return Ok(Some(local_contract_stop()));
-        };
-        anyhow::ensure!(
-            expectation.volume_id() == &desired_volume.volume_id,
-            "PrepareNetwork serving proof names another Volume"
-        );
-        let first_authority = self
-            .authority
-            .load_volume(&desired_volume.volume_id)
-            .context("load PrepareNetwork Volume authority")?;
-        anyhow::ensure!(
-            expectation.matches_current_authority(&first_authority),
-            "PrepareNetwork Volume authority conflicts with serving admission"
-        );
-        let first_lease_expiry = first_authority
-            .lease_expires_at
-            .context("PrepareNetwork Volume authority lacks a serving lease")?;
+        }
 
         let CheckpointEvidence::Valid {
             checkpoint_path,
@@ -1108,21 +1129,13 @@ impl PrepareNetworkReservationEffect {
         if stored.content_digest() != content_digest || stored.checkpoint().step != runtime.step {
             return Ok(Some(RuntimeDesiredEffectOutcome::RefreshInventory));
         }
-        let prepared = prepared_device_input(stored.checkpoint())?;
+        let prepared = prepared_device_inputs(stored.checkpoint())?;
         self.allocation.reserve_and_replace(
             context,
             &store,
             &stored,
             &desired.runtime.network_config,
-            || {
-                self.revalidate_serving_authority(
-                    context,
-                    expectation,
-                    serving,
-                    &first_authority,
-                    first_lease_expiry,
-                )
-            },
+            || self.revalidate_serving_authorities(context, &admitted),
             |network| prepare_network_successor(&stored, network, prepared),
         )?;
         Ok(Some(RuntimeDesiredEffectOutcome::RefreshInventory))
@@ -1426,20 +1439,6 @@ pub(super) fn prepared_device_inputs(
     prepared_device_inputs_from_step(&checkpoint.step)
 }
 
-pub(super) fn prepared_device_set_is_exact(
-    desired: &DesiredRuntimeSpec,
-    devices: &[PreparedDeviceInput],
-) -> bool {
-    desired.volumes.len() == devices.len()
-        && desired.volumes.iter().all(|volume| {
-            devices
-                .iter()
-                .filter(|device| device.volume_id == volume.volume_id)
-                .count()
-                == 1
-        })
-}
-
 pub(super) fn prepare_device_checkpoint_view(
     checkpoint: &RuntimeCheckpoint,
 ) -> Result<RuntimeCheckpoint> {
@@ -1450,32 +1449,15 @@ pub(super) fn prepare_device_checkpoint_view(
             cats_api::runtime_reconciliation::ServingAuthorityProvenance::AfterRootProvision { .. }
         )
     });
-    let device = root_handoff
+    root_handoff
         .next()
         .context("prepared-device projection lacks its Root handoff device")?;
     anyhow::ensure!(
         root_handoff.next().is_none(),
         "prepared-device projection contains duplicate Root handoff devices"
     );
-    let device = device.clone();
     let mut prepared = checkpoint.clone();
-    prepared.step = ReconcileStep::PrepareDevice {
-        volume_intent_id: device.volume_intent_id,
-        disk_id: device.disk_id,
-        volume_id: device.volume_id,
-        disk_kind: device.disk_kind,
-        attachment_id: device.attachment_id,
-        attachment_epoch: device.attachment_epoch,
-        acquire_origin: device.acquire_origin,
-        expected_head: device.expected_head,
-        size_bytes: device.size_bytes,
-        durability: device.durability,
-        guest_device: device.guest_device,
-        ownership_token: device.ownership_token,
-        serving_authority: device.serving_authority,
-        serving_process: device.serving_process,
-        frontend: device.frontend,
-    };
+    prepared.step = ReconcileStep::PrepareDevice { devices };
     // This is a canonical pre-launch reconstruction used only to rejoin the
     // immutable serving handoff after later phases replaced `step`. Never
     // carry live-VMM or Guest evidence backward into that reconstruction.
@@ -1499,13 +1481,10 @@ pub(super) fn prepare_device_checkpoint_view(
 fn prepare_network_successor(
     predecessor: &StoredCheckpoint,
     network: RuntimeNetworkIdentity,
-    device: PreparedDeviceInput,
+    devices: Vec<PreparedDeviceInput>,
 ) -> Result<RuntimeCheckpoint> {
     let mut checkpoint = predecessor.checkpoint().clone();
-    checkpoint.step = ReconcileStep::PrepareNetwork {
-        network,
-        devices: vec![device],
-    };
+    checkpoint.step = ReconcileStep::PrepareNetwork { network, devices };
     checkpoint.updated_at_unix_ms = monotonic_wall_clock(predecessor)?;
     encode_runtime_checkpoint(&checkpoint)
         .context("constructed PrepareNetwork checkpoint is not canonical V1")?;
@@ -1908,7 +1887,7 @@ exit 97\n",
             || Ok(()),
             |network| {
                 mutation();
-                prepare_network_successor(predecessor, network, prepared)
+                prepare_network_successor(predecessor, network, vec![prepared])
             },
         )
     }
@@ -2065,22 +2044,18 @@ exit 97\n",
             ownership_token: random('e'),
         };
         let prepared_a = prepared_device_input(&source_a).unwrap();
-        let reserved_a = prepare_network_successor(&predecessor_a, identity_a, prepared_a).unwrap();
+        let reserved_a =
+            prepare_network_successor(&predecessor_a, identity_a, vec![prepared_a]).unwrap();
         store_a.replace(&predecessor_a, &reserved_a).unwrap();
 
         let cat_b = Id::new("cat_b").unwrap();
         let mut source_b = fixed_predecessor();
         source_b.cat_id = cat_b.clone();
-        let ReconcileStep::PrepareDevice {
-            ownership_token,
-            serving_process,
-            ..
-        } = &mut source_b.step
-        else {
+        let ReconcileStep::PrepareDevice { devices } = &mut source_b.step else {
             panic!("fixture is not PrepareDevice")
         };
-        *ownership_token = random('b');
-        serving_process.process_identity_token = random('c');
+        devices[0].ownership_token = random('b');
+        devices[0].serving_process.process_identity_token = random('c');
         let mut desired_b = desired_for(&cat_b);
         desired_b.runtime.network_config = NetworkConfig {
             network_id: Id::new("net_b").unwrap(),
@@ -2107,7 +2082,7 @@ exit 97\n",
                 || Ok(()),
                 |network| {
                     build_called.set(true);
-                    prepare_network_successor(&predecessor_b, network, prepared_b)
+                    prepare_network_successor(&predecessor_b, network, vec![prepared_b])
                 },
             )
             .expect_err("foreign owner of Cat A's durable range reached Cat B reservation CAS");

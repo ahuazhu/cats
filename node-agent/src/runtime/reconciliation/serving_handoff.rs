@@ -2644,20 +2644,20 @@ pub(crate) fn validate_scanned_serving_handoff_artifacts(
             }
             None
         }
-        ReconcileStep::PrepareDevice {
-            volume_id,
-            attachment_id,
-            attachment_epoch,
-            acquire_origin,
-            expected_head,
-            size_bytes,
-            durability,
-            serving_authority,
-            serving_process,
-            ..
-        } => {
+        ReconcileStep::PrepareDevice { devices } => {
+            let mut roots = devices.iter().filter(|device| matches!(
+                device.serving_authority.as_ref(),
+                ServingAuthorityProvenance::AfterRootProvision { .. }
+            ));
+            let device = roots.next().context(
+                "PrepareDevice handoff lacks its Root prepared-device authority",
+            )?;
+            anyhow::ensure!(
+                roots.next().is_none(),
+                "PrepareDevice handoff duplicates its Root authority"
+            );
             let ServingAuthorityProvenance::AfterRootProvision { handoff } =
-                serving_authority.as_ref()
+                device.serving_authority.as_ref()
             else {
                 anyhow::bail!(
                     "direct authorized attachment cannot retain root-provision handoff artifacts"
@@ -2680,11 +2680,11 @@ pub(crate) fn validate_scanned_serving_handoff_artifacts(
                     && decoded.placement_epoch == checkpoint.placement_epoch
                     && decoded.desired_revision == checkpoint.desired_revision
                     && decoded.spec_digest == checkpoint.spec_digest
-                    && decoded.volume_id == *volume_id
-                    && decoded.attachment_id == *attachment_id
-                    && decoded.attachment_epoch == *attachment_epoch
-                    && decoded.acquire_origin == *acquire_origin
-                    && decoded.expected_provisioned_head == *expected_head
+                    && decoded.volume_id == device.volume_id
+                    && decoded.attachment_id == device.attachment_id
+                    && decoded.attachment_epoch == device.attachment_epoch
+                    && decoded.acquire_origin == device.acquire_origin
+                    && decoded.expected_provisioned_head == device.expected_head
                     && decoded.expected_provisioned_head == target_artifact.attachment.head
                     && target_artifact.attachment.identity == acquired.attachment.identity
                     && target_artifact.attachment.acquire_request
@@ -2693,10 +2693,10 @@ pub(crate) fn validate_scanned_serving_handoff_artifacts(
                         == acquired.attachment.size_bytes
                     && target_artifact.attachment.durability
                         == acquired.attachment.durability
-                    && acquired.attachment.size_bytes == *size_bytes
-                    && acquired.attachment.durability == *durability
+                    && acquired.attachment.size_bytes == device.size_bytes
+                    && acquired.attachment.durability == device.durability
                     && decoded.old_control_process.data_directory
-                        == serving_process.data_directory,
+                        == device.serving_process.data_directory,
                 "PrepareDevice handoff does not preserve the exact predecessor lineage"
             );
             Some(RetainedRootProvisionProcessAttempt {
@@ -3884,8 +3884,8 @@ mod tests {
         GuestTransportEvidence, Ipv4Address, IsolatedIpv4Kind, LifecycleAdmission, MacAddress,
         NetworkConfig, NodeObservation, NormalAcquireRequest, NormalAcquireResult, ObservedDevice,
         ObservedNetwork, ObservedRuntimeStatus, OwnershipTokenEvidence, PrepareDeviceFrontend,
-        ProgressingReason, RequireIdleCheckpoint, RuntimeCheckpoint, RuntimeConfig,
-        RuntimeLaunchArtifact, RuntimeTarget, RuntimeTransition, Sequence,
+        PreparedDeviceInput, ProgressingReason, RequireIdleCheckpoint, RuntimeCheckpoint,
+        RuntimeConfig, RuntimeLaunchArtifact, RuntimeTarget, RuntimeTransition, Sequence,
         ServingAuthorityProvenance, ServingBlockdIdentity, SessionBinding, UnixMillis,
         VmmBootProvenance, VolumeAccess, VolumeAcquire, VolumeAdminState, VolumeAuthorityEvidence,
         VolumeDisposition, VolumeIntent, WarmSnapshotEvidence,
@@ -4820,40 +4820,44 @@ mod tests {
         let ownership_token = random('8');
         let data_directory = host(fixture.data_directory.to_str().unwrap());
         checkpoint.step = ReconcileStep::PrepareDevice {
-            volume_intent_id: volume.volume_intent_id.clone(),
-            disk_id: volume.disk_id.clone(),
-            volume_id: volume.volume_id.clone(),
-            disk_kind: volume.disk_kind,
-            attachment_id: attachment.identity.attachment_id.clone(),
-            attachment_epoch: attachment.identity.attachment_epoch,
-            acquire_origin: attachment.identity.acquire_origin.clone(),
-            expected_head: fixture.authority.volume.head.clone(),
-            size_bytes: attachment.size_bytes,
-            durability: attachment.durability,
-            guest_device: volume.guest_device.clone(),
-            ownership_token,
-            serving_authority: Box::new(ServingAuthorityProvenance::AfterRootProvision { handoff }),
-            serving_process: ServingBlockdIdentity {
-                scope_id: id(&format!(
-                    "cats-serving-{}.service",
-                    process_identity_token.as_str()
-                )),
-                control_socket_path: host(&format!(
-                    "{}/serving-control.sock",
-                    fixture.data_directory.display()
-                )),
-                data_directory,
-                executable_path: fixture.expected_executable_path.clone(),
-                process_identity_token,
-            },
-            frontend: PrepareDeviceFrontend::VhostUserBlk {
-                socket_path: host(&format!(
-                    "{}/serving-vhost.sock",
-                    fixture.data_directory.display()
-                )),
-                queues: 2,
-                queue_size: 256,
-            },
+            devices: vec![PreparedDeviceInput {
+                volume_intent_id: volume.volume_intent_id.clone(),
+                disk_id: volume.disk_id.clone(),
+                volume_id: volume.volume_id.clone(),
+                disk_kind: volume.disk_kind,
+                attachment_id: attachment.identity.attachment_id.clone(),
+                attachment_epoch: attachment.identity.attachment_epoch,
+                acquire_origin: attachment.identity.acquire_origin.clone(),
+                expected_head: fixture.authority.volume.head.clone(),
+                size_bytes: attachment.size_bytes,
+                durability: attachment.durability,
+                guest_device: volume.guest_device.clone(),
+                ownership_token,
+                serving_authority: Box::new(ServingAuthorityProvenance::AfterRootProvision {
+                    handoff,
+                }),
+                serving_process: ServingBlockdIdentity {
+                    scope_id: id(&format!(
+                        "cats-serving-{}.service",
+                        process_identity_token.as_str()
+                    )),
+                    control_socket_path: host(&format!(
+                        "{}/serving-control.sock",
+                        fixture.data_directory.display()
+                    )),
+                    data_directory,
+                    executable_path: fixture.expected_executable_path.clone(),
+                    process_identity_token,
+                },
+                frontend: PrepareDeviceFrontend::VhostUserBlk {
+                    socket_path: host(&format!(
+                        "{}/serving-vhost.sock",
+                        fixture.data_directory.display()
+                    )),
+                    queues: 2,
+                    queue_size: 256,
+                },
+            }],
         };
         let observed = checkpoint
             .volumes
@@ -4948,10 +4952,10 @@ mod tests {
 
     fn replace_with_kernel_nbd_prepare_device(fixture: &mut Fixture) {
         let mut checkpoint = fixture.stored_checkpoint.checkpoint().clone();
-        let ReconcileStep::PrepareDevice { frontend, .. } = &mut checkpoint.step else {
+        let ReconcileStep::PrepareDevice { devices } = &mut checkpoint.step else {
             panic!("kernel-NBD test fixture is not at PrepareDevice")
         };
-        *frontend = PrepareDeviceFrontend::KernelNbd {
+        devices[0].frontend = PrepareDeviceFrontend::KernelNbd {
             listener_socket_path: host(&format!(
                 "{}/serving-nbd.sock",
                 fixture.data_directory.display()
@@ -6520,18 +6524,15 @@ mod tests {
             .get_args()
             .map(|argument| argument.to_string_lossy().into_owned())
             .collect::<Vec<_>>();
-        let ReconcileStep::PrepareDevice {
-            serving_authority,
-            serving_process,
-            ownership_token,
-            frontend,
-            guest_device,
-            ..
-        } = &fixture.stored_checkpoint.checkpoint().step
+        let ReconcileStep::PrepareDevice { devices } = &fixture.stored_checkpoint.checkpoint().step
         else {
             panic!("fixture must have reached PrepareDevice")
         };
-        let ServingAuthorityProvenance::AfterRootProvision { handoff } = serving_authority.as_ref()
+        let [device] = devices.as_slice() else {
+            panic!("single-Root fixture must prepare one device")
+        };
+        let ServingAuthorityProvenance::AfterRootProvision { handoff } =
+            device.serving_authority.as_ref()
         else {
             panic!("fixture must retain Root handoff provenance")
         };
@@ -6539,7 +6540,7 @@ mod tests {
             socket_path,
             queues,
             queue_size,
-        } = frontend
+        } = &device.frontend
         else {
             panic!("fixture must use vhost-user")
         };
@@ -6557,23 +6558,23 @@ mod tests {
         );
         assert_eq!(
             argument_after(&arguments, "--runtime-scope-id"),
-            serving_process.scope_id.as_str()
+            device.serving_process.scope_id.as_str()
         );
         assert_eq!(
             argument_after(&arguments, "--process-identity-token"),
-            serving_process.process_identity_token.as_str()
+            device.serving_process.process_identity_token.as_str()
         );
         assert_eq!(
             argument_after(&arguments, "--device-ownership-token"),
-            ownership_token.as_str()
+            device.ownership_token.as_str()
         );
         assert_eq!(
             argument_after(&arguments, "--guest-device-serial"),
-            guest_device.serial.as_str()
+            device.guest_device.serial.as_str()
         );
         assert_eq!(
             argument_after(&arguments, "--listen-control"),
-            serving_process.control_socket_path.as_str()
+            device.serving_process.control_socket_path.as_str()
         );
         assert_eq!(
             argument_after(&arguments, "--listen-vhost-user"),
@@ -6879,23 +6880,22 @@ mod tests {
                         }
                         "paired_volume_intent_id" => {
                             let foreign = id("foreign_intent");
-                            let ReconcileStep::PrepareDevice {
-                                volume_intent_id, ..
-                            } = &mut observation.runtimes[0].step
-                            else {
-                                panic!("fixture is not PrepareDevice")
-                            };
-                            *volume_intent_id = foreign.clone();
-                            observation.runtimes[0].volumes[0].volume_intent_id = Some(foreign);
-                        }
-                        "paired_disk_id" => {
-                            let foreign = id("foreign_disk");
-                            let ReconcileStep::PrepareDevice { disk_id, .. } =
+                            let ReconcileStep::PrepareDevice { devices } =
                                 &mut observation.runtimes[0].step
                             else {
                                 panic!("fixture is not PrepareDevice")
                             };
-                            *disk_id = foreign.clone();
+                            devices[0].volume_intent_id = foreign.clone();
+                            observation.runtimes[0].volumes[0].volume_intent_id = Some(foreign);
+                        }
+                        "paired_disk_id" => {
+                            let foreign = id("foreign_disk");
+                            let ReconcileStep::PrepareDevice { devices } =
+                                &mut observation.runtimes[0].step
+                            else {
+                                panic!("fixture is not PrepareDevice")
+                            };
+                            devices[0].disk_id = foreign.clone();
                             observation.runtimes[0].volumes[0].disk_id = Some(foreign);
                         }
                         _ => unreachable!(),
@@ -8046,10 +8046,10 @@ mod tests {
             complete_old_process_retirement(&mut fixture);
             if kernel {
                 let mut checkpoint = fixture.stored_checkpoint.checkpoint().clone();
-                let ReconcileStep::PrepareDevice { frontend, .. } = &mut checkpoint.step else {
+                let ReconcileStep::PrepareDevice { devices } = &mut checkpoint.step else {
                     unreachable!()
                 };
-                *frontend = PrepareDeviceFrontend::KernelNbd {
+                devices[0].frontend = PrepareDeviceFrontend::KernelNbd {
                     listener_socket_path: host(&format!(
                         "{}/serving-nbd.sock",
                         fixture.data_directory.display()
@@ -8116,10 +8116,10 @@ mod tests {
                     persisted.assert_serving_listener(&listener).unwrap();
 
                     let mut wrong_direct = fixture.stored_checkpoint.checkpoint().clone();
-                    let ReconcileStep::PrepareDevice {
-                        frontend: PrepareDeviceFrontend::KernelNbd { direct, .. },
-                        ..
-                    } = &mut wrong_direct.step
+                    let ReconcileStep::PrepareDevice { devices } = &mut wrong_direct.step else {
+                        unreachable!()
+                    };
+                    let PrepareDeviceFrontend::KernelNbd { direct, .. } = &mut devices[0].frontend
                     else {
                         unreachable!()
                     };
@@ -8136,13 +8136,11 @@ mod tests {
                     );
 
                     let mut wrong_epoch = fixture.stored_checkpoint.checkpoint().clone();
-                    let ReconcileStep::PrepareDevice {
-                        attachment_epoch, ..
-                    } = &mut wrong_epoch.step
-                    else {
+                    let ReconcileStep::PrepareDevice { devices } = &mut wrong_epoch.step else {
                         unreachable!()
                     };
-                    *attachment_epoch = FenceEpoch::new(attachment_epoch.get() + 1).unwrap();
+                    devices[0].attachment_epoch =
+                        FenceEpoch::new(devices[0].attachment_epoch.get() + 1).unwrap();
                     assert!(
                         super::super::kernel_nbd::KernelNbdDeviceExpectation::from_prepare_device(
                             &wrong_epoch,
@@ -8182,10 +8180,10 @@ mod tests {
             let mut fixture = fixture();
             complete_old_process_retirement(&mut fixture);
             let mut checkpoint = fixture.stored_checkpoint.checkpoint().clone();
-            let ReconcileStep::PrepareDevice { frontend, .. } = &mut checkpoint.step else {
+            let ReconcileStep::PrepareDevice { devices } = &mut checkpoint.step else {
                 unreachable!()
             };
-            *frontend = PrepareDeviceFrontend::KernelNbd {
+            devices[0].frontend = PrepareDeviceFrontend::KernelNbd {
                 listener_socket_path: host(&format!(
                     "{}/serving-nbd.sock",
                     fixture.data_directory.display()
@@ -8972,57 +8970,58 @@ mod tests {
         )
         .unwrap();
         let current = checkpoint_store.load().unwrap().unwrap();
-        let ReconcileStep::PrepareDevice {
-            volume_intent_id,
-            disk_id,
-            volume_id,
-            disk_kind,
-            attachment_id,
-            attachment_epoch,
-            acquire_origin,
-            expected_head,
-            size_bytes,
-            durability,
-            guest_device,
-            ownership_token,
-            serving_authority,
-            serving_process,
-            frontend,
-        } = &current.checkpoint().step
-        else {
+        let ReconcileStep::PrepareDevice { devices } = &current.checkpoint().step else {
             panic!("production Ready must advance only to PrepareDevice")
         };
+        let [device] = devices.as_slice() else {
+            panic!("single-Root fixture must prepare one device")
+        };
         let attachment = &fixture.acquired.attachment;
-        assert_eq!(volume_intent_id, &fixture.acquired.volume.volume_intent_id);
-        assert_eq!(disk_id, &fixture.acquired.volume.disk_id);
-        assert_eq!(volume_id, &attachment.identity.volume_id);
-        assert_eq!(*disk_kind, fixture.acquired.volume.disk_kind);
-        assert_eq!(attachment_id, &attachment.identity.attachment_id);
-        assert_eq!(*attachment_epoch, attachment.identity.attachment_epoch);
-        assert_eq!(acquire_origin, &attachment.identity.acquire_origin);
-        assert_eq!(expected_head, &fixture.authority.volume.head);
-        assert_eq!(*size_bytes, attachment.size_bytes);
-        assert_eq!(*durability, attachment.durability);
-        assert_eq!(guest_device, &fixture.acquired.volume.guest_device);
-        assert_ne!(ownership_token, &serving_process.process_identity_token);
+        assert_eq!(
+            &device.volume_intent_id,
+            &fixture.acquired.volume.volume_intent_id
+        );
+        assert_eq!(&device.disk_id, &fixture.acquired.volume.disk_id);
+        assert_eq!(&device.volume_id, &attachment.identity.volume_id);
+        assert_eq!(device.disk_kind, fixture.acquired.volume.disk_kind);
+        assert_eq!(&device.attachment_id, &attachment.identity.attachment_id);
+        assert_eq!(
+            device.attachment_epoch,
+            attachment.identity.attachment_epoch
+        );
+        assert_eq!(&device.acquire_origin, &attachment.identity.acquire_origin);
+        assert_eq!(&device.expected_head, &fixture.authority.volume.head);
+        assert_eq!(device.size_bytes, attachment.size_bytes);
+        assert_eq!(device.durability, attachment.durability);
+        assert_eq!(&device.guest_device, &fixture.acquired.volume.guest_device);
         assert_ne!(
-            serving_process.process_identity_token,
+            &device.ownership_token,
+            &device.serving_process.process_identity_token
+        );
+        assert_ne!(
+            device.serving_process.process_identity_token,
             fixture.process.ownership_token
         );
         assert_eq!(
-            serving_process.executable_path,
+            device.serving_process.executable_path,
             fixture.expected_executable_path
         );
         assert_eq!(
-            serving_process.data_directory.as_str(),
+            device.serving_process.data_directory.as_str(),
             fixture.data_directory.to_str().unwrap()
         );
-        assert!(serving_process
+        assert!(device
+            .serving_process
             .scope_id
             .as_str()
             .starts_with("cats-serving-"));
-        assert!(serving_process.scope_id.as_str().ends_with(".service"));
-        let ServingAuthorityProvenance::AfterRootProvision { handoff } = serving_authority.as_ref()
+        assert!(device
+            .serving_process
+            .scope_id
+            .as_str()
+            .ends_with(".service"));
+        let ServingAuthorityProvenance::AfterRootProvision { handoff } =
+            device.serving_authority.as_ref()
         else {
             panic!("new Root must retain after-root-provision provenance")
         };
@@ -9035,7 +9034,7 @@ mod tests {
             fixture.record_path().to_str().unwrap()
         );
         assert_eq!(
-            frontend,
+            &device.frontend,
             &PrepareDeviceFrontend::VhostUserBlk {
                 socket_path: host(&format!(
                     "{}/serving-vhost.sock",
@@ -9867,13 +9866,11 @@ mod tests {
             scanned_file(&fixture.record_path(), &oversized_record_bytes);
         oversized_record_scan.length = WireU64::new(oversized_record_bytes.len() as u64).unwrap();
         let mut oversized_successor = successor.clone();
-        let ReconcileStep::PrepareDevice {
-            serving_authority, ..
-        } = &mut oversized_successor.step
-        else {
+        let ReconcileStep::PrepareDevice { devices } = &mut oversized_successor.step else {
             unreachable!()
         };
-        let ServingAuthorityProvenance::AfterRootProvision { handoff } = serving_authority.as_mut()
+        let ServingAuthorityProvenance::AfterRootProvision { handoff } =
+            devices[0].serving_authority.as_mut()
         else {
             unreachable!()
         };

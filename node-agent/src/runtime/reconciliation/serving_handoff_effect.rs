@@ -16,20 +16,24 @@ use anyhow::Context as _;
 use cats_api::runtime_reconciliation::{
     encode_desired_runtime_spec, encode_runtime_checkpoint, AppliedDesiredEvidence,
     CheckpointEvidence, Condition, ContractVersion, ControlHandshakeEvidence, DesiredRuntimeSpec,
-    DiskKind, GuestTransportEvidence, HostPath, Id, LifecycleAdmission, LocalLineageState,
-    ObservedDiskKind, ObservedRuntimeStatus, OwnershipTokenEvidence, PrepareDeviceFrontend,
-    ProcessRole, ProcessState, ProgressingReason, RandomId128, ReconcileStep, RuntimeCheckpoint,
-    RuntimeTarget, RuntimeTransition, ServingAuthorityProvenance, ServingBlockdIdentity,
-    UnixMillis, VolumeAccess, VolumeAcquire, VolumeAuthorityEvidence, VolumeDisposition,
-    VolumeIntent, VolumeRecord, WarmSnapshotEvidence,
+    DirectAuthorizedAttachmentPurpose, DiskKind, FilesystemInitialization, GuestTransportEvidence,
+    HostPath, Id, LifecycleAdmission, LocalLineageState, ObservedDiskKind, ObservedRuntimeStatus,
+    OwnershipTokenEvidence, PrepareDeviceFrontend, PreparedDeviceInput, ProcessRole, ProcessState,
+    ProgressingReason, RandomId128, ReconcileStep, RuntimeCheckpoint, RuntimeTarget,
+    RuntimeTransition, ServingAuthorityProvenance, ServingBlockdIdentity, UnixMillis, VolumeAccess,
+    VolumeAcquire, VolumeAuthorityEvidence, VolumeDisposition, VolumeIntent, VolumeRecord,
+    WarmSnapshotEvidence,
 };
 use cats_storage::authority::{
-    validate_volume_record, AttachmentLineageIdentity, VolumeDataAuthority,
+    validate_authorized_serving_record, validate_volume_record, AttachmentLineageIdentity,
+    VolumeDataAuthority,
 };
 use cats_storage::BlobStore;
 
 use crate::ch::effective_vhost_user_queues;
-use crate::runtime_spine::RuntimeDesiredEffectContext;
+use crate::runtime_spine::{
+    RuntimeDesiredEffectContext, RuntimeDesiredEffectOutcome, RuntimeDesiredEffectStopReason,
+};
 #[cfg(not(target_os = "linux"))]
 use crate::state_directory::StateDirectory;
 
@@ -51,7 +55,9 @@ use super::serving_handoff::{
 use super::signed_running::{
     expected_provision_heads, provision_checkpoint_is_bound, ProvisionHeadRead,
 };
-use super::{AuthorizedBlockdStore, FileCheckpointStore, StoredCheckpoint};
+use super::{
+    AuthorizedBlockdStore, FileCheckpointStore, PreparedAuthorizedBlockd, StoredCheckpoint,
+};
 
 const SERVING_SCOPE_PREFIX: &str = "cats-serving-";
 const SERVING_SCOPE_SUFFIX: &str = ".service";
@@ -124,6 +130,7 @@ impl ServingPrepareFrontend {
 pub(crate) struct ServingPrepareDeviceEffect {
     frontend: ServingPrepareFrontend,
     executable_path: HostPath,
+    authority: Option<Arc<dyn VolumeDataAuthority>>,
     #[cfg(test)]
     before_replace: Option<Arc<dyn Fn() + Send + Sync>>,
     #[cfg(test)]
@@ -142,11 +149,328 @@ impl ServingPrepareDeviceEffect {
         Ok(Self {
             frontend,
             executable_path,
+            authority: None,
             #[cfg(test)]
             before_replace: None,
             #[cfg(test)]
             after_replace: None,
         })
+    }
+
+    pub(crate) fn with_volume_authority(mut self, authority: Arc<dyn VolumeDataAuthority>) -> Self {
+        self.authority = Some(authority);
+        self
+    }
+
+    fn retain_persistent_authorizations(
+        &self,
+        context: &RuntimeDesiredEffectContext,
+        desired: &DesiredRuntimeSpec,
+    ) -> anyhow::Result<Vec<PreparedAuthorizedBlockd>> {
+        if desired.volumes.len() == 1 {
+            return Ok(Vec::new());
+        }
+        let authority = self
+            .authority
+            .as_ref()
+            .context("multi-volume PrepareDevice lacks production Volume authority")?;
+        let blockd = AuthorizedBlockdStore::new(context.state_directory().clone());
+        let mut retained = Vec::with_capacity(desired.volumes.len() - 1);
+        for intent in desired.volumes.iter().skip(1) {
+            context.check_active()?;
+            let record = authority.load_volume(&intent.volume_id).with_context(|| {
+                format!("load PrepareDevice authority for {}", intent.volume_id)
+            })?;
+            validate_volume_record(&record)
+                .context("validate PrepareDevice Persistent authority")?;
+            let VolumeAcquire::Normal {
+                transition_id,
+                expected_unowned_epoch,
+            } = &intent.acquire
+            else {
+                anyhow::bail!(
+                    "takeover Persistent authorization requires its thick consumed evidence artifact"
+                )
+            };
+            let attachment_epoch = expected_unowned_epoch
+                .get()
+                .checked_add(1)
+                .and_then(cats_api::runtime_reconciliation::FenceEpoch::new)
+                .context("PrepareDevice normal-acquire epoch overflowed")?;
+            let identity = AttachmentLineageIdentity {
+                volume_id: intent.volume_id.clone(),
+                attachment_id: intent.attachment_id.clone(),
+                attachment_epoch,
+                acquire_origin: cats_api::runtime_reconciliation::AcquireOrigin::Normal {
+                    transition_id: transition_id.clone(),
+                },
+                node_id: desired.placement.node_id.clone(),
+                placement_epoch: desired.placement.placement_epoch,
+            };
+            anyhow::ensure!(
+                record.lease_owner.as_ref() == Some(&identity.attachment_id)
+                    && record.lease_epoch == identity.attachment_epoch
+                    && record.lease_expires_at.is_some(),
+                "PrepareDevice Persistent authority changed owner, epoch, or lease"
+            );
+            let prepared = blockd
+                .reopen_adopted(desired, intent, &identity)
+                .context("reopen exact Persistent authorized blockd artifact")?;
+            validate_authorized_serving_record(&record, &prepared.checkpoint().attachment, None)
+                .context("Persistent authorized artifact conflicts with current Volume")?;
+            retained.push(prepared);
+        }
+        Ok(retained)
+    }
+
+    fn retain_direct_authorizations(
+        &self,
+        context: &RuntimeDesiredEffectContext,
+        desired: &DesiredRuntimeSpec,
+    ) -> anyhow::Result<Vec<PreparedAuthorizedBlockd>> {
+        let authority = self
+            .authority
+            .as_ref()
+            .context("direct PrepareDevice lacks production Volume authority")?;
+        let blockd = AuthorizedBlockdStore::new(context.state_directory().clone());
+        let mut retained = Vec::with_capacity(desired.volumes.len());
+        for intent in &desired.volumes {
+            context.check_active()?;
+            let record = authority
+                .load_volume(&intent.volume_id)
+                .with_context(|| format!("load direct authority for {}", intent.volume_id))?;
+            validate_volume_record(&record).context("validate direct PrepareDevice authority")?;
+            let VolumeAcquire::Normal {
+                transition_id,
+                expected_unowned_epoch,
+            } = &intent.acquire
+            else {
+                anyhow::bail!("takeover direct authority requires thick consumed evidence")
+            };
+            let attachment_epoch = expected_unowned_epoch
+                .get()
+                .checked_add(1)
+                .and_then(cats_api::runtime_reconciliation::FenceEpoch::new)
+                .context("direct normal-acquire epoch overflowed")?;
+            let identity = AttachmentLineageIdentity {
+                volume_id: intent.volume_id.clone(),
+                attachment_id: intent.attachment_id.clone(),
+                attachment_epoch,
+                acquire_origin: cats_api::runtime_reconciliation::AcquireOrigin::Normal {
+                    transition_id: transition_id.clone(),
+                },
+                node_id: desired.placement.node_id.clone(),
+                placement_epoch: desired.placement.placement_epoch,
+            };
+            let prepared = blockd
+                .reopen_adopted(desired, intent, &identity)
+                .context("reopen exact direct authorized blockd artifact")?;
+            validate_authorized_serving_record(&record, &prepared.checkpoint().attachment, None)
+                .context("direct authorized artifact conflicts with current Volume")?;
+            retained.push(prepared);
+        }
+        Ok(retained)
+    }
+
+    fn revalidate_retained_authorizations(
+        &self,
+        context: &RuntimeDesiredEffectContext,
+        desired: &DesiredRuntimeSpec,
+        first_slot: usize,
+        retained: &[PreparedAuthorizedBlockd],
+    ) -> anyhow::Result<()> {
+        anyhow::ensure!(
+            desired.volumes.len().saturating_sub(first_slot) == retained.len(),
+            "PrepareDevice authority revalidation set is incomplete"
+        );
+        if retained.is_empty() {
+            return context.check_active();
+        }
+        let authority = self
+            .authority
+            .as_ref()
+            .context("PrepareDevice authority revalidation is not configured")?;
+        for (intent, prepared) in desired.volumes.iter().skip(first_slot).zip(retained) {
+            context.check_active()?;
+            // Reopen from the retained, flocked attachment directory and
+            // double-sample the immutable authorization again. This proves
+            // that the builder's prior identity is still the same inode and
+            // bytes at the publication barrier.
+            let _identity = prepared.direct_authorization_identity()?;
+            let record = authority.load_volume(&intent.volume_id).with_context(|| {
+                format!("reread PrepareDevice authority for {}", intent.volume_id)
+            })?;
+            validate_authorized_serving_record(&record, &prepared.checkpoint().attachment, None)
+                .context("PrepareDevice authority drifted before checkpoint CAS")?;
+        }
+        context.check_active()
+    }
+
+    pub(crate) fn try_persist_direct_existing(
+        &self,
+        context: &RuntimeDesiredEffectContext,
+        desired: &DesiredRuntimeSpec,
+    ) -> anyhow::Result<Option<RuntimeDesiredEffectOutcome>> {
+        let accepted = context.accepted_full()?;
+        let Some(runtime) = unique_runtime(&accepted.observation().runtimes, desired)? else {
+            return Ok(None);
+        };
+        if !matches!(runtime.step, ReconcileStep::AcquireVolume { .. }) {
+            return Ok(None);
+        }
+        if !checkpoint_is_current_exact(desired, runtime)
+            || !base_admission_is_exact(accepted, desired, runtime)
+            || !runtime.processes.is_empty()
+            || runtime.volumes.len() != desired.volumes.len()
+            || runtime.volumes.iter().any(|volume| {
+                !volume.devices.is_empty()
+                    || volume.local_lineages.len() != 1
+                    || !matches!(volume.authority, VolumeAuthorityEvidence::Owned { .. })
+            })
+        {
+            return Ok(Some(RuntimeDesiredEffectOutcome::Stop(
+                RuntimeDesiredEffectStopReason::LocalContract,
+            )));
+        }
+        let Some(root) = runtime
+            .volumes
+            .iter()
+            .find(|volume| volume.volume_id == desired.volumes[0].volume_id)
+        else {
+            return Ok(Some(RuntimeDesiredEffectOutcome::Stop(
+                RuntimeDesiredEffectStopReason::LocalContract,
+            )));
+        };
+        let VolumeAuthorityEvidence::Owned { head, .. } = &root.authority else {
+            unreachable!("direct admission checked owned authority")
+        };
+        if head.generation.get() == 0 {
+            return Ok(None);
+        }
+
+        // Acquire every attachment lock in canonical slot order before the
+        // checkpoint writer and optional Node-global NBD allocator.
+        let prepared = self.retain_direct_authorizations(context, desired)?;
+        let data_directories = prepared
+            .iter()
+            .map(|prepared| host_path(prepared.data_directory(), "direct serving data directory"))
+            .collect::<anyhow::Result<Vec<_>>>()?;
+        let checkpoint_directory = context.state_directory().path().join(CHECKPOINT_NAMESPACE);
+        let state_root = context.state_directory().try_clone_directory()?;
+        let store = FileCheckpointStore::open_preserving_checkpoint_temp(
+            &checkpoint_directory,
+            &desired.cat_id,
+        )?;
+        revalidate_checkpoint_namespace(
+            &state_root,
+            CHECKPOINT_NAMESPACE,
+            &[store.retained_directory()],
+        )?;
+        let Some(stored) = store.load()? else {
+            return Ok(Some(RuntimeDesiredEffectOutcome::RefreshInventory));
+        };
+        let CheckpointEvidence::Valid {
+            checkpoint_path,
+            content_digest,
+            ..
+        } = &runtime.checkpoint
+        else {
+            return Ok(Some(RuntimeDesiredEffectOutcome::RefreshInventory));
+        };
+        if Path::new(checkpoint_path.as_str()) != store.path()
+            || stored.content_digest() != content_digest
+            || stored.checkpoint().step != runtime.step
+        {
+            return Ok(Some(RuntimeDesiredEffectOutcome::RefreshInventory));
+        }
+
+        match &self.frontend {
+            #[cfg(target_os = "linux")]
+            ServingPrepareFrontend::KernelNbd { port, direct } => {
+                port.reserve_set_and_replace(
+                    context,
+                    &store,
+                    &stored,
+                    desired.volumes.len(),
+                    |device_paths| {
+                        let frontends = data_directories
+                            .iter()
+                            .zip(device_paths)
+                            .map(|(data_directory, device_path)| {
+                                Ok(PrepareDeviceFrontend::KernelNbd {
+                                    listener_socket_path: serving_path(
+                                        data_directory,
+                                        SERVING_NBD_SOCKET_BASENAME,
+                                    )?,
+                                    device_path,
+                                    direct: *direct,
+                                })
+                            })
+                            .collect::<anyhow::Result<Vec<_>>>()?;
+                        prepare_direct_device_successor(
+                            desired,
+                            &stored,
+                            &prepared,
+                            frontends,
+                            &self.executable_path,
+                        )
+                    },
+                    || self.revalidate_retained_authorizations(context, desired, 0, &prepared),
+                )?;
+            }
+            #[cfg(not(target_os = "linux"))]
+            ServingPrepareFrontend::KernelNbdUnsupported => {
+                anyhow::bail!("kernel-NBD PrepareDevice composition requires Linux")
+            }
+            ServingPrepareFrontend::VhostUserBlk {
+                maximum_queues,
+                queue_size,
+            } => {
+                let queues = u16::try_from(effective_vhost_user_queues(
+                    *maximum_queues,
+                    desired.runtime.vcpus,
+                ))?;
+                cats_blockd::frontend_contract::validate_authorized_vhost_shape(
+                    usize::from(queues),
+                    *queue_size,
+                )?;
+                let frontends = data_directories
+                    .iter()
+                    .map(|data_directory| {
+                        Ok(PrepareDeviceFrontend::VhostUserBlk {
+                            socket_path: serving_path(
+                                data_directory,
+                                SERVING_VHOST_SOCKET_BASENAME,
+                            )?,
+                            queues,
+                            queue_size: *queue_size,
+                        })
+                    })
+                    .collect::<anyhow::Result<Vec<_>>>()?;
+                let successor = prepare_direct_device_successor(
+                    desired,
+                    &stored,
+                    &prepared,
+                    frontends,
+                    &self.executable_path,
+                )?;
+                context.check_active()?;
+                revalidate_checkpoint_namespace(
+                    &state_root,
+                    CHECKPOINT_NAMESPACE,
+                    &[store.retained_directory()],
+                )?;
+                self.revalidate_retained_authorizations(context, desired, 0, &prepared)?;
+                store.replace(&stored, &successor)?;
+                revalidate_checkpoint_namespace(
+                    &state_root,
+                    CHECKPOINT_NAMESPACE,
+                    &[store.retained_directory()],
+                )?;
+                context.check_active()?;
+            }
+        }
+        Ok(Some(RuntimeDesiredEffectOutcome::RefreshInventory))
     }
 
     #[cfg(test)]
@@ -168,6 +492,10 @@ impl ServingPrepareDeviceEffect {
         ready: &ServingHandoffReady,
     ) -> anyhow::Result<()> {
         context.check_active()?;
+        // `ready` retains Root first; retain Persistents in canonical slot
+        // order before acquiring the per-Cat checkpoint writer. This is the
+        // global attachment -> checkpoint -> allocator lock order.
+        let persistent = self.retain_persistent_authorizations(context, desired)?;
         // `ready` already owns the attachment-directory flock. Preserve the
         // established attachment -> per-Cat checkpoint -> Node-global NBD
         // order. Every filesystem lock in that order is acquired with `NB`,
@@ -205,25 +533,53 @@ impl ServingPrepareDeviceEffect {
         validate_prepare_predecessor(desired, &stored, ready)?;
         context.check_active()?;
 
+        let data_directories =
+            std::iter::once(Ok(ready.old_control_process().data_directory.clone()))
+                .chain(persistent.iter().map(|prepared| {
+                    host_path(
+                        prepared.data_directory(),
+                        "Persistent serving data directory",
+                    )
+                }))
+                .collect::<anyhow::Result<Vec<_>>>()?;
+        anyhow::ensure!(
+            data_directories.len() == desired.volumes.len(),
+            "retained authorization set is not the complete Desired set"
+        );
         ready.consume_for_prepare_device(&stored, |handoff| match &self.frontend {
             #[cfg(target_os = "linux")]
             ServingPrepareFrontend::KernelNbd { port, direct } => port
-                .reserve_and_replace(context, &store, &stored, |device_path| {
-                    prepare_device_successor(
-                        desired,
-                        &stored,
-                        ready,
-                        handoff,
-                        PrepareDeviceFrontend::KernelNbd {
-                            listener_socket_path: serving_path(
-                                &ready.old_control_process().data_directory,
-                                SERVING_NBD_SOCKET_BASENAME,
-                            )?,
-                            device_path,
-                            direct: *direct,
-                        },
-                    )
-                })
+                .reserve_set_and_replace(
+                    context,
+                    &store,
+                    &stored,
+                    desired.volumes.len(),
+                    |device_paths| {
+                        let frontends = data_directories
+                            .iter()
+                            .zip(device_paths)
+                            .map(|(data_directory, device_path)| {
+                                Ok(PrepareDeviceFrontend::KernelNbd {
+                                    listener_socket_path: serving_path(
+                                        data_directory,
+                                        SERVING_NBD_SOCKET_BASENAME,
+                                    )?,
+                                    device_path,
+                                    direct: *direct,
+                                })
+                            })
+                            .collect::<anyhow::Result<Vec<_>>>()?;
+                        prepare_device_successor(
+                            desired,
+                            &stored,
+                            ready,
+                            handoff,
+                            &persistent,
+                            frontends,
+                        )
+                    },
+                    || self.revalidate_retained_authorizations(context, desired, 1, &persistent),
+                )
                 .map(|_| ()),
             #[cfg(not(target_os = "linux"))]
             ServingPrepareFrontend::KernelNbdUnsupported => {
@@ -241,19 +597,26 @@ impl ServingPrepareDeviceEffect {
                     *queue_size,
                 )
                 .context("effective vhost-user shape is outside the authorized-serving contract")?;
+                let frontends = data_directories
+                    .iter()
+                    .map(|data_directory| {
+                        Ok(PrepareDeviceFrontend::VhostUserBlk {
+                            socket_path: serving_path(
+                                data_directory,
+                                SERVING_VHOST_SOCKET_BASENAME,
+                            )?,
+                            queues,
+                            queue_size: *queue_size,
+                        })
+                    })
+                    .collect::<anyhow::Result<Vec<_>>>()?;
                 let successor = prepare_device_successor(
                     desired,
                     &stored,
                     ready,
                     handoff,
-                    PrepareDeviceFrontend::VhostUserBlk {
-                        socket_path: serving_path(
-                            &ready.old_control_process().data_directory,
-                            SERVING_VHOST_SOCKET_BASENAME,
-                        )?,
-                        queues,
-                        queue_size: *queue_size,
-                    },
+                    &persistent,
+                    frontends,
                 )?;
                 context.check_active()?;
                 #[cfg(test)]
@@ -266,6 +629,7 @@ impl ServingPrepareDeviceEffect {
                     &[store.retained_directory()],
                 )
                 .context("validate PrepareDevice checkpoint namespace before publication")?;
+                self.revalidate_retained_authorizations(context, desired, 1, &persistent)?;
                 store
                     .replace(&stored, &successor)
                     .context("atomically replace Root handoff with PrepareDevice")?;
@@ -323,7 +687,11 @@ fn validate_prepare_predecessor(
     let checkpoint = stored.checkpoint();
     let record = ready.record();
     let attachment = &ready.target_control_authorization().artifact.attachment;
-    let [intent] = desired.volumes.as_slice() else {
+    let Some(intent) = desired
+        .volumes
+        .first()
+        .filter(|intent| intent.disk_kind == DiskKind::Root && intent.guest_device.slot == 0)
+    else {
         anyhow::bail!("Root handoff PrepareDevice requires one Desired volume")
     };
     let ReconcileStep::ProvisionRootImage {
@@ -384,85 +752,366 @@ fn prepare_device_successor(
     stored: &StoredCheckpoint,
     ready: &ServingHandoffReady,
     handoff: cats_api::runtime_reconciliation::RootServingHandoff,
-    frontend: PrepareDeviceFrontend,
+    persistent: &[PreparedAuthorizedBlockd],
+    frontends: Vec<PrepareDeviceFrontend>,
 ) -> anyhow::Result<RuntimeCheckpoint> {
     validate_prepare_predecessor(desired, stored, ready)?;
-    let [intent] = desired.volumes.as_slice() else {
+    let Some(root_intent) = desired.volumes.first() else {
         unreachable!("predecessor validation requires one Root volume")
     };
-    let attachment = &ready.target_control_authorization().artifact.attachment;
-    let old_process = ready.old_control_process();
-    let process_identity_token = fresh_identity_token(&[&old_process.ownership_token])?;
-    let ownership_token =
-        fresh_identity_token(&[&old_process.ownership_token, &process_identity_token])?;
     anyhow::ensure!(
-        process_identity_token != ownership_token,
-        "serving process and Guest device tokens must be independent"
+        persistent.len() + 1 == desired.volumes.len() && frontends.len() == desired.volumes.len(),
+        "PrepareDevice successor lacks the complete authorization or frontend set"
     );
-    let scope_id = Id::new(format!(
+    let root_attachment = &ready.target_control_authorization().artifact.attachment;
+    let old_process = ready.old_control_process();
+    let mut excluded = vec![old_process.ownership_token.clone()];
+    let mut next_tokens = || -> anyhow::Result<(RandomId128, RandomId128)> {
+        let references = excluded.iter().collect::<Vec<_>>();
+        let process = fresh_identity_token(&references)?;
+        excluded.push(process.clone());
+        let references = excluded.iter().collect::<Vec<_>>();
+        let device = fresh_identity_token(&references)?;
+        excluded.push(device.clone());
+        Ok((process, device))
+    };
+    let mut frontends = frontends.into_iter();
+    let (root_process_token, root_ownership_token) = next_tokens()?;
+    let root_frontend = frontends
+        .next()
+        .context("PrepareDevice successor omitted Root frontend")?;
+    let root_scope = Id::new(format!(
         "{SERVING_SCOPE_PREFIX}{}{SERVING_SCOPE_SUFFIX}",
-        process_identity_token.as_str()
+        root_process_token.as_str()
     ))
-    .context("fresh serving process token does not form a canonical scope")?;
-    let control_socket_path =
-        serving_path(&old_process.data_directory, SERVING_CONTROL_SOCKET_BASENAME)?;
-
-    let mut checkpoint = stored.checkpoint().clone();
-    checkpoint.step = ReconcileStep::PrepareDevice {
-        volume_intent_id: intent.volume_intent_id.clone(),
-        disk_id: intent.disk_id.clone(),
-        volume_id: attachment.identity.volume_id.clone(),
-        disk_kind: intent.disk_kind,
-        attachment_id: attachment.identity.attachment_id.clone(),
-        attachment_epoch: attachment.identity.attachment_epoch,
-        acquire_origin: attachment.identity.acquire_origin.clone(),
-        expected_head: attachment.head.clone(),
-        size_bytes: attachment.size_bytes,
-        durability: attachment.durability,
-        guest_device: intent.guest_device.clone(),
-        ownership_token,
+    .context("fresh Root serving token does not form a canonical scope")?;
+    let mut devices = Vec::with_capacity(desired.volumes.len());
+    devices.push(PreparedDeviceInput {
+        volume_intent_id: root_intent.volume_intent_id.clone(),
+        disk_id: root_intent.disk_id.clone(),
+        volume_id: root_attachment.identity.volume_id.clone(),
+        disk_kind: root_intent.disk_kind,
+        attachment_id: root_attachment.identity.attachment_id.clone(),
+        attachment_epoch: root_attachment.identity.attachment_epoch,
+        acquire_origin: root_attachment.identity.acquire_origin.clone(),
+        expected_head: root_attachment.head.clone(),
+        size_bytes: root_attachment.size_bytes,
+        durability: root_attachment.durability,
+        guest_device: root_intent.guest_device.clone(),
+        ownership_token: root_ownership_token,
         serving_authority: Box::new(ServingAuthorityProvenance::AfterRootProvision { handoff }),
         serving_process: ServingBlockdIdentity {
-            scope_id,
-            control_socket_path,
+            scope_id: root_scope,
+            control_socket_path: serving_path(
+                &old_process.data_directory,
+                SERVING_CONTROL_SOCKET_BASENAME,
+            )?,
             data_directory: old_process.data_directory.clone(),
             executable_path: ready.record().expected_control_executable_path.clone(),
-            process_identity_token,
+            process_identity_token: root_process_token,
         },
-        frontend,
-    };
-    let [observed] = checkpoint.volumes.as_mut_slice() else {
+        frontend: root_frontend,
+    });
+
+    for ((intent, prepared), frontend) in desired
+        .volumes
+        .iter()
+        .skip(1)
+        .zip(persistent)
+        .zip(frontends)
+    {
+        let attachment = &prepared.checkpoint().attachment;
+        anyhow::ensure!(
+            prepared.checkpoint().volume == *intent
+                && attachment.identity.volume_id == intent.volume_id
+                && attachment.identity.attachment_id == intent.attachment_id
+                && attachment.size_bytes == intent.size_bytes
+                && attachment.durability == intent.durability,
+            "Persistent retained authorization changed Desired identity"
+        );
+        let observed = stored
+            .checkpoint()
+            .volumes
+            .iter()
+            .find(|observed| observed.volume_id == intent.volume_id)
+            .context("Root handoff predecessor omitted one Persistent Volume")?;
+        let [lineage] = observed.local_lineages.as_slice() else {
+            anyhow::bail!("Persistent Volume lacks one exact retained lineage")
+        };
+        anyhow::ensure!(
+            matches!(
+                &observed.authority,
+                VolumeAuthorityEvidence::Owned {
+                    attachment_id,
+                    attachment_epoch,
+                    head,
+                } if attachment_id == &attachment.identity.attachment_id
+                    && *attachment_epoch == attachment.identity.attachment_epoch
+                    && head == &attachment.head
+            ) && lineage.attachment_id == attachment.identity.attachment_id
+                && lineage.attachment_epoch == attachment.identity.attachment_epoch
+                && lineage.acquire_origin == attachment.identity.acquire_origin
+                && lineage.local_durable_generation == attachment.head.generation
+                && lineage.remote_durable_generation == attachment.head.generation
+                && lineage.data_directory
+                    == host_path(
+                        prepared.data_directory(),
+                        "Persistent retained data directory",
+                    )?
+                && lineage.pending_pack_count.get() == 0
+                && !lineage.fenced
+                && lineage.state == LocalLineageState::Active,
+            "Persistent retained artifact and checkpoint lineage disagree"
+        );
+        let mount = intent
+            .mount
+            .as_ref()
+            .context("Persistent PrepareDevice intent lacks its mount")?;
+        let purpose = match &mount.initialization {
+            FilesystemInitialization::Existing => {
+                anyhow::ensure!(
+                    attachment.head.generation.get() > 0,
+                    "Existing Persistent authority is blank"
+                );
+                DirectAuthorizedAttachmentPurpose::PersistentInitialized
+            }
+            FilesystemInitialization::Initialize { .. }
+                if attachment.head.generation.get() == 0 =>
+            {
+                DirectAuthorizedAttachmentPurpose::PersistentUninitialized
+            }
+            FilesystemInitialization::Initialize { .. } => {
+                DirectAuthorizedAttachmentPurpose::PersistentInitialized
+            }
+        };
+        let authorization = prepared.direct_authorization_identity()?;
+        let data_directory = host_path(
+            prepared.data_directory(),
+            "Persistent serving data directory",
+        )?;
+        let (process_identity_token, ownership_token) = next_tokens()?;
+        let scope_id = Id::new(format!(
+            "{SERVING_SCOPE_PREFIX}{}{SERVING_SCOPE_SUFFIX}",
+            process_identity_token.as_str()
+        ))
+        .context("fresh Persistent serving token does not form a canonical scope")?;
+        devices.push(PreparedDeviceInput {
+            volume_intent_id: intent.volume_intent_id.clone(),
+            disk_id: intent.disk_id.clone(),
+            volume_id: intent.volume_id.clone(),
+            disk_kind: intent.disk_kind,
+            attachment_id: attachment.identity.attachment_id.clone(),
+            attachment_epoch: attachment.identity.attachment_epoch,
+            acquire_origin: attachment.identity.acquire_origin.clone(),
+            expected_head: attachment.head.clone(),
+            size_bytes: attachment.size_bytes,
+            durability: attachment.durability,
+            guest_device: intent.guest_device.clone(),
+            ownership_token,
+            serving_authority: Box::new(ServingAuthorityProvenance::DirectAuthorizedAttachment {
+                authorization,
+                purpose,
+            }),
+            serving_process: ServingBlockdIdentity {
+                scope_id,
+                control_socket_path: serving_path(
+                    &data_directory,
+                    SERVING_CONTROL_SOCKET_BASENAME,
+                )?,
+                data_directory,
+                executable_path: ready.record().expected_control_executable_path.clone(),
+                process_identity_token,
+            },
+            frontend,
+        });
+    }
+    anyhow::ensure!(
+        devices.len() == desired.volumes.len(),
+        "PrepareDevice successor did not consume every Desired frontend"
+    );
+    let mut checkpoint = stored.checkpoint().clone();
+    checkpoint.step = ReconcileStep::PrepareDevice { devices };
+    let Some(observed) = checkpoint
+        .volumes
+        .iter_mut()
+        .find(|observed| observed.volume_id == root_intent.volume_id)
+    else {
         anyhow::bail!("Root handoff predecessor does not carry one observed volume")
     };
     anyhow::ensure!(
-        observed.volume_id == intent.volume_id
+        observed.volume_id == root_intent.volume_id
             && observed.disk_kind == ObservedDiskKind::Root
-            && observed.size_bytes == Some(attachment.size_bytes)
-            && observed.durability == Some(attachment.durability)
+            && observed.size_bytes == Some(root_attachment.size_bytes)
+            && observed.durability == Some(root_attachment.durability)
             && !observed.local_lineages.is_empty(),
         "Root handoff predecessor observed volume is not the frozen Root lineage"
     );
     observed.authority = VolumeAuthorityEvidence::Owned {
-        attachment_id: attachment.identity.attachment_id.clone(),
-        attachment_epoch: attachment.identity.attachment_epoch,
-        head: attachment.head.clone(),
+        attachment_id: root_attachment.identity.attachment_id.clone(),
+        attachment_epoch: root_attachment.identity.attachment_epoch,
+        head: root_attachment.head.clone(),
     };
     for lineage in &mut observed.local_lineages {
         anyhow::ensure!(
-            lineage.attachment_id == attachment.identity.attachment_id
-                && lineage.attachment_epoch == attachment.identity.attachment_epoch
-                && lineage.acquire_origin == attachment.identity.acquire_origin
+            lineage.attachment_id == root_attachment.identity.attachment_id
+                && lineage.attachment_epoch == root_attachment.identity.attachment_epoch
+                && lineage.acquire_origin == root_attachment.identity.acquire_origin
                 && lineage.data_directory == old_process.data_directory
                 && lineage.state == LocalLineageState::Active
                 && !lineage.fenced,
             "Root handoff predecessor contains another local lineage"
         );
-        lineage.local_durable_generation = attachment.head.generation;
-        lineage.remote_durable_generation = attachment.head.generation;
+        lineage.local_durable_generation = root_attachment.head.generation;
+        lineage.remote_durable_generation = root_attachment.head.generation;
     }
     checkpoint.updated_at_unix_ms = monotonic_wall_clock(stored)?;
     encode_runtime_checkpoint(&checkpoint)
         .context("constructed Root handoff PrepareDevice checkpoint is not canonical V1")?;
+    Ok(checkpoint)
+}
+
+fn prepare_direct_device_successor(
+    desired: &DesiredRuntimeSpec,
+    stored: &StoredCheckpoint,
+    prepared: &[PreparedAuthorizedBlockd],
+    frontends: Vec<PrepareDeviceFrontend>,
+    executable_path: &HostPath,
+) -> anyhow::Result<RuntimeCheckpoint> {
+    anyhow::ensure!(
+        prepared.len() == desired.volumes.len()
+            && frontends.len() == desired.volumes.len()
+            && stored.checkpoint().volumes.len() == desired.volumes.len(),
+        "direct PrepareDevice successor lacks its complete canonical input set"
+    );
+    let mut excluded = Vec::<RandomId128>::new();
+    let mut devices = Vec::with_capacity(desired.volumes.len());
+    for (((index, intent), retained), frontend) in desired
+        .volumes
+        .iter()
+        .enumerate()
+        .zip(prepared)
+        .zip(frontends)
+    {
+        let attachment = &retained.checkpoint().attachment;
+        let observed = &stored.checkpoint().volumes[index];
+        let [lineage] = observed.local_lineages.as_slice() else {
+            anyhow::bail!("direct PrepareDevice volume lacks one exact retained lineage")
+        };
+        let expected_disk_kind = match intent.disk_kind {
+            DiskKind::Root => ObservedDiskKind::Root,
+            DiskKind::Persistent => ObservedDiskKind::Persistent,
+        };
+        let data_directory = host_path(retained.data_directory(), "direct serving data directory")?;
+        anyhow::ensure!(
+            retained.checkpoint().volume == *intent
+                && attachment.identity.volume_id == intent.volume_id
+                && attachment.identity.attachment_id == intent.attachment_id
+                && attachment.size_bytes == intent.size_bytes
+                && attachment.durability == intent.durability
+                && observed.volume_intent_id.as_ref() == Some(&intent.volume_intent_id)
+                && observed.disk_id.as_ref() == Some(&intent.disk_id)
+                && observed.volume_id == intent.volume_id
+                && observed.disk_kind == expected_disk_kind
+                && observed.size_bytes == Some(attachment.size_bytes)
+                && observed.durability == Some(attachment.durability)
+                && observed.devices.is_empty()
+                && matches!(
+                    &observed.authority,
+                    VolumeAuthorityEvidence::Owned {
+                        attachment_id,
+                        attachment_epoch,
+                        head,
+                    } if attachment_id == &attachment.identity.attachment_id
+                        && *attachment_epoch == attachment.identity.attachment_epoch
+                        && head == &attachment.head
+                )
+                && lineage.attachment_id == attachment.identity.attachment_id
+                && lineage.attachment_epoch == attachment.identity.attachment_epoch
+                && lineage.acquire_origin == attachment.identity.acquire_origin
+                && lineage.node_id == attachment.identity.node_id
+                && lineage.placement_epoch == attachment.identity.placement_epoch
+                && lineage.local_durable_generation == attachment.head.generation
+                && lineage.remote_durable_generation == attachment.head.generation
+                && lineage.pending_pack_count.get() == 0
+                && lineage.data_directory == data_directory
+                && !lineage.fenced
+                && lineage.state == LocalLineageState::Active,
+            "direct retained authorization, checkpoint lineage, and Desired disagree"
+        );
+        let purpose = if index == 0 {
+            anyhow::ensure!(
+                intent.disk_kind == DiskKind::Root && attachment.head.generation.get() > 0,
+                "direct Root must be an existing nonblank Root"
+            );
+            DirectAuthorizedAttachmentPurpose::ExistingRoot
+        } else {
+            let mount = intent
+                .mount
+                .as_ref()
+                .context("direct Persistent lacks its mount intent")?;
+            match &mount.initialization {
+                FilesystemInitialization::Existing => {
+                    anyhow::ensure!(
+                        attachment.head.generation.get() > 0,
+                        "Existing Persistent direct authority is blank"
+                    );
+                    DirectAuthorizedAttachmentPurpose::PersistentInitialized
+                }
+                FilesystemInitialization::Initialize { .. }
+                    if attachment.head.generation.get() == 0 =>
+                {
+                    DirectAuthorizedAttachmentPurpose::PersistentUninitialized
+                }
+                FilesystemInitialization::Initialize { .. } => {
+                    DirectAuthorizedAttachmentPurpose::PersistentInitialized
+                }
+            }
+        };
+        let references = excluded.iter().collect::<Vec<_>>();
+        let process_identity_token = fresh_identity_token(&references)?;
+        excluded.push(process_identity_token.clone());
+        let references = excluded.iter().collect::<Vec<_>>();
+        let ownership_token = fresh_identity_token(&references)?;
+        excluded.push(ownership_token.clone());
+        devices.push(PreparedDeviceInput {
+            volume_intent_id: intent.volume_intent_id.clone(),
+            disk_id: intent.disk_id.clone(),
+            volume_id: intent.volume_id.clone(),
+            disk_kind: intent.disk_kind,
+            attachment_id: attachment.identity.attachment_id.clone(),
+            attachment_epoch: attachment.identity.attachment_epoch,
+            acquire_origin: attachment.identity.acquire_origin.clone(),
+            expected_head: attachment.head.clone(),
+            size_bytes: attachment.size_bytes,
+            durability: attachment.durability,
+            guest_device: intent.guest_device.clone(),
+            ownership_token,
+            serving_authority: Box::new(ServingAuthorityProvenance::DirectAuthorizedAttachment {
+                authorization: retained.direct_authorization_identity()?,
+                purpose,
+            }),
+            serving_process: ServingBlockdIdentity {
+                scope_id: Id::new(format!(
+                    "{SERVING_SCOPE_PREFIX}{}{SERVING_SCOPE_SUFFIX}",
+                    process_identity_token.as_str()
+                ))
+                .context("direct serving token does not form a canonical scope")?,
+                control_socket_path: serving_path(
+                    &data_directory,
+                    SERVING_CONTROL_SOCKET_BASENAME,
+                )?,
+                data_directory,
+                executable_path: executable_path.clone(),
+                process_identity_token,
+            },
+            frontend,
+        });
+    }
+    let mut checkpoint = stored.checkpoint().clone();
+    checkpoint.step = ReconcileStep::PrepareDevice { devices };
+    checkpoint.updated_at_unix_ms = monotonic_wall_clock(stored)?;
+    encode_runtime_checkpoint(&checkpoint)
+        .context("constructed direct PrepareDevice checkpoint is not canonical V1")?;
     Ok(checkpoint)
 }
 
@@ -483,6 +1132,15 @@ fn serving_path(data_directory: &HostPath, basename: &str) -> anyhow::Result<Hos
         .context("serving path is not UTF-8")?
         .to_owned();
     HostPath::new(path).context("serving path is not a canonical absolute HostPath")
+}
+
+fn host_path(path: &Path, label: &str) -> anyhow::Result<HostPath> {
+    HostPath::new(
+        path.to_str()
+            .with_context(|| format!("{label} is not UTF-8"))?
+            .to_owned(),
+    )
+    .with_context(|| format!("{label} is not a canonical absolute HostPath"))
 }
 
 fn monotonic_wall_clock(stored: &StoredCheckpoint) -> anyhow::Result<UnixMillis> {
@@ -558,7 +1216,11 @@ impl ServingHandoffEffect {
             base_admission_is_exact(accepted, desired, runtime),
             "serving handoff lacks an exact current ProvisionRootImage admission"
         );
-        let [volume] = desired.volumes.as_slice() else {
+        let Some(volume) = desired
+            .volumes
+            .first()
+            .filter(|volume| volume.disk_kind == DiskKind::Root && volume.guest_device.slot == 0)
+        else {
             unreachable!("base admission requires one Root Volume")
         };
         let (blank, target) =
@@ -1076,14 +1738,17 @@ fn base_admission_is_exact(
         && desired.version == ContractVersion::V1
         && desired.target == RuntimeTarget::Running
         && matches!(desired.transition, RuntimeTransition::CancelAndDrain)
-        && desired.volumes.len() == 1
+        && (1..=64).contains(&desired.volumes.len())
         && desired.placement.node_id == accepted.session().node_id
-        && desired.volumes.iter().all(|volume| {
+        && desired.volumes.iter().enumerate().all(|(index, volume)| {
             matches!(volume.acquire, VolumeAcquire::Normal { .. })
-                && volume.disk_kind == DiskKind::Root
                 && volume.access == VolumeAccess::ReadWriteOnce
-                && volume.mount.is_none()
                 && matches!(volume.disposition, VolumeDisposition::Retain)
+                && usize::from(volume.guest_device.slot) == index
+                && match index {
+                    0 => volume.disk_kind == DiskKind::Root && volume.mount.is_none(),
+                    _ => volume.disk_kind == DiskKind::Persistent && volume.mount.is_some(),
+                }
         })
         && observation.complete_inventory
         && observation.node_id == accepted.session().node_id
@@ -1101,7 +1766,7 @@ fn base_admission_is_exact(
         && runtime.runtime_incarnation.is_none()
         && runtime.stable_state.is_none()
         && runtime.processes.len() <= 1
-        && runtime.volumes.len() == 1
+        && runtime.volumes.len() == desired.volumes.len()
         && runtime.mounts.is_empty()
         && runtime.networks.is_empty()
         && matches!(runtime.guest_transport, GuestTransportEvidence::Unavailable)
@@ -1125,9 +1790,10 @@ fn observed_lineage(
     AttachmentLineageIdentity,
     cats_api::runtime_reconciliation::RemoteHead,
 )> {
-    let [observed] = runtime.volumes.as_slice() else {
-        return None;
-    };
+    let observed = runtime
+        .volumes
+        .iter()
+        .find(|observed| observed.volume_id == volume.volume_id)?;
     let [lineage] = observed.local_lineages.as_slice() else {
         return None;
     };

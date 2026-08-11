@@ -182,9 +182,10 @@ placement authority；晚到的本地结果绑定精确 incarnation，由下一�
 
 planner 的逐步 token、条件和晚到结果处理以 Runtime Reconciliation spec 的表格为准。
 
-V1启动链固定为`PrepareDevice -> PrepareNetwork -> StartRuntime`，三个step不能合并。`PrepareDevice`
-先持久`volume_intent_id`/`disk_id`/`volume_id`/显式disk kind、完整attachment lineage和随机process/device
-identity；`PrepareNetwork`与`StartRuntime`都逐字段复制按Guest slot排序的同一closed
+V1启动链固定为`PrepareDevice -> PrepareNetwork -> StartRuntime`，三个step不能合并。首个`PrepareDevice`
+必须一次持久完整、按Guest slot连续排序的1..=64卷集合；不得用逐轮append或current-index accumulator。
+每项都冻结`volume_intent_id`/`disk_id`/`volume_id`/显式disk kind、完整attachment lineage和随机process/device
+identity；`PrepareNetwork`与`StartRuntime`都逐字段复制同一closed
 `PreparedDeviceInput`，包括sealed serving provenance、Blockd scope/control/data/executable/token及完整frontend
 参数。该嵌套对象是Agent crash/restart后的authority；公开`ProcessEvidence`/`ObservedDevice`可在待重扫时缺失，
 出现时只能是逐项exact projection且不得有extra/duplicate，top-level `ObservedVolume`的logical IDs、kind、

@@ -397,6 +397,7 @@ pub fn recover_normal_acquire_from_authority(
         || record.size_bytes != volume.size_bytes
         || record.durability != volume.durability
         || !matches!(record.admin_state, VolumeAdminState::Active)
+        || !acquire_head_matches_intent(volume, &record.head)
     {
         return Ok(NormalAcquireAuthorityRecovery::Blocked);
     }
@@ -507,10 +508,12 @@ fn validate_local_normal_request<'a>(
         || request.placement.node_id != request.session.node_id
         || *lease_duration_ms == 0
         || volume.size_bytes == 0
-        || volume.disk_kind != DiskKind::Root
         || volume.access != VolumeAccess::ReadWriteOnce
-        || volume.mount.is_some()
         || !matches!(volume.disposition, VolumeDisposition::Retain)
+        || match volume.disk_kind {
+            DiskKind::Root => volume.mount.is_some(),
+            DiskKind::Persistent => volume.mount.is_none(),
+        }
     {
         return Err(NormalAcquireClientError::InvalidVolumeBinding);
     }
@@ -664,6 +667,9 @@ fn exact_success_attachment(
     {
         return None;
     }
+    if !acquire_head_matches_intent(volume, &grant.head) {
+        return None;
+    }
     let acquire_request = NormalAcquireRequest {
         volume_id: volume_id.clone(),
         transition_id: transition_id.clone(),
@@ -700,6 +706,20 @@ fn exact_success_attachment(
     validate_authorized_serving_attachment(&attachment)
         .is_ok()
         .then_some(attachment)
+}
+
+fn acquire_head_matches_intent(volume: &VolumeIntent, head: &RemoteHead) -> bool {
+    match (volume.disk_kind, volume.mount.as_ref()) {
+        (DiskKind::Root, None) => true,
+        (DiskKind::Persistent, Some(mount)) => match &mount.initialization {
+            FilesystemInitialization::Initialize {
+                expected_blank_head,
+                ..
+            } => head == expected_blank_head,
+            FilesystemInitialization::Existing => head.generation.get() > 0,
+        },
+        _ => false,
+    }
 }
 
 fn exact_release_success(

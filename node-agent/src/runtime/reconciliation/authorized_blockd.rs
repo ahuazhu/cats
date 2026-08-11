@@ -19,7 +19,8 @@ use std::process::Command;
 use anyhow::{Context as _, Result};
 use cats_api::blockd::DurabilityStatus;
 use cats_api::runtime_reconciliation::{
-    checkpoint_content_digest, DesiredRuntimeSpec, ReconcileStep, RuntimeCheckpoint, Sha256Digest,
+    checkpoint_content_digest, DesiredRuntimeSpec, DirectAuthorizedAttachmentIdentity, HostPath,
+    ReconcileStep, RuntimeCheckpoint, Sha256Digest, WireU64,
 };
 use cats_api::runtime_reconciliation::{
     encode_desired_runtime_spec, ContractVersion, DiskKind, Durability, Id, RandomId128,
@@ -1531,6 +1532,75 @@ impl PreparedAuthorizedBlockd {
     pub(crate) fn state_directory_path(&self) -> &Path {
         &self.state_directory
     }
+
+    /// Seal the immutable authorized-serving file into the private
+    /// PrepareDevice provenance.  The retained attachment-directory lock and
+    /// descriptor-relative `O_NOFOLLOW` open keep the pathname from being
+    /// swapped between validation and checkpoint publication.
+    pub(crate) fn direct_authorization_identity(
+        &self,
+    ) -> Result<DirectAuthorizedAttachmentIdentity> {
+        let path = self.data_directory.join(AUTHORIZED_SERVING_FILE);
+        let name = c_string(AUTHORIZED_SERVING_FILE, &path)?;
+        let mut file = open_at(
+            &self._directory_lock,
+            &name,
+            libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_CLOEXEC | libc::O_NONBLOCK,
+            0,
+        )
+        .with_context(|| format!("open retained direct authorization {}", path.display()))?;
+        let metadata = file
+            .metadata()
+            .with_context(|| format!("inspect retained direct authorization {}", path.display()))?;
+        // SAFETY: geteuid/getegid take no pointers and cannot fail.
+        let (euid, egid) = unsafe { (libc::geteuid(), libc::getegid()) };
+        anyhow::ensure!(
+            metadata.file_type().is_file()
+                && metadata.nlink() == 1
+                && metadata.uid() == euid
+                && metadata.gid() == egid
+                && metadata.permissions().mode() & 0o7777 == 0o600
+                && metadata.len() > 0
+                && metadata.len() <= MAX_AUTHORIZED_SERVING_BYTES as u64,
+            "direct authorization has unsafe type, ownership, mode, links, or size"
+        );
+        let before = stable_identity(&file, &path)?;
+        let mut bytes = Vec::with_capacity(usize::try_from(before.length)?);
+        std::io::Read::by_ref(&mut file)
+            .take(MAX_AUTHORIZED_SERVING_BYTES as u64 + 1)
+            .read_to_end(&mut bytes)
+            .context("read retained direct authorization")?;
+        anyhow::ensure!(
+            bytes.len() == usize::try_from(before.length)?,
+            "direct authorization length changed while read"
+        );
+        let after = stable_identity(&file, &path)?;
+        anyhow::ensure!(before == after, "direct authorization changed while read");
+        let decoded: AuthorizedServingAttachment =
+            serde_json::from_slice(&bytes).context("decode retained direct authorization")?;
+        anyhow::ensure!(
+            decoded == self.checkpoint.attachment
+                && serde_json::to_vec(&decoded)
+                    .context("re-encode retained direct authorization")?
+                    == bytes,
+            "direct authorization bytes conflict with retained launch authority"
+        );
+        Ok(DirectAuthorizedAttachmentIdentity {
+            path: HostPath::new(
+                path.to_str()
+                    .context("direct authorization path is not UTF-8")?
+                    .to_owned(),
+            )
+            .context("direct authorization path is not canonical")?,
+            device: WireU64::new(before.device)
+                .context("direct authorization device exceeds wire range")?,
+            inode: WireU64::new(before.inode)
+                .context("direct authorization inode exceeds wire range")?,
+            length: WireU64::new(before.length)
+                .context("direct authorization length exceeds wire range")?,
+            content_sha256: Sha256Digest::from_bytes(Sha256::digest(&bytes).into()),
+        })
+    }
 }
 
 /// Process composition values that are not part of Desired or Volume
@@ -1795,6 +1865,7 @@ pub(crate) fn authorized_blockd_status_is_bound_to_head(
                 Durability::Strict => "strict",
                 Durability::Relaxed => "relaxed",
             }
+        && !status.backpressured
         && !status.fenced
 }
 
