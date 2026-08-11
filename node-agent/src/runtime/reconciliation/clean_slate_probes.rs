@@ -65,8 +65,8 @@ use super::checkpoint::{
 #[cfg(test)]
 use super::inventory::serving_process_expectations;
 use super::inventory::{
-    AuthorityVolumeInventoryEvidence, AuthorizedBlockdControlState,
-    AuthorizedBlockdInventoryEvidence, DesiredCheckpointBinding,
+    checkpoint_prepared_volume_matches_blockd, AuthorityVolumeInventoryEvidence,
+    AuthorizedBlockdControlState, AuthorizedBlockdInventoryEvidence, DesiredCheckpointBinding,
     RuntimeCheckpointInventoryEvidence,
 };
 use super::kernel_nbd::{KernelNbdInventoryConfig, KernelNbdInventoryPort};
@@ -2010,11 +2010,20 @@ pub(crate) fn classify_local_publication_recovery(
             .filter(|volume| !volume.local_lineages.is_empty())
             .map(|volume| volume.volume_id.clone())
             .collect::<BTreeSet<_>>();
-        let actual_prepared = data
-            .evidence
-            .get(&desired.cat_id)
+        let actual_for_cat = data.evidence.get(&desired.cat_id);
+        let actual_prepared = actual_for_cat
             .map(|volumes| volumes.keys().cloned().collect::<BTreeSet<_>>())
             .unwrap_or_default();
+        let prepared_values_are_exact = expected_prepared.iter().all(|volume_id| {
+            actual_for_cat
+                .and_then(|volumes| volumes.get(volume_id))
+                .is_some_and(|blockd| checkpoint_prepared_volume_matches_blockd(checkpoint, blockd))
+        });
+        if !prepared_values_are_exact
+            || !data.recovery_incompleteness_is_scoped_to(&desired.cat_id, &target.volume_id)
+        {
+            continue;
+        }
         if !actual_prepared.contains(&target.volume_id) && actual_prepared == expected_prepared {
             authorized_recovery.insert(desired.cat_id.clone());
             continue;
@@ -2101,6 +2110,9 @@ impl InventoryAbsenceProbe for AuthorizedBlockdDataProbe {
 struct AuthorizedBlockdDataScan {
     evidence: BTreeMap<Id, BTreeMap<Id, AuthorizedBlockdInventoryEvidence>>,
     candidate_volume_ids: BTreeSet<Id>,
+    observed_volume_paths: BTreeSet<(Id, Id)>,
+    recoverable_publication_windows: BTreeSet<(Id, Id)>,
+    unattributed_incomplete: bool,
     leaf_count: usize,
     complete: bool,
     handoff_temps: Vec<(Id, ServingHandoffTempKind, AuthorizedBlockdCheckpoint)>,
@@ -2111,6 +2123,25 @@ struct AuthorizedBlockdDataScan {
 impl AuthorizedBlockdDataScan {
     fn evidence_count(&self) -> usize {
         self.evidence.values().map(BTreeMap::len).sum()
+    }
+
+    fn recovery_incompleteness_is_scoped_to(&self, cat_id: &Id, volume_id: &Id) -> bool {
+        if self.complete {
+            return true;
+        }
+        let target = (cat_id.clone(), volume_id.clone());
+        if self.unattributed_incomplete
+            || self.recoverable_publication_windows != BTreeSet::from([target.clone()])
+        {
+            return false;
+        }
+        self.observed_volume_paths.iter().all(|observed| {
+            observed == &target
+                || self
+                    .evidence
+                    .get(&observed.0)
+                    .is_some_and(|volumes| volumes.contains_key(&observed.1))
+        })
     }
 }
 
@@ -2463,6 +2494,9 @@ fn scan_authorized_blockd_data(
             return Ok(AuthorizedBlockdDataScan {
                 evidence: BTreeMap::new(),
                 candidate_volume_ids: BTreeSet::new(),
+                observed_volume_paths: BTreeSet::new(),
+                recoverable_publication_windows: BTreeSet::new(),
+                unattributed_incomplete: false,
                 leaf_count: 0,
                 complete: true,
                 handoff_temps: Vec::new(),
@@ -2474,6 +2508,9 @@ fn scan_authorized_blockd_data(
             return Ok(AuthorizedBlockdDataScan {
                 evidence: BTreeMap::new(),
                 candidate_volume_ids: BTreeSet::new(),
+                observed_volume_paths: BTreeSet::new(),
+                recoverable_publication_windows: BTreeSet::new(),
+                unattributed_incomplete: true,
                 leaf_count: 0,
                 complete: false,
                 handoff_temps: Vec::new(),
@@ -2498,6 +2535,9 @@ fn scan_authorized_blockd_data(
         return Ok(AuthorizedBlockdDataScan {
             evidence: BTreeMap::new(),
             candidate_volume_ids: BTreeSet::new(),
+            observed_volume_paths: BTreeSet::new(),
+            recoverable_publication_windows: BTreeSet::new(),
+            unattributed_incomplete: true,
             leaf_count: 0,
             complete: false,
             handoff_temps: Vec::new(),
@@ -2508,6 +2548,9 @@ fn scan_authorized_blockd_data(
     let mut scan = AuthorizedBlockdDataScan {
         evidence: BTreeMap::new(),
         candidate_volume_ids: BTreeSet::new(),
+        observed_volume_paths: BTreeSet::new(),
+        recoverable_publication_windows: BTreeSet::new(),
+        unattributed_incomplete: false,
         leaf_count: 0,
         complete: true,
         handoff_temps: Vec::new(),
@@ -2526,15 +2569,18 @@ fn scan_authorized_blockd_data(
             open_exact_only_child_directory(&directory, &cat_entry, root, context)?
         else {
             scan.complete = false;
+            scan.unattributed_incomplete = true;
             continue;
         };
         let Some(volume_entries) = strict_directory_entries(&cat_directory, &mut budget, context)?
         else {
             scan.complete = false;
+            scan.unattributed_incomplete = true;
             continue;
         };
         if volume_entries.is_empty() {
             scan.complete = false;
+            scan.unattributed_incomplete = true;
             continue;
         }
         for volume_entry in volume_entries {
@@ -2544,28 +2590,61 @@ fn scan_authorized_blockd_data(
                 .to_str()
                 .context("authorized blockd volume path is not UTF-8")?
                 .to_owned();
+            let scanned_volume_id = desired
+                .volumes
+                .iter()
+                .find(|volume| volume_name == format!("volume-{}", volume.volume_id))
+                .map(|volume| volume.volume_id.clone());
+            if let Some(volume_id) = &scanned_volume_id {
+                scan.observed_volume_paths
+                    .insert((desired.cat_id.clone(), volume_id.clone()));
+            } else {
+                scan.unattributed_incomplete = true;
+            }
             let Some(volume_directory) =
                 open_strict_child_directory(&cat_directory, &volume_entry, root)?
             else {
                 scan.complete = false;
                 continue;
             };
-            let Some((attachment_name, attachment_directory)) = descend_only_directory(
+            let (attachment_name, attachment_directory) = match descend_only_directory(
                 &volume_directory,
                 root,
                 &mut budget,
                 context,
                 "attachment",
-            )?
-            else {
-                scan.complete = false;
-                continue;
+            )? {
+                OnlyDirectoryDescent::Open { name, directory } => (name, directory),
+                OnlyDirectoryDescent::Empty | OnlyDirectoryDescent::Unavailable => {
+                    scan.complete = false;
+                    continue;
+                }
             };
-            let Some((epoch_name, epoch_directory)) =
-                descend_only_directory(&attachment_directory, root, &mut budget, context, "epoch")?
-            else {
-                scan.complete = false;
-                continue;
+            let (epoch_name, epoch_directory) = match descend_only_directory(
+                &attachment_directory,
+                root,
+                &mut budget,
+                context,
+                "epoch",
+            )? {
+                OnlyDirectoryDescent::Open { name, directory } => (name, directory),
+                OnlyDirectoryDescent::Empty => {
+                    scan.complete = false;
+                    if desired.volumes.iter().any(|volume| {
+                        scanned_volume_id.as_ref() == Some(&volume.volume_id)
+                            && attachment_name == format!("attachment-{}", volume.attachment_id)
+                    }) {
+                        if let Some(volume_id) = &scanned_volume_id {
+                            scan.recoverable_publication_windows
+                                .insert((desired.cat_id.clone(), volume_id.clone()));
+                        }
+                    }
+                    continue;
+                }
+                OnlyDirectoryDescent::Unavailable => {
+                    scan.complete = false;
+                    continue;
+                }
             };
             let Some(leaf_entries) =
                 strict_directory_entries(&epoch_directory, &mut budget, context)?
@@ -2612,6 +2691,22 @@ fn scan_authorized_blockd_data(
             }) {
                 bail!("authorized blockd leaf retains foreign entry {foreign}")
             }
+            let recoverable_publication_window = matches!(
+                (
+                    by_name.contains_key(IDENTITY_FILE),
+                    by_name.contains_key(IDENTITY_TEMP),
+                    by_name.contains_key(AUTHORIZED_SERVING_FILE),
+                    by_name.contains_key(AUTHORIZED_SERVING_TEMP),
+                    by_name.contains_key(LAUNCH_CHECKPOINT_FILE),
+                    by_name.contains_key(LAUNCH_CHECKPOINT_TEMP),
+                    by_name.len(),
+                ),
+                (false, true, false, false, false, false, 1)
+                    | (true, false, false, false, false, false, 1)
+                    | (true, false, false, true, false, false, 2)
+                    | (true, false, true, false, false, false, 2)
+                    | (true, false, true, false, false, true, 3)
+            );
             if [
                 IDENTITY_TEMP,
                 AUTHORIZED_SERVING_TEMP,
@@ -2630,6 +2725,14 @@ fn scan_authorized_blockd_data(
                 .any(|name| !by_name.contains_key(name))
             {
                 scan.complete = false;
+                if recoverable_publication_window {
+                    if let Some(volume_id) = &scanned_volume_id {
+                        scan.recoverable_publication_windows
+                            .insert((desired.cat_id.clone(), volume_id.clone()));
+                    } else {
+                        scan.unattributed_incomplete = true;
+                    }
+                }
                 continue;
             }
             let root_metadata = root.metadata().context("inspect retained state root")?;
@@ -3207,18 +3310,24 @@ fn read_scanned_handoff_artifact(
     }))
 }
 
+enum OnlyDirectoryDescent {
+    Empty,
+    Unavailable,
+    Open { name: String, directory: File },
+}
+
 fn descend_only_directory(
     parent: &File,
     root: &File,
     budget: &mut usize,
     context: &RuntimeInventoryScanContext,
     label: &str,
-) -> anyhow::Result<Option<(String, File)>> {
+) -> anyhow::Result<OnlyDirectoryDescent> {
     let Some(entries) = strict_directory_entries(parent, budget, context)? else {
-        return Ok(None);
+        return Ok(OnlyDirectoryDescent::Unavailable);
     };
     if entries.is_empty() {
-        return Ok(None);
+        return Ok(OnlyDirectoryDescent::Empty);
     }
     anyhow::ensure!(
         entries.len() == 1,
@@ -3230,9 +3339,9 @@ fn descend_only_directory(
         .with_context(|| format!("authorized blockd {label} path is not UTF-8"))?
         .to_owned();
     let Some(directory) = open_strict_child_directory(parent, &entries[0], root)? else {
-        return Ok(None);
+        return Ok(OnlyDirectoryDescent::Unavailable);
     };
-    Ok(Some((name, directory)))
+    Ok(OnlyDirectoryDescent::Open { name, directory })
 }
 
 fn authorized_blockd_binding(

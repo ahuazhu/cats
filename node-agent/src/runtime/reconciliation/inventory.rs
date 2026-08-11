@@ -1949,7 +1949,7 @@ fn authority_record_matches_local_attachment(
         && record.last_transition == Some(attachment.expected_last_transition())
 }
 
-fn checkpoint_prepared_volume_matches_blockd(
+pub(crate) fn checkpoint_prepared_volume_matches_blockd(
     checkpoint: &RuntimeCheckpoint,
     blockd: &AuthorizedBlockdInventoryEvidence,
 ) -> bool {
@@ -2049,7 +2049,14 @@ fn takeover_historical_r0_is_closed(
                     head,
                 } if attachment_id == &authorization.expected_attachment_id
                     && *attachment_epoch == authorization.expected_epoch
-                    && remote_head_is_same_or_later(&receipt.resulting_head, head)
+                    // The durable checkpoint is the pre-A22 predecessor. A
+                    // Takeover preserves that locked head, so it must equal
+                    // the Control-signed primary receipt even when current
+                    // authority is a later closed successor. Monotonicity is
+                    // reserved for current-vs-primary below; accepting an
+                    // older checkpoint head here would let unrelated durable
+                    // bytes borrow an otherwise valid receipt and R0.
+                    && head == &receipt.resulting_head
             )
     });
     let previously_adopted_sibling = checkpoint_volume.is_some_and(|volume| {
