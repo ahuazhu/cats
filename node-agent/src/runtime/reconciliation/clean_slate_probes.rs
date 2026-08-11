@@ -94,6 +94,8 @@ use super::vmm_process::{
     PlatformSystemdVmmProcessPort, VmmProcessConflict, VmmProcessExpectation,
     VmmProcessGlobalInspection, VmmProcessGlobalPort, VmmProcessInspection, VmmProcessPort,
 };
+#[cfg(all(test, target_os = "linux"))]
+use super::vmm_runtime_paths::VMM_LAUNCH_FILE_NAMESPACE;
 #[cfg(target_os = "linux")]
 use super::vmm_runtime_paths::{
     scan_managed_vmm_launch_root, ManagedVmmLaunchRootScan, RetainedManagedVmmLaunchRoot,
@@ -3607,13 +3609,15 @@ impl VmmProcessGlobalPort for PlatformRootProcessInventoryBridge {
                     .remove(expected.cat_id())
                     .expect("target VMM expectation was retained in the closed set")
                 {
-                    VmmProcessInspection::Absent => Ok(VmmProcessGlobalInspection::Absent(
-                        super::vmm_process::ExactVmmProcessAbsenceProof::for_expectation(
-                            expected.clone(),
-                        ),
-                    )),
+                    VmmProcessInspection::Absent => {
+                        Ok(VmmProcessGlobalInspection::Absent(Box::new(
+                            super::vmm_process::ExactVmmProcessAbsenceProof::for_expectation(
+                                expected.clone(),
+                            ),
+                        )))
+                    }
                     VmmProcessInspection::Exact(evidence) => Ok(VmmProcessGlobalInspection::Exact(
-                        expected.clone().prove_exact_process(*evidence)?,
+                        Box::new(expected.clone().prove_exact_process(*evidence)?),
                     )),
                     VmmProcessInspection::Conflict(problem) => {
                         Ok(VmmProcessGlobalInspection::Conflict(problem))
@@ -6081,7 +6085,18 @@ mod tests {
             )
             .unwrap();
         let cat_id = expected.cat_id().clone();
-        let bridge = root_process_bridge(&environment, []);
+        let bridge = root_process_bridge_with_all_ports(
+            &environment,
+            Arc::new(FakeRootProcessPort {
+                inspections: Mutex::new(VecDeque::new()),
+            }),
+            Arc::new(FakeServingProcessPort {
+                process_ids: Mutex::new(VecDeque::new()),
+            }),
+            Arc::new(FakeVmmProcessPort {
+                process_ids: Mutex::new(VecDeque::from([None, None])),
+            }),
+        );
         let outcome = bridge
             .inspect_all(
                 BTreeMap::new(),
@@ -9104,6 +9119,9 @@ mod tests {
             }
             std::fs::set_permissions(installed, std::fs::Permissions::from_mode(0o700)).unwrap();
             VmmSocketReceiptStore::provision_for_test(state.clone()).unwrap();
+            let launch_root = state.path().join(VMM_LAUNCH_FILE_NAMESPACE);
+            std::fs::create_dir(&launch_root).unwrap();
+            std::fs::set_permissions(&launch_root, std::fs::Permissions::from_mode(0o700)).unwrap();
         }
         let config = ProbeConfig::installed(InstalledCleanSlateProbeConfig {
             state_directory: state.clone(),
@@ -9167,7 +9185,21 @@ mod tests {
             ))
             .unwrap(),
         );
+        let launch_namespace = environment.state.join(VMM_LAUNCH_FILE_NAMESPACE);
+        std::fs::create_dir(&launch_namespace).unwrap();
+        std::fs::set_permissions(
+            &launch_namespace,
+            std::os::unix::fs::PermissionsExt::from_mode(0o700),
+        )
+        .unwrap();
+        let launch_root = Arc::new(
+            RetainedManagedVmmLaunchRoot::open_existing(StateDirectory::unanchored(
+                environment.state.clone(),
+            ))
+            .unwrap(),
+        );
         bridge.managed_vmm_socket_root = Some(Arc::clone(&managed_root));
+        bridge.managed_vmm_launch_root = Some(launch_root);
         bridge.vmm_socket_receipts = Some(receipts);
         let empty = BTreeSet::new();
         let expected_vmms = BTreeMap::new();

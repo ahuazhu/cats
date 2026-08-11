@@ -575,10 +575,17 @@ mod tests {
         encode_image_manifest, AdapterConfig, AdapterSelection, BlobError, ImageManifestV1,
         LowerHexSha256,
     };
+    #[cfg(target_os = "linux")]
+    use std::os::unix::fs::PermissionsExt as _;
 
     use crate::runtime::reconciliation::{
         clean_slate_scanner_with_volume_authority_and_blob_for_test, runtime_checkpoint_path,
         TestCleanSlateProbeConfig,
+    };
+    #[cfg(target_os = "linux")]
+    use crate::runtime::reconciliation::{
+        RetainedManagedVmmLaunchRoot, RetainedManagedVmmSocketRoot, VmmSocketReceiptStore,
+        INSTALLED_VMM_SOCKET_ROOT, VMM_LAUNCH_FILE_NAMESPACE,
     };
 
     struct StubbornEffectChildOwner {
@@ -1014,7 +1021,7 @@ mod tests {
             include_bytes!("../../tests/fixtures/route_grant_private_ed25519.pem"),
         )
         .unwrap();
-        AgentRegistrationConfig::for_loopback_test(
+        let config = AgentRegistrationConfig::for_loopback_test(
             NodeIdentity {
                 version: ContractVersion::V1,
                 node_id: Id::new("node_cutover_a").unwrap(),
@@ -1027,7 +1034,7 @@ mod tests {
                 state: NodeIdentityState::Provisioned,
             },
             signer,
-            state_path,
+            state_path.clone(),
             NodeBootId::new("11111111111111111111111111111111").unwrap(),
             &GuestRuntimeProfileReceipt {
                 version: ContractVersion::V1,
@@ -1036,7 +1043,32 @@ mod tests {
                 kernel_cmdline: AsciiText::new("console=hvc0 root=/dev/vda").unwrap(),
                 guest_agent_protocol_version: ContractVersion::V1,
             },
-        )
+        )?;
+        #[cfg(target_os = "linux")]
+        provision_runtime_namespaces_for_test(&state_path)?;
+        Ok(config)
+    }
+
+    #[cfg(target_os = "linux")]
+    fn provision_runtime_namespaces_for_test(state_path: &std::path::Path) -> anyhow::Result<()> {
+        let state = crate::state_directory::StateDirectory::unanchored(state_path.to_path_buf());
+        let launch = state.path().join(VMM_LAUNCH_FILE_NAMESPACE);
+        if !launch.exists() {
+            std::fs::create_dir(&launch)?;
+            std::fs::set_permissions(&launch, std::fs::Permissions::from_mode(0o700))?;
+        }
+        RetainedManagedVmmLaunchRoot::open_existing(state.clone())?;
+        if VmmSocketReceiptStore::open_existing(state.clone()).is_err() {
+            VmmSocketReceiptStore::provision_for_test(state.clone())?;
+        }
+        let installed = std::path::Path::new(INSTALLED_VMM_SOCKET_ROOT);
+        if !installed.exists() {
+            std::fs::create_dir_all(installed.parent().unwrap())?;
+            RetainedManagedVmmSocketRoot::provision_for_test(installed)?;
+        } else {
+            RetainedManagedVmmSocketRoot::open_installed()?;
+        }
+        Ok(())
     }
 
     fn test_ch_config() -> ChConfig {
@@ -1225,6 +1257,8 @@ mod tests {
         assert!(source.contains("VmmLaunchArtifactPaths"));
         assert!(source.contains("vmm_launcher_bin"));
         assert!(running_effect.contains("StartRuntimeReservationEffect::platform"));
+        assert!(running_effect.contains("StartRuntimePhysicalEffect::platform"));
+        assert!(running_effect.contains("physical_start_runtime.try_apply"));
         let placeholder_effect = ["Unavailable", "Desired", "Effect"].concat();
         let legacy_job = ["Node", "Job"].concat();
         let legacy_runtime = ["Node", "Runtime", "::", "new"].concat();

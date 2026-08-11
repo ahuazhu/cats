@@ -46,7 +46,7 @@ use super::signed_root_provision::signed_start_runtime_inventory_admission_is_ex
 use super::vmm_launch_artifacts::{RetainedVmmLaunchArtifacts, VmmLaunchArtifactPaths};
 use super::vmm_process::VmmProcessGlobalPort;
 #[cfg(target_os = "linux")]
-use super::vmm_process::{CheckpointedVmmProcess, VmmProcessGlobalInspection, VmmProcessStart};
+use super::vmm_process::{CheckpointedVmmProcess, VmmProcessGlobalInspection};
 #[cfg(target_os = "linux")]
 use super::vmm_runtime_paths::{ManagedVmmLaunchPreparation, RetainedManagedVmmLaunchRoot};
 #[cfg(target_os = "linux")]
@@ -129,6 +129,8 @@ pub(crate) struct StartRuntimePhysicalEffect {
     vmm_process: Arc<dyn VmmProcessGlobalPort>,
     kernel_nbd: Option<KernelNbdInventoryPort>,
     artifact_paths: VmmLaunchArtifactPaths,
+    #[cfg(test)]
+    artifact_test_root: Option<std::path::PathBuf>,
     #[cfg(target_os = "linux")]
     socket_root: Arc<RetainedManagedVmmSocketRoot>,
     #[cfg(target_os = "linux")]
@@ -184,6 +186,12 @@ impl StartRuntimeReservationEffect {
             artifacts,
             socket_root: ManagedVmmSocketRoot::installed(),
         }
+    }
+
+    #[cfg(all(test, target_os = "linux"))]
+    pub(crate) fn with_socket_root_for_test(mut self, socket_root: ManagedVmmSocketRoot) -> Self {
+        self.socket_root = socket_root;
+        self
     }
 
     #[cfg(test)]
@@ -480,6 +488,8 @@ impl StartRuntimePhysicalEffect {
             vmm_process,
             kernel_nbd: kernel_nbd.map(KernelNbdInventoryPort::new),
             artifact_paths,
+            #[cfg(test)]
+            artifact_test_root: None,
             #[cfg(target_os = "linux")]
             socket_root,
             #[cfg(target_os = "linux")]
@@ -499,6 +509,7 @@ impl StartRuntimePhysicalEffect {
     pub(crate) fn for_test(
         state_directory: StateDirectory,
         artifact_paths: VmmLaunchArtifactPaths,
+        artifact_test_root: std::path::PathBuf,
         network: Arc<PrepareNetworkReservationEffect>,
         authority: Arc<dyn VolumeDataAuthority>,
         serving_process: Arc<dyn ServingBlockdProcessGlobalPort>,
@@ -515,6 +526,7 @@ impl StartRuntimePhysicalEffect {
             vmm_process,
             kernel_nbd: None,
             artifact_paths,
+            artifact_test_root: Some(artifact_test_root),
             socket_root,
             launch_root,
             receipts,
@@ -544,7 +556,7 @@ impl StartRuntimePhysicalEffect {
                 desired,
                 runtime,
             );
-            return Ok(Some(RuntimeDesiredEffectOutcome::RefreshInventory));
+            Ok(Some(RuntimeDesiredEffectOutcome::RefreshInventory))
         }
         #[cfg(target_os = "linux")]
         self.try_apply_linux(context, desired, runtime)
@@ -595,8 +607,7 @@ impl StartRuntimePhysicalEffect {
             return Ok(Some(RuntimeDesiredEffectOutcome::RefreshInventory));
         };
         if stored.content_digest() != content_digest
-            || stored.checkpoint().step != runtime.step
-            || !checkpoint_is_current_exact(desired, runtime)
+            || !physical_start_runtime_checkpoint_evidence_is_exact(desired, runtime, &stored)
         {
             return Ok(Some(RuntimeDesiredEffectOutcome::RefreshInventory));
         }
@@ -620,7 +631,9 @@ impl StartRuntimePhysicalEffect {
                     .inspect_vmm_exact_or_absent_after_node_global_sweep(&expectation, context)
                     .context("reinspect admitted physical VMM")?
                 {
-                    VmmProcessGlobalInspection::Exact(current) if &current == admitted_vmm => {
+                    VmmProcessGlobalInspection::Exact(current)
+                        if current.as_ref() == admitted_vmm =>
+                    {
                         RuntimeDesiredEffectOutcome::RefreshInventory
                     }
                     VmmProcessGlobalInspection::Exact(_)
@@ -706,7 +719,8 @@ impl StartRuntimePhysicalEffect {
         let first_lease_expiry = first_authority
             .lease_expires_at
             .context("physical StartRuntime Volume authority lacks serving lease")?;
-        let artifacts = RetainedVmmLaunchArtifacts::open(&self.artifact_paths)
+        let artifacts = self
+            .retain_physical_artifacts()
             .context("retain physical StartRuntime launch artifacts")?;
         CheckpointedVmmProcess::prepare(&expectation, &store, &stored, &artifacts)
             .context("validate physical StartRuntime checkpoint and artifacts")?;
@@ -815,6 +829,35 @@ impl StartRuntimePhysicalEffect {
             stored.checkpoint(),
             &receipt,
         )?;
+        // Publishing the receipt-owned attempt marker is only the first
+        // filesystem mutation. Close that boundary with another fresh global
+        // sweep under the same exclusive namespace guard, then continue to
+        // the one submit in this admission when the exact attempt is ready.
+        let preparation = match preparation {
+            ManagedVmmLaunchPreparation::PublishedIntent => {
+                let published_authority = namespace_guard.bind_fresh_absence(
+                    self.revalidate_absent_physical_authority(
+                        context,
+                        &store,
+                        &stored,
+                        &expectation,
+                        serving_expectation,
+                        serving,
+                        kernel_nbd_proof,
+                        &first_authority,
+                        first_lease_expiry,
+                        &artifacts,
+                    )?,
+                    stored.checkpoint(),
+                )?;
+                self.launch_root.prepare_existing_receipt(
+                    &published_authority,
+                    stored.checkpoint(),
+                    &receipt,
+                )?
+            }
+            other => other,
+        };
         let ready = match preparation {
             ManagedVmmLaunchPreparation::PublishedIntent => {
                 return Ok(Some(RuntimeDesiredEffectOutcome::RefreshInventory));
@@ -859,7 +902,6 @@ impl StartRuntimePhysicalEffect {
         submit_authority.assert_for(&self.launch_root, stored.checkpoint())?;
         ready.assert_ready()?;
         self.receipts.assert_current()?;
-        drop(namespace_guard);
 
         // This is the sole submission call in the admission. Every result,
         // including definite local exec failure or response loss, requires a
@@ -896,11 +938,13 @@ impl StartRuntimePhysicalEffect {
         }
         *submitted = Some(observation_id.clone());
         drop(submitted);
-        let _start = match self.vmm_process.start_checkpointed(checkpointed, context)? {
-            VmmProcessStart::Submitted => VmmProcessStart::Submitted,
-            VmmProcessStart::OutcomeUnknown => VmmProcessStart::OutcomeUnknown,
-            VmmProcessStart::DefinitelyNotStarted => VmmProcessStart::DefinitelyNotStarted,
-        };
+        self.vmm_process.start_checkpointed(checkpointed, context)?;
+        // Keep the same exclusive launch namespace coordinate alive from the
+        // final fresh global absence sweep through the systemd submission.
+        // The launcher takes the corresponding shared lock before touching
+        // any leaf, so it cannot race this proof or its final revalidations.
+        drop(submit_authority);
+        drop(namespace_guard);
         Ok(Some(RuntimeDesiredEffectOutcome::RefreshInventory))
     }
 
@@ -937,7 +981,7 @@ impl StartRuntimePhysicalEffect {
             .vmm_process
             .inspect_vmm_exact_or_absent_after_node_global_sweep(expectation, context)?
         {
-            VmmProcessGlobalInspection::Absent(absence) => Ok(absence),
+            VmmProcessGlobalInspection::Absent(absence) => Ok(*absence),
             VmmProcessGlobalInspection::Exact(_) => {
                 anyhow::bail!("physical StartRuntime VMM appeared before mutation")
             }
@@ -1022,6 +1066,15 @@ impl StartRuntimePhysicalEffect {
         self.receipts.assert_current()?;
         context.check_active()
     }
+
+    #[cfg(target_os = "linux")]
+    fn retain_physical_artifacts(&self) -> Result<RetainedVmmLaunchArtifacts> {
+        #[cfg(test)]
+        if let Some(root) = &self.artifact_test_root {
+            return RetainedVmmLaunchArtifacts::open_for_test(root, &self.artifact_paths);
+        }
+        RetainedVmmLaunchArtifacts::open(&self.artifact_paths)
+    }
 }
 
 #[cfg(target_os = "linux")]
@@ -1029,11 +1082,58 @@ fn physical_vmm_expectation(
     stored: &StoredCheckpoint,
     checkpoint_path: HostPath,
 ) -> Result<super::vmm_process::VmmProcessExpectation> {
-    // Keep the retained launch selection behind this narrow helper so the
-    // running-tail integration can switch from current-step authority to the
-    // closed top-level `runtime_launch` field without scattering matches.
+    super::retained_runtime_launch::RetainedRuntimeLaunchAuthority::from_start_runtime_checkpoint(
+        stored.checkpoint(),
+    )?;
     super::vmm_process::VmmProcessExpectation::from_checkpoint(stored.checkpoint().clone())?
         .with_checkpoint_path(checkpoint_path)
+}
+
+#[cfg(target_os = "linux")]
+fn physical_start_runtime_checkpoint_evidence_is_exact(
+    desired: &DesiredRuntimeSpec,
+    runtime: &ObservedRuntimeStatus,
+    stored: &StoredCheckpoint,
+) -> bool {
+    let checkpoint = stored.checkpoint();
+    matches!(
+        &runtime.checkpoint,
+        CheckpointEvidence::Valid {
+            content_digest,
+            version,
+            cat_id,
+            node_id,
+            desired_revision,
+            spec_digest,
+            placement_epoch,
+            runtime_incarnation,
+            runtime_launch,
+            stable_state,
+            step,
+            require_idle,
+            updated_at_unix_ms,
+            ..
+        } if content_digest == stored.content_digest()
+            && *version == checkpoint.version
+            && cat_id == &checkpoint.cat_id
+            && cat_id == &desired.cat_id
+            && node_id == &checkpoint.node_id
+            && node_id == &desired.placement.node_id
+            && *desired_revision == checkpoint.desired_revision
+            && *desired_revision == desired.desired_revision
+            && spec_digest == &checkpoint.spec_digest
+            && spec_digest == &desired.spec_digest
+            && *placement_epoch == checkpoint.placement_epoch
+            && *placement_epoch == desired.placement.placement_epoch
+            && runtime_incarnation == &checkpoint.runtime_incarnation
+            && runtime_launch.as_ref() == &checkpoint.runtime_launch
+            && *stable_state == checkpoint.stable_state
+            && step.as_ref() == &checkpoint.step
+            && runtime.step == checkpoint.step
+            && require_idle.as_ref() == &checkpoint.require_idle
+            && *updated_at_unix_ms == checkpoint.updated_at_unix_ms
+            && super::retained_runtime_launch::RetainedRuntimeLaunchAuthority::from_start_runtime_checkpoint(checkpoint).is_ok()
+    )
 }
 
 #[cfg(target_os = "linux")]

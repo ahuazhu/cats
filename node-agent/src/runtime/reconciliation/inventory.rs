@@ -42,6 +42,7 @@ use super::{
         prepare_device_checkpoint_view, prepared_device_input, NodeGlobalNetworkScanAdmission,
     },
     prepare_device_retirement::prepared_device_input_is_exact,
+    retained_runtime_launch::RetainedRuntimeLaunchAuthority,
     root_provision_process::{
         NodeGlobalManagedProcessScanAdmission, RetainedRootProvisionProcessAttempt,
         RootProvisionAuthoritySnapshot, RootProvisionProcessExpectation,
@@ -712,7 +713,7 @@ fn vmm_process_expectations(
     let mut expected = BTreeMap::new();
     for (cat_id, evidence) in checkpoints_by_cat {
         if evidence.binding != DesiredCheckpointBinding::Current
-            || !matches!(evidence.checkpoint.step, ReconcileStep::StartRuntime { .. })
+            || evidence.checkpoint.runtime_launch.identity().is_none()
         {
             continue;
         }
@@ -721,7 +722,7 @@ fn vmm_process_expectations(
                 .to_string_lossy()
                 .into_owned(),
         )
-        .context("StartRuntime checkpoint path is not canonical")?;
+        .context("retained-launch checkpoint path is not canonical")?;
         let expectation = super::vmm_process::VmmProcessExpectation::from_checkpoint(
             evidence.checkpoint.clone(),
         )?
@@ -860,10 +861,10 @@ fn serving_process_expectations(
         };
         if checkpoint.binding != DesiredCheckpointBinding::Current
             || blockd.binding != DesiredCheckpointBinding::Current
-            || !matches!(
+            || !(matches!(
                 checkpoint.checkpoint.step,
                 ReconcileStep::PrepareDevice { .. } | ReconcileStep::PrepareNetwork { .. }
-            )
+            ) || checkpoint.checkpoint.runtime_launch.identity().is_some())
         {
             continue;
         }
@@ -1457,6 +1458,11 @@ fn validate_scanned_checkpoint(
             .context("validate checkpointed PrepareNetwork identity")?;
             validate_current_prepared_checkpoint(desired, checkpoint, blockd, false)?;
         }
+        _ if binding == DesiredCheckpointBinding::Current
+            && checkpoint.runtime_launch.identity().is_some() =>
+        {
+            validate_current_launched_checkpoint(desired, checkpoint, blockd)?;
+        }
         ReconcileStep::CleanupRelease { cleanup }
             if binding == DesiredCheckpointBinding::Current =>
         {
@@ -1507,6 +1513,26 @@ fn validate_current_prepared_checkpoint(
         "prepared-device checkpoint does not bind authorized root handoff lineage"
     );
     Ok(())
+}
+
+fn validate_current_launched_checkpoint(
+    desired: &DesiredRuntimeSpec,
+    checkpoint: &RuntimeCheckpoint,
+    blockd: Option<&AuthorizedBlockdInventoryEvidence>,
+) -> anyhow::Result<()> {
+    let authority = RetainedRuntimeLaunchAuthority::from_checkpoint(checkpoint)
+        .context("validate current retained VMM launch authority")?;
+    let launch = authority.identity();
+    anyhow::ensure!(
+        desired.target == cats_api::runtime_reconciliation::RuntimeTarget::Running
+            && launch.vcpus == desired.runtime.vcpus
+            && launch.memory_bytes == desired.runtime.memory_bytes
+            && launch.boot_image_digest == desired.runtime.boot_image_digest
+            && launch.guest_config_digest == desired.runtime.guest_config_digest
+            && launch.network.network_config == desired.runtime.network_config,
+        "retained VMM launch does not bind the exact current Desired runtime"
+    );
+    validate_current_prepared_checkpoint(desired, checkpoint, blockd, false)
 }
 
 fn current_acquire_adoption_is_closed(
@@ -1646,10 +1672,11 @@ mod tests {
 
     use cats_api::runtime_reconciliation::{
         decode_desired_read_snapshot, decode_runtime_checkpoint, encode_node_observation,
-        inventory_digest, spec_digest, AssignedKind, AssignedPlacement, ContractVersion,
-        DesiredRuntimeSpec, Epoch, Id, InventorySource, Ipv4Address, IsolatedIpv4Kind, KeyId,
-        MacAddress, NetworkConfig, NodeObservation, RandomId128, Revision, RuntimeConfig,
-        RuntimeTarget, RuntimeTransition, SessionBinding, Sha256Digest,
+        encode_runtime_checkpoint, inventory_digest, spec_digest, AssignedKind, AssignedPlacement,
+        ContractVersion, DesiredRuntimeSpec, Epoch, Id, InventorySource, Ipv4Address,
+        IsolatedIpv4Kind, KeyId, MacAddress, NetworkConfig, NodeObservation, RandomId128,
+        ReconcileStep, Revision, RuntimeConfig, RuntimeTarget, RuntimeTransition, SessionBinding,
+        Sha256Digest, StableState,
     };
 
     use super::*;
@@ -1657,7 +1684,7 @@ mod tests {
     const SNAPSHOT: &[u8] = br#"{"desired_specs":[],"expires_at_unix_ms":1720000030000,"issued_at_unix_ms":1720000000000,"read_position":12,"request_sequence":1,"session":{"agent_instance_id":"44444444444444444444444444444444","agent_session_epoch":2,"node_boot_id":"33333333333333333333333333333333","node_id":"node_a"},"version":1}"#;
 
     #[test]
-    fn only_current_start_runtime_mints_a_vmm_inventory_expectation() {
+    fn current_retained_launch_mints_vmm_expectations_through_running_tail() {
         let checkpoint = decode_runtime_checkpoint(include_bytes!(concat!(
             env!("CARGO_MANIFEST_DIR"),
             "/../testdata/runtime-reconciliation-v1-start-runtime-checkpoint.json"
@@ -1679,6 +1706,22 @@ mod tests {
         assert_eq!(
             expectation.checkpoint_path().unwrap().as_str(),
             "/var/lib/cats/checkpoints/cat-cat_01.checkpoint.json"
+        );
+
+        let mut tail = evidence.clone();
+        tail.checkpoint.step = ReconcileStep::Stable {
+            state: StableState::Running,
+        };
+        tail.checkpoint.stable_state = Some(StableState::Running);
+        encode_runtime_checkpoint(&tail.checkpoint).unwrap();
+        let tail_expected = vmm_process_expectations(
+            std::path::Path::new("/var/lib/cats/checkpoints"),
+            &BTreeMap::from([(cat_id.clone(), tail)]),
+        )
+        .unwrap();
+        assert_eq!(
+            tail_expected.get(&cat_id).unwrap().launch_identity(),
+            expectation.launch_identity()
         );
 
         let superseded = RuntimeCheckpointInventoryEvidence {

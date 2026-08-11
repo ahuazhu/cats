@@ -36,6 +36,7 @@ mod kernel_nbd;
 mod network;
 mod normal_acquire;
 mod prepare_device_retirement;
+mod retained_runtime_launch;
 mod root_provision;
 mod running_admission;
 // The sealed serving-process foundation is composed with the Node-global
@@ -186,6 +187,8 @@ pub(crate) use vmm_launch_artifacts::VmmLaunchArtifactPaths;
 pub(crate) use vmm_runtime_paths::ManagedVmmLaunchFilePaths;
 #[cfg(target_os = "linux")]
 pub(crate) use vmm_runtime_paths::RetainedManagedVmmLaunchRoot;
+#[cfg(all(test, target_os = "linux"))]
+pub(crate) use vmm_runtime_paths::VMM_LAUNCH_FILE_NAMESPACE;
 #[cfg(target_os = "linux")]
 pub(crate) use vmm_socket_namespace::ManagedVmmSocketPreparation;
 #[allow(unused_imports)]

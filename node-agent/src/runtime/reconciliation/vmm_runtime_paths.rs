@@ -20,11 +20,15 @@ use std::sync::Arc;
 
 use anyhow::{Context as _, Result};
 #[cfg(target_os = "linux")]
-use cats_api::runtime_reconciliation::encode_runtime_checkpoint;
-use cats_api::runtime_reconciliation::{HostPath, RandomId128, RuntimeCheckpoint};
+use cats_api::runtime_reconciliation::{
+    checkpoint_content_digest, decode_runtime_checkpoint, encode_runtime_checkpoint,
+    RUNTIME_CHECKPOINT_MAX_WIRE_BYTES,
+};
+use cats_api::runtime_reconciliation::{HostPath, RandomId128, RuntimeCheckpoint, Sha256Digest};
 
 use crate::state_directory::StateDirectory;
 
+use super::retained_runtime_launch::RetainedRuntimeLaunchAuthority;
 use super::vmm_launch_artifacts::VmmLaunchArtifactDescriptors;
 #[cfg(target_os = "linux")]
 use super::vmm_socket_namespace::{
@@ -98,26 +102,14 @@ impl ManagedVmmLaunchFilePaths {
         state_directory: &StateDirectory,
         checkpoint: &RuntimeCheckpoint,
     ) -> Result<Self> {
-        let cats_api::runtime_reconciliation::ReconcileStep::StartRuntime {
-            runtime_incarnation,
-            memory_file_path,
-            serial_log_path,
-            vmm_log_path,
-            ..
-        } = &checkpoint.step
-        else {
-            anyhow::bail!("managed VMM launch file paths require StartRuntime")
-        };
+        let authority = RetainedRuntimeLaunchAuthority::from_checkpoint(checkpoint)?;
+        let launch = authority.identity();
+        let paths = Self::for_incarnation(state_directory, &launch.runtime_incarnation)?;
         anyhow::ensure!(
-            checkpoint.runtime_incarnation.as_ref() == Some(runtime_incarnation),
-            "StartRuntime launch file paths have a non-exact top-level incarnation"
-        );
-        let paths = Self::for_incarnation(state_directory, runtime_incarnation)?;
-        anyhow::ensure!(
-            memory_file_path == &paths.memory_file_path
-                && serial_log_path == &paths.serial_log_path
-                && vmm_log_path == &paths.vmm_log_path,
-            "StartRuntime launch files are outside the managed VMM namespace"
+            launch.memory_file_path == paths.memory_file_path
+                && launch.serial_log_path == paths.serial_log_path
+                && launch.vmm_log_path == paths.vmm_log_path,
+            "retained VMM launch files are outside the managed namespace"
         );
         Ok(paths)
     }
@@ -1325,6 +1317,7 @@ fn canonical_host_path(path: PathBuf, label: &str) -> Result<HostPath> {
 pub(crate) struct VmmRuntimePathRequirements {
     pub(crate) checkpoint_path: HostPath,
     pub(crate) checkpoint: RuntimeCheckpoint,
+    pub(crate) original_checkpoint_content_digest: Sha256Digest,
     pub(crate) memory_file_path: HostPath,
     pub(crate) memory_bytes: u64,
     pub(crate) serial_log_path: HostPath,
@@ -1340,7 +1333,9 @@ pub(crate) enum VmmRuntimePathInspection {
 
 #[derive(Debug)]
 pub(crate) struct RetainedVmmRuntimePaths {
-    checkpoint: PinnedRuntimePath,
+    current_checkpoint: PinnedRuntimePath,
+    #[cfg(target_os = "linux")]
+    launch_checkpoint: PinnedRuntimeDescriptor,
     memory: PinnedRuntimePath,
     serial_log: PinnedRuntimePath,
     vmm_log: PinnedRuntimePath,
@@ -1348,7 +1343,18 @@ pub(crate) struct RetainedVmmRuntimePaths {
 
 impl PartialEq for RetainedVmmRuntimePaths {
     fn eq(&self, other: &Self) -> bool {
-        self.identities() == other.identities()
+        let common = self.current_checkpoint.identity == other.current_checkpoint.identity
+            && self.memory.identity == other.memory.identity
+            && self.serial_log.identity == other.serial_log.identity
+            && self.vmm_log.identity == other.vmm_log.identity;
+        #[cfg(target_os = "linux")]
+        {
+            common && self.launch_checkpoint.identity == other.launch_checkpoint.identity
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            common
+        }
     }
 }
 
@@ -1358,19 +1364,58 @@ impl RetainedVmmRuntimePaths {
     #[cfg(target_os = "linux")]
     pub(crate) fn open(
         requirements: &VmmRuntimePathRequirements,
+        process_id: u32,
     ) -> Result<VmmRuntimePathInspection> {
+        let Some(current_checkpoint) = Self::open_current_checkpoint(requirements)? else {
+            return Ok(VmmRuntimePathInspection::Unavailable);
+        };
+        let launch_checkpoint =
+            match PinnedRuntimeDescriptor::open_launch_checkpoint(process_id, requirements) {
+                Ok(checkpoint) => checkpoint,
+                Err(_) => return Ok(VmmRuntimePathInspection::Conflict),
+            };
+        Self::open_with_checkpoints(requirements, current_checkpoint, launch_checkpoint)
+    }
+
+    #[cfg(all(test, target_os = "linux"))]
+    fn open_with_launch_descriptor_for_test(
+        requirements: &VmmRuntimePathRequirements,
+        launch_checkpoint: File,
+    ) -> Result<VmmRuntimePathInspection> {
+        let Some(current_checkpoint) = Self::open_current_checkpoint(requirements)? else {
+            return Ok(VmmRuntimePathInspection::Unavailable);
+        };
+        let launch_checkpoint = match PinnedRuntimeDescriptor::from_launch_checkpoint_descriptor(
+            launch_checkpoint,
+            requirements,
+        ) {
+            Ok(checkpoint) => checkpoint,
+            Err(_) => return Ok(VmmRuntimePathInspection::Conflict),
+        };
+        Self::open_with_checkpoints(requirements, current_checkpoint, launch_checkpoint)
+    }
+
+    #[cfg(target_os = "linux")]
+    fn open_current_checkpoint(
+        requirements: &VmmRuntimePathRequirements,
+    ) -> Result<Option<PinnedRuntimePath>> {
         let checkpoint_bytes = encode_runtime_checkpoint(&requirements.checkpoint)
-            .context("encode exact StartRuntime checkpoint")?;
-        let Some(checkpoint) = PinnedRuntimePath::open(
+            .context("encode exact current Runtime checkpoint")?;
+        PinnedRuntimePath::open(
             &requirements.checkpoint_path,
             LeafRule::ImmutableRegular {
                 mode: 0o600,
                 bytes: checkpoint_bytes,
             },
-        )?
-        else {
-            return Ok(VmmRuntimePathInspection::Unavailable);
-        };
+        )
+    }
+
+    #[cfg(target_os = "linux")]
+    fn open_with_checkpoints(
+        requirements: &VmmRuntimePathRequirements,
+        current_checkpoint: PinnedRuntimePath,
+        launch_checkpoint: PinnedRuntimeDescriptor,
+    ) -> Result<VmmRuntimePathInspection> {
         let Some(memory) = PinnedRuntimePath::open(
             &requirements.memory_file_path,
             LeafRule::Regular {
@@ -1402,7 +1447,8 @@ impl RetainedVmmRuntimePaths {
             return Ok(VmmRuntimePathInspection::Unavailable);
         };
         let retained = Self {
-            checkpoint,
+            current_checkpoint,
+            launch_checkpoint,
             memory,
             serial_log,
             vmm_log,
@@ -1418,15 +1464,19 @@ impl RetainedVmmRuntimePaths {
     #[cfg(not(target_os = "linux"))]
     pub(crate) fn open(
         _requirements: &VmmRuntimePathRequirements,
+        _process_id: u32,
     ) -> Result<VmmRuntimePathInspection> {
         Ok(VmmRuntimePathInspection::Unavailable)
     }
 
     #[cfg(target_os = "linux")]
     pub(crate) fn assert_current(&self) -> Result<()> {
-        self.checkpoint
+        self.current_checkpoint
             .assert_current()
-            .context("StartRuntime checkpoint path changed")?;
+            .context("current Runtime checkpoint path changed")?;
+        self.launch_checkpoint
+            .assert_current()
+            .context("inherited StartRuntime checkpoint descriptor changed")?;
         self.memory
             .assert_current()
             .context("VMM memory file path changed")?;
@@ -1450,7 +1500,11 @@ impl RetainedVmmRuntimePaths {
         process_id: u32,
         launch: VmmLaunchArtifactDescriptors<'_>,
     ) -> Result<()> {
-        assert_process_fd(process_id, CHECKPOINT_FD, &self.checkpoint.leaf_identity)?;
+        assert_process_fd(
+            process_id,
+            CHECKPOINT_FD,
+            &self.launch_checkpoint.identity.leaf,
+        )?;
         assert_process_fd(
             process_id,
             VMM_FD,
@@ -1483,15 +1537,105 @@ impl RetainedVmmRuntimePaths {
     ) -> Result<()> {
         anyhow::bail!("VMM fixed-descriptor proof is unavailable on this platform")
     }
+}
 
-    fn identities(&self) -> [&PathIdentity; 4] {
-        [
-            &self.checkpoint.identity,
-            &self.memory.identity,
-            &self.serial_log.identity,
-            &self.vmm_log.identity,
-        ]
+#[cfg(target_os = "linux")]
+#[derive(Debug)]
+struct PinnedRuntimeDescriptor {
+    descriptor: File,
+    identity: LaunchCheckpointDescriptorIdentity,
+}
+
+#[cfg(target_os = "linux")]
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct LaunchCheckpointDescriptorIdentity {
+    leaf: LeafIdentity,
+    bytes: Vec<u8>,
+}
+
+#[cfg(target_os = "linux")]
+impl PinnedRuntimeDescriptor {
+    fn open_launch_checkpoint(
+        process_id: u32,
+        requirements: &VmmRuntimePathRequirements,
+    ) -> Result<Self> {
+        anyhow::ensure!(process_id > 0, "VMM process ID is zero");
+        let path = PathBuf::from(format!("/proc/{process_id}/fd/{CHECKPOINT_FD}"));
+        let descriptor = open_path(&path, libc::O_RDONLY | libc::O_CLOEXEC)
+            .context("open inherited VMM StartRuntime checkpoint fd64")?;
+        Self::from_launch_checkpoint_descriptor(descriptor, requirements)
     }
+
+    fn from_launch_checkpoint_descriptor(
+        descriptor: File,
+        requirements: &VmmRuntimePathRequirements,
+    ) -> Result<Self> {
+        let before = descriptor.metadata()?;
+        ensure_inherited_checkpoint_leaf(&before)?;
+        let length = usize::try_from(before.len())
+            .context("inherited StartRuntime checkpoint length exceeds usize")?;
+        anyhow::ensure!(
+            length <= RUNTIME_CHECKPOINT_MAX_WIRE_BYTES,
+            "inherited StartRuntime checkpoint exceeds the wire bound"
+        );
+        let bytes = read_file_exact_length(&descriptor, length)?;
+        let after = descriptor.metadata()?;
+        let leaf = LeafIdentity::from_metadata(&before);
+        anyhow::ensure!(
+            LeafIdentity::from_metadata(&after) == leaf,
+            "inherited StartRuntime checkpoint changed while read"
+        );
+        let checkpoint = decode_runtime_checkpoint(&bytes)
+            .context("decode inherited StartRuntime checkpoint")?;
+        anyhow::ensure!(
+            checkpoint_content_digest(&checkpoint)?
+                == requirements.original_checkpoint_content_digest,
+            "inherited StartRuntime checkpoint digest differs from durable receipt"
+        );
+        let current = RetainedRuntimeLaunchAuthority::from_checkpoint(&requirements.checkpoint)?;
+        anyhow::ensure!(
+            current.matches_launch_checkpoint(&checkpoint)?,
+            "inherited StartRuntime checkpoint differs from retained launch authority"
+        );
+        Ok(Self {
+            descriptor,
+            identity: LaunchCheckpointDescriptorIdentity { leaf, bytes },
+        })
+    }
+
+    fn assert_current(&self) -> Result<()> {
+        let before = self.descriptor.metadata()?;
+        anyhow::ensure!(
+            LeafIdentity::from_metadata(&before) == self.identity.leaf,
+            "retained StartRuntime checkpoint descriptor identity changed"
+        );
+        let bytes = read_file_exact_length(&self.descriptor, self.identity.bytes.len())?;
+        let after = self.descriptor.metadata()?;
+        anyhow::ensure!(
+            LeafIdentity::from_metadata(&after) == self.identity.leaf
+                && bytes == self.identity.bytes,
+            "retained StartRuntime checkpoint descriptor changed"
+        );
+        Ok(())
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn ensure_inherited_checkpoint_leaf(metadata: &std::fs::Metadata) -> Result<()> {
+    // A successful checkpoint CAS atomically replaces the current pathname,
+    // leaving the VMM's inherited descriptor on the original, unlinked inode
+    // (`st_nlink == 0`). One remaining canonical pathname is also valid before
+    // the first successor CAS; multiple links would make the original launch
+    // bytes mutable through an unaccounted alias.
+    anyhow::ensure!(
+        metadata.is_file()
+            && metadata.uid() == 0
+            && metadata.gid() == 0
+            && metadata.nlink() <= 1
+            && metadata.mode() & 0o7777 == 0o600,
+        "inherited StartRuntime checkpoint type, owner, links or mode changed"
+    );
+    Ok(())
 }
 
 #[derive(Debug)]
@@ -1826,6 +1970,17 @@ fn assert_leaf_content(file: &File, identity: &LeafIdentity, rule: &LeafRule) ->
     Ok(())
 }
 
+fn read_file_exact_length(file: &File, length: usize) -> Result<Vec<u8>> {
+    let mut bytes = vec![0_u8; length];
+    let mut offset = 0_usize;
+    while offset < bytes.len() {
+        let read = file.read_at(&mut bytes[offset..], offset as u64)?;
+        anyhow::ensure!(read > 0, "retained file ended early");
+        offset += read;
+    }
+    Ok(bytes)
+}
+
 #[cfg(target_os = "linux")]
 fn assert_process_fd(process_id: u32, descriptor: i32, expected: &LeafIdentity) -> Result<()> {
     let path = PathBuf::from(format!("/proc/{process_id}/fd/{descriptor}"));
@@ -1857,10 +2012,15 @@ fn unsafe_path_error(error: &io::Error) -> bool {
 
 #[cfg(test)]
 mod tests {
+    use cats_api::runtime_reconciliation::{
+        decode_runtime_checkpoint, ReconcileStep, RuntimeLaunch,
+    };
+    #[cfg(target_os = "linux")]
+    use cats_api::runtime_reconciliation::{
+        encode_runtime_checkpoint, Epoch, Generation, Id, RemoteHead, StableState,
+    };
     use std::io::Write as _;
     use std::os::unix::fs::{MetadataExt as _, OpenOptionsExt as _};
-
-    use cats_api::runtime_reconciliation::{decode_runtime_checkpoint, ReconcileStep};
 
     use super::*;
 
@@ -1873,6 +2033,222 @@ mod tests {
             "/../testdata/runtime-reconciliation-v1-start-runtime-checkpoint.json"
         )))
         .unwrap()
+    }
+
+    fn sync_retained_launch(checkpoint: &mut RuntimeCheckpoint) {
+        checkpoint.runtime_launch = RuntimeLaunch::Present(Box::new(
+            checkpoint
+                .step
+                .start_runtime_launch_identity()
+                .expect("test checkpoint remains StartRuntime"),
+        ));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[derive(Debug, Clone, Copy)]
+    enum RunningTail {
+        Format,
+        InstallGate,
+        Stable,
+    }
+
+    #[cfg(target_os = "linux")]
+    fn running_tail_checkpoint(
+        launch_checkpoint: &RuntimeCheckpoint,
+        tail: RunningTail,
+    ) -> RuntimeCheckpoint {
+        let mut checkpoint = launch_checkpoint.clone();
+        checkpoint.step = match tail {
+            RunningTail::Format => ReconcileStep::FormatFilesystem {
+                volume_id: Id::new("vol_root").unwrap(),
+                attachment_id: Id::new("att_01").unwrap(),
+                filesystem_uuid: RandomId128::new("dddddddddddddddddddddddddddddddd").unwrap(),
+                initialization_token: RandomId128::new("eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee").unwrap(),
+                expected_blank_head: RemoteHead {
+                    generation: Generation::new(0).unwrap(),
+                    root_hash: None,
+                    root_object_id: None,
+                },
+            },
+            RunningTail::InstallGate => ReconcileStep::InstallGate {
+                endpoint_id: Id::new("endpoint_01").unwrap(),
+                route_epoch: Epoch::new(1).unwrap(),
+            },
+            RunningTail::Stable => {
+                checkpoint.stable_state = Some(StableState::Running);
+                ReconcileStep::Stable {
+                    state: StableState::Running,
+                }
+            }
+        };
+        if !matches!(tail, RunningTail::Stable) {
+            checkpoint.stable_state = None;
+        }
+        encode_runtime_checkpoint(&checkpoint).unwrap_or_else(|error| {
+            panic!("running-tail checkpoint is invalid: {:?}", error.error)
+        });
+        checkpoint
+    }
+
+    #[cfg(target_os = "linux")]
+    fn launch_checkpoint_for_paths(root: &Path) -> RuntimeCheckpoint {
+        let mut checkpoint = start_runtime_checkpoint();
+        let ReconcileStep::StartRuntime {
+            memory_file_path,
+            serial_log_path,
+            vmm_log_path,
+            ..
+        } = &mut checkpoint.step
+        else {
+            unreachable!()
+        };
+        *memory_file_path =
+            HostPath::new(root.join("memory.bin").to_str().unwrap().to_owned()).unwrap();
+        *serial_log_path =
+            HostPath::new(root.join("serial.log").to_str().unwrap().to_owned()).unwrap();
+        *vmm_log_path = HostPath::new(root.join("vmm.log").to_str().unwrap().to_owned()).unwrap();
+        sync_retained_launch(&mut checkpoint);
+        encode_runtime_checkpoint(&checkpoint).unwrap();
+        checkpoint
+    }
+
+    #[cfg(target_os = "linux")]
+    fn changed_launch_identity(checkpoint: &RuntimeCheckpoint) -> RuntimeCheckpoint {
+        let mut changed = checkpoint.clone();
+        let ReconcileStep::StartRuntime {
+            process_identity_token,
+            ..
+        } = &mut changed.step
+        else {
+            unreachable!()
+        };
+        *process_identity_token = RandomId128::new("cccccccccccccccccccccccccccccccc").unwrap();
+        sync_retained_launch(&mut changed);
+        encode_runtime_checkpoint(&changed).unwrap();
+        changed
+    }
+
+    #[cfg(target_os = "linux")]
+    fn create_mode_600(path: &Path, bytes: &[u8]) -> File {
+        let mut file = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(path)
+            .unwrap();
+        file.write_all(bytes).unwrap();
+        file.sync_all().unwrap();
+        file
+    }
+
+    #[cfg(target_os = "linux")]
+    fn inspect_after_checkpoint_cas(
+        tail: RunningTail,
+        inherited_identity_drift: bool,
+        current_identity_drift: bool,
+        receipt_digest_drift: bool,
+    ) -> VmmRuntimePathInspection {
+        let temporary = tempfile::Builder::new()
+            .prefix("cats-fd64-")
+            // `/root` is Cargo's live cache parent in the Linux gate. Its
+            // metadata can legitimately change while another test builds a
+            // helper, invalidating an otherwise exact retained ancestor.
+            .tempdir_in("/var/lib")
+            .unwrap();
+        let root = temporary.path();
+        let original = launch_checkpoint_for_paths(root);
+        let changed = changed_launch_identity(&original);
+        let inherited = if inherited_identity_drift {
+            &changed
+        } else {
+            &original
+        };
+        let current_launch = if current_identity_drift {
+            &changed
+        } else {
+            &original
+        };
+        let current = running_tail_checkpoint(current_launch, tail);
+
+        let checkpoint_path = root.join("checkpoint.json");
+        let original_file = create_mode_600(
+            &checkpoint_path,
+            &encode_runtime_checkpoint(inherited).unwrap(),
+        );
+        let replacement_path = root.join("checkpoint.next");
+        create_mode_600(
+            &replacement_path,
+            &encode_runtime_checkpoint(&current).unwrap(),
+        );
+        std::fs::rename(&replacement_path, &checkpoint_path).unwrap();
+
+        let launch = current.runtime_launch.identity().unwrap();
+        let memory_file_path = launch.memory_file_path.clone();
+        let memory_bytes = launch.memory_bytes;
+        let serial_log_path = launch.serial_log_path.clone();
+        let vmm_log_path = launch.vmm_log_path.clone();
+        let memory = create_mode_600(Path::new(memory_file_path.as_str()), &[]);
+        memory.set_len(memory_bytes).unwrap();
+        memory.sync_all().unwrap();
+        create_mode_600(Path::new(serial_log_path.as_str()), &[]);
+        create_mode_600(Path::new(vmm_log_path.as_str()), &[]);
+        let mut receipt_digest = checkpoint_content_digest(&original).unwrap();
+        if receipt_digest_drift {
+            receipt_digest = Sha256Digest::from_bytes([0xabu8; 32]);
+        }
+        let requirements = VmmRuntimePathRequirements {
+            checkpoint_path: HostPath::new(checkpoint_path.to_str().unwrap().to_owned()).unwrap(),
+            checkpoint: current,
+            original_checkpoint_content_digest: receipt_digest,
+            memory_file_path,
+            memory_bytes,
+            serial_log_path,
+            vmm_log_path,
+        };
+        let inspection = RetainedVmmRuntimePaths::open_with_launch_descriptor_for_test(
+            &requirements,
+            original_file,
+        )
+        .unwrap();
+        if let VmmRuntimePathInspection::Exact(retained) = &inspection {
+            retained.assert_current().unwrap();
+        }
+        drop(temporary);
+        inspection
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn fd64_retains_original_launch_across_format_gate_and_stable_checkpoint_cas() {
+        for tail in [
+            RunningTail::Format,
+            RunningTail::InstallGate,
+            RunningTail::Stable,
+        ] {
+            let inspection = inspect_after_checkpoint_cas(tail, false, false, false);
+            assert!(
+                matches!(&inspection, VmmRuntimePathInspection::Exact(_)),
+                "{tail:?}: {inspection:?}"
+            );
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn fd64_rejects_receipt_old_bytes_and_current_retained_identity_drift() {
+        assert!(matches!(
+            inspect_after_checkpoint_cas(RunningTail::Format, false, false, true),
+            VmmRuntimePathInspection::Conflict
+        ));
+        assert!(matches!(
+            inspect_after_checkpoint_cas(RunningTail::Format, true, false, false),
+            VmmRuntimePathInspection::Conflict
+        ));
+        assert!(matches!(
+            inspect_after_checkpoint_cas(RunningTail::Format, false, true, false),
+            VmmRuntimePathInspection::Conflict
+        ));
     }
 
     #[cfg(target_os = "linux")]
@@ -1927,6 +2303,7 @@ mod tests {
             *memory_file_path = files.memory_file_path().clone();
             *serial_log_path = files.serial_log_path().clone();
             *vmm_log_path = files.vmm_log_path().clone();
+            sync_retained_launch(&mut checkpoint);
             let receipt_store = VmmSocketReceiptStore::provision_for_test(state.clone()).unwrap();
             let receipt = VmmSocketOwnershipReceiptV1::from_checkpoint(
                 &checkpoint,
@@ -2047,6 +2424,7 @@ mod tests {
         *memory_file_path = paths.memory_file_path().clone();
         *serial_log_path = paths.serial_log_path().clone();
         *vmm_log_path = paths.vmm_log_path().clone();
+        sync_retained_launch(&mut checkpoint);
         assert_eq!(
             ManagedVmmLaunchFilePaths::paths_from_checkpoint(&state, &checkpoint).unwrap(),
             paths

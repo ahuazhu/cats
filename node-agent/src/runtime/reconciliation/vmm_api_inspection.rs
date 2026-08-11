@@ -9,15 +9,18 @@
 
 use std::collections::BTreeSet;
 
+#[cfg(target_os = "linux")]
 use anyhow::Context as _;
 use cats_api::runtime_reconciliation::{
-    encode_runtime_checkpoint, HostPath, PrepareDeviceFrontend, ReconcileStep, RuntimeCheckpoint,
+    HostPath, PrepareDeviceFrontend, RuntimeCheckpoint, RuntimeLaunchIdentity,
 };
 use serde::Deserialize;
 
 use crate::runtime_spine::RuntimePhysicalReadContext;
 #[cfg(target_os = "linux")]
 use crate::vmm_launcher::VMM_API_LISTENER_FD;
+
+use super::retained_runtime_launch::RetainedRuntimeLaunchAuthority;
 
 const MAX_HTTP_HEADER_BYTES: usize = 64 * 1024;
 const MAX_HTTP_BODY_BYTES: usize = 2 * 1024 * 1024;
@@ -90,24 +93,17 @@ impl VmmApiExpectation {
         checkpoint: &RuntimeCheckpoint,
         process_id: u32,
     ) -> anyhow::Result<Self> {
+        let launch = RetainedRuntimeLaunchAuthority::from_checkpoint(checkpoint)?;
+        Self::from_launch_identity(launch.identity(), process_id)
+    }
+
+    pub(super) fn from_launch_identity(
+        launch: &RuntimeLaunchIdentity,
+        process_id: u32,
+    ) -> anyhow::Result<Self> {
         anyhow::ensure!(process_id > 0, "VMM API expectation has a zero process ID");
-        encode_runtime_checkpoint(checkpoint)
-            .context("validate VMM API StartRuntime checkpoint")?;
-        let ReconcileStep::StartRuntime {
-            boot,
-            vcpus,
-            memory_bytes,
-            api_socket_path,
-            vsock_socket_path,
-            guest_cid,
-            network,
-            devices,
-            ..
-        } = &checkpoint.step
-        else {
-            anyhow::bail!("VMM API expectation is not StartRuntime")
-        };
-        let disks = devices
+        let disks = launch
+            .devices
             .iter()
             .map(|device| match &device.frontend {
                 PrepareDeviceFrontend::KernelNbd {
@@ -133,15 +129,15 @@ impl VmmApiExpectation {
             .collect();
         Ok(Self {
             process_id,
-            api_socket_path: api_socket_path.clone(),
-            vsock_socket_path: vsock_socket_path.clone(),
-            vcpus: *vcpus,
-            memory_bytes: *memory_bytes,
-            kernel_cmdline: boot.kernel_cmdline.as_str().to_owned(),
-            has_initramfs: boot.initramfs.is_some(),
-            guest_cid: *guest_cid,
-            tap_name: network.tap_name.as_str().to_owned(),
-            guest_mac: network.network_config.guest_mac.as_str().to_owned(),
+            api_socket_path: launch.api_socket_path.clone(),
+            vsock_socket_path: launch.vsock_socket_path.clone(),
+            vcpus: launch.vcpus,
+            memory_bytes: launch.memory_bytes,
+            kernel_cmdline: launch.boot.kernel_cmdline.as_str().to_owned(),
+            has_initramfs: launch.boot.initramfs.is_some(),
+            guest_cid: launch.guest_cid,
+            tap_name: launch.network.tap_name.as_str().to_owned(),
+            guest_mac: launch.network.network_config.guest_mac.as_str().to_owned(),
             disks,
         })
     }
@@ -2054,6 +2050,37 @@ mod tests {
     }
 
     #[cfg(target_os = "linux")]
+    unsafe fn close_unrelated_fds_after_fork(mut retained: [libc::c_int; 5]) -> bool {
+        // This child deliberately waits without exec. Close every descriptor
+        // inherited from the parallel Rust test runner so it cannot retain an
+        // unrelated checkpoint or attachment flock after that test's parent
+        // thread drops its owner. Sorting a fixed stack array does not touch
+        // allocator or synchronization state inherited across fork.
+        retained.sort_unstable();
+        let mut first = 3_u32;
+        for descriptor in retained {
+            if descriptor < 3 {
+                continue;
+            }
+            let descriptor = descriptor as u32;
+            if descriptor < first {
+                continue;
+            }
+            if first < descriptor
+                // SAFETY: this is the post-fork child and the retained values
+                // above are the only descriptors it needs before `_exit`.
+                && unsafe { libc::close_range(first, descriptor - 1, 0) } != 0
+            {
+                return false;
+            }
+            first = descriptor.saturating_add(1);
+        }
+        first == u32::MAX
+            // SAFETY: same invariant as the bounded ranges above.
+            || unsafe { libc::close_range(first, u32::MAX, 0) } == 0
+    }
+
+    #[cfg(target_os = "linux")]
     #[test]
     fn fd71_and_sole_holder_are_both_required_for_api_identity() {
         for duplicate_api_holder in [false, true] {
@@ -2102,13 +2129,34 @@ mod tests {
                     // SAFETY: fd71 now owns the only required API reference.
                     unsafe { libc::close(api_source) };
                 }
-                if duplicate_api_holder {
+                let duplicate_holder = if duplicate_api_holder {
                     // SAFETY: this intentionally creates a second holder for
                     // the negative half of the test.
-                    if unsafe { libc::fcntl(VMM_API_LISTENER_FD, libc::F_DUPFD_CLOEXEC, 100) } < 0 {
+                    let descriptor =
+                        unsafe { libc::fcntl(VMM_API_LISTENER_FD, libc::F_DUPFD_CLOEXEC, 100) };
+                    if descriptor < 0 {
                         // SAFETY: the child cannot safely unwind after fork.
                         unsafe { libc::_exit(92) };
                     }
+                    descriptor
+                } else {
+                    -1
+                };
+                // SAFETY: the fixed stack-only helper retains exactly the two
+                // socket holders, the synchronization pipes, fd71 and the
+                // intentional negative duplicate while closing inherited
+                // test-runner state before the child announces readiness.
+                if !unsafe {
+                    close_unrelated_fds_after_fork([
+                        VMM_API_LISTENER_FD,
+                        vsock.as_raw_fd(),
+                        ready[1],
+                        stop[0],
+                        duplicate_holder,
+                    ])
+                } {
+                    // SAFETY: the child cannot safely unwind after fork.
+                    unsafe { libc::_exit(94) };
                 }
                 let byte = [1_u8];
                 // SAFETY: the pipe endpoints and one-byte buffers are valid.

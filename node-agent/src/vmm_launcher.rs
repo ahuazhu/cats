@@ -12,7 +12,8 @@ use std::path::Path;
 
 use anyhow::Result;
 use cats_api::runtime_reconciliation::{
-    PrepareDeviceFrontend, ReconcileStep, RuntimeCheckpoint, RuntimeLaunchArtifact,
+    PrepareDeviceFrontend, ReconcileStep, RuntimeCheckpoint, RuntimeLaunch, RuntimeLaunchArtifact,
+    RuntimeLaunchIdentity,
 };
 
 use crate::ch::{file_disk_arg_with_serial, vhost_user_disk_arg_with_serial};
@@ -58,137 +59,22 @@ pub struct VmmLauncherPlan {
 
 impl VmmLauncherPlan {
     pub fn from_checkpoint(checkpoint: RuntimeCheckpoint) -> Result<Self> {
-        let ReconcileStep::StartRuntime {
-            runtime_incarnation,
-            boot,
-            process_identity_token,
-            vcpus,
-            memory_bytes,
-            api_socket_path: _,
-            vsock_socket_path,
-            guest_cid,
-            memory_file_path,
-            serial_log_path,
-            vmm_log_path,
-            network,
-            devices,
-            ..
-        } = &checkpoint.step
-        else {
+        let Some(step_identity) = checkpoint.step.start_runtime_launch_identity() else {
             anyhow::bail!("VMM launcher checkpoint is not StartRuntime")
         };
+        let RuntimeLaunch::Present(retained_identity) = &checkpoint.runtime_launch else {
+            anyhow::bail!("VMM launcher checkpoint has no retained launch authority")
+        };
         anyhow::ensure!(
-            checkpoint.runtime_incarnation.as_ref() == Some(runtime_incarnation),
-            "StartRuntime top-level incarnation is not exact"
+            retained_identity.as_ref() == &step_identity
+                && checkpoint.runtime_incarnation.as_ref()
+                    == Some(&retained_identity.runtime_incarnation),
+            "StartRuntime step, retained launch and top-level incarnation are not exact"
         );
-        anyhow::ensure!(
-            *vcpus > 0,
-            "StartRuntime VMM launch requires at least one vCPU"
-        );
-        anyhow::ensure!(
-            *memory_bytes >= 128 * MIB && *memory_bytes % MIB == 0,
-            "StartRuntime memory must be at least 128 MiB and MiB-aligned"
-        );
-        anyhow::ensure!(
-            (3..=u32::MAX - 1).contains(guest_cid),
-            "StartRuntime Guest CID is outside the allocatable range"
-        );
-        anyhow::ensure!(
-            !vsock_socket_path.as_str().contains(','),
-            "vsock socket path contains a Cloud Hypervisor separator"
-        );
-        let launch_file_paths = [
-            Path::new(memory_file_path.as_str()),
-            Path::new(serial_log_path.as_str()),
-            Path::new(vmm_log_path.as_str()),
-        ];
-        anyhow::ensure!(
-            launch_file_parents_are_equal_or_disjoint(&launch_file_paths),
-            "VMM launch file parents are nested"
-        );
-
-        let mut arguments = vec![
-            OsString::from("--api-socket"),
-            OsString::from(format!("fd={VMM_API_LISTENER_FD}")),
-            OsString::from("--kernel"),
-            fixed_fd_path(KERNEL_FD),
-        ];
-        if boot.initramfs.is_some() {
-            arguments.push(OsString::from("--initramfs"));
-            arguments.push(fixed_fd_path(INITRAMFS_FD));
-        }
-        arguments.extend([
-            OsString::from("--cmdline"),
-            OsString::from(boot.kernel_cmdline.as_str()),
-            OsString::from("--cpus"),
-            OsString::from(format!("boot={vcpus}")),
-            OsString::from("--memory"),
-            OsString::from("size=0"),
-            OsString::from("--memory-zone"),
-            OsString::from(format!(
-                "id=cat-ram,size={}M,file={},shared=on",
-                memory_bytes / MIB,
-                fixed_fd_path(MEMORY_FD).to_string_lossy()
-            )),
-            OsString::from("--vsock"),
-            OsString::from(format!(
-                "cid={guest_cid},socket={}",
-                vsock_socket_path.as_str()
-            )),
-            OsString::from("--net"),
-            OsString::from(format!(
-                "tap={},mac={}",
-                network.tap_name.as_str(),
-                network.network_config.guest_mac.as_str()
-            )),
-        ]);
-        for device in devices {
-            let disk = match &device.frontend {
-                PrepareDeviceFrontend::KernelNbd {
-                    device_path,
-                    direct,
-                    ..
-                } => {
-                    anyhow::ensure!(
-                        !device_path.as_str().contains(','),
-                        "kernel-NBD device path contains a Cloud Hypervisor separator"
-                    );
-                    file_disk_arg_with_serial(
-                        device_path.as_str(),
-                        *direct,
-                        device.guest_device.serial.as_str(),
-                    )?
-                }
-                PrepareDeviceFrontend::VhostUserBlk {
-                    socket_path,
-                    queues,
-                    queue_size,
-                } => vhost_user_disk_arg_with_serial(
-                    Path::new(socket_path.as_str()),
-                    usize::from(*queues),
-                    *queue_size,
-                    device.guest_device.serial.as_str(),
-                )?,
-            };
-            arguments.push(OsString::from("--disk"));
-            arguments.push(OsString::from(disk));
-        }
-        arguments.extend([
-            OsString::from("--serial"),
-            OsString::from(format!(
-                "file={}",
-                fixed_fd_path(SERIAL_LOG_FD).to_string_lossy()
-            )),
-            OsString::from("--console"),
-            OsString::from("off"),
-        ]);
-        anyhow::ensure!(
-            !process_identity_token.as_str().is_empty(),
-            "StartRuntime process token is empty"
-        );
+        let cloud_hypervisor_arguments = cloud_hypervisor_arguments_for_launch(retained_identity)?;
         Ok(Self {
             checkpoint,
-            cloud_hypervisor_arguments: arguments,
+            cloud_hypervisor_arguments,
         })
     }
 
@@ -206,6 +92,131 @@ impl VmmLauncherPlan {
         };
         &boot.vmm_executable
     }
+}
+
+pub(crate) fn cloud_hypervisor_arguments_for_launch(
+    launch: &RuntimeLaunchIdentity,
+) -> Result<Vec<OsString>> {
+    let RuntimeLaunchIdentity {
+        boot,
+        process_identity_token,
+        vcpus,
+        memory_bytes,
+        vsock_socket_path,
+        guest_cid,
+        memory_file_path,
+        serial_log_path,
+        vmm_log_path,
+        network,
+        devices,
+        ..
+    } = launch;
+    anyhow::ensure!(
+        *vcpus > 0,
+        "StartRuntime VMM launch requires at least one vCPU"
+    );
+    anyhow::ensure!(
+        *memory_bytes >= 128 * MIB && *memory_bytes % MIB == 0,
+        "StartRuntime memory must be at least 128 MiB and MiB-aligned"
+    );
+    anyhow::ensure!(
+        (3..=u32::MAX - 1).contains(guest_cid),
+        "StartRuntime Guest CID is outside the allocatable range"
+    );
+    anyhow::ensure!(
+        !vsock_socket_path.as_str().contains(','),
+        "vsock socket path contains a Cloud Hypervisor separator"
+    );
+    let launch_file_paths = [
+        Path::new(memory_file_path.as_str()),
+        Path::new(serial_log_path.as_str()),
+        Path::new(vmm_log_path.as_str()),
+    ];
+    anyhow::ensure!(
+        launch_file_parents_are_equal_or_disjoint(&launch_file_paths),
+        "VMM launch file parents are nested"
+    );
+
+    let mut arguments = vec![
+        OsString::from("--api-socket"),
+        OsString::from(format!("fd={VMM_API_LISTENER_FD}")),
+        OsString::from("--kernel"),
+        fixed_fd_path(KERNEL_FD),
+    ];
+    if boot.initramfs.is_some() {
+        arguments.push(OsString::from("--initramfs"));
+        arguments.push(fixed_fd_path(INITRAMFS_FD));
+    }
+    arguments.extend([
+        OsString::from("--cmdline"),
+        OsString::from(boot.kernel_cmdline.as_str()),
+        OsString::from("--cpus"),
+        OsString::from(format!("boot={vcpus}")),
+        OsString::from("--memory"),
+        OsString::from("size=0"),
+        OsString::from("--memory-zone"),
+        OsString::from(format!(
+            "id=cat-ram,size={}M,file={},shared=on",
+            memory_bytes / MIB,
+            fixed_fd_path(MEMORY_FD).to_string_lossy()
+        )),
+        OsString::from("--vsock"),
+        OsString::from(format!(
+            "cid={guest_cid},socket={}",
+            vsock_socket_path.as_str()
+        )),
+        OsString::from("--net"),
+        OsString::from(format!(
+            "tap={},mac={}",
+            network.tap_name.as_str(),
+            network.network_config.guest_mac.as_str()
+        )),
+    ]);
+    for device in devices {
+        let disk = match &device.frontend {
+            PrepareDeviceFrontend::KernelNbd {
+                device_path,
+                direct,
+                ..
+            } => {
+                anyhow::ensure!(
+                    !device_path.as_str().contains(','),
+                    "kernel-NBD device path contains a Cloud Hypervisor separator"
+                );
+                file_disk_arg_with_serial(
+                    device_path.as_str(),
+                    *direct,
+                    device.guest_device.serial.as_str(),
+                )?
+            }
+            PrepareDeviceFrontend::VhostUserBlk {
+                socket_path,
+                queues,
+                queue_size,
+            } => vhost_user_disk_arg_with_serial(
+                Path::new(socket_path.as_str()),
+                usize::from(*queues),
+                *queue_size,
+                device.guest_device.serial.as_str(),
+            )?,
+        };
+        arguments.push(OsString::from("--disk"));
+        arguments.push(OsString::from(disk));
+    }
+    arguments.extend([
+        OsString::from("--serial"),
+        OsString::from(format!(
+            "file={}",
+            fixed_fd_path(SERIAL_LOG_FD).to_string_lossy()
+        )),
+        OsString::from("--console"),
+        OsString::from("off"),
+    ]);
+    anyhow::ensure!(
+        !process_identity_token.as_str().is_empty(),
+        "StartRuntime process token is empty"
+    );
+    Ok(arguments)
 }
 
 fn fixed_fd_path(fd: i32) -> OsString {
@@ -1299,7 +1310,7 @@ pub fn run() -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use cats_api::runtime_reconciliation::decode_runtime_checkpoint;
+    use cats_api::runtime_reconciliation::{decode_runtime_checkpoint, RuntimeLaunch};
 
     fn start_runtime() -> RuntimeCheckpoint {
         decode_runtime_checkpoint(include_bytes!(concat!(
@@ -1307,6 +1318,15 @@ mod tests {
             "/../testdata/runtime-reconciliation-v1-start-runtime-checkpoint.json"
         )))
         .unwrap()
+    }
+
+    fn sync_retained_launch(checkpoint: &mut RuntimeCheckpoint) {
+        checkpoint.runtime_launch = RuntimeLaunch::Present(Box::new(
+            checkpoint
+                .step
+                .start_runtime_launch_identity()
+                .expect("test checkpoint remains StartRuntime"),
+        ));
     }
 
     #[test]
@@ -1374,6 +1394,7 @@ mod tests {
                 .unwrap(),
             direct: true,
         };
+        sync_retained_launch(&mut checkpoint);
         let plan = VmmLauncherPlan::from_checkpoint(checkpoint).unwrap();
         let arguments = plan
             .cloud_hypervisor_arguments()
@@ -1400,6 +1421,7 @@ mod tests {
             "/run/cats/cat_01/vmm,vsock.sock".to_owned(),
         )
         .unwrap();
+        sync_retained_launch(&mut checkpoint);
 
         let error = VmmLauncherPlan::from_checkpoint(checkpoint).unwrap_err();
         assert!(error
@@ -1419,6 +1441,7 @@ mod tests {
         *memory_file_path =
             cats_api::runtime_reconciliation::HostPath::new("/var/log/cats/memory.bin".to_owned())
                 .unwrap();
+        sync_retained_launch(&mut checkpoint);
 
         let error = VmmLauncherPlan::from_checkpoint(checkpoint).unwrap_err();
         assert!(error

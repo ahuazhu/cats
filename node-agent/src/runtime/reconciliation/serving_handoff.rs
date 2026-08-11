@@ -2609,7 +2609,9 @@ pub(crate) fn validate_scanned_serving_handoff_artifacts(
     retirement: Option<&ScannedServingHandoffArtifact<'_>>,
 ) -> Result<Option<RetainedRootProvisionProcessAttempt>> {
     let prepared_checkpoint;
-    let checkpoint = if matches!(checkpoint.step, ReconcileStep::PrepareNetwork { .. }) {
+    let checkpoint = if matches!(checkpoint.step, ReconcileStep::PrepareNetwork { .. })
+        || checkpoint.runtime_launch.identity().is_some()
+    {
         prepared_checkpoint = prepare_device_checkpoint_view(checkpoint)?;
         &prepared_checkpoint
     } else {
@@ -2824,7 +2826,9 @@ pub(crate) fn scanned_target_control_process_launch(
     target: &ScannedServingHandoffArtifact<'_>,
 ) -> Result<TargetControlProcessLaunchIdentity> {
     let prepared_checkpoint;
-    let checkpoint = if matches!(checkpoint.step, ReconcileStep::PrepareNetwork { .. }) {
+    let checkpoint = if matches!(checkpoint.step, ReconcileStep::PrepareNetwork { .. })
+        || checkpoint.runtime_launch.identity().is_some()
+    {
         prepared_checkpoint = prepare_device_checkpoint_view(checkpoint)?;
         &prepared_checkpoint
     } else {
@@ -3864,6 +3868,8 @@ impl PublicationStage {
 mod tests {
     use std::cell::Cell;
     use std::collections::{BTreeMap, VecDeque};
+    #[cfg(target_os = "linux")]
+    use std::os::unix::fs::OpenOptionsExt as _;
     use std::os::unix::fs::{symlink, MetadataExt as _, PermissionsExt as _};
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Arc;
@@ -3882,6 +3888,8 @@ mod tests {
         VmmBootProvenance, VolumeAccess, VolumeAcquire, VolumeAdminState, VolumeAuthorityEvidence,
         VolumeDisposition, VolumeIntent, WarmSnapshotEvidence,
     };
+    #[cfg(target_os = "linux")]
+    use cats_api::runtime_reconciliation::{guest_config_digest, GuestRuntimeProfileReceipt};
     use cats_storage::authority::{
         AuthorityError, LastVolumeTransition, RenewLeaseRequest, RenewLeaseResult,
         VolumeDataAuthority, VolumeHeadCasRequest, VolumeHeadCasResult,
@@ -4442,6 +4450,14 @@ mod tests {
         fixture: &Fixture,
         processes: Vec<cats_api::runtime_reconciliation::ProcessEvidence>,
     ) -> RuntimeDesiredEffectContext {
+        effect_context_with_processes_and_observation(fixture, processes, random('4'))
+    }
+
+    fn effect_context_with_processes_and_observation(
+        fixture: &Fixture,
+        processes: Vec<cats_api::runtime_reconciliation::ProcessEvidence>,
+        observation_id: RandomId128,
+    ) -> RuntimeDesiredEffectContext {
         let checkpoint = fixture.stored_checkpoint.checkpoint();
         let desired = &fixture.acquired.desired;
         let session = AgentSession {
@@ -4572,11 +4588,11 @@ mod tests {
                     .prove_exact_process(expectation.exact_evidence_for_test(71))
                     .unwrap();
                 let public = exact.clone().into_process_evidence();
-                let proofs = processes
-                    .iter()
-                    .any(|process| process == &public)
-                    .then(|| BTreeMap::from([(desired.cat_id.clone(), exact)]))
-                    .unwrap_or_default();
+                let proofs = if processes.iter().any(|process| process == &public) {
+                    BTreeMap::from([(desired.cat_id.clone(), exact)])
+                } else {
+                    BTreeMap::new()
+                };
                 scan.with_vmms(
                     BTreeMap::from([(desired.cat_id.clone(), expectation)]),
                     proofs,
@@ -4640,7 +4656,7 @@ mod tests {
         };
         let observation = NodeObservation {
             version: ContractVersion::V1,
-            observation_id: random('4'),
+            observation_id,
             node_id: session.node_id.clone(),
             node_boot_id: session.node_boot_id.clone(),
             agent_instance_id: session.agent_instance_id.clone(),
@@ -5092,6 +5108,7 @@ mod tests {
         inspections: Mutex<VecDeque<VmmInspectionKind>>,
         starts: AtomicUsize,
         start: VmmProcessStart,
+        before_start: Mutex<Option<Arc<dyn Fn() + Send + Sync>>>,
     }
 
     #[cfg(target_os = "linux")]
@@ -5104,7 +5121,13 @@ mod tests {
                 inspections: Mutex::new(inspections.into_iter().collect()),
                 starts: AtomicUsize::new(0),
                 start,
+                before_start: Mutex::new(None),
             }
+        }
+
+        fn with_before_start(self, before_start: impl Fn() + Send + Sync + 'static) -> Self {
+            *self.before_start.lock().unwrap() = Some(Arc::new(before_start));
+            self
         }
 
         fn next(
@@ -5150,6 +5173,9 @@ mod tests {
         ) -> Result<VmmProcessStart> {
             context.check_active()?;
             checkpointed.assert_current()?;
+            if let Some(before_start) = self.before_start.lock().unwrap().take() {
+                before_start();
+            }
             self.starts.fetch_add(1, Ordering::SeqCst);
             Ok(self.start)
         }
@@ -5166,13 +5192,13 @@ mod tests {
             _context: &RuntimeDesiredEffectContext,
         ) -> Result<VmmProcessGlobalInspection> {
             Ok(match self.next(expected) {
-                VmmProcessInspection::Absent => VmmProcessGlobalInspection::Absent(
+                VmmProcessInspection::Absent => VmmProcessGlobalInspection::Absent(Box::new(
                     super::super::vmm_process::ExactVmmProcessAbsenceProof::for_expectation(
                         expected.clone(),
                     ),
-                ),
+                )),
                 VmmProcessInspection::Exact(evidence) => VmmProcessGlobalInspection::Exact(
-                    expected.clone().prove_exact_process(*evidence)?,
+                    Box::new(expected.clone().prove_exact_process(*evidence)?),
                 ),
                 VmmProcessInspection::Conflict(problem) => {
                     VmmProcessGlobalInspection::Conflict(problem)
@@ -5309,6 +5335,31 @@ mod tests {
             .into_process_evidence()
     }
 
+    #[cfg(target_os = "linux")]
+    fn accepted_vmm_process(
+        fixture: &Fixture,
+    ) -> cats_api::runtime_reconciliation::ProcessEvidence {
+        let checkpoint_path = host(
+            super::super::runtime_checkpoint_path(
+                &fixture.checkpoint_directory,
+                &fixture.stored_checkpoint.checkpoint().cat_id,
+            )
+            .to_str()
+            .unwrap(),
+        );
+        let expected = super::super::vmm_process::VmmProcessExpectation::from_checkpoint(
+            fixture.stored_checkpoint.checkpoint().clone(),
+        )
+        .unwrap()
+        .with_checkpoint_path(checkpoint_path)
+        .unwrap();
+        expected
+            .clone()
+            .prove_exact_process(expected.exact_evidence_for_test(71))
+            .unwrap()
+            .into_process_evidence()
+    }
+
     fn empty_ip_binary(fixture: &Fixture) -> PathBuf {
         let path = fixture.data_directory.join("test-ip");
         std::fs::write(
@@ -5420,6 +5471,178 @@ mod tests {
             }),
             assertions,
         )
+    }
+
+    #[cfg(target_os = "linux")]
+    fn physical_guest_config_digest() -> Sha256Digest {
+        guest_config_digest(&GuestRuntimeProfileReceipt {
+            version: ContractVersion::V1,
+            kernel_digest: Sha256Digest::from_bytes(Sha256::digest(b"kernel").into()),
+            initramfs_digest: Some(Sha256Digest::from_bytes(
+                Sha256::digest(b"initramfs").into(),
+            )),
+            kernel_cmdline: AsciiText::new("console=ttyS0 panic=1").unwrap(),
+            guest_agent_protocol_version: ContractVersion::V1,
+        })
+        .unwrap()
+    }
+
+    #[cfg(target_os = "linux")]
+    fn physical_launch_artifacts(
+        fixture: &Fixture,
+    ) -> (
+        PathBuf,
+        VmmLaunchArtifactPaths,
+        Arc<FixedLaunchArtifactPort>,
+    ) {
+        let root = fixture.data_directory.join("physical-artifacts");
+        std::fs::create_dir(&root).unwrap();
+        std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o700)).unwrap();
+        for (name, mode, bytes) in [
+            ("launcher", 0o755, b"launcher".as_slice()),
+            ("cloud-hypervisor", 0o755, b"cloud-hypervisor".as_slice()),
+            ("kernel", 0o644, b"kernel".as_slice()),
+            ("initramfs", 0o644, b"initramfs".as_slice()),
+        ] {
+            let path = root.join(name);
+            std::fs::write(&path, bytes).unwrap();
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(mode)).unwrap();
+        }
+        let paths = VmmLaunchArtifactPaths {
+            launcher_executable: PathBuf::from("/launcher"),
+            vmm_executable: PathBuf::from("/cloud-hypervisor"),
+            kernel: PathBuf::from("/kernel"),
+            initramfs: Some(PathBuf::from("/initramfs")),
+            kernel_cmdline: "console=ttyS0 panic=1".to_owned(),
+        };
+        let retained = RetainedVmmLaunchArtifacts::open_for_test(&root, &paths).unwrap();
+        let assertions = Arc::new(AtomicUsize::new(0));
+        let port = Arc::new(FixedLaunchArtifactPort {
+            launcher: retained.launcher_executable().clone(),
+            boot: retained.boot(),
+            assertions,
+            fail_on_assertion: None,
+        });
+        (root, paths, port)
+    }
+
+    #[cfg(target_os = "linux")]
+    struct PhysicalStartFixture {
+        _socket_directory: tempfile::TempDir,
+        artifact_root: PathBuf,
+        artifact_paths: VmmLaunchArtifactPaths,
+        network: Arc<PrepareNetworkReservationEffect>,
+        authority: Arc<FixedEffectAuthority>,
+        serving: Arc<FakeServingBlockdPort>,
+        socket_root: Arc<RetainedManagedVmmSocketRoot>,
+        launch_root: Arc<RetainedManagedVmmLaunchRoot>,
+        receipts: Arc<VmmSocketReceiptStore>,
+    }
+
+    #[cfg(target_os = "linux")]
+    fn advance_fixture_to_physical_start(fixture: &mut Fixture) -> PhysicalStartFixture {
+        advance_fixture_to_prepare_network(fixture);
+        let launch_namespace = fixture
+            .state_directory
+            .path()
+            .join(VMM_LAUNCH_FILE_NAMESPACE);
+        std::fs::create_dir(&launch_namespace).unwrap();
+        std::fs::set_permissions(&launch_namespace, std::fs::Permissions::from_mode(0o700))
+            .unwrap();
+        // AF_UNIX paths have a small fixed bound. Keep the test-owned public
+        // socket namespace directly below the platform temporary directory,
+        // rather than below the deliberately verbose fixture path.
+        let socket_directory = tempfile::tempdir().unwrap();
+        let socket_root = Arc::new(
+            RetainedManagedVmmSocketRoot::provision_for_test(&socket_directory.path().join("vmm"))
+                .unwrap(),
+        );
+        let launch_root = Arc::new(
+            RetainedManagedVmmLaunchRoot::open_existing(fixture.state_directory.clone()).unwrap(),
+        );
+        let receipts = Arc::new(
+            VmmSocketReceiptStore::provision_for_test(fixture.state_directory.clone()).unwrap(),
+        );
+        let (artifact_root, artifact_paths, artifact_port) = physical_launch_artifacts(fixture);
+        let authority = Arc::new(FixedEffectAuthority::new(fixture.authority.volume.clone()));
+        let serving = Arc::new(FakeServingBlockdPort::new(
+            std::iter::repeat_n(ServingBlockdProcessInspectionKind::Exact, 128),
+            ServingBlockdProcessStart::Submitted,
+        ));
+        let network = Arc::new(
+            PrepareNetworkReservationEffect::new(
+                fixture.state_directory.clone(),
+                exact_ip_binary(fixture, fixture.stored_checkpoint.checkpoint()),
+                Arc::clone(&authority) as Arc<dyn VolumeDataAuthority>,
+                Arc::clone(&serving) as Arc<dyn ServingBlockdProcessGlobalPort>,
+            )
+            .unwrap(),
+        );
+        let reservation = StartRuntimeReservationEffect::for_test(
+            fixture.state_directory.clone(),
+            Arc::clone(&network),
+            Arc::clone(&authority) as Arc<dyn VolumeDataAuthority>,
+            Arc::clone(&serving) as Arc<dyn ServingBlockdProcessGlobalPort>,
+            artifact_port,
+        )
+        .with_socket_root_for_test(socket_root.planner().clone());
+        let context = with_exact_network_admission(
+            effect_context_with_processes(fixture, vec![accepted_serving_process(fixture)]),
+            fixture.stored_checkpoint.checkpoint(),
+        );
+        let reservation_outcome = reservation.try_apply(&context, &fixture.acquired.desired);
+        assert!(reservation_outcome.is_ok(), "{reservation_outcome:#?}");
+        assert_eq!(
+            reservation_outcome.unwrap(),
+            Some(RuntimeDesiredEffectOutcome::RefreshInventory)
+        );
+        fixture.stored_checkpoint = current_runtime_checkpoint(fixture);
+        assert!(matches!(
+            fixture.stored_checkpoint.checkpoint().step,
+            ReconcileStep::StartRuntime { .. }
+        ));
+        PhysicalStartFixture {
+            _socket_directory: socket_directory,
+            artifact_root,
+            artifact_paths,
+            network,
+            authority,
+            serving,
+            socket_root,
+            launch_root,
+            receipts,
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    fn physical_start_effect(
+        fixture: &Fixture,
+        physical: &PhysicalStartFixture,
+        vmm: Arc<FakePhysicalVmmPort>,
+    ) -> StartRuntimePhysicalEffect {
+        StartRuntimePhysicalEffect::for_test(
+            fixture.state_directory.clone(),
+            physical.artifact_paths.clone(),
+            physical.artifact_root.clone(),
+            Arc::clone(&physical.network),
+            Arc::clone(&physical.authority) as Arc<dyn VolumeDataAuthority>,
+            Arc::clone(&physical.serving) as Arc<dyn ServingBlockdProcessGlobalPort>,
+            vmm,
+            Arc::clone(&physical.socket_root),
+            Arc::clone(&physical.launch_root),
+            Arc::clone(&physical.receipts),
+        )
+    }
+
+    #[cfg(target_os = "linux")]
+    fn assert_no_physical_launch_residue(fixture: &Fixture, physical: &PhysicalStartFixture) {
+        let checkpoint = fixture.stored_checkpoint.checkpoint();
+        let incarnation = checkpoint.runtime_incarnation.as_ref().unwrap();
+        assert!(physical.receipts.load(incarnation).unwrap().is_none());
+        let launch_paths =
+            ManagedVmmLaunchFilePaths::paths_from_checkpoint(&fixture.state_directory, checkpoint)
+                .unwrap();
+        assert!(!Path::new(launch_paths.directory().as_str()).exists());
     }
 
     fn current_runtime_checkpoint(fixture: &Fixture) -> StoredCheckpoint {
@@ -5592,6 +5815,15 @@ mod tests {
     }
 
     fn fixture() -> Fixture {
+        fixture_with_guest_config_digest(
+            Sha256Digest::new(
+                "sha256:78215611e8c3bd683eb542b5696a6316156365a94624c7521446ab5660d067e2",
+            )
+            .unwrap(),
+        )
+    }
+
+    fn fixture_with_guest_config_digest(guest_config_digest: Sha256Digest) -> Fixture {
         let root = tempfile::tempdir().expect("create serving handoff fixture");
         std::fs::set_permissions(root.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
         let state_directory = StateDirectory::unanchored(root.path().to_path_buf());
@@ -5635,12 +5867,7 @@ mod tests {
                 vcpus: 2,
                 memory_bytes: 2 * 1024 * 1024 * 1024,
                 boot_image_digest: digest('a'),
-                // Matches the fixed StartRuntime launch-artifact vector used
-                // by the suffix-effect tests below.
-                guest_config_digest: Sha256Digest::new(
-                    "sha256:78215611e8c3bd683eb542b5696a6316156365a94624c7521446ab5660d067e2",
-                )
-                .unwrap(),
+                guest_config_digest,
                 network_config: NetworkConfig {
                     kind: IsolatedIpv4Kind::IsolatedIpv4,
                     network_id: id("network_a"),
@@ -6911,6 +7138,229 @@ mod tests {
                 &persisted_digest
             );
         }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn physical_start_publishes_intent_and_submits_once_for_every_systemd_result() {
+        for start in [
+            VmmProcessStart::Submitted,
+            VmmProcessStart::OutcomeUnknown,
+            VmmProcessStart::DefinitelyNotStarted,
+        ] {
+            let mut fixture = fixture_with_guest_config_digest(physical_guest_config_digest());
+            let physical = advance_fixture_to_physical_start(&mut fixture);
+            let vmm = Arc::new(FakePhysicalVmmPort::new(
+                std::iter::repeat_n(VmmInspectionKind::Absent, 32),
+                start,
+            ));
+            let effect = physical_start_effect(&fixture, &physical, Arc::clone(&vmm));
+            let context = with_exact_network_admission(
+                effect_context_with_processes(&fixture, vec![accepted_serving_process(&fixture)]),
+                fixture.stored_checkpoint.checkpoint(),
+            );
+
+            assert_eq!(
+                effect
+                    .try_apply(&context, &fixture.acquired.desired)
+                    .unwrap(),
+                Some(RuntimeDesiredEffectOutcome::RefreshInventory)
+            );
+            assert_eq!(vmm.starts.load(Ordering::SeqCst), 1, "{start:?}");
+            let incarnation = fixture
+                .stored_checkpoint
+                .checkpoint()
+                .runtime_incarnation
+                .as_ref()
+                .unwrap();
+            assert!(physical.receipts.load(incarnation).unwrap().is_some());
+            let launch_paths = ManagedVmmLaunchFilePaths::paths_from_checkpoint(
+                &fixture.state_directory,
+                fixture.stored_checkpoint.checkpoint(),
+            )
+            .unwrap();
+            assert!(Path::new(launch_paths.directory().as_str()).is_dir());
+
+            // A response loss, a successful response, and a definite local
+            // failure all consume this accepted observation exactly once.
+            assert_eq!(
+                effect
+                    .try_apply(&context, &fixture.acquired.desired)
+                    .unwrap(),
+                Some(RuntimeDesiredEffectOutcome::RefreshInventory)
+            );
+            assert_eq!(vmm.starts.load(Ordering::SeqCst), 1, "{start:?}");
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn physical_start_adopts_exact_vmm_without_publishing_or_submitting() {
+        let mut fixture = fixture_with_guest_config_digest(physical_guest_config_digest());
+        let physical = advance_fixture_to_physical_start(&mut fixture);
+        let vmm = Arc::new(FakePhysicalVmmPort::new(
+            [VmmInspectionKind::Exact],
+            VmmProcessStart::Submitted,
+        ));
+        let effect = physical_start_effect(&fixture, &physical, Arc::clone(&vmm));
+        let context = with_exact_network_admission(
+            effect_context_with_processes(
+                &fixture,
+                vec![
+                    accepted_vmm_process(&fixture),
+                    accepted_serving_process(&fixture),
+                ],
+            ),
+            fixture.stored_checkpoint.checkpoint(),
+        );
+
+        assert_eq!(
+            effect
+                .try_apply(&context, &fixture.acquired.desired)
+                .unwrap(),
+            Some(RuntimeDesiredEffectOutcome::RefreshInventory)
+        );
+        assert_eq!(vmm.starts.load(Ordering::SeqCst), 0);
+        assert_no_physical_launch_residue(&fixture, &physical);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn physical_start_conflict_or_unavailable_has_zero_effect() {
+        for inspection in [VmmInspectionKind::Conflict, VmmInspectionKind::Unavailable] {
+            let mut fixture = fixture_with_guest_config_digest(physical_guest_config_digest());
+            let physical = advance_fixture_to_physical_start(&mut fixture);
+            let vmm = Arc::new(FakePhysicalVmmPort::new(
+                [inspection],
+                VmmProcessStart::Submitted,
+            ));
+            let effect = physical_start_effect(&fixture, &physical, Arc::clone(&vmm));
+            let context = with_exact_network_admission(
+                effect_context_with_processes(&fixture, vec![accepted_serving_process(&fixture)]),
+                fixture.stored_checkpoint.checkpoint(),
+            );
+
+            let error = effect
+                .try_apply(&context, &fixture.acquired.desired)
+                .expect_err("ambiguous VMM inventory reached a physical effect");
+            assert!(
+                format!("{error:#}").contains("physical StartRuntime VMM"),
+                "{error:#}"
+            );
+            assert_eq!(vmm.starts.load(Ordering::SeqCst), 0, "{inspection:?}");
+            assert_no_physical_launch_residue(&fixture, &physical);
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn physical_start_recovers_partial_launcher_residue_before_a_fresh_retry() {
+        let mut fixture = fixture_with_guest_config_digest(physical_guest_config_digest());
+        let physical = advance_fixture_to_physical_start(&mut fixture);
+        let launch_paths = ManagedVmmLaunchFilePaths::paths_from_checkpoint(
+            &fixture.state_directory,
+            fixture.stored_checkpoint.checkpoint(),
+        )
+        .unwrap();
+        let memory_path = PathBuf::from(launch_paths.memory_file_path().as_str());
+        let vmm = Arc::new(
+            FakePhysicalVmmPort::new(
+                std::iter::repeat_n(VmmInspectionKind::Absent, 64),
+                VmmProcessStart::DefinitelyNotStarted,
+            )
+            .with_before_start(move || {
+                let mut memory = std::fs::OpenOptions::new()
+                    .write(true)
+                    .create_new(true)
+                    .mode(0o600)
+                    .open(&memory_path)
+                    .unwrap();
+                memory.write_all(b"partial-launch").unwrap();
+                memory.sync_all().unwrap();
+            }),
+        );
+        let effect = physical_start_effect(&fixture, &physical, Arc::clone(&vmm));
+        let context = |observation_id| {
+            with_exact_network_admission(
+                effect_context_with_processes_and_observation(
+                    &fixture,
+                    vec![accepted_serving_process(&fixture)],
+                    observation_id,
+                ),
+                fixture.stored_checkpoint.checkpoint(),
+            )
+        };
+
+        assert_eq!(
+            effect
+                .try_apply(&context(random('4')), &fixture.acquired.desired)
+                .unwrap(),
+            Some(RuntimeDesiredEffectOutcome::RefreshInventory)
+        );
+        assert_eq!(vmm.starts.load(Ordering::SeqCst), 1);
+        assert!(Path::new(launch_paths.memory_file_path().as_str()).exists());
+
+        // A fresh accepted-full absence quarantines and removes the partial
+        // receipt-owned attempt, but does not submit in that recovery round.
+        assert_eq!(
+            effect
+                .try_apply(&context(random('9')), &fixture.acquired.desired)
+                .unwrap(),
+            Some(RuntimeDesiredEffectOutcome::RefreshInventory)
+        );
+        assert_eq!(vmm.starts.load(Ordering::SeqCst), 1);
+        assert!(!Path::new(launch_paths.directory().as_str()).exists());
+
+        // Only the next fresh observation may rebuild the exact attempt and
+        // issue another systemd submission.
+        assert_eq!(
+            effect
+                .try_apply(&context(random('8')), &fixture.acquired.desired)
+                .unwrap(),
+            Some(RuntimeDesiredEffectOutcome::RefreshInventory)
+        );
+        assert_eq!(vmm.starts.load(Ordering::SeqCst), 2);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn physical_start_holds_one_exclusive_namespace_guard_through_submit() {
+        let mut fixture = fixture_with_guest_config_digest(physical_guest_config_digest());
+        let physical = advance_fixture_to_physical_start(&mut fixture);
+        let checkpoint = fixture.stored_checkpoint.checkpoint().clone();
+        let incarnation = checkpoint.runtime_incarnation.as_ref().unwrap().clone();
+        let launch_root = Arc::clone(&physical.launch_root);
+        let receipts = Arc::clone(&physical.receipts);
+        let blocked = Arc::new(AtomicUsize::new(0));
+        let blocked_in_hook = Arc::clone(&blocked);
+        let vmm = Arc::new(
+            FakePhysicalVmmPort::new(
+                std::iter::repeat_n(VmmInspectionKind::Absent, 32),
+                VmmProcessStart::Submitted,
+            )
+            .with_before_start(move || {
+                let receipt = receipts.load(&incarnation).unwrap().unwrap();
+                assert!(launch_root
+                    .retain_launcher_attempt(&checkpoint, &receipt)
+                    .unwrap()
+                    .is_none());
+                blocked_in_hook.fetch_add(1, Ordering::SeqCst);
+            }),
+        );
+        let effect = physical_start_effect(&fixture, &physical, Arc::clone(&vmm));
+        let context = with_exact_network_admission(
+            effect_context_with_processes(&fixture, vec![accepted_serving_process(&fixture)]),
+            fixture.stored_checkpoint.checkpoint(),
+        );
+
+        assert_eq!(
+            effect
+                .try_apply(&context, &fixture.acquired.desired)
+                .unwrap(),
+            Some(RuntimeDesiredEffectOutcome::RefreshInventory)
+        );
+        assert_eq!(blocked.load(Ordering::SeqCst), 1);
+        assert_eq!(vmm.starts.load(Ordering::SeqCst), 1);
     }
 
     #[test]

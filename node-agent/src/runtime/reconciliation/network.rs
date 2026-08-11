@@ -18,12 +18,13 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context as _, Result};
 use cats_api::runtime_reconciliation::{
-    encode_runtime_checkpoint, CheckpointEvidence, DesiredRuntimeSpec, DiskKind, Epoch, Id,
-    LocalLineageState, NodeBootId, NodeObservation, ObservedDevice, ObservedDiskKind,
-    ObservedNetwork, OwnershipTokenEvidence, PrepareDeviceFrontend, PreparedDeviceInput,
-    RandomId128, ReconcileStep, RuntimeCheckpoint, RuntimeNetworkIdentity, RuntimeTarget,
-    RuntimeTransition, Sequence, Sha256Digest, UnixMillis, VolumeAccess, VolumeAcquire,
-    VolumeAuthorityEvidence, VolumeDisposition,
+    encode_runtime_checkpoint, CheckpointEvidence, DesiredRuntimeSpec, DiskKind, Epoch,
+    GuestTransportEvidence, Id, LifecycleAdmission, LocalLineageState, NodeBootId, NodeObservation,
+    ObservedDevice, ObservedDiskKind, ObservedNetwork, OwnershipTokenEvidence,
+    PrepareDeviceFrontend, PreparedDeviceInput, RandomId128, ReconcileStep, RequireIdleCheckpoint,
+    RuntimeCheckpoint, RuntimeLaunch, RuntimeNetworkIdentity, RuntimeTarget, RuntimeTransition,
+    Sequence, Sha256Digest, UnixMillis, VolumeAccess, VolumeAcquire, VolumeAuthorityEvidence,
+    VolumeDisposition, WarmSnapshotEvidence,
 };
 use cats_storage::authority::{VolumeDataAuthority, VolumeRecord};
 
@@ -51,6 +52,7 @@ use super::prepare_device_retirement::{
     prepare_device_base_admission_is_exact, prepared_device_input_from_step,
     prepared_device_input_is_exact, retirement_authority_lease_is_monotonic, unique_runtime,
 };
+use super::retained_runtime_launch::RetainedRuntimeLaunchAuthority;
 use super::serving_blockd_process::{
     ExactServingBlockdProcessProof, ServingBlockdExpectation, ServingBlockdProcessGlobalPort,
     ServingBlockdProcessInspection,
@@ -174,11 +176,8 @@ impl NodeGlobalNetworkScanAdmission {
 
     #[cfg(test)]
     pub(crate) fn absent_checkpoint_for_test(checkpoint: &RuntimeCheckpoint) -> Result<Self> {
-        let network = match &checkpoint.step {
-            ReconcileStep::PrepareNetwork { network, .. } => network,
-            ReconcileStep::StartRuntime { network, .. } => network.as_ref(),
-            _ => anyhow::bail!("test network admission requires PrepareNetwork or StartRuntime"),
-        };
+        let network = checkpoint_network_identity(checkpoint)
+            .context("test network admission requires retained network authority")?;
         Self::new(
             [NetworkReservation {
                 cat_id: checkpoint.cat_id.clone(),
@@ -190,11 +189,8 @@ impl NodeGlobalNetworkScanAdmission {
 
     #[cfg(test)]
     pub(crate) fn exact_checkpoint_for_test(checkpoint: &RuntimeCheckpoint) -> Result<Self> {
-        let network = match &checkpoint.step {
-            ReconcileStep::PrepareNetwork { network, .. } => network,
-            ReconcileStep::StartRuntime { network, .. } => network.as_ref(),
-            _ => anyhow::bail!("test network admission requires PrepareNetwork or StartRuntime"),
-        };
+        let network = checkpoint_network_identity(checkpoint)
+            .context("test network admission requires retained network authority")?;
         Self::new(
             [NetworkReservation {
                 cat_id: checkpoint.cat_id.clone(),
@@ -253,6 +249,16 @@ fn observed_network(identity: &RuntimeNetworkIdentity) -> ObservedNetwork {
     }
 }
 
+fn checkpoint_network_identity(checkpoint: &RuntimeCheckpoint) -> Result<&RuntimeNetworkIdentity> {
+    if let ReconcileStep::PrepareNetwork { network, .. } = &checkpoint.step {
+        return Ok(network);
+    }
+    Ok(RetainedRuntimeLaunchAuthority::from_checkpoint(checkpoint)?
+        .identity()
+        .network
+        .as_ref())
+}
+
 #[derive(Debug, Clone, Default)]
 struct NetworkReservations {
     by_tap: BTreeMap<Id, NetworkReservation>,
@@ -273,7 +279,12 @@ impl NetworkReservations {
                         identity: network.clone(),
                     })?;
                 }
-                ReconcileStep::StartRuntime { network, .. } => {
+                _ if checkpoint.runtime_launch.identity().is_some() => {
+                    let network = &checkpoint
+                        .runtime_launch
+                        .identity()
+                        .expect("guarded retained launch")
+                        .network;
                     reservations.insert(NetworkReservation {
                         cat_id: checkpoint.cat_id.clone(),
                         identity: network.as_ref().clone(),
@@ -319,36 +330,32 @@ impl NetworkReservations {
             }
             Ok(())
         };
-        match &checkpoint.step {
-            ReconcileStep::PrepareDevice {
-                ownership_token,
-                serving_process,
-                ..
-            } => {
-                record(ownership_token)?;
-                record(&serving_process.process_identity_token)?;
+        if let Some(launch) = checkpoint.runtime_launch.identity() {
+            record(&launch.process_identity_token)?;
+            record(&launch.network.ownership_token)?;
+            for device in &launch.devices {
+                record(&device.ownership_token)?;
+                record(&device.serving_process.process_identity_token)?;
             }
-            ReconcileStep::PrepareNetwork { network, devices } => {
-                record(&network.ownership_token)?;
-                for device in devices {
-                    record(&device.ownership_token)?;
-                    record(&device.serving_process.process_identity_token)?;
+        } else {
+            match &checkpoint.step {
+                ReconcileStep::PrepareDevice {
+                    ownership_token,
+                    serving_process,
+                    ..
+                } => {
+                    record(ownership_token)?;
+                    record(&serving_process.process_identity_token)?;
                 }
-            }
-            ReconcileStep::StartRuntime {
-                process_identity_token,
-                network,
-                devices,
-                ..
-            } => {
-                record(process_identity_token)?;
-                record(&network.ownership_token)?;
-                for device in devices {
-                    record(&device.ownership_token)?;
-                    record(&device.serving_process.process_identity_token)?;
+                ReconcileStep::PrepareNetwork { network, devices } => {
+                    record(&network.ownership_token)?;
+                    for device in devices {
+                        record(&device.ownership_token)?;
+                        record(&device.serving_process.process_identity_token)?;
+                    }
                 }
+                _ => {}
             }
-            _ => {}
         }
         for process in &checkpoint.processes {
             if let OwnershipTokenEvidence::Valid { ownership_token } = &process.ownership_token {
@@ -710,9 +717,8 @@ impl NetworkAllocationPort {
         let entry = admission
             .reservation(&stored.checkpoint().cat_id)
             .context("PrepareNetwork lacks its provider-private TAP reservation")?;
-        let ReconcileStep::PrepareNetwork { network, .. } = &stored.checkpoint().step else {
-            anyhow::bail!("physical network effect requires PrepareNetwork")
-        };
+        let network = checkpoint_network_identity(stored.checkpoint())
+            .context("physical network effect lacks retained network authority")?;
         anyhow::ensure!(
             &entry.reservation.identity == network,
             "provider-private TAP proof changed its durable reservation"
@@ -1317,6 +1323,16 @@ fn local_contract_stop() -> RuntimeDesiredEffectOutcome {
 }
 
 pub(super) fn prepared_device_input(checkpoint: &RuntimeCheckpoint) -> Result<PreparedDeviceInput> {
+    if let Some(identity) = checkpoint.runtime_launch.identity() {
+        anyhow::ensure!(
+            checkpoint.runtime_incarnation.as_ref() == Some(&identity.runtime_incarnation),
+            "retained Runtime launch incarnation is not top-level exact"
+        );
+        let [device] = identity.devices.as_slice() else {
+            anyhow::bail!("retained Runtime launch must carry exactly one prepared device")
+        };
+        return Ok(device.clone());
+    }
     prepared_device_input_from_step(&checkpoint.step)
 }
 
@@ -1342,6 +1358,23 @@ pub(super) fn prepare_device_checkpoint_view(
         serving_process: device.serving_process,
         frontend: device.frontend,
     };
+    // This is a canonical pre-launch reconstruction used only to rejoin the
+    // immutable serving handoff after later phases replaced `step`. Never
+    // carry live-VMM or Guest evidence backward into that reconstruction.
+    prepared.runtime_incarnation = None;
+    prepared.runtime_launch = RuntimeLaunch::Absent;
+    prepared.stable_state = None;
+    prepared.processes.clear();
+    for volume in &mut prepared.volumes {
+        volume.devices.clear();
+    }
+    prepared.mounts.clear();
+    prepared.networks.clear();
+    prepared.guest_transport = GuestTransportEvidence::Unavailable;
+    prepared.warm_snapshot = WarmSnapshotEvidence::Absent;
+    prepared.lifecycle_admission = LifecycleAdmission::Closed;
+    prepared.route_gates.clear();
+    prepared.require_idle = RequireIdleCheckpoint::NotApplicable;
     Ok(prepared)
 }
 

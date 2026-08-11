@@ -21,17 +21,18 @@ use anyhow::Context as _;
 use cats_api::runtime_reconciliation::{
     encode_runtime_checkpoint, ControlHandshakeEvidence, HostPath, Id, ObservedVmShape,
     OwnershipTokenEvidence, PreparedDeviceInput, ProcessEvidence, ProcessRole, ProcessState,
-    RandomId128, ReconcileStep, RuntimeCheckpoint, RuntimeLaunchArtifact, RuntimeNetworkIdentity,
-    VmmBootProvenance, WireU64,
+    RandomId128, RuntimeCheckpoint, RuntimeLaunchArtifact, RuntimeLaunchIdentity,
+    RuntimeNetworkIdentity, WireU64,
 };
 
 use crate::runtime_spine::RuntimeDesiredEffectContext;
 use crate::vmm_launcher::{
-    VmmLauncherPlan, RUNTIME_INCARNATION_ENVIRONMENT, VMM_LAUNCHER_CONTRACT_ARGUMENT,
-    VMM_PROCESS_TOKEN_ENVIRONMENT,
+    cloud_hypervisor_arguments_for_launch, RUNTIME_INCARNATION_ENVIRONMENT,
+    VMM_LAUNCHER_CONTRACT_ARGUMENT, VMM_PROCESS_TOKEN_ENVIRONMENT,
 };
 
 use super::checkpoint::{FileCheckpointStore, RetainedCurrentCheckpoint, StoredCheckpoint};
+use super::retained_runtime_launch::RetainedRuntimeLaunchAuthority;
 #[cfg(any(test, target_os = "linux"))]
 use super::systemd_root_provision::{
     exact_unset_environment, sanitized_systemd_command, LinuxProcessSample,
@@ -54,6 +55,11 @@ use super::vmm_launch_artifacts::{
 use super::vmm_runtime_paths::VmmRuntimePathRequirements;
 #[cfg(target_os = "linux")]
 use super::vmm_runtime_paths::{RetainedVmmRuntimePaths, VmmRuntimePathInspection};
+#[cfg(target_os = "linux")]
+use super::vmm_socket_namespace::{
+    vmm_state_directory_from_checkpoint, RetainedManagedVmmSocketRoot, VmmSocketOwnershipReceiptV1,
+    VmmSocketReceiptStore,
+};
 
 const SYSTEM_SLICE: &str = "system.slice";
 const CGROUP_ROOT: &str = "/sys/fs/cgroup";
@@ -132,8 +138,8 @@ pub(crate) trait VmmProcessGlobalPort:
 
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) enum VmmProcessGlobalInspection {
-    Absent(ExactVmmProcessAbsenceProof),
-    Exact(ExactVmmProcessProof),
+    Absent(Box<ExactVmmProcessAbsenceProof>),
+    Exact(Box<ExactVmmProcessProof>),
     Conflict(VmmProcessConflict),
     Unavailable,
 }
@@ -143,14 +149,11 @@ pub(crate) enum VmmProcessGlobalInspection {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct VmmProcessExpectation {
     checkpoint: RuntimeCheckpoint,
+    launch: RuntimeLaunchIdentity,
     unit_id: Id,
     cgroup_path: HostPath,
-    launcher_executable: RuntimeLaunchArtifact,
-    boot: VmmBootProvenance,
     launcher_command_line: Vec<OsString>,
     vmm_command_line: Vec<OsString>,
-    runtime_incarnation: RandomId128,
-    process_identity_token: RandomId128,
     /// Present only on an expectation minted by the descriptor-rooted full
     /// scanner.  A naked checkpoint is sufficient to build one start command,
     /// but it cannot authorize adoption because fixed fd 64 must be joined to
@@ -163,24 +166,18 @@ impl VmmProcessExpectation {
         // Direct Rust construction must cross the same F0/cross validator as
         // persisted input before it can become a process expectation.
         encode_runtime_checkpoint(&checkpoint)
-            .context("validate VMM process StartRuntime checkpoint")?;
-        let plan = VmmLauncherPlan::from_checkpoint(checkpoint.clone())?;
-        let ReconcileStep::StartRuntime {
-            runtime_incarnation,
-            scope_id,
-            launcher_executable,
-            boot,
-            process_identity_token,
-            ..
-        } = &checkpoint.step
-        else {
-            anyhow::bail!("VMM process expectation is not StartRuntime")
-        };
-        let expected_unit = Id::new(format!("cats-vmm-{}.service", runtime_incarnation.as_str()))
-            .context("StartRuntime incarnation cannot form a systemd unit")?;
+            .context("validate VMM process retained-launch checkpoint")?;
+        let launch = RetainedRuntimeLaunchAuthority::from_checkpoint(&checkpoint)?
+            .identity()
+            .clone();
+        let expected_unit = Id::new(format!(
+            "cats-vmm-{}.service",
+            launch.runtime_incarnation.as_str()
+        ))
+        .context("retained VMM incarnation cannot form a systemd unit")?;
         anyhow::ensure!(
-            scope_id == &expected_unit,
-            "StartRuntime systemd unit is not the exact incarnation-derived identity"
+            launch.scope_id == expected_unit,
+            "retained VMM systemd unit is not the exact incarnation-derived identity"
         );
         let cgroup_path = HostPath::new(format!(
             "{CGROUP_ROOT}/{SYSTEM_SLICE}/{}",
@@ -188,26 +185,20 @@ impl VmmProcessExpectation {
         ))
         .context("StartRuntime cgroup path is not canonical")?;
         let launcher_command_line = vec![
-            OsString::from(launcher_executable.path.as_str()),
+            OsString::from(launch.launcher_executable.path.as_str()),
             OsString::from(VMM_LAUNCHER_CONTRACT_ARGUMENT),
         ];
-        let vmm_command_line = std::iter::once(OsString::from(boot.vmm_executable.path.as_str()))
-            .chain(plan.cloud_hypervisor_arguments().iter().cloned())
-            .collect();
-        let launcher_executable = (**launcher_executable).clone();
-        let boot = (**boot).clone();
-        let runtime_incarnation = runtime_incarnation.clone();
-        let process_identity_token = process_identity_token.clone();
+        let vmm_command_line =
+            std::iter::once(OsString::from(launch.boot.vmm_executable.path.as_str()))
+                .chain(cloud_hypervisor_arguments_for_launch(&launch)?)
+                .collect();
         Ok(Self {
             checkpoint,
+            launch,
             unit_id: expected_unit,
             cgroup_path,
-            launcher_executable,
-            boot,
             launcher_command_line,
             vmm_command_line,
-            runtime_incarnation,
-            process_identity_token,
             checkpoint_path: None,
         })
     }
@@ -249,15 +240,19 @@ impl VmmProcessExpectation {
     }
 
     pub(crate) fn vmm_executable(&self) -> &RuntimeLaunchArtifact {
-        &self.boot.vmm_executable
+        &self.launch.boot.vmm_executable
     }
 
     pub(crate) fn runtime_incarnation(&self) -> &RandomId128 {
-        &self.runtime_incarnation
+        &self.launch.runtime_incarnation
     }
 
     pub(crate) fn process_identity_token(&self) -> &RandomId128 {
-        &self.process_identity_token
+        &self.launch.process_identity_token
+    }
+
+    pub(crate) fn launch_identity(&self) -> &RuntimeLaunchIdentity {
+        &self.launch
     }
 
     pub(crate) fn checkpoint_path(&self) -> Option<&HostPath> {
@@ -265,79 +260,54 @@ impl VmmProcessExpectation {
     }
 
     pub(crate) fn api_socket_path(&self) -> &HostPath {
-        let ReconcileStep::StartRuntime {
-            api_socket_path, ..
-        } = &self.checkpoint.step
-        else {
-            unreachable!("VMM expectation construction checked StartRuntime")
-        };
-        api_socket_path
+        &self.launch.api_socket_path
     }
 
     pub(crate) fn vsock_socket_path(&self) -> &HostPath {
-        let ReconcileStep::StartRuntime {
-            vsock_socket_path, ..
-        } = &self.checkpoint.step
-        else {
-            unreachable!("VMM expectation construction checked StartRuntime")
-        };
-        vsock_socket_path
+        &self.launch.vsock_socket_path
     }
 
     pub(crate) fn memory_file_path(&self) -> &HostPath {
-        let ReconcileStep::StartRuntime {
-            memory_file_path, ..
-        } = &self.checkpoint.step
-        else {
-            unreachable!("VMM expectation construction checked StartRuntime")
-        };
-        memory_file_path
+        &self.launch.memory_file_path
     }
 
     pub(crate) fn serial_log_path(&self) -> &HostPath {
-        let ReconcileStep::StartRuntime {
-            serial_log_path, ..
-        } = &self.checkpoint.step
-        else {
-            unreachable!("VMM expectation construction checked StartRuntime")
-        };
-        serial_log_path
+        &self.launch.serial_log_path
     }
 
     pub(crate) fn vmm_log_path(&self) -> &HostPath {
-        let ReconcileStep::StartRuntime { vmm_log_path, .. } = &self.checkpoint.step else {
-            unreachable!("VMM expectation construction checked StartRuntime")
-        };
-        vmm_log_path
+        &self.launch.vmm_log_path
     }
 
     fn launch_artifact_paths(&self) -> VmmLaunchArtifactPaths {
         VmmLaunchArtifactPaths {
-            launcher_executable: PathBuf::from(self.launcher_executable.path.as_str()),
-            vmm_executable: PathBuf::from(self.boot.vmm_executable.path.as_str()),
-            kernel: PathBuf::from(self.boot.kernel.path.as_str()),
+            launcher_executable: PathBuf::from(self.launch.launcher_executable.path.as_str()),
+            vmm_executable: PathBuf::from(self.launch.boot.vmm_executable.path.as_str()),
+            kernel: PathBuf::from(self.launch.boot.kernel.path.as_str()),
             initramfs: self
+                .launch
                 .boot
                 .initramfs
                 .as_ref()
                 .map(|artifact| PathBuf::from(artifact.path.as_str())),
-            kernel_cmdline: self.boot.kernel_cmdline.as_str().to_owned(),
+            kernel_cmdline: self.launch.boot.kernel_cmdline.as_str().to_owned(),
         }
     }
 
-    fn runtime_path_requirements(&self) -> anyhow::Result<VmmRuntimePathRequirements> {
+    fn runtime_path_requirements(
+        &self,
+        original_checkpoint_content_digest: cats_api::runtime_reconciliation::Sha256Digest,
+    ) -> anyhow::Result<VmmRuntimePathRequirements> {
         let checkpoint_path = self
             .checkpoint_path
             .clone()
             .context("VMM inventory expectation lacks its checkpoint pathname")?;
-        let ReconcileStep::StartRuntime { memory_bytes, .. } = &self.checkpoint.step else {
-            unreachable!("VMM expectation construction checked StartRuntime")
-        };
         Ok(VmmRuntimePathRequirements {
             checkpoint_path,
             checkpoint: self.checkpoint.clone(),
+            original_checkpoint_content_digest,
             memory_file_path: self.memory_file_path().clone(),
-            memory_bytes: *memory_bytes,
+            memory_bytes: self.launch.memory_bytes,
             serial_log_path: self.serial_log_path().clone(),
             vmm_log_path: self.vmm_log_path().clone(),
         })
@@ -347,37 +317,24 @@ impl VmmProcessExpectation {
         BTreeMap::from([
             (
                 OsString::from(RUNTIME_INCARNATION_ENVIRONMENT),
-                OsString::from(self.runtime_incarnation.as_str()),
+                OsString::from(self.launch.runtime_incarnation.as_str()),
             ),
             (
                 OsString::from(VMM_PROCESS_TOKEN_ENVIRONMENT),
-                OsString::from(self.process_identity_token.as_str()),
+                OsString::from(self.launch.process_identity_token.as_str()),
             ),
         ])
     }
 
     fn vm_info(&self) -> VmmVmInfoEvidence {
-        let ReconcileStep::StartRuntime {
-            vcpus,
-            memory_bytes,
-            boot_image_digest,
-            guest_config_digest,
-            guest_cid,
-            network,
-            devices,
-            ..
-        } = &self.checkpoint.step
-        else {
-            unreachable!("VMM expectation construction checked StartRuntime")
-        };
         VmmVmInfoEvidence {
-            vcpus: *vcpus,
-            memory_bytes: *memory_bytes,
-            boot_image_digest: boot_image_digest.clone(),
-            guest_config_digest: guest_config_digest.clone(),
-            guest_cid: *guest_cid,
-            network: (**network).clone(),
-            devices: devices.clone(),
+            vcpus: self.launch.vcpus,
+            memory_bytes: self.launch.memory_bytes,
+            boot_image_digest: self.launch.boot_image_digest.clone(),
+            guest_config_digest: self.launch.guest_config_digest.clone(),
+            guest_cid: self.launch.guest_cid,
+            network: (*self.launch.network).clone(),
+            devices: self.launch.devices.clone(),
         }
     }
 
@@ -410,8 +367,8 @@ impl VmmProcessExpectation {
             environment: self.exact_environment(),
             api_socket_path: self.api_socket_path().clone(),
             vsock_socket_path: self.vsock_socket_path().clone(),
-            process_identity_token: self.process_identity_token.clone(),
-            runtime_incarnation: self.runtime_incarnation.clone(),
+            process_identity_token: self.launch.process_identity_token.clone(),
+            runtime_incarnation: self.launch.runtime_incarnation.clone(),
             api_peer_process_id: process_id,
             fixed_descriptors_exact: true,
             api_socket_exact: true,
@@ -441,7 +398,7 @@ struct VmmVmInfoEvidence {
 enum VmmPhysicalAuthority {
     #[cfg(target_os = "linux")]
     Platform {
-        descriptors: VmmDescriptorAuthority,
+        descriptors: Box<VmmDescriptorAuthority>,
         api: Box<ExactVmmApiProof>,
     },
     #[cfg(test)]
@@ -632,14 +589,10 @@ impl ExactVmmProcessProof {
     /// allocator from rebuilding a live owner from public `ProcessEvidence`
     /// or from an independently reopened checkpoint.
     pub(crate) fn guest_cid_identity(&self) -> (&Id, &RandomId128, u32) {
-        let ReconcileStep::StartRuntime { guest_cid, .. } = &self.expectation.checkpoint.step
-        else {
-            unreachable!("exact VMM proof was minted only from StartRuntime")
-        };
         (
             self.expectation.cat_id(),
             self.expectation.runtime_incarnation(),
-            *guest_cid,
+            self.expectation.launch.guest_cid,
         )
     }
 
@@ -705,8 +658,8 @@ impl<'a> CheckpointedVmmProcess<'a> {
             "VMM process expectation is not the retained current checkpoint"
         );
         anyhow::ensure!(
-            artifacts.launcher_executable() == &expected.launcher_executable
-                && artifacts.boot() == expected.boot,
+            artifacts.launcher_executable() == expected.launch.launcher_executable.as_ref()
+                && artifacts.boot() == *expected.launch.boot,
             "installed VMM artifacts do not match StartRuntime"
         );
         let checkpoint = store
@@ -745,8 +698,9 @@ impl<'a> CheckpointedVmmProcess<'a> {
             .assert_current()
             .context("revalidate installed VMM launch artifacts")?;
         anyhow::ensure!(
-            self.artifacts.launcher_executable() == &self.expected.launcher_executable
-                && self.artifacts.boot() == self.expected.boot,
+            self.artifacts.launcher_executable()
+                == self.expected.launch.launcher_executable.as_ref()
+                && self.artifacts.boot() == *self.expected.launch.boot,
             "installed VMM launch projection changed"
         );
         Ok(())
@@ -801,8 +755,8 @@ impl VmmProcessPort for PlatformSystemdVmmProcessPort {
                             ))
                         }
                     }
-                    let api_expectation = VmmApiExpectation::from_checkpoint(
-                        expected.checkpoint(),
+                    let api_expectation = VmmApiExpectation::from_launch_identity(
+                        expected.launch_identity(),
                         identity.process_id(),
                     )?;
                     anyhow::ensure!(
@@ -949,6 +903,10 @@ impl VmmManagerProcessIdentity {
 struct VmmDescriptorAuthority {
     launch: Arc<RetainedVmmLaunchArtifacts>,
     runtime: Arc<RetainedVmmRuntimePaths>,
+    socket_root: Arc<RetainedManagedVmmSocketRoot>,
+    receipts: Arc<VmmSocketReceiptStore>,
+    receipt: VmmSocketOwnershipReceiptV1,
+    checkpoint: RuntimeCheckpoint,
 }
 
 #[cfg(target_os = "linux")]
@@ -957,6 +915,10 @@ impl PartialEq for VmmDescriptorAuthority {
         self.launch.launcher_executable() == other.launch.launcher_executable()
             && self.launch.boot() == other.launch.boot()
             && self.runtime == other.runtime
+            && self.socket_root.identity_coordinate() == other.socket_root.identity_coordinate()
+            && self.receipts.identity_coordinate() == other.receipts.identity_coordinate()
+            && self.receipt == other.receipt
+            && self.checkpoint == other.checkpoint
     }
 }
 
@@ -972,6 +934,25 @@ impl VmmDescriptorAuthority {
         self.runtime
             .assert_current()
             .context("revalidate retained VMM runtime paths")?;
+        self.socket_root
+            .assert_current()
+            .context("revalidate retained VMM socket root")?;
+        self.receipts
+            .assert_current()
+            .context("revalidate retained VMM receipt namespace")?;
+        let current_receipt = self
+            .receipts
+            .load(self.receipt.runtime_incarnation())?
+            .context("retained VMM launch receipt disappeared")?;
+        anyhow::ensure!(
+            current_receipt == self.receipt,
+            "retained VMM launch receipt changed"
+        );
+        self.receipt.validate_against(
+            &self.checkpoint,
+            self.receipts.state_directory(),
+            &self.socket_root,
+        )?;
         self.runtime
             .assert_fixed_descriptors(process_id, self.launch.descriptors())
             .context("revalidate VMM fixed descriptor set")
@@ -980,7 +961,7 @@ impl VmmDescriptorAuthority {
 
 #[cfg(target_os = "linux")]
 enum VmmDescriptorInspection {
-    Exact(VmmDescriptorAuthority),
+    Exact(Box<VmmDescriptorAuthority>),
     Conflict,
 }
 
@@ -993,13 +974,40 @@ fn inspect_vmm_descriptor_authority(
         Ok(launch) => Arc::new(launch),
         Err(_) => return Ok(VmmDescriptorInspection::Conflict),
     };
-    if launch.launcher_executable() != &expected.launcher_executable
-        || launch.boot() != expected.boot
+    if launch.launcher_executable() != expected.launch.launcher_executable.as_ref()
+        || launch.boot() != *expected.launch.boot
     {
         return Ok(VmmDescriptorInspection::Conflict);
     }
-    let requirements = expected.runtime_path_requirements()?;
-    let runtime = match RetainedVmmRuntimePaths::open(&requirements)? {
+    let state_directory = match vmm_state_directory_from_checkpoint(expected.checkpoint()) {
+        Ok(directory) => directory,
+        Err(_) => return Ok(VmmDescriptorInspection::Conflict),
+    };
+    let socket_root = match RetainedManagedVmmSocketRoot::open_installed() {
+        Ok(root) => Arc::new(root),
+        Err(_) => return Ok(VmmDescriptorInspection::Conflict),
+    };
+    let receipts = match VmmSocketReceiptStore::open_existing(state_directory) {
+        Ok(receipts) => Arc::new(receipts),
+        Err(_) => return Ok(VmmDescriptorInspection::Conflict),
+    };
+    let receipt = match receipts.load(expected.runtime_incarnation())? {
+        Some(receipt) => receipt,
+        None => return Ok(VmmDescriptorInspection::Conflict),
+    };
+    if receipt
+        .validate_against(
+            expected.checkpoint(),
+            receipts.state_directory(),
+            &socket_root,
+        )
+        .is_err()
+    {
+        return Ok(VmmDescriptorInspection::Conflict);
+    }
+    let requirements =
+        expected.runtime_path_requirements(receipt.checkpoint_content_digest().clone())?;
+    let runtime = match RetainedVmmRuntimePaths::open(&requirements, process_id)? {
         VmmRuntimePathInspection::Exact(runtime) => runtime,
         VmmRuntimePathInspection::Conflict => return Ok(VmmDescriptorInspection::Conflict),
         // A live exact systemd process cannot legitimately lose any path it
@@ -1007,11 +1015,18 @@ fn inspect_vmm_descriptor_authority(
         // conflict, not absence evidence and not a retryable empty state.
         VmmRuntimePathInspection::Unavailable => return Ok(VmmDescriptorInspection::Conflict),
     };
-    let authority = VmmDescriptorAuthority { launch, runtime };
+    let authority = VmmDescriptorAuthority {
+        launch,
+        runtime,
+        socket_root,
+        receipts,
+        receipt,
+        checkpoint: expected.checkpoint().clone(),
+    };
     if authority.assert_current(process_id).is_err() {
         return Ok(VmmDescriptorInspection::Conflict);
     }
-    Ok(VmmDescriptorInspection::Exact(authority))
+    Ok(VmmDescriptorInspection::Exact(Box::new(authority)))
 }
 
 #[cfg(target_os = "linux")]
@@ -1304,7 +1319,10 @@ fn systemd_vmm_command(
 mod tests {
     use std::collections::BTreeMap;
 
-    use cats_api::runtime_reconciliation::decode_runtime_checkpoint;
+    use cats_api::runtime_reconciliation::{
+        decode_runtime_checkpoint, encode_runtime_checkpoint, Epoch, Generation, Id, RandomId128,
+        ReconcileStep, RemoteHead, StableState,
+    };
 
     use super::*;
 
@@ -1321,6 +1339,77 @@ mod tests {
         expectation()
             .with_checkpoint_path(HostPath::new("/var/lib/cats/checkpoints/cat_01.json").unwrap())
             .unwrap()
+    }
+
+    #[derive(Clone, Copy)]
+    enum RunningTail {
+        Format,
+        InstallGate,
+        Stable,
+    }
+
+    fn running_tail_checkpoint(
+        launch_checkpoint: &RuntimeCheckpoint,
+        tail: RunningTail,
+    ) -> RuntimeCheckpoint {
+        let mut checkpoint = launch_checkpoint.clone();
+        checkpoint.step = match tail {
+            RunningTail::Format => ReconcileStep::FormatFilesystem {
+                volume_id: Id::new("vol_root").unwrap(),
+                attachment_id: Id::new("att_01").unwrap(),
+                filesystem_uuid: RandomId128::new("dddddddddddddddddddddddddddddddd").unwrap(),
+                initialization_token: RandomId128::new("eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee").unwrap(),
+                expected_blank_head: RemoteHead {
+                    generation: Generation::new(0).unwrap(),
+                    root_hash: None,
+                    root_object_id: None,
+                },
+            },
+            RunningTail::InstallGate => ReconcileStep::InstallGate {
+                endpoint_id: Id::new("endpoint_01").unwrap(),
+                route_epoch: Epoch::new(1).unwrap(),
+            },
+            RunningTail::Stable => {
+                checkpoint.stable_state = Some(StableState::Running);
+                ReconcileStep::Stable {
+                    state: StableState::Running,
+                }
+            }
+        };
+        if !matches!(tail, RunningTail::Stable) {
+            checkpoint.stable_state = None;
+        }
+        encode_runtime_checkpoint(&checkpoint).unwrap();
+        checkpoint
+    }
+
+    #[test]
+    fn running_tail_expectations_retain_the_original_vmm_identity() {
+        let launch_checkpoint = decode_runtime_checkpoint(include_bytes!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../testdata/runtime-reconciliation-v1-start-runtime-checkpoint.json"
+        )))
+        .unwrap();
+        let launch = VmmProcessExpectation::from_checkpoint(launch_checkpoint.clone()).unwrap();
+        for tail in [
+            RunningTail::Format,
+            RunningTail::InstallGate,
+            RunningTail::Stable,
+        ] {
+            let retained = VmmProcessExpectation::from_checkpoint(running_tail_checkpoint(
+                &launch_checkpoint,
+                tail,
+            ))
+            .unwrap();
+            assert_eq!(retained.launch_identity(), launch.launch_identity());
+            assert_eq!(retained.unit_id(), launch.unit_id());
+            assert_eq!(retained.cgroup_path(), launch.cgroup_path());
+            assert_eq!(
+                retained.launcher_command_line(),
+                launch.launcher_command_line()
+            );
+            assert_eq!(retained.vmm_command_line(), launch.vmm_command_line());
+        }
     }
 
     fn exact_manager_properties(

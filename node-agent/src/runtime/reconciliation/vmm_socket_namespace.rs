@@ -21,14 +21,17 @@ use std::os::unix::fs::MetadataExt as _;
 use std::path::{Component, Path, PathBuf};
 
 use anyhow::Context as _;
+#[cfg(test)]
+use cats_api::runtime_reconciliation::ReconcileStep;
 use cats_api::runtime_reconciliation::{
-    checkpoint_content_digest, Epoch, HostPath, Id, RandomId128, ReconcileStep, Revision,
-    RuntimeCheckpoint, Sha256Digest,
+    checkpoint_content_digest, Epoch, HostPath, Id, RandomId128, Revision, RuntimeCheckpoint,
+    Sha256Digest,
 };
 use serde::{Deserialize, Serialize};
 
 use crate::state_directory::StateDirectory;
 
+use super::retained_runtime_launch::RetainedRuntimeLaunchAuthority;
 use super::vmm_runtime_paths::ManagedVmmLaunchFilePaths;
 
 /// Installation-owned short socket root.  It is deliberately outside the
@@ -61,21 +64,15 @@ pub(crate) enum ManagedVmmSocketRootScan {
 pub(crate) fn vmm_state_directory_from_checkpoint(
     checkpoint: &RuntimeCheckpoint,
 ) -> anyhow::Result<StateDirectory> {
-    let ReconcileStep::StartRuntime {
-        runtime_incarnation,
-        memory_file_path,
-        ..
-    } = &checkpoint.step
-    else {
-        anyhow::bail!("VMM state-directory recovery requires StartRuntime")
-    };
-    let memory = Path::new(memory_file_path.as_str());
+    let authority = RetainedRuntimeLaunchAuthority::from_checkpoint(checkpoint)?;
+    let launch = authority.identity();
+    let memory = Path::new(launch.memory_file_path.as_str());
     let attempt = memory
         .parent()
         .context("VMM memory path has no attempt directory")?;
     anyhow::ensure!(
         attempt.file_name().and_then(|name| name.to_str())
-            == Some(format!("p-{}", runtime_incarnation.as_str()).as_str()),
+            == Some(format!("p-{}", launch.runtime_incarnation.as_str()).as_str()),
         "VMM memory path has a non-exact attempt directory"
     );
     let namespace = attempt
@@ -169,24 +166,13 @@ impl ManagedVmmSocketRoot {
         &self,
         checkpoint: &RuntimeCheckpoint,
     ) -> anyhow::Result<ManagedVmmSocketPaths> {
-        let ReconcileStep::StartRuntime {
-            runtime_incarnation,
-            api_socket_path,
-            vsock_socket_path,
-            ..
-        } = &checkpoint.step
-        else {
-            anyhow::bail!("managed VMM socket paths require StartRuntime")
-        };
+        let authority = RetainedRuntimeLaunchAuthority::from_checkpoint(checkpoint)?;
+        let launch = authority.identity();
+        let paths = self.paths_for(&launch.runtime_incarnation)?;
         anyhow::ensure!(
-            checkpoint.runtime_incarnation.as_ref() == Some(runtime_incarnation),
-            "StartRuntime socket paths have a non-exact top-level incarnation"
-        );
-        let paths = self.paths_for(runtime_incarnation)?;
-        anyhow::ensure!(
-            api_socket_path == &paths.api_socket_path
-                && vsock_socket_path == &paths.vsock_socket_path,
-            "StartRuntime socket paths are outside the managed VMM namespace"
+            launch.api_socket_path == paths.api_socket_path
+                && launch.vsock_socket_path == paths.vsock_socket_path,
+            "retained VMM socket paths are outside the managed namespace"
         );
         Ok(paths)
     }
@@ -264,6 +250,7 @@ pub(crate) struct VmmSocketOwnershipReceiptV1 {
     spec_digest: Sha256Digest,
     placement_epoch: Epoch,
     checkpoint_content_digest: Sha256Digest,
+    runtime_launch_content_digest: Sha256Digest,
     runtime_incarnation: RandomId128,
     scope_id: Id,
     process_identity_token: RandomId128,
@@ -289,17 +276,8 @@ impl VmmSocketOwnershipReceiptV1 {
         managed_root: &RetainedManagedVmmSocketRoot,
         creation_nonce: RandomId128,
     ) -> anyhow::Result<Self> {
-        let ReconcileStep::StartRuntime {
-            runtime_incarnation,
-            scope_id,
-            launcher_executable,
-            boot,
-            process_identity_token,
-            ..
-        } = &checkpoint.step
-        else {
-            anyhow::bail!("VMM socket ownership receipt requires StartRuntime")
-        };
+        let authority = RetainedRuntimeLaunchAuthority::from_start_runtime_checkpoint(checkpoint)?;
+        let launch = authority.identity();
         let paths = managed_root
             .planner
             .paths_from_checkpoint(checkpoint)
@@ -308,7 +286,8 @@ impl VmmSocketOwnershipReceiptV1 {
             ManagedVmmLaunchFilePaths::paths_from_checkpoint(state_directory, checkpoint)
                 .context("validate managed StartRuntime launch file paths")?;
         anyhow::ensure!(
-            &creation_nonce != runtime_incarnation && &creation_nonce != process_identity_token,
+            creation_nonce != launch.runtime_incarnation
+                && creation_nonce != launch.process_identity_token,
             "VMM socket creation nonce aliases another launch identity"
         );
         let receipt = Self {
@@ -320,12 +299,13 @@ impl VmmSocketOwnershipReceiptV1 {
             placement_epoch: checkpoint.placement_epoch,
             checkpoint_content_digest: checkpoint_content_digest(checkpoint)
                 .context("digest StartRuntime checkpoint for socket ownership")?,
-            runtime_incarnation: runtime_incarnation.clone(),
-            scope_id: scope_id.clone(),
-            process_identity_token: process_identity_token.clone(),
+            runtime_launch_content_digest: authority.identity_content_digest()?,
+            runtime_incarnation: launch.runtime_incarnation.clone(),
+            scope_id: launch.scope_id.clone(),
+            process_identity_token: launch.process_identity_token.clone(),
             creation_nonce,
-            launcher_executable_path: launcher_executable.path.clone(),
-            vmm_executable_path: boot.vmm_executable.path.clone(),
+            launcher_executable_path: launch.launcher_executable.path.clone(),
+            vmm_executable_path: launch.boot.vmm_executable.path.clone(),
             managed_root_path: paths.root().clone(),
             managed_root_identity: managed_root.identity,
             public_name: paths.public_name().to_owned(),
@@ -351,17 +331,8 @@ impl VmmSocketOwnershipReceiptV1 {
             self.version == VMM_SOCKET_RECEIPT_VERSION,
             "unsupported VMM socket receipt version"
         );
-        let ReconcileStep::StartRuntime {
-            runtime_incarnation,
-            scope_id,
-            launcher_executable,
-            boot,
-            process_identity_token,
-            ..
-        } = &checkpoint.step
-        else {
-            anyhow::bail!("VMM socket ownership receipt requires StartRuntime")
-        };
+        let authority = RetainedRuntimeLaunchAuthority::from_checkpoint(checkpoint)?;
+        let launch = authority.identity();
         let paths = managed_root.planner.paths_from_checkpoint(checkpoint)?;
         let launch_file_paths =
             ManagedVmmLaunchFilePaths::paths_from_checkpoint(state_directory, checkpoint)?;
@@ -371,16 +342,15 @@ impl VmmSocketOwnershipReceiptV1 {
                 && self.desired_revision == checkpoint.desired_revision
                 && self.spec_digest == checkpoint.spec_digest
                 && self.placement_epoch == checkpoint.placement_epoch
-                && self.checkpoint_content_digest
-                    == checkpoint_content_digest(checkpoint)
-                        .context("re-digest StartRuntime checkpoint")?
-                && &self.runtime_incarnation == runtime_incarnation
-                && &self.scope_id == scope_id
-                && &self.process_identity_token == process_identity_token
-                && &self.creation_nonce != runtime_incarnation
-                && &self.creation_nonce != process_identity_token
-                && self.launcher_executable_path == launcher_executable.path
-                && self.vmm_executable_path == boot.vmm_executable.path
+                && self.runtime_launch_content_digest == authority.identity_content_digest()?
+                && self.original_checkpoint_digest_matches_if_current_start(checkpoint)?
+                && self.runtime_incarnation == launch.runtime_incarnation
+                && self.scope_id == launch.scope_id
+                && self.process_identity_token == launch.process_identity_token
+                && self.creation_nonce != launch.runtime_incarnation
+                && self.creation_nonce != launch.process_identity_token
+                && self.launcher_executable_path == launch.launcher_executable.path
+                && self.vmm_executable_path == launch.boot.vmm_executable.path
                 && &self.managed_root_path == paths.root()
                 && self.managed_root_identity == managed_root.identity
                 && self.public_name == paths.public_name()
@@ -426,21 +396,17 @@ impl VmmSocketOwnershipReceiptV1 {
         state_directory: &StateDirectory,
         paths: &ManagedVmmLaunchFilePaths,
     ) -> anyhow::Result<()> {
-        let ReconcileStep::StartRuntime {
-            runtime_incarnation,
-            ..
-        } = &checkpoint.step
-        else {
-            anyhow::bail!("VMM launch receipt requires StartRuntime")
-        };
+        let authority = RetainedRuntimeLaunchAuthority::from_checkpoint(checkpoint)?;
+        let launch = authority.identity();
         anyhow::ensure!(
             self.node_id == checkpoint.node_id
                 && self.cat_id == checkpoint.cat_id
                 && self.desired_revision == checkpoint.desired_revision
                 && self.spec_digest == checkpoint.spec_digest
                 && self.placement_epoch == checkpoint.placement_epoch
-                && self.checkpoint_content_digest == checkpoint_content_digest(checkpoint)?
-                && &self.runtime_incarnation == runtime_incarnation
+                && self.runtime_launch_content_digest == authority.identity_content_digest()?
+                && self.original_checkpoint_digest_matches_if_current_start(checkpoint)?
+                && self.runtime_incarnation == launch.runtime_incarnation
                 && &self.memory_file_path == paths.memory_file_path()
                 && &self.serial_log_path == paths.serial_log_path()
                 && &self.vmm_log_path == paths.vmm_log_path()
@@ -449,6 +415,17 @@ impl VmmSocketOwnershipReceiptV1 {
             "VMM launch receipt is not checkpoint-exact"
         );
         Ok(())
+    }
+
+    fn original_checkpoint_digest_matches_if_current_start(
+        &self,
+        checkpoint: &RuntimeCheckpoint,
+    ) -> anyhow::Result<bool> {
+        if checkpoint.step.start_runtime_launch_identity().is_some() {
+            Ok(self.checkpoint_content_digest == checkpoint_content_digest(checkpoint)?)
+        } else {
+            Ok(true)
+        }
     }
 
     pub(crate) fn encoded_bytes(&self) -> anyhow::Result<Vec<u8>> {
@@ -538,6 +515,16 @@ impl RetainedManagedVmmSocketRoot {
 
     pub(crate) fn owner(&self) -> (u32, u32) {
         (self.identity.user, self.identity.group)
+    }
+
+    pub(crate) fn identity_coordinate(&self) -> (u64, u64, u32, u32, u32) {
+        (
+            self.identity.device,
+            self.identity.inode,
+            self.identity.mode,
+            self.identity.user,
+            self.identity.group,
+        )
     }
 
     pub(crate) fn assert_current(&self) -> anyhow::Result<()> {
@@ -651,14 +638,8 @@ impl ReceiptNamespaceSnapshot {
         let Self::Exact(receipts) = self else {
             return Ok(None);
         };
-        let ReconcileStep::StartRuntime {
-            runtime_incarnation,
-            ..
-        } = &checkpoint.step
-        else {
-            anyhow::bail!("VMM receipt snapshot requires StartRuntime")
-        };
-        let name = receipt_file_name(runtime_incarnation)?
+        let launch = RetainedRuntimeLaunchAuthority::from_checkpoint(checkpoint)?;
+        let name = receipt_file_name(&launch.identity().runtime_incarnation)?
             .into_string()
             .map_err(|_| anyhow::anyhow!("VMM receipt filename is not UTF-8"))?;
         receipts
@@ -719,12 +700,9 @@ fn scan_managed_vmm_socket_root_linux_inner(
             Ok(paths) => paths,
             Err(_) => return Ok(ManagedVmmSocketRootScan::Residue),
         };
-        let incarnation = match &checkpoint.step {
-            ReconcileStep::StartRuntime {
-                runtime_incarnation,
-                ..
-            } => runtime_incarnation.as_str().to_owned(),
-            _ => return Ok(ManagedVmmSocketRootScan::Residue),
+        let incarnation = match RetainedRuntimeLaunchAuthority::from_checkpoint(checkpoint) {
+            Ok(authority) => authority.identity().runtime_incarnation.as_str().to_owned(),
+            Err(_) => return Ok(ManagedVmmSocketRootScan::Residue),
         };
         for (name, kind) in [
             (paths.public_name, ScannedAttemptKind::Public),
@@ -762,15 +740,13 @@ fn scan_managed_vmm_socket_root_linux_inner(
         if !seen_incarnations.insert(expected.incarnation.clone()) {
             return Ok(ManagedVmmSocketRootScan::Residue);
         }
-        let receipt_name = match &expected.checkpoint.step {
-            ReconcileStep::StartRuntime {
-                runtime_incarnation,
-                ..
-            } => receipt_file_name(runtime_incarnation)?
-                .into_string()
-                .map_err(|_| anyhow::anyhow!("VMM receipt filename is not UTF-8"))?,
-            _ => unreachable!("expected map accepted only StartRuntime"),
-        };
+        let receipt_name =
+            match RetainedRuntimeLaunchAuthority::from_checkpoint(expected.checkpoint) {
+                Ok(authority) => receipt_file_name(&authority.identity().runtime_incarnation)?
+                    .into_string()
+                    .map_err(|_| anyhow::anyhow!("VMM receipt filename is not UTF-8"))?,
+                Err(_) => return Ok(ManagedVmmSocketRootScan::Residue),
+            };
         let Some(scanned_receipt) = first_receipts.get(&receipt_name) else {
             return Ok(ManagedVmmSocketRootScan::Residue);
         };
@@ -922,14 +898,11 @@ pub(crate) fn scan_receipt_namespace_snapshot(
     }
     let mut expected = std::collections::BTreeMap::new();
     for checkpoint in expected_checkpoints {
-        let ReconcileStep::StartRuntime {
-            runtime_incarnation,
-            ..
-        } = &checkpoint.step
-        else {
-            return Ok(ReceiptNamespaceSnapshot::Residue);
+        let launch = match RetainedRuntimeLaunchAuthority::from_checkpoint(checkpoint) {
+            Ok(authority) => authority,
+            Err(_) => return Ok(ReceiptNamespaceSnapshot::Residue),
         };
-        let name = receipt_file_name(runtime_incarnation)?
+        let name = receipt_file_name(&launch.identity().runtime_incarnation)?
             .into_string()
             .map_err(|_| anyhow::anyhow!("VMM receipt filename is not UTF-8"))?;
         if expected.insert(name, *checkpoint).is_some() {
@@ -1096,6 +1069,16 @@ impl VmmSocketReceiptStore {
 
     pub(crate) fn state_directory(&self) -> &StateDirectory {
         &self.state_directory
+    }
+
+    pub(crate) fn identity_coordinate(&self) -> (u64, u64, u32, u32, u32) {
+        (
+            self.identity.device,
+            self.identity.inode,
+            self.identity.mode,
+            self.identity.user,
+            self.identity.group,
+        )
     }
 
     pub(crate) fn load(
@@ -1350,15 +1333,9 @@ impl RetainedManagedVmmSocketRoot {
     ) -> anyhow::Result<ManagedVmmSocketPreparation<'a>> {
         self.assert_current()?;
         receipts.assert_current()?;
-        let ReconcileStep::StartRuntime {
-            runtime_incarnation,
-            ..
-        } = &checkpoint.step
-        else {
-            anyhow::bail!("managed VMM socket preparation requires StartRuntime")
-        };
+        let launch = RetainedRuntimeLaunchAuthority::from_checkpoint(checkpoint)?;
         let receipt = receipts
-            .load(runtime_incarnation)?
+            .load(&launch.identity().runtime_incarnation)?
             .context("VMM socket ownership receipt is not durable")?;
         let paths = receipt.validate_against(checkpoint, receipts.state_directory(), self)?;
         let (expected_user, expected_group) = self.owner();
@@ -2532,7 +2509,7 @@ mod tests {
     #[cfg(target_os = "linux")]
     use std::time::{Duration, Instant};
 
-    use cats_api::runtime_reconciliation::decode_runtime_checkpoint;
+    use cats_api::runtime_reconciliation::{decode_runtime_checkpoint, RuntimeLaunch};
 
     use super::*;
 
@@ -2542,6 +2519,15 @@ mod tests {
             "/../testdata/runtime-reconciliation-v1-start-runtime-checkpoint.json"
         )))
         .unwrap()
+    }
+
+    fn sync_retained_launch(checkpoint: &mut RuntimeCheckpoint) {
+        checkpoint.runtime_launch = RuntimeLaunch::Present(Box::new(
+            checkpoint
+                .step
+                .start_runtime_launch_identity()
+                .expect("test checkpoint remains StartRuntime"),
+        ));
     }
 
     fn checkpoint_for_root(
@@ -2574,6 +2560,7 @@ mod tests {
         *memory_file_path = launch_file_paths.memory_file_path().clone();
         *serial_log_path = launch_file_paths.serial_log_path().clone();
         *vmm_log_path = launch_file_paths.vmm_log_path().clone();
+        sync_retained_launch(&mut checkpoint);
         checkpoint
     }
 
@@ -2738,6 +2725,7 @@ mod tests {
         };
         *api_socket_path = paths.api_socket_path().clone();
         *vsock_socket_path = paths.vsock_socket_path().clone();
+        sync_retained_launch(&mut checkpoint);
         assert_eq!(root.paths_from_checkpoint(&checkpoint).unwrap(), paths);
     }
 

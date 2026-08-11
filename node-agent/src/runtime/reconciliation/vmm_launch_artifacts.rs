@@ -163,7 +163,10 @@ impl RetainedVmmLaunchArtifacts {
     }
 
     #[cfg(test)]
-    fn open_for_test(canonical_root: &Path, paths: &VmmLaunchArtifactPaths) -> Result<Self> {
+    pub(crate) fn open_for_test(
+        canonical_root: &Path,
+        paths: &VmmLaunchArtifactPaths,
+    ) -> Result<Self> {
         // SAFETY: these libc accessors have no pointer arguments and only read
         // the effective credentials of the current test process.
         let uid = unsafe { libc::geteuid() };
