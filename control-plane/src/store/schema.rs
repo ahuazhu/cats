@@ -511,6 +511,45 @@ fn verify_authority_catalog(transaction: &mut postgres::Transaction<'_>) -> Resu
             return Err(partial_catalog_object(index));
         }
     }
+    for (index, first_key, second_key, predicate) in REQUIRED_RUNTIME_OPERATION_LOOKUP_INDEXES {
+        let present: bool = transaction
+            .query_one(
+                "SELECT EXISTS (
+                    SELECT 1
+                      FROM pg_index i
+                      JOIN pg_class source ON source.oid=i.indrelid
+                      JOIN pg_namespace source_namespace
+                        ON source_namespace.oid=source.relnamespace
+                      JOIN pg_class index_relation
+                        ON index_relation.oid=i.indexrelid
+                      JOIN pg_am access_method
+                        ON access_method.oid=index_relation.relam
+                     WHERE source_namespace.nspname=current_schema()
+                       AND source.relname='runtime_operations'
+                       AND index_relation.relname=$1
+                       AND NOT i.indisunique AND i.indisvalid AND i.indisready
+                       AND i.indnkeyatts=2 AND i.indnatts=2
+                       AND i.indoption::TEXT='0 0'
+                       AND access_method.amname='btree'
+                       AND i.indcollation[0]='pg_catalog.\"C\"'::regcollation
+                       AND i.indcollation[1]='pg_catalog.\"C\"'::regcollation
+                       AND pg_get_indexdef(i.indexrelid, 1, FALSE)=$2
+                       AND pg_get_indexdef(i.indexrelid, 2, FALSE)=$3
+                       AND (($4::TEXT IS NULL AND i.indpred IS NULL)
+                            OR pg_get_expr(i.indpred, i.indrelid)=$4)
+                 )",
+                &[index, first_key, second_key, predicate],
+            )
+            .map_err(|error| {
+                internal(format!(
+                    "verify authority runtime Operation lookup-index catalog: {error:?}"
+                ))
+            })?
+            .get(0);
+        if !present {
+            return Err(partial_catalog_object(index));
+        }
+    }
     for (table, trigger, function, trigger_type, body_sha256) in REQUIRED_IMMUTABILITY_TRIGGERS {
         let body = transaction
             .query_opt(
@@ -1183,6 +1222,39 @@ const REQUIRED_EXPRESSION_INDEXES: &[(&str, &str, &str, &str, &str)] = &[(
     "jsonb_path_ops",
     "(record -> 'authorization'::text)",
 )];
+
+const REQUIRED_RUNTIME_OPERATION_LOOKUP_INDEXES: &[(&str, &str, &str, Option<&str>)] = &[
+    (
+        "runtime_operations_lookup_scalar_scalar",
+        "workspace_id",
+        "operation_id",
+        None,
+    ),
+    (
+        "runtime_operations_lookup_scalar_record",
+        "workspace_id",
+        "((record ->> 'operation_id'::text))",
+        Some(
+            "((operation_id COLLATE \"C\") IS DISTINCT FROM ((record ->> 'operation_id'::text) COLLATE \"C\"))",
+        ),
+    ),
+    (
+        "runtime_operations_lookup_record_scalar",
+        "((record ->> 'workspace_id'::text))",
+        "operation_id",
+        Some(
+            "((workspace_id COLLATE \"C\") IS DISTINCT FROM ((record ->> 'workspace_id'::text) COLLATE \"C\"))",
+        ),
+    ),
+    (
+        "runtime_operations_lookup_record_record",
+        "((record ->> 'workspace_id'::text))",
+        "((record ->> 'operation_id'::text))",
+        Some(
+            "(((workspace_id COLLATE \"C\") IS DISTINCT FROM ((record ->> 'workspace_id'::text) COLLATE \"C\")) AND ((operation_id COLLATE \"C\") IS DISTINCT FROM ((record ->> 'operation_id'::text) COLLATE \"C\")))",
+        ),
+    ),
+];
 
 type RequiredOrderedPartialIndex = (
     &'static str,
@@ -2066,6 +2138,26 @@ CREATE TABLE IF NOT EXISTS runtime_operations (
 );
 CREATE UNIQUE INDEX IF NOT EXISTS runtime_operations_one_pending_per_cat
 ON runtime_operations(cat_id) WHERE phase = 'pending';
+CREATE INDEX IF NOT EXISTS runtime_operations_lookup_scalar_scalar
+ON runtime_operations(workspace_id COLLATE \"C\", operation_id COLLATE \"C\");
+CREATE INDEX IF NOT EXISTS runtime_operations_lookup_scalar_record
+ON runtime_operations(
+    workspace_id COLLATE \"C\", ((record->>'operation_id') COLLATE \"C\")
+) WHERE operation_id COLLATE \"C\" IS DISTINCT FROM
+    (record->>'operation_id') COLLATE \"C\";
+CREATE INDEX IF NOT EXISTS runtime_operations_lookup_record_scalar
+ON runtime_operations(
+    ((record->>'workspace_id') COLLATE \"C\"), operation_id COLLATE \"C\"
+) WHERE workspace_id COLLATE \"C\" IS DISTINCT FROM
+    (record->>'workspace_id') COLLATE \"C\";
+CREATE INDEX IF NOT EXISTS runtime_operations_lookup_record_record
+ON runtime_operations(
+    ((record->>'workspace_id') COLLATE \"C\"),
+    ((record->>'operation_id') COLLATE \"C\")
+) WHERE workspace_id COLLATE \"C\" IS DISTINCT FROM
+        (record->>'workspace_id') COLLATE \"C\"
+    AND operation_id COLLATE \"C\" IS DISTINCT FROM
+        (record->>'operation_id') COLLATE \"C\";
 CREATE TABLE IF NOT EXISTS api_idempotency_results (
     authenticated_workspace_id TEXT NOT NULL REFERENCES workspaces(id),
     canonical_route TEXT NOT NULL CHECK (

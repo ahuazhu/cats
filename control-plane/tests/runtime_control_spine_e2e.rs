@@ -7,7 +7,7 @@
 
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use base64::Engine as _;
@@ -42,7 +42,9 @@ use cats_control_plane::server::{
     spawn, spawn_runtime_authority_with_billing_for_tests, Config, Handle,
 };
 use cats_control_plane::store::DsnSource;
-use cats_control_plane::testsupport::RuntimeCutoverAcceptanceFacts;
+use cats_control_plane::testsupport::{
+    RuntimeCutoverAcceptanceFacts, RuntimeOperationsTableLockForTest,
+};
 use cats_metadata_store_sqlite::SqliteMetadataStore;
 use cats_metering::{
     CheckoutIntent, CheckoutPayment, CheckoutRefund, CreditApplyOutcome, CreditStore,
@@ -232,6 +234,7 @@ struct Context {
     image_blob: Arc<FixedImageBlob>,
     config: Config,
     credits: Arc<ToggleCreditStore>,
+    control_store_dsn: String,
 }
 
 impl Context {
@@ -254,11 +257,10 @@ impl Context {
             reads: AtomicUsize::new(0),
         });
         let credits = Arc::new(ToggleCreditStore::new(usage.clone()));
+        let control_store_dsn = cats_control_plane::testsupport::isolated_control_store_url();
         let config = Config {
             listen: "127.0.0.1:0".into(),
-            control_store_dsn: DsnSource::Literal(
-                cats_control_plane::testsupport::isolated_control_store_url(),
-            ),
+            control_store_dsn: DsnSource::Literal(control_store_dsn.clone()),
             control_store_ca_file: None,
             usage_store: usage.clone(),
             credit_store: credits.clone(),
@@ -300,6 +302,7 @@ impl Context {
             image_blob,
             config,
             credits,
+            control_store_dsn,
         }
     }
 
@@ -783,6 +786,43 @@ async fn production_replicas_share_registration_observation_and_cat_create_autho
         br#"{"code":"unauthenticated","message":"missing or invalid authentication credential"}"#
     );
 
+    let unauthenticated_malformed = context
+        .http
+        .get(format!(
+            "{}/v1/workspaces/{workspace_id}/operations/%FF",
+            context.first.base_url()
+        ))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        json_body(unauthenticated_malformed, StatusCode::UNAUTHORIZED).await,
+        br#"{"code":"unauthenticated","message":"missing or invalid authentication credential"}"#
+    );
+
+    // A raw percent alias and malformed UTF-8 are rejected only after
+    // workspace authorization. Holding ACCESS EXCLUSIVE proves neither case
+    // reaches the runtime_operations Store read.
+    let operation_alias = format!("%6F{}", &created.operation_id.as_str()[1..]);
+    let operation_lock =
+        RuntimeOperationsTableLockForTest::acquire(&context.control_store_dsn).await;
+    for raw_operation in [operation_alias.as_str(), "%FF"] {
+        let response = tokio::time::timeout(
+            Duration::from_secs(1),
+            context
+                .operation_request(&context.first, &workspace_id, raw_operation)
+                .send(),
+        )
+        .await
+        .expect("invalid raw Operation ID reached the locked Store lookup")
+        .unwrap();
+        assert_eq!(
+            json_body(response, StatusCode::NOT_FOUND).await,
+            br#"{"code":"not_found","message":"operation not found"}"#
+        );
+    }
+    operation_lock.release();
+
     let missing = context
         .operation_request(&context.first, &workspace_id, "op_missing")
         .send()
@@ -927,11 +967,64 @@ async fn production_replicas_share_registration_observation_and_cat_create_autho
         }
     );
 
+    // A transient PostgreSQL lock timeout is an ordinary unavailable read and
+    // must not poison readiness.
+    let mut temporary_lock =
+        RuntimeOperationsTableLockForTest::acquire(&context.control_store_dsn).await;
+    let temporary_read = tokio::spawn({
+        let request =
+            context.operation_request(&context.first, &workspace_id, created.operation_id.as_str());
+        async move { request.send().await }
+    });
+    temporary_lock.wait_until_query_blocked().await;
+    let temporary_response = temporary_read.await.unwrap().unwrap();
+    assert_eq!(temporary_response.status(), StatusCode::SERVICE_UNAVAILABLE);
+    assert_eq!(
+        context
+            .http
+            .get(format!("{}/healthz", context.first.base_url()))
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        StatusCode::OK
+    );
+    temporary_lock.release();
+
     cats_control_plane::testsupport::corrupt_runtime_operation_projection_for_test(
         &context.first.state.store,
         created.operation_id.clone(),
     )
     .await;
+    let mut corrupt_lock =
+        RuntimeOperationsTableLockForTest::acquire(&context.control_store_dsn).await;
+    let cancelled_read = tokio::spawn({
+        let request =
+            context.operation_request(&context.first, &workspace_id, created.operation_id.as_str());
+        async move { request.send().await }
+    });
+    corrupt_lock.wait_until_query_blocked().await;
+    cancelled_read.abort();
+    assert!(cancelled_read.await.unwrap_err().is_cancelled());
+    corrupt_lock.release();
+    tokio::time::timeout(Duration::from_secs(2), async {
+        loop {
+            let status = context
+                .http
+                .get(format!("{}/healthz", context.first.base_url()))
+                .send()
+                .await
+                .unwrap()
+                .status();
+            if status == StatusCode::SERVICE_UNAVAILABLE {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .expect("cancelled corrupt Operation read did not poison readiness");
+
     let corrupt = context
         .operation_request(&context.first, &workspace_id, created.operation_id.as_str())
         .send()

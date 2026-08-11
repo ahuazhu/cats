@@ -33,6 +33,7 @@ use super::product::{
 use super::product_rows::{
     insert_disk, insert_endpoint, insert_hostname_lookup, insert_operation,
     load_disk_by_id_for_update, load_operation_by_cat_revision_unlocked,
+    operation_by_workspace_candidates_sql,
 };
 use super::rows::{database_now, insert_volume};
 use crate::store::{internal, DsnSource, Store};
@@ -287,6 +288,19 @@ pub(super) fn request(
         },
         envelopes: CatCreateEnvelopes::new(accepted, cat_id, operation_id, conflict).unwrap(),
     }
+}
+
+pub(crate) fn create_runtime_operation_for_api_test(store: &Store, workspace: &Id) -> Id {
+    let create = request(
+        workspace,
+        "operation-cancellation",
+        9_999,
+        "operation-cancellation",
+    );
+    store
+        .create_cat_covered_without_admission_for_product_test(&create)
+        .unwrap();
+    create.candidate.operation_id
 }
 
 #[test]
@@ -1894,6 +1908,184 @@ fn runtime_operation_exact_get_is_workspace_qualified_and_projection_closed() {
             .get_runtime_operation(&workspace, &operation.operation_id)
             .unwrap(),
         RuntimeOperationRead::Corrupt
+    );
+}
+
+#[test]
+fn runtime_operation_exact_get_reaches_all_scalar_and_record_key_combinations() {
+    for drift in [
+        "record keys",
+        "scalar operation",
+        "scalar workspace",
+        "both scalar keys",
+    ] {
+        let (_url, store, _second, workspace) = stores();
+        let create = request(&workspace, "operation-key-drift", 1, "operation-key-drift");
+        store
+            .create_cat_covered_without_admission_for_product_test(&create)
+            .unwrap();
+        let operation_id = create.candidate.operation_id.clone();
+        store
+            .with(|client| {
+                match drift {
+                    "record keys" => {
+                        client.execute(
+                            "UPDATE runtime_operations
+                                SET record=jsonb_set(
+                                    jsonb_set(
+                                        record, '{workspace_id}',
+                                        to_jsonb('ws_record_drift'::TEXT), FALSE
+                                    ),
+                                    '{operation_id}',
+                                    to_jsonb('op_record_drift'::TEXT), FALSE
+                                )
+                              WHERE operation_id=$1",
+                            &[&operation_id.as_str()],
+                        )?;
+                    }
+                    "scalar operation" => {
+                        client.execute(
+                            "UPDATE runtime_operations
+                                SET operation_id='op_scalar_drift'
+                              WHERE operation_id=$1",
+                            &[&operation_id.as_str()],
+                        )?;
+                    }
+                    "scalar workspace" | "both scalar keys" => {
+                        client
+                            .batch_execute("ALTER TABLE runtime_operations DISABLE TRIGGER ALL")?;
+                        let scalar_operation_id = if drift == "both scalar keys" {
+                            "op_scalar_drift"
+                        } else {
+                            operation_id.as_str()
+                        };
+                        client.execute(
+                            "UPDATE runtime_operations
+                                SET workspace_id='ws_scalar_drift', operation_id=$2
+                              WHERE operation_id=$1",
+                            &[&operation_id.as_str(), &scalar_operation_id],
+                        )?;
+                        client
+                            .batch_execute("ALTER TABLE runtime_operations ENABLE TRIGGER ALL")?;
+                    }
+                    _ => unreachable!(),
+                }
+                Ok(())
+            })
+            .unwrap();
+
+        assert_eq!(
+            store
+                .get_runtime_operation(&workspace, &operation_id)
+                .unwrap(),
+            RuntimeOperationRead::Corrupt,
+            "{drift} drift escaped the workspace-qualified reachability set"
+        );
+    }
+}
+
+#[test]
+fn runtime_operation_exact_get_rejects_duplicates_but_ignores_foreign_and_missing_rows() {
+    let (_url, store, _second, workspace) = stores();
+    let first = request(&workspace, "operation-first", 1, "operation-first");
+    let second = request(&workspace, "operation-second", 2, "operation-second");
+    store
+        .create_cat_covered_without_admission_for_product_test(&first)
+        .unwrap();
+    store
+        .create_cat_covered_without_admission_for_product_test(&second)
+        .unwrap();
+
+    let foreign_workspace = bootstrap_workspace(&store, "operation-foreign");
+    let foreign = request(
+        &foreign_workspace,
+        "operation-foreign",
+        3,
+        "operation-foreign",
+    );
+    store
+        .create_cat_covered_without_admission_for_product_test(&foreign)
+        .unwrap();
+    assert_eq!(
+        store
+            .get_runtime_operation(&workspace, &foreign.candidate.operation_id)
+            .unwrap(),
+        RuntimeOperationRead::NotFound
+    );
+    assert_eq!(
+        store
+            .get_runtime_operation(&workspace, &id("op_missing"))
+            .unwrap(),
+        RuntimeOperationRead::NotFound
+    );
+
+    store
+        .with(|client| {
+            client.execute(
+                "UPDATE runtime_operations
+                    SET record=jsonb_set(
+                        record, '{operation_id}', to_jsonb($2::TEXT), FALSE
+                    )
+                  WHERE operation_id=$1",
+                &[
+                    &second.candidate.operation_id.as_str(),
+                    &first.candidate.operation_id.as_str(),
+                ],
+            )
+        })
+        .unwrap();
+    assert_eq!(
+        store
+            .get_runtime_operation(&workspace, &first.candidate.operation_id)
+            .unwrap(),
+        RuntimeOperationRead::Corrupt
+    );
+}
+
+#[test]
+fn runtime_operation_exact_get_has_four_bounded_workspace_indexes() {
+    let (_url, store, _second, workspace) = stores();
+    let operation_id = id("op_plan_probe");
+    let plan = store
+        .with(|client| {
+            let mut transaction = client.transaction()?;
+            transaction.batch_execute("SET LOCAL enable_seqscan=off")?;
+            let rows = transaction.query(
+                &format!(
+                    "EXPLAIN (COSTS OFF) {}",
+                    operation_by_workspace_candidates_sql()
+                ),
+                &[&workspace.as_str(), &operation_id.as_str()],
+            )?;
+            Ok(rows
+                .into_iter()
+                .map(|row| row.get::<_, String>(0))
+                .collect::<Vec<_>>()
+                .join("\n"))
+        })
+        .unwrap();
+
+    for index in [
+        "runtime_operations_lookup_scalar_scalar",
+        "runtime_operations_lookup_scalar_record",
+        "runtime_operations_lookup_record_scalar",
+        "runtime_operations_lookup_record_record",
+    ] {
+        assert!(
+            plan.contains(index),
+            "workspace-qualified selector did not use {index}:\n{plan}"
+        );
+    }
+    assert!(
+        !plan.contains("Seq Scan on runtime_operations"),
+        "runtime Operation lookup planned an unbounded scan:\n{plan}"
+    );
+    assert_eq!(
+        operation_by_workspace_candidates_sql()
+            .matches("LIMIT 2")
+            .count(),
+        4,
+        "every indexed projection branch must retain its own candidate bound"
     );
 }
 

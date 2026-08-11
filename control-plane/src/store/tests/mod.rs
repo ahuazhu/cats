@@ -1133,6 +1133,35 @@ fn refuses_missing_or_replaced_authorization_indexes_without_repair() {
 }
 
 #[test]
+fn refuses_missing_runtime_operation_lookup_indexes_without_repair() {
+    for index in [
+        "runtime_operations_lookup_scalar_scalar",
+        "runtime_operations_lookup_scalar_record",
+        "runtime_operations_lookup_record_scalar",
+        "runtime_operations_lookup_record_record",
+    ] {
+        let url = crate::testsupport::isolated_control_store_url();
+        drop(Store::connect(&url, None).unwrap());
+        let mut admin = postgres::Client::connect(&url, postgres::NoTls).unwrap();
+        admin.batch_execute(&format!("DROP INDEX {index}")).unwrap();
+
+        let Err(error) = Store::connect(&url, None) else {
+            panic!("a stamped schema missing {index} must fail closed");
+        };
+        assert_eq!(error.code, ErrorCode::FailedPrecondition);
+        assert!(error.to_string().contains(index), "{error}");
+        let definition: Option<String> = admin
+            .query_one("SELECT pg_get_indexdef(to_regclass($1))", &[&index])
+            .unwrap()
+            .get(0);
+        assert!(
+            definition.is_none(),
+            "startup recreated deliberately dropped {index}: {definition:?}"
+        );
+    }
+}
+
+#[test]
 fn refuses_missing_or_weakened_volume_owner_constraints_without_repair() {
     for (constraint, ddl, expected_definition) in [
         (

@@ -36,7 +36,7 @@ pub(crate) mod cat_create_service_tests;
 mod persistent_disk_create_service_tests;
 
 #[cfg(test)]
-mod product_tests;
+pub(crate) mod product_tests;
 
 #[cfg(test)]
 mod placement_policy_tests;

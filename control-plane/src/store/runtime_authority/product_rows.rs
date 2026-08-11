@@ -1108,19 +1108,62 @@ pub(super) fn load_operation_by_workspace_unlocked(
     workspace_id: &Id,
     operation_id: &Id,
 ) -> Result<RuntimeOperationRead> {
-    let sql = format!(
-        "SELECT {OPERATION_COLUMNS} FROM runtime_operations
-          WHERE workspace_id=$1 AND operation_id=$2"
-    );
-    let row = store
-        .with(|client| client.query_opt(&sql, &[&workspace_id.as_str(), &operation_id.as_str()]))?;
-    Ok(match row {
-        None => RuntimeOperationRead::NotFound,
-        Some(row) => match decode_operation_row(&row) {
-            Ok(operation) => RuntimeOperationRead::Found(Box::new(operation)),
-            Err(_) => RuntimeOperationRead::Corrupt,
-        },
-    })
+    let sql = operation_by_workspace_candidates_sql();
+    let rows = store
+        .with(|client| client.query(&sql, &[&workspace_id.as_str(), &operation_id.as_str()]))?;
+    if rows.len() > 1 {
+        return Ok(RuntimeOperationRead::Corrupt);
+    }
+    let Some(row) = rows.first() else {
+        return Ok(RuntimeOperationRead::NotFound);
+    };
+    let Ok(operation) = decode_operation_row(row) else {
+        return Ok(RuntimeOperationRead::Corrupt);
+    };
+    if operation.workspace_id != *workspace_id || operation.operation_id != *operation_id {
+        return Ok(RuntimeOperationRead::Corrupt);
+    }
+    Ok(RuntimeOperationRead::Found(Box::new(operation)))
+}
+
+/// Find every bounded row that can claim the workspace-qualified Operation
+/// key through either its scalar or canonical JSON projection. The four
+/// branches are deliberately disjoint: each has its own exact two-key index
+/// and reads at most two rows, so duplicate corruption cannot turn this API
+/// into an unbounded scan.
+pub(super) fn operation_by_workspace_candidates_sql() -> String {
+    format!(
+        "(SELECT {OPERATION_COLUMNS} FROM runtime_operations
+           WHERE workspace_id COLLATE \"C\"=$1 AND operation_id COLLATE \"C\"=$2
+           LIMIT 2)
+         UNION ALL
+         (SELECT {OPERATION_COLUMNS} FROM runtime_operations
+           WHERE workspace_id COLLATE \"C\"=$1
+             AND (record->>'operation_id') COLLATE \"C\"=$2
+             AND operation_id COLLATE \"C\"<>$2
+             AND operation_id COLLATE \"C\" IS DISTINCT FROM
+                 (record->>'operation_id') COLLATE \"C\"
+           LIMIT 2)
+         UNION ALL
+         (SELECT {OPERATION_COLUMNS} FROM runtime_operations
+           WHERE (record->>'workspace_id') COLLATE \"C\"=$1
+             AND operation_id COLLATE \"C\"=$2
+             AND workspace_id COLLATE \"C\"<>$1
+             AND workspace_id COLLATE \"C\" IS DISTINCT FROM
+                 (record->>'workspace_id') COLLATE \"C\"
+           LIMIT 2)
+         UNION ALL
+         (SELECT {OPERATION_COLUMNS} FROM runtime_operations
+           WHERE (record->>'workspace_id') COLLATE \"C\"=$1
+             AND (record->>'operation_id') COLLATE \"C\"=$2
+             AND workspace_id COLLATE \"C\"<>$1
+             AND operation_id COLLATE \"C\"<>$2
+             AND workspace_id COLLATE \"C\" IS DISTINCT FROM
+                 (record->>'workspace_id') COLLATE \"C\"
+             AND operation_id COLLATE \"C\" IS DISTINCT FROM
+                 (record->>'operation_id') COLLATE \"C\"
+           LIMIT 2)"
+    )
 }
 
 pub(super) fn load_operation_by_cat_revision_unlocked(

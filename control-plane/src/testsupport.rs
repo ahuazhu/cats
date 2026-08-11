@@ -6,8 +6,114 @@
 //! is treated as disposable; schemas are created and never dropped.
 
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use postgres::NoTls;
+
+/// Hold an isolated test schema's runtime_operations table at an
+/// ACCESS-EXCLUSIVE barrier and report when one production Store query is
+/// waiting behind it. This is shared by unit and cross-router cancellation
+/// tests so both prove that the blocking Store closure has been claimed.
+pub struct RuntimeOperationsTableLockForTest {
+    blocked: tokio::sync::oneshot::Receiver<bool>,
+    release: Option<std::sync::mpsc::Sender<()>>,
+    worker: Option<std::thread::JoinHandle<()>>,
+}
+
+impl RuntimeOperationsTableLockForTest {
+    pub async fn acquire(dsn: &str) -> Self {
+        let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
+        let (blocked_tx, blocked_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let dsn = dsn.to_owned();
+        let worker = std::thread::spawn(move || {
+            let mut client = postgres::Client::connect(&dsn, postgres::NoTls).unwrap();
+            client
+                .batch_execute(
+                    "BEGIN;
+                     SET LOCAL lock_timeout='5s';
+                     LOCK TABLE runtime_operations IN ACCESS EXCLUSIVE MODE",
+                )
+                .unwrap();
+            let own_pid: i32 = client
+                .query_one("SELECT pg_backend_pid()", &[])
+                .unwrap()
+                .get(0);
+            ready_tx.send(()).unwrap();
+
+            let deadline = Instant::now() + Duration::from_secs(5);
+            loop {
+                if release_rx.try_recv().is_ok() {
+                    client.batch_execute("ROLLBACK").unwrap();
+                    return;
+                }
+                let blocked: bool = client
+                    .query_one(
+                        "SELECT EXISTS (
+                            SELECT 1
+                              FROM pg_locks waiting
+                              JOIN pg_class relation ON relation.oid=waiting.relation
+                              JOIN pg_namespace namespace
+                                ON namespace.oid=relation.relnamespace
+                             WHERE waiting.pid<>$1 AND NOT waiting.granted
+                               AND waiting.locktype='relation'
+                               AND namespace.nspname=current_schema()
+                               AND relation.relname='runtime_operations'
+                         )",
+                        &[&own_pid],
+                    )
+                    .unwrap()
+                    .get(0);
+                if blocked || Instant::now() >= deadline {
+                    let _ = blocked_tx.send(blocked);
+                    break;
+                }
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            let _ = release_rx.recv_timeout(Duration::from_secs(10));
+            client.batch_execute("ROLLBACK").unwrap();
+        });
+        tokio::time::timeout(Duration::from_secs(5), ready_rx)
+            .await
+            .expect("runtime_operations table lock was not acquired")
+            .expect("runtime_operations table-lock worker stopped");
+        Self {
+            blocked: blocked_rx,
+            release: Some(release_tx),
+            worker: Some(worker),
+        }
+    }
+
+    pub async fn wait_until_query_blocked(&mut self) {
+        assert!(
+            tokio::time::timeout(Duration::from_secs(6), &mut self.blocked)
+                .await
+                .expect("runtime Operation query did not reach the PostgreSQL lock barrier")
+                .expect("runtime_operations table-lock worker stopped"),
+            "runtime Operation query never blocked on runtime_operations"
+        );
+    }
+
+    pub fn release(mut self) {
+        if let Some(release) = self.release.take() {
+            let _ = release.send(());
+        }
+        if let Some(worker) = self.worker.take() {
+            worker.join().unwrap();
+        }
+    }
+}
+
+impl Drop for RuntimeOperationsTableLockForTest {
+    fn drop(&mut self) {
+        if let Some(release) = self.release.take() {
+            let _ = release.send(());
+        }
+        if let Some(worker) = self.worker.take() {
+            let _ = worker.join();
+        }
+    }
+}
 
 struct UnavailableImageBlob;
 
