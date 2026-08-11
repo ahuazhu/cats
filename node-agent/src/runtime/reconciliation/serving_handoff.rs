@@ -4569,14 +4569,26 @@ mod tests {
                 .any(|process| process == &root_public)
                 .then_some(root_proof);
 
-            let serving_expectation = ServingBlockdExpectation::from_handoff(
-                &ready,
-                &serving_systemd_config(fixture),
-                checkpoint,
-                desired,
-                &fixture.authority.volume,
-            )
-            .unwrap();
+            let serving_expectation =
+                if matches!(&checkpoint.step, ReconcileStep::StartRuntime { .. }) {
+                    ServingBlockdExpectation::from_running_handoff(
+                        &ready,
+                        &serving_systemd_config(fixture),
+                        checkpoint,
+                        desired,
+                        &fixture.authority.volume,
+                    )
+                    .unwrap()
+                } else {
+                    ServingBlockdExpectation::from_handoff(
+                        &ready,
+                        &serving_systemd_config(fixture),
+                        checkpoint,
+                        desired,
+                        &fixture.authority.volume,
+                    )
+                    .unwrap()
+                };
             let serving_proof = serving_expectation
                 .clone()
                 .prove_exact_process(serving_expectation.exact_evidence_for_test(51))

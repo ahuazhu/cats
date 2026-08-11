@@ -286,6 +286,20 @@ impl ServingBlockdExpectation {
         Self::from_command(volume, command, prepared)
     }
 
+    /// Build the scanner-shaped expectation used by retained-Running tests.
+    /// Unlike the start-time expectation, it binds a renewed current lease.
+    #[cfg(test)]
+    pub(crate) fn from_running_handoff(
+        ready: &PrepareDeviceHandoffReady,
+        systemd: &RootProvisionSystemdConfig,
+        checkpoint: &RuntimeCheckpoint,
+        desired: &DesiredRuntimeSpec,
+        authority: &VolumeRecord,
+    ) -> anyhow::Result<Self> {
+        Self::from_handoff(ready, systemd, checkpoint, desired, authority)?
+            .with_current_authority(checkpoint, authority)
+    }
+
     fn from_command(
         volume: AuthorizedBlockdCheckpoint,
         command: std::process::Command,
