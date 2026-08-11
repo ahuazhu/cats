@@ -4018,16 +4018,18 @@ impl RootProcessInventoryBridge for PlatformRootProcessInventoryBridge {
     fn serving_expectation(
         &self,
         checkpoint: &RuntimeCheckpoint,
-        desired: &DesiredRuntimeSpec,
+        physical_desired: &DesiredRuntimeSpec,
+        gate_desired: &DesiredRuntimeSpec,
         prepared: &cats_api::runtime_reconciliation::PreparedDeviceInput,
         blockd: &AuthorizedBlockdInventoryEvidence,
         authority: &VolumeRecord,
     ) -> anyhow::Result<ServingBlockdExpectation> {
-        ServingBlockdExpectation::from_inventory(
+        ServingBlockdExpectation::from_inventory_running(
             &self.state_directory,
             &self.root_provision_systemd,
             checkpoint,
-            desired,
+            physical_desired,
+            gate_desired,
             prepared,
             blockd,
             authority,
@@ -8431,16 +8433,18 @@ mod tests {
         fn serving_expectation(
             &self,
             checkpoint: &RuntimeCheckpoint,
-            desired: &DesiredRuntimeSpec,
+            physical_desired: &DesiredRuntimeSpec,
+            gate_desired: &DesiredRuntimeSpec,
             prepared: &PreparedDeviceInput,
             blockd: &AuthorizedBlockdInventoryEvidence,
             authority: &VolumeRecord,
         ) -> anyhow::Result<ServingBlockdExpectation> {
-            ServingBlockdExpectation::from_inventory(
+            ServingBlockdExpectation::from_inventory_running(
                 &self.state_directory,
                 &self.systemd,
                 checkpoint,
-                desired,
+                physical_desired,
+                gate_desired,
                 prepared,
                 blockd,
                 authority,
@@ -12890,6 +12894,109 @@ mod tests {
                 .lifecycle_admission(),
             LifecycleAdmission::Closed,
         );
+
+        // The blockd artifacts deliberately remain bound to the immutable
+        // launch Desired (R0). A later stable Endpoint-only Desired (R1) must
+        // be rescannable from those Superseded artifacts without rewriting
+        // storage launch provenance.
+        let mut gate_desired = desired.clone();
+        gate_desired.desired_revision = Revision::new(desired.desired_revision.get() + 1).unwrap();
+        let endpoint_template =
+            cats_api::runtime_reconciliation::decode_desired_runtime_spec(include_bytes!(concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/../testdata/runtime-reconciliation-v1-desired.json"
+            )))
+            .unwrap()
+            .endpoints
+            .remove(0);
+        gate_desired.endpoints = vec![endpoint_template.clone()];
+        gate_desired.spec_digest = spec_digest(&gate_desired).unwrap();
+        let mut gate_stable = stable;
+        gate_stable.desired_revision = gate_desired.desired_revision;
+        gate_stable.spec_digest = gate_desired.spec_digest.clone();
+        gate_stable.updated_at_unix_ms =
+            UnixMillis::new(gate_stable.updated_at_unix_ms.get() + 1).unwrap();
+        let runtime_incarnation = gate_stable
+            .runtime_launch
+            .identity()
+            .unwrap()
+            .runtime_incarnation
+            .clone();
+        gate_stable.route_gates = vec![cats_api::runtime_reconciliation::CheckpointRouteGate {
+            binding: cats_api::runtime_reconciliation::RouteGateBinding {
+                workspace_id: gate_desired.workspace_id.clone(),
+                endpoint_id: endpoint_template.endpoint_id,
+                hostname: endpoint_template.hostname,
+                cat_id: gate_desired.cat_id.clone(),
+                node_id: gate_desired.placement.node_id.clone(),
+                runtime_incarnation,
+                route_epoch: endpoint_template.route_epoch,
+                protocol: endpoint_template.protocol,
+                target_port: endpoint_template.target_port,
+            },
+            gate: cats_api::runtime_reconciliation::RouteGateState::Active,
+        }];
+        let active_session = registry
+            .existing_session(&desired.cat_id)
+            .unwrap()
+            .expect("successful admission retains its checkpoint writer");
+        let predecessor = active_session.checkpoint_store().load().unwrap().unwrap();
+        active_session
+            .checkpoint_store()
+            .replace(&predecessor, &gate_stable)
+            .unwrap();
+        let mut gate_scan_context = scan_context.clone();
+        gate_scan_context.coordinates_mut().desired.desired_specs[0] = gate_desired.clone();
+        let authority: Arc<dyn VolumeDataAuthority> = Arc::new(ExactVolumeSetDataAuthority {
+            records: records.clone(),
+        });
+        let bridge = Arc::new(ExactRunningProcessBridge {
+            state_directory: state_directory.clone(),
+            systemd: test_root_provision_systemd(&environment.blockd_binary),
+            executable_path: HostPath::new(
+                environment.blockd_binary.to_string_lossy().into_owned(),
+            )
+            .unwrap(),
+            exact_vmms: true,
+        });
+        let mut config = environment.config();
+        if let Some(client) = &kernel_nbd_client {
+            config.kernel_nbd_inventory_port = Some(KernelNbdInventoryPort::new(
+                KernelNbdInventoryConfig::fixture(
+                    state_directory.clone(),
+                    environment.block_root.clone(),
+                    environment.proc_root.clone(),
+                    client.clone(),
+                    u32::try_from(gate_desired.volumes.len()).unwrap(),
+                ),
+            ));
+        }
+        let endpoint_registry = AdmissionCellRegistry::for_state_directory(&state_directory);
+        let endpoint_scanner = scanner_with_metadata_authority_and_blob(
+            config,
+            Arc::new(VolumeDataAuthorityMetadataReader::start(authority).unwrap()),
+            None,
+        )
+        .unwrap()
+        .with_root_process_bridge_for_test(bridge)
+        .with_network_bridge(Arc::new(ExactRunningNetworkBridge))
+        .with_running_tail_transport_for_test(
+            endpoint_registry,
+            Arc::new(ExactRunningGuestReadyPort {
+                calls: Arc::clone(&guest_calls),
+                fault: RunningGuestReadyFault::Exact,
+            }),
+        );
+        let RuntimeInventoryScanOutcome::Complete(mut gate_inventory) =
+            endpoint_scanner.scan_complete(gate_scan_context).unwrap()
+        else {
+            panic!("R0 blockd artifacts plus current Stable/Open R1 must rescan exactly")
+        };
+        assert_eq!(
+            gate_inventory.runtimes()[0].processes.len(),
+            gate_desired.volumes.len() + 1,
+        );
+        assert!(gate_inventory.take_running_tail_admission().is_some());
         drop(listeners);
     }
 

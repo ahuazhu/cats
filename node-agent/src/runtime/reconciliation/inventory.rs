@@ -188,7 +188,8 @@ pub(crate) trait RootProcessInventoryBridge:
     fn serving_expectation(
         &self,
         checkpoint: &RuntimeCheckpoint,
-        desired: &DesiredRuntimeSpec,
+        physical_desired: &DesiredRuntimeSpec,
+        gate_desired: &DesiredRuntimeSpec,
         prepared: &cats_api::runtime_reconciliation::PreparedDeviceInput,
         blockd: &AuthorizedBlockdInventoryEvidence,
         authority: &VolumeRecord,
@@ -1357,40 +1358,33 @@ fn serving_process_expectations_inner(
             blockds.len() == devices.len(),
             "prepared-device checkpoint and AuthorizedBlockd inventory differ in exact size"
         );
-        let artifact_desired = blockds
+        let physical_desired = blockds
             .values()
             .next()
-            .map(|blockd| &blockd.checkpoint.desired)
-            .context("prepared-device checkpoint has no AuthorizedBlockd Desired")?;
-        anyhow::ensure!(
-            blockds
-                .values()
-                .all(|blockd| &blockd.checkpoint.desired == artifact_desired),
-            "prepared-device checkpoint has mixed AuthorizedBlockd Desired lineage"
-        );
-        // Once a VMM has launched, AuthorizedBlockd is immutable physical
-        // provenance. Endpoint-only Desired revisions deliberately advance
-        // the checkpoint/cell tuple without rewriting that artifact, so the
-        // process expectation must remain bound to its exact launch Desired.
-        let physical_desired = if checkpoint.checkpoint.runtime_launch.identity().is_some()
-            || checkpoint.binding != DesiredCheckpointBinding::Current
-        {
-            artifact_desired
+            .context("prepared-device checkpoint lacks immutable physical Desired")?
+            .checkpoint
+            .desired
+            .clone();
+        super::authorized_blockd::validate_running_physical_desired_successor(
+            &physical_desired,
+            desired,
+        )?;
+        let expected_blockd_binding = if physical_desired == *desired {
+            DesiredCheckpointBinding::Current
         } else {
-            desired
+            DesiredCheckpointBinding::Superseded
         };
         anyhow::ensure!(
-            super::network::prepared_device_set_is_exact(physical_desired, &devices),
-            "prepared-device checkpoint does not cover its exact physical Desired Volume set"
+            blockds.values().all(|blockd| {
+                blockd.checkpoint.desired == physical_desired
+                    && blockd.binding == expected_blockd_binding
+            }),
+            "prepared-device AuthorizedBlockd set does not share one exact physical Desired"
         );
         for prepared in devices {
             let blockd = blockds
                 .get(&prepared.volume_id)
                 .context("prepared device lacks its AuthorizedBlockd lineage")?;
-            anyhow::ensure!(
-                blockd.binding == checkpoint.binding,
-                "prepared device and AuthorizedBlockd binding disagree"
-            );
             let authority = volumes_by_cat
                 .get(&desired.cat_id)
                 .and_then(|volumes| {
@@ -1401,7 +1395,8 @@ fn serving_process_expectations_inner(
                 .context("serving blockd process lacks its raw authority VolumeRecord")?;
             let expectation = bridge.serving_expectation(
                 &checkpoint.checkpoint,
-                physical_desired,
+                &physical_desired,
+                desired,
                 &prepared,
                 blockd,
                 &authority.record,
@@ -1548,9 +1543,17 @@ fn runtime_from_inventory(
             (ReconcileStep::Quarantined, VolumeAuthorityEvidence::Unowned { .. }) => true,
             _ => false,
         };
+        let retained_running_physical_launch =
+            runtime_checkpoint.runtime_launch.identity().is_some()
+                && super::authorized_blockd::validate_running_physical_desired_successor(
+                    &blockd.checkpoint.desired,
+                    desired,
+                )
+                .is_ok();
         let mixed_binding_is_closed = checkpoint_binding == DesiredCheckpointBinding::Current
             && blockd.binding == DesiredCheckpointBinding::Superseded
-            && current_checkpoint_adopts_blockd(runtime_checkpoint, attachment);
+            && (current_checkpoint_adopts_blockd(runtime_checkpoint, attachment)
+                || retained_running_physical_launch);
         anyhow::ensure!(
             blockd.binding == checkpoint_binding || mixed_binding_is_closed,
             "Runtime and authorized blockd checkpoint bindings disagree"
