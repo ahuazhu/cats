@@ -10,10 +10,11 @@ use cats_api::agent_registration::AuthenticatedNodeCredential;
 use cats_api::runtime_reconciliation::{
     encode_runtime_volume_transition_evidence_request, encode_runtime_volume_transition_request,
     AcquireOrigin, AgentSession, AssignedPlacement, CleanupRelease, CleanupTarget, ContractError,
-    ContractErrorDetail, ContractVersion, CredentialBinding, DesiredRuntimeSpec, DiskKind, Id,
-    LocalLineageState, NodeIdentity, NodeIdentityState, NodeResidue, ObservedDiskKind,
-    ObservedRuntimeStatus, ProcessRole, Revision, RuntimeTarget, RuntimeVolumeAuthorityRejection,
-    RuntimeVolumeAuthorizationRejection, RuntimeVolumeTransition,
+    ContractErrorDetail, ContractVersion, CredentialBinding, DesiredRuntimeSpec, DiskKind,
+    FilesystemInitialization, Id, LocalLineageState, NodeIdentity, NodeIdentityState, NodeResidue,
+    ObservedDiskKind, ObservedRuntimeStatus, PersistentFilesystemBinding,
+    PersistentInitializationReceipt, ProcessRole, Revision, RuntimeTarget,
+    RuntimeVolumeAuthorityRejection, RuntimeVolumeAuthorizationRejection, RuntimeVolumeTransition,
     RuntimeVolumeTransitionEvidenceRequest, RuntimeVolumeTransitionOutcome,
     RuntimeVolumeTransitionPreconditionProblem, RuntimeVolumeTransitionRequest,
     RuntimeVolumeTransitionSuccess, SessionBinding, Sha256Digest, UnixMillis, VolumeAcquire,
@@ -28,7 +29,10 @@ use cats_storage::authority::{
 };
 use postgres::Transaction;
 
-use super::product::{DiskAdminState, DiskRecord, DiskRole};
+use super::product::{
+    persistent_initialization_matches_mount, DiskAdminState, DiskRecord, DiskRole,
+    PersistentDiskInitialization,
+};
 use super::product_rows::{
     load_any_disk_snapshot_for_update, load_cat_by_id_for_update, load_desired_for_update,
     load_disk_by_id_for_update, load_pending_operation_by_cat_for_update, update_disk,
@@ -349,6 +353,10 @@ fn runtime_volume_transition_in(
         RuntimeVolumeTransition::DeleteDisposableRoot { authorization_id } => {
             execute_disposable_delete(context, authorization_id)?
         }
+        RuntimeVolumeTransition::CommitInitialized {
+            filesystem,
+            new_remote_head,
+        } => execute_commit_initialized(context, filesystem, new_remote_head)?,
     };
     Ok(match outcome {
         VolumeTransitionStoreOutcome::Accepted(outcome) => {
@@ -493,8 +501,18 @@ fn execute_normal_acquire(
     else {
         return Err(AuthorityError::BackendUnknown.into());
     };
-    if !disk_and_volume_match_intent(&disk, &volume, &locked_desired, locked_intent) {
+    if !matches!(disk.admin_state, DiskAdminState::Active)
+        || !disk_and_volume_common_identity_matches_intent(
+            &disk,
+            &volume,
+            &locked_desired,
+            locked_intent,
+        )
+    {
         return Err(AuthorityError::BackendUnknown.into());
+    }
+    if !disk_and_volume_identity_matches_intent(&disk, &volume, &locked_desired, locked_intent) {
+        return Ok(volume_intent_rejected_for_cat(&context.desired.cat_id));
     }
     if !normal_physical_evidence_is_safe(&context, &intent, &volume, &request) {
         return Ok(precondition_rejected(
@@ -534,6 +552,135 @@ fn execute_normal_acquire(
                 acquire_origin: AcquireOrigin::Normal {
                     transition_id: result.transition_id,
                 },
+            },
+        },
+    ))
+}
+
+fn execute_commit_initialized(
+    context: LockedMutationContext<'_, '_>,
+    filesystem: &PersistentFilesystemBinding,
+    new_remote_head: &cats_api::runtime_reconciliation::RemoteHead,
+) -> AuthorityTxResult<VolumeTransitionStoreOutcome<RuntimeVolumeTransitionOutcome>> {
+    if context.desired.target != RuntimeTarget::Running {
+        return Ok(volume_intent_rejected_for_cat(&context.desired.cat_id));
+    }
+    let Some(intent) = unique_intent(&context.desired, |intent| {
+        persistent_filesystem_binding_matches_intent(filesystem, intent)
+    })?
+    .cloned() else {
+        return Ok(volume_intent_rejected_for_cat(&context.desired.cat_id));
+    };
+
+    // The data plane has already published the initialization writes.  Lock
+    // the exact current Volume before the Disk/current-Desired suffix and
+    // accept only that complete nonblank head as the CAS result.
+    let stored_volume = load_stored_volume_for_update(context.transaction, &intent.volume_id)?
+        .ok_or(AuthorityError::BackendUnknown)?;
+    let volume = stored_volume.record;
+    let (mut disk, locked_desired) =
+        lock_product_context(context.transaction, &context.desired, &intent, false)?;
+    let Some(locked_intent) = unique_intent(&locked_desired, |candidate| candidate == &intent)?
+    else {
+        return Err(AuthorityError::BackendUnknown.into());
+    };
+
+    if !disk_and_volume_common_identity_matches_intent(
+        &disk,
+        &volume,
+        &locked_desired,
+        locked_intent,
+    ) || !persistent_filesystem_binding_matches_intent(filesystem, locked_intent)
+        || !commit_initialized_volume_authority_matches(
+            &context,
+            &stored_volume.owner_binding,
+            &volume,
+            filesystem,
+            new_remote_head,
+        )
+        || !commit_initialized_physical_evidence_matches(
+            &context,
+            locked_intent,
+            filesystem,
+            new_remote_head,
+        )
+    {
+        return Ok(volume_intent_rejected_for_cat(&context.desired.cat_id));
+    }
+
+    let (initialization_token, filesystem_uuid, expected_blank_head, initialized_at, update) =
+        match &disk.role {
+            DiskRole::Persistent { initialization } => match initialization.as_ref() {
+                PersistentDiskInitialization::Uninitialized {
+                    initialization_token,
+                    filesystem_uuid,
+                    expected_blank_head,
+                } if persistent_disk_commit_tuple_matches(
+                    filesystem,
+                    initialization_token,
+                    filesystem_uuid,
+                    expected_blank_head,
+                ) =>
+                {
+                    (
+                        initialization_token.clone(),
+                        filesystem_uuid.clone(),
+                        expected_blank_head.clone(),
+                        context.db_now,
+                        true,
+                    )
+                }
+                PersistentDiskInitialization::Initialized {
+                    initialization_token,
+                    filesystem_uuid,
+                    expected_blank_head,
+                    initialized_head,
+                    initialized_at,
+                } if persistent_disk_commit_tuple_matches(
+                    filesystem,
+                    initialization_token,
+                    filesystem_uuid,
+                    expected_blank_head,
+                ) && initialized_head == new_remote_head =>
+                {
+                    (
+                        initialization_token.clone(),
+                        filesystem_uuid.clone(),
+                        expected_blank_head.clone(),
+                        *initialized_at,
+                        false,
+                    )
+                }
+                _ => return Ok(volume_intent_rejected_for_cat(&context.desired.cat_id)),
+            },
+            DiskRole::Root { .. } => {
+                return Ok(volume_intent_rejected_for_cat(&context.desired.cat_id));
+            }
+        };
+
+    if update {
+        disk.role = DiskRole::Persistent {
+            initialization: Box::new(PersistentDiskInitialization::Initialized {
+                initialization_token: initialization_token.clone(),
+                filesystem_uuid: filesystem_uuid.clone(),
+                expected_blank_head: expected_blank_head.clone(),
+                initialized_head: new_remote_head.clone(),
+                initialized_at,
+            }),
+        };
+        update_disk(context.transaction, &disk)?;
+    }
+
+    Ok(VolumeTransitionStoreOutcome::Accepted(
+        RuntimeVolumeTransitionOutcome::PersistentInitialized {
+            receipt: PersistentInitializationReceipt {
+                disk_id: disk.disk_id,
+                volume_id: volume.volume_id,
+                initialization_token,
+                filesystem_uuid,
+                expected_blank_head,
+                initialized_head: new_remote_head.clone(),
+                initialized_at,
             },
         },
     ))
@@ -934,6 +1081,224 @@ fn lock_product_context(
         return Err(AuthorityError::BackendUnknown.into());
     }
     Ok((disk, locked_desired))
+}
+
+fn persistent_filesystem_binding_matches_intent(
+    filesystem: &PersistentFilesystemBinding,
+    intent: &VolumeIntent,
+) -> bool {
+    let Some(mount) = intent.mount.as_ref() else {
+        return false;
+    };
+    intent.disk_kind == DiskKind::Persistent
+        && intent.volume_intent_id == filesystem.volume_intent_id
+        && intent.disk_id == filesystem.disk_id
+        && intent.volume_id == filesystem.volume_id
+        && intent.attachment_id == filesystem.attachment_id
+        && intent.size_bytes == filesystem.size_bytes
+        && intent.guest_device == filesystem.guest_device
+        && mount.filesystem_uuid == filesystem.filesystem_uuid
+        && mount.mount_path == filesystem.mount_path
+        && mount.initialization == filesystem.initialization
+        && matches!(
+            filesystem.initialization,
+            FilesystemInitialization::Initialize { .. }
+        )
+}
+
+fn persistent_disk_commit_tuple_matches(
+    filesystem: &PersistentFilesystemBinding,
+    initialization_token: &cats_api::runtime_reconciliation::RandomId128,
+    filesystem_uuid: &cats_api::runtime_reconciliation::RandomId128,
+    expected_blank_head: &cats_api::runtime_reconciliation::RemoteHead,
+) -> bool {
+    filesystem.filesystem_uuid == *filesystem_uuid
+        && matches!(
+            &filesystem.initialization,
+            FilesystemInitialization::Initialize {
+                initialization_token: presented_token,
+                expected_blank_head: presented_blank,
+            } if presented_token == initialization_token
+                && presented_blank == expected_blank_head
+        )
+}
+
+fn commit_initialized_volume_authority_matches(
+    context: &LockedMutationContext<'_, '_>,
+    owner_binding: &Option<VolumeOwnerBinding>,
+    volume: &VolumeRecord,
+    filesystem: &PersistentFilesystemBinding,
+    new_remote_head: &cats_api::runtime_reconciliation::RemoteHead,
+) -> bool {
+    matches!(
+        volume.admin_state,
+        cats_storage::authority::VolumeAdminState::Active
+    ) && volume.volume_id == filesystem.volume_id
+        && volume.lease_owner.as_ref() == Some(&filesystem.attachment_id)
+        && volume.lease_epoch == filesystem.attachment_epoch
+        && volume.head == *new_remote_head
+        && new_remote_head.generation.get() > 0
+        && owner_binding.as_ref().is_some_and(|binding| {
+            binding.volume_id == filesystem.volume_id
+                && binding.owner_node_id == context.node_id
+                && binding.attachment_id == filesystem.attachment_id
+                && binding.attachment_epoch == filesystem.attachment_epoch
+        })
+}
+
+fn commit_initialized_physical_evidence_matches(
+    context: &LockedMutationContext<'_, '_>,
+    intent: &VolumeIntent,
+    filesystem: &PersistentFilesystemBinding,
+    new_remote_head: &cats_api::runtime_reconciliation::RemoteHead,
+) -> bool {
+    let physical = PhysicalVolumeAuthorityIndex::build(
+        &context.admission.full_inventory_observation,
+        &intent.volume_id,
+    );
+    if physical.has_residue
+        || physical.volumes.len() != 1
+        || physical.blockd_processes.len() != 1
+        || !physical.mounts.is_empty()
+    {
+        return false;
+    }
+    let Some(runtime) = runtime_for_desired(&context.admission, &context.desired) else {
+        return false;
+    };
+    let (observed_runtime, observed) = physical.volumes[0];
+    if !std::ptr::eq(observed_runtime, runtime)
+        || runtime.runtime_incarnation.as_ref() != Some(&filesystem.runtime_incarnation)
+        || runtime.stable_state.is_some()
+        || !observed_volume_identity_matches(observed, intent)
+    {
+        return false;
+    }
+    let expected_step = cats_api::runtime_reconciliation::ReconcileStep::CommitInitialized {
+        filesystem: Box::new(filesystem.clone()),
+        new_remote_head: new_remote_head.clone(),
+    };
+    if runtime.step != expected_step {
+        return false;
+    }
+    let cats_api::runtime_reconciliation::CheckpointEvidence::Valid {
+        cat_id,
+        node_id,
+        desired_revision,
+        spec_digest,
+        placement_epoch,
+        runtime_incarnation,
+        runtime_launch,
+        stable_state,
+        step,
+        ..
+    } = &runtime.checkpoint
+    else {
+        return false;
+    };
+    if cat_id != &context.desired.cat_id
+        || node_id != &context.node_id
+        || desired_revision != &context.desired.desired_revision
+        || spec_digest != &context.desired.spec_digest
+        || placement_epoch != &context.desired.placement.placement_epoch
+        || runtime_incarnation.as_ref() != Some(&filesystem.runtime_incarnation)
+        || stable_state.is_some()
+        || step.as_ref() != &expected_step
+    {
+        return false;
+    }
+    let Some(launch) = runtime_launch.identity() else {
+        return false;
+    };
+    if launch.runtime_incarnation != filesystem.runtime_incarnation
+        || launch
+            .devices
+            .iter()
+            .filter(|device| device.volume_intent_id == filesystem.volume_intent_id)
+            .count()
+            != 1
+        || !launch.devices.iter().any(|device| {
+            device.volume_intent_id == filesystem.volume_intent_id
+                && device.disk_id == filesystem.disk_id
+                && device.volume_id == filesystem.volume_id
+                && device.disk_kind == DiskKind::Persistent
+                && device.attachment_id == filesystem.attachment_id
+                && device.attachment_epoch == filesystem.attachment_epoch
+                && acquire_origin_matches_intent(&device.acquire_origin, &intent.acquire)
+                && device.size_bytes == filesystem.size_bytes
+                && device.durability == intent.durability
+                && device.guest_device == filesystem.guest_device
+                && matches!(
+                    &filesystem.initialization,
+                    FilesystemInitialization::Initialize {
+                        expected_blank_head,
+                        ..
+                    } if device.expected_head == *expected_blank_head
+                )
+        })
+    {
+        return false;
+    }
+    let VolumeAuthorityEvidence::Owned {
+        attachment_id,
+        attachment_epoch,
+        head,
+    } = &observed.authority
+    else {
+        return false;
+    };
+    if attachment_id != &filesystem.attachment_id
+        || *attachment_epoch != filesystem.attachment_epoch
+        || head != new_remote_head
+        || observed.local_lineages.len() != 1
+        || observed.devices.len() != 1
+    {
+        return false;
+    }
+    let lineage_matches = observed.local_lineages.first().is_some_and(|lineage| {
+        lineage.attachment_id == filesystem.attachment_id
+            && lineage.attachment_epoch == filesystem.attachment_epoch
+            && acquire_origin_matches_intent(&lineage.acquire_origin, &intent.acquire)
+            && lineage.node_id == context.node_id
+            && lineage.placement_epoch == context.desired.placement.placement_epoch
+            && lineage.local_durable_generation == new_remote_head.generation
+            && lineage.remote_durable_generation == new_remote_head.generation
+            && lineage.pending_pack_count.get() == 0
+            && !lineage.fenced
+            && lineage.state == LocalLineageState::Active
+    });
+    let device_matches = observed.devices.first().is_some_and(|device| match device {
+        cats_api::runtime_reconciliation::ObservedDevice::KernelNbd {
+            guest_device,
+            ownership_token,
+            ..
+        }
+        | cats_api::runtime_reconciliation::ObservedDevice::VhostUserBlk {
+            guest_device,
+            ownership_token,
+            ..
+        } => {
+            guest_device == &filesystem.guest_device
+                && matches!(
+                    ownership_token,
+                    cats_api::runtime_reconciliation::OwnershipTokenEvidence::Valid { .. }
+                )
+        }
+    });
+    let blockd_matches =
+        physical
+            .blockd_processes
+            .first()
+            .is_some_and(|(process_runtime, process)| {
+                std::ptr::eq(*process_runtime, runtime)
+                    && blockd_process_matches(
+                        process,
+                        &filesystem.volume_id,
+                        &filesystem.attachment_id,
+                        filesystem.attachment_epoch,
+                    )
+            });
+    lineage_matches && device_matches && blockd_matches
 }
 
 fn normal_physical_evidence_is_safe(
@@ -1841,6 +2206,23 @@ fn disk_and_volume_match_intent(
 }
 
 fn disk_and_volume_identity_matches_intent(
+    disk: &DiskRecord,
+    volume: &VolumeRecord,
+    desired: &DesiredRuntimeSpec,
+    intent: &VolumeIntent,
+) -> bool {
+    disk_and_volume_common_identity_matches_intent(disk, volume, desired, intent)
+        && match &disk.role {
+            DiskRole::Root { .. } => true,
+            DiskRole::Persistent { initialization } => persistent_initialization_matches_mount(
+                initialization,
+                &volume.head,
+                intent.mount.as_ref(),
+            ),
+        }
+}
+
+fn disk_and_volume_common_identity_matches_intent(
     disk: &DiskRecord,
     volume: &VolumeRecord,
     desired: &DesiredRuntimeSpec,

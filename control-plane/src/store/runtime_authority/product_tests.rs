@@ -8,10 +8,11 @@ use cats_api::error::ErrorCode;
 use cats_api::runtime_reconciliation::{
     encode_desired_runtime_spec, encode_operation, spec_digest, AsciiText, AssignedKind,
     AssignedPlacement, ContractVersion, DesiredRuntimeSpec, DiskKind, Durability, EndpointIntent,
-    Epoch, FenceEpoch, Generation, GuestDeviceIdentity, Hostname, HttpProtocol, Id, Ipv4Address,
-    IsolatedIpv4Kind, MacAddress, NetworkConfig, Operation, OperationPhase, OperationTerminal,
-    RandomId128, Revision, RuntimeConfig, RuntimeTarget, RuntimeTransition, Sha256Digest,
-    UnixMillis, VolumeAccess, VolumeAcquire, VolumeDisposition, VolumeIntent,
+    Epoch, Ext4MountIntent, FenceEpoch, FilesystemInitialization, Generation, GuestDeviceIdentity,
+    Hostname, HttpProtocol, Id, Ipv4Address, IsolatedIpv4Kind, MacAddress, NetworkConfig,
+    Operation, OperationPhase, OperationTerminal, RandomId128, Revision, RuntimeConfig,
+    RuntimeTarget, RuntimeTransition, Sha256Digest, UnixMillis, VolumeAccess, VolumeAcquire,
+    VolumeDisposition, VolumeIntent,
 };
 use cats_storage::authority::{
     LastVolumeTransition, RemoteHead, VolumeAdminState, VolumeDurability, VolumeRecord,
@@ -22,12 +23,12 @@ use sha2::{Digest, Sha256};
 use super::cat_create_service::CatCreatePlacementMutation;
 use super::product::{
     api_request_fingerprint, candidate_matches_placement_mutation,
-    encode_cat_create_accepted_response, encode_cat_name_conflict_response, ApiIdempotencyRequest,
-    CandidateCollision, CatCreateCandidate, CatCreateEnvelopes, CoveredCatCreateError,
-    CoveredCatCreateRequest, DiskAdminState, DiskRecord, DiskRecordCandidate, DiskRole,
-    EndpointRecord, EndpointRecordCandidate, ExactContentType, ExactHttpResponse,
-    HostnameDesiredLocation, HostnameDesiredLookup, IfMatchFingerprint,
-    PersistentDiskInitialization,
+    encode_cat_create_accepted_response, encode_cat_name_conflict_response,
+    persistent_initialization_matches_mount, ApiIdempotencyRequest, CandidateCollision,
+    CatCreateCandidate, CatCreateEnvelopes, CoveredCatCreateError, CoveredCatCreateRequest,
+    DiskAdminState, DiskRecord, DiskRecordCandidate, DiskRole, EndpointRecord,
+    EndpointRecordCandidate, ExactContentType, ExactHttpResponse, HostnameDesiredLocation,
+    HostnameDesiredLookup, IfMatchFingerprint, PersistentDiskInitialization,
 };
 use super::product_rows::{
     insert_disk, insert_endpoint, insert_hostname_lookup, insert_operation,
@@ -863,6 +864,84 @@ fn persistent_disk_closed_codec_round_trips_both_states_and_detects_projection_d
         })
         .unwrap_err();
     assert_eq!(error.code, ErrorCode::Internal);
+}
+
+#[test]
+fn persistent_initialization_f0_closes_desired_variant_and_head_drift() {
+    let blank = blank_volume("volume_f0").head;
+    let token = random_id(7_101);
+    let filesystem_uuid = random_id(7_102);
+    let initialized = RemoteHead {
+        generation: generation(1),
+        root_hash: Some(Sha256Digest::from_bytes([8; 32])),
+        root_object_id: Some(AsciiText::new("roots/1").unwrap()),
+    };
+    let uninitialized = PersistentDiskInitialization::Uninitialized {
+        initialization_token: token.clone(),
+        filesystem_uuid: filesystem_uuid.clone(),
+        expected_blank_head: blank.clone(),
+    };
+    let initialize_mount = Ext4MountIntent {
+        filesystem_uuid: filesystem_uuid.clone(),
+        mount_path: cats_api::runtime_reconciliation::HostPath::new("/data").unwrap(),
+        initialization: FilesystemInitialization::Initialize {
+            initialization_token: token.clone(),
+            expected_blank_head: blank.clone(),
+        },
+    };
+    assert!(persistent_initialization_matches_mount(
+        &uninitialized,
+        &blank,
+        Some(&initialize_mount),
+    ));
+    assert!(!persistent_initialization_matches_mount(
+        &uninitialized,
+        &initialized,
+        Some(&initialize_mount),
+    ));
+
+    let initialized_state = PersistentDiskInitialization::Initialized {
+        initialization_token: token,
+        filesystem_uuid: filesystem_uuid.clone(),
+        expected_blank_head: blank,
+        initialized_head: initialized.clone(),
+        initialized_at: unix_millis(7_103),
+    };
+    let existing_mount = Ext4MountIntent {
+        filesystem_uuid,
+        mount_path: cats_api::runtime_reconciliation::HostPath::new("/data").unwrap(),
+        initialization: FilesystemInitialization::Existing,
+    };
+    assert!(persistent_initialization_matches_mount(
+        &initialized_state,
+        &initialized,
+        Some(&existing_mount),
+    ));
+    let advanced = RemoteHead {
+        generation: generation(2),
+        root_hash: Some(Sha256Digest::from_bytes([9; 32])),
+        root_object_id: Some(AsciiText::new("roots/2").unwrap()),
+    };
+    assert!(persistent_initialization_matches_mount(
+        &initialized_state,
+        &advanced,
+        Some(&existing_mount),
+    ));
+    let same_generation_foreign = RemoteHead {
+        generation: initialized.generation,
+        root_hash: Some(Sha256Digest::from_bytes([10; 32])),
+        root_object_id: Some(AsciiText::new("roots/foreign").unwrap()),
+    };
+    assert!(!persistent_initialization_matches_mount(
+        &initialized_state,
+        &same_generation_foreign,
+        Some(&existing_mount),
+    ));
+    assert!(!persistent_initialization_matches_mount(
+        &initialized_state,
+        &advanced,
+        Some(&initialize_mount),
+    ));
 }
 
 #[test]

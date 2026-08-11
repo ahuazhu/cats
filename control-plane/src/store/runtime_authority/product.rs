@@ -14,9 +14,9 @@ use cats_api::persistent_disk::{
 use cats_api::resources::DiskDurability as PublicDiskDurability;
 use cats_api::runtime_reconciliation::{
     encode_desired_runtime_spec, AsciiText, ContractVersion, DesiredRuntimeSpec, DiskKind,
-    Durability, FenceEpoch, Generation, Hostname, HttpProtocol, Id, Operation, OperationPhase,
-    RandomId128, Revision, RuntimeTarget, RuntimeTransition, Sha256Digest, UnixMillis,
-    VolumeAccess, VolumeAcquire, VolumeDisposition,
+    Durability, Ext4MountIntent, FenceEpoch, FilesystemInitialization, Generation, Hostname,
+    HttpProtocol, Id, Operation, OperationPhase, RandomId128, Revision, RuntimeTarget,
+    RuntimeTransition, Sha256Digest, UnixMillis, VolumeAccess, VolumeAcquire, VolumeDisposition,
 };
 use cats_storage::authority::{RemoteHead, VolumeAdminState, VolumeDurability, VolumeRecord};
 use postgres::Transaction;
@@ -153,6 +153,50 @@ pub(crate) enum PersistentDiskInitialization {
         initialized_head: RemoteHead,
         initialized_at: UnixMillis,
     },
+}
+
+/// Validates the only two legal PersistentDisk projections into current
+/// Desired.  Callers must use the current locked Volume head: an old Desired
+/// JSON value is not allowed to choose its own initialization authority.
+pub(super) fn persistent_initialization_matches_mount(
+    initialization: &PersistentDiskInitialization,
+    current_head: &RemoteHead,
+    mount: Option<&Ext4MountIntent>,
+) -> bool {
+    let Some(mount) = mount else {
+        return false;
+    };
+    match (initialization, &mount.initialization) {
+        (
+            PersistentDiskInitialization::Uninitialized {
+                initialization_token,
+                filesystem_uuid,
+                expected_blank_head,
+            },
+            FilesystemInitialization::Initialize {
+                initialization_token: desired_token,
+                expected_blank_head: desired_blank_head,
+            },
+        ) => {
+            mount.filesystem_uuid == *filesystem_uuid
+                && desired_token == initialization_token
+                && desired_blank_head == expected_blank_head
+                && current_head == expected_blank_head
+        }
+        (
+            PersistentDiskInitialization::Initialized {
+                filesystem_uuid,
+                initialized_head,
+                ..
+            },
+            FilesystemInitialization::Existing,
+        ) => {
+            mount.filesystem_uuid == *filesystem_uuid
+                && (current_head.generation.get() > initialized_head.generation.get()
+                    || current_head == initialized_head)
+        }
+        _ => false,
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

@@ -5,17 +5,18 @@ use std::time::{Duration, Instant};
 use cats_api::agent_registration::AuthenticatedNodeCredential;
 use cats_api::error::ErrorCode;
 use cats_api::runtime_reconciliation::{
-    encode_desired_runtime_spec, guest_config_digest, inventory_digest, spec_digest,
-    AgentRegistrationAttempt, AgentSession, AppliedDesiredEvidence, AsciiText as RuntimeAsciiText,
-    AssignedKind, AssignedPlacement, CheckpointEvidence, CleanupRelease, CleanupTarget,
-    ContractErrorDetail, ContractVersion, ControlHandshakeEvidence, CredentialBinding,
-    DesiredReadRequest, DesiredRuntimeSpec, DiskKind, GuestDeviceIdentity,
-    GuestRuntimeProfileReceipt, GuestTransportEvidence, Ipv4Address, IsolatedIpv4Kind,
-    LifecycleAdmission, LocalLineageState, LocalVolumeLineage, MacAddress, MountAccess,
-    NetworkConfig, NodeBootId, NodeIdentity, NodeIdentityState, NodeObservation, NodeResidue,
-    ObservedDiskKind, ObservedMount, ObservedRuntimeStatus, ObservedVolume, Operation,
-    OperationPhase, OwnershipTokenEvidence, ProcessEvidence, ProcessRole, ProcessState,
-    ReconcileStep, RuntimeConfig, RuntimeTarget, RuntimeTransition,
+    decode_runtime_checkpoint, encode_desired_runtime_spec, guest_config_digest, inventory_digest,
+    spec_digest, AgentRegistrationAttempt, AgentSession, AppliedDesiredEvidence,
+    AsciiText as RuntimeAsciiText, AssignedKind, AssignedPlacement, CheckpointEvidence,
+    CleanupRelease, CleanupTarget, ContractErrorDetail, ContractVersion, ControlHandshakeEvidence,
+    CredentialBinding, DesiredReadRequest, DesiredRuntimeSpec, DiskKind, Ext4MountIntent,
+    FilesystemInitialization, GuestDeviceIdentity, GuestRuntimeProfileReceipt,
+    GuestTransportEvidence, HostPath, Ipv4Address, IsolatedIpv4Kind, LifecycleAdmission,
+    LocalLineageState, LocalVolumeLineage, MacAddress, MountAccess, NetworkConfig, NodeBootId,
+    NodeIdentity, NodeIdentityState, NodeObservation, NodeResidue, ObservedDiskKind, ObservedMount,
+    ObservedRuntimeStatus, ObservedVolume, Operation, OperationPhase, OwnershipTokenEvidence,
+    PersistentFilesystemBinding, ProcessEvidence, ProcessRole, ProcessState, ReconcileStep,
+    RuntimeCheckpoint, RuntimeConfig, RuntimeTarget, RuntimeTransition,
     RuntimeVolumeAuthorizationRejection, RuntimeVolumeTransition,
     RuntimeVolumeTransitionEvidenceRequest, RuntimeVolumeTransitionOutcome,
     RuntimeVolumeTransitionPreconditionProblem, RuntimeVolumeTransitionRequest, Sequence,
@@ -23,16 +24,19 @@ use cats_api::runtime_reconciliation::{
     VolumeDisposition, VolumeIntent, VolumeReleaseReplay, WarmSnapshotEvidence, WireU64,
 };
 use cats_storage::authority::{
-    complete_disposable_root_delete, consume_disposable_root_delete, AsciiText, AuthorityError,
-    AuthorizationConsumedReceipt, AuthorizationRecord, AuthorizationState, DeleteCompletionReceipt,
-    DisposableDeleteIsolationBasis, DisposableRootDeleteAuthorization, Epoch, FenceEpoch,
-    Generation, HostFenceEvent, HostFenceEventState, HostIsolationState, Id, NormalAcquireRequest,
-    RandomId128, ReleaseRequest, RemoteHead, Revision, Sha256Digest, TakeoverConsumedReceipt,
-    UnixMillis, VolumeAdminState, VolumeAuthorization, VolumeDurability, VolumeOwnerBinding,
-    VolumeRecord, VolumeTakeoverAuthorization,
+    complete_disposable_root_delete, consume_disposable_root_delete, normal_acquire, AsciiText,
+    AuthorityError, AuthorizationConsumedReceipt, AuthorizationRecord, AuthorizationState,
+    DeleteCompletionReceipt, DisposableDeleteIsolationBasis, DisposableRootDeleteAuthorization,
+    Epoch, FenceEpoch, Generation, HostFenceEvent, HostFenceEventState, HostIsolationState, Id,
+    NormalAcquireRequest, RandomId128, ReleaseRequest, RemoteHead, Revision, Sha256Digest,
+    TakeoverConsumedReceipt, UnixMillis, VolumeAdminState, VolumeAuthorization, VolumeDurability,
+    VolumeOwnerBinding, VolumeRecord, VolumeTakeoverAuthorization,
 };
 
-use super::product::{CatRecord, DiskAdminState, DiskRecord, DiskRole, DiskSnapshotRecord};
+use super::product::{
+    CatRecord, DiskAdminState, DiskRecord, DiskRole, DiskSnapshotRecord,
+    PersistentDiskInitialization,
+};
 use super::product_rows::{
     insert_cat, insert_desired, insert_disk, insert_disk_snapshot, insert_operation,
     load_desired_for_update, load_disk_by_id_for_update,
@@ -320,6 +324,373 @@ fn transition_desired(
     };
     desired.spec_digest = spec_digest(&desired).unwrap();
     desired
+}
+
+fn commit_initialized_checkpoint(
+    desired: &DesiredRuntimeSpec,
+    root_volume: &VolumeRecord,
+    persistent_volume: &VolumeRecord,
+    filesystem: &PersistentFilesystemBinding,
+) -> RuntimeCheckpoint {
+    let root = &desired.volumes[0];
+    let persistent = &desired.volumes[1];
+    let runtime_incarnation = filesystem.runtime_incarnation.clone();
+    let vmm_scope = format!("cats-vmm-{}.service", runtime_incarnation.as_str());
+    let root_process_token = random_id(6_001);
+    let root_device_token = random_id(6_002);
+    let persistent_process_token = random_id(6_003);
+    let persistent_device_token = random_id(6_004);
+    let vmm_token = random_id(6_005);
+    let network_token = random_id(6_006);
+    let origin = |intent: &VolumeIntent| match &intent.acquire {
+        VolumeAcquire::Normal { transition_id, .. } => serde_json::json!({
+            "kind": "normal",
+            "transition_id": transition_id,
+        }),
+        VolumeAcquire::Takeover { authorization_id } => serde_json::json!({
+            "kind": "takeover",
+            "authorization_id": authorization_id,
+        }),
+    };
+    let artifact = |path: &str, length: u64, digest: Sha256Digest| {
+        serde_json::json!({
+            "path": path,
+            "length": length,
+            "content_sha256": digest,
+        })
+    };
+    let root_device = serde_json::json!({
+        "volume_intent_id": root.volume_intent_id,
+        "disk_id": root.disk_id,
+        "volume_id": root.volume_id,
+        "disk_kind": "root",
+        "attachment_id": root.attachment_id,
+        "attachment_epoch": root_volume.lease_epoch,
+        "acquire_origin": origin(root),
+        "expected_head": root_volume.head,
+        "size_bytes": root.size_bytes,
+        "durability": root.durability,
+        "guest_device": root.guest_device,
+        "ownership_token": root_device_token,
+        "serving_authority": {
+            "kind": "direct_authorized_attachment",
+            "authorization": {
+                "path": "/var/lib/cats/attachments/root.json",
+                "device": 1,
+                "inode": 11,
+                "length": 512,
+                "content_sha256": Sha256Digest::from_bytes([11; 32]),
+            },
+            "purpose": "existing_root",
+        },
+        "serving_process": {
+            "scope_id": "cats-root-serving",
+            "control_socket_path": "/run/cats/root-blockd.sock",
+            "data_directory": "/var/lib/cats/volumes/root",
+            "executable_path": "/usr/bin/cats-blockd",
+            "process_identity_token": root_process_token,
+        },
+        "frontend": {
+            "kind": "vhost_user_blk",
+            "socket_path": "/run/cats/root-vhost.sock",
+            "queues": 1,
+            "queue_size": 256,
+        },
+    });
+    let expected_blank_head = match &filesystem.initialization {
+        FilesystemInitialization::Initialize {
+            expected_blank_head,
+            ..
+        } => expected_blank_head,
+        FilesystemInitialization::Existing => {
+            panic!("commit_initialized fixture requires Initialize")
+        }
+    };
+    let persistent_device = serde_json::json!({
+        "volume_intent_id": persistent.volume_intent_id,
+        "disk_id": persistent.disk_id,
+        "volume_id": persistent.volume_id,
+        "disk_kind": "persistent",
+        "attachment_id": persistent.attachment_id,
+        "attachment_epoch": persistent_volume.lease_epoch,
+        "acquire_origin": origin(persistent),
+        "expected_head": expected_blank_head,
+        "size_bytes": persistent.size_bytes,
+        "durability": persistent.durability,
+        "guest_device": persistent.guest_device,
+        "ownership_token": persistent_device_token,
+        "serving_authority": {
+            "kind": "direct_authorized_attachment",
+            "authorization": {
+                "path": "/var/lib/cats/attachments/data.json",
+                "device": 1,
+                "inode": 12,
+                "length": 512,
+                "content_sha256": Sha256Digest::from_bytes([12; 32]),
+            },
+            "purpose": "persistent_uninitialized",
+        },
+        "serving_process": {
+            "scope_id": "cats-data-serving",
+            "control_socket_path": "/run/cats/data-blockd.sock",
+            "data_directory": "/var/lib/cats/volumes/data",
+            "executable_path": "/usr/bin/cats-blockd",
+            "process_identity_token": persistent_process_token,
+        },
+        "frontend": {
+            "kind": "vhost_user_blk",
+            "socket_path": "/run/cats/data-vhost.sock",
+            "queues": 1,
+            "queue_size": 256,
+        },
+    });
+    let observed_process = |volume_id: &Id,
+                            attachment_id: &Id,
+                            attachment_epoch: FenceEpoch,
+                            scope_id: &str,
+                            socket: &str,
+                            token: &RandomId128,
+                            process_id: u32| {
+        serde_json::json!({
+            "role": {
+                "kind": "blockd",
+                "volume_id": volume_id,
+                "attachment_id": attachment_id,
+                "attachment_epoch": attachment_epoch,
+            },
+            "process_id": process_id,
+            "process_start_time_ticks": u64::from(process_id) + 1_000,
+            "executable_path": "/usr/bin/cats-blockd",
+            "scope_id": scope_id,
+            "control_socket_path": socket,
+            "state": "running",
+            "ownership_token": {"kind": "valid", "ownership_token": token},
+            "control_handshake": {"kind": "verified"},
+            "observed_vm_shape": null,
+        })
+    };
+    let observed_volume = |intent: &VolumeIntent,
+                           volume: &VolumeRecord,
+                           disk_kind: &str,
+                           data_directory: &str,
+                           socket: &str,
+                           token: &RandomId128| {
+        serde_json::json!({
+            "volume_intent_id": intent.volume_intent_id,
+            "disk_id": intent.disk_id,
+            "volume_id": intent.volume_id,
+            "disk_kind": disk_kind,
+            "size_bytes": intent.size_bytes,
+            "durability": intent.durability,
+            "authority": {
+                "kind": "owned",
+                "attachment_id": intent.attachment_id,
+                "attachment_epoch": volume.lease_epoch,
+                "head": volume.head,
+            },
+            "local_lineages": [{
+                "attachment_id": intent.attachment_id,
+                "attachment_epoch": volume.lease_epoch,
+                "acquire_origin": origin(intent),
+                "node_id": desired.placement.node_id,
+                "placement_epoch": desired.placement.placement_epoch,
+                "local_durable_generation": volume.head.generation,
+                "remote_durable_generation": volume.head.generation,
+                "data_directory": data_directory,
+                "pending_pack_count": 0,
+                "fenced": false,
+                "state": "active",
+            }],
+            "devices": [{
+                "kind": "vhost_user_blk",
+                "guest_device": intent.guest_device,
+                "socket_path": socket,
+                "ownership_token": {"kind": "valid", "ownership_token": token},
+            }],
+        })
+    };
+    let filesystem_step = serde_json::json!({
+        "kind": "commit_initialized",
+        "filesystem": filesystem,
+        "new_remote_head": persistent_volume.head,
+    });
+    let network = serde_json::json!({
+        "network_config": desired.runtime.network_config,
+        "tap_name": "cats0001",
+        "ownership_token": network_token,
+    });
+    let checkpoint = serde_json::json!({
+        "version": 1,
+        "cat_id": desired.cat_id,
+        "node_id": desired.placement.node_id,
+        "placement_epoch": desired.placement.placement_epoch,
+        "desired_revision": desired.desired_revision,
+        "spec_digest": desired.spec_digest,
+        "runtime_incarnation": runtime_incarnation,
+        "runtime_launch": {
+            "kind": "present",
+            "identity": {
+                "runtime_incarnation": filesystem.runtime_incarnation,
+                "scope_id": vmm_scope,
+                "launcher_executable": artifact(
+                    "/usr/libexec/cats-vmm-launcher",
+                    1_024,
+                    Sha256Digest::from_bytes([3; 32]),
+                ),
+                "boot": {
+                    "vmm_executable": artifact(
+                        "/usr/bin/cloud-hypervisor",
+                        2_048,
+                        Sha256Digest::from_bytes([4; 32]),
+                    ),
+                    "kernel": artifact(
+                        "/opt/cats/guest/vmlinuz",
+                        4_096,
+                        Sha256Digest::from_bytes([1; 32]),
+                    ),
+                    "initramfs": artifact(
+                        "/opt/cats/guest/initramfs.img",
+                        4_096,
+                        Sha256Digest::from_bytes([2; 32]),
+                    ),
+                    "kernel_cmdline": "console=hvc0 root=/dev/vda",
+                },
+                "process_identity_token": vmm_token,
+                "vcpus": desired.runtime.vcpus,
+                "memory_bytes": desired.runtime.memory_bytes,
+                "boot_image_digest": desired.runtime.boot_image_digest,
+                "guest_config_digest": desired.runtime.guest_config_digest,
+                "api_socket_path": "/run/cats/vmm-api.sock",
+                "vsock_socket_path": "/run/cats/vmm-vsock.sock",
+                "guest_cid": 3,
+                "memory_file_path": "/var/lib/cats/runtime-memory.bin",
+                "serial_log_path": "/var/log/cats/runtime-serial.log",
+                "vmm_log_path": "/var/log/cats/runtime-vmm.log",
+                "network": network,
+                "devices": [root_device, persistent_device],
+            },
+        },
+        "stable_state": null,
+        "step": filesystem_step,
+        "processes": [{
+            "role": {"kind": "vmm", "runtime_incarnation": filesystem.runtime_incarnation},
+            "process_id": 7_001,
+            "process_start_time_ticks": 8_001,
+            "executable_path": "/usr/bin/cloud-hypervisor",
+            "scope_id": vmm_scope,
+            "control_socket_path": "/run/cats/vmm-api.sock",
+            "state": "running",
+            "ownership_token": {"kind": "valid", "ownership_token": vmm_token},
+            "control_handshake": {"kind": "verified"},
+            "observed_vm_shape": {
+                "vcpus": desired.runtime.vcpus,
+                "memory_bytes": desired.runtime.memory_bytes,
+                "boot_image_digest": desired.runtime.boot_image_digest,
+                "guest_config_digest": desired.runtime.guest_config_digest,
+            },
+        }, observed_process(
+            &persistent.volume_id,
+            &persistent.attachment_id,
+            persistent_volume.lease_epoch,
+            "cats-data-serving",
+            "/run/cats/data-blockd.sock",
+            &persistent_process_token,
+            7_003,
+        ), observed_process(
+            &root.volume_id,
+            &root.attachment_id,
+            root_volume.lease_epoch,
+            "cats-root-serving",
+            "/run/cats/root-blockd.sock",
+            &root_process_token,
+            7_002,
+        )],
+        "volumes": [observed_volume(
+            persistent,
+            persistent_volume,
+            "persistent",
+            "/var/lib/cats/volumes/data",
+            "/run/cats/data-vhost.sock",
+            &persistent_device_token,
+        ), observed_volume(
+            root,
+            root_volume,
+            "root",
+            "/var/lib/cats/volumes/root",
+            "/run/cats/root-vhost.sock",
+            &root_device_token,
+        )],
+        "mounts": [],
+        "networks": [{
+            "kind": "isolated_ipv4",
+            "network_id": desired.runtime.network_config.network_id,
+            "guest_mac": desired.runtime.network_config.guest_mac,
+            "guest_ipv4": desired.runtime.network_config.guest_ipv4,
+            "prefix_length": desired.runtime.network_config.prefix_length,
+            "gateway_ipv4": desired.runtime.network_config.gateway_ipv4,
+            "tap_name": "cats0001",
+            "ownership_token": {"kind": "valid", "ownership_token": network_token},
+        }],
+        "guest_transport": {
+            "kind": "vsock_ready",
+            "runtime_incarnation": filesystem.runtime_incarnation,
+            "guest_cid": 3,
+            "guest_port": 5_000,
+            "guest_agent_protocol_version": 1,
+            "guest_boot_id": "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
+        },
+        "warm_snapshot": {"kind": "absent"},
+        "lifecycle_admission": "closed",
+        "route_gates": [],
+        "require_idle": {"kind": "not_applicable"},
+        "updated_at_unix_ms": 1,
+    });
+    decode_runtime_checkpoint(&serde_json::to_vec(&checkpoint).unwrap()).unwrap()
+}
+
+fn commit_initialized_runtime_status(checkpoint: &RuntimeCheckpoint) -> ObservedRuntimeStatus {
+    ObservedRuntimeStatus {
+        cat_id: checkpoint.cat_id.clone(),
+        applied_desired: Some(AppliedDesiredEvidence {
+            desired_revision: checkpoint.desired_revision,
+            spec_digest: checkpoint.spec_digest.clone(),
+            placement: AssignedPlacement {
+                kind: AssignedKind::Assigned,
+                node_id: checkpoint.node_id.clone(),
+                placement_epoch: checkpoint.placement_epoch,
+            },
+            target: RuntimeTarget::Running,
+        }),
+        runtime_incarnation: checkpoint.runtime_incarnation.clone(),
+        stable_state: checkpoint.stable_state,
+        step: checkpoint.step.clone(),
+        checkpoint: CheckpointEvidence::Valid {
+            checkpoint_path: HostPath::new("/var/lib/cats/checkpoints/cat-1.json").unwrap(),
+            content_digest: Sha256Digest::from_bytes([77; 32]),
+            version: checkpoint.version,
+            cat_id: checkpoint.cat_id.clone(),
+            node_id: checkpoint.node_id.clone(),
+            desired_revision: checkpoint.desired_revision,
+            spec_digest: checkpoint.spec_digest.clone(),
+            placement_epoch: checkpoint.placement_epoch,
+            runtime_incarnation: checkpoint.runtime_incarnation.clone(),
+            runtime_launch: Box::new(checkpoint.runtime_launch.clone()),
+            stable_state: checkpoint.stable_state,
+            step: Box::new(checkpoint.step.clone()),
+            require_idle: Box::new(checkpoint.require_idle.clone()),
+            updated_at_unix_ms: checkpoint.updated_at_unix_ms,
+        },
+        processes: checkpoint.processes.clone(),
+        volumes: checkpoint.volumes.clone(),
+        mounts: checkpoint.mounts.clone(),
+        networks: checkpoint.networks.clone(),
+        guest_transport: checkpoint.guest_transport.clone(),
+        warm_snapshot: checkpoint.warm_snapshot.clone(),
+        lifecycle_admission: checkpoint.lifecycle_admission,
+        routes: Vec::new(),
+        platform_guards: 0,
+        conditions: Vec::new(),
+    }
 }
 
 fn observed_runtime_with_volumes(
@@ -969,6 +1340,269 @@ fn normal_acquire_fixture(
         },
     );
     (volume, node, desired, request)
+}
+
+fn blank_commit_volume(volume_id: &str) -> VolumeRecord {
+    VolumeRecord {
+        volume_id: id(volume_id),
+        size_bytes: 4 * 1024 * 1024,
+        durability: VolumeDurability::Strict,
+        admin_state: VolumeAdminState::Active,
+        head: head(0),
+        lease_owner: None,
+        lease_epoch: fence_epoch(0),
+        lease_expires_at: None,
+        last_transition: None,
+    }
+}
+
+fn acquire_commit_volume(
+    blank: &VolumeRecord,
+    attachment_id: &Id,
+    transition_id: &RandomId128,
+) -> VolumeRecord {
+    let (mut owned, _) = normal_acquire(
+        blank,
+        &NormalAcquireRequest {
+            volume_id: blank.volume_id.clone(),
+            transition_id: transition_id.clone(),
+            attachment_id: attachment_id.clone(),
+            expected_unowned_epoch: blank.lease_epoch,
+            desired_revision: revision(11),
+            placement_epoch: epoch(3),
+            lease_duration_ms: 30_000,
+        },
+        unix_millis(1_000),
+    )
+    .unwrap();
+    owned.head = head(1);
+    owned
+}
+
+fn commit_initialized_fixture(
+    store: &Store,
+    workspace_suffix: &str,
+) -> (
+    TransitionNode,
+    DesiredRuntimeSpec,
+    RuntimeVolumeTransitionRequest,
+    PersistentFilesystemBinding,
+    VolumeRecord,
+) {
+    let node = transition_node(store, "node-new");
+    let workspace = super::product_tests::bootstrap_workspace(store, workspace_suffix);
+    let root_blank = blank_commit_volume("volume-root");
+    let persistent_blank = blank_commit_volume("volume-data");
+    let root_transition = random_id(8_001);
+    let persistent_transition = random_id(8_002);
+    let root_attachment = id("attachment-root");
+    let persistent_attachment = id("attachment-data");
+    let root_volume = acquire_commit_volume(&root_blank, &root_attachment, &root_transition);
+    let persistent_volume = acquire_commit_volume(
+        &persistent_blank,
+        &persistent_attachment,
+        &persistent_transition,
+    );
+    let initialization_token = random_id(8_003);
+    let filesystem_uuid = random_id(8_004);
+
+    let mut desired = transition_desired(
+        &workspace,
+        &node,
+        &root_volume,
+        RuntimeTarget::Running,
+        revision(11),
+        epoch(3),
+        root_attachment.clone(),
+        VolumeAcquire::Normal {
+            transition_id: root_transition,
+            expected_unowned_epoch: root_blank.lease_epoch,
+        },
+        VolumeDisposition::Retain,
+    );
+    desired.volumes[0].volume_intent_id = id("intent-a-root");
+    desired.volumes[0].disk_id = id("disk-root");
+    desired.volumes[0].guest_device.serial = id("cats-root");
+    desired.volumes.push(VolumeIntent {
+        volume_intent_id: id("intent-z-data"),
+        disk_id: id("disk-data"),
+        volume_id: persistent_volume.volume_id.clone(),
+        attachment_id: persistent_attachment.clone(),
+        size_bytes: persistent_volume.size_bytes,
+        disk_kind: DiskKind::Persistent,
+        access: VolumeAccess::ReadWriteOnce,
+        durability: persistent_volume.durability,
+        guest_device: GuestDeviceIdentity {
+            serial: id("cats-data"),
+            slot: 1,
+        },
+        acquire: VolumeAcquire::Normal {
+            transition_id: persistent_transition,
+            expected_unowned_epoch: persistent_blank.lease_epoch,
+        },
+        disposition: VolumeDisposition::Retain,
+        mount: Some(Ext4MountIntent {
+            filesystem_uuid: filesystem_uuid.clone(),
+            mount_path: HostPath::new("/data").unwrap(),
+            initialization: FilesystemInitialization::Initialize {
+                initialization_token: initialization_token.clone(),
+                expected_blank_head: persistent_blank.head.clone(),
+            },
+        }),
+    });
+    desired.spec_digest = spec_digest(&desired).unwrap();
+    let filesystem = PersistentFilesystemBinding {
+        runtime_incarnation: random_id(8_005),
+        volume_intent_id: id("intent-z-data"),
+        disk_id: id("disk-data"),
+        volume_id: persistent_volume.volume_id.clone(),
+        attachment_id: persistent_attachment.clone(),
+        attachment_epoch: persistent_volume.lease_epoch,
+        size_bytes: persistent_volume.size_bytes,
+        guest_device: GuestDeviceIdentity {
+            serial: id("cats-data"),
+            slot: 1,
+        },
+        filesystem_uuid: filesystem_uuid.clone(),
+        mount_path: HostPath::new("/data").unwrap(),
+        initialization: FilesystemInitialization::Initialize {
+            initialization_token: initialization_token.clone(),
+            expected_blank_head: persistent_blank.head.clone(),
+        },
+    };
+    let checkpoint =
+        commit_initialized_checkpoint(&desired, &root_volume, &persistent_volume, &filesystem);
+    let runtime = commit_initialized_runtime_status(&checkpoint);
+
+    store
+        .authority_transaction(|transaction| {
+            let now = database_now(transaction)?;
+            insert_volume(transaction, &root_blank)?;
+            update_volume_owner(
+                transaction,
+                &root_volume,
+                Some(&VolumeOwnerBinding {
+                    volume_id: root_volume.volume_id.clone(),
+                    owner_node_id: node.session.node_id.clone(),
+                    attachment_id: root_attachment.clone(),
+                    attachment_epoch: root_volume.lease_epoch,
+                }),
+            )?;
+            insert_volume(transaction, &persistent_blank)?;
+            update_volume_owner(
+                transaction,
+                &persistent_volume,
+                Some(&VolumeOwnerBinding {
+                    volume_id: persistent_volume.volume_id.clone(),
+                    owner_node_id: node.session.node_id.clone(),
+                    attachment_id: persistent_attachment.clone(),
+                    attachment_epoch: persistent_volume.lease_epoch,
+                }),
+            )?;
+            insert_cat(
+                transaction,
+                &CatRecord {
+                    cat_id: desired.cat_id.clone(),
+                    workspace_id: workspace.clone(),
+                    name: id("cat-1"),
+                    created_at: now,
+                },
+            )?;
+            insert_disk(
+                transaction,
+                &DiskRecord {
+                    disk_id: id("disk-root"),
+                    workspace_id: workspace.clone(),
+                    name: id("disk-root"),
+                    volume_id: root_volume.volume_id.clone(),
+                    size_bytes: root_volume.size_bytes,
+                    durability: root_volume.durability,
+                    created_at: now,
+                    admin_state: DiskAdminState::Active,
+                    role: DiskRole::Root {
+                        cat_id: desired.cat_id.clone(),
+                    },
+                },
+            )?;
+            insert_disk(
+                transaction,
+                &DiskRecord {
+                    disk_id: id("disk-data"),
+                    workspace_id: workspace.clone(),
+                    name: id("disk-data"),
+                    volume_id: persistent_volume.volume_id.clone(),
+                    size_bytes: persistent_volume.size_bytes,
+                    durability: persistent_volume.durability,
+                    created_at: now,
+                    admin_state: DiskAdminState::Active,
+                    role: DiskRole::Persistent {
+                        initialization: Box::new(PersistentDiskInitialization::Uninitialized {
+                            initialization_token: initialization_token.clone(),
+                            filesystem_uuid: filesystem_uuid.clone(),
+                            expected_blank_head: persistent_blank.head.clone(),
+                        }),
+                    },
+                },
+            )?;
+            insert_desired(transaction, &desired)
+        })
+        .unwrap();
+
+    let desired_read = match store
+        .runtime_desired_read(
+            &node.authenticated,
+            &DesiredReadRequest {
+                version: ContractVersion::V1,
+                session: node.session.clone(),
+                request_sequence: Sequence::new(1).unwrap(),
+            },
+        )
+        .unwrap()
+    {
+        RuntimeSpineOutcome::Accepted(snapshot) => snapshot,
+        RuntimeSpineOutcome::Rejected(rejection) => {
+            panic!("commit_initialized Desired read rejected: {rejection:?}")
+        }
+    };
+    let mut observation = NodeObservation {
+        version: ContractVersion::V1,
+        observation_id: random_id(8_006),
+        node_id: node.session.node_id.clone(),
+        node_boot_id: node.session.node_boot_id.clone(),
+        agent_instance_id: node.session.agent_instance_id.clone(),
+        agent_session_epoch: node.session.agent_session_epoch,
+        heartbeat_sequence: Sequence::new(1).unwrap(),
+        observed_at_unix_ms: unix_millis(1),
+        complete_inventory: true,
+        inventory_epoch: epoch(1),
+        inventory_digest: Some(Sha256Digest::from_bytes([0; 32])),
+        inventory_read_position: Some(desired_read.read_position),
+        key_ring_version: None,
+        key_ring_digest: None,
+        loaded_kids: Vec::new(),
+        runtimes: vec![runtime],
+        residue: Vec::new(),
+    };
+    observation.inventory_digest = Some(inventory_digest(&observation).unwrap());
+    match store
+        .runtime_accept_observation(&node.authenticated, &observation)
+        .unwrap()
+    {
+        RuntimeSpineOutcome::Accepted(_) => {}
+        RuntimeSpineOutcome::Rejected(rejection) => {
+            panic!("commit_initialized observation rejected: {rejection:?}")
+        }
+    }
+
+    let request = transition_request(
+        &node,
+        &desired,
+        RuntimeVolumeTransition::CommitInitialized {
+            filesystem: Box::new(filesystem.clone()),
+            new_remote_head: persistent_volume.head.clone(),
+        },
+    );
+    (node, desired, request, filesystem, persistent_volume)
 }
 
 pub(crate) fn prepare_a22_http_normal_fixture(
@@ -1845,6 +2479,225 @@ fn a22_normal_acquire_commits_once_and_replays_after_response_loss() {
     assert_eq!(grant.lease_expires_at, original_expiry);
     assert_eq!(stored_volume(&store, &volume.volume_id), committed);
     assert_eq!(stored_volume_row(&store, &volume.volume_id), before_replay);
+}
+
+#[test]
+fn a22_commit_initialized_is_atomic_idempotent_and_conflict_closed() {
+    let store = Store::connect(&crate::testsupport::isolated_control_store_url(), None).unwrap();
+    let (node, desired, request, filesystem, volume) =
+        commit_initialized_fixture(&store, "a22-commit-initialized");
+
+    store.inject_request_committed_response_loss_once_after(Duration::ZERO);
+    let lost = execute_transition(&store, &node, &request).unwrap_err();
+    assert_eq!(lost.code, ErrorCode::Unavailable);
+    let committed = store
+        .authority_transaction(|transaction| {
+            Ok(load_disk_by_id_for_update(transaction, &filesystem.disk_id)?.unwrap())
+        })
+        .unwrap();
+    let DiskRole::Persistent { initialization } = &committed.role else {
+        panic!("PersistentDisk changed role during initialization")
+    };
+    let PersistentDiskInitialization::Initialized {
+        initialization_token,
+        filesystem_uuid,
+        expected_blank_head,
+        initialized_head,
+        initialized_at,
+    } = initialization.as_ref()
+    else {
+        panic!("response loss did not leave the initialization commit durable")
+    };
+    assert_eq!(initialization_token, &random_id(8_003));
+    assert_eq!(filesystem_uuid, &random_id(8_004));
+    assert_eq!(expected_blank_head, &head(0));
+    assert_eq!(initialized_head, &volume.head);
+    let first_initialized_at = *initialized_at;
+
+    let first = execute_transition(&store, &node, &request).unwrap();
+    let second = execute_transition(&store, &node, &request).unwrap();
+    assert_eq!(first, second);
+    let VolumeTransitionStoreOutcome::Accepted(success) = first else {
+        panic!("exact initialization replay was rejected")
+    };
+    let RuntimeVolumeTransitionOutcome::PersistentInitialized { receipt } = success.outcome else {
+        panic!("initialization replay returned another outcome")
+    };
+    assert_eq!(receipt.disk_id, filesystem.disk_id);
+    assert_eq!(receipt.volume_id, filesystem.volume_id);
+    assert_eq!(receipt.initialized_head, volume.head);
+    assert_eq!(receipt.initialized_at, first_initialized_at);
+    assert_eq!(
+        store
+            .authority_transaction(|transaction| {
+                Ok(load_disk_by_id_for_update(transaction, &filesystem.disk_id)?.unwrap())
+            })
+            .unwrap(),
+        committed,
+    );
+
+    let mut conflict = request.clone();
+    let RuntimeVolumeTransition::CommitInitialized {
+        new_remote_head, ..
+    } = &mut conflict.transition
+    else {
+        unreachable!()
+    };
+    *new_remote_head = head(2);
+    assert!(matches!(
+        execute_transition(&store, &node, &conflict).unwrap(),
+        VolumeTransitionStoreOutcome::Rejected(
+            VolumeTransitionStoreRejection::TransitionPreconditionFailed {
+                problem: RuntimeVolumeTransitionPreconditionProblem::VolumeIntentMismatch,
+                ..
+            }
+        )
+    ));
+
+    // Once the Disk CAS has committed, the old Initialize Desired cannot be
+    // reused to enter another storage mutation. Control must project a fresh
+    // Existing Desired first.
+    let stale_acquire = transition_request(
+        &node,
+        &desired,
+        RuntimeVolumeTransition::Acquire {
+            request: VolumeAcquireRequest::Normal {
+                volume_id: volume.volume_id.clone(),
+                transition_id: random_id(8_002),
+                attachment_id: filesystem.attachment_id.clone(),
+                expected_unowned_epoch: fence_epoch(0),
+                desired_revision: desired.desired_revision,
+                placement_epoch: desired.placement.placement_epoch,
+                lease_duration_ms: 30_000,
+            },
+        },
+    );
+    let before = stored_volume_row(&store, &volume.volume_id);
+    assert!(matches!(
+        execute_transition(&store, &node, &stale_acquire).unwrap(),
+        VolumeTransitionStoreOutcome::Rejected(
+            VolumeTransitionStoreRejection::TransitionPreconditionFailed {
+                problem: RuntimeVolumeTransitionPreconditionProblem::VolumeIntentMismatch,
+                ..
+            }
+        )
+    ));
+    assert_eq!(stored_volume_row(&store, &volume.volume_id), before);
+}
+
+#[test]
+fn a22_commit_initialized_two_exact_writers_converge_to_one_receipt() {
+    let url = crate::testsupport::isolated_control_store_url();
+    let first_store = Store::connect(&url, None).unwrap();
+    let second_store = Store::connect(&url, None).unwrap();
+    let (node, _desired, request, filesystem, _volume) =
+        commit_initialized_fixture(&first_store, "a22-commit-initialized-writers");
+    let barrier = Arc::new(Barrier::new(3));
+    let spawn = |store: Store| {
+        let barrier = Arc::clone(&barrier);
+        let node = node.clone();
+        let request = request.clone();
+        std::thread::spawn(move || {
+            barrier.wait();
+            execute_transition(&store, &node, &request).unwrap()
+        })
+    };
+    let first = spawn(first_store);
+    let second = spawn(second_store);
+    barrier.wait();
+    let first = first.join().unwrap();
+    let second = second.join().unwrap();
+    assert_eq!(first, second);
+    let VolumeTransitionStoreOutcome::Accepted(success) = first else {
+        panic!("first exact initialization writer was rejected")
+    };
+    let RuntimeVolumeTransitionOutcome::PersistentInitialized { receipt } = success.outcome else {
+        panic!("initialization writer returned another outcome")
+    };
+    assert_eq!(receipt.disk_id, filesystem.disk_id);
+}
+
+#[test]
+fn a22_commit_initialized_rejects_authority_drift_after_observation() {
+    let store = Store::connect(&crate::testsupport::isolated_control_store_url(), None).unwrap();
+    let (node, _desired, request, filesystem, volume) =
+        commit_initialized_fixture(&store, "a22-commit-initialized-drift");
+    let before_disk = store
+        .authority_transaction(|transaction| {
+            Ok(load_disk_by_id_for_update(transaction, &filesystem.disk_id)?.unwrap())
+        })
+        .unwrap();
+
+    let mut advanced = volume.clone();
+    advanced.head = head(2);
+    store
+        .authority_transaction(|transaction| {
+            let stored =
+                load_stored_volume_for_update(transaction, &filesystem.volume_id)?.unwrap();
+            update_volume_owner(transaction, &advanced, stored.owner_binding.as_ref())
+        })
+        .unwrap();
+
+    assert!(matches!(
+        execute_transition(&store, &node, &request).unwrap(),
+        VolumeTransitionStoreOutcome::Rejected(
+            VolumeTransitionStoreRejection::TransitionPreconditionFailed {
+                problem: RuntimeVolumeTransitionPreconditionProblem::VolumeIntentMismatch,
+                ..
+            }
+        )
+    ));
+    assert_eq!(stored_volume(&store, &filesystem.volume_id), advanced);
+    assert_eq!(
+        store
+            .authority_transaction(|transaction| {
+                Ok(load_disk_by_id_for_update(transaction, &filesystem.disk_id)?.unwrap())
+            })
+            .unwrap(),
+        before_disk,
+    );
+}
+
+#[test]
+fn a22_commit_initialized_rejects_a_replaced_agent_session() {
+    let store = Store::connect(&crate::testsupport::isolated_control_store_url(), None).unwrap();
+    let (node, _desired, request, filesystem, _volume) =
+        commit_initialized_fixture(&store, "a22-commit-initialized-session");
+    let before_disk = store
+        .authority_transaction(|transaction| {
+            Ok(load_disk_by_id_for_update(transaction, &filesystem.disk_id)?.unwrap())
+        })
+        .unwrap();
+    let policy = AgentSessionRegistrationPolicy::from_release_receipt(&runtime_release()).unwrap();
+    let replacement = AgentRegistrationAttempt {
+        version: ContractVersion::V1,
+        node_id: node.session.node_id.clone(),
+        immutable_host_id: id("host-9"),
+        node_boot_id: boot_id(51),
+        agent_instance_id: random_id(52),
+        registration_attempt_id: random_id(53),
+        guest_config_digest: policy.approved_guest_config_digest().clone(),
+        expected_agent_session_epoch: Some(node.session.agent_session_epoch),
+    };
+    assert!(matches!(
+        store
+            .register_agent_session(&node.authenticated, &replacement, &policy)
+            .unwrap(),
+        AgentRegistrationOutcome::Registered(_)
+    ));
+
+    assert!(matches!(
+        execute_transition(&store, &node, &request).unwrap(),
+        VolumeTransitionStoreOutcome::Rejected(_)
+    ));
+    assert_eq!(
+        store
+            .authority_transaction(|transaction| {
+                Ok(load_disk_by_id_for_update(transaction, &filesystem.disk_id)?.unwrap())
+            })
+            .unwrap(),
+        before_disk,
+    );
 }
 
 #[test]

@@ -28,7 +28,7 @@ use cats_storage::authority::{DeleteCompletionReceipt, VolumeAdminState, VolumeD
 use postgres::{Row, Transaction};
 
 use super::pg_codec::PgBigInt;
-use super::product::{DiskAdminState, DiskRole};
+use super::product::{persistent_initialization_matches_mount, DiskAdminState, DiskRole};
 use super::product_rows::{
     load_assigned_desired_for_update, load_assigned_desired_unlocked, load_desired_for_update,
     load_disk_by_id_for_update, load_pending_operation_by_cat_for_update, update_operation,
@@ -2306,6 +2306,15 @@ fn database_postcondition_satisfied(
             || !disk_kind_matches(intent.disk_kind, &disk.role, &desired.cat_id)
             || !matches!(disk.admin_state, DiskAdminState::Active)
             || !matches!(volume.admin_state, VolumeAdminState::Active)
+            || matches!(
+                &disk.role,
+                DiskRole::Persistent { initialization }
+                    if !persistent_initialization_matches_mount(
+                        initialization,
+                        &volume.head,
+                        intent.mount.as_ref(),
+                    )
+            )
         {
             return Ok(false);
         }
