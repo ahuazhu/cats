@@ -40,6 +40,11 @@ pub(crate) struct AdmissionCellSession {
     checkpoint_store: Arc<FileCheckpointStore>,
 }
 
+pub(crate) enum AdmissionCellSessionLookup {
+    CreatedClosed(Arc<AdmissionCellSession>),
+    Existing,
+}
+
 impl AdmissionCellSession {
     pub(crate) fn cell(&self) -> &Arc<AdmissionCell> {
         &self.cell
@@ -100,16 +105,30 @@ impl AdmissionCellRegistry {
         }
     }
 
+    pub(crate) fn existing_session(
+        &self,
+        cat_id: &Id,
+    ) -> Result<Option<Arc<AdmissionCellSession>>, AdmissionRegistryError> {
+        let state = self.lock_observing()?;
+        match state.entries.get(cat_id) {
+            Some(RegistrySlot::Ready(session)) => Ok(Some(Arc::clone(session))),
+            Some(RegistrySlot::Initializing { .. }) => Err(AdmissionRegistryError::Initializing {
+                cat_id: cat_id.clone(),
+            }),
+            None => Ok(None),
+        }
+    }
+
     pub(crate) fn ensure_closed(
         &self,
         cat_id: &Id,
         checkpoint_snapshot: AdmissionSnapshot,
-    ) -> Result<Arc<AdmissionCellSession>, AdmissionRegistryError> {
+    ) -> Result<AdmissionCellSessionLookup, AdmissionRegistryError> {
         let generation = {
             let mut state = self.lock_mutating()?;
             match state.entries.get(cat_id) {
-                Some(RegistrySlot::Ready(session)) => {
-                    return Ok(Arc::clone(session));
+                Some(RegistrySlot::Ready(_)) => {
+                    return Ok(AdmissionCellSessionLookup::Existing);
                 }
                 Some(RegistrySlot::Initializing { .. }) => {
                     return Err(AdmissionRegistryError::Initializing {
@@ -141,7 +160,7 @@ impl AdmissionCellRegistry {
                         state
                             .entries
                             .insert(cat_id.clone(), RegistrySlot::Ready(Arc::clone(&session)));
-                        Ok(session)
+                        Ok(AdmissionCellSessionLookup::CreatedClosed(session))
                     }
                     Some(RegistrySlot::Initializing { .. })
                     | Some(RegistrySlot::Ready(_))
@@ -167,6 +186,13 @@ impl AdmissionCellRegistry {
         }
     }
 
+    #[cfg_attr(
+        not(test),
+        expect(
+            dead_code,
+            reason = "lifecycle replacement consumes exact compare-replace in the next composition slice"
+        )
+    )]
     pub(crate) fn replace_closed(
         &self,
         cat_id: &Id,
@@ -308,6 +334,9 @@ mod tests {
         let first = registry
             .ensure_closed(&cat_id, snapshot.clone())
             .expect("create session");
+        let AdmissionCellSessionLookup::CreatedClosed(first) = first else {
+            panic!("first lookup must create the cell")
+        };
         assert_eq!(
             first.cell().snapshot().lifecycle_admission(),
             LifecycleAdmission::Closed
@@ -347,6 +376,9 @@ mod tests {
         let first = first_process
             .ensure_closed(&cat_id, snapshot.clone())
             .expect("first process session");
+        let AdmissionCellSessionLookup::CreatedClosed(first) = first else {
+            panic!("first process must create the cell")
+        };
         let mut port = first.cell().port();
         let closed = port.snapshot();
         let open = AdmissionSnapshot::new(
@@ -373,6 +405,9 @@ mod tests {
         let second = second_process
             .ensure_closed(&cat_id, snapshot)
             .expect("successor process session");
+        let AdmissionCellSessionLookup::CreatedClosed(second) = second else {
+            panic!("successor process must create its own cell")
+        };
         assert_eq!(
             second.cell().snapshot().lifecycle_admission(),
             LifecycleAdmission::Closed

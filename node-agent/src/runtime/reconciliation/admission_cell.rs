@@ -44,6 +44,26 @@ pub struct AdmissionGuardCounts {
     pub endpoint_guards: Vec<EndpointGuardCount>,
 }
 
+/// One mutex-linearized projection of every AdmissionCell field visible to
+/// reconciliation and inventory. Keeping the snapshot and guard counts in
+/// one value prevents a scanner from binding routes from one instant to guard
+/// counts from another.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct AdmissionCellObservation {
+    snapshot: AdmissionSnapshot,
+    guards: AdmissionGuardCounts,
+}
+
+impl AdmissionCellObservation {
+    pub(crate) fn snapshot(&self) -> &AdmissionSnapshot {
+        &self.snapshot
+    }
+
+    pub(crate) fn guards(&self) -> &AdmissionGuardCounts {
+        &self.guards
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Error)]
 pub enum PlatformAdmissionError {
     #[error("platform admission is closed")]
@@ -103,6 +123,17 @@ impl AdmissionCell {
         AdmissionGuardCounts {
             platform_guards: state.platform_guards,
             endpoint_guards: nonzero_endpoint_guards(&state.endpoint_guards),
+        }
+    }
+
+    pub(crate) fn observe(&self) -> AdmissionCellObservation {
+        let state = self.lock_observing();
+        AdmissionCellObservation {
+            snapshot: state.snapshot.clone(),
+            guards: AdmissionGuardCounts {
+                platform_guards: state.platform_guards,
+                endpoint_guards: nonzero_endpoint_guards(&state.endpoint_guards),
+            },
         }
     }
 

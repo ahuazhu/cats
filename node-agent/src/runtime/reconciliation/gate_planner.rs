@@ -1329,6 +1329,22 @@ fn first_endpoint_action(
     Ok(None)
 }
 
+/// Returns only the deterministic next install edge. Other endpoint actions
+/// belong to the endpoint-only reconciler and are deliberately not treated as
+/// a Running-tail admission effect.
+pub(super) fn next_install_gate(
+    checkpoint: &RuntimeCheckpoint,
+    desired: &DesiredRuntimeSpec,
+) -> Result<Option<Id>, GateReconcileError> {
+    match first_endpoint_action(checkpoint, desired)? {
+        Some(EndpointAction::Install { endpoint_id, .. }) => Ok(Some(endpoint_id)),
+        Some(EndpointAction::Close { .. })
+        | Some(EndpointAction::PrepareChanged { .. })
+        | Some(EndpointAction::Remove { .. })
+        | None => Ok(None),
+    }
+}
+
 fn is_matching_close_step(checkpoint: &RuntimeCheckpoint, route: &CheckpointRouteGate) -> bool {
     matches!(
         &checkpoint.step,

@@ -117,6 +117,7 @@ pub(crate) mod inventory_probe_sealed {
     pub trait Sealed {}
 }
 
+pub(crate) use admission_cell::AdmissionCellObservation;
 pub use admission_cell::{
     AdmissionCell, AdmissionCellBuildError, AdmissionCellPort, AdmissionGuardCounts,
     PlatformAdmissionError, PlatformAdmissionGuard, RouteAdmissionGuard,
@@ -124,7 +125,9 @@ pub use admission_cell::{
 pub use admission_port::{
     AdmissionGatePort, AdmissionSnapshot, GatePortError, IdleCloseResult, SnapshotError,
 };
-pub(crate) use admission_registry::{AdmissionCellRegistry, AdmissionCellSession};
+pub(crate) use admission_registry::{
+    AdmissionCellRegistry, AdmissionCellSession, AdmissionCellSessionLookup,
+};
 pub use authorized_blockd::{
     authorized_blockd_command, authorized_blockd_status_is_bound, AuthorizedBlockFrontend,
     AuthorizedBlockdCheckpoint, AuthorizedBlockdLaunchConfig, AuthorizedBlockdStore,
