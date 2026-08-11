@@ -38,7 +38,8 @@ use super::product_rows::{
     load_endpoint_by_cat_name_unlocked, load_endpoint_by_id_for_update,
     load_endpoint_by_id_unlocked, load_hostname_lookup_for_update, load_hostname_lookup_unlocked,
     load_hostname_lookups_by_cat_unlocked, load_operation_by_cat_revision_unlocked,
-    load_operation_for_update, load_root_disk_by_cat_unlocked,
+    load_operation_by_workspace_unlocked, load_operation_for_update,
+    load_root_disk_by_cat_unlocked,
 };
 use super::rows::{
     database_now, insert_volume, load_any_volume_by_id_for_update, load_volume_for_update,
@@ -251,6 +252,13 @@ pub(crate) struct CatCreateCandidate {
     pub(crate) endpoint: EndpointRecordCandidate,
     pub(crate) hostname_lookup: HostnameDesiredLookup,
     pub(crate) operation_id: Id,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum RuntimeOperationRead {
+    Found(Box<Operation>),
+    NotFound,
+    Corrupt,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -542,6 +550,17 @@ pub(crate) fn encode_cat_name_conflict_response() -> Vec<u8> {
 }
 
 impl Store {
+    /// Read one canonical runtime Operation without exposing a global-ID
+    /// authority. The row codec validates the JSON record against every
+    /// denormalized projection before returning it.
+    pub(crate) fn get_runtime_operation(
+        &self,
+        workspace_id: &Id,
+        operation_id: &Id,
+    ) -> Result<RuntimeOperationRead> {
+        load_operation_by_workspace_unlocked(self, workspace_id, operation_id)
+    }
+
     /// Optional preflight optimization. It never reserves the key and never
     /// reads a resource; the create transaction below always rechecks.
     pub(super) fn covered_api_result_fast_lookup(

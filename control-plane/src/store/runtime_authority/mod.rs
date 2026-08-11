@@ -21,6 +21,8 @@ mod volume;
     reason = "A22 authenticated Store entrypoints are consumed when the internal HTTP routes are composed"
 )]
 pub(crate) mod volume_transition_auth;
+
+pub(crate) use product::RuntimeOperationRead;
 #[allow(
     dead_code,
     reason = "A22 transaction-local evidence loader is composed by the authenticated A23 route"

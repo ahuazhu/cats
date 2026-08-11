@@ -13,7 +13,7 @@ use super::pg_codec::{PgBigInt, SizeBytes};
 use super::product::{
     ApiIdempotencyRequest, ApiIdempotencyResult, CatRecord, DiskAdminState, DiskRecord, DiskRole,
     DiskSnapshotRecord, EndpointRecord, ExactContentType, HostnameDesiredLookup,
-    PersistentDiskInitialization,
+    PersistentDiskInitialization, RuntimeOperationRead,
 };
 use crate::store::transaction::{AuthorityTransactionError, AuthorityTxResult};
 use crate::store::{internal, Result, Store};
@@ -1101,6 +1101,26 @@ pub(super) fn load_operation_for_update(
         .query_opt(&sql, &[&operation_id.as_str()])?
         .map(|row| decode_operation_row(&row))
         .transpose()
+}
+
+pub(super) fn load_operation_by_workspace_unlocked(
+    store: &Store,
+    workspace_id: &Id,
+    operation_id: &Id,
+) -> Result<RuntimeOperationRead> {
+    let sql = format!(
+        "SELECT {OPERATION_COLUMNS} FROM runtime_operations
+          WHERE workspace_id=$1 AND operation_id=$2"
+    );
+    let row = store
+        .with(|client| client.query_opt(&sql, &[&workspace_id.as_str(), &operation_id.as_str()]))?;
+    Ok(match row {
+        None => RuntimeOperationRead::NotFound,
+        Some(row) => match decode_operation_row(&row) {
+            Ok(operation) => RuntimeOperationRead::Found(Box::new(operation)),
+            Err(_) => RuntimeOperationRead::Corrupt,
+        },
+    })
 }
 
 pub(super) fn load_operation_by_cat_revision_unlocked(

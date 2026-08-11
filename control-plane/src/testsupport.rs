@@ -322,6 +322,74 @@ pub async fn runtime_cutover_acceptance_facts(
         .expect("load runtime cutover acceptance facts")
 }
 
+/// Replace only the mutable settlement fields of one runtime Operation in an
+/// isolated schema. The canonical encoder validates the complete fixture;
+/// immutable identity and placement projections remain those written by the
+/// production Cat-create transaction.
+pub async fn settle_runtime_operation_for_test(
+    store: &Arc<crate::store::Store>,
+    operation: cats_api::runtime_reconciliation::Operation,
+) {
+    use cats_api::runtime_reconciliation::{encode_operation, OperationPhase};
+
+    let record = String::from_utf8(encode_operation(&operation).expect("valid test Operation"))
+        .expect("runtime wire JSON is UTF-8");
+    let phase = match operation.phase {
+        OperationPhase::Pending => "pending",
+        OperationPhase::Succeeded => "succeeded",
+        OperationPhase::Failed => "failed",
+        OperationPhase::Superseded => "superseded",
+    };
+    let terminal_kind = operation.terminal.as_ref().map(|_| phase);
+    let updated_at = i64::try_from(operation.updated_at_unix_ms.get())
+        .expect("test Operation timestamp fits PostgreSQL");
+    let operation_id = operation.operation_id;
+    store
+        .execute(move |store| {
+            store.with(|client| {
+                let changed = client.execute(
+                    "UPDATE runtime_operations
+                        SET record=$2::TEXT::jsonb, phase=$3,
+                            terminal_kind=$4, updated_at=$5
+                      WHERE operation_id=$1",
+                    &[
+                        &operation_id.as_str(),
+                        &record,
+                        &phase,
+                        &terminal_kind,
+                        &updated_at,
+                    ],
+                )?;
+                assert_eq!(changed, 1, "test Operation must already exist");
+                Ok(())
+            })
+        })
+        .await
+        .expect("settle isolated test Operation");
+}
+
+/// Introduce one deterministic projection mismatch in an isolated runtime
+/// Operation row so an HTTP test can exercise fatal-corruption policy.
+pub async fn corrupt_runtime_operation_projection_for_test(
+    store: &Arc<crate::store::Store>,
+    operation_id: cats_api::runtime_reconciliation::Id,
+) {
+    store
+        .execute(move |store| {
+            store.with(|client| {
+                let changed = client.execute(
+                    "UPDATE runtime_operations SET updated_at=updated_at+1
+                      WHERE operation_id=$1",
+                    &[&operation_id.as_str()],
+                )?;
+                assert_eq!(changed, 1, "test Operation must already exist");
+                Ok(())
+            })
+        })
+        .await
+        .expect("corrupt isolated test Operation projection");
+}
+
 /// Expire one isolated test session while preserving every JSON/projection
 /// invariant. The immutable-attempt trigger is disabled only inside this
 /// disposable-schema transaction and is restored before commit.

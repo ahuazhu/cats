@@ -53,6 +53,7 @@ mod persistent_disk_create_v1;
 pub(crate) mod route_resolve_v2;
 mod routes;
 pub(crate) mod runtime_node_authority;
+mod runtime_operations;
 mod runtime_spine;
 mod runtime_volume_transitions;
 mod sessions;
@@ -580,6 +581,14 @@ pub fn router(state: AppState) -> Router {
                     .fallback(runtime_volume_transitions::evidence),
             )
     };
+    let runtime_operation_read = if state.retired_product_authority_for_tests {
+        Router::new()
+    } else {
+        Router::new().route(
+            "/v1/workspaces/{workspace}/operations/{operation}",
+            get(runtime_operations::get_runtime_operation),
+        )
+    };
     let route_resolve_v2 = Router::<AppState>::new()
         .route(
             "/v1/internal/routes/resolve",
@@ -697,6 +706,7 @@ pub fn router(state: AppState) -> Router {
         )
         .route("/v1/billing/stripe/webhook", post(stripe_webhook))
         .route("/v1/admin/workspaces", get(admin_list_workspaces))
+        .merge(runtime_operation_read)
         .merge(runtime_volume_authority)
         .merge(route_resolve_v2)
         .merge(retired_product_support)
@@ -849,6 +859,7 @@ GET /v1/workspaces/{workspace}/disks
 GET /v1/workspaces/{workspace}/disks/{disk}
 GET /v1/workspaces/{workspace}/disks/{disk}/snapshots
 GET /v1/workspaces/{workspace}/operations
+GET /v1/workspaces/{workspace}/operations/{operation}
 GET /v1/workspaces/{workspace}/tokens
 GET /zh-CN
 GET /zh-CN/

@@ -28,7 +28,7 @@ use super::product::{
     CatCreateCandidate, CatCreateEnvelopes, CoveredCatCreateError, CoveredCatCreateRequest,
     DiskAdminState, DiskRecord, DiskRecordCandidate, DiskRole, EndpointRecord,
     EndpointRecordCandidate, ExactContentType, ExactHttpResponse, HostnameDesiredLocation,
-    HostnameDesiredLookup, IfMatchFingerprint, PersistentDiskInitialization,
+    HostnameDesiredLookup, IfMatchFingerprint, PersistentDiskInitialization, RuntimeOperationRead,
 };
 use super::product_rows::{
     insert_disk, insert_endpoint, insert_hostname_lookup, insert_operation,
@@ -1855,6 +1855,46 @@ fn every_query_projection_drift_fails_closed_without_a_409_result() {
         assert_eq!(error_code(error), ErrorCode::Internal, "table {table}");
         assert_eq!(counts(&store), [1, 1, 1, 1, 1, 1, 1, 1], "table {table}");
     }
+}
+
+#[test]
+fn runtime_operation_exact_get_is_workspace_qualified_and_projection_closed() {
+    let (_url, store, _second, workspace) = stores();
+    let create = request(&workspace, "operation-read", 1, "operation-read");
+    store
+        .create_cat_covered_without_admission_for_product_test(&create)
+        .unwrap();
+
+    let RuntimeOperationRead::Found(operation) = store
+        .get_runtime_operation(&workspace, &create.candidate.operation_id)
+        .unwrap()
+    else {
+        panic!("created runtime Operation was not readable");
+    };
+    assert_eq!(operation.operation_id, create.candidate.operation_id);
+    assert_eq!(operation.workspace_id, workspace);
+    assert_eq!(
+        store
+            .get_runtime_operation(&id("ws_other"), &operation.operation_id)
+            .unwrap(),
+        RuntimeOperationRead::NotFound
+    );
+
+    store
+        .with(|client| {
+            client.execute(
+                "UPDATE runtime_operations SET updated_at=updated_at+1
+                  WHERE operation_id=$1",
+                &[&operation.operation_id.as_str()],
+            )
+        })
+        .unwrap();
+    assert_eq!(
+        store
+            .get_runtime_operation(&workspace, &operation.operation_id)
+            .unwrap(),
+        RuntimeOperationRead::Corrupt
+    );
 }
 
 #[test]

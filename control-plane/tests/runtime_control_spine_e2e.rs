@@ -1,9 +1,9 @@
 //! Cross-router PostgreSQL acceptance for the production runtime authority.
 //!
-//! Every mutation below enters through one of two independently composed
-//! production HTTP servers sharing only their durable PostgreSQL schema and
-//! configured authorities. Direct Store access is reserved for the final
-//! read-only cardinality/lease projection.
+//! Production authority mutations enter through one of two independently
+//! composed HTTP servers sharing only their durable PostgreSQL schema and
+//! configured authorities. Direct Store access is limited to explicit test
+//! setup/terminal-corruption fixtures and the final read-only facts projection.
 
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
@@ -24,16 +24,18 @@ use cats_api::runtime_node_authority::{
 };
 use cats_api::runtime_reconciliation::{
     decode_agent_session, decode_desired_read_snapshot, decode_observation_acceptance,
-    decode_runtime_node_authority_apply_result, encode_agent_registration_attempt,
-    encode_desired_read_request, encode_node_observation, encode_runtime_node_authority_apply,
-    guest_config_digest, inventory_digest, AgentRegistrationAttempt, AllocatableMemoryBytes,
-    AllocatableVcpus, ContractVersion, CredentialBinding, DesiredReadRequest, Durability, Epoch,
-    GuestIpv4Pool, GuestIpv4PoolKind, Id, Ipv4Address, NodeBootId, NodeIdentity, NodeIdentityState,
-    NodeObservation, NodePlacementPolicy, NodeTransportTarget, RandomId128,
-    RuntimeNodeAuthorityApply, RuntimeNodeAuthorityMutation, RuntimeNodeAuthorityOutcome,
-    RuntimePlacementBlockFrontend, RuntimePlacementCapabilities, RuntimePlacementGuestNetwork,
-    RuntimePlacementGuestTransport, RuntimePlacementVmm, RuntimeSchedulingState, Sequence,
-    SessionBinding, Sha256Digest, UnixMillis, DESIRED_READ_PATH, OBSERVATION_PATH,
+    decode_operation, decode_runtime_node_authority_apply_result,
+    encode_agent_registration_attempt, encode_desired_read_request, encode_node_observation,
+    encode_operation, encode_runtime_node_authority_apply, guest_config_digest, inventory_digest,
+    AgentRegistrationAttempt, AllocatableMemoryBytes, AllocatableVcpus, ContractVersion,
+    CredentialBinding, DesiredReadRequest, Durability, Epoch, GuestIpv4Pool, GuestIpv4PoolKind, Id,
+    Ipv4Address, NodeBootId, NodeIdentity, NodeIdentityState, NodeObservation, NodePlacementPolicy,
+    NodeTransportTarget, Operation, OperationFailure, OperationPhase, OperationSuccess,
+    OperationTerminal, RandomId128, Revision, RuntimeNodeAuthorityApply,
+    RuntimeNodeAuthorityMutation, RuntimeNodeAuthorityOutcome, RuntimePlacementBlockFrontend,
+    RuntimePlacementCapabilities, RuntimePlacementGuestNetwork, RuntimePlacementGuestTransport,
+    RuntimePlacementVmm, RuntimeSchedulingState, Sequence, SessionBinding, Sha256Digest,
+    UnixMillis, DESIRED_READ_PATH, OBSERVATION_PATH,
 };
 use cats_control_plane::controller::AutoTierPolicy;
 use cats_control_plane::server::{
@@ -371,6 +373,21 @@ impl Context {
             .header("Idempotency-Key", idempotency_key)
             .body(PERSISTENT_DISK_CREATE_BODY.to_vec())
     }
+
+    fn operation_request(
+        &self,
+        server: &Handle,
+        workspace_id: &str,
+        operation_id: &str,
+    ) -> RequestBuilder {
+        self.http
+            .get(format!(
+                "{}/v1/workspaces/{workspace_id}/operations/{operation_id}",
+                server.base_url()
+            ))
+            .bearer_auth(ADMIN_TOKEN)
+            .header(reqwest::header::ACCEPT, JSON_CONTENT_TYPE)
+    }
 }
 
 fn id(value: &str) -> Id {
@@ -523,6 +540,12 @@ async fn send_through_replica_barrier(
     tokio::join!(first, second)
 }
 
+async fn assert_exact_operation_response(response: Response, expected: &Operation) {
+    let body = json_body(response, StatusCode::OK).await;
+    assert_eq!(body, encode_operation(expected).unwrap());
+    assert_eq!(decode_operation(&body).unwrap(), *expected);
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn production_replicas_share_registration_observation_and_cat_create_authority() {
     let context = Context::new().await;
@@ -645,12 +668,13 @@ async fn production_replicas_share_registration_observation_and_cat_create_autho
     );
     let workspaces: ListResponse<cats_api::auth::Workspace> =
         serde_json::from_slice(&workspaces.bytes().await.unwrap()).unwrap();
-    let workspace_id = workspaces
+    let workspace = workspaces
         .items
         .into_iter()
         .find(|workspace| workspace.is_default)
-        .expect("bootstrap account has one default Workspace")
-        .id;
+        .expect("bootstrap account has one default Workspace");
+    let workspace_id = workspace.id;
+    let account_id = workspace.account_id;
     let idempotency_key = "two-replica-cat-create";
     let (first_create, second_create) = send_through_replica_barrier(
         context.cat_create_request(&context.first, &workspace_id, idempotency_key),
@@ -746,6 +770,123 @@ async fn production_replicas_share_registration_observation_and_cat_create_autho
         .unwrap();
     assert_eq!(json_body(replay, StatusCode::OK).await, desired_body);
 
+    // Public Operation observation is workspace-qualified and reads the exact
+    // canonical runtime_operations record written by Cat-create.
+    let operation_path = format!(
+        "{}/v1/workspaces/{workspace_id}/operations/{}",
+        context.first.base_url(),
+        created.operation_id
+    );
+    let unauthenticated = context.http.get(&operation_path).send().await.unwrap();
+    assert_eq!(
+        json_body(unauthenticated, StatusCode::UNAUTHORIZED).await,
+        br#"{"code":"unauthenticated","message":"missing or invalid authentication credential"}"#
+    );
+
+    let missing = context
+        .operation_request(&context.first, &workspace_id, "op_missing")
+        .send()
+        .await
+        .unwrap();
+    let missing_body = json_body(missing, StatusCode::NOT_FOUND).await;
+    assert_eq!(
+        missing_body,
+        br#"{"code":"not_found","message":"operation not found"}"#
+    );
+
+    let sibling_workspace = context
+        .first
+        .state
+        .store
+        .execute(move |store| store.create_workspace(&account_id, "sibling", "Sibling"))
+        .await
+        .unwrap();
+    let wrong_workspace = context
+        .operation_request(
+            &context.second,
+            &sibling_workspace.id,
+            created.operation_id.as_str(),
+        )
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        json_body(wrong_workspace, StatusCode::NOT_FOUND).await,
+        missing_body
+    );
+
+    let pending_response = context
+        .operation_request(
+            &context.second,
+            &workspace_id,
+            created.operation_id.as_str(),
+        )
+        .send()
+        .await
+        .unwrap();
+    let pending_body = json_body(pending_response, StatusCode::OK).await;
+    let pending = decode_operation(&pending_body).unwrap();
+    assert_eq!(pending.operation_id, created.operation_id);
+    assert_eq!(pending.workspace_id.as_str(), workspace_id);
+    assert_eq!(pending.phase, OperationPhase::Pending);
+    assert_eq!(pending_body, encode_operation(&pending).unwrap());
+
+    let completed_at = UnixMillis::new(pending.updated_at_unix_ms.get() + 1).unwrap();
+    let mut succeeded = pending.clone();
+    succeeded.phase = OperationPhase::Succeeded;
+    succeeded.updated_at_unix_ms = completed_at;
+    succeeded.terminal = Some(OperationTerminal::Succeeded {
+        result: OperationSuccess {
+            observation_id: random("55555555555555555555555555555555"),
+            node_id: succeeded.placement.node_id.clone(),
+            agent_session_epoch: session.agent_session_epoch,
+            heartbeat_sequence: Sequence::new(2).unwrap(),
+            observed_target: succeeded.target,
+            runtime_incarnation: Some(random("66666666666666666666666666666666")),
+        },
+        completed_at_unix_ms: completed_at,
+    });
+
+    let mut failed = pending.clone();
+    failed.phase = OperationPhase::Failed;
+    failed.updated_at_unix_ms = completed_at;
+    failed.terminal = Some(OperationTerminal::Failed {
+        error: Box::new(OperationFailure::HostLost {
+            node_id: failed.placement.node_id.clone(),
+            agent_session_epoch: session.agent_session_epoch,
+            host_fence_event_id: id("fence_operation_read"),
+        }),
+        completed_at_unix_ms: completed_at,
+    });
+
+    let mut superseded = pending.clone();
+    superseded.phase = OperationPhase::Superseded;
+    superseded.updated_at_unix_ms = completed_at;
+    superseded.terminal = Some(OperationTerminal::Superseded {
+        superseded_by_revision: Revision::new(pending.desired_revision.get() + 1).unwrap(),
+        superseded_by_operation_id: id("op_replacement"),
+        completed_at_unix_ms: completed_at,
+    });
+
+    for (index, terminal) in [succeeded, failed, superseded].into_iter().enumerate() {
+        cats_control_plane::testsupport::settle_runtime_operation_for_test(
+            &context.first.state.store,
+            terminal.clone(),
+        )
+        .await;
+        let server = if index % 2 == 0 {
+            &context.first
+        } else {
+            &context.second
+        };
+        let response = context
+            .operation_request(server, &workspace_id, terminal.operation_id.as_str())
+            .send()
+            .await
+            .unwrap();
+        assert_exact_operation_response(response, &terminal).await;
+    }
+
     let facts = cats_control_plane::testsupport::runtime_cutover_acceptance_facts(
         &context.first.state.store,
         session.node_id.clone(),
@@ -784,6 +925,28 @@ async fn production_replicas_share_registration_observation_and_cat_create_autho
             stored_api_response_body: Some(first_create_body),
             stored_persistent_disk_response_body: Some(first_disk_body),
         }
+    );
+
+    cats_control_plane::testsupport::corrupt_runtime_operation_projection_for_test(
+        &context.first.state.store,
+        created.operation_id.clone(),
+    )
+    .await;
+    let corrupt = context
+        .operation_request(&context.first, &workspace_id, created.operation_id.as_str())
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(corrupt.status(), StatusCode::INTERNAL_SERVER_ERROR);
+    assert_eq!(
+        context
+            .http
+            .get(format!("{}/healthz", context.first.base_url()))
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        StatusCode::SERVICE_UNAVAILABLE
     );
 
     context.first.shutdown().await.unwrap();
