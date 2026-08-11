@@ -6015,8 +6015,14 @@ fn direct_successor_is_monotonic(
             let AuthorizationConsumedReceipt::Takeover(receipt) = receipt.as_ref() else {
                 return false;
             };
-            authorization.expected_attachment_id == primary_receipt.new_attachment_id
-                && authorization.expected_epoch == primary_receipt.resulting_epoch
+            ((authorization.expected_attachment_id == primary_receipt.new_attachment_id
+                && authorization.expected_epoch == primary_receipt.resulting_epoch)
+                // A signed direct authorization may describe the current tip
+                // after one or more intervening ownership cycles. A strictly
+                // higher predecessor epoch is itself a closed fence over the
+                // primary receipt; equal epoch with another owner remains a
+                // competing branch.
+                || authorization.expected_epoch > primary_receipt.resulting_epoch)
                 && remote_head_same_or_later(
                     &receipt.resulting_head,
                     &primary_receipt.resulting_head,
@@ -6026,8 +6032,9 @@ fn direct_successor_is_monotonic(
             VolumeAuthorization::DisposableRootDelete(authorization),
             AuthorizationState::Consumed(_),
         ) => {
-            authorization.expected_attachment_id == primary_receipt.new_attachment_id
-                && authorization.expected_epoch == primary_receipt.resulting_epoch
+            ((authorization.expected_attachment_id == primary_receipt.new_attachment_id
+                && authorization.expected_epoch == primary_receipt.resulting_epoch)
+                || authorization.expected_epoch > primary_receipt.resulting_epoch)
                 && remote_head_same_or_later(
                     &authorization.expected_head,
                     &primary_receipt.resulting_head,

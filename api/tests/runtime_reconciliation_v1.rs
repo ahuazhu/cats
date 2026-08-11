@@ -169,6 +169,16 @@ fn takeover_evidence_with_direct_successor() -> serde_json::Value {
     success
 }
 
+fn takeover_evidence_with_higher_direct_successor() -> serde_json::Value {
+    let mut success = takeover_evidence_with_direct_successor();
+    success["direct_successor_authorization"]["authorization"]["expected_attachment_id"] =
+        "att_later_predecessor".into();
+    success["direct_successor_authorization"]["authorization"]["expected_epoch"] = 8.into();
+    success["direct_successor_authorization"]["state"]["receipt"]["resulting_epoch"] = 9.into();
+    success["current_volume"]["lease_epoch"] = 9.into();
+    success
+}
+
 fn nonzero_remote_head() -> serde_json::Value {
     serde_json::json!({
         "generation": 1,
@@ -1790,6 +1800,13 @@ fn a22_evidence_success_codec_requires_the_complete_authority_closure() {
     )
     .unwrap();
 
+    // The signed direct row may be the visible tip after intermediate
+    // ownership cycles. A strictly higher predecessor epoch still proves the
+    // primary takeover fenced; no omitted row is inferred as a writer grant.
+    let higher_direct = takeover_evidence_with_higher_direct_successor();
+    decode_runtime_volume_transition_evidence_success(&serde_json::to_vec(&higher_direct).unwrap())
+        .unwrap();
+
     let mut wrong_volume = takeover_evidence_with_direct_successor();
     wrong_volume["direct_successor_authorization"]["authorization"]["volume_id"] =
         "vol_other".into();
@@ -1810,6 +1827,17 @@ fn a22_evidence_success_codec_requires_the_complete_authority_closure() {
     non_monotonic["direct_successor_authorization"]["authorization"]["expected_attachment_id"] =
         "att_unrelated".into();
     assert_direct_successor_invalid(non_monotonic);
+
+    let mut conflicting_head = takeover_evidence_with_higher_direct_successor();
+    conflicting_head["authorization"]["state"]["receipt"]["resulting_head"] = nonzero_remote_head();
+    let mut other_head = nonzero_remote_head();
+    other_head["root_hash"] =
+        "sha256:1111111111111111111111111111111111111111111111111111111111111111".into();
+    other_head["root_object_id"] = "volumes/vol_root/roots/conflict".into();
+    conflicting_head["direct_successor_authorization"]["state"]["receipt"]["resulting_head"] =
+        other_head.clone();
+    conflicting_head["current_volume"]["head"] = other_head;
+    assert_direct_successor_invalid(conflicting_head);
 }
 
 fn assert_direct_successor_invalid(value: serde_json::Value) {

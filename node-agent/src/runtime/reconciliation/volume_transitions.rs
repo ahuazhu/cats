@@ -450,15 +450,14 @@ fn closed_takeover_successor(
                 deleting_head,
                 ..
             } => {
-                is_epoch_offset(
-                    primary_receipt.resulting_epoch.get(),
-                    request.expected_unowned_epoch.get(),
-                    1,
-                ) && is_epoch_offset(
-                    primary_receipt.resulting_epoch.get(),
-                    deleting_epoch.get(),
-                    2,
-                ) && remote_head_is_same_or_later(deleting_head, &primary_receipt.resulting_head)
+                request.volume_id == primary_receipt.volume_id
+                    && request.expected_unowned_epoch > primary_receipt.resulting_epoch
+                    && is_epoch_offset(
+                        request.expected_unowned_epoch.get(),
+                        deleting_epoch.get(),
+                        1,
+                    )
+                    && remote_head_is_same_or_later(deleting_head, &primary_receipt.resulting_head)
             }
             DeleteCompletionReceipt::DisposableRoot { .. } => evidence
                 .direct_successor_authorization
@@ -478,15 +477,26 @@ fn closed_takeover_successor(
             true
         }
         Some(LastVolumeTransition::Takeover { .. })
-        | Some(LastVolumeTransition::BeginDisposableDelete { .. }) => evidence
-            .direct_successor_authorization
-            .as_ref()
-            .is_some_and(|direct| direct_authorization_follows_takeover(direct, primary_receipt)),
+        | Some(LastVolumeTransition::BeginDisposableDelete { .. }) => {
+            evidence
+                .direct_successor_authorization
+                .as_ref()
+                .is_some_and(|direct| {
+                    direct_authorization_follows_takeover(direct, primary_receipt)
+                })
+                && remote_head_is_same_or_later(&current.head, &primary_receipt.resulting_head)
+        }
         Some(LastVolumeTransition::Release { request, result }) => {
-            request.attachment_id == primary_receipt.new_attachment_id
-                && request.expected_epoch == primary_receipt.resulting_epoch
+            ((request.attachment_id == primary_receipt.new_attachment_id
+                && request.expected_epoch == primary_receipt.resulting_epoch)
+                // A strictly later owner may itself have released. The
+                // validated Release pair and higher expected epoch prove the
+                // primary takeover was fenced without guessing the omitted
+                // intervening markers. Equal epoch with another attachment
+                // remains a competing branch and is blocked.
+                || request.expected_epoch > primary_receipt.resulting_epoch)
                 && is_epoch_offset(
-                    primary_receipt.resulting_epoch.get(),
+                    request.expected_epoch.get(),
                     result.resulting_epoch.get(),
                     1,
                 )
@@ -496,18 +506,17 @@ fn closed_takeover_successor(
                 )
         }
         Some(LastVolumeTransition::BeginDelete { request, result }) => {
-            is_epoch_offset(
-                primary_receipt.resulting_epoch.get(),
-                request.expected_unowned_epoch.get(),
-                1,
-            ) && is_epoch_offset(
-                primary_receipt.resulting_epoch.get(),
-                result.resulting_epoch.get(),
-                2,
-            ) && remote_head_is_same_or_later(
-                &result.resulting_head,
-                &primary_receipt.resulting_head,
-            )
+            request.volume_id == primary_receipt.volume_id
+                && request.expected_unowned_epoch > primary_receipt.resulting_epoch
+                && is_epoch_offset(
+                    request.expected_unowned_epoch.get(),
+                    result.resulting_epoch.get(),
+                    1,
+                )
+                && remote_head_is_same_or_later(
+                    &result.resulting_head,
+                    &primary_receipt.resulting_head,
+                )
         }
         Some(LastVolumeTransition::NormalAcquire { request, result }) => {
             request.volume_id == primary_receipt.volume_id
@@ -544,13 +553,15 @@ fn direct_authorization_follows_takeover(
     match &direct.authorization {
         VolumeAuthorization::Takeover(authorization) => {
             authorization.volume_id == primary_receipt.volume_id
-                && authorization.expected_attachment_id == primary_receipt.new_attachment_id
-                && authorization.expected_epoch == primary_receipt.resulting_epoch
+                && ((authorization.expected_attachment_id == primary_receipt.new_attachment_id
+                    && authorization.expected_epoch == primary_receipt.resulting_epoch)
+                    || authorization.expected_epoch > primary_receipt.resulting_epoch)
         }
         VolumeAuthorization::DisposableRootDelete(authorization) => {
             authorization.volume_id == primary_receipt.volume_id
-                && authorization.expected_attachment_id == primary_receipt.new_attachment_id
-                && authorization.expected_epoch == primary_receipt.resulting_epoch
+                && ((authorization.expected_attachment_id == primary_receipt.new_attachment_id
+                    && authorization.expected_epoch == primary_receipt.resulting_epoch)
+                    || authorization.expected_epoch > primary_receipt.resulting_epoch)
                 && remote_head_is_same_or_later(
                     &authorization.expected_head,
                     &primary_receipt.resulting_head,
@@ -569,8 +580,9 @@ mod tests {
 
     use cats_api::runtime_reconciliation::{
         decode_runtime_volume_transition_evidence_request,
-        encode_runtime_volume_transition_evidence_request, Epoch, FenceEpoch, NormalAcquireRequest,
-        ReleaseRequest, Revision,
+        encode_runtime_volume_transition_evidence_request, BeginDeleteRequest,
+        DisposableDeleteIsolationBasis, DisposableRootDeleteAuthorization, Epoch, FenceEpoch,
+        NormalAcquireRequest, ReleaseRequest, Revision,
     };
 
     use super::*;
@@ -813,7 +825,80 @@ mod tests {
 
         assert_eq!(
             classify_evidence(&evidence).unwrap(),
-            VolumeEvidenceRecoveryDecision::AdoptTakeover(primary_receipt)
+            VolumeEvidenceRecoveryDecision::AdoptTakeover(primary_receipt.clone())
+        );
+
+        let higher_id = Id::new("auth_03").unwrap();
+        let higher_attachment = Id::new("att_higher").unwrap();
+        evidence.direct_successor_authorization = Some(AuthorizationRecord {
+            authorization: VolumeAuthorization::Takeover(
+                cats_api::runtime_reconciliation::VolumeTakeoverAuthorization {
+                    authorization_id: higher_id.clone(),
+                    authorized_node_id: Id::new("node_c").unwrap(),
+                    host_fence_event_id: Id::new("fence_03").unwrap(),
+                    volume_id: primary_receipt.volume_id.clone(),
+                    expected_attachment_id: Id::new("att_next").unwrap(),
+                    expected_epoch: FenceEpoch::new(5).unwrap(),
+                    new_attachment_id: higher_attachment.clone(),
+                    desired_revision: Revision::new(10).unwrap(),
+                    new_placement_epoch: Epoch::new(6).unwrap(),
+                    lease_duration_ms: 60_000,
+                    not_after: cats_api::runtime_reconciliation::UnixMillis::new(1_720_000_050_000)
+                        .unwrap(),
+                },
+            ),
+            state: AuthorizationState::Consumed(Box::new(AuthorizationConsumedReceipt::Takeover(
+                TakeoverConsumedReceipt {
+                    authorization_id: higher_id.clone(),
+                    host_fence_event_id: Id::new("fence_03").unwrap(),
+                    volume_id: primary_receipt.volume_id.clone(),
+                    new_attachment_id: higher_attachment.clone(),
+                    resulting_epoch: FenceEpoch::new(6).unwrap(),
+                    resulting_head: primary_receipt.resulting_head.clone(),
+                    consumed_at: cats_api::runtime_reconciliation::UnixMillis::new(
+                        1_720_000_002_000,
+                    )
+                    .unwrap(),
+                },
+            ))),
+        });
+        let current = evidence.current_volume.as_mut().unwrap();
+        current.lease_owner = Some(higher_attachment);
+        current.lease_epoch = FenceEpoch::new(6).unwrap();
+        current.lease_expires_at =
+            Some(cats_api::runtime_reconciliation::UnixMillis::new(1_720_000_062_000).unwrap());
+        current.last_transition = Some(LastVolumeTransition::Takeover {
+            authorization_id: higher_id,
+        });
+        assert_eq!(
+            classify_evidence(&evidence).unwrap(),
+            VolumeEvidenceRecoveryDecision::AdoptTakeover(primary_receipt.clone())
+        );
+
+        // Equal epoch plus another predecessor attachment is a competing
+        // branch, even when the direct authorization/receipt are otherwise
+        // internally consistent.
+        let direct = evidence.direct_successor_authorization.as_mut().unwrap();
+        let VolumeAuthorization::Takeover(authorization) = &mut direct.authorization else {
+            unreachable!()
+        };
+        authorization.expected_epoch = primary_receipt.resulting_epoch;
+        let AuthorizationState::Consumed(receipt) = &mut direct.state else {
+            unreachable!()
+        };
+        let AuthorizationConsumedReceipt::Takeover(receipt) = receipt.as_mut() else {
+            unreachable!()
+        };
+        receipt.resulting_epoch =
+            FenceEpoch::new(primary_receipt.resulting_epoch.get() + 1).unwrap();
+        let current = evidence.current_volume.as_mut().unwrap();
+        current.lease_epoch = receipt.resulting_epoch;
+        assert!(
+            !matches!(
+                classify_evidence(&evidence),
+                Ok(VolumeEvidenceRecoveryDecision::AdoptTakeover(_))
+            ),
+            "an equal-epoch foreign direct authorization must not close the primary takeover"
         );
     }
 
@@ -873,6 +958,241 @@ mod tests {
         assert_eq!(
             classify_evidence(&evidence).unwrap(),
             VolumeEvidenceRecoveryDecision::AdoptTakeover(primary_receipt)
+        );
+    }
+
+    #[test]
+    fn takeover_higher_release_requires_a_strictly_later_closed_branch() {
+        let (mut evidence, primary_receipt) = takeover_then_normal_reacquire_evidence();
+        let reacquired = evidence.current_volume.take().unwrap();
+        let (released, _) = cats_storage::authority::release(
+            &reacquired,
+            &ReleaseRequest {
+                volume_id: primary_receipt.volume_id.clone(),
+                transition_id: cats_api::runtime_reconciliation::RandomId128::new(
+                    "77777777777777777777777777777777",
+                )
+                .unwrap(),
+                attachment_id: reacquired.lease_owner.clone().unwrap(),
+                expected_epoch: reacquired.lease_epoch,
+            },
+        )
+        .unwrap();
+        evidence.current_volume = Some(released);
+        assert_eq!(
+            classify_evidence(&evidence).unwrap(),
+            VolumeEvidenceRecoveryDecision::AdoptTakeover(primary_receipt.clone())
+        );
+
+        // Another attachment at the primary epoch is a competing branch, not
+        // a historical successor. Even an internally consistent Release pair
+        // must not close the primary takeover without a strictly later epoch.
+        let current = evidence.current_volume.as_mut().unwrap();
+        let Some(LastVolumeTransition::Release { request, result }) =
+            current.last_transition.as_mut()
+        else {
+            unreachable!()
+        };
+        request.expected_epoch = primary_receipt.resulting_epoch;
+        result.resulting_epoch =
+            FenceEpoch::new(primary_receipt.resulting_epoch.get() + 1).unwrap();
+        current.lease_epoch = result.resulting_epoch;
+        assert_eq!(
+            classify_evidence(&evidence).unwrap(),
+            VolumeEvidenceRecoveryDecision::Blocked
+        );
+    }
+
+    #[test]
+    fn takeover_higher_normal_delete_and_completion_close_the_primary() {
+        let (mut evidence, primary_receipt) = takeover_then_normal_reacquire_evidence();
+        let reacquired = evidence.current_volume.take().unwrap();
+        let (released, _) = cats_storage::authority::release(
+            &reacquired,
+            &ReleaseRequest {
+                volume_id: primary_receipt.volume_id.clone(),
+                transition_id: cats_api::runtime_reconciliation::RandomId128::new(
+                    "88888888888888888888888888888888",
+                )
+                .unwrap(),
+                attachment_id: reacquired.lease_owner.clone().unwrap(),
+                expected_epoch: reacquired.lease_epoch,
+            },
+        )
+        .unwrap();
+        let request = BeginDeleteRequest {
+            delete_id: Id::new("delete_after_later_owner").unwrap(),
+            disk_id: Id::new("disk_root").unwrap(),
+            volume_id: primary_receipt.volume_id.clone(),
+            expected_unowned_epoch: released.lease_epoch,
+            expected_head: released.head.clone(),
+        };
+        let (deleting, _) = cats_storage::authority::begin_delete(&released, &request).unwrap();
+        evidence.current_volume = Some(deleting.clone());
+        assert_eq!(
+            classify_evidence(&evidence).unwrap(),
+            VolumeEvidenceRecoveryDecision::AdoptTakeover(primary_receipt.clone())
+        );
+
+        evidence.current_volume = None;
+        evidence.delete_completion = Some(
+            cats_storage::authority::complete_normal_delete(
+                &deleting,
+                cats_api::runtime_reconciliation::UnixMillis::new(1_720_000_090_000).unwrap(),
+            )
+            .unwrap(),
+        );
+        assert_eq!(
+            classify_evidence(&evidence).unwrap(),
+            VolumeEvidenceRecoveryDecision::AdoptTakeover(primary_receipt.clone())
+        );
+
+        let DeleteCompletionReceipt::Normal {
+            request,
+            deleting_epoch,
+            ..
+        } = evidence.delete_completion.as_mut().unwrap()
+        else {
+            unreachable!()
+        };
+        request.expected_unowned_epoch = primary_receipt.resulting_epoch;
+        *deleting_epoch = FenceEpoch::new(primary_receipt.resulting_epoch.get() + 1).unwrap();
+        assert!(
+            !matches!(
+                classify_evidence(&evidence),
+                Ok(VolumeEvidenceRecoveryDecision::AdoptTakeover(_))
+            ),
+            "an equal-epoch foreign delete branch must not close the primary takeover"
+        );
+    }
+
+    #[test]
+    fn takeover_higher_disposable_delete_and_completion_require_signed_direct_proof() {
+        let (mut evidence, primary_receipt) = takeover_then_normal_reacquire_evidence();
+        let predecessor = evidence.current_volume.take().unwrap();
+        let authorization_id = Id::new("auth_disposable_higher").unwrap();
+        let authorization = DisposableRootDeleteAuthorization {
+            authorization_id: authorization_id.clone(),
+            authorized_node_id: Id::new("node_c").unwrap(),
+            delete_id: Id::new("delete_disposable_higher").unwrap(),
+            disk_id: Id::new("disk_root").unwrap(),
+            volume_id: primary_receipt.volume_id.clone(),
+            cat_id: Id::new("cat_01").unwrap(),
+            desired_revision: Revision::new(10).unwrap(),
+            placement_epoch: Epoch::new(6).unwrap(),
+            expected_attachment_id: predecessor.lease_owner.clone().unwrap(),
+            expected_epoch: predecessor.lease_epoch,
+            expected_head: predecessor.head.clone(),
+            isolation_basis: DisposableDeleteIsolationBasis::HostFenceEvent {
+                event_id: Id::new("fence_disposable_higher").unwrap(),
+            },
+            not_after: cats_api::runtime_reconciliation::UnixMillis::new(1_720_000_100_000)
+                .unwrap(),
+        };
+        let receipt = BeginDisposableDeleteConsumedReceipt {
+            authorization_id: authorization_id.clone(),
+            volume_id: primary_receipt.volume_id.clone(),
+            disk_id: authorization.disk_id.clone(),
+            cat_id: authorization.cat_id.clone(),
+            delete_id: authorization.delete_id.clone(),
+            prior_attachment_id: authorization.expected_attachment_id.clone(),
+            resulting_epoch: FenceEpoch::new(authorization.expected_epoch.get() + 1).unwrap(),
+            resulting_head: authorization.expected_head.clone(),
+            consumed_at: cats_api::runtime_reconciliation::UnixMillis::new(1_720_000_020_000)
+                .unwrap(),
+        };
+        let direct = AuthorizationRecord {
+            authorization: VolumeAuthorization::DisposableRootDelete(authorization.clone()),
+            state: AuthorizationState::Consumed(Box::new(
+                AuthorizationConsumedReceipt::BeginDisposableDelete(receipt.clone()),
+            )),
+        };
+        let mut deleting = predecessor;
+        deleting.admin_state = VolumeAdminState::Deleting {
+            delete_id: authorization.delete_id.clone(),
+        };
+        deleting.lease_owner = None;
+        deleting.lease_epoch = receipt.resulting_epoch;
+        deleting.lease_expires_at = None;
+        deleting.last_transition = Some(LastVolumeTransition::BeginDisposableDelete {
+            authorization_id: authorization_id.clone(),
+        });
+        evidence.current_volume = Some(deleting.clone());
+        evidence.direct_successor_authorization = Some(direct.clone());
+        assert_eq!(
+            classify_evidence(&evidence).unwrap(),
+            VolumeEvidenceRecoveryDecision::AdoptTakeover(primary_receipt.clone())
+        );
+
+        let mut equal_epoch = evidence.clone();
+        let equal_direct = equal_epoch.direct_successor_authorization.as_mut().unwrap();
+        let VolumeAuthorization::DisposableRootDelete(equal_authorization) =
+            &mut equal_direct.authorization
+        else {
+            unreachable!()
+        };
+        equal_authorization.expected_epoch = primary_receipt.resulting_epoch;
+        let AuthorizationState::Consumed(equal_receipt) = &mut equal_direct.state else {
+            unreachable!()
+        };
+        let AuthorizationConsumedReceipt::BeginDisposableDelete(equal_receipt) =
+            equal_receipt.as_mut()
+        else {
+            unreachable!()
+        };
+        equal_receipt.resulting_epoch =
+            FenceEpoch::new(primary_receipt.resulting_epoch.get() + 1).unwrap();
+        equal_epoch.current_volume.as_mut().unwrap().lease_epoch = equal_receipt.resulting_epoch;
+        assert!(
+            !matches!(
+                classify_evidence(&equal_epoch),
+                Ok(VolumeEvidenceRecoveryDecision::AdoptTakeover(_))
+            ),
+            "equal-epoch foreign disposable authority must not close the primary takeover"
+        );
+
+        let mut regressed_head = evidence.clone();
+        let AuthorizationState::Consumed(primary) = &mut regressed_head.authorization.state else {
+            unreachable!()
+        };
+        let AuthorizationConsumedReceipt::Takeover(primary) = primary.as_mut() else {
+            unreachable!()
+        };
+        primary.resulting_head = cats_api::runtime_reconciliation::RemoteHead {
+            generation: cats_api::runtime_reconciliation::Generation::new(1).unwrap(),
+            root_hash: Some(cats_api::runtime_reconciliation::Sha256Digest::from_bytes(
+                [0x44; 32],
+            )),
+            root_object_id: Some(
+                cats_api::runtime_reconciliation::AsciiText::new("roots/primary-1").unwrap(),
+            ),
+        };
+        assert!(
+            !matches!(
+                classify_evidence(&regressed_head),
+                Ok(VolumeEvidenceRecoveryDecision::AdoptTakeover(_))
+            ),
+            "a direct disposable successor behind the primary head must be rejected"
+        );
+
+        evidence.current_volume = None;
+        evidence.delete_completion = Some(
+            cats_storage::authority::complete_disposable_root_delete(
+                &deleting,
+                &direct,
+                cats_api::runtime_reconciliation::UnixMillis::new(1_720_000_090_000).unwrap(),
+            )
+            .unwrap(),
+        );
+        assert_eq!(
+            classify_evidence(&evidence).unwrap(),
+            VolumeEvidenceRecoveryDecision::AdoptTakeover(primary_receipt.clone())
+        );
+
+        evidence.direct_successor_authorization = None;
+        assert!(
+            classify_evidence(&evidence).is_err(),
+            "a disposable completion is not self-authenticating without its direct authorization"
         );
     }
 
