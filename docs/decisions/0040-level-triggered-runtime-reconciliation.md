@@ -217,6 +217,13 @@ queues/queue-size不得丢失。该provenance不假设新的release installer、
 protocol v1按既有`GuestRuntimeProfileReceipt` domain重算，且等于current Desired选择的approved digest；不能让
 Guest回显一个与实际boot bytes无关的digest。
 
+`RuntimeCheckpoint`还必须在top-level携带closed `runtime_launch = absent | present(identity)`；这里的
+`identity`与上述完整`StartRuntime`字段集合相同。写`StartRuntime`时两份identity必须逐字段相等，之后的
+filesystem、mount、admission、Running/Suspended和stop步骤只原样保留top-level copy，不能从公开inventory或
+current Desired重建。Acquire/Provision/PrepareDevice/PrepareNetwork等pre-launch checkpoint只能为`absent`；
+`StopRuntime`本身仍为`present`。只有exact stop postcondition及Cold/Deleted cleanup边界已由planner/scanner证明，
+并同时清除top-level runtime incarnation时，successor才可写`absent`。该字段不是nullable/optional兼容面。
+
 Guest CID是Node-global持久reservation，范围固定`3..=u32::MAX-1`（排除`VMADDR_CID_ANY`）。分配持有同一
 Node-global allocation flock，在一次严格有界的checkpoint namespace/full live-VMM scan中闭合所有reservation；
 若validated occupied count为N，只检查N+1个连续candidate（每Node assigned上限使其至多1025），选中后只做
@@ -250,6 +257,12 @@ heartbeat引用该epoch，只upsert具体Cat，缺项不代表不存在，也不
 同时检查fresh attestation和fresh per-Cat observation，不要求每次heartbeat全量扫描。稳定Running
 用独立、低频、有硬deadline的periodic full scan刷新attestation；失败先Degraded，过期后停止新
 Grant签发而不猜测Quarantine。
+
+Ready Running若完整current Desired的`endpoints=[]`，planner使用单独的checkpoint-first
+`OpenAdmission {runtime_incarnation}`：持久step时`stable_state=null`、lifecycle Closed、route集合为空且
+`runtime_launch`仍为同一`present(identity)`；确认cell已对同一incarnation打开后才CAS为Stable Running。
+只要Desired有Endpoint就不得使用该step；第一条`InstallGate`负责把lifecycle从Closed打开，后续Endpoint按
+既有顺序安装。这样zero-endpoint和Endpoint-bearing路径不会形成两套可同时开闸的authority。
 
 Control Plane对当前AgentSession按heartbeat sequence接受observation：大于已接受最高值的新payload
 在一个事务中原子应用；等于且完整payload相同是零新副作用的exact replay；等于但
@@ -338,6 +351,10 @@ Root都可授权，包括最后`R == L`或L未知，不能等待已不可达Node
 [Operations and HA §8](../operations-ha.md#8-首次终态部署)执行一次 clean-slate vertical cutover；
 切换后只有空的新 schema 和一套协议版本，组件版本不匹配直接启动失败。ChunkStore 格式与 Guest
 ABI 可以继续使用，但切换不依赖任何旧数据。
+
+因此本次`runtime_launch`/`open_admission`是未部署V1的锁步shape替换，不提升`ContractVersion`：新字段必填、
+旧checkpoint缺字段或使用`null`/裸optional形态严格malformed，unknown step也严格拒绝；不提供default、alias或
+双读迁移窗口。
 所有Runtime V1顶层合同都使用同名必填`version: 1`字段和同一严格decoder规则，不保留
 `format_version`或为error/checkpoint定制的版本入口。
 
