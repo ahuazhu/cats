@@ -736,8 +736,10 @@ pub(crate) struct RunningAdmissionEffect {
 }
 
 /// Mandatory process-local close reconciler invoked by the runner before any
-/// fallible physical inventory probe. Its only Endpoint mutation is the
-/// deterministic next CloseGate; it never installs or reopens an edge.
+/// fallible physical inventory probe. It latches the complete changed/removed
+/// Endpoint set for immediate process-local cancellation while leaving the
+/// durable GateSequencer journal to settle one Endpoint at a time. It never
+/// installs or reopens an edge.
 pub(crate) struct RunningAdmissionPreScan {
     registry: Arc<AdmissionCellRegistry>,
 }
@@ -1645,23 +1647,23 @@ fn plan_running_tail_action(
                 cell == &checkpoint_cell,
                 "CloseGate admission lost its exact predecessor cell"
             );
-            return Ok(Some(RunningTailAction::CloseGate(endpoint_id)));
+            Ok(Some(RunningTailAction::CloseGate(endpoint_id)))
         }
         EndpointAction::PrepareChanged { endpoint_id, .. } => {
             anyhow::ensure!(
                 cell == &checkpoint_cell,
                 "changed-gate admission lost its exact Closed cell"
             );
-            return Ok(endpoint_is_drained(guards, &endpoint_id)
-                .then_some(RunningTailAction::PrepareChanged(endpoint_id)));
+            Ok(endpoint_is_drained(guards, &endpoint_id)
+                .then_some(RunningTailAction::PrepareChanged(endpoint_id)))
         }
         EndpointAction::Remove { endpoint_id } => {
             anyhow::ensure!(
                 cell == &checkpoint_cell,
                 "closed-gate admission lost its exact Closed cell"
             );
-            return Ok(endpoint_is_drained(guards, &endpoint_id)
-                .then_some(RunningTailAction::RemoveGate(endpoint_id)));
+            Ok(endpoint_is_drained(guards, &endpoint_id)
+                .then_some(RunningTailAction::RemoveGate(endpoint_id)))
         }
         EndpointAction::Install { endpoint_id, .. } => {
             match cell.lifecycle_admission() {
@@ -1689,7 +1691,7 @@ fn plan_running_tail_action(
                     );
                 }
             }
-            return Ok(Some(RunningTailAction::InstallGate(endpoint_id)));
+            Ok(Some(RunningTailAction::InstallGate(endpoint_id)))
         }
     }
 }
@@ -2026,11 +2028,7 @@ mod tests {
         let mut b_guard = guards.remove(1);
         drop(guards);
         let mut order = Vec::new();
-        loop {
-            let Some(action) = first_endpoint_action(stored.checkpoint(), &successor).unwrap()
-            else {
-                break;
-            };
+        while let Some(action) = first_endpoint_action(stored.checkpoint(), &successor).unwrap() {
             let times = next_persist_times(&stored).unwrap();
             let mut port = session.cell().port();
             let mut sequencer = GateSequencer::new(session.checkpoint_store(), &mut port);
@@ -2172,11 +2170,7 @@ mod tests {
 
         let mut stored = session.checkpoint_store().load().unwrap().unwrap();
         let mut order = Vec::new();
-        loop {
-            let Some(action) = first_endpoint_action(stored.checkpoint(), &successor).unwrap()
-            else {
-                break;
-            };
+        while let Some(action) = first_endpoint_action(stored.checkpoint(), &successor).unwrap() {
             let times = next_persist_times(&stored).unwrap();
             let mut port = session.cell().port();
             let mut sequencer = GateSequencer::new(session.checkpoint_store(), &mut port);

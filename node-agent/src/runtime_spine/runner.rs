@@ -2106,6 +2106,10 @@ impl RuntimeSpineRunner {
     /// Production composition for an effect which may transfer a bounded
     /// helper resource into process-local cleanup ownership after an ambiguous
     /// provider call.
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "production composition keeps each independently owned runtime port explicit"
+    )]
     pub(crate) fn new_with_recovery_desired_effects_and_resource_owner(
         state_directory: StateDirectory,
         registered_session: AgentSession,
@@ -2128,6 +2132,10 @@ impl RuntimeSpineRunner {
         )
     }
 
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "the private constructor preserves explicit optional production ports"
+    )]
     fn new_inner(
         state_directory: StateDirectory,
         registered_session: AgentSession,
