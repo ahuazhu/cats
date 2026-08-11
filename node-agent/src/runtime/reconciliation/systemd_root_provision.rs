@@ -1472,14 +1472,16 @@ fn parse_systemd_properties(bytes: &[u8]) -> anyhow::Result<SystemdUnitPropertie
             "systemctl show emitted a duplicate property"
         );
     }
-    // systemd 255 accepts an explicit empty `EnvironmentFile=` transient
-    // property but does not expose `EnvironmentFiles` through `show`. Newer
-    // managers do expose it. Absence therefore has the same meaning as an
-    // empty value here; a nonempty exposed value still conflicts, and the
-    // independent `/proc/<pid>/environ` sample rejects every forbidden key.
+    // systemd 255 omits empty `EnvironmentFiles` and, for a not-found unit,
+    // empty `ExecStart` from `show` even when both properties were requested.
+    // Treat omission as the same closed empty value. A loaded unit without an
+    // ExecStart still cannot prove an exact running identity, and a nonempty
+    // EnvironmentFiles value still conflicts with the independently sampled
+    // `/proc/<pid>/environ` proof.
     let environment_files = values.remove("EnvironmentFiles").unwrap_or_default();
+    let exec_start = values.remove("ExecStart").unwrap_or_default();
     anyhow::ensure!(
-        values.len() == 17,
+        values.len() == 16,
         "systemctl show omitted a fixed property"
     );
     let take = |values: &mut BTreeMap<&str, String>, key| {
@@ -1499,7 +1501,7 @@ fn parse_systemd_properties(bytes: &[u8]) -> anyhow::Result<SystemdUnitPropertie
         transient: take(&mut values, "Transient")?,
         main_pid,
         control_group: take(&mut values, "ControlGroup")?,
-        exec_start: match take(&mut values, "ExecStart")? {
+        exec_start: match exec_start {
             value if value.is_empty() => None,
             value => Some(parse_systemd_exec_start(&value)?),
         },
@@ -3871,6 +3873,12 @@ while True:
         )
         .unwrap();
         assert!(absent.proves_absent(&id("cats-root.service")));
+
+        let systemd_255_absent = parse_systemd_properties(
+            b"Id=cats-root.service\nLoadState=not-found\nActiveState=inactive\nSubState=dead\nType=\nTransient=no\nMainPID=0\nControlGroup=\nEnvironment=\nPassEnvironment=\nUnsetEnvironment=\nKillMode=control-group\nRestart=no\nUMask=0022\nTimeoutStopUSec=1min 30s\nCollectMode=inactive\n",
+        )
+        .unwrap();
+        assert!(systemd_255_absent.proves_absent(&id("cats-root.service")));
 
         let launch = build_launch(&config(), &expectation()).unwrap();
         let running = parse_systemd_properties(exact_running_systemctl_wire().as_bytes()).unwrap();
