@@ -23,6 +23,12 @@ pub struct PersistTimes {
 
 #[derive(Debug)]
 pub enum GateTransitionResult {
+    Opened {
+        checkpoint: StoredCheckpoint,
+        /// Retained only for diagnostics when an ambiguous local return was
+        /// resolved by reading the exact same-incarnation open postcondition.
+        port_error: Option<GatePortError>,
+    },
     Installed {
         checkpoint: StoredCheckpoint,
     },
@@ -60,7 +66,8 @@ pub enum GateTransitionResult {
 impl GateTransitionResult {
     pub fn checkpoint(&self) -> &StoredCheckpoint {
         match self {
-            Self::Installed { checkpoint }
+            Self::Opened { checkpoint, .. }
+            | Self::Installed { checkpoint }
             | Self::Closed { checkpoint }
             | Self::EndpointClosed { checkpoint, .. }
             | Self::EndpointPrepared { checkpoint }
@@ -124,6 +131,10 @@ pub enum GateReconcileError {
     UnexpectedRequireIdle,
     #[error("gate installation requires a Running Desired and runtime incarnation")]
     RuntimeNotInstallable,
+    #[error("OpenAdmission requires a current Running Desired with no Endpoints")]
+    OpenAdmissionNotInstallable,
+    #[error("OpenAdmission lost the retained StartRuntime launch authority")]
+    MissingRuntimeLaunchAuthority,
     #[error("Desired does not contain Endpoint {0}")]
     EndpointNotFound(Id),
     #[error("Endpoint {0} route epoch regressed")]
@@ -267,6 +278,112 @@ pub struct GateSequencer<'a, P: AdmissionGatePort> {
 impl<'a, P: AdmissionGatePort> GateSequencer<'a, P> {
     pub fn new(store: &'a FileCheckpointStore, port: &'a mut P) -> Self {
         Self { store, port }
+    }
+
+    /// Opens lifecycle admission for a Ready runtime whose exact current
+    /// Desired has no Endpoints. The durable `OpenAdmission` token is
+    /// published before the same-incarnation cell can open. A lost local
+    /// response is closed only by the complete open snapshot; after restart
+    /// the newly Closed cell replays the same checkpointed token.
+    pub fn open_admission(
+        &mut self,
+        current: &StoredCheckpoint,
+        desired: &DesiredRuntimeSpec,
+        times: PersistTimes,
+    ) -> Result<GateTransitionResult, GateReconcileError> {
+        validate_times(times)?;
+        encode_desired_runtime_spec(desired).map_err(AppliedDesiredError::from)?;
+        if desired.target != RuntimeTarget::Running
+            || !desired.endpoints.is_empty()
+            || matches!(desired.transition, RuntimeTransition::RequireIdle { .. })
+        {
+            return Err(GateReconcileError::OpenAdmissionNotInstallable);
+        }
+        applied_desired_evidence(current.checkpoint(), desired)?;
+        let incarnation = current
+            .checkpoint()
+            .runtime_incarnation
+            .as_ref()
+            .ok_or(GateReconcileError::OpenAdmissionNotInstallable)?;
+        let launch = current
+            .checkpoint()
+            .runtime_launch
+            .identity()
+            .ok_or(GateReconcileError::MissingRuntimeLaunchAuthority)?;
+        if &launch.runtime_incarnation != incarnation
+            || !current.checkpoint().route_gates.is_empty()
+        {
+            return Err(GateReconcileError::OpenAdmissionNotInstallable);
+        }
+
+        let already_prepared = matches!(
+            &current.checkpoint().step,
+            ReconcileStep::OpenAdmission {
+                runtime_incarnation,
+            } if runtime_incarnation == incarnation
+        );
+        let mut prepared_checkpoint = current.checkpoint().clone();
+        if !already_prepared {
+            prepared_checkpoint.stable_state = None;
+            prepared_checkpoint.lifecycle_admission = LifecycleAdmission::Closed;
+            prepared_checkpoint.require_idle = RequireIdleCheckpoint::NotApplicable;
+            prepared_checkpoint.step = ReconcileStep::OpenAdmission {
+                runtime_incarnation: incarnation.clone(),
+            };
+            prepared_checkpoint.updated_at_unix_ms = times.before_effect;
+        }
+        encode_runtime_checkpoint(&prepared_checkpoint).map_err(|error| {
+            GateReconcileError::AppliedDesired(AppliedDesiredError::CheckpointContract { error })
+        })?;
+        let expected = AdmissionSnapshot::from_checkpoint(&prepared_checkpoint)?;
+        let replacement = AdmissionSnapshot::new(
+            expected.applied_desired_revision(),
+            expected.spec_digest().clone(),
+            expected.placement().clone(),
+            expected.runtime_incarnation().cloned(),
+            LifecycleAdmission::Open,
+            Vec::new(),
+        );
+        let mut completed = prepared_checkpoint.clone();
+        completed.lifecycle_admission = LifecycleAdmission::Open;
+        completed.stable_state = Some(cats_api::runtime_reconciliation::StableState::Running);
+        completed.step = ReconcileStep::Stable {
+            state: cats_api::runtime_reconciliation::StableState::Running,
+        };
+        completed.updated_at_unix_ms = times.after_effect;
+        encode_runtime_checkpoint(&completed).map_err(|error| {
+            GateReconcileError::AppliedDesired(AppliedDesiredError::CheckpointContract { error })
+        })?;
+
+        let prepared = if already_prepared {
+            current.clone()
+        } else {
+            self.store.replace(current, &prepared_checkpoint)?
+        };
+        let live = self.port.snapshot();
+        let mut port_error = None;
+        if live != replacement {
+            if live != expected {
+                return Err(GateReconcileError::EndpointCellMismatch);
+            }
+            let result = self.port.open_lifecycle(&expected, &replacement);
+            let after = self.port.snapshot();
+            match result {
+                Ok(()) if after != replacement => {
+                    return Err(GateReconcileError::EndpointCellMismatch)
+                }
+                Err(error) if after == replacement => port_error = Some(error),
+                Err(error) if after == expected => return Err(error.into()),
+                Err(_) => return Err(GateReconcileError::EndpointCellMismatch),
+                Ok(()) => {}
+            }
+        }
+
+        let completed = self.store.replace(&prepared, &completed)?;
+        Ok(GateTransitionResult::Opened {
+            checkpoint: completed,
+            port_error,
+        })
     }
 
     /// Installs or advances one Endpoint gate after the caller has verified

@@ -1,10 +1,11 @@
 //! Checkpoint-first admission-gate convergence for Runtime Reconciliation v1.
 //!
-//! This is deliberately only the local gate spine. It persists the shared
+//! The local gate spine persists the shared
 //! [`cats_api::runtime_reconciliation::RuntimeCheckpoint`] before asking the
 //! in-memory admission boundary to change, and persists the resulting state
-//! afterwards. Volume, VMM, device, network, mount, cleanup, inventory, and
-//! production server wiring remain outside this module.
+//! afterwards. Its process-owned cells and sealed tail effect are composed in
+//! the production dispatcher. Physical VMM/Guest proof and the Route v2
+//! Gateway-to-Node machine transport remain separate prerequisites.
 //!
 //! In particular, this spine does not manufacture an "Endpoint-only" proof:
 //! the complete reconciler must first compare the new Desired with its
@@ -15,6 +16,7 @@
 
 mod admission_cell;
 mod admission_port;
+mod admission_registry;
 mod authorized_blockd;
 mod checkpoint;
 mod clean_slate_probes;
@@ -35,6 +37,7 @@ mod network;
 mod normal_acquire;
 mod prepare_device_retirement;
 mod root_provision;
+mod running_admission;
 // The sealed serving-process foundation is composed with the Node-global
 // managed-process admission port in the following integration slice.  Its
 // fake port already exercises the complete one-effect start/adopt contract.
@@ -121,6 +124,7 @@ pub use admission_cell::{
 pub use admission_port::{
     AdmissionGatePort, AdmissionSnapshot, GatePortError, IdleCloseResult, SnapshotError,
 };
+pub(crate) use admission_registry::{AdmissionCellRegistry, AdmissionCellSession};
 pub use authorized_blockd::{
     authorized_blockd_command, authorized_blockd_status_is_bound, AuthorizedBlockFrontend,
     AuthorizedBlockdCheckpoint, AuthorizedBlockdLaunchConfig, AuthorizedBlockdStore,
@@ -162,6 +166,9 @@ pub(crate) use root_provision::PlatformRootProvisionProcessIdentityPort;
 pub use root_provision::{
     AuthorityRereadRequired, RootProvisionClientError, RootProvisionControlPort,
     RootProvisionResponseHint, RootProvisionUnknownReason, UnixRootProvisionClient,
+};
+pub(crate) use running_admission::{
+    RunningAdmissionEffect, RunningTailAdmission, RunningTailScanAdmission,
 };
 pub(crate) use serving_handoff_effect::ServingPrepareFrontend;
 pub(crate) use signed_root_provision::{

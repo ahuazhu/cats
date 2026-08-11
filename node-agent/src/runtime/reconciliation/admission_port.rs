@@ -139,6 +139,16 @@ pub trait AdmissionGatePort {
     /// complete value as `expected` in the cell's linearization point.
     fn snapshot(&self) -> AdmissionSnapshot;
 
+    /// Compare-opens lifecycle admission for the exact same runtime
+    /// incarnation when the complete Desired contains no Endpoint. Both
+    /// snapshots must have an empty Endpoint set; Endpoint-bearing Running
+    /// tails use the first `install_gate` transition instead.
+    fn open_lifecycle(
+        &mut self,
+        expected: &AdmissionSnapshot,
+        replacement: &AdmissionSnapshot,
+    ) -> Result<(), GatePortError>;
+
     fn install_gate(
         &mut self,
         expected: &AdmissionSnapshot,

@@ -3833,6 +3833,111 @@ fn install_fresh_two_endpoint_epochs(
         .all(|route| route.gate == RouteGateState::Active));
 }
 
+#[test]
+fn zero_endpoint_open_admission_is_checkpoint_first_and_restart_safe() {
+    let root = TempDir::new().expect("tempdir");
+    let desired = running_desired_with_endpoints(1, Vec::new());
+    let checkpoint = running_checkpoint(&desired, 10);
+    let retained_launch = checkpoint.runtime_launch.clone();
+    let store = store(&root, &desired.cat_id);
+    let stored = store.create(&checkpoint).expect("source checkpoint");
+    // A successor Agent never reconstructs Open from the stable checkpoint.
+    let restarted_closed = AdmissionSnapshot::from_checkpoint(&checkpoint)
+        .expect("source snapshot")
+        .fail_closed();
+    let mut port = FakePort::new(restarted_closed, store.path());
+    port.expected_disk.push_back(DiskMarker::OpenAdmission {
+        revision: desired.desired_revision,
+        runtime_incarnation: random('5'),
+    });
+
+    let result = GateSequencer::new(&store, &mut port)
+        .open_admission(&stored, &desired, times(11, 12))
+        .expect("reopen exact zero-Endpoint runtime");
+    let final_checkpoint = result.checkpoint().checkpoint();
+    assert_eq!(port.calls, [PortCall::Open]);
+    assert_eq!(final_checkpoint.runtime_launch, retained_launch);
+    assert_eq!(
+        final_checkpoint.lifecycle_admission,
+        LifecycleAdmission::Open
+    );
+    assert_eq!(final_checkpoint.stable_state, Some(StableState::Running));
+    assert!(matches!(
+        final_checkpoint.step,
+        ReconcileStep::Stable {
+            state: StableState::Running
+        }
+    ));
+    assert!(final_checkpoint.route_gates.is_empty());
+    assert_eq!(
+        port.snapshot(),
+        AdmissionSnapshot::from_checkpoint(final_checkpoint).expect("final snapshot")
+    );
+}
+
+#[test]
+fn zero_endpoint_open_admission_closes_ambiguous_response_by_exact_postcondition() {
+    let root = TempDir::new().expect("tempdir");
+    let desired = running_desired_with_endpoints(1, Vec::new());
+    let mut checkpoint = running_checkpoint(&desired, 10);
+    checkpoint.stable_state = None;
+    checkpoint.lifecycle_admission = LifecycleAdmission::Closed;
+    checkpoint.step = ReconcileStep::OpenAdmission {
+        runtime_incarnation: random('5'),
+    };
+    let store = store(&root, &desired.cat_id);
+    let stored = store.create(&checkpoint).expect("OpenAdmission checkpoint");
+    let mut port = FakePort::new(
+        AdmissionSnapshot::from_checkpoint(&checkpoint).expect("closed snapshot"),
+        store.path(),
+    );
+    port.endpoint_results
+        .push_back(EndpointPortResult::ErrorAfter(GatePortError::Unavailable));
+    port.expected_disk.push_back(DiskMarker::OpenAdmission {
+        revision: desired.desired_revision,
+        runtime_incarnation: random('5'),
+    });
+
+    let result = GateSequencer::new(&store, &mut port)
+        .open_admission(&stored, &desired, times(11, 12))
+        .expect("exact open postcondition resolves response loss");
+    assert!(matches!(
+        &result,
+        GateTransitionResult::Opened {
+            port_error: Some(GatePortError::Unavailable),
+            ..
+        }
+    ));
+    assert_eq!(
+        result.checkpoint().checkpoint().stable_state,
+        Some(StableState::Running)
+    );
+}
+
+#[test]
+fn open_admission_never_accepts_an_endpoint_bearing_desired() {
+    let root = TempDir::new().expect("tempdir");
+    let desired = desired(
+        1,
+        RuntimeTarget::Running,
+        1,
+        RuntimeTransition::CancelAndDrain,
+    );
+    let checkpoint = running_checkpoint(&desired, 10);
+    let store = store(&root, &desired.cat_id);
+    let stored = store.create(&checkpoint).expect("source checkpoint");
+    let mut port = FakePort::new(
+        AdmissionSnapshot::from_checkpoint(&checkpoint).expect("source snapshot"),
+        store.path(),
+    );
+
+    assert!(matches!(
+        GateSequencer::new(&store, &mut port).open_admission(&stored, &desired, times(11, 12)),
+        Err(GateReconcileError::OpenAdmissionNotInstallable)
+    ));
+    assert!(port.calls.is_empty());
+}
+
 fn store(root: &TempDir, cat_id: &Id) -> FileCheckpointStore {
     FileCheckpointStore::open(root.path(), cat_id).expect("checkpoint store")
 }
@@ -4030,6 +4135,7 @@ fn times(before: u64, after: u64) -> PersistTimes {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum PortCall {
+    Open,
     Install,
     CloseGate(Id),
     RemoveGate(Id),
@@ -4039,6 +4145,10 @@ enum PortCall {
 
 #[derive(Debug)]
 enum DiskMarker {
+    OpenAdmission {
+        revision: Revision,
+        runtime_incarnation: RandomId128,
+    },
     Installed {
         revision: Revision,
         endpoint_id: Id,
@@ -4099,6 +4209,24 @@ impl FakePort {
         let checkpoint =
             decode_runtime_checkpoint(&bytes).expect("decode checkpoint at effect boundary");
         match marker {
+            DiskMarker::OpenAdmission {
+                revision,
+                runtime_incarnation,
+            } => {
+                assert_eq!(checkpoint.desired_revision, revision);
+                assert_eq!(
+                    checkpoint.runtime_incarnation,
+                    Some(runtime_incarnation.clone())
+                );
+                assert_eq!(checkpoint.lifecycle_admission, LifecycleAdmission::Closed);
+                assert!(checkpoint.route_gates.is_empty());
+                assert!(matches!(
+                    checkpoint.step,
+                    ReconcileStep::OpenAdmission {
+                        runtime_incarnation: ref saved,
+                    } if saved == &runtime_incarnation
+                ));
+            }
             DiskMarker::Installed {
                 revision,
                 endpoint_id,
@@ -4240,6 +4368,16 @@ impl FakePort {
 impl AdmissionGatePort for FakePort {
     fn snapshot(&self) -> AdmissionSnapshot {
         self.current.clone()
+    }
+
+    fn open_lifecycle(
+        &mut self,
+        expected: &AdmissionSnapshot,
+        replacement: &AdmissionSnapshot,
+    ) -> Result<(), GatePortError> {
+        self.calls.push(PortCall::Open);
+        self.assert_checkpoint_first();
+        self.apply_endpoint_result(expected, replacement)
     }
 
     fn install_gate(

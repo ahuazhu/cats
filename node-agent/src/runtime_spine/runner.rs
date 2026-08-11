@@ -19,7 +19,7 @@ use thiserror::Error;
 use crate::runtime::reconciliation::{
     KernelNbdPoolAdmission, KernelNbdPoolScanAdmission, NodeGlobalManagedProcessAdmission,
     NodeGlobalManagedProcessScanAdmission, NodeGlobalNetworkAdmission,
-    NodeGlobalNetworkScanAdmission,
+    NodeGlobalNetworkScanAdmission, RunningTailAdmission, RunningTailScanAdmission,
 };
 use crate::state_directory::StateDirectory;
 
@@ -215,6 +215,7 @@ pub struct RuntimeDesiredEffectContext {
     node_global_process: Option<NodeGlobalManagedProcessAdmission>,
     node_global_network: Option<NodeGlobalNetworkAdmission>,
     kernel_nbd_pool: Option<KernelNbdPoolAdmission>,
+    running_tail: Option<RunningTailAdmission>,
 }
 
 /// Shared read-only deadline/cancellation boundary for physical identity
@@ -336,6 +337,7 @@ pub struct RuntimeDesiredEffectAdmission {
     node_global_process: Option<NodeGlobalManagedProcessAdmission>,
     node_global_network: Option<NodeGlobalNetworkAdmission>,
     kernel_nbd_pool: Option<KernelNbdPoolAdmission>,
+    running_tail: Option<RunningTailAdmission>,
 }
 
 impl RuntimeDesiredEffectAdmission {
@@ -346,6 +348,7 @@ impl RuntimeDesiredEffectAdmission {
         node_global_process: Option<NodeGlobalManagedProcessAdmission>,
         node_global_network: Option<NodeGlobalNetworkAdmission>,
         kernel_nbd_pool: Option<KernelNbdPoolAdmission>,
+        running_tail: Option<RunningTailAdmission>,
     ) -> Option<Self> {
         let ObservationInventoryAcceptance::Full { attestation } = &acceptance.inventory else {
             return None;
@@ -366,6 +369,9 @@ impl RuntimeDesiredEffectAdmission {
             || kernel_nbd_pool
                 .as_ref()
                 .is_some_and(|admission| !admission.matches_observation(&observation))
+            || running_tail
+                .as_ref()
+                .is_some_and(|admission| !admission.matches_observation(&observation))
         {
             return None;
         }
@@ -379,6 +385,7 @@ impl RuntimeDesiredEffectAdmission {
             node_global_process,
             node_global_network,
             kernel_nbd_pool,
+            running_tail,
         })
     }
 
@@ -436,6 +443,7 @@ impl RuntimeDesiredEffectAdmission {
             node_global_process: None,
             node_global_network: None,
             kernel_nbd_pool: None,
+            running_tail: None,
         }
     }
 
@@ -451,6 +459,12 @@ impl RuntimeDesiredEffectAdmission {
     #[cfg(test)]
     pub(crate) fn with_observation_for_test(mut self, observation: NodeObservation) -> Self {
         self.observation = observation;
+        self
+    }
+
+    #[cfg(test)]
+    pub(crate) fn with_running_tail_for_test(mut self, admission: RunningTailAdmission) -> Self {
+        self.running_tail = Some(admission);
         self
     }
 }
@@ -471,6 +485,9 @@ impl RuntimeDesiredEffectContext {
         let kernel_nbd_pool = accepted_full
             .as_ref()
             .and_then(|admission| admission.kernel_nbd_pool.clone());
+        let running_tail = accepted_full
+            .as_ref()
+            .and_then(|admission| admission.running_tail.clone());
         Self {
             state_directory,
             deadline,
@@ -479,6 +496,7 @@ impl RuntimeDesiredEffectContext {
             node_global_process,
             node_global_network,
             kernel_nbd_pool,
+            running_tail,
         }
     }
 
@@ -532,6 +550,10 @@ impl RuntimeDesiredEffectContext {
         })
     }
 
+    pub(crate) fn running_tail_admission(&self) -> Option<&RunningTailAdmission> {
+        self.running_tail.as_ref()
+    }
+
     #[cfg(test)]
     pub(crate) fn for_test(state_directory: StateDirectory, deadline: Instant) -> Self {
         Self::new(
@@ -570,6 +592,7 @@ impl RuntimeDesiredEffectContext {
             node_global_process: Some(admission),
             node_global_network: None,
             kernel_nbd_pool: None,
+            running_tail: None,
         }
     }
 
@@ -740,6 +763,7 @@ pub struct CompleteRuntimeInventory {
     node_global_process: Option<NodeGlobalManagedProcessScanAdmission>,
     node_global_network: Option<Box<NodeGlobalNetworkScanAdmission>>,
     kernel_nbd_pool: Option<Box<KernelNbdPoolScanAdmission>>,
+    running_tail: Option<Box<RunningTailScanAdmission>>,
 }
 
 impl CompleteRuntimeInventory {
@@ -758,6 +782,7 @@ impl CompleteRuntimeInventory {
             node_global_process: None,
             node_global_network: None,
             kernel_nbd_pool: None,
+            running_tail: None,
         }
     }
 
@@ -801,6 +826,22 @@ impl CompleteRuntimeInventory {
         self.kernel_nbd_pool.take().map(|admission| *admission)
     }
 
+    #[expect(
+        dead_code,
+        reason = "the live-VMM plus Guest Ready scanner mints this sealed admission in the next composition slice"
+    )]
+    pub(crate) fn with_running_tail_admission(
+        mut self,
+        admission: Option<RunningTailScanAdmission>,
+    ) -> Self {
+        self.running_tail = admission.map(Box::new);
+        self
+    }
+
+    pub(crate) fn take_running_tail_admission(&mut self) -> Option<RunningTailScanAdmission> {
+        self.running_tail.take().map(|admission| *admission)
+    }
+
     #[cfg(test)]
     fn for_test(
         observed_at_unix_ms: UnixMillis,
@@ -816,6 +857,7 @@ impl CompleteRuntimeInventory {
             node_global_process: None,
             node_global_network: None,
             kernel_nbd_pool: None,
+            running_tail: None,
         }
     }
 
@@ -1824,6 +1866,7 @@ pub struct RuntimeSpineRunner {
     current_process_node_global_process: Option<NodeGlobalManagedProcessAdmission>,
     current_process_node_global_network: Option<NodeGlobalNetworkAdmission>,
     current_process_kernel_nbd_pool: Option<KernelNbdPoolAdmission>,
+    current_process_running_tail: Option<RunningTailAdmission>,
     effect_admission_open: bool,
     effect_admission: Option<RuntimeDesiredEffectAdmission>,
     pending_effects: VecDeque<DesiredRuntimeSpec>,
@@ -1941,6 +1984,7 @@ impl RuntimeSpineRunner {
             current_process_node_global_process: None,
             current_process_node_global_network: None,
             current_process_kernel_nbd_pool: None,
+            current_process_running_tail: None,
             effect_admission_open: false,
             effect_admission: None,
             pending_effects: VecDeque::new(),
@@ -1979,6 +2023,7 @@ impl RuntimeSpineRunner {
                 self.current_process_node_global_process = None;
                 self.current_process_node_global_network = None;
                 self.current_process_kernel_nbd_pool = None;
+                self.current_process_running_tail = None;
                 if self
                     .effect_lane
                     .as_ref()
@@ -2042,6 +2087,7 @@ impl RuntimeSpineRunner {
                 let node_global_process = inventory.take_node_global_process_admission();
                 let node_global_network = inventory.take_node_global_network_admission();
                 let kernel_nbd_pool = inventory.take_kernel_nbd_pool_admission();
+                let running_tail = inventory.take_running_tail_admission();
                 let candidate = build_full_observation(coordinates, inventory)?;
                 let node_global_process = node_global_process
                     .map(|admission| admission.bind(&candidate))
@@ -2067,9 +2113,18 @@ impl RuntimeSpineRunner {
                             "provider-private kernel-NBD admission conflicts with full observation",
                         )
                     })?;
+                let running_tail = running_tail
+                    .map(|admission| admission.bind(&candidate))
+                    .transpose()
+                    .map_err(|_| {
+                        RuntimeSpineRunError::InvalidScan(
+                            "provider-private Running-tail admission conflicts with full observation",
+                        )
+                    })?;
                 self.current_process_node_global_process = node_global_process;
                 self.current_process_node_global_network = node_global_network;
                 self.current_process_kernel_nbd_pool = kernel_nbd_pool;
+                self.current_process_running_tail = running_tail;
                 let request = self.journal_lane()?.prepare_observation(candidate).await?;
                 self.current_process_scan_observation_id =
                     Some(request.value().observation_id.clone());
@@ -2298,6 +2353,7 @@ impl RuntimeSpineRunner {
                     let node_global_process = self.current_process_node_global_process.take();
                     let node_global_network = self.current_process_node_global_network.take();
                     let kernel_nbd_pool = self.current_process_kernel_nbd_pool.take();
+                    let running_tail = self.current_process_running_tail.take();
                     Some(
                         RuntimeDesiredEffectAdmission::from_acceptance(
                             self.registered_session.clone(),
@@ -2306,6 +2362,7 @@ impl RuntimeSpineRunner {
                             node_global_process,
                             node_global_network,
                             kernel_nbd_pool,
+                            running_tail,
                         )
                         .ok_or(RuntimeSpineRunError::InvalidScan(
                             "accepted full observation does not form one effect admission",
@@ -2321,6 +2378,7 @@ impl RuntimeSpineRunner {
                 self.current_process_node_global_process = None;
                 self.current_process_node_global_network = None;
                 self.current_process_kernel_nbd_pool = None;
+                self.current_process_running_tail = None;
                 if establishes_effect_admission {
                     self.effect_admission = admission;
                     self.effect_admission_open = true;
@@ -2341,6 +2399,7 @@ impl RuntimeSpineRunner {
                         self.current_process_node_global_process = None;
                         self.current_process_node_global_network = None;
                         self.current_process_kernel_nbd_pool = None;
+                        self.current_process_running_tail = None;
                         Ok(RuntimeSpineRunStep::DesiredInvalidated { status, error })
                     }
                     DesiredInvalidationBinding::Mismatch => Ok(RuntimeSpineRunStep::RetryExact(
@@ -3231,6 +3290,7 @@ mod tests {
             Some(private),
             None,
             None,
+            None,
         )
         .expect("exact private scan binding must enter the effect context");
         assert!(admitted.node_global_process.is_some());
@@ -3250,6 +3310,7 @@ mod tests {
             observation,
             &acceptance,
             Some(foreign_private),
+            None,
             None,
             None,
         )

@@ -58,7 +58,6 @@ use super::signed_running::{
     expected_provision_heads, provision_checkpoint_is_bound, ProvisionHeadRead,
 };
 use super::vmm_start_runtime_effect::StartRuntimeReservationEffect;
-use super::SignedRunningAcquireEffect;
 use super::{
     ensure_root_provision_process_from_persisted_checkpoint, AuthorizedBlockdStore,
     FileCheckpointStore, PlatformRootProvisionProcessIdentityPort,
@@ -68,6 +67,7 @@ use super::{
     RootProvisionSystemdConfig, UnixRootProvisionClient, VmmCidInventoryPort,
     VmmLaunchArtifactPaths,
 };
+use super::{AdmissionCellRegistry, RunningAdmissionEffect, SignedRunningAcquireEffect};
 
 pub(crate) mod request_sealed {
     pub(crate) trait Sealed {}
@@ -132,12 +132,15 @@ pub(crate) struct SignedRootProvisionEffect {
     before_stop_receipt_publish: Option<BeforeStopReceiptPublishHook>,
 }
 
-/// Production dispatcher for the currently implemented Running prefix.  The
-/// old target-control retirement stage runs first so an already-complete
-/// absence can fall through, while a submitted stop consumes this full scan.
-/// A current provision checkpoint remains exclusively owned by `provision`;
-/// every earlier state stays with the acquire/stale planner.
+/// Production dispatcher for the implemented Running prefix and the sealed
+/// admission tail. The tail remains inert unless the accepted full scan owns
+/// its opaque live-runtime plus Guest Ready proof. The old target-control
+/// retirement stage runs first so an already-complete absence can fall
+/// through, while a submitted stop consumes this full scan. A current
+/// provision checkpoint remains exclusively owned by `provision`; every
+/// earlier state stays with the acquire/stale planner.
 pub(crate) struct SignedRunningEffect {
+    running_admission: Option<RunningAdmissionEffect>,
     acquire: SignedRunningAcquireEffect,
     provision: SignedRootProvisionEffect,
     handoff: ServingHandoffEffect,
@@ -250,6 +253,9 @@ impl SignedRunningEffect {
             Arc::clone(&authority),
             Arc::clone(&process_ports.serving_global),
         )?);
+        let running_admission = RunningAdmissionEffect::new(AdmissionCellRegistry::new(
+            state_directory.path().join(CHECKPOINT_NAMESPACE),
+        ));
         let start_runtime = StartRuntimeReservationEffect::platform(
             state_directory,
             vmm_launch_artifacts,
@@ -260,6 +266,7 @@ impl SignedRunningEffect {
             kernel_nbd_inventory,
         );
         Ok(Self {
+            running_admission: Some(running_admission),
             acquire,
             provision: SignedRootProvisionEffect::platform(
                 Arc::clone(&authority),
@@ -290,6 +297,11 @@ impl RuntimeDesiredEffect for SignedRunningEffect {
         context: RuntimeDesiredEffectContext,
         desired: &DesiredRuntimeSpec,
     ) -> anyhow::Result<RuntimeDesiredEffectOutcome> {
+        if let Some(running_admission) = &self.running_admission {
+            if let Some(outcome) = running_admission.try_apply(&context, desired)? {
+                return Ok(outcome);
+            }
+        }
         if let Some(prepare_device_retirement) = &self.prepare_device_retirement {
             if let Some(outcome) = prepare_device_retirement.try_apply(&context, desired)? {
                 return Ok(outcome);
@@ -2339,6 +2351,7 @@ mod tests {
             )
             .unwrap();
             SignedRunningEffect {
+                running_admission: None,
                 acquire,
                 provision: self.effect_with_ports(process, retirement, request),
                 handoff,

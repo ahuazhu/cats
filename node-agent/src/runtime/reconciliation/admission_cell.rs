@@ -113,6 +113,17 @@ impl AdmissionCell {
             .copied()
     }
 
+    /// Conservatively closes this process-local cell without waiting for
+    /// already admitted guards. Registry replacement/removal and process
+    /// shutdown use this before making the cell unreachable to new callers.
+    pub(crate) fn force_close(&self) {
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        state.snapshot = state.snapshot.fail_closed();
+    }
+
     /// Acquires a platform-wide guard for a future control/exec consumer.
     /// Route admission uses the narrower Endpoint guard below.
     pub fn try_acquire_platform(
@@ -286,6 +297,36 @@ impl AdmissionCellPort {
 impl AdmissionGatePort for AdmissionCellPort {
     fn snapshot(&self) -> AdmissionSnapshot {
         self.cell.snapshot()
+    }
+
+    fn open_lifecycle(
+        &mut self,
+        expected: &AdmissionSnapshot,
+        replacement: &AdmissionSnapshot,
+    ) -> Result<(), GatePortError> {
+        validate_snapshot(expected).map_err(|_| GatePortError::Unavailable)?;
+        validate_snapshot(replacement).map_err(|_| GatePortError::Unavailable)?;
+        if expected.placement() != replacement.placement()
+            || expected.applied_desired_revision() != replacement.applied_desired_revision()
+            || expected.spec_digest() != replacement.spec_digest()
+            || expected.runtime_incarnation().is_none()
+            || expected.runtime_incarnation() != replacement.runtime_incarnation()
+            || expected.lifecycle_admission() != LifecycleAdmission::Closed
+            || replacement.lifecycle_admission() != LifecycleAdmission::Open
+            || !expected.endpoints().is_empty()
+            || !replacement.endpoints().is_empty()
+        {
+            return Err(GatePortError::Unavailable);
+        }
+        let mut state = self.lock_mutating()?;
+        if &state.snapshot == replacement {
+            return Ok(());
+        }
+        if &state.snapshot != expected {
+            return Err(GatePortError::StateMismatch);
+        }
+        state.snapshot = replacement.clone();
+        Ok(())
     }
 
     fn install_gate(
