@@ -328,6 +328,7 @@ pub(crate) struct KernelNbdDeviceExpectation {
 }
 
 impl KernelNbdDeviceExpectation {
+    #[cfg(test)]
     pub(super) fn from_prepare_device(checkpoint: &RuntimeCheckpoint) -> Result<Option<Self>> {
         if !matches!(checkpoint.step, ReconcileStep::PrepareDevice { .. }) {
             return Ok(None);
@@ -1049,6 +1050,7 @@ impl KernelNbdAllocationPermit {
     /// Choose the lowest configured slot that is both physically free and not
     /// named by any durable checkpoint. The caller must fsync its new
     /// `PrepareDevice` checkpoint before this permit is dropped.
+    #[cfg(test)]
     fn select_free(&self, reservations: &KernelNbdReservations) -> Result<HostPath> {
         let mut selected = self.select_free_set(reservations, 1)?;
         Ok(selected.remove(0))
@@ -1449,6 +1451,7 @@ impl KernelNbdInventoryPort {
     /// generic callback result would let a caller drop this permit before it
     /// had durably published the reservation, so this API deliberately returns
     /// only a [`StoredCheckpoint`].
+    #[cfg(test)]
     pub(crate) fn reserve_and_replace(
         &self,
         context: &RuntimeDesiredEffectContext,
