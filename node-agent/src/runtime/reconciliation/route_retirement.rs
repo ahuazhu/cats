@@ -142,6 +142,23 @@ pub(crate) fn classify_superseded_route_retirement(
         if cell.snapshot() == &checkpoint_cell && endpoint_only_successor(predecessor, desired) {
             return Ok(Some(RouteRetirementMode::EndpointOnly));
         }
+        let restart_closed = cell.snapshot() == &checkpoint_cell.fail_closed()
+            && cell.guards().platform_guards == 0
+            && cell.guards().endpoint_guards.is_empty()
+            && checkpoint.lifecycle_admission == LifecycleAdmission::Open
+            && matches!(
+                checkpoint.step,
+                ReconcileStep::Stable {
+                    state: cats_api::runtime_reconciliation::StableState::Running
+                }
+            )
+            && checkpoint.route_gates.iter().all(|route| {
+                route.gate == cats_api::runtime_reconciliation::RouteGateState::Active
+            })
+            && restart_closed_endpoint_successor(predecessor, desired);
+        if restart_closed {
+            return Ok(Some(RouteRetirementMode::EndpointOnly));
+        }
     }
     anyhow::ensure!(
         cell.snapshot() == &checkpoint_cell || cell.snapshot() == &checkpoint_cell.fail_closed(),
@@ -248,4 +265,27 @@ pub(super) fn endpoint_only_successor(old: &DesiredRuntimeSpec, new: &DesiredRun
         && matches!(old.transition, RuntimeTransition::CancelAndDrain)
         && matches!(new.transition, RuntimeTransition::CancelAndDrain)
         && old.spec_digest != new.spec_digest
+}
+
+/// A process restart burns every formerly Active route epoch when the
+/// registry reconstructs its cell Closed. Reopening is possible only from a
+/// strict Endpoint-only successor that removes an old Endpoint or replaces
+/// every retained old binding with a strictly higher epoch; an unchanged old
+/// binding must remain permanently closed.
+pub(super) fn restart_closed_endpoint_successor(
+    predecessor: &DesiredRuntimeSpec,
+    successor: &DesiredRuntimeSpec,
+) -> bool {
+    super::authorized_blockd::validate_running_endpoint_only_desired_successor(
+        predecessor,
+        successor,
+    )
+    .is_ok()
+        && predecessor.endpoints.iter().all(|old| {
+            successor
+                .endpoints
+                .iter()
+                .find(|current| current.endpoint_id == old.endpoint_id)
+                .is_none_or(|current| current != old && current.route_epoch > old.route_epoch)
+        })
 }

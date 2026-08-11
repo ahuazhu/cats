@@ -609,6 +609,102 @@ impl<'a, P: AdmissionGatePort> GateSequencer<'a, P> {
         })
     }
 
+    /// Adopts the exact global fail-close performed by a process restart for
+    /// a strict higher-epoch Endpoint-only Desired. This edge never opens a
+    /// lifecycle or route: it publishes the successor metadata with every old
+    /// binding Closed, then advances only the already-Closed cell tuple. The
+    /// ordinary one-at-a-time Endpoint journal resumes from the selected
+    /// `CloseGate` token on the next accepted full scan.
+    pub fn adopt_restart_closed_endpoint_successor(
+        &mut self,
+        current: &StoredCheckpoint,
+        desired: &DesiredRuntimeSpec,
+        close_token: Option<&Id>,
+        updated_at: UnixMillis,
+    ) -> Result<GateTransitionResult, GateReconcileError> {
+        validate_endpoint_desired(desired)?;
+        let source = AdmissionSnapshot::from_checkpoint(current.checkpoint())?;
+        let closed_source = source.fail_closed();
+        let action = first_endpoint_action(current.checkpoint(), desired)?;
+        let fallback_endpoint = close_token
+            .or_else(|| {
+                desired
+                    .endpoints
+                    .first()
+                    .map(|endpoint| &endpoint.endpoint_id)
+            })
+            .ok_or_else(|| GateReconcileError::WrongEndpointAction(desired.cat_id.clone()))?;
+        if action.is_none()
+            || close_token.is_some_and(|endpoint_id| {
+                !current
+                    .checkpoint()
+                    .route_gates
+                    .iter()
+                    .any(|route| &route.binding.endpoint_id == endpoint_id)
+            })
+            || (close_token.is_none() && !current.checkpoint().route_gates.is_empty())
+        {
+            return Err(GateReconcileError::WrongEndpointAction(
+                fallback_endpoint.clone(),
+            ));
+        }
+        if current.checkpoint().lifecycle_admission != LifecycleAdmission::Open
+            || current.checkpoint().stable_state
+                != Some(cats_api::runtime_reconciliation::StableState::Running)
+            || !matches!(
+                current.checkpoint().step,
+                ReconcileStep::Stable {
+                    state: cats_api::runtime_reconciliation::StableState::Running
+                }
+            )
+            || current
+                .checkpoint()
+                .route_gates
+                .iter()
+                .any(|route| route.gate != RouteGateState::Active)
+            || self.port.snapshot() != closed_source
+        {
+            return Err(GateReconcileError::EndpointCellMismatch);
+        }
+
+        let mut adopted = stage_desired(current.checkpoint(), desired, updated_at)?;
+        close_checkpoint_gates(&mut adopted);
+        adopted.lifecycle_admission = LifecycleAdmission::Closed;
+        adopted.stable_state = None;
+        adopted.require_idle = RequireIdleCheckpoint::NotApplicable;
+        adopted.step = if let Some(endpoint_id) = close_token {
+            let route_epoch = route_entry(&adopted, endpoint_id)?.binding.route_epoch;
+            ReconcileStep::CloseGate {
+                endpoint_id: endpoint_id.clone(),
+                route_epoch,
+            }
+        } else {
+            ReconcileStep::OpenAdmission {
+                runtime_incarnation: adopted
+                    .runtime_incarnation
+                    .clone()
+                    .ok_or(GateReconcileError::RuntimeNotInstallable)?,
+            }
+        };
+        encode_runtime_checkpoint(&adopted).map_err(|error| {
+            GateReconcileError::AppliedDesired(AppliedDesiredError::CheckpointContract { error })
+        })?;
+        let replacement = AdmissionSnapshot::from_checkpoint(&adopted)?;
+        let adopted = self.store.replace(current, &adopted)?;
+        let result = self.port.advance_closed(&closed_source, &replacement);
+        let after = self.port.snapshot();
+        let port_error = match result {
+            Ok(()) if after == replacement => None,
+            Err(error) if after == replacement => Some(error),
+            Err(error) if after == closed_source => return Err(error.into()),
+            Ok(()) | Err(_) => return Err(GateReconcileError::EndpointCellMismatch),
+        };
+        Ok(GateTransitionResult::EndpointClosed {
+            checkpoint: adopted,
+            port_error,
+        })
+    }
+
     /// Applies one deterministic Endpoint-only close. The first publication
     /// binds the checkpoint top level to the new Desired while retaining the
     /// exact old installed binding and an Active gate. Only after that token
@@ -1607,7 +1703,12 @@ fn validate_close_gate_checkpoint(
         || checkpoint.placement_epoch != desired.placement.placement_epoch
         || checkpoint.node_id != desired.placement.node_id
         || checkpoint.runtime_incarnation.is_none()
-        || checkpoint.lifecycle_admission != LifecycleAdmission::Open
+        || !(checkpoint.lifecycle_admission == LifecycleAdmission::Open
+            || (checkpoint.lifecycle_admission == LifecycleAdmission::Closed
+                && checkpoint
+                    .route_gates
+                    .iter()
+                    .all(|route| route.gate == RouteGateState::Closed)))
         || !matches!(
             &checkpoint.step,
             ReconcileStep::CloseGate {

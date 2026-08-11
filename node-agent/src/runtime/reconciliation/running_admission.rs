@@ -860,6 +860,45 @@ impl RunningAdmissionPreScan {
                 .map_err(super::GateReconcileError::from)?;
             return Ok(());
         }
+        // A restart-closed Endpoint successor publishes only a Closed R2
+        // journal before advancing the process-local metadata tuple. If that
+        // response is lost, the exact sealed R1 Closed source may finish this
+        // no-admission edge; neither lifecycle nor any old route is reopened.
+        let restart_endpoint_close_source = top_is_current
+            && super::route_retirement::restart_closed_endpoint_successor(&sealed, desired)
+            && checkpoint_cell.lifecycle_admission() == LifecycleAdmission::Closed
+            && checkpoint_cell
+                .endpoints()
+                .iter()
+                .all(|route| route.gate == RouteGateState::Closed)
+            && matches!(
+                checkpoint.step,
+                ReconcileStep::CloseGate { .. } | ReconcileStep::OpenAdmission { .. }
+            )
+            && live.lifecycle_admission() == LifecycleAdmission::Closed
+            && live
+                .endpoints()
+                .iter()
+                .all(|route| route.gate == RouteGateState::Closed)
+            && live.applied_desired_revision() == sealed.desired_revision
+            && live.spec_digest() == &sealed.spec_digest
+            && live.placement() == &sealed.placement
+            && live.runtime_incarnation() == checkpoint_cell.runtime_incarnation()
+            && live.guest_ipv4() == checkpoint_cell.guest_ipv4()
+            && live.endpoints().len() == checkpoint_cell.endpoints().len()
+            && live
+                .endpoints()
+                .iter()
+                .zip(checkpoint_cell.endpoints())
+                .all(|(source, current)| source.binding == current.binding);
+        if restart_endpoint_close_source {
+            let source_closed = live.fail_closed();
+            session.cell().force_close();
+            let mut port = session.cell().port();
+            port.advance_closed(&source_closed, &checkpoint_cell)
+                .map_err(super::GateReconcileError::from)?;
+            return Ok(());
+        }
         let require_idle_needs_settlement = !matches!(
             checkpoint.require_idle,
             RequireIdleCheckpoint::NotApplicable | RequireIdleCheckpoint::Armed { .. }
@@ -1349,9 +1388,50 @@ impl RunningAdmissionEffect {
         } else {
             false
         };
+        let require_idle_source = if retiring.checkpoint_binding
+            == DesiredCheckpointBinding::Current
+            && matches!(
+                retiring.mode,
+                RouteRetirementMode::GlobalDesired | RouteRetirementMode::GlobalPhysicalNegative
+            )
+            && matches!(
+                stored.checkpoint().require_idle,
+                RequireIdleCheckpoint::Busy {
+                    gate_closed: false,
+                    ..
+                }
+            ) {
+            let sealed = retiring
+                .gate_predecessor
+                .as_ref()
+                .context("Busy/Open retirement lacks its sealed Running source")?;
+            Some(exact_require_idle_source_snapshot(
+                sealed,
+                desired,
+                stored.checkpoint(),
+            )?)
+        } else {
+            None
+        };
+        let restart_closed_allows_live = retiring.mode == RouteRetirementMode::EndpointOnly
+            && retiring.checkpoint_binding == DesiredCheckpointBinding::Superseded
+            && retiring
+                .gate_predecessor
+                .as_ref()
+                .is_some_and(|predecessor| {
+                    super::route_retirement::restart_closed_endpoint_successor(predecessor, desired)
+                })
+            && live.snapshot() == &checkpoint_cell.fail_closed()
+            && live.guards().platform_guards == 0
+            && live.guards().endpoint_guards.is_empty();
         anyhow::ensure!(
-            live.snapshot() == &checkpoint_cell || current_edge_allows_live,
-            "route-retirement cell lost its exact checkpoint or stored effect edge"
+            live.snapshot() == &checkpoint_cell
+                || current_edge_allows_live
+                || require_idle_source
+                    .as_ref()
+                    .is_some_and(|source| live.snapshot() == source)
+                || restart_closed_allows_live,
+            "route-retirement cell lost its exact checkpoint, stored effect edge, or RequireIdle source"
         );
         context.check_active()?;
         let Some(action) =
@@ -1389,9 +1469,19 @@ impl RunningAdmissionEffect {
         }
 
         let times = next_persist_times(&stored)?;
+        if matches!(action, RouteRetirementAction::SettleOpenBusyFailClosed) {
+            session.cell().force_close();
+        }
         let mut port = session.cell().port();
         let mut sequencer = GateSequencer::new(session.checkpoint_store(), &mut port);
         let result = match action {
+            RouteRetirementAction::AdoptRestartClosed(close_token) => sequencer
+                .adopt_restart_closed_endpoint_successor(
+                    &stored,
+                    desired,
+                    close_token.as_ref(),
+                    times.after_effect,
+                )?,
             RouteRetirementAction::CloseGate(endpoint_id) => {
                 sequencer.close_gate(&stored, desired, &endpoint_id, times)?
             }
@@ -1428,6 +1518,15 @@ impl RunningAdmissionEffect {
             RouteRetirementAction::RecoverRequireIdle => {
                 sequencer.recover_armed(&stored, desired, times)?
             }
+            RouteRetirementAction::SettleOpenBusyFailClosed => sequencer
+                .settle_open_busy_fail_closed(
+                    &stored,
+                    desired,
+                    require_idle_source.as_ref().context(
+                        "physical-negative Busy retirement lacks its exact source snapshot",
+                    )?,
+                    times.after_effect,
+                )?,
             RouteRetirementAction::RemoveSession => unreachable!("handled before sequencer"),
         };
         debug_assert_eq!(
@@ -1693,6 +1792,7 @@ enum RunningTailAction {
 }
 
 enum RouteRetirementAction {
+    AdoptRestartClosed(Option<Id>),
     CloseGate(Id),
     PrepareChanged(Id),
     RemoveGate(Id),
@@ -1700,6 +1800,7 @@ enum RouteRetirementAction {
     CloseAll,
     BeginRequireIdle,
     RecoverRequireIdle,
+    SettleOpenBusyFailClosed,
     RemoveSession,
 }
 
@@ -1720,7 +1821,27 @@ fn plan_route_retirement(
             .all(|route| route.gate == RouteGateState::Closed);
     let all_drained = guards.platform_guards == 0 && guards.endpoint_guards.is_empty();
 
-    if cell_is_closed {
+    if cell_is_closed
+        && retiring.mode == RouteRetirementMode::EndpointOnly
+        && retiring.checkpoint_binding == DesiredCheckpointBinding::Superseded
+    {
+        let predecessor = retiring
+            .gate_predecessor
+            .as_ref()
+            .context("restart-closed retirement lacks its sealed Running predecessor")?;
+        anyhow::ensure!(
+            all_drained
+                && cell == &AdmissionSnapshot::from_checkpoint(checkpoint)?.fail_closed()
+                && super::route_retirement::restart_closed_endpoint_successor(predecessor, desired,),
+            "restart-closed Endpoint retirement lacks its exact higher-epoch successor"
+        );
+        let close_token = checkpoint
+            .route_gates
+            .first()
+            .map(|route| route.binding.endpoint_id.clone());
+        return Ok(Some(RouteRetirementAction::AdoptRestartClosed(close_token)));
+    }
+    if cell_is_closed && retiring.mode != RouteRetirementMode::EndpointOnly {
         return Ok(all_drained.then_some(RouteRetirementAction::RemoveSession));
     }
 
@@ -1786,6 +1907,17 @@ fn plan_route_retirement(
                 };
             }
             Ok(Some(RouteRetirementAction::CloseAll))
+        }
+        RouteRetirementMode::GlobalPhysicalNegative
+            if matches!(
+                checkpoint.require_idle,
+                RequireIdleCheckpoint::Busy {
+                    gate_closed: false,
+                    ..
+                }
+            ) =>
+        {
+            Ok(Some(RouteRetirementAction::SettleOpenBusyFailClosed))
         }
         RouteRetirementMode::GlobalPhysicalNegative => Ok(Some(RouteRetirementAction::CloseAll)),
     }
@@ -2861,6 +2993,213 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn physical_exact_require_idle_busy_preserves_open_source_and_guard() {
+        let fixture = Fixture::new(1);
+        let registry = fixture.registry();
+        let effect = RunningAdmissionEffect::new(Arc::clone(&registry));
+        effect
+            .try_apply(&fixture.context(&registry, true), &fixture.desired)
+            .unwrap()
+            .unwrap();
+        let session = registry
+            .existing_session(&fixture.desired.cat_id)
+            .unwrap()
+            .unwrap();
+        let old = session.cell().snapshot();
+        let mut guard = session
+            .cell()
+            .acquire_verified_route(
+                &claims(&old.endpoints()[0].binding),
+                RouteGrantV2TimeVerdict::Valid,
+            )
+            .unwrap()
+            .0;
+        let mut successor = fixture.desired.clone();
+        successor.desired_revision = Revision::new(successor.desired_revision.get() + 1).unwrap();
+        successor.target = RuntimeTarget::Suspended;
+        successor.transition = RuntimeTransition::RequireIdle {
+            attempt_id: RandomId128::new("cccccccccccccccccccccccccccccccc").unwrap(),
+            source_revision: fixture.desired.desired_revision,
+            source_runtime_incarnation: old.runtime_incarnation().cloned().unwrap(),
+        };
+        successor.spec_digest = spec_digest(&successor).unwrap();
+        RunningAdmissionPreScan::new(Arc::clone(&registry))
+            .reconcile(pre_scan_context(successor.clone()))
+            .unwrap();
+
+        let exact = retirement_context(
+            fixture.root.path(),
+            &successor,
+            &fixture.desired,
+            &session,
+            RouteRetirementMode::GlobalDesired,
+            false,
+        );
+        assert_eq!(
+            effect.try_retire(&exact, &successor).unwrap(),
+            Some(RuntimeDesiredEffectOutcome::Applied)
+        );
+        assert_eq!(
+            session.cell().snapshot().lifecycle_admission(),
+            LifecycleAdmission::Open
+        );
+        assert!(
+            tokio::time::timeout(Duration::from_millis(25), guard.cancelled())
+                .await
+                .is_err()
+        );
+        assert!(session
+            .cell()
+            .acquire_verified_route(
+                &claims(&old.endpoints()[0].binding),
+                RouteGrantV2TimeVerdict::Valid,
+            )
+            .is_ok());
+    }
+
+    #[tokio::test]
+    async fn complete_physical_negative_overrides_require_idle_busy_and_closes_all() {
+        let fixture = Fixture::new(1);
+        let registry = fixture.registry();
+        let effect = RunningAdmissionEffect::new(Arc::clone(&registry));
+        effect
+            .try_apply(&fixture.context(&registry, true), &fixture.desired)
+            .unwrap()
+            .unwrap();
+        let session = registry
+            .existing_session(&fixture.desired.cat_id)
+            .unwrap()
+            .unwrap();
+        let old = session.cell().snapshot();
+        let mut guard = session
+            .cell()
+            .acquire_verified_route(
+                &claims(&old.endpoints()[0].binding),
+                RouteGrantV2TimeVerdict::Valid,
+            )
+            .unwrap()
+            .0;
+        let mut successor = fixture.desired.clone();
+        successor.desired_revision = Revision::new(successor.desired_revision.get() + 1).unwrap();
+        successor.target = RuntimeTarget::Suspended;
+        successor.transition = RuntimeTransition::RequireIdle {
+            attempt_id: RandomId128::new("cccccccccccccccccccccccccccccccc").unwrap(),
+            source_revision: fixture.desired.desired_revision,
+            source_runtime_incarnation: old.runtime_incarnation().cloned().unwrap(),
+        };
+        successor.spec_digest = spec_digest(&successor).unwrap();
+        RunningAdmissionPreScan::new(Arc::clone(&registry))
+            .reconcile(pre_scan_context(successor.clone()))
+            .unwrap();
+        assert!(matches!(
+            session
+                .checkpoint_store()
+                .load()
+                .unwrap()
+                .unwrap()
+                .checkpoint()
+                .require_idle,
+            RequireIdleCheckpoint::Busy {
+                gate_closed: false,
+                ..
+            }
+        ));
+
+        let negative = retirement_context(
+            fixture.root.path(),
+            &successor,
+            &fixture.desired,
+            &session,
+            RouteRetirementMode::GlobalPhysicalNegative,
+            false,
+        );
+        assert_eq!(
+            effect.try_retire(&negative, &successor).unwrap(),
+            Some(RuntimeDesiredEffectOutcome::RefreshInventory)
+        );
+        tokio::time::timeout(Duration::from_secs(1), guard.cancelled())
+            .await
+            .expect("complete physical negative cancels Busy/Open stream");
+        assert_eq!(
+            session.cell().snapshot().lifecycle_admission(),
+            LifecycleAdmission::Closed
+        );
+        assert!(session
+            .cell()
+            .acquire_verified_route(
+                &claims(&old.endpoints()[0].binding),
+                RouteGrantV2TimeVerdict::Valid,
+            )
+            .is_err());
+    }
+
+    #[tokio::test]
+    async fn complete_physical_negative_overrides_endpoint_latch_and_closes_unchanged_route() {
+        let fixture = Fixture::new(2);
+        let registry = fixture.registry();
+        let effect = RunningAdmissionEffect::new(Arc::clone(&registry));
+        for _ in 0..2 {
+            effect
+                .try_apply(&fixture.context(&registry, true), &fixture.desired)
+                .unwrap()
+                .unwrap();
+        }
+        let session = registry
+            .existing_session(&fixture.desired.cat_id)
+            .unwrap()
+            .unwrap();
+        let old = session.cell().snapshot();
+        let mut guards = old
+            .endpoints()
+            .iter()
+            .map(|route| {
+                session
+                    .cell()
+                    .acquire_verified_route(&claims(&route.binding), RouteGrantV2TimeVerdict::Valid)
+                    .unwrap()
+                    .0
+            })
+            .collect::<Vec<_>>();
+        let mut successor = fixture.desired.clone();
+        successor.desired_revision = Revision::new(successor.desired_revision.get() + 1).unwrap();
+        successor.endpoints[0].route_epoch =
+            Epoch::new(successor.endpoints[0].route_epoch.get() + 1).unwrap();
+        successor.endpoints[0].target_port += 10;
+        successor.spec_digest = spec_digest(&successor).unwrap();
+        RunningAdmissionPreScan::new(Arc::clone(&registry))
+            .reconcile(pre_scan_context(successor.clone()))
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(1), guards[0].cancelled())
+            .await
+            .expect("changed A is latched before the physical scan");
+        assert!(
+            tokio::time::timeout(Duration::from_millis(25), guards[1].cancelled())
+                .await
+                .is_err()
+        );
+
+        let negative = retirement_context(
+            fixture.root.path(),
+            &successor,
+            &fixture.desired,
+            &session,
+            RouteRetirementMode::GlobalPhysicalNegative,
+            false,
+        );
+        assert_eq!(
+            effect.try_retire(&negative, &successor).unwrap(),
+            Some(RuntimeDesiredEffectOutcome::RefreshInventory)
+        );
+        tokio::time::timeout(Duration::from_secs(1), guards[1].cancelled())
+            .await
+            .expect("complete physical negative cancels unchanged B too");
+        assert_eq!(
+            session.cell().snapshot().lifecycle_admission(),
+            LifecycleAdmission::Closed
+        );
+    }
+
+    #[tokio::test]
     async fn global_close_ignores_guard_count_race_but_session_removal_waits_for_drain() {
         let fixture = Fixture::new(1);
         let registry = fixture.registry();
@@ -3746,6 +4085,162 @@ mod tests {
             condition,
             cats_api::runtime_reconciliation::Condition::Ready { .. }
         )));
+
+        let old_bindings = closed
+            .endpoints()
+            .iter()
+            .map(|route| route.binding.clone())
+            .collect::<Vec<_>>();
+        let session = successor
+            .existing_session(&fixture.desired.cat_id)
+            .unwrap()
+            .unwrap();
+        let mut fresh = fixture.desired.clone();
+        fresh.desired_revision = Revision::new(fresh.desired_revision.get() + 1).unwrap();
+        for endpoint in &mut fresh.endpoints {
+            endpoint.route_epoch = Epoch::new(endpoint.route_epoch.get() + 1).unwrap();
+        }
+        let mut new_first = fresh.endpoints[0].clone();
+        new_first.endpoint_id = Id::new("ep_00").unwrap();
+        new_first.hostname = Hostname::new("first.example.test").unwrap();
+        new_first.target_port += 100;
+        fresh.endpoints.insert(0, new_first);
+        fresh.spec_digest = spec_digest(&fresh).unwrap();
+        RunningAdmissionPreScan::new(Arc::clone(&successor))
+            .reconcile(pre_scan_context(fresh.clone()))
+            .expect("strict higher-epoch successor retains only the Closed restart source");
+
+        for _ in 0..8 {
+            let stored = session.checkpoint_store().load().unwrap().unwrap();
+            if stored.checkpoint().desired_revision == fresh.desired_revision
+                && stored.checkpoint().stable_state == Some(StableState::Running)
+            {
+                break;
+            }
+            let context = retirement_context(
+                fixture.root.path(),
+                &fresh,
+                &fixture.desired,
+                &session,
+                RouteRetirementMode::EndpointOnly,
+                true,
+            );
+            assert_eq!(
+                successor_effect.try_retire(&context, &fresh).unwrap(),
+                Some(RuntimeDesiredEffectOutcome::RefreshInventory)
+            );
+        }
+        let durable = session.checkpoint_store().load().unwrap().unwrap();
+        assert_eq!(
+            durable.checkpoint().desired_revision,
+            fresh.desired_revision
+        );
+        assert_eq!(
+            durable.checkpoint().stable_state,
+            Some(StableState::Running)
+        );
+        let reopened = session.cell().snapshot();
+        assert_eq!(reopened.lifecycle_admission(), LifecycleAdmission::Open);
+        assert!(reopened
+            .endpoints()
+            .iter()
+            .all(|route| route.gate == RouteGateState::Active));
+        for old in old_bindings {
+            assert!(session
+                .cell()
+                .acquire_verified_route(&claims(&old), RouteGrantV2TimeVerdict::Valid)
+                .is_err());
+        }
+        for route in reopened.endpoints() {
+            assert!(session
+                .cell()
+                .acquire_verified_route(&claims(&route.binding), RouteGrantV2TimeVerdict::Valid,)
+                .is_ok());
+        }
+    }
+
+    #[test]
+    fn restart_closed_zero_endpoint_source_can_install_its_first_fresh_endpoint() {
+        let fixture = Fixture::new(0);
+        let first_registry = fixture.registry();
+        RunningAdmissionEffect::new(Arc::clone(&first_registry))
+            .try_apply(&fixture.context(&first_registry, true), &fixture.desired)
+            .unwrap()
+            .unwrap();
+        drop(first_registry);
+
+        let restarted = fixture.registry();
+        let store = FileCheckpointStore::open(
+            &fixture.root.path().join(CHECKPOINTS),
+            &fixture.desired.cat_id,
+        )
+        .unwrap();
+        let source = store.load().unwrap().unwrap();
+        let source_closed = AdmissionSnapshot::from_checkpoint(source.checkpoint())
+            .unwrap()
+            .fail_closed();
+        drop(store);
+        let session = match restarted
+            .ensure_closed(
+                &fixture.desired.cat_id,
+                source_closed,
+                Some(fixture.desired.clone()),
+            )
+            .unwrap()
+        {
+            AdmissionCellSessionLookup::CreatedClosed(session) => session,
+            AdmissionCellSessionLookup::Existing => panic!("restart session unexpectedly existed"),
+        };
+        let mut successor = fixture.desired.clone();
+        successor.desired_revision = Revision::new(successor.desired_revision.get() + 1).unwrap();
+        successor.endpoints = decode_desired_runtime_spec(DESIRED).unwrap().endpoints;
+        successor.spec_digest = spec_digest(&successor).unwrap();
+        RunningAdmissionPreScan::new(Arc::clone(&restarted))
+            .reconcile(pre_scan_context(successor.clone()))
+            .unwrap();
+
+        let effect = RunningAdmissionEffect::new(Arc::clone(&restarted));
+        let retirement = retirement_context(
+            fixture.root.path(),
+            &successor,
+            &fixture.desired,
+            &session,
+            RouteRetirementMode::EndpointOnly,
+            true,
+        );
+        assert_eq!(
+            effect.try_retire(&retirement, &successor).unwrap(),
+            Some(RuntimeDesiredEffectOutcome::RefreshInventory)
+        );
+        let adopted = session.checkpoint_store().load().unwrap().unwrap();
+        assert_eq!(
+            adopted.checkpoint().desired_revision,
+            successor.desired_revision
+        );
+        assert!(matches!(
+            adopted.checkpoint().step,
+            ReconcileStep::OpenAdmission { .. }
+        ));
+        assert_eq!(
+            session.cell().snapshot().lifecycle_admission(),
+            LifecycleAdmission::Closed
+        );
+
+        assert_eq!(
+            effect
+                .try_apply(
+                    &ready_context(fixture.root.path(), &successor, &session),
+                    &successor,
+                )
+                .unwrap(),
+            Some(RuntimeDesiredEffectOutcome::RefreshInventory)
+        );
+        let stable = session.checkpoint_store().load().unwrap().unwrap();
+        assert_eq!(stable.checkpoint().stable_state, Some(StableState::Running));
+        let live = session.cell().snapshot();
+        assert_eq!(live.lifecycle_admission(), LifecycleAdmission::Open);
+        assert_eq!(live.endpoints().len(), 1);
+        assert_eq!(live.endpoints()[0].gate, RouteGateState::Active);
     }
 
     #[test]
