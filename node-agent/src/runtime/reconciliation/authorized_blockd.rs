@@ -1752,6 +1752,28 @@ pub fn authorized_blockd_status_is_bound(
     process_identity_token: &RandomId128,
     device_ownership_token: &RandomId128,
 ) -> bool {
+    authorized_blockd_status_is_bound_to_head(
+        status,
+        acquired,
+        scope_id,
+        process_identity_token,
+        device_ownership_token,
+        &acquired.attachment.head,
+    )
+}
+
+/// The serving process retains its immutable acquire-time authorization while
+/// its live engine advances the same fenced attachment.  A scanner must bind
+/// the dynamic `remote_head` to the independently loaded current Volume head,
+/// never to the old grant or to a public generation counter.
+pub(crate) fn authorized_blockd_status_is_bound_to_head(
+    status: &DurabilityStatus,
+    acquired: &AuthorizedBlockdCheckpoint,
+    scope_id: &Id,
+    process_identity_token: &RandomId128,
+    device_ownership_token: &RandomId128,
+    current_head: &cats_api::runtime_reconciliation::RemoteHead,
+) -> bool {
     let attachment = &acquired.attachment;
     process_identity_token != device_ownership_token
         && status.volume_id == attachment.identity.volume_id.as_str()
@@ -1767,7 +1789,7 @@ pub fn authorized_blockd_status_is_bound(
         && status.device_ownership_token.as_ref() == Some(device_ownership_token)
         && status.guest_device_serial.as_ref() == Some(&acquired.volume.guest_device.serial)
         && status.control_only == Some(false)
-        && status.remote_head.as_ref() == Some(&attachment.head)
+        && status.remote_head.as_ref() == Some(current_head)
         && status.mode
             == match attachment.durability {
                 Durability::Strict => "strict",

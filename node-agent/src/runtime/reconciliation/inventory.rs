@@ -24,8 +24,8 @@ use cats_api::runtime_reconciliation::{
 };
 use cats_storage::{
     authority::{
-        validate_authorized_serving_attachment, validate_volume_record, LastVolumeTransition,
-        VolumeRecord,
+        remote_head_is_same_or_later, validate_authorized_serving_attachment,
+        validate_volume_record, LastVolumeTransition, VolumeRecord,
     },
     BlobStore,
 };
@@ -508,6 +508,7 @@ impl RuntimeInventoryScanner for CleanSlateInventoryScanner {
         let mut aggregate = InventoryProbeAggregation::new();
         let mut processes_by_cat = BTreeMap::new();
         let mut serving_devices_by_cat = BTreeMap::new();
+        let mut serving_status_by_cat = BTreeMap::new();
         let mut networks_by_cat = BTreeMap::new();
         let mut node_global_process_admission = None;
         let mut node_global_network_admission = None;
@@ -581,6 +582,7 @@ impl RuntimeInventoryScanner for CleanSlateInventoryScanner {
                 RootProcessInventoryBridgeOutcome::Complete(admission) => {
                     processes_by_cat = admission.process_projections();
                     serving_devices_by_cat = admission.vhost_device_projections();
+                    serving_status_by_cat = admission.serving_status_projections();
                     node_global_process_admission = Some(admission);
                 }
                 RootProcessInventoryBridgeOutcome::Unavailable => {
@@ -831,6 +833,9 @@ impl RuntimeInventoryScanner for CleanSlateInventoryScanner {
                         serving_devices: serving_devices_by_cat
                             .remove(&desired.cat_id)
                             .unwrap_or_default(),
+                        serving_status: serving_status_by_cat
+                            .remove(&desired.cat_id)
+                            .unwrap_or_default(),
                         networks: networks_by_cat.remove(&desired.cat_id).unwrap_or_default(),
                     },
                 )
@@ -847,6 +852,7 @@ impl RuntimeInventoryScanner for CleanSlateInventoryScanner {
                 && aggregate.blockd_by_cat.is_empty()
                 && processes_by_cat.is_empty()
                 && serving_devices_by_cat.is_empty()
+                && serving_status_by_cat.is_empty()
                 && networks_by_cat.is_empty(),
             "inventory named a Cat outside Desired"
         );
@@ -1091,6 +1097,7 @@ struct InventoryProjectionContext<'a> {
 struct RuntimeManagedProjection {
     processes: Vec<ProcessEvidence>,
     serving_devices: BTreeMap<Id, ObservedDevice>,
+    serving_status: BTreeMap<Id, cats_api::blockd::DurabilityStatus>,
     networks: Vec<cats_api::runtime_reconciliation::ObservedNetwork>,
 }
 
@@ -1101,7 +1108,7 @@ fn runtime_from_inventory(
     mut volume_evidence: Vec<AuthorityVolumeInventoryEvidence>,
     checkpoint: Option<RuntimeCheckpointInventoryEvidence>,
     blockds: BTreeMap<Id, AuthorizedBlockdInventoryEvidence>,
-    managed: RuntimeManagedProjection,
+    mut managed: RuntimeManagedProjection,
 ) -> anyhow::Result<ObservedRuntimeStatus> {
     let checkpoint_path = runtime_checkpoint_path(projection.checkpoint_directory, &desired.cat_id);
     let checkpoint_path = HostPath::new(
@@ -1178,17 +1185,13 @@ fn runtime_from_inventory(
                         )
                 })
             }
+            (ReconcileStep::StartRuntime { .. }, VolumeAuthorityEvidence::Owned { head, .. }) => {
+                head == &attachment.head
+            }
             (_, VolumeAuthorityEvidence::Owned { head, .. })
-                if matches!(runtime_checkpoint.runtime_launch, RuntimeLaunch::Present(_)) =>
+                if runtime_checkpoint.runtime_launch.identity().is_some() =>
             {
-                let RuntimeLaunch::Present(launch) = &runtime_checkpoint.runtime_launch else {
-                    unreachable!("the match guard proved a retained launch")
-                };
-                launch
-                    .devices
-                    .iter()
-                    .find(|device| device.volume_id == volume.volume_id)
-                    .is_some_and(|device| &device.expected_head == head)
+                remote_head_is_same_or_later(head, &attachment.head)
             }
             (_, VolumeAuthorityEvidence::Owned { head, .. }) => head == &attachment.head,
             (
@@ -1230,10 +1233,49 @@ fn runtime_from_inventory(
             "authorized blockd lineage conflicts with Volume authority"
         );
         let released = matches!(volume.authority, VolumeAuthorityEvidence::Unowned { .. });
-        let lineage_generation = match &volume.authority {
+        let authority_generation = match &volume.authority {
             VolumeAuthorityEvidence::Owned { head, .. }
             | VolumeAuthorityEvidence::Unowned { head, .. } => head.generation,
             _ => unreachable!("owned or exact released authority was checked above"),
+        };
+        let status = managed
+            .serving_status
+            .remove(&attachment.identity.volume_id);
+        anyhow::ensure!(
+            !released || status.is_none(),
+            "released authorized lineage still has an exact serving process"
+        );
+        let (local_generation, remote_generation, pending_pack_count, fenced) = match status {
+            Some(status) => {
+                let local = u64::try_from(status.local_durable_generation)
+                    .ok()
+                    .and_then(cats_api::runtime_reconciliation::Generation::new)
+                    .context("serving local generation is outside the wire range")?;
+                let remote = u64::try_from(status.remote_durable_generation)
+                    .ok()
+                    .and_then(cats_api::runtime_reconciliation::Generation::new)
+                    .context("serving remote generation is outside the wire range")?;
+                anyhow::ensure!(
+                    remote == authority_generation && local >= remote && !status.fenced,
+                    "serving durability watermarks conflict with current Volume authority"
+                );
+                (
+                    local,
+                    remote,
+                    WireU64::new(
+                        u64::try_from(status.unpublished_generations)
+                            .context("serving pending pack count exceeds WireU64")?,
+                    )
+                    .context("serving pending pack count exceeds WireU64")?,
+                    false,
+                )
+            }
+            None => (
+                authority_generation,
+                authority_generation,
+                WireU64::new(0).expect("zero fits WireU64"),
+                released,
+            ),
         };
         volume.local_lineages.push(LocalVolumeLineage {
             attachment_id: attachment.identity.attachment_id.clone(),
@@ -1241,15 +1283,14 @@ fn runtime_from_inventory(
             acquire_origin: attachment.identity.acquire_origin.clone(),
             node_id: attachment.identity.node_id.clone(),
             placement_epoch: attachment.identity.placement_epoch,
-            // The authorized pre-Guest lineage cannot contain Guest writes.
-            // A late deterministic provision may already have advanced the
-            // remote head; projecting that exact authoritative generation is
-            // therefore the closed R == L boundary used by stale cleanup.
-            local_durable_generation: lineage_generation,
-            remote_durable_generation: lineage_generation,
+            // A live serving proof contributes its actual blockd durability
+            // watermarks. Immutable pre-serving lineage remains closed at the
+            // independently loaded metadata head.
+            local_durable_generation: local_generation,
+            remote_durable_generation: remote_generation,
             data_directory: blockd.data_directory.clone(),
-            pending_pack_count: WireU64::new(0).expect("zero fits WireU64"),
-            fenced: released,
+            pending_pack_count,
+            fenced,
             state: if released {
                 LocalLineageState::Released
             } else {
@@ -1257,6 +1298,10 @@ fn runtime_from_inventory(
             },
         });
     }
+    anyhow::ensure!(
+        managed.serving_status.is_empty(),
+        "exact serving status lacks its AuthorizedBlockd lineage"
+    );
 
     let mut volumes: Vec<ObservedVolume> = volume_evidence
         .into_iter()
@@ -1406,7 +1451,9 @@ fn authority_record_matches_local_attachment(
         )
         && record.lease_owner.as_ref() == Some(&attachment.identity.attachment_id)
         && record.lease_epoch == attachment.identity.attachment_epoch
-        && record.lease_expires_at == Some(attachment.lease_expires_at)
+        && record
+            .lease_expires_at
+            .is_some_and(|expiry| expiry >= attachment.lease_expires_at)
         && record.last_transition
             == Some(LastVolumeTransition::NormalAcquire {
                 request: attachment.acquire_request.clone(),

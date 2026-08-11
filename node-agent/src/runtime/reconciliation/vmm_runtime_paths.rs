@@ -2366,7 +2366,7 @@ mod tests {
     };
     #[cfg(target_os = "linux")]
     use cats_api::runtime_reconciliation::{
-        encode_runtime_checkpoint, Epoch, Generation, Id, RemoteHead, Revision, StableState,
+        encode_runtime_checkpoint, Epoch, Id, Revision, StableState,
     };
     use std::io::Write as _;
     use std::os::unix::fs::{MetadataExt as _, OpenOptionsExt as _};
@@ -2399,7 +2399,7 @@ mod tests {
     #[cfg(target_os = "linux")]
     #[derive(Debug, Clone, Copy)]
     enum RunningTail {
-        Format,
+        OpenAdmission,
         InstallGate,
         Stable,
     }
@@ -2414,16 +2414,11 @@ mod tests {
             Revision::new(launch_checkpoint.desired_revision.get() + 1).unwrap();
         checkpoint.spec_digest = Sha256Digest::from_bytes([0x92; 32]);
         checkpoint.step = match tail {
-            RunningTail::Format => ReconcileStep::FormatFilesystem {
-                volume_id: Id::new("vol_root").unwrap(),
-                attachment_id: Id::new("att_01").unwrap(),
-                filesystem_uuid: RandomId128::new("dddddddddddddddddddddddddddddddd").unwrap(),
-                initialization_token: RandomId128::new("eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee").unwrap(),
-                expected_blank_head: RemoteHead {
-                    generation: Generation::new(0).unwrap(),
-                    root_hash: None,
-                    root_object_id: None,
-                },
+            RunningTail::OpenAdmission => ReconcileStep::OpenAdmission {
+                runtime_incarnation: checkpoint
+                    .runtime_incarnation
+                    .clone()
+                    .expect("Running-tail fixture has an incarnation"),
             },
             RunningTail::InstallGate => ReconcileStep::InstallGate {
                 endpoint_id: Id::new("endpoint_01").unwrap(),
@@ -2578,9 +2573,9 @@ mod tests {
 
     #[cfg(target_os = "linux")]
     #[test]
-    fn fd64_retains_original_launch_across_format_gate_and_stable_checkpoint_cas() {
+    fn fd64_retains_original_launch_across_admission_gate_and_stable_checkpoint_cas() {
         for tail in [
-            RunningTail::Format,
+            RunningTail::OpenAdmission,
             RunningTail::InstallGate,
             RunningTail::Stable,
         ] {
@@ -2596,15 +2591,15 @@ mod tests {
     #[test]
     fn fd64_rejects_receipt_old_bytes_and_current_retained_identity_drift() {
         assert!(matches!(
-            inspect_after_checkpoint_cas(RunningTail::Format, false, false, true),
+            inspect_after_checkpoint_cas(RunningTail::OpenAdmission, false, false, true),
             VmmRuntimePathInspection::Conflict
         ));
         assert!(matches!(
-            inspect_after_checkpoint_cas(RunningTail::Format, true, false, false),
+            inspect_after_checkpoint_cas(RunningTail::OpenAdmission, true, false, false),
             VmmRuntimePathInspection::Conflict
         ));
         assert!(matches!(
-            inspect_after_checkpoint_cas(RunningTail::Format, false, true, false),
+            inspect_after_checkpoint_cas(RunningTail::OpenAdmission, false, true, false),
             VmmRuntimePathInspection::Conflict
         ));
     }
@@ -3005,7 +3000,7 @@ mod tests {
     #[test]
     fn stale_boot_receipt_recovery_is_replayable_and_drains_exact_launch_residue() {
         for tail in [
-            RunningTail::Format,
+            RunningTail::OpenAdmission,
             RunningTail::InstallGate,
             RunningTail::Stable,
         ] {

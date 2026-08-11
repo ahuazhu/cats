@@ -1336,8 +1336,7 @@ mod tests {
     use std::collections::BTreeMap;
 
     use cats_api::runtime_reconciliation::{
-        decode_runtime_checkpoint, encode_runtime_checkpoint, Epoch, Generation, Id, RandomId128,
-        ReconcileStep, RemoteHead, StableState,
+        decode_runtime_checkpoint, encode_runtime_checkpoint, Epoch, Id, ReconcileStep, StableState,
     };
 
     use super::*;
@@ -1359,7 +1358,6 @@ mod tests {
 
     #[derive(Clone, Copy)]
     enum RunningTail {
-        Format,
         InstallGate,
         Stable,
     }
@@ -1370,17 +1368,6 @@ mod tests {
     ) -> RuntimeCheckpoint {
         let mut checkpoint = launch_checkpoint.clone();
         checkpoint.step = match tail {
-            RunningTail::Format => ReconcileStep::FormatFilesystem {
-                volume_id: Id::new("vol_root").unwrap(),
-                attachment_id: Id::new("att_01").unwrap(),
-                filesystem_uuid: RandomId128::new("dddddddddddddddddddddddddddddddd").unwrap(),
-                initialization_token: RandomId128::new("eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee").unwrap(),
-                expected_blank_head: RemoteHead {
-                    generation: Generation::new(0).unwrap(),
-                    root_hash: None,
-                    root_object_id: None,
-                },
-            },
             RunningTail::InstallGate => ReconcileStep::InstallGate {
                 endpoint_id: Id::new("endpoint_01").unwrap(),
                 route_epoch: Epoch::new(1).unwrap(),
@@ -1407,11 +1394,7 @@ mod tests {
         )))
         .unwrap();
         let launch = VmmProcessExpectation::from_checkpoint(launch_checkpoint.clone()).unwrap();
-        for tail in [
-            RunningTail::Format,
-            RunningTail::InstallGate,
-            RunningTail::Stable,
-        ] {
+        for tail in [RunningTail::InstallGate, RunningTail::Stable] {
             let retained = VmmProcessExpectation::from_checkpoint(running_tail_checkpoint(
                 &launch_checkpoint,
                 tail,

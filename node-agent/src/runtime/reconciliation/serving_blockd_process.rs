@@ -14,12 +14,12 @@ use cats_api::blockd::DurabilityStatus;
 use cats_api::runtime_reconciliation::{
     ControlHandshakeEvidence, DesiredRuntimeSpec, HostPath, Id, ObservedDevice,
     ObservedRuntimeStatus, OwnershipTokenEvidence, PrepareDeviceFrontend, PreparedDeviceInput,
-    ProcessEvidence, ProcessRole, ProcessState, RandomId128, ReconcileStep, RuntimeCheckpoint,
-    ServingAuthorityProvenance, WireU64,
+    ProcessEvidence, ProcessRole, ProcessState, RandomId128, ReconcileStep, RemoteHead,
+    RuntimeCheckpoint, ServingAuthorityProvenance, UnixMillis, WireU64,
 };
 use cats_storage::authority::{
-    validate_authorized_serving_attachment, validate_volume_record, LastVolumeTransition,
-    VolumeDataAuthority, VolumeRecord,
+    remote_head_is_same_or_later, validate_authorized_serving_attachment, validate_volume_record,
+    LastVolumeTransition, VolumeDataAuthority, VolumeRecord,
 };
 
 use crate::runtime_spine::{
@@ -29,7 +29,8 @@ use crate::runtime_spine::{
 use crate::state_directory::StateDirectory;
 
 use super::authorized_blockd::{
-    retained_authorized_blockd_command, AuthorizedBlockFrontend, RetainedAuthorizedBlockd,
+    authorized_blockd_status_is_bound_to_head, retained_authorized_blockd_command,
+    AuthorizedBlockFrontend, RetainedAuthorizedBlockd,
 };
 use super::checkpoint::CurrentCheckpointGuard;
 use super::clean_slate_probes::CHECKPOINT_NAMESPACE;
@@ -46,8 +47,8 @@ use super::serving_handoff_effect::checkpoint_is_current_exact;
 use super::signed_root_provision::signed_inventory_admission_is_exact_with_networks;
 use super::systemd_root_provision::ListenerPhysicalIdentity;
 use super::{
-    authorized_blockd_status_is_bound, AuthorizedBlockdCheckpoint, AuthorizedBlockdStore,
-    FileCheckpointStore, RootProvisionSystemdConfig, StoredCheckpoint,
+    AuthorizedBlockdCheckpoint, AuthorizedBlockdStore, FileCheckpointStore,
+    RootProvisionSystemdConfig, StoredCheckpoint,
 };
 
 pub(crate) mod process_sealed {
@@ -128,6 +129,8 @@ pub(crate) struct ServingBlockdExpectation {
     device_ownership_token: RandomId128,
     frontend: PrepareDeviceFrontend,
     prepared_device: PreparedDeviceInput,
+    expected_remote_head: RemoteHead,
+    authority_lease_expires_at: UnixMillis,
 }
 
 impl ServingBlockdExpectation {
@@ -151,7 +154,7 @@ impl ServingBlockdExpectation {
             "serving expectation inventory changed its Cat, Volume, or data directory"
         );
         let store = AuthorizedBlockdStore::new(state_directory.clone());
-        match prepared.serving_authority.as_ref() {
+        let expectation = match prepared.serving_authority.as_ref() {
             cats_api::runtime_reconciliation::ServingAuthorityProvenance::AfterRootProvision {
                 ..
             } => {
@@ -220,7 +223,8 @@ impl ServingBlockdExpectation {
                     prepared.clone(),
                 )
             }
-        }
+        }?;
+        expectation.with_current_authority(checkpoint, authority)
     }
 
     pub(crate) fn from_handoff(
@@ -279,6 +283,8 @@ impl ServingBlockdExpectation {
                 .any(|(name, value)| name == "CATS_CRASH_POINT" && value.is_none()),
             "serving blockd command did not clear crash injection"
         );
+        let expected_remote_head = volume.attachment.head.clone();
+        let authority_lease_expires_at = volume.attachment.lease_expires_at;
         Ok(Self {
             volume,
             unit_id: serving_process.scope_id.clone(),
@@ -291,28 +297,89 @@ impl ServingBlockdExpectation {
             device_ownership_token: prepared.ownership_token.clone(),
             frontend: prepared.frontend.clone(),
             prepared_device: prepared,
+            expected_remote_head,
+            authority_lease_expires_at,
         })
     }
 
+    fn with_current_authority(
+        mut self,
+        checkpoint: &RuntimeCheckpoint,
+        authority: &VolumeRecord,
+    ) -> anyhow::Result<Self> {
+        let attachment = &self.volume.attachment;
+        anyhow::ensure!(
+            validate_volume_record(authority).is_ok()
+                && authority.volume_id == attachment.identity.volume_id
+                && authority.size_bytes == attachment.size_bytes
+                && authority.durability == attachment.durability
+                && matches!(
+                    authority.admin_state,
+                    cats_api::runtime_reconciliation::VolumeAdminState::Active
+                )
+                && authority.lease_owner.as_ref() == Some(&attachment.identity.attachment_id)
+                && authority.lease_epoch == attachment.identity.attachment_epoch
+                && authority
+                    .lease_expires_at
+                    .is_some_and(|expiry| expiry >= attachment.lease_expires_at)
+                && authority.last_transition
+                    == Some(LastVolumeTransition::NormalAcquire {
+                        request: attachment.acquire_request.clone(),
+                        result: attachment.acquire_result.clone(),
+                    })
+                && remote_head_is_same_or_later(&authority.head, &attachment.head),
+            "serving process current authority changed its retained attachment"
+        );
+        // A generation-zero Persistent device is not allowed to acquire a
+        // nonblank head before the checkpointed initialization tail begins.
+        anyhow::ensure!(
+            attachment.head.generation.get() > 0
+                || authority.head.generation.get() == 0
+                || matches!(
+                    checkpoint.step,
+                    ReconcileStep::FormatFilesystem { .. }
+                        | ReconcileStep::DrainInitialization { .. }
+                        | ReconcileStep::CommitInitialized { .. }
+                        | ReconcileStep::MountFilesystem { .. }
+                        | ReconcileStep::OpenAdmission { .. }
+                        | ReconcileStep::InstallGate { .. }
+                        | ReconcileStep::Stable {
+                            state: cats_api::runtime_reconciliation::StableState::Running
+                        }
+                ),
+            "blank Persistent authority advanced before its initialization checkpoint"
+        );
+        self.expected_remote_head = authority.head.clone();
+        self.authority_lease_expires_at = authority
+            .lease_expires_at
+            .context("serving process current authority lacks a lease")?;
+        Ok(self)
+    }
+
     fn status_is_exact(&self, status: &DurabilityStatus) -> bool {
-        authorized_blockd_status_is_bound(
+        let remote_generation = i64::try_from(self.expected_remote_head.generation.get())
+            .ok()
+            .unwrap_or(-1);
+        let generation_gap = status
+            .local_durable_generation
+            .checked_sub(status.remote_durable_generation);
+        authorized_blockd_status_is_bound_to_head(
             status,
             &self.volume,
             &self.unit_id,
             &self.process_identity_token,
             &self.device_ownership_token,
-        ) && status.local_durable_generation
-            == i64::try_from(self.volume.attachment.head.generation.get())
-                .ok()
-                .unwrap_or(-1)
-            && status.remote_durable_generation
-                == i64::try_from(self.volume.attachment.head.generation.get())
-                    .ok()
-                    .unwrap_or(-1)
-            && status.unpublished_generations == 0
-            && status.unpublished_bytes == 0
-            && status.oldest_unpublished_age_ms == 0
-            && !status.backpressured
+            &self.expected_remote_head,
+        ) && status.remote_durable_generation == remote_generation
+            && generation_gap.is_some_and(|gap| {
+                gap >= 0
+                    && usize::try_from(gap).ok() == Some(status.unpublished_generations)
+                    && (gap != 0
+                        || (status.unpublished_bytes == 0 && status.oldest_unpublished_age_ms == 0))
+                    && (self.volume.attachment.durability
+                        != cats_api::runtime_reconciliation::Durability::Strict
+                        || gap == 0)
+            })
     }
 
     pub(crate) fn cat_id(&self) -> &Id {
@@ -352,8 +419,8 @@ impl ServingBlockdExpectation {
             && current.lease_epoch == attachment.identity.attachment_epoch
             && current
                 .lease_expires_at
-                .is_some_and(|expiry| expiry >= attachment.lease_expires_at)
-            && current.head == attachment.head
+                .is_some_and(|expiry| expiry >= self.authority_lease_expires_at)
+            && current.head == self.expected_remote_head
             && current.last_transition
                 == Some(LastVolumeTransition::NormalAcquire {
                     request: attachment.acquire_request.clone(),
@@ -638,6 +705,10 @@ impl ServingBlockdProcessEvidence {
         &self.control_socket_path
     }
 
+    pub(crate) fn durability_status(&self) -> &DurabilityStatus {
+        &self.status
+    }
+
     pub(crate) fn listener_path(&self) -> &HostPath {
         match &self.frontend {
             PrepareDeviceFrontend::KernelNbd {
@@ -705,6 +776,10 @@ impl ExactServingBlockdProcessProof {
 
     pub(crate) fn evidence(&self) -> &ServingBlockdProcessEvidence {
         &self.evidence
+    }
+
+    pub(crate) fn durability_status(&self) -> &DurabilityStatus {
+        self.evidence.durability_status()
     }
 
     pub(crate) fn matches_public_process(&self, process: &ProcessEvidence) -> bool {

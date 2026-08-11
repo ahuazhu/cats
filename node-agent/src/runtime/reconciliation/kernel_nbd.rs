@@ -3862,17 +3862,6 @@ mod tests {
         encode_runtime_checkpoint(&launch).unwrap();
 
         for step in [
-            ReconcileStep::FormatFilesystem {
-                volume_id: id("vol_root"),
-                attachment_id: id("att_01"),
-                filesystem_uuid: random('d'),
-                initialization_token: random('e'),
-                expected_blank_head: RemoteHead {
-                    generation: Generation::new(0).unwrap(),
-                    root_hash: None,
-                    root_object_id: None,
-                },
-            },
             ReconcileStep::InstallGate {
                 endpoint_id: id("endpoint_01"),
                 route_epoch: Epoch::new(1).unwrap(),

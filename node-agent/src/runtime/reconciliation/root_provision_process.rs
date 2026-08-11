@@ -833,6 +833,35 @@ impl NodeGlobalManagedProcessScanAdmission {
         projections
     }
 
+    /// Dynamic durability facts from the exact serving control handshake.
+    /// This remains scanner-private until `inventory` joins it to the same
+    /// retained Volume and process proof; public process fields cannot mint
+    /// these watermarks.
+    pub(crate) fn serving_status_projections(
+        &self,
+    ) -> BTreeMap<Id, BTreeMap<Id, cats_api::blockd::DurabilityStatus>> {
+        let mut projections =
+            BTreeMap::<Id, BTreeMap<Id, cats_api::blockd::DurabilityStatus>>::new();
+        for entry in &self.entries {
+            let NodeGlobalManagedProcessExpectation::ServingBlockd {
+                expectation,
+                exact: Some(proof),
+            } = entry
+            else {
+                continue;
+            };
+            let previous = projections
+                .entry(expectation.cat_id().clone())
+                .or_default()
+                .insert(
+                    expectation.volume_id().clone(),
+                    proof.durability_status().clone(),
+                );
+            debug_assert!(previous.is_none(), "typed serving keys are unique");
+        }
+        projections
+    }
+
     /// Provider-private serving proof retained by the same complete scanner
     /// pass. Frontend scanners may join this proof with independent physical
     /// device evidence, but public process/device projections cannot recreate
