@@ -6527,6 +6527,7 @@ fn array_identity_order_and_numeric_indices_are_deterministic() {
     second["disk_id"] = "disk_two".into();
     second["volume_id"] = "vol_two".into();
     second["attachment_id"] = "att_two".into();
+    second["acquire"]["transition_id"] = "ffeeddccbbaa99887766554433221100".into();
     second["guest_device"]["serial"] = "cats-two".into();
     second["guest_device"]["slot"] = 1.into();
 
