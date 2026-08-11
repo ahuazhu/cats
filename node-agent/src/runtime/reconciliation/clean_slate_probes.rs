@@ -93,6 +93,10 @@ use super::vmm_process::{
     PlatformSystemdVmmProcessPort, VmmProcessConflict, VmmProcessExpectation, VmmProcessInspection,
     VmmProcessPort,
 };
+use super::vmm_socket_namespace::{
+    scan_managed_vmm_socket_root, ManagedVmmSocketRootScan, RetainedManagedVmmSocketRoot,
+    VmmSocketReceiptStore,
+};
 use super::{
     inventory::{
         root_process_inventory_bridge_sealed, InstalledRuntimeInventoryKeyRingReader,
@@ -982,6 +986,8 @@ struct ProbeConfig {
     root_provision_systemd: Option<RootProvisionSystemdConfig>,
     network_allocation_port: Option<NetworkAllocationPort>,
     kernel_nbd_inventory_port: Option<KernelNbdInventoryPort>,
+    managed_vmm_socket_root: Option<Arc<RetainedManagedVmmSocketRoot>>,
+    vmm_socket_receipts: Option<Arc<VmmSocketReceiptStore>>,
 }
 
 impl ProbeConfig {
@@ -1005,6 +1011,19 @@ impl ProbeConfig {
                 "installed kernel-NBD scanner uses another StateDirectory"
             );
         }
+        #[cfg(target_os = "linux")]
+        let (managed_vmm_socket_root, vmm_socket_receipts) = (
+            Some(Arc::new(
+                RetainedManagedVmmSocketRoot::open_installed()
+                    .context("open installed managed VMM socket root")?,
+            )),
+            Some(Arc::new(
+                VmmSocketReceiptStore::open_existing(config.state_directory.clone())
+                    .context("open installed VMM socket receipt namespace")?,
+            )),
+        );
+        #[cfg(not(target_os = "linux"))]
+        let (managed_vmm_socket_root, vmm_socket_receipts) = (None, None);
         Ok(Self {
             state_directory: config.state_directory.clone(),
             checkpoint_directory,
@@ -1031,6 +1050,8 @@ impl ProbeConfig {
                 config.ip_binary,
             )?),
             kernel_nbd_inventory_port: config.kernel_nbd_inventory.map(KernelNbdInventoryPort::new),
+            managed_vmm_socket_root,
+            vmm_socket_receipts,
         })
     }
 }
@@ -1155,6 +1176,8 @@ fn clean_slate_scanner_with_metadata_for_test(
             root_provision_systemd: None,
             network_allocation_port: None,
             kernel_nbd_inventory_port: None,
+            managed_vmm_socket_root: None,
+            vmm_socket_receipts: None,
         },
         metadata_authority,
         blob_store,
@@ -1337,6 +1360,8 @@ fn platform_root_process_inventory_bridge(
         metering_root: config.metering_cgroup_root.clone(),
         legacy_socket_root: config.legacy_socket_root.clone(),
         limits: config.limits,
+        managed_vmm_socket_root: config.managed_vmm_socket_root.clone(),
+        vmm_socket_receipts: config.vmm_socket_receipts.clone(),
     }))
 }
 
@@ -2915,6 +2940,8 @@ struct PlatformRootProcessInventoryBridge {
     metering_root: Option<PathBuf>,
     legacy_socket_root: PathBuf,
     limits: ProbeLimits,
+    managed_vmm_socket_root: Option<Arc<RetainedManagedVmmSocketRoot>>,
+    vmm_socket_receipts: Option<Arc<VmmSocketReceiptStore>>,
 }
 
 enum AdmittedManagedProcessInspection {
@@ -2942,6 +2969,7 @@ impl PlatformRootProcessInventoryBridge {
         allowed_units: &BTreeSet<Id>,
         allowed_pids: &BTreeSet<u32>,
         allowed_sockets: &BTreeSet<PathBuf>,
+        expected_vmms: &BTreeMap<Id, VmmProcessExpectation>,
         context: &dyn RuntimePhysicalReadContext,
     ) -> anyhow::Result<ProbeFact> {
         let mut budget = self.limits.os_entries;
@@ -2975,10 +3003,33 @@ impl PlatformRootProcessInventoryBridge {
             self.limits,
             context,
         )?;
+        let managed_vmm_sockets = match (
+            self.managed_vmm_socket_root.as_deref(),
+            self.vmm_socket_receipts.as_deref(),
+        ) {
+            (Some(root), Some(receipts)) => {
+                let checkpoints = expected_vmms
+                    .values()
+                    .map(VmmProcessExpectation::checkpoint)
+                    .collect::<Vec<_>>();
+                match scan_managed_vmm_socket_root(root, receipts, &checkpoints, context)? {
+                    ManagedVmmSocketRootScan::Accounted => ProbeFact::Empty,
+                    ManagedVmmSocketRootScan::Residue => ProbeFact::Present,
+                    ManagedVmmSocketRootScan::Unavailable => ProbeFact::Unavailable,
+                }
+            }
+            (None, None) if !self.process_paths.supported => ProbeFact::Unavailable,
+            (None, None) => ProbeFact::Empty,
+            _ => ProbeFact::Unavailable,
+        };
         Ok(
-            if [systemd, metering, processes, sockets].contains(&ProbeFact::Present) {
+            if [systemd, metering, processes, sockets, managed_vmm_sockets]
+                .contains(&ProbeFact::Present)
+            {
                 ProbeFact::Present
-            } else if [systemd, metering, processes, sockets].contains(&ProbeFact::Unavailable) {
+            } else if [systemd, metering, processes, sockets, managed_vmm_sockets]
+                .contains(&ProbeFact::Unavailable)
+            {
                 ProbeFact::Unavailable
             } else {
                 ProbeFact::Empty
@@ -3050,8 +3101,6 @@ impl PlatformRootProcessInventoryBridge {
             if let VmmProcessInspection::Exact(evidence) = inspection {
                 if !allowed_units.insert(evidence.unit_id().clone())
                     || !allowed_pids.insert(evidence.process_id())
-                    || !allowed_sockets.insert(PathBuf::from(evidence.api_socket_path().as_str()))
-                    || !allowed_sockets.insert(PathBuf::from(evidence.vsock_socket_path().as_str()))
                 {
                     return Ok(AdmittedManagedProcessInspection::DuplicateIdentity);
                 }
@@ -3067,6 +3116,7 @@ impl PlatformRootProcessInventoryBridge {
             &allowed_units,
             &allowed_pids,
             &allowed_sockets,
+            &vmm_expected,
             context,
         ) {
             Ok(sweep) => sweep,
@@ -3255,11 +3305,7 @@ impl RootProcessInventoryBridge for PlatformRootProcessInventoryBridge {
             if let VmmProcessInspection::Exact(evidence) = inspection {
                 anyhow::ensure!(
                     allowed_units.insert(evidence.unit_id().clone())
-                        && allowed_pids.insert(evidence.process_id())
-                        && allowed_sockets
-                            .insert(PathBuf::from(evidence.api_socket_path().as_str()))
-                        && allowed_sockets
-                            .insert(PathBuf::from(evidence.vsock_socket_path().as_str())),
+                        && allowed_pids.insert(evidence.process_id()),
                     "managed-process inventory contains duplicate VMM physical identity"
                 );
             }
@@ -3301,6 +3347,7 @@ impl RootProcessInventoryBridge for PlatformRootProcessInventoryBridge {
             &allowed_units,
             &allowed_pids,
             &allowed_sockets,
+            &vmm_expected,
             context,
         )? {
             ProbeFact::Present => {
@@ -6443,6 +6490,8 @@ mod tests {
                 root_provision_systemd: None,
                 network_allocation_port: None,
                 kernel_nbd_inventory_port: None,
+                managed_vmm_socket_root: None,
+                vmm_socket_receipts: None,
             }
         }
     }
@@ -6957,6 +7006,8 @@ mod tests {
             metering_root: None,
             legacy_socket_root: environment.socket_root.clone(),
             limits: ProbeLimits::default(),
+            managed_vmm_socket_root: None,
+            vmm_socket_receipts: None,
         }
     }
 
@@ -8894,6 +8945,22 @@ mod tests {
     fn installed_factory_derives_checkpoint_evidence_from_the_scanned_dirfd_child() {
         let environment = TestEnvironment::new();
         let state = StateDirectory::unanchored(environment.state.clone());
+        #[cfg(target_os = "linux")]
+        {
+            std::fs::create_dir_all(
+                Path::new(super::super::vmm_socket_namespace::INSTALLED_VMM_SOCKET_ROOT)
+                    .parent()
+                    .unwrap(),
+            )
+            .unwrap();
+            let installed =
+                Path::new(super::super::vmm_socket_namespace::INSTALLED_VMM_SOCKET_ROOT);
+            if !installed.exists() {
+                std::fs::create_dir(installed).unwrap();
+            }
+            std::fs::set_permissions(installed, std::fs::Permissions::from_mode(0o700)).unwrap();
+            VmmSocketReceiptStore::provision_for_test(state.clone()).unwrap();
+        }
         let config = ProbeConfig::installed(InstalledCleanSlateProbeConfig {
             state_directory: state.clone(),
             cloud_hypervisor_binary: environment.ch_binary.clone(),
@@ -8928,6 +8995,66 @@ mod tests {
             config.checkpoint_directory,
             state.path().join(CHECKPOINT_NAMESPACE)
         );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn node_global_sweep_includes_the_bounded_managed_vmm_socket_root() {
+        let environment = TestEnvironment::new();
+        let mut bridge = root_process_bridge_with_port(
+            &environment,
+            Arc::new(FakeRootProcessPort {
+                inspections: Mutex::new(VecDeque::new()),
+            }),
+        );
+        let managed_root = Arc::new(
+            RetainedManagedVmmSocketRoot::provision_for_test(
+                &environment
+                    .state
+                    .parent()
+                    .unwrap()
+                    .join("managed-vmm-sockets"),
+            )
+            .unwrap(),
+        );
+        let receipts = Arc::new(
+            VmmSocketReceiptStore::provision_for_test(StateDirectory::unanchored(
+                environment.state.clone(),
+            ))
+            .unwrap(),
+        );
+        bridge.managed_vmm_socket_root = Some(Arc::clone(&managed_root));
+        bridge.vmm_socket_receipts = Some(receipts);
+        let empty = BTreeSet::new();
+        let expected_vmms = BTreeMap::new();
+        assert_eq!(
+            bridge
+                .sweep_node_global_inventory(
+                    &empty,
+                    &BTreeSet::new(),
+                    &BTreeSet::new(),
+                    &expected_vmms,
+                    &context(),
+                )
+                .unwrap(),
+            ProbeFact::Empty
+        );
+
+        let foreign = Path::new(managed_root.planner().path().as_str()).join("foreign");
+        std::fs::write(&foreign, b"foreign").unwrap();
+        assert_eq!(
+            bridge
+                .sweep_node_global_inventory(
+                    &empty,
+                    &BTreeSet::new(),
+                    &BTreeSet::new(),
+                    &expected_vmms,
+                    &context(),
+                )
+                .unwrap(),
+            ProbeFact::Present
+        );
+        assert_eq!(std::fs::read(foreign).unwrap(), b"foreign");
     }
 
     fn install_exact_process_fixture(

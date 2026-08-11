@@ -27,8 +27,8 @@ apt-get update -q
 # libssl-dev is required by the PostgreSQL metadata adapter's native-tls stack.
 apt-get install -qy build-essential curl git nbd-client busybox-static \
   musl-tools e2fsprogs cpio zstd pkg-config libssl-dev debootstrap iptables \
-  util-linux openssl
-for required in flock stat curl openssl findmnt systemd-run; do
+  util-linux openssl jq
+for required in flock stat curl jq openssl findmnt systemd-run systemd-tmpfiles; do
   command -v "$required" >/dev/null 2>&1 || {
     echo "worker deployment needs $required" >&2
     exit 1
@@ -216,6 +216,13 @@ fi
 echo "==> state dirs + config"
 install -d /var/lib/cats/{node,blob} /etc/cats
 cats_worker_deployment_crash_probe after-install-state-directories
+install -D -o root -g root -m 0644 "$REPO/deploy/metal/tmpfiles/cats-vmm.conf" \
+  /usr/lib/tmpfiles.d/cats-vmm.conf
+install -o root -g root -m 0755 \
+  "$REPO/deploy/aws/metal/provision-vmm-socket-namespaces.sh" \
+  "$PREFIX/bin/provision-vmm-socket-namespaces"
+"$PREFIX/bin/provision-vmm-socket-namespaces"
+cats_worker_deployment_crash_probe after-provision-vmm-socket-namespaces
 if [[ ! -f /etc/cats/cats.env ]]; then
   install -m 0600 "$REPO/deploy/metal/cats.env.example" /etc/cats/cats.env
   cats_worker_deployment_crash_probe after-install-cats-environment

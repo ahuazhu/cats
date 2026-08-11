@@ -39,7 +39,7 @@ install -m 0600 "$ROUTE_GRANT_PUBLIC_KEY_SOURCE" "$ROUTE_GRANT_PUBLIC_KEY_STAGE"
 
 "$CATS_REPO/deploy/aws/metal/validate-node-identity-installation.sh"
 . "$CATS_REPO/deploy/aws/metal/worker-deployment-transaction.sh"
-for required in flock stat curl openssl findmnt systemd-run; do
+for required in flock stat curl openssl findmnt systemd-run systemd-tmpfiles; do
   command -v "$required" >/dev/null 2>&1 || {
     echo "worker deployment needs $required" >&2
     exit 1
@@ -53,7 +53,7 @@ export HOME="${HOME:-/root}"
 
 export DEBIAN_FRONTEND=noninteractive
 apt-get update -q
-apt-get install -qy build-essential curl nbd-client busybox-static musl-tools \
+apt-get install -qy build-essential curl jq nbd-client busybox-static musl-tools \
   e2fsprogs cpio zstd pkg-config libssl-dev ca-certificates debootstrap iptables
 
 export PATH="/root/.cargo/bin:$PATH"
@@ -170,6 +170,13 @@ cats_worker_deployment_crash_probe after-installer-return
 
 install -d "$CATS_PREFIX/bin" "$CATS_PREFIX/guest" /var/lib/cats/node /etc/cats
 cats_worker_deployment_crash_probe after-install-runtime-directories
+install -D -o root -g root -m 0644 "$CATS_REPO/deploy/metal/tmpfiles/cats-vmm.conf" \
+  /usr/lib/tmpfiles.d/cats-vmm.conf
+install -o root -g root -m 0755 \
+  "$CATS_REPO/deploy/aws/metal/provision-vmm-socket-namespaces.sh" \
+  "$CATS_PREFIX/bin/provision-vmm-socket-namespaces"
+"$CATS_PREFIX/bin/provision-vmm-socket-namespaces"
+cats_worker_deployment_crash_probe after-provision-vmm-socket-namespaces
 install -o root -g root -m 0644 "$ROUTE_GRANT_PUBLIC_KEY_STAGE" \
   /etc/cats/route-grant-public.pem
 cats_worker_deployment_crash_probe after-install-route-key
