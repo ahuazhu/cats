@@ -7327,10 +7327,7 @@ mod tests {
     fn physical_start_holds_one_exclusive_namespace_guard_through_submit() {
         let mut fixture = fixture_with_guest_config_digest(physical_guest_config_digest());
         let physical = advance_fixture_to_physical_start(&mut fixture);
-        let checkpoint = fixture.stored_checkpoint.checkpoint().clone();
-        let incarnation = checkpoint.runtime_incarnation.as_ref().unwrap().clone();
         let launch_root = Arc::clone(&physical.launch_root);
-        let receipts = Arc::clone(&physical.receipts);
         let blocked = Arc::new(AtomicUsize::new(0));
         let blocked_in_hook = Arc::clone(&blocked);
         let vmm = Arc::new(
@@ -7339,11 +7336,9 @@ mod tests {
                 VmmProcessStart::Submitted,
             )
             .with_before_start(move || {
-                let receipt = receipts.load(&incarnation).unwrap().unwrap();
                 assert!(launch_root
-                    .retain_launcher_attempt(&checkpoint, &receipt)
-                    .unwrap()
-                    .is_none());
+                    .launcher_shared_lock_is_blocked_for_test()
+                    .unwrap());
                 blocked_in_hook.fetch_add(1, Ordering::SeqCst);
             }),
         );

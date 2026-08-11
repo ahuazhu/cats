@@ -348,8 +348,7 @@ mod linux {
         // than a leaf-replacement unlink race.
         let launch_attempt = launch_root
             .retain_launcher_attempt(plan.checkpoint(), &receipt)
-            .context("retain checkpointed VMM launch attempt")?
-            .context("VMM launch namespace is held by recovery")?;
+            .context("retain checkpointed VMM launch attempt")?;
         launch_attempt.assert_ready()?;
         let api_listener = match managed_socket_root
             .prepare_existing_receipt(plan.checkpoint(), &socket_receipts)

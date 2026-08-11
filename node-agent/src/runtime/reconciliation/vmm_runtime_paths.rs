@@ -469,9 +469,11 @@ impl RetainedManagedVmmLaunchAttempt {
 }
 
 /// A launcher-only retained guard. The shared namespace flock is acquired
-/// before any socket/file mutation and is released automatically at the
-/// successful `exec` boundary because this descriptor is CLOEXEC. Recovery
-/// requires the exclusive side of the same lock.
+/// before any socket/file mutation, waiting for the submitting effect to
+/// release its exclusive side after systemd's `Type=exec` boundary. It is
+/// released automatically at the successful VMM `exec` boundary because this
+/// descriptor is CLOEXEC. Recovery requires the exclusive side of the same
+/// lock.
 #[cfg(target_os = "linux")]
 #[derive(Debug)]
 pub(crate) struct RetainedManagedVmmLauncherAttempt {
@@ -492,7 +494,16 @@ impl RetainedManagedVmmLaunchRoot {
         self: &Arc<Self>,
         checkpoint: &RuntimeCheckpoint,
         receipt: &VmmSocketOwnershipReceiptV1,
-    ) -> Result<Option<RetainedManagedVmmLauncherAttempt>> {
+    ) -> Result<RetainedManagedVmmLauncherAttempt> {
+        self.retain_launcher_attempt_inner(checkpoint, receipt, || {})
+    }
+
+    fn retain_launcher_attempt_inner(
+        self: &Arc<Self>,
+        checkpoint: &RuntimeCheckpoint,
+        receipt: &VmmSocketOwnershipReceiptV1,
+        before_lock: impl FnOnce(),
+    ) -> Result<RetainedManagedVmmLauncherAttempt> {
         self.assert_current()?;
         let namespace_guard = open_at(
             &self
@@ -502,9 +513,8 @@ impl RetainedManagedVmmLaunchRoot {
             OsStr::new(VMM_LAUNCH_FILE_NAMESPACE),
             libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
         )?;
-        if !try_flock(&namespace_guard, libc::LOCK_SH)? {
-            return Ok(None);
-        }
+        before_lock();
+        lock_flock(&namespace_guard, libc::LOCK_SH)?;
         anyhow::ensure!(
             LaunchDirectoryIdentity::from_metadata(&namespace_guard.metadata()?) == self.identity,
             "VMM launch namespace changed before launcher lock"
@@ -522,10 +532,34 @@ impl RetainedManagedVmmLaunchRoot {
             receipt.encoded_bytes()?,
         )?;
         attempt.assert_ready()?;
-        Ok(Some(RetainedManagedVmmLauncherAttempt {
+        Ok(RetainedManagedVmmLauncherAttempt {
             _namespace_guard: namespace_guard,
             attempt,
-        }))
+        })
+    }
+
+    #[cfg(test)]
+    fn retain_launcher_attempt_with_before_lock(
+        self: &Arc<Self>,
+        checkpoint: &RuntimeCheckpoint,
+        receipt: &VmmSocketOwnershipReceiptV1,
+        before_lock: impl FnOnce(),
+    ) -> Result<RetainedManagedVmmLauncherAttempt> {
+        self.retain_launcher_attempt_inner(checkpoint, receipt, before_lock)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn launcher_shared_lock_is_blocked_for_test(&self) -> Result<bool> {
+        self.assert_current()?;
+        let descriptor = open_at(
+            &self
+                .state_directory
+                .try_reopen_directory()
+                .context("reopen state directory for VMM launcher lock probe")?,
+            OsStr::new(VMM_LAUNCH_FILE_NAMESPACE),
+            libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+        )?;
+        Ok(!try_flock(&descriptor, libc::LOCK_SH)?)
     }
 }
 
@@ -847,6 +881,24 @@ fn try_flock(file: &File, kind: i32) -> Result<bool> {
             Ok(false)
         } else {
             Err(error).context("lock VMM launch namespace")
+        }
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn lock_flock(file: &File, kind: i32) -> Result<()> {
+    loop {
+        // SAFETY: flock changes only the advisory lock associated with this
+        // live descriptor. A launcher waits here until the effect which
+        // submitted it releases its exclusive proof guard after systemd has
+        // completed the Type=exec boundary.
+        let result = unsafe { libc::flock(file.as_raw_fd(), kind) };
+        if result == 0 {
+            return Ok(());
+        }
+        let error = io::Error::last_os_error();
+        if error.kind() != io::ErrorKind::Interrupted {
+            return Err(error).context("lock VMM launcher namespace");
         }
     }
 }
@@ -2751,8 +2803,7 @@ mod tests {
                 boundaries.push(boundary);
                 assert!(fixture
                     .launch_root
-                    .retain_launcher_attempt(&fixture.checkpoint, &fixture.receipt)?
-                    .is_none());
+                    .launcher_shared_lock_is_blocked_for_test()?);
                 Ok(())
             })
             .unwrap();
@@ -2951,14 +3002,59 @@ mod tests {
         let launcher = fixture
             .launch_root
             .retain_launcher_attempt(&fixture.checkpoint, &fixture.receipt)
-            .unwrap()
-            .expect("launcher should acquire the shared guard");
+            .unwrap();
         launcher.assert_ready().unwrap();
         assert!(fixture
             .launch_root
             .try_lock_effect_namespace()
             .unwrap()
             .is_none());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn submitted_launcher_waits_for_effect_guard_then_acquires_shared_authority() {
+        let fixture = LaunchFixture::new();
+        fixture.receipt_store.publish(&fixture.receipt).unwrap();
+        let _ready = match fixture.prepare() {
+            ManagedVmmLaunchPreparation::Ready(ready) => ready,
+            _ => panic!("fresh launch attempt was not ready"),
+        };
+        let effect_guard = fixture
+            .launch_root
+            .try_lock_effect_namespace()
+            .unwrap()
+            .unwrap();
+        assert!(fixture
+            .launch_root
+            .launcher_shared_lock_is_blocked_for_test()
+            .unwrap());
+
+        let launch_root = Arc::clone(&fixture.launch_root);
+        let checkpoint = fixture.checkpoint.clone();
+        let receipt = fixture.receipt.clone();
+        let (waiting_sender, waiting_receiver) = std::sync::mpsc::sync_channel(0);
+        let (result_sender, result_receiver) = std::sync::mpsc::sync_channel(0);
+        let launcher = std::thread::spawn(move || {
+            let result = launch_root
+                .retain_launcher_attempt_with_before_lock(&checkpoint, &receipt, || {
+                    waiting_sender.send(()).unwrap()
+                })
+                .and_then(|guard| guard.assert_ready());
+            result_sender.send(result)
+        });
+        waiting_receiver.recv().unwrap();
+        assert!(matches!(
+            result_receiver.recv_timeout(std::time::Duration::from_millis(100)),
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout)
+        ));
+
+        drop(effect_guard);
+        result_receiver
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .expect("launcher did not acquire the shared guard after submit released EX")
+            .unwrap();
+        launcher.join().unwrap().unwrap();
     }
 
     #[test]
