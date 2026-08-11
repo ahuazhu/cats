@@ -14,12 +14,12 @@ use std::os::unix::ffi::OsStrExt as _;
 use std::os::unix::fs::{FileExt as _, MetadataExt as _};
 use std::path::{Component, Path, PathBuf};
 
-#[cfg(target_os = "linux")]
-use anyhow::Context as _;
-use anyhow::Result;
+use anyhow::{Context as _, Result};
 #[cfg(target_os = "linux")]
 use cats_api::runtime_reconciliation::encode_runtime_checkpoint;
-use cats_api::runtime_reconciliation::{HostPath, RuntimeCheckpoint};
+use cats_api::runtime_reconciliation::{HostPath, RandomId128, RuntimeCheckpoint};
+
+use crate::state_directory::StateDirectory;
 
 use super::vmm_launch_artifacts::VmmLaunchArtifactDescriptors;
 
@@ -30,6 +30,109 @@ const INITRAMFS_FD: i32 = 67;
 const MEMORY_FD: i32 = 68;
 const SERIAL_LOG_FD: i32 = 69;
 const VMM_LOG_FD: i32 = 70;
+const VMM_LAUNCH_FILE_NAMESPACE: &str = "vmm-launch-v1";
+const VMM_MEMORY_BASENAME: &str = "memory.bin";
+const VMM_SERIAL_LOG_BASENAME: &str = "serial.log";
+const VMM_LOG_BASENAME: &str = "vmm.log";
+
+/// Pure, canonical mapping for the mutable files owned by one VMM attempt.
+///
+/// The mapping is separate from the boot-local AF_UNIX namespace.  It is
+/// derived only from the identity-selected Node state path and the fresh
+/// Runtime incarnation, so a StartRuntime CAS never accepts caller-chosen
+/// RAM/log paths.  Creating the directory or leaves remains a later physical
+/// effect guarded by the provider-private launch-resource receipt.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ManagedVmmLaunchFilePaths {
+    directory: HostPath,
+    memory_file_path: HostPath,
+    serial_log_path: HostPath,
+    vmm_log_path: HostPath,
+}
+
+impl ManagedVmmLaunchFilePaths {
+    pub(crate) fn for_incarnation(
+        state_directory: &StateDirectory,
+        incarnation: &RandomId128,
+    ) -> Result<Self> {
+        canonical_components(state_directory.path())?;
+        let directory = state_directory
+            .path()
+            .join(VMM_LAUNCH_FILE_NAMESPACE)
+            .join(format!("p-{}", incarnation.as_str()));
+        let directory = canonical_host_path(directory, "VMM launch file directory")?;
+        let memory_file_path = canonical_host_path(
+            Path::new(directory.as_str()).join(VMM_MEMORY_BASENAME),
+            "VMM memory file path",
+        )?;
+        let serial_log_path = canonical_host_path(
+            Path::new(directory.as_str()).join(VMM_SERIAL_LOG_BASENAME),
+            "VMM serial log path",
+        )?;
+        let vmm_log_path = canonical_host_path(
+            Path::new(directory.as_str()).join(VMM_LOG_BASENAME),
+            "VMM log path",
+        )?;
+        Ok(Self {
+            directory,
+            memory_file_path,
+            serial_log_path,
+            vmm_log_path,
+        })
+    }
+
+    pub(crate) fn paths_from_checkpoint(
+        state_directory: &StateDirectory,
+        checkpoint: &RuntimeCheckpoint,
+    ) -> Result<Self> {
+        let cats_api::runtime_reconciliation::ReconcileStep::StartRuntime {
+            runtime_incarnation,
+            memory_file_path,
+            serial_log_path,
+            vmm_log_path,
+            ..
+        } = &checkpoint.step
+        else {
+            anyhow::bail!("managed VMM launch file paths require StartRuntime")
+        };
+        anyhow::ensure!(
+            checkpoint.runtime_incarnation.as_ref() == Some(runtime_incarnation),
+            "StartRuntime launch file paths have a non-exact top-level incarnation"
+        );
+        let paths = Self::for_incarnation(state_directory, runtime_incarnation)?;
+        anyhow::ensure!(
+            memory_file_path == &paths.memory_file_path
+                && serial_log_path == &paths.serial_log_path
+                && vmm_log_path == &paths.vmm_log_path,
+            "StartRuntime launch files are outside the managed VMM namespace"
+        );
+        Ok(paths)
+    }
+
+    pub(crate) fn directory(&self) -> &HostPath {
+        &self.directory
+    }
+
+    pub(crate) fn memory_file_path(&self) -> &HostPath {
+        &self.memory_file_path
+    }
+
+    pub(crate) fn serial_log_path(&self) -> &HostPath {
+        &self.serial_log_path
+    }
+
+    pub(crate) fn vmm_log_path(&self) -> &HostPath {
+        &self.vmm_log_path
+    }
+}
+
+fn canonical_host_path(path: PathBuf, label: &str) -> Result<HostPath> {
+    canonical_components(&path).with_context(|| format!("{label} is not canonical"))?;
+    let path = path
+        .to_str()
+        .with_context(|| format!("{label} is not UTF-8"))?;
+    HostPath::new(path.to_owned()).with_context(|| format!("{label} is not a canonical HostPath"))
+}
 
 #[derive(Debug, Clone)]
 pub(crate) struct VmmRuntimePathRequirements {
@@ -570,7 +673,73 @@ mod tests {
     use std::io::Write as _;
     use std::os::unix::fs::{MetadataExt as _, OpenOptionsExt as _};
 
+    use cats_api::runtime_reconciliation::{decode_runtime_checkpoint, ReconcileStep};
+
     use super::*;
+
+    fn start_runtime_checkpoint() -> RuntimeCheckpoint {
+        decode_runtime_checkpoint(include_bytes!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../testdata/runtime-reconciliation-v1-start-runtime-checkpoint.json"
+        )))
+        .unwrap()
+    }
+
+    #[test]
+    fn launch_file_mapping_is_state_selected_and_incarnation_exact() {
+        let root = tempfile::tempdir().unwrap();
+        let state = StateDirectory::unanchored(root.path().to_path_buf());
+        let mut checkpoint = start_runtime_checkpoint();
+        let incarnation = checkpoint.runtime_incarnation.as_ref().unwrap().clone();
+        let paths = ManagedVmmLaunchFilePaths::for_incarnation(&state, &incarnation).unwrap();
+        let expected_directory = root
+            .path()
+            .join("vmm-launch-v1/p-55555555555555555555555555555555");
+        assert_eq!(
+            paths.directory().as_str(),
+            expected_directory.to_str().unwrap()
+        );
+        assert_eq!(
+            paths.memory_file_path().as_str(),
+            expected_directory.join("memory.bin").to_str().unwrap()
+        );
+        assert_eq!(
+            paths.serial_log_path().as_str(),
+            expected_directory.join("serial.log").to_str().unwrap()
+        );
+        assert_eq!(
+            paths.vmm_log_path().as_str(),
+            expected_directory.join("vmm.log").to_str().unwrap()
+        );
+        assert!(ManagedVmmLaunchFilePaths::paths_from_checkpoint(&state, &checkpoint).is_err());
+        let ReconcileStep::StartRuntime {
+            memory_file_path,
+            serial_log_path,
+            vmm_log_path,
+            ..
+        } = &mut checkpoint.step
+        else {
+            unreachable!()
+        };
+        *memory_file_path = paths.memory_file_path().clone();
+        *serial_log_path = paths.serial_log_path().clone();
+        *vmm_log_path = paths.vmm_log_path().clone();
+        assert_eq!(
+            ManagedVmmLaunchFilePaths::paths_from_checkpoint(&state, &checkpoint).unwrap(),
+            paths
+        );
+    }
+
+    #[test]
+    fn launch_file_mapping_rejects_a_noncanonical_state_root() {
+        let state = StateDirectory::unanchored(PathBuf::from("relative-state"));
+        let checkpoint = start_runtime_checkpoint();
+        assert!(ManagedVmmLaunchFilePaths::for_incarnation(
+            &state,
+            checkpoint.runtime_incarnation.as_ref().unwrap()
+        )
+        .is_err());
+    }
 
     #[test]
     fn canonical_runtime_paths_reject_aliasing_components() {

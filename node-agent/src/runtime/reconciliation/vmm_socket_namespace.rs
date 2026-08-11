@@ -282,7 +282,7 @@ mod tests {
     #[test]
     fn custom_root_rejects_aliases_and_sockaddr_overflow() {
         for path in ["relative", "/", "/run/cats/../vmm"] {
-            if let Ok(path) = HostPath::new(path) {
+            if let Some(path) = HostPath::new(path) {
                 assert!(ManagedVmmSocketRoot::from_canonical_path(path).is_err());
             }
         }
