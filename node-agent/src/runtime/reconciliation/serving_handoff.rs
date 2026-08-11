@@ -3889,7 +3889,7 @@ mod tests {
     };
 
     use super::*;
-    use crate::ch::{PendingTap, TapCreatePort};
+    use crate::ch::{ChNetwork, PendingTap, TapCreatePort};
     use crate::runtime::reconciliation::kernel_nbd::{
         attach_port_sealed as kernel_attach_sealed, KernelNbdAttachConflict, KernelNbdAttachEffect,
         KernelNbdAttachPort, KernelNbdAttachRequest, KernelNbdAttachResult,
@@ -4666,6 +4666,7 @@ mod tests {
         mutate: impl FnOnce(&mut AgentSession, &mut NodeObservation, &mut AdmissionInventoryAttestation),
     ) -> RuntimeDesiredEffectContext {
         let node_global_process = base.node_global_process().ok().cloned();
+        let node_global_network = base.node_global_network().ok().cloned();
         let accepted = base.accepted_full().unwrap();
         let mut session = accepted.session().clone();
         let mut observation = accepted.observation().clone();
@@ -4676,8 +4677,12 @@ mod tests {
             Instant::now() + Duration::from_secs(10),
             RuntimeDesiredEffectAdmission::for_test(session, observation, attestation),
         );
-        match node_global_process {
+        let context = match node_global_process {
             Some(admission) => context.with_node_global_process_for_test(admission),
+            None => context,
+        };
+        match node_global_network {
+            Some(admission) => context.with_node_global_network_for_test(admission),
             None => context,
         }
     }
@@ -5073,6 +5078,15 @@ mod tests {
     }
 
     impl PendingTap for NetworkPendingTap {
+        fn configure(
+            &mut self,
+            _ip_bin: &Path,
+            _network: &ChNetwork,
+            effect_context: &RuntimeDesiredEffectContext,
+        ) -> Result<()> {
+            effect_context.check_active()
+        }
+
         fn publish(mut self: Box<Self>) -> Result<()> {
             self.events.publish_attempts.fetch_add(1, Ordering::SeqCst);
             if self.lose_response {
@@ -6032,6 +6046,8 @@ mod tests {
             "guest_transport",
             "platform_guards",
             "volume_lineage",
+            "paired_volume_intent_id",
+            "paired_disk_id",
         ] {
             let mut fixture = fixture();
             complete_old_process_retirement(&mut fixture);
@@ -6054,6 +6070,27 @@ mod tests {
                         "platform_guards" => observation.runtimes[0].platform_guards = 1,
                         "volume_lineage" => {
                             observation.runtimes[0].volumes[0].local_lineages.clear();
+                        }
+                        "paired_volume_intent_id" => {
+                            let foreign = id("foreign_intent");
+                            let ReconcileStep::PrepareDevice {
+                                volume_intent_id, ..
+                            } = &mut observation.runtimes[0].step
+                            else {
+                                panic!("fixture is not PrepareDevice")
+                            };
+                            *volume_intent_id = foreign.clone();
+                            observation.runtimes[0].volumes[0].volume_intent_id = Some(foreign);
+                        }
+                        "paired_disk_id" => {
+                            let foreign = id("foreign_disk");
+                            let ReconcileStep::PrepareDevice { disk_id, .. } =
+                                &mut observation.runtimes[0].step
+                            else {
+                                panic!("fixture is not PrepareDevice")
+                            };
+                            *disk_id = foreign.clone();
+                            observation.runtimes[0].volumes[0].disk_id = Some(foreign);
                         }
                         _ => unreachable!(),
                     }
@@ -6163,6 +6200,106 @@ mod tests {
             assert_eq!(
                 port.remaining_inspections(),
                 1 - exact_revalidations_before_drift
+            );
+        }
+    }
+
+    #[test]
+    fn prepare_network_physical_rejects_paired_foreign_prepared_device_ids() {
+        for field in ["volume_intent_id", "disk_id"] {
+            let mut fixture = fixture();
+            complete_old_process_retirement(&mut fixture);
+            let reservation_port = Arc::new(FakeServingBlockdPort::new(
+                [
+                    ServingBlockdProcessInspectionKind::Exact,
+                    ServingBlockdProcessInspectionKind::Exact,
+                ],
+                ServingBlockdProcessStart::Submitted,
+            ));
+            prepare_network_reservation_effect(
+                &fixture,
+                Arc::new(FixedEffectAuthority::new(fixture.authority.volume.clone())),
+                reservation_port,
+            )
+            .try_apply(
+                &effect_context_with_processes(&fixture, vec![accepted_serving_process(&fixture)]),
+                &fixture.acquired.desired,
+            )
+            .unwrap();
+            fixture.stored_checkpoint = current_runtime_checkpoint(&fixture);
+
+            let mut poisoned = fixture.stored_checkpoint.checkpoint().clone();
+            let ReconcileStep::PrepareNetwork { devices, .. } = &mut poisoned.step else {
+                panic!("reservation did not persist PrepareNetwork")
+            };
+            let [device] = devices.as_mut_slice() else {
+                panic!("PrepareNetwork did not retain one device")
+            };
+            match field {
+                "volume_intent_id" => {
+                    let foreign = id("foreign_intent");
+                    device.volume_intent_id = foreign.clone();
+                    poisoned.volumes[0].volume_intent_id = Some(foreign);
+                }
+                "disk_id" => {
+                    let foreign = id("foreign_disk");
+                    device.disk_id = foreign.clone();
+                    poisoned.volumes[0].disk_id = Some(foreign);
+                }
+                _ => unreachable!(),
+            }
+            poisoned.updated_at_unix_ms = UnixMillis::new(
+                fixture
+                    .stored_checkpoint
+                    .checkpoint()
+                    .updated_at_unix_ms
+                    .get()
+                    + 1,
+            )
+            .unwrap();
+            fixture.replace_checkpoint(poisoned);
+            let poisoned_digest = fixture.stored_checkpoint.content_digest().clone();
+
+            let base =
+                effect_context_with_processes(&fixture, vec![accepted_serving_process(&fixture)]);
+            let context =
+                with_absent_network_admission(base, fixture.stored_checkpoint.checkpoint());
+            let events = Arc::new(NetworkTapEvents::default());
+            let tap = Arc::new(NetworkTapPort {
+                behavior: NetworkTapBehavior::Publish,
+                context: context.clone(),
+                events: Arc::clone(&events),
+            });
+            let authority = Arc::new(FixedEffectAuthority::new(fixture.authority.volume.clone()));
+            let process = Arc::new(FakeServingBlockdPort::new(
+                [
+                    ServingBlockdProcessInspectionKind::Exact,
+                    ServingBlockdProcessInspectionKind::Exact,
+                ],
+                ServingBlockdProcessStart::Submitted,
+            ));
+            let effect = prepare_network_reservation_effect(
+                &fixture,
+                authority.clone(),
+                Arc::clone(&process),
+            )
+            .with_tap_create_for_test(tap);
+
+            assert_eq!(
+                effect
+                    .try_apply(&context, &fixture.acquired.desired)
+                    .unwrap(),
+                Some(RuntimeDesiredEffectOutcome::Stop(
+                    RuntimeDesiredEffectStopReason::LocalContract,
+                )),
+                "paired foreign {field} reached the physical TAP effect"
+            );
+            assert_eq!(events.creates.load(Ordering::SeqCst), 0);
+            assert_eq!(authority.loads.load(Ordering::SeqCst), 0);
+            assert_eq!(process.remaining_inspections(), 2);
+            assert_eq!(
+                current_runtime_checkpoint(&fixture).content_digest(),
+                &poisoned_digest
             );
         }
     }

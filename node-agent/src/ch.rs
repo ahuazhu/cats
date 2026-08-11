@@ -28,6 +28,10 @@ use std::fs::{File, OpenOptions};
 use std::io::{self, BufRead, BufReader, Read, Write};
 use std::net::Ipv4Addr;
 use std::os::fd::AsRawFd as _;
+#[cfg(target_os = "linux")]
+use std::os::fd::FromRawFd as _;
+#[cfg(target_os = "linux")]
+use std::os::unix::fs::MetadataExt as _;
 use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
@@ -223,6 +227,19 @@ pub(crate) fn validate_network_plan(network: &ChNetwork) -> Result<()> {
 /// Linux removes the non-persistent interface when the descriptor closes, so
 /// an error path never has to guess ownership from a reusable name or ifindex.
 pub(crate) trait PendingTap: Send {
+    /// Configure the exact unpublished interface retained by this object.
+    ///
+    /// Production binds every mutation to the TUN descriptor's stable
+    /// network-namespace and ifindex identity. Test doubles implement the
+    /// same lifecycle seam without claiming that a reusable interface name
+    /// is an authority handle.
+    fn configure(
+        &mut self,
+        ip_bin: &Path,
+        network: &ChNetwork,
+        effect_context: &RuntimeDesiredEffectContext,
+    ) -> Result<()>;
+
     fn publish(self: Box<Self>) -> Result<()>;
 }
 
@@ -238,11 +255,45 @@ pub(crate) struct PlatformTapCreatePort;
 #[cfg(target_os = "linux")]
 struct LinuxPendingTap {
     descriptor: File,
+    network_namespace: File,
+    network_namespace_identity: LinuxNetworkNamespaceIdentity,
+    route_socket: File,
+    tap_name: String,
+    ifindex: u32,
+    next_sequence: u32,
+}
+
+#[cfg(target_os = "linux")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct LinuxNetworkNamespaceIdentity {
+    device: u64,
+    inode: u64,
+}
+
+#[cfg(target_os = "linux")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LinuxTapConfigurationBoundary {
+    BeforeAlias,
+    BeforeAddress,
+    BeforeLinkUp,
+    BeforePublish,
 }
 
 #[cfg(target_os = "linux")]
 impl PendingTap for LinuxPendingTap {
+    fn configure(
+        &mut self,
+        _ip_bin: &Path,
+        network: &ChNetwork,
+        effect_context: &RuntimeDesiredEffectContext,
+    ) -> Result<()> {
+        let context = IpCommandContext::Desired(effect_context);
+        self.configure_with_boundary_hook(network, &context, |_| Ok(()))
+    }
+
     fn publish(self: Box<Self>) -> Result<()> {
+        self.assert_stable_identity()
+            .context("revalidate unpublished Linux TAP before publication")?;
         // TUNSETPERSIST consumes an integer value, despite its `_IOW<int>`
         // encoding. On failure `self` still drops and closes the clone fd, so
         // the unpublished TAP is removed by the kernel.
@@ -260,6 +311,434 @@ impl PendingTap for LinuxPendingTap {
         } else {
             Ok(())
         }
+    }
+}
+
+#[cfg(target_os = "linux")]
+const LINUX_NETLINK_HEADER_LEN: usize = 16;
+#[cfg(target_os = "linux")]
+const LINUX_NETLINK_ALIGNMENT: usize = 4;
+
+#[cfg(target_os = "linux")]
+fn linux_netlink_align(length: usize) -> usize {
+    (length + LINUX_NETLINK_ALIGNMENT - 1) & !(LINUX_NETLINK_ALIGNMENT - 1)
+}
+
+#[cfg(target_os = "linux")]
+fn linux_network_namespace_identity(file: &File) -> Result<LinuxNetworkNamespaceIdentity> {
+    let metadata = file
+        .metadata()
+        .context("inspect Linux network namespace descriptor")?;
+    Ok(LinuxNetworkNamespaceIdentity {
+        device: metadata.dev(),
+        inode: metadata.ino(),
+    })
+}
+
+#[cfg(target_os = "linux")]
+fn linux_tap_network_namespace(descriptor: &File) -> Result<File> {
+    // SAFETY: `descriptor` is a live TUN clone descriptor. TUNGETDEVNETNS
+    // returns a new owned fd and retains no Rust memory.
+    let namespace_fd = unsafe {
+        libc::ioctl(
+            descriptor.as_raw_fd(),
+            libc::TUNGETDEVNETNS,
+            0 as libc::c_int,
+        )
+    };
+    if namespace_fd < 0 {
+        return Err(io::Error::last_os_error()).context("read Linux TAP network namespace");
+    }
+    // SAFETY: a successful TUNGETDEVNETNS returns one newly-owned descriptor.
+    let namespace = unsafe { File::from_raw_fd(namespace_fd) };
+    // TUNGETDEVNETNS predates an atomic CLOEXEC variant. Set it before this fd
+    // can outlive the create call and accidentally cross a later exec.
+    // SAFETY: `namespace` owns a live descriptor and fcntl retains no memory.
+    let result = unsafe { libc::fcntl(namespace.as_raw_fd(), libc::F_SETFD, libc::FD_CLOEXEC) };
+    if result < 0 {
+        return Err(io::Error::last_os_error())
+            .context("set CLOEXEC on Linux TAP network namespace descriptor");
+    }
+    Ok(namespace)
+}
+
+#[cfg(target_os = "linux")]
+fn linux_route_socket(expected_namespace: LinuxNetworkNamespaceIdentity) -> Result<File> {
+    // Network namespaces are a per-thread property. `/proc/self/ns/net`
+    // follows the thread-group leader and can therefore name a different
+    // namespace after this worker thread has called `setns` or `unshare`.
+    // `/proc/thread-self` is the race-free handle for the calling thread.
+    let current_namespace = File::open("/proc/thread-self/ns/net")
+        .context("open current Linux thread network namespace")?;
+    anyhow::ensure!(
+        linux_network_namespace_identity(&current_namespace)? == expected_namespace,
+        "new Linux TAP moved out of the creating network namespace"
+    );
+
+    // SAFETY: socket returns a new descriptor and retains no Rust memory.
+    let socket_fd = unsafe {
+        libc::socket(
+            libc::AF_NETLINK,
+            libc::SOCK_RAW | libc::SOCK_CLOEXEC | libc::SOCK_NONBLOCK,
+            libc::NETLINK_ROUTE,
+        )
+    };
+    if socket_fd < 0 {
+        return Err(io::Error::last_os_error()).context("open Linux routing netlink socket");
+    }
+    // SAFETY: a successful socket call returns one newly-owned descriptor.
+    let socket = unsafe { File::from_raw_fd(socket_fd) };
+    // SAFETY: zero is the required initial representation for sockaddr_nl;
+    // the public family field is set before the value reaches the kernel.
+    let mut address: libc::sockaddr_nl = unsafe { std::mem::zeroed() };
+    address.nl_family = libc::AF_NETLINK as libc::sa_family_t;
+    // SAFETY: `address` has the exact sockaddr_nl layout and is live for the
+    // duration of bind. The socket retains neither its pointer nor Rust data.
+    let result = unsafe {
+        libc::bind(
+            socket.as_raw_fd(),
+            (&raw const address).cast::<libc::sockaddr>(),
+            std::mem::size_of::<libc::sockaddr_nl>() as libc::socklen_t,
+        )
+    };
+    if result < 0 {
+        return Err(io::Error::last_os_error()).context("bind Linux routing netlink socket");
+    }
+    Ok(socket)
+}
+
+#[cfg(target_os = "linux")]
+fn linux_interface_index(name: &str) -> Result<u32> {
+    let name = std::ffi::CString::new(name).context("Linux TAP name contains NUL")?;
+    // SAFETY: `name` is NUL-terminated and live for this lookup.
+    let ifindex = unsafe { libc::if_nametoindex(name.as_ptr()) };
+    if ifindex == 0 {
+        Err(io::Error::last_os_error()).context("resolve Linux TAP ifindex")
+    } else {
+        Ok(ifindex)
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn linux_tap_identity(descriptor: &File) -> Result<(String, libc::c_short)> {
+    // SAFETY: an all-zero ifreq is the required writable request for
+    // TUNGETIFF. The kernel initializes the name and flag union.
+    let mut request: libc::ifreq = unsafe { std::mem::zeroed() };
+    // SAFETY: `descriptor` is a TUN clone descriptor and `request` is a live,
+    // correctly-sized writable ifreq retained only for this call.
+    let result = unsafe { libc::ioctl(descriptor.as_raw_fd(), libc::TUNGETIFF, &mut request) };
+    if result < 0 {
+        return Err(io::Error::last_os_error()).context("read Linux TAP identity");
+    }
+    let name_end = request
+        .ifr_name
+        .iter()
+        .position(|byte| *byte == 0)
+        .context("Linux TUNGETIFF returned a non-terminated interface name")?;
+    let name = request.ifr_name[..name_end]
+        .iter()
+        .map(|byte| byte.to_ne_bytes()[0])
+        .collect::<Vec<_>>();
+    let name = String::from_utf8(name).context("Linux TUNGETIFF returned a non-UTF-8 name")?;
+    // SAFETY: TUNGETIFF initialized the flag member of the ifreq union.
+    let flags = unsafe { request.ifr_ifru.ifru_flags };
+    Ok((name, flags))
+}
+
+#[cfg(target_os = "linux")]
+fn linux_append_route_attribute(message: &mut Vec<u8>, kind: u16, value: &[u8]) -> Result<()> {
+    let attribute_length = 4usize
+        .checked_add(value.len())
+        .context("Linux routing attribute length overflow")?;
+    let encoded_length =
+        u16::try_from(attribute_length).context("Linux routing attribute exceeds u16 length")?;
+    message.extend_from_slice(&encoded_length.to_ne_bytes());
+    message.extend_from_slice(&kind.to_ne_bytes());
+    message.extend_from_slice(value);
+    message.resize(linux_netlink_align(message.len()), 0);
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+fn linux_route_message(
+    message_type: u16,
+    flags: u16,
+    sequence: u32,
+    payload: &[u8],
+) -> Result<Vec<u8>> {
+    let length = LINUX_NETLINK_HEADER_LEN
+        .checked_add(payload.len())
+        .context("Linux routing message length overflow")?;
+    let length = u32::try_from(length).context("Linux routing message exceeds u32 length")?;
+    let mut message = Vec::with_capacity(length as usize);
+    message.extend_from_slice(&length.to_ne_bytes());
+    message.extend_from_slice(&message_type.to_ne_bytes());
+    message.extend_from_slice(&flags.to_ne_bytes());
+    message.extend_from_slice(&sequence.to_ne_bytes());
+    message.extend_from_slice(&0u32.to_ne_bytes());
+    message.extend_from_slice(payload);
+    Ok(message)
+}
+
+#[cfg(target_os = "linux")]
+impl LinuxPendingTap {
+    fn configure_with_boundary_hook(
+        &mut self,
+        network: &ChNetwork,
+        context: &IpCommandContext<'_>,
+        mut boundary: impl FnMut(LinuxTapConfigurationBoundary) -> Result<()>,
+    ) -> Result<()> {
+        validate_network_plan(network)?;
+        anyhow::ensure!(
+            network.tap == self.tap_name,
+            "pending Linux TAP does not match the checkpointed name"
+        );
+        let gateway = network
+            .config
+            .gateway_ipv4
+            .as_str()
+            .parse::<Ipv4Addr>()
+            .context("parse checkpointed Host gateway IPv4")?;
+
+        boundary(LinuxTapConfigurationBoundary::BeforeAlias)?;
+        self.change_link_alias(&network_alias(network), context)?;
+        boundary(LinuxTapConfigurationBoundary::BeforeAddress)?;
+        self.add_ipv4_address(gateway, network.config.prefix_length, context)?;
+        boundary(LinuxTapConfigurationBoundary::BeforeLinkUp)?;
+        self.change_link_up(context)?;
+        boundary(LinuxTapConfigurationBoundary::BeforePublish)?;
+        self.assert_stable_identity()
+            .context("revalidate configured unpublished Linux TAP")
+    }
+
+    fn assert_stable_identity(&self) -> Result<()> {
+        let current_namespace = linux_tap_network_namespace(&self.descriptor)?;
+        anyhow::ensure!(
+            linux_network_namespace_identity(&current_namespace)?
+                == self.network_namespace_identity,
+            "unpublished Linux TAP moved to a different network namespace"
+        );
+        anyhow::ensure!(
+            linux_network_namespace_identity(&self.network_namespace)?
+                == self.network_namespace_identity,
+            "retained Linux TAP network namespace identity changed"
+        );
+        let (name, flags) = linux_tap_identity(&self.descriptor)?;
+        anyhow::ensure!(
+            name == self.tap_name,
+            "unpublished Linux TAP was renamed from its checkpointed name"
+        );
+        let required_flags = (libc::IFF_TAP | libc::IFF_NO_PI) as libc::c_short;
+        anyhow::ensure!(
+            flags & required_flags == required_flags,
+            "unpublished Linux TAP flags changed"
+        );
+        anyhow::ensure!(
+            linux_interface_index(&self.tap_name)? == self.ifindex,
+            "checkpointed Linux TAP name resolves to a replacement ifindex"
+        );
+        Ok(())
+    }
+
+    fn next_sequence(&mut self) -> u32 {
+        let sequence = self.next_sequence;
+        self.next_sequence = self.next_sequence.wrapping_add(1).max(1);
+        sequence
+    }
+
+    fn send_route_message(
+        &mut self,
+        message_type: u16,
+        flags: u16,
+        payload: &[u8],
+        context: &IpCommandContext<'_>,
+        operation: &str,
+    ) -> Result<()> {
+        context.check_active()?;
+        self.assert_stable_identity()
+            .with_context(|| format!("revalidate Linux TAP before {operation}"))?;
+        let sequence = self.next_sequence();
+        let message = linux_route_message(message_type, flags, sequence, payload)?;
+        // SAFETY: zero is the required initial sockaddr_nl representation;
+        // setting only the family addresses the kernel routing endpoint.
+        let mut kernel: libc::sockaddr_nl = unsafe { std::mem::zeroed() };
+        kernel.nl_family = libc::AF_NETLINK as libc::sa_family_t;
+        // SAFETY: all buffers and the sockaddr are live for this call, and the
+        // kernel retains no pointers after sendto returns.
+        let sent = unsafe {
+            libc::sendto(
+                self.route_socket.as_raw_fd(),
+                message.as_ptr().cast::<libc::c_void>(),
+                message.len(),
+                0,
+                (&raw const kernel).cast::<libc::sockaddr>(),
+                std::mem::size_of::<libc::sockaddr_nl>() as libc::socklen_t,
+            )
+        };
+        if sent < 0 {
+            return Err(io::Error::last_os_error())
+                .with_context(|| format!("send Linux routing request to {operation}"));
+        }
+        anyhow::ensure!(
+            sent as usize == message.len(),
+            "short Linux routing request while attempting to {operation}"
+        );
+        self.await_route_ack(sequence, context, operation)?;
+        self.assert_stable_identity()
+            .with_context(|| format!("revalidate Linux TAP after {operation}"))
+    }
+
+    fn await_route_ack(
+        &self,
+        sequence: u32,
+        context: &IpCommandContext<'_>,
+        operation: &str,
+    ) -> Result<()> {
+        let mut response = [0u8; 8192];
+        loop {
+            context.check_active()?;
+            // SAFETY: `response` is a live writable byte buffer. recv retains
+            // no pointer after returning.
+            let received = unsafe {
+                libc::recv(
+                    self.route_socket.as_raw_fd(),
+                    response.as_mut_ptr().cast::<libc::c_void>(),
+                    response.len(),
+                    0,
+                )
+            };
+            if received < 0 {
+                let error = io::Error::last_os_error();
+                if error.kind() == io::ErrorKind::Interrupted {
+                    continue;
+                }
+                if error.kind() == io::ErrorKind::WouldBlock {
+                    let remaining = context.deadline().saturating_duration_since(Instant::now());
+                    std::thread::sleep(IP_COMMAND_POLL_INTERVAL.min(remaining));
+                    continue;
+                }
+                return Err(error)
+                    .with_context(|| format!("receive Linux routing {operation} ack"));
+            }
+            anyhow::ensure!(
+                received != 0,
+                "Linux routing socket closed while awaiting {operation}"
+            );
+            let received = received as usize;
+            let mut offset = 0usize;
+            while offset < received {
+                anyhow::ensure!(
+                    received - offset >= LINUX_NETLINK_HEADER_LEN,
+                    "truncated Linux routing response while awaiting {operation}"
+                );
+                let message_length = u32::from_ne_bytes(
+                    response[offset..offset + 4]
+                        .try_into()
+                        .expect("fixed-width netlink length slice"),
+                ) as usize;
+                anyhow::ensure!(
+                    message_length >= LINUX_NETLINK_HEADER_LEN
+                        && message_length <= received - offset,
+                    "invalid Linux routing response length while awaiting {operation}"
+                );
+                let message_type = u16::from_ne_bytes(
+                    response[offset + 4..offset + 6]
+                        .try_into()
+                        .expect("fixed-width netlink type slice"),
+                );
+                let message_sequence = u32::from_ne_bytes(
+                    response[offset + 8..offset + 12]
+                        .try_into()
+                        .expect("fixed-width netlink sequence slice"),
+                );
+                if message_sequence == sequence && message_type == libc::NLMSG_ERROR as u16 {
+                    anyhow::ensure!(
+                        message_length >= LINUX_NETLINK_HEADER_LEN + 4,
+                        "truncated Linux routing error while awaiting {operation}"
+                    );
+                    let code = i32::from_ne_bytes(
+                        response[offset + LINUX_NETLINK_HEADER_LEN
+                            ..offset + LINUX_NETLINK_HEADER_LEN + 4]
+                            .try_into()
+                            .expect("fixed-width netlink error slice"),
+                    );
+                    if code == 0 {
+                        return Ok(());
+                    }
+                    return Err(io::Error::from_raw_os_error(code.saturating_neg()))
+                        .with_context(|| format!("Linux routing request to {operation}"));
+                }
+                offset = offset
+                    .checked_add(linux_netlink_align(message_length))
+                    .context("Linux routing response offset overflow")?;
+            }
+        }
+    }
+
+    fn change_link_alias(&mut self, alias: &str, context: &IpCommandContext<'_>) -> Result<()> {
+        anyhow::ensure!(
+            !alias.as_bytes().contains(&0),
+            "Linux TAP alias contains NUL"
+        );
+        let mut payload = Vec::with_capacity(16 + 4 + alias.len() + 1);
+        let ifindex = i32::try_from(self.ifindex).context("Linux TAP ifindex exceeds i32")?;
+        payload.push(libc::AF_UNSPEC as u8);
+        payload.push(0);
+        payload.extend_from_slice(&0u16.to_ne_bytes());
+        payload.extend_from_slice(&ifindex.to_ne_bytes());
+        payload.extend_from_slice(&0u32.to_ne_bytes());
+        payload.extend_from_slice(&0u32.to_ne_bytes());
+        let mut encoded_alias = alias.as_bytes().to_vec();
+        encoded_alias.push(0);
+        linux_append_route_attribute(&mut payload, libc::IFLA_IFALIAS, &encoded_alias)?;
+        self.send_route_message(
+            libc::RTM_NEWLINK,
+            (libc::NLM_F_REQUEST | libc::NLM_F_ACK) as u16,
+            &payload,
+            context,
+            "set the unpublished TAP alias",
+        )
+    }
+
+    fn add_ipv4_address(
+        &mut self,
+        address: Ipv4Addr,
+        prefix_length: u8,
+        context: &IpCommandContext<'_>,
+    ) -> Result<()> {
+        let mut payload = Vec::with_capacity(8 + 16);
+        payload.push(libc::AF_INET as u8);
+        payload.push(prefix_length);
+        payload.push(0);
+        payload.push(libc::RT_SCOPE_UNIVERSE);
+        payload.extend_from_slice(&self.ifindex.to_ne_bytes());
+        linux_append_route_attribute(&mut payload, libc::IFA_LOCAL, &address.octets())?;
+        linux_append_route_attribute(&mut payload, libc::IFA_ADDRESS, &address.octets())?;
+        self.send_route_message(
+            libc::RTM_NEWADDR,
+            (libc::NLM_F_REQUEST | libc::NLM_F_ACK | libc::NLM_F_CREATE | libc::NLM_F_EXCL) as u16,
+            &payload,
+            context,
+            "add the unpublished TAP IPv4 address",
+        )
+    }
+
+    fn change_link_up(&mut self, context: &IpCommandContext<'_>) -> Result<()> {
+        let mut payload = Vec::with_capacity(16);
+        let ifindex = i32::try_from(self.ifindex).context("Linux TAP ifindex exceeds i32")?;
+        payload.push(libc::AF_UNSPEC as u8);
+        payload.push(0);
+        payload.extend_from_slice(&0u16.to_ne_bytes());
+        payload.extend_from_slice(&ifindex.to_ne_bytes());
+        payload.extend_from_slice(&(libc::IFF_UP as u32).to_ne_bytes());
+        payload.extend_from_slice(&(libc::IFF_UP as u32).to_ne_bytes());
+        self.send_route_message(
+            libc::RTM_NEWLINK,
+            (libc::NLM_F_REQUEST | libc::NLM_F_ACK) as u16,
+            &payload,
+            context,
+            "bring the unpublished TAP up",
+        )
     }
 }
 
@@ -282,36 +761,57 @@ fn linux_tap_request(tap_name: &str) -> Result<libc::ifreq> {
 }
 
 #[cfg(target_os = "linux")]
+fn create_linux_pending_tap(tap_name: &str) -> Result<LinuxPendingTap> {
+    let descriptor = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .custom_flags(libc::O_CLOEXEC)
+        .open("/dev/net/tun")
+        .context("open Linux /dev/net/tun clone device")?;
+    let mut request = linux_tap_request(tap_name)?;
+    // SAFETY: the fd is a live TUN clone descriptor and `request` is a
+    // correctly-sized writable ifreq that remains live for this call.
+    let result = unsafe { libc::ioctl(descriptor.as_raw_fd(), libc::TUNSETIFF, &mut request) };
+    if result < 0 {
+        return Err(io::Error::last_os_error())
+            .with_context(|| format!("create exclusive non-persistent Linux TAP {tap_name}"));
+    }
+    let actual_name_end = request
+        .ifr_name
+        .iter()
+        .position(|byte| *byte == 0)
+        .context("Linux TUNSETIFF returned a non-terminated interface name")?;
+    let actual_name = request.ifr_name[..actual_name_end]
+        .iter()
+        .map(|byte| byte.to_ne_bytes()[0])
+        .collect::<Vec<_>>();
+    anyhow::ensure!(
+        actual_name == tap_name.as_bytes(),
+        "Linux TUNSETIFF returned a different TAP name"
+    );
+    let network_namespace = linux_tap_network_namespace(&descriptor)?;
+    let network_namespace_identity = linux_network_namespace_identity(&network_namespace)?;
+    let route_socket = linux_route_socket(network_namespace_identity)?;
+    let ifindex = linux_interface_index(tap_name)?;
+    let pending = LinuxPendingTap {
+        descriptor,
+        network_namespace,
+        network_namespace_identity,
+        route_socket,
+        tap_name: tap_name.to_owned(),
+        ifindex,
+        next_sequence: 1,
+    };
+    pending
+        .assert_stable_identity()
+        .context("bind new Linux TAP to its stable namespace and ifindex")?;
+    Ok(pending)
+}
+
+#[cfg(target_os = "linux")]
 impl TapCreatePort for PlatformTapCreatePort {
     fn create_nonpersistent(&self, tap_name: &str) -> Result<Box<dyn PendingTap>> {
-        let descriptor = OpenOptions::new()
-            .read(true)
-            .write(true)
-            .custom_flags(libc::O_CLOEXEC)
-            .open("/dev/net/tun")
-            .context("open Linux /dev/net/tun clone device")?;
-        let mut request = linux_tap_request(tap_name)?;
-        // SAFETY: the fd is a live TUN clone descriptor and `request` is a
-        // correctly-sized writable ifreq that remains live for this call.
-        let result = unsafe { libc::ioctl(descriptor.as_raw_fd(), libc::TUNSETIFF, &mut request) };
-        if result < 0 {
-            return Err(io::Error::last_os_error())
-                .with_context(|| format!("create exclusive non-persistent Linux TAP {tap_name}"));
-        }
-        let actual_name_end = request
-            .ifr_name
-            .iter()
-            .position(|byte| *byte == 0)
-            .context("Linux TUNSETIFF returned a non-terminated interface name")?;
-        let actual_name = request.ifr_name[..actual_name_end]
-            .iter()
-            .map(|byte| byte.to_ne_bytes()[0])
-            .collect::<Vec<_>>();
-        anyhow::ensure!(
-            actual_name == tap_name.as_bytes(),
-            "Linux TUNSETIFF returned a different TAP name"
-        );
-        Ok(Box::new(LinuxPendingTap { descriptor }))
+        Ok(Box::new(create_linux_pending_tap(tap_name)?))
     }
 }
 
@@ -1223,32 +1723,11 @@ pub(crate) fn prepare_network_with_tap_port(
     }
 
     ensure_host_cidr_available(&cfg.ip_bin, desired_cidr, None, &context)?;
-    let pending_tap = tap_create
+    let mut pending_tap = tap_create
         .create_nonpersistent(&network.tap)
         .with_context(|| format!("create unpublished Host tap {}", network.tap))?;
     (|| {
-        ip_status(
-            &context,
-            &cfg.ip_bin,
-            &[
-                "link",
-                "set",
-                "dev",
-                &network.tap,
-                "alias",
-                &network_alias(network),
-            ],
-        )?;
-        ip_status(
-            &context,
-            &cfg.ip_bin,
-            &["addr", "add", &host_cidr, "dev", &network.tap],
-        )?;
-        ip_status(
-            &context,
-            &cfg.ip_bin,
-            &["link", "set", "dev", &network.tap, "up"],
-        )?;
+        pending_tap.configure(&cfg.ip_bin, network, effect_context)?;
         // This is the publication boundary. Every earlier failure,
         // cancellation or process exit closes `pending_tap`, so Linux removes
         // the exact unpublished interface without a name-based delete.
@@ -1285,35 +1764,13 @@ pub(crate) fn create_network_from_sealed_absence_with_tap_port(
     ensure_host_cidr_available(ip_bin, desired_cidr, None, &context)?;
     context.check_active()?;
 
-    let pending_tap = match tap_create.create_nonpersistent(&network.tap) {
+    let mut pending_tap = match tap_create.create_nonpersistent(&network.tap) {
         Ok(pending) => pending,
         Err(_) => return Ok(NetworkCreateAttempt::DefinitelyNotPublished),
     };
-    let configured = (|| {
-        ip_status(
-            &context,
-            ip_bin,
-            &[
-                "link",
-                "set",
-                "dev",
-                &network.tap,
-                "alias",
-                &network_alias(network),
-            ],
-        )?;
-        ip_status(
-            &context,
-            ip_bin,
-            &["addr", "add", &host_cidr, "dev", &network.tap],
-        )?;
-        ip_status(
-            &context,
-            ip_bin,
-            &["link", "set", "dev", &network.tap, "up"],
-        )?;
-        context.check_active()
-    })();
+    let configured = pending_tap
+        .configure(ip_bin, network, effect_context)
+        .and_then(|()| context.check_active());
     if configured.is_err() {
         drop(pending_tap);
         return Ok(NetworkCreateAttempt::DefinitelyNotPublished);
@@ -2280,6 +2737,37 @@ mod tests {
     }
 
     impl PendingTap for MarkerPendingTap {
+        fn configure(
+            &mut self,
+            ip_bin: &Path,
+            network: &ChNetwork,
+            effect_context: &RuntimeDesiredEffectContext,
+        ) -> Result<()> {
+            let context = IpCommandContext::Desired(effect_context);
+            ip_status(
+                &context,
+                ip_bin,
+                &[
+                    "link",
+                    "set",
+                    "dev",
+                    &network.tap,
+                    "alias",
+                    &network_alias(network),
+                ],
+            )?;
+            ip_status(
+                &context,
+                ip_bin,
+                &["addr", "add", &host_cidr(network), "dev", &network.tap],
+            )?;
+            ip_status(
+                &context,
+                ip_bin,
+                &["link", "set", "dev", &network.tap, "up"],
+            )
+        }
+
         fn publish(mut self: Box<Self>) -> Result<()> {
             if matches!(self.behavior, FakePublishBehavior::PanicBeforePublish) {
                 panic!("injected process crash before TAP publish");
@@ -3138,6 +3626,115 @@ exit 0\n",
                 .unwrap(),
             ReservedHostNetworkState::Exact
         );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    #[ignore = "requires Linux CAP_SYS_ADMIN, CAP_NET_ADMIN, iproute2, and /dev/net/tun"]
+    fn real_linux_pending_tap_rejects_name_replacement_at_every_configuration_boundary() {
+        let ip = ["/usr/sbin/ip", "/sbin/ip", "/usr/bin/ip"]
+            .into_iter()
+            .map(PathBuf::from)
+            .find(|candidate| candidate.is_file())
+            .expect("install iproute2 for the scoped TAP test");
+        assert!(Path::new("/dev/net/tun").exists(), "/dev/net/tun is absent");
+        // SAFETY: unshare changes only this test thread's network namespace.
+        // The ignored test runs in a disposable privileged Linux process.
+        let result = unsafe { libc::unshare(libc::CLONE_NEWNET) };
+        assert_eq!(
+            result,
+            0,
+            "unshare(CLONE_NEWNET): {}",
+            io::Error::last_os_error()
+        );
+
+        let state = tempfile::tempdir().unwrap();
+        let context = desired_effect_context(state.path());
+        for (index, injection) in [
+            LinuxTapConfigurationBoundary::BeforeAlias,
+            LinuxTapConfigurationBoundary::BeforeAddress,
+            LinuxTapConfigurationBoundary::BeforeLinkUp,
+            LinuxTapConfigurationBoundary::BeforePublish,
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let mut network = plan_network(&desired_network()).unwrap();
+            network.tap = format!("cataba{index}");
+            validate_network_plan(&network).unwrap();
+            let detached_name = format!("catold{index}");
+            let mut pending = create_linux_pending_tap(&network.tap).unwrap();
+            let original_ifindex = pending.ifindex;
+            let mut replacement = None;
+            let ip_context = IpCommandContext::Standalone {
+                deadline: Instant::now() + STANDALONE_IP_COMMAND_TIMEOUT,
+            };
+
+            let error = pending
+                .configure_with_boundary_hook(
+                    &network,
+                    &IpCommandContext::Desired(&context),
+                    |at| {
+                        if at == injection {
+                            ip_status(
+                                &ip_context,
+                                &ip,
+                                &["link", "set", "dev", &network.tap, "name", &detached_name],
+                            )?;
+                            replacement = Some(create_linux_pending_tap(&network.tap)?);
+                        }
+                        Ok(())
+                    },
+                )
+                .expect_err("same-name replacement passed fd-bound configuration");
+            assert!(
+                format!("{error:#}").contains("renamed")
+                    || format!("{error:#}").contains("replacement ifindex"),
+                "unexpected identity failure: {error:#}"
+            );
+
+            let replacement_tap = replacement
+                .as_ref()
+                .expect("the configured boundary did not run");
+            assert_ne!(replacement_tap.ifindex, original_ifindex);
+            let snapshot = host_network_snapshot_once(
+                &ip,
+                &IpCommandContext::Standalone {
+                    deadline: Instant::now() + STANDALONE_IP_COMMAND_TIMEOUT,
+                },
+            )
+            .unwrap();
+            let replacement_link = snapshot
+                .links
+                .get(&network.tap)
+                .expect("same-name replacement disappeared");
+            assert_eq!(replacement_link.ifindex, replacement_tap.ifindex);
+            assert_eq!(replacement_link.alias, None);
+            assert!(!replacement_link.is_up);
+            assert!(replacement_link.ipv4.is_empty());
+            let identity = RuntimeNetworkIdentity {
+                network_config: network.config.clone(),
+                tap_name: cats_api::runtime_reconciliation::Id::new(network.tap.clone()).unwrap(),
+                ownership_token: network.ownership_token.clone(),
+            };
+            assert!(
+                snapshot.reserved_network_state(&identity).is_err(),
+                "same-name replacement became adoptable"
+            );
+
+            drop(pending);
+            assert!(
+                !Command::new(&ip)
+                    .args(["link", "show", "dev", &detached_name])
+                    .stdout(Stdio::null())
+                    .stderr(Stdio::null())
+                    .status()
+                    .unwrap()
+                    .success(),
+                "renamed original unpublished TAP leaked after descriptor close"
+            );
+            drop(replacement);
+        }
     }
 
     #[test]

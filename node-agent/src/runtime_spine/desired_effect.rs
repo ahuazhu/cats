@@ -700,6 +700,15 @@ mod tests {
     }
 
     impl PendingTap for FakePendingTap {
+        fn configure(
+            &mut self,
+            _ip_bin: &Path,
+            _network: &ChNetwork,
+            effect_context: &RuntimeDesiredEffectContext,
+        ) -> anyhow::Result<()> {
+            effect_context.check_active()
+        }
+
         fn publish(self: Box<Self>) -> anyhow::Result<()> {
             self.calls
                 .lock()

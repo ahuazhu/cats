@@ -48,7 +48,8 @@ use super::inventory::{
     RuntimeCheckpointInventoryEvidence,
 };
 use super::prepare_device_retirement::{
-    prepare_device_base_admission_is_exact, retirement_authority_lease_is_monotonic, unique_runtime,
+    prepare_device_base_admission_is_exact, prepared_device_input_from_step,
+    prepared_device_input_is_exact, retirement_authority_lease_is_monotonic, unique_runtime,
 };
 use super::serving_blockd_process::{
     ExactServingBlockdProcessProof, ServingBlockdExpectation, ServingBlockdProcessGlobalPort,
@@ -430,7 +431,52 @@ impl NetworkReservations {
 struct NetworkAllocationPermit {
     state_root: File,
     lock: File,
+    lock_identity: NetworkLockIdentity,
     lock_held: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct NetworkLockIdentity {
+    device: u64,
+    inode: u64,
+    owner: u32,
+    group: u32,
+    mode: u32,
+    links: u64,
+    length: u64,
+    modified_seconds: i64,
+    modified_nanoseconds: i64,
+    changed_seconds: i64,
+    changed_nanoseconds: i64,
+}
+
+impl NetworkLockIdentity {
+    fn capture(file: &File) -> Result<Self> {
+        let metadata = file
+            .metadata()
+            .context("capture network allocation lock identity")?;
+        Ok(Self {
+            device: metadata.dev(),
+            inode: metadata.ino(),
+            owner: metadata.uid(),
+            group: metadata.gid(),
+            mode: metadata.mode(),
+            links: metadata.nlink(),
+            length: metadata.len(),
+            modified_seconds: metadata.mtime(),
+            modified_nanoseconds: metadata.mtime_nsec(),
+            changed_seconds: metadata.ctime(),
+            changed_nanoseconds: metadata.ctime_nsec(),
+        })
+    }
+
+    fn assert_exact(self, file: &File) -> Result<()> {
+        anyhow::ensure!(
+            Self::capture(file)? == self,
+            "network allocation lock changed from its acquisition identity"
+        );
+        Ok(())
+    }
 }
 
 impl NetworkAllocationPermit {
@@ -442,13 +488,18 @@ impl NetworkAllocationPermit {
         Ok(&self.lock)
     }
 
+    fn assert_current_lock(&self) -> Result<()> {
+        self.lock_identity.assert_exact(self.lock()?)?;
+        let reopened = open_network_allocation_lock(&self.state_root)?;
+        self.lock_identity.assert_exact(&reopened)
+    }
+
     fn assert_current_paths(
         &self,
         snapshot: &RuntimeCheckpointNamespaceSnapshot,
         store: &FileCheckpointStore,
     ) -> Result<()> {
-        let reopened = open_network_allocation_lock(&self.state_root)?;
-        ensure_same_file(self.lock()?, &reopened, "network allocation lock changed")?;
+        self.assert_current_lock()?;
         revalidate_checkpoint_namespace(
             &self.state_root,
             CHECKPOINT_NAMESPACE,
@@ -459,8 +510,7 @@ impl NetworkAllocationPermit {
     }
 
     fn assert_current_snapshot(&self, snapshot: &RuntimeCheckpointNamespaceSnapshot) -> Result<()> {
-        let reopened = open_network_allocation_lock(&self.state_root)?;
-        ensure_same_file(self.lock()?, &reopened, "network allocation lock changed")?;
+        self.assert_current_lock()?;
         let _reopened_namespace = revalidate_checkpoint_namespace(
             &self.state_root,
             CHECKPOINT_NAMESPACE,
@@ -471,8 +521,7 @@ impl NetworkAllocationPermit {
     }
 
     fn assert_current_absent_namespace(&self) -> Result<()> {
-        let reopened = open_network_allocation_lock(&self.state_root)?;
-        ensure_same_file(self.lock()?, &reopened, "network allocation lock changed")?;
+        self.assert_current_lock()?;
         anyhow::ensure!(
             checkpoint_namespace_is_absent(&self.state_root)?,
             "network inventory checkpoint namespace appeared during scan"
@@ -523,13 +572,14 @@ impl NetworkAllocationPort {
             .context("retain Node state root for network allocation")?;
         let lock = open_network_allocation_lock(&state_root)?;
         lock_exclusive_nonblocking(&lock)?;
+        let lock_identity = NetworkLockIdentity::capture(&lock)?;
         let permit = NetworkAllocationPermit {
             state_root,
             lock,
+            lock_identity,
             lock_held: true,
         };
-        let reopened = open_network_allocation_lock(&permit.state_root)?;
-        ensure_same_file(permit.lock()?, &reopened, "network allocation lock changed")?;
+        permit.assert_current_lock()?;
         context.check_active()?;
         Ok(permit)
     }
@@ -581,6 +631,12 @@ impl NetworkAllocationPort {
                 .values()
                 .map(|reservation| &reservation.identity),
         )?;
+        physical.ensure_reserved_network_ranges(
+            reservations
+                .by_tap
+                .values()
+                .map(|reservation| &reservation.identity),
+        )?;
         physical.ensure_candidate_available(&planned)?;
         revalidate_authority()?;
         context.check_active()?;
@@ -600,6 +656,12 @@ impl NetworkAllocationPort {
             "Host network inventory changed before reservation publication"
         );
         physical_after.ensure_managed_networks_are_reserved(
+            prospective
+                .by_tap
+                .values()
+                .map(|reservation| &reservation.identity),
+        )?;
+        physical_after.ensure_reserved_network_ranges(
             prospective
                 .by_tap
                 .values()
@@ -1148,7 +1210,8 @@ pub(super) fn prepare_network_volume_admission_is_exact(
     else {
         return false;
     };
-    desired.target == RuntimeTarget::Running
+    prepared_device_input_is_exact(device, desired, observed_volume)
+        && desired.target == RuntimeTarget::Running
         && matches!(desired.transition, RuntimeTransition::CancelAndDrain)
         && desired_volume.disk_kind == DiskKind::Root
         && desired_volume.access == VolumeAccess::ReadWriteOnce
@@ -1191,49 +1254,7 @@ fn local_contract_stop() -> RuntimeDesiredEffectOutcome {
 }
 
 pub(super) fn prepared_device_input(checkpoint: &RuntimeCheckpoint) -> Result<PreparedDeviceInput> {
-    if let ReconcileStep::PrepareNetwork { devices, .. } = &checkpoint.step {
-        let [device] = devices.as_slice() else {
-            anyhow::bail!("PrepareNetwork must retain exactly one prepared device")
-        };
-        return Ok(device.clone());
-    }
-    let ReconcileStep::PrepareDevice {
-        volume_intent_id,
-        disk_id,
-        volume_id,
-        disk_kind,
-        attachment_id,
-        attachment_epoch,
-        acquire_origin,
-        expected_head,
-        size_bytes,
-        durability,
-        guest_device,
-        ownership_token,
-        serving_authority,
-        serving_process,
-        frontend,
-    } = &checkpoint.step
-    else {
-        anyhow::bail!("PrepareNetwork predecessor is not PrepareDevice")
-    };
-    Ok(PreparedDeviceInput {
-        volume_intent_id: volume_intent_id.clone(),
-        disk_id: disk_id.clone(),
-        volume_id: volume_id.clone(),
-        disk_kind: *disk_kind,
-        attachment_id: attachment_id.clone(),
-        attachment_epoch: *attachment_epoch,
-        acquire_origin: acquire_origin.clone(),
-        expected_head: expected_head.clone(),
-        size_bytes: *size_bytes,
-        durability: *durability,
-        guest_device: guest_device.clone(),
-        ownership_token: ownership_token.clone(),
-        serving_authority: serving_authority.clone(),
-        serving_process: serving_process.clone(),
-        frontend: frontend.clone(),
-    })
+    prepared_device_input_from_step(&checkpoint.step)
 }
 
 pub(super) fn prepare_device_checkpoint_view(
@@ -1408,6 +1429,7 @@ fn effective_user_id() -> u32 {
 
 #[cfg(test)]
 mod tests {
+    use std::cell::Cell;
     use std::fs;
     use std::os::fd::FromRawFd as _;
     use std::os::unix::fs::PermissionsExt as _;
@@ -1452,6 +1474,13 @@ mod tests {
     }
 
     fn desired_effect_context(state: &Path, cats: &[Id]) -> RuntimeDesiredEffectContext {
+        desired_effect_context_for(state, cats.iter().map(desired_for).collect())
+    }
+
+    fn desired_effect_context_for(
+        state: &Path,
+        desired_specs: Vec<DesiredRuntimeSpec>,
+    ) -> RuntimeDesiredEffectContext {
         let node_boot_id = NodeBootId::new("a".repeat(32)).unwrap();
         let agent_instance_id = random('b');
         let session = AgentSession {
@@ -1479,7 +1508,7 @@ mod tests {
             read_position,
             issued_at_unix_ms: UnixMillis::new(1_000).unwrap(),
             expires_at_unix_ms: UnixMillis::new(2_000).unwrap(),
-            desired_specs: cats.iter().map(desired_for).collect(),
+            desired_specs,
         };
         let inventory_digest = Sha256Digest::from_bytes([5; 32]);
         let observation = NodeObservation {
@@ -1748,6 +1777,114 @@ exit 97\n",
             predecessor.checkpoint()
         );
         assert!(detached.exists());
+    }
+
+    #[test]
+    fn reservation_rejects_network_lock_move_away_replacement_and_move_back_aba() {
+        let fixture = Fixture::empty();
+        let lock = fixture.state.join(NETWORK_ALLOCATION_LOCK_BASENAME);
+        let detached = fixture.state.join("network-allocation-detached.lock");
+        let replacement = fixture.state.join("network-allocation-replacement.lock");
+        let source = fixed_predecessor();
+        let store = fixture.store(&source);
+        let predecessor = store.create(&source).unwrap();
+
+        let error = reserve(&fixture, &store, &predecessor, || {
+            fs::rename(&lock, &detached).unwrap();
+            fs::write(&lock, []).unwrap();
+            fs::set_permissions(&lock, fs::Permissions::from_mode(0o600)).unwrap();
+            fs::rename(&lock, &replacement).unwrap();
+            fs::rename(&detached, &lock).unwrap();
+        })
+        .expect_err("move-away/replacement/move-back lock ABA reached checkpoint CAS");
+        assert!(
+            format!("{error:#}").contains("acquisition identity"),
+            "{error:#}"
+        );
+        assert_eq!(
+            store.load().unwrap().unwrap().checkpoint(),
+            predecessor.checkpoint()
+        );
+        assert!(replacement.exists());
+    }
+
+    #[test]
+    fn reservation_closes_every_durable_range_before_build_or_cas() {
+        let fixture = Fixture::with_after_link(Some(("foreign", "10.240.0.5")));
+        let script = fs::read_to_string(&fixture.ip)
+            .unwrap()
+            .replace("catold000001", "foreign0");
+        fs::write(&fixture.ip, script).unwrap();
+        fs::write(&fixture.marker, b"present").unwrap();
+
+        let source_a = fixed_predecessor();
+        let desired_a = desired_for(&source_a.cat_id);
+        let store_a = fixture.store(&source_a);
+        let predecessor_a = store_a.create(&source_a).unwrap();
+        let identity_a = RuntimeNetworkIdentity {
+            network_config: desired_a.runtime.network_config.clone(),
+            tap_name: Id::new("cata00000001").unwrap(),
+            ownership_token: random('e'),
+        };
+        let prepared_a = prepared_device_input(&source_a).unwrap();
+        let reserved_a = prepare_network_successor(&predecessor_a, identity_a, prepared_a).unwrap();
+        store_a.replace(&predecessor_a, &reserved_a).unwrap();
+
+        let cat_b = Id::new("cat_b").unwrap();
+        let mut source_b = fixed_predecessor();
+        source_b.cat_id = cat_b.clone();
+        let ReconcileStep::PrepareDevice {
+            ownership_token,
+            serving_process,
+            ..
+        } = &mut source_b.step
+        else {
+            panic!("fixture is not PrepareDevice")
+        };
+        *ownership_token = random('b');
+        serving_process.process_identity_token = random('c');
+        let mut desired_b = desired_for(&cat_b);
+        desired_b.runtime.network_config = NetworkConfig {
+            network_id: Id::new("net_b").unwrap(),
+            gateway_ipv4: cats_api::runtime_reconciliation::Ipv4Address::new("10.240.0.9").unwrap(),
+            guest_ipv4: cats_api::runtime_reconciliation::Ipv4Address::new("10.240.0.10").unwrap(),
+            guest_mac: cats_api::runtime_reconciliation::MacAddress::new("02:ca:0a:f0:00:0a")
+                .unwrap(),
+            ..desired_b.runtime.network_config.clone()
+        };
+        let store_b = fixture.store(&source_b);
+        let predecessor_b = store_b.create(&source_b).unwrap();
+        let prepared_b = prepared_device_input(&source_b).unwrap();
+        let context =
+            desired_effect_context_for(&fixture.state, vec![desired_a, desired_b.clone()]);
+        let build_called = Cell::new(false);
+
+        let error = fixture
+            .port()
+            .reserve_and_replace(
+                &context,
+                &store_b,
+                &predecessor_b,
+                &desired_b.runtime.network_config,
+                || Ok(()),
+                |network| {
+                    build_called.set(true);
+                    prepare_network_successor(&predecessor_b, network, prepared_b)
+                },
+            )
+            .expect_err("foreign owner of Cat A's durable range reached Cat B reservation CAS");
+        assert!(
+            format!("{error:#}").contains("durable Host network range"),
+            "{error:#}"
+        );
+        assert!(
+            !build_called.get(),
+            "range conflict reached successor build"
+        );
+        assert_eq!(
+            store_b.load().unwrap().unwrap().checkpoint(),
+            predecessor_b.checkpoint()
+        );
     }
 
     #[test]

@@ -38,7 +38,10 @@ use crate::runtime_spine::{
 
 use super::{
     kernel_nbd::{KernelNbdInventoryPort, KernelNbdPoolScanOutcome},
-    network::{prepare_device_checkpoint_view, NodeGlobalNetworkScanAdmission},
+    network::{
+        prepare_device_checkpoint_view, prepared_device_input, NodeGlobalNetworkScanAdmission,
+    },
+    prepare_device_retirement::prepared_device_input_is_exact,
     root_provision_process::{
         NodeGlobalManagedProcessScanAdmission, RetainedRootProvisionProcessAttempt,
         RootProvisionAuthoritySnapshot, RootProvisionProcessExpectation,
@@ -961,6 +964,14 @@ fn runtime_from_inventory(
             {
                 head == expected_head
             }
+            (
+                ReconcileStep::PrepareNetwork { devices, .. },
+                VolumeAuthorityEvidence::Owned { head, .. },
+            ) => matches!(
+                devices.as_slice(),
+                [device]
+                    if device.volume_id == volume.volume_id && &device.expected_head == head
+            ),
             (ReconcileStep::Quarantined, VolumeAuthorityEvidence::Owned { head, .. }) => {
                 runtime_checkpoint.volumes.iter().any(|checkpoint_volume| {
                     checkpoint_volume.volume_id == volume.volume_id
@@ -1421,53 +1432,29 @@ fn validate_scanned_checkpoint(
             }
         }
         ReconcileStep::PrepareDevice {
-            volume_id,
-            attachment_id,
-            attachment_epoch,
-            acquire_origin,
-            expected_head,
-            size_bytes,
-            durability,
-            guest_device,
-            serving_authority,
-            serving_process,
-            ..
+            serving_authority, ..
         } if binding == DesiredCheckpointBinding::Current
             && matches!(
                 serving_authority.as_ref(),
                 cats_api::runtime_reconciliation::ServingAuthorityProvenance::AfterRootProvision { .. }
             ) =>
         {
-            let Some(blockd) = blockd else {
-                anyhow::bail!("PrepareDevice checkpoint lacks authorized blockd lineage")
-            };
-            let [intent] = desired.volumes.as_slice() else {
-                anyhow::bail!("current PrepareDevice checkpoint requires one root Volume")
-            };
-            let attachment = &blockd.checkpoint.attachment;
-            let checkpoint_volume = checkpoint
-                .volumes
-                .iter()
-                .find(|volume| volume.volume_id == *volume_id)
-                .context("PrepareDevice checkpoint lacks its observed Volume")?;
+            validate_current_prepared_checkpoint(desired, checkpoint, blockd, true)?
+        }
+        ReconcileStep::PrepareNetwork { network, .. }
+            if binding == DesiredCheckpointBinding::Current =>
+        {
             anyhow::ensure!(
-                volume_id == &intent.volume_id
-                    && attachment_id == &attachment.identity.attachment_id
-                    && *attachment_epoch == attachment.identity.attachment_epoch
-                    && *acquire_origin == attachment.identity.acquire_origin
-                    && *size_bytes == attachment.size_bytes
-                    && *durability == attachment.durability
-                    && guest_device == &intent.guest_device
-                    && serving_process.data_directory == blockd.data_directory
-                    && checkpoint_volume.size_bytes == Some(attachment.size_bytes)
-                    && checkpoint_volume.durability == Some(attachment.durability)
-                    && blockd.retained_root_process.is_some()
-                    && matches!(
-                        &checkpoint_volume.authority,
-                        VolumeAuthorityEvidence::Owned { head, .. } if head == expected_head
-                    ),
-                "PrepareDevice checkpoint does not bind authorized root handoff lineage"
+                network.network_config == desired.runtime.network_config,
+                "PrepareNetwork checkpoint does not bind the exact Desired network"
             );
+            crate::ch::validate_network_plan(&crate::ch::ChNetwork {
+                tap: network.tap_name.as_str().to_owned(),
+                ownership_token: network.ownership_token.clone(),
+                config: network.network_config.clone(),
+            })
+            .context("validate checkpointed PrepareNetwork identity")?;
+            validate_current_prepared_checkpoint(desired, checkpoint, blockd, false)?;
         }
         ReconcileStep::CleanupRelease { cleanup }
             if binding == DesiredCheckpointBinding::Current =>
@@ -1485,6 +1472,39 @@ fn validate_scanned_checkpoint(
         }
         _ => anyhow::bail!("pre-launch scanner encountered an unsupported Runtime step"),
     }
+    Ok(())
+}
+
+fn validate_current_prepared_checkpoint(
+    desired: &DesiredRuntimeSpec,
+    checkpoint: &RuntimeCheckpoint,
+    blockd: Option<&AuthorizedBlockdInventoryEvidence>,
+    requires_retained_root_process: bool,
+) -> anyhow::Result<()> {
+    let Some(blockd) = blockd else {
+        anyhow::bail!("prepared-device checkpoint lacks authorized blockd lineage")
+    };
+    let device = prepared_device_input(checkpoint)?;
+    let [checkpoint_volume] = checkpoint.volumes.as_slice() else {
+        anyhow::bail!("prepared-device checkpoint requires one observed root Volume")
+    };
+    let attachment = &blockd.checkpoint.attachment;
+    anyhow::ensure!(
+        prepared_device_input_is_exact(&device, desired, checkpoint_volume)
+            && device.volume_id == attachment.identity.volume_id
+            && device.attachment_id == attachment.identity.attachment_id
+            && device.attachment_epoch == attachment.identity.attachment_epoch
+            && device.acquire_origin == attachment.identity.acquire_origin
+            && device.size_bytes == attachment.size_bytes
+            && device.durability == attachment.durability
+            && device.serving_process.data_directory == blockd.data_directory
+            && (!requires_retained_root_process || blockd.retained_root_process.is_some())
+            && matches!(
+                device.serving_authority.as_ref(),
+                cats_api::runtime_reconciliation::ServingAuthorityProvenance::AfterRootProvision { .. }
+            ),
+        "prepared-device checkpoint does not bind authorized root handoff lineage"
+    );
     Ok(())
 }
 

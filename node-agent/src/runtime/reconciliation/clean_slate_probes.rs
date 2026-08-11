@@ -68,7 +68,7 @@ use super::inventory::{
     RuntimeCheckpointInventoryEvidence,
 };
 use super::kernel_nbd::{KernelNbdInventoryConfig, KernelNbdInventoryPort};
-use super::network::NetworkAllocationPort;
+use super::network::{prepare_device_checkpoint_view, NetworkAllocationPort};
 use super::root_provision_process::inspect_exact_root_provision_process;
 use super::root_provision_process::StopReceiptSocketAdmission;
 use super::serving_blockd_process::{
@@ -2510,9 +2510,19 @@ fn scan_authorized_blockd_data(
                 .as_ref()
                 .and_then(|snapshot| snapshot.get(&desired.cat_id))
             {
+                let prepared_checkpoint;
+                let handoff_checkpoint = if matches!(
+                    runtime_checkpoint.step,
+                    ReconcileStep::PrepareNetwork { .. }
+                ) {
+                    prepared_checkpoint = prepare_device_checkpoint_view(runtime_checkpoint)?;
+                    &prepared_checkpoint
+                } else {
+                    runtime_checkpoint
+                };
                 anyhow::ensure!(
                     !matches!(
-                        &runtime_checkpoint.step,
+                        &handoff_checkpoint.step,
                         ReconcileStep::PrepareDevice {
                             serving_authority,
                             ..
@@ -2534,7 +2544,17 @@ fn scan_authorized_blockd_data(
                 scan.complete = false;
                 continue;
             };
-            let provision_transition_id = match &runtime_checkpoint.step {
+            let prepared_checkpoint;
+            let handoff_checkpoint = if matches!(
+                runtime_checkpoint.step,
+                ReconcileStep::PrepareNetwork { .. }
+            ) {
+                prepared_checkpoint = prepare_device_checkpoint_view(&runtime_checkpoint)?;
+                &prepared_checkpoint
+            } else {
+                &runtime_checkpoint
+            };
+            let provision_transition_id = match &handoff_checkpoint.step {
                 ReconcileStep::ProvisionRootImage {
                     provision_transition_id,
                     ..
@@ -2580,7 +2600,7 @@ fn scan_authorized_blockd_data(
                     record.provision_transition_id
                 }
                 _ => bail!(
-                    "serving handoff artifacts require provision_root_image or after-root-provision PrepareDevice"
+                    "serving handoff artifacts require provision_root_image or an after-root-provision prepared-device phase"
                 ),
             };
             let target_name = format!(
@@ -5784,8 +5804,8 @@ mod tests {
         Durability, Epoch, FenceEpoch, Generation, GuestDeviceIdentity, HostPath, Id, Ipv4Address,
         IsolatedIpv4Kind, LifecycleAdmission, MacAddress, NetworkConfig, NodeBootId,
         NodeObservation, NormalAcquireRequest, PrepareDeviceFrontend, RandomId128, ReconcileStep,
-        RemoteHead, Revision, RuntimeConfig, RuntimeTarget, RuntimeTransition,
-        RuntimeVolumeTransition, RuntimeVolumeTransitionPreconditionProblem,
+        RemoteHead, Revision, RuntimeConfig, RuntimeNetworkIdentity, RuntimeTarget,
+        RuntimeTransition, RuntimeVolumeTransition, RuntimeVolumeTransitionPreconditionProblem,
         RuntimeVolumeTransitionRequest, ServingAuthorityProvenance, ServingBlockdIdentity,
         SessionBinding, Sha256Digest, UnixMillis, VolumeAccess, VolumeAcquire,
         VolumeAcquireRequest, VolumeDisposition, VolumeIntent, VolumeReleaseReplay, WireU64,
@@ -9173,6 +9193,15 @@ mod tests {
         inspections: impl IntoIterator<Item = RootProvisionProcessInspection>,
         serving_process_ids: impl IntoIterator<Item = Option<u32>>,
     ) -> CleanSlateInventoryScanner {
+        full_root_scanner_with_serving_and_network(fixture, inspections, serving_process_ids, None)
+    }
+
+    fn full_root_scanner_with_serving_and_network(
+        fixture: &FullRootScannerFixture,
+        inspections: impl IntoIterator<Item = RootProvisionProcessInspection>,
+        serving_process_ids: impl IntoIterator<Item = Option<u32>>,
+        network_allocation_port: Option<NetworkAllocationPort>,
+    ) -> CleanSlateInventoryScanner {
         let mut config = fixture.config.clone();
         config.root_process_port = Some(Arc::new(FakeRootProcessPort {
             inspections: Mutex::new(inspections.into_iter().collect()),
@@ -9180,6 +9209,7 @@ mod tests {
         config.serving_process_port = Some(Arc::new(FakeServingProcessPort {
             process_ids: Mutex::new(serving_process_ids.into_iter().collect()),
         }));
+        config.network_allocation_port = network_allocation_port;
         let (authority, _) = TestVolumeDataAuthority::exact(fixture.record.clone());
         let blob: Arc<dyn BlobStore> = fixture.blob.clone();
         scanner_with_metadata_authority_and_blob(
@@ -9261,6 +9291,272 @@ mod tests {
         )
         .unwrap();
         checkpoint
+    }
+
+    struct LivePreparedScannerFixture {
+        stored: StoredCheckpoint,
+        old_process: super::super::root_provision_process::RootProvisionProcessEvidence,
+        _listeners: Vec<std::os::unix::net::UnixListener>,
+    }
+
+    fn install_live_prepare_device_fixture(
+        environment: &TestEnvironment,
+        fixture: &FullRootScannerFixture,
+    ) -> LivePreparedScannerFixture {
+        install_exact_control_only_files(
+            &fixture.data_directory,
+            fixture.expected.attachment.size_bytes,
+        );
+        let proof = fixture
+            .expected
+            .clone()
+            .prove_exact_process(exact_process_evidence(&fixture.expected, 79))
+            .unwrap();
+        let handoff_store = super::super::serving_handoff::ServingHandoffStore::new(
+            StateDirectory::unanchored(environment.state.clone()),
+        );
+        let ready = handoff_store
+            .seal_serving_ready(
+                &fixture.stored_checkpoint,
+                &fixture.acquired,
+                &fixture.authority,
+                &proof,
+            )
+            .unwrap();
+        let checkpoint_store = FileCheckpointStore::open(
+            &environment.state.join(CHECKPOINT_NAMESPACE),
+            &fixture.expected.cat_id,
+        )
+        .unwrap();
+        let stored = ready
+            .consume_for_prepare_device(&fixture.stored_checkpoint, |handoff| {
+                let successor = prepare_device_successor(fixture, handoff);
+                checkpoint_store
+                    .replace(&fixture.stored_checkpoint, &successor)
+                    .map_err(anyhow::Error::from)
+            })
+            .unwrap();
+        drop(ready);
+
+        let old_process = exact_process_evidence(&fixture.expected, 79);
+        let old_socket =
+            install_exact_process_fixture(environment, &fixture.expected, old_process.process_id);
+        let retained =
+            AuthorizedBlockdStore::new(StateDirectory::unanchored(environment.state.clone()))
+                .retain_prepare_device_handoff(stored.checkpoint(), &fixture.acquired.desired)
+                .unwrap();
+        let serving_ready = handoff_store
+            .reopen_prepare_device_handoff(
+                stored.checkpoint(),
+                &fixture.acquired.desired,
+                &fixture.record,
+                retained,
+            )
+            .unwrap();
+        let serving_expected = ServingBlockdExpectation::from_handoff(
+            &serving_ready,
+            &test_root_provision_systemd(&environment.blockd_binary),
+            stored.checkpoint(),
+            &fixture.acquired.desired,
+            &fixture.record,
+        )
+        .unwrap();
+        drop(serving_ready);
+        std::fs::create_dir(
+            environment
+                .systemd_root
+                .join(serving_expected.unit_id().as_str()),
+        )
+        .unwrap();
+        let serving_proc = environment.proc_root.join("81");
+        std::fs::create_dir(&serving_proc).unwrap();
+        std::os::unix::fs::symlink(
+            serving_expected.executable_path().as_str(),
+            serving_proc.join("exe"),
+        )
+        .unwrap();
+        let serving_cmdline = serving_expected
+            .command_line()
+            .iter()
+            .flat_map(|argument| {
+                argument
+                    .as_os_str()
+                    .as_bytes()
+                    .iter()
+                    .copied()
+                    .chain(std::iter::once(0))
+            })
+            .collect::<Vec<_>>();
+        std::fs::write(serving_proc.join("cmdline"), serving_cmdline).unwrap();
+        let serving_control =
+            std::os::unix::net::UnixListener::bind(serving_expected.control_socket_path().as_str())
+                .unwrap();
+        let serving_frontend =
+            std::os::unix::net::UnixListener::bind(serving_expected.listener_path().as_str())
+                .unwrap();
+        for path in [
+            serving_expected.control_socket_path().as_str(),
+            serving_expected.listener_path().as_str(),
+        ] {
+            std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700)).unwrap();
+        }
+        LivePreparedScannerFixture {
+            stored,
+            old_process,
+            _listeners: vec![old_socket, serving_control, serving_frontend],
+        }
+    }
+
+    #[test]
+    fn fresh_full_scanner_rejects_paired_foreign_prepared_device_ids() {
+        for field in ["volume_intent_id", "disk_id"] {
+            let environment = TestEnvironment::new();
+            let fixture = full_root_scanner_fixture(&environment);
+            let live = install_live_prepare_device_fixture(&environment, &fixture);
+            let mut poisoned = live.stored.checkpoint().clone();
+            let observed = poisoned.volumes.first_mut().unwrap();
+            match (&mut poisoned.step, field) {
+                (
+                    ReconcileStep::PrepareDevice {
+                        volume_intent_id, ..
+                    },
+                    "volume_intent_id",
+                ) => {
+                    let foreign = Id::new("vint_foreign").unwrap();
+                    *volume_intent_id = foreign.clone();
+                    observed.volume_intent_id = Some(foreign);
+                }
+                (ReconcileStep::PrepareDevice { disk_id, .. }, "disk_id") => {
+                    let foreign = Id::new("disk_foreign").unwrap();
+                    *disk_id = foreign.clone();
+                    observed.disk_id = Some(foreign);
+                }
+                _ => panic!("unexpected prepared-device fixture or mutation field"),
+            }
+            poisoned.updated_at_unix_ms =
+                UnixMillis::new(live.stored.checkpoint().updated_at_unix_ms.get() + 1).unwrap();
+            FileCheckpointStore::open(
+                &environment.state.join(CHECKPOINT_NAMESPACE),
+                &fixture.expected.cat_id,
+            )
+            .unwrap()
+            .replace(&live.stored, &poisoned)
+            .unwrap();
+
+            let error = full_root_scanner_with_serving(
+                &fixture,
+                [
+                    RootProvisionProcessInspection::Exact(Box::new(live.old_process.clone())),
+                    RootProvisionProcessInspection::Exact(Box::new(live.old_process.clone())),
+                ],
+                [Some(81), Some(81)],
+            )
+            .scan_complete(fixture.scan_context.clone())
+            .expect_err("paired foreign prepared-device IDs entered full inventory");
+            assert!(
+                format!("{error:#}").contains("prepared-device checkpoint"),
+                "{field}: {error:#}"
+            );
+        }
+    }
+
+    #[test]
+    fn fresh_full_prepare_network_scan_seals_absence_and_provisioned_head() {
+        let environment = TestEnvironment::new();
+        let fixture = full_root_scanner_fixture(&environment);
+        let live = install_live_prepare_device_fixture(&environment, &fixture);
+        let desired = &fixture.acquired.desired;
+        let planned = crate::ch::plan_network(&desired.runtime.network_config).unwrap();
+        let identity = RuntimeNetworkIdentity {
+            network_config: planned.config,
+            tap_name: Id::new(planned.tap).unwrap(),
+            ownership_token: planned.ownership_token,
+        };
+        let device =
+            super::super::network::prepared_device_input(live.stored.checkpoint()).unwrap();
+        assert_eq!(device.expected_head, fixture.record.head);
+        let mut checkpoint = live.stored.checkpoint().clone();
+        checkpoint.step = ReconcileStep::PrepareNetwork {
+            network: identity.clone(),
+            devices: vec![device.clone()],
+        };
+        checkpoint.updated_at_unix_ms =
+            UnixMillis::new(live.stored.checkpoint().updated_at_unix_ms.get() + 1).unwrap();
+        FileCheckpointStore::open(
+            &environment.state.join(CHECKPOINT_NAMESPACE),
+            &fixture.expected.cat_id,
+        )
+        .unwrap()
+        .replace(&live.stored, &checkpoint)
+        .unwrap();
+
+        let ip = environment.state.parent().unwrap().join("ip-empty");
+        std::fs::write(
+            &ip,
+            "#!/bin/sh\nif [ \"$2\" = \"-d\" ] || [ \"$2\" = \"-4\" ]; then printf '[]'; exit 0; fi\nexit 97\n",
+        )
+        .unwrap();
+        std::fs::set_permissions(&ip, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let network_port =
+            NetworkAllocationPort::new(StateDirectory::unanchored(environment.state.clone()), ip)
+                .unwrap();
+        let coordinates = fixture.scan_context.coordinates().clone();
+        let scanner = full_root_scanner_with_serving_and_network(
+            &fixture,
+            [
+                RootProvisionProcessInspection::Exact(Box::new(live.old_process.clone())),
+                RootProvisionProcessInspection::Exact(Box::new(live.old_process.clone())),
+            ],
+            [Some(81), Some(81)],
+            Some(network_port),
+        );
+        let RuntimeInventoryScanOutcome::Complete(mut inventory) =
+            scanner.scan_complete(fixture.scan_context.clone()).unwrap()
+        else {
+            panic!("fresh PrepareNetwork scan must be complete")
+        };
+        let runtime = &inventory.runtimes()[0];
+        let ReconcileStep::PrepareNetwork { network, devices } = &runtime.step else {
+            panic!("fresh scan did not retain PrepareNetwork")
+        };
+        assert_eq!(network, &identity);
+        assert_eq!(devices, &[device]);
+        let VolumeAuthorityEvidence::Owned { head, .. } = &runtime.volumes[0].authority else {
+            panic!("fresh PrepareNetwork scan lost owned authority")
+        };
+        assert_eq!(head, &fixture.record.head);
+        assert!(runtime.networks.is_empty());
+
+        let process_scan = inventory
+            .take_node_global_process_admission()
+            .expect("fresh PrepareNetwork scan lacks sealed process admission");
+        let network_scan = inventory
+            .take_node_global_network_admission()
+            .expect("fresh PrepareNetwork scan lacks sealed network admission");
+        let mut observation = NodeObservation {
+            version: ContractVersion::V1,
+            observation_id: RandomId128::new("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa").unwrap(),
+            node_id: coordinates.session.node_id.clone(),
+            node_boot_id: coordinates.session.node_boot_id.clone(),
+            agent_instance_id: coordinates.session.agent_instance_id.clone(),
+            agent_session_epoch: coordinates.session.agent_session_epoch,
+            heartbeat_sequence: coordinates.heartbeat_sequence,
+            observed_at_unix_ms: inventory.observed_at_unix_ms(),
+            complete_inventory: true,
+            inventory_epoch: coordinates.inventory_epoch,
+            inventory_digest: Some(Sha256Digest::from_bytes([0; 32])),
+            inventory_read_position: Some(coordinates.desired.read_position),
+            key_ring_version: None,
+            key_ring_digest: None,
+            loaded_kids: Vec::new(),
+            runtimes: inventory.runtimes().to_vec(),
+            residue: inventory.residue().to_vec(),
+        };
+        observation.inventory_digest = Some(inventory_digest(&observation).unwrap());
+        let process_admission = process_scan.bind(&observation).unwrap();
+        let network_admission = network_scan.bind(&observation).unwrap();
+        assert!(process_admission.matches_observation(&observation));
+        assert!(network_admission.matches_observation(&observation));
     }
 
     #[test]
