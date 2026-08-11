@@ -2892,6 +2892,8 @@ mod tests {
 
     struct IncompleteScanner;
 
+    struct ErrorScanner;
+
     impl crate::runtime_spine::inventory_scanner_sealed::Sealed for IncompleteScanner {}
 
     impl RuntimeInventoryScanner for IncompleteScanner {
@@ -2903,6 +2905,17 @@ mod tests {
             Ok(RuntimeInventoryScanOutcome::Incomplete {
                 unavailable_sources: vec![InventorySource::Process],
             })
+        }
+    }
+
+    impl crate::runtime_spine::inventory_scanner_sealed::Sealed for ErrorScanner {}
+
+    impl RuntimeInventoryScanner for ErrorScanner {
+        fn scan_complete(
+            &self,
+            _context: RuntimeInventoryScanContext,
+        ) -> anyhow::Result<RuntimeInventoryScanOutcome> {
+            anyhow::bail!("injected complete-source conflict")
         }
     }
 
@@ -4071,13 +4084,21 @@ mod tests {
         let effect = Arc::new(CountingEffect {
             calls: AtomicUsize::new(0),
         });
+        let admission = Arc::new(TestPreScanAdmission {
+            calls: AtomicUsize::new(0),
+            fail_closes: AtomicUsize::new(0),
+            fail: AtomicBool::new(false),
+        });
         let root = tempfile::tempdir().unwrap();
-        let mut runner = RuntimeSpineRunner::new_with_desired_effects(
+        let mut runner = RuntimeSpineRunner::new_inner(
             StateDirectory::unanchored(root.path().to_path_buf()),
             decode_agent_session(SESSION).unwrap(),
             RuntimeSpineHttpClient::for_loopback_test(&origin, signer()).unwrap(),
             Arc::new(IncompleteScanner),
-            effect.clone(),
+            Some(effect.clone()),
+            Some(admission.clone()),
+            None,
+            None,
         )
         .unwrap();
 
@@ -4097,6 +4118,67 @@ mod tests {
                 RuntimeSpineRunStep::ScanIncomplete { .. }
             ));
         }
+        assert_eq!(effect.calls.load(Ordering::SeqCst), 0);
+        assert_eq!(admission.calls.load(Ordering::SeqCst), 2);
+        assert_eq!(
+            admission.fail_closes.load(Ordering::SeqCst),
+            0,
+            "a successful typed pre-scan survives transient Incomplete inventory"
+        );
+
+        runner.shutdown().await.unwrap();
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn explicit_scanner_error_fail_closes_successful_pre_scan_admission() {
+        let snapshot = snapshot_with_network();
+        let app = Router::new().route(
+            cats_api::runtime_reconciliation::DESIRED_READ_PATH,
+            post(move || {
+                let snapshot = snapshot.clone();
+                async move { wire_response(StatusCode::OK, snapshot) }
+            }),
+        );
+        let (origin, server) = spawn(app).await;
+        let effect = Arc::new(CountingEffect {
+            calls: AtomicUsize::new(0),
+        });
+        let admission = Arc::new(TestPreScanAdmission {
+            calls: AtomicUsize::new(0),
+            fail_closes: AtomicUsize::new(0),
+            fail: AtomicBool::new(false),
+        });
+        let root = tempfile::tempdir().unwrap();
+        let mut runner = RuntimeSpineRunner::new_inner(
+            StateDirectory::unanchored(root.path().to_path_buf()),
+            decode_agent_session(SESSION).unwrap(),
+            RuntimeSpineHttpClient::for_loopback_test(&origin, signer()).unwrap(),
+            Arc::new(ErrorScanner),
+            Some(effect.clone()),
+            Some(admission.clone()),
+            None,
+            None,
+        )
+        .unwrap();
+
+        assert!(matches!(
+            runner
+                .run_once_until(Instant::now() + Duration::from_secs(5))
+                .await
+                .unwrap(),
+            RuntimeSpineRunStep::DesiredAccepted
+        ));
+        let RuntimeSpineRunStep::ScanUnavailable(error) = runner
+            .run_once_until(Instant::now() + Duration::from_secs(5))
+            .await
+            .unwrap()
+        else {
+            panic!("explicit scanner error did not remain typed")
+        };
+        assert!(error.to_string().contains("complete-source conflict"));
+        assert_eq!(admission.calls.load(Ordering::SeqCst), 1);
+        assert_eq!(admission.fail_closes.load(Ordering::SeqCst), 1);
         assert_eq!(effect.calls.load(Ordering::SeqCst), 0);
 
         runner.shutdown().await.unwrap();
@@ -4589,11 +4671,22 @@ mod tests {
         let state = StateDirectory::unanchored(root.path().to_path_buf());
         let registered = decode_agent_session(SESSION).unwrap();
         let client = RuntimeSpineHttpClient::for_loopback_test(&origin, signer()).unwrap();
-        let mut runner = RuntimeSpineRunner::new(
+        let admission = Arc::new(TestPreScanAdmission {
+            calls: AtomicUsize::new(0),
+            fail_closes: AtomicUsize::new(0),
+            fail: AtomicBool::new(false),
+        });
+        let mut runner = RuntimeSpineRunner::new_inner(
             state.clone(),
             registered.clone(),
             client.clone(),
             scanner.clone(),
+            Some(Arc::new(CountingEffect {
+                calls: AtomicUsize::new(0),
+            })),
+            Some(admission.clone()),
+            None,
+            None,
         )
         .unwrap();
         assert!(matches!(
@@ -4613,6 +4706,12 @@ mod tests {
         ));
         started_receiver.try_recv().unwrap();
         assert_eq!(scanner.calls.load(Ordering::SeqCst), 1);
+        assert_eq!(admission.calls.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            admission.fail_closes.load(Ordering::SeqCst),
+            0,
+            "a successful typed pre-scan survives scanner timeout"
+        );
         assert!(matches!(
             runner
                 .run_once_until(Instant::now() + Duration::from_secs(5))
