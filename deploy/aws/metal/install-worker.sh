@@ -175,6 +175,8 @@ install -o root -g root -m 0644 "$ROUTE_GRANT_PUBLIC_KEY_STAGE" \
 cats_worker_deployment_crash_probe after-install-route-key
 install -m 0755 "$CATS_REPO/target/release/cats-noded" "$CATS_PREFIX/bin/cats-noded"
 cats_worker_deployment_crash_probe after-install-cats-noded
+install -m 0755 "$CATS_REPO/target/release/cats-vmm-launcher" "$CATS_PREFIX/bin/cats-vmm-launcher"
+cats_worker_deployment_crash_probe after-install-cats-vmm-launcher
 install -m 0755 "$CATS_REPO/target/release/cats-blockd" "$CATS_PREFIX/bin/cats-blockd"
 cats_worker_deployment_crash_probe after-install-cats-blockd
 install -m 0755 "$CATS_REPO/target/release/cats-guest-agent" "$CATS_PREFIX/bin/cats-guest-agent"

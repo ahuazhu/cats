@@ -1012,6 +1012,7 @@ mod tests {
     fn ch_config(ip_bin: PathBuf) -> ChConfig {
         ChConfig {
             block_direct: false,
+            vmm_launcher_bin: "unused-vmm-launcher".into(),
             ch_bin: "unused-ch".into(),
             kernel: "unused-kernel".into(),
             initramfs: None,

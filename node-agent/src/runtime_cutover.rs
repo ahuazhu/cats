@@ -1032,6 +1032,7 @@ mod tests {
     fn test_ch_config() -> ChConfig {
         ChConfig {
             block_direct: false,
+            vmm_launcher_bin: "/opt/cats/bin/cats-vmm-launcher".into(),
             ch_bin: "/opt/cats/bin/cloud-hypervisor".into(),
             kernel: "/opt/cats/release/guest/vmlinuz".into(),
             initramfs: None,

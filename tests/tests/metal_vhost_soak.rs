@@ -389,6 +389,7 @@ impl Soak {
             },
             vmm: VmmMode::CloudHypervisor(ChConfig {
                 block_direct: false,
+                vmm_launcher_bin: PathBuf::from("/opt/cats/bin/cats-vmm-launcher"),
                 ch_bin: cfg.ch_bin.clone(),
                 kernel: cfg.kernel.clone(),
                 initramfs: Some(cfg.initramfs.clone()),

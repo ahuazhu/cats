@@ -106,6 +106,8 @@ struct Args {
     /// VMM mode: fake (host processes) or ch (Cloud Hypervisor, Linux+KVM).
     #[arg(long, default_value = "ch")]
     vmm: String,
+    #[arg(long, default_value = "/opt/cats/bin/cats-vmm-launcher")]
+    vmm_launcher_bin: PathBuf,
     #[arg(long, default_value = "/usr/local/bin/cloud-hypervisor")]
     ch_bin: PathBuf,
     /// Raw golden-root image written into fresh root volumes.
@@ -229,12 +231,17 @@ fn installed_ch_config(
         args.vmm == "ch",
         "the signed production Runtime supports only --vmm ch"
     );
+    anyhow::ensure!(
+        args.vmm_launcher_bin.is_absolute(),
+        "--vmm-launcher-bin must be an absolute installed path"
+    );
     let boot_contract = installed.boot_contract();
     let initramfs = boot_contract
         .initramfs()
         .map(|_| cats_api::runtime_artifacts::GUEST_INITRAMFS_PATH.into());
     Ok(ChConfig {
         block_direct: args.ch_block_direct,
+        vmm_launcher_bin: args.vmm_launcher_bin.clone(),
         ch_bin: args.ch_bin.clone(),
         kernel: cats_api::runtime_artifacts::GUEST_KERNEL_PATH.into(),
         initramfs,

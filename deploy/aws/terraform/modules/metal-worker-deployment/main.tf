@@ -212,6 +212,8 @@ locals {
     # the association only ever ran against hosts that had been set up by hand.
     install -D -m 0755 "$stage_path/cats-noded" "${var.install_root}/bin/cats-noded"
     cats_worker_deployment_crash_probe after-install-cats-noded
+    install -D -m 0755 "$stage_path/cats-vmm-launcher" "${var.install_root}/bin/cats-vmm-launcher"
+    cats_worker_deployment_crash_probe after-install-cats-vmm-launcher
     install -D -m 0755 "$stage_path/cats-blockd" "${var.install_root}/bin/cats-blockd"
     cats_worker_deployment_crash_probe after-install-cats-blockd
     install -D -m 0755 "$stage_path/cats-guest-agent" "${var.install_root}/bin/cats-guest-agent"

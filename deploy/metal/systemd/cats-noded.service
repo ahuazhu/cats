@@ -25,6 +25,7 @@ ExecStart=/opt/cats/bin/cats-noded \
   --guest-runtime-profile-receipt-file /opt/cats/release/guest-runtime-profile.v1.json \
   --blockd-bin /opt/cats/bin/cats-blockd \
   --guest-agent-bin /opt/cats/bin/cats-guest-agent \
+  --vmm-launcher-bin /opt/cats/bin/cats-vmm-launcher \
   --vmm ch \
   --ch-bin /usr/local/bin/cloud-hypervisor \
   --ch-seed-image /opt/cats/guest/rootfs.ext4 \

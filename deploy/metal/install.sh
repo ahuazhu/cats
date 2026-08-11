@@ -114,7 +114,7 @@ cats_worker_deployment_crash_probe after-installer-return
 echo "==> install binaries to $PREFIX/bin"
 install -d "$PREFIX/bin"
 cats_worker_deployment_crash_probe after-install-bin-directory
-for bin in cats cats-controld cats-noded cats-blockd cats-guest-agent; do
+for bin in cats cats-controld cats-noded cats-vmm-launcher cats-blockd cats-guest-agent; do
   install -m 0755 "$REPO/target/release/$bin" "$PREFIX/bin/$bin"
   cats_worker_deployment_crash_probe "after-install-$bin"
 done

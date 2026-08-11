@@ -889,6 +889,7 @@ mod teardown_tests {
             state_dir,
             VmmMode::CloudHypervisor(ChConfig {
                 block_direct: false,
+                vmm_launcher_bin: PathBuf::from("unused-vmm-launcher"),
                 ch_bin: PathBuf::from("unused-ch"),
                 kernel: PathBuf::from("unused-kernel"),
                 initramfs: None,

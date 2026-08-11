@@ -24,9 +24,11 @@ RUN cargo build --locked --release \
       -p cats-guest-agent \
     && strip \
       target/release/cats-noded \
+      target/release/cats-vmm-launcher \
       target/release/cats-blockd \
       target/release/cats-guest-agent \
     && install -D -m 0755 target/release/cats-noded /out/cats-noded \
+    && install -D -m 0755 target/release/cats-vmm-launcher /out/cats-vmm-launcher \
     && install -D -m 0755 target/release/cats-blockd /out/cats-blockd \
     && install -D -m 0755 target/release/cats-guest-agent /out/cats-guest-agent
 
@@ -41,6 +43,7 @@ COPY deploy/metal/guest-systemd /out/guest-systemd
 FROM scratch AS artifact
 
 COPY --from=builder /out/cats-noded /cats-noded
+COPY --from=builder /out/cats-vmm-launcher /cats-vmm-launcher
 COPY --from=builder /out/cats-blockd /cats-blockd
 COPY --from=builder /out/cats-guest-agent /cats-guest-agent
 COPY --from=builder /out/update-guest-seed.sh /update-guest-seed.sh

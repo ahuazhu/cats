@@ -53,7 +53,7 @@ while IFS= read -r process_line; do
   set -- $process_line
   [ "$#" -ge 2 ] || continue
   case "$2" in
-    "$runtime_bin_root/cats-blockd"|"$runtime_bin_root/cloud-hypervisor")
+    "$runtime_bin_root/cats-blockd"|"$runtime_bin_root/cats-vmm-launcher"|"$runtime_bin_root/cloud-hypervisor")
       runtime_pids="$runtime_pids $1(${2##*/})"
       ;;
   esac

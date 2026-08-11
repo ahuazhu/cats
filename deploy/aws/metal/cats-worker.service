@@ -28,6 +28,7 @@ ExecStart=/opt/cats/bin/cats-noded \
   --guest-runtime-profile-receipt-file /opt/cats/release/guest-runtime-profile.v1.json \
   --blockd-bin /opt/cats/bin/cats-blockd \
   --guest-agent-bin /opt/cats/bin/cats-guest-agent \
+  --vmm-launcher-bin /opt/cats/bin/cats-vmm-launcher \
   --metadata-store-adapter postgres \
   --metadata-store-option url-file=/run/cats/postgres-url \
   --metadata-store-option ca-file=/etc/cats/rds-ca.pem \

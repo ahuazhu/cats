@@ -85,6 +85,10 @@ pub struct ChConfig {
     /// cache. Only meaningful on [`BlockPath::KernelNbd`]; the vhost-user path
     /// never had a host-side cache to bypass.
     pub block_direct: bool,
+    /// Fixed launcher selected by the installed Node configuration. The
+    /// StartRuntime checkpoint records and hashes this exact executable; it is
+    /// never inferred from the Agent executable or from PATH.
+    pub vmm_launcher_bin: PathBuf,
     pub ch_bin: PathBuf,
     pub kernel: PathBuf,
     pub initramfs: Option<PathBuf>,
@@ -2375,6 +2379,7 @@ mod tests {
     fn probe_config(nbd_client_bin: PathBuf, nbd_devices: u32) -> ChConfig {
         ChConfig {
             block_direct: false,
+            vmm_launcher_bin: PathBuf::from("cats-vmm-launcher"),
             ch_bin: PathBuf::from("ch"),
             kernel: PathBuf::from("vmlinuz"),
             initramfs: None,
@@ -2546,6 +2551,7 @@ mod tests {
     fn queue_count_never_exceeds_the_cats_vcpus() {
         let mut cfg = ChConfig {
             block_direct: false,
+            vmm_launcher_bin: PathBuf::from("cats-vmm-launcher"),
             ch_bin: PathBuf::from("ch"),
             kernel: PathBuf::from("vmlinuz"),
             initramfs: None,
@@ -3240,6 +3246,7 @@ exit 0\n",
         prepare_memory_backing(&memory_file, 256).unwrap();
         let cfg = ChConfig {
             block_direct: false,
+            vmm_launcher_bin: dir.path().join("cats-vmm-launcher"),
             ch_bin: fake_ch,
             kernel,
             initramfs: None,

@@ -57,6 +57,7 @@ fn deployment_units_take_the_pinned_guest_cmdline_only_from_the_shared_receipt()
         assert!(text.contains(
             "--guest-runtime-profile-receipt-file /opt/cats/release/guest-runtime-profile.v1.json"
         ));
+        assert!(text.contains("--vmm-launcher-bin /opt/cats/bin/cats-vmm-launcher"));
         let recovery = text
             .find("ExecStartPre=/opt/cats/bin/install-guest-runtime-release startup-recover")
             .expect("service restart recovery gate");
@@ -472,6 +473,7 @@ fn production_worker_bundle_updates_an_idle_guest_seed_before_restart() {
         );
     }
     for required in [
+        "COPY --from=builder /out/cats-vmm-launcher /cats-vmm-launcher",
         "COPY deploy/aws/metal/update-guest-seed.sh /out/update-guest-seed.sh",
         "COPY deploy/aws/metal/require-idle-worker.sh /out/require-idle-worker.sh",
         "COPY deploy/metal/guest-systemd /out/guest-systemd",
@@ -495,6 +497,9 @@ fn production_worker_bundle_updates_an_idle_guest_seed_before_restart() {
     let first_install = deployment
         .find("install -D -m 0755 \"$stage_path/cats-noded\"")
         .expect("worker deployment installs cats-noded");
+    let launcher_install = deployment
+        .find("install -D -m 0755 \"$stage_path/cats-vmm-launcher\"")
+        .expect("worker deployment installs the fixed VMM launcher");
     let release_verify = deployment
         .find("install-guest-runtime-release.sh\" verify")
         .expect("worker deployment verifies the shared Guest release");
@@ -536,7 +541,8 @@ fn production_worker_bundle_updates_an_idle_guest_seed_before_restart() {
             && locked_idle_guard < stop
             && stop < prepare
             && prepare < first_install
-            && first_install < update
+            && first_install < launcher_install
+            && launcher_install < update
             && deployment[update..start].contains("\"${var.install_root}/bin/update-guest-seed\""),
         "worker must verify and guard the drain, stop, then replace release bytes before start"
     );
@@ -1907,13 +1913,14 @@ fn worker_release_refuses_live_runtime_binaries_outside_metering_cgroups() {
     let bin_root = temp.path().join("bin");
     std::fs::create_dir_all(&bin_root).expect("create bin fixture");
 
-    // A cats-blockd is not metered, so it lives outside every metering cgroup;
-    // and the VMM's name is 16 characters, one past the kernel's 15-character
-    // comm, so comm-based matching (`pgrep cloud-hypervisor`) never sees it.
-    // The guard must catch both by their full argv[0] path (issue #98).
+    // cats-blockd and the short-lived launcher may be outside the metering
+    // cgroup, while the VMM's name is longer than Linux comm. The guard must
+    // catch all of them by their full argv[0] path (issue #98).
     let blockd_bin = bin_root.join("cats-blockd");
+    let launcher_bin = bin_root.join("cats-vmm-launcher");
     let vmm_bin = bin_root.join("cloud-hypervisor");
     std::os::unix::fs::symlink("/bin/sleep", &blockd_bin).expect("stage fake blockd");
+    std::os::unix::fs::symlink("/bin/sleep", &launcher_bin).expect("stage fake launcher");
     std::os::unix::fs::symlink("/bin/sleep", &vmm_bin).expect("stage fake vmm");
     let mut children = RuntimeChildren(Vec::new());
     children.0.push(
@@ -1923,15 +1930,26 @@ fn worker_release_refuses_live_runtime_binaries_outside_metering_cgroups() {
             .expect("spawn fake blockd"),
     );
     children.0.push(
+        std::process::Command::new(&launcher_bin)
+            .arg("300")
+            .spawn()
+            .expect("spawn fake launcher"),
+    );
+    children.0.push(
         std::process::Command::new(&vmm_bin)
             .arg("300")
             .spawn()
             .expect("spawn fake vmm"),
     );
     let blockd_pid = children.0[0].id();
-    let vmm_pid = children.0[1].id();
-    wait_until_process_table_has(&[(blockd_pid, &blockd_bin), (vmm_pid, &vmm_bin)])
-        .expect("runtime fixtures must be visible before exercising the guard");
+    let launcher_pid = children.0[1].id();
+    let vmm_pid = children.0[2].id();
+    wait_until_process_table_has(&[
+        (blockd_pid, &blockd_bin),
+        (launcher_pid, &launcher_bin),
+        (vmm_pid, &vmm_bin),
+    ])
+    .expect("runtime fixtures must be visible before exercising the guard");
 
     let guard = workspace_root().join("deploy/aws/metal/require-idle-worker.sh");
     let refused = std::process::Command::new(&guard)
@@ -1947,9 +1965,10 @@ fn worker_release_refuses_live_runtime_binaries_outside_metering_cgroups() {
     let stderr = String::from_utf8_lossy(&refused.stderr);
     assert!(
         stderr.contains(&format!("{blockd_pid}(cats-blockd)"))
+            && stderr.contains(&format!("{launcher_pid}(cats-vmm-launcher)"))
             && stderr.contains(&format!("{vmm_pid}(cloud-hypervisor)"))
             && stderr.contains("unpublished writes"),
-        "guard must name both runtime pids and the journal hazard: {stderr}"
+        "guard must name all runtime pids and the journal hazard: {stderr}"
     );
 
     for installer_path in [
