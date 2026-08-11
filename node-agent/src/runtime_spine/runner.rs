@@ -84,7 +84,16 @@ pub(crate) trait RuntimePreScanAdmission: Send + Sync + 'static {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum RuntimePreScanRecoveryOutcome {
     NoChange,
-    Recovered { cat_id: Id },
+    Recovered {
+        cat_id: Id,
+    },
+    /// Fresh signed authority evidence proved that the persisted one-shot
+    /// intent has already been closed by a successor which cannot be encoded
+    /// safely in the public inventory. No local writer was recovered; the
+    /// retained Desired must be invalidated before any scan/effect retry.
+    ReplanDesired {
+        cat_id: Id,
+    },
 }
 
 /// Executes one bounded, typed reconciliation unit for an exact fresh Desired
@@ -338,6 +347,10 @@ impl RuntimePreScanRecoveryContext {
 
     pub(crate) fn coordinates(&self) -> &RuntimeSpineFullScan {
         &self.coordinates
+    }
+
+    pub(crate) fn deadline(&self) -> Instant {
+        self.deadline
     }
 
     pub(crate) fn check_active(&self) -> anyhow::Result<()> {
@@ -2259,6 +2272,15 @@ impl RuntimeSpineRunner {
                         RecoveryWait::Finished(Ok(RuntimePreScanRecoveryOutcome::Recovered {
                             cat_id,
                         })) => return Ok(RuntimeSpineRunStep::PreScanRecovered { cat_id }),
+                        RecoveryWait::Finished(Ok(
+                            RuntimePreScanRecoveryOutcome::ReplanDesired { cat_id },
+                        )) => {
+                            self.clear_effect_batch();
+                            self.journal_lane()?
+                                .invalidate_desired_after_effect_replan()
+                                .await?;
+                            return Ok(RuntimeSpineRunStep::EffectReplanDesired { cat_id });
+                        }
                         RecoveryWait::Finished(Ok(RuntimePreScanRecoveryOutcome::NoChange)) => {}
                         RecoveryWait::Finished(Err(error)) => {
                             return Ok(RuntimeSpineRunStep::PreScanRecoveryUnavailable(error));
@@ -3018,6 +3040,11 @@ mod tests {
         fail: AtomicBool,
     }
 
+    struct ReplanRecovery {
+        calls: AtomicUsize,
+        cat_id: Id,
+    }
+
     struct TestEffectResourceOwner {
         pending: AtomicBool,
         polls: AtomicUsize,
@@ -3123,6 +3150,19 @@ mod tests {
 
         fn fail_close_all(&self) {
             self.fail_closes.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+
+    impl RuntimePreScanRecovery for ReplanRecovery {
+        fn recover_one(
+            &self,
+            context: RuntimePreScanRecoveryContext,
+        ) -> anyhow::Result<RuntimePreScanRecoveryOutcome> {
+            context.check_active()?;
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            Ok(RuntimePreScanRecoveryOutcome::ReplanDesired {
+                cat_id: self.cat_id.clone(),
+            })
         }
     }
 
@@ -4410,6 +4450,72 @@ mod tests {
             panic!("replan must durably advance to a fresh Desired read")
         };
         assert_eq!(next.value().request_sequence.get(), 3);
+    }
+
+    #[tokio::test]
+    async fn pre_scan_replan_invalidates_desired_before_scanner_or_effect() {
+        let root = tempfile::tempdir().unwrap();
+        let state = StateDirectory::unanchored(root.path().to_path_buf());
+        let registered = decode_agent_session(SESSION).unwrap();
+        {
+            let mut journal =
+                RuntimeSpineJournal::open_for_test(&state, registered.clone()).unwrap();
+            assert!(matches!(
+                journal.desired_work().unwrap(),
+                RuntimeSpineDesiredWork::Request(_)
+            ));
+            let mut snapshot = decode_desired_read_snapshot(SNAPSHOT).unwrap();
+            snapshot.desired_specs = vec![desired_with_network()];
+            let bytes = encode_desired_read_snapshot(&snapshot).unwrap();
+            journal.accept_desired(snapshot, &bytes).unwrap();
+        }
+
+        let scanner = Arc::new(EmptyScanner {
+            calls: AtomicUsize::new(0),
+        });
+        let effect = Arc::new(CountingEffect {
+            calls: AtomicUsize::new(0),
+        });
+        let recovery = Arc::new(ReplanRecovery {
+            calls: AtomicUsize::new(0),
+            cat_id: Id::new("cat_closed_takeover").unwrap(),
+        });
+        let recovery_port: Arc<dyn RuntimePreScanRecovery> = recovery.clone();
+        let mut runner = RuntimeSpineRunner::new_inner(
+            state.clone(),
+            registered.clone(),
+            RuntimeSpineHttpClient::for_loopback_test("http://127.0.0.1:1/", signer()).unwrap(),
+            scanner.clone(),
+            Some(effect.clone()),
+            Some(recovery_port),
+            None,
+        )
+        .unwrap();
+        // Model stale process-local admission left by the preceding loop. The
+        // pre-scan proof must discard it before invalidating the old Desired.
+        runner.effect_admission_open = true;
+
+        assert!(matches!(
+            runner
+                .run_once_until(Instant::now() + Duration::from_secs(5))
+                .await
+                .unwrap(),
+            RuntimeSpineRunStep::EffectReplanDesired { cat_id }
+                if cat_id == Id::new("cat_closed_takeover").unwrap()
+        ));
+        assert_eq!(recovery.calls.load(Ordering::SeqCst), 1);
+        assert_eq!(scanner.calls.load(Ordering::SeqCst), 0);
+        assert_eq!(effect.calls.load(Ordering::SeqCst), 0);
+        assert!(runner.pending_effects.is_empty());
+        assert!(runner.effect_admission.is_none());
+        assert!(!runner.effect_admission_open);
+        runner.shutdown().await.unwrap();
+
+        let mut recovered = RuntimeSpineJournal::open_for_test(&state, registered).unwrap();
+        let RuntimeSpineDesiredWork::Request(next) = recovered.desired_work().unwrap() else {
+            panic!("pre-scan replan must durably advance to a fresh Desired read")
+        };
+        assert_eq!(next.value().request_sequence.get(), 2);
     }
 
     #[tokio::test]
