@@ -61,7 +61,7 @@ use super::vmm_process::VmmProcessGlobalPort;
 use super::vmm_start_runtime_effect::{StartRuntimePhysicalEffect, StartRuntimeReservationEffect};
 use super::{
     ensure_root_provision_process_from_persisted_checkpoint, AuthorizedBlockdStore,
-    FileCheckpointStore, PlatformRootProvisionProcessIdentityPort,
+    FileCheckpointStore, PersistentFilesystemEffect, PlatformRootProvisionProcessIdentityPort,
     PlatformSystemdRootProvisionProcessPort, RootProvisionProcessConflict,
     RootProvisionProcessInspection, RootProvisionProcessOutcome, RootProvisionProcessPort,
     RootProvisionProcessRetirementPort, RootProvisionProcessStop, RootProvisionResponseHint,
@@ -151,6 +151,7 @@ pub(crate) struct SignedRunningEffect {
     kernel_nbd_attach: Option<KernelNbdAttachEffect>,
     prepare_network: Option<Arc<PrepareNetworkReservationEffect>>,
     start_runtime: Option<StartRuntimeReservationEffect>,
+    persistent_filesystem: Option<PersistentFilesystemEffect>,
     physical_start_runtime: Option<StartRuntimePhysicalEffect>,
 }
 
@@ -259,7 +260,7 @@ impl SignedRunningEffect {
             Arc::clone(&authority),
             Arc::clone(&process_ports.serving_global),
         )?);
-        let running_launch_authority = RunningLaunchAuthorityRevalidator::platform_parts(
+        let running_launch_authority = Arc::new(RunningLaunchAuthorityRevalidator::platform_parts(
             state_directory.clone(),
             systemd.clone(),
             Arc::clone(&prepare_network),
@@ -267,10 +268,15 @@ impl SignedRunningEffect {
             Arc::clone(&process_ports.serving_global),
             Arc::clone(&process_ports.vmm_global),
             kernel_nbd_inventory.clone(),
+        ));
+        let persistent_filesystem = PersistentFilesystemEffect::platform(
+            Arc::clone(&authority),
+            acquire.volume_transition_port(),
+            Arc::clone(&running_launch_authority),
         );
         let running_admission = RunningAdmissionEffect::with_launch_authority(
             admission_registry,
-            running_launch_authority,
+            Arc::clone(&running_launch_authority),
         );
         let start_runtime = StartRuntimeReservationEffect::platform(
             state_directory.clone(),
@@ -312,6 +318,7 @@ impl SignedRunningEffect {
             kernel_nbd_attach,
             prepare_network: Some(prepare_network),
             start_runtime: Some(start_runtime),
+            persistent_filesystem: Some(persistent_filesystem),
             physical_start_runtime: Some(physical_start_runtime),
         })
     }
@@ -350,6 +357,11 @@ impl RuntimeDesiredEffect for SignedRunningEffect {
         }
         if let Some(start_runtime) = &self.start_runtime {
             if let Some(outcome) = start_runtime.try_apply(&context, desired)? {
+                return Ok(outcome);
+            }
+        }
+        if let Some(persistent_filesystem) = &self.persistent_filesystem {
+            if let Some(outcome) = persistent_filesystem.try_apply(&context, desired)? {
                 return Ok(outcome);
             }
         }
@@ -2419,6 +2431,7 @@ mod tests {
                 kernel_nbd_attach: None,
                 prepare_network: None,
                 start_runtime: None,
+                persistent_filesystem: None,
                 physical_start_runtime: None,
             }
         }

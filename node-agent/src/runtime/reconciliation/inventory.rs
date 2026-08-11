@@ -19,8 +19,7 @@ use cats_api::runtime_reconciliation::{
     DesiredRuntimeSpec, GuestTransportEvidence, HostPath, Id, InventorySource, LifecycleAdmission,
     LocalLineageState, LocalVolumeLineage, ObservedDevice, ObservedRuntimeStatus, ObservedVolume,
     ProcessEvidence, ProgressingReason, ReconcileStep, RequireIdleCheckpoint, RuntimeCheckpoint,
-    RuntimeLaunch, RuntimeTarget, UnixMillis, VolumeAuthorityEvidence, WarmSnapshotEvidence,
-    WireU64,
+    RuntimeTarget, UnixMillis, VolumeAuthorityEvidence, WarmSnapshotEvidence, WireU64,
 };
 use cats_storage::{
     authority::{

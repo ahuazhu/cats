@@ -356,10 +356,8 @@ impl ServingBlockdExpectation {
         Ok(self)
     }
 
-    fn status_is_exact(&self, status: &DurabilityStatus) -> bool {
-        let remote_generation = i64::try_from(self.expected_remote_head.generation.get())
-            .ok()
-            .unwrap_or(-1);
+    fn status_is_exact_at_head(&self, status: &DurabilityStatus, head: &RemoteHead) -> bool {
+        let remote_generation = i64::try_from(head.generation.get()).ok().unwrap_or(-1);
         let generation_gap = status
             .local_durable_generation
             .checked_sub(status.remote_durable_generation);
@@ -369,7 +367,7 @@ impl ServingBlockdExpectation {
             &self.unit_id,
             &self.process_identity_token,
             &self.device_ownership_token,
-            &self.expected_remote_head,
+            head,
         ) && status.remote_durable_generation == remote_generation
             && generation_gap.is_some_and(|gap| {
                 gap >= 0
@@ -380,6 +378,10 @@ impl ServingBlockdExpectation {
                         != cats_api::runtime_reconciliation::Durability::Strict
                         || gap == 0)
             })
+    }
+
+    fn status_is_exact(&self, status: &DurabilityStatus) -> bool {
+        self.status_is_exact_at_head(status, &self.expected_remote_head)
     }
 
     pub(crate) fn cat_id(&self) -> &Id {
@@ -780,6 +782,30 @@ impl ExactServingBlockdProcessProof {
 
     pub(crate) fn durability_status(&self) -> &DurabilityStatus {
         self.evidence.durability_status()
+    }
+
+    /// Validate a fresh control-socket status after this exact process has
+    /// advanced the same fenced attachment. The supplied head must come from
+    /// an independent current Volume authority read; the status payload never
+    /// self-authorizes its own remote head.
+    pub(crate) fn validates_status_at_head(
+        &self,
+        status: &DurabilityStatus,
+        head: &RemoteHead,
+    ) -> bool {
+        self.expectation.status_is_exact_at_head(status, head)
+    }
+
+    pub(crate) fn validates_fully_drained_status_at_head(
+        &self,
+        status: &DurabilityStatus,
+        head: &RemoteHead,
+    ) -> bool {
+        self.validates_status_at_head(status, head)
+            && status.local_durable_generation == status.remote_durable_generation
+            && status.unpublished_generations == 0
+            && status.unpublished_bytes == 0
+            && status.oldest_unpublished_age_ms == 0
     }
 
     pub(crate) fn matches_public_process(&self, process: &ProcessEvidence) -> bool {

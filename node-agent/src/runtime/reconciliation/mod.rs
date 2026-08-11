@@ -36,6 +36,7 @@ mod inventory;
 mod kernel_nbd;
 mod network;
 mod normal_acquire;
+mod persistent_filesystem;
 mod prepare_device_retirement;
 mod retained_runtime_launch;
 mod root_provision;
@@ -172,6 +173,7 @@ pub use normal_acquire::{
     RuntimeVolumeTransitionHttpClient, SignedVolumeTransitionResponse,
     VolumeTransitionTransportFailure,
 };
+pub(crate) use persistent_filesystem::PersistentFilesystemEffect;
 pub(crate) use root_provision::PlatformRootProvisionProcessIdentityPort;
 pub use root_provision::{
     AuthorityRereadRequired, RootProvisionClientError, RootProvisionControlPort,

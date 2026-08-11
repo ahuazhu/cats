@@ -499,7 +499,7 @@ impl RunningTailReadyAdmission {
 pub(crate) struct RunningAdmissionEffect {
     registry: Arc<AdmissionCellRegistry>,
     guest_ready: Arc<dyn GuestReadyTransportPort>,
-    launch_authority: Option<RunningLaunchAuthorityRevalidator>,
+    launch_authority: Option<Arc<RunningLaunchAuthorityRevalidator>>,
     #[cfg(test)]
     after_registry: Option<AfterRegistryHook>,
 }
@@ -518,7 +518,7 @@ impl RunningAdmissionEffect {
 
     pub(crate) fn with_launch_authority(
         registry: Arc<AdmissionCellRegistry>,
-        launch_authority: RunningLaunchAuthorityRevalidator,
+        launch_authority: Arc<RunningLaunchAuthorityRevalidator>,
     ) -> Self {
         Self {
             registry,
@@ -573,7 +573,7 @@ impl RunningAdmissionEffect {
         // themselves.
         ready.revalidate_physical(
             self.guest_ready.as_ref(),
-            self.launch_authority.as_ref(),
+            self.launch_authority.as_deref(),
             context,
             desired,
             session.checkpoint_store(),

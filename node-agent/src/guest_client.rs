@@ -211,12 +211,32 @@ impl GuestClient {
         &mut self,
         request: FilesystemControlRequestV1,
     ) -> Result<FilesystemControlResponseV1> {
-        request
-            .validate()
-            .context("validate filesystem control request before send")?;
         let timeout = Duration::from_millis(u64::from(request.timeout_ms))
             .checked_add(Duration::from_secs(5))
             .context("filesystem control socket timeout overflow")?;
+        self.filesystem_control_bounded(request, timeout)
+    }
+
+    /// Apply an outer Host deadline to one filesystem operation. The Guest's
+    /// own timeout remains in the canonical request, while this independent
+    /// socket bound prevents transport slack from exceeding the reconciler's
+    /// accepted-effect deadline.
+    pub(crate) fn filesystem_control_bounded(
+        &mut self,
+        request: FilesystemControlRequestV1,
+        transport_timeout: Duration,
+    ) -> Result<FilesystemControlResponseV1> {
+        request
+            .validate()
+            .context("validate filesystem control request before send")?;
+        anyhow::ensure!(
+            !transport_timeout.is_zero(),
+            "filesystem control transport timeout is zero"
+        );
+        let operation_timeout = Duration::from_millis(u64::from(request.timeout_ms))
+            .checked_add(Duration::from_secs(5))
+            .context("filesystem control socket timeout overflow")?;
+        let timeout = transport_timeout.min(operation_timeout);
         self.stream.set_read_timeout(Some(timeout))?;
         self.stream.set_write_timeout(Some(timeout))?;
         let id = self.next_id;
@@ -244,6 +264,12 @@ impl GuestClient {
             GuestResponseBody::Error { message } => bail!("guest error: {message}"),
             other => bail!("unexpected filesystem control response: {other:?}"),
         }
+    }
+
+    pub(crate) fn try_clone_transport(&self) -> Result<UnixStream> {
+        self.stream
+            .try_clone()
+            .context("clone Guest control transport")
     }
 
     pub fn hybrid_assigned_port(&self) -> Option<u32> {
