@@ -2872,6 +2872,7 @@ mod tests {
             desired_revision: Revision::new(5).unwrap(),
             spec_digest: digest('f'),
             runtime_incarnation: None,
+            runtime_launch: cats_api::runtime_reconciliation::RuntimeLaunch::Absent,
             stable_state: None,
             step,
             processes: Vec::new(),

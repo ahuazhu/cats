@@ -4560,6 +4560,7 @@ mod tests {
                 spec_digest: checkpoint.spec_digest.clone(),
                 placement_epoch: checkpoint.placement_epoch,
                 runtime_incarnation: checkpoint.runtime_incarnation.clone(),
+                runtime_launch: Box::new(checkpoint.runtime_launch.clone()),
                 stable_state: checkpoint.stable_state,
                 step: Box::new(checkpoint.step.clone()),
                 require_idle: Box::new(checkpoint.require_idle.clone()),
@@ -5547,6 +5548,7 @@ mod tests {
             desired_revision,
             spec_digest: desired.spec_digest.clone(),
             runtime_incarnation: None,
+            runtime_launch: cats_api::runtime_reconciliation::RuntimeLaunch::Absent,
             stable_state: None,
             step: ReconcileStep::ProvisionRootImage {
                 provision_transition_id: provision_transition_id.clone(),

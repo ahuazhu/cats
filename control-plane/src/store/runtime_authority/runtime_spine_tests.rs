@@ -12,24 +12,25 @@ use cats_api::route_grant_v2::{
     ROUTE_RESOLVE_V2_PATH, ROUTE_V2_JSON_CONTENT_TYPE,
 };
 use cats_api::runtime_reconciliation::{
-    decode_operation, encode_admission_inventory_attestation, encode_agent_session,
-    encode_desired_read_snapshot, encode_node_observation, guest_config_digest, inventory_digest,
-    key_ring_digest, spec_digest, AgentRegistrationAttempt, AgentSession, AllocatableMemoryBytes,
-    AllocatableVcpus, AppliedDesiredEvidence, AsciiText, AssignedKind, AssignedPlacement,
-    BlockedReason, CheckpointEvidence, Condition, ContractErrorDetail, ContractVersion,
-    ControlHandshakeEvidence, CredentialBinding, DesiredRuntimeSpec, EndpointIntent, Epoch,
-    GuestBootId, GuestIpv4Pool, GuestIpv4PoolKind, GuestRuntimeProfileReceipt,
-    GuestTransportEvidence, HostPath, Hostname, HttpProtocol, Id, InventorySource, Ipv4Address,
-    IsolatedIpv4Kind, KeyId, LifecycleAdmission, MacAddress, NetworkConfig, NodeBootId,
-    NodeIdentity, NodeIdentityState, NodeObservation, NodePlacementPolicy, NodeTransportTarget,
-    ObservationInventoryAcceptance, ObservedNetwork, ObservedRouteGate, ObservedRuntimeStatus,
-    ObservedVmShape, Operation, OperationFailure, OperationPhase, OperationTerminal,
-    OwnershipTokenEvidence, PlacementRejectionReason, PreconditionFailureReason, ProcessEvidence,
-    ProcessRole, ProcessState, QuarantineReason, RandomId128, ReadyReason, ReconcileStep, Revision,
-    RouteGateBinding, RouteGateState, RuntimeConfig, RuntimePlacementBlockFrontend,
-    RuntimePlacementCapabilities, RuntimePlacementGuestNetwork, RuntimePlacementGuestTransport,
-    RuntimePlacementVmm, RuntimeSchedulingState, RuntimeTarget, RuntimeTransition, Sequence,
-    SessionBinding, Sha256Digest, StableState, UnixMillis, WarmSnapshotEvidence, WireU64,
+    decode_operation, decode_runtime_checkpoint, encode_admission_inventory_attestation,
+    encode_agent_session, encode_desired_read_snapshot, encode_node_observation,
+    guest_config_digest, inventory_digest, key_ring_digest, spec_digest, AgentRegistrationAttempt,
+    AgentSession, AllocatableMemoryBytes, AllocatableVcpus, AppliedDesiredEvidence, AsciiText,
+    AssignedKind, AssignedPlacement, BlockedReason, CheckpointEvidence, Condition,
+    ContractErrorDetail, ContractVersion, ControlHandshakeEvidence, CredentialBinding,
+    DesiredRuntimeSpec, EndpointIntent, Epoch, GuestBootId, GuestIpv4Pool, GuestIpv4PoolKind,
+    GuestRuntimeProfileReceipt, GuestTransportEvidence, HostPath, Hostname, HttpProtocol, Id,
+    InventorySource, Ipv4Address, IsolatedIpv4Kind, KeyId, LifecycleAdmission, MacAddress,
+    NetworkConfig, NodeBootId, NodeIdentity, NodeIdentityState, NodeObservation,
+    NodePlacementPolicy, NodeTransportTarget, ObservationInventoryAcceptance, ObservedNetwork,
+    ObservedRouteGate, ObservedRuntimeStatus, ObservedVmShape, Operation, OperationFailure,
+    OperationPhase, OperationTerminal, OwnershipTokenEvidence, PlacementRejectionReason,
+    PreconditionFailureReason, ProcessEvidence, ProcessRole, ProcessState, QuarantineReason,
+    RandomId128, ReadyReason, ReconcileStep, Revision, RouteGateBinding, RouteGateState,
+    RuntimeConfig, RuntimeLaunch, RuntimePlacementBlockFrontend, RuntimePlacementCapabilities,
+    RuntimePlacementGuestNetwork, RuntimePlacementGuestTransport, RuntimePlacementVmm,
+    RuntimeSchedulingState, RuntimeTarget, RuntimeTransition, Sequence, SessionBinding,
+    Sha256Digest, StableState, UnixMillis, WarmSnapshotEvidence, WireU64,
 };
 
 use super::placement_policy::insert_policy_on_store_for_test;
@@ -54,6 +55,21 @@ fn id(value: impl Into<String>) -> Id {
 
 fn random(value: u128) -> RandomId128 {
     RandomId128::new(format!("{value:032x}")).unwrap()
+}
+
+fn runtime_launch(runtime_incarnation: &RandomId128) -> RuntimeLaunch {
+    let mut launch = decode_runtime_checkpoint(include_bytes!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../testdata/runtime-reconciliation-v1-start-runtime-checkpoint.json"
+    )))
+    .unwrap()
+    .runtime_launch;
+    let RuntimeLaunch::Present(identity) = &mut launch else {
+        unreachable!("fixed StartRuntime checkpoint retains its launch identity")
+    };
+    identity.runtime_incarnation = runtime_incarnation.clone();
+    identity.scope_id = id(format!("cats-vmm-{}.service", runtime_incarnation.as_str()));
+    launch
 }
 
 fn boot(value: u128) -> NodeBootId {
@@ -621,7 +637,8 @@ fn settlement_runtime(
             desired_revision: desired.desired_revision,
             spec_digest: desired.spec_digest.clone(),
             placement_epoch: desired.placement.placement_epoch,
-            runtime_incarnation: Some(runtime_incarnation),
+            runtime_incarnation: Some(runtime_incarnation.clone()),
+            runtime_launch: Box::new(runtime_launch(&runtime_incarnation)),
             stable_state: Some(StableState::Running),
             step: Box::new(step),
             require_idle: Box::new(
@@ -2868,6 +2885,7 @@ fn route_ready_runtime(desired: &DesiredRuntimeSpec) -> ObservedRuntimeStatus {
             spec_digest: desired.spec_digest.clone(),
             placement_epoch: desired.placement.placement_epoch,
             runtime_incarnation: Some(incarnation.clone()),
+            runtime_launch: Box::new(runtime_launch(&incarnation)),
             stable_state: Some(StableState::Running),
             step: Box::new(step),
             require_idle: Box::new(

@@ -8,7 +8,8 @@
 use anyhow::{Context as _, Result};
 use cats_api::runtime_reconciliation::{
     encode_runtime_checkpoint, DesiredRuntimeSpec, Id, ObservedNetwork, RandomId128, ReconcileStep,
-    RuntimeCheckpoint, RuntimeLaunchArtifact, RuntimeTarget, UnixMillis, VmmBootProvenance,
+    RuntimeCheckpoint, RuntimeLaunch, RuntimeLaunchArtifact, RuntimeTarget, UnixMillis,
+    VmmBootProvenance,
 };
 
 use super::{ManagedVmmLaunchFilePaths, ManagedVmmSocketPaths};
@@ -44,7 +45,8 @@ pub(crate) fn build_start_runtime_successor(
             && predecessor.placement_epoch == desired.placement.placement_epoch
             && predecessor.desired_revision == desired.desired_revision
             && predecessor.spec_digest == desired.spec_digest
-            && predecessor.runtime_incarnation.is_none(),
+            && predecessor.runtime_incarnation.is_none()
+            && matches!(&predecessor.runtime_launch, RuntimeLaunch::Absent),
         "StartRuntime predecessor is not current-exact for Desired"
     );
     anyhow::ensure!(
@@ -83,6 +85,12 @@ pub(crate) fn build_start_runtime_successor(
         network: Box::new(network.clone()),
         devices: devices.clone(),
     };
+    successor.runtime_launch = RuntimeLaunch::Present(Box::new(
+        successor
+            .step
+            .start_runtime_launch_identity()
+            .context("constructed StartRuntime step lost its launch identity")?,
+    ));
     successor.updated_at_unix_ms = updated_at_unix_ms;
     encode_runtime_checkpoint(&successor)
         .context("constructed StartRuntime checkpoint is not canonical V1")?;
@@ -160,6 +168,15 @@ mod tests {
         let desired = decode_desired_runtime_spec(DESIRED).unwrap();
         let successor = build(&predecessor, &desired, random('6')).unwrap();
         assert_eq!(
+            successor.runtime_launch,
+            RuntimeLaunch::Present(Box::new(
+                successor
+                    .step
+                    .start_runtime_launch_identity()
+                    .expect("StartRuntime successor launch identity"),
+            )),
+        );
+        assert_eq!(
             successor.runtime_incarnation.as_ref().unwrap().as_str(),
             "55555555555555555555555555555555"
         );
@@ -214,6 +231,12 @@ mod tests {
         wrong_revision.desired_revision =
             cats_api::runtime_reconciliation::Revision::new(8).unwrap();
         assert!(build(&predecessor, &wrong_revision, random('6')).is_err());
+
+        let mut already_launched = predecessor.clone();
+        already_launched.runtime_launch = decode_runtime_checkpoint(START_RUNTIME)
+            .unwrap()
+            .runtime_launch;
+        assert!(build(&already_launched, &desired, random('6')).is_err());
 
         let ReconcileStep::PrepareNetwork { network, .. } = &predecessor.step else {
             unreachable!()

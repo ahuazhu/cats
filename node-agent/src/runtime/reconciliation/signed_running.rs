@@ -19,7 +19,7 @@ use cats_api::runtime_reconciliation::{
     LastVolumeTransition, LifecycleAdmission, LocalLineageState, LocalVolumeLineage,
     NormalAcquireRequest, ObservedDiskKind, ObservedRuntimeStatus, ObservedVolume,
     ProgressingReason, RandomId128, ReconcileStep, RemoteHead, RequireIdleCheckpoint,
-    RuntimeCheckpoint, RuntimeTarget, RuntimeTransition, RuntimeVolumeTransition,
+    RuntimeCheckpoint, RuntimeLaunch, RuntimeTarget, RuntimeTransition, RuntimeVolumeTransition,
     RuntimeVolumeTransitionRequest, SessionBinding, Sha256Digest, UnixMillis, VolumeAccess,
     VolumeAcquire, VolumeAcquireRequest, VolumeAdminState, VolumeAuthorityEvidence,
     VolumeDisposition, VolumeIntent, VolumeRecord, VolumeReleaseReplay, WarmSnapshotEvidence,
@@ -1460,6 +1460,7 @@ impl SignedRunningAcquireEffect {
             desired_revision: desired.desired_revision,
             spec_digest: desired.spec_digest.clone(),
             runtime_incarnation: None,
+            runtime_launch: RuntimeLaunch::Absent,
             stable_state: None,
             step: ReconcileStep::ProvisionRootImage {
                 provision_transition_id: random_id(),
@@ -2175,6 +2176,7 @@ fn closed_checkpoint(
         desired_revision: desired.desired_revision,
         spec_digest: desired.spec_digest.clone(),
         runtime_incarnation: None,
+        runtime_launch: RuntimeLaunch::Absent,
         stable_state: None,
         step,
         processes: Vec::new(),
@@ -2667,6 +2669,7 @@ pub(super) fn acquire_checkpoint(
         desired_revision: desired.desired_revision,
         spec_digest: desired.spec_digest.clone(),
         runtime_incarnation: None,
+        runtime_launch: RuntimeLaunch::Absent,
         stable_state: None,
         step: ReconcileStep::AcquireVolume { request },
         processes: Vec::new(),
@@ -3284,7 +3287,7 @@ mod tests {
                 .unwrap();
         assert_eq!(
             checkpoint_content_digest(&checkpoint).unwrap().as_str(),
-            "sha256:84fd43db1740c036fa869eda7be65826748df181aa9ac098c85eaa968e43aa1d"
+            "sha256:f1df3e1cfe83fdd0b4a4a5ead32f1ba71533cddbb38e2dc354e0a277a92addcb"
         );
         let (expected_blank_head, expected_provisioned_head) = match &checkpoint.step {
             ReconcileStep::ProvisionRootImage {
@@ -6021,6 +6024,7 @@ mod tests {
                     spec_digest: stored.spec_digest.clone(),
                     placement_epoch: stored.placement_epoch,
                     runtime_incarnation: stored.runtime_incarnation.clone(),
+                    runtime_launch: Box::new(stored.runtime_launch.clone()),
                     stable_state: stored.stable_state,
                     step: Box::new(stored.step.clone()),
                     require_idle: Box::new(stored.require_idle.clone()),

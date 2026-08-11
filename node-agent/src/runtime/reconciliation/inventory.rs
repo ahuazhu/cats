@@ -1099,6 +1099,7 @@ fn runtime_from_inventory(
                     spec_digest: checkpoint.spec_digest.clone(),
                     placement_epoch: checkpoint.placement_epoch,
                     runtime_incarnation: checkpoint.runtime_incarnation.clone(),
+                    runtime_launch: Box::new(checkpoint.runtime_launch.clone()),
                     stable_state: checkpoint.stable_state,
                     step: Box::new(checkpoint.step.clone()),
                     require_idle: Box::new(checkpoint.require_idle.clone()),

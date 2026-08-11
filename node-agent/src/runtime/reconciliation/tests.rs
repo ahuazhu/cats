@@ -968,6 +968,10 @@ fn real_admission_cell_global_close_requires_higher_epochs_before_reopen() {
     let closed = GateSequencer::new(&store, &mut port)
         .close_all(&source, &stop, times(20, 21))
         .expect("global close");
+    assert_eq!(
+        closed.checkpoint().checkpoint().runtime_launch,
+        source_checkpoint.runtime_launch,
+    );
     let closed_snapshot = cell.snapshot();
     assert_eq!(
         closed_snapshot.lifecycle_admission(),
@@ -1003,6 +1007,14 @@ fn real_admission_cell_global_close_requires_higher_epochs_before_reopen() {
         .install_gate(closed.checkpoint(), &fresh, &id("ep_a"), times(30, 31))
         .expect("install fresh A");
     assert_eq!(
+        a.checkpoint().checkpoint().runtime_launch,
+        source_checkpoint.runtime_launch,
+    );
+    assert_eq!(
+        a.checkpoint().checkpoint().lifecycle_admission,
+        LifecycleAdmission::Open,
+    );
+    assert_eq!(
         snapshot_route(&cell.snapshot(), "ep_a").binding.route_epoch,
         epoch(2)
     );
@@ -1019,9 +1031,13 @@ fn real_admission_cell_global_close_requires_higher_epochs_before_reopen() {
         RouteGateState::Closed
     );
 
-    GateSequencer::new(&store, &mut port)
+    let b = GateSequencer::new(&store, &mut port)
         .install_gate(a.checkpoint(), &fresh, &id("ep_b"), times(32, 33))
         .expect("install fresh B");
+    assert_eq!(
+        b.checkpoint().checkpoint().runtime_launch,
+        source_checkpoint.runtime_launch,
+    );
     assert_eq!(
         snapshot_route(&cell.snapshot(), "ep_b").binding.route_epoch,
         epoch(8)
@@ -3925,6 +3941,12 @@ fn running_checkpoint(desired: &DesiredRuntimeSpec, updated_at: u64) -> RuntimeC
         desired_revision: desired.desired_revision,
         spec_digest: desired.spec_digest.clone(),
         runtime_incarnation: Some(incarnation.clone()),
+        runtime_launch: decode_runtime_checkpoint(include_bytes!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../testdata/runtime-reconciliation-v1-start-runtime-checkpoint.json"
+        )))
+        .expect("fixed StartRuntime checkpoint")
+        .runtime_launch,
         stable_state: Some(StableState::Running),
         step: ReconcileStep::Stable {
             state: StableState::Running,

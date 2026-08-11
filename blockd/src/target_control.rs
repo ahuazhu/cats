@@ -94,6 +94,7 @@ pub fn provision_root_authorization_context_digest(
         desired_revision,
         spec_digest,
         runtime_incarnation,
+        runtime_launch: _,
         stable_state,
         step,
         processes,

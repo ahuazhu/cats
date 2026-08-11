@@ -3269,6 +3269,7 @@ mod tests {
             ))
             .unwrap(),
             runtime_incarnation: None,
+            runtime_launch: cats_api::runtime_reconciliation::RuntimeLaunch::Absent,
             stable_state: None,
             step: ReconcileStep::PrepareDevice {
                 volume_intent_id: id(&format!("intent_{volume}")),

@@ -2714,6 +2714,45 @@ fn vmm_boot_provenance_schema() -> Schema {
     ])
 }
 
+fn runtime_launch_identity_fields() -> Vec<Field> {
+    vec![
+        field("runtime_incarnation", random_id()),
+        field("scope_id", id()),
+        field("launcher_executable", runtime_launch_artifact_schema()),
+        field("boot", vmm_boot_provenance_schema()),
+        field("process_identity_token", random_id()),
+        field("vcpus", number(1, u64::from(u32::MAX))),
+        field("memory_bytes", number(1, MAX_WIRE_INTEGER)),
+        field("boot_image_digest", digest()),
+        field("guest_config_digest", digest()),
+        field("api_socket_path", string(StringRule::HostPath)),
+        field("vsock_socket_path", string(StringRule::HostPath)),
+        field("guest_cid", number(3, u64::from(u32::MAX - 1))),
+        field("memory_file_path", string(StringRule::HostPath)),
+        field("serial_log_path", string(StringRule::HostPath)),
+        field("vmm_log_path", string(StringRule::HostPath)),
+        field("network", runtime_network_identity_schema()),
+        field("devices", array(prepared_device_input_schema(), 64)),
+    ]
+}
+
+fn runtime_launch_identity_schema() -> Schema {
+    object(runtime_launch_identity_fields())
+}
+
+fn runtime_launch_schema() -> Schema {
+    union(
+        "kind",
+        vec![
+            variant("absent", vec![]),
+            variant(
+                "present",
+                vec![field("identity", runtime_launch_identity_schema())],
+            ),
+        ],
+    )
+}
+
 fn prepared_device_input_schema() -> Schema {
     object(vec![
         field("volume_intent_id", id()),
@@ -2833,28 +2872,7 @@ fn reconcile_step_schema() -> Schema {
                     field("mount_path", string(StringRule::HostPath)),
                 ],
             ),
-            variant(
-                "start_runtime",
-                vec![
-                    field("runtime_incarnation", random_id()),
-                    field("scope_id", id()),
-                    field("launcher_executable", runtime_launch_artifact_schema()),
-                    field("boot", vmm_boot_provenance_schema()),
-                    field("process_identity_token", random_id()),
-                    field("vcpus", number(1, u64::from(u32::MAX))),
-                    field("memory_bytes", number(1, MAX_WIRE_INTEGER)),
-                    field("boot_image_digest", digest()),
-                    field("guest_config_digest", digest()),
-                    field("api_socket_path", string(StringRule::HostPath)),
-                    field("vsock_socket_path", string(StringRule::HostPath)),
-                    field("guest_cid", number(3, u64::from(u32::MAX - 1))),
-                    field("memory_file_path", string(StringRule::HostPath)),
-                    field("serial_log_path", string(StringRule::HostPath)),
-                    field("vmm_log_path", string(StringRule::HostPath)),
-                    field("network", runtime_network_identity_schema()),
-                    field("devices", array(prepared_device_input_schema(), 64)),
-                ],
-            ),
+            variant("start_runtime", runtime_launch_identity_fields()),
             variant(
                 "drain_publish",
                 vec![
@@ -2895,6 +2913,10 @@ fn reconcile_step_schema() -> Schema {
             variant(
                 "delete_disposable_root",
                 vec![field("authorization_id", id())],
+            ),
+            variant(
+                "open_admission",
+                vec![field("runtime_incarnation", random_id())],
             ),
             variant(
                 "install_gate",
@@ -3348,6 +3370,7 @@ fn checkpoint_evidence_schema() -> Schema {
                     field("spec_digest", digest()),
                     field("placement_epoch", epoch()),
                     field("runtime_incarnation", nullable(random_id())),
+                    field("runtime_launch", runtime_launch_schema()),
                     field("stable_state", nullable(stable_state_schema())),
                     field("step", reconcile_step_schema()),
                     field("require_idle", require_idle_schema()),
@@ -3832,6 +3855,7 @@ fn runtime_checkpoint_schema() -> Schema {
         field("desired_revision", revision()),
         field("spec_digest", digest()),
         field("runtime_incarnation", nullable(random_id())),
+        field("runtime_launch", runtime_launch_schema()),
         field("stable_state", nullable(stable_state_schema())),
         field("step", reconcile_step_schema()),
         field("processes", array(process_evidence_schema(), 128)),
@@ -6503,6 +6527,153 @@ fn collect_network_config_cross(
     }
 }
 
+fn start_runtime_step_from_launch(identity: &RuntimeLaunchIdentity) -> ReconcileStep {
+    ReconcileStep::StartRuntime {
+        runtime_incarnation: identity.runtime_incarnation.clone(),
+        scope_id: identity.scope_id.clone(),
+        launcher_executable: identity.launcher_executable.clone(),
+        boot: identity.boot.clone(),
+        process_identity_token: identity.process_identity_token.clone(),
+        vcpus: identity.vcpus,
+        memory_bytes: identity.memory_bytes,
+        boot_image_digest: identity.boot_image_digest.clone(),
+        guest_config_digest: identity.guest_config_digest.clone(),
+        api_socket_path: identity.api_socket_path.clone(),
+        vsock_socket_path: identity.vsock_socket_path.clone(),
+        guest_cid: identity.guest_cid,
+        memory_file_path: identity.memory_file_path.clone(),
+        serial_log_path: identity.serial_log_path.clone(),
+        vmm_log_path: identity.vmm_log_path.clone(),
+        network: identity.network.clone(),
+        devices: identity.devices.clone(),
+    }
+}
+
+#[derive(Clone, Copy)]
+enum RuntimeLaunchRequirement {
+    Any,
+    Absent,
+    Present,
+}
+
+fn runtime_launch_requirement(step: &ReconcileStep) -> RuntimeLaunchRequirement {
+    match step {
+        ReconcileStep::AcquireVolume { .. }
+        | ReconcileStep::ProvisionRootImage { .. }
+        | ReconcileStep::PrepareDevice { .. }
+        | ReconcileStep::PrepareNetwork { .. }
+        | ReconcileStep::DeleteDisposableRoot { .. }
+        | ReconcileStep::Stable {
+            state: StableState::Warm | StableState::Cold | StableState::Deleted,
+        } => RuntimeLaunchRequirement::Absent,
+        ReconcileStep::CloseGate { .. }
+        | ReconcileStep::FormatFilesystem { .. }
+        | ReconcileStep::DrainInitialization { .. }
+        | ReconcileStep::CommitInitialized { .. }
+        | ReconcileStep::MountFilesystem { .. }
+        | ReconcileStep::StartRuntime { .. }
+        | ReconcileStep::PauseRuntime { .. }
+        | ReconcileStep::SnapshotWarmRuntime { .. }
+        | ReconcileStep::StopRuntime { .. }
+        | ReconcileStep::OpenAdmission { .. }
+        | ReconcileStep::InstallGate { .. }
+        | ReconcileStep::Stable {
+            state: StableState::Running | StableState::Suspended,
+        } => RuntimeLaunchRequirement::Present,
+        ReconcileStep::InspectInventory { .. }
+        | ReconcileStep::CloseAdmission { .. }
+        | ReconcileStep::DrainPublish { .. }
+        | ReconcileStep::CleanupRelease { .. }
+        | ReconcileStep::Quarantined => RuntimeLaunchRequirement::Any,
+    }
+}
+
+fn step_runtime_incarnation(step: &ReconcileStep) -> Option<&RandomId128> {
+    match step {
+        ReconcileStep::StartRuntime {
+            runtime_incarnation,
+            ..
+        }
+        | ReconcileStep::PauseRuntime {
+            runtime_incarnation,
+            ..
+        }
+        | ReconcileStep::SnapshotWarmRuntime {
+            runtime_incarnation,
+            ..
+        }
+        | ReconcileStep::StopRuntime {
+            runtime_incarnation,
+            ..
+        }
+        | ReconcileStep::OpenAdmission {
+            runtime_incarnation,
+        } => Some(runtime_incarnation),
+        _ => None,
+    }
+}
+
+fn collect_runtime_launch_cross(
+    runtime_incarnation: Option<&RandomId128>,
+    runtime_launch: &RuntimeLaunch,
+    step: &ReconcileStep,
+    base_path: &[PathSegment],
+    output: &mut Vec<Candidate>,
+) {
+    let launch_path = child(base_path, "runtime_launch");
+    let expected_start_runtime_identity = step.start_runtime_launch_identity();
+    let exact_absent =
+        runtime_incarnation.is_none() && matches!(runtime_launch, RuntimeLaunch::Absent);
+    let exact_present =
+        runtime_incarnation.is_some() && matches!(runtime_launch, RuntimeLaunch::Present(_));
+    match (runtime_incarnation, runtime_launch) {
+        (None, RuntimeLaunch::Absent) => {}
+        (Some(runtime_incarnation), RuntimeLaunch::Present(identity))
+            if identity.runtime_incarnation == *runtime_incarnation =>
+        {
+            // StartRuntime already validates the same exact bytes at `/step`.
+            // Later steps no longer carry them, so their retained identity is
+            // validated independently at its durable checkpoint location.
+            if expected_start_runtime_identity.as_ref() != Some(identity.as_ref()) {
+                let identity_path = child(&launch_path, "identity");
+                let launch_step = start_runtime_step_from_launch(identity);
+                collect_reconcile_step_cross(&launch_step, &identity_path, false, output);
+            }
+        }
+        _ => output.push(Candidate::at(&launch_path, MalformedProblem::InvalidValue)),
+    }
+
+    let presence_is_valid = match runtime_launch_requirement(step) {
+        RuntimeLaunchRequirement::Any => true,
+        RuntimeLaunchRequirement::Absent => exact_absent,
+        RuntimeLaunchRequirement::Present => exact_present,
+    };
+    if !presence_is_valid {
+        output.push(Candidate::at(&launch_path, MalformedProblem::InvalidValue));
+    }
+    if let Some(step_incarnation) = step_runtime_incarnation(step) {
+        if runtime_incarnation != Some(step_incarnation) {
+            output.push(Candidate::field(
+                base_path,
+                "runtime_incarnation",
+                MalformedProblem::InvalidValue,
+            ));
+        }
+    }
+
+    if let Some(expected) = expected_start_runtime_identity {
+        let step_path = child(base_path, "step");
+        let step_is_independently_invalid = output
+            .iter()
+            .any(|candidate| candidate.path.starts_with(&step_path));
+        if !step_is_independently_invalid
+            && runtime_launch != &RuntimeLaunch::Present(Box::new(expected))
+        {
+            output.push(Candidate::at(&launch_path, MalformedProblem::InvalidValue));
+        }
+    }
+}
+
 fn validate_runtime_checkpoint(checkpoint: &RuntimeCheckpoint) -> Result<(), ContractError> {
     if let Some(candidate) = choose(collect_checkpoint_arrays(checkpoint)) {
         return Err(malformed(ContractName::RuntimeCheckpoint, candidate));
@@ -6510,6 +6681,13 @@ fn validate_runtime_checkpoint(checkpoint: &RuntimeCheckpoint) -> Result<(), Con
     let mut cross = Vec::new();
     collect_physical_cross(&checkpoint.processes, &checkpoint.volumes, &[], &mut cross);
     collect_reconcile_step_cross(&checkpoint.step, &path(&["step"]), false, &mut cross);
+    collect_runtime_launch_cross(
+        checkpoint.runtime_incarnation.as_ref(),
+        &checkpoint.runtime_launch,
+        &checkpoint.step,
+        &[],
+        &mut cross,
+    );
     collect_close_gate_checkpoint_cross(checkpoint, &mut cross);
     collect_runtime_resource_cross(checkpoint, &[], &mut cross);
     collect_warm_snapshot_cross(
@@ -6849,6 +7027,44 @@ fn collect_runtime_resource_cross(
             if mount_path_conflict {
                 output.push(Candidate::at(
                     &child(runtime_path, "step"),
+                    MalformedProblem::InvalidValue,
+                ));
+            }
+        }
+        ReconcileStep::OpenAdmission {
+            runtime_incarnation,
+        } => {
+            if runtime.resource_runtime_incarnation() != Some(runtime_incarnation) {
+                output.push(Candidate::field(
+                    runtime_path,
+                    "runtime_incarnation",
+                    MalformedProblem::InvalidValue,
+                ));
+            }
+            if runtime.resource_stable_state().is_some() {
+                output.push(Candidate::field(
+                    runtime_path,
+                    "stable_state",
+                    MalformedProblem::InvalidValue,
+                ));
+            }
+            if runtime.resource_lifecycle_admission() != LifecycleAdmission::Closed {
+                output.push(Candidate::field(
+                    runtime_path,
+                    "lifecycle_admission",
+                    MalformedProblem::InvalidValue,
+                ));
+            }
+            if !runtime.resource_routes_are_empty() {
+                output.push(Candidate::at(
+                    &child(
+                        runtime_path,
+                        if runtime_path.is_empty() {
+                            "route_gates"
+                        } else {
+                            "routes"
+                        },
+                    ),
                     MalformedProblem::InvalidValue,
                 ));
             }
@@ -8065,11 +8281,26 @@ fn collect_runtime_arrays(
 ) {
     collect_step_arrays(&runtime.step, &child(path, "step"), output);
     if let CheckpointEvidence::Valid {
-        step, require_idle, ..
+        step,
+        runtime_launch,
+        require_idle,
+        ..
     } = &runtime.checkpoint
     {
         let checkpoint_path = child(path, "checkpoint");
         collect_step_arrays(step, &child(&checkpoint_path, "step"), output);
+        if let RuntimeLaunch::Present(identity) = runtime_launch.as_ref() {
+            if step.start_runtime_launch_identity().as_ref() != Some(identity.as_ref()) {
+                collect_prepared_device_arrays(
+                    &identity.devices,
+                    &child(
+                        &child(&child(&checkpoint_path, "runtime_launch"), "identity"),
+                        "devices",
+                    ),
+                    output,
+                );
+            }
+        }
         collect_require_idle_arrays(
             require_idle,
             &child(&checkpoint_path, "require_idle"),
@@ -8280,6 +8511,15 @@ fn residue_key(residue: &NodeResidue) -> Vec<SortPart> {
 fn collect_checkpoint_arrays(checkpoint: &RuntimeCheckpoint) -> Vec<Candidate> {
     let mut output = Vec::new();
     collect_step_arrays(&checkpoint.step, &path(&["step"]), &mut output);
+    if let RuntimeLaunch::Present(identity) = &checkpoint.runtime_launch {
+        if checkpoint.step.start_runtime_launch_identity().as_ref() != Some(identity.as_ref()) {
+            collect_prepared_device_arrays(
+                &identity.devices,
+                &path(&["runtime_launch", "identity", "devices"]),
+                &mut output,
+            );
+        }
+    }
     collect_require_idle_arrays(
         &checkpoint.require_idle,
         &path(&["require_idle"]),
@@ -9097,6 +9337,7 @@ fn collect_runtime_cross(
             cat_id,
             step,
             runtime_incarnation,
+            runtime_launch,
             stable_state,
             ..
         } => {
@@ -9113,6 +9354,13 @@ fn collect_runtime_cross(
                 step,
                 &child(&child(path, "checkpoint"), "step"),
                 false,
+                output,
+            );
+            collect_runtime_launch_cross(
+                runtime_incarnation.as_ref(),
+                runtime_launch,
+                step,
+                &child(path, "checkpoint"),
                 output,
             );
         }

@@ -933,6 +933,12 @@ pub struct RuntimeCheckpoint {
     pub desired_revision: Revision,
     pub spec_digest: Sha256Digest,
     pub runtime_incarnation: Option<RandomId128>,
+    /// Closed, durable launch authority for every live VMM phase.
+    ///
+    /// This is deliberately not an `Option`: a checkpoint must state whether
+    /// no launch exists or retain the complete identity that originally
+    /// authorized `StartRuntime`.
+    pub runtime_launch: RuntimeLaunch,
     pub stable_state: Option<StableState>,
     pub step: ReconcileStep,
     pub processes: Vec<ProcessEvidence>,
@@ -1126,6 +1132,55 @@ pub struct VmmBootProvenance {
     pub kernel_cmdline: AsciiText,
 }
 
+/// Complete, restart-safe identity of one VMM launch.
+///
+/// `ReconcileStep::StartRuntime` carries the same fields for the narrow start
+/// effect.  The checkpoint-level copy survives later Guest/admission steps so
+/// replacing the step can never erase the only exact launch expectation.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RuntimeLaunchIdentity {
+    pub runtime_incarnation: RandomId128,
+    pub scope_id: Id,
+    pub launcher_executable: Box<RuntimeLaunchArtifact>,
+    pub boot: Box<VmmBootProvenance>,
+    pub process_identity_token: RandomId128,
+    pub vcpus: u32,
+    pub memory_bytes: u64,
+    pub boot_image_digest: Sha256Digest,
+    pub guest_config_digest: Sha256Digest,
+    pub api_socket_path: HostPath,
+    pub vsock_socket_path: HostPath,
+    pub guest_cid: u32,
+    pub memory_file_path: HostPath,
+    pub serial_log_path: HostPath,
+    pub vmm_log_path: HostPath,
+    pub network: Box<RuntimeNetworkIdentity>,
+    pub devices: Vec<PreparedDeviceInput>,
+}
+
+/// Closed checkpoint state for the retained VMM launch authority.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(
+    tag = "kind",
+    content = "identity",
+    rename_all = "snake_case",
+    deny_unknown_fields
+)]
+pub enum RuntimeLaunch {
+    Absent,
+    Present(Box<RuntimeLaunchIdentity>),
+}
+
+impl RuntimeLaunch {
+    pub fn identity(&self) -> Option<&RuntimeLaunchIdentity> {
+        match self {
+            Self::Absent => None,
+            Self::Present(identity) => Some(identity),
+        }
+    }
+}
+
 /// One exact PrepareDevice expectation retained by every later launch phase.
 ///
 /// Public process/device observations are only projections of this authority:
@@ -1282,11 +1337,67 @@ pub enum ReconcileStep {
     DeleteDisposableRoot {
         authorization_id: Id,
     },
+    /// Checkpoint-first lifecycle admission for a Ready Running runtime whose
+    /// complete Desired contains no Endpoint gates to install.
+    OpenAdmission {
+        runtime_incarnation: RandomId128,
+    },
     InstallGate {
         endpoint_id: Id,
         route_epoch: Epoch,
     },
     Quarantined,
+}
+
+impl ReconcileStep {
+    /// Projects the complete launch identity carried by `StartRuntime`.
+    ///
+    /// Callers use this at the single predecessor -> successor boundary; all
+    /// later phases must retain the resulting value verbatim at checkpoint
+    /// top level rather than trying to reconstruct it from public evidence.
+    pub fn start_runtime_launch_identity(&self) -> Option<RuntimeLaunchIdentity> {
+        let Self::StartRuntime {
+            runtime_incarnation,
+            scope_id,
+            launcher_executable,
+            boot,
+            process_identity_token,
+            vcpus,
+            memory_bytes,
+            boot_image_digest,
+            guest_config_digest,
+            api_socket_path,
+            vsock_socket_path,
+            guest_cid,
+            memory_file_path,
+            serial_log_path,
+            vmm_log_path,
+            network,
+            devices,
+        } = self
+        else {
+            return None;
+        };
+        Some(RuntimeLaunchIdentity {
+            runtime_incarnation: runtime_incarnation.clone(),
+            scope_id: scope_id.clone(),
+            launcher_executable: launcher_executable.clone(),
+            boot: boot.clone(),
+            process_identity_token: process_identity_token.clone(),
+            vcpus: *vcpus,
+            memory_bytes: *memory_bytes,
+            boot_image_digest: boot_image_digest.clone(),
+            guest_config_digest: guest_config_digest.clone(),
+            api_socket_path: api_socket_path.clone(),
+            vsock_socket_path: vsock_socket_path.clone(),
+            guest_cid: *guest_cid,
+            memory_file_path: memory_file_path.clone(),
+            serial_log_path: serial_log_path.clone(),
+            vmm_log_path: vmm_log_path.clone(),
+            network: network.clone(),
+            devices: devices.clone(),
+        })
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -2261,6 +2372,7 @@ pub enum CheckpointEvidence {
         spec_digest: Sha256Digest,
         placement_epoch: Epoch,
         runtime_incarnation: Option<RandomId128>,
+        runtime_launch: Box<RuntimeLaunch>,
         stable_state: Option<StableState>,
         step: Box<ReconcileStep>,
         require_idle: Box<RequireIdleCheckpoint>,
