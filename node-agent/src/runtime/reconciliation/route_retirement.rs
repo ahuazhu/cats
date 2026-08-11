@@ -193,21 +193,3 @@ pub(super) fn endpoint_only_successor(old: &DesiredRuntimeSpec, new: &DesiredRun
         && matches!(new.transition, RuntimeTransition::CancelAndDrain)
         && old.spec_digest != new.spec_digest
 }
-
-/// Closed compatibility relation between immutable launch provenance and a
-/// later live-gate Desired. Route revisions may change only the endpoint set;
-/// every field that can affect retained storage, VMM, Guest or network proof
-/// remains byte-for-byte identical.
-pub(super) fn running_physical_compatible(
-    launch: &DesiredRuntimeSpec,
-    gate: &DesiredRuntimeSpec,
-) -> bool {
-    launch.version == gate.version
-        && launch.workspace_id == gate.workspace_id
-        && launch.cat_id == gate.cat_id
-        && launch.target == RuntimeTarget::Running
-        && gate.target == RuntimeTarget::Running
-        && launch.placement == gate.placement
-        && launch.runtime == gate.runtime
-        && launch.volumes == gate.volumes
-}

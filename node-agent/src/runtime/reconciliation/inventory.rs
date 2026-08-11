@@ -546,12 +546,13 @@ impl RuntimeInventoryScanner for CleanSlateInventoryScanner {
                 &aggregate.blockd_by_cat,
                 &aggregate.volumes_by_cat,
             )?;
-            let serving_expected = serving_process_expectations(
+            let serving_expected = serving_process_expectations_with_registry(
                 &context,
                 bridge.as_ref(),
                 &aggregate.checkpoints_by_cat,
                 &aggregate.blockd_by_cat,
                 &aggregate.volumes_by_cat,
+                self.running_admission_registry.as_deref(),
             )?;
             let vmm_expected = vmm_process_expectations(
                 &self.checkpoint_directory,
@@ -851,6 +852,7 @@ impl RuntimeInventoryScanner for CleanSlateInventoryScanner {
                         let physical_is_exact =
                             match validate_retained_running_close_scan_exact_set(
                                 sealed_running,
+                                desired,
                                 checkpoint,
                                 aggregate
                                     .volumes_by_cat
@@ -1288,6 +1290,7 @@ fn root_process_expectations_inner(
     Ok(expected)
 }
 
+#[cfg(test)]
 pub(super) fn serving_process_expectations(
     context: &RuntimeInventoryScanContext,
     bridge: &dyn RootProcessInventoryBridge,
@@ -1304,6 +1307,28 @@ pub(super) fn serving_process_expectations(
         blockd_by_cat,
         volumes_by_cat,
         true,
+        None,
+    )
+}
+
+fn serving_process_expectations_with_registry(
+    context: &RuntimeInventoryScanContext,
+    bridge: &dyn RootProcessInventoryBridge,
+    checkpoints_by_cat: &BTreeMap<Id, RuntimeCheckpointInventoryEvidence>,
+    blockd_by_cat: &BTreeMap<Id, BTreeMap<Id, AuthorizedBlockdInventoryEvidence>>,
+    volumes_by_cat: &BTreeMap<Id, Vec<AuthorityVolumeInventoryEvidence>>,
+    registry: Option<&AdmissionCellRegistry>,
+) -> anyhow::Result<
+    BTreeMap<ManagedServingKey, super::serving_blockd_process::ServingBlockdExpectation>,
+> {
+    serving_process_expectations_inner(
+        context,
+        bridge,
+        checkpoints_by_cat,
+        blockd_by_cat,
+        volumes_by_cat,
+        true,
+        registry,
     )
 }
 
@@ -1324,6 +1349,7 @@ pub(super) fn recovery_serving_process_expectations(
         blockd_by_cat,
         volumes_by_cat,
         true,
+        None,
     )
 }
 
@@ -1334,6 +1360,7 @@ fn serving_process_expectations_inner(
     blockd_by_cat: &BTreeMap<Id, BTreeMap<Id, AuthorizedBlockdInventoryEvidence>>,
     volumes_by_cat: &BTreeMap<Id, Vec<AuthorityVolumeInventoryEvidence>>,
     include_superseded: bool,
+    registry: Option<&AdmissionCellRegistry>,
 ) -> anyhow::Result<
     BTreeMap<ManagedServingKey, super::serving_blockd_process::ServingBlockdExpectation>,
 > {
@@ -1365,9 +1392,50 @@ fn serving_process_expectations_inner(
             .checkpoint
             .desired
             .clone();
+        let current_running_gate = checkpoint.binding == DesiredCheckpointBinding::Current
+            && desired.target == RuntimeTarget::Running
+            && !matches!(
+                checkpoint.checkpoint.step,
+                ReconcileStep::CloseAdmission { .. }
+            );
+        let session = registry
+            .map(|registry| registry.existing_session(&desired.cat_id))
+            .transpose()?
+            .flatten();
+        let gate_desired = if current_running_gate {
+            desired.clone()
+        } else if let Some(session) = session {
+            let sealed = session
+                .sealed_running_desired()
+                .context("retained route process expectation lacks its sealed live-gate Desired")?;
+            if checkpoint.binding == DesiredCheckpointBinding::Superseded {
+                anyhow::ensure!(
+                    checkpoint.checkpoint.desired_revision == sealed.desired_revision
+                        && checkpoint.checkpoint.spec_digest == sealed.spec_digest
+                        && checkpoint.checkpoint.node_id == sealed.placement.node_id
+                        && checkpoint.checkpoint.placement_epoch
+                            == sealed.placement.placement_epoch,
+                    "superseded process expectation does not bind its sealed live-gate Desired"
+                );
+            } else {
+                anyhow::ensure!(
+                    matches!(
+                        checkpoint.checkpoint.step,
+                        ReconcileStep::CloseAdmission { .. }
+                    ),
+                    "current process expectation differs from its sealed gate outside CloseAdmission"
+                );
+            }
+            sealed
+        } else {
+            // A fresh Agent owns no prior process-local admission. Immutable
+            // launch provenance can identify the old process for cleanup but
+            // can never recreate process-local route admission.
+            physical_desired.clone()
+        };
         super::authorized_blockd::validate_running_physical_desired_successor(
             &physical_desired,
-            desired,
+            &gate_desired,
         )?;
         let expected_blockd_binding = if physical_desired == *desired {
             DesiredCheckpointBinding::Current
@@ -1396,7 +1464,7 @@ fn serving_process_expectations_inner(
             let expectation = bridge.serving_expectation(
                 &checkpoint.checkpoint,
                 &physical_desired,
-                desired,
+                &gate_desired,
                 &prepared,
                 blockd,
                 &authority.record,

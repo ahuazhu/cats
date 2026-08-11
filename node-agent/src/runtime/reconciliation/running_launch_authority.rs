@@ -11,8 +11,8 @@ use std::sync::Arc;
 
 use anyhow::{Context as _, Result};
 use cats_api::runtime_reconciliation::{
-    DesiredRuntimeSpec, Id, PrepareDeviceFrontend, ReconcileStep, RuntimeCheckpoint,
-    RuntimeNetworkIdentity, RuntimeTarget,
+    DesiredRuntimeSpec, Id, PrepareDeviceFrontend, ReconcileStep, RequireIdleCheckpoint,
+    RuntimeCheckpoint, RuntimeNetworkIdentity, RuntimeTarget, RuntimeTransition,
 };
 use cats_storage::authority::{VolumeDataAuthority, VolumeRecord};
 
@@ -144,6 +144,7 @@ pub(crate) fn validate_retained_running_scan_exact_set<'a>(
     networks: &NodeGlobalNetworkScanAdmission,
     kernel_nbd: Option<&'a KernelNbdPoolScanAdmission>,
 ) -> Result<Option<&'a ExactVmmProcessProof>> {
+    let coordinates = ValidatedRunningCheckpoint::exact(desired, checkpoint)?;
     let records = scanner_volume_records(checkpoint, volumes)?;
     let devices = prepared_device_inputs(checkpoint)?;
     anyhow::ensure!(
@@ -157,13 +158,12 @@ pub(crate) fn validate_retained_running_scan_exact_set<'a>(
         return Ok(None);
     }
     validate_running_exact_set(
-        desired,
+        coordinates,
         checkpoint,
         &records,
         ProcessProofSet::Scan(processes),
         NetworkProofSet::Scan(networks),
         kernel_nbd.map(KernelNbdProofSet::Scan),
-        true,
     )
     .map(Some)
 }
@@ -176,18 +176,15 @@ pub(crate) fn validate_retained_running_scan_exact_set<'a>(
 /// gate.
 pub(crate) fn validate_retained_running_close_scan_exact_set<'a>(
     sealed_running: &DesiredRuntimeSpec,
+    close_desired: &DesiredRuntimeSpec,
     checkpoint: &RuntimeCheckpoint,
     volumes: &[AuthorityVolumeInventoryEvidence],
     processes: &'a NodeGlobalManagedProcessScanAdmission,
     networks: &NodeGlobalNetworkScanAdmission,
     kernel_nbd: Option<&'a KernelNbdPoolScanAdmission>,
 ) -> Result<Option<&'a ExactVmmProcessProof>> {
-    anyhow::ensure!(
-        sealed_running.target == RuntimeTarget::Running
-            && checkpoint.desired_revision > sealed_running.desired_revision
-            && matches!(checkpoint.step, ReconcileStep::CloseAdmission { .. }),
-        "retained close scan is not a successor of its sealed Running source"
-    );
+    let coordinates =
+        ValidatedRunningCheckpoint::require_idle(sealed_running, close_desired, checkpoint)?;
     let records = scanner_volume_records(checkpoint, volumes)?;
     let devices = prepared_device_inputs(checkpoint)?;
     anyhow::ensure!(
@@ -207,13 +204,12 @@ pub(crate) fn validate_retained_running_close_scan_exact_set<'a>(
         return Ok(None);
     }
     validate_running_exact_set(
-        sealed_running,
+        coordinates,
         checkpoint,
         &records,
         ProcessProofSet::Scan(processes),
         NetworkProofSet::Scan(networks),
         kernel_nbd.map(KernelNbdProofSet::Scan),
-        false,
     )
     .map(Some)
 }
@@ -539,13 +535,15 @@ impl RunningLaunchAuthorityRevalidator {
             .optional_kernel_nbd_pool()
             .map(KernelNbdProofSet::Accepted);
         let validated_vmm = validate_running_exact_set(
-            live_gate_predecessor,
+            ValidatedRunningCheckpoint::exact(
+                live_gate_predecessor,
+                accepted_checkpoint.checkpoint(),
+            )?,
             accepted_checkpoint.checkpoint(),
             &records,
             ProcessProofSet::Accepted(process_admission),
             NetworkProofSet::Accepted(network_admission),
             kernel_admission,
-            true,
         )?;
         anyhow::ensure!(
             validated_vmm == admitted_vmm,
@@ -689,30 +687,88 @@ impl RunningLaunchAuthorityRevalidator {
     }
 }
 
+struct ValidatedRunningCheckpoint<'a> {
+    physical_desired: &'a DesiredRuntimeSpec,
+}
+
+impl<'a> ValidatedRunningCheckpoint<'a> {
+    fn exact(desired: &'a DesiredRuntimeSpec, checkpoint: &RuntimeCheckpoint) -> Result<Self> {
+        anyhow::ensure!(
+            desired.target == RuntimeTarget::Running
+                && checkpoint.cat_id == desired.cat_id
+                && checkpoint.node_id == desired.placement.node_id
+                && checkpoint.placement_epoch == desired.placement.placement_epoch
+                && checkpoint.desired_revision == desired.desired_revision
+                && checkpoint.spec_digest == desired.spec_digest,
+            "retained Running checkpoint does not bind the exact gate Desired"
+        );
+        Ok(Self {
+            physical_desired: desired,
+        })
+    }
+
+    fn require_idle(
+        source: &'a DesiredRuntimeSpec,
+        successor: &DesiredRuntimeSpec,
+        checkpoint: &RuntimeCheckpoint,
+    ) -> Result<Self> {
+        let RuntimeTransition::RequireIdle {
+            source_revision,
+            source_runtime_incarnation,
+            ..
+        } = &successor.transition
+        else {
+            anyhow::bail!("retained close scan Desired is not RequireIdle")
+        };
+        let mut expected = source.clone();
+        expected.desired_revision = successor.desired_revision;
+        expected.spec_digest = successor.spec_digest.clone();
+        expected.target = successor.target;
+        expected.transition = successor.transition.clone();
+        anyhow::ensure!(
+            source.target == RuntimeTarget::Running
+                && source.desired_revision == *source_revision
+                && expected == *successor
+                && checkpoint.cat_id == successor.cat_id
+                && checkpoint.node_id == successor.placement.node_id
+                && checkpoint.placement_epoch == successor.placement.placement_epoch
+                && checkpoint.desired_revision == successor.desired_revision
+                && checkpoint.spec_digest == successor.spec_digest
+                && checkpoint.runtime_incarnation.as_ref() == Some(source_runtime_incarnation)
+                && matches!(
+                    checkpoint.step,
+                    ReconcileStep::CloseAdmission {
+                        require_idle_attempt_id: Some(_)
+                    }
+                )
+                && matches!(
+                    checkpoint.require_idle,
+                    RequireIdleCheckpoint::Busy {
+                        gate_closed: false,
+                        ..
+                    }
+                ),
+            "retained close scan is not the exact RequireIdle successor of its sealed Running source"
+        );
+        Ok(Self {
+            physical_desired: source,
+        })
+    }
+}
+
 fn validate_running_exact_set<'a>(
-    desired: &DesiredRuntimeSpec,
+    coordinates: ValidatedRunningCheckpoint<'_>,
     checkpoint: &RuntimeCheckpoint,
     records: &BTreeMap<Id, &VolumeRecord>,
     processes: ProcessProofSet<'a>,
     networks: NetworkProofSet<'_>,
     kernel_nbd: Option<KernelNbdProofSet<'a>>,
-    exact_desired_coordinates: bool,
 ) -> Result<&'a ExactVmmProcessProof> {
+    let desired = coordinates.physical_desired;
     let retained = RetainedRuntimeLaunchAuthority::from_checkpoint(checkpoint)?;
     let launch = retained.identity();
-    let coordinates_match = checkpoint.cat_id == desired.cat_id
-        && checkpoint.node_id == desired.placement.node_id
-        && if exact_desired_coordinates {
-            checkpoint.placement_epoch == desired.placement.placement_epoch
-                && checkpoint.desired_revision == desired.desired_revision
-                && checkpoint.spec_digest == desired.spec_digest
-        } else {
-            checkpoint.placement_epoch >= desired.placement.placement_epoch
-                && checkpoint.desired_revision > desired.desired_revision
-        };
     anyhow::ensure!(
         desired.target == RuntimeTarget::Running
-            && coordinates_match
             && launch.vcpus == desired.runtime.vcpus
             && launch.memory_bytes == desired.runtime.memory_bytes
             && launch.boot_image_digest == desired.runtime.boot_image_digest
