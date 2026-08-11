@@ -37,7 +37,7 @@ use crate::runtime::reconciliation::{
     KernelNbdInventoryConfig, RootProvisionSystemdConfig, RunningAdmissionPreScan,
     RuntimeVolumeTransitionHttpClient, ServingPrepareFrontend, SignedRunningAcquireEffect,
     SignedRunningEffect, SignedRunningHostConfig, SignedRunningProcessPorts,
-    SignedRunningPublicationRecovery, VmmLaunchArtifactPaths,
+    SignedRunningPublicationRecovery, SignedVolumeEvidencePort, VmmLaunchArtifactPaths,
 };
 use crate::runtime_spine::{
     RuntimeEffectResourceOwner, RuntimeInventoryScanner, RuntimeSpineDeadlinePolicy,
@@ -400,9 +400,9 @@ async fn spawn_signed_runtime_cutover_with_overrides(
                 &effect_registration,
             )?
         };
-        let volume_evidence = Arc::new(ControlBlockingSignedVolumeEvidenceClient::new(
-            volume_transition_transport.clone(),
-        ));
+        let volume_evidence: Arc<dyn SignedVolumeEvidencePort> = Arc::new(
+            ControlBlockingSignedVolumeEvidenceClient::new(volume_transition_transport.clone()),
+        );
         let acquire = SignedRunningAcquireEffect::new(
             Arc::new(ControlSignedNormalAcquireClient::new(
                 volume_transition_transport,
@@ -412,7 +412,7 @@ async fn spawn_signed_runtime_cutover_with_overrides(
             effect_lease_duration_ms,
         )
         .context("compose one-step signed Running acquire")?
-        .with_volume_evidence(volume_evidence);
+        .with_volume_evidence(Arc::clone(&volume_evidence));
         let effect = SignedRunningEffect::platform(
             acquire,
             Arc::clone(&effect_volume_authority),
@@ -451,7 +451,8 @@ async fn spawn_signed_runtime_cutover_with_overrides(
                     SignedRunningPublicationRecovery::new(Arc::clone(&effect_volume_authority))
                 }
             }
-        };
+        }
+        .with_volume_evidence(volume_evidence);
         RuntimeSpineRunner::new_with_recovery_desired_effects_and_resource_owner(
             effect_state_directory,
             session,

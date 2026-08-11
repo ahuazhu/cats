@@ -180,6 +180,7 @@ pub(crate) struct SignedRunningAcquireEffect {
 /// current point-read authority must prove the persisted request already won.
 pub(crate) struct SignedRunningPublicationRecovery {
     authority: Arc<dyn VolumeDataAuthority>,
+    volume_evidence: Option<Arc<dyn SignedVolumeEvidencePort>>,
     #[cfg(target_os = "linux")]
     stale_boot_vmm: Option<InstalledStaleBootVmmRecoveryPorts>,
 }
@@ -189,6 +190,7 @@ impl SignedRunningPublicationRecovery {
     pub(crate) fn new(authority: Arc<dyn VolumeDataAuthority>) -> Self {
         Self {
             authority,
+            volume_evidence: None,
             #[cfg(target_os = "linux")]
             stale_boot_vmm: None,
         }
@@ -201,8 +203,17 @@ impl SignedRunningPublicationRecovery {
     ) -> Self {
         Self {
             authority,
+            volume_evidence: None,
             stale_boot_vmm: Some(stale_boot_vmm),
         }
+    }
+
+    pub(crate) fn with_volume_evidence(
+        mut self,
+        evidence: Arc<dyn SignedVolumeEvidencePort>,
+    ) -> Self {
+        self.volume_evidence = Some(evidence);
+        self
     }
 
     #[cfg(test)]
@@ -214,6 +225,7 @@ impl SignedRunningPublicationRecovery {
         // retain this seam to assert the supplied port receives zero calls.
         Self {
             authority,
+            volume_evidence: None,
             #[cfg(target_os = "linux")]
             stale_boot_vmm: None,
         }
@@ -310,6 +322,7 @@ impl SignedRunningPublicationRecovery {
         &self,
         context: &RuntimePreScanRecoveryContext,
         cat_id: &Id,
+        target_already_published: bool,
     ) -> anyhow::Result<RuntimePreScanRecoveryOutcome> {
         let desired = context
             .coordinates()
@@ -318,9 +331,6 @@ impl SignedRunningPublicationRecovery {
             .iter()
             .find(|desired| &desired.cat_id == cat_id)
             .context("publication recovery Cat is absent from current Desired")?;
-        let Some(volume) = recovery_volume(desired, &context.coordinates().session) else {
-            return Ok(RuntimePreScanRecoveryOutcome::NoChange);
-        };
         let checkpoint_directory = context.state_directory().path().join(CHECKPOINT_NAMESPACE);
         let store =
             FileCheckpointStore::open_preserving_checkpoint_temp(&checkpoint_directory, cat_id)
@@ -331,37 +341,167 @@ impl SignedRunningPublicationRecovery {
         else {
             return Ok(RuntimePreScanRecoveryOutcome::NoChange);
         };
-        let Some(persisted) =
-            persisted_acquire_request(stored.checkpoint(), desired, volume).cloned()
-        else {
+        let Some(volume) = recovery_volume(
+            desired,
+            &context.coordinates().session,
+            stored.checkpoint(),
+            context.state_directory().path(),
+        ) else {
             return Ok(RuntimePreScanRecoveryOutcome::NoChange);
         };
-        let request = normal_acquire_request_with_binding(
+        let Some(persisted) = persisted_acquire_request(
+            stored.checkpoint(),
             desired,
-            context.coordinates().session.clone(),
-            persisted,
-        );
-        context.check_active()?;
-        let record = match self.authority.load_volume(&volume.volume_id) {
-            Ok(record) => record,
-            Err(AuthorityError::BackendUnknown) => {
-                anyhow::bail!("volume authority unavailable during publication recovery")
+            volume,
+            context.state_directory().path(),
+        )
+        .cloned() else {
+            return Ok(RuntimePreScanRecoveryOutcome::NoChange);
+        };
+        let attachment = match &persisted {
+            VolumeAcquireRequest::Normal { .. } => {
+                let request = normal_acquire_request_with_binding(
+                    desired,
+                    context.coordinates().session.clone(),
+                    persisted,
+                );
+                context.check_active()?;
+                let record = match self.authority.load_volume(&volume.volume_id) {
+                    Ok(record) => record,
+                    Err(AuthorityError::BackendUnknown) => {
+                        anyhow::bail!("volume authority unavailable during publication recovery")
+                    }
+                    Err(_) => return Ok(RuntimePreScanRecoveryOutcome::NoChange),
+                };
+                context.check_active()?;
+                match recover_normal_acquire_from_authority(&request, volume, &record) {
+                    Ok(NormalAcquireAuthorityRecovery::Granted(attachment))
+                        if normal_publication_closes_checkpoint_predecessor(
+                            stored.checkpoint(),
+                            desired,
+                            volume,
+                            &attachment,
+                        ) =>
+                    {
+                        attachment
+                    }
+                    Ok(
+                        NormalAcquireAuthorityRecovery::Granted(_)
+                        | NormalAcquireAuthorityRecovery::RetryExact
+                        | NormalAcquireAuthorityRecovery::Blocked,
+                    )
+                    | Err(_) => return Ok(RuntimePreScanRecoveryOutcome::NoChange),
+                }
             }
-            Err(_) => return Ok(RuntimePreScanRecoveryOutcome::NoChange),
+            VolumeAcquireRequest::Takeover { authorization_id } => {
+                let Some(evidence_port) = &self.volume_evidence else {
+                    return Ok(RuntimePreScanRecoveryOutcome::NoChange);
+                };
+                let request = RuntimeVolumeTransitionEvidenceRequest {
+                    version: ContractVersion::V1,
+                    session: context.coordinates().session.clone(),
+                    authorization_id: authorization_id.clone(),
+                };
+                context.check_active()?;
+                let recovery = evidence_port
+                    .recover_authorization(&request, context.deadline())
+                    .map_err(|error| {
+                        anyhow::anyhow!(
+                            "read signed takeover evidence during publication recovery: {error}"
+                        )
+                    })?;
+                context.check_active()?;
+                let (evidence, receipt) = match recovery {
+                    VolumeEvidenceRecovery::Validated { evidence, decision } => match *decision {
+                        VolumeEvidenceRecoveryDecision::AdoptTakeover(receipt) => {
+                            (evidence, receipt)
+                        }
+                        _ => return Ok(RuntimePreScanRecoveryOutcome::NoChange),
+                    },
+                    _ => return Ok(RuntimePreScanRecoveryOutcome::NoChange),
+                };
+                if evidence.version != ContractVersion::V1
+                    || evidence.session != request.session
+                    || evidence.authorization_id != *authorization_id
+                {
+                    return Ok(RuntimePreScanRecoveryOutcome::NoChange);
+                }
+                let Some(prior) = stored
+                    .checkpoint()
+                    .volumes
+                    .iter()
+                    .find(|observed| observed.volume_id == volume.volume_id)
+                else {
+                    return Ok(RuntimePreScanRecoveryOutcome::NoChange);
+                };
+                let Some(attachment) = takeover_attachment_from_signed_evidence(
+                    desired, volume, prior, &evidence, &receipt, None,
+                ) else {
+                    return Ok(RuntimePreScanRecoveryOutcome::NoChange);
+                };
+                context.check_active()?;
+                let current = self.authority.load_volume(&volume.volume_id);
+                context.check_active()?;
+                if !signed_takeover_successor_matches_point_read(&evidence, current)? {
+                    return Ok(RuntimePreScanRecoveryOutcome::NoChange);
+                }
+                let retained_publication = if target_already_published {
+                    let retained = AuthorizedBlockdStore::new(context.state_directory().clone())
+                        .reopen_adopted(desired, volume, &attachment.identity)
+                        .context("reopen exact takeover publication before signed recovery")?;
+                    if retained.checkpoint().desired != *desired
+                        || retained.checkpoint().volume != *volume
+                        || retained.checkpoint().attachment != attachment
+                    {
+                        return Ok(RuntimePreScanRecoveryOutcome::NoChange);
+                    }
+                    Some(retained)
+                } else {
+                    None
+                };
+                if takeover_successor_requires_immediate_replan(
+                    &evidence,
+                    authorization_id,
+                    &receipt,
+                ) {
+                    // A later Takeover/disposable-delete needs the signed
+                    // direct authorization to close it; a completed delete
+                    // has no VolumeRecord at all. Neither proof can be
+                    // reconstructed from the immutable primary R0 artifact
+                    // on the next scan. Consume the still-fresh signed proof
+                    // only to invalidate this spent Desired. Never publish or
+                    // reopen a local writer for these closed successors.
+                    let checkpoint_guard = store
+                        .assert_current(&stored)
+                        .context("retain takeover checkpoint before pre-scan replan")?;
+                    store
+                        .revalidate_current(&stored, &checkpoint_guard)
+                        .context("revalidate takeover checkpoint before pre-scan replan")?;
+                    return Ok(RuntimePreScanRecoveryOutcome::ReplanDesired {
+                        cat_id: cat_id.clone(),
+                    });
+                }
+                if retained_publication.is_some() {
+                    // Exact primary R0 is already durable. Its checkpoint CAS
+                    // response was the only missing publication, so leave the
+                    // immutable bytes untouched and let the normal full scan
+                    // plus Desired effect adopt them.
+                    return Ok(RuntimePreScanRecoveryOutcome::NoChange);
+                }
+                Box::new(attachment)
+            }
         };
         context.check_active()?;
-        let attachment = match recover_normal_acquire_from_authority(&request, volume, &record) {
-            Ok(NormalAcquireAuthorityRecovery::Granted(attachment)) => attachment,
-            Ok(
-                NormalAcquireAuthorityRecovery::RetryExact
-                | NormalAcquireAuthorityRecovery::Blocked,
-            ) => return Ok(RuntimePreScanRecoveryOutcome::NoChange),
-            Err(_) => return Ok(RuntimePreScanRecoveryOutcome::NoChange),
-        };
+        let current_checkpoint = store
+            .assert_current(&stored)
+            .context("revalidate publication recovery checkpoint before local mutation")?;
         AuthorizedBlockdStore::new(context.state_directory().clone())
             .prepare(desired, volume, &attachment)
             .context("recover exact authorized blockd publication")?;
         context.check_active()?;
+        store
+            .revalidate_current(&stored, &current_checkpoint)
+            .context("revalidate publication recovery checkpoint after local durability")?;
         Ok(RuntimePreScanRecoveryOutcome::Recovered {
             cat_id: cat_id.clone(),
         })
@@ -503,7 +643,10 @@ impl RuntimePreScanRecovery for SignedRunningPublicationRecovery {
                 Ok(RuntimePreScanRecoveryOutcome::Recovered { cat_id })
             }
             LocalPublicationRecoveryEvidence::AuthorizedBlockd { cat_id } => {
-                self.recover_authorized_blockd(&context, &cat_id)
+                self.recover_authorized_blockd(&context, &cat_id, false)
+            }
+            LocalPublicationRecoveryEvidence::AuthorizedBlockdTakeoverPublication { cat_id } => {
+                self.recover_authorized_blockd(&context, &cat_id, true)
             }
             LocalPublicationRecoveryEvidence::RootProvisionStopReceipt { cat_id }
             | LocalPublicationRecoveryEvidence::RootProvisionStopReceiptPublication { cat_id } => {
@@ -1477,7 +1620,12 @@ impl SignedRunningAcquireEffect {
                     .context("persist normal-acquire request before authority mutation")?,
                 fresh_request,
             ),
-            Some(stored) => match persisted_acquire_request(stored.checkpoint(), desired, volume) {
+            Some(stored) => match persisted_acquire_request(
+                stored.checkpoint(),
+                desired,
+                volume,
+                context.state_directory().path(),
+            ) {
                 Some(persisted) => {
                     let persisted = persisted.clone();
                     (
@@ -1576,6 +1724,15 @@ impl SignedRunningAcquireEffect {
             }
         };
 
+        if !normal_publication_closes_checkpoint_predecessor(
+            predecessor.checkpoint(),
+            desired,
+            volume,
+            &attachment,
+        ) {
+            return Ok(RuntimeDesiredEffectOutcome::RefreshInventory);
+        }
+
         self.persist_provision_step(
             context,
             desired,
@@ -1608,6 +1765,9 @@ impl SignedRunningAcquireEffect {
             MultiAcquireAdmission::Exact(runtime) => runtime,
             MultiAcquireAdmission::RefreshInventory => {
                 return Ok(RuntimeDesiredEffectOutcome::RefreshInventory)
+            }
+            MultiAcquireAdmission::ReplanDesired => {
+                return Ok(RuntimeDesiredEffectOutcome::ReplanDesired)
             }
             MultiAcquireAdmission::StopLocal => return Ok(stop_local()),
         };
@@ -1688,6 +1848,21 @@ impl SignedRunningAcquireEffect {
                 stored
             }
         };
+
+        if matches!(volume.acquire, VolumeAcquire::Normal { .. })
+            && !normal_checkpoint_predecessor_matches_accepted(
+                predecessor.checkpoint(),
+                runtime,
+                volume,
+            )
+        {
+            // Before A22, the fresh point-read authority and the durable
+            // unprepared checkpoint predecessor must be the same exact
+            // Unowned tuple. A grant publication window is represented by an
+            // exact local lineage and is closed after the idempotent result
+            // below; no malformed predecessor may reach a new mutation.
+            return Ok(RuntimeDesiredEffectOutcome::RefreshInventory);
+        }
 
         let accepted_context = NormalAcquireAcceptedContext {
             session: accepted.session().clone(),
@@ -1835,10 +2010,46 @@ impl SignedRunningAcquireEffect {
                     }
                 };
                 context.check_active()?;
+                let accepted_current = runtime
+                    .volumes
+                    .iter()
+                    .find(|observed| observed.volume_id == volume.volume_id)
+                    .context("accepted full set lacks the takeover current Volume")?;
+                let VolumeAuthorization::Takeover(authorization) =
+                    &evidence.authorization.authorization
+                else {
+                    return Ok(stop_local());
+                };
+                let prior = predecessor
+                    .checkpoint()
+                    .volumes
+                    .iter()
+                    .find(|observed| observed.volume_id == volume.volume_id)
+                    .context("takeover checkpoint lacks its durable predecessor Volume")?;
+                if !(signed_takeover_current_matches_observed(&evidence, accepted_current)
+                    || (accepted_current == prior
+                        && takeover_predecessor_is_exact(
+                            accepted_current,
+                            volume,
+                            authorization,
+                            &receipt,
+                        )))
+                {
+                    return Ok(RuntimeDesiredEffectOutcome::RefreshInventory);
+                }
+                context.check_active()?;
+                let current = self.authority.load_volume(&volume.volume_id);
+                context.check_active()?;
+                match signed_takeover_successor_matches_point_read(&evidence, current) {
+                    Ok(true) => {}
+                    Ok(false) => return Ok(RuntimeDesiredEffectOutcome::RefreshInventory),
+                    Err(_) => return Ok(RuntimeDesiredEffectOutcome::RetryExact),
+                }
                 Box::new(
                     takeover_attachment_from_signed_evidence(
                         desired,
                         volume,
+                        prior,
                         &evidence,
                         &receipt,
                         grant.as_ref(),
@@ -1847,6 +2058,16 @@ impl SignedRunningAcquireEffect {
                 )
             }
         };
+        if matches!(volume.acquire, VolumeAcquire::Normal { .. })
+            && !normal_publication_closes_checkpoint_predecessor(
+                predecessor.checkpoint(),
+                desired,
+                volume,
+                &attachment,
+            )
+        {
+            return Ok(RuntimeDesiredEffectOutcome::RefreshInventory);
+        }
         let prepared = AuthorizedBlockdStore::new(context.state_directory().clone())
             .prepare(desired, volume, &attachment)
             .context("persist exact multi-volume authorized blockd grant")?;
@@ -2084,6 +2305,50 @@ impl RuntimeDesiredEffect for SignedRunningAcquireEffect {
         desired: &DesiredRuntimeSpec,
     ) -> anyhow::Result<RuntimeDesiredEffectOutcome> {
         context.check_active()?;
+        // The production composition always injects the takeover evidence
+        // port, including for a one-volume Normal Desired.  Preserve the
+        // mature single-volume stale/replan state machine before dispatching
+        // the clean-slate current multi-volume producer; capability presence
+        // must not reinterpret an already-durable Acquire/Provision/Cleanup
+        // checkpoint.
+        let legacy_replan_state = desired.volumes.len() == 1
+            && desired
+                .volumes
+                .first()
+                .is_some_and(|volume| matches!(volume.acquire, VolumeAcquire::Normal { .. }))
+            && context.accepted_full().ok().is_some_and(|accepted| {
+                let mut runtimes = accepted
+                    .observation()
+                    .runtimes
+                    .iter()
+                    .filter(|runtime| runtime.cat_id == desired.cat_id);
+                runtimes.next().is_some_and(|runtime| {
+                    runtimes.next().is_none()
+                        && (matches!(
+                            runtime.step,
+                            ReconcileStep::CleanupRelease { .. } | ReconcileStep::Quarantined
+                        ) || (matches!(runtime.step, ReconcileStep::AcquireVolume { .. })
+                            && runtime.volumes.iter().any(|volume| {
+                                matches!(volume.authority, VolumeAuthorityEvidence::Owned { .. })
+                            }))
+                            || matches!(
+                                &runtime.checkpoint,
+                                CheckpointEvidence::Valid {
+                                    placement_epoch,
+                                    desired_revision,
+                                    spec_digest,
+                                    ..
+                                } if *placement_epoch != desired.placement.placement_epoch
+                                    || *desired_revision != desired.desired_revision
+                                    || spec_digest != &desired.spec_digest
+                            ))
+                })
+            });
+        if legacy_replan_state {
+            if let Some(outcome) = self.apply_checkpoint_replan(&context, desired)? {
+                return Ok(outcome);
+            }
+        }
         if self.volume_evidence.is_some() || desired.volumes.len() > 1 {
             return self.apply_multi_acquire(&context, desired);
         }
@@ -2097,6 +2362,7 @@ impl RuntimeDesiredEffect for SignedRunningAcquireEffect {
 enum MultiAcquireAdmission<'a> {
     Exact(&'a ObservedRuntimeStatus),
     RefreshInventory,
+    ReplanDesired,
     StopLocal,
 }
 
@@ -2158,15 +2424,10 @@ fn validate_multi_acquire_admission<'a>(
         || runtime.lifecycle_admission != LifecycleAdmission::Closed
         || !runtime.routes.is_empty()
         || runtime.platform_guards != 0
-        || runtime.conditions
-            != [Condition::Progressing {
-                reason: ProgressingReason::ReconcileStep {
-                    step: runtime.step.clone(),
-                },
-            }]
     {
         return MultiAcquireAdmission::StopLocal;
     }
+    let mut closed_takeover_history = false;
     for intent in &desired.volumes {
         let Some(observed) = runtime
             .volumes
@@ -2228,20 +2489,10 @@ fn validate_multi_acquire_admission<'a>(
                 }
             }
             VolumeAcquire::Takeover { authorization_id } => {
-                let VolumeAuthorityEvidence::Owned {
-                    attachment_id,
-                    attachment_epoch,
-                    head,
-                } = &observed.authority
-                else {
-                    return MultiAcquireAdmission::StopLocal;
-                };
                 match observed.local_lineages.as_slice() {
                     [] => {}
                     [lineage]
-                        if attachment_id == &intent.attachment_id
-                            && *attachment_epoch == lineage.attachment_epoch
-                            && lineage.attachment_id == intent.attachment_id
+                        if lineage.attachment_id == intent.attachment_id
                             && lineage.acquire_origin
                                 == (AcquireOrigin::Takeover {
                                     authorization_id: authorization_id.clone(),
@@ -2263,20 +2514,58 @@ fn validate_multi_acquire_admission<'a>(
                         ) else {
                             return MultiAcquireAdmission::StopLocal;
                         };
-                        if observed.local_lineages
-                            != [expected_local_lineage_at_head(
-                                &identity,
-                                &data_directory,
-                                head,
-                            )]
-                        {
-                            return MultiAcquireAdmission::StopLocal;
+                        match (&observed.authority, lineage.state) {
+                            (
+                                VolumeAuthorityEvidence::Owned {
+                                    attachment_id,
+                                    attachment_epoch,
+                                    head,
+                                },
+                                LocalLineageState::Active,
+                            ) if attachment_id == &intent.attachment_id
+                                && *attachment_epoch == lineage.attachment_epoch
+                                && observed.local_lineages
+                                    == [expected_local_lineage_at_head(
+                                        &identity,
+                                        &data_directory,
+                                        head,
+                                    )] => {}
+                            (
+                                VolumeAuthorityEvidence::Owned { head, .. }
+                                | VolumeAuthorityEvidence::Unowned { head, .. },
+                                LocalLineageState::Released,
+                            ) if lineage.fenced
+                                && lineage.pending_pack_count.get() == 0
+                                && lineage.local_durable_generation
+                                    == lineage.remote_durable_generation
+                                && lineage.local_durable_generation <= head.generation
+                                && lineage.data_directory == data_directory =>
+                            {
+                                closed_takeover_history = true;
+                            }
+                            _ => return MultiAcquireAdmission::StopLocal,
                         }
                     }
                     _ => return MultiAcquireAdmission::StopLocal,
                 }
             }
         }
+    }
+    if closed_takeover_history {
+        return if runtime.conditions.is_empty() {
+            MultiAcquireAdmission::ReplanDesired
+        } else {
+            MultiAcquireAdmission::StopLocal
+        };
+    }
+    if runtime.conditions
+        != [Condition::Progressing {
+            reason: ProgressingReason::ReconcileStep {
+                step: runtime.step.clone(),
+            },
+        }]
+    {
+        return MultiAcquireAdmission::StopLocal;
     }
     let checkpoint_path =
         runtime_checkpoint_path(&state_directory.join(CHECKPOINT_NAMESPACE), &desired.cat_id);
@@ -2349,6 +2638,112 @@ fn multi_acquire_head_matches_intent(intent: &VolumeIntent, head: &RemoteHead) -
         },
         _ => false,
     }
+}
+
+pub(super) fn multi_acquire_checkpoint_is_bound(
+    checkpoint: &RuntimeCheckpoint,
+    desired: &DesiredRuntimeSpec,
+    state_directory: &std::path::Path,
+) -> bool {
+    let ReconcileStep::AcquireVolume { request } = &checkpoint.step else {
+        return false;
+    };
+    let mut targets = desired
+        .volumes
+        .iter()
+        .filter(|intent| request_matches_volume(request, desired, intent));
+    let Some(target) = targets.next() else {
+        return false;
+    };
+    if targets.next().is_some()
+        || checkpoint.version != ContractVersion::V1
+        || checkpoint.cat_id != desired.cat_id
+        || checkpoint.node_id != desired.placement.node_id
+        || checkpoint.placement_epoch != desired.placement.placement_epoch
+        || checkpoint.desired_revision != desired.desired_revision
+        || checkpoint.spec_digest != desired.spec_digest
+        || checkpoint.runtime_incarnation.is_some()
+        || checkpoint.runtime_launch.identity().is_some()
+        || checkpoint.stable_state.is_some()
+        || !checkpoint.processes.is_empty()
+        || checkpoint.volumes.len() != desired.volumes.len()
+        || !checkpoint.mounts.is_empty()
+        || !checkpoint.networks.is_empty()
+        || !matches!(
+            checkpoint.guest_transport,
+            GuestTransportEvidence::Unavailable
+        )
+        || !matches!(checkpoint.warm_snapshot, WarmSnapshotEvidence::Absent)
+        || checkpoint.lifecycle_admission != LifecycleAdmission::Closed
+        || !checkpoint.route_gates.is_empty()
+        || !matches!(
+            checkpoint.require_idle,
+            RequireIdleCheckpoint::NotApplicable
+        )
+    {
+        return false;
+    }
+    desired.volumes.iter().all(|intent| {
+        let mut observed_matches = checkpoint
+            .volumes
+            .iter()
+            .filter(|observed| observed.volume_id == intent.volume_id);
+        let Some(observed) = observed_matches.next() else {
+            return false;
+        };
+        if observed_matches.next().is_some()
+            || observed.volume_intent_id.as_ref() != Some(&intent.volume_intent_id)
+            || observed.disk_id.as_ref() != Some(&intent.disk_id)
+            || observed.disk_kind
+                != match intent.disk_kind {
+                    DiskKind::Root => ObservedDiskKind::Root,
+                    DiskKind::Persistent => ObservedDiskKind::Persistent,
+                }
+            || observed.size_bytes != Some(intent.size_bytes)
+            || observed.durability != Some(intent.durability)
+            || !observed.devices.is_empty()
+            || !observed_authority_head(observed)
+                .is_some_and(|head| multi_acquire_head_matches_intent(intent, head))
+        {
+            return false;
+        }
+        if prepared_observed_volume_is_exact(desired, intent, observed, state_directory) {
+            return true;
+        }
+        match (&intent.acquire, &observed.authority) {
+            (
+                VolumeAcquire::Normal {
+                    expected_unowned_epoch,
+                    ..
+                },
+                VolumeAuthorityEvidence::Unowned {
+                    attachment_epoch, ..
+                },
+            ) => attachment_epoch == expected_unowned_epoch && observed.local_lineages.is_empty(),
+            (
+                VolumeAcquire::Normal {
+                    expected_unowned_epoch,
+                    ..
+                },
+                VolumeAuthorityEvidence::Owned {
+                    attachment_id,
+                    attachment_epoch,
+                    ..
+                },
+            ) if intent.volume_id == target.volume_id => {
+                observed.local_lineages.is_empty()
+                    && attachment_id == &intent.attachment_id
+                    && expected_unowned_epoch
+                        .get()
+                        .checked_add(1)
+                        .is_some_and(|next| next == attachment_epoch.get())
+            }
+            (VolumeAcquire::Takeover { .. }, VolumeAuthorityEvidence::Owned { .. }) => {
+                observed.local_lineages.is_empty()
+            }
+            _ => false,
+        }
+    })
 }
 
 fn expected_local_lineage_at_head(
@@ -2812,6 +3207,7 @@ fn record_matches_attachment_lineage(
 fn takeover_attachment_from_signed_evidence(
     desired: &DesiredRuntimeSpec,
     volume: &VolumeIntent,
+    prior: &ObservedVolume,
     evidence: &RuntimeVolumeTransitionEvidenceSuccess,
     decision_receipt: &cats_api::runtime_reconciliation::TakeoverConsumedReceipt,
     grant: Option<&VolumeLeaseGrant>,
@@ -2828,7 +3224,6 @@ fn takeover_attachment_from_signed_evidence(
     let AuthorizationConsumedReceipt::Takeover(stored_receipt) = stored_receipt.as_ref() else {
         return None;
     };
-    let record = evidence.current_volume.as_ref()?;
     let lease_expires_at = decision_receipt
         .consumed_at
         .get()
@@ -2842,19 +3237,8 @@ fn takeover_attachment_from_signed_evidence(
         || authorization.new_attachment_id != volume.attachment_id
         || authorization.desired_revision != desired.desired_revision
         || authorization.new_placement_epoch != desired.placement.placement_epoch
-        || record.volume_id != volume.volume_id
-        || record.size_bytes != volume.size_bytes
-        || record.durability != volume.durability
-        || !matches!(record.admin_state, VolumeAdminState::Active)
-        || record.lease_owner.as_ref() != Some(&volume.attachment_id)
-        || record.lease_epoch != decision_receipt.resulting_epoch
-        || record.lease_expires_at != Some(lease_expires_at)
-        || record.head != decision_receipt.resulting_head
-        || record.last_transition
-            != Some(LastVolumeTransition::Takeover {
-                authorization_id: authorization_id.clone(),
-            })
-        || !multi_acquire_head_matches_intent(volume, &record.head)
+        || !takeover_predecessor_is_exact(prior, volume, authorization, decision_receipt)
+        || !multi_acquire_head_matches_intent(volume, &decision_receipt.resulting_head)
     {
         return None;
     }
@@ -2864,7 +3248,7 @@ fn takeover_attachment_from_signed_evidence(
             || grant.attachment_epoch != decision_receipt.resulting_epoch
             || grant.size_bytes != volume.size_bytes
             || grant.durability != volume.durability
-            || grant.head != record.head
+            || grant.head != decision_receipt.resulting_head
             || grant.lease_expires_at != lease_expires_at
             || grant.acquire_origin
                 != (AcquireOrigin::Takeover {
@@ -2886,16 +3270,230 @@ fn takeover_attachment_from_signed_evidence(
         },
         size_bytes: volume.size_bytes,
         durability: volume.durability,
-        head: record.head.clone(),
+        // This publication is the immutable R0 acquire artifact. A signed
+        // current record may already be a renewed/head-advanced/released or
+        // higher-epoch successor; it proves closure but must never rewrite the
+        // primary grant that was lost before local durability.
+        head: decision_receipt.resulting_head.clone(),
         lease_expires_at,
         acquire: AuthorizedServingAcquire::Takeover {
             authorization: authorization.clone(),
             receipt: stored_receipt.clone(),
         },
     };
-    (validate_authorized_serving_attachment(&attachment).is_ok()
-        && validate_authorized_serving_record(record, &attachment, Some(lease_expires_at)).is_ok())
-    .then_some(attachment)
+    validate_authorized_serving_attachment(&attachment)
+        .is_ok()
+        .then_some(attachment)
+}
+
+fn takeover_predecessor_is_exact(
+    observed: &ObservedVolume,
+    volume: &VolumeIntent,
+    authorization: &cats_api::runtime_reconciliation::VolumeTakeoverAuthorization,
+    receipt: &cats_api::runtime_reconciliation::TakeoverConsumedReceipt,
+) -> bool {
+    observed.volume_intent_id.as_ref() == Some(&volume.volume_intent_id)
+        && observed.disk_id.as_ref() == Some(&volume.disk_id)
+        && observed.volume_id == volume.volume_id
+        && observed.disk_kind
+            == match volume.disk_kind {
+                DiskKind::Root => ObservedDiskKind::Root,
+                DiskKind::Persistent => ObservedDiskKind::Persistent,
+            }
+        && observed.size_bytes == Some(volume.size_bytes)
+        && observed.durability == Some(volume.durability)
+        && observed.local_lineages.is_empty()
+        && observed.devices.is_empty()
+        && matches!(
+            &observed.authority,
+            VolumeAuthorityEvidence::Owned {
+                attachment_id,
+                attachment_epoch,
+                head,
+            } if attachment_id == &authorization.expected_attachment_id
+                && *attachment_epoch == authorization.expected_epoch
+                && multi_acquire_head_matches_intent(volume, head)
+                // A Takeover preserves the locked predecessor head.  The
+                // authorization has no head field, so the Control-signed
+                // consumed receipt is the canonical exact binding for the
+                // durable checkpoint predecessor.  A merely lower/compatible
+                // head could otherwise borrow an unrelated valid receipt.
+                && head == &receipt.resulting_head
+        )
+}
+
+fn normal_checkpoint_predecessor_matches_accepted(
+    checkpoint: &RuntimeCheckpoint,
+    accepted: &ObservedRuntimeStatus,
+    volume: &VolumeIntent,
+) -> bool {
+    let Some(durable) = checkpoint
+        .volumes
+        .iter()
+        .find(|observed| observed.volume_id == volume.volume_id)
+    else {
+        return false;
+    };
+    let Some(current) = accepted
+        .volumes
+        .iter()
+        .find(|observed| observed.volume_id == volume.volume_id)
+    else {
+        return false;
+    };
+    // An exact local publication can legitimately be one item ahead of the
+    // checkpoint CAS. The full scanner value-binds that artifact separately.
+    // Without such a lineage, the accepted point read must reproduce every
+    // durable predecessor byte before A22 is reachable.
+    !current.local_lineages.is_empty() || current == durable
+}
+
+fn normal_publication_closes_checkpoint_predecessor(
+    checkpoint: &RuntimeCheckpoint,
+    desired: &DesiredRuntimeSpec,
+    volume: &VolumeIntent,
+    attachment: &AuthorizedServingAttachment,
+) -> bool {
+    let Some((request, result)) = attachment.normal_acquire() else {
+        return false;
+    };
+    let Some(prior) = checkpoint
+        .volumes
+        .iter()
+        .find(|observed| observed.volume_id == volume.volume_id)
+    else {
+        return false;
+    };
+    prior.volume_intent_id.as_ref() == Some(&volume.volume_intent_id)
+        && prior.disk_id.as_ref() == Some(&volume.disk_id)
+        && prior.volume_id == volume.volume_id
+        && prior.disk_kind
+            == match volume.disk_kind {
+                DiskKind::Root => ObservedDiskKind::Root,
+                DiskKind::Persistent => ObservedDiskKind::Persistent,
+            }
+        && prior.size_bytes == Some(volume.size_bytes)
+        && prior.durability == Some(volume.durability)
+        && prior.local_lineages.is_empty()
+        && prior.devices.is_empty()
+        && matches!(
+            &prior.authority,
+            VolumeAuthorityEvidence::Unowned {
+                attachment_epoch,
+                head,
+            } if *attachment_epoch == request.expected_unowned_epoch
+                // NormalAcquire preserves the locked Unowned head. Both the
+                // checkpoint predecessor and immutable local R0 therefore
+                // bind the signed result exactly; monotonic compatibility is
+                // insufficient for a publication-recovery boundary.
+                && head == &result.resulting_head
+        )
+        && attachment.head == result.resulting_head
+        && request_matches_volume(&attachment.checkpoint_acquire_request(), desired, volume)
+        && multi_acquire_head_matches_intent(volume, &result.resulting_head)
+        && validate_authorized_serving_attachment(attachment).is_ok()
+}
+
+fn signed_takeover_successor_matches_point_read(
+    evidence: &RuntimeVolumeTransitionEvidenceSuccess,
+    current: cats_storage::authority::Result<VolumeRecord>,
+) -> anyhow::Result<bool> {
+    match (evidence.current_volume.as_ref(), current) {
+        (Some(signed), Ok(point)) => Ok(validate_volume_record(signed).is_ok() && point == *signed),
+        (None, Err(AuthorityError::NotFound)) if evidence.delete_completion.is_some() => Ok(true),
+        (_, Err(AuthorityError::BackendUnknown)) => {
+            anyhow::bail!("volume authority unavailable during takeover publication recovery")
+        }
+        _ => Ok(false),
+    }
+}
+
+fn takeover_successor_requires_immediate_replan(
+    evidence: &RuntimeVolumeTransitionEvidenceSuccess,
+    primary_authorization_id: &Id,
+    primary_receipt: &cats_api::runtime_reconciliation::TakeoverConsumedReceipt,
+) -> bool {
+    if evidence.delete_completion.is_some() || evidence.current_volume.is_none() {
+        return true;
+    }
+    match evidence
+        .current_volume
+        .as_ref()
+        .and_then(|record| record.last_transition.as_ref())
+    {
+        Some(LastVolumeTransition::Takeover { authorization_id }) => {
+            authorization_id != primary_authorization_id
+        }
+        Some(LastVolumeTransition::Release { request, .. }) => {
+            request.attachment_id != primary_receipt.new_attachment_id
+                || request.expected_epoch != primary_receipt.resulting_epoch
+        }
+        Some(LastVolumeTransition::NormalAcquire { .. }) => false,
+        Some(
+            LastVolumeTransition::BeginDelete { .. }
+            | LastVolumeTransition::BeginDisposableDelete { .. },
+        )
+        | None => true,
+    }
+}
+
+fn signed_takeover_current_matches_observed(
+    evidence: &RuntimeVolumeTransitionEvidenceSuccess,
+    observed: &ObservedVolume,
+) -> bool {
+    let Some(current) = evidence.current_volume.as_ref() else {
+        return false;
+    };
+    if validate_volume_record(current).is_err()
+        || current.volume_id != observed.volume_id
+        || Some(current.size_bytes) != observed.size_bytes
+        || Some(current.durability) != observed.durability
+    {
+        return false;
+    }
+    match (
+        &current.admin_state,
+        &current.lease_owner,
+        &observed.authority,
+    ) {
+        (
+            VolumeAdminState::Active,
+            Some(owner),
+            VolumeAuthorityEvidence::Owned {
+                attachment_id,
+                attachment_epoch,
+                head,
+            },
+        ) => {
+            owner == attachment_id
+                && current.lease_epoch == *attachment_epoch
+                && current.head == *head
+        }
+        (
+            VolumeAdminState::Active,
+            None,
+            VolumeAuthorityEvidence::Unowned {
+                attachment_epoch,
+                head,
+            },
+        ) => current.lease_epoch == *attachment_epoch && current.head == *head,
+        (
+            VolumeAdminState::Deleting {
+                delete_id: current_id,
+            },
+            None,
+            VolumeAuthorityEvidence::Deleting {
+                delete_id,
+                attachment_epoch,
+                head,
+            },
+        ) => {
+            current_id == delete_id
+                && current.lease_epoch == *attachment_epoch
+                && current.head == *head
+        }
+        _ => false,
+    }
 }
 
 fn local_lineage_is_absent_or_exact(
@@ -3576,6 +4174,8 @@ fn normal_acquire_request_with_binding(
 fn recovery_volume<'a>(
     desired: &'a DesiredRuntimeSpec,
     session: &SessionBinding,
+    checkpoint: &RuntimeCheckpoint,
+    state_directory: &std::path::Path,
 ) -> Option<&'a VolumeIntent> {
     if encode_desired_runtime_spec(desired).is_err()
         || desired.version != ContractVersion::V1
@@ -3585,13 +4185,21 @@ fn recovery_volume<'a>(
     {
         return None;
     }
-    let [volume] = desired.volumes.as_slice() else {
+    if !multi_acquire_checkpoint_is_bound(checkpoint, desired, state_directory) {
+        return None;
+    }
+    let ReconcileStep::AcquireVolume { request } = &checkpoint.step else {
         return None;
     };
-    if !matches!(volume.acquire, VolumeAcquire::Normal { .. })
-        || volume.disk_kind != DiskKind::Root
-        || volume.access != VolumeAccess::ReadWriteOnce
-        || volume.mount.is_some()
+    let mut volumes = desired
+        .volumes
+        .iter()
+        .filter(|volume| request_matches_volume(request, desired, volume));
+    let volume = volumes.next()?;
+    if volumes.next().is_some() {
+        return None;
+    }
+    if volume.access != VolumeAccess::ReadWriteOnce
         || !matches!(volume.disposition, VolumeDisposition::Retain)
     {
         return None;
@@ -3682,6 +4290,7 @@ fn persisted_acquire_request<'a>(
     checkpoint: &'a RuntimeCheckpoint,
     desired: &DesiredRuntimeSpec,
     volume: &VolumeIntent,
+    state_directory: &std::path::Path,
 ) -> Option<&'a VolumeAcquireRequest> {
     let ReconcileStep::AcquireVolume { request } = &checkpoint.step else {
         return None;
@@ -3689,15 +4298,7 @@ fn persisted_acquire_request<'a>(
     if !request_matches_volume(request, desired, volume) {
         return None;
     }
-    let expected = acquire_checkpoint(
-        desired,
-        volume,
-        RuntimeVolumeTransition::Acquire {
-            request: request.clone(),
-        },
-        checkpoint.updated_at_unix_ms,
-    );
-    (checkpoint == &expected).then_some(request)
+    multi_acquire_checkpoint_is_bound(checkpoint, desired, state_directory).then_some(request)
 }
 
 pub(super) fn unowned_observed_volume(volume: &VolumeIntent) -> ObservedVolume {
@@ -3712,7 +4313,10 @@ pub(super) fn unowned_observed_volume(volume: &VolumeIntent) -> ObservedVolume {
         volume_intent_id: Some(volume.volume_intent_id.clone()),
         disk_id: Some(volume.disk_id.clone()),
         volume_id: volume.volume_id.clone(),
-        disk_kind: ObservedDiskKind::Root,
+        disk_kind: match volume.disk_kind {
+            DiskKind::Root => ObservedDiskKind::Root,
+            DiskKind::Persistent => ObservedDiskKind::Persistent,
+        },
         size_bytes: Some(volume.size_bytes),
         durability: Some(volume.durability),
         authority: VolumeAuthorityEvidence::Unowned {
@@ -3787,20 +4391,6 @@ pub(super) fn provision_checkpoint_is_bound(
     else {
         return false;
     };
-    let VolumeAcquire::Normal {
-        expected_unowned_epoch,
-        ..
-    } = volume.acquire
-    else {
-        return false;
-    };
-    let Some(expected_identity) =
-        expected_attachment_identity(desired, volume, expected_unowned_epoch)
-    else {
-        return false;
-    };
-    let expected_data_directory =
-        authorized_blockd_data_directory(state_directory, desired, &expected_identity);
     let Some(observed_volume) = checkpoint
         .volumes
         .iter()
@@ -3808,31 +4398,18 @@ pub(super) fn provision_checkpoint_is_bound(
     else {
         return false;
     };
-    let observed_head = match &observed_volume.authority {
-        VolumeAuthorityEvidence::Owned {
-            attachment_id: observed_attachment_id,
-            attachment_epoch: observed_attachment_epoch,
-            head,
-        } if observed_attachment_id == attachment_id
-            && observed_attachment_epoch == attachment_epoch
-            && (head == expected_blank_head || head == expected_provisioned_head) =>
-        {
-            head
-        }
-        _ => return false,
+    let Some((expected_identity, observed_head)) = prepared_observed_volume_identity_if_exact(
+        desired,
+        volume,
+        observed_volume,
+        state_directory,
+    ) else {
+        return false;
     };
-    let mut expected_lineage = expected_local_lineage(&expected_identity, data_directory);
-    expected_lineage.local_durable_generation = observed_head.generation;
-    expected_lineage.remote_durable_generation = observed_head.generation;
-    let observed_volume_matches = observed_volume.volume_intent_id.as_ref()
-        == Some(&volume.volume_intent_id)
-        && observed_volume.disk_id.as_ref() == Some(&volume.disk_id)
-        && observed_volume.volume_id == volume.volume_id
-        && observed_volume.disk_kind == ObservedDiskKind::Root
-        && observed_volume.size_bytes == Some(volume.size_bytes)
-        && observed_volume.durability == Some(volume.durability)
-        && observed_volume.local_lineages == [expected_lineage]
-        && observed_volume.devices.is_empty();
+    let expected_data_directory =
+        authorized_blockd_data_directory(state_directory, desired, &expected_identity);
+    let observed_volume_matches =
+        observed_head == *expected_blank_head || observed_head == *expected_provisioned_head;
     checkpoint.version == ContractVersion::V1
         && checkpoint.cat_id == desired.cat_id
         && checkpoint.node_id == desired.placement.node_id
@@ -3891,24 +4468,17 @@ fn prepared_observed_volume_is_exact(
     observed: &ObservedVolume,
     state_directory: &std::path::Path,
 ) -> bool {
-    let VolumeAcquire::Normal {
-        expected_unowned_epoch,
-        ..
-    } = intent.acquire
-    else {
-        return false;
-    };
-    let Some(identity) = expected_attachment_identity(desired, intent, expected_unowned_epoch)
-    else {
-        return false;
-    };
-    let expected_data_directory =
-        authorized_blockd_data_directory(state_directory, desired, &identity);
-    let Ok(expected_data_directory) = host_path(
-        &expected_data_directory,
-        "prepared observed Volume data directory",
-    ) else {
-        return false;
+    prepared_observed_volume_identity_if_exact(desired, intent, observed, state_directory).is_some()
+}
+
+fn prepared_observed_volume_identity_if_exact(
+    desired: &DesiredRuntimeSpec,
+    intent: &VolumeIntent,
+    observed: &ObservedVolume,
+    state_directory: &std::path::Path,
+) -> Option<(AttachmentLineageIdentity, RemoteHead)> {
+    let [lineage] = observed.local_lineages.as_slice() else {
+        return None;
     };
     let VolumeAuthorityEvidence::Owned {
         attachment_id,
@@ -3916,28 +4486,76 @@ fn prepared_observed_volume_is_exact(
         head,
     } = &observed.authority
     else {
-        return false;
+        return None;
     };
-    observed.volume_intent_id.as_ref() == Some(&intent.volume_intent_id)
-        && observed.disk_id.as_ref() == Some(&intent.disk_id)
-        && observed.volume_id == intent.volume_id
-        && observed.disk_kind
-            == match intent.disk_kind {
+    let acquire_is_exact = match (&intent.acquire, &lineage.acquire_origin) {
+        (
+            VolumeAcquire::Normal {
+                transition_id,
+                expected_unowned_epoch,
+            },
+            AcquireOrigin::Normal {
+                transition_id: observed,
+            },
+        ) => {
+            observed == transition_id
+                && expected_unowned_epoch
+                    .get()
+                    .checked_add(1)
+                    .is_some_and(|next| next == attachment_epoch.get())
+        }
+        (
+            VolumeAcquire::Takeover { authorization_id },
+            AcquireOrigin::Takeover {
+                authorization_id: observed,
+            },
+        ) => observed == authorization_id,
+        _ => false,
+    };
+    if !acquire_is_exact
+        || observed.volume_intent_id.as_ref() != Some(&intent.volume_intent_id)
+        || observed.disk_id.as_ref() != Some(&intent.disk_id)
+        || observed.volume_id != intent.volume_id
+        || observed.disk_kind
+            != match intent.disk_kind {
                 DiskKind::Root => ObservedDiskKind::Root,
                 DiskKind::Persistent => ObservedDiskKind::Persistent,
             }
-        && observed.size_bytes == Some(intent.size_bytes)
-        && observed.durability == Some(intent.durability)
-        && observed.devices.is_empty()
-        && attachment_id == &intent.attachment_id
-        && *attachment_epoch == identity.attachment_epoch
-        && multi_acquire_head_matches_intent(intent, head)
-        && observed.local_lineages
-            == [expected_local_lineage_at_head(
-                &identity,
-                &expected_data_directory,
-                head,
-            )]
+        || observed.size_bytes != Some(intent.size_bytes)
+        || observed.durability != Some(intent.durability)
+        || !observed.devices.is_empty()
+        || attachment_id != &intent.attachment_id
+        || *attachment_epoch != lineage.attachment_epoch
+        || lineage.attachment_id != intent.attachment_id
+        || lineage.node_id != desired.placement.node_id
+        || lineage.placement_epoch != desired.placement.placement_epoch
+        || !multi_acquire_head_matches_intent(intent, head)
+    {
+        return None;
+    }
+    let identity = AttachmentLineageIdentity {
+        volume_id: intent.volume_id.clone(),
+        attachment_id: lineage.attachment_id.clone(),
+        attachment_epoch: lineage.attachment_epoch,
+        acquire_origin: lineage.acquire_origin.clone(),
+        node_id: lineage.node_id.clone(),
+        placement_epoch: lineage.placement_epoch,
+    };
+    let expected_data_directory =
+        authorized_blockd_data_directory(state_directory, desired, &identity);
+    let Ok(expected_data_directory) = host_path(
+        &expected_data_directory,
+        "prepared observed Volume data directory",
+    ) else {
+        return None;
+    };
+    (observed.local_lineages
+        == [expected_local_lineage_at_head(
+            &identity,
+            &expected_data_directory,
+            head,
+        )])
+    .then(|| (identity, head.clone()))
 }
 
 fn root_provision_scope_id_is_canonical(scope_id: &Id) -> bool {
@@ -4033,11 +4651,14 @@ mod tests {
     use cats_api::runtime_reconciliation::{
         checkpoint_content_digest, decode_desired_runtime_spec, decode_runtime_checkpoint,
         spec_digest, AcquireOrigin, AdmissionInventoryAttestation, AgentSession, AssignedKind,
-        AssignedPlacement, AuthorizationRecord, DesiredReadSnapshot, Epoch, GuestDeviceIdentity,
-        Ipv4Address, IsolatedIpv4Kind, LastVolumeTransition, MacAddress, NetworkConfig, NodeBootId,
-        NodeObservation, NormalAcquireRequest, NormalAcquireResult, Revision, RuntimeConfig,
-        RuntimeVolumeAuthorityRejection, RuntimeVolumeTransitionPreconditionProblem, Sequence,
-        TakeoverConsumedReceipt, VolumeAdminState, VolumeRecord, VolumeTakeoverAuthorization,
+        AssignedPlacement, AuthorizationRecord, BeginDeleteRequest,
+        BeginDisposableDeleteConsumedReceipt, DeleteCompletionReceipt, DesiredReadSnapshot,
+        DisposableDeleteIsolationBasis, DisposableRootDeleteAuthorization, Epoch,
+        GuestDeviceIdentity, Ipv4Address, IsolatedIpv4Kind, LastVolumeTransition, MacAddress,
+        NetworkConfig, NodeBootId, NodeObservation, NormalAcquireRequest, NormalAcquireResult,
+        Revision, RuntimeConfig, RuntimeVolumeAuthorityRejection,
+        RuntimeVolumeTransitionPreconditionProblem, Sequence, TakeoverConsumedReceipt,
+        VolumeAdminState, VolumeRecord, VolumeTakeoverAuthorization,
     };
     use cats_storage::authority::{
         AttachmentLineageIdentity, RenewLeaseRequest, RenewLeaseResult, VolumeHeadCasRequest,
@@ -4109,6 +4730,7 @@ mod tests {
         outcomes: VecDeque<VolumeEvidenceRecovery>,
         requests: Vec<RuntimeVolumeTransitionEvidenceRequest>,
         deadlines: Vec<Instant>,
+        after_call: Option<Arc<dyn Fn() + Send + Sync>>,
     }
 
     struct FakeEvidence {
@@ -4121,13 +4743,22 @@ mod tests {
             request: &RuntimeVolumeTransitionEvidenceRequest,
             deadline: Instant,
         ) -> Result<VolumeEvidenceRecovery, super::super::VolumeEvidenceClientError> {
-            let mut state = self.state.lock().unwrap();
-            state.requests.push(request.clone());
-            state.deadlines.push(deadline);
-            Ok(state
-                .outcomes
-                .pop_front()
-                .unwrap_or(VolumeEvidenceRecovery::Ambiguous))
+            let (outcome, after_call) = {
+                let mut state = self.state.lock().unwrap();
+                state.requests.push(request.clone());
+                state.deadlines.push(deadline);
+                (
+                    state
+                        .outcomes
+                        .pop_front()
+                        .unwrap_or(VolumeEvidenceRecovery::Ambiguous),
+                    state.after_call.clone(),
+                )
+            };
+            if let Some(after_call) = after_call {
+                after_call();
+            }
+            Ok(outcome)
         }
     }
 
@@ -4409,6 +5040,26 @@ mod tests {
             VolumeAcquire::Normal { .. }
         ));
         (effect, state)
+    }
+
+    fn production_effect_with_release(
+        desired: &DesiredRuntimeSpec,
+        release_outcomes: Vec<NormalReleaseAttempt>,
+        authority: Arc<FakeAuthority>,
+        blob: Arc<RecordingBlob>,
+        checkpoint_path: std::path::PathBuf,
+    ) -> (
+        SignedRunningAcquireEffect,
+        Arc<Mutex<AcquireState>>,
+        Arc<Mutex<EvidenceState>>,
+    ) {
+        let (effect, acquire) =
+            effect_with_release(desired, release_outcomes, authority, blob, checkpoint_path);
+        let evidence = Arc::new(Mutex::new(EvidenceState::default()));
+        let port: Arc<dyn SignedVolumeEvidencePort> = Arc::new(FakeEvidence {
+            state: Arc::clone(&evidence),
+        });
+        (effect.with_volume_evidence(port), acquire, evidence)
     }
 
     fn production_effect(
@@ -4754,7 +5405,7 @@ mod tests {
                     AuthorizationConsumedReceipt::Takeover(receipt.clone()),
                 )),
             },
-            current_volume: Some(record),
+            current_volume: Some(record.clone()),
             delete_completion: None,
             direct_successor_authorization: None,
         };
@@ -4782,7 +5433,7 @@ mod tests {
                     receipt.clone(),
                 )),
             }],
-            Arc::new(FakeAuthority::new(Err(AuthorityError::BackendUnknown))),
+            Arc::new(FakeAuthority::new(Ok(record))),
             Arc::clone(&blob),
             path.clone(),
         );
@@ -4845,7 +5496,7 @@ mod tests {
     }
 
     #[test]
-    fn takeover_thick_evidence_requires_initial_revision_and_reopens_at_higher_revision() {
+    fn takeover_thick_evidence_requires_initial_revision_reopens_and_provisions_blank_root() {
         let root = tempfile::tempdir().unwrap();
         let mut desired = desired();
         let authorization_id = id("takeover-auth-root");
@@ -4890,6 +5541,21 @@ mod tests {
                 authorization_id: authorization_id.clone(),
             }),
         };
+        let prior = ObservedVolume {
+            volume_intent_id: Some(volume.volume_intent_id.clone()),
+            disk_id: Some(volume.disk_id.clone()),
+            volume_id: volume.volume_id.clone(),
+            disk_kind: ObservedDiskKind::Root,
+            size_bytes: Some(volume.size_bytes),
+            durability: Some(volume.durability),
+            authority: VolumeAuthorityEvidence::Owned {
+                attachment_id: authorization.expected_attachment_id.clone(),
+                attachment_epoch: authorization.expected_epoch,
+                head: blank_head(),
+            },
+            local_lineages: Vec::new(),
+            devices: Vec::new(),
+        };
         let evidence = RuntimeVolumeTransitionEvidenceSuccess {
             version: ContractVersion::V1,
             session: SessionBinding {
@@ -4905,25 +5571,27 @@ mod tests {
                     AuthorizationConsumedReceipt::Takeover(receipt.clone()),
                 )),
             },
-            current_volume: Some(record),
+            current_volume: Some(record.clone()),
             delete_completion: None,
             direct_successor_authorization: None,
         };
-        let attachment =
-            takeover_attachment_from_signed_evidence(&desired, volume, &evidence, &receipt, None)
-                .expect("exact consumed evidence must form the thick serving authority");
+        let attachment = takeover_attachment_from_signed_evidence(
+            &desired, volume, &prior, &evidence, &receipt, None,
+        )
+        .expect("exact consumed evidence must form the thick serving authority");
         assert_eq!(attachment.lease_expires_at, unix_ms(70_000));
 
         let mut wrong_revision = evidence.clone();
-        let VolumeAuthorization::Takeover(authorization) =
+        let VolumeAuthorization::Takeover(wrong_authorization) =
             &mut wrong_revision.authorization.authorization
         else {
             unreachable!()
         };
-        authorization.desired_revision = Revision::new(2).unwrap();
+        wrong_authorization.desired_revision = Revision::new(2).unwrap();
         assert!(takeover_attachment_from_signed_evidence(
             &desired,
             volume,
+            &prior,
             &wrong_revision,
             &receipt,
             None,
@@ -4942,6 +5610,81 @@ mod tests {
                 &attachment.identity,
             )
             .expect("a higher revision may retain the immutable takeover authority");
+
+        let producer_root = tempfile::tempdir().unwrap();
+        let producer_authority = Arc::new(FakeAuthority::new(Ok(record.clone())));
+        let blob = Arc::new(RecordingBlob::present(&desired));
+        let path = checkpoint_path(producer_root.path(), &desired.cat_id);
+        let grant = VolumeLeaseGrant {
+            volume_id: volume.volume_id.clone(),
+            attachment_id: volume.attachment_id.clone(),
+            attachment_epoch: receipt.resulting_epoch,
+            size_bytes: volume.size_bytes,
+            durability: volume.durability,
+            head: blank_head(),
+            lease_expires_at: attachment.lease_expires_at,
+            acquire_origin: AcquireOrigin::Takeover {
+                authorization_id: authorization_id.clone(),
+            },
+        };
+        let recovery = VolumeEvidenceRecovery::Validated {
+            evidence: Box::new(evidence.clone()),
+            decision: Box::new(VolumeEvidenceRecoveryDecision::AdoptTakeover(
+                receipt.clone(),
+            )),
+        };
+        let (effect, acquire, evidence_calls) = production_effect(
+            &desired,
+            Vec::new(),
+            vec![TakeoverAcquireAttempt::LeaseGranted(grant)],
+            vec![recovery],
+            Arc::clone(&producer_authority),
+            Arc::clone(&blob),
+            path.clone(),
+        );
+        let initial = observed_runtime_with_volumes(
+            producer_root.path(),
+            &desired,
+            None,
+            vec![prior.clone()],
+        );
+        let (initial_context, _) = context(producer_root.path(), &desired, Some(initial));
+        assert_eq!(
+            effect.apply(initial_context, &desired).unwrap(),
+            RuntimeDesiredEffectOutcome::RefreshInventory
+        );
+        assert!(acquire.lock().unwrap().requests.is_empty());
+        assert!(evidence_calls.lock().unwrap().requests.is_empty());
+
+        let first = read_checkpoint(&path);
+        let admitted = observed_runtime_with_volumes(
+            producer_root.path(),
+            &desired,
+            Some(&first),
+            vec![prior],
+        );
+        let (acquire_context, _) = context(producer_root.path(), &desired, Some(admitted));
+        assert_eq!(
+            effect.apply(acquire_context, &desired).unwrap(),
+            RuntimeDesiredEffectOutcome::RefreshInventory
+        );
+        let provision = read_checkpoint(&path);
+        assert!(matches!(
+            provision.step,
+            ReconcileStep::ProvisionRootImage { .. }
+        ));
+        assert_eq!(acquire.lock().unwrap().requests.len(), 1);
+        assert_eq!(evidence_calls.lock().unwrap().requests.len(), 1);
+
+        producer_authority.set(Ok(record));
+        let scanner_authority: Arc<dyn VolumeDataAuthority> = producer_authority;
+        let scanner_blob: Arc<dyn BlobStore> = blob;
+        let scanner =
+            fresh_scanner_with_blob(producer_root.path(), scanner_authority, scanner_blob);
+        assert!(matches!(
+            scanner.scan_complete(scan_context(&desired)).unwrap(),
+            RuntimeInventoryScanOutcome::Complete(_)
+        ));
     }
 
     #[test]
@@ -4979,7 +5722,7 @@ mod tests {
         desired.volumes.push(persistent.clone());
         desired.spec_digest = spec_digest(&desired).unwrap();
 
-        let mut takeover_observed = ObservedVolume {
+        let takeover_observed = ObservedVolume {
             volume_intent_id: Some(persistent.volume_intent_id.clone()),
             disk_id: Some(persistent.disk_id.clone()),
             volume_id: persistent.volume_id.clone(),
@@ -4993,6 +5736,19 @@ mod tests {
             },
             local_lineages: Vec::new(),
             devices: Vec::new(),
+        };
+        let prior_takeover_record = VolumeRecord {
+            volume_id: persistent.volume_id.clone(),
+            size_bytes: persistent.size_bytes,
+            durability: persistent.durability,
+            admin_state: VolumeAdminState::Active,
+            head: blank_head(),
+            lease_owner: Some(id("att-persistent-old")),
+            lease_epoch: fence(7),
+            lease_expires_at: Some(unix_ms(1_900_000_060_000)),
+            last_transition: Some(LastVolumeTransition::Takeover {
+                authorization_id: id("prior-takeover-persistent"),
+            }),
         };
         let root_attachment = attachment(&desired);
         let authority = Arc::new(FakeAuthority::new(Err(AuthorityError::BackendUnknown)));
@@ -5027,6 +5783,24 @@ mod tests {
         assert!(first_evidence.lock().unwrap().requests.is_empty());
 
         let first_checkpoint = read_checkpoint(&path);
+        authority.set_records(BTreeMap::from([
+            (
+                desired.volumes[0].volume_id.clone(),
+                Ok(unowned_record(&desired)),
+            ),
+            (
+                persistent.volume_id.clone(),
+                Ok(prior_takeover_record.clone()),
+            ),
+        ]));
+        let first_scanner_authority: Arc<dyn VolumeDataAuthority> = authority.clone();
+        let first_scanner_blob: Arc<dyn BlobStore> = blob.clone();
+        let first_scanner =
+            fresh_scanner_with_blob(root.path(), first_scanner_authority, first_scanner_blob);
+        assert!(matches!(
+            first_scanner.scan_complete(scan_context(&desired)).unwrap(),
+            RuntimeInventoryScanOutcome::Complete(_)
+        ));
         let admitted = observed_runtime_with_volumes(
             root.path(),
             &desired,
@@ -5050,6 +5824,101 @@ mod tests {
         ));
         assert_eq!(first_calls.lock().unwrap().requests.len(), 1);
         assert_eq!(blob.reads.load(Ordering::SeqCst), 0);
+        authority.set_records(BTreeMap::from([
+            (
+                root_attachment.identity.volume_id.clone(),
+                Ok(owned_record(&desired, &root_attachment)),
+            ),
+            (
+                persistent.volume_id.clone(),
+                Ok(prior_takeover_record.clone()),
+            ),
+        ]));
+        let root_data_directory = root_grant_checkpoint.volumes[0]
+            .local_lineages
+            .first()
+            .map(|lineage| std::path::PathBuf::from(lineage.data_directory.as_str()))
+            .unwrap();
+        let held_root_data_directory = root.path().join("held-root-authorized-blockd");
+        std::fs::rename(&root_data_directory, &held_root_data_directory).unwrap();
+        let missing_scanner_authority: Arc<dyn VolumeDataAuthority> = authority.clone();
+        let missing_scanner_blob: Arc<dyn BlobStore> = blob.clone();
+        let missing_scanner =
+            fresh_scanner_with_blob(root.path(), missing_scanner_authority, missing_scanner_blob);
+        assert!(
+            !matches!(
+                missing_scanner.scan_complete(scan_context(&desired)),
+                Ok(RuntimeInventoryScanOutcome::Complete(_))
+            ),
+            "a checkpointed prepared sibling cannot disappear from the actual blockd set"
+        );
+        std::fs::rename(&held_root_data_directory, &root_data_directory).unwrap();
+        let partial_scanner_authority: Arc<dyn VolumeDataAuthority> = authority.clone();
+        let partial_scanner_blob: Arc<dyn BlobStore> = blob.clone();
+        let partial_scanner =
+            fresh_scanner_with_blob(root.path(), partial_scanner_authority, partial_scanner_blob);
+        assert!(matches!(
+            partial_scanner
+                .scan_complete(scan_context(&desired))
+                .unwrap(),
+            RuntimeInventoryScanOutcome::Complete(_)
+        ));
+        for conflict in ["head", "origin", "epoch"] {
+            let scanner_authority: Arc<dyn VolumeDataAuthority> = authority.clone();
+            let scanner_blob: Arc<dyn BlobStore> = blob.clone();
+            let root_volume_id = desired.volumes[0].volume_id.clone();
+            assert_fresh_scanner_rejects_checkpoint_mutation(
+                root.path(),
+                &desired,
+                scanner_authority,
+                scanner_blob,
+                move |checkpoint| {
+                    let observed = checkpoint
+                        .volumes
+                        .iter_mut()
+                        .find(|observed| observed.volume_id == root_volume_id)
+                        .unwrap();
+                    let [lineage] = observed.local_lineages.as_mut_slice() else {
+                        panic!("Root grant must be checkpoint-prepared")
+                    };
+                    match conflict {
+                        "head" => {
+                            let conflicting = RemoteHead {
+                                generation: Generation::new(2).unwrap(),
+                                root_hash: Some(Sha256Digest::from_bytes([0x91; 32])),
+                                root_object_id: Some(
+                                    AsciiText::new("roots/checkpoint-conflict-2").unwrap(),
+                                ),
+                            };
+                            let VolumeAuthorityEvidence::Owned { head, .. } =
+                                &mut observed.authority
+                            else {
+                                panic!("prepared Root must be owned")
+                            };
+                            *head = conflicting.clone();
+                            lineage.local_durable_generation = conflicting.generation;
+                            lineage.remote_durable_generation = conflicting.generation;
+                        }
+                        "origin" => {
+                            lineage.acquire_origin = AcquireOrigin::Takeover {
+                                authorization_id: id("foreign_root_acquire_origin"),
+                            };
+                        }
+                        "epoch" => {
+                            let VolumeAuthorityEvidence::Owned {
+                                attachment_epoch, ..
+                            } = &mut observed.authority
+                            else {
+                                panic!("prepared Root must be owned")
+                            };
+                            *attachment_epoch = fence(attachment_epoch.get() + 1);
+                            lineage.attachment_epoch = *attachment_epoch;
+                        }
+                        _ => unreachable!(),
+                    }
+                },
+            );
+        }
 
         let authorization = VolumeTakeoverAuthorization {
             authorization_id: authorization_id.clone(),
@@ -5102,43 +5971,88 @@ mod tests {
                     AuthorizationConsumedReceipt::Takeover(receipt.clone()),
                 )),
             },
-            current_volume: Some(takeover_record),
+            current_volume: Some(takeover_record.clone()),
             delete_completion: None,
             direct_successor_authorization: None,
         };
         let recovery = VolumeEvidenceRecovery::Validated {
-            evidence: Box::new(evidence),
+            evidence: Box::new(evidence.clone()),
             decision: Box::new(VolumeEvidenceRecoveryDecision::AdoptTakeover(
                 receipt.clone(),
             )),
         };
+        authority.set_records(BTreeMap::from([
+            (
+                root_attachment.identity.volume_id.clone(),
+                Ok(owned_record(&desired, &root_attachment)),
+            ),
+            (persistent.volume_id.clone(), Ok(takeover_record.clone())),
+        ]));
+        let recovery_state = Arc::new(Mutex::new(EvidenceState {
+            outcomes: VecDeque::from([VolumeEvidenceRecovery::Validated {
+                evidence: Box::new(evidence),
+                decision: Box::new(VolumeEvidenceRecoveryDecision::AdoptTakeover(
+                    receipt.clone(),
+                )),
+            }]),
+            ..EvidenceState::default()
+        }));
+        let recovery_port: Arc<dyn SignedVolumeEvidencePort> = Arc::new(FakeEvidence {
+            state: Arc::clone(&recovery_state),
+        });
+        let publication_recovery = SignedRunningPublicationRecovery::new(authority.clone())
+            .with_volume_evidence(recovery_port);
+        assert_eq!(
+            publication_recovery
+                .recover_one(recovery_context(root.path(), &desired))
+                .unwrap(),
+            RuntimePreScanRecoveryOutcome::Recovered {
+                cat_id: desired.cat_id.clone(),
+            }
+        );
+        assert_eq!(recovery_state.lock().unwrap().requests.len(), 1);
+
+        let restart_scanner_authority: Arc<dyn VolumeDataAuthority> = authority.clone();
+        let restart_scanner_blob: Arc<dyn BlobStore> = blob.clone();
+        let restart_scanner =
+            fresh_scanner_with_blob(root.path(), restart_scanner_authority, restart_scanner_blob);
+        let RuntimeInventoryScanOutcome::Complete(restart_inventory) = restart_scanner
+            .scan_complete(scan_context(&desired))
+            .unwrap()
+        else {
+            panic!("mandatory recovery must close the next complete scan")
+        };
+        let [restarted] = restart_inventory.runtimes() else {
+            panic!("restart scan must project exactly one Runtime")
+        };
+        let recovered_target = restarted
+            .volumes
+            .iter()
+            .find(|volume| volume.volume_id == persistent.volume_id)
+            .unwrap();
+        assert!(matches!(
+            recovered_target.authority,
+            VolumeAuthorityEvidence::Owned {
+                ref attachment_id,
+                attachment_epoch,
+                ..
+            } if attachment_id == &persistent.attachment_id
+                && attachment_epoch == receipt.resulting_epoch
+        ));
+        assert_eq!(recovered_target.local_lineages.len(), 1);
         let (restart_effect, restart_calls, restart_evidence) = production_effect(
             &desired,
             Vec::new(),
             vec![TakeoverAcquireAttempt::Ambiguous],
             vec![recovery],
-            authority,
+            Arc::clone(&authority),
             blob.clone(),
             path.clone(),
-        );
-        // Model a fresh accepted full after the Agent restarted: Root retains
-        // its sealed artifact, while the takeover target remains the first
-        // missing local lineage.
-        takeover_observed.authority = VolumeAuthorityEvidence::Owned {
-            attachment_id: id("att-persistent-old"),
-            attachment_epoch: fence(7),
-            head: blank_head(),
-        };
-        let restarted = observed_runtime_with_volumes(
-            root.path(),
-            &desired,
-            Some(&root_grant_checkpoint),
-            vec![root_grant_checkpoint.volumes[0].clone(), takeover_observed],
         );
         let (context, _) = context_with_session(
             root.path(),
             &desired,
-            Some(restarted),
+            Some(restarted.clone()),
             '8',
             3,
             1_900_000_010_000,
@@ -5167,6 +6081,311 @@ mod tests {
             .volumes
             .iter()
             .all(|volume| volume.local_lineages.len() == 1));
+
+        let takeover_data_directory = provision
+            .volumes
+            .iter()
+            .find(|observed| observed.volume_id == persistent.volume_id)
+            .and_then(|observed| observed.local_lineages.first())
+            .map(|lineage| std::path::PathBuf::from(lineage.data_directory.as_str()))
+            .unwrap();
+        let takeover_attachment: AuthorizedServingAttachment = serde_json::from_slice(
+            &std::fs::read(takeover_data_directory.join("authorized-serving.json")).unwrap(),
+        )
+        .unwrap();
+        authority.set_records(BTreeMap::from([
+            (
+                root_attachment.identity.volume_id.clone(),
+                Ok(owned_record(&desired, &root_attachment)),
+            ),
+            (
+                takeover_attachment.identity.volume_id.clone(),
+                Ok(owned_record(&desired, &takeover_attachment)),
+            ),
+        ]));
+        let scanner_authority: Arc<dyn VolumeDataAuthority> = authority;
+        let scanner_blob: Arc<dyn BlobStore> = blob.clone();
+        let scanner = fresh_scanner_with_blob(
+            root.path(),
+            Arc::clone(&scanner_authority),
+            Arc::clone(&scanner_blob),
+        );
+        assert!(matches!(
+            scanner.scan_complete(scan_context(&desired)).unwrap(),
+            RuntimeInventoryScanOutcome::Complete(_)
+        ));
+        for conflict in ["head", "origin", "epoch"] {
+            let persistent_volume_id = persistent.volume_id.clone();
+            assert_fresh_scanner_rejects_checkpoint_mutation(
+                root.path(),
+                &desired,
+                Arc::clone(&scanner_authority),
+                Arc::clone(&scanner_blob),
+                move |checkpoint| {
+                    let observed = checkpoint
+                        .volumes
+                        .iter_mut()
+                        .find(|observed| observed.volume_id == persistent_volume_id)
+                        .unwrap();
+                    let [lineage] = observed.local_lineages.as_mut_slice() else {
+                        panic!("Persistent grant must be checkpoint-prepared")
+                    };
+                    match conflict {
+                        "head" => {
+                            let conflicting = RemoteHead {
+                                generation: Generation::new(1).unwrap(),
+                                root_hash: Some(Sha256Digest::from_bytes([0x92; 32])),
+                                root_object_id: Some(
+                                    AsciiText::new("roots/persistent-conflict-1").unwrap(),
+                                ),
+                            };
+                            let VolumeAuthorityEvidence::Owned { head, .. } =
+                                &mut observed.authority
+                            else {
+                                panic!("prepared Persistent must be owned")
+                            };
+                            *head = conflicting.clone();
+                            lineage.local_durable_generation = conflicting.generation;
+                            lineage.remote_durable_generation = conflicting.generation;
+                        }
+                        "origin" => {
+                            lineage.acquire_origin = AcquireOrigin::Normal {
+                                transition_id: random('f'),
+                            };
+                        }
+                        "epoch" => {
+                            let VolumeAuthorityEvidence::Owned {
+                                attachment_epoch, ..
+                            } = &mut observed.authority
+                            else {
+                                panic!("prepared Persistent must be owned")
+                            };
+                            *attachment_epoch = fence(attachment_epoch.get() + 1);
+                            lineage.attachment_epoch = *attachment_epoch;
+                        }
+                        _ => unreachable!(),
+                    }
+                },
+            );
+        }
+    }
+
+    #[test]
+    fn provision_scan_cross_binds_root_and_all_persistent_artifacts_by_value() {
+        let root = tempfile::tempdir().unwrap();
+        let mut desired = desired();
+        let existing_head = RemoteHead {
+            generation: Generation::new(4).unwrap(),
+            root_hash: Some(Sha256Digest::from_bytes([0x31; 32])),
+            root_object_id: Some(AsciiText::new("roots/persistent-existing-4").unwrap()),
+        };
+        let existing = VolumeIntent {
+            volume_intent_id: id("vint_z_existing"),
+            disk_id: id("disk_persistent_existing"),
+            volume_id: id("vol_z_existing"),
+            attachment_id: id("att_persistent_existing"),
+            size_bytes: 4 * 1024 * 1024,
+            disk_kind: DiskKind::Persistent,
+            access: VolumeAccess::ReadWriteOnce,
+            durability: cats_api::runtime_reconciliation::Durability::Strict,
+            guest_device: GuestDeviceIdentity {
+                serial: id("cats-persist-exist"),
+                slot: 1,
+            },
+            acquire: VolumeAcquire::Normal {
+                transition_id: random('5'),
+                expected_unowned_epoch: fence(4),
+            },
+            disposition: VolumeDisposition::Retain,
+            mount: Some(cats_api::runtime_reconciliation::Ext4MountIntent {
+                filesystem_uuid: random('6'),
+                mount_path: HostPath::new("/srv/cats/existing").unwrap(),
+                initialization:
+                    cats_api::runtime_reconciliation::FilesystemInitialization::Existing,
+            }),
+        };
+        let initialize = VolumeIntent {
+            volume_intent_id: id("vint_zz_initialize"),
+            disk_id: id("disk_persistent_initialize"),
+            volume_id: id("vol_zz_initialize"),
+            attachment_id: id("att_persistent_initialize"),
+            size_bytes: 4 * 1024 * 1024,
+            disk_kind: DiskKind::Persistent,
+            access: VolumeAccess::ReadWriteOnce,
+            durability: cats_api::runtime_reconciliation::Durability::Strict,
+            guest_device: GuestDeviceIdentity {
+                serial: id("cats-persist-init"),
+                slot: 2,
+            },
+            acquire: VolumeAcquire::Normal {
+                transition_id: random('7'),
+                expected_unowned_epoch: fence(6),
+            },
+            disposition: VolumeDisposition::Retain,
+            mount: Some(cats_api::runtime_reconciliation::Ext4MountIntent {
+                filesystem_uuid: random('8'),
+                mount_path: HostPath::new("/srv/cats/initialize").unwrap(),
+                initialization:
+                    cats_api::runtime_reconciliation::FilesystemInitialization::Initialize {
+                        initialization_token: random('9'),
+                        expected_blank_head: blank_head(),
+                    },
+            }),
+        };
+        desired.volumes.extend([existing, initialize]);
+        desired.spec_digest = spec_digest(&desired).unwrap();
+
+        let root_attachment = normal_attachment(&desired, 0);
+        let mut existing_attachment = normal_attachment(&desired, 1);
+        existing_attachment.head = existing_head.clone();
+        let AuthorizedServingAcquire::Normal { result, .. } = &mut existing_attachment.acquire
+        else {
+            unreachable!()
+        };
+        result.resulting_head = existing_head.clone();
+        let initialize_attachment = normal_attachment(&desired, 2);
+        let attachments = [
+            root_attachment.clone(),
+            existing_attachment.clone(),
+            initialize_attachment.clone(),
+        ];
+
+        let mut records = desired
+            .volumes
+            .iter()
+            .map(unowned_record_for)
+            .collect::<Vec<_>>();
+        records[1].head = existing_head.clone();
+        let authority = Arc::new(FakeAuthority::new(Err(AuthorityError::BackendUnknown)));
+        let publish_records = |authority: &FakeAuthority, records: &[VolumeRecord]| {
+            authority.set_records(
+                records
+                    .iter()
+                    .map(|record| (record.volume_id.clone(), Ok(record.clone())))
+                    .collect(),
+            );
+        };
+        publish_records(&authority, &records);
+        let blob = Arc::new(RecordingBlob::present(&desired));
+        let path = checkpoint_path(root.path(), &desired.cat_id);
+        let (effect, calls, evidence_calls) = production_effect(
+            &desired,
+            attachments
+                .iter()
+                .cloned()
+                .map(|attachment| NormalAcquireAttempt::Granted(Box::new(attachment)))
+                .collect(),
+            Vec::new(),
+            Vec::new(),
+            Arc::clone(&authority),
+            Arc::clone(&blob),
+            path.clone(),
+        );
+        let mut initial_volumes = desired
+            .volumes
+            .iter()
+            .map(unowned_observed_volume)
+            .collect::<Vec<_>>();
+        let VolumeAuthorityEvidence::Unowned { head, .. } = &mut initial_volumes[1].authority
+        else {
+            unreachable!()
+        };
+        *head = existing_head.clone();
+        let initial = observed_runtime_with_volumes(root.path(), &desired, None, initial_volumes);
+        let (initial_context, _) = context(root.path(), &desired, Some(initial));
+        assert_eq!(
+            effect.apply(initial_context, &desired).unwrap(),
+            RuntimeDesiredEffectOutcome::RefreshInventory
+        );
+        assert!(calls.lock().unwrap().requests.is_empty());
+
+        for (index, attachment) in attachments.iter().enumerate() {
+            let scanner_authority: Arc<dyn VolumeDataAuthority> = authority.clone();
+            let scanner_blob: Arc<dyn BlobStore> = blob.clone();
+            let scanner = fresh_scanner_with_blob(root.path(), scanner_authority, scanner_blob);
+            let RuntimeInventoryScanOutcome::Complete(inventory) =
+                scanner.scan_complete(scan_context(&desired)).unwrap()
+            else {
+                panic!("partial multi-acquire scan did not complete")
+            };
+            let [runtime] = inventory.runtimes() else {
+                panic!("partial multi-acquire scan projected the wrong Runtime set")
+            };
+            let (effect_context, _) = context_with_session(
+                root.path(),
+                &desired,
+                Some(runtime.clone()),
+                '8',
+                3,
+                1_900_000_010_000 + index as u64,
+            );
+            assert_eq!(
+                effect.apply(effect_context, &desired).unwrap(),
+                RuntimeDesiredEffectOutcome::RefreshInventory
+            );
+            records[index] = owned_record(&desired, attachment);
+            publish_records(&authority, &records);
+            assert_eq!(
+                read_checkpoint(&path)
+                    .volumes
+                    .iter()
+                    .filter(|volume| !volume.local_lineages.is_empty())
+                    .count(),
+                index + 1,
+            );
+        }
+        assert_eq!(calls.lock().unwrap().requests.len(), 3);
+        assert!(evidence_calls.lock().unwrap().requests.is_empty());
+        let provision = read_checkpoint(&path);
+        let ReconcileStep::ProvisionRootImage {
+            expected_provisioned_head,
+            ..
+        } = &provision.step
+        else {
+            panic!("complete volume set did not advance to Root provision")
+        };
+        let expected_provisioned_head = expected_provisioned_head.clone();
+
+        let scanner_authority: Arc<dyn VolumeDataAuthority> = authority.clone();
+        let scanner_blob: Arc<dyn BlobStore> = blob.clone();
+        assert!(matches!(
+            fresh_scanner_with_blob(root.path(), scanner_authority, scanner_blob)
+                .scan_complete(scan_context(&desired))
+                .unwrap(),
+            RuntimeInventoryScanOutcome::Complete(_)
+        ));
+
+        // Root may have completed its exact blank->target CAS while both
+        // Persistent artifacts retain their own unrelated acquire heads.
+        records[0].head = expected_provisioned_head;
+        publish_records(&authority, &records);
+        let scanner_authority: Arc<dyn VolumeDataAuthority> = authority.clone();
+        let scanner_blob: Arc<dyn BlobStore> = blob.clone();
+        assert!(matches!(
+            fresh_scanner_with_blob(root.path(), scanner_authority, scanner_blob)
+                .scan_complete(scan_context(&desired))
+                .unwrap(),
+            RuntimeInventoryScanOutcome::Complete(_)
+        ));
+
+        // A same-generation but foreign Persistent tuple is not "later" and
+        // must not be hidden by the Root provision head exception.
+        records[1].head = RemoteHead {
+            generation: existing_head.generation,
+            root_hash: Some(Sha256Digest::from_bytes([0x32; 32])),
+            root_object_id: Some(AsciiText::new("roots/persistent-conflict-4").unwrap()),
+        };
+        publish_records(&authority, &records);
+        let scanner_authority: Arc<dyn VolumeDataAuthority> = authority;
+        let scanner_blob: Arc<dyn BlobStore> = blob;
+        assert!(
+            !matches!(
+                fresh_scanner_with_blob(root.path(), scanner_authority, scanner_blob)
+                    .scan_complete(scan_context(&desired)),
+                Ok(RuntimeInventoryScanOutcome::Complete(_))
+            ),
+            "a Persistent sibling same-generation tuple drift must fail closed"
+        );
     }
 
     #[test]
@@ -5625,6 +6844,1054 @@ mod tests {
     }
 
     #[test]
+    fn pre_scan_recovery_rebuilds_thick_takeover_authority_for_root_and_persistent() {
+        for target_index in [0, 1] {
+            let root = tempfile::tempdir().unwrap();
+            let mut desired = desired();
+            desired.volumes.push(normal_persistent_volume());
+            let authorization_id = if target_index == 0 {
+                id("takeover_recovery_root")
+            } else {
+                id("takeover_recovery_persistent")
+            };
+            desired.volumes[target_index].acquire = VolumeAcquire::Takeover {
+                authorization_id: authorization_id.clone(),
+            };
+            desired.spec_digest = spec_digest(&desired).unwrap();
+
+            let (expected, mut record, mut evidence, prior) =
+                takeover_recovery_fixture(&desired, target_index);
+            // The local R0 publication may be the only lost effect. A
+            // mandatory renewal, and for Root a same-owner head CAS, may
+            // already have advanced the signed current record. Recovery must
+            // still materialize the immutable primary grant rather than
+            // mistaking that closed successor for the first takeover result.
+            record.lease_expires_at = Some(unix_ms(1_900_000_080_000));
+            if target_index == 0 {
+                record.head = RemoteHead {
+                    generation: Generation::new(1).unwrap(),
+                    root_hash: Some(Sha256Digest::from_bytes([9; 32])),
+                    root_object_id: Some(AsciiText::new("roots/recovery-head-1").unwrap()),
+                };
+            }
+            let VolumeEvidenceRecovery::Validated {
+                evidence: signed, ..
+            } = &mut evidence
+            else {
+                unreachable!("fixture returns validated takeover evidence")
+            };
+            signed.current_volume = Some(record.clone());
+            let volumes = if target_index == 0 {
+                vec![prior, unowned_observed_volume(&desired.volumes[1])]
+            } else {
+                let root_attachment = normal_attachment(&desired, 0);
+                let data_directory = authorized_blockd_data_directory(
+                    root.path(),
+                    &desired,
+                    &root_attachment.identity,
+                );
+                drop(
+                    AuthorizedBlockdStore::new(StateDirectory::unanchored(
+                        root.path().to_path_buf(),
+                    ))
+                    .prepare(&desired, &desired.volumes[0], &root_attachment)
+                    .unwrap(),
+                );
+                vec![
+                    prepared_owned_observed_volume(
+                        &desired.volumes[0],
+                        &root_attachment,
+                        host(data_directory),
+                    ),
+                    prior,
+                ]
+            };
+            let checkpoint = closed_checkpoint(
+                &desired,
+                ReconcileStep::AcquireVolume {
+                    request: VolumeAcquireRequest::Takeover {
+                        authorization_id: authorization_id.clone(),
+                    },
+                },
+                volumes,
+                unix_ms(1_900_000_000_000),
+            );
+            assert!(multi_acquire_checkpoint_is_bound(
+                &checkpoint,
+                &desired,
+                root.path(),
+            ));
+            persist_checkpoint(root.path(), &checkpoint);
+
+            let authority = Arc::new(FakeAuthority::new(Ok(record.clone())));
+            let evidence_state = Arc::new(Mutex::new(EvidenceState {
+                outcomes: VecDeque::from([evidence]),
+                ..EvidenceState::default()
+            }));
+            let evidence_port: Arc<dyn SignedVolumeEvidencePort> = Arc::new(FakeEvidence {
+                state: Arc::clone(&evidence_state),
+            });
+            let recovery = SignedRunningPublicationRecovery::new(authority.clone())
+                .with_volume_evidence(evidence_port);
+            assert_eq!(
+                recovery
+                    .recover_one(recovery_context(root.path(), &desired))
+                    .unwrap(),
+                RuntimePreScanRecoveryOutcome::Recovered {
+                    cat_id: desired.cat_id.clone(),
+                },
+                "target slot {target_index}",
+            );
+            let data_directory =
+                authorized_blockd_data_directory(root.path(), &desired, &expected.identity);
+            let recovered: AuthorizedServingAttachment = serde_json::from_slice(
+                &std::fs::read(data_directory.join("authorized-serving.json")).unwrap(),
+            )
+            .unwrap();
+            assert_eq!(recovered, expected, "target slot {target_index}");
+            let state = evidence_state.lock().unwrap();
+            assert_eq!(state.requests.len(), 1, "target slot {target_index}");
+            assert_eq!(
+                state.requests[0].authorization_id, authorization_id,
+                "target slot {target_index}",
+            );
+            assert_eq!(state.requests[0].session.agent_instance_id, random('8'));
+            drop(state);
+            let other_index = usize::from(target_index == 0);
+            let other_record = if target_index == 0 {
+                unowned_record_for(&desired.volumes[other_index])
+            } else {
+                owned_record(&desired, &normal_attachment(&desired, other_index))
+            };
+            authority.set_records(BTreeMap::from([
+                (desired.volumes[target_index].volume_id.clone(), Ok(record)),
+                (
+                    desired.volumes[other_index].volume_id.clone(),
+                    Ok(other_record),
+                ),
+            ]));
+            let scanner_authority: Arc<dyn VolumeDataAuthority> = authority;
+            let scanner_blob: Arc<dyn BlobStore> = Arc::new(RecordingBlob::present(&desired));
+            let scanner = fresh_scanner_with_blob(root.path(), scanner_authority, scanner_blob);
+            let scan = scanner.scan_complete(scan_context(&desired)).unwrap();
+            let RuntimeInventoryScanOutcome::Complete(inventory) = scan else {
+                panic!("same-lineage renewal/head successor must remain scannable: {scan:?}")
+            };
+            let [runtime] = inventory.runtimes() else {
+                panic!("recovered takeover scan must project exactly one Runtime")
+            };
+            let recovered_volume = runtime
+                .volumes
+                .iter()
+                .find(|volume| volume.volume_id == desired.volumes[target_index].volume_id)
+                .unwrap();
+            assert_eq!(
+                recovered_volume.local_lineages[0].state,
+                LocalLineageState::Active
+            );
+        }
+    }
+
+    #[test]
+    fn pre_scan_recovery_materializes_primary_takeover_after_closed_successors() {
+        let mut desired = desired();
+        let authorization_id = id("takeover_recovery_successor");
+        desired.volumes[0].acquire = VolumeAcquire::Takeover {
+            authorization_id: authorization_id.clone(),
+        };
+        desired.spec_digest = spec_digest(&desired).unwrap();
+        let (expected, primary, evidence, prior) = takeover_recovery_fixture(&desired, 0);
+
+        let (released, _) = cats_storage::authority::release(
+            &primary,
+            &cats_api::runtime_reconciliation::ReleaseRequest {
+                volume_id: primary.volume_id.clone(),
+                transition_id: random('e'),
+                attachment_id: desired.volumes[0].attachment_id.clone(),
+                expected_epoch: primary.lease_epoch,
+            },
+        )
+        .unwrap();
+        let reacquire_request = NormalAcquireRequest {
+            volume_id: released.volume_id.clone(),
+            transition_id: random('f'),
+            attachment_id: id("att_recovery_successor"),
+            expected_unowned_epoch: released.lease_epoch,
+            desired_revision: Revision::new(2).unwrap(),
+            placement_epoch: epoch(4),
+            lease_duration_ms: 60_000,
+        };
+        let (reacquired, _) = cats_storage::authority::normal_acquire(
+            &released,
+            &reacquire_request,
+            unix_ms(1_900_000_090_000),
+        )
+        .unwrap();
+
+        for (case, current) in [("released", released), ("higher-epoch", reacquired)] {
+            let root = tempfile::tempdir().unwrap();
+            let checkpoint = closed_checkpoint(
+                &desired,
+                ReconcileStep::AcquireVolume {
+                    request: VolumeAcquireRequest::Takeover {
+                        authorization_id: authorization_id.clone(),
+                    },
+                },
+                vec![prior.clone()],
+                unix_ms(1_900_000_000_000),
+            );
+            persist_checkpoint(root.path(), &checkpoint);
+
+            let mut successor_evidence = evidence.clone();
+            let VolumeEvidenceRecovery::Validated {
+                evidence: signed, ..
+            } = &mut successor_evidence
+            else {
+                unreachable!("fixture returns validated takeover evidence")
+            };
+            signed.current_volume = Some(current.clone());
+            let evidence_state = Arc::new(Mutex::new(EvidenceState {
+                outcomes: VecDeque::from([successor_evidence]),
+                ..EvidenceState::default()
+            }));
+            let evidence_port: Arc<dyn SignedVolumeEvidencePort> = Arc::new(FakeEvidence {
+                state: Arc::clone(&evidence_state),
+            });
+            let authority = Arc::new(FakeAuthority::new(Ok(current)));
+            let recovery = SignedRunningPublicationRecovery::new(authority.clone())
+                .with_volume_evidence(evidence_port);
+            assert_eq!(
+                recovery
+                    .recover_one(recovery_context(root.path(), &desired))
+                    .unwrap(),
+                RuntimePreScanRecoveryOutcome::Recovered {
+                    cat_id: desired.cat_id.clone(),
+                },
+                "closed successor case {case}",
+            );
+            let data_directory =
+                authorized_blockd_data_directory(root.path(), &desired, &expected.identity);
+            let recovered: AuthorizedServingAttachment = serde_json::from_slice(
+                &std::fs::read(data_directory.join("authorized-serving.json")).unwrap(),
+            )
+            .unwrap();
+            assert_eq!(recovered, expected, "closed successor case {case}");
+            let scanner_authority: Arc<dyn VolumeDataAuthority> = authority;
+            let scanner_blob: Arc<dyn BlobStore> = Arc::new(RecordingBlob::present(&desired));
+            let scanner = fresh_scanner_with_blob(root.path(), scanner_authority, scanner_blob);
+            let RuntimeInventoryScanOutcome::Complete(inventory) =
+                scanner.scan_complete(scan_context(&desired)).unwrap()
+            else {
+                panic!("closed successor must remain a complete fail-closed inventory")
+            };
+            let [runtime] = inventory.runtimes() else {
+                panic!("closed successor scan must project exactly one Runtime")
+            };
+            assert!(runtime.conditions.is_empty());
+            assert_eq!(
+                runtime.volumes[0].local_lineages[0].state,
+                LocalLineageState::Released
+            );
+            let effect_authority =
+                Arc::new(FakeAuthority::new(Err(AuthorityError::BackendUnknown)));
+            let effect_blob = Arc::new(RecordingBlob::present(&desired));
+            let (effect, acquire_calls, evidence_calls) = production_effect(
+                &desired,
+                Vec::new(),
+                Vec::new(),
+                Vec::new(),
+                effect_authority,
+                effect_blob,
+                checkpoint_path(root.path(), &desired.cat_id),
+            );
+            let (effect_context, _) = context(root.path(), &desired, Some(runtime.clone()));
+            assert_eq!(
+                effect.apply(effect_context, &desired).unwrap(),
+                RuntimeDesiredEffectOutcome::ReplanDesired,
+                "closed successor case {case}",
+            );
+            assert!(acquire_calls.lock().unwrap().requests.is_empty());
+            assert!(evidence_calls.lock().unwrap().requests.is_empty());
+        }
+    }
+
+    #[test]
+    fn pre_scan_delete_successors_replan_without_recovering_a_writer() {
+        for case in [
+            "higher-release",
+            "begin-delete",
+            "disposable-delete",
+            "deleted",
+        ] {
+            let root = tempfile::tempdir().unwrap();
+            let mut desired = desired();
+            let authorization_id = id("takeover_recovery_delete");
+            desired.volumes[0].acquire = VolumeAcquire::Takeover {
+                authorization_id: authorization_id.clone(),
+            };
+            desired.spec_digest = spec_digest(&desired).unwrap();
+            let (expected, primary, fixture_evidence, prior) =
+                takeover_recovery_fixture(&desired, 0);
+            let VolumeEvidenceRecovery::Validated {
+                evidence: fixture_evidence,
+                ..
+            } = fixture_evidence
+            else {
+                unreachable!("fixture returns validated takeover evidence")
+            };
+            let mut signed = *fixture_evidence;
+            let mut point = Err(AuthorityError::NotFound);
+
+            match case {
+                "higher-release" => {
+                    let (released, _) = cats_storage::authority::release(
+                        &primary,
+                        &cats_api::runtime_reconciliation::ReleaseRequest {
+                            volume_id: primary.volume_id.clone(),
+                            transition_id: random('1'),
+                            attachment_id: expected.identity.attachment_id.clone(),
+                            expected_epoch: expected.identity.attachment_epoch,
+                        },
+                    )
+                    .unwrap();
+                    let reacquire_request = NormalAcquireRequest {
+                        volume_id: primary.volume_id.clone(),
+                        transition_id: random('2'),
+                        attachment_id: id("att_after_primary_takeover"),
+                        expected_unowned_epoch: released.lease_epoch,
+                        desired_revision: Revision::new(2).unwrap(),
+                        placement_epoch: epoch(4),
+                        lease_duration_ms: 60_000,
+                    };
+                    let (reacquired, _) = cats_storage::authority::normal_acquire(
+                        &released,
+                        &reacquire_request,
+                        unix_ms(1_900_000_030_000),
+                    )
+                    .unwrap();
+                    let reacquired_epoch = reacquired.lease_epoch;
+                    let reacquired_owner = reacquired.lease_owner.clone().unwrap();
+                    let (released_again, _) = cats_storage::authority::release(
+                        &reacquired,
+                        &cats_api::runtime_reconciliation::ReleaseRequest {
+                            volume_id: primary.volume_id.clone(),
+                            transition_id: random('3'),
+                            attachment_id: reacquired_owner,
+                            expected_epoch: reacquired_epoch,
+                        },
+                    )
+                    .unwrap();
+                    signed.current_volume = Some(released_again.clone());
+                    point = Ok(released_again);
+                }
+                "begin-delete" | "deleted" => {
+                    let (released, _) = cats_storage::authority::release(
+                        &primary,
+                        &cats_api::runtime_reconciliation::ReleaseRequest {
+                            volume_id: primary.volume_id.clone(),
+                            transition_id: random('d'),
+                            attachment_id: expected.identity.attachment_id.clone(),
+                            expected_epoch: expected.identity.attachment_epoch,
+                        },
+                    )
+                    .unwrap();
+                    let request = BeginDeleteRequest {
+                        delete_id: id("delete_after_takeover"),
+                        disk_id: desired.volumes[0].disk_id.clone(),
+                        volume_id: primary.volume_id.clone(),
+                        expected_unowned_epoch: released.lease_epoch,
+                        expected_head: released.head.clone(),
+                    };
+                    let (deleting, _) =
+                        cats_storage::authority::begin_delete(&released, &request).unwrap();
+                    if case == "begin-delete" {
+                        signed.current_volume = Some(deleting.clone());
+                        point = Ok(deleting);
+                    } else {
+                        let completion = cats_storage::authority::complete_normal_delete(
+                            &deleting,
+                            unix_ms(1_900_000_090_000),
+                        )
+                        .unwrap();
+                        signed.current_volume = None;
+                        signed.delete_completion = Some(completion);
+                    }
+                }
+                "disposable-delete" => {
+                    let direct_id = id("disposable_after_takeover");
+                    let direct_authorization = DisposableRootDeleteAuthorization {
+                        authorization_id: direct_id.clone(),
+                        authorized_node_id: desired.placement.node_id.clone(),
+                        delete_id: id("delete_disposable_after_takeover"),
+                        disk_id: desired.volumes[0].disk_id.clone(),
+                        volume_id: primary.volume_id.clone(),
+                        cat_id: desired.cat_id.clone(),
+                        desired_revision: desired.desired_revision,
+                        placement_epoch: desired.placement.placement_epoch,
+                        expected_attachment_id: expected.identity.attachment_id.clone(),
+                        expected_epoch: expected.identity.attachment_epoch,
+                        expected_head: expected.head.clone(),
+                        isolation_basis: DisposableDeleteIsolationBasis::HostFenceEvent {
+                            event_id: id("fence_disposable_after_takeover"),
+                        },
+                        not_after: unix_ms(1_900_000_100_000),
+                    };
+                    let direct_receipt = BeginDisposableDeleteConsumedReceipt {
+                        authorization_id: direct_id.clone(),
+                        volume_id: primary.volume_id.clone(),
+                        disk_id: desired.volumes[0].disk_id.clone(),
+                        cat_id: desired.cat_id.clone(),
+                        delete_id: direct_authorization.delete_id.clone(),
+                        prior_attachment_id: expected.identity.attachment_id.clone(),
+                        resulting_epoch: fence(expected.identity.attachment_epoch.get() + 1),
+                        resulting_head: expected.head.clone(),
+                        consumed_at: unix_ms(1_900_000_020_000),
+                    };
+                    let direct = AuthorizationRecord {
+                        authorization: VolumeAuthorization::DisposableRootDelete(
+                            direct_authorization.clone(),
+                        ),
+                        state: AuthorizationState::Consumed(Box::new(
+                            AuthorizationConsumedReceipt::BeginDisposableDelete(
+                                direct_receipt.clone(),
+                            ),
+                        )),
+                    };
+                    let mut deleting = primary.clone();
+                    deleting.admin_state = VolumeAdminState::Deleting {
+                        delete_id: direct_authorization.delete_id,
+                    };
+                    deleting.lease_owner = None;
+                    deleting.lease_epoch = direct_receipt.resulting_epoch;
+                    deleting.lease_expires_at = None;
+                    deleting.last_transition = Some(LastVolumeTransition::BeginDisposableDelete {
+                        authorization_id: direct_id,
+                    });
+                    signed.current_volume = Some(deleting.clone());
+                    signed.direct_successor_authorization = Some(direct);
+                    point = Ok(deleting);
+                }
+                _ => unreachable!(),
+            }
+            cats_storage::authority::validate_volume_transition_evidence_bundle(
+                &signed.authorization,
+                signed.current_volume.as_ref(),
+                signed.delete_completion.as_ref(),
+                signed.direct_successor_authorization.as_ref(),
+            )
+            .unwrap();
+            let signed_for_published = signed.clone();
+            let signed_for_mismatch = signed.clone();
+            let point_for_published = point.clone();
+
+            let checkpoint = closed_checkpoint(
+                &desired,
+                ReconcileStep::AcquireVolume {
+                    request: VolumeAcquireRequest::Takeover {
+                        authorization_id: authorization_id.clone(),
+                    },
+                },
+                vec![prior],
+                unix_ms(1_900_000_000_000),
+            );
+            persist_checkpoint(root.path(), &checkpoint);
+            let evidence_state = Arc::new(Mutex::new(EvidenceState {
+                outcomes: VecDeque::from([VolumeEvidenceRecovery::Validated {
+                    evidence: Box::new(signed),
+                    decision: Box::new(VolumeEvidenceRecoveryDecision::AdoptTakeover(
+                        match &expected.acquire {
+                            AuthorizedServingAcquire::Takeover { receipt, .. } => receipt.clone(),
+                            AuthorizedServingAcquire::Normal { .. } => unreachable!(),
+                        },
+                    )),
+                }]),
+                ..EvidenceState::default()
+            }));
+            let evidence_port: Arc<dyn SignedVolumeEvidencePort> = Arc::new(FakeEvidence {
+                state: Arc::clone(&evidence_state),
+            });
+            let authority = Arc::new(FakeAuthority::new(point));
+            let recovery = SignedRunningPublicationRecovery::new(authority)
+                .with_volume_evidence(evidence_port);
+            assert_eq!(
+                recovery
+                    .recover_one(recovery_context(root.path(), &desired))
+                    .unwrap(),
+                RuntimePreScanRecoveryOutcome::ReplanDesired {
+                    cat_id: desired.cat_id.clone(),
+                },
+                "closed delete case {case}",
+            );
+            assert!(
+                !authorized_blockd_data_directory(root.path(), &desired, &expected.identity)
+                    .exists(),
+                "closed delete case {case} must not recover a local writer",
+            );
+
+            let published_root = tempfile::tempdir().unwrap();
+            persist_checkpoint(published_root.path(), &checkpoint);
+            let published = AuthorizedBlockdStore::new(StateDirectory::unanchored(
+                published_root.path().to_path_buf(),
+            ))
+            .prepare(&desired, &desired.volumes[0], &expected)
+            .unwrap();
+            let authorized_path = published.data_directory().join("authorized-serving.json");
+            let before = std::fs::read(&authorized_path).unwrap();
+            drop(published);
+            let published_evidence = Arc::new(Mutex::new(EvidenceState {
+                outcomes: VecDeque::from([VolumeEvidenceRecovery::Validated {
+                    evidence: Box::new(signed_for_published),
+                    decision: Box::new(VolumeEvidenceRecoveryDecision::AdoptTakeover(
+                        match &expected.acquire {
+                            AuthorizedServingAcquire::Takeover { receipt, .. } => receipt.clone(),
+                            AuthorizedServingAcquire::Normal { .. } => unreachable!(),
+                        },
+                    )),
+                }]),
+                ..EvidenceState::default()
+            }));
+            let published_port: Arc<dyn SignedVolumeEvidencePort> = Arc::new(FakeEvidence {
+                state: published_evidence,
+            });
+            let published_recovery = SignedRunningPublicationRecovery::new(Arc::new(
+                FakeAuthority::new(point_for_published),
+            ))
+            .with_volume_evidence(published_port);
+            assert_eq!(
+                published_recovery
+                    .recover_one(recovery_context(published_root.path(), &desired))
+                    .unwrap(),
+                RuntimePreScanRecoveryOutcome::ReplanDesired {
+                    cat_id: desired.cat_id.clone(),
+                },
+                "published closed delete case {case}",
+            );
+            assert_eq!(std::fs::read(authorized_path).unwrap(), before);
+
+            if case == "disposable-delete" {
+                let mismatch_root = tempfile::tempdir().unwrap();
+                persist_checkpoint(mismatch_root.path(), &checkpoint);
+                drop(
+                    AuthorizedBlockdStore::new(StateDirectory::unanchored(
+                        mismatch_root.path().to_path_buf(),
+                    ))
+                    .prepare(&desired, &desired.volumes[0], &expected)
+                    .unwrap(),
+                );
+                let mismatch_evidence = Arc::new(Mutex::new(EvidenceState {
+                    outcomes: VecDeque::from([VolumeEvidenceRecovery::Validated {
+                        evidence: Box::new(signed_for_mismatch),
+                        decision: Box::new(VolumeEvidenceRecoveryDecision::AdoptTakeover(
+                            match &expected.acquire {
+                                AuthorizedServingAcquire::Takeover { receipt, .. } => {
+                                    receipt.clone()
+                                }
+                                AuthorizedServingAcquire::Normal { .. } => unreachable!(),
+                            },
+                        )),
+                    }]),
+                    ..EvidenceState::default()
+                }));
+                let mismatch_port: Arc<dyn SignedVolumeEvidencePort> = Arc::new(FakeEvidence {
+                    state: mismatch_evidence,
+                });
+                let mismatch = SignedRunningPublicationRecovery::new(Arc::new(FakeAuthority::new(
+                    Ok(primary.clone()),
+                )))
+                .with_volume_evidence(mismatch_port);
+                assert_eq!(
+                    mismatch
+                        .recover_one(recovery_context(mismatch_root.path(), &desired))
+                        .unwrap(),
+                    RuntimePreScanRecoveryOutcome::NoChange,
+                    "signed direct successor cannot replan against a different point read",
+                );
+            }
+        }
+
+        // A direct successor marker is not self-authenticating. The signed
+        // bundle must retain the exact consumed direct authorization, and a
+        // completion must retain its exact epoch/head tuple.
+        let mut desired = desired();
+        let authorization_id = id("takeover_recovery_negative");
+        desired.volumes[0].acquire = VolumeAcquire::Takeover {
+            authorization_id: authorization_id.clone(),
+        };
+        desired.spec_digest = spec_digest(&desired).unwrap();
+        let (_, primary, fixture, _) = takeover_recovery_fixture(&desired, 0);
+        let VolumeEvidenceRecovery::Validated { evidence, .. } = fixture else {
+            unreachable!()
+        };
+        let mut missing_direct = *evidence;
+        missing_direct.current_volume = Some(VolumeRecord {
+            last_transition: Some(LastVolumeTransition::BeginDisposableDelete {
+                authorization_id: id("missing_direct_authorization"),
+            }),
+            admin_state: VolumeAdminState::Deleting {
+                delete_id: id("missing_direct_delete"),
+            },
+            lease_owner: None,
+            lease_epoch: fence(primary.lease_epoch.get() + 1),
+            lease_expires_at: None,
+            ..primary.clone()
+        });
+        assert!(
+            cats_storage::authority::validate_volume_transition_evidence_bundle(
+                &missing_direct.authorization,
+                missing_direct.current_volume.as_ref(),
+                None,
+                None,
+            )
+            .is_err()
+        );
+        let wrong_completion = DeleteCompletionReceipt::Normal {
+            request: BeginDeleteRequest {
+                delete_id: id("wrong_completion_delete"),
+                disk_id: desired.volumes[0].disk_id.clone(),
+                volume_id: primary.volume_id.clone(),
+                expected_unowned_epoch: fence(primary.lease_epoch.get() + 1),
+                expected_head: primary.head.clone(),
+            },
+            deleting_epoch: fence(primary.lease_epoch.get() + 3),
+            deleting_head: primary.head,
+            completed_at: unix_ms(1_900_000_090_000),
+        };
+        assert!(
+            cats_storage::authority::validate_volume_transition_evidence_bundle(
+                &missing_direct.authorization,
+                None,
+                Some(&wrong_completion),
+                None,
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn pre_scan_normal_recovery_binds_the_exact_unowned_checkpoint_head() {
+        for target in ["root", "persistent-existing"] {
+            let mut desired = desired();
+            let target_index = if target == "root" {
+                0
+            } else {
+                let mut persistent = normal_persistent_volume();
+                persistent.mount.as_mut().unwrap().initialization =
+                    cats_api::runtime_reconciliation::FilesystemInitialization::Existing;
+                desired.volumes.push(persistent);
+                1
+            };
+            desired.spec_digest = spec_digest(&desired).unwrap();
+            let canonical_head = RemoteHead {
+                generation: Generation::new(5).unwrap(),
+                root_hash: Some(Sha256Digest::from_bytes([0x25; 32])),
+                root_object_id: Some(
+                    AsciiText::new(format!("roots/{target}-normal-predecessor-5")).unwrap(),
+                ),
+            };
+            let mut attachment = normal_attachment(&desired, target_index);
+            attachment.head = canonical_head.clone();
+            attachment.normal_acquire_mut().unwrap().1.resulting_head = canonical_head.clone();
+            let record = owned_record(&desired, &attachment);
+            let mut exact_prior = unowned_observed_volume(&desired.volumes[target_index]);
+            let VolumeAuthorityEvidence::Unowned { head, .. } = &mut exact_prior.authority else {
+                unreachable!("normal predecessor fixture is unowned")
+            };
+            *head = canonical_head.clone();
+
+            for case in ["exact", "lower-head", "higher-head", "head-tuple"] {
+                let root = tempfile::tempdir().unwrap();
+                let mut prior = exact_prior.clone();
+                if case != "exact" {
+                    let VolumeAuthorityEvidence::Unowned { head, .. } = &mut prior.authority else {
+                        unreachable!("normal predecessor fixture is unowned")
+                    };
+                    let (generation, byte, suffix) = match case {
+                        "lower-head" => (4, 0x24, "lower"),
+                        "higher-head" => (6, 0x26, "higher"),
+                        "head-tuple" => (5, 0x27, "foreign-tuple"),
+                        _ => unreachable!(),
+                    };
+                    *head = RemoteHead {
+                        generation: Generation::new(generation).unwrap(),
+                        root_hash: Some(Sha256Digest::from_bytes([byte; 32])),
+                        root_object_id: Some(
+                            AsciiText::new(format!("roots/{target}-normal-{suffix}")).unwrap(),
+                        ),
+                    };
+                }
+                let volumes = if target_index == 0 {
+                    vec![prior]
+                } else {
+                    vec![unowned_observed_volume(&desired.volumes[0]), prior]
+                };
+                let checkpoint = closed_checkpoint(
+                    &desired,
+                    ReconcileStep::AcquireVolume {
+                        request: attachment.checkpoint_acquire_request(),
+                    },
+                    volumes,
+                    unix_ms(1_900_000_000_000),
+                );
+                assert!(multi_acquire_checkpoint_is_bound(
+                    &checkpoint,
+                    &desired,
+                    root.path(),
+                ));
+                persist_checkpoint(root.path(), &checkpoint);
+                let recovery = SignedRunningPublicationRecovery::new(Arc::new(FakeAuthority::new(
+                    Ok(record.clone()),
+                )));
+                let outcome = recovery
+                    .recover_one(recovery_context(root.path(), &desired))
+                    .unwrap();
+                let data_directory =
+                    authorized_blockd_data_directory(root.path(), &desired, &attachment.identity);
+                if case == "exact" {
+                    assert_eq!(
+                        outcome,
+                        RuntimePreScanRecoveryOutcome::Recovered {
+                            cat_id: desired.cat_id.clone(),
+                        },
+                        "{target} exact Normal predecessor",
+                    );
+                    assert!(data_directory.is_dir());
+                } else {
+                    assert_eq!(
+                        outcome,
+                        RuntimePreScanRecoveryOutcome::NoChange,
+                        "{target} Normal predecessor drift case {case}",
+                    );
+                    assert!(
+                        !data_directory.exists(),
+                        "{target} Normal predecessor drift case {case} published R0",
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn live_multi_normal_rejects_checkpoint_head_drift_before_a22() {
+        for case in ["lower-head", "higher-head", "head-tuple"] {
+            let root = tempfile::tempdir().unwrap();
+            let mut desired = desired();
+            let mut persistent = normal_persistent_volume();
+            persistent.mount.as_mut().unwrap().initialization =
+                cats_api::runtime_reconciliation::FilesystemInitialization::Existing;
+            desired.volumes.push(persistent);
+            desired.spec_digest = spec_digest(&desired).unwrap();
+            let target = &desired.volumes[1];
+            let canonical_head = RemoteHead {
+                generation: Generation::new(5).unwrap(),
+                root_hash: Some(Sha256Digest::from_bytes([0x35; 32])),
+                root_object_id: Some(AsciiText::new("roots/live-normal-predecessor-5").unwrap()),
+            };
+            let mut attachment = normal_attachment(&desired, 1);
+            attachment.head = canonical_head.clone();
+            attachment.normal_acquire_mut().unwrap().1.resulting_head = canonical_head.clone();
+            let mut exact_current = unowned_observed_volume(target);
+            let VolumeAuthorityEvidence::Unowned { head, .. } = &mut exact_current.authority else {
+                unreachable!("normal predecessor fixture is unowned")
+            };
+            *head = canonical_head;
+            let mut wrong = exact_current.clone();
+            let VolumeAuthorityEvidence::Unowned { head, .. } = &mut wrong.authority else {
+                unreachable!("normal predecessor fixture is unowned")
+            };
+            let (generation, byte, suffix) = match case {
+                "lower-head" => (4, 0x34, "lower"),
+                "higher-head" => (6, 0x36, "higher"),
+                "head-tuple" => (5, 0x37, "foreign-tuple"),
+                _ => unreachable!(),
+            };
+            *head = RemoteHead {
+                generation: Generation::new(generation).unwrap(),
+                root_hash: Some(Sha256Digest::from_bytes([byte; 32])),
+                root_object_id: Some(
+                    AsciiText::new(format!("roots/live-normal-{suffix}")).unwrap(),
+                ),
+            };
+            let checkpoint = closed_checkpoint(
+                &desired,
+                ReconcileStep::AcquireVolume {
+                    request: attachment.checkpoint_acquire_request(),
+                },
+                vec![unowned_observed_volume(&desired.volumes[0]), wrong],
+                unix_ms(1_900_000_000_000),
+            );
+            assert!(multi_acquire_checkpoint_is_bound(
+                &checkpoint,
+                &desired,
+                root.path(),
+            ));
+            persist_checkpoint(root.path(), &checkpoint);
+            let runtime = observed_runtime_with_volumes(
+                root.path(),
+                &desired,
+                Some(&checkpoint),
+                vec![unowned_observed_volume(&desired.volumes[0]), exact_current],
+            );
+            let path = checkpoint_path(root.path(), &desired.cat_id);
+            let (effect, acquire, _) = production_effect(
+                &desired,
+                vec![NormalAcquireAttempt::Granted(Box::new(attachment.clone()))],
+                Vec::new(),
+                Vec::new(),
+                Arc::new(FakeAuthority::new(Err(AuthorityError::BackendUnknown))),
+                Arc::new(RecordingBlob::missing()),
+                path,
+            );
+            let (context, _) = context(root.path(), &desired, Some(runtime));
+            assert_eq!(
+                effect.apply(context, &desired).unwrap(),
+                RuntimeDesiredEffectOutcome::RefreshInventory,
+                "live multi Normal predecessor drift case {case}",
+            );
+            assert!(
+                acquire.lock().unwrap().requests.is_empty(),
+                "live multi Normal predecessor drift case {case} reached A22",
+            );
+            assert!(
+                !authorized_blockd_data_directory(root.path(), &desired, &attachment.identity)
+                    .exists(),
+                "live multi Normal predecessor drift case {case} published R0",
+            );
+            assert_eq!(
+                read_checkpoint(&checkpoint_path(root.path(), &desired.cat_id)),
+                checkpoint
+            );
+        }
+    }
+
+    #[test]
+    fn pre_scan_takeover_recovery_binds_the_exact_checkpoint_predecessor() {
+        for target in ["root", "persistent-existing"] {
+            let mut desired = desired();
+            let target_index = if target == "root" {
+                0
+            } else {
+                desired.volumes.push(normal_persistent_volume());
+                1
+            };
+            let authorization_id = if target == "root" {
+                id("takeover_recovery_root_predecessor")
+            } else {
+                id("takeover_recovery_persistent_predecessor")
+            };
+            desired.volumes[target_index].acquire = VolumeAcquire::Takeover {
+                authorization_id: authorization_id.clone(),
+            };
+            desired.spec_digest = spec_digest(&desired).unwrap();
+            let (mut expected, mut record, mut evidence, mut prior) =
+                takeover_recovery_fixture(&desired, target_index);
+            if target == "persistent-existing" {
+                desired.volumes[target_index]
+                    .mount
+                    .as_mut()
+                    .unwrap()
+                    .initialization =
+                    cats_api::runtime_reconciliation::FilesystemInitialization::Existing;
+                desired.spec_digest = spec_digest(&desired).unwrap();
+            }
+            let canonical_head = RemoteHead {
+                generation: Generation::new(5).unwrap(),
+                root_hash: Some(Sha256Digest::from_bytes([5; 32])),
+                root_object_id: Some(
+                    AsciiText::new(format!("roots/{target}-predecessor-5")).unwrap(),
+                ),
+            };
+            set_takeover_recovery_fixture_head(
+                &mut expected,
+                &mut record,
+                &mut evidence,
+                &mut prior,
+                canonical_head,
+            );
+
+            for case in ["owner", "epoch", "lower-head", "higher-head", "head-tuple"] {
+                let root = tempfile::tempdir().unwrap();
+                let mut wrong = prior.clone();
+                let VolumeAuthorityEvidence::Owned {
+                    attachment_id,
+                    attachment_epoch,
+                    head,
+                } = &mut wrong.authority
+                else {
+                    unreachable!("fixture predecessor is owned")
+                };
+                match case {
+                    "owner" => *attachment_id = id("att_foreign_predecessor"),
+                    "epoch" => *attachment_epoch = fence(attachment_epoch.get() + 1),
+                    "lower-head" | "higher-head" | "head-tuple" => {
+                        let (generation, byte, suffix) = match case {
+                            "lower-head" => (4, 4, "lower"),
+                            "higher-head" => (6, 6, "higher"),
+                            "head-tuple" => (5, 7, "foreign-tuple"),
+                            _ => unreachable!(),
+                        };
+                        *head = RemoteHead {
+                            generation: Generation::new(generation).unwrap(),
+                            root_hash: Some(Sha256Digest::from_bytes([byte; 32])),
+                            root_object_id: Some(
+                                AsciiText::new(format!("roots/{target}-{suffix}")).unwrap(),
+                            ),
+                        };
+                    }
+                    _ => unreachable!(),
+                }
+                let volumes = if target_index == 0 {
+                    vec![wrong]
+                } else {
+                    vec![unowned_observed_volume(&desired.volumes[0]), wrong]
+                };
+                let checkpoint = closed_checkpoint(
+                    &desired,
+                    ReconcileStep::AcquireVolume {
+                        request: VolumeAcquireRequest::Takeover {
+                            authorization_id: authorization_id.clone(),
+                        },
+                    },
+                    volumes,
+                    unix_ms(1_900_000_000_000),
+                );
+                assert!(multi_acquire_checkpoint_is_bound(
+                    &checkpoint,
+                    &desired,
+                    root.path(),
+                ));
+                persist_checkpoint(root.path(), &checkpoint);
+                let evidence_state = Arc::new(Mutex::new(EvidenceState {
+                    outcomes: VecDeque::from([evidence.clone()]),
+                    ..EvidenceState::default()
+                }));
+                let evidence_port: Arc<dyn SignedVolumeEvidencePort> = Arc::new(FakeEvidence {
+                    state: Arc::clone(&evidence_state),
+                });
+                let recovery = SignedRunningPublicationRecovery::new(Arc::new(FakeAuthority::new(
+                    Ok(record.clone()),
+                )))
+                .with_volume_evidence(evidence_port);
+                assert_eq!(
+                    recovery
+                        .recover_one(recovery_context(root.path(), &desired))
+                        .unwrap(),
+                    RuntimePreScanRecoveryOutcome::NoChange,
+                    "{target} checkpoint predecessor drift case {case}",
+                );
+                assert_eq!(evidence_state.lock().unwrap().requests.len(), 1);
+                assert!(
+                    !authorized_blockd_data_directory(root.path(), &desired, &expected.identity)
+                        .exists(),
+                    "{target} checkpoint predecessor drift case {case} published a grant",
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn pre_scan_takeover_recovery_revalidates_checkpoint_before_publication() {
+        let root = tempfile::tempdir().unwrap();
+        let mut desired = desired();
+        let authorization_id = id("takeover_recovery_checkpoint_drift");
+        desired.volumes[0].acquire = VolumeAcquire::Takeover {
+            authorization_id: authorization_id.clone(),
+        };
+        desired.spec_digest = spec_digest(&desired).unwrap();
+        let (expected, record, evidence, prior) = takeover_recovery_fixture(&desired, 0);
+        let checkpoint = closed_checkpoint(
+            &desired,
+            ReconcileStep::AcquireVolume {
+                request: VolumeAcquireRequest::Takeover {
+                    authorization_id: authorization_id.clone(),
+                },
+            },
+            vec![prior],
+            unix_ms(1_900_000_000_000),
+        );
+        persist_checkpoint(root.path(), &checkpoint);
+
+        let mut successor = checkpoint.clone();
+        successor.updated_at_unix_ms = unix_ms(1_900_000_000_001);
+        let successor = encode_runtime_checkpoint(&successor).unwrap();
+        let checkpoint_path = checkpoint_path(root.path(), &desired.cat_id);
+        let after_call: Arc<dyn Fn() + Send + Sync> = Arc::new(move || {
+            std::fs::write(&checkpoint_path, &successor).unwrap();
+        });
+        let evidence_state = Arc::new(Mutex::new(EvidenceState {
+            outcomes: VecDeque::from([evidence]),
+            after_call: Some(after_call),
+            ..EvidenceState::default()
+        }));
+        let evidence_port: Arc<dyn SignedVolumeEvidencePort> = Arc::new(FakeEvidence {
+            state: Arc::clone(&evidence_state),
+        });
+        let recovery =
+            SignedRunningPublicationRecovery::new(Arc::new(FakeAuthority::new(Ok(record))))
+                .with_volume_evidence(evidence_port);
+        let error = recovery
+            .recover_one(recovery_context(root.path(), &desired))
+            .unwrap_err();
+        assert!(format!("{error:#}").contains("before local mutation"));
+        assert!(
+            !authorized_blockd_data_directory(root.path(), &desired, &expected.identity).exists(),
+            "checkpoint drift published a local takeover grant",
+        );
+    }
+
+    #[test]
+    fn pre_scan_takeover_recovery_never_adopts_another_cats_signed_evidence() {
+        let root = tempfile::tempdir().unwrap();
+        let mut first = desired();
+        let first_authorization = id("takeover_recovery_first_cat");
+        first.volumes[0].acquire = VolumeAcquire::Takeover {
+            authorization_id: first_authorization.clone(),
+        };
+        first.spec_digest = spec_digest(&first).unwrap();
+        let (expected, record, _, prior) = takeover_recovery_fixture(&first, 0);
+        let checkpoint = closed_checkpoint(
+            &first,
+            ReconcileStep::AcquireVolume {
+                request: VolumeAcquireRequest::Takeover {
+                    authorization_id: first_authorization.clone(),
+                },
+            },
+            vec![prior],
+            unix_ms(1_900_000_000_000),
+        );
+        persist_checkpoint(root.path(), &checkpoint);
+
+        let mut second = second_desired();
+        second.volumes[0].acquire = VolumeAcquire::Takeover {
+            authorization_id: id("takeover_recovery_second_cat"),
+        };
+        second.spec_digest = spec_digest(&second).unwrap();
+        let (_, _, foreign_evidence, _) = takeover_recovery_fixture(&second, 0);
+        let evidence_state = Arc::new(Mutex::new(EvidenceState {
+            outcomes: VecDeque::from([foreign_evidence]),
+            ..EvidenceState::default()
+        }));
+        let evidence_port: Arc<dyn SignedVolumeEvidencePort> = Arc::new(FakeEvidence {
+            state: Arc::clone(&evidence_state),
+        });
+        let recovery =
+            SignedRunningPublicationRecovery::new(Arc::new(FakeAuthority::new(Ok(record))))
+                .with_volume_evidence(evidence_port);
+        assert_eq!(
+            recovery
+                .recover_one(recovery_context_with_desireds(
+                    root.path(),
+                    vec![first.clone(), second],
+                ))
+                .unwrap(),
+            RuntimePreScanRecoveryOutcome::NoChange,
+        );
+        assert_eq!(evidence_state.lock().unwrap().requests.len(), 1);
+        assert!(
+            !authorized_blockd_data_directory(root.path(), &first, &expected.identity,).exists()
+        );
+    }
+
+    #[test]
     fn fork_kill_at_each_authorized_publication_barrier_recovers_exactly() {
         for point in [
             "identity.json:temp",
@@ -6008,8 +8275,10 @@ mod tests {
             assert!(matches!(scanned.step, ReconcileStep::AcquireVolume { .. }));
             let blob = Arc::new(RecordingBlob::present(&current));
             let path = checkpoint_path(root.path(), &current.cat_id);
-            let (effect, calls) = effect(
+            let (effect, calls, evidence_calls) = production_effect(
                 &current,
+                Vec::new(),
+                Vec::new(),
                 Vec::new(),
                 authority,
                 Arc::clone(&blob),
@@ -6042,6 +8311,7 @@ mod tests {
                 &current.volumes[0]
             ));
             assert!(calls.lock().unwrap().requests.is_empty());
+            assert!(evidence_calls.lock().unwrap().requests.is_empty());
             assert_eq!(blob.reads.load(Ordering::SeqCst), 0);
         }
     }
@@ -6112,7 +8382,15 @@ mod tests {
         let first_scan = scan_runtime(root.path(), &current, authority.clone(), '8', 3);
         let blob = Arc::new(RecordingBlob::present(&current));
         let path = checkpoint_path(root.path(), &current.cat_id);
-        let (effect, calls) = effect(&current, Vec::new(), authority.clone(), blob, path.clone());
+        let (effect, calls, evidence_calls) = production_effect(
+            &current,
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            authority.clone(),
+            blob,
+            path.clone(),
+        );
         let (first_context, _) = context_with_session(
             root.path(),
             &current,
@@ -6154,6 +8432,7 @@ mod tests {
             ReconcileStep::ProvisionRootImage { .. }
         ));
         assert!(calls.lock().unwrap().requests.is_empty());
+        assert!(evidence_calls.lock().unwrap().requests.is_empty());
         let third_scan = scan_runtime(root.path(), &current, authority, '8', 3);
         assert!(matches!(
             third_scan.step,
@@ -6203,8 +8482,10 @@ mod tests {
             current.spec_digest = spec_digest(&current).unwrap();
             let scanned = scan_runtime(root.path(), &current, authority.clone(), '8', 3);
             let current_blob = Arc::new(RecordingBlob::present(&current));
-            let (planner, calls) = effect(
+            let (planner, calls, evidence_calls) = production_effect(
                 &current,
+                Vec::new(),
+                Vec::new(),
                 Vec::new(),
                 authority.clone(),
                 current_blob,
@@ -6231,6 +8512,7 @@ mod tests {
             ));
             assert!(calls.lock().unwrap().requests.is_empty());
             assert!(calls.lock().unwrap().release_requests.is_empty());
+            assert!(evidence_calls.lock().unwrap().requests.is_empty());
             let rescanned = scan_runtime(root.path(), &current, authority.clone(), '8', 3);
             assert!(matches!(
                 rescanned.step,
@@ -6274,7 +8556,7 @@ mod tests {
         current.runtime.boot_image_digest = Sha256Digest::from_bytes([3; 32]);
         current.spec_digest = spec_digest(&current).unwrap();
         let stale = scan_runtime(root.path(), &current, authority.clone(), '8', 3);
-        let (planner, release_calls) = effect_with_release(
+        let (planner, release_calls, evidence_calls) = production_effect_with_release(
             &current,
             vec![NormalReleaseAttempt::Ambiguous],
             authority.clone(),
@@ -6388,6 +8670,7 @@ mod tests {
         let closed = scan_runtime(root.path(), &current, authority, '8', 3);
         assert!(matches!(closed.step, ReconcileStep::CleanupRelease { .. }));
         assert!(closed.conditions.is_empty());
+        assert!(evidence_calls.lock().unwrap().requests.is_empty());
     }
 
     #[test]
@@ -7890,6 +10173,37 @@ mod tests {
         desired
     }
 
+    fn normal_persistent_volume() -> VolumeIntent {
+        VolumeIntent {
+            volume_intent_id: id("vint_z_persistent"),
+            disk_id: id("disk_z_persistent"),
+            volume_id: id("vol_z_persistent"),
+            attachment_id: id("att_z_persistent"),
+            size_bytes: 4 * 1024 * 1024,
+            disk_kind: DiskKind::Persistent,
+            access: VolumeAccess::ReadWriteOnce,
+            durability: cats_api::runtime_reconciliation::Durability::Strict,
+            guest_device: GuestDeviceIdentity {
+                serial: id("cats-persistent"),
+                slot: 1,
+            },
+            acquire: VolumeAcquire::Normal {
+                transition_id: random('b'),
+                expected_unowned_epoch: fence(0),
+            },
+            disposition: VolumeDisposition::Retain,
+            mount: Some(cats_api::runtime_reconciliation::Ext4MountIntent {
+                filesystem_uuid: random('c'),
+                mount_path: HostPath::new("/srv/cats/persistent").unwrap(),
+                initialization:
+                    cats_api::runtime_reconciliation::FilesystemInitialization::Initialize {
+                        initialization_token: random('d'),
+                        expected_blank_head: blank_head(),
+                    },
+            }),
+        }
+    }
+
     fn second_desired() -> DesiredRuntimeSpec {
         let mut desired = desired();
         desired.cat_id = id("cat_02");
@@ -8266,7 +10580,14 @@ mod tests {
     }
 
     fn attachment(desired: &DesiredRuntimeSpec) -> AuthorizedServingAttachment {
-        let volume = &desired.volumes[0];
+        normal_attachment(desired, 0)
+    }
+
+    fn normal_attachment(
+        desired: &DesiredRuntimeSpec,
+        volume_index: usize,
+    ) -> AuthorizedServingAttachment {
+        let volume = &desired.volumes[volume_index];
         let VolumeAcquire::Normal {
             transition_id,
             expected_unowned_epoch,
@@ -8310,6 +10631,158 @@ mod tests {
         }
     }
 
+    fn takeover_recovery_fixture(
+        desired: &DesiredRuntimeSpec,
+        volume_index: usize,
+    ) -> (
+        AuthorizedServingAttachment,
+        VolumeRecord,
+        VolumeEvidenceRecovery,
+        ObservedVolume,
+    ) {
+        let volume = &desired.volumes[volume_index];
+        let VolumeAcquire::Takeover { authorization_id } = &volume.acquire else {
+            panic!("takeover recovery fixture requires Takeover Desired")
+        };
+        let prior_attachment_id = if volume_index == 0 {
+            id("att_root_prior")
+        } else {
+            id("att_persistent_prior")
+        };
+        let prior_epoch = fence(7 + u64::try_from(volume_index).unwrap());
+        let authorization = VolumeTakeoverAuthorization {
+            authorization_id: authorization_id.clone(),
+            authorized_node_id: desired.placement.node_id.clone(),
+            host_fence_event_id: if volume_index == 0 {
+                id("fence_root_recovery")
+            } else {
+                id("fence_persistent_recovery")
+            },
+            volume_id: volume.volume_id.clone(),
+            expected_attachment_id: prior_attachment_id.clone(),
+            expected_epoch: prior_epoch,
+            new_attachment_id: volume.attachment_id.clone(),
+            desired_revision: desired.desired_revision,
+            new_placement_epoch: desired.placement.placement_epoch,
+            lease_duration_ms: 60_000,
+            not_after: unix_ms(1_900_000_020_000),
+        };
+        let resulting_epoch = fence(prior_epoch.get() + 1);
+        let receipt = TakeoverConsumedReceipt {
+            authorization_id: authorization_id.clone(),
+            host_fence_event_id: authorization.host_fence_event_id.clone(),
+            volume_id: volume.volume_id.clone(),
+            new_attachment_id: volume.attachment_id.clone(),
+            resulting_epoch,
+            resulting_head: blank_head(),
+            consumed_at: unix_ms(1_900_000_010_000),
+        };
+        let record = VolumeRecord {
+            volume_id: volume.volume_id.clone(),
+            size_bytes: volume.size_bytes,
+            durability: volume.durability,
+            admin_state: VolumeAdminState::Active,
+            head: blank_head(),
+            lease_owner: Some(volume.attachment_id.clone()),
+            lease_epoch: resulting_epoch,
+            lease_expires_at: Some(unix_ms(1_900_000_070_000)),
+            last_transition: Some(LastVolumeTransition::Takeover {
+                authorization_id: authorization_id.clone(),
+            }),
+        };
+        let prior = ObservedVolume {
+            volume_intent_id: Some(volume.volume_intent_id.clone()),
+            disk_id: Some(volume.disk_id.clone()),
+            volume_id: volume.volume_id.clone(),
+            disk_kind: match volume.disk_kind {
+                DiskKind::Root => ObservedDiskKind::Root,
+                DiskKind::Persistent => ObservedDiskKind::Persistent,
+            },
+            size_bytes: Some(volume.size_bytes),
+            durability: Some(volume.durability),
+            authority: VolumeAuthorityEvidence::Owned {
+                attachment_id: prior_attachment_id,
+                attachment_epoch: prior_epoch,
+                head: blank_head(),
+            },
+            local_lineages: Vec::new(),
+            devices: Vec::new(),
+        };
+        let evidence = RuntimeVolumeTransitionEvidenceSuccess {
+            version: ContractVersion::V1,
+            session: SessionBinding {
+                node_id: desired.placement.node_id.clone(),
+                node_boot_id: NodeBootId::new("33333333333333333333333333333333").unwrap(),
+                agent_instance_id: random('8'),
+                agent_session_epoch: epoch(3),
+            },
+            authorization_id: authorization_id.clone(),
+            authorization: AuthorizationRecord {
+                authorization: VolumeAuthorization::Takeover(authorization),
+                state: AuthorizationState::Consumed(Box::new(
+                    AuthorizationConsumedReceipt::Takeover(receipt.clone()),
+                )),
+            },
+            current_volume: Some(record.clone()),
+            delete_completion: None,
+            direct_successor_authorization: None,
+        };
+        let attachment = takeover_attachment_from_signed_evidence(
+            desired, volume, &prior, &evidence, &receipt, None,
+        )
+        .unwrap();
+        (
+            attachment,
+            record,
+            VolumeEvidenceRecovery::Validated {
+                evidence: Box::new(evidence),
+                decision: Box::new(VolumeEvidenceRecoveryDecision::AdoptTakeover(receipt)),
+            },
+            prior,
+        )
+    }
+
+    fn set_takeover_recovery_fixture_head(
+        attachment: &mut AuthorizedServingAttachment,
+        record: &mut VolumeRecord,
+        evidence: &mut VolumeEvidenceRecovery,
+        prior: &mut ObservedVolume,
+        head: RemoteHead,
+    ) {
+        attachment.head = head.clone();
+        let AuthorizedServingAcquire::Takeover { receipt, .. } = &mut attachment.acquire else {
+            panic!("takeover fixture must retain a takeover attachment")
+        };
+        receipt.resulting_head = head.clone();
+        record.head = head.clone();
+        let VolumeAuthorityEvidence::Owned {
+            head: prior_head, ..
+        } = &mut prior.authority
+        else {
+            panic!("takeover fixture predecessor must remain owned")
+        };
+        *prior_head = head.clone();
+        let VolumeEvidenceRecovery::Validated { evidence, decision } = evidence else {
+            panic!("takeover fixture must retain validated evidence")
+        };
+        let AuthorizationState::Consumed(stored) = &mut evidence.authorization.state else {
+            panic!("takeover fixture authorization must remain consumed")
+        };
+        let AuthorizationConsumedReceipt::Takeover(stored) = stored.as_mut() else {
+            panic!("takeover fixture must retain its takeover receipt")
+        };
+        stored.resulting_head = head.clone();
+        evidence
+            .current_volume
+            .as_mut()
+            .expect("takeover fixture has a current Volume")
+            .head = head.clone();
+        let VolumeEvidenceRecoveryDecision::AdoptTakeover(decision) = decision.as_mut() else {
+            panic!("takeover fixture decision must remain AdoptTakeover")
+        };
+        decision.resulting_head = head;
+    }
+
     fn acquire_checkpoint_from_attachment(
         desired: &DesiredRuntimeSpec,
         attachment: &AuthorizedServingAttachment,
@@ -8330,8 +10803,37 @@ mod tests {
         store.create(checkpoint).unwrap();
     }
 
+    fn assert_fresh_scanner_rejects_checkpoint_mutation(
+        root: &std::path::Path,
+        desired: &DesiredRuntimeSpec,
+        authority: Arc<dyn VolumeDataAuthority>,
+        blob: Arc<dyn BlobStore>,
+        mutate: impl FnOnce(&mut RuntimeCheckpoint),
+    ) {
+        let store =
+            FileCheckpointStore::open(&root.join(CHECKPOINT_NAMESPACE), &desired.cat_id).unwrap();
+        let current = store.load().unwrap().unwrap();
+        let original = current.checkpoint().clone();
+        let mut conflicting = original.clone();
+        mutate(&mut conflicting);
+        encode_runtime_checkpoint(&conflicting).unwrap();
+        let conflicting = store.replace(&current, &conflicting).unwrap();
+        let scanner = fresh_scanner_with_blob(root, authority, blob);
+        assert!(
+            !matches!(
+                scanner.scan_complete(scan_context(desired)),
+                Ok(RuntimeInventoryScanOutcome::Complete(_))
+            ),
+            "actual AuthorizedBlockd bytes must be value-exact with the durable checkpoint"
+        );
+        store.replace(&conflicting, &original).unwrap();
+    }
+
     fn unowned_record(desired: &DesiredRuntimeSpec) -> VolumeRecord {
-        let volume = &desired.volumes[0];
+        unowned_record_for(&desired.volumes[0])
+    }
+
+    fn unowned_record_for(volume: &VolumeIntent) -> VolumeRecord {
         let VolumeAcquire::Normal {
             expected_unowned_epoch,
             ..

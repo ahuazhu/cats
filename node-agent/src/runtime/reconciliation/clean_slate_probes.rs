@@ -90,6 +90,7 @@ use super::serving_handoff::{
 use super::serving_handoff_effect::{
     SERVING_CONTROL_SOCKET_BASENAME, SERVING_NBD_SOCKET_BASENAME, SERVING_VHOST_SOCKET_BASENAME,
 };
+use super::signed_running::request_matches_volume;
 use super::vmm_cid::{
     inventory_port_sealed as vmm_cid_inventory_sealed, ExactLiveVmmCid, VmmCidInventoryPort,
     VmmCidInventorySnapshot, VmmCidOwner,
@@ -176,6 +177,13 @@ pub(crate) enum LocalPublicationRecoveryEvidence {
         cat_id: Id,
     },
     AuthorizedBlockd {
+        cat_id: Id,
+    },
+    /// The current Takeover target artifact is already the one exact extra
+    /// member beyond the checkpoint's prepared set. The checkpoint CAS may
+    /// have lost its response; pre-scan recovery may read fresh signed
+    /// successor evidence, but must not rewrite or delete this immutable R0.
+    AuthorizedBlockdTakeoverPublication {
         cat_id: Id,
     },
     RootProvisionStopReceipt {
@@ -1977,22 +1985,59 @@ pub(crate) fn classify_local_publication_recovery(
         )
         .expect("nonempty stop receipt evidence has one recovery candidate"));
     }
-    let authorized_recovery = context
-        .coordinates()
-        .desired
-        .desired_specs
-        .iter()
-        .filter_map(|desired| {
-            let checkpoint = checkpoints.get(&desired.cat_id)?;
-            (matches!(
-                checkpoint.step,
-                cats_api::runtime_reconciliation::ReconcileStep::AcquireVolume { .. }
-            ) && !data.evidence.contains_key(&desired.cat_id))
-            .then(|| desired.cat_id.clone())
-        })
-        .collect::<BTreeSet<_>>();
+    let mut authorized_recovery = BTreeSet::new();
+    let mut takeover_publications = BTreeSet::new();
+    for desired in &context.coordinates().desired.desired_specs {
+        let Some(checkpoint) = checkpoints.get(&desired.cat_id) else {
+            continue;
+        };
+        let ReconcileStep::AcquireVolume { request } = &checkpoint.step else {
+            continue;
+        };
+        let mut targets = desired
+            .volumes
+            .iter()
+            .filter(|volume| request_matches_volume(request, desired, volume));
+        let Some(target) = targets.next() else {
+            continue;
+        };
+        if targets.next().is_some() {
+            continue;
+        }
+        let expected_prepared = checkpoint
+            .volumes
+            .iter()
+            .filter(|volume| !volume.local_lineages.is_empty())
+            .map(|volume| volume.volume_id.clone())
+            .collect::<BTreeSet<_>>();
+        let actual_prepared = data
+            .evidence
+            .get(&desired.cat_id)
+            .map(|volumes| volumes.keys().cloned().collect::<BTreeSet<_>>())
+            .unwrap_or_default();
+        if !actual_prepared.contains(&target.volume_id) && actual_prepared == expected_prepared {
+            authorized_recovery.insert(desired.cat_id.clone());
+            continue;
+        }
+        if matches!(
+            request,
+            cats_api::runtime_reconciliation::VolumeAcquireRequest::Takeover { .. }
+        ) && !expected_prepared.contains(&target.volume_id)
+        {
+            let mut exact_publication = expected_prepared;
+            exact_publication.insert(target.volume_id.clone());
+            if actual_prepared == exact_publication {
+                takeover_publications.insert(desired.cat_id.clone());
+            }
+        }
+    }
     if let Some(cat_id) = authorized_recovery.into_iter().next() {
         return Ok(LocalPublicationRecoveryEvidence::AuthorizedBlockd { cat_id });
+    }
+    if let Some(cat_id) = takeover_publications.into_iter().next() {
+        return Ok(
+            LocalPublicationRecoveryEvidence::AuthorizedBlockdTakeoverPublication { cat_id },
+        );
     }
     if !data.complete {
         // An unsupported, racing or foreign authorized publication remains
