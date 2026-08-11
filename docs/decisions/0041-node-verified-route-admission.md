@@ -56,6 +56,17 @@ checkpoint top-level revision/spec/placement/incarnation与同一old entry。任
 entry、serving gate、guards或cancellation，已有stream和旧Grant继续有效。同Cat的removed/changed/new
 Endpoint delta按endpoint ID稳定，每个完整序列一次一个，不建立batch token。
 
+每次full inventory前，runner在与checkpoint effect lane串行的mandatory pre-scan中检查process-local
+AdmissionCell session。session只封闭保存由accepted Ready effect或complete scan确认的最后一个exact Running
+gate Desired；它可在StartRuntime/final Mount建立，不要求checkpoint已经Stable。strict
+Endpoint-only successor在一个cell临界区内立即latch并取消全部changed/removed Endpoint tunnel，未变
+Endpoint保持原gate、guards和stream；durable CloseGate/drain/remove仍按Endpoint ID逐个完成。pre-scan只在
+exact current Stable/cell、previous exact Stable + strict Endpoint successor的完整latch、exact RequireIdle
+Busy/Open source，或current checkpoint与retained effect edge结算之一成立时，才允许Open gate继续存活；
+前两类是概念上的exact-retained/endpoint-latched状态，不新增wire。已经Closed/untrusted的session可先
+fail-close后正常返回。通过上述保留条件后scanner Incomplete/deadline按Degraded保留已证明gate；
+pre-scan本身非完成或scanner显式corrupt/conflict/foreign必须全局fail-close并取消tunnel。
+
 若revision同时改变runtime/placement/lifecycle/volume/mount/network/platform，则使用全局`CloseAdmission`关闭
 全部Endpoint；Endpoint-only不得使用它。任何实际或不明close后的reopen都先通过新完整Desired提高相应
 Endpoint route epochs。Agent restart/global close仍提高全部原Active Endpoint epochs，不能靠CloseGate
@@ -71,7 +82,12 @@ platform Ready 指 VMM、network、完整 disks/mounts 和 Guest transport Ready
 cancellation handles。token验证后的binding compare、gate check和guard increment在其中线性化；
 它不执行网络、数据库、VMM、文件或fsync I/O，也不持锁跨`.await`。
 
-gate先写入并fsync RuntimeCheckpoint，再发布到内存；observation只能随后报告Active。Endpoint-only
+Endpoint install先fsync Closed prepared token及同进程effect edge，再fsync Active token；最后一次fsync后，
+以immutable launch Desired、live gate predecessor和current Endpoint successor三层authority重新闭合Host与
+Guest物理事实，随后才compare-and-publish到内存，最后持久化completed postcondition。observation只能随后
+报告Active。prepared只可在exact edge仍保留的同进程内重放；Active可由该edge继续，或在cell已等于exact
+postcondition时只完成结算。重启默认Closed并烧掉Active/结果不明epoch。zero-Endpoint OpenAdmission同样先持久Stable/Open successor，最后barrier后才打开cell，cell后没有
+尚待CAS的状态。Endpoint-only
 close先fsync只含Endpoint/old epoch的CloseGate token，在cell内compare-and-close同entry完整old binding，
 再fsync该entry Closed；相同binding已Closed是幂等postcondition，结果不明必须以同binding重试，或在
 restart默认Closed后确认，确认前不能只写Closed。旧epoch永不重开，new binding必须使用更大epoch。Agent启动/

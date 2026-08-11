@@ -312,8 +312,13 @@ Active {
 }
 ```
 
-reconciler先fsync包含current desired依据的checkpoint，再短暂进入`AdmissionCell`发布Active，
-随后observation才能报告route Active。重复安装完全相同值幂等；同route epoch不同binding是
+reconciler先fsync包含current desired依据的Closed prepared checkpoint和同进程effect edge，再fsync
+Active checkpoint。最后一次fsync后，以immutable launch Desired、live gate predecessor Desired和current
+Endpoint successor Desired三层封闭authority重跑Host全局扫描与Guest mounted-set challenge；只有该barrier
+仍绑定durable Active successor时，才短暂进入`AdmissionCell`compare-and-publish Active，随后持久化completed
+postcondition并由observation报告route Active。prepared只可在保留exact effect edge的同进程内重放；Active
+可由该edge继续，或在cell已逐字段等于exact postcondition时只完成持久结算。重启默认Closed，任何已Active或
+结果不明的epoch均烧掉并要求更高epoch。重复安装完全相同值幂等；同route epoch不同binding是
 `SpecDigestConflict`。Agent启动或重启时，先从checkpoint、当前desired和完整物理inventory重建；
 证明闭合前全局lifecycle admission和全部Endpoint entries都保持Closed。进程重启使内存gate实际
 关闭，因此新AgentSession建立后，Control Plane必须提交提高所有原Active Endpoint route epochs的
@@ -340,6 +345,17 @@ Endpoint-only changed/removed A的durable close顺序固定为：
 缓存Grant继续。一个Cat的removed/changed/new Endpoint delta按endpoint ID稳定升序，每个Endpoint完整序列
 完成后才处理下一个，不引入batch close token。
 stale CloseGate遇到new revision或new binding只能零副作用，不能按endpoint ID误关新gate。
+
+每次full inventory之前，runner还必须执行mandatory serialized pre-scan。process-local session封闭保存由
+accepted Ready effect或complete scan确认的最后一个exact Running gate Desired；它可在StartRuntime/final
+Mount建立，不要求checkpoint已经Stable。strict Endpoint-only successor会在一个cell临界区内立即latch并取消全部
+changed/removed Endpoint tunnel，未变Endpoint保持原gate、guard和stream。该process-local latch可一次覆盖
+多个changed Endpoint，但durable CloseGate/drain/remove仍严格按Endpoint ID逐个完成。pre-scan只在exact
+current Stable/cell、previous exact Stable + strict Endpoint successor的完整latch、exact RequireIdle Busy/Open
+source，或current checkpoint与retained effect edge结算之一成立时，才允许Open gate继续存活；前两类只是
+概念上的exact-retained/endpoint-latched状态。已经Closed/untrusted的session可先fail-close后正常返回。通过
+上述保留条件后scanner Incomplete/deadline按Degraded保留已证明gate；pre-scan
+本身非完成或scanner显式corrupt/conflict/foreign必须全局fail-close并取消tunnel。
 
 `CloseAdmission`只用于离开Running、runtime replacement、Node drain、placement、volume、mount、network、
 platform变化以及下面的RequireIdle；它在cell内同时关闭全局lifecycle admission和全部Endpoint gates，

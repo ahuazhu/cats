@@ -286,9 +286,17 @@ Grant签发而不猜测Quarantine。
 
 Ready Running若完整current Desired的`endpoints=[]`，planner使用单独的checkpoint-first
 `OpenAdmission {runtime_incarnation}`：持久step时`stable_state=null`、lifecycle Closed、route集合为空且
-`runtime_launch`仍为同一`present(identity)`；确认cell已对同一incarnation打开后才CAS为Stable Running。
+`runtime_launch`仍为同一`present(identity)`；随后先持久化完整Stable/Open successor，再以同一次accepted
+physical predecessor和这个durable successor做最后一次Host全局扫描与Guest mounted-set challenge，最后才
+compare-and-open同一incarnation的cell。crash在cell前只留下durable Stable/Open + process-local Closed，下一轮
+必须重新跨过该barrier；cell后没有尚待持久化的状态。
 只要Desired有Endpoint就不得使用该step；第一条`InstallGate`负责把lifecycle从Closed打开，后续Endpoint按
-既有顺序安装。这样zero-endpoint和Endpoint-bearing路径不会形成两套可同时开闸的authority。
+既有顺序安装。Endpoint路径先持久化Closed prepared token和同进程effect edge，再持久化Active token，之后
+以immutable launch Desired、live gate predecessor Desired和current Endpoint successor三层authority执行同样
+的最后barrier，才compare-and-install cell；最后的completed checkpoint只记录已经线性化的postcondition。
+prepared token仅可在保留精确process-local edge的同进程内重放；Active token可由该edge继续，或在cell已经
+逐字段等于exact postcondition时只完成持久结算。Agent重启会默认Closed并烧掉任何已Active或结果不明的
+route epoch。这样zero-endpoint和Endpoint-bearing路径不会形成两套可同时开闸的authority。
 
 Control Plane对当前AgentSession按heartbeat sequence接受observation：大于已接受最高值的新payload
 在一个事务中原子应用；等于且完整payload相同是零新副作用的exact replay；等于但
@@ -299,6 +307,17 @@ attestation或Operation。
 MetadataStore 或某个 inventory source 的短暂故障是 Degraded：保留当前 VMM 和已验证 admission，
 冻结新生命周期/破坏性动作。发现确定的重复 VMM/writer 或 identity/epoch 冲突则立即关 gate
 并 Quarantine。
+
+每次full scan前，runner必须先在与effect lane串行的mandatory pre-scan中对共享AdmissionCell做安全
+reconciliation。process-local session保存由accepted Ready effect或complete scan封闭的最后一个exact
+Running gate Desired；它可在StartRuntime/final Mount建立，不要求checkpoint已经Stable。strict Endpoint-only successor
+会在一个cell临界区内立即latch并取消全部changed/removed Endpoint（按Endpoint ID的durable close/drain仍一次
+一个），未变Endpoint保持原gate、guards和stream。pre-scan只在能证明exact current Stable/cell、previous
+Stable + strict Endpoint successor的完整latch、exact RequireIdle Busy/Open source，或current checkpoint与
+retained effect edge结算之一时，才允许任一Open gate继续存活；前两类可概念化为
+exact-retained/endpoint-latched状态，不是新增wire。已经Closed或untrusted的session可在先fail-close后正常返回。
+其他歧义、pre-scan超时/取消/错误都先全局fail-close并取消tunnel。通过上述保留条件后，随后的scan Incomplete或
+scan deadline按Degraded处理并保留已经证明可留的gate；scanner显式报告corrupt/conflict/foreign时仍全局关闭。
 
 ## Host fencing 与 Volume takeover
 
