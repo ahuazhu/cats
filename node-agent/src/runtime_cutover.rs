@@ -208,13 +208,14 @@ async fn spawn_signed_runtime_cutover_with_scanner(
     config: SignedRuntimeCutoverConfig,
     scanner_override: Option<Arc<dyn RuntimeInventoryScanner>>,
 ) -> anyhow::Result<SignedRuntimeCutoverHandle> {
-    spawn_signed_runtime_cutover_with_overrides(config, scanner_override, None).await
+    spawn_signed_runtime_cutover_with_overrides(config, scanner_override, None, None).await
 }
 
 async fn spawn_signed_runtime_cutover_with_overrides(
     config: SignedRuntimeCutoverConfig,
     scanner_override: Option<Arc<dyn RuntimeInventoryScanner>>,
     resource_owner_override: Option<Arc<dyn RuntimeEffectResourceOwner>>,
+    recovery_override: Option<SignedRunningPublicationRecovery>,
 ) -> anyhow::Result<SignedRuntimeCutoverHandle> {
     // Reject an unrepresentable operator budget before registration, worker
     // construction, or listener binding can mutate external/local state.
@@ -390,7 +391,22 @@ async fn spawn_signed_runtime_cutover_with_overrides(
             admission_registry,
         )
         .context("compose signed Running root provision prefix")?;
-        let recovery = SignedRunningPublicationRecovery::new(Arc::clone(&effect_volume_authority));
+        let recovery = match recovery_override {
+            Some(recovery) => recovery,
+            None => {
+                #[cfg(target_os = "linux")]
+                {
+                    SignedRunningPublicationRecovery::with_stale_boot_vmm_recovery(
+                        Arc::clone(&effect_volume_authority),
+                        effect_root_process_ports.stale_boot_vmm.clone(),
+                    )
+                }
+                #[cfg(not(target_os = "linux"))]
+                {
+                    SignedRunningPublicationRecovery::new(Arc::clone(&effect_volume_authority))
+                }
+            }
+        };
         RuntimeSpineRunner::new_with_recovery_desired_effects_and_resource_owner(
             effect_state_directory,
             session,
@@ -576,6 +592,12 @@ mod tests {
         VolumeAcquire, VolumeAcquireRequest, VolumeAdminState, VolumeDisposition, VolumeIntent,
         VolumeLeaseGrant, DESIRED_READ_PATH, OBSERVATION_PATH, RUNTIME_VOLUME_TRANSITION_PATH,
     };
+    #[cfg(target_os = "linux")]
+    use cats_api::runtime_reconciliation::{
+        decode_desired_runtime_spec, AppliedDesiredEvidence, CheckpointEvidence, Condition,
+        GuestTransportEvidence, HostPath, InventorySource, LifecycleAdmission,
+        ObservedRuntimeStatus, ProgressingReason, RuntimeLaunch, WarmSnapshotEvidence,
+    };
     use cats_storage::authority::{
         AuthorityError, NodeVolumeInventorySnapshot, RenewLeaseRequest, RenewLeaseResult,
         VolumeHeadCasRequest, VolumeHeadCasResult, VolumeRecord,
@@ -593,13 +615,142 @@ mod tests {
     };
     #[cfg(target_os = "linux")]
     use crate::runtime::reconciliation::{
-        RetainedManagedVmmLaunchRoot, RetainedManagedVmmSocketRoot, VmmSocketReceiptStore,
-        INSTALLED_VMM_SOCKET_ROOT, VMM_LAUNCH_FILE_NAMESPACE,
+        current_kernel_node_boot_id, stale_boot_recovery_global_sealed,
+        ExactVmmProcessAbsenceProof, InstalledStaleBootVmmRecoveryPorts, ManagedVmmLaunchFilePaths,
+        RetainedManagedVmmLaunchRoot, RetainedManagedVmmSocketRoot, RuntimeCheckpointRecoverySet,
+        StaleBootVmmProcessGlobalInspection, StaleBootVmmProcessGlobalPort, VmmProcessExpectation,
+        VmmSocketOwnershipReceiptV1, VmmSocketReceiptStore, INSTALLED_VMM_SOCKET_ROOT,
+        VMM_LAUNCH_FILE_NAMESPACE,
+    };
+    #[cfg(target_os = "linux")]
+    use crate::runtime_spine::{
+        CompleteRuntimeInventory, InventoryCoverageAggregator, RuntimeInventoryKeyRing,
+        RuntimeInventoryScanContext, RuntimeInventoryScanOutcome,
     };
 
     struct StubbornEffectChildOwner {
         pending: AtomicBool,
         shutdowns: std::sync::atomic::AtomicUsize,
+    }
+
+    #[cfg(target_os = "linux")]
+    struct CompositionStaleBootGlobal {
+        calls: Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    #[cfg(target_os = "linux")]
+    impl stale_boot_recovery_global_sealed::Sealed for CompositionStaleBootGlobal {}
+
+    #[cfg(target_os = "linux")]
+    impl StaleBootVmmProcessGlobalPort for CompositionStaleBootGlobal {
+        fn inspect_stale_boot_absence_after_node_global_sweep(
+            &self,
+            selected: &VmmProcessExpectation,
+            checkpoints: &RuntimeCheckpointRecoverySet,
+            context: &crate::runtime_spine::RuntimePreScanRecoveryContext,
+        ) -> anyhow::Result<StaleBootVmmProcessGlobalInspection> {
+            context.check_active()?;
+            anyhow::ensure!(
+                checkpoints.checkpoint(selected.cat_id()) == Some(selected.checkpoint()),
+                "composition recovery did not receive the complete retained checkpoint set"
+            );
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            Ok(StaleBootVmmProcessGlobalInspection::Absent(Box::new(
+                ExactVmmProcessAbsenceProof::for_test_expectation(selected.clone()),
+            )))
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    struct ReceiptRetiredCompositionScanner {
+        receipts: Arc<VmmSocketReceiptStore>,
+        incarnation: cats_api::runtime_reconciliation::RandomId128,
+        calls: Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    #[cfg(target_os = "linux")]
+    impl crate::runtime_spine::inventory_scanner_sealed::Sealed for ReceiptRetiredCompositionScanner {}
+
+    #[cfg(target_os = "linux")]
+    impl RuntimeInventoryScanner for ReceiptRetiredCompositionScanner {
+        fn scan_complete(
+            &self,
+            context: RuntimeInventoryScanContext,
+        ) -> anyhow::Result<RuntimeInventoryScanOutcome> {
+            context.check_active()?;
+            anyhow::ensure!(
+                self.receipts.load(&self.incarnation)?.is_none(),
+                "full scan ran before stale-boot VMM receipt retirement"
+            );
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            let mut coverage = InventoryCoverageAggregator::new();
+            for source in [
+                InventorySource::Checkpoint,
+                InventorySource::Systemd,
+                InventorySource::Process,
+                InventorySource::ControlSocket,
+                InventorySource::BlockFrontend,
+                InventorySource::Network,
+                InventorySource::DataDirectory,
+                InventorySource::PendingPack,
+                InventorySource::WarmSnapshot,
+                InventorySource::MetadataStore,
+                InventorySource::GuestMount,
+            ] {
+                coverage.record(source)?;
+            }
+            let runtimes = context
+                .coordinates()
+                .desired
+                .desired_specs
+                .iter()
+                .map(|desired| {
+                    let step = ReconcileStep::InspectInventory {
+                        inventory_epoch: context.coordinates().inventory_epoch,
+                    };
+                    ObservedRuntimeStatus {
+                        cat_id: desired.cat_id.clone(),
+                        applied_desired: Some(AppliedDesiredEvidence {
+                            desired_revision: desired.desired_revision,
+                            spec_digest: desired.spec_digest.clone(),
+                            placement: desired.placement.clone(),
+                            target: desired.target,
+                        }),
+                        runtime_incarnation: None,
+                        stable_state: None,
+                        step: step.clone(),
+                        checkpoint: CheckpointEvidence::Missing {
+                            checkpoint_path: HostPath::new(format!(
+                                "/var/lib/cats/test/{}.json",
+                                desired.cat_id
+                            ))
+                            .unwrap(),
+                        },
+                        processes: Vec::new(),
+                        volumes: Vec::new(),
+                        mounts: Vec::new(),
+                        networks: Vec::new(),
+                        guest_transport: GuestTransportEvidence::Unavailable,
+                        warm_snapshot: WarmSnapshotEvidence::Absent,
+                        lifecycle_admission: LifecycleAdmission::Closed,
+                        routes: Vec::new(),
+                        platform_guards: 0,
+                        conditions: vec![Condition::Progressing {
+                            reason: ProgressingReason::ReconcileStep { step },
+                        }],
+                    }
+                })
+                .collect();
+            Ok(RuntimeInventoryScanOutcome::Complete(
+                CompleteRuntimeInventory::from_validated_coverage(
+                    coverage.finish()?,
+                    UnixMillis::new(1_900_000_006_000).unwrap(),
+                    RuntimeInventoryKeyRing::Unavailable,
+                    runtimes,
+                    Vec::new(),
+                ),
+            ))
+        }
     }
 
     impl crate::runtime_spine::effect_resource_owner_sealed::Sealed for StubbornEffectChildOwner {}
@@ -1157,6 +1308,120 @@ mod tests {
         desired
     }
 
+    #[cfg(target_os = "linux")]
+    fn stale_boot_composition_desired_spec() -> DesiredRuntimeSpec {
+        let mut desired = decode_desired_runtime_spec(include_bytes!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../testdata/runtime-reconciliation-v1-desired.json"
+        )))
+        .unwrap();
+        desired.placement.node_id = Id::new("node_cutover_a").unwrap();
+        desired.spec_digest = spec_digest(&desired).unwrap();
+        desired
+    }
+
+    #[cfg(target_os = "linux")]
+    fn stale_boot_composition_fixture(
+        root: &std::path::Path,
+        state_path: &std::path::Path,
+        desired: &DesiredRuntimeSpec,
+        global_calls: Arc<std::sync::atomic::AtomicUsize>,
+    ) -> (
+        InstalledStaleBootVmmRecoveryPorts,
+        Arc<VmmSocketReceiptStore>,
+        cats_api::runtime_reconciliation::RandomId128,
+        std::path::PathBuf,
+    ) {
+        std::fs::create_dir(state_path).unwrap();
+        std::fs::set_permissions(state_path, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let state = crate::state_directory::StateDirectory::unanchored(state_path.to_path_buf());
+        let launch_namespace = state.path().join(VMM_LAUNCH_FILE_NAMESPACE);
+        std::fs::create_dir(&launch_namespace).unwrap();
+        std::fs::set_permissions(&launch_namespace, std::fs::Permissions::from_mode(0o700))
+            .unwrap();
+        let launch_root =
+            Arc::new(RetainedManagedVmmLaunchRoot::open_existing(state.clone()).unwrap());
+        let socket_root = Arc::new(
+            RetainedManagedVmmSocketRoot::provision_for_test(&root.join("recovery-sockets"))
+                .unwrap(),
+        );
+        let receipts = Arc::new(VmmSocketReceiptStore::provision_for_test(state.clone()).unwrap());
+        let mut checkpoint = decode_runtime_checkpoint(include_bytes!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../testdata/runtime-reconciliation-v1-start-runtime-checkpoint.json"
+        )))
+        .unwrap();
+        checkpoint.node_id = desired.placement.node_id.clone();
+        checkpoint.desired_revision = desired.desired_revision;
+        checkpoint.spec_digest = desired.spec_digest.clone();
+        checkpoint.placement_epoch = desired.placement.placement_epoch;
+        for lineage in &mut checkpoint.volumes[0].local_lineages {
+            lineage.node_id = desired.placement.node_id.clone();
+            lineage.placement_epoch = desired.placement.placement_epoch;
+        }
+        let incarnation = checkpoint.runtime_incarnation.as_ref().unwrap().clone();
+        let sockets = socket_root.planner().paths_for(&incarnation).unwrap();
+        let files = ManagedVmmLaunchFilePaths::for_incarnation(&state, &incarnation).unwrap();
+        let ReconcileStep::StartRuntime {
+            api_socket_path,
+            vsock_socket_path,
+            memory_file_path,
+            serial_log_path,
+            vmm_log_path,
+            ..
+        } = &mut checkpoint.step
+        else {
+            unreachable!()
+        };
+        *api_socket_path = sockets.api_socket_path().clone();
+        *vsock_socket_path = sockets.vsock_socket_path().clone();
+        *memory_file_path = files.memory_file_path().clone();
+        *serial_log_path = files.serial_log_path().clone();
+        *vmm_log_path = files.vmm_log_path().clone();
+        checkpoint.runtime_launch = RuntimeLaunch::Present(Box::new(
+            checkpoint.step.start_runtime_launch_identity().unwrap(),
+        ));
+        let checkpoint_path =
+            runtime_checkpoint_path(&state.path().join("checkpoints"), &checkpoint.cat_id);
+        crate::runtime::reconciliation::FileCheckpointStore::open(
+            &state.path().join("checkpoints"),
+            &checkpoint.cat_id,
+        )
+        .unwrap()
+        .create(&checkpoint)
+        .unwrap();
+        let mut receipt = VmmSocketOwnershipReceiptV1::from_checkpoint(
+            &checkpoint,
+            &state,
+            &socket_root,
+            current_kernel_node_boot_id().unwrap(),
+            cats_api::runtime_reconciliation::RandomId128::new("bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb")
+                .unwrap(),
+        )
+        .unwrap();
+        let current_boot = current_kernel_node_boot_id().unwrap();
+        let old_boot = ["e".repeat(32), "f".repeat(32)]
+            .into_iter()
+            .map(|value| NodeBootId::new(value).unwrap())
+            .find(|value| value != &current_boot)
+            .unwrap();
+        receipt.set_node_boot_id_for_test(old_boot);
+        receipts.publish(&receipt).unwrap();
+        (
+            InstalledStaleBootVmmRecoveryPorts {
+                global: Arc::new(CompositionStaleBootGlobal {
+                    calls: global_calls,
+                }),
+                socket_root,
+                launch_root,
+                receipts: Arc::clone(&receipts),
+            },
+            receipts,
+            incarnation,
+            checkpoint_path,
+        )
+    }
+
     fn blank_head() -> RemoteHead {
         RemoteHead {
             generation: Generation::new(0).unwrap(),
@@ -1263,6 +1528,8 @@ mod tests {
         assert!(source.contains("SignedRunningAcquireEffect::new"));
         assert!(source.contains("RuntimeVolumeTransitionHttpClient::for_production"));
         assert!(source.contains("installed_clean_slate_scanner"));
+        #[cfg(target_os = "linux")]
+        assert!(source.contains("with_stale_boot_vmm_recovery"));
         assert!(source.contains("VmmLaunchArtifactPaths"));
         assert!(source.contains("vmm_launcher_bin"));
         assert!(running_effect.contains("StartRuntimeReservationEffect::platform"));
@@ -1278,6 +1545,97 @@ mod tests {
         assert!(!source.contains(&placeholder_effect));
         assert!(!source.contains(&legacy_job));
         assert!(!source.contains(&legacy_runtime));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn production_composition_retires_stale_boot_receipt_before_fresh_full_scan() {
+        let root = tempfile::tempdir().unwrap();
+        let state_path = root.path().join("state");
+        let desired = stale_boot_composition_desired_spec();
+        let authority = Arc::new(CompositionAuthority::new(&desired));
+        let blob = Arc::new(CompositionBlobStore::new(&desired));
+        let control = CompositionControl {
+            desired: desired.clone(),
+            authority: Arc::clone(&authority),
+            registrations: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            desired_reads: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            observations: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            a22_calls: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+        };
+        let global_calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let (ports, receipts, incarnation, checkpoint_path) = stale_boot_composition_fixture(
+            root.path(),
+            &state_path,
+            &desired,
+            Arc::clone(&global_calls),
+        );
+        let scan_calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let scanner: Arc<dyn RuntimeInventoryScanner> =
+            Arc::new(ReceiptRetiredCompositionScanner {
+                receipts: Arc::clone(&receipts),
+                incarnation: incarnation.clone(),
+                calls: Arc::clone(&scan_calls),
+            });
+        let recovery_authority: Arc<dyn VolumeDataAuthority> = authority.clone();
+        let recovery = SignedRunningPublicationRecovery::with_stale_boot_vmm_recovery(
+            recovery_authority,
+            ports,
+        );
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let origin = format!("http://{}/", listener.local_addr().unwrap());
+        let server_control = control.clone();
+        let server = tokio::spawn(async move {
+            axum::serve(
+                listener,
+                Router::new()
+                    .route(REGISTRATION_PATH, post(composition_registration))
+                    .route(DESIRED_READ_PATH, post(composition_desired))
+                    .route(OBSERVATION_PATH, post(composition_observation))
+                    .route(RUNTIME_VOLUME_TRANSITION_PATH, post(composition_a22))
+                    .with_state(server_control),
+            )
+            .await
+            .unwrap();
+        });
+
+        let mut handle = spawn_signed_runtime_cutover_with_overrides(
+            composition_config(state_path.clone(), origin, Arc::clone(&authority), blob),
+            Some(scanner),
+            None,
+            Some(recovery),
+        )
+        .await
+        .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(8);
+        while control.observations.load(Ordering::SeqCst) == 0 {
+            if Instant::now() >= deadline {
+                panic!(
+                    "production composition did not continue into a fresh full scan: registrations={} desired_reads={} global_calls={} scan_calls={} receipt_present={} runner_finished={}",
+                    control.registrations.load(Ordering::SeqCst),
+                    control.desired_reads.load(Ordering::SeqCst),
+                    global_calls.load(Ordering::SeqCst),
+                    scan_calls.load(Ordering::SeqCst),
+                    receipts.load(&incarnation).unwrap().is_some(),
+                    handle.runner_task.is_finished(),
+                );
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert_eq!(global_calls.load(Ordering::SeqCst), 1);
+        assert!(scan_calls.load(Ordering::SeqCst) >= 1);
+        assert!(receipts.load(&incarnation).unwrap().is_none());
+        assert!(checkpoint_path.is_file());
+
+        handle.request_runner_shutdown();
+        join_result(
+            (&mut handle.runner_task).await,
+            "join stale-boot composition",
+        )
+        .unwrap();
+        drop(handle);
+        server.abort();
     }
 
     #[tokio::test]
@@ -1563,6 +1921,7 @@ mod tests {
             },
             None,
             Some(owner_port),
+            None,
         )
         .await
         .unwrap();

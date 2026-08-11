@@ -83,6 +83,11 @@ pub(crate) mod global_sealed {
     pub(crate) trait Sealed {}
 }
 
+#[cfg(target_os = "linux")]
+pub(crate) mod stale_boot_recovery_global_sealed {
+    pub(crate) trait Sealed {}
+}
+
 #[cfg(test)]
 pub(crate) use sealed::Sealed as VmmProcessPortSealedForTest;
 
@@ -135,6 +140,32 @@ pub(crate) trait VmmProcessGlobalPort:
         expected: &VmmProcessExpectation,
         context: &RuntimeDesiredEffectContext,
     ) -> anyhow::Result<VmmProcessGlobalInspection>;
+}
+
+/// Restart-only absence boundary for retiring one previous-kernel-boot VMM
+/// receipt.  This is intentionally separate from [`VmmProcessGlobalPort`]: a
+/// pre-scan recovery has no accepted-full admission sidecar to consume.
+/// Implementations must instead revalidate the complete current checkpoint
+/// namespace supplied by the serialized recovery lane and perform a fresh,
+/// closed Node-global sweep while the caller holds the launch-root EX lock.
+#[cfg(target_os = "linux")]
+pub(crate) trait StaleBootVmmProcessGlobalPort:
+    stale_boot_recovery_global_sealed::Sealed + Send + Sync
+{
+    fn inspect_stale_boot_absence_after_node_global_sweep(
+        &self,
+        selected: &VmmProcessExpectation,
+        checkpoints: &super::clean_slate_probes::RuntimeCheckpointRecoverySet,
+        context: &crate::runtime_spine::RuntimePreScanRecoveryContext,
+    ) -> anyhow::Result<StaleBootVmmProcessGlobalInspection>;
+}
+
+#[derive(Debug, PartialEq, Eq)]
+#[cfg(target_os = "linux")]
+pub(crate) enum StaleBootVmmProcessGlobalInspection {
+    Absent(Box<ExactVmmProcessAbsenceProof>),
+    Conflict(VmmProcessConflict),
+    Unavailable,
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -573,6 +604,11 @@ pub(crate) struct ExactVmmProcessAbsenceProof {
 impl ExactVmmProcessAbsenceProof {
     pub(super) fn for_expectation(expectation: VmmProcessExpectation) -> Self {
         Self { expectation }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn for_test_expectation(expectation: VmmProcessExpectation) -> Self {
+        Self::for_expectation(expectation)
     }
 
     pub(crate) fn expectation(&self) -> &VmmProcessExpectation {

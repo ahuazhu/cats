@@ -34,7 +34,8 @@ use super::retained_runtime_launch::RetainedRuntimeLaunchAuthority;
 use super::vmm_launch_artifacts::VmmLaunchArtifactDescriptors;
 #[cfg(target_os = "linux")]
 use super::vmm_socket_namespace::{
-    current_kernel_node_boot_id, scan_receipt_namespace_snapshot, ReceiptNamespaceSnapshot,
+    current_kernel_node_boot_id, scan_receipt_namespace_snapshot,
+    scan_stale_boot_receipt_namespace_snapshot, ReceiptNamespaceSnapshot,
     RetainedManagedVmmSocketRoot, RetainedStaleVmmSocketReceipt,
     StaleVmmReceiptRetirementAuthority, VmmSocketOwnershipReceiptV1, VmmSocketReceiptStore,
 };
@@ -1430,6 +1431,47 @@ pub(crate) fn scan_managed_vmm_launch_root(
     expected_checkpoints: &[&RuntimeCheckpoint],
     context: &dyn crate::runtime_spine::RuntimePhysicalReadContext,
 ) -> Result<ManagedVmmLaunchRootScan> {
+    scan_managed_vmm_launch_root_with_receipt_policy(
+        root,
+        socket_root,
+        receipts,
+        expected_checkpoints,
+        context,
+        false,
+    )
+}
+
+/// Recovery-only launch-file accounting which accepts exact old-boot receipt
+/// bytes (including the receipt quarantine replay name). It grants no cleanup
+/// authority by itself; the selected candidate still needs the launch-root EX
+/// guard and the recovery-specific Node-global absence proof.
+#[cfg(target_os = "linux")]
+pub(crate) fn scan_managed_vmm_launch_root_for_stale_boot_recovery(
+    root: &RetainedManagedVmmLaunchRoot,
+    socket_root: &RetainedManagedVmmSocketRoot,
+    receipts: &VmmSocketReceiptStore,
+    expected_checkpoints: &[&RuntimeCheckpoint],
+    context: &dyn crate::runtime_spine::RuntimePhysicalReadContext,
+) -> Result<ManagedVmmLaunchRootScan> {
+    scan_managed_vmm_launch_root_with_receipt_policy(
+        root,
+        socket_root,
+        receipts,
+        expected_checkpoints,
+        context,
+        true,
+    )
+}
+
+#[cfg(target_os = "linux")]
+fn scan_managed_vmm_launch_root_with_receipt_policy(
+    root: &RetainedManagedVmmLaunchRoot,
+    socket_root: &RetainedManagedVmmSocketRoot,
+    receipts: &VmmSocketReceiptStore,
+    expected_checkpoints: &[&RuntimeCheckpoint],
+    context: &dyn crate::runtime_spine::RuntimePhysicalReadContext,
+    allow_stale_boot: bool,
+) -> Result<ManagedVmmLaunchRootScan> {
     context.check_active()?;
     if root.assert_current().is_err()
         || socket_root.assert_current().is_err()
@@ -1438,8 +1480,16 @@ pub(crate) fn scan_managed_vmm_launch_root(
     {
         return Ok(ManagedVmmLaunchRootScan::Residue);
     }
-    let first_receipts =
-        scan_receipt_namespace_snapshot(socket_root, receipts, expected_checkpoints, context)?;
+    let first_receipts = if allow_stale_boot {
+        scan_stale_boot_receipt_namespace_snapshot(
+            socket_root,
+            receipts,
+            expected_checkpoints,
+            context,
+        )?
+    } else {
+        scan_receipt_namespace_snapshot(socket_root, receipts, expected_checkpoints, context)?
+    };
     match &first_receipts {
         ReceiptNamespaceSnapshot::Exact(_) => {}
         ReceiptNamespaceSnapshot::Residue => return Ok(ManagedVmmLaunchRootScan::Residue),
@@ -1451,6 +1501,7 @@ pub(crate) fn scan_managed_vmm_launch_root(
         &first_receipts,
         expected_checkpoints,
         context,
+        allow_stale_boot,
     )? {
         Some(snapshot) => snapshot,
         None => return Ok(ManagedVmmLaunchRootScan::Unavailable),
@@ -1461,6 +1512,7 @@ pub(crate) fn scan_managed_vmm_launch_root(
         &first_receipts,
         expected_checkpoints,
         context,
+        allow_stale_boot,
     )? {
         Some(snapshot) => snapshot,
         None => return Ok(ManagedVmmLaunchRootScan::Unavailable),
@@ -1468,8 +1520,16 @@ pub(crate) fn scan_managed_vmm_launch_root(
     if first.contains_key("<foreign>") || second.contains_key("<foreign>") || first != second {
         return Ok(ManagedVmmLaunchRootScan::Residue);
     }
-    let second_receipts =
-        scan_receipt_namespace_snapshot(socket_root, receipts, expected_checkpoints, context)?;
+    let second_receipts = if allow_stale_boot {
+        scan_stale_boot_receipt_namespace_snapshot(
+            socket_root,
+            receipts,
+            expected_checkpoints,
+            context,
+        )?
+    } else {
+        scan_receipt_namespace_snapshot(socket_root, receipts, expected_checkpoints, context)?
+    };
     match &second_receipts {
         ReceiptNamespaceSnapshot::Exact(_) => {}
         ReceiptNamespaceSnapshot::Residue => return Ok(ManagedVmmLaunchRootScan::Residue),
@@ -1489,6 +1549,7 @@ fn scan_launch_root_snapshot(
     receipt_snapshot: &ReceiptNamespaceSnapshot,
     expected_checkpoints: &[&RuntimeCheckpoint],
     context: &dyn crate::runtime_spine::RuntimePhysicalReadContext,
+    allow_stale_boot: bool,
 ) -> Result<Option<std::collections::BTreeMap<String, LaunchAttemptSnapshot>>> {
     context.check_active()?;
     let mut expected = std::collections::BTreeMap::new();
@@ -1576,7 +1637,12 @@ fn scan_launch_root_snapshot(
             Ok(names) => names,
             Err(_) => return Ok(Some(foreign_launch_snapshot())),
         };
-        let Some(receipt) = receipt_snapshot.receipt_for_checkpoint(checkpoint)? else {
+        let receipt = if allow_stale_boot {
+            receipt_snapshot.stale_boot_receipt_for_checkpoint(checkpoint)?
+        } else {
+            receipt_snapshot.receipt_for_checkpoint(checkpoint)?
+        };
+        let Some(receipt) = receipt else {
             return Ok(Some(foreign_launch_snapshot()));
         };
         let paths =
@@ -1587,9 +1653,17 @@ fn scan_launch_root_snapshot(
                 location,
                 LaunchResidueLocation::Public | LaunchResidueLocation::Quarantine
             );
-        if receipt
-            .validate_launch_paths(checkpoint, receipts.state_directory(), &paths)
-            .is_err()
+        let receipt_paths_are_exact = if allow_stale_boot {
+            receipt.validate_stale_boot_launch_paths(
+                checkpoint,
+                receipts.state_directory(),
+                &paths,
+                &current_kernel_node_boot_id()?,
+            )
+        } else {
+            receipt.validate_launch_paths(checkpoint, receipts.state_directory(), &paths)
+        };
+        if receipt_paths_are_exact.is_err()
             || validate_launch_attempt_entries(&directory, &names).is_err()
             || (!marker_present && !recoverable_unmarked)
             || (marker_present
@@ -2374,6 +2448,8 @@ mod tests {
     use super::*;
 
     #[cfg(target_os = "linux")]
+    use super::super::vmm_process::{ExactVmmProcessAbsenceProof, VmmProcessExpectation};
+    #[cfg(target_os = "linux")]
     use crate::runtime::reconciliation::{
         vmm_socket_namespace::{current_kernel_node_boot_id, StaleVmmSocketReceiptScan},
         RetainedManagedVmmSocketRoot, VmmSocketReceiptStore,
@@ -3062,6 +3138,208 @@ mod tests {
                 ));
             }
         }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn multiple_stale_boot_cats_recover_one_per_round_without_mutating_the_other() {
+        let mut fixture = LaunchFixture::new();
+        fixture.publish_as_stale_boot();
+        let mut second = fixture.checkpoint.clone();
+        second.cat_id = Id::new("cat_02").unwrap();
+        let second_incarnation = RandomId128::new("eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee").unwrap();
+        second.runtime_incarnation = Some(second_incarnation.clone());
+        let second_sockets = fixture
+            .socket_root
+            .planner()
+            .paths_for(&second_incarnation)
+            .unwrap();
+        let second_files = ManagedVmmLaunchFilePaths::for_incarnation(
+            fixture.launch_root.state_directory(),
+            &second_incarnation,
+        )
+        .unwrap();
+        let ReconcileStep::StartRuntime {
+            runtime_incarnation,
+            scope_id,
+            process_identity_token,
+            api_socket_path,
+            vsock_socket_path,
+            memory_file_path,
+            serial_log_path,
+            vmm_log_path,
+            ..
+        } = &mut second.step
+        else {
+            unreachable!()
+        };
+        *runtime_incarnation = second_incarnation.clone();
+        *scope_id = Id::new(format!("cats-vmm-{}.service", second_incarnation.as_str())).unwrap();
+        *process_identity_token = RandomId128::new("cccccccccccccccccccccccccccccccc").unwrap();
+        *api_socket_path = second_sockets.api_socket_path().clone();
+        *vsock_socket_path = second_sockets.vsock_socket_path().clone();
+        *memory_file_path = second_files.memory_file_path().clone();
+        *serial_log_path = second_files.serial_log_path().clone();
+        *vmm_log_path = second_files.vmm_log_path().clone();
+        sync_retained_launch(&mut second);
+        let mut second_receipt = VmmSocketOwnershipReceiptV1::from_checkpoint(
+            &second,
+            fixture.receipt_store.state_directory(),
+            &fixture.socket_root,
+            current_kernel_node_boot_id().unwrap(),
+            RandomId128::new("dddddddddddddddddddddddddddddddd").unwrap(),
+        )
+        .unwrap();
+        second_receipt.set_node_boot_id_for_test(fixture.receipt.node_boot_id().clone());
+        fixture.receipt_store.publish(&second_receipt).unwrap();
+
+        for (checkpoint, receipt) in [
+            (&fixture.checkpoint, &fixture.receipt),
+            (&second, &second_receipt),
+        ] {
+            let paths = ManagedVmmLaunchFilePaths::paths_from_checkpoint(
+                fixture.launch_root.state_directory(),
+                checkpoint,
+            )
+            .unwrap();
+            std::fs::create_dir(paths.directory().as_str()).unwrap();
+            std::fs::set_permissions(
+                paths.directory().as_str(),
+                std::os::unix::fs::PermissionsExt::from_mode(0o700),
+            )
+            .unwrap();
+            let directory =
+                open_launch_attempt(&fixture.launch_root, &launch_attempt_name(&paths).unwrap())
+                    .unwrap()
+                    .unwrap();
+            create_launch_owner_marker(&directory, &receipt.encoded_bytes().unwrap()).unwrap();
+            std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .mode(0o600)
+                .open(paths.memory_file_path().as_str())
+                .unwrap()
+                .write_all(b"old-boot-memory")
+                .unwrap();
+            directory.sync_all().unwrap();
+        }
+        let second_directory_before = std::fs::metadata(second_files.directory().as_str()).unwrap();
+        let foreign = Path::new(second_files.directory().as_str()).join("foreign");
+        std::fs::write(&foreign, b"foreign").unwrap();
+        assert_eq!(
+            scan_managed_vmm_launch_root_for_stale_boot_recovery(
+                &fixture.launch_root,
+                &fixture.socket_root,
+                &fixture.receipt_store,
+                &[&fixture.checkpoint, &second],
+                &scan_context(),
+            )
+            .unwrap(),
+            ManagedVmmLaunchRootScan::Residue
+        );
+        assert!(Path::new(
+            ManagedVmmLaunchFilePaths::paths_from_checkpoint(
+                fixture.launch_root.state_directory(),
+                &fixture.checkpoint,
+            )
+            .unwrap()
+            .directory()
+            .as_str()
+        )
+        .is_dir());
+        assert!(fixture
+            .receipt_store
+            .load(fixture.receipt.runtime_incarnation())
+            .unwrap()
+            .is_some());
+        std::fs::remove_file(&foreign).unwrap();
+
+        let expected_checkpoints = [&fixture.checkpoint, &second];
+        for expected_incarnation in [
+            fixture.receipt.runtime_incarnation().clone(),
+            second_receipt.runtime_incarnation().clone(),
+        ] {
+            let candidate = match fixture
+                .receipt_store
+                .retain_one_stale_boot_receipt(
+                    &fixture.socket_root,
+                    &expected_checkpoints,
+                    &scan_context(),
+                )
+                .unwrap()
+            {
+                StaleVmmSocketReceiptScan::Candidate(candidate) => *candidate,
+                StaleVmmSocketReceiptScan::Settled => panic!("stale round lacked a candidate"),
+            };
+            assert_eq!(
+                candidate.receipt().runtime_incarnation(),
+                &expected_incarnation
+            );
+            let checkpoint = expected_checkpoints
+                .iter()
+                .copied()
+                .find(|checkpoint| {
+                    checkpoint.runtime_incarnation.as_ref() == Some(&expected_incarnation)
+                })
+                .unwrap();
+            let expectation = VmmProcessExpectation::from_checkpoint(checkpoint.clone())
+                .unwrap()
+                .with_checkpoint_path(
+                    HostPath::new(format!(
+                        "/var/lib/cats/checkpoints/{expected_incarnation}.json"
+                    ))
+                    .unwrap(),
+                )
+                .unwrap();
+            let absence = ExactVmmProcessAbsenceProof::for_expectation(expectation);
+            assert!(fixture
+                .launch_root
+                .recover_stale_boot_receipt(
+                    &fixture.socket_root,
+                    &fixture.receipt_store,
+                    checkpoint,
+                    candidate,
+                    &scan_context(),
+                    |_| {
+                        anyhow::ensure!(
+                            scan_managed_vmm_launch_root_for_stale_boot_recovery(
+                                &fixture.launch_root,
+                                &fixture.socket_root,
+                                &fixture.receipt_store,
+                                &expected_checkpoints,
+                                &scan_context(),
+                            )? == ManagedVmmLaunchRootScan::Accounted,
+                            "complete stale launch set changed"
+                        );
+                        Ok(absence)
+                    },
+                )
+                .unwrap());
+            if expected_incarnation == *fixture.receipt.runtime_incarnation() {
+                let second_directory_after =
+                    std::fs::metadata(second_files.directory().as_str()).unwrap();
+                assert_eq!(second_directory_before.ino(), second_directory_after.ino());
+                assert_eq!(
+                    fixture
+                        .receipt_store
+                        .load(second_receipt.runtime_incarnation())
+                        .unwrap(),
+                    Some(second_receipt.clone())
+                );
+            }
+        }
+        assert!(matches!(
+            fixture
+                .receipt_store
+                .retain_one_stale_boot_receipt(
+                    &fixture.socket_root,
+                    &expected_checkpoints,
+                    &scan_context(),
+                )
+                .unwrap(),
+            StaleVmmSocketReceiptScan::Settled
+        ));
+        assert!(!Path::new(second_files.directory().as_str()).exists());
     }
 
     #[cfg(target_os = "linux")]

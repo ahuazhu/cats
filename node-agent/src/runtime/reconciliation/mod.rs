@@ -149,6 +149,10 @@ pub(crate) use clean_slate_probes::{
     installed_clean_slate_scanner, installed_root_process_effect_ports,
     InstalledCleanSlateProbeConfig,
 };
+#[cfg(all(test, target_os = "linux"))]
+pub(crate) use clean_slate_probes::{
+    InstalledStaleBootVmmRecoveryPorts, RuntimeCheckpointRecoverySet,
+};
 pub use gate_planner::{
     applied_desired_evidence, AppliedDesiredError, GateReconcileError, GateSequencer,
     GateTransitionResult, PersistTimes,
@@ -195,6 +199,11 @@ pub(crate) use signed_running::{SignedRunningAcquireEffect, SignedRunningPublica
 pub(crate) use vmm_cid::PlatformExactVmmCidInventoryPort;
 pub(crate) use vmm_cid::{VmmCidAllocationPort, VmmCidInventoryPort};
 pub(crate) use vmm_launch_artifacts::VmmLaunchArtifactPaths;
+#[cfg(all(test, target_os = "linux"))]
+pub(crate) use vmm_process::{
+    stale_boot_recovery_global_sealed, ExactVmmProcessAbsenceProof,
+    StaleBootVmmProcessGlobalInspection, StaleBootVmmProcessGlobalPort, VmmProcessExpectation,
+};
 #[allow(unused_imports)]
 pub(crate) use vmm_runtime_paths::ManagedVmmLaunchFilePaths;
 #[cfg(target_os = "linux")]
@@ -203,6 +212,8 @@ pub(crate) use vmm_runtime_paths::RetainedManagedVmmLaunchRoot;
 pub(crate) use vmm_runtime_paths::VMM_LAUNCH_FILE_NAMESPACE;
 #[cfg(target_os = "linux")]
 pub(crate) use vmm_socket_namespace::ManagedVmmSocketPreparation;
+#[cfg(all(test, target_os = "linux"))]
+pub(crate) use vmm_socket_namespace::{current_kernel_node_boot_id, VmmSocketOwnershipReceiptV1};
 #[allow(unused_imports)]
 pub(crate) use vmm_socket_namespace::{
     vmm_state_directory_from_checkpoint, ManagedVmmSocketPaths, ManagedVmmSocketRoot,

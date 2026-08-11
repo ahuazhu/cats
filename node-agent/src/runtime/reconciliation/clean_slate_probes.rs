@@ -99,11 +99,23 @@ use super::vmm_process::{
     PlatformSystemdVmmProcessPort, VmmProcessConflict, VmmProcessExpectation,
     VmmProcessGlobalInspection, VmmProcessGlobalPort, VmmProcessInspection, VmmProcessPort,
 };
+#[cfg(target_os = "linux")]
+use super::vmm_process::{
+    stale_boot_recovery_global_sealed, StaleBootVmmProcessGlobalInspection,
+    StaleBootVmmProcessGlobalPort,
+};
 #[cfg(all(test, target_os = "linux"))]
 use super::vmm_runtime_paths::VMM_LAUNCH_FILE_NAMESPACE;
 #[cfg(target_os = "linux")]
 use super::vmm_runtime_paths::{
-    scan_managed_vmm_launch_root, ManagedVmmLaunchRootScan, RetainedManagedVmmLaunchRoot,
+    scan_managed_vmm_launch_root, scan_managed_vmm_launch_root_for_stale_boot_recovery,
+    ManagedVmmLaunchRootScan, RetainedManagedVmmLaunchRoot,
+};
+#[cfg(target_os = "linux")]
+use super::vmm_socket_namespace::{
+    current_kernel_node_boot_id, scan_managed_vmm_socket_root_for_stale_boot_recovery,
+    scan_stale_boot_receipt_namespace_snapshot, ReceiptNamespaceSnapshot,
+    StaleVmmSocketReceiptScan,
 };
 use super::vmm_socket_namespace::{
     scan_managed_vmm_socket_root, ManagedVmmSocketRootScan, RetainedManagedVmmSocketRoot,
@@ -1002,6 +1014,8 @@ struct ProbeConfig {
     #[cfg(target_os = "linux")]
     managed_vmm_launch_root: Option<Arc<RetainedManagedVmmLaunchRoot>>,
     vmm_socket_receipts: Option<Arc<VmmSocketReceiptStore>>,
+    recovery_metadata_authority: Option<Arc<dyn MetadataAuthorityAbsenceReader>>,
+    recovery_blob_store: Option<Arc<dyn BlobStore>>,
 }
 
 impl ProbeConfig {
@@ -1042,6 +1056,9 @@ impl ProbeConfig {
         );
         #[cfg(not(target_os = "linux"))]
         let (managed_vmm_socket_root, vmm_socket_receipts) = (None, None);
+        let recovery_metadata_authority = Arc::new(PagedMetadataAuthorityReader::new(Arc::new(
+            RuntimeVolumeInventoryPagePort::start(Arc::clone(&config.volume_inventory_authority))?,
+        ))) as Arc<dyn MetadataAuthorityAbsenceReader>;
         Ok(Self {
             state_directory: config.state_directory.clone(),
             checkpoint_directory,
@@ -1072,6 +1089,8 @@ impl ProbeConfig {
             #[cfg(target_os = "linux")]
             managed_vmm_launch_root,
             vmm_socket_receipts,
+            recovery_metadata_authority: Some(recovery_metadata_authority),
+            recovery_blob_store: Some(config.blob_store),
         })
     }
 }
@@ -1098,6 +1117,17 @@ pub(crate) struct InstalledRootProcessEffectPorts {
     pub(crate) serving: Arc<dyn ServingBlockdProcessGlobalPort>,
     pub(crate) vmm: Arc<dyn VmmProcessGlobalPort>,
     pub(crate) vmm_cid: Arc<dyn VmmCidInventoryPort>,
+    #[cfg(target_os = "linux")]
+    pub(crate) stale_boot_vmm: InstalledStaleBootVmmRecoveryPorts,
+}
+
+#[cfg(target_os = "linux")]
+#[derive(Clone)]
+pub(crate) struct InstalledStaleBootVmmRecoveryPorts {
+    pub(crate) global: Arc<dyn StaleBootVmmProcessGlobalPort>,
+    pub(crate) socket_root: Arc<RetainedManagedVmmSocketRoot>,
+    pub(crate) launch_root: Arc<RetainedManagedVmmLaunchRoot>,
+    pub(crate) receipts: Arc<VmmSocketReceiptStore>,
 }
 
 pub(crate) fn installed_root_process_effect_ports(
@@ -1115,12 +1145,30 @@ pub(crate) fn installed_root_process_effect_ports(
         limits: config.limits,
     };
     let bridge = platform_root_process_inventory_bridge(&config, process_paths)?;
+    #[cfg(target_os = "linux")]
+    let stale_boot_vmm = InstalledStaleBootVmmRecoveryPorts {
+        global: Arc::clone(&bridge) as Arc<dyn StaleBootVmmProcessGlobalPort>,
+        socket_root: config
+            .managed_vmm_socket_root
+            .clone()
+            .context("installed bridge lacks the retained VMM socket root")?,
+        launch_root: config
+            .managed_vmm_launch_root
+            .clone()
+            .context("installed bridge lacks the retained VMM launch root")?,
+        receipts: config
+            .vmm_socket_receipts
+            .clone()
+            .context("installed bridge lacks the retained VMM receipt store")?,
+    };
     Ok(InstalledRootProcessEffectPorts {
         retirement: Arc::clone(&bridge) as Arc<dyn RootProvisionProcessRetirementPort>,
         global: Arc::clone(&bridge) as Arc<dyn RootProvisionProcessGlobalPort>,
         serving: Arc::clone(&bridge) as Arc<dyn ServingBlockdProcessGlobalPort>,
         vmm: Arc::clone(&bridge) as Arc<dyn VmmProcessGlobalPort>,
         vmm_cid: bridge as Arc<dyn VmmCidInventoryPort>,
+        #[cfg(target_os = "linux")]
+        stale_boot_vmm,
     })
 }
 
@@ -1204,6 +1252,8 @@ fn clean_slate_scanner_with_metadata_for_test(
             #[cfg(target_os = "linux")]
             managed_vmm_launch_root: None,
             vmm_socket_receipts: None,
+            recovery_metadata_authority: None,
+            recovery_blob_store: None,
         },
         metadata_authority,
         blob_store,
@@ -1390,6 +1440,8 @@ fn platform_root_process_inventory_bridge(
         #[cfg(target_os = "linux")]
         managed_vmm_launch_root: config.managed_vmm_launch_root.clone(),
         vmm_socket_receipts: config.vmm_socket_receipts.clone(),
+        recovery_metadata_authority: config.recovery_metadata_authority.clone(),
+        recovery_blob_store: config.recovery_blob_store.clone(),
     }))
 }
 
@@ -2015,6 +2067,81 @@ impl AuthorizedBlockdDataScan {
 pub(crate) struct RuntimeCheckpointNamespaceSnapshot {
     directory: File,
     checkpoints: BTreeMap<Id, RuntimeCheckpoint>,
+    // The coordinate is consumed only by Linux's restart-only VMM recovery.
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+    coordinate: RuntimeCheckpointNamespaceCoordinate,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct RuntimeCheckpointNamespaceCoordinate {
+    directory: StrictFilesystemCoordinate,
+    entries: BTreeMap<OsString, StrictFilesystemCoordinate>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct StrictFilesystemCoordinate {
+    device: u64,
+    inode: u64,
+    mode: u32,
+    links: u64,
+    user: u32,
+    group: u32,
+    length: u64,
+}
+
+impl StrictFilesystemCoordinate {
+    fn from_metadata(metadata: &std::fs::Metadata) -> Self {
+        Self {
+            device: metadata.dev(),
+            inode: metadata.ino(),
+            mode: metadata.mode(),
+            links: metadata.nlink(),
+            user: metadata.uid(),
+            group: metadata.gid(),
+            length: metadata.len(),
+        }
+    }
+
+    fn from_stat(metadata: &libc::stat) -> anyhow::Result<Self> {
+        Ok(Self {
+            device: raw_device_to_u64(metadata.st_dev)
+                .context("checkpoint namespace entry has an invalid device")?,
+            inode: metadata.st_ino,
+            mode: u32::try_from(u64::from(metadata.st_mode))
+                .context("checkpoint namespace entry has an invalid mode")?,
+            links: u64::from(metadata.st_nlink),
+            user: metadata.st_uid,
+            group: metadata.st_gid,
+            length: u64::try_from(metadata.st_size)
+                .context("checkpoint namespace entry has a negative length")?,
+        })
+    }
+}
+
+/// Stable, complete checkpoint collection admitted only for restart-only VMM
+/// receipt recovery.  The private namespace coordinate prevents a provider
+/// from presenting a hand-picked checkpoint subset as the Node-wide set.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[cfg(target_os = "linux")]
+pub(crate) struct RuntimeCheckpointRecoverySet {
+    checkpoints: BTreeMap<Id, RuntimeCheckpoint>,
+    bindings: BTreeMap<Id, DesiredCheckpointBinding>,
+    coordinate: RuntimeCheckpointNamespaceCoordinate,
+}
+
+#[cfg(target_os = "linux")]
+impl RuntimeCheckpointRecoverySet {
+    pub(crate) fn iter_checkpoints(&self) -> impl ExactSizeIterator<Item = &RuntimeCheckpoint> {
+        self.checkpoints.values()
+    }
+
+    pub(crate) fn checkpoint(&self, cat_id: &Id) -> Option<&RuntimeCheckpoint> {
+        self.checkpoints.get(cat_id)
+    }
+
+    fn binding(&self, cat_id: &Id) -> Option<DesiredCheckpointBinding> {
+        self.bindings.get(cat_id).copied()
+    }
 }
 
 impl RuntimeCheckpointNamespaceSnapshot {
@@ -2052,6 +2179,18 @@ pub(crate) fn snapshot_runtime_checkpoint_namespace(
     let Some(entries) = strict_checkpoint_directory_entries(&directory, &mut budget, context)?
     else {
         return Ok(None);
+    };
+    let coordinate = RuntimeCheckpointNamespaceCoordinate {
+        directory: StrictFilesystemCoordinate::from_metadata(&directory.metadata()?),
+        entries: entries
+            .iter()
+            .map(|entry| {
+                Ok((
+                    entry.name.clone(),
+                    StrictFilesystemCoordinate::from_stat(&entry.metadata)?,
+                ))
+            })
+            .collect::<anyhow::Result<BTreeMap<_, _>>>()?,
     };
     let desired_by_target = assigned_cats
         .iter()
@@ -2161,12 +2300,102 @@ pub(crate) fn snapshot_runtime_checkpoint_namespace(
     let snapshot = RuntimeCheckpointNamespaceSnapshot {
         directory,
         checkpoints,
+        coordinate,
     };
     anyhow::ensure!(
         snapshot.iter_checkpoints().len() <= RUNTIME_V1_MAX_ASSIGNED_CATS,
         "handoff checkpoint index exceeds the assigned-Cat cap"
     );
     Ok(Some(snapshot))
+}
+
+/// Classify the complete checkpoint namespace twice before a stale-boot
+/// receipt is selected. Every present checkpoint must be either exact-current
+/// or a structurally exact retained phase which is legally superseded by the
+/// current same-Node Desired. Corrupt, foreign, incomplete, conflicting or
+/// racing namespaces yield no recovery authority.
+#[cfg(target_os = "linux")]
+pub(crate) fn runtime_checkpoint_recovery_set(
+    context: &RuntimePreScanRecoveryContext,
+    socket_root: &RetainedManagedVmmSocketRoot,
+) -> anyhow::Result<Option<RuntimeCheckpointRecoverySet>> {
+    context.check_active()?;
+    let scan_context = context.inventory_context();
+    let assigned = scan_context.assigned_cats()?;
+    let Some(root) = clone_state_root(context.state_directory())? else {
+        return Ok(None);
+    };
+    let Some(first) = snapshot_runtime_checkpoint_namespace(
+        &root,
+        &scan_context,
+        &assigned,
+        RUNTIME_CHECKPOINT_NAMESPACE_ENTRY_LIMIT,
+    )?
+    else {
+        return Ok(None);
+    };
+    let Some(first_bindings) =
+        checkpoint_set_recovery_bindings(&first.checkpoints, context, socket_root)
+    else {
+        return Ok(None);
+    };
+    let Some(second) = snapshot_runtime_checkpoint_namespace(
+        &root,
+        &scan_context,
+        &assigned,
+        RUNTIME_CHECKPOINT_NAMESPACE_ENTRY_LIMIT,
+    )?
+    else {
+        return Ok(None);
+    };
+    let Some(second_bindings) =
+        checkpoint_set_recovery_bindings(&second.checkpoints, context, socket_root)
+    else {
+        return Ok(None);
+    };
+    if first.coordinate != second.coordinate
+        || first.checkpoints != second.checkpoints
+        || first_bindings != second_bindings
+    {
+        return Ok(None);
+    }
+    context.check_active()?;
+    Ok(Some(RuntimeCheckpointRecoverySet {
+        checkpoints: second.checkpoints,
+        bindings: second_bindings,
+        coordinate: second.coordinate,
+    }))
+}
+
+#[cfg(target_os = "linux")]
+fn checkpoint_set_recovery_bindings(
+    checkpoints: &BTreeMap<Id, RuntimeCheckpoint>,
+    context: &RuntimePreScanRecoveryContext,
+    socket_root: &RetainedManagedVmmSocketRoot,
+) -> Option<BTreeMap<Id, DesiredCheckpointBinding>> {
+    let desired = context
+        .coordinates()
+        .desired
+        .desired_specs
+        .iter()
+        .map(|desired| (&desired.cat_id, desired))
+        .collect::<BTreeMap<_, _>>();
+    checkpoints
+        .iter()
+        .map(|(cat_id, checkpoint)| {
+            let desired = *desired.get(cat_id)?;
+            let binding = checkpoint_binding(desired, checkpoint).ok()?;
+            super::inventory::validate_checkpoint_recovery_structure(
+                desired,
+                checkpoint,
+                binding,
+                context.state_directory(),
+                socket_root.planner(),
+            )
+            .ok()?;
+            Some((cat_id.clone(), binding))
+        })
+        .collect()
 }
 
 fn scan_authorized_blockd_data(
@@ -3012,6 +3241,11 @@ struct PlatformRootProcessInventoryBridge {
     #[cfg(target_os = "linux")]
     managed_vmm_launch_root: Option<Arc<RetainedManagedVmmLaunchRoot>>,
     vmm_socket_receipts: Option<Arc<VmmSocketReceiptStore>>,
+    // These sidecars are reached only by Linux's restart-only VMM recovery.
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+    recovery_metadata_authority: Option<Arc<dyn MetadataAuthorityAbsenceReader>>,
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+    recovery_blob_store: Option<Arc<dyn BlobStore>>,
 }
 
 enum AdmittedManagedProcessInspection {
@@ -3030,7 +3264,216 @@ enum AdmittedRootTargetPurpose {
     StopReceipt,
 }
 
+#[cfg(target_os = "linux")]
+struct StaleBootRecoveryManagedSet {
+    root_expected: BTreeMap<Id, RootProvisionProcessExpectation>,
+    serving_expected: BTreeMap<ManagedServingKey, ServingBlockdExpectation>,
+    vmm_expected: BTreeMap<Id, VmmProcessExpectation>,
+    stale_vmm: BTreeSet<Id>,
+    receipt_snapshot: ReceiptNamespaceSnapshot,
+    stop_receipt_sockets: BTreeMap<Id, StopReceiptSocketAdmission>,
+}
+
+#[cfg(target_os = "linux")]
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum StaleBootRecoveryManagedInspection {
+    Exact {
+        root: BTreeMap<Id, RootProvisionProcessInspection>,
+        serving: BTreeMap<ManagedServingKey, ServingBlockdProcessInspection>,
+        vmm: BTreeMap<Id, VmmProcessInspection>,
+    },
+    Unavailable,
+    Conflict,
+}
+
 impl PlatformRootProcessInventoryBridge {
+    #[cfg(target_os = "linux")]
+    fn stale_boot_recovery_managed_set(
+        &self,
+        checkpoints: &RuntimeCheckpointRecoverySet,
+        context: &RuntimePreScanRecoveryContext,
+    ) -> anyhow::Result<Option<StaleBootRecoveryManagedSet>> {
+        let physical = context.inventory_context();
+        let Some(root) = clone_state_root(&self.state_directory)? else {
+            return Ok(None);
+        };
+        let checkpoints_by_cat = match scan_runtime_checkpoints(&root, &physical, self.limits)? {
+            InventoryAbsence::Empty if checkpoints.iter_checkpoints().len() == 0 => BTreeMap::new(),
+            InventoryAbsence::RuntimeCheckpoints(checkpoints_by_cat) => checkpoints_by_cat,
+            InventoryAbsence::Empty | InventoryAbsence::Unavailable => return Ok(None),
+            _ => unreachable!("checkpoint probe returned another source kind"),
+        };
+        if checkpoints_by_cat.len() != checkpoints.iter_checkpoints().len()
+            || checkpoints_by_cat.iter().any(|(cat_id, evidence)| {
+                checkpoints.checkpoint(cat_id) != Some(&evidence.checkpoint)
+                    || checkpoints.binding(cat_id) != Some(evidence.binding)
+            })
+        {
+            return Ok(None);
+        }
+
+        let data = scan_authorized_blockd_data(
+            &root,
+            self.state_directory.path(),
+            &physical,
+            self.limits,
+        )?;
+        if !data.complete
+            || !data.handoff_temps.is_empty()
+            || !data.recoverable_stop_receipts.is_empty()
+        {
+            return Ok(None);
+        }
+        let blockd_by_cat = data.evidence;
+        let metadata_authority = self
+            .recovery_metadata_authority
+            .as_ref()
+            .context("stale-boot recovery lacks complete metadata inventory authority")?;
+        let volumes_by_cat = match (MetadataStoreProbe {
+            state_directory: self.state_directory.clone(),
+            authority: Arc::clone(metadata_authority),
+            limits: self.limits,
+        })
+        .prove_absent(&physical)?
+        {
+            InventoryAbsence::Empty => BTreeMap::new(),
+            InventoryAbsence::DesiredVolumes(volumes) => volumes,
+            InventoryAbsence::Unavailable => return Ok(None),
+            _ => unreachable!("metadata probe returned another source kind"),
+        };
+
+        for desired in &context.coordinates().desired.desired_specs {
+            let Some(evidence) = checkpoints_by_cat.get(&desired.cat_id) else {
+                continue;
+            };
+            super::inventory::validate_scanned_checkpoint(
+                desired,
+                &evidence.checkpoint,
+                evidence.binding,
+                blockd_by_cat.get(&desired.cat_id),
+                &self.state_directory.path().join(CHECKPOINT_NAMESPACE),
+                self.recovery_blob_store.as_deref(),
+                physical.deadline(),
+            )?;
+        }
+        let checkpoint_directory = self.state_directory.path().join(CHECKPOINT_NAMESPACE);
+        let root_expected = super::inventory::recovery_root_process_expectations(
+            &physical,
+            &checkpoint_directory,
+            self.recovery_blob_store.as_deref(),
+            &self.executable_path,
+            &checkpoints_by_cat,
+            &blockd_by_cat,
+            &volumes_by_cat,
+        )?;
+        let serving_expected = super::inventory::recovery_serving_process_expectations(
+            &physical,
+            self,
+            &checkpoints_by_cat,
+            &blockd_by_cat,
+            &volumes_by_cat,
+        )?;
+        let vmm_expected = super::inventory::recovery_vmm_process_expectations(
+            &checkpoint_directory,
+            &checkpoints_by_cat,
+        )?;
+        let socket_root = self
+            .managed_vmm_socket_root
+            .as_deref()
+            .context("stale-boot recovery lacks the managed VMM socket root")?;
+        let receipts = self
+            .vmm_socket_receipts
+            .as_deref()
+            .context("stale-boot recovery lacks the VMM receipt store")?;
+        let expected_checkpoints = vmm_expected
+            .values()
+            .map(VmmProcessExpectation::checkpoint)
+            .collect::<Vec<_>>();
+        let receipt_snapshot = scan_stale_boot_receipt_namespace_snapshot(
+            socket_root,
+            receipts,
+            &expected_checkpoints,
+            &physical,
+        )?;
+        if !matches!(receipt_snapshot, ReceiptNamespaceSnapshot::Exact(_)) {
+            return Ok(None);
+        }
+        let current_boot_id = current_kernel_node_boot_id()?;
+        let stale_vmm =
+            vmm_expected
+                .iter()
+                .try_fold(BTreeSet::new(), |mut stale, (cat_id, expectation)| {
+                    if receipt_snapshot
+                        .stale_boot_receipt_for_checkpoint(expectation.checkpoint())?
+                        .is_some_and(|receipt| receipt.node_boot_id() != &current_boot_id)
+                    {
+                        stale.insert(cat_id.clone());
+                    }
+                    Ok::<_, anyhow::Error>(stale)
+                })?;
+        let stop_receipt_sockets = blockd_by_cat.iter().try_fold(
+            BTreeMap::new(),
+            |mut sockets, (cat_id, by_volume)| {
+                for evidence in by_volume.values() {
+                    if let Some(socket) = evidence.stop_receipt_socket.clone() {
+                        anyhow::ensure!(
+                            sockets.insert(cat_id.clone(), socket).is_none(),
+                            "stale-boot recovery found duplicate Root stop-receipt sockets"
+                        );
+                    }
+                }
+                Ok::<_, anyhow::Error>(sockets)
+            },
+        )?;
+        Ok(Some(StaleBootRecoveryManagedSet {
+            root_expected,
+            serving_expected,
+            vmm_expected,
+            stale_vmm,
+            receipt_snapshot,
+            stop_receipt_sockets,
+        }))
+    }
+
+    #[cfg(target_os = "linux")]
+    fn inspect_stale_boot_recovery_managed_set(
+        &self,
+        expected: &StaleBootRecoveryManagedSet,
+        selected: &VmmProcessExpectation,
+        context: &RuntimePreScanRecoveryContext,
+    ) -> anyhow::Result<StaleBootRecoveryManagedInspection> {
+        let physical = context.inventory_context();
+        let Some(root) =
+            inspect_root_process_set(self.port.as_ref(), &expected.root_expected, &physical)?
+        else {
+            return Ok(StaleBootRecoveryManagedInspection::Unavailable);
+        };
+        let Some(serving) = inspect_serving_process_set(
+            self.serving_port.as_ref(),
+            &expected.serving_expected,
+            &physical,
+        )?
+        else {
+            return Ok(StaleBootRecoveryManagedInspection::Unavailable);
+        };
+        let Some(vmm) =
+            inspect_vmm_process_set(self.vmm_port.as_ref(), &expected.vmm_expected, &physical)?
+        else {
+            return Ok(StaleBootRecoveryManagedInspection::Unavailable);
+        };
+        if expected
+            .stale_vmm
+            .iter()
+            .any(|cat_id| !matches!(vmm.get(cat_id), Some(VmmProcessInspection::Absent)))
+            || !matches!(
+                vmm.get(selected.cat_id()),
+                Some(VmmProcessInspection::Absent)
+            )
+        {
+            return Ok(StaleBootRecoveryManagedInspection::Conflict);
+        }
+        Ok(StaleBootRecoveryManagedInspection::Exact { root, serving, vmm })
+    }
     /// One shared sealed sweep for both full-inventory projection and
     /// retirement absence. Every managed service, Cats binary process, and
     /// managed socket must be accounted for by the exact identities supplied
@@ -3141,6 +3584,213 @@ impl PlatformRootProcessInventoryBridge {
                 sockets,
                 managed_vmm_sockets,
                 managed_vmm_launch_files,
+            ]
+            .contains(&ProbeFact::Unavailable)
+            {
+                ProbeFact::Unavailable
+            } else {
+                ProbeFact::Empty
+            },
+        )
+    }
+
+    #[cfg(target_os = "linux")]
+    fn sweep_node_global_stale_boot_recovery(
+        &self,
+        expected: &StaleBootRecoveryManagedSet,
+        inspected: &StaleBootRecoveryManagedInspection,
+        context: &RuntimePreScanRecoveryContext,
+    ) -> anyhow::Result<ProbeFact> {
+        let StaleBootRecoveryManagedInspection::Exact { root, serving, vmm } = inspected else {
+            return Ok(ProbeFact::Present);
+        };
+        if expected
+            .stale_vmm
+            .iter()
+            .any(|cat_id| !matches!(vmm.get(cat_id), Some(VmmProcessInspection::Absent)))
+        {
+            return Ok(ProbeFact::Present);
+        }
+        let physical = context.inventory_context();
+        let socket_root = self
+            .managed_vmm_socket_root
+            .as_deref()
+            .context("stale-boot recovery lacks the managed VMM socket root")?;
+        let receipts = self
+            .vmm_socket_receipts
+            .as_deref()
+            .context("stale-boot recovery lacks the VMM receipt store")?;
+        let checkpoints = expected
+            .vmm_expected
+            .values()
+            .map(VmmProcessExpectation::checkpoint)
+            .collect::<Vec<_>>();
+        if scan_stale_boot_receipt_namespace_snapshot(
+            socket_root,
+            receipts,
+            &checkpoints,
+            &physical,
+        )? != expected.receipt_snapshot
+        {
+            return Ok(ProbeFact::Present);
+        }
+        let mut budget = self.limits.os_entries;
+        let mut allowed_units = BTreeSet::new();
+        let mut allowed_pids = BTreeSet::new();
+        let mut allowed_sockets = BTreeSet::new();
+        for inspection in root.values() {
+            if let RootProvisionProcessInspection::Exact(evidence) = inspection {
+                if !allowed_units.insert(evidence.scope_id.clone())
+                    || !allowed_pids.insert(evidence.process_id)
+                    || !allowed_sockets.insert(PathBuf::from(evidence.control_socket_path.as_str()))
+                {
+                    return Ok(ProbeFact::Present);
+                }
+            }
+        }
+        for inspection in serving.values() {
+            if let ServingBlockdProcessInspection::Exact(evidence) = inspection {
+                if !allowed_units.insert(evidence.unit_id().clone())
+                    || !allowed_pids.insert(evidence.process_id())
+                    || !allowed_sockets
+                        .insert(PathBuf::from(evidence.control_socket_path().as_str()))
+                    || !allowed_sockets.insert(PathBuf::from(evidence.listener_path().as_str()))
+                {
+                    return Ok(ProbeFact::Present);
+                }
+            }
+        }
+        for inspection in vmm.values() {
+            if let VmmProcessInspection::Exact(evidence) = inspection {
+                if !allowed_units.insert(evidence.unit_id().clone())
+                    || !allowed_pids.insert(evidence.process_id())
+                {
+                    return Ok(ProbeFact::Present);
+                }
+            }
+        }
+        for (cat_id, socket) in &expected.stop_receipt_sockets {
+            let Some(root_expected) = expected.root_expected.get(cat_id) else {
+                return Ok(ProbeFact::Present);
+            };
+            if &root_expected.control_socket_path != socket.receipt_socket() {
+                return Ok(ProbeFact::Present);
+            }
+            match root.get(cat_id) {
+                Some(RootProvisionProcessInspection::Absent) => {
+                    for path in socket.physical_paths() {
+                        if !allowed_sockets.insert(PathBuf::from(path.as_str())) {
+                            return Ok(ProbeFact::Present);
+                        }
+                    }
+                }
+                Some(RootProvisionProcessInspection::Exact(evidence))
+                    if &evidence.control_socket_path == socket.receipt_socket()
+                        && socket.physical_paths()
+                            == &BTreeSet::from([socket.receipt_socket().clone()]) => {}
+                _ => return Ok(ProbeFact::Present),
+            }
+        }
+        let systemd = scan_cgroup_tree_allowing(
+            &self.systemd_root,
+            CgroupKind::Systemd,
+            0,
+            &mut budget,
+            self.limits.recursion_depth,
+            &allowed_units,
+            &physical,
+        )?;
+        let metering = if let Some(root) = &self.metering_root {
+            scan_cgroup_tree_allowing(
+                root,
+                CgroupKind::DedicatedMeteringRoot,
+                0,
+                &mut budget,
+                self.limits.recursion_depth,
+                &BTreeSet::new(),
+                &physical,
+            )?
+        } else {
+            ProbeFact::Empty
+        };
+        let processes = scan_processes_allowing(&self.process_paths, &allowed_pids, &physical)?;
+        let sockets = scan_root_process_sockets(
+            &self.state_directory,
+            &self.legacy_socket_root,
+            &allowed_sockets,
+            self.limits,
+            &physical,
+        )?;
+        let managed_vmm_sockets = match (
+            self.managed_vmm_socket_root.as_deref(),
+            self.vmm_socket_receipts.as_deref(),
+        ) {
+            (Some(root), Some(receipts)) => {
+                match scan_managed_vmm_socket_root_for_stale_boot_recovery(
+                    root,
+                    receipts,
+                    &checkpoints,
+                    &physical,
+                )? {
+                    ManagedVmmSocketRootScan::Accounted => ProbeFact::Empty,
+                    ManagedVmmSocketRootScan::Residue => ProbeFact::Present,
+                    ManagedVmmSocketRootScan::Unavailable => ProbeFact::Unavailable,
+                }
+            }
+            _ => ProbeFact::Unavailable,
+        };
+        let managed_vmm_launch_files = match (
+            self.managed_vmm_launch_root.as_deref(),
+            self.managed_vmm_socket_root.as_deref(),
+            self.vmm_socket_receipts.as_deref(),
+        ) {
+            (Some(launch_root), Some(socket_root), Some(receipts)) => {
+                match scan_managed_vmm_launch_root_for_stale_boot_recovery(
+                    launch_root,
+                    socket_root,
+                    receipts,
+                    &checkpoints,
+                    &physical,
+                )? {
+                    ManagedVmmLaunchRootScan::Accounted => ProbeFact::Empty,
+                    ManagedVmmLaunchRootScan::Residue => ProbeFact::Present,
+                    ManagedVmmLaunchRootScan::Unavailable => ProbeFact::Unavailable,
+                }
+            }
+            _ => ProbeFact::Unavailable,
+        };
+        let receipts_still_exact = if scan_stale_boot_receipt_namespace_snapshot(
+            socket_root,
+            receipts,
+            &checkpoints,
+            &physical,
+        )? == expected.receipt_snapshot
+        {
+            ProbeFact::Empty
+        } else {
+            ProbeFact::Present
+        };
+        Ok(
+            if [
+                systemd,
+                metering,
+                processes,
+                sockets,
+                managed_vmm_sockets,
+                managed_vmm_launch_files,
+                receipts_still_exact,
+            ]
+            .contains(&ProbeFact::Present)
+            {
+                ProbeFact::Present
+            } else if [
+                systemd,
+                metering,
+                processes,
+                sockets,
+                managed_vmm_sockets,
+                managed_vmm_launch_files,
+                receipts_still_exact,
             ]
             .contains(&ProbeFact::Unavailable)
             {
@@ -3689,6 +4339,154 @@ impl VmmProcessGlobalPort for PlatformRootProcessInventoryBridge {
                 VmmProcessGlobalInspection::Conflict(VmmProcessConflict::DuplicateIdentity),
             ),
         }
+    }
+}
+
+#[cfg(target_os = "linux")]
+impl stale_boot_recovery_global_sealed::Sealed for PlatformRootProcessInventoryBridge {}
+
+#[cfg(target_os = "linux")]
+impl StaleBootVmmProcessGlobalPort for PlatformRootProcessInventoryBridge {
+    fn inspect_stale_boot_absence_after_node_global_sweep(
+        &self,
+        selected: &VmmProcessExpectation,
+        checkpoints: &RuntimeCheckpointRecoverySet,
+        context: &RuntimePreScanRecoveryContext,
+    ) -> anyhow::Result<StaleBootVmmProcessGlobalInspection> {
+        context.check_active()?;
+        let socket_root = self
+            .managed_vmm_socket_root
+            .as_deref()
+            .context("stale-boot VMM recovery lacks the managed socket root")?;
+        let Some(fresh_before) = runtime_checkpoint_recovery_set(context, socket_root)? else {
+            return Ok(StaleBootVmmProcessGlobalInspection::Conflict(
+                VmmProcessConflict::IdentityMismatch,
+            ));
+        };
+        if &fresh_before != checkpoints {
+            return Ok(StaleBootVmmProcessGlobalInspection::Conflict(
+                VmmProcessConflict::IdentityMismatch,
+            ));
+        }
+
+        let Some(expected) = self.stale_boot_recovery_managed_set(checkpoints, context)? else {
+            return Ok(StaleBootVmmProcessGlobalInspection::Unavailable);
+        };
+        if expected.vmm_expected.get(selected.cat_id()) != Some(selected) {
+            return Ok(StaleBootVmmProcessGlobalInspection::Conflict(
+                VmmProcessConflict::IdentityMismatch,
+            ));
+        }
+
+        let physical = context.inventory_context();
+        let first = self.inspect_stale_boot_recovery_managed_set(&expected, selected, context)?;
+        match &first {
+            StaleBootRecoveryManagedInspection::Exact { .. } => {}
+            StaleBootRecoveryManagedInspection::Unavailable => {
+                return Ok(StaleBootVmmProcessGlobalInspection::Unavailable)
+            }
+            StaleBootRecoveryManagedInspection::Conflict => {
+                return Ok(StaleBootVmmProcessGlobalInspection::Conflict(
+                    VmmProcessConflict::IdentityMismatch,
+                ))
+            }
+        }
+
+        let receipts = self
+            .vmm_socket_receipts
+            .as_deref()
+            .context("stale-boot VMM recovery lacks the receipt store")?;
+        let expected_checkpoints = expected
+            .vmm_expected
+            .values()
+            .map(VmmProcessExpectation::checkpoint)
+            .collect::<Vec<_>>();
+        let candidate = receipts.retain_one_stale_boot_receipt(
+            socket_root,
+            &expected_checkpoints,
+            &physical,
+        )?;
+        let StaleVmmSocketReceiptScan::Candidate(candidate) = candidate else {
+            return Ok(StaleBootVmmProcessGlobalInspection::Conflict(
+                VmmProcessConflict::IdentityMismatch,
+            ));
+        };
+        if candidate.cat_id() != selected.cat_id()
+            || candidate.receipt().runtime_incarnation() != selected.runtime_incarnation()
+        {
+            return Ok(StaleBootVmmProcessGlobalInspection::Conflict(
+                VmmProcessConflict::IdentityMismatch,
+            ));
+        }
+        candidate.assert_current(receipts)?;
+        socket_root.assert_stale_boot_attempt_absent(candidate.receipt())?;
+
+        match self.sweep_node_global_stale_boot_recovery(&expected, &first, context)? {
+            ProbeFact::Present => {
+                return Ok(StaleBootVmmProcessGlobalInspection::Conflict(
+                    VmmProcessConflict::DuplicateIdentity,
+                ))
+            }
+            ProbeFact::Unavailable => return Ok(StaleBootVmmProcessGlobalInspection::Unavailable),
+            ProbeFact::Empty => {}
+        }
+        let second = self.inspect_stale_boot_recovery_managed_set(&expected, selected, context)?;
+        match &second {
+            StaleBootRecoveryManagedInspection::Exact { .. } if second == first => {}
+            StaleBootRecoveryManagedInspection::Unavailable => {
+                return Ok(StaleBootVmmProcessGlobalInspection::Unavailable)
+            }
+            StaleBootRecoveryManagedInspection::Exact { .. }
+            | StaleBootRecoveryManagedInspection::Conflict => {
+                return Ok(StaleBootVmmProcessGlobalInspection::Conflict(
+                    VmmProcessConflict::IdentityMismatch,
+                ))
+            }
+        }
+        let Some(fresh_after) = runtime_checkpoint_recovery_set(context, socket_root)? else {
+            return Ok(StaleBootVmmProcessGlobalInspection::Conflict(
+                VmmProcessConflict::IdentityMismatch,
+            ));
+        };
+        if &fresh_after != checkpoints {
+            return Ok(StaleBootVmmProcessGlobalInspection::Conflict(
+                VmmProcessConflict::IdentityMismatch,
+            ));
+        }
+        if scan_stale_boot_receipt_namespace_snapshot(
+            socket_root,
+            receipts,
+            &expected_checkpoints,
+            &physical,
+        )? != expected.receipt_snapshot
+        {
+            return Ok(StaleBootVmmProcessGlobalInspection::Conflict(
+                VmmProcessConflict::IdentityMismatch,
+            ));
+        }
+        let fresh_candidate = receipts.retain_one_stale_boot_receipt(
+            socket_root,
+            &expected_checkpoints,
+            &physical,
+        )?;
+        let StaleVmmSocketReceiptScan::Candidate(fresh_candidate) = fresh_candidate else {
+            return Ok(StaleBootVmmProcessGlobalInspection::Conflict(
+                VmmProcessConflict::IdentityMismatch,
+            ));
+        };
+        if fresh_candidate.cat_id() != selected.cat_id()
+            || fresh_candidate.receipt().runtime_incarnation() != selected.runtime_incarnation()
+        {
+            return Ok(StaleBootVmmProcessGlobalInspection::Conflict(
+                VmmProcessConflict::IdentityMismatch,
+            ));
+        }
+        fresh_candidate.assert_current(receipts)?;
+        socket_root.assert_stale_boot_attempt_absent(fresh_candidate.receipt())?;
+        context.check_active()?;
+        Ok(StaleBootVmmProcessGlobalInspection::Absent(Box::new(
+            super::vmm_process::ExactVmmProcessAbsenceProof::for_expectation(selected.clone()),
+        )))
     }
 }
 
@@ -6103,6 +6901,8 @@ mod tests {
     use cats_api::guest::{
         RuntimeReadyDeviceV1, RuntimeReadyMountV1, RuntimeReadyRequestV1, RuntimeReadyResponseV1,
     };
+    #[cfg(target_os = "linux")]
+    use cats_api::runtime_reconciliation::RuntimeLaunch;
     use cats_api::runtime_reconciliation::{
         decode_desired_read_snapshot, decode_runtime_checkpoint, inventory_digest, spec_digest,
         AcquireOrigin, AdmissionInventoryAttestation, AgentSession, AsciiText, AssignedKind,
@@ -6143,6 +6943,8 @@ mod tests {
         AuthorizedBlockdStore, FileCheckpointStore, NodeGlobalManagedProcessScanAdmission,
         NodeGlobalNetworkScanAdmission, StoredCheckpoint,
     };
+    #[cfg(target_os = "linux")]
+    use super::super::{ManagedVmmLaunchFilePaths, VmmSocketOwnershipReceiptV1};
 
     use super::*;
 
@@ -6194,6 +6996,313 @@ mod tests {
                 assert!(admission.vmm_proofs().is_empty());
             }
         }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn stale_boot_global_sweep_preserves_current_live_cat_and_rejects_extra_unit() {
+        let environment = TestEnvironment::new();
+        std::fs::set_permissions(
+            &environment.state,
+            std::os::unix::fs::PermissionsExt::from_mode(0o700),
+        )
+        .unwrap();
+        let state_directory = StateDirectory::unanchored(environment.state.clone());
+        let launch_namespace = environment.state.join(VMM_LAUNCH_FILE_NAMESPACE);
+        std::fs::create_dir(&launch_namespace).unwrap();
+        std::fs::set_permissions(
+            &launch_namespace,
+            std::os::unix::fs::PermissionsExt::from_mode(0o700),
+        )
+        .unwrap();
+        let launch_root =
+            Arc::new(RetainedManagedVmmLaunchRoot::open_existing(state_directory.clone()).unwrap());
+        let managed_socket_root = Arc::new(
+            RetainedManagedVmmSocketRoot::provision_for_test(
+                &environment.state.parent().unwrap().join("managed-vmm"),
+            )
+            .unwrap(),
+        );
+        let receipts =
+            Arc::new(VmmSocketReceiptStore::provision_for_test(state_directory.clone()).unwrap());
+
+        let mut current = decode_runtime_checkpoint(include_bytes!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../testdata/runtime-reconciliation-v1-start-runtime-checkpoint.json"
+        )))
+        .unwrap();
+        let current_incarnation = current.runtime_incarnation.as_ref().unwrap().clone();
+        let current_sockets = managed_socket_root
+            .planner()
+            .paths_for(&current_incarnation)
+            .unwrap();
+        let current_files =
+            ManagedVmmLaunchFilePaths::for_incarnation(&state_directory, &current_incarnation)
+                .unwrap();
+        let ReconcileStep::StartRuntime {
+            api_socket_path,
+            vsock_socket_path,
+            memory_file_path,
+            serial_log_path,
+            vmm_log_path,
+            ..
+        } = &mut current.step
+        else {
+            unreachable!()
+        };
+        *api_socket_path = current_sockets.api_socket_path().clone();
+        *vsock_socket_path = current_sockets.vsock_socket_path().clone();
+        *memory_file_path = current_files.memory_file_path().clone();
+        *serial_log_path = current_files.serial_log_path().clone();
+        *vmm_log_path = current_files.vmm_log_path().clone();
+        current.runtime_launch = RuntimeLaunch::Present(Box::new(
+            current.step.start_runtime_launch_identity().unwrap(),
+        ));
+        let current_receipt = VmmSocketOwnershipReceiptV1::from_checkpoint(
+            &current,
+            &state_directory,
+            &managed_socket_root,
+            current_kernel_node_boot_id().unwrap(),
+            RandomId128::new("bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb").unwrap(),
+        )
+        .unwrap();
+        receipts.publish(&current_receipt).unwrap();
+        let current_attempt = match managed_socket_root
+            .prepare_existing_receipt(&current, &receipts)
+            .unwrap()
+        {
+            super::super::vmm_socket_namespace::ManagedVmmSocketPreparation::Prepared(attempt) => {
+                *attempt
+            }
+            super::super::vmm_socket_namespace::ManagedVmmSocketPreparation::ExistingLive => {
+                panic!("current Cat fixture unexpectedly pre-existed")
+            }
+        };
+        let current_directory =
+            std::fs::metadata(current_sockets.public_directory().as_str()).unwrap();
+        let current_api = std::fs::metadata(current_sockets.api_socket_path().as_str()).unwrap();
+
+        let mut stale = current.clone();
+        stale.cat_id = Id::new("cat_02").unwrap();
+        let stale_incarnation = RandomId128::new("eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee").unwrap();
+        stale.runtime_incarnation = Some(stale_incarnation.clone());
+        let stale_sockets = managed_socket_root
+            .planner()
+            .paths_for(&stale_incarnation)
+            .unwrap();
+        let stale_files =
+            ManagedVmmLaunchFilePaths::for_incarnation(&state_directory, &stale_incarnation)
+                .unwrap();
+        let ReconcileStep::StartRuntime {
+            runtime_incarnation,
+            scope_id,
+            process_identity_token,
+            api_socket_path,
+            vsock_socket_path,
+            memory_file_path,
+            serial_log_path,
+            vmm_log_path,
+            ..
+        } = &mut stale.step
+        else {
+            unreachable!()
+        };
+        *runtime_incarnation = stale_incarnation.clone();
+        *scope_id = Id::new(format!("cats-vmm-{}.service", stale_incarnation.as_str())).unwrap();
+        *process_identity_token = RandomId128::new("cccccccccccccccccccccccccccccccc").unwrap();
+        *api_socket_path = stale_sockets.api_socket_path().clone();
+        *vsock_socket_path = stale_sockets.vsock_socket_path().clone();
+        *memory_file_path = stale_files.memory_file_path().clone();
+        *serial_log_path = stale_files.serial_log_path().clone();
+        *vmm_log_path = stale_files.vmm_log_path().clone();
+        stale.runtime_launch = RuntimeLaunch::Present(Box::new(
+            stale.step.start_runtime_launch_identity().unwrap(),
+        ));
+        let mut stale_receipt = VmmSocketOwnershipReceiptV1::from_checkpoint(
+            &stale,
+            &state_directory,
+            &managed_socket_root,
+            current_kernel_node_boot_id().unwrap(),
+            RandomId128::new("dddddddddddddddddddddddddddddddd").unwrap(),
+        )
+        .unwrap();
+        let current_boot = current_kernel_node_boot_id().unwrap();
+        let old_boot = ["e".repeat(32), "f".repeat(32)]
+            .into_iter()
+            .map(|value| NodeBootId::new(value).unwrap())
+            .find(|value| value != &current_boot)
+            .unwrap();
+        stale_receipt.set_node_boot_id_for_test(old_boot);
+        receipts.publish(&stale_receipt).unwrap();
+
+        let current_expected = VmmProcessExpectation::from_checkpoint(current.clone())
+            .unwrap()
+            .with_checkpoint_path(
+                HostPath::new(
+                    environment
+                        .state
+                        .join("checkpoints/cat-cat_01.checkpoint.json")
+                        .to_string_lossy()
+                        .into_owned(),
+                )
+                .unwrap(),
+            )
+            .unwrap();
+        let stale_expected = VmmProcessExpectation::from_checkpoint(stale.clone())
+            .unwrap()
+            .with_checkpoint_path(
+                HostPath::new(
+                    environment
+                        .state
+                        .join("checkpoints/cat-cat_02.checkpoint.json")
+                        .to_string_lossy()
+                        .into_owned(),
+                )
+                .unwrap(),
+            )
+            .unwrap();
+        let expectations = BTreeMap::from([
+            (current.cat_id.clone(), current_expected.clone()),
+            (stale.cat_id.clone(), stale_expected),
+        ]);
+        let expected_checkpoints = expectations
+            .values()
+            .map(VmmProcessExpectation::checkpoint)
+            .collect::<Vec<_>>();
+        let scan = assigned_context(true);
+        let recovery_context = RuntimePreScanRecoveryContext::for_test(
+            state_directory,
+            scan.coordinates().clone(),
+            Instant::now() + Duration::from_secs(10),
+        );
+        let receipt_snapshot = scan_stale_boot_receipt_namespace_snapshot(
+            &managed_socket_root,
+            &receipts,
+            &expected_checkpoints,
+            &recovery_context.inventory_context(),
+        )
+        .unwrap();
+        let managed = StaleBootRecoveryManagedSet {
+            root_expected: BTreeMap::new(),
+            serving_expected: BTreeMap::new(),
+            vmm_expected: expectations,
+            stale_vmm: BTreeSet::from([stale.cat_id.clone()]),
+            receipt_snapshot,
+            stop_receipt_sockets: BTreeMap::new(),
+        };
+        let process_id = 4_242;
+        let inspected = StaleBootRecoveryManagedInspection::Exact {
+            root: BTreeMap::new(),
+            serving: BTreeMap::new(),
+            vmm: BTreeMap::from([
+                (
+                    current.cat_id.clone(),
+                    VmmProcessInspection::Exact(Box::new(
+                        current_expected.exact_evidence_for_test(process_id),
+                    )),
+                ),
+                (stale.cat_id.clone(), VmmProcessInspection::Absent),
+            ]),
+        };
+        std::fs::create_dir(
+            environment
+                .systemd_root
+                .join(current_expected.unit_id().as_str()),
+        )
+        .unwrap();
+        let proc = environment.proc_root.join(process_id.to_string());
+        std::fs::create_dir(&proc).unwrap();
+        let vmm_binary = PathBuf::from(
+            current_expected
+                .launch_identity()
+                .boot
+                .vmm_executable
+                .path
+                .as_str(),
+        );
+        std::os::unix::fs::symlink(&vmm_binary, proc.join("exe")).unwrap();
+        std::fs::write(
+            proc.join("cmdline"),
+            [vmm_binary.as_os_str().as_bytes(), b"\0"].concat(),
+        )
+        .unwrap();
+        let mut bridge = root_process_bridge_with_all_ports(
+            &environment,
+            Arc::new(FakeRootProcessPort {
+                inspections: Mutex::new(VecDeque::new()),
+            }),
+            Arc::new(FakeServingProcessPort {
+                process_ids: Mutex::new(VecDeque::new()),
+            }),
+            Arc::new(FakeVmmProcessPort {
+                process_ids: Mutex::new(VecDeque::new()),
+            }),
+        );
+        bridge.process_paths.binaries = vec![vmm_binary];
+        bridge.managed_vmm_socket_root = Some(Arc::clone(&managed_socket_root));
+        bridge.managed_vmm_launch_root = Some(launch_root);
+        bridge.vmm_socket_receipts = Some(Arc::clone(&receipts));
+
+        assert_eq!(
+            bridge
+                .sweep_node_global_stale_boot_recovery(&managed, &inspected, &recovery_context,)
+                .unwrap(),
+            ProbeFact::Empty
+        );
+        let current_directory_after =
+            std::fs::metadata(current_sockets.public_directory().as_str()).unwrap();
+        let current_api_after =
+            std::fs::metadata(current_sockets.api_socket_path().as_str()).unwrap();
+        assert_eq!(current_directory.ino(), current_directory_after.ino());
+        assert_eq!(current_api.ino(), current_api_after.ino());
+
+        let live_stale = StaleBootRecoveryManagedInspection::Exact {
+            root: BTreeMap::new(),
+            serving: BTreeMap::new(),
+            vmm: BTreeMap::from([
+                (
+                    current.cat_id.clone(),
+                    VmmProcessInspection::Exact(Box::new(
+                        current_expected.exact_evidence_for_test(process_id),
+                    )),
+                ),
+                (
+                    stale.cat_id.clone(),
+                    VmmProcessInspection::Exact(Box::new(
+                        managed
+                            .vmm_expected
+                            .get(&stale.cat_id)
+                            .unwrap()
+                            .exact_evidence_for_test(5_252),
+                    )),
+                ),
+            ]),
+        };
+        assert_eq!(
+            bridge
+                .sweep_node_global_stale_boot_recovery(&managed, &live_stale, &recovery_context,)
+                .unwrap(),
+            ProbeFact::Present
+        );
+        assert_eq!(
+            receipts.load(stale_receipt.runtime_incarnation()).unwrap(),
+            Some(stale_receipt.clone())
+        );
+
+        let foreign = environment.systemd_root.join("cats-foreign.scope");
+        std::fs::create_dir(&foreign).unwrap();
+        assert_eq!(
+            bridge
+                .sweep_node_global_stale_boot_recovery(&managed, &inspected, &recovery_context,)
+                .unwrap(),
+            ProbeFact::Present
+        );
+        assert!(foreign.is_dir());
+        assert_eq!(
+            receipts.load(stale_receipt.runtime_incarnation()).unwrap(),
+            Some(stale_receipt)
+        );
+        drop(current_attempt);
     }
 
     #[test]
@@ -6727,6 +7836,8 @@ mod tests {
                 #[cfg(target_os = "linux")]
                 managed_vmm_launch_root: None,
                 vmm_socket_receipts: None,
+                recovery_metadata_authority: None,
+                recovery_blob_store: None,
             }
         }
     }
@@ -7547,6 +8658,8 @@ mod tests {
             #[cfg(target_os = "linux")]
             managed_vmm_launch_root: None,
             vmm_socket_receipts: None,
+            recovery_metadata_authority: None,
+            recovery_blob_store: None,
         }
     }
 

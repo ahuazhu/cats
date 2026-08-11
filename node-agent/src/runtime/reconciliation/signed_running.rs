@@ -44,6 +44,10 @@ use super::authorized_blockd::StopReceiptSettlement;
 use super::clean_slate_probes::{
     classify_local_publication_recovery, LocalPublicationRecoveryEvidence, CHECKPOINT_NAMESPACE,
 };
+#[cfg(target_os = "linux")]
+use super::clean_slate_probes::{
+    runtime_checkpoint_recovery_set, InstalledStaleBootVmmRecoveryPorts,
+};
 use super::serving_handoff::ServingHandoffStore;
 #[cfg(test)]
 use super::RootProvisionProcessRetirementPort;
@@ -176,11 +180,29 @@ pub(crate) struct SignedRunningAcquireEffect {
 /// current point-read authority must prove the persisted request already won.
 pub(crate) struct SignedRunningPublicationRecovery {
     authority: Arc<dyn VolumeDataAuthority>,
+    #[cfg(target_os = "linux")]
+    stale_boot_vmm: Option<InstalledStaleBootVmmRecoveryPorts>,
 }
 
 impl SignedRunningPublicationRecovery {
+    #[cfg(any(test, not(target_os = "linux")))]
     pub(crate) fn new(authority: Arc<dyn VolumeDataAuthority>) -> Self {
-        Self { authority }
+        Self {
+            authority,
+            #[cfg(target_os = "linux")]
+            stale_boot_vmm: None,
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    pub(crate) fn with_stale_boot_vmm_recovery(
+        authority: Arc<dyn VolumeDataAuthority>,
+        stale_boot_vmm: InstalledStaleBootVmmRecoveryPorts,
+    ) -> Self {
+        Self {
+            authority,
+            stale_boot_vmm: Some(stale_boot_vmm),
+        }
     }
 
     #[cfg(test)]
@@ -190,7 +212,98 @@ impl SignedRunningPublicationRecovery {
     ) -> Self {
         // Stable stop receipts deliberately do no pre-scan process I/O. Tests
         // retain this seam to assert the supplied port receives zero calls.
-        Self { authority }
+        Self {
+            authority,
+            #[cfg(target_os = "linux")]
+            stale_boot_vmm: None,
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    fn recover_stale_boot_vmm(
+        &self,
+        context: &RuntimePreScanRecoveryContext,
+    ) -> anyhow::Result<RuntimePreScanRecoveryOutcome> {
+        use super::vmm_process::{StaleBootVmmProcessGlobalInspection, VmmProcessExpectation};
+        use super::vmm_socket_namespace::StaleVmmSocketReceiptScan;
+
+        let Some(ports) = &self.stale_boot_vmm else {
+            return Ok(RuntimePreScanRecoveryOutcome::NoChange);
+        };
+        let Some(checkpoints) = runtime_checkpoint_recovery_set(context, &ports.socket_root)?
+        else {
+            return Ok(RuntimePreScanRecoveryOutcome::NoChange);
+        };
+        let expected_checkpoints = checkpoints
+            .iter_checkpoints()
+            .filter(|checkpoint| matches!(checkpoint.runtime_launch, RuntimeLaunch::Present(_)))
+            .collect::<Vec<_>>();
+        let physical = context.inventory_context();
+        let candidate = ports.receipts.retain_one_stale_boot_receipt(
+            &ports.socket_root,
+            &expected_checkpoints,
+            &physical,
+        )?;
+        let StaleVmmSocketReceiptScan::Candidate(candidate) = candidate else {
+            return Ok(RuntimePreScanRecoveryOutcome::NoChange);
+        };
+        let checkpoint = checkpoints
+            .checkpoint(candidate.cat_id())
+            .context("stale-boot VMM receipt lacks its admitted checkpoint")?;
+        let checkpoint_path = HostPath::new(
+            runtime_checkpoint_path(
+                &context.state_directory().path().join(CHECKPOINT_NAMESPACE),
+                &checkpoint.cat_id,
+            )
+            .to_string_lossy()
+            .into_owned(),
+        )
+        .context("stale-boot recovery checkpoint path is not canonical")?;
+        let expected = VmmProcessExpectation::from_checkpoint(checkpoint.clone())?
+            .with_checkpoint_path(checkpoint_path)?;
+        anyhow::ensure!(
+            candidate.receipt().runtime_incarnation() == expected.runtime_incarnation(),
+            "stale-boot VMM receipt changed incarnation after classification"
+        );
+        let cat_id = checkpoint.cat_id.clone();
+        let recovered = ports.launch_root.recover_stale_boot_receipt(
+            &ports.socket_root,
+            &ports.receipts,
+            checkpoint,
+            *candidate,
+            &physical,
+            |_| match ports
+                .global
+                .inspect_stale_boot_absence_after_node_global_sweep(
+                    &expected,
+                    &checkpoints,
+                    context,
+                )? {
+                StaleBootVmmProcessGlobalInspection::Absent(absence) => Ok(*absence),
+                StaleBootVmmProcessGlobalInspection::Conflict(problem) => {
+                    anyhow::bail!(
+                        "stale-boot VMM recovery found conflicting global identity: {problem:?}"
+                    )
+                }
+                StaleBootVmmProcessGlobalInspection::Unavailable => {
+                    anyhow::bail!("stale-boot VMM recovery global sweep is unavailable")
+                }
+            },
+        )?;
+        context.check_active()?;
+        Ok(if recovered {
+            RuntimePreScanRecoveryOutcome::Recovered { cat_id }
+        } else {
+            RuntimePreScanRecoveryOutcome::NoChange
+        })
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    fn recover_stale_boot_vmm(
+        &self,
+        _context: &RuntimePreScanRecoveryContext,
+    ) -> anyhow::Result<RuntimePreScanRecoveryOutcome> {
+        Ok(RuntimePreScanRecoveryOutcome::NoChange)
     }
 
     fn recover_authorized_blockd(
@@ -308,8 +421,12 @@ impl RuntimePreScanRecovery for SignedRunningPublicationRecovery {
         context: RuntimePreScanRecoveryContext,
     ) -> anyhow::Result<RuntimePreScanRecoveryOutcome> {
         context.check_active()?;
-        match classify_local_publication_recovery(&context)? {
-            LocalPublicationRecoveryEvidence::None => Ok(RuntimePreScanRecoveryOutcome::NoChange),
+        let evidence = classify_local_publication_recovery(&context)?;
+        if matches!(evidence, LocalPublicationRecoveryEvidence::None) {
+            return self.recover_stale_boot_vmm(&context);
+        }
+        let outcome = match evidence {
+            LocalPublicationRecoveryEvidence::None => unreachable!(),
             // Supersession is typed evidence, but it is not a publication
             // window. Rebinding requires the complete A20 physical scan; a
             // point read here cannot prove that no extra lineage or device
@@ -348,13 +465,13 @@ impl RuntimePreScanRecovery for SignedRunningPublicationRecovery {
                     .load()
                     .context("load checkpoint for definite release rejection confirmation")?
                 else {
-                    return Ok(RuntimePreScanRecoveryOutcome::NoChange);
+                    return self.recover_stale_boot_vmm(&context);
                 };
                 if !store
                     .confirm_durable_definite_release_rejection(&stored)
                     .context("confirm definite release rejection durability")?
                 {
-                    return Ok(RuntimePreScanRecoveryOutcome::NoChange);
+                    return self.recover_stale_boot_vmm(&context);
                 }
                 context.check_active()?;
                 // Directory durability changed, but the visible inventory did
@@ -374,13 +491,13 @@ impl RuntimePreScanRecovery for SignedRunningPublicationRecovery {
                     .load()
                     .context("load checkpoint for definite release rejection recovery")?
                 else {
-                    return Ok(RuntimePreScanRecoveryOutcome::NoChange);
+                    return self.recover_stale_boot_vmm(&context);
                 };
                 if !store
                     .recover_definite_release_rejection_publication(&stored)
                     .context("recover definite release rejection publication")?
                 {
-                    return Ok(RuntimePreScanRecoveryOutcome::NoChange);
+                    return self.recover_stale_boot_vmm(&context);
                 }
                 context.check_active()?;
                 Ok(RuntimePreScanRecoveryOutcome::Recovered { cat_id })
@@ -420,7 +537,7 @@ impl RuntimePreScanRecovery for SignedRunningPublicationRecovery {
                     .load()
                     .context("load handoff temp recovery checkpoint")?
                 else {
-                    return Ok(RuntimePreScanRecoveryOutcome::NoChange);
+                    return self.recover_stale_boot_vmm(&context);
                 };
                 // The attachment flock is acquired before the checkpoint
                 // writer guard, matching every handoff publisher's lock order.
@@ -444,6 +561,11 @@ impl RuntimePreScanRecovery for SignedRunningPublicationRecovery {
                     RuntimePreScanRecoveryOutcome::NoChange
                 })
             }
+        }?;
+        if matches!(outcome, RuntimePreScanRecoveryOutcome::NoChange) {
+            self.recover_stale_boot_vmm(&context)
+        } else {
+            Ok(outcome)
         }
     }
 }
@@ -3931,6 +4053,25 @@ mod tests {
     };
     use crate::state_directory::StateDirectory;
 
+    #[cfg(target_os = "linux")]
+    use super::super::clean_slate_probes::{
+        InstalledStaleBootVmmRecoveryPorts, RuntimeCheckpointRecoverySet,
+    };
+    #[cfg(target_os = "linux")]
+    use super::super::vmm_process::{
+        stale_boot_recovery_global_sealed, ExactVmmProcessAbsenceProof,
+        StaleBootVmmProcessGlobalInspection, StaleBootVmmProcessGlobalPort, VmmProcessExpectation,
+    };
+    #[cfg(target_os = "linux")]
+    use super::super::vmm_runtime_paths::{
+        ManagedVmmLaunchFilePaths, RetainedManagedVmmLaunchRoot, VMM_LAUNCH_FILE_NAMESPACE,
+    };
+    #[cfg(target_os = "linux")]
+    use super::super::vmm_socket_namespace::{
+        current_kernel_node_boot_id, RetainedManagedVmmSocketRoot, VmmSocketOwnershipReceiptV1,
+        VmmSocketReceiptStore,
+    };
+
     use super::super::{
         clean_slate_scanner_with_volume_authority_and_blob_for_test,
         clean_slate_scanner_with_volume_authority_for_test, TestCleanSlateProbeConfig,
@@ -7213,6 +7354,394 @@ mod tests {
         let store =
             FileCheckpointStore::open(&root.join(CHECKPOINT_NAMESPACE), &desired.cat_id).unwrap();
         store.create(&checkpoint).unwrap();
+    }
+
+    #[cfg(target_os = "linux")]
+    struct RecordingStaleBootGlobal {
+        calls: Arc<AtomicUsize>,
+    }
+
+    #[cfg(target_os = "linux")]
+    impl stale_boot_recovery_global_sealed::Sealed for RecordingStaleBootGlobal {}
+
+    #[cfg(target_os = "linux")]
+    impl StaleBootVmmProcessGlobalPort for RecordingStaleBootGlobal {
+        fn inspect_stale_boot_absence_after_node_global_sweep(
+            &self,
+            selected: &VmmProcessExpectation,
+            checkpoints: &RuntimeCheckpointRecoverySet,
+            context: &RuntimePreScanRecoveryContext,
+        ) -> anyhow::Result<StaleBootVmmProcessGlobalInspection> {
+            context.check_active()?;
+            anyhow::ensure!(
+                checkpoints.checkpoint(selected.cat_id()) == Some(selected.checkpoint()),
+                "test global port did not receive the complete selected checkpoint"
+            );
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            Ok(StaleBootVmmProcessGlobalInspection::Absent(Box::new(
+                ExactVmmProcessAbsenceProof::for_expectation(selected.clone()),
+            )))
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    struct StaleBootPublicationFixture {
+        _root: tempfile::TempDir,
+        state: StateDirectory,
+        desired: DesiredRuntimeSpec,
+        checkpoint: RuntimeCheckpoint,
+        socket_root: Arc<RetainedManagedVmmSocketRoot>,
+        launch_root: Arc<RetainedManagedVmmLaunchRoot>,
+        receipts: Arc<VmmSocketReceiptStore>,
+        calls: Arc<AtomicUsize>,
+    }
+
+    #[cfg(target_os = "linux")]
+    impl StaleBootPublicationFixture {
+        fn new() -> Self {
+            let root = tempfile::tempdir().unwrap();
+            let state_path = root.path().join("state");
+            std::fs::create_dir(&state_path).unwrap();
+            std::fs::set_permissions(&state_path, std::fs::Permissions::from_mode(0o700)).unwrap();
+            let launch_namespace = state_path.join(VMM_LAUNCH_FILE_NAMESPACE);
+            std::fs::create_dir(&launch_namespace).unwrap();
+            std::fs::set_permissions(&launch_namespace, std::fs::Permissions::from_mode(0o700))
+                .unwrap();
+            let state = StateDirectory::unanchored(state_path.clone());
+            let socket_root = Arc::new(
+                RetainedManagedVmmSocketRoot::provision_for_test(&root.path().join("sockets"))
+                    .unwrap(),
+            );
+            let launch_root =
+                Arc::new(RetainedManagedVmmLaunchRoot::open_existing(state.clone()).unwrap());
+            let receipts =
+                Arc::new(VmmSocketReceiptStore::provision_for_test(state.clone()).unwrap());
+            let desired =
+                decode_desired_runtime_spec(literal_file_bytes(FIXED_DESIRED_WIRE)).unwrap();
+            let mut checkpoint = decode_runtime_checkpoint(include_bytes!(concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/../testdata/runtime-reconciliation-v1-start-runtime-checkpoint.json"
+            )))
+            .unwrap();
+            let incarnation = checkpoint.runtime_incarnation.as_ref().unwrap().clone();
+            let sockets = socket_root.planner().paths_for(&incarnation).unwrap();
+            let files = ManagedVmmLaunchFilePaths::for_incarnation(&state, &incarnation).unwrap();
+            let ReconcileStep::StartRuntime {
+                api_socket_path,
+                vsock_socket_path,
+                memory_file_path,
+                serial_log_path,
+                vmm_log_path,
+                ..
+            } = &mut checkpoint.step
+            else {
+                unreachable!()
+            };
+            *api_socket_path = sockets.api_socket_path().clone();
+            *vsock_socket_path = sockets.vsock_socket_path().clone();
+            *memory_file_path = files.memory_file_path().clone();
+            *serial_log_path = files.serial_log_path().clone();
+            *vmm_log_path = files.vmm_log_path().clone();
+            checkpoint.runtime_launch = RuntimeLaunch::Present(Box::new(
+                checkpoint.step.start_runtime_launch_identity().unwrap(),
+            ));
+            FileCheckpointStore::open(&state_path.join(CHECKPOINT_NAMESPACE), &checkpoint.cat_id)
+                .unwrap()
+                .create(&checkpoint)
+                .unwrap();
+            let mut receipt = VmmSocketOwnershipReceiptV1::from_checkpoint(
+                &checkpoint,
+                &state,
+                &socket_root,
+                current_kernel_node_boot_id().unwrap(),
+                random('b'),
+            )
+            .unwrap();
+            let current_boot = current_kernel_node_boot_id().unwrap();
+            let old_boot = ["e".repeat(32), "f".repeat(32)]
+                .into_iter()
+                .map(|value| NodeBootId::new(value).unwrap())
+                .find(|value| value != &current_boot)
+                .unwrap();
+            receipt.set_node_boot_id_for_test(old_boot);
+            receipts.publish(&receipt).unwrap();
+            Self {
+                _root: root,
+                state,
+                desired,
+                checkpoint,
+                socket_root,
+                launch_root,
+                receipts,
+                calls: Arc::new(AtomicUsize::new(0)),
+            }
+        }
+
+        fn recovery(&self) -> SignedRunningPublicationRecovery {
+            let authority: Arc<dyn VolumeDataAuthority> =
+                Arc::new(FakeAuthority::new(Err(AuthorityError::NotFound)));
+            SignedRunningPublicationRecovery::with_stale_boot_vmm_recovery(
+                authority,
+                InstalledStaleBootVmmRecoveryPorts {
+                    global: Arc::new(RecordingStaleBootGlobal {
+                        calls: Arc::clone(&self.calls),
+                    }),
+                    socket_root: Arc::clone(&self.socket_root),
+                    launch_root: Arc::clone(&self.launch_root),
+                    receipts: Arc::clone(&self.receipts),
+                },
+            )
+        }
+
+        fn context(&self, desired: DesiredRuntimeSpec) -> RuntimePreScanRecoveryContext {
+            recovery_context(self.state.path(), &desired)
+        }
+
+        fn install_stable_stop_receipt(
+            &self,
+        ) -> (DesiredRuntimeSpec, std::path::PathBuf, std::fs::Metadata) {
+            let desired = second_desired();
+            let attachment = attachment(&desired);
+            let record = owned_record(&desired, &attachment);
+            let data_directory =
+                authorized_blockd_data_directory(self.state.path(), &desired, &attachment.identity);
+            let data_path = HostPath::new(data_directory.to_string_lossy().into_owned()).unwrap();
+            let control_socket_path = HostPath::new(
+                data_directory
+                    .join(ROOT_PROVISION_SOCKET)
+                    .to_string_lossy()
+                    .into_owned(),
+            )
+            .unwrap();
+            let expected_target = RemoteHead {
+                generation: Generation::new(1).unwrap(),
+                root_hash: Some(Sha256Digest::from_bytes([7; 32])),
+                root_object_id: Some(AsciiText::new("roots/stable-stop-test").unwrap()),
+            };
+            let mut checkpoint = acquire_checkpoint_from_attachment(&desired, &attachment);
+            checkpoint.step = ReconcileStep::ProvisionRootImage {
+                provision_transition_id: random('c'),
+                volume_id: attachment.identity.volume_id.clone(),
+                attachment_id: attachment.identity.attachment_id.clone(),
+                attachment_epoch: attachment.identity.attachment_epoch,
+                scope_id: Id::new(format!("cats-root-{}.service", "d".repeat(32))).unwrap(),
+                control_socket_path: control_socket_path.clone(),
+                data_directory: data_path.clone(),
+                process_identity_token: random('d'),
+                size_bytes: attachment.size_bytes,
+                boot_image_digest: desired.runtime.boot_image_digest.clone(),
+                expected_blank_head: attachment.head.clone(),
+                expected_provisioned_head: expected_target,
+            };
+            checkpoint.volumes = vec![prepared_owned_observed_volume(
+                &desired.volumes[0],
+                &attachment,
+                data_path,
+            )];
+            let stored = FileCheckpointStore::open(
+                &self.state.path().join(CHECKPOINT_NAMESPACE),
+                &desired.cat_id,
+            )
+            .unwrap()
+            .create(&checkpoint)
+            .unwrap();
+            let prepared = AuthorizedBlockdStore::new(self.state.clone())
+                .prepare(&desired, &desired.volumes[0], &attachment)
+                .unwrap();
+            assert_eq!(prepared.data_directory(), data_directory);
+            let authorized = prepared.checkpoint().clone();
+            drop(prepared);
+            let executable = HostPath::new(
+                std::env::current_exe()
+                    .unwrap()
+                    .to_string_lossy()
+                    .into_owned(),
+            )
+            .unwrap();
+            let expected =
+                super::super::root_provision_process::RootProvisionProcessExpectation::from_checkpoint(
+                    &checkpoint,
+                    super::super::root_provision_process::RootProvisionAuthoritySnapshot {
+                        attachment: attachment.clone(),
+                        volume: &record,
+                    },
+                    executable,
+                )
+                .unwrap();
+            let listener =
+                std::os::unix::net::UnixListener::bind(control_socket_path.as_str()).unwrap();
+            std::fs::set_permissions(
+                control_socket_path.as_str(),
+                std::fs::Permissions::from_mode(0o700),
+            )
+            .unwrap();
+            let mut retained = AuthorizedBlockdStore::new(self.state.clone())
+                .retain_exact_runtime_checkpoint(stored.checkpoint())
+                .unwrap();
+            let socket = retained
+                .retain_exact_control_socket()
+                .unwrap()
+                .expect("stable-stop fixture has an exact socket");
+            let process = super::super::root_provision_process::RootProvisionProcessEvidence {
+                process_id: 91,
+                unit_main_process_id: 91,
+                process_start_time_ticks: WireU64::new(123).unwrap(),
+                executable_path: expected.executable_path.clone(),
+                scope_id: expected.scope_id.clone(),
+                cgroup_path: expected.cgroup_path.clone(),
+                cgroup_process_ids: vec![91],
+                control_socket_path: expected.control_socket_path.clone(),
+                data_directory: expected.data_directory.clone(),
+                ownership_token: expected.process_identity_token.clone(),
+                handshake: super::super::root_provision_process::RootProvisionBlockdHandshake {
+                    peer_process_id: 91,
+                    identity: expected.attachment.identity.clone(),
+                    size_bytes: expected.size_bytes,
+                    durability: expected.attachment.durability,
+                    remote_head: expected.expected_remote_head().clone(),
+                    process_identity_token: expected.process_identity_token.clone(),
+                    control_only: true,
+                    guest_io_enabled: false,
+                },
+            };
+            let receipt = super::super::authorized_blockd::RootProvisionStopReceipt::new(
+                stored.checkpoint(),
+                &authorized,
+                record,
+                process,
+                socket,
+                super::super::root_provision_process::RootProvisionRetirementAdmission {
+                    node_boot_id: NodeBootId::new("33333333333333333333333333333333").unwrap(),
+                    agent_instance_id: random('4'),
+                    agent_session_epoch: epoch(2),
+                    inventory_epoch: epoch(4),
+                    inventory_digest: Sha256Digest::from_bytes([9; 32]),
+                    inventory_read_position: sequence(12),
+                },
+            )
+            .unwrap();
+            assert!(matches!(
+                retained.persist_or_reopen_stop_receipt(&receipt).unwrap(),
+                super::super::authorized_blockd::StopReceiptPublication::Published(_)
+            ));
+            drop(listener);
+            let receipt_path = data_directory
+                .join(super::super::authorized_blockd::ROOT_PROVISION_STOP_RECEIPT_FILE);
+            let identity = std::fs::metadata(&receipt_path).unwrap();
+            (desired, receipt_path, identity)
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn stale_boot_recovery_runs_after_current_or_legal_superseded_classification() {
+        for superseded in [false, true] {
+            let fixture = StaleBootPublicationFixture::new();
+            let mut desired = fixture.desired.clone();
+            if superseded {
+                desired.desired_revision =
+                    Revision::new(desired.desired_revision.get() + 1).unwrap();
+                desired.spec_digest = spec_digest(&desired).unwrap();
+                assert!(matches!(
+                    classify_local_publication_recovery(&fixture.context(desired.clone())).unwrap(),
+                    LocalPublicationRecoveryEvidence::SupersededCheckpoint { .. }
+                ));
+            }
+            assert!(matches!(
+                fixture
+                    .recovery()
+                    .recover_one(fixture.context(desired))
+                    .unwrap(),
+                RuntimePreScanRecoveryOutcome::Recovered { cat_id }
+                    if cat_id == fixture.checkpoint.cat_id
+            ));
+            assert_eq!(fixture.calls.load(Ordering::SeqCst), 1);
+            assert!(fixture
+                .receipts
+                .load(fixture.checkpoint.runtime_incarnation.as_ref().unwrap())
+                .unwrap()
+                .is_none());
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn stable_stop_receipt_does_not_starve_unrelated_stale_boot_vmm_recovery() {
+        let fixture = StaleBootPublicationFixture::new();
+        let (stable, stop_receipt, before) = fixture.install_stable_stop_receipt();
+        let desireds = vec![stable.clone(), fixture.desired.clone()];
+        let context = recovery_context_with_desireds(fixture.state.path(), desireds.clone());
+        assert!(matches!(
+            classify_local_publication_recovery(&context).unwrap(),
+            LocalPublicationRecoveryEvidence::RootProvisionStopReceipt { cat_id }
+                if cat_id == stable.cat_id
+        ));
+
+        assert!(matches!(
+            fixture.recovery().recover_one(context).unwrap(),
+            RuntimePreScanRecoveryOutcome::Recovered { cat_id }
+                if cat_id == fixture.checkpoint.cat_id
+        ));
+        assert_eq!(fixture.calls.load(Ordering::SeqCst), 1);
+        assert!(fixture
+            .receipts
+            .load(fixture.checkpoint.runtime_incarnation.as_ref().unwrap())
+            .unwrap()
+            .is_none());
+        let after = std::fs::metadata(&stop_receipt).unwrap();
+        assert_eq!(after.len(), before.len());
+        assert_eq!(after.dev(), before.dev());
+        assert_eq!(after.ino(), before.ino());
+        assert_eq!(after.nlink(), before.nlink());
+
+        // The stale VMM repair forces a fresh round; the unrelated stable stop
+        // receipt remains full-scan effect work and is still classified.
+        assert!(matches!(
+            classify_local_publication_recovery(&recovery_context_with_desireds(
+                fixture.state.path(),
+                desireds,
+            ))
+            .unwrap(),
+            LocalPublicationRecoveryEvidence::RootProvisionStopReceipt { cat_id }
+                if cat_id == stable.cat_id
+        ));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn drifted_superseded_launch_never_reaches_global_or_deletes_receipt() {
+        let fixture = StaleBootPublicationFixture::new();
+        let store = FileCheckpointStore::open(
+            &fixture.state.path().join(CHECKPOINT_NAMESPACE),
+            &fixture.checkpoint.cat_id,
+        )
+        .unwrap();
+        let stored = store.load().unwrap().unwrap();
+        let mut drifted = stored.checkpoint().clone();
+        let ReconcileStep::StartRuntime { vcpus, .. } = &mut drifted.step else {
+            unreachable!()
+        };
+        *vcpus += 1;
+        drifted.runtime_launch = RuntimeLaunch::Present(Box::new(
+            drifted.step.start_runtime_launch_identity().unwrap(),
+        ));
+        store.replace(&stored, &drifted).unwrap();
+        let mut desired = fixture.desired.clone();
+        desired.desired_revision = Revision::new(desired.desired_revision.get() + 1).unwrap();
+        desired.spec_digest = spec_digest(&desired).unwrap();
+        assert!(matches!(
+            fixture
+                .recovery()
+                .recover_one(fixture.context(desired))
+                .unwrap(),
+            RuntimePreScanRecoveryOutcome::NoChange
+        ));
+        assert_eq!(fixture.calls.load(Ordering::SeqCst), 0);
+        assert!(fixture
+            .receipts
+            .load(fixture.checkpoint.runtime_incarnation.as_ref().unwrap())
+            .unwrap()
+            .is_some());
     }
 
     fn recovery_context(

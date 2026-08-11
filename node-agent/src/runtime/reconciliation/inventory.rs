@@ -872,13 +872,29 @@ impl RuntimeInventoryScanner for CleanSlateInventoryScanner {
     }
 }
 
-fn vmm_process_expectations(
+pub(super) fn vmm_process_expectations(
     checkpoint_directory: &std::path::Path,
     checkpoints_by_cat: &BTreeMap<Id, RuntimeCheckpointInventoryEvidence>,
 ) -> anyhow::Result<BTreeMap<Id, super::vmm_process::VmmProcessExpectation>> {
+    vmm_process_expectations_inner(checkpoint_directory, checkpoints_by_cat, false)
+}
+
+#[cfg(target_os = "linux")]
+pub(super) fn recovery_vmm_process_expectations(
+    checkpoint_directory: &std::path::Path,
+    checkpoints_by_cat: &BTreeMap<Id, RuntimeCheckpointInventoryEvidence>,
+) -> anyhow::Result<BTreeMap<Id, super::vmm_process::VmmProcessExpectation>> {
+    vmm_process_expectations_inner(checkpoint_directory, checkpoints_by_cat, true)
+}
+
+fn vmm_process_expectations_inner(
+    checkpoint_directory: &std::path::Path,
+    checkpoints_by_cat: &BTreeMap<Id, RuntimeCheckpointInventoryEvidence>,
+    include_superseded: bool,
+) -> anyhow::Result<BTreeMap<Id, super::vmm_process::VmmProcessExpectation>> {
     let mut expected = BTreeMap::new();
     for (cat_id, evidence) in checkpoints_by_cat {
-        if evidence.binding != DesiredCheckpointBinding::Current
+        if (!include_superseded && evidence.binding != DesiredCheckpointBinding::Current)
             || evidence.checkpoint.runtime_launch.identity().is_none()
         {
             continue;
@@ -901,7 +917,7 @@ fn vmm_process_expectations(
     Ok(expected)
 }
 
-fn root_process_expectations(
+pub(super) fn root_process_expectations(
     context: &RuntimeInventoryScanContext,
     checkpoint_directory: &std::path::Path,
     blob: Option<&dyn BlobStore>,
@@ -910,12 +926,63 @@ fn root_process_expectations(
     blockd_by_cat: &BTreeMap<Id, BTreeMap<Id, AuthorizedBlockdInventoryEvidence>>,
     volumes_by_cat: &BTreeMap<Id, Vec<AuthorityVolumeInventoryEvidence>>,
 ) -> anyhow::Result<BTreeMap<Id, RootProvisionProcessExpectation>> {
+    let projection = InventoryProjectionContext {
+        checkpoint_directory,
+        blob,
+        deadline: context.deadline(),
+    };
+    root_process_expectations_inner(
+        context,
+        &projection,
+        executable_path,
+        checkpoints_by_cat,
+        blockd_by_cat,
+        volumes_by_cat,
+        false,
+    )
+}
+
+#[cfg(target_os = "linux")]
+pub(super) fn recovery_root_process_expectations(
+    context: &RuntimeInventoryScanContext,
+    checkpoint_directory: &std::path::Path,
+    blob: Option<&dyn BlobStore>,
+    executable_path: &HostPath,
+    checkpoints_by_cat: &BTreeMap<Id, RuntimeCheckpointInventoryEvidence>,
+    blockd_by_cat: &BTreeMap<Id, BTreeMap<Id, AuthorizedBlockdInventoryEvidence>>,
+    volumes_by_cat: &BTreeMap<Id, Vec<AuthorityVolumeInventoryEvidence>>,
+) -> anyhow::Result<BTreeMap<Id, RootProvisionProcessExpectation>> {
+    let projection = InventoryProjectionContext {
+        checkpoint_directory,
+        blob,
+        deadline: context.deadline(),
+    };
+    root_process_expectations_inner(
+        context,
+        &projection,
+        executable_path,
+        checkpoints_by_cat,
+        blockd_by_cat,
+        volumes_by_cat,
+        true,
+    )
+}
+
+fn root_process_expectations_inner(
+    context: &RuntimeInventoryScanContext,
+    projection: &InventoryProjectionContext<'_>,
+    executable_path: &HostPath,
+    checkpoints_by_cat: &BTreeMap<Id, RuntimeCheckpointInventoryEvidence>,
+    blockd_by_cat: &BTreeMap<Id, BTreeMap<Id, AuthorizedBlockdInventoryEvidence>>,
+    volumes_by_cat: &BTreeMap<Id, Vec<AuthorityVolumeInventoryEvidence>>,
+    include_superseded: bool,
+) -> anyhow::Result<BTreeMap<Id, RootProvisionProcessExpectation>> {
     let mut expected = BTreeMap::new();
     for desired in &context.coordinates().desired.desired_specs {
         let Some(checkpoint) = checkpoints_by_cat.get(&desired.cat_id) else {
             continue;
         };
-        if checkpoint.binding != DesiredCheckpointBinding::Current {
+        if !include_superseded && checkpoint.binding != DesiredCheckpointBinding::Current {
             continue;
         }
         let needs_root_process_bridge = match &checkpoint.checkpoint.step {
@@ -932,29 +999,29 @@ fn root_process_expectations(
         }
         let blockds = blockd_by_cat
             .get(&desired.cat_id)
-            .context("current root-provision checkpoint lacks AuthorizedBlockd lineage")?;
+            .context("root-provision checkpoint lacks AuthorizedBlockd lineage")?;
         let mut roots = blockds.values().filter(|blockd| {
             blockd.checkpoint.volume.disk_kind == cats_api::runtime_reconciliation::DiskKind::Root
         });
         let blockd = roots
             .next()
-            .context("current root-provision checkpoint lacks Root AuthorizedBlockd lineage")?;
+            .context("root-provision checkpoint lacks Root AuthorizedBlockd lineage")?;
         anyhow::ensure!(
             roots.next().is_none(),
-            "current root-provision checkpoint has duplicate Root AuthorizedBlockd lineage"
+            "root-provision checkpoint has duplicate Root AuthorizedBlockd lineage"
         );
         anyhow::ensure!(
-            blockd.binding == DesiredCheckpointBinding::Current,
-            "current root-provision checkpoint has superseded AuthorizedBlockd lineage"
+            blockd.binding == checkpoint.binding,
+            "root-provision checkpoint and AuthorizedBlockd binding disagree"
         );
         validate_scanned_checkpoint(
             desired,
             &checkpoint.checkpoint,
             checkpoint.binding,
             Some(blockds),
-            checkpoint_directory,
-            blob,
-            context.deadline(),
+            projection.checkpoint_directory,
+            projection.blob,
+            projection.deadline,
         )?;
         if let Some(retained) = &blockd.retained_root_process {
             anyhow::ensure!(
@@ -965,9 +1032,14 @@ fn root_process_expectations(
                 "retained Root process projection is outside a prepared-device phase"
             );
             let prepared_checkpoint = prepare_device_checkpoint_view(&checkpoint.checkpoint)?;
+            let expectation_desired = if checkpoint.binding == DesiredCheckpointBinding::Current {
+                desired
+            } else {
+                &blockd.checkpoint.desired
+            };
             let expectation = RootProvisionProcessExpectation::from_retained_prepare_device(
                 &prepared_checkpoint,
-                desired,
+                expectation_desired,
                 retained,
             )?;
             anyhow::ensure!(
@@ -1027,12 +1099,52 @@ pub(super) fn serving_process_expectations(
 ) -> anyhow::Result<
     BTreeMap<ManagedServingKey, super::serving_blockd_process::ServingBlockdExpectation>,
 > {
+    serving_process_expectations_inner(
+        context,
+        bridge,
+        checkpoints_by_cat,
+        blockd_by_cat,
+        volumes_by_cat,
+        false,
+    )
+}
+
+#[cfg(target_os = "linux")]
+pub(super) fn recovery_serving_process_expectations(
+    context: &RuntimeInventoryScanContext,
+    bridge: &dyn RootProcessInventoryBridge,
+    checkpoints_by_cat: &BTreeMap<Id, RuntimeCheckpointInventoryEvidence>,
+    blockd_by_cat: &BTreeMap<Id, BTreeMap<Id, AuthorizedBlockdInventoryEvidence>>,
+    volumes_by_cat: &BTreeMap<Id, Vec<AuthorityVolumeInventoryEvidence>>,
+) -> anyhow::Result<
+    BTreeMap<ManagedServingKey, super::serving_blockd_process::ServingBlockdExpectation>,
+> {
+    serving_process_expectations_inner(
+        context,
+        bridge,
+        checkpoints_by_cat,
+        blockd_by_cat,
+        volumes_by_cat,
+        true,
+    )
+}
+
+fn serving_process_expectations_inner(
+    context: &RuntimeInventoryScanContext,
+    bridge: &dyn RootProcessInventoryBridge,
+    checkpoints_by_cat: &BTreeMap<Id, RuntimeCheckpointInventoryEvidence>,
+    blockd_by_cat: &BTreeMap<Id, BTreeMap<Id, AuthorizedBlockdInventoryEvidence>>,
+    volumes_by_cat: &BTreeMap<Id, Vec<AuthorityVolumeInventoryEvidence>>,
+    include_superseded: bool,
+) -> anyhow::Result<
+    BTreeMap<ManagedServingKey, super::serving_blockd_process::ServingBlockdExpectation>,
+> {
     let mut expected = BTreeMap::new();
     for desired in &context.coordinates().desired.desired_specs {
         let Some(checkpoint) = checkpoints_by_cat.get(&desired.cat_id) else {
             continue;
         };
-        if checkpoint.binding != DesiredCheckpointBinding::Current
+        if (!include_superseded && checkpoint.binding != DesiredCheckpointBinding::Current)
             || !(matches!(
                 checkpoint.checkpoint.step,
                 ReconcileStep::PrepareDevice { .. } | ReconcileStep::PrepareNetwork { .. }
@@ -1057,8 +1169,8 @@ pub(super) fn serving_process_expectations(
                 .get(&prepared.volume_id)
                 .context("prepared device lacks its AuthorizedBlockd lineage")?;
             anyhow::ensure!(
-                blockd.binding == DesiredCheckpointBinding::Current,
-                "current prepared device has superseded AuthorizedBlockd lineage"
+                blockd.binding == checkpoint.binding,
+                "prepared device and AuthorizedBlockd binding disagree"
             );
             let authority = volumes_by_cat
                 .get(&desired.cat_id)
@@ -1068,9 +1180,14 @@ pub(super) fn serving_process_expectations(
                         .find(|volume| volume.record.volume_id == prepared.volume_id)
                 })
                 .context("serving blockd process lacks its raw authority VolumeRecord")?;
+            let expectation_desired = if checkpoint.binding == DesiredCheckpointBinding::Current {
+                desired
+            } else {
+                &blockd.checkpoint.desired
+            };
             let expectation = bridge.serving_expectation(
                 &checkpoint.checkpoint,
-                desired,
+                expectation_desired,
                 &prepared,
                 blockd,
                 &authority.record,
@@ -1554,7 +1671,248 @@ fn cleanup_release_matches_released_authority(
         && replay.generation == head.generation
 }
 
-fn validate_scanned_checkpoint(
+/// Sidecar-free structural gate used before a previous-boot VMM receipt may
+/// be selected. The later recovery-global sweep still joins blockd, metadata
+/// and BlobStore evidence through [`validate_scanned_checkpoint`]; this first
+/// layer prevents copied top-level digest coordinates from blessing drifted
+/// device, network, incarnation or managed-path contents.
+#[cfg(target_os = "linux")]
+pub(super) fn validate_checkpoint_recovery_structure(
+    desired: &DesiredRuntimeSpec,
+    checkpoint: &RuntimeCheckpoint,
+    binding: DesiredCheckpointBinding,
+    state_directory: &crate::state_directory::StateDirectory,
+    socket_root: &super::vmm_socket_namespace::ManagedVmmSocketRoot,
+) -> anyhow::Result<()> {
+    let binding_is_valid = match binding {
+        DesiredCheckpointBinding::Current => {
+            checkpoint.desired_revision == desired.desired_revision
+                && checkpoint.spec_digest == desired.spec_digest
+                && checkpoint.placement_epoch == desired.placement.placement_epoch
+        }
+        DesiredCheckpointBinding::Superseded => {
+            checkpoint.desired_revision < desired.desired_revision
+                && checkpoint.placement_epoch <= desired.placement.placement_epoch
+        }
+    };
+    anyhow::ensure!(
+        checkpoint.version == cats_api::runtime_reconciliation::ContractVersion::V1
+            && checkpoint.cat_id == desired.cat_id
+            && checkpoint.node_id == desired.placement.node_id
+            && binding_is_valid
+            && scanned_checkpoint_phase_envelope_is_valid(checkpoint)
+            && checkpoint.processes.is_empty()
+            && checkpoint.mounts.is_empty()
+            && matches!(
+                checkpoint.guest_transport,
+                GuestTransportEvidence::Unavailable
+            )
+            && matches!(checkpoint.warm_snapshot, WarmSnapshotEvidence::Absent),
+        "Runtime recovery checkpoint does not bind the current Desired phase envelope"
+    );
+
+    if let ReconcileStep::AcquireVolume { request } = &checkpoint.step {
+        if binding == DesiredCheckpointBinding::Superseded {
+            validate_superseded_acquire_checkpoint(checkpoint, request)?;
+            return Ok(());
+        }
+        let [intent] = desired.volumes.as_slice() else {
+            anyhow::bail!("current Acquire recovery checkpoint requires one root Volume")
+        };
+        anyhow::ensure!(
+            request_matches_volume(request, desired, intent)
+                && (checkpoint.volumes == [unowned_observed_volume(intent)]
+                    || current_acquire_adoption_is_closed(checkpoint, intent, None)),
+            "Acquire recovery checkpoint does not bind the exact Desired root"
+        );
+        return Ok(());
+    }
+
+    if let ReconcileStep::ProvisionRootImage {
+        volume_id,
+        attachment_id,
+        attachment_epoch,
+        size_bytes,
+        boot_image_digest,
+        expected_blank_head,
+        expected_provisioned_head,
+        ..
+    } = &checkpoint.step
+    {
+        let [intent] = desired.volumes.as_slice() else {
+            anyhow::bail!("current provision recovery checkpoint requires one root Volume")
+        };
+        let observed = checkpoint
+            .volumes
+            .iter()
+            .find(|volume| &volume.volume_id == volume_id)
+            .context("provision recovery checkpoint lacks its observed Volume")?;
+        let common_is_exact = volume_id == &intent.volume_id
+            && attachment_id == &intent.attachment_id
+            && attachment_epoch.get()
+                == match &intent.acquire {
+                    cats_api::runtime_reconciliation::VolumeAcquire::Normal {
+                        expected_unowned_epoch,
+                        ..
+                    } => expected_unowned_epoch.get().checked_add(1),
+                    cats_api::runtime_reconciliation::VolumeAcquire::Takeover { .. } => None,
+                }
+                .context("provision recovery attachment epoch overflow")?
+            && *size_bytes == intent.size_bytes
+            && boot_image_digest == &desired.runtime.boot_image_digest
+            && observed.volume_intent_id.as_ref() == Some(&intent.volume_intent_id)
+            && observed.disk_id.as_ref() == Some(&intent.disk_id)
+            && observed.size_bytes == Some(intent.size_bytes)
+            && observed.durability == Some(intent.durability)
+            && observed.devices.is_empty();
+        anyhow::ensure!(
+            common_is_exact,
+            "provision recovery checkpoint does not bind the exact Desired root"
+        );
+        let rebound;
+        let structural = if binding == DesiredCheckpointBinding::Current {
+            checkpoint
+        } else {
+            // Rebind only the top-level Desired coordinates for the pure
+            // structural validator. Every retained lineage, managed path,
+            // authority identity and phase field remains the predecessor's
+            // physical value and must independently match current Desired.
+            rebound = {
+                let mut checkpoint = checkpoint.clone();
+                checkpoint.desired_revision = desired.desired_revision;
+                checkpoint.spec_digest = desired.spec_digest.clone();
+                checkpoint.placement_epoch = desired.placement.placement_epoch;
+                checkpoint
+            };
+            &rebound
+        };
+        anyhow::ensure!(
+            provision_checkpoint_is_bound(
+                structural,
+                desired,
+                intent,
+                state_directory.path(),
+                expected_blank_head,
+                expected_provisioned_head,
+            ),
+            "provision recovery checkpoint has drifted managed paths or lineage"
+        );
+        return Ok(());
+    }
+
+    if matches!(
+        checkpoint.step,
+        ReconcileStep::PrepareDevice { .. } | ReconcileStep::PrepareNetwork { .. }
+    ) || checkpoint.runtime_launch.identity().is_some()
+    {
+        let devices = prepared_device_inputs(checkpoint)?;
+        anyhow::ensure!(
+            super::network::prepared_device_set_is_exact(desired, &devices),
+            "Runtime recovery checkpoint does not cover the exact Desired device set"
+        );
+        for device in devices {
+            let observed = checkpoint
+                .volumes
+                .iter()
+                .find(|volume| volume.volume_id == device.volume_id)
+                .context("Runtime recovery device lacks its observed Volume")?;
+            anyhow::ensure!(
+                prepared_device_input_is_exact(&device, desired, observed),
+                "Runtime recovery device does not bind the exact Desired Volume"
+            );
+        }
+    }
+    if let ReconcileStep::PrepareNetwork { network, .. } = &checkpoint.step {
+        anyhow::ensure!(
+            network.network_config == desired.runtime.network_config,
+            "Runtime recovery checkpoint does not bind the exact Desired network"
+        );
+    }
+    if let Some(launch) = checkpoint.runtime_launch.identity() {
+        anyhow::ensure!(
+            desired.target == RuntimeTarget::Running
+                && launch.vcpus == desired.runtime.vcpus
+                && launch.memory_bytes == desired.runtime.memory_bytes
+                && launch.boot_image_digest == desired.runtime.boot_image_digest
+                && launch.guest_config_digest == desired.runtime.guest_config_digest
+                && launch.network.network_config == desired.runtime.network_config,
+            "Runtime recovery launch does not bind the exact Desired runtime"
+        );
+        let recovered =
+            super::vmm_socket_namespace::vmm_state_directory_from_checkpoint(checkpoint)?;
+        anyhow::ensure!(
+            recovered.path() == state_directory.path(),
+            "Runtime recovery launch names another Node state directory"
+        );
+        super::vmm_runtime_paths::ManagedVmmLaunchFilePaths::paths_from_checkpoint(
+            state_directory,
+            checkpoint,
+        )?;
+        socket_root.paths_from_checkpoint(checkpoint)?;
+        let checkpoint_path = HostPath::new(
+            runtime_checkpoint_path(
+                &state_directory.path().join("checkpoints"),
+                &checkpoint.cat_id,
+            )
+            .to_string_lossy()
+            .into_owned(),
+        )
+        .context("recovery checkpoint path is not canonical")?;
+        super::vmm_process::VmmProcessExpectation::from_checkpoint(checkpoint.clone())?
+            .with_checkpoint_path(checkpoint_path)?;
+        return Ok(());
+    }
+    match &checkpoint.step {
+        ReconcileStep::PrepareDevice { .. } | ReconcileStep::PrepareNetwork { .. }
+            if binding == DesiredCheckpointBinding::Current =>
+        {
+            Ok(())
+        }
+        ReconcileStep::CleanupRelease { cleanup }
+            if binding == DesiredCheckpointBinding::Current =>
+        {
+            let [intent] = desired.volumes.as_slice() else {
+                anyhow::bail!("current cleanup recovery requires one root intent")
+            };
+            let [observed] = checkpoint.volumes.as_slice() else {
+                anyhow::bail!("current cleanup recovery requires one observed root")
+            };
+            let cats_api::runtime_reconciliation::CleanupTarget::Volume {
+                volume_id,
+                attachment_id,
+                ..
+            } = &cleanup.target
+            else {
+                anyhow::bail!("current cleanup recovery is not a Volume release")
+            };
+            anyhow::ensure!(
+                cleanup.inventory_session.node_id == desired.placement.node_id
+                    && cleanup.desired_read_position >= cleanup.inventory_read_position
+                    && volume_id == &intent.volume_id
+                    && attachment_id == &intent.attachment_id
+                    && observed.volume_intent_id.as_ref() == Some(&intent.volume_intent_id)
+                    && observed.disk_id.as_ref() == Some(&intent.disk_id)
+                    && observed.volume_id == intent.volume_id
+                    && observed.devices.is_empty(),
+                "current cleanup recovery does not bind the exact Desired root"
+            );
+            Ok(())
+        }
+        ReconcileStep::Quarantined if binding == DesiredCheckpointBinding::Current => {
+            anyhow::ensure!(
+                checkpoint
+                    .volumes
+                    .iter()
+                    .all(|volume| volume.devices.is_empty()),
+                "quarantined recovery checkpoint contains a device"
+            );
+            Ok(())
+        }
+        _ => anyhow::bail!("recovery encountered an unsupported checkpoint phase"),
+    }
+}
+
+pub(super) fn validate_scanned_checkpoint(
     desired: &DesiredRuntimeSpec,
     checkpoint: &RuntimeCheckpoint,
     binding: DesiredCheckpointBinding,
@@ -1692,9 +2050,7 @@ fn validate_scanned_checkpoint(
             .context("validate checkpointed PrepareNetwork identity")?;
             validate_current_prepared_checkpoint(desired, checkpoint, blockds, false)?;
         }
-        _ if binding == DesiredCheckpointBinding::Current
-            && checkpoint.runtime_launch.identity().is_some() =>
-        {
+        _ if checkpoint.runtime_launch.identity().is_some() => {
             validate_current_launched_checkpoint(desired, checkpoint, blockds)?;
         }
         ReconcileStep::CleanupRelease { cleanup }
@@ -1951,10 +2307,143 @@ mod tests {
         ReconcileStep, Revision, RuntimeConfig, RuntimeTarget, RuntimeTransition, SessionBinding,
         Sha256Digest, StableState,
     };
+    #[cfg(target_os = "linux")]
+    use cats_api::runtime_reconciliation::{decode_desired_runtime_spec, RuntimeLaunch};
 
     use super::*;
 
     const SNAPSHOT: &[u8] = br#"{"desired_specs":[],"expires_at_unix_ms":1720000030000,"issued_at_unix_ms":1720000000000,"read_position":12,"request_sequence":1,"session":{"agent_instance_id":"44444444444444444444444444444444","agent_session_epoch":2,"node_boot_id":"33333333333333333333333333333333","node_id":"node_a"},"version":1}"#;
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn recovery_structure_rejects_runtime_device_and_path_drift_but_allows_endpoint_supersession() {
+        let desired = decode_desired_runtime_spec(include_bytes!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../testdata/runtime-reconciliation-v1-desired.json"
+        )))
+        .unwrap();
+        let mut checkpoint = decode_runtime_checkpoint(include_bytes!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../testdata/runtime-reconciliation-v1-start-runtime-checkpoint.json"
+        )))
+        .unwrap();
+        let state = crate::state_directory::StateDirectory::unanchored("/var/lib/cats".into());
+        let socket_root = super::super::vmm_socket_namespace::ManagedVmmSocketRoot::installed();
+        let incarnation = checkpoint.runtime_incarnation.as_ref().unwrap().clone();
+        let sockets = socket_root.paths_for(&incarnation).unwrap();
+        let files = super::super::vmm_runtime_paths::ManagedVmmLaunchFilePaths::for_incarnation(
+            &state,
+            &incarnation,
+        )
+        .unwrap();
+        let ReconcileStep::StartRuntime {
+            api_socket_path,
+            vsock_socket_path,
+            memory_file_path,
+            serial_log_path,
+            vmm_log_path,
+            ..
+        } = &mut checkpoint.step
+        else {
+            unreachable!()
+        };
+        *api_socket_path = sockets.api_socket_path().clone();
+        *vsock_socket_path = sockets.vsock_socket_path().clone();
+        *memory_file_path = files.memory_file_path().clone();
+        *serial_log_path = files.serial_log_path().clone();
+        *vmm_log_path = files.vmm_log_path().clone();
+        checkpoint.runtime_launch = RuntimeLaunch::Present(Box::new(
+            checkpoint.step.start_runtime_launch_identity().unwrap(),
+        ));
+        validate_checkpoint_recovery_structure(
+            &desired,
+            &checkpoint,
+            DesiredCheckpointBinding::Current,
+            &state,
+            &socket_root,
+        )
+        .unwrap();
+
+        let mut endpoint_only = desired.clone();
+        endpoint_only.desired_revision = Revision::new(desired.desired_revision.get() + 1).unwrap();
+        endpoint_only.spec_digest = spec_digest(&endpoint_only).unwrap();
+        validate_checkpoint_recovery_structure(
+            &endpoint_only,
+            &checkpoint,
+            DesiredCheckpointBinding::Superseded,
+            &state,
+            &socket_root,
+        )
+        .unwrap();
+
+        let mut runtime_drift = checkpoint.clone();
+        let ReconcileStep::StartRuntime { vcpus, .. } = &mut runtime_drift.step else {
+            unreachable!()
+        };
+        *vcpus += 1;
+        runtime_drift.runtime_launch = RuntimeLaunch::Present(Box::new(
+            runtime_drift.step.start_runtime_launch_identity().unwrap(),
+        ));
+        assert!(validate_checkpoint_recovery_structure(
+            &desired,
+            &runtime_drift,
+            DesiredCheckpointBinding::Current,
+            &state,
+            &socket_root,
+        )
+        .is_err());
+
+        let mut device_drift = checkpoint.clone();
+        let ReconcileStep::StartRuntime { devices, .. } = &mut device_drift.step else {
+            unreachable!()
+        };
+        devices[0].volume_intent_id = Id::new("vint_foreign").unwrap();
+        device_drift.volumes[0].volume_intent_id = Some(Id::new("vint_foreign").unwrap());
+        device_drift.runtime_launch = RuntimeLaunch::Present(Box::new(
+            device_drift.step.start_runtime_launch_identity().unwrap(),
+        ));
+        assert!(validate_checkpoint_recovery_structure(
+            &desired,
+            &device_drift,
+            DesiredCheckpointBinding::Current,
+            &state,
+            &socket_root,
+        )
+        .is_err());
+
+        let mut path_drift = checkpoint.clone();
+        let ReconcileStep::StartRuntime {
+            memory_file_path, ..
+        } = &mut path_drift.step
+        else {
+            unreachable!()
+        };
+        *memory_file_path = HostPath::new("/var/lib/cats/foreign-memory".to_owned()).unwrap();
+        path_drift.runtime_launch = RuntimeLaunch::Present(Box::new(
+            path_drift.step.start_runtime_launch_identity().unwrap(),
+        ));
+        assert!(validate_checkpoint_recovery_structure(
+            &desired,
+            &path_drift,
+            DesiredCheckpointBinding::Current,
+            &state,
+            &socket_root,
+        )
+        .is_err());
+
+        let mut placement_drift = endpoint_only;
+        placement_drift.placement.placement_epoch =
+            Epoch::new(desired.placement.placement_epoch.get() + 1).unwrap();
+        placement_drift.spec_digest = spec_digest(&placement_drift).unwrap();
+        assert!(validate_checkpoint_recovery_structure(
+            &placement_drift,
+            &checkpoint,
+            DesiredCheckpointBinding::Superseded,
+            &state,
+            &socket_root,
+        )
+        .is_err());
+    }
 
     #[test]
     fn current_retained_launch_mints_vmm_expectations_through_running_tail() {
