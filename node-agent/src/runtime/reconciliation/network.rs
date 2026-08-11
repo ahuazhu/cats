@@ -984,6 +984,7 @@ impl PrepareNetworkReservationEffect {
         store: &FileCheckpointStore,
         stored: &StoredCheckpoint,
     ) -> Result<()> {
+        let _node_global_effect = context.lock_node_global_effect()?;
         let accepted = context.accepted_full()?;
         let admission = context.node_global_network()?;
         anyhow::ensure!(
@@ -1026,6 +1027,7 @@ impl PrepareNetworkReservationEffect {
             return Ok(None);
         };
         if matches!(runtime.step, ReconcileStep::PrepareNetwork { .. }) {
+            let _node_global_effect = context.lock_node_global_effect()?;
             return self.try_apply_physical(context, desired, runtime);
         }
         let ReconcileStep::PrepareDevice { devices } = &runtime.step else {
@@ -1034,6 +1036,7 @@ impl PrepareNetworkReservationEffect {
         if !prepare_device_base_admission_is_exact(accepted, desired, runtime) {
             return Ok(Some(local_contract_stop()));
         }
+        let _node_global_effect = context.lock_node_global_effect()?;
         let process_admission = context.node_global_process()?;
         if process_admission.serving_blockd_count(&desired.cat_id) != devices.len() {
             return Ok(Some(RuntimeDesiredEffectOutcome::RefreshInventory));

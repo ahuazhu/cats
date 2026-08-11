@@ -1283,6 +1283,7 @@ impl ServingHandoffEffect {
             observed_head == target,
             "serving handoff accepted authority is not the exact provision target"
         );
+        let _node_global_effect = context.lock_node_global_effect()?;
 
         // Reopen the scanner-attributed blank grant before trusting the
         // checkpoint path. Only the cloned value crosses into the handoff
@@ -1547,6 +1548,7 @@ impl ServingHandoffEffect {
             expectation,
             target_ready,
         )?;
+        let _node_global_effect = context.lock_node_global_effect()?;
         let inspection = self
             .global_process
             .inspect_exact_or_absent_after_node_global_sweep(expectation, context)?;
@@ -1605,6 +1607,7 @@ impl ServingHandoffEffect {
     ) -> anyhow::Result<()> {
         target_ready.assert_current(stored)?;
         let _current = checkpoint_store.assert_current(stored)?;
+        let _node_global_effect = context.lock_node_global_effect()?;
         let evidence = match self
             .global_process
             .inspect_exact_or_absent_after_node_global_sweep(expectation, context)?
@@ -1653,6 +1656,7 @@ impl ServingHandoffEffect {
         );
         let _current = checkpoint_store.assert_current(stored)?;
         ready.assert_current(stored)?;
+        let _node_global_effect = context.lock_node_global_effect()?;
         let evidence = match self
             .global_process
             .inspect_exact_or_absent_after_node_global_sweep(expectation, context)?

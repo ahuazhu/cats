@@ -136,6 +136,7 @@ impl inventory_port_sealed::Sealed for PlatformExactVmmCidInventoryPort {}
 impl VmmCidInventoryPort for PlatformExactVmmCidInventoryPort {
     fn inspect(&self, context: &RuntimeDesiredEffectContext) -> Result<VmmCidInventorySnapshot> {
         context.check_active()?;
+        let _node_global_effect = context.lock_node_global_effect()?;
         let accepted = context.accepted_full()?;
         let admission = context.node_global_process()?;
         anyhow::ensure!(

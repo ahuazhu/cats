@@ -1240,6 +1240,7 @@ impl RunningAdmissionEffect {
         let mut port = session.cell().port();
         let result = match action {
             RunningTailAction::OpenLifecycle => {
+                let _node_global_effect = context.lock_node_global_effect()?;
                 let times = next_persist_times(&stored)?;
                 Some(
                     GateSequencer::new(session.checkpoint_store(), &mut port)
@@ -1290,6 +1291,7 @@ impl RunningAdmissionEffect {
                 )
             }
             RunningTailAction::InstallGate(endpoint_id) => {
+                let _node_global_effect = context.lock_node_global_effect()?;
                 let times = next_persist_times(&stored)?;
                 Some(
                     GateSequencer::new(session.checkpoint_store(), &mut port)
@@ -1498,8 +1500,9 @@ impl RunningAdmissionEffect {
             RouteRetirementAction::RemoveGate(endpoint_id) => {
                 sequencer.remove_closed_gate(&stored, desired, &endpoint_id, times.after_effect)?
             }
-            RouteRetirementAction::InstallGate(endpoint_id) => sequencer
-                .install_gate_with_barrier(
+            RouteRetirementAction::InstallGate(endpoint_id) => {
+                let _node_global_effect = context.lock_node_global_effect()?;
+                sequencer.install_gate_with_barrier(
                     &stored,
                     desired,
                     &endpoint_id,
@@ -1514,7 +1517,8 @@ impl RunningAdmissionEffect {
                             durable,
                         )
                     },
-                )?,
+                )?
+            }
             RouteRetirementAction::CloseAll => sequencer.close_all(&stored, desired, times)?,
             RouteRetirementAction::BeginRequireIdle => {
                 sequencer.begin_require_idle(&stored, desired, times)?

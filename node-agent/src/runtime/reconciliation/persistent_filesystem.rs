@@ -332,6 +332,7 @@ impl PersistentFilesystemEffect {
             return Ok(Some(RuntimeDesiredEffectOutcome::RefreshInventory));
         }
 
+        let _node_global_effect = context.lock_node_global_effect()?;
         let processes = context.node_global_process()?;
         anyhow::ensure!(
             processes.matches_observation(accepted.observation()),

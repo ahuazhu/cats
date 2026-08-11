@@ -621,7 +621,11 @@ fn apply_readiness_policy(
         }
         RuntimeSpineRunStep::EffectStopped { cat_id, reason } => {
             readiness.set(false);
-            anyhow::bail!("signed Runtime effect stopped for {cat_id}: {reason:?}");
+            // Stop is an exact Cat reconciliation decision, not a Node-loop
+            // terminal condition. Keep the durable Desired item available to
+            // a later fresh scan while independent Cat workers continue.
+            tracing::warn!(%cat_id, ?reason, "signed Runtime effect stopped for one Cat");
+            Ok(RuntimeLoopAction::RetryAfterDelay)
         }
     }
 }
@@ -2204,6 +2208,23 @@ mod tests {
             )
             .unwrap(),
             RuntimeLoopAction::WaitForIdentityRepair
+        );
+        assert!(!readiness.is_ready());
+    }
+
+    #[test]
+    fn one_stopped_cat_does_not_terminate_the_node_loop() {
+        let readiness = Readiness::closed();
+        assert_eq!(
+            apply_readiness_policy(
+                RuntimeSpineRunStep::EffectStopped {
+                    cat_id: Id::new("cat_stopped").unwrap(),
+                    reason: crate::runtime_spine::RuntimeDesiredEffectStopReason::LocalContract,
+                },
+                &readiness,
+            )
+            .unwrap(),
+            RuntimeLoopAction::RetryAfterDelay
         );
         assert!(!readiness.is_ready());
     }

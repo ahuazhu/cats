@@ -4210,6 +4210,7 @@ impl PlatformRootProcessInventoryBridge {
         purpose: AdmittedRootTargetPurpose,
         context: &crate::runtime_spine::RuntimeDesiredEffectContext,
     ) -> anyhow::Result<RootProvisionProcessInspection> {
+        let _node_global_effect = context.lock_node_global_effect()?;
         let admission = context.node_global_process()?;
         let Some((admitted_target, admitted_exact)) = admission.root_control(&expected.cat_id)
         else {
@@ -4510,6 +4511,7 @@ impl ServingBlockdProcessGlobalPort for PlatformRootProcessInventoryBridge {
         expected: &ServingBlockdExpectation,
         context: &crate::runtime_spine::RuntimeDesiredEffectContext,
     ) -> anyhow::Result<ServingBlockdProcessInspection> {
+        let _node_global_effect = context.lock_node_global_effect()?;
         let admission = context.node_global_process()?;
         let Some((admitted_target, _)) =
             admission.serving_blockd(expected.cat_id(), expected.volume_id())
@@ -4576,6 +4578,7 @@ impl VmmProcessGlobalPort for PlatformRootProcessInventoryBridge {
         expected: &VmmProcessExpectation,
         context: &crate::runtime_spine::RuntimeDesiredEffectContext,
     ) -> anyhow::Result<VmmProcessGlobalInspection> {
+        let _node_global_effect = context.lock_node_global_effect()?;
         let admission = context.node_global_process()?;
         let Some((admitted_target, _)) = admission.vmm(expected.cat_id()) else {
             return Ok(VmmProcessGlobalInspection::Conflict(
@@ -4629,6 +4632,7 @@ impl VmmProcessGlobalPort for PlatformRootProcessInventoryBridge {
         successor_proof: &VmmGateSuccessorProof,
         context: &crate::runtime_spine::RuntimeDesiredEffectContext,
     ) -> anyhow::Result<VmmProcessGlobalInspection> {
+        let _node_global_effect = context.lock_node_global_effect()?;
         let successor = successor_proof.validate_for(admitted_predecessor)?;
         let admission = context.node_global_process()?;
         let Some((admitted_target, admitted_exact)) =
@@ -4842,6 +4846,7 @@ impl VmmCidInventoryPort for PlatformRootProcessInventoryBridge {
         context: &crate::runtime_spine::RuntimeDesiredEffectContext,
     ) -> anyhow::Result<VmmCidInventorySnapshot> {
         context.check_active()?;
+        let _node_global_effect = context.lock_node_global_effect()?;
         let accepted = context.accepted_full()?;
         let admission = context.node_global_process()?;
         anyhow::ensure!(

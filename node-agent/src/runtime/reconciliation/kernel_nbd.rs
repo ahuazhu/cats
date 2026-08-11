@@ -2205,6 +2205,17 @@ impl KernelNbdAttachEffect {
             runtimes.next().is_none(),
             "kernel-NBD admission duplicates one Cat"
         );
+        let kernel_nbd_phase = match &runtime.step {
+            ReconcileStep::PrepareDevice { devices }
+            | ReconcileStep::PrepareNetwork { devices, .. } => devices
+                .iter()
+                .any(|device| matches!(device.frontend, PrepareDeviceFrontend::KernelNbd { .. })),
+            _ => false,
+        };
+        if !kernel_nbd_phase {
+            return Ok(None);
+        }
+        let _node_global_effect = context.lock_node_global_effect()?;
         let observed_devices = match &runtime.step {
             ReconcileStep::PrepareDevice { devices }
                 if devices.iter().any(|device| {
@@ -2250,7 +2261,7 @@ impl KernelNbdAttachEffect {
                 }
                 Some(devices.as_slice())
             }
-            _ => return Ok(None),
+            _ => unreachable!("phase was classified before global admission"),
         };
         let admission = context.kernel_nbd_pool()?;
         anyhow::ensure!(

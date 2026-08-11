@@ -509,6 +509,7 @@ impl RunningLaunchAuthorityRevalidator {
             context.state_directory().path() == self.state_directory.path(),
             "Running revalidator and Desired effect use different state roots"
         );
+        let _node_global_effect = context.lock_node_global_effect()?;
         let accepted = context.accepted_full()?;
         let process_admission = context.node_global_process()?;
         let network_admission = context.node_global_network()?;

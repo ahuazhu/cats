@@ -183,6 +183,7 @@ impl RuntimeDesiredEffect for ProductionRuntimeDesiredEffect {
         if let Some(after_checkpoint) = &self.after_checkpoint {
             after_checkpoint();
         }
+        let _node_global_effect = context.lock_node_global_effect()?;
         context.check_active()?;
         if network_is_ready {
             self.launch

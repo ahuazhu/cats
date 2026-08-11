@@ -522,6 +522,7 @@ impl SignedRootProvisionEffect {
             // control-only process is absent in a later accepted full scan.
             // Retiring a live exact incarnation is one bounded physical
             // effect and never mutates the checkpoint or volume authority.
+            let _node_global_effect = context.lock_node_global_effect()?;
             return if runtime.processes.is_empty() {
                 self.finish_superseded_retirement(context, runtime, &store, &stored)
             } else {
@@ -595,6 +596,7 @@ impl SignedRootProvisionEffect {
             return Ok(Some(stop_local()));
         }
 
+        let _node_global_effect = context.lock_node_global_effect()?;
         if runtime.processes.is_empty() {
             let outcome = ensure_root_provision_process_from_persisted_checkpoint(
                 &store,
@@ -810,6 +812,7 @@ impl SignedRootProvisionEffect {
             return Ok(RuntimeDesiredEffectOutcome::RefreshInventory);
         };
         context.check_active()?;
+        let _node_global_effect = context.lock_node_global_effect()?;
         let evidence = match self
             .retirement
             .inspect_exact_after_node_global_sweep(&expectation, context)?
@@ -949,6 +952,7 @@ impl SignedRootProvisionEffect {
         let target_control_launch = target_authorization
             .as_ref()
             .map(|target| target_control_process_launch_identity(target.identity()));
+        let _node_global_effect = context.lock_node_global_effect()?;
         let absence = match prove_exact_root_provision_process_absence(
             store,
             stored,

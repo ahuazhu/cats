@@ -1,9 +1,10 @@
 //! One-step orchestration for the durable signed Node spine.
 
-use std::collections::{BTreeSet, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::io;
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{mpsc, Arc, Mutex, MutexGuard};
+use std::panic::{catch_unwind, AssertUnwindSafe};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{mpsc, Arc, Condvar, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 
 use cats_api::runtime_reconciliation::{
@@ -43,6 +44,13 @@ const REQUIRED_INVENTORY_SOURCES: [InventorySource; 11] = [
 ];
 const EFFECT_RESOURCE_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(5);
 const EFFECT_RESOURCE_SHUTDOWN_RETRY_INTERVAL: Duration = Duration::from_millis(10);
+const MAX_CONCURRENT_CAT_EFFECT_WORKERS: usize = 8;
+const NODE_GLOBAL_EFFECT_WAIT_INTERVAL: Duration = Duration::from_millis(10);
+static NEXT_RUNTIME_EFFECT_WORKER_ID: AtomicU64 = AtomicU64::new(1);
+
+fn next_runtime_effect_worker_id() -> u64 {
+    NEXT_RUNTIME_EFFECT_WORKER_ID.fetch_add(1, Ordering::Relaxed)
+}
 
 /// Performs one bounded scan of every physical source required by Runtime §6.
 ///
@@ -234,7 +242,71 @@ pub struct RuntimeDesiredEffectContext {
     node_global_network: Option<NodeGlobalNetworkAdmission>,
     kernel_nbd_pool: Option<KernelNbdPoolAdmission>,
     running_tail: Option<RunningTailAdmission>,
+    node_global_effect_gate: Arc<NodeGlobalEffectGate>,
+    node_global_effect_open: Arc<AtomicBool>,
+    effect_worker_id: u64,
 }
+
+#[derive(Debug, Default)]
+struct NodeGlobalEffectGate {
+    owner: Mutex<Option<u64>>,
+    changed: Condvar,
+}
+
+impl NodeGlobalEffectGate {
+    fn acquire(
+        &self,
+        context: &RuntimeDesiredEffectContext,
+    ) -> anyhow::Result<RuntimeNodeGlobalEffectPermit> {
+        let mut owner = self
+            .owner
+            .lock()
+            .map_err(|_| anyhow::anyhow!("Node-global Desired effect gate was poisoned"))?;
+        loop {
+            context.check_active()?;
+            anyhow::ensure!(
+                context.node_global_effect_open.load(Ordering::Acquire),
+                "Node-global Desired effect admission was invalidated"
+            );
+            match *owner {
+                None => {
+                    *owner = Some(context.effect_worker_id);
+                    return Ok(RuntimeNodeGlobalEffectPermit(()));
+                }
+                Some(worker_id) if worker_id == context.effect_worker_id => {
+                    return Ok(RuntimeNodeGlobalEffectPermit(()));
+                }
+                Some(_) => {
+                    let remaining = context.deadline.saturating_duration_since(Instant::now());
+                    let wait = remaining.min(NODE_GLOBAL_EFFECT_WAIT_INTERVAL);
+                    let (next, _) = self.changed.wait_timeout(owner, wait).map_err(|_| {
+                        anyhow::anyhow!("Node-global Desired effect gate was poisoned")
+                    })?;
+                    owner = next;
+                }
+            }
+        }
+    }
+
+    fn release_worker_and_close(&self, worker_id: u64, open: &AtomicBool) {
+        let mut owner = match self.owner.lock() {
+            Ok(owner) => owner,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        if owner.as_ref() == Some(&worker_id) {
+            // Close while ownership is retained so no sibling can acquire in
+            // the interval before this exact worker releases the gate.
+            open.store(false, Ordering::Release);
+            *owner = None;
+            self.changed.notify_all();
+        }
+    }
+}
+
+/// Proof that this exact Cat worker owns (or re-entered) the batch-global
+/// effect authority. Dropping this marker does not release ownership: the
+/// worker closes and releases it only after the entire effect call returns.
+pub(crate) struct RuntimeNodeGlobalEffectPermit(());
 
 /// Shared read-only deadline/cancellation boundary for physical identity
 /// inspection. Both a full inventory scan and a Desired effect may inspect
@@ -543,6 +615,9 @@ impl RuntimeDesiredEffectContext {
         deadline: Instant,
         cancellation: RuntimeInventoryScanCancellation,
         accepted_full: Option<RuntimeDesiredEffectAdmission>,
+        node_global_effect_gate: Arc<NodeGlobalEffectGate>,
+        node_global_effect_open: Arc<AtomicBool>,
+        effect_worker_id: u64,
     ) -> Self {
         let node_global_process = accepted_full
             .as_ref()
@@ -565,6 +640,9 @@ impl RuntimeDesiredEffectContext {
             node_global_network,
             kernel_nbd_pool,
             running_tail,
+            node_global_effect_gate,
+            node_global_effect_open,
+            effect_worker_id,
         }
     }
 
@@ -626,6 +704,16 @@ impl RuntimeDesiredEffectContext {
         self.running_tail.as_ref()
     }
 
+    /// Serializes the use of one accepted full scan as Node-global mutation
+    /// authority while leaving Cat-local reconciliation independent. The
+    /// caller must acquire this only after it has classified its exact Cat
+    /// step as one that will inspect or mutate a shared Host namespace. The
+    /// logical ownership remains attached to this worker through the final
+    /// provider postcondition even if the returned marker leaves scope.
+    pub(crate) fn lock_node_global_effect(&self) -> anyhow::Result<RuntimeNodeGlobalEffectPermit> {
+        self.node_global_effect_gate.acquire(self)
+    }
+
     #[cfg(test)]
     pub(crate) fn for_test(state_directory: StateDirectory, deadline: Instant) -> Self {
         Self::new(
@@ -633,6 +721,9 @@ impl RuntimeDesiredEffectContext {
             deadline,
             RuntimeInventoryScanCancellation::new(),
             None,
+            Arc::new(NodeGlobalEffectGate::default()),
+            Arc::new(AtomicBool::new(true)),
+            next_runtime_effect_worker_id(),
         )
     }
 
@@ -647,6 +738,9 @@ impl RuntimeDesiredEffectContext {
             deadline,
             RuntimeInventoryScanCancellation::new(),
             Some(admission),
+            Arc::new(NodeGlobalEffectGate::default()),
+            Arc::new(AtomicBool::new(true)),
+            next_runtime_effect_worker_id(),
         )
     }
 
@@ -665,6 +759,9 @@ impl RuntimeDesiredEffectContext {
             node_global_network: None,
             kernel_nbd_pool: None,
             running_tail: None,
+            node_global_effect_gate: Arc::new(NodeGlobalEffectGate::default()),
+            node_global_effect_open: Arc::new(AtomicBool::new(true)),
+            effect_worker_id: next_runtime_effect_worker_id(),
         }
     }
 
@@ -1497,11 +1594,6 @@ impl Drop for ScanLane {
 }
 
 enum EffectCommand {
-    Apply {
-        context: Box<RuntimeDesiredEffectContext>,
-        desired: Box<DesiredRuntimeSpec>,
-        reply: tokio::sync::oneshot::Sender<anyhow::Result<RuntimeDesiredEffectOutcome>>,
-    },
     Recover {
         context: Box<RuntimePreScanRecoveryContext>,
         reply: tokio::sync::oneshot::Sender<anyhow::Result<RuntimePreScanRecoveryOutcome>>,
@@ -1513,29 +1605,28 @@ enum EffectCommand {
 }
 
 #[derive(Default)]
-struct EffectLaneState {
+struct CoordinatorLaneState {
     poisoned: AtomicBool,
     active: Mutex<Option<RuntimeInventoryScanCancellation>>,
 }
 
-struct EffectLane {
+struct CoordinatorLane {
     sender: Option<mpsc::SyncSender<EffectCommand>>,
     thread: Option<std::thread::JoinHandle<()>>,
-    state: Arc<EffectLaneState>,
+    state: Arc<CoordinatorLaneState>,
     has_recovery: bool,
     has_pre_scan_admission: bool,
     pre_scan_admission: Option<Arc<dyn RuntimePreScanAdmission>>,
 }
 
-impl EffectLane {
+impl CoordinatorLane {
     fn start(
-        effect: Arc<dyn RuntimeDesiredEffect>,
         pre_scan_admission: Option<Arc<dyn RuntimePreScanAdmission>>,
         recovery: Option<Arc<dyn RuntimePreScanRecovery>>,
         resource_owner: Option<Arc<dyn RuntimeEffectResourceOwner>>,
     ) -> Result<Self, RuntimeSpineRunError> {
         let (sender, receiver) = mpsc::sync_channel(1);
-        let state = Arc::new(EffectLaneState::default());
+        let state = Arc::new(CoordinatorLaneState::default());
         let worker_state = Arc::clone(&state);
         let has_recovery = recovery.is_some();
         let has_pre_scan_admission = pre_scan_admission.is_some();
@@ -1545,35 +1636,6 @@ impl EffectLane {
             .spawn(move || {
                 while let Ok(command) = receiver.recv() {
                     match command {
-                        EffectCommand::Apply {
-                            context,
-                            desired,
-                            reply,
-                        } => {
-                            let resources_ready = resource_owner
-                                .as_ref()
-                                .map(|owner| {
-                                    owner.poll()?;
-                                    anyhow::ensure!(
-                                        !owner.has_pending(),
-                                        "runtime effect resource owner retains pending work"
-                                    );
-                                    Ok(())
-                                })
-                                .unwrap_or(Ok(()));
-                            let result =
-                                if context.check_active().is_ok() && resources_ready.is_ok() {
-                                    effect.apply(*context, &desired)
-                                } else {
-                                    resources_ready.and_then(|()| {
-                                        Err(anyhow::anyhow!(
-                                            "runtime Desired effect was cancelled before execution"
-                                        ))
-                                    })
-                                };
-                            active_effect(&worker_state.active).take();
-                            let _ = reply.send(result);
-                        }
                         EffectCommand::Recover { context, reply } => {
                             let resources_ready = resource_owner
                                 .as_ref()
@@ -1798,81 +1860,6 @@ impl EffectLane {
         }
     }
 
-    async fn apply(
-        &self,
-        state_directory: StateDirectory,
-        desired: DesiredRuntimeSpec,
-        accepted_full: Option<RuntimeDesiredEffectAdmission>,
-        deadline: Instant,
-    ) -> Result<EffectWait, RuntimeSpineRunError> {
-        if self.state.poisoned.load(Ordering::Acquire) {
-            return Err(RuntimeSpineRunError::EffectLanePoisoned);
-        }
-        if Instant::now() >= deadline {
-            return Ok(EffectWait::DeadlineExceeded);
-        }
-        let cancellation = RuntimeInventoryScanCancellation::new();
-        let context = RuntimeDesiredEffectContext::new(
-            state_directory,
-            deadline,
-            cancellation.clone(),
-            accepted_full,
-        );
-        {
-            let mut active = active_effect(&self.state.active);
-            if active.is_some() {
-                return Err(RuntimeSpineRunError::EffectQueueFull);
-            }
-            *active = Some(cancellation.clone());
-        }
-        let (reply, received) = tokio::sync::oneshot::channel();
-        let command = EffectCommand::Apply {
-            context: Box::new(context),
-            desired: Box::new(desired),
-            reply,
-        };
-        let send_result = self
-            .sender
-            .as_ref()
-            .ok_or_else(|| RuntimeSpineRunError::WorkerStopped("Desired effect".to_owned()))?
-            .try_send(command);
-        if let Err(error) = send_result {
-            active_effect(&self.state.active).take();
-            return match error {
-                mpsc::TrySendError::Full(_) => Err(RuntimeSpineRunError::EffectQueueFull),
-                mpsc::TrySendError::Disconnected(_) => Err(RuntimeSpineRunError::WorkerStopped(
-                    "Desired effect".to_owned(),
-                )),
-            };
-        }
-
-        let mut guard = ActiveEffectGuard {
-            cancellation,
-            state: Arc::clone(&self.state),
-            armed: true,
-        };
-        match receive_effect_result_until(received, deadline).await {
-            EffectReceive::Delivered(result) => {
-                guard.disarm();
-                // A completed typed outcome is the authoritative phase
-                // boundary even when it became ready together with the outer
-                // deadline. Discarding it could replay a physical step from
-                // the old full-inventory admission.
-                Ok(EffectWait::Finished(result))
-            }
-            EffectReceive::Closed => {
-                guard.poison();
-                Err(RuntimeSpineRunError::WorkerStopped(
-                    "Desired effect".to_owned(),
-                ))
-            }
-            EffectReceive::DeadlineExceeded => {
-                guard.poison();
-                Ok(EffectWait::DeadlineExceeded)
-            }
-        }
-    }
-
     fn is_poisoned(&self) -> bool {
         self.state.poisoned.load(Ordering::Acquire)
     }
@@ -1891,9 +1878,330 @@ impl EffectLane {
     }
 }
 
-impl Drop for EffectLane {
+impl Drop for CoordinatorLane {
     fn drop(&mut self) {
         let _ = self.shutdown_blocking();
+    }
+}
+
+struct CatEffectCommand {
+    context: RuntimeDesiredEffectContext,
+    desired: DesiredRuntimeSpec,
+}
+
+struct CatEffectCompletion {
+    cat_id: Id,
+    desired: DesiredRuntimeSpec,
+    result: anyhow::Result<RuntimeDesiredEffectOutcome>,
+}
+
+struct CatEffectWorker {
+    cancellation: RuntimeInventoryScanCancellation,
+    deadline: Instant,
+    timed_out: bool,
+    discard_result: bool,
+    thread: Option<std::thread::JoinHandle<()>>,
+}
+
+/// Bounded set of exact Cat-keyed, one-command worker mailboxes.
+///
+/// A worker is never reassigned to another Cat and no second command can be
+/// admitted for the same key until its first thread has been joined. A timed
+/// out provider call therefore consumes one bounded slot but cannot poison a
+/// sibling Cat or detach from runner shutdown. The completion wake channel is
+/// unbounded only at the transport type level: a worker sends exactly once and
+/// remains in `active` until that message is drained, so at most `limit`
+/// completions can be queued.
+struct CatEffectWorkers {
+    effect: Arc<dyn RuntimeDesiredEffect>,
+    completion_sender: tokio::sync::mpsc::UnboundedSender<CatEffectCompletion>,
+    completion_receiver: tokio::sync::mpsc::UnboundedReceiver<CatEffectCompletion>,
+    active: BTreeMap<Id, CatEffectWorker>,
+    limit: usize,
+}
+
+impl CatEffectWorkers {
+    fn new(
+        effect: Arc<dyn RuntimeDesiredEffect>,
+        limit: usize,
+    ) -> Result<Self, RuntimeSpineRunError> {
+        if limit == 0 {
+            return Err(RuntimeSpineRunError::InvalidComposition(
+                "per-Cat Desired effect worker limit must be positive",
+            ));
+        }
+        let (completion_sender, completion_receiver) = tokio::sync::mpsc::unbounded_channel();
+        Ok(Self {
+            effect,
+            completion_sender,
+            completion_receiver,
+            active: BTreeMap::new(),
+            limit,
+        })
+    }
+
+    fn has_active(&self) -> bool {
+        !self.active.is_empty()
+    }
+
+    fn available_slots(&self) -> usize {
+        self.limit.saturating_sub(self.active.len())
+    }
+
+    fn dispatch(
+        &mut self,
+        state_directory: StateDirectory,
+        desired: DesiredRuntimeSpec,
+        accepted_full: Option<RuntimeDesiredEffectAdmission>,
+        node_global_effect_gate: Arc<NodeGlobalEffectGate>,
+        node_global_effect_open: Arc<AtomicBool>,
+        deadline: Instant,
+    ) -> Result<(), RuntimeSpineRunError> {
+        if self.active.len() >= self.limit {
+            return Err(RuntimeSpineRunError::EffectQueueFull);
+        }
+        let cat_id = desired.cat_id.clone();
+        if self.active.contains_key(&cat_id) {
+            return Err(RuntimeSpineRunError::InvalidComposition(
+                "one Cat was dispatched while its reconciler was already in flight",
+            ));
+        }
+        let cancellation = RuntimeInventoryScanCancellation::new();
+        let effect_worker_id = next_runtime_effect_worker_id();
+        let context = RuntimeDesiredEffectContext::new(
+            state_directory,
+            deadline,
+            cancellation.clone(),
+            accepted_full,
+            node_global_effect_gate,
+            node_global_effect_open,
+            effect_worker_id,
+        );
+        let (command_sender, command_receiver) = mpsc::sync_channel::<CatEffectCommand>(1);
+        let effect = Arc::clone(&self.effect);
+        let completion = self.completion_sender.clone();
+        let global_gate = Arc::clone(&context.node_global_effect_gate);
+        let global_open = Arc::clone(&context.node_global_effect_open);
+        let worker_cat_id = cat_id.clone();
+        let thread = std::thread::Builder::new()
+            .name("cats-runtime-cat-effect".to_owned())
+            .spawn(move || {
+                let Ok(command) = command_receiver.recv() else {
+                    return;
+                };
+                let CatEffectCommand { context, desired } = command;
+                let result = catch_unwind(AssertUnwindSafe(|| {
+                    if context.check_active().is_ok() {
+                        effect.apply(context, &desired)
+                    } else {
+                        Err(anyhow::anyhow!(
+                            "runtime Desired effect was cancelled before execution"
+                        ))
+                    }
+                }))
+                .unwrap_or_else(|_| Err(anyhow::anyhow!("per-Cat Desired effect worker panicked")));
+                global_gate.release_worker_and_close(effect_worker_id, global_open.as_ref());
+                // This send is the worker's final observable action. The
+                // coordinator may therefore join synchronously after receipt
+                // without waiting on provider or filesystem work.
+                let _ = completion.send(CatEffectCompletion {
+                    cat_id: worker_cat_id,
+                    desired,
+                    result,
+                });
+            })
+            .map_err(|source| RuntimeSpineRunError::WorkerStart {
+                worker: "per-Cat Desired effect",
+                source,
+            })?;
+        self.active.insert(
+            cat_id.clone(),
+            CatEffectWorker {
+                cancellation,
+                deadline,
+                timed_out: false,
+                discard_result: false,
+                thread: Some(thread),
+            },
+        );
+        if command_sender
+            .send(CatEffectCommand { context, desired })
+            .is_err()
+        {
+            // The thread exited before accepting the only bounded command.
+            // It cannot have called user code, but it must still be joined.
+            let mut worker = self.active.remove(&cat_id).ok_or_else(|| {
+                RuntimeSpineRunError::WorkerStopped("per-Cat Desired effect startup".to_owned())
+            })?;
+            let _ = join_worker_blocking("per-Cat Desired effect", worker.thread.take());
+            return Err(RuntimeSpineRunError::WorkerStopped(
+                "per-Cat Desired effect startup".to_owned(),
+            ));
+        }
+        Ok(())
+    }
+
+    async fn wait_next(
+        &mut self,
+        poll_deadline: Instant,
+    ) -> Result<CatEffectWait, RuntimeSpineRunError> {
+        loop {
+            match self.completion_receiver.try_recv() {
+                Ok(completion) => return self.finish_completion(completion),
+                Err(tokio::sync::mpsc::error::TryRecvError::Disconnected) => {
+                    return Err(RuntimeSpineRunError::WorkerStopped(
+                        "per-Cat Desired effect completion".to_owned(),
+                    ));
+                }
+                Err(tokio::sync::mpsc::error::TryRecvError::Empty) => {}
+            }
+
+            let task_deadline = self
+                .active
+                .values()
+                .filter(|worker| !worker.timed_out && !worker.discard_result)
+                .map(|worker| worker.deadline)
+                .min();
+            let wait_deadline =
+                task_deadline.map_or(poll_deadline, |deadline| deadline.min(poll_deadline));
+            if Instant::now() >= wait_deadline {
+                if let Some(cat_id) = self.mark_expired() {
+                    return Ok(CatEffectWait::DeadlineExceeded { cat_id });
+                }
+                let cat_id = self.active.keys().next().cloned().ok_or_else(|| {
+                    RuntimeSpineRunError::WorkerStopped(
+                        "per-Cat Desired effect wait without an active worker".to_owned(),
+                    )
+                })?;
+                return Ok(CatEffectWait::AwaitingLateWorker { cat_id });
+            }
+
+            let timer = tokio::time::sleep_until(tokio::time::Instant::from_std(wait_deadline));
+            tokio::pin!(timer);
+            tokio::select! {
+                biased;
+                completion = self.completion_receiver.recv() => {
+                    let completion = completion.ok_or_else(|| RuntimeSpineRunError::WorkerStopped(
+                        "per-Cat Desired effect completion".to_owned(),
+                    ))?;
+                    return self.finish_completion(completion);
+                }
+                () = &mut timer => {}
+            }
+        }
+    }
+
+    fn mark_expired(&mut self) -> Option<Id> {
+        let now = Instant::now();
+        let expired = self
+            .active
+            .iter()
+            .filter(|(_, worker)| {
+                !worker.timed_out && !worker.discard_result && now >= worker.deadline
+            })
+            .map(|(cat_id, _)| cat_id.clone())
+            .collect::<Vec<_>>();
+        for cat_id in &expired {
+            if let Some(worker) = self.active.get_mut(cat_id) {
+                worker.timed_out = true;
+                worker.cancellation.cancel();
+            }
+        }
+        expired.into_iter().next()
+    }
+
+    fn finish_completion(
+        &mut self,
+        completion: CatEffectCompletion,
+    ) -> Result<CatEffectWait, RuntimeSpineRunError> {
+        let Some(mut worker) = self.active.remove(&completion.cat_id) else {
+            return Err(RuntimeSpineRunError::WorkerStopped(
+                "stale or duplicate per-Cat Desired effect completion".to_owned(),
+            ));
+        };
+        join_worker_blocking("per-Cat Desired effect", worker.thread.take())?;
+        if worker.timed_out {
+            Ok(CatEffectWait::LateWorkerJoined {
+                cat_id: completion.cat_id,
+            })
+        } else if worker.discard_result {
+            Ok(CatEffectWait::Discarded {
+                cat_id: completion.cat_id,
+            })
+        } else {
+            Ok(CatEffectWait::Finished {
+                desired: Box::new(completion.desired),
+                result: completion.result,
+            })
+        }
+    }
+
+    fn cancel_all(&self) {
+        for worker in self.active.values() {
+            worker.cancellation.cancel();
+        }
+    }
+
+    fn cancel_all_and_discard(&mut self) {
+        for worker in self.active.values_mut() {
+            worker.discard_result = true;
+            worker.cancellation.cancel();
+        }
+    }
+
+    fn shutdown_blocking(&mut self) -> Result<(), RuntimeSpineRunError> {
+        self.cancel_all();
+        let mut failures = Vec::new();
+        while let Some((cat_id, mut worker)) = self.active.pop_first() {
+            if let Err(error) = join_worker_blocking("per-Cat Desired effect", worker.thread.take())
+            {
+                failures.push(format!("{cat_id}: {error}"));
+            }
+        }
+        if failures.is_empty() {
+            Ok(())
+        } else {
+            Err(RuntimeSpineRunError::WorkerShutdown(failures.join("; ")))
+        }
+    }
+}
+
+impl Drop for CatEffectWorkers {
+    fn drop(&mut self) {
+        let _ = self.shutdown_blocking();
+    }
+}
+
+enum CatEffectWait {
+    Finished {
+        desired: Box<DesiredRuntimeSpec>,
+        result: anyhow::Result<RuntimeDesiredEffectOutcome>,
+    },
+    DeadlineExceeded {
+        cat_id: Id,
+    },
+    AwaitingLateWorker {
+        cat_id: Id,
+    },
+    LateWorkerJoined {
+        cat_id: Id,
+    },
+    Discarded {
+        cat_id: Id,
+    },
+}
+
+enum DeferredEffectDecision {
+    IdentityRepairRequired { cat_id: Id },
+}
+
+impl DeferredEffectDecision {
+    fn into_run_step(self) -> RuntimeSpineRunStep {
+        match self {
+            Self::IdentityRepairRequired { cat_id } => {
+                RuntimeSpineRunStep::EffectIdentityRepairRequired { cat_id }
+            }
+        }
     }
 }
 
@@ -1904,11 +2212,6 @@ fn active_effect(
         Ok(guard) => guard,
         Err(poisoned) => poisoned.into_inner(),
     }
-}
-
-enum EffectWait {
-    Finished(anyhow::Result<RuntimeDesiredEffectOutcome>),
-    DeadlineExceeded,
 }
 
 enum RecoveryWait {
@@ -1955,7 +2258,7 @@ async fn receive_effect_result_until<T>(
 
 struct ActiveEffectGuard {
     cancellation: RuntimeInventoryScanCancellation,
-    state: Arc<EffectLaneState>,
+    state: Arc<CoordinatorLaneState>,
     armed: bool,
 }
 
@@ -2052,7 +2355,8 @@ pub struct RuntimeSpineRunner {
     client: RuntimeSpineHttpClient,
     journal_lane: Option<JournalLane>,
     scan_lane: Option<ScanLane>,
-    effect_lane: Option<EffectLane>,
+    coordinator_lane: Option<CoordinatorLane>,
+    cat_effect_workers: Option<CatEffectWorkers>,
     effect_resource_owner: Option<Arc<dyn RuntimeEffectResourceOwner>>,
     current_process_scan_observation_id: Option<RandomId128>,
     current_process_node_global_process: Option<NodeGlobalManagedProcessAdmission>,
@@ -2061,6 +2365,10 @@ pub struct RuntimeSpineRunner {
     current_process_running_tail: Option<RunningTailAdmission>,
     effect_admission_open: bool,
     effect_admission: Option<RuntimeDesiredEffectAdmission>,
+    node_global_effect_gate: Option<Arc<NodeGlobalEffectGate>>,
+    node_global_effect_open: Option<Arc<AtomicBool>>,
+    effect_batch_closing: bool,
+    deferred_effect_decision: Option<DeferredEffectDecision>,
     pending_effects: VecDeque<DesiredRuntimeSpec>,
 }
 
@@ -2178,10 +2486,17 @@ impl RuntimeSpineRunner {
                 "effect resource owner requires the serialized Desired mutation lane",
             ));
         }
-        let effect_lane = effect
-            .map(|effect| {
-                EffectLane::start(effect, pre_scan_admission, recovery, resource_owner.clone())
-            })
+        let coordinator_lane = if pre_scan_admission.is_some() || recovery.is_some() {
+            Some(CoordinatorLane::start(
+                pre_scan_admission,
+                recovery,
+                resource_owner.clone(),
+            )?)
+        } else {
+            None
+        };
+        let cat_effect_workers = effect
+            .map(|effect| CatEffectWorkers::new(effect, MAX_CONCURRENT_CAT_EFFECT_WORKERS))
             .transpose()?;
         let journal_lane = JournalLane::start(state_directory.clone(), registered_session.clone())?;
         Ok(Self {
@@ -2190,7 +2505,8 @@ impl RuntimeSpineRunner {
             client,
             journal_lane: Some(journal_lane),
             scan_lane: Some(scan_lane),
-            effect_lane,
+            coordinator_lane,
+            cat_effect_workers,
             effect_resource_owner: resource_owner,
             current_process_scan_observation_id: None,
             current_process_node_global_process: None,
@@ -2199,6 +2515,10 @@ impl RuntimeSpineRunner {
             current_process_running_tail: None,
             effect_admission_open: false,
             effect_admission: None,
+            node_global_effect_gate: None,
+            node_global_effect_open: None,
+            effect_batch_closing: false,
+            deferred_effect_decision: None,
             pending_effects: VecDeque::new(),
         })
     }
@@ -2217,14 +2537,16 @@ impl RuntimeSpineRunner {
         // shutdown joins it before a successor runner establishes new
         // full-inventory admission.
         if self
-            .effect_lane
+            .coordinator_lane
             .as_ref()
-            .is_some_and(EffectLane::is_poisoned)
+            .is_some_and(CoordinatorLane::is_poisoned)
         {
             return Err(RuntimeSpineRunError::EffectLanePoisoned);
         }
-        if !self.pending_effects.is_empty() {
-            return self.run_next_effect(deadlines.effect_step).await;
+        if self.effect_batch_is_live() {
+            if let Some(step) = self.run_next_effect(deadlines.effect_step).await? {
+                return Ok(step);
+            }
         }
         let work = self.journal_lane()?.next().await?;
 
@@ -2237,12 +2559,12 @@ impl RuntimeSpineRunner {
                 self.current_process_kernel_nbd_pool = None;
                 self.current_process_running_tail = None;
                 if self
-                    .effect_lane
+                    .coordinator_lane
                     .as_ref()
-                    .is_some_and(EffectLane::has_pre_scan_admission)
+                    .is_some_and(CoordinatorLane::has_pre_scan_admission)
                 {
                     match self
-                        .effect_lane()?
+                        .coordinator_lane()?
                         .reconcile_pre_scan_admission(scan.clone(), deadlines.effect_step)
                         .await?
                     {
@@ -2256,12 +2578,12 @@ impl RuntimeSpineRunner {
                     }
                 }
                 if self
-                    .effect_lane
+                    .coordinator_lane
                     .as_ref()
-                    .is_some_and(EffectLane::has_recovery)
+                    .is_some_and(CoordinatorLane::has_recovery)
                 {
                     match self
-                        .effect_lane()?
+                        .coordinator_lane()?
                         .recover(
                             self.state_directory.clone(),
                             scan.clone(),
@@ -2304,8 +2626,8 @@ impl RuntimeSpineRunner {
                             // contract is corrupt, conflicting or foreign.
                             // The earlier endpoint-only latch may therefore
                             // no longer preserve any old route safely.
-                            if let Some(effect_lane) = &self.effect_lane {
-                                effect_lane.fail_close_all_admission();
+                            if let Some(coordinator_lane) = &self.coordinator_lane {
+                                coordinator_lane.fail_close_all_admission();
                             }
                             return Ok(RuntimeSpineRunStep::ScanUnavailable(error));
                         }
@@ -2323,8 +2645,8 @@ impl RuntimeSpineRunner {
                         unavailable_sources,
                     } => {
                         if unavailable_sources.is_empty() {
-                            if let Some(effect_lane) = &self.effect_lane {
-                                effect_lane.fail_close_all_admission();
+                            if let Some(coordinator_lane) = &self.coordinator_lane {
+                                coordinator_lane.fail_close_all_admission();
                             }
                             return Err(RuntimeSpineRunError::InvalidScan(
                                 "an incomplete scan has no unavailable source",
@@ -2424,111 +2746,280 @@ impl RuntimeSpineRunner {
             .ok_or_else(|| RuntimeSpineRunError::WorkerStopped("inventory scan".to_owned()))
     }
 
-    fn effect_lane(&self) -> Result<&EffectLane, RuntimeSpineRunError> {
-        self.effect_lane
+    fn coordinator_lane(&self) -> Result<&CoordinatorLane, RuntimeSpineRunError> {
+        self.coordinator_lane
             .as_ref()
             .ok_or_else(|| RuntimeSpineRunError::WorkerStopped("Desired effect".to_owned()))
     }
 
     fn take_workers(&mut self) -> RunnerWorkers {
+        if let Some(open) = &self.node_global_effect_open {
+            open.store(false, Ordering::Release);
+        }
         RunnerWorkers {
-            effect_lane: self.effect_lane.take(),
+            coordinator_lane: self.coordinator_lane.take(),
+            cat_effect_workers: self.cat_effect_workers.take(),
             scan_lane: self.scan_lane.take(),
             journal_lane: self.journal_lane.take(),
             effect_resource_owner: self.effect_resource_owner.take(),
         }
     }
 
+    fn effect_batch_is_live(&self) -> bool {
+        !self.pending_effects.is_empty()
+            || self.effect_batch_closing
+            || self
+                .cat_effect_workers
+                .as_ref()
+                .is_some_and(CatEffectWorkers::has_active)
+    }
+
     async fn run_next_effect(
         &mut self,
         deadline: Instant,
-    ) -> Result<RuntimeSpineRunStep, RuntimeSpineRunError> {
-        let desired = self
-            .pending_effects
-            .front()
-            .cloned()
-            .ok_or_else(|| RuntimeSpineRunError::WorkerStopped("Desired effect".to_owned()))?;
-        let cat_id = desired.cat_id.clone();
-        let wait = match self
-            .effect_lane()?
-            .apply(
-                self.state_directory.clone(),
-                desired,
-                self.effect_admission.clone(),
-                deadline,
-            )
-            .await
-        {
-            Ok(wait) => wait,
-            Err(error) => {
-                // A closed or poisoned worker cannot prove whether the queued
-                // effect linearized. Never preserve the old admission batch.
-                self.clear_effect_batch();
-                return Err(error);
-            }
-        };
-        match wait {
-            EffectWait::Finished(Ok(RuntimeDesiredEffectOutcome::Applied)) => {
-                self.pending_effects.pop_front();
-                if self.pending_effects.is_empty() {
-                    self.effect_admission = None;
-                    Ok(RuntimeSpineRunStep::EffectsApplied)
+    ) -> Result<Option<RuntimeSpineRunStep>, RuntimeSpineRunError> {
+        loop {
+            if self.pending_effects.is_empty()
+                && !self
+                    .cat_effect_workers
+                    .as_ref()
+                    .is_some_and(CatEffectWorkers::has_active)
+            {
+                if let Some(decision) = self.deferred_effect_decision.take() {
+                    self.finish_effect_batch();
+                    return Ok(Some(decision.into_run_step()));
+                }
+                let closed = self.effect_batch_closing;
+                self.finish_effect_batch();
+                return if closed {
+                    Ok(None)
                 } else {
-                    Ok(RuntimeSpineRunStep::EffectApplied { cat_id })
+                    Ok(Some(RuntimeSpineRunStep::EffectsApplied))
+                };
+            }
+
+            if !self.pending_effects.is_empty()
+                && self
+                    .effect_resource_owner
+                    .as_ref()
+                    .is_some_and(|owner| owner.has_pending())
+            {
+                let cat_id = self
+                    .pending_effects
+                    .front()
+                    .expect("nonempty Desired effect queue has a front")
+                    .cat_id
+                    .clone();
+                self.hard_close_effect_batch();
+                return Ok(Some(RuntimeSpineRunStep::EffectUnavailable {
+                    cat_id,
+                    error: anyhow::anyhow!("runtime effect resource owner retains pending work"),
+                }));
+            }
+
+            if !self.pending_effects.is_empty() && Instant::now() >= deadline {
+                let desired = self
+                    .pending_effects
+                    .pop_front()
+                    .expect("nonempty Desired effect queue has a front");
+                let cat_id = desired.cat_id;
+                self.require_refresh_after_cat_failure();
+                return Ok(Some(RuntimeSpineRunStep::EffectDeadlineExceeded { cat_id }));
+            }
+
+            let available_slots = self
+                .cat_effect_workers
+                .as_ref()
+                .ok_or_else(|| {
+                    RuntimeSpineRunError::WorkerStopped("per-Cat Desired effect".to_owned())
+                })?
+                .available_slots();
+            if available_slots > 0 && !self.pending_effects.is_empty() {
+                let gate = self
+                    .node_global_effect_gate
+                    .get_or_insert_with(|| Arc::new(NodeGlobalEffectGate::default()))
+                    .clone();
+                let open = self
+                    .node_global_effect_open
+                    .get_or_insert_with(|| Arc::new(AtomicBool::new(!self.effect_batch_closing)))
+                    .clone();
+                let state_directory = self.state_directory.clone();
+                let admission = self.effect_admission.clone();
+                for _ in 0..available_slots {
+                    let Some(desired) = self.pending_effects.pop_front() else {
+                        break;
+                    };
+                    self.cat_effect_workers
+                        .as_mut()
+                        .ok_or_else(|| {
+                            RuntimeSpineRunError::WorkerStopped("per-Cat Desired effect".to_owned())
+                        })?
+                        .dispatch(
+                            state_directory.clone(),
+                            desired,
+                            admission.clone(),
+                            Arc::clone(&gate),
+                            Arc::clone(&open),
+                            deadline,
+                        )?;
                 }
             }
-            EffectWait::Finished(Ok(RuntimeDesiredEffectOutcome::RetryExact)) => {
-                Ok(RuntimeSpineRunStep::EffectRetryExact { cat_id })
-            }
-            EffectWait::Finished(Ok(RuntimeDesiredEffectOutcome::RefreshInventory)) => {
-                self.clear_effect_batch();
-                Ok(RuntimeSpineRunStep::EffectRefreshInventory { cat_id })
-            }
-            EffectWait::Finished(Ok(RuntimeDesiredEffectOutcome::ReplanDesired)) => {
-                // Clear the in-memory admission before the fallible durable
-                // invalidation. If persistence itself fails, the runner stops
-                // without making the old batch runnable again.
-                self.clear_effect_batch();
-                self.journal_lane()?
-                    .invalidate_desired_after_effect_replan()
-                    .await?;
-                Ok(RuntimeSpineRunStep::EffectReplanDesired { cat_id })
-            }
-            EffectWait::Finished(Ok(RuntimeDesiredEffectOutcome::IdentityRepairRequired)) => {
-                self.clear_effect_batch();
-                Ok(RuntimeSpineRunStep::EffectIdentityRepairRequired { cat_id })
-            }
-            EffectWait::Finished(Ok(RuntimeDesiredEffectOutcome::SessionReplacementRequired)) => {
-                self.clear_effect_batch();
-                Ok(RuntimeSpineRunStep::EffectSessionReplacementRequired { cat_id })
-            }
-            EffectWait::Finished(Ok(RuntimeDesiredEffectOutcome::Stop(reason))) => {
-                self.clear_effect_batch();
-                Ok(RuntimeSpineRunStep::EffectStopped { cat_id, reason })
-            }
-            EffectWait::Finished(Err(error)) => {
-                // `anyhow::Error` carries no proof that the effect remained
-                // pre-linearization. Conservatively discard the entire old
-                // admission batch; the durable Desired journal now leads the
-                // next iteration through a fresh physical scan.
-                self.clear_effect_batch();
-                Ok(RuntimeSpineRunStep::EffectUnavailable { cat_id, error })
-            }
-            EffectWait::DeadlineExceeded => {
-                // The worker is cancelled and poisoned because its phase is
-                // unknown. Never replay this Cat or another Cat from the old
-                // accepted inventory. Shutdown/restart joins the late worker;
-                // the successor can establish a new full-scan admission.
-                self.clear_effect_batch();
-                Ok(RuntimeSpineRunStep::EffectDeadlineExceeded { cat_id })
+
+            let wait = self
+                .cat_effect_workers
+                .as_mut()
+                .ok_or_else(|| {
+                    RuntimeSpineRunError::WorkerStopped("per-Cat Desired effect".to_owned())
+                })?
+                .wait_next(deadline)
+                .await?;
+            match wait {
+                CatEffectWait::Finished { desired, result } => {
+                    if self
+                        .node_global_effect_open
+                        .as_ref()
+                        .is_some_and(|open| !open.load(Ordering::Acquire))
+                    {
+                        // A worker consumed the one-shot Node-global part of
+                        // this accepted full admission. Cat-local siblings
+                        // may finish, but the next coordinator phase is a
+                        // fresh full scan.
+                        self.effect_batch_closing = true;
+                    }
+                    let cat_id = desired.cat_id.clone();
+                    match result {
+                        Ok(RuntimeDesiredEffectOutcome::Applied) => {
+                            let drained = self.pending_effects.is_empty()
+                                && !self
+                                    .cat_effect_workers
+                                    .as_ref()
+                                    .is_some_and(CatEffectWorkers::has_active);
+                            if drained && !self.effect_batch_closing {
+                                self.finish_effect_batch();
+                                return Ok(Some(RuntimeSpineRunStep::EffectsApplied));
+                            }
+                            if drained {
+                                self.finish_effect_batch();
+                            }
+                            return Ok(Some(RuntimeSpineRunStep::EffectApplied { cat_id }));
+                        }
+                        Ok(RuntimeDesiredEffectOutcome::RetryExact) => {
+                            self.pending_effects.push_back(*desired);
+                            return Ok(Some(RuntimeSpineRunStep::EffectRetryExact { cat_id }));
+                        }
+                        Ok(RuntimeDesiredEffectOutcome::RefreshInventory) => {
+                            self.hard_close_effect_batch();
+                            return Ok(Some(RuntimeSpineRunStep::EffectRefreshInventory {
+                                cat_id,
+                            }));
+                        }
+                        Ok(RuntimeDesiredEffectOutcome::ReplanDesired) => {
+                            // Close the accepted batch before the fallible
+                            // durable invalidation. Sibling completions are
+                            // drained but can no longer publish an outcome.
+                            self.hard_close_effect_batch();
+                            self.journal_lane()?
+                                .invalidate_desired_after_effect_replan()
+                                .await?;
+                            return Ok(Some(RuntimeSpineRunStep::EffectReplanDesired { cat_id }));
+                        }
+                        Ok(RuntimeDesiredEffectOutcome::IdentityRepairRequired) => {
+                            self.hard_close_effect_batch();
+                            // Identity repair parks the production Node loop.
+                            // Defer that terminal action until every cancelled
+                            // sibling is joined so no late provider thread can
+                            // live forever beside the parked task.
+                            self.deferred_effect_decision =
+                                Some(DeferredEffectDecision::IdentityRepairRequired { cat_id });
+                        }
+                        Ok(RuntimeDesiredEffectOutcome::SessionReplacementRequired) => {
+                            self.hard_close_effect_batch();
+                            return Ok(Some(
+                                RuntimeSpineRunStep::EffectSessionReplacementRequired { cat_id },
+                            ));
+                        }
+                        Ok(RuntimeDesiredEffectOutcome::Stop(reason)) => {
+                            // Stop is scoped to this exact Cat. It must not
+                            // terminate or cancel independent Cat workers,
+                            // but the batch was not wholly Applied and must
+                            // return through a fresh accepted full scan.
+                            self.require_refresh_after_cat_failure();
+                            let drained = self.pending_effects.is_empty()
+                                && !self
+                                    .cat_effect_workers
+                                    .as_ref()
+                                    .is_some_and(CatEffectWorkers::has_active);
+                            if drained {
+                                self.finish_effect_batch();
+                            }
+                            return Ok(Some(RuntimeSpineRunStep::EffectStopped { cat_id, reason }));
+                        }
+                        Err(error) => {
+                            // The unknown phase withdraws only this Cat's
+                            // unit. Close Node-global use of the shared full
+                            // admission, while already admitted Cat-local
+                            // siblings retain their independent workers.
+                            self.require_refresh_after_cat_failure();
+                            return Ok(Some(RuntimeSpineRunStep::EffectUnavailable {
+                                cat_id,
+                                error,
+                            }));
+                        }
+                    }
+                }
+                CatEffectWait::DeadlineExceeded { cat_id } => {
+                    self.require_refresh_after_cat_failure();
+                    return Ok(Some(RuntimeSpineRunStep::EffectDeadlineExceeded { cat_id }));
+                }
+                CatEffectWait::AwaitingLateWorker { cat_id } => {
+                    return Ok(Some(RuntimeSpineRunStep::EffectDeadlineExceeded { cat_id }));
+                }
+                CatEffectWait::LateWorkerJoined { cat_id }
+                | CatEffectWait::Discarded { cat_id } => {
+                    let _ = cat_id;
+                    // A late or invalidated result carries no reusable phase
+                    // claim. Drain it, then either wait for siblings or let
+                    // the durable journal start the mandatory fresh scan.
+                }
             }
         }
     }
 
     fn clear_effect_batch(&mut self) {
+        self.hard_close_effect_batch();
+    }
+
+    fn require_refresh_after_cat_failure(&mut self) {
+        self.effect_admission_open = false;
+        self.effect_batch_closing = true;
+        if let Some(open) = &self.node_global_effect_open {
+            open.store(false, Ordering::Release);
+        }
+    }
+
+    fn hard_close_effect_batch(&mut self) {
         self.pending_effects.clear();
         self.effect_admission = None;
         self.effect_admission_open = false;
+        self.effect_batch_closing = true;
+        if let Some(open) = &self.node_global_effect_open {
+            open.store(false, Ordering::Release);
+        }
+        if let Some(workers) = &mut self.cat_effect_workers {
+            workers.cancel_all_and_discard();
+        }
+    }
+
+    fn finish_effect_batch(&mut self) {
+        self.pending_effects.clear();
+        self.effect_admission = None;
+        self.effect_admission_open = false;
+        if let Some(open) = &self.node_global_effect_open {
+            open.store(false, Ordering::Release);
+        }
+        self.node_global_effect_gate = None;
+        self.node_global_effect_open = None;
+        self.effect_batch_closing = false;
     }
 
     async fn send_desired(
@@ -2538,7 +3029,7 @@ impl RuntimeSpineRunner {
         match self.client.desired_read(request.bytes()).await? {
             RuntimeSpineAttempt::Accepted(accepted) => {
                 let desired_specs = accepted.value.desired_specs.clone();
-                if self.effect_lane.is_some() && self.effect_admission_open {
+                if self.cat_effect_workers.is_some() && self.effect_admission_open {
                     self.effect_admission
                         .as_mut()
                         .ok_or(RuntimeSpineRunError::InvalidScan(
@@ -2554,13 +3045,17 @@ impl RuntimeSpineRunner {
                 self.journal_lane()?
                     .accept_desired(accepted.value, accepted.bytes)
                     .await?;
-                if self.effect_lane.is_some() && self.effect_admission_open {
+                if self.cat_effect_workers.is_some() && self.effect_admission_open {
                     self.effect_admission_open = false;
                     self.pending_effects = desired_specs.into();
                     if self.pending_effects.is_empty() {
-                        self.effect_admission = None;
+                        self.finish_effect_batch();
                         Ok(RuntimeSpineRunStep::EffectsApplied)
                     } else {
+                        self.node_global_effect_gate =
+                            Some(Arc::new(NodeGlobalEffectGate::default()));
+                        self.node_global_effect_open = Some(Arc::new(AtomicBool::new(true)));
+                        self.effect_batch_closing = false;
                         Ok(RuntimeSpineRunStep::DesiredAccepted)
                     }
                 } else {
@@ -2633,6 +3128,10 @@ impl RuntimeSpineRunner {
                 if establishes_effect_admission {
                     self.effect_admission = admission;
                     self.effect_admission_open = true;
+                    self.node_global_effect_gate = None;
+                    self.node_global_effect_open = None;
+                    self.effect_batch_closing = false;
+                    self.deferred_effect_decision = None;
                     Ok(RuntimeSpineRunStep::ObservationAccepted { service_ready })
                 } else {
                     Ok(RuntimeSpineRunStep::ObservationReplayed)
@@ -2684,7 +3183,8 @@ impl Drop for RuntimeSpineRunner {
 }
 
 struct RunnerWorkers {
-    effect_lane: Option<EffectLane>,
+    coordinator_lane: Option<CoordinatorLane>,
+    cat_effect_workers: Option<CatEffectWorkers>,
     scan_lane: Option<ScanLane>,
     journal_lane: Option<JournalLane>,
     effect_resource_owner: Option<Arc<dyn RuntimeEffectResourceOwner>>,
@@ -2692,20 +3192,29 @@ struct RunnerWorkers {
 
 impl RunnerWorkers {
     fn shutdown_blocking(mut self) -> Result<(), RuntimeSpineRunError> {
-        if let Some(effect) = self.effect_lane.as_ref() {
-            effect.cancel_and_poison();
+        if let Some(workers) = self.cat_effect_workers.as_ref() {
+            workers.cancel_all();
+        }
+        if let Some(coordinator) = self.coordinator_lane.as_ref() {
+            coordinator.cancel_and_poison();
         }
         if let Some(scan) = self.scan_lane.as_ref() {
             scan.cancel_and_poison();
         }
-        let effect_result = self
-            .effect_lane
+        let cat_effect_result = self
+            .cat_effect_workers
             .as_mut()
-            .map_or(Ok(()), EffectLane::shutdown_blocking);
-        // EffectLane is the sole producer. Always attempt bounded cleanup only
-        // after its sender has closed and its worker has joined (or reported a
-        // join failure), before scanner/journal teardown can be reported as a
-        // clean runner shutdown.
+            .map_or(Ok(()), CatEffectWorkers::shutdown_blocking);
+        // Drop the producer implementation before asking its resource owner
+        // to prove that every late helper has been reaped.
+        self.cat_effect_workers.take();
+        let coordinator_result = self
+            .coordinator_lane
+            .as_mut()
+            .map_or(Ok(()), CoordinatorLane::shutdown_blocking);
+        // All Cat producers and the Node coordinator have now closed. Attempt
+        // bounded cleanup before scanner/journal teardown can be reported as
+        // a clean runner shutdown.
         let effect_resource_result = self.effect_resource_owner.as_ref().map_or(Ok(()), |owner| {
             let shutdown_once = || {
                 let deadline = Instant::now()
@@ -2745,16 +3254,20 @@ impl RunnerWorkers {
             .as_mut()
             .map_or(Ok(()), JournalLane::shutdown_blocking);
         match (
-            effect_result,
+            cat_effect_result,
+            coordinator_result,
             effect_resource_result,
             scan_result,
             journal_result,
         ) {
-            (Ok(()), Ok(()), Ok(()), Ok(())) => Ok(()),
-            (effect, effect_resource, scan, journal) => {
+            (Ok(()), Ok(()), Ok(()), Ok(()), Ok(())) => Ok(()),
+            (cat_effect, coordinator, effect_resource, scan, journal) => {
                 let mut failures = Vec::new();
-                if let Err(error) = effect {
-                    failures.push(format!("Desired effect: {error}"));
+                if let Err(error) = cat_effect {
+                    failures.push(format!("per-Cat Desired effect: {error}"));
+                }
+                if let Err(error) = coordinator {
+                    failures.push(format!("effect coordinator: {error}"));
                 }
                 if let Err(error) = effect_resource {
                     failures.push(format!("effect resource owner: {error}"));
@@ -3198,6 +3711,50 @@ mod tests {
         delay: Duration,
     }
 
+    struct BlockingRetryEffect {
+        slow_cat: Id,
+        slow_started: test_mpsc::SyncSender<()>,
+        slow_release: Mutex<test_mpsc::Receiver<()>>,
+        ready_cat: Id,
+        ready_started: test_mpsc::SyncSender<()>,
+    }
+
+    struct BlockingAppliedEffect {
+        slow_cat: Id,
+        slow_started: test_mpsc::SyncSender<()>,
+        slow_release: Mutex<test_mpsc::Receiver<()>>,
+        ready_cat: Id,
+        ready_started: test_mpsc::SyncSender<()>,
+    }
+
+    struct StopOneCatEffect {
+        stopped_cat: Id,
+    }
+
+    struct BoundedBlockingEffect {
+        started: test_mpsc::SyncSender<Id>,
+        release: Mutex<test_mpsc::Receiver<()>>,
+        active: AtomicUsize,
+        max_active: AtomicUsize,
+    }
+
+    struct GlobalGateEffect {
+        first_cat: Id,
+        first_entered: test_mpsc::SyncSender<()>,
+        first_release: Mutex<test_mpsc::Receiver<()>>,
+        second_allowed: Mutex<test_mpsc::Receiver<()>>,
+        first_reentries: AtomicUsize,
+        second_mutations: AtomicUsize,
+    }
+
+    struct IdentityAndBlockingSiblingEffect {
+        identity_cat: Id,
+        sibling_started: test_mpsc::SyncSender<()>,
+        identity_unblock: test_mpsc::SyncSender<()>,
+        identity_waits_for_sibling: Mutex<test_mpsc::Receiver<()>>,
+        sibling_release: Mutex<test_mpsc::Receiver<()>>,
+    }
+
     struct NeverLaunch {
         calls: AtomicUsize,
     }
@@ -3259,14 +3816,11 @@ mod tests {
 
     #[tokio::test]
     async fn typed_pre_scan_recovery_is_serialized_on_the_mutation_lane() {
-        let effect = Arc::new(CountingEffect {
-            calls: AtomicUsize::new(0),
-        });
         let recovery = Arc::new(SequencedRecovery {
             calls: AtomicUsize::new(0),
         });
         let recovery_port: Arc<dyn RuntimePreScanRecovery> = recovery.clone();
-        let mut lane = EffectLane::start(effect.clone(), None, Some(recovery_port), None).unwrap();
+        let mut lane = CoordinatorLane::start(None, Some(recovery_port), None).unwrap();
         let snapshot = decode_desired_read_snapshot(SNAPSHOT).unwrap();
         let coordinates = RuntimeSpineFullScan {
             session: snapshot.session.clone(),
@@ -3309,15 +3863,11 @@ mod tests {
             RecoveryWait::Finished(Ok(RuntimePreScanRecoveryOutcome::NoChange))
         ));
         assert_eq!(recovery.calls.load(Ordering::SeqCst), 2);
-        assert_eq!(effect.calls.load(Ordering::SeqCst), 0);
         lane.shutdown_blocking().unwrap();
     }
 
     #[tokio::test]
     async fn mandatory_pre_scan_admission_ignores_pending_resources_and_every_error_fails_closed() {
-        let effect = Arc::new(CountingEffect {
-            calls: AtomicUsize::new(0),
-        });
         let admission = Arc::new(TestPreScanAdmission {
             calls: AtomicUsize::new(0),
             fail_closes: AtomicUsize::new(0),
@@ -3327,7 +3877,7 @@ mod tests {
         let admission_port: Arc<dyn RuntimePreScanAdmission> = admission.clone();
         let owner_port: Arc<dyn RuntimeEffectResourceOwner> = owner.clone();
         let mut lane =
-            EffectLane::start(effect, Some(admission_port), None, Some(owner_port)).unwrap();
+            CoordinatorLane::start(Some(admission_port), None, Some(owner_port)).unwrap();
         let snapshot = decode_desired_read_snapshot(SNAPSHOT).unwrap();
         let coordinates = RuntimeSpineFullScan {
             session: snapshot.session.clone(),
@@ -3373,37 +3923,16 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn pending_effect_resource_blocks_apply_and_recovery_before_user_code() {
-        let effect = Arc::new(CountingEffect {
-            calls: AtomicUsize::new(0),
-        });
+    async fn pending_effect_resource_blocks_recovery_before_user_code() {
         let recovery = Arc::new(SequencedRecovery {
             calls: AtomicUsize::new(0),
         });
         let owner = Arc::new(TestEffectResourceOwner::new(true));
         let recovery_port: Arc<dyn RuntimePreScanRecovery> = recovery.clone();
         let owner_port: Arc<dyn RuntimeEffectResourceOwner> = owner.clone();
-        let mut lane =
-            EffectLane::start(effect.clone(), None, Some(recovery_port), Some(owner_port)).unwrap();
+        let mut lane = CoordinatorLane::start(None, Some(recovery_port), Some(owner_port)).unwrap();
         let root = tempfile::tempdir().unwrap();
         let deadline = Instant::now() + Duration::from_secs(2);
-        let EffectWait::Finished(Err(error)) = lane
-            .apply(
-                StateDirectory::unanchored(root.path().to_path_buf()),
-                desired_with_network(),
-                None,
-                deadline,
-            )
-            .await
-            .unwrap()
-        else {
-            panic!("pending owner did not close the Desired effect")
-        };
-        assert!(
-            error.to_string().contains("retains pending work"),
-            "{error:#}"
-        );
-
         let snapshot = decode_desired_read_snapshot(SNAPSHOT).unwrap();
         let coordinates = RuntimeSpineFullScan {
             session: snapshot.session.clone(),
@@ -3426,9 +3955,8 @@ mod tests {
             error.to_string().contains("retains pending work"),
             "{error:#}"
         );
-        assert_eq!(effect.calls.load(Ordering::SeqCst), 0);
         assert_eq!(recovery.calls.load(Ordering::SeqCst), 0);
-        assert_eq!(owner.polls.load(Ordering::SeqCst), 2);
+        assert_eq!(owner.polls.load(Ordering::SeqCst), 1);
         owner.pending.store(false, Ordering::SeqCst);
         lane.shutdown_blocking().unwrap();
     }
@@ -3444,17 +3972,17 @@ mod tests {
             effect_dropped: Some(Arc::clone(&effect_dropped)),
         });
         let owner_port: Arc<dyn RuntimeEffectResourceOwner> = owner.clone();
-        let lane = EffectLane::start(
+        let lane = CoordinatorLane::start(None, None, Some(owner_port.clone())).unwrap();
+        let workers = CatEffectWorkers::new(
             Arc::new(DropWitnessEffect {
                 dropped: Arc::clone(&effect_dropped),
             }),
-            None,
-            None,
-            Some(owner_port.clone()),
+            1,
         )
         .unwrap();
         RunnerWorkers {
-            effect_lane: Some(lane),
+            coordinator_lane: Some(lane),
+            cat_effect_workers: Some(workers),
             scan_lane: None,
             journal_lane: None,
             effect_resource_owner: Some(owner_port),
@@ -3473,7 +4001,8 @@ mod tests {
         });
         let failing_owner_port: Arc<dyn RuntimeEffectResourceOwner> = failing_owner.clone();
         let error = RunnerWorkers {
-            effect_lane: None,
+            coordinator_lane: None,
+            cat_effect_workers: None,
             scan_lane: None,
             journal_lane: None,
             effect_resource_owner: Some(failing_owner_port),
@@ -3528,6 +4057,123 @@ mod tests {
         }
     }
 
+    impl RuntimeDesiredEffect for BlockingRetryEffect {
+        fn apply(
+            &self,
+            context: RuntimeDesiredEffectContext,
+            desired: &DesiredRuntimeSpec,
+        ) -> anyhow::Result<RuntimeDesiredEffectOutcome> {
+            context.check_active()?;
+            if desired.cat_id == self.slow_cat {
+                self.slow_started.send(()).unwrap();
+                self.slow_release.lock().unwrap().recv().unwrap();
+                return Ok(RuntimeDesiredEffectOutcome::RetryExact);
+            }
+            anyhow::ensure!(desired.cat_id == self.ready_cat, "unexpected test Cat");
+            self.ready_started.send(()).unwrap();
+            Ok(RuntimeDesiredEffectOutcome::Applied)
+        }
+    }
+
+    impl RuntimeDesiredEffect for BlockingAppliedEffect {
+        fn apply(
+            &self,
+            context: RuntimeDesiredEffectContext,
+            desired: &DesiredRuntimeSpec,
+        ) -> anyhow::Result<RuntimeDesiredEffectOutcome> {
+            context.check_active()?;
+            if desired.cat_id == self.slow_cat {
+                self.slow_started.send(()).unwrap();
+                self.slow_release.lock().unwrap().recv().unwrap();
+                return Ok(RuntimeDesiredEffectOutcome::Applied);
+            }
+            anyhow::ensure!(desired.cat_id == self.ready_cat, "unexpected test Cat");
+            self.ready_started.send(()).unwrap();
+            Ok(RuntimeDesiredEffectOutcome::Applied)
+        }
+    }
+
+    impl RuntimeDesiredEffect for StopOneCatEffect {
+        fn apply(
+            &self,
+            context: RuntimeDesiredEffectContext,
+            desired: &DesiredRuntimeSpec,
+        ) -> anyhow::Result<RuntimeDesiredEffectOutcome> {
+            context.check_active()?;
+            if desired.cat_id == self.stopped_cat {
+                Ok(RuntimeDesiredEffectOutcome::Stop(
+                    RuntimeDesiredEffectStopReason::LocalContract,
+                ))
+            } else {
+                Ok(RuntimeDesiredEffectOutcome::Applied)
+            }
+        }
+    }
+
+    impl RuntimeDesiredEffect for BoundedBlockingEffect {
+        fn apply(
+            &self,
+            context: RuntimeDesiredEffectContext,
+            desired: &DesiredRuntimeSpec,
+        ) -> anyhow::Result<RuntimeDesiredEffectOutcome> {
+            context.check_active()?;
+            let active = self.active.fetch_add(1, Ordering::SeqCst) + 1;
+            self.max_active.fetch_max(active, Ordering::SeqCst);
+            self.started.send(desired.cat_id.clone()).unwrap();
+            self.release.lock().unwrap().recv().unwrap();
+            self.active.fetch_sub(1, Ordering::SeqCst);
+            Ok(RuntimeDesiredEffectOutcome::Applied)
+        }
+    }
+
+    impl RuntimeDesiredEffect for GlobalGateEffect {
+        fn apply(
+            &self,
+            context: RuntimeDesiredEffectContext,
+            desired: &DesiredRuntimeSpec,
+        ) -> anyhow::Result<RuntimeDesiredEffectOutcome> {
+            if desired.cat_id != self.first_cat {
+                self.second_allowed.lock().unwrap().recv().unwrap();
+            }
+            let _global = context.lock_node_global_effect()?;
+            if desired.cat_id == self.first_cat {
+                self.first_entered.send(()).unwrap();
+                self.first_release.lock().unwrap().recv().unwrap();
+                // A composite effect may pass through several independently
+                // typed Node-global adapters. Re-entry belongs to this same
+                // worker until the entire apply call returns.
+                let _reentered = context.lock_node_global_effect()?;
+                self.first_reentries.fetch_add(1, Ordering::SeqCst);
+                Ok(RuntimeDesiredEffectOutcome::RefreshInventory)
+            } else {
+                self.second_mutations.fetch_add(1, Ordering::SeqCst);
+                Ok(RuntimeDesiredEffectOutcome::RefreshInventory)
+            }
+        }
+    }
+
+    impl RuntimeDesiredEffect for IdentityAndBlockingSiblingEffect {
+        fn apply(
+            &self,
+            context: RuntimeDesiredEffectContext,
+            desired: &DesiredRuntimeSpec,
+        ) -> anyhow::Result<RuntimeDesiredEffectOutcome> {
+            context.check_active()?;
+            if desired.cat_id == self.identity_cat {
+                self.identity_waits_for_sibling
+                    .lock()
+                    .unwrap()
+                    .recv()
+                    .unwrap();
+                return Ok(RuntimeDesiredEffectOutcome::IdentityRepairRequired);
+            }
+            self.sibling_started.send(()).unwrap();
+            self.identity_unblock.send(()).unwrap();
+            self.sibling_release.lock().unwrap().recv().unwrap();
+            Ok(RuntimeDesiredEffectOutcome::Applied)
+        }
+    }
+
     fn desired_with_network() -> DesiredRuntimeSpec {
         let mut desired = DesiredRuntimeSpec {
             version: ContractVersion::V1,
@@ -3559,6 +4205,13 @@ mod tests {
             transition: RuntimeTransition::CancelAndDrain,
             spec_digest: Sha256Digest::from_bytes([0; 32]),
         };
+        desired.spec_digest = spec_digest(&desired).unwrap();
+        desired
+    }
+
+    fn desired_with_network_for_cat(cat_id: &str) -> DesiredRuntimeSpec {
+        let mut desired = desired_with_network();
+        desired.cat_id = Id::new(cat_id).unwrap();
         desired.spec_digest = spec_digest(&desired).unwrap();
         desired
     }
@@ -4080,7 +4733,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn timed_out_noncooperative_effect_blocks_a_successor_scan_until_shutdown() {
+    async fn timed_out_noncooperative_effect_blocks_a_successor_scan_without_node_poison() {
         let root = tempfile::tempdir().unwrap();
         let scanner = Arc::new(EmptyScanner {
             calls: AtomicUsize::new(0),
@@ -4109,12 +4762,10 @@ mod tests {
         assert!(runner.pending_effects.is_empty());
         assert_eq!(effect.calls.load(Ordering::SeqCst), 1);
 
-        assert!(matches!(
-            runner
-                .run_once_until(Instant::now() + Duration::from_secs(1))
-                .await,
-            Err(RuntimeSpineRunError::EffectLanePoisoned)
-        ));
+        assert!(runner
+            .run_once_until(Instant::now() + Duration::from_millis(20))
+            .await
+            .is_ok());
         assert_eq!(scanner.calls.load(Ordering::SeqCst), 0);
 
         tokio::time::timeout(Duration::from_secs(1), runner.shutdown())
@@ -4152,6 +4803,372 @@ mod tests {
         ));
         assert_eq!(runner.pending_effects.front(), Some(&desired));
         assert_eq!(effect.calls.load(Ordering::SeqCst), 1);
+        runner.shutdown().await.unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn retry_exact_slow_cat_does_not_block_a_ready_sibling_cat() {
+        let root = tempfile::tempdir().unwrap();
+        let slow = desired_with_network_for_cat("cat_slow");
+        let ready = desired_with_network_for_cat("cat_ready");
+        let (slow_started_tx, slow_started_rx) = test_mpsc::sync_channel(1);
+        let (slow_release_tx, slow_release_rx) = test_mpsc::sync_channel(1);
+        let (ready_started_tx, ready_started_rx) = test_mpsc::sync_channel(1);
+        let effect = Arc::new(BlockingRetryEffect {
+            slow_cat: slow.cat_id.clone(),
+            slow_started: slow_started_tx,
+            slow_release: Mutex::new(slow_release_rx),
+            ready_cat: ready.cat_id.clone(),
+            ready_started: ready_started_tx,
+        });
+        let mut runner = RuntimeSpineRunner::new_with_desired_effects(
+            StateDirectory::unanchored(root.path().to_path_buf()),
+            decode_agent_session(SESSION).unwrap(),
+            RuntimeSpineHttpClient::for_loopback_test("http://127.0.0.1:1/", signer()).unwrap(),
+            Arc::new(EmptyScanner {
+                calls: AtomicUsize::new(0),
+            }),
+            effect,
+        )
+        .unwrap();
+        runner.pending_effects.extend([slow, ready]);
+
+        let running = tokio::spawn(async move {
+            let step = runner
+                .run_once_until(Instant::now() + Duration::from_secs(5))
+                .await
+                .unwrap();
+            (runner, step)
+        });
+        tokio::task::spawn_blocking(move || {
+            slow_started_rx
+                .recv_timeout(Duration::from_secs(1))
+                .expect("slow Cat never entered its worker")
+        })
+        .await
+        .unwrap();
+        let ready_started_before_release = tokio::task::spawn_blocking(move || {
+            ready_started_rx
+                .recv_timeout(Duration::from_millis(100))
+                .is_ok()
+        })
+        .await
+        .unwrap();
+        slow_release_tx.send(()).unwrap();
+        let (runner, _step) = running.await.unwrap();
+
+        assert!(
+            ready_started_before_release,
+            "a slow RetryExact Cat serialized the independent ready Cat"
+        );
+        runner.shutdown().await.unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn one_cat_timeout_does_not_poison_the_node_or_cancel_a_ready_sibling() {
+        let root = tempfile::tempdir().unwrap();
+        let slow = desired_with_network_for_cat("cat_timeout");
+        let ready = desired_with_network_for_cat("cat_ready_after_timeout");
+        let (slow_started_tx, slow_started_rx) = test_mpsc::sync_channel(1);
+        let (slow_release_tx, slow_release_rx) = test_mpsc::sync_channel(1);
+        let (ready_started_tx, ready_started_rx) = test_mpsc::sync_channel(1);
+        let effect = Arc::new(BlockingAppliedEffect {
+            slow_cat: slow.cat_id.clone(),
+            slow_started: slow_started_tx,
+            slow_release: Mutex::new(slow_release_rx),
+            ready_cat: ready.cat_id.clone(),
+            ready_started: ready_started_tx,
+        });
+        let scanner = Arc::new(EmptyScanner {
+            calls: AtomicUsize::new(0),
+        });
+        let mut runner = RuntimeSpineRunner::new_with_desired_effects(
+            StateDirectory::unanchored(root.path().to_path_buf()),
+            decode_agent_session(SESSION).unwrap(),
+            RuntimeSpineHttpClient::for_loopback_test("http://127.0.0.1:1/", signer()).unwrap(),
+            scanner.clone(),
+            effect,
+        )
+        .unwrap();
+        runner.pending_effects.extend([slow.clone(), ready.clone()]);
+
+        assert!(matches!(
+            runner
+                .run_once_until(Instant::now() + Duration::from_secs(1))
+                .await
+                .unwrap(),
+            RuntimeSpineRunStep::EffectApplied { cat_id } if cat_id == ready.cat_id
+        ));
+        slow_started_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("slow Cat never entered its worker");
+        ready_started_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("ready sibling never ran independently");
+
+        assert!(matches!(
+            runner
+                .run_once_until(Instant::now() + Duration::from_millis(20))
+                .await
+                .unwrap(),
+            RuntimeSpineRunStep::EffectDeadlineExceeded { cat_id } if cat_id == slow.cat_id
+        ));
+        // The late physical phase still blocks a fresh Node-global scan, but
+        // the runner remains live instead of poisoning the whole effect lane.
+        assert!(matches!(
+            runner
+                .run_once_until(Instant::now() + Duration::from_millis(20))
+                .await
+                .unwrap(),
+            RuntimeSpineRunStep::EffectDeadlineExceeded { cat_id } if cat_id == slow.cat_id
+        ));
+        assert_eq!(scanner.calls.load(Ordering::SeqCst), 0);
+
+        slow_release_tx.send(()).unwrap();
+        runner.shutdown().await.unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn one_stopped_cat_does_not_cancel_an_applied_sibling() {
+        let root = tempfile::tempdir().unwrap();
+        let stopped = desired_with_network_for_cat("cat_stopped");
+        let ready = desired_with_network_for_cat("cat_ready_beside_stop");
+        let effect = Arc::new(StopOneCatEffect {
+            stopped_cat: stopped.cat_id.clone(),
+        });
+        let mut runner = RuntimeSpineRunner::new_with_desired_effects(
+            StateDirectory::unanchored(root.path().to_path_buf()),
+            decode_agent_session(SESSION).unwrap(),
+            RuntimeSpineHttpClient::for_loopback_test("http://127.0.0.1:1/", signer()).unwrap(),
+            Arc::new(EmptyScanner {
+                calls: AtomicUsize::new(0),
+            }),
+            effect,
+        )
+        .unwrap();
+        runner
+            .pending_effects
+            .extend([stopped.clone(), ready.clone()]);
+
+        let first = runner
+            .run_once_until(Instant::now() + Duration::from_secs(1))
+            .await
+            .unwrap();
+        let second = runner
+            .run_once_until(Instant::now() + Duration::from_secs(1))
+            .await
+            .unwrap();
+        assert!(
+            matches!(
+                (&first, &second),
+            (
+                RuntimeSpineRunStep::EffectStopped { cat_id, .. },
+                RuntimeSpineRunStep::EffectApplied { cat_id: ready_id }
+            ) if cat_id == &stopped.cat_id && ready_id == &ready.cat_id
+            ) || matches!(
+                (&first, &second),
+                (
+                    RuntimeSpineRunStep::EffectApplied { cat_id },
+                    RuntimeSpineRunStep::EffectStopped { cat_id: stopped_id, .. }
+                ) if cat_id == &ready.cat_id && stopped_id == &stopped.cat_id
+            )
+        );
+        runner.shutdown().await.unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn per_cat_workers_are_single_flight_and_globally_bounded() {
+        let root = tempfile::tempdir().unwrap();
+        let (started_tx, started_rx) = test_mpsc::sync_channel(16);
+        let (release_tx, release_rx) = test_mpsc::sync_channel(16);
+        let effect = Arc::new(BoundedBlockingEffect {
+            started: started_tx,
+            release: Mutex::new(release_rx),
+            active: AtomicUsize::new(0),
+            max_active: AtomicUsize::new(0),
+        });
+        let mut workers = CatEffectWorkers::new(effect.clone(), 2).unwrap();
+        let gate = Arc::new(NodeGlobalEffectGate::default());
+        let open = Arc::new(AtomicBool::new(true));
+        let first = desired_with_network_for_cat("cat_one");
+        let second = desired_with_network_for_cat("cat_two");
+        let overflow = desired_with_network_for_cat("cat_three");
+        let deadline = Instant::now() + Duration::from_secs(2);
+        workers
+            .dispatch(
+                StateDirectory::unanchored(root.path().to_path_buf()),
+                first.clone(),
+                None,
+                Arc::clone(&gate),
+                Arc::clone(&open),
+                deadline,
+            )
+            .unwrap();
+        assert!(matches!(
+            workers.dispatch(
+                StateDirectory::unanchored(root.path().to_path_buf()),
+                first,
+                None,
+                Arc::clone(&gate),
+                Arc::clone(&open),
+                deadline,
+            ),
+            Err(RuntimeSpineRunError::InvalidComposition(_))
+        ));
+        workers
+            .dispatch(
+                StateDirectory::unanchored(root.path().to_path_buf()),
+                second,
+                None,
+                Arc::clone(&gate),
+                Arc::clone(&open),
+                deadline,
+            )
+            .unwrap();
+        assert!(matches!(
+            workers.dispatch(
+                StateDirectory::unanchored(root.path().to_path_buf()),
+                overflow,
+                None,
+                gate,
+                open,
+                deadline,
+            ),
+            Err(RuntimeSpineRunError::EffectQueueFull)
+        ));
+        for _ in 0..2 {
+            started_rx
+                .recv_timeout(Duration::from_secs(1))
+                .expect("bounded worker never started");
+        }
+        assert_eq!(effect.max_active.load(Ordering::SeqCst), 2);
+        release_tx.send(()).unwrap();
+        release_tx.send(()).unwrap();
+        for _ in 0..2 {
+            assert!(matches!(
+                workers
+                    .wait_next(Instant::now() + Duration::from_secs(1))
+                    .await
+                    .unwrap(),
+                CatEffectWait::Finished { .. }
+            ));
+        }
+        workers.shutdown_blocking().unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn production_worker_limit_backpressures_the_ninth_cat() {
+        let root = tempfile::tempdir().unwrap();
+        let state = StateDirectory::unanchored(root.path().to_path_buf());
+        let (started_tx, started_rx) =
+            test_mpsc::sync_channel(MAX_CONCURRENT_CAT_EFFECT_WORKERS + 1);
+        let (release_tx, release_rx) =
+            test_mpsc::sync_channel(MAX_CONCURRENT_CAT_EFFECT_WORKERS + 1);
+        let effect = Arc::new(BoundedBlockingEffect {
+            started: started_tx,
+            release: Mutex::new(release_rx),
+            active: AtomicUsize::new(0),
+            max_active: AtomicUsize::new(0),
+        });
+        let mut workers =
+            CatEffectWorkers::new(effect.clone(), MAX_CONCURRENT_CAT_EFFECT_WORKERS).unwrap();
+        let gate = Arc::new(NodeGlobalEffectGate::default());
+        let open = Arc::new(AtomicBool::new(true));
+        let deadline = Instant::now() + Duration::from_secs(2);
+        for index in 0..MAX_CONCURRENT_CAT_EFFECT_WORKERS {
+            workers
+                .dispatch(
+                    state.clone(),
+                    desired_with_network_for_cat(&format!("cat_bounded_{index}")),
+                    None,
+                    Arc::clone(&gate),
+                    Arc::clone(&open),
+                    deadline,
+                )
+                .unwrap();
+        }
+        assert!(matches!(
+            workers.dispatch(
+                state,
+                desired_with_network_for_cat("cat_bounded_overflow"),
+                None,
+                gate,
+                open,
+                deadline,
+            ),
+            Err(RuntimeSpineRunError::EffectQueueFull)
+        ));
+        for _ in 0..MAX_CONCURRENT_CAT_EFFECT_WORKERS {
+            started_rx
+                .recv_timeout(Duration::from_secs(1))
+                .expect("production-bounded worker never started");
+        }
+        assert_eq!(
+            effect.max_active.load(Ordering::SeqCst),
+            MAX_CONCURRENT_CAT_EFFECT_WORKERS
+        );
+        for _ in 0..MAX_CONCURRENT_CAT_EFFECT_WORKERS {
+            release_tx.send(()).unwrap();
+        }
+        for _ in 0..MAX_CONCURRENT_CAT_EFFECT_WORKERS {
+            assert!(matches!(
+                workers
+                    .wait_next(Instant::now() + Duration::from_secs(1))
+                    .await
+                    .unwrap(),
+                CatEffectWait::Finished { .. }
+            ));
+        }
+        workers.shutdown_blocking().unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn accepted_full_node_global_authority_is_one_shot_across_cats() {
+        let root = tempfile::tempdir().unwrap();
+        let first = desired_with_network_for_cat("cat_global_first");
+        let second = desired_with_network_for_cat("cat_global_second");
+        let (first_entered_tx, first_entered_rx) = test_mpsc::sync_channel(1);
+        let (first_release_tx, first_release_rx) = test_mpsc::sync_channel(1);
+        let (second_allowed_tx, second_allowed_rx) = test_mpsc::sync_channel(1);
+        let effect = Arc::new(GlobalGateEffect {
+            first_cat: first.cat_id.clone(),
+            first_entered: first_entered_tx,
+            first_release: Mutex::new(first_release_rx),
+            second_allowed: Mutex::new(second_allowed_rx),
+            first_reentries: AtomicUsize::new(0),
+            second_mutations: AtomicUsize::new(0),
+        });
+        let mut runner = RuntimeSpineRunner::new_with_desired_effects(
+            StateDirectory::unanchored(root.path().to_path_buf()),
+            decode_agent_session(SESSION).unwrap(),
+            RuntimeSpineHttpClient::for_loopback_test("http://127.0.0.1:1/", signer()).unwrap(),
+            Arc::new(EmptyScanner {
+                calls: AtomicUsize::new(0),
+            }),
+            effect.clone(),
+        )
+        .unwrap();
+        runner.pending_effects.extend([first.clone(), second]);
+
+        let running = tokio::spawn(async move {
+            let step = runner
+                .run_once_until(Instant::now() + Duration::from_secs(2))
+                .await
+                .unwrap();
+            (runner, step)
+        });
+        first_entered_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("first global effect never acquired the gate");
+        second_allowed_tx.send(()).unwrap();
+        first_release_tx.send(()).unwrap();
+        let (runner, step) = running.await.unwrap();
+        assert!(matches!(
+            step,
+            RuntimeSpineRunStep::EffectRefreshInventory { cat_id } if cat_id == first.cat_id
+        ));
+        assert_eq!(effect.first_reentries.load(Ordering::SeqCst), 1);
+        assert_eq!(effect.second_mutations.load(Ordering::SeqCst), 0);
         runner.shutdown().await.unwrap();
     }
 
@@ -4639,6 +5656,58 @@ mod tests {
         assert_eq!(snapshot.desired_specs, vec![desired]);
     }
 
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn identity_repair_waits_until_every_cancelled_sibling_is_joined() {
+        let root = tempfile::tempdir().unwrap();
+        let identity = desired_with_network_for_cat("cat_identity_repair");
+        let sibling = desired_with_network_for_cat("cat_late_sibling");
+        let (sibling_started_tx, sibling_started_rx) = test_mpsc::sync_channel(1);
+        let (identity_unblock_tx, identity_wait_rx) = test_mpsc::sync_channel(1);
+        let (sibling_release_tx, sibling_release_rx) = test_mpsc::sync_channel(1);
+        let effect = Arc::new(IdentityAndBlockingSiblingEffect {
+            identity_cat: identity.cat_id.clone(),
+            sibling_started: sibling_started_tx,
+            identity_unblock: identity_unblock_tx,
+            identity_waits_for_sibling: Mutex::new(identity_wait_rx),
+            sibling_release: Mutex::new(sibling_release_rx),
+        });
+        let mut runner = RuntimeSpineRunner::new_with_desired_effects(
+            StateDirectory::unanchored(root.path().to_path_buf()),
+            decode_agent_session(SESSION).unwrap(),
+            RuntimeSpineHttpClient::for_loopback_test("http://127.0.0.1:1/", signer()).unwrap(),
+            Arc::new(EmptyScanner {
+                calls: AtomicUsize::new(0),
+            }),
+            effect,
+        )
+        .unwrap();
+        runner
+            .pending_effects
+            .extend([identity.clone(), sibling.clone()]);
+
+        assert!(matches!(
+            runner
+                .run_once_until(Instant::now() + Duration::from_millis(30))
+                .await
+                .unwrap(),
+            RuntimeSpineRunStep::EffectDeadlineExceeded { cat_id } if cat_id == sibling.cat_id
+        ));
+        sibling_started_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("identity-repair sibling never entered its worker");
+        sibling_release_tx.send(()).unwrap();
+
+        assert!(matches!(
+            runner
+                .run_once_until(Instant::now() + Duration::from_secs(1))
+                .await
+                .unwrap(),
+            RuntimeSpineRunStep::EffectIdentityRepairRequired { cat_id }
+                if cat_id == identity.cat_id
+        ));
+        runner.shutdown().await.unwrap();
+    }
+
     #[tokio::test]
     async fn hanging_production_ip_is_reaped_before_shutdown_releases_the_journal_flock() {
         let root = tempfile::tempdir().unwrap();
@@ -4741,11 +5810,14 @@ mod tests {
             ))
         ));
 
-        // Cancelling the in-flight wait must poison the lane and signal the
-        // exact active effect. Shutdown is then the oracle that the worker
-        // killed and reaped its child before releasing the journal flock.
+        // Cancelling the in-flight wait leaves only this exact Cat worker
+        // active. Shutdown is the oracle that it is cancelled and joined
+        // before the journal flock can be released.
         drop(effect_step);
-        assert!(runner.effect_lane().unwrap().is_poisoned());
+        assert!(runner
+            .cat_effect_workers
+            .as_ref()
+            .is_some_and(CatEffectWorkers::has_active));
         tokio::time::timeout(Duration::from_secs(3), runner.shutdown())
             .await
             .expect("hanging ip prevented runner shutdown from joining")

@@ -1272,6 +1272,16 @@ impl ServingBlockdStartEffect {
         let Some(runtime) = unique_runtime(&accepted.observation().runtimes, desired)? else {
             return Ok(None);
         };
+        if !matches!(
+            runtime.step,
+            ReconcileStep::PrepareDevice { .. } | ReconcileStep::PrepareNetwork { .. }
+        ) {
+            return Ok(None);
+        }
+        // This accepted-full process set is Node-global. Only one Cat may
+        // consume it as mutation authority; a sibling Refresh/timeout closes
+        // the batch before the next waiter can submit.
+        let _node_global_effect = context.lock_node_global_effect()?;
         let observed_devices = match &runtime.step {
             ReconcileStep::PrepareDevice { .. } => {
                 if !prepare_device_base_admission_is_exact(accepted, desired, runtime) {
@@ -1300,7 +1310,7 @@ impl ServingBlockdStartEffect {
                 }
                 Some(devices.as_slice())
             }
-            _ => return Ok(None),
+            _ => unreachable!("phase was classified before global admission"),
         };
 
         let cats_api::runtime_reconciliation::CheckpointEvidence::Valid {

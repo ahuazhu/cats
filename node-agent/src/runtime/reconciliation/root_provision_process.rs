@@ -1920,6 +1920,7 @@ where
     P: RootProvisionProcessRetirementPort + ?Sized,
 {
     context.check_active()?;
+    let _node_global_effect = context.lock_node_global_effect()?;
     let admission =
         accepted_full_proves_exact_process_absence(context, checkpoint_store, stored_checkpoint)?;
     let mut expectation = RootProvisionProcessExpectation::from_checkpoint(

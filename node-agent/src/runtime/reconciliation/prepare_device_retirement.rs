@@ -174,6 +174,7 @@ impl PrepareDeviceTargetRetirementEffect {
             Ok(expectation) => expectation,
             Err(_) => return Ok(Some(stop_local())),
         };
+        let _node_global_effect = context.lock_node_global_effect()?;
         let admission = match context.node_global_process() {
             Ok(admission) => admission,
             Err(_) => return Ok(Some(stop_local())),

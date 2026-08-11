@@ -227,6 +227,7 @@ impl StartRuntimeReservationEffect {
         let ReconcileStep::PrepareNetwork { network, devices } = &runtime.step else {
             return Ok(None);
         };
+        let _node_global_effect = context.lock_node_global_effect()?;
         if devices.is_empty() || !prepared_device_set_is_exact(desired, devices) {
             return Ok(Some(local_contract_stop()));
         }
@@ -583,6 +584,7 @@ impl StartRuntimePhysicalEffect {
         if !matches!(runtime.step, ReconcileStep::StartRuntime { .. }) {
             return Ok(None);
         }
+        let _node_global_effect = context.lock_node_global_effect()?;
         #[cfg(not(target_os = "linux"))]
         {
             let _ = (
