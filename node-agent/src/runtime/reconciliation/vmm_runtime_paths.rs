@@ -20,6 +20,8 @@ use std::sync::Arc;
 
 use anyhow::{Context as _, Result};
 #[cfg(target_os = "linux")]
+use cats_api::runtime_reconciliation::NodeBootId;
+#[cfg(target_os = "linux")]
 use cats_api::runtime_reconciliation::{
     checkpoint_content_digest, decode_runtime_checkpoint, encode_runtime_checkpoint,
     RUNTIME_CHECKPOINT_MAX_WIRE_BYTES,
@@ -32,8 +34,9 @@ use super::retained_runtime_launch::RetainedRuntimeLaunchAuthority;
 use super::vmm_launch_artifacts::VmmLaunchArtifactDescriptors;
 #[cfg(target_os = "linux")]
 use super::vmm_socket_namespace::{
-    scan_receipt_namespace_snapshot, ReceiptNamespaceSnapshot, RetainedManagedVmmSocketRoot,
-    VmmSocketOwnershipReceiptV1, VmmSocketReceiptStore,
+    current_kernel_node_boot_id, scan_receipt_namespace_snapshot, ReceiptNamespaceSnapshot,
+    RetainedManagedVmmSocketRoot, RetainedStaleVmmSocketReceipt,
+    StaleVmmReceiptRetirementAuthority, VmmSocketOwnershipReceiptV1, VmmSocketReceiptStore,
 };
 
 const CHECKPOINT_FD: i32 = 64;
@@ -317,6 +320,123 @@ impl RetainedManagedVmmLaunchRoot {
             )?,
         )))
     }
+
+    /// Retire one receipt-owned attempt from an earlier kernel boot. The
+    /// exclusive launch-root lock is acquired before every mutable namespace
+    /// is revalidated. Same-name current-boot socket replacements are never
+    /// removed, and the durable receipt is removed only after any exact launch
+    /// directory has been isolated and drained through its retained fd.
+    pub(crate) fn recover_stale_boot_receipt(
+        self: &Arc<Self>,
+        socket_root: &RetainedManagedVmmSocketRoot,
+        receipts: &VmmSocketReceiptStore,
+        checkpoint: &RuntimeCheckpoint,
+        candidate: RetainedStaleVmmSocketReceipt,
+        context: &dyn crate::runtime_spine::RuntimePhysicalReadContext,
+        inspect_fresh_global_absence: impl FnOnce(
+            &ManagedVmmLaunchNamespaceGuard,
+        ) -> Result<
+            super::vmm_process::ExactVmmProcessAbsenceProof,
+        >,
+    ) -> Result<bool> {
+        context.check_active()?;
+        let Some(namespace_guard) = self.try_lock_effect_namespace()? else {
+            return Ok(false);
+        };
+        // The callback is invoked only after the same EX launch-root flock
+        // held through cleanup. Production must perform the sealed global
+        // unit/cgroup/process/socket/file sweep here; a point process probe is
+        // not sufficient authority to retire a previous-boot receipt.
+        let absence = inspect_fresh_global_absence(&namespace_guard)?;
+        let authority = namespace_guard.bind_stale_boot_absence(
+            absence,
+            candidate.receipt(),
+            checkpoint,
+            context,
+        )?;
+        candidate.assert_current(receipts)?;
+        let current_boot_id = current_kernel_node_boot_id()?;
+        candidate.receipt().validate_stale_boot_against(
+            checkpoint,
+            receipts.state_directory(),
+            socket_root,
+            &current_boot_id,
+        )?;
+        socket_root.assert_stale_boot_attempt_absent(candidate.receipt())?;
+        if let Some(residue) = self.retain_stale_boot_launch_residue(
+            &authority,
+            checkpoint,
+            candidate.receipt(),
+            &current_boot_id,
+        )? {
+            residue.recover_stale_boot(&authority, checkpoint)?;
+        }
+        context.check_active()?;
+        candidate.assert_current(receipts)?;
+        socket_root.assert_stale_boot_attempt_absent(candidate.receipt())?;
+        candidate.retire(receipts, &authority)?;
+        context.check_active()?;
+        Ok(true)
+    }
+
+    fn retain_stale_boot_launch_residue(
+        self: &Arc<Self>,
+        authority: &GuardedStaleBootVmmLaunchAbsence<'_>,
+        checkpoint: &RuntimeCheckpoint,
+        receipt: &VmmSocketOwnershipReceiptV1,
+        current_boot_id: &NodeBootId,
+    ) -> Result<Option<Box<RetainedManagedVmmLaunchResidue>>> {
+        authority.assert_for(self, checkpoint)?;
+        self.assert_current()?;
+        let paths =
+            ManagedVmmLaunchFilePaths::paths_from_checkpoint(&self.state_directory, checkpoint)?;
+        receipt.validate_stale_boot_launch_paths(
+            checkpoint,
+            &self.state_directory,
+            &paths,
+            current_boot_id,
+        )?;
+        let public_name = launch_attempt_name(&paths)?;
+        let quarantine_name = quarantine_attempt_name(&public_name)?;
+        let public = open_launch_attempt(self, &public_name)?;
+        let quarantine = open_launch_attempt(self, &quarantine_name)?;
+        anyhow::ensure!(
+            public.is_none() || quarantine.is_none(),
+            "stale-boot VMM launch attempt has public and quarantine aliases"
+        );
+        let marker_bytes = receipt.encoded_bytes()?;
+        if let Some(directory) = public {
+            let names = launch_attempt_names(&directory)?;
+            if !names.contains(VMM_LAUNCH_OWNER_BASENAME) {
+                anyhow::ensure!(
+                    names.is_empty(),
+                    "unmarked stale-boot VMM launch attempt contains foreign leaves"
+                );
+                create_launch_owner_marker(&directory, &marker_bytes)?;
+                directory.sync_all()?;
+                authority.assert_for(self, checkpoint)?;
+            }
+            return Ok(Some(Box::new(RetainedManagedVmmLaunchResidue::new(
+                Arc::clone(self),
+                public_name,
+                quarantine_name,
+                directory,
+                marker_bytes,
+                LaunchResidueLocation::Public,
+            )?)));
+        }
+        if let Some(directory) = quarantine {
+            return Ok(Some(Box::new(RetainedManagedVmmLaunchResidue::new(
+                Arc::clone(self),
+                public_name,
+                quarantine_name,
+                directory,
+                marker_bytes,
+                LaunchResidueLocation::Quarantine,
+            )?)));
+        }
+        Ok(None)
+    }
 }
 
 #[cfg(target_os = "linux")]
@@ -365,6 +485,42 @@ impl ManagedVmmLaunchNamespaceGuard {
             absence,
         })
     }
+
+    /// A different kernel boot is a stronger absence boundary than a process
+    /// point scan for the receipt's old process: Linux cannot preserve that
+    /// process across the boot-ID change. The same EX namespace lock still
+    /// excludes every supported current-boot launcher while old durable
+    /// launch files and the receipt are quarantined.
+    pub(crate) fn bind_stale_boot_absence<'a>(
+        &'a self,
+        absence: super::vmm_process::ExactVmmProcessAbsenceProof,
+        receipt: &VmmSocketOwnershipReceiptV1,
+        checkpoint: &RuntimeCheckpoint,
+        context: &'a dyn crate::runtime_spine::RuntimePhysicalReadContext,
+    ) -> Result<GuardedStaleBootVmmLaunchAbsence<'a>> {
+        context.check_active()?;
+        self.assert_for(&self.root)?;
+        let current_boot_id = current_kernel_node_boot_id()?;
+        anyhow::ensure!(
+            receipt.node_boot_id() != &current_boot_id,
+            "VMM receipt belongs to the current kernel boot"
+        );
+        let retained = RetainedRuntimeLaunchAuthority::from_checkpoint(checkpoint)?;
+        anyhow::ensure!(
+            absence.matches_checkpoint(checkpoint)
+                && receipt.cat_id() == &checkpoint.cat_id
+                && receipt.runtime_incarnation() == &retained.identity().runtime_incarnation,
+            "stale-boot VMM absence or receipt names another retained launch"
+        );
+        Ok(GuardedStaleBootVmmLaunchAbsence {
+            guard: self,
+            absence,
+            checkpoint: checkpoint.clone(),
+            stale_boot_id: receipt.node_boot_id().clone(),
+            runtime_incarnation: receipt.runtime_incarnation().clone(),
+            context,
+        })
+    }
 }
 
 /// Non-cloneable effect-time absence authority whose lifetime cannot outlive
@@ -387,6 +543,57 @@ impl GuardedVmmLaunchAbsence<'_> {
         anyhow::ensure!(
             self.absence.matches_checkpoint(checkpoint),
             "guarded VMM absence names another checkpoint"
+        );
+        Ok(())
+    }
+}
+
+#[cfg(target_os = "linux")]
+pub(crate) struct GuardedStaleBootVmmLaunchAbsence<'a> {
+    guard: &'a ManagedVmmLaunchNamespaceGuard,
+    absence: super::vmm_process::ExactVmmProcessAbsenceProof,
+    checkpoint: RuntimeCheckpoint,
+    stale_boot_id: NodeBootId,
+    runtime_incarnation: RandomId128,
+    context: &'a dyn crate::runtime_spine::RuntimePhysicalReadContext,
+}
+
+#[cfg(target_os = "linux")]
+impl GuardedStaleBootVmmLaunchAbsence<'_> {
+    fn assert_for(
+        &self,
+        root: &Arc<RetainedManagedVmmLaunchRoot>,
+        checkpoint: &RuntimeCheckpoint,
+    ) -> Result<()> {
+        self.guard.assert_for(root)?;
+        self.context.check_active()?;
+        let retained = RetainedRuntimeLaunchAuthority::from_checkpoint(checkpoint)?;
+        anyhow::ensure!(
+            checkpoint == &self.checkpoint
+                && self.absence.matches_checkpoint(checkpoint)
+                && retained.identity().runtime_incarnation == self.runtime_incarnation
+                && current_kernel_node_boot_id()? != self.stale_boot_id,
+            "stale-boot VMM launch absence changed coordinate"
+        );
+        Ok(())
+    }
+}
+
+#[cfg(target_os = "linux")]
+impl super::vmm_socket_namespace::stale_receipt_retirement_sealed::Sealed
+    for GuardedStaleBootVmmLaunchAbsence<'_>
+{
+}
+
+#[cfg(target_os = "linux")]
+impl StaleVmmReceiptRetirementAuthority for GuardedStaleBootVmmLaunchAbsence<'_> {
+    fn assert_receipt_retirement(&self, receipt: &VmmSocketOwnershipReceiptV1) -> Result<()> {
+        self.assert_for(&self.guard.root, &self.checkpoint)?;
+        anyhow::ensure!(
+            receipt.node_boot_id() == &self.stale_boot_id
+                && receipt.runtime_incarnation() == &self.runtime_incarnation
+                && receipt.cat_id() == &self.checkpoint.cat_id,
+            "stale-boot VMM receipt changed recovery coordinate"
         );
         Ok(())
     }
@@ -596,6 +803,37 @@ pub(crate) struct RetainedManagedVmmLaunchResidue {
 }
 
 #[cfg(target_os = "linux")]
+trait VmmLaunchCleanupAuthority {
+    fn assert_cleanup_for(
+        &self,
+        root: &Arc<RetainedManagedVmmLaunchRoot>,
+        checkpoint: &RuntimeCheckpoint,
+    ) -> Result<()>;
+}
+
+#[cfg(target_os = "linux")]
+impl VmmLaunchCleanupAuthority for GuardedVmmLaunchAbsence<'_> {
+    fn assert_cleanup_for(
+        &self,
+        root: &Arc<RetainedManagedVmmLaunchRoot>,
+        checkpoint: &RuntimeCheckpoint,
+    ) -> Result<()> {
+        self.assert_for(root, checkpoint)
+    }
+}
+
+#[cfg(target_os = "linux")]
+impl VmmLaunchCleanupAuthority for GuardedStaleBootVmmLaunchAbsence<'_> {
+    fn assert_cleanup_for(
+        &self,
+        root: &Arc<RetainedManagedVmmLaunchRoot>,
+        checkpoint: &RuntimeCheckpoint,
+    ) -> Result<()> {
+        self.assert_for(root, checkpoint)
+    }
+}
+
+#[cfg(target_os = "linux")]
 impl RetainedManagedVmmLaunchResidue {
     fn new(
         root: Arc<RetainedManagedVmmLaunchRoot>,
@@ -648,6 +886,14 @@ impl RetainedManagedVmmLaunchResidue {
         self.recover_inner(authority, checkpoint, |_| Ok(()))
     }
 
+    pub(crate) fn recover_stale_boot(
+        self,
+        authority: &GuardedStaleBootVmmLaunchAbsence<'_>,
+        checkpoint: &RuntimeCheckpoint,
+    ) -> Result<()> {
+        self.recover_inner(authority, checkpoint, |_| Ok(()))
+    }
+
     #[cfg(test)]
     fn recover_with_boundaries(
         self,
@@ -660,11 +906,11 @@ impl RetainedManagedVmmLaunchResidue {
 
     fn recover_inner(
         mut self,
-        authority: &GuardedVmmLaunchAbsence<'_>,
+        authority: &impl VmmLaunchCleanupAuthority,
         checkpoint: &RuntimeCheckpoint,
         mut before_boundary: impl FnMut(LaunchCleanupBoundary) -> Result<()>,
     ) -> Result<()> {
-        authority.assert_for(&self.root, checkpoint)?;
+        authority.assert_cleanup_for(&self.root, checkpoint)?;
         self.assert_current()?;
         if self.location == LaunchResidueLocation::Public {
             before_boundary(LaunchCleanupBoundary::BeforeQuarantine)?;
@@ -713,7 +959,7 @@ impl RetainedManagedVmmLaunchResidue {
             };
             unlink_isolated_launch_leaf(&self.directory, leaf)?;
             self.directory.sync_all()?;
-            authority.assert_for(&self.root, checkpoint)?;
+            authority.assert_cleanup_for(&self.root, checkpoint)?;
         }
         before_boundary(LaunchCleanupBoundary::BeforeMarker)?;
         self.assert_cleanup_leaf(VMM_LAUNCH_OWNER_BASENAME)?;
@@ -726,7 +972,7 @@ impl RetainedManagedVmmLaunchResidue {
             launch_attempt_names(&self.directory)?.is_empty(),
             "quarantined VMM launch attempt did not become empty"
         );
-        authority.assert_for(&self.root, checkpoint)?;
+        authority.assert_cleanup_for(&self.root, checkpoint)?;
         before_boundary(LaunchCleanupBoundary::BeforeDirectory)?;
         let reopened = open_directory_at_name(&self.root.descriptor, &self.quarantine_name)?;
         anyhow::ensure!(
@@ -736,7 +982,7 @@ impl RetainedManagedVmmLaunchResidue {
         );
         remove_isolated_launch_directory(&self.root.descriptor, &self.quarantine_name)?;
         self.root.descriptor.sync_all()?;
-        authority.assert_for(&self.root, checkpoint)
+        authority.assert_cleanup_for(&self.root, checkpoint)
     }
 
     fn assert_cleanup_leaf(&self, name: &str) -> Result<()> {
@@ -2128,7 +2374,10 @@ mod tests {
     use super::*;
 
     #[cfg(target_os = "linux")]
-    use crate::runtime::reconciliation::{RetainedManagedVmmSocketRoot, VmmSocketReceiptStore};
+    use crate::runtime::reconciliation::{
+        vmm_socket_namespace::{current_kernel_node_boot_id, StaleVmmSocketReceiptScan},
+        RetainedManagedVmmSocketRoot, VmmSocketReceiptStore,
+    };
 
     fn start_runtime_checkpoint() -> RuntimeCheckpoint {
         decode_runtime_checkpoint(include_bytes!(concat!(
@@ -2459,6 +2708,7 @@ mod tests {
                 &checkpoint,
                 &state,
                 &socket_root,
+                current_kernel_node_boot_id().unwrap(),
                 RandomId128::new("bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb").unwrap(),
             )
             .unwrap();
@@ -2512,6 +2762,50 @@ mod tests {
                 .bind_fresh_absence(self.absence(), &self.checkpoint)
                 .unwrap();
             residue.recover(&authority, &self.checkpoint).unwrap();
+        }
+
+        fn publish_as_stale_boot(&mut self) {
+            let current = current_kernel_node_boot_id().unwrap();
+            let candidate = ["e".repeat(32), "f".repeat(32)]
+                .into_iter()
+                .map(|value| NodeBootId::new(value).unwrap())
+                .find(|value| value != &current)
+                .unwrap();
+            self.receipt.set_node_boot_id_for_test(candidate);
+            self.receipt_store.publish(&self.receipt).unwrap();
+        }
+
+        fn stale_candidate(&self) -> RetainedStaleVmmSocketReceipt {
+            match self
+                .receipt_store
+                .retain_one_stale_boot_receipt(
+                    &self.socket_root,
+                    &[&self.checkpoint],
+                    &scan_context(),
+                )
+                .unwrap()
+            {
+                StaleVmmSocketReceiptScan::Candidate(candidate) => *candidate,
+                StaleVmmSocketReceiptScan::Settled => panic!("stale receipt was not selected"),
+            }
+        }
+
+        fn recover_stale(&self) -> Result<bool> {
+            self.launch_root.recover_stale_boot_receipt(
+                &self.socket_root,
+                &self.receipt_store,
+                &self.checkpoint,
+                self.stale_candidate(),
+                &scan_context(),
+                |guard| {
+                    guard.assert_for(&self.launch_root)?;
+                    anyhow::ensure!(
+                        self.launch_root.try_lock_effect_namespace()?.is_none(),
+                        "fresh global absence callback ran without launch-root exclusion"
+                    );
+                    Ok(self.absence())
+                },
+            )
         }
     }
 
@@ -2705,6 +2999,147 @@ mod tests {
             ManagedVmmLaunchRootScan::Residue
         );
         assert!(foreign.is_dir());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn stale_boot_receipt_recovery_is_replayable_and_drains_exact_launch_residue() {
+        for tail in [
+            RunningTail::Format,
+            RunningTail::InstallGate,
+            RunningTail::Stable,
+        ] {
+            for with_residue in [false, true] {
+                let mut fixture = LaunchFixture::new();
+                fixture.checkpoint = running_tail_checkpoint(&fixture.checkpoint, tail);
+                fixture.publish_as_stale_boot();
+                let paths = ManagedVmmLaunchFilePaths::paths_from_checkpoint(
+                    fixture.launch_root.state_directory(),
+                    &fixture.checkpoint,
+                )
+                .unwrap();
+                if with_residue {
+                    std::fs::create_dir(paths.directory().as_str()).unwrap();
+                    std::fs::set_permissions(
+                        paths.directory().as_str(),
+                        std::os::unix::fs::PermissionsExt::from_mode(0o700),
+                    )
+                    .unwrap();
+                    let directory = open_launch_attempt(
+                        &fixture.launch_root,
+                        &launch_attempt_name(&paths).unwrap(),
+                    )
+                    .unwrap()
+                    .unwrap();
+                    create_launch_owner_marker(
+                        &directory,
+                        &fixture.receipt.encoded_bytes().unwrap(),
+                    )
+                    .unwrap();
+                    std::fs::OpenOptions::new()
+                        .write(true)
+                        .create_new(true)
+                        .mode(0o600)
+                        .open(paths.memory_file_path().as_str())
+                        .unwrap()
+                        .write_all(b"old-boot-partial-memory")
+                        .unwrap();
+                    directory.sync_all().unwrap();
+                }
+
+                assert!(fixture.recover_stale().unwrap());
+                assert!(!Path::new(paths.directory().as_str()).exists());
+                assert!(fixture
+                    .receipt_store
+                    .load(fixture.receipt.runtime_incarnation())
+                    .unwrap()
+                    .is_none());
+                assert!(matches!(
+                    fixture
+                        .receipt_store
+                        .retain_one_stale_boot_receipt(
+                            &fixture.socket_root,
+                            &[&fixture.checkpoint],
+                            &scan_context(),
+                        )
+                        .unwrap(),
+                    StaleVmmSocketReceiptScan::Settled
+                ));
+            }
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn stale_boot_recovery_preserves_current_socket_and_foreign_launch_replacements() {
+        let mut socket_replacement = LaunchFixture::new();
+        socket_replacement.publish_as_stale_boot();
+        let socket_paths = socket_replacement
+            .socket_root
+            .planner()
+            .paths_from_checkpoint(&socket_replacement.checkpoint)
+            .unwrap();
+        let public_socket_directory = socket_replacement.socket_root.planner().path().as_str();
+        let public_socket_directory =
+            Path::new(public_socket_directory).join(socket_paths.public_name());
+        std::fs::create_dir(&public_socket_directory).unwrap();
+        std::fs::set_permissions(
+            &public_socket_directory,
+            std::os::unix::fs::PermissionsExt::from_mode(0o700),
+        )
+        .unwrap();
+        assert!(socket_replacement.recover_stale().is_err());
+        assert!(public_socket_directory.is_dir());
+        assert!(socket_replacement
+            .receipt_store
+            .load(socket_replacement.receipt.runtime_incarnation())
+            .unwrap()
+            .is_some());
+
+        let mut launch_replacement = LaunchFixture::new();
+        launch_replacement.publish_as_stale_boot();
+        let paths = ManagedVmmLaunchFilePaths::paths_from_checkpoint(
+            launch_replacement.launch_root.state_directory(),
+            &launch_replacement.checkpoint,
+        )
+        .unwrap();
+        std::fs::create_dir(paths.directory().as_str()).unwrap();
+        std::fs::set_permissions(
+            paths.directory().as_str(),
+            std::os::unix::fs::PermissionsExt::from_mode(0o700),
+        )
+        .unwrap();
+        let foreign = Path::new(paths.directory().as_str()).join("foreign");
+        std::fs::write(&foreign, b"replacement").unwrap();
+        assert!(launch_replacement.recover_stale().is_err());
+        assert_eq!(std::fs::read(&foreign).unwrap(), b"replacement");
+        assert!(launch_replacement
+            .receipt_store
+            .load(launch_replacement.receipt.runtime_incarnation())
+            .unwrap()
+            .is_some());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn stale_boot_receipt_quarantine_crash_replays_to_removal() {
+        let mut fixture = LaunchFixture::new();
+        fixture.publish_as_stale_boot();
+        let namespace = fixture
+            .receipt_store
+            .state_directory()
+            .path()
+            .join(super::super::vmm_socket_namespace::VMM_SOCKET_RECEIPT_NAMESPACE);
+        let incarnation = fixture.receipt.runtime_incarnation().as_str();
+        std::fs::rename(
+            namespace.join(format!("vmm-{incarnation}.receipt.json")),
+            namespace.join(format!("q-vmm-{incarnation}.receipt.json")),
+        )
+        .unwrap();
+        std::fs::File::open(&namespace).unwrap().sync_all().unwrap();
+
+        assert!(fixture.recover_stale().unwrap());
+        assert!(std::fs::read_dir(namespace).unwrap().next().is_none());
     }
 
     #[cfg(target_os = "linux")]

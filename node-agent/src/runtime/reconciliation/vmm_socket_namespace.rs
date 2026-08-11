@@ -24,8 +24,8 @@ use anyhow::Context as _;
 #[cfg(test)]
 use cats_api::runtime_reconciliation::ReconcileStep;
 use cats_api::runtime_reconciliation::{
-    checkpoint_content_digest, Epoch, HostPath, Id, RandomId128, Revision, RuntimeCheckpoint,
-    Sha256Digest,
+    checkpoint_content_digest, Epoch, HostPath, Id, NodeBootId, RandomId128, Revision,
+    RuntimeCheckpoint, Sha256Digest,
 };
 use serde::{Deserialize, Serialize};
 
@@ -45,10 +45,21 @@ pub(crate) const VMM_VSOCK_SOCKET_BASENAME: &str = "vsock.sock";
 pub(crate) const VMM_SOCKET_RECEIPT_NAMESPACE: &str = "vmm-socket-receipts";
 pub(crate) const VMM_SOCKET_OWNER_BASENAME: &str = ".owner.v1.json";
 
-const VMM_SOCKET_RECEIPT_VERSION: u32 = 1;
+const VMM_SOCKET_RECEIPT_VERSION: u32 = 2;
 const VMM_SOCKET_RECEIPT_MAX_BYTES: usize = 16 * 1024;
 const VMM_SOCKET_LISTEN_BACKLOG: i32 = 128;
 pub(crate) const MANAGED_VMM_SOCKET_ROOT_ENTRY_LIMIT: usize = 3 * 1024;
+
+/// Read the same compact kernel boot coordinate used by Agent registration.
+/// A durable receipt may authorize a boot-local `/run` inode only while this
+/// value remains exact; a different value proves every process from the old
+/// receipt's kernel instance is gone.
+pub(crate) fn current_kernel_node_boot_id() -> anyhow::Result<NodeBootId> {
+    let text = std::fs::read_to_string("/proc/sys/kernel/random/boot_id")
+        .context("read kernel Node boot ID")?;
+    let compact = text.strip_suffix('\n').unwrap_or(&text).replace('-', "");
+    NodeBootId::new(compact).context("kernel Node boot ID is invalid")
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum ManagedVmmSocketRootScan {
@@ -244,6 +255,7 @@ impl ManagedVmmSocketPaths {
 #[serde(deny_unknown_fields)]
 pub(crate) struct VmmSocketOwnershipReceiptV1 {
     version: u32,
+    node_boot_id: NodeBootId,
     node_id: Id,
     cat_id: Id,
     desired_revision: Revision,
@@ -274,8 +286,13 @@ impl VmmSocketOwnershipReceiptV1 {
         checkpoint: &RuntimeCheckpoint,
         state_directory: &StateDirectory,
         managed_root: &RetainedManagedVmmSocketRoot,
+        node_boot_id: NodeBootId,
         creation_nonce: RandomId128,
     ) -> anyhow::Result<Self> {
+        anyhow::ensure!(
+            node_boot_id == current_kernel_node_boot_id()?,
+            "VMM socket receipt publication boot differs from the running kernel"
+        );
         let authority = RetainedRuntimeLaunchAuthority::from_start_runtime_checkpoint(checkpoint)?;
         let launch = authority.identity();
         let paths = managed_root
@@ -292,6 +309,7 @@ impl VmmSocketOwnershipReceiptV1 {
         );
         let receipt = Self {
             version: VMM_SOCKET_RECEIPT_VERSION,
+            node_boot_id,
             node_id: checkpoint.node_id.clone(),
             cat_id: checkpoint.cat_id.clone(),
             desired_revision: checkpoint.desired_revision,
@@ -331,6 +349,10 @@ impl VmmSocketOwnershipReceiptV1 {
             self.version == VMM_SOCKET_RECEIPT_VERSION,
             "unsupported VMM socket receipt version"
         );
+        anyhow::ensure!(
+            self.node_boot_id == current_kernel_node_boot_id()?,
+            "VMM socket ownership receipt belongs to another Node boot"
+        );
         let authority = RetainedRuntimeLaunchAuthority::from_checkpoint(checkpoint)?;
         let launch = authority.identity();
         let paths = managed_root.planner.paths_from_checkpoint(checkpoint)?;
@@ -360,6 +382,54 @@ impl VmmSocketOwnershipReceiptV1 {
                 && &self.serial_log_path == launch_file_paths.serial_log_path()
                 && &self.vmm_log_path == launch_file_paths.vmm_log_path(),
             "VMM socket ownership receipt is not checkpoint-exact"
+        );
+        Ok(paths)
+    }
+
+    /// Validate a receipt from a previous kernel boot without granting it
+    /// authority over the current boot-local socket-root inode. This is only
+    /// a recovery classification: ordinary launch/adoption paths must use
+    /// `validate_against`, which requires the current kernel boot and exact
+    /// root identity.
+    pub(crate) fn validate_stale_boot_against(
+        &self,
+        checkpoint: &RuntimeCheckpoint,
+        state_directory: &StateDirectory,
+        managed_root: &RetainedManagedVmmSocketRoot,
+        current_boot_id: &NodeBootId,
+    ) -> anyhow::Result<ManagedVmmSocketPaths> {
+        anyhow::ensure!(
+            self.version == VMM_SOCKET_RECEIPT_VERSION && &self.node_boot_id != current_boot_id,
+            "VMM socket receipt is not from a distinct supported Node boot"
+        );
+        let authority = RetainedRuntimeLaunchAuthority::from_checkpoint(checkpoint)?;
+        let launch = authority.identity();
+        let paths = managed_root.planner.paths_from_checkpoint(checkpoint)?;
+        let launch_file_paths =
+            ManagedVmmLaunchFilePaths::paths_from_checkpoint(state_directory, checkpoint)?;
+        anyhow::ensure!(
+            self.node_id == checkpoint.node_id
+                && self.cat_id == checkpoint.cat_id
+                && self.placement_epoch == checkpoint.placement_epoch
+                && self.runtime_launch_content_digest == authority.identity_content_digest()?
+                && self.original_checkpoint_digest_matches_if_current_start(checkpoint)?
+                && self.runtime_incarnation == launch.runtime_incarnation
+                && self.scope_id == launch.scope_id
+                && self.process_identity_token == launch.process_identity_token
+                && self.creation_nonce != launch.runtime_incarnation
+                && self.creation_nonce != launch.process_identity_token
+                && self.launcher_executable_path == launch.launcher_executable.path
+                && self.vmm_executable_path == launch.boot.vmm_executable.path
+                && &self.managed_root_path == paths.root()
+                && self.public_name == paths.public_name()
+                && self.staging_name == paths.staging_name()
+                && self.quarantine_name == paths.quarantine_name()
+                && &self.api_socket_path == paths.api_socket_path()
+                && &self.vsock_socket_path == paths.vsock_socket_path()
+                && &self.memory_file_path == launch_file_paths.memory_file_path()
+                && &self.serial_log_path == launch_file_paths.serial_log_path()
+                && &self.vmm_log_path == launch_file_paths.vmm_log_path(),
+            "stale-boot VMM socket ownership receipt is not retained-launch exact"
         );
         Ok(paths)
     }
@@ -397,6 +467,10 @@ impl VmmSocketOwnershipReceiptV1 {
         let authority = RetainedRuntimeLaunchAuthority::from_checkpoint(checkpoint)?;
         let launch = authority.identity();
         anyhow::ensure!(
+            self.node_boot_id == current_kernel_node_boot_id()?,
+            "VMM launch receipt belongs to another Node boot"
+        );
+        anyhow::ensure!(
             self.node_id == checkpoint.node_id
                 && self.cat_id == checkpoint.cat_id
                 && self.placement_epoch == checkpoint.placement_epoch
@@ -409,6 +483,36 @@ impl VmmSocketOwnershipReceiptV1 {
                 && ManagedVmmLaunchFilePaths::paths_from_checkpoint(state_directory, checkpoint)?
                     == *paths,
             "VMM launch receipt is not checkpoint-exact"
+        );
+        Ok(())
+    }
+
+    pub(crate) fn validate_stale_boot_launch_paths(
+        &self,
+        checkpoint: &RuntimeCheckpoint,
+        state_directory: &StateDirectory,
+        paths: &ManagedVmmLaunchFilePaths,
+        current_boot_id: &NodeBootId,
+    ) -> anyhow::Result<()> {
+        anyhow::ensure!(
+            self.version == VMM_SOCKET_RECEIPT_VERSION && &self.node_boot_id != current_boot_id,
+            "VMM launch receipt is not from a distinct supported Node boot"
+        );
+        let authority = RetainedRuntimeLaunchAuthority::from_checkpoint(checkpoint)?;
+        let launch = authority.identity();
+        anyhow::ensure!(
+            self.node_id == checkpoint.node_id
+                && self.cat_id == checkpoint.cat_id
+                && self.placement_epoch == checkpoint.placement_epoch
+                && self.runtime_launch_content_digest == authority.identity_content_digest()?
+                && self.original_checkpoint_digest_matches_if_current_start(checkpoint)?
+                && self.runtime_incarnation == launch.runtime_incarnation
+                && &self.memory_file_path == paths.memory_file_path()
+                && &self.serial_log_path == paths.serial_log_path()
+                && &self.vmm_log_path == paths.vmm_log_path()
+                && ManagedVmmLaunchFilePaths::paths_from_checkpoint(state_directory, checkpoint)?
+                    == *paths,
+            "stale-boot VMM launch receipt is not retained-launch exact"
         );
         Ok(())
     }
@@ -457,6 +561,15 @@ impl VmmSocketOwnershipReceiptV1 {
 
     pub(crate) fn original_placement_epoch(&self) -> Epoch {
         self.placement_epoch
+    }
+
+    pub(crate) fn node_boot_id(&self) -> &NodeBootId {
+        &self.node_boot_id
+    }
+
+    #[cfg(test)]
+    pub(crate) fn set_node_boot_id_for_test(&mut self, node_boot_id: NodeBootId) {
+        self.node_boot_id = node_boot_id;
     }
 
     pub(crate) fn encoded_bytes(&self) -> anyhow::Result<Vec<u8>> {
@@ -1054,6 +1167,162 @@ pub(crate) enum VmmSocketReceiptPublication {
     ExactReplay,
 }
 
+#[cfg(target_os = "linux")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum StaleReceiptLocation {
+    Public,
+    Quarantine,
+}
+
+/// One previous-boot receipt selected only after a bounded, stable, complete
+/// receipt-namespace enumeration. The retained bytes and inode identity must
+/// still be exact when the launch-root exclusion consumes this candidate.
+#[cfg(target_os = "linux")]
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) struct RetainedStaleVmmSocketReceipt {
+    receipt: VmmSocketOwnershipReceiptV1,
+    public_name: CString,
+    quarantine_name: CString,
+    snapshot: ScannedReceipt,
+    location: StaleReceiptLocation,
+}
+
+#[cfg(target_os = "linux")]
+impl RetainedStaleVmmSocketReceipt {
+    pub(crate) fn receipt(&self) -> &VmmSocketOwnershipReceiptV1 {
+        &self.receipt
+    }
+
+    pub(crate) fn cat_id(&self) -> &Id {
+        self.receipt.cat_id()
+    }
+
+    fn current_name(&self) -> &CStr {
+        match self.location {
+            StaleReceiptLocation::Public => &self.public_name,
+            StaleReceiptLocation::Quarantine => &self.quarantine_name,
+        }
+    }
+
+    pub(crate) fn assert_current(&self, store: &VmmSocketReceiptStore) -> anyhow::Result<()> {
+        store.assert_current()?;
+        let current = read_optional_receipt_snapshot(&store.directory, self.current_name())?
+            .context("stale-boot VMM receipt disappeared")?;
+        anyhow::ensure!(
+            current == self.snapshot && decode_receipt(&current.bytes)? == self.receipt,
+            "stale-boot VMM receipt changed identity or bytes"
+        );
+        Ok(())
+    }
+
+    pub(crate) fn retire(
+        self,
+        store: &VmmSocketReceiptStore,
+        authority: &impl StaleVmmReceiptRetirementAuthority,
+    ) -> anyhow::Result<()> {
+        self.retire_inner(store, authority, |_| Ok(()))
+    }
+
+    fn retire_inner(
+        mut self,
+        store: &VmmSocketReceiptStore,
+        authority: &impl StaleVmmReceiptRetirementAuthority,
+        mut before_point: impl FnMut(StaleReceiptRetirementPoint) -> anyhow::Result<()>,
+    ) -> anyhow::Result<()> {
+        authority.assert_receipt_retirement(&self.receipt)?;
+        self.assert_current(store)?;
+        if self.location == StaleReceiptLocation::Public {
+            before_point(StaleReceiptRetirementPoint::BeforeQuarantine)?;
+            anyhow::ensure!(
+                read_optional_receipt_snapshot(&store.directory, &self.quarantine_name)?.is_none(),
+                "stale VMM receipt quarantine already exists"
+            );
+            rename_at_no_replace(
+                &store.directory,
+                &self.public_name,
+                &store.directory,
+                &self.quarantine_name,
+            )
+            .context("quarantine stale-boot VMM receipt")?;
+            store
+                .directory
+                .sync_all()
+                .context("fsync stale VMM receipt quarantine")?;
+            let moved = read_optional_receipt_snapshot(&store.directory, &self.quarantine_name)?
+                .context("quarantined stale VMM receipt disappeared")?;
+            // `renameat2` updates ctime, so compare the stable object
+            // coordinate and exact bytes rather than the pre-rename ctime.
+            // The next retained snapshot includes the new ctime and therefore
+            // still detects any subsequent A/B/A content or inode swap.
+            if !moved.identity.same_file_object(self.snapshot.identity)
+                || moved.bytes != self.snapshot.bytes
+                || decode_receipt(&moved.bytes)? != self.receipt
+            {
+                // Preserve any replacement. A best-effort no-replace restore
+                // can only move the exact currently selected quarantine name;
+                // failure leaves all evidence isolated for the next scan.
+                let _ = rename_at_no_replace(
+                    &store.directory,
+                    &self.quarantine_name,
+                    &store.directory,
+                    &self.public_name,
+                );
+                let _ = store.directory.sync_all();
+                anyhow::bail!("stale VMM receipt changed during quarantine")
+            }
+            self.snapshot = moved;
+            self.location = StaleReceiptLocation::Quarantine;
+        }
+        authority.assert_receipt_retirement(&self.receipt)?;
+        self.assert_current(store)?;
+        before_point(StaleReceiptRetirementPoint::AfterQuarantine)?;
+        before_point(StaleReceiptRetirementPoint::BeforeRemoval)?;
+        self.assert_current(store)?;
+        unlink_at(&store.directory, &self.quarantine_name, 0)
+            .context("remove isolated stale-boot VMM receipt")?;
+        store
+            .directory
+            .sync_all()
+            .context("fsync stale VMM receipt removal")?;
+        authority.assert_receipt_retirement(&self.receipt)?;
+        store.assert_current()
+    }
+}
+
+#[cfg(target_os = "linux")]
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum StaleVmmSocketReceiptScan {
+    Settled,
+    Candidate(Box<RetainedStaleVmmSocketReceipt>),
+}
+
+#[cfg(target_os = "linux")]
+pub(crate) mod stale_receipt_retirement_sealed {
+    pub(crate) trait Sealed {}
+}
+
+/// Only the launch-root module may implement this proof. Its implementation
+/// owns the same exclusive namespace flock used by every supported physical
+/// submit/launcher and proves that the receipt belongs to an older kernel
+/// boot before any durable name is removed.
+#[cfg(target_os = "linux")]
+pub(crate) trait StaleVmmReceiptRetirementAuthority:
+    stale_receipt_retirement_sealed::Sealed
+{
+    fn assert_receipt_retirement(
+        &self,
+        receipt: &VmmSocketOwnershipReceiptV1,
+    ) -> anyhow::Result<()>;
+}
+
+#[cfg(target_os = "linux")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum StaleReceiptRetirementPoint {
+    BeforeQuarantine,
+    AfterQuarantine,
+    BeforeRemoval,
+}
+
 /// Durable receipt store under the identity-selected Node state directory.
 /// The namespace itself is provisioned at Node installation/startup, before
 /// any per-Cat attempt.  `open_existing` never creates it.
@@ -1117,6 +1386,55 @@ impl VmmSocketReceiptStore {
         incarnation: &RandomId128,
     ) -> anyhow::Result<Option<VmmSocketOwnershipReceiptV1>> {
         self.load_inner(incarnation, || Ok(()))
+    }
+
+    /// Select at most one previous-kernel-boot receipt after two identical,
+    /// complete descriptor-relative namespace snapshots. Missing expected
+    /// receipts are valid; every present public or recovery-quarantine name
+    /// must map uniquely to a current retained launch checkpoint.
+    #[cfg(target_os = "linux")]
+    pub(crate) fn retain_one_stale_boot_receipt(
+        &self,
+        root: &RetainedManagedVmmSocketRoot,
+        expected_checkpoints: &[&RuntimeCheckpoint],
+        context: &dyn crate::runtime_spine::RuntimePhysicalReadContext,
+    ) -> anyhow::Result<StaleVmmSocketReceiptScan> {
+        context.check_active()?;
+        self.assert_current()?;
+        root.assert_current()?;
+        anyhow::ensure!(
+            expected_checkpoints.len() <= 1024,
+            "stale-boot VMM receipt scan exceeds the checkpoint bound"
+        );
+        let current_boot_id = current_kernel_node_boot_id()?;
+        let first = scan_boot_receipt_namespace(
+            self,
+            root,
+            expected_checkpoints,
+            &current_boot_id,
+            context,
+        )?;
+        let second = scan_boot_receipt_namespace(
+            self,
+            root,
+            expected_checkpoints,
+            &current_boot_id,
+            context,
+        )?;
+        anyhow::ensure!(
+            first == second,
+            "VMM receipt namespace changed across stale-boot classification"
+        );
+        self.assert_current()?;
+        root.assert_current()?;
+        context.check_active()?;
+        Ok(first
+            .stale
+            .into_iter()
+            .next()
+            .map_or(StaleVmmSocketReceiptScan::Settled, |candidate| {
+                StaleVmmSocketReceiptScan::Candidate(Box::new(candidate))
+            }))
     }
 
     fn load_inner(
@@ -1226,6 +1544,112 @@ impl VmmSocketReceiptStore {
         );
         Self::open_existing(state_directory)
     }
+}
+
+#[cfg(target_os = "linux")]
+#[derive(Debug, PartialEq, Eq)]
+struct BootReceiptNamespaceSnapshot {
+    entries: std::collections::BTreeMap<String, ScannedReceipt>,
+    stale: Vec<RetainedStaleVmmSocketReceipt>,
+}
+
+#[cfg(target_os = "linux")]
+fn scan_boot_receipt_namespace(
+    store: &VmmSocketReceiptStore,
+    root: &RetainedManagedVmmSocketRoot,
+    expected_checkpoints: &[&RuntimeCheckpoint],
+    current_boot_id: &NodeBootId,
+    context: &dyn crate::runtime_spine::RuntimePhysicalReadContext,
+) -> anyhow::Result<BootReceiptNamespaceSnapshot> {
+    context.check_active()?;
+    let mut expected = std::collections::BTreeMap::new();
+    for checkpoint in expected_checkpoints {
+        let authority = RetainedRuntimeLaunchAuthority::from_checkpoint(checkpoint)?;
+        let public = receipt_file_name(&authority.identity().runtime_incarnation)?;
+        let quarantine =
+            stale_receipt_quarantine_file_name(&authority.identity().runtime_incarnation)?;
+        let public = public
+            .into_string()
+            .map_err(|_| anyhow::anyhow!("VMM receipt filename is not UTF-8"))?;
+        let quarantine = quarantine
+            .into_string()
+            .map_err(|_| anyhow::anyhow!("VMM receipt quarantine filename is not UTF-8"))?;
+        anyhow::ensure!(
+            expected
+                .insert(public, (*checkpoint, StaleReceiptLocation::Public))
+                .is_none()
+                && expected
+                    .insert(quarantine, (*checkpoint, StaleReceiptLocation::Quarantine),)
+                    .is_none(),
+            "VMM receipt recovery names duplicate retained identities"
+        );
+    }
+
+    let entries = std::fs::read_dir(format!("/proc/self/fd/{}", store.directory.as_raw_fd()))
+        .context("enumerate VMM receipt namespace for boot recovery")?;
+    let mut snapshot = std::collections::BTreeMap::new();
+    for entry in entries {
+        context.check_active()?;
+        let entry = entry.context("read VMM receipt namespace entry for boot recovery")?;
+        let name = entry
+            .file_name()
+            .into_string()
+            .map_err(|_| anyhow::anyhow!("VMM receipt recovery name is not UTF-8"))?;
+        anyhow::ensure!(
+            snapshot.len() < 1024 && !snapshot.contains_key(&name),
+            "VMM receipt recovery namespace is duplicate or over bound"
+        );
+        anyhow::ensure!(
+            expected.contains_key(&name),
+            "VMM receipt recovery found an unattributable name"
+        );
+        let name_c = CString::new(name.as_bytes())?;
+        let scanned = read_optional_receipt_snapshot(&store.directory, &name_c)?
+            .context("enumerated VMM receipt disappeared during boot recovery")?;
+        snapshot.insert(name, scanned);
+    }
+
+    let mut stale = Vec::new();
+    let mut seen_incarnations = std::collections::BTreeSet::new();
+    for (name, scanned) in &snapshot {
+        let (checkpoint, location) = expected
+            .get(name)
+            .expect("snapshot names were checked against expected names");
+        let receipt = decode_receipt(&scanned.bytes)?;
+        anyhow::ensure!(
+            seen_incarnations.insert(receipt.runtime_incarnation.clone()),
+            "VMM receipt recovery found public and quarantine aliases"
+        );
+        if receipt.node_boot_id() == current_boot_id {
+            anyhow::ensure!(
+                *location == StaleReceiptLocation::Public,
+                "current-boot VMM receipt is stranded in recovery quarantine"
+            );
+            receipt.validate_against(checkpoint, store.state_directory(), root)?;
+            continue;
+        }
+        receipt.validate_stale_boot_against(
+            checkpoint,
+            store.state_directory(),
+            root,
+            current_boot_id,
+        )?;
+        let public_name = receipt_file_name(receipt.runtime_incarnation())?;
+        let quarantine_name = stale_receipt_quarantine_file_name(receipt.runtime_incarnation())?;
+        stale.push(RetainedStaleVmmSocketReceipt {
+            receipt,
+            public_name,
+            quarantine_name,
+            snapshot: scanned.clone(),
+            location: *location,
+        });
+    }
+    store.assert_current()?;
+    context.check_active()?;
+    Ok(BootReceiptNamespaceSnapshot {
+        entries: snapshot,
+        stale,
+    })
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1344,6 +1768,35 @@ enum NamespacePreparationPoint {
 
 #[cfg(target_os = "linux")]
 impl RetainedManagedVmmSocketRoot {
+    /// A previous kernel boot cannot leave a live Unix socket inode in the
+    /// newly-created `/run` namespace. Never delete a same-name current-boot
+    /// replacement: stale receipt retirement is allowed only while all three
+    /// deterministic attempt names are absent from the current root.
+    pub(crate) fn assert_stale_boot_attempt_absent(
+        &self,
+        receipt: &VmmSocketOwnershipReceiptV1,
+    ) -> anyhow::Result<()> {
+        self.assert_current()?;
+        let (expected_user, expected_group) = self.owner();
+        for name in [
+            &receipt.public_name,
+            &receipt.staging_name,
+            &receipt.quarantine_name,
+        ] {
+            anyhow::ensure!(
+                open_owned_attempt_directory(
+                    &self.descriptor,
+                    name,
+                    expected_user,
+                    expected_group,
+                )?
+                .is_none(),
+                "current boot contains a same-name VMM socket attempt"
+            );
+        }
+        self.assert_current()
+    }
+
     /// Recover or prepare one exact-owned public directory and pre-bound API
     /// listener.  The durable receipt must already exist.  This method never
     /// creates the installed root or receipt namespace and never interprets a
@@ -2246,6 +2699,12 @@ fn receipt_file_name(incarnation: &RandomId128) -> anyhow::Result<CString> {
         .context("VMM socket receipt filename contains NUL")
 }
 
+#[cfg(target_os = "linux")]
+fn stale_receipt_quarantine_file_name(incarnation: &RandomId128) -> anyhow::Result<CString> {
+    CString::new(format!("q-vmm-{}.receipt.json", incarnation.as_str()))
+        .context("VMM stale receipt quarantine filename contains NUL")
+}
+
 fn read_optional_receipt(directory: &File, name: &CStr) -> anyhow::Result<Option<Vec<u8>>> {
     Ok(read_optional_receipt_snapshot(directory, name)?.map(|scanned| scanned.bytes))
 }
@@ -2473,6 +2932,12 @@ struct StableFileIdentity {
     changed_nanoseconds: i64,
 }
 
+impl StableFileIdentity {
+    fn same_file_object(self, other: Self) -> bool {
+        self.device == other.device && self.inode == other.inode
+    }
+}
+
 fn stable_file_identity(metadata: &std::fs::Metadata) -> StableFileIdentity {
     StableFileIdentity {
         device: metadata.dev(),
@@ -2599,6 +3064,32 @@ mod tests {
 
     fn creation_nonce() -> RandomId128 {
         RandomId128::new("bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb").unwrap()
+    }
+
+    #[cfg(target_os = "linux")]
+    struct TestStaleReceiptRetirementAuthority;
+
+    #[cfg(target_os = "linux")]
+    impl stale_receipt_retirement_sealed::Sealed for TestStaleReceiptRetirementAuthority {}
+
+    #[cfg(target_os = "linux")]
+    impl StaleVmmReceiptRetirementAuthority for TestStaleReceiptRetirementAuthority {
+        fn assert_receipt_retirement(
+            &self,
+            _receipt: &VmmSocketOwnershipReceiptV1,
+        ) -> anyhow::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    fn distinct_test_boot_id() -> NodeBootId {
+        let current = current_kernel_node_boot_id().unwrap();
+        ["e".repeat(32), "f".repeat(32)]
+            .into_iter()
+            .map(|value| NodeBootId::new(value).unwrap())
+            .find(|value| value != &current)
+            .unwrap()
     }
 
     #[cfg(target_os = "linux")]
@@ -2849,6 +3340,7 @@ mod tests {
             &checkpoint,
             &store.state_directory,
             &managed_root,
+            current_kernel_node_boot_id().unwrap(),
             creation_nonce(),
         )
         .unwrap();
@@ -2859,6 +3351,14 @@ mod tests {
     #[test]
     fn ownership_receipt_is_canonical_checkpoint_exact_and_no_replace() {
         let (_temporary, managed_root, checkpoint, store, receipt) = receipt_fixture();
+        assert!(VmmSocketOwnershipReceiptV1::from_checkpoint(
+            &checkpoint,
+            &store.state_directory,
+            &managed_root,
+            distinct_test_boot_id(),
+            creation_nonce(),
+        )
+        .is_err());
         assert_eq!(
             store.publish(&receipt).unwrap(),
             VmmSocketReceiptPublication::Published
@@ -3098,6 +3598,54 @@ mod tests {
                 assert!(store.publish(&receipt).is_err());
                 assert_eq!(std::fs::read(&path).unwrap(), b"foreign");
             }
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn stale_receipt_retirement_preserves_replacements_at_every_cleanup_boundary() {
+        for replacement_point in [
+            StaleReceiptRetirementPoint::BeforeQuarantine,
+            StaleReceiptRetirementPoint::AfterQuarantine,
+            StaleReceiptRetirementPoint::BeforeRemoval,
+        ] {
+            let (temporary, root, checkpoint, store, mut receipt) = receipt_fixture();
+            receipt.set_node_boot_id_for_test(distinct_test_boot_id());
+            store.publish(&receipt).unwrap();
+            let candidate = match store
+                .retain_one_stale_boot_receipt(&root, &[&checkpoint], &scan_context())
+                .unwrap()
+            {
+                StaleVmmSocketReceiptScan::Candidate(candidate) => *candidate,
+                StaleVmmSocketReceiptScan::Settled => panic!("stale receipt was not selected"),
+            };
+            let incarnation = receipt.runtime_incarnation().as_str();
+            let namespace = receipt_namespace_path(&temporary);
+            let replacement = if replacement_point == StaleReceiptRetirementPoint::BeforeQuarantine
+            {
+                namespace.join(format!("vmm-{incarnation}.receipt.json"))
+            } else {
+                namespace.join(format!("q-vmm-{incarnation}.receipt.json"))
+            };
+            let retained = namespace.join(format!("retained-{incarnation}.receipt.json"));
+            let mut replaced = false;
+            let result =
+                candidate.retire_inner(&store, &TestStaleReceiptRetirementAuthority, |point| {
+                    if point == replacement_point && !replaced {
+                        std::fs::rename(&replacement, &retained)?;
+                        write_foreign(&replacement, b"foreign-replacement");
+                        store.directory.sync_all()?;
+                        replaced = true;
+                    }
+                    Ok(())
+                });
+            assert!(result.is_err());
+            assert!(replaced);
+            assert_eq!(std::fs::read(&replacement).unwrap(), b"foreign-replacement");
+            assert_eq!(
+                std::fs::read(&retained).unwrap(),
+                receipt.encoded_bytes().unwrap()
+            );
         }
     }
 

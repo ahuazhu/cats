@@ -3875,15 +3875,17 @@ mod tests {
     use std::sync::Arc;
     use std::time::{Duration, Instant};
 
+    #[cfg(not(target_os = "linux"))]
+    use cats_api::runtime_reconciliation::NodeBootId;
     use cats_api::runtime_reconciliation::{
         decode_runtime_checkpoint, spec_digest, AdmissionInventoryAttestation, AgentSession,
         AppliedDesiredEvidence, AsciiText, AssignedKind, AssignedPlacement, CheckpointEvidence,
         Condition, DesiredReadSnapshot, DiskKind, Generation, GuestDeviceIdentity,
         GuestTransportEvidence, Ipv4Address, IsolatedIpv4Kind, LifecycleAdmission, MacAddress,
-        NetworkConfig, NodeBootId, NodeObservation, NormalAcquireRequest, NormalAcquireResult,
-        ObservedDevice, ObservedNetwork, ObservedRuntimeStatus, OwnershipTokenEvidence,
-        PrepareDeviceFrontend, ProgressingReason, RequireIdleCheckpoint, RuntimeCheckpoint,
-        RuntimeConfig, RuntimeLaunchArtifact, RuntimeTarget, RuntimeTransition, Sequence,
+        NetworkConfig, NodeObservation, NormalAcquireRequest, NormalAcquireResult, ObservedDevice,
+        ObservedNetwork, ObservedRuntimeStatus, OwnershipTokenEvidence, PrepareDeviceFrontend,
+        ProgressingReason, RequireIdleCheckpoint, RuntimeCheckpoint, RuntimeConfig,
+        RuntimeLaunchArtifact, RuntimeTarget, RuntimeTransition, Sequence,
         ServingAuthorityProvenance, ServingBlockdIdentity, SessionBinding, UnixMillis,
         VmmBootProvenance, VolumeAccess, VolumeAcquire, VolumeAdminState, VolumeAuthorityEvidence,
         VolumeDisposition, VolumeIntent, WarmSnapshotEvidence,
@@ -4460,11 +4462,16 @@ mod tests {
     ) -> RuntimeDesiredEffectContext {
         let checkpoint = fixture.stored_checkpoint.checkpoint();
         let desired = &fixture.acquired.desired;
+        #[cfg(target_os = "linux")]
+        let node_boot_id =
+            super::super::vmm_socket_namespace::current_kernel_node_boot_id().unwrap();
+        #[cfg(not(target_os = "linux"))]
+        let node_boot_id = NodeBootId::new("11111111111111111111111111111111").unwrap();
         let session = AgentSession {
             version: ContractVersion::V1,
             node_id: checkpoint.node_id.clone(),
             immutable_host_id: id("host_01"),
-            node_boot_id: NodeBootId::new("11111111111111111111111111111111").unwrap(),
+            node_boot_id,
             agent_instance_id: random('2'),
             agent_session_epoch: Epoch::new(2).unwrap(),
             registration_attempt_id: random('3'),

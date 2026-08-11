@@ -778,6 +778,7 @@ impl StartRuntimePhysicalEffect {
                     stored.checkpoint(),
                     &self.state_directory,
                     &self.socket_root,
+                    accepted.session().node_boot_id.clone(),
                     nonce,
                 )?;
                 // Receipt publication is itself a mutation boundary.
