@@ -591,6 +591,7 @@ impl RunningLaunchAuthorityRevalidator {
             anyhow::ensure!(
                 retained.expectation_running(
                     &self.systemd,
+                    accepted_checkpoint.checkpoint(),
                     physical_launch_desired,
                     &first_authority,
                 )? == *expectation,

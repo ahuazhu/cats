@@ -13,11 +13,11 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::Context as _;
 use cats_api::runtime_reconciliation::{
-    CheckpointEvidence, DesiredRuntimeSpec, Epoch, GuestTransportEvidence, Id, LifecycleAdmission,
-    NodeBootId, NodeObservation, ObservedMount, ObservedRouteGate, ObservedRuntimeStatus,
-    RandomId128, ReadyReason, ReconcileStep, RequireIdleCheckpoint, Revision, RouteGateState,
-    RuntimeCheckpoint, RuntimeTarget, RuntimeTransition, Sequence, Sha256Digest, StableState,
-    UnixMillis,
+    CheckpointEvidence, DesiredRuntimeSpec, DiskKind, Epoch, GuestTransportEvidence, Id,
+    LifecycleAdmission, NodeBootId, NodeObservation, ObservedMount, ObservedRouteGate,
+    ObservedRuntimeStatus, PersistentFilesystemBinding, RandomId128, ReadyReason, ReconcileStep,
+    RequireIdleCheckpoint, Revision, RouteGateState, RuntimeCheckpoint, RuntimeTarget,
+    RuntimeTransition, Sequence, Sha256Digest, StableState, UnixMillis,
 };
 
 use crate::runtime_spine::{
@@ -159,6 +159,10 @@ impl RunningTailScanAdmission {
         self.ready.is_empty() && self.retiring.is_empty()
     }
 
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "the scanner seals one closed physical/checkpoint/cell authority tuple"
+    )]
     pub(crate) fn insert_exact(
         &mut self,
         physical_launch_desired: DesiredRuntimeSpec,
@@ -1640,8 +1644,7 @@ impl RouteRetirementExpectation {
                 durable.checkpoint(),
                 successor.vmm(),
             )?;
-            successor.revalidate_current()?;
-            return Ok(());
+            successor.revalidate_current()
         } else {
             #[cfg(test)]
             {
@@ -1670,8 +1673,7 @@ impl RouteRetirementExpectation {
                     durable.checkpoint(),
                     &successor_vmm,
                 )?;
-                store.revalidate_current(durable, &durable_guard)?;
-                return Ok(());
+                Ok(store.revalidate_current(durable, &durable_guard)?)
             }
             #[cfg(not(test))]
             anyhow::bail!("production route retirement lacks launch revalidation authority");
@@ -1723,34 +1725,36 @@ impl RunningTailReadyAdmission {
                         durable.checkpoint(),
                         successor.vmm(),
                     )?;
-                    successor.revalidate_current()?;
-                    return Ok(());
-                }
-                #[cfg(test)]
-                {
-                    let durable_guard = store.assert_current(durable)?;
-                    let Some(revalidate) = effect.launch_revalidation.as_ref() else {
-                        anyhow::bail!(
+                    successor.revalidate_current()
+                } else {
+                    #[cfg(test)]
+                    {
+                        let durable_guard = store.assert_current(durable)?;
+                        let Some(revalidate) = effect.launch_revalidation.as_ref() else {
+                            anyhow::bail!(
                             "production Running-tail effect lacks launch revalidation authority"
                         );
-                    };
-                    revalidate(context, desired, store, accepted, durable, vmm)?;
-                    let successor_vmm = vmm
-                        .expectation()
-                        .gate_only_successor(durable.checkpoint())?
-                        .prove_exact_process(vmm.evidence().clone())?;
-                    mounted_set.revalidate(
-                        effect.guest_ready.as_ref(),
-                        context,
-                        desired,
-                        durable.checkpoint(),
-                        &successor_vmm,
-                    )?;
-                    store.revalidate_current(durable, &durable_guard)?;
-                    Ok(())
+                        };
+                        revalidate(context, desired, store, accepted, durable, vmm)?;
+                        let successor_vmm = vmm
+                            .expectation()
+                            .gate_only_successor(durable.checkpoint())?
+                            .prove_exact_process(vmm.evidence().clone())?;
+                        mounted_set.revalidate(
+                            effect.guest_ready.as_ref(),
+                            context,
+                            desired,
+                            durable.checkpoint(),
+                            &successor_vmm,
+                        )?;
+                        store.revalidate_current(durable, &durable_guard)?;
+                        Ok(())
+                    }
+                    #[cfg(not(test))]
+                    anyhow::bail!(
+                        "production Running-tail effect lacks launch revalidation authority"
+                    )
                 }
-                #[cfg(not(test))]
-                anyhow::bail!("production Running-tail effect lacks launch revalidation authority")
             }
             #[cfg(test)]
             RunningTailPhysicalAuthority::Test => Ok(()),
@@ -1789,6 +1793,112 @@ enum RunningTailAction {
     PrepareChanged(Id),
     RemoveGate(Id),
     InstallGate(Id),
+}
+
+/// Closed classification of the only checkpoint phases that may retain the
+/// private all-volume Running physical proof. A correct Guest mount is never
+/// allowed to manufacture route authority while Persistent initialization is
+/// still in an earlier durable phase.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum RunningTailPhase {
+    Admission,
+    EndpointRetirement,
+    Ineligible,
+}
+
+impl RunningTailPhase {
+    pub(super) fn permits_physical_proof(self) -> bool {
+        self != Self::Ineligible
+    }
+}
+
+pub(super) fn classify_running_tail_phase(
+    desired: &DesiredRuntimeSpec,
+    checkpoint: &RuntimeCheckpoint,
+) -> anyhow::Result<RunningTailPhase> {
+    if desired.target != RuntimeTarget::Running {
+        return Ok(RunningTailPhase::Ineligible);
+    }
+    let persistent = desired
+        .volumes
+        .iter()
+        .filter(|volume| volume.disk_kind == DiskKind::Persistent)
+        .collect::<Vec<_>>();
+    let admission_tail = match &checkpoint.step {
+        ReconcileStep::OpenAdmission { .. }
+        | ReconcileStep::InstallGate { .. }
+        | ReconcileStep::Stable {
+            state: StableState::Running,
+        } => Some(RunningTailPhase::Admission),
+        ReconcileStep::CloseGate { .. } => Some(RunningTailPhase::EndpointRetirement),
+        _ => None,
+    };
+    if persistent.is_empty() {
+        return Ok(match checkpoint.step {
+            ReconcileStep::StartRuntime { .. } => RunningTailPhase::Admission,
+            _ => admission_tail.unwrap_or(RunningTailPhase::Ineligible),
+        });
+    }
+    if let Some(phase) = admission_tail {
+        return Ok(phase);
+    }
+    let ReconcileStep::MountFilesystem { filesystem, .. } = &checkpoint.step else {
+        return Ok(RunningTailPhase::Ineligible);
+    };
+    let final_intent = persistent
+        .into_iter()
+        .max_by(|left, right| {
+            (left.guest_device.slot, left.guest_device.serial.as_str())
+                .cmp(&(right.guest_device.slot, right.guest_device.serial.as_str()))
+        })
+        .expect("non-empty Persistent set");
+    if final_persistent_mount_matches(checkpoint, final_intent, filesystem)? {
+        Ok(RunningTailPhase::Admission)
+    } else {
+        Ok(RunningTailPhase::Ineligible)
+    }
+}
+
+fn final_persistent_mount_matches(
+    checkpoint: &RuntimeCheckpoint,
+    intent: &cats_api::runtime_reconciliation::VolumeIntent,
+    filesystem: &PersistentFilesystemBinding,
+) -> anyhow::Result<bool> {
+    let Some(mount) = intent.mount.as_ref() else {
+        return Ok(false);
+    };
+    let Some(launch) = checkpoint.runtime_launch.identity() else {
+        return Ok(false);
+    };
+    let mut prepared_matches = launch
+        .devices
+        .iter()
+        .filter(|device| device.volume_intent_id == intent.volume_intent_id);
+    let Some(prepared) = prepared_matches.next() else {
+        return Ok(false);
+    };
+    anyhow::ensure!(
+        prepared_matches.next().is_none(),
+        "retained launch repeats the final Persistent volume intent"
+    );
+    Ok(filesystem.runtime_incarnation == launch.runtime_incarnation
+        && filesystem.volume_intent_id == intent.volume_intent_id
+        && filesystem.disk_id == intent.disk_id
+        && filesystem.volume_id == intent.volume_id
+        && filesystem.attachment_id == intent.attachment_id
+        && filesystem.size_bytes == intent.size_bytes
+        && filesystem.guest_device == intent.guest_device
+        && filesystem.filesystem_uuid == mount.filesystem_uuid
+        && filesystem.mount_path == mount.mount_path
+        && filesystem.initialization == mount.initialization
+        && prepared.disk_kind == DiskKind::Persistent
+        && prepared.volume_intent_id == intent.volume_intent_id
+        && prepared.disk_id == intent.disk_id
+        && prepared.volume_id == intent.volume_id
+        && prepared.attachment_id == intent.attachment_id
+        && prepared.attachment_epoch == filesystem.attachment_epoch
+        && prepared.size_bytes == intent.size_bytes
+        && prepared.guest_device == intent.guest_device)
 }
 
 enum RouteRetirementAction {
@@ -2164,9 +2274,10 @@ mod tests {
     use cats_api::runtime_reconciliation::{
         decode_desired_runtime_spec, decode_runtime_checkpoint, spec_digest,
         AdmissionInventoryAttestation, AgentSession, AppliedDesiredEvidence, CheckpointEvidence,
-        ContractVersion, DesiredReadSnapshot, DesiredRuntimeSpec, Epoch, GuestBootId, HostPath,
-        Hostname, NodeBootId, ObservedRuntimeStatus, ReconcileStep, RouteGateState, RuntimeLaunch,
-        Sequence, SessionBinding, StableState, WarmSnapshotEvidence,
+        ContractVersion, DesiredReadSnapshot, DesiredRuntimeSpec, DiskKind, Epoch, Ext4MountIntent,
+        FilesystemInitialization, GuestBootId, GuestDeviceIdentity, HostPath, Hostname, NodeBootId,
+        ObservedRuntimeStatus, PersistentFilesystemBinding, ReconcileStep, RouteGateState,
+        RuntimeLaunch, Sequence, SessionBinding, StableState, WarmSnapshotEvidence,
     };
     use tempfile::TempDir;
 
@@ -2343,6 +2454,128 @@ mod tests {
             },
             Instant::now() + Duration::from_secs(2),
         )
+    }
+
+    fn add_persistent_phase_volume(
+        desired: &mut DesiredRuntimeSpec,
+        checkpoint: &mut RuntimeCheckpoint,
+        suffix: &str,
+        slot: u16,
+    ) -> PersistentFilesystemBinding {
+        let mut intent = desired.volumes[0].clone();
+        intent.volume_intent_id = Id::new(format!("vint_{suffix}")).unwrap();
+        intent.disk_id = Id::new(format!("disk_{suffix}")).unwrap();
+        intent.volume_id = Id::new(format!("vol_{suffix}")).unwrap();
+        intent.attachment_id = Id::new(format!("att_{suffix}")).unwrap();
+        intent.disk_kind = DiskKind::Persistent;
+        intent.guest_device = GuestDeviceIdentity {
+            serial: Id::new(format!("cats-{suffix}")).unwrap(),
+            slot,
+        };
+        let filesystem_uuid = RandomId128::new(format!("{slot:032x}")).unwrap();
+        let mount_path = HostPath::new(format!("/mnt/{suffix}")).unwrap();
+        intent.mount = Some(Ext4MountIntent {
+            filesystem_uuid: filesystem_uuid.clone(),
+            mount_path: mount_path.clone(),
+            initialization: FilesystemInitialization::Existing,
+        });
+        desired.volumes.push(intent.clone());
+
+        let RuntimeLaunch::Present(launch) = &mut checkpoint.runtime_launch else {
+            panic!("phase fixture retains a launch")
+        };
+        let mut prepared = launch.devices[0].clone();
+        prepared.volume_intent_id = intent.volume_intent_id.clone();
+        prepared.disk_id = intent.disk_id.clone();
+        prepared.volume_id = intent.volume_id.clone();
+        prepared.disk_kind = DiskKind::Persistent;
+        prepared.attachment_id = intent.attachment_id.clone();
+        prepared.guest_device = intent.guest_device.clone();
+        launch.devices.push(prepared.clone());
+        PersistentFilesystemBinding {
+            runtime_incarnation: launch.runtime_incarnation.clone(),
+            volume_intent_id: intent.volume_intent_id,
+            disk_id: intent.disk_id,
+            volume_id: intent.volume_id,
+            attachment_id: intent.attachment_id,
+            attachment_epoch: prepared.attachment_epoch,
+            size_bytes: intent.size_bytes,
+            guest_device: intent.guest_device,
+            filesystem_uuid,
+            mount_path,
+            initialization: FilesystemInitialization::Existing,
+        }
+    }
+
+    #[test]
+    fn persistent_running_tail_phase_is_closed_until_the_final_sorted_mount() {
+        let mut desired = decode_desired_runtime_spec(DESIRED).expect("Desired vector");
+        let mut checkpoint =
+            decode_runtime_checkpoint(START_RUNTIME).expect("StartRuntime checkpoint");
+        assert_eq!(
+            classify_running_tail_phase(&desired, &checkpoint).unwrap(),
+            RunningTailPhase::Admission
+        );
+        let start_runtime_step = checkpoint.step.clone();
+        let first = add_persistent_phase_volume(&mut desired, &mut checkpoint, "data", 1);
+        let final_mount = add_persistent_phase_volume(&mut desired, &mut checkpoint, "logs", 2);
+
+        let early = [
+            start_runtime_step,
+            ReconcileStep::FormatFilesystem {
+                filesystem: Box::new(first.clone()),
+            },
+            ReconcileStep::DrainInitialization {
+                filesystem: Box::new(first.clone()),
+                local_generation: cats_api::runtime_reconciliation::Generation::new(1).unwrap(),
+                remote_generation: cats_api::runtime_reconciliation::Generation::new(1).unwrap(),
+            },
+            ReconcileStep::CommitInitialized {
+                filesystem: Box::new(first.clone()),
+                new_remote_head: checkpoint.runtime_launch.identity().unwrap().devices[1]
+                    .expected_head
+                    .clone(),
+            },
+            ReconcileStep::MountFilesystem {
+                filesystem: Box::new(first),
+                expected_head: checkpoint.runtime_launch.identity().unwrap().devices[1]
+                    .expected_head
+                    .clone(),
+            },
+        ];
+        for step in early {
+            checkpoint.step = step;
+            assert_eq!(
+                classify_running_tail_phase(&desired, &checkpoint).unwrap(),
+                RunningTailPhase::Ineligible
+            );
+        }
+
+        checkpoint.step = ReconcileStep::MountFilesystem {
+            filesystem: Box::new(final_mount),
+            expected_head: checkpoint.runtime_launch.identity().unwrap().devices[2]
+                .expected_head
+                .clone(),
+        };
+        assert_eq!(
+            classify_running_tail_phase(&desired, &checkpoint).unwrap(),
+            RunningTailPhase::Admission
+        );
+        checkpoint.step = ReconcileStep::CloseAdmission {
+            require_idle_attempt_id: None,
+        };
+        assert_eq!(
+            classify_running_tail_phase(&desired, &checkpoint).unwrap(),
+            RunningTailPhase::Ineligible
+        );
+        checkpoint.step = ReconcileStep::CloseGate {
+            endpoint_id: desired.endpoints[0].endpoint_id.clone(),
+            route_epoch: desired.endpoints[0].route_epoch,
+        };
+        assert_eq!(
+            classify_running_tail_phase(&desired, &checkpoint).unwrap(),
+            RunningTailPhase::EndpointRetirement
+        );
     }
 
     #[test]

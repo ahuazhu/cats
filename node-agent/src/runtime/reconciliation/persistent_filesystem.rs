@@ -40,7 +40,6 @@ use crate::runtime_spine::{
 use super::clean_slate_probes::CHECKPOINT_NAMESPACE;
 use super::prepare_device_retirement::unique_runtime;
 use super::serving_blockd_process::ExactServingBlockdProcessProof;
-use super::serving_handoff_effect::checkpoint_is_current_exact;
 use super::signed_running::SignedNormalAcquirePort;
 use super::vmm_process::ExactVmmProcessProof;
 use super::{
@@ -51,7 +50,7 @@ use super::{
 const BLOCKD_CONTROL_MAX_LINE_BYTES: usize = 64 * 1024;
 const CONTROL_POLL_INTERVAL: Duration = Duration::from_millis(25);
 
-trait PersistentFilesystemGuestPort: Send + Sync {
+pub(super) trait PersistentFilesystemGuestPort: Send + Sync {
     fn control(
         &self,
         context: &dyn RuntimePhysicalReadContext,
@@ -61,7 +60,7 @@ trait PersistentFilesystemGuestPort: Send + Sync {
     ) -> anyhow::Result<FilesystemControlResponseV1>;
 }
 
-trait PersistentBlockdControlPort: Send + Sync {
+pub(super) trait PersistentBlockdControlPort: Send + Sync {
     fn status(
         &self,
         context: &dyn RuntimePhysicalReadContext,
@@ -261,6 +260,23 @@ impl PersistentFilesystemEffect {
         }
     }
 
+    #[cfg(test)]
+    pub(super) fn for_test(
+        authority: Arc<dyn VolumeDataAuthority>,
+        transition: Arc<dyn SignedNormalAcquirePort>,
+        guest: Arc<dyn PersistentFilesystemGuestPort>,
+        blockd: Arc<dyn PersistentBlockdControlPort>,
+        launch_authority: Arc<RunningLaunchAuthorityRevalidator>,
+    ) -> Self {
+        Self {
+            authority,
+            transition,
+            guest,
+            blockd,
+            launch_authority,
+        }
+    }
+
     pub(crate) fn try_apply(
         &self,
         context: &RuntimeDesiredEffectContext,
@@ -282,7 +298,7 @@ impl PersistentFilesystemEffect {
             return Ok(None);
         }
         if desired.target != RuntimeTarget::Running
-            || !checkpoint_is_current_exact(desired, runtime)
+            || !filesystem_checkpoint_is_current_exact(desired, runtime)
         {
             return Ok(Some(stop_local()));
         }
@@ -451,6 +467,13 @@ impl PersistentFilesystemEffect {
             FilesystemIdentityV1::Blank => {
                 self.launch_authority
                     .revalidate_exact_retained_running(context, desired, store, stored, vmm)?;
+                let (serving, authority) =
+                    self.current_serving_authority(processes, desired, &filesystem.volume_id)?;
+                if authority.head != *expected_blank_head
+                    || !current_attachment_matches(serving, &authority)
+                {
+                    return quarantine(store, stored);
+                }
                 let format = self.guest.control(
                     context,
                     launch,
@@ -555,7 +578,7 @@ impl PersistentFilesystemEffect {
             Ok(_) => return quarantine(store, stored),
             Err(_) => return Ok(RuntimeDesiredEffectOutcome::RefreshInventory),
         }
-        let (serving, _) =
+        let (serving, accepted_authority) =
             self.current_serving_authority(processes, desired, &filesystem.volume_id)?;
         vmm.assert_current(context)?;
         serving.assert_listener_current(context)?;
@@ -568,7 +591,7 @@ impl PersistentFilesystemEffect {
             .authority
             .load_volume(&filesystem.volume_id)
             .context("load post-drain Persistent Volume authority")?;
-        if !current_attachment_matches(serving, &authority)
+        if !post_drain_authority_is_same_attachment(&accepted_authority, &authority)
             || authority.head.generation.get() == 0
             || !serving.validates_fully_drained_status_at_head(&status, &authority.head)
         {
@@ -696,12 +719,16 @@ impl PersistentFilesystemEffect {
     ) -> anyhow::Result<RuntimeDesiredEffectOutcome> {
         let (serving, authority) =
             self.current_serving_authority(processes, desired, &filesystem.volume_id)?;
-        if authority.head != *expected_head
-            || !remote_head_is_same_or_later(&authority.head, expected_head)
+        if !remote_head_is_same_or_later(&authority.head, expected_head)
             || !current_attachment_matches(serving, &authority)
         {
             return quarantine(store, stored);
         }
+        // The MountFilesystem checkpoint head is the attachment-scoped lower
+        // bound established by initialization/acquire. Writes may legitimately
+        // advance the same attachment before a later Persistent volume reaches
+        // its mount turn, so every Guest request binds the fresh exact head.
+        let current_head = authority.head.clone();
         let launch = stored.checkpoint().runtime_launch.identity().unwrap();
         let probe = match self.guest.control(
             context,
@@ -709,7 +736,7 @@ impl PersistentFilesystemEffect {
             vmm,
             filesystem_request(
                 filesystem,
-                expected_head,
+                &current_head,
                 FilesystemControlOperationV1::Probe,
             )?,
         ) {
@@ -722,13 +749,21 @@ impl PersistentFilesystemEffect {
         if probe.observation.mounts.is_empty() {
             self.launch_authority
                 .revalidate_exact_retained_running(context, desired, store, stored, vmm)?;
+            let (serving, authority) =
+                self.current_serving_authority(processes, desired, &filesystem.volume_id)?;
+            if !remote_head_is_same_or_later(&authority.head, expected_head)
+                || !current_attachment_matches(serving, &authority)
+            {
+                return quarantine(store, stored);
+            }
+            let mount_head = authority.head.clone();
             match self.guest.control(
                 context,
                 launch,
                 vmm,
                 filesystem_request(
                     filesystem,
-                    expected_head,
+                    &mount_head,
                     FilesystemControlOperationV1::MountExt4,
                 )?,
             ) {
@@ -789,12 +824,61 @@ impl PersistentFilesystemEffect {
     }
 }
 
+fn filesystem_checkpoint_is_current_exact(
+    desired: &DesiredRuntimeSpec,
+    runtime: &cats_api::runtime_reconciliation::ObservedRuntimeStatus,
+) -> bool {
+    matches!(
+        &runtime.checkpoint,
+        CheckpointEvidence::Valid {
+            version,
+            cat_id,
+            node_id,
+            desired_revision,
+            spec_digest,
+            placement_epoch,
+            runtime_incarnation: Some(_),
+            stable_state: None,
+            step,
+            ..
+        } if *version == ContractVersion::V1
+            && cat_id == &desired.cat_id
+            && node_id == &desired.placement.node_id
+            && *placement_epoch == desired.placement.placement_epoch
+            && *desired_revision == desired.desired_revision
+            && spec_digest == &desired.spec_digest
+            && step.as_ref() == &runtime.step
+    )
+}
+
 fn current_attachment_matches(
     serving: &ExactServingBlockdProcessProof,
     authority: &VolumeRecord,
 ) -> bool {
     validate_volume_record(authority).is_ok()
         && serving.expectation().matches_current_authority(authority)
+}
+
+/// A successful Relaxed drain may publish a new RemoteHead on the same fenced
+/// attachment. The accepted process sidecar remains intentionally bound to
+/// the pre-drain head, so it is only a lower bound here: the independent
+/// post-drain authority read and exact blockd status must agree on the new
+/// head while every non-head authority field remains closed.
+fn post_drain_authority_is_same_attachment(before: &VolumeRecord, after: &VolumeRecord) -> bool {
+    validate_volume_record(before).is_ok()
+        && validate_volume_record(after).is_ok()
+        && before.volume_id == after.volume_id
+        && before.size_bytes == after.size_bytes
+        && before.durability == after.durability
+        && before.admin_state == after.admin_state
+        && before.lease_owner == after.lease_owner
+        && before.lease_epoch == after.lease_epoch
+        && before.last_transition == after.last_transition
+        && before
+            .lease_expires_at
+            .zip(after.lease_expires_at)
+            .is_some_and(|(accepted, current)| current >= accepted)
+        && remote_head_is_same_or_later(&after.head, &before.head)
 }
 
 fn first_step(
@@ -980,4 +1064,90 @@ fn monotonic_timestamp(current: &StoredCheckpoint) -> anyhow::Result<UnixMillis>
 
 fn stop_local() -> RuntimeDesiredEffectOutcome {
     RuntimeDesiredEffectOutcome::Stop(RuntimeDesiredEffectStopReason::LocalContract)
+}
+
+#[cfg(test)]
+mod tests {
+    use cats_storage::authority::{
+        normal_acquire, AsciiText, Epoch, FenceEpoch, NormalAcquireRequest, Revision, Sha256Digest,
+        VolumeAdminState, VolumeDurability,
+    };
+
+    use super::*;
+
+    fn relaxed_owned_record() -> VolumeRecord {
+        let predecessor = VolumeRecord {
+            volume_id: Id::new("vol_relaxed").unwrap(),
+            size_bytes: 4_096,
+            durability: VolumeDurability::Relaxed,
+            admin_state: VolumeAdminState::Active,
+            head: RemoteHead {
+                generation: Generation::new(0).unwrap(),
+                root_hash: None,
+                root_object_id: None,
+            },
+            lease_owner: None,
+            lease_epoch: FenceEpoch::new(0).unwrap(),
+            lease_expires_at: None,
+            last_transition: None,
+        };
+        normal_acquire(
+            &predecessor,
+            &NormalAcquireRequest {
+                volume_id: predecessor.volume_id.clone(),
+                transition_id: RandomId128::new("11111111111111111111111111111111").unwrap(),
+                attachment_id: Id::new("att_relaxed").unwrap(),
+                expected_unowned_epoch: predecessor.lease_epoch,
+                desired_revision: Revision::new(1).unwrap(),
+                placement_epoch: Epoch::new(1).unwrap(),
+                lease_duration_ms: 60_000,
+            },
+            UnixMillis::new(10_000).unwrap(),
+        )
+        .unwrap()
+        .0
+    }
+
+    fn head(generation: u64, fill: u8) -> RemoteHead {
+        RemoteHead {
+            generation: Generation::new(generation).unwrap(),
+            root_hash: Some(Sha256Digest::from_bytes([fill; 32])),
+            root_object_id: Some(AsciiText::new(format!("roots/{fill:02x}")).unwrap()),
+        }
+    }
+
+    #[test]
+    fn relaxed_post_drain_head_may_advance_only_on_the_exact_attachment() {
+        let before = relaxed_owned_record();
+        let mut after = before.clone();
+        after.head = head(1, 1);
+        after.lease_expires_at = Some(UnixMillis::new(70_001).unwrap());
+        assert!(post_drain_authority_is_same_attachment(&before, &after));
+
+        let mut wrong = after.clone();
+        wrong.lease_owner = Some(Id::new("att_foreign").unwrap());
+        assert!(!post_drain_authority_is_same_attachment(&before, &wrong));
+
+        let mut wrong = after.clone();
+        wrong.lease_epoch = FenceEpoch::new(2).unwrap();
+        assert!(!post_drain_authority_is_same_attachment(&before, &wrong));
+
+        let mut wrong = after.clone();
+        wrong.lease_expires_at = before
+            .lease_expires_at
+            .and_then(|expiry| UnixMillis::new(expiry.get() - 1));
+        assert!(!post_drain_authority_is_same_attachment(&before, &wrong));
+
+        let mut advanced = after.clone();
+        advanced.head = head(2, 2);
+        assert!(post_drain_authority_is_same_attachment(&after, &advanced));
+        assert!(!post_drain_authority_is_same_attachment(&advanced, &after));
+
+        let mut conflicting = after.clone();
+        conflicting.head = head(1, 9);
+        assert!(!post_drain_authority_is_same_attachment(
+            &after,
+            &conflicting
+        ));
+    }
 }

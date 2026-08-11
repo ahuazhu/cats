@@ -6995,7 +6995,10 @@ mod tests {
     use std::time::{Duration, Instant};
 
     use cats_api::guest::{
-        RuntimeReadyDeviceV1, RuntimeReadyMountV1, RuntimeReadyRequestV1, RuntimeReadyResponseV1,
+        FilesystemControlOperationV1, FilesystemControlOutcomeV1, FilesystemControlRequestV1,
+        FilesystemControlResponseV1, FilesystemIdentityV1, PersistentFilesystemMountV1,
+        PersistentFilesystemObservationV1, RuntimeReadyDeviceV1, RuntimeReadyMountV1,
+        RuntimeReadyRequestV1, RuntimeReadyResponseV1,
     };
     #[cfg(target_os = "linux")]
     use cats_api::runtime_reconciliation::RuntimeLaunch;
@@ -7007,13 +7010,13 @@ mod tests {
         DiskKind, Durability, Epoch, Ext4MountIntent, FenceEpoch, FilesystemInitialization,
         Generation, GuestBootId, GuestDeviceIdentity, HostPath, Id, Ipv4Address, IsolatedIpv4Kind,
         LifecycleAdmission, MacAddress, MountAccess, NetworkConfig, NodeBootId, NodeObservation,
-        NormalAcquireRequest, ObservedNetwork, OwnershipTokenEvidence, PrepareDeviceFrontend,
-        PreparedDeviceInput, RandomId128, ReconcileStep, RemoteHead, Revision, RuntimeConfig,
-        RuntimeNetworkIdentity, RuntimeTarget, RuntimeTransition, RuntimeVolumeTransition,
-        RuntimeVolumeTransitionPreconditionProblem, RuntimeVolumeTransitionRequest,
-        ServingAuthorityProvenance, ServingBlockdIdentity, SessionBinding, Sha256Digest,
-        UnixMillis, VolumeAccess, VolumeAcquire, VolumeAcquireRequest, VolumeDisposition,
-        VolumeIntent, VolumeReleaseReplay, WireU64,
+        NormalAcquireRequest, ObservedNetwork, OwnershipTokenEvidence, PersistentFilesystemBinding,
+        PersistentInitializationReceipt, PrepareDeviceFrontend, PreparedDeviceInput, RandomId128,
+        ReconcileStep, RemoteHead, Revision, RuntimeConfig, RuntimeNetworkIdentity, RuntimeTarget,
+        RuntimeTransition, RuntimeVolumeTransition, RuntimeVolumeTransitionPreconditionProblem,
+        RuntimeVolumeTransitionRequest, ServingAuthorityProvenance, ServingBlockdIdentity,
+        SessionBinding, Sha256Digest, UnixMillis, VolumeAccess, VolumeAcquire,
+        VolumeAcquireRequest, VolumeDisposition, VolumeIntent, VolumeReleaseReplay, WireU64,
     };
     use cats_storage::{
         encode_image_manifest, AdapterConfig, AdapterSelection, BlobError, ImageManifestV1,
@@ -7639,12 +7642,44 @@ mod tests {
         records: BTreeMap<Id, VolumeRecord>,
     }
 
+    struct SharedVolumeSetDataAuthority {
+        records: Arc<Mutex<BTreeMap<Id, VolumeRecord>>>,
+    }
+
     impl VolumeDataAuthority for ExactVolumeSetDataAuthority {
         fn load_volume(
             &self,
             volume_id: &Id,
         ) -> cats_storage::authority::Result<cats_storage::authority::VolumeRecord> {
             self.records
+                .get(volume_id)
+                .cloned()
+                .ok_or(cats_storage::authority::AuthorityError::NotFound)
+        }
+
+        fn renew_lease(
+            &self,
+            _request: &cats_storage::authority::RenewLeaseRequest,
+        ) -> cats_storage::authority::Result<cats_storage::authority::RenewLeaseResult> {
+            Err(cats_storage::authority::AuthorityError::BackendUnknown)
+        }
+
+        fn compare_and_swap_head(
+            &self,
+            _request: &cats_storage::authority::VolumeHeadCasRequest,
+        ) -> cats_storage::authority::Result<cats_storage::authority::VolumeHeadCasResult> {
+            Err(cats_storage::authority::AuthorityError::BackendUnknown)
+        }
+    }
+
+    impl VolumeDataAuthority for SharedVolumeSetDataAuthority {
+        fn load_volume(
+            &self,
+            volume_id: &Id,
+        ) -> cats_storage::authority::Result<cats_storage::authority::VolumeRecord> {
+            self.records
+                .lock()
+                .unwrap()
                 .get(volume_id)
                 .cloned()
                 .ok_or(cats_storage::authority::AuthorityError::NotFound)
@@ -8241,8 +8276,10 @@ mod tests {
             placement_epoch: desired.placement.placement_epoch,
             lease_duration_ms: 60_000,
         };
+        let mut predecessor = unowned_record(volume.volume_id.as_str(), volume.size_bytes);
+        predecessor.durability = volume.durability;
         let (record, result) = cats_storage::authority::normal_acquire(
-            &unowned_record(volume.volume_id.as_str(), volume.size_bytes),
+            &predecessor,
             &request,
             cats_storage::authority::UnixMillis::new(10_000).unwrap(),
         )
@@ -8299,7 +8336,7 @@ mod tests {
         let authorization_path = data_directory.join(AUTHORIZED_SERVING_FILE);
         let authorization_bytes = std::fs::read(&authorization_path).unwrap();
         let authorization_metadata = std::fs::metadata(&authorization_path).unwrap();
-        let suffix = if index == 0 { "root" } else { "persistent" };
+        let suffix = volume.volume_id.as_str();
         PreparedDeviceInput {
             volume_intent_id: volume.volume_intent_id.clone(),
             disk_id: volume.disk_id.clone(),
@@ -8312,12 +8349,7 @@ mod tests {
             size_bytes: attachment.size_bytes,
             durability: attachment.durability,
             guest_device: volume.guest_device.clone(),
-            ownership_token: RandomId128::new(if index == 0 {
-                "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa1"
-            } else {
-                "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa2"
-            })
-            .unwrap(),
+            ownership_token: RandomId128::new(format!("{:032x}", index + 1)).unwrap(),
             serving_authority: Box::new(ServingAuthorityProvenance::DirectAuthorizedAttachment {
                 authorization: DirectAuthorizedAttachmentIdentity {
                     path: HostPath::new(authorization_path.to_string_lossy().into_owned()).unwrap(),
@@ -8330,6 +8362,16 @@ mod tests {
                 },
                 purpose: match volume.disk_kind {
                     DiskKind::Root => DirectAuthorizedAttachmentPurpose::ExistingRoot,
+                    DiskKind::Persistent
+                        if volume.mount.as_ref().is_some_and(|mount| {
+                            matches!(
+                                mount.initialization,
+                                FilesystemInitialization::Initialize { .. }
+                            )
+                        }) =>
+                    {
+                        DirectAuthorizedAttachmentPurpose::PersistentUninitialized
+                    }
                     DiskKind::Persistent => {
                         DirectAuthorizedAttachmentPurpose::PersistentInitialized
                     }
@@ -8350,12 +8392,7 @@ mod tests {
                     environment.blockd_binary.to_string_lossy().into_owned(),
                 )
                 .unwrap(),
-                process_identity_token: RandomId128::new(if index == 0 {
-                    "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb1"
-                } else {
-                    "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb2"
-                })
-                .unwrap(),
+                process_identity_token: RandomId128::new(format!("{:032x}", index + 101)).unwrap(),
             },
             frontend: PrepareDeviceFrontend::VhostUserBlk {
                 socket_path: HostPath::new(
@@ -8615,6 +8652,302 @@ mod tests {
         }
     }
 
+    struct ScriptedPersistentGuest {
+        formatted: AtomicBool,
+        lose_first_format_response: AtomicBool,
+        operations: Arc<Mutex<Vec<(FilesystemControlOperationV1, Id, RemoteHead)>>>,
+    }
+
+    impl ScriptedPersistentGuest {
+        fn response(
+            request: FilesystemControlRequestV1,
+            filesystem: FilesystemIdentityV1,
+            mounted: bool,
+        ) -> FilesystemControlResponseV1 {
+            let mounts = mounted
+                .then(|| PersistentFilesystemMountV1 {
+                    device_major: 252,
+                    device_minor: u32::from(request.filesystem.guest_device.slot),
+                    source_path: HostPath::new("/dev/vdb").unwrap(),
+                    mount_root: HostPath::new("/").unwrap(),
+                    mount_path: request.filesystem.mount_path.clone(),
+                    filesystem_type: Id::new("ext4").unwrap(),
+                    access: MountAccess::ReadWrite,
+                })
+                .into_iter()
+                .collect();
+            FilesystemControlResponseV1 {
+                version: request.version,
+                request: Box::new(request.clone()),
+                outcome: FilesystemControlOutcomeV1::Exact,
+                observation: PersistentFilesystemObservationV1 {
+                    guest_device: request.filesystem.guest_device.clone(),
+                    device_path: HostPath::new("/dev/vdb").unwrap(),
+                    device_major: 252,
+                    device_minor: u32::from(request.filesystem.guest_device.slot),
+                    size_bytes: request.filesystem.size_bytes,
+                    filesystem,
+                    mounts,
+                },
+            }
+        }
+    }
+
+    impl super::super::persistent_filesystem::PersistentFilesystemGuestPort
+        for ScriptedPersistentGuest
+    {
+        fn control(
+            &self,
+            _context: &dyn RuntimePhysicalReadContext,
+            _launch: &cats_api::runtime_reconciliation::RuntimeLaunchIdentity,
+            _vmm: &super::super::vmm_process::ExactVmmProcessProof,
+            request: FilesystemControlRequestV1,
+        ) -> anyhow::Result<FilesystemControlResponseV1> {
+            self.operations.lock().unwrap().push((
+                request.operation,
+                request.filesystem.volume_id.clone(),
+                request.expected_head.clone(),
+            ));
+            match request.operation {
+                FilesystemControlOperationV1::Probe if !self.formatted.load(Ordering::SeqCst) => {
+                    Ok(Self::response(request, FilesystemIdentityV1::Blank, false))
+                }
+                FilesystemControlOperationV1::FormatExt4 => {
+                    self.formatted.store(true, Ordering::SeqCst);
+                    if self
+                        .lose_first_format_response
+                        .swap(false, Ordering::SeqCst)
+                    {
+                        anyhow::bail!("injected mkfs response loss")
+                    }
+                    let filesystem_uuid = request.filesystem.filesystem_uuid.clone();
+                    Ok(Self::response(
+                        request,
+                        FilesystemIdentityV1::Ext4 { filesystem_uuid },
+                        false,
+                    ))
+                }
+                FilesystemControlOperationV1::Probe | FilesystemControlOperationV1::FlushDevice => {
+                    let filesystem_uuid = request.filesystem.filesystem_uuid.clone();
+                    Ok(Self::response(
+                        request,
+                        FilesystemIdentityV1::Ext4 { filesystem_uuid },
+                        false,
+                    ))
+                }
+                FilesystemControlOperationV1::MountExt4 => {
+                    let filesystem_uuid = request.filesystem.filesystem_uuid.clone();
+                    Ok(Self::response(
+                        request,
+                        FilesystemIdentityV1::Ext4 { filesystem_uuid },
+                        true,
+                    ))
+                }
+            }
+        }
+    }
+
+    struct AdvancingRelaxedBlockd {
+        records: Arc<Mutex<BTreeMap<Id, VolumeRecord>>>,
+        volume_id: Id,
+        initialized_head: RemoteHead,
+        drains: Arc<AtomicUsize>,
+    }
+
+    impl AdvancingRelaxedBlockd {
+        fn status_for(
+            &self,
+            serving: &super::super::serving_blockd_process::ExactServingBlockdProcessProof,
+        ) -> cats_api::blockd::DurabilityStatus {
+            let current = self.records.lock().unwrap()[&self.volume_id].clone();
+            let mut status = serving.durability_status().clone();
+            let generation = i64::try_from(current.head.generation.get()).unwrap();
+            status.remote_head = Some(current.head);
+            status.remote_durable_generation = generation;
+            if generation == 0 {
+                status.local_durable_generation = 1;
+                status.unpublished_generations = 1;
+                status.unpublished_bytes = 4_096;
+                status.oldest_unpublished_age_ms = 1;
+            } else {
+                status.local_durable_generation = generation;
+                status.unpublished_generations = 0;
+                status.unpublished_bytes = 0;
+                status.oldest_unpublished_age_ms = 0;
+            }
+            status
+        }
+    }
+
+    impl super::super::persistent_filesystem::PersistentBlockdControlPort for AdvancingRelaxedBlockd {
+        fn status(
+            &self,
+            _context: &dyn RuntimePhysicalReadContext,
+            serving: &super::super::serving_blockd_process::ExactServingBlockdProcessProof,
+        ) -> anyhow::Result<cats_api::blockd::DurabilityStatus> {
+            Ok(self.status_for(serving))
+        }
+
+        fn drain(
+            &self,
+            _context: &dyn RuntimePhysicalReadContext,
+            serving: &super::super::serving_blockd_process::ExactServingBlockdProcessProof,
+        ) -> anyhow::Result<cats_api::blockd::DurabilityStatus> {
+            self.drains.fetch_add(1, Ordering::SeqCst);
+            self.records
+                .lock()
+                .unwrap()
+                .get_mut(&self.volume_id)
+                .unwrap()
+                .head = self.initialized_head.clone();
+            Ok(self.status_for(serving))
+        }
+    }
+
+    struct CommitInitializedPort {
+        calls: Arc<AtomicUsize>,
+    }
+
+    impl super::super::signed_running::SignedNormalAcquirePort for CommitInitializedPort {
+        fn acquire(
+            &self,
+            _request: &RuntimeVolumeTransitionRequest,
+            _volume: &VolumeIntent,
+            _accepted: &super::super::NormalAcquireAcceptedContext,
+            _deadline: Instant,
+        ) -> Result<super::super::NormalAcquireAttempt, super::super::NormalAcquireClientError>
+        {
+            unreachable!("filesystem test never acquires a volume")
+        }
+
+        fn release(
+            &self,
+            _request: &RuntimeVolumeTransitionRequest,
+            _volume: &VolumeIntent,
+            _expected_head: &RemoteHead,
+            _accepted: &super::super::NormalAcquireAcceptedContext,
+            _deadline: Instant,
+        ) -> Result<super::super::NormalReleaseAttempt, super::super::NormalAcquireClientError>
+        {
+            unreachable!("filesystem test never releases a volume")
+        }
+
+        fn commit_initialized(
+            &self,
+            request: &RuntimeVolumeTransitionRequest,
+            _volume: &VolumeIntent,
+            _accepted: &super::super::NormalAcquireAcceptedContext,
+            _deadline: Instant,
+        ) -> Result<super::super::CommitInitializedAttempt, super::super::NormalAcquireClientError>
+        {
+            let RuntimeVolumeTransition::CommitInitialized {
+                filesystem,
+                new_remote_head,
+            } = &request.transition
+            else {
+                return Err(super::super::NormalAcquireClientError::InvalidVolumeBinding);
+            };
+            let FilesystemInitialization::Initialize {
+                initialization_token,
+                expected_blank_head,
+            } = &filesystem.initialization
+            else {
+                return Err(super::super::NormalAcquireClientError::InvalidVolumeBinding);
+            };
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            Ok(super::super::CommitInitializedAttempt::Committed(Box::new(
+                PersistentInitializationReceipt {
+                    disk_id: filesystem.disk_id.clone(),
+                    volume_id: filesystem.volume_id.clone(),
+                    initialization_token: initialization_token.clone(),
+                    filesystem_uuid: filesystem.filesystem_uuid.clone(),
+                    expected_blank_head: expected_blank_head.clone(),
+                    initialized_head: new_remote_head.clone(),
+                    initialized_at: UnixMillis::new(20_000).unwrap(),
+                },
+            )))
+        }
+    }
+
+    fn bind_inventory_for_running_effect(
+        mut inventory: crate::runtime_spine::CompleteRuntimeInventory,
+        scan_context: &RuntimeInventoryScanContext,
+        state_directory: StateDirectory,
+    ) -> RuntimeDesiredEffectContext {
+        let process_scan = inventory
+            .take_node_global_process_admission()
+            .expect("filesystem scan lacks its sealed process authority");
+        let network_scan = inventory
+            .take_node_global_network_admission()
+            .expect("filesystem scan lacks its sealed network authority");
+        let kernel_nbd_scan = inventory.take_kernel_nbd_pool_admission();
+        let coordinates = scan_context.coordinates().clone();
+        let mut observation = NodeObservation {
+            version: ContractVersion::V1,
+            observation_id: RandomId128::new("dadadadadadadadadadadadadadadada").unwrap(),
+            node_id: coordinates.session.node_id.clone(),
+            node_boot_id: coordinates.session.node_boot_id.clone(),
+            agent_instance_id: coordinates.session.agent_instance_id.clone(),
+            agent_session_epoch: coordinates.session.agent_session_epoch,
+            heartbeat_sequence: coordinates.heartbeat_sequence,
+            observed_at_unix_ms: inventory.observed_at_unix_ms(),
+            complete_inventory: true,
+            inventory_epoch: coordinates.inventory_epoch,
+            inventory_digest: Some(Sha256Digest::from_bytes([0; 32])),
+            inventory_read_position: Some(coordinates.desired.read_position),
+            key_ring_version: None,
+            key_ring_digest: None,
+            loaded_kids: Vec::new(),
+            runtimes: inventory.runtimes().to_vec(),
+            residue: inventory.residue().to_vec(),
+        };
+        observation.inventory_digest = Some(inventory_digest(&observation).unwrap());
+        let process = process_scan.bind(&observation).unwrap();
+        let network = network_scan.bind(&observation).unwrap();
+        let kernel_nbd = kernel_nbd_scan.map(|scan| scan.bind(&observation).unwrap());
+        let desired = coordinates
+            .desired
+            .desired_specs
+            .iter()
+            .find(|desired| desired.cat_id == observation.runtimes[0].cat_id)
+            .unwrap();
+        let session = AgentSession {
+            version: ContractVersion::V1,
+            node_id: observation.node_id.clone(),
+            immutable_host_id: Id::new("host_test").unwrap(),
+            node_boot_id: observation.node_boot_id.clone(),
+            agent_instance_id: observation.agent_instance_id.clone(),
+            agent_session_epoch: observation.agent_session_epoch,
+            registration_attempt_id: RandomId128::new("cdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcd").unwrap(),
+            guest_config_digest: desired.runtime.guest_config_digest.clone(),
+            lease_deadline_unix_ms: UnixMillis::new(observation.observed_at_unix_ms.get() + 60_000)
+                .unwrap(),
+        };
+        let attestation = AdmissionInventoryAttestation {
+            version: ContractVersion::V1,
+            node_id: observation.node_id.clone(),
+            agent_session_epoch: observation.agent_session_epoch,
+            inventory_epoch: observation.inventory_epoch,
+            inventory_digest: observation.inventory_digest.clone().unwrap(),
+            inventory_read_position: observation.inventory_read_position.unwrap(),
+            accepted_at_unix_ms: UnixMillis::new(observation.observed_at_unix_ms.get() + 1)
+                .unwrap(),
+        };
+        let admission = RuntimeDesiredEffectAdmission::for_test(session, observation, attestation)
+            .bind_assigned_cats_for_test(&coordinates.desired);
+        let context = RuntimeDesiredEffectContext::for_test_with_admission(
+            state_directory,
+            Instant::now() + Duration::from_secs(5),
+            admission,
+        )
+        .with_node_global_process_for_test(process)
+        .with_node_global_network_for_test(network);
+        match kernel_nbd {
+            Some(kernel_nbd) => context.with_kernel_nbd_pool_for_test(kernel_nbd),
+            None => context,
+        }
+    }
+
     fn exact_running_ip_binary(directory: &Path, checkpoint: &RuntimeCheckpoint) -> PathBuf {
         let launch = checkpoint
             .runtime_launch
@@ -8706,10 +9039,11 @@ mod tests {
                         device_major: 252,
                         device_minor: u32::from(prepared.guest_device.slot),
                         size_bytes: prepared.size_bytes,
-                        filesystem_uuid: RandomId128::new(if prepared.guest_device.slot == 0 {
-                            "dddddddddddddddddddddddddddddddd"
-                        } else {
-                            "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee"
+                        filesystem_uuid: RandomId128::new(match prepared.guest_device.slot {
+                            0 => "dddddddddddddddddddddddddddddddd",
+                            1 => "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
+                            2 => "ffffffffffffffffffffffffffffffff",
+                            _ => anyhow::bail!("test Guest fixture supports slots 0 through 2"),
                         })
                         .context("test filesystem UUID")?,
                     })
@@ -8717,22 +9051,25 @@ mod tests {
                 .collect::<anyhow::Result<Vec<_>>>()?;
             let mounts = devices
                 .iter()
-                .map(|device| RuntimeReadyMountV1 {
-                    device_major: device.device_major,
-                    device_minor: device.device_minor,
-                    source_path: device.device_path.clone(),
-                    filesystem_uuid: device.filesystem_uuid.clone(),
-                    mount_root: HostPath::new("/").expect("canonical mount root"),
-                    mount_path: HostPath::new(if device.guest_device.slot == 0 {
-                        "/"
-                    } else {
-                        "/data"
+                .map(|device| {
+                    Ok(RuntimeReadyMountV1 {
+                        device_major: device.device_major,
+                        device_minor: device.device_minor,
+                        source_path: device.device_path.clone(),
+                        filesystem_uuid: device.filesystem_uuid.clone(),
+                        mount_root: HostPath::new("/").expect("canonical mount root"),
+                        mount_path: HostPath::new(match device.guest_device.slot {
+                            0 => "/",
+                            1 => "/data",
+                            2 => "/logs",
+                            _ => anyhow::bail!("test Guest fixture supports slots 0 through 2"),
+                        })
+                        .expect("canonical test mount path"),
+                        filesystem_type: Id::new("ext4").expect("filesystem ID"),
+                        access: MountAccess::ReadWrite,
                     })
-                    .expect("canonical test mount path"),
-                    filesystem_type: Id::new("ext4").expect("filesystem ID"),
-                    access: MountAccess::ReadWrite,
                 })
-                .collect();
+                .collect::<anyhow::Result<Vec<_>>>()?;
             let mut response = RuntimeReadyResponseV1 {
                 version: request.version,
                 challenge: request.challenge,
@@ -8761,7 +9098,7 @@ mod tests {
                 }
                 RunningGuestReadyFault::ForeignPersistentUuid => {
                     anyhow::ensure!(response.mounts.len() > 1, "fault needs Persistent mount");
-                    let foreign = RandomId128::new("ffffffffffffffffffffffffffffffff")
+                    let foreign = RandomId128::new("cccccccccccccccccccccccccccccccc")
                         .context("foreign test filesystem UUID")?;
                     response.devices[1].filesystem_uuid = foreign.clone();
                     response.mounts[1].filesystem_uuid = foreign;
@@ -12599,9 +12936,33 @@ mod tests {
         let mut scan_context = assigned_context_with_root_and_persistent();
         let desired = &mut scan_context.coordinates_mut().desired.desired_specs[0];
         desired.cat_id = Id::new("c1").unwrap();
+        let mut second_persistent = desired.volumes[1].clone();
+        second_persistent.guest_device.slot = 2;
+        second_persistent.acquire = VolumeAcquire::Normal {
+            transition_id: RandomId128::new("33333333333333333333333333333333").unwrap(),
+            expected_unowned_epoch: FenceEpoch::new(0).unwrap(),
+        };
+        second_persistent.mount = Some(Ext4MountIntent {
+            filesystem_uuid: RandomId128::new("ffffffffffffffffffffffffffffffff").unwrap(),
+            mount_path: HostPath::new("/logs").unwrap(),
+            initialization: FilesystemInitialization::Existing,
+        });
+        desired.volumes.push(second_persistent);
+        let initialization_blank_head = RemoteHead {
+            generation: Generation::new(0).unwrap(),
+            root_hash: None,
+            root_object_id: None,
+        };
+        desired.volumes[1].mount.as_mut().unwrap().initialization =
+            FilesystemInitialization::Initialize {
+                initialization_token: RandomId128::new("abababababababababababababababab").unwrap(),
+                expected_blank_head: initialization_blank_head.clone(),
+            };
+        desired.volumes[1].durability = Durability::Relaxed;
         for (volume, ids) in desired.volumes.iter_mut().zip([
             ("via", "dr", "vr", "ar", "root"),
-            ("viz", "dp", "vp", "ap", "data"),
+            ("vib", "dp", "vp", "ap", "data"),
+            ("vic", "dl", "vl", "al", "logs"),
         ]) {
             volume.volume_intent_id = Id::new(ids.0).unwrap();
             volume.disk_id = Id::new(ids.1).unwrap();
@@ -12656,6 +13017,11 @@ mod tests {
             });
 
         let mut records = BTreeMap::new();
+        let initialized_persistent_head = RemoteHead {
+            generation: Generation::new(1).unwrap(),
+            root_hash: Some(Sha256Digest::from_bytes([2; 32])),
+            root_object_id: Some(AsciiText::new("roots/vp").unwrap()),
+        };
         let mut attachments = Vec::new();
         let mut devices = Vec::new();
         let mut listeners = Vec::new();
@@ -12675,8 +13041,14 @@ mod tests {
                     .unwrap(),
                 ),
             };
-            record.head = head.clone();
-            attachment.head = head;
+            if index == 1 {
+                assert_eq!(record.head, initialization_blank_head);
+                assert_eq!(attachment.head, initialization_blank_head);
+                assert_eq!(head, initialized_persistent_head);
+            } else {
+                record.head = head.clone();
+                attachment.head = head;
+            }
             let data = prepare_exact_lineage_for(&environment, &desired, index, &attachment);
             install_exact_control_only_files(&data, attachment.size_bytes);
             let mut device =
@@ -12856,11 +13228,12 @@ mod tests {
             .unwrap();
         drop(checkpoint_store);
 
+        let records = Arc::new(Mutex::new(records));
         let registry = AdmissionCellRegistry::for_state_directory(&state_directory);
         let guest_calls = Arc::new(AtomicUsize::new(0));
         let build_scanner = |fault, exact_vmms| {
             let authority: Arc<dyn VolumeDataAuthority> = Arc::new(ExactVolumeSetDataAuthority {
-                records: records.clone(),
+                records: records.lock().unwrap().clone(),
             });
             let bridge = Arc::new(ExactRunningProcessBridge {
                 state_directory: state_directory.clone(),
@@ -12900,6 +13273,318 @@ mod tests {
             )
         };
 
+        let RuntimeInventoryScanOutcome::Complete(mut early_inventory) =
+            build_scanner(RunningGuestReadyFault::Exact, true)
+                .scan_complete(scan_context.clone())
+                .unwrap()
+        else {
+            panic!("exact physical StartRuntime must remain a complete closed observation")
+        };
+        assert_eq!(guest_calls.load(Ordering::SeqCst), 0);
+        assert!(
+            early_inventory.take_running_tail_admission().is_none(),
+            "Persistent StartRuntime must not mint Running-tail authority"
+        );
+
+        let checkpoint_store = FileCheckpointStore::open(
+            &environment.state.join(CHECKPOINT_NAMESPACE),
+            &desired.cat_id,
+        )
+        .unwrap();
+        let mut phase_stored = checkpoint_store.load().unwrap().unwrap();
+        let launch = phase_stored.checkpoint().runtime_launch.identity().unwrap();
+        let mut persistent = launch
+            .devices
+            .iter()
+            .filter(|device| device.disk_kind == DiskKind::Persistent)
+            .map(|prepared| {
+                let intent = desired
+                    .volumes
+                    .iter()
+                    .find(|intent| intent.volume_id == prepared.volume_id)
+                    .unwrap();
+                let mount = intent.mount.as_ref().unwrap();
+                (
+                    PersistentFilesystemBinding {
+                        runtime_incarnation: launch.runtime_incarnation.clone(),
+                        volume_intent_id: prepared.volume_intent_id.clone(),
+                        disk_id: prepared.disk_id.clone(),
+                        volume_id: prepared.volume_id.clone(),
+                        attachment_id: prepared.attachment_id.clone(),
+                        attachment_epoch: prepared.attachment_epoch,
+                        size_bytes: prepared.size_bytes,
+                        guest_device: prepared.guest_device.clone(),
+                        filesystem_uuid: mount.filesystem_uuid.clone(),
+                        mount_path: mount.mount_path.clone(),
+                        initialization: mount.initialization.clone(),
+                    },
+                    prepared.expected_head.clone(),
+                )
+            })
+            .collect::<Vec<_>>();
+        persistent.sort_by_key(|(filesystem, _)| filesystem.guest_device.slot);
+        let first_filesystem = persistent[0].0.clone();
+        let first_head = persistent[0].1.clone();
+        let final_filesystem = persistent[1].0.clone();
+        let final_head = persistent[1].1.clone();
+        assert_eq!(first_head, initialization_blank_head);
+        for step in [
+            ReconcileStep::FormatFilesystem {
+                filesystem: Box::new(first_filesystem.clone()),
+            },
+            ReconcileStep::DrainInitialization {
+                filesystem: Box::new(first_filesystem.clone()),
+                local_generation: Generation::new(1).unwrap(),
+                remote_generation: Generation::new(0).unwrap(),
+            },
+            ReconcileStep::CommitInitialized {
+                filesystem: Box::new(first_filesystem.clone()),
+                new_remote_head: initialized_persistent_head.clone(),
+            },
+            ReconcileStep::MountFilesystem {
+                filesystem: Box::new(first_filesystem.clone()),
+                expected_head: initialized_persistent_head.clone(),
+            },
+        ] {
+            let mut early = phase_stored.checkpoint().clone();
+            early.step = step.clone();
+            phase_stored = checkpoint_store.replace(&phase_stored, &early).unwrap();
+            let RuntimeInventoryScanOutcome::Complete(mut inventory) =
+                build_scanner(RunningGuestReadyFault::Exact, true)
+                    .scan_complete(scan_context.clone())
+                    .unwrap()
+            else {
+                panic!("exact early Persistent phase must remain a complete closed observation")
+            };
+            assert!(
+                inventory.take_running_tail_admission().is_none(),
+                "early Persistent phase {step:?} minted Running-tail authority"
+            );
+            assert_eq!(
+                guest_calls.load(Ordering::SeqCst),
+                0,
+                "early Persistent phase challenged Guest Ready"
+            );
+        }
+        let mut format = phase_stored.checkpoint().clone();
+        format.step = ReconcileStep::FormatFilesystem {
+            filesystem: Box::new(first_filesystem.clone()),
+        };
+        phase_stored = checkpoint_store.replace(&phase_stored, &format).unwrap();
+        drop(checkpoint_store);
+
+        let effect_authority: Arc<dyn VolumeDataAuthority> =
+            Arc::new(SharedVolumeSetDataAuthority {
+                records: Arc::clone(&records),
+            });
+        let process_port = Arc::new(AcceptedRunningProcessPort);
+        let network = Arc::new(
+            super::super::network::PrepareNetworkReservationEffect::new(
+                state_directory.clone(),
+                exact_running_ip_binary(
+                    environment.state.parent().unwrap(),
+                    phase_stored.checkpoint(),
+                ),
+                Arc::clone(&effect_authority),
+                Arc::clone(&process_port)
+                    as Arc<
+                        dyn super::super::serving_blockd_process::ServingBlockdProcessGlobalPort,
+                    >,
+            )
+            .unwrap(),
+        );
+        let kernel_nbd_revalidation = kernel_nbd_client.as_ref().map(|client| {
+            KernelNbdInventoryConfig::fixture(
+                state_directory.clone(),
+                environment.block_root.clone(),
+                environment.proc_root.clone(),
+                client.clone(),
+                u32::try_from(desired.volumes.len()).unwrap(),
+            )
+        });
+        let revalidator = Arc::new(
+            super::super::RunningLaunchAuthorityRevalidator::platform_parts(
+                state_directory.clone(),
+                test_root_provision_systemd(&environment.blockd_binary),
+                network,
+                Arc::clone(&effect_authority),
+                Arc::clone(&process_port)
+                    as Arc<
+                        dyn super::super::serving_blockd_process::ServingBlockdProcessGlobalPort,
+                    >,
+                process_port as Arc<dyn super::super::vmm_process::VmmProcessGlobalPort>,
+                kernel_nbd_revalidation,
+            ),
+        );
+        let filesystem_operations = Arc::new(Mutex::new(Vec::new()));
+        let filesystem_guest = Arc::new(ScriptedPersistentGuest {
+            formatted: AtomicBool::new(false),
+            lose_first_format_response: AtomicBool::new(true),
+            operations: Arc::clone(&filesystem_operations),
+        });
+        let drains = Arc::new(AtomicUsize::new(0));
+        let blockd = Arc::new(AdvancingRelaxedBlockd {
+            records: Arc::clone(&records),
+            volume_id: first_filesystem.volume_id.clone(),
+            initialized_head: initialized_persistent_head.clone(),
+            drains: Arc::clone(&drains),
+        });
+        let commits = Arc::new(AtomicUsize::new(0));
+        let filesystem_effect = super::super::PersistentFilesystemEffect::for_test(
+            effect_authority,
+            Arc::new(CommitInitializedPort {
+                calls: Arc::clone(&commits),
+            }),
+            filesystem_guest,
+            blockd,
+            revalidator,
+        );
+        let apply_filesystem_round = || {
+            assert!(
+                registry
+                    .existing_session(&desired.cat_id)
+                    .unwrap()
+                    .is_none(),
+                "an early filesystem scan created a Running admission session"
+            );
+            let RuntimeInventoryScanOutcome::Complete(inventory) =
+                build_scanner(RunningGuestReadyFault::Exact, true)
+                    .scan_complete(scan_context.clone())
+                    .unwrap()
+            else {
+                panic!("filesystem phase must retain one complete physical inventory")
+            };
+            let context = bind_inventory_for_running_effect(
+                inventory,
+                &scan_context,
+                state_directory.clone(),
+            );
+            assert_eq!(
+                filesystem_effect.try_apply(&context, &desired).unwrap(),
+                Some(RuntimeDesiredEffectOutcome::RefreshInventory)
+            );
+        };
+
+        // mkfs succeeds but its first response is lost. The next accepted-full
+        // round adopts the exact UUID and must not issue a second format.
+        let load_filesystem_checkpoint = || {
+            FileCheckpointStore::open(
+                &environment.state.join(CHECKPOINT_NAMESPACE),
+                &desired.cat_id,
+            )
+            .unwrap()
+            .load()
+            .unwrap()
+            .unwrap()
+        };
+        apply_filesystem_round();
+        assert!(matches!(
+            load_filesystem_checkpoint().checkpoint().step,
+            ReconcileStep::FormatFilesystem { .. }
+        ));
+        apply_filesystem_round();
+        let after_format = load_filesystem_checkpoint();
+        assert!(matches!(
+            after_format.checkpoint().step,
+            ReconcileStep::DrainInitialization {
+                local_generation,
+                remote_generation,
+                ..
+            } if local_generation.get() == 1 && remote_generation.get() == 0
+        ));
+        apply_filesystem_round();
+        let after_drain = load_filesystem_checkpoint();
+        assert!(matches!(
+            &after_drain.checkpoint().step,
+            ReconcileStep::CommitInitialized {
+                new_remote_head,
+                ..
+            } if new_remote_head == &initialized_persistent_head
+        ));
+        apply_filesystem_round();
+        let after_commit = load_filesystem_checkpoint();
+        assert!(matches!(
+            &after_commit.checkpoint().step,
+            ReconcileStep::MountFilesystem {
+                filesystem,
+                expected_head,
+            } if filesystem.volume_id == first_filesystem.volume_id
+                && expected_head == &initialized_persistent_head
+        ));
+        apply_filesystem_round();
+        let after_mount = load_filesystem_checkpoint();
+        assert!(matches!(
+            &after_mount.checkpoint().step,
+            ReconcileStep::MountFilesystem {
+                filesystem,
+                expected_head,
+            } if filesystem.as_ref() == &final_filesystem
+                && expected_head == &final_head
+        ));
+
+        // The durable Mount checkpoint is only a lower bound on the current
+        // attachment head. A write to an already mounted sibling may publish a
+        // later head before this final volume is handled. Both the fresh Probe
+        // and the post-launch-barrier Mount must bind that same current head;
+        // replaying the checkpoint's older head would be stale authority.
+        let advanced_final_head = RemoteHead {
+            generation: Generation::new(final_head.generation.get() + 1).unwrap(),
+            root_hash: Some(Sha256Digest::from_bytes([9; 32])),
+            root_object_id: Some(AsciiText::new("roots/vl-advanced").unwrap()),
+        };
+        records
+            .lock()
+            .unwrap()
+            .get_mut(&final_filesystem.volume_id)
+            .unwrap()
+            .head = advanced_final_head.clone();
+        apply_filesystem_round();
+        let after_final_mount = load_filesystem_checkpoint();
+        assert!(matches!(
+            &after_final_mount.checkpoint().step,
+            ReconcileStep::MountFilesystem {
+                filesystem,
+                expected_head,
+            } if filesystem.as_ref() == &final_filesystem
+                && expected_head == &final_head
+        ));
+        assert_eq!(drains.load(Ordering::SeqCst), 1);
+        assert_eq!(commits.load(Ordering::SeqCst), 1);
+        let operations = filesystem_operations.lock().unwrap();
+        assert_eq!(
+            operations
+                .iter()
+                .filter(|(operation, _, _)| {
+                    *operation == FilesystemControlOperationV1::FormatExt4
+                })
+                .count(),
+            1,
+            "an ambiguous mkfs response must be adopted by exact UUID probe"
+        );
+        let final_mount_operations = operations
+            .iter()
+            .filter(|(_, volume_id, _)| volume_id == &final_filesystem.volume_id)
+            .collect::<Vec<_>>();
+        assert_eq!(
+            final_mount_operations.len(),
+            2,
+            "the final Existing volume needs one exact Probe and Mount"
+        );
+        assert!(final_mount_operations.iter().all(|(operation, _, head)| {
+            matches!(
+                operation,
+                FilesystemControlOperationV1::Probe | FilesystemControlOperationV1::MountExt4
+            ) && head == &advanced_final_head
+        }));
+        assert!(operations.iter().all(|(_, volume_id, head)| {
+            if volume_id == &final_filesystem.volume_id {
+                head == &advanced_final_head
+            } else {
+                head == &initialization_blank_head || head == &initialized_persistent_head
+            }
+        }));
+        drop(operations);
+
         let RuntimeInventoryScanOutcome::Complete(mut inventory) =
             build_scanner(RunningGuestReadyFault::Exact, true)
                 .scan_complete(scan_context.clone())
@@ -12907,10 +13592,14 @@ mod tests {
         else {
             panic!("exact Root + Persistent physical set must complete")
         };
-        assert_eq!(guest_calls.load(Ordering::SeqCst), 1);
-        assert_eq!(inventory.runtimes()[0].volumes.len(), 2);
-        assert_eq!(inventory.runtimes()[0].mounts.len(), 2);
-        assert_eq!(inventory.runtimes()[0].processes.len(), 3);
+        assert_eq!(
+            guest_calls.load(Ordering::SeqCst),
+            2,
+            "the final-Mount effect scan and acceptance scan each challenge the exact mounted set"
+        );
+        assert_eq!(inventory.runtimes()[0].volumes.len(), 3);
+        assert_eq!(inventory.runtimes()[0].mounts.len(), 3);
+        assert_eq!(inventory.runtimes()[0].processes.len(), 4);
         let bind_inventory = |inventory: &mut crate::runtime_spine::CompleteRuntimeInventory| {
             let process_scan = inventory
                 .take_node_global_process_admission()
@@ -13207,7 +13896,7 @@ mod tests {
         let mut gate_scan_context = scan_context.clone();
         gate_scan_context.coordinates_mut().desired.desired_specs[0] = gate_desired.clone();
         let authority: Arc<dyn VolumeDataAuthority> = Arc::new(ExactVolumeSetDataAuthority {
-            records: records.clone(),
+            records: records.lock().unwrap().clone(),
         });
         let bridge = Arc::new(ExactRunningProcessBridge {
             state_directory: state_directory.clone(),

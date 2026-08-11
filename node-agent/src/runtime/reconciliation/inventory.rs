@@ -51,7 +51,7 @@ use super::{
         RootProvisionProcessExpectation, StopReceiptSocketAdmission,
         TargetControlProcessLaunchIdentity,
     },
-    running_admission::RunningTailScanAdmission,
+    running_admission::{classify_running_tail_phase, RunningTailScanAdmission},
     running_launch_authority::{
         validate_retained_running_close_scan_exact_set, validate_retained_running_scan_exact_set,
     },
@@ -902,6 +902,13 @@ impl RuntimeInventoryScanner for CleanSlateInventoryScanner {
                 if desired.target != RuntimeTarget::Running
                     || checkpoint_evidence.binding != DesiredCheckpointBinding::Current
                 {
+                    continue;
+                }
+                // This gate applies only to current Running Ready/Install
+                // authority. Superseded/global-negative route retirement must
+                // be classified before reaching this branch so an early
+                // filesystem phase cannot suppress close/drain convergence.
+                if !classify_running_tail_phase(desired, checkpoint)?.permits_physical_proof() {
                     continue;
                 }
                 let Some(vmm) = validate_retained_running_scan_exact_set(

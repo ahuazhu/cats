@@ -587,7 +587,7 @@ impl ServingBlockdExpectation {
 
     #[cfg(test)]
     pub(crate) fn exact_evidence_for_test(&self, process_id: u32) -> ServingBlockdProcessEvidence {
-        let head_generation = i64::try_from(self.volume.attachment.head.generation.get()).unwrap();
+        let head_generation = i64::try_from(self.expected_remote_head.generation.get()).unwrap();
         ServingBlockdProcessEvidence {
             process_id,
             unit_main_process_id: process_id,
@@ -623,7 +623,7 @@ impl ServingBlockdExpectation {
                 device_ownership_token: Some(self.device_ownership_token.clone()),
                 guest_device_serial: Some(self.volume.volume.guest_device.serial.clone()),
                 control_only: Some(false),
-                remote_head: Some(self.volume.attachment.head.clone()),
+                remote_head: Some(self.expected_remote_head.clone()),
                 mode: match self.volume.attachment.durability {
                     cats_api::runtime_reconciliation::Durability::Strict => "strict",
                     cats_api::runtime_reconciliation::Durability::Relaxed => "relaxed",
@@ -1090,10 +1090,26 @@ impl RetainedServingBlockdAuthority {
         desired: &DesiredRuntimeSpec,
         authority: &VolumeRecord,
     ) -> anyhow::Result<ServingBlockdExpectation> {
-        self.expectation_running(systemd, desired, authority)
+        let expected = self.build_expectation(systemd, desired, authority)?;
+        anyhow::ensure!(
+            expected.matches_current_authority(authority),
+            "retained serving authority conflicts with current Volume authority"
+        );
+        Ok(expected)
     }
 
     pub(crate) fn expectation_running(
+        &self,
+        systemd: &RootProvisionSystemdConfig,
+        checkpoint: &RuntimeCheckpoint,
+        physical_desired: &DesiredRuntimeSpec,
+        authority: &VolumeRecord,
+    ) -> anyhow::Result<ServingBlockdExpectation> {
+        self.build_expectation(systemd, physical_desired, authority)?
+            .with_current_authority(checkpoint, authority)
+    }
+
+    fn build_expectation(
         &self,
         systemd: &RootProvisionSystemdConfig,
         physical_desired: &DesiredRuntimeSpec,
@@ -1143,10 +1159,6 @@ impl RetainedServingBlockdAuthority {
                 )?
             }
         };
-        anyhow::ensure!(
-            expected.matches_current_authority(authority),
-            "retained serving authority conflicts with current Volume authority"
-        );
         Ok(expected)
     }
 
