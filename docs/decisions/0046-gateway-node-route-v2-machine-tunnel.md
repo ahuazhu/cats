@@ -22,19 +22,24 @@ Control resolve已经由current PostgreSQL Gateway credential签发Grant。若Gr
    Node先完成TLS client chain验证，再从同一connection的leaf提取相同digest；不匹配是pre-admission
    `BindingMismatch`。SAN、subject、remote IP和HTTP header不提供Cats authority。
 2. authenticated resolve success增加`cat_id`。Gateway仍不解析Grant；它只保存Control返回的typed字段和
-   opaque bytes。`cat_id`只用于定位Node进程内同一`AdmissionCellRegistry`，最终authority仍是验签claims和cell。
+   opaque bytes。Node必须先验签并把frame的`cat_id`精确绑定到claims，再只用已验证claims中的`cat_id`定位
+   进程内同一`AdmissionCellRegistry`；不得用未验证frame探测registry。最终authority仍是验签claims和cell。
 3. 每个应用connection使用一个TLS 1.3、ALPN `http/1.1`的machine request：
    `POST /v1/internal/routes/tunnel`，无query，exact `application/json`、`Connection: upgrade`和
    `Upgrade: cats-route-v2-tunnel`。canonical body依次包含`version,cat_id,endpoint_id,hostname,
    opaque_grant,grant_sha256`，最多5120 bytes。禁止Authorization、Cookie、content encoding、transfer
    encoding、method override和未知header。
-4. 这一个request就是实际proxy，不是preflight。Node完成mTLS proof、strict frame、Grant verification和
-   shared per-Cat cell内的binding/gate/guard linearization后，从同一snapshot取得checkpointed Guest IPv4，
-   在guard外连接Grant的exact target port；成功才返回`101`。101后的raw bytes承载public HTTP/1.1或
-   WebSocket，内部frame和Grant永不进入Guest。
-5. Guest IPv4只来自同一exact `runtime_launch.network.network_config`；缺launch target、缺registry cell、
-   缺physical Ready所打开的gate均fail closed为`RuntimeNotReady`或`GateClosed`。transport不创造Guest
-   Ready scanner proof，也不因checkpoint中存在Active entry而在进程重启后自动重开。
+4. 这一个request就是实际proxy，不是preflight。Node完成mTLS proof、strict frame、Grant signature/claims及
+   完整request binding验证，产生不可由wire构造的claims/time proof；随后才按该proof的Cat定位shared
+   per-Cat cell并完成binding/gate/guard linearization，从同一snapshot取得checkpointed Guest IPv4，在guard外
+   连接Grant的exact target port；成功才返回`101`。101后的raw bytes承载public HTTP/1.1或WebSocket，内部
+   frame和Grant永不进入Guest。tampered signature或unknown `kid`在Cat present/absent时必须同错且零guard/I/O；
+   只有完整已验证请求的Cat确实absent时才返回`RuntimeNotReady`。
+5. Guest IPv4只来自同一exact `runtime_launch.network.network_config`；同一cell、同一runtime incarnation的
+   lifecycle open、Endpoint install/close/remove、全局close/try-close及RequireIdle Busy source transition都必须
+   保持该值逐字段不变，IP变化只能随new incarnation/new cell发布。缺launch target、缺registry cell、缺physical
+   Ready所打开的gate均fail closed为`RuntimeNotReady`或`GateClosed`。transport不创造Guest Ready scanner proof，
+   也不因checkpoint中存在Active entry而在进程重启后自动重开。
 6. 只有尚未取得guard的闭集failure使用canonical typed envelope和`guard_acquired=false`。取得guard后的
    connect/upgrade/stream失败只使用`UpstreamUnavailable, guard_acquired=true`或关闭stream。Gateway只把
    authenticated pre-admission refreshable failure交给既有exact-digest cache规则；当前request绝不重放。

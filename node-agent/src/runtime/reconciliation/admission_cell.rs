@@ -350,6 +350,7 @@ impl AdmissionGatePort for AdmissionCellPort {
             || expected.spec_digest() != replacement.spec_digest()
             || expected.runtime_incarnation().is_none()
             || expected.runtime_incarnation() != replacement.runtime_incarnation()
+            || expected.guest_ipv4() != replacement.guest_ipv4()
             || expected.lifecycle_admission() != LifecycleAdmission::Closed
             || replacement.lifecycle_admission() != LifecycleAdmission::Open
             || !expected.endpoints().is_empty()
@@ -592,6 +593,7 @@ fn valid_endpoint_top_transition(
 ) -> bool {
     expected.placement() == replacement.placement()
         && expected.runtime_incarnation() == replacement.runtime_incarnation()
+        && expected.guest_ipv4() == replacement.guest_ipv4()
         && replacement.applied_desired_revision() >= expected.applied_desired_revision()
         && (replacement.applied_desired_revision() > expected.applied_desired_revision()
             || replacement.spec_digest() == expected.spec_digest())
@@ -649,6 +651,7 @@ fn validate_global_close(
         || replacement_placement.node_id != expected_placement.node_id
         || replacement_placement.placement_epoch < expected_placement.placement_epoch
         || replacement.runtime_incarnation() != expected.runtime_incarnation()
+        || replacement.guest_ipv4() != expected.guest_ipv4()
         || replacement.lifecycle_admission() != LifecycleAdmission::Closed
         || replacement
             .endpoints()

@@ -438,29 +438,32 @@ async fn handle_tunnel_request(
         Ok(frame) => frame,
         Err(_) => return Ok(plain_response(StatusCode::BAD_REQUEST)),
     };
-    let Some(cell) = service.registry.get(&frame.cat_id) else {
-        return Ok(failure_response(
-            RouteAdmissionV2Failure::pre_admission(RouteAdmissionV2Reason::RuntimeNotReady)
-                .expect("RuntimeNotReady is pre-admission"),
-        ));
-    };
     let now = match SystemTime::now().duration_since(UNIX_EPOCH) {
         Ok(now) => now.as_secs(),
         Err(_) => return Ok(plain_response(StatusCode::SERVICE_UNAVAILABLE)),
     };
     let binding = RouteAdmissionV2RequestBinding {
         local_node_id: service.local_node_id.clone(),
+        cat_id: frame.cat_id,
         endpoint_id: frame.endpoint_id,
         canonical_hostname: frame.hostname,
         protocol: HttpProtocol::Http,
     };
-    let admitted = match service.verifier.verify_and_admit(
-        &principal,
-        &frame.opaque_grant,
-        &binding,
-        now,
-        &cell,
-    ) {
+    let verified =
+        match service
+            .verifier
+            .verify_request(&principal, &frame.opaque_grant, &binding, now)
+        {
+            Ok(verified) => verified,
+            Err(failure) => return Ok(failure_response(failure)),
+        };
+    let Some(cell) = service.registry.get(verified.cat_id()) else {
+        return Ok(failure_response(
+            RouteAdmissionV2Failure::pre_admission(RouteAdmissionV2Reason::RuntimeNotReady)
+                .expect("RuntimeNotReady is pre-admission"),
+        ));
+    };
+    let admitted = match verified.admit(&cell) {
         Ok(admitted) => admitted,
         Err(failure) => return Ok(failure_response(failure)),
     };
@@ -856,17 +859,20 @@ mod tests {
     }
 
     fn sign(keys: &TestKeys, claims: &RouteGrantV2Claims) -> String {
+        sign_with_private(&keys.public, &keys.private, claims)
+    }
+
+    fn sign_with_private(
+        public: &RouteGrantV2PublicKey,
+        private: &Ed25519KeyPair,
+        claims: &RouteGrantV2Claims,
+    ) -> String {
         let input = RouteGrantV2SigningInput::new(
-            &RouteGrantV2ProtectedHeader::new(keys.public.kid().clone()),
+            &RouteGrantV2ProtectedHeader::new(public.kid().clone()),
             claims,
         )
         .unwrap();
-        let signature: [u8; 64] = keys
-            .private
-            .sign(input.as_bytes())
-            .as_ref()
-            .try_into()
-            .unwrap();
+        let signature: [u8; 64] = private.sign(input.as_bytes()).as_ref().try_into().unwrap();
         input.finish(&signature).unwrap()
     }
 
@@ -1130,6 +1136,25 @@ mod tests {
         );
         assert_eq!(failure.reason, RouteAdmissionV2Reason::BindingMismatch);
 
+        let wrong_frame_cat = RouteTunnelV2Request::new(
+            Id::new("cat_untrusted_frame").unwrap(),
+            active_claims.endpoint_id.clone(),
+            active_claims.hostname.clone(),
+            sign(&keys, &active_claims),
+        )
+        .unwrap();
+        let (_, failure) = rejection(
+            exchange(
+                listener.addr(),
+                &wrong_frame_cat,
+                CLIENT_CERTIFICATE,
+                CLIENT_PRIVATE_KEY,
+            )
+            .await
+            .unwrap(),
+        );
+        assert_eq!(failure.reason, RouteAdmissionV2Reason::BindingMismatch);
+
         let mut expired = active_claims.clone();
         expired.iat = now() - 120;
         expired.nbf = expired.iat;
@@ -1217,6 +1242,83 @@ mod tests {
         .await
         .is_err());
         listener.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn unverified_grants_cannot_probe_registry_presence_or_touch_guest() {
+        let guest = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let target_port = guest.local_addr().unwrap().port();
+        let trusted = keys();
+        let untrusted = keys();
+        let claims = claims("cat_probe", "ep_probe", target_port);
+        let active = cell(&claims, RouteGateState::Active);
+        let present_root = TempDir::new().unwrap();
+        let present_registry = AdmissionCellRegistry::new(present_root.path().join("checkpoints"));
+        present_registry
+            .insert_cell_for_machine_test(claims.cat_id.clone(), Arc::clone(&active))
+            .unwrap();
+        let absent_root = TempDir::new().unwrap();
+        let absent_registry = AdmissionCellRegistry::new(absent_root.path().join("checkpoints"));
+        let mut present_listener = listener(&trusted, present_registry).await;
+        let mut absent_listener = listener(&trusted, absent_registry).await;
+
+        let invalid_signature = sign_with_private(&trusted.public, &untrusted.private, &claims);
+        let unknown_kid = sign(&untrusted, &claims);
+        for (token, expected_reason) in [
+            (invalid_signature, RouteAdmissionV2Reason::InvalidSignature),
+            (unknown_kid, RouteAdmissionV2Reason::UnknownKey),
+        ] {
+            let present = rejection(
+                exchange(
+                    present_listener.addr(),
+                    &frame(&claims, token.clone()),
+                    CLIENT_CERTIFICATE,
+                    CLIENT_PRIVATE_KEY,
+                )
+                .await
+                .unwrap(),
+            );
+            let absent = rejection(
+                exchange(
+                    absent_listener.addr(),
+                    &frame(&claims, token),
+                    CLIENT_CERTIFICATE,
+                    CLIENT_PRIVATE_KEY,
+                )
+                .await
+                .unwrap(),
+            );
+            assert_eq!(present, absent);
+            assert_eq!(present.0, StatusCode::CONFLICT);
+            assert_eq!(present.1.reason, expected_reason);
+            assert!(!present.1.guard_acquired);
+            assert_eq!(active.active_guards(&claims.endpoint_id), Some(0));
+        }
+
+        let (_, valid_absent) = rejection(
+            exchange(
+                absent_listener.addr(),
+                &frame(&claims, sign(&trusted, &claims)),
+                CLIENT_CERTIFICATE,
+                CLIENT_PRIVATE_KEY,
+            )
+            .await
+            .unwrap(),
+        );
+        assert_eq!(
+            valid_absent,
+            RouteAdmissionV2Failure::pre_admission(RouteAdmissionV2Reason::RuntimeNotReady)
+                .unwrap()
+        );
+        assert!(
+            tokio::time::timeout(Duration::from_millis(50), guest.accept())
+                .await
+                .is_err()
+        );
+        assert_eq!(active.active_guards(&claims.endpoint_id), Some(0));
+
+        present_listener.shutdown().await.unwrap();
+        absent_listener.shutdown().await.unwrap();
     }
 
     #[tokio::test]

@@ -1357,6 +1357,63 @@ fn fresh_running_after_open_busy_keeps_the_same_gate_epoch() {
 }
 
 #[test]
+fn fresh_running_after_open_busy_rejects_guest_ipv4_source_drift() {
+    let root = TempDir::new().expect("tempdir");
+    let source_desired = desired(
+        1,
+        RuntimeTarget::Running,
+        7,
+        RuntimeTransition::CancelAndDrain,
+    );
+    let source_checkpoint = running_checkpoint(&source_desired, 10);
+    let store = store(&root, &source_desired.cat_id);
+    let source = store.create(&source_checkpoint).expect("source checkpoint");
+    let suspended = require_idle_desired(2, 1, 7, 'e');
+    let mut port = FakePort::new(
+        AdmissionSnapshot::from_checkpoint(&source_checkpoint).expect("snapshot"),
+        store.path(),
+    );
+    port.idle_results.push_back(Ok(IdleCloseResult::Busy {
+        platform_guards: 1,
+        endpoint_guards: Vec::new(),
+    }));
+    port.expected_disk.push_back(DiskMarker::Armed);
+    let busy = GateSequencer::new(&store, &mut port)
+        .begin_require_idle(&source, &suspended, times(20, 21))
+        .expect("Busy");
+    let GateTransitionResult::RequireIdleBusy {
+        checkpoint: busy,
+        gate_closed: false,
+        ..
+    } = busy
+    else {
+        panic!("expected open Busy")
+    };
+
+    let live = port.current.clone();
+    port.current = AdmissionSnapshot::new(
+        live.applied_desired_revision(),
+        live.spec_digest().clone(),
+        live.placement().clone(),
+        live.runtime_incarnation().cloned(),
+        live.lifecycle_admission(),
+        live.endpoints().to_vec(),
+    )
+    .with_guest_ipv4(Ipv4Address::new("10.240.0.10").expect("drifted Guest IP"));
+    let fresh_running = desired(
+        3,
+        RuntimeTarget::Running,
+        7,
+        RuntimeTransition::CancelAndDrain,
+    );
+    let error = GateSequencer::new(&store, &mut port)
+        .install_gate(&busy, &fresh_running, &id("ep_01"), times(30, 31))
+        .expect_err("same-incarnation Guest IP drift must not become a new target");
+    assert!(matches!(error, GateReconcileError::WrongOpenBusySource));
+    assert_eq!(port.calls, vec![PortCall::TryIdle]);
+}
+
+#[test]
 fn ordinary_transition_after_open_busy_compares_the_live_source_tuple() {
     let root = TempDir::new().expect("tempdir");
     let source_desired = desired(

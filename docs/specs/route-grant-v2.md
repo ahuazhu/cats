@@ -210,10 +210,13 @@ request body最多5120 bytes，是canonical JSON：
 {"version":2,"cat_id":"cat_01","endpoint_id":"ep_01","hostname":"app.cats.run","opaque_grant":"...","grant_sha256":"sha256:..."}
 ```
 
-Node先用`cat_id`在本进程唯一registry定位cell；该字段不授权。Node验签后比较Grant中的Gateway leaf digest、
-local Node/request binding与同一cell binding，在cell内原子取得guard和checkpointed Guest IPv4，再在锁外连接
-Grant target port。成功返回`101`，同一exchange随后成为public HTTP/WebSocket raw byte tunnel；Grant和内部
-frame不进入Guest。这是实际proxy request，不是裸Grant preflight。
+Node先验证Grant signature/claims并把frame的`cat_id/endpoint_id/hostname`与local Node/protocol完整request
+binding逐字段闭合，产生不可由wire构造的claims/time proof；只有随后才允许用该proof中已验证的`cat_id`在
+本进程唯一registry定位cell。未验证frame的`cat_id`不得触发registry lookup。Node再比较Grant中的Gateway leaf
+digest与同一cell binding，在cell内原子取得guard和checkpointed Guest IPv4，再在锁外连接Grant target port。
+成功返回`101`，同一exchange随后成为public HTTP/WebSocket raw byte tunnel；Grant和内部frame不进入Guest。
+这是实际proxy request，不是裸Grant preflight。tampered signature和unknown `kid`不得因Cat present/absent改变
+typed error或触达guard/Guest；只有完整已验证请求对应的Cat absent才返回`RuntimeNotReady`。
 
 full inventory中的ring version/digest/`loaded_kids`必须从这个listener实际使用的同一进程
 `Arc<RouteGrantV2Verifier>`读取；磁盘ring只是在下次受控启动时可加载的candidate，不能冒充已加载事实。
@@ -267,8 +270,10 @@ Node 对每个内部请求按以下顺序执行：
 2. 严格解析 protected header，按 `kid` 选择本地 ring key并验证 Ed25519 signature。
 3. 严格 decode claims，验证 version/issuer/audience/字段结构；计算 time verdict，但先不返回
    `Expired/NotYetValid`。
-4. 比较请求到达的 Node、canonical hostname、Endpoint 和 protocol。
-5. 进入该Cat的短临界区`AdmissionCell`，加载对应Endpoint entry；精确比较workspace、Cat、Node、
+4. 比较请求到达的 Node、frame Cat、canonical hostname、Endpoint 和 protocol；只有全部相等才产生不可由wire
+   构造的verified claims/time proof，并按proof的claims Cat查询registry。有效签名对应的cell absent返回
+   `RuntimeNotReady`；在此之前不得观察registry。
+5. 进入已验证Cat的短临界区`AdmissionCell`，加载对应Endpoint entry；精确比较workspace、Cat、Node、
    runtime incarnation、route epoch、hostname、protocol、port和platform target。
 6. 若 binding 不同返回 `BindingMismatch`；若 gate/target 已关闭返回 `GateClosed` 或
    `RuntimeNotReady`。只有 binding 和 Active gate 都有效时才返回步骤 3 的时间错误。
@@ -282,9 +287,11 @@ admission、Endpoint/Platform guards 和 cancellation handles。HTTP/WebSocket�
 
 当前Node core实现以同一个mutex同时承载complete `AdmissionSnapshot` compare-and-apply和已验签Grant的
 binding compare/guard increment；snapshot精确包含desired revision、spec digest、placement、runtime
-incarnation、checkpointed Guest IPv4、lifecycle与全部Endpoint bindings。replacement在取得mutex前完整验证；Endpoint-scoped
-stale revision/spec/placement compare零副作用，全局compare歧义则fail closed。Endpoint close和新guard
-不能跨两个锁竞态。guard是不可clone的RAII值，
+incarnation、checkpointed Guest IPv4、lifecycle与全部Endpoint bindings。replacement在取得mutex前完整验证；
+同一cell/incarnation的open、install/close/remove、global close/try-close与RequireIdle open-Busy source都要求
+Guest IPv4完全相等，target变化只能进入new incarnation/new cell。Endpoint-scoped stale
+revision/spec/placement/target compare零副作用，全局compare歧义则fail closed。Endpoint close和新guard不能跨
+两个锁竞态。guard是不可clone的RAII值，
 普通返回、错误、panic和async task取消都经`Drop`归还。machine transport只从CA-verified TLS leaf构造
 不可由wire生成的typed Gateway principal，并用同一registry执行该core；它不从header构造principal。
 
@@ -449,7 +456,11 @@ observation revision，不能把desired revision塞回Grant vector。
 - Node machine TLS矩阵覆盖有效Gateway leaf、无client certificate、未知CA、错误EKU、非Ed25519 leaf和
   错误ALPN；有效chain但Grant绑定另一Gateway SPKI时必须在Guest connect前返回`BindingMismatch`；
 - tunnel frame覆盖noncanonical/duplicate/unknown/oversize header与body、错误digest、错误Node、过期Grant、
-  缺registry cell、缺Guest target和Closed gate；只有完整认证/验签/gate通过才允许触达Guest socket；
+  frame Cat与claims Cat不等、缺registry cell、缺Guest target和Closed gate；tampered signature/unknown `kid`在
+  registry present/absent时同错且零guard/Guest I/O，只有valid signed absent Cat返回`RuntimeNotReady`；只有完整
+  认证/验签/request binding/gate通过才允许触达Guest socket；
+- same-incarnation AdmissionSnapshot的open、install、close、remove、global close、try-close与RequireIdle Busy
+  source逐项拒绝Guest IPv4-only drift；两个Active Endpoint下close A不能改变B取得的target；
 - Gateway到Node每个current request最多一次TCP/TLS/HTTP attempt；TLS/HTTP/Guest失败和typed rejection均不
   自动重放。`101`后的双向EOF/cancel以及Node shutdown都必须有界结束并把guard/permit归零；
 - pre-admission stale rejection与新resolve竞争时，旧 digest不能删除新entry；当前POST和WebSocket

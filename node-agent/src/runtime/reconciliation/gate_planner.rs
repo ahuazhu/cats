@@ -1173,10 +1173,12 @@ impl<'a, P: AdmissionGatePort> GateSequencer<'a, P> {
         if desired.desired_revision <= current.checkpoint().desired_revision {
             return Err(GateReconcileError::WrongOpenBusySource);
         }
+        let checkpoint_snapshot = AdmissionSnapshot::from_checkpoint(current.checkpoint())?;
         let live = self.port.snapshot();
         if live.applied_desired_revision() != *source_revision
             || live.placement() != &checkpoint_placement(current.checkpoint())
             || live.runtime_incarnation() != Some(source_runtime_incarnation)
+            || live.guest_ipv4() != checkpoint_snapshot.guest_ipv4()
             || live.lifecycle_admission() != LifecycleAdmission::Open
             || live.endpoints() != current.checkpoint().route_gates
             || current.checkpoint().lifecycle_admission != LifecycleAdmission::Open

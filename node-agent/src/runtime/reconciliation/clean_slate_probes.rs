@@ -1105,12 +1105,9 @@ pub(crate) fn installed_clean_slate_scanner(
     )));
     let blob_store = Arc::clone(&config.blob_store);
     let config = ProbeConfig::installed(config)?;
-    let scanner = scanner_with_metadata_authority_and_blob(
-        config,
-        metadata_authority,
-        Some(blob_store),
-    )?
-    .with_running_tail(admission_registry);
+    let scanner =
+        scanner_with_metadata_authority_and_blob(config, metadata_authority, Some(blob_store))?
+            .with_running_tail(admission_registry);
     let scanner = match route_grant_verifier {
         Some(verifier) => scanner
             .with_key_ring_reader(Arc::new(ActiveRuntimeInventoryKeyRingReader::new(verifier))),
