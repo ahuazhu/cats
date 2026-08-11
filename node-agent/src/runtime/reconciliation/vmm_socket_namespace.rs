@@ -540,12 +540,24 @@ impl VmmSocketReceiptStore {
         &self,
         incarnation: &RandomId128,
     ) -> anyhow::Result<Option<VmmSocketOwnershipReceiptV1>> {
+        self.load_inner(incarnation, || Ok(()))
+    }
+
+    fn load_inner(
+        &self,
+        incarnation: &RandomId128,
+        after_observation: impl FnOnce() -> anyhow::Result<()>,
+    ) -> anyhow::Result<Option<VmmSocketOwnershipReceiptV1>> {
         self.assert_current()?;
         let name = receipt_file_name(incarnation)?;
-        let Some(bytes) = read_optional_receipt(&self.directory, &name)? else {
-            return Ok(None);
-        };
-        decode_receipt(&bytes).map(Some)
+        let observed = read_optional_receipt(&self.directory, &name)?;
+        after_observation()?;
+        // The retained descriptor is only authority while the complete
+        // lexical Node-state/receipt-namespace chain still selects it.  This
+        // final check closes both a present-read and an absent-read rename
+        // window before either observation escapes to reconciliation.
+        self.assert_current()?;
+        observed.map(|bytes| decode_receipt(&bytes)).transpose()
     }
 
     pub(crate) fn publish(
@@ -572,6 +584,10 @@ impl VmmSocketReceiptStore {
                 .sync_all()
                 .context("settle replayed VMM socket receipt directory")?;
             checkpoint(ReceiptPublicationPoint::DirectorySynced)?;
+            // Exact replay is still a physical admission result.  Revalidate
+            // the complete lexical namespace after the last injected/crash
+            // boundary, just as the newly-published path does below.
+            self.assert_current()?;
             return Ok(VmmSocketReceiptPublication::ExactReplay);
         }
 
@@ -951,6 +967,10 @@ fn host_path(path: PathBuf, label: &str) -> anyhow::Result<HostPath> {
 #[cfg(test)]
 mod tests {
     #[cfg(target_os = "linux")]
+    use std::io::Write as _;
+    #[cfg(target_os = "linux")]
+    use std::os::unix::ffi::OsStrExt as _;
+    #[cfg(target_os = "linux")]
     use std::os::unix::fs::{symlink, OpenOptionsExt as _};
 
     use cats_api::runtime_reconciliation::decode_runtime_checkpoint;
@@ -1000,6 +1020,78 @@ mod tests {
 
     fn creation_nonce() -> RandomId128 {
         RandomId128::new("bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb").unwrap()
+    }
+
+    #[cfg(target_os = "linux")]
+    fn state_path(temporary: &tempfile::TempDir) -> PathBuf {
+        temporary.path().join("authority").join("state")
+    }
+
+    #[cfg(target_os = "linux")]
+    fn receipt_namespace_path(temporary: &tempfile::TempDir) -> PathBuf {
+        state_path(temporary).join(VMM_SOCKET_RECEIPT_NAMESPACE)
+    }
+
+    #[cfg(target_os = "linux")]
+    fn write_foreign(path: &Path, bytes: &[u8]) {
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(path)
+            .unwrap();
+        file.write_all(bytes).unwrap();
+        file.sync_all().unwrap();
+    }
+
+    #[cfg(target_os = "linux")]
+    fn replace_receipt_namespace(
+        temporary: &tempfile::TempDir,
+        replacement_target: Option<(&CStr, &[u8])>,
+    ) -> (PathBuf, PathBuf) {
+        let current = receipt_namespace_path(temporary);
+        let old = current.with_file_name("vmm-socket-receipts-old");
+        std::fs::rename(&current, &old).unwrap();
+        std::fs::create_dir(&current).unwrap();
+        std::fs::set_permissions(
+            &current,
+            std::os::unix::fs::PermissionsExt::from_mode(0o700),
+        )
+        .unwrap();
+        write_foreign(&old.join("old.foreign"), b"old-foreign");
+        write_foreign(&current.join("new.foreign"), b"new-foreign");
+        if let Some((target, bytes)) = replacement_target {
+            write_foreign(
+                &current.join(std::ffi::OsStr::from_bytes(target.to_bytes())),
+                bytes,
+            );
+        }
+        (old, current)
+    }
+
+    #[cfg(target_os = "linux")]
+    fn replace_state_ancestor(
+        temporary: &tempfile::TempDir,
+        replacement_target: (&CStr, &[u8]),
+    ) -> (PathBuf, PathBuf) {
+        let current = temporary.path().join("authority");
+        let old = temporary.path().join("authority-old");
+        std::fs::rename(&current, &old).unwrap();
+        let new_namespace = current.join("state").join(VMM_SOCKET_RECEIPT_NAMESPACE);
+        std::fs::create_dir_all(&new_namespace).unwrap();
+        std::fs::set_permissions(
+            &new_namespace,
+            std::os::unix::fs::PermissionsExt::from_mode(0o700),
+        )
+        .unwrap();
+        let old_namespace = old.join("state").join(VMM_SOCKET_RECEIPT_NAMESPACE);
+        write_foreign(&old_namespace.join("old.foreign"), b"old-foreign");
+        write_foreign(&new_namespace.join("new.foreign"), b"new-foreign");
+        write_foreign(
+            &new_namespace.join(std::ffi::OsStr::from_bytes(replacement_target.0.to_bytes())),
+            replacement_target.1,
+        );
+        (old_namespace, new_namespace)
     }
 
     #[test]
@@ -1076,8 +1168,8 @@ mod tests {
         let managed_root =
             RetainedManagedVmmSocketRoot::provision_for_test(&temporary.path().join("vmm"))
                 .unwrap();
-        let state_path = temporary.path().join("state");
-        std::fs::create_dir(&state_path).unwrap();
+        let state_path = state_path(&temporary);
+        std::fs::create_dir_all(&state_path).unwrap();
         std::fs::set_permissions(
             &state_path,
             std::os::unix::fs::PermissionsExt::from_mode(0o700),
@@ -1128,6 +1220,117 @@ mod tests {
 
     #[cfg(target_os = "linux")]
     #[test]
+    fn present_receipt_load_rejects_a_final_namespace_swap_without_mutation() {
+        let (temporary, _managed_root, _checkpoint, store, receipt) = receipt_fixture();
+        assert_eq!(
+            store.publish(&receipt).unwrap(),
+            VmmSocketReceiptPublication::Published
+        );
+        let name = receipt_file_name(receipt.runtime_incarnation()).unwrap();
+        let original = std::fs::read(
+            receipt_namespace_path(&temporary).join(std::ffi::OsStr::from_bytes(name.to_bytes())),
+        )
+        .unwrap();
+        let result = store.load_inner(receipt.runtime_incarnation(), || {
+            replace_receipt_namespace(&temporary, Some((&name, b"new-foreign-receipt")));
+            Ok(())
+        });
+        assert!(result.is_err());
+        let old = receipt_namespace_path(&temporary).with_file_name("vmm-socket-receipts-old");
+        let new = receipt_namespace_path(&temporary);
+        assert_eq!(
+            std::fs::read(old.join(std::ffi::OsStr::from_bytes(name.to_bytes()))).unwrap(),
+            original
+        );
+        assert_eq!(
+            std::fs::read(old.join("old.foreign")).unwrap(),
+            b"old-foreign"
+        );
+        assert_eq!(
+            std::fs::read(new.join("new.foreign")).unwrap(),
+            b"new-foreign"
+        );
+        assert_eq!(
+            std::fs::read(new.join(std::ffi::OsStr::from_bytes(name.to_bytes()))).unwrap(),
+            b"new-foreign-receipt"
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn absent_receipt_load_rejects_a_final_ancestor_swap_without_mutation() {
+        let (temporary, _managed_root, _checkpoint, store, _receipt) = receipt_fixture();
+        let missing = RandomId128::new("cccccccccccccccccccccccccccccccc").unwrap();
+        let name = receipt_file_name(&missing).unwrap();
+        let result = store.load_inner(&missing, || {
+            replace_state_ancestor(&temporary, (&name, b"new-foreign-receipt"));
+            Ok(())
+        });
+        assert!(result.is_err());
+        let old = temporary
+            .path()
+            .join("authority-old")
+            .join("state")
+            .join(VMM_SOCKET_RECEIPT_NAMESPACE);
+        let new = receipt_namespace_path(&temporary);
+        assert!(!old
+            .join(std::ffi::OsStr::from_bytes(name.to_bytes()))
+            .exists());
+        assert_eq!(
+            std::fs::read(old.join("old.foreign")).unwrap(),
+            b"old-foreign"
+        );
+        assert_eq!(
+            std::fs::read(new.join("new.foreign")).unwrap(),
+            b"new-foreign"
+        );
+        assert_eq!(
+            std::fs::read(new.join(std::ffi::OsStr::from_bytes(name.to_bytes()))).unwrap(),
+            b"new-foreign-receipt"
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn exact_replay_rejects_a_final_namespace_swap_without_mutation() {
+        let (temporary, _managed_root, _checkpoint, store, receipt) = receipt_fixture();
+        assert_eq!(
+            store.publish(&receipt).unwrap(),
+            VmmSocketReceiptPublication::Published
+        );
+        let name = receipt_file_name(receipt.runtime_incarnation()).unwrap();
+        let original = std::fs::read(
+            receipt_namespace_path(&temporary).join(std::ffi::OsStr::from_bytes(name.to_bytes())),
+        )
+        .unwrap();
+        let result = store.publish_inner(&receipt, |point| {
+            assert_eq!(point, ReceiptPublicationPoint::DirectorySynced);
+            replace_receipt_namespace(&temporary, Some((&name, b"new-foreign-receipt")));
+            Ok(())
+        });
+        assert!(result.is_err());
+        let old = receipt_namespace_path(&temporary).with_file_name("vmm-socket-receipts-old");
+        let new = receipt_namespace_path(&temporary);
+        assert_eq!(
+            std::fs::read(old.join(std::ffi::OsStr::from_bytes(name.to_bytes()))).unwrap(),
+            original
+        );
+        assert_eq!(
+            std::fs::read(old.join("old.foreign")).unwrap(),
+            b"old-foreign"
+        );
+        assert_eq!(
+            std::fs::read(new.join("new.foreign")).unwrap(),
+            b"new-foreign"
+        );
+        assert_eq!(
+            std::fs::read(new.join(std::ffi::OsStr::from_bytes(name.to_bytes()))).unwrap(),
+            b"new-foreign-receipt"
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
     fn every_receipt_publication_crash_window_replays_without_partial_name() {
         for crash in [
             ReceiptPublicationPoint::AnonymousCreated,
@@ -1166,6 +1369,7 @@ mod tests {
             let name = format!("vmm-{}.receipt.json", receipt.runtime_incarnation());
             let path = temporary
                 .path()
+                .join("authority")
                 .join("state")
                 .join(VMM_SOCKET_RECEIPT_NAMESPACE)
                 .join(name);
