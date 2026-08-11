@@ -26,8 +26,11 @@ pub const GUEST_HOST_CONTROL_VSOCK_PORT_V1: u32 = 5_000;
 /// peers reject the length prefix before allocating the JSON body.
 pub const RUNTIME_READY_REQUEST_MAX_FRAME_BYTES_V1: u32 = 4 * 1024;
 pub const RUNTIME_READY_RESPONSE_MAX_FRAME_BYTES_V1: u32 = 64 * 1024;
-pub const RUNTIME_READY_MAX_DEVICES_V1: usize = 16;
-pub const RUNTIME_READY_MAX_MOUNTS_V1: usize = 32;
+/// Matches the frozen Runtime Reconciliation V1 maximum of Root plus 63
+/// Persistent volumes. RuntimeReady must not narrow an otherwise legal
+/// Desired/StartRuntime device set.
+pub const RUNTIME_READY_MAX_DEVICES_V1: usize = 64;
+pub const RUNTIME_READY_MAX_MOUNTS_V1: usize = 64;
 
 /// Stable Guest ABI endpoint. The Guest Agent serves HTTP/1.1 over this Unix
 /// socket; no TCP/UDP port or Cats SDK is required.
