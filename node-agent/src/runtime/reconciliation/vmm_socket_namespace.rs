@@ -15,6 +15,8 @@ use std::io::Write as _;
 use std::io::{self, Read as _};
 use std::os::fd::{AsRawFd as _, FromRawFd as _};
 use std::os::unix::ffi::OsStrExt as _;
+#[cfg(target_os = "linux")]
+use std::os::unix::fs::FileTypeExt as _;
 use std::os::unix::fs::MetadataExt as _;
 use std::path::{Component, Path, PathBuf};
 
@@ -38,9 +40,55 @@ pub(crate) const INSTALLED_VMM_SOCKET_ROOT: &str = "/run/cats/vmm-v1";
 pub(crate) const VMM_API_SOCKET_BASENAME: &str = "api.sock";
 pub(crate) const VMM_VSOCK_SOCKET_BASENAME: &str = "vsock.sock";
 pub(crate) const VMM_SOCKET_RECEIPT_NAMESPACE: &str = "vmm-socket-receipts";
+pub(crate) const VMM_SOCKET_OWNER_BASENAME: &str = ".owner.v1.json";
 
 const VMM_SOCKET_RECEIPT_VERSION: u32 = 1;
 const VMM_SOCKET_RECEIPT_MAX_BYTES: usize = 16 * 1024;
+const VMM_SOCKET_LISTEN_BACKLOG: i32 = 128;
+pub(crate) const MANAGED_VMM_SOCKET_ROOT_ENTRY_LIMIT: usize = 3 * 1024;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ManagedVmmSocketRootScan {
+    Accounted,
+    Residue,
+    Unavailable,
+}
+
+/// Recover the identity-selected state root only from the frozen launch-file
+/// mapping already carried by StartRuntime.  The launcher has no CLI/env path
+/// override and immediately revalidates all three paths through
+/// `ManagedVmmLaunchFilePaths` before opening the existing receipt namespace.
+pub(crate) fn vmm_state_directory_from_checkpoint(
+    checkpoint: &RuntimeCheckpoint,
+) -> anyhow::Result<StateDirectory> {
+    let ReconcileStep::StartRuntime {
+        runtime_incarnation,
+        memory_file_path,
+        ..
+    } = &checkpoint.step
+    else {
+        anyhow::bail!("VMM state-directory recovery requires StartRuntime")
+    };
+    let memory = Path::new(memory_file_path.as_str());
+    let attempt = memory
+        .parent()
+        .context("VMM memory path has no attempt directory")?;
+    anyhow::ensure!(
+        attempt.file_name().and_then(|name| name.to_str())
+            == Some(format!("p-{}", runtime_incarnation.as_str()).as_str()),
+        "VMM memory path has a non-exact attempt directory"
+    );
+    let namespace = attempt
+        .parent()
+        .context("VMM memory path has no launch namespace")?;
+    let state_path = namespace
+        .parent()
+        .context("VMM launch namespace has no state-directory parent")?;
+    let state_directory = StateDirectory::unanchored(state_path.to_path_buf());
+    ManagedVmmLaunchFilePaths::paths_from_checkpoint(&state_directory, checkpoint)
+        .context("validate checkpointed VMM launch paths against recovered state directory")?;
+    Ok(state_directory)
+}
 
 #[cfg(target_os = "linux")]
 const UNIX_SOCKET_PATH_CAPACITY: usize = 108;
@@ -371,6 +419,10 @@ impl VmmSocketOwnershipReceiptV1 {
     pub(crate) fn vsock_socket_path(&self) -> &HostPath {
         &self.vsock_socket_path
     }
+
+    pub(crate) fn encoded_bytes(&self) -> anyhow::Result<Vec<u8>> {
+        encode_receipt(self)
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -446,6 +498,17 @@ impl RetainedManagedVmmSocketRoot {
         &self.planner
     }
 
+    pub(crate) fn try_clone_descriptor(&self) -> anyhow::Result<File> {
+        self.assert_current()?;
+        self.descriptor
+            .try_clone()
+            .context("clone managed VMM socket root descriptor")
+    }
+
+    pub(crate) fn owner(&self) -> (u32, u32) {
+        (self.identity.user, self.identity.group)
+    }
+
     pub(crate) fn assert_current(&self) -> anyhow::Result<()> {
         let retained = self.descriptor.metadata()?;
         ensure_owned_directory(&retained, self.identity.user, self.identity.group, 0o700)?;
@@ -474,7 +537,7 @@ impl RetainedManagedVmmSocketRoot {
     }
 
     #[cfg(test)]
-    fn provision_for_test(path: &Path) -> anyhow::Result<Self> {
+    pub(crate) fn provision_for_test(path: &Path) -> anyhow::Result<Self> {
         std::fs::create_dir(path).context("create test managed VMM socket root")?;
         std::fs::set_permissions(path, std::os::unix::fs::PermissionsExt::from_mode(0o700))?;
         let metadata = std::fs::metadata(path)?;
@@ -484,6 +547,304 @@ impl RetainedManagedVmmSocketRoot {
         )?)?;
         Self::open(planner, metadata.uid(), metadata.gid())
     }
+}
+
+/// Bounded, descriptor-rooted accounting for the complete installed socket
+/// namespace. A directory is allowed only when one current StartRuntime
+/// checkpoint derives its exact name and its durable receipt/owner marker
+/// close the physical contents. One crash residue name is accounted so the
+/// same attempt may repair it; multiple names for one incarnation are an ABA
+/// conflict and remain untouched.
+pub(crate) fn scan_managed_vmm_socket_root(
+    root: &RetainedManagedVmmSocketRoot,
+    receipts: &VmmSocketReceiptStore,
+    expected_checkpoints: &[&RuntimeCheckpoint],
+    context: &dyn crate::runtime_spine::RuntimePhysicalReadContext,
+) -> anyhow::Result<ManagedVmmSocketRootScan> {
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = (root, receipts, expected_checkpoints, context);
+        Ok(ManagedVmmSocketRootScan::Unavailable)
+    }
+    #[cfg(target_os = "linux")]
+    {
+        scan_managed_vmm_socket_root_linux(root, receipts, expected_checkpoints, context)
+    }
+}
+
+#[cfg(target_os = "linux")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ScannedAttemptKind {
+    Public,
+    Staging,
+    Quarantine,
+}
+
+#[cfg(target_os = "linux")]
+struct ExpectedManagedAttempt<'a> {
+    checkpoint: &'a RuntimeCheckpoint,
+    incarnation: String,
+    kind: ScannedAttemptKind,
+}
+
+#[cfg(target_os = "linux")]
+struct ScannedManagedAttempt {
+    name: String,
+    contents: std::collections::BTreeSet<String>,
+    directory_identity: DirectoryIdentity,
+    marker_identity: Option<StableFileIdentity>,
+    api_identity: Option<StableSocketLeafIdentity>,
+    vsock_identity: Option<StableSocketLeafIdentity>,
+}
+
+#[cfg(target_os = "linux")]
+fn scan_managed_vmm_socket_root_linux(
+    root: &RetainedManagedVmmSocketRoot,
+    receipts: &VmmSocketReceiptStore,
+    expected_checkpoints: &[&RuntimeCheckpoint],
+    context: &dyn crate::runtime_spine::RuntimePhysicalReadContext,
+) -> anyhow::Result<ManagedVmmSocketRootScan> {
+    context.check_active()?;
+    if root.assert_current().is_err()
+        || receipts.assert_current().is_err()
+        || expected_checkpoints.len() > 1024
+    {
+        return Ok(ManagedVmmSocketRootScan::Residue);
+    }
+
+    let mut expected_names = std::collections::BTreeMap::new();
+    for checkpoint in expected_checkpoints {
+        let paths = match root.planner.paths_from_checkpoint(checkpoint) {
+            Ok(paths) => paths,
+            Err(_) => return Ok(ManagedVmmSocketRootScan::Residue),
+        };
+        let incarnation = match &checkpoint.step {
+            ReconcileStep::StartRuntime {
+                runtime_incarnation,
+                ..
+            } => runtime_incarnation.as_str().to_owned(),
+            _ => return Ok(ManagedVmmSocketRootScan::Residue),
+        };
+        for (name, kind) in [
+            (paths.public_name, ScannedAttemptKind::Public),
+            (paths.staging_name, ScannedAttemptKind::Staging),
+            (paths.quarantine_name, ScannedAttemptKind::Quarantine),
+        ] {
+            if expected_names
+                .insert(
+                    name,
+                    ExpectedManagedAttempt {
+                        checkpoint,
+                        incarnation: incarnation.clone(),
+                        kind,
+                    },
+                )
+                .is_some()
+            {
+                return Ok(ManagedVmmSocketRootScan::Residue);
+            }
+        }
+    }
+
+    let first_names = match managed_root_names(root, context)? {
+        Some(names) => names,
+        None => return Ok(ManagedVmmSocketRootScan::Unavailable),
+    };
+    let (expected_user, expected_group) = root.owner();
+    let mut seen_incarnations = std::collections::BTreeSet::new();
+    let mut scanned = Vec::with_capacity(first_names.len());
+    for name in &first_names {
+        context.check_active()?;
+        let Some(expected) = expected_names.get(name) else {
+            return Ok(ManagedVmmSocketRootScan::Residue);
+        };
+        if !seen_incarnations.insert(expected.incarnation.clone()) {
+            return Ok(ManagedVmmSocketRootScan::Residue);
+        }
+        let receipt = match &expected.checkpoint.step {
+            ReconcileStep::StartRuntime {
+                runtime_incarnation,
+                ..
+            } => match receipts.load(runtime_incarnation) {
+                Ok(Some(receipt)) => receipt,
+                Ok(None) | Err(_) => return Ok(ManagedVmmSocketRootScan::Residue),
+            },
+            _ => unreachable!("expected map accepted only StartRuntime"),
+        };
+        if receipt
+            .validate_against(expected.checkpoint, receipts.state_directory(), root)
+            .is_err()
+        {
+            return Ok(ManagedVmmSocketRootScan::Residue);
+        }
+        let directory = match open_owned_attempt_directory(
+            &root.descriptor,
+            name,
+            expected_user,
+            expected_group,
+        ) {
+            Ok(Some(directory)) => directory,
+            Ok(None) | Err(_) => return Ok(ManagedVmmSocketRootScan::Residue),
+        };
+        let allow_missing_marker = expected.kind == ScannedAttemptKind::Staging;
+        if verify_closed_owned_directory(&directory, &receipt, allow_missing_marker).is_err() {
+            return Ok(ManagedVmmSocketRootScan::Residue);
+        }
+        let names = match strict_directory_names(&directory) {
+            Ok(names) => names,
+            Err(_) => return Ok(ManagedVmmSocketRootScan::Residue),
+        };
+        if expected.kind == ScannedAttemptKind::Staging
+            && (names.contains(VMM_API_SOCKET_BASENAME)
+                || names.contains(VMM_VSOCK_SOCKET_BASENAME))
+        {
+            return Ok(ManagedVmmSocketRootScan::Residue);
+        }
+        let api_identity = match socket_leaf_identity(
+            &directory,
+            VMM_API_SOCKET_BASENAME,
+            expected_user,
+            expected_group,
+        ) {
+            Ok(identity) => identity,
+            Err(_) => return Ok(ManagedVmmSocketRootScan::Residue),
+        };
+        let vsock_identity = match socket_leaf_identity(
+            &directory,
+            VMM_VSOCK_SOCKET_BASENAME,
+            expected_user,
+            expected_group,
+        ) {
+            Ok(identity) => identity,
+            Err(_) => return Ok(ManagedVmmSocketRootScan::Residue),
+        };
+        let marker_identity = match owner_marker_identity(&directory) {
+            Ok(identity) => identity,
+            Err(_) => return Ok(ManagedVmmSocketRootScan::Residue),
+        };
+        scanned.push(ScannedManagedAttempt {
+            name: name.clone(),
+            contents: names,
+            directory_identity: DirectoryIdentity::from_metadata(&directory.metadata()?),
+            marker_identity,
+            api_identity,
+            vsock_identity,
+        });
+    }
+
+    context.check_active()?;
+    let second_names = match managed_root_names(root, context)? {
+        Some(names) => names,
+        None => return Ok(ManagedVmmSocketRootScan::Unavailable),
+    };
+    if first_names != second_names || root.assert_current().is_err() {
+        return Ok(ManagedVmmSocketRootScan::Residue);
+    }
+    for attempt in scanned {
+        let directory = match open_owned_attempt_directory(
+            &root.descriptor,
+            &attempt.name,
+            expected_user,
+            expected_group,
+        ) {
+            Ok(Some(directory)) => directory,
+            Ok(None) | Err(_) => return Ok(ManagedVmmSocketRootScan::Residue),
+        };
+        let current_directory = DirectoryIdentity::from_metadata(&directory.metadata()?);
+        let current_contents = match strict_directory_names(&directory) {
+            Ok(names) => names,
+            Err(_) => return Ok(ManagedVmmSocketRootScan::Residue),
+        };
+        let current_marker = match owner_marker_identity(&directory) {
+            Ok(identity) => identity,
+            Err(_) => return Ok(ManagedVmmSocketRootScan::Residue),
+        };
+        let current_api = match socket_leaf_identity(
+            &directory,
+            VMM_API_SOCKET_BASENAME,
+            expected_user,
+            expected_group,
+        ) {
+            Ok(identity) => identity,
+            Err(_) => return Ok(ManagedVmmSocketRootScan::Residue),
+        };
+        let current_vsock = match socket_leaf_identity(
+            &directory,
+            VMM_VSOCK_SOCKET_BASENAME,
+            expected_user,
+            expected_group,
+        ) {
+            Ok(identity) => identity,
+            Err(_) => return Ok(ManagedVmmSocketRootScan::Residue),
+        };
+        if current_directory != attempt.directory_identity
+            || current_contents != attempt.contents
+            || current_marker != attempt.marker_identity
+            || current_api != attempt.api_identity
+            || current_vsock != attempt.vsock_identity
+        {
+            return Ok(ManagedVmmSocketRootScan::Residue);
+        }
+    }
+    context.check_active()?;
+    Ok(ManagedVmmSocketRootScan::Accounted)
+}
+
+#[cfg(target_os = "linux")]
+fn managed_root_names(
+    root: &RetainedManagedVmmSocketRoot,
+    context: &dyn crate::runtime_spine::RuntimePhysicalReadContext,
+) -> anyhow::Result<Option<std::collections::BTreeSet<String>>> {
+    context.check_active()?;
+    let entries = match std::fs::read_dir(format!("/proc/self/fd/{}", root.descriptor.as_raw_fd()))
+    {
+        Ok(entries) => entries,
+        Err(_) => return Ok(None),
+    };
+    let mut names = std::collections::BTreeSet::new();
+    for entry in entries {
+        context.check_active()?;
+        let entry = match entry {
+            Ok(entry) => entry,
+            Err(_) => return Ok(None),
+        };
+        let name = match entry.file_name().into_string() {
+            Ok(name) => name,
+            Err(_) => {
+                return Ok(Some(std::collections::BTreeSet::from([
+                    "<non-utf8>".to_owned()
+                ])))
+            }
+        };
+        if !names.insert(name) || names.len() > MANAGED_VMM_SOCKET_ROOT_ENTRY_LIMIT {
+            return Ok(Some(std::collections::BTreeSet::from([
+                "<invalid-root-enumeration>".to_owned(),
+            ])));
+        }
+    }
+    Ok(Some(names))
+}
+
+#[cfg(target_os = "linux")]
+fn owner_marker_identity(directory: &File) -> anyhow::Result<Option<StableFileIdentity>> {
+    let marker = match open_at(
+        directory,
+        &fixed_c_string(VMM_SOCKET_OWNER_BASENAME),
+        libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_CLOEXEC | libc::O_NONBLOCK,
+        0,
+    ) {
+        Ok(marker) => marker,
+        Err(source) if source.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(source) => return Err(source).context("open VMM owner marker identity"),
+    };
+    let metadata = marker.metadata()?;
+    ensure_owned_regular_file(
+        &metadata,
+        directory.metadata()?.uid(),
+        directory.metadata()?.gid(),
+        0o600,
+    )?;
+    Ok(Some(stable_file_identity(&metadata)))
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -534,6 +895,10 @@ impl VmmSocketReceiptStore {
             "VMM socket receipt namespace changed identity"
         );
         Ok(())
+    }
+
+    pub(crate) fn state_directory(&self) -> &StateDirectory {
+        &self.state_directory
     }
 
     pub(crate) fn load(
@@ -636,7 +1001,7 @@ impl VmmSocketReceiptStore {
     }
 
     #[cfg(all(test, target_os = "linux"))]
-    fn provision_for_test(state_directory: StateDirectory) -> anyhow::Result<Self> {
+    pub(crate) fn provision_for_test(state_directory: StateDirectory) -> anyhow::Result<Self> {
         let root = state_directory.try_clone_directory()?;
         let root_metadata = root.metadata()?;
         let name = fixed_c_string(VMM_SOCKET_RECEIPT_NAMESPACE);
@@ -658,6 +1023,980 @@ enum ReceiptPublicationPoint {
     ContentSynced,
     Published,
     DirectorySynced,
+}
+
+/// Result of preparing the provider-private API listener for one already
+/// checkpointed StartRuntime attempt. `ExistingLive` is deliberately not an
+/// adoption result: only the systemd/process/API inspector can decide whether
+/// the holder is the exact VMM.  The namespace owner therefore never unlinks
+/// or replaces a live endpoint while trying to start.
+#[cfg(target_os = "linux")]
+#[derive(Debug)]
+pub(crate) enum ManagedVmmSocketPreparation<'a> {
+    Prepared(Box<PreparedManagedVmmSocketAttempt<'a>>),
+    ExistingLive,
+}
+
+/// Descriptor-retained API listener which may be transferred to the fixed
+/// launcher.  It owns no stop authority: dropping this value only closes the
+/// Agent's descriptor and intentionally leaves the exact-owned filesystem
+/// entry for crash discovery.
+#[cfg(target_os = "linux")]
+#[derive(Debug)]
+pub(crate) struct PreparedManagedVmmSocketAttempt<'a> {
+    root: &'a RetainedManagedVmmSocketRoot,
+    receipt: VmmSocketOwnershipReceiptV1,
+    public_directory: File,
+    public_identity: DirectoryIdentity,
+    api_socket_identity: StableSocketLeafIdentity,
+    api_listener: File,
+    api_kernel_inode: u64,
+}
+
+#[cfg(target_os = "linux")]
+impl PreparedManagedVmmSocketAttempt<'_> {
+    pub(crate) fn receipt(&self) -> &VmmSocketOwnershipReceiptV1 {
+        &self.receipt
+    }
+
+    pub(crate) fn api_listener(&self) -> &File {
+        &self.api_listener
+    }
+
+    pub(crate) fn assert_current(&self) -> anyhow::Result<()> {
+        self.root.assert_current()?;
+        let metadata = self.public_directory.metadata()?;
+        ensure_owned_directory(
+            &metadata,
+            self.public_identity.user,
+            self.public_identity.group,
+            0o700,
+        )?;
+        anyhow::ensure!(
+            DirectoryIdentity::from_metadata(&metadata) == self.public_identity,
+            "retained VMM public socket directory changed"
+        );
+        let public_name = CString::new(self.receipt.public_name.as_bytes())?;
+        let reopened = open_directory_at(&self.root.descriptor, &public_name)
+            .context("reopen VMM public socket directory")?;
+        anyhow::ensure!(
+            DirectoryIdentity::from_metadata(&reopened.metadata()?) == self.public_identity,
+            "VMM public socket directory pathname changed identity"
+        );
+        verify_owner_marker(&self.public_directory, &self.receipt)?;
+        let current = socket_leaf_identity(
+            &self.public_directory,
+            VMM_API_SOCKET_BASENAME,
+            self.public_identity.user,
+            self.public_identity.group,
+        )?
+        .context("prepared VMM API socket disappeared")?;
+        anyhow::ensure!(
+            current == self.api_socket_identity,
+            "prepared VMM API socket pathname changed identity"
+        );
+        ensure_listening_unix_socket(&self.api_listener)?;
+        anyhow::ensure!(
+            socket_kernel_inode(&self.api_listener)? == self.api_kernel_inode,
+            "prepared VMM API listener changed kernel identity"
+        );
+        api_listener_self_handshake(
+            &self.api_listener,
+            Path::new(self.receipt.api_socket_path.as_str()),
+        )?;
+        Ok(())
+    }
+}
+
+#[cfg(target_os = "linux")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct StableSocketLeafIdentity {
+    device: u64,
+    inode: u64,
+    mode: u32,
+    links: u64,
+    user: u32,
+    group: u32,
+}
+
+#[cfg(target_os = "linux")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum NamespacePreparationPoint {
+    StagingCreated,
+    OwnerMarkerSynced,
+    PublicPublished,
+    PublicQuarantined,
+    QuarantineRemoved,
+    ApiBound,
+    DirectorySynced,
+}
+
+#[cfg(target_os = "linux")]
+impl RetainedManagedVmmSocketRoot {
+    /// Recover or prepare one exact-owned public directory and pre-bound API
+    /// listener.  The durable receipt must already exist.  This method never
+    /// creates the installed root or receipt namespace and never interprets a
+    /// socket cleanup as proof that a VMM stopped.
+    pub(crate) fn prepare_existing_receipt<'a>(
+        &'a self,
+        checkpoint: &RuntimeCheckpoint,
+        receipts: &VmmSocketReceiptStore,
+    ) -> anyhow::Result<ManagedVmmSocketPreparation<'a>> {
+        self.prepare_existing_receipt_inner(checkpoint, receipts, |_| Ok(()))
+    }
+
+    fn prepare_existing_receipt_inner<'a>(
+        &'a self,
+        checkpoint: &RuntimeCheckpoint,
+        receipts: &VmmSocketReceiptStore,
+        mut checkpoint_hook: impl FnMut(NamespacePreparationPoint) -> anyhow::Result<()>,
+    ) -> anyhow::Result<ManagedVmmSocketPreparation<'a>> {
+        self.assert_current()?;
+        receipts.assert_current()?;
+        let ReconcileStep::StartRuntime {
+            runtime_incarnation,
+            ..
+        } = &checkpoint.step
+        else {
+            anyhow::bail!("managed VMM socket preparation requires StartRuntime")
+        };
+        let receipt = receipts
+            .load(runtime_incarnation)?
+            .context("VMM socket ownership receipt is not durable")?;
+        let paths = receipt.validate_against(checkpoint, receipts.state_directory(), self)?;
+        let (expected_user, expected_group) = self.owner();
+
+        // A single prior crash residue is recoverable. Two names for the same
+        // incarnation cannot be produced by this serialized no-replace state
+        // machine; they are therefore a rename/recreate ABA and both must be
+        // preserved. In particular, never settle quarantine before checking
+        // whether a fresh public or staging name appeared beside it.
+        let mut public = open_owned_attempt_directory(
+            &self.descriptor,
+            &paths.public_name,
+            expected_user,
+            expected_group,
+        )?;
+        let staging = open_owned_attempt_directory(
+            &self.descriptor,
+            &paths.staging_name,
+            expected_user,
+            expected_group,
+        )?;
+        let quarantine = open_owned_attempt_directory(
+            &self.descriptor,
+            &paths.quarantine_name,
+            expected_user,
+            expected_group,
+        )?;
+        let present_names = usize::from(public.is_some())
+            + usize::from(staging.is_some())
+            + usize::from(quarantine.is_some());
+        anyhow::ensure!(
+            present_names <= 1,
+            "multiple VMM socket attempt names are a preserved ABA conflict"
+        );
+        if quarantine.is_some() {
+            settle_quarantine(
+                self,
+                &receipt,
+                expected_user,
+                expected_group,
+                &mut checkpoint_hook,
+            )?;
+        }
+        if public.is_none() {
+            let staging = match staging {
+                Some(staging) => {
+                    ensure_owner_marker(&staging, &receipt, true)?;
+                    verify_closed_owned_directory(&staging, &receipt, true)?;
+                    staging
+                }
+                None => {
+                    let staging_name = CString::new(paths.staging_name.as_bytes())?;
+                    mkdir_at(&self.descriptor, &staging_name, 0o700)
+                        .context("create VMM staging socket directory")?;
+                    checkpoint_hook(NamespacePreparationPoint::StagingCreated)?;
+                    self.descriptor.sync_all()?;
+                    let staging = open_directory_at(&self.descriptor, &staging_name)?;
+                    ensure_owned_directory(
+                        &staging.metadata()?,
+                        expected_user,
+                        expected_group,
+                        0o700,
+                    )?;
+                    ensure_owner_marker(&staging, &receipt, false)?;
+                    checkpoint_hook(NamespacePreparationPoint::OwnerMarkerSynced)?;
+                    staging.sync_all()?;
+                    staging
+                }
+            };
+            publish_staging_directory(self, &paths, &staging)?;
+            checkpoint_hook(NamespacePreparationPoint::PublicPublished)?;
+            public = Some(open_directory_at(
+                &self.descriptor,
+                &CString::new(paths.public_name.as_bytes())?,
+            )?);
+        }
+
+        let mut public = public.context("VMM public socket directory was not published")?;
+        verify_closed_owned_directory(&public, &receipt, false)?;
+        match classify_attempt_sockets(&public, &paths, expected_user, expected_group)? {
+            AttemptSocketState::Empty => {}
+            AttemptSocketState::Live => return Ok(ManagedVmmSocketPreparation::ExistingLive),
+            AttemptSocketState::Stale => {
+                quarantine_public_directory(
+                    self,
+                    &paths,
+                    &public,
+                    &receipt,
+                    expected_user,
+                    expected_group,
+                )?;
+                checkpoint_hook(NamespacePreparationPoint::PublicQuarantined)?;
+                settle_quarantine(
+                    self,
+                    &receipt,
+                    expected_user,
+                    expected_group,
+                    &mut checkpoint_hook,
+                )?;
+                let staging_name = CString::new(paths.staging_name.as_bytes())?;
+                mkdir_at(&self.descriptor, &staging_name, 0o700)
+                    .context("recreate VMM staging socket directory")?;
+                checkpoint_hook(NamespacePreparationPoint::StagingCreated)?;
+                self.descriptor.sync_all()?;
+                let staging = open_directory_at(&self.descriptor, &staging_name)?;
+                ensure_owned_directory(&staging.metadata()?, expected_user, expected_group, 0o700)?;
+                ensure_owner_marker(&staging, &receipt, false)?;
+                checkpoint_hook(NamespacePreparationPoint::OwnerMarkerSynced)?;
+                staging.sync_all()?;
+                publish_staging_directory(self, &paths, &staging)?;
+                checkpoint_hook(NamespacePreparationPoint::PublicPublished)?;
+                public = open_directory_at(
+                    &self.descriptor,
+                    &CString::new(paths.public_name.as_bytes())?,
+                )?;
+                verify_closed_owned_directory(&public, &receipt, false)?;
+            }
+        }
+
+        let api_listener = bind_api_listener(&public, expected_user, expected_group)?;
+        checkpoint_hook(NamespacePreparationPoint::ApiBound)?;
+        public.sync_all()?;
+        self.descriptor.sync_all()?;
+        checkpoint_hook(NamespacePreparationPoint::DirectorySynced)?;
+        let public_identity = DirectoryIdentity::from_metadata(&public.metadata()?);
+        let api_socket_identity = socket_leaf_identity(
+            &public,
+            VMM_API_SOCKET_BASENAME,
+            expected_user,
+            expected_group,
+        )?
+        .context("bound VMM API socket is absent")?;
+        let prepared = PreparedManagedVmmSocketAttempt {
+            root: self,
+            receipt,
+            public_directory: public,
+            public_identity,
+            api_kernel_inode: socket_kernel_inode(&api_listener)?,
+            api_socket_identity,
+            api_listener,
+        };
+        prepared.assert_current()?;
+        Ok(ManagedVmmSocketPreparation::Prepared(Box::new(prepared)))
+    }
+}
+
+#[cfg(target_os = "linux")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AttemptSocketState {
+    Empty,
+    Stale,
+    Live,
+}
+
+#[cfg(target_os = "linux")]
+fn classify_attempt_sockets(
+    directory: &File,
+    paths: &ManagedVmmSocketPaths,
+    expected_user: u32,
+    expected_group: u32,
+) -> anyhow::Result<AttemptSocketState> {
+    let api = socket_leaf_identity(
+        directory,
+        VMM_API_SOCKET_BASENAME,
+        expected_user,
+        expected_group,
+    )?;
+    let vsock = socket_leaf_identity(
+        directory,
+        VMM_VSOCK_SOCKET_BASENAME,
+        expected_user,
+        expected_group,
+    )?;
+    if api.is_none() && vsock.is_none() {
+        return Ok(AttemptSocketState::Empty);
+    }
+    if api.is_some() {
+        match probe_api_socket(Path::new(paths.api_socket_path.as_str()))? {
+            SocketLiveness::Live => return Ok(AttemptSocketState::Live),
+            SocketLiveness::Stale => {}
+            SocketLiveness::Unavailable => {
+                anyhow::bail!("VMM API socket liveness is unavailable")
+            }
+        }
+    }
+    if vsock.is_some() {
+        match named_unix_socket_liveness(paths.vsock_socket_path.as_str())? {
+            SocketLiveness::Live => return Ok(AttemptSocketState::Live),
+            SocketLiveness::Stale => {}
+            SocketLiveness::Unavailable => {
+                anyhow::bail!("VMM vsock liveness is unavailable")
+            }
+        }
+    }
+    Ok(AttemptSocketState::Stale)
+}
+
+#[cfg(target_os = "linux")]
+fn open_owned_attempt_directory(
+    root: &File,
+    name: &str,
+    expected_user: u32,
+    expected_group: u32,
+) -> anyhow::Result<Option<File>> {
+    let name = CString::new(name)?;
+    match open_directory_at(root, &name) {
+        Ok(directory) => {
+            ensure_owned_directory(&directory.metadata()?, expected_user, expected_group, 0o700)?;
+            Ok(Some(directory))
+        }
+        Err(source) if source.kind() == io::ErrorKind::NotFound => Ok(None),
+        Err(source) => Err(source).context("open VMM attempt socket directory"),
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn ensure_owner_marker(
+    directory: &File,
+    receipt: &VmmSocketOwnershipReceiptV1,
+    allow_missing_incomplete: bool,
+) -> anyhow::Result<()> {
+    let name = fixed_c_string(VMM_SOCKET_OWNER_BASENAME);
+    if let Some(existing) = read_optional_receipt(directory, &name)? {
+        anyhow::ensure!(
+            existing == receipt.encoded_bytes()?,
+            "VMM socket owner marker differs from its durable receipt"
+        );
+        return Ok(());
+    }
+    if allow_missing_incomplete {
+        anyhow::ensure!(
+            strict_directory_names(directory)?.is_empty(),
+            "unmarked VMM staging directory is not empty"
+        );
+    }
+    let bytes = receipt.encoded_bytes()?;
+    let mut marker = open_at(
+        directory,
+        &name,
+        libc::O_WRONLY | libc::O_CREAT | libc::O_EXCL | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+        0o600,
+    )
+    .context("create VMM socket owner marker")?;
+    marker.write_all(&bytes)?;
+    marker.sync_all()?;
+    directory.sync_all()?;
+    verify_owner_marker(directory, receipt)
+}
+
+#[cfg(target_os = "linux")]
+fn verify_owner_marker(
+    directory: &File,
+    receipt: &VmmSocketOwnershipReceiptV1,
+) -> anyhow::Result<()> {
+    let name = fixed_c_string(VMM_SOCKET_OWNER_BASENAME);
+    let existing =
+        read_optional_receipt(directory, &name)?.context("VMM socket owner marker is missing")?;
+    anyhow::ensure!(
+        existing == receipt.encoded_bytes()?,
+        "VMM socket owner marker differs from its durable receipt"
+    );
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+fn verify_closed_owned_directory(
+    directory: &File,
+    receipt: &VmmSocketOwnershipReceiptV1,
+    allow_missing_marker: bool,
+) -> anyhow::Result<()> {
+    let names = strict_directory_names(directory)?;
+    anyhow::ensure!(
+        names.iter().all(|name| {
+            name == VMM_SOCKET_OWNER_BASENAME
+                || name == VMM_API_SOCKET_BASENAME
+                || name == VMM_VSOCK_SOCKET_BASENAME
+        }),
+        "VMM socket directory contains a foreign entry"
+    );
+    if allow_missing_marker && !names.contains(VMM_SOCKET_OWNER_BASENAME) {
+        anyhow::ensure!(
+            names.is_empty(),
+            "unmarked VMM socket directory is not empty"
+        );
+    } else {
+        verify_owner_marker(directory, receipt)?;
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+fn strict_directory_names(directory: &File) -> anyhow::Result<std::collections::BTreeSet<String>> {
+    let path = PathBuf::from(format!("/proc/self/fd/{}", directory.as_raw_fd()));
+    let entries = std::fs::read_dir(path).context("enumerate retained VMM socket directory")?;
+    let mut names = std::collections::BTreeSet::new();
+    for entry in entries {
+        let entry = entry.context("read retained VMM socket directory entry")?;
+        let name = entry
+            .file_name()
+            .into_string()
+            .map_err(|_| anyhow::anyhow!("VMM socket directory entry is not UTF-8"))?;
+        anyhow::ensure!(
+            names.insert(name),
+            "VMM socket directory contains a duplicate entry"
+        );
+        anyhow::ensure!(
+            names.len() <= 3,
+            "VMM socket directory exceeds its closed entry bound"
+        );
+    }
+    Ok(names)
+}
+
+#[cfg(target_os = "linux")]
+fn publish_staging_directory(
+    root: &RetainedManagedVmmSocketRoot,
+    paths: &ManagedVmmSocketPaths,
+    staging: &File,
+) -> anyhow::Result<()> {
+    root.assert_current()?;
+    let before = DirectoryIdentity::from_metadata(&staging.metadata()?);
+    rename_at_no_replace(
+        &root.descriptor,
+        &CString::new(paths.staging_name.as_bytes())?,
+        &root.descriptor,
+        &CString::new(paths.public_name.as_bytes())?,
+    )
+    .context("publish VMM socket directory")?;
+    root.descriptor.sync_all()?;
+    let public = open_directory_at(
+        &root.descriptor,
+        &CString::new(paths.public_name.as_bytes())?,
+    )?;
+    anyhow::ensure!(
+        DirectoryIdentity::from_metadata(&public.metadata()?) == before,
+        "published VMM socket directory changed identity"
+    );
+    anyhow::ensure!(
+        open_owned_attempt_directory(
+            &root.descriptor,
+            paths.staging_name(),
+            before.user,
+            before.group,
+        )?
+        .is_none(),
+        "VMM staging directory remained after publication"
+    );
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+fn quarantine_public_directory(
+    root: &RetainedManagedVmmSocketRoot,
+    paths: &ManagedVmmSocketPaths,
+    public: &File,
+    receipt: &VmmSocketOwnershipReceiptV1,
+    expected_user: u32,
+    expected_group: u32,
+) -> anyhow::Result<()> {
+    verify_closed_owned_directory(public, receipt, false)?;
+    anyhow::ensure!(
+        open_owned_attempt_directory(
+            &root.descriptor,
+            paths.quarantine_name(),
+            expected_user,
+            expected_group,
+        )?
+        .is_none(),
+        "VMM quarantine directory is already occupied"
+    );
+    let before = DirectoryIdentity::from_metadata(&public.metadata()?);
+    rename_at_no_replace(
+        &root.descriptor,
+        &CString::new(paths.public_name.as_bytes())?,
+        &root.descriptor,
+        &CString::new(paths.quarantine_name.as_bytes())?,
+    )?;
+    root.descriptor.sync_all()?;
+    let quarantine = open_directory_at(
+        &root.descriptor,
+        &CString::new(paths.quarantine_name.as_bytes())?,
+    )?;
+    anyhow::ensure!(
+        DirectoryIdentity::from_metadata(&quarantine.metadata()?) == before,
+        "quarantined VMM socket directory changed identity"
+    );
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+fn settle_quarantine(
+    root: &RetainedManagedVmmSocketRoot,
+    receipt: &VmmSocketOwnershipReceiptV1,
+    expected_user: u32,
+    expected_group: u32,
+    checkpoint_hook: &mut impl FnMut(NamespacePreparationPoint) -> anyhow::Result<()>,
+) -> anyhow::Result<()> {
+    let Some(quarantine) = open_owned_attempt_directory(
+        &root.descriptor,
+        &receipt.quarantine_name,
+        expected_user,
+        expected_group,
+    )?
+    else {
+        return Ok(());
+    };
+    verify_closed_owned_directory(&quarantine, receipt, false)?;
+    cleanup_exact_owned_directory(&quarantine, receipt, false, expected_user, expected_group)?;
+    remove_exact_directory(
+        &root.descriptor,
+        &receipt.quarantine_name,
+        &quarantine,
+        expected_user,
+        expected_group,
+    )?;
+    root.descriptor.sync_all()?;
+    checkpoint_hook(NamespacePreparationPoint::QuarantineRemoved)
+}
+
+#[cfg(target_os = "linux")]
+fn cleanup_exact_owned_directory(
+    directory: &File,
+    receipt: &VmmSocketOwnershipReceiptV1,
+    allow_missing_marker: bool,
+    expected_user: u32,
+    expected_group: u32,
+) -> anyhow::Result<()> {
+    verify_closed_owned_directory(directory, receipt, allow_missing_marker)?;
+    for basename in [VMM_API_SOCKET_BASENAME, VMM_VSOCK_SOCKET_BASENAME] {
+        let Some(identity) =
+            socket_leaf_identity(directory, basename, expected_user, expected_group)?
+        else {
+            continue;
+        };
+        let liveness = socket_leaf_liveness(directory, basename, receipt)?;
+        anyhow::ensure!(
+            liveness == SocketLiveness::Stale,
+            "refuse to unlink a live or unclassifiable VMM socket"
+        );
+        unlink_socket_leaf_if_exact(directory, basename, identity)?;
+        directory.sync_all()?;
+    }
+    let marker = fixed_c_string(VMM_SOCKET_OWNER_BASENAME);
+    match unlink_at(directory, &marker, 0) {
+        Ok(()) => directory.sync_all()?,
+        Err(source) if source.kind() == io::ErrorKind::NotFound && allow_missing_marker => {}
+        Err(source) => return Err(source).context("remove VMM socket owner marker"),
+    }
+    anyhow::ensure!(
+        strict_directory_names(directory)?.is_empty(),
+        "VMM socket directory was not emptied"
+    );
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+fn remove_exact_directory(
+    root: &File,
+    name: &str,
+    directory: &File,
+    expected_user: u32,
+    expected_group: u32,
+) -> anyhow::Result<()> {
+    let expected = DirectoryIdentity::from_metadata(&directory.metadata()?);
+    ensure_owned_directory(&directory.metadata()?, expected_user, expected_group, 0o700)?;
+    let reopened = open_directory_at(root, &CString::new(name.as_bytes())?)?;
+    anyhow::ensure!(
+        DirectoryIdentity::from_metadata(&reopened.metadata()?) == expected,
+        "VMM socket directory changed before removal"
+    );
+    unlink_at(root, &CString::new(name.as_bytes())?, libc::AT_REMOVEDIR)
+        .context("remove exact VMM socket directory")
+}
+
+#[cfg(target_os = "linux")]
+fn bind_api_listener(
+    public: &File,
+    expected_user: u32,
+    expected_group: u32,
+) -> anyhow::Result<File> {
+    anyhow::ensure!(
+        socket_leaf_identity(
+            public,
+            VMM_API_SOCKET_BASENAME,
+            expected_user,
+            expected_group,
+        )?
+        .is_none(),
+        "VMM API socket already exists"
+    );
+    let bind_path = format!(
+        "/proc/self/fd/{}/{}",
+        public.as_raw_fd(),
+        VMM_API_SOCKET_BASENAME
+    );
+    anyhow::ensure!(
+        bind_path.len() < UNIX_SOCKET_PATH_CAPACITY,
+        "descriptor-relative VMM API socket path exceeds sockaddr_un"
+    );
+    // SAFETY: socket returns one fresh descriptor and retains no Rust data.
+    let descriptor = unsafe {
+        libc::socket(
+            libc::AF_UNIX,
+            libc::SOCK_STREAM | libc::SOCK_CLOEXEC | libc::SOCK_NONBLOCK,
+            0,
+        )
+    };
+    if descriptor < 0 {
+        return Err(io::Error::last_os_error()).context("create VMM API listener");
+    }
+    // SAFETY: the fresh descriptor is transferred exactly once to File.
+    let listener = unsafe { File::from_raw_fd(descriptor) };
+    let bytes = bind_path.as_bytes();
+    // SAFETY: zeroed sockaddr_un is valid initialization and all fields read
+    // by bind are initialized below.
+    let mut address: libc::sockaddr_un = unsafe { std::mem::zeroed() };
+    address.sun_family = libc::AF_UNIX as libc::sa_family_t;
+    for (target, source) in address.sun_path.iter_mut().zip(bytes.iter().copied()) {
+        *target = source as libc::c_char;
+    }
+    let length = (std::mem::size_of::<libc::sa_family_t>() + bytes.len() + 1) as libc::socklen_t;
+    // SAFETY: listener and address remain live for the call; bind retains no
+    // Rust pointer.
+    let result = unsafe {
+        libc::bind(
+            listener.as_raw_fd(),
+            (&raw const address).cast::<libc::sockaddr>(),
+            length,
+        )
+    };
+    if result != 0 {
+        return Err(io::Error::last_os_error()).context("bind VMM API listener no-replace");
+    }
+    let basename = fixed_c_string(VMM_API_SOCKET_BASENAME);
+    fchmod_at(public, &basename, 0o700)?;
+    // SAFETY: listen changes only the state of this live Unix socket.
+    if unsafe { libc::listen(listener.as_raw_fd(), VMM_SOCKET_LISTEN_BACKLOG) } != 0 {
+        return Err(io::Error::last_os_error()).context("listen on VMM API socket");
+    }
+    ensure_listening_unix_socket(&listener)?;
+    let identity = socket_leaf_identity(
+        public,
+        VMM_API_SOCKET_BASENAME,
+        expected_user,
+        expected_group,
+    )?
+    .context("VMM API bind did not create its exact leaf")?;
+    let reopened = socket_leaf_identity(
+        public,
+        VMM_API_SOCKET_BASENAME,
+        expected_user,
+        expected_group,
+    )?
+    .context("VMM API socket disappeared after bind")?;
+    anyhow::ensure!(identity == reopened, "VMM API socket changed after bind");
+    Ok(listener)
+}
+
+#[cfg(target_os = "linux")]
+fn ensure_listening_unix_socket(socket: &File) -> anyhow::Result<()> {
+    let metadata = socket.metadata()?;
+    anyhow::ensure!(
+        metadata.file_type().is_socket(),
+        "VMM API descriptor is not a socket"
+    );
+    let mut value = 0_i32;
+    let mut length = std::mem::size_of::<i32>() as libc::socklen_t;
+    // SAFETY: value/length are valid writable storage and the descriptor is
+    // live for the complete getsockopt call.
+    let result = unsafe {
+        libc::getsockopt(
+            socket.as_raw_fd(),
+            libc::SOL_SOCKET,
+            libc::SO_ACCEPTCONN,
+            (&raw mut value).cast(),
+            &raw mut length,
+        )
+    };
+    anyhow::ensure!(
+        result == 0 && length as usize == std::mem::size_of::<i32>() && value == 1,
+        "VMM API descriptor is not a listening socket"
+    );
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+fn api_listener_self_handshake(listener: &File, path: &Path) -> anyhow::Result<()> {
+    use std::os::unix::net::UnixStream;
+
+    let client = UnixStream::connect(path).context("connect prepared VMM API listener")?;
+    // SAFETY: the listener is live and nonblocking. The immediately preceding
+    // connect queued one local connection; accept4 returns a fresh descriptor.
+    let accepted = unsafe {
+        libc::accept4(
+            listener.as_raw_fd(),
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            libc::SOCK_CLOEXEC | libc::SOCK_NONBLOCK,
+        )
+    };
+    if accepted < 0 {
+        return Err(io::Error::last_os_error()).context("accept VMM API self-handshake");
+    }
+    // SAFETY: accept4 returned one fresh descriptor owned by this File.
+    let accepted = unsafe { File::from_raw_fd(accepted) };
+    let self_pid = std::process::id();
+    anyhow::ensure!(
+        socket_peer_process_id(client.as_raw_fd()) == Some(self_pid)
+            && socket_peer_process_id(accepted.as_raw_fd()) == Some(self_pid),
+        "prepared VMM API descriptor/path peer identity differs"
+    );
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+fn socket_peer_process_id(descriptor: i32) -> Option<u32> {
+    // SAFETY: zeroed ucred is valid output storage for SO_PEERCRED.
+    let mut credentials: libc::ucred = unsafe { std::mem::zeroed() };
+    let mut length = std::mem::size_of::<libc::ucred>() as libc::socklen_t;
+    // SAFETY: credentials/length are writable and descriptor remains live.
+    let result = unsafe {
+        libc::getsockopt(
+            descriptor,
+            libc::SOL_SOCKET,
+            libc::SO_PEERCRED,
+            (&raw mut credentials).cast(),
+            &raw mut length,
+        )
+    };
+    (result == 0 && length as usize == std::mem::size_of::<libc::ucred>() && credentials.pid > 0)
+        .then_some(credentials.pid as u32)
+}
+
+#[cfg(target_os = "linux")]
+fn socket_leaf_identity(
+    directory: &File,
+    basename: &str,
+    expected_user: u32,
+    expected_group: u32,
+) -> anyhow::Result<Option<StableSocketLeafIdentity>> {
+    let name = CString::new(basename)?;
+    let leaf = match open_at(
+        directory,
+        &name,
+        libc::O_PATH | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+        0,
+    ) {
+        Ok(leaf) => leaf,
+        Err(source) if source.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(source) => return Err(source).context("open VMM socket leaf"),
+    };
+    let metadata = leaf.metadata()?;
+    anyhow::ensure!(
+        metadata.file_type().is_socket()
+            && metadata.nlink() == 1
+            && metadata.uid() == expected_user
+            && metadata.gid() == expected_group
+            && metadata.mode() & 0o7777 == 0o700,
+        "VMM socket leaf has unsafe type, links, owner or mode"
+    );
+    Ok(Some(StableSocketLeafIdentity {
+        device: metadata.dev(),
+        inode: metadata.ino(),
+        mode: metadata.mode(),
+        links: metadata.nlink(),
+        user: metadata.uid(),
+        group: metadata.gid(),
+    }))
+}
+
+#[cfg(target_os = "linux")]
+fn unlink_socket_leaf_if_exact(
+    directory: &File,
+    basename: &str,
+    expected: StableSocketLeafIdentity,
+) -> anyhow::Result<()> {
+    let current = socket_leaf_identity(directory, basename, expected.user, expected.group)?
+        .context("VMM socket leaf disappeared before exact unlink")?;
+    anyhow::ensure!(current == expected, "VMM socket leaf changed before unlink");
+    unlink_at(directory, &CString::new(basename)?, 0).context("unlink exact stale VMM socket")
+}
+
+#[cfg(target_os = "linux")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SocketLiveness {
+    Live,
+    Stale,
+    Unavailable,
+}
+
+#[cfg(target_os = "linux")]
+fn probe_api_socket(path: &Path) -> anyhow::Result<SocketLiveness> {
+    use std::os::unix::net::UnixStream;
+
+    match UnixStream::connect(path) {
+        Ok(stream) => {
+            drop(stream);
+            Ok(SocketLiveness::Live)
+        }
+        Err(source) if source.raw_os_error() == Some(libc::ECONNREFUSED) => {
+            Ok(SocketLiveness::Stale)
+        }
+        Err(source) if source.kind() == io::ErrorKind::NotFound => Ok(SocketLiveness::Stale),
+        Err(_) => Ok(SocketLiveness::Unavailable),
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn named_unix_socket_liveness(path: &str) -> anyhow::Result<SocketLiveness> {
+    let file = match File::open("/proc/net/unix") {
+        Ok(file) => file,
+        Err(_) => return Ok(SocketLiveness::Unavailable),
+    };
+    let mut bytes = Vec::new();
+    file.take(4 * 1024 * 1024 + 1).read_to_end(&mut bytes)?;
+    if bytes.len() > 4 * 1024 * 1024 {
+        return Ok(SocketLiveness::Unavailable);
+    }
+    let text = match std::str::from_utf8(&bytes) {
+        Ok(text) => text,
+        Err(_) => return Ok(SocketLiveness::Unavailable),
+    };
+    Ok(
+        if text
+            .lines()
+            .skip(1)
+            .any(|line| line.split_ascii_whitespace().last() == Some(path))
+        {
+            SocketLiveness::Live
+        } else {
+            SocketLiveness::Stale
+        },
+    )
+}
+
+#[cfg(target_os = "linux")]
+fn socket_leaf_liveness(
+    directory: &File,
+    basename: &str,
+    receipt: &VmmSocketOwnershipReceiptV1,
+) -> anyhow::Result<SocketLiveness> {
+    let descriptor_relative = format!("/proc/self/fd/{}/{}", directory.as_raw_fd(), basename);
+    if basename == VMM_API_SOCKET_BASENAME {
+        // The API listener was bound through a descriptor-relative pathname,
+        // whose numeric FD is not durable across recovery.  Connecting
+        // through this retained directory proves the current socket inode is
+        // still accepting; any non-refused result remains fail closed.
+        return probe_api_socket(Path::new(&descriptor_relative));
+    }
+
+    // Cloud Hypervisor binds the vsock backend at the canonical public path.
+    // After a crash-recovery rename, Linux retains that original name in
+    // /proc/net/unix, while a future implementation could report the current
+    // descriptor-relative name. Check both and never turn an unreadable table
+    // into stale authority.
+    for path in [receipt.vsock_socket_path.as_str(), &descriptor_relative] {
+        match named_unix_socket_liveness(path)? {
+            SocketLiveness::Live => return Ok(SocketLiveness::Live),
+            SocketLiveness::Unavailable => return Ok(SocketLiveness::Unavailable),
+            SocketLiveness::Stale => {}
+        }
+    }
+    Ok(SocketLiveness::Stale)
+}
+
+#[cfg(target_os = "linux")]
+fn socket_kernel_inode(socket: &File) -> anyhow::Result<u64> {
+    let target = std::fs::read_link(format!("/proc/self/fd/{}", socket.as_raw_fd()))?;
+    let bytes = target.as_os_str().as_bytes();
+    let payload = bytes
+        .strip_prefix(b"socket:[")
+        .and_then(|bytes| bytes.strip_suffix(b"]"))
+        .context("VMM API descriptor lacks a kernel socket inode")?;
+    std::str::from_utf8(payload)?
+        .parse::<u64>()
+        .context("parse VMM API kernel socket inode")
+}
+
+#[cfg(target_os = "linux")]
+fn rename_at_no_replace(
+    old_parent: &File,
+    old_name: &CStr,
+    new_parent: &File,
+    new_name: &CStr,
+) -> io::Result<()> {
+    loop {
+        // SAFETY: both parent descriptors and names remain live; renameat2
+        // retains no Rust pointer and RENAME_NOREPLACE forbids overwrite.
+        let result = unsafe {
+            libc::renameat2(
+                old_parent.as_raw_fd(),
+                old_name.as_ptr(),
+                new_parent.as_raw_fd(),
+                new_name.as_ptr(),
+                libc::RENAME_NOREPLACE,
+            )
+        };
+        if result == 0 {
+            return Ok(());
+        }
+        let source = io::Error::last_os_error();
+        if source.kind() != io::ErrorKind::Interrupted {
+            return Err(source);
+        }
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn unlink_at(parent: &File, name: &CStr, flags: i32) -> io::Result<()> {
+    loop {
+        // SAFETY: parent/name remain live and unlinkat retains neither.
+        let result = unsafe { libc::unlinkat(parent.as_raw_fd(), name.as_ptr(), flags) };
+        if result == 0 {
+            return Ok(());
+        }
+        let source = io::Error::last_os_error();
+        if source.kind() != io::ErrorKind::Interrupted {
+            return Err(source);
+        }
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn fchmod_at(parent: &File, name: &CStr, mode: libc::mode_t) -> io::Result<()> {
+    loop {
+        // SAFETY: parent/name remain live and fchmodat retains neither.
+        let result = unsafe { libc::fchmodat(parent.as_raw_fd(), name.as_ptr(), mode, 0) };
+        if result == 0 {
+            return Ok(());
+        }
+        let source = io::Error::last_os_error();
+        if source.kind() != io::ErrorKind::Interrupted {
+            return Err(source);
+        }
+    }
 }
 
 fn encode_receipt(receipt: &VmmSocketOwnershipReceiptV1) -> anyhow::Result<Vec<u8>> {
@@ -908,16 +2247,27 @@ fn ensure_owned_regular_file(
     Ok(())
 }
 
-fn stable_file_identity(metadata: &std::fs::Metadata) -> (u64, u64, u64, i64, i64, i64, i64) {
-    (
-        metadata.dev(),
-        metadata.ino(),
-        metadata.len(),
-        metadata.mtime(),
-        metadata.mtime_nsec(),
-        metadata.ctime(),
-        metadata.ctime_nsec(),
-    )
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct StableFileIdentity {
+    device: u64,
+    inode: u64,
+    length: u64,
+    modified_seconds: i64,
+    modified_nanoseconds: i64,
+    changed_seconds: i64,
+    changed_nanoseconds: i64,
+}
+
+fn stable_file_identity(metadata: &std::fs::Metadata) -> StableFileIdentity {
+    StableFileIdentity {
+        device: metadata.dev(),
+        inode: metadata.ino(),
+        length: metadata.len(),
+        modified_seconds: metadata.mtime(),
+        modified_nanoseconds: metadata.mtime_nsec(),
+        changed_seconds: metadata.ctime(),
+        changed_nanoseconds: metadata.ctime_nsec(),
+    }
 }
 
 fn fixed_c_string(value: &str) -> CString {
@@ -972,6 +2322,8 @@ mod tests {
     use std::os::unix::ffi::OsStrExt as _;
     #[cfg(target_os = "linux")]
     use std::os::unix::fs::{symlink, OpenOptionsExt as _};
+    #[cfg(target_os = "linux")]
+    use std::time::{Duration, Instant};
 
     use cats_api::runtime_reconciliation::decode_runtime_checkpoint;
 
@@ -1094,6 +2446,30 @@ mod tests {
         (old_namespace, new_namespace)
     }
 
+    #[cfg(target_os = "linux")]
+    struct TestPhysicalContext {
+        deadline: Instant,
+    }
+
+    #[cfg(target_os = "linux")]
+    impl crate::runtime_spine::RuntimePhysicalReadContext for TestPhysicalContext {
+        fn deadline(&self) -> Instant {
+            self.deadline
+        }
+
+        fn check_active(&self) -> anyhow::Result<()> {
+            anyhow::ensure!(Instant::now() < self.deadline, "test deadline expired");
+            Ok(())
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    fn scan_context() -> TestPhysicalContext {
+        TestPhysicalContext {
+            deadline: Instant::now() + Duration::from_secs(10),
+        }
+    }
+
     #[test]
     fn installed_mapping_is_short_canonical_and_incarnation_exact() {
         let checkpoint = checkpoint();
@@ -1154,6 +2530,52 @@ mod tests {
         assert!(root
             .paths_for(&RandomId128::new("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa").unwrap())
             .is_err());
+    }
+
+    #[test]
+    fn production_open_boundaries_never_create_missing_roots() {
+        let temporary = tempfile::tempdir().unwrap();
+        let state_path = temporary.path().join("state");
+        std::fs::create_dir(&state_path).unwrap();
+        std::fs::set_permissions(
+            &state_path,
+            std::os::unix::fs::PermissionsExt::from_mode(0o700),
+        )
+        .unwrap();
+        let state = StateDirectory::unanchored(state_path.clone());
+        assert!(VmmSocketReceiptStore::open_existing(state).is_err());
+        assert!(!state_path.join(VMM_SOCKET_RECEIPT_NAMESPACE).exists());
+
+        let missing = temporary.path().join("missing-vmm-root");
+        let planner = ManagedVmmSocketRoot::from_canonical_path(
+            HostPath::new(missing.to_string_lossy().into_owned()).unwrap(),
+        )
+        .unwrap();
+        let owner = std::fs::metadata(temporary.path()).unwrap();
+        assert!(RetainedManagedVmmSocketRoot::open(planner, owner.uid(), owner.gid()).is_err());
+        assert!(!missing.exists());
+    }
+
+    #[test]
+    fn receipt_namespace_must_be_an_existing_exact_0700_directory() {
+        let temporary = tempfile::tempdir().unwrap();
+        let state_path = temporary.path().join("state");
+        let receipts = state_path.join(VMM_SOCKET_RECEIPT_NAMESPACE);
+        std::fs::create_dir_all(&receipts).unwrap();
+        std::fs::set_permissions(
+            &state_path,
+            std::os::unix::fs::PermissionsExt::from_mode(0o700),
+        )
+        .unwrap();
+        std::fs::set_permissions(
+            &receipts,
+            std::os::unix::fs::PermissionsExt::from_mode(0o755),
+        )
+        .unwrap();
+        assert!(
+            VmmSocketReceiptStore::open_existing(StateDirectory::unanchored(state_path)).is_err()
+        );
+        assert!(receipts.is_dir());
     }
 
     #[cfg(target_os = "linux")]
@@ -1392,6 +2814,253 @@ mod tests {
                 assert_eq!(std::fs::read(&path).unwrap(), b"foreign");
             }
         }
+    }
+
+    #[cfg(target_os = "linux")]
+    fn expect_prepared(
+        preparation: ManagedVmmSocketPreparation<'_>,
+    ) -> PreparedManagedVmmSocketAttempt<'_> {
+        match preparation {
+            ManagedVmmSocketPreparation::Prepared(prepared) => *prepared,
+            ManagedVmmSocketPreparation::ExistingLive => panic!("expected a fresh API listener"),
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    fn inject_namespace_crash(
+        root: &RetainedManagedVmmSocketRoot,
+        checkpoint: &RuntimeCheckpoint,
+        store: &VmmSocketReceiptStore,
+        target: NamespacePreparationPoint,
+    ) {
+        let mut reached = false;
+        let result = root.prepare_existing_receipt_inner(checkpoint, store, |point| {
+            if point == target {
+                reached = true;
+                anyhow::bail!("injected VMM socket namespace crash")
+            }
+            Ok(())
+        });
+        assert!(result.is_err());
+        assert!(reached, "injected crash point was not reached");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn every_prepare_crash_window_replays_to_one_exact_listener() {
+        for crash in [
+            NamespacePreparationPoint::StagingCreated,
+            NamespacePreparationPoint::OwnerMarkerSynced,
+            NamespacePreparationPoint::PublicPublished,
+            NamespacePreparationPoint::ApiBound,
+            NamespacePreparationPoint::DirectorySynced,
+        ] {
+            let (_temporary, root, checkpoint, store, receipt) = receipt_fixture();
+            store.publish(&receipt).unwrap();
+            inject_namespace_crash(&root, &checkpoint, &store, crash);
+            let prepared =
+                expect_prepared(root.prepare_existing_receipt(&checkpoint, &store).unwrap());
+            prepared.assert_current().unwrap();
+        }
+
+        for crash in [
+            NamespacePreparationPoint::PublicQuarantined,
+            NamespacePreparationPoint::QuarantineRemoved,
+        ] {
+            let (_temporary, root, checkpoint, store, receipt) = receipt_fixture();
+            store.publish(&receipt).unwrap();
+            drop(expect_prepared(
+                root.prepare_existing_receipt(&checkpoint, &store).unwrap(),
+            ));
+            inject_namespace_crash(&root, &checkpoint, &store, crash);
+            let prepared =
+                expect_prepared(root.prepare_existing_receipt(&checkpoint, &store).unwrap());
+            prepared.assert_current().unwrap();
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn live_api_holder_is_preserved_and_blocks_a_second_prepare() {
+        let (_temporary, root, checkpoint, store, receipt) = receipt_fixture();
+        store.publish(&receipt).unwrap();
+        let prepared = expect_prepared(root.prepare_existing_receipt(&checkpoint, &store).unwrap());
+        let before = std::fs::symlink_metadata(receipt.api_socket_path.as_str())
+            .unwrap()
+            .ino();
+
+        assert!(matches!(
+            root.prepare_existing_receipt(&checkpoint, &store).unwrap(),
+            ManagedVmmSocketPreparation::ExistingLive
+        ));
+        assert_eq!(
+            std::fs::symlink_metadata(receipt.api_socket_path.as_str())
+                .unwrap()
+                .ino(),
+            before
+        );
+        prepared.assert_current().unwrap();
+
+        drop(prepared);
+        expect_prepared(root.prepare_existing_receipt(&checkpoint, &store).unwrap())
+            .assert_current()
+            .unwrap();
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn foreign_attempt_entries_and_symlinks_are_preserved() {
+        for selector in 0..3 {
+            let (temporary, root, checkpoint, store, receipt) = receipt_fixture();
+            store.publish(&receipt).unwrap();
+            let paths = root.planner().paths_from_checkpoint(&checkpoint).unwrap();
+            let attempt = match selector {
+                0 => paths.public_directory(),
+                1 => paths.staging_directory(),
+                _ => paths.quarantine_directory(),
+            };
+            std::fs::create_dir(attempt.as_str()).unwrap();
+            std::fs::set_permissions(
+                attempt.as_str(),
+                std::os::unix::fs::PermissionsExt::from_mode(0o700),
+            )
+            .unwrap();
+            let foreign = Path::new(attempt.as_str()).join("foreign");
+            std::fs::write(&foreign, b"foreign-owned-by-someone-else").unwrap();
+
+            assert!(root.prepare_existing_receipt(&checkpoint, &store).is_err());
+            assert_eq!(
+                std::fs::read(&foreign).unwrap(),
+                b"foreign-owned-by-someone-else"
+            );
+            drop(temporary);
+        }
+
+        for selector in 0..3 {
+            let (temporary, root, checkpoint, store, receipt) = receipt_fixture();
+            store.publish(&receipt).unwrap();
+            let paths = root.planner().paths_from_checkpoint(&checkpoint).unwrap();
+            let attempt = match selector {
+                0 => paths.public_directory(),
+                1 => paths.staging_directory(),
+                _ => paths.quarantine_directory(),
+            };
+            let target = temporary.path().join("foreign-directory");
+            std::fs::create_dir(&target).unwrap();
+            symlink(&target, attempt.as_str()).unwrap();
+
+            assert!(root.prepare_existing_receipt(&checkpoint, &store).is_err());
+            assert_eq!(std::fs::read_link(attempt.as_str()).unwrap(), target);
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn retained_prepared_attempt_rejects_public_directory_aba() {
+        let (temporary, root, checkpoint, store, receipt) = receipt_fixture();
+        store.publish(&receipt).unwrap();
+        let prepared = expect_prepared(root.prepare_existing_receipt(&checkpoint, &store).unwrap());
+        let paths = root.planner().paths_from_checkpoint(&checkpoint).unwrap();
+        let displaced = temporary.path().join("vmm").join("displaced-public");
+        std::fs::rename(paths.public_directory().as_str(), &displaced).unwrap();
+        std::fs::create_dir(paths.public_directory().as_str()).unwrap();
+        std::fs::set_permissions(
+            paths.public_directory().as_str(),
+            std::os::unix::fs::PermissionsExt::from_mode(0o700),
+        )
+        .unwrap();
+
+        assert!(prepared.assert_current().is_err());
+        assert!(displaced.join(VMM_API_SOCKET_BASENAME).exists());
+        assert!(Path::new(paths.public_directory().as_str()).is_dir());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn multiple_attempt_names_are_preserved_as_rename_recreate_aba() {
+        for second_name in ["staging", "quarantine"] {
+            let (_temporary, root, checkpoint, store, receipt) = receipt_fixture();
+            store.publish(&receipt).unwrap();
+            drop(expect_prepared(
+                root.prepare_existing_receipt(&checkpoint, &store).unwrap(),
+            ));
+            let paths = root.planner().paths_from_checkpoint(&checkpoint).unwrap();
+            let second_path = if second_name == "staging" {
+                paths.staging_directory()
+            } else {
+                paths.quarantine_directory()
+            };
+            std::fs::create_dir(second_path.as_str()).unwrap();
+            std::fs::set_permissions(
+                second_path.as_str(),
+                std::os::unix::fs::PermissionsExt::from_mode(0o700),
+            )
+            .unwrap();
+
+            assert!(root.prepare_existing_receipt(&checkpoint, &store).is_err());
+            assert!(Path::new(paths.public_directory().as_str()).is_dir());
+            assert!(Path::new(second_path.as_str()).is_dir());
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn bounded_managed_root_scan_accounts_only_exact_receipted_attempts() {
+        let (temporary, root, checkpoint, store, receipt) = receipt_fixture();
+        assert_eq!(
+            scan_managed_vmm_socket_root(&root, &store, &[&checkpoint], &scan_context()).unwrap(),
+            ManagedVmmSocketRootScan::Accounted
+        );
+        store.publish(&receipt).unwrap();
+        drop(expect_prepared(
+            root.prepare_existing_receipt(&checkpoint, &store).unwrap(),
+        ));
+        assert_eq!(
+            scan_managed_vmm_socket_root(&root, &store, &[&checkpoint], &scan_context()).unwrap(),
+            ManagedVmmSocketRootScan::Accounted
+        );
+
+        let foreign = temporary.path().join("vmm").join("foreign-entry");
+        std::fs::write(&foreign, b"foreign").unwrap();
+        assert_eq!(
+            scan_managed_vmm_socket_root(&root, &store, &[&checkpoint], &scan_context()).unwrap(),
+            ManagedVmmSocketRootScan::Residue
+        );
+        assert_eq!(std::fs::read(foreign).unwrap(), b"foreign");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn managed_root_scan_rejects_aba_and_entry_bound_without_cleanup() {
+        let (_temporary, root, checkpoint, store, receipt) = receipt_fixture();
+        store.publish(&receipt).unwrap();
+        drop(expect_prepared(
+            root.prepare_existing_receipt(&checkpoint, &store).unwrap(),
+        ));
+        let paths = root.planner().paths_from_checkpoint(&checkpoint).unwrap();
+        std::fs::create_dir(paths.staging_directory().as_str()).unwrap();
+        std::fs::set_permissions(
+            paths.staging_directory().as_str(),
+            std::os::unix::fs::PermissionsExt::from_mode(0o700),
+        )
+        .unwrap();
+        assert_eq!(
+            scan_managed_vmm_socket_root(&root, &store, &[&checkpoint], &scan_context()).unwrap(),
+            ManagedVmmSocketRootScan::Residue
+        );
+        assert!(Path::new(paths.public_directory().as_str()).is_dir());
+        assert!(Path::new(paths.staging_directory().as_str()).is_dir());
+
+        let (_temporary, root, _checkpoint, store, _receipt) = receipt_fixture();
+        let root_path = Path::new(root.planner().path().as_str());
+        for index in 0..=MANAGED_VMM_SOCKET_ROOT_ENTRY_LIMIT {
+            std::fs::write(root_path.join(format!("foreign-{index}")), b"x").unwrap();
+        }
+        assert_eq!(
+            scan_managed_vmm_socket_root(&root, &store, &[], &scan_context()).unwrap(),
+            ManagedVmmSocketRootScan::Residue
+        );
+        assert_eq!(std::fs::read(root_path.join("foreign-0")).unwrap(), b"x");
     }
 
     #[cfg(target_os = "linux")]
