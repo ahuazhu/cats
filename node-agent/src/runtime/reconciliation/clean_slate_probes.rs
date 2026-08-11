@@ -6112,6 +6112,7 @@ mod tests {
         RuntimePreScanRecoveryOutcome, RuntimeSpineFullScan,
     };
 
+    use super::super::serving_blockd_process::RetainedServingBlockdAuthority;
     use super::super::signed_running::{
         acquire_checkpoint, expected_provision_heads, prepared_owned_observed_volume,
         ProvisionHeadRead, SignedRunningPublicationRecovery,
@@ -7816,6 +7817,85 @@ mod tests {
             &volumes,
         )
         .is_err());
+    }
+
+    #[test]
+    fn retained_direct_serving_authority_reopens_root_and_persistent_exactly() {
+        let environment = TestEnvironment::new();
+        let scan_context = assigned_context_with_root_and_persistent();
+        let desired = &scan_context.coordinates().desired.desired_specs[0];
+        let (root_record, root_attachment) = exact_owned_record_and_attachment_for(desired, 0);
+        let (persistent_record, persistent_attachment) =
+            exact_owned_record_and_attachment_for(desired, 1);
+        let root_data = prepare_exact_lineage_for(&environment, desired, 0, &root_attachment);
+        let persistent_data =
+            prepare_exact_lineage_for(&environment, desired, 1, &persistent_attachment);
+        let root =
+            direct_vhost_prepared_device(&environment, desired, 0, &root_attachment, &root_data);
+        let persistent = direct_vhost_prepared_device(
+            &environment,
+            desired,
+            1,
+            &persistent_attachment,
+            &persistent_data,
+        );
+        let mut checkpoint = acquire_checkpoint(
+            desired,
+            &desired.volumes[0],
+            RuntimeVolumeTransition::Acquire {
+                request: VolumeAcquireRequest::Normal {
+                    volume_id: root_attachment.acquire_request.volume_id.clone(),
+                    transition_id: root_attachment.acquire_request.transition_id.clone(),
+                    attachment_id: root_attachment.acquire_request.attachment_id.clone(),
+                    expected_unowned_epoch: root_attachment.acquire_request.expected_unowned_epoch,
+                    desired_revision: root_attachment.acquire_request.desired_revision,
+                    placement_epoch: root_attachment.acquire_request.placement_epoch,
+                    lease_duration_ms: root_attachment.acquire_request.lease_duration_ms,
+                },
+            },
+            UnixMillis::new(9_000).unwrap(),
+        );
+        checkpoint.step = ReconcileStep::PrepareNetwork {
+            network: RuntimeNetworkIdentity {
+                network_config: desired.runtime.network_config.clone(),
+                tap_name: Id::new("tap_multi").unwrap(),
+                ownership_token: RandomId128::new("cccccccccccccccccccccccccccccccc").unwrap(),
+            },
+            devices: vec![root.clone(), persistent.clone()],
+        };
+        checkpoint.volumes = vec![
+            prepared_owned_observed_volume(
+                &desired.volumes[0],
+                &root_attachment,
+                root.serving_process.data_directory.clone(),
+            ),
+            prepared_owned_observed_volume(
+                &desired.volumes[1],
+                &persistent_attachment,
+                persistent.serving_process.data_directory.clone(),
+            ),
+        ];
+        checkpoint
+            .volumes
+            .sort_by(|left, right| left.volume_id.cmp(&right.volume_id));
+        let state = StateDirectory::unanchored(environment.state.clone());
+        let systemd = test_systemd_config_for_path(&environment.blockd_binary);
+
+        for (device, record) in [(&root, &root_record), (&persistent, &persistent_record)] {
+            let retained = RetainedServingBlockdAuthority::reopen(
+                &state,
+                &checkpoint,
+                desired,
+                device,
+                record,
+            )
+            .unwrap();
+            let expected = retained.expectation(&systemd, desired, record).unwrap();
+            assert!(expected.matches_device_contract(&desired.cat_id, device));
+            retained
+                .assert_current(&checkpoint, desired, record, &expected)
+                .unwrap();
+        }
     }
 
     #[test]

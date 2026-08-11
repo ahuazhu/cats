@@ -4684,6 +4684,8 @@ mod tests {
             runtimes: vec![runtime],
             residue: Vec::new(),
         };
+        let node_global_process =
+            node_global_process.map(|admission| admission.rebind_for_test(&observation).unwrap());
         let desired_snapshot = DesiredReadSnapshot {
             version: ContractVersion::V1,
             session: SessionBinding {
@@ -5238,6 +5240,7 @@ mod tests {
             &self,
             _request: &KernelNbdAttachRequest,
             _listener: &dyn RetainedKernelNbdListenerGuard,
+            _admitted_exact_devices: &[&super::super::kernel_nbd::ExactKernelNbdDeviceProof],
             _store: &FileCheckpointStore,
             _stored: &StoredCheckpoint,
             context: &RuntimeDesiredEffectContext,
@@ -5740,6 +5743,7 @@ mod tests {
                 ownership_token: prepared.ownership_token.clone(),
             },
         }];
+        let node_global_process = node_global_process.rebind_for_test(&observation).unwrap();
         let admission = base
             .accepted_full()
             .unwrap()

@@ -7,14 +7,15 @@
 
 use std::ffi::OsString;
 use std::path::Path;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use anyhow::Context as _;
 use cats_api::blockd::DurabilityStatus;
 use cats_api::runtime_reconciliation::{
     ControlHandshakeEvidence, DesiredRuntimeSpec, HostPath, Id, ObservedDevice,
     ObservedRuntimeStatus, OwnershipTokenEvidence, PrepareDeviceFrontend, PreparedDeviceInput,
-    ProcessEvidence, ProcessRole, ProcessState, RandomId128, ReconcileStep, WireU64,
+    ProcessEvidence, ProcessRole, ProcessState, RandomId128, ReconcileStep, RuntimeCheckpoint,
+    ServingAuthorityProvenance, WireU64,
 };
 use cats_storage::authority::{
     validate_authorized_serving_attachment, validate_volume_record, LastVolumeTransition,
@@ -27,13 +28,15 @@ use crate::runtime_spine::{
 };
 use crate::state_directory::StateDirectory;
 
-use super::authorized_blockd::{retained_authorized_blockd_command, AuthorizedBlockFrontend};
+use super::authorized_blockd::{
+    retained_authorized_blockd_command, AuthorizedBlockFrontend, RetainedAuthorizedBlockd,
+};
 use super::checkpoint::CurrentCheckpointGuard;
 use super::clean_slate_probes::CHECKPOINT_NAMESPACE;
 use super::inventory::AuthorizedBlockdInventoryEvidence;
 use super::network::{
     prepare_device_checkpoint_view, prepare_network_volume_admission_is_exact,
-    prepared_device_input,
+    prepared_device_input, prepared_device_inputs, prepared_device_set_is_exact,
 };
 use super::prepare_device_retirement::{
     prepare_device_base_admission_is_exact, retirement_authority_lease_is_monotonic, unique_runtime,
@@ -784,6 +787,10 @@ impl ServingBlockdListenerProof {
         &self.exact.evidence
     }
 
+    pub(crate) fn matches_public_process(&self, process: &ProcessEvidence) -> bool {
+        self.exact.matches_public_process(process)
+    }
+
     /// Reopen the listener and process identity before a later frontend
     /// submission. The retained proof keeps the filesystem and kernel socket
     /// inodes private; callers receive only success or a closed error and
@@ -818,7 +825,7 @@ impl ServingBlockdListenerProof {
 /// checkpoint-current predicate from an old digest.
 pub(crate) struct CheckpointedServingBlockdProcess<'a> {
     expected: &'a ServingBlockdExpectation,
-    handoff: &'a PrepareDeviceHandoffReady,
+    retained_authority: &'a RetainedServingBlockdAuthority,
     stored: &'a StoredCheckpoint,
     desired: &'a DesiredRuntimeSpec,
     authority: &'a VolumeRecord,
@@ -834,8 +841,169 @@ impl CheckpointedServingBlockdProcess<'_> {
     pub(crate) fn assert_current(&self) -> anyhow::Result<()> {
         self.store
             .revalidate_current(self.stored, &self.current_checkpoint)?;
-        self.handoff
-            .assert_current(self.stored.checkpoint(), self.desired, self.authority)
+        self.retained_authority.assert_current(
+            self.stored.checkpoint(),
+            self.desired,
+            self.authority,
+            self.expected,
+        )
+    }
+}
+
+/// Descriptor-retained immutable serving authority for one prepared Volume.
+/// Root retains the post-provision handoff files; direct Persistent/Root
+/// retains the original authorized attachment files.  Callers cannot choose
+/// the variant independently of the checkpointed provenance.
+pub(crate) enum RetainedServingBlockdAuthority {
+    Root {
+        prepared_checkpoint: RuntimeCheckpoint,
+        prepared: PreparedDeviceInput,
+        ready: PrepareDeviceHandoffReady,
+    },
+    Direct {
+        prepared: PreparedDeviceInput,
+        retained: RetainedAuthorizedBlockd,
+    },
+}
+
+impl RetainedServingBlockdAuthority {
+    pub(crate) fn reopen(
+        state_directory: &StateDirectory,
+        checkpoint: &RuntimeCheckpoint,
+        desired: &DesiredRuntimeSpec,
+        prepared: &PreparedDeviceInput,
+        authority: &VolumeRecord,
+    ) -> anyhow::Result<Self> {
+        let store = AuthorizedBlockdStore::new(state_directory.clone());
+        match prepared.serving_authority.as_ref() {
+            ServingAuthorityProvenance::AfterRootProvision { .. } => {
+                let prepared_checkpoint = prepare_device_checkpoint_view(checkpoint)?;
+                anyhow::ensure!(
+                    prepared_device_input(&prepared_checkpoint)? == *prepared,
+                    "Root serving authority selected another prepared device"
+                );
+                let retained =
+                    store.retain_prepare_device_handoff(&prepared_checkpoint, desired)?;
+                let ready = ServingHandoffStore::new(state_directory.clone())
+                    .reopen_prepare_device_handoff(
+                        &prepared_checkpoint,
+                        desired,
+                        authority,
+                        retained,
+                    )?;
+                Ok(Self::Root {
+                    prepared_checkpoint,
+                    prepared: prepared.clone(),
+                    ready,
+                })
+            }
+            ServingAuthorityProvenance::DirectAuthorizedAttachment { .. } => {
+                let retained = store.retain_prepared_device(checkpoint, desired, prepared)?;
+                Ok(Self::Direct {
+                    prepared: prepared.clone(),
+                    retained,
+                })
+            }
+        }
+    }
+
+    pub(crate) fn expectation(
+        &self,
+        systemd: &RootProvisionSystemdConfig,
+        desired: &DesiredRuntimeSpec,
+        authority: &VolumeRecord,
+    ) -> anyhow::Result<ServingBlockdExpectation> {
+        let expected = match self {
+            Self::Root {
+                prepared_checkpoint,
+                ready,
+                ..
+            } => ServingBlockdExpectation::from_handoff(
+                ready,
+                systemd,
+                prepared_checkpoint,
+                desired,
+                authority,
+            )?,
+            Self::Direct { prepared, retained } => {
+                retained.assert_prepared_authority(prepared)?;
+                let frontend = match &prepared.frontend {
+                    PrepareDeviceFrontend::KernelNbd {
+                        listener_socket_path,
+                        ..
+                    } => AuthorizedBlockFrontend::NbdUnix {
+                        socket: Path::new(listener_socket_path.as_str()).to_path_buf(),
+                    },
+                    PrepareDeviceFrontend::VhostUserBlk {
+                        socket_path,
+                        queues,
+                        queue_size,
+                    } => AuthorizedBlockFrontend::VhostUser {
+                        socket: Path::new(socket_path.as_str()).to_path_buf(),
+                        queues: usize::try_from(*queues)
+                            .context("prepared vhost queue count does not fit usize")?,
+                        queue_size: *queue_size,
+                    },
+                };
+                let command = retained_authorized_blockd_command(
+                    systemd.validated_blockd(),
+                    retained,
+                    prepared,
+                    &frontend,
+                )?;
+                ServingBlockdExpectation::from_command(
+                    retained.checkpoint().clone(),
+                    command,
+                    prepared.clone(),
+                )?
+            }
+        };
+        anyhow::ensure!(
+            expected.matches_current_authority(authority),
+            "retained serving authority conflicts with current Volume authority"
+        );
+        Ok(expected)
+    }
+
+    pub(crate) fn assert_current(
+        &self,
+        checkpoint: &RuntimeCheckpoint,
+        desired: &DesiredRuntimeSpec,
+        authority: &VolumeRecord,
+        expected: &ServingBlockdExpectation,
+    ) -> anyhow::Result<()> {
+        anyhow::ensure!(
+            checkpoint.cat_id == desired.cat_id
+                && checkpoint.node_id == desired.placement.node_id
+                && checkpoint.placement_epoch == desired.placement.placement_epoch
+                && checkpoint.desired_revision == desired.desired_revision
+                && checkpoint.spec_digest == desired.spec_digest,
+            "retained serving authority changed its current checkpoint coordinate"
+        );
+        let prepared = match self {
+            Self::Root { prepared, .. } | Self::Direct { prepared, .. } => prepared,
+        };
+        anyhow::ensure!(
+            prepared_device_inputs(checkpoint)?
+                .iter()
+                .filter(|candidate| *candidate == prepared)
+                .count()
+                == 1
+                && expected.matches_device_contract(&checkpoint.cat_id, prepared)
+                && expected.matches_current_authority(authority),
+            "retained serving authority changed its prepared device or Volume authority"
+        );
+        match self {
+            Self::Root {
+                prepared_checkpoint,
+                ready,
+                ..
+            } => ready.assert_current(prepared_checkpoint, desired, authority),
+            Self::Direct { prepared, retained } => {
+                retained.assert_current()?;
+                retained.assert_prepared_authority(prepared)
+            }
+        }
     }
 }
 
@@ -843,6 +1011,15 @@ pub(crate) struct ServingBlockdStartEffect {
     authority: Arc<dyn VolumeDataAuthority>,
     systemd: RootProvisionSystemdConfig,
     process: Arc<dyn ServingBlockdProcessGlobalPort>,
+    submitted_admission: Mutex<Option<RandomId128>>,
+}
+
+struct AdmittedServingStart<'a> {
+    expected: ServingBlockdExpectation,
+    admitted_exact: Option<&'a ExactServingBlockdProcessProof>,
+    retained: RetainedServingBlockdAuthority,
+    first_authority: VolumeRecord,
+    first_lease_expiry: cats_api::runtime_reconciliation::UnixMillis,
 }
 
 impl ServingBlockdStartEffect {
@@ -855,6 +1032,7 @@ impl ServingBlockdStartEffect {
             authority,
             systemd,
             process,
+            submitted_admission: Mutex::new(None),
         }
     }
 
@@ -871,7 +1049,7 @@ impl ServingBlockdStartEffect {
         let Some(runtime) = unique_runtime(&accepted.observation().runtimes, desired)? else {
             return Ok(None);
         };
-        let prepare_network_device = match &runtime.step {
+        let observed_devices = match &runtime.step {
             ReconcileStep::PrepareDevice { .. } => {
                 if !prepare_device_base_admission_is_exact(accepted, desired, runtime) {
                     return Ok(Some(stop_local()));
@@ -879,9 +1057,9 @@ impl ServingBlockdStartEffect {
                 None
             }
             ReconcileStep::PrepareNetwork { network, devices } => {
-                let [device] = devices.as_slice() else {
+                if !prepared_device_set_is_exact(desired, devices) {
                     return Ok(Some(stop_local()));
-                };
+                }
                 let Some(expected_networks) = context
                     .node_global_network()?
                     .expected_networks(&desired.cat_id, network)
@@ -897,7 +1075,7 @@ impl ServingBlockdStartEffect {
                 {
                     return Ok(Some(stop_local()));
                 }
-                Some(device)
+                Some(devices.as_slice())
             }
             _ => return Ok(None),
         };
@@ -929,140 +1107,186 @@ impl ServingBlockdStartEffect {
         if stored.content_digest() != content_digest || stored.checkpoint().step != runtime.step {
             return Ok(Some(RuntimeDesiredEffectOutcome::RefreshInventory));
         }
-
-        let [desired_volume] = desired.volumes.as_slice() else {
-            return Ok(Some(stop_local()));
-        };
-        let first_authority = match self.authority.load_volume(&desired_volume.volume_id) {
-            Ok(authority) => authority,
-            Err(_) => return Ok(Some(RuntimeDesiredEffectOutcome::RefreshInventory)),
-        };
-        let retained = match AuthorizedBlockdStore::new(context.state_directory().clone())
-            .retain_prepare_device_handoff(stored.checkpoint(), desired)
-        {
-            Ok(retained) => retained,
-            Err(_) => return Ok(Some(stop_local())),
-        };
-        let ready = match ServingHandoffStore::new(context.state_directory().clone())
-            .reopen_prepare_device_handoff(stored.checkpoint(), desired, &first_authority, retained)
-        {
-            Ok(ready) => ready,
-            Err(_) => return Ok(Some(stop_local())),
-        };
-        let Some(first_lease_expiry) = first_authority
-            .lease_expires_at
-            .filter(|current| *current >= ready.attempt().attachment.lease_expires_at)
-        else {
-            return Ok(Some(stop_local()));
-        };
-        let expected = ServingBlockdExpectation::from_handoff(
-            &ready,
-            &self.systemd,
-            stored.checkpoint(),
-            desired,
-            &first_authority,
-        )?;
-        let admission = context.node_global_process()?;
-        let Some((admitted_expected, admitted_exact)) =
-            admission.serving_blockd(&desired.cat_id, expected.volume_id())
-        else {
-            return Ok(Some(stop_local()));
-        };
-        let prepare_network_is_exact = prepare_network_device.is_none_or(|device| {
-            expected.matches_device_contract(&desired.cat_id, device)
-                && prepare_network_volume_admission_is_exact(
-                    desired,
-                    runtime,
-                    device,
-                    expected.volume_id(),
-                    runtime
-                        .volumes
-                        .first()
-                        .and_then(|volume| match volume.devices.as_slice() {
-                            [observed] => Some(observed),
-                            _ => None,
-                        }),
-                )
-        });
-        if admitted_expected != &expected
-            || !prepare_network_is_exact
-            || !accepted_devices_are_compatible(context, runtime, &expected, admitted_exact)?
+        let prepared = prepared_device_inputs(stored.checkpoint())?;
+        if prepared.is_empty()
+            || observed_devices.is_some_and(|observed| observed != prepared.as_slice())
         {
             return Ok(Some(stop_local()));
         }
-        let accepted_process = match runtime.processes.as_slice() {
-            [] if admitted_exact.is_none() => None,
-            [process]
-                if admitted_exact.is_some_and(|proof| proof.matches_public_process(process)) =>
+        let admission = context.node_global_process()?;
+        anyhow::ensure!(
+            admission.matches_observation(accepted.observation()),
+            "serving process admission is not bound to the accepted full observation"
+        );
+        if admission.serving_blockd_count(&desired.cat_id) != prepared.len() {
+            return Ok(Some(RuntimeDesiredEffectOutcome::RefreshInventory));
+        }
+        let mut serving = Vec::with_capacity(prepared.len());
+        for device in &prepared {
+            let Some((admitted_expected, admitted_exact)) =
+                admission.serving_blockd(&desired.cat_id, &device.volume_id)
+            else {
+                return Ok(Some(RuntimeDesiredEffectOutcome::RefreshInventory));
+            };
+            if !admitted_expected.matches_device_contract(&desired.cat_id, device)
+                || observed_devices.is_some()
+                    && !prepare_network_volume_admission_is_exact(
+                        desired,
+                        runtime,
+                        device,
+                        admitted_expected.volume_id(),
+                        runtime
+                            .volumes
+                            .iter()
+                            .find(|volume| volume.volume_id == device.volume_id)
+                            .and_then(|volume| match volume.devices.as_slice() {
+                                [observed] => Some(observed),
+                                _ => None,
+                            }),
+                    )
+                || !accepted_devices_are_compatible(
+                    context,
+                    runtime,
+                    admitted_expected,
+                    admitted_exact,
+                )?
             {
-                Some(process)
+                return Ok(Some(stop_local()));
             }
-            _ => return Ok(Some(stop_local())),
-        };
+            let first_authority = match self.authority.load_volume(&device.volume_id) {
+                Ok(authority) => authority,
+                Err(_) => return Ok(Some(RuntimeDesiredEffectOutcome::RefreshInventory)),
+            };
+            let retained = match RetainedServingBlockdAuthority::reopen(
+                context.state_directory(),
+                stored.checkpoint(),
+                desired,
+                device,
+                &first_authority,
+            ) {
+                Ok(retained) => retained,
+                Err(_) => return Ok(Some(stop_local())),
+            };
+            let expected = retained.expectation(&self.systemd, desired, &first_authority)?;
+            if &expected != admitted_expected {
+                return Ok(Some(stop_local()));
+            }
+            let Some(first_lease_expiry) = first_authority.lease_expires_at else {
+                return Ok(Some(stop_local()));
+            };
+            serving.push(AdmittedServingStart {
+                expected,
+                admitted_exact,
+                retained,
+                first_authority,
+                first_lease_expiry,
+            });
+        }
+        let admitted_exact_count = serving
+            .iter()
+            .filter(|entry| entry.admitted_exact.is_some())
+            .count();
+        if runtime.processes.len() != admitted_exact_count
+            || runtime.processes.iter().any(|process| {
+                serving
+                    .iter()
+                    .filter_map(|entry| entry.admitted_exact)
+                    .filter(|proof| proof.matches_public_process(process))
+                    .count()
+                    != 1
+            })
+        {
+            return Ok(Some(stop_local()));
+        }
 
-        context.check_active()?;
-        let inspection = self
-            .process
-            .inspect_serving_exact_or_absent_after_node_global_sweep(&expected, context)?;
-        match (accepted_process, inspection) {
-            (None, ServingBlockdProcessInspection::Exact(_))
-            | (Some(_), ServingBlockdProcessInspection::Absent)
-            | (_, ServingBlockdProcessInspection::Unavailable) => {
-                Ok(Some(RuntimeDesiredEffectOutcome::RefreshInventory))
-            }
-            (_, ServingBlockdProcessInspection::Conflict(_)) => Ok(Some(stop_local())),
-            (Some(accepted), ServingBlockdProcessInspection::Exact(evidence)) => {
-                if !evidence.exactly_matches(&expected)
-                    || !accepted_process_matches_evidence(accepted, &evidence)
-                {
+        let mut selected_absent = None;
+        for (index, entry) in serving.iter().enumerate() {
+            context.check_active()?;
+            let inspection = self
+                .process
+                .inspect_serving_exact_or_absent_after_node_global_sweep(
+                    &entry.expected,
+                    context,
+                )?;
+            match (entry.admitted_exact, inspection) {
+                (None, ServingBlockdProcessInspection::Absent) => {
+                    selected_absent.get_or_insert(index);
+                }
+                (Some(admitted), ServingBlockdProcessInspection::Exact(evidence))
+                    if evidence.exactly_matches(&entry.expected)
+                        && evidence.as_ref() == admitted.evidence() => {}
+                (_, ServingBlockdProcessInspection::Conflict(_)) => {
                     return Ok(Some(stop_local()));
                 }
-                let current = self.reread_current(
-                    context,
-                    &desired_volume.volume_id,
-                    &first_authority,
-                    first_lease_expiry,
-                )?;
-                ready.assert_current(stored.checkpoint(), desired, &current)?;
-                let guard = store.assert_current(&stored)?;
-                store.revalidate_current(&stored, &guard)?;
-                Ok(None)
-            }
-            (None, ServingBlockdProcessInspection::Absent) => {
-                let current = self.reread_current(
-                    context,
-                    &desired_volume.volume_id,
-                    &first_authority,
-                    first_lease_expiry,
-                )?;
-                ready.assert_current(stored.checkpoint(), desired, &current)?;
-                let guard = store.assert_current(&stored)?;
-                store.revalidate_current(&stored, &guard)?;
-                let checkpointed = CheckpointedServingBlockdProcess {
-                    expected: &expected,
-                    handoff: &ready,
-                    stored: &stored,
-                    desired,
-                    authority: &current,
-                    store: &store,
-                    current_checkpoint: guard,
-                };
-                checkpointed.assert_current()?;
-                let _submission = self.process.start_checkpointed(checkpointed, context)?;
-
-                // The response is never a postcondition.  Revalidate every
-                // retained boundary after the ambiguous external call, then
-                // require a newly accepted complete inventory.
-                let after = self.reread_current(
-                    context,
-                    &desired_volume.volume_id,
-                    &first_authority,
-                    first_lease_expiry,
-                )?;
-                ready.assert_current(stored.checkpoint(), desired, &after)?;
-                Ok(Some(RuntimeDesiredEffectOutcome::RefreshInventory))
+                (_, ServingBlockdProcessInspection::Unavailable)
+                | (None, ServingBlockdProcessInspection::Exact(_))
+                | (Some(_), ServingBlockdProcessInspection::Absent)
+                | (Some(_), ServingBlockdProcessInspection::Exact(_)) => {
+                    return Ok(Some(RuntimeDesiredEffectOutcome::RefreshInventory));
+                }
             }
         }
+
+        let guard = store.assert_current(&stored)?;
+        let mut current_authorities = Vec::with_capacity(serving.len());
+        for entry in &serving {
+            let current = self.reread_current(
+                context,
+                entry.expected.volume_id(),
+                &entry.first_authority,
+                entry.first_lease_expiry,
+            )?;
+            entry.retained.assert_current(
+                stored.checkpoint(),
+                desired,
+                &current,
+                &entry.expected,
+            )?;
+            current_authorities.push(current);
+        }
+        store.revalidate_current(&stored, &guard)?;
+        let Some(selected) = selected_absent else {
+            return Ok(None);
+        };
+
+        let observation_id = &accepted.observation().observation_id;
+        let mut submitted = self
+            .submitted_admission
+            .lock()
+            .map_err(|_| anyhow::anyhow!("serving process submission gate poisoned"))?;
+        if submitted.as_ref() == Some(observation_id) {
+            return Ok(Some(RuntimeDesiredEffectOutcome::RefreshInventory));
+        }
+        *submitted = Some(observation_id.clone());
+        drop(submitted);
+        let selected_entry = &serving[selected];
+        let checkpointed = CheckpointedServingBlockdProcess {
+            expected: &selected_entry.expected,
+            retained_authority: &selected_entry.retained,
+            stored: &stored,
+            desired,
+            authority: &current_authorities[selected],
+            store: &store,
+            current_checkpoint: guard,
+        };
+        checkpointed.assert_current()?;
+        let _submission = self.process.start_checkpointed(checkpointed, context)?;
+
+        // A systemd response is never a postcondition and never permits a
+        // second Volume start in this admission. Recheck every retained
+        // Volume/filesystem authority, then require a newly accepted full.
+        for entry in &serving {
+            let after = self.reread_current(
+                context,
+                entry.expected.volume_id(),
+                &entry.first_authority,
+                entry.first_lease_expiry,
+            )?;
+            entry
+                .retained
+                .assert_current(stored.checkpoint(), desired, &after, &entry.expected)?;
+        }
+        Ok(Some(RuntimeDesiredEffectOutcome::RefreshInventory))
     }
 
     fn reread_current(
