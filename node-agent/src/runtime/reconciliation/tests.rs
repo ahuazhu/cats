@@ -3735,14 +3735,18 @@ fn snapshot_with_closed_endpoint(
         .find(|route| route.binding.endpoint_id == id(endpoint_id))
         .expect("snapshot route")
         .gate = RouteGateState::Closed;
-    AdmissionSnapshot::new(
+    let mut replacement = AdmissionSnapshot::new(
         snapshot.applied_desired_revision(),
         snapshot.spec_digest().clone(),
         snapshot.placement().clone(),
         snapshot.runtime_incarnation().cloned(),
         snapshot.lifecycle_admission(),
         endpoints,
-    )
+    );
+    if let Some(guest_ipv4) = snapshot.guest_ipv4().cloned() {
+        replacement = replacement.with_guest_ipv4(guest_ipv4);
+    }
+    replacement
 }
 
 fn arm_pending_close_edge(
