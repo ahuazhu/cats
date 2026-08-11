@@ -2062,6 +2062,18 @@ pub(crate) fn validate_running_physical_desired_successor(
         normalized == *physical,
         "live-gate Desired changed non-Endpoint physical launch authority"
     );
+    for current in &gate.endpoints {
+        if let Some(previous) = physical
+            .endpoints
+            .iter()
+            .find(|endpoint| endpoint.endpoint_id == current.endpoint_id)
+        {
+            anyhow::ensure!(
+                previous == current || current.route_epoch > previous.route_epoch,
+                "changed retained Endpoint did not advance its route epoch"
+            );
+        }
+    }
     Ok(())
 }
 
@@ -3053,6 +3065,22 @@ mod tests {
         same_revision.runtime.memory_bytes += 4096;
         same_revision.spec_digest = spec_digest(&same_revision).unwrap();
         assert!(validate_running_physical_desired_successor(&physical, &same_revision).is_err());
+    }
+
+    #[test]
+    fn running_physical_desired_successor_rejects_a_lower_retained_route_epoch() {
+        let physical =
+            cats_api::runtime_reconciliation::decode_desired_runtime_spec(include_bytes!(concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/../testdata/runtime-reconciliation-v1-desired.json"
+            )))
+            .unwrap();
+        let mut regressed = physical.clone();
+        regressed.desired_revision = Revision::new(physical.desired_revision.get() + 1).unwrap();
+        regressed.endpoints[0].route_epoch =
+            Epoch::new(physical.endpoints[0].route_epoch.get() - 1).unwrap();
+        regressed.spec_digest = spec_digest(&regressed).unwrap();
+        assert!(validate_running_physical_desired_successor(&physical, &regressed).is_err());
     }
 
     fn final_directory(root: &Path) -> PathBuf {
