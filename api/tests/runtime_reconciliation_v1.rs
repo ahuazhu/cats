@@ -6358,15 +6358,25 @@ fn guest_device_serial_bound_is_uniform_across_v1_carriers() {
         ("start_runtime", start_runtime_checkpoint_value()),
     ] {
         checkpoint["step"]["devices"][0]["guest_device"]["serial"] = BOUNDARY.into();
+        if name == "start_runtime" {
+            sync_retained_runtime_launch(&mut checkpoint);
+        }
         decode_runtime_checkpoint(&serde_json::to_vec(&checkpoint).unwrap())
             .unwrap_or_else(|error| panic!("{name} rejected 20-byte serial: {error:?}"));
 
         checkpoint["step"]["devices"][0]["guest_device"]["serial"] = TOO_LONG.into();
+        if name == "start_runtime" {
+            sync_retained_runtime_launch(&mut checkpoint);
+        }
         let error =
             decode_runtime_checkpoint(&serde_json::to_vec(&checkpoint).unwrap()).unwrap_err();
         assert_eq!(
             malformed(&error).0.as_str(),
-            "/step/devices/0/guest_device/serial",
+            if name == "start_runtime" {
+                "/runtime_launch/identity/devices/0/guest_device/serial"
+            } else {
+                "/step/devices/0/guest_device/serial"
+            },
             "{name}"
         );
         assert_eq!(
