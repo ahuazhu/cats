@@ -8,10 +8,10 @@
 //! signed NormalAcquire after an accepted full inventory. The composed Root
 //! prefix now continues through exact target-control handoff and the
 //! checkpoint-only `PrepareDevice` transition, old-process retirement, and
-//! one-effect start/adoption of the exact serving blockd. The vhost-user path
-//! then reserves its exact Host network in a separate checkpoint-only round.
-//! Kernel-NBD attachment, TAP creation, and VMM/device consumption remain
-//! later fresh-inventory effects.
+//! one-effect start/adoption of the exact serving blockd. Both frontends then
+//! converge through independent device, Host-network reservation/TAP, and
+//! checkpoint-only StartRuntime CID rounds. Physical VMM launch and Guest
+//! handshake remain later fresh-inventory effects.
 //! This path does not construct `NodeRuntime`, adopt a legacy ledger, or run a
 //! destructive residue/device sweep.
 
@@ -35,7 +35,7 @@ use crate::runtime::reconciliation::{
     KernelNbdClientCleanupOwner, KernelNbdInventoryConfig, RootProvisionSystemdConfig,
     RuntimeVolumeTransitionHttpClient, ServingPrepareFrontend, SignedRunningAcquireEffect,
     SignedRunningEffect, SignedRunningHostConfig, SignedRunningProcessPorts,
-    SignedRunningPublicationRecovery,
+    SignedRunningPublicationRecovery, VmmLaunchArtifactPaths,
 };
 use crate::runtime_spine::{
     RuntimeEffectResourceOwner, RuntimeInventoryScanner, RuntimeSpineDeadlinePolicy,
@@ -242,6 +242,13 @@ async fn spawn_signed_runtime_cutover_with_overrides(
     #[cfg(not(target_os = "linux"))]
     let kernel_nbd_inventory: Option<KernelNbdInventoryConfig> = None;
     let kernel_nbd_cleanup_owner = Arc::new(KernelNbdClientCleanupOwner::new());
+    let effect_vmm_launch_artifacts = VmmLaunchArtifactPaths {
+        launcher_executable: config.ch_config.vmm_launcher_bin.clone(),
+        vmm_executable: config.ch_config.ch_bin.clone(),
+        kernel: config.ch_config.kernel.clone(),
+        initramfs: config.ch_config.initramfs.clone(),
+        kernel_cmdline: config.ch_config.cmdline.clone(),
+    };
     let installed_probe_config = InstalledCleanSlateProbeConfig {
         state_directory: config.agent_registration.runtime_state_directory(),
         cloud_hypervisor_binary: config.ch_config.ch_bin.clone(),
@@ -362,6 +369,7 @@ async fn spawn_signed_runtime_cutover_with_overrides(
                 effect_network_ip_binary,
                 effect_kernel_nbd_inventory,
                 Arc::clone(&effect_kernel_nbd_cleanup_owner),
+                effect_vmm_launch_artifacts,
             ),
             SignedRunningProcessPorts::new(
                 Arc::clone(&effect_root_process_ports.retirement),
@@ -1208,9 +1216,13 @@ mod tests {
     #[test]
     fn production_composition_starts_with_one_checkpointed_signed_acquire() {
         let source = include_str!("runtime_cutover.rs");
+        let running_effect = include_str!("runtime/reconciliation/signed_root_provision.rs");
         assert!(source.contains("SignedRunningAcquireEffect::new"));
         assert!(source.contains("RuntimeVolumeTransitionHttpClient::for_production"));
         assert!(source.contains("installed_clean_slate_scanner"));
+        assert!(source.contains("VmmLaunchArtifactPaths"));
+        assert!(source.contains("vmm_launcher_bin"));
+        assert!(running_effect.contains("StartRuntimeReservationEffect::platform"));
         let placeholder_effect = ["Unavailable", "Desired", "Effect"].concat();
         let legacy_job = ["Node", "Job"].concat();
         let legacy_runtime = ["Node", "Runtime", "::", "new"].concat();

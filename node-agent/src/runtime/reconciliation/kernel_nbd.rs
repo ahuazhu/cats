@@ -1121,6 +1121,77 @@ impl KernelNbdInventoryPort {
         self.config.device_count()
     }
 
+    /// Reinspect the complete kernel-NBD pool under its allocation flock and
+    /// prove that one accepted exact device is still the same client joined
+    /// to the same persisted PrepareNetwork contract. This is read-only and
+    /// is used immediately around the StartRuntime CID reservation CAS.
+    pub(crate) fn revalidate_exact_device(
+        &self,
+        context: &RuntimeDesiredEffectContext,
+        store: &FileCheckpointStore,
+        stored: &StoredCheckpoint,
+        admitted: &ExactKernelNbdDeviceProof,
+    ) -> Result<()> {
+        let permit = self.lock_and_inspect(context)?;
+        let context_state_root = context
+            .state_directory()
+            .try_clone_directory()
+            .context("retain Desired-effect state root for kernel-NBD revalidation")?;
+        ensure_same_directory(
+            permit.state_root(),
+            &context_state_root,
+            "kernel-NBD revalidation and Desired effect use different directories",
+        )?;
+        let assigned_cats = context.accepted_full()?.assigned_cats()?;
+        let namespace = snapshot_runtime_checkpoint_namespace(
+            permit.state_root(),
+            context,
+            assigned_cats,
+            RUNTIME_CHECKPOINT_NAMESPACE_ENTRY_LIMIT,
+        )?
+        .context("kernel-NBD revalidation requires a complete checkpoint namespace")?;
+        permit.assert_current_publication_paths(&namespace, store)?;
+        anyhow::ensure!(
+            namespace.checkpoint(&stored.checkpoint().cat_id) == Some(stored.checkpoint()),
+            "kernel-NBD StartRuntime predecessor changed in the complete namespace"
+        );
+        let reservations = KernelNbdReservations::from_snapshot(&namespace)?;
+        let expected = device_expectations_from_namespace(&namespace)?
+            .into_values()
+            .find(|expected| expected.cat_id == stored.checkpoint().cat_id)
+            .context("PrepareNetwork lacks its exact kernel-NBD device expectation")?;
+        anyhow::ensure!(
+            admitted.expected == expected,
+            "accepted kernel-NBD proof changed its persisted device expectation"
+        );
+        reservations.assert_contains(
+            &expected.reservation(),
+            "kernel-NBD StartRuntime expectation lacks its durable reservation",
+        )?;
+        permit.configured_index(&expected.device_path)?;
+        anyhow::ensure!(
+            matches!(
+                permit.snapshot().state(&expected.device_path),
+                Some(KernelNbdSlotState::Serving(client)) if client == &admitted.client
+            ),
+            "kernel-NBD client changed before StartRuntime reservation"
+        );
+        for (path, state) in permit.snapshot().iter() {
+            if !reservations.by_device.contains_key(path) {
+                anyhow::ensure!(
+                    matches!(state, KernelNbdSlotState::Free),
+                    "physical kernel-NBD slot has no exact durable reservation"
+                );
+            }
+        }
+        admitted.listener().assert_current(context)?;
+        permit.assert_current_publication_paths(&namespace, store)?;
+        context.check_active()?;
+        permit
+            .release()
+            .context("unlock kernel-NBD allocator after StartRuntime revalidation")
+    }
+
     #[cfg(test)]
     fn inject_unlock_failures(&mut self, count: usize) {
         self.injected_unlock_failures = count;

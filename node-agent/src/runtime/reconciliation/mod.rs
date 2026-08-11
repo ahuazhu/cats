@@ -76,17 +76,8 @@ mod vmm_launch_artifacts;
     reason = "retained VMM runtime paths are staged before exact process composition"
 )]
 mod vmm_runtime_paths;
-// The StartRuntime edge is checkpoint-only. Production composition is added
-// with the scanner-sealed live-VMM CID adapter; until then this module remains
-// private and cannot start a process.
-#[cfg_attr(
-    not(test),
-    expect(
-        dead_code,
-        reason = "StartRuntime checkpoint builder awaits sealed CID production composition"
-    )
-)]
 mod vmm_start_runtime;
+mod vmm_start_runtime_effect;
 // A StartRuntime attempt must own its API/vsock namespace before the fixed
 // launcher or PID 1 can create anything.  This provider-private WAL and
 // descriptor-rooted namespace land before the production effect consumes it.
@@ -113,13 +104,9 @@ mod vmm_api_inspection;
     reason = "checkpointed VMM systemd port awaits full-inventory composition"
 )]
 mod vmm_process;
-// Guest CID reservation is checkpoint-first and provider-private.  The VMM
-// process scanner and physical start effect consume this sealed allocator in
-// the following StartRuntime composition slice.
-#[expect(
-    dead_code,
-    reason = "sealed VMM CID allocator is staged before StartRuntime composition"
-)]
+// Guest CID reservation is checkpoint-first and provider-private. The
+// checkpoint-only StartRuntime effect consumes it; physical launch remains a
+// later fresh-inventory effect.
 mod vmm_cid;
 mod volume_transitions;
 
@@ -183,6 +170,7 @@ pub(crate) use signed_root_provision::{
 pub(crate) use signed_running::{SignedRunningAcquireEffect, SignedRunningPublicationRecovery};
 #[allow(unused_imports)]
 pub(crate) use vmm_cid::{PlatformExactVmmCidInventoryPort, VmmCidAllocationPort};
+pub(crate) use vmm_launch_artifacts::VmmLaunchArtifactPaths;
 #[allow(unused_imports)]
 pub(crate) use vmm_runtime_paths::ManagedVmmLaunchFilePaths;
 #[allow(unused_imports)]

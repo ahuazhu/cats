@@ -57,6 +57,7 @@ use super::serving_handoff_effect::{
 use super::signed_running::{
     expected_provision_heads, provision_checkpoint_is_bound, ProvisionHeadRead,
 };
+use super::vmm_start_runtime_effect::StartRuntimeReservationEffect;
 use super::SignedRunningAcquireEffect;
 use super::{
     ensure_root_provision_process_from_persisted_checkpoint, AuthorizedBlockdStore,
@@ -64,7 +65,7 @@ use super::{
     PlatformSystemdRootProvisionProcessPort, RootProvisionProcessConflict,
     RootProvisionProcessInspection, RootProvisionProcessOutcome, RootProvisionProcessPort,
     RootProvisionProcessRetirementPort, RootProvisionProcessStop, RootProvisionResponseHint,
-    RootProvisionSystemdConfig, UnixRootProvisionClient,
+    RootProvisionSystemdConfig, UnixRootProvisionClient, VmmLaunchArtifactPaths,
 };
 
 pub(crate) mod request_sealed {
@@ -143,7 +144,8 @@ pub(crate) struct SignedRunningEffect {
     prepare_device_retirement: Option<PrepareDeviceTargetRetirementEffect>,
     serving_process: Option<ServingBlockdStartEffect>,
     kernel_nbd_attach: Option<KernelNbdAttachEffect>,
-    prepare_network: Option<PrepareNetworkReservationEffect>,
+    prepare_network: Option<Arc<PrepareNetworkReservationEffect>>,
+    start_runtime: Option<StartRuntimeReservationEffect>,
 }
 
 pub(crate) struct SignedRunningProcessPorts {
@@ -158,6 +160,7 @@ pub(crate) struct SignedRunningHostConfig {
     network_ip_binary: PathBuf,
     kernel_nbd_inventory: Option<KernelNbdInventoryConfig>,
     kernel_nbd_cleanup_owner: Arc<KernelNbdClientCleanupOwner>,
+    vmm_launch_artifacts: VmmLaunchArtifactPaths,
 }
 
 impl SignedRunningHostConfig {
@@ -167,6 +170,7 @@ impl SignedRunningHostConfig {
         network_ip_binary: PathBuf,
         kernel_nbd_inventory: Option<KernelNbdInventoryConfig>,
         kernel_nbd_cleanup_owner: Arc<KernelNbdClientCleanupOwner>,
+        vmm_launch_artifacts: VmmLaunchArtifactPaths,
     ) -> Self {
         Self {
             systemd,
@@ -174,6 +178,7 @@ impl SignedRunningHostConfig {
             network_ip_binary,
             kernel_nbd_inventory,
             kernel_nbd_cleanup_owner,
+            vmm_launch_artifacts,
         }
     }
 }
@@ -207,6 +212,7 @@ impl SignedRunningEffect {
             network_ip_binary,
             kernel_nbd_inventory,
             kernel_nbd_cleanup_owner,
+            vmm_launch_artifacts,
         } = host;
         let executable = systemd
             .blockd_binary()
@@ -227,13 +233,27 @@ impl SignedRunningEffect {
             systemd.clone(),
             Arc::clone(&process_ports.serving_global),
         );
-        let kernel_nbd_attach = kernel_nbd_inventory.map(|config| {
+        let kernel_nbd_attach = kernel_nbd_inventory.clone().map(|config| {
             KernelNbdAttachEffect::platform(
                 Arc::clone(&authority),
                 config,
                 kernel_nbd_cleanup_owner,
             )
         });
+        let prepare_network = Arc::new(PrepareNetworkReservationEffect::new(
+            state_directory.clone(),
+            network_ip_binary,
+            Arc::clone(&authority),
+            Arc::clone(&process_ports.serving_global),
+        )?);
+        let start_runtime = StartRuntimeReservationEffect::platform(
+            state_directory,
+            vmm_launch_artifacts,
+            Arc::clone(&prepare_network),
+            Arc::clone(&authority),
+            Arc::clone(&process_ports.serving_global),
+            kernel_nbd_inventory,
+        );
         Ok(Self {
             acquire,
             provision: SignedRootProvisionEffect::platform(
@@ -253,12 +273,8 @@ impl SignedRunningEffect {
             prepare_device_retirement: Some(prepare_device_retirement),
             serving_process: Some(serving_process_effect),
             kernel_nbd_attach,
-            prepare_network: Some(PrepareNetworkReservationEffect::new(
-                state_directory,
-                network_ip_binary,
-                Arc::clone(&authority),
-                process_ports.serving_global,
-            )?),
+            prepare_network: Some(prepare_network),
+            start_runtime: Some(start_runtime),
         })
     }
 }
@@ -286,6 +302,11 @@ impl RuntimeDesiredEffect for SignedRunningEffect {
         }
         if let Some(prepare_network) = &self.prepare_network {
             if let Some(outcome) = prepare_network.try_apply(&context, desired)? {
+                return Ok(outcome);
+            }
+        }
+        if let Some(start_runtime) = &self.start_runtime {
+            if let Some(outcome) = start_runtime.try_apply(&context, desired)? {
                 return Ok(outcome);
             }
         }
@@ -2319,6 +2340,7 @@ mod tests {
                 serving_process: None,
                 kernel_nbd_attach: None,
                 prepare_network: None,
+                start_runtime: None,
             }
         }
     }

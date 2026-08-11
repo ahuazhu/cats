@@ -1317,6 +1317,15 @@ fn compare_process_evidence(left: &ProcessEvidence, right: &ProcessEvidence) -> 
 }
 
 impl NodeGlobalManagedProcessAdmission {
+    #[cfg(test)]
+    pub(crate) fn rebind_for_test(&self, observation: &NodeObservation) -> anyhow::Result<Self> {
+        NodeGlobalManagedProcessScanAdmission {
+            entries: self.entries.clone(),
+            stop_receipt_sockets: self.stop_receipt_sockets.clone(),
+        }
+        .bind(observation)
+    }
+
     pub(crate) fn stop_receipt_socket(&self, cat_id: &Id) -> Option<&StopReceiptSocketAdmission> {
         self.stop_receipt_sockets.get(cat_id)
     }

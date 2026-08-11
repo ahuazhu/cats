@@ -340,7 +340,7 @@ impl Drop for VmmCidAllocationPermit {
 }
 
 #[cfg(test)]
-type AfterReplaceHook = Arc<dyn Fn(&RuntimeDesiredEffectContext) + Send + Sync>;
+type AfterReplaceHook = Arc<dyn Fn(&RuntimeDesiredEffectContext) -> Result<()> + Send + Sync>;
 
 pub(crate) struct VmmCidAllocationPort {
     state_directory: StateDirectory,
@@ -373,7 +373,7 @@ impl VmmCidAllocationPort {
     }
 
     #[cfg(test)]
-    fn with_after_replace(mut self, hook: AfterReplaceHook) -> Self {
+    pub(crate) fn with_after_replace(mut self, hook: AfterReplaceHook) -> Self {
         self.after_replace = Some(hook);
         self
     }
@@ -408,6 +408,7 @@ impl VmmCidAllocationPort {
         context: &RuntimeDesiredEffectContext,
         store: &FileCheckpointStore,
         predecessor: &StoredCheckpoint,
+        mut revalidate_authority: impl FnMut() -> Result<()>,
         build: impl FnOnce(u32) -> Result<RuntimeCheckpoint>,
     ) -> Result<StoredCheckpoint> {
         let permit = self.lock(context)?;
@@ -444,6 +445,10 @@ impl VmmCidAllocationPort {
         let physical_before = self.inventory.inspect(context)?;
         physical_before.validate_against(&reservations)?;
         let selected = reservations.select_free()?;
+        // The accepted full scan is only the admission that opened this
+        // batch. Reopen every external launch authority after taking the
+        // Node-global CID flock, before constructing a successor from it.
+        revalidate_authority()?;
         context.check_active()?;
         let replacement = build(selected)?;
         let ReconcileStep::StartRuntime {
@@ -472,6 +477,11 @@ impl VmmCidAllocationPort {
             "Node-global live VMM CID inventory changed before reservation publication"
         );
         physical_after.validate_against(&prospective)?;
+        // Close the other side of the CID critical section. In particular,
+        // an exact TAP, serving process, device, Volume lease or installed
+        // launch artifact may not drift while the allocator was selecting a
+        // CID and validating the complete live-VMM namespace.
+        revalidate_authority()?;
         context.check_active()?;
         permit.assert_current_paths(&snapshot, store)?;
         let persisted = store
@@ -479,7 +489,7 @@ impl VmmCidAllocationPort {
             .context("persist StartRuntime CID reservation checkpoint")?;
         #[cfg(test)]
         if let Some(hook) = &self.after_replace {
-            hook(context);
+            hook(context)?;
         }
         permit.assert_current_paths(&snapshot, store)?;
         // Publication is durable even when cancellation wins its final race.
@@ -1126,6 +1136,7 @@ mod tests {
                 ),
                 &store,
                 &predecessor,
+                || Ok(()),
                 |selected| {
                     let mut replacement = start_runtime();
                     let ReconcileStep::StartRuntime { guest_cid, .. } = &mut replacement.step
@@ -1145,6 +1156,49 @@ mod tests {
     }
 
     #[test]
+    fn reservation_revalidates_external_authority_across_the_cid_critical_section() {
+        let fixture = Fixture::new();
+        let predecessor_checkpoint = prepare_network();
+        let store = fixture.store(&predecessor_checkpoint);
+        let predecessor = store.create(&predecessor_checkpoint).unwrap();
+        let port = VmmCidAllocationPort::new(
+            StateDirectory::unanchored(fixture.state.clone()),
+            Arc::new(FakeInventory::stable(
+                VmmCidInventorySnapshot::try_new(Vec::new()).unwrap(),
+            )),
+        );
+        let context = context(
+            &fixture.state,
+            std::slice::from_ref(&predecessor_checkpoint.cat_id),
+        );
+        let mut revalidations = 0;
+
+        let error = port
+            .reserve_and_replace(
+                &context,
+                &store,
+                &predecessor,
+                || {
+                    revalidations += 1;
+                    anyhow::ensure!(
+                        revalidations == 1,
+                        "injected launch authority drift before CID publication"
+                    );
+                    Ok(())
+                },
+                |_| Ok(start_runtime()),
+            )
+            .expect_err("drift after CID selection reached checkpoint publication");
+
+        assert!(format!("{error:#}").contains("authority drift"));
+        assert_eq!(revalidations, 2);
+        let current = store.load().unwrap().unwrap();
+        assert_eq!(current.checkpoint(), predecessor.checkpoint());
+        assert_eq!(current.content_digest(), predecessor.content_digest());
+        port.lock(&TestPhysicalContext::active()).unwrap();
+    }
+
+    #[test]
     fn cancellation_after_publication_returns_error_but_keeps_the_reservation() {
         let fixture = Fixture::new();
         let predecessor_checkpoint = prepare_network();
@@ -1156,20 +1210,30 @@ mod tests {
                 VmmCidInventorySnapshot::try_new(Vec::new()).unwrap(),
             )),
         )
-        .with_after_replace(Arc::new(|context| context.cancel_for_test()));
+        .with_after_replace(Arc::new(|context| {
+            context.cancel_for_test();
+            Ok(())
+        }));
         let context = context(
             &fixture.state,
             std::slice::from_ref(&predecessor_checkpoint.cat_id),
         );
         assert!(port
-            .reserve_and_replace(&context, &store, &predecessor, |selected| {
-                let mut replacement = start_runtime();
-                let ReconcileStep::StartRuntime { guest_cid, .. } = &mut replacement.step else {
-                    unreachable!()
-                };
-                *guest_cid = selected;
-                Ok(replacement)
-            })
+            .reserve_and_replace(
+                &context,
+                &store,
+                &predecessor,
+                || Ok(()),
+                |selected| {
+                    let mut replacement = start_runtime();
+                    let ReconcileStep::StartRuntime { guest_cid, .. } = &mut replacement.step
+                    else {
+                        unreachable!()
+                    };
+                    *guest_cid = selected;
+                    Ok(replacement)
+                }
+            )
             .is_err());
         let current = store.load().unwrap().unwrap();
         let ReconcileStep::StartRuntime { guest_cid, .. } = current.checkpoint().step else {
@@ -1205,6 +1269,7 @@ mod tests {
             ),
             &store_a,
             &predecessor_a,
+            || Ok(()),
             |selected| {
                 fs::rename(&lock_path, &moved_lock_path).unwrap();
                 // Force a generation change on the retained inode even on a
@@ -1280,6 +1345,7 @@ mod tests {
                 ),
                 &store,
                 &predecessor,
+                || Ok(()),
                 |_| Ok(start_runtime()),
             )
             .is_err());
@@ -1311,6 +1377,7 @@ mod tests {
                 ),
                 &store,
                 &predecessor,
+                || Ok(()),
                 |_| Ok(start_runtime()),
             )
             .is_err());
@@ -1338,6 +1405,7 @@ mod tests {
                 ),
                 &store,
                 &predecessor,
+                || Ok(()),
                 |_| {
                     let mut replacement = start_runtime();
                     let ReconcileStep::StartRuntime { guest_cid, .. } = &mut replacement.step

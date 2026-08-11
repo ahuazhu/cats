@@ -185,6 +185,20 @@ impl NodeGlobalNetworkScanAdmission {
             HostNetworkSnapshot::empty_for_test(),
         )
     }
+
+    #[cfg(test)]
+    pub(crate) fn exact_checkpoint_for_test(checkpoint: &RuntimeCheckpoint) -> Result<Self> {
+        let ReconcileStep::PrepareNetwork { network, .. } = &checkpoint.step else {
+            anyhow::bail!("test network admission requires PrepareNetwork")
+        };
+        Self::new(
+            [NetworkReservation {
+                cat_id: checkpoint.cat_id.clone(),
+                identity: network.clone(),
+            }],
+            HostNetworkSnapshot::exact_for_test(network)?,
+        )
+    }
 }
 
 impl NodeGlobalNetworkAdmission {
@@ -914,6 +928,44 @@ impl PrepareNetworkReservationEffect {
         self
     }
 
+    /// Reopen the complete checkpoint/TAP namespace and prove that the
+    /// persisted reservation is still the same exact physical TAP. This is a
+    /// read-only boundary for the later StartRuntime CID critical section;
+    /// an absent reservation is rejected and can never reach the create port.
+    pub(crate) fn revalidate_exact_reserved(
+        &self,
+        context: &RuntimeDesiredEffectContext,
+        store: &FileCheckpointStore,
+        stored: &StoredCheckpoint,
+    ) -> Result<()> {
+        let accepted = context.accepted_full()?;
+        let admission = context.node_global_network()?;
+        anyhow::ensure!(
+            admission.matches_observation(accepted.observation()),
+            "StartRuntime network admission is not bound to the accepted full observation"
+        );
+        let entry = admission
+            .reservation(&stored.checkpoint().cat_id)
+            .context("StartRuntime lacks its provider-private TAP reservation")?;
+        anyhow::ensure!(
+            entry.state == ReservedHostNetworkState::Exact,
+            "StartRuntime requires an exact physical TAP"
+        );
+        let round = self.allocation.create_or_adopt_reserved(
+            context,
+            admission,
+            store,
+            stored,
+            self.tap_create.as_ref(),
+            || Ok(()),
+        )?;
+        anyhow::ensure!(
+            round == NetworkPhysicalRound::AdoptedExact,
+            "StartRuntime network revalidation attempted a physical create"
+        );
+        Ok(())
+    }
+
     /// Reserve the Host network only after the accepted full scan and sealed
     /// serving proof agree on one exact device. Kernel-NBD reaches this CAS
     /// only through its scanner-sealed physical client proof; a checkpoint or
@@ -928,7 +980,7 @@ impl PrepareNetworkReservationEffect {
             return Ok(None);
         };
         if matches!(runtime.step, ReconcileStep::PrepareNetwork { .. }) {
-            return self.try_apply_physical(context, desired, runtime).map(Some);
+            return self.try_apply_physical(context, desired, runtime);
         }
         let ReconcileStep::PrepareDevice { frontend, .. } = &runtime.step else {
             return Ok(None);
@@ -1032,18 +1084,18 @@ impl PrepareNetworkReservationEffect {
         context: &RuntimeDesiredEffectContext,
         desired: &DesiredRuntimeSpec,
         runtime: &cats_api::runtime_reconciliation::ObservedRuntimeStatus,
-    ) -> Result<RuntimeDesiredEffectOutcome> {
+    ) -> Result<Option<RuntimeDesiredEffectOutcome>> {
         let accepted = context.accepted_full()?;
         let ReconcileStep::PrepareNetwork { network, devices } = &runtime.step else {
             unreachable!("caller selected PrepareNetwork")
         };
         let [device] = devices.as_slice() else {
-            return Ok(local_contract_stop());
+            return Ok(Some(local_contract_stop()));
         };
         let network_admission = context.node_global_network()?;
         let Some(expected_networks) = network_admission.expected_networks(&desired.cat_id, network)
         else {
-            return Ok(local_contract_stop());
+            return Ok(Some(local_contract_stop()));
         };
         if !signed_inventory_admission_is_exact_with_networks(
             accepted,
@@ -1052,21 +1104,21 @@ impl PrepareNetworkReservationEffect {
             &expected_networks,
         ) || !checkpoint_is_current_exact(desired, runtime)
         {
-            return Ok(local_contract_stop());
+            return Ok(Some(local_contract_stop()));
         }
         let Some((expectation, Some(serving))) = context
             .node_global_process()?
             .serving_blockd(&desired.cat_id)
         else {
-            return Ok(RuntimeDesiredEffectOutcome::RefreshInventory);
+            return Ok(Some(RuntimeDesiredEffectOutcome::RefreshInventory));
         };
         if !expectation.matches_device_contract(&desired.cat_id, device) {
-            return Ok(local_contract_stop());
+            return Ok(Some(local_contract_stop()));
         }
         let (volume_id, observed_device) = match &device.frontend {
             PrepareDeviceFrontend::VhostUserBlk { .. } => {
                 let Some(projection) = serving.vhost_device_projection() else {
-                    return Ok(local_contract_stop());
+                    return Ok(Some(local_contract_stop()));
                 };
                 projection
             }
@@ -1078,7 +1130,7 @@ impl PrepareNetworkReservationEffect {
                 if exact.listener().expectation() != expectation
                     || !exact.matches_prepared_device(&desired.cat_id, device)
                 {
-                    return Ok(local_contract_stop());
+                    return Ok(Some(local_contract_stop()));
                 }
                 exact.projection()
             }
@@ -1093,7 +1145,7 @@ impl PrepareNetworkReservationEffect {
             runtime.processes.as_slice(),
             [process] if serving.matches_public_process(process)
         ) {
-            return Ok(local_contract_stop());
+            return Ok(Some(local_contract_stop()));
         }
         let first_authority = self
             .authority
@@ -1113,7 +1165,7 @@ impl PrepareNetworkReservationEffect {
             ..
         } = &runtime.checkpoint
         else {
-            return Ok(local_contract_stop());
+            return Ok(Some(local_contract_stop()));
         };
         let store = FileCheckpointStore::open_preserving_checkpoint_temp(
             &context.state_directory().path().join(CHECKPOINT_NAMESPACE),
@@ -1124,12 +1176,12 @@ impl PrepareNetworkReservationEffect {
             "TAP effect admission names another checkpoint path"
         );
         let Some(stored) = store.load()? else {
-            return Ok(RuntimeDesiredEffectOutcome::RefreshInventory);
+            return Ok(Some(RuntimeDesiredEffectOutcome::RefreshInventory));
         };
         if stored.content_digest() != content_digest || stored.checkpoint().step != runtime.step {
-            return Ok(RuntimeDesiredEffectOutcome::RefreshInventory);
+            return Ok(Some(RuntimeDesiredEffectOutcome::RefreshInventory));
         }
-        let _round = self.allocation.create_or_adopt_reserved(
+        let round = self.allocation.create_or_adopt_reserved(
             context,
             network_admission,
             &store,
@@ -1145,7 +1197,14 @@ impl PrepareNetworkReservationEffect {
                 )
             },
         )?;
-        Ok(RuntimeDesiredEffectOutcome::RefreshInventory)
+        Ok(match round {
+            // Exact TAP adoption is a read-only proof. Let the independent
+            // StartRuntime reservation effect own this batch's sole CAS.
+            NetworkPhysicalRound::AdoptedExact => None,
+            NetworkPhysicalRound::CreateAttempted => {
+                Some(RuntimeDesiredEffectOutcome::RefreshInventory)
+            }
+        })
     }
 
     fn revalidate_serving_authority(

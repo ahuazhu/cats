@@ -1190,6 +1190,28 @@ impl HostNetworkSnapshot {
         }
     }
 
+    #[cfg(test)]
+    pub(crate) fn exact_for_test(identity: &RuntimeNetworkIdentity) -> Result<Self> {
+        let expected = ChNetwork {
+            tap: identity.tap_name.as_str().to_owned(),
+            ownership_token: identity.ownership_token.clone(),
+            config: identity.network_config.clone(),
+        };
+        validate_network_plan(&expected)?;
+        Ok(Self {
+            links: BTreeMap::from([(
+                expected.tap.clone(),
+                HostNetworkLinkSnapshot {
+                    ifindex: 17,
+                    is_tap: true,
+                    is_up: true,
+                    alias: Some(network_alias(&expected)),
+                    ipv4: vec![Ipv4Cidr::parse(&host_cidr(&expected))?],
+                },
+            )]),
+        })
+    }
+
     fn managed_networks(
         &self,
     ) -> Result<BTreeMap<String, (cats_api::runtime_reconciliation::Id, RandomId128, Ipv4Cidr)>>

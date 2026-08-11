@@ -3868,16 +3868,17 @@ mod tests {
     use std::time::{Duration, Instant};
 
     use cats_api::runtime_reconciliation::{
-        spec_digest, AdmissionInventoryAttestation, AgentSession, AppliedDesiredEvidence,
-        AsciiText, AssignedKind, AssignedPlacement, CheckpointEvidence, Condition,
-        DesiredReadSnapshot, DiskKind, Generation, GuestDeviceIdentity, GuestTransportEvidence,
-        Ipv4Address, IsolatedIpv4Kind, LifecycleAdmission, MacAddress, NetworkConfig, NodeBootId,
-        NodeObservation, NormalAcquireRequest, NormalAcquireResult, ObservedDevice,
-        ObservedRuntimeStatus, OwnershipTokenEvidence, PrepareDeviceFrontend, ProgressingReason,
-        RequireIdleCheckpoint, RuntimeCheckpoint, RuntimeConfig, RuntimeTarget, RuntimeTransition,
-        Sequence, ServingAuthorityProvenance, ServingBlockdIdentity, SessionBinding, UnixMillis,
-        VolumeAccess, VolumeAcquire, VolumeAdminState, VolumeAuthorityEvidence, VolumeDisposition,
-        VolumeIntent, WarmSnapshotEvidence,
+        decode_runtime_checkpoint, spec_digest, AdmissionInventoryAttestation, AgentSession,
+        AppliedDesiredEvidence, AsciiText, AssignedKind, AssignedPlacement, CheckpointEvidence,
+        Condition, DesiredReadSnapshot, DiskKind, Generation, GuestDeviceIdentity,
+        GuestTransportEvidence, Ipv4Address, IsolatedIpv4Kind, LifecycleAdmission, MacAddress,
+        NetworkConfig, NodeBootId, NodeObservation, NormalAcquireRequest, NormalAcquireResult,
+        ObservedDevice, ObservedNetwork, ObservedRuntimeStatus, OwnershipTokenEvidence,
+        PrepareDeviceFrontend, ProgressingReason, RequireIdleCheckpoint, RuntimeCheckpoint,
+        RuntimeConfig, RuntimeLaunchArtifact, RuntimeTarget, RuntimeTransition, Sequence,
+        ServingAuthorityProvenance, ServingBlockdIdentity, SessionBinding, UnixMillis,
+        VmmBootProvenance, VolumeAccess, VolumeAcquire, VolumeAdminState, VolumeAuthorityEvidence,
+        VolumeDisposition, VolumeIntent, WarmSnapshotEvidence,
     };
     use cats_storage::authority::{
         AuthorityError, LastVolumeTransition, RenewLeaseRequest, RenewLeaseResult,
@@ -3918,6 +3919,9 @@ mod tests {
         ServingPrepareFrontend,
     };
     use crate::runtime::reconciliation::signed_running::prepared_owned_observed_volume;
+    use crate::runtime::reconciliation::vmm_start_runtime_effect::{
+        LaunchArtifactAuthorityPort, RetainedLaunchArtifactAuthority, StartRuntimeReservationEffect,
+    };
     use crate::runtime::reconciliation::{
         AuthorizedBlockdStore, FileCheckpointStore, RootProvisionProcessConflict,
         RootProvisionProcessInspection, RootProvisionSystemdConfig,
@@ -5152,6 +5156,106 @@ mod tests {
         path
     }
 
+    fn exact_ip_binary(fixture: &Fixture, checkpoint: &RuntimeCheckpoint) -> PathBuf {
+        let ReconcileStep::PrepareNetwork { network, .. } = &checkpoint.step else {
+            panic!("exact ip fixture requires PrepareNetwork")
+        };
+        let path = fixture.data_directory.join("test-ip-exact");
+        let alias = format!(
+            "cats-network:{}:{}",
+            network.network_config.network_id, network.ownership_token
+        );
+        let links = format!(
+            r#"[{{"ifindex":17,"ifname":"{}","flags":["UP"],"ifalias":"{}","linkinfo":{{"info_kind":"tun","info_data":{{"type":"tap"}}}}}}]"#,
+            network.tap_name, alias
+        );
+        let addresses = format!(
+            r#"[{{"ifindex":17,"ifname":"{}","addr_info":[{{"family":"inet","local":"{}","prefixlen":30}}]}}]"#,
+            network.tap_name, network.network_config.gateway_ipv4
+        );
+        std::fs::write(
+            &path,
+            format!(
+                "#!/bin/sh\nif [ \"$2\" = '-d' ]; then printf '%s' '{links}'; else printf '%s' '{addresses}'; fi\n"
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o700)).unwrap();
+        path
+    }
+
+    struct FixedLaunchArtifactPort {
+        launcher: RuntimeLaunchArtifact,
+        boot: VmmBootProvenance,
+        assertions: Arc<AtomicUsize>,
+        fail_on_assertion: Option<usize>,
+    }
+
+    struct FixedRetainedLaunchArtifacts {
+        launcher: RuntimeLaunchArtifact,
+        boot: VmmBootProvenance,
+        assertions: Arc<AtomicUsize>,
+        fail_on_assertion: Option<usize>,
+    }
+
+    impl LaunchArtifactAuthorityPort for FixedLaunchArtifactPort {
+        fn retain(&self) -> Result<Box<dyn RetainedLaunchArtifactAuthority>> {
+            Ok(Box::new(FixedRetainedLaunchArtifacts {
+                launcher: self.launcher.clone(),
+                boot: self.boot.clone(),
+                assertions: Arc::clone(&self.assertions),
+                fail_on_assertion: self.fail_on_assertion,
+            }))
+        }
+    }
+
+    impl RetainedLaunchArtifactAuthority for FixedRetainedLaunchArtifacts {
+        fn launcher_executable(&self) -> RuntimeLaunchArtifact {
+            self.launcher.clone()
+        }
+
+        fn boot(&self) -> VmmBootProvenance {
+            self.boot.clone()
+        }
+
+        fn assert_current(&self) -> Result<()> {
+            let assertion = self.assertions.fetch_add(1, Ordering::SeqCst) + 1;
+            anyhow::ensure!(
+                self.fail_on_assertion != Some(assertion),
+                "injected installed VMM artifact ABA"
+            );
+            Ok(())
+        }
+    }
+
+    fn fixed_launch_artifacts(
+        fail_on_assertion: Option<usize>,
+    ) -> (Arc<FixedLaunchArtifactPort>, Arc<AtomicUsize>) {
+        let template = decode_runtime_checkpoint(include_bytes!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../testdata/runtime-reconciliation-v1-start-runtime-checkpoint.json"
+        )))
+        .unwrap();
+        let ReconcileStep::StartRuntime {
+            launcher_executable,
+            boot,
+            ..
+        } = template.step
+        else {
+            unreachable!()
+        };
+        let assertions = Arc::new(AtomicUsize::new(0));
+        (
+            Arc::new(FixedLaunchArtifactPort {
+                launcher: *launcher_executable,
+                boot: *boot,
+                assertions: Arc::clone(&assertions),
+                fail_on_assertion,
+            }),
+            assertions,
+        )
+    }
+
     fn current_runtime_checkpoint(fixture: &Fixture) -> StoredCheckpoint {
         FileCheckpointStore::open(
             &fixture.checkpoint_directory,
@@ -5168,6 +5272,49 @@ mod tests {
         checkpoint: &RuntimeCheckpoint,
     ) -> RuntimeDesiredEffectContext {
         let scan = NodeGlobalNetworkScanAdmission::absent_checkpoint_for_test(checkpoint).unwrap();
+        let admission = scan
+            .bind(context.accepted_full().unwrap().observation())
+            .unwrap();
+        context.with_node_global_network_for_test(admission)
+    }
+
+    fn with_exact_network_admission(
+        context: RuntimeDesiredEffectContext,
+        checkpoint: &RuntimeCheckpoint,
+    ) -> RuntimeDesiredEffectContext {
+        let ReconcileStep::PrepareNetwork { network, .. } = &checkpoint.step else {
+            panic!("exact network test admission requires PrepareNetwork")
+        };
+        let node_global_process = context.node_global_process().unwrap().clone();
+        let mut observation = context.accepted_full().unwrap().observation().clone();
+        let [runtime] = observation.runtimes.as_mut_slice() else {
+            panic!("network test admission requires one Runtime")
+        };
+        runtime.networks = vec![ObservedNetwork {
+            kind: network.network_config.kind,
+            network_id: network.network_config.network_id.clone(),
+            guest_mac: network.network_config.guest_mac.clone(),
+            guest_ipv4: network.network_config.guest_ipv4.clone(),
+            prefix_length: network.network_config.prefix_length,
+            gateway_ipv4: network.network_config.gateway_ipv4.clone(),
+            tap_name: network.tap_name.clone(),
+            ownership_token: OwnershipTokenEvidence::Valid {
+                ownership_token: network.ownership_token.clone(),
+            },
+        }];
+        let node_global_process = node_global_process.rebind_for_test(&observation).unwrap();
+        let admission = context
+            .accepted_full()
+            .unwrap()
+            .clone()
+            .with_observation_for_test(observation);
+        let context = RuntimeDesiredEffectContext::for_test_with_admission(
+            context.state_directory().clone(),
+            Instant::now() + Duration::from_secs(10),
+            admission,
+        )
+        .with_node_global_process_for_test(node_global_process);
+        let scan = NodeGlobalNetworkScanAdmission::exact_checkpoint_for_test(checkpoint).unwrap();
         let admission = scan
             .bind(context.accepted_full().unwrap().observation())
             .unwrap();
@@ -5231,6 +5378,39 @@ mod tests {
         .unwrap()
     }
 
+    fn advance_fixture_to_prepare_network(fixture: &mut Fixture) {
+        complete_old_process_retirement(fixture);
+        let process = Arc::new(FakeServingBlockdPort::new(
+            [
+                ServingBlockdProcessInspectionKind::Exact,
+                ServingBlockdProcessInspectionKind::Exact,
+            ],
+            ServingBlockdProcessStart::Submitted,
+        ));
+        let effect = prepare_network_reservation_effect(
+            fixture,
+            Arc::new(FixedEffectAuthority::new(fixture.authority.volume.clone())),
+            process,
+        );
+        assert_eq!(
+            effect
+                .try_apply(
+                    &effect_context_with_processes(
+                        fixture,
+                        vec![accepted_serving_process(fixture)],
+                    ),
+                    &fixture.acquired.desired,
+                )
+                .unwrap(),
+            Some(RuntimeDesiredEffectOutcome::RefreshInventory)
+        );
+        fixture.stored_checkpoint = current_runtime_checkpoint(fixture);
+        assert!(matches!(
+            fixture.stored_checkpoint.checkpoint().step,
+            ReconcileStep::PrepareNetwork { .. }
+        ));
+    }
+
     fn prepare_device_retirement_effect(
         fixture: &Fixture,
         global: Arc<dyn RootProvisionProcessGlobalPort>,
@@ -5287,7 +5467,12 @@ mod tests {
                 vcpus: 2,
                 memory_bytes: 2 * 1024 * 1024 * 1024,
                 boot_image_digest: digest('a'),
-                guest_config_digest: digest('b'),
+                // Matches the fixed StartRuntime launch-artifact vector used
+                // by the suffix-effect tests below.
+                guest_config_digest: Sha256Digest::new(
+                    "sha256:78215611e8c3bd683eb542b5696a6316156365a94624c7521446ab5660d067e2",
+                )
+                .unwrap(),
                 network_config: NetworkConfig {
                     kind: IsolatedIpv4Kind::IsolatedIpv4,
                     network_id: id("network_a"),
@@ -6382,6 +6567,223 @@ mod tests {
                 &checkpoint_digest
             );
         }
+    }
+
+    #[test]
+    fn exact_tap_falls_through_to_one_checkpoint_only_start_runtime_cas() {
+        let mut fixture = fixture();
+        advance_fixture_to_prepare_network(&mut fixture);
+        let predecessor_digest = fixture.stored_checkpoint.content_digest().clone();
+        let context = with_exact_network_admission(
+            effect_context_with_processes(&fixture, vec![accepted_serving_process(&fixture)]),
+            fixture.stored_checkpoint.checkpoint(),
+        );
+        let authority = Arc::new(FixedEffectAuthority::new(fixture.authority.volume.clone()));
+        let process = Arc::new(FakeServingBlockdPort::new(
+            [
+                ServingBlockdProcessInspectionKind::Exact,
+                ServingBlockdProcessInspectionKind::Exact,
+                ServingBlockdProcessInspectionKind::Exact,
+                ServingBlockdProcessInspectionKind::Exact,
+            ],
+            ServingBlockdProcessStart::Submitted,
+        ));
+        let network = Arc::new(
+            PrepareNetworkReservationEffect::new(
+                fixture.state_directory.clone(),
+                exact_ip_binary(&fixture, fixture.stored_checkpoint.checkpoint()),
+                Arc::clone(&authority) as Arc<dyn VolumeDataAuthority>,
+                Arc::clone(&process) as Arc<dyn ServingBlockdProcessGlobalPort>,
+            )
+            .unwrap(),
+        );
+        let (artifacts, assertions) = fixed_launch_artifacts(None);
+        let artifact_port: Arc<dyn LaunchArtifactAuthorityPort> = artifacts;
+        let start_runtime = StartRuntimeReservationEffect::for_test(
+            fixture.state_directory.clone(),
+            Arc::clone(&network),
+            Arc::clone(&authority) as Arc<dyn VolumeDataAuthority>,
+            Arc::clone(&process) as Arc<dyn ServingBlockdProcessGlobalPort>,
+            artifact_port,
+        );
+
+        assert_eq!(
+            network
+                .try_apply(&context, &fixture.acquired.desired)
+                .unwrap(),
+            None,
+            "an exact TAP must be a read-only fallthrough"
+        );
+        assert_eq!(
+            start_runtime
+                .try_apply(&context, &fixture.acquired.desired)
+                .unwrap(),
+            Some(RuntimeDesiredEffectOutcome::RefreshInventory)
+        );
+        fixture.stored_checkpoint = current_runtime_checkpoint(&fixture);
+        assert_ne!(
+            fixture.stored_checkpoint.content_digest(),
+            &predecessor_digest
+        );
+        let ReconcileStep::StartRuntime {
+            runtime_incarnation,
+            process_identity_token,
+            network,
+            devices,
+            ..
+        } = &fixture.stored_checkpoint.checkpoint().step
+        else {
+            panic!("exact TAP did not publish StartRuntime")
+        };
+        let [device] = devices.as_slice() else {
+            panic!("StartRuntime lost its prepared device")
+        };
+        assert_ne!(runtime_incarnation, process_identity_token);
+        assert_ne!(runtime_incarnation, &network.ownership_token);
+        assert_ne!(runtime_incarnation, &device.ownership_token);
+        assert_ne!(
+            runtime_incarnation,
+            &device.serving_process.process_identity_token
+        );
+        assert_eq!(assertions.load(Ordering::SeqCst), 3);
+        assert_eq!(process.remaining_inspections(), 0);
+
+        let persisted_digest = fixture.stored_checkpoint.content_digest().clone();
+        let fresh = effect_context_with_processes(&fixture, Vec::new());
+        assert_eq!(
+            start_runtime
+                .try_apply(&fresh, &fixture.acquired.desired)
+                .unwrap(),
+            None,
+            "fresh StartRuntime was re-CASed"
+        );
+        assert_eq!(
+            current_runtime_checkpoint(&fixture).content_digest(),
+            &persisted_digest
+        );
+    }
+
+    #[test]
+    fn start_runtime_cancellation_and_response_loss_adopt_without_recas() {
+        for response_loss in [false, true] {
+            let mut fixture = fixture();
+            advance_fixture_to_prepare_network(&mut fixture);
+            let context = with_exact_network_admission(
+                effect_context_with_processes(&fixture, vec![accepted_serving_process(&fixture)]),
+                fixture.stored_checkpoint.checkpoint(),
+            );
+            let authority = Arc::new(FixedEffectAuthority::new(fixture.authority.volume.clone()));
+            let process = Arc::new(FakeServingBlockdPort::new(
+                [
+                    ServingBlockdProcessInspectionKind::Exact,
+                    ServingBlockdProcessInspectionKind::Exact,
+                ],
+                ServingBlockdProcessStart::Submitted,
+            ));
+            let network = Arc::new(
+                PrepareNetworkReservationEffect::new(
+                    fixture.state_directory.clone(),
+                    exact_ip_binary(&fixture, fixture.stored_checkpoint.checkpoint()),
+                    Arc::clone(&authority) as Arc<dyn VolumeDataAuthority>,
+                    Arc::clone(&process) as Arc<dyn ServingBlockdProcessGlobalPort>,
+                )
+                .unwrap(),
+            );
+            let (artifacts, _) = fixed_launch_artifacts(None);
+            let artifact_port: Arc<dyn LaunchArtifactAuthorityPort> = artifacts;
+            let start_runtime = StartRuntimeReservationEffect::for_test(
+                fixture.state_directory.clone(),
+                network,
+                Arc::clone(&authority) as Arc<dyn VolumeDataAuthority>,
+                process,
+                artifact_port,
+            )
+            .with_after_cid_replace(Arc::new(move |context| {
+                if response_loss {
+                    anyhow::bail!("injected StartRuntime publication response loss")
+                }
+                context.cancel_for_test();
+                Ok(())
+            }));
+
+            let error = start_runtime
+                .try_apply(&context, &fixture.acquired.desired)
+                .expect_err("ambiguous post-publication result returned false success");
+            let expected = if response_loss {
+                "response loss"
+            } else {
+                "cancelled"
+            };
+            assert!(format!("{error:#}").contains(expected), "{error:#}");
+            fixture.stored_checkpoint = current_runtime_checkpoint(&fixture);
+            assert!(matches!(
+                fixture.stored_checkpoint.checkpoint().step,
+                ReconcileStep::StartRuntime { .. }
+            ));
+            let persisted_digest = fixture.stored_checkpoint.content_digest().clone();
+            assert_eq!(
+                start_runtime
+                    .try_apply(
+                        &effect_context_with_processes(&fixture, Vec::new()),
+                        &fixture.acquired.desired,
+                    )
+                    .unwrap(),
+                None
+            );
+            assert_eq!(
+                current_runtime_checkpoint(&fixture).content_digest(),
+                &persisted_digest
+            );
+        }
+    }
+
+    #[test]
+    fn installed_artifact_aba_before_cid_publication_preserves_prepare_network() {
+        let mut fixture = fixture();
+        advance_fixture_to_prepare_network(&mut fixture);
+        let predecessor_digest = fixture.stored_checkpoint.content_digest().clone();
+        let context = with_exact_network_admission(
+            effect_context_with_processes(&fixture, vec![accepted_serving_process(&fixture)]),
+            fixture.stored_checkpoint.checkpoint(),
+        );
+        let authority = Arc::new(FixedEffectAuthority::new(fixture.authority.volume.clone()));
+        let process = Arc::new(FakeServingBlockdPort::new(
+            [
+                ServingBlockdProcessInspectionKind::Exact,
+                ServingBlockdProcessInspectionKind::Exact,
+            ],
+            ServingBlockdProcessStart::Submitted,
+        ));
+        let network = Arc::new(
+            PrepareNetworkReservationEffect::new(
+                fixture.state_directory.clone(),
+                exact_ip_binary(&fixture, fixture.stored_checkpoint.checkpoint()),
+                Arc::clone(&authority) as Arc<dyn VolumeDataAuthority>,
+                Arc::clone(&process) as Arc<dyn ServingBlockdProcessGlobalPort>,
+            )
+            .unwrap(),
+        );
+        let (artifacts, assertions) = fixed_launch_artifacts(Some(3));
+        let artifact_port: Arc<dyn LaunchArtifactAuthorityPort> = artifacts;
+        let start_runtime = StartRuntimeReservationEffect::for_test(
+            fixture.state_directory.clone(),
+            network,
+            authority,
+            process,
+            artifact_port,
+        );
+
+        let error = start_runtime
+            .try_apply(&context, &fixture.acquired.desired)
+            .expect_err("installed artifact ABA reached StartRuntime publication");
+        assert!(format!("{error:#}").contains("artifact ABA"), "{error:#}");
+        assert_eq!(assertions.load(Ordering::SeqCst), 3);
+        let current = current_runtime_checkpoint(&fixture);
+        assert_eq!(current.content_digest(), &predecessor_digest);
+        assert!(matches!(
+            current.checkpoint().step,
+            ReconcileStep::PrepareNetwork { .. }
+        ));
     }
 
     #[test]
