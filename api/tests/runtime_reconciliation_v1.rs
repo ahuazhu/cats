@@ -6540,6 +6540,31 @@ fn array_identity_order_and_numeric_indices_are_deterministic() {
 }
 
 #[test]
+fn desired_acquire_ids_are_unique_even_across_normal_and_takeover_variants() {
+    let mut desired = desired_value();
+    append_initializing_persistent_volume(&mut desired, zero_remote_head());
+    let shared = desired["volumes"][0]["acquire"]["transition_id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    desired["volumes"][1]["acquire"] = serde_json::json!({
+        "kind": "takeover",
+        "authorization_id": shared,
+    });
+    let error = decode_desired_runtime_spec(&serde_json::to_vec(&desired).unwrap()).unwrap_err();
+    assert_eq!(malformed(&error).0.as_str(), "/volumes");
+    assert_eq!(malformed(&error).1, MalformedProblem::DuplicateIdentity);
+
+    desired["volumes"][1]["acquire"]["authorization_id"] = "takeover-auth-distinct".into();
+    refresh_spec_digest(&mut desired);
+    let decoded = decode_desired_runtime_spec(&serde_json::to_vec(&desired).unwrap()).unwrap();
+    assert!(matches!(
+        decoded.volumes[1].acquire,
+        VolumeAcquire::Takeover { .. }
+    ));
+}
+
+#[test]
 fn multiplicity_facts_cannot_be_split_across_duplicate_items() {
     let claim = "sha256:a8673fa09b1a9655115edb594cac8d7804e640a6797ab0bffc3ff999eaaa8356";
     let base: serde_json::Value =

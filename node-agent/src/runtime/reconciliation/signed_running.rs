@@ -14,16 +14,18 @@ use std::time::{Instant, SystemTime, UNIX_EPOCH};
 use anyhow::Context as _;
 use cats_api::runtime_reconciliation::{
     encode_desired_runtime_spec, encode_runtime_checkpoint, AcquireOrigin, AgentSession,
-    AppliedDesiredEvidence, AsciiText, CheckpointEvidence, CleanupRelease, CleanupTarget,
-    Condition, ContractVersion, DesiredRuntimeSpec, DiskKind, FenceEpoch, Generation,
-    GuestTransportEvidence, HostPath, Id, LastVolumeTransition, LifecycleAdmission,
-    LocalLineageState, LocalVolumeLineage, NormalAcquireRequest, ObservedDiskKind,
-    ObservedRuntimeStatus, ObservedVolume, ProgressingReason, RandomId128, ReconcileStep,
-    RemoteHead, RequireIdleCheckpoint, RuntimeCheckpoint, RuntimeLaunch, RuntimeTarget,
-    RuntimeTransition, RuntimeVolumeTransition, RuntimeVolumeTransitionRequest, SessionBinding,
-    Sha256Digest, UnixMillis, VolumeAccess, VolumeAcquire, VolumeAcquireRequest, VolumeAdminState,
-    VolumeAuthorityEvidence, VolumeDisposition, VolumeIntent, VolumeRecord, VolumeReleaseReplay,
-    WarmSnapshotEvidence, WireU64,
+    AppliedDesiredEvidence, AsciiText, AuthorizationConsumedReceipt, AuthorizationState,
+    CheckpointEvidence, CleanupRelease, CleanupTarget, Condition, ContractVersion,
+    DesiredRuntimeSpec, DiskKind, FenceEpoch, Generation, GuestTransportEvidence, HostPath, Id,
+    LastVolumeTransition, LifecycleAdmission, LocalLineageState, LocalVolumeLineage,
+    NormalAcquireRequest, ObservedDiskKind, ObservedRuntimeStatus, ObservedVolume,
+    ProgressingReason, RandomId128, ReconcileStep, RemoteHead, RequireIdleCheckpoint,
+    RuntimeCheckpoint, RuntimeLaunch, RuntimeTarget, RuntimeTransition, RuntimeVolumeTransition,
+    RuntimeVolumeTransitionEvidenceRequest, RuntimeVolumeTransitionEvidenceSuccess,
+    RuntimeVolumeTransitionRequest, SessionBinding, Sha256Digest, UnixMillis, VolumeAccess,
+    VolumeAcquire, VolumeAcquireRequest, VolumeAdminState, VolumeAuthorityEvidence,
+    VolumeAuthorization, VolumeDisposition, VolumeIntent, VolumeLeaseGrant, VolumeRecord,
+    VolumeReleaseReplay, WarmSnapshotEvidence, WireU64,
 };
 use cats_storage::authority::{
     validate_authorized_serving_attachment, validate_authorized_serving_record,
@@ -50,7 +52,9 @@ use super::{
     recover_normal_release_from_authority, runtime_checkpoint_path, AuthorizedBlockdStore,
     ControlSignedNormalAcquireClient, FileCheckpointStore, NormalAcquireAcceptedContext,
     NormalAcquireAttempt, NormalAcquireAuthorityRecovery, NormalAcquireClientError,
-    NormalReleaseAttempt, NormalReleaseAuthorityRecovery, StoredCheckpoint,
+    NormalReleaseAttempt, NormalReleaseAuthorityRecovery, SignedVolumeEvidencePort,
+    StoredCheckpoint, TakeoverAcquireAttempt, VolumeEvidenceRecovery,
+    VolumeEvidenceRecoveryDecision,
 };
 
 const MAX_LEASE_DURATION_MS: u64 = i64::MAX as u64;
@@ -68,6 +72,16 @@ pub(crate) trait SignedNormalAcquirePort: Send + Sync + 'static {
         accepted: &NormalAcquireAcceptedContext,
         deadline: Instant,
     ) -> Result<NormalAcquireAttempt, NormalAcquireClientError>;
+
+    fn takeover(
+        &self,
+        _request: &RuntimeVolumeTransitionRequest,
+        _volume: &VolumeIntent,
+        _accepted: &NormalAcquireAcceptedContext,
+        _deadline: Instant,
+    ) -> Result<TakeoverAcquireAttempt, NormalAcquireClientError> {
+        Ok(TakeoverAcquireAttempt::StopForLocalContract)
+    }
 
     fn release(
         &self,
@@ -102,6 +116,16 @@ where
         deadline: Instant,
     ) -> Result<NormalAcquireAttempt, NormalAcquireClientError> {
         ControlSignedNormalAcquireClient::acquire(self, request, volume, accepted, deadline)
+    }
+
+    fn takeover(
+        &self,
+        request: &RuntimeVolumeTransitionRequest,
+        volume: &VolumeIntent,
+        accepted: &NormalAcquireAcceptedContext,
+        deadline: Instant,
+    ) -> Result<TakeoverAcquireAttempt, NormalAcquireClientError> {
+        ControlSignedNormalAcquireClient::takeover(self, request, volume, accepted, deadline)
     }
 
     fn release(
@@ -139,6 +163,7 @@ where
 /// lease budget before any accepted inventory can reach the effect lane.
 pub(crate) struct SignedRunningAcquireEffect {
     volume_transition: Arc<dyn SignedNormalAcquirePort>,
+    volume_evidence: Option<Arc<dyn SignedVolumeEvidencePort>>,
     authority: Arc<dyn VolumeDataAuthority>,
     blob: Arc<dyn BlobStore>,
     lease_duration_ms: u64,
@@ -441,12 +466,21 @@ impl SignedRunningAcquireEffect {
         Self::validate_lease_duration(lease_duration_ms)?;
         Ok(Self {
             volume_transition: acquire,
+            volume_evidence: None,
             authority,
             blob,
             lease_duration_ms,
             #[cfg(test)]
             after_prepare: None,
         })
+    }
+
+    pub(crate) fn with_volume_evidence(
+        mut self,
+        evidence: Arc<dyn SignedVolumeEvidencePort>,
+    ) -> Self {
+        self.volume_evidence = Some(evidence);
+        self
     }
 
     pub(crate) fn volume_transition_port(&self) -> Arc<dyn SignedNormalAcquirePort> {
@@ -1467,21 +1501,15 @@ impl SignedRunningAcquireEffect {
             }
             _ => return Ok(stop_local()),
         };
-        let VolumeAcquire::Normal { .. } = volume.acquire else {
-            // Takeover uses its own thick signed-evidence path; never coerce
-            // its authorization ID into the normal immutable grant artifact.
-            return Ok(stop_local());
-        };
-
         let root = &desired.volumes[0];
 
         let request =
-            normal_acquire_request(desired, volume, accepted.session(), self.lease_duration_ms);
+            desired_acquire_request(desired, volume, accepted.session(), self.lease_duration_ms);
         let RuntimeVolumeTransition::Acquire {
             request: request_payload,
         } = &request.transition
         else {
-            unreachable!("normal acquire builder returns Acquire")
+            unreachable!("Desired acquire builder returns Acquire")
         };
         let checkpoint_directory = context.state_directory().path().join(CHECKPOINT_NAMESPACE);
         let store = FileCheckpointStore::open(&checkpoint_directory, &desired.cat_id)
@@ -1544,52 +1572,157 @@ impl SignedRunningAcquireEffect {
             inventory_attestation: accepted.attestation().clone(),
         };
         context.check_active()?;
-        let attempt = self
-            .volume_transition
-            .acquire(&request, volume, &accepted_context, context.deadline())
-            .map_err(|error| anyhow::anyhow!("submit signed multi-volume acquire: {error}"))?;
-        let attachment = match attempt {
-            NormalAcquireAttempt::Granted(attachment) => attachment,
-            NormalAcquireAttempt::RetryExact => return Ok(RuntimeDesiredEffectOutcome::RetryExact),
-            NormalAcquireAttempt::RefreshInventory => {
-                return Ok(RuntimeDesiredEffectOutcome::RefreshInventory)
-            }
-            NormalAcquireAttempt::ReplanDesired => {
-                return Ok(RuntimeDesiredEffectOutcome::ReplanDesired)
-            }
-            NormalAcquireAttempt::SessionReplacementRequired => {
-                return Ok(RuntimeDesiredEffectOutcome::SessionReplacementRequired)
-            }
-            NormalAcquireAttempt::IdentityRepairRequired => {
-                return Ok(RuntimeDesiredEffectOutcome::IdentityRepairRequired)
-            }
-            NormalAcquireAttempt::AuthorityRejected(reason) => {
-                return Ok(RuntimeDesiredEffectOutcome::Stop(
-                    RuntimeDesiredEffectStopReason::AuthorityRejected(reason),
-                ))
-            }
-            NormalAcquireAttempt::StopForLocalContract => return Ok(stop_local()),
-            NormalAcquireAttempt::StopForDeploymentMismatch => {
-                return Ok(RuntimeDesiredEffectOutcome::Stop(
-                    RuntimeDesiredEffectStopReason::DeploymentMismatch,
-                ))
-            }
-            NormalAcquireAttempt::Ambiguous => {
-                context.check_active()?;
-                let record = match self.authority.load_volume(&volume.volume_id) {
-                    Ok(record) => record,
-                    Err(AuthorityError::BackendUnknown) => {
+        let attachment = match &volume.acquire {
+            VolumeAcquire::Normal { .. } => {
+                let attempt = self
+                    .volume_transition
+                    .acquire(&request, volume, &accepted_context, context.deadline())
+                    .map_err(|error| {
+                        anyhow::anyhow!("submit signed multi-volume acquire: {error}")
+                    })?;
+                match attempt {
+                    NormalAcquireAttempt::Granted(attachment) => attachment,
+                    NormalAcquireAttempt::RetryExact => {
                         return Ok(RuntimeDesiredEffectOutcome::RetryExact)
                     }
-                    Err(_) => return Ok(RuntimeDesiredEffectOutcome::RefreshInventory),
-                };
-                match recover_normal_acquire_from_authority(&request, volume, &record) {
-                    Ok(NormalAcquireAuthorityRecovery::Granted(attachment)) => attachment,
-                    Ok(NormalAcquireAuthorityRecovery::RetryExact) => {
-                        return Ok(RuntimeDesiredEffectOutcome::RetryExact)
+                    NormalAcquireAttempt::RefreshInventory => {
+                        return Ok(RuntimeDesiredEffectOutcome::RefreshInventory)
                     }
-                    Ok(NormalAcquireAuthorityRecovery::Blocked) | Err(_) => return Ok(stop_local()),
+                    NormalAcquireAttempt::ReplanDesired => {
+                        return Ok(RuntimeDesiredEffectOutcome::ReplanDesired)
+                    }
+                    NormalAcquireAttempt::SessionReplacementRequired => {
+                        return Ok(RuntimeDesiredEffectOutcome::SessionReplacementRequired)
+                    }
+                    NormalAcquireAttempt::IdentityRepairRequired => {
+                        return Ok(RuntimeDesiredEffectOutcome::IdentityRepairRequired)
+                    }
+                    NormalAcquireAttempt::AuthorityRejected(reason) => {
+                        return Ok(RuntimeDesiredEffectOutcome::Stop(
+                            RuntimeDesiredEffectStopReason::AuthorityRejected(reason),
+                        ))
+                    }
+                    NormalAcquireAttempt::StopForLocalContract => return Ok(stop_local()),
+                    NormalAcquireAttempt::StopForDeploymentMismatch => {
+                        return Ok(RuntimeDesiredEffectOutcome::Stop(
+                            RuntimeDesiredEffectStopReason::DeploymentMismatch,
+                        ))
+                    }
+                    NormalAcquireAttempt::Ambiguous => {
+                        context.check_active()?;
+                        let record = match self.authority.load_volume(&volume.volume_id) {
+                            Ok(record) => record,
+                            Err(AuthorityError::BackendUnknown) => {
+                                return Ok(RuntimeDesiredEffectOutcome::RetryExact)
+                            }
+                            Err(_) => return Ok(RuntimeDesiredEffectOutcome::RefreshInventory),
+                        };
+                        match recover_normal_acquire_from_authority(&request, volume, &record) {
+                            Ok(NormalAcquireAuthorityRecovery::Granted(attachment)) => attachment,
+                            Ok(NormalAcquireAuthorityRecovery::RetryExact) => {
+                                return Ok(RuntimeDesiredEffectOutcome::RetryExact)
+                            }
+                            Ok(NormalAcquireAuthorityRecovery::Blocked) | Err(_) => {
+                                return Ok(stop_local())
+                            }
+                        }
+                    }
                 }
+            }
+            VolumeAcquire::Takeover { authorization_id } => {
+                let grant = match self
+                    .volume_transition
+                    .takeover(&request, volume, &accepted_context, context.deadline())
+                    .map_err(|error| anyhow::anyhow!("submit signed takeover acquire: {error}"))?
+                {
+                    TakeoverAcquireAttempt::LeaseGranted(grant) => Some(grant),
+                    TakeoverAcquireAttempt::RetryExact
+                    | TakeoverAcquireAttempt::Ambiguous => None,
+                    TakeoverAcquireAttempt::RefreshInventory => {
+                        return Ok(RuntimeDesiredEffectOutcome::RefreshInventory)
+                    }
+                    TakeoverAcquireAttempt::ReplanDesired => {
+                        return Ok(RuntimeDesiredEffectOutcome::ReplanDesired)
+                    }
+                    TakeoverAcquireAttempt::SessionReplacementRequired => {
+                        return Ok(RuntimeDesiredEffectOutcome::SessionReplacementRequired)
+                    }
+                    TakeoverAcquireAttempt::IdentityRepairRequired => {
+                        return Ok(RuntimeDesiredEffectOutcome::IdentityRepairRequired)
+                    }
+                    TakeoverAcquireAttempt::AuthorizationRejected(
+                        cats_api::runtime_reconciliation::RuntimeVolumeAuthorizationRejection::InvalidAuthorization,
+                    ) => return Ok(RuntimeDesiredEffectOutcome::ReplanDesired),
+                    TakeoverAcquireAttempt::AuthorizationRejected(
+                        cats_api::runtime_reconciliation::RuntimeVolumeAuthorizationRejection::InvalidLeaseDuration,
+                    )
+                    | TakeoverAcquireAttempt::StopForLocalContract => return Ok(stop_local()),
+                    TakeoverAcquireAttempt::AuthorizationRejected(_) => {
+                        return Ok(RuntimeDesiredEffectOutcome::ReplanDesired)
+                    }
+                    TakeoverAcquireAttempt::StopForDeploymentMismatch => {
+                        return Ok(RuntimeDesiredEffectOutcome::Stop(
+                            RuntimeDesiredEffectStopReason::DeploymentMismatch,
+                        ))
+                    }
+                };
+                context.check_active()?;
+                let evidence_port = self
+                    .volume_evidence
+                    .as_ref()
+                    .context("takeover acquire lacks signed evidence port")?;
+                let evidence_request = RuntimeVolumeTransitionEvidenceRequest {
+                    version: ContractVersion::V1,
+                    session: session_binding(accepted.session()),
+                    authorization_id: authorization_id.clone(),
+                };
+                let recovery = evidence_port
+                    .recover_authorization(&evidence_request, context.deadline())
+                    .map_err(|error| anyhow::anyhow!("read signed takeover evidence: {error}"))?;
+                let (evidence, receipt) = match recovery {
+                    VolumeEvidenceRecovery::Validated { evidence, decision } => match *decision {
+                        VolumeEvidenceRecoveryDecision::AdoptTakeover(receipt) => {
+                            (evidence, receipt)
+                        }
+                        VolumeEvidenceRecoveryDecision::RetryOriginalAuthorization {
+                            authorization_id: retry,
+                        } if retry == *authorization_id => {
+                            return Ok(RuntimeDesiredEffectOutcome::RetryExact)
+                        }
+                        VolumeEvidenceRecoveryDecision::Blocked => {
+                            return Ok(RuntimeDesiredEffectOutcome::RefreshInventory)
+                        }
+                        _ => return Ok(stop_local()),
+                    },
+                    VolumeEvidenceRecovery::SessionReplacementRequired => {
+                        return Ok(RuntimeDesiredEffectOutcome::SessionReplacementRequired)
+                    }
+                    VolumeEvidenceRecovery::IdentityRepairRequired => {
+                        return Ok(RuntimeDesiredEffectOutcome::IdentityRepairRequired)
+                    }
+                    VolumeEvidenceRecovery::StopForDeploymentMismatch => {
+                        return Ok(RuntimeDesiredEffectOutcome::Stop(
+                            RuntimeDesiredEffectStopReason::DeploymentMismatch,
+                        ))
+                    }
+                    VolumeEvidenceRecovery::StopForLocalContract => return Ok(stop_local()),
+                    VolumeEvidenceRecovery::AuthorizationEvidenceUnavailable
+                    | VolumeEvidenceRecovery::RetrySameRequest
+                    | VolumeEvidenceRecovery::Ambiguous => {
+                        return Ok(RuntimeDesiredEffectOutcome::RetryExact)
+                    }
+                };
+                context.check_active()?;
+                Box::new(
+                    takeover_attachment_from_signed_evidence(
+                        desired,
+                        volume,
+                        &evidence,
+                        &receipt,
+                        grant.as_ref(),
+                    )
+                    .context("signed takeover evidence did not close the initial attachment")?,
+                )
             }
         };
         let prepared = AuthorizedBlockdStore::new(context.state_directory().clone())
@@ -1618,16 +1751,13 @@ impl SignedRunningAcquireEffect {
                 .is_none_or(|observed| observed.local_lineages.is_empty())
         });
         if let Some(next) = next {
-            let VolumeAcquire::Normal { .. } = next.acquire else {
-                return Ok(stop_local());
-            };
             let next_request =
-                normal_acquire_request(desired, next, accepted.session(), self.lease_duration_ms);
+                desired_acquire_request(desired, next, accepted.session(), self.lease_duration_ms);
             let RuntimeVolumeTransition::Acquire {
                 request: next_payload,
             } = next_request.transition
             else {
-                unreachable!("normal acquire builder returns Acquire")
+                unreachable!("Desired acquire builder returns Acquire")
             };
             successor.step = ReconcileStep::AcquireVolume {
                 request: next_payload,
@@ -1649,9 +1779,22 @@ impl SignedRunningAcquireEffect {
                 node_id: root_lineage.node_id.clone(),
                 placement_epoch: root_lineage.placement_epoch,
             };
-            let root_prepared = AuthorizedBlockdStore::new(context.state_directory().clone())
-                .reopen_adopted(desired, root, &root_identity)
-                .context("reopen exact Root authorization after all volume acquires")?;
+            // The final acquired volume may itself be Root (single-volume
+            // existing/takeover). Its just-published artifact already holds
+            // the nonblocking attachment flock, so reopening the same
+            // directory would self-deadlock/fail EWOULDBLOCK. Reuse that
+            // retained descriptor; only reopen Root when another volume was
+            // the final mutation.
+            let reopened_root;
+            let root_prepared =
+                if prepared.checkpoint().attachment.identity.volume_id == root.volume_id {
+                    &prepared
+                } else {
+                    reopened_root = AuthorizedBlockdStore::new(context.state_directory().clone())
+                        .reopen_adopted(desired, root, &root_identity)
+                        .context("reopen exact Root authorization after all volume acquires")?;
+                    &reopened_root
+                };
             let root_attachment = &root_prepared.checkpoint().attachment;
             if root_attachment.head.generation.get() > 0 {
                 // Existing Root never depends on the image BlobStore and is
@@ -1819,7 +1962,7 @@ impl RuntimeDesiredEffect for SignedRunningAcquireEffect {
         desired: &DesiredRuntimeSpec,
     ) -> anyhow::Result<RuntimeDesiredEffectOutcome> {
         context.check_active()?;
-        if desired.volumes.len() > 1 {
+        if self.volume_evidence.is_some() || desired.volumes.len() > 1 {
             return self.apply_multi_acquire(&context, desired);
         }
         if let Some(outcome) = self.apply_checkpoint_replan(&context, desired)? {
@@ -1844,12 +1987,8 @@ fn validate_multi_acquire_admission<'a>(
         || desired.version != ContractVersion::V1
         || desired.target != RuntimeTarget::Running
         || !matches!(desired.transition, RuntimeTransition::CancelAndDrain)
-        || !(2..=64).contains(&desired.volumes.len())
+        || !(1..=64).contains(&desired.volumes.len())
         || desired.placement.node_id != accepted.session().node_id
-        || desired
-            .volumes
-            .iter()
-            .any(|volume| !matches!(volume.acquire, VolumeAcquire::Normal { .. }))
     {
         return MultiAcquireAdmission::StopLocal;
     }
@@ -1914,23 +2053,6 @@ fn validate_multi_acquire_admission<'a>(
         else {
             return MultiAcquireAdmission::StopLocal;
         };
-        let VolumeAcquire::Normal {
-            expected_unowned_epoch,
-            ..
-        } = &intent.acquire
-        else {
-            return MultiAcquireAdmission::StopLocal;
-        };
-        let Some(identity) = expected_attachment_identity(desired, intent, *expected_unowned_epoch)
-        else {
-            return MultiAcquireAdmission::StopLocal;
-        };
-        let Ok(data_directory) = host_path(
-            &authorized_blockd_data_directory(state_directory, desired, &identity),
-            "multi-volume expected blockd data directory",
-        ) else {
-            return MultiAcquireAdmission::StopLocal;
-        };
         let disk_kind = match intent.disk_kind {
             DiskKind::Root => ObservedDiskKind::Root,
             DiskKind::Persistent => ObservedDiskKind::Persistent,
@@ -1946,25 +2068,92 @@ fn validate_multi_acquire_admission<'a>(
         {
             return MultiAcquireAdmission::StopLocal;
         }
-        match &observed.authority {
-            VolumeAuthorityEvidence::Unowned {
-                attachment_epoch, ..
-            } if attachment_epoch == expected_unowned_epoch
-                && observed.local_lineages.is_empty() => {}
-            VolumeAuthorityEvidence::Owned {
-                attachment_id,
-                attachment_epoch,
-                head,
-            } if attachment_id == &intent.attachment_id
-                && *attachment_epoch == identity.attachment_epoch
-                && (observed.local_lineages.is_empty()
-                    || observed.local_lineages
-                        == [expected_local_lineage_at_head(
-                            &identity,
-                            &data_directory,
-                            head,
-                        )]) => {}
-            _ => return MultiAcquireAdmission::StopLocal,
+        match &intent.acquire {
+            VolumeAcquire::Normal {
+                expected_unowned_epoch,
+                ..
+            } => {
+                let Some(identity) =
+                    expected_attachment_identity(desired, intent, *expected_unowned_epoch)
+                else {
+                    return MultiAcquireAdmission::StopLocal;
+                };
+                let Ok(data_directory) = host_path(
+                    &authorized_blockd_data_directory(state_directory, desired, &identity),
+                    "multi-volume expected blockd data directory",
+                ) else {
+                    return MultiAcquireAdmission::StopLocal;
+                };
+                match &observed.authority {
+                    VolumeAuthorityEvidence::Unowned {
+                        attachment_epoch, ..
+                    } if attachment_epoch == expected_unowned_epoch
+                        && observed.local_lineages.is_empty() => {}
+                    VolumeAuthorityEvidence::Owned {
+                        attachment_id,
+                        attachment_epoch,
+                        head,
+                    } if attachment_id == &intent.attachment_id
+                        && *attachment_epoch == identity.attachment_epoch
+                        && (observed.local_lineages.is_empty()
+                            || observed.local_lineages
+                                == [expected_local_lineage_at_head(
+                                    &identity,
+                                    &data_directory,
+                                    head,
+                                )]) => {}
+                    _ => return MultiAcquireAdmission::StopLocal,
+                }
+            }
+            VolumeAcquire::Takeover { authorization_id } => {
+                let VolumeAuthorityEvidence::Owned {
+                    attachment_id,
+                    attachment_epoch,
+                    head,
+                } = &observed.authority
+                else {
+                    return MultiAcquireAdmission::StopLocal;
+                };
+                match observed.local_lineages.as_slice() {
+                    [] => {}
+                    [lineage]
+                        if attachment_id == &intent.attachment_id
+                            && *attachment_epoch == lineage.attachment_epoch
+                            && lineage.attachment_id == intent.attachment_id
+                            && lineage.acquire_origin
+                                == (AcquireOrigin::Takeover {
+                                    authorization_id: authorization_id.clone(),
+                                })
+                            && lineage.node_id == desired.placement.node_id
+                            && lineage.placement_epoch == desired.placement.placement_epoch =>
+                    {
+                        let identity = AttachmentLineageIdentity {
+                            volume_id: intent.volume_id.clone(),
+                            attachment_id: lineage.attachment_id.clone(),
+                            attachment_epoch: lineage.attachment_epoch,
+                            acquire_origin: lineage.acquire_origin.clone(),
+                            node_id: lineage.node_id.clone(),
+                            placement_epoch: lineage.placement_epoch,
+                        };
+                        let Ok(data_directory) = host_path(
+                            &authorized_blockd_data_directory(state_directory, desired, &identity),
+                            "takeover expected blockd data directory",
+                        ) else {
+                            return MultiAcquireAdmission::StopLocal;
+                        };
+                        if observed.local_lineages
+                            != [expected_local_lineage_at_head(
+                                &identity,
+                                &data_directory,
+                                head,
+                            )]
+                        {
+                            return MultiAcquireAdmission::StopLocal;
+                        }
+                    }
+                    _ => return MultiAcquireAdmission::StopLocal,
+                }
+            }
         }
     }
     let checkpoint_path =
@@ -2496,6 +2685,95 @@ fn record_matches_attachment_lineage(
             &record.head,
             attachment.initial_head(),
         )
+}
+
+fn takeover_attachment_from_signed_evidence(
+    desired: &DesiredRuntimeSpec,
+    volume: &VolumeIntent,
+    evidence: &RuntimeVolumeTransitionEvidenceSuccess,
+    decision_receipt: &cats_api::runtime_reconciliation::TakeoverConsumedReceipt,
+    grant: Option<&VolumeLeaseGrant>,
+) -> Option<AuthorizedServingAttachment> {
+    let VolumeAcquire::Takeover { authorization_id } = &volume.acquire else {
+        return None;
+    };
+    let VolumeAuthorization::Takeover(authorization) = &evidence.authorization.authorization else {
+        return None;
+    };
+    let AuthorizationState::Consumed(stored_receipt) = &evidence.authorization.state else {
+        return None;
+    };
+    let AuthorizationConsumedReceipt::Takeover(stored_receipt) = stored_receipt.as_ref() else {
+        return None;
+    };
+    let record = evidence.current_volume.as_ref()?;
+    let lease_expires_at = decision_receipt
+        .consumed_at
+        .get()
+        .checked_add(authorization.lease_duration_ms)
+        .and_then(UnixMillis::new)?;
+    if evidence.authorization_id != *authorization_id
+        || authorization.authorization_id != *authorization_id
+        || stored_receipt != decision_receipt
+        || authorization.authorized_node_id != desired.placement.node_id
+        || authorization.volume_id != volume.volume_id
+        || authorization.new_attachment_id != volume.attachment_id
+        || authorization.desired_revision != desired.desired_revision
+        || authorization.new_placement_epoch != desired.placement.placement_epoch
+        || record.volume_id != volume.volume_id
+        || record.size_bytes != volume.size_bytes
+        || record.durability != volume.durability
+        || !matches!(record.admin_state, VolumeAdminState::Active)
+        || record.lease_owner.as_ref() != Some(&volume.attachment_id)
+        || record.lease_epoch != decision_receipt.resulting_epoch
+        || record.lease_expires_at != Some(lease_expires_at)
+        || record.head != decision_receipt.resulting_head
+        || record.last_transition
+            != Some(LastVolumeTransition::Takeover {
+                authorization_id: authorization_id.clone(),
+            })
+        || !multi_acquire_head_matches_intent(volume, &record.head)
+    {
+        return None;
+    }
+    if grant.is_some_and(|grant| {
+        grant.volume_id != volume.volume_id
+            || grant.attachment_id != volume.attachment_id
+            || grant.attachment_epoch != decision_receipt.resulting_epoch
+            || grant.size_bytes != volume.size_bytes
+            || grant.durability != volume.durability
+            || grant.head != record.head
+            || grant.lease_expires_at != lease_expires_at
+            || grant.acquire_origin
+                != (AcquireOrigin::Takeover {
+                    authorization_id: authorization_id.clone(),
+                })
+    }) {
+        return None;
+    }
+    let attachment = AuthorizedServingAttachment {
+        identity: AttachmentLineageIdentity {
+            volume_id: volume.volume_id.clone(),
+            attachment_id: volume.attachment_id.clone(),
+            attachment_epoch: decision_receipt.resulting_epoch,
+            acquire_origin: AcquireOrigin::Takeover {
+                authorization_id: authorization_id.clone(),
+            },
+            node_id: desired.placement.node_id.clone(),
+            placement_epoch: desired.placement.placement_epoch,
+        },
+        size_bytes: volume.size_bytes,
+        durability: volume.durability,
+        head: record.head.clone(),
+        lease_expires_at,
+        acquire: AuthorizedServingAcquire::Takeover {
+            authorization: authorization.clone(),
+            receipt: stored_receipt.clone(),
+        },
+    };
+    (validate_authorized_serving_attachment(&attachment).is_ok()
+        && validate_authorized_serving_record(record, &attachment, Some(lease_expires_at)).is_ok())
+    .then_some(attachment)
 }
 
 fn local_lineage_is_absent_or_exact(
@@ -3120,6 +3398,26 @@ fn normal_acquire_request(
     )
 }
 
+fn desired_acquire_request(
+    desired: &DesiredRuntimeSpec,
+    volume: &VolumeIntent,
+    session: &AgentSession,
+    lease_duration_ms: u64,
+) -> RuntimeVolumeTransitionRequest {
+    match &volume.acquire {
+        VolumeAcquire::Normal { .. } => {
+            normal_acquire_request(desired, volume, session, lease_duration_ms)
+        }
+        VolumeAcquire::Takeover { authorization_id } => normal_acquire_request_with_binding(
+            desired,
+            session_binding(session),
+            VolumeAcquireRequest::Takeover {
+                authorization_id: authorization_id.clone(),
+            },
+        ),
+    }
+}
+
 fn normal_acquire_request_with_payload(
     desired: &DesiredRuntimeSpec,
     session: &AgentSession,
@@ -3184,32 +3482,38 @@ pub(super) fn request_matches_volume(
     desired: &DesiredRuntimeSpec,
     volume: &VolumeIntent,
 ) -> bool {
-    let VolumeAcquireRequest::Normal {
-        volume_id,
-        transition_id,
-        attachment_id,
-        expected_unowned_epoch,
-        desired_revision,
-        placement_epoch,
-        lease_duration_ms,
-    } = request
-    else {
-        return false;
-    };
-    let VolumeAcquire::Normal {
-        transition_id: intended_transition,
-        expected_unowned_epoch: intended_epoch,
-    } = &volume.acquire
-    else {
-        return false;
-    };
-    volume_id == &volume.volume_id
-        && transition_id == intended_transition
-        && attachment_id == &volume.attachment_id
-        && expected_unowned_epoch == intended_epoch
-        && desired_revision == &desired.desired_revision
-        && placement_epoch == &desired.placement.placement_epoch
-        && (1..=MAX_LEASE_DURATION_MS).contains(lease_duration_ms)
+    match (request, &volume.acquire) {
+        (
+            VolumeAcquireRequest::Normal {
+                volume_id,
+                transition_id,
+                attachment_id,
+                expected_unowned_epoch,
+                desired_revision,
+                placement_epoch,
+                lease_duration_ms,
+            },
+            VolumeAcquire::Normal {
+                transition_id: intended_transition,
+                expected_unowned_epoch: intended_epoch,
+            },
+        ) => {
+            volume_id == &volume.volume_id
+                && transition_id == intended_transition
+                && attachment_id == &volume.attachment_id
+                && expected_unowned_epoch == intended_epoch
+                && desired_revision == &desired.desired_revision
+                && placement_epoch == &desired.placement.placement_epoch
+                && (1..=MAX_LEASE_DURATION_MS).contains(lease_duration_ms)
+        }
+        (
+            VolumeAcquireRequest::Takeover { authorization_id },
+            VolumeAcquire::Takeover {
+                authorization_id: intended,
+            },
+        ) => authorization_id == intended,
+        _ => false,
+    }
 }
 
 pub(super) fn acquire_checkpoint(
@@ -3607,11 +3911,11 @@ mod tests {
     use cats_api::runtime_reconciliation::{
         checkpoint_content_digest, decode_desired_runtime_spec, decode_runtime_checkpoint,
         spec_digest, AcquireOrigin, AdmissionInventoryAttestation, AgentSession, AssignedKind,
-        AssignedPlacement, DesiredReadSnapshot, Epoch, GuestDeviceIdentity, Ipv4Address,
-        IsolatedIpv4Kind, LastVolumeTransition, MacAddress, NetworkConfig, NodeBootId,
+        AssignedPlacement, AuthorizationRecord, DesiredReadSnapshot, Epoch, GuestDeviceIdentity,
+        Ipv4Address, IsolatedIpv4Kind, LastVolumeTransition, MacAddress, NetworkConfig, NodeBootId,
         NodeObservation, NormalAcquireRequest, NormalAcquireResult, Revision, RuntimeConfig,
         RuntimeVolumeAuthorityRejection, RuntimeVolumeTransitionPreconditionProblem, Sequence,
-        VolumeAdminState, VolumeRecord,
+        TakeoverConsumedReceipt, VolumeAdminState, VolumeRecord, VolumeTakeoverAuthorization,
     };
     use cats_storage::authority::{
         AttachmentLineageIdentity, RenewLeaseRequest, RenewLeaseResult, VolumeHeadCasRequest,
@@ -3646,6 +3950,7 @@ mod tests {
     #[derive(Default)]
     struct AcquireState {
         outcomes: VecDeque<NormalAcquireAttempt>,
+        takeover_outcomes: VecDeque<TakeoverAcquireAttempt>,
         release_outcomes: VecDeque<NormalReleaseAttempt>,
         requests: Vec<RuntimeVolumeTransitionRequest>,
         release_requests: Vec<RuntimeVolumeTransitionRequest>,
@@ -3656,6 +3961,33 @@ mod tests {
 
     struct FakeAcquire {
         state: Arc<Mutex<AcquireState>>,
+    }
+
+    #[derive(Default)]
+    struct EvidenceState {
+        outcomes: VecDeque<VolumeEvidenceRecovery>,
+        requests: Vec<RuntimeVolumeTransitionEvidenceRequest>,
+        deadlines: Vec<Instant>,
+    }
+
+    struct FakeEvidence {
+        state: Arc<Mutex<EvidenceState>>,
+    }
+
+    impl SignedVolumeEvidencePort for FakeEvidence {
+        fn recover_authorization(
+            &self,
+            request: &RuntimeVolumeTransitionEvidenceRequest,
+            deadline: Instant,
+        ) -> Result<VolumeEvidenceRecovery, super::super::VolumeEvidenceClientError> {
+            let mut state = self.state.lock().unwrap();
+            state.requests.push(request.clone());
+            state.deadlines.push(deadline);
+            Ok(state
+                .outcomes
+                .pop_front()
+                .unwrap_or(VolumeEvidenceRecovery::Ambiguous))
+        }
     }
 
     impl SignedNormalAcquirePort for FakeAcquire {
@@ -3682,6 +4014,31 @@ mod tests {
                 .outcomes
                 .pop_front()
                 .unwrap_or(NormalAcquireAttempt::RetryExact))
+        }
+
+        fn takeover(
+            &self,
+            request: &RuntimeVolumeTransitionRequest,
+            _volume: &VolumeIntent,
+            _accepted: &NormalAcquireAcceptedContext,
+            deadline: Instant,
+        ) -> Result<TakeoverAcquireAttempt, NormalAcquireClientError> {
+            let mut state = self.state.lock().unwrap();
+            let checkpoint_seen = state.checkpoint_path.as_ref().is_some_and(|path| {
+                std::fs::read(path)
+                    .ok()
+                    .and_then(|bytes| decode_runtime_checkpoint(&bytes).ok())
+                    .is_some_and(|checkpoint| {
+                        matches!(checkpoint.step, ReconcileStep::AcquireVolume { .. })
+                    })
+            });
+            state.checkpoint_seen_before_call.push(checkpoint_seen);
+            state.requests.push(request.clone());
+            state.deadlines.push(deadline);
+            Ok(state
+                .takeover_outcomes
+                .pop_front()
+                .unwrap_or(TakeoverAcquireAttempt::RetryExact))
         }
 
         fn release(
@@ -3913,6 +4270,40 @@ mod tests {
         (effect, state)
     }
 
+    fn production_effect(
+        _desired: &DesiredRuntimeSpec,
+        normal_outcomes: Vec<NormalAcquireAttempt>,
+        takeover_outcomes: Vec<TakeoverAcquireAttempt>,
+        evidence_outcomes: Vec<VolumeEvidenceRecovery>,
+        authority: Arc<FakeAuthority>,
+        blob: Arc<RecordingBlob>,
+        checkpoint_path: std::path::PathBuf,
+    ) -> (
+        SignedRunningAcquireEffect,
+        Arc<Mutex<AcquireState>>,
+        Arc<Mutex<EvidenceState>>,
+    ) {
+        let acquire = Arc::new(Mutex::new(AcquireState {
+            outcomes: normal_outcomes.into(),
+            takeover_outcomes: takeover_outcomes.into(),
+            checkpoint_path: Some(checkpoint_path),
+            ..AcquireState::default()
+        }));
+        let acquire_port: Arc<dyn SignedNormalAcquirePort> = Arc::new(FakeAcquire {
+            state: Arc::clone(&acquire),
+        });
+        let effect =
+            SignedRunningAcquireEffect::new(acquire_port, authority, blob, 60_000).unwrap();
+        let evidence = Arc::new(Mutex::new(EvidenceState {
+            outcomes: evidence_outcomes.into(),
+            ..EvidenceState::default()
+        }));
+        let port: Arc<dyn SignedVolumeEvidencePort> = Arc::new(FakeEvidence {
+            state: Arc::clone(&evidence),
+        });
+        (effect.with_volume_evidence(port), acquire, evidence)
+    }
+
     #[test]
     fn shared_provision_predecessor_is_production_bound() {
         let desired = decode_desired_runtime_spec(literal_file_bytes(FIXED_DESIRED_WIRE)).unwrap();
@@ -4052,6 +4443,589 @@ mod tests {
             .join("launch-checkpoint.json")
             .is_file());
         assert!(!root.path().join("runtime-effects").exists());
+    }
+
+    #[test]
+    fn production_first_acquire_checkpoint_is_the_rounds_only_durable_effect() {
+        let root = tempfile::tempdir().unwrap();
+        let desired = desired();
+        let authority = Arc::new(FakeAuthority::new(Err(AuthorityError::BackendUnknown)));
+        let blob = Arc::new(RecordingBlob::present(&desired));
+        let path = checkpoint_path(root.path(), &desired.cat_id);
+        let (effect, acquire, evidence) = production_effect(
+            &desired,
+            vec![NormalAcquireAttempt::Granted(Box::new(attachment(
+                &desired,
+            )))],
+            Vec::new(),
+            Vec::new(),
+            Arc::clone(&authority),
+            Arc::clone(&blob),
+            path.clone(),
+        );
+        let (context, _) = context(root.path(), &desired, None);
+
+        assert_eq!(
+            effect.apply(context, &desired).unwrap(),
+            RuntimeDesiredEffectOutcome::RefreshInventory
+        );
+        assert!(acquire.lock().unwrap().requests.is_empty());
+        assert!(evidence.lock().unwrap().requests.is_empty());
+        assert_eq!(authority.loads.load(Ordering::SeqCst), 0);
+        assert_eq!(blob.reads.load(Ordering::SeqCst), 0);
+        let checkpoint = read_checkpoint(&path);
+        assert!(matches!(
+            checkpoint.step,
+            ReconcileStep::AcquireVolume { .. }
+        ));
+        assert!(checkpoint
+            .volumes
+            .iter()
+            .all(|volume| volume.local_lineages.is_empty()));
+    }
+
+    #[test]
+    fn production_existing_root_bypasses_the_image_store_and_keeps_the_direct_bridge() {
+        let root = tempfile::tempdir().unwrap();
+        let desired = desired();
+        let existing_head = RemoteHead {
+            generation: Generation::new(4).unwrap(),
+            root_hash: Some(Sha256Digest::from_bytes([7; 32])),
+            root_object_id: Some(AsciiText::new("roots/existing-root-4").unwrap()),
+        };
+        let mut existing = attachment(&desired);
+        existing.head = existing_head.clone();
+        existing.normal_acquire_mut().unwrap().1.resulting_head = existing_head.clone();
+        let authority = Arc::new(FakeAuthority::new(Err(AuthorityError::BackendUnknown)));
+        let blob = Arc::new(RecordingBlob::missing());
+        let path = checkpoint_path(root.path(), &desired.cat_id);
+        let (effect, acquire, _) = production_effect(
+            &desired,
+            vec![NormalAcquireAttempt::Granted(Box::new(existing.clone()))],
+            Vec::new(),
+            Vec::new(),
+            authority,
+            Arc::clone(&blob),
+            path.clone(),
+        );
+        let mut initial_volume = unowned_observed_volume(&desired.volumes[0]);
+        let VolumeAuthorityEvidence::Unowned { head, .. } = &mut initial_volume.authority else {
+            unreachable!()
+        };
+        *head = existing_head.clone();
+        let initial = observed_runtime_with_volumes(
+            root.path(),
+            &desired,
+            None,
+            vec![initial_volume.clone()],
+        );
+        let (initial_context, _) = context(root.path(), &desired, Some(initial));
+        assert_eq!(
+            effect.apply(initial_context, &desired).unwrap(),
+            RuntimeDesiredEffectOutcome::RefreshInventory
+        );
+        let first = read_checkpoint(&path);
+        let admitted = observed_runtime_with_volumes(
+            root.path(),
+            &desired,
+            Some(&first),
+            vec![initial_volume],
+        );
+        let (acquire_context, _) = context(root.path(), &desired, Some(admitted));
+        assert_eq!(
+            effect.apply(acquire_context, &desired).unwrap(),
+            RuntimeDesiredEffectOutcome::RefreshInventory
+        );
+        assert_eq!(blob.reads.load(Ordering::SeqCst), 0);
+        assert_eq!(acquire.lock().unwrap().requests.len(), 1);
+        let bridge = read_checkpoint(&path);
+        assert!(matches!(bridge.step, ReconcileStep::AcquireVolume { .. }));
+        assert_eq!(bridge.volumes[0].local_lineages.len(), 1);
+        assert!(matches!(
+            bridge.volumes[0].authority,
+            VolumeAuthorityEvidence::Owned { ref head, .. } if head == &existing_head
+        ));
+    }
+
+    #[test]
+    fn production_single_existing_root_takeover_persists_thick_authority_without_manifest() {
+        let root = tempfile::tempdir().unwrap();
+        let mut desired = desired();
+        let authorization_id = id("takeover-auth-root-single");
+        desired.volumes[0].acquire = VolumeAcquire::Takeover {
+            authorization_id: authorization_id.clone(),
+        };
+        desired.spec_digest = spec_digest(&desired).unwrap();
+        let existing_head = RemoteHead {
+            generation: Generation::new(5).unwrap(),
+            root_hash: Some(Sha256Digest::from_bytes([8; 32])),
+            root_object_id: Some(AsciiText::new("roots/takeover-root-5").unwrap()),
+        };
+        let volume = &desired.volumes[0];
+        let authorization = VolumeTakeoverAuthorization {
+            authorization_id: authorization_id.clone(),
+            authorized_node_id: desired.placement.node_id.clone(),
+            host_fence_event_id: id("fence-event-root-single"),
+            volume_id: volume.volume_id.clone(),
+            expected_attachment_id: id("att-root-old"),
+            expected_epoch: fence(9),
+            new_attachment_id: volume.attachment_id.clone(),
+            desired_revision: desired.desired_revision,
+            new_placement_epoch: desired.placement.placement_epoch,
+            lease_duration_ms: 60_000,
+            not_after: unix_ms(1_900_000_020_000),
+        };
+        let receipt = TakeoverConsumedReceipt {
+            authorization_id: authorization_id.clone(),
+            host_fence_event_id: authorization.host_fence_event_id.clone(),
+            volume_id: volume.volume_id.clone(),
+            new_attachment_id: volume.attachment_id.clone(),
+            resulting_epoch: fence(10),
+            resulting_head: existing_head.clone(),
+            consumed_at: unix_ms(1_900_000_010_000),
+        };
+        let expiry = unix_ms(1_900_000_070_000);
+        let record = VolumeRecord {
+            volume_id: volume.volume_id.clone(),
+            size_bytes: volume.size_bytes,
+            durability: volume.durability,
+            admin_state: VolumeAdminState::Active,
+            head: existing_head.clone(),
+            lease_owner: Some(volume.attachment_id.clone()),
+            lease_epoch: receipt.resulting_epoch,
+            lease_expires_at: Some(expiry),
+            last_transition: Some(LastVolumeTransition::Takeover {
+                authorization_id: authorization_id.clone(),
+            }),
+        };
+        let evidence = RuntimeVolumeTransitionEvidenceSuccess {
+            version: ContractVersion::V1,
+            session: SessionBinding {
+                node_id: desired.placement.node_id.clone(),
+                node_boot_id: NodeBootId::new("33333333333333333333333333333333").unwrap(),
+                agent_instance_id: random('4'),
+                agent_session_epoch: epoch(2),
+            },
+            authorization_id: authorization_id.clone(),
+            authorization: AuthorizationRecord {
+                authorization: VolumeAuthorization::Takeover(authorization),
+                state: AuthorizationState::Consumed(Box::new(
+                    AuthorizationConsumedReceipt::Takeover(receipt.clone()),
+                )),
+            },
+            current_volume: Some(record),
+            delete_completion: None,
+            direct_successor_authorization: None,
+        };
+        let grant = VolumeLeaseGrant {
+            volume_id: volume.volume_id.clone(),
+            attachment_id: volume.attachment_id.clone(),
+            attachment_epoch: receipt.resulting_epoch,
+            size_bytes: volume.size_bytes,
+            durability: volume.durability,
+            head: existing_head.clone(),
+            lease_expires_at: expiry,
+            acquire_origin: AcquireOrigin::Takeover {
+                authorization_id: authorization_id.clone(),
+            },
+        };
+        let blob = Arc::new(RecordingBlob::missing());
+        let path = checkpoint_path(root.path(), &desired.cat_id);
+        let (effect, acquire, evidence_calls) = production_effect(
+            &desired,
+            Vec::new(),
+            vec![TakeoverAcquireAttempt::LeaseGranted(grant)],
+            vec![VolumeEvidenceRecovery::Validated {
+                evidence: Box::new(evidence),
+                decision: Box::new(VolumeEvidenceRecoveryDecision::AdoptTakeover(
+                    receipt.clone(),
+                )),
+            }],
+            Arc::new(FakeAuthority::new(Err(AuthorityError::BackendUnknown))),
+            Arc::clone(&blob),
+            path.clone(),
+        );
+        let initial_volume = ObservedVolume {
+            volume_intent_id: Some(volume.volume_intent_id.clone()),
+            disk_id: Some(volume.disk_id.clone()),
+            volume_id: volume.volume_id.clone(),
+            disk_kind: ObservedDiskKind::Root,
+            size_bytes: Some(volume.size_bytes),
+            durability: Some(volume.durability),
+            authority: VolumeAuthorityEvidence::Owned {
+                attachment_id: id("att-root-old"),
+                attachment_epoch: fence(9),
+                head: existing_head.clone(),
+            },
+            local_lineages: Vec::new(),
+            devices: Vec::new(),
+        };
+        let initial = observed_runtime_with_volumes(
+            root.path(),
+            &desired,
+            None,
+            vec![initial_volume.clone()],
+        );
+        let (initial_context, _) = context(root.path(), &desired, Some(initial));
+        assert_eq!(
+            effect.apply(initial_context, &desired).unwrap(),
+            RuntimeDesiredEffectOutcome::RefreshInventory
+        );
+        assert!(acquire.lock().unwrap().requests.is_empty());
+        let first = read_checkpoint(&path);
+        let admitted = observed_runtime_with_volumes(
+            root.path(),
+            &desired,
+            Some(&first),
+            vec![initial_volume],
+        );
+        let (acquire_context, _) = context(root.path(), &desired, Some(admitted));
+        assert_eq!(
+            effect.apply(acquire_context, &desired).unwrap(),
+            RuntimeDesiredEffectOutcome::RefreshInventory
+        );
+        let calls = acquire.lock().unwrap();
+        assert_eq!(calls.requests.len(), 1);
+        assert!(matches!(
+            calls.requests[0].transition,
+            RuntimeVolumeTransition::Acquire {
+                request: VolumeAcquireRequest::Takeover { .. }
+            }
+        ));
+        assert_eq!(evidence_calls.lock().unwrap().requests.len(), 1);
+        assert_eq!(blob.reads.load(Ordering::SeqCst), 0);
+        let bridge = read_checkpoint(&path);
+        assert!(matches!(bridge.step, ReconcileStep::AcquireVolume { .. }));
+        assert_eq!(bridge.volumes[0].local_lineages.len(), 1);
+        assert!(matches!(
+            bridge.volumes[0].authority,
+            VolumeAuthorityEvidence::Owned { ref head, .. } if head == &existing_head
+        ));
+    }
+
+    #[test]
+    fn takeover_thick_evidence_requires_initial_revision_and_reopens_at_higher_revision() {
+        let root = tempfile::tempdir().unwrap();
+        let mut desired = desired();
+        let authorization_id = id("takeover-auth-root");
+        desired.volumes[0].acquire = VolumeAcquire::Takeover {
+            authorization_id: authorization_id.clone(),
+        };
+        desired.spec_digest = spec_digest(&desired).unwrap();
+        let volume = &desired.volumes[0];
+        let head = blank_head();
+        let authorization = VolumeTakeoverAuthorization {
+            authorization_id: authorization_id.clone(),
+            authorized_node_id: desired.placement.node_id.clone(),
+            host_fence_event_id: id("fence-event-root"),
+            volume_id: volume.volume_id.clone(),
+            expected_attachment_id: id("old-root-attachment"),
+            expected_epoch: fence(7),
+            new_attachment_id: volume.attachment_id.clone(),
+            desired_revision: desired.desired_revision,
+            new_placement_epoch: desired.placement.placement_epoch,
+            lease_duration_ms: 60_000,
+            not_after: unix_ms(100_000),
+        };
+        let receipt = TakeoverConsumedReceipt {
+            authorization_id: authorization_id.clone(),
+            host_fence_event_id: authorization.host_fence_event_id.clone(),
+            volume_id: volume.volume_id.clone(),
+            new_attachment_id: volume.attachment_id.clone(),
+            resulting_epoch: fence(8),
+            resulting_head: head.clone(),
+            consumed_at: unix_ms(10_000),
+        };
+        let record = VolumeRecord {
+            volume_id: volume.volume_id.clone(),
+            size_bytes: volume.size_bytes,
+            durability: volume.durability,
+            admin_state: VolumeAdminState::Active,
+            head: head.clone(),
+            lease_owner: Some(volume.attachment_id.clone()),
+            lease_epoch: receipt.resulting_epoch,
+            lease_expires_at: Some(unix_ms(70_000)),
+            last_transition: Some(LastVolumeTransition::Takeover {
+                authorization_id: authorization_id.clone(),
+            }),
+        };
+        let evidence = RuntimeVolumeTransitionEvidenceSuccess {
+            version: ContractVersion::V1,
+            session: SessionBinding {
+                node_id: desired.placement.node_id.clone(),
+                node_boot_id: NodeBootId::new("33333333333333333333333333333333").unwrap(),
+                agent_instance_id: random('4'),
+                agent_session_epoch: epoch(2),
+            },
+            authorization_id: authorization_id.clone(),
+            authorization: AuthorizationRecord {
+                authorization: VolumeAuthorization::Takeover(authorization.clone()),
+                state: AuthorizationState::Consumed(Box::new(
+                    AuthorizationConsumedReceipt::Takeover(receipt.clone()),
+                )),
+            },
+            current_volume: Some(record),
+            delete_completion: None,
+            direct_successor_authorization: None,
+        };
+        let attachment =
+            takeover_attachment_from_signed_evidence(&desired, volume, &evidence, &receipt, None)
+                .expect("exact consumed evidence must form the thick serving authority");
+        assert_eq!(attachment.lease_expires_at, unix_ms(70_000));
+
+        let mut wrong_revision = evidence.clone();
+        let VolumeAuthorization::Takeover(authorization) =
+            &mut wrong_revision.authorization.authorization
+        else {
+            unreachable!()
+        };
+        authorization.desired_revision = Revision::new(2).unwrap();
+        assert!(takeover_attachment_from_signed_evidence(
+            &desired,
+            volume,
+            &wrong_revision,
+            &receipt,
+            None,
+        )
+        .is_none());
+
+        let store = AuthorizedBlockdStore::new(StateDirectory::unanchored(root.path().into()));
+        store.prepare(&desired, volume, &attachment).unwrap();
+        let mut endpoint_only_successor = desired.clone();
+        endpoint_only_successor.desired_revision = Revision::new(2).unwrap();
+        endpoint_only_successor.spec_digest = spec_digest(&endpoint_only_successor).unwrap();
+        store
+            .reopen_adopted(
+                &endpoint_only_successor,
+                &endpoint_only_successor.volumes[0],
+                &attachment.identity,
+            )
+            .expect("a higher revision may retain the immutable takeover authority");
+    }
+
+    #[test]
+    fn restart_after_root_grant_adopts_missing_takeover_response_loss_in_a_mixed_set() {
+        let root = tempfile::tempdir().unwrap();
+        let mut desired = desired();
+        let authorization_id = id("takeover-auth-persistent");
+        let persistent = VolumeIntent {
+            volume_intent_id: id("vint_z_persistent"),
+            disk_id: id("disk-persistent"),
+            volume_id: id("vol_z_persistent"),
+            attachment_id: id("att-persistent-new"),
+            size_bytes: 4 * 1024 * 1024,
+            disk_kind: DiskKind::Persistent,
+            access: VolumeAccess::ReadWriteOnce,
+            durability: cats_api::runtime_reconciliation::Durability::Strict,
+            guest_device: GuestDeviceIdentity {
+                serial: id("cats-persistent"),
+                slot: 1,
+            },
+            acquire: VolumeAcquire::Takeover {
+                authorization_id: authorization_id.clone(),
+            },
+            disposition: VolumeDisposition::Retain,
+            mount: Some(cats_api::runtime_reconciliation::Ext4MountIntent {
+                filesystem_uuid: random('b'),
+                mount_path: HostPath::new("/srv/cats/persistent").unwrap(),
+                initialization:
+                    cats_api::runtime_reconciliation::FilesystemInitialization::Initialize {
+                        initialization_token: random('c'),
+                        expected_blank_head: blank_head(),
+                    },
+            }),
+        };
+        desired.volumes.push(persistent.clone());
+        desired.spec_digest = spec_digest(&desired).unwrap();
+
+        let mut takeover_observed = ObservedVolume {
+            volume_intent_id: Some(persistent.volume_intent_id.clone()),
+            disk_id: Some(persistent.disk_id.clone()),
+            volume_id: persistent.volume_id.clone(),
+            disk_kind: ObservedDiskKind::Persistent,
+            size_bytes: Some(persistent.size_bytes),
+            durability: Some(persistent.durability),
+            authority: VolumeAuthorityEvidence::Owned {
+                attachment_id: id("att-persistent-old"),
+                attachment_epoch: fence(7),
+                head: blank_head(),
+            },
+            local_lineages: Vec::new(),
+            devices: Vec::new(),
+        };
+        let root_attachment = attachment(&desired);
+        let authority = Arc::new(FakeAuthority::new(Err(AuthorityError::BackendUnknown)));
+        let blob = Arc::new(RecordingBlob::present(&desired));
+        let path = checkpoint_path(root.path(), &desired.cat_id);
+        let (first_effect, first_calls, first_evidence) = production_effect(
+            &desired,
+            vec![NormalAcquireAttempt::Granted(Box::new(
+                root_attachment.clone(),
+            ))],
+            Vec::new(),
+            Vec::new(),
+            Arc::clone(&authority),
+            Arc::clone(&blob),
+            path.clone(),
+        );
+        let initial = observed_runtime_with_volumes(
+            root.path(),
+            &desired,
+            None,
+            vec![
+                unowned_observed_volume(&desired.volumes[0]),
+                takeover_observed.clone(),
+            ],
+        );
+        let (initial_context, _) = context(root.path(), &desired, Some(initial));
+        assert_eq!(
+            first_effect.apply(initial_context, &desired).unwrap(),
+            RuntimeDesiredEffectOutcome::RefreshInventory
+        );
+        assert!(first_calls.lock().unwrap().requests.is_empty());
+        assert!(first_evidence.lock().unwrap().requests.is_empty());
+
+        let first_checkpoint = read_checkpoint(&path);
+        let admitted = observed_runtime_with_volumes(
+            root.path(),
+            &desired,
+            Some(&first_checkpoint),
+            vec![
+                unowned_observed_volume(&desired.volumes[0]),
+                takeover_observed.clone(),
+            ],
+        );
+        let (acquire_context, _) = context(root.path(), &desired, Some(admitted));
+        assert_eq!(
+            first_effect.apply(acquire_context, &desired).unwrap(),
+            RuntimeDesiredEffectOutcome::RefreshInventory
+        );
+        let root_grant_checkpoint = read_checkpoint(&path);
+        assert!(matches!(
+            root_grant_checkpoint.step,
+            ReconcileStep::AcquireVolume {
+                request: VolumeAcquireRequest::Takeover { .. }
+            }
+        ));
+        assert_eq!(first_calls.lock().unwrap().requests.len(), 1);
+        assert_eq!(blob.reads.load(Ordering::SeqCst), 0);
+
+        let authorization = VolumeTakeoverAuthorization {
+            authorization_id: authorization_id.clone(),
+            authorized_node_id: desired.placement.node_id.clone(),
+            host_fence_event_id: id("fence-event-persistent"),
+            volume_id: persistent.volume_id.clone(),
+            expected_attachment_id: id("att-persistent-old"),
+            expected_epoch: fence(7),
+            new_attachment_id: persistent.attachment_id.clone(),
+            desired_revision: desired.desired_revision,
+            new_placement_epoch: desired.placement.placement_epoch,
+            lease_duration_ms: 60_000,
+            not_after: unix_ms(1_900_000_020_000),
+        };
+        let receipt = TakeoverConsumedReceipt {
+            authorization_id: authorization_id.clone(),
+            host_fence_event_id: authorization.host_fence_event_id.clone(),
+            volume_id: persistent.volume_id.clone(),
+            new_attachment_id: persistent.attachment_id.clone(),
+            resulting_epoch: fence(8),
+            resulting_head: blank_head(),
+            consumed_at: unix_ms(1_900_000_010_000),
+        };
+        let expiry = unix_ms(1_900_000_070_000);
+        let takeover_record = VolumeRecord {
+            volume_id: persistent.volume_id.clone(),
+            size_bytes: persistent.size_bytes,
+            durability: persistent.durability,
+            admin_state: VolumeAdminState::Active,
+            head: blank_head(),
+            lease_owner: Some(persistent.attachment_id.clone()),
+            lease_epoch: receipt.resulting_epoch,
+            lease_expires_at: Some(expiry),
+            last_transition: Some(LastVolumeTransition::Takeover {
+                authorization_id: authorization_id.clone(),
+            }),
+        };
+        let evidence = RuntimeVolumeTransitionEvidenceSuccess {
+            version: ContractVersion::V1,
+            session: SessionBinding {
+                node_id: desired.placement.node_id.clone(),
+                node_boot_id: NodeBootId::new("33333333333333333333333333333333").unwrap(),
+                agent_instance_id: random('8'),
+                agent_session_epoch: epoch(3),
+            },
+            authorization_id: authorization_id.clone(),
+            authorization: AuthorizationRecord {
+                authorization: VolumeAuthorization::Takeover(authorization),
+                state: AuthorizationState::Consumed(Box::new(
+                    AuthorizationConsumedReceipt::Takeover(receipt.clone()),
+                )),
+            },
+            current_volume: Some(takeover_record),
+            delete_completion: None,
+            direct_successor_authorization: None,
+        };
+        let recovery = VolumeEvidenceRecovery::Validated {
+            evidence: Box::new(evidence),
+            decision: Box::new(VolumeEvidenceRecoveryDecision::AdoptTakeover(
+                receipt.clone(),
+            )),
+        };
+        let (restart_effect, restart_calls, restart_evidence) = production_effect(
+            &desired,
+            Vec::new(),
+            vec![TakeoverAcquireAttempt::Ambiguous],
+            vec![recovery],
+            authority,
+            blob.clone(),
+            path.clone(),
+        );
+        // Model a fresh accepted full after the Agent restarted: Root retains
+        // its sealed artifact, while the takeover target remains the first
+        // missing local lineage.
+        takeover_observed.authority = VolumeAuthorityEvidence::Owned {
+            attachment_id: id("att-persistent-old"),
+            attachment_epoch: fence(7),
+            head: blank_head(),
+        };
+        let restarted = observed_runtime_with_volumes(
+            root.path(),
+            &desired,
+            Some(&root_grant_checkpoint),
+            vec![root_grant_checkpoint.volumes[0].clone(), takeover_observed],
+        );
+        let (context, _) = context_with_session(
+            root.path(),
+            &desired,
+            Some(restarted),
+            '8',
+            3,
+            1_900_000_010_000,
+        );
+        assert_eq!(
+            restart_effect.apply(context, &desired).unwrap(),
+            RuntimeDesiredEffectOutcome::RefreshInventory
+        );
+        let calls = restart_calls.lock().unwrap();
+        assert_eq!(calls.requests.len(), 1);
+        assert!(matches!(
+            calls.requests[0].transition,
+            RuntimeVolumeTransition::Acquire {
+                request: VolumeAcquireRequest::Takeover { .. }
+            }
+        ));
+        assert_eq!(restart_evidence.lock().unwrap().requests.len(), 1);
+        assert_eq!(blob.reads.load(Ordering::SeqCst), 1);
+        let provision = read_checkpoint(&path);
+        assert!(matches!(
+            provision.step,
+            ReconcileStep::ProvisionRootImage { .. }
+        ));
+        assert_eq!(provision.volumes.len(), 2);
+        assert!(provision
+            .volumes
+            .iter()
+            .all(|volume| volume.local_lineages.len() == 1));
     }
 
     #[test]
@@ -6684,6 +7658,71 @@ mod tests {
             checkpoint,
             processes: Vec::new(),
             volumes: vec![volume],
+            mounts: Vec::new(),
+            networks: Vec::new(),
+            guest_transport: GuestTransportEvidence::Unavailable,
+            warm_snapshot: WarmSnapshotEvidence::Absent,
+            lifecycle_admission: LifecycleAdmission::Closed,
+            routes: Vec::new(),
+            platform_guards: 0,
+            conditions: vec![Condition::Progressing {
+                reason: ProgressingReason::ReconcileStep { step },
+            }],
+        }
+    }
+
+    fn observed_runtime_with_volumes(
+        root: &std::path::Path,
+        desired: &DesiredRuntimeSpec,
+        checkpoint: Option<&RuntimeCheckpoint>,
+        volumes: Vec<ObservedVolume>,
+    ) -> ObservedRuntimeStatus {
+        let (step, checkpoint) = match checkpoint {
+            Some(stored) => (
+                stored.step.clone(),
+                CheckpointEvidence::Valid {
+                    checkpoint_path: host(checkpoint_path(root, &desired.cat_id)),
+                    content_digest: checkpoint_content_digest(stored).unwrap(),
+                    version: stored.version,
+                    cat_id: stored.cat_id.clone(),
+                    node_id: stored.node_id.clone(),
+                    desired_revision: stored.desired_revision,
+                    spec_digest: stored.spec_digest.clone(),
+                    placement_epoch: stored.placement_epoch,
+                    runtime_incarnation: stored.runtime_incarnation.clone(),
+                    runtime_launch: Box::new(stored.runtime_launch.clone()),
+                    stable_state: stored.stable_state,
+                    step: Box::new(stored.step.clone()),
+                    require_idle: Box::new(stored.require_idle.clone()),
+                    updated_at_unix_ms: stored.updated_at_unix_ms,
+                },
+            ),
+            None => {
+                let step = ReconcileStep::InspectInventory {
+                    inventory_epoch: epoch(4),
+                };
+                (
+                    step,
+                    CheckpointEvidence::Missing {
+                        checkpoint_path: host(checkpoint_path(root, &desired.cat_id)),
+                    },
+                )
+            }
+        };
+        ObservedRuntimeStatus {
+            cat_id: desired.cat_id.clone(),
+            applied_desired: Some(AppliedDesiredEvidence {
+                desired_revision: desired.desired_revision,
+                spec_digest: desired.spec_digest.clone(),
+                placement: desired.placement.clone(),
+                target: desired.target,
+            }),
+            runtime_incarnation: None,
+            stable_state: None,
+            step: step.clone(),
+            checkpoint,
+            processes: Vec::new(),
+            volumes,
             mounts: Vec::new(),
             networks: Vec::new(),
             guest_transport: GuestTransportEvidence::Unavailable,

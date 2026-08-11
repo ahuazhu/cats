@@ -6477,6 +6477,19 @@ fn validate_desired_runtime_spec(
             MalformedProblem::DuplicateIdentity,
         ));
     }
+    if has_duplicate(spec.volumes.iter().map(|volume| match &volume.acquire {
+        VolumeAcquire::Normal { transition_id, .. } => transition_id.as_str(),
+        VolumeAcquire::Takeover { authorization_id } => authorization_id.as_str(),
+    })) {
+        // Acquire identifiers are variant-tagged at every lineage boundary,
+        // but one Desired set may not reuse the same text across variants.
+        // Rejecting it here prevents logs/checkpoints/operators from ever
+        // having two simultaneously current meanings for one identifier.
+        arrays.push(Candidate::at(
+            &volumes_path,
+            MalformedProblem::DuplicateIdentity,
+        ));
+    }
     if has_duplicate(spec.volumes.iter().map(|volume| volume.guest_device.slot)) {
         arrays.push(Candidate::at(
             &volumes_path,

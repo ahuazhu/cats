@@ -31,11 +31,12 @@ use crate::agent_registration::AgentRegistrationConfig;
 use crate::ch::{BlockPath, ChConfig};
 use crate::runtime::reconciliation::{
     installed_clean_slate_scanner, installed_root_process_effect_ports, AdmissionCellRegistry,
-    AuthorizedBlockdLaunchConfig, ControlSignedNormalAcquireClient, InstalledCleanSlateProbeConfig,
-    KernelNbdClientCleanupOwner, KernelNbdInventoryConfig, RootProvisionSystemdConfig,
-    RuntimeVolumeTransitionHttpClient, ServingPrepareFrontend, SignedRunningAcquireEffect,
-    SignedRunningEffect, SignedRunningHostConfig, SignedRunningProcessPorts,
-    SignedRunningPublicationRecovery, VmmLaunchArtifactPaths,
+    AuthorizedBlockdLaunchConfig, ControlBlockingSignedVolumeEvidenceClient,
+    ControlSignedNormalAcquireClient, InstalledCleanSlateProbeConfig, KernelNbdClientCleanupOwner,
+    KernelNbdInventoryConfig, RootProvisionSystemdConfig, RuntimeVolumeTransitionHttpClient,
+    ServingPrepareFrontend, SignedRunningAcquireEffect, SignedRunningEffect,
+    SignedRunningHostConfig, SignedRunningProcessPorts, SignedRunningPublicationRecovery,
+    VmmLaunchArtifactPaths,
 };
 use crate::runtime_spine::{
     RuntimeEffectResourceOwner, RuntimeInventoryScanner, RuntimeSpineDeadlinePolicy,
@@ -353,6 +354,9 @@ async fn spawn_signed_runtime_cutover_with_overrides(
                 &effect_registration,
             )?
         };
+        let volume_evidence = Arc::new(ControlBlockingSignedVolumeEvidenceClient::new(
+            volume_transition_transport.clone(),
+        ));
         let acquire = SignedRunningAcquireEffect::new(
             Arc::new(ControlSignedNormalAcquireClient::new(
                 volume_transition_transport,
@@ -361,7 +365,8 @@ async fn spawn_signed_runtime_cutover_with_overrides(
             Arc::clone(&effect_blob_store),
             effect_lease_duration_ms,
         )
-        .context("compose one-step signed Running acquire")?;
+        .context("compose one-step signed Running acquire")?
+        .with_volume_evidence(volume_evidence);
         let effect = SignedRunningEffect::platform(
             acquire,
             Arc::clone(&effect_volume_authority),

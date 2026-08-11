@@ -170,7 +170,7 @@ pub use normal_acquire::{
     A19SignedVolumeTransitionTransport, CommitInitializedAttempt, ControlSignedNormalAcquireClient,
     NormalAcquireAcceptedContext, NormalAcquireAttempt, NormalAcquireAuthorityRecovery,
     NormalAcquireClientError, NormalReleaseAttempt, NormalReleaseAuthorityRecovery,
-    RuntimeVolumeTransitionHttpClient, SignedVolumeTransitionResponse,
+    RuntimeVolumeTransitionHttpClient, SignedVolumeTransitionResponse, TakeoverAcquireAttempt,
     VolumeTransitionTransportFailure,
 };
 pub(crate) use persistent_filesystem::PersistentFilesystemEffect;
@@ -231,6 +231,9 @@ pub use volume_transitions::{
     A19SignedVolumeEvidenceTransport, ControlSignedVolumeEvidenceClient,
     SignedVolumeEvidenceResponse, VolumeEvidenceClientError, VolumeEvidenceRecovery,
     VolumeEvidenceRecoveryDecision, VolumeEvidenceTransportFailure, VolumeTransitionEvidencePort,
+};
+pub(crate) use volume_transitions::{
+    ControlBlockingSignedVolumeEvidenceClient, SignedVolumeEvidencePort,
 };
 
 #[cfg(test)]

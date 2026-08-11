@@ -4,6 +4,8 @@
 //! PostgreSQL handle and does not fall back to blockd authority reads, a
 //! legacy bearer, or a second transition ledger.
 
+use std::time::Instant;
+
 use futures_util::future::BoxFuture;
 
 use cats_api::runtime_reconciliation::{
@@ -55,6 +57,21 @@ pub trait A19SignedVolumeEvidenceTransport: Send + Sync {
     ) -> BoxFuture<'a, Result<SignedVolumeEvidenceResponse, VolumeEvidenceTransportFailure>>;
 }
 
+/// Deadline-aware blocking transport for the reconciliation effect lane.
+///
+/// The async port above remains available to async callers.  Production
+/// Running effects execute inside `spawn_blocking`, so they use this seam
+/// directly and never create a runtime or `block_on` an async future.
+pub(crate) trait A19BlockingSignedVolumeEvidenceTransport: Send + Sync {
+    fn post_a19_signed_evidence_json(
+        &self,
+        exact_path: &'static str,
+        canonical_body: &[u8],
+        response_wire_cap: usize,
+        deadline: Instant,
+    ) -> Result<SignedVolumeEvidenceResponse, VolumeEvidenceTransportFailure>;
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum VolumeEvidenceRecoveryDecision {
     RetryOriginalAuthorization { authorization_id: Id },
@@ -92,9 +109,35 @@ pub trait VolumeTransitionEvidencePort: Send + Sync {
     ) -> BoxFuture<'a, Result<VolumeEvidenceRecovery, VolumeEvidenceClientError>>;
 }
 
+/// Synchronous signed evidence boundary used only from the blocking Runtime
+/// Desired effect lane.
+pub(crate) trait SignedVolumeEvidencePort: Send + Sync + 'static {
+    fn recover_authorization(
+        &self,
+        request: &RuntimeVolumeTransitionEvidenceRequest,
+        deadline: Instant,
+    ) -> Result<VolumeEvidenceRecovery, VolumeEvidenceClientError>;
+}
+
 #[derive(Debug, Clone)]
 pub struct ControlSignedVolumeEvidenceClient<T> {
     transport: T,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct ControlBlockingSignedVolumeEvidenceClient<T> {
+    transport: T,
+}
+
+impl<T> ControlBlockingSignedVolumeEvidenceClient<T> {
+    pub(crate) fn new(transport: T) -> Self {
+        Self { transport }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn transport(&self) -> &T {
+        &self.transport
+    }
 }
 
 impl<T> ControlSignedVolumeEvidenceClient<T> {
@@ -130,38 +173,71 @@ where
                 Ok(response) => response,
                 Err(_) => return Ok(VolumeEvidenceRecovery::Ambiguous),
             };
-            match response {
-                SignedVolumeEvidenceResponse::Success(body) => {
-                    let Ok(evidence) = decode_runtime_volume_transition_evidence_success(&body)
-                    else {
-                        return Ok(VolumeEvidenceRecovery::Ambiguous);
-                    };
-                    if evidence.version != request.version
-                        || evidence.session != request.session
-                        || evidence.authorization_id != request.authorization_id
-                    {
-                        return Ok(VolumeEvidenceRecovery::Ambiguous);
-                    }
-                    let Ok(decision) = classify_evidence(&evidence) else {
-                        return Ok(VolumeEvidenceRecovery::Ambiguous);
-                    };
-                    Ok(VolumeEvidenceRecovery::Validated {
-                        evidence: Box::new(evidence),
-                        decision: Box::new(decision),
-                    })
-                }
-                SignedVolumeEvidenceResponse::ClosedError { status, body } => {
-                    let Ok(error) = decode_runtime_volume_transition_error(&body) else {
-                        return Ok(VolumeEvidenceRecovery::Ambiguous);
-                    };
-                    Ok(map_closed_error(status, error, request))
-                }
-                SignedVolumeEvidenceResponse::PlainRouteNotFound => {
-                    Ok(VolumeEvidenceRecovery::StopForDeploymentMismatch)
-                }
-                SignedVolumeEvidenceResponse::Ambiguous => Ok(VolumeEvidenceRecovery::Ambiguous),
-            }
+            Ok(classify_signed_evidence_response(request, response))
         })
+    }
+}
+
+impl<T> SignedVolumeEvidencePort for ControlBlockingSignedVolumeEvidenceClient<T>
+where
+    T: A19BlockingSignedVolumeEvidenceTransport + 'static,
+{
+    fn recover_authorization(
+        &self,
+        request: &RuntimeVolumeTransitionEvidenceRequest,
+        deadline: Instant,
+    ) -> Result<VolumeEvidenceRecovery, VolumeEvidenceClientError> {
+        let body = encode_runtime_volume_transition_evidence_request(request)
+            .map_err(VolumeEvidenceClientError::InvalidRequest)?;
+        let response = self.transport.post_a19_signed_evidence_json(
+            RUNTIME_VOLUME_TRANSITION_EVIDENCE_PATH,
+            &body,
+            RUNTIME_VOLUME_TRANSITION_EVIDENCE_SUCCESS_MAX_WIRE_BYTES,
+            deadline,
+        );
+        Ok(match response {
+            Ok(response) => classify_signed_evidence_response(request, response),
+            Err(_) => VolumeEvidenceRecovery::Ambiguous,
+        })
+    }
+}
+
+/// One pure response classifier shared by async recovery callers and the
+/// blocking production effect.  Neither transport may reinterpret malformed
+/// bytes or a response bound to another session/authorization.
+fn classify_signed_evidence_response(
+    request: &RuntimeVolumeTransitionEvidenceRequest,
+    response: SignedVolumeEvidenceResponse,
+) -> VolumeEvidenceRecovery {
+    match response {
+        SignedVolumeEvidenceResponse::Success(body) => {
+            let Ok(evidence) = decode_runtime_volume_transition_evidence_success(&body) else {
+                return VolumeEvidenceRecovery::Ambiguous;
+            };
+            if evidence.version != request.version
+                || evidence.session != request.session
+                || evidence.authorization_id != request.authorization_id
+            {
+                return VolumeEvidenceRecovery::Ambiguous;
+            }
+            let Ok(decision) = classify_evidence(&evidence) else {
+                return VolumeEvidenceRecovery::Ambiguous;
+            };
+            VolumeEvidenceRecovery::Validated {
+                evidence: Box::new(evidence),
+                decision: Box::new(decision),
+            }
+        }
+        SignedVolumeEvidenceResponse::ClosedError { status, body } => {
+            let Ok(error) = decode_runtime_volume_transition_error(&body) else {
+                return VolumeEvidenceRecovery::Ambiguous;
+            };
+            map_closed_error(status, error, request)
+        }
+        SignedVolumeEvidenceResponse::PlainRouteNotFound => {
+            VolumeEvidenceRecovery::StopForDeploymentMismatch
+        }
+        SignedVolumeEvidenceResponse::Ambiguous => VolumeEvidenceRecovery::Ambiguous,
     }
 }
 
@@ -535,6 +611,41 @@ mod tests {
         }
     }
 
+    struct FakeBlockingTransport {
+        response:
+            Mutex<Option<Result<SignedVolumeEvidenceResponse, VolumeEvidenceTransportFailure>>>,
+        seen: Mutex<Vec<(&'static str, Vec<u8>, usize)>>,
+    }
+
+    impl FakeBlockingTransport {
+        fn new(
+            response: Result<SignedVolumeEvidenceResponse, VolumeEvidenceTransportFailure>,
+        ) -> Self {
+            Self {
+                response: Mutex::new(Some(response)),
+                seen: Mutex::new(Vec::new()),
+            }
+        }
+    }
+
+    impl A19BlockingSignedVolumeEvidenceTransport for FakeBlockingTransport {
+        fn post_a19_signed_evidence_json(
+            &self,
+            exact_path: &'static str,
+            canonical_body: &[u8],
+            response_wire_cap: usize,
+            deadline: Instant,
+        ) -> Result<SignedVolumeEvidenceResponse, VolumeEvidenceTransportFailure> {
+            assert!(deadline > Instant::now());
+            self.seen.lock().unwrap().push((
+                exact_path,
+                canonical_body.to_vec(),
+                response_wire_cap,
+            ));
+            self.response.lock().unwrap().take().unwrap()
+        }
+    }
+
     struct DropObservedFuture<'a> {
         dropped: &'a AtomicBool,
     }
@@ -600,6 +711,48 @@ mod tests {
         assert_eq!(
             seen[0].2,
             RUNTIME_VOLUME_TRANSITION_EVIDENCE_SUCCESS_MAX_WIRE_BYTES
+        );
+    }
+
+    #[test]
+    fn blocking_client_uses_the_same_pure_classifier_and_fixed_route() {
+        let request = request();
+        let client =
+            ControlBlockingSignedVolumeEvidenceClient::new(FakeBlockingTransport::new(Ok(
+                SignedVolumeEvidenceResponse::Success(SUCCESS.as_bytes().to_vec()),
+            )));
+        let recovery = SignedVolumeEvidencePort::recover_authorization(
+            &client,
+            &request,
+            Instant::now() + std::time::Duration::from_secs(1),
+        )
+        .unwrap();
+        assert!(matches!(
+            recovery,
+            VolumeEvidenceRecovery::Validated { ref decision, .. }
+                if matches!(decision.as_ref(), VolumeEvidenceRecoveryDecision::AdoptTakeover(_))
+        ));
+        let seen = client.transport().seen.lock().unwrap();
+        assert_eq!(
+            seen.as_slice(),
+            &[(
+                RUNTIME_VOLUME_TRANSITION_EVIDENCE_PATH,
+                REQUEST.as_bytes().to_vec(),
+                RUNTIME_VOLUME_TRANSITION_EVIDENCE_SUCCESS_MAX_WIRE_BYTES
+            )]
+        );
+
+        let cancelled = ControlBlockingSignedVolumeEvidenceClient::new(FakeBlockingTransport::new(
+            Err(VolumeEvidenceTransportFailure::Cancelled),
+        ));
+        assert_eq!(
+            SignedVolumeEvidencePort::recover_authorization(
+                &cancelled,
+                &request,
+                Instant::now() + std::time::Duration::from_secs(1),
+            )
+            .unwrap(),
+            VolumeEvidenceRecovery::Ambiguous
         );
     }
 

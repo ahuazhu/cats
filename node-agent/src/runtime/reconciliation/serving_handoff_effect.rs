@@ -65,6 +65,54 @@ pub(super) const SERVING_CONTROL_SOCKET_BASENAME: &str = "serving-control.sock";
 pub(super) const SERVING_NBD_SOCKET_BASENAME: &str = "serving-nbd.sock";
 pub(super) const SERVING_VHOST_SOCKET_BASENAME: &str = "serving-vhost.sock";
 
+fn acquired_attachment_identity(
+    desired: &DesiredRuntimeSpec,
+    intent: &VolumeIntent,
+    record: &VolumeRecord,
+) -> anyhow::Result<AttachmentLineageIdentity> {
+    anyhow::ensure!(
+        record.lease_owner.as_ref() == Some(&intent.attachment_id)
+            && record.lease_expires_at.is_some(),
+        "PrepareDevice authority changed owner or lost its lease"
+    );
+    let (attachment_epoch, acquire_origin) = match &intent.acquire {
+        VolumeAcquire::Normal {
+            transition_id,
+            expected_unowned_epoch,
+        } => {
+            let attachment_epoch = expected_unowned_epoch
+                .get()
+                .checked_add(1)
+                .and_then(cats_api::runtime_reconciliation::FenceEpoch::new)
+                .context("PrepareDevice normal-acquire epoch overflowed")?;
+            anyhow::ensure!(
+                record.lease_epoch == attachment_epoch,
+                "PrepareDevice normal-acquire epoch changed"
+            );
+            (
+                attachment_epoch,
+                cats_api::runtime_reconciliation::AcquireOrigin::Normal {
+                    transition_id: transition_id.clone(),
+                },
+            )
+        }
+        VolumeAcquire::Takeover { authorization_id } => (
+            record.lease_epoch,
+            cats_api::runtime_reconciliation::AcquireOrigin::Takeover {
+                authorization_id: authorization_id.clone(),
+            },
+        ),
+    };
+    Ok(AttachmentLineageIdentity {
+        volume_id: intent.volume_id.clone(),
+        attachment_id: intent.attachment_id.clone(),
+        attachment_epoch,
+        acquire_origin,
+        node_id: desired.placement.node_id.clone(),
+        placement_epoch: desired.placement.placement_epoch,
+    })
+}
+
 /// Frozen Node-local frontend inputs for the one durable transition from a
 /// sealed Root handoff to `PrepareDevice`. The wider Cloud Hypervisor config
 /// is projected once at production composition; the effect cannot silently
@@ -183,36 +231,7 @@ impl ServingPrepareDeviceEffect {
             })?;
             validate_volume_record(&record)
                 .context("validate PrepareDevice Persistent authority")?;
-            let VolumeAcquire::Normal {
-                transition_id,
-                expected_unowned_epoch,
-            } = &intent.acquire
-            else {
-                anyhow::bail!(
-                    "takeover Persistent authorization requires its thick consumed evidence artifact"
-                )
-            };
-            let attachment_epoch = expected_unowned_epoch
-                .get()
-                .checked_add(1)
-                .and_then(cats_api::runtime_reconciliation::FenceEpoch::new)
-                .context("PrepareDevice normal-acquire epoch overflowed")?;
-            let identity = AttachmentLineageIdentity {
-                volume_id: intent.volume_id.clone(),
-                attachment_id: intent.attachment_id.clone(),
-                attachment_epoch,
-                acquire_origin: cats_api::runtime_reconciliation::AcquireOrigin::Normal {
-                    transition_id: transition_id.clone(),
-                },
-                node_id: desired.placement.node_id.clone(),
-                placement_epoch: desired.placement.placement_epoch,
-            };
-            anyhow::ensure!(
-                record.lease_owner.as_ref() == Some(&identity.attachment_id)
-                    && record.lease_epoch == identity.attachment_epoch
-                    && record.lease_expires_at.is_some(),
-                "PrepareDevice Persistent authority changed owner, epoch, or lease"
-            );
+            let identity = acquired_attachment_identity(desired, intent, &record)?;
             let prepared = blockd
                 .reopen_adopted(desired, intent, &identity)
                 .context("reopen exact Persistent authorized blockd artifact")?;
@@ -240,28 +259,7 @@ impl ServingPrepareDeviceEffect {
                 .load_volume(&intent.volume_id)
                 .with_context(|| format!("load direct authority for {}", intent.volume_id))?;
             validate_volume_record(&record).context("validate direct PrepareDevice authority")?;
-            let VolumeAcquire::Normal {
-                transition_id,
-                expected_unowned_epoch,
-            } = &intent.acquire
-            else {
-                anyhow::bail!("takeover direct authority requires thick consumed evidence")
-            };
-            let attachment_epoch = expected_unowned_epoch
-                .get()
-                .checked_add(1)
-                .and_then(cats_api::runtime_reconciliation::FenceEpoch::new)
-                .context("direct normal-acquire epoch overflowed")?;
-            let identity = AttachmentLineageIdentity {
-                volume_id: intent.volume_id.clone(),
-                attachment_id: intent.attachment_id.clone(),
-                attachment_epoch,
-                acquire_origin: cats_api::runtime_reconciliation::AcquireOrigin::Normal {
-                    transition_id: transition_id.clone(),
-                },
-                node_id: desired.placement.node_id.clone(),
-                placement_epoch: desired.placement.placement_epoch,
-            };
+            let identity = acquired_attachment_identity(desired, intent, &record)?;
             let prepared = blockd
                 .reopen_adopted(desired, intent, &identity)
                 .context("reopen exact direct authorized blockd artifact")?;

@@ -19,19 +19,26 @@ use cats_api::runtime_reconciliation::{
     AgentSession, CleanupRelease, CleanupTarget, ContractErrorDetail, ContractName, DiskKind,
     FilesystemInitialization, LastVolumeTransition, NormalAcquireRequest, NormalAcquireResult,
     PersistentFilesystemBinding, PersistentInitializationReceipt, ReleaseRequest, ReleaseResult,
-    RemoteHead, RuntimeSpineHttpProblem, RuntimeVolumeAuthorityRejection, RuntimeVolumeTransition,
-    RuntimeVolumeTransitionError, RuntimeVolumeTransitionErrorDetail,
-    RuntimeVolumeTransitionOutcome, RuntimeVolumeTransitionPreconditionProblem,
-    RuntimeVolumeTransitionRequest, SessionBinding, VolumeAccess, VolumeAcquire,
-    VolumeAcquireRequest, VolumeAdminState, VolumeDisposition, VolumeIntent, VolumeRecord,
-    RUNTIME_INTERNAL_ROUTE_NOT_FOUND_BODY, RUNTIME_INTERNAL_ROUTE_NOT_FOUND_ROBOTS,
-    RUNTIME_SPINE_METHOD, RUNTIME_VOLUME_TRANSITION_ERROR_MAX_WIRE_BYTES,
-    RUNTIME_VOLUME_TRANSITION_PATH, RUNTIME_VOLUME_TRANSITION_SUCCESS_MAX_WIRE_BYTES,
+    RemoteHead, RuntimeSpineHttpProblem, RuntimeVolumeAuthorityRejection,
+    RuntimeVolumeAuthorizationRejection, RuntimeVolumeTransition, RuntimeVolumeTransitionError,
+    RuntimeVolumeTransitionErrorDetail, RuntimeVolumeTransitionOutcome,
+    RuntimeVolumeTransitionPreconditionProblem, RuntimeVolumeTransitionRequest, SessionBinding,
+    VolumeAccess, VolumeAcquire, VolumeAcquireRequest, VolumeAdminState, VolumeDisposition,
+    VolumeIntent, VolumeLeaseGrant, VolumeRecord, RUNTIME_INTERNAL_ROUTE_NOT_FOUND_BODY,
+    RUNTIME_INTERNAL_ROUTE_NOT_FOUND_ROBOTS, RUNTIME_SPINE_METHOD,
+    RUNTIME_VOLUME_TRANSITION_ERROR_MAX_WIRE_BYTES, RUNTIME_VOLUME_TRANSITION_EVIDENCE_PATH,
+    RUNTIME_VOLUME_TRANSITION_EVIDENCE_SUCCESS_MAX_WIRE_BYTES, RUNTIME_VOLUME_TRANSITION_PATH,
+    RUNTIME_VOLUME_TRANSITION_SUCCESS_MAX_WIRE_BYTES,
 };
 use cats_storage::authority::{
     validate_authorized_serving_attachment, validate_authorized_serving_record,
     validate_volume_record, AttachmentLineageIdentity, AuthorizedServingAcquire,
     AuthorizedServingAttachment,
+};
+
+use super::volume_transitions::{
+    A19BlockingSignedVolumeEvidenceTransport, SignedVolumeEvidenceResponse,
+    VolumeEvidenceTransportFailure,
 };
 
 const RESPONSE_TIMEOUT: Duration = Duration::from_secs(15);
@@ -73,6 +80,23 @@ pub enum NormalAcquireAttempt {
     SessionReplacementRequired,
     IdentityRepairRequired,
     AuthorityRejected(RuntimeVolumeAuthorityRejection),
+    StopForLocalContract,
+    StopForDeploymentMismatch,
+    Ambiguous,
+}
+
+/// A22 takeover is deliberately only a thin mutation result.  Even an exact
+/// success must be cross-checked against A19 signed thick evidence before the
+/// caller may persist an authorized-serving artifact.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TakeoverAcquireAttempt {
+    LeaseGranted(VolumeLeaseGrant),
+    RetryExact,
+    RefreshInventory,
+    ReplanDesired,
+    SessionReplacementRequired,
+    IdentityRepairRequired,
+    AuthorizationRejected(RuntimeVolumeAuthorizationRejection),
     StopForLocalContract,
     StopForDeploymentMismatch,
     Ambiguous,
@@ -214,6 +238,57 @@ where
                 Ok(NormalAcquireAttempt::StopForDeploymentMismatch)
             }
             SignedVolumeTransitionResponse::Ambiguous => Ok(NormalAcquireAttempt::Ambiguous),
+        }
+    }
+
+    pub fn takeover(
+        &self,
+        request: &RuntimeVolumeTransitionRequest,
+        volume: &VolumeIntent,
+        accepted: &NormalAcquireAcceptedContext,
+        deadline: Instant,
+    ) -> Result<TakeoverAcquireAttempt, NormalAcquireClientError> {
+        let body = encode_runtime_volume_transition_request(request)
+            .map_err(NormalAcquireClientError::InvalidRequest)?;
+        let authorization_id = validate_local_takeover_request(request, volume)?;
+        validate_accepted_context(request, accepted)?;
+        let response = match self.transport.post_a19_signed_json(
+            RUNTIME_VOLUME_TRANSITION_PATH,
+            &body,
+            RUNTIME_VOLUME_TRANSITION_SUCCESS_MAX_WIRE_BYTES,
+            deadline,
+        ) {
+            Ok(response) => response,
+            Err(_) => return Ok(TakeoverAcquireAttempt::Ambiguous),
+        };
+        match response {
+            SignedVolumeTransitionResponse::Success(body) => {
+                let Ok(success) = decode_runtime_volume_transition_success(&body) else {
+                    return Ok(TakeoverAcquireAttempt::Ambiguous);
+                };
+                Ok(
+                    exact_takeover_success(request, volume, authorization_id, success)
+                        .map(TakeoverAcquireAttempt::LeaseGranted)
+                        .unwrap_or(TakeoverAcquireAttempt::Ambiguous),
+                )
+            }
+            SignedVolumeTransitionResponse::ClosedError { status, body } => {
+                let Ok(error) = decode_runtime_volume_transition_error(&body) else {
+                    return Ok(TakeoverAcquireAttempt::Ambiguous);
+                };
+                Ok(map_closed_takeover_error(
+                    status,
+                    &error,
+                    request,
+                    volume,
+                    accepted,
+                    authorization_id,
+                ))
+            }
+            SignedVolumeTransitionResponse::PlainRouteNotFound => {
+                Ok(TakeoverAcquireAttempt::StopForDeploymentMismatch)
+            }
+            SignedVolumeTransitionResponse::Ambiguous => Ok(TakeoverAcquireAttempt::Ambiguous),
         }
     }
 
@@ -523,6 +598,37 @@ fn validate_local_normal_request<'a>(
     Ok(acquire)
 }
 
+fn validate_local_takeover_request<'a>(
+    request: &'a RuntimeVolumeTransitionRequest,
+    volume: &VolumeIntent,
+) -> Result<&'a cats_api::runtime_reconciliation::Id, NormalAcquireClientError> {
+    let RuntimeVolumeTransition::Acquire {
+        request: VolumeAcquireRequest::Takeover { authorization_id },
+    } = &request.transition
+    else {
+        return Err(NormalAcquireClientError::InvalidVolumeBinding);
+    };
+    let VolumeAcquire::Takeover {
+        authorization_id: intended,
+    } = &volume.acquire
+    else {
+        return Err(NormalAcquireClientError::InvalidVolumeBinding);
+    };
+    if authorization_id != intended
+        || request.placement.node_id != request.session.node_id
+        || volume.size_bytes == 0
+        || volume.access != VolumeAccess::ReadWriteOnce
+        || !matches!(volume.disposition, VolumeDisposition::Retain)
+        || match volume.disk_kind {
+            DiskKind::Root => volume.mount.is_some(),
+            DiskKind::Persistent => volume.mount.is_none(),
+        }
+    {
+        return Err(NormalAcquireClientError::InvalidVolumeBinding);
+    }
+    Ok(authorization_id)
+}
+
 fn validate_local_release_request<'a>(
     request: &'a RuntimeVolumeTransitionRequest,
     volume: &VolumeIntent,
@@ -713,6 +819,36 @@ fn exact_success_attachment(
         .then_some(attachment)
 }
 
+fn exact_takeover_success(
+    request: &RuntimeVolumeTransitionRequest,
+    volume: &VolumeIntent,
+    authorization_id: &cats_api::runtime_reconciliation::Id,
+    success: cats_api::runtime_reconciliation::RuntimeVolumeTransitionSuccess,
+) -> Option<VolumeLeaseGrant> {
+    if success.version != request.version
+        || success.session != request.session
+        || success.cat_id != request.cat_id
+        || success.desired_revision != request.desired_revision
+        || success.spec_digest != request.spec_digest
+        || success.placement != request.placement
+    {
+        return None;
+    }
+    let RuntimeVolumeTransitionOutcome::LeaseGranted { grant } = success.outcome else {
+        return None;
+    };
+    (grant.volume_id == volume.volume_id
+        && grant.attachment_id == volume.attachment_id
+        && grant.size_bytes == volume.size_bytes
+        && grant.durability == volume.durability
+        && grant.acquire_origin
+            == (AcquireOrigin::Takeover {
+                authorization_id: authorization_id.clone(),
+            })
+        && acquire_head_matches_intent(volume, &grant.head))
+    .then_some(grant)
+}
+
 fn acquire_head_matches_intent(volume: &VolumeIntent, head: &RemoteHead) -> bool {
     match (volume.disk_kind, volume.mount.as_ref()) {
         (DiskKind::Root, None) => true,
@@ -872,6 +1008,48 @@ fn map_closed_error(
             NormalAcquireAttempt::StopForLocalContract
         }
         _ => NormalAcquireAttempt::Ambiguous,
+    }
+}
+
+fn map_closed_takeover_error(
+    status: u16,
+    error: &RuntimeVolumeTransitionError,
+    request: &RuntimeVolumeTransitionRequest,
+    volume: &VolumeIntent,
+    accepted: &NormalAcquireAcceptedContext,
+    authorization_id: &cats_api::runtime_reconciliation::Id,
+) -> TakeoverAcquireAttempt {
+    if let (
+        409,
+        RuntimeVolumeTransitionErrorDetail::VolumeAuthorizationRejected {
+            authorization_id: rejected,
+            reason,
+        },
+    ) = (status, error.error.as_ref())
+    {
+        return if rejected == authorization_id {
+            TakeoverAcquireAttempt::AuthorizationRejected(*reason)
+        } else {
+            TakeoverAcquireAttempt::Ambiguous
+        };
+    }
+    match map_closed_error(status, error, request, volume, accepted) {
+        NormalAcquireAttempt::Granted(_) => unreachable!("closed response cannot grant a lease"),
+        NormalAcquireAttempt::RetryExact => TakeoverAcquireAttempt::RetryExact,
+        NormalAcquireAttempt::RefreshInventory => TakeoverAcquireAttempt::RefreshInventory,
+        NormalAcquireAttempt::ReplanDesired => TakeoverAcquireAttempt::ReplanDesired,
+        NormalAcquireAttempt::SessionReplacementRequired => {
+            TakeoverAcquireAttempt::SessionReplacementRequired
+        }
+        NormalAcquireAttempt::IdentityRepairRequired => {
+            TakeoverAcquireAttempt::IdentityRepairRequired
+        }
+        NormalAcquireAttempt::AuthorityRejected(_) => TakeoverAcquireAttempt::Ambiguous,
+        NormalAcquireAttempt::StopForLocalContract => TakeoverAcquireAttempt::StopForLocalContract,
+        NormalAcquireAttempt::StopForDeploymentMismatch => {
+            TakeoverAcquireAttempt::StopForDeploymentMismatch
+        }
+        NormalAcquireAttempt::Ambiguous => TakeoverAcquireAttempt::Ambiguous,
     }
 }
 
@@ -1190,21 +1368,14 @@ impl RuntimeVolumeTransitionHttpClient {
             client,
         })
     }
-}
 
-impl A19SignedVolumeTransitionTransport for RuntimeVolumeTransitionHttpClient {
-    fn post_a19_signed_json(
+    fn post_exact_signed_json(
         &self,
         exact_path: &'static str,
         canonical_body: &[u8],
         success_wire_cap: usize,
         deadline: Instant,
-    ) -> Result<SignedVolumeTransitionResponse, VolumeTransitionTransportFailure> {
-        if exact_path != RUNTIME_VOLUME_TRANSITION_PATH
-            || success_wire_cap != RUNTIME_VOLUME_TRANSITION_SUCCESS_MAX_WIRE_BYTES
-        {
-            return Ok(SignedVolumeTransitionResponse::Ambiguous);
-        }
+    ) -> Result<StrictSignedJsonResponse, VolumeTransitionTransportFailure> {
         let remaining = deadline
             .checked_duration_since(Instant::now())
             .filter(|remaining| !remaining.is_zero())
@@ -1215,7 +1386,7 @@ impl A19SignedVolumeTransitionTransport for RuntimeVolumeTransitionHttpClient {
         let url = self
             .origin
             .join(exact_path)
-            .expect("validated origin accepts the fixed A22 path");
+            .expect("validated origin accepts every fixed Runtime Spine path");
         let response = self
             .client
             .post(url)
@@ -1239,16 +1410,99 @@ impl A19SignedVolumeTransitionTransport for RuntimeVolumeTransitionHttpClient {
     }
 }
 
+impl A19SignedVolumeTransitionTransport for RuntimeVolumeTransitionHttpClient {
+    fn post_a19_signed_json(
+        &self,
+        exact_path: &'static str,
+        canonical_body: &[u8],
+        success_wire_cap: usize,
+        deadline: Instant,
+    ) -> Result<SignedVolumeTransitionResponse, VolumeTransitionTransportFailure> {
+        if exact_path != RUNTIME_VOLUME_TRANSITION_PATH
+            || success_wire_cap != RUNTIME_VOLUME_TRANSITION_SUCCESS_MAX_WIRE_BYTES
+        {
+            return Ok(SignedVolumeTransitionResponse::Ambiguous);
+        }
+        Ok(
+            match self.post_exact_signed_json(
+                exact_path,
+                canonical_body,
+                success_wire_cap,
+                deadline,
+            )? {
+                StrictSignedJsonResponse::Success(body) => {
+                    SignedVolumeTransitionResponse::Success(body)
+                }
+                StrictSignedJsonResponse::ClosedError { status, body } => {
+                    SignedVolumeTransitionResponse::ClosedError { status, body }
+                }
+                StrictSignedJsonResponse::PlainRouteNotFound => {
+                    SignedVolumeTransitionResponse::PlainRouteNotFound
+                }
+                StrictSignedJsonResponse::Ambiguous => SignedVolumeTransitionResponse::Ambiguous,
+            },
+        )
+    }
+}
+
+impl A19BlockingSignedVolumeEvidenceTransport for RuntimeVolumeTransitionHttpClient {
+    fn post_a19_signed_evidence_json(
+        &self,
+        exact_path: &'static str,
+        canonical_body: &[u8],
+        response_wire_cap: usize,
+        deadline: Instant,
+    ) -> Result<SignedVolumeEvidenceResponse, VolumeEvidenceTransportFailure> {
+        if exact_path != RUNTIME_VOLUME_TRANSITION_EVIDENCE_PATH
+            || response_wire_cap != RUNTIME_VOLUME_TRANSITION_EVIDENCE_SUCCESS_MAX_WIRE_BYTES
+        {
+            return Ok(SignedVolumeEvidenceResponse::Ambiguous);
+        }
+        let response = self
+            .post_exact_signed_json(exact_path, canonical_body, response_wire_cap, deadline)
+            .map_err(|failure| match failure {
+                VolumeTransitionTransportFailure::Cancelled => {
+                    VolumeEvidenceTransportFailure::Cancelled
+                }
+                VolumeTransitionTransportFailure::Timeout => {
+                    VolumeEvidenceTransportFailure::Timeout
+                }
+                VolumeTransitionTransportFailure::Eof => VolumeEvidenceTransportFailure::Eof,
+                VolumeTransitionTransportFailure::Connection => {
+                    VolumeEvidenceTransportFailure::Connection
+                }
+            })?;
+        Ok(match response {
+            StrictSignedJsonResponse::Success(body) => SignedVolumeEvidenceResponse::Success(body),
+            StrictSignedJsonResponse::ClosedError { status, body } => {
+                SignedVolumeEvidenceResponse::ClosedError { status, body }
+            }
+            StrictSignedJsonResponse::PlainRouteNotFound => {
+                SignedVolumeEvidenceResponse::PlainRouteNotFound
+            }
+            StrictSignedJsonResponse::Ambiguous => SignedVolumeEvidenceResponse::Ambiguous,
+        })
+    }
+}
+
 #[derive(Debug, Clone, Copy)]
 enum TransportMode {
     ProductionHttps,
     LoopbackTest,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum StrictSignedJsonResponse {
+    Success(Vec<u8>),
+    ClosedError { status: u16, body: Vec<u8> },
+    PlainRouteNotFound,
+    Ambiguous,
+}
+
 fn classify_http_response(
     mut response: reqwest::blocking::Response,
     success_cap: usize,
-) -> Result<SignedVolumeTransitionResponse, VolumeTransitionTransportFailure> {
+) -> Result<StrictSignedJsonResponse, VolumeTransitionTransportFailure> {
     let status = response.status();
     if status == reqwest::StatusCode::NOT_FOUND {
         return Ok(classify_plain_route_not_found(&mut response));
@@ -1261,7 +1515,7 @@ fn classify_http_response(
     if !valid_common_headers(response.headers())
         || declared_response_exceeds(response.headers(), cap)
     {
-        return Ok(SignedVolumeTransitionResponse::Ambiguous);
+        return Ok(StrictSignedJsonResponse::Ambiguous);
     }
     let mut body = Vec::new();
     if response
@@ -1273,18 +1527,18 @@ fn classify_http_response(
         return Err(VolumeTransitionTransportFailure::Eof);
     }
     if body.len() > cap {
-        return Ok(SignedVolumeTransitionResponse::Ambiguous);
+        return Ok(StrictSignedJsonResponse::Ambiguous);
     }
     if status == reqwest::StatusCode::OK {
-        return Ok(SignedVolumeTransitionResponse::Success(body));
+        return Ok(StrictSignedJsonResponse::Success(body));
     }
     let Ok(error) = decode_runtime_volume_transition_error(&body) else {
-        return Ok(SignedVolumeTransitionResponse::Ambiguous);
+        return Ok(StrictSignedJsonResponse::Ambiguous);
     };
     if !status_matches_error(status, response.headers(), &error) {
-        return Ok(SignedVolumeTransitionResponse::Ambiguous);
+        return Ok(StrictSignedJsonResponse::Ambiguous);
     }
-    Ok(SignedVolumeTransitionResponse::ClosedError {
+    Ok(StrictSignedJsonResponse::ClosedError {
         status: status.as_u16(),
         body,
     })
@@ -1292,7 +1546,7 @@ fn classify_http_response(
 
 fn classify_plain_route_not_found(
     response: &mut reqwest::blocking::Response,
-) -> SignedVolumeTransitionResponse {
+) -> StrictSignedJsonResponse {
     let headers = response.headers();
     let forbidden_proxy_headers = ["via", "forwarded", "x-cache", "x-proxy-cache"];
     if headers.contains_key(reqwest::header::CONTENT_ENCODING)
@@ -1312,7 +1566,7 @@ fn classify_plain_route_not_found(
             .iter()
             .any(|name| headers.contains_key(*name))
     {
-        return SignedVolumeTransitionResponse::Ambiguous;
+        return StrictSignedJsonResponse::Ambiguous;
     }
     let mut body = Vec::new();
     if response
@@ -1322,9 +1576,9 @@ fn classify_plain_route_not_found(
         .is_err()
         || body != RUNTIME_INTERNAL_ROUTE_NOT_FOUND_BODY
     {
-        return SignedVolumeTransitionResponse::Ambiguous;
+        return StrictSignedJsonResponse::Ambiguous;
     }
-    SignedVolumeTransitionResponse::PlainRouteNotFound
+    StrictSignedJsonResponse::PlainRouteNotFound
 }
 
 fn valid_common_headers(headers: &reqwest::header::HeaderMap) -> bool {
@@ -1596,6 +1850,31 @@ mod tests {
         }
     }
 
+    fn takeover_request_and_volume() -> (RuntimeVolumeTransitionRequest, VolumeIntent) {
+        let authorization_id = Id::new("takeover-auth-01").unwrap();
+        let mut request = request();
+        request.transition = RuntimeVolumeTransition::Acquire {
+            request: VolumeAcquireRequest::Takeover {
+                authorization_id: authorization_id.clone(),
+            },
+        };
+        let mut volume = volume();
+        volume.acquire = VolumeAcquire::Takeover { authorization_id };
+        (request, volume)
+    }
+
+    fn takeover_success() -> Vec<u8> {
+        let mut success = decode_runtime_volume_transition_success(SUCCESS).unwrap();
+        let RuntimeVolumeTransitionOutcome::LeaseGranted { grant } = &mut success.outcome else {
+            unreachable!()
+        };
+        grant.acquire_origin = AcquireOrigin::Takeover {
+            authorization_id: Id::new("takeover-auth-01").unwrap(),
+        };
+        cats_api::runtime_reconciliation::encode_runtime_volume_transition_success(&success)
+            .unwrap()
+    }
+
     #[test]
     fn exact_grant_becomes_closed_authorized_attachment() {
         let transport =
@@ -1627,6 +1906,55 @@ mod tests {
                 REQUEST.to_vec(),
                 RUNTIME_VOLUME_TRANSITION_SUCCESS_MAX_WIRE_BYTES,
             )]
+        );
+    }
+
+    #[test]
+    fn takeover_success_remains_thin_and_is_bound_to_the_exact_authorization() {
+        let (request, volume) = takeover_request_and_volume();
+        let client = ControlSignedNormalAcquireClient::new(FakeTransport::new(
+            SignedVolumeTransitionResponse::Success(takeover_success()),
+        ));
+        let attempt = client
+            .takeover(
+                &request,
+                &volume,
+                &accepted_context(),
+                Instant::now() + Duration::from_secs(1),
+            )
+            .unwrap();
+        let TakeoverAcquireAttempt::LeaseGranted(grant) = attempt else {
+            panic!("expected an exact thin takeover grant")
+        };
+        assert_eq!(
+            grant.acquire_origin,
+            AcquireOrigin::Takeover {
+                authorization_id: Id::new("takeover-auth-01").unwrap()
+            }
+        );
+
+        let mut wrong = decode_runtime_volume_transition_success(&takeover_success()).unwrap();
+        let RuntimeVolumeTransitionOutcome::LeaseGranted { grant } = &mut wrong.outcome else {
+            unreachable!()
+        };
+        grant.acquire_origin = AcquireOrigin::Takeover {
+            authorization_id: Id::new("takeover-auth-other").unwrap(),
+        };
+        let wrong =
+            cats_api::runtime_reconciliation::encode_runtime_volume_transition_success(&wrong)
+                .unwrap();
+        assert_eq!(
+            ControlSignedNormalAcquireClient::new(FakeTransport::new(
+                SignedVolumeTransitionResponse::Success(wrong),
+            ))
+            .takeover(
+                &request,
+                &volume,
+                &accepted_context(),
+                Instant::now() + Duration::from_secs(1),
+            )
+            .unwrap(),
+            TakeoverAcquireAttempt::Ambiguous
         );
     }
 
@@ -2174,6 +2502,35 @@ mod tests {
                 .unwrap(),
         );
         Ed25519RequestSigner::from_pkcs8_der(Id::new("credential_a").unwrap(), &der).unwrap()
+    }
+
+    #[test]
+    fn blocking_evidence_transport_rejects_foreign_routes_and_expired_deadlines_before_io() {
+        let client =
+            RuntimeVolumeTransitionHttpClient::for_loopback_test("http://127.0.0.1:9/", signer())
+                .unwrap();
+        assert_eq!(
+            A19BlockingSignedVolumeEvidenceTransport::post_a19_signed_evidence_json(
+                &client,
+                "/internal/runtime/foreign-evidence",
+                b"{}",
+                RUNTIME_VOLUME_TRANSITION_EVIDENCE_SUCCESS_MAX_WIRE_BYTES,
+                Instant::now() + Duration::from_secs(1),
+            )
+            .unwrap(),
+            SignedVolumeEvidenceResponse::Ambiguous
+        );
+        assert_eq!(
+            A19BlockingSignedVolumeEvidenceTransport::post_a19_signed_evidence_json(
+                &client,
+                RUNTIME_VOLUME_TRANSITION_EVIDENCE_PATH,
+                b"{}",
+                RUNTIME_VOLUME_TRANSITION_EVIDENCE_SUCCESS_MAX_WIRE_BYTES,
+                Instant::now().checked_sub(Duration::from_secs(1)).unwrap(),
+            )
+            .unwrap_err(),
+            VolumeEvidenceTransportFailure::Timeout
+        );
     }
 
     fn raw_transport_response(
