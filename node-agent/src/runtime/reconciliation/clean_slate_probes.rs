@@ -8506,6 +8506,147 @@ mod tests {
         }
     }
 
+    /// Test provider that repeats the exact accepted process set through the
+    /// production revalidation ports. It deliberately does not reconstruct
+    /// evidence from public observation fields.
+    struct AcceptedRunningProcessPort;
+
+    impl super::super::serving_blockd_process::process_sealed::Sealed for AcceptedRunningProcessPort {}
+
+    impl super::super::serving_blockd_process::global_sealed::Sealed for AcceptedRunningProcessPort {}
+
+    impl super::super::serving_blockd_process::ServingBlockdProcessPort for AcceptedRunningProcessPort {
+        fn inspect(
+            &self,
+            _expected: &ServingBlockdExpectation,
+            _context: &dyn crate::runtime_spine::RuntimePhysicalReadContext,
+        ) -> anyhow::Result<super::super::serving_blockd_process::ServingBlockdProcessInspection>
+        {
+            anyhow::bail!("accepted-full test port only supports the global sweep")
+        }
+
+        fn start_checkpointed(
+            &self,
+            _checkpointed: super::super::serving_blockd_process::CheckpointedServingBlockdProcess<
+                '_,
+            >,
+            _context: &RuntimeDesiredEffectContext,
+        ) -> anyhow::Result<super::super::serving_blockd_process::ServingBlockdProcessStart>
+        {
+            anyhow::bail!("accepted-full test port is read-only")
+        }
+    }
+
+    impl super::super::serving_blockd_process::ServingBlockdProcessGlobalPort
+        for AcceptedRunningProcessPort
+    {
+        fn inspect_serving_exact_or_absent_after_node_global_sweep(
+            &self,
+            expected: &ServingBlockdExpectation,
+            context: &RuntimeDesiredEffectContext,
+        ) -> anyhow::Result<super::super::serving_blockd_process::ServingBlockdProcessInspection>
+        {
+            let (_, exact) = context
+                .node_global_process()?
+                .serving_blockd(expected.cat_id(), expected.volume_id())
+                .context("accepted full set lacks the retained serving process")?;
+            let exact = exact.context("accepted serving process is not exact")?;
+            Ok(
+                super::super::serving_blockd_process::ServingBlockdProcessInspection::Exact(
+                    Box::new(exact.evidence().clone()),
+                ),
+            )
+        }
+    }
+
+    impl super::super::vmm_process::sealed::Sealed for AcceptedRunningProcessPort {}
+    impl super::super::vmm_process::global_sealed::Sealed for AcceptedRunningProcessPort {}
+
+    impl super::super::vmm_process::VmmProcessPort for AcceptedRunningProcessPort {
+        fn inspect(
+            &self,
+            _expected: &VmmProcessExpectation,
+            _context: &dyn crate::runtime_spine::RuntimePhysicalReadContext,
+        ) -> anyhow::Result<super::super::vmm_process::VmmProcessInspection> {
+            anyhow::bail!("accepted-full test port only supports the global sweep")
+        }
+
+        fn start_checkpointed(
+            &self,
+            _checkpointed: super::super::vmm_process::CheckpointedVmmProcess<'_>,
+            _context: &RuntimeDesiredEffectContext,
+        ) -> anyhow::Result<super::super::vmm_process::VmmProcessStart> {
+            anyhow::bail!("accepted-full test port is read-only")
+        }
+    }
+
+    impl super::super::vmm_process::VmmProcessGlobalPort for AcceptedRunningProcessPort {
+        fn inspect_vmm_exact_or_absent_after_node_global_sweep(
+            &self,
+            expected: &VmmProcessExpectation,
+            context: &RuntimeDesiredEffectContext,
+        ) -> anyhow::Result<super::super::vmm_process::VmmProcessGlobalInspection> {
+            let (_, exact) = context
+                .node_global_process()?
+                .vmm(expected.cat_id())
+                .context("accepted full set lacks the retained VMM")?;
+            let exact = exact.context("accepted VMM is not exact")?;
+            Ok(
+                super::super::vmm_process::VmmProcessGlobalInspection::Exact(Box::new(
+                    exact.clone(),
+                )),
+            )
+        }
+
+        fn inspect_vmm_gate_successor_exact_after_node_global_sweep(
+            &self,
+            admitted_predecessor: &super::super::vmm_process::ExactVmmProcessProof,
+            successor: &super::super::vmm_process::VmmGateSuccessorProof,
+            _context: &RuntimeDesiredEffectContext,
+        ) -> anyhow::Result<super::super::vmm_process::VmmProcessGlobalInspection> {
+            Ok(
+                super::super::vmm_process::VmmProcessGlobalInspection::Exact(Box::new(
+                    successor
+                        .successor()
+                        .clone()
+                        .prove_exact_process(admitted_predecessor.evidence().clone())?,
+                )),
+            )
+        }
+    }
+
+    fn exact_running_ip_binary(directory: &Path, checkpoint: &RuntimeCheckpoint) -> PathBuf {
+        let launch = checkpoint
+            .runtime_launch
+            .identity()
+            .expect("exact Running checkpoint retains a launch");
+        let network = launch.network.as_ref();
+        let alias = format!(
+            "cats-network:{}:{}",
+            network.network_config.network_id, network.ownership_token
+        );
+        let links = format!(
+            r#"[{{"ifindex":17,"ifname":"{}","flags":["UP"],"ifalias":"{}","linkinfo":{{"info_kind":"tun","info_data":{{"type":"tap"}}}}}}]"#,
+            network.tap_name, alias
+        );
+        let addresses = format!(
+            r#"[{{"ifindex":17,"ifname":"{}","addr_info":[{{"family":"inet","local":"{}","prefixlen":{}}}]}}]"#,
+            network.tap_name,
+            network.network_config.gateway_ipv4,
+            network.network_config.prefix_length
+        );
+        let path = directory.join("test-ip-running-exact");
+        std::fs::write(
+            &path,
+            format!(
+                "#!/bin/sh\nif [ \"$2\" = '-d' ]; then printf '%s' '{links}'; else printf '%s' '{addresses}'; fi\n"
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o700)).unwrap();
+        path
+    }
+
     struct ExactRunningNetworkBridge;
 
     impl network_inventory_bridge_sealed::Sealed for ExactRunningNetworkBridge {}
@@ -8653,9 +8794,13 @@ mod tests {
             )
             .context("decode prepared admission checkpoint")?;
             anyhow::ensure!(
-                matches!(prepared.step, ReconcileStep::OpenAdmission { .. })
-                    && prepared.lifecycle_admission == LifecycleAdmission::Closed,
-                "Guest mounted-set challenge preceded durable gate preparation"
+                matches!(
+                    prepared.step,
+                    ReconcileStep::Stable {
+                        state: cats_api::runtime_reconciliation::StableState::Running
+                    }
+                ) && prepared.lifecycle_admission == LifecycleAdmission::Open,
+                "Guest mounted-set challenge preceded the durable Stable/Open successor"
             );
             self.inner.challenge(context, launch, request)
         }
@@ -12200,7 +12345,7 @@ mod tests {
             UnixMillis::new(predecessor.updated_at_unix_ms.get() + 1).unwrap(),
         )
         .unwrap();
-        FileCheckpointStore::open(
+        let start_stored = FileCheckpointStore::open(
             &environment.state.join(CHECKPOINT_NAMESPACE),
             &desired.cat_id,
         )
@@ -12223,7 +12368,7 @@ mod tests {
             .with_root_process_bridge_for_test(bridge)
             .with_network_bridge(Arc::new(ExactRunningNetworkBridge))
             .with_running_tail_transport_for_test(
-                registry,
+                Arc::clone(&registry),
                 Arc::new(ExactRunningGuestReadyPort {
                     calls: Arc::clone(&guest_calls),
                     fault: RunningGuestReadyFault::Exact,
@@ -12246,6 +12391,12 @@ mod tests {
         ));
         assert_eq!(runtime.mounts.len(), 1);
         assert_eq!(runtime.mounts[0].mount_path.as_str(), "/");
+        let process_scan = inventory
+            .take_node_global_process_admission()
+            .expect("exact scan must retain its complete process admission");
+        let network_scan = inventory
+            .take_node_global_network_admission()
+            .expect("exact scan must retain its complete network admission");
         let tail = inventory
             .take_running_tail_admission()
             .expect("exact scan must retain a private Running-tail admission");
@@ -12269,7 +12420,9 @@ mod tests {
             residue: inventory.residue().to_vec(),
         };
         observation.inventory_digest = Some(inventory_digest(&observation).unwrap());
-        assert!(tail.bind(&observation).is_ok());
+        let process_admission = process_scan.bind(&observation).unwrap();
+        let network_admission = network_scan.bind(&observation).unwrap();
+        let tail_admission = tail.bind(&observation).unwrap();
 
         let absent_guest_calls = Arc::new(AtomicUsize::new(0));
         let absent_bridge = Arc::new(ExactRunningProcessBridge {
@@ -12304,6 +12457,107 @@ mod tests {
             cats_api::runtime_reconciliation::GuestTransportEvidence::Unavailable
         ));
         assert!(absent_inventory.take_running_tail_admission().is_none());
+
+        let session = AgentSession {
+            version: ContractVersion::V1,
+            node_id: observation.node_id.clone(),
+            immutable_host_id: Id::new("host_test").unwrap(),
+            node_boot_id: observation.node_boot_id.clone(),
+            agent_instance_id: observation.agent_instance_id.clone(),
+            agent_session_epoch: observation.agent_session_epoch,
+            registration_attempt_id: RandomId128::new("cdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcd").unwrap(),
+            guest_config_digest: desired.runtime.guest_config_digest.clone(),
+            lease_deadline_unix_ms: UnixMillis::new(observation.observed_at_unix_ms.get() + 60_000)
+                .unwrap(),
+        };
+        let attestation = AdmissionInventoryAttestation {
+            version: ContractVersion::V1,
+            node_id: observation.node_id.clone(),
+            agent_session_epoch: observation.agent_session_epoch,
+            inventory_epoch: observation.inventory_epoch,
+            inventory_digest: observation.inventory_digest.clone().unwrap(),
+            inventory_read_position: observation.inventory_read_position.unwrap(),
+            accepted_at_unix_ms: UnixMillis::new(observation.observed_at_unix_ms.get() + 1)
+                .unwrap(),
+        };
+        let admission =
+            RuntimeDesiredEffectAdmission::for_test(session, observation.clone(), attestation)
+                .bind_assigned_cats_for_test(&fixture.scan_context.coordinates().desired)
+                .with_running_tail_for_test(tail_admission);
+        let context = RuntimeDesiredEffectContext::for_test_with_admission(
+            state_directory.clone(),
+            Instant::now() + Duration::from_secs(5),
+            admission,
+        )
+        .with_node_global_process_for_test(process_admission)
+        .with_node_global_network_for_test(network_admission);
+        let authority: Arc<dyn VolumeDataAuthority> = Arc::new(ExactVolumeSetDataAuthority {
+            records: BTreeMap::from([(fixture.record.volume_id.clone(), fixture.record.clone())]),
+        });
+        let process_port = Arc::new(AcceptedRunningProcessPort);
+        let network = Arc::new(
+            super::super::network::PrepareNetworkReservationEffect::new(
+                state_directory.clone(),
+                exact_running_ip_binary(
+                    environment.state.parent().unwrap(),
+                    start_stored.checkpoint(),
+                ),
+                Arc::clone(&authority),
+                Arc::clone(&process_port)
+                    as Arc<
+                        dyn super::super::serving_blockd_process::ServingBlockdProcessGlobalPort,
+                    >,
+            )
+            .unwrap(),
+        );
+        let revalidator = Arc::new(
+            super::super::RunningLaunchAuthorityRevalidator::platform_parts(
+                state_directory,
+                test_root_provision_systemd(&environment.blockd_binary),
+                network,
+                authority,
+                Arc::clone(&process_port)
+                    as Arc<
+                        dyn super::super::serving_blockd_process::ServingBlockdProcessGlobalPort,
+                    >,
+                process_port as Arc<dyn super::super::vmm_process::VmmProcessGlobalPort>,
+                None,
+            ),
+        );
+        let effect_guest_calls = Arc::new(AtomicUsize::new(0));
+        let effect = super::super::RunningAdmissionEffect::with_launch_authority(
+            Arc::clone(&registry),
+            revalidator,
+        )
+        .with_physical_revalidation_for_test(
+            Arc::new(ExactRunningGuestReadyPort {
+                calls: Arc::clone(&effect_guest_calls),
+                fault: RunningGuestReadyFault::Exact,
+            }),
+            Arc::new(|_, _, _, _, _, _| {
+                unreachable!("the real launch authority must replace the test hook")
+            }),
+        );
+        let effect_desired = desired.clone();
+        let (complete_tx, complete_rx) = std::sync::mpsc::sync_channel(1);
+        std::thread::spawn(move || {
+            let outcome = effect.try_apply(&context, &effect_desired);
+            let _ = complete_tx.send(outcome);
+        });
+        let outcome = complete_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("production launch authority deadlocked on its checkpoint guard")
+            .unwrap();
+        assert_eq!(outcome, Some(RuntimeDesiredEffectOutcome::RefreshInventory));
+        assert_eq!(effect_guest_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            registry
+                .get(&desired.cat_id)
+                .expect("production launch barrier opens the shared cell")
+                .snapshot()
+                .lifecycle_admission(),
+            LifecycleAdmission::Open
+        );
     }
 
     #[derive(Debug, Clone, Copy)]
@@ -12749,7 +13003,7 @@ mod tests {
             let effect = super::super::RunningAdmissionEffect::new(Arc::clone(&registry))
                 .with_physical_revalidation_for_test(
                     fresh_guest,
-                    Arc::new(move |_, _, _, _, _| {
+                    Arc::new(move |_, _, _, _, _, _| {
                         launch_hook_flag.store(true, Ordering::SeqCst);
                         Ok(())
                     }),
@@ -12775,8 +13029,13 @@ mod tests {
             let after = std::fs::read(&checkpoint_path).unwrap();
             assert_ne!(after, before);
             let prepared = decode_runtime_checkpoint(&after).unwrap();
-            assert!(matches!(prepared.step, ReconcileStep::OpenAdmission { .. }));
-            assert_eq!(prepared.lifecycle_admission, LifecycleAdmission::Closed);
+            assert!(matches!(
+                prepared.step,
+                ReconcileStep::Stable {
+                    state: cats_api::runtime_reconciliation::StableState::Running
+                }
+            ));
+            assert_eq!(prepared.lifecycle_admission, LifecycleAdmission::Open);
         }
 
         let mut success_inventory =
@@ -12811,7 +13070,7 @@ mod tests {
         let success_effect = super::super::RunningAdmissionEffect::new(Arc::clone(&registry))
             .with_physical_revalidation_for_test(
                 success_guest,
-                Arc::new(move |_, _, _, _, _| {
+                Arc::new(move |_, _, _, _, _, _| {
                     success_launch_hook.store(true, Ordering::SeqCst);
                     Ok(())
                 }),

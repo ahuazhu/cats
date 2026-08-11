@@ -63,6 +63,7 @@ impl AdmissionSnapshot {
         self.guest_ipv4.as_ref()
     }
 
+    #[cfg(test)]
     pub(crate) fn with_guest_ipv4(mut self, guest_ipv4: Ipv4Address) -> Self {
         self.guest_ipv4 = Some(guest_ipv4);
         self

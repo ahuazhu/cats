@@ -966,8 +966,10 @@ impl RetainedAuthorizedBlockd {
 
     pub(crate) fn assert_current(&self) -> Result<()> {
         anyhow::ensure!(
-            verify_retained_state_root(&self.root_directory, self.state_directory.path())?
-                == self.root_identity,
+            mutable_directory_identity_matches(
+                &verify_retained_state_root(&self.root_directory, self.state_directory.path())?,
+                &self.root_identity,
+            ),
             "retained Node state directory changed identity"
         );
         let current_root = self
@@ -975,18 +977,31 @@ impl RetainedAuthorizedBlockd {
             .try_reopen_directory()
             .context("reopen current Node state directory")?;
         anyhow::ensure!(
-            verify_retained_state_root(&current_root, self.state_directory.path())?
-                == self.root_identity,
+            mutable_directory_identity_matches(
+                &verify_retained_state_root(&current_root, self.state_directory.path())?,
+                &self.root_identity,
+            ),
             "lexical Node state directory changed identity"
         );
         let mut current = current_root;
         let mut relative = PathBuf::new();
-        for (component, expected) in self.components.iter().zip(self.component_identities.iter()) {
+        for (index, (component, expected)) in self
+            .components
+            .iter()
+            .zip(self.component_identities.iter())
+            .enumerate()
+        {
             relative.push(component);
             current =
                 open_existing_directory_at(&current, component, &relative, &self.root_identity)?;
+            let current_identity = stable_identity(&current, &relative)?;
+            let is_leaf = index + 1 == self.component_identities.len();
             anyhow::ensure!(
-                stable_identity(&current, &relative)? == *expected,
+                if is_leaf {
+                    current_identity == *expected
+                } else {
+                    mutable_directory_identity_matches(&current_identity, expected)
+                },
                 "authorized blockd path component {} changed identity",
                 relative.display()
             );
@@ -2568,6 +2583,18 @@ fn stable_identity(file: &File, path: &Path) -> Result<StableFsIdentity> {
     })
 }
 
+fn mutable_directory_identity_matches(
+    current: &StableFsIdentity,
+    expected: &StableFsIdentity,
+) -> bool {
+    current.device == expected.device
+        && current.inode == expected.inode
+        && current.mode == expected.mode
+        && current.uid == expected.uid
+        && current.gid == expected.gid
+        && current.links > 0
+}
+
 fn stat_at_optional(directory: &File, name: &CStr) -> Result<Option<StableFsIdentity>> {
     // SAFETY: all-zero is a valid initial stat buffer and fstatat writes it
     // only for this call. `directory` and `name` remain live throughout.
@@ -3575,6 +3602,52 @@ mod tests {
             assert_eq!(std::fs::metadata(path).unwrap().ino(), expected.0);
             assert_eq!(std::fs::read(path).unwrap(), expected.1);
         }
+    }
+
+    #[test]
+    fn mutable_ancestor_identity_allows_siblings_but_rejects_replacement() {
+        let temp = tempfile::tempdir().unwrap();
+        let ancestor = temp.path().join("ancestor");
+        std::fs::create_dir(&ancestor).unwrap();
+        let retained = File::open(&ancestor).unwrap();
+        let expected = stable_identity(&retained, &ancestor).unwrap();
+
+        std::fs::create_dir(ancestor.join("sibling")).unwrap();
+        let changed = stable_identity(&retained, &ancestor).unwrap();
+        assert!(mutable_directory_identity_matches(&changed, &expected));
+
+        std::fs::set_permissions(&ancestor, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let changed_mode = stable_identity(&retained, &ancestor).unwrap();
+        assert!(!mutable_directory_identity_matches(
+            &changed_mode,
+            &expected
+        ));
+        std::fs::set_permissions(
+            &ancestor,
+            std::fs::Permissions::from_mode(expected.mode & 0o7777),
+        )
+        .unwrap();
+
+        let leaf = ancestor.join("leaf");
+        std::fs::create_dir(&leaf).unwrap();
+        let leaf_file = File::open(&leaf).unwrap();
+        let leaf_before = stable_identity(&leaf_file, &leaf).unwrap();
+        std::fs::create_dir(leaf.join("foreign-sibling")).unwrap();
+        assert_ne!(
+            stable_identity(&leaf_file, &leaf).unwrap(),
+            leaf_before,
+            "the immutable leaf keeps strict metadata identity"
+        );
+
+        let moved = temp.path().join("ancestor-replaced");
+        std::fs::rename(&ancestor, moved).unwrap();
+        std::fs::create_dir(&ancestor).unwrap();
+        let replacement = File::open(&ancestor).unwrap();
+        let replacement_identity = stable_identity(&replacement, &ancestor).unwrap();
+        assert!(!mutable_directory_identity_matches(
+            &replacement_identity,
+            &expected
+        ));
     }
 
     #[test]

@@ -151,6 +151,10 @@ pub enum GateReconcileError {
     Port(#[from] GatePortError),
     #[error("final admission authority barrier failed")]
     AdmissionBarrier(#[source] anyhow::Error),
+    #[error(
+        "durable gate successor is not the exact allowed evolution of the accepted checkpoint"
+    )]
+    AdmissionBarrierSuccessor,
     #[error("checkpoint does not hold the expected RequireIdle state")]
     WrongRequireIdleCheckpoint,
     #[error("post-close Busy can only be recorded while every gate is closed")]
@@ -293,7 +297,7 @@ impl<'a, P: AdmissionGatePort> GateSequencer<'a, P> {
         desired: &DesiredRuntimeSpec,
         times: PersistTimes,
     ) -> Result<GateTransitionResult, GateReconcileError> {
-        self.open_admission_with_barrier(current, desired, times, || Ok(()))
+        self.open_admission_with_barrier(current, desired, times, |_, _| Ok(()))
     }
 
     pub(crate) fn open_admission_with_barrier<F>(
@@ -304,7 +308,7 @@ impl<'a, P: AdmissionGatePort> GateSequencer<'a, P> {
         final_authority_barrier: F,
     ) -> Result<GateTransitionResult, GateReconcileError>
     where
-        F: FnOnce() -> anyhow::Result<()>,
+        F: FnOnce(&StoredCheckpoint, &StoredCheckpoint) -> anyhow::Result<()>,
     {
         validate_times(times)?;
         encode_desired_runtime_spec(desired).map_err(AppliedDesiredError::from)?;
@@ -331,6 +335,16 @@ impl<'a, P: AdmissionGatePort> GateSequencer<'a, P> {
             return Err(GateReconcileError::OpenAdmissionNotInstallable);
         }
 
+        let already_completed = current.checkpoint().lifecycle_admission
+            == LifecycleAdmission::Open
+            && current.checkpoint().stable_state
+                == Some(cats_api::runtime_reconciliation::StableState::Running)
+            && matches!(
+                current.checkpoint().step,
+                ReconcileStep::Stable {
+                    state: cats_api::runtime_reconciliation::StableState::Running
+                }
+            );
         let already_prepared = matches!(
             &current.checkpoint().step,
             ReconcileStep::OpenAdmission {
@@ -338,7 +352,7 @@ impl<'a, P: AdmissionGatePort> GateSequencer<'a, P> {
             } if runtime_incarnation == incarnation
         );
         let mut prepared_checkpoint = current.checkpoint().clone();
-        if !already_prepared {
+        if !already_completed && !already_prepared {
             prepared_checkpoint.stable_state = None;
             prepared_checkpoint.lifecycle_admission = LifecycleAdmission::Closed;
             prepared_checkpoint.require_idle = RequireIdleCheckpoint::NotApplicable;
@@ -346,43 +360,44 @@ impl<'a, P: AdmissionGatePort> GateSequencer<'a, P> {
                 runtime_incarnation: incarnation.clone(),
             };
             prepared_checkpoint.updated_at_unix_ms = times.before_effect;
+            encode_runtime_checkpoint(&prepared_checkpoint).map_err(|error| {
+                GateReconcileError::AppliedDesired(AppliedDesiredError::CheckpointContract {
+                    error,
+                })
+            })?;
         }
-        encode_runtime_checkpoint(&prepared_checkpoint).map_err(|error| {
-            GateReconcileError::AppliedDesired(AppliedDesiredError::CheckpointContract { error })
-        })?;
-        let expected = AdmissionSnapshot::from_checkpoint(&prepared_checkpoint)?;
-        let mut replacement = AdmissionSnapshot::new(
-            expected.applied_desired_revision(),
-            expected.spec_digest().clone(),
-            expected.placement().clone(),
-            expected.runtime_incarnation().cloned(),
-            LifecycleAdmission::Open,
-            Vec::new(),
-        );
-        if let Some(guest_ipv4) = expected.guest_ipv4().cloned() {
-            replacement = replacement.with_guest_ipv4(guest_ipv4);
-        }
-        let mut completed = prepared_checkpoint.clone();
+        let prepared = if already_completed || already_prepared {
+            current.clone()
+        } else {
+            self.store.replace(current, &prepared_checkpoint)?
+        };
+
+        let mut completed = prepared.checkpoint().clone();
+        completed.require_idle = RequireIdleCheckpoint::NotApplicable;
         completed.lifecycle_admission = LifecycleAdmission::Open;
         completed.stable_state = Some(cats_api::runtime_reconciliation::StableState::Running);
         completed.step = ReconcileStep::Stable {
             state: cats_api::runtime_reconciliation::StableState::Running,
         };
-        completed.updated_at_unix_ms = times.after_effect;
+        if !already_completed {
+            completed.updated_at_unix_ms = times.after_effect;
+        }
         encode_runtime_checkpoint(&completed).map_err(|error| {
             GateReconcileError::AppliedDesired(AppliedDesiredError::CheckpointContract { error })
         })?;
 
-        let prepared = if already_prepared {
-            current.clone()
+        let durable = if completed == *prepared.checkpoint() {
+            prepared
         } else {
-            self.store.replace(current, &prepared_checkpoint)?
+            self.store.replace(&prepared, &completed)?
         };
-        // All checkpoint-first storage work is now durable. Revalidate the
-        // provider-private physical authority at this final boundary so no
-        // blocking preparation can create a stale-proof window before the
-        // AdmissionCell compare-open.
-        final_authority_barrier().map_err(GateReconcileError::AdmissionBarrier)?;
+        let replacement = AdmissionSnapshot::from_checkpoint(durable.checkpoint())?;
+        let expected = replacement.fail_closed();
+        // The complete Stable/Open successor is durable before the cell can
+        // open. The barrier closes the accepted physical predecessor and this
+        // gate-only successor after the final checkpoint fsync, leaving no
+        // unrepresentable Open-cell/Closed-checkpoint failure state.
+        final_authority_barrier(current, &durable).map_err(GateReconcileError::AdmissionBarrier)?;
         let live = self.port.snapshot();
         let mut port_error = None;
         if live != replacement {
@@ -402,9 +417,8 @@ impl<'a, P: AdmissionGatePort> GateSequencer<'a, P> {
             }
         }
 
-        let completed = self.store.replace(&prepared, &completed)?;
         Ok(GateTransitionResult::Opened {
-            checkpoint: completed,
+            checkpoint: durable,
             port_error,
         })
     }
@@ -420,7 +434,7 @@ impl<'a, P: AdmissionGatePort> GateSequencer<'a, P> {
         endpoint_id: &Id,
         times: PersistTimes,
     ) -> Result<GateTransitionResult, GateReconcileError> {
-        self.install_gate_with_barrier(current, desired, endpoint_id, times, || Ok(()))
+        self.install_gate_with_barrier(current, desired, endpoint_id, times, |_, _| Ok(()))
     }
 
     pub(crate) fn install_gate_with_barrier<F>(
@@ -432,7 +446,7 @@ impl<'a, P: AdmissionGatePort> GateSequencer<'a, P> {
         final_authority_barrier: F,
     ) -> Result<GateTransitionResult, GateReconcileError>
     where
-        F: FnOnce() -> anyhow::Result<()>,
+        F: FnOnce(&StoredCheckpoint, &StoredCheckpoint) -> anyhow::Result<()>,
     {
         validate_times(times)?;
         if desired.target != RuntimeTarget::Running {
@@ -562,19 +576,27 @@ impl<'a, P: AdmissionGatePort> GateSequencer<'a, P> {
         } else {
             self.store.replace(&prepared, &active_checkpoint)?
         };
-        // The prepared endpoint transition and active checkpoint token are
-        // durable. Nothing blocking may run between this fresh authority
-        // barrier and the AdmissionCell compare-install below.
-        final_authority_barrier().map_err(GateReconcileError::AdmissionBarrier)?;
-        if live != replacement {
-            let result = self.port.install_gate(&live, &replacement, endpoint_id);
+        // Burn the route epoch durably before it can become reachable, then
+        // close the accepted physical predecessor and the exact gate-only
+        // Active successor after the final fsync. No blocking work occurs
+        // between this barrier and the AdmissionCell compare-install.
+        final_authority_barrier(current, &active_storage)
+            .map_err(GateReconcileError::AdmissionBarrier)?;
+        let fresh_live = self.port.snapshot();
+        if fresh_live != live && fresh_live != replacement {
+            return Err(GateReconcileError::EndpointCellMismatch);
+        }
+        if fresh_live != replacement {
+            let result = self
+                .port
+                .install_gate(&fresh_live, &replacement, endpoint_id);
             let after = self.port.snapshot();
             match result {
                 Ok(()) if after != replacement => {
                     return Err(GateReconcileError::EndpointCellMismatch)
                 }
                 Err(_) if after == replacement => {}
-                Err(error) if after == live => return Err(error.into()),
+                Err(error) if after == fresh_live => return Err(error.into()),
                 Err(_) => return Err(GateReconcileError::EndpointCellMismatch),
                 Ok(()) => {}
             }
@@ -1456,6 +1478,109 @@ pub(super) fn first_endpoint_action(
     Ok(None)
 }
 
+/// Independently reconstructs the only durable successor that a final
+/// Running authority barrier may accept. This closes the predecessor-bound
+/// scanner sidecars to either Stable/Open for a zero-Endpoint Desired or one
+/// exact Active InstallGate token; no launch/storage/network field is treated
+/// as gate authority.
+pub(super) fn validate_gate_barrier_successor(
+    accepted: &RuntimeCheckpoint,
+    durable: &RuntimeCheckpoint,
+    desired: &DesiredRuntimeSpec,
+) -> Result<(), GateReconcileError> {
+    encode_runtime_checkpoint(accepted).map_err(|error| {
+        GateReconcileError::AppliedDesired(AppliedDesiredError::CheckpointContract { error })
+    })?;
+    encode_runtime_checkpoint(durable).map_err(|error| {
+        GateReconcileError::AppliedDesired(AppliedDesiredError::CheckpointContract { error })
+    })?;
+    if desired.endpoints.is_empty() {
+        let mut expected = accepted.clone();
+        expected.require_idle = RequireIdleCheckpoint::NotApplicable;
+        expected.lifecycle_admission = LifecycleAdmission::Open;
+        expected.stable_state = Some(cats_api::runtime_reconciliation::StableState::Running);
+        expected.step = ReconcileStep::Stable {
+            state: cats_api::runtime_reconciliation::StableState::Running,
+        };
+        expected.updated_at_unix_ms = durable.updated_at_unix_ms;
+        if expected == *durable {
+            return Ok(());
+        }
+        return Err(GateReconcileError::AdmissionBarrierSuccessor);
+    }
+
+    let ReconcileStep::InstallGate {
+        endpoint_id,
+        route_epoch,
+    } = &durable.step
+    else {
+        return Err(GateReconcileError::AdmissionBarrierSuccessor);
+    };
+    let endpoint = desired
+        .endpoints
+        .iter()
+        .find(|endpoint| &endpoint.endpoint_id == endpoint_id)
+        .ok_or_else(|| GateReconcileError::EndpointNotFound(endpoint_id.clone()))?;
+    if &endpoint.route_epoch != route_epoch {
+        return Err(GateReconcileError::AdmissionBarrierSuccessor);
+    }
+    let incarnation = accepted
+        .runtime_incarnation
+        .as_ref()
+        .ok_or(GateReconcileError::RuntimeNotInstallable)?;
+    let binding = route_binding(desired, endpoint, Some(incarnation))
+        .ok_or(GateReconcileError::RuntimeNotInstallable)?;
+    let already_prepared = install_step_matches(accepted, desired, endpoint_id)?;
+    let open_busy_reuse = matches!(
+        accepted.require_idle,
+        RequireIdleCheckpoint::Busy {
+            gate_closed: false,
+            ..
+        }
+    ) && accepted
+        .route_gates
+        .iter()
+        .any(|route| route.binding == binding && route.gate == RouteGateState::Active)
+        && desired.desired_revision > accepted.desired_revision;
+    let mut expected = if already_prepared {
+        accepted.clone()
+    } else {
+        if !open_busy_reuse {
+            let action = first_endpoint_action(accepted, desired)?
+                .ok_or_else(|| GateReconcileError::WrongEndpointAction(endpoint_id.clone()))?;
+            let EndpointAction::Install { new_binding, .. } = action else {
+                return Err(GateReconcileError::WrongEndpointAction(endpoint_id.clone()));
+            };
+            if new_binding != binding {
+                return Err(GateReconcileError::AdmissionBarrierSuccessor);
+            }
+        }
+        let mut prepared = stage_desired(accepted, desired, durable.updated_at_unix_ms)?;
+        prepared.stable_state = None;
+        prepared.require_idle = RequireIdleCheckpoint::NotApplicable;
+        if !open_busy_reuse {
+            prepare_install_entry(&mut prepared, binding.clone())?;
+        }
+        prepared.step = ReconcileStep::InstallGate {
+            endpoint_id: endpoint_id.clone(),
+            route_epoch: endpoint.route_epoch,
+        };
+        prepared
+    };
+    activate_install_entry(&mut expected, &binding)?;
+    expected.lifecycle_admission = LifecycleAdmission::Open;
+    expected.stable_state = None;
+    expected.step = ReconcileStep::InstallGate {
+        endpoint_id: endpoint_id.clone(),
+        route_epoch: endpoint.route_epoch,
+    };
+    if expected == *durable {
+        Ok(())
+    } else {
+        Err(GateReconcileError::AdmissionBarrierSuccessor)
+    }
+}
+
 fn is_matching_close_step(checkpoint: &RuntimeCheckpoint, route: &CheckpointRouteGate) -> bool {
     matches!(
         &checkpoint.step,
@@ -1643,7 +1768,7 @@ fn activate_install_entry(
     Ok(())
 }
 
-fn active_install_snapshot(
+pub(super) fn active_install_snapshot(
     checkpoint: &RuntimeCheckpoint,
     endpoint_id: &Id,
 ) -> Result<AdmissionSnapshot, GateReconcileError> {

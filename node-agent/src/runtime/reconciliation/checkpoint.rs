@@ -381,7 +381,6 @@ impl FileCheckpointStore {
         ))
     }
 
-    #[cfg(test)]
     pub(super) fn endpoint_effect_edge_status(
         &self,
         candidate: &EndpointEffectEdge,
@@ -1560,7 +1559,6 @@ impl EndpointEffectEdge {
     }
 }
 
-#[cfg(test)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum EndpointEffectEdgeStatus {
     Exact,

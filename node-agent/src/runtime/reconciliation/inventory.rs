@@ -972,6 +972,7 @@ impl RuntimeInventoryScanner for CleanSlateInventoryScanner {
                     }
                 };
                 tail.insert_exact(
+                    launch_predecessor,
                     desired,
                     checkpoint,
                     checkpoint_content_digest(checkpoint)

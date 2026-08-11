@@ -22,7 +22,7 @@ use crate::state_directory::StateDirectory;
 use super::authorized_blockd::{
     validate_running_endpoint_only_desired_successor, validate_running_physical_desired_successor,
 };
-use super::checkpoint::{FileCheckpointStore, StoredCheckpoint};
+use super::checkpoint::{CurrentCheckpointGuard, FileCheckpointStore, StoredCheckpoint};
 use super::inventory::AuthorityVolumeInventoryEvidence;
 use super::kernel_nbd::{
     ExactKernelNbdDeviceProof, KernelNbdInventoryConfig, KernelNbdInventoryPort,
@@ -331,6 +331,29 @@ struct RetainedRunningDevice<'a> {
     first_lease_expiry: cats_api::runtime_reconciliation::UnixMillis,
 }
 
+/// Non-cloneable authority retained across the final Guest mounted-set
+/// challenge. The checkpoint writer guard is acquired before the Host sweep
+/// and remains held until the caller has challenged the Guest and performed
+/// the final pathname revalidation immediately before the cell effect.
+pub(crate) struct RetainedGateSuccessorAuthority<'store, 'checkpoint> {
+    successor_vmm: ExactVmmProcessProof,
+    store: &'store FileCheckpointStore,
+    durable_successor: &'checkpoint StoredCheckpoint,
+    checkpoint_guard: CurrentCheckpointGuard<'store>,
+}
+
+impl RetainedGateSuccessorAuthority<'_, '_> {
+    pub(crate) fn vmm(&self) -> &ExactVmmProcessProof {
+        &self.successor_vmm
+    }
+
+    pub(crate) fn revalidate_current(&self) -> Result<()> {
+        self.store
+            .revalidate_current(self.durable_successor, &self.checkpoint_guard)
+            .context("revalidate durable Running gate successor after Guest challenge")
+    }
+}
+
 impl RunningLaunchAuthorityRevalidator {
     pub(super) fn platform_parts(
         state_directory: StateDirectory,
@@ -364,35 +387,37 @@ impl RunningLaunchAuthorityRevalidator {
         stored: &StoredCheckpoint,
         admitted_vmm: &ExactVmmProcessProof,
     ) -> Result<()> {
-        self.revalidate_exact_retained_running_gate_successor(
+        let retained = self.revalidate_exact_retained_running_gate_successor(
             context,
+            desired,
             desired,
             store,
             stored,
             stored,
             admitted_vmm,
-        )
-        .map(|_| ())
+        )?;
+        retained.revalidate_current()
     }
 
     #[allow(
         clippy::too_many_arguments,
         reason = "the gate barrier closes one accepted physical predecessor and its durable successor"
     )]
-    pub(crate) fn revalidate_exact_retained_running_gate_successor(
+    pub(crate) fn revalidate_exact_retained_running_gate_successor<'store, 'checkpoint>(
         &self,
         context: &RuntimeDesiredEffectContext,
-        desired: &DesiredRuntimeSpec,
-        store: &FileCheckpointStore,
+        physical_launch_desired: &DesiredRuntimeSpec,
+        gate_desired: &DesiredRuntimeSpec,
+        store: &'store FileCheckpointStore,
         accepted_checkpoint: &StoredCheckpoint,
-        durable_successor: &StoredCheckpoint,
+        durable_successor: &'checkpoint StoredCheckpoint,
         admitted_vmm: &ExactVmmProcessProof,
-    ) -> Result<ExactVmmProcessProof> {
+    ) -> Result<RetainedGateSuccessorAuthority<'store, 'checkpoint>> {
         self.revalidate_exact_retained_running_gate_chain(
             context,
-            desired,
-            desired,
-            desired,
+            physical_launch_desired,
+            gate_desired,
+            gate_desired,
             false,
             store,
             accepted_checkpoint,
@@ -405,21 +430,17 @@ impl RunningLaunchAuthorityRevalidator {
         clippy::too_many_arguments,
         reason = "the Endpoint-only barrier closes immutable launch, live-gate predecessor, and durable successor separately"
     )]
-    #[expect(
-        dead_code,
-        reason = "the route-retirement integration consumes this closed three-Desired seam"
-    )]
-    pub(crate) fn revalidate_exact_retained_running_endpoint_successor(
+    pub(crate) fn revalidate_exact_retained_running_endpoint_successor<'store, 'checkpoint>(
         &self,
         context: &RuntimeDesiredEffectContext,
         physical_launch_desired: &DesiredRuntimeSpec,
         live_gate_predecessor: &DesiredRuntimeSpec,
         gate_successor: &DesiredRuntimeSpec,
-        store: &FileCheckpointStore,
+        store: &'store FileCheckpointStore,
         accepted_checkpoint: &StoredCheckpoint,
-        durable_successor: &StoredCheckpoint,
+        durable_successor: &'checkpoint StoredCheckpoint,
         admitted_vmm: &ExactVmmProcessProof,
-    ) -> Result<ExactVmmProcessProof> {
+    ) -> Result<RetainedGateSuccessorAuthority<'store, 'checkpoint>> {
         self.revalidate_exact_retained_running_gate_chain(
             context,
             physical_launch_desired,
@@ -437,18 +458,18 @@ impl RunningLaunchAuthorityRevalidator {
         clippy::too_many_arguments,
         reason = "the closed gate chain keeps three Desired authorities and two durable checkpoints distinct"
     )]
-    fn revalidate_exact_retained_running_gate_chain(
+    fn revalidate_exact_retained_running_gate_chain<'store, 'checkpoint>(
         &self,
         context: &RuntimeDesiredEffectContext,
         physical_launch_desired: &DesiredRuntimeSpec,
         live_gate_predecessor: &DesiredRuntimeSpec,
         gate_successor: &DesiredRuntimeSpec,
         endpoint_only: bool,
-        store: &FileCheckpointStore,
+        store: &'store FileCheckpointStore,
         accepted_checkpoint: &StoredCheckpoint,
-        durable_successor: &StoredCheckpoint,
+        durable_successor: &'checkpoint StoredCheckpoint,
         admitted_vmm: &ExactVmmProcessProof,
-    ) -> Result<ExactVmmProcessProof> {
+    ) -> Result<RetainedGateSuccessorAuthority<'store, 'checkpoint>> {
         validate_running_physical_desired_successor(
             physical_launch_desired,
             live_gate_predecessor,
@@ -683,7 +704,12 @@ impl RunningLaunchAuthorityRevalidator {
         current_vmm.assert_current(context)?;
         store.revalidate_current(durable_successor, &checkpoint_guard)?;
         context.check_active()?;
-        Ok(*current_vmm)
+        Ok(RetainedGateSuccessorAuthority {
+            successor_vmm: *current_vmm,
+            store,
+            durable_successor,
+            checkpoint_guard,
+        })
     }
 }
 

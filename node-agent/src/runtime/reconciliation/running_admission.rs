@@ -25,7 +25,11 @@ use crate::runtime_spine::{
     RuntimePreScanAdmissionContext,
 };
 
-use super::gate_planner::{first_endpoint_action, route_binding, EndpointAction};
+use super::checkpoint::{EndpointEffectEdge, EndpointEffectEdgeStatus};
+use super::gate_planner::{
+    active_install_snapshot, first_endpoint_action, route_binding, validate_gate_barrier_successor,
+    EndpointAction,
+};
 use super::inventory::DesiredCheckpointBinding;
 use super::vmm_process::ExactVmmProcessProof;
 use super::{
@@ -40,11 +44,19 @@ use super::{
 type AfterRegistryHook = Arc<dyn Fn(&RuntimeDesiredEffectContext) + Send + Sync>;
 
 #[cfg(test)]
+type GateBarrierHook = Arc<
+    dyn Fn(&FileCheckpointStore, &StoredCheckpoint, &StoredCheckpoint) -> anyhow::Result<()>
+        + Send
+        + Sync,
+>;
+
+#[cfg(test)]
 pub(crate) type LaunchRevalidationHook = Arc<
     dyn Fn(
             &RuntimeDesiredEffectContext,
             &DesiredRuntimeSpec,
             &FileCheckpointStore,
+            &StoredCheckpoint,
             &StoredCheckpoint,
             &ExactVmmProcessProof,
         ) -> anyhow::Result<()>
@@ -92,6 +104,7 @@ struct RouteRetirementExpectation {
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum RunningTailPhysicalAuthority {
     Exact {
+        physical_launch_desired: Box<DesiredRuntimeSpec>,
         vmm: Box<ExactVmmProcessProof>,
         mounted_set: Box<ExactGuestMountedSetProof>,
     },
@@ -148,6 +161,7 @@ impl RunningTailScanAdmission {
 
     pub(crate) fn insert_exact(
         &mut self,
+        physical_launch_desired: DesiredRuntimeSpec,
         desired: &DesiredRuntimeSpec,
         checkpoint: &RuntimeCheckpoint,
         checkpoint_content_digest: Sha256Digest,
@@ -163,6 +177,10 @@ impl RunningTailScanAdmission {
             .runtime_launch
             .identity()
             .context("Running-tail checkpoint lacks retained launch authority")?;
+        super::authorized_blockd::validate_running_physical_desired_successor(
+            &physical_launch_desired,
+            desired,
+        )?;
         anyhow::ensure!(
             desired.target == RuntimeTarget::Running
                 && checkpoint.cat_id == desired.cat_id
@@ -215,6 +233,7 @@ impl RunningTailScanAdmission {
             cell,
             routes,
             physical: RunningTailPhysicalAuthority::Exact {
+                physical_launch_desired: Box::new(physical_launch_desired),
                 vmm: Box::new(vmm),
                 mounted_set: Box::new(mounted_set),
             },
@@ -270,8 +289,12 @@ impl RunningTailScanAdmission {
                     "route-retirement live-gate Desired conflicts with immutable launch provenance",
                 )?;
         }
+        let physical_launch_desired = launch_predecessor.clone();
         let physical = physical
             .map(|(vmm, mounted_set)| {
+                let physical_launch_desired = physical_launch_desired
+                    .clone()
+                    .context("route install lacks immutable launch provenance")?;
                 anyhow::ensure!(
                     vmm.expectation().checkpoint() == checkpoint
                         && vmm.expectation().launch_identity() == launch
@@ -287,6 +310,7 @@ impl RunningTailScanAdmission {
                     "route-retirement physical proof conflicts with retained launch"
                 );
                 Ok(RunningTailPhysicalAuthority::Exact {
+                    physical_launch_desired: Box::new(physical_launch_desired),
                     vmm: Box::new(vmm),
                     mounted_set: Box::new(mounted_set),
                 })
@@ -733,6 +757,8 @@ pub(crate) struct RunningAdmissionEffect {
     #[cfg(test)]
     after_registry: Option<AfterRegistryHook>,
     #[cfg(test)]
+    gate_barrier: Option<GateBarrierHook>,
+    #[cfg(test)]
     launch_revalidation: Option<LaunchRevalidationHook>,
 }
 
@@ -1066,6 +1092,8 @@ impl RunningAdmissionEffect {
             #[cfg(test)]
             after_registry: None,
             #[cfg(test)]
+            gate_barrier: None,
+            #[cfg(test)]
             launch_revalidation: None,
         }
     }
@@ -1081,6 +1109,8 @@ impl RunningAdmissionEffect {
             #[cfg(test)]
             after_registry: None,
             #[cfg(test)]
+            gate_barrier: None,
+            #[cfg(test)]
             launch_revalidation: None,
         }
     }
@@ -1088,6 +1118,12 @@ impl RunningAdmissionEffect {
     #[cfg(test)]
     fn with_after_registry(mut self, hook: AfterRegistryHook) -> Self {
         self.after_registry = Some(hook);
+        self
+    }
+
+    #[cfg(test)]
+    fn with_gate_barrier(mut self, hook: GateBarrierHook) -> Self {
+        self.gate_barrier = Some(hook);
         self
     }
 
@@ -1132,7 +1168,9 @@ impl RunningAdmissionEffect {
             .context("Running-tail authority names a missing checkpoint")?;
         ready.authorize(desired, &stored)?;
         context.check_active()?;
-        let Some(action) = plan_running_tail_action(desired, &stored, &live)? else {
+        let Some(action) =
+            plan_running_tail_action(desired, &stored, &live, session.checkpoint_store())?
+        else {
             let checkpoint = stored.checkpoint();
             let converged = session.cell().snapshot()
                 == AdmissionSnapshot::from_checkpoint(checkpoint)?
@@ -1162,15 +1200,21 @@ impl RunningAdmissionEffect {
                 let times = next_persist_times(&stored)?;
                 Some(
                     GateSequencer::new(session.checkpoint_store(), &mut port)
-                        .open_admission_with_barrier(&stored, desired, times, || {
-                            ready.revalidate_physical(
-                                self,
-                                context,
-                                desired,
-                                session.checkpoint_store(),
-                                &stored,
-                            )
-                        })?,
+                        .open_admission_with_barrier(
+                            &stored,
+                            desired,
+                            times,
+                            |accepted, durable| {
+                                ready.revalidate_physical(
+                                    self,
+                                    context,
+                                    desired,
+                                    session.checkpoint_store(),
+                                    accepted,
+                                    durable,
+                                )
+                            },
+                        )?,
                 )
             }
             RunningTailAction::CloseGate(endpoint_id) => {
@@ -1206,15 +1250,22 @@ impl RunningAdmissionEffect {
                 let times = next_persist_times(&stored)?;
                 Some(
                     GateSequencer::new(session.checkpoint_store(), &mut port)
-                        .install_gate_with_barrier(&stored, desired, &endpoint_id, times, || {
-                            ready.revalidate_physical(
-                                self,
-                                context,
-                                desired,
-                                session.checkpoint_store(),
-                                &stored,
-                            )
-                        })?,
+                        .install_gate_with_barrier(
+                            &stored,
+                            desired,
+                            &endpoint_id,
+                            times,
+                            |accepted, durable| {
+                                ready.revalidate_physical(
+                                    self,
+                                    context,
+                                    desired,
+                                    session.checkpoint_store(),
+                                    accepted,
+                                    durable,
+                                )
+                            },
+                        )?,
                 )
             }
         };
@@ -1354,9 +1405,22 @@ impl RunningAdmissionEffect {
                 sequencer.remove_closed_gate(&stored, desired, &endpoint_id, times.after_effect)?
             }
             RouteRetirementAction::InstallGate(endpoint_id) => sequencer
-                .install_gate_with_barrier(&stored, desired, &endpoint_id, times, || {
-                    retiring.revalidate_physical(self, context, session.checkpoint_store(), &stored)
-                })?,
+                .install_gate_with_barrier(
+                    &stored,
+                    desired,
+                    &endpoint_id,
+                    times,
+                    |accepted, durable| {
+                        retiring.revalidate_physical(
+                            self,
+                            context,
+                            desired,
+                            session.checkpoint_store(),
+                            accepted,
+                            durable,
+                        )
+                    },
+                )?,
             RouteRetirementAction::CloseAll => sequencer.close_all(&stored, desired, times)?,
             RouteRetirementAction::BeginRequireIdle => {
                 sequencer.begin_require_idle(&stored, desired, times)?
@@ -1402,14 +1466,30 @@ impl RouteRetirementExpectation {
         &self,
         effect: &RunningAdmissionEffect,
         context: &RuntimeDesiredEffectContext,
+        desired: &DesiredRuntimeSpec,
         store: &FileCheckpointStore,
-        stored: &StoredCheckpoint,
+        accepted: &StoredCheckpoint,
+        durable: &StoredCheckpoint,
     ) -> anyhow::Result<()> {
+        validate_gate_barrier_successor(accepted.checkpoint(), durable.checkpoint(), desired)
+            .context("validate durable route gate-only successor")?;
+        #[cfg(test)]
+        if let Some(barrier) = effect.gate_barrier.as_ref() {
+            barrier(store, accepted, durable)?;
+        }
         let Some(physical) = &self.physical else {
             anyhow::bail!("route install lacks fresh physical authority")
         };
-        let (vmm, mounted_set) = match physical {
-            RunningTailPhysicalAuthority::Exact { vmm, mounted_set } => (vmm, mounted_set),
+        let (physical_launch_desired, vmm, mounted_set) = match physical {
+            RunningTailPhysicalAuthority::Exact {
+                physical_launch_desired,
+                vmm,
+                mounted_set,
+            } => (
+                physical_launch_desired.as_ref(),
+                vmm.as_ref(),
+                mounted_set.as_ref(),
+            ),
             #[cfg(test)]
             RunningTailPhysicalAuthority::Test => return Ok(()),
         };
@@ -1421,36 +1501,82 @@ impl RouteRetirementExpectation {
             .launch_predecessor
             .as_ref()
             .context("route install lacks immutable launch provenance")?;
+        anyhow::ensure!(
+            physical_launch_desired == launch_predecessor,
+            "route physical proof changed its immutable launch provenance"
+        );
         super::authorized_blockd::validate_running_physical_desired_successor(
             launch_predecessor,
             predecessor,
         )
         .context("live-gate predecessor conflicts with immutable launch provenance")?;
         if let Some(launch_authority) = effect.launch_authority.as_deref() {
-            launch_authority.revalidate_exact_retained_running(
+            let successor = match self.checkpoint_binding {
+                DesiredCheckpointBinding::Superseded => launch_authority
+                    .revalidate_exact_retained_running_endpoint_successor(
+                        context,
+                        physical_launch_desired,
+                        predecessor,
+                        desired,
+                        store,
+                        accepted,
+                        durable,
+                        vmm,
+                    )?,
+                DesiredCheckpointBinding::Current => launch_authority
+                    .revalidate_exact_retained_running_gate_successor(
+                        context,
+                        physical_launch_desired,
+                        desired,
+                        store,
+                        accepted,
+                        durable,
+                        vmm,
+                    )?,
+            };
+            mounted_set.revalidate(
+                effect.guest_ready.as_ref(),
                 context,
-                predecessor,
-                store,
-                stored,
-                vmm,
+                desired,
+                durable.checkpoint(),
+                successor.vmm(),
             )?;
+            successor.revalidate_current()?;
+            return Ok(());
         } else {
             #[cfg(test)]
-            if let Some(revalidate) = effect.launch_revalidation.as_ref() {
-                revalidate(context, predecessor, store, stored, vmm)?;
-            } else {
-                anyhow::bail!("production route retirement lacks launch revalidation authority");
+            {
+                let durable_guard = store.assert_current(durable)?;
+                if let Some(revalidate) = effect.launch_revalidation.as_ref() {
+                    revalidate(context, desired, store, accepted, durable, vmm)?;
+                } else {
+                    anyhow::bail!(
+                        "production route retirement lacks launch revalidation authority"
+                    );
+                }
+                let successor_vmm = match self.checkpoint_binding {
+                    DesiredCheckpointBinding::Superseded => vmm
+                        .expectation()
+                        .endpoint_only_gate_successor(predecessor, desired, durable.checkpoint())?
+                        .prove_exact_process(vmm.evidence().clone())?,
+                    DesiredCheckpointBinding::Current => vmm
+                        .expectation()
+                        .gate_only_successor(durable.checkpoint())?
+                        .prove_exact_process(vmm.evidence().clone())?,
+                };
+                mounted_set.revalidate(
+                    effect.guest_ready.as_ref(),
+                    context,
+                    desired,
+                    durable.checkpoint(),
+                    &successor_vmm,
+                )?;
+                store.revalidate_current(durable, &durable_guard)?;
+                return Ok(());
             }
             #[cfg(not(test))]
             anyhow::bail!("production route retirement lacks launch revalidation authority");
         }
-        mounted_set.revalidate(
-            effect.guest_ready.as_ref(),
-            context,
-            predecessor,
-            stored.checkpoint(),
-            vmm,
-        )
     }
 }
 
@@ -1461,39 +1587,71 @@ impl RunningTailReadyAdmission {
         context: &RuntimeDesiredEffectContext,
         desired: &DesiredRuntimeSpec,
         store: &FileCheckpointStore,
-        stored: &StoredCheckpoint,
+        accepted: &StoredCheckpoint,
+        durable: &StoredCheckpoint,
     ) -> anyhow::Result<()> {
+        validate_gate_barrier_successor(accepted.checkpoint(), durable.checkpoint(), desired)
+            .context("validate durable Running gate-only successor")?;
+        #[cfg(test)]
+        if let Some(barrier) = effect.gate_barrier.as_ref() {
+            barrier(store, accepted, durable)?;
+        }
         match &self.expectation.physical {
-            RunningTailPhysicalAuthority::Exact { vmm, mounted_set } => {
+            RunningTailPhysicalAuthority::Exact {
+                physical_launch_desired,
+                vmm,
+                mounted_set,
+            } => {
                 // First close every retained Host-side authority. The fresh
                 // mounted-set challenge is deliberately last so no earlier
                 // public observation, or slower Host inspection, can stand in
                 // for the immediate pre-gate Guest physical barrier.
                 if let Some(launch_authority) = effect.launch_authority.as_deref() {
-                    launch_authority
-                        .revalidate_exact_retained_running(context, desired, store, stored, vmm)?;
-                } else {
-                    #[cfg(test)]
-                    if let Some(revalidate) = effect.launch_revalidation.as_ref() {
-                        revalidate(context, desired, store, stored, vmm)?;
-                    } else {
+                    let successor = launch_authority
+                        .revalidate_exact_retained_running_gate_successor(
+                            context,
+                            physical_launch_desired,
+                            desired,
+                            store,
+                            accepted,
+                            durable,
+                            vmm,
+                        )?;
+                    mounted_set.revalidate(
+                        effect.guest_ready.as_ref(),
+                        context,
+                        desired,
+                        durable.checkpoint(),
+                        successor.vmm(),
+                    )?;
+                    successor.revalidate_current()?;
+                    return Ok(());
+                }
+                #[cfg(test)]
+                {
+                    let durable_guard = store.assert_current(durable)?;
+                    let Some(revalidate) = effect.launch_revalidation.as_ref() else {
                         anyhow::bail!(
                             "production Running-tail effect lacks launch revalidation authority"
                         );
-                    }
-                    #[cfg(not(test))]
-                    anyhow::bail!(
-                        "production Running-tail effect lacks launch revalidation authority"
-                    );
+                    };
+                    revalidate(context, desired, store, accepted, durable, vmm)?;
+                    let successor_vmm = vmm
+                        .expectation()
+                        .gate_only_successor(durable.checkpoint())?
+                        .prove_exact_process(vmm.evidence().clone())?;
+                    mounted_set.revalidate(
+                        effect.guest_ready.as_ref(),
+                        context,
+                        desired,
+                        durable.checkpoint(),
+                        &successor_vmm,
+                    )?;
+                    store.revalidate_current(durable, &durable_guard)?;
+                    Ok(())
                 }
-                mounted_set.revalidate(
-                    effect.guest_ready.as_ref(),
-                    context,
-                    desired,
-                    stored.checkpoint(),
-                    vmm,
-                )?;
-                Ok(())
+                #[cfg(not(test))]
+                anyhow::bail!("production Running-tail effect lacks launch revalidation authority")
             }
             #[cfg(test)]
             RunningTailPhysicalAuthority::Test => Ok(()),
@@ -1644,6 +1802,7 @@ fn plan_running_tail_action(
     desired: &DesiredRuntimeSpec,
     stored: &StoredCheckpoint,
     live: &AdmissionCellObservation,
+    store: &FileCheckpointStore,
 ) -> anyhow::Result<Option<RunningTailAction>> {
     let checkpoint = stored.checkpoint();
     let cell = live.snapshot();
@@ -1680,6 +1839,46 @@ fn plan_running_tail_action(
     }
 
     let checkpoint_cell = AdmissionSnapshot::from_checkpoint(checkpoint)?;
+    if cell == &checkpoint_cell {
+        if let ReconcileStep::InstallGate { endpoint_id, .. } = &checkpoint.step {
+            let active = checkpoint.route_gates.iter().any(|route| {
+                &route.binding.endpoint_id == endpoint_id
+                    && route.gate == cats_api::runtime_reconciliation::RouteGateState::Active
+            });
+            if active {
+                // The cell effect linearized but publishing its completed
+                // successor failed or lost its response. Only this exact
+                // same-process snapshot may finish the burned epoch without
+                // invoking the cell effect again.
+                return Ok(Some(RunningTailAction::InstallGate(endpoint_id.clone())));
+            }
+        }
+    }
+    if let ReconcileStep::InstallGate { endpoint_id, .. } = &checkpoint.step {
+        let active = checkpoint.route_gates.iter().any(|route| {
+            &route.binding.endpoint_id == endpoint_id
+                && route.gate == cats_api::runtime_reconciliation::RouteGateState::Active
+        });
+        if active && cell != &checkpoint_cell {
+            let edge =
+                EndpointEffectEdge::new(cell.clone(), checkpoint_cell.clone(), endpoint_id.clone());
+            return match store.endpoint_effect_edge_status(&edge)? {
+                EndpointEffectEdgeStatus::Exact => {
+                    Ok(Some(RunningTailAction::InstallGate(endpoint_id.clone())))
+                }
+                // A reopened process deliberately has no retained edge. Send
+                // the burned Active token through GateSequencer so its sealed
+                // transition check returns FreshRouteEpochRequired; silently
+                // treating it as converged would strand this epoch forever.
+                EndpointEffectEdgeStatus::Missing => {
+                    Ok(Some(RunningTailAction::InstallGate(endpoint_id.clone())))
+                }
+                EndpointEffectEdgeStatus::Mismatch => {
+                    anyhow::bail!("Running Active InstallGate edge changed before replay")
+                }
+            };
+        }
+    }
     if cell == &checkpoint_cell.fail_closed() && cell != &checkpoint_cell {
         anyhow::ensure!(
             guards.platform_guards == 0 && guards.endpoint_guards.is_empty(),
@@ -1739,13 +1938,43 @@ fn plan_running_tail_action(
         EndpointAction::Install { endpoint_id, .. } => {
             match cell.lifecycle_admission() {
                 LifecycleAdmission::Closed => {
+                    let prepared_first_shape = matches!(
+                        &checkpoint.step,
+                        ReconcileStep::InstallGate {
+                            endpoint_id: prepared_endpoint,
+                            route_epoch,
+                        } if prepared_endpoint == &endpoint_id
+                            && *route_epoch == desired.endpoints
+                                .iter()
+                                .find(|endpoint| endpoint.endpoint_id == endpoint_id)
+                                .context("planned Endpoint disappeared from Desired")?
+                                .route_epoch
+                    ) && checkpoint.route_gates.len() == 1
+                        && checkpoint.route_gates[0].binding.endpoint_id == endpoint_id
+                        && checkpoint.route_gates[0].gate == RouteGateState::Closed;
+                    let exact_prepared_first = if prepared_first_shape {
+                        let replacement = active_install_snapshot(checkpoint, &endpoint_id)?;
+                        let edge =
+                            EndpointEffectEdge::new(cell.clone(), replacement, endpoint_id.clone());
+                        match store.endpoint_effect_edge_status(&edge)? {
+                            EndpointEffectEdgeStatus::Exact | EndpointEffectEdgeStatus::Missing => {
+                                true
+                            }
+                            EndpointEffectEdgeStatus::Mismatch => anyhow::bail!(
+                                "prepared Running InstallGate edge changed before replay"
+                            ),
+                        }
+                    } else {
+                        false
+                    };
                     anyhow::ensure!(
                         checkpoint.lifecycle_admission == LifecycleAdmission::Closed
-                            && checkpoint.route_gates.is_empty()
-                            && cell.endpoints().is_empty()
+                            && ((checkpoint.route_gates.is_empty()
+                                && cell.endpoints().is_empty())
+                                || exact_prepared_first)
                             && guards.platform_guards == 0
                             && guards.endpoint_guards.is_empty(),
-                        "only the first empty-gate InstallGate may open lifecycle admission"
+                        "only the first empty or exact prepared InstallGate may open lifecycle admission"
                     );
                 }
                 LifecycleAdmission::Open => {
@@ -1809,9 +2038,10 @@ mod tests {
     };
     use tempfile::TempDir;
 
-    use super::super::checkpoint::EndpointEffectEdge;
+    use super::super::checkpoint::{EndpointEffectEdge, WriteStage};
     use super::super::{
         runtime_checkpoint_path, AdmissionCell, AdmissionGatePort, FileCheckpointStore,
+        GateReconcileError,
     };
     use super::*;
     use crate::runtime_spine::RuntimeDesiredEffectAdmission;
@@ -2346,9 +2576,13 @@ mod tests {
                 EndpointAction::Install { endpoint_id, .. } => {
                     order.push(format!("install:{}", endpoint_id.as_str()));
                     sequencer
-                        .install_gate_with_barrier(&stored, &successor, &endpoint_id, times, || {
-                            Ok(())
-                        })
+                        .install_gate_with_barrier(
+                            &stored,
+                            &successor,
+                            &endpoint_id,
+                            times,
+                            |_, _| Ok(()),
+                        )
                         .unwrap()
                 }
                 EndpointAction::Remove { endpoint_id } => {
@@ -3137,6 +3371,221 @@ mod tests {
         assert_eq!(
             session.cell().snapshot().lifecycle_admission(),
             LifecycleAdmission::Closed
+        );
+    }
+
+    #[test]
+    fn prepared_first_install_replays_only_with_the_retained_process_edge() {
+        let fixture = Fixture::new(1);
+        let registry = fixture.registry();
+        let crash_registry = Arc::clone(&registry);
+        let crash_cat_id = fixture.desired.cat_id.clone();
+        let crashing = RunningAdmissionEffect::new(Arc::clone(&registry)).with_after_registry(
+            Arc::new(move |_| {
+                let session = crash_registry
+                    .existing_session(&crash_cat_id)
+                    .expect("registry lookup")
+                    .expect("effect registered a session before planning");
+                // The first publication is the Closed prepared token; fail
+                // the following Active publication before the cell effect.
+                session
+                    .checkpoint_store()
+                    .inject_crash_on_nth(WriteStage::TempWritten, 2);
+            }),
+        );
+        let error = crashing
+            .try_apply(&fixture.context(&registry, true), &fixture.desired)
+            .expect_err("injected Active publication crash");
+        assert!(error
+            .downcast_ref::<GateReconcileError>()
+            .is_some_and(|error| matches!(
+                error,
+                GateReconcileError::Checkpoint(super::super::CheckpointStoreError::InjectedCrash)
+            )));
+        let session = registry
+            .existing_session(&fixture.desired.cat_id)
+            .unwrap()
+            .unwrap();
+        let prepared = session.checkpoint_store().load().unwrap().unwrap();
+        assert!(matches!(
+            prepared.checkpoint().step,
+            ReconcileStep::InstallGate { .. }
+        ));
+        assert_eq!(prepared.checkpoint().route_gates.len(), 1);
+        assert_eq!(
+            prepared.checkpoint().route_gates[0].gate,
+            RouteGateState::Closed
+        );
+        assert!(session.cell().snapshot().endpoints().is_empty());
+
+        assert_eq!(
+            RunningAdmissionEffect::new(Arc::clone(&registry))
+                .try_apply(&fixture.context(&registry, true), &fixture.desired)
+                .expect("same-process retained edge resumes the prepared token"),
+            Some(RuntimeDesiredEffectOutcome::RefreshInventory)
+        );
+        assert_eq!(
+            session.cell().snapshot().endpoints()[0].gate,
+            RouteGateState::Active
+        );
+
+        let restarted_fixture = Fixture::new(1);
+        let restarted_registry = restarted_fixture.registry();
+        let crash_registry = Arc::clone(&restarted_registry);
+        let crash_cat_id = restarted_fixture.desired.cat_id.clone();
+        let crashing = RunningAdmissionEffect::new(Arc::clone(&restarted_registry))
+            .with_after_registry(Arc::new(move |_| {
+                let session = crash_registry
+                    .existing_session(&crash_cat_id)
+                    .unwrap()
+                    .unwrap();
+                session
+                    .checkpoint_store()
+                    .inject_crash_on_nth(WriteStage::TempWritten, 2);
+            }));
+        crashing
+            .try_apply(
+                &restarted_fixture.context(&restarted_registry, true),
+                &restarted_fixture.desired,
+            )
+            .expect_err("leave a durable prepared token");
+        drop(crashing);
+        drop(restarted_registry);
+
+        let reopened = restarted_fixture.registry();
+        let error = RunningAdmissionEffect::new(Arc::clone(&reopened))
+            .try_apply(
+                &restarted_fixture.context(&reopened, true),
+                &restarted_fixture.desired,
+            )
+            .expect_err("a restarted process cannot replay the old route epoch");
+        assert!(error
+            .downcast_ref::<GateReconcileError>()
+            .is_some_and(|error| matches!(
+                error,
+                GateReconcileError::FreshRouteEpochRequired(endpoint_id)
+                    if endpoint_id == &restarted_fixture.desired.endpoints[0].endpoint_id
+            )));
+        let reopened_session = reopened
+            .existing_session(&restarted_fixture.desired.cat_id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            reopened_session.cell().snapshot().lifecycle_admission(),
+            LifecycleAdmission::Closed
+        );
+        assert_eq!(
+            reopened_session
+                .checkpoint_store()
+                .load()
+                .unwrap()
+                .unwrap()
+                .checkpoint()
+                .route_gates[0]
+                .gate,
+            RouteGateState::Closed
+        );
+    }
+
+    #[test]
+    fn active_install_barrier_failure_retries_only_with_the_retained_process_edge() {
+        let fixture = Fixture::new(1);
+        let registry = fixture.registry();
+        let failing = RunningAdmissionEffect::new(Arc::clone(&registry)).with_gate_barrier(
+            Arc::new(|store, accepted, durable| {
+                assert!(matches!(
+                    accepted.checkpoint().step,
+                    ReconcileStep::StartRuntime { .. }
+                ));
+                assert!(matches!(
+                    durable.checkpoint().step,
+                    ReconcileStep::InstallGate { .. }
+                ));
+                assert_eq!(
+                    durable.checkpoint().route_gates[0].gate,
+                    RouteGateState::Active
+                );
+                let current = store.load()?.expect("durable Active checkpoint");
+                assert_eq!(current.content_digest(), durable.content_digest());
+                anyhow::bail!("injected final authority barrier failure")
+            }),
+        );
+        let error = failing
+            .try_apply(&fixture.context(&registry, true), &fixture.desired)
+            .expect_err("the barrier fails after burning the route epoch");
+        assert!(error
+            .downcast_ref::<GateReconcileError>()
+            .is_some_and(|error| matches!(error, GateReconcileError::AdmissionBarrier(_))));
+        let session = registry
+            .existing_session(&fixture.desired.cat_id)
+            .unwrap()
+            .unwrap();
+        let active = session.checkpoint_store().load().unwrap().unwrap();
+        assert_eq!(
+            active.checkpoint().route_gates[0].gate,
+            RouteGateState::Active
+        );
+        assert!(session.cell().snapshot().endpoints().is_empty());
+
+        assert_eq!(
+            RunningAdmissionEffect::new(Arc::clone(&registry))
+                .try_apply(&fixture.context(&registry, true), &fixture.desired)
+                .expect("same-process retained edge retries the fresh barrier and cell effect"),
+            Some(RuntimeDesiredEffectOutcome::RefreshInventory)
+        );
+        assert_eq!(
+            session.cell().snapshot().endpoints()[0].gate,
+            RouteGateState::Active
+        );
+
+        let restarted_fixture = Fixture::new(1);
+        let restarted_registry = restarted_fixture.registry();
+        let failing = RunningAdmissionEffect::new(Arc::clone(&restarted_registry))
+            .with_gate_barrier(Arc::new(|_, _, _| {
+                anyhow::bail!("injected final authority barrier failure")
+            }));
+        failing
+            .try_apply(
+                &restarted_fixture.context(&restarted_registry, true),
+                &restarted_fixture.desired,
+            )
+            .expect_err("leave Active durable and the cell at its edge predecessor");
+        drop(failing);
+        drop(restarted_registry);
+
+        let reopened = restarted_fixture.registry();
+        let error = RunningAdmissionEffect::new(Arc::clone(&reopened))
+            .try_apply(
+                &restarted_fixture.context(&reopened, true),
+                &restarted_fixture.desired,
+            )
+            .expect_err("restart cannot replay the burned route epoch without its edge");
+        assert!(error
+            .downcast_ref::<GateReconcileError>()
+            .is_some_and(|error| matches!(
+                error,
+                GateReconcileError::FreshRouteEpochRequired(endpoint_id)
+                    if endpoint_id == &restarted_fixture.desired.endpoints[0].endpoint_id
+            )));
+        let session = reopened
+            .existing_session(&restarted_fixture.desired.cat_id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            session.cell().snapshot().lifecycle_admission(),
+            LifecycleAdmission::Closed
+        );
+        assert_eq!(
+            session
+                .checkpoint_store()
+                .load()
+                .unwrap()
+                .unwrap()
+                .checkpoint()
+                .route_gates[0]
+                .gate,
+            RouteGateState::Active,
+            "the burned Active token remains durable until Control supplies a fresh epoch"
         );
     }
 

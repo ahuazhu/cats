@@ -2923,6 +2923,74 @@ fn restart_confirms_an_exact_active_install_postcondition_without_reinstalling()
 }
 
 #[test]
+fn endpoint_barrier_observes_burned_active_successor_before_cell_install() {
+    let root = TempDir::new().expect("tempdir");
+    let source_desired = running_desired_with_endpoints(1, Vec::new());
+    let desired =
+        running_desired_with_endpoints(2, vec![endpoint("ep_a", "a.example.test", 1, 8080)]);
+    let checkpoint = running_checkpoint(&source_desired, 10);
+    let store = store(&root, &source_desired.cat_id);
+    let source = store.create(&checkpoint).expect("source checkpoint");
+    let source_cell = AdmissionSnapshot::from_checkpoint(&checkpoint).expect("source snapshot");
+    let mut port = FakePort::new(source_cell.clone(), store.path());
+
+    let error = GateSequencer::new(&store, &mut port)
+        .install_gate_with_barrier(
+            &source,
+            &desired,
+            &id("ep_a"),
+            times(20, 21),
+            |accepted, durable| {
+                assert_eq!(accepted.checkpoint(), &checkpoint);
+                assert!(matches!(
+                    durable.checkpoint().step,
+                    ReconcileStep::InstallGate {
+                        ref endpoint_id,
+                        route_epoch,
+                    } if endpoint_id == &id("ep_a") && route_epoch == epoch(1)
+                ));
+                assert_eq!(
+                    route(durable.checkpoint(), "ep_a").gate,
+                    RouteGateState::Active
+                );
+                let current = store.load().unwrap().unwrap();
+                assert_eq!(current.checkpoint(), durable.checkpoint());
+                assert_eq!(current.content_digest(), durable.content_digest());
+                anyhow::bail!("injected successor authority failure")
+            },
+        )
+        .expect_err("barrier failure must precede cell install");
+    assert!(matches!(error, GateReconcileError::AdmissionBarrier(_)));
+    assert_eq!(port.current, source_cell);
+    assert!(port.calls.is_empty());
+    let active = store.load().unwrap().unwrap();
+    assert_eq!(
+        route(active.checkpoint(), "ep_a").gate,
+        RouteGateState::Active
+    );
+
+    port.expected_disk.push_back(DiskMarker::Installed {
+        revision: revision(2),
+        endpoint_id: id("ep_a"),
+        route_epoch: epoch(1),
+    });
+    GateSequencer::new(&store, &mut port)
+        .install_gate_with_barrier(
+            &active,
+            &desired,
+            &id("ep_a"),
+            times(22, 23),
+            |accepted, durable| {
+                assert_eq!(accepted.checkpoint(), active.checkpoint());
+                assert_eq!(durable.checkpoint(), active.checkpoint());
+                Ok(())
+            },
+        )
+        .expect("same-session edge may retry after a fresh successful barrier");
+    assert_eq!(port.calls, [PortCall::Install]);
+}
+
+#[test]
 fn same_session_install_retry_requires_the_exact_predecessor() {
     let root = TempDir::new().expect("tempdir");
     let source_desired =
@@ -3907,10 +3975,11 @@ fn zero_endpoint_open_admission_is_checkpoint_first_and_restart_safe() {
         .expect("source snapshot")
         .fail_closed();
     let mut port = FakePort::new(restarted_closed, store.path());
-    port.expected_disk.push_back(DiskMarker::OpenAdmission {
-        revision: desired.desired_revision,
-        runtime_incarnation: random('5'),
-    });
+    port.expected_disk
+        .push_back(DiskMarker::StableOpenAdmission {
+            revision: desired.desired_revision,
+            runtime_incarnation: random('5'),
+        });
 
     let result = GateSequencer::new(&store, &mut port)
         .open_admission(&stored, &desired, times(11, 12))
@@ -3954,10 +4023,11 @@ fn zero_endpoint_open_admission_closes_ambiguous_response_by_exact_postcondition
     );
     port.endpoint_results
         .push_back(EndpointPortResult::ErrorAfter(GatePortError::Unavailable));
-    port.expected_disk.push_back(DiskMarker::OpenAdmission {
-        revision: desired.desired_revision,
-        runtime_incarnation: random('5'),
-    });
+    port.expected_disk
+        .push_back(DiskMarker::StableOpenAdmission {
+            revision: desired.desired_revision,
+            runtime_incarnation: random('5'),
+        });
 
     let result = GateSequencer::new(&store, &mut port)
         .open_admission(&stored, &desired, times(11, 12))
@@ -3973,6 +4043,104 @@ fn zero_endpoint_open_admission_closes_ambiguous_response_by_exact_postcondition
         result.checkpoint().checkpoint().stable_state,
         Some(StableState::Running)
     );
+}
+
+#[test]
+fn zero_endpoint_barrier_uses_the_stable_successor_and_replays_from_closed() {
+    let root = TempDir::new().expect("tempdir");
+    let desired = running_desired_with_endpoints(1, Vec::new());
+    let checkpoint = running_checkpoint(&desired, 10);
+    let store = store(&root, &desired.cat_id);
+    let stored = store.create(&checkpoint).expect("source checkpoint");
+    let closed = AdmissionSnapshot::from_checkpoint(&checkpoint)
+        .expect("source snapshot")
+        .fail_closed();
+    let mut port = FakePort::new(closed.clone(), store.path());
+
+    let error = GateSequencer::new(&store, &mut port)
+        .open_admission_with_barrier(&stored, &desired, times(11, 12), |accepted, durable| {
+            assert_eq!(accepted.checkpoint(), stored.checkpoint());
+            assert_eq!(accepted.content_digest(), stored.content_digest());
+            assert!(matches!(
+                durable.checkpoint().step,
+                ReconcileStep::Stable {
+                    state: StableState::Running
+                }
+            ));
+            let current = store.load().unwrap().unwrap();
+            assert_eq!(current.checkpoint(), durable.checkpoint());
+            assert_eq!(current.content_digest(), durable.content_digest());
+            anyhow::bail!("injected fresh authority failure")
+        })
+        .expect_err("fresh barrier failure must keep the cell closed");
+    assert!(matches!(error, GateReconcileError::AdmissionBarrier(_)));
+    assert_eq!(port.current, closed);
+    assert!(port.calls.is_empty());
+
+    let durable = store.load().unwrap().unwrap();
+    port.expected_disk
+        .push_back(DiskMarker::StableOpenAdmission {
+            revision: desired.desired_revision,
+            runtime_incarnation: random('5'),
+        });
+    GateSequencer::new(&store, &mut port)
+        .open_admission_with_barrier(&durable, &desired, times(13, 14), |accepted, successor| {
+            assert_eq!(accepted.checkpoint(), durable.checkpoint());
+            assert_eq!(accepted.content_digest(), durable.content_digest());
+            assert_eq!(successor.checkpoint(), durable.checkpoint());
+            assert_eq!(successor.content_digest(), durable.content_digest());
+            let current = store.load().unwrap().unwrap();
+            assert_eq!(current.checkpoint(), successor.checkpoint());
+            assert_eq!(current.content_digest(), successor.content_digest());
+            Ok(())
+        })
+        .expect("fresh restart admission reopens the durable Stable successor");
+    assert_eq!(port.calls, [PortCall::Open]);
+}
+
+#[test]
+fn zero_endpoint_crash_after_prepared_token_never_reaches_the_cell() {
+    let root = TempDir::new().expect("tempdir");
+    let desired = running_desired_with_endpoints(1, Vec::new());
+    let mut checkpoint = running_checkpoint(&desired, 10);
+    checkpoint.stable_state = None;
+    checkpoint.lifecycle_admission = LifecycleAdmission::Closed;
+    checkpoint.step = ReconcileStep::OpenAdmission {
+        runtime_incarnation: random('5'),
+    };
+    let store = store(&root, &desired.cat_id);
+    let stored = store.create(&checkpoint).expect("source checkpoint");
+    let closed = AdmissionSnapshot::from_checkpoint(&checkpoint)
+        .expect("source snapshot")
+        .fail_closed();
+    let mut port = FakePort::new(closed, store.path());
+    store.inject_crash_once(WriteStage::TempWritten);
+    assert!(matches!(
+        GateSequencer::new(&store, &mut port)
+            .open_admission(&stored, &desired, times(11, 12))
+            .expect_err("crash publishing Stable successor"),
+        GateReconcileError::Checkpoint(CheckpointStoreError::InjectedCrash)
+    ));
+    assert!(port.calls.is_empty());
+    let prepared = store.load().unwrap().unwrap();
+    assert!(matches!(
+        prepared.checkpoint().step,
+        ReconcileStep::OpenAdmission { .. }
+    ));
+    assert_eq!(
+        prepared.checkpoint().lifecycle_admission,
+        LifecycleAdmission::Closed
+    );
+
+    port.expected_disk
+        .push_back(DiskMarker::StableOpenAdmission {
+            revision: desired.desired_revision,
+            runtime_incarnation: random('5'),
+        });
+    GateSequencer::new(&store, &mut port)
+        .open_admission(&prepared, &desired, times(13, 14))
+        .expect("prepared OpenAdmission token is replayable");
+    assert_eq!(port.calls, [PortCall::Open]);
 }
 
 #[test]
@@ -4206,7 +4374,7 @@ enum PortCall {
 
 #[derive(Debug)]
 enum DiskMarker {
-    OpenAdmission {
+    StableOpenAdmission {
         revision: Revision,
         runtime_incarnation: RandomId128,
     },
@@ -4270,7 +4438,7 @@ impl FakePort {
         let checkpoint =
             decode_runtime_checkpoint(&bytes).expect("decode checkpoint at effect boundary");
         match marker {
-            DiskMarker::OpenAdmission {
+            DiskMarker::StableOpenAdmission {
                 revision,
                 runtime_incarnation,
             } => {
@@ -4279,13 +4447,13 @@ impl FakePort {
                     checkpoint.runtime_incarnation,
                     Some(runtime_incarnation.clone())
                 );
-                assert_eq!(checkpoint.lifecycle_admission, LifecycleAdmission::Closed);
+                assert_eq!(checkpoint.lifecycle_admission, LifecycleAdmission::Open);
                 assert!(checkpoint.route_gates.is_empty());
                 assert!(matches!(
                     checkpoint.step,
-                    ReconcileStep::OpenAdmission {
-                        runtime_incarnation: ref saved,
-                    } if saved == &runtime_incarnation
+                    ReconcileStep::Stable {
+                        state: StableState::Running
+                    }
                 ));
             }
             DiskMarker::Installed {
