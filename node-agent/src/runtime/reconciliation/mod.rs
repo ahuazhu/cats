@@ -76,6 +76,17 @@ mod vmm_launch_artifacts;
     reason = "retained VMM runtime paths are staged before exact process composition"
 )]
 mod vmm_runtime_paths;
+// The StartRuntime edge is checkpoint-only. Production composition is added
+// with the scanner-sealed live-VMM CID adapter; until then this module remains
+// private and cannot start a process.
+#[cfg_attr(
+    not(test),
+    expect(
+        dead_code,
+        reason = "StartRuntime checkpoint builder awaits sealed CID production composition"
+    )
+)]
+mod vmm_start_runtime;
 // A StartRuntime attempt must own its API/vsock namespace before the fixed
 // launcher or PID 1 can create anything.  This provider-private WAL and
 // descriptor-rooted namespace land before the production effect consumes it.
