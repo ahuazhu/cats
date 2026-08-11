@@ -766,7 +766,6 @@ struct LaunchDirectoryIdentity {
     mode: u32,
     user: u32,
     group: u32,
-    links: u64,
 }
 
 #[cfg(target_os = "linux")]
@@ -778,7 +777,6 @@ impl LaunchDirectoryIdentity {
             mode: metadata.mode(),
             user: metadata.uid(),
             group: metadata.gid(),
-            links: metadata.nlink(),
         }
     }
 }
@@ -1336,7 +1334,6 @@ fn foreign_launch_snapshot() -> std::collections::BTreeMap<String, LaunchAttempt
                 mode: 0,
                 user: 0,
                 group: 0,
-                links: 0,
             },
             names: std::collections::BTreeSet::new(),
             leaves: std::collections::BTreeMap::new(),
@@ -2288,6 +2285,47 @@ mod tests {
             inspect_after_checkpoint_cas(RunningTail::Format, false, true, false),
             VmmRuntimePathInspection::Conflict
         ));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn mutable_launch_root_remains_exact_across_owned_child_link_count_changes() {
+        let temporary = tempfile::Builder::new()
+            .prefix("cats-launch-root-links-")
+            .tempdir_in("/dev/shm")
+            .unwrap();
+        let state_path = temporary.path().join("state");
+        std::fs::create_dir(&state_path).unwrap();
+        std::fs::set_permissions(
+            &state_path,
+            std::os::unix::fs::PermissionsExt::from_mode(0o700),
+        )
+        .unwrap();
+        let namespace = state_path.join(VMM_LAUNCH_FILE_NAMESPACE);
+        std::fs::create_dir(&namespace).unwrap();
+        std::fs::set_permissions(
+            &namespace,
+            std::os::unix::fs::PermissionsExt::from_mode(0o700),
+        )
+        .unwrap();
+        let root =
+            RetainedManagedVmmLaunchRoot::open_existing(StateDirectory::unanchored(state_path))
+                .unwrap();
+        let original_links = root.descriptor.metadata().unwrap().nlink();
+        let attempt = CString::new("inc-test").unwrap();
+
+        mkdir_launch_attempt(&root.descriptor, &attempt).unwrap();
+        let links_with_child = root.descriptor.metadata().unwrap().nlink();
+        assert_eq!(
+            links_with_child,
+            original_links + 1,
+            "tmpfs fixture did not exercise mutable directory link counts"
+        );
+        root.assert_current().unwrap();
+
+        remove_isolated_launch_directory(&root.descriptor, &attempt).unwrap();
+        assert_eq!(root.descriptor.metadata().unwrap().nlink(), original_links);
+        root.assert_current().unwrap();
     }
 
     #[cfg(target_os = "linux")]
