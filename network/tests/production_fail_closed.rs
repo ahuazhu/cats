@@ -3,11 +3,43 @@ use std::net::TcpListener;
 use std::process::Command;
 
 const CUTOVER_BLOCKER: &str = "cats-gatewayd is intentionally unavailable: Route Grant v2 is not composed: missing Gateway workload credential and policy authority and Route v2 signer and Node key-ring distribution and Control machine-authenticated resolve transport and public ingress proxy/listener composition; production ingress remains fail-closed";
+const FORBIDDEN_SHIPPED_GATEWAY_SURFACES: [&str; 4] = [
+    "CATS_SHARED_ROUTE_CACHE_TABLE",
+    "/v1/routes/resolve",
+    "/v1/routes/wake",
+    "/v1/cats/",
+];
 
 fn contains_bytes(haystack: &[u8], needle: &[u8]) -> bool {
     haystack
         .windows(needle.len())
         .any(|candidate| candidate == needle)
+}
+
+fn embedded_forbidden_surface(binary: &[u8]) -> Option<&'static str> {
+    FORBIDDEN_SHIPPED_GATEWAY_SURFACES
+        .into_iter()
+        .find(|forbidden| contains_bytes(binary, forbidden.as_bytes()))
+}
+
+#[test]
+fn legacy_surface_probe_ignores_dependency_paths_but_detects_cats_routes() {
+    assert_eq!(
+        embedded_forbidden_surface(b"src/client/legacy/connect/proxy/tunnel.rs"),
+        None
+    );
+    for legacy_surface in [
+        b"CATS_SHARED_ROUTE_CACHE_TABLE".as_slice(),
+        b"/v1/routes/resolve".as_slice(),
+        b"/v1/routes/wake".as_slice(),
+        b"/v1/cats/cat_a/proxy".as_slice(),
+        b"/v1/cats/cat_a/proxy-websocket".as_slice(),
+    ] {
+        assert!(
+            embedded_forbidden_surface(legacy_surface).is_some(),
+            "known legacy Cats surface escaped the shipped-binary probe"
+        );
+    }
 }
 
 #[test]
@@ -50,16 +82,9 @@ fn shipped_gateway_binary_exits_before_listening_or_legacy_outbound() {
 
     let binary = std::fs::read(env!("CARGO_BIN_EXE_cats-gatewayd"))
         .expect("read the exact tested gateway binary");
-    for forbidden in [
-        "CATS_SHARED_ROUTE_CACHE_TABLE",
-        "/v1/routes/resolve",
-        "/v1/routes/wake",
-        "/v1/cats/",
-        "/proxy",
-    ] {
-        assert!(
-            !contains_bytes(&binary, forbidden.as_bytes()),
-            "shipped gateway binary still embeds legacy surface {forbidden:?}"
-        );
-    }
+    assert!(
+        embedded_forbidden_surface(&binary).is_none(),
+        "shipped gateway binary still embeds legacy surface {:?}",
+        embedded_forbidden_surface(&binary)
+    );
 }
