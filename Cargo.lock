@@ -1149,13 +1149,11 @@ dependencies = [
  "cats-object-store-file",
  "cats-storage",
  "cats-test-support",
- "futures-util",
  "hex",
  "reqwest",
  "serde_json",
  "tempfile",
  "tokio",
- "tokio-tungstenite",
 ]
 
 [[package]]
