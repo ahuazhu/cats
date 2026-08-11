@@ -26,6 +26,7 @@ pub mod ids;
 pub mod metering;
 pub mod nodejob;
 pub mod oci;
+pub mod persistent_disk;
 pub mod requests;
 pub mod resources;
 pub mod route_grant;

@@ -17,6 +17,7 @@ use cats_api::agent_registration::{
 };
 use cats_api::cat_create::decode_cat_create_v2_accepted_response;
 use cats_api::requests::ListResponse;
+use cats_api::resources::Disk;
 use cats_api::runtime_node_authority::{
     runtime_node_authority_signed_request, PROVISIONER_CREDENTIAL_ID_HEADER,
     PROVISIONER_SIGNATURE_HEADER, RUNTIME_NODE_AUTHORITY_PATH,
@@ -55,6 +56,8 @@ const IMAGE_HEX: &str = "0123456789abcdef0123456789abcdef0123456789abcdef0123456
 const IMAGE_DIGEST: &str =
     "sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
 const CAT_CREATE_BODY: &[u8] = br#"{"name":"app","boot_image_digest":"sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef","vcpus":2,"memory_bytes":2147483648,"root_size_bytes":4294967296,"durability":"strict"}"#;
+const PERSISTENT_DISK_CREATE_BODY: &[u8] =
+    br#"{"durability":"strict","name":"data","size_bytes":1073741824}"#;
 const RFC8032_TEST_SEED: [u8; 32] = [
     0x9d, 0x61, 0xb1, 0x9d, 0xef, 0xfd, 0x5a, 0x60, 0xba, 0x84, 0x4a, 0xf4, 0x92, 0xec, 0x2c, 0xc4,
     0x44, 0x49, 0xc5, 0x69, 0x7b, 0x32, 0x69, 0x19, 0x70, 0x3b, 0xac, 0x03, 0x1c, 0xae, 0x7f, 0x60,
@@ -253,6 +256,23 @@ impl Context {
             .header(reqwest::header::CONTENT_TYPE, JSON_CONTENT_TYPE)
             .header("Idempotency-Key", idempotency_key)
             .body(CAT_CREATE_BODY.to_vec())
+    }
+
+    fn persistent_disk_create_request(
+        &self,
+        server: &Handle,
+        workspace_id: &str,
+        idempotency_key: &str,
+    ) -> RequestBuilder {
+        self.http
+            .post(format!(
+                "{}/v1/workspaces/{workspace_id}/disks",
+                server.base_url()
+            ))
+            .bearer_auth(ADMIN_TOKEN)
+            .header(reqwest::header::CONTENT_TYPE, JSON_CONTENT_TYPE)
+            .header("Idempotency-Key", idempotency_key)
+            .body(PERSISTENT_DISK_CREATE_BODY.to_vec())
     }
 }
 
@@ -562,6 +582,45 @@ async fn production_replicas_share_registration_observation_and_cat_create_autho
         "settled replay must not re-read the immutable manifest"
     );
 
+    let disk_key = "two-replica-persistent-disk-create";
+    let (first_disk, second_disk) = send_through_replica_barrier(
+        context.persistent_disk_create_request(&context.first, &workspace_id, disk_key),
+        context.persistent_disk_create_request(&context.second, &workspace_id, disk_key),
+    )
+    .await;
+    let first_disk_body = json_body(first_disk, StatusCode::CREATED).await;
+    let second_disk_body = json_body(second_disk, StatusCode::CREATED).await;
+    assert_eq!(second_disk_body, first_disk_body);
+    let disk: Disk = serde_json::from_slice(&first_disk_body).unwrap();
+    assert_eq!(disk.workspace_id, workspace_id);
+    assert_eq!(disk.name, "data");
+    assert_eq!(disk.size_bytes, 1_073_741_824);
+    assert_eq!(disk.kind, cats_api::resources::DiskKind::Persistent);
+    assert_eq!(disk.state, cats_api::resources::DiskState::Available);
+    assert_eq!(
+        context.image_blob.reads.load(Ordering::SeqCst),
+        reads_after_commit,
+        "PersistentDisk create must not read the Root image manifest"
+    );
+    let disk_replay = context
+        .persistent_disk_create_request(&context.first, &workspace_id, disk_key)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        json_body(disk_replay, StatusCode::CREATED).await,
+        first_disk_body
+    );
+    let disk_name_conflict = context
+        .persistent_disk_create_request(&context.second, &workspace_id, "disk-name-conflict")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        json_body(disk_name_conflict, StatusCode::CONFLICT).await,
+        br#"{"code":"already_exists","message":"disk name already exists"}"#
+    );
+
     let desired_two = DesiredReadRequest {
         version: ContractVersion::V1,
         session: session_binding(&session),
@@ -609,13 +668,13 @@ async fn production_replicas_share_registration_observation_and_cat_create_autho
             admission_inventory_state_count: 1,
             current_cat_observation_count: 0,
             cat_record_count: 1,
-            disk_record_count: 1,
-            volume_record_count: 1,
+            disk_record_count: 2,
+            volume_record_count: 2,
             desired_spec_count: 1,
             endpoint_record_count: 1,
             hostname_lookup_count: 1,
             runtime_operation_count: 1,
-            api_result_count: 1,
+            api_result_count: 3,
             retired_node_count: 0,
             retired_cat_count: 0,
             registration_attempt_lease_deadline_unix_ms: Some(
@@ -626,6 +685,7 @@ async fn production_replicas_share_registration_observation_and_cat_create_autho
             ),
             desired_read_last_request_sequence: Some(2),
             stored_api_response_body: Some(first_create_body),
+            stored_persistent_disk_response_body: Some(first_disk_body),
         }
     );
 

@@ -112,6 +112,31 @@ pub(super) fn load_volume_for_update(
         .transpose()
 }
 
+/// Lock every row that could claim this Volume identity in either the scalar
+/// projection or canonical JSON. A second match is stored corruption rather
+/// than a candidate collision.
+pub(super) fn load_any_volume_by_id_for_update(
+    transaction: &mut Transaction<'_>,
+    volume_id: &Id,
+) -> AuthorityTxResult<Option<VolumeRecord>> {
+    let sql = format!(
+        "SELECT {VOLUME_COLUMNS} FROM volume_records
+          WHERE volume_id=$1 OR record->>'volume_id'=$1
+          ORDER BY volume_id
+          LIMIT 2
+          FOR UPDATE"
+    );
+    let rows = transaction.query(&sql, &[&volume_id.as_str()])?;
+    let mut decoded = rows
+        .iter()
+        .map(decode_volume)
+        .collect::<AuthorityTxResult<Vec<_>>>()?;
+    if decoded.len() > 1 {
+        return Err(corrupt(()));
+    }
+    Ok(decoded.pop())
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(super) struct StoredVolume {
     pub(super) record: VolumeRecord,

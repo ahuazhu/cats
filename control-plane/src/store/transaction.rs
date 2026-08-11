@@ -568,11 +568,11 @@ impl Store {
         )
     }
 
-    /// Cat-create exposes its commit-send phase to an async cancellation
-    /// owner. A serialization/deadlock failure is a definite non-commit and
-    /// therefore permits that owner to reset its per-attempt phase before the
-    /// closed transaction is replayed. Connection failures stay ambiguous and
-    /// deliberately do not invoke this hook.
+    /// Covered Workspace mutations expose their commit-send phase to an async
+    /// cancellation owner. A serialization/deadlock failure is a definite
+    /// non-commit and therefore permits that owner to reset its per-attempt
+    /// phase before the closed transaction is replayed. Connection failures
+    /// stay ambiguous and deliberately do not invoke this hook.
     pub(super) fn authority_transaction_outcome_with_definite_retry<T: Send>(
         &self,
         mut operation: impl FnMut(&mut postgres::Transaction<'_>) -> AuthorityTxResult<T> + Send,

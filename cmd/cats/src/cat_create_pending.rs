@@ -1,6 +1,6 @@
-//! Durable, descriptor-relative recovery state for the public Cat-create
-//! request. One unresolved request is bound to one API origin, immutable
-//! Workspace ID, Cat name, exact path, exact body, and Idempotency-Key.
+//! Durable, descriptor-relative recovery state for covered public create
+//! requests. One unresolved request is bound to one API origin, immutable
+//! Workspace ID, resource name, exact path, exact body, and Idempotency-Key.
 
 use std::ffi::{CStr, CString};
 use std::fs::File;
@@ -13,8 +13,10 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context as _, Result};
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
 use cats_api::cat_create::CatCreateV2Request;
+use cats_api::persistent_disk::PersistentDiskCreateV1Request;
 use cats_api::runtime_reconciliation::Id;
 use fs2::FileExt as _;
+use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest as _, Sha256};
 
@@ -29,7 +31,27 @@ const METHOD: &str = "POST";
 const CONTENT_TYPE: &str = "application/json";
 const PENDING_MAX_BYTES: usize = 16 * 1024;
 const BODY_MAX_BYTES: usize = 4 * 1024;
-const STATE_DIRECTORY: &str = "cat-create-v2-authority-v1";
+const CAT_STATE_DIRECTORY: &str = "cat-create-v2-authority-v1";
+const PERSISTENT_DISK_STATE_DIRECTORY: &str = "persistent-disk-create-v1-authority-v1";
+
+#[derive(Clone, Copy)]
+struct PendingNamespace {
+    description: &'static str,
+    lock_scope: &'static str,
+    file_prefix: &'static str,
+}
+
+const CAT_NAMESPACE: PendingNamespace = PendingNamespace {
+    description: "Cat-create",
+    lock_scope: "cat-create-v2",
+    file_prefix: "cat",
+};
+
+const PERSISTENT_DISK_NAMESPACE: PendingNamespace = PendingNamespace {
+    description: "PersistentDisk-create",
+    lock_scope: "persistent-disk-create-v1",
+    file_prefix: "disk",
+};
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -149,9 +171,15 @@ impl PreparedCatCreate {
     fn prepare_in(root: &Path, origin: &str, workspace_id: &str, body: &[u8]) -> Result<Self> {
         let desired = PendingRecord::new(origin, workspace_id, body)?;
         let request = desired.validate()?;
-        let state =
-            PendingState::acquire(root, &desired.authenticated_workspace_id, &request.name)?;
-        let record = match state.load_pending()? {
+        let slot = request_slot(&desired.authenticated_workspace_id, request.name.as_str());
+        let state = PendingState::acquire(
+            root,
+            &desired.authenticated_workspace_id,
+            &request.name,
+            CAT_NAMESPACE,
+            slot,
+        )?;
+        let record: PendingRecord = match state.load_pending::<PendingRecord>()? {
             Some(existing) => {
                 anyhow::ensure!(
                     existing.binds(&desired)?,
@@ -161,10 +189,12 @@ impl PreparedCatCreate {
                 existing
             }
             None => {
+                desired.validate_for_slot(&state.slot)?;
                 state.publish_pending(&desired)?;
                 desired
             }
         };
+        record.validate_for_slot(&state.slot)?;
         Ok(Self { state, record })
     }
 
@@ -182,6 +212,197 @@ impl PreparedCatCreate {
 
     pub(crate) fn idempotency_key(&self) -> &str {
         &self.record.idempotency_key
+    }
+
+    pub(crate) fn body(&self) -> Result<Vec<u8>> {
+        self.record.body()
+    }
+
+    pub(crate) fn assert_current(&self) -> Result<()> {
+        self.state.assert_current_authority()
+    }
+
+    pub(crate) fn pending_path(&self) -> PathBuf {
+        self.state.pending_path()
+    }
+
+    pub(crate) fn clear(&self) -> Result<()> {
+        self.state.delete_pending()
+    }
+}
+
+impl PendingRecord {
+    fn validate_for_slot(&self, slot: &str) -> Result<()> {
+        let request = self.validate()?;
+        anyhow::ensure!(
+            request_slot(&self.authenticated_workspace_id, request.name.as_str(),) == slot,
+            "pending Cat-create state does not bind its storage slot"
+        );
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PersistentDiskPendingRecord {
+    version: u32,
+    origin: String,
+    authenticated_workspace_id: String,
+    method: String,
+    target: String,
+    content_type: String,
+    idempotency_key: String,
+    request_sha256: String,
+    body_base64: String,
+}
+
+impl PersistentDiskPendingRecord {
+    fn new(origin: &str, workspace_id: &str, body: &[u8]) -> Result<Self> {
+        let origin = canonical_api_origin(origin)?;
+        let workspace_id = canonical_workspace_id(workspace_id)?;
+        let request = canonical_persistent_disk_request(body)?;
+        let record = Self {
+            version: STATE_VERSION,
+            origin,
+            target: persistent_disk_create_target(&workspace_id),
+            authenticated_workspace_id: workspace_id,
+            method: METHOD.to_owned(),
+            content_type: CONTENT_TYPE.to_owned(),
+            idempotency_key: format!("cli-{}", uuid::Uuid::new_v4().simple()),
+            request_sha256: sha256_digest(body),
+            body_base64: URL_SAFE_NO_PAD.encode(body),
+        };
+        anyhow::ensure!(
+            record.validate()? == request,
+            "new pending PersistentDisk-create state changed the exact request body"
+        );
+        Ok(record)
+    }
+
+    fn validate(&self) -> Result<PersistentDiskCreateV1Request> {
+        anyhow::ensure!(
+            self.version == STATE_VERSION,
+            "pending PersistentDisk-create state has an unsupported version"
+        );
+        anyhow::ensure!(
+            canonical_api_origin(&self.origin)? == self.origin,
+            "pending PersistentDisk-create state contains a non-canonical API origin"
+        );
+        let workspace_id = canonical_workspace_id(&self.authenticated_workspace_id)?;
+        anyhow::ensure!(
+            self.method == METHOD
+                && self.content_type == CONTENT_TYPE
+                && self.target == persistent_disk_create_target(&workspace_id),
+            "pending PersistentDisk-create state changed its exact HTTP request binding"
+        );
+        validate_idempotency_key(&self.idempotency_key, "PersistentDisk-create")?;
+        let body = canonical_pending_body(
+            &self.body_base64,
+            &self.request_sha256,
+            "PersistentDisk-create",
+        )?;
+        canonical_persistent_disk_request(&body)
+    }
+
+    fn validate_for_slot(&self, slot: &str) -> Result<()> {
+        let request = self.validate()?;
+        anyhow::ensure!(
+            persistent_disk_request_slot(&self.authenticated_workspace_id, request.name.as_str(),)
+                == slot,
+            "pending PersistentDisk-create state does not bind its storage slot"
+        );
+        Ok(())
+    }
+
+    fn body(&self) -> Result<Vec<u8>> {
+        self.validate()?;
+        URL_SAFE_NO_PAD
+            .decode(&self.body_base64)
+            .context("pending PersistentDisk-create state contains invalid body base64")
+    }
+
+    fn binds(&self, desired: &Self) -> Result<bool> {
+        self.validate()?;
+        desired.validate()?;
+        Ok(self.origin == desired.origin
+            && self.authenticated_workspace_id == desired.authenticated_workspace_id
+            && self.method == desired.method
+            && self.target == desired.target
+            && self.content_type == desired.content_type
+            && self.request_sha256 == desired.request_sha256
+            && self.body_base64 == desired.body_base64)
+    }
+}
+
+/// A held cross-process authority lock plus the exact persisted
+/// PersistentDisk-create request.
+pub(crate) struct PreparedPersistentDiskCreate {
+    state: PendingState,
+    record: PersistentDiskPendingRecord,
+}
+
+impl PreparedPersistentDiskCreate {
+    pub(crate) fn prepare(origin: &str, workspace_id: &str, body: &[u8]) -> Result<Self> {
+        Self::prepare_in(&persistent_disk_state_root()?, origin, workspace_id, body)
+    }
+
+    fn prepare_in(root: &Path, origin: &str, workspace_id: &str, body: &[u8]) -> Result<Self> {
+        let desired = PersistentDiskPendingRecord::new(origin, workspace_id, body)?;
+        let request = desired.validate()?;
+        let slot = persistent_disk_request_slot(
+            &desired.authenticated_workspace_id,
+            request.name.as_str(),
+        );
+        let state = PendingState::acquire(
+            root,
+            &desired.authenticated_workspace_id,
+            &request.name,
+            PERSISTENT_DISK_NAMESPACE,
+            slot,
+        )?;
+        let record: PersistentDiskPendingRecord = match state
+            .load_pending::<PersistentDiskPendingRecord>()?
+        {
+            Some(existing) => {
+                anyhow::ensure!(
+                    existing.binds(&desired)?,
+                    "an unresolved PersistentDisk-create request for this Workspace and Disk name is bound to a different origin, path, or body; no HTTP request was sent (pending {})",
+                    state.pending_path().display()
+                );
+                existing
+            }
+            None => {
+                desired.validate_for_slot(&state.slot)?;
+                state.publish_pending(&desired)?;
+                desired
+            }
+        };
+        record.validate_for_slot(&state.slot)?;
+        Ok(Self { state, record })
+    }
+
+    pub(crate) fn origin(&self) -> &str {
+        &self.record.origin
+    }
+
+    pub(crate) fn target(&self) -> &str {
+        &self.record.target
+    }
+
+    pub(crate) fn content_type(&self) -> &str {
+        &self.record.content_type
+    }
+
+    pub(crate) fn idempotency_key(&self) -> &str {
+        &self.record.idempotency_key
+    }
+
+    pub(crate) fn workspace_id(&self) -> &str {
+        &self.record.authenticated_workspace_id
+    }
+
+    pub(crate) fn request(&self) -> Result<PersistentDiskCreateV1Request> {
+        self.record.validate()
     }
 
     pub(crate) fn body(&self) -> Result<Vec<u8>> {
@@ -232,6 +453,10 @@ fn cat_create_target(workspace_id: &str) -> String {
     format!("/v1/workspaces/{workspace_id}/cats")
 }
 
+fn persistent_disk_create_target(workspace_id: &str) -> String {
+    format!("/v1/workspaces/{workspace_id}/disks")
+}
+
 fn canonical_request(bytes: &[u8]) -> Result<CatCreateV2Request> {
     anyhow::ensure!(
         bytes.len() <= BODY_MAX_BYTES,
@@ -251,6 +476,58 @@ fn canonical_request(bytes: &[u8]) -> Result<CatCreateV2Request> {
     Ok(request)
 }
 
+fn canonical_persistent_disk_request(bytes: &[u8]) -> Result<PersistentDiskCreateV1Request> {
+    anyhow::ensure!(
+        bytes.len() <= BODY_MAX_BYTES,
+        "PersistentDisk-create request exceeds its closed byte limit"
+    );
+    let mut decoder = serde_json::Deserializer::from_slice(bytes);
+    let request = PersistentDiskCreateV1Request::deserialize(&mut decoder)
+        .context("parse exact PersistentDisk-create request")?;
+    decoder
+        .end()
+        .context("PersistentDisk-create request has a trailing JSON value")?;
+    request
+        .validate()
+        .context("invalid PersistentDisk-create request")?;
+    anyhow::ensure!(
+        serde_json::to_vec(&request)? == bytes,
+        "PersistentDisk-create request is not the canonical frozen DTO encoding"
+    );
+    Ok(request)
+}
+
+fn validate_idempotency_key(value: &str, description: &str) -> Result<()> {
+    anyhow::ensure!(
+        (1..=512).contains(&value.len()) && value.bytes().all(|byte| (0x20..=0x7e).contains(&byte)),
+        "pending {description} state contains an invalid Idempotency-Key"
+    );
+    Ok(())
+}
+
+fn canonical_pending_body(
+    body_base64: &str,
+    request_sha256: &str,
+    description: &str,
+) -> Result<Vec<u8>> {
+    let body = URL_SAFE_NO_PAD
+        .decode(body_base64)
+        .with_context(|| format!("pending {description} state contains invalid body base64"))?;
+    anyhow::ensure!(
+        URL_SAFE_NO_PAD.encode(&body) == body_base64,
+        "pending {description} body base64 is not canonical"
+    );
+    anyhow::ensure!(
+        body.len() <= BODY_MAX_BYTES,
+        "pending {description} body exceeds its closed byte limit"
+    );
+    anyhow::ensure!(
+        sha256_digest(&body) == request_sha256,
+        "pending {description} body digest does not match"
+    );
+    Ok(body)
+}
+
 fn state_root() -> Result<PathBuf> {
     #[cfg(test)]
     if let Some(root) = TEST_STATE_ROOT.with(|slot| slot.borrow().clone()) {
@@ -262,12 +539,29 @@ fn state_root() -> Result<PathBuf> {
     }
     let config = crate::config::config_path();
     let parent = config.parent().context("Cats config path has no parent")?;
-    Ok(parent.join(STATE_DIRECTORY))
+    Ok(parent.join(CAT_STATE_DIRECTORY))
+}
+
+fn persistent_disk_state_root() -> Result<PathBuf> {
+    #[cfg(test)]
+    if let Some(root) = TEST_PERSISTENT_DISK_STATE_ROOT.with(|slot| slot.borrow().clone()) {
+        return Ok(root);
+    }
+    #[cfg(test)]
+    if let Some(root) = std::env::var_os("CATS_TEST_PERSISTENT_DISK_CREATE_STATE_ROOT") {
+        return Ok(PathBuf::from(root));
+    }
+    let config = crate::config::config_path();
+    let parent = config.parent().context("Cats config path has no parent")?;
+    Ok(parent.join(PERSISTENT_DISK_STATE_DIRECTORY))
 }
 
 #[cfg(test)]
 thread_local! {
     static TEST_STATE_ROOT: std::cell::RefCell<Option<PathBuf>> = const {
+        std::cell::RefCell::new(None)
+    };
+    static TEST_PERSISTENT_DISK_STATE_ROOT: std::cell::RefCell<Option<PathBuf>> = const {
         std::cell::RefCell::new(None)
     };
 }
@@ -296,6 +590,30 @@ impl Drop for TestStateRootGuard {
     }
 }
 
+#[cfg(test)]
+pub(crate) struct TestPersistentDiskStateRootGuard;
+
+#[cfg(test)]
+impl TestPersistentDiskStateRootGuard {
+    pub(crate) fn set(root: PathBuf) -> Self {
+        TEST_PERSISTENT_DISK_STATE_ROOT.with(|slot| {
+            assert!(
+                slot.borrow().is_none(),
+                "PersistentDisk-create test state root is already set"
+            );
+            *slot.borrow_mut() = Some(root);
+        });
+        Self
+    }
+}
+
+#[cfg(test)]
+impl Drop for TestPersistentDiskStateRootGuard {
+    fn drop(&mut self) {
+        TEST_PERSISTENT_DISK_STATE_ROOT.with(|slot| *slot.borrow_mut() = None);
+    }
+}
+
 struct PendingState {
     display_root: PathBuf,
     state_root: StateRoot,
@@ -304,22 +622,30 @@ struct PendingState {
     lock_name: CString,
     lock_identity: FileIdentity,
     slot: String,
+    namespace: PendingNamespace,
 }
 
 impl PendingState {
-    fn acquire(root: &Path, workspace_id: &str, name: &Id) -> Result<Self> {
-        let state_root = StateRoot::open_or_create(root)?;
-        let slot = request_slot(workspace_id, name.as_str());
+    fn acquire(
+        root: &Path,
+        workspace_id: &str,
+        name: &Id,
+        namespace: PendingNamespace,
+        slot: String,
+    ) -> Result<Self> {
+        let state_root = StateRoot::open_or_create(root, namespace.description)?;
         let lock_directory = open_global_lock_directory()?;
-        let namespace = sha256_digest(root.as_os_str().as_bytes());
+        let root_digest = sha256_digest(root.as_os_str().as_bytes());
         let lock_name = c_name(&format!(
-            ".cats-cat-create-v2-{}-{namespace}-{slot}.lock",
-            effective_uid()
+            ".cats-{}-{}-{root_digest}-{slot}.lock",
+            namespace.lock_scope,
+            effective_uid(),
         ))?;
         let (lock, created) = open_state_lock(&lock_directory, &lock_name)?;
         lock.try_lock_exclusive().with_context(|| {
             format!(
-                "another Cat-create invocation for Workspace {workspace_id} and Cat {name} is in progress; no HTTP request was sent"
+                "another {} invocation for Workspace {workspace_id} and resource {name} is in progress; no HTTP request was sent",
+                namespace.description
             )
         })?;
         validate_private_regular_file(&lock, lock_name.to_string_lossy().as_ref())?;
@@ -334,18 +660,24 @@ impl PendingState {
             _lock: lock,
             state_root,
             slot,
+            namespace,
         };
         state.assert_current_authority()?;
         Ok(state)
     }
 
     fn pending_name(&self) -> Result<CString> {
-        c_name(&format!("cat-{}.pending.json", self.slot))
+        c_name(&format!(
+            "{}-{}.pending.json",
+            self.namespace.file_prefix, self.slot
+        ))
     }
 
     fn pending_path(&self) -> PathBuf {
-        self.display_root
-            .join(format!("cat-{}.pending.json", self.slot))
+        self.display_root.join(format!(
+            "{}-{}.pending.json",
+            self.namespace.file_prefix, self.slot
+        ))
     }
 
     fn assert_current_authority(&self) -> Result<()> {
@@ -357,12 +689,16 @@ impl PendingState {
         )?;
         anyhow::ensure!(
             current_lock == self.lock_identity,
-            "Cat-create authority lock identity changed"
+            "{} authority lock identity changed",
+            self.namespace.description
         );
         validate_private_regular_file(&self._lock, self.lock_name.to_string_lossy().as_ref())
     }
 
-    fn load_pending(&self) -> Result<Option<PendingRecord>> {
+    fn load_pending<T>(&self) -> Result<Option<T>>
+    where
+        T: DeserializeOwned + Serialize,
+    {
         self.assert_current_authority()?;
         let name = self.pending_name()?;
         cleanup_publish_temp(&self.state_root.directory, &name)?;
@@ -371,27 +707,23 @@ impl PendingState {
         else {
             return Ok(None);
         };
-        let pending: PendingRecord =
-            serde_json::from_slice(&bytes).context("parse pending Cat-create state")?;
+        let pending: T = serde_json::from_slice(&bytes)
+            .with_context(|| format!("parse pending {} state", self.namespace.description))?;
         anyhow::ensure!(
             serde_json::to_vec(&pending)? == bytes,
-            "pending Cat-create state is not canonical"
-        );
-        let request = pending.validate()?;
-        anyhow::ensure!(
-            request_slot(&pending.authenticated_workspace_id, request.name.as_str()) == self.slot,
-            "pending Cat-create state does not bind its storage slot"
+            "pending {} state is not canonical",
+            self.namespace.description
         );
         Ok(Some(pending))
     }
 
-    fn publish_pending(&self, pending: &PendingRecord) -> Result<()> {
+    fn publish_pending<T: Serialize>(&self, pending: &T) -> Result<()> {
         self.assert_current_authority()?;
-        pending.validate()?;
         let bytes = serde_json::to_vec(pending)?;
         anyhow::ensure!(
             bytes.len() <= PENDING_MAX_BYTES,
-            "pending Cat-create state exceeds its closed byte limit"
+            "pending {} state exceeds its closed byte limit",
+            self.namespace.description
         );
         publish_new(&self.state_root.directory, &self.pending_name()?, &bytes)?;
         self.assert_current_authority()
@@ -403,11 +735,15 @@ impl PendingState {
         match unlink_at(&self.state_root.directory, &name) {
             Ok(()) => {}
             Err(error) if error.kind() == io::ErrorKind::NotFound => {}
-            Err(error) => return Err(error).context("remove pending Cat-create state"),
+            Err(error) => {
+                return Err(error).with_context(|| {
+                    format!("remove pending {} state", self.namespace.description)
+                })
+            }
         }
         sync_directory(
             &self.state_root.directory,
-            "sync pending Cat-create deletion",
+            "sync pending covered-create deletion",
         )?;
         self.assert_current_authority()
     }
@@ -418,20 +754,21 @@ struct StateRoot {
     directory: File,
     entry_name: CString,
     identity: FileIdentity,
+    description: &'static str,
 }
 
 impl StateRoot {
-    fn open_or_create(path: &Path) -> Result<Self> {
+    fn open_or_create(path: &Path, description: &'static str) -> Result<Self> {
         anyhow::ensure!(
             path.is_absolute(),
-            "durable Cat-create state requires an absolute config directory"
+            "durable {description} state requires an absolute config directory"
         );
         let parent_path = path
             .parent()
-            .context("Cat-create state root has no parent")?;
+            .with_context(|| format!("{description} state root has no parent"))?;
         let entry_name = c_os_name(
             path.file_name()
-                .context("Cat-create state root has no basename")?,
+                .with_context(|| format!("{description} state root has no basename"))?,
         )?;
         let parent = StableDirectory::open_or_create(parent_path)?;
         parent.assert_current()?;
@@ -450,6 +787,7 @@ impl StateRoot {
             directory,
             entry_name,
             identity,
+            description,
         };
         root.assert_current()?;
         Ok(root)
@@ -459,7 +797,8 @@ impl StateRoot {
         self.parent.assert_current()?;
         anyhow::ensure!(
             FileIdentity::of(&self.directory)? == self.identity,
-            "Cat-create state-root descriptor changed identity"
+            "{} state-root descriptor changed identity",
+            self.description
         );
         anyhow::ensure!(
             identity_at(
@@ -467,7 +806,8 @@ impl StateRoot {
                 &self.entry_name,
                 libc::AT_SYMLINK_NOFOLLOW,
             )? == self.identity,
-            "Cat-create state root was renamed or replaced"
+            "{} state root was renamed or replaced",
+            self.description
         );
         validate_owned_directory(&self.directory, true)
     }
@@ -710,6 +1050,15 @@ fn request_slot(workspace_id: &str, name: &str) -> String {
     lowercase_hex(&hasher.finalize())
 }
 
+fn persistent_disk_request_slot(workspace_id: &str, name: &str) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(b"cats.persistent-disk-create-v1.pending-slot.v1\0");
+    hasher.update(workspace_id.as_bytes());
+    hasher.update([0]);
+    hasher.update(name.as_bytes());
+    lowercase_hex(&hasher.finalize())
+}
+
 fn sha256_digest(bytes: &[u8]) -> String {
     let mut hasher = Sha256::new();
     hasher.update(bytes);
@@ -746,6 +1095,15 @@ mod tests {
             )
             .unwrap(),
         )
+        .unwrap()
+    }
+
+    fn persistent_disk_body(size_bytes: u64) -> Vec<u8> {
+        serde_json::to_vec(&PersistentDiskCreateV1Request {
+            durability: cats_api::resources::DiskDurability::Strict,
+            name: Id::new("data").unwrap(),
+            size_bytes,
+        })
         .unwrap()
     }
 
@@ -796,6 +1154,75 @@ mod tests {
         let recovered =
             PreparedCatCreate::prepare_in(&root, "https://control.example", "ws_01", &body(2))
                 .unwrap();
+        assert_eq!(recovered.idempotency_key(), key);
+    }
+
+    #[test]
+    fn persistent_disk_restart_recovers_exact_path_body_and_key() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().canonicalize().unwrap().join("disk-state");
+        let first = PreparedPersistentDiskCreate::prepare_in(
+            &root,
+            "https://CONTROL.example:443",
+            "ws_01",
+            &persistent_disk_body(1 << 30),
+        )
+        .unwrap();
+        let key = first.idempotency_key().to_owned();
+        let exact_body = first.body().unwrap();
+        let pending_path = first.pending_path();
+        assert!(pending_path
+            .file_name()
+            .unwrap()
+            .to_string_lossy()
+            .starts_with("disk-"));
+        drop(first);
+
+        let recovered = PreparedPersistentDiskCreate::prepare_in(
+            &root,
+            "https://control.example",
+            "ws_01",
+            &persistent_disk_body(1 << 30),
+        )
+        .unwrap();
+        assert_eq!(recovered.idempotency_key(), key);
+        assert_eq!(recovered.body().unwrap(), exact_body);
+        assert_eq!(recovered.target(), "/v1/workspaces/ws_01/disks");
+        recovered.clear().unwrap();
+        assert!(!pending_path.exists());
+    }
+
+    #[test]
+    fn persistent_disk_incompatible_pending_body_fails_closed() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().canonicalize().unwrap().join("disk-state");
+        let first = PreparedPersistentDiskCreate::prepare_in(
+            &root,
+            "https://control.example",
+            "ws_01",
+            &persistent_disk_body(1 << 30),
+        )
+        .unwrap();
+        let key = first.idempotency_key().to_owned();
+        drop(first);
+        let error = PreparedPersistentDiskCreate::prepare_in(
+            &root,
+            "https://control.example",
+            "ws_01",
+            &persistent_disk_body(2 << 30),
+        )
+        .err()
+        .unwrap();
+        assert!(error
+            .to_string()
+            .contains("different origin, path, or body"));
+        let recovered = PreparedPersistentDiskCreate::prepare_in(
+            &root,
+            "https://control.example",
+            "ws_01",
+            &persistent_disk_body(1 << 30),
+        )
+        .unwrap();
         assert_eq!(recovered.idempotency_key(), key);
     }
 

@@ -10,6 +10,8 @@ use anyhow::{bail, Result};
 
 pub(crate) enum PreparedCatCreate {}
 
+pub(crate) enum PreparedPersistentDiskCreate {}
+
 impl PreparedCatCreate {
     pub(crate) fn prepare(_origin: &str, _workspace_id: &str, _body: &[u8]) -> Result<Self> {
         bail!(
@@ -30,6 +32,56 @@ impl PreparedCatCreate {
     }
 
     pub(crate) fn idempotency_key(&self) -> &str {
+        match *self {}
+    }
+
+    pub(crate) fn body(&self) -> Result<Vec<u8>> {
+        match *self {}
+    }
+
+    pub(crate) fn assert_current(&self) -> Result<()> {
+        match *self {}
+    }
+
+    pub(crate) fn pending_path(&self) -> PathBuf {
+        match *self {}
+    }
+
+    pub(crate) fn clear(&self) -> Result<()> {
+        match *self {}
+    }
+}
+
+impl PreparedPersistentDiskCreate {
+    pub(crate) fn prepare(_origin: &str, _workspace_id: &str, _body: &[u8]) -> Result<Self> {
+        bail!(
+            "durable PersistentDisk-create recovery is unavailable on this platform; no HTTP request was sent"
+        )
+    }
+
+    pub(crate) fn origin(&self) -> &str {
+        match *self {}
+    }
+
+    pub(crate) fn target(&self) -> &str {
+        match *self {}
+    }
+
+    pub(crate) fn content_type(&self) -> &str {
+        match *self {}
+    }
+
+    pub(crate) fn idempotency_key(&self) -> &str {
+        match *self {}
+    }
+
+    pub(crate) fn workspace_id(&self) -> &str {
+        match *self {}
+    }
+
+    pub(crate) fn request(
+        &self,
+    ) -> Result<cats_api::persistent_disk::PersistentDiskCreateV1Request> {
         match *self {}
     }
 
@@ -78,6 +130,12 @@ mod tests {
     #[test]
     fn unsupported_platform_fails_before_request_materialization() {
         let error = PreparedCatCreate::prepare("https://cats.run", "ws_01", b"{}")
+            .err()
+            .unwrap()
+            .to_string();
+        assert!(error.contains("no HTTP request was sent"));
+
+        let error = PreparedPersistentDiskCreate::prepare("https://cats.run", "ws_01", b"{}")
             .err()
             .unwrap()
             .to_string();

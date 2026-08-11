@@ -27,15 +27,16 @@ use cats_api::runtime_reconciliation::{
 use cats_storage::authority::{RemoteHead, VolumeAdminState, VolumeDurability, VolumeRecord};
 use serde::Deserialize;
 
+use super::covered_commit::{CommitResolutionRegistry, CoveredCommitCancellation};
 use super::placement_planner::PlacementTargetSnapshot;
 use super::product::{
     api_request_fingerprint, encode_cat_create_accepted_response,
     encode_cat_name_conflict_response, ApiIdempotencyRequest, ApiIdempotencyResult,
-    CatCreateCandidate, CatCreateCommitCancellation, CatCreateEnvelopes, CoveredCatCreateError,
-    CoveredCatCreateRequest, DiskAdminState, DiskRecordCandidate, DiskRole,
-    EndpointRecordCandidate, ExactContentType, ExactHttpResponse, HostnameDesiredLookup,
-    IfMatchFingerprint,
+    CatCreateCandidate, CatCreateEnvelopes, CoveredCatCreateError, CoveredCatCreateRequest,
+    DiskAdminState, DiskRecordCandidate, DiskRole, EndpointRecordCandidate, ExactContentType,
+    ExactHttpResponse, HostnameDesiredLookup, IfMatchFingerprint,
 };
+use super::product_identity::ProductIdentitySource;
 use super::runtime_spine::PLACEMENT_INVENTORY_MAX_AGE_MS;
 use crate::store::{Result, Store};
 
@@ -277,22 +278,6 @@ pub(crate) trait CatCreatePlacementPlanner: Send + Sync {
     ) -> ServiceFuture<'a, CatCreatePlacementOutcome>;
 }
 
-pub(crate) trait CatCreateIdentitySource: Send + Sync {
-    fn random_id(&self) -> Result<RandomId128>;
-}
-
-#[derive(Debug, Default)]
-pub(crate) struct UuidCatCreateIdentitySource;
-
-impl CatCreateIdentitySource for UuidCatCreateIdentitySource {
-    fn random_id(&self) -> Result<RandomId128> {
-        // UUID v4 fixes non-zero version and variant bits, so the canonical
-        // 128-bit random identity can never be the forbidden all-zero value.
-        RandomId128::new(uuid::Uuid::new_v4().simple().to_string())
-            .ok_or_else(|| ApiError::internal("UUID v4 did not form a RandomId128"))
-    }
-}
-
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct CatCreateIdentities {
     cat: RandomId128,
@@ -307,7 +292,7 @@ struct CatCreateIdentities {
 }
 
 impl CatCreateIdentities {
-    fn generate(source: &dyn CatCreateIdentitySource) -> Result<Self> {
+    fn generate(source: &dyn ProductIdentitySource) -> Result<Self> {
         Ok(Self {
             cat: source.random_id()?,
             disk: source.random_id()?,
@@ -372,7 +357,7 @@ pub(crate) struct CatCreateService {
     store: Arc<Store>,
     manifests: Arc<dyn CatCreateManifestResolver>,
     planner: Arc<dyn CatCreatePlacementPlanner>,
-    identities: Arc<dyn CatCreateIdentitySource>,
+    identities: Arc<dyn ProductIdentitySource>,
     guest_config_digest: Sha256Digest,
     commit_resolutions: Arc<CommitResolutionRegistry>,
     admission: tokio::sync::watch::Sender<bool>,
@@ -380,47 +365,12 @@ pub(crate) struct CatCreateService {
     planner_calls: std::sync::atomic::AtomicUsize,
 }
 
-#[derive(Default)]
-struct CommitResolutionRegistry {
-    active: std::sync::atomic::AtomicUsize,
-    changed: tokio::sync::Notify,
-}
-
-struct ActiveCommitResolution(Arc<CommitResolutionRegistry>);
-
-impl CommitResolutionRegistry {
-    fn begin(self: &Arc<Self>) -> ActiveCommitResolution {
-        self.active
-            .fetch_add(1, std::sync::atomic::Ordering::AcqRel);
-        ActiveCommitResolution(Arc::clone(self))
-    }
-
-    async fn wait_empty(&self) {
-        loop {
-            let changed = self.changed.notified();
-            if self.active.load(std::sync::atomic::Ordering::Acquire) == 0 {
-                return;
-            }
-            changed.await;
-        }
-    }
-}
-
-impl Drop for ActiveCommitResolution {
-    fn drop(&mut self) {
-        self.0
-            .active
-            .fetch_sub(1, std::sync::atomic::Ordering::AcqRel);
-        self.0.changed.notify_waiters();
-    }
-}
-
 impl CatCreateService {
     pub(crate) fn new(
         store: Arc<Store>,
         manifests: Arc<dyn CatCreateManifestResolver>,
         planner: Arc<dyn CatCreatePlacementPlanner>,
-        identities: Arc<dyn CatCreateIdentitySource>,
+        identities: Arc<dyn ProductIdentitySource>,
         active_release_receipt: &GuestRuntimeProfileReceipt,
     ) -> Result<Self> {
         let guest_config_digest = guest_config_digest(active_release_receipt)
@@ -462,7 +412,7 @@ impl CatCreateService {
         if let Some(result) = await_cat_create_before_deadline(
             absolute_deadline,
             self.store
-                .execute(move |store| store.cat_create_result_fast_lookup(&fast_request)),
+                .execute(move |store| store.covered_api_result_fast_lookup(&fast_request)),
         )
         .await
         .map_err(CatCreateServiceError::from_api)?
@@ -538,7 +488,7 @@ impl CatCreateService {
         .map_err(CatCreateServiceError::from_api)?;
         let resolution_request = covered.idempotency.clone();
         let (commit_cancellation, commit_state) =
-            CatCreateCommitCancellation::new(absolute_deadline);
+            CoveredCommitCancellation::new("Cat create", absolute_deadline);
         let commit_observer = commit_state.clone();
         let cancellation_observer = commit_state.clone();
         // Register an owner before the Store job starts. The request handler
@@ -646,18 +596,14 @@ impl CatCreateService {
         .map_err(|_| {
             ApiError::unavailable(format!(
                 "{} Cat create commit resolutions remain after shutdown deadline",
-                self.commit_resolutions
-                    .active
-                    .load(std::sync::atomic::Ordering::Acquire)
+                self.commit_resolutions.active()
             ))
         })
     }
 
     #[cfg(test)]
     pub(crate) fn active_commit_resolutions(&self) -> usize {
-        self.commit_resolutions
-            .active
-            .load(std::sync::atomic::Ordering::Acquire)
+        self.commit_resolutions.active()
     }
 
     #[cfg(test)]
@@ -699,7 +645,7 @@ async fn resolve_cat_create_commit_loop(
     loop {
         let lookup = request.clone();
         match store
-            .execute(move |store| store.cat_create_result_after_commit(&lookup))
+            .execute(move |store| store.covered_api_result_after_commit(&lookup))
             .await
         {
             Ok(Some(result)) => return Ok(result),

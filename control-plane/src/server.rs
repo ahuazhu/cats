@@ -504,6 +504,9 @@ pub struct AppState {
     pub storage_meta: Arc<dyn MetadataStore>,
     pub(crate) cat_create:
         Arc<crate::store::runtime_authority::cat_create_service::CatCreateService>,
+    pub(crate) persistent_disk_create: Arc<
+        crate::store::runtime_authority::persistent_disk_create_service::PersistentDiskCreateService,
+    >,
     pub(crate) readiness: Arc<ReadinessLatch>,
     pub notify: Arc<tokio::sync::Notify>,
     pub controller: Arc<Controller>,
@@ -565,6 +568,7 @@ impl Handle {
             listener.begin_shutdown();
         }
         self.state.cat_create.begin_shutdown();
+        self.state.persistent_disk_create.begin_shutdown();
         self.state
             .runtime_volume_transition_service
             .begin_shutdown();
@@ -597,6 +601,10 @@ impl Handle {
         let volume_transitions = self.state.runtime_volume_transition_service.shutdown();
         let route_resolutions = self.state.route_resolve_admission.shutdown();
         let commit_resolutions = self.state.cat_create.shutdown_commit_resolutions();
+        let persistent_disk_commit_resolutions = self
+            .state
+            .persistent_disk_create
+            .shutdown_commit_resolutions();
         let node_authority_resolutions = self
             .state
             .runtime_node_authority
@@ -614,6 +622,7 @@ impl Handle {
             transition_result,
             route_result,
             commit_result,
+            persistent_disk_commit_result,
             node_authority_result,
             manifest_result,
             gateway_machine_result,
@@ -622,6 +631,7 @@ impl Handle {
             volume_transitions,
             route_resolutions,
             commit_resolutions,
+            persistent_disk_commit_resolutions,
             node_authority_resolutions,
             manifest_reads,
             gateway_machine
@@ -636,6 +646,7 @@ impl Handle {
         route_result?;
         gateway_machine_result?;
         commit_result.map_err(anyhow::Error::from)?;
+        persistent_disk_commit_result.map_err(anyhow::Error::from)?;
         node_authority_result.map_err(anyhow::Error::from)
     }
 }
@@ -971,6 +982,9 @@ async fn spawn_inner(
             cfg.image_blob.clone(),
         ),
     );
+    let product_identities: Arc<
+        dyn crate::store::runtime_authority::product_identity::ProductIdentitySource,
+    > = Arc::new(crate::store::runtime_authority::product_identity::UuidProductIdentitySource);
     let cat_create = Arc::new(
         crate::store::runtime_authority::cat_create_service::CatCreateService::new(
             store.clone(),
@@ -980,11 +994,15 @@ async fn spawn_inner(
                     store.clone(),
                 ),
             ),
-            Arc::new(
-                crate::store::runtime_authority::cat_create_service::UuidCatCreateIdentitySource,
-            ),
+            Arc::clone(&product_identities),
             &cfg.guest_runtime_profile_receipt,
         )?,
+    );
+    let persistent_disk_create = Arc::new(
+        crate::store::runtime_authority::persistent_disk_create_service::PersistentDiskCreateService::new(
+            store.clone(),
+            product_identities,
+        ),
     );
     let readiness = Arc::new(ReadinessLatch::new());
     let notify = Arc::new(tokio::sync::Notify::new());
@@ -1015,6 +1033,7 @@ async fn spawn_inner(
         credits,
         storage_meta,
         cat_create,
+        persistent_disk_create,
         readiness,
         notify,
         controller: controller.clone(),

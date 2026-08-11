@@ -37,6 +37,9 @@ use anyhow::{anyhow, bail, Context, Result};
 use cats_api::cat_create::{
     decode_cat_create_v2_accepted_response, CatCreateV2AcceptedResponse, CatCreateV2Request,
 };
+use cats_api::persistent_disk::{
+    PersistentDiskCreateV1Request, PERSISTENT_DISK_NAME_CONFLICT_BODY,
+};
 use clap::{Args, Parser, Subcommand};
 use serde_json::json;
 
@@ -562,31 +565,31 @@ impl Client {
         Ok((status, body))
     }
 
-    fn send_cat_create(
+    fn send_exact_create(
         &self,
-        pending: &cat_create_pending::PreparedCatCreate,
-    ) -> Result<CatCreateHttpResponse> {
+        description: &str,
+        origin: &str,
+        target: &str,
+        content_type: &str,
+        idempotency_key: &str,
+        body: Vec<u8>,
+    ) -> Result<ExactCreateHttpResponse> {
         const MAX_RESPONSE_BYTES: usize = 64 * 1024;
 
-        pending.assert_current()?;
-        anyhow::ensure!(
-            pending.origin() == self.base,
-            "pending Cat-create request is bound to a different API origin"
-        );
-        let exact_url = format!("{}{}", pending.origin(), pending.target());
+        let exact_url = format!("{origin}{target}");
         let response = self
             .http
             .post(&exact_url)
             .bearer_auth(&self.token)
             .header(reqwest::header::ACCEPT, "application/json")
-            .header(reqwest::header::CONTENT_TYPE, pending.content_type())
-            .header("Idempotency-Key", pending.idempotency_key())
-            .body(pending.body()?)
+            .header(reqwest::header::CONTENT_TYPE, content_type)
+            .header("Idempotency-Key", idempotency_key)
+            .body(body)
             .send()
             .context("control plane unreachable")?;
         anyhow::ensure!(
             response.url().as_str() == exact_url,
-            "Cat-create request did not remain on its exact canonical URL"
+            "{description} request did not remain on its exact canonical URL"
         );
         let status = response.status();
         let content_types = response
@@ -608,14 +611,52 @@ impl Client {
             .context("read control-plane response")?;
         anyhow::ensure!(
             body.len() <= MAX_RESPONSE_BYTES,
-            "Cat-create response exceeds its closed byte limit"
+            "{description} response exceeds its closed byte limit"
         );
-        Ok(CatCreateHttpResponse {
+        Ok(ExactCreateHttpResponse {
             status,
             content_types,
             content_encodings,
             body,
         })
+    }
+
+    fn send_cat_create(
+        &self,
+        pending: &cat_create_pending::PreparedCatCreate,
+    ) -> Result<ExactCreateHttpResponse> {
+        pending.assert_current()?;
+        anyhow::ensure!(
+            pending.origin() == self.base,
+            "pending Cat-create request is bound to a different API origin"
+        );
+        self.send_exact_create(
+            "Cat-create",
+            pending.origin(),
+            pending.target(),
+            pending.content_type(),
+            pending.idempotency_key(),
+            pending.body()?,
+        )
+    }
+
+    fn send_persistent_disk_create(
+        &self,
+        pending: &cat_create_pending::PreparedPersistentDiskCreate,
+    ) -> Result<ExactCreateHttpResponse> {
+        pending.assert_current()?;
+        anyhow::ensure!(
+            pending.origin() == self.base && pending.workspace_id() == self.workspace_id,
+            "pending PersistentDisk-create request is bound to a different API origin or Workspace"
+        );
+        self.send_exact_create(
+            "PersistentDisk-create",
+            pending.origin(),
+            pending.target(),
+            pending.content_type(),
+            pending.idempotency_key(),
+            pending.body()?,
+        )
     }
 
     fn get(&self, path: &str) -> Result<serde_json::Value> {
@@ -769,6 +810,9 @@ fn runtime_cutover_unsupported(command: &Command) -> Option<&'static str> {
         | Command::Shell { .. }
         | Command::Sleep { .. }
         | Command::Expiry { .. } => Some("Cat lifecycle"),
+        Command::Disk {
+            cmd: DiskCommand::Create { .. },
+        } => None,
         Command::Disk { .. } | Command::Mount { .. } | Command::Unmount { .. } => {
             Some("PersistentDisk")
         }
@@ -1649,17 +1693,67 @@ fn run_disk(client: &Client, cli: &Cli, cmd: &DiskCommand) -> Result<()> {
             size,
             durability,
         } => {
-            let v = client.post(
-                "/disks",
-                Some(json!({
-                    "name": name,
-                    "size_bytes": parse_size(size)?,
-                    "durability": durability,
-                })),
+            let request = PersistentDiskCreateV1Request {
+                durability: DiskDurability::parse(durability)
+                    .context("invalid PersistentDisk durability")?,
+                name: cats_api::runtime_reconciliation::Id::new(name.clone())
+                    .context("invalid PersistentDisk name")?,
+                size_bytes: parse_size(size)?,
+            };
+            request
+                .validate()
+                .context("invalid PersistentDisk-create request")?;
+            let request_body = serde_json::to_vec(&request)?;
+            let pending = cat_create_pending::PreparedPersistentDiskCreate::prepare(
+                &client.base,
+                &client.workspace_id,
+                &request_body,
+            )
+            .context(
+                "could not durably prepare PersistentDisk-create recovery state; no HTTP request was sent",
             )?;
-            let disk: Disk = serde_json::from_value(v)?;
-            print_disk(&disk, cli.json);
-            Ok(())
+            let response = client
+                .send_persistent_disk_create(&pending)
+                .with_context(|| {
+                    format!(
+                        "PersistentDisk-create response is ambiguous; the exact path, body, and Idempotency-Key remain pending at {}",
+                        pending.pending_path().display()
+                    )
+                })?;
+            match classify_persistent_disk_create_response(&response, &pending)? {
+                PersistentDiskCreateResponseClassification::Created(disk) => {
+                    print_disk(&disk, cli.json);
+                    std::io::stdout()
+                        .flush()
+                        .context("flush created PersistentDisk identity before cleanup")?;
+                    pending.clear().context(
+                        "PersistentDisk-create committed and was reported, but its pending recovery state could not be durably cleared",
+                    )?;
+                    Ok(())
+                }
+                PersistentDiskCreateResponseClassification::NameConflict => {
+                    pending.clear().context(
+                        "PersistentDisk name conflict is terminal, but its pending recovery state could not be durably cleared",
+                    )?;
+                    bail!("disk name already exists (AlreadyExists)")
+                }
+                PersistentDiskCreateResponseClassification::Nonterminal => {
+                    let detail =
+                        serde_json::from_slice::<cats_api::error::ErrorBody>(&response.body)
+                            .map(|error| format!("{} ({:?})", error.message, error.code))
+                            .unwrap_or_else(|_| {
+                                format!(
+                                    "HTTP {}: {}",
+                                    response.status,
+                                    String::from_utf8_lossy(&response.body)
+                                )
+                            });
+                    bail!(
+                        "PersistentDisk-create response was not an exact terminal result ({detail}); replay the same command to reuse the pending Idempotency-Key at {}",
+                        pending.pending_path().display()
+                    )
+                }
+            }
         }
         DiskCommand::Ls => {
             let v = client.get("/disks")?;
@@ -1723,7 +1817,7 @@ fn unix_now() -> i64 {
 const CAT_CREATE_NAME_CONFLICT_BODY: &[u8] =
     br#"{"code":"already_exists","message":"cat name already exists"}"#;
 
-struct CatCreateHttpResponse {
+struct ExactCreateHttpResponse {
     status: reqwest::StatusCode,
     content_types: Vec<Vec<u8>>,
     content_encodings: Vec<Vec<u8>>,
@@ -1737,7 +1831,7 @@ enum CatCreateResponseClassification {
 }
 
 fn classify_cat_create_response(
-    response: &CatCreateHttpResponse,
+    response: &ExactCreateHttpResponse,
 ) -> CatCreateResponseClassification {
     let exact_json_identity = response.content_types.as_slice() == [b"application/json"]
         && response.content_encodings.is_empty();
@@ -1756,6 +1850,59 @@ fn classify_cat_create_response(
         return CatCreateResponseClassification::NameConflict;
     }
     CatCreateResponseClassification::Nonterminal
+}
+
+enum PersistentDiskCreateResponseClassification {
+    Created(Disk),
+    NameConflict,
+    Nonterminal,
+}
+
+fn classify_persistent_disk_create_response(
+    response: &ExactCreateHttpResponse,
+    pending: &cat_create_pending::PreparedPersistentDiskCreate,
+) -> Result<PersistentDiskCreateResponseClassification> {
+    let exact_json_identity = response.content_types.as_slice() == [b"application/json"]
+        && response.content_encodings.is_empty();
+    if !exact_json_identity {
+        return Ok(PersistentDiskCreateResponseClassification::Nonterminal);
+    }
+    if response.status == reqwest::StatusCode::CREATED {
+        let Ok(disk) = serde_json::from_slice::<Disk>(&response.body) else {
+            return Ok(PersistentDiskCreateResponseClassification::Nonterminal);
+        };
+        if serde_json::to_vec(&disk).ok().as_deref() != Some(response.body.as_slice()) {
+            return Ok(PersistentDiskCreateResponseClassification::Nonterminal);
+        }
+        let request = pending.request()?;
+        let exact = disk.workspace_id == pending.workspace_id()
+            && disk.name == request.name.as_str()
+            && disk.kind == DiskKind::Persistent
+            && disk.size_bytes == request.size_bytes
+            && disk.state == DiskState::Available
+            && disk.durability == request.durability
+            && disk.bound_cat_id.is_none()
+            && disk.created_at_unix >= 0
+            && exact_product_identity(&disk.id, "disk_")
+            && exact_product_identity(&disk.volume_id, "vol_");
+        if exact {
+            return Ok(PersistentDiskCreateResponseClassification::Created(disk));
+        }
+    } else if response.status == reqwest::StatusCode::CONFLICT
+        && response.body == PERSISTENT_DISK_NAME_CONFLICT_BODY
+    {
+        return Ok(PersistentDiskCreateResponseClassification::NameConflict);
+    }
+    Ok(PersistentDiskCreateResponseClassification::Nonterminal)
+}
+
+fn exact_product_identity(value: &str, prefix: &str) -> bool {
+    value.strip_prefix(prefix).is_some_and(|random| {
+        random.len() == 32
+            && random
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    })
 }
 
 #[cfg(test)]
@@ -2190,6 +2337,67 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
+    fn persistent_disk_create_sends_one_exact_covered_request() {
+        use clap::Parser as _;
+        use std::io::Write as _;
+
+        let state_directory = tempfile::tempdir().unwrap();
+        let state_root = state_directory.path().canonicalize().unwrap().join("state");
+        let _state_guard =
+            cat_create_pending::TestPersistentDiskStateRootGuard::set(state_root.clone());
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let captured = read_request(&mut stream);
+            let response = br#"{"id":"disk_11111111111111111111111111111111","workspace_id":"ws_01","name":"data","kind":"persistent","size_bytes":1073741824,"state":"available","durability":"strict","volume_id":"vol_22222222222222222222222222222222","created_at_unix":1720000000}"#;
+            write!(
+                stream,
+                "HTTP/1.1 201 Created\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                response.len()
+            )
+            .unwrap();
+            stream.write_all(response).unwrap();
+            stream.flush().unwrap();
+            captured
+        });
+        let base = format!("http://{address}");
+        let cli = Cli::parse_from([
+            "cats",
+            "--api-url",
+            &base,
+            "--token",
+            "test-token",
+            "--workspace",
+            "ws_01",
+            "disk",
+            "create",
+            "data",
+            "--size",
+            "1GiB",
+            "--durability",
+            "strict",
+        ]);
+        run(cli).unwrap();
+        let (headers, body) = server.join().unwrap();
+        assert!(headers.starts_with("POST /v1/workspaces/ws_01/disks HTTP/1.1\r\n"));
+        assert_eq!(request_header(&headers, "content-type"), "application/json");
+        assert!(request_header(&headers, "idempotency-key").starts_with("cli-"));
+        assert_eq!(
+            body,
+            br#"{"durability":"strict","name":"data","size_bytes":1073741824}"#
+        );
+        assert!(std::fs::read_dir(state_root).unwrap().all(|entry| {
+            !entry
+                .unwrap()
+                .file_name()
+                .to_string_lossy()
+                .ends_with(".pending.json")
+        }));
+    }
+
+    #[cfg(unix)]
+    #[test]
     fn cat_create_restart_process_helper() {
         use clap::Parser as _;
 
@@ -2217,6 +2425,41 @@ mod tests {
             "4GiB",
             "--durability",
             "relaxed",
+        ]);
+        match mode.to_string_lossy().as_ref() {
+            "lost" => {
+                let error = run(cli).expect_err("the committed response is deliberately dropped");
+                assert!(error.to_string().contains("ambiguous"), "{error:#}");
+            }
+            "replay" => run(cli).unwrap(),
+            unexpected => panic!("unexpected helper mode {unexpected}"),
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn persistent_disk_create_restart_process_helper() {
+        use clap::Parser as _;
+
+        let Some(mode) = std::env::var_os("CATS_TEST_PERSISTENT_DISK_CREATE_HELPER_MODE") else {
+            return;
+        };
+        let base = std::env::var("CATS_TEST_PERSISTENT_DISK_CREATE_HELPER_BASE").unwrap();
+        let cli = Cli::parse_from([
+            "cats",
+            "--api-url",
+            &base,
+            "--token",
+            "test-token",
+            "--workspace",
+            "ws_01",
+            "disk",
+            "create",
+            "data",
+            "--size",
+            "1GiB",
+            "--durability",
+            "strict",
         ]);
         match mode.to_string_lossy().as_ref() {
             "lost" => {
@@ -2330,6 +2573,101 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
+    fn persistent_disk_response_loss_process_restart_replays_one_disk_exactly() {
+        use std::collections::HashMap;
+        use std::io::Write as _;
+        use std::process::Command as ProcessCommand;
+
+        let state_directory = tempfile::tempdir().unwrap();
+        let state_root = state_directory.path().canonicalize().unwrap().join("state");
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        let server_state_root = state_root.clone();
+        let server = std::thread::spawn(move || {
+            let mut requests = Vec::new();
+            let mut results = HashMap::new();
+            for attempt in 0..2 {
+                let (mut stream, _) = listener.accept().unwrap();
+                let (headers, body) = read_request(&mut stream);
+                assert!(std::fs::read_dir(&server_state_root).unwrap().any(|entry| {
+                    entry
+                        .unwrap()
+                        .file_name()
+                        .to_string_lossy()
+                        .ends_with(".pending.json")
+                }));
+                let first_line = headers.lines().next().unwrap().to_owned();
+                let key = request_header(&headers, "Idempotency-Key");
+                requests.push((first_line, body, key.clone()));
+                let response = results.entry(key).or_insert_with(|| {
+                    br#"{"id":"disk_11111111111111111111111111111111","workspace_id":"ws_01","name":"data","kind":"persistent","size_bytes":1073741824,"state":"available","durability":"strict","volume_id":"vol_22222222222222222222222222222222","created_at_unix":1720000000}"#.to_vec()
+                });
+                if attempt == 0 {
+                    // The authoritative Disk+Volume+result transaction is
+                    // complete, but the client sees no response bytes.
+                    drop(stream);
+                    continue;
+                }
+                write!(
+                    stream,
+                    "HTTP/1.1 201 Created\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                    response.len()
+                )
+                .unwrap();
+                stream.write_all(response).unwrap();
+                stream.flush().unwrap();
+            }
+            (requests, results.len())
+        });
+
+        let helper = "tests::persistent_disk_create_restart_process_helper";
+        let executable = std::env::current_exe().unwrap();
+        let invoke = |mode: &str| {
+            ProcessCommand::new(&executable)
+                .args(["--exact", helper, "--nocapture"])
+                .env("CATS_TEST_PERSISTENT_DISK_CREATE_HELPER_MODE", mode)
+                .env("CATS_TEST_PERSISTENT_DISK_CREATE_HELPER_BASE", &base)
+                .env("CATS_TEST_PERSISTENT_DISK_CREATE_STATE_ROOT", &state_root)
+                .output()
+                .unwrap()
+        };
+        let lost = invoke("lost");
+        assert!(
+            lost.status.success(),
+            "lost-response helper failed:\nstdout={}\nstderr={}",
+            String::from_utf8_lossy(&lost.stdout),
+            String::from_utf8_lossy(&lost.stderr)
+        );
+        let replay = invoke("replay");
+        assert!(
+            replay.status.success(),
+            "replay helper failed:\nstdout={}\nstderr={}",
+            String::from_utf8_lossy(&replay.stdout),
+            String::from_utf8_lossy(&replay.stderr)
+        );
+        assert!(String::from_utf8_lossy(&replay.stdout).contains("data"));
+
+        let (requests, result_count) = server.join().unwrap();
+        assert_eq!(result_count, 1);
+        assert_eq!(requests.len(), 2);
+        assert_eq!(requests[0], requests[1]);
+        assert_eq!(requests[0].0, "POST /v1/workspaces/ws_01/disks HTTP/1.1");
+        assert_eq!(
+            requests[0].1,
+            br#"{"durability":"strict","name":"data","size_bytes":1073741824}"#
+        );
+        assert!(requests[0].2.starts_with("cli-"));
+        assert!(std::fs::read_dir(&state_root).unwrap().all(|entry| {
+            !entry
+                .unwrap()
+                .file_name()
+                .to_string_lossy()
+                .ends_with(".pending.json")
+        }));
+    }
+
+    #[cfg(unix)]
+    #[test]
     fn exact_name_conflict_is_terminal_and_durably_clears_pending_state() {
         use clap::Parser as _;
         use std::io::Write as _;
@@ -2378,7 +2716,7 @@ mod tests {
 
     #[test]
     fn cat_create_response_classification_is_exact_and_closed() {
-        let response = |status, body: &[u8]| CatCreateHttpResponse {
+        let response = |status, body: &[u8]| ExactCreateHttpResponse {
             status,
             content_types: vec![b"application/json".to_vec()],
             content_encodings: Vec::new(),
@@ -2428,6 +2766,67 @@ mod tests {
         ));
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn persistent_disk_response_classification_is_exact_and_closed() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().canonicalize().unwrap().join("state");
+        let _state_guard = cat_create_pending::TestPersistentDiskStateRootGuard::set(root.clone());
+        let request = PersistentDiskCreateV1Request {
+            durability: DiskDurability::Strict,
+            name: cats_api::runtime_reconciliation::Id::new("data").unwrap(),
+            size_bytes: 1 << 30,
+        };
+        let pending = cat_create_pending::PreparedPersistentDiskCreate::prepare(
+            "https://control.example",
+            "ws_01",
+            &serde_json::to_vec(&request).unwrap(),
+        )
+        .unwrap();
+        let response = |status, body: &[u8]| ExactCreateHttpResponse {
+            status,
+            content_types: vec![b"application/json".to_vec()],
+            content_encodings: Vec::new(),
+            body: body.to_vec(),
+        };
+        let exact = br#"{"id":"disk_11111111111111111111111111111111","workspace_id":"ws_01","name":"data","kind":"persistent","size_bytes":1073741824,"state":"available","durability":"strict","volume_id":"vol_22222222222222222222222222222222","created_at_unix":1720000000}"#;
+        assert!(matches!(
+            classify_persistent_disk_create_response(
+                &response(reqwest::StatusCode::CREATED, exact),
+                &pending,
+            )
+            .unwrap(),
+            PersistentDiskCreateResponseClassification::Created(_)
+        ));
+        assert!(matches!(
+            classify_persistent_disk_create_response(
+                &response(
+                    reqwest::StatusCode::CONFLICT,
+                    PERSISTENT_DISK_NAME_CONFLICT_BODY,
+                ),
+                &pending,
+            )
+            .unwrap(),
+            PersistentDiskCreateResponseClassification::NameConflict
+        ));
+        for closed in [
+            response(reqwest::StatusCode::OK, exact),
+            response(
+                reqwest::StatusCode::CREATED,
+                br#"{ "id":"disk_11111111111111111111111111111111","workspace_id":"ws_01","name":"data","kind":"persistent","size_bytes":1073741824,"state":"available","durability":"strict","volume_id":"vol_22222222222222222222222222222222","created_at_unix":1720000000}"#,
+            ),
+            response(
+                reqwest::StatusCode::CREATED,
+                br#"{"id":"disk_11111111111111111111111111111111","workspace_id":"ws_02","name":"data","kind":"persistent","size_bytes":1073741824,"state":"available","durability":"strict","volume_id":"vol_22222222222222222222222222222222","created_at_unix":1720000000}"#,
+            ),
+        ] {
+            assert!(matches!(
+                classify_persistent_disk_create_response(&closed, &pending).unwrap(),
+                PersistentDiskCreateResponseClassification::Nonterminal
+            ));
+        }
+    }
+
     #[test]
     fn every_retired_product_command_fails_before_any_outbound_request() {
         use clap::Parser;
@@ -2458,7 +2857,6 @@ mod tests {
             &["sleep", "off", "app"],
             &["sleep", "status", "app"],
             &["expiry", "app"],
-            &["disk", "create", "data", "--size", "1GiB"],
             &["disk", "ls"],
             &["disk", "get", "data"],
             &["disk", "resize", "data", "--size", "2GiB"],

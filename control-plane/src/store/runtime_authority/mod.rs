@@ -1,12 +1,15 @@
 //! PostgreSQL persistence for the ADR-0042 volume authority core.
 
 pub(crate) mod cat_create_service;
+mod covered_commit;
 pub(crate) mod gateway_identity;
 pub(crate) mod image_manifest_resolver;
+pub(crate) mod persistent_disk_create_service;
 pub(super) mod pg_codec;
 pub(crate) mod placement_planner;
 pub(crate) mod placement_policy;
 mod product;
+pub(crate) mod product_identity;
 mod product_rows;
 pub(crate) mod route_signer;
 pub(crate) mod route_signing_authority;
@@ -26,6 +29,9 @@ pub(crate) mod volume_transition_evidence;
 
 #[cfg(test)]
 pub(crate) mod cat_create_service_tests;
+
+#[cfg(test)]
+mod persistent_disk_create_service_tests;
 
 #[cfg(test)]
 mod product_tests;

@@ -739,8 +739,10 @@ fn persistent_disk_closed_codec_round_trips_both_states_and_detects_projection_d
     let (url, store, _second, workspace) = stores();
     let uninitialized_volume = blank_volume("volume_persistent_blank");
     let initialized_volume = blank_volume("volume_persistent_initialized");
-    let token = random_id(7001);
-    let filesystem_uuid = random_id(7002);
+    let uninitialized_token = random_id(7001);
+    let uninitialized_filesystem_uuid = random_id(7002);
+    let initialized_token = random_id(7003);
+    let initialized_filesystem_uuid = random_id(7004);
     let initialized_head = RemoteHead {
         generation: generation(1),
         root_hash: Some(Sha256Digest::from_bytes([7; 32])),
@@ -752,8 +754,8 @@ fn persistent_disk_closed_codec_round_trips_both_states_and_detects_projection_d
         "persistent-blank",
         &uninitialized_volume,
         PersistentDiskInitialization::Uninitialized {
-            initialization_token: token.clone(),
-            filesystem_uuid: filesystem_uuid.clone(),
+            initialization_token: uninitialized_token,
+            filesystem_uuid: uninitialized_filesystem_uuid,
             expected_blank_head: uninitialized_volume.head.clone(),
         },
     );
@@ -763,8 +765,8 @@ fn persistent_disk_closed_codec_round_trips_both_states_and_detects_projection_d
         "persistent-initialized",
         &initialized_volume,
         PersistentDiskInitialization::Initialized {
-            initialization_token: token,
-            filesystem_uuid,
+            initialization_token: initialized_token,
+            filesystem_uuid: initialized_filesystem_uuid,
             expected_blank_head: initialized_volume.head.clone(),
             initialized_head,
             initialized_at: unix_millis(456),
@@ -868,7 +870,7 @@ fn first_create_and_lost_response_replay_are_exact_and_atomic() {
     let (url, store, _second, workspace) = stores();
     let request = request(&workspace, "demo", 1, "key-1");
     assert!(store
-        .cat_create_result_fast_lookup(&request.idempotency)
+        .covered_api_result_fast_lookup(&request.idempotency)
         .unwrap()
         .is_none());
     let first = store
@@ -896,7 +898,7 @@ fn first_create_and_lost_response_replay_are_exact_and_atomic() {
     assert_eq!(replay, first);
     assert_eq!(
         store
-            .cat_create_result_fast_lookup(&request.idempotency)
+            .covered_api_result_fast_lookup(&request.idempotency)
             .unwrap(),
         Some(first.clone())
     );
@@ -1026,11 +1028,11 @@ fn fast_miss_same_key_race_commits_only_one_candidate_bundle() {
     second_request.idempotency.request_fingerprint =
         first_request.idempotency.request_fingerprint.clone();
     assert!(first
-        .cat_create_result_fast_lookup(&first_request.idempotency)
+        .covered_api_result_fast_lookup(&first_request.idempotency)
         .unwrap()
         .is_none());
     assert!(second
-        .cat_create_result_fast_lookup(&second_request.idempotency)
+        .covered_api_result_fast_lookup(&second_request.idempotency)
         .unwrap()
         .is_none());
     let saved_first = first_request.clone();
@@ -1970,7 +1972,7 @@ fn corrupt_api_result_fails_both_fast_and_transactional_reads_closed() {
         .unwrap();
 
     let fast = store
-        .cat_create_result_fast_lookup(&original.idempotency)
+        .covered_api_result_fast_lookup(&original.idempotency)
         .unwrap_err();
     assert_eq!(fast.code, ErrorCode::Internal);
     let transactional = store

@@ -1392,6 +1392,65 @@ fn refuses_missing_or_replaced_volume_primary_key_without_repair() {
 }
 
 #[test]
+fn refuses_missing_or_replaced_persistent_disk_identity_indexes_without_repair() {
+    for (index, ddl, expected_fragment) in [
+        (
+            "disk_records_initialization_token_unique",
+            "DROP INDEX disk_records_initialization_token_unique",
+            None,
+        ),
+        (
+            "disk_records_initialization_token_unique",
+            "DROP INDEX disk_records_initialization_token_unique;
+             CREATE INDEX disk_records_initialization_token_unique
+                 ON disk_records(initialization_token)
+                 WHERE role_kind='persistent'",
+            Some("CREATE INDEX"),
+        ),
+        (
+            "disk_records_filesystem_uuid_unique",
+            "DROP INDEX disk_records_filesystem_uuid_unique",
+            None,
+        ),
+        (
+            "disk_records_filesystem_uuid_unique",
+            "DROP INDEX disk_records_filesystem_uuid_unique;
+             CREATE UNIQUE INDEX disk_records_filesystem_uuid_unique
+                 ON disk_records(filesystem_uuid)
+                 WHERE role_kind='root'",
+            Some("role_kind = 'root'::text"),
+        ),
+    ] {
+        let url = crate::testsupport::isolated_control_store_url();
+        drop(Store::connect(&url, None).unwrap());
+        let mut admin = postgres::Client::connect(&url, postgres::NoTls).unwrap();
+        admin.batch_execute(ddl).unwrap();
+
+        let Err(error) = Store::connect(&url, None) else {
+            panic!("a stamped schema with changed {index} must fail closed");
+        };
+        assert_eq!(error.code, ErrorCode::FailedPrecondition);
+        assert!(error.to_string().contains(index), "{error}");
+        let definition: Option<String> = admin
+            .query_one("SELECT pg_get_indexdef(to_regclass($1))", &[&index])
+            .unwrap()
+            .get(0);
+        match expected_fragment {
+            Some(fragment) => assert!(
+                definition
+                    .as_deref()
+                    .is_some_and(|value| value.contains(fragment)),
+                "startup repaired deliberately changed {index}: {definition:?}"
+            ),
+            None => assert!(
+                definition.is_none(),
+                "startup recreated deliberately dropped {index}: {definition:?}"
+            ),
+        }
+    }
+}
+
+#[test]
 fn refuses_missing_or_replaced_volume_owner_indexes_without_repair() {
     for (index, ddl, expected_fragment) in [
         (

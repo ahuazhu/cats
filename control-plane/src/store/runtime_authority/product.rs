@@ -5,16 +5,18 @@
 //! the atomic PostgreSQL contract land without a second authority or dual
 //! write to the legacy product tables.
 
-use std::sync::atomic::{AtomicU8, Ordering};
-use std::sync::Arc;
-use std::time::Instant;
-
+use cats_api::chunk::MAX_VOLUME_BYTES;
 use cats_api::error::ApiError;
+use cats_api::persistent_disk::{
+    encode_persistent_disk_create_response, persistent_disk_create_response,
+    PERSISTENT_DISK_NAME_CONFLICT_BODY,
+};
+use cats_api::resources::DiskDurability as PublicDiskDurability;
 use cats_api::runtime_reconciliation::{
     encode_desired_runtime_spec, AsciiText, ContractVersion, DesiredRuntimeSpec, DiskKind,
-    Durability, Generation, Hostname, HttpProtocol, Id, Operation, OperationPhase, Revision,
-    RuntimeTarget, RuntimeTransition, Sha256Digest, UnixMillis, VolumeAccess, VolumeAcquire,
-    VolumeDisposition,
+    Durability, FenceEpoch, Generation, Hostname, HttpProtocol, Id, Operation, OperationPhase,
+    RandomId128, Revision, RuntimeTarget, RuntimeTransition, Sha256Digest, UnixMillis,
+    VolumeAccess, VolumeAcquire, VolumeDisposition,
 };
 use cats_storage::authority::{RemoteHead, VolumeAdminState, VolumeDurability, VolumeRecord};
 use postgres::Transaction;
@@ -22,21 +24,25 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 use super::cat_create_service::CatCreatePlacementMutation;
+use super::covered_commit::CoveredCommitState;
 use super::placement_planner::{
     lock_cat_create_placement_for_desired_mutation, PlacementCommitLoad, PlacementTargetSnapshot,
 };
 use super::product_rows::{
     insert_api_result, insert_cat, insert_desired, insert_disk, insert_endpoint,
-    insert_hostname_lookup, insert_operation, load_api_result_for_update,
-    load_cat_by_id_for_update, load_cat_by_name_unlocked, load_desired_by_network_id_unlocked,
-    load_desired_for_update, load_desired_unlocked, load_disk_by_id_for_update,
-    load_disk_by_name_for_update, load_endpoint_by_cat_name_unlocked,
-    load_endpoint_by_id_for_update, load_endpoint_by_id_unlocked, load_hostname_lookup_for_update,
-    load_hostname_lookup_unlocked, load_hostname_lookups_by_cat_unlocked,
-    load_operation_by_cat_revision_unlocked, load_operation_for_update,
-    load_root_disk_by_cat_unlocked,
+    insert_hostname_lookup, insert_operation, load_any_disk_by_filesystem_uuid_for_update,
+    load_any_disk_by_id_for_update, load_any_disk_by_initialization_token_for_update,
+    load_any_disk_by_name_unlocked, load_api_result_for_update, load_cat_by_id_for_update,
+    load_cat_by_name_unlocked, load_desired_by_network_id_unlocked, load_desired_for_update,
+    load_desired_unlocked, load_disk_by_id_for_update, load_disk_by_name_for_update,
+    load_endpoint_by_cat_name_unlocked, load_endpoint_by_id_for_update,
+    load_endpoint_by_id_unlocked, load_hostname_lookup_for_update, load_hostname_lookup_unlocked,
+    load_hostname_lookups_by_cat_unlocked, load_operation_by_cat_revision_unlocked,
+    load_operation_for_update, load_root_disk_by_cat_unlocked,
 };
-use super::rows::{database_now, insert_volume, load_volume_for_update};
+use super::rows::{
+    database_now, insert_volume, load_any_volume_by_id_for_update, load_volume_for_update,
+};
 use super::runtime_spine::{
     lock_placement_admission_for_desired_mutation, PlacementAdmissionLoad,
     PlacementAdmissionSnapshot,
@@ -285,6 +291,25 @@ pub(crate) struct CoveredCatCreateRequest {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct PersistentDiskCreateCandidate {
+    pub(crate) disk_id: Id,
+    pub(crate) workspace_id: Id,
+    pub(crate) name: Id,
+    pub(crate) volume_id: Id,
+    pub(crate) size_bytes: u64,
+    pub(crate) durability: VolumeDurability,
+    pub(crate) initialization_token: RandomId128,
+    pub(crate) filesystem_uuid: RandomId128,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct CoveredPersistentDiskCreateRequest {
+    pub(crate) idempotency: ApiIdempotencyRequest,
+    pub(crate) candidate: PersistentDiskCreateCandidate,
+    pub(crate) name_conflict: ExactHttpResponse,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct ApiIdempotencyResult {
     pub(crate) authenticated_workspace_id: Id,
     pub(crate) canonical_route: AsciiText,
@@ -305,6 +330,8 @@ pub(crate) enum CandidateCollision {
     Hostname,
     OperationId,
     NetworkId,
+    InitializationToken,
+    FilesystemUuid,
 }
 
 #[derive(Debug)]
@@ -325,182 +352,14 @@ pub(crate) enum CoveredCatCreateError {
 
 type CoveredCatCreateResult<T> = std::result::Result<T, CoveredCatCreateError>;
 
-const CAT_CREATE_PRE_COMMIT: u8 = 0;
-const CAT_CREATE_COMMIT_SENT: u8 = 1;
-const CAT_CREATE_CANCELLED: u8 = 2;
-
-struct CatCreateCommitShared {
-    phase: AtomicU8,
-    cancel_requested: std::sync::atomic::AtomicBool,
-    cancelled: tokio::sync::Notify,
+#[derive(Debug)]
+pub(crate) enum CoveredPersistentDiskCreateError {
+    CandidateCollision(CandidateCollision),
+    Store(ApiError),
 }
 
-impl CatCreateCommitShared {
-    fn mark_cancelled(&self) {
-        let _ = self.phase.compare_exchange(
-            CAT_CREATE_PRE_COMMIT,
-            CAT_CREATE_CANCELLED,
-            Ordering::AcqRel,
-            Ordering::Acquire,
-        );
-        if self.phase.load(Ordering::Acquire) == CAT_CREATE_CANCELLED {
-            self.cancelled.notify_waiters();
-        }
-    }
-}
-
-/// Request-lifetime cancellation half of the Cat-create commit boundary.
-/// Dropping it only cancels work which has not crossed into PostgreSQL commit;
-/// after that point the blocking Store job owns result resolution.
-pub(crate) struct CatCreateCommitCancellation(Arc<CatCreateCommitShared>);
-
-#[derive(Clone)]
-pub(crate) struct CatCreateCommitState {
-    shared: Arc<CatCreateCommitShared>,
-    absolute_deadline: Instant,
-}
-
-impl CatCreateCommitCancellation {
-    pub(crate) fn new(absolute_deadline: Instant) -> (Self, CatCreateCommitState) {
-        let state = Arc::new(CatCreateCommitShared {
-            phase: AtomicU8::new(CAT_CREATE_PRE_COMMIT),
-            cancel_requested: std::sync::atomic::AtomicBool::new(false),
-            cancelled: tokio::sync::Notify::new(),
-        });
-        (
-            Self(Arc::clone(&state)),
-            CatCreateCommitState {
-                shared: state,
-                absolute_deadline,
-            },
-        )
-    }
-
-    /// Atomically cancel only work which has not crossed the commit-send
-    /// boundary. `false` means the Store job owns non-cancellable resolution.
-    pub(crate) fn cancel_before_commit(&self) -> bool {
-        self.0.cancel_requested.store(true, Ordering::Release);
-        self.0.mark_cancelled();
-        match self.0.phase.load(Ordering::Acquire) {
-            CAT_CREATE_CANCELLED => true,
-            CAT_CREATE_COMMIT_SENT => false,
-            _ => true,
-        }
-    }
-}
-
-impl Drop for CatCreateCommitCancellation {
-    fn drop(&mut self) {
-        self.0.cancel_requested.store(true, Ordering::Release);
-        self.0.mark_cancelled();
-    }
-}
-
-impl CatCreateCommitState {
-    pub(crate) fn commit_was_sent(&self) -> bool {
-        self.shared.phase.load(Ordering::Acquire) == CAT_CREATE_COMMIT_SENT
-    }
-
-    pub(crate) async fn cancelled_before_commit(&self) {
-        loop {
-            let cancelled = self.shared.cancelled.notified();
-            if self.shared.phase.load(Ordering::Acquire) == CAT_CREATE_CANCELLED {
-                return;
-            }
-            cancelled.await;
-        }
-    }
-
-    fn checkpoint(&self, transaction: &mut Transaction<'_>) -> AuthorityTxResult<()> {
-        if self.shared.cancel_requested.load(Ordering::Acquire) {
-            self.shared.mark_cancelled();
-        }
-        let phase = self.shared.phase.load(Ordering::Acquire);
-        if phase == CAT_CREATE_CANCELLED {
-            return Err(
-                ApiError::unavailable("Cat create was cancelled before PostgreSQL commit").into(),
-            );
-        }
-        if phase == CAT_CREATE_COMMIT_SENT {
-            return Ok(());
-        }
-        let Some(remaining) = self
-            .absolute_deadline
-            .checked_duration_since(Instant::now())
-            .filter(|remaining| !remaining.is_zero())
-        else {
-            self.shared.mark_cancelled();
-            return Err(ApiError::unavailable("Cat create deadline elapsed").into());
-        };
-        let statement_ms = remaining.as_millis().clamp(1, 5_000);
-        let lock_ms = remaining.as_millis().clamp(1, 2_000);
-        transaction.query_one(
-            "SELECT set_config('statement_timeout', $1, true),
-                    set_config('lock_timeout', $2, true)",
-            &[&format!("{statement_ms}ms"), &format!("{lock_ms}ms")],
-        )?;
-        Ok(())
-    }
-
-    fn begin_commit(&self, transaction: &mut Transaction<'_>) -> AuthorityTxResult<()> {
-        self.checkpoint(transaction)?;
-        match self.shared.phase.compare_exchange(
-            CAT_CREATE_PRE_COMMIT,
-            CAT_CREATE_COMMIT_SENT,
-            Ordering::AcqRel,
-            Ordering::Acquire,
-        ) {
-            Ok(_) => {
-                // `checkpoint` performs SQL and its response can cross the
-                // wall-clock deadline. The CAS is only a provisional local
-                // commit-send linearization until this post-CAS clock/cancel
-                // check succeeds; no PostgreSQL COMMIT has been issued yet.
-                if self.shared.cancel_requested.load(Ordering::Acquire)
-                    || Instant::now() >= self.absolute_deadline
-                {
-                    if self
-                        .shared
-                        .phase
-                        .compare_exchange(
-                            CAT_CREATE_COMMIT_SENT,
-                            CAT_CREATE_CANCELLED,
-                            Ordering::AcqRel,
-                            Ordering::Acquire,
-                        )
-                        .is_ok()
-                    {
-                        self.shared.cancelled.notify_waiters();
-                    }
-                    return Err(ApiError::unavailable(
-                        "Cat create deadline elapsed before PostgreSQL commit",
-                    )
-                    .into());
-                }
-                Ok(())
-            }
-            Err(CAT_CREATE_COMMIT_SENT) => Ok(()),
-            Err(CAT_CREATE_CANCELLED) => Err(ApiError::unavailable(
-                "Cat create was cancelled before PostgreSQL commit",
-            )
-            .into()),
-            Err(_) => Err(ApiError::internal("invalid Cat create commit state").into()),
-        }
-    }
-
-    fn reset_after_definite_retry(&self) {
-        let _ = self.shared.phase.compare_exchange(
-            CAT_CREATE_COMMIT_SENT,
-            CAT_CREATE_PRE_COMMIT,
-            Ordering::AcqRel,
-            Ordering::Acquire,
-        );
-        if self.shared.cancel_requested.load(Ordering::Acquire)
-            || Instant::now() >= self.absolute_deadline
-        {
-            self.shared.mark_cancelled();
-        }
-    }
-}
+type CoveredPersistentDiskCreateResult<T> =
+    std::result::Result<T, CoveredPersistentDiskCreateError>;
 
 enum CreateCatTransactionError {
     Authority(AuthorityTransactionError),
@@ -522,6 +381,35 @@ impl From<cats_storage::authority::AuthorityError> for CreateCatTransactionError
 
 impl From<postgres::Error> for CreateCatTransactionError {
     fn from(error: postgres::Error) -> Self {
+        Self::Authority(error.into())
+    }
+}
+
+enum CreatePersistentDiskTransactionError {
+    Authority(AuthorityTransactionError),
+    CandidateCollision(CandidateCollision),
+}
+
+impl From<AuthorityTransactionError> for CreatePersistentDiskTransactionError {
+    fn from(error: AuthorityTransactionError) -> Self {
+        Self::Authority(error)
+    }
+}
+
+impl From<cats_storage::authority::AuthorityError> for CreatePersistentDiskTransactionError {
+    fn from(error: cats_storage::authority::AuthorityError) -> Self {
+        Self::Authority(error.into())
+    }
+}
+
+impl From<postgres::Error> for CreatePersistentDiskTransactionError {
+    fn from(error: postgres::Error) -> Self {
+        Self::Authority(error.into())
+    }
+}
+
+impl From<ApiError> for CreatePersistentDiskTransactionError {
+    fn from(error: ApiError) -> Self {
         Self::Authority(error.into())
     }
 }
@@ -591,7 +479,7 @@ pub(crate) fn encode_cat_name_conflict_response() -> Vec<u8> {
 impl Store {
     /// Optional preflight optimization. It never reserves the key and never
     /// reads a resource; the create transaction below always rechecks.
-    pub(crate) fn cat_create_result_fast_lookup(
+    pub(super) fn covered_api_result_fast_lookup(
         &self,
         request: &ApiIdempotencyRequest,
     ) -> Result<Option<ApiIdempotencyResult>> {
@@ -606,7 +494,7 @@ impl Store {
     /// The same API-key advisory reservation is the visibility barrier: a
     /// missing row is definitive only after the original transaction has
     /// committed or rolled back and released this lock.
-    pub(crate) fn cat_create_result_after_commit(
+    pub(super) fn covered_api_result_after_commit(
         &self,
         request: &ApiIdempotencyRequest,
     ) -> Result<Option<ApiIdempotencyResult>> {
@@ -662,13 +550,13 @@ impl Store {
         )
     }
 
-    pub(crate) fn create_cat_covered_with_placement(
+    pub(super) fn create_cat_covered_with_placement(
         &self,
         request: &CoveredCatCreateRequest,
         planned_target: &PlacementTargetSnapshot,
         planned_mutation: &CatCreatePlacementMutation,
         active_guest_digest: &Sha256Digest,
-        commit_state: &CatCreateCommitState,
+        commit_state: &CoveredCommitState,
     ) -> CoveredCatCreateResult<ApiIdempotencyResult> {
         self.create_cat_covered_inner(
             request,
@@ -695,7 +583,7 @@ impl Store {
             &CatCreatePlacementMutation,
             &Sha256Digest,
         )>,
-        commit_state: Option<&CatCreateCommitState>,
+        commit_state: Option<&CoveredCommitState>,
     ) -> CoveredCatCreateResult<ApiIdempotencyResult> {
         let mut collision = None;
         let result = self.authority_transaction_outcome_with_definite_retry(
@@ -740,6 +628,216 @@ impl Store {
             Err(AuthorityExecutionError::Store(error)) => Err(CoveredCatCreateError::Store(error)),
         }
     }
+
+    pub(super) fn create_persistent_disk_covered(
+        &self,
+        request: &CoveredPersistentDiskCreateRequest,
+        commit_state: &CoveredCommitState,
+    ) -> CoveredPersistentDiskCreateResult<ApiIdempotencyResult> {
+        self.create_persistent_disk_covered_inner(request, Some(commit_state))
+    }
+
+    fn create_persistent_disk_covered_inner(
+        &self,
+        request: &CoveredPersistentDiskCreateRequest,
+        commit_state: Option<&CoveredCommitState>,
+    ) -> CoveredPersistentDiskCreateResult<ApiIdempotencyResult> {
+        let mut collision = None;
+        let result = self.authority_transaction_outcome_with_definite_retry(
+            |transaction| {
+                checkpoint_covered_commit(transaction, commit_state)?;
+                match create_persistent_disk_in(transaction, request, commit_state) {
+                    Ok(result) => {
+                        checkpoint_covered_commit(transaction, commit_state)?;
+                        if let Some(commit_state) = commit_state {
+                            commit_state.begin_commit(transaction)?;
+                        }
+                        Ok(result)
+                    }
+                    Err(CreatePersistentDiskTransactionError::Authority(error)) => Err(error),
+                    Err(CreatePersistentDiskTransactionError::CandidateCollision(kind)) => {
+                        collision = Some(kind);
+                        Err(AuthorityTransactionError::CandidateCollision)
+                    }
+                }
+            },
+            || {
+                if let Some(commit_state) = commit_state {
+                    commit_state.reset_after_definite_retry();
+                }
+            },
+        );
+        match result {
+            Ok(result) => Ok(result),
+            Err(AuthorityExecutionError::CandidateCollision) => match collision.take() {
+                Some(kind) => Err(CoveredPersistentDiskCreateError::CandidateCollision(kind)),
+                None => Err(CoveredPersistentDiskCreateError::Store(ApiError::internal(
+                    "candidate-collision transaction lost its typed reason",
+                ))),
+            },
+            Err(AuthorityExecutionError::PlacementStale) => {
+                Err(CoveredPersistentDiskCreateError::Store(ApiError::internal(
+                    "PersistentDisk create returned an impossible placement-stale marker",
+                )))
+            }
+            Err(AuthorityExecutionError::Store(error)) => {
+                Err(CoveredPersistentDiskCreateError::Store(error))
+            }
+        }
+    }
+}
+
+fn create_persistent_disk_in(
+    transaction: &mut Transaction<'_>,
+    request: &CoveredPersistentDiskCreateRequest,
+    commit_state: Option<&CoveredCommitState>,
+) -> std::result::Result<ApiIdempotencyResult, CreatePersistentDiskTransactionError> {
+    checkpoint_covered_commit(transaction, commit_state)?;
+    reserve_api_key(transaction, &request.idempotency)?;
+    checkpoint_covered_commit(transaction, commit_state)?;
+    if let Some(result) = load_api_result_for_update(transaction, &request.idempotency)? {
+        return check_replay(result, &request.idempotency.request_fingerprint)
+            .map_err(AuthorityTransactionError::from)
+            .map_err(CreatePersistentDiskTransactionError::from);
+    }
+
+    validate_persistent_disk_candidate(request).map_err(AuthorityTransactionError::from)?;
+    checkpoint_covered_commit(transaction, commit_state)?;
+    lock_disk_name(
+        transaction,
+        &request.candidate.workspace_id,
+        &request.candidate.name,
+    )?;
+    checkpoint_covered_commit(transaction, commit_state)?;
+    if let Some(peeked_disk) = load_any_disk_by_name_unlocked(
+        transaction,
+        &request.candidate.workspace_id,
+        &request.candidate.name,
+    )? {
+        validate_existing_disk_for_name_conflict(transaction, &peeked_disk, commit_state)?;
+        checkpoint_covered_commit(transaction, commit_state)?;
+        let now = database_now(transaction)?;
+        let result = result_from_envelope(&request.idempotency, &request.name_conflict, now);
+        checkpoint_covered_commit(transaction, commit_state)?;
+        insert_api_result(transaction, &result)?;
+        return Ok(result);
+    }
+
+    // The candidate namespace is globally closed in the shared mutation lock
+    // order. A collision never reuses part of a bundle; the service retries
+    // with four freshly sampled identities.
+    checkpoint_covered_commit(transaction, commit_state)?;
+    lock_candidate_id(transaction, "volume", &request.candidate.volume_id)?;
+    checkpoint_covered_commit(transaction, commit_state)?;
+    if load_any_volume_by_id_for_update(transaction, &request.candidate.volume_id)?.is_some() {
+        return Err(persistent_candidate_collision(CandidateCollision::VolumeId));
+    }
+
+    checkpoint_covered_commit(transaction, commit_state)?;
+    lock_candidate_id(transaction, "disk", &request.candidate.disk_id)?;
+    checkpoint_covered_commit(transaction, commit_state)?;
+    if load_any_disk_by_id_for_update(transaction, &request.candidate.disk_id)?.is_some() {
+        return Err(persistent_candidate_collision(
+            CandidateCollision::DiskIdOrName,
+        ));
+    }
+
+    checkpoint_covered_commit(transaction, commit_state)?;
+    lock_candidate_text(
+        transaction,
+        "disk-initialization-token",
+        request.candidate.initialization_token.as_str(),
+    )?;
+    checkpoint_covered_commit(transaction, commit_state)?;
+    if load_any_disk_by_initialization_token_for_update(
+        transaction,
+        &request.candidate.initialization_token,
+    )?
+    .is_some()
+    {
+        return Err(persistent_candidate_collision(
+            CandidateCollision::InitializationToken,
+        ));
+    }
+
+    checkpoint_covered_commit(transaction, commit_state)?;
+    lock_candidate_text(
+        transaction,
+        "disk-filesystem-uuid",
+        request.candidate.filesystem_uuid.as_str(),
+    )?;
+    checkpoint_covered_commit(transaction, commit_state)?;
+    if load_any_disk_by_filesystem_uuid_for_update(transaction, &request.candidate.filesystem_uuid)?
+        .is_some()
+    {
+        return Err(persistent_candidate_collision(
+            CandidateCollision::FilesystemUuid,
+        ));
+    }
+
+    checkpoint_covered_commit(transaction, commit_state)?;
+    let now = database_now(transaction)?;
+    let blank_head = RemoteHead {
+        generation: Generation::new(0).expect("zero is a valid Generation"),
+        root_hash: None,
+        root_object_id: None,
+    };
+    let volume = VolumeRecord {
+        volume_id: request.candidate.volume_id.clone(),
+        size_bytes: request.candidate.size_bytes,
+        durability: request.candidate.durability,
+        admin_state: VolumeAdminState::Active,
+        head: blank_head.clone(),
+        lease_owner: None,
+        lease_epoch: FenceEpoch::new(0).expect("zero is a valid FenceEpoch"),
+        lease_expires_at: None,
+        last_transition: None,
+    };
+    let disk = DiskRecord {
+        disk_id: request.candidate.disk_id.clone(),
+        workspace_id: request.candidate.workspace_id.clone(),
+        name: request.candidate.name.clone(),
+        volume_id: request.candidate.volume_id.clone(),
+        size_bytes: request.candidate.size_bytes,
+        durability: request.candidate.durability,
+        created_at: now,
+        admin_state: DiskAdminState::Active,
+        role: DiskRole::Persistent {
+            initialization: Box::new(PersistentDiskInitialization::Uninitialized {
+                initialization_token: request.candidate.initialization_token.clone(),
+                filesystem_uuid: request.candidate.filesystem_uuid.clone(),
+                expected_blank_head: blank_head,
+            }),
+        },
+    };
+    let public_durability = match request.candidate.durability {
+        VolumeDurability::Strict => PublicDiskDurability::Strict,
+        VolumeDurability::Relaxed => PublicDiskDurability::Relaxed,
+    };
+    let response = persistent_disk_create_response(
+        &disk.disk_id,
+        &disk.workspace_id,
+        &disk.name,
+        &disk.volume_id,
+        disk.size_bytes,
+        public_durability,
+        now,
+    );
+    let response = ExactHttpResponse::new(
+        201,
+        Some(ExactContentType::ApplicationJson),
+        encode_persistent_disk_create_response(&response)
+            .map_err(|error| internal(format!("failed to encode PersistentDisk: {error}")))?,
+    )?;
+    let result = result_from_envelope(&request.idempotency, &response, now);
+
+    checkpoint_covered_commit(transaction, commit_state)?;
+    insert_volume(transaction, &volume)?;
+    checkpoint_covered_commit(transaction, commit_state)?;
+    insert_disk(transaction, &disk)?;
+    checkpoint_covered_commit(transaction, commit_state)?;
+    insert_api_result(transaction, &result)?;
+    Ok(result)
 }
 
 fn create_cat_in(
@@ -751,7 +849,7 @@ fn create_cat_in(
         &CatCreatePlacementMutation,
         &Sha256Digest,
     )>,
-    commit_state: Option<&CatCreateCommitState>,
+    commit_state: Option<&CoveredCommitState>,
 ) -> std::result::Result<ApiIdempotencyResult, CreateCatTransactionError> {
     checkpoint_cat_create(transaction, commit_state)?;
     reserve_api_key(transaction, &request.idempotency)?;
@@ -994,6 +1092,88 @@ fn create_cat_in(
     Ok(result)
 }
 
+fn validate_persistent_disk_candidate(request: &CoveredPersistentDiskCreateRequest) -> Result<()> {
+    let candidate = &request.candidate;
+    if candidate.workspace_id != request.idempotency.authenticated_workspace_id {
+        return Err(invalid_persistent_disk_bundle(
+            "authenticated Workspace binding mismatch",
+        ));
+    }
+    if !(1..=MAX_VOLUME_BYTES).contains(&candidate.size_bytes) {
+        return Err(invalid_persistent_disk_bundle(
+            "size_bytes is outside the V1 range",
+        ));
+    }
+    validate_prefixed_random_id(&candidate.disk_id, "disk_")?;
+    validate_prefixed_random_id(&candidate.volume_id, "vol_")?;
+    if candidate.initialization_token == candidate.filesystem_uuid {
+        return Err(invalid_persistent_disk_bundle(
+            "initialization token and filesystem UUID share one sample",
+        ));
+    }
+    validate_envelope(&request.name_conflict, 409)?;
+    if request.name_conflict.response_body != PERSISTENT_DISK_NAME_CONFLICT_BODY {
+        return Err(invalid_persistent_disk_bundle(
+            "name-conflict body is not the canonical already_exists response",
+        ));
+    }
+    Ok(())
+}
+
+fn validate_prefixed_random_id(value: &Id, prefix: &'static str) -> Result<()> {
+    let Some(suffix) = value.as_str().strip_prefix(prefix).filter(|suffix| {
+        suffix.len() == 32
+            && suffix
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    }) else {
+        return Err(invalid_persistent_disk_bundle(format!(
+            "identity must be {prefix} plus 32 lowercase hex digits"
+        )));
+    };
+    debug_assert_eq!(suffix.len(), 32);
+    Ok(())
+}
+
+fn validate_existing_disk_for_name_conflict(
+    transaction: &mut Transaction<'_>,
+    peeked_disk: &DiskRecord,
+    commit_state: Option<&CoveredCommitState>,
+) -> std::result::Result<(), CreatePersistentDiskTransactionError> {
+    checkpoint_covered_commit(transaction, commit_state)?;
+    lock_candidate_id(transaction, "volume", &peeked_disk.volume_id)?;
+    checkpoint_covered_commit(transaction, commit_state)?;
+    let volume = load_any_volume_by_id_for_update(transaction, &peeked_disk.volume_id)?
+        .ok_or_else(|| stored_corruption("existing Disk Volume disappeared"))?;
+
+    checkpoint_covered_commit(transaction, commit_state)?;
+    lock_candidate_id(transaction, "disk", &peeked_disk.disk_id)?;
+    checkpoint_covered_commit(transaction, commit_state)?;
+    let disk = load_any_disk_by_id_for_update(transaction, &peeked_disk.disk_id)?
+        .ok_or_else(|| stored_corruption("existing Disk disappeared"))?;
+    let admin_state_matches = match (&disk.admin_state, &volume.admin_state) {
+        (DiskAdminState::Active, VolumeAdminState::Active) => true,
+        (
+            DiskAdminState::Deleting {
+                delete_id: disk_delete,
+            },
+            VolumeAdminState::Deleting {
+                delete_id: volume_delete,
+            },
+        ) => disk_delete == volume_delete,
+        _ => false,
+    };
+    if disk != *peeked_disk
+        || disk.volume_id != volume.volume_id
+        || disk.size_bytes != volume.size_bytes
+        || disk.durability != volume.durability
+        || !admin_state_matches
+    {
+        return Err(stored_corruption("existing Disk/Volume name authority is invalid").into());
+    }
+    Ok(())
+}
+
 pub(super) fn candidate_matches_placement_mutation(
     candidate: &CatCreateCandidate,
     planned: &CatCreatePlacementMutation,
@@ -1008,18 +1188,22 @@ pub(super) fn candidate_matches_placement_mutation(
 
 fn checkpoint_cat_create(
     transaction: &mut Transaction<'_>,
-    commit_state: Option<&CatCreateCommitState>,
+    commit_state: Option<&CoveredCommitState>,
 ) -> AuthorityTxResult<()> {
-    match commit_state {
-        Some(commit_state) => commit_state.checkpoint(transaction),
-        None => Ok(()),
-    }
+    checkpoint_covered_commit(transaction, commit_state)
+}
+
+fn checkpoint_covered_commit(
+    transaction: &mut Transaction<'_>,
+    commit_state: Option<&CoveredCommitState>,
+) -> AuthorityTxResult<()> {
+    commit_state.map_or(Ok(()), |state| state.checkpoint(transaction))
 }
 
 fn validate_existing_cat_for_name_conflict(
     transaction: &mut Transaction<'_>,
     peeked_cat: &CatRecord,
-    commit_state: Option<&CatCreateCommitState>,
+    commit_state: Option<&CoveredCommitState>,
 ) -> AuthorityTxResult<()> {
     checkpoint_cat_create(transaction, commit_state)?;
     let peeked_disk = load_root_disk_by_cat_unlocked(transaction, &peeked_cat.cat_id)?
@@ -1136,7 +1320,7 @@ fn validate_existing_endpoints(
     transaction: &mut Transaction<'_>,
     cat: &CatRecord,
     desired: &DesiredRuntimeSpec,
-    commit_state: Option<&CatCreateCommitState>,
+    commit_state: Option<&CoveredCommitState>,
 ) -> AuthorityTxResult<()> {
     checkpoint_cat_create(transaction, commit_state)?;
     let lookups = load_hostname_lookups_by_cat_unlocked(transaction, &cat.cat_id)?;
@@ -1374,6 +1558,21 @@ fn lock_cat_name(
     Ok(())
 }
 
+fn lock_disk_name(
+    transaction: &mut Transaction<'_>,
+    workspace_id: &Id,
+    name: &Id,
+) -> AuthorityTxResult<()> {
+    transaction.query_one(
+        "SELECT pg_advisory_xact_lock(hashtextextended(
+            current_schema() || ':disk-name:' || $1 || ':' || $2,
+            0::BIGINT
+         ))",
+        &[&workspace_id.as_str(), &name.as_str()],
+    )?;
+    Ok(())
+}
+
 fn lock_candidate_id(
     transaction: &mut Transaction<'_>,
     kind: &'static str,
@@ -1385,6 +1584,21 @@ fn lock_candidate_id(
             0::BIGINT
          ))",
         &[&kind, &id.as_str()],
+    )?;
+    Ok(())
+}
+
+fn lock_candidate_text(
+    transaction: &mut Transaction<'_>,
+    kind: &'static str,
+    value: &str,
+) -> AuthorityTxResult<()> {
+    transaction.query_one(
+        "SELECT pg_advisory_xact_lock(hashtextextended(
+            current_schema() || ':runtime-authority:' || $1 || ':' || $2,
+            0::BIGINT
+         ))",
+        &[&kind, &value],
     )?;
     Ok(())
 }
@@ -1451,6 +1665,12 @@ fn candidate_collision(kind: CandidateCollision) -> CreateCatTransactionError {
     CreateCatTransactionError::CandidateCollision(kind)
 }
 
+fn persistent_candidate_collision(
+    kind: CandidateCollision,
+) -> CreatePersistentDiskTransactionError {
+    CreatePersistentDiskTransactionError::CandidateCollision(kind)
+}
+
 fn stored_corruption(_message: &'static str) -> AuthorityTransactionError {
     cats_storage::authority::AuthorityError::BackendUnknown.into()
 }
@@ -1458,6 +1678,13 @@ fn stored_corruption(_message: &'static str) -> AuthorityTransactionError {
 fn invalid_bundle(message: impl Into<String>) -> ApiError {
     ApiError::internal(format!(
         "covered Cat create candidate is inconsistent: {}",
+        message.into()
+    ))
+}
+
+fn invalid_persistent_disk_bundle(message: impl Into<String>) -> ApiError {
+    ApiError::internal(format!(
+        "covered PersistentDisk create candidate is inconsistent: {}",
         message.into()
     ))
 }

@@ -241,6 +241,7 @@ pub struct RuntimeCutoverAcceptanceFacts {
     pub current_session_lease_deadline_unix_ms: Option<i64>,
     pub desired_read_last_request_sequence: Option<i64>,
     pub stored_api_response_body: Option<Vec<u8>>,
+    pub stored_persistent_disk_response_body: Option<Vec<u8>>,
 }
 
 pub async fn runtime_cutover_acceptance_facts(
@@ -279,7 +280,13 @@ pub async fn runtime_cutover_acceptance_facts(
                                FROM current_agent_sessions WHERE node_id=$1),
                             (SELECT last_request_sequence
                                FROM runtime_desired_read_states WHERE node_id=$1),
-                            (SELECT response_body FROM api_idempotency_results LIMIT 1)",
+                            (SELECT response_body FROM api_idempotency_results
+                              WHERE canonical_route='POST /v1/workspaces/{workspace}/cats'
+                              LIMIT 1),
+                            (SELECT response_body FROM api_idempotency_results
+                              WHERE canonical_route='POST /v1/workspaces/{workspace}/disks'
+                                AND http_status=201
+                              LIMIT 1)",
                         &[&node_id.as_str()],
                     )
                     .map(|row| RuntimeCutoverAcceptanceFacts {
@@ -307,6 +314,7 @@ pub async fn runtime_cutover_acceptance_facts(
                         current_session_lease_deadline_unix_ms: row.get(21),
                         desired_read_last_request_sequence: row.get(22),
                         stored_api_response_body: row.get(23),
+                        stored_persistent_disk_response_body: row.get(24),
                     })
             })
         })

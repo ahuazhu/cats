@@ -14,13 +14,14 @@ use cats_api::runtime_reconciliation::{
 };
 
 use super::cat_create_service::{
-    parse_authorized_cat_create, CatCreateHttpFields, CatCreateIdentitySource,
-    CatCreateManifestResolver, CatCreatePlacementMutation, CatCreatePlacementOutcome,
-    CatCreatePlacementPlanner, CatCreatePlan, CatCreatePlanRequest, CatCreateService,
-    ServiceFuture, ValidatedImageManifest, CAT_CREATE_MAX_BODY_BYTES, CAT_CREATE_TOTAL_DEADLINE,
+    parse_authorized_cat_create, CatCreateHttpFields, CatCreateManifestResolver,
+    CatCreatePlacementMutation, CatCreatePlacementOutcome, CatCreatePlacementPlanner,
+    CatCreatePlan, CatCreatePlanRequest, CatCreateService, ServiceFuture, ValidatedImageManifest,
+    CAT_CREATE_MAX_BODY_BYTES, CAT_CREATE_TOTAL_DEADLINE,
 };
 use super::placement_planner::PlacementTargetSnapshot;
 use super::product::CatRecord;
+use super::product_identity::ProductIdentitySource;
 use super::product_rows::insert_cat;
 use super::rows::database_now;
 use super::runtime_spine::PlacementAdmissionSnapshot;
@@ -362,7 +363,7 @@ impl CatCreatePlacementPlanner for FakePlanner {
 #[derive(Default)]
 struct SequentialIdentities(AtomicU64);
 
-impl CatCreateIdentitySource for SequentialIdentities {
+impl ProductIdentitySource for SequentialIdentities {
     fn random_id(&self) -> Result<RandomId128> {
         let value = self.0.fetch_add(1, Ordering::SeqCst) + 1;
         Ok(RandomId128::new(format!("{value:032x}")).unwrap())
@@ -375,7 +376,7 @@ struct PausingIdentities {
     release_batch: Mutex<mpsc::Receiver<()>>,
 }
 
-impl CatCreateIdentitySource for PausingIdentities {
+impl ProductIdentitySource for PausingIdentities {
     fn random_id(&self) -> Result<RandomId128> {
         let value = self.next.fetch_add(1, Ordering::SeqCst) + 1;
         if value == 9 {
@@ -1092,7 +1093,7 @@ fn post_commit_resolver_waits_for_the_original_api_key_owner() {
     let resolver = std::thread::spawn(move || {
         let store = Store::connect(&url, None).unwrap();
         done_tx
-            .send(store.cat_create_result_after_commit(&request))
+            .send(store.covered_api_result_after_commit(&request))
             .unwrap();
     });
     assert!(

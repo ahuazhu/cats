@@ -49,6 +49,7 @@ mod disks;
 mod endpoints;
 mod nodes;
 mod operations;
+mod persistent_disk_create_v1;
 pub(crate) mod route_resolve_v2;
 mod routes;
 pub(crate) mod runtime_node_authority;
@@ -65,6 +66,7 @@ use disks::*;
 use endpoints::*;
 use nodes::*;
 use operations::*;
+use persistent_disk_create_v1::*;
 use routes::*;
 use sessions::*;
 use usage::*;
@@ -447,6 +449,13 @@ async fn reject_retired_product_authority(
     .into_response()
 }
 
+async fn reject_retired_product_get() -> Response {
+    Failure(ApiError::unavailable(
+        "legacy product authority is unavailable during the signed runtime cutover",
+    ))
+    .into_response()
+}
+
 fn retired_product_support_router(enabled: bool) -> Router<AppState> {
     if enabled {
         Router::new()
@@ -462,6 +471,11 @@ pub fn router(state: AppState) -> Router {
         post(create_cat_legacy_for_tests)
     } else {
         post(create_cat_v2)
+    };
+    let disk_collection_route = if state.retired_product_authority_for_tests {
+        post(create_disk).get(list_disks)
+    } else {
+        post(create_persistent_disk_v1).get(reject_retired_product_get)
     };
     // These handlers read or mutate the retired Cat/Operation/Node authority.
     // Keep them reachable only from the explicit pre-cutover test composition.
@@ -501,10 +515,6 @@ pub fn router(state: AppState) -> Router {
         .route(
             "/v1/workspaces/{workspace}/cats/{cat}/endpoints",
             post(create_endpoint).get(list_endpoints),
-        )
-        .route(
-            "/v1/workspaces/{workspace}/disks",
-            post(create_disk).get(list_disks),
         )
         .route(
             "/v1/workspaces/{workspace}/disks/{disk}",
@@ -650,6 +660,7 @@ pub fn router(state: AppState) -> Router {
             axum::routing::patch(update_account_member).delete(deactivate_account_member),
         )
         .route("/v1/workspaces/{workspace}/cats", cat_create_route)
+        .route("/v1/workspaces/{workspace}/disks", disk_collection_route)
         .route(
             "/v1/workspaces/{workspace}/tokens",
             post(create_workspace_token).get(list_workspace_tokens),
@@ -767,6 +778,12 @@ mod tests {
             "conditional Cat-create route is missing",
         );
         routes.push("POST /v1/workspaces/{workspace}/cats".to_string());
+        assert!(
+            router.contains(".route(\"/v1/workspaces/{workspace}/disks\", disk_collection_route)"),
+            "conditional PersistentDisk collection route is missing",
+        );
+        routes.push("GET /v1/workspaces/{workspace}/disks".to_string());
+        routes.push("POST /v1/workspaces/{workspace}/disks".to_string());
         routes.sort();
 
         let expected = r#"DELETE /v1/accounts/{account}/members/{membership}

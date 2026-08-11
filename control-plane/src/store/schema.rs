@@ -1049,6 +1049,18 @@ const REQUIRED_DEFERRED_FOREIGN_KEYS: &[RequiredDeferredForeignKey] = &[
 
 const REQUIRED_UNIQUE_INDEXES: &[(&str, &str, &str, Option<&str>)] = &[
     (
+        "disk_records",
+        "disk_records_initialization_token_unique",
+        "initialization_token",
+        Some("(role_kind = 'persistent'::text)"),
+    ),
+    (
+        "disk_records",
+        "disk_records_filesystem_uuid_unique",
+        "filesystem_uuid",
+        Some("(role_kind = 'persistent'::text)"),
+    ),
+    (
         "route_v2_signing_authority",
         "route_v2_signing_authority_deployment_id_key",
         "deployment_id",
@@ -1976,6 +1988,10 @@ CREATE TABLE IF NOT EXISTS disk_records (
 );
 CREATE UNIQUE INDEX IF NOT EXISTS disk_records_one_root_per_cat
 ON disk_records(root_cat_id) WHERE role_kind = 'root';
+CREATE UNIQUE INDEX IF NOT EXISTS disk_records_initialization_token_unique
+ON disk_records(initialization_token) WHERE role_kind = 'persistent';
+CREATE UNIQUE INDEX IF NOT EXISTS disk_records_filesystem_uuid_unique
+ON disk_records(filesystem_uuid) WHERE role_kind = 'persistent';
 CREATE TABLE IF NOT EXISTS disk_snapshot_records (
     snapshot_id TEXT PRIMARY KEY,
     record JSONB NOT NULL CHECK (jsonb_typeof(record) = 'object'),

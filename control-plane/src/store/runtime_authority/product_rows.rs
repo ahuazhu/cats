@@ -693,6 +693,93 @@ pub(super) fn load_disk_by_name_for_update(
         .transpose()
 }
 
+/// Bounded exact lookup used before the Volume -> Disk lock suffix for a
+/// PersistentDisk name conflict. Both scalar and canonical JSON projections
+/// participate so stored drift cannot turn an existing name into apparent
+/// absence.
+pub(super) fn load_any_disk_by_name_unlocked(
+    transaction: &mut Transaction<'_>,
+    workspace_id: &Id,
+    name: &Id,
+) -> AuthorityTxResult<Option<DiskRecord>> {
+    let sql = format!(
+        "SELECT {DISK_COLUMNS} FROM disk_records
+          WHERE (workspace_id=$1 AND name=$2)
+             OR (record->>'workspace_id'=$1 AND record->>'name'=$2)
+          ORDER BY disk_id
+          LIMIT 2"
+    );
+    decode_at_most_one_disk(transaction.query(&sql, &[&workspace_id.as_str(), &name.as_str()])?)
+}
+
+/// Lock every row that could claim this Disk identity in either projection.
+pub(super) fn load_any_disk_by_id_for_update(
+    transaction: &mut Transaction<'_>,
+    disk_id: &Id,
+) -> AuthorityTxResult<Option<DiskRecord>> {
+    let sql = format!(
+        "SELECT {DISK_COLUMNS} FROM disk_records
+          WHERE disk_id=$1 OR record->>'disk_id'=$1
+          ORDER BY disk_id
+          LIMIT 2
+          FOR UPDATE"
+    );
+    decode_at_most_one_disk(transaction.query(&sql, &[&disk_id.as_str()])?)
+}
+
+pub(super) fn load_any_disk_by_initialization_token_for_update(
+    transaction: &mut Transaction<'_>,
+    token: &cats_api::runtime_reconciliation::RandomId128,
+) -> AuthorityTxResult<Option<DiskRecord>> {
+    load_any_disk_by_persistent_identity_for_update(
+        transaction,
+        "initialization_token",
+        "initialization_token",
+        token.as_str(),
+    )
+}
+
+pub(super) fn load_any_disk_by_filesystem_uuid_for_update(
+    transaction: &mut Transaction<'_>,
+    filesystem_uuid: &cats_api::runtime_reconciliation::RandomId128,
+) -> AuthorityTxResult<Option<DiskRecord>> {
+    load_any_disk_by_persistent_identity_for_update(
+        transaction,
+        "filesystem_uuid",
+        "filesystem_uuid",
+        filesystem_uuid.as_str(),
+    )
+}
+
+fn load_any_disk_by_persistent_identity_for_update(
+    transaction: &mut Transaction<'_>,
+    column: &'static str,
+    json_field: &'static str,
+    value: &str,
+) -> AuthorityTxResult<Option<DiskRecord>> {
+    // `column` and `json_field` are closed call-site constants, never input.
+    let sql = format!(
+        "SELECT {DISK_COLUMNS} FROM disk_records
+          WHERE {column}=$1
+             OR record #>> '{{role,initialization,{json_field}}}'=$1
+          ORDER BY disk_id
+          LIMIT 2
+          FOR UPDATE"
+    );
+    decode_at_most_one_disk(transaction.query(&sql, &[&value])?)
+}
+
+fn decode_at_most_one_disk(rows: Vec<Row>) -> AuthorityTxResult<Option<DiskRecord>> {
+    let mut decoded = rows
+        .iter()
+        .map(decode_disk)
+        .collect::<AuthorityTxResult<Vec<_>>>()?;
+    if decoded.len() > 1 {
+        return Err(corrupt(()));
+    }
+    Ok(decoded.pop())
+}
+
 fn decode_disk(row: &Row) -> AuthorityTxResult<DiskRecord> {
     let stored = DiskProjection::from_row(row)?;
     let record: DiskRecord = decode_json(row.try_get("record_json")?)?;
