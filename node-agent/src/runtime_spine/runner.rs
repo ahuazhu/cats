@@ -2301,6 +2301,9 @@ impl RuntimeSpineRunner {
                         unavailable_sources,
                     } => {
                         if unavailable_sources.is_empty() {
+                            if let Some(effect_lane) = &self.effect_lane {
+                                effect_lane.fail_close_all_admission();
+                            }
                             return Err(RuntimeSpineRunError::InvalidScan(
                                 "an incomplete scan has no unavailable source",
                             ));
@@ -2892,6 +2895,8 @@ mod tests {
 
     struct IncompleteScanner;
 
+    struct InvalidIncompleteScanner;
+
     struct ErrorScanner;
 
     impl crate::runtime_spine::inventory_scanner_sealed::Sealed for IncompleteScanner {}
@@ -2909,6 +2914,19 @@ mod tests {
     }
 
     impl crate::runtime_spine::inventory_scanner_sealed::Sealed for ErrorScanner {}
+
+    impl crate::runtime_spine::inventory_scanner_sealed::Sealed for InvalidIncompleteScanner {}
+
+    impl RuntimeInventoryScanner for InvalidIncompleteScanner {
+        fn scan_complete(
+            &self,
+            _context: RuntimeInventoryScanContext,
+        ) -> anyhow::Result<RuntimeInventoryScanOutcome> {
+            Ok(RuntimeInventoryScanOutcome::Incomplete {
+                unavailable_sources: Vec::new(),
+            })
+        }
+    }
 
     impl RuntimeInventoryScanner for ErrorScanner {
         fn scan_complete(
@@ -4181,6 +4199,55 @@ mod tests {
         assert_eq!(admission.fail_closes.load(Ordering::SeqCst), 1);
         assert_eq!(effect.calls.load(Ordering::SeqCst), 0);
 
+        runner.shutdown().await.unwrap();
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn invalid_empty_incomplete_scan_fail_closes_pre_scan_admission() {
+        let snapshot = snapshot_with_network();
+        let app = Router::new().route(
+            cats_api::runtime_reconciliation::DESIRED_READ_PATH,
+            post(move || {
+                let snapshot = snapshot.clone();
+                async move { wire_response(StatusCode::OK, snapshot) }
+            }),
+        );
+        let (origin, server) = spawn(app).await;
+        let admission = Arc::new(TestPreScanAdmission {
+            calls: AtomicUsize::new(0),
+            fail_closes: AtomicUsize::new(0),
+            fail: AtomicBool::new(false),
+        });
+        let root = tempfile::tempdir().unwrap();
+        let mut runner = RuntimeSpineRunner::new_inner(
+            StateDirectory::unanchored(root.path().to_path_buf()),
+            decode_agent_session(SESSION).unwrap(),
+            RuntimeSpineHttpClient::for_loopback_test(&origin, signer()).unwrap(),
+            Arc::new(InvalidIncompleteScanner),
+            Some(Arc::new(CountingEffect {
+                calls: AtomicUsize::new(0),
+            })),
+            Some(admission.clone()),
+            None,
+            None,
+        )
+        .unwrap();
+        assert!(matches!(
+            runner
+                .run_once_until(Instant::now() + Duration::from_secs(5))
+                .await
+                .unwrap(),
+            RuntimeSpineRunStep::DesiredAccepted
+        ));
+        assert!(matches!(
+            runner
+                .run_once_until(Instant::now() + Duration::from_secs(5))
+                .await,
+            Err(RuntimeSpineRunError::InvalidScan(_))
+        ));
+        assert_eq!(admission.calls.load(Ordering::SeqCst), 1);
+        assert_eq!(admission.fail_closes.load(Ordering::SeqCst), 1);
         runner.shutdown().await.unwrap();
         server.abort();
     }

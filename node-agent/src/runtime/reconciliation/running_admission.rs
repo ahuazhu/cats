@@ -1003,6 +1003,7 @@ fn exact_require_idle_source_snapshot(
     desired: &DesiredRuntimeSpec,
     checkpoint: &RuntimeCheckpoint,
 ) -> anyhow::Result<AdmissionSnapshot> {
+    super::route_retirement::validate_require_idle_checkpoint_tuple(desired, checkpoint)?;
     let RuntimeTransition::RequireIdle {
         source_revision,
         source_runtime_incarnation,
@@ -2189,6 +2190,90 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn endpoint_latch_survives_incomplete_scan_without_touching_unchanged_route() {
+        let fixture = Fixture::new(2);
+        let registry = fixture.registry();
+        let effect = RunningAdmissionEffect::new(Arc::clone(&registry));
+        for _ in 0..2 {
+            effect
+                .try_apply(&fixture.context(&registry, true), &fixture.desired)
+                .unwrap()
+                .unwrap();
+        }
+        let session = registry
+            .existing_session(&fixture.desired.cat_id)
+            .unwrap()
+            .unwrap();
+        let before = session.checkpoint_store().load().unwrap().unwrap();
+        let old = session.cell().snapshot();
+        let mut a_guard = session
+            .cell()
+            .acquire_verified_route(
+                &claims(&old.endpoints()[0].binding),
+                RouteGrantV2TimeVerdict::Valid,
+            )
+            .unwrap()
+            .0;
+        let mut b_guard = session
+            .cell()
+            .acquire_verified_route(
+                &claims(&old.endpoints()[1].binding),
+                RouteGrantV2TimeVerdict::Valid,
+            )
+            .unwrap()
+            .0;
+        let mut successor = fixture.desired.clone();
+        successor.desired_revision = Revision::new(successor.desired_revision.get() + 1).unwrap();
+        successor.endpoints[0].route_epoch =
+            Epoch::new(successor.endpoints[0].route_epoch.get() + 1).unwrap();
+        successor.endpoints[0].target_port += 10;
+        successor.spec_digest = spec_digest(&successor).unwrap();
+
+        RunningAdmissionPreScan::new(Arc::clone(&registry))
+            .reconcile(pre_scan_context(successor.clone()))
+            .unwrap();
+        // Model a transient scanner Incomplete outcome: no retirement
+        // sidecar/effect follows this successful mandatory pre-scan.
+        let unchanged = session.checkpoint_store().load().unwrap().unwrap();
+        assert_eq!(unchanged.content_digest(), before.content_digest());
+        assert_eq!(unchanged.checkpoint(), before.checkpoint());
+        tokio::time::timeout(Duration::from_secs(1), a_guard.cancelled())
+            .await
+            .expect("changed A guard is cancelled by the pre-scan latch");
+        assert!(
+            tokio::time::timeout(Duration::from_millis(25), b_guard.cancelled())
+                .await
+                .is_err(),
+            "unchanged B guard must survive Incomplete inventory"
+        );
+        assert!(session
+            .cell()
+            .acquire_verified_route(
+                &claims(&old.endpoints()[0].binding),
+                RouteGrantV2TimeVerdict::Valid,
+            )
+            .is_err());
+        let new_a_binding = route_binding(
+            &successor,
+            &successor.endpoints[0],
+            old.runtime_incarnation(),
+        )
+        .unwrap();
+        assert!(session
+            .cell()
+            .acquire_verified_route(&claims(&new_a_binding), RouteGrantV2TimeVerdict::Valid,)
+            .is_err());
+        let b = session
+            .cell()
+            .acquire_verified_route(
+                &claims(&old.endpoints()[1].binding),
+                RouteGrantV2TimeVerdict::Valid,
+            )
+            .expect("unchanged B remains admissible after Incomplete inventory");
+        drop(b);
+    }
+
+    #[tokio::test]
     async fn latched_changed_and_removed_endpoints_settle_one_at_a_time() {
         let fixture = Fixture::new(3);
         let registry = fixture.registry();
@@ -2794,6 +2879,86 @@ mod tests {
             ),
             Err(RouteAdmissionV2Reason::GateClosed)
         ));
+    }
+
+    #[test]
+    fn mandatory_pre_scan_rejects_each_drifted_require_idle_source_coordinate() {
+        for drift in ["attempt", "revision", "incarnation"] {
+            let fixture = Fixture::new(1);
+            let registry = fixture.registry();
+            let effect = RunningAdmissionEffect::new(Arc::clone(&registry));
+            effect
+                .try_apply(&fixture.context(&registry, true), &fixture.desired)
+                .unwrap()
+                .unwrap();
+            let session = registry
+                .existing_session(&fixture.desired.cat_id)
+                .unwrap()
+                .unwrap();
+            let old = session.cell().snapshot();
+            let _guard = session
+                .cell()
+                .acquire_verified_route(
+                    &claims(&old.endpoints()[0].binding),
+                    RouteGrantV2TimeVerdict::Valid,
+                )
+                .unwrap()
+                .0;
+            let mut successor = fixture.desired.clone();
+            successor.desired_revision =
+                Revision::new(successor.desired_revision.get() + 1).unwrap();
+            successor.target = RuntimeTarget::Suspended;
+            successor.transition = RuntimeTransition::RequireIdle {
+                attempt_id: RandomId128::new("cccccccccccccccccccccccccccccccc").unwrap(),
+                source_revision: fixture.desired.desired_revision,
+                source_runtime_incarnation: old.runtime_incarnation().cloned().unwrap(),
+            };
+            successor.spec_digest = spec_digest(&successor).unwrap();
+            let pre_scan = RunningAdmissionPreScan::new(Arc::clone(&registry));
+            pre_scan
+                .reconcile(pre_scan_context(successor.clone()))
+                .unwrap();
+            let busy = session.checkpoint_store().load().unwrap().unwrap();
+            let mut poisoned = busy.checkpoint().clone();
+            let RequireIdleCheckpoint::Busy {
+                attempt_id,
+                source_revision,
+                source_runtime_incarnation,
+                ..
+            } = &mut poisoned.require_idle
+            else {
+                panic!("fixture did not persist Busy/Open")
+            };
+            match drift {
+                "attempt" => {
+                    *attempt_id = RandomId128::new("dddddddddddddddddddddddddddddddd").unwrap();
+                }
+                "revision" => {
+                    *source_revision = Revision::new(source_revision.get() + 1).unwrap();
+                }
+                "incarnation" => {
+                    *source_runtime_incarnation =
+                        RandomId128::new("eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee").unwrap();
+                }
+                _ => unreachable!(),
+            }
+            poisoned.updated_at_unix_ms =
+                UnixMillis::new(poisoned.updated_at_unix_ms.get() + 1).unwrap();
+            session
+                .checkpoint_store()
+                .replace(&busy, &poisoned)
+                .unwrap();
+
+            let error = pre_scan
+                .reconcile(pre_scan_context(successor))
+                .expect_err("drifted RequireIdle tuple retained admission");
+            assert!(format!("{error:#}").contains("different source tuples"));
+            assert_eq!(
+                session.cell().snapshot().lifecycle_admission(),
+                LifecycleAdmission::Closed,
+                "{drift} drift did not fail closed"
+            );
+        }
     }
 
     #[test]

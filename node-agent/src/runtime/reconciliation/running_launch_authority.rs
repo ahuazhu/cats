@@ -11,8 +11,8 @@ use std::sync::Arc;
 
 use anyhow::{Context as _, Result};
 use cats_api::runtime_reconciliation::{
-    DesiredRuntimeSpec, Id, PrepareDeviceFrontend, ReconcileStep, RequireIdleCheckpoint,
-    RuntimeCheckpoint, RuntimeNetworkIdentity, RuntimeTarget, RuntimeTransition,
+    DesiredRuntimeSpec, Id, PrepareDeviceFrontend, RequireIdleCheckpoint, RuntimeCheckpoint,
+    RuntimeNetworkIdentity, RuntimeTarget, RuntimeTransition,
 };
 use cats_storage::authority::{VolumeDataAuthority, VolumeRecord};
 
@@ -720,6 +720,7 @@ impl<'a> ValidatedRunningCheckpoint<'a> {
         else {
             anyhow::bail!("retained close scan Desired is not RequireIdle")
         };
+        super::route_retirement::validate_require_idle_checkpoint_tuple(successor, checkpoint)?;
         let mut expected = source.clone();
         expected.desired_revision = successor.desired_revision;
         expected.spec_digest = successor.spec_digest.clone();
@@ -735,12 +736,6 @@ impl<'a> ValidatedRunningCheckpoint<'a> {
                 && checkpoint.desired_revision == successor.desired_revision
                 && checkpoint.spec_digest == successor.spec_digest
                 && checkpoint.runtime_incarnation.as_ref() == Some(source_runtime_incarnation)
-                && matches!(
-                    checkpoint.step,
-                    ReconcileStep::CloseAdmission {
-                        require_idle_attempt_id: Some(_)
-                    }
-                )
                 && matches!(
                     checkpoint.require_idle,
                     RequireIdleCheckpoint::Busy {

@@ -27,6 +27,59 @@ pub(crate) enum RouteRetirementMode {
     GlobalPhysicalNegative,
 }
 
+/// Binds every copy of the one-shot RequireIdle source tuple. The Desired,
+/// CloseAdmission journal token and Armed/Busy/Closed evidence must name the
+/// same attempt, source revision and runtime incarnation; no individual copy
+/// can stand in for the other two.
+pub(super) fn validate_require_idle_checkpoint_tuple(
+    desired: &DesiredRuntimeSpec,
+    checkpoint: &RuntimeCheckpoint,
+) -> anyhow::Result<()> {
+    let RuntimeTransition::RequireIdle {
+        attempt_id,
+        source_revision,
+        source_runtime_incarnation,
+    } = &desired.transition
+    else {
+        anyhow::bail!("Desired is not RequireIdle")
+    };
+    let ReconcileStep::CloseAdmission {
+        require_idle_attempt_id: Some(step_attempt_id),
+    } = &checkpoint.step
+    else {
+        anyhow::bail!("RequireIdle checkpoint lacks its CloseAdmission attempt token")
+    };
+    let (saved_attempt_id, saved_revision, saved_incarnation) = match &checkpoint.require_idle {
+        RequireIdleCheckpoint::Armed {
+            attempt_id,
+            source_revision,
+            source_runtime_incarnation,
+        }
+        | RequireIdleCheckpoint::Busy {
+            attempt_id,
+            source_revision,
+            source_runtime_incarnation,
+            ..
+        }
+        | RequireIdleCheckpoint::Closed {
+            attempt_id,
+            source_revision,
+            source_runtime_incarnation,
+        } => (attempt_id, source_revision, source_runtime_incarnation),
+        RequireIdleCheckpoint::NotApplicable => {
+            anyhow::bail!("RequireIdle checkpoint lacks one-shot evidence")
+        }
+    };
+    anyhow::ensure!(
+        step_attempt_id == attempt_id
+            && saved_attempt_id == attempt_id
+            && saved_revision == source_revision
+            && saved_incarnation == source_runtime_incarnation,
+        "RequireIdle Desired, journal and checkpoint evidence name different source tuples"
+    );
+    Ok(())
+}
+
 /// Returns the one sealed Running Desired which authorized every retained
 /// blockd in this launch (R0). Mixed or missing launch lineage is unavailable,
 /// not permission to infer either the live-gate predecessor or successor from
@@ -155,6 +208,9 @@ pub(crate) fn classify_current_global_route_retirement(
             && !matches!(checkpoint.step, ReconcileStep::CloseAdmission { .. }))
     {
         return Ok(None);
+    }
+    if matches!(desired.transition, RuntimeTransition::RequireIdle { .. }) {
+        validate_require_idle_checkpoint_tuple(desired, checkpoint)?;
     }
     let checkpoint_cell = AdmissionSnapshot::from_checkpoint(checkpoint)?;
     let exact_current = cell.snapshot() == &checkpoint_cell;
