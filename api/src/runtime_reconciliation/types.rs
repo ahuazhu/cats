@@ -1215,6 +1215,29 @@ pub struct PreparedDeviceInput {
     pub frontend: PrepareDeviceFrontend,
 }
 
+/// Exact PersistentDisk filesystem identity retained by every filesystem
+/// reconciliation step after the VMM has started.
+///
+/// This is deliberately a projection of one [`PreparedDeviceInput`] plus the
+/// current Desired mount contract.  The Node must join it back to the
+/// immutable top-level [`RuntimeLaunch`] before issuing a Guest effect; the
+/// Guest echo is physical evidence, never storage or attachment authority.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PersistentFilesystemBinding {
+    pub runtime_incarnation: RandomId128,
+    pub volume_intent_id: Id,
+    pub disk_id: Id,
+    pub volume_id: Id,
+    pub attachment_id: Id,
+    pub attachment_epoch: FenceEpoch,
+    pub size_bytes: u64,
+    pub guest_device: GuestDeviceIdentity,
+    pub filesystem_uuid: RandomId128,
+    pub mount_path: HostPath,
+    pub initialization: FilesystemInitialization,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 pub enum ReconcileStep {
@@ -1274,29 +1297,20 @@ pub enum ReconcileStep {
         devices: Vec<PreparedDeviceInput>,
     },
     FormatFilesystem {
-        volume_id: Id,
-        attachment_id: Id,
-        filesystem_uuid: RandomId128,
-        initialization_token: RandomId128,
-        expected_blank_head: RemoteHead,
+        filesystem: Box<PersistentFilesystemBinding>,
     },
     DrainInitialization {
-        volume_id: Id,
-        attachment_epoch: FenceEpoch,
+        filesystem: Box<PersistentFilesystemBinding>,
         local_generation: Generation,
         remote_generation: Generation,
     },
     CommitInitialized {
-        volume_id: Id,
-        initialization_token: RandomId128,
-        expected_blank_head: RemoteHead,
+        filesystem: Box<PersistentFilesystemBinding>,
         new_remote_head: RemoteHead,
     },
     MountFilesystem {
-        volume_id: Id,
-        guest_device: GuestDeviceIdentity,
-        filesystem_uuid: RandomId128,
-        mount_path: HostPath,
+        filesystem: Box<PersistentFilesystemBinding>,
+        expected_head: RemoteHead,
     },
     StartRuntime {
         runtime_incarnation: RandomId128,
@@ -1757,9 +1771,19 @@ pub struct RuntimeVolumeTransitionRequest {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 pub enum RuntimeVolumeTransition {
-    Acquire { request: VolumeAcquireRequest },
-    Release { cleanup: CleanupRelease },
-    DeleteDisposableRoot { authorization_id: Id },
+    Acquire {
+        request: VolumeAcquireRequest,
+    },
+    Release {
+        cleanup: CleanupRelease,
+    },
+    DeleteDisposableRoot {
+        authorization_id: Id,
+    },
+    CommitInitialized {
+        filesystem: Box<PersistentFilesystemBinding>,
+        new_remote_head: RemoteHead,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -1786,6 +1810,21 @@ pub enum RuntimeVolumeTransitionOutcome {
     DisposableRootDeleting {
         receipt: BeginDisposableDeleteConsumedReceipt,
     },
+    PersistentInitialized {
+        receipt: PersistentInitializationReceipt,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PersistentInitializationReceipt {
+    pub disk_id: Id,
+    pub volume_id: Id,
+    pub initialization_token: RandomId128,
+    pub filesystem_uuid: RandomId128,
+    pub expected_blank_head: RemoteHead,
+    pub initialized_head: RemoteHead,
+    pub initialized_at: UnixMillis,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

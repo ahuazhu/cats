@@ -14,8 +14,8 @@ use std::path::PathBuf;
 
 use crate::oci::{DeployOciRequest, OciDeployment};
 use crate::runtime_reconciliation::{
-    GuestBootId, GuestDeviceIdentity, HostPath, Id, MountAccess, RandomId128,
-    GUEST_DEVICE_SERIAL_MAX_BYTES_V1,
+    FilesystemInitialization, GuestBootId, GuestDeviceIdentity, HostPath, Id, MountAccess,
+    PersistentFilesystemBinding, RandomId128, RemoteHead, GUEST_DEVICE_SERIAL_MAX_BYTES_V1,
 };
 
 pub const MAX_FRAME_BYTES: u32 = 16 * 1024 * 1024;
@@ -37,6 +37,15 @@ pub const RUNTIME_READY_RESPONSE_MAX_FRAME_BYTES_V1: u32 = 4 * 1024 * 1024;
 pub const RUNTIME_READY_REQUEST_FRAME_TAG_V1: u8 = 0x01;
 /// Reserved non-JSON leading byte for one canonical RuntimeReady response.
 pub const RUNTIME_READY_RESPONSE_FRAME_TAG_V1: u8 = 0x02;
+/// Filesystem control is a separate ABI from RuntimeReady: in particular a
+/// pre-format probe can report a blank device and may never be decoded through
+/// the ready-state path.
+pub const FILESYSTEM_CONTROL_REQUEST_FRAME_TAG_V1: u8 = 0x03;
+pub const FILESYSTEM_CONTROL_RESPONSE_FRAME_TAG_V1: u8 = 0x04;
+pub const FILESYSTEM_CONTROL_REQUEST_MAX_FRAME_BYTES_V1: u32 = 16 * 1024;
+pub const FILESYSTEM_CONTROL_RESPONSE_MAX_FRAME_BYTES_V1: u32 = 64 * 1024;
+pub const FILESYSTEM_CONTROL_MAX_TIMEOUT_MS_V1: u32 = 120_000;
+pub const FILESYSTEM_CONTROL_MAX_MOUNTS_V1: usize = 4;
 /// Matches the frozen Runtime Reconciliation V1 maximum of Root plus 63
 /// Persistent volumes. RuntimeReady must not narrow an otherwise legal
 /// Desired/StartRuntime device set.
@@ -176,6 +185,27 @@ pub fn write_runtime_ready_request_frame<W: Write>(
     )
 }
 
+/// Write one canonical, independently capped Persistent filesystem request.
+/// The reserved tag is part of the length-prefixed frame and therefore lets
+/// the Guest reject an oversized prefix before allocating its JSON body.
+pub fn write_filesystem_control_request_frame<W: Write>(
+    writer: &mut W,
+    request: &GuestRequest,
+) -> std::io::Result<()> {
+    let GuestRequestBody::FilesystemControl { filesystem } = &request.body else {
+        return Err(std::io::Error::other(
+            "filesystem request codec received another operation",
+        ));
+    };
+    filesystem.validate().map_err(std::io::Error::other)?;
+    write_runtime_ready_tagged_frame(
+        writer,
+        FILESYSTEM_CONTROL_REQUEST_FRAME_TAG_V1,
+        request,
+        FILESYSTEM_CONTROL_REQUEST_MAX_FRAME_BYTES_V1,
+    )
+}
+
 /// Read the shared Guest request envelope. A RuntimeReady tag selects the
 /// independent 4 KiB cap after reading only the fixed prefix and tag; all
 /// other requests retain the generic 16 MiB JSON contract.
@@ -207,9 +237,29 @@ pub fn read_guest_request_frame<R: Read>(reader: &mut R) -> std::io::Result<Gues
         ready.validate().map_err(std::io::Error::other)?;
         return Ok(request);
     }
+    if first[0] == FILESYSTEM_CONTROL_REQUEST_FRAME_TAG_V1 {
+        if len > FILESYSTEM_CONTROL_REQUEST_MAX_FRAME_BYTES_V1 {
+            return Err(std::io::Error::other("oversized filesystem control frame"));
+        }
+        let mut body = vec![0u8; len as usize - 1];
+        reader.read_exact(&mut body)?;
+        let request: GuestRequest = decode_canonical_json(&body)?;
+        let GuestRequestBody::FilesystemControl { filesystem } = &request.body else {
+            return Err(std::io::Error::other(
+                "filesystem request tag carried another operation",
+            ));
+        };
+        filesystem.validate().map_err(std::io::Error::other)?;
+        return Ok(request);
+    }
     if first[0] == RUNTIME_READY_RESPONSE_FRAME_TAG_V1 {
         return Err(std::io::Error::other(
             "RuntimeReady response tag on request stream",
+        ));
+    }
+    if first[0] == FILESYSTEM_CONTROL_RESPONSE_FRAME_TAG_V1 {
+        return Err(std::io::Error::other(
+            "filesystem response tag on request stream",
         ));
     }
 
@@ -220,6 +270,11 @@ pub fn read_guest_request_frame<R: Read>(reader: &mut R) -> std::io::Result<Gues
     if matches!(&request.body, GuestRequestBody::RuntimeReady { .. }) {
         return Err(std::io::Error::other(
             "untagged RuntimeReady request is forbidden",
+        ));
+    }
+    if matches!(&request.body, GuestRequestBody::FilesystemControl { .. }) {
+        return Err(std::io::Error::other(
+            "untagged filesystem control request is forbidden",
         ));
     }
     Ok(request)
@@ -265,6 +320,51 @@ pub fn read_runtime_ready_response_frame<R: Read>(
         return Err(std::io::Error::other(
             "RuntimeReady response tag carried another result",
         ));
+    }
+    Ok(response)
+}
+
+pub fn write_filesystem_control_response_frame<W: Write>(
+    writer: &mut W,
+    response: &GuestResponse,
+) -> std::io::Result<()> {
+    match &response.body {
+        GuestResponseBody::FilesystemControl { filesystem } => {
+            filesystem.validate().map_err(std::io::Error::other)?;
+        }
+        GuestResponseBody::Error { .. } => {}
+        _ => {
+            return Err(std::io::Error::other(
+                "filesystem response codec received another result",
+            ));
+        }
+    }
+    write_runtime_ready_tagged_frame(
+        writer,
+        FILESYSTEM_CONTROL_RESPONSE_FRAME_TAG_V1,
+        response,
+        FILESYSTEM_CONTROL_RESPONSE_MAX_FRAME_BYTES_V1,
+    )
+}
+
+pub fn read_filesystem_control_response_frame<R: Read>(
+    reader: &mut R,
+) -> std::io::Result<GuestResponse> {
+    let response: GuestResponse = read_runtime_ready_tagged_frame(
+        reader,
+        FILESYSTEM_CONTROL_RESPONSE_FRAME_TAG_V1,
+        FILESYSTEM_CONTROL_RESPONSE_MAX_FRAME_BYTES_V1,
+    )?;
+    match &response.body {
+        GuestResponseBody::FilesystemControl { filesystem } => {
+            filesystem.validate().map_err(std::io::Error::other)?;
+        }
+        GuestResponseBody::Error { .. } => {}
+        _ => {
+            return Err(std::io::Error::other(
+                "filesystem response tag carried another result",
+            ));
+        }
     }
     Ok(response)
 }
@@ -317,6 +417,11 @@ pub enum GuestRequestBody {
     /// closed object keeps this new frozen ABI strict without changing the
     /// legacy flattened request shapes.
     RuntimeReady { ready: RuntimeReadyRequestV1 },
+    /// Dedicated PersistentDisk filesystem probe/effect ABI. This may not be
+    /// sent as generic JSON or decoded as RuntimeReady.
+    FilesystemControl {
+        filesystem: FilesystemControlRequestV1,
+    },
     /// Current user-program work leases. When `after_sequence` is supplied,
     /// wait until the sequence changes or the bounded timeout elapses.
     WorkStatus {
@@ -386,6 +491,9 @@ pub enum GuestResponseBody {
     },
     RuntimeReady {
         ready: RuntimeReadyResponseV1,
+    },
+    FilesystemControl {
+        filesystem: FilesystemControlResponseV1,
     },
     WorkStatus {
         status: GuestWorkStatus,
@@ -474,6 +582,100 @@ pub struct RuntimeReadyResponseV1 {
     pub mounts: Vec<RuntimeReadyMountV1>,
 }
 
+/// One bounded operation on exactly one PersistentDisk. `filesystem` is the
+/// checkpointed identity; `expected_head` is the current storage authority at
+/// the call boundary. Neither value becomes authoritative merely because the
+/// Guest echoes it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct FilesystemControlRequestV1 {
+    pub version: u16,
+    pub challenge: RandomId128,
+    pub timeout_ms: u32,
+    pub operation: FilesystemControlOperationV1,
+    pub filesystem: Box<PersistentFilesystemBinding>,
+    pub expected_head: RemoteHead,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum FilesystemControlOperationV1 {
+    Probe,
+    FormatExt4,
+    FlushDevice,
+    MountExt4,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+pub enum FilesystemIdentityV1 {
+    Blank,
+    Ext4 { filesystem_uuid: RandomId128 },
+    Foreign,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PersistentFilesystemMountV1 {
+    pub device_major: u32,
+    pub device_minor: u32,
+    pub source_path: HostPath,
+    pub mount_root: HostPath,
+    pub mount_path: HostPath,
+    pub filesystem_type: Id,
+    pub access: MountAccess,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PersistentFilesystemObservationV1 {
+    pub guest_device: GuestDeviceIdentity,
+    pub device_path: HostPath,
+    pub device_major: u32,
+    pub device_minor: u32,
+    pub size_bytes: u64,
+    pub filesystem: FilesystemIdentityV1,
+    pub mounts: Vec<PersistentFilesystemMountV1>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum FilesystemControlOutcomeV1 {
+    Exact,
+    Conflict,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct FilesystemControlResponseV1 {
+    pub version: u16,
+    pub request: Box<FilesystemControlRequestV1>,
+    pub outcome: FilesystemControlOutcomeV1,
+    pub observation: PersistentFilesystemObservationV1,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+pub enum FilesystemControlContractError {
+    #[error("filesystem control version is not the frozen V1 value")]
+    Version,
+    #[error("filesystem control timeout is outside the frozen V1 bound")]
+    Timeout,
+    #[error("filesystem control binding is not a canonical PersistentDisk contract")]
+    Binding,
+    #[error("filesystem control operation is incompatible with its initialization branch")]
+    Operation,
+    #[error("filesystem control RemoteHead is incomplete or incompatible with the operation")]
+    Head,
+    #[error("filesystem control response does not exactly echo its request")]
+    RequestEcho,
+    #[error("filesystem control observation does not match the challenged device")]
+    Device,
+    #[error("filesystem control mount projection is not canonical")]
+    Mount,
+    #[error("filesystem control exact outcome does not satisfy the requested postcondition")]
+    Postcondition,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
 pub enum RuntimeReadyContractError {
     #[error("RuntimeReady version is not the frozen V1 value")]
@@ -508,6 +710,163 @@ pub enum RuntimeReadyContractError {
 
 fn assignable_guest_cid(cid: u32) -> bool {
     (3..=u32::MAX - 1).contains(&cid)
+}
+
+fn complete_remote_head(head: &RemoteHead) -> bool {
+    if head.generation.get() == 0 {
+        head.root_hash.is_none() && head.root_object_id.is_none()
+    } else {
+        head.root_hash.is_some() && head.root_object_id.is_some()
+    }
+}
+
+impl FilesystemControlRequestV1 {
+    pub fn validate(&self) -> Result<(), FilesystemControlContractError> {
+        if self.version != GUEST_HOST_CONTROL_PROTOCOL_VERSION_V1 {
+            return Err(FilesystemControlContractError::Version);
+        }
+        if self.timeout_ms == 0 || self.timeout_ms > FILESYSTEM_CONTROL_MAX_TIMEOUT_MS_V1 {
+            return Err(FilesystemControlContractError::Timeout);
+        }
+        let filesystem = self.filesystem.as_ref();
+        if filesystem.size_bytes == 0
+            || filesystem.mount_path.as_str() == "/"
+            || filesystem.guest_device.serial.as_str().len() > GUEST_DEVICE_SERIAL_MAX_BYTES_V1
+        {
+            return Err(FilesystemControlContractError::Binding);
+        }
+        if !complete_remote_head(&self.expected_head) {
+            return Err(FilesystemControlContractError::Head);
+        }
+        match (&filesystem.initialization, self.operation) {
+            (
+                FilesystemInitialization::Initialize {
+                    initialization_token,
+                    expected_blank_head,
+                },
+                operation,
+            ) => {
+                if !complete_remote_head(expected_blank_head)
+                    || expected_blank_head.generation.get() != 0
+                    || initialization_token == &filesystem.filesystem_uuid
+                {
+                    return Err(FilesystemControlContractError::Binding);
+                }
+                match operation {
+                    FilesystemControlOperationV1::FormatExt4
+                    | FilesystemControlOperationV1::FlushDevice
+                        if self.expected_head != *expected_blank_head =>
+                    {
+                        return Err(FilesystemControlContractError::Head);
+                    }
+                    FilesystemControlOperationV1::MountExt4
+                        if self.expected_head.generation.get() == 0 =>
+                    {
+                        return Err(FilesystemControlContractError::Head);
+                    }
+                    _ => {}
+                }
+            }
+            (FilesystemInitialization::Existing, FilesystemControlOperationV1::Probe) => {
+                if self.expected_head.generation.get() == 0 {
+                    return Err(FilesystemControlContractError::Head);
+                }
+            }
+            (FilesystemInitialization::Existing, FilesystemControlOperationV1::MountExt4) => {
+                if self.expected_head.generation.get() == 0 {
+                    return Err(FilesystemControlContractError::Head);
+                }
+            }
+            (FilesystemInitialization::Existing, _) => {
+                return Err(FilesystemControlContractError::Operation);
+            }
+        }
+        Ok(())
+    }
+}
+
+impl FilesystemControlResponseV1 {
+    pub fn validate(&self) -> Result<(), FilesystemControlContractError> {
+        self.request.validate()?;
+        if self.version != GUEST_HOST_CONTROL_PROTOCOL_VERSION_V1 {
+            return Err(FilesystemControlContractError::Version);
+        }
+        let request = self.request.as_ref();
+        let expected = request.filesystem.as_ref();
+        let observation = &self.observation;
+        if observation.guest_device != expected.guest_device
+            || observation.size_bytes != expected.size_bytes
+            || (observation.device_major == 0 && observation.device_minor == 0)
+        {
+            return Err(FilesystemControlContractError::Device);
+        }
+        if observation.mounts.len() > FILESYSTEM_CONTROL_MAX_MOUNTS_V1 {
+            return Err(FilesystemControlContractError::Mount);
+        }
+        let mut prior: Option<(&str, &str)> = None;
+        let mut paths = BTreeSet::new();
+        for mount in &observation.mounts {
+            let key = (mount.mount_path.as_str(), mount.source_path.as_str());
+            if prior.is_some_and(|prior| prior >= key)
+                || !paths.insert(mount.mount_path.as_str())
+                || mount.device_major != observation.device_major
+                || mount.device_minor != observation.device_minor
+                || mount.source_path != observation.device_path
+            {
+                return Err(FilesystemControlContractError::Mount);
+            }
+            prior = Some(key);
+        }
+        if self.outcome == FilesystemControlOutcomeV1::Conflict {
+            return Ok(());
+        }
+
+        let expected_uuid = &expected.filesystem_uuid;
+        let exact_ext4 = matches!(
+            &observation.filesystem,
+            FilesystemIdentityV1::Ext4 { filesystem_uuid } if filesystem_uuid == expected_uuid
+        );
+        let exact_mount = || {
+            observation.mounts.as_slice().first().is_some_and(|mount| {
+                observation.mounts.len() == 1
+                    && mount.mount_root.as_str() == "/"
+                    && mount.mount_path == expected.mount_path
+                    && mount.filesystem_type.as_str() == "ext4"
+                    && mount.access == MountAccess::ReadWrite
+            })
+        };
+        let postcondition = match request.operation {
+            FilesystemControlOperationV1::Probe => match &expected.initialization {
+                FilesystemInitialization::Initialize { .. } => {
+                    observation.mounts.is_empty()
+                        && (matches!(observation.filesystem, FilesystemIdentityV1::Blank)
+                            || exact_ext4)
+                }
+                FilesystemInitialization::Existing => {
+                    exact_ext4 && (observation.mounts.is_empty() || exact_mount())
+                }
+            },
+            FilesystemControlOperationV1::FormatExt4
+            | FilesystemControlOperationV1::FlushDevice => {
+                exact_ext4 && observation.mounts.is_empty()
+            }
+            FilesystemControlOperationV1::MountExt4 => exact_ext4 && exact_mount(),
+        };
+        if !postcondition {
+            return Err(FilesystemControlContractError::Postcondition);
+        }
+        Ok(())
+    }
+
+    pub fn validate_against(
+        &self,
+        request: &FilesystemControlRequestV1,
+    ) -> Result<(), FilesystemControlContractError> {
+        if self.request.as_ref() != request {
+            return Err(FilesystemControlContractError::RequestEcho);
+        }
+        self.validate()
+    }
 }
 
 impl RuntimeReadyRequestV1 {
@@ -711,6 +1070,96 @@ mod tests {
         }
     }
 
+    fn blank_head() -> RemoteHead {
+        RemoteHead {
+            generation: crate::runtime_reconciliation::Generation::new(0).unwrap(),
+            root_hash: None,
+            root_object_id: None,
+        }
+    }
+
+    fn initialized_head() -> RemoteHead {
+        RemoteHead {
+            generation: crate::runtime_reconciliation::Generation::new(2).unwrap(),
+            root_hash: Some(
+                crate::runtime_reconciliation::Sha256Digest::new(format!(
+                    "sha256:{}",
+                    "55".repeat(32)
+                ))
+                .unwrap(),
+            ),
+            root_object_id: Some(
+                crate::runtime_reconciliation::AsciiText::new("volumes/data/roots/2").unwrap(),
+            ),
+        }
+    }
+
+    fn filesystem_request(operation: FilesystemControlOperationV1) -> FilesystemControlRequestV1 {
+        let expected_blank_head = blank_head();
+        FilesystemControlRequestV1 {
+            version: 1,
+            challenge: RandomId128::new("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa").unwrap(),
+            timeout_ms: 30_000,
+            operation,
+            filesystem: Box::new(PersistentFilesystemBinding {
+                runtime_incarnation: RandomId128::new("bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb").unwrap(),
+                volume_intent_id: Id::new("intent-data").unwrap(),
+                disk_id: Id::new("disk-data").unwrap(),
+                volume_id: Id::new("volume-data").unwrap(),
+                attachment_id: Id::new("attachment-data").unwrap(),
+                attachment_epoch: crate::runtime_reconciliation::FenceEpoch::new(4).unwrap(),
+                size_bytes: 4_294_967_296,
+                guest_device: GuestDeviceIdentity {
+                    serial: Id::new("cats-data").unwrap(),
+                    slot: 1,
+                },
+                filesystem_uuid: RandomId128::new("cccccccccccccccccccccccccccccccc").unwrap(),
+                mount_path: HostPath::new("/data").unwrap(),
+                initialization: FilesystemInitialization::Initialize {
+                    initialization_token: RandomId128::new("dddddddddddddddddddddddddddddddd")
+                        .unwrap(),
+                    expected_blank_head: expected_blank_head.clone(),
+                },
+            }),
+            expected_head: match operation {
+                FilesystemControlOperationV1::MountExt4 => initialized_head(),
+                _ => expected_blank_head,
+            },
+        }
+    }
+
+    fn filesystem_response(request: &FilesystemControlRequestV1) -> FilesystemControlResponseV1 {
+        let mounted = request.operation == FilesystemControlOperationV1::MountExt4;
+        FilesystemControlResponseV1 {
+            version: 1,
+            request: Box::new(request.clone()),
+            outcome: FilesystemControlOutcomeV1::Exact,
+            observation: PersistentFilesystemObservationV1 {
+                guest_device: request.filesystem.guest_device.clone(),
+                device_path: HostPath::new("/dev/vdb").unwrap(),
+                device_major: 252,
+                device_minor: 16,
+                size_bytes: request.filesystem.size_bytes,
+                filesystem: FilesystemIdentityV1::Ext4 {
+                    filesystem_uuid: request.filesystem.filesystem_uuid.clone(),
+                },
+                mounts: if mounted {
+                    vec![PersistentFilesystemMountV1 {
+                        device_major: 252,
+                        device_minor: 16,
+                        source_path: HostPath::new("/dev/vdb").unwrap(),
+                        mount_root: HostPath::new("/").unwrap(),
+                        mount_path: request.filesystem.mount_path.clone(),
+                        filesystem_type: Id::new("ext4").unwrap(),
+                        access: MountAccess::ReadWrite,
+                    }]
+                } else {
+                    Vec::new()
+                },
+            },
+        }
+    }
+
     #[test]
     fn guest_health_frame_is_byte_stable() {
         let request = GuestRequest {
@@ -779,6 +1228,161 @@ mod tests {
             decoded.body,
             GuestResponseBody::RuntimeReady { .. }
         ));
+    }
+
+    #[test]
+    fn filesystem_control_frames_have_frozen_directional_canonical_encodings() {
+        use sha2::{Digest as _, Sha256};
+
+        let request = filesystem_request(FilesystemControlOperationV1::FormatExt4);
+        let envelope = GuestRequest {
+            id: 9,
+            body: GuestRequestBody::FilesystemControl {
+                filesystem: request.clone(),
+            },
+        };
+        let mut encoded_request = Vec::new();
+        write_filesystem_control_request_frame(&mut encoded_request, &envelope).unwrap();
+        assert_eq!(encoded_request[4], FILESYSTEM_CONTROL_REQUEST_FRAME_TAG_V1);
+        assert_eq!(
+            u32::from_be_bytes(encoded_request[..4].try_into().unwrap()) as usize,
+            encoded_request.len() - 4
+        );
+        assert_eq!(
+            hex::encode(Sha256::digest(&encoded_request)),
+            "629eb8830ebf6ab9aef01d4efad850d804028c30d973b2450a5d9a2120c09c54"
+        );
+        let decoded_request = read_guest_request_frame(&mut &encoded_request[..]).unwrap();
+        assert_eq!(decoded_request.id, envelope.id);
+        let GuestRequestBody::FilesystemControl { filesystem } = decoded_request.body else {
+            panic!("filesystem request vector decoded as another operation")
+        };
+        assert_eq!(filesystem, request);
+
+        let response = GuestResponse {
+            id: 9,
+            body: GuestResponseBody::FilesystemControl {
+                filesystem: filesystem_response(&request),
+            },
+        };
+        let mut encoded_response = Vec::new();
+        write_filesystem_control_response_frame(&mut encoded_response, &response).unwrap();
+        assert_eq!(
+            encoded_response[4],
+            FILESYSTEM_CONTROL_RESPONSE_FRAME_TAG_V1
+        );
+        assert_eq!(
+            u32::from_be_bytes(encoded_response[..4].try_into().unwrap()) as usize,
+            encoded_response.len() - 4
+        );
+        assert_eq!(
+            hex::encode(Sha256::digest(&encoded_response)),
+            "49c365817c6491415ae8487e0c4c6eba1cd379bf3b7abf6a901d61c8c06538c6"
+        );
+        let decoded_response =
+            read_filesystem_control_response_frame(&mut &encoded_response[..]).unwrap();
+        assert_eq!(decoded_response.id, response.id);
+        let GuestResponseBody::FilesystemControl { filesystem } = decoded_response.body else {
+            panic!("filesystem response vector decoded as another result")
+        };
+        assert_eq!(filesystem, filesystem_response(&request));
+    }
+
+    #[test]
+    fn filesystem_control_contract_is_checkpoint_bound_and_fail_closed() {
+        let format = filesystem_request(FilesystemControlOperationV1::FormatExt4);
+        format.validate().unwrap();
+        filesystem_response(&format)
+            .validate_against(&format)
+            .unwrap();
+
+        let mut existing_format = format.clone();
+        existing_format.filesystem.initialization = FilesystemInitialization::Existing;
+        assert_eq!(
+            existing_format.validate(),
+            Err(FilesystemControlContractError::Operation)
+        );
+
+        let mut wrong_blank = format.clone();
+        wrong_blank.expected_head = initialized_head();
+        assert_eq!(
+            wrong_blank.validate(),
+            Err(FilesystemControlContractError::Head)
+        );
+
+        let mount = filesystem_request(FilesystemControlOperationV1::MountExt4);
+        let mut response = filesystem_response(&mount);
+        response.validate_against(&mount).unwrap();
+        response.request.filesystem.attachment_epoch =
+            crate::runtime_reconciliation::FenceEpoch::new(5).unwrap();
+        assert_eq!(
+            response.validate_against(&mount),
+            Err(FilesystemControlContractError::RequestEcho)
+        );
+
+        let mut response = filesystem_response(&mount);
+        response.observation.mounts[0].mount_path = HostPath::new("/foreign").unwrap();
+        assert_eq!(
+            response.validate_against(&mount),
+            Err(FilesystemControlContractError::Postcondition)
+        );
+
+        let mut conflict = filesystem_response(&mount);
+        conflict.outcome = FilesystemControlOutcomeV1::Conflict;
+        conflict.observation.filesystem = FilesystemIdentityV1::Foreign;
+        conflict.observation.mounts.clear();
+        conflict.validate_against(&mount).unwrap();
+    }
+
+    #[test]
+    fn filesystem_control_prefix_tag_and_canonical_failures_do_not_fallback() {
+        let mut oversized = (FILESYSTEM_CONTROL_REQUEST_MAX_FRAME_BYTES_V1 + 1)
+            .to_be_bytes()
+            .to_vec();
+        oversized.push(FILESYSTEM_CONTROL_REQUEST_FRAME_TAG_V1);
+        assert_eq!(
+            read_guest_request_frame(&mut &oversized[..])
+                .unwrap_err()
+                .to_string(),
+            "oversized filesystem control frame"
+        );
+
+        let request = GuestRequest {
+            id: 9,
+            body: GuestRequestBody::FilesystemControl {
+                filesystem: filesystem_request(FilesystemControlOperationV1::Probe),
+            },
+        };
+        let mut untagged = Vec::new();
+        write_frame(&mut untagged, &request).unwrap();
+        assert_eq!(
+            read_guest_request_frame(&mut &untagged[..])
+                .unwrap_err()
+                .to_string(),
+            "untagged filesystem control request is forbidden"
+        );
+
+        let mut tagged = Vec::new();
+        write_filesystem_control_request_frame(&mut tagged, &request).unwrap();
+        tagged[4] = FILESYSTEM_CONTROL_RESPONSE_FRAME_TAG_V1;
+        assert_eq!(
+            read_guest_request_frame(&mut &tagged[..])
+                .unwrap_err()
+                .to_string(),
+            "filesystem response tag on request stream"
+        );
+
+        let canonical = canonical_json(&request).unwrap();
+        let mut noncanonical = Vec::new();
+        noncanonical
+            .extend_from_slice(&(u32::try_from(canonical.len()).unwrap() + 2).to_be_bytes());
+        noncanonical.push(FILESYSTEM_CONTROL_REQUEST_FRAME_TAG_V1);
+        noncanonical.push(b' ');
+        noncanonical.extend_from_slice(&canonical);
+        assert!(read_guest_request_frame(&mut &noncanonical[..])
+            .unwrap_err()
+            .to_string()
+            .contains("non-canonical"));
     }
 
     #[test]

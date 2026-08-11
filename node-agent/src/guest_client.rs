@@ -8,9 +8,11 @@ use std::time::{Duration, Instant};
 use anyhow::{bail, Context, Result};
 
 use cats_api::guest::{
-    read_frame, read_runtime_ready_response_frame, write_frame, write_runtime_ready_request_frame,
-    GuestRequest, GuestRequestBody, GuestResponse, GuestResponseBody, GuestShellFrame,
-    GuestWorkStatus, RuntimeReadyRequestV1, RuntimeReadyResponseV1,
+    read_filesystem_control_response_frame, read_frame, read_runtime_ready_response_frame,
+    write_filesystem_control_request_frame, write_frame, write_runtime_ready_request_frame,
+    FilesystemControlRequestV1, FilesystemControlResponseV1, GuestRequest, GuestRequestBody,
+    GuestResponse, GuestResponseBody, GuestShellFrame, GuestWorkStatus, RuntimeReadyRequestV1,
+    RuntimeReadyResponseV1,
 };
 use cats_api::oci::{DeployOciRequest, OciDeployment};
 
@@ -199,6 +201,48 @@ impl GuestClient {
             }
             GuestResponseBody::Error { message } => bail!("guest error: {message}"),
             other => bail!("unexpected RuntimeReady response: {other:?}"),
+        }
+    }
+
+    /// Issue one independently tagged, canonical and bounded PersistentDisk
+    /// filesystem operation. A response must echo every authority-bearing
+    /// request field before its physical observation is returned.
+    pub fn filesystem_control(
+        &mut self,
+        request: FilesystemControlRequestV1,
+    ) -> Result<FilesystemControlResponseV1> {
+        request
+            .validate()
+            .context("validate filesystem control request before send")?;
+        let timeout = Duration::from_millis(u64::from(request.timeout_ms))
+            .checked_add(Duration::from_secs(5))
+            .context("filesystem control socket timeout overflow")?;
+        self.stream.set_read_timeout(Some(timeout))?;
+        self.stream.set_write_timeout(Some(timeout))?;
+        let id = self.next_id;
+        self.next_id += 1;
+        write_filesystem_control_request_frame(
+            &mut self.stream,
+            &GuestRequest {
+                id,
+                body: GuestRequestBody::FilesystemControl {
+                    filesystem: request.clone(),
+                },
+            },
+        )
+        .context("write bounded filesystem control request")?;
+        let response = read_filesystem_control_response_frame(&mut self.stream)
+            .context("read bounded filesystem control response")?;
+        anyhow::ensure!(response.id == id, "guest response id mismatch");
+        match response.body {
+            GuestResponseBody::FilesystemControl { filesystem } => {
+                filesystem
+                    .validate_against(&request)
+                    .context("validate filesystem control response")?;
+                Ok(filesystem)
+            }
+            GuestResponseBody::Error { message } => bail!("guest error: {message}"),
+            other => bail!("unexpected filesystem control response: {other:?}"),
         }
     }
 

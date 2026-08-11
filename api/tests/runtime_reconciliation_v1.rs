@@ -479,6 +479,47 @@ fn retain_fixed_runtime_launch(checkpoint: &mut serde_json::Value) {
     checkpoint["runtime_launch"] = start["runtime_launch"].clone();
 }
 
+fn persistent_filesystem_binding(initialized: bool) -> serde_json::Value {
+    let initialization = if initialized {
+        serde_json::json!({"kind": "existing"})
+    } else {
+        serde_json::json!({
+            "kind": "initialize",
+            "initialization_token": "cccccccccccccccccccccccccccccccc",
+            "expected_blank_head": zero_remote_head(),
+        })
+    };
+    serde_json::json!({
+        "runtime_incarnation": "55555555555555555555555555555555",
+        "volume_intent_id": "vint_zdata",
+        "disk_id": "disk_zdata",
+        "volume_id": "vol_zdata",
+        "attachment_id": "att_zdata",
+        "attachment_epoch": 9,
+        "size_bytes": 4_294_967_296_u64,
+        "guest_device": {"serial": "cats-data", "slot": 1},
+        "filesystem_uuid": "dddddddddddddddddddddddddddddddd",
+        "mount_path": "/data",
+        "initialization": initialization,
+    })
+}
+
+fn retain_runtime_launch_with_persistent(checkpoint: &mut serde_json::Value, initialized: bool) {
+    let start = start_runtime_checkpoint_value();
+    let mut follower = prepared_follower_input();
+    if !initialized {
+        follower["expected_head"] = zero_remote_head();
+        follower["serving_authority"]["purpose"] = "persistent_uninitialized".into();
+    }
+    let mut launch = start["runtime_launch"].clone();
+    launch["identity"]["devices"]
+        .as_array_mut()
+        .unwrap()
+        .push(follower);
+    checkpoint["runtime_incarnation"] = start["runtime_incarnation"].clone();
+    checkpoint["runtime_launch"] = launch;
+}
+
 fn crash_redecode_checkpoint_value(checkpoint: &serde_json::Value) -> serde_json::Value {
     let wire = serde_json::to_vec(checkpoint).unwrap();
     let decoded = decode_runtime_checkpoint(&wire).unwrap();
@@ -2856,20 +2897,14 @@ fn volume_and_gate_reconcile_steps_round_trip_without_copied_authority_payloads(
             "format_filesystem",
             serde_json::json!({
                 "kind": "format_filesystem",
-                "volume_id": "vol_root",
-                "attachment_id": "att_01",
-                "filesystem_uuid": "99999999999999999999999999999999",
-                "initialization_token": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
-                "expected_blank_head": zero_remote_head(),
+                "filesystem": persistent_filesystem_binding(false),
             }),
         ),
         (
             "commit_initialized",
             serde_json::json!({
                 "kind": "commit_initialized",
-                "volume_id": "vol_root",
-                "initialization_token": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
-                "expected_blank_head": zero_remote_head(),
+                "filesystem": persistent_filesystem_binding(false),
                 "new_remote_head": nonzero_remote_head(),
             }),
         ),
@@ -2903,7 +2938,11 @@ fn volume_and_gate_reconcile_steps_round_trip_without_copied_authority_payloads(
             name,
             "close_gate" | "format_filesystem" | "commit_initialized" | "snapshot_warm_runtime"
         ) {
-            retain_fixed_runtime_launch(&mut checkpoint);
+            if matches!(name, "format_filesystem" | "commit_initialized") {
+                retain_runtime_launch_with_persistent(&mut checkpoint, false);
+            } else {
+                retain_fixed_runtime_launch(&mut checkpoint);
+            }
         }
         if name == "close_gate" {
             checkpoint["route_gates"] =
@@ -3199,7 +3238,15 @@ fn fixed_running_launch_chain_preserves_desired_binding_and_prepared_authority()
 
 #[test]
 fn running_tail_successors_crash_redecode_the_exact_start_runtime_launch() {
-    let start = start_runtime_checkpoint_value();
+    let mut start = start_runtime_checkpoint_value();
+    let mut follower = prepared_follower_input();
+    follower["expected_head"] = zero_remote_head();
+    follower["serving_authority"]["purpose"] = "persistent_uninitialized".into();
+    start["step"]["devices"]
+        .as_array_mut()
+        .unwrap()
+        .push(follower);
+    sync_retained_runtime_launch(&mut start);
     assert_eq!(
         start["runtime_launch"],
         retained_runtime_launch(&start["step"]),
@@ -3241,28 +3288,15 @@ fn running_tail_successors_crash_redecode_the_exact_start_runtime_launch() {
     let mut format_filesystem = start.clone();
     format_filesystem["step"] = serde_json::json!({
         "kind": "format_filesystem",
-        "volume_id": "vol_root",
-        "attachment_id": "att_01",
-        "filesystem_uuid": "99999999999999999999999999999999",
-        "initialization_token": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
-        "expected_blank_head": {
-            "generation": 0,
-            "root_hash": null,
-            "root_object_id": null,
-        },
+        "filesystem": persistent_filesystem_binding(false),
     });
     assert_retained("format_filesystem", format_filesystem);
 
     let mut mount_filesystem = start.clone();
     mount_filesystem["step"] = serde_json::json!({
         "kind": "mount_filesystem",
-        "volume_id": "vol_root",
-        "guest_device": {
-            "serial": "cats-root",
-            "slot": 0,
-        },
-        "filesystem_uuid": "99999999999999999999999999999999",
-        "mount_path": "/run/cats/mnt/root",
+        "filesystem": persistent_filesystem_binding(false),
+        "expected_head": nonzero_remote_head(),
     });
     assert_retained("mount_filesystem", mount_filesystem);
 
@@ -5577,29 +5611,27 @@ fn remote_head_accepts_exactly_the_two_complete_states() {
         (1, Some(ZERO_DIGEST), Some("volumes/vol_root/roots/1"), true),
     ];
 
-    for (generation, root_hash, root_object_id, valid) in combinations {
+    for (generation, root_hash, root_object_id, structurally_valid) in combinations {
         let mut checkpoint: serde_json::Value = serde_json::from_str(CHECKPOINT_WIRE).unwrap();
         checkpoint["step"] = serde_json::json!({
-            "kind": "format_filesystem",
-            "volume_id": "vol_root",
-            "attachment_id": "att_01",
-            "filesystem_uuid": "99999999999999999999999999999999",
-            "initialization_token": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
-            "expected_blank_head": {
+            "kind": "commit_initialized",
+            "filesystem": persistent_filesystem_binding(false),
+            "new_remote_head": {
                 "generation": generation,
                 "root_hash": root_hash,
                 "root_object_id": root_object_id,
             },
         });
-        retain_fixed_runtime_launch(&mut checkpoint);
+        retain_runtime_launch_with_persistent(&mut checkpoint, false);
         let result = decode_runtime_checkpoint(&serde_json::to_vec(&checkpoint).unwrap());
+        let valid = structurally_valid && generation > 0;
         if valid {
             result.unwrap();
         } else {
             let error = result.unwrap_err();
             assert_eq!(
                 malformed(&error).0.as_str(),
-                "/step/expected_blank_head",
+                "/step/new_remote_head",
                 "generation={generation}, hash={}, object={}",
                 root_hash.is_some(),
                 root_object_id.is_some(),
@@ -5620,11 +5652,23 @@ fn every_remote_head_host_reuses_the_same_validator() {
     });
     let invalid_step = serde_json::json!({
         "kind": "format_filesystem",
-        "volume_id": "vol_root",
-        "attachment_id": "att_01",
-        "filesystem_uuid": "99999999999999999999999999999999",
-        "initialization_token": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
-        "expected_blank_head": invalid_head,
+        "filesystem": {
+            "runtime_incarnation": "55555555555555555555555555555555",
+            "volume_intent_id": "vint_zdata",
+            "disk_id": "disk_zdata",
+            "volume_id": "vol_zdata",
+            "attachment_id": "att_zdata",
+            "attachment_epoch": 9,
+            "size_bytes": 4_294_967_296_u64,
+            "guest_device": {"serial": "cats-data", "slot": 1},
+            "filesystem_uuid": "dddddddddddddddddddddddddddddddd",
+            "mount_path": "/data",
+            "initialization": {
+                "kind": "initialize",
+                "initialization_token": "cccccccccccccccccccccccccccccccc",
+                "expected_blank_head": invalid_head,
+            },
+        },
     });
 
     let mut desired = desired_value();
@@ -5641,7 +5685,7 @@ fn every_remote_head_host_reuses_the_same_validator() {
 
     let mut checkpoint_step: serde_json::Value = serde_json::from_str(CHECKPOINT_WIRE).unwrap();
     checkpoint_step["step"] = invalid_step.clone();
-    retain_fixed_runtime_launch(&mut checkpoint_step);
+    retain_runtime_launch_with_persistent(&mut checkpoint_step, false);
 
     let projection: serde_json::Value = serde_json::from_str(NONEMPTY_INVENTORY_INPUT).unwrap();
     let volume = projection["runtimes"][0]["volumes"][0].clone();
@@ -5677,11 +5721,10 @@ fn every_remote_head_host_reuses_the_same_validator() {
     let mut observed_runtime_and_checkpoint = observation.clone();
     observed_runtime_and_checkpoint["runtimes"][0]["step"] = invalid_step.clone();
     observed_runtime_and_checkpoint["runtimes"][0]["checkpoint"]["step"] = invalid_step.clone();
-    let start = start_runtime_checkpoint_value();
     observed_runtime_and_checkpoint["runtimes"][0]["checkpoint"]["runtime_incarnation"] =
         observed_runtime_and_checkpoint["runtimes"][0]["runtime_incarnation"].clone();
     observed_runtime_and_checkpoint["runtimes"][0]["checkpoint"]["runtime_launch"] =
-        start["runtime_launch"].clone();
+        checkpoint_step["runtime_launch"].clone();
 
     let mut progressing_condition = observation.clone();
     progressing_condition["runtimes"][0]["conditions"] = serde_json::json!([{
@@ -5706,19 +5749,19 @@ fn every_remote_head_host_reuses_the_same_validator() {
             "runtime_checkpoint_step",
             checkpoint_step,
             reject_checkpoint,
-            "/step/expected_blank_head",
+            "/step/filesystem/initialization/expected_blank_head",
         ),
         (
             "observed_runtime_and_checkpoint_step",
             observed_runtime_and_checkpoint,
             reject_observation,
-            "/runtimes/0/checkpoint/step/expected_blank_head",
+            "/runtimes/0/checkpoint/step/filesystem/initialization/expected_blank_head",
         ),
         (
             "progressing_condition_step",
             progressing_condition,
             reject_observation,
-            "/runtimes/0/conditions/0/reason/step/expected_blank_head",
+            "/runtimes/0/conditions/0/reason/step/filesystem/initialization/expected_blank_head",
         ),
         (
             "runtime_checkpoint_authority",

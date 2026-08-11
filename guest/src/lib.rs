@@ -26,13 +26,15 @@ use serde::{Deserialize, Serialize};
 
 pub use cats_api::guest::{read_frame, write_frame, DiskMap, DiskMapEntry};
 use cats_api::guest::{
-    read_guest_request_frame, write_runtime_ready_response_frame, AcquireGuestWorkLeaseRequest,
-    GuestRequestBody, GuestResponse, GuestResponseBody, GuestRuntimeApiError,
-    GuestRuntimeApiErrorResponse, GuestShellFrame, GuestWorkLease, GuestWorkStatus,
-    RenewGuestWorkLeaseRequest, GUEST_WORK_LEASES_PATH, MAX_WORK_LEASES, MAX_WORK_LEASE_TTL_MS,
+    read_guest_request_frame, write_filesystem_control_response_frame,
+    write_runtime_ready_response_frame, AcquireGuestWorkLeaseRequest, GuestRequestBody,
+    GuestResponse, GuestResponseBody, GuestRuntimeApiError, GuestRuntimeApiErrorResponse,
+    GuestShellFrame, GuestWorkLease, GuestWorkStatus, RenewGuestWorkLeaseRequest,
+    GUEST_WORK_LEASES_PATH, MAX_WORK_LEASES, MAX_WORK_LEASE_TTL_MS,
 };
 use cats_block_client::NbdClient;
 
+mod filesystem_control;
 mod oci;
 mod runtime_ready;
 
@@ -623,15 +625,16 @@ impl GuestAgent {
     }
 
     pub fn handle(&self, req: GuestRequestBody) -> GuestResponseBody {
-        self.handle_on_transport(req, None)
+        self.handle_on_transport(req, None, None)
     }
 
     fn handle_on_transport(
         &self,
         req: GuestRequestBody,
         vsock_endpoint: Option<VsockLocalEndpoint>,
+        peer_fd: Option<std::os::fd::RawFd>,
     ) -> GuestResponseBody {
-        match self.try_handle(req, vsock_endpoint) {
+        match self.try_handle(req, vsock_endpoint, peer_fd) {
             Ok(resp) => resp,
             Err(e) => GuestResponseBody::Error {
                 message: format!("{e:#}"),
@@ -652,6 +655,7 @@ impl GuestAgent {
         &self,
         req: GuestRequestBody,
         vsock_endpoint: Option<VsockLocalEndpoint>,
+        peer_fd: Option<std::os::fd::RawFd>,
     ) -> Result<GuestResponseBody> {
         match req {
             GuestRequestBody::Health => {
@@ -679,6 +683,17 @@ impl GuestAgent {
                     &self.boot_id,
                 )?;
                 Ok(GuestResponseBody::RuntimeReady { ready })
+            }
+            GuestRequestBody::FilesystemControl { filesystem } => {
+                anyhow::ensure!(
+                    self.mode == GuestMode::Vm,
+                    "filesystem control is available only in a real Guest"
+                );
+                vsock_endpoint
+                    .context("filesystem control requires an accepted AF_VSOCK stream")?;
+                let filesystem = filesystem_control::FilesystemController::system()
+                    .execute(filesystem, peer_fd)?;
+                Ok(GuestResponseBody::FilesystemControl { filesystem })
             }
             GuestRequestBody::WorkStatus {
                 after_sequence,
@@ -973,12 +988,20 @@ impl GuestAgent {
                     body => {
                         let is_runtime_ready =
                             matches!(&body, GuestRequestBody::RuntimeReady { .. });
+                        let is_filesystem_control =
+                            matches!(&body, GuestRequestBody::FilesystemControl { .. });
                         let resp = GuestResponse {
                             id: req.id,
-                            body: agent.handle_on_transport(body, vsock_endpoint),
+                            body: agent.handle_on_transport(
+                                body,
+                                vsock_endpoint,
+                                Some(std::os::fd::AsRawFd::as_raw_fd(&stream)),
+                            ),
                         };
                         let written = if is_runtime_ready {
                             write_runtime_ready_response_frame(&mut stream, &resp)
+                        } else if is_filesystem_control {
+                            write_filesystem_control_response_frame(&mut stream, &resp)
                         } else {
                             write_frame(&mut stream, &resp)
                         };
@@ -1515,6 +1538,7 @@ mod tests {
                 cid: 4,
                 port: 5_000,
             }),
+            None,
         );
         let GuestResponseBody::Error { message } = rejected else {
             panic!("mismatched accepted AF_VSOCK endpoint was accepted")

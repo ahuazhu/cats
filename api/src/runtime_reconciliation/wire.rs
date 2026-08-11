@@ -1845,6 +1845,22 @@ fn mount_intent_schema() -> Schema {
     ])
 }
 
+fn persistent_filesystem_binding_schema() -> Schema {
+    object(vec![
+        field("runtime_incarnation", random_id()),
+        field("volume_intent_id", id()),
+        field("disk_id", id()),
+        field("volume_id", id()),
+        field("attachment_id", id()),
+        field("attachment_epoch", number(1, MAX_WIRE_INTEGER)),
+        field("size_bytes", number(1, MAX_WIRE_INTEGER)),
+        field("guest_device", guest_device_schema()),
+        field("filesystem_uuid", random_id()),
+        field("mount_path", string(StringRule::HostPath)),
+        field("initialization", filesystem_initialization_schema()),
+    ])
+}
+
 fn volume_intent_schema() -> Schema {
     object(vec![
         field("volume_intent_id", id()),
@@ -2362,6 +2378,13 @@ fn runtime_volume_transition_schema() -> Schema {
                 "delete_disposable_root",
                 vec![field("authorization_id", id())],
             ),
+            variant(
+                "commit_initialized",
+                vec![
+                    field("filesystem", persistent_filesystem_binding_schema()),
+                    field("new_remote_head", remote_head_schema()),
+                ],
+            ),
         ],
     )
 }
@@ -2405,6 +2428,21 @@ fn runtime_volume_transition_outcome_schema() -> Schema {
                 vec![field(
                     "receipt",
                     object(disposable_delete_consumed_receipt_fields()),
+                )],
+            ),
+            variant(
+                "persistent_initialized",
+                vec![field(
+                    "receipt",
+                    object(vec![
+                        field("disk_id", id()),
+                        field("volume_id", id()),
+                        field("initialization_token", random_id()),
+                        field("filesystem_uuid", random_id()),
+                        field("expected_blank_head", remote_head_schema()),
+                        field("initialized_head", remote_head_schema()),
+                        field("initialized_at", wire_u64()),
+                    ]),
                 )],
             ),
         ],
@@ -2839,19 +2877,12 @@ fn reconcile_step_schema() -> Schema {
             ),
             variant(
                 "format_filesystem",
-                vec![
-                    field("volume_id", id()),
-                    field("attachment_id", id()),
-                    field("filesystem_uuid", random_id()),
-                    field("initialization_token", random_id()),
-                    field("expected_blank_head", remote_head_schema()),
-                ],
+                vec![field("filesystem", persistent_filesystem_binding_schema())],
             ),
             variant(
                 "drain_initialization",
                 vec![
-                    field("volume_id", id()),
-                    field("attachment_epoch", wire_u64()),
+                    field("filesystem", persistent_filesystem_binding_schema()),
                     field("local_generation", wire_u64()),
                     field("remote_generation", wire_u64()),
                 ],
@@ -2859,19 +2890,15 @@ fn reconcile_step_schema() -> Schema {
             variant(
                 "commit_initialized",
                 vec![
-                    field("volume_id", id()),
-                    field("initialization_token", random_id()),
-                    field("expected_blank_head", remote_head_schema()),
+                    field("filesystem", persistent_filesystem_binding_schema()),
                     field("new_remote_head", remote_head_schema()),
                 ],
             ),
             variant(
                 "mount_filesystem",
                 vec![
-                    field("volume_id", id()),
-                    field("guest_device", guest_device_schema()),
-                    field("filesystem_uuid", random_id()),
-                    field("mount_path", string(StringRule::HostPath)),
+                    field("filesystem", persistent_filesystem_binding_schema()),
+                    field("expected_head", remote_head_schema()),
                 ],
             ),
             variant("start_runtime", runtime_launch_identity_fields()),
@@ -6198,6 +6225,30 @@ fn validate_runtime_volume_transition_request(
             request: VolumeAcquireRequest::Takeover { .. },
         }
         | RuntimeVolumeTransition::DeleteDisposableRoot { .. } => {}
+        RuntimeVolumeTransition::CommitInitialized {
+            filesystem,
+            new_remote_head,
+        } => {
+            let transition_path = path(&["transition"]);
+            collect_persistent_filesystem_binding_cross(
+                filesystem,
+                &transition_path,
+                true,
+                &mut candidates,
+            );
+            collect_remote_head_cross(
+                new_remote_head,
+                &child(&transition_path, "new_remote_head"),
+                &mut candidates,
+            );
+            if new_remote_head.generation.get() == 0 {
+                candidates.push(Candidate::field(
+                    &transition_path,
+                    "new_remote_head",
+                    MalformedProblem::InvalidValue,
+                ));
+            }
+        }
     }
     if let Some(candidate) = choose(candidates) {
         return Err(malformed(contract, candidate));
@@ -6228,6 +6279,24 @@ fn validate_runtime_volume_transition_success(
             &receipt.resulting_head,
             path(&["outcome", "receipt", "resulting_head"]),
         ),
+        RuntimeVolumeTransitionOutcome::PersistentInitialized { receipt } => {
+            let receipt_path = path(&["outcome", "receipt"]);
+            collect_remote_head_cross(
+                &receipt.expected_blank_head,
+                &child(&receipt_path, "expected_blank_head"),
+                &mut candidates,
+            );
+            if receipt.expected_blank_head.generation.get() != 0
+                || receipt.initialized_head.generation.get() == 0
+                || receipt.initialization_token == receipt.filesystem_uuid
+            {
+                candidates.push(Candidate::at(&receipt_path, MalformedProblem::InvalidValue));
+            }
+            (
+                &receipt.initialized_head,
+                child(&receipt_path, "initialized_head"),
+            )
+        }
     };
     collect_remote_head_cross(head, &head_path, &mut candidates);
     if let Some(candidate) = choose(candidates) {
@@ -6592,6 +6661,12 @@ fn runtime_launch_requirement(step: &ReconcileStep) -> RuntimeLaunchRequirement 
 
 fn step_runtime_incarnation(step: &ReconcileStep) -> Option<&RandomId128> {
     match step {
+        ReconcileStep::FormatFilesystem { filesystem }
+        | ReconcileStep::DrainInitialization { filesystem, .. }
+        | ReconcileStep::CommitInitialized { filesystem, .. }
+        | ReconcileStep::MountFilesystem { filesystem, .. } => {
+            Some(&filesystem.runtime_incarnation)
+        }
         ReconcileStep::StartRuntime {
             runtime_incarnation,
             ..
@@ -6673,6 +6748,62 @@ fn collect_runtime_launch_cross(
         {
             output.push(Candidate::at(&launch_path, MalformedProblem::InvalidValue));
         }
+    }
+
+    let step_path = child(base_path, "step");
+    let filesystem_step_is_independently_invalid = output
+        .iter()
+        .any(|candidate| candidate.path.starts_with(&step_path));
+    if let (Some(filesystem), RuntimeLaunch::Present(launch)) =
+        (persistent_filesystem_step_binding(step), runtime_launch)
+    {
+        if filesystem_step_is_independently_invalid {
+            return;
+        }
+        let exact = launch.runtime_incarnation == filesystem.runtime_incarnation
+            && launch
+                .devices
+                .iter()
+                .filter(|device| device.volume_intent_id == filesystem.volume_intent_id)
+                .count()
+                == 1
+            && launch.devices.iter().any(|device| {
+                device.disk_kind == DiskKind::Persistent
+                    && device.volume_intent_id == filesystem.volume_intent_id
+                    && device.disk_id == filesystem.disk_id
+                    && device.volume_id == filesystem.volume_id
+                    && device.attachment_id == filesystem.attachment_id
+                    && device.attachment_epoch == filesystem.attachment_epoch
+                    && device.size_bytes == filesystem.size_bytes
+                    && device.guest_device == filesystem.guest_device
+                    && match &filesystem.initialization {
+                        FilesystemInitialization::Initialize {
+                            expected_blank_head,
+                            ..
+                        } => device.expected_head == *expected_blank_head,
+                        FilesystemInitialization::Existing => match step {
+                            ReconcileStep::MountFilesystem { expected_head, .. } => {
+                                device.expected_head == *expected_head
+                            }
+                            _ => false,
+                        },
+                    }
+            });
+        if !exact {
+            output.push(Candidate::at(&launch_path, MalformedProblem::InvalidValue));
+        }
+    }
+}
+
+fn persistent_filesystem_step_binding(
+    step: &ReconcileStep,
+) -> Option<&PersistentFilesystemBinding> {
+    match step {
+        ReconcileStep::FormatFilesystem { filesystem }
+        | ReconcileStep::DrainInitialization { filesystem, .. }
+        | ReconcileStep::CommitInitialized { filesystem, .. }
+        | ReconcileStep::MountFilesystem { filesystem, .. } => Some(filesystem),
+        _ => None,
     }
 }
 
@@ -8986,25 +9117,46 @@ fn collect_reconcile_step_cross(
                 output.push(Candidate::at(path, MalformedProblem::InvalidValue));
             }
         }
-        ReconcileStep::FormatFilesystem {
-            expected_blank_head,
-            ..
-        } => collect_remote_head_cross(
-            expected_blank_head,
-            &child(path, "expected_blank_head"),
-            output,
-        ),
+        ReconcileStep::FormatFilesystem { filesystem } => {
+            collect_persistent_filesystem_binding_cross(filesystem, path, true, output);
+        }
         ReconcileStep::CommitInitialized {
-            expected_blank_head,
+            filesystem,
             new_remote_head,
-            ..
         } => {
-            collect_remote_head_cross(
-                expected_blank_head,
-                &child(path, "expected_blank_head"),
-                output,
-            );
+            collect_persistent_filesystem_binding_cross(filesystem, path, true, output);
             collect_remote_head_cross(new_remote_head, &child(path, "new_remote_head"), output);
+            if new_remote_head.generation.get() == 0 {
+                output.push(Candidate::field(
+                    path,
+                    "new_remote_head",
+                    MalformedProblem::InvalidValue,
+                ));
+            }
+        }
+        ReconcileStep::DrainInitialization {
+            filesystem,
+            local_generation,
+            remote_generation,
+        } => {
+            collect_persistent_filesystem_binding_cross(filesystem, path, true, output);
+            if local_generation.get() < remote_generation.get() {
+                output.push(Candidate::at(path, MalformedProblem::InvalidValue));
+            }
+        }
+        ReconcileStep::MountFilesystem {
+            filesystem,
+            expected_head,
+        } => {
+            collect_persistent_filesystem_binding_cross(filesystem, path, false, output);
+            collect_remote_head_cross(expected_head, &child(path, "expected_head"), output);
+            if expected_head.generation.get() == 0 {
+                output.push(Candidate::field(
+                    path,
+                    "expected_head",
+                    MalformedProblem::InvalidValue,
+                ));
+            }
         }
         ReconcileStep::ProvisionRootImage {
             expected_blank_head,
@@ -9033,12 +9185,7 @@ fn collect_reconcile_step_cross(
                 output,
             );
         }
-        ReconcileStep::DrainInitialization {
-            local_generation,
-            remote_generation,
-            ..
-        }
-        | ReconcileStep::DrainPublish {
+        ReconcileStep::DrainPublish {
             local_generation,
             remote_generation,
             ..
@@ -9046,6 +9193,56 @@ fn collect_reconcile_step_cross(
             output.push(Candidate::at(path, MalformedProblem::InvalidValue));
         }
         _ => {}
+    }
+}
+
+fn collect_persistent_filesystem_binding_cross(
+    filesystem: &PersistentFilesystemBinding,
+    step_path: &[PathSegment],
+    initialize_required: bool,
+    output: &mut Vec<Candidate>,
+) {
+    let path = child(step_path, "filesystem");
+    if filesystem.mount_path.as_str() == "/" {
+        output.push(Candidate::field(
+            &path,
+            "mount_path",
+            MalformedProblem::InvalidValue,
+        ));
+    }
+    match &filesystem.initialization {
+        FilesystemInitialization::Initialize {
+            initialization_token,
+            expected_blank_head,
+        } => {
+            let initialization_path = child(&path, "initialization");
+            collect_remote_head_cross(
+                expected_blank_head,
+                &child(&initialization_path, "expected_blank_head"),
+                output,
+            );
+            if expected_blank_head.generation.get() != 0 {
+                output.push(Candidate::field(
+                    &initialization_path,
+                    "expected_blank_head",
+                    MalformedProblem::InvalidValue,
+                ));
+            }
+            if initialization_token == &filesystem.filesystem_uuid {
+                output.push(Candidate::at(
+                    &initialization_path,
+                    MalformedProblem::InvalidValue,
+                ));
+            }
+        }
+        FilesystemInitialization::Existing if initialize_required => {
+            output.push(Candidate::field(
+                &path,
+                "initialization",
+                MalformedProblem::InvalidValue,
+            ));
+        }
+        FilesystemInitialization::Existing => {}
     }
 }
 
