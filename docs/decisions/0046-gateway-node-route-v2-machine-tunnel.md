@@ -46,7 +46,9 @@ Control resolve已经由current PostgreSQL Gateway credential签发Grant。若Gr
    取消或shutdown。
 9. shutdown先关闭machine admission，再关闭connections并cancel/join全部tunnel；所有guard和permit必须在
    listener完成前归还。`runtime_cutover`中的scanner、effect与transport必须clone同一进程唯一的
-   `Arc<AdmissionCellRegistry>`，不得各自构造registry。
+   `Arc<AdmissionCellRegistry>`，不得各自构造registry。scanner报告的`loaded_kids`也必须来自listener实际
+   使用的同一个`Arc<RouteGrantV2Verifier>`；不得把磁盘上的候选ring误报成进程已加载的authority。listener
+   未组成时ring observation为Unavailable，Control不能向关闭的ingress签发Grant。
 10. Node固定artifact为public ring、Gateway client CA、Node server certificate/private key；Gateway固定
     artifact为Node server CA、Gateway client certificate/private key。目录root:root `0700`，public material
     `0644`，private key `0600`，用no-follow、single-link、stable descriptor合同一次性读取。显式配置listener

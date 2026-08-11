@@ -11,9 +11,6 @@ use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::Context as _;
-use cats_api::runtime_artifacts::{
-    inspect_installed_route_grant_v2_public_key_ring, InstalledRouteGrantV2PublicKeyRingState,
-};
 use cats_api::runtime_reconciliation::{
     checkpoint_content_digest, AppliedDesiredEvidence, CheckpointEvidence, Condition,
     DesiredRuntimeSpec, GuestTransportEvidence, HostPath, Id, InventorySource, LifecycleAdmission,
@@ -30,7 +27,7 @@ use cats_storage::{
 };
 use thiserror::Error;
 
-use crate::route_grant_v2::RouteGrantV2KeyRing;
+use crate::route_grant_v2::RouteGrantV2Verifier;
 use crate::runtime_spine::{
     CompleteRuntimeInventory, InventoryCoverageAggregator, RuntimeInventoryKeyRing,
     RuntimeInventoryScanContext, RuntimeInventoryScanOutcome, RuntimeInventoryScanner,
@@ -232,9 +229,9 @@ pub(crate) mod runtime_inventory_key_ring_reader_sealed {
     pub(crate) trait Sealed {}
 }
 
-/// One bounded read of the Node's installed Route v2 verifier ring. The
-/// scanner calls this port at most once per full scan and never retains a
-/// successful result for a later scan.
+/// One bounded read of the Node's actually loaded Route v2 verifier ring. The
+/// scanner calls this port at most once per full scan and never substitutes
+/// filesystem candidates for the in-process authorization fact.
 pub(crate) trait RuntimeInventoryKeyRingReader:
     runtime_inventory_key_ring_reader_sealed::Sealed + Send + Sync + 'static
 {
@@ -245,33 +242,34 @@ pub(crate) trait RuntimeInventoryKeyRingReader:
 }
 
 #[derive(Debug)]
-pub(crate) struct InstalledRuntimeInventoryKeyRingReader;
+pub(crate) struct ActiveRuntimeInventoryKeyRingReader {
+    verifier: Arc<RouteGrantV2Verifier>,
+}
 
-impl runtime_inventory_key_ring_reader_sealed::Sealed for InstalledRuntimeInventoryKeyRingReader {}
+impl ActiveRuntimeInventoryKeyRingReader {
+    pub(crate) fn new(verifier: Arc<RouteGrantV2Verifier>) -> Self {
+        Self { verifier }
+    }
+}
 
-impl RuntimeInventoryKeyRingReader for InstalledRuntimeInventoryKeyRingReader {
+impl runtime_inventory_key_ring_reader_sealed::Sealed for ActiveRuntimeInventoryKeyRingReader {}
+
+impl RuntimeInventoryKeyRingReader for ActiveRuntimeInventoryKeyRingReader {
     fn read(
         &self,
         context: &RuntimeInventoryScanContext,
     ) -> anyhow::Result<RuntimeInventoryKeyRing> {
         context.check_active()?;
-        let installed = inspect_installed_route_grant_v2_public_key_ring()
-            .context("inspect the fixed installed Route Grant v2 public-key ring")?;
+        let ring = self
+            .verifier
+            .current_ring()
+            .context("read the active Route Grant v2 verifier ring")?;
         context.check_active()?;
-        match installed {
-            InstalledRouteGrantV2PublicKeyRingState::Unavailable => {
-                Ok(RuntimeInventoryKeyRing::Unavailable)
-            }
-            InstalledRouteGrantV2PublicKeyRingState::Loaded(installed) => {
-                let ring = RouteGrantV2KeyRing::from_artifact(installed.ring())
-                    .context("construct the installed Route Grant v2 verifier ring")?;
-                Ok(RuntimeInventoryKeyRing::Loaded {
-                    version: ring.version(),
-                    digest: ring.digest().clone(),
-                    kids: ring.loaded_kids().to_vec(),
-                })
-            }
-        }
+        Ok(RuntimeInventoryKeyRing::Loaded {
+            version: ring.version(),
+            digest: ring.digest().clone(),
+            kids: ring.loaded_kids().to_vec(),
+        })
     }
 }
 
@@ -2299,6 +2297,7 @@ mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::time::Instant;
 
+    use cats_api::route_grant_v2::decode_route_grant_v2_public_key_ring;
     use cats_api::runtime_reconciliation::{
         decode_desired_read_snapshot, decode_runtime_checkpoint, encode_node_observation,
         encode_runtime_checkpoint, inventory_digest, spec_digest, AssignedKind, AssignedPlacement,
@@ -2311,8 +2310,10 @@ mod tests {
     use cats_api::runtime_reconciliation::{decode_desired_runtime_spec, RuntimeLaunch};
 
     use super::*;
+    use crate::route_grant_v2::{RouteGrantV2KeyRing, RouteGrantV2Verifier};
 
     const SNAPSHOT: &[u8] = br#"{"desired_specs":[],"expires_at_unix_ms":1720000030000,"issued_at_unix_ms":1720000000000,"read_position":12,"request_sequence":1,"session":{"agent_instance_id":"44444444444444444444444444444444","agent_session_epoch":2,"node_boot_id":"33333333333333333333333333333333","node_id":"node_a"},"version":1}"#;
+    const ACTIVE_ROUTE_RING: &[u8] = br#"{"version":1,"ring_version":1,"expected_previous":null,"keys":[{"kid":"2281a02a7f42d92fa9caa5b7907b29c2f060cb00196be280af33fb7bc8e27e99","public_key_spki":"MCowBQYDK2VwAyEAsz3X-kqrYHysotqiQjIuGgGom4LK9bK8tonhiWAQ0To"}]}"#;
 
     #[cfg(target_os = "linux")]
     #[test]
@@ -2740,6 +2741,41 @@ mod tests {
         };
         assert_eq!(inventory.key_ring(), &RuntimeInventoryKeyRing::Unavailable);
         assert_eq!(absent_calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn active_verifier_reader_tracks_the_exact_in_process_ring() {
+        let artifact = decode_route_grant_v2_public_key_ring(ACTIVE_ROUTE_RING).unwrap();
+        let public_keys = artifact.public_keys().unwrap();
+        let initial = RouteGrantV2KeyRing::from_artifact(&artifact).unwrap();
+        let verifier = Arc::new(RouteGrantV2Verifier::new(initial));
+        let reader = ActiveRuntimeInventoryKeyRingReader::new(Arc::clone(&verifier));
+
+        assert_eq!(
+            reader.read(&context()).unwrap(),
+            RuntimeInventoryKeyRing::Loaded {
+                version: artifact.ring_version,
+                digest: artifact.digest().unwrap(),
+                kids: artifact
+                    .keys
+                    .iter()
+                    .map(|entry| entry.kid.clone())
+                    .collect(),
+            }
+        );
+
+        let replacement = RouteGrantV2KeyRing::new(Epoch::new(2).unwrap(), public_keys).unwrap();
+        let replacement_digest = replacement.digest().clone();
+        let replacement_kids = replacement.loaded_kids().to_vec();
+        verifier.replace_ring(replacement).unwrap();
+        assert_eq!(
+            reader.read(&context()).unwrap(),
+            RuntimeInventoryKeyRing::Loaded {
+                version: Epoch::new(2).unwrap(),
+                digest: replacement_digest,
+                kids: replacement_kids,
+            }
+        );
     }
 
     #[test]

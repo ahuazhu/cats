@@ -123,7 +123,7 @@ use super::vmm_socket_namespace::{
 };
 use super::{
     inventory::{
-        root_process_inventory_bridge_sealed, InstalledRuntimeInventoryKeyRingReader,
+        root_process_inventory_bridge_sealed, ActiveRuntimeInventoryKeyRingReader,
         RootProcessInventoryBridge, RootProcessInventoryBridgeOutcome,
     },
     AdmissionCellRegistry, AuthorizedBlockdCheckpoint, CleanSlateInventoryScanner,
@@ -1098,16 +1098,27 @@ impl ProbeConfig {
 pub(crate) fn installed_clean_slate_scanner(
     config: InstalledCleanSlateProbeConfig,
     admission_registry: Arc<AdmissionCellRegistry>,
+    route_grant_verifier: Option<Arc<crate::route_grant_v2::RouteGrantV2Verifier>>,
 ) -> anyhow::Result<Arc<dyn RuntimeInventoryScanner>> {
     let metadata_authority = Arc::new(PagedMetadataAuthorityReader::new(Arc::new(
         RuntimeVolumeInventoryPagePort::start(Arc::clone(&config.volume_inventory_authority))?,
     )));
     let blob_store = Arc::clone(&config.blob_store);
     let config = ProbeConfig::installed(config)?;
-    let scanner =
-        scanner_with_metadata_authority_and_blob(config, metadata_authority, Some(blob_store))?
-            .with_key_ring_reader(Arc::new(InstalledRuntimeInventoryKeyRingReader))
-            .with_running_tail(admission_registry);
+    let scanner = scanner_with_metadata_authority_and_blob(
+        config,
+        metadata_authority,
+        Some(blob_store),
+    )?
+    .with_running_tail(admission_registry);
+    let scanner = match route_grant_verifier {
+        Some(verifier) => scanner
+            .with_key_ring_reader(Arc::new(ActiveRuntimeInventoryKeyRingReader::new(verifier))),
+        // A ring artifact is not an authorization fact when the machine
+        // listener is disabled. Reporting unavailable prevents Control from
+        // minting a Grant to an ingress that this process cannot serve.
+        None => scanner,
+    };
     Ok(Arc::new(scanner))
 }
 

@@ -256,6 +256,9 @@ async fn spawn_signed_runtime_cutover_with_overrides(
     recovery_override: Option<SignedRunningPublicationRecovery>,
 ) -> anyhow::Result<SignedRuntimeCutoverHandle> {
     let route_v2_machine_config = config.route_v2_machine;
+    let route_v2_verifier = route_v2_machine_config
+        .as_ref()
+        .map(RouteV2MachineConfig::verifier);
     // Reject an unrepresentable operator budget before registration, worker
     // construction, or listener binding can mutate external/local state.
     config
@@ -359,10 +362,12 @@ async fn spawn_signed_runtime_cutover_with_overrides(
     let admission_registry = AdmissionCellRegistry::for_state_directory(&effect_state_directory);
     let scanner = match scanner_override {
         Some(scanner) => scanner,
-        None => {
-            installed_clean_slate_scanner(installed_probe_config, Arc::clone(&admission_registry))
-                .context("compose installed clean-slate inventory probes")?
-        }
+        None => installed_clean_slate_scanner(
+            installed_probe_config,
+            Arc::clone(&admission_registry),
+            route_v2_verifier,
+        )
+        .context("compose installed clean-slate inventory probes")?,
     };
     let effect_registration = config.agent_registration.clone();
     let effect_control_plane_url = config.control_plane_url.clone();

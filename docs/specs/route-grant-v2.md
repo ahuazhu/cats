@@ -215,6 +215,10 @@ local Node/request binding与同一cell binding，在cell内原子取得guard和
 Grant target port。成功返回`101`，同一exchange随后成为public HTTP/WebSocket raw byte tunnel；Grant和内部
 frame不进入Guest。这是实际proxy request，不是裸Grant preflight。
 
+full inventory中的ring version/digest/`loaded_kids`必须从这个listener实际使用的同一进程
+`Arc<RouteGrantV2Verifier>`读取；磁盘ring只是在下次受控启动时可加载的candidate，不能冒充已加载事实。
+listener未组成时inventory必须报告ring unavailable，使§3 signer闭合失败。
+
 pre-admission failure为canonical JSON
 `{"version":2,"guard_acquired":false,"reason":"expired"}`及§8闭集；只有已取得guard后的Guest
 connect失败为`502`和`UpstreamUnavailable, guard_acquired=true`。普通stream failure关闭tunnel。Gateway不

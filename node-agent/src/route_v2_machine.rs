@@ -97,6 +97,10 @@ impl RouteV2MachineConfig {
         })
     }
 
+    pub(crate) fn verifier(&self) -> Arc<RouteGrantV2Verifier> {
+        Arc::clone(&self.verifier)
+    }
+
     #[cfg(test)]
     fn for_test(
         listen: String,
