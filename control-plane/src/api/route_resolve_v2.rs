@@ -25,8 +25,10 @@ use cats_api::route_grant_v2::{
 use cats_api::runtime_reconciliation::Sha256Digest;
 
 use crate::server::AppState;
+#[cfg(test)]
+use crate::store::runtime_authority::route_signer::RouteGrantV2AuthorityLoad;
 use crate::store::runtime_authority::route_signer::{
-    RouteGrantV2AuthorityLoad, RouteGrantV2AuthorityRejection, RouteGrantV2MachineAuthorityLoad,
+    RouteGrantV2AuthorityRejection, RouteGrantV2MachineAuthorityLoad,
 };
 use crate::store::runtime_authority::route_signing_authority::RouteGrantV2SignerBinding;
 use crate::store::{AuthorityRequestContext, Store};
@@ -567,6 +569,7 @@ pub(crate) async fn resolve(
         }
     };
 
+    #[cfg(test)]
     let signer_kid = route_grant_signer.kid().clone();
     let active_guest_digest = service.active_guest_digest.clone();
     let hostname = request.hostname;
@@ -605,20 +608,28 @@ pub(crate) async fn resolve(
             } else {
                 // Explicit crate-test routers retain their historical route
                 // authority oracle without creating a production principal.
-                match store.load_route_grant_v2_authority(
-                    &hostname,
-                    &signer_kid,
-                    &active_guest_digest,
-                )? {
-                    RouteGrantV2AuthorityLoad::Ready(snapshot) => {
-                        let issued = route_grant_signer.issue(&snapshot).map_err(|_| {
-                            ApiError::unavailable("test Route Grant v2 signer failed")
-                        })?;
-                        Ok(RouteGrantV2MachineAuthorityLoad::Ready { snapshot, issued })
+                #[cfg(test)]
+                {
+                    match store.load_route_grant_v2_authority(
+                        &hostname,
+                        &signer_kid,
+                        &active_guest_digest,
+                    )? {
+                        RouteGrantV2AuthorityLoad::Ready(snapshot) => {
+                            let issued =
+                                route_grant_signer.issue_for_test(&snapshot).map_err(|_| {
+                                    ApiError::unavailable("test Route Grant v2 signer failed")
+                                })?;
+                            Ok(RouteGrantV2MachineAuthorityLoad::Ready { snapshot, issued })
+                        }
+                        RouteGrantV2AuthorityLoad::Rejected(rejection) => {
+                            Ok(RouteGrantV2MachineAuthorityLoad::Rejected(rejection))
+                        }
                     }
-                    RouteGrantV2AuthorityLoad::Rejected(rejection) => {
-                        Ok(RouteGrantV2MachineAuthorityLoad::Rejected(rejection))
-                    }
+                }
+                #[cfg(not(test))]
+                {
+                    Ok(RouteGrantV2MachineAuthorityLoad::AuthenticationFailed)
                 }
             }
         }),
@@ -652,6 +663,7 @@ pub(crate) async fn resolve(
         Err(_) => return unavailable_response(),
     };
     let response = match RouteResolveV2Success::new(
+        snapshot.cat_id.clone(),
         snapshot.endpoint_id.clone(),
         snapshot.node_transport_target.clone(),
         issued.expires_at_unix_seconds,

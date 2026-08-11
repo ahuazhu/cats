@@ -1,6 +1,6 @@
 use cats_api::runtime_reconciliation::{
-    AssignedKind, AssignedPlacement, CheckpointRouteGate, EndpointGuardCount, LifecycleAdmission,
-    RandomId128, Revision, RuntimeCheckpoint, Sha256Digest,
+    AssignedKind, AssignedPlacement, CheckpointRouteGate, EndpointGuardCount, Ipv4Address,
+    LifecycleAdmission, RandomId128, Revision, RuntimeCheckpoint, Sha256Digest,
 };
 use thiserror::Error;
 
@@ -15,6 +15,7 @@ pub struct AdmissionSnapshot {
     spec_digest: Sha256Digest,
     placement: AssignedPlacement,
     runtime_incarnation: Option<RandomId128>,
+    guest_ipv4: Option<Ipv4Address>,
     lifecycle_admission: LifecycleAdmission,
     endpoints: Vec<CheckpointRouteGate>,
 }
@@ -36,6 +37,7 @@ impl AdmissionSnapshot {
             spec_digest,
             placement,
             runtime_incarnation,
+            guest_ipv4: None,
             lifecycle_admission,
             endpoints,
         }
@@ -55,6 +57,15 @@ impl AdmissionSnapshot {
 
     pub fn runtime_incarnation(&self) -> Option<&RandomId128> {
         self.runtime_incarnation.as_ref()
+    }
+
+    pub fn guest_ipv4(&self) -> Option<&Ipv4Address> {
+        self.guest_ipv4.as_ref()
+    }
+
+    pub(crate) fn with_guest_ipv4(mut self, guest_ipv4: Ipv4Address) -> Self {
+        self.guest_ipv4 = Some(guest_ipv4);
+        self
     }
 
     pub fn lifecycle_admission(&self) -> LifecycleAdmission {
@@ -79,7 +90,11 @@ impl AdmissionSnapshot {
 
     pub(super) fn from_checkpoint(checkpoint: &RuntimeCheckpoint) -> Result<Self, SnapshotError> {
         validate_route_identities(checkpoint)?;
-        Ok(Self::new(
+        let guest_ipv4 = checkpoint
+            .runtime_launch
+            .identity()
+            .map(|launch| launch.network.network_config.guest_ipv4.clone());
+        let mut snapshot = Self::new(
             checkpoint.desired_revision,
             checkpoint.spec_digest.clone(),
             AssignedPlacement {
@@ -90,7 +105,9 @@ impl AdmissionSnapshot {
             checkpoint.runtime_incarnation.clone(),
             checkpoint.lifecycle_admission,
             checkpoint.route_gates.clone(),
-        ))
+        );
+        snapshot.guest_ipv4 = guest_ipv4;
+        Ok(snapshot)
     }
 }
 

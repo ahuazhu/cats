@@ -1727,6 +1727,8 @@ mod tests {
             route_epoch: binding.route_epoch,
             protocol: binding.protocol,
             target_port: binding.target_port,
+            gateway_public_key_spki_sha256:
+                cats_api::runtime_reconciliation::Sha256Digest::from_bytes([0_u8; 32]),
             iat: 10,
             nbf: 10,
             exp: 20,

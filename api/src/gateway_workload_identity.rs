@@ -26,6 +26,97 @@ pub const CONTROL_MACHINE_SERVER_CERTIFICATE_MAX_WIRE_BYTES: usize = 65_536;
 pub const CONTROL_MACHINE_SERVER_PRIVATE_KEY_MAX_WIRE_BYTES: usize = 16_384;
 pub const MAX_GATEWAY_WORKLOAD_CREDENTIALS: usize = 16;
 pub const MAX_GATEWAY_WORKLOAD_SCOPE_WORKSPACES: usize = 256;
+const ED25519_SPKI_PREFIX: [u8; 12] = [
+    0x30, 0x2a, 0x30, 0x05, 0x06, 0x03, 0x2b, 0x65, 0x70, 0x03, 0x21, 0x00,
+];
+const ED25519_SPKI_LEN: usize = ED25519_SPKI_PREFIX.len() + 32;
+
+/// Extract the exact canonical Ed25519 SubjectPublicKeyInfo from one DER X.509
+/// leaf and return its ordinary SHA-256 identity. Certificate naming fields
+/// are deliberately ignored; callers must first establish chain/EKU trust.
+pub fn canonical_gateway_leaf_spki_sha256(certificate_der: &[u8]) -> Option<Sha256Digest> {
+    let certificate = DerTlv::read(certificate_der, 0)?;
+    if certificate.tag != 0x30 || certificate.end != certificate_der.len() {
+        return None;
+    }
+    let tbs = DerTlv::read(certificate_der, certificate.value_start)?;
+    if tbs.tag != 0x30 {
+        return None;
+    }
+    let mut cursor = tbs.value_start;
+    let first = DerTlv::read(certificate_der, cursor)?;
+    if first.tag == 0xa0 {
+        cursor = first.end;
+    }
+    for expected_tag in [0x02, 0x30, 0x30, 0x30, 0x30] {
+        let field = DerTlv::read(certificate_der, cursor)?;
+        if field.tag != expected_tag || field.end > tbs.end {
+            return None;
+        }
+        cursor = field.end;
+    }
+    let spki = DerTlv::read(certificate_der, cursor)?;
+    if spki.tag != 0x30 || spki.end > tbs.end {
+        return None;
+    }
+    let exact_spki = certificate_der.get(spki.start..spki.end)?;
+    if exact_spki.len() != ED25519_SPKI_LEN || !exact_spki.starts_with(&ED25519_SPKI_PREFIX) {
+        return None;
+    }
+    Some(Sha256Digest::from_bytes(Sha256::digest(exact_spki).into()))
+}
+
+#[derive(Clone, Copy)]
+struct DerTlv {
+    tag: u8,
+    start: usize,
+    value_start: usize,
+    end: usize,
+}
+
+impl DerTlv {
+    fn read(input: &[u8], start: usize) -> Option<Self> {
+        let tag = *input.get(start)?;
+        if tag & 0x1f == 0x1f {
+            return None;
+        }
+        let first_length = *input.get(start.checked_add(1)?)?;
+        let (value_start, value_len) = if first_length & 0x80 == 0 {
+            (start.checked_add(2)?, usize::from(first_length))
+        } else {
+            let length_octets = usize::from(first_length & 0x7f);
+            if !(1..=std::mem::size_of::<usize>()).contains(&length_octets) {
+                return None;
+            }
+            let length_start = start.checked_add(2)?;
+            let length_end = length_start.checked_add(length_octets)?;
+            let length_bytes = input.get(length_start..length_end)?;
+            if length_bytes.first() == Some(&0) {
+                return None;
+            }
+            let mut value_len = 0_usize;
+            for byte in length_bytes {
+                value_len = value_len
+                    .checked_mul(256)?
+                    .checked_add(usize::from(*byte))?;
+            }
+            if value_len < 128 {
+                return None;
+            }
+            (length_end, value_len)
+        };
+        let end = value_start.checked_add(value_len)?;
+        if end > input.len() {
+            return None;
+        }
+        Some(Self {
+            tag,
+            start,
+            value_start,
+            end,
+        })
+    }
+}
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -419,5 +510,30 @@ mod tests {
             ]),
             Err(GatewayWorkloadIdentityError::WireTooLarge)
         );
+    }
+
+    #[test]
+    fn certificate_leaf_identity_parser_is_exact_and_bounded() {
+        let pem = include_bytes!(
+            "../../control-plane/tests/fixtures/gateway_machine_client_certificate.pem"
+        );
+        let text = std::str::from_utf8(pem).unwrap();
+        let certificate = base64::engine::general_purpose::STANDARD
+            .decode(
+                text.lines()
+                    .filter(|line| !line.starts_with("-----"))
+                    .collect::<String>(),
+            )
+            .unwrap();
+        assert_eq!(
+            canonical_gateway_leaf_spki_sha256(certificate.as_ref())
+                .unwrap()
+                .as_str(),
+            "sha256:c82f69461d48dda0d056def48aff86908f4f32213163d47de658ea98c6527795"
+        );
+        assert!(
+            canonical_gateway_leaf_spki_sha256(&certificate[..certificate.len() - 1]).is_none()
+        );
+        assert!(canonical_gateway_leaf_spki_sha256(&ED25519_SPKI_PREFIX).is_none());
     }
 }

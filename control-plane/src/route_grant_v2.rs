@@ -16,7 +16,7 @@ use cats_api::route_grant_v2::{
     ROUTE_GRANT_V2_ISSUER, ROUTE_GRANT_V2_VERSION,
 };
 use cats_api::runtime_artifacts::InstalledRouteGrantV2Signer;
-use cats_api::runtime_reconciliation::KeyId;
+use cats_api::runtime_reconciliation::{KeyId, Sha256Digest};
 use jsonwebtoken::{Algorithm, DecodingKey, EncodingKey};
 use ring::signature::{Ed25519KeyPair, KeyPair as _};
 
@@ -176,17 +176,27 @@ impl RouteGrantV2Signer {
     pub(crate) fn issue(
         &self,
         snapshot: &RouteGrantV2AuthoritySnapshot,
+        gateway_public_key_spki_sha256: &Sha256Digest,
     ) -> anyhow::Result<IssuedRouteGrantV2> {
         let wall_now = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .context("system clock is before the Unix epoch")?
             .as_secs();
-        self.issue_at_wall_clock(snapshot, wall_now)
+        self.issue_at_wall_clock(snapshot, gateway_public_key_spki_sha256, wall_now)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn issue_for_test(
+        &self,
+        snapshot: &RouteGrantV2AuthoritySnapshot,
+    ) -> anyhow::Result<IssuedRouteGrantV2> {
+        self.issue(snapshot, &Sha256Digest::from_bytes([0_u8; 32]))
     }
 
     fn issue_at_wall_clock(
         &self,
         snapshot: &RouteGrantV2AuthoritySnapshot,
+        gateway_public_key_spki_sha256: &Sha256Digest,
         wall_now_unix_seconds: u64,
     ) -> anyhow::Result<IssuedRouteGrantV2> {
         let issued_at_unix_seconds = snapshot.evaluated_at_unix_ms.get() / 1_000;
@@ -207,6 +217,7 @@ impl RouteGrantV2Signer {
             route_epoch: snapshot.route_epoch,
             protocol: snapshot.protocol,
             target_port: snapshot.target_port,
+            gateway_public_key_spki_sha256: gateway_public_key_spki_sha256.clone(),
             iat: issued_at_unix_seconds,
             nbf: issued_at_unix_seconds,
             exp: expires_at_unix_seconds,
@@ -299,11 +310,15 @@ mod tests {
     fn signer_matches_the_shared_fixed_vector() {
         let signer = RouteGrantV2Signer::from_ed25519_pem(PRIVATE_KEY, PUBLIC_KEY, 120).unwrap();
         let grant = signer
-            .issue_at_wall_clock(&snapshot(), 1_786_156_800)
+            .issue_at_wall_clock(
+                &snapshot(),
+                &Sha256Digest::from_bytes([0_u8; 32]),
+                1_786_156_800,
+            )
             .unwrap();
         assert_eq!(
             grant.token,
-            "eyJhbGciOiJFZERTQSIsInR5cCI6ImNhdHMtcm91dGUtZ3JhbnQrand0Iiwia2lkIjoiMjI4MWEwMmE3ZjQyZDkyZmE5Y2FhNWI3OTA3YjI5YzJmMDYwY2IwMDE5NmJlMjgwYWYzM2ZiN2JjOGUyN2U5OSJ9.eyJ2ZXJzaW9uIjoyLCJpc3MiOiJjYXRzLWNvbnRyb2wtcGxhbmUiLCJhdWQiOiJjYXRzLW5vZGUtYWdlbnQiLCJ3b3Jrc3BhY2VfaWQiOiJ3c18wMSIsImVuZHBvaW50X2lkIjoiZXBfMDEiLCJob3N0bmFtZSI6ImFwcC5jYXRzLnJ1biIsImNhdF9pZCI6ImNhdF8wMSIsIm5vZGVfaWQiOiJub2RlLWEiLCJydW50aW1lX2luY2FybmF0aW9uIjoiMTExMTExMTExMTExMTExMTExMTExMTExMTExMTExMTEiLCJyb3V0ZV9lcG9jaCI6NywicHJvdG9jb2wiOiJodHRwIiwidGFyZ2V0X3BvcnQiOjgwODAsImlhdCI6MTc4NjE1NjgwMCwibmJmIjoxNzg2MTU2ODAwLCJleHAiOjE3ODYxNTY5MjB9.665Xtyyij0KLYLtJFLKhc7MxT5u96GI3qllvKvpLwR592PLlpP_eWdi0Ctmnll6RSopLxMNaKxW7f6YfansuBQ"
+            "eyJhbGciOiJFZERTQSIsInR5cCI6ImNhdHMtcm91dGUtZ3JhbnQrand0Iiwia2lkIjoiMjI4MWEwMmE3ZjQyZDkyZmE5Y2FhNWI3OTA3YjI5YzJmMDYwY2IwMDE5NmJlMjgwYWYzM2ZiN2JjOGUyN2U5OSJ9.eyJ2ZXJzaW9uIjoyLCJpc3MiOiJjYXRzLWNvbnRyb2wtcGxhbmUiLCJhdWQiOiJjYXRzLW5vZGUtYWdlbnQiLCJ3b3Jrc3BhY2VfaWQiOiJ3c18wMSIsImVuZHBvaW50X2lkIjoiZXBfMDEiLCJob3N0bmFtZSI6ImFwcC5jYXRzLnJ1biIsImNhdF9pZCI6ImNhdF8wMSIsIm5vZGVfaWQiOiJub2RlLWEiLCJydW50aW1lX2luY2FybmF0aW9uIjoiMTExMTExMTExMTExMTExMTExMTExMTExMTExMTExMTEiLCJyb3V0ZV9lcG9jaCI6NywicHJvdG9jb2wiOiJodHRwIiwidGFyZ2V0X3BvcnQiOjgwODAsImdhdGV3YXlfcHVibGljX2tleV9zcGtpX3NoYTI1NiI6InNoYTI1NjowMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwIiwiaWF0IjoxNzg2MTU2ODAwLCJuYmYiOjE3ODYxNTY4MDAsImV4cCI6MTc4NjE1NjkyMH0.iXeD5dSKty7QnCEvTfwZLQ9IGkZBpZnQgmTGNKOR0o3hr8-o87PPlBpRboonIIZFWWSzR7CZGFrCUE5z3dFYDg"
         );
         let compact = RouteGrantV2Compact::parse(&grant.token).unwrap();
         let public = RouteGrantV2PublicKey::from_public_key_pem(PUBLIC_KEY).unwrap();
@@ -409,7 +424,11 @@ mod tests {
         assert!(RouteGrantV2Signer::from_ed25519_pem(PRIVATE_KEY, PUBLIC_KEY, 0).is_err());
         let signer = RouteGrantV2Signer::from_ed25519_pem(PRIVATE_KEY, PUBLIC_KEY, 120).unwrap();
         assert!(signer
-            .issue_at_wall_clock(&snapshot(), 1_786_156_920)
+            .issue_at_wall_clock(
+                &snapshot(),
+                &Sha256Digest::from_bytes([0_u8; 32]),
+                1_786_156_920,
+            )
             .is_err());
     }
 }

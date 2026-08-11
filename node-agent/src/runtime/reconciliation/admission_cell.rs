@@ -12,7 +12,7 @@ use cats_api::route_grant_v2::{
     RouteAdmissionV2Reason, RouteGrantV2Claims, RouteGrantV2TimeVerdict,
 };
 use cats_api::runtime_reconciliation::{
-    CheckpointRouteGate, EndpointGuardCount, Id, LifecycleAdmission, RouteGateState,
+    CheckpointRouteGate, EndpointGuardCount, Id, Ipv4Address, LifecycleAdmission, RouteGateState,
 };
 use thiserror::Error;
 
@@ -182,7 +182,7 @@ impl AdmissionCell {
         self: &Arc<Self>,
         claims: &RouteGrantV2Claims,
         time_verdict: RouteGrantV2TimeVerdict,
-    ) -> Result<RouteAdmissionGuard, RouteAdmissionV2Reason> {
+    ) -> Result<(RouteAdmissionGuard, Ipv4Address), RouteAdmissionV2Reason> {
         let mut state = self.lock_for_admission()?;
         let placement = state.snapshot.placement();
         if placement.node_id != claims.node_id {
@@ -215,6 +215,11 @@ impl AdmissionCell {
             RouteGrantV2TimeVerdict::Expired => return Err(RouteAdmissionV2Reason::Expired),
             RouteGrantV2TimeVerdict::Valid => {}
         }
+        let guest_ipv4 = state
+            .snapshot
+            .guest_ipv4()
+            .cloned()
+            .ok_or(RouteAdmissionV2Reason::RuntimeNotReady)?;
         let count = state
             .endpoint_guards
             .get_mut(&claims.endpoint_id)
@@ -222,10 +227,13 @@ impl AdmissionCell {
         *count = count
             .checked_add(1)
             .ok_or(RouteAdmissionV2Reason::RuntimeNotReady)?;
-        Ok(RouteAdmissionGuard {
-            cell: Arc::clone(self),
-            endpoint_id: claims.endpoint_id.clone(),
-        })
+        Ok((
+            RouteAdmissionGuard {
+                cell: Arc::clone(self),
+                endpoint_id: claims.endpoint_id.clone(),
+            },
+            guest_ipv4,
+        ))
     }
 
     fn lock_for_admission(&self) -> Result<MutexGuard<'_, CellState>, RouteAdmissionV2Reason> {

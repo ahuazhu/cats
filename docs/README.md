@@ -120,6 +120,7 @@ AdmissionCell。它们由同一个vertical cutover合同和故障矩阵收敛。
 - [0043 Provisioner-owned runtime placement policy](decisions/0043-provisioner-owned-runtime-placement-policy.md)
 - [0044 独立Route v2 signing authority](decisions/0044-independent-route-v2-signing-authority.md)
 - [0045 独立Gateway workload identity authority](decisions/0045-independent-gateway-workload-identity.md)
+- [0046 Gateway到Node Route v2 machine tunnel](decisions/0046-gateway-node-route-v2-machine-tunnel.md)
 
 ### Deferred
 

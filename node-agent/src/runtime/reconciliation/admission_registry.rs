@@ -97,19 +97,36 @@ impl AdmissionCellRegistry {
         })
     }
 
-    #[cfg_attr(
-        not(test),
-        expect(
-            dead_code,
-            reason = "the Route v2 machine transport consumes registry lookup in the next composition slice"
-        )
-    )]
     pub(crate) fn get(&self, cat_id: &Id) -> Option<Arc<AdmissionCell>> {
         let state = self.lock_observing().ok()?;
         match state.entries.get(cat_id) {
             Some(RegistrySlot::Ready(session)) => Some(Arc::clone(session.cell())),
             Some(RegistrySlot::Initializing { .. }) | None => None,
         }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn insert_cell_for_machine_test(
+        &self,
+        cat_id: Id,
+        cell: Arc<AdmissionCell>,
+    ) -> Result<(), AdmissionRegistryError> {
+        let checkpoint_store = Arc::new(FileCheckpointStore::open(
+            &self.checkpoint_directory,
+            &cat_id,
+        )?);
+        let mut state = self.lock_mutating()?;
+        if state.entries.contains_key(&cat_id) {
+            return Err(AdmissionRegistryError::EntryChanged);
+        }
+        state.entries.insert(
+            cat_id,
+            RegistrySlot::Ready(Arc::new(AdmissionCellSession {
+                cell,
+                checkpoint_store,
+            })),
+        );
+        Ok(())
     }
 
     pub(crate) fn existing_session(

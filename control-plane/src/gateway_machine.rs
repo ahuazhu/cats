@@ -10,6 +10,7 @@ use std::time::Duration;
 use anyhow::Context as _;
 use axum::routing::post;
 use axum::{Extension, Router};
+use cats_api::gateway_workload_identity::canonical_gateway_leaf_spki_sha256;
 use cats_api::route_grant_v2::ROUTE_RESOLVE_V2_PATH;
 use cats_api::runtime_artifacts::InstalledGatewayMachineArtifacts;
 use cats_api::runtime_reconciliation::Sha256Digest;
@@ -20,7 +21,6 @@ use rustls::pki_types::pem::PemObject as _;
 use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer};
 use rustls::server::WebPkiClientVerifier;
 use rustls::{RootCertStore, ServerConfig};
-use sha2::{Digest as _, Sha256};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::task::JoinSet;
 use tokio_rustls::TlsAcceptor;
@@ -35,10 +35,6 @@ const LISTENER_SHUTDOWN_DEADLINE: Duration = Duration::from_secs(35);
 const LISTENER_TASK_SHUTDOWN_DEADLINE: Duration = Duration::from_secs(40);
 const MACHINE_CONNECTION_LIMIT: usize = 64;
 const HTTP_11_ALPN: &[u8] = b"http/1.1";
-const ED25519_SPKI_PREFIX: [u8; 12] = [
-    0x30, 0x2a, 0x30, 0x05, 0x06, 0x03, 0x2b, 0x65, 0x70, 0x03, 0x21, 0x00,
-];
-const ED25519_SPKI_LEN: usize = ED25519_SPKI_PREFIX.len() + 32;
 
 pub(crate) struct GatewayMachineListener {
     addr: SocketAddr,
@@ -436,94 +432,8 @@ async fn serve_connection(
 }
 
 fn leaf_ed25519_spki_sha256(certificate_der: &[u8]) -> anyhow::Result<Sha256Digest> {
-    let certificate = DerTlv::read(certificate_der, 0)?;
-    anyhow::ensure!(
-        certificate.tag == 0x30 && certificate.end == certificate_der.len(),
-        "Gateway leaf certificate has a malformed outer DER sequence"
-    );
-    let tbs = DerTlv::read(certificate_der, certificate.value_start)?;
-    anyhow::ensure!(
-        tbs.tag == 0x30,
-        "Gateway leaf certificate has no TBSCertificate"
-    );
-    let mut cursor = tbs.value_start;
-    let first = DerTlv::read(certificate_der, cursor)?;
-    if first.tag == 0xa0 {
-        cursor = first.end;
-    }
-    for expected_tag in [0x02, 0x30, 0x30, 0x30, 0x30] {
-        let field = DerTlv::read(certificate_der, cursor)?;
-        anyhow::ensure!(
-            field.tag == expected_tag && field.end <= tbs.end,
-            "Gateway leaf TBSCertificate fields are malformed"
-        );
-        cursor = field.end;
-    }
-    let spki = DerTlv::read(certificate_der, cursor)?;
-    anyhow::ensure!(
-        spki.tag == 0x30 && spki.end <= tbs.end,
-        "Gateway leaf has no SubjectPublicKeyInfo"
-    );
-    let exact_spki = &certificate_der[spki.start..spki.end];
-    anyhow::ensure!(
-        exact_spki.len() == ED25519_SPKI_LEN && exact_spki.starts_with(&ED25519_SPKI_PREFIX),
-        "Gateway leaf SubjectPublicKeyInfo is not canonical Ed25519 DER"
-    );
-    Ok(Sha256Digest::from_bytes(Sha256::digest(exact_spki).into()))
-}
-
-#[derive(Clone, Copy)]
-struct DerTlv {
-    tag: u8,
-    start: usize,
-    value_start: usize,
-    end: usize,
-}
-
-impl DerTlv {
-    fn read(input: &[u8], start: usize) -> anyhow::Result<Self> {
-        let tag = *input.get(start).context("DER field is missing its tag")?;
-        anyhow::ensure!(tag & 0x1f != 0x1f, "high-tag-number DER is not accepted");
-        let first_length = *input
-            .get(start + 1)
-            .context("DER field is missing its length")?;
-        let (value_start, value_len) = if first_length & 0x80 == 0 {
-            (start + 2, usize::from(first_length))
-        } else {
-            let length_octets = usize::from(first_length & 0x7f);
-            anyhow::ensure!(
-                (1..=std::mem::size_of::<usize>()).contains(&length_octets),
-                "DER length is indefinite or oversized"
-            );
-            let length_start = start.checked_add(2).context("DER length offset overflow")?;
-            let length_end = length_start
-                .checked_add(length_octets)
-                .context("DER length offset overflow")?;
-            let length_bytes = input
-                .get(length_start..length_end)
-                .context("DER long length is truncated")?;
-            anyhow::ensure!(length_bytes[0] != 0, "DER long length is not minimal");
-            let mut value_len = 0_usize;
-            for byte in length_bytes {
-                value_len = value_len
-                    .checked_mul(256)
-                    .and_then(|value| value.checked_add(usize::from(*byte)))
-                    .context("DER value length overflow")?;
-            }
-            anyhow::ensure!(value_len >= 128, "DER long length is not minimal");
-            (length_end, value_len)
-        };
-        let end = value_start
-            .checked_add(value_len)
-            .context("DER field length overflow")?;
-        anyhow::ensure!(end <= input.len(), "DER field is truncated");
-        Ok(Self {
-            tag,
-            start,
-            value_start,
-            end,
-        })
-    }
+    canonical_gateway_leaf_spki_sha256(certificate_der)
+        .context("Gateway leaf SubjectPublicKeyInfo is not canonical Ed25519 DER")
 }
 
 #[cfg(test)]
@@ -730,6 +640,6 @@ mod tests {
             "sha256:c82f69461d48dda0d056def48aff86908f4f32213163d47de658ea98c6527795"
         );
         assert!(leaf_ed25519_spki_sha256(&certificate[..certificate.len() - 1]).is_err());
-        assert!(leaf_ed25519_spki_sha256(&ED25519_SPKI_PREFIX).is_err());
+        assert!(leaf_ed25519_spki_sha256(&[0_u8; 12]).is_err());
     }
 }

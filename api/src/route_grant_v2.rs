@@ -39,6 +39,15 @@ pub const ROUTE_V2_JSON_CONTENT_TYPE: &str = "application/json";
 pub const ROUTE_RESOLVE_V2_REQUEST_MAX_WIRE_BYTES: usize = 512;
 pub const ROUTE_RESOLVE_V2_RESPONSE_MAX_WIRE_BYTES: usize = 8192;
 pub const ROUTE_RESOLVE_V2_DEADLINE_MILLIS: u64 = 2_000;
+/// Exact Node machine-ingress method. A successful request upgrades this same
+/// authenticated HTTP/1.1 exchange into the public-request byte tunnel; it is
+/// not a separate Grant preflight.
+pub const ROUTE_TUNNEL_V2_METHOD: &str = "POST";
+pub const ROUTE_TUNNEL_V2_PATH: &str = "/v1/internal/routes/tunnel";
+pub const ROUTE_TUNNEL_V2_UPGRADE: &str = "cats-route-v2-tunnel";
+pub const ROUTE_TUNNEL_V2_REQUEST_MAX_WIRE_BYTES: usize = 5_120;
+pub const ROUTE_TUNNEL_V2_FAILURE_MAX_WIRE_BYTES: usize = 256;
+pub const ROUTE_TUNNEL_V2_CONNECT_DEADLINE_MILLIS: u64 = 2_000;
 pub const MAX_ROUTE_GRANT_V2_RING_KEYS: usize = 8;
 pub const ROUTE_GRANT_V2_ARTIFACT_MAX_WIRE_BYTES: usize = 16_384;
 pub const ROUTE_GRANT_V2_ARTIFACT_DIRECTORY: &str = "/etc/cats/route-v2";
@@ -46,6 +55,18 @@ pub const ROUTE_GRANT_V2_SIGNER_REFERENCE_PATH: &str = "/etc/cats/route-v2/signe
 pub const ROUTE_GRANT_V2_SIGNER_PRIVATE_KEY_PATH: &str =
     "/etc/cats/route-v2/signer-private-key.pem";
 pub const ROUTE_GRANT_V2_PUBLIC_KEY_RING_PATH: &str = "/etc/cats/route-v2/public-key-ring.v1.json";
+pub const NODE_ROUTE_V2_SERVER_CERTIFICATE_PATH: &str =
+    "/etc/cats/route-v2/node-machine-server-certificate.pem";
+pub const NODE_ROUTE_V2_SERVER_PRIVATE_KEY_PATH: &str =
+    "/etc/cats/route-v2/node-machine-server-private-key.pem";
+pub const NODE_ROUTE_V2_SERVER_CA_BUNDLE_PATH: &str =
+    "/etc/cats/route-v2/node-server-ca-bundle.pem";
+pub const GATEWAY_ROUTE_V2_CLIENT_CERTIFICATE_PATH: &str =
+    "/etc/cats/route-v2/gateway-machine-client-certificate.pem";
+pub const GATEWAY_ROUTE_V2_CLIENT_PRIVATE_KEY_PATH: &str =
+    "/etc/cats/route-v2/gateway-machine-client-private-key.pem";
+pub const ROUTE_V2_CERTIFICATE_MAX_WIRE_BYTES: usize = 65_536;
+pub const ROUTE_V2_PRIVATE_KEY_MAX_WIRE_BYTES: usize = 16_384;
 
 /// Exact previous public-ring pointer used by the installer to reject a stale,
 /// conflicting or skipped rotation before replacing the current artifact.
@@ -309,11 +330,40 @@ pub struct RouteResolveV2Request {
 #[serde(deny_unknown_fields)]
 pub struct RouteResolveV2Success {
     pub version: u8,
+    pub cat_id: Id,
     pub endpoint_id: Id,
     pub node_transport_target: NodeTransportTarget,
     pub expires_at_unix_seconds: u64,
     pub opaque_grant: String,
     pub grant_sha256: Sha256Digest,
+}
+
+/// Canonical admission frame for one Gateway-to-Node tunnel. The public HTTP
+/// request starts only after the authenticated Node returns `101`; therefore
+/// these fields can never be confused with application headers or body bytes.
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RouteTunnelV2Request {
+    pub version: u8,
+    pub cat_id: Id,
+    pub endpoint_id: Id,
+    pub hostname: Hostname,
+    pub opaque_grant: String,
+    pub grant_sha256: Sha256Digest,
+}
+
+impl std::fmt::Debug for RouteTunnelV2Request {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("RouteTunnelV2Request")
+            .field("version", &self.version)
+            .field("cat_id", &self.cat_id)
+            .field("endpoint_id", &self.endpoint_id)
+            .field("hostname", &self.hostname)
+            .field("opaque_grant", &"[redacted]")
+            .field("grant_sha256", &self.grant_sha256)
+            .finish()
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -384,6 +434,7 @@ impl RouteResolveV2Request {
 
 impl RouteResolveV2Success {
     pub fn new(
+        cat_id: Id,
         endpoint_id: Id,
         node_transport_target: NodeTransportTarget,
         expires_at_unix_seconds: u64,
@@ -392,6 +443,7 @@ impl RouteResolveV2Success {
         let grant_sha256 = Sha256Digest::from_bytes(Sha256::digest(opaque_grant.as_bytes()).into());
         let value = Self {
             version: ROUTE_GRANT_V2_VERSION,
+            cat_id,
             endpoint_id,
             node_transport_target,
             expires_at_unix_seconds,
@@ -405,6 +457,40 @@ impl RouteResolveV2Success {
     pub fn validate(&self) -> Result<(), RouteV2EnvelopeError> {
         if self.version != ROUTE_GRANT_V2_VERSION
             || self.expires_at_unix_seconds > i64::MAX as u64
+            || self.opaque_grant.is_empty()
+            || self.opaque_grant.len() > MAX_ROUTE_GRANT_V2_COMPACT_BYTES
+            || !self.opaque_grant.is_ascii()
+            || self.grant_sha256
+                != Sha256Digest::from_bytes(Sha256::digest(self.opaque_grant.as_bytes()).into())
+        {
+            return Err(RouteV2EnvelopeError::Invalid);
+        }
+        Ok(())
+    }
+}
+
+impl RouteTunnelV2Request {
+    pub fn new(
+        cat_id: Id,
+        endpoint_id: Id,
+        hostname: Hostname,
+        opaque_grant: String,
+    ) -> Result<Self, RouteV2EnvelopeError> {
+        let grant_sha256 = Sha256Digest::from_bytes(Sha256::digest(opaque_grant.as_bytes()).into());
+        let value = Self {
+            version: ROUTE_GRANT_V2_VERSION,
+            cat_id,
+            endpoint_id,
+            hostname,
+            opaque_grant,
+            grant_sha256,
+        };
+        value.validate()?;
+        Ok(value)
+    }
+
+    pub fn validate(&self) -> Result<(), RouteV2EnvelopeError> {
+        if self.version != ROUTE_GRANT_V2_VERSION
             || self.opaque_grant.is_empty()
             || self.opaque_grant.len() > MAX_ROUTE_GRANT_V2_COMPACT_BYTES
             || !self.opaque_grant.is_ascii()
@@ -494,6 +580,22 @@ pub fn decode_route_resolve_v2_success(
     Ok(value)
 }
 
+pub fn encode_route_tunnel_v2_request(
+    value: &RouteTunnelV2Request,
+) -> Result<Vec<u8>, RouteV2EnvelopeError> {
+    value.validate()?;
+    encode_canonical(value, ROUTE_TUNNEL_V2_REQUEST_MAX_WIRE_BYTES)
+}
+
+pub fn decode_route_tunnel_v2_request(
+    bytes: &[u8],
+) -> Result<RouteTunnelV2Request, RouteV2EnvelopeError> {
+    let value: RouteTunnelV2Request =
+        decode_canonical(bytes, ROUTE_TUNNEL_V2_REQUEST_MAX_WIRE_BYTES)?;
+    value.validate()?;
+    Ok(value)
+}
+
 pub fn encode_route_resolve_v2_rejection(
     value: &RouteResolveV2Rejection,
 ) -> Result<Vec<u8>, RouteV2EnvelopeError> {
@@ -518,13 +620,14 @@ pub fn encode_route_admission_v2_failure(
     value: &RouteAdmissionV2Failure,
 ) -> Result<Vec<u8>, RouteV2EnvelopeError> {
     value.validate()?;
-    encode_canonical(value, 256)
+    encode_canonical(value, ROUTE_TUNNEL_V2_FAILURE_MAX_WIRE_BYTES)
 }
 
 pub fn decode_route_admission_v2_failure(
     bytes: &[u8],
 ) -> Result<RouteAdmissionV2Failure, RouteV2EnvelopeError> {
-    let value: RouteAdmissionV2Failure = decode_canonical(bytes, 256)?;
+    let value: RouteAdmissionV2Failure =
+        decode_canonical(bytes, ROUTE_TUNNEL_V2_FAILURE_MAX_WIRE_BYTES)?;
     value.validate()?;
     Ok(value)
 }
@@ -607,6 +710,9 @@ pub struct RouteGrantV2Claims {
     pub route_epoch: Epoch,
     pub protocol: HttpProtocol,
     pub target_port: u16,
+    /// Exact CA-verified Gateway leaf that obtained this Grant from Control.
+    /// Node compares it with the leaf on the same mTLS tunnel before admission.
+    pub gateway_public_key_spki_sha256: Sha256Digest,
     pub iat: u64,
     pub nbf: u64,
     pub exp: u64,
@@ -990,6 +1096,7 @@ mod tests {
             route_epoch: Epoch::new(7).unwrap(),
             protocol: HttpProtocol::Http,
             target_port: 8080,
+            gateway_public_key_spki_sha256: Sha256Digest::from_bytes([0_u8; 32]),
             iat: 1_786_156_800,
             nbf: 1_786_156_800,
             exp: 1_786_156_920,
@@ -1042,7 +1149,7 @@ mod tests {
         let (token, public) = signed_token(&expected);
         assert_eq!(
             token,
-            "eyJhbGciOiJFZERTQSIsInR5cCI6ImNhdHMtcm91dGUtZ3JhbnQrand0Iiwia2lkIjoiMjI4MWEwMmE3ZjQyZDkyZmE5Y2FhNWI3OTA3YjI5YzJmMDYwY2IwMDE5NmJlMjgwYWYzM2ZiN2JjOGUyN2U5OSJ9.eyJ2ZXJzaW9uIjoyLCJpc3MiOiJjYXRzLWNvbnRyb2wtcGxhbmUiLCJhdWQiOiJjYXRzLW5vZGUtYWdlbnQiLCJ3b3Jrc3BhY2VfaWQiOiJ3c18wMSIsImVuZHBvaW50X2lkIjoiZXBfMDEiLCJob3N0bmFtZSI6ImFwcC5jYXRzLnJ1biIsImNhdF9pZCI6ImNhdF8wMSIsIm5vZGVfaWQiOiJub2RlLWEiLCJydW50aW1lX2luY2FybmF0aW9uIjoiMTExMTExMTExMTExMTExMTExMTExMTExMTExMTExMTEiLCJyb3V0ZV9lcG9jaCI6NywicHJvdG9jb2wiOiJodHRwIiwidGFyZ2V0X3BvcnQiOjgwODAsImlhdCI6MTc4NjE1NjgwMCwibmJmIjoxNzg2MTU2ODAwLCJleHAiOjE3ODYxNTY5MjB9.665Xtyyij0KLYLtJFLKhc7MxT5u96GI3qllvKvpLwR592PLlpP_eWdi0Ctmnll6RSopLxMNaKxW7f6YfansuBQ"
+            "eyJhbGciOiJFZERTQSIsInR5cCI6ImNhdHMtcm91dGUtZ3JhbnQrand0Iiwia2lkIjoiMjI4MWEwMmE3ZjQyZDkyZmE5Y2FhNWI3OTA3YjI5YzJmMDYwY2IwMDE5NmJlMjgwYWYzM2ZiN2JjOGUyN2U5OSJ9.eyJ2ZXJzaW9uIjoyLCJpc3MiOiJjYXRzLWNvbnRyb2wtcGxhbmUiLCJhdWQiOiJjYXRzLW5vZGUtYWdlbnQiLCJ3b3Jrc3BhY2VfaWQiOiJ3c18wMSIsImVuZHBvaW50X2lkIjoiZXBfMDEiLCJob3N0bmFtZSI6ImFwcC5jYXRzLnJ1biIsImNhdF9pZCI6ImNhdF8wMSIsIm5vZGVfaWQiOiJub2RlLWEiLCJydW50aW1lX2luY2FybmF0aW9uIjoiMTExMTExMTExMTExMTExMTExMTExMTExMTExMTExMTEiLCJyb3V0ZV9lcG9jaCI6NywicHJvdG9jb2wiOiJodHRwIiwidGFyZ2V0X3BvcnQiOjgwODAsImdhdGV3YXlfcHVibGljX2tleV9zcGtpX3NoYTI1NiI6InNoYTI1NjowMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwIiwiaWF0IjoxNzg2MTU2ODAwLCJuYmYiOjE3ODYxNTY4MDAsImV4cCI6MTc4NjE1NjkyMH0.iXeD5dSKty7QnCEvTfwZLQ9IGkZBpZnQgmTGNKOR0o3hr8-o87PPlBpRboonIIZFWWSzR7CZGFrCUE5z3dFYDg"
         );
         let compact = RouteGrantV2Compact::parse(&token).unwrap();
         assert_eq!(compact.header().kid, *public.kid());
@@ -1179,6 +1286,7 @@ mod tests {
         );
 
         let success = RouteResolveV2Success::new(
+            Id::new("cat_01").unwrap(),
             Id::new("ep_01").unwrap(),
             NodeTransportTarget::new("https://node-a.internal:7301").unwrap(),
             1_786_156_920,
@@ -1188,12 +1296,30 @@ mod tests {
         let success_bytes = encode_route_resolve_v2_success(&success).unwrap();
         assert_eq!(
             success_bytes,
-            br#"{"version":2,"endpoint_id":"ep_01","node_transport_target":"https://node-a.internal:7301","expires_at_unix_seconds":1786156920,"opaque_grant":"opaque-grant-v2","grant_sha256":"sha256:535211e38407e27449db1cd21b6e5e3e82c3fe1fd6aa55fc59308dd8bc6d293a"}"#
+            br#"{"version":2,"cat_id":"cat_01","endpoint_id":"ep_01","node_transport_target":"https://node-a.internal:7301","expires_at_unix_seconds":1786156920,"opaque_grant":"opaque-grant-v2","grant_sha256":"sha256:535211e38407e27449db1cd21b6e5e3e82c3fe1fd6aa55fc59308dd8bc6d293a"}"#
         );
         assert_eq!(
             decode_route_resolve_v2_success(&success_bytes).unwrap(),
             success
         );
+
+        let tunnel = RouteTunnelV2Request::new(
+            Id::new("cat_01").unwrap(),
+            Id::new("ep_01").unwrap(),
+            Hostname::new("app.cats.run").unwrap(),
+            "opaque-grant-v2".to_owned(),
+        )
+        .unwrap();
+        let tunnel_bytes = encode_route_tunnel_v2_request(&tunnel).unwrap();
+        assert_eq!(
+            tunnel_bytes,
+            br#"{"version":2,"cat_id":"cat_01","endpoint_id":"ep_01","hostname":"app.cats.run","opaque_grant":"opaque-grant-v2","grant_sha256":"sha256:535211e38407e27449db1cd21b6e5e3e82c3fe1fd6aa55fc59308dd8bc6d293a"}"#
+        );
+        assert_eq!(
+            decode_route_tunnel_v2_request(&tunnel_bytes).unwrap(),
+            tunnel
+        );
+        assert!(!format!("{tunnel:?}").contains("opaque-grant-v2"));
 
         let rejection = RouteResolveV2Rejection::new(RouteResolveV2RejectionCode::Pending);
         assert_eq!(
@@ -1235,7 +1361,7 @@ mod tests {
             decode_route_admission_v2_failure(inconsistent),
             Err(RouteV2EnvelopeError::Invalid)
         );
-        let wrong_digest = br#"{"version":2,"endpoint_id":"ep_01","node_transport_target":"https://node-a.internal:7301","expires_at_unix_seconds":1786156920,"opaque_grant":"opaque-grant-v2","grant_sha256":"sha256:0000000000000000000000000000000000000000000000000000000000000000"}"#;
+        let wrong_digest = br#"{"version":2,"cat_id":"cat_01","endpoint_id":"ep_01","node_transport_target":"https://node-a.internal:7301","expires_at_unix_seconds":1786156920,"opaque_grant":"opaque-grant-v2","grant_sha256":"sha256:0000000000000000000000000000000000000000000000000000000000000000"}"#;
         assert_eq!(
             decode_route_resolve_v2_success(wrong_digest),
             Err(RouteV2EnvelopeError::Invalid)

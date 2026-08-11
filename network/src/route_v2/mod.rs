@@ -4,15 +4,15 @@
 //! now. Gateway never parses Grant claims or owns a public-key ring; Node is the
 //! sole Grant verifier and final admission authority. The shipped Gateway stays
 //! closed until the Gateway workload identity authority, independent v2 key
-//! distribution, machine-authenticated Control/Node transports, and public
-//! proxy/listener composition are frozen and implemented. The strict Control
-//! resolve frame now exists, but its handler deliberately receives no
-//! production principal or legacy signer. This module does not infer identity
-//! from the retired V1 paths.
+//! distribution, machine-authenticated Control composition, and public
+//! proxy/listener composition are complete. The Node machine tunnel is now a
+//! production primitive, but the shipped public Gateway remains closed. This
+//! module does not infer identity from the retired V1 paths.
 
 mod cache;
 mod grant;
 mod http_body;
+mod node_machine;
 
 pub use cache::{
     CacheLookup, CacheRefreshStatus, CurrentRequestDisposition, NegativeRoute,
@@ -23,6 +23,7 @@ pub use grant::{AuthenticatedResolveEnvelope, GrantDigest, ResolveEnvelopeError,
 pub use http_body::{
     read_bounded_response_body, strict_https_client, ResponseBodyBounds, ResponseReadError,
 };
+pub use node_machine::{GatewayNodeRouteTunnel, GatewayNodeRouteV2Client, GatewayNodeRouteV2Error};
 
 /// A missing contract that prevents the public Gateway from opening a socket.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -30,7 +31,6 @@ pub enum ProductionIngressSeam {
     GatewayWorkloadIdentityAuthority,
     RouteV2KeyDistributionComposition,
     ControlMachineTransportComposition,
-    NodeV2HttpsAdmissionTransport,
     PublicProxyListenerComposition,
 }
 
@@ -45,9 +45,6 @@ impl std::fmt::Display for ProductionIngressSeam {
             }
             Self::ControlMachineTransportComposition => {
                 formatter.write_str("Control machine-authenticated resolve transport")
-            }
-            Self::NodeV2HttpsAdmissionTransport => {
-                formatter.write_str("Node machine-authenticated v2 HTTPS admission transport")
             }
             Self::PublicProxyListenerComposition => {
                 formatter.write_str("public ingress proxy/listener composition")
@@ -67,7 +64,6 @@ impl ProductionIngressBlocker {
         ProductionIngressSeam::GatewayWorkloadIdentityAuthority,
         ProductionIngressSeam::RouteV2KeyDistributionComposition,
         ProductionIngressSeam::ControlMachineTransportComposition,
-        ProductionIngressSeam::NodeV2HttpsAdmissionTransport,
         ProductionIngressSeam::PublicProxyListenerComposition,
     ];
 
@@ -110,13 +106,12 @@ mod tests {
                 ProductionIngressSeam::GatewayWorkloadIdentityAuthority,
                 ProductionIngressSeam::RouteV2KeyDistributionComposition,
                 ProductionIngressSeam::ControlMachineTransportComposition,
-                ProductionIngressSeam::NodeV2HttpsAdmissionTransport,
                 ProductionIngressSeam::PublicProxyListenerComposition,
             ]
         );
         assert_eq!(
             blocker.to_string(),
-            "missing Gateway workload credential and policy authority and Route v2 signer and Node key-ring distribution and Control machine-authenticated resolve transport and Node machine-authenticated v2 HTTPS admission transport and public ingress proxy/listener composition"
+            "missing Gateway workload credential and policy authority and Route v2 signer and Node key-ring distribution and Control machine-authenticated resolve transport and public ingress proxy/listener composition"
         );
     }
 }

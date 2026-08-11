@@ -4,6 +4,7 @@ use std::time::Duration;
 
 use anyhow::Context;
 use cats_node_agent::ch::{BlockPath, ChConfig};
+use cats_node_agent::route_v2_machine::RouteV2MachineConfig;
 use cats_node_agent::runtime::reconciliation::AuthorizedBlockdLaunchConfig;
 use cats_node_agent::runtime_cutover::{spawn_signed_runtime_cutover, SignedRuntimeCutoverConfig};
 use cats_node_agent::runtime_spine::RuntimeSpineDeadlinePolicy;
@@ -19,9 +20,42 @@ struct Args {
     listen: String,
     #[arg(long)]
     control_plane_url: String,
-    /// Ed25519 public key used to verify control-plane signed Route Grants.
-    #[arg(long, env = "CATS_ROUTE_GRANT_PUBLIC_KEY_FILE")]
-    route_grant_public_key_file: PathBuf,
+    /// Retired single-key CLI retained only until the metal unit/install
+    /// transaction moves as one change. These bytes are never opened or used
+    /// as Route v2 authority.
+    #[arg(
+        long = "route-grant-public-key-file",
+        env = "CATS_ROUTE_GRANT_PUBLIC_KEY_FILE"
+    )]
+    _retired_route_grant_public_key_file: PathBuf,
+    #[arg(
+        long,
+        env = "CATS_ROUTE_V2_PUBLIC_KEY_RING_FILE",
+        default_value = cats_api::route_grant_v2::ROUTE_GRANT_V2_PUBLIC_KEY_RING_PATH
+    )]
+    route_v2_public_key_ring_file: PathBuf,
+    /// Independent TLS listener for authenticated Gateway Route v2 tunnels.
+    /// Absence keeps this ingress closed and does not read its fixed artifacts.
+    #[arg(long, env = "CATS_ROUTE_V2_MACHINE_LISTEN")]
+    route_v2_machine_listen: Option<String>,
+    #[arg(
+        long,
+        env = "CATS_GATEWAY_CLIENT_CA_BUNDLE_FILE",
+        default_value = cats_api::gateway_workload_identity::GATEWAY_CLIENT_CA_BUNDLE_PATH
+    )]
+    gateway_client_ca_bundle_file: PathBuf,
+    #[arg(
+        long,
+        env = "CATS_NODE_ROUTE_V2_SERVER_CERTIFICATE_FILE",
+        default_value = cats_api::route_grant_v2::NODE_ROUTE_V2_SERVER_CERTIFICATE_PATH
+    )]
+    node_route_v2_server_certificate_file: PathBuf,
+    #[arg(
+        long,
+        env = "CATS_NODE_ROUTE_V2_SERVER_PRIVATE_KEY_FILE",
+        default_value = cats_api::route_grant_v2::NODE_ROUTE_V2_SERVER_PRIVATE_KEY_PATH
+    )]
+    node_route_v2_server_private_key_file: PathBuf,
     #[arg(
         long,
         env = "CATS_GUEST_RUNTIME_PROFILE_RECEIPT_FILE",
@@ -196,6 +230,23 @@ async fn main() -> anyhow::Result<()> {
         cats_node_agent::agent_registration::AgentRegistrationConfig::load_installed(
             installed_receipt.receipt(),
         )?;
+    let route_v2_machine = match args.route_v2_machine_listen {
+        Some(listen) => {
+            let artifacts =
+                cats_api::runtime_artifacts::load_installed_node_route_v2_machine_artifacts(
+                    &args.route_v2_public_key_ring_file,
+                    &args.gateway_client_ca_bundle_file,
+                    &args.node_route_v2_server_certificate_file,
+                    &args.node_route_v2_server_private_key_file,
+                )?;
+            Some(RouteV2MachineConfig::from_installed_artifacts(
+                listen,
+                agent_registration.identity().node_id.clone(),
+                &artifacts,
+            )?)
+        }
+        None => None,
+    };
     let deadline_policy = RuntimeSpineDeadlinePolicy::new(
         Duration::from_millis(args.runtime_inventory_scan_timeout_ms),
         Duration::from_millis(args.runtime_effect_step_timeout_ms),
@@ -203,6 +254,7 @@ async fn main() -> anyhow::Result<()> {
     .context("validate signed Runtime scan/effect deadline policy")?;
     let handle = spawn_signed_runtime_cutover(SignedRuntimeCutoverConfig {
         listen: args.listen,
+        route_v2_machine,
         control_plane_url: args.control_plane_url,
         agent_registration,
         ch_config,
@@ -216,10 +268,16 @@ async fn main() -> anyhow::Result<()> {
         deadline_policy,
     })
     .await?;
-    eprintln!(
-        "signed Runtime listener {} is bound; readiness stays closed until complete inventory is attested",
-        handle.addr
-    );
+    match handle.route_v2_addr {
+        Some(route_v2_addr) => eprintln!(
+            "signed Runtime listener {} and authenticated Route v2 listener {} are bound; readiness stays closed until complete inventory is attested",
+            handle.addr, route_v2_addr
+        ),
+        None => eprintln!(
+            "signed Runtime listener {} is bound; Route v2 machine ingress is closed; readiness stays closed until complete inventory is attested",
+            handle.addr
+        ),
+    }
     handle.run_until_signal().await
 }
 

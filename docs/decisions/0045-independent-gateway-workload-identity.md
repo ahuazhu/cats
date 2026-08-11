@@ -52,7 +52,8 @@ keepalive连接越过撤销继续签发。
    admission，等待active owners归零，再结束listener。一次请求的绝对deadline仍为2000ms。
 10. 没有machine配置、artifact、PG current authority、exact signer binding或TLS proof时均fail closed；
     无配置仍在pre-body/pre-PG返回401，principal已认证但signer未组成则pre-body/pre-PG返回503。该决策不开放
-    public proxy、不改变Node admission，也不定义Gateway到Node的TLS/proxy frame。
+    public proxy。Gateway到Node的TLS/proxy frame随后由[ADR-0046](0046-gateway-node-route-v2-machine-tunnel.md)
+    冻结，并把本request授权的leaf SPKI digest签入Grant。
 
 ## 当前实现边界
 
@@ -62,8 +63,8 @@ Control现已从唯一固定目录用descriptor/stable-reopen合同读取policy�
 snapshot内闭合hostname-derived Workspace、Route/Desired/ring ACK、Gateway scope与signer current后才签名。
 认证/resolve拥有独立bounded RAII owner，shutdown关闭两类admission并join Store closure与listener task。
 
-本实现仍不包含Gateway到Node credential/listener、public proxy、Route signer rotation writer或Node public-ring
-installer/全量ACK rollout。Gateway与signer表仍共同属于尚未合流部署的clean-slate schema 13最终形态；中间
+本实现仍不包含public proxy、Route signer rotation writer或Node public-ring全量ACK rollout；Gateway到Node
+machine tunnel由ADR-0046独立组成。Gateway与signer表仍共同属于尚未合流部署的clean-slate schema 13最终形态；中间
 提交不构成可单独部署migration。
 
 ## 后果
@@ -73,8 +74,8 @@ installer/全量ACK rollout。Gateway与signer表仍共同属于尚未合流部�
   Cats credential policy。
 - private material不进入Control Store或IaC state；代价是部署前必须有独立secret安装通道和严格fixed-file
   reader。
-- production Control resolve可以在独立machine listener上逐步开放，但Gateway->Node transport/public proxy
-  仍保持关闭，直到另一个Accepted合同冻结其streaming、upgrade、guard和credential边界。
+- production Control resolve和Gateway->Node machine tunnel可独立开放；public proxy仍保持关闭，直到其
+  SNI/Host、cache与listener组合完成。
 
 ## 不采用的方案
 

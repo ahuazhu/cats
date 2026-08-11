@@ -78,6 +78,7 @@ struct RouteGrantV2AuthorityLocator {
 }
 
 impl Store {
+    #[cfg(test)]
     pub(crate) fn load_route_grant_v2_authority(
         &self,
         hostname: &Hostname,
@@ -174,11 +175,13 @@ impl Store {
                     return Ok(RouteGrantV2MachineAuthorityLoad::Rejected(rejection));
                 }
             };
-            let issued = signer.issue(&snapshot).map_err(|_| {
-                AuthorityTransactionError::Application(ApiError::unavailable(
-                    "Route Grant v2 signer could not issue from the current snapshot",
-                ))
-            })?;
+            let issued = signer
+                .issue(&snapshot, &principal.public_key_spki_sha256)
+                .map_err(|_| {
+                    AuthorityTransactionError::Application(ApiError::unavailable(
+                        "Route Grant v2 signer could not issue from the current snapshot",
+                    ))
+                })?;
             Ok(RouteGrantV2MachineAuthorityLoad::Ready { snapshot, issued })
         })
     }
@@ -227,6 +230,7 @@ fn load_endpoint_scope_workspace_in(
         .transpose()
 }
 
+#[cfg(test)]
 fn load_route_grant_v2_authority_in(
     transaction: &mut postgres::Transaction<'_>,
     hostname: &Hostname,

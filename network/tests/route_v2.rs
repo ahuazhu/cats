@@ -29,6 +29,7 @@ fn envelope(opaque_grant: Vec<u8>, expires_at_unix_seconds: u64) -> Authenticate
     let response_bytes = opaque_grant.len() + 256;
     let digest = grant_digest(&opaque_grant);
     AuthenticatedResolveEnvelope::from_authenticated_transport(
+        Id::new("cat_01").unwrap(),
         Id::new("ep_01").unwrap(),
         NodeTransportTarget::new("https://node-a.internal:7301").unwrap(),
         expires_at_unix_seconds,
@@ -73,6 +74,7 @@ fn authenticated_envelope_validates_metadata_without_parsing_the_opaque_grant() 
         ResolveEnvelopeError::ExpiryTooFar
     );
     let wrong_digest = AuthenticatedResolveEnvelope::from_authenticated_transport(
+        Id::new("cat_01").unwrap(),
         Id::new("ep_01").unwrap(),
         NodeTransportTarget::new("https://node-a.internal:7301").unwrap(),
         now + 120,
@@ -93,6 +95,7 @@ fn authenticated_envelope_validates_metadata_without_parsing_the_opaque_grant() 
         ResolveEnvelopeError::EmptyOpaqueGrant
     );
     let invalid_size = AuthenticatedResolveEnvelope::from_authenticated_transport(
+        Id::new("cat_01").unwrap(),
         Id::new("ep_01").unwrap(),
         NodeTransportTarget::new("https://node-a.internal:7301").unwrap(),
         now + 120,

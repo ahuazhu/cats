@@ -29,6 +29,7 @@ use cats_storage::BlobStore;
 
 use crate::agent_registration::AgentRegistrationConfig;
 use crate::ch::{BlockPath, ChConfig};
+use crate::route_v2_machine::{RouteV2MachineConfig, RouteV2MachineListener};
 use crate::runtime::reconciliation::{
     installed_clean_slate_scanner, installed_root_process_effect_ports, AdmissionCellRegistry,
     AuthorizedBlockdLaunchConfig, ControlBlockingSignedVolumeEvidenceClient,
@@ -47,6 +48,10 @@ const RETRY_DELAY: Duration = Duration::from_secs(1);
 
 pub struct SignedRuntimeCutoverConfig {
     pub listen: String,
+    /// Independent authenticated Gateway-to-Node listener. `noded` can supply
+    /// this only from the fixed artifact set; absence keeps Route v2 ingress
+    /// closed without affecting the signed Runtime worker.
+    pub route_v2_machine: Option<RouteV2MachineConfig>,
     pub control_plane_url: String,
     pub agent_registration: AgentRegistrationConfig,
     pub ch_config: ChConfig,
@@ -69,29 +74,33 @@ pub struct SignedRuntimeCutoverConfig {
 
 pub struct SignedRuntimeCutoverHandle {
     pub addr: std::net::SocketAddr,
+    pub route_v2_addr: Option<std::net::SocketAddr>,
     shutdown_runner: Option<tokio::sync::oneshot::Sender<()>>,
     server_task: tokio::task::JoinHandle<anyhow::Result<()>>,
     runner_task: tokio::task::JoinHandle<anyhow::Result<()>>,
+    route_v2_machine: Option<RouteV2MachineListener>,
 }
 
 impl SignedRuntimeCutoverHandle {
     /// Runs until process shutdown or a component failure. Shutdown first
-    /// cancels and joins the effect and scanner workers, then joins the journal
-    /// worker and drops its flock inside `RuntimeSpineRunner::shutdown`; only
-    /// then is the local health listener stopped and the process allowed to
-    /// return.
+    /// closes Route v2 admission and joins every tunnel so its guard is
+    /// returned, then cancels and joins the effect/scanner/journal workers and
+    /// drops the Runtime flock. The health listener is stopped last.
     pub async fn run_until_signal(mut self) -> anyhow::Result<()> {
         enum Stop {
             Signal(anyhow::Result<()>),
             Server(Result<anyhow::Result<()>, tokio::task::JoinError>),
             Runner(Result<anyhow::Result<()>, tokio::task::JoinError>),
+            RouteV2(anyhow::Result<()>),
         }
 
         let stop = tokio::select! {
             signal = shutdown_signal() => Stop::Signal(signal),
             result = &mut self.server_task => Stop::Server(result),
             result = &mut self.runner_task => Stop::Runner(result),
+            result = wait_route_v2_machine(&mut self.route_v2_machine) => Stop::RouteV2(result),
         };
+        let route_shutdown = self.shutdown_route_v2_machine().await;
         let (outcome, stop_server) = match stop {
             Stop::Signal(signal) => {
                 self.request_runner_shutdown();
@@ -99,7 +108,7 @@ impl SignedRuntimeCutoverHandle {
                     (&mut self.runner_task).await,
                     "join signed Runtime spine during shutdown",
                 );
-                (signal.and(runner), true)
+                (signal.and(route_shutdown).and(runner), true)
             }
             Stop::Server(server) => {
                 self.request_runner_shutdown();
@@ -108,16 +117,26 @@ impl SignedRuntimeCutoverHandle {
                     "join signed Runtime spine after listener exit",
                 );
                 (
-                    join_result(server, "signed Runtime health listener task stopped").and(runner),
+                    join_result(server, "signed Runtime health listener task stopped")
+                        .and(route_shutdown)
+                        .and(runner),
                     false,
                 )
             }
             Stop::Runner(runner) => {
                 self.shutdown_runner.take();
                 (
-                    join_result(runner, "signed Runtime spine task stopped"),
+                    join_result(runner, "signed Runtime spine task stopped").and(route_shutdown),
                     true,
                 )
+            }
+            Stop::RouteV2(route) => {
+                self.request_runner_shutdown();
+                let runner = join_result(
+                    (&mut self.runner_task).await,
+                    "join signed Runtime spine after Route v2 listener exit",
+                );
+                (route.and(route_shutdown).and(runner), true)
             }
         };
         if stop_server {
@@ -132,6 +151,22 @@ impl SignedRuntimeCutoverHandle {
             let _ = shutdown.send(());
         }
     }
+
+    async fn shutdown_route_v2_machine(&mut self) -> anyhow::Result<()> {
+        match self.route_v2_machine.as_mut() {
+            Some(listener) => listener.shutdown().await,
+            None => Ok(()),
+        }
+    }
+}
+
+async fn wait_route_v2_machine(
+    listener: &mut Option<RouteV2MachineListener>,
+) -> anyhow::Result<()> {
+    match listener {
+        Some(listener) => listener.wait().await,
+        None => std::future::pending().await,
+    }
 }
 
 fn join_result(
@@ -144,6 +179,9 @@ fn join_result(
 impl Drop for SignedRuntimeCutoverHandle {
     fn drop(&mut self) {
         self.request_runner_shutdown();
+        if let Some(listener) = &self.route_v2_machine {
+            listener.begin_shutdown();
+        }
         self.server_task.abort();
     }
 }
@@ -217,6 +255,7 @@ async fn spawn_signed_runtime_cutover_with_overrides(
     resource_owner_override: Option<Arc<dyn RuntimeEffectResourceOwner>>,
     recovery_override: Option<SignedRunningPublicationRecovery>,
 ) -> anyhow::Result<SignedRuntimeCutoverHandle> {
+    let route_v2_machine_config = config.route_v2_machine;
     // Reject an unrepresentable operator budget before registration, worker
     // construction, or listener binding can mutate external/local state.
     config
@@ -330,6 +369,7 @@ async fn spawn_signed_runtime_cutover_with_overrides(
     let effect_volume_authority = Arc::clone(&config.volume_data_authority);
     let effect_blob_store = Arc::clone(&config.blob_store);
     let effect_lease_duration_ms = config.volume_lease_duration_ms;
+    let effect_admission_registry = Arc::clone(&admission_registry);
     let effect_network_ip_binary = config.ch_config.ip_bin.clone();
     let effect_kernel_nbd_inventory = kernel_nbd_inventory;
     let effect_kernel_nbd_cleanup_owner = Arc::clone(&kernel_nbd_cleanup_owner);
@@ -388,7 +428,7 @@ async fn spawn_signed_runtime_cutover_with_overrides(
                 Arc::clone(&effect_root_process_ports.vmm_cid),
             ),
             effect_prepare_frontend,
-            admission_registry,
+            effect_admission_registry,
         )
         .context("compose signed Running root provision prefix")?;
         let recovery = match recovery_override {
@@ -426,6 +466,15 @@ async fn spawn_signed_runtime_cutover_with_overrides(
         .await
         .with_context(|| format!("bind signed Runtime health listener {}", config.listen))?;
     let addr = listener.local_addr()?;
+    let route_v2_machine = match route_v2_machine_config {
+        Some(config) => Some(
+            RouteV2MachineListener::spawn(config, admission_registry)
+                .await
+                .context("start authenticated Node Route v2 listener")?,
+        ),
+        None => None,
+    };
+    let route_v2_addr = route_v2_machine.as_ref().map(RouteV2MachineListener::addr);
 
     let readiness = Readiness::closed();
     let runner_readiness = readiness.clone();
@@ -464,9 +513,11 @@ async fn spawn_signed_runtime_cutover_with_overrides(
 
     Ok(SignedRuntimeCutoverHandle {
         addr,
+        route_v2_addr,
         shutdown_runner: Some(shutdown_runner),
         server_task,
         runner_task,
+        route_v2_machine,
     })
 }
 
@@ -1486,6 +1537,7 @@ mod tests {
         let blob_store: Arc<dyn BlobStore> = blob;
         SignedRuntimeCutoverConfig {
             listen: "127.0.0.1:0".into(),
+            route_v2_machine: None,
             control_plane_url: origin,
             agent_registration: registration_config(state_path).unwrap(),
             ch_config: test_ch_config(),
@@ -1823,6 +1875,7 @@ mod tests {
         let registration = registration_config(state_path.clone()).unwrap();
         let mut handle = spawn_signed_runtime_cutover(SignedRuntimeCutoverConfig {
             listen: "127.0.0.1:0".into(),
+            route_v2_machine: None,
             control_plane_url: origin.clone(),
             agent_registration: registration,
             ch_config: test_ch_config(),
@@ -1903,6 +1956,7 @@ mod tests {
         let mut handle = spawn_signed_runtime_cutover_with_overrides(
             SignedRuntimeCutoverConfig {
                 listen: "127.0.0.1:0".into(),
+                route_v2_machine: None,
                 control_plane_url: origin,
                 agent_registration: registration_config(state_path.clone()).unwrap(),
                 ch_config: test_ch_config(),
@@ -1983,6 +2037,7 @@ mod tests {
         });
         let result = spawn_signed_runtime_cutover(SignedRuntimeCutoverConfig {
             listen: "not-a-socket-address".into(),
+            route_v2_machine: None,
             control_plane_url: format!("http://{control_address}"),
             agent_registration: registration_config(state_root.path().join("state")).unwrap(),
             ch_config: test_ch_config(),
@@ -2029,6 +2084,7 @@ mod tests {
         });
         let result = spawn_signed_runtime_cutover(SignedRuntimeCutoverConfig {
             listen: "not-a-socket-address".into(),
+            route_v2_machine: None,
             control_plane_url: format!("http://{control_address}"),
             agent_registration: registration_config(state_root.path().join("state")).unwrap(),
             ch_config: test_ch_config(),

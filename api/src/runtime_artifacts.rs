@@ -19,8 +19,12 @@ use crate::gateway_workload_identity::{
 use crate::route_grant_v2::{
     decode_route_grant_v2_public_key_ring, decode_route_grant_v2_signer_reference,
     RouteGrantV2PublicKeyRingArtifact, RouteGrantV2SignerReference, RouteGrantV2SignerSelection,
-    ROUTE_GRANT_V2_ARTIFACT_MAX_WIRE_BYTES, ROUTE_GRANT_V2_PUBLIC_KEY_RING_PATH,
-    ROUTE_GRANT_V2_SIGNER_PRIVATE_KEY_PATH, ROUTE_GRANT_V2_SIGNER_REFERENCE_PATH,
+    GATEWAY_ROUTE_V2_CLIENT_CERTIFICATE_PATH, GATEWAY_ROUTE_V2_CLIENT_PRIVATE_KEY_PATH,
+    NODE_ROUTE_V2_SERVER_CA_BUNDLE_PATH, NODE_ROUTE_V2_SERVER_CERTIFICATE_PATH,
+    NODE_ROUTE_V2_SERVER_PRIVATE_KEY_PATH, ROUTE_GRANT_V2_ARTIFACT_MAX_WIRE_BYTES,
+    ROUTE_GRANT_V2_PUBLIC_KEY_RING_PATH, ROUTE_GRANT_V2_SIGNER_PRIVATE_KEY_PATH,
+    ROUTE_GRANT_V2_SIGNER_REFERENCE_PATH, ROUTE_V2_CERTIFICATE_MAX_WIRE_BYTES,
+    ROUTE_V2_PRIVATE_KEY_MAX_WIRE_BYTES,
 };
 use crate::runtime_reconciliation::{
     decode_guest_runtime_profile_receipt, decode_runtime_provisioner_trust_bundle, ContractVersion,
@@ -127,6 +131,76 @@ pub struct InstalledGatewayMachineArtifacts {
     client_ca_bundle_pem: Vec<u8>,
     server_certificate_pem: Vec<u8>,
     server_private_key_pem: Vec<u8>,
+}
+
+/// Startup-pinned Node Route v2 verification and mTLS server material.
+pub struct InstalledNodeRouteV2MachineArtifacts {
+    ring: InstalledRouteGrantV2PublicKeyRing,
+    gateway_client_ca_bundle_pem: Vec<u8>,
+    server_certificate_pem: Vec<u8>,
+    server_private_key_pem: Vec<u8>,
+}
+
+/// Startup-pinned Gateway identity and trust material for the Node hop.
+pub struct InstalledGatewayNodeRouteV2MachineArtifacts {
+    node_server_ca_bundle_pem: Vec<u8>,
+    client_certificate_pem: Vec<u8>,
+    client_private_key_pem: Vec<u8>,
+}
+
+impl std::fmt::Debug for InstalledNodeRouteV2MachineArtifacts {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("InstalledNodeRouteV2MachineArtifacts")
+            .field("ring", &self.ring)
+            .field("gateway_client_ca_bundle_pem", &"[redacted]")
+            .field("server_certificate_pem", &"[redacted]")
+            .field("server_private_key_pem", &"[redacted]")
+            .finish()
+    }
+}
+
+impl std::fmt::Debug for InstalledGatewayNodeRouteV2MachineArtifacts {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("InstalledGatewayNodeRouteV2MachineArtifacts")
+            .field("node_server_ca_bundle_pem", &"[redacted]")
+            .field("client_certificate_pem", &"[redacted]")
+            .field("client_private_key_pem", &"[redacted]")
+            .finish()
+    }
+}
+
+impl InstalledNodeRouteV2MachineArtifacts {
+    pub fn ring(&self) -> &InstalledRouteGrantV2PublicKeyRing {
+        &self.ring
+    }
+
+    pub fn gateway_client_ca_bundle_pem(&self) -> &[u8] {
+        &self.gateway_client_ca_bundle_pem
+    }
+
+    pub fn server_certificate_pem(&self) -> &[u8] {
+        &self.server_certificate_pem
+    }
+
+    pub fn server_private_key_pem(&self) -> &[u8] {
+        &self.server_private_key_pem
+    }
+}
+
+impl InstalledGatewayNodeRouteV2MachineArtifacts {
+    pub fn node_server_ca_bundle_pem(&self) -> &[u8] {
+        &self.node_server_ca_bundle_pem
+    }
+
+    pub fn client_certificate_pem(&self) -> &[u8] {
+        &self.client_certificate_pem
+    }
+
+    pub fn client_private_key_pem(&self) -> &[u8] {
+        &self.client_private_key_pem
+    }
 }
 
 impl std::fmt::Debug for InstalledGatewayMachineArtifacts {
@@ -288,6 +362,10 @@ pub enum RuntimeArtifactError {
     WrongRouteGrantV2SignerPath,
     #[error("Gateway machine artifact paths must be the canonical installed paths")]
     WrongGatewayMachineArtifactPath,
+    #[error("Node Route v2 machine artifact paths must be the canonical installed paths")]
+    WrongNodeRouteV2MachineArtifactPath,
+    #[error("Gateway-to-Node Route v2 artifact paths must be the canonical installed paths")]
+    WrongGatewayNodeRouteV2MachineArtifactPath,
     #[error("Guest runtime release is not supported on this platform")]
     UnsupportedPlatform,
     #[error("Guest runtime release filesystem contract failed at {path}")]
@@ -304,6 +382,10 @@ pub enum RuntimeArtifactError {
     InvalidRouteGrantV2Signer,
     #[error("Gateway machine artifact set is invalid")]
     InvalidGatewayMachineArtifacts,
+    #[error("Node Route v2 machine artifact set is invalid")]
+    InvalidNodeRouteV2MachineArtifacts,
+    #[error("Gateway-to-Node Route v2 artifact set is invalid")]
+    InvalidGatewayNodeRouteV2MachineArtifacts,
 }
 
 /// Load the one fixed Gateway policy and Control machine-listener TLS set.
@@ -453,6 +535,187 @@ enum GatewayMachineArtifactReadPhase {
     ClientCaBundle,
     ServerCertificate,
     ServerPrivateKey,
+}
+
+/// Load the one fixed Node Route v2 ring and mTLS server set. Path arguments
+/// prove that production startup accepted neither alternate trust roots nor
+/// caller-selected private material.
+pub fn load_installed_node_route_v2_machine_artifacts(
+    public_key_ring_path: &Path,
+    gateway_client_ca_bundle_path: &Path,
+    server_certificate_path: &Path,
+    server_private_key_path: &Path,
+) -> Result<InstalledNodeRouteV2MachineArtifacts, RuntimeArtifactError> {
+    if public_key_ring_path != Path::new(ROUTE_GRANT_V2_PUBLIC_KEY_RING_PATH)
+        || gateway_client_ca_bundle_path != Path::new(GATEWAY_CLIENT_CA_BUNDLE_PATH)
+        || server_certificate_path != Path::new(NODE_ROUTE_V2_SERVER_CERTIFICATE_PATH)
+        || server_private_key_path != Path::new(NODE_ROUTE_V2_SERVER_PRIVATE_KEY_PATH)
+    {
+        return Err(RuntimeArtifactError::WrongNodeRouteV2MachineArtifactPath);
+    }
+    load_installed_node_route_v2_machine_artifacts_platform()
+}
+
+/// Load the fixed Gateway client identity and Node-server trust root used by
+/// the production Gateway-to-Node hop.
+pub fn load_installed_gateway_node_route_v2_machine_artifacts(
+    node_server_ca_bundle_path: &Path,
+    client_certificate_path: &Path,
+    client_private_key_path: &Path,
+) -> Result<InstalledGatewayNodeRouteV2MachineArtifacts, RuntimeArtifactError> {
+    if node_server_ca_bundle_path != Path::new(NODE_ROUTE_V2_SERVER_CA_BUNDLE_PATH)
+        || client_certificate_path != Path::new(GATEWAY_ROUTE_V2_CLIENT_CERTIFICATE_PATH)
+        || client_private_key_path != Path::new(GATEWAY_ROUTE_V2_CLIENT_PRIVATE_KEY_PATH)
+    {
+        return Err(RuntimeArtifactError::WrongGatewayNodeRouteV2MachineArtifactPath);
+    }
+    load_installed_gateway_node_route_v2_machine_artifacts_platform()
+}
+
+#[cfg(unix)]
+fn load_installed_node_route_v2_machine_artifacts_platform(
+) -> Result<InstalledNodeRouteV2MachineArtifacts, RuntimeArtifactError> {
+    let directory = open_installed_directory(
+        &["etc", "cats", "route-v2"],
+        InstalledDirectoryMode::Exact(0o700),
+    )?;
+    load_node_route_v2_machine_artifacts_from(
+        &directory,
+        InstalledFileContract::root(0o644),
+        InstalledFileContract::root(0o600),
+    )
+}
+
+#[cfg(unix)]
+fn load_node_route_v2_machine_artifacts_from(
+    directory: &InstalledDirectoryPath,
+    public: InstalledFileContract,
+    private: InstalledFileContract,
+) -> Result<InstalledNodeRouteV2MachineArtifacts, RuntimeArtifactError> {
+    let ring_file = read_pinned_installed_file_at_with_contract(
+        directory.final_descriptor(),
+        "public-key-ring.v1.json",
+        Path::new(ROUTE_GRANT_V2_PUBLIC_KEY_RING_PATH),
+        ROUTE_GRANT_V2_ARTIFACT_MAX_WIRE_BYTES,
+        public,
+    )?;
+    let client_ca_file = read_pinned_installed_file_at_with_contract(
+        directory.final_descriptor(),
+        "gateway-client-ca-bundle.pem",
+        Path::new(GATEWAY_CLIENT_CA_BUNDLE_PATH),
+        GATEWAY_CLIENT_CA_BUNDLE_MAX_WIRE_BYTES,
+        public,
+    )?;
+    let server_certificate_file = read_pinned_installed_file_at_with_contract(
+        directory.final_descriptor(),
+        "node-machine-server-certificate.pem",
+        Path::new(NODE_ROUTE_V2_SERVER_CERTIFICATE_PATH),
+        ROUTE_V2_CERTIFICATE_MAX_WIRE_BYTES,
+        public,
+    )?;
+    let server_private_key_file = read_pinned_installed_file_at_with_contract(
+        directory.final_descriptor(),
+        "node-machine-server-private-key.pem",
+        Path::new(NODE_ROUTE_V2_SERVER_PRIVATE_KEY_PATH),
+        ROUTE_V2_PRIVATE_KEY_MAX_WIRE_BYTES,
+        private,
+    )?;
+    let fresh = directory.reopen_canonical_path()?;
+    ring_file.revalidate_from(&fresh, ROUTE_GRANT_V2_ARTIFACT_MAX_WIRE_BYTES, public)?;
+    client_ca_file.revalidate_from(&fresh, GATEWAY_CLIENT_CA_BUNDLE_MAX_WIRE_BYTES, public)?;
+    server_certificate_file.revalidate_from(&fresh, ROUTE_V2_CERTIFICATE_MAX_WIRE_BYTES, public)?;
+    server_private_key_file.revalidate_from(
+        &fresh,
+        ROUTE_V2_PRIVATE_KEY_MAX_WIRE_BYTES,
+        private,
+    )?;
+    if client_ca_file.exact_bytes().is_empty()
+        || server_certificate_file.exact_bytes().is_empty()
+        || server_private_key_file.exact_bytes().is_empty()
+    {
+        return Err(RuntimeArtifactError::InvalidNodeRouteV2MachineArtifacts);
+    }
+    let ring = decode_route_grant_v2_public_key_ring(ring_file.exact_bytes())
+        .map_err(|_| RuntimeArtifactError::InvalidNodeRouteV2MachineArtifacts)?;
+    Ok(InstalledNodeRouteV2MachineArtifacts {
+        ring: InstalledRouteGrantV2PublicKeyRing {
+            ring,
+            exact_bytes: ring_file.into_exact_bytes(),
+        },
+        gateway_client_ca_bundle_pem: client_ca_file.into_exact_bytes(),
+        server_certificate_pem: server_certificate_file.into_exact_bytes(),
+        server_private_key_pem: server_private_key_file.into_exact_bytes(),
+    })
+}
+
+#[cfg(not(unix))]
+fn load_installed_node_route_v2_machine_artifacts_platform(
+) -> Result<InstalledNodeRouteV2MachineArtifacts, RuntimeArtifactError> {
+    Err(RuntimeArtifactError::UnsupportedPlatform)
+}
+
+#[cfg(unix)]
+fn load_installed_gateway_node_route_v2_machine_artifacts_platform(
+) -> Result<InstalledGatewayNodeRouteV2MachineArtifacts, RuntimeArtifactError> {
+    let directory = open_installed_directory(
+        &["etc", "cats", "route-v2"],
+        InstalledDirectoryMode::Exact(0o700),
+    )?;
+    load_gateway_node_route_v2_machine_artifacts_from(
+        &directory,
+        InstalledFileContract::root(0o644),
+        InstalledFileContract::root(0o600),
+    )
+}
+
+#[cfg(unix)]
+fn load_gateway_node_route_v2_machine_artifacts_from(
+    directory: &InstalledDirectoryPath,
+    public: InstalledFileContract,
+    private: InstalledFileContract,
+) -> Result<InstalledGatewayNodeRouteV2MachineArtifacts, RuntimeArtifactError> {
+    let ca_file = read_pinned_installed_file_at_with_contract(
+        directory.final_descriptor(),
+        "node-server-ca-bundle.pem",
+        Path::new(NODE_ROUTE_V2_SERVER_CA_BUNDLE_PATH),
+        ROUTE_V2_CERTIFICATE_MAX_WIRE_BYTES,
+        public,
+    )?;
+    let certificate_file = read_pinned_installed_file_at_with_contract(
+        directory.final_descriptor(),
+        "gateway-machine-client-certificate.pem",
+        Path::new(GATEWAY_ROUTE_V2_CLIENT_CERTIFICATE_PATH),
+        ROUTE_V2_CERTIFICATE_MAX_WIRE_BYTES,
+        public,
+    )?;
+    let private_key_file = read_pinned_installed_file_at_with_contract(
+        directory.final_descriptor(),
+        "gateway-machine-client-private-key.pem",
+        Path::new(GATEWAY_ROUTE_V2_CLIENT_PRIVATE_KEY_PATH),
+        ROUTE_V2_PRIVATE_KEY_MAX_WIRE_BYTES,
+        private,
+    )?;
+    let fresh = directory.reopen_canonical_path()?;
+    ca_file.revalidate_from(&fresh, ROUTE_V2_CERTIFICATE_MAX_WIRE_BYTES, public)?;
+    certificate_file.revalidate_from(&fresh, ROUTE_V2_CERTIFICATE_MAX_WIRE_BYTES, public)?;
+    private_key_file.revalidate_from(&fresh, ROUTE_V2_PRIVATE_KEY_MAX_WIRE_BYTES, private)?;
+    if ca_file.exact_bytes().is_empty()
+        || certificate_file.exact_bytes().is_empty()
+        || private_key_file.exact_bytes().is_empty()
+    {
+        return Err(RuntimeArtifactError::InvalidGatewayNodeRouteV2MachineArtifacts);
+    }
+    Ok(InstalledGatewayNodeRouteV2MachineArtifacts {
+        node_server_ca_bundle_pem: ca_file.into_exact_bytes(),
+        client_certificate_pem: certificate_file.into_exact_bytes(),
+        client_private_key_pem: private_key_file.into_exact_bytes(),
+    })
+}
+
+#[cfg(not(unix))]
+fn load_installed_gateway_node_route_v2_machine_artifacts_platform(
+) -> Result<InstalledGatewayNodeRouteV2MachineArtifacts, RuntimeArtifactError> {
+    Err(RuntimeArtifactError::UnsupportedPlatform)
 }
 
 /// Load the one public ring installed on a Node. The path argument exists only
@@ -1831,6 +2094,54 @@ mod tests {
     }
 
     #[cfg(unix)]
+    fn write_test_node_route_v2_machine_artifacts(directory: &Path) {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        write_test_route_artifacts(directory, false);
+        for (basename, bytes, mode) in [
+            ("gateway-client-ca-bundle.pem", TEST_CLIENT_CA, 0o644),
+            (
+                "node-machine-server-certificate.pem",
+                TEST_SERVER_CERTIFICATE,
+                0o644,
+            ),
+            (
+                "node-machine-server-private-key.pem",
+                TEST_SERVER_PRIVATE_KEY,
+                0o600,
+            ),
+        ] {
+            let path = directory.join(basename);
+            std::fs::write(&path, bytes).unwrap();
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(mode)).unwrap();
+        }
+    }
+
+    #[cfg(unix)]
+    fn write_test_gateway_node_route_v2_machine_artifacts(directory: &Path) {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        write_test_route_artifacts(directory, false);
+        for (basename, bytes, mode) in [
+            ("node-server-ca-bundle.pem", TEST_CLIENT_CA, 0o644),
+            (
+                "gateway-machine-client-certificate.pem",
+                TEST_SERVER_CERTIFICATE,
+                0o644,
+            ),
+            (
+                "gateway-machine-client-private-key.pem",
+                TEST_SERVER_PRIVATE_KEY,
+                0o600,
+            ),
+        ] {
+            let path = directory.join(basename);
+            std::fs::write(&path, bytes).unwrap();
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(mode)).unwrap();
+        }
+    }
+
+    #[cfg(unix)]
     fn test_gateway_contracts(directory: &Path) -> (InstalledFileContract, InstalledFileContract) {
         use std::os::unix::fs::MetadataExt as _;
 
@@ -2601,6 +2912,93 @@ mod tests {
         assert!(matches!(
             load_gateway_machine_artifacts_from(&retained, public_contract, private_contract),
             Err(RuntimeArtifactError::InvalidGatewayMachineArtifacts)
+        ));
+    }
+
+    #[test]
+    fn route_v2_machine_readers_reject_every_alternate_path_before_io() {
+        assert!(matches!(
+            load_installed_node_route_v2_machine_artifacts(
+                Path::new("/not/the/fixed/ring"),
+                Path::new(GATEWAY_CLIENT_CA_BUNDLE_PATH),
+                Path::new(NODE_ROUTE_V2_SERVER_CERTIFICATE_PATH),
+                Path::new(NODE_ROUTE_V2_SERVER_PRIVATE_KEY_PATH),
+            )
+            .unwrap_err(),
+            RuntimeArtifactError::WrongNodeRouteV2MachineArtifactPath
+        ));
+        assert!(matches!(
+            load_installed_gateway_node_route_v2_machine_artifacts(
+                Path::new(NODE_ROUTE_V2_SERVER_CA_BUNDLE_PATH),
+                Path::new(GATEWAY_ROUTE_V2_CLIENT_CERTIFICATE_PATH),
+                Path::new("/not/the/fixed/client-key"),
+            )
+            .unwrap_err(),
+            RuntimeArtifactError::WrongGatewayNodeRouteV2MachineArtifactPath
+        ));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn node_route_v2_machine_reader_pins_closed_set_and_private_mode() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let temp = tempfile::tempdir().unwrap();
+        let directory_path = temp.path().join("route-v2");
+        write_test_node_route_v2_machine_artifacts(&directory_path);
+        let (public_contract, private_contract) = test_route_contracts(&directory_path);
+        let retained = open_test_route_directory(temp.path());
+        let installed =
+            load_node_route_v2_machine_artifacts_from(&retained, public_contract, private_contract)
+                .unwrap();
+        assert_eq!(installed.ring().exact_bytes(), ROUTE_RING);
+        assert_eq!(installed.gateway_client_ca_bundle_pem(), TEST_CLIENT_CA);
+        assert_eq!(installed.server_certificate_pem(), TEST_SERVER_CERTIFICATE);
+        assert_eq!(installed.server_private_key_pem(), TEST_SERVER_PRIVATE_KEY);
+        let debug = format!("{installed:?}");
+        assert!(debug.contains("[redacted]"));
+        assert!(!debug.contains("BEGIN PRIVATE KEY"));
+
+        let key_path = directory_path.join("node-machine-server-private-key.pem");
+        std::fs::set_permissions(&key_path, std::fs::Permissions::from_mode(0o644)).unwrap();
+        assert!(matches!(
+            load_node_route_v2_machine_artifacts_from(&retained, public_contract, private_contract,),
+            Err(RuntimeArtifactError::Filesystem { .. })
+        ));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn gateway_node_route_v2_machine_reader_pins_closed_set_and_private_mode() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let temp = tempfile::tempdir().unwrap();
+        let directory_path = temp.path().join("route-v2");
+        write_test_gateway_node_route_v2_machine_artifacts(&directory_path);
+        let (public_contract, private_contract) = test_route_contracts(&directory_path);
+        let retained = open_test_route_directory(temp.path());
+        let installed = load_gateway_node_route_v2_machine_artifacts_from(
+            &retained,
+            public_contract,
+            private_contract,
+        )
+        .unwrap();
+        assert_eq!(installed.node_server_ca_bundle_pem(), TEST_CLIENT_CA);
+        assert_eq!(installed.client_certificate_pem(), TEST_SERVER_CERTIFICATE);
+        assert_eq!(installed.client_private_key_pem(), TEST_SERVER_PRIVATE_KEY);
+        let debug = format!("{installed:?}");
+        assert!(debug.contains("[redacted]"));
+        assert!(!debug.contains("BEGIN PRIVATE KEY"));
+
+        let key_path = directory_path.join("gateway-machine-client-private-key.pem");
+        std::fs::set_permissions(&key_path, std::fs::Permissions::from_mode(0o644)).unwrap();
+        assert!(matches!(
+            load_gateway_node_route_v2_machine_artifacts_from(
+                &retained,
+                public_contract,
+                private_contract,
+            ),
+            Err(RuntimeArtifactError::Filesystem { .. })
         ));
     }
 

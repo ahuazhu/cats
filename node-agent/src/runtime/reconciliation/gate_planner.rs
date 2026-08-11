@@ -336,7 +336,7 @@ impl<'a, P: AdmissionGatePort> GateSequencer<'a, P> {
             GateReconcileError::AppliedDesired(AppliedDesiredError::CheckpointContract { error })
         })?;
         let expected = AdmissionSnapshot::from_checkpoint(&prepared_checkpoint)?;
-        let replacement = AdmissionSnapshot::new(
+        let mut replacement = AdmissionSnapshot::new(
             expected.applied_desired_revision(),
             expected.spec_digest().clone(),
             expected.placement().clone(),
@@ -344,6 +344,9 @@ impl<'a, P: AdmissionGatePort> GateSequencer<'a, P> {
             LifecycleAdmission::Open,
             Vec::new(),
         );
+        if let Some(guest_ipv4) = expected.guest_ipv4().cloned() {
+            replacement = replacement.with_guest_ipv4(guest_ipv4);
+        }
         let mut completed = prepared_checkpoint.clone();
         completed.lifecycle_admission = LifecycleAdmission::Open;
         completed.stable_state = Some(cats_api::runtime_reconciliation::StableState::Running);

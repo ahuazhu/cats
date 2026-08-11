@@ -1,7 +1,7 @@
 # Route Grant v2
 
-- 状态：Target contract；shared codec、Control独立Gateway machine resolve transport与Node
-  verification/admission core已实现，Gateway到Node transport与public proxy仍保持关闭
+- 状态：Target contract；shared codec、Control独立Gateway machine resolve transport、Node
+  verification/admission core与Gateway到Node machine tunnel已实现；public proxy仍保持关闭
 - Authority：[ADR-0041](../decisions/0041-node-verified-route-admission.md)
 - Runtime identity：[Runtime Reconciliation v1](runtime-reconciliation-v1.md)
 - Runtime accepted facts：[Runtime Inventory and Observation Spine v1](runtime-inventory-observation-v1.md)
@@ -37,6 +37,7 @@ claims 的逻辑形态：
   "route_epoch": 7,
   "protocol": "http",
   "target_port": 8080,
+  "gateway_public_key_spki_sha256": "sha256:...",
   "iat": 1786156800,
   "nbf": 1786156800,
   "exp": 1786156920
@@ -54,6 +55,7 @@ claims 的逻辑形态：
 | `route_epoch` | Runtime Reconciliation v1 `Epoch`（`1..=9223372036854775807`），精确匹配Endpoint serving gate；close后重开必须更大 |
 | `protocol` | v2 只允许 `http`；WebSocket 是该 HTTP route 的 upgrade |
 | `target_port` | `1..=65535`，精确匹配 gate；请求不能覆盖 |
+| `gateway_public_key_spki_sha256` | Control machine listener实际认证并授权的Gateway leaf canonical Ed25519 SPKI SHA-256；精确匹配Node tunnel同一TLS connection的leaf |
 | `iat`/`nbf`/`exp` | JSON integer `0..=9223372036854775807` Unix seconds；`iat <= nbf < exp` |
 
 默认 TTL 为 120 秒，最大 TTL 为 300 秒，最大时钟偏差为 5 秒；必须满足
@@ -163,7 +165,7 @@ handler在读取body、取得admission permit或访问PostgreSQL前要求该prin
   从headers到最终response为2000ms；
 - request是canonical JSON `{"version":2,"hostname":"app.cats.run"}`。decoder拒绝非canonical
   member order/whitespace、重复或未知字段；
-- success最多8192 bytes，canonical JSON字段依次是`version`、`endpoint_id`、
+- success最多8192 bytes，canonical JSON字段依次是`version`、`cat_id`、`endpoint_id`、
   `node_transport_target`、`expires_at_unix_seconds`、`opaque_grant`、`grant_sha256`。Gateway只校验
   strict A23 target、expiry range、opaque grant ASCII/4096-byte bound和`SHA-256(opaque_grant)`；不解析
   protected header、claims或签名；
@@ -186,21 +188,38 @@ authority，filesystem JSON只做install candidate。它不借legacy或HTTP head
 [Route v2 Signing Authority v1](route-signing-authority-v1.md)另行冻结独立Route v2 signer。production success
 只有在machine listener的Gateway credential和进程内fixed signer分别等于同一PG snapshot的current binding时
 开放；无machine配置仍pre-body/pre-PG `401`，principal已认证但signer未组成则pre-body/pre-PG `503`，不存在
-legacy V1 signer/key fallback。Gateway到Node的credential/listener/proxy仍按§4.2保持关闭。
+legacy V1 signer/key fallback。签发时还把该request实际授权的Gateway leaf SPKI digest写入Grant；
+Gateway到Node必须以同一leaf证明持有credential。
 
 A19只授权Node到Control，A23只授权deployment provisioner写placement policy；两者都不能授权Gateway。
 legacy shared bearer、`nodes.agent_url`、HTTP header自报principal、推测的SPIFFE/SAN或云IAM映射都不是
 fallback。test principal仍只用于显式test router，不能进入production machine listener。
 
-### 4.2 Node admission frame的冻结边界
+### 4.2 Node machine tunnel frame
 
-Node typed failure envelope已经冻结为canonical JSON
-`{"version":2,"guard_acquired":false,"reason":"expired"}`及§8闭集；只有
-`UpstreamUnavailable`允许`guard_acquired=true`。但完整Gateway->Node HTTPS request frame尚不能从现有
-authority推导：Gateway credential/trust、内部grant保留字段、public request header/body streaming、
-upgrade、deadline、取消以及guard与proxy lifetime的组合仍未冻结。实现不得增加裸Grant preflight，
-也不得借legacy Node HTTP/shared bearer旁路；Node verification/admission core保持可组合但production
-HTTPS route/listener关闭，直到同一Accepted合同闭合这些边界。
+[ADR-0046](../decisions/0046-gateway-node-route-v2-machine-tunnel.md)冻结完整hop：Gateway以固定client
+certificate对A23 strict HTTPS target建立TLS 1.3，Node用固定Gateway client CA验证chain并从leaf提取
+canonical Ed25519 SPKI digest。method/path精确为`POST /v1/internal/routes/tunnel`，无query，只接受
+HTTP/1.1、exact `application/json`、`Connection: upgrade`与
+`Upgrade: cats-route-v2-tunnel`；不接受Authorization、Cookie、content/transfer encoding、条件、
+method override或未知header。TLS/header/body/Guest connect各有独立deadline，connections与tunnels有硬上限。
+
+request body最多5120 bytes，是canonical JSON：
+
+```json
+{"version":2,"cat_id":"cat_01","endpoint_id":"ep_01","hostname":"app.cats.run","opaque_grant":"...","grant_sha256":"sha256:..."}
+```
+
+Node先用`cat_id`在本进程唯一registry定位cell；该字段不授权。Node验签后比较Grant中的Gateway leaf digest、
+local Node/request binding与同一cell binding，在cell内原子取得guard和checkpointed Guest IPv4，再在锁外连接
+Grant target port。成功返回`101`，同一exchange随后成为public HTTP/WebSocket raw byte tunnel；Grant和内部
+frame不进入Guest。这是实际proxy request，不是裸Grant preflight。
+
+pre-admission failure为canonical JSON
+`{"version":2,"guard_acquired":false,"reason":"expired"}`及§8闭集；只有已取得guard后的Guest
+connect失败为`502`和`UpstreamUnavailable, guard_acquired=true`。普通stream failure关闭tunnel。Gateway不
+redirect、不fallback、不自动重试当前request。Node shutdown先关闭new admission，再cancel/join全部tunnel，
+guard覆盖从admission到EOF/error/cancel/shutdown的完整lifetime。
 
 ## 5. Gateway cache
 
@@ -209,7 +228,7 @@ HTTPS route/listener关闭，直到同一Accepted合同闭合这些边界。
 
 ```text
 canonical hostname -> {
-  endpoint_id, node_transport_target, opaque_grant,
+  cat_id, endpoint_id, node_transport_target, opaque_grant,
   grant_digest, expires_at
 }
 ```
@@ -240,7 +259,7 @@ Node transport failure、Guest connect failure、部分响应、timeout、取消
 
 Node 对每个内部请求按以下顺序执行：
 
-1. 认证并加密 Gateway machine hop；限制 request/token/segment 大小。
+1. 认证并加密 Gateway machine hop；比较Grant绑定的Gateway leaf SPKI digest；限制request/token/segment大小。
 2. 严格解析 protected header，按 `kid` 选择本地 ring key并验证 Ed25519 signature。
 3. 严格 decode claims，验证 version/issuer/audience/字段结构；计算 time verdict，但先不返回
    `Expired/NotYetValid`。
@@ -259,11 +278,11 @@ admission、Endpoint/Platform guards 和 cancellation handles。HTTP/WebSocket�
 
 当前Node core实现以同一个mutex同时承载complete `AdmissionSnapshot` compare-and-apply和已验签Grant的
 binding compare/guard increment；snapshot精确包含desired revision、spec digest、placement、runtime
-incarnation、lifecycle与全部Endpoint bindings。replacement在取得mutex前完整验证；Endpoint-scoped
+incarnation、checkpointed Guest IPv4、lifecycle与全部Endpoint bindings。replacement在取得mutex前完整验证；Endpoint-scoped
 stale revision/spec/placement compare零副作用，全局compare歧义则fail closed。Endpoint close和新guard
 不能跨两个锁竞态。guard是不可clone的RAII值，
-普通返回、错误、panic和async task取消都经`Drop`归还。该core要求不可由wire构造的authenticated
-Gateway principal，但不会自行构造principal或执行proxy I/O；HTTPS transport仍受§4.2阻塞。
+普通返回、错误、panic和async task取消都经`Drop`归还。machine transport只从CA-verified TLS leaf构造
+不可由wire生成的typed Gateway principal，并用同一registry执行该core；它不从header构造principal。
 
 一旦 guard increment 成功，Node 后续只能返回 `UpstreamUnavailable` 或普通 upstream response，
 不能再伪装成 pre-admission rejection。一次 Grant 只授权指定 target 上的一次 admission，不授权
@@ -423,6 +442,12 @@ observation revision，不能把desired revision塞回Grant vector。
 - 在上述每个边界另行kill Agent；restart使全部内存gate实际Closed，必须提高全部原Active Endpoint epochs，
   不能声称只恢复A，也不把CloseGate当作旧epoch恢复依据；
 - app port未监听产生 `UpstreamUnavailable`，不把 platform gate误报为未Ready，不刷新 route；
+- Node machine TLS矩阵覆盖有效Gateway leaf、无client certificate、未知CA、错误EKU、非Ed25519 leaf和
+  错误ALPN；有效chain但Grant绑定另一Gateway SPKI时必须在Guest connect前返回`BindingMismatch`；
+- tunnel frame覆盖noncanonical/duplicate/unknown/oversize header与body、错误digest、错误Node、过期Grant、
+  缺registry cell、缺Guest target和Closed gate；只有完整认证/验签/gate通过才允许触达Guest socket；
+- Gateway到Node每个current request最多一次TCP/TLS/HTTP attempt；TLS/HTTP/Guest失败和typed rejection均不
+  自动重放。`101`后的双向EOF/cancel以及Node shutdown都必须有界结束并把guard/permit归零；
 - pre-admission stale rejection与新resolve竞争时，旧 digest不能删除新entry；当前POST和WebSocket
   upgrade都不重放；
 - per-replica LRU、negative backoff、singleflight、waiter和resolve semaphore在高基数hostname与慢

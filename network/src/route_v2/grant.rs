@@ -41,6 +41,7 @@ impl GrantDigest {
 /// Grant remains opaque bytes here.
 #[derive(Clone)]
 pub struct AuthenticatedResolveEnvelope {
+    cat_id: Id,
     endpoint_id: Id,
     node_transport_target: NodeTransportTarget,
     expires_at_unix_seconds: u64,
@@ -51,6 +52,7 @@ pub struct AuthenticatedResolveEnvelope {
 
 impl AuthenticatedResolveEnvelope {
     pub fn from_authenticated_transport(
+        cat_id: Id,
         endpoint_id: Id,
         node_transport_target: NodeTransportTarget,
         expires_at_unix_seconds: u64,
@@ -59,6 +61,7 @@ impl AuthenticatedResolveEnvelope {
         response_bytes: usize,
     ) -> Self {
         Self {
+            cat_id,
             endpoint_id,
             node_transport_target,
             expires_at_unix_seconds,
@@ -111,6 +114,7 @@ impl AuthenticatedResolveEnvelope {
 
         Ok(ResolvedRoute {
             hostname: hostname.clone(),
+            cat_id: self.cat_id,
             endpoint_id: self.endpoint_id,
             node_transport_target: self.node_transport_target,
             expires_at_unix_seconds: self.expires_at_unix_seconds,
@@ -126,6 +130,7 @@ impl std::fmt::Debug for AuthenticatedResolveEnvelope {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter
             .debug_struct("AuthenticatedResolveEnvelope")
+            .field("cat_id", &self.cat_id)
             .field("endpoint_id", &self.endpoint_id)
             .field("node_transport_target", &self.node_transport_target)
             .field("expires_at_unix_seconds", &self.expires_at_unix_seconds)
@@ -144,6 +149,7 @@ impl std::fmt::Debug for AuthenticatedResolveEnvelope {
 #[derive(Clone, PartialEq, Eq)]
 pub struct ResolvedRoute {
     hostname: Hostname,
+    cat_id: Id,
     endpoint_id: Id,
     node_transport_target: NodeTransportTarget,
     expires_at_unix_seconds: u64,
@@ -160,6 +166,10 @@ impl ResolvedRoute {
 
     pub fn endpoint_id(&self) -> &Id {
         &self.endpoint_id
+    }
+
+    pub fn cat_id(&self) -> &Id {
+        &self.cat_id
     }
 
     pub fn node_transport_target(&self) -> &NodeTransportTarget {
@@ -192,6 +202,7 @@ impl std::fmt::Debug for ResolvedRoute {
         formatter
             .debug_struct("ResolvedRoute")
             .field("hostname", &self.hostname)
+            .field("cat_id", &self.cat_id)
             .field("endpoint_id", &self.endpoint_id)
             .field("node_transport_target", &self.node_transport_target)
             .field("expires_at_unix_seconds", &self.expires_at_unix_seconds)

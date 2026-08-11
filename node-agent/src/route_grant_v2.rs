@@ -15,7 +15,7 @@ use cats_api::route_grant_v2::{
     ROUTE_GRANT_V2_VERSION,
 };
 use cats_api::runtime_reconciliation::{
-    key_ring_digest, Epoch, Hostname, HttpProtocol, Id, KeyId, Sha256Digest,
+    key_ring_digest, Epoch, Hostname, HttpProtocol, Id, Ipv4Address, KeyId, Sha256Digest,
 };
 use thiserror::Error;
 
@@ -141,15 +141,21 @@ pub enum RouteGrantV2RingInstallError {
 
 /// Proof supplied only by the future trusted Node machine-transport adapter.
 /// No HTTP header or external crate can construct it.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AuthenticatedGatewayPrincipal {
-    _private: (),
+    public_key_spki_sha256: Sha256Digest,
 }
 
 impl AuthenticatedGatewayPrincipal {
+    pub(crate) fn from_verified_spki_sha256(public_key_spki_sha256: Sha256Digest) -> Self {
+        Self {
+            public_key_spki_sha256,
+        }
+    }
+
     #[cfg(test)]
-    pub(crate) const fn for_test() -> Self {
-        Self { _private: () }
+    pub(crate) fn for_test() -> Self {
+        Self::from_verified_spki_sha256(Sha256Digest::from_bytes([0_u8; 32]))
     }
 }
 
@@ -165,6 +171,7 @@ pub struct RouteAdmissionV2RequestBinding {
 pub struct AdmittedRouteV2 {
     claims: cats_api::route_grant_v2::RouteGrantV2Claims,
     guard: RouteAdmissionGuard,
+    guest_ipv4: Ipv4Address,
 }
 
 impl AdmittedRouteV2 {
@@ -176,13 +183,18 @@ impl AdmittedRouteV2 {
         &self.guard
     }
 
+    pub fn guest_ipv4(&self) -> &Ipv4Address {
+        &self.guest_ipv4
+    }
+
     pub fn into_parts(
         self,
     ) -> (
         cats_api::route_grant_v2::RouteGrantV2Claims,
         RouteAdmissionGuard,
+        Ipv4Address,
     ) {
-        (self.claims, self.guard)
+        (self.claims, self.guard, self.guest_ipv4)
     }
 }
 
@@ -244,7 +256,7 @@ impl RouteGrantV2Verifier {
     /// backend, file, VMM or network I/O.
     pub fn verify_and_admit(
         &self,
-        _principal: &AuthenticatedGatewayPrincipal,
+        principal: &AuthenticatedGatewayPrincipal,
         opaque_grant: &str,
         request: &RouteAdmissionV2RequestBinding,
         now_unix_seconds: u64,
@@ -264,6 +276,9 @@ impl RouteGrantV2Verifier {
         let claims = verified
             .claims()
             .map_err(|_| pre_admission(RouteAdmissionV2Reason::InvalidClaims))?;
+        if claims.gateway_public_key_spki_sha256 != principal.public_key_spki_sha256 {
+            return Err(pre_admission(RouteAdmissionV2Reason::BindingMismatch));
+        }
         let time_verdict = claims
             .time_verdict(now_unix_seconds)
             .map_err(|_| pre_admission(RouteAdmissionV2Reason::InvalidClaims))?;
@@ -274,10 +289,14 @@ impl RouteGrantV2Verifier {
         {
             return Err(pre_admission(RouteAdmissionV2Reason::BindingMismatch));
         }
-        let guard = admission_cell
+        let (guard, guest_ipv4) = admission_cell
             .acquire_verified_route(&claims, time_verdict)
             .map_err(pre_admission)?;
-        Ok(AdmittedRouteV2 { claims, guard })
+        Ok(AdmittedRouteV2 {
+            claims,
+            guard,
+            guest_ipv4,
+        })
     }
 }
 
@@ -317,8 +336,8 @@ mod tests {
         RouteGrantV2SigningInput, ROUTE_GRANT_V2_AUDIENCE, ROUTE_GRANT_V2_ISSUER,
     };
     use cats_api::runtime_reconciliation::{
-        AssignedKind, AssignedPlacement, CheckpointRouteGate, LifecycleAdmission, RandomId128,
-        Revision, RouteGateBinding, RouteGateState,
+        AssignedKind, AssignedPlacement, CheckpointRouteGate, Ipv4Address, LifecycleAdmission,
+        RandomId128, Revision, RouteGateBinding, RouteGateState,
     };
     use ring::rand::SystemRandom;
     use ring::signature::{Ed25519KeyPair, KeyPair as _};
@@ -369,6 +388,7 @@ mod tests {
             route_epoch: Epoch::new(7).unwrap(),
             protocol: HttpProtocol::Http,
             target_port: 8080,
+            gateway_public_key_spki_sha256: Sha256Digest::from_bytes([0_u8; 32]),
             iat: 1_786_156_800,
             nbf: 1_786_156_800,
             exp: 1_786_156_920,
@@ -412,7 +432,7 @@ mod tests {
         lifecycle: LifecycleAdmission,
     ) -> AdmissionSnapshot {
         let first = claims.first().unwrap();
-        AdmissionSnapshot::new(
+        with_guest_target(AdmissionSnapshot::new(
             Revision::new(11).unwrap(),
             Sha256Digest::from_bytes([0x11; 32]),
             AssignedPlacement {
@@ -439,7 +459,11 @@ mod tests {
                     gate,
                 })
                 .collect(),
-        )
+        ))
+    }
+
+    fn with_guest_target(snapshot: AdmissionSnapshot) -> AdmissionSnapshot {
+        snapshot.with_guest_ipv4(Ipv4Address::new("10.240.0.6").unwrap())
     }
 
     fn reason(error: RouteAdmissionV2Failure) -> RouteAdmissionV2Reason {
@@ -661,14 +685,14 @@ mod tests {
             node_id: Id::new("node-b").unwrap(),
             placement_epoch: Epoch::new(3).unwrap(),
         };
-        incoherent = AdmissionSnapshot::new(
+        incoherent = with_guest_target(AdmissionSnapshot::new(
             incoherent.applied_desired_revision(),
             incoherent.spec_digest().clone(),
             wrong_placement,
             incoherent.runtime_incarnation().cloned(),
             incoherent.lifecycle_admission(),
             incoherent.endpoints().to_vec(),
-        );
+        ));
         assert!(matches!(
             AdmissionCell::new(incoherent),
             Err(crate::runtime::reconciliation::AdmissionCellBuildError::WrongPlacement { .. })
@@ -745,14 +769,14 @@ mod tests {
         for route in &mut closed_routes {
             route.gate = RouteGateState::Closed;
         }
-        let replacement = AdmissionSnapshot::new(
+        let replacement = with_guest_target(AdmissionSnapshot::new(
             Revision::new(12).unwrap(),
             Sha256Digest::from_bytes([0x12; 32]),
             expected.placement().clone(),
             expected.runtime_incarnation().cloned(),
             LifecycleAdmission::Closed,
             closed_routes,
-        );
+        ));
         let mut port = cell.port();
         assert_eq!(
             port.try_close_all_if_idle(&expected, &replacement).unwrap(),
@@ -807,24 +831,24 @@ mod tests {
             .verify_and_admit(&principal, &token, &request(&claims), claims.nbf, &cell)
             .unwrap();
         let expected = cell.snapshot();
-        let stale_expected = AdmissionSnapshot::new(
+        let stale_expected = with_guest_target(AdmissionSnapshot::new(
             Revision::new(10).unwrap(),
             Sha256Digest::from_bytes([0x10; 32]),
             expected.placement().clone(),
             expected.runtime_incarnation().cloned(),
             expected.lifecycle_admission(),
             expected.endpoints().to_vec(),
-        );
+        ));
         let mut stale_routes = stale_expected.endpoints().to_vec();
         stale_routes[0].gate = RouteGateState::Closed;
-        let stale_replacement = AdmissionSnapshot::new(
+        let stale_replacement = with_guest_target(AdmissionSnapshot::new(
             stale_expected.applied_desired_revision(),
             stale_expected.spec_digest().clone(),
             stale_expected.placement().clone(),
             stale_expected.runtime_incarnation().cloned(),
             stale_expected.lifecycle_admission(),
             stale_routes,
-        );
+        ));
         let mut port = cell.port();
         assert_eq!(
             port.close_gate(&stale_expected, &stale_replacement, &claims.endpoint_id),
@@ -833,14 +857,14 @@ mod tests {
         assert_eq!(cell.snapshot(), expected);
         let mut routes = expected.endpoints().to_vec();
         routes[0].gate = RouteGateState::Closed;
-        let replacement = AdmissionSnapshot::new(
+        let replacement = with_guest_target(AdmissionSnapshot::new(
             expected.applied_desired_revision(),
             expected.spec_digest().clone(),
             expected.placement().clone(),
             expected.runtime_incarnation().cloned(),
             expected.lifecycle_admission(),
             routes,
-        );
+        ));
         port.close_gate(&expected, &replacement, &claims.endpoint_id)
             .unwrap();
         assert_eq!(cell.active_guards(&claims.endpoint_id), Some(1));
@@ -888,14 +912,14 @@ mod tests {
         );
         let mut initial_routes = initial.endpoints().to_vec();
         initial_routes[0].gate = RouteGateState::Closed;
-        initial = AdmissionSnapshot::new(
+        initial = with_guest_target(AdmissionSnapshot::new(
             initial.applied_desired_revision(),
             initial.spec_digest().clone(),
             initial.placement().clone(),
             initial.runtime_incarnation().cloned(),
             initial.lifecycle_admission(),
             initial_routes,
-        );
+        ));
         let cell = AdmissionCell::new(initial.clone()).unwrap();
         let b_guard = verifier
             .verify_and_admit(
@@ -914,14 +938,14 @@ mod tests {
         installed_routes[0] = snapshot(&new_a, RouteGateState::Active, LifecycleAdmission::Open)
             .endpoints()[0]
             .clone();
-        let installed = AdmissionSnapshot::new(
+        let installed = with_guest_target(AdmissionSnapshot::new(
             Revision::new(12).unwrap(),
             Sha256Digest::from_bytes([0x12; 32]),
             initial.placement().clone(),
             initial.runtime_incarnation().cloned(),
             initial.lifecycle_admission(),
             installed_routes,
-        );
+        ));
         let mut port = cell.port();
         port.install_gate(&initial, &installed, &old_a.endpoint_id)
             .unwrap();
@@ -954,24 +978,24 @@ mod tests {
 
         let mut closed_routes = installed.endpoints().to_vec();
         closed_routes[0].gate = RouteGateState::Closed;
-        let closed = AdmissionSnapshot::new(
+        let closed = with_guest_target(AdmissionSnapshot::new(
             installed.applied_desired_revision(),
             installed.spec_digest().clone(),
             installed.placement().clone(),
             installed.runtime_incarnation().cloned(),
             installed.lifecycle_admission(),
             closed_routes,
-        );
+        ));
         port.close_gate(&installed, &closed, &new_a.endpoint_id)
             .unwrap();
-        let absent = AdmissionSnapshot::new(
+        let absent = with_guest_target(AdmissionSnapshot::new(
             closed.applied_desired_revision(),
             closed.spec_digest().clone(),
             closed.placement().clone(),
             closed.runtime_incarnation().cloned(),
             closed.lifecycle_admission(),
             vec![closed.endpoints()[1].clone()],
-        );
+        ));
         port.remove_closed_gate(&closed, &absent, &new_a.endpoint_id)
             .unwrap();
         assert_eq!(cell.active_guards(&new_a.endpoint_id), None);
