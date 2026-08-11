@@ -5833,7 +5833,7 @@ mod tests {
     const SNAPSHOT: &[u8] = br#"{"desired_specs":[],"expires_at_unix_ms":1720000030000,"issued_at_unix_ms":1720000000000,"read_position":12,"request_sequence":1,"session":{"agent_instance_id":"44444444444444444444444444444444","agent_session_epoch":2,"node_boot_id":"33333333333333333333333333333333","node_id":"node_a"},"version":1}"#;
 
     #[test]
-    fn start_runtime_cannot_be_projected_before_the_exact_vmm_inspector_is_available() {
+    fn start_runtime_is_never_projected_without_an_exact_live_vmm() {
         let environment = TestEnvironment::new();
         let checkpoint = decode_runtime_checkpoint(include_bytes!(concat!(
             env!("CARGO_MANIFEST_DIR"),
@@ -5848,18 +5848,25 @@ mod tests {
             .unwrap();
         let cat_id = expected.cat_id().clone();
         let bridge = root_process_bridge(&environment, []);
-        assert!(matches!(
-            bridge
-                .inspect_all(
-                    BTreeMap::new(),
-                    BTreeMap::new(),
-                    BTreeMap::from([(cat_id, expected)]),
-                    BTreeMap::new(),
-                    &assigned_context(true),
-                )
-                .unwrap(),
-            RootProcessInventoryBridgeOutcome::Unavailable
-        ));
+        let outcome = bridge
+            .inspect_all(
+                BTreeMap::new(),
+                BTreeMap::new(),
+                BTreeMap::from([(cat_id, expected)]),
+                BTreeMap::new(),
+                &assigned_context(true),
+            )
+            .unwrap();
+        match outcome {
+            // Non-Linux builds cannot perform the production VMM inspection.
+            RootProcessInventoryBridgeOutcome::Unavailable => {}
+            // Linux can prove the exact unit absent. Absence is sealed in the
+            // private admission but must never become a public VMM process.
+            RootProcessInventoryBridgeOutcome::Complete(admission) => {
+                assert!(admission.process_projections().is_empty());
+                assert!(admission.vmm_proofs().is_empty());
+            }
+        }
     }
 
     #[test]
