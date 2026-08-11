@@ -67,7 +67,7 @@ Not yet available: **private Guest-to-Guest networking across nodes**.
 
     cats get dev
     cats endpoint ls dev
-    cats operation ls
+    cats operation get OPERATION_ID
     cats exec dev -- sh -lc 'ss -lnt'
 
-Verify the Cat is healthy, the Endpoint targets the expected port, the latest activation Operation succeeded, and the Guest service is actually listening. Operators should also check route epoch mismatch and gateway/node connectivity metrics.
+Verify the Cat is healthy, the Endpoint targets the expected port, the accepted activation Operation succeeded, and the Guest service is actually listening. Operation list is unavailable, so retain the ID returned by the mutation. Operators should also check route epoch mismatch and gateway/node connectivity metrics.

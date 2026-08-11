@@ -70,10 +70,10 @@ cats endpoint ls CAT</code></pre>
 <p>每个 Cat 已经拥有转发 8080 的 <code>web</code> Endpoint。<code>cats expose CAT PORT</code> 会重新配置它；使用其他 <code>--name</code> 可增加 URL。</p>
 
 <h2 id="operation-commands">Operation 命令</h2>
-<pre><code>cats operation ls
-cats operation get ID
+<pre><code>cats operation get ID
 cats operation wait ID</code></pre>
-<p>变更默认最多等待 120 秒。使用 <code>--no-wait</code> 时请保存返回 ID，再执行 <code>operation wait</code> 或 <code>operation get</code>。安全重试应保持同一资源意图；API 会为变更附带幂等键。</p>
+<p>Cat Create 返回已接受的 Operation ID。<code>operation get</code> 在当前 Workspace 精确读取该 Operation；<code>operation wait</code> 最多轮询 120 秒，并在 <code>failed</code> 或 <code>superseded</code> 时以失败退出。两个命令都使用严格的 Runtime Reconciliation Decoder。</p>
+<p><code>operation ls</code> 仍不可用，且不会发出 HTTP：Runtime Authority 有意不提供无界 Operation List。旧的全局 Operation URL 已退役。</p>
 
 <h2 id="automation">自动化建议</h2>
 <ul>

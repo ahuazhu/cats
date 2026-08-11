@@ -119,10 +119,11 @@ When available credit is exhausted, paid compute admission returns HTTP `402` wi
 
 ## Operations
 
-    GET /v1/workspaces/{workspace_id}/operations
-    GET /v1/operations/{operation}
+    GET /v1/workspaces/{workspace_id}/operations/{operation}
 
-An Operation contains immutable `workspace_id` ownership, kind, target resource ID/generation, phase, timestamps, and an optional structured error. Access is still Workspace-scoped even though the single-Operation URL does not contain the workspace segment.
+This exact lookup returns the canonical Runtime Reconciliation Operation: its immutable Workspace/Cat/revision/spec/placement binding, target, timestamps, and `pending`, `succeeded`, `failed`, or `superseded` settlement. A successful response is `application/json` with `Cache-Control: no-store`.
+
+Authorization is checked before the opaque Operation ID is looked up. An ID owned by another Workspace and an absent ID both return the same `not_found` response. The former global `GET /v1/operations/{operation}` and the Workspace Operation collection/list route are retired; no unbounded list contract is exposed.
 
 ## Errors
 

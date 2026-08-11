@@ -65,7 +65,7 @@ HTTP 与 WebSocket 入站已经可用：Endpoint 地址、路由绑定、按请�
 
     cats get dev
     cats endpoint ls dev
-    cats operation ls
+    cats operation get OPERATION_ID
     cats exec dev -- sh -lc 'ss -lnt'
 
-确认 Cat 健康、Endpoint 指向预期端口、最新 Activation Operation 成功，并且 Guest 服务确实在监听。管理员还应检查 Route Epoch mismatch 以及 Gateway/Node 连通性指标。
+确认 Cat 健康、Endpoint 指向预期端口、已接受的 Activation Operation 成功，并且 Guest 服务确实在监听。Operation List 当前不可用，因此请保留变更响应返回的 ID。管理员还应检查 Route Epoch mismatch 以及 Gateway/Node 连通性指标。

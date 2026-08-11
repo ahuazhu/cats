@@ -1,12 +1,11 @@
 ## Understand Operations
 
-Create, lifecycle, and delete requests are asynchronous. The control plane records an Operation with an ID, kind, target resource, phase, timestamps, and an optional structured error.
+Cat create is asynchronous. The control plane returns an ID for the canonical Operation that binds the Cat, desired revision/spec, placement, target, phase, timestamps, and optional terminal result or error.
 
-    cats operation ls
     cats operation get OPERATION_ID
     cats operation wait OPERATION_ID
 
-Phases move from pending/running to succeeded or failed. A network timeout does not prove that the original mutation failed—look up the accepted Operation before retrying.
+An Operation moves from `pending` to exactly one of `succeeded`, `failed`, or `superseded`. Select the same Workspace that accepted the mutation; another Workspace and an absent ID intentionally look identical. Operation list is unavailable. A network timeout does not prove that the original mutation failed—replay the same durable create intent to recover its accepted ID, then query that exact Operation.
 
 ## Common error classes
 
@@ -24,7 +23,7 @@ Phases move from pending/running to succeeded or failed. A network timeout does 
 ## Cat does not become Ready
 
 1.  Run `cats get NAME --json` and note desired/observed state and node.
-2.  Inspect recent Operations and the final error.
+2.  Inspect the accepted Operation by ID and its terminal result or error.
 3.  Operators check node heartbeat, blockd/Guest readiness, console output, and attachment epoch.
 4.  If Suspended/Warm restore failed, verify the controller converged to Cold fallback instead of remaining in an intermediate state.
 

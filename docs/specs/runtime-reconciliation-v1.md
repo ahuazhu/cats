@@ -2776,6 +2776,28 @@ standalone `Operation` decode/validation还必须逐字段要求
 stale/conflicting observation sequence、revision、stored digest或placement也只拒绝那次输入，绝不能终结
 当前Operation。
 
+V1的public read surface只包含workspace-qualified exact lookup：
+
+```text
+GET /v1/workspaces/{workspace}/operations/{operation}
+```
+
+Control Plane必须先完成Workspace authentication/authorization，再解析opaque Operation ID或读取
+`runtime_operations`。查询同时以authenticated Workspace ID和Operation ID为键；其他Workspace中存在
+同一Operation ID与本Workspace中不存在的ID返回完全相同的`not_found`，不得先做global-ID lookup。
+成功响应必须是本节standalone decoder接受的canonical `Operation` bytes，精确携带
+`Content-Type: application/json`和`Cache-Control: no-store`。读取row时必须把canonical record与
+`operation_id/workspace_id/cat_id/desired_revision/desired_spec_digest/node_id/placement_epoch/target/phase/
+terminal_kind/created_at/updated_at`全部projection逐字段核对；确定的record/projection损坏是fatal authority
+corruption并使该Control实例readiness fail closed，临时PostgreSQL错误只返回相应请求错误而不据此毒化
+readiness。
+
+旧的global `GET /v1/operations/{operation}`与无界
+`GET /v1/workspaces/{workspace}/operations` collection合同均已退役，不能通过读取旧`operations`表或增加
+第二投影恢复。客户端读取上限固定为本规范的`Operation` wire limit，禁用response content encoding并使用
+standalone decoder；CLI因此只开放`operation get`和有界轮询的`operation wait`，`operation ls`继续在发出
+任何HTTP前fail closed。
+
 - 结算时必须先从`NodeObservation.runtimes`选出唯一
   `runtime.cat_id == Operation.cat_id`的`ObservedRuntimeStatus`，且`runtime.applied_desired`非`null`。
   只有Operation、`runtime.applied_desired`和`current_desired`三者的`desired_revision`相等，
