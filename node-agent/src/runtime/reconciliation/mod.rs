@@ -40,6 +40,7 @@ mod persistent_filesystem;
 mod prepare_device_retirement;
 mod retained_runtime_launch;
 mod root_provision;
+mod route_retirement;
 mod running_admission;
 mod running_launch_authority;
 // The sealed serving-process foundation is composed with the Node-global
@@ -183,8 +184,12 @@ pub use root_provision::{
     AuthorityRereadRequired, RootProvisionClientError, RootProvisionControlPort,
     RootProvisionResponseHint, RootProvisionUnknownReason, UnixRootProvisionClient,
 };
+pub(crate) use route_retirement::{
+    classify_current_global_route_retirement, classify_superseded_route_retirement,
+    sealed_running_predecessor, RouteRetirementMode,
+};
 pub(crate) use running_admission::{
-    RunningAdmissionEffect, RunningTailAdmission, RunningTailScanAdmission,
+    RunningAdmissionEffect, RunningAdmissionPreScan, RunningTailAdmission, RunningTailScanAdmission,
 };
 #[allow(unused_imports)]
 pub(crate) use running_launch_authority::{

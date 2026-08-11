@@ -332,6 +332,9 @@ impl RuntimeDesiredEffect for SignedRunningEffect {
         desired: &DesiredRuntimeSpec,
     ) -> anyhow::Result<RuntimeDesiredEffectOutcome> {
         if let Some(running_admission) = &self.running_admission {
+            if let Some(outcome) = running_admission.try_retire(&context, desired)? {
+                return Ok(outcome);
+            }
             if let Some(outcome) = running_admission.try_apply(&context, desired)? {
                 return Ok(outcome);
             }

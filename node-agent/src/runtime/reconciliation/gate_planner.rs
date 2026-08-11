@@ -1011,6 +1011,81 @@ impl<'a, P: AdmissionGatePort> GateSequencer<'a, P> {
         self.settle_armed_fail_closed(armed, desired, times, None)
     }
 
+    /// Settles the narrow race where `try_close_all_if_idle` durably returned
+    /// Busy/Open, but the runner's mandatory timeout/cancellation fallback
+    /// subsequently fail-closed the exact source cell before it received the
+    /// result. The idle attempt is never evaluated again. Once the caller
+    /// proves the exact source's fail-closed snapshot, burn the endpoint
+    /// effect capability and record the terminal Busy/Closed outcome.
+    pub fn settle_open_busy_fail_closed(
+        &mut self,
+        busy: &StoredCheckpoint,
+        desired: &DesiredRuntimeSpec,
+        source_snapshot: &AdmissionSnapshot,
+        updated_at: UnixMillis,
+    ) -> Result<GateTransitionResult, GateReconcileError> {
+        applied_desired_evidence(busy.checkpoint(), desired)?;
+        let (attempt_id, source_revision, source_incarnation) = require_idle_fields(desired)?;
+        let (platform_guards, endpoint_guards) = match &busy.checkpoint().require_idle {
+            RequireIdleCheckpoint::Busy {
+                attempt_id: saved_attempt,
+                source_revision: saved_revision,
+                source_runtime_incarnation: saved_incarnation,
+                gate_closed: false,
+                platform_guards,
+                endpoint_guards,
+            } if saved_attempt == attempt_id
+                && *saved_revision == source_revision
+                && saved_incarnation == source_incarnation =>
+            {
+                (*platform_guards, endpoint_guards.clone())
+            }
+            _ => return Err(GateReconcileError::WrongRequireIdleCheckpoint),
+        };
+
+        let checkpoint_snapshot = AdmissionSnapshot::from_checkpoint(busy.checkpoint())?;
+        if source_snapshot.applied_desired_revision() != source_revision
+            || source_snapshot.placement() != checkpoint_snapshot.placement()
+            || source_snapshot.runtime_incarnation() != Some(source_incarnation)
+            || source_snapshot.guest_ipv4() != checkpoint_snapshot.guest_ipv4()
+            || source_snapshot.lifecycle_admission() != LifecycleAdmission::Open
+            || source_snapshot.endpoints() != checkpoint_snapshot.endpoints()
+            || self.port.snapshot() != source_snapshot.fail_closed()
+        {
+            return Err(GateReconcileError::WrongOpenBusySource);
+        }
+
+        let mut settled = busy.checkpoint().clone();
+        close_checkpoint_gates(&mut settled);
+        settled.require_idle = RequireIdleCheckpoint::Busy {
+            attempt_id: attempt_id.clone(),
+            source_revision,
+            source_runtime_incarnation: source_incarnation.clone(),
+            gate_closed: true,
+            platform_guards,
+            endpoint_guards,
+        };
+        settled.updated_at_unix_ms = updated_at;
+        let replacement_snapshot = AdmissionSnapshot::from_checkpoint(&settled)?;
+        encode_runtime_checkpoint(&settled).map_err(|error| {
+            GateReconcileError::AppliedDesired(AppliedDesiredError::CheckpointContract { error })
+        })?;
+
+        // The local close has already linearized. Revoke every stale endpoint
+        // edge before publishing the durable Closed claim; a persistence
+        // failure remains safely retryable from the process-local Closed cell.
+        let revocation = self.store.prepare_endpoint_effect_revocation()?;
+        revocation.confirm();
+        let settled = self.store.replace(busy, &settled)?;
+        self.port
+            .advance_closed(&source_snapshot.fail_closed(), &replacement_snapshot)?;
+        Ok(GateTransitionResult::RequireIdleBusy {
+            checkpoint: settled,
+            gate_closed: true,
+            port_error: None,
+        })
+    }
+
     /// Records a watcher/quiesce failure after a successful idle close. No
     /// gate effect is issued and the old serving epoch remains closed.
     pub fn record_post_close_busy(
@@ -1227,8 +1302,8 @@ impl<'a, P: AdmissionGatePort> GateSequencer<'a, P> {
     }
 }
 
-#[derive(Debug, Clone)]
-enum EndpointAction {
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) enum EndpointAction {
     Close {
         endpoint_id: Id,
     },
@@ -1246,7 +1321,7 @@ enum EndpointAction {
 }
 
 impl EndpointAction {
-    fn endpoint_id(&self) -> &Id {
+    pub(super) fn endpoint_id(&self) -> &Id {
         match self {
             Self::Close { endpoint_id }
             | Self::PrepareChanged { endpoint_id, .. }
@@ -1266,7 +1341,7 @@ fn validate_endpoint_desired(desired: &DesiredRuntimeSpec) -> Result<(), GateRec
     Ok(())
 }
 
-fn first_endpoint_action(
+pub(super) fn first_endpoint_action(
     checkpoint: &RuntimeCheckpoint,
     desired: &DesiredRuntimeSpec,
 ) -> Result<Option<EndpointAction>, GateReconcileError> {
@@ -1289,6 +1364,7 @@ fn first_endpoint_action(
         .runtime_incarnation
         .as_ref()
         .ok_or(GateReconcileError::RuntimeNotInstallable)?;
+
     let mut current_index = 0;
     let mut desired_index = 0;
 
@@ -1300,11 +1376,15 @@ fn first_endpoint_action(
                 if current.binding.endpoint_id < endpoint.endpoint_id =>
             {
                 let endpoint_id = current.binding.endpoint_id.clone();
-                return Ok(Some(if is_matching_close_step(checkpoint, current) {
-                    EndpointAction::Remove { endpoint_id }
-                } else {
-                    EndpointAction::Close { endpoint_id }
-                }));
+                return Ok(Some(
+                    if current.gate == RouteGateState::Closed
+                        && is_matching_close_step(checkpoint, current)
+                    {
+                        EndpointAction::Remove { endpoint_id }
+                    } else {
+                        EndpointAction::Close { endpoint_id }
+                    },
+                ));
             }
             (Some(current), Some(endpoint))
                 if current.binding.endpoint_id > endpoint.endpoint_id =>
@@ -1352,11 +1432,15 @@ fn first_endpoint_action(
             }
             (Some(current), None) => {
                 let endpoint_id = current.binding.endpoint_id.clone();
-                return Ok(Some(if is_matching_close_step(checkpoint, current) {
-                    EndpointAction::Remove { endpoint_id }
-                } else {
-                    EndpointAction::Close { endpoint_id }
-                }));
+                return Ok(Some(
+                    if current.gate == RouteGateState::Closed
+                        && is_matching_close_step(checkpoint, current)
+                    {
+                        EndpointAction::Remove { endpoint_id }
+                    } else {
+                        EndpointAction::Close { endpoint_id }
+                    },
+                ));
             }
             (None, Some(endpoint)) => {
                 let new_binding = route_binding(desired, endpoint, Some(incarnation))
@@ -1370,22 +1454,6 @@ fn first_endpoint_action(
         }
     }
     Ok(None)
-}
-
-/// Returns only the deterministic next install edge. Other endpoint actions
-/// belong to the endpoint-only reconciler and are deliberately not treated as
-/// a Running-tail admission effect.
-pub(super) fn next_install_gate(
-    checkpoint: &RuntimeCheckpoint,
-    desired: &DesiredRuntimeSpec,
-) -> Result<Option<Id>, GateReconcileError> {
-    match first_endpoint_action(checkpoint, desired)? {
-        Some(EndpointAction::Install { endpoint_id, .. }) => Ok(Some(endpoint_id)),
-        Some(EndpointAction::Close { .. })
-        | Some(EndpointAction::PrepareChanged { .. })
-        | Some(EndpointAction::Remove { .. })
-        | None => Ok(None),
-    }
 }
 
 fn is_matching_close_step(checkpoint: &RuntimeCheckpoint, route: &CheckpointRouteGate) -> bool {
@@ -1843,7 +1911,7 @@ fn validate_unchanged_active_routes(
     Ok(())
 }
 
-fn route_binding(
+pub(super) fn route_binding(
     desired: &DesiredRuntimeSpec,
     endpoint: &EndpointIntent,
     runtime_incarnation: Option<&RandomId128>,

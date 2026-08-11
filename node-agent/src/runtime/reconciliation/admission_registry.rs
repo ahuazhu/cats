@@ -11,7 +11,7 @@ use std::collections::BTreeMap;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex, MutexGuard};
 
-use cats_api::runtime_reconciliation::Id;
+use cats_api::runtime_reconciliation::{DesiredRuntimeSpec, Id, RuntimeTarget};
 use thiserror::Error;
 
 use crate::state_directory::StateDirectory;
@@ -39,8 +39,10 @@ pub(crate) enum AdmissionRegistryError {
 }
 
 pub(crate) struct AdmissionCellSession {
+    generation: u64,
     cell: Arc<AdmissionCell>,
     checkpoint_store: Arc<FileCheckpointStore>,
+    sealed_running_desired: Mutex<Option<DesiredRuntimeSpec>>,
 }
 
 pub(crate) enum AdmissionCellSessionLookup {
@@ -49,12 +51,48 @@ pub(crate) enum AdmissionCellSessionLookup {
 }
 
 impl AdmissionCellSession {
+    pub(crate) fn generation(&self) -> u64 {
+        self.generation
+    }
+
     pub(crate) fn cell(&self) -> &Arc<AdmissionCell> {
         &self.cell
     }
 
     pub(crate) fn checkpoint_store(&self) -> &FileCheckpointStore {
         self.checkpoint_store.as_ref()
+    }
+
+    pub(crate) fn sealed_running_desired(&self) -> Option<DesiredRuntimeSpec> {
+        match self.sealed_running_desired.lock() {
+            Ok(desired) => desired.clone(),
+            Err(_) => {
+                self.close();
+                None
+            }
+        }
+    }
+
+    pub(crate) fn advance_sealed_running_desired(
+        &self,
+        desired: DesiredRuntimeSpec,
+    ) -> Result<(), AdmissionRegistryError> {
+        let mut sealed = self
+            .sealed_running_desired
+            .lock()
+            .map_err(|_| AdmissionRegistryError::Unavailable)?;
+        let Some(current) = sealed.as_ref() else {
+            self.close();
+            return Err(AdmissionRegistryError::EntryChanged);
+        };
+        if current != &desired
+            && !super::route_retirement::endpoint_only_successor(current, &desired)
+        {
+            self.close();
+            return Err(AdmissionRegistryError::EntryChanged);
+        }
+        *sealed = Some(desired);
+        Ok(())
     }
 
     fn close(&self) {
@@ -119,11 +157,14 @@ impl AdmissionCellRegistry {
         if state.entries.contains_key(&cat_id) {
             return Err(AdmissionRegistryError::EntryChanged);
         }
+        let generation = take_generation(&mut state)?;
         state.entries.insert(
             cat_id,
             RegistrySlot::Ready(Arc::new(AdmissionCellSession {
+                generation,
                 cell,
                 checkpoint_store,
+                sealed_running_desired: Mutex::new(None),
             })),
         );
         Ok(())
@@ -147,7 +188,13 @@ impl AdmissionCellRegistry {
         &self,
         cat_id: &Id,
         checkpoint_snapshot: AdmissionSnapshot,
+        sealed_running_desired: Option<DesiredRuntimeSpec>,
     ) -> Result<AdmissionCellSessionLookup, AdmissionRegistryError> {
+        if sealed_running_desired.as_ref().is_some_and(|desired| {
+            desired.target != RuntimeTarget::Running || &desired.cat_id != cat_id
+        }) {
+            return Err(AdmissionRegistryError::EntryChanged);
+        }
         let generation = {
             let mut state = self.lock_mutating()?;
             match state.entries.get(cat_id) {
@@ -161,18 +208,19 @@ impl AdmissionCellRegistry {
                 }
                 None => {}
             }
-            let generation = state.next_generation;
-            state.next_generation = state
-                .next_generation
-                .checked_add(1)
-                .ok_or(AdmissionRegistryError::GenerationExhausted)?;
+            let generation = take_generation(&mut state)?;
             state
                 .entries
                 .insert(cat_id.clone(), RegistrySlot::Initializing { generation });
             generation
         };
 
-        let initialized = self.initialize_closed(cat_id, checkpoint_snapshot);
+        let initialized = self.initialize_closed(
+            cat_id,
+            generation,
+            checkpoint_snapshot,
+            sealed_running_desired,
+        );
         match initialized {
             Ok(session) => {
                 let session = Arc::new(session);
@@ -234,9 +282,12 @@ impl AdmissionCellRegistry {
         if !Arc::ptr_eq(current, expected) {
             return Err(AdmissionRegistryError::EntryChanged);
         }
+        let generation = take_generation(&mut state)?;
         let replacement = Arc::new(AdmissionCellSession {
+            generation,
             cell: replacement_cell,
             checkpoint_store: Arc::clone(&expected.checkpoint_store),
+            sealed_running_desired: Mutex::new(expected.sealed_running_desired()),
         });
         state.entries.insert(
             cat_id.clone(),
@@ -245,13 +296,6 @@ impl AdmissionCellRegistry {
         Ok(replacement)
     }
 
-    #[cfg_attr(
-        not(test),
-        expect(
-            dead_code,
-            reason = "the Route v2 transport and lifecycle worker consume compare-remove in the next composition slice"
-        )
-    )]
     pub(crate) fn remove(
         &self,
         cat_id: &Id,
@@ -272,13 +316,17 @@ impl AdmissionCellRegistry {
     fn initialize_closed(
         &self,
         cat_id: &Id,
+        generation: u64,
         checkpoint_snapshot: AdmissionSnapshot,
+        sealed_running_desired: Option<DesiredRuntimeSpec>,
     ) -> Result<AdmissionCellSession, AdmissionRegistryError> {
         let checkpoint_store = FileCheckpointStore::open(&self.checkpoint_directory, cat_id)?;
         let cell = AdmissionCell::new(checkpoint_snapshot.fail_closed())?;
         Ok(AdmissionCellSession {
+            generation,
             cell,
             checkpoint_store: Arc::new(checkpoint_store),
+            sealed_running_desired: Mutex::new(sealed_running_desired),
         })
     }
 
@@ -299,6 +347,39 @@ impl AdmissionCellRegistry {
             }
         }
     }
+
+    pub(crate) fn ready_sessions(
+        &self,
+    ) -> Result<Vec<(Id, Arc<AdmissionCellSession>)>, AdmissionRegistryError> {
+        let state = self.lock_observing()?;
+        Ok(state
+            .entries
+            .iter()
+            .filter_map(|(cat_id, slot)| match slot {
+                RegistrySlot::Ready(session) => Some((cat_id.clone(), Arc::clone(session))),
+                RegistrySlot::Initializing { .. } => None,
+            })
+            .collect())
+    }
+
+    pub(crate) fn fail_close_all(&self) {
+        if let Ok(sessions) = self.ready_sessions() {
+            for (_, session) in sessions {
+                session.close();
+            }
+        }
+        // `ready_sessions` uses the observing poison path, which itself
+        // closes and clears every reachable Ready slot before returning Err.
+    }
+}
+
+fn take_generation(state: &mut RegistryState) -> Result<u64, AdmissionRegistryError> {
+    let generation = state.next_generation;
+    state.next_generation = state
+        .next_generation
+        .checked_add(1)
+        .ok_or(AdmissionRegistryError::GenerationExhausted)?;
+    Ok(generation)
 }
 
 impl Drop for AdmissionCellRegistry {
@@ -356,7 +437,7 @@ mod tests {
         let (root, cat_id, snapshot) = fixture();
         let registry = AdmissionCellRegistry::new(root.path().to_path_buf());
         let first = registry
-            .ensure_closed(&cat_id, snapshot.clone())
+            .ensure_closed(&cat_id, snapshot.clone(), None)
             .expect("create session");
         let AdmissionCellSessionLookup::CreatedClosed(first) = first else {
             panic!("first lookup must create the cell")
@@ -398,7 +479,7 @@ mod tests {
         let (root, cat_id, snapshot) = fixture();
         let first_process = AdmissionCellRegistry::new(root.path().to_path_buf());
         let first = first_process
-            .ensure_closed(&cat_id, snapshot.clone())
+            .ensure_closed(&cat_id, snapshot.clone(), None)
             .expect("first process session");
         let AdmissionCellSessionLookup::CreatedClosed(first) = first else {
             panic!("first process must create the cell")
@@ -427,7 +508,7 @@ mod tests {
 
         let second_process = AdmissionCellRegistry::new(root.path().to_path_buf());
         let second = second_process
-            .ensure_closed(&cat_id, snapshot)
+            .ensure_closed(&cat_id, snapshot, None)
             .expect("successor process session");
         let AdmissionCellSessionLookup::CreatedClosed(second) = second else {
             panic!("successor process must create its own cell")

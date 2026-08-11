@@ -12416,7 +12416,7 @@ mod tests {
 
         let registry = AdmissionCellRegistry::for_state_directory(&state_directory);
         let guest_calls = Arc::new(AtomicUsize::new(0));
-        let build_scanner = |fault| {
+        let build_scanner = |fault, exact_vmms| {
             let authority: Arc<dyn VolumeDataAuthority> = Arc::new(ExactVolumeSetDataAuthority {
                 records: records.clone(),
             });
@@ -12427,7 +12427,7 @@ mod tests {
                     environment.blockd_binary.to_string_lossy().into_owned(),
                 )
                 .unwrap(),
-                exact_vmms: true,
+                exact_vmms,
             });
             let mut config = environment.config();
             if let Some(client) = &kernel_nbd_client {
@@ -12459,7 +12459,7 @@ mod tests {
         };
 
         let RuntimeInventoryScanOutcome::Complete(mut inventory) =
-            build_scanner(RunningGuestReadyFault::Exact)
+            build_scanner(RunningGuestReadyFault::Exact, true)
                 .scan_complete(scan_context.clone())
                 .unwrap()
         else {
@@ -12594,7 +12594,7 @@ mod tests {
         let mut success_inventory =
             if matches!(frontend_fixture, RunningFrontendFixture::VhostUserBlk) {
                 let RuntimeInventoryScanOutcome::Complete(inventory) =
-                    build_scanner(RunningGuestReadyFault::Exact)
+                    build_scanner(RunningGuestReadyFault::Exact, true)
                         .scan_complete(scan_context.clone())
                         .unwrap()
                 else {
@@ -12657,15 +12657,55 @@ mod tests {
             RunningGuestReadyFault::DuplicateRootMount,
             RunningGuestReadyFault::ForeignPersistentUuid,
         ] {
-            let RuntimeInventoryScanOutcome::Complete(mut inventory) = build_scanner(fault)
+            let RuntimeInventoryScanOutcome::Complete(mut inventory) = build_scanner(fault, true)
                 .scan_complete(scan_context.clone())
                 .unwrap()
             else {
                 panic!("invalid Guest mount set is exact closed progress")
             };
             assert!(inventory.runtimes()[0].mounts.is_empty());
-            assert!(inventory.take_running_tail_admission().is_none());
+            assert_eq!(
+                inventory.runtimes()[0].lifecycle_admission,
+                LifecycleAdmission::Open,
+                "the scanner must project the still-live shared cell"
+            );
+            assert!(
+                inventory.take_running_tail_admission().is_some(),
+                "Guest drift must mint a close-only retirement sidecar"
+            );
         }
+
+        let RuntimeInventoryScanOutcome::Complete(mut vmm_absent) =
+            build_scanner(RunningGuestReadyFault::Exact, false)
+                .scan_complete(scan_context.clone())
+                .unwrap()
+        else {
+            panic!("an absent expected VMM is complete negative physical evidence")
+        };
+        assert_eq!(
+            vmm_absent.runtimes()[0].lifecycle_admission,
+            LifecycleAdmission::Open,
+            "VMM absence must not hide a still-live shared cell"
+        );
+        assert!(matches!(
+            vmm_absent.runtimes()[0].guest_transport,
+            cats_api::runtime_reconciliation::GuestTransportEvidence::Unavailable
+        ));
+        let vmm_absent_context = bind_inventory(&mut vmm_absent);
+        assert_eq!(
+            success_effect
+                .try_retire(&vmm_absent_context, &desired)
+                .unwrap(),
+            Some(RuntimeDesiredEffectOutcome::RefreshInventory)
+        );
+        assert_eq!(
+            registry
+                .get(&desired.cat_id)
+                .expect("negative physical proof retains the cell until retirement")
+                .snapshot()
+                .lifecycle_admission(),
+            LifecycleAdmission::Closed,
+        );
         drop(listeners);
     }
 

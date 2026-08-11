@@ -34,10 +34,10 @@ use crate::runtime::reconciliation::{
     installed_clean_slate_scanner, installed_root_process_effect_ports, AdmissionCellRegistry,
     AuthorizedBlockdLaunchConfig, ControlBlockingSignedVolumeEvidenceClient,
     ControlSignedNormalAcquireClient, InstalledCleanSlateProbeConfig, KernelNbdClientCleanupOwner,
-    KernelNbdInventoryConfig, RootProvisionSystemdConfig, RuntimeVolumeTransitionHttpClient,
-    ServingPrepareFrontend, SignedRunningAcquireEffect, SignedRunningEffect,
-    SignedRunningHostConfig, SignedRunningProcessPorts, SignedRunningPublicationRecovery,
-    VmmLaunchArtifactPaths,
+    KernelNbdInventoryConfig, RootProvisionSystemdConfig, RunningAdmissionPreScan,
+    RuntimeVolumeTransitionHttpClient, ServingPrepareFrontend, SignedRunningAcquireEffect,
+    SignedRunningEffect, SignedRunningHostConfig, SignedRunningProcessPorts,
+    SignedRunningPublicationRecovery, VmmLaunchArtifactPaths,
 };
 use crate::runtime_spine::{
     RuntimeEffectResourceOwner, RuntimeInventoryScanner, RuntimeSpineDeadlinePolicy,
@@ -433,7 +433,7 @@ async fn spawn_signed_runtime_cutover_with_overrides(
                 Arc::clone(&effect_root_process_ports.vmm_cid),
             ),
             effect_prepare_frontend,
-            effect_admission_registry,
+            Arc::clone(&effect_admission_registry),
         )
         .context("compose signed Running root provision prefix")?;
         let recovery = match recovery_override {
@@ -457,6 +457,7 @@ async fn spawn_signed_runtime_cutover_with_overrides(
             session,
             client,
             scanner,
+            Arc::new(RunningAdmissionPreScan::new(effect_admission_registry)),
             Arc::new(recovery),
             Arc::new(effect),
             runner_effect_resource_owner,
@@ -586,6 +587,8 @@ fn apply_readiness_policy(
         | RuntimeSpineRunStep::ScanUnavailable(_)
         | RuntimeSpineRunStep::ScanIncomplete { .. }
         | RuntimeSpineRunStep::ScanDeadlineExceeded
+        | RuntimeSpineRunStep::PreScanAdmissionUnavailable(_)
+        | RuntimeSpineRunStep::PreScanAdmissionDeadlineExceeded
         | RuntimeSpineRunStep::PreScanRecoveryUnavailable(_)
         | RuntimeSpineRunStep::PreScanRecoveryDeadlineExceeded
         | RuntimeSpineRunStep::EffectRetryExact { .. }

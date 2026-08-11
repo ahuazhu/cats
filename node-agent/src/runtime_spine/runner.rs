@@ -72,6 +72,15 @@ pub(crate) trait RuntimePreScanRecovery: Send + Sync + 'static {
     ) -> anyhow::Result<RuntimePreScanRecoveryOutcome>;
 }
 
+/// Mandatory admission reconciliation which runs on the serialized mutation
+/// lane before every physical scan. It may only close process-local admission
+/// (and durably settle the matching close edge); it cannot open a gate or
+/// repair unrelated publication artifacts.
+pub(crate) trait RuntimePreScanAdmission: Send + Sync + 'static {
+    fn reconcile(&self, context: RuntimePreScanAdmissionContext) -> anyhow::Result<()>;
+    fn fail_close_all(&self);
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum RuntimePreScanRecoveryOutcome {
     NoChange,
@@ -251,6 +260,52 @@ impl RuntimeAssignedCatSet {
 
     pub(crate) fn iter(&self) -> impl ExactSizeIterator<Item = &Id> {
         self.cat_ids.iter()
+    }
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct RuntimePreScanAdmissionContext {
+    coordinates: RuntimeSpineFullScan,
+    deadline: Instant,
+    cancellation: RuntimeInventoryScanCancellation,
+}
+
+impl RuntimePreScanAdmissionContext {
+    fn new(
+        coordinates: RuntimeSpineFullScan,
+        deadline: Instant,
+        cancellation: RuntimeInventoryScanCancellation,
+    ) -> Self {
+        Self {
+            coordinates,
+            deadline,
+            cancellation,
+        }
+    }
+
+    pub(crate) fn coordinates(&self) -> &RuntimeSpineFullScan {
+        &self.coordinates
+    }
+
+    pub(crate) fn check_active(&self) -> anyhow::Result<()> {
+        anyhow::ensure!(
+            !self.cancellation.is_cancelled(),
+            "runtime pre-scan admission reconciliation was cancelled"
+        );
+        anyhow::ensure!(
+            Instant::now() < self.deadline,
+            "runtime pre-scan admission reconciliation deadline expired"
+        );
+        Ok(())
+    }
+
+    #[cfg(test)]
+    pub(crate) fn for_test(coordinates: RuntimeSpineFullScan, deadline: Instant) -> Self {
+        Self::new(
+            coordinates,
+            deadline,
+            RuntimeInventoryScanCancellation::new(),
+        )
     }
 }
 
@@ -1006,6 +1061,8 @@ pub enum RuntimeSpineRunStep {
         unavailable_sources: Vec<InventorySource>,
     },
     ScanDeadlineExceeded,
+    PreScanAdmissionUnavailable(anyhow::Error),
+    PreScanAdmissionDeadlineExceeded,
     PreScanRecoveryUnavailable(anyhow::Error),
     PreScanRecoveryDeadlineExceeded,
     EffectUnavailable {
@@ -1436,6 +1493,10 @@ enum EffectCommand {
         context: Box<RuntimePreScanRecoveryContext>,
         reply: tokio::sync::oneshot::Sender<anyhow::Result<RuntimePreScanRecoveryOutcome>>,
     },
+    ReconcileAdmission {
+        context: Box<RuntimePreScanAdmissionContext>,
+        reply: tokio::sync::oneshot::Sender<anyhow::Result<()>>,
+    },
 }
 
 #[derive(Default)]
@@ -1449,11 +1510,14 @@ struct EffectLane {
     thread: Option<std::thread::JoinHandle<()>>,
     state: Arc<EffectLaneState>,
     has_recovery: bool,
+    has_pre_scan_admission: bool,
+    pre_scan_admission: Option<Arc<dyn RuntimePreScanAdmission>>,
 }
 
 impl EffectLane {
     fn start(
         effect: Arc<dyn RuntimeDesiredEffect>,
+        pre_scan_admission: Option<Arc<dyn RuntimePreScanAdmission>>,
         recovery: Option<Arc<dyn RuntimePreScanRecovery>>,
         resource_owner: Option<Arc<dyn RuntimeEffectResourceOwner>>,
     ) -> Result<Self, RuntimeSpineRunError> {
@@ -1461,6 +1525,8 @@ impl EffectLane {
         let state = Arc::new(EffectLaneState::default());
         let worker_state = Arc::clone(&state);
         let has_recovery = recovery.is_some();
+        let has_pre_scan_admission = pre_scan_admission.is_some();
+        let lane_pre_scan_admission = pre_scan_admission.clone();
         let thread = std::thread::Builder::new()
             .name("cats-runtime-spine-effect".to_owned())
             .spawn(move || {
@@ -1523,6 +1589,22 @@ impl EffectLane {
                             active_effect(&worker_state.active).take();
                             let _ = reply.send(result);
                         }
+                        EffectCommand::ReconcileAdmission { context, reply } => {
+                            let result = if context.check_active().is_ok() {
+                                pre_scan_admission
+                                    .as_ref()
+                                    .map_or(Ok(()), |admission| admission.reconcile(*context))
+                            } else {
+                                if let Some(admission) = &pre_scan_admission {
+                                    admission.fail_close_all();
+                                }
+                                Err(anyhow::anyhow!(
+                                    "runtime pre-scan admission was cancelled before execution"
+                                ))
+                            };
+                            active_effect(&worker_state.active).take();
+                            let _ = reply.send(result);
+                        }
                     }
                 }
             })
@@ -1535,11 +1617,103 @@ impl EffectLane {
             thread: Some(thread),
             state,
             has_recovery,
+            has_pre_scan_admission,
+            pre_scan_admission: lane_pre_scan_admission,
         })
     }
 
     fn has_recovery(&self) -> bool {
         self.has_recovery
+    }
+
+    fn has_pre_scan_admission(&self) -> bool {
+        self.has_pre_scan_admission
+    }
+
+    fn fail_close_all_admission(&self) {
+        if let Some(admission) = &self.pre_scan_admission {
+            admission.fail_close_all();
+        }
+    }
+
+    async fn reconcile_pre_scan_admission(
+        &self,
+        coordinates: RuntimeSpineFullScan,
+        deadline: Instant,
+    ) -> Result<AdmissionWait, RuntimeSpineRunError> {
+        if self.state.poisoned.load(Ordering::Acquire) {
+            self.fail_close_all_admission();
+            return Err(RuntimeSpineRunError::EffectLanePoisoned);
+        }
+        if Instant::now() >= deadline {
+            if let Some(admission) = &self.pre_scan_admission {
+                admission.fail_close_all();
+            }
+            return Ok(AdmissionWait::DeadlineExceeded);
+        }
+        let cancellation = RuntimeInventoryScanCancellation::new();
+        let context =
+            RuntimePreScanAdmissionContext::new(coordinates, deadline, cancellation.clone());
+        {
+            let mut active = active_effect(&self.state.active);
+            if active.is_some() {
+                drop(active);
+                self.fail_close_all_admission();
+                return Err(RuntimeSpineRunError::EffectQueueFull);
+            }
+            *active = Some(cancellation.clone());
+        }
+        let (reply, received) = tokio::sync::oneshot::channel();
+        let command = EffectCommand::ReconcileAdmission {
+            context: Box::new(context),
+            reply,
+        };
+        let Some(sender) = self.sender.as_ref() else {
+            active_effect(&self.state.active).take();
+            self.fail_close_all_admission();
+            return Err(RuntimeSpineRunError::WorkerStopped(
+                "pre-scan admission".to_owned(),
+            ));
+        };
+        let send_result = sender.try_send(command);
+        if let Err(error) = send_result {
+            active_effect(&self.state.active).take();
+            self.fail_close_all_admission();
+            return match error {
+                mpsc::TrySendError::Full(_) => Err(RuntimeSpineRunError::EffectQueueFull),
+                mpsc::TrySendError::Disconnected(_) => Err(RuntimeSpineRunError::WorkerStopped(
+                    "pre-scan admission".to_owned(),
+                )),
+            };
+        }
+        let mut guard = ActiveEffectGuard {
+            cancellation,
+            state: Arc::clone(&self.state),
+            armed: true,
+        };
+        match receive_effect_result_until(received, deadline).await {
+            EffectReceive::Delivered(result) => {
+                if result.is_err() {
+                    self.fail_close_all_admission();
+                }
+                guard.disarm();
+                Ok(AdmissionWait::Finished(result))
+            }
+            EffectReceive::Closed => {
+                self.fail_close_all_admission();
+                guard.poison();
+                Err(RuntimeSpineRunError::WorkerStopped(
+                    "pre-scan admission".to_owned(),
+                ))
+            }
+            EffectReceive::DeadlineExceeded => {
+                if let Some(admission) = &self.pre_scan_admission {
+                    admission.fail_close_all();
+                }
+                guard.poison();
+                Ok(AdmissionWait::DeadlineExceeded)
+            }
+        }
     }
 
     async fn recover(
@@ -1729,6 +1903,11 @@ enum RecoveryWait {
     DeadlineExceeded,
 }
 
+enum AdmissionWait {
+    Finished(anyhow::Result<()>),
+    DeadlineExceeded,
+}
+
 enum EffectReceive<T> {
     Delivered(anyhow::Result<T>),
     Closed,
@@ -1898,6 +2077,7 @@ impl RuntimeSpineRunner {
             None,
             None,
             None,
+            None,
         )
     }
 
@@ -1919,6 +2099,7 @@ impl RuntimeSpineRunner {
             Some(effect),
             None,
             None,
+            None,
         )
     }
 
@@ -1930,6 +2111,7 @@ impl RuntimeSpineRunner {
         registered_session: AgentSession,
         client: RuntimeSpineHttpClient,
         scanner: Arc<dyn RuntimeInventoryScanner>,
+        pre_scan_admission: Arc<dyn RuntimePreScanAdmission>,
         recovery: Arc<dyn RuntimePreScanRecovery>,
         effect: Arc<dyn RuntimeDesiredEffect>,
         resource_owner: Arc<dyn RuntimeEffectResourceOwner>,
@@ -1940,6 +2122,7 @@ impl RuntimeSpineRunner {
             client,
             scanner,
             Some(effect),
+            Some(pre_scan_admission),
             Some(recovery),
             Some(resource_owner),
         )
@@ -1951,6 +2134,7 @@ impl RuntimeSpineRunner {
         client: RuntimeSpineHttpClient,
         scanner: Arc<dyn RuntimeInventoryScanner>,
         effect: Option<Arc<dyn RuntimeDesiredEffect>>,
+        pre_scan_admission: Option<Arc<dyn RuntimePreScanAdmission>>,
         recovery: Option<Arc<dyn RuntimePreScanRecovery>>,
         resource_owner: Option<Arc<dyn RuntimeEffectResourceOwner>>,
     ) -> Result<Self, RuntimeSpineRunError> {
@@ -1963,13 +2147,20 @@ impl RuntimeSpineRunner {
                 "pre-scan recovery requires the serialized Desired mutation lane",
             ));
         }
+        if pre_scan_admission.is_some() && effect.is_none() {
+            return Err(RuntimeSpineRunError::InvalidComposition(
+                "pre-scan admission requires the serialized Desired mutation lane",
+            ));
+        }
         if resource_owner.is_some() && effect.is_none() {
             return Err(RuntimeSpineRunError::InvalidComposition(
                 "effect resource owner requires the serialized Desired mutation lane",
             ));
         }
         let effect_lane = effect
-            .map(|effect| EffectLane::start(effect, recovery, resource_owner.clone()))
+            .map(|effect| {
+                EffectLane::start(effect, pre_scan_admission, recovery, resource_owner.clone())
+            })
             .transpose()?;
         let journal_lane = JournalLane::start(state_directory.clone(), registered_session.clone())?;
         Ok(Self {
@@ -2027,6 +2218,25 @@ impl RuntimeSpineRunner {
                 if self
                     .effect_lane
                     .as_ref()
+                    .is_some_and(EffectLane::has_pre_scan_admission)
+                {
+                    match self
+                        .effect_lane()?
+                        .reconcile_pre_scan_admission(scan.clone(), deadlines.effect_step)
+                        .await?
+                    {
+                        AdmissionWait::Finished(Ok(())) => {}
+                        AdmissionWait::Finished(Err(error)) => {
+                            return Ok(RuntimeSpineRunStep::PreScanAdmissionUnavailable(error));
+                        }
+                        AdmissionWait::DeadlineExceeded => {
+                            return Ok(RuntimeSpineRunStep::PreScanAdmissionDeadlineExceeded);
+                        }
+                    }
+                }
+                if self
+                    .effect_lane
+                    .as_ref()
                     .is_some_and(EffectLane::has_recovery)
                 {
                     match self
@@ -2059,6 +2269,14 @@ impl RuntimeSpineRunner {
                     ScanWait::Finished(result) => match *result {
                         Ok(outcome) => outcome,
                         Err(error) => {
+                            // An explicit scanner error is stronger than an
+                            // unavailable source: the complete-source
+                            // contract is corrupt, conflicting or foreign.
+                            // The earlier endpoint-only latch may therefore
+                            // no longer preserve any old route safely.
+                            if let Some(effect_lane) = &self.effect_lane {
+                                effect_lane.fail_close_all_admission();
+                            }
                             return Ok(RuntimeSpineRunStep::ScanUnavailable(error));
                         }
                     },
@@ -2755,6 +2973,12 @@ mod tests {
         calls: AtomicUsize,
     }
 
+    struct TestPreScanAdmission {
+        calls: AtomicUsize,
+        fail_closes: AtomicUsize,
+        fail: AtomicBool,
+    }
+
     struct TestEffectResourceOwner {
         pending: AtomicBool,
         polls: AtomicUsize,
@@ -2847,6 +3071,22 @@ mod tests {
         }
     }
 
+    impl RuntimePreScanAdmission for TestPreScanAdmission {
+        fn reconcile(&self, context: RuntimePreScanAdmissionContext) -> anyhow::Result<()> {
+            context.check_active()?;
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            anyhow::ensure!(
+                !self.fail.load(Ordering::SeqCst),
+                "injected admission failure"
+            );
+            Ok(())
+        }
+
+        fn fail_close_all(&self) {
+            self.fail_closes.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+
     struct NonCooperativeEffect {
         calls: AtomicUsize,
         delay: Duration,
@@ -2920,7 +3160,7 @@ mod tests {
             calls: AtomicUsize::new(0),
         });
         let recovery_port: Arc<dyn RuntimePreScanRecovery> = recovery.clone();
-        let mut lane = EffectLane::start(effect.clone(), Some(recovery_port), None).unwrap();
+        let mut lane = EffectLane::start(effect.clone(), None, Some(recovery_port), None).unwrap();
         let snapshot = decode_desired_read_snapshot(SNAPSHOT).unwrap();
         let coordinates = RuntimeSpineFullScan {
             session: snapshot.session.clone(),
@@ -2968,6 +3208,65 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn mandatory_pre_scan_admission_ignores_pending_resources_and_every_error_fails_closed() {
+        let effect = Arc::new(CountingEffect {
+            calls: AtomicUsize::new(0),
+        });
+        let admission = Arc::new(TestPreScanAdmission {
+            calls: AtomicUsize::new(0),
+            fail_closes: AtomicUsize::new(0),
+            fail: AtomicBool::new(false),
+        });
+        let owner = Arc::new(TestEffectResourceOwner::new(true));
+        let admission_port: Arc<dyn RuntimePreScanAdmission> = admission.clone();
+        let owner_port: Arc<dyn RuntimeEffectResourceOwner> = owner.clone();
+        let mut lane =
+            EffectLane::start(effect, Some(admission_port), None, Some(owner_port)).unwrap();
+        let snapshot = decode_desired_read_snapshot(SNAPSHOT).unwrap();
+        let coordinates = RuntimeSpineFullScan {
+            session: snapshot.session.clone(),
+            heartbeat_sequence: Sequence::new(1).unwrap(),
+            inventory_epoch: Epoch::new(1).unwrap(),
+            desired: snapshot,
+        };
+
+        assert!(matches!(
+            lane.reconcile_pre_scan_admission(coordinates.clone(), Instant::now())
+                .await
+                .unwrap(),
+            AdmissionWait::DeadlineExceeded
+        ));
+        assert_eq!(admission.calls.load(Ordering::SeqCst), 0);
+        assert_eq!(admission.fail_closes.load(Ordering::SeqCst), 1);
+
+        assert!(matches!(
+            lane.reconcile_pre_scan_admission(
+                coordinates.clone(),
+                Instant::now() + Duration::from_secs(2),
+            )
+            .await
+            .unwrap(),
+            AdmissionWait::Finished(Ok(()))
+        ));
+        assert_eq!(admission.calls.load(Ordering::SeqCst), 1);
+        assert_eq!(owner.polls.load(Ordering::SeqCst), 0);
+
+        admission.fail.store(true, Ordering::SeqCst);
+        let AdmissionWait::Finished(Err(error)) = lane
+            .reconcile_pre_scan_admission(coordinates, Instant::now() + Duration::from_secs(2))
+            .await
+            .unwrap()
+        else {
+            panic!("injected admission error was not returned")
+        };
+        assert!(error.to_string().contains("injected admission failure"));
+        assert_eq!(admission.calls.load(Ordering::SeqCst), 2);
+        assert_eq!(admission.fail_closes.load(Ordering::SeqCst), 2);
+        owner.pending.store(false, Ordering::SeqCst);
+        lane.shutdown_blocking().unwrap();
+    }
+
+    #[tokio::test]
     async fn pending_effect_resource_blocks_apply_and_recovery_before_user_code() {
         let effect = Arc::new(CountingEffect {
             calls: AtomicUsize::new(0),
@@ -2979,7 +3278,7 @@ mod tests {
         let recovery_port: Arc<dyn RuntimePreScanRecovery> = recovery.clone();
         let owner_port: Arc<dyn RuntimeEffectResourceOwner> = owner.clone();
         let mut lane =
-            EffectLane::start(effect.clone(), Some(recovery_port), Some(owner_port)).unwrap();
+            EffectLane::start(effect.clone(), None, Some(recovery_port), Some(owner_port)).unwrap();
         let root = tempfile::tempdir().unwrap();
         let deadline = Instant::now() + Duration::from_secs(2);
         let EffectWait::Finished(Err(error)) = lane
@@ -3043,6 +3342,7 @@ mod tests {
             Arc::new(DropWitnessEffect {
                 dropped: Arc::clone(&effect_dropped),
             }),
+            None,
             None,
             Some(owner_port.clone()),
         )
@@ -3869,6 +4169,7 @@ mod tests {
             RuntimeSpineHttpClient::for_loopback_test(&origin, signer()).unwrap(),
             Arc::new(AssignedScanner),
             Some(effect.clone()),
+            None,
             None,
             Some(resource_owner_port),
         )

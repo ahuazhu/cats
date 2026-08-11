@@ -15,19 +15,25 @@ use anyhow::Context as _;
 use cats_api::runtime_reconciliation::{
     CheckpointEvidence, DesiredRuntimeSpec, Epoch, GuestTransportEvidence, Id, LifecycleAdmission,
     NodeBootId, NodeObservation, ObservedMount, ObservedRouteGate, ObservedRuntimeStatus,
-    RandomId128, ReadyReason, ReconcileStep, Revision, RuntimeCheckpoint, RuntimeTarget, Sequence,
-    Sha256Digest, StableState, UnixMillis,
+    RandomId128, ReadyReason, ReconcileStep, RequireIdleCheckpoint, Revision, RouteGateState,
+    RuntimeCheckpoint, RuntimeTarget, RuntimeTransition, Sequence, Sha256Digest, StableState,
+    UnixMillis,
 };
 
-use crate::runtime_spine::{RuntimeDesiredEffectContext, RuntimeDesiredEffectOutcome};
+use crate::runtime_spine::{
+    RuntimeDesiredEffectContext, RuntimeDesiredEffectOutcome, RuntimePreScanAdmission,
+    RuntimePreScanAdmissionContext,
+};
 
-use super::gate_planner::next_install_gate;
+use super::gate_planner::{first_endpoint_action, route_binding, EndpointAction};
+use super::inventory::DesiredCheckpointBinding;
 use super::vmm_process::ExactVmmProcessProof;
 use super::{
     AdmissionCell, AdmissionCellObservation, AdmissionCellRegistry, AdmissionCellSession,
-    AdmissionCellSessionLookup, AdmissionSnapshot, ExactGuestMountedSetProof, FileCheckpointStore,
-    GateSequencer, GuestReadyTransportPort, PersistTimes, PlatformGuestReadyTransportPort,
-    RunningLaunchAuthorityRevalidator, StoredCheckpoint,
+    AdmissionCellSessionLookup, AdmissionGatePort, AdmissionSnapshot, ExactGuestMountedSetProof,
+    FileCheckpointStore, GateSequencer, GuestReadyTransportPort, PersistTimes,
+    PlatformGuestReadyTransportPort, RouteRetirementMode, RunningLaunchAuthorityRevalidator,
+    StoredCheckpoint,
 };
 
 #[cfg(test)]
@@ -67,6 +73,23 @@ struct RunningTailReadyExpectation {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+struct RouteRetirementExpectation {
+    cat_id: Id,
+    desired_revision: Revision,
+    spec_digest: Sha256Digest,
+    checkpoint_binding: DesiredCheckpointBinding,
+    checkpoint_content_digest: Sha256Digest,
+    checkpoint: RuntimeCheckpoint,
+    gate_predecessor: Option<DesiredRuntimeSpec>,
+    launch_predecessor: Option<DesiredRuntimeSpec>,
+    session_generation: u64,
+    cell: AdmissionCellObservation,
+    routes: Vec<ObservedRouteGate>,
+    mode: RouteRetirementMode,
+    physical: Option<RunningTailPhysicalAuthority>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 enum RunningTailPhysicalAuthority {
     Exact {
         vmm: Box<ExactVmmProcessProof>,
@@ -88,6 +111,7 @@ enum RunningTailCellPresence {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct RunningTailScanAdmission {
     ready: BTreeMap<Id, RunningTailReadyExpectation>,
+    retiring: BTreeMap<Id, RouteRetirementExpectation>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -107,17 +131,19 @@ pub(crate) struct RunningTailAdmission {
     inventory_digest: Sha256Digest,
     inventory_read_position: Sequence,
     ready: BTreeMap<Id, RunningTailReadyAdmission>,
+    retiring: BTreeMap<Id, RouteRetirementExpectation>,
 }
 
 impl RunningTailScanAdmission {
     pub(crate) fn empty() -> Self {
         Self {
             ready: BTreeMap::new(),
+            retiring: BTreeMap::new(),
         }
     }
 
     pub(crate) fn is_empty(&self) -> bool {
-        self.ready.is_empty()
+        self.ready.is_empty() && self.retiring.is_empty()
     }
 
     pub(crate) fn insert_exact(
@@ -202,10 +228,104 @@ impl RunningTailScanAdmission {
         Ok(())
     }
 
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn insert_route_retirement(
+        &mut self,
+        desired: &DesiredRuntimeSpec,
+        checkpoint: &RuntimeCheckpoint,
+        checkpoint_binding: DesiredCheckpointBinding,
+        checkpoint_content_digest: Sha256Digest,
+        gate_predecessor: Option<DesiredRuntimeSpec>,
+        launch_predecessor: Option<DesiredRuntimeSpec>,
+        session_generation: u64,
+        cell: AdmissionCellObservation,
+        mode: RouteRetirementMode,
+        physical: Option<(ExactVmmProcessProof, ExactGuestMountedSetProof)>,
+    ) -> anyhow::Result<()> {
+        let launch = checkpoint
+            .runtime_launch
+            .identity()
+            .context("route retirement lacks retained launch authority")?;
+        anyhow::ensure!(
+            checkpoint.cat_id == desired.cat_id
+                && checkpoint.node_id == desired.placement.node_id
+                && checkpoint.placement_epoch == desired.placement.placement_epoch
+                && checkpoint.runtime_incarnation.as_ref() == Some(&launch.runtime_incarnation)
+                && gate_predecessor.as_ref().is_none_or(|predecessor| {
+                    predecessor.target == RuntimeTarget::Running
+                        && predecessor.cat_id == checkpoint.cat_id
+                })
+                && launch_predecessor.as_ref().is_none_or(|predecessor| {
+                    predecessor.target == RuntimeTarget::Running
+                        && predecessor.cat_id == checkpoint.cat_id
+                })
+                && match (launch_predecessor.as_ref(), gate_predecessor.as_ref()) {
+                    (Some(launch), Some(gate)) => {
+                        super::route_retirement::running_physical_compatible(launch, gate)
+                    }
+                    _ => true,
+                }
+                && session_generation != 0
+                && !self.ready.contains_key(&desired.cat_id),
+            "route-retirement authority conflicts with Desired/checkpoint"
+        );
+        let physical = physical
+            .map(|(vmm, mounted_set)| {
+                anyhow::ensure!(
+                    vmm.expectation().checkpoint() == checkpoint
+                        && vmm.expectation().launch_identity() == launch
+                        && matches!(
+                            mounted_set.guest_transport(),
+                            GuestTransportEvidence::VsockReady {
+                                runtime_incarnation,
+                                guest_cid,
+                                ..
+                            } if runtime_incarnation == &launch.runtime_incarnation
+                                && *guest_cid == launch.guest_cid
+                        ),
+                    "route-retirement physical proof conflicts with retained launch"
+                );
+                Ok(RunningTailPhysicalAuthority::Exact {
+                    vmm: Box::new(vmm),
+                    mounted_set: Box::new(mounted_set),
+                })
+            })
+            .transpose()?;
+        let routes = projected_routes(&cell);
+        let expectation = RouteRetirementExpectation {
+            cat_id: desired.cat_id.clone(),
+            desired_revision: desired.desired_revision,
+            spec_digest: desired.spec_digest.clone(),
+            checkpoint_binding,
+            checkpoint_content_digest,
+            checkpoint: checkpoint.clone(),
+            gate_predecessor,
+            launch_predecessor,
+            session_generation,
+            cell,
+            routes,
+            mode,
+            physical,
+        };
+        anyhow::ensure!(
+            self.retiring
+                .insert(desired.cat_id.clone(), expectation)
+                .is_none(),
+            "route-retirement scan repeats one Cat"
+        );
+        Ok(())
+    }
+
     pub(crate) fn project_runtime(
         &self,
         runtime: &mut ObservedRuntimeStatus,
     ) -> anyhow::Result<()> {
+        if let Some(expectation) = self.retiring.get(&runtime.cat_id) {
+            runtime.lifecycle_admission = expectation.cell.snapshot().lifecycle_admission();
+            runtime.platform_guards = expectation.cell.guards().platform_guards;
+            runtime.routes = expectation.routes.clone();
+            return Ok(());
+        }
         let Some(expectation) = self.ready.get(&runtime.cat_id) else {
             return Ok(());
         };
@@ -330,6 +450,40 @@ impl RunningTailScanAdmission {
             );
             ready.insert(cat_id, RunningTailReadyAdmission { expectation });
         }
+        let mut retiring = BTreeMap::new();
+        for (cat_id, expectation) in self.retiring {
+            let mut matches = observation
+                .runtimes
+                .iter()
+                .filter(|runtime| runtime.cat_id == cat_id);
+            let runtime = matches
+                .next()
+                .context("route-retirement proof names a Cat absent from inventory")?;
+            anyhow::ensure!(
+                matches.next().is_none()
+                    && expectation.cat_id == cat_id
+                    && expectation.desired_revision
+                        == runtime
+                            .applied_desired
+                            .as_ref()
+                            .context("route-retirement runtime lacks applied Desired")?
+                            .desired_revision
+                    && expectation.spec_digest
+                        == runtime
+                            .applied_desired
+                            .as_ref()
+                            .context("route-retirement runtime lacks applied Desired")?
+                            .spec_digest
+                    && exact_checkpoint_projection(
+                        &expectation.checkpoint,
+                        &expectation.checkpoint_content_digest,
+                        runtime,
+                    )
+                    && exact_cell_projection_parts(&expectation.cell, &expectation.routes, runtime,),
+                "route-retirement private proof conflicts with its public projection"
+            );
+            retiring.insert(cat_id, expectation);
+        }
         Ok(RunningTailAdmission {
             observation_id: observation.observation_id.clone(),
             node_id: observation.node_id.clone(),
@@ -340,6 +494,7 @@ impl RunningTailScanAdmission {
             inventory_digest,
             inventory_read_position,
             ready,
+            retiring,
         })
     }
 
@@ -387,7 +542,10 @@ impl RunningTailScanAdmission {
                 physical: RunningTailPhysicalAuthority::Test,
             },
         )]);
-        Ok(Self { ready })
+        Ok(Self {
+            ready,
+            retiring: BTreeMap::new(),
+        })
     }
 }
 
@@ -395,19 +553,61 @@ fn projected_routes(cell: &AdmissionCellObservation) -> Vec<ObservedRouteGate> {
     cell.snapshot()
         .endpoints()
         .iter()
-        .map(|route| ObservedRouteGate {
-            binding: route.binding.clone(),
-            gate: route.gate,
-            active_guards: cell
+        .map(|route| {
+            let active_guards = cell
                 .guards()
                 .endpoint_guards
                 .iter()
                 .find(|count| count.endpoint_id == route.binding.endpoint_id)
-                .map_or(0, |count| count.active_guards),
-            cancellation_pending: false,
-            instance_count: 1,
+                .map_or(0, |count| count.active_guards);
+            ObservedRouteGate {
+                binding: route.binding.clone(),
+                gate: route.gate,
+                active_guards,
+                cancellation_pending: cell.endpoint_is_revoked(&route.binding.endpoint_id)
+                    || (route.gate == RouteGateState::Closed && active_guards != 0),
+                instance_count: 1,
+            }
         })
         .collect()
+}
+
+fn exact_checkpoint_projection(
+    checkpoint: &RuntimeCheckpoint,
+    expected_digest: &Sha256Digest,
+    runtime: &ObservedRuntimeStatus,
+) -> bool {
+    matches!(
+        &runtime.checkpoint,
+        CheckpointEvidence::Valid {
+            content_digest,
+            version,
+            cat_id,
+            node_id,
+            placement_epoch,
+            desired_revision,
+            spec_digest,
+            runtime_incarnation,
+            runtime_launch,
+            stable_state,
+            step,
+            require_idle,
+            updated_at_unix_ms,
+            ..
+        } if content_digest == expected_digest
+            && *version == checkpoint.version
+            && cat_id == &checkpoint.cat_id
+            && node_id == &checkpoint.node_id
+            && *placement_epoch == checkpoint.placement_epoch
+            && *desired_revision == checkpoint.desired_revision
+            && spec_digest == &checkpoint.spec_digest
+            && runtime_incarnation == &checkpoint.runtime_incarnation
+            && runtime_launch.as_ref() == &checkpoint.runtime_launch
+            && *stable_state == checkpoint.stable_state
+            && step.as_ref() == &checkpoint.step
+            && require_idle.as_ref() == &checkpoint.require_idle
+            && *updated_at_unix_ms == checkpoint.updated_at_unix_ms
+    )
 }
 
 impl RunningTailAdmission {
@@ -426,22 +626,38 @@ impl RunningTailAdmission {
     fn ready(&self, cat_id: &Id) -> Option<&RunningTailReadyAdmission> {
         self.ready.get(cat_id)
     }
+
+    fn retiring(&self, cat_id: &Id) -> Option<&RouteRetirementExpectation> {
+        self.retiring.get(cat_id)
+    }
 }
 
 fn exact_cell_projection(
     expectation: &RunningTailReadyExpectation,
     runtime: &ObservedRuntimeStatus,
 ) -> bool {
-    let snapshot = expectation.cell.snapshot();
-    let guards = expectation.cell.guards();
-    if snapshot.applied_desired_revision() != expectation.desired_revision
-        || snapshot.spec_digest() != &expectation.spec_digest
-        || snapshot.placement() != &expectation.placement
-        || snapshot.runtime_incarnation() != Some(&expectation.runtime_incarnation)
-        || runtime.lifecycle_admission != snapshot.lifecycle_admission()
+    if expectation.cell.snapshot().applied_desired_revision() != expectation.desired_revision
+        || expectation.cell.snapshot().spec_digest() != &expectation.spec_digest
+        || expectation.cell.snapshot().placement() != &expectation.placement
+        || expectation.cell.snapshot().runtime_incarnation()
+            != Some(&expectation.runtime_incarnation)
+    {
+        return false;
+    }
+    exact_cell_projection_parts(&expectation.cell, &expectation.routes, runtime)
+}
+
+fn exact_cell_projection_parts(
+    cell: &AdmissionCellObservation,
+    routes: &[ObservedRouteGate],
+    runtime: &ObservedRuntimeStatus,
+) -> bool {
+    let snapshot = cell.snapshot();
+    let guards = cell.guards();
+    if runtime.lifecycle_admission != snapshot.lifecycle_admission()
         || runtime.platform_guards != guards.platform_guards
-        || runtime.routes != expectation.routes
-        || snapshot.endpoints().len() != expectation.routes.len()
+        || runtime.routes != routes
+        || snapshot.endpoints().len() != routes.len()
     {
         return false;
     }
@@ -467,7 +683,7 @@ fn exact_cell_projection(
     snapshot
         .endpoints()
         .iter()
-        .zip(&expectation.routes)
+        .zip(routes)
         .all(|(admission, observed)| {
             observed.binding == admission.binding
                 && observed.gate == admission.gate
@@ -517,6 +733,281 @@ pub(crate) struct RunningAdmissionEffect {
     after_registry: Option<AfterRegistryHook>,
     #[cfg(test)]
     launch_revalidation: Option<LaunchRevalidationHook>,
+}
+
+/// Mandatory process-local close reconciler invoked by the runner before any
+/// fallible physical inventory probe. Its only Endpoint mutation is the
+/// deterministic next CloseGate; it never installs or reopens an edge.
+pub(crate) struct RunningAdmissionPreScan {
+    registry: Arc<AdmissionCellRegistry>,
+}
+
+impl RunningAdmissionPreScan {
+    pub(crate) fn new(registry: Arc<AdmissionCellRegistry>) -> Self {
+        Self { registry }
+    }
+
+    fn reconcile_session(
+        &self,
+        context: &RuntimePreScanAdmissionContext,
+        desired: Option<&DesiredRuntimeSpec>,
+        session: &Arc<AdmissionCellSession>,
+    ) -> anyhow::Result<()> {
+        context.check_active()?;
+        let Some(desired) = desired else {
+            session.cell().force_close();
+            return Ok(());
+        };
+        let stored = match session.checkpoint_store().load() {
+            Ok(Some(stored)) => stored,
+            Ok(None) | Err(_) => {
+                session.cell().force_close();
+                return Ok(());
+            }
+        };
+        let checkpoint = stored.checkpoint();
+        let checkpoint_cell = match AdmissionSnapshot::from_checkpoint(checkpoint) {
+            Ok(snapshot) => snapshot,
+            Err(_) => {
+                session.cell().force_close();
+                return Ok(());
+            }
+        };
+        let Some(sealed) = session.sealed_running_desired() else {
+            session.cell().force_close();
+            return Ok(());
+        };
+        let live = session.cell().snapshot();
+        let require_idle_needs_settlement = !matches!(
+            checkpoint.require_idle,
+            RequireIdleCheckpoint::NotApplicable | RequireIdleCheckpoint::Armed { .. }
+        ) && live != checkpoint_cell;
+        if live.lifecycle_admission() == LifecycleAdmission::Closed
+            && live
+                .endpoints()
+                .iter()
+                .all(|route| route.gate == RouteGateState::Closed)
+            && !require_idle_needs_settlement
+        {
+            return Ok(());
+        }
+
+        let top_is_sealed = checkpoint.cat_id == sealed.cat_id
+            && checkpoint.node_id == sealed.placement.node_id
+            && checkpoint.placement_epoch == sealed.placement.placement_epoch
+            && checkpoint.desired_revision == sealed.desired_revision
+            && checkpoint.spec_digest == sealed.spec_digest;
+        let top_is_current = checkpoint.cat_id == desired.cat_id
+            && checkpoint.node_id == desired.placement.node_id
+            && checkpoint.placement_epoch == desired.placement.placement_epoch
+            && checkpoint.desired_revision == desired.desired_revision
+            && checkpoint.spec_digest == desired.spec_digest;
+
+        if matches!(desired.transition, RuntimeTransition::RequireIdle { .. }) {
+            let result = if top_is_sealed
+                && checkpoint.runtime_launch.identity().is_some()
+                && checkpoint.lifecycle_admission == LifecycleAdmission::Open
+                && checkpoint.stable_state == Some(StableState::Running)
+                && matches!(
+                    checkpoint.step,
+                    ReconcileStep::Stable {
+                        state: StableState::Running
+                    }
+                )
+                && live == checkpoint_cell
+            {
+                let times = next_persist_times(&stored)?;
+                let mut port = session.cell().port();
+                GateSequencer::new(session.checkpoint_store(), &mut port)
+                    .begin_require_idle(&stored, desired, times)
+                    .map(|_| ())
+            } else if top_is_current {
+                match &checkpoint.require_idle {
+                    RequireIdleCheckpoint::Armed { .. } => {
+                        let times = next_persist_times(&stored)?;
+                        let mut port = session.cell().port();
+                        GateSequencer::new(session.checkpoint_store(), &mut port)
+                            .recover_armed(&stored, desired, times)
+                            .map(|_| ())
+                    }
+                    RequireIdleCheckpoint::Busy {
+                        gate_closed: false, ..
+                    } => {
+                        let source_snapshot =
+                            exact_require_idle_source_snapshot(&sealed, desired, checkpoint)?;
+                        if live == source_snapshot {
+                            Ok(())
+                        } else if live == source_snapshot.fail_closed() {
+                            let times = next_persist_times(&stored)?;
+                            let mut port = session.cell().port();
+                            GateSequencer::new(session.checkpoint_store(), &mut port)
+                                .settle_open_busy_fail_closed(
+                                    &stored,
+                                    desired,
+                                    &source_snapshot,
+                                    times.after_effect,
+                                )
+                                .map(|_| ())
+                        } else {
+                            Err(super::GateReconcileError::WrongRequireIdleCheckpoint)
+                        }
+                    }
+                    RequireIdleCheckpoint::Closed { .. }
+                    | RequireIdleCheckpoint::Busy {
+                        gate_closed: true, ..
+                    } if live.lifecycle_admission() == LifecycleAdmission::Closed => {
+                        if live == checkpoint_cell {
+                            Ok(())
+                        } else {
+                            let source_snapshot =
+                                exact_require_idle_source_snapshot(&sealed, desired, checkpoint)?;
+                            let source_closed = source_snapshot.fail_closed();
+                            let mut port = session.cell().port();
+                            port.advance_closed(&source_closed, &checkpoint_cell)
+                                .map_err(super::GateReconcileError::from)
+                        }
+                    }
+                    _ => Err(super::GateReconcileError::WrongRequireIdleCheckpoint),
+                }
+            } else {
+                Err(super::GateReconcileError::WrongRequireIdleSource)
+            };
+            if let Err(error) = result {
+                session.cell().force_close();
+                return Err(error.into());
+            }
+            return Ok(());
+        }
+
+        let eligible_running_phase = checkpoint.runtime_launch.identity().is_some()
+            && matches!(
+                checkpoint.step,
+                ReconcileStep::OpenAdmission { .. }
+                    | ReconcileStep::InstallGate { .. }
+                    | ReconcileStep::CloseGate { .. }
+                    | ReconcileStep::Stable {
+                        state: StableState::Running
+                    }
+            );
+        let sealed_matches_current = sealed == *desired;
+        let endpoint_only = super::route_retirement::endpoint_only_successor(&sealed, desired);
+        let cell_is_exact_or_closed_edge = live == checkpoint_cell
+            || match &checkpoint.step {
+                ReconcileStep::CloseGate { endpoint_id, .. }
+                | ReconcileStep::InstallGate { endpoint_id, .. } => session
+                    .checkpoint_store()
+                    .endpoint_effect_edge_allows_live(endpoint_id, &live)?,
+                _ => false,
+            };
+        let trusted = desired.target == RuntimeTarget::Running
+            && eligible_running_phase
+            && (sealed_matches_current || endpoint_only)
+            && ((top_is_current && cell_is_exact_or_closed_edge)
+                || (top_is_sealed && endpoint_only && live == checkpoint_cell));
+        if !trusted {
+            session.cell().force_close();
+            return Ok(());
+        }
+
+        if endpoint_only {
+            context.check_active()?;
+            let incarnation = checkpoint
+                .runtime_incarnation
+                .as_ref()
+                .context("Endpoint retirement lacks a runtime incarnation")?;
+            let mut revoke = Vec::new();
+            for route in live.endpoints() {
+                let desired_binding = desired
+                    .endpoints
+                    .binary_search_by(|endpoint| {
+                        endpoint.endpoint_id.cmp(&route.binding.endpoint_id)
+                    })
+                    .ok()
+                    .and_then(|index| desired.endpoints.get(index))
+                    .and_then(|endpoint| route_binding(desired, endpoint, Some(incarnation)));
+                if desired_binding.as_ref() != Some(&route.binding) {
+                    revoke.push(route.binding.endpoint_id.clone());
+                }
+            }
+            if let Err(error) = session.cell().latch_endpoint_revocations(&live, &revoke) {
+                session.cell().force_close();
+                return Err(error.into());
+            }
+        }
+
+        let final_checkpoint = stored.checkpoint();
+        if final_checkpoint.desired_revision == desired.desired_revision
+            && final_checkpoint.spec_digest == desired.spec_digest
+            && session.cell().snapshot() == AdmissionSnapshot::from_checkpoint(final_checkpoint)?
+            && final_checkpoint.stable_state == Some(StableState::Running)
+            && matches!(
+                final_checkpoint.step,
+                ReconcileStep::Stable {
+                    state: StableState::Running
+                }
+            )
+        {
+            session.advance_sealed_running_desired(desired.clone())?;
+        }
+        Ok(())
+    }
+}
+
+fn exact_require_idle_source_snapshot(
+    sealed: &DesiredRuntimeSpec,
+    desired: &DesiredRuntimeSpec,
+    checkpoint: &RuntimeCheckpoint,
+) -> anyhow::Result<AdmissionSnapshot> {
+    let RuntimeTransition::RequireIdle {
+        source_revision,
+        source_runtime_incarnation,
+        ..
+    } = &desired.transition
+    else {
+        anyhow::bail!("Desired is not RequireIdle")
+    };
+    let mut expected_successor = sealed.clone();
+    expected_successor.desired_revision = desired.desired_revision;
+    expected_successor.spec_digest = desired.spec_digest.clone();
+    expected_successor.target = desired.target;
+    expected_successor.transition = desired.transition.clone();
+    anyhow::ensure!(
+        expected_successor == *desired && sealed.desired_revision == *source_revision,
+        "RequireIdle Desired is not the exact sealed Running successor"
+    );
+    let mut source_checkpoint = checkpoint.clone();
+    source_checkpoint.desired_revision = sealed.desired_revision;
+    source_checkpoint.spec_digest = sealed.spec_digest.clone();
+    let source_snapshot = AdmissionSnapshot::from_checkpoint(&source_checkpoint)?;
+    anyhow::ensure!(
+        source_snapshot.runtime_incarnation() == Some(source_runtime_incarnation),
+        "RequireIdle source incarnation changed"
+    );
+    Ok(source_snapshot)
+}
+
+impl RuntimePreScanAdmission for RunningAdmissionPreScan {
+    fn reconcile(&self, context: RuntimePreScanAdmissionContext) -> anyhow::Result<()> {
+        let result = (|| {
+            context.check_active()?;
+            let desired_specs = &context.coordinates().desired.desired_specs;
+            for (cat_id, session) in self.registry.ready_sessions()? {
+                let desired = desired_specs
+                    .iter()
+                    .find(|desired| desired.cat_id == cat_id);
+                self.reconcile_session(&context, desired, &session)?;
+            }
+            Ok(())
+        })();
+        if result.is_err() {
+            self.registry.fail_close_all();
+        }
+        result
+    }
+
+    fn fail_close_all(&self) {
+        self.registry.fail_close_all();
+    }
 }
 
 impl RunningAdmissionEffect {
@@ -577,15 +1068,16 @@ impl RunningAdmissionEffect {
             return Ok(None);
         };
         context.check_active()?;
-        let session = ready.session(&self.registry, &desired.cat_id)?;
+        let session = ready.session(&self.registry, desired)?;
         #[cfg(test)]
         if let Some(hook) = &self.after_registry {
             hook(context);
         }
         context.check_active()?;
+        let live = session.cell().observe();
         anyhow::ensure!(
-            session.cell().observe() == ready.expectation.cell,
-            "Running-tail sidecar is stale for the current AdmissionCell"
+            live.snapshot() == ready.expectation.cell.snapshot(),
+            "Running-tail sidecar is stale for the current AdmissionCell snapshot"
         );
         let stored = session
             .checkpoint_store()
@@ -594,8 +1086,28 @@ impl RunningAdmissionEffect {
             .context("Running-tail authority names a missing checkpoint")?;
         ready.authorize(desired, &stored)?;
         context.check_active()?;
-        let Some(action) = plan_running_tail_action(ready, desired, &stored)? else {
-            return Ok(None);
+        let Some(action) = plan_running_tail_action(desired, &stored, &live)? else {
+            let checkpoint = stored.checkpoint();
+            let converged = session.cell().snapshot()
+                == AdmissionSnapshot::from_checkpoint(checkpoint)?
+                && checkpoint.stable_state == Some(StableState::Running)
+                && matches!(
+                    checkpoint.step,
+                    ReconcileStep::Stable {
+                        state: StableState::Running
+                    }
+                );
+            // A scanner-sealed admission tail owns this dispatch. In
+            // particular, a Closed endpoint with live guards must not fall
+            // through into storage/network teardown while its tunnel tasks
+            // are still draining. Only the exact Stable/Open replay is a
+            // completed unit; every other no-action state needs fresh guard
+            // evidence.
+            return Ok(Some(if converged {
+                RuntimeDesiredEffectOutcome::Applied
+            } else {
+                RuntimeDesiredEffectOutcome::RefreshInventory
+            }));
         };
         context.check_active()?;
         let mut port = session.cell().port();
@@ -613,6 +1125,35 @@ impl RunningAdmissionEffect {
                                 &stored,
                             )
                         })?,
+                )
+            }
+            RunningTailAction::CloseGate(endpoint_id) => {
+                let times = next_persist_times(&stored)?;
+                Some(
+                    GateSequencer::new(session.checkpoint_store(), &mut port).close_gate(
+                        &stored,
+                        desired,
+                        &endpoint_id,
+                        times,
+                    )?,
+                )
+            }
+            RunningTailAction::PrepareChanged(endpoint_id) => {
+                let times = next_persist_times(&stored)?;
+                Some(
+                    GateSequencer::new(session.checkpoint_store(), &mut port)
+                        .prepare_changed_gate(&stored, desired, &endpoint_id, times.after_effect)?,
+                )
+            }
+            RunningTailAction::RemoveGate(endpoint_id) => {
+                let times = next_persist_times(&stored)?;
+                Some(
+                    GateSequencer::new(session.checkpoint_store(), &mut port).remove_closed_gate(
+                        &stored,
+                        desired,
+                        &endpoint_id,
+                        times.after_effect,
+                    )?,
                 )
             }
             RunningTailAction::InstallGate(endpoint_id) => {
@@ -636,12 +1177,209 @@ impl RunningAdmissionEffect {
                 result.checkpoint().checkpoint().runtime_launch,
                 stored.checkpoint().runtime_launch
             );
+            seal_stable_running_session(&session, desired, result.checkpoint().checkpoint())?;
         }
         // Do not re-check cancellation after the local linearization point:
         // the bounded sequencer has already resolved the exact postcondition
         // and finalized its checkpoint. The runner still discards the stale
         // accepted batch and obtains a new full inventory.
         Ok(Some(RuntimeDesiredEffectOutcome::RefreshInventory))
+    }
+
+    /// Applies one scanner-sealed retirement edge before any component may
+    /// mutate VMM, storage or network state. Every successful edge forces a
+    /// fresh complete inventory; a closed gate with live guards simply waits
+    /// for the cancellation-aware tunnel tasks to release them.
+    pub(crate) fn try_retire(
+        &self,
+        context: &RuntimeDesiredEffectContext,
+        desired: &DesiredRuntimeSpec,
+    ) -> anyhow::Result<Option<RuntimeDesiredEffectOutcome>> {
+        let Some(admission) = context.running_tail_admission() else {
+            return Ok(None);
+        };
+        let Some(retiring) = admission.retiring(&desired.cat_id) else {
+            return Ok(None);
+        };
+        context.check_active()?;
+        anyhow::ensure!(
+            retiring.desired_revision == desired.desired_revision
+                && retiring.spec_digest == desired.spec_digest
+                && retiring.cat_id == desired.cat_id,
+            "route-retirement authority does not bind current Desired"
+        );
+        let session = self
+            .registry
+            .existing_session(&desired.cat_id)?
+            .context("route-retirement authority names a missing AdmissionCell")?;
+        let live = session.cell().observe();
+        anyhow::ensure!(
+            session.generation() == retiring.session_generation
+                && live.snapshot() == retiring.cell.snapshot()
+                && retiring
+                    .gate_predecessor
+                    .as_ref()
+                    .is_none_or(|predecessor| {
+                        session.sealed_running_desired().as_ref() == Some(predecessor)
+                    }),
+            "route-retirement shared-registry evidence changed"
+        );
+        let stored = session
+            .checkpoint_store()
+            .load()
+            .context("load route-retirement checkpoint")?
+            .context("route-retirement authority names a missing checkpoint")?;
+        anyhow::ensure!(
+            stored.content_digest() == &retiring.checkpoint_content_digest
+                && stored.checkpoint() == &retiring.checkpoint,
+            "route-retirement checkpoint changed after accepted inventory"
+        );
+        context.check_active()?;
+        let Some(action) = plan_route_retirement(retiring, desired, &stored, &live)? else {
+            // A Busy RequireIdle decision is already terminal and
+            // intentionally preserves its exact open source. Every other
+            // no-action retirement state is waiting for cancellation-aware
+            // guards or fresh physical proof and must retain dispatch
+            // ownership until a new complete inventory is accepted.
+            let terminal_busy = matches!(
+                stored.checkpoint().require_idle,
+                RequireIdleCheckpoint::Busy {
+                    gate_closed: false,
+                    ..
+                }
+            );
+            return Ok(Some(if terminal_busy {
+                RuntimeDesiredEffectOutcome::Applied
+            } else {
+                RuntimeDesiredEffectOutcome::RefreshInventory
+            }));
+        };
+        context.check_active()?;
+        if matches!(action, RouteRetirementAction::RemoveSession) {
+            anyhow::ensure!(
+                live.guards().platform_guards == 0 && live.guards().endpoint_guards.is_empty(),
+                "route-retirement cannot remove a cell with live guards"
+            );
+            anyhow::ensure!(
+                self.registry.remove(&desired.cat_id, &session)?,
+                "route-retirement shared-registry compare-remove lost ownership"
+            );
+            return Ok(Some(RuntimeDesiredEffectOutcome::RefreshInventory));
+        }
+
+        let times = next_persist_times(&stored)?;
+        let mut port = session.cell().port();
+        let mut sequencer = GateSequencer::new(session.checkpoint_store(), &mut port);
+        let result = match action {
+            RouteRetirementAction::CloseGate(endpoint_id) => {
+                sequencer.close_gate(&stored, desired, &endpoint_id, times)?
+            }
+            RouteRetirementAction::PrepareChanged(endpoint_id) => sequencer.prepare_changed_gate(
+                &stored,
+                desired,
+                &endpoint_id,
+                times.after_effect,
+            )?,
+            RouteRetirementAction::RemoveGate(endpoint_id) => {
+                sequencer.remove_closed_gate(&stored, desired, &endpoint_id, times.after_effect)?
+            }
+            RouteRetirementAction::InstallGate(endpoint_id) => sequencer
+                .install_gate_with_barrier(&stored, desired, &endpoint_id, times, || {
+                    retiring.revalidate_physical(self, context, session.checkpoint_store(), &stored)
+                })?,
+            RouteRetirementAction::CloseAll => sequencer.close_all(&stored, desired, times)?,
+            RouteRetirementAction::BeginRequireIdle => {
+                sequencer.begin_require_idle(&stored, desired, times)?
+            }
+            RouteRetirementAction::RecoverRequireIdle => {
+                sequencer.recover_armed(&stored, desired, times)?
+            }
+            RouteRetirementAction::RemoveSession => unreachable!("handled before sequencer"),
+        };
+        debug_assert_eq!(
+            result.checkpoint().checkpoint().runtime_launch,
+            stored.checkpoint().runtime_launch
+        );
+        seal_stable_running_session(&session, desired, result.checkpoint().checkpoint())?;
+        Ok(Some(RuntimeDesiredEffectOutcome::RefreshInventory))
+    }
+}
+
+fn seal_stable_running_session(
+    session: &AdmissionCellSession,
+    desired: &DesiredRuntimeSpec,
+    checkpoint: &RuntimeCheckpoint,
+) -> anyhow::Result<()> {
+    if desired.target == RuntimeTarget::Running
+        && checkpoint.desired_revision == desired.desired_revision
+        && checkpoint.spec_digest == desired.spec_digest
+        && checkpoint.stable_state == Some(StableState::Running)
+        && matches!(
+            checkpoint.step,
+            ReconcileStep::Stable {
+                state: StableState::Running
+            }
+        )
+        && session.cell().snapshot() == AdmissionSnapshot::from_checkpoint(checkpoint)?
+    {
+        session.advance_sealed_running_desired(desired.clone())?;
+    }
+    Ok(())
+}
+
+impl RouteRetirementExpectation {
+    fn revalidate_physical(
+        &self,
+        effect: &RunningAdmissionEffect,
+        context: &RuntimeDesiredEffectContext,
+        store: &FileCheckpointStore,
+        stored: &StoredCheckpoint,
+    ) -> anyhow::Result<()> {
+        let Some(physical) = &self.physical else {
+            anyhow::bail!("route install lacks fresh physical authority")
+        };
+        let (vmm, mounted_set) = match physical {
+            RunningTailPhysicalAuthority::Exact { vmm, mounted_set } => (vmm, mounted_set),
+            #[cfg(test)]
+            RunningTailPhysicalAuthority::Test => return Ok(()),
+        };
+        let predecessor = self
+            .gate_predecessor
+            .as_ref()
+            .context("route install lacks its sealed live-gate predecessor")?;
+        let launch_predecessor = self
+            .launch_predecessor
+            .as_ref()
+            .context("route install lacks immutable launch provenance")?;
+        anyhow::ensure!(
+            super::route_retirement::running_physical_compatible(launch_predecessor, predecessor,),
+            "live-gate predecessor conflicts with immutable launch provenance"
+        );
+        if let Some(launch_authority) = effect.launch_authority.as_deref() {
+            launch_authority.revalidate_exact_retained_running(
+                context,
+                predecessor,
+                store,
+                stored,
+                vmm,
+            )?;
+        } else {
+            #[cfg(test)]
+            if let Some(revalidate) = effect.launch_revalidation.as_ref() {
+                revalidate(context, predecessor, store, stored, vmm)?;
+            } else {
+                anyhow::bail!("production route retirement lacks launch revalidation authority");
+            }
+            #[cfg(not(test))]
+            anyhow::bail!("production route retirement lacks launch revalidation authority");
+        }
+        mounted_set.revalidate(
+            effect.guest_ready.as_ref(),
+            context,
+            predecessor,
+            stored.checkpoint(),
+            vmm,
+        )
     }
 }
 
@@ -694,11 +1432,16 @@ impl RunningTailReadyAdmission {
     fn session(
         &self,
         registry: &AdmissionCellRegistry,
-        cat_id: &Id,
+        desired: &DesiredRuntimeSpec,
     ) -> anyhow::Result<Arc<AdmissionCellSession>> {
+        let cat_id = &desired.cat_id;
         match self.expectation.cell_presence {
             RunningTailCellPresence::Absent => {
-                match registry.ensure_closed(cat_id, self.expectation.cell.snapshot().clone())? {
+                match registry.ensure_closed(
+                    cat_id,
+                    self.expectation.cell.snapshot().clone(),
+                    Some(desired.clone()),
+                )? {
                     AdmissionCellSessionLookup::CreatedClosed(session) => Ok(session),
                     AdmissionCellSessionLookup::Existing => {
                         anyhow::bail!("Running-tail sidecar expected an absent AdmissionCell")
@@ -714,17 +1457,124 @@ impl RunningTailReadyAdmission {
 
 enum RunningTailAction {
     OpenLifecycle,
+    CloseGate(Id),
+    PrepareChanged(Id),
+    RemoveGate(Id),
     InstallGate(Id),
 }
 
-fn plan_running_tail_action(
-    ready: &RunningTailReadyAdmission,
+enum RouteRetirementAction {
+    CloseGate(Id),
+    PrepareChanged(Id),
+    RemoveGate(Id),
+    InstallGate(Id),
+    CloseAll,
+    BeginRequireIdle,
+    RecoverRequireIdle,
+    RemoveSession,
+}
+
+fn plan_route_retirement(
+    retiring: &RouteRetirementExpectation,
     desired: &DesiredRuntimeSpec,
     stored: &StoredCheckpoint,
+    live: &AdmissionCellObservation,
+) -> anyhow::Result<Option<RouteRetirementAction>> {
+    let checkpoint = stored.checkpoint();
+    let cell = live.snapshot();
+    let guards = live.guards();
+    let cell_is_closed = cell.lifecycle_admission() == LifecycleAdmission::Closed
+        && cell
+            .endpoints()
+            .iter()
+            .all(|route| route.gate == RouteGateState::Closed);
+    let all_drained = guards.platform_guards == 0 && guards.endpoint_guards.is_empty();
+
+    if cell_is_closed {
+        return Ok(all_drained.then_some(RouteRetirementAction::RemoveSession));
+    }
+
+    match retiring.mode {
+        RouteRetirementMode::EndpointOnly => {
+            anyhow::ensure!(
+                desired.target == RuntimeTarget::Running
+                    && matches!(desired.transition, RuntimeTransition::CancelAndDrain),
+                "Endpoint-only route retirement lost its Running Desired"
+            );
+            let checkpoint_cell = AdmissionSnapshot::from_checkpoint(checkpoint)?;
+            match first_endpoint_action(checkpoint, desired)? {
+                Some(EndpointAction::Close { endpoint_id }) => {
+                    anyhow::ensure!(
+                        cell == &checkpoint_cell,
+                        "CloseGate route retirement lost its exact predecessor cell"
+                    );
+                    Ok(Some(RouteRetirementAction::CloseGate(endpoint_id)))
+                }
+                Some(EndpointAction::PrepareChanged { endpoint_id, .. }) => {
+                    anyhow::ensure!(
+                        cell == &checkpoint_cell,
+                        "changed-gate preparation lost its exact Closed cell"
+                    );
+                    Ok(endpoint_is_drained(guards, &endpoint_id)
+                        .then_some(RouteRetirementAction::PrepareChanged(endpoint_id)))
+                }
+                Some(EndpointAction::Remove { endpoint_id }) => {
+                    anyhow::ensure!(
+                        cell == &checkpoint_cell,
+                        "closed-gate removal lost its exact Closed cell"
+                    );
+                    Ok(endpoint_is_drained(guards, &endpoint_id)
+                        .then_some(RouteRetirementAction::RemoveGate(endpoint_id)))
+                }
+                Some(EndpointAction::Install { endpoint_id, .. }) => Ok(retiring
+                    .physical
+                    .as_ref()
+                    .map(|_| RouteRetirementAction::InstallGate(endpoint_id))),
+                None => anyhow::bail!(
+                    "superseded Endpoint-only checkpoint has no deterministic transition"
+                ),
+            }
+        }
+        RouteRetirementMode::Global => {
+            if matches!(desired.transition, RuntimeTransition::RequireIdle { .. }) {
+                return match &checkpoint.require_idle {
+                    RequireIdleCheckpoint::NotApplicable => {
+                        Ok(Some(RouteRetirementAction::BeginRequireIdle))
+                    }
+                    RequireIdleCheckpoint::Armed { .. } => {
+                        Ok(Some(RouteRetirementAction::RecoverRequireIdle))
+                    }
+                    RequireIdleCheckpoint::Busy {
+                        gate_closed: false, ..
+                    } => Ok(None),
+                    RequireIdleCheckpoint::Busy {
+                        gate_closed: true, ..
+                    }
+                    | RequireIdleCheckpoint::Closed { .. } => anyhow::bail!(
+                        "RequireIdle checkpoint claims Closed while its live cell remains Open"
+                    ),
+                };
+            }
+            Ok(Some(RouteRetirementAction::CloseAll))
+        }
+    }
+}
+
+fn endpoint_is_drained(guards: &super::AdmissionGuardCounts, endpoint_id: &Id) -> bool {
+    guards
+        .endpoint_guards
+        .iter()
+        .all(|count| &count.endpoint_id != endpoint_id || count.active_guards == 0)
+}
+
+fn plan_running_tail_action(
+    desired: &DesiredRuntimeSpec,
+    stored: &StoredCheckpoint,
+    live: &AdmissionCellObservation,
 ) -> anyhow::Result<Option<RunningTailAction>> {
     let checkpoint = stored.checkpoint();
-    let cell = ready.expectation.cell.snapshot();
-    let guards = ready.expectation.cell.guards();
+    let cell = live.snapshot();
+    let guards = live.guards();
     if desired.endpoints.is_empty() {
         anyhow::ensure!(
             checkpoint.route_gates.is_empty() && cell.endpoints().is_empty(),
@@ -771,47 +1621,77 @@ fn plan_running_tail_action(
         return Ok(None);
     }
 
-    let Some(endpoint_id) = next_install_gate(checkpoint, desired)? else {
-        anyhow::ensure!(
-            checkpoint.stable_state == Some(StableState::Running)
-                && matches!(
-                    checkpoint.step,
-                    ReconcileStep::Stable {
-                        state: StableState::Running
-                    }
-                )
-                && cell == &checkpoint_cell,
-            "Endpoint admission has no deterministic InstallGate successor"
-        );
-        return Ok(None);
+    let action = match first_endpoint_action(checkpoint, desired)? {
+        Some(action) => action,
+        None => {
+            anyhow::ensure!(
+                checkpoint.stable_state == Some(StableState::Running)
+                    && matches!(
+                        checkpoint.step,
+                        ReconcileStep::Stable {
+                            state: StableState::Running
+                        }
+                    )
+                    && cell == &checkpoint_cell,
+                "Endpoint admission has no deterministic successor"
+            );
+            return Ok(None);
+        }
     };
 
-    match cell.lifecycle_admission() {
-        LifecycleAdmission::Closed => {
+    match action {
+        EndpointAction::Close { endpoint_id } => {
             anyhow::ensure!(
-                checkpoint.lifecycle_admission == LifecycleAdmission::Closed
-                    && checkpoint.route_gates.is_empty()
-                    && cell.endpoints().is_empty()
-                    && guards.platform_guards == 0
-                    && guards.endpoint_guards.is_empty(),
-                "only the first empty-gate InstallGate may open lifecycle admission"
+                cell == &checkpoint_cell,
+                "CloseGate admission lost its exact predecessor cell"
             );
+            return Ok(Some(RunningTailAction::CloseGate(endpoint_id)));
         }
-        LifecycleAdmission::Open => {
+        EndpointAction::PrepareChanged { endpoint_id, .. } => {
             anyhow::ensure!(
-                !checkpoint.route_gates.is_empty()
-                    && matches!(
-                        &checkpoint.step,
-                        ReconcileStep::InstallGate {
-                            endpoint_id: saved_endpoint,
-                            ..
-                        } if saved_endpoint == &endpoint_id
-                    ),
-                "subsequent InstallGate does not match the durable next step"
+                cell == &checkpoint_cell,
+                "changed-gate admission lost its exact Closed cell"
             );
+            return Ok(endpoint_is_drained(guards, &endpoint_id)
+                .then_some(RunningTailAction::PrepareChanged(endpoint_id)));
+        }
+        EndpointAction::Remove { endpoint_id } => {
+            anyhow::ensure!(
+                cell == &checkpoint_cell,
+                "closed-gate admission lost its exact Closed cell"
+            );
+            return Ok(endpoint_is_drained(guards, &endpoint_id)
+                .then_some(RunningTailAction::RemoveGate(endpoint_id)));
+        }
+        EndpointAction::Install { endpoint_id, .. } => {
+            match cell.lifecycle_admission() {
+                LifecycleAdmission::Closed => {
+                    anyhow::ensure!(
+                        checkpoint.lifecycle_admission == LifecycleAdmission::Closed
+                            && checkpoint.route_gates.is_empty()
+                            && cell.endpoints().is_empty()
+                            && guards.platform_guards == 0
+                            && guards.endpoint_guards.is_empty(),
+                        "only the first empty-gate InstallGate may open lifecycle admission"
+                    );
+                }
+                LifecycleAdmission::Open => {
+                    anyhow::ensure!(
+                        !checkpoint.route_gates.is_empty()
+                            && matches!(
+                                &checkpoint.step,
+                                ReconcileStep::InstallGate {
+                                    endpoint_id: saved_endpoint,
+                                    ..
+                                } if saved_endpoint == &endpoint_id
+                            ),
+                        "subsequent InstallGate does not match the durable next step"
+                    );
+                }
+            }
+            return Ok(Some(RunningTailAction::InstallGate(endpoint_id)));
         }
     }
-    Ok(Some(RunningTailAction::InstallGate(endpoint_id)))
 }
 
 fn next_persist_times(stored: &StoredCheckpoint) -> anyhow::Result<PersistTimes> {
@@ -844,15 +1724,15 @@ mod tests {
     use std::time::{Duration, Instant};
 
     use cats_api::route_grant_v2::{
-        RouteGrantV2Claims, RouteGrantV2TimeVerdict, ROUTE_GRANT_V2_AUDIENCE,
-        ROUTE_GRANT_V2_ISSUER, ROUTE_GRANT_V2_VERSION,
+        RouteAdmissionV2Reason, RouteGrantV2Claims, RouteGrantV2TimeVerdict,
+        ROUTE_GRANT_V2_AUDIENCE, ROUTE_GRANT_V2_ISSUER, ROUTE_GRANT_V2_VERSION,
     };
     use cats_api::runtime_reconciliation::{
         decode_desired_runtime_spec, decode_runtime_checkpoint, spec_digest,
         AdmissionInventoryAttestation, AgentSession, AppliedDesiredEvidence, CheckpointEvidence,
-        ContractVersion, DesiredRuntimeSpec, Epoch, GuestBootId, HostPath, Hostname, NodeBootId,
-        ObservedRuntimeStatus, ReconcileStep, RouteGateState, RuntimeLaunch, Sequence, StableState,
-        WarmSnapshotEvidence,
+        ContractVersion, DesiredReadSnapshot, DesiredRuntimeSpec, Epoch, GuestBootId, HostPath,
+        Hostname, NodeBootId, ObservedRuntimeStatus, ReconcileStep, RouteGateState, RuntimeLaunch,
+        Sequence, SessionBinding, StableState, WarmSnapshotEvidence,
     };
     use tempfile::TempDir;
 
@@ -894,7 +1774,20 @@ mod tests {
                     second.target_port = 8081;
                     desired.endpoints.push(second);
                 }
-                _ => panic!("fixture supports at most two Endpoints"),
+                3 => {
+                    let mut second = desired.endpoints[0].clone();
+                    second.endpoint_id = Id::new("ep_02").expect("second Endpoint ID");
+                    second.hostname =
+                        Hostname::new("b.example.test").expect("second Endpoint hostname");
+                    second.target_port = 8081;
+                    let mut third = desired.endpoints[0].clone();
+                    third.endpoint_id = Id::new("ep_03").expect("third Endpoint ID");
+                    third.hostname =
+                        Hostname::new("c.example.test").expect("third Endpoint hostname");
+                    third.target_port = 8082;
+                    desired.endpoints.extend([second, third]);
+                }
+                _ => panic!("fixture supports at most three Endpoints"),
             }
             desired.spec_digest = spec_digest(&desired).expect("fixture spec digest");
             let mut checkpoint =
@@ -984,6 +1877,38 @@ mod tests {
         observation: NodeObservation,
     }
 
+    fn pre_scan_context(desired: DesiredRuntimeSpec) -> RuntimePreScanAdmissionContext {
+        RuntimePreScanAdmissionContext::for_test(
+            crate::runtime_spine::RuntimeSpineFullScan {
+                session: SessionBinding {
+                    node_id: desired.placement.node_id.clone(),
+                    node_boot_id: NodeBootId::new("bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb").unwrap(),
+                    agent_instance_id: RandomId128::new("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")
+                        .unwrap(),
+                    agent_session_epoch: Epoch::new(1).unwrap(),
+                },
+                heartbeat_sequence: Sequence::new(1).unwrap(),
+                inventory_epoch: Epoch::new(1).unwrap(),
+                desired: DesiredReadSnapshot {
+                    version: ContractVersion::V1,
+                    session: SessionBinding {
+                        node_id: desired.placement.node_id.clone(),
+                        node_boot_id: NodeBootId::new("bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb").unwrap(),
+                        agent_instance_id: RandomId128::new("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")
+                            .unwrap(),
+                        agent_session_epoch: Epoch::new(1).unwrap(),
+                    },
+                    request_sequence: Sequence::new(1).unwrap(),
+                    read_position: Sequence::new(1).unwrap(),
+                    issued_at_unix_ms: UnixMillis::new(1).unwrap(),
+                    expires_at_unix_ms: UnixMillis::new(2).unwrap(),
+                    desired_specs: vec![desired],
+                },
+            },
+            Instant::now() + Duration::from_secs(2),
+        )
+    }
+
     #[test]
     fn production_effect_without_scanner_sealed_authority_is_inert() {
         let fixture = Fixture::new(0);
@@ -1007,6 +1932,658 @@ mod tests {
             .expect("unchanged bytes"),
             before
         );
+    }
+
+    #[tokio::test]
+    async fn mandatory_pre_scan_closes_every_removed_endpoint_but_preserves_unchanged_route() {
+        let fixture = Fixture::new(3);
+        let registry = fixture.registry();
+        let effect = RunningAdmissionEffect::new(Arc::clone(&registry));
+        for _ in 0..3 {
+            effect
+                .try_apply(&fixture.context(&registry, true), &fixture.desired)
+                .unwrap()
+                .expect("install each old Endpoint");
+        }
+        let session = registry
+            .existing_session(&fixture.desired.cat_id)
+            .unwrap()
+            .unwrap();
+        let old = session.cell().snapshot();
+        assert!(old
+            .endpoints()
+            .iter()
+            .all(|route| route.gate == RouteGateState::Active));
+        let mut guards = old
+            .endpoints()
+            .iter()
+            .map(|route| {
+                session
+                    .cell()
+                    .acquire_verified_route(&claims(&route.binding), RouteGrantV2TimeVerdict::Valid)
+                    .unwrap()
+                    .0
+            })
+            .collect::<Vec<_>>();
+
+        let mut successor = fixture.desired.clone();
+        successor.desired_revision = Revision::new(successor.desired_revision.get() + 1).unwrap();
+        successor.endpoints = vec![successor.endpoints[1].clone()];
+        successor.spec_digest = spec_digest(&successor).unwrap();
+        RunningAdmissionPreScan::new(Arc::clone(&registry))
+            .reconcile(pre_scan_context(successor.clone()))
+            .unwrap();
+
+        let live = session.cell().snapshot();
+        assert_eq!(live.endpoints().len(), 3);
+        assert!(live
+            .endpoints()
+            .iter()
+            .all(|route| route.gate == RouteGateState::Active));
+        let latched = session.cell().observe();
+        assert!(latched.endpoint_is_revoked(&live.endpoints()[0].binding.endpoint_id));
+        assert!(!latched.endpoint_is_revoked(&live.endpoints()[1].binding.endpoint_id));
+        assert!(latched.endpoint_is_revoked(&live.endpoints()[2].binding.endpoint_id));
+        let projected = projected_routes(&latched);
+        assert!(projected[0].cancellation_pending);
+        assert!(!projected[1].cancellation_pending);
+        assert!(projected[2].cancellation_pending);
+        tokio::time::timeout(Duration::from_secs(1), guards[0].cancelled())
+            .await
+            .expect("A cancellation");
+        assert!(
+            tokio::time::timeout(Duration::from_millis(25), guards[1].cancelled())
+                .await
+                .is_err()
+        );
+        tokio::time::timeout(Duration::from_secs(1), guards[2].cancelled())
+            .await
+            .expect("C cancellation");
+        assert!(matches!(
+            session.cell().acquire_verified_route(
+                &claims(&live.endpoints()[0].binding),
+                RouteGrantV2TimeVerdict::Valid,
+            ),
+            Err(RouteAdmissionV2Reason::GateClosed)
+        ));
+        let retained = session
+            .cell()
+            .acquire_verified_route(
+                &claims(&live.endpoints()[1].binding),
+                RouteGrantV2TimeVerdict::Valid,
+            )
+            .expect("unchanged B remains admissible");
+        drop(retained);
+        let mut stored = session.checkpoint_store().load().unwrap().unwrap();
+        assert_eq!(
+            stored.checkpoint().desired_revision,
+            fixture.desired.desired_revision
+        );
+        assert_eq!(stored.checkpoint().route_gates, live.endpoints());
+
+        // Releasing A/C lets the canonical durable journal settle A fully
+        // before touching C. B's live guard remains admitted throughout.
+        let mut b_guard = guards.remove(1);
+        drop(guards);
+        let mut order = Vec::new();
+        loop {
+            let Some(action) = first_endpoint_action(stored.checkpoint(), &successor).unwrap()
+            else {
+                break;
+            };
+            let times = next_persist_times(&stored).unwrap();
+            let mut port = session.cell().port();
+            let mut sequencer = GateSequencer::new(session.checkpoint_store(), &mut port);
+            let result = match action {
+                EndpointAction::Close { endpoint_id } => {
+                    order.push(format!("close:{}", endpoint_id.as_str()));
+                    sequencer
+                        .close_gate(&stored, &successor, &endpoint_id, times)
+                        .unwrap()
+                }
+                EndpointAction::Remove { endpoint_id } => {
+                    order.push(format!("remove:{}", endpoint_id.as_str()));
+                    sequencer
+                        .remove_closed_gate(&stored, &successor, &endpoint_id, times.after_effect)
+                        .unwrap()
+                }
+                EndpointAction::PrepareChanged { .. } | EndpointAction::Install { .. } => {
+                    panic!("removal-only successor must not prepare or install")
+                }
+            };
+            stored = result.checkpoint().clone();
+        }
+        assert_eq!(
+            order,
+            ["close:ep_01", "remove:ep_01", "close:ep_03", "remove:ep_03"]
+        );
+        assert!(matches!(
+            stored.checkpoint().step,
+            ReconcileStep::Stable {
+                state: StableState::Running
+            }
+        ));
+        assert_eq!(
+            stored.checkpoint().desired_revision,
+            successor.desired_revision
+        );
+        let settled = session.cell().snapshot();
+        assert_eq!(
+            settled,
+            AdmissionSnapshot::from_checkpoint(stored.checkpoint()).unwrap()
+        );
+        assert_eq!(settled.endpoints().len(), 1);
+        assert_eq!(settled.endpoints()[0].binding.endpoint_id.as_str(), "ep_02");
+        assert!(
+            tokio::time::timeout(Duration::from_millis(25), b_guard.cancelled())
+                .await
+                .is_err()
+        );
+
+        // The effect must seal R1 at the Stable linearization point; no
+        // intervening R1 pre-scan is required before a direct R2 read.
+        seal_stable_running_session(&session, &successor, stored.checkpoint()).unwrap();
+        assert_eq!(session.sealed_running_desired().as_ref(), Some(&successor));
+        let mut second_successor = successor.clone();
+        second_successor.desired_revision =
+            Revision::new(second_successor.desired_revision.get() + 1).unwrap();
+        second_successor.endpoints[0].route_epoch =
+            Epoch::new(second_successor.endpoints[0].route_epoch.get() + 1).unwrap();
+        second_successor.endpoints[0].target_port += 10;
+        second_successor.spec_digest = spec_digest(&second_successor).unwrap();
+        RunningAdmissionPreScan::new(Arc::clone(&registry))
+            .reconcile(pre_scan_context(second_successor.clone()))
+            .unwrap();
+        let r2_latched = session.cell().observe();
+        assert_eq!(
+            r2_latched.snapshot().lifecycle_admission(),
+            LifecycleAdmission::Open
+        );
+        assert!(r2_latched
+            .endpoint_is_revoked(&r2_latched.snapshot().endpoints()[0].binding.endpoint_id));
+        tokio::time::timeout(Duration::from_secs(1), b_guard.cancelled())
+            .await
+            .expect("direct R2 cancels its changed B stream");
+
+        let mut leaving_running = second_successor;
+        leaving_running.desired_revision =
+            Revision::new(leaving_running.desired_revision.get() + 1).unwrap();
+        leaving_running.target = RuntimeTarget::Cold;
+        leaving_running.spec_digest = spec_digest(&leaving_running).unwrap();
+        RunningAdmissionPreScan::new(Arc::clone(&registry))
+            .reconcile(pre_scan_context(leaving_running))
+            .unwrap();
+        assert_eq!(
+            session.cell().snapshot().lifecycle_admission(),
+            LifecycleAdmission::Closed
+        );
+    }
+
+    #[tokio::test]
+    async fn latched_changed_and_removed_endpoints_settle_one_at_a_time() {
+        let fixture = Fixture::new(3);
+        let registry = fixture.registry();
+        let effect = RunningAdmissionEffect::new(Arc::clone(&registry));
+        for _ in 0..3 {
+            effect
+                .try_apply(&fixture.context(&registry, true), &fixture.desired)
+                .unwrap()
+                .unwrap();
+        }
+        let session = registry
+            .existing_session(&fixture.desired.cat_id)
+            .unwrap()
+            .unwrap();
+        let old = session.cell().snapshot();
+        let mut guards = old
+            .endpoints()
+            .iter()
+            .map(|route| {
+                session
+                    .cell()
+                    .acquire_verified_route(&claims(&route.binding), RouteGrantV2TimeVerdict::Valid)
+                    .unwrap()
+                    .0
+            })
+            .collect::<Vec<_>>();
+        let mut successor = fixture.desired.clone();
+        successor.desired_revision = Revision::new(successor.desired_revision.get() + 1).unwrap();
+        successor.endpoints[0].route_epoch =
+            Epoch::new(successor.endpoints[0].route_epoch.get() + 1).unwrap();
+        successor.endpoints[0].target_port += 10;
+        successor.endpoints.pop();
+        successor.spec_digest = spec_digest(&successor).unwrap();
+
+        RunningAdmissionPreScan::new(Arc::clone(&registry))
+            .reconcile(pre_scan_context(successor.clone()))
+            .unwrap();
+        let latched = session.cell().observe();
+        assert!(latched.endpoint_is_revoked(&old.endpoints()[0].binding.endpoint_id));
+        assert!(!latched.endpoint_is_revoked(&old.endpoints()[1].binding.endpoint_id));
+        assert!(latched.endpoint_is_revoked(&old.endpoints()[2].binding.endpoint_id));
+        tokio::time::timeout(Duration::from_secs(1), guards[0].cancelled())
+            .await
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(1), guards[2].cancelled())
+            .await
+            .unwrap();
+        let mut b_guard = guards.remove(1);
+        drop(guards);
+
+        let mut stored = session.checkpoint_store().load().unwrap().unwrap();
+        let mut order = Vec::new();
+        loop {
+            let Some(action) = first_endpoint_action(stored.checkpoint(), &successor).unwrap()
+            else {
+                break;
+            };
+            let times = next_persist_times(&stored).unwrap();
+            let mut port = session.cell().port();
+            let mut sequencer = GateSequencer::new(session.checkpoint_store(), &mut port);
+            let result = match action {
+                EndpointAction::Close { endpoint_id } => {
+                    order.push(format!("close:{}", endpoint_id.as_str()));
+                    sequencer
+                        .close_gate(&stored, &successor, &endpoint_id, times)
+                        .unwrap()
+                }
+                EndpointAction::PrepareChanged { endpoint_id, .. } => {
+                    order.push(format!("prepare:{}", endpoint_id.as_str()));
+                    sequencer
+                        .prepare_changed_gate(&stored, &successor, &endpoint_id, times.after_effect)
+                        .unwrap()
+                }
+                EndpointAction::Install { endpoint_id, .. } => {
+                    order.push(format!("install:{}", endpoint_id.as_str()));
+                    sequencer
+                        .install_gate_with_barrier(&stored, &successor, &endpoint_id, times, || {
+                            Ok(())
+                        })
+                        .unwrap()
+                }
+                EndpointAction::Remove { endpoint_id } => {
+                    order.push(format!("remove:{}", endpoint_id.as_str()));
+                    sequencer
+                        .remove_closed_gate(&stored, &successor, &endpoint_id, times.after_effect)
+                        .unwrap()
+                }
+            };
+            stored = result.checkpoint().clone();
+        }
+        assert_eq!(
+            order,
+            [
+                "close:ep_01",
+                "prepare:ep_01",
+                "install:ep_01",
+                "close:ep_03",
+                "remove:ep_03",
+            ]
+        );
+        assert!(matches!(
+            stored.checkpoint().step,
+            ReconcileStep::Stable {
+                state: StableState::Running
+            }
+        ));
+        let settled = session.cell().observe();
+        assert_eq!(
+            settled.snapshot(),
+            &AdmissionSnapshot::from_checkpoint(stored.checkpoint()).unwrap()
+        );
+        assert!(!settled.endpoint_is_revoked(&old.endpoints()[0].binding.endpoint_id));
+        assert!(!settled.endpoint_is_revoked(&old.endpoints()[2].binding.endpoint_id));
+        assert!(
+            tokio::time::timeout(Duration::from_millis(25), b_guard.cancelled())
+                .await
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn endpoint_successor_effect_seals_stable_before_an_immediate_next_revision() {
+        let fixture = Fixture::new(2);
+        let registry = fixture.registry();
+        let effect = RunningAdmissionEffect::new(Arc::clone(&registry));
+        for _ in 0..2 {
+            effect
+                .try_apply(&fixture.context(&registry, true), &fixture.desired)
+                .unwrap()
+                .unwrap();
+        }
+        let session = registry
+            .existing_session(&fixture.desired.cat_id)
+            .unwrap()
+            .unwrap();
+        let mut first_successor = fixture.desired.clone();
+        first_successor.desired_revision =
+            Revision::new(first_successor.desired_revision.get() + 1).unwrap();
+        first_successor.endpoints[0].route_epoch =
+            Epoch::new(first_successor.endpoints[0].route_epoch.get() + 1).unwrap();
+        first_successor.endpoints[0].target_port += 10;
+        first_successor.spec_digest = spec_digest(&first_successor).unwrap();
+        RunningAdmissionPreScan::new(Arc::clone(&registry))
+            .reconcile(pre_scan_context(first_successor.clone()))
+            .unwrap();
+
+        for _ in 0..8 {
+            let stored = session.checkpoint_store().load().unwrap().unwrap();
+            if stored.checkpoint().desired_revision == first_successor.desired_revision
+                && matches!(
+                    stored.checkpoint().step,
+                    ReconcileStep::Stable {
+                        state: StableState::Running
+                    }
+                )
+            {
+                break;
+            }
+            let context = if stored.checkpoint().desired_revision < first_successor.desired_revision
+            {
+                retirement_context(
+                    fixture.root.path(),
+                    &first_successor,
+                    &fixture.desired,
+                    &session,
+                    RouteRetirementMode::EndpointOnly,
+                    true,
+                )
+            } else {
+                ready_context(fixture.root.path(), &first_successor, &session)
+            };
+            let outcome =
+                if stored.checkpoint().desired_revision < first_successor.desired_revision {
+                    effect.try_retire(&context, &first_successor)
+                } else {
+                    effect.try_apply(&context, &first_successor)
+                }
+                .unwrap();
+            assert_eq!(outcome, Some(RuntimeDesiredEffectOutcome::RefreshInventory));
+        }
+        let stable = session.checkpoint_store().load().unwrap().unwrap();
+        assert!(matches!(
+            stable.checkpoint().step,
+            ReconcileStep::Stable {
+                state: StableState::Running
+            }
+        ));
+        assert_eq!(
+            session.sealed_running_desired().as_ref(),
+            Some(&first_successor)
+        );
+
+        let mut second_successor = first_successor.clone();
+        second_successor.desired_revision =
+            Revision::new(second_successor.desired_revision.get() + 1).unwrap();
+        second_successor.endpoints[1].route_epoch =
+            Epoch::new(second_successor.endpoints[1].route_epoch.get() + 1).unwrap();
+        second_successor.endpoints[1].target_port += 10;
+        second_successor.spec_digest = spec_digest(&second_successor).unwrap();
+        RunningAdmissionPreScan::new(Arc::clone(&registry))
+            .reconcile(pre_scan_context(second_successor))
+            .expect("R2 directly follows the R1 effect without an R1 pre-scan");
+        let live = session.cell().observe();
+        assert_eq!(
+            live.snapshot().lifecycle_admission(),
+            LifecycleAdmission::Open
+        );
+        assert!(!live.endpoint_is_revoked(&live.snapshot().endpoints()[0].binding.endpoint_id));
+        assert!(live.endpoint_is_revoked(&live.snapshot().endpoints()[1].binding.endpoint_id));
+    }
+
+    #[tokio::test]
+    async fn global_close_ignores_guard_count_race_but_session_removal_waits_for_drain() {
+        let fixture = Fixture::new(1);
+        let registry = fixture.registry();
+        let effect = RunningAdmissionEffect::new(Arc::clone(&registry));
+        effect
+            .try_apply(&fixture.context(&registry, true), &fixture.desired)
+            .unwrap()
+            .unwrap();
+        let session = registry
+            .existing_session(&fixture.desired.cat_id)
+            .unwrap()
+            .unwrap();
+        let accepted = retirement_context(
+            fixture.root.path(),
+            &fixture.desired,
+            &fixture.desired,
+            &session,
+            RouteRetirementMode::Global,
+            false,
+        );
+        let open = session.cell().snapshot();
+        let mut guard = session
+            .cell()
+            .acquire_verified_route(
+                &claims(&open.endpoints()[0].binding),
+                RouteGrantV2TimeVerdict::Valid,
+            )
+            .unwrap()
+            .0;
+
+        assert_eq!(
+            effect.try_retire(&accepted, &fixture.desired).unwrap(),
+            Some(RuntimeDesiredEffectOutcome::RefreshInventory)
+        );
+        assert_eq!(
+            session.cell().snapshot().lifecycle_admission(),
+            LifecycleAdmission::Closed
+        );
+        tokio::time::timeout(Duration::from_secs(1), guard.cancelled())
+            .await
+            .expect("global close cancels the racing guard");
+
+        let draining = retirement_context(
+            fixture.root.path(),
+            &fixture.desired,
+            &fixture.desired,
+            &session,
+            RouteRetirementMode::Global,
+            false,
+        );
+        assert_eq!(
+            effect.try_retire(&draining, &fixture.desired).unwrap(),
+            Some(RuntimeDesiredEffectOutcome::RefreshInventory)
+        );
+        assert!(registry.get(&fixture.desired.cat_id).is_some());
+        drop(guard);
+
+        let drained = retirement_context(
+            fixture.root.path(),
+            &fixture.desired,
+            &fixture.desired,
+            &session,
+            RouteRetirementMode::Global,
+            false,
+        );
+        assert_eq!(
+            effect.try_retire(&drained, &fixture.desired).unwrap(),
+            Some(RuntimeDesiredEffectOutcome::RefreshInventory)
+        );
+        assert!(registry.get(&fixture.desired.cat_id).is_none());
+    }
+
+    #[tokio::test]
+    async fn mandatory_pre_scan_global_mismatch_closes_and_cancels_every_route() {
+        let fixture = Fixture::new(2);
+        let registry = fixture.registry();
+        let effect = RunningAdmissionEffect::new(Arc::clone(&registry));
+        for _ in 0..2 {
+            effect
+                .try_apply(&fixture.context(&registry, true), &fixture.desired)
+                .unwrap()
+                .unwrap();
+        }
+        let session = registry
+            .existing_session(&fixture.desired.cat_id)
+            .unwrap()
+            .unwrap();
+        let old = session.cell().snapshot();
+        let mut guards = old
+            .endpoints()
+            .iter()
+            .map(|route| {
+                session
+                    .cell()
+                    .acquire_verified_route(&claims(&route.binding), RouteGrantV2TimeVerdict::Valid)
+                    .unwrap()
+                    .0
+            })
+            .collect::<Vec<_>>();
+        let mut successor = fixture.desired.clone();
+        successor.desired_revision = Revision::new(successor.desired_revision.get() + 1).unwrap();
+        successor.target = RuntimeTarget::Cold;
+        successor.spec_digest = spec_digest(&successor).unwrap();
+        RunningAdmissionPreScan::new(Arc::clone(&registry))
+            .reconcile(pre_scan_context(successor))
+            .unwrap();
+        let live = session.cell().snapshot();
+        assert_eq!(live.lifecycle_admission(), LifecycleAdmission::Closed);
+        assert!(live
+            .endpoints()
+            .iter()
+            .all(|route| route.gate == RouteGateState::Closed));
+        for guard in &mut guards {
+            tokio::time::timeout(Duration::from_secs(1), guard.cancelled())
+                .await
+                .expect("global cancellation");
+        }
+    }
+
+    #[tokio::test]
+    async fn mandatory_pre_scan_require_idle_busy_preserves_open_epoch() {
+        let fixture = Fixture::new(1);
+        let registry = fixture.registry();
+        let effect = RunningAdmissionEffect::new(Arc::clone(&registry));
+        effect
+            .try_apply(&fixture.context(&registry, true), &fixture.desired)
+            .unwrap()
+            .unwrap();
+        let session = registry
+            .existing_session(&fixture.desired.cat_id)
+            .unwrap()
+            .unwrap();
+        let old = session.cell().snapshot();
+        let mut guard = session
+            .cell()
+            .acquire_verified_route(
+                &claims(&old.endpoints()[0].binding),
+                RouteGrantV2TimeVerdict::Valid,
+            )
+            .unwrap()
+            .0;
+        let mut successor = fixture.desired.clone();
+        successor.desired_revision = Revision::new(successor.desired_revision.get() + 1).unwrap();
+        successor.target = RuntimeTarget::Suspended;
+        successor.transition = RuntimeTransition::RequireIdle {
+            attempt_id: RandomId128::new("cccccccccccccccccccccccccccccccc").unwrap(),
+            source_revision: fixture.desired.desired_revision,
+            source_runtime_incarnation: old.runtime_incarnation().cloned().unwrap(),
+        };
+        successor.spec_digest = spec_digest(&successor).unwrap();
+        RunningAdmissionPreScan::new(Arc::clone(&registry))
+            .reconcile(pre_scan_context(successor))
+            .unwrap();
+        assert_eq!(
+            session.cell().snapshot().lifecycle_admission(),
+            LifecycleAdmission::Open
+        );
+        assert!(
+            tokio::time::timeout(Duration::from_millis(25), guard.cancelled())
+                .await
+                .is_err()
+        );
+        let stored = session.checkpoint_store().load().unwrap().unwrap();
+        assert!(matches!(
+            stored.checkpoint().require_idle,
+            RequireIdleCheckpoint::Busy {
+                gate_closed: false,
+                ..
+            }
+        ));
+    }
+
+    #[tokio::test]
+    async fn mandatory_pre_scan_settles_open_busy_after_timeout_fail_close() {
+        let fixture = Fixture::new(1);
+        let registry = fixture.registry();
+        let effect = RunningAdmissionEffect::new(Arc::clone(&registry));
+        effect
+            .try_apply(&fixture.context(&registry, true), &fixture.desired)
+            .unwrap()
+            .unwrap();
+        let session = registry
+            .existing_session(&fixture.desired.cat_id)
+            .unwrap()
+            .unwrap();
+        let old = session.cell().snapshot();
+        let mut guard = session
+            .cell()
+            .acquire_verified_route(
+                &claims(&old.endpoints()[0].binding),
+                RouteGrantV2TimeVerdict::Valid,
+            )
+            .unwrap()
+            .0;
+        let mut successor = fixture.desired.clone();
+        successor.desired_revision = Revision::new(successor.desired_revision.get() + 1).unwrap();
+        successor.target = RuntimeTarget::Suspended;
+        successor.transition = RuntimeTransition::RequireIdle {
+            attempt_id: RandomId128::new("cccccccccccccccccccccccccccccccc").unwrap(),
+            source_revision: fixture.desired.desired_revision,
+            source_runtime_incarnation: old.runtime_incarnation().cloned().unwrap(),
+        };
+        successor.spec_digest = spec_digest(&successor).unwrap();
+        let pre_scan = RunningAdmissionPreScan::new(Arc::clone(&registry));
+        pre_scan
+            .reconcile(pre_scan_context(successor.clone()))
+            .unwrap();
+        let busy = session.checkpoint_store().load().unwrap().unwrap();
+        let RequireIdleCheckpoint::Busy {
+            platform_guards,
+            endpoint_guards,
+            gate_closed: false,
+            ..
+        } = &busy.checkpoint().require_idle
+        else {
+            panic!("first RequireIdle pass must record Busy/Open")
+        };
+        assert_eq!(*platform_guards, 0);
+        assert_eq!(endpoint_guards.len(), 1);
+        let saved_guards = endpoint_guards.clone();
+
+        // This is the runner's synchronous fallback racing after the worker
+        // durably produced Busy/Open but before its response was received.
+        session.cell().force_close();
+        tokio::time::timeout(Duration::from_secs(1), guard.cancelled())
+            .await
+            .expect("timeout fallback cancels the stream");
+        pre_scan
+            .reconcile(pre_scan_context(successor))
+            .expect("next mandatory pass settles the terminal closed result");
+
+        let settled = session.checkpoint_store().load().unwrap().unwrap();
+        assert!(matches!(
+            &settled.checkpoint().require_idle,
+            RequireIdleCheckpoint::Busy {
+                gate_closed: true,
+                platform_guards: 0,
+                endpoint_guards,
+                ..
+            } if endpoint_guards == &saved_guards
+        ));
+        assert_eq!(
+            session.cell().snapshot(),
+            AdmissionSnapshot::from_checkpoint(settled.checkpoint()).unwrap()
+        );
+        assert!(matches!(
+            session.cell().acquire_verified_route(
+                &claims(&old.endpoints()[0].binding),
+                RouteGrantV2TimeVerdict::Valid,
+            ),
+            Err(RouteAdmissionV2Reason::GateClosed)
+        ));
     }
 
     #[test]
@@ -1109,6 +2686,86 @@ mod tests {
     }
 
     #[test]
+    fn sealed_session_advances_only_across_an_endpoint_only_successor() {
+        let fixture = Fixture::new(1);
+        let registry = fixture.registry();
+        RunningAdmissionEffect::new(Arc::clone(&registry))
+            .try_apply(&fixture.context(&registry, true), &fixture.desired)
+            .unwrap()
+            .unwrap();
+        let session = registry
+            .existing_session(&fixture.desired.cat_id)
+            .unwrap()
+            .unwrap();
+        let mut endpoint_successor = fixture.desired.clone();
+        endpoint_successor.desired_revision =
+            Revision::new(endpoint_successor.desired_revision.get() + 1).unwrap();
+        endpoint_successor.endpoints[0].route_epoch =
+            Epoch::new(endpoint_successor.endpoints[0].route_epoch.get() + 1).unwrap();
+        endpoint_successor.spec_digest = spec_digest(&endpoint_successor).unwrap();
+        session
+            .advance_sealed_running_desired(endpoint_successor.clone())
+            .expect("exact endpoint-only successor");
+        assert_eq!(
+            session.sealed_running_desired().as_ref(),
+            Some(&endpoint_successor)
+        );
+
+        let mut invalid = Vec::new();
+        let mut runtime = endpoint_successor.clone();
+        runtime.desired_revision = Revision::new(runtime.desired_revision.get() + 1).unwrap();
+        runtime.runtime.vcpus += 1;
+        runtime.spec_digest = spec_digest(&runtime).unwrap();
+        invalid.push(runtime);
+
+        let mut volume = endpoint_successor.clone();
+        volume.desired_revision = Revision::new(volume.desired_revision.get() + 1).unwrap();
+        volume.volumes[0].size_bytes += 4096;
+        volume.spec_digest = spec_digest(&volume).unwrap();
+        invalid.push(volume);
+
+        let mut placement = endpoint_successor.clone();
+        placement.desired_revision = Revision::new(placement.desired_revision.get() + 1).unwrap();
+        placement.placement.placement_epoch =
+            Epoch::new(placement.placement.placement_epoch.get() + 1).unwrap();
+        placement.spec_digest = spec_digest(&placement).unwrap();
+        invalid.push(placement);
+
+        let mut transition = endpoint_successor.clone();
+        transition.desired_revision = Revision::new(transition.desired_revision.get() + 1).unwrap();
+        transition.transition = RuntimeTransition::RequireIdle {
+            attempt_id: RandomId128::new("dddddddddddddddddddddddddddddddd").unwrap(),
+            source_revision: endpoint_successor.desired_revision,
+            source_runtime_incarnation: session
+                .cell()
+                .snapshot()
+                .runtime_incarnation()
+                .cloned()
+                .unwrap(),
+        };
+        transition.target = RuntimeTarget::Suspended;
+        transition.spec_digest = spec_digest(&transition).unwrap();
+        invalid.push(transition);
+
+        let mut non_increasing = endpoint_successor.clone();
+        non_increasing.endpoints[0].target_port += 1;
+        non_increasing.spec_digest = spec_digest(&non_increasing).unwrap();
+        invalid.push(non_increasing);
+
+        for candidate in invalid {
+            assert!(session.advance_sealed_running_desired(candidate).is_err());
+            assert_eq!(
+                session.sealed_running_desired().as_ref(),
+                Some(&endpoint_successor)
+            );
+        }
+        assert_eq!(
+            session.cell().snapshot().lifecycle_admission(),
+            LifecycleAdmission::Closed
+        );
+    }
+
+    #[test]
     fn two_endpoints_install_across_fresh_acceptance_without_rewriting_the_first() {
         let fixture = Fixture::new(2);
         let registry = fixture.registry();
@@ -1187,7 +2844,7 @@ mod tests {
             effect
                 .try_apply(&fixture.context(&registry, true), &fixture.desired)
                 .expect("Stable Running replay is inert"),
-            None
+            Some(RuntimeDesiredEffectOutcome::Applied)
         );
         assert_eq!(cell.snapshot(), stable_cell);
         drop(first_guard);
@@ -1224,7 +2881,7 @@ mod tests {
             successor_effect
                 .try_apply(&fixture.context(&successor, true), &fixture.desired)
                 .expect("old Endpoint epochs remain fail-closed after restart"),
-            None
+            Some(RuntimeDesiredEffectOutcome::RefreshInventory)
         );
         let closed = successor
             .get(&fixture.desired.cat_id)
@@ -1245,7 +2902,7 @@ mod tests {
             successor_effect
                 .try_apply(&fixture.context(&successor, true), &fixture.desired)
                 .expect("old Endpoint epoch replay stays closed"),
-            None
+            Some(RuntimeDesiredEffectOutcome::RefreshInventory)
         );
         let restart_scan = fixture.scan(&successor);
         let sealed = RunningTailScanAdmission::for_test_from_authorities(
@@ -1339,7 +2996,7 @@ mod tests {
             effect
                 .try_apply(&fixture.context(&registry, true), &fixture.desired)
                 .expect("final exact replay is inert"),
-            None
+            Some(RuntimeDesiredEffectOutcome::Applied)
         );
         assert_eq!(cell.snapshot(), after_unknown);
     }
@@ -1589,17 +3246,21 @@ mod tests {
         cell.snapshot()
             .endpoints()
             .iter()
-            .map(|route| ObservedRouteGate {
-                binding: route.binding.clone(),
-                gate: route.gate,
-                active_guards: cell
+            .map(|route| {
+                let active_guards = cell
                     .guards()
                     .endpoint_guards
                     .iter()
                     .find(|count| count.endpoint_id == route.binding.endpoint_id)
-                    .map_or(0, |count| count.active_guards),
-                cancellation_pending: false,
-                instance_count: 1,
+                    .map_or(0, |count| count.active_guards);
+                ObservedRouteGate {
+                    binding: route.binding.clone(),
+                    gate: route.gate,
+                    active_guards,
+                    cancellation_pending: cell.endpoint_is_revoked(&route.binding.endpoint_id)
+                        || (route.gate == RouteGateState::Closed && active_guards != 0),
+                    instance_count: 1,
+                }
             })
             .collect()
     }
@@ -1705,6 +3366,27 @@ mod tests {
         with_running_tail: bool,
     ) -> RuntimeDesiredEffectContext {
         let observation = scan.observation;
+        let tail = with_running_tail.then(|| {
+            RunningTailScanAdmission::for_test_from_authorities(
+                &observation,
+                &scan.stored,
+                scan.cell_presence,
+                scan.cell,
+                scan.routes,
+            )
+            .expect("test live/Ready scan proof")
+            .bind(&observation)
+            .expect("bind exact full observation")
+        });
+        context_from_tail(root, desired, observation, tail)
+    }
+
+    fn context_from_tail(
+        root: &std::path::Path,
+        desired: &DesiredRuntimeSpec,
+        observation: NodeObservation,
+        tail: Option<RunningTailAdmission>,
+    ) -> RuntimeDesiredEffectContext {
         let session = AgentSession {
             version: ContractVersion::V1,
             node_id: observation.node_id.clone(),
@@ -1731,18 +3413,6 @@ mod tests {
                 .expect("inventory read position"),
             accepted_at_unix_ms: unix_ms(1_900_000_001_000),
         };
-        let tail = with_running_tail.then(|| {
-            RunningTailScanAdmission::for_test_from_authorities(
-                &observation,
-                &scan.stored,
-                scan.cell_presence,
-                scan.cell,
-                scan.routes,
-            )
-            .expect("test live/Ready scan proof")
-            .bind(&observation)
-            .expect("bind exact full observation")
-        });
         let mut admission =
             RuntimeDesiredEffectAdmission::for_test(session, observation, attestation);
         if let Some(tail) = tail {
@@ -1753,6 +3423,78 @@ mod tests {
             Instant::now() + Duration::from_secs(30),
             admission,
         )
+    }
+
+    fn retirement_context(
+        root: &std::path::Path,
+        desired: &DesiredRuntimeSpec,
+        launch_predecessor: &DesiredRuntimeSpec,
+        session: &Arc<AdmissionCellSession>,
+        mode: RouteRetirementMode,
+        physical: bool,
+    ) -> RuntimeDesiredEffectContext {
+        let stored = session
+            .checkpoint_store()
+            .load()
+            .unwrap()
+            .expect("retirement checkpoint");
+        let cell = session.cell().observe();
+        let routes = projected_routes(&cell);
+        let observation = observation(desired, &stored, &cell, routes);
+        let binding = if stored.checkpoint().desired_revision == desired.desired_revision
+            && stored.checkpoint().spec_digest == desired.spec_digest
+        {
+            DesiredCheckpointBinding::Current
+        } else {
+            DesiredCheckpointBinding::Superseded
+        };
+        let gate_predecessor = session.sealed_running_desired();
+        let mut scan = RunningTailScanAdmission::empty();
+        scan.insert_route_retirement(
+            desired,
+            stored.checkpoint(),
+            binding,
+            stored.content_digest().clone(),
+            gate_predecessor,
+            Some(launch_predecessor.clone()),
+            session.generation(),
+            cell,
+            mode,
+            None,
+        )
+        .unwrap();
+        if physical {
+            scan.retiring.get_mut(&desired.cat_id).unwrap().physical =
+                Some(RunningTailPhysicalAuthority::Test);
+        }
+        let tail = scan.bind(&observation).unwrap();
+        context_from_tail(root, desired, observation, Some(tail))
+    }
+
+    fn ready_context(
+        root: &std::path::Path,
+        desired: &DesiredRuntimeSpec,
+        session: &Arc<AdmissionCellSession>,
+    ) -> RuntimeDesiredEffectContext {
+        let stored = session
+            .checkpoint_store()
+            .load()
+            .unwrap()
+            .expect("ready checkpoint");
+        let cell = session.cell().observe();
+        let routes = projected_routes(&cell);
+        let observation = observation(desired, &stored, &cell, routes.clone());
+        let tail = RunningTailScanAdmission::for_test_from_authorities(
+            &observation,
+            &stored,
+            RunningTailCellPresence::Present,
+            cell,
+            routes,
+        )
+        .unwrap()
+        .bind(&observation)
+        .unwrap();
+        context_from_tail(root, desired, observation, Some(tail))
     }
 
     fn fixture_runtime_launch() -> RuntimeLaunch {

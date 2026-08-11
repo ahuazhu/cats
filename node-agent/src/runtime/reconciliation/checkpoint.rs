@@ -361,6 +361,26 @@ impl FileCheckpointStore {
         Ok(true)
     }
 
+    pub(super) fn endpoint_effect_edge_allows_live(
+        &self,
+        endpoint_id: &Id,
+        live: &AdmissionSnapshot,
+    ) -> Result<bool, CheckpointStoreError> {
+        let edges = self.endpoint_effect_edges.lock().map_err(|_| {
+            CheckpointStoreError::SessionContinuityPoisoned {
+                path: self.target_path.clone(),
+            }
+        })?;
+        Ok(matches!(
+            edges
+                .iter()
+                .filter(|edge| &edge.endpoint_id == endpoint_id)
+                .collect::<Vec<_>>()
+                .as_slice(),
+            [edge] if live == &edge.predecessor || live == &edge.replacement
+        ))
+    }
+
     #[cfg(test)]
     pub(super) fn endpoint_effect_edge_status(
         &self,

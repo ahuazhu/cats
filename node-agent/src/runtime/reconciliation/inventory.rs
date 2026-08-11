@@ -35,6 +35,7 @@ use crate::runtime_spine::{
 
 use super::{
     admission_registry::AdmissionCellRegistry,
+    classify_current_global_route_retirement, classify_superseded_route_retirement,
     guest_ready::{GuestReadyTransportPort, PlatformGuestReadyTransportPort},
     kernel_nbd::{KernelNbdInventoryPort, KernelNbdPoolScanOutcome},
     network::{
@@ -51,7 +52,7 @@ use super::{
     },
     running_admission::RunningTailScanAdmission,
     running_launch_authority::validate_retained_running_scan_exact_set,
-    runtime_checkpoint_path,
+    runtime_checkpoint_path, sealed_running_predecessor,
     signed_running::{
         expected_provision_heads, provision_checkpoint_is_bound, request_matches_volume,
         superseded_checkpoint_has_supported_replan, unowned_observed_volume, ProvisionHeadRead,
@@ -709,19 +710,15 @@ impl RuntimeInventoryScanner for CleanSlateInventoryScanner {
         ) {
             let mut tail = RunningTailScanAdmission::empty();
             for desired in &context.coordinates().desired.desired_specs {
-                if desired.target != RuntimeTarget::Running {
-                    continue;
-                }
                 let Some(checkpoint_evidence) = aggregate.checkpoints_by_cat.get(&desired.cat_id)
                 else {
                     continue;
                 };
-                if checkpoint_evidence.binding != DesiredCheckpointBinding::Current
-                    || checkpoint_evidence
-                        .checkpoint
-                        .runtime_launch
-                        .identity()
-                        .is_none()
+                if checkpoint_evidence
+                    .checkpoint
+                    .runtime_launch
+                    .identity()
+                    .is_none()
                 {
                     continue;
                 }
@@ -735,6 +732,89 @@ impl RuntimeInventoryScanner for CleanSlateInventoryScanner {
                     self.blob.as_deref(),
                     context.deadline(),
                 )?;
+                let session = registry
+                    .existing_session(&desired.cat_id)
+                    .context("observe the process-owned Running admission cell")?;
+                let observed_cell = session.as_ref().map(|session| session.cell().observe());
+                let launch_predecessor = sealed_running_predecessor(
+                    checkpoint,
+                    aggregate.blockd_by_cat.get(&desired.cat_id),
+                )?;
+                let gate_predecessor = session
+                    .as_ref()
+                    .and_then(|session| session.sealed_running_desired());
+                let retirement_mode = match (&session, &observed_cell) {
+                    (Some(_), Some(cell)) => classify_superseded_route_retirement(
+                        desired,
+                        checkpoint,
+                        checkpoint_evidence.binding,
+                        gate_predecessor.as_ref(),
+                        cell,
+                    )?
+                    .or(classify_current_global_route_retirement(
+                        desired,
+                        checkpoint,
+                        checkpoint_evidence.binding,
+                        cell,
+                    )?),
+                    _ => None,
+                };
+                if let (Some(session), Some(cell), Some(mode)) =
+                    (session.as_ref(), observed_cell.as_ref(), retirement_mode)
+                {
+                    let physical = if mode == super::RouteRetirementMode::EndpointOnly {
+                        let physical_desired = gate_predecessor.as_ref().context(
+                            "Endpoint-only route retirement lacks its sealed live-gate Desired",
+                        )?;
+                        match validate_retained_running_scan_exact_set(
+                            physical_desired,
+                            checkpoint,
+                            aggregate
+                                .volumes_by_cat
+                                .get(&desired.cat_id)
+                                .map_or(&[], Vec::as_slice),
+                            processes,
+                            networks,
+                            kernel_nbd_pool_admission.as_ref(),
+                        )? {
+                            Some(vmm) => match probe_exact_guest_mounted_set(
+                                guest_ready.as_ref(),
+                                &context,
+                                physical_desired,
+                                checkpoint,
+                                vmm,
+                            ) {
+                                Ok(mounted) => Some((vmm.clone(), mounted)),
+                                Err(_) => {
+                                    context.check_active()?;
+                                    None
+                                }
+                            },
+                            None => None,
+                        }
+                    } else {
+                        None
+                    };
+                    tail.insert_route_retirement(
+                        desired,
+                        checkpoint,
+                        checkpoint_evidence.binding,
+                        checkpoint_content_digest(checkpoint)
+                            .context("digest route-retirement checkpoint")?,
+                        gate_predecessor,
+                        Some(launch_predecessor),
+                        session.generation(),
+                        cell.clone(),
+                        mode,
+                        physical,
+                    )?;
+                    continue;
+                }
+                if desired.target != RuntimeTarget::Running
+                    || checkpoint_evidence.binding != DesiredCheckpointBinding::Current
+                {
+                    continue;
+                }
                 let Some(vmm) = validate_retained_running_scan_exact_set(
                     desired,
                     checkpoint,
@@ -747,6 +827,22 @@ impl RuntimeInventoryScanner for CleanSlateInventoryScanner {
                     kernel_nbd_pool_admission.as_ref(),
                 )?
                 else {
+                    if let (Some(session), Some(cell)) = (session.as_ref(), observed_cell.as_ref())
+                    {
+                        tail.insert_route_retirement(
+                            desired,
+                            checkpoint,
+                            checkpoint_evidence.binding,
+                            checkpoint_content_digest(checkpoint)
+                                .context("digest physically-negative Running checkpoint")?,
+                            gate_predecessor.clone(),
+                            Some(launch_predecessor.clone()),
+                            session.generation(),
+                            cell.clone(),
+                            super::RouteRetirementMode::Global,
+                            None,
+                        )?;
+                    }
                     continue;
                 };
                 let vmm = vmm.clone();
@@ -760,17 +856,32 @@ impl RuntimeInventoryScanner for CleanSlateInventoryScanner {
                     Ok(evidence) => evidence,
                     Err(_) => {
                         // A booting Guest or an earlier Format/Mount phase is
-                        // an exact closed observation, not a reason to starve
-                        // the physical effect that will make it Ready. A
-                        // cancelled/deadline-expired scan is still propagated.
+                        // an exact closed observation. If a process-local cell
+                        // nevertheless exists, its routes remain observable
+                        // and a close-only sidecar owns dispatch; complete
+                        // negative physical evidence can never coexist with a
+                        // publicly absent but actually Active route.
                         context.check_active()?;
+                        if let (Some(session), Some(cell)) =
+                            (session.as_ref(), observed_cell.as_ref())
+                        {
+                            tail.insert_route_retirement(
+                                desired,
+                                checkpoint,
+                                checkpoint_evidence.binding,
+                                checkpoint_content_digest(checkpoint)
+                                    .context("digest Guest-negative Running checkpoint")?,
+                                gate_predecessor.clone(),
+                                Some(launch_predecessor.clone()),
+                                session.generation(),
+                                cell.clone(),
+                                super::RouteRetirementMode::Global,
+                                None,
+                            )?;
+                        }
                         continue;
                     }
                 };
-                let observed_cell = registry
-                    .existing_session(&desired.cat_id)
-                    .context("observe the process-owned Running admission cell")?
-                    .map(|session| session.cell().observe());
                 tail.insert_exact(
                     desired,
                     checkpoint,
@@ -874,7 +985,9 @@ pub(super) fn vmm_process_expectations(
     checkpoint_directory: &std::path::Path,
     checkpoints_by_cat: &BTreeMap<Id, RuntimeCheckpointInventoryEvidence>,
 ) -> anyhow::Result<BTreeMap<Id, super::vmm_process::VmmProcessExpectation>> {
-    vmm_process_expectations_inner(checkpoint_directory, checkpoints_by_cat, false)
+    // A superseded retained Running launch stays an owned process until its
+    // shared AdmissionCell has been closed and retirement can proceed.
+    vmm_process_expectations_inner(checkpoint_directory, checkpoints_by_cat, true)
 }
 
 #[cfg(target_os = "linux")]
@@ -1103,7 +1216,7 @@ pub(super) fn serving_process_expectations(
         checkpoints_by_cat,
         blockd_by_cat,
         volumes_by_cat,
-        false,
+        true,
     )
 }
 
@@ -1151,16 +1264,38 @@ fn serving_process_expectations_inner(
             continue;
         }
         let devices = prepared_device_inputs(&checkpoint.checkpoint)?;
-        anyhow::ensure!(
-            super::network::prepared_device_set_is_exact(desired, &devices),
-            "prepared-device checkpoint does not cover the exact Desired Volume set"
-        );
         let blockds = blockd_by_cat
             .get(&desired.cat_id)
             .context("prepared-device checkpoint lacks AuthorizedBlockd inventory")?;
         anyhow::ensure!(
             blockds.len() == devices.len(),
             "prepared-device checkpoint and AuthorizedBlockd inventory differ in exact size"
+        );
+        let artifact_desired = blockds
+            .values()
+            .next()
+            .map(|blockd| &blockd.checkpoint.desired)
+            .context("prepared-device checkpoint has no AuthorizedBlockd Desired")?;
+        anyhow::ensure!(
+            blockds
+                .values()
+                .all(|blockd| &blockd.checkpoint.desired == artifact_desired),
+            "prepared-device checkpoint has mixed AuthorizedBlockd Desired lineage"
+        );
+        // Once a VMM has launched, AuthorizedBlockd is immutable physical
+        // provenance. Endpoint-only Desired revisions deliberately advance
+        // the checkpoint/cell tuple without rewriting that artifact, so the
+        // process expectation must remain bound to its exact launch Desired.
+        let physical_desired = if checkpoint.checkpoint.runtime_launch.identity().is_some()
+            || checkpoint.binding != DesiredCheckpointBinding::Current
+        {
+            artifact_desired
+        } else {
+            desired
+        };
+        anyhow::ensure!(
+            super::network::prepared_device_set_is_exact(physical_desired, &devices),
+            "prepared-device checkpoint does not cover its exact physical Desired Volume set"
         );
         for prepared in devices {
             let blockd = blockds
@@ -1178,14 +1313,9 @@ fn serving_process_expectations_inner(
                         .find(|volume| volume.record.volume_id == prepared.volume_id)
                 })
                 .context("serving blockd process lacks its raw authority VolumeRecord")?;
-            let expectation_desired = if checkpoint.binding == DesiredCheckpointBinding::Current {
-                desired
-            } else {
-                &blockd.checkpoint.desired
-            };
             let expectation = bridge.serving_expectation(
                 &checkpoint.checkpoint,
-                expectation_desired,
+                physical_desired,
                 &prepared,
                 blockd,
                 &authority.record,
@@ -1452,6 +1582,7 @@ fn runtime_from_inventory(
     let (step, checkpoint_evidence, runtime_incarnation, stable_state, lifecycle_admission) =
         match checkpoint {
             Some(inventory_checkpoint) => {
+                let checkpoint_binding = inventory_checkpoint.binding;
                 let checkpoint = inventory_checkpoint.checkpoint;
                 validate_scanned_checkpoint(
                     desired,
@@ -1484,7 +1615,11 @@ fn runtime_from_inventory(
                     evidence,
                     checkpoint.runtime_incarnation,
                     checkpoint.stable_state,
-                    checkpoint.lifecycle_admission,
+                    if checkpoint_binding == DesiredCheckpointBinding::Superseded {
+                        LifecycleAdmission::Closed
+                    } else {
+                        checkpoint.lifecycle_admission
+                    },
                 )
             }
             None => {
@@ -2078,7 +2213,15 @@ pub(super) fn validate_scanned_checkpoint(
             validate_current_prepared_checkpoint(desired, checkpoint, blockds, false)?;
         }
         _ if checkpoint.runtime_launch.identity().is_some() => {
-            validate_current_launched_checkpoint(desired, checkpoint, blockds)?;
+            if binding == DesiredCheckpointBinding::Current
+                && desired.target == RuntimeTarget::Running
+                && !matches!(checkpoint.step, ReconcileStep::CloseAdmission { .. })
+            {
+                validate_current_launched_checkpoint(desired, checkpoint, blockds)?;
+            } else {
+                let predecessor = super::sealed_running_predecessor(checkpoint, blockds)?;
+                validate_current_launched_checkpoint(&predecessor, checkpoint, blockds)?;
+            }
         }
         ReconcileStep::CleanupRelease { cleanup }
             if binding == DesiredCheckpointBinding::Current =>
@@ -2477,7 +2620,7 @@ mod tests {
     }
 
     #[test]
-    fn current_retained_launch_mints_vmm_expectations_through_running_tail() {
+    fn retained_launch_mints_vmm_expectations_through_running_tail_retirement() {
         let checkpoint = decode_runtime_checkpoint(include_bytes!(concat!(
             env!("CARGO_MANIFEST_DIR"),
             "/../testdata/runtime-reconciliation-v1-start-runtime-checkpoint.json"
@@ -2529,12 +2672,19 @@ mod tests {
             binding: DesiredCheckpointBinding::Superseded,
             ..evidence
         };
-        assert!(vmm_process_expectations(
+        let superseded_expected = vmm_process_expectations(
             std::path::Path::new("/var/lib/cats/checkpoints"),
             &BTreeMap::from([(cat_id, superseded)]),
         )
-        .unwrap()
-        .is_empty());
+        .unwrap();
+        assert_eq!(
+            superseded_expected
+                .values()
+                .next()
+                .unwrap()
+                .launch_identity(),
+            expectation.launch_identity()
+        );
     }
 
     #[test]

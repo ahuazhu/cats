@@ -34,7 +34,8 @@ pub use runner::{
     RuntimeSpineRunError, RuntimeSpineRunRetry, RuntimeSpineRunStep, RuntimeSpineRunner,
 };
 pub(crate) use runner::{
-    RuntimePreScanRecovery, RuntimePreScanRecoveryContext, RuntimePreScanRecoveryOutcome,
+    RuntimePreScanAdmission, RuntimePreScanAdmissionContext, RuntimePreScanRecovery,
+    RuntimePreScanRecoveryContext, RuntimePreScanRecoveryOutcome,
 };
 pub(crate) use state::RuntimeSpineJournal;
 pub use state::{
