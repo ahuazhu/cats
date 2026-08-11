@@ -48,7 +48,7 @@ use super::clean_slate_probes::{
 };
 use super::network::{prepare_network_volume_admission_is_exact, prepared_device_input};
 use super::prepare_device_retirement::prepare_device_base_admission_is_exact;
-use super::root_provision_process::NodeGlobalManagedProcessScanAdmission;
+use super::root_provision_process::{ManagedServingKey, NodeGlobalManagedProcessScanAdmission};
 use super::serving_blockd_process::ServingBlockdListenerProof;
 use super::serving_handoff::ServingHandoffStore;
 use super::serving_handoff_effect::checkpoint_is_current_exact;
@@ -469,7 +469,7 @@ pub(crate) enum KernelNbdDeviceScanState {
 /// checkpoint namespace and physical pool scan.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct KernelNbdPoolScanAdmission {
-    devices_by_cat: BTreeMap<Id, KernelNbdDeviceScanState>,
+    devices_by_key: BTreeMap<ManagedServingKey, KernelNbdDeviceScanState>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -491,7 +491,7 @@ pub(crate) struct KernelNbdPoolAdmission {
     inventory_epoch: Epoch,
     inventory_digest: Sha256Digest,
     inventory_read_position: Sequence,
-    devices_by_cat: BTreeMap<Id, KernelNbdDeviceScanState>,
+    devices_by_key: BTreeMap<ManagedServingKey, KernelNbdDeviceScanState>,
 }
 
 impl KernelNbdPoolScanAdmission {
@@ -518,9 +518,10 @@ impl KernelNbdPoolScanAdmission {
     ) -> Result<KernelNbdPoolAdmission> {
         let expected = Self::expectation_for_test(checkpoint)?;
         expected.assert_serving_listener(&listener)?;
+        let key = ManagedServingKey::new(expected.cat_id.clone(), expected.volume_id.clone());
         Self {
-            devices_by_cat: BTreeMap::from([(
-                checkpoint.cat_id.clone(),
+            devices_by_key: BTreeMap::from([(
+                key,
                 KernelNbdDeviceScanState::Absent {
                     expected,
                     listener: Some(listener),
@@ -549,33 +550,37 @@ impl KernelNbdPoolScanAdmission {
             size_sectors: expected.expected_size_sectors,
         };
         let proof = ExactKernelNbdDeviceProof::new(expected, client, listener)?;
+        let key = ManagedServingKey::new(
+            proof.expected.cat_id.clone(),
+            proof.expected.volume_id.clone(),
+        );
         Self {
-            devices_by_cat: BTreeMap::from([(
-                checkpoint.cat_id.clone(),
-                KernelNbdDeviceScanState::Exact(proof),
-            )]),
+            devices_by_key: BTreeMap::from([(key, KernelNbdDeviceScanState::Exact(proof))]),
         }
         .bind(observation)
     }
 
     pub(crate) fn has_unavailable_device(&self) -> bool {
-        self.devices_by_cat
+        self.devices_by_key
             .values()
             .any(|state| matches!(state, KernelNbdDeviceScanState::Unavailable { .. }))
     }
 
-    pub(crate) fn device_projections(&self) -> BTreeMap<Id, (Id, ObservedDevice)> {
-        self.devices_by_cat
-            .iter()
-            .filter_map(|(cat_id, state)| match state {
-                KernelNbdDeviceScanState::Exact(proof) => {
-                    Some((cat_id.clone(), proof.projection()))
-                }
-                KernelNbdDeviceScanState::Absent { .. }
-                | KernelNbdDeviceScanState::Leaked { .. }
-                | KernelNbdDeviceScanState::Unavailable { .. } => None,
-            })
-            .collect()
+    pub(crate) fn device_projections(&self) -> BTreeMap<Id, BTreeMap<Id, ObservedDevice>> {
+        let mut projections = BTreeMap::<Id, BTreeMap<Id, ObservedDevice>>::new();
+        for (key, state) in &self.devices_by_key {
+            let KernelNbdDeviceScanState::Exact(proof) = state else {
+                continue;
+            };
+            let (volume_id, device) = proof.projection();
+            debug_assert_eq!(&volume_id, key.volume_id());
+            let previous = projections
+                .entry(key.cat_id().clone())
+                .or_default()
+                .insert(volume_id, device);
+            debug_assert!(previous.is_none(), "typed kernel-NBD keys are unique");
+        }
+        projections
     }
 
     pub(crate) fn bind(self, observation: &NodeObservation) -> Result<KernelNbdPoolAdmission> {
@@ -599,7 +604,7 @@ impl KernelNbdPoolScanAdmission {
             inventory_epoch: observation.inventory_epoch,
             inventory_digest,
             inventory_read_position,
-            devices_by_cat: self.devices_by_cat,
+            devices_by_key: self.devices_by_key,
         })
     }
 }
@@ -617,12 +622,17 @@ impl KernelNbdPoolAdmission {
             && observation.inventory_read_position == Some(self.inventory_read_position)
     }
 
-    pub(crate) fn device(&self, cat_id: &Id) -> Option<&KernelNbdDeviceScanState> {
-        self.devices_by_cat.get(cat_id)
+    pub(crate) fn device(&self, cat_id: &Id, volume_id: &Id) -> Option<&KernelNbdDeviceScanState> {
+        self.devices_by_key
+            .get(&ManagedServingKey::new(cat_id.clone(), volume_id.clone()))
     }
 
-    pub(crate) fn exact_device(&self, cat_id: &Id) -> Option<&ExactKernelNbdDeviceProof> {
-        match self.device(cat_id) {
+    pub(crate) fn exact_device(
+        &self,
+        cat_id: &Id,
+        volume_id: &Id,
+    ) -> Option<&ExactKernelNbdDeviceProof> {
+        match self.device(cat_id, volume_id) {
             Some(KernelNbdDeviceScanState::Exact(proof)) => Some(proof),
             _ => None,
         }
@@ -1158,8 +1168,8 @@ impl KernelNbdInventoryPort {
         let reservations = KernelNbdReservations::from_snapshot(&namespace)?;
         let expected = device_expectations_from_namespace(&namespace)?
             .into_values()
-            .find(|expected| expected.cat_id == stored.checkpoint().cat_id)
-            .context("PrepareNetwork lacks its exact kernel-NBD device expectation")?;
+            .find(|expected| expected == &admitted.expected)
+            .context("PrepareNetwork lacks the admitted Cat/Volume kernel-NBD expectation")?;
         anyhow::ensure!(
             admitted.expected == expected,
             "accepted kernel-NBD proof changed its persisted device expectation"
@@ -1272,7 +1282,7 @@ impl KernelNbdInventoryPort {
                 "persisted kernel-NBD device contracts and durable reservations disagree"
             );
 
-            let mut devices_by_cat = BTreeMap::new();
+            let mut devices_by_key = BTreeMap::new();
             for (device_path, slot) in permit.snapshot().iter() {
                 let reservation = reservations.by_device.get(device_path);
                 let expected = expectations.get(device_path);
@@ -1342,21 +1352,21 @@ impl KernelNbdInventoryPort {
                         expected: expected.clone(),
                     },
                 };
+                let key =
+                    ManagedServingKey::new(expected.cat_id.clone(), expected.volume_id.clone());
                 anyhow::ensure!(
-                    devices_by_cat
-                        .insert(expected.cat_id.clone(), state)
-                        .is_none(),
-                    "kernel-NBD pool admission contains multiple devices for one V1 Cat"
+                    devices_by_key.insert(key, state).is_none(),
+                    "kernel-NBD pool admission contains duplicate devices for one Cat/Volume"
                 );
             }
             anyhow::ensure!(
-                devices_by_cat.len() == expectations.len(),
+                devices_by_key.len() == expectations.len(),
                 "kernel-NBD pool scan omitted a durable reservation"
             );
             permit.assert_current_scan_paths(&namespace)?;
             context.check_active()?;
             Ok(KernelNbdPoolScanOutcome::Complete(
-                KernelNbdPoolScanAdmission { devices_by_cat },
+                KernelNbdPoolScanAdmission { devices_by_key },
             ))
         })();
         let released = permit
@@ -2026,8 +2036,9 @@ impl KernelNbdAttachEffect {
             runtimes.next().is_none(),
             "kernel-NBD admission duplicates one Cat"
         );
-        let prepare_network_device = match &runtime.step {
+        let (prepare_network_device, selected_volume_id) = match &runtime.step {
             ReconcileStep::PrepareDevice {
+                volume_id,
                 frontend: PrepareDeviceFrontend::KernelNbd { .. },
                 ..
             } => {
@@ -2036,7 +2047,7 @@ impl KernelNbdAttachEffect {
                         RuntimeDesiredEffectStopReason::LocalContract,
                     )));
                 }
-                None
+                (None, volume_id)
             }
             ReconcileStep::PrepareNetwork { network, devices } => {
                 let [device] = devices.as_slice() else {
@@ -2066,7 +2077,7 @@ impl KernelNbdAttachEffect {
                         RuntimeDesiredEffectStopReason::LocalContract,
                     )));
                 }
-                Some(device)
+                (Some(device), &device.volume_id)
             }
             _ => return Ok(None),
         };
@@ -2089,8 +2100,8 @@ impl KernelNbdAttachEffect {
         );
 
         let state = admission
-            .device(&desired.cat_id)
-            .context("kernel-NBD accepted full lacks this Cat's durable reservation")?;
+            .device(&desired.cat_id, selected_volume_id)
+            .context("kernel-NBD accepted full lacks this Cat/Volume durable reservation")?;
         let prepare_network_contract_is_exact = match (prepare_network_device, state) {
             (None, _) => true,
             (Some(device), KernelNbdDeviceScanState::Exact(proof)) => {
@@ -2868,10 +2879,11 @@ mod tests {
         AcquireOrigin, AdmissionInventoryAttestation, AgentSession, AssignedKind,
         AssignedPlacement, ContractVersion, DesiredReadSnapshot, DesiredRuntimeSpec, DiskKind,
         Durability, Epoch, FenceEpoch, Generation, GuestDeviceIdentity, GuestTransportEvidence,
-        Ipv4Address, IsolatedIpv4Kind, LifecycleAdmission, MacAddress, NetworkConfig, NodeBootId,
-        NodeObservation, RemoteHead, RequireIdleCheckpoint, Revision, RuntimeConfig, RuntimeTarget,
+        Ipv4Address, IsolatedIpv4Kind, LifecycleAdmission, LocalLineageState, LocalVolumeLineage,
+        MacAddress, NetworkConfig, NodeBootId, NodeObservation, ObservedDiskKind, ObservedVolume,
+        RemoteHead, RequireIdleCheckpoint, Revision, RuntimeConfig, RuntimeTarget,
         RuntimeTransition, Sequence, ServingAuthorityProvenance, ServingBlockdIdentity,
-        SessionBinding, Sha256Digest, UnixMillis, WarmSnapshotEvidence,
+        SessionBinding, Sha256Digest, UnixMillis, VolumeAuthorityEvidence, WarmSnapshotEvidence,
     };
     use tempfile::TempDir;
 
@@ -3343,6 +3355,39 @@ mod tests {
         }
     }
 
+    fn observed_prepared_volume(device: &PreparedDeviceInput) -> ObservedVolume {
+        ObservedVolume {
+            volume_intent_id: Some(device.volume_intent_id.clone()),
+            disk_id: Some(device.disk_id.clone()),
+            volume_id: device.volume_id.clone(),
+            disk_kind: match device.disk_kind {
+                DiskKind::Root => ObservedDiskKind::Root,
+                DiskKind::Persistent => ObservedDiskKind::Persistent,
+            },
+            size_bytes: Some(device.size_bytes),
+            durability: Some(device.durability),
+            authority: VolumeAuthorityEvidence::Owned {
+                attachment_id: device.attachment_id.clone(),
+                attachment_epoch: device.attachment_epoch,
+                head: device.expected_head.clone(),
+            },
+            local_lineages: vec![LocalVolumeLineage {
+                attachment_id: device.attachment_id.clone(),
+                attachment_epoch: device.attachment_epoch,
+                acquire_origin: device.acquire_origin.clone(),
+                node_id: id("node_a"),
+                placement_epoch: Epoch::new(1).unwrap(),
+                local_durable_generation: device.expected_head.generation,
+                remote_durable_generation: device.expected_head.generation,
+                data_directory: device.serving_process.data_directory.clone(),
+                pending_pack_count: WireU64::new(0).unwrap(),
+                fenced: false,
+                state: LocalLineageState::Active,
+            }],
+            devices: Vec::new(),
+        }
+    }
+
     fn desired(cat: &str) -> DesiredRuntimeSpec {
         DesiredRuntimeSpec {
             version: ContractVersion::V1,
@@ -3555,7 +3600,9 @@ mod tests {
             panic!("free reserved slot must form an explicit Absent admission")
         };
         assert!(matches!(
-            absent.devices_by_cat.get(&id("cat_a")),
+            absent
+                .devices_by_key
+                .get(&ManagedServingKey::new(id("cat_a"), id("vol_a"))),
             Some(KernelNbdDeviceScanState::Absent { listener: None, .. })
         ));
         assert!(absent.device_projections().is_empty());
@@ -3569,7 +3616,9 @@ mod tests {
             panic!("reserved uncertain slot must retain its typed state")
         };
         assert!(matches!(
-            unavailable.devices_by_cat.get(&id("cat_a")),
+            unavailable
+                .devices_by_key
+                .get(&ManagedServingKey::new(id("cat_a"), id("vol_a"))),
             Some(KernelNbdDeviceScanState::Unavailable { .. })
         ));
         assert!(unavailable.has_unavailable_device());
@@ -3605,6 +3654,99 @@ mod tests {
                 "PrepareNetwork lost its persisted kernel-NBD reservation",
             )
             .unwrap();
+    }
+
+    #[test]
+    fn complete_pool_scan_retains_two_kernel_nbd_volumes_for_one_cat() {
+        let fixture = Fixture::new(2);
+        let root = checkpoint("cat_a", "vol_root", "/dev/nbd0", '6');
+        let mut persistent = checkpoint("cat_a", "vol_persistent", "/dev/nbd1", '7');
+        let ReconcileStep::PrepareDevice {
+            volume_intent_id,
+            disk_id,
+            disk_kind,
+            attachment_id,
+            guest_device,
+            serving_authority,
+            serving_process,
+            frontend,
+            ..
+        } = &mut persistent.step
+        else {
+            unreachable!()
+        };
+        *volume_intent_id = id("intent_persistent");
+        *disk_id = id("disk_persistent");
+        *disk_kind = DiskKind::Persistent;
+        *attachment_id = id("att_persistent");
+        guest_device.serial = id("cats-persistent");
+        guest_device.slot = 1;
+        let ServingAuthorityProvenance::DirectAuthorizedAttachment {
+            authorization,
+            purpose,
+        } = serving_authority.as_mut()
+        else {
+            unreachable!()
+        };
+        authorization.path = host("/var/lib/cats/persistent-authorized-serving.json");
+        *purpose = cats_api::runtime_reconciliation::DirectAuthorizedAttachmentPurpose::PersistentInitialized;
+        serving_process.scope_id = id("cats-serving-persistent.service");
+        serving_process.control_socket_path = host("/run/cats/persistent-control.sock");
+        serving_process.data_directory = host("/var/lib/cats/persistent-data");
+        serving_process.process_identity_token = random('8');
+        let PrepareDeviceFrontend::KernelNbd {
+            listener_socket_path,
+            ..
+        } = frontend
+        else {
+            unreachable!()
+        };
+        *listener_socket_path = host("/run/cats/persistent-nbd.sock");
+
+        let root_device = super::super::network::prepared_device_input(&root).unwrap();
+        let persistent_device = super::super::network::prepared_device_input(&persistent).unwrap();
+        let mut successor = root.clone();
+        successor.step = ReconcileStep::PrepareNetwork {
+            network: cats_api::runtime_reconciliation::RuntimeNetworkIdentity {
+                network_config: desired("cat_a").runtime.network_config,
+                tap_name: id("cata00000001"),
+                ownership_token: random('9'),
+            },
+            devices: vec![root_device.clone(), persistent_device.clone()],
+        };
+        successor.volumes = vec![
+            observed_prepared_volume(&root_device),
+            observed_prepared_volume(&persistent_device),
+        ];
+        successor
+            .volumes
+            .sort_by(|left, right| left.volume_id.cmp(&right.volume_id));
+        let store =
+            FileCheckpointStore::open(&fixture.state.join(CHECKPOINT_NAMESPACE), &successor.cat_id)
+                .unwrap();
+        store.create(&successor).unwrap();
+        let processes = NodeGlobalManagedProcessScanAdmission::from_root_controls(
+            BTreeMap::new(),
+            BTreeMap::new(),
+        )
+        .unwrap();
+
+        let KernelNbdPoolScanOutcome::Complete(admission) =
+            KernelNbdInventoryPort::new(fixture.config(2))
+                .scan_complete_pool(&inventory_scan_context(&["cat_a"]), &processes)
+                .unwrap()
+        else {
+            panic!("two free durable reservations must form complete admission")
+        };
+        for volume in ["vol_root", "vol_persistent"] {
+            assert!(matches!(
+                admission
+                    .devices_by_key
+                    .get(&ManagedServingKey::new(id("cat_a"), id(volume),)),
+                Some(KernelNbdDeviceScanState::Absent { listener: None, .. })
+            ));
+        }
+        assert_eq!(admission.devices_by_key.len(), 2);
     }
 
     #[test]

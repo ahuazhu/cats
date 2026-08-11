@@ -289,7 +289,7 @@ impl StartRuntimeReservationEffect {
                         "StartRuntime kernel-NBD admission is not bound to the accepted full observation"
                     );
                     let exact = pool
-                        .exact_device(&desired.cat_id)
+                        .exact_device(&desired.cat_id, &device.volume_id)
                         .context("StartRuntime lacks an exact kernel-NBD device proof")?;
                     if exact.listener().expectation() != expectation
                         || !exact.matches_prepared_device(&desired.cat_id, device)
@@ -726,7 +726,7 @@ impl StartRuntimePhysicalEffect {
                         "physical StartRuntime kernel-NBD proof is not admission-bound"
                     );
                     let exact = pool
-                        .exact_device(&desired.cat_id)
+                        .exact_device(&desired.cat_id, &device.volume_id)
                         .context("physical StartRuntime lacks exact kernel-NBD device")?;
                     if exact.listener().expectation() != serving_expectation
                         || !exact.matches_prepared_device(&desired.cat_id, device)

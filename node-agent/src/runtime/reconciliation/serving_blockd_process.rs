@@ -1120,14 +1120,21 @@ fn accepted_devices_are_compatible(
     expected: &ServingBlockdExpectation,
     admitted_exact: Option<&ExactServingBlockdProcessProof>,
 ) -> anyhow::Result<bool> {
-    let Some(volume) = runtime.volumes.first() else {
+    let Some(volume) = runtime
+        .volumes
+        .iter()
+        .find(|volume| volume.volume_id == *expected.volume_id())
+    else {
         return Ok(false);
     };
     match &expected.frontend {
         PrepareDeviceFrontend::KernelNbd { .. } => match volume.devices.as_slice() {
             [] => Ok(true),
             [observed] if admitted_exact.is_some() => {
-                let Some(exact) = context.kernel_nbd_pool()?.exact_device(expected.cat_id()) else {
+                let Some(exact) = context
+                    .kernel_nbd_pool()?
+                    .exact_device(expected.cat_id(), expected.volume_id())
+                else {
                     return Ok(false);
                 };
                 let (volume_id, projected) = exact.projection();

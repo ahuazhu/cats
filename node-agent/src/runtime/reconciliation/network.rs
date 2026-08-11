@@ -1020,7 +1020,7 @@ impl PrepareNetworkReservationEffect {
             PrepareDeviceFrontend::KernelNbd { .. } => {
                 let exact = context
                     .kernel_nbd_pool()?
-                    .exact_device(&desired.cat_id)
+                    .exact_device(&desired.cat_id, &prepared.volume_id)
                     .context("PrepareNetwork lacks exact kernel-NBD client proof")?;
                 anyhow::ensure!(
                     exact.listener().expectation() == expectation,
@@ -1149,7 +1149,7 @@ impl PrepareNetworkReservationEffect {
                 PrepareDeviceFrontend::KernelNbd { .. } => {
                     let exact = context
                         .kernel_nbd_pool()?
-                        .exact_device(&desired.cat_id)
+                        .exact_device(&desired.cat_id, &device.volume_id)
                         .context("PrepareNetwork lacks exact kernel-NBD client proof")?;
                     if exact.listener().expectation() != expectation
                         || !exact.matches_prepared_device(&desired.cat_id, device)

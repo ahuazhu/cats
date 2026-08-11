@@ -569,16 +569,17 @@ impl RuntimeInventoryScanner for CleanSlateInventoryScanner {
                                 .unavailable_sources
                                 .push(InventorySource::BlockFrontend);
                         }
-                        for (cat_id, projection) in admission.device_projections() {
-                            let (volume_id, device) = projection;
-                            anyhow::ensure!(
-                                serving_devices_by_cat
-                                    .entry(cat_id)
-                                    .or_default()
-                                    .insert(volume_id, device)
-                                    .is_none(),
-                                "managed frontend scan projects two devices for one Volume"
-                            );
+                        for (cat_id, projections) in admission.device_projections() {
+                            for (volume_id, device) in projections {
+                                anyhow::ensure!(
+                                    serving_devices_by_cat
+                                        .entry(cat_id.clone())
+                                        .or_default()
+                                        .insert(volume_id, device)
+                                        .is_none(),
+                                    "managed frontend scan projects two devices for one Volume"
+                                );
+                            }
                         }
                         kernel_nbd_pool_admission = Some(admission);
                     }
