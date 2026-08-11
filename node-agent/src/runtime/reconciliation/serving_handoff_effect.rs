@@ -413,7 +413,13 @@ impl ServingPrepareDeviceEffect {
                             &self.executable_path,
                         )
                     },
-                    || self.revalidate_retained_authorizations(context, desired, 0, &prepared),
+                    || {
+                        #[cfg(test)]
+                        if let Some(hook) = &self.before_replace {
+                            hook();
+                        }
+                        self.revalidate_retained_authorizations(context, desired, 0, &prepared)
+                    },
                 )?;
             }
             #[cfg(not(target_os = "linux"))]
@@ -453,6 +459,10 @@ impl ServingPrepareDeviceEffect {
                     &self.executable_path,
                 )?;
                 context.check_active()?;
+                #[cfg(test)]
+                if let Some(hook) = &self.before_replace {
+                    hook();
+                }
                 revalidate_checkpoint_namespace(
                     &state_root,
                     CHECKPOINT_NAMESPACE,
@@ -576,7 +586,13 @@ impl ServingPrepareDeviceEffect {
                             frontends,
                         )
                     },
-                    || self.revalidate_retained_authorizations(context, desired, 1, &persistent),
+                    || {
+                        #[cfg(test)]
+                        if let Some(hook) = &self.before_replace {
+                            hook();
+                        }
+                        self.revalidate_retained_authorizations(context, desired, 1, &persistent)
+                    },
                 )
                 .map(|_| ()),
             #[cfg(not(target_os = "linux"))]
@@ -1910,4 +1926,459 @@ fn process_conflict(
     problem: RootProvisionProcessConflict,
 ) -> anyhow::Error {
     anyhow::anyhow!("root-provision process conflict {boundary}: {problem:?}")
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::BTreeMap;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Mutex;
+    use std::time::{Duration, Instant};
+
+    use cats_api::runtime_reconciliation::{
+        checkpoint_content_digest, spec_digest, AcquireOrigin, AdmissionInventoryAttestation,
+        AgentSession, AssignedKind, AssignedPlacement, Durability, Epoch, Ext4MountIntent,
+        FenceEpoch, FilesystemInitialization, Generation, GuestDeviceIdentity, Ipv4Address,
+        IsolatedIpv4Kind, MacAddress, NetworkConfig, NodeBootId, NodeObservation,
+        NormalAcquireRequest, NormalAcquireResult, Revision, RuntimeConfig, RuntimeLaunch,
+        Sequence, Sha256Digest, VolumeAdminState,
+    };
+    use cats_storage::authority::{
+        AuthorityError, AuthorizedServingAcquire, AuthorizedServingAttachment, RenewLeaseRequest,
+        RenewLeaseResult, VolumeHeadCasRequest, VolumeHeadCasResult,
+    };
+
+    use crate::runtime_spine::{RuntimeDesiredEffectAdmission, RuntimeDesiredEffectContext};
+    use crate::state_directory::StateDirectory;
+
+    use super::super::signed_running::prepared_owned_observed_volume;
+    use super::*;
+
+    fn id(value: &str) -> Id {
+        Id::new(value).unwrap()
+    }
+
+    fn random(value: char) -> RandomId128 {
+        RandomId128::new(std::iter::repeat_n(value, 32).collect::<String>()).unwrap()
+    }
+
+    fn epoch(value: u64) -> Epoch {
+        Epoch::new(value).unwrap()
+    }
+
+    fn fence(value: u64) -> FenceEpoch {
+        FenceEpoch::new(value).unwrap()
+    }
+
+    fn unix_ms(value: u64) -> UnixMillis {
+        UnixMillis::new(value).unwrap()
+    }
+
+    fn head(
+        generation: u64,
+        value: u8,
+        object: &str,
+    ) -> cats_api::runtime_reconciliation::RemoteHead {
+        cats_api::runtime_reconciliation::RemoteHead {
+            generation: Generation::new(generation).unwrap(),
+            root_hash: Some(Sha256Digest::from_bytes([value; 32])),
+            root_object_id: Some(cats_api::runtime_reconciliation::AsciiText::new(object).unwrap()),
+        }
+    }
+
+    fn desired() -> DesiredRuntimeSpec {
+        let mut desired = DesiredRuntimeSpec {
+            version: ContractVersion::V1,
+            workspace_id: id("ws_01"),
+            cat_id: id("cat_01"),
+            desired_revision: Revision::new(4).unwrap(),
+            target: RuntimeTarget::Running,
+            placement: AssignedPlacement {
+                kind: AssignedKind::Assigned,
+                node_id: id("node_a"),
+                placement_epoch: epoch(3),
+            },
+            runtime: RuntimeConfig {
+                vcpus: 2,
+                memory_bytes: 2 * 1024 * 1024 * 1024,
+                boot_image_digest: Sha256Digest::from_bytes([1; 32]),
+                guest_config_digest: Sha256Digest::from_bytes([2; 32]),
+                network_config: NetworkConfig {
+                    kind: IsolatedIpv4Kind::IsolatedIpv4,
+                    network_id: id("net_01"),
+                    guest_mac: MacAddress::new("02:ca:0a:f0:00:06").unwrap(),
+                    guest_ipv4: Ipv4Address::new("10.240.0.6").unwrap(),
+                    prefix_length: 30,
+                    gateway_ipv4: Ipv4Address::new("10.240.0.5").unwrap(),
+                },
+            },
+            volumes: vec![
+                VolumeIntent {
+                    volume_intent_id: id("intent_0_root"),
+                    disk_id: id("disk_0_root"),
+                    volume_id: id("vol_0_root"),
+                    attachment_id: id("att_0_root"),
+                    size_bytes: 4 * 1024 * 1024,
+                    disk_kind: DiskKind::Root,
+                    access: VolumeAccess::ReadWriteOnce,
+                    durability: Durability::Strict,
+                    guest_device: GuestDeviceIdentity {
+                        serial: id("cats-root"),
+                        slot: 0,
+                    },
+                    acquire: VolumeAcquire::Normal {
+                        transition_id: random('1'),
+                        expected_unowned_epoch: fence(0),
+                    },
+                    disposition: VolumeDisposition::Retain,
+                    mount: None,
+                },
+                VolumeIntent {
+                    volume_intent_id: id("intent_1_persistent"),
+                    disk_id: id("disk_1_persistent"),
+                    volume_id: id("vol_1_persistent"),
+                    attachment_id: id("att_1_persistent"),
+                    size_bytes: 4 * 1024 * 1024,
+                    disk_kind: DiskKind::Persistent,
+                    access: VolumeAccess::ReadWriteOnce,
+                    durability: Durability::Strict,
+                    guest_device: GuestDeviceIdentity {
+                        serial: id("cats-persistent"),
+                        slot: 1,
+                    },
+                    acquire: VolumeAcquire::Normal {
+                        transition_id: random('2'),
+                        expected_unowned_epoch: fence(4),
+                    },
+                    disposition: VolumeDisposition::Retain,
+                    mount: Some(Ext4MountIntent {
+                        filesystem_uuid: random('3'),
+                        mount_path: HostPath::new("/srv/cats/persistent").unwrap(),
+                        initialization: FilesystemInitialization::Existing,
+                    }),
+                },
+            ],
+            endpoints: Vec::new(),
+            transition: RuntimeTransition::CancelAndDrain,
+            spec_digest: Sha256Digest::from_bytes([0; 32]),
+        };
+        desired.spec_digest = spec_digest(&desired).unwrap();
+        desired
+    }
+
+    fn attachment(
+        desired: &DesiredRuntimeSpec,
+        volume: &VolumeIntent,
+        current_head: cats_api::runtime_reconciliation::RemoteHead,
+    ) -> AuthorizedServingAttachment {
+        let VolumeAcquire::Normal {
+            transition_id,
+            expected_unowned_epoch,
+        } = &volume.acquire
+        else {
+            unreachable!()
+        };
+        let request = NormalAcquireRequest {
+            volume_id: volume.volume_id.clone(),
+            transition_id: transition_id.clone(),
+            attachment_id: volume.attachment_id.clone(),
+            expected_unowned_epoch: *expected_unowned_epoch,
+            desired_revision: desired.desired_revision,
+            placement_epoch: desired.placement.placement_epoch,
+            lease_duration_ms: 60_000,
+        };
+        let result = NormalAcquireResult {
+            volume_id: volume.volume_id.clone(),
+            transition_id: transition_id.clone(),
+            attachment_id: volume.attachment_id.clone(),
+            resulting_epoch: fence(expected_unowned_epoch.get() + 1),
+            resulting_head: current_head.clone(),
+            lease_expires_at: unix_ms(1_900_000_060_000),
+        };
+        AuthorizedServingAttachment {
+            identity: AttachmentLineageIdentity {
+                volume_id: volume.volume_id.clone(),
+                attachment_id: volume.attachment_id.clone(),
+                attachment_epoch: result.resulting_epoch,
+                acquire_origin: AcquireOrigin::Normal {
+                    transition_id: transition_id.clone(),
+                },
+                node_id: desired.placement.node_id.clone(),
+                placement_epoch: desired.placement.placement_epoch,
+            },
+            size_bytes: volume.size_bytes,
+            durability: volume.durability,
+            head: current_head,
+            lease_expires_at: result.lease_expires_at,
+            acquire: AuthorizedServingAcquire::Normal { request, result },
+        }
+    }
+
+    fn record(attachment: &AuthorizedServingAttachment) -> VolumeRecord {
+        VolumeRecord {
+            volume_id: attachment.identity.volume_id.clone(),
+            size_bytes: attachment.size_bytes,
+            durability: attachment.durability,
+            admin_state: VolumeAdminState::Active,
+            head: attachment.head.clone(),
+            lease_owner: Some(attachment.identity.attachment_id.clone()),
+            lease_epoch: attachment.identity.attachment_epoch,
+            lease_expires_at: Some(attachment.lease_expires_at),
+            last_transition: Some(attachment.expected_last_transition()),
+        }
+    }
+
+    struct MapAuthority {
+        records: Mutex<BTreeMap<Id, VolumeRecord>>,
+        loads: AtomicUsize,
+    }
+
+    impl VolumeDataAuthority for MapAuthority {
+        fn load_volume(&self, volume_id: &Id) -> Result<VolumeRecord, AuthorityError> {
+            self.loads.fetch_add(1, Ordering::SeqCst);
+            self.records
+                .lock()
+                .unwrap()
+                .get(volume_id)
+                .cloned()
+                .ok_or(AuthorityError::NotFound)
+        }
+
+        fn renew_lease(
+            &self,
+            _request: &RenewLeaseRequest,
+        ) -> Result<RenewLeaseResult, AuthorityError> {
+            unreachable!()
+        }
+
+        fn compare_and_swap_head(
+            &self,
+            _request: &VolumeHeadCasRequest,
+        ) -> Result<VolumeHeadCasResult, AuthorityError> {
+            unreachable!()
+        }
+    }
+
+    fn accepted_context(
+        root: &std::path::Path,
+        desired: &DesiredRuntimeSpec,
+        stored: &StoredCheckpoint,
+    ) -> RuntimeDesiredEffectContext {
+        let session = AgentSession {
+            version: ContractVersion::V1,
+            node_id: desired.placement.node_id.clone(),
+            immutable_host_id: id("host_a"),
+            node_boot_id: NodeBootId::new("33333333333333333333333333333333").unwrap(),
+            agent_instance_id: random('4'),
+            agent_session_epoch: epoch(2),
+            registration_attempt_id: random('5'),
+            guest_config_digest: desired.runtime.guest_config_digest.clone(),
+            lease_deadline_unix_ms: unix_ms(1_900_000_120_000),
+        };
+        let attestation = AdmissionInventoryAttestation {
+            version: ContractVersion::V1,
+            node_id: session.node_id.clone(),
+            agent_session_epoch: session.agent_session_epoch,
+            inventory_epoch: epoch(4),
+            inventory_digest: Sha256Digest::from_bytes([7; 32]),
+            inventory_read_position: Sequence::new(12).unwrap(),
+            accepted_at_unix_ms: unix_ms(1_900_000_000_000),
+        };
+        let checkpoint = stored.checkpoint();
+        let step = checkpoint.step.clone();
+        let runtime = ObservedRuntimeStatus {
+            cat_id: desired.cat_id.clone(),
+            applied_desired: Some(AppliedDesiredEvidence {
+                desired_revision: desired.desired_revision,
+                spec_digest: desired.spec_digest.clone(),
+                placement: desired.placement.clone(),
+                target: desired.target,
+            }),
+            runtime_incarnation: None,
+            stable_state: None,
+            step: step.clone(),
+            checkpoint: CheckpointEvidence::Valid {
+                checkpoint_path: HostPath::new(
+                    super::super::runtime_checkpoint_path(
+                        &root.join(CHECKPOINT_NAMESPACE),
+                        &desired.cat_id,
+                    )
+                    .to_str()
+                    .unwrap()
+                    .to_owned(),
+                )
+                .unwrap(),
+                content_digest: stored.content_digest().clone(),
+                version: checkpoint.version,
+                cat_id: checkpoint.cat_id.clone(),
+                node_id: checkpoint.node_id.clone(),
+                desired_revision: checkpoint.desired_revision,
+                spec_digest: checkpoint.spec_digest.clone(),
+                placement_epoch: checkpoint.placement_epoch,
+                runtime_incarnation: None,
+                runtime_launch: Box::new(RuntimeLaunch::Absent),
+                stable_state: None,
+                step: Box::new(step.clone()),
+                require_idle: Box::new(checkpoint.require_idle.clone()),
+                updated_at_unix_ms: checkpoint.updated_at_unix_ms,
+            },
+            processes: Vec::new(),
+            volumes: checkpoint.volumes.clone(),
+            mounts: Vec::new(),
+            networks: Vec::new(),
+            guest_transport: GuestTransportEvidence::Unavailable,
+            warm_snapshot: WarmSnapshotEvidence::Absent,
+            lifecycle_admission: LifecycleAdmission::Closed,
+            routes: Vec::new(),
+            platform_guards: 0,
+            conditions: vec![Condition::Progressing {
+                reason: ProgressingReason::ReconcileStep { step },
+            }],
+        };
+        let observation = NodeObservation {
+            version: ContractVersion::V1,
+            observation_id: random('6'),
+            node_id: session.node_id.clone(),
+            node_boot_id: session.node_boot_id.clone(),
+            agent_instance_id: session.agent_instance_id.clone(),
+            agent_session_epoch: session.agent_session_epoch,
+            heartbeat_sequence: Sequence::new(9).unwrap(),
+            observed_at_unix_ms: unix_ms(1_899_999_999_000),
+            complete_inventory: true,
+            inventory_epoch: attestation.inventory_epoch,
+            inventory_digest: Some(attestation.inventory_digest.clone()),
+            inventory_read_position: Some(attestation.inventory_read_position),
+            key_ring_version: None,
+            key_ring_digest: None,
+            loaded_kids: Vec::new(),
+            runtimes: vec![runtime],
+            residue: Vec::new(),
+        };
+        RuntimeDesiredEffectContext::for_test_with_admission(
+            StateDirectory::unanchored(root.to_path_buf()),
+            Instant::now() + Duration::from_secs(30),
+            RuntimeDesiredEffectAdmission::for_test(session, observation, attestation),
+        )
+    }
+
+    #[test]
+    fn nth_retained_authority_drift_has_zero_prepare_device_cas() {
+        let root = tempfile::tempdir().unwrap();
+        let desired = desired();
+        let root_attachment = attachment(&desired, &desired.volumes[0], head(2, 8, "roots/root-2"));
+        let persistent_attachment = attachment(
+            &desired,
+            &desired.volumes[1],
+            head(3, 9, "roots/persistent-3"),
+        );
+        let blockd = AuthorizedBlockdStore::new(StateDirectory::unanchored(root.path().into()));
+        let root_prepared = blockd
+            .prepare(&desired, &desired.volumes[0], &root_attachment)
+            .unwrap();
+        let persistent_prepared = blockd
+            .prepare(&desired, &desired.volumes[1], &persistent_attachment)
+            .unwrap();
+        let volumes = vec![
+            prepared_owned_observed_volume(
+                &desired.volumes[0],
+                &root_attachment,
+                HostPath::new(root_prepared.data_directory().to_str().unwrap().to_owned()).unwrap(),
+            ),
+            prepared_owned_observed_volume(
+                &desired.volumes[1],
+                &persistent_attachment,
+                HostPath::new(
+                    persistent_prepared
+                        .data_directory()
+                        .to_str()
+                        .unwrap()
+                        .to_owned(),
+                )
+                .unwrap(),
+            ),
+        ];
+        drop((root_prepared, persistent_prepared));
+        let checkpoint = RuntimeCheckpoint {
+            version: ContractVersion::V1,
+            cat_id: desired.cat_id.clone(),
+            node_id: desired.placement.node_id.clone(),
+            placement_epoch: desired.placement.placement_epoch,
+            desired_revision: desired.desired_revision,
+            spec_digest: desired.spec_digest.clone(),
+            runtime_incarnation: None,
+            runtime_launch: RuntimeLaunch::Absent,
+            stable_state: None,
+            step: ReconcileStep::AcquireVolume {
+                request: persistent_attachment.checkpoint_acquire_request(),
+            },
+            processes: Vec::new(),
+            volumes,
+            mounts: Vec::new(),
+            networks: Vec::new(),
+            guest_transport: GuestTransportEvidence::Unavailable,
+            warm_snapshot: WarmSnapshotEvidence::Absent,
+            lifecycle_admission: LifecycleAdmission::Closed,
+            route_gates: Vec::new(),
+            require_idle: cats_api::runtime_reconciliation::RequireIdleCheckpoint::NotApplicable,
+            updated_at_unix_ms: unix_ms(1_900_000_000_000),
+        };
+        encode_runtime_checkpoint(&checkpoint).unwrap();
+        let store =
+            FileCheckpointStore::open(&root.path().join(CHECKPOINT_NAMESPACE), &desired.cat_id)
+                .unwrap();
+        let stored = store.create(&checkpoint).unwrap();
+        let before_digest = checkpoint_content_digest(stored.checkpoint()).unwrap();
+        drop(store);
+        let authority = Arc::new(MapAuthority {
+            records: Mutex::new(BTreeMap::from([
+                (
+                    root_attachment.identity.volume_id.clone(),
+                    record(&root_attachment),
+                ),
+                (
+                    persistent_attachment.identity.volume_id.clone(),
+                    record(&persistent_attachment),
+                ),
+            ])),
+            loads: AtomicUsize::new(0),
+        });
+        let drift = Arc::clone(&authority);
+        let persistent_volume_id = persistent_attachment.identity.volume_id.clone();
+        let effect = ServingPrepareDeviceEffect::new(
+            ServingPrepareFrontend::vhost_user_blk(4, 256).unwrap(),
+            HostPath::new("/usr/bin/cats-blockd").unwrap(),
+        )
+        .unwrap()
+        .with_volume_authority(authority.clone())
+        .with_before_replace(Arc::new(move || {
+            drift
+                .records
+                .lock()
+                .unwrap()
+                .get_mut(&persistent_volume_id)
+                .unwrap()
+                .lease_owner = Some(id("att_foreign"));
+        }));
+        let context = accepted_context(root.path(), &desired, &stored);
+
+        let error = effect
+            .try_persist_direct_existing(&context, &desired)
+            .unwrap_err();
+        assert!(
+            format!("{error:#}").contains("authority drifted before checkpoint CAS"),
+            "{error:#}"
+        );
+        assert_eq!(authority.loads.load(Ordering::SeqCst), 4);
+        let current =
+            FileCheckpointStore::open(&root.path().join(CHECKPOINT_NAMESPACE), &desired.cat_id)
+                .unwrap()
+                .load()
+                .unwrap()
+                .unwrap();
+        assert_eq!(current.content_digest(), &before_digest);
+        assert!(matches!(
+            current.checkpoint().step,
+            ReconcileStep::AcquireVolume { .. }
+        ));
+    }
 }
