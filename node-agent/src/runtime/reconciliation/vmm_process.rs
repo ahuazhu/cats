@@ -34,14 +34,16 @@ use crate::vmm_launcher::{
 use super::checkpoint::{FileCheckpointStore, RetainedCurrentCheckpoint, StoredCheckpoint};
 #[cfg(any(test, target_os = "linux"))]
 use super::systemd_root_provision::{
-    exact_unset_environment, sanitized_systemd_command, LinuxProcessSample, SystemdUnitProperties,
-    SYSTEMD_RUN, UNSET_PROCESS_ENVIRONMENT,
+    exact_unset_environment, sanitized_systemd_command, LinuxProcessSample,
+    LinuxProcessSampleInspection, SystemdUnitProperties, SYSTEMD_RUN, UNSET_PROCESS_ENVIRONMENT,
 };
 #[cfg(target_os = "linux")]
 use super::systemd_root_provision::{
     read_cgroup_processes, sample_linux_process, submit_fixed_systemd_command,
     systemd_unit_properties, SystemdStartSubmission,
 };
+#[cfg(test)]
+use super::systemd_root_provision::{SystemdExecStart, SystemdExecTimestamp};
 #[cfg(target_os = "linux")]
 use super::vmm_api_inspection::{
     inspect_vmm_api, ExactVmmApiProof, VmmApiExpectation, VmmApiInspection,
@@ -972,12 +974,19 @@ fn inspect_vmm_manager_process(
     }
 
     let process_id = first_properties.main_pid;
-    let Some(first_process) = sample_linux_process(process_id) else {
-        return Ok(VmmManagerProcessInspection::Unavailable);
+    let first_process = match exact_vmm_process_sample(
+        sample_linux_process(process_id),
+        expected,
+        &first_properties.control_group,
+    ) {
+        Ok(sample) => sample,
+        Err(VmmProcessSampleFailure::Unavailable) => {
+            return Ok(VmmManagerProcessInspection::Unavailable)
+        }
+        Err(VmmProcessSampleFailure::IdentityMismatch) => {
+            return Ok(VmmManagerProcessInspection::Conflict)
+        }
     };
-    if !vmm_process_sample_is_exact(&first_process, expected, &first_properties.control_group) {
-        return Ok(VmmManagerProcessInspection::Conflict);
-    }
     let physical_cgroup = Path::new(CGROUP_ROOT).join(
         first_properties
             .control_group
@@ -994,8 +1003,18 @@ fn inspect_vmm_manager_process(
         return Ok(VmmManagerProcessInspection::Conflict);
     }
 
-    let Some(second_process) = sample_linux_process(process_id) else {
-        return Ok(VmmManagerProcessInspection::Unavailable);
+    let second_process = match exact_vmm_process_sample(
+        sample_linux_process(process_id),
+        expected,
+        &first_properties.control_group,
+    ) {
+        Ok(sample) => sample,
+        Err(VmmProcessSampleFailure::Unavailable) => {
+            return Ok(VmmManagerProcessInspection::Unavailable)
+        }
+        Err(VmmProcessSampleFailure::IdentityMismatch) => {
+            return Ok(VmmManagerProcessInspection::Conflict)
+        }
     };
     if second_process != first_process {
         return Ok(VmmManagerProcessInspection::Conflict);
@@ -1027,11 +1046,17 @@ fn vmm_systemd_properties_are_exact(
         && properties.load_state == "loaded"
         && properties.active_state == "active"
         && properties.sub_state == "running"
+        && properties.service_type == "exec"
+        && properties.transient == "yes"
         && properties.main_pid > 0
         && properties.control_group == expected_control_group
-        && expected_exec_start
-            .as_ref()
-            .is_some_and(|exec_start| &properties.exec_start == exec_start)
+        && expected_exec_start.as_ref().is_some_and(|(path, argv)| {
+            properties.exec_start.as_ref().is_some_and(|exec_start| {
+                exec_start.is_running(properties.main_pid)
+                    && &exec_start.path == path
+                    && &exec_start.argv == argv
+            })
+        })
         && systemd_environment_is_exact(&properties.environment, expected)
         && properties.environment_files.is_empty()
         && properties.pass_environment.is_empty()
@@ -1044,7 +1069,7 @@ fn vmm_systemd_properties_are_exact(
 }
 
 #[cfg(any(test, target_os = "linux"))]
-fn expected_systemd_exec_start(expected: &VmmProcessExpectation) -> Option<String> {
+fn expected_systemd_exec_start(expected: &VmmProcessExpectation) -> Option<(String, String)> {
     let [launcher, argument] = expected.launcher_command_line() else {
         return None;
     };
@@ -1057,9 +1082,7 @@ fn expected_systemd_exec_start(expected: &VmmProcessExpectation) -> Option<Strin
     }) {
         return None;
     }
-    Some(format!(
-        "{{ path={launcher} ; argv[]={launcher} {argument} ; }}"
-    ))
+    Some((launcher.to_owned(), format!("{launcher} {argument}")))
 }
 
 #[cfg(any(test, target_os = "linux"))]
@@ -1089,6 +1112,32 @@ fn vmm_process_sample_is_exact(
         && sample.command_line == expected.vmm_command_line()
         && sample.control_group == control_group
         && sample.environment == expected.exact_environment()
+}
+
+#[cfg(any(test, target_os = "linux"))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum VmmProcessSampleFailure {
+    IdentityMismatch,
+    Unavailable,
+}
+
+#[cfg(any(test, target_os = "linux"))]
+fn exact_vmm_process_sample(
+    inspection: LinuxProcessSampleInspection,
+    expected: &VmmProcessExpectation,
+    control_group: &str,
+) -> Result<LinuxProcessSample, VmmProcessSampleFailure> {
+    match inspection {
+        LinuxProcessSampleInspection::Exact(sample)
+            if vmm_process_sample_is_exact(&sample, expected, control_group) =>
+        {
+            Ok(sample)
+        }
+        LinuxProcessSampleInspection::Exact(_) | LinuxProcessSampleInspection::Conflict => {
+            Err(VmmProcessSampleFailure::IdentityMismatch)
+        }
+        LinuxProcessSampleInspection::Unavailable => Err(VmmProcessSampleFailure::Unavailable),
+    }
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -1214,9 +1263,25 @@ mod tests {
             load_state: "loaded".to_owned(),
             active_state: "active".to_owned(),
             sub_state: "running".to_owned(),
+            service_type: "exec".to_owned(),
+            transient: "yes".to_owned(),
             main_pid: process_id,
             control_group: format!("/{SYSTEM_SLICE}/{}", expected.unit_id()),
-            exec_start: expected_systemd_exec_start(expected).unwrap(),
+            exec_start: {
+                let (path, argv) = expected_systemd_exec_start(expected).unwrap();
+                Some(SystemdExecStart {
+                    path,
+                    argv,
+                    ignore_errors: false,
+                    start_time: SystemdExecTimestamp::Recorded(
+                        "Tue 2026-08-11 12:34:56 UTC".to_owned(),
+                    ),
+                    stop_time: SystemdExecTimestamp::NotAvailable,
+                    pid: process_id,
+                    code: "(null)".to_owned(),
+                    status: "0/0".to_owned(),
+                })
+            },
             environment: expected
                 .exact_environment()
                 .into_iter()
@@ -1290,13 +1355,49 @@ mod tests {
             &expected,
             &properties.control_group
         ));
+        assert_eq!(
+            exact_vmm_process_sample(
+                LinuxProcessSampleInspection::Conflict,
+                &expected,
+                &properties.control_group,
+            ),
+            Err(VmmProcessSampleFailure::IdentityMismatch)
+        );
+        assert_eq!(
+            exact_vmm_process_sample(
+                LinuxProcessSampleInspection::Unavailable,
+                &expected,
+                &properties.control_group,
+            ),
+            Err(VmmProcessSampleFailure::Unavailable)
+        );
 
         let mut extra_argument = properties.clone();
-        extra_argument.exec_start = extra_argument.exec_start.replace(" ; }", " --foreign ; }");
+        extra_argument
+            .exec_start
+            .as_mut()
+            .unwrap()
+            .argv
+            .push_str(" --foreign");
         assert!(!vmm_systemd_properties_are_exact(
             &extra_argument,
             &expected
         ));
+
+        let mut wrong_exec_pid = properties.clone();
+        wrong_exec_pid.exec_start.as_mut().unwrap().pid += 1;
+        assert!(!vmm_systemd_properties_are_exact(
+            &wrong_exec_pid,
+            &expected
+        ));
+
+        let mut permanent = properties.clone();
+        permanent.transient = "no".to_owned();
+        assert!(!vmm_systemd_properties_are_exact(&permanent, &expected));
+
+        let mut wrong_type = properties.clone();
+        wrong_type.service_type = "simple".to_owned();
+        assert!(!vmm_systemd_properties_are_exact(&wrong_type, &expected));
 
         let mut extra_manager_environment = properties.clone();
         extra_manager_environment

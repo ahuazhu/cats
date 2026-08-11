@@ -1176,8 +1176,10 @@ fn platform_inspect_systemd(
         return Ok(SystemdInspection::Conflict);
     }
     let process_id = first.main_pid;
-    let Some(sample_before) = sample_linux_process(process_id) else {
-        return Ok(SystemdInspection::Starting);
+    let sample_before = match sample_linux_process(process_id) {
+        LinuxProcessSampleInspection::Exact(sample) => sample,
+        LinuxProcessSampleInspection::Unavailable => return Ok(SystemdInspection::Starting),
+        LinuxProcessSampleInspection::Conflict => return Ok(SystemdInspection::Conflict),
     };
     if sample_before.executable_path != launch.executable
         || sample_before.command_line != launch.expected_command_line()
@@ -1200,8 +1202,10 @@ fn platform_inspect_systemd(
     if cgroup_process_ids != [process_id] {
         return Ok(SystemdInspection::Conflict);
     }
-    let Some(sample_after) = sample_linux_process(process_id) else {
-        return Ok(SystemdInspection::Starting);
+    let sample_after = match sample_linux_process(process_id) {
+        LinuxProcessSampleInspection::Exact(sample) => sample,
+        LinuxProcessSampleInspection::Unavailable => return Ok(SystemdInspection::Starting),
+        LinuxProcessSampleInspection::Conflict => return Ok(SystemdInspection::Conflict),
     };
     if sample_after != sample_before {
         return Ok(SystemdInspection::Conflict);
@@ -1344,9 +1348,11 @@ pub(super) struct SystemdUnitProperties {
     pub(super) load_state: String,
     pub(super) active_state: String,
     pub(super) sub_state: String,
+    pub(super) service_type: String,
+    pub(super) transient: String,
     pub(super) main_pid: u32,
     pub(super) control_group: String,
-    pub(super) exec_start: String,
+    pub(super) exec_start: Option<SystemdExecStart>,
     pub(super) environment: String,
     pub(super) environment_files: String,
     pub(super) pass_environment: String,
@@ -1366,7 +1372,7 @@ impl SystemdUnitProperties {
             && self.sub_state == "dead"
             && self.main_pid == 0
             && self.control_group.is_empty()
-            && self.exec_start.is_empty()
+            && self.exec_start.is_none()
             && self.environment.is_empty()
             && self.environment_files.is_empty()
             && self.pass_environment.is_empty()
@@ -1377,6 +1383,8 @@ impl SystemdUnitProperties {
         self.id == expected.as_str()
             && self.load_state == "loaded"
             && matches!(self.active_state.as_str(), "activating" | "reloading")
+            && self.service_type == "exec"
+            && self.transient == "yes"
     }
 
     fn is_running(&self, launch: &TransientServiceLaunch) -> bool {
@@ -1384,15 +1392,18 @@ impl SystemdUnitProperties {
             && self.load_state == "loaded"
             && self.active_state == "active"
             && self.sub_state == "running"
+            && self.service_type == "exec"
+            && self.transient == "yes"
             && self.main_pid > 0
             && self.control_group == format!("/{SYSTEM_SLICE}/{}", launch.unit_id.as_str())
-            && self
-                .exec_start
-                .contains(&launch.executable.to_string_lossy().into_owned())
-            && self.exec_start.contains("--process-identity-token")
-            && self
-                .exec_start
-                .contains(launch.process_identity_token.as_str())
+            && self.exec_start.as_ref().is_some_and(|exec_start| {
+                exec_start.is_running(self.main_pid)
+                    && exec_start.path.as_str() == launch.executable.to_string_lossy().as_ref()
+                    && exec_start.argv.contains("--process-identity-token")
+                    && exec_start
+                        .argv
+                        .contains(launch.process_identity_token.as_str())
+            })
             && self.environment.is_empty()
             && self.environment_files.is_empty()
             && self.pass_environment.is_empty()
@@ -1423,6 +1434,8 @@ pub(super) fn systemd_unit_properties(
         "LoadState",
         "ActiveState",
         "SubState",
+        "Type",
+        "Transient",
         "MainPID",
         "ControlGroup",
         "ExecStart",
@@ -1466,7 +1479,7 @@ fn parse_systemd_properties(bytes: &[u8]) -> anyhow::Result<SystemdUnitPropertie
     // independent `/proc/<pid>/environ` sample rejects every forbidden key.
     let environment_files = values.remove("EnvironmentFiles").unwrap_or_default();
     anyhow::ensure!(
-        values.len() == 15,
+        values.len() == 17,
         "systemctl show omitted a fixed property"
     );
     let take = |values: &mut BTreeMap<&str, String>, key| {
@@ -1482,9 +1495,14 @@ fn parse_systemd_properties(bytes: &[u8]) -> anyhow::Result<SystemdUnitPropertie
         load_state: take(&mut values, "LoadState")?,
         active_state: take(&mut values, "ActiveState")?,
         sub_state: take(&mut values, "SubState")?,
+        service_type: take(&mut values, "Type")?,
+        transient: take(&mut values, "Transient")?,
         main_pid,
         control_group: take(&mut values, "ControlGroup")?,
-        exec_start: take(&mut values, "ExecStart")?,
+        exec_start: match take(&mut values, "ExecStart")? {
+            value if value.is_empty() => None,
+            value => Some(parse_systemd_exec_start(&value)?),
+        },
         environment: take(&mut values, "Environment")?,
         environment_files,
         pass_environment: take(&mut values, "PassEnvironment")?,
@@ -1494,6 +1512,110 @@ fn parse_systemd_properties(bytes: &[u8]) -> anyhow::Result<SystemdUnitPropertie
         umask: take(&mut values, "UMask")?,
         timeout_stop_usec: take(&mut values, "TimeoutStopUSec")?,
         collect_mode: take(&mut values, "CollectMode")?,
+    })
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) struct SystemdExecStart {
+    pub(super) path: String,
+    pub(super) argv: String,
+    pub(super) ignore_errors: bool,
+    pub(super) start_time: SystemdExecTimestamp,
+    pub(super) stop_time: SystemdExecTimestamp,
+    pub(super) pid: u32,
+    pub(super) code: String,
+    pub(super) status: String,
+}
+
+impl SystemdExecStart {
+    pub(super) fn is_running(&self, main_pid: u32) -> bool {
+        main_pid > 0
+            && self.pid == main_pid
+            && !self.ignore_errors
+            && matches!(&self.start_time, SystemdExecTimestamp::Recorded(_))
+            && self.stop_time == SystemdExecTimestamp::NotAvailable
+            && self.code == "(null)"
+            && self.status == "0/0"
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) enum SystemdExecTimestamp {
+    NotAvailable,
+    Recorded(String),
+}
+
+fn parse_systemd_exec_start(value: &str) -> anyhow::Result<SystemdExecStart> {
+    let body = value
+        .strip_prefix("{ ")
+        .and_then(|value| value.strip_suffix(" }"))
+        .context("systemctl ExecStart is not one systemd command record")?;
+    let mut fields = BTreeMap::new();
+    for field in body.split(" ; ") {
+        let (name, value) = field
+            .split_once('=')
+            .context("systemctl ExecStart contains a malformed field")?;
+        anyhow::ensure!(
+            fields.insert(name, value.to_owned()).is_none(),
+            "systemctl ExecStart contains a duplicate field"
+        );
+    }
+    anyhow::ensure!(
+        fields.len() == 8,
+        "systemctl ExecStart does not contain the systemd 255 field closure"
+    );
+    let take = |fields: &mut BTreeMap<&str, String>, name| {
+        fields
+            .remove(name)
+            .with_context(|| format!("systemctl ExecStart omitted {name}"))
+    };
+    let path = take(&mut fields, "path")?;
+    let argv = take(&mut fields, "argv[]")?;
+    anyhow::ensure!(
+        !path.is_empty() && !argv.is_empty(),
+        "systemctl ExecStart contains an empty command identity"
+    );
+    let ignore_errors = match take(&mut fields, "ignore_errors")?.as_str() {
+        "yes" => true,
+        "no" => false,
+        _ => anyhow::bail!("systemctl ExecStart ignore_errors is not a boolean"),
+    };
+    let start_time = parse_systemd_exec_timestamp(&take(&mut fields, "start_time")?)?;
+    let stop_time = parse_systemd_exec_timestamp(&take(&mut fields, "stop_time")?)?;
+    let pid = take(&mut fields, "pid")?
+        .parse::<u32>()
+        .context("systemctl ExecStart pid is not a u32")?;
+    let code = take(&mut fields, "code")?;
+    let status = take(&mut fields, "status")?;
+    anyhow::ensure!(
+        !code.is_empty() && !status.is_empty() && fields.is_empty(),
+        "systemctl ExecStart contains an incomplete field closure"
+    );
+    Ok(SystemdExecStart {
+        path,
+        argv,
+        ignore_errors,
+        start_time,
+        stop_time,
+        pid,
+        code,
+        status,
+    })
+}
+
+fn parse_systemd_exec_timestamp(value: &str) -> anyhow::Result<SystemdExecTimestamp> {
+    let timestamp = value
+        .strip_prefix('[')
+        .and_then(|value| value.strip_suffix(']'))
+        .context("systemctl ExecStart timestamp is not bracketed")?;
+    anyhow::ensure!(
+        !timestamp.is_empty() && !timestamp.contains('[') && !timestamp.contains(']'),
+        "systemctl ExecStart timestamp is malformed"
+    );
+    Ok(if timestamp == "n/a" {
+        SystemdExecTimestamp::NotAvailable
+    } else {
+        SystemdExecTimestamp::Recorded(timestamp.to_owned())
     })
 }
 
@@ -1518,37 +1640,91 @@ pub(super) struct LinuxProcessSample {
     pub(super) environment: BTreeMap<OsString, OsString>,
 }
 
+#[cfg(any(test, target_os = "linux"))]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) enum LinuxProcessSampleInspection {
+    Exact(LinuxProcessSample),
+    /// At least one procfs leaf could not be read; exit/PID churn is not
+    /// distinguishable from a transient host read failure at this boundary.
+    Unavailable,
+    /// Every procfs leaf was read, but its start ticks, argv, cgroup or
+    /// environment was structurally invalid or carried a forbidden credential
+    /// key.
+    Conflict,
+}
+
+#[cfg(any(test, target_os = "linux"))]
+struct RawLinuxProcessSample {
+    stat: String,
+    executable_path: PathBuf,
+    command_line: Vec<u8>,
+    cgroup: String,
+    environment: Vec<u8>,
+}
+
 #[cfg(target_os = "linux")]
-pub(super) fn sample_linux_process(process_id: u32) -> Option<LinuxProcessSample> {
+pub(super) fn sample_linux_process(process_id: u32) -> LinuxProcessSampleInspection {
+    let raw = (|| {
+        Some(RawLinuxProcessSample {
+            stat: std::fs::read_to_string(format!("/proc/{process_id}/stat")).ok()?,
+            executable_path: std::fs::read_link(format!("/proc/{process_id}/exe")).ok()?,
+            command_line: std::fs::read(format!("/proc/{process_id}/cmdline")).ok()?,
+            cgroup: std::fs::read_to_string(format!("/proc/{process_id}/cgroup")).ok()?,
+            environment: std::fs::read(format!("/proc/{process_id}/environ")).ok()?,
+        })
+    })();
+    let Some(raw) = raw else {
+        return inspect_linux_process_snapshot(None);
+    };
+    inspect_linux_process_snapshot(Some(raw))
+}
+
+#[cfg(any(test, target_os = "linux"))]
+fn inspect_linux_process_snapshot(
+    raw: Option<RawLinuxProcessSample>,
+) -> LinuxProcessSampleInspection {
+    let Some(raw) = raw else {
+        return LinuxProcessSampleInspection::Unavailable;
+    };
+    match parse_linux_process_sample(raw) {
+        Some(sample) => LinuxProcessSampleInspection::Exact(sample),
+        None => LinuxProcessSampleInspection::Conflict,
+    }
+}
+
+#[cfg(any(test, target_os = "linux"))]
+fn parse_linux_process_sample(raw: RawLinuxProcessSample) -> Option<LinuxProcessSample> {
     use std::os::unix::ffi::OsStringExt as _;
 
-    let stat = std::fs::read_to_string(format!("/proc/{process_id}/stat")).ok()?;
-    let (_, after_comm) = stat.rsplit_once(')')?;
+    let (_, after_comm) = raw.stat.rsplit_once(')')?;
     let start_time_ticks = after_comm.split_whitespace().nth(19)?.parse().ok()?;
     if start_time_ticks == 0 {
         return None;
     }
-    let executable_path = std::fs::read_link(format!("/proc/{process_id}/exe")).ok()?;
-    let command_line = std::fs::read(format!("/proc/{process_id}/cmdline"))
-        .ok()?
-        .split(|byte| *byte == 0)
-        .filter(|part| !part.is_empty())
-        .map(|part| OsString::from_vec(part.to_vec()))
-        .collect::<Vec<_>>();
-    let cgroup = std::fs::read_to_string(format!("/proc/{process_id}/cgroup")).ok()?;
-    let mut unified = cgroup.lines().filter_map(|line| line.strip_prefix("0::"));
+    let command_line = if raw.command_line.is_empty() {
+        Vec::new()
+    } else {
+        raw.command_line
+            .strip_suffix(&[0])?
+            .split(|byte| *byte == 0)
+            .map(|part| OsString::from_vec(part.to_vec()))
+            .collect::<Vec<_>>()
+    };
+    let mut unified = raw
+        .cgroup
+        .lines()
+        .filter_map(|line| line.strip_prefix("0::"));
     let control_group = unified.next()?.to_owned();
     if unified.next().is_some() || !control_group.starts_with('/') {
         return None;
     }
-    let environment = std::fs::read(format!("/proc/{process_id}/environ")).ok()?;
-    let environment = parse_process_environment(&environment)?;
+    let environment = parse_process_environment(&raw.environment)?;
     if !forbidden_process_environment_is_absent(environment.keys()) {
         return None;
     }
     Some(LinuxProcessSample {
         start_time_ticks,
-        executable_path,
+        executable_path: raw.executable_path,
         command_line,
         control_group,
         environment: environment
@@ -3305,6 +3481,19 @@ while True:
             std::thread::sleep(POLL_INTERVAL);
         };
 
+        let properties = systemd_unit_properties(&unit_id, &context_for(Duration::from_secs(5)))
+            .expect("query real systemd 255 service properties")
+            .expect("real systemd 255 service properties are readable");
+        assert_eq!(properties.service_type, "exec");
+        assert_eq!(properties.transient, "yes");
+        let exec_start = properties
+            .exec_start
+            .as_ref()
+            .expect("real systemd 255 exposes one typed ExecStart record");
+        assert_eq!(exec_start.pid, properties.main_pid);
+        assert_eq!(exec_start.pid, proof.process_id);
+        assert!(exec_start.is_running(properties.main_pid));
+
         state
             .try_reopen_directory()
             .expect("canonical state root remains the retained root after launch");
@@ -3601,76 +3790,121 @@ while True:
             .contains("Agent-private descriptor path"));
     }
 
+    fn exact_systemd_exec_start() -> String {
+        "{ path=/usr/bin/cats-blockd ; argv[]=/usr/bin/cats-blockd --process-identity-token 44444444444444444444444444444444 ; ignore_errors=no ; start_time=[Tue 2026-08-11 12:34:56 UTC] ; stop_time=[n/a] ; pid=4242 ; code=(null) ; status=0/0 }".to_owned()
+    }
+
+    fn exact_running_systemctl_wire() -> String {
+        format!(
+            "Id=cats-root.service\nLoadState=loaded\nActiveState=active\nSubState=running\nType=exec\nTransient=yes\nMainPID=4242\nControlGroup=/system.slice/cats-root.service\nExecStart={}\nEnvironment=\nEnvironmentFiles=\nPassEnvironment=\nUnsetEnvironment={}\nKillMode=control-group\nRestart=no\nUMask=0077\nTimeoutStopUSec=2s\nCollectMode=inactive-or-failed\n",
+            exact_systemd_exec_start(),
+            UNSET_PROCESS_ENVIRONMENT.join(" ")
+        )
+    }
+
     #[test]
     fn fixed_systemctl_properties_distinguish_absent_and_exact_running_unit() {
         let absent = parse_systemd_properties(
-            b"Id=cats-root.service\nLoadState=not-found\nActiveState=inactive\nSubState=dead\nMainPID=0\nControlGroup=\nExecStart=\nEnvironment=\nEnvironmentFiles=\nPassEnvironment=\nUnsetEnvironment=\nKillMode=control-group\nRestart=no\nUMask=0022\nTimeoutStopUSec=1min 30s\nCollectMode=inactive\n",
+            b"Id=cats-root.service\nLoadState=not-found\nActiveState=inactive\nSubState=dead\nType=\nTransient=no\nMainPID=0\nControlGroup=\nExecStart=\nEnvironment=\nEnvironmentFiles=\nPassEnvironment=\nUnsetEnvironment=\nKillMode=control-group\nRestart=no\nUMask=0022\nTimeoutStopUSec=1min 30s\nCollectMode=inactive\n",
         )
         .unwrap();
         assert!(absent.proves_absent(&id("cats-root.service")));
 
         let launch = build_launch(&config(), &expectation()).unwrap();
-        let running = parse_systemd_properties(
-            b"Id=cats-root.service\nLoadState=loaded\nActiveState=active\nSubState=running\nMainPID=4242\nControlGroup=/system.slice/cats-root.service\nExecStart={ path=/usr/bin/cats-blockd ; argv[]=/usr/bin/cats-blockd --process-identity-token 44444444444444444444444444444444 ; }\nEnvironment=\nEnvironmentFiles=\nPassEnvironment=\nUnsetEnvironment=AWS_ACCESS_KEY_ID AWS_SECRET_ACCESS_KEY AWS_SESSION_TOKEN AWS_CONTAINER_CREDENTIALS_FULL_URI AWS_CONTAINER_AUTHORIZATION_TOKEN_FILE CATS_POSTGRES_URL CATS_CRASH_POINT\nKillMode=control-group\nRestart=no\nUMask=0077\nTimeoutStopUSec=2s\nCollectMode=inactive-or-failed\n",
-        )
-        .unwrap();
+        let running = parse_systemd_properties(exact_running_systemctl_wire().as_bytes()).unwrap();
         assert!(running.is_running(&launch));
-        let systemd_255 = parse_systemd_properties(
-            b"Id=cats-root.service\nLoadState=loaded\nActiveState=active\nSubState=running\nMainPID=4242\nControlGroup=/system.slice/cats-root.service\nExecStart={ path=/usr/bin/cats-blockd ; argv[]=/usr/bin/cats-blockd --process-identity-token 44444444444444444444444444444444 ; }\nEnvironment=\nPassEnvironment=\nUnsetEnvironment=AWS_ACCESS_KEY_ID AWS_SECRET_ACCESS_KEY AWS_SESSION_TOKEN AWS_CONTAINER_CREDENTIALS_FULL_URI AWS_CONTAINER_AUTHORIZATION_TOKEN_FILE CATS_POSTGRES_URL CATS_CRASH_POINT\nKillMode=control-group\nRestart=no\nUMask=0077\nTimeoutStopUSec=2s\nCollectMode=inactive-or-failed\n",
-        )
-        .unwrap();
-        assert!(systemd_255.is_running(&launch));
 
-        let wrong_token = parse_systemd_properties(
-            b"Id=cats-root.service\nLoadState=loaded\nActiveState=active\nSubState=running\nMainPID=4242\nControlGroup=/system.slice/cats-root.service\nExecStart={ path=/usr/bin/cats-blockd ; argv[]=/usr/bin/cats-blockd --process-identity-token 55555555555555555555555555555555 ; }\nEnvironment=\nEnvironmentFiles=\nPassEnvironment=\nUnsetEnvironment=AWS_ACCESS_KEY_ID AWS_SECRET_ACCESS_KEY AWS_SESSION_TOKEN AWS_CONTAINER_CREDENTIALS_FULL_URI AWS_CONTAINER_AUTHORIZATION_TOKEN_FILE CATS_POSTGRES_URL CATS_CRASH_POINT\nKillMode=control-group\nRestart=no\nUMask=0077\nTimeoutStopUSec=2s\nCollectMode=inactive-or-failed\n",
-        )
-        .unwrap();
-        assert!(!wrong_token.is_running(&launch));
-
-        for (property, wrong) in [
-            ("KillMode", "process"),
-            ("Restart", "on-failure"),
-            ("UMask", "0022"),
-            ("TimeoutStopUSec", "3s"),
-            ("CollectMode", "inactive"),
-        ] {
-            let wire = String::from_utf8(
-                b"Id=cats-root.service\nLoadState=loaded\nActiveState=active\nSubState=running\nMainPID=4242\nControlGroup=/system.slice/cats-root.service\nExecStart={ path=/usr/bin/cats-blockd ; argv[]=/usr/bin/cats-blockd --process-identity-token 44444444444444444444444444444444 ; }\nEnvironment=\nEnvironmentFiles=\nPassEnvironment=\nUnsetEnvironment=AWS_ACCESS_KEY_ID AWS_SECRET_ACCESS_KEY AWS_SESSION_TOKEN AWS_CONTAINER_CREDENTIALS_FULL_URI AWS_CONTAINER_AUTHORIZATION_TOKEN_FILE CATS_POSTGRES_URL CATS_CRASH_POINT\nKillMode=control-group\nRestart=no\nUMask=0077\nTimeoutStopUSec=2s\nCollectMode=inactive-or-failed\n"
-                    .to_vec(),
-            )
+        // systemd 255 accepts EnvironmentFile= on the transient unit but does
+        // not expose the corresponding empty EnvironmentFiles show property.
+        let systemd_255 = exact_running_systemctl_wire().replace("EnvironmentFiles=\n", "");
+        assert!(parse_systemd_properties(systemd_255.as_bytes())
             .unwrap()
-            .replace(
-                &format!("{property}={}", match property {
-                    "KillMode" => "control-group",
-                    "Restart" => "no",
-                    "UMask" => "0077",
-                    "TimeoutStopUSec" => "2s",
-                    "CollectMode" => "inactive-or-failed",
-                    _ => unreachable!(),
-                }),
-                &format!("{property}={wrong}"),
-            );
+            .is_running(&launch));
+
+        let wrong_token = exact_running_systemctl_wire().replace(
+            "44444444444444444444444444444444",
+            "55555555555555555555555555555555",
+        );
+        assert!(!parse_systemd_properties(wrong_token.as_bytes())
+            .unwrap()
+            .is_running(&launch));
+
+        for (exact, wrong) in [
+            ("Type=exec", "Type=simple"),
+            ("Transient=yes", "Transient=no"),
+            ("KillMode=control-group", "KillMode=process"),
+            ("Restart=no", "Restart=on-failure"),
+            ("UMask=0077", "UMask=0022"),
+            ("TimeoutStopUSec=2s", "TimeoutStopUSec=3s"),
+            ("CollectMode=inactive-or-failed", "CollectMode=inactive"),
+        ] {
+            let wire = exact_running_systemctl_wire().replace(exact, wrong);
             assert!(!parse_systemd_properties(wire.as_bytes())
                 .unwrap()
                 .is_running(&launch));
+        }
+        for omitted in ["Type=exec\n", "Transient=yes\n"] {
+            let wire = exact_running_systemctl_wire().replace(omitted, "");
+            assert!(parse_systemd_properties(wire.as_bytes()).is_err());
+        }
+    }
+
+    #[test]
+    fn systemd_255_exec_start_is_typed_closed_and_bound_to_main_pid() {
+        let exact = parse_systemd_exec_start(&exact_systemd_exec_start()).unwrap();
+        assert!(exact.is_running(4242));
+        assert!(!exact.is_running(4243));
+
+        for (exact_field, wrong_field) in [
+            ("ignore_errors=no", "ignore_errors=yes"),
+            (
+                "start_time=[Tue 2026-08-11 12:34:56 UTC]",
+                "start_time=[n/a]",
+            ),
+            ("stop_time=[n/a]", "stop_time=[Tue 2026-08-11 12:35:56 UTC]"),
+            ("pid=4242", "pid=4243"),
+            ("code=(null)", "code=exited"),
+            ("status=0/0", "status=1/FAILURE"),
+        ] {
+            let observed = parse_systemd_exec_start(
+                &exact_systemd_exec_start().replace(exact_field, wrong_field),
+            )
+            .unwrap();
+            assert!(!observed.is_running(4242));
+        }
+
+        for malformed in [
+            exact_systemd_exec_start().replace(" ; status=0/0", ""),
+            exact_systemd_exec_start().replace(" ; status=0/0", " ; flags= ; status=0/0"),
+            exact_systemd_exec_start().replace(" ; pid=4242", " ; pid=4242 ; pid=4242"),
+            exact_systemd_exec_start().replace("ignore_errors=no", "ignore_errors=maybe"),
+            exact_systemd_exec_start().replace("start_time=[", "start_time="),
+        ] {
+            assert!(parse_systemd_exec_start(&malformed).is_err());
         }
     }
 
     #[test]
     fn running_unit_requires_exactly_empty_explicit_environment_sources() {
         let launch = build_launch(&config(), &expectation()).unwrap();
-        for bytes in [
-            &b"Id=cats-root.service\nLoadState=loaded\nActiveState=active\nSubState=running\nMainPID=4242\nControlGroup=/system.slice/cats-root.service\nExecStart=/usr/bin/cats-blockd --process-identity-token 44444444444444444444444444444444\nEnvironment=EXTRA=value\nEnvironmentFiles=\nPassEnvironment=\nUnsetEnvironment=AWS_ACCESS_KEY_ID AWS_SECRET_ACCESS_KEY AWS_SESSION_TOKEN AWS_CONTAINER_CREDENTIALS_FULL_URI AWS_CONTAINER_AUTHORIZATION_TOKEN_FILE CATS_POSTGRES_URL\n"[..],
-            &b"Id=cats-root.service\nLoadState=loaded\nActiveState=active\nSubState=running\nMainPID=4242\nControlGroup=/system.slice/cats-root.service\nExecStart=/usr/bin/cats-blockd --process-identity-token 44444444444444444444444444444444\nEnvironment=\nEnvironmentFiles=/run/foreign-environment (ignore_errors=no)\nPassEnvironment=\nUnsetEnvironment=AWS_ACCESS_KEY_ID AWS_SECRET_ACCESS_KEY AWS_SESSION_TOKEN AWS_CONTAINER_CREDENTIALS_FULL_URI AWS_CONTAINER_AUTHORIZATION_TOKEN_FILE CATS_POSTGRES_URL\n"[..],
-            &b"Id=cats-root.service\nLoadState=loaded\nActiveState=active\nSubState=running\nMainPID=4242\nControlGroup=/system.slice/cats-root.service\nExecStart=/usr/bin/cats-blockd --process-identity-token 44444444444444444444444444444444\nEnvironment=\nEnvironmentFiles=\nPassEnvironment=AWS_ACCESS_KEY_ID\nUnsetEnvironment=AWS_ACCESS_KEY_ID AWS_SECRET_ACCESS_KEY AWS_SESSION_TOKEN AWS_CONTAINER_CREDENTIALS_FULL_URI AWS_CONTAINER_AUTHORIZATION_TOKEN_FILE CATS_POSTGRES_URL\n"[..],
-            &b"Id=cats-root.service\nLoadState=loaded\nActiveState=active\nSubState=running\nMainPID=4242\nControlGroup=/system.slice/cats-root.service\nExecStart=/usr/bin/cats-blockd --process-identity-token 44444444444444444444444444444444\nEnvironment=\nEnvironmentFiles=\nPassEnvironment=\nUnsetEnvironment=AWS_ACCESS_KEY_ID AWS_SECRET_ACCESS_KEY AWS_SESSION_TOKEN AWS_CONTAINER_CREDENTIALS_FULL_URI CATS_POSTGRES_URL\n"[..],
-            &b"Id=cats-root.service\nLoadState=loaded\nActiveState=active\nSubState=running\nMainPID=4242\nControlGroup=/system.slice/cats-root.service\nExecStart=/usr/bin/cats-blockd --process-identity-token 44444444444444444444444444444444\nEnvironment=\nEnvironmentFiles=\nPassEnvironment=\nUnsetEnvironment=AWS_ACCESS_KEY_ID AWS_SECRET_ACCESS_KEY AWS_SESSION_TOKEN AWS_CONTAINER_CREDENTIALS_FULL_URI AWS_CONTAINER_AUTHORIZATION_TOKEN_FILE CATS_POSTGRES_URL EXTRA\n"[..],
+        for (exact, wrong) in [
+            ("\nEnvironment=\n", "\nEnvironment=EXTRA=value\n"),
+            (
+                "EnvironmentFiles=\n",
+                "EnvironmentFiles=/run/foreign-environment (ignore_errors=no)\n",
+            ),
+            ("PassEnvironment=\n", "PassEnvironment=AWS_ACCESS_KEY_ID\n"),
+            (
+                "UnsetEnvironment=AWS_ACCESS_KEY_ID AWS_SECRET_ACCESS_KEY AWS_SESSION_TOKEN AWS_CONTAINER_CREDENTIALS_FULL_URI AWS_CONTAINER_AUTHORIZATION_TOKEN_FILE CATS_POSTGRES_URL CATS_CRASH_POINT\n",
+                "UnsetEnvironment=AWS_ACCESS_KEY_ID AWS_SECRET_ACCESS_KEY AWS_SESSION_TOKEN AWS_CONTAINER_CREDENTIALS_FULL_URI AWS_CONTAINER_AUTHORIZATION_TOKEN_FILE CATS_POSTGRES_URL\n",
+            ),
+            (
+                "UnsetEnvironment=AWS_ACCESS_KEY_ID AWS_SECRET_ACCESS_KEY AWS_SESSION_TOKEN AWS_CONTAINER_CREDENTIALS_FULL_URI AWS_CONTAINER_AUTHORIZATION_TOKEN_FILE CATS_POSTGRES_URL CATS_CRASH_POINT\n",
+                "UnsetEnvironment=AWS_ACCESS_KEY_ID AWS_SECRET_ACCESS_KEY AWS_SESSION_TOKEN AWS_CONTAINER_CREDENTIALS_FULL_URI AWS_CONTAINER_AUTHORIZATION_TOKEN_FILE CATS_POSTGRES_URL CATS_CRASH_POINT EXTRA\n",
+            ),
         ] {
-            let mut wire = bytes.to_vec();
-            wire.extend_from_slice(
-                b"KillMode=control-group\nRestart=no\nUMask=0077\nTimeoutStopUSec=2s\nCollectMode=inactive-or-failed\n",
-            );
-            assert!(!parse_systemd_properties(&wire)
+            let wire = exact_running_systemctl_wire().replace(exact, wrong);
+            assert!(!parse_systemd_properties(wire.as_bytes())
                 .unwrap()
                 .is_running(&launch));
         }
@@ -3712,6 +3946,60 @@ while True:
             &b"LANG=C\0LANG=D\0"[..],
         ] {
             assert!(parse_process_environment_keys(malformed).is_none());
+        }
+    }
+
+    fn raw_linux_process_sample(start_time_ticks: &str) -> RawLinuxProcessSample {
+        let mut stat_fields = vec!["0"; 20];
+        stat_fields[0] = "S";
+        stat_fields[19] = start_time_ticks;
+        RawLinuxProcessSample {
+            stat: format!("4242 (cloud hypervisor worker) {}", stat_fields.join(" ")),
+            executable_path: PathBuf::from("/usr/bin/cloud-hypervisor"),
+            command_line: b"/usr/bin/cloud-hypervisor\0--cpus\0boot=2\0".to_vec(),
+            cgroup: "0::/system.slice/cats-vmm.service\n".to_owned(),
+            environment: b"CATS_RUNTIME_INCARNATION=11111111111111111111111111111111\0".to_vec(),
+        }
+    }
+
+    #[test]
+    fn linux_process_snapshot_distinguishes_unreadable_from_definite_identity_conflict() {
+        assert_eq!(
+            inspect_linux_process_snapshot(None),
+            LinuxProcessSampleInspection::Unavailable
+        );
+        assert!(matches!(
+            inspect_linux_process_snapshot(Some(raw_linux_process_sample("1234"))),
+            LinuxProcessSampleInspection::Exact(LinuxProcessSample {
+                start_time_ticks: 1234,
+                ..
+            })
+        ));
+
+        let mut malformed_cgroup = raw_linux_process_sample("1234");
+        malformed_cgroup.cgroup = "0::relative\n".to_owned();
+        let mut duplicate_cgroup = raw_linux_process_sample("1234");
+        duplicate_cgroup.cgroup = "0::/first\n0::/second\n".to_owned();
+        let mut malformed_command_line = raw_linux_process_sample("1234");
+        malformed_command_line.command_line.pop();
+        let mut malformed_environment = raw_linux_process_sample("1234");
+        malformed_environment.environment = b"LANG=C".to_vec();
+        let mut forbidden_environment = raw_linux_process_sample("1234");
+        forbidden_environment.environment = b"AWS_ACCESS_KEY_ID=credential\0".to_vec();
+
+        for definite_conflict in [
+            raw_linux_process_sample("0"),
+            raw_linux_process_sample("not-a-tick-count"),
+            malformed_cgroup,
+            duplicate_cgroup,
+            malformed_command_line,
+            malformed_environment,
+            forbidden_environment,
+        ] {
+            assert_eq!(
+                inspect_linux_process_snapshot(Some(definite_conflict)),
+                LinuxProcessSampleInspection::Conflict
+            );
         }
     }
 
