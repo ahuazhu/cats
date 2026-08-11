@@ -90,8 +90,13 @@ use super::vmm_cid::{
     VmmCidInventorySnapshot, VmmCidOwner,
 };
 use super::vmm_process::{
-    PlatformSystemdVmmProcessPort, VmmProcessConflict, VmmProcessExpectation, VmmProcessInspection,
-    VmmProcessPort,
+    global_sealed as vmm_global_sealed, sealed as vmm_process_sealed,
+    PlatformSystemdVmmProcessPort, VmmProcessConflict, VmmProcessExpectation,
+    VmmProcessGlobalInspection, VmmProcessGlobalPort, VmmProcessInspection, VmmProcessPort,
+};
+#[cfg(target_os = "linux")]
+use super::vmm_runtime_paths::{
+    scan_managed_vmm_launch_root, ManagedVmmLaunchRootScan, RetainedManagedVmmLaunchRoot,
 };
 use super::vmm_socket_namespace::{
     scan_managed_vmm_socket_root, ManagedVmmSocketRootScan, RetainedManagedVmmSocketRoot,
@@ -987,6 +992,8 @@ struct ProbeConfig {
     network_allocation_port: Option<NetworkAllocationPort>,
     kernel_nbd_inventory_port: Option<KernelNbdInventoryPort>,
     managed_vmm_socket_root: Option<Arc<RetainedManagedVmmSocketRoot>>,
+    #[cfg(target_os = "linux")]
+    managed_vmm_launch_root: Option<Arc<RetainedManagedVmmLaunchRoot>>,
     vmm_socket_receipts: Option<Arc<VmmSocketReceiptStore>>,
 }
 
@@ -1012,10 +1019,14 @@ impl ProbeConfig {
             );
         }
         #[cfg(target_os = "linux")]
-        let (managed_vmm_socket_root, vmm_socket_receipts) = (
+        let (managed_vmm_socket_root, managed_vmm_launch_root, vmm_socket_receipts) = (
             Some(Arc::new(
                 RetainedManagedVmmSocketRoot::open_installed()
                     .context("open installed managed VMM socket root")?,
+            )),
+            Some(Arc::new(
+                RetainedManagedVmmLaunchRoot::open_existing(config.state_directory.clone())
+                    .context("open installed VMM launch-file namespace")?,
             )),
             Some(Arc::new(
                 VmmSocketReceiptStore::open_existing(config.state_directory.clone())
@@ -1051,6 +1062,8 @@ impl ProbeConfig {
             )?),
             kernel_nbd_inventory_port: config.kernel_nbd_inventory.map(KernelNbdInventoryPort::new),
             managed_vmm_socket_root,
+            #[cfg(target_os = "linux")]
+            managed_vmm_launch_root,
             vmm_socket_receipts,
         })
     }
@@ -1074,6 +1087,7 @@ pub(crate) struct InstalledRootProcessEffectPorts {
     pub(crate) retirement: Arc<dyn RootProvisionProcessRetirementPort>,
     pub(crate) global: Arc<dyn RootProvisionProcessGlobalPort>,
     pub(crate) serving: Arc<dyn ServingBlockdProcessGlobalPort>,
+    pub(crate) vmm: Arc<dyn VmmProcessGlobalPort>,
     pub(crate) vmm_cid: Arc<dyn VmmCidInventoryPort>,
 }
 
@@ -1096,6 +1110,7 @@ pub(crate) fn installed_root_process_effect_ports(
         retirement: Arc::clone(&bridge) as Arc<dyn RootProvisionProcessRetirementPort>,
         global: Arc::clone(&bridge) as Arc<dyn RootProvisionProcessGlobalPort>,
         serving: Arc::clone(&bridge) as Arc<dyn ServingBlockdProcessGlobalPort>,
+        vmm: Arc::clone(&bridge) as Arc<dyn VmmProcessGlobalPort>,
         vmm_cid: bridge as Arc<dyn VmmCidInventoryPort>,
     })
 }
@@ -1177,6 +1192,8 @@ fn clean_slate_scanner_with_metadata_for_test(
             network_allocation_port: None,
             kernel_nbd_inventory_port: None,
             managed_vmm_socket_root: None,
+            #[cfg(target_os = "linux")]
+            managed_vmm_launch_root: None,
             vmm_socket_receipts: None,
         },
         metadata_authority,
@@ -1361,6 +1378,8 @@ fn platform_root_process_inventory_bridge(
         legacy_socket_root: config.legacy_socket_root.clone(),
         limits: config.limits,
         managed_vmm_socket_root: config.managed_vmm_socket_root.clone(),
+        #[cfg(target_os = "linux")]
+        managed_vmm_launch_root: config.managed_vmm_launch_root.clone(),
         vmm_socket_receipts: config.vmm_socket_receipts.clone(),
     }))
 }
@@ -2941,6 +2960,8 @@ struct PlatformRootProcessInventoryBridge {
     legacy_socket_root: PathBuf,
     limits: ProbeLimits,
     managed_vmm_socket_root: Option<Arc<RetainedManagedVmmSocketRoot>>,
+    #[cfg(target_os = "linux")]
+    managed_vmm_launch_root: Option<Arc<RetainedManagedVmmLaunchRoot>>,
     vmm_socket_receipts: Option<Arc<VmmSocketReceiptStore>>,
 }
 
@@ -2948,6 +2969,7 @@ enum AdmittedManagedProcessInspection {
     Exact {
         root: BTreeMap<Id, RootProvisionProcessInspection>,
         serving: BTreeMap<Id, ServingBlockdProcessInspection>,
+        vmm: BTreeMap<Id, VmmProcessInspection>,
     },
     Unavailable,
     IdentityMismatch,
@@ -3022,13 +3044,56 @@ impl PlatformRootProcessInventoryBridge {
             (None, None) => ProbeFact::Empty,
             _ => ProbeFact::Unavailable,
         };
+        #[cfg(target_os = "linux")]
+        let managed_vmm_launch_files = match (
+            self.managed_vmm_launch_root.as_deref(),
+            self.managed_vmm_socket_root.as_deref(),
+            self.vmm_socket_receipts.as_deref(),
+        ) {
+            (Some(launch_root), Some(socket_root), Some(receipts)) => {
+                let checkpoints = expected_vmms
+                    .values()
+                    .map(VmmProcessExpectation::checkpoint)
+                    .collect::<Vec<_>>();
+                match scan_managed_vmm_launch_root(
+                    launch_root,
+                    socket_root,
+                    receipts,
+                    &checkpoints,
+                    context,
+                )? {
+                    ManagedVmmLaunchRootScan::Accounted => ProbeFact::Empty,
+                    ManagedVmmLaunchRootScan::Residue => ProbeFact::Present,
+                    ManagedVmmLaunchRootScan::Unavailable => ProbeFact::Unavailable,
+                }
+            }
+            (None, None, None) if !self.process_paths.supported => ProbeFact::Unavailable,
+            (None, None, None) => ProbeFact::Empty,
+            _ => ProbeFact::Unavailable,
+        };
+        #[cfg(not(target_os = "linux"))]
+        let managed_vmm_launch_files = ProbeFact::Empty;
         Ok(
-            if [systemd, metering, processes, sockets, managed_vmm_sockets]
-                .contains(&ProbeFact::Present)
+            if [
+                systemd,
+                metering,
+                processes,
+                sockets,
+                managed_vmm_sockets,
+                managed_vmm_launch_files,
+            ]
+            .contains(&ProbeFact::Present)
             {
                 ProbeFact::Present
-            } else if [systemd, metering, processes, sockets, managed_vmm_sockets]
-                .contains(&ProbeFact::Unavailable)
+            } else if [
+                systemd,
+                metering,
+                processes,
+                sockets,
+                managed_vmm_sockets,
+                managed_vmm_launch_files,
+            ]
+            .contains(&ProbeFact::Unavailable)
             {
                 ProbeFact::Unavailable
             } else {
@@ -3156,6 +3221,7 @@ impl PlatformRootProcessInventoryBridge {
         Ok(AdmittedManagedProcessInspection::Exact {
             root: root_second,
             serving: serving_second,
+            vmm: vmm_second,
         })
     }
 
@@ -3492,6 +3558,80 @@ impl ServingBlockdProcessGlobalPort for PlatformRootProcessInventoryBridge {
                     ServingBlockdProcessConflict::DuplicateIdentity,
                 ))
             }
+        }
+    }
+}
+
+impl vmm_process_sealed::Sealed for PlatformRootProcessInventoryBridge {}
+
+impl VmmProcessPort for PlatformRootProcessInventoryBridge {
+    fn inspect(
+        &self,
+        expected: &VmmProcessExpectation,
+        context: &dyn RuntimePhysicalReadContext,
+    ) -> anyhow::Result<VmmProcessInspection> {
+        self.vmm_port.inspect(expected, context)
+    }
+
+    fn start_checkpointed(
+        &self,
+        checkpointed: super::vmm_process::CheckpointedVmmProcess<'_>,
+        context: &crate::runtime_spine::RuntimeDesiredEffectContext,
+    ) -> anyhow::Result<super::vmm_process::VmmProcessStart> {
+        self.vmm_port.start_checkpointed(checkpointed, context)
+    }
+}
+
+impl vmm_global_sealed::Sealed for PlatformRootProcessInventoryBridge {}
+
+impl VmmProcessGlobalPort for PlatformRootProcessInventoryBridge {
+    fn inspect_vmm_exact_or_absent_after_node_global_sweep(
+        &self,
+        expected: &VmmProcessExpectation,
+        context: &crate::runtime_spine::RuntimeDesiredEffectContext,
+    ) -> anyhow::Result<VmmProcessGlobalInspection> {
+        let admission = context.node_global_process()?;
+        let Some((admitted_target, _)) = admission.vmm(expected.cat_id()) else {
+            return Ok(VmmProcessGlobalInspection::Conflict(
+                VmmProcessConflict::IdentityMismatch,
+            ));
+        };
+        if admitted_target != expected {
+            return Ok(VmmProcessGlobalInspection::Conflict(
+                VmmProcessConflict::IdentityMismatch,
+            ));
+        }
+        match self.inspect_admitted_managed_processes(admission, context)? {
+            AdmittedManagedProcessInspection::Exact { mut vmm, .. } => {
+                match vmm
+                    .remove(expected.cat_id())
+                    .expect("target VMM expectation was retained in the closed set")
+                {
+                    VmmProcessInspection::Absent => Ok(VmmProcessGlobalInspection::Absent(
+                        super::vmm_process::ExactVmmProcessAbsenceProof::for_expectation(
+                            expected.clone(),
+                        ),
+                    )),
+                    VmmProcessInspection::Exact(evidence) => Ok(VmmProcessGlobalInspection::Exact(
+                        expected.clone().prove_exact_process(*evidence)?,
+                    )),
+                    VmmProcessInspection::Conflict(problem) => {
+                        Ok(VmmProcessGlobalInspection::Conflict(problem))
+                    }
+                    VmmProcessInspection::Unavailable => {
+                        Ok(VmmProcessGlobalInspection::Unavailable)
+                    }
+                }
+            }
+            AdmittedManagedProcessInspection::Unavailable => {
+                Ok(VmmProcessGlobalInspection::Unavailable)
+            }
+            AdmittedManagedProcessInspection::IdentityMismatch => Ok(
+                VmmProcessGlobalInspection::Conflict(VmmProcessConflict::IdentityMismatch),
+            ),
+            AdmittedManagedProcessInspection::DuplicateIdentity => Ok(
+                VmmProcessGlobalInspection::Conflict(VmmProcessConflict::DuplicateIdentity),
+            ),
         }
     }
 }
@@ -6491,6 +6631,8 @@ mod tests {
                 network_allocation_port: None,
                 kernel_nbd_inventory_port: None,
                 managed_vmm_socket_root: None,
+                #[cfg(target_os = "linux")]
+                managed_vmm_launch_root: None,
                 vmm_socket_receipts: None,
             }
         }
@@ -7007,6 +7149,8 @@ mod tests {
             legacy_socket_root: environment.socket_root.clone(),
             limits: ProbeLimits::default(),
             managed_vmm_socket_root: None,
+            #[cfg(target_os = "linux")]
+            managed_vmm_launch_root: None,
             vmm_socket_receipts: None,
         }
     }

@@ -243,6 +243,7 @@ mod linux {
     use std::os::unix::process::CommandExt as _;
     use std::path::{Component, Path, PathBuf};
     use std::process::{Command, Stdio};
+    use std::sync::Arc;
 
     use anyhow::{Context as _, Result};
     use cats_api::runtime_reconciliation::{
@@ -253,7 +254,7 @@ mod linux {
 
     use crate::runtime::reconciliation::{
         vmm_state_directory_from_checkpoint, ManagedVmmSocketPreparation,
-        RetainedManagedVmmSocketRoot, VmmSocketReceiptStore,
+        RetainedManagedVmmLaunchRoot, RetainedManagedVmmSocketRoot, VmmSocketReceiptStore,
     };
 
     use super::{
@@ -320,8 +321,25 @@ mod linux {
         let state_directory = vmm_state_directory_from_checkpoint(plan.checkpoint())?;
         let managed_socket_root = RetainedManagedVmmSocketRoot::open_installed()
             .context("open installed VMM socket root")?;
+        let launch_root = Arc::new(
+            RetainedManagedVmmLaunchRoot::open_existing(state_directory.clone())
+                .context("open installed VMM launch-file namespace")?,
+        );
         let socket_receipts = VmmSocketReceiptStore::open_existing(state_directory)
             .context("open installed VMM socket receipt namespace")?;
+        let receipt = socket_receipts
+            .load(runtime_incarnation)
+            .context("load checkpointed VMM ownership receipt")?
+            .context("checkpointed VMM ownership receipt is missing")?;
+        // The shared namespace guard is acquired before the first socket or
+        // launch-file mutation and remains live until exec. Recovery takes
+        // its exclusive side, so a late launcher produces a refresh rather
+        // than a leaf-replacement unlink race.
+        let launch_attempt = launch_root
+            .retain_launcher_attempt(plan.checkpoint(), &receipt)
+            .context("retain checkpointed VMM launch attempt")?
+            .context("VMM launch namespace is held by recovery")?;
+        launch_attempt.assert_ready()?;
         let api_listener = match managed_socket_root
             .prepare_existing_receipt(plan.checkpoint(), &socket_receipts)
             .context("prepare checkpointed VMM socket namespace")?
@@ -353,6 +371,7 @@ mod linux {
         memory.assert_current(*memory_bytes)?;
         serial_log.assert_current(0)?;
         vmm_log.assert_current(0)?;
+        launch_attempt.assert_ready()?;
 
         install_fixed_fd(&checkpoint_file, CHECKPOINT_FD)?;
         install_fixed_fd(&vmm, VMM_FD)?;
@@ -394,6 +413,7 @@ mod linux {
         memory.assert_current(*memory_bytes)?;
         serial_log.assert_current(0)?;
         vmm_log.assert_current(0)?;
+        launch_attempt.assert_ready()?;
         let error = command.exec();
         Err(error).context("exec exact Cloud Hypervisor descriptor")
     }

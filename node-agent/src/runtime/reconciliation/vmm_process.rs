@@ -68,7 +68,11 @@ const VMM_FD_NAME: &str = "cats-vmm-v1";
 const KERNEL_FD_NAME: &str = "cats-kernel-v1";
 const INITRAMFS_FD_NAME: &str = "cats-initramfs-v1";
 
-mod sealed {
+pub(crate) mod sealed {
+    pub(crate) trait Sealed {}
+}
+
+pub(crate) mod global_sealed {
     pub(crate) trait Sealed {}
 }
 
@@ -111,6 +115,27 @@ pub(crate) trait VmmProcessPort: sealed::Sealed + Send + Sync {
         checkpointed: CheckpointedVmmProcess<'_>,
         context: &RuntimeDesiredEffectContext,
     ) -> anyhow::Result<VmmProcessStart>;
+}
+
+/// The only provider boundary which may authorize a physical VMM start or
+/// launch-residue recovery. Implementations must bracket the same closed
+/// Node-global unit/cgroup/process/socket/file sweep as full inventory.
+pub(crate) trait VmmProcessGlobalPort:
+    global_sealed::Sealed + VmmProcessPort + Send + Sync
+{
+    fn inspect_vmm_exact_or_absent_after_node_global_sweep(
+        &self,
+        expected: &VmmProcessExpectation,
+        context: &RuntimeDesiredEffectContext,
+    ) -> anyhow::Result<VmmProcessGlobalInspection>;
+}
+
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum VmmProcessGlobalInspection {
+    Absent(ExactVmmProcessAbsenceProof),
+    Exact(ExactVmmProcessProof),
+    Conflict(VmmProcessConflict),
+    Unavailable,
 }
 
 /// Closed launch identity shared by the physical start adapter and the future
@@ -567,6 +592,29 @@ impl VmmProcessEvidence {
 pub(crate) struct ExactVmmProcessProof {
     expectation: VmmProcessExpectation,
     evidence: VmmProcessEvidence,
+}
+
+/// Ephemeral proof that the accepted exact `StartRuntime` attempt remained
+/// absent across a fresh closed Node-global sweep. Its private expectation
+/// prevents provider-local `systemctl show` absence from authorizing a
+/// namespace mutation or systemd submission.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) struct ExactVmmProcessAbsenceProof {
+    expectation: VmmProcessExpectation,
+}
+
+impl ExactVmmProcessAbsenceProof {
+    pub(super) fn for_expectation(expectation: VmmProcessExpectation) -> Self {
+        Self { expectation }
+    }
+
+    pub(crate) fn expectation(&self) -> &VmmProcessExpectation {
+        &self.expectation
+    }
+
+    pub(super) fn matches_checkpoint(&self, checkpoint: &RuntimeCheckpoint) -> bool {
+        self.expectation.checkpoint() == checkpoint
+    }
 }
 
 impl ExactVmmProcessProof {

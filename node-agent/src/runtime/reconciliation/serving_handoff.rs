@@ -3921,6 +3921,26 @@ mod tests {
         ServingPrepareFrontend,
     };
     use crate::runtime::reconciliation::signed_running::prepared_owned_observed_volume;
+    #[cfg(target_os = "linux")]
+    use crate::runtime::reconciliation::vmm_launch_artifacts::{
+        RetainedVmmLaunchArtifacts, VmmLaunchArtifactPaths,
+    };
+    #[cfg(target_os = "linux")]
+    use crate::runtime::reconciliation::vmm_process::{
+        global_sealed as vmm_global_sealed, sealed as vmm_process_sealed, CheckpointedVmmProcess,
+        VmmProcessConflict, VmmProcessGlobalInspection, VmmProcessGlobalPort, VmmProcessInspection,
+        VmmProcessPort, VmmProcessStart,
+    };
+    #[cfg(target_os = "linux")]
+    use crate::runtime::reconciliation::vmm_runtime_paths::{
+        ManagedVmmLaunchFilePaths, RetainedManagedVmmLaunchRoot, VMM_LAUNCH_FILE_NAMESPACE,
+    };
+    #[cfg(target_os = "linux")]
+    use crate::runtime::reconciliation::vmm_socket_namespace::{
+        RetainedManagedVmmSocketRoot, VmmSocketReceiptStore,
+    };
+    #[cfg(target_os = "linux")]
+    use crate::runtime::reconciliation::vmm_start_runtime_effect::StartRuntimePhysicalEffect;
     use crate::runtime::reconciliation::vmm_start_runtime_effect::{
         LaunchArtifactAuthorityPort, RetainedLaunchArtifactAuthority, StartRuntimeReservationEffect,
     };
@@ -4460,7 +4480,9 @@ mod tests {
         }
         let node_global_process = if matches!(
             checkpoint.step,
-            ReconcileStep::PrepareDevice { .. } | ReconcileStep::PrepareNetwork { .. }
+            ReconcileStep::PrepareDevice { .. }
+                | ReconcileStep::PrepareNetwork { .. }
+                | ReconcileStep::StartRuntime { .. }
         ) {
             let retained = AuthorizedBlockdStore::new(fixture.state_directory.clone())
                 .retain_prepare_device_handoff(checkpoint, desired)
@@ -4514,7 +4536,7 @@ mod tests {
             {
                 observed_volume.devices = vec![device];
             }
-            Some(
+            let scan =
                 super::super::root_provision_process::NodeGlobalManagedProcessScanAdmission::from_root_controls(
                     BTreeMap::from([(desired.cat_id.clone(), root_expectation)]),
                     root_exact
@@ -4528,9 +4550,42 @@ mod tests {
                         .map(|proof| BTreeMap::from([(desired.cat_id.clone(), proof)]))
                         .unwrap_or_default(),
                 )
+                .unwrap();
+            let scan = if matches!(checkpoint.step, ReconcileStep::StartRuntime { .. }) {
+                let checkpoint_path = host(
+                    super::super::runtime_checkpoint_path(
+                        &fixture.checkpoint_directory,
+                        &checkpoint.cat_id,
+                    )
+                    .to_str()
+                    .unwrap(),
+                );
+                let expectation =
+                    super::super::vmm_process::VmmProcessExpectation::from_checkpoint(
+                        checkpoint.clone(),
+                    )
+                    .unwrap()
+                    .with_checkpoint_path(checkpoint_path)
+                    .unwrap();
+                let exact = expectation
+                    .clone()
+                    .prove_exact_process(expectation.exact_evidence_for_test(71))
+                    .unwrap();
+                let public = exact.clone().into_process_evidence();
+                let proofs = processes
+                    .iter()
+                    .any(|process| process == &public)
+                    .then(|| BTreeMap::from([(desired.cat_id.clone(), exact)]))
+                    .unwrap_or_default();
+                scan.with_vmms(
+                    BTreeMap::from([(desired.cat_id.clone(), expectation)]),
+                    proofs,
+                )
                 .unwrap()
-                .into_admission_for_test(),
-            )
+            } else {
+                scan
+            };
+            Some(scan.into_admission_for_test())
         } else {
             None
         };
@@ -5023,6 +5078,110 @@ mod tests {
         }
     }
 
+    #[cfg(target_os = "linux")]
+    #[derive(Debug, Clone, Copy)]
+    enum VmmInspectionKind {
+        Absent,
+        Exact,
+        Conflict,
+        Unavailable,
+    }
+
+    #[cfg(target_os = "linux")]
+    struct FakePhysicalVmmPort {
+        inspections: Mutex<VecDeque<VmmInspectionKind>>,
+        starts: AtomicUsize,
+        start: VmmProcessStart,
+    }
+
+    #[cfg(target_os = "linux")]
+    impl FakePhysicalVmmPort {
+        fn new(
+            inspections: impl IntoIterator<Item = VmmInspectionKind>,
+            start: VmmProcessStart,
+        ) -> Self {
+            Self {
+                inspections: Mutex::new(inspections.into_iter().collect()),
+                starts: AtomicUsize::new(0),
+                start,
+            }
+        }
+
+        fn next(
+            &self,
+            expected: &super::super::vmm_process::VmmProcessExpectation,
+        ) -> VmmProcessInspection {
+            match self
+                .inspections
+                .lock()
+                .unwrap()
+                .pop_front()
+                .expect("fake VMM inspection exhausted")
+            {
+                VmmInspectionKind::Absent => VmmProcessInspection::Absent,
+                VmmInspectionKind::Exact => {
+                    VmmProcessInspection::Exact(Box::new(expected.exact_evidence_for_test(71)))
+                }
+                VmmInspectionKind::Conflict => {
+                    VmmProcessInspection::Conflict(VmmProcessConflict::DuplicateIdentity)
+                }
+                VmmInspectionKind::Unavailable => VmmProcessInspection::Unavailable,
+            }
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    impl vmm_process_sealed::Sealed for FakePhysicalVmmPort {}
+
+    #[cfg(target_os = "linux")]
+    impl VmmProcessPort for FakePhysicalVmmPort {
+        fn inspect(
+            &self,
+            expected: &super::super::vmm_process::VmmProcessExpectation,
+            _context: &dyn RuntimePhysicalReadContext,
+        ) -> Result<VmmProcessInspection> {
+            Ok(self.next(expected))
+        }
+
+        fn start_checkpointed(
+            &self,
+            checkpointed: CheckpointedVmmProcess<'_>,
+            context: &RuntimeDesiredEffectContext,
+        ) -> Result<VmmProcessStart> {
+            context.check_active()?;
+            checkpointed.assert_current()?;
+            self.starts.fetch_add(1, Ordering::SeqCst);
+            Ok(self.start)
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    impl vmm_global_sealed::Sealed for FakePhysicalVmmPort {}
+
+    #[cfg(target_os = "linux")]
+    impl VmmProcessGlobalPort for FakePhysicalVmmPort {
+        fn inspect_vmm_exact_or_absent_after_node_global_sweep(
+            &self,
+            expected: &super::super::vmm_process::VmmProcessExpectation,
+            _context: &RuntimeDesiredEffectContext,
+        ) -> Result<VmmProcessGlobalInspection> {
+            Ok(match self.next(expected) {
+                VmmProcessInspection::Absent => VmmProcessGlobalInspection::Absent(
+                    super::super::vmm_process::ExactVmmProcessAbsenceProof::for_expectation(
+                        expected.clone(),
+                    ),
+                ),
+                VmmProcessInspection::Exact(evidence) => VmmProcessGlobalInspection::Exact(
+                    expected.clone().prove_exact_process(*evidence)?,
+                ),
+                VmmProcessInspection::Conflict(problem) => {
+                    VmmProcessGlobalInspection::Conflict(problem)
+                }
+                VmmProcessInspection::Unavailable => VmmProcessGlobalInspection::Unavailable,
+            })
+        }
+    }
+
     #[derive(Clone, Copy)]
     enum KernelAttachBehavior {
         OutcomeUnknown,
@@ -5162,8 +5321,10 @@ mod tests {
     }
 
     fn exact_ip_binary(fixture: &Fixture, checkpoint: &RuntimeCheckpoint) -> PathBuf {
-        let ReconcileStep::PrepareNetwork { network, .. } = &checkpoint.step else {
-            panic!("exact ip fixture requires PrepareNetwork")
+        let network = match &checkpoint.step {
+            ReconcileStep::PrepareNetwork { network, .. } => network,
+            ReconcileStep::StartRuntime { network, .. } => network.as_ref(),
+            _ => panic!("exact ip fixture requires PrepareNetwork or StartRuntime"),
         };
         let path = fixture.data_directory.join("test-ip-exact");
         let alias = format!(
@@ -5287,8 +5448,10 @@ mod tests {
         context: RuntimeDesiredEffectContext,
         checkpoint: &RuntimeCheckpoint,
     ) -> RuntimeDesiredEffectContext {
-        let ReconcileStep::PrepareNetwork { network, .. } = &checkpoint.step else {
-            panic!("exact network test admission requires PrepareNetwork")
+        let network = match &checkpoint.step {
+            ReconcileStep::PrepareNetwork { network, .. } => network,
+            ReconcileStep::StartRuntime { network, .. } => network.as_ref(),
+            _ => panic!("exact network test admission requires PrepareNetwork or StartRuntime"),
         };
         let node_global_process = context.node_global_process().unwrap().clone();
         let mut observation = context.accepted_full().unwrap().observation().clone();

@@ -9,6 +9,8 @@
 use std::collections::BTreeSet;
 use std::path::Path;
 use std::sync::Arc;
+#[cfg(target_os = "linux")]
+use std::sync::Mutex;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context as _, Result};
@@ -16,6 +18,8 @@ use cats_api::runtime_reconciliation::{
     CheckpointEvidence, DesiredRuntimeSpec, PrepareDeviceFrontend, RandomId128, ReconcileStep,
     RuntimeLaunchArtifact, UnixMillis, VmmBootProvenance,
 };
+#[cfg(target_os = "linux")]
+use cats_api::runtime_reconciliation::{HostPath, ObservedRuntimeStatus};
 use cats_storage::authority::{VolumeDataAuthority, VolumeRecord};
 
 use crate::runtime_spine::{
@@ -37,7 +41,18 @@ use super::serving_blockd_process::{
 };
 use super::serving_handoff_effect::checkpoint_is_current_exact;
 use super::signed_root_provision::signed_inventory_admission_is_exact_with_networks;
+#[cfg(target_os = "linux")]
+use super::signed_root_provision::signed_start_runtime_inventory_admission_is_exact_with_networks;
 use super::vmm_launch_artifacts::{RetainedVmmLaunchArtifacts, VmmLaunchArtifactPaths};
+use super::vmm_process::VmmProcessGlobalPort;
+#[cfg(target_os = "linux")]
+use super::vmm_process::{CheckpointedVmmProcess, VmmProcessGlobalInspection, VmmProcessStart};
+#[cfg(target_os = "linux")]
+use super::vmm_runtime_paths::{ManagedVmmLaunchPreparation, RetainedManagedVmmLaunchRoot};
+#[cfg(target_os = "linux")]
+use super::vmm_socket_namespace::{
+    RetainedManagedVmmSocketRoot, VmmSocketOwnershipReceiptV1, VmmSocketReceiptStore,
+};
 use super::vmm_start_runtime::{build_start_runtime_successor, StartRuntimeCheckpointAuthority};
 #[cfg(test)]
 use super::PlatformExactVmmCidInventoryPort;
@@ -93,6 +108,35 @@ pub(crate) struct StartRuntimeReservationEffect {
     kernel_nbd: Option<KernelNbdInventoryPort>,
     artifacts: Arc<dyn LaunchArtifactAuthorityPort>,
     socket_root: ManagedVmmSocketRoot,
+}
+
+/// The fresh accepted-full `StartRuntime` owner. It adopts an exact VMM, or
+/// consumes one sealed global-absence round to publish/recover durable launch
+/// intent and submit systemd exactly once. It never advances into Guest work
+/// in the same admission.
+#[cfg_attr(
+    not(target_os = "linux"),
+    allow(
+        dead_code,
+        reason = "production VMM mutation fields are intentionally inert on non-Linux hosts"
+    )
+)]
+pub(crate) struct StartRuntimePhysicalEffect {
+    state_directory: StateDirectory,
+    network: Arc<PrepareNetworkReservationEffect>,
+    authority: Arc<dyn VolumeDataAuthority>,
+    serving_process: Arc<dyn ServingBlockdProcessGlobalPort>,
+    vmm_process: Arc<dyn VmmProcessGlobalPort>,
+    kernel_nbd: Option<KernelNbdInventoryPort>,
+    artifact_paths: VmmLaunchArtifactPaths,
+    #[cfg(target_os = "linux")]
+    socket_root: Arc<RetainedManagedVmmSocketRoot>,
+    #[cfg(target_os = "linux")]
+    launch_root: Arc<RetainedManagedVmmLaunchRoot>,
+    #[cfg(target_os = "linux")]
+    receipts: Arc<VmmSocketReceiptStore>,
+    #[cfg(target_os = "linux")]
+    submitted_admission: Mutex<Option<RandomId128>>,
 }
 
 impl StartRuntimeReservationEffect {
@@ -397,6 +441,614 @@ impl StartRuntimeReservationEffect {
             .context("StartRuntime installed launch artifacts changed")?;
         context.check_active()
     }
+}
+
+impl StartRuntimePhysicalEffect {
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "production composition passes the already-sealed process and device authorities"
+    )]
+    pub(crate) fn platform(
+        state_directory: StateDirectory,
+        artifact_paths: VmmLaunchArtifactPaths,
+        network: Arc<PrepareNetworkReservationEffect>,
+        authority: Arc<dyn VolumeDataAuthority>,
+        serving_process: Arc<dyn ServingBlockdProcessGlobalPort>,
+        vmm_process: Arc<dyn VmmProcessGlobalPort>,
+        kernel_nbd: Option<KernelNbdInventoryConfig>,
+    ) -> Result<Self> {
+        #[cfg(target_os = "linux")]
+        let socket_root = Arc::new(
+            RetainedManagedVmmSocketRoot::open_installed()
+                .context("open installed physical StartRuntime socket root")?,
+        );
+        #[cfg(target_os = "linux")]
+        let launch_root = Arc::new(
+            RetainedManagedVmmLaunchRoot::open_existing(state_directory.clone())
+                .context("open installed physical StartRuntime launch root")?,
+        );
+        #[cfg(target_os = "linux")]
+        let receipts = Arc::new(
+            VmmSocketReceiptStore::open_existing(state_directory.clone())
+                .context("open installed physical StartRuntime receipt root")?,
+        );
+        Ok(Self {
+            state_directory,
+            network,
+            authority,
+            serving_process,
+            vmm_process,
+            kernel_nbd: kernel_nbd.map(KernelNbdInventoryPort::new),
+            artifact_paths,
+            #[cfg(target_os = "linux")]
+            socket_root,
+            #[cfg(target_os = "linux")]
+            launch_root,
+            #[cfg(target_os = "linux")]
+            receipts,
+            #[cfg(target_os = "linux")]
+            submitted_admission: Mutex::new(None),
+        })
+    }
+
+    #[cfg(all(test, target_os = "linux"))]
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "tests inject each sealed physical authority independently"
+    )]
+    pub(crate) fn for_test(
+        state_directory: StateDirectory,
+        artifact_paths: VmmLaunchArtifactPaths,
+        network: Arc<PrepareNetworkReservationEffect>,
+        authority: Arc<dyn VolumeDataAuthority>,
+        serving_process: Arc<dyn ServingBlockdProcessGlobalPort>,
+        vmm_process: Arc<dyn VmmProcessGlobalPort>,
+        socket_root: Arc<RetainedManagedVmmSocketRoot>,
+        launch_root: Arc<RetainedManagedVmmLaunchRoot>,
+        receipts: Arc<VmmSocketReceiptStore>,
+    ) -> Self {
+        Self {
+            state_directory,
+            network,
+            authority,
+            serving_process,
+            vmm_process,
+            kernel_nbd: None,
+            artifact_paths,
+            socket_root,
+            launch_root,
+            receipts,
+            submitted_admission: Mutex::new(None),
+        }
+    }
+
+    pub(crate) fn try_apply(
+        &self,
+        context: &RuntimeDesiredEffectContext,
+        desired: &DesiredRuntimeSpec,
+    ) -> Result<Option<RuntimeDesiredEffectOutcome>> {
+        context.check_active()?;
+        let accepted = context.accepted_full()?;
+        let Some(runtime) = unique_runtime(&accepted.observation().runtimes, desired)? else {
+            return Ok(None);
+        };
+        if !matches!(runtime.step, ReconcileStep::StartRuntime { .. }) {
+            return Ok(None);
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            let _ = (
+                &self.state_directory,
+                &self.artifact_paths,
+                context,
+                desired,
+                runtime,
+            );
+            return Ok(Some(RuntimeDesiredEffectOutcome::RefreshInventory));
+        }
+        #[cfg(target_os = "linux")]
+        self.try_apply_linux(context, desired, runtime)
+    }
+
+    #[cfg(target_os = "linux")]
+    fn try_apply_linux(
+        &self,
+        context: &RuntimeDesiredEffectContext,
+        desired: &DesiredRuntimeSpec,
+        runtime: &ObservedRuntimeStatus,
+    ) -> Result<Option<RuntimeDesiredEffectOutcome>> {
+        let accepted = context.accepted_full()?;
+        let ReconcileStep::StartRuntime {
+            network,
+            devices,
+            runtime_incarnation,
+            process_identity_token,
+            ..
+        } = &runtime.step
+        else {
+            unreachable!("caller selected StartRuntime")
+        };
+        let [device] = devices.as_slice() else {
+            return Ok(Some(local_contract_stop()));
+        };
+        let CheckpointEvidence::Valid {
+            checkpoint_path,
+            content_digest,
+            ..
+        } = &runtime.checkpoint
+        else {
+            return Ok(Some(local_contract_stop()));
+        };
+        let store = FileCheckpointStore::open_preserving_checkpoint_temp(
+            &context.state_directory().path().join(CHECKPOINT_NAMESPACE),
+            &desired.cat_id,
+        )
+        .context("open physical StartRuntime checkpoint")?;
+        anyhow::ensure!(
+            store.path() == Path::new(checkpoint_path.as_str()),
+            "physical StartRuntime admission names another checkpoint path"
+        );
+        let Some(stored) = store
+            .load()
+            .context("load physical StartRuntime checkpoint")?
+        else {
+            return Ok(Some(RuntimeDesiredEffectOutcome::RefreshInventory));
+        };
+        if stored.content_digest() != content_digest
+            || stored.checkpoint().step != runtime.step
+            || !checkpoint_is_current_exact(desired, runtime)
+        {
+            return Ok(Some(RuntimeDesiredEffectOutcome::RefreshInventory));
+        }
+        let expectation = physical_vmm_expectation(&stored, checkpoint_path.clone())?;
+        let process_admission = context.node_global_process()?;
+        anyhow::ensure!(
+            process_admission.matches_observation(accepted.observation()),
+            "physical StartRuntime process admission is not bound to accepted full"
+        );
+        let Some((admitted_vmm_expectation, admitted_vmm)) = process_admission.vmm(&desired.cat_id)
+        else {
+            return Ok(Some(local_contract_stop()));
+        };
+        if admitted_vmm_expectation != &expectation {
+            return Ok(Some(local_contract_stop()));
+        }
+        if let Some(admitted_vmm) = admitted_vmm {
+            return Ok(Some(
+                match self
+                    .vmm_process
+                    .inspect_vmm_exact_or_absent_after_node_global_sweep(&expectation, context)
+                    .context("reinspect admitted physical VMM")?
+                {
+                    VmmProcessGlobalInspection::Exact(current) if &current == admitted_vmm => {
+                        RuntimeDesiredEffectOutcome::RefreshInventory
+                    }
+                    VmmProcessGlobalInspection::Exact(_)
+                    | VmmProcessGlobalInspection::Conflict(_) => local_contract_stop(),
+                    VmmProcessGlobalInspection::Absent(_)
+                    | VmmProcessGlobalInspection::Unavailable => {
+                        RuntimeDesiredEffectOutcome::RefreshInventory
+                    }
+                },
+            ));
+        }
+
+        let network_admission = context.node_global_network()?;
+        let Some(expected_networks) = network_admission.expected_networks(&desired.cat_id, network)
+        else {
+            return Ok(Some(local_contract_stop()));
+        };
+        let [_expected_network] = expected_networks.as_slice() else {
+            return Ok(Some(RuntimeDesiredEffectOutcome::RefreshInventory));
+        };
+        if !signed_start_runtime_inventory_admission_is_exact_with_networks(
+            accepted,
+            desired,
+            runtime,
+            &expected_networks,
+            runtime_incarnation,
+        ) {
+            return Ok(Some(local_contract_stop()));
+        }
+        let Some((serving_expectation, Some(serving))) =
+            process_admission.serving_blockd(&desired.cat_id)
+        else {
+            return Ok(Some(RuntimeDesiredEffectOutcome::RefreshInventory));
+        };
+        if !serving_expectation.matches_device_contract(&desired.cat_id, device) {
+            return Ok(Some(local_contract_stop()));
+        }
+        let (volume_id, observed_device, kernel_nbd_proof) = match &device.frontend {
+            PrepareDeviceFrontend::VhostUserBlk { .. } => {
+                let Some((volume_id, observed)) = serving.vhost_device_projection() else {
+                    return Ok(Some(local_contract_stop()));
+                };
+                (volume_id, observed, None)
+            }
+            PrepareDeviceFrontend::KernelNbd { .. } => {
+                let pool = context.kernel_nbd_pool()?;
+                anyhow::ensure!(
+                    pool.matches_observation(accepted.observation()),
+                    "physical StartRuntime kernel-NBD proof is not admission-bound"
+                );
+                let exact = pool
+                    .exact_device(&desired.cat_id)
+                    .context("physical StartRuntime lacks exact kernel-NBD device")?;
+                if exact.listener().expectation() != serving_expectation
+                    || !exact.matches_prepared_device(&desired.cat_id, device)
+                {
+                    return Ok(Some(local_contract_stop()));
+                }
+                let (volume_id, observed) = exact.projection();
+                (volume_id, observed, Some(exact))
+            }
+        };
+        if !prepare_network_volume_admission_is_exact(
+            desired,
+            runtime,
+            device,
+            &volume_id,
+            Some(&observed_device),
+        ) || !matches!(
+            runtime.processes.as_slice(),
+            [process] if serving.matches_public_process(process)
+        ) {
+            return Ok(Some(local_contract_stop()));
+        }
+        let first_authority = self
+            .authority
+            .load_volume(serving_expectation.volume_id())
+            .context("load physical StartRuntime Volume authority")?;
+        anyhow::ensure!(
+            serving_expectation.matches_current_authority(&first_authority),
+            "physical StartRuntime Volume authority conflicts with admission"
+        );
+        let first_lease_expiry = first_authority
+            .lease_expires_at
+            .context("physical StartRuntime Volume authority lacks serving lease")?;
+        let artifacts = RetainedVmmLaunchArtifacts::open(&self.artifact_paths)
+            .context("retain physical StartRuntime launch artifacts")?;
+        CheckpointedVmmProcess::prepare(&expectation, &store, &stored, &artifacts)
+            .context("validate physical StartRuntime checkpoint and artifacts")?;
+        let socket_paths = self
+            .socket_root
+            .planner()
+            .paths_from_checkpoint(stored.checkpoint())?;
+        let launch_paths = ManagedVmmLaunchFilePaths::paths_from_checkpoint(
+            &self.state_directory,
+            stored.checkpoint(),
+        )?;
+        anyhow::ensure!(
+            socket_paths.api_socket_path() == expectation.api_socket_path()
+                && socket_paths.vsock_socket_path() == expectation.vsock_socket_path()
+                && launch_paths.memory_file_path() == expectation.memory_file_path()
+                && launch_paths.serial_log_path() == expectation.serial_log_path()
+                && launch_paths.vmm_log_path() == expectation.vmm_log_path(),
+            "physical StartRuntime managed path authority changed"
+        );
+
+        // Holding the exclusive namespace guard closes every supported late
+        // launcher while the global absence proof is refreshed and consumed.
+        let Some(namespace_guard) = self.launch_root.try_lock_effect_namespace()? else {
+            return Ok(Some(RuntimeDesiredEffectOutcome::RefreshInventory));
+        };
+        let _initial_authority = namespace_guard.bind_fresh_absence(
+            self.revalidate_absent_physical_authority(
+                context,
+                &store,
+                &stored,
+                &expectation,
+                serving_expectation,
+                serving,
+                kernel_nbd_proof,
+                &first_authority,
+                first_lease_expiry,
+                &artifacts,
+            )?,
+            stored.checkpoint(),
+        )?;
+
+        let receipt = match self.receipts.load(runtime_incarnation)? {
+            Some(receipt) => {
+                receipt.validate_against(
+                    stored.checkpoint(),
+                    &self.state_directory,
+                    &self.socket_root,
+                )?;
+                receipt
+            }
+            None => {
+                let nonce =
+                    fresh_receipt_nonce(runtime_incarnation, process_identity_token, device)?;
+                let receipt = VmmSocketOwnershipReceiptV1::from_checkpoint(
+                    stored.checkpoint(),
+                    &self.state_directory,
+                    &self.socket_root,
+                    nonce,
+                )?;
+                // Receipt publication is itself a mutation boundary.
+                let receipt_authority = namespace_guard.bind_fresh_absence(
+                    self.revalidate_absent_physical_authority(
+                        context,
+                        &store,
+                        &stored,
+                        &expectation,
+                        serving_expectation,
+                        serving,
+                        kernel_nbd_proof,
+                        &first_authority,
+                        first_lease_expiry,
+                        &artifacts,
+                    )?,
+                    stored.checkpoint(),
+                )?;
+                receipt_authority.assert_for(&self.launch_root, stored.checkpoint())?;
+                self.receipts.publish(&receipt)?;
+                self.receipts
+                    .load(runtime_incarnation)?
+                    .context("published physical StartRuntime receipt disappeared")?
+            }
+        };
+        receipt.validate_against(
+            stored.checkpoint(),
+            &self.state_directory,
+            &self.socket_root,
+        )?;
+
+        let launch_authority = namespace_guard.bind_fresh_absence(
+            self.revalidate_absent_physical_authority(
+                context,
+                &store,
+                &stored,
+                &expectation,
+                serving_expectation,
+                serving,
+                kernel_nbd_proof,
+                &first_authority,
+                first_lease_expiry,
+                &artifacts,
+            )?,
+            stored.checkpoint(),
+        )?;
+        let preparation = self.launch_root.prepare_existing_receipt(
+            &launch_authority,
+            stored.checkpoint(),
+            &receipt,
+        )?;
+        let ready = match preparation {
+            ManagedVmmLaunchPreparation::PublishedIntent => {
+                return Ok(Some(RuntimeDesiredEffectOutcome::RefreshInventory));
+            }
+            ManagedVmmLaunchPreparation::Residue(residue) => {
+                let cleanup_authority = namespace_guard.bind_fresh_absence(
+                    self.revalidate_absent_physical_authority(
+                        context,
+                        &store,
+                        &stored,
+                        &expectation,
+                        serving_expectation,
+                        serving,
+                        kernel_nbd_proof,
+                        &first_authority,
+                        first_lease_expiry,
+                        &artifacts,
+                    )?,
+                    stored.checkpoint(),
+                )?;
+                residue.recover(&cleanup_authority, stored.checkpoint())?;
+                return Ok(Some(RuntimeDesiredEffectOutcome::RefreshInventory));
+            }
+            ManagedVmmLaunchPreparation::Ready(ready) => ready,
+        };
+        ready.assert_ready()?;
+        let submit_authority = namespace_guard.bind_fresh_absence(
+            self.revalidate_absent_physical_authority(
+                context,
+                &store,
+                &stored,
+                &expectation,
+                serving_expectation,
+                serving,
+                kernel_nbd_proof,
+                &first_authority,
+                first_lease_expiry,
+                &artifacts,
+            )?,
+            stored.checkpoint(),
+        )?;
+        submit_authority.assert_for(&self.launch_root, stored.checkpoint())?;
+        ready.assert_ready()?;
+        self.receipts.assert_current()?;
+        drop(namespace_guard);
+
+        // This is the sole submission call in the admission. Every result,
+        // including definite local exec failure or response loss, requires a
+        // new accepted full scan before another attempt.
+        self.revalidate_physical_dependencies(
+            context,
+            &store,
+            &stored,
+            serving_expectation,
+            serving,
+            kernel_nbd_proof,
+            &first_authority,
+            first_lease_expiry,
+            &artifacts,
+        )?;
+        ready.assert_ready()?;
+        let current_receipt = self
+            .receipts
+            .load(runtime_incarnation)?
+            .context("physical StartRuntime receipt disappeared before submit")?;
+        anyhow::ensure!(
+            current_receipt == receipt,
+            "physical StartRuntime receipt changed before submit"
+        );
+        let checkpointed =
+            CheckpointedVmmProcess::prepare(&expectation, &store, &stored, &artifacts)?;
+        let observation_id = &context.accepted_full()?.observation().observation_id;
+        let mut submitted = self
+            .submitted_admission
+            .lock()
+            .map_err(|_| anyhow::anyhow!("physical StartRuntime submission gate poisoned"))?;
+        if submitted.as_ref() == Some(observation_id) {
+            return Ok(Some(RuntimeDesiredEffectOutcome::RefreshInventory));
+        }
+        *submitted = Some(observation_id.clone());
+        drop(submitted);
+        let _start = match self.vmm_process.start_checkpointed(checkpointed, context)? {
+            VmmProcessStart::Submitted => VmmProcessStart::Submitted,
+            VmmProcessStart::OutcomeUnknown => VmmProcessStart::OutcomeUnknown,
+            VmmProcessStart::DefinitelyNotStarted => VmmProcessStart::DefinitelyNotStarted,
+        };
+        Ok(Some(RuntimeDesiredEffectOutcome::RefreshInventory))
+    }
+
+    #[cfg(target_os = "linux")]
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "the complete cross-provider physical launch authority is revalidated as one tuple"
+    )]
+    fn revalidate_absent_physical_authority(
+        &self,
+        context: &RuntimeDesiredEffectContext,
+        store: &FileCheckpointStore,
+        stored: &StoredCheckpoint,
+        expectation: &super::vmm_process::VmmProcessExpectation,
+        serving_expectation: &ServingBlockdExpectation,
+        admitted_serving: &ExactServingBlockdProcessProof,
+        admitted_kernel_nbd: Option<&ExactKernelNbdDeviceProof>,
+        first_authority: &VolumeRecord,
+        first_lease_expiry: UnixMillis,
+        artifacts: &RetainedVmmLaunchArtifacts,
+    ) -> Result<super::vmm_process::ExactVmmProcessAbsenceProof> {
+        self.revalidate_physical_dependencies(
+            context,
+            store,
+            stored,
+            serving_expectation,
+            admitted_serving,
+            admitted_kernel_nbd,
+            first_authority,
+            first_lease_expiry,
+            artifacts,
+        )?;
+        match self
+            .vmm_process
+            .inspect_vmm_exact_or_absent_after_node_global_sweep(expectation, context)?
+        {
+            VmmProcessGlobalInspection::Absent(absence) => Ok(absence),
+            VmmProcessGlobalInspection::Exact(_) => {
+                anyhow::bail!("physical StartRuntime VMM appeared before mutation")
+            }
+            VmmProcessGlobalInspection::Conflict(problem) => {
+                anyhow::bail!("physical StartRuntime VMM conflicts ({problem:?})")
+            }
+            VmmProcessGlobalInspection::Unavailable => {
+                anyhow::bail!("physical StartRuntime VMM inventory is unavailable")
+            }
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "all non-VMM launch dependencies are revalidated immediately before each mutation or submit"
+    )]
+    fn revalidate_physical_dependencies(
+        &self,
+        context: &RuntimeDesiredEffectContext,
+        store: &FileCheckpointStore,
+        stored: &StoredCheckpoint,
+        serving_expectation: &ServingBlockdExpectation,
+        admitted_serving: &ExactServingBlockdProcessProof,
+        admitted_kernel_nbd: Option<&ExactKernelNbdDeviceProof>,
+        first_authority: &VolumeRecord,
+        first_lease_expiry: UnixMillis,
+        artifacts: &RetainedVmmLaunchArtifacts,
+    ) -> Result<()> {
+        context.check_active()?;
+        let current_checkpoint = store
+            .load()
+            .context("reread physical StartRuntime checkpoint")?
+            .context("physical StartRuntime checkpoint disappeared")?;
+        anyhow::ensure!(
+            current_checkpoint.content_digest() == stored.content_digest()
+                && current_checkpoint.checkpoint() == stored.checkpoint(),
+            "physical StartRuntime checkpoint changed"
+        );
+        self.network
+            .revalidate_exact_reserved(context, store, stored)?;
+        let current_serving = match self
+            .serving_process
+            .inspect_serving_exact_or_absent_after_node_global_sweep(serving_expectation, context)?
+        {
+            ServingBlockdProcessInspection::Exact(evidence) => evidence,
+            ServingBlockdProcessInspection::Absent
+            | ServingBlockdProcessInspection::Conflict(_)
+            | ServingBlockdProcessInspection::Unavailable => {
+                anyhow::bail!("physical StartRuntime serving authority is no longer exact")
+            }
+        };
+        anyhow::ensure!(
+            current_serving.as_ref() == admitted_serving.evidence()
+                && current_serving.exactly_matches(serving_expectation),
+            "physical StartRuntime serving authority drifted"
+        );
+        let current_authority = self
+            .authority
+            .load_volume(serving_expectation.volume_id())?;
+        anyhow::ensure!(
+            serving_expectation.matches_current_authority(&current_authority)
+                && retirement_authority_lease_is_monotonic(
+                    first_authority,
+                    &current_authority,
+                    first_lease_expiry,
+                ),
+            "physical StartRuntime Volume authority changed"
+        );
+        match (admitted_kernel_nbd, &self.kernel_nbd) {
+            (Some(admitted), Some(inventory)) => {
+                inventory.revalidate_exact_device(context, store, stored, admitted)?
+            }
+            (None, _) => {}
+            (Some(_), None) => anyhow::bail!(
+                "physical StartRuntime kernel-NBD checkpoint lacks production inventory"
+            ),
+        }
+        artifacts.assert_current()?;
+        self.socket_root.assert_current()?;
+        self.launch_root.assert_current()?;
+        self.receipts.assert_current()?;
+        context.check_active()
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn physical_vmm_expectation(
+    stored: &StoredCheckpoint,
+    checkpoint_path: HostPath,
+) -> Result<super::vmm_process::VmmProcessExpectation> {
+    // Keep the retained launch selection behind this narrow helper so the
+    // running-tail integration can switch from current-step authority to the
+    // closed top-level `runtime_launch` field without scattering matches.
+    super::vmm_process::VmmProcessExpectation::from_checkpoint(stored.checkpoint().clone())?
+        .with_checkpoint_path(checkpoint_path)
+}
+
+#[cfg(target_os = "linux")]
+fn fresh_receipt_nonce(
+    runtime_incarnation: &RandomId128,
+    process_identity_token: &RandomId128,
+    device: &cats_api::runtime_reconciliation::PreparedDeviceInput,
+) -> Result<RandomId128> {
+    let occupied = BTreeSet::from([
+        runtime_incarnation.clone(),
+        process_identity_token.clone(),
+        device.ownership_token.clone(),
+        device.serving_process.process_identity_token.clone(),
+    ]);
+    fresh_random_id(&occupied)
 }
 
 fn fresh_runtime_identities(

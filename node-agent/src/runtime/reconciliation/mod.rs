@@ -185,6 +185,8 @@ pub(crate) use vmm_launch_artifacts::VmmLaunchArtifactPaths;
 #[allow(unused_imports)]
 pub(crate) use vmm_runtime_paths::ManagedVmmLaunchFilePaths;
 #[cfg(target_os = "linux")]
+pub(crate) use vmm_runtime_paths::RetainedManagedVmmLaunchRoot;
+#[cfg(target_os = "linux")]
 pub(crate) use vmm_socket_namespace::ManagedVmmSocketPreparation;
 #[allow(unused_imports)]
 pub(crate) use vmm_socket_namespace::{

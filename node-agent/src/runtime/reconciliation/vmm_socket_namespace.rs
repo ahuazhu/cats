@@ -629,16 +629,43 @@ struct ScannedManagedAttempt {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-struct ScannedReceipt {
+pub(crate) struct ScannedReceipt {
     identity: StableFileIdentity,
     bytes: Vec<u8>,
 }
 
 #[cfg(target_os = "linux")]
-enum ReceiptNamespaceSnapshot {
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum ReceiptNamespaceSnapshot {
     Exact(std::collections::BTreeMap<String, ScannedReceipt>),
     Residue,
     Unavailable,
+}
+
+#[cfg(target_os = "linux")]
+impl ReceiptNamespaceSnapshot {
+    pub(crate) fn receipt_for_checkpoint(
+        &self,
+        checkpoint: &RuntimeCheckpoint,
+    ) -> anyhow::Result<Option<VmmSocketOwnershipReceiptV1>> {
+        let Self::Exact(receipts) = self else {
+            return Ok(None);
+        };
+        let ReconcileStep::StartRuntime {
+            runtime_incarnation,
+            ..
+        } = &checkpoint.step
+        else {
+            anyhow::bail!("VMM receipt snapshot requires StartRuntime")
+        };
+        let name = receipt_file_name(runtime_incarnation)?
+            .into_string()
+            .map_err(|_| anyhow::anyhow!("VMM receipt filename is not UTF-8"))?;
+        receipts
+            .get(&name)
+            .map(|receipt| decode_receipt(&receipt.bytes))
+            .transpose()
+    }
 }
 
 #[cfg(target_os = "linux")]
@@ -883,7 +910,7 @@ fn scan_managed_vmm_socket_root_linux_inner(
 }
 
 #[cfg(target_os = "linux")]
-fn scan_receipt_namespace_snapshot(
+pub(crate) fn scan_receipt_namespace_snapshot(
     root: &RetainedManagedVmmSocketRoot,
     receipts: &VmmSocketReceiptStore,
     expected_checkpoints: &[&RuntimeCheckpoint],

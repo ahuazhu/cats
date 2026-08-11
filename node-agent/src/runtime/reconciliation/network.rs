@@ -174,8 +174,10 @@ impl NodeGlobalNetworkScanAdmission {
 
     #[cfg(test)]
     pub(crate) fn absent_checkpoint_for_test(checkpoint: &RuntimeCheckpoint) -> Result<Self> {
-        let ReconcileStep::PrepareNetwork { network, .. } = &checkpoint.step else {
-            anyhow::bail!("test network admission requires PrepareNetwork")
+        let network = match &checkpoint.step {
+            ReconcileStep::PrepareNetwork { network, .. } => network,
+            ReconcileStep::StartRuntime { network, .. } => network.as_ref(),
+            _ => anyhow::bail!("test network admission requires PrepareNetwork or StartRuntime"),
         };
         Self::new(
             [NetworkReservation {
@@ -188,8 +190,10 @@ impl NodeGlobalNetworkScanAdmission {
 
     #[cfg(test)]
     pub(crate) fn exact_checkpoint_for_test(checkpoint: &RuntimeCheckpoint) -> Result<Self> {
-        let ReconcileStep::PrepareNetwork { network, .. } = &checkpoint.step else {
-            anyhow::bail!("test network admission requires PrepareNetwork")
+        let network = match &checkpoint.step {
+            ReconcileStep::PrepareNetwork { network, .. } => network,
+            ReconcileStep::StartRuntime { network, .. } => network.as_ref(),
+            _ => anyhow::bail!("test network admission requires PrepareNetwork or StartRuntime"),
         };
         Self::new(
             [NetworkReservation {

@@ -375,6 +375,7 @@ async fn spawn_signed_runtime_cutover_with_overrides(
                 Arc::clone(&effect_root_process_ports.retirement),
                 Arc::clone(&effect_root_process_ports.global),
                 Arc::clone(&effect_root_process_ports.serving),
+                Arc::clone(&effect_root_process_ports.vmm),
                 Arc::clone(&effect_root_process_ports.vmm_cid),
             ),
             effect_prepare_frontend,

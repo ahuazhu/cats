@@ -16,9 +16,9 @@ use cats_api::runtime_reconciliation::{
     ContractVersion, ControlHandshakeEvidence, DesiredRuntimeSpec, DiskKind,
     GuestTransportEvidence, HostPath, LifecycleAdmission, LocalLineageState, ObservedDiskKind,
     ObservedNetwork, ObservedRuntimeStatus, OwnershipTokenEvidence, ProcessRole, ProcessState,
-    ProgressingReason, ProvisionRootImageError, ReconcileStep, RuntimeTarget, RuntimeTransition,
-    VolumeAccess, VolumeAcquire, VolumeAuthorityEvidence, VolumeDisposition, VolumeIntent,
-    WarmSnapshotEvidence,
+    ProgressingReason, ProvisionRootImageError, RandomId128, ReconcileStep, RuntimeTarget,
+    RuntimeTransition, VolumeAccess, VolumeAcquire, VolumeAuthorityEvidence, VolumeDisposition,
+    VolumeIntent, WarmSnapshotEvidence,
 };
 use cats_blockd::target_control::provision_root_image_request;
 use cats_storage::authority::{AttachmentLineageIdentity, VolumeDataAuthority, VolumeRecord};
@@ -57,7 +57,8 @@ use super::serving_handoff_effect::{
 use super::signed_running::{
     expected_provision_heads, provision_checkpoint_is_bound, ProvisionHeadRead,
 };
-use super::vmm_start_runtime_effect::StartRuntimeReservationEffect;
+use super::vmm_process::VmmProcessGlobalPort;
+use super::vmm_start_runtime_effect::{StartRuntimePhysicalEffect, StartRuntimeReservationEffect};
 use super::{
     ensure_root_provision_process_from_persisted_checkpoint, AuthorizedBlockdStore,
     FileCheckpointStore, PlatformRootProvisionProcessIdentityPort,
@@ -150,12 +151,14 @@ pub(crate) struct SignedRunningEffect {
     kernel_nbd_attach: Option<KernelNbdAttachEffect>,
     prepare_network: Option<Arc<PrepareNetworkReservationEffect>>,
     start_runtime: Option<StartRuntimeReservationEffect>,
+    physical_start_runtime: Option<StartRuntimePhysicalEffect>,
 }
 
 pub(crate) struct SignedRunningProcessPorts {
     retirement: Arc<dyn RootProvisionProcessRetirementPort>,
     root_global: Arc<dyn RootProvisionProcessGlobalPort>,
     serving_global: Arc<dyn ServingBlockdProcessGlobalPort>,
+    vmm_global: Arc<dyn VmmProcessGlobalPort>,
     vmm_cid: Arc<dyn VmmCidInventoryPort>,
 }
 
@@ -193,12 +196,14 @@ impl SignedRunningProcessPorts {
         retirement: Arc<dyn RootProvisionProcessRetirementPort>,
         root_global: Arc<dyn RootProvisionProcessGlobalPort>,
         serving_global: Arc<dyn ServingBlockdProcessGlobalPort>,
+        vmm_global: Arc<dyn VmmProcessGlobalPort>,
         vmm_cid: Arc<dyn VmmCidInventoryPort>,
     ) -> Self {
         Self {
             retirement,
             root_global,
             serving_global,
+            vmm_global,
             vmm_cid,
         }
     }
@@ -257,14 +262,23 @@ impl SignedRunningEffect {
             state_directory.path().join(CHECKPOINT_NAMESPACE),
         ));
         let start_runtime = StartRuntimeReservationEffect::platform(
+            state_directory.clone(),
+            vmm_launch_artifacts.clone(),
+            Arc::clone(&prepare_network),
+            Arc::clone(&authority),
+            Arc::clone(&process_ports.serving_global),
+            process_ports.vmm_cid,
+            kernel_nbd_inventory.clone(),
+        );
+        let physical_start_runtime = StartRuntimePhysicalEffect::platform(
             state_directory,
             vmm_launch_artifacts,
             Arc::clone(&prepare_network),
             Arc::clone(&authority),
             Arc::clone(&process_ports.serving_global),
-            process_ports.vmm_cid,
+            Arc::clone(&process_ports.vmm_global),
             kernel_nbd_inventory,
-        );
+        )?;
         Ok(Self {
             running_admission: Some(running_admission),
             acquire,
@@ -287,6 +301,7 @@ impl SignedRunningEffect {
             kernel_nbd_attach,
             prepare_network: Some(prepare_network),
             start_runtime: Some(start_runtime),
+            physical_start_runtime: Some(physical_start_runtime),
         })
     }
 }
@@ -324,6 +339,11 @@ impl RuntimeDesiredEffect for SignedRunningEffect {
         }
         if let Some(start_runtime) = &self.start_runtime {
             if let Some(outcome) = start_runtime.try_apply(&context, desired)? {
+                return Ok(outcome);
+            }
+        }
+        if let Some(physical_start_runtime) = &self.physical_start_runtime {
+            if let Some(outcome) = physical_start_runtime.try_apply(&context, desired)? {
                 return Ok(outcome);
             }
         }
@@ -1022,6 +1042,33 @@ pub(super) fn signed_inventory_admission_is_exact_with_networks(
     runtime: &ObservedRuntimeStatus,
     expected_networks: &[ObservedNetwork],
 ) -> bool {
+    signed_inventory_admission_is_exact_inner(accepted, desired, runtime, expected_networks, None)
+}
+
+#[cfg(target_os = "linux")]
+pub(super) fn signed_start_runtime_inventory_admission_is_exact_with_networks(
+    accepted: &crate::runtime_spine::RuntimeDesiredEffectAdmission,
+    desired: &DesiredRuntimeSpec,
+    runtime: &ObservedRuntimeStatus,
+    expected_networks: &[ObservedNetwork],
+    runtime_incarnation: &RandomId128,
+) -> bool {
+    signed_inventory_admission_is_exact_inner(
+        accepted,
+        desired,
+        runtime,
+        expected_networks,
+        Some(runtime_incarnation),
+    )
+}
+
+fn signed_inventory_admission_is_exact_inner(
+    accepted: &crate::runtime_spine::RuntimeDesiredEffectAdmission,
+    desired: &DesiredRuntimeSpec,
+    runtime: &ObservedRuntimeStatus,
+    expected_networks: &[ObservedNetwork],
+    runtime_incarnation: Option<&RandomId128>,
+) -> bool {
     let observation = accepted.observation();
     let expected_applied = AppliedDesiredEvidence {
         desired_revision: desired.desired_revision,
@@ -1045,7 +1092,7 @@ pub(super) fn signed_inventory_admission_is_exact_with_networks(
         && accepted.attestation().agent_session_epoch == accepted.session().agent_session_epoch
         && accepted.attestation().accepted_at_unix_ms < accepted.session().lease_deadline_unix_ms
         && runtime.applied_desired.as_ref() == Some(&expected_applied)
-        && runtime.runtime_incarnation.is_none()
+        && runtime.runtime_incarnation.as_ref() == runtime_incarnation
         && runtime.stable_state.is_none()
         && runtime.mounts.is_empty()
         && runtime.networks == expected_networks
@@ -2361,6 +2408,7 @@ mod tests {
                 kernel_nbd_attach: None,
                 prepare_network: None,
                 start_runtime: None,
+                physical_start_runtime: None,
             }
         }
     }
