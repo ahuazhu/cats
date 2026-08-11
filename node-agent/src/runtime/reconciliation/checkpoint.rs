@@ -1,8 +1,8 @@
 use std::ffi::{CStr, CString};
-use std::fs::{File, Metadata, OpenOptions};
+use std::fs::{DirBuilder, File, Metadata, OpenOptions};
 use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::os::fd::{AsRawFd, FromRawFd};
-use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
+use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
 use std::sync::{Mutex, MutexGuard};
 
@@ -202,7 +202,10 @@ impl FileCheckpointStore {
         cat_id: &Id,
         settle_checkpoint_temp: bool,
     ) -> Result<Self, CheckpointStoreError> {
-        std::fs::create_dir_all(directory)
+        let mut directory_builder = DirBuilder::new();
+        directory_builder.recursive(true).mode(0o700);
+        directory_builder
+            .create(directory)
             .map_err(|source| io_error("create checkpoint directory", directory, source))?;
 
         let mut options = OpenOptions::new();
@@ -1848,6 +1851,24 @@ mod retained_checkpoint_tests {
     use cats_api::runtime_reconciliation::decode_runtime_checkpoint;
 
     use super::*;
+
+    #[test]
+    fn newly_created_checkpoint_namespace_uses_an_explicit_private_mode() {
+        let checkpoint = decode_runtime_checkpoint(include_bytes!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../testdata/runtime-reconciliation-v1-start-runtime-checkpoint.json"
+        )))
+        .unwrap();
+        let root = tempfile::tempdir().unwrap();
+        let namespace = root.path().join("checkpoints");
+
+        let _store = FileCheckpointStore::open(&namespace, &checkpoint.cat_id).unwrap();
+
+        assert_eq!(
+            std::fs::metadata(namespace).unwrap().permissions().mode() & 0o777,
+            0o700
+        );
+    }
 
     #[test]
     fn retained_checkpoint_rejects_a_lexical_leaf_replacement() {
