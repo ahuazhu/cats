@@ -17,7 +17,8 @@ use cats_api::runtime_reconciliation::{
     decode_runtime_volume_transition_error, decode_runtime_volume_transition_success,
     encode_runtime_volume_transition_request, AcquireOrigin, AdmissionInventoryAttestation,
     AgentSession, CleanupRelease, CleanupTarget, ContractErrorDetail, ContractName, DiskKind,
-    LastVolumeTransition, NormalAcquireRequest, NormalAcquireResult, ReleaseRequest, ReleaseResult,
+    FilesystemInitialization, LastVolumeTransition, NormalAcquireRequest, NormalAcquireResult,
+    PersistentFilesystemBinding, PersistentInitializationReceipt, ReleaseRequest, ReleaseResult,
     RemoteHead, RuntimeSpineHttpProblem, RuntimeVolumeAuthorityRejection, RuntimeVolumeTransition,
     RuntimeVolumeTransitionError, RuntimeVolumeTransitionErrorDetail,
     RuntimeVolumeTransitionOutcome, RuntimeVolumeTransitionPreconditionProblem,
@@ -65,6 +66,23 @@ pub trait A19SignedVolumeTransitionTransport: Send + Sync {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum NormalAcquireAttempt {
     Granted(Box<AuthorizedServingAttachment>),
+    RetryExact,
+    RefreshInventory,
+    ReplanDesired,
+    SessionReplacementRequired,
+    IdentityRepairRequired,
+    AuthorityRejected(RuntimeVolumeAuthorityRejection),
+    StopForLocalContract,
+    StopForDeploymentMismatch,
+    Ambiguous,
+}
+
+/// Closed result classes for the one-time PersistentDisk initialization CAS.
+/// Ambiguous transport never becomes success; the exact checkpointed request
+/// is retried and Control's Disk tuple provides idempotence.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CommitInitializedAttempt {
+    Committed(PersistentInitializationReceipt),
     RetryExact,
     RefreshInventory,
     ReplanDesired,
@@ -242,6 +260,53 @@ where
                 Ok(NormalReleaseAttempt::StopForDeploymentMismatch)
             }
             SignedVolumeTransitionResponse::Ambiguous => Ok(NormalReleaseAttempt::Ambiguous),
+        }
+    }
+
+    pub fn commit_initialized(
+        &self,
+        request: &RuntimeVolumeTransitionRequest,
+        volume: &VolumeIntent,
+        accepted: &NormalAcquireAcceptedContext,
+        deadline: Instant,
+    ) -> Result<CommitInitializedAttempt, NormalAcquireClientError> {
+        let body = encode_runtime_volume_transition_request(request)
+            .map_err(NormalAcquireClientError::InvalidRequest)?;
+        let (filesystem, new_remote_head) = validate_local_commit_initialized(request, volume)?;
+        validate_accepted_context(request, accepted)?;
+        let response = match self.transport.post_a19_signed_json(
+            RUNTIME_VOLUME_TRANSITION_PATH,
+            &body,
+            RUNTIME_VOLUME_TRANSITION_SUCCESS_MAX_WIRE_BYTES,
+            deadline,
+        ) {
+            Ok(response) => response,
+            Err(_) => return Ok(CommitInitializedAttempt::Ambiguous),
+        };
+        match response {
+            SignedVolumeTransitionResponse::Success(body) => {
+                let Ok(success) = decode_runtime_volume_transition_success(&body) else {
+                    return Ok(CommitInitializedAttempt::Ambiguous);
+                };
+                let Some(receipt) =
+                    exact_commit_initialized_success(request, filesystem, new_remote_head, success)
+                else {
+                    return Ok(CommitInitializedAttempt::Ambiguous);
+                };
+                Ok(CommitInitializedAttempt::Committed(receipt))
+            }
+            SignedVolumeTransitionResponse::ClosedError { status, body } => {
+                let Ok(error) = decode_runtime_volume_transition_error(&body) else {
+                    return Ok(CommitInitializedAttempt::Ambiguous);
+                };
+                Ok(map_closed_commit_initialized_error(
+                    status, &error, request, volume, accepted,
+                ))
+            }
+            SignedVolumeTransitionResponse::PlainRouteNotFound => {
+                Ok(CommitInitializedAttempt::StopForDeploymentMismatch)
+            }
+            SignedVolumeTransitionResponse::Ambiguous => Ok(CommitInitializedAttempt::Ambiguous),
         }
     }
 }
@@ -493,6 +558,45 @@ fn validate_local_release_request<'a>(
     Ok(cleanup)
 }
 
+fn validate_local_commit_initialized<'a>(
+    request: &'a RuntimeVolumeTransitionRequest,
+    volume: &VolumeIntent,
+) -> Result<(&'a PersistentFilesystemBinding, &'a RemoteHead), NormalAcquireClientError> {
+    let RuntimeVolumeTransition::CommitInitialized {
+        filesystem,
+        new_remote_head,
+    } = &request.transition
+    else {
+        return Err(NormalAcquireClientError::InvalidVolumeBinding);
+    };
+    let Some(mount) = volume.mount.as_ref() else {
+        return Err(NormalAcquireClientError::InvalidVolumeBinding);
+    };
+    let FilesystemInitialization::Initialize { .. } = &mount.initialization else {
+        return Err(NormalAcquireClientError::InvalidVolumeBinding);
+    };
+    if request.placement.node_id != request.session.node_id
+        || volume.disk_kind != DiskKind::Persistent
+        || volume.access != VolumeAccess::ReadWriteOnce
+        || !matches!(volume.disposition, VolumeDisposition::Retain)
+        || filesystem.volume_intent_id != volume.volume_intent_id
+        || filesystem.disk_id != volume.disk_id
+        || filesystem.volume_id != volume.volume_id
+        || filesystem.attachment_id != volume.attachment_id
+        || filesystem.size_bytes != volume.size_bytes
+        || filesystem.guest_device != volume.guest_device
+        || filesystem.filesystem_uuid != mount.filesystem_uuid
+        || filesystem.mount_path != mount.mount_path
+        || filesystem.initialization != mount.initialization
+        || new_remote_head.generation.get() == 0
+        || new_remote_head.root_hash.is_none()
+        || new_remote_head.root_object_id.is_none()
+    {
+        return Err(NormalAcquireClientError::InvalidVolumeBinding);
+    }
+    Ok((filesystem, new_remote_head))
+}
+
 fn validate_accepted_context(
     request: &RuntimeVolumeTransitionRequest,
     accepted: &NormalAcquireAcceptedContext,
@@ -636,6 +740,40 @@ fn exact_release_success(
         .then_some(release)
 }
 
+fn exact_commit_initialized_success(
+    request: &RuntimeVolumeTransitionRequest,
+    filesystem: &PersistentFilesystemBinding,
+    new_remote_head: &RemoteHead,
+    success: cats_api::runtime_reconciliation::RuntimeVolumeTransitionSuccess,
+) -> Option<PersistentInitializationReceipt> {
+    if success.version != request.version
+        || success.session != request.session
+        || success.cat_id != request.cat_id
+        || success.desired_revision != request.desired_revision
+        || success.spec_digest != request.spec_digest
+        || success.placement != request.placement
+    {
+        return None;
+    }
+    let RuntimeVolumeTransitionOutcome::PersistentInitialized { receipt } = success.outcome else {
+        return None;
+    };
+    let FilesystemInitialization::Initialize {
+        initialization_token,
+        expected_blank_head,
+    } = &filesystem.initialization
+    else {
+        return None;
+    };
+    (receipt.disk_id == filesystem.disk_id
+        && receipt.volume_id == filesystem.volume_id
+        && receipt.initialization_token == *initialization_token
+        && receipt.filesystem_uuid == filesystem.filesystem_uuid
+        && receipt.expected_blank_head == *expected_blank_head
+        && receipt.initialized_head == *new_remote_head)
+        .then_some(receipt)
+}
+
 fn map_closed_error(
     status: u16,
     error: &RuntimeVolumeTransitionError,
@@ -709,6 +847,37 @@ fn map_closed_error(
             NormalAcquireAttempt::StopForLocalContract
         }
         _ => NormalAcquireAttempt::Ambiguous,
+    }
+}
+
+fn map_closed_commit_initialized_error(
+    status: u16,
+    error: &RuntimeVolumeTransitionError,
+    request: &RuntimeVolumeTransitionRequest,
+    volume: &VolumeIntent,
+    accepted: &NormalAcquireAcceptedContext,
+) -> CommitInitializedAttempt {
+    match map_closed_error(status, error, request, volume, accepted) {
+        NormalAcquireAttempt::Granted(_) => unreachable!("closed response cannot grant a lease"),
+        NormalAcquireAttempt::RetryExact => CommitInitializedAttempt::RetryExact,
+        NormalAcquireAttempt::RefreshInventory => CommitInitializedAttempt::RefreshInventory,
+        NormalAcquireAttempt::ReplanDesired => CommitInitializedAttempt::ReplanDesired,
+        NormalAcquireAttempt::SessionReplacementRequired => {
+            CommitInitializedAttempt::SessionReplacementRequired
+        }
+        NormalAcquireAttempt::IdentityRepairRequired => {
+            CommitInitializedAttempt::IdentityRepairRequired
+        }
+        NormalAcquireAttempt::AuthorityRejected(reason) => {
+            CommitInitializedAttempt::AuthorityRejected(reason)
+        }
+        NormalAcquireAttempt::StopForLocalContract => {
+            CommitInitializedAttempt::StopForLocalContract
+        }
+        NormalAcquireAttempt::StopForDeploymentMismatch => {
+            CommitInitializedAttempt::StopForDeploymentMismatch
+        }
+        NormalAcquireAttempt::Ambiguous => CommitInitializedAttempt::Ambiguous,
     }
 }
 

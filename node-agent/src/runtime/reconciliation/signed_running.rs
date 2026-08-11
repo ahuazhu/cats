@@ -77,6 +77,17 @@ pub(crate) trait SignedNormalAcquirePort: Send + Sync + 'static {
         accepted: &NormalAcquireAcceptedContext,
         deadline: Instant,
     ) -> Result<NormalReleaseAttempt, NormalAcquireClientError>;
+
+    fn commit_initialized(
+        &self,
+        request: &RuntimeVolumeTransitionRequest,
+        volume: &VolumeIntent,
+        accepted: &NormalAcquireAcceptedContext,
+        deadline: Instant,
+    ) -> Result<super::CommitInitializedAttempt, NormalAcquireClientError> {
+        let _ = (request, volume, accepted, deadline);
+        Err(NormalAcquireClientError::InvalidVolumeBinding)
+    }
 }
 
 impl<T> SignedNormalAcquirePort for ControlSignedNormalAcquireClient<T>
@@ -108,6 +119,18 @@ where
             expected_head,
             accepted,
             deadline,
+        )
+    }
+
+    fn commit_initialized(
+        &self,
+        request: &RuntimeVolumeTransitionRequest,
+        volume: &VolumeIntent,
+        accepted: &NormalAcquireAcceptedContext,
+        deadline: Instant,
+    ) -> Result<super::CommitInitializedAttempt, NormalAcquireClientError> {
+        ControlSignedNormalAcquireClient::commit_initialized(
+            self, request, volume, accepted, deadline,
         )
     }
 }
@@ -424,6 +447,10 @@ impl SignedRunningAcquireEffect {
             #[cfg(test)]
             after_prepare: None,
         })
+    }
+
+    pub(crate) fn volume_transition_port(&self) -> Arc<dyn SignedNormalAcquirePort> {
+        Arc::clone(&self.volume_transition)
     }
 
     #[cfg(test)]

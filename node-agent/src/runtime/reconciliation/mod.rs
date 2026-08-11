@@ -166,7 +166,7 @@ pub(crate) use kernel_nbd::{
 pub(crate) use network::{NodeGlobalNetworkAdmission, NodeGlobalNetworkScanAdmission};
 pub use normal_acquire::{
     recover_normal_acquire_from_authority, recover_normal_release_from_authority,
-    A19SignedVolumeTransitionTransport, ControlSignedNormalAcquireClient,
+    A19SignedVolumeTransitionTransport, CommitInitializedAttempt, ControlSignedNormalAcquireClient,
     NormalAcquireAcceptedContext, NormalAcquireAttempt, NormalAcquireAuthorityRecovery,
     NormalAcquireClientError, NormalReleaseAttempt, NormalReleaseAuthorityRecovery,
     RuntimeVolumeTransitionHttpClient, SignedVolumeTransitionResponse,
