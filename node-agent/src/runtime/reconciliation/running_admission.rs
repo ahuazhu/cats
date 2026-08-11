@@ -780,6 +780,59 @@ impl RunningAdmissionPreScan {
             return Ok(());
         };
         let live = session.cell().snapshot();
+        let top_is_sealed = checkpoint.cat_id == sealed.cat_id
+            && checkpoint.node_id == sealed.placement.node_id
+            && checkpoint.placement_epoch == sealed.placement.placement_epoch
+            && checkpoint.desired_revision == sealed.desired_revision
+            && checkpoint.spec_digest == sealed.spec_digest;
+        let top_is_current = checkpoint.cat_id == desired.cat_id
+            && checkpoint.node_id == desired.placement.node_id
+            && checkpoint.placement_epoch == desired.placement.placement_epoch
+            && checkpoint.desired_revision == desired.desired_revision
+            && checkpoint.spec_digest == desired.spec_digest;
+
+        // A checkpoint-first ordinary global close may have durably advanced
+        // to the current Desired before the cell mutation response was known.
+        // Once the exact sealed source is conservatively Closed, advance only
+        // that already-Closed metadata tuple so the current close journal can
+        // drain and be removed. This edge can never recreate admission.
+        let ordinary_close_source = top_is_current
+            && !matches!(desired.transition, RuntimeTransition::RequireIdle { .. })
+            && matches!(
+                checkpoint.step,
+                ReconcileStep::CloseAdmission {
+                    require_idle_attempt_id: None
+                }
+            )
+            && matches!(
+                checkpoint.require_idle,
+                RequireIdleCheckpoint::NotApplicable
+            )
+            && checkpoint_cell.lifecycle_admission() == LifecycleAdmission::Closed
+            && checkpoint_cell
+                .endpoints()
+                .iter()
+                .all(|route| route.gate == RouteGateState::Closed)
+            && live.applied_desired_revision() == sealed.desired_revision
+            && live.spec_digest() == &sealed.spec_digest
+            && live.placement().node_id == sealed.placement.node_id
+            && live.placement().placement_epoch == sealed.placement.placement_epoch
+            && live.runtime_incarnation() == checkpoint_cell.runtime_incarnation()
+            && live.guest_ipv4() == checkpoint_cell.guest_ipv4()
+            && live.endpoints().len() == checkpoint_cell.endpoints().len()
+            && live
+                .endpoints()
+                .iter()
+                .zip(checkpoint_cell.endpoints())
+                .all(|(source, current)| source.binding == current.binding);
+        if ordinary_close_source {
+            let source_closed = live.fail_closed();
+            session.cell().force_close();
+            let mut port = session.cell().port();
+            port.advance_closed(&source_closed, &checkpoint_cell)
+                .map_err(super::GateReconcileError::from)?;
+            return Ok(());
+        }
         let require_idle_needs_settlement = !matches!(
             checkpoint.require_idle,
             RequireIdleCheckpoint::NotApplicable | RequireIdleCheckpoint::Armed { .. }
@@ -793,17 +846,6 @@ impl RunningAdmissionPreScan {
         {
             return Ok(());
         }
-
-        let top_is_sealed = checkpoint.cat_id == sealed.cat_id
-            && checkpoint.node_id == sealed.placement.node_id
-            && checkpoint.placement_epoch == sealed.placement.placement_epoch
-            && checkpoint.desired_revision == sealed.desired_revision
-            && checkpoint.spec_digest == sealed.spec_digest;
-        let top_is_current = checkpoint.cat_id == desired.cat_id
-            && checkpoint.node_id == desired.placement.node_id
-            && checkpoint.placement_epoch == desired.placement.placement_epoch
-            && checkpoint.desired_revision == desired.desired_revision
-            && checkpoint.spec_digest == desired.spec_digest;
 
         if matches!(desired.transition, RuntimeTransition::RequireIdle { .. }) {
             let result = if top_is_sealed
@@ -1236,8 +1278,32 @@ impl RunningAdmissionEffect {
                 && stored.checkpoint() == &retiring.checkpoint,
             "route-retirement checkpoint changed after accepted inventory"
         );
+        let checkpoint_cell = AdmissionSnapshot::from_checkpoint(stored.checkpoint())?;
+        let current_edge_allows_live = if retiring.mode == RouteRetirementMode::EndpointOnly
+            && retiring.checkpoint_binding == DesiredCheckpointBinding::Current
+            && live.snapshot() != &checkpoint_cell
+        {
+            let endpoint_id = match &stored.checkpoint().step {
+                ReconcileStep::CloseGate { endpoint_id, .. }
+                | ReconcileStep::InstallGate { endpoint_id, .. } => endpoint_id,
+                _ => anyhow::bail!(
+                    "current Endpoint retirement cell differs outside an effect journal"
+                ),
+            };
+            session
+                .checkpoint_store()
+                .endpoint_effect_edge_allows_live(endpoint_id, live.snapshot())?
+        } else {
+            false
+        };
+        anyhow::ensure!(
+            live.snapshot() == &checkpoint_cell || current_edge_allows_live,
+            "route-retirement cell lost its exact checkpoint or stored effect edge"
+        );
         context.check_active()?;
-        let Some(action) = plan_route_retirement(retiring, desired, &stored, &live)? else {
+        let Some(action) =
+            plan_route_retirement(retiring, desired, &stored, &live, current_edge_allows_live)?
+        else {
             // A Busy RequireIdle decision is already terminal and
             // intentionally preserves its exact open source. Every other
             // no-action retirement state is waiting for cancellation-aware
@@ -1481,6 +1547,7 @@ fn plan_route_retirement(
     desired: &DesiredRuntimeSpec,
     stored: &StoredCheckpoint,
     live: &AdmissionCellObservation,
+    current_edge_allows_live: bool,
 ) -> anyhow::Result<Option<RouteRetirementAction>> {
     let checkpoint = stored.checkpoint();
     let cell = live.snapshot();
@@ -1507,8 +1574,8 @@ fn plan_route_retirement(
             match first_endpoint_action(checkpoint, desired)? {
                 Some(EndpointAction::Close { endpoint_id }) => {
                     anyhow::ensure!(
-                        cell == &checkpoint_cell,
-                        "CloseGate route retirement lost its exact predecessor cell"
+                        cell == &checkpoint_cell || current_edge_allows_live,
+                        "CloseGate route retirement lost its exact predecessor cell or edge"
                     );
                     Ok(Some(RouteRetirementAction::CloseGate(endpoint_id)))
                 }
@@ -1537,7 +1604,7 @@ fn plan_route_retirement(
                 ),
             }
         }
-        RouteRetirementMode::Global => {
+        RouteRetirementMode::GlobalDesired => {
             if matches!(desired.transition, RuntimeTransition::RequireIdle { .. }) {
                 return match &checkpoint.require_idle {
                     RequireIdleCheckpoint::NotApplicable => {
@@ -1559,6 +1626,7 @@ fn plan_route_retirement(
             }
             Ok(Some(RouteRetirementAction::CloseAll))
         }
+        RouteRetirementMode::GlobalPhysicalNegative => Ok(Some(RouteRetirementAction::CloseAll)),
     }
 }
 
@@ -2343,7 +2411,7 @@ mod tests {
             &fixture.desired,
             &fixture.desired,
             &session,
-            RouteRetirementMode::Global,
+            RouteRetirementMode::GlobalDesired,
             false,
         );
         let open = session.cell().snapshot();
@@ -2373,7 +2441,7 @@ mod tests {
             &fixture.desired,
             &fixture.desired,
             &session,
-            RouteRetirementMode::Global,
+            RouteRetirementMode::GlobalDesired,
             false,
         );
         assert_eq!(
@@ -2388,7 +2456,7 @@ mod tests {
             &fixture.desired,
             &fixture.desired,
             &session,
-            RouteRetirementMode::Global,
+            RouteRetirementMode::GlobalDesired,
             false,
         );
         assert_eq!(

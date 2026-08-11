@@ -23,7 +23,8 @@ use super::{AdmissionCellObservation, AdmissionSnapshot};
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum RouteRetirementMode {
     EndpointOnly,
-    Global,
+    GlobalDesired,
+    GlobalPhysicalNegative,
 }
 
 /// Returns the one sealed Running Desired which authorized every retained
@@ -93,7 +94,49 @@ pub(crate) fn classify_superseded_route_retirement(
         cell.snapshot() == &checkpoint_cell || cell.snapshot() == &checkpoint_cell.fail_closed(),
         "superseded route retirement cell is not the exact live predecessor"
     );
-    Ok(Some(RouteRetirementMode::Global))
+    Ok(Some(RouteRetirementMode::GlobalDesired))
+}
+
+/// Same-process checkpoint-first continuation for an Endpoint-only successor.
+/// The checkpoint already names the current successor, while the live cell may
+/// still be either endpoint of the one process-owned effect edge. This never
+/// authorizes a new edge: the caller must prove the exact stored edge for a
+/// non-identical cell and the effect rechecks it before mutation.
+pub(crate) fn classify_current_endpoint_route_retirement(
+    desired: &DesiredRuntimeSpec,
+    checkpoint: &RuntimeCheckpoint,
+    binding: DesiredCheckpointBinding,
+    predecessor: Option<&DesiredRuntimeSpec>,
+    cell: &AdmissionCellObservation,
+    stored_edge_allows_live: bool,
+) -> anyhow::Result<Option<RouteRetirementMode>> {
+    let Some(predecessor) = predecessor else {
+        return Ok(None);
+    };
+    if binding != DesiredCheckpointBinding::Current
+        || checkpoint.runtime_launch.identity().is_none()
+        || !endpoint_only_successor(predecessor, desired)
+        || !matches!(
+            checkpoint.step,
+            ReconcileStep::CloseGate { .. } | ReconcileStep::InstallGate { .. }
+        )
+    {
+        return Ok(None);
+    }
+    anyhow::ensure!(
+        checkpoint.cat_id == desired.cat_id
+            && checkpoint.node_id == desired.placement.node_id
+            && checkpoint.placement_epoch == desired.placement.placement_epoch
+            && checkpoint.desired_revision == desired.desired_revision
+            && checkpoint.spec_digest == desired.spec_digest,
+        "current Endpoint retirement checkpoint does not bind its successor Desired"
+    );
+    let checkpoint_cell = AdmissionSnapshot::from_checkpoint(checkpoint)?;
+    anyhow::ensure!(
+        cell.snapshot() == &checkpoint_cell || stored_edge_allows_live,
+        "current Endpoint retirement lacks its exact checkpoint cell or stored effect edge"
+    );
+    Ok(Some(RouteRetirementMode::EndpointOnly))
 }
 
 /// Current global-close continuation. This is intentionally disjoint from the
@@ -132,7 +175,7 @@ pub(crate) fn classify_current_global_route_retirement(
         exact_current || exact_source_busy,
         "current route-retirement journal does not match its live cell"
     );
-    Ok(Some(RouteRetirementMode::Global))
+    Ok(Some(RouteRetirementMode::GlobalDesired))
 }
 
 pub(super) fn endpoint_only_successor(old: &DesiredRuntimeSpec, new: &DesiredRuntimeSpec) -> bool {

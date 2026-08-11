@@ -11,8 +11,8 @@ use std::sync::Arc;
 
 use anyhow::{Context as _, Result};
 use cats_api::runtime_reconciliation::{
-    DesiredRuntimeSpec, Id, PrepareDeviceFrontend, RuntimeCheckpoint, RuntimeNetworkIdentity,
-    RuntimeTarget,
+    DesiredRuntimeSpec, Id, PrepareDeviceFrontend, ReconcileStep, RuntimeCheckpoint,
+    RuntimeNetworkIdentity, RuntimeTarget,
 };
 use cats_storage::authority::{VolumeDataAuthority, VolumeRecord};
 
@@ -163,6 +163,57 @@ pub(crate) fn validate_retained_running_scan_exact_set<'a>(
         ProcessProofSet::Scan(processes),
         NetworkProofSet::Scan(networks),
         kernel_nbd.map(KernelNbdProofSet::Scan),
+        true,
+    )
+    .map(Some)
+}
+
+/// Exact physical check for a current global-close/RequireIdle checkpoint
+/// whose durable top already advanced beyond the sealed Running source. The
+/// checkpoint remains the exact VMM/process expectation from this scan; only
+/// its top-level Desired coordinates are excluded from physical equality.
+/// This proof can preserve a Busy/Open source, but can never open or install a
+/// gate.
+pub(crate) fn validate_retained_running_close_scan_exact_set<'a>(
+    sealed_running: &DesiredRuntimeSpec,
+    checkpoint: &RuntimeCheckpoint,
+    volumes: &[AuthorityVolumeInventoryEvidence],
+    processes: &'a NodeGlobalManagedProcessScanAdmission,
+    networks: &NodeGlobalNetworkScanAdmission,
+    kernel_nbd: Option<&'a KernelNbdPoolScanAdmission>,
+) -> Result<Option<&'a ExactVmmProcessProof>> {
+    anyhow::ensure!(
+        sealed_running.target == RuntimeTarget::Running
+            && checkpoint.desired_revision > sealed_running.desired_revision
+            && matches!(checkpoint.step, ReconcileStep::CloseAdmission { .. }),
+        "retained close scan is not a successor of its sealed Running source"
+    );
+    let records = scanner_volume_records(checkpoint, volumes)?;
+    let devices = prepared_device_inputs(checkpoint)?;
+    anyhow::ensure!(
+        records.len() == devices.len()
+            && devices
+                .iter()
+                .all(|device| records.contains_key(&device.volume_id)),
+        "retained close scan VolumeRecords differ from the exact device set"
+    );
+    if !running_scan_components_are_exact(
+        sealed_running,
+        checkpoint,
+        processes,
+        networks,
+        kernel_nbd,
+    )? {
+        return Ok(None);
+    }
+    validate_running_exact_set(
+        sealed_running,
+        checkpoint,
+        &records,
+        ProcessProofSet::Scan(processes),
+        NetworkProofSet::Scan(networks),
+        kernel_nbd.map(KernelNbdProofSet::Scan),
+        false,
     )
     .map(Some)
 }
@@ -494,6 +545,7 @@ impl RunningLaunchAuthorityRevalidator {
             ProcessProofSet::Accepted(process_admission),
             NetworkProofSet::Accepted(network_admission),
             kernel_admission,
+            true,
         )?;
         anyhow::ensure!(
             validated_vmm == admitted_vmm,
@@ -644,16 +696,23 @@ fn validate_running_exact_set<'a>(
     processes: ProcessProofSet<'a>,
     networks: NetworkProofSet<'_>,
     kernel_nbd: Option<KernelNbdProofSet<'a>>,
+    exact_desired_coordinates: bool,
 ) -> Result<&'a ExactVmmProcessProof> {
     let retained = RetainedRuntimeLaunchAuthority::from_checkpoint(checkpoint)?;
     let launch = retained.identity();
+    let coordinates_match = checkpoint.cat_id == desired.cat_id
+        && checkpoint.node_id == desired.placement.node_id
+        && if exact_desired_coordinates {
+            checkpoint.placement_epoch == desired.placement.placement_epoch
+                && checkpoint.desired_revision == desired.desired_revision
+                && checkpoint.spec_digest == desired.spec_digest
+        } else {
+            checkpoint.placement_epoch >= desired.placement.placement_epoch
+                && checkpoint.desired_revision > desired.desired_revision
+        };
     anyhow::ensure!(
         desired.target == RuntimeTarget::Running
-            && checkpoint.cat_id == desired.cat_id
-            && checkpoint.node_id == desired.placement.node_id
-            && checkpoint.placement_epoch == desired.placement.placement_epoch
-            && checkpoint.desired_revision == desired.desired_revision
-            && checkpoint.spec_digest == desired.spec_digest
+            && coordinates_match
             && launch.vcpus == desired.runtime.vcpus
             && launch.memory_bytes == desired.runtime.memory_bytes
             && launch.boot_image_digest == desired.runtime.boot_image_digest

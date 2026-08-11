@@ -35,7 +35,8 @@ use crate::runtime_spine::{
 
 use super::{
     admission_registry::AdmissionCellRegistry,
-    classify_current_global_route_retirement, classify_superseded_route_retirement,
+    classify_current_endpoint_route_retirement, classify_current_global_route_retirement,
+    classify_superseded_route_retirement,
     guest_ready::{GuestReadyTransportPort, PlatformGuestReadyTransportPort},
     kernel_nbd::{KernelNbdInventoryPort, KernelNbdPoolScanOutcome},
     network::{
@@ -51,7 +52,9 @@ use super::{
         TargetControlProcessLaunchIdentity,
     },
     running_admission::RunningTailScanAdmission,
-    running_launch_authority::validate_retained_running_scan_exact_set,
+    running_launch_authority::{
+        validate_retained_running_close_scan_exact_set, validate_retained_running_scan_exact_set,
+    },
     runtime_checkpoint_path, sealed_running_predecessor,
     signed_running::{
         expected_provision_heads, provision_checkpoint_is_bound, request_matches_volume,
@@ -743,29 +746,65 @@ impl RuntimeInventoryScanner for CleanSlateInventoryScanner {
                 let gate_predecessor = session
                     .as_ref()
                     .and_then(|session| session.sealed_running_desired());
+                let stored_edge_allows_live =
+                    match (session.as_ref(), observed_cell.as_ref(), &checkpoint.step) {
+                        (
+                            Some(session),
+                            Some(cell),
+                            ReconcileStep::CloseGate { endpoint_id, .. },
+                        )
+                        | (
+                            Some(session),
+                            Some(cell),
+                            ReconcileStep::InstallGate { endpoint_id, .. },
+                        ) => session
+                            .checkpoint_store()
+                            .endpoint_effect_edge_allows_live(endpoint_id, cell.snapshot())?,
+                        _ => false,
+                    };
                 let retirement_mode = match (&session, &observed_cell) {
-                    (Some(_), Some(cell)) => classify_superseded_route_retirement(
-                        desired,
-                        checkpoint,
-                        checkpoint_evidence.binding,
-                        gate_predecessor.as_ref(),
-                        cell,
-                    )?
-                    .or(classify_current_global_route_retirement(
-                        desired,
-                        checkpoint,
-                        checkpoint_evidence.binding,
-                        cell,
-                    )?),
+                    (Some(_), Some(cell)) => {
+                        let mut mode = classify_superseded_route_retirement(
+                            desired,
+                            checkpoint,
+                            checkpoint_evidence.binding,
+                            gate_predecessor.as_ref(),
+                            cell,
+                        )?;
+                        if mode.is_none() {
+                            mode = classify_current_endpoint_route_retirement(
+                                desired,
+                                checkpoint,
+                                checkpoint_evidence.binding,
+                                gate_predecessor.as_ref(),
+                                cell,
+                                stored_edge_allows_live,
+                            )?;
+                        }
+                        if mode.is_none() {
+                            mode = classify_current_global_route_retirement(
+                                desired,
+                                checkpoint,
+                                checkpoint_evidence.binding,
+                                cell,
+                            )?;
+                        }
+                        mode
+                    }
                     _ => None,
                 };
-                if let (Some(session), Some(cell), Some(mode)) =
+                if let (Some(session), Some(cell), Some(mut mode)) =
                     (session.as_ref(), observed_cell.as_ref(), retirement_mode)
                 {
                     let physical = if mode == super::RouteRetirementMode::EndpointOnly {
-                        let physical_desired = gate_predecessor.as_ref().context(
-                            "Endpoint-only route retirement lacks its sealed live-gate Desired",
-                        )?;
+                        let physical_desired =
+                            if checkpoint_evidence.binding == DesiredCheckpointBinding::Current {
+                                desired
+                            } else {
+                                gate_predecessor.as_ref().context(
+                                "Endpoint-only route retirement lacks its sealed live-gate Desired",
+                            )?
+                            };
                         match validate_retained_running_scan_exact_set(
                             physical_desired,
                             checkpoint,
@@ -787,11 +826,58 @@ impl RuntimeInventoryScanner for CleanSlateInventoryScanner {
                                 Ok(mounted) => Some((vmm.clone(), mounted)),
                                 Err(_) => {
                                     context.check_active()?;
+                                    mode = super::RouteRetirementMode::GlobalPhysicalNegative;
                                     None
                                 }
                             },
-                            None => None,
+                            None => {
+                                mode = super::RouteRetirementMode::GlobalPhysicalNegative;
+                                None
+                            }
                         }
+                    } else if mode == super::RouteRetirementMode::GlobalDesired
+                        && matches!(
+                            checkpoint.require_idle,
+                            cats_api::runtime_reconciliation::RequireIdleCheckpoint::Busy {
+                                gate_closed: false,
+                                ..
+                            }
+                        )
+                    {
+                        let sealed_running = gate_predecessor.as_ref().context(
+                            "Busy/Open route retirement lacks its sealed Running source",
+                        )?;
+                        let physical_is_exact =
+                            match validate_retained_running_close_scan_exact_set(
+                                sealed_running,
+                                checkpoint,
+                                aggregate
+                                    .volumes_by_cat
+                                    .get(&desired.cat_id)
+                                    .map_or(&[], Vec::as_slice),
+                                processes,
+                                networks,
+                                kernel_nbd_pool_admission.as_ref(),
+                            )? {
+                                Some(vmm) => match probe_exact_guest_mounted_set(
+                                    guest_ready.as_ref(),
+                                    &context,
+                                    sealed_running,
+                                    checkpoint,
+                                    vmm,
+                                ) {
+                                    Ok(_) => true,
+                                    Err(_) => {
+                                        context.check_active()?;
+                                        false
+                                    }
+                                },
+                                None => false,
+                            };
+                        if !physical_is_exact {
+                            mode = super::RouteRetirementMode::GlobalPhysicalNegative;
+                        }
+                        None
                     } else {
                         None
                     };
@@ -839,7 +925,7 @@ impl RuntimeInventoryScanner for CleanSlateInventoryScanner {
                             Some(launch_predecessor.clone()),
                             session.generation(),
                             cell.clone(),
-                            super::RouteRetirementMode::Global,
+                            super::RouteRetirementMode::GlobalPhysicalNegative,
                             None,
                         )?;
                     }
@@ -875,7 +961,7 @@ impl RuntimeInventoryScanner for CleanSlateInventoryScanner {
                                 Some(launch_predecessor.clone()),
                                 session.generation(),
                                 cell.clone(),
-                                super::RouteRetirementMode::Global,
+                                super::RouteRetirementMode::GlobalPhysicalNegative,
                                 None,
                             )?;
                         }

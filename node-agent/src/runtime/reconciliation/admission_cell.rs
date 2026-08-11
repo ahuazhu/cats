@@ -606,7 +606,8 @@ impl AdmissionGatePort for AdmissionCellPort {
                 .endpoints()
                 .iter()
                 .any(|route| route.gate != RouteGateState::Closed)
-            || expected.placement() != replacement.placement()
+            || expected.placement().node_id != replacement.placement().node_id
+            || replacement.placement().placement_epoch < expected.placement().placement_epoch
             || expected.runtime_incarnation() != replacement.runtime_incarnation()
             || expected.guest_ipv4() != replacement.guest_ipv4()
             || replacement.applied_desired_revision() < expected.applied_desired_revision()

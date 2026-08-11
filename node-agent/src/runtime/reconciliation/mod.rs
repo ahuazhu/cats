@@ -185,8 +185,8 @@ pub use root_provision::{
     RootProvisionResponseHint, RootProvisionUnknownReason, UnixRootProvisionClient,
 };
 pub(crate) use route_retirement::{
-    classify_current_global_route_retirement, classify_superseded_route_retirement,
-    sealed_running_predecessor, RouteRetirementMode,
+    classify_current_endpoint_route_retirement, classify_current_global_route_retirement,
+    classify_superseded_route_retirement, sealed_running_predecessor, RouteRetirementMode,
 };
 pub(crate) use running_admission::{
     RunningAdmissionEffect, RunningAdmissionPreScan, RunningTailAdmission, RunningTailScanAdmission,
