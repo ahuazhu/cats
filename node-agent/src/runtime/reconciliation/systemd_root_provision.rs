@@ -2272,6 +2272,18 @@ impl ListenerPhysicalIdentity {
         }
     }
 
+    #[cfg(test)]
+    pub(super) fn is_test(&self) -> bool {
+        #[cfg(target_os = "linux")]
+        {
+            self.retained_path.is_none()
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            true
+        }
+    }
+
     #[cfg(target_os = "linux")]
     fn assert_path_current(&self) -> anyhow::Result<()> {
         let retained = self
@@ -2287,6 +2299,10 @@ impl ListenerPhysicalIdentity {
         frontend: &cats_api::runtime_reconciliation::PrepareDeviceFrontend,
         context: &dyn RuntimePhysicalReadContext,
     ) -> anyhow::Result<()> {
+        #[cfg(test)]
+        if self.retained_path.is_none() {
+            return context.check_active();
+        }
         let socket = match frontend {
             cats_api::runtime_reconciliation::PrepareDeviceFrontend::KernelNbd {
                 listener_socket_path,
@@ -2322,7 +2338,14 @@ impl ListenerPhysicalIdentity {
         _frontend: &cats_api::runtime_reconciliation::PrepareDeviceFrontend,
         _context: &dyn RuntimePhysicalReadContext,
     ) -> anyhow::Result<()> {
-        anyhow::bail!("serving listener physical proof is unavailable on this platform")
+        #[cfg(test)]
+        {
+            _context.check_active()
+        }
+        #[cfg(not(test))]
+        {
+            anyhow::bail!("serving listener physical proof is unavailable on this platform")
+        }
     }
 }
 

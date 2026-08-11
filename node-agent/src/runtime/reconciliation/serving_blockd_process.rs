@@ -814,6 +814,10 @@ fn assert_serving_listener_current(
     evidence: &ServingBlockdProcessEvidence,
     context: &dyn RuntimePhysicalReadContext,
 ) -> anyhow::Result<()> {
+    #[cfg(test)]
+    if evidence.listener_identity.is_test() {
+        return context.check_active();
+    }
     context.check_active()?;
     let before = crate::proc::ProcIdentity::sample(evidence.process_id);
     anyhow::ensure!(

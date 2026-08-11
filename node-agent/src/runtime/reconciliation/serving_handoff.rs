@@ -3922,7 +3922,9 @@ mod tests {
         RootProvisionProcessRetirementPort, RootProvisionProcessStart, RootProvisionProcessStop,
         TargetControlProcessPort,
     };
-    use crate::runtime::reconciliation::running_launch_authority::validate_retained_running_scan_exact_set;
+    use crate::runtime::reconciliation::running_launch_authority::{
+        validate_retained_running_scan_exact_set, RunningLaunchAuthorityRevalidator,
+    };
     use crate::runtime::reconciliation::serving_blockd_process::{
         global_sealed as serving_global_sealed, process_sealed as serving_process_sealed,
         CheckpointedServingBlockdProcess, ServingBlockdExpectation, ServingBlockdProcessConflict,
@@ -3938,12 +3940,10 @@ mod tests {
     use crate::runtime::reconciliation::vmm_launch_artifacts::{
         RetainedVmmLaunchArtifacts, VmmLaunchArtifactPaths,
     };
-    use crate::runtime::reconciliation::vmm_process::VmmProcessExpectation;
-    #[cfg(target_os = "linux")]
     use crate::runtime::reconciliation::vmm_process::{
         global_sealed as vmm_global_sealed, sealed as vmm_process_sealed, CheckpointedVmmProcess,
-        VmmProcessConflict, VmmProcessGlobalInspection, VmmProcessGlobalPort, VmmProcessInspection,
-        VmmProcessPort, VmmProcessStart,
+        VmmProcessConflict, VmmProcessExpectation, VmmProcessGlobalInspection,
+        VmmProcessGlobalPort, VmmProcessInspection, VmmProcessPort, VmmProcessStart,
     };
     #[cfg(target_os = "linux")]
     use crate::runtime::reconciliation::vmm_runtime_paths::{
@@ -5111,6 +5111,83 @@ mod tests {
         }
     }
 
+    #[derive(Clone, Copy)]
+    enum RunningVmmInspectionKind {
+        Exact,
+        Conflict,
+    }
+
+    struct FakeRunningVmmPort {
+        inspections: Mutex<VecDeque<RunningVmmInspectionKind>>,
+    }
+
+    impl FakeRunningVmmPort {
+        fn new(inspections: impl IntoIterator<Item = RunningVmmInspectionKind>) -> Self {
+            Self {
+                inspections: Mutex::new(inspections.into_iter().collect()),
+            }
+        }
+
+        fn inspect_one(&self, expected: &VmmProcessExpectation) -> VmmProcessInspection {
+            match self
+                .inspections
+                .lock()
+                .unwrap()
+                .pop_front()
+                .expect("fake Running VMM inspection exhausted")
+            {
+                RunningVmmInspectionKind::Exact => {
+                    VmmProcessInspection::Exact(Box::new(expected.exact_evidence_for_test(71)))
+                }
+                RunningVmmInspectionKind::Conflict => {
+                    VmmProcessInspection::Conflict(VmmProcessConflict::IdentityMismatch)
+                }
+            }
+        }
+    }
+
+    impl vmm_process_sealed::Sealed for FakeRunningVmmPort {}
+
+    impl VmmProcessPort for FakeRunningVmmPort {
+        fn inspect(
+            &self,
+            expected: &VmmProcessExpectation,
+            _context: &dyn RuntimePhysicalReadContext,
+        ) -> Result<VmmProcessInspection> {
+            Ok(self.inspect_one(expected))
+        }
+
+        fn start_checkpointed(
+            &self,
+            _checkpointed: CheckpointedVmmProcess<'_>,
+            _context: &RuntimeDesiredEffectContext,
+        ) -> Result<VmmProcessStart> {
+            unreachable!("Running revalidation never starts a VMM")
+        }
+    }
+
+    impl vmm_global_sealed::Sealed for FakeRunningVmmPort {}
+
+    impl VmmProcessGlobalPort for FakeRunningVmmPort {
+        fn inspect_vmm_exact_or_absent_after_node_global_sweep(
+            &self,
+            expected: &VmmProcessExpectation,
+            _context: &RuntimeDesiredEffectContext,
+        ) -> Result<VmmProcessGlobalInspection> {
+            Ok(match self.inspect_one(expected) {
+                VmmProcessInspection::Exact(evidence) => VmmProcessGlobalInspection::Exact(
+                    Box::new(expected.clone().prove_exact_process(*evidence)?),
+                ),
+                VmmProcessInspection::Conflict(problem) => {
+                    VmmProcessGlobalInspection::Conflict(problem)
+                }
+                VmmProcessInspection::Absent | VmmProcessInspection::Unavailable => {
+                    unreachable!("fake Running VMM returns only exact or conflict")
+                }
+            })
+        }
+    }
+
     #[cfg(target_os = "linux")]
     #[derive(Debug, Clone, Copy)]
     enum VmmInspectionKind {
@@ -5353,7 +5430,6 @@ mod tests {
             .into_process_evidence()
     }
 
-    #[cfg(target_os = "linux")]
     fn accepted_vmm_process(
         fixture: &Fixture,
     ) -> cats_api::runtime_reconciliation::ProcessEvidence {
@@ -5530,6 +5606,61 @@ mod tests {
             fixture.stored_checkpoint.checkpoint().step,
             ReconcileStep::StartRuntime { .. }
         ));
+    }
+
+    fn revalidate_retained_running_fixture(
+        fixture: &Fixture,
+        authority_record: VolumeRecord,
+        serving_inspection: ServingBlockdProcessInspectionKind,
+        vmm_inspection: RunningVmmInspectionKind,
+    ) -> Result<()> {
+        let context = with_exact_network_admission(
+            effect_context_with_processes(
+                fixture,
+                vec![
+                    accepted_vmm_process(fixture),
+                    accepted_serving_process(fixture),
+                ],
+            ),
+            fixture.stored_checkpoint.checkpoint(),
+        );
+        let authority = Arc::new(FixedEffectAuthority::new(authority_record));
+        let serving = Arc::new(FakeServingBlockdPort::new(
+            [serving_inspection],
+            ServingBlockdProcessStart::Submitted,
+        ));
+        let network = Arc::new(PrepareNetworkReservationEffect::new(
+            fixture.state_directory.clone(),
+            exact_ip_binary(fixture, fixture.stored_checkpoint.checkpoint()),
+            Arc::clone(&authority) as Arc<dyn VolumeDataAuthority>,
+            Arc::clone(&serving) as Arc<dyn ServingBlockdProcessGlobalPort>,
+        )?);
+        let vmm = Arc::new(FakeRunningVmmPort::new([vmm_inspection]));
+        let revalidator = RunningLaunchAuthorityRevalidator::platform_parts(
+            fixture.state_directory.clone(),
+            serving_systemd_config(fixture),
+            network,
+            authority,
+            serving,
+            vmm,
+            None,
+        );
+        let store = FileCheckpointStore::open(
+            &fixture.checkpoint_directory,
+            &fixture.acquired.desired.cat_id,
+        )?;
+        let admitted_vmm = context
+            .node_global_process()?
+            .vmm(&fixture.acquired.desired.cat_id)
+            .and_then(|(_, exact)| exact)
+            .context("test Running admission lacks exact VMM")?;
+        revalidator.revalidate_exact_retained_running(
+            &context,
+            &fixture.acquired.desired,
+            &store,
+            &fixture.stored_checkpoint,
+            admitted_vmm,
+        )
     }
 
     #[cfg(target_os = "linux")]
@@ -7236,6 +7367,67 @@ mod tests {
             None,
         )
         .is_err());
+    }
+
+    #[test]
+    fn retained_running_revalidator_accepts_the_exact_physical_authority_tuple() {
+        let mut fixture = fixture();
+        advance_fixture_to_start_runtime(&mut fixture);
+
+        revalidate_retained_running_fixture(
+            &fixture,
+            fixture.authority.volume.clone(),
+            ServingBlockdProcessInspectionKind::Exact,
+            RunningVmmInspectionKind::Exact,
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn retained_running_revalidator_rejects_volume_serving_and_vmm_drift() {
+        let mut volume_fixture = fixture();
+        advance_fixture_to_start_runtime(&mut volume_fixture);
+        let mut foreign_volume = volume_fixture.authority.volume.clone();
+        foreign_volume.lease_owner = Some(id("att_foreign"));
+        let volume_error = revalidate_retained_running_fixture(
+            &volume_fixture,
+            foreign_volume,
+            ServingBlockdProcessInspectionKind::Exact,
+            RunningVmmInspectionKind::Exact,
+        )
+        .unwrap_err();
+        assert!(
+            format!("{volume_error:#}").contains("Volume"),
+            "{volume_error:#}"
+        );
+
+        let mut serving_fixture = fixture();
+        advance_fixture_to_start_runtime(&mut serving_fixture);
+        let serving_error = revalidate_retained_running_fixture(
+            &serving_fixture,
+            serving_fixture.authority.volume.clone(),
+            ServingBlockdProcessInspectionKind::WrongStatus("volume"),
+            RunningVmmInspectionKind::Exact,
+        )
+        .unwrap_err();
+        assert!(
+            format!("{serving_error:#}").contains("serving process changed"),
+            "{serving_error:#}"
+        );
+
+        let mut vmm_fixture = fixture();
+        advance_fixture_to_start_runtime(&mut vmm_fixture);
+        let vmm_error = revalidate_retained_running_fixture(
+            &vmm_fixture,
+            vmm_fixture.authority.volume.clone(),
+            ServingBlockdProcessInspectionKind::Exact,
+            RunningVmmInspectionKind::Conflict,
+        )
+        .unwrap_err();
+        assert!(
+            format!("{vmm_error:#}").contains("VMM is no longer exact"),
+            "{vmm_error:#}"
+        );
     }
 
     #[test]

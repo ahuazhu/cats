@@ -411,6 +411,11 @@ enum VmmPhysicalAuthority {
 }
 
 impl VmmPhysicalAuthority {
+    #[cfg(test)]
+    fn is_test(&self) -> bool {
+        matches!(self, Self::Test)
+    }
+
     fn assert_current(
         &self,
         process_id: u32,
@@ -606,7 +611,7 @@ impl ExactVmmProcessProof {
         context: &dyn crate::runtime_spine::RuntimePhysicalReadContext,
     ) -> anyhow::Result<()> {
         #[cfg(test)]
-        if matches!(self.evidence.authority, VmmPhysicalAuthority::Test) {
+        if self.evidence.authority.is_test() {
             // Test providers mint this closed proof directly from the exact
             // expectation. Keep that provider seam portable instead of
             // accidentally consulting the test runner's real PID 1 on Linux.
