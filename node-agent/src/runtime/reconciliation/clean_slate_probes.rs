@@ -2020,7 +2020,7 @@ pub(crate) fn classify_local_publication_recovery(
                 .is_some_and(|blockd| checkpoint_prepared_volume_matches_blockd(checkpoint, blockd))
         });
         if !prepared_values_are_exact
-            || !data.recovery_incompleteness_is_scoped_to(&desired.cat_id, &target.volume_id)
+            || !data.recovery_incompleteness_is_scoped_to(checkpoint, target)
         {
             continue;
         }
@@ -2111,7 +2111,7 @@ struct AuthorizedBlockdDataScan {
     evidence: BTreeMap<Id, BTreeMap<Id, AuthorizedBlockdInventoryEvidence>>,
     candidate_volume_ids: BTreeSet<Id>,
     observed_volume_paths: BTreeSet<(Id, Id)>,
-    recoverable_publication_windows: BTreeSet<(Id, Id)>,
+    recoverable_publication_prefixes: BTreeSet<RecoverableAuthorizedBlockdPrefix>,
     unattributed_incomplete: bool,
     leaf_count: usize,
     complete: bool,
@@ -2125,24 +2125,98 @@ impl AuthorizedBlockdDataScan {
         self.evidence.values().map(BTreeMap::len).sum()
     }
 
-    fn recovery_incompleteness_is_scoped_to(&self, cat_id: &Id, volume_id: &Id) -> bool {
+    fn recovery_incompleteness_is_scoped_to(
+        &self,
+        checkpoint: &RuntimeCheckpoint,
+        target: &VolumeIntent,
+    ) -> bool {
         if self.complete {
             return true;
         }
-        let target = (cat_id.clone(), volume_id.clone());
-        if self.unattributed_incomplete
-            || self.recoverable_publication_windows != BTreeSet::from([target.clone()])
-        {
+        let Some(observed) = checkpoint
+            .volumes
+            .iter()
+            .find(|volume| volume.volume_id == target.volume_id)
+        else {
+            return false;
+        };
+        let predecessor_epoch = match observed.authority {
+            VolumeAuthorityEvidence::Unowned {
+                attachment_epoch, ..
+            }
+            | VolumeAuthorityEvidence::Owned {
+                attachment_epoch, ..
+            } => attachment_epoch,
+            _ => return false,
+        };
+        let Some(expected_epoch) = predecessor_epoch.get().checked_add(1) else {
+            return false;
+        };
+        let target_path = (checkpoint.cat_id.clone(), target.volume_id.clone());
+        let prefix_is_exact = self.recoverable_publication_prefixes.len() == 1
+            && self
+                .recoverable_publication_prefixes
+                .iter()
+                .next()
+                .is_some_and(|prefix| match prefix {
+                    RecoverableAuthorizedBlockdPrefix::Cat { cat_id } => {
+                        cat_id == &checkpoint.cat_id
+                    }
+                    RecoverableAuthorizedBlockdPrefix::Volume { cat_id, volume_id } => {
+                        (cat_id, volume_id) == (&checkpoint.cat_id, &target.volume_id)
+                    }
+                    RecoverableAuthorizedBlockdPrefix::Attachment {
+                        cat_id,
+                        volume_id,
+                        attachment_name,
+                    } => {
+                        (cat_id, volume_id) == (&checkpoint.cat_id, &target.volume_id)
+                            && attachment_name == &format!("attachment-{}", target.attachment_id)
+                    }
+                    RecoverableAuthorizedBlockdPrefix::Epoch {
+                        cat_id,
+                        volume_id,
+                        attachment_name,
+                        epoch_name,
+                    } => {
+                        (cat_id, volume_id) == (&checkpoint.cat_id, &target.volume_id)
+                            && attachment_name == &format!("attachment-{}", target.attachment_id)
+                            && epoch_name == &format!("epoch-{expected_epoch}")
+                    }
+                });
+        if self.unattributed_incomplete || !prefix_is_exact {
             return false;
         }
         self.observed_volume_paths.iter().all(|observed| {
-            observed == &target
+            observed == &target_path
                 || self
                     .evidence
                     .get(&observed.0)
                     .is_some_and(|volumes| volumes.contains_key(&observed.1))
         })
     }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+enum RecoverableAuthorizedBlockdPrefix {
+    Cat {
+        cat_id: Id,
+    },
+    Volume {
+        cat_id: Id,
+        volume_id: Id,
+    },
+    Attachment {
+        cat_id: Id,
+        volume_id: Id,
+        attachment_name: String,
+    },
+    Epoch {
+        cat_id: Id,
+        volume_id: Id,
+        attachment_name: String,
+        epoch_name: String,
+    },
 }
 
 /// One immutable checkpoint-namespace join for the whole data-directory
@@ -2495,7 +2569,7 @@ fn scan_authorized_blockd_data(
                 evidence: BTreeMap::new(),
                 candidate_volume_ids: BTreeSet::new(),
                 observed_volume_paths: BTreeSet::new(),
-                recoverable_publication_windows: BTreeSet::new(),
+                recoverable_publication_prefixes: BTreeSet::new(),
                 unattributed_incomplete: false,
                 leaf_count: 0,
                 complete: true,
@@ -2509,7 +2583,7 @@ fn scan_authorized_blockd_data(
                 evidence: BTreeMap::new(),
                 candidate_volume_ids: BTreeSet::new(),
                 observed_volume_paths: BTreeSet::new(),
-                recoverable_publication_windows: BTreeSet::new(),
+                recoverable_publication_prefixes: BTreeSet::new(),
                 unattributed_incomplete: true,
                 leaf_count: 0,
                 complete: false,
@@ -2536,7 +2610,7 @@ fn scan_authorized_blockd_data(
             evidence: BTreeMap::new(),
             candidate_volume_ids: BTreeSet::new(),
             observed_volume_paths: BTreeSet::new(),
-            recoverable_publication_windows: BTreeSet::new(),
+            recoverable_publication_prefixes: BTreeSet::new(),
             unattributed_incomplete: true,
             leaf_count: 0,
             complete: false,
@@ -2549,7 +2623,7 @@ fn scan_authorized_blockd_data(
         evidence: BTreeMap::new(),
         candidate_volume_ids: BTreeSet::new(),
         observed_volume_paths: BTreeSet::new(),
-        recoverable_publication_windows: BTreeSet::new(),
+        recoverable_publication_prefixes: BTreeSet::new(),
         unattributed_incomplete: false,
         leaf_count: 0,
         complete: true,
@@ -2580,7 +2654,10 @@ fn scan_authorized_blockd_data(
         };
         if volume_entries.is_empty() {
             scan.complete = false;
-            scan.unattributed_incomplete = true;
+            scan.recoverable_publication_prefixes
+                .insert(RecoverableAuthorizedBlockdPrefix::Cat {
+                    cat_id: desired.cat_id.clone(),
+                });
             continue;
         }
         for volume_entry in volume_entries {
@@ -2615,7 +2692,19 @@ fn scan_authorized_blockd_data(
                 "attachment",
             )? {
                 OnlyDirectoryDescent::Open { name, directory } => (name, directory),
-                OnlyDirectoryDescent::Empty | OnlyDirectoryDescent::Unavailable => {
+                OnlyDirectoryDescent::Empty => {
+                    scan.complete = false;
+                    if let Some(volume_id) = &scanned_volume_id {
+                        scan.recoverable_publication_prefixes.insert(
+                            RecoverableAuthorizedBlockdPrefix::Volume {
+                                cat_id: desired.cat_id.clone(),
+                                volume_id: volume_id.clone(),
+                            },
+                        );
+                    }
+                    continue;
+                }
+                OnlyDirectoryDescent::Unavailable => {
                     scan.complete = false;
                     continue;
                 }
@@ -2630,14 +2719,14 @@ fn scan_authorized_blockd_data(
                 OnlyDirectoryDescent::Open { name, directory } => (name, directory),
                 OnlyDirectoryDescent::Empty => {
                     scan.complete = false;
-                    if desired.volumes.iter().any(|volume| {
-                        scanned_volume_id.as_ref() == Some(&volume.volume_id)
-                            && attachment_name == format!("attachment-{}", volume.attachment_id)
-                    }) {
-                        if let Some(volume_id) = &scanned_volume_id {
-                            scan.recoverable_publication_windows
-                                .insert((desired.cat_id.clone(), volume_id.clone()));
-                        }
+                    if let Some(volume_id) = &scanned_volume_id {
+                        scan.recoverable_publication_prefixes.insert(
+                            RecoverableAuthorizedBlockdPrefix::Attachment {
+                                cat_id: desired.cat_id.clone(),
+                                volume_id: volume_id.clone(),
+                                attachment_name: attachment_name.clone(),
+                            },
+                        );
                     }
                     continue;
                 }
@@ -2701,7 +2790,8 @@ fn scan_authorized_blockd_data(
                     by_name.contains_key(LAUNCH_CHECKPOINT_TEMP),
                     by_name.len(),
                 ),
-                (false, true, false, false, false, false, 1)
+                (false, false, false, false, false, false, 0)
+                    | (false, true, false, false, false, false, 1)
                     | (true, false, false, false, false, false, 1)
                     | (true, false, false, true, false, false, 2)
                     | (true, false, true, false, false, false, 2)
@@ -2727,8 +2817,14 @@ fn scan_authorized_blockd_data(
                 scan.complete = false;
                 if recoverable_publication_window {
                     if let Some(volume_id) = &scanned_volume_id {
-                        scan.recoverable_publication_windows
-                            .insert((desired.cat_id.clone(), volume_id.clone()));
+                        scan.recoverable_publication_prefixes.insert(
+                            RecoverableAuthorizedBlockdPrefix::Epoch {
+                                cat_id: desired.cat_id.clone(),
+                                volume_id: volume_id.clone(),
+                                attachment_name: attachment_name.clone(),
+                                epoch_name: epoch_name.clone(),
+                            },
+                        );
                     } else {
                         scan.unattributed_incomplete = true;
                     }

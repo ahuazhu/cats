@@ -6856,6 +6856,222 @@ mod tests {
     }
 
     #[test]
+    fn pre_scan_recovery_completes_every_authorized_blockd_directory_prefix() {
+        for acquire in [PublicationAcquire::Normal, PublicationAcquire::Takeover] {
+            for prefix in [
+                PublicationPrefix::Cat,
+                PublicationPrefix::Volume,
+                PublicationPrefix::Attachment,
+                PublicationPrefix::Epoch,
+            ] {
+                let root = tempfile::tempdir().unwrap();
+                let mut desired = desired();
+                if acquire == PublicationAcquire::Takeover {
+                    desired.volumes[0].acquire = VolumeAcquire::Takeover {
+                        authorization_id: id("takeover_directory_prefix"),
+                    };
+                    desired.spec_digest = spec_digest(&desired).unwrap();
+                }
+
+                let (expected, record, evidence) = match acquire {
+                    PublicationAcquire::Normal => {
+                        let expected = attachment(&desired);
+                        persist_acquire_checkpoint(root.path(), &desired);
+                        (expected.clone(), owned_record(&desired, &expected), None)
+                    }
+                    PublicationAcquire::Takeover => {
+                        let (expected, record, evidence, prior) =
+                            takeover_recovery_fixture(&desired, 0);
+                        let checkpoint = closed_checkpoint(
+                            &desired,
+                            ReconcileStep::AcquireVolume {
+                                request: VolumeAcquireRequest::Takeover {
+                                    authorization_id: id("takeover_directory_prefix"),
+                                },
+                            },
+                            vec![prior],
+                            unix_ms(1_900_000_000_000),
+                        );
+                        assert!(multi_acquire_checkpoint_is_bound(
+                            &checkpoint,
+                            &desired,
+                            root.path(),
+                        ));
+                        persist_checkpoint(root.path(), &checkpoint);
+                        (expected, record, Some(evidence))
+                    }
+                };
+                let data_directory =
+                    authorized_blockd_data_directory(root.path(), &desired, &expected.identity);
+                drop(
+                    AuthorizedBlockdStore::new(StateDirectory::unanchored(
+                        root.path().to_path_buf(),
+                    ))
+                    .prepare(&desired, &desired.volumes[0], &expected)
+                    .unwrap(),
+                );
+                shape_publication_prefix(&data_directory, prefix);
+
+                let recovery =
+                    SignedRunningPublicationRecovery::new(Arc::new(FakeAuthority::new(Ok(record))));
+                let recovery = if let Some(evidence) = evidence {
+                    recovery.with_volume_evidence(Arc::new(FakeEvidence {
+                        state: Arc::new(Mutex::new(EvidenceState {
+                            outcomes: VecDeque::from([evidence]),
+                            ..EvidenceState::default()
+                        })),
+                    }))
+                } else {
+                    recovery
+                };
+                assert_eq!(
+                    recovery
+                        .recover_one(recovery_context(root.path(), &desired))
+                        .unwrap(),
+                    RuntimePreScanRecoveryOutcome::Recovered {
+                        cat_id: desired.cat_id.clone(),
+                    },
+                    "{acquire:?} {prefix:?}",
+                );
+                for name in [
+                    super::super::authorized_blockd::IDENTITY_FILE,
+                    super::super::authorized_blockd::AUTHORIZED_SERVING_FILE,
+                    super::super::authorized_blockd::LAUNCH_CHECKPOINT_FILE,
+                ] {
+                    assert!(
+                        data_directory.join(name).is_file(),
+                        "{acquire:?} {prefix:?}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn pre_scan_recovery_preserves_prepared_siblings_across_target_directory_prefixes() {
+        for prefix in [
+            PublicationPrefix::Volume,
+            PublicationPrefix::Attachment,
+            PublicationPrefix::Epoch,
+        ] {
+            let root = tempfile::tempdir().unwrap();
+            let mut desired = desired();
+            desired.volumes.push(normal_persistent_volume());
+            desired.spec_digest = spec_digest(&desired).unwrap();
+
+            let prepared = normal_attachment(&desired, 0);
+            let prepared_directory =
+                authorized_blockd_data_directory(root.path(), &desired, &prepared.identity);
+            drop(
+                AuthorizedBlockdStore::new(StateDirectory::unanchored(root.path().to_path_buf()))
+                    .prepare(&desired, &desired.volumes[0], &prepared)
+                    .unwrap(),
+            );
+            let prepared_before = directory_file_snapshot(&prepared_directory);
+
+            let target = normal_attachment(&desired, 1);
+            let checkpoint = closed_checkpoint(
+                &desired,
+                ReconcileStep::AcquireVolume {
+                    request: target.checkpoint_acquire_request(),
+                },
+                vec![
+                    prepared_owned_observed_volume(
+                        &desired.volumes[0],
+                        &prepared,
+                        host(prepared_directory.clone()),
+                    ),
+                    unowned_observed_volume(&desired.volumes[1]),
+                ],
+                unix_ms(1_900_000_000_000),
+            );
+            assert!(multi_acquire_checkpoint_is_bound(
+                &checkpoint,
+                &desired,
+                root.path(),
+            ));
+            persist_checkpoint(root.path(), &checkpoint);
+
+            let target_directory =
+                authorized_blockd_data_directory(root.path(), &desired, &target.identity);
+            drop(
+                AuthorizedBlockdStore::new(StateDirectory::unanchored(root.path().to_path_buf()))
+                    .prepare(&desired, &desired.volumes[1], &target)
+                    .unwrap(),
+            );
+            shape_publication_prefix(&target_directory, prefix);
+
+            let recovery = SignedRunningPublicationRecovery::new(Arc::new(FakeAuthority::new(Ok(
+                owned_record(&desired, &target),
+            ))));
+            assert_eq!(
+                recovery
+                    .recover_one(recovery_context(root.path(), &desired))
+                    .unwrap(),
+                RuntimePreScanRecoveryOutcome::Recovered {
+                    cat_id: desired.cat_id.clone(),
+                },
+                "prepared sibling with target {prefix:?}",
+            );
+            assert_eq!(
+                directory_file_snapshot(&prepared_directory),
+                prepared_before,
+                "prepared sibling changed while recovering target {prefix:?}",
+            );
+            for name in [
+                super::super::authorized_blockd::IDENTITY_FILE,
+                super::super::authorized_blockd::AUTHORIZED_SERVING_FILE,
+                super::super::authorized_blockd::LAUNCH_CHECKPOINT_FILE,
+            ] {
+                assert!(target_directory.join(name).is_file(), "target {prefix:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn pre_scan_recovery_rejects_misattributed_authorized_blockd_directory_prefixes() {
+        for prefix in [
+            PublicationPrefix::Cat,
+            PublicationPrefix::Volume,
+            PublicationPrefix::Attachment,
+            PublicationPrefix::Epoch,
+        ] {
+            let root = tempfile::tempdir().unwrap();
+            let desired = desired();
+            let expected = attachment(&desired);
+            persist_acquire_checkpoint(root.path(), &desired);
+            let data_directory =
+                authorized_blockd_data_directory(root.path(), &desired, &expected.identity);
+            drop(
+                AuthorizedBlockdStore::new(StateDirectory::unanchored(root.path().to_path_buf()))
+                    .prepare(&desired, &desired.volumes[0], &expected)
+                    .unwrap(),
+            );
+            shape_publication_prefix(&data_directory, prefix);
+            let foreign = misattribute_publication_prefix(&data_directory, prefix);
+
+            let recovery = SignedRunningPublicationRecovery::new(Arc::new(FakeAuthority::new(Ok(
+                owned_record(&desired, &expected),
+            ))));
+            assert!(
+                !matches!(
+                    recovery.recover_one(recovery_context(root.path(), &desired)),
+                    Ok(RuntimePreScanRecoveryOutcome::Recovered { .. })
+                ),
+                "misattributed {prefix:?} prefix allowed publication",
+            );
+            assert!(
+                foreign.exists(),
+                "misattributed {prefix:?} residue was removed"
+            );
+            assert!(
+                !data_directory.exists(),
+                "misattributed {prefix:?} prefix was replaced by a target publication",
+            );
+        }
+    }
+
+    #[test]
     fn pre_scan_recovery_does_not_cross_an_unrelated_incomplete_blockd_leaf() {
         let root = tempfile::tempdir().unwrap();
         let desired = desired();
@@ -10204,6 +10420,20 @@ mod tests {
         assert!(!missing_checkpoint.exists());
     }
 
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    enum PublicationAcquire {
+        Normal,
+        Takeover,
+    }
+
+    #[derive(Clone, Copy, Debug)]
+    enum PublicationPrefix {
+        Cat,
+        Volume,
+        Attachment,
+        Epoch,
+    }
+
     #[derive(Clone, Copy, Debug)]
     enum PublicationWindow {
         BeforeIdentity,
@@ -10989,6 +11219,66 @@ mod tests {
                 .unwrap();
             }
         }
+    }
+
+    fn publication_prefix_path(
+        directory: &std::path::Path,
+        prefix: PublicationPrefix,
+    ) -> std::path::PathBuf {
+        let attachment = directory.parent().expect("epoch has attachment parent");
+        let volume = attachment.parent().expect("attachment has volume parent");
+        let cat = volume.parent().expect("volume has Cat parent");
+        match prefix {
+            PublicationPrefix::Cat => cat.to_path_buf(),
+            PublicationPrefix::Volume => volume.to_path_buf(),
+            PublicationPrefix::Attachment => attachment.to_path_buf(),
+            PublicationPrefix::Epoch => directory.to_path_buf(),
+        }
+    }
+
+    fn shape_publication_prefix(directory: &std::path::Path, prefix: PublicationPrefix) {
+        let prefix_path = publication_prefix_path(directory, prefix);
+        match prefix {
+            PublicationPrefix::Cat => {
+                let volume = directory
+                    .parent()
+                    .and_then(std::path::Path::parent)
+                    .expect("epoch has a volume ancestor");
+                std::fs::remove_dir_all(volume).unwrap();
+            }
+            PublicationPrefix::Volume => {
+                let attachment = directory.parent().expect("epoch has attachment parent");
+                std::fs::remove_dir_all(attachment).unwrap();
+            }
+            PublicationPrefix::Attachment => {
+                std::fs::remove_dir_all(directory).unwrap();
+            }
+            PublicationPrefix::Epoch => {
+                for entry in std::fs::read_dir(&prefix_path).unwrap() {
+                    let entry = entry.unwrap();
+                    assert!(entry.file_type().unwrap().is_file());
+                    std::fs::remove_file(entry.path()).unwrap();
+                }
+            }
+        }
+        assert!(prefix_path.is_dir());
+        assert_eq!(std::fs::read_dir(prefix_path).unwrap().count(), 0);
+    }
+
+    fn misattribute_publication_prefix(
+        directory: &std::path::Path,
+        prefix: PublicationPrefix,
+    ) -> std::path::PathBuf {
+        let source = publication_prefix_path(directory, prefix);
+        let foreign_name = match prefix {
+            PublicationPrefix::Cat => "cat-wrong",
+            PublicationPrefix::Volume => "volume-wrong",
+            PublicationPrefix::Attachment => "attachment-wrong",
+            PublicationPrefix::Epoch => "epoch-999",
+        };
+        let foreign = source.with_file_name(foreign_name);
+        std::fs::rename(source, &foreign).unwrap();
+        foreign
     }
 
     fn set_directory_tree_mode(root: &std::path::Path, leaf: &std::path::Path) {
