@@ -15,10 +15,11 @@ use std::sync::Arc;
 use std::thread::JoinHandle;
 use std::time::Duration;
 
+use cats_api::runtime_reconciliation::Id;
 use cats_block_client::NbdClient;
 use cats_blockd::engine::{ChunkEngine, EngineConfig, EngineError};
 use cats_blockd::nbd;
-use cats_blockd::vhost_user::{self, VhostUserOptions};
+use cats_blockd::vhost_user::{self, VhostUserDeviceId, VhostUserOptions};
 use cats_metadata_store_sqlite::SqliteMetadataStore;
 use cats_object_store_file::FileBlobStore;
 use cats_storage::MetadataStore;
@@ -153,6 +154,7 @@ fn config_space_reports_the_engine_geometry() {
     let options = VhostUserOptions {
         num_queues: 2,
         queue_size: 128,
+        ..VhostUserOptions::default()
     };
     let harness = Harness::start(options);
     let mut frontend = harness.connect();
@@ -312,16 +314,33 @@ fn discard_and_write_zeroes_zero_the_range() {
 }
 
 #[test]
-fn get_id_reports_the_volume_id() {
-    let harness = Harness::single_queue();
+fn get_id_reports_the_exact_guest_serial_not_the_volume_id() {
+    let guest_serial = Id::new("guest-root-serial").unwrap();
+    let harness = Harness::start(VhostUserOptions {
+        guest_device_serial: VhostUserDeviceId::from_guest_device_serial(&guest_serial).unwrap(),
+        ..VhostUserOptions::default()
+    });
     let mut frontend = harness.connect();
     let completion = frontend.queue(0).get_id().expect("get id");
     assert_eq!(completion.status, VIRTIO_BLK_S_OK);
     let id = String::from_utf8_lossy(&completion.data)
         .trim_end_matches('\0')
         .to_string();
-    assert_eq!(id, VOLUME_ID);
+    assert_ne!(id, VOLUME_ID);
+    assert_eq!(id, guest_serial.as_str());
     harness.shutdown(frontend);
+}
+
+#[test]
+fn guest_serial_accepts_twenty_bytes_and_rejects_twenty_one() {
+    assert!(
+        VhostUserDeviceId::from_guest_device_serial(&Id::new("12345678901234567890").unwrap())
+            .is_ok()
+    );
+    assert!(VhostUserDeviceId::from_guest_device_serial(
+        &Id::new("123456789012345678901").unwrap()
+    )
+    .is_err());
 }
 
 #[test]
@@ -385,6 +404,7 @@ fn multi_queue_requests_run_in_parallel() {
     let options = VhostUserOptions {
         num_queues: 4,
         queue_size: 256,
+        ..VhostUserOptions::default()
     };
     let harness = Harness::start(options);
     let mut frontend = harness.connect();

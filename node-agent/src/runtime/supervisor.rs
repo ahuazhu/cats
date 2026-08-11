@@ -446,10 +446,11 @@ impl NodeRuntime {
                             .vhost_user_socket
                             .as_ref()
                             .context("blockd was started without a vhost-user socket")?;
-                        disks.push(ch::vhost_user_disk_arg(
+                        disks.push(ch::vhost_user_disk_arg_with_serial(
                             socket,
                             vhost_user_queues,
                             chc.vhost_user_queue_size,
+                            &grant.disk_id,
                         )?);
                     }
                 }

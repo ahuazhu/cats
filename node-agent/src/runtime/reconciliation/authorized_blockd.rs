@@ -1568,6 +1568,8 @@ pub fn authorized_blockd_command(
         .arg(process_identity_token.as_str())
         .arg("--device-ownership-token")
         .arg(device_ownership_token.as_str())
+        .arg("--guest-device-serial")
+        .arg(checkpoint.volume.guest_device.serial.as_str())
         .arg("--metadata-store-adapter")
         .arg(&config.metadata_store.name)
         .arg("--object-store-adapter")
@@ -1642,6 +1644,7 @@ pub fn authorized_blockd_status_is_bound(
         && status.scope_id.as_ref() == Some(scope_id)
         && status.process_identity_token.as_ref() == Some(process_identity_token)
         && status.device_ownership_token.as_ref() == Some(device_ownership_token)
+        && status.guest_device_serial.as_ref() == Some(&acquired.volume.guest_device.serial)
         && status.control_only == Some(false)
         && status.remote_head.as_ref() == Some(&attachment.head)
         && status.mode
@@ -2883,6 +2886,7 @@ mod tests {
             scope_id: Some(scope_id.clone()),
             process_identity_token: Some(process_identity_token.clone()),
             device_ownership_token: Some(device_ownership_token.clone()),
+            guest_device_serial: Some(acquired.volume.guest_device.serial.clone()),
             control_only: Some(false),
             remote_head: Some(attachment.head.clone()),
             mode: match attachment.durability {
@@ -2968,6 +2972,8 @@ mod tests {
             OsString::from("00000000000000000000000000000002"),
             OsString::from("--device-ownership-token"),
             OsString::from("00000000000000000000000000000003"),
+            OsString::from("--guest-device-serial"),
+            OsString::from("cats-root-1"),
             OsString::from("--listen-vhost-user"),
             frontend.into_os_string(),
             OsString::from("--lease-ttl-ms"),
@@ -3040,6 +3046,51 @@ mod tests {
     }
 
     #[test]
+    fn kernel_and_vhost_serving_commands_bind_the_same_checkpoint_serial() {
+        let temp = tempfile::tempdir().unwrap();
+        let (desired, volume, attachment) = fixture();
+        let prepared =
+            AuthorizedBlockdStore::new(StateDirectory::unanchored(temp.path().to_path_buf()))
+                .prepare(&desired, &volume, &attachment)
+                .unwrap();
+        let control = temp.path().join("control.sock");
+        let frontends = [
+            AuthorizedBlockFrontend::NbdUnix {
+                socket: temp.path().join("nbd.sock"),
+            },
+            AuthorizedBlockFrontend::VhostUser {
+                socket: temp.path().join("vhost.sock"),
+                queues: 2,
+                queue_size: 256,
+            },
+        ];
+        for frontend in &frontends {
+            let arguments = argv(
+                &authorized_blockd_command(
+                    &launch_config(),
+                    &prepared,
+                    &id("cats-cat-1-root.scope"),
+                    &random(2),
+                    &random(3),
+                    &control,
+                    frontend,
+                )
+                .unwrap(),
+            );
+            let serial_index = arguments
+                .iter()
+                .position(|argument| argument == "--guest-device-serial")
+                .expect("Guest serial flag");
+            assert_eq!(
+                arguments.get(serial_index + 1),
+                Some(&OsString::from(
+                    prepared.checkpoint().volume.guest_device.serial.as_str()
+                ))
+            );
+        }
+    }
+
+    #[test]
     fn serving_handshake_requires_both_exact_independent_tokens() {
         let temp = tempfile::tempdir().unwrap();
         let (desired, volume, attachment) = fixture();
@@ -3078,6 +3129,24 @@ mod tests {
         wrong_device.device_ownership_token = Some(random(4));
         assert!(!authorized_blockd_status_is_bound(
             &wrong_device,
+            prepared.checkpoint(),
+            &scope_id,
+            &process_identity_token,
+            &device_ownership_token,
+        ));
+        let mut missing_serial = status.clone();
+        missing_serial.guest_device_serial = None;
+        assert!(!authorized_blockd_status_is_bound(
+            &missing_serial,
+            prepared.checkpoint(),
+            &scope_id,
+            &process_identity_token,
+            &device_ownership_token,
+        ));
+        let mut wrong_serial = status.clone();
+        wrong_serial.guest_device_serial = Some(id("cats-wrong"));
+        assert!(!authorized_blockd_status_is_bound(
+            &wrong_serial,
             prepared.checkpoint(),
             &scope_id,
             &process_identity_token,

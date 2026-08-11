@@ -4400,6 +4400,7 @@ while True:
             scope_id: Some(expected.scope_id),
             process_identity_token: Some(expected.process_identity_token),
             device_ownership_token: None,
+            guest_device_serial: None,
             control_only: Some(true),
             remote_head: Some(expected.attachment.head),
             mode: "strict".into(),

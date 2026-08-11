@@ -354,6 +354,7 @@ fn status_reports_the_configured_volume_and_attachment() {
     let status: cats_api::blockd::DurabilityStatus = serde_json::from_str(&wire).unwrap();
     assert_eq!(status.volume_id, VOL);
     assert_eq!(status.attachment_id, "attA");
+    assert_eq!(status.guest_device_serial, None);
     e.detach().unwrap();
 
     // A later attachment of the same volume reports its own attachment id, so

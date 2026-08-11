@@ -318,6 +318,8 @@ fn legacy_blockd_command(spec: LegacyBlockdCommand<'_>) -> Command {
     {
         cmd.arg("--listen-vhost-user")
             .arg(socket)
+            .arg("--guest-device-serial")
+            .arg(&spec.grant.disk_id)
             .arg("--vhost-user-queues")
             .arg(spec.vhost_user_queues.to_string())
             .arg("--vhost-user-queue-size")

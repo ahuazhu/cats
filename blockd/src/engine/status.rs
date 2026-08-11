@@ -63,6 +63,7 @@ impl ChunkEngine {
             scope_id: None,
             process_identity_token: None,
             device_ownership_token: None,
+            guest_device_serial: None,
             control_only: None,
             remote_head: self.authorized_attachment.as_ref().map(|_| remote_head),
             mode: match self.cfg.durability {

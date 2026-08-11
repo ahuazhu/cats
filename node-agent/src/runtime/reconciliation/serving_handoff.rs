@@ -289,6 +289,8 @@ impl PrepareDeviceHandoffReady {
             .arg(prepared.serving_process.process_identity_token.as_str())
             .arg("--device-ownership-token")
             .arg(prepared.ownership_token.as_str())
+            .arg("--guest-device-serial")
+            .arg(prepared.guest_device.serial.as_str())
             .arg("--metadata-store-adapter")
             .arg(&config.metadata_store.name)
             .arg("--object-store-adapter")
@@ -4946,6 +4948,8 @@ mod tests {
                         "scope" => status.scope_id = Some(id("foreign.service")),
                         "process_token" => status.process_identity_token = Some(random('9')),
                         "device_token" => status.device_ownership_token = Some(random('9')),
+                        "guest_serial" => status.guest_device_serial = Some(id("cats-foreign")),
+                        "missing_guest_serial" => status.guest_device_serial = None,
                         "control_only" => status.control_only = Some(true),
                         "guest_io" => status.guest_io_enabled = Some(false),
                         "local_generation" => status.local_durable_generation += 1,
@@ -5913,6 +5917,7 @@ mod tests {
             serving_process,
             ownership_token,
             frontend,
+            guest_device,
             ..
         } = &fixture.stored_checkpoint.checkpoint().step
         else {
@@ -5953,6 +5958,10 @@ mod tests {
         assert_eq!(
             argument_after(&arguments, "--device-ownership-token"),
             ownership_token.as_str()
+        );
+        assert_eq!(
+            argument_after(&arguments, "--guest-device-serial"),
+            guest_device.serial.as_str()
         );
         assert_eq!(
             argument_after(&arguments, "--listen-control"),
@@ -6126,6 +6135,8 @@ mod tests {
             "scope",
             "process_token",
             "device_token",
+            "guest_serial",
+            "missing_guest_serial",
             "control_only",
             "guest_io",
             "local_generation",

@@ -348,6 +348,7 @@ impl ServingBlockdExpectation {
                 scope_id: Some(self.unit_id.clone()),
                 process_identity_token: Some(self.process_identity_token.clone()),
                 device_ownership_token: Some(self.device_ownership_token.clone()),
+                guest_device_serial: Some(self.volume.volume.guest_device.serial.clone()),
                 control_only: Some(false),
                 remote_head: Some(self.volume.attachment.head.clone()),
                 mode: match self.volume.attachment.durability {

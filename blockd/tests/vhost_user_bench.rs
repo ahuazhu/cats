@@ -473,6 +473,7 @@ fn frontend_cost_nbd_versus_vhost_user() {
                     VhostUserOptions {
                         num_queues: workload.threads,
                         queue_size: 256,
+                        ..VhostUserOptions::default()
                     },
                     frontend == Frontend::VhostUser,
                 );
@@ -576,6 +577,7 @@ fn vhost_user_queue_depth_scaling() {
             VhostUserOptions {
                 num_queues: 1,
                 queue_size: 256,
+                ..VhostUserOptions::default()
             },
             true,
         );
@@ -622,6 +624,7 @@ fn vhost_user_queue_count_versus_depth() {
             VhostUserOptions {
                 num_queues: queues,
                 queue_size: 256,
+                ..VhostUserOptions::default()
             },
             true,
         );
@@ -669,6 +672,7 @@ fn vhost_user_notification_cost() {
                 VhostUserOptions {
                     num_queues: 1,
                     queue_size: 256,
+                    ..VhostUserOptions::default()
                 },
                 true,
             );

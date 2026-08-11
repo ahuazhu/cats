@@ -17,6 +17,7 @@ use cats_api::blockd::{BlockdControlCommand, BlockdControlResponse};
 use cats_api::runtime_reconciliation::{
     HostPath, Id, ProvisionRootImageDefiniteConflictProblem, ProvisionRootImageError,
     ProvisionRootImageRequest, ProvisionRootImageResult, RandomId128, Sha256Digest,
+    GUEST_DEVICE_SERIAL_MAX_BYTES_V1,
 };
 use cats_blockd::engine::{ChunkEngine, EngineConfig, ProvisionRootImageEffectError};
 use cats_blockd::nbd;
@@ -124,6 +125,12 @@ struct Args {
     /// atomically with process startup.
     #[arg(long, value_name = "RANDOM_ID_128")]
     device_ownership_token: Option<String>,
+
+    /// Exact Cloud Hypervisor V53 Guest-visible virtio-blk serial. Every
+    /// authorized serving mode requires this even on the kernel-NBD path so
+    /// process status and the later VMM launch share one sealed identity.
+    #[arg(long, value_name = "ID")]
+    guest_device_serial: Option<String>,
 
     /// Exact grant epoch to adopt in `--control-only` mode.
     #[arg(long, requires = "control_only")]
@@ -1366,6 +1373,11 @@ fn main() -> Result<()> {
         socket: args.listen_vhost_user.clone(),
         queues: args.vhost_user_queues,
         queue_size: args.vhost_user_queue_size,
+        guest_device_serial: args
+            .guest_device_serial
+            .as_deref()
+            .map(parse_guest_device_serial)
+            .transpose()?,
     };
 
     let object_config = AdapterConfig::from_cli(std::mem::take(&mut args.object_store_options))
@@ -1773,6 +1785,7 @@ struct RuntimeProcessIdentity {
     scope_id: Id,
     process_identity_token: RandomId128,
     device_ownership_token: Option<RandomId128>,
+    guest_device_serial: Option<Id>,
     control_only: bool,
 }
 
@@ -1786,6 +1799,7 @@ fn runtime_status_json(
         status.scope_id = Some(identity.scope_id.clone());
         status.process_identity_token = Some(identity.process_identity_token.clone());
         status.device_ownership_token = identity.device_ownership_token.clone();
+        status.guest_device_serial = identity.guest_device_serial.clone();
         status.control_only = Some(identity.control_only);
     }
     serde_json::to_string(&status)
@@ -2111,6 +2125,9 @@ fn validate_process_mode(args: &Args) -> Result<()> {
     {
         bail!("target-control expectations require --authorized-target-control-spec");
     }
+    if args.listen_vhost_user.is_some() && args.guest_device_serial.is_none() {
+        bail!("--listen-vhost-user requires --guest-device-serial");
+    }
     let _ = runtime_process_identity(args)?;
     Ok(())
 }
@@ -2127,6 +2144,13 @@ fn runtime_process_identity(args: &Args) -> Result<Option<RuntimeProcessIdentity
             bail!(
                 "--runtime-scope-id, --process-identity-token and --device-ownership-token are only valid for signed target modes"
             );
+        }
+        if let Some(serial) = args.guest_device_serial.as_deref() {
+            anyhow::ensure!(
+                args.listen_vhost_user.is_some(),
+                "--guest-device-serial outside signed serving requires --listen-vhost-user"
+            );
+            let _ = parse_guest_device_serial(serial)?;
         }
         return Ok(None);
     }
@@ -2153,12 +2177,29 @@ fn runtime_process_identity(args: &Args) -> Result<Option<RuntimeProcessIdentity
     if device_ownership_token.as_ref() == Some(&process_identity_token) {
         bail!("process and device ownership tokens must differ");
     }
+    let guest_device_serial = match (args.control_only, args.guest_device_serial.as_deref()) {
+        (true, None) => None,
+        (true, Some(_)) => bail!("--control-only forbids --guest-device-serial"),
+        (false, Some(serial)) => Some(parse_guest_device_serial(serial)?),
+        (false, None) => bail!("authorized serving requires --guest-device-serial"),
+    };
     Ok(Some(RuntimeProcessIdentity {
         scope_id: Id::new(scope.to_owned()).context("--runtime-scope-id is not a valid Id")?,
         process_identity_token,
         device_ownership_token,
+        guest_device_serial,
         control_only: args.control_only,
     }))
+}
+
+fn parse_guest_device_serial(value: &str) -> Result<Id> {
+    let serial = Id::new(value.to_owned()).context("--guest-device-serial is not a valid Id")?;
+    anyhow::ensure!(
+        (1..=GUEST_DEVICE_SERIAL_MAX_BYTES_V1).contains(&serial.as_str().len()),
+        "--guest-device-serial must contain 1..={} UTF-8 bytes",
+        GUEST_DEVICE_SERIAL_MAX_BYTES_V1
+    );
+    Ok(serial)
 }
 
 /// NBD-only mode: the listener threads own the work, so the process lives as
@@ -2180,14 +2221,24 @@ struct VhostUserArgs {
     queues: usize,
     #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
     queue_size: u16,
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+    guest_device_serial: Option<Id>,
 }
 
 #[cfg(target_os = "linux")]
-fn vhost_user_options(args: &VhostUserArgs) -> cats_blockd::vhost_user::VhostUserOptions {
-    cats_blockd::vhost_user::VhostUserOptions {
+fn vhost_user_options(args: &VhostUserArgs) -> Result<cats_blockd::vhost_user::VhostUserOptions> {
+    let serial = args
+        .guest_device_serial
+        .as_ref()
+        .context("--listen-vhost-user requires --guest-device-serial")?;
+    Ok(cats_blockd::vhost_user::VhostUserOptions {
         num_queues: args.queues,
         queue_size: args.queue_size,
-    }
+        guest_device_serial: cats_blockd::vhost_user::VhostUserDeviceId::from_guest_device_serial(
+            serial,
+        )
+        .context("validate vhost-user Guest device serial")?,
+    })
 }
 
 #[cfg(target_os = "linux")]
@@ -2197,10 +2248,11 @@ fn bind_vhost_user(
 ) -> Result<Option<vhost::vhost_user::Listener>> {
     match &args.socket {
         Some(path) => {
+            let options = vhost_user_options(args)?;
             let listener = if replace_existing {
-                cats_blockd::vhost_user::bind(path, vhost_user_options(args))
+                cats_blockd::vhost_user::bind(path, options)
             } else {
-                cats_blockd::vhost_user::bind_new(path, vhost_user_options(args))
+                cats_blockd::vhost_user::bind_new(path, options)
             };
             Ok(Some(listener.with_context(|| {
                 format!("bind vhost-user socket {}", path.display())
@@ -2232,7 +2284,7 @@ fn serve_vhost_user(
             cats_blockd::vhost_user::serve_listener(
                 &mut listener,
                 engine,
-                vhost_user_options(args),
+                vhost_user_options(args)?,
             )
             .context("serve vhost-user-blk")?;
             tracing::info!("vhost-user client disconnected; detaching");
@@ -2570,6 +2622,8 @@ mod tests {
                 "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_owned(),
                 "--device-ownership-token".to_owned(),
                 "cccccccccccccccccccccccccccccccc".to_owned(),
+                "--guest-device-serial".to_owned(),
+                "cats-root".to_owned(),
             ])
             .unwrap()
         }
@@ -3413,6 +3467,13 @@ mod tests {
         ])
         .unwrap();
         assert!(validate_process_mode(&legacy_blank).is_ok());
+        assert_eq!(
+            runtime_process_identity(&legacy_blank)
+                .unwrap()
+                .unwrap()
+                .guest_device_serial,
+            None
+        );
 
         let conflicting = parse_target_control_mode(&[
             "--authorized-control-spec",
@@ -3438,6 +3499,8 @@ mod tests {
             "13579bdf2468ace013579bdf2468ace0",
             "--device-ownership-token",
             "2468ace013579bdf2468ace013579bdf",
+            "--guest-device-serial",
+            "cats-root",
         ];
         arguments.extend_from_slice(extra);
         Args::try_parse_from(arguments).unwrap()
@@ -3531,6 +3594,35 @@ mod tests {
     }
 
     #[test]
+    fn legacy_vhost_requires_the_exact_guest_serial_before_the_engine_effect() {
+        let mut args = Args::try_parse_from([
+            "cats-blockd",
+            "--volume-id",
+            TARGET_VOLUME_ID,
+            "--data-dir",
+            "/runtime/root-data",
+            "--attachment-id",
+            TARGET_ATTACHMENT_ID,
+            "--object-store-adapter",
+            "file",
+            "--listen-vhost-user",
+            "/runtime/vhost.sock",
+        ])
+        .unwrap();
+        let effect_calls = std::cell::Cell::new(0_u64);
+        let result = validate_process_mode(&args).map(|()| {
+            effect_calls.set(effect_calls.get() + 1);
+        });
+        assert!(result.is_err());
+        assert_eq!(effect_calls.get(), 0);
+
+        args.guest_device_serial = Some("12345678901234567890".to_owned());
+        assert!(validate_process_mode(&args).is_ok());
+        args.guest_device_serial = Some("123456789012345678901".to_owned());
+        assert!(validate_process_mode(&args).is_err());
+    }
+
+    #[test]
     fn authorized_serving_requires_distinct_local_handshake_and_frontend_names() {
         let missing_control = Args::try_parse_from([
             "cats-blockd",
@@ -3597,6 +3689,8 @@ mod tests {
             "cats-cat_01-root.scope",
             "--process-identity-token",
             "13579bdf2468ace013579bdf2468ace0",
+            "--guest-device-serial",
+            "cats-root",
         ])
         .unwrap();
         assert!(validate_process_mode(&missing).is_err());
@@ -3623,6 +3717,8 @@ mod tests {
             "13579bdf2468ace013579bdf2468ace0",
             "--device-ownership-token",
             "13579bdf2468ace013579bdf2468ace0",
+            "--guest-device-serial",
+            "cats-root",
         ])
         .unwrap();
         assert!(validate_process_mode(&same).is_err());
@@ -3641,5 +3737,23 @@ mod tests {
             identity.device_ownership_token.as_ref(),
             Some(&identity.process_identity_token)
         );
+        assert_eq!(
+            identity.guest_device_serial.as_ref().unwrap().as_str(),
+            "cats-root"
+        );
+
+        let mut missing_serial = parse_target(&["--listen-unix", "/runtime/block.sock"]);
+        missing_serial.guest_device_serial = None;
+        assert!(validate_process_mode(&missing_serial).is_err());
+
+        let mut boundary = parse_target(&["--listen-unix", "/runtime/block.sock"]);
+        boundary.guest_device_serial = Some("12345678901234567890".to_owned());
+        assert!(validate_process_mode(&boundary).is_ok());
+        boundary.guest_device_serial = Some("123456789012345678901".to_owned());
+        assert!(validate_process_mode(&boundary).is_err());
+
+        let mut control = parse_target_control_mode(&[]);
+        control.guest_device_serial = Some("cats-root".to_owned());
+        assert!(validate_process_mode(&control).is_err());
     }
 }

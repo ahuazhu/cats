@@ -47,12 +47,13 @@ struct Env {
 
 impl Env {
     fn new() -> Self {
-        let dir = tempfile::tempdir().unwrap();
         // macOS exposes its per-user temporary directory through `/var`,
         // which is itself a symlink to `/private/var`. Production correctly
         // rejects a Runtime data directory with any symlink ancestor, so the
         // acceptance fixture must pass the canonical spelling of the same
         // retained temporary directory.
+        let canonical_temp = std::fs::canonicalize(std::env::temp_dir()).unwrap();
+        let dir = tempfile::tempdir_in(canonical_temp).unwrap();
         let canonical_root = dir.path().canonicalize().unwrap();
         let blob = Arc::new(FileBlobStore::open(canonical_root.join("blob")).unwrap());
         let postgres_url = cats_control_plane::testsupport::isolated_control_store_url();
@@ -75,16 +76,19 @@ impl Env {
         let data_dir = canonical_root.join("control-data");
         std::fs::create_dir_all(&data_dir).unwrap();
         std::fs::set_permissions(&data_dir, std::fs::Permissions::from_mode(0o700)).unwrap();
-        std::fs::write(
-            data_dir.join("identity.json"),
-            serde_json::to_vec(&attachment.identity).unwrap(),
-        )
-        .unwrap();
-        std::fs::write(
-            data_dir.join("authorized-control.json"),
-            serde_json::to_vec(&attachment).unwrap(),
-        )
-        .unwrap();
+        for (path, bytes) in [
+            (
+                data_dir.join("identity.json"),
+                serde_json::to_vec(&attachment.identity).unwrap(),
+            ),
+            (
+                data_dir.join("authorized-control.json"),
+                serde_json::to_vec(&attachment).unwrap(),
+            ),
+        ] {
+            std::fs::write(&path, bytes).unwrap();
+            std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        }
         Self {
             dir,
             canonical_root,

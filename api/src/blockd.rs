@@ -203,6 +203,11 @@ pub struct DurabilityStatus {
     /// serving process; missing is legacy/unproven and cannot be adopted.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub device_ownership_token: Option<RandomId128>,
+    /// Exact GuestDeviceIdentity serial carried by every signed authorized
+    /// serving process. Missing is control-only or legacy/unproven and can
+    /// never satisfy a production serving handshake.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub guest_device_serial: Option<Id>,
     /// Exact process mode. Missing means legacy; `guest_io_enabled=false`
     /// alone is not proof that the process exposes only Host control I/O.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -273,6 +278,7 @@ mod tests {
             scope_id: None,
             process_identity_token: None,
             device_ownership_token: None,
+            guest_device_serial: Some(Id::new("cats-root").unwrap()),
             control_only: None,
             remote_head: None,
             mode: "relaxed".to_string(),
@@ -293,7 +299,7 @@ mod tests {
         };
         assert_eq!(
             serde_json::to_string(&status).unwrap(),
-            "{\"volume_id\":\"vol_x\",\"attachment_id\":\"att_x\",\"mode\":\"relaxed\",\"local_durable_generation\":7,\"remote_durable_generation\":5,\"unpublished_generations\":2,\"unpublished_bytes\":65536,\"oldest_unpublished_age_ms\":250,\"max_unpublished_generations\":4096,\"max_unpublished_bytes\":8589934592,\"local_allocated_bytes\":131072,\"local_accounted_bytes\":196608,\"max_local_bytes\":17179869184,\"evicted_cache_chunks\":3,\"backpressured\":false,\"fenced\":false,\"last_publish_error\":\"timeout\"}"
+            "{\"volume_id\":\"vol_x\",\"attachment_id\":\"att_x\",\"guest_device_serial\":\"cats-root\",\"mode\":\"relaxed\",\"local_durable_generation\":7,\"remote_durable_generation\":5,\"unpublished_generations\":2,\"unpublished_bytes\":65536,\"oldest_unpublished_age_ms\":250,\"max_unpublished_generations\":4096,\"max_unpublished_bytes\":8589934592,\"local_allocated_bytes\":131072,\"local_accounted_bytes\":196608,\"max_local_bytes\":17179869184,\"evicted_cache_chunks\":3,\"backpressured\":false,\"fenced\":false,\"last_publish_error\":\"timeout\"}"
         );
         assert_eq!(
             serde_json::from_str::<DurabilityStatus>(&serde_json::to_string(&status).unwrap())
@@ -310,6 +316,7 @@ mod tests {
         // what the node agent must read as "not adoptable".
         assert_eq!(status.volume_id, "");
         assert_eq!(status.attachment_id, "");
+        assert_eq!(status.guest_device_serial, None);
         // Every pre-existing field keeps its value and meaning.
         assert_eq!(status.mode, "relaxed");
         assert_eq!(status.local_durable_generation, 7);
