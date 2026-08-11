@@ -550,6 +550,10 @@ impl RuntimeDesiredEffectContext {
         })
     }
 
+    pub(crate) fn optional_kernel_nbd_pool(&self) -> Option<&KernelNbdPoolAdmission> {
+        self.kernel_nbd_pool.as_ref()
+    }
+
     pub(crate) fn running_tail_admission(&self) -> Option<&RunningTailAdmission> {
         self.running_tail.as_ref()
     }

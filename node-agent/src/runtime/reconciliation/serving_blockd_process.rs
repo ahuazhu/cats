@@ -204,8 +204,7 @@ impl ServingBlockdExpectation {
                         queue_size,
                     } => AuthorizedBlockFrontend::VhostUser {
                         socket: Path::new(socket_path.as_str()).to_path_buf(),
-                        queues: usize::try_from(*queues)
-                            .context("prepared vhost queue count does not fit usize")?,
+                        queues: usize::from(*queues),
                         queue_size: *queue_size,
                     },
                 };
@@ -753,6 +752,13 @@ impl ExactServingBlockdProcessProof {
             exact: self.clone(),
         }
     }
+
+    pub(crate) fn assert_listener_current(
+        &self,
+        context: &dyn RuntimePhysicalReadContext,
+    ) -> anyhow::Result<()> {
+        assert_serving_listener_current(&self.expectation, &self.evidence, context)
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -799,25 +805,31 @@ impl ServingBlockdListenerProof {
         &self,
         context: &dyn RuntimePhysicalReadContext,
     ) -> anyhow::Result<()> {
-        context.check_active()?;
-        let before = crate::proc::ProcIdentity::sample(self.exact.evidence.process_id);
-        anyhow::ensure!(
-            before.start_ticks == Some(self.exact.evidence.process_start_time_ticks.get())
-                && before.exe.as_deref()
-                    == Some(Path::new(self.exact.evidence.executable_path.as_str())),
-            "serving listener process identity changed after full inventory"
-        );
-        self.exact
-            .evidence
-            .listener_identity
-            .assert_current(&self.exact.expectation.frontend, context)?;
-        let after = crate::proc::ProcIdentity::sample(self.exact.evidence.process_id);
-        anyhow::ensure!(
-            after == before,
-            "serving listener process identity changed during current revalidation"
-        );
-        context.check_active()
+        assert_serving_listener_current(&self.exact.expectation, &self.exact.evidence, context)
     }
+}
+
+fn assert_serving_listener_current(
+    expectation: &ServingBlockdExpectation,
+    evidence: &ServingBlockdProcessEvidence,
+    context: &dyn RuntimePhysicalReadContext,
+) -> anyhow::Result<()> {
+    context.check_active()?;
+    let before = crate::proc::ProcIdentity::sample(evidence.process_id);
+    anyhow::ensure!(
+        before.start_ticks == Some(evidence.process_start_time_ticks.get())
+            && before.exe.as_deref() == Some(Path::new(evidence.executable_path.as_str())),
+        "serving listener process identity changed after full inventory"
+    );
+    evidence
+        .listener_identity
+        .assert_current(&expectation.frontend, context)?;
+    let after = crate::proc::ProcIdentity::sample(evidence.process_id);
+    anyhow::ensure!(
+        after == before,
+        "serving listener process identity changed during current revalidation"
+    );
+    context.check_active()
 }
 
 /// Current checkpoint and descriptor-retained handoff held across one start
@@ -856,13 +868,13 @@ impl CheckpointedServingBlockdProcess<'_> {
 /// the variant independently of the checkpointed provenance.
 pub(crate) enum RetainedServingBlockdAuthority {
     Root {
-        prepared_checkpoint: RuntimeCheckpoint,
+        prepared_checkpoint: Box<RuntimeCheckpoint>,
         prepared: PreparedDeviceInput,
-        ready: PrepareDeviceHandoffReady,
+        ready: Box<PrepareDeviceHandoffReady>,
     },
     Direct {
         prepared: PreparedDeviceInput,
-        retained: RetainedAuthorizedBlockd,
+        retained: Box<RetainedAuthorizedBlockd>,
     },
 }
 
@@ -892,16 +904,16 @@ impl RetainedServingBlockdAuthority {
                         retained,
                     )?;
                 Ok(Self::Root {
-                    prepared_checkpoint,
+                    prepared_checkpoint: Box::new(prepared_checkpoint),
                     prepared: prepared.clone(),
-                    ready,
+                    ready: Box::new(ready),
                 })
             }
             ServingAuthorityProvenance::DirectAuthorizedAttachment { .. } => {
                 let retained = store.retain_prepared_device(checkpoint, desired, prepared)?;
                 Ok(Self::Direct {
                     prepared: prepared.clone(),
-                    retained,
+                    retained: Box::new(retained),
                 })
             }
         }
@@ -940,8 +952,7 @@ impl RetainedServingBlockdAuthority {
                         queue_size,
                     } => AuthorizedBlockFrontend::VhostUser {
                         socket: Path::new(socket_path.as_str()).to_path_buf(),
-                        queues: usize::try_from(*queues)
-                            .context("prepared vhost queue count does not fit usize")?,
+                        queues: usize::from(*queues),
                         queue_size: *queue_size,
                     },
                 };

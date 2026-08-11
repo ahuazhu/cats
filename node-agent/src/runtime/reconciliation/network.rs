@@ -140,6 +140,22 @@ impl NodeGlobalNetworkScanAdmission {
         })
     }
 
+    pub(crate) fn exact_network_is_present(
+        &self,
+        cat_id: &Id,
+        identity: &RuntimeNetworkIdentity,
+    ) -> Result<bool> {
+        let entry = self
+            .entries
+            .get(cat_id)
+            .context("Running scan lacks its retained network reservation")?;
+        anyhow::ensure!(
+            entry.reservation.identity == *identity,
+            "Running scan network reservation changed its retained identity"
+        );
+        Ok(entry.state == ReservedHostNetworkState::Exact)
+    }
+
     pub(crate) fn bind(self, observation: &NodeObservation) -> Result<NodeGlobalNetworkAdmission> {
         anyhow::ensure!(
             observation.complete_inventory,
@@ -238,6 +254,13 @@ impl NodeGlobalNetworkAdmission {
         Some(match entry.state {
             ReservedHostNetworkState::Absent => Vec::new(),
             ReservedHostNetworkState::Exact => vec![observed_network(identity)],
+        })
+    }
+
+    pub(crate) fn has_exact_network(&self, cat_id: &Id, identity: &RuntimeNetworkIdentity) -> bool {
+        self.entries.get(cat_id).is_some_and(|entry| {
+            entry.reservation.identity == *identity
+                && entry.state == ReservedHostNetworkState::Exact
         })
     }
 }
@@ -1163,8 +1186,7 @@ impl PrepareNetworkReservationEffect {
                     {
                         return Ok(Some(local_contract_stop()));
                     }
-                    let projection = exact.projection();
-                    projection
+                    exact.projection()
                 }
             };
             if !prepare_network_volume_admission_is_exact(

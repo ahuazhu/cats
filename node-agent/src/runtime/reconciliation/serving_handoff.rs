@@ -3903,6 +3903,7 @@ mod tests {
 
     use super::*;
     use crate::ch::{ChNetwork, PendingTap, TapCreatePort};
+    use crate::runtime::reconciliation::inventory::AuthorityVolumeInventoryEvidence;
     use crate::runtime::reconciliation::kernel_nbd::{
         attach_port_sealed as kernel_attach_sealed, KernelNbdAttachConflict, KernelNbdAttachEffect,
         KernelNbdAttachPort, KernelNbdAttachRequest, KernelNbdAttachResult,
@@ -3916,10 +3917,12 @@ mod tests {
         global_sealed as root_process_global_sealed,
         retirement_sealed as root_process_retirement_sealed, sealed as root_process_sealed,
         target_start_sealed as target_process_start_sealed, CheckpointedRootProvisionProcess,
-        CheckpointedTargetControlProcess, RootProvisionProcessGlobalPort, RootProvisionProcessPort,
+        CheckpointedTargetControlProcess, ManagedServingKey, NodeGlobalManagedProcessScanAdmission,
+        RootProvisionProcessGlobalPort, RootProvisionProcessPort,
         RootProvisionProcessRetirementPort, RootProvisionProcessStart, RootProvisionProcessStop,
         TargetControlProcessPort,
     };
+    use crate::runtime::reconciliation::running_launch_authority::validate_retained_running_scan_exact_set;
     use crate::runtime::reconciliation::serving_blockd_process::{
         global_sealed as serving_global_sealed, process_sealed as serving_process_sealed,
         CheckpointedServingBlockdProcess, ServingBlockdExpectation, ServingBlockdProcessConflict,
@@ -3935,6 +3938,7 @@ mod tests {
     use crate::runtime::reconciliation::vmm_launch_artifacts::{
         RetainedVmmLaunchArtifacts, VmmLaunchArtifactPaths,
     };
+    use crate::runtime::reconciliation::vmm_process::VmmProcessExpectation;
     #[cfg(target_os = "linux")]
     use crate::runtime::reconciliation::vmm_process::{
         global_sealed as vmm_global_sealed, sealed as vmm_process_sealed, CheckpointedVmmProcess,
@@ -5485,6 +5489,47 @@ mod tests {
             }),
             assertions,
         )
+    }
+
+    fn advance_fixture_to_start_runtime(fixture: &mut Fixture) {
+        advance_fixture_to_prepare_network(fixture);
+        let authority = Arc::new(FixedEffectAuthority::new(fixture.authority.volume.clone()));
+        let serving = Arc::new(FakeServingBlockdPort::new(
+            std::iter::repeat_n(ServingBlockdProcessInspectionKind::Exact, 16),
+            ServingBlockdProcessStart::Submitted,
+        ));
+        let network = Arc::new(
+            PrepareNetworkReservationEffect::new(
+                fixture.state_directory.clone(),
+                exact_ip_binary(fixture, fixture.stored_checkpoint.checkpoint()),
+                Arc::clone(&authority) as Arc<dyn VolumeDataAuthority>,
+                Arc::clone(&serving) as Arc<dyn ServingBlockdProcessGlobalPort>,
+            )
+            .unwrap(),
+        );
+        let (artifacts, _) = fixed_launch_artifacts(None);
+        let reservation = StartRuntimeReservationEffect::for_test(
+            fixture.state_directory.clone(),
+            network,
+            Arc::clone(&authority) as Arc<dyn VolumeDataAuthority>,
+            serving,
+            artifacts,
+        );
+        let context = with_exact_network_admission(
+            effect_context_with_processes(fixture, vec![accepted_serving_process(fixture)]),
+            fixture.stored_checkpoint.checkpoint(),
+        );
+        assert_eq!(
+            reservation
+                .try_apply(&context, &fixture.acquired.desired)
+                .unwrap(),
+            Some(RuntimeDesiredEffectOutcome::RefreshInventory)
+        );
+        fixture.stored_checkpoint = current_runtime_checkpoint(fixture);
+        assert!(matches!(
+            fixture.stored_checkpoint.checkpoint().step,
+            ReconcileStep::StartRuntime { .. }
+        ));
     }
 
     #[cfg(target_os = "linux")]
@@ -7079,6 +7124,118 @@ mod tests {
             current_runtime_checkpoint(&fixture).content_digest(),
             &persisted_digest
         );
+    }
+
+    #[test]
+    fn retained_running_scan_treats_only_absent_expected_members_as_not_ready() {
+        let mut fixture = fixture();
+        advance_fixture_to_start_runtime(&mut fixture);
+        let checkpoint = fixture.stored_checkpoint.checkpoint();
+        let desired = &fixture.acquired.desired;
+        let serving = serving_expectation(&fixture);
+        let serving_key =
+            ManagedServingKey::new(serving.cat_id().clone(), serving.volume_id().clone());
+        let serving_proof = serving
+            .clone()
+            .prove_exact_process(serving.exact_evidence_for_test(51))
+            .unwrap();
+        let extra = serving.persistent_vhost_peer_for_test(true);
+        let extra_key = ManagedServingKey::new(extra.cat_id().clone(), extra.volume_id().clone());
+        let extra_proof = extra
+            .clone()
+            .prove_exact_process(extra.exact_evidence_for_test(52))
+            .unwrap();
+        let checkpoint_path = host(
+            super::super::runtime_checkpoint_path(
+                &fixture.checkpoint_directory,
+                &checkpoint.cat_id,
+            )
+            .to_str()
+            .unwrap(),
+        );
+        let vmm = VmmProcessExpectation::from_checkpoint(checkpoint.clone())
+            .unwrap()
+            .with_checkpoint_path(checkpoint_path)
+            .unwrap();
+        let vmm_proof = vmm
+            .clone()
+            .prove_exact_process(vmm.exact_evidence_for_test(71))
+            .unwrap();
+        let build_scan = |include_serving: bool, exact_serving: bool, include_extra: bool| {
+            let mut serving_expectations = BTreeMap::new();
+            let mut serving_proofs = BTreeMap::new();
+            if include_serving {
+                serving_expectations.insert(serving_key.clone(), serving.clone());
+                if exact_serving {
+                    serving_proofs.insert(serving_key.clone(), serving_proof.clone());
+                }
+            }
+            if include_extra {
+                serving_expectations.insert(extra_key.clone(), extra.clone());
+                serving_proofs.insert(extra_key.clone(), extra_proof.clone());
+            }
+            NodeGlobalManagedProcessScanAdmission::from_root_controls(
+                BTreeMap::new(),
+                BTreeMap::new(),
+            )
+            .unwrap()
+            .with_serving_blockds(serving_expectations, serving_proofs)
+            .unwrap()
+            .with_vmms(
+                BTreeMap::from([(desired.cat_id.clone(), vmm.clone())]),
+                BTreeMap::from([(desired.cat_id.clone(), vmm_proof.clone())]),
+            )
+            .unwrap()
+        };
+        let network =
+            NodeGlobalNetworkScanAdmission::exact_checkpoint_for_test(checkpoint).unwrap();
+        let mut metadata_observed = checkpoint.volumes[0].clone();
+        assert!(!metadata_observed.local_lineages.is_empty());
+        metadata_observed.local_lineages.clear();
+        metadata_observed.devices.clear();
+        let volumes = [AuthorityVolumeInventoryEvidence {
+            observed: metadata_observed,
+            record: fixture.authority.volume.clone(),
+        }];
+
+        assert!(validate_retained_running_scan_exact_set(
+            desired,
+            checkpoint,
+            &volumes,
+            &build_scan(true, true, false),
+            &network,
+            None,
+        )
+        .unwrap()
+        .is_some());
+        assert!(validate_retained_running_scan_exact_set(
+            desired,
+            checkpoint,
+            &volumes,
+            &build_scan(true, false, false),
+            &network,
+            None,
+        )
+        .unwrap()
+        .is_none());
+        assert!(validate_retained_running_scan_exact_set(
+            desired,
+            checkpoint,
+            &volumes,
+            &build_scan(false, false, false),
+            &network,
+            None,
+        )
+        .is_err());
+        assert!(validate_retained_running_scan_exact_set(
+            desired,
+            checkpoint,
+            &volumes,
+            &build_scan(true, true, true),
+            &network,
+            None,
+        )
+        .is_err());
     }
 
     #[test]

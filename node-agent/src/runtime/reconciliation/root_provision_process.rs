@@ -701,6 +701,22 @@ impl StopReceiptSocketAdmission {
 }
 
 impl NodeGlobalManagedProcessExpectation {
+    fn cat_id(&self) -> &Id {
+        match self {
+            Self::RootControl { expectation, .. } => &expectation.cat_id,
+            Self::ServingBlockd { expectation, .. } => expectation.cat_id(),
+            Self::Vmm { expectation, .. } => expectation.cat_id(),
+        }
+    }
+
+    fn is_exact(&self) -> bool {
+        match self {
+            Self::RootControl { exact, .. } => exact.is_some(),
+            Self::ServingBlockd { exact, .. } => exact.is_some(),
+            Self::Vmm { exact, .. } => exact.is_some(),
+        }
+    }
+
     pub(crate) fn key(&self) -> NodeGlobalManagedProcessKey {
         match self {
             Self::RootControl { expectation, .. } => {
@@ -746,6 +762,25 @@ pub(crate) struct NodeGlobalManagedProcessAdmission {
 }
 
 impl NodeGlobalManagedProcessScanAdmission {
+    pub(crate) fn exact_process_count(&self, cat_id: &Id) -> usize {
+        self.entries
+            .iter()
+            .filter(|entry| entry.cat_id() == cat_id && entry.is_exact())
+            .count()
+    }
+
+    pub(crate) fn has_exact_root_control(&self, cat_id: &Id) -> bool {
+        self.entries.iter().any(|entry| {
+            matches!(
+                entry,
+                NodeGlobalManagedProcessExpectation::RootControl {
+                    expectation,
+                    exact: Some(_),
+                } if &expectation.cat_id == cat_id
+            )
+        })
+    }
+
     pub(crate) fn process_projections(&self) -> BTreeMap<Id, Vec<ProcessEvidence>> {
         let mut projections = BTreeMap::<Id, Vec<ProcessEvidence>>::new();
         for entry in &self.entries {
@@ -835,6 +870,23 @@ impl NodeGlobalManagedProcessScanAdmission {
     > + 'a {
         self.entries.iter().filter_map(move |entry| match entry {
             NodeGlobalManagedProcessExpectation::ServingBlockd { expectation, exact }
+                if expectation.cat_id() == cat_id =>
+            {
+                Some((expectation.as_ref(), exact.as_deref()))
+            }
+            _ => None,
+        })
+    }
+
+    pub(crate) fn vmm(
+        &self,
+        cat_id: &Id,
+    ) -> Option<(
+        &super::vmm_process::VmmProcessExpectation,
+        Option<&super::vmm_process::ExactVmmProcessProof>,
+    )> {
+        self.entries.iter().find_map(|entry| match entry {
+            NodeGlobalManagedProcessExpectation::Vmm { expectation, exact }
                 if expectation.cat_id() == cat_id =>
             {
                 Some((expectation.as_ref(), exact.as_deref()))
@@ -1409,6 +1461,13 @@ fn compare_process_evidence(left: &ProcessEvidence, right: &ProcessEvidence) -> 
 }
 
 impl NodeGlobalManagedProcessAdmission {
+    pub(crate) fn exact_process_count(&self, cat_id: &Id) -> usize {
+        self.entries
+            .iter()
+            .filter(|entry| entry.cat_id() == cat_id && entry.is_exact())
+            .count()
+    }
+
     #[cfg(test)]
     pub(crate) fn rebind_for_test(&self, observation: &NodeObservation) -> anyhow::Result<Self> {
         NodeGlobalManagedProcessScanAdmission {

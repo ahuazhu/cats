@@ -65,8 +65,8 @@ use super::{
     PlatformSystemdRootProvisionProcessPort, RootProvisionProcessConflict,
     RootProvisionProcessInspection, RootProvisionProcessOutcome, RootProvisionProcessPort,
     RootProvisionProcessRetirementPort, RootProvisionProcessStop, RootProvisionResponseHint,
-    RootProvisionSystemdConfig, UnixRootProvisionClient, VmmCidInventoryPort,
-    VmmLaunchArtifactPaths,
+    RootProvisionSystemdConfig, RunningLaunchAuthorityRevalidator, UnixRootProvisionClient,
+    VmmCidInventoryPort, VmmLaunchArtifactPaths,
 };
 use super::{AdmissionCellRegistry, RunningAdmissionEffect, SignedRunningAcquireEffect};
 
@@ -188,6 +188,27 @@ impl SignedRunningHostConfig {
             kernel_nbd_cleanup_owner,
             vmm_launch_artifacts,
         }
+    }
+
+    #[expect(
+        dead_code,
+        reason = "the integrated Running-tail effect consumes this provider-private constructor"
+    )]
+    pub(crate) fn running_launch_authority_revalidator(
+        &self,
+        network: Arc<PrepareNetworkReservationEffect>,
+        authority: Arc<dyn VolumeDataAuthority>,
+        process_ports: &SignedRunningProcessPorts,
+    ) -> RunningLaunchAuthorityRevalidator {
+        RunningLaunchAuthorityRevalidator::platform_parts(
+            self.state_directory.clone(),
+            self.systemd.clone(),
+            network,
+            authority,
+            Arc::clone(&process_ports.serving_global),
+            Arc::clone(&process_ports.vmm_global),
+            self.kernel_nbd_inventory.clone(),
+        )
     }
 }
 

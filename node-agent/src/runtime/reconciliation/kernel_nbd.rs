@@ -586,6 +586,27 @@ impl KernelNbdPoolScanAdmission {
             .any(|state| matches!(state, KernelNbdDeviceScanState::Unavailable { .. }))
     }
 
+    pub(crate) fn device_count(&self, cat_id: &Id) -> usize {
+        self.devices_by_key
+            .keys()
+            .filter(|key| key.cat_id() == cat_id)
+            .count()
+    }
+
+    pub(crate) fn exact_device(
+        &self,
+        cat_id: &Id,
+        volume_id: &Id,
+    ) -> Option<&ExactKernelNbdDeviceProof> {
+        match self
+            .devices_by_key
+            .get(&ManagedServingKey::new(cat_id.clone(), volume_id.clone()))
+        {
+            Some(KernelNbdDeviceScanState::Exact(proof)) => Some(proof),
+            _ => None,
+        }
+    }
+
     pub(crate) fn device_projections(&self) -> BTreeMap<Id, BTreeMap<Id, ObservedDevice>> {
         let mut projections = BTreeMap::<Id, BTreeMap<Id, ObservedDevice>>::new();
         for (key, state) in &self.devices_by_key {
@@ -898,15 +919,20 @@ impl KernelNbdReservations {
                 ownership_token: ownership_token.clone(),
             })?;
         }
-        if let ReconcileStep::PrepareNetwork { devices, .. }
-        | ReconcileStep::StartRuntime { devices, .. } = &checkpoint.step
+        let retained_devices = if checkpoint.runtime_launch.identity().is_some()
+            || matches!(
+                &checkpoint.step,
+                ReconcileStep::PrepareNetwork { .. } | ReconcileStep::StartRuntime { .. }
+            ) {
+            prepared_device_inputs(checkpoint)?
+        } else {
+            Vec::new()
+        };
+        for reservation in retained_devices
+            .iter()
+            .filter_map(|device| reservation_from_prepared_device(&checkpoint.cat_id, device))
         {
-            for reservation in devices
-                .iter()
-                .filter_map(|device| reservation_from_prepared_device(&checkpoint.cat_id, device))
-            {
-                self.insert(reservation)?;
-            }
+            self.insert(reservation)?;
         }
         for volume in &checkpoint.volumes {
             for device in &volume.devices {
@@ -1503,15 +1529,19 @@ fn device_expectations_from_namespace(
 ) -> Result<BTreeMap<HostPath, KernelNbdDeviceExpectation>> {
     let mut expectations = BTreeMap::new();
     for checkpoint in namespace.iter_checkpoints() {
-        let prepared: Vec<&PreparedDeviceInput> = match &checkpoint.step {
-            ReconcileStep::PrepareNetwork { devices, .. }
-            | ReconcileStep::StartRuntime { devices, .. } => devices.iter().collect(),
-            _ => Vec::new(),
+        let prepared = if checkpoint.runtime_launch.identity().is_some()
+            || matches!(
+                checkpoint.step,
+                ReconcileStep::PrepareNetwork { .. } | ReconcileStep::StartRuntime { .. }
+            ) {
+            prepared_device_inputs(checkpoint)?
+        } else {
+            Vec::new()
         };
         let direct = KernelNbdDeviceExpectation::from_prepare_device(checkpoint)?;
         let candidates = direct.into_iter().chain(
             prepared
-                .into_iter()
+                .iter()
                 .map(|device| {
                     KernelNbdDeviceExpectation::from_prepared_device(&checkpoint.cat_id, device)
                 })
@@ -3028,14 +3058,16 @@ mod tests {
     use std::time::{Duration, Instant};
 
     use cats_api::runtime_reconciliation::{
-        AcquireOrigin, AdmissionInventoryAttestation, AgentSession, AssignedKind,
-        AssignedPlacement, ContractVersion, DesiredReadSnapshot, DesiredRuntimeSpec, DiskKind,
-        Durability, Epoch, FenceEpoch, Generation, GuestDeviceIdentity, GuestTransportEvidence,
-        Ipv4Address, IsolatedIpv4Kind, LifecycleAdmission, LocalLineageState, LocalVolumeLineage,
-        MacAddress, NetworkConfig, NodeBootId, NodeObservation, ObservedDiskKind, ObservedVolume,
-        RemoteHead, RequireIdleCheckpoint, Revision, RuntimeConfig, RuntimeTarget,
+        decode_runtime_checkpoint, encode_runtime_checkpoint, AcquireOrigin,
+        AdmissionInventoryAttestation, AgentSession, AssignedKind, AssignedPlacement,
+        ContractVersion, DesiredReadSnapshot, DesiredRuntimeSpec, DiskKind, Durability, Epoch,
+        FenceEpoch, Generation, GuestDeviceIdentity, GuestTransportEvidence, Ipv4Address,
+        IsolatedIpv4Kind, LifecycleAdmission, LocalLineageState, LocalVolumeLineage, MacAddress,
+        NetworkConfig, NodeBootId, NodeObservation, ObservedDiskKind, ObservedVolume, RemoteHead,
+        RequireIdleCheckpoint, Revision, RuntimeConfig, RuntimeLaunch, RuntimeTarget,
         RuntimeTransition, Sequence, ServingAuthorityProvenance, ServingBlockdIdentity,
-        SessionBinding, Sha256Digest, UnixMillis, VolumeAuthorityEvidence, WarmSnapshotEvidence,
+        SessionBinding, Sha256Digest, StableState, UnixMillis, VolumeAuthorityEvidence,
+        WarmSnapshotEvidence,
     };
     use tempfile::TempDir;
 
@@ -3806,6 +3838,64 @@ mod tests {
                 "PrepareNetwork lost its persisted kernel-NBD reservation",
             )
             .unwrap();
+    }
+
+    #[test]
+    fn running_tail_retains_kernel_nbd_reservation_without_current_step_or_public_device() {
+        let mut launch = decode_runtime_checkpoint(include_bytes!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../testdata/runtime-reconciliation-v1-start-runtime-checkpoint.json"
+        )))
+        .unwrap();
+        let ReconcileStep::StartRuntime { devices, .. } = &mut launch.step else {
+            unreachable!()
+        };
+        devices[0].frontend = PrepareDeviceFrontend::KernelNbd {
+            listener_socket_path: host("/run/cats/cat_01/root-nbd.sock"),
+            device_path: host("/dev/nbd0"),
+            direct: false,
+        };
+        launch.runtime_launch = RuntimeLaunch::Present(Box::new(
+            launch.step.start_runtime_launch_identity().unwrap(),
+        ));
+        launch.volumes[0].devices.clear();
+        encode_runtime_checkpoint(&launch).unwrap();
+
+        for step in [
+            ReconcileStep::FormatFilesystem {
+                volume_id: id("vol_root"),
+                attachment_id: id("att_01"),
+                filesystem_uuid: random('d'),
+                initialization_token: random('e'),
+                expected_blank_head: RemoteHead {
+                    generation: Generation::new(0).unwrap(),
+                    root_hash: None,
+                    root_object_id: None,
+                },
+            },
+            ReconcileStep::InstallGate {
+                endpoint_id: id("endpoint_01"),
+                route_epoch: Epoch::new(1).unwrap(),
+            },
+            ReconcileStep::Stable {
+                state: StableState::Running,
+            },
+        ] {
+            let mut tail = launch.clone();
+            tail.stable_state =
+                matches!(&step, ReconcileStep::Stable { .. }).then_some(StableState::Running);
+            tail.step = step;
+            encode_runtime_checkpoint(&tail).unwrap();
+            let prepared = prepared_device_inputs(&tail).unwrap();
+            let expected = reservation_from_prepared_device(&tail.cat_id, &prepared[0]).unwrap();
+            KernelNbdReservations::from_checkpoints([&tail])
+                .unwrap()
+                .assert_contains(
+                    &expected,
+                    "Running tail lost its retained kernel-NBD reservation",
+                )
+                .unwrap();
+        }
     }
 
     #[test]
