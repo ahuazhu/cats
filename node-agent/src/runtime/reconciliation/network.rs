@@ -133,6 +133,13 @@ impl NodeGlobalNetworkScanAdmission {
             .collect()
     }
 
+    pub(crate) fn has_exact_network(&self, cat_id: &Id, identity: &RuntimeNetworkIdentity) -> bool {
+        self.entries.get(cat_id).is_some_and(|entry| {
+            entry.reservation.identity == *identity
+                && entry.state == ReservedHostNetworkState::Exact
+        })
+    }
+
     pub(crate) fn bind(self, observation: &NodeObservation) -> Result<NodeGlobalNetworkAdmission> {
         anyhow::ensure!(
             observation.complete_inventory,

@@ -826,10 +826,6 @@ impl CompleteRuntimeInventory {
         self.kernel_nbd_pool.take().map(|admission| *admission)
     }
 
-    #[expect(
-        dead_code,
-        reason = "the live-VMM plus Guest Ready scanner mints this sealed admission in the next composition slice"
-    )]
     pub(crate) fn with_running_tail_admission(
         mut self,
         admission: Option<RunningTailScanAdmission>,

@@ -2,10 +2,10 @@
 //!
 //! Public `ObservedRuntimeStatus` fields are consistency projections, never
 //! authority to open a cell. One complete scanner pass may attach the opaque
-//! scan admission below only after provider-private live-VMM and Guest Ready
-//! proofs agree. The current production scanner has no constructor for that
-//! token, so this effect is composed but unreachable until that exact scanner
-//! seam lands.
+//! scan admission below only after provider-private storage, frontend,
+//! network, live-VMM and Guest Ready proofs agree. The production scanner is
+//! the only constructor for that token; the Desired effect must still repeat
+//! the complete physical proof immediately before its local gate mutation.
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
@@ -54,10 +54,6 @@ struct RunningTailReadyExpectation {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum RunningTailPhysicalAuthority {
-    #[allow(
-        dead_code,
-        reason = "the production Guest Ready scanner constructs this sealed variant"
-    )]
     Exact {
         vmm: Box<ExactVmmProcessProof>,
         guest_ready: Box<GuestReadyEvidence>,
@@ -66,13 +62,6 @@ enum RunningTailPhysicalAuthority {
     Test,
 }
 
-#[cfg_attr(
-    not(test),
-    expect(
-        dead_code,
-        reason = "the live-VMM plus Guest Ready scanner constructs cell-presence proof in the next composition slice"
-    )
-)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum RunningTailCellPresence {
     Absent,
@@ -80,8 +69,8 @@ enum RunningTailCellPresence {
 }
 
 /// Provider-private result of one complete scan, before it is bound to the
-/// exact public observation. There is deliberately no production constructor
-/// until the live-VMM plus Guest Ready scanner owns both exact proofs.
+/// exact public observation. Only the production full scanner constructs an
+/// exact entry, after all physical authorities agree in the same pass.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct RunningTailScanAdmission {
     ready: BTreeMap<Id, RunningTailReadyExpectation>,
@@ -111,6 +100,10 @@ impl RunningTailScanAdmission {
         Self {
             ready: BTreeMap::new(),
         }
+    }
+
+    pub(crate) fn is_empty(&self) -> bool {
+        self.ready.is_empty()
     }
 
     pub(crate) fn insert_exact(

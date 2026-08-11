@@ -113,8 +113,8 @@ use super::{
         root_process_inventory_bridge_sealed, InstalledRuntimeInventoryKeyRingReader,
         RootProcessInventoryBridge, RootProcessInventoryBridgeOutcome,
     },
-    AuthorizedBlockdCheckpoint, CleanSlateInventoryScanner, InventoryAbsence,
-    InventoryAbsenceProbe, PlatformSystemdRootProvisionProcessPort,
+    AdmissionCellRegistry, AuthorizedBlockdCheckpoint, CleanSlateInventoryScanner,
+    InventoryAbsence, InventoryAbsenceProbe, PlatformSystemdRootProvisionProcessPort,
     PlatformSystemdServingBlockdProcessPort, RootProvisionProcessConflict,
     RootProvisionProcessExpectation, RootProvisionProcessGlobalPort,
     RootProvisionProcessInspection, RootProvisionProcessPort, RootProvisionProcessRetirementPort,
@@ -1077,6 +1077,7 @@ impl ProbeConfig {
 
 pub(crate) fn installed_clean_slate_scanner(
     config: InstalledCleanSlateProbeConfig,
+    admission_registry: Arc<AdmissionCellRegistry>,
 ) -> anyhow::Result<Arc<dyn RuntimeInventoryScanner>> {
     let metadata_authority = Arc::new(PagedMetadataAuthorityReader::new(Arc::new(
         RuntimeVolumeInventoryPagePort::start(Arc::clone(&config.volume_inventory_authority))?,
@@ -1085,7 +1086,8 @@ pub(crate) fn installed_clean_slate_scanner(
     let config = ProbeConfig::installed(config)?;
     let scanner =
         scanner_with_metadata_authority_and_blob(config, metadata_authority, Some(blob_store))?
-            .with_key_ring_reader(Arc::new(InstalledRuntimeInventoryKeyRingReader));
+            .with_key_ring_reader(Arc::new(InstalledRuntimeInventoryKeyRingReader))
+            .with_running_tail(admission_registry);
     Ok(Arc::new(scanner))
 }
 

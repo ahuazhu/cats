@@ -19,7 +19,7 @@ use cats_api::runtime_reconciliation::{
     DesiredRuntimeSpec, GuestTransportEvidence, HostPath, Id, InventorySource, LifecycleAdmission,
     LocalLineageState, LocalVolumeLineage, ObservedDevice, ObservedRuntimeStatus, ObservedVolume,
     ProcessEvidence, ProgressingReason, ReconcileStep, RequireIdleCheckpoint, RuntimeCheckpoint,
-    UnixMillis, VolumeAuthorityEvidence, WarmSnapshotEvidence, WireU64,
+    RuntimeTarget, UnixMillis, VolumeAuthorityEvidence, WarmSnapshotEvidence, WireU64,
 };
 use cats_storage::{
     authority::{
@@ -37,11 +37,14 @@ use crate::runtime_spine::{
 };
 
 use super::{
+    admission_registry::AdmissionCellRegistry,
+    guest_ready::{GuestReadyTransportPort, PlatformGuestReadyTransportPort},
     kernel_nbd::{KernelNbdInventoryPort, KernelNbdPoolScanOutcome},
     network::{
         prepare_device_checkpoint_view, prepared_device_inputs, NodeGlobalNetworkScanAdmission,
     },
     prepare_device_retirement::prepared_device_input_is_exact,
+    probe_exact_guest_ready,
     retained_runtime_launch::RetainedRuntimeLaunchAuthority,
     root_provision_process::{
         ManagedServingKey, NodeGlobalManagedProcessScanAdmission,
@@ -49,6 +52,7 @@ use super::{
         RootProvisionProcessExpectation, StopReceiptSocketAdmission,
         TargetControlProcessLaunchIdentity,
     },
+    running_admission::RunningTailScanAdmission,
     runtime_checkpoint_path,
     signed_running::{
         expected_provision_heads, provision_checkpoint_is_bound, request_matches_volume,
@@ -286,6 +290,8 @@ pub struct CleanSlateInventoryScanner {
     network_bridge: Option<Arc<dyn NetworkInventoryBridge>>,
     kernel_nbd_port: Option<KernelNbdInventoryPort>,
     key_ring_reader: Option<Arc<dyn RuntimeInventoryKeyRingReader>>,
+    running_admission_registry: Option<Arc<AdmissionCellRegistry>>,
+    guest_ready: Option<Arc<dyn GuestReadyTransportPort>>,
 }
 
 impl crate::runtime_spine::inventory_scanner_sealed::Sealed for CleanSlateInventoryScanner {}
@@ -332,6 +338,8 @@ impl CleanSlateInventoryScanner {
             network_bridge: None,
             kernel_nbd_port: None,
             key_ring_reader: None,
+            running_admission_registry: None,
+            guest_ready: None,
         })
     }
 
@@ -371,6 +379,23 @@ impl CleanSlateInventoryScanner {
 
     pub(crate) fn with_kernel_nbd_pool(mut self, port: KernelNbdInventoryPort) -> Self {
         self.kernel_nbd_port = Some(port);
+        self
+    }
+
+    pub(crate) fn with_running_tail(mut self, registry: Arc<AdmissionCellRegistry>) -> Self {
+        self.running_admission_registry = Some(registry);
+        self.guest_ready = Some(Arc::new(PlatformGuestReadyTransportPort));
+        self
+    }
+
+    #[cfg(test)]
+    pub(crate) fn with_running_tail_transport_for_test(
+        mut self,
+        registry: Arc<AdmissionCellRegistry>,
+        guest_ready: Arc<dyn GuestReadyTransportPort>,
+    ) -> Self {
+        self.running_admission_registry = Some(registry);
+        self.guest_ready = Some(guest_ready);
         self
     }
 }
@@ -665,6 +690,109 @@ impl RuntimeInventoryScanner for CleanSlateInventoryScanner {
             });
         }
 
+        let mut running_tail_admission = None;
+        if let (Some(registry), Some(guest_ready), Some(processes), Some(networks)) = (
+            self.running_admission_registry.as_ref(),
+            self.guest_ready.as_ref(),
+            node_global_process_admission.as_ref(),
+            node_global_network_admission.as_ref(),
+        ) {
+            let mut tail = RunningTailScanAdmission::empty();
+            let mut vmm_proofs = processes.vmm_proofs();
+            let serving_proofs = processes.serving_blockd_proofs();
+            for desired in &context.coordinates().desired.desired_specs {
+                if desired.target != RuntimeTarget::Running {
+                    continue;
+                }
+                let Some(checkpoint_evidence) = aggregate.checkpoints_by_cat.get(&desired.cat_id)
+                else {
+                    continue;
+                };
+                if checkpoint_evidence.binding != DesiredCheckpointBinding::Current
+                    || checkpoint_evidence
+                        .checkpoint
+                        .runtime_launch
+                        .identity()
+                        .is_none()
+                {
+                    continue;
+                }
+                let checkpoint = &checkpoint_evidence.checkpoint;
+                validate_scanned_checkpoint(
+                    desired,
+                    checkpoint,
+                    checkpoint_evidence.binding,
+                    aggregate.blockd_by_cat.get(&desired.cat_id),
+                    &self.checkpoint_directory,
+                    self.blob.as_deref(),
+                    context.deadline(),
+                )?;
+                let launch = checkpoint
+                    .runtime_launch
+                    .identity()
+                    .expect("retained launch presence was checked above");
+                let prepared = prepared_device_inputs(checkpoint)?;
+                let projected_devices = serving_devices_by_cat
+                    .get(&desired.cat_id)
+                    .cloned()
+                    .unwrap_or_default();
+                let exact_device_set = prepared.len() == projected_devices.len()
+                    && prepared.iter().all(|device| {
+                        let key = ManagedServingKey::new(
+                            desired.cat_id.clone(),
+                            device.volume_id.clone(),
+                        );
+                        serving_proofs.get(&key).is_some_and(|proof| {
+                            proof
+                                .expectation()
+                                .matches_device_contract(&desired.cat_id, device)
+                                && projected_devices.contains_key(&device.volume_id)
+                        })
+                    });
+                if !exact_device_set
+                    || !networks.has_exact_network(&desired.cat_id, launch.network.as_ref())
+                {
+                    continue;
+                }
+                let Some(vmm) = vmm_proofs.remove(&desired.cat_id) else {
+                    continue;
+                };
+                let guest_ready = match probe_exact_guest_ready(
+                    guest_ready.as_ref(),
+                    &context,
+                    desired,
+                    checkpoint,
+                    &vmm,
+                ) {
+                    Ok(evidence) => evidence,
+                    Err(_) => {
+                        // A booting Guest or an earlier Format/Mount phase is
+                        // an exact closed observation, not a reason to starve
+                        // the physical effect that will make it Ready. A
+                        // cancelled/deadline-expired scan is still propagated.
+                        context.check_active()?;
+                        continue;
+                    }
+                };
+                let observed_cell = registry
+                    .existing_session(&desired.cat_id)
+                    .context("observe the process-owned Running admission cell")?
+                    .map(|session| session.cell().observe());
+                tail.insert_exact(
+                    desired,
+                    checkpoint,
+                    checkpoint_content_digest(checkpoint)
+                        .context("digest Running-tail checkpoint")?,
+                    vmm,
+                    guest_ready,
+                    observed_cell,
+                )?;
+            }
+            if !tail.is_empty() {
+                running_tail_admission = Some(tail);
+            }
+        }
+
         let key_ring = match &self.key_ring_reader {
             Some(reader) => reader.read(&context)?,
             None => RuntimeInventoryKeyRing::Unavailable,
@@ -685,7 +813,7 @@ impl RuntimeInventoryScanner for CleanSlateInventoryScanner {
             blob: self.blob.as_deref(),
             deadline: context.deadline(),
         };
-        let runtimes = context
+        let mut runtimes = context
             .coordinates()
             .desired
             .desired_specs
@@ -714,6 +842,11 @@ impl RuntimeInventoryScanner for CleanSlateInventoryScanner {
                 )
             })
             .collect::<anyhow::Result<Vec<_>>>()?;
+        if let Some(tail) = &running_tail_admission {
+            for runtime in &mut runtimes {
+                tail.project_runtime(runtime)?;
+            }
+        }
         anyhow::ensure!(
             aggregate.volumes_by_cat.is_empty()
                 && aggregate.checkpoints_by_cat.is_empty()
@@ -734,7 +867,8 @@ impl RuntimeInventoryScanner for CleanSlateInventoryScanner {
             )
             .with_node_global_process_admission(node_global_process_admission)
             .with_node_global_network_admission(node_global_network_admission)
-            .with_kernel_nbd_pool_admission(kernel_nbd_pool_admission),
+            .with_kernel_nbd_pool_admission(kernel_nbd_pool_admission)
+            .with_running_tail_admission(running_tail_admission),
         ))
     }
 }
@@ -1991,7 +2125,11 @@ mod tests {
 
         let scanner =
             CleanSlateInventoryScanner::new(PathBuf::from("/checkpoints"), probes(None, &calls))
-                .unwrap();
+                .unwrap()
+                .with_running_tail_transport_for_test(
+                    AdmissionCellRegistry::new(PathBuf::from("/checkpoints")),
+                    Arc::new(PlatformGuestReadyTransportPort),
+                );
         let RuntimeInventoryScanOutcome::Complete(inventory) =
             scanner.scan_complete(context()).unwrap()
         else {

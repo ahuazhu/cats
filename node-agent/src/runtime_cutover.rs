@@ -314,18 +314,20 @@ async fn spawn_signed_runtime_cutover_with_overrides(
             &config.agent_registration,
         )?
     };
+    let effect_state_directory = config.agent_registration.runtime_state_directory();
+    let admission_registry = AdmissionCellRegistry::for_state_directory(&effect_state_directory);
     let scanner = match scanner_override {
         Some(scanner) => scanner,
-        None => installed_clean_slate_scanner(installed_probe_config)
-            .context("compose installed clean-slate inventory probes")?,
+        None => {
+            installed_clean_slate_scanner(installed_probe_config, Arc::clone(&admission_registry))
+                .context("compose installed clean-slate inventory probes")?
+        }
     };
     let effect_registration = config.agent_registration.clone();
     let effect_control_plane_url = config.control_plane_url.clone();
     let effect_volume_authority = Arc::clone(&config.volume_data_authority);
     let effect_blob_store = Arc::clone(&config.blob_store);
     let effect_lease_duration_ms = config.volume_lease_duration_ms;
-    let effect_state_directory = config.agent_registration.runtime_state_directory();
-    let admission_registry = AdmissionCellRegistry::for_state_directory(&effect_state_directory);
     let effect_network_ip_binary = config.ch_config.ip_bin.clone();
     let effect_kernel_nbd_inventory = kernel_nbd_inventory;
     let effect_kernel_nbd_cleanup_owner = Arc::clone(&kernel_nbd_cleanup_owner);
