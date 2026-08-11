@@ -85,6 +85,10 @@ use super::serving_handoff::{
 use super::serving_handoff_effect::{
     SERVING_CONTROL_SOCKET_BASENAME, SERVING_NBD_SOCKET_BASENAME, SERVING_VHOST_SOCKET_BASENAME,
 };
+use super::vmm_cid::{
+    inventory_port_sealed as vmm_cid_inventory_sealed, ExactLiveVmmCid, VmmCidInventoryPort,
+    VmmCidInventorySnapshot, VmmCidOwner,
+};
 use super::vmm_process::{
     PlatformSystemdVmmProcessPort, VmmProcessConflict, VmmProcessExpectation, VmmProcessInspection,
     VmmProcessPort,
@@ -1049,6 +1053,7 @@ pub(crate) struct InstalledRootProcessEffectPorts {
     pub(crate) retirement: Arc<dyn RootProvisionProcessRetirementPort>,
     pub(crate) global: Arc<dyn RootProvisionProcessGlobalPort>,
     pub(crate) serving: Arc<dyn ServingBlockdProcessGlobalPort>,
+    pub(crate) vmm_cid: Arc<dyn VmmCidInventoryPort>,
 }
 
 pub(crate) fn installed_root_process_effect_ports(
@@ -1069,7 +1074,8 @@ pub(crate) fn installed_root_process_effect_ports(
     Ok(InstalledRootProcessEffectPorts {
         retirement: Arc::clone(&bridge) as Arc<dyn RootProvisionProcessRetirementPort>,
         global: Arc::clone(&bridge) as Arc<dyn RootProvisionProcessGlobalPort>,
-        serving: bridge as Arc<dyn ServingBlockdProcessGlobalPort>,
+        serving: Arc::clone(&bridge) as Arc<dyn ServingBlockdProcessGlobalPort>,
+        vmm_cid: bridge as Arc<dyn VmmCidInventoryPort>,
     })
 }
 
@@ -3443,6 +3449,47 @@ impl ServingBlockdProcessGlobalPort for PlatformRootProcessInventoryBridge {
     }
 }
 
+impl vmm_cid_inventory_sealed::Sealed for PlatformRootProcessInventoryBridge {}
+
+impl VmmCidInventoryPort for PlatformRootProcessInventoryBridge {
+    fn inspect(
+        &self,
+        context: &crate::runtime_spine::RuntimeDesiredEffectContext,
+    ) -> anyhow::Result<VmmCidInventorySnapshot> {
+        context.check_active()?;
+        let accepted = context.accepted_full()?;
+        let admission = context.node_global_process()?;
+        anyhow::ensure!(
+            admission.matches_observation(accepted.observation()),
+            "VMM CID inventory admission is not bound to the accepted full observation"
+        );
+        match self.inspect_admitted_managed_processes(admission, context)? {
+            AdmittedManagedProcessInspection::Exact { .. } => {}
+            AdmittedManagedProcessInspection::Unavailable => {
+                anyhow::bail!("Node-global VMM CID inventory is unavailable")
+            }
+            AdmittedManagedProcessInspection::IdentityMismatch => {
+                anyhow::bail!("Node-global VMM CID inventory changed from its admission")
+            }
+            AdmittedManagedProcessInspection::DuplicateIdentity => {
+                anyhow::bail!("Node-global VMM CID inventory contains foreign or duplicate state")
+            }
+        }
+        let exact = admission
+            .exact_vmm_proofs()
+            .map(|proof| {
+                let (cat_id, runtime_incarnation, guest_cid) = proof.guest_cid_identity();
+                ExactLiveVmmCid::new(
+                    VmmCidOwner::new(cat_id.clone(), runtime_incarnation.clone()),
+                    guest_cid,
+                )
+            })
+            .collect::<anyhow::Result<Vec<_>>>()?;
+        context.check_active()?;
+        VmmCidInventorySnapshot::try_new(exact)
+    }
+}
+
 impl RootProvisionProcessRetirementPort for PlatformRootProcessInventoryBridge {
     fn inspect_exact_after_node_global_sweep(
         &self,
@@ -5798,11 +5845,11 @@ mod tests {
 
     use cats_api::runtime_reconciliation::{
         decode_desired_read_snapshot, decode_runtime_checkpoint, inventory_digest, spec_digest,
-        AcquireOrigin, AsciiText, AssignedKind, AssignedPlacement, CheckpointEvidence,
-        CleanupRelease, CleanupTarget, ContractVersion, DesiredRuntimeSpec,
-        DirectAuthorizedAttachmentIdentity, DirectAuthorizedAttachmentPurpose, DiskKind,
-        Durability, Epoch, FenceEpoch, Generation, GuestDeviceIdentity, HostPath, Id, Ipv4Address,
-        IsolatedIpv4Kind, LifecycleAdmission, MacAddress, NetworkConfig, NodeBootId,
+        AcquireOrigin, AdmissionInventoryAttestation, AgentSession, AsciiText, AssignedKind,
+        AssignedPlacement, CheckpointEvidence, CleanupRelease, CleanupTarget, ContractVersion,
+        DesiredRuntimeSpec, DirectAuthorizedAttachmentIdentity, DirectAuthorizedAttachmentPurpose,
+        DiskKind, Durability, Epoch, FenceEpoch, Generation, GuestDeviceIdentity, HostPath, Id,
+        Ipv4Address, IsolatedIpv4Kind, LifecycleAdmission, MacAddress, NetworkConfig, NodeBootId,
         NodeObservation, NormalAcquireRequest, PrepareDeviceFrontend, RandomId128, ReconcileStep,
         RemoteHead, Revision, RuntimeConfig, RuntimeNetworkIdentity, RuntimeTarget,
         RuntimeTransition, RuntimeVolumeTransition, RuntimeVolumeTransitionPreconditionProblem,
@@ -5817,9 +5864,9 @@ mod tests {
     use tempfile::TempDir;
 
     use crate::runtime_spine::{
-        RuntimeDesiredEffectContext, RuntimeInventoryScanOutcome, RuntimeInventoryScanner,
-        RuntimePreScanRecovery, RuntimePreScanRecoveryContext, RuntimePreScanRecoveryOutcome,
-        RuntimeSpineFullScan,
+        RuntimeDesiredEffectAdmission, RuntimeDesiredEffectContext, RuntimeInventoryScanOutcome,
+        RuntimeInventoryScanner, RuntimePreScanRecovery, RuntimePreScanRecoveryContext,
+        RuntimePreScanRecoveryOutcome, RuntimeSpineFullScan,
     };
 
     use super::super::signed_running::{
@@ -5866,6 +5913,43 @@ mod tests {
                 assert!(admission.process_projections().is_empty());
                 assert!(admission.vmm_proofs().is_empty());
             }
+        }
+    }
+
+    #[test]
+    fn cid_inventory_rejects_a_vmm_late_before_or_between_fresh_global_scans() {
+        for process_ids in [vec![Some(4_242)], vec![None, Some(4_242)]] {
+            let environment = TestEnvironment::new();
+            let checkpoint = decode_runtime_checkpoint(include_bytes!(concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/../testdata/runtime-reconciliation-v1-start-runtime-checkpoint.json"
+            )))
+            .unwrap();
+            let expected = VmmProcessExpectation::from_checkpoint(checkpoint)
+                .unwrap()
+                .with_checkpoint_path(
+                    HostPath::new("/var/lib/cats/checkpoints/cat-cat_01.checkpoint.json").unwrap(),
+                )
+                .unwrap();
+            let context = effect_context_with_absent_vmm(&environment, expected);
+            let bridge = root_process_bridge_with_all_ports(
+                &environment,
+                Arc::new(FakeRootProcessPort {
+                    inspections: Mutex::new(VecDeque::new()),
+                }),
+                Arc::new(FakeServingProcessPort {
+                    process_ids: Mutex::new(VecDeque::new()),
+                }),
+                Arc::new(FakeVmmProcessPort {
+                    process_ids: Mutex::new(process_ids.into()),
+                }),
+            );
+
+            let error = VmmCidInventoryPort::inspect(&bridge, &context).unwrap_err();
+
+            assert!(error
+                .to_string()
+                .contains("VMM CID inventory changed from its admission"));
         }
     }
 
@@ -6544,6 +6628,43 @@ mod tests {
         process_ids: Mutex<VecDeque<Option<u32>>>,
     }
 
+    struct FakeVmmProcessPort {
+        process_ids: Mutex<VecDeque<Option<u32>>>,
+    }
+
+    impl super::super::vmm_process::VmmProcessPortSealedForTest for FakeVmmProcessPort {}
+
+    impl VmmProcessPort for FakeVmmProcessPort {
+        fn inspect(
+            &self,
+            expected: &VmmProcessExpectation,
+            _context: &dyn RuntimePhysicalReadContext,
+        ) -> anyhow::Result<VmmProcessInspection> {
+            Ok(
+                match self
+                    .process_ids
+                    .lock()
+                    .unwrap()
+                    .pop_front()
+                    .expect("fake VMM inspection exhausted")
+                {
+                    Some(process_id) => VmmProcessInspection::Exact(Box::new(
+                        expected.exact_evidence_for_test(process_id),
+                    )),
+                    None => VmmProcessInspection::Absent,
+                },
+            )
+        }
+
+        fn start_checkpointed(
+            &self,
+            _checkpointed: super::super::vmm_process::CheckpointedVmmProcess<'_>,
+            _context: &RuntimeDesiredEffectContext,
+        ) -> anyhow::Result<super::super::vmm_process::VmmProcessStart> {
+            unreachable!("inventory fake is read-only")
+        }
+    }
+
     impl serving_process_sealed::Sealed for FakeServingProcessPort {}
 
     impl ServingBlockdProcessPort for FakeServingProcessPort {
@@ -6802,10 +6923,24 @@ mod tests {
         port: Arc<dyn RootProvisionProcessPort>,
         serving_port: Arc<dyn ServingBlockdProcessPort>,
     ) -> PlatformRootProcessInventoryBridge {
+        root_process_bridge_with_all_ports(
+            environment,
+            port,
+            serving_port,
+            Arc::new(PlatformSystemdVmmProcessPort),
+        )
+    }
+
+    fn root_process_bridge_with_all_ports(
+        environment: &TestEnvironment,
+        port: Arc<dyn RootProvisionProcessPort>,
+        serving_port: Arc<dyn ServingBlockdProcessPort>,
+        vmm_port: Arc<dyn VmmProcessPort>,
+    ) -> PlatformRootProcessInventoryBridge {
         PlatformRootProcessInventoryBridge {
             port,
             serving_port,
-            vmm_port: Arc::new(PlatformSystemdVmmProcessPort),
+            vmm_port,
             root_provision_systemd: test_root_provision_systemd(&environment.blockd_binary),
             executable_path: HostPath::new(
                 environment.blockd_binary.to_string_lossy().into_owned(),
@@ -6927,6 +7062,66 @@ mod tests {
             Instant::now() + Duration::from_secs(5),
             admission,
         )
+    }
+
+    fn effect_context_with_absent_vmm(
+        environment: &TestEnvironment,
+        expected: VmmProcessExpectation,
+    ) -> RuntimeDesiredEffectContext {
+        let cat_id = expected.cat_id().clone();
+        let managed = super::super::root_provision_process::NodeGlobalManagedProcessScanAdmission::from_root_controls(
+            BTreeMap::new(),
+            BTreeMap::new(),
+        )
+        .unwrap()
+        .with_vmms(BTreeMap::from([(cat_id, expected)]), BTreeMap::new())
+        .unwrap()
+        .into_admission_for_test();
+        let session = AgentSession {
+            version: ContractVersion::V1,
+            node_id: Id::new("node_test").unwrap(),
+            immutable_host_id: Id::new("host_test").unwrap(),
+            node_boot_id: NodeBootId::new("2".repeat(32)).unwrap(),
+            agent_instance_id: RandomId128::new("3".repeat(32)).unwrap(),
+            agent_session_epoch: Epoch::new(1).unwrap(),
+            registration_attempt_id: RandomId128::new("4".repeat(32)).unwrap(),
+            guest_config_digest: Sha256Digest::from_bytes([6; 32]),
+            lease_deadline_unix_ms: UnixMillis::new(2_000).unwrap(),
+        };
+        let observation = NodeObservation {
+            version: ContractVersion::V1,
+            observation_id: RandomId128::new("1".repeat(32)).unwrap(),
+            node_id: session.node_id.clone(),
+            node_boot_id: session.node_boot_id.clone(),
+            agent_instance_id: session.agent_instance_id.clone(),
+            agent_session_epoch: session.agent_session_epoch,
+            heartbeat_sequence: Sequence::new(1).unwrap(),
+            observed_at_unix_ms: UnixMillis::new(1_000).unwrap(),
+            complete_inventory: true,
+            inventory_epoch: Epoch::new(1).unwrap(),
+            inventory_digest: Some(Sha256Digest::from_bytes([4; 32])),
+            inventory_read_position: Some(Sequence::new(1).unwrap()),
+            key_ring_version: None,
+            key_ring_digest: None,
+            loaded_kids: Vec::new(),
+            runtimes: Vec::new(),
+            residue: Vec::new(),
+        };
+        let attestation = AdmissionInventoryAttestation {
+            version: ContractVersion::V1,
+            node_id: session.node_id.clone(),
+            agent_session_epoch: session.agent_session_epoch,
+            inventory_epoch: observation.inventory_epoch,
+            inventory_digest: observation.inventory_digest.clone().unwrap(),
+            inventory_read_position: observation.inventory_read_position.unwrap(),
+            accepted_at_unix_ms: UnixMillis::new(1_100).unwrap(),
+        };
+        RuntimeDesiredEffectContext::for_test_with_admission(
+            StateDirectory::unanchored(environment.state.clone()),
+            Instant::now() + Duration::from_secs(5),
+            RuntimeDesiredEffectAdmission::for_test(session, observation, attestation),
+        )
+        .with_node_global_process_for_test(managed)
     }
 
     fn persist_acquire_checkpoint(

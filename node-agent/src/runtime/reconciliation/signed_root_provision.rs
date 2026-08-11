@@ -65,7 +65,8 @@ use super::{
     PlatformSystemdRootProvisionProcessPort, RootProvisionProcessConflict,
     RootProvisionProcessInspection, RootProvisionProcessOutcome, RootProvisionProcessPort,
     RootProvisionProcessRetirementPort, RootProvisionProcessStop, RootProvisionResponseHint,
-    RootProvisionSystemdConfig, UnixRootProvisionClient, VmmLaunchArtifactPaths,
+    RootProvisionSystemdConfig, UnixRootProvisionClient, VmmCidInventoryPort,
+    VmmLaunchArtifactPaths,
 };
 
 pub(crate) mod request_sealed {
@@ -152,6 +153,7 @@ pub(crate) struct SignedRunningProcessPorts {
     retirement: Arc<dyn RootProvisionProcessRetirementPort>,
     root_global: Arc<dyn RootProvisionProcessGlobalPort>,
     serving_global: Arc<dyn ServingBlockdProcessGlobalPort>,
+    vmm_cid: Arc<dyn VmmCidInventoryPort>,
 }
 
 pub(crate) struct SignedRunningHostConfig {
@@ -188,11 +190,13 @@ impl SignedRunningProcessPorts {
         retirement: Arc<dyn RootProvisionProcessRetirementPort>,
         root_global: Arc<dyn RootProvisionProcessGlobalPort>,
         serving_global: Arc<dyn ServingBlockdProcessGlobalPort>,
+        vmm_cid: Arc<dyn VmmCidInventoryPort>,
     ) -> Self {
         Self {
             retirement,
             root_global,
             serving_global,
+            vmm_cid,
         }
     }
 }
@@ -252,6 +256,7 @@ impl SignedRunningEffect {
             Arc::clone(&prepare_network),
             Arc::clone(&authority),
             Arc::clone(&process_ports.serving_global),
+            process_ports.vmm_cid,
             kernel_nbd_inventory,
         );
         Ok(Self {

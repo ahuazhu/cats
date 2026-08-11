@@ -114,21 +114,25 @@ pub(crate) trait VmmCidInventoryPort: inventory_port_sealed::Sealed + Send + Syn
     fn inspect(&self, context: &RuntimeDesiredEffectContext) -> Result<VmmCidInventorySnapshot>;
 }
 
-/// Production live-CID projection from the exact accepted full-inventory
+/// Test-only live-CID projection from the exact accepted full-inventory
 /// admission that opened this Desired effect batch.
 ///
 /// The complete clean-slate scanner already rejected unavailable, malformed,
 /// conflicting, duplicate and foreign managed processes before it could mint
 /// `NodeGlobalManagedProcessAdmission`. Reopening `/proc`, systemd or public
-/// process projections here would create a second, weaker scan. This port
-/// therefore projects only the unforgeable exact VMM proofs retained by that
-/// same admission. A legitimately absent VMM contributes no live CID; a
+/// Production uses the full Node-global process bridge, which reopens the same
+/// admitted closed set under the CID allocation flock. Tests that exercise
+/// the allocator in isolation use this projection after explicitly building a
+/// sealed admission. A legitimately absent VMM contributes no live CID; a
 /// missing admission fails rather than becoming an unproven empty inventory.
+#[cfg(test)]
 #[derive(Debug, Default, Clone, Copy)]
 pub(crate) struct PlatformExactVmmCidInventoryPort;
 
+#[cfg(test)]
 impl inventory_port_sealed::Sealed for PlatformExactVmmCidInventoryPort {}
 
+#[cfg(test)]
 impl VmmCidInventoryPort for PlatformExactVmmCidInventoryPort {
     fn inspect(&self, context: &RuntimeDesiredEffectContext) -> Result<VmmCidInventorySnapshot> {
         context.check_active()?;

@@ -39,9 +39,11 @@ use super::serving_handoff_effect::checkpoint_is_current_exact;
 use super::signed_root_provision::signed_inventory_admission_is_exact_with_networks;
 use super::vmm_launch_artifacts::{RetainedVmmLaunchArtifacts, VmmLaunchArtifactPaths};
 use super::vmm_start_runtime::{build_start_runtime_successor, StartRuntimeCheckpointAuthority};
+#[cfg(test)]
+use super::PlatformExactVmmCidInventoryPort;
 use super::{
-    FileCheckpointStore, ManagedVmmLaunchFilePaths, ManagedVmmSocketRoot,
-    PlatformExactVmmCidInventoryPort, StoredCheckpoint, VmmCidAllocationPort,
+    FileCheckpointStore, ManagedVmmLaunchFilePaths, ManagedVmmSocketRoot, StoredCheckpoint,
+    VmmCidAllocationPort, VmmCidInventoryPort,
 };
 
 pub(crate) trait RetainedLaunchArtifactAuthority: Send + Sync {
@@ -100,14 +102,12 @@ impl StartRuntimeReservationEffect {
         network: Arc<PrepareNetworkReservationEffect>,
         authority: Arc<dyn VolumeDataAuthority>,
         serving_process: Arc<dyn ServingBlockdProcessGlobalPort>,
+        vmm_cid_inventory: Arc<dyn VmmCidInventoryPort>,
         kernel_nbd: Option<KernelNbdInventoryConfig>,
     ) -> Self {
         Self {
             state_directory: state_directory.clone(),
-            cid: VmmCidAllocationPort::new(
-                state_directory,
-                Arc::new(PlatformExactVmmCidInventoryPort),
-            ),
+            cid: VmmCidAllocationPort::new(state_directory, vmm_cid_inventory),
             network,
             authority,
             serving_process,

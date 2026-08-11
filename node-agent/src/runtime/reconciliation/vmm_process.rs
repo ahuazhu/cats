@@ -72,6 +72,9 @@ mod sealed {
     pub(crate) trait Sealed {}
 }
 
+#[cfg(test)]
+pub(crate) use sealed::Sealed as VmmProcessPortSealedForTest;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum VmmProcessStart {
     Submitted,
