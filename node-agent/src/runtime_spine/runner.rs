@@ -4487,6 +4487,7 @@ mod tests {
             RuntimeSpineHttpClient::for_loopback_test("http://127.0.0.1:1/", signer()).unwrap(),
             scanner.clone(),
             Some(effect.clone()),
+            None,
             Some(recovery_port),
             None,
         )
