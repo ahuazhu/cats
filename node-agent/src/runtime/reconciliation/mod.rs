@@ -68,6 +68,23 @@ mod systemd_root_provision;
     reason = "fixed VMM launch artifacts are staged before StartRuntime composition"
 )]
 mod vmm_launch_artifacts;
+// The live VMM must still own the exact checkpoint, RAM/log leaves and Unix
+// socket pathnames recorded by StartRuntime. Keep the descriptor-retained
+// path set private until the process inspector below composes all of it.
+#[expect(
+    dead_code,
+    reason = "retained VMM runtime paths are staged before exact process composition"
+)]
+mod vmm_runtime_paths;
+// Cloud Hypervisor v53 exposes its live shape through a local HTTP API.  This
+// provider-private adapter freezes the exact wire schema, socket ownership,
+// SO_PEERCRED and deadline bounds before the process scanner composes it into
+// an adoption proof.
+#[expect(
+    dead_code,
+    reason = "bounded VMM API proof is staged before VMM process composition"
+)]
+mod vmm_api_inspection;
 // This sealed process boundary is staged immediately before the full VMM
 // inventory/adopt composition.  It already consumes the exact checkpoint and
 // pinned artifact descriptors; only that follow-up may mint an accepted-full

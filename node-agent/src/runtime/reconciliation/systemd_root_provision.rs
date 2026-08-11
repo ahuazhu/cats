@@ -1339,27 +1339,27 @@ fn read_bounded_and_drain(mut reader: impl Read) -> anyhow::Result<Vec<u8>> {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-struct SystemdUnitProperties {
-    id: String,
-    load_state: String,
-    active_state: String,
-    sub_state: String,
-    main_pid: u32,
-    control_group: String,
-    exec_start: String,
-    environment: String,
-    environment_files: String,
-    pass_environment: String,
-    unset_environment: String,
-    kill_mode: String,
-    restart: String,
-    umask: String,
-    timeout_stop_usec: String,
-    collect_mode: String,
+pub(super) struct SystemdUnitProperties {
+    pub(super) id: String,
+    pub(super) load_state: String,
+    pub(super) active_state: String,
+    pub(super) sub_state: String,
+    pub(super) main_pid: u32,
+    pub(super) control_group: String,
+    pub(super) exec_start: String,
+    pub(super) environment: String,
+    pub(super) environment_files: String,
+    pub(super) pass_environment: String,
+    pub(super) unset_environment: String,
+    pub(super) kill_mode: String,
+    pub(super) restart: String,
+    pub(super) umask: String,
+    pub(super) timeout_stop_usec: String,
+    pub(super) collect_mode: String,
 }
 
 impl SystemdUnitProperties {
-    fn proves_absent(&self, expected: &Id) -> bool {
+    pub(super) fn proves_absent(&self, expected: &Id) -> bool {
         self.id == expected.as_str()
             && self.load_state == "not-found"
             && self.active_state == "inactive"
@@ -1373,7 +1373,7 @@ impl SystemdUnitProperties {
             && self.unset_environment.is_empty()
     }
 
-    fn is_starting(&self, expected: &Id) -> bool {
+    pub(super) fn is_starting(&self, expected: &Id) -> bool {
         self.id == expected.as_str()
             && self.load_state == "loaded"
             && matches!(self.active_state.as_str(), "activating" | "reloading")
@@ -1406,7 +1406,7 @@ impl SystemdUnitProperties {
 }
 
 #[cfg(target_os = "linux")]
-fn systemd_unit_properties(
+pub(super) fn systemd_unit_properties(
     unit_id: &Id,
     context: &dyn RuntimePhysicalReadContext,
 ) -> anyhow::Result<Option<SystemdUnitProperties>> {
@@ -1497,7 +1497,7 @@ fn parse_systemd_properties(bytes: &[u8]) -> anyhow::Result<SystemdUnitPropertie
     })
 }
 
-fn exact_unset_environment(value: &str) -> bool {
+pub(super) fn exact_unset_environment(value: &str) -> bool {
     let mut actual = value
         .split_ascii_whitespace()
         .map(|entry| entry.trim_matches('"'))
@@ -1508,18 +1508,18 @@ fn exact_unset_environment(value: &str) -> bool {
     actual == expected
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(any(test, target_os = "linux"))]
 #[derive(Debug, Clone, PartialEq, Eq)]
-struct LinuxProcessSample {
-    start_time_ticks: u64,
-    executable_path: PathBuf,
-    command_line: Vec<OsString>,
-    control_group: String,
-    environment_keys: Vec<Vec<u8>>,
+pub(super) struct LinuxProcessSample {
+    pub(super) start_time_ticks: u64,
+    pub(super) executable_path: PathBuf,
+    pub(super) command_line: Vec<OsString>,
+    pub(super) control_group: String,
+    pub(super) environment: BTreeMap<OsString, OsString>,
 }
 
 #[cfg(target_os = "linux")]
-fn sample_linux_process(process_id: u32) -> Option<LinuxProcessSample> {
+pub(super) fn sample_linux_process(process_id: u32) -> Option<LinuxProcessSample> {
     use std::os::unix::ffi::OsStringExt as _;
 
     let stat = std::fs::read_to_string(format!("/proc/{process_id}/stat")).ok()?;
@@ -1542,8 +1542,8 @@ fn sample_linux_process(process_id: u32) -> Option<LinuxProcessSample> {
         return None;
     }
     let environment = std::fs::read(format!("/proc/{process_id}/environ")).ok()?;
-    let environment_keys = parse_process_environment_keys(&environment)?;
-    if !forbidden_process_environment_is_absent(&environment_keys) {
+    let environment = parse_process_environment(&environment)?;
+    if !forbidden_process_environment_is_absent(environment.keys()) {
         return None;
     }
     Some(LinuxProcessSample {
@@ -1551,29 +1551,42 @@ fn sample_linux_process(process_id: u32) -> Option<LinuxProcessSample> {
         executable_path,
         command_line,
         control_group,
-        environment_keys,
+        environment: environment
+            .into_iter()
+            .map(|(key, value)| (OsString::from_vec(key), OsString::from_vec(value)))
+            .collect(),
     })
 }
 
 fn parse_process_environment_keys(bytes: &[u8]) -> Option<Vec<Vec<u8>>> {
+    Some(parse_process_environment(bytes)?.into_keys().collect())
+}
+
+fn parse_process_environment(bytes: &[u8]) -> Option<BTreeMap<Vec<u8>, Vec<u8>>> {
     if bytes.len() > STATUS_MAX_BYTES || bytes.last().is_some_and(|byte| *byte != 0) {
         return None;
     }
-    let mut keys = bytes
+    let mut environment = BTreeMap::new();
+    for entry in bytes
         .split(|byte| *byte == 0)
         .filter(|entry| !entry.is_empty())
-        .map(|entry| {
-            let separator = entry.iter().position(|byte| *byte == b'=')?;
-            (separator > 0).then(|| entry[..separator].to_vec())
-        })
-        .collect::<Option<Vec<_>>>()?;
-    keys.sort();
-    let before = keys.len();
-    keys.dedup();
-    (keys.len() == before).then_some(keys)
+    {
+        let separator = entry.iter().position(|byte| *byte == b'=')?;
+        if separator == 0
+            || environment
+                .insert(entry[..separator].to_vec(), entry[separator + 1..].to_vec())
+                .is_some()
+        {
+            return None;
+        }
+    }
+    Some(environment)
 }
 
-fn forbidden_process_environment_is_absent(keys: &[Vec<u8>]) -> bool {
+fn forbidden_process_environment_is_absent<'a>(
+    keys: impl IntoIterator<Item = &'a Vec<u8>>,
+) -> bool {
+    let keys = keys.into_iter().collect::<Vec<_>>();
     UNSET_PROCESS_ENVIRONMENT.iter().all(|forbidden| {
         !keys
             .iter()
@@ -1582,7 +1595,7 @@ fn forbidden_process_environment_is_absent(keys: &[Vec<u8>]) -> bool {
 }
 
 #[cfg(target_os = "linux")]
-fn read_cgroup_processes(path: &Path) -> anyhow::Result<Option<Vec<u32>>> {
+pub(super) fn read_cgroup_processes(path: &Path) -> anyhow::Result<Option<Vec<u32>>> {
     let bytes = match std::fs::read(path.join("cgroup.procs")) {
         Ok(bytes) => bytes,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
@@ -3679,6 +3692,13 @@ while True:
         let ordinary = parse_process_environment_keys(b"LANG=C\0PATH=/usr/bin\0").unwrap();
         assert_eq!(ordinary, [b"LANG".to_vec(), b"PATH".to_vec()]);
         assert!(forbidden_process_environment_is_absent(&ordinary));
+        assert_eq!(
+            parse_process_environment(b"LANG=C\0PATH=/usr/bin\0").unwrap(),
+            BTreeMap::from([
+                (b"LANG".to_vec(), b"C".to_vec()),
+                (b"PATH".to_vec(), b"/usr/bin".to_vec()),
+            ])
+        );
 
         for forbidden in UNSET_PROCESS_ENVIRONMENT {
             let sample = format!("LANG=C\0{forbidden}=secret\0");
