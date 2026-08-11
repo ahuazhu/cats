@@ -26,11 +26,10 @@ use serde::{Deserialize, Serialize};
 
 pub use cats_api::guest::{read_frame, write_frame, DiskMap, DiskMapEntry};
 use cats_api::guest::{
-    write_frame_with_limit, AcquireGuestWorkLeaseRequest, GuestRequest, GuestRequestBody,
-    GuestResponse, GuestResponseBody, GuestRuntimeApiError, GuestRuntimeApiErrorResponse,
-    GuestShellFrame, GuestWorkLease, GuestWorkStatus, RenewGuestWorkLeaseRequest,
-    GUEST_WORK_LEASES_PATH, MAX_WORK_LEASES, MAX_WORK_LEASE_TTL_MS,
-    RUNTIME_READY_RESPONSE_MAX_FRAME_BYTES_V1,
+    read_guest_request_frame, write_runtime_ready_response_frame, AcquireGuestWorkLeaseRequest,
+    GuestRequestBody, GuestResponse, GuestResponseBody, GuestRuntimeApiError,
+    GuestRuntimeApiErrorResponse, GuestShellFrame, GuestWorkLease, GuestWorkStatus,
+    RenewGuestWorkLeaseRequest, GUEST_WORK_LEASES_PATH, MAX_WORK_LEASES, MAX_WORK_LEASE_TTL_MS,
 };
 use cats_block_client::NbdClient;
 
@@ -955,7 +954,7 @@ impl GuestAgent {
     ) {
         let agent = self.clone();
         std::thread::spawn(move || {
-            while let Ok(req) = read_frame::<_, GuestRequest>(&mut stream) {
+            while let Ok(req) = read_guest_request_frame(&mut stream) {
                 match req.body {
                     GuestRequestBody::Shell { rows, cols } => {
                         if let Err(error) = agent.serve_shell(&mut stream, req.id, rows, cols) {
@@ -972,17 +971,14 @@ impl GuestAgent {
                         break;
                     }
                     body => {
+                        let is_runtime_ready =
+                            matches!(&body, GuestRequestBody::RuntimeReady { .. });
                         let resp = GuestResponse {
                             id: req.id,
                             body: agent.handle_on_transport(body, vsock_endpoint),
                         };
-                        let written = if matches!(resp.body, GuestResponseBody::RuntimeReady { .. })
-                        {
-                            write_frame_with_limit(
-                                &mut stream,
-                                &resp,
-                                RUNTIME_READY_RESPONSE_MAX_FRAME_BYTES_V1,
-                            )
+                        let written = if is_runtime_ready {
+                            write_runtime_ready_response_frame(&mut stream, &resp)
                         } else {
                             write_frame(&mut stream, &resp)
                         };
@@ -1398,6 +1394,7 @@ pub fn bind_vsock(_port: u32) -> Result<VsockListener> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use cats_api::guest::GuestRequest;
 
     #[test]
     fn frame_roundtrip() {

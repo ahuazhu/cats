@@ -8,10 +8,9 @@ use std::time::Duration;
 use anyhow::{bail, Context, Result};
 
 use cats_api::guest::{
-    read_frame, read_frame_with_limit, write_frame, write_frame_with_limit, GuestRequest,
-    GuestRequestBody, GuestResponse, GuestResponseBody, GuestShellFrame, GuestWorkStatus,
-    RuntimeReadyRequestV1, RuntimeReadyResponseV1, RUNTIME_READY_REQUEST_MAX_FRAME_BYTES_V1,
-    RUNTIME_READY_RESPONSE_MAX_FRAME_BYTES_V1,
+    read_frame, read_runtime_ready_response_frame, write_frame, write_runtime_ready_request_frame,
+    GuestRequest, GuestRequestBody, GuestResponse, GuestResponseBody, GuestShellFrame,
+    GuestWorkStatus, RuntimeReadyRequestV1, RuntimeReadyResponseV1,
 };
 use cats_api::oci::{DeployOciRequest, OciDeployment};
 
@@ -164,7 +163,7 @@ impl GuestClient {
             .context("validate RuntimeReady challenge before send")?;
         let id = self.next_id;
         self.next_id += 1;
-        write_frame_with_limit(
+        write_runtime_ready_request_frame(
             &mut self.stream,
             &GuestRequest {
                 id,
@@ -172,12 +171,10 @@ impl GuestClient {
                     ready: request.clone(),
                 },
             },
-            RUNTIME_READY_REQUEST_MAX_FRAME_BYTES_V1,
         )
         .context("write bounded RuntimeReady request")?;
-        let response: GuestResponse =
-            read_frame_with_limit(&mut self.stream, RUNTIME_READY_RESPONSE_MAX_FRAME_BYTES_V1)
-                .context("read bounded RuntimeReady response")?;
+        let response: GuestResponse = read_runtime_ready_response_frame(&mut self.stream)
+            .context("read bounded RuntimeReady response")?;
         anyhow::ensure!(response.id == id, "guest response id mismatch");
         match response.body {
             GuestResponseBody::RuntimeReady { ready } => {
@@ -374,10 +371,9 @@ mod tests {
     use std::thread;
 
     use cats_api::guest::{
-        read_frame, read_frame_with_limit, write_frame, write_frame_with_limit, GuestRequest,
-        GuestRequestBody, GuestResponse, GuestResponseBody, RuntimeReadyRequestV1,
-        RuntimeReadyResponseV1, RUNTIME_READY_REQUEST_MAX_FRAME_BYTES_V1,
-        RUNTIME_READY_RESPONSE_MAX_FRAME_BYTES_V1,
+        read_frame, read_guest_request_frame, write_frame, write_runtime_ready_response_frame,
+        GuestRequest, GuestRequestBody, GuestResponse, GuestResponseBody, RuntimeReadyRequestV1,
+        RuntimeReadyResponseV1, RUNTIME_READY_RESPONSE_MAX_FRAME_BYTES_V1,
     };
     use cats_api::runtime_reconciliation::{GuestBootId, RandomId128};
 
@@ -463,13 +459,11 @@ mod tests {
         let listener = UnixListener::bind(&path).unwrap();
         let peer = thread::spawn(move || {
             let (mut server, _) = listener.accept().unwrap();
-            let request: GuestRequest =
-                read_frame_with_limit(&mut server, RUNTIME_READY_REQUEST_MAX_FRAME_BYTES_V1)
-                    .unwrap();
+            let request = read_guest_request_frame(&mut server).unwrap();
             let GuestRequestBody::RuntimeReady { ready } = request.body else {
                 panic!("unexpected request")
             };
-            write_frame_with_limit(
+            write_runtime_ready_response_frame(
                 &mut server,
                 &GuestResponse {
                     id: request.id,
@@ -492,7 +486,6 @@ mod tests {
                         },
                     },
                 },
-                RUNTIME_READY_RESPONSE_MAX_FRAME_BYTES_V1,
             )
             .unwrap();
         });
@@ -512,9 +505,7 @@ mod tests {
             use std::io::Write;
 
             let (mut server, _) = listener.accept().unwrap();
-            let _: GuestRequest =
-                read_frame_with_limit(&mut server, RUNTIME_READY_REQUEST_MAX_FRAME_BYTES_V1)
-                    .unwrap();
+            let _ = read_guest_request_frame(&mut server).unwrap();
             server
                 .write_all(&(RUNTIME_READY_RESPONSE_MAX_FRAME_BYTES_V1 + 1).to_be_bytes())
                 .unwrap();

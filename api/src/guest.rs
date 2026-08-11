@@ -6,6 +6,7 @@
 //! `/run/cats/runtime.sock` (ADR-0007). Host control requests carry an id
 //! echoed in the response; commands are argument arrays, never shell strings.
 
+use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::io::{Read, Write};
@@ -30,6 +31,12 @@ pub const RUNTIME_READY_REQUEST_MAX_FRAME_BYTES_V1: u32 = 4 * 1024;
 /// at the shared HostPath boundary and needs JSON escaping, while remaining an
 /// independent quarter of the generic Guest control allocation ceiling.
 pub const RUNTIME_READY_RESPONSE_MAX_FRAME_BYTES_V1: u32 = 4 * 1024 * 1024;
+/// Reserved non-JSON leading byte for one canonical RuntimeReady request.
+/// The byte is included in the outer length and lets the shared Guest receiver
+/// select the 4 KiB cap before allocating or waiting for the JSON body.
+pub const RUNTIME_READY_REQUEST_FRAME_TAG_V1: u8 = 0x01;
+/// Reserved non-JSON leading byte for one canonical RuntimeReady response.
+pub const RUNTIME_READY_RESPONSE_FRAME_TAG_V1: u8 = 0x02;
 /// Matches the frozen Runtime Reconciliation V1 maximum of Root plus 63
 /// Persistent volumes. RuntimeReady must not narrow an otherwise legal
 /// Desired/StartRuntime device set.
@@ -87,6 +94,179 @@ pub fn read_frame_with_limit<R: Read, T: for<'de> Deserialize<'de>>(
     let mut body = vec![0u8; len as usize];
     reader.read_exact(&mut body)?;
     serde_json::from_slice(&body).map_err(std::io::Error::other)
+}
+
+fn canonical_json<T: Serialize>(value: &T) -> std::io::Result<Vec<u8>> {
+    let value = serde_json::to_value(value).map_err(std::io::Error::other)?;
+    Ok(crate::runtime_reconciliation::canonical_json_value_bytes(
+        &value,
+    ))
+}
+
+fn decode_canonical_json<T: DeserializeOwned>(body: &[u8]) -> std::io::Result<T> {
+    let value: serde_json::Value = serde_json::from_slice(body).map_err(std::io::Error::other)?;
+    if crate::runtime_reconciliation::canonical_json_value_bytes(&value) != body {
+        return Err(std::io::Error::other("non-canonical RuntimeReady JSON"));
+    }
+    serde_json::from_value(value).map_err(std::io::Error::other)
+}
+
+fn write_runtime_ready_tagged_frame<W: Write, T: Serialize>(
+    writer: &mut W,
+    tag: u8,
+    value: &T,
+    max_frame_bytes: u32,
+) -> std::io::Result<()> {
+    let body = canonical_json(value)?;
+    let len = body
+        .len()
+        .checked_add(1)
+        .and_then(|len| u32::try_from(len).ok())
+        .ok_or_else(|| std::io::Error::other("oversized RuntimeReady frame"))?;
+    if len > max_frame_bytes {
+        return Err(std::io::Error::other("oversized RuntimeReady frame"));
+    }
+    writer.write_all(&len.to_be_bytes())?;
+    writer.write_all(&[tag])?;
+    writer.write_all(&body)?;
+    writer.flush()
+}
+
+fn read_runtime_ready_tagged_frame<R: Read, T: DeserializeOwned>(
+    reader: &mut R,
+    expected_tag: u8,
+    max_frame_bytes: u32,
+) -> std::io::Result<T> {
+    let mut len_buf = [0u8; 4];
+    reader.read_exact(&mut len_buf)?;
+    let len = u32::from_be_bytes(len_buf);
+    if len == 0 {
+        return Err(std::io::Error::other("missing RuntimeReady frame tag"));
+    }
+    if len > max_frame_bytes {
+        return Err(std::io::Error::other("oversized RuntimeReady frame"));
+    }
+    let mut tag = [0u8; 1];
+    reader.read_exact(&mut tag)?;
+    if tag[0] != expected_tag {
+        return Err(std::io::Error::other("unexpected RuntimeReady frame tag"));
+    }
+    let mut body = vec![0u8; len as usize - 1];
+    reader.read_exact(&mut body)?;
+    decode_canonical_json(&body)
+}
+
+/// Write one canonical, independently tagged RuntimeReady request. Untagged
+/// JSON is not a valid encoding of this ABI.
+pub fn write_runtime_ready_request_frame<W: Write>(
+    writer: &mut W,
+    request: &GuestRequest,
+) -> std::io::Result<()> {
+    let GuestRequestBody::RuntimeReady { ready } = &request.body else {
+        return Err(std::io::Error::other(
+            "RuntimeReady request codec received another operation",
+        ));
+    };
+    ready.validate().map_err(std::io::Error::other)?;
+    write_runtime_ready_tagged_frame(
+        writer,
+        RUNTIME_READY_REQUEST_FRAME_TAG_V1,
+        request,
+        RUNTIME_READY_REQUEST_MAX_FRAME_BYTES_V1,
+    )
+}
+
+/// Read the shared Guest request envelope. A RuntimeReady tag selects the
+/// independent 4 KiB cap after reading only the fixed prefix and tag; all
+/// other requests retain the generic 16 MiB JSON contract.
+pub fn read_guest_request_frame<R: Read>(reader: &mut R) -> std::io::Result<GuestRequest> {
+    let mut len_buf = [0u8; 4];
+    reader.read_exact(&mut len_buf)?;
+    let len = u32::from_be_bytes(len_buf);
+    if len == 0 {
+        return Err(std::io::Error::other("empty Guest request frame"));
+    }
+    if len > MAX_FRAME_BYTES {
+        return Err(std::io::Error::other("oversized frame"));
+    }
+
+    let mut first = [0u8; 1];
+    reader.read_exact(&mut first)?;
+    if first[0] == RUNTIME_READY_REQUEST_FRAME_TAG_V1 {
+        if len > RUNTIME_READY_REQUEST_MAX_FRAME_BYTES_V1 {
+            return Err(std::io::Error::other("oversized RuntimeReady frame"));
+        }
+        let mut body = vec![0u8; len as usize - 1];
+        reader.read_exact(&mut body)?;
+        let request: GuestRequest = decode_canonical_json(&body)?;
+        let GuestRequestBody::RuntimeReady { ready } = &request.body else {
+            return Err(std::io::Error::other(
+                "RuntimeReady request tag carried another operation",
+            ));
+        };
+        ready.validate().map_err(std::io::Error::other)?;
+        return Ok(request);
+    }
+    if first[0] == RUNTIME_READY_RESPONSE_FRAME_TAG_V1 {
+        return Err(std::io::Error::other(
+            "RuntimeReady response tag on request stream",
+        ));
+    }
+
+    let mut body = vec![0u8; len as usize];
+    body[0] = first[0];
+    reader.read_exact(&mut body[1..])?;
+    let request: GuestRequest = serde_json::from_slice(&body).map_err(std::io::Error::other)?;
+    if matches!(&request.body, GuestRequestBody::RuntimeReady { .. }) {
+        return Err(std::io::Error::other(
+            "untagged RuntimeReady request is forbidden",
+        ));
+    }
+    Ok(request)
+}
+
+/// Write one canonical, independently tagged response to a RuntimeReady
+/// request. A bounded Error response uses the same tag so the client never
+/// falls back to the generic response decoder.
+pub fn write_runtime_ready_response_frame<W: Write>(
+    writer: &mut W,
+    response: &GuestResponse,
+) -> std::io::Result<()> {
+    if !matches!(
+        &response.body,
+        GuestResponseBody::RuntimeReady { .. } | GuestResponseBody::Error { .. }
+    ) {
+        return Err(std::io::Error::other(
+            "RuntimeReady response codec received another result",
+        ));
+    }
+    write_runtime_ready_tagged_frame(
+        writer,
+        RUNTIME_READY_RESPONSE_FRAME_TAG_V1,
+        response,
+        RUNTIME_READY_RESPONSE_MAX_FRAME_BYTES_V1,
+    )
+}
+
+/// Read one canonical tagged RuntimeReady response. Generic JSON and request
+/// tags are rejected rather than accepted as equivalent encodings.
+pub fn read_runtime_ready_response_frame<R: Read>(
+    reader: &mut R,
+) -> std::io::Result<GuestResponse> {
+    let response: GuestResponse = read_runtime_ready_tagged_frame(
+        reader,
+        RUNTIME_READY_RESPONSE_FRAME_TAG_V1,
+        RUNTIME_READY_RESPONSE_MAX_FRAME_BYTES_V1,
+    )?;
+    if !matches!(
+        &response.body,
+        GuestResponseBody::RuntimeReady { .. } | GuestResponseBody::Error { .. }
+    ) {
+        return Err(std::io::Error::other(
+            "RuntimeReady response tag carried another result",
+        ));
+    }
+    Ok(response)
 }
 
 pub fn default_work_lease_ttl_ms() -> u64 {
@@ -310,6 +490,8 @@ pub enum RuntimeReadyContractError {
     RuntimeIncarnationEcho,
     #[error("RuntimeReady response did not exactly echo its expected transport")]
     ExpectedTransportEcho,
+    #[error("RuntimeReady observed transport did not match the challenged transport")]
+    ActualTransportMismatch,
     #[error("RuntimeReady device list exceeds its V1 bound")]
     TooManyDevices,
     #[error("RuntimeReady mount list exceeds its V1 bound")]
@@ -368,14 +550,12 @@ impl RuntimeReadyResponseV1 {
         {
             return Err(RuntimeReadyContractError::ExpectedTransportEcho);
         }
-        if !assignable_guest_cid(self.actual_guest_cid) {
-            return Err(RuntimeReadyContractError::GuestCid);
-        }
-        if self.actual_guest_port != GUEST_HOST_CONTROL_VSOCK_PORT_V1 {
-            return Err(RuntimeReadyContractError::GuestPort);
-        }
-        if self.actual_guest_agent_protocol_version != GUEST_HOST_CONTROL_PROTOCOL_VERSION_V1 {
-            return Err(RuntimeReadyContractError::GuestProtocol);
+        if self.actual_guest_cid != request.expected_guest_cid
+            || self.actual_guest_port != request.expected_guest_port
+            || self.actual_guest_agent_protocol_version
+                != request.expected_guest_agent_protocol_version
+        {
+            return Err(RuntimeReadyContractError::ActualTransportMismatch);
         }
         if self.devices.len() > RUNTIME_READY_MAX_DEVICES_V1 {
             return Err(RuntimeReadyContractError::TooManyDevices);
@@ -554,6 +734,211 @@ mod tests {
     }
 
     #[test]
+    fn runtime_ready_request_frame_has_one_frozen_canonical_encoding() {
+        let request = GuestRequest {
+            id: 7,
+            body: GuestRequestBody::RuntimeReady {
+                ready: ready_request(),
+            },
+        };
+        let canonical = br#"{"id":7,"op":"runtime_ready","ready":{"challenge":"11111111111111111111111111111111","expected_guest_agent_protocol_version":1,"expected_guest_cid":3,"expected_guest_port":5000,"runtime_incarnation":"22222222222222222222222222222222","version":1}}"#;
+        let mut expected = vec![0, 0, 0, 0xf8, RUNTIME_READY_REQUEST_FRAME_TAG_V1];
+        expected.extend_from_slice(canonical);
+
+        let mut encoded = Vec::new();
+        write_runtime_ready_request_frame(&mut encoded, &request).unwrap();
+        assert_eq!(encoded, expected);
+        let decoded = read_guest_request_frame(&mut &encoded[..]).unwrap();
+        assert_eq!(decoded.id, 7);
+        assert!(matches!(
+            decoded.body,
+            GuestRequestBody::RuntimeReady { .. }
+        ));
+    }
+
+    #[test]
+    fn runtime_ready_response_frame_has_one_frozen_canonical_encoding() {
+        let request = ready_request();
+        let mut ready = ready_response(&request);
+        ready.devices.clear();
+        ready.mounts.clear();
+        let response = GuestResponse {
+            id: 7,
+            body: GuestResponseBody::RuntimeReady { ready },
+        };
+        let canonical = br#"{"id":7,"ready":{"actual_guest_agent_protocol_version":1,"actual_guest_cid":3,"actual_guest_port":5000,"challenge":"11111111111111111111111111111111","devices":[],"expected_guest_agent_protocol_version":1,"expected_guest_cid":3,"expected_guest_port":5000,"guest_boot_id":"33333333333333333333333333333333","mounts":[],"runtime_incarnation":"22222222222222222222222222222222","version":1},"result":"runtime_ready"}"#;
+        let mut expected = vec![0, 0, 1, 0x9e, RUNTIME_READY_RESPONSE_FRAME_TAG_V1];
+        expected.extend_from_slice(canonical);
+
+        let mut encoded = Vec::new();
+        write_runtime_ready_response_frame(&mut encoded, &response).unwrap();
+        assert_eq!(encoded, expected);
+        let decoded = read_runtime_ready_response_frame(&mut &encoded[..]).unwrap();
+        assert_eq!(decoded.id, 7);
+        assert!(matches!(
+            decoded.body,
+            GuestResponseBody::RuntimeReady { .. }
+        ));
+    }
+
+    #[test]
+    fn runtime_ready_codec_rejects_equivalent_noncanonical_json() {
+        let canonical = br#"{"id":7,"op":"runtime_ready","ready":{"challenge":"11111111111111111111111111111111","expected_guest_agent_protocol_version":1,"expected_guest_cid":3,"expected_guest_port":5000,"runtime_incarnation":"22222222222222222222222222222222","version":1}}"#;
+        let variants: [&[u8]; 4] = [
+            br#"{ "id":7,"op":"runtime_ready","ready":{"challenge":"11111111111111111111111111111111","expected_guest_agent_protocol_version":1,"expected_guest_cid":3,"expected_guest_port":5000,"runtime_incarnation":"22222222222222222222222222222222","version":1}}"#,
+            br#"{"op":"runtime_ready","id":7,"ready":{"challenge":"11111111111111111111111111111111","expected_guest_agent_protocol_version":1,"expected_guest_cid":3,"expected_guest_port":5000,"runtime_incarnation":"22222222222222222222222222222222","version":1}}"#,
+            br#"{"id":7,"op":"runtime\u005fready","ready":{"challenge":"11111111111111111111111111111111","expected_guest_agent_protocol_version":1,"expected_guest_cid":3,"expected_guest_port":5000,"runtime_incarnation":"22222222222222222222222222222222","version":1}}"#,
+            br#"{"id":7,"id":7,"op":"runtime_ready","ready":{"challenge":"11111111111111111111111111111111","expected_guest_agent_protocol_version":1,"expected_guest_cid":3,"expected_guest_port":5000,"runtime_incarnation":"22222222222222222222222222222222","version":1}}"#,
+        ];
+        for body in variants {
+            assert_ne!(body, canonical);
+            let mut frame = Vec::new();
+            frame.extend_from_slice(&(u32::try_from(body.len()).unwrap() + 1).to_be_bytes());
+            frame.push(RUNTIME_READY_REQUEST_FRAME_TAG_V1);
+            frame.extend_from_slice(body);
+            assert_eq!(
+                read_guest_request_frame(&mut &frame[..])
+                    .unwrap_err()
+                    .to_string(),
+                "non-canonical RuntimeReady JSON"
+            );
+        }
+
+        let response_variants: [&[u8]; 3] = [
+            br#"{ "id":7,"ready":{"actual_guest_agent_protocol_version":1,"actual_guest_cid":3,"actual_guest_port":5000,"challenge":"11111111111111111111111111111111","devices":[],"expected_guest_agent_protocol_version":1,"expected_guest_cid":3,"expected_guest_port":5000,"guest_boot_id":"33333333333333333333333333333333","mounts":[],"runtime_incarnation":"22222222222222222222222222222222","version":1},"result":"runtime_ready"}"#,
+            br#"{"result":"runtime_ready","id":7,"ready":{"actual_guest_agent_protocol_version":1,"actual_guest_cid":3,"actual_guest_port":5000,"challenge":"11111111111111111111111111111111","devices":[],"expected_guest_agent_protocol_version":1,"expected_guest_cid":3,"expected_guest_port":5000,"guest_boot_id":"33333333333333333333333333333333","mounts":[],"runtime_incarnation":"22222222222222222222222222222222","version":1}}"#,
+            br#"{"id":7,"ready":{"actual_guest_agent_protocol_version":1,"actual_guest_cid":3,"actual_guest_port":5000,"challenge":"11111111111111111111111111111111","devices":[],"expected_guest_agent_protocol_version":1,"expected_guest_cid":3,"expected_guest_port":5000,"guest_boot_id":"33333333333333333333333333333333","mounts":[],"runtime_incarnation":"22222222222222222222222222222222","version":1},"result":"runtime\u005fready"}"#,
+        ];
+        for body in response_variants {
+            let mut frame = Vec::new();
+            frame.extend_from_slice(&(u32::try_from(body.len()).unwrap() + 1).to_be_bytes());
+            frame.push(RUNTIME_READY_RESPONSE_FRAME_TAG_V1);
+            frame.extend_from_slice(body);
+            assert_eq!(
+                read_runtime_ready_response_frame(&mut &frame[..])
+                    .unwrap_err()
+                    .to_string(),
+                "non-canonical RuntimeReady JSON"
+            );
+        }
+    }
+
+    #[test]
+    fn runtime_ready_tags_are_mandatory_directional_and_truncation_closed() {
+        let request = GuestRequest {
+            id: 7,
+            body: GuestRequestBody::RuntimeReady {
+                ready: ready_request(),
+            },
+        };
+        let mut untagged_request = Vec::new();
+        write_frame(&mut untagged_request, &request).unwrap();
+        assert_eq!(
+            read_guest_request_frame(&mut &untagged_request[..])
+                .unwrap_err()
+                .to_string(),
+            "untagged RuntimeReady request is forbidden"
+        );
+
+        let mut tagged_request = Vec::new();
+        write_runtime_ready_request_frame(&mut tagged_request, &request).unwrap();
+        assert!(read_frame::<_, GuestRequest>(&mut &tagged_request[..]).is_err());
+        let mut wrong_direction = tagged_request.clone();
+        wrong_direction[4] = RUNTIME_READY_RESPONSE_FRAME_TAG_V1;
+        assert_eq!(
+            read_guest_request_frame(&mut &wrong_direction[..])
+                .unwrap_err()
+                .to_string(),
+            "RuntimeReady response tag on request stream"
+        );
+
+        assert_eq!(
+            read_guest_request_frame(&mut &tagged_request[..4])
+                .unwrap_err()
+                .kind(),
+            std::io::ErrorKind::UnexpectedEof
+        );
+        assert_eq!(
+            read_guest_request_frame(&mut &tagged_request[..5])
+                .unwrap_err()
+                .kind(),
+            std::io::ErrorKind::UnexpectedEof
+        );
+
+        let response = GuestResponse {
+            id: 7,
+            body: GuestResponseBody::RuntimeReady {
+                ready: ready_response(&ready_request()),
+            },
+        };
+        let mut untagged_response = Vec::new();
+        write_frame(&mut untagged_response, &response).unwrap();
+        assert_eq!(
+            read_runtime_ready_response_frame(&mut &untagged_response[..])
+                .unwrap_err()
+                .to_string(),
+            "unexpected RuntimeReady frame tag"
+        );
+        let mut tagged_response = Vec::new();
+        write_runtime_ready_response_frame(&mut tagged_response, &response).unwrap();
+        let mut wrong_response_direction = tagged_response.clone();
+        wrong_response_direction[4] = RUNTIME_READY_REQUEST_FRAME_TAG_V1;
+        assert_eq!(
+            read_runtime_ready_response_frame(&mut &wrong_response_direction[..])
+                .unwrap_err()
+                .to_string(),
+            "unexpected RuntimeReady frame tag"
+        );
+        assert_eq!(
+            read_runtime_ready_response_frame(&mut &tagged_response[..4])
+                .unwrap_err()
+                .kind(),
+            std::io::ErrorKind::UnexpectedEof
+        );
+        assert_eq!(
+            read_runtime_ready_response_frame(&mut &tagged_response[..5])
+                .unwrap_err()
+                .kind(),
+            std::io::ErrorKind::UnexpectedEof
+        );
+    }
+
+    #[test]
+    fn shared_receiver_rejects_ready_cap_after_prefix_and_tag_only() {
+        let mut frame = (RUNTIME_READY_REQUEST_MAX_FRAME_BYTES_V1 + 1)
+            .to_be_bytes()
+            .to_vec();
+        frame.push(RUNTIME_READY_REQUEST_FRAME_TAG_V1);
+        assert_eq!(
+            read_guest_request_frame(&mut &frame[..])
+                .unwrap_err()
+                .to_string(),
+            "oversized RuntimeReady frame"
+        );
+    }
+
+    #[test]
+    fn shared_receiver_preserves_large_generic_request_contract() {
+        let request = GuestRequest {
+            id: 8,
+            body: GuestRequestBody::Exec {
+                command: vec!["true".to_owned()],
+                timeout_ms: None,
+                env: BTreeMap::new(),
+                stdin: vec![0x5a; RUNTIME_READY_REQUEST_MAX_FRAME_BYTES_V1 as usize],
+            },
+        };
+        let mut frame = Vec::new();
+        write_frame(&mut frame, &request).unwrap();
+        assert!(
+            u32::from_be_bytes(frame[..4].try_into().unwrap())
+                > RUNTIME_READY_REQUEST_MAX_FRAME_BYTES_V1
+        );
+        let decoded = read_guest_request_frame(&mut &frame[..]).unwrap();
+        assert!(matches!(decoded.body, GuestRequestBody::Exec { .. }));
+    }
+
+    #[test]
     fn runtime_ready_v1_is_challenge_bound_and_physically_closed() {
         let request = ready_request();
         let response = ready_response(&request);
@@ -565,6 +950,13 @@ mod tests {
         assert_eq!(
             wrong.validate_against(&request),
             Err(RuntimeReadyContractError::ChallengeEcho)
+        );
+
+        let mut wrong_actual_cid = response.clone();
+        wrong_actual_cid.actual_guest_cid = request.expected_guest_cid + 1;
+        assert_eq!(
+            wrong_actual_cid.validate_against(&request),
+            Err(RuntimeReadyContractError::ActualTransportMismatch)
         );
 
         let mut duplicate = response.clone();
@@ -646,12 +1038,8 @@ mod tests {
     #[test]
     fn runtime_ready_small_frame_cap_is_checked_before_body_allocation() {
         let bytes = (RUNTIME_READY_RESPONSE_MAX_FRAME_BYTES_V1 + 1).to_be_bytes();
-        let error = read_frame_with_limit::<_, GuestResponse>(
-            &mut &bytes[..],
-            RUNTIME_READY_RESPONSE_MAX_FRAME_BYTES_V1,
-        )
-        .unwrap_err();
-        assert_eq!(error.to_string(), "oversized frame");
+        let error = read_runtime_ready_response_frame(&mut &bytes[..]).unwrap_err();
+        assert_eq!(error.to_string(), "oversized RuntimeReady frame");
     }
 
     #[test]
@@ -700,15 +1088,10 @@ mod tests {
             id: 1,
             body: GuestResponseBody::RuntimeReady { ready: response },
         };
-        let body = serde_json::to_vec(&envelope).unwrap();
+        let body = canonical_json(&envelope).unwrap();
         assert!(body.len() > 64 * 1024);
-        assert!(body.len() <= RUNTIME_READY_RESPONSE_MAX_FRAME_BYTES_V1 as usize);
-        write_frame_with_limit(
-            &mut Vec::new(),
-            &envelope,
-            RUNTIME_READY_RESPONSE_MAX_FRAME_BYTES_V1,
-        )
-        .unwrap();
+        assert!(body.len() < RUNTIME_READY_RESPONSE_MAX_FRAME_BYTES_V1 as usize);
+        write_runtime_ready_response_frame(&mut Vec::new(), &envelope).unwrap();
     }
 
     #[test]
