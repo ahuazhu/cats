@@ -1,6 +1,7 @@
 //! A13/A14 acceptance against the real blockd composition root.
 
 use std::io::{BufRead, BufReader, Read, Write};
+use std::os::unix::fs::PermissionsExt;
 use std::os::unix::net::UnixStream;
 use std::path::PathBuf;
 use std::process::{Child, Command, Stdio};
@@ -38,6 +39,7 @@ const SCOPE_ID: &str = "cats-root-provision.scope";
 
 struct Env {
     dir: tempfile::TempDir,
+    canonical_root: PathBuf,
     postgres_url: String,
     epoch: i64,
     request: ProvisionRootImageRequest,
@@ -46,7 +48,13 @@ struct Env {
 impl Env {
     fn new() -> Self {
         let dir = tempfile::tempdir().unwrap();
-        let blob = Arc::new(FileBlobStore::open(dir.path().join("blob")).unwrap());
+        // macOS exposes its per-user temporary directory through `/var`,
+        // which is itself a symlink to `/private/var`. Production correctly
+        // rejects a Runtime data directory with any symlink ancestor, so the
+        // acceptance fixture must pass the canonical spelling of the same
+        // retained temporary directory.
+        let canonical_root = dir.path().canonicalize().unwrap();
+        let blob = Arc::new(FileBlobStore::open(canonical_root.join("blob")).unwrap());
         let postgres_url = cats_control_plane::testsupport::isolated_control_store_url();
         drop(Store::connect(&postgres_url, None).unwrap());
         let mut postgres = Client::connect(&postgres_url, NoTls).unwrap();
@@ -54,7 +62,7 @@ impl Env {
         insert_volume(&mut postgres, &owned_volume(epoch));
         assert_legacy_metadata_absent(&mut postgres);
 
-        let image = dir.path().join("root.img");
+        let image = canonical_root.join("root.img");
         let bytes: Vec<u8> = (0..CHUNK_SIZE as usize)
             .map(|index| (index as u8).wrapping_mul(17).wrapping_add(9))
             .collect();
@@ -64,8 +72,9 @@ impl Env {
             .manifest;
         let request = request_from_manifest(&manifest, epoch);
         let attachment = authorized_attachment(epoch);
-        let data_dir = dir.path().join("control-data");
+        let data_dir = canonical_root.join("control-data");
         std::fs::create_dir_all(&data_dir).unwrap();
+        std::fs::set_permissions(&data_dir, std::fs::Permissions::from_mode(0o700)).unwrap();
         std::fs::write(
             data_dir.join("identity.json"),
             serde_json::to_vec(&attachment.identity).unwrap(),
@@ -78,6 +87,7 @@ impl Env {
         .unwrap();
         Self {
             dir,
+            canonical_root,
             postgres_url,
             epoch,
             request,
@@ -85,15 +95,15 @@ impl Env {
     }
 
     fn blob_root(&self) -> PathBuf {
-        self.dir.path().join("blob")
+        self.canonical_root.join("blob")
     }
 
     fn data_dir(&self) -> PathBuf {
-        self.dir.path().join("control-data")
+        self.canonical_root.join("control-data")
     }
 
     fn control_socket(&self) -> PathBuf {
-        self.dir.path().join("provision.sock")
+        self.canonical_root.join("provision.sock")
     }
 
     fn authorized_control_spec(&self) -> PathBuf {
@@ -140,7 +150,7 @@ impl Env {
             .arg("--lease-ttl-ms")
             .arg("60000")
             .stdout(Stdio::piped())
-            .stderr(Stdio::null())
+            .stderr(Stdio::piped())
             .env("CATS_BLOCKD_TARGET_TEST_POSTGRES_URL", &self.postgres_url)
             .env_remove("CATS_CRASH_POINT");
         if let Some(point) = crash_point {
@@ -313,7 +323,22 @@ impl Server {
         let stdout = self.child.stdout.take().unwrap();
         let mut line = String::new();
         BufReader::new(stdout).read_line(&mut line).unwrap();
-        assert_eq!(line.trim(), format!("READY {}", expected.display()));
+        if line.trim() != format!("READY {}", expected.display()) {
+            let status = match self.child.try_wait().unwrap() {
+                Some(status) => status,
+                None => {
+                    self.child.kill().unwrap();
+                    self.child.wait().unwrap()
+                }
+            };
+            let mut stderr = String::new();
+            if let Some(mut stream) = self.child.stderr.take() {
+                stream.read_to_string(&mut stderr).unwrap();
+            }
+            panic!(
+                "control-only blockd did not publish READY: stdout={line:?}, status={status}, stderr={stderr:?}"
+            );
+        }
     }
 
     fn wait_exit(&mut self) {
