@@ -1401,28 +1401,21 @@ fn validate_scanned_checkpoint(
                 && checkpoint.placement_epoch <= desired.placement.placement_epoch
         }
     };
+    let phase_envelope_is_valid = scanned_checkpoint_phase_envelope_is_valid(checkpoint);
     anyhow::ensure!(
         checkpoint.version == cats_api::runtime_reconciliation::ContractVersion::V1
             && checkpoint.cat_id == desired.cat_id
             && checkpoint.node_id == desired.placement.node_id
             && top_level_binding_is_valid
-            && checkpoint.runtime_incarnation.is_none()
-            && checkpoint.stable_state.is_none()
+            && phase_envelope_is_valid
             && checkpoint.processes.is_empty()
             && checkpoint.mounts.is_empty()
-            && checkpoint.networks.is_empty()
             && matches!(
                 checkpoint.guest_transport,
                 GuestTransportEvidence::Unavailable
             )
-            && matches!(checkpoint.warm_snapshot, WarmSnapshotEvidence::Absent)
-            && checkpoint.lifecycle_admission == LifecycleAdmission::Closed
-            && checkpoint.route_gates.is_empty()
-            && matches!(
-                checkpoint.require_idle,
-                RequireIdleCheckpoint::NotApplicable
-            ),
-        "Runtime checkpoint does not bind the current pre-launch Desired"
+            && matches!(checkpoint.warm_snapshot, WarmSnapshotEvidence::Absent),
+        "Runtime checkpoint does not bind the current Desired phase envelope"
     );
     match &checkpoint.step {
         ReconcileStep::AcquireVolume { request } => match binding {
@@ -1549,6 +1542,25 @@ fn validate_scanned_checkpoint(
         _ => anyhow::bail!("pre-launch scanner encountered an unsupported Runtime step"),
     }
     Ok(())
+}
+
+fn scanned_checkpoint_phase_envelope_is_valid(checkpoint: &RuntimeCheckpoint) -> bool {
+    match checkpoint.runtime_launch.identity() {
+        Some(launch) => {
+            checkpoint.runtime_incarnation.as_ref() == Some(&launch.runtime_incarnation)
+        }
+        None => {
+            checkpoint.runtime_incarnation.is_none()
+                && checkpoint.stable_state.is_none()
+                && checkpoint.networks.is_empty()
+                && checkpoint.lifecycle_admission == LifecycleAdmission::Closed
+                && checkpoint.route_gates.is_empty()
+                && matches!(
+                    checkpoint.require_idle,
+                    RequireIdleCheckpoint::NotApplicable
+                )
+        }
+    }
 }
 
 fn validate_current_prepared_checkpoint(
@@ -1779,6 +1791,7 @@ mod tests {
             "/../testdata/runtime-reconciliation-v1-start-runtime-checkpoint.json"
         )))
         .unwrap();
+        assert!(scanned_checkpoint_phase_envelope_is_valid(&checkpoint));
         let cat_id = checkpoint.cat_id.clone();
         let evidence = RuntimeCheckpointInventoryEvidence {
             checkpoint,
@@ -1803,15 +1816,22 @@ mod tests {
         };
         tail.checkpoint.stable_state = Some(StableState::Running);
         encode_runtime_checkpoint(&tail.checkpoint).unwrap();
+        assert!(scanned_checkpoint_phase_envelope_is_valid(&tail.checkpoint));
         let tail_expected = vmm_process_expectations(
             std::path::Path::new("/var/lib/cats/checkpoints"),
-            &BTreeMap::from([(cat_id.clone(), tail)]),
+            &BTreeMap::from([(cat_id.clone(), tail.clone())]),
         )
         .unwrap();
         assert_eq!(
             tail_expected.get(&cat_id).unwrap().launch_identity(),
             expectation.launch_identity()
         );
+
+        let mut mismatched_incarnation = tail.checkpoint.clone();
+        mismatched_incarnation.runtime_incarnation = None;
+        assert!(!scanned_checkpoint_phase_envelope_is_valid(
+            &mismatched_incarnation
+        ));
 
         let superseded = RuntimeCheckpointInventoryEvidence {
             binding: DesiredCheckpointBinding::Superseded,
