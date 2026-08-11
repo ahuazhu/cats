@@ -9407,6 +9407,28 @@ mod tests {
         }
     }
 
+    fn retire_old_process_fixture(
+        environment: &TestEnvironment,
+        fixture: &FullRootScannerFixture,
+        live: &mut LivePreparedScannerFixture,
+    ) {
+        let old_listener = live._listeners.remove(0);
+        drop(old_listener);
+        std::fs::remove_file(fixture.expected.control_socket_path.as_str()).unwrap();
+        std::fs::remove_dir_all(
+            environment
+                .proc_root
+                .join(live.old_process.process_id.to_string()),
+        )
+        .unwrap();
+        std::fs::remove_dir_all(
+            environment
+                .systemd_root
+                .join(fixture.expected.scope_id.as_str()),
+        )
+        .unwrap();
+    }
+
     #[test]
     fn fresh_full_scanner_rejects_paired_foreign_prepared_device_ids() {
         for field in ["volume_intent_id", "disk_id"] {
@@ -9464,7 +9486,8 @@ mod tests {
     fn fresh_full_prepare_network_scan_seals_absence_and_provisioned_head() {
         let environment = TestEnvironment::new();
         let fixture = full_root_scanner_fixture(&environment);
-        let live = install_live_prepare_device_fixture(&environment, &fixture);
+        let mut live = install_live_prepare_device_fixture(&environment, &fixture);
+        retire_old_process_fixture(&environment, &fixture, &mut live);
         let desired = &fixture.acquired.desired;
         let planned = crate::ch::plan_network(&desired.runtime.network_config).unwrap();
         let identity = RuntimeNetworkIdentity {
@@ -9504,8 +9527,8 @@ mod tests {
         let scanner = full_root_scanner_with_serving_and_network(
             &fixture,
             [
-                RootProvisionProcessInspection::Exact(Box::new(live.old_process.clone())),
-                RootProvisionProcessInspection::Exact(Box::new(live.old_process.clone())),
+                RootProvisionProcessInspection::Absent,
+                RootProvisionProcessInspection::Absent,
             ],
             [Some(81), Some(81)],
             Some(network_port),
