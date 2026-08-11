@@ -446,10 +446,22 @@ async fn pending_bodies_hit_deadline_release_global_admission_and_cannot_registe
         context.attempt.node_id.clone(),
     )
     .await;
-    let mut pending = Vec::new();
+    let mut openers = tokio::task::JoinSet::new();
     for _ in 0..65 {
-        pending.push(pending_chunked_request(context.server.addr).await);
+        openers.spawn(pending_chunked_request(context.server.addr));
     }
+    let mut pending = tokio::task::JoinSet::new();
+    while let Some(stream) = openers.join_next().await {
+        pending.spawn(raw_status(stream.unwrap()));
+    }
+
+    let first_rejection =
+        tokio::time::timeout(std::time::Duration::from_secs(2), pending.join_next())
+            .await
+            .expect("registration saturation was never observed")
+            .expect("the pending response set ended before saturation")
+            .unwrap();
+    assert_eq!(first_rejection, StatusCode::SERVICE_UNAVAILABLE);
 
     let body = encode_agent_registration_attempt(&context.attempt).unwrap();
     let saturated = tokio::time::timeout(
@@ -461,8 +473,8 @@ async fn pending_bodies_hit_deadline_release_global_admission_and_cannot_registe
     .unwrap();
     assert_eq!(saturated.status(), StatusCode::SERVICE_UNAVAILABLE);
 
-    for stream in pending {
-        assert_eq!(raw_status(stream).await, StatusCode::SERVICE_UNAVAILABLE);
+    while let Some(status) = pending.join_next().await {
+        assert_eq!(status.unwrap(), StatusCode::SERVICE_UNAVAILABLE);
     }
     assert_eq!(
         cats_control_plane::testsupport::runtime_spine_state_fingerprint(
