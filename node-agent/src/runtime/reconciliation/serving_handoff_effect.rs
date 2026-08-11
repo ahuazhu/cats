@@ -1772,8 +1772,7 @@ fn base_admission_is_exact(
         && (1..=64).contains(&desired.volumes.len())
         && desired.placement.node_id == accepted.session().node_id
         && desired.volumes.iter().enumerate().all(|(index, volume)| {
-            matches!(volume.acquire, VolumeAcquire::Normal { .. })
-                && volume.access == VolumeAccess::ReadWriteOnce
+            volume.access == VolumeAccess::ReadWriteOnce
                 && matches!(volume.disposition, VolumeDisposition::Retain)
                 && usize::from(volume.guest_device.slot) == index
                 && match index {
@@ -1958,7 +1957,8 @@ mod tests {
         FenceEpoch, FilesystemInitialization, Generation, GuestDeviceIdentity, Ipv4Address,
         IsolatedIpv4Kind, MacAddress, NetworkConfig, NodeBootId, NodeObservation,
         NormalAcquireRequest, NormalAcquireResult, Revision, RuntimeConfig, RuntimeLaunch,
-        Sequence, Sha256Digest, VolumeAdminState,
+        Sequence, Sha256Digest, TakeoverConsumedReceipt, VolumeAdminState,
+        VolumeTakeoverAuthorization,
     };
     use cats_storage::authority::{
         AuthorityError, AuthorizedServingAcquire, AuthorizedServingAttachment, RenewLeaseRequest,
@@ -2083,51 +2083,108 @@ mod tests {
         desired
     }
 
+    fn takeover_desired() -> DesiredRuntimeSpec {
+        let mut desired = desired();
+        for (index, volume) in desired.volumes.iter_mut().enumerate() {
+            volume.acquire = VolumeAcquire::Takeover {
+                authorization_id: id(&format!("takeover_auth_{index}")),
+            };
+        }
+        desired.spec_digest = spec_digest(&desired).unwrap();
+        desired
+    }
+
     fn attachment(
         desired: &DesiredRuntimeSpec,
         volume: &VolumeIntent,
         current_head: cats_api::runtime_reconciliation::RemoteHead,
     ) -> AuthorizedServingAttachment {
-        let VolumeAcquire::Normal {
-            transition_id,
-            expected_unowned_epoch,
-        } = &volume.acquire
-        else {
-            unreachable!()
-        };
-        let request = NormalAcquireRequest {
-            volume_id: volume.volume_id.clone(),
-            transition_id: transition_id.clone(),
-            attachment_id: volume.attachment_id.clone(),
-            expected_unowned_epoch: *expected_unowned_epoch,
-            desired_revision: desired.desired_revision,
-            placement_epoch: desired.placement.placement_epoch,
-            lease_duration_ms: 60_000,
-        };
-        let result = NormalAcquireResult {
-            volume_id: volume.volume_id.clone(),
-            transition_id: transition_id.clone(),
-            attachment_id: volume.attachment_id.clone(),
-            resulting_epoch: fence(expected_unowned_epoch.get() + 1),
-            resulting_head: current_head.clone(),
-            lease_expires_at: unix_ms(1_900_000_060_000),
+        let (attachment_epoch, acquire_origin, lease_expires_at, acquire) = match &volume.acquire {
+            VolumeAcquire::Normal {
+                transition_id,
+                expected_unowned_epoch,
+            } => {
+                let request = NormalAcquireRequest {
+                    volume_id: volume.volume_id.clone(),
+                    transition_id: transition_id.clone(),
+                    attachment_id: volume.attachment_id.clone(),
+                    expected_unowned_epoch: *expected_unowned_epoch,
+                    desired_revision: desired.desired_revision,
+                    placement_epoch: desired.placement.placement_epoch,
+                    lease_duration_ms: 60_000,
+                };
+                let result = NormalAcquireResult {
+                    volume_id: volume.volume_id.clone(),
+                    transition_id: transition_id.clone(),
+                    attachment_id: volume.attachment_id.clone(),
+                    resulting_epoch: fence(expected_unowned_epoch.get() + 1),
+                    resulting_head: current_head.clone(),
+                    lease_expires_at: unix_ms(1_900_000_060_000),
+                };
+                (
+                    result.resulting_epoch,
+                    AcquireOrigin::Normal {
+                        transition_id: transition_id.clone(),
+                    },
+                    result.lease_expires_at,
+                    AuthorizedServingAcquire::Normal { request, result },
+                )
+            }
+            VolumeAcquire::Takeover { authorization_id } => {
+                let expected_epoch = fence(20 + u64::from(volume.guest_device.slot));
+                let resulting_epoch = fence(expected_epoch.get() + 1);
+                let authorization = VolumeTakeoverAuthorization {
+                    authorization_id: authorization_id.clone(),
+                    authorized_node_id: desired.placement.node_id.clone(),
+                    host_fence_event_id: id("fence_event_takeover"),
+                    volume_id: volume.volume_id.clone(),
+                    expected_attachment_id: id(&format!(
+                        "old_{}",
+                        volume.guest_device.serial.as_str()
+                    )),
+                    expected_epoch,
+                    new_attachment_id: volume.attachment_id.clone(),
+                    desired_revision: desired.desired_revision,
+                    new_placement_epoch: desired.placement.placement_epoch,
+                    lease_duration_ms: 60_000,
+                    not_after: unix_ms(1_900_000_030_000),
+                };
+                let receipt = TakeoverConsumedReceipt {
+                    authorization_id: authorization_id.clone(),
+                    host_fence_event_id: authorization.host_fence_event_id.clone(),
+                    volume_id: volume.volume_id.clone(),
+                    new_attachment_id: volume.attachment_id.clone(),
+                    resulting_epoch,
+                    resulting_head: current_head.clone(),
+                    consumed_at: unix_ms(1_900_000_000_000),
+                };
+                (
+                    resulting_epoch,
+                    AcquireOrigin::Takeover {
+                        authorization_id: authorization_id.clone(),
+                    },
+                    unix_ms(1_900_000_060_000),
+                    AuthorizedServingAcquire::Takeover {
+                        authorization,
+                        receipt,
+                    },
+                )
+            }
         };
         AuthorizedServingAttachment {
             identity: AttachmentLineageIdentity {
                 volume_id: volume.volume_id.clone(),
                 attachment_id: volume.attachment_id.clone(),
-                attachment_epoch: result.resulting_epoch,
-                acquire_origin: AcquireOrigin::Normal {
-                    transition_id: transition_id.clone(),
-                },
+                attachment_epoch,
+                acquire_origin,
                 node_id: desired.placement.node_id.clone(),
                 placement_epoch: desired.placement.placement_epoch,
             },
             size_bytes: volume.size_bytes,
             durability: volume.durability,
             head: current_head,
-            lease_expires_at: result.lease_expires_at,
-            acquire: AuthorizedServingAcquire::Normal { request, result },
+            lease_expires_at,
+            acquire,
         }
     }
 
@@ -2276,6 +2333,266 @@ mod tests {
             Instant::now() + Duration::from_secs(30),
             RuntimeDesiredEffectAdmission::for_test(session, observation, attestation),
         )
+    }
+
+    #[test]
+    fn takeover_handoff_and_existing_root_delegate_to_exact_thick_authority() {
+        let root = tempfile::tempdir().unwrap();
+        let desired = takeover_desired();
+        let root_attachment = attachment(&desired, &desired.volumes[0], head(2, 8, "roots/root-2"));
+        let persistent_attachment = attachment(
+            &desired,
+            &desired.volumes[1],
+            head(3, 9, "roots/persistent-3"),
+        );
+        let blockd = AuthorizedBlockdStore::new(StateDirectory::unanchored(root.path().into()));
+        let root_prepared = blockd
+            .prepare(&desired, &desired.volumes[0], &root_attachment)
+            .unwrap();
+        let persistent_prepared = blockd
+            .prepare(&desired, &desired.volumes[1], &persistent_attachment)
+            .unwrap();
+        let volumes = vec![
+            prepared_owned_observed_volume(
+                &desired.volumes[0],
+                &root_attachment,
+                HostPath::new(root_prepared.data_directory().to_str().unwrap().to_owned()).unwrap(),
+            ),
+            prepared_owned_observed_volume(
+                &desired.volumes[1],
+                &persistent_attachment,
+                HostPath::new(
+                    persistent_prepared
+                        .data_directory()
+                        .to_str()
+                        .unwrap()
+                        .to_owned(),
+                )
+                .unwrap(),
+            ),
+        ];
+        drop((root_prepared, persistent_prepared));
+
+        let checkpoint = RuntimeCheckpoint {
+            version: ContractVersion::V1,
+            cat_id: desired.cat_id.clone(),
+            node_id: desired.placement.node_id.clone(),
+            placement_epoch: desired.placement.placement_epoch,
+            desired_revision: desired.desired_revision,
+            spec_digest: desired.spec_digest.clone(),
+            runtime_incarnation: None,
+            runtime_launch: RuntimeLaunch::Absent,
+            stable_state: None,
+            step: ReconcileStep::AcquireVolume {
+                request: persistent_attachment.checkpoint_acquire_request(),
+            },
+            processes: Vec::new(),
+            volumes,
+            mounts: Vec::new(),
+            networks: Vec::new(),
+            guest_transport: GuestTransportEvidence::Unavailable,
+            warm_snapshot: WarmSnapshotEvidence::Absent,
+            lifecycle_admission: LifecycleAdmission::Closed,
+            route_gates: Vec::new(),
+            require_idle: cats_api::runtime_reconciliation::RequireIdleCheckpoint::NotApplicable,
+            updated_at_unix_ms: unix_ms(1_900_000_000_000),
+        };
+        encode_runtime_checkpoint(&checkpoint).unwrap();
+        let store =
+            FileCheckpointStore::open(&root.path().join(CHECKPOINT_NAMESPACE), &desired.cat_id)
+                .unwrap();
+        let stored = store.create(&checkpoint).unwrap();
+        drop(store);
+        let context = accepted_context(root.path(), &desired, &stored);
+        let accepted = context.accepted_full().unwrap();
+        let runtime = &accepted.observation().runtimes[0];
+
+        // The generic admission is shared by the existing-Root direct bridge
+        // and the post-provision handoff.  It accepts the closed acquire enum,
+        // while the retained artifacts below remain the authorization proof.
+        assert!(base_admission_is_exact(accepted, &desired, runtime));
+        let mut post_provision_runtime = runtime.clone();
+        let post_provision_data_directory = post_provision_runtime.volumes[0].local_lineages[0]
+            .data_directory
+            .clone();
+        post_provision_runtime.step = ReconcileStep::ProvisionRootImage {
+            provision_transition_id: random('8'),
+            volume_id: desired.volumes[0].volume_id.clone(),
+            attachment_id: root_attachment.identity.attachment_id.clone(),
+            attachment_epoch: root_attachment.identity.attachment_epoch,
+            scope_id: id("cats-root-test.service"),
+            control_socket_path: HostPath::new(format!(
+                "/var/lib/cats/{}/root-provision.sock",
+                root_attachment.identity.volume_id.as_str()
+            ))
+            .unwrap(),
+            data_directory: post_provision_data_directory.clone(),
+            process_identity_token: random('9'),
+            size_bytes: root_attachment.size_bytes,
+            boot_image_digest: desired.runtime.boot_image_digest.clone(),
+            expected_blank_head: cats_api::runtime_reconciliation::RemoteHead {
+                generation: Generation::new(0).unwrap(),
+                root_hash: None,
+                root_object_id: None,
+            },
+            expected_provisioned_head: root_attachment.head.clone(),
+        };
+        post_provision_runtime.conditions = vec![Condition::Progressing {
+            reason: ProgressingReason::ReconcileStep {
+                step: post_provision_runtime.step.clone(),
+            },
+        }];
+        assert!(base_admission_is_exact(
+            accepted,
+            &desired,
+            &post_provision_runtime
+        ));
+        let (post_provision_identity, post_provision_head) = observed_lineage(
+            &post_provision_runtime,
+            &desired.volumes[0],
+            &post_provision_data_directory,
+        )
+        .unwrap();
+        assert_eq!(post_provision_identity, root_attachment.identity);
+        assert_eq!(post_provision_head, root_attachment.head);
+        drop(
+            blockd
+                .reopen_adopted(&desired, &desired.volumes[0], &post_provision_identity)
+                .unwrap(),
+        );
+
+        let records = BTreeMap::from([
+            (
+                root_attachment.identity.volume_id.clone(),
+                record(&root_attachment),
+            ),
+            (
+                persistent_attachment.identity.volume_id.clone(),
+                record(&persistent_attachment),
+            ),
+        ]);
+        for (volume, attachment) in desired
+            .volumes
+            .iter()
+            .zip([&root_attachment, &persistent_attachment])
+        {
+            let authority = records.get(&volume.volume_id).unwrap();
+            let identity = acquired_attachment_identity(&desired, volume, authority).unwrap();
+            assert_eq!(identity, attachment.identity);
+            drop(blockd.reopen_adopted(&desired, volume, &identity).unwrap());
+        }
+
+        let mut wrong_records = records.clone();
+        let wrong_marker = cats_api::runtime_reconciliation::LastVolumeTransition::Takeover {
+            authorization_id: id("wrong_takeover_authorization"),
+        };
+        wrong_records
+            .get_mut(&persistent_attachment.identity.volume_id)
+            .unwrap()
+            .last_transition = Some(wrong_marker);
+        let unverified = ServingPrepareDeviceEffect::new(
+            ServingPrepareFrontend::vhost_user_blk(4, 256).unwrap(),
+            HostPath::new("/usr/bin/cats-blockd").unwrap(),
+        )
+        .unwrap()
+        .with_volume_authority(Arc::new(MapAuthority {
+            records: Mutex::new(wrong_records),
+            loads: AtomicUsize::new(0),
+        }));
+        let error = unverified
+            .try_persist_direct_existing(&context, &desired)
+            .unwrap_err();
+        assert!(
+            format!("{error:#}").contains("authorized artifact conflicts"),
+            "{error:#}"
+        );
+
+        let authority = Arc::new(MapAuthority {
+            records: Mutex::new(records),
+            loads: AtomicUsize::new(0),
+        });
+        let effect = ServingPrepareDeviceEffect::new(
+            ServingPrepareFrontend::vhost_user_blk(4, 256).unwrap(),
+            HostPath::new("/usr/bin/cats-blockd").unwrap(),
+        )
+        .unwrap()
+        .with_volume_authority(authority);
+        assert_eq!(
+            effect
+                .try_persist_direct_existing(&context, &desired)
+                .unwrap(),
+            Some(RuntimeDesiredEffectOutcome::RefreshInventory)
+        );
+
+        let prepared =
+            FileCheckpointStore::open(&root.path().join(CHECKPOINT_NAMESPACE), &desired.cat_id)
+                .unwrap()
+                .load()
+                .unwrap()
+                .unwrap();
+        let ReconcileStep::PrepareDevice { devices } = &prepared.checkpoint().step else {
+            panic!("existing takeover Root must reach PrepareDevice")
+        };
+        assert_eq!(devices.len(), desired.volumes.len());
+        for (device, observed) in devices.iter().zip(&prepared.checkpoint().volumes) {
+            assert!(
+                super::super::prepare_device_retirement::prepared_device_input_is_exact(
+                    device, &desired, observed
+                )
+            );
+            assert!(matches!(
+                device.acquire_origin,
+                AcquireOrigin::Takeover { .. }
+            ));
+        }
+        assert!(matches!(
+            devices[0].serving_authority.as_ref(),
+            ServingAuthorityProvenance::DirectAuthorizedAttachment {
+                purpose: DirectAuthorizedAttachmentPurpose::ExistingRoot,
+                ..
+            }
+        ));
+
+        let mut wrong_authorization = devices[0].clone();
+        wrong_authorization.acquire_origin = AcquireOrigin::Takeover {
+            authorization_id: id("wrong_takeover_authorization"),
+        };
+        assert!(
+            !super::super::prepare_device_retirement::prepared_device_input_is_exact(
+                &wrong_authorization,
+                &desired,
+                &prepared.checkpoint().volumes[0],
+            )
+        );
+        let mut wrong_origin = devices[0].clone();
+        wrong_origin.acquire_origin = AcquireOrigin::Normal {
+            transition_id: random('a'),
+        };
+        assert!(
+            !super::super::prepare_device_retirement::prepared_device_input_is_exact(
+                &wrong_origin,
+                &desired,
+                &prepared.checkpoint().volumes[0],
+            )
+        );
+        let mut wrong_attachment = devices[0].clone();
+        wrong_attachment.attachment_id = id("wrong_attachment");
+        assert!(
+            !super::super::prepare_device_retirement::prepared_device_input_is_exact(
+                &wrong_attachment,
+                &desired,
+                &prepared.checkpoint().volumes[0],
+            )
+        );
+        let mut wrong_epoch = devices[0].clone();
+        wrong_epoch.attachment_epoch = fence(wrong_epoch.attachment_epoch.get() + 1);
+        assert!(
+            !super::super::prepare_device_retirement::prepared_device_input_is_exact(
+                &wrong_epoch,
+                &desired,
+                &prepared.checkpoint().volumes[0],
+            )
+        );
     }
 
     #[test]

@@ -23,8 +23,8 @@ use cats_api::runtime_reconciliation::{
     ObservedDevice, ObservedDiskKind, ObservedNetwork, OwnershipTokenEvidence,
     PrepareDeviceFrontend, PreparedDeviceInput, RandomId128, ReconcileStep, RequireIdleCheckpoint,
     RuntimeCheckpoint, RuntimeLaunch, RuntimeNetworkIdentity, RuntimeTarget, RuntimeTransition,
-    Sequence, Sha256Digest, UnixMillis, VolumeAccess, VolumeAcquire, VolumeAuthorityEvidence,
-    VolumeDisposition, WarmSnapshotEvidence,
+    Sequence, Sha256Digest, UnixMillis, VolumeAccess, VolumeAuthorityEvidence, VolumeDisposition,
+    WarmSnapshotEvidence,
 };
 use cats_storage::authority::{VolumeDataAuthority, VolumeRecord};
 
@@ -1373,7 +1373,6 @@ pub(super) fn prepare_network_volume_admission_is_exact(
         && desired.target == RuntimeTarget::Running
         && matches!(desired.transition, RuntimeTransition::CancelAndDrain)
         && desired_volume.access == VolumeAccess::ReadWriteOnce
-        && matches!(desired_volume.acquire, VolumeAcquire::Normal { .. })
         && matches!(desired_volume.disposition, VolumeDisposition::Retain)
         && device.volume_intent_id == desired_volume.volume_intent_id
         && device.disk_id == desired_volume.disk_id
@@ -1630,10 +1629,13 @@ mod tests {
     use std::time::{Duration, Instant};
 
     use cats_api::runtime_reconciliation::{
-        decode_desired_runtime_spec, decode_runtime_checkpoint, AdmissionInventoryAttestation,
-        AgentSession, ContractVersion, DesiredReadSnapshot, DesiredRuntimeSpec, Epoch,
-        LifecycleAdmission, NetworkConfig, NodeBootId, NodeObservation, RuntimeTarget,
-        RuntimeTransition, Sequence, SessionBinding, Sha256Digest,
+        decode_desired_runtime_spec, decode_runtime_checkpoint, spec_digest,
+        AdmissionInventoryAttestation, AgentSession, AppliedDesiredEvidence, CheckpointEvidence,
+        Condition, ContractVersion, DesiredReadSnapshot, DesiredRuntimeSpec, Epoch,
+        GuestTransportEvidence, HostPath, LifecycleAdmission, NetworkConfig, NodeBootId,
+        NodeObservation, ObservedRuntimeStatus, ProgressingReason, RuntimeTarget,
+        RuntimeTransition, Sequence, SessionBinding, Sha256Digest, VolumeAcquire,
+        WarmSnapshotEvidence,
     };
     use tempfile::TempDir;
 
@@ -1644,6 +1646,14 @@ mod tests {
     const PREPARE_DEVICE: &[u8] = include_bytes!(concat!(
         env!("CARGO_MANIFEST_DIR"),
         "/../testdata/runtime-reconciliation-v1-prepare-device-checkpoint.json"
+    ));
+    const PREPARE_NETWORK: &[u8] = include_bytes!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../testdata/runtime-reconciliation-v1-prepare-network-checkpoint.json"
+    ));
+    const START_RUNTIME: &[u8] = include_bytes!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../testdata/runtime-reconciliation-v1-start-runtime-checkpoint.json"
     ));
     const DESIRED: &[u8] = include_bytes!(concat!(
         env!("CARGO_MANIFEST_DIR"),
@@ -1763,6 +1773,147 @@ mod tests {
             &desired,
             &[prepared.clone(), prepared]
         ));
+    }
+
+    #[test]
+    fn takeover_volume_remains_exact_through_prepare_network_and_start_runtime() {
+        for encoded_checkpoint in [PREPARE_NETWORK, START_RUNTIME] {
+            let mut checkpoint = decode_runtime_checkpoint(encoded_checkpoint).unwrap();
+            let mut desired = desired_for(&checkpoint.cat_id);
+            let authorization_id = Id::new("takeover_auth_root").unwrap();
+            desired.volumes[0].acquire = VolumeAcquire::Takeover {
+                authorization_id: authorization_id.clone(),
+            };
+            desired.spec_digest = spec_digest(&desired).unwrap();
+            checkpoint.spec_digest = desired.spec_digest.clone();
+
+            let acquire_origin = cats_api::runtime_reconciliation::AcquireOrigin::Takeover {
+                authorization_id: authorization_id.clone(),
+            };
+            match &mut checkpoint.step {
+                ReconcileStep::PrepareNetwork { devices, .. }
+                | ReconcileStep::StartRuntime { devices, .. } => {
+                    devices[0].acquire_origin = acquire_origin.clone();
+                }
+                _ => panic!("fixture must be a downstream launch phase"),
+            }
+            if let RuntimeLaunch::Present(identity) = &mut checkpoint.runtime_launch {
+                identity.devices[0].acquire_origin = acquire_origin.clone();
+            }
+            checkpoint.volumes[0].local_lineages[0].acquire_origin = acquire_origin;
+            let device = match &checkpoint.step {
+                ReconcileStep::PrepareNetwork { devices, .. }
+                | ReconcileStep::StartRuntime { devices, .. } => devices[0].clone(),
+                _ => unreachable!("phase was checked above"),
+            };
+            let observed_device = match &device.frontend {
+                PrepareDeviceFrontend::KernelNbd { device_path, .. } => ObservedDevice::KernelNbd {
+                    guest_device: device.guest_device.clone(),
+                    device_path: device_path.clone(),
+                    ownership_token: OwnershipTokenEvidence::Valid {
+                        ownership_token: device.ownership_token.clone(),
+                    },
+                },
+                PrepareDeviceFrontend::VhostUserBlk { socket_path, .. } => {
+                    ObservedDevice::VhostUserBlk {
+                        guest_device: device.guest_device.clone(),
+                        socket_path: socket_path.clone(),
+                        ownership_token: OwnershipTokenEvidence::Valid {
+                            ownership_token: device.ownership_token.clone(),
+                        },
+                    }
+                }
+            };
+            checkpoint.volumes[0].devices = vec![observed_device.clone()];
+            assert!(prepared_device_set_is_exact(
+                &desired,
+                std::slice::from_ref(&device)
+            ));
+
+            let runtime = ObservedRuntimeStatus {
+                cat_id: checkpoint.cat_id.clone(),
+                applied_desired: Some(AppliedDesiredEvidence {
+                    desired_revision: desired.desired_revision,
+                    spec_digest: desired.spec_digest.clone(),
+                    placement: desired.placement.clone(),
+                    target: desired.target,
+                }),
+                runtime_incarnation: checkpoint.runtime_incarnation.clone(),
+                stable_state: checkpoint.stable_state,
+                step: checkpoint.step.clone(),
+                checkpoint: CheckpointEvidence::Missing {
+                    checkpoint_path: HostPath::new("/var/lib/cats/checkpoints/cat_01.json")
+                        .unwrap(),
+                },
+                processes: Vec::new(),
+                volumes: checkpoint.volumes.clone(),
+                mounts: checkpoint.mounts.clone(),
+                networks: checkpoint.networks.clone(),
+                guest_transport: GuestTransportEvidence::Unavailable,
+                warm_snapshot: WarmSnapshotEvidence::Absent,
+                lifecycle_admission: LifecycleAdmission::Closed,
+                routes: Vec::new(),
+                platform_guards: 0,
+                conditions: vec![Condition::Progressing {
+                    reason: ProgressingReason::ReconcileStep {
+                        step: checkpoint.step.clone(),
+                    },
+                }],
+            };
+            assert!(prepare_network_volume_admission_is_exact(
+                &desired,
+                &runtime,
+                &device,
+                &device.volume_id,
+                Some(&observed_device),
+            ));
+
+            let mut wrong_desired_authorization = desired.clone();
+            wrong_desired_authorization.volumes[0].acquire = VolumeAcquire::Takeover {
+                authorization_id: Id::new("wrong_takeover_authorization").unwrap(),
+            };
+            wrong_desired_authorization.spec_digest =
+                spec_digest(&wrong_desired_authorization).unwrap();
+            assert!(!prepare_network_volume_admission_is_exact(
+                &wrong_desired_authorization,
+                &runtime,
+                &device,
+                &device.volume_id,
+                Some(&observed_device),
+            ));
+            let mut wrong_origin = device.clone();
+            wrong_origin.acquire_origin = cats_api::runtime_reconciliation::AcquireOrigin::Normal {
+                transition_id: random('f'),
+            };
+            assert!(!prepare_network_volume_admission_is_exact(
+                &desired,
+                &runtime,
+                &wrong_origin,
+                &wrong_origin.volume_id,
+                Some(&observed_device),
+            ));
+            let mut wrong_attachment = device.clone();
+            wrong_attachment.attachment_id = Id::new("wrong_attachment").unwrap();
+            assert!(!prepare_network_volume_admission_is_exact(
+                &desired,
+                &runtime,
+                &wrong_attachment,
+                &wrong_attachment.volume_id,
+                Some(&observed_device),
+            ));
+            let mut wrong_epoch = device.clone();
+            wrong_epoch.attachment_epoch = cats_api::runtime_reconciliation::FenceEpoch::new(
+                wrong_epoch.attachment_epoch.get() + 1,
+            )
+            .unwrap();
+            assert!(!prepare_network_volume_admission_is_exact(
+                &desired,
+                &runtime,
+                &wrong_epoch,
+                &wrong_epoch.volume_id,
+                Some(&observed_device),
+            ));
+        }
     }
 
     struct Fixture {

@@ -17,8 +17,8 @@ use cats_api::runtime_reconciliation::{
     GuestTransportEvidence, HostPath, LifecycleAdmission, LocalLineageState, ObservedDiskKind,
     ObservedNetwork, ObservedRuntimeStatus, OwnershipTokenEvidence, ProcessRole, ProcessState,
     ProgressingReason, ProvisionRootImageError, RandomId128, ReconcileStep, RuntimeTarget,
-    RuntimeTransition, VolumeAccess, VolumeAcquire, VolumeAuthorityEvidence, VolumeDisposition,
-    VolumeIntent, WarmSnapshotEvidence,
+    RuntimeTransition, VolumeAccess, VolumeAuthorityEvidence, VolumeDisposition, VolumeIntent,
+    WarmSnapshotEvidence,
 };
 use cats_blockd::target_control::provision_root_image_request;
 use cats_storage::authority::{AttachmentLineageIdentity, VolumeDataAuthority, VolumeRecord};
@@ -1154,8 +1154,7 @@ fn current_provision_admission_is_exact(
         && matches!(desired.transition, RuntimeTransition::CancelAndDrain)
         && (1..=64).contains(&desired.volumes.len())
         && desired.volumes.iter().enumerate().all(|(index, volume)| {
-            matches!(volume.acquire, VolumeAcquire::Normal { .. })
-                && volume.access == VolumeAccess::ReadWriteOnce
+            volume.access == VolumeAccess::ReadWriteOnce
                 && matches!(volume.disposition, VolumeDisposition::Retain)
                 && usize::from(volume.guest_device.slot) == index
                 && match index {
@@ -1292,13 +1291,13 @@ mod tests {
         checkpoint_content_digest, encode_provision_root_image_request,
         encode_provision_root_image_result, inventory_digest, spec_digest, AcquireOrigin,
         AdmissionInventoryAttestation, AgentSession, AssignedKind, AssignedPlacement,
-        DesiredReadSnapshot, Durability, EndpointIntent, Epoch, FenceEpoch, GuestDeviceIdentity,
-        Hostname, HttpProtocol, Id, Ipv4Address, IsolatedIpv4Kind, LocalVolumeLineage, MacAddress,
-        NetworkConfig, NodeBootId, NodeObservation, NormalAcquireRequest, NormalAcquireResult,
-        ObservedRuntimeStatus, ObservedVolume, ProcessEvidence, ProvisionRootImageResult,
-        RandomId128, RemoteHead, Revision, RuntimeCheckpoint, RuntimeConfig,
-        RuntimeVolumeTransitionRequest, Sequence, SessionBinding, Sha256Digest, UnixMillis,
-        VolumeRecord, WireU64,
+        DesiredReadSnapshot, Durability, EndpointIntent, Epoch, Ext4MountIntent, FenceEpoch,
+        FilesystemInitialization, GuestDeviceIdentity, Hostname, HttpProtocol, Id, Ipv4Address,
+        IsolatedIpv4Kind, LocalVolumeLineage, MacAddress, NetworkConfig, NodeBootId,
+        NodeObservation, NormalAcquireRequest, NormalAcquireResult, ObservedRuntimeStatus,
+        ObservedVolume, ProcessEvidence, ProvisionRootImageResult, RandomId128, RemoteHead,
+        Revision, RuntimeCheckpoint, RuntimeConfig, RuntimeVolumeTransitionRequest, Sequence,
+        SessionBinding, Sha256Digest, UnixMillis, VolumeAcquire, VolumeRecord, WireU64,
     };
     use cats_storage::authority::{
         AuthorityError, AuthorizedServingAttachment, LastVolumeTransition, RenewLeaseRequest,
@@ -2613,6 +2612,67 @@ mod tests {
         assert_eq!(process.inspections.load(Ordering::SeqCst), 1);
         assert_eq!(process.starts.load(Ordering::SeqCst), 1);
         assert_eq!(request.calls.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn current_provision_gate_accepts_an_exact_mixed_takeover_volume_set() {
+        let fixture = Fixture::new();
+        let context = fixture.context(Vec::new());
+        let mut runtime = context.accepted_full().unwrap().observation().runtimes[0].clone();
+        let mut desired = fixture.desired.clone();
+        let root_authorization_id = id("auth_root_takeover");
+        desired.volumes[0].acquire = VolumeAcquire::Takeover {
+            authorization_id: root_authorization_id.clone(),
+        };
+        runtime.volumes[0].local_lineages[0].acquire_origin = AcquireOrigin::Takeover {
+            authorization_id: root_authorization_id,
+        };
+
+        let mut persistent = desired.volumes[0].clone();
+        persistent.volume_intent_id = id("vint_z_persistent");
+        persistent.disk_id = id("disk_z_persistent");
+        persistent.volume_id = id("vol_z_persistent");
+        persistent.attachment_id = id("att_z_persistent");
+        persistent.disk_kind = DiskKind::Persistent;
+        persistent.guest_device = GuestDeviceIdentity {
+            serial: id("cats-persistent"),
+            slot: 1,
+        };
+        let persistent_authorization_id = id("auth_persistent_takeover");
+        persistent.acquire = VolumeAcquire::Takeover {
+            authorization_id: persistent_authorization_id.clone(),
+        };
+        persistent.mount = Some(Ext4MountIntent {
+            filesystem_uuid: random('e'),
+            mount_path: HostPath::new("/srv/persistent").unwrap(),
+            initialization: FilesystemInitialization::Existing,
+        });
+        desired.volumes.push(persistent.clone());
+        desired.spec_digest = spec_digest(&desired).unwrap();
+
+        let mut observed_persistent = runtime.volumes[0].clone();
+        observed_persistent.volume_intent_id = Some(persistent.volume_intent_id.clone());
+        observed_persistent.disk_id = Some(persistent.disk_id.clone());
+        observed_persistent.volume_id = persistent.volume_id.clone();
+        observed_persistent.disk_kind = ObservedDiskKind::Persistent;
+        let VolumeAuthorityEvidence::Owned {
+            attachment_id,
+            attachment_epoch,
+            ..
+        } = &mut observed_persistent.authority
+        else {
+            unreachable!("provision fixture owns its Root")
+        };
+        *attachment_id = persistent.attachment_id.clone();
+        let lineage = &mut observed_persistent.local_lineages[0];
+        lineage.attachment_id = persistent.attachment_id.clone();
+        lineage.attachment_epoch = *attachment_epoch;
+        lineage.acquire_origin = AcquireOrigin::Takeover {
+            authorization_id: persistent_authorization_id,
+        };
+        runtime.volumes.push(observed_persistent);
+
+        assert!(current_provision_admission_is_exact(&desired, &runtime));
     }
 
     #[test]
