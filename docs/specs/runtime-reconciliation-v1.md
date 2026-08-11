@@ -1233,8 +1233,12 @@ cmdline、`cpus=boot=<vcpus>`、file-backed shared memory、checkpoint CID/vsock
 全部disk、serial descriptor和console-off。kernel disk argument固定
 `path=<path>,image_type=raw,direct=on|off,serial=<guest_device.serial>`；vhost argument固定
 `vhost_user=on,socket=<path>,num_queues=<queues>,queue_size=<queue_size>,serial=<guest_device.serial>`。
-`vm.info.config.disks[*].serial`必须按slot顺序逐项等于同一checkpoint identity。不得继续使用硬编码CID 3、丢弃
-`direct`/queue参数、按map顺序生成disk或从current ChConfig重新选择不同boot bytes。
+`vm.info.config.disks[*].serial`必须按slot顺序逐项等于同一checkpoint identity。authorized serving blockd在
+kernel-NBD和vhost-user两条path都必须把该serial放入sealed CLI/process expectation与
+`DurabilityStatus.guest_device_serial=Some(exact)`；missing/wrong status不可adopt，control-only/legacy为`None`
+且不可成为production serving proof。vhost-user backend的20-byte zero-padded `VIRTIO_BLK_T_GET_ID`只能由该
+serial构造，不能使用或截断`volume_id`。blockd argv/status、CH argv和`vm.info`因此闭合到同一checkpoint值。
+不得继续使用硬编码CID 3、丢弃`direct`/queue参数、按map顺序生成disk或从current ChConfig重新选择不同boot bytes。
 
 transient service固定`Type=exec`、`--collect`、`CollectMode=inactive-or-failed`、`Restart=no`、
 `KillMode=control-group`、`UMask=0077`及contract版本冻结的stop timeout；cgroup必须精确
@@ -2294,22 +2298,32 @@ RuntimeReadyMountV1 {
 }
 ```
 
-两方向都使用`u32` big-endian length + canonical JSON body。request独立cap为4 KiB，response独立cap为
-4 MiB；后者覆盖64 devices + 64 mounts且每个字段取合法最大HostPath并作JSON escape的实际canonical
-encoding，仍不允许退回generic 16 MiB reader。Node在分配body前先读并检查length prefix，`cap+1`立即
-拒绝。所有nested/top-level object deny unknown，duplicate/missing/malformed字段拒绝；response必须exact
-echo challenge/incarnation/expected transport。device按`(slot, serial)`严格排序，slot、serial、path、kernel
-device number及UUID分别唯一；mount按`(mount_path, source_path)`严格排序且mount path唯一，并由device
-number、source path和UUID exact join恰好一个同轮device。
+wire固定为`u32` big-endian length + one-byte direction tag + canonical JSON body，length包含tag；request tag
+是非`{`字节`0x01`，response tag是`0x02`。两方向分别冻结完整tag/length/body vector；body object key按字典序，
+decode后重编码必须逐byte等于原body，所以member reorder、whitespace和等价JSON escape也拒绝。request独立cap
+为4 KiB，response独立cap为4 MiB；后者覆盖64 devices + 64 mounts且每个字段取合法最大HostPath并作JSON
+escape的实际canonical encoding。shared Guest receiver先只读length和tag：`0x01`必须立即选定4 KiB cap，
+`cap+1`不等待body；generic 16 MiB reader不得fallback接受该tag或untagged RuntimeReady JSON。Node的dedicated
+response reader也在分配或读取tag/body前先按length拒绝`cap+1`，Ready reader不接受untagged JSON或错误方向tag。
+所有nested/top-level object deny unknown，duplicate/missing/malformed/truncated字段拒绝；response必须exact
+echo challenge/incarnation/expected transport，且actual CID/port/protocol tuple必须逐字段等于request expected
+tuple。device按`(slot, serial)`严格排序，slot、serial、path、kernel device number及UUID分别唯一；mount按
+`(mount_path, source_path)`严格排序且mount path唯一，并由device number、source path和UUID exact join恰好一个
+同轮device。
 
 Guest只在real VM的accepted AF_VSOCK stream服务该op，并用`getsockname`取得actual local CID/port；Guest自报
 不能替代VMM authority。Node连接CH hybrid-vsock时只接受最多32 bytes的exact canonical
 `OK <assigned>\n`，逐byte读到首个LF而不吞后续Guest frame；prefix、trailing、CRLF、多行、leading-zero、0、
-`u32::MAX`及无LF都拒绝。Guest在同一pass从sysfs、ext4 superblock和`/proc/self/mountinfo`收集事实；Root UUID
-仅是该pass的nonzero physical fact，不能“首次观察即authority”持久或采用。若launch/image authority不能导出
-expected Root UUID，validation必须明确保留该gap，只能要求same fresh proof内device/ext4/mount join闭合，不能
-声称Control UUID匹配。Persistent未格式化或mount语义未实现时RuntimeReady fail closed；本ABI结果不得复用为
-未来Format前filesystem probe，也不虚构Format/Mount/Gate effect。
+`u32::MAX`及无LF都拒绝。Guest physical collector先取`/sys/block/vd*`的serial/slot/sector-size/device-number
+样本A；随后以`O_RDONLY|O_CLOEXEC|O_NOFOLLOW|O_NONBLOCK`保留每个`/dev/<name>` fd，要求`fstat`为block device、
+`st_rdev`等于sysfs major/minor，且当前pathname仍是同一device/inode/rdev。ext4 UUID A从该fd读；再要求
+`/proc/self/mountinfo` A/B exact bytes相同、从同一fd读到相同ext4 UUID B，最终再次fstat/pathname并取得逐字段
+exact sysfs样本B。symlink/regular replacement以及中途device serial/size/number、UUID或mountinfo漂移全部拒绝，
+测试provider不得放宽production `S_IFBLK/st_rdev`证明。Root UUID仅是该pass的nonzero physical fact，不能
+“首次观察即authority”持久或采用。若launch/image authority不能导出expected Root UUID，validation必须明确
+保留该gap，只能要求same fresh proof内device/ext4/mount join闭合，不能声称Control UUID匹配。Persistent未格式化
+或mount语义未实现时RuntimeReady fail closed；本ABI结果不得复用为未来Format前filesystem probe，也不虚构
+Format/Mount/Gate effect。
 
 这里的`AcquireOrigin`与[Volume Authority §6](volume-authority.md#6-本地-attachment-lineage)是同一个closed
 wire union，不是第二套identity定义。`LocalVolumeLineage.acquire_origin`是data-dir `identity.json`中该值的

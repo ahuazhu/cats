@@ -216,6 +216,11 @@ queues/queue-size不得丢失。该provenance不假设新的release installer、
 `GuestDeviceIdentity.serial`保持`Id`的wire/type形态，但因production唯一目标Cloud Hypervisor v53的
 `VIRTIO_BLK_ID_BYTES`限制，所有Desired、checkpoint nested input、Observed和Guest Ready承载点都必须在
 F0/strict ABI统一拒绝UTF-8 byte length不在1..=20的值；launcher不得截断或成为首次拒绝边界。
+同一个checkpoint serial还必须进入authorized serving blockd的sealed CLI/process expectation和status：
+kernel-NBD与vhost-user两条production path都要求`DurabilityStatus.guest_device_serial=Some(exact)`，缺失或
+不等于checkpoint的status不可adopt；control-only和legacy status保持`None`且不是production serving proof。
+vhost-user backend只能从该值构造20-byte zero-padded `VIRTIO_BLK_T_GET_ID`结果，不能再使用、截断或推导
+`volume_id`。blockd argv/status、Cloud Hypervisor disk argv与`vm.info` inspector必须逐字段闭合到同一serial。
 `guest_config_digest`还必须由checkpoint kernel digest、optional initramfs digest、exact cmdline及Guest Agent
 protocol v1按既有`GuestRuntimeProfileReceipt` domain重算，且等于current Desired选择的approved digest；不能让
 Guest回显一个与实际boot bytes无关的digest。
@@ -238,9 +243,18 @@ provider-private exact argv/env/cgroup/unit/PID/start/executable/file/tap/device
 Ready不得继续使用legacy `Health {boot_id, disks}`或宽松hybrid-vsock prefix。每次fresh scan使用fresh random
 challenge并绑定retained launch的incarnation/CID/fixed port/protocol；Guest exact echo，同时以accepted AF_VSOCK
 stream的`getsockname`报告actual CID/port、canonical boot ID及同pass的bounded/sorted device/ext4/mountinfo
-事实。request/response分别使用独立4 KiB/4 MiB frame cap，Node在body allocation前拒绝oversized length；
-unknown/duplicate/missing/malformed字段以及非exact `OK <assigned>\n` CH handshake全部fail closed。Guest projection
-只能夹在前后两次exact VMM/systemd/process/API/socket/volume proof之间，不能成为任何一项authority。Root UUID
+事实，且actual CID/port/protocol必须逐字段等于challenged expected tuple。RuntimeReady request/response分别固定
+非JSON direction tag `0x01`/`0x02`，wire length包含该tag，后接字典序canonical JSON；decode后的canonical重编码
+必须逐byte等于原body，因此reorder、whitespace和等价escape也拒绝。request/response分别使用独立4 KiB/4 MiB
+frame cap：shared Guest receiver只读length与tag就选定4 KiB cap，Node dedicated response reader也在读body和分配前
+拒绝oversized length；generic 16 MiB reader不得fallback接受tagged Ready，Ready reader也不得接受untagged JSON。
+unknown/duplicate/missing/malformed字段以及非exact `OK <assigned>\n` CH handshake全部fail closed。
+
+Guest physical collector先取`/sys/block/vd*`样本A，再以`O_NOFOLLOW`保留每个`/dev` block fd，要求`fstat`
+`S_IFBLK/st_rdev`、当前pathname identity与sysfs device number闭合；ext4 UUID A/B都从同一retained fd读取，
+`/proc/self/mountinfo` A/B必须exact bytes相同，最后再次`fstat`/pathname并取得逐字段exact sysfs样本B。
+symlink、regular-file或中途pathname/device/serial/size/UUID/mountinfo漂移全部拒绝。Guest projection只能夹在
+前后两次exact VMM/systemd/process/API/socket/volume proof之间，不能成为任何一项authority。Root UUID
 若不能由image/launch authority导出，只记录same-pass nonzero物理事实和validation gap，不作首次观察采用；
 Persistent/Format/Mount未实现语义继续fail closed。
 
