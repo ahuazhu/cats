@@ -4704,7 +4704,7 @@ mod tests {
     #[cfg(target_os = "linux")]
     use super::super::vmm_socket_namespace::{
         current_kernel_node_boot_id, RetainedManagedVmmSocketRoot, VmmSocketOwnershipReceiptV1,
-        VmmSocketReceiptStore,
+        VmmSocketReceiptStore, VMM_SOCKET_RECEIPT_NAMESPACE,
     };
 
     use super::super::{
@@ -10379,6 +10379,20 @@ mod tests {
             recovery_context(self.state.path(), &desired)
         }
 
+        fn receipt_path(&self) -> std::path::PathBuf {
+            self.state
+                .path()
+                .join(VMM_SOCKET_RECEIPT_NAMESPACE)
+                .join(format!(
+                    "vmm-{}.receipt.json",
+                    self.checkpoint
+                        .runtime_incarnation
+                        .as_ref()
+                        .expect("stale-boot fixture retains one launch")
+                        .as_str()
+                ))
+        }
+
         fn install_stable_stop_receipt(
             &self,
         ) -> (DesiredRuntimeSpec, std::path::PathBuf, std::fs::Metadata) {
@@ -10515,6 +10529,181 @@ mod tests {
     }
 
     #[cfg(target_os = "linux")]
+    #[derive(Clone, Copy)]
+    enum UnrelatedCurrentCheckpointPhase {
+        Acquire,
+        Provision,
+    }
+
+    #[cfg(target_os = "linux")]
+    #[derive(Debug, Clone, Copy)]
+    enum UnrelatedCurrentCheckpointDrift {
+        Authorization,
+        Origin,
+        Attachment,
+        Epoch,
+        Head,
+        DataDirectory,
+        GuestSlot,
+        ExtraObservedVolume,
+        MissingObservedVolume,
+    }
+
+    #[cfg(target_os = "linux")]
+    fn unrelated_current_multi_takeover_checkpoint(
+        state_path: &std::path::Path,
+        phase: UnrelatedCurrentCheckpointPhase,
+    ) -> (DesiredRuntimeSpec, RuntimeCheckpoint) {
+        let mut desired = second_desired();
+        desired.volumes.push(normal_persistent_volume());
+        let authorization_id = id("takeover_stale_boot_root");
+        desired.volumes[0].acquire = VolumeAcquire::Takeover {
+            authorization_id: authorization_id.clone(),
+        };
+        desired.spec_digest = spec_digest(&desired).unwrap();
+
+        let (root_attachment, _, _, root_predecessor) = takeover_recovery_fixture(&desired, 0);
+        let checkpoint = match phase {
+            UnrelatedCurrentCheckpointPhase::Acquire => closed_checkpoint(
+                &desired,
+                ReconcileStep::AcquireVolume {
+                    request: VolumeAcquireRequest::Takeover { authorization_id },
+                },
+                vec![
+                    root_predecessor,
+                    unowned_observed_volume(&desired.volumes[1]),
+                ],
+                unix_ms(1_900_000_000_000),
+            ),
+            UnrelatedCurrentCheckpointPhase::Provision => {
+                let persistent_attachment = normal_attachment(&desired, 1);
+                let root_data_directory = authorized_blockd_data_directory(
+                    state_path,
+                    &desired,
+                    &root_attachment.identity,
+                );
+                let persistent_data_directory = authorized_blockd_data_directory(
+                    state_path,
+                    &desired,
+                    &persistent_attachment.identity,
+                );
+                let expected_provisioned_head = RemoteHead {
+                    generation: Generation::new(1).unwrap(),
+                    root_hash: Some(Sha256Digest::from_bytes([0x51; 32])),
+                    root_object_id: Some(AsciiText::new("roots/stale-boot-multi-target").unwrap()),
+                };
+                closed_checkpoint(
+                    &desired,
+                    ReconcileStep::ProvisionRootImage {
+                        provision_transition_id: random('6'),
+                        volume_id: desired.volumes[0].volume_id.clone(),
+                        attachment_id: root_attachment.identity.attachment_id.clone(),
+                        attachment_epoch: root_attachment.identity.attachment_epoch,
+                        scope_id: id(&format!("cats-root-{}.service", "7".repeat(32))),
+                        control_socket_path: host(root_data_directory.join(ROOT_PROVISION_SOCKET)),
+                        data_directory: host(root_data_directory.clone()),
+                        process_identity_token: random('8'),
+                        size_bytes: desired.volumes[0].size_bytes,
+                        boot_image_digest: desired.runtime.boot_image_digest.clone(),
+                        expected_blank_head: root_attachment.head.clone(),
+                        expected_provisioned_head,
+                    },
+                    vec![
+                        prepared_owned_observed_volume(
+                            &desired.volumes[0],
+                            &root_attachment,
+                            host(root_data_directory),
+                        ),
+                        prepared_owned_observed_volume(
+                            &desired.volumes[1],
+                            &persistent_attachment,
+                            host(persistent_data_directory),
+                        ),
+                    ],
+                    unix_ms(1_900_000_000_000),
+                )
+            }
+        };
+        (desired, checkpoint)
+    }
+
+    #[cfg(target_os = "linux")]
+    fn drifted_unrelated_current_multi_takeover_checkpoint(
+        state_path: &std::path::Path,
+        drift: UnrelatedCurrentCheckpointDrift,
+    ) -> (DesiredRuntimeSpec, RuntimeCheckpoint) {
+        let phase = if matches!(drift, UnrelatedCurrentCheckpointDrift::Authorization) {
+            UnrelatedCurrentCheckpointPhase::Acquire
+        } else {
+            UnrelatedCurrentCheckpointPhase::Provision
+        };
+        let (mut desired, mut checkpoint) =
+            unrelated_current_multi_takeover_checkpoint(state_path, phase);
+        match drift {
+            UnrelatedCurrentCheckpointDrift::Authorization => {
+                let ReconcileStep::AcquireVolume {
+                    request: VolumeAcquireRequest::Takeover { authorization_id },
+                } = &mut checkpoint.step
+                else {
+                    unreachable!("authorization drift fixture must use Takeover Acquire")
+                };
+                *authorization_id = id("takeover_stale_boot_foreign");
+            }
+            UnrelatedCurrentCheckpointDrift::Origin => {
+                checkpoint.volumes[0].local_lineages[0].acquire_origin = AcquireOrigin::Normal {
+                    transition_id: random('9'),
+                };
+            }
+            UnrelatedCurrentCheckpointDrift::Attachment => {
+                let ReconcileStep::ProvisionRootImage { attachment_id, .. } = &mut checkpoint.step
+                else {
+                    unreachable!("attachment drift fixture must use Root provision")
+                };
+                *attachment_id = id("att_stale_boot_foreign");
+            }
+            UnrelatedCurrentCheckpointDrift::Epoch => {
+                let ReconcileStep::ProvisionRootImage {
+                    attachment_epoch, ..
+                } = &mut checkpoint.step
+                else {
+                    unreachable!("epoch drift fixture must use Root provision")
+                };
+                *attachment_epoch = fence(attachment_epoch.get() + 1);
+            }
+            UnrelatedCurrentCheckpointDrift::Head => {
+                let VolumeAuthorityEvidence::Owned { head, .. } =
+                    &mut checkpoint.volumes[0].authority
+                else {
+                    unreachable!("head drift fixture must retain owned Root authority")
+                };
+                *head = RemoteHead {
+                    generation: Generation::new(2).unwrap(),
+                    root_hash: Some(Sha256Digest::from_bytes([0x52; 32])),
+                    root_object_id: Some(AsciiText::new("roots/stale-boot-foreign-head").unwrap()),
+                };
+            }
+            UnrelatedCurrentCheckpointDrift::DataDirectory => {
+                checkpoint.volumes[0].local_lineages[0].data_directory =
+                    host(state_path.join("data/stale-boot-foreign-lineage"));
+            }
+            UnrelatedCurrentCheckpointDrift::GuestSlot => {
+                desired.volumes[1].guest_device.slot = desired.volumes[0].guest_device.slot;
+            }
+            UnrelatedCurrentCheckpointDrift::ExtraObservedVolume => {
+                let mut extra = checkpoint.volumes[1].clone();
+                extra.volume_intent_id = Some(id("vint_zz_stale_boot_extra"));
+                extra.disk_id = Some(id("disk_zz_stale_boot_extra"));
+                extra.volume_id = id("vol_zz_stale_boot_extra");
+                checkpoint.volumes.push(extra);
+            }
+            UnrelatedCurrentCheckpointDrift::MissingObservedVolume => {
+                checkpoint.volumes.pop();
+            }
+        }
+        (desired, checkpoint)
+    }
+
+    #[cfg(target_os = "linux")]
     #[test]
     fn stale_boot_recovery_runs_after_current_or_legal_superseded_classification() {
         for superseded in [false, true] {
@@ -10587,6 +10776,99 @@ mod tests {
             LocalPublicationRecoveryEvidence::RootProvisionStopReceipt { cat_id }
                 if cat_id == stable.cat_id
         ));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn current_multi_takeover_acquire_and_provision_do_not_starve_stale_boot_recovery() {
+        for phase in [
+            UnrelatedCurrentCheckpointPhase::Acquire,
+            UnrelatedCurrentCheckpointPhase::Provision,
+        ] {
+            let fixture = StaleBootPublicationFixture::new();
+            let (unrelated, checkpoint) =
+                unrelated_current_multi_takeover_checkpoint(fixture.state.path(), phase);
+            persist_checkpoint(fixture.state.path(), &checkpoint);
+            let context = recovery_context_with_desireds(
+                fixture.state.path(),
+                vec![fixture.desired.clone(), unrelated],
+            );
+
+            assert!(matches!(
+                fixture.recovery().recover_one(context).unwrap(),
+                RuntimePreScanRecoveryOutcome::Recovered { cat_id }
+                    if cat_id == fixture.checkpoint.cat_id
+            ));
+            assert_eq!(fixture.calls.load(Ordering::SeqCst), 1);
+            assert!(fixture
+                .receipts
+                .load(fixture.checkpoint.runtime_incarnation.as_ref().unwrap())
+                .unwrap()
+                .is_none());
+            assert_eq!(
+                read_checkpoint(&checkpoint_path(fixture.state.path(), &checkpoint.cat_id,)),
+                checkpoint,
+                "stale-boot recovery must not mutate the unrelated checkpoint",
+            );
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn drifted_current_multi_takeover_checkpoint_never_deletes_unrelated_stale_boot_receipt() {
+        for drift in [
+            UnrelatedCurrentCheckpointDrift::Authorization,
+            UnrelatedCurrentCheckpointDrift::Origin,
+            UnrelatedCurrentCheckpointDrift::Attachment,
+            UnrelatedCurrentCheckpointDrift::Epoch,
+            UnrelatedCurrentCheckpointDrift::Head,
+            UnrelatedCurrentCheckpointDrift::DataDirectory,
+            UnrelatedCurrentCheckpointDrift::GuestSlot,
+            UnrelatedCurrentCheckpointDrift::ExtraObservedVolume,
+            UnrelatedCurrentCheckpointDrift::MissingObservedVolume,
+        ] {
+            let fixture = StaleBootPublicationFixture::new();
+            let receipt_path = fixture.receipt_path();
+            let before_bytes = std::fs::read(&receipt_path).unwrap();
+            let before = std::fs::metadata(&receipt_path).unwrap();
+            let (unrelated, checkpoint) =
+                drifted_unrelated_current_multi_takeover_checkpoint(fixture.state.path(), drift);
+            if matches!(drift, UnrelatedCurrentCheckpointDrift::GuestSlot) {
+                assert!(encode_desired_runtime_spec(&unrelated).is_err());
+            } else {
+                encode_desired_runtime_spec(&unrelated).unwrap();
+            }
+            encode_runtime_checkpoint(&checkpoint).unwrap();
+            persist_checkpoint(fixture.state.path(), &checkpoint);
+
+            assert_eq!(
+                fixture
+                    .recovery()
+                    .recover_one(recovery_context_with_desireds(
+                        fixture.state.path(),
+                        vec![fixture.desired.clone(), unrelated],
+                    ))
+                    .unwrap(),
+                RuntimePreScanRecoveryOutcome::NoChange,
+                "drift case {drift:?}",
+            );
+            assert_eq!(
+                fixture.calls.load(Ordering::SeqCst),
+                0,
+                "drift case {drift:?} reached the global VMM sweep",
+            );
+            assert!(fixture
+                .receipts
+                .load(fixture.checkpoint.runtime_incarnation.as_ref().unwrap())
+                .unwrap()
+                .is_some());
+            let after = std::fs::metadata(&receipt_path).unwrap();
+            assert_eq!(std::fs::read(&receipt_path).unwrap(), before_bytes);
+            assert_eq!(after.len(), before.len());
+            assert_eq!(after.dev(), before.dev());
+            assert_eq!(after.ino(), before.ino());
+            assert_eq!(after.nlink(), before.nlink());
+        }
     }
 
     #[cfg(target_os = "linux")]

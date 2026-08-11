@@ -2264,6 +2264,20 @@ pub(super) fn validate_checkpoint_recovery_structure(
     state_directory: &crate::state_directory::StateDirectory,
     socket_root: &super::vmm_socket_namespace::ManagedVmmSocketRoot,
 ) -> anyhow::Result<()> {
+    let unique_guest_slots = desired
+        .volumes
+        .iter()
+        .map(|intent| intent.guest_device.slot)
+        .collect::<BTreeSet<_>>();
+    anyhow::ensure!(
+        unique_guest_slots.len() == desired.volumes.len()
+            && desired
+                .volumes
+                .iter()
+                .enumerate()
+                .all(|(index, intent)| usize::from(intent.guest_device.slot) == index),
+        "Runtime recovery Desired volume slots are not canonical and unique"
+    );
     let binding_is_valid = match binding {
         DesiredCheckpointBinding::Current => {
             checkpoint.desired_revision == desired.desired_revision
@@ -2296,58 +2310,29 @@ pub(super) fn validate_checkpoint_recovery_structure(
             validate_superseded_acquire_checkpoint(checkpoint, request)?;
             return Ok(());
         }
-        let [intent] = desired.volumes.as_slice() else {
-            anyhow::bail!("current Acquire recovery checkpoint requires one root Volume")
-        };
         anyhow::ensure!(
-            request_matches_volume(request, desired, intent)
-                && (checkpoint.volumes == [unowned_observed_volume(intent)]
-                    || current_acquire_adoption_is_closed(checkpoint, intent, None)),
-            "Acquire recovery checkpoint does not bind the exact Desired root"
+            multi_acquire_checkpoint_is_bound(checkpoint, desired, state_directory.path()),
+            "Acquire recovery checkpoint does not bind the complete Desired volume set"
         );
         return Ok(());
     }
 
     if let ReconcileStep::ProvisionRootImage {
-        volume_id,
-        attachment_id,
-        attachment_epoch,
-        size_bytes,
-        boot_image_digest,
         expected_blank_head,
         expected_provisioned_head,
         ..
     } = &checkpoint.step
     {
-        let [intent] = desired.volumes.as_slice() else {
-            anyhow::bail!("current provision recovery checkpoint requires one root Volume")
-        };
-        let observed = checkpoint
+        let mut roots = desired
             .volumes
             .iter()
-            .find(|volume| &volume.volume_id == volume_id)
-            .context("provision recovery checkpoint lacks its observed Volume")?;
-        let common_is_exact = volume_id == &intent.volume_id
-            && attachment_id == &intent.attachment_id
-            && attachment_epoch.get()
-                == match &intent.acquire {
-                    cats_api::runtime_reconciliation::VolumeAcquire::Normal {
-                        expected_unowned_epoch,
-                        ..
-                    } => expected_unowned_epoch.get().checked_add(1),
-                    cats_api::runtime_reconciliation::VolumeAcquire::Takeover { .. } => None,
-                }
-                .context("provision recovery attachment epoch overflow")?
-            && *size_bytes == intent.size_bytes
-            && boot_image_digest == &desired.runtime.boot_image_digest
-            && observed.volume_intent_id.as_ref() == Some(&intent.volume_intent_id)
-            && observed.disk_id.as_ref() == Some(&intent.disk_id)
-            && observed.size_bytes == Some(intent.size_bytes)
-            && observed.durability == Some(intent.durability)
-            && observed.devices.is_empty();
+            .filter(|intent| intent.disk_kind == cats_api::runtime_reconciliation::DiskKind::Root);
+        let intent = roots
+            .next()
+            .context("provision recovery checkpoint lacks its Root Volume")?;
         anyhow::ensure!(
-            common_is_exact,
-            "provision recovery checkpoint does not bind the exact Desired root"
+            roots.next().is_none(),
+            "provision recovery checkpoint repeats the Root Volume"
         );
         let rebound;
         let structural = if binding == DesiredCheckpointBinding::Current {
