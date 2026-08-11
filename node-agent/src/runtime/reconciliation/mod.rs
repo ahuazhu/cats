@@ -21,10 +21,6 @@ mod authorized_blockd;
 mod checkpoint;
 mod clean_slate_probes;
 mod gate_planner;
-#[expect(
-    dead_code,
-    reason = "Guest Ready proof is staged immediately before its scanner/effect composition"
-)]
 mod guest_ready;
 mod inventory;
 // Kernel NBD is the default ADR-0015 frontend and is a Host-global resource.
@@ -155,7 +151,6 @@ pub use gate_planner::{
     applied_desired_evidence, AppliedDesiredError, GateReconcileError, GateSequencer,
     GateTransitionResult, PersistTimes,
 };
-#[allow(unused_imports)]
 pub(crate) use guest_ready::{
     probe_exact_guest_ready, GuestReadyEvidence, GuestReadyTransportPort,
     PlatformGuestReadyTransportPort,

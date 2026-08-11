@@ -14,17 +14,19 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use anyhow::Context as _;
 use cats_api::runtime_reconciliation::{
     CheckpointEvidence, DesiredRuntimeSpec, Epoch, GuestTransportEvidence, Id, LifecycleAdmission,
-    NodeBootId, NodeObservation, ObservedRouteGate, ObservedRuntimeStatus, RandomId128,
-    ReconcileStep, Revision, RuntimeCheckpoint, RuntimeTarget, Sequence, Sha256Digest, StableState,
-    UnixMillis,
+    NodeBootId, NodeObservation, ObservedMount, ObservedRouteGate, ObservedRuntimeStatus,
+    RandomId128, ReadyReason, ReconcileStep, Revision, RuntimeCheckpoint, RuntimeTarget, Sequence,
+    Sha256Digest, StableState, UnixMillis,
 };
 
 use crate::runtime_spine::{RuntimeDesiredEffectContext, RuntimeDesiredEffectOutcome};
 
 use super::gate_planner::next_install_gate;
+use super::{probe_exact_guest_ready, vmm_process::ExactVmmProcessProof};
 use super::{
-    AdmissionCellObservation, AdmissionCellRegistry, AdmissionCellSession,
-    AdmissionCellSessionLookup, AdmissionSnapshot, GateSequencer, PersistTimes, StoredCheckpoint,
+    AdmissionCell, AdmissionCellObservation, AdmissionCellRegistry, AdmissionCellSession,
+    AdmissionCellSessionLookup, AdmissionSnapshot, GateSequencer, GuestReadyEvidence,
+    GuestReadyTransportPort, PersistTimes, PlatformGuestReadyTransportPort, StoredCheckpoint,
 };
 
 #[cfg(test)]
@@ -40,12 +42,28 @@ struct RunningTailReadyExpectation {
     checkpoint_content_digest: Sha256Digest,
     checkpoint: RuntimeCheckpoint,
     guest_transport: GuestTransportEvidence,
+    mounts: Vec<ObservedMount>,
     // These fields come from the private AdmissionCell/Route machine scan.
     // `bind` only checks their public projection; public routes can never
     // construct this expectation.
     cell_presence: RunningTailCellPresence,
     cell: AdmissionCellObservation,
     routes: Vec<ObservedRouteGate>,
+    physical: RunningTailPhysicalAuthority,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum RunningTailPhysicalAuthority {
+    #[allow(
+        dead_code,
+        reason = "the production Guest Ready scanner constructs this sealed variant"
+    )]
+    Exact {
+        vmm: Box<ExactVmmProcessProof>,
+        guest_ready: Box<GuestReadyEvidence>,
+    },
+    #[cfg(test)]
+    Test,
 }
 
 #[cfg_attr(
@@ -89,6 +107,125 @@ pub(crate) struct RunningTailAdmission {
 }
 
 impl RunningTailScanAdmission {
+    pub(crate) fn empty() -> Self {
+        Self {
+            ready: BTreeMap::new(),
+        }
+    }
+
+    pub(crate) fn insert_exact(
+        &mut self,
+        desired: &DesiredRuntimeSpec,
+        checkpoint: &RuntimeCheckpoint,
+        checkpoint_content_digest: Sha256Digest,
+        vmm: ExactVmmProcessProof,
+        guest_ready: GuestReadyEvidence,
+        observed_cell: Option<AdmissionCellObservation>,
+    ) -> anyhow::Result<()> {
+        let runtime_incarnation = checkpoint
+            .runtime_incarnation
+            .clone()
+            .context("Running-tail checkpoint lacks a runtime incarnation")?;
+        let launch = checkpoint
+            .runtime_launch
+            .identity()
+            .context("Running-tail checkpoint lacks retained launch authority")?;
+        anyhow::ensure!(
+            desired.target == RuntimeTarget::Running
+                && checkpoint.cat_id == desired.cat_id
+                && checkpoint.desired_revision == desired.desired_revision
+                && checkpoint.spec_digest == desired.spec_digest
+                && checkpoint.node_id == desired.placement.node_id
+                && checkpoint.placement_epoch == desired.placement.placement_epoch
+                && launch.runtime_incarnation == runtime_incarnation
+                && vmm.expectation().checkpoint() == checkpoint
+                && vmm.expectation().launch_identity() == launch
+                && matches!(
+                    guest_ready.guest_transport(),
+                    GuestTransportEvidence::VsockReady {
+                        runtime_incarnation: ready_incarnation,
+                        guest_cid,
+                        ..
+                    } if ready_incarnation == &runtime_incarnation
+                        && *guest_cid == launch.guest_cid
+                ),
+            "Running-tail physical authority conflicts with Desired/checkpoint"
+        );
+
+        let (cell_presence, cell) = match observed_cell {
+            Some(cell) => (RunningTailCellPresence::Present, cell),
+            None => {
+                let snapshot = AdmissionSnapshot::from_checkpoint(checkpoint)?.fail_closed();
+                let cell = AdmissionCell::new(snapshot)?.observe();
+                (RunningTailCellPresence::Absent, cell)
+            }
+        };
+        anyhow::ensure!(
+            cell.snapshot().applied_desired_revision() == desired.desired_revision
+                && cell.snapshot().spec_digest() == &desired.spec_digest
+                && cell.snapshot().placement() == &desired.placement
+                && cell.snapshot().runtime_incarnation() == Some(&runtime_incarnation),
+            "Running-tail AdmissionCell differs from Desired/checkpoint"
+        );
+        let routes = projected_routes(&cell);
+        let expectation = RunningTailReadyExpectation {
+            cat_id: desired.cat_id.clone(),
+            desired_revision: desired.desired_revision,
+            spec_digest: desired.spec_digest.clone(),
+            placement: desired.placement.clone(),
+            runtime_incarnation,
+            checkpoint_content_digest,
+            checkpoint: checkpoint.clone(),
+            guest_transport: guest_ready.guest_transport().clone(),
+            mounts: guest_ready.mounts().to_vec(),
+            cell_presence,
+            cell,
+            routes,
+            physical: RunningTailPhysicalAuthority::Exact {
+                vmm: Box::new(vmm),
+                guest_ready: Box::new(guest_ready),
+            },
+        };
+        anyhow::ensure!(
+            self.ready
+                .insert(desired.cat_id.clone(), expectation)
+                .is_none(),
+            "Running-tail scan repeats one Cat"
+        );
+        Ok(())
+    }
+
+    pub(crate) fn project_runtime(
+        &self,
+        runtime: &mut ObservedRuntimeStatus,
+    ) -> anyhow::Result<()> {
+        let Some(expectation) = self.ready.get(&runtime.cat_id) else {
+            return Ok(());
+        };
+        runtime.guest_transport = expectation.guest_transport.clone();
+        runtime.mounts = expectation.mounts.clone();
+        runtime.lifecycle_admission = expectation.cell.snapshot().lifecycle_admission();
+        runtime.platform_guards = expectation.cell.guards().platform_guards;
+        runtime.routes = expectation.routes.clone();
+        let checkpoint_cell = AdmissionSnapshot::from_checkpoint(&expectation.checkpoint)?;
+        if expectation.cell.snapshot() == &checkpoint_cell
+            && expectation.checkpoint.stable_state == Some(StableState::Running)
+            && matches!(
+                expectation.checkpoint.step,
+                ReconcileStep::Stable {
+                    state: StableState::Running
+                }
+            )
+        {
+            runtime.conditions = vec![cats_api::runtime_reconciliation::Condition::Ready {
+                reason: ReadyReason::PostconditionSatisfied {
+                    target: RuntimeTarget::Running,
+                },
+            }];
+        }
+        Ok(())
+    }
+
     pub(crate) fn bind(
         self,
         observation: &NodeObservation,
@@ -173,6 +310,7 @@ impl RunningTailScanAdmission {
                     && checkpoint.updated_at_unix_ms == *updated_at_unix_ms
                     && expectation.checkpoint_content_digest == *content_digest
                     && runtime.guest_transport == expectation.guest_transport
+                    && runtime.mounts == expectation.mounts
                     && matches!(
                         &runtime.guest_transport,
                         GuestTransportEvidence::VsockReady {
@@ -235,13 +373,34 @@ impl RunningTailScanAdmission {
                 checkpoint_content_digest: stored.content_digest().clone(),
                 checkpoint: stored.checkpoint().clone(),
                 guest_transport: runtime.guest_transport.clone(),
+                mounts: runtime.mounts.clone(),
                 cell_presence,
                 cell,
                 routes,
+                physical: RunningTailPhysicalAuthority::Test,
             },
         )]);
         Ok(Self { ready })
     }
+}
+
+fn projected_routes(cell: &AdmissionCellObservation) -> Vec<ObservedRouteGate> {
+    cell.snapshot()
+        .endpoints()
+        .iter()
+        .map(|route| ObservedRouteGate {
+            binding: route.binding.clone(),
+            gate: route.gate,
+            active_guards: cell
+                .guards()
+                .endpoint_guards
+                .iter()
+                .find(|count| count.endpoint_id == route.binding.endpoint_id)
+                .map_or(0, |count| count.active_guards),
+            cancellation_pending: false,
+            instance_count: 1,
+        })
+        .collect()
 }
 
 impl RunningTailAdmission {
@@ -345,6 +504,7 @@ impl RunningTailReadyAdmission {
 /// Checkpoint-first production effect over the process-owned registry.
 pub(crate) struct RunningAdmissionEffect {
     registry: Arc<AdmissionCellRegistry>,
+    guest_ready: Arc<dyn GuestReadyTransportPort>,
     #[cfg(test)]
     after_registry: Option<AfterRegistryHook>,
 }
@@ -353,6 +513,7 @@ impl RunningAdmissionEffect {
     pub(crate) fn new(registry: Arc<AdmissionCellRegistry>) -> Self {
         Self {
             registry,
+            guest_ready: Arc::new(PlatformGuestReadyTransportPort),
             #[cfg(test)]
             after_registry: None,
         }
@@ -396,23 +557,39 @@ impl RunningAdmissionEffect {
         let Some(action) = plan_running_tail_action(ready, desired, &stored)? else {
             return Ok(None);
         };
-        let times = next_persist_times(&stored)?;
+        // This is the last blocking inspection before GateSequencer's
+        // checkpoint-first local linearization. Public Guest/mount fields and
+        // a previously accepted scan can never authorize the cell by
+        // themselves.
+        ready.revalidate_physical(self.guest_ready.as_ref(), context, desired, &stored)?;
+        context.check_active()?;
         let mut port = session.cell().port();
         let result = match action {
             RunningTailAction::OpenLifecycle => {
-                GateSequencer::new(session.checkpoint_store(), &mut port)
-                    .open_admission(&stored, desired, times)?
+                let times = next_persist_times(&stored)?;
+                Some(
+                    GateSequencer::new(session.checkpoint_store(), &mut port)
+                        .open_admission(&stored, desired, times)?,
+                )
             }
-            RunningTailAction::InstallGate(endpoint_id) => GateSequencer::new(
-                session.checkpoint_store(),
-                &mut port,
-            )
-            .install_gate(&stored, desired, &endpoint_id, times)?,
+            RunningTailAction::InstallGate(endpoint_id) => {
+                let times = next_persist_times(&stored)?;
+                Some(
+                    GateSequencer::new(session.checkpoint_store(), &mut port).install_gate(
+                        &stored,
+                        desired,
+                        &endpoint_id,
+                        times,
+                    )?,
+                )
+            }
         };
-        debug_assert_eq!(
-            result.checkpoint().checkpoint().runtime_launch,
-            stored.checkpoint().runtime_launch
-        );
+        if let Some(result) = result {
+            debug_assert_eq!(
+                result.checkpoint().checkpoint().runtime_launch,
+                stored.checkpoint().runtime_launch
+            );
+        }
         // Do not re-check cancellation after the local linearization point:
         // the bounded sequencer has already resolved the exact postcondition
         // and finalized its checkpoint. The runner still discards the stale
@@ -422,6 +599,28 @@ impl RunningAdmissionEffect {
 }
 
 impl RunningTailReadyAdmission {
+    fn revalidate_physical(
+        &self,
+        port: &dyn GuestReadyTransportPort,
+        context: &RuntimeDesiredEffectContext,
+        desired: &DesiredRuntimeSpec,
+        stored: &StoredCheckpoint,
+    ) -> anyhow::Result<()> {
+        match &self.expectation.physical {
+            RunningTailPhysicalAuthority::Exact { vmm, guest_ready } => {
+                let fresh =
+                    probe_exact_guest_ready(port, context, desired, stored.checkpoint(), vmm)?;
+                anyhow::ensure!(
+                    guest_ready.same_physical_facts(&fresh),
+                    "Running-tail Guest Ready facts changed before admission"
+                );
+                Ok(())
+            }
+            #[cfg(test)]
+            RunningTailPhysicalAuthority::Test => Ok(()),
+        }
+    }
+
     fn session(
         &self,
         registry: &AdmissionCellRegistry,
@@ -487,8 +686,22 @@ fn plan_running_tail_action(
         };
     }
 
+    let checkpoint_cell = AdmissionSnapshot::from_checkpoint(checkpoint)?;
+    if cell == &checkpoint_cell.fail_closed() && cell != &checkpoint_cell {
+        anyhow::ensure!(
+            guards.platform_guards == 0 && guards.endpoint_guards.is_empty(),
+            "restart-closed Running admission still has active guards"
+        );
+        // An Agent restart is a real global close. ADR-0041 forbids
+        // republishing any previously Active or result-unknown Endpoint epoch,
+        // even after the VMM and Guest have been freshly revalidated. Keep the
+        // process-local cell closed and expose that fact in the next
+        // observation; Control must issue a fresh complete Desired with higher
+        // route epochs before this effect may install gates again.
+        return Ok(None);
+    }
+
     let Some(endpoint_id) = next_install_gate(checkpoint, desired)? else {
-        let checkpoint_cell = AdmissionSnapshot::from_checkpoint(checkpoint)?;
         anyhow::ensure!(
             checkpoint.stable_state == Some(StableState::Running)
                 && matches!(
@@ -915,6 +1128,76 @@ mod tests {
     }
 
     #[test]
+    fn stable_endpoint_checkpoint_stays_closed_after_restart_until_route_epochs_advance() {
+        let fixture = Fixture::new(2);
+        let registry = fixture.registry();
+        let effect = RunningAdmissionEffect::new(Arc::clone(&registry));
+        for _ in 0..2 {
+            assert_eq!(
+                effect
+                    .try_apply(&fixture.context(&registry, true), &fixture.desired)
+                    .expect("install the next Endpoint"),
+                Some(RuntimeDesiredEffectOutcome::RefreshInventory)
+            );
+        }
+        let checkpoint_path = runtime_checkpoint_path(
+            &fixture.root.path().join(CHECKPOINTS),
+            &fixture.desired.cat_id,
+        );
+        let stable_bytes = std::fs::read(&checkpoint_path).expect("Stable checkpoint bytes");
+        drop(effect);
+        drop(registry);
+
+        let successor = fixture.registry();
+        let successor_effect = RunningAdmissionEffect::new(Arc::clone(&successor));
+        assert_eq!(
+            successor_effect
+                .try_apply(&fixture.context(&successor, true), &fixture.desired)
+                .expect("old Endpoint epochs remain fail-closed after restart"),
+            None
+        );
+        let closed = successor
+            .get(&fixture.desired.cat_id)
+            .expect("restart-closed AdmissionCell")
+            .snapshot();
+        assert_eq!(closed.lifecycle_admission(), LifecycleAdmission::Closed);
+        assert_eq!(closed.endpoints().len(), 2);
+        assert!(closed
+            .endpoints()
+            .iter()
+            .all(|route| route.gate == RouteGateState::Closed));
+        assert_eq!(
+            std::fs::read(checkpoint_path).expect("checkpoint after local restore"),
+            stable_bytes,
+            "fail-closing the process-local cell must not rewrite durable authority"
+        );
+        assert_eq!(
+            successor_effect
+                .try_apply(&fixture.context(&successor, true), &fixture.desired)
+                .expect("old Endpoint epoch replay stays closed"),
+            None
+        );
+        let restart_scan = fixture.scan(&successor);
+        let sealed = RunningTailScanAdmission::for_test_from_authorities(
+            &restart_scan.observation,
+            &restart_scan.stored,
+            restart_scan.cell_presence,
+            restart_scan.cell,
+            restart_scan.routes,
+        )
+        .expect("sealed restart-closed scan");
+        let mut projected = restart_scan.observation.runtimes[0].clone();
+        sealed
+            .project_runtime(&mut projected)
+            .expect("project restart-closed Running tail");
+        assert_eq!(projected.lifecycle_admission, LifecycleAdmission::Closed);
+        assert!(!projected.conditions.iter().any(|condition| matches!(
+            condition,
+            cats_api::runtime_reconciliation::Condition::Ready { .. }
+        )));
+    }
+
+    #[test]
     fn second_gate_response_loss_replay_finalizes_without_reapplying_either_gate() {
         let fixture = Fixture::new(2);
         let registry = fixture.registry();
@@ -1154,6 +1437,18 @@ mod tests {
             authority.routes.clone(),
         )
         .expect("sealed routed scan");
+        let mut projected = authority.observation.runtimes[0].clone();
+        scan.clone()
+            .project_runtime(&mut projected)
+            .expect("project exact Stable Running tail");
+        assert!(matches!(
+            projected.conditions.as_slice(),
+            [cats_api::runtime_reconciliation::Condition::Ready {
+                reason: ReadyReason::PostconditionSatisfied {
+                    target: RuntimeTarget::Running
+                }
+            }]
+        ));
         let mut pending_routes = authority.routes.clone();
         pending_routes[0].cancellation_pending = true;
         let mut pending_observation = authority.observation.clone();
