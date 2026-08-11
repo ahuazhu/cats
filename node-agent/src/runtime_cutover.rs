@@ -30,7 +30,7 @@ use cats_storage::BlobStore;
 use crate::agent_registration::AgentRegistrationConfig;
 use crate::ch::{BlockPath, ChConfig};
 use crate::runtime::reconciliation::{
-    installed_clean_slate_scanner, installed_root_process_effect_ports,
+    installed_clean_slate_scanner, installed_root_process_effect_ports, AdmissionCellRegistry,
     AuthorizedBlockdLaunchConfig, ControlSignedNormalAcquireClient, InstalledCleanSlateProbeConfig,
     KernelNbdClientCleanupOwner, KernelNbdInventoryConfig, RootProvisionSystemdConfig,
     RuntimeVolumeTransitionHttpClient, ServingPrepareFrontend, SignedRunningAcquireEffect,
@@ -325,6 +325,7 @@ async fn spawn_signed_runtime_cutover_with_overrides(
     let effect_blob_store = Arc::clone(&config.blob_store);
     let effect_lease_duration_ms = config.volume_lease_duration_ms;
     let effect_state_directory = config.agent_registration.runtime_state_directory();
+    let admission_registry = AdmissionCellRegistry::for_state_directory(&effect_state_directory);
     let effect_network_ip_binary = config.ch_config.ip_bin.clone();
     let effect_kernel_nbd_inventory = kernel_nbd_inventory;
     let effect_kernel_nbd_cleanup_owner = Arc::clone(&kernel_nbd_cleanup_owner);
@@ -379,6 +380,7 @@ async fn spawn_signed_runtime_cutover_with_overrides(
                 Arc::clone(&effect_root_process_ports.vmm_cid),
             ),
             effect_prepare_frontend,
+            admission_registry,
         )
         .context("compose signed Running root provision prefix")?;
         let recovery = SignedRunningPublicationRecovery::new(Arc::clone(&effect_volume_authority));

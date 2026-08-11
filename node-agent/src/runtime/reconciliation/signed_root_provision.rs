@@ -217,6 +217,7 @@ impl SignedRunningEffect {
         host: SignedRunningHostConfig,
         process_ports: SignedRunningProcessPorts,
         prepare_frontend: ServingPrepareFrontend,
+        admission_registry: Arc<AdmissionCellRegistry>,
     ) -> anyhow::Result<Self> {
         let SignedRunningHostConfig {
             systemd,
@@ -258,9 +259,7 @@ impl SignedRunningEffect {
             Arc::clone(&authority),
             Arc::clone(&process_ports.serving_global),
         )?);
-        let running_admission = RunningAdmissionEffect::new(AdmissionCellRegistry::new(
-            state_directory.path().join(CHECKPOINT_NAMESPACE),
-        ));
+        let running_admission = RunningAdmissionEffect::new(admission_registry);
         let start_runtime = StartRuntimeReservationEffect::platform(
             state_directory.clone(),
             vmm_launch_artifacts.clone(),

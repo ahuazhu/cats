@@ -14,6 +14,9 @@ use std::sync::{Arc, Mutex, MutexGuard};
 use cats_api::runtime_reconciliation::Id;
 use thiserror::Error;
 
+use crate::state_directory::StateDirectory;
+
+use super::clean_slate_probes::CHECKPOINT_NAMESPACE;
 use super::{
     AdmissionCell, AdmissionCellBuildError, AdmissionSnapshot, CheckpointStoreError,
     FileCheckpointStore,
@@ -80,6 +83,10 @@ pub(crate) struct AdmissionCellRegistry {
 }
 
 impl AdmissionCellRegistry {
+    pub(crate) fn for_state_directory(state_directory: &StateDirectory) -> Arc<Self> {
+        Self::new(state_directory.path().join(CHECKPOINT_NAMESPACE))
+    }
+
     pub(crate) fn new(checkpoint_directory: PathBuf) -> Arc<Self> {
         Arc::new(Self {
             checkpoint_directory,
