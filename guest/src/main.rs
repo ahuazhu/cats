@@ -5,7 +5,7 @@ use std::sync::Arc;
 use anyhow::{Context, Result};
 use clap::Parser;
 
-use cats_api::guest::GUEST_RUNTIME_SOCKET_PATH;
+use cats_api::guest::{GUEST_HOST_CONTROL_VSOCK_PORT_V1, GUEST_RUNTIME_SOCKET_PATH};
 use cats_guest_agent::{bind_vsock, GuestAgent, GuestMode};
 
 #[derive(Parser, Debug)]
@@ -113,6 +113,12 @@ fn main() -> Result<()> {
             agent.serve_control(listener);
         }
         (None, Some(port)) => {
+            anyhow::ensure!(is_vm, "AF_VSOCK host control requires --mode vm");
+            anyhow::ensure!(
+                port == GUEST_HOST_CONTROL_VSOCK_PORT_V1,
+                "Guest host-control V1 requires fixed AF_VSOCK port {}",
+                GUEST_HOST_CONTROL_VSOCK_PORT_V1
+            );
             let listener = bind_vsock(port).context("bind vsock control port")?;
             println!("READY");
             agent.serve_vsock_control(listener)?;
