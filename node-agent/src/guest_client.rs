@@ -3,7 +3,7 @@
 
 use std::os::unix::net::UnixStream;
 use std::path::Path;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use anyhow::{bail, Context, Result};
 
@@ -75,19 +75,33 @@ impl GuestClient {
     /// Connect with one caller-supplied bound covering both sides of the mux
     /// handshake. Fresh inventory uses its remaining scan deadline here.
     pub fn connect_hybrid_vsock_bounded(path: &Path, port: u32, timeout: Duration) -> Result<Self> {
-        use std::io::Write;
-
         anyhow::ensure!(
             port > 0 && port < u32::MAX,
             "vsock destination port is outside the canonical range"
         );
         anyhow::ensure!(!timeout.is_zero(), "vsock handshake timeout is zero");
-        let mut stream = UnixStream::connect(path)
+        let deadline = Instant::now()
+            .checked_add(timeout)
+            .context("vsock handshake deadline overflow")?;
+        let mut stream = connect_unix_before(path, deadline)
             .with_context(|| format!("connect vsock mux at {}", path.display()))?;
+        write_all_before(
+            &mut stream,
+            format!("CONNECT {port}\n").as_bytes(),
+            deadline,
+        )
+        .context("vsock handshake write")?;
+        let hybrid_assigned_port = read_hybrid_vsock_ack_before(&mut stream, deadline)?;
+        ensure_before(deadline)?;
+
+        // The connect and mux handshake stay nonblocking so one absolute
+        // deadline covers every wait. The established Guest stream preserves
+        // the blocking and timeout behavior all existing callers rely on.
+        stream
+            .set_nonblocking(false)
+            .context("restore blocking Guest stream")?;
         stream.set_read_timeout(Some(timeout))?;
         stream.set_write_timeout(Some(timeout))?;
-        stream.write_all(format!("CONNECT {port}\n").as_bytes())?;
-        let hybrid_assigned_port = read_hybrid_vsock_ack(&mut stream)?;
         Ok(Self {
             stream,
             next_id: 1,
@@ -317,27 +331,295 @@ impl GuestClient {
 
 const MAX_HYBRID_VSOCK_ACK_BYTES: usize = 32;
 
+fn connect_unix_before(path: &Path, deadline: Instant) -> Result<UnixStream> {
+    use std::mem::offset_of;
+    use std::os::fd::{AsRawFd as _, FromRawFd as _};
+    use std::os::unix::ffi::OsStrExt as _;
+
+    ensure_before(deadline)?;
+    let path_bytes = path.as_os_str().as_bytes();
+    // SAFETY: all-zero is a valid initial sockaddr_un. The family, optional
+    // BSD length and complete pathname are initialized before connect reads it.
+    let mut address: libc::sockaddr_un = unsafe { std::mem::zeroed() };
+    anyhow::ensure!(
+        !path_bytes.is_empty()
+            && path_bytes.len() < address.sun_path.len()
+            && !path_bytes.contains(&0),
+        "vsock mux path is outside the Unix socket address range"
+    );
+    let address_length = offset_of!(libc::sockaddr_un, sun_path)
+        .checked_add(path_bytes.len())
+        .and_then(|length| length.checked_add(1))
+        .context("vsock mux address length overflow")?;
+    address.sun_family = libc::AF_UNIX as libc::sa_family_t;
+    #[cfg(any(
+        target_os = "macos",
+        target_os = "ios",
+        target_os = "freebsd",
+        target_os = "netbsd",
+        target_os = "openbsd",
+        target_os = "dragonfly"
+    ))]
+    {
+        address.sun_len =
+            u8::try_from(address_length).context("vsock mux address exceeds BSD range")?;
+    }
+    for (target, source) in address.sun_path.iter_mut().zip(path_bytes.iter().copied()) {
+        *target = source as libc::c_char;
+    }
+    let address_length = libc::socklen_t::try_from(address_length)
+        .context("vsock mux address exceeds socket range")?;
+
+    let socket_type = libc::SOCK_STREAM;
+    #[cfg(target_os = "linux")]
+    let socket_type = socket_type | libc::SOCK_CLOEXEC | libc::SOCK_NONBLOCK;
+    // SAFETY: socket returns a fresh descriptor and retains no Rust memory.
+    let descriptor = unsafe { libc::socket(libc::AF_UNIX, socket_type, 0) };
+    if descriptor < 0 {
+        return Err(std::io::Error::last_os_error()).context("create nonblocking vsock mux socket");
+    }
+    #[cfg(not(target_os = "linux"))]
+    if let Err(error) = set_descriptor_nonblocking_and_cloexec(descriptor) {
+        // SAFETY: ownership of the fresh descriptor has not moved.
+        unsafe { libc::close(descriptor) };
+        return Err(error).context("configure nonblocking vsock mux socket");
+    }
+    // SAFETY: ownership of the fresh descriptor moves into UnixStream once.
+    let stream = unsafe { UnixStream::from_raw_fd(descriptor) };
+
+    loop {
+        ensure_before(deadline)?;
+        // SAFETY: stream owns a live AF_UNIX descriptor; address is fully
+        // initialized and neither pointer is retained after this call.
+        let result = unsafe {
+            libc::connect(
+                stream.as_raw_fd(),
+                (&raw const address).cast::<libc::sockaddr>(),
+                address_length,
+            )
+        };
+        if result == 0 {
+            return Ok(stream);
+        }
+        let error = std::io::Error::last_os_error();
+        match error.raw_os_error() {
+            Some(libc::EINTR) => continue,
+            Some(libc::EISCONN) => return Ok(stream),
+            Some(code) if code == libc::EAGAIN || code == libc::EWOULDBLOCK => {
+                // Linux AF_UNIX reports a full listener backlog as EAGAIN
+                // without arming an asynchronous connect. Retry at a bounded
+                // cadence rather than spinning on an always-writable socket.
+                wait_before_retry(deadline)?;
+            }
+            Some(libc::EINPROGRESS) | Some(libc::EALREADY) => {
+                poll_before(&stream, libc::POLLOUT, deadline)?;
+                match socket_error_before(&stream, deadline)? {
+                    0 => return Ok(stream),
+                    libc::EINTR | libc::EINPROGRESS | libc::EALREADY => {}
+                    code if code == libc::EAGAIN || code == libc::EWOULDBLOCK => {
+                        wait_before_retry(deadline)?;
+                    }
+                    code => {
+                        return Err(std::io::Error::from_raw_os_error(code))
+                            .context("complete nonblocking vsock mux connect")
+                    }
+                }
+            }
+            _ => return Err(error).context("start nonblocking vsock mux connect"),
+        }
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+fn set_descriptor_nonblocking_and_cloexec(descriptor: libc::c_int) -> std::io::Result<()> {
+    // SAFETY: descriptor is live and these fcntl operations only read or
+    // replace its integer status/descriptor flags.
+    let status = unsafe { libc::fcntl(descriptor, libc::F_GETFL) };
+    if status < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    // SAFETY: descriptor remains live and F_SETFL consumes only the status
+    // flags read immediately above.
+    let set_status = unsafe { libc::fcntl(descriptor, libc::F_SETFL, status | libc::O_NONBLOCK) };
+    if set_status < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    // SAFETY: same live descriptor; preserve any existing descriptor flags.
+    let descriptor_flags = unsafe { libc::fcntl(descriptor, libc::F_GETFD) };
+    if descriptor_flags < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    // SAFETY: descriptor remains live and F_SETFD consumes only the descriptor
+    // flags read immediately above.
+    let set_descriptor = unsafe {
+        libc::fcntl(
+            descriptor,
+            libc::F_SETFD,
+            descriptor_flags | libc::FD_CLOEXEC,
+        )
+    };
+    if set_descriptor < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(())
+}
+
+fn socket_error_before(stream: &UnixStream, deadline: Instant) -> Result<libc::c_int> {
+    use std::mem::size_of;
+    use std::os::fd::AsRawFd as _;
+
+    loop {
+        ensure_before(deadline)?;
+        let mut error = 0_i32;
+        let mut length = size_of::<i32>() as libc::socklen_t;
+        // SAFETY: error and length are valid writable scalar storage and the
+        // stream retains ownership of its live descriptor.
+        let result = unsafe {
+            libc::getsockopt(
+                stream.as_raw_fd(),
+                libc::SOL_SOCKET,
+                libc::SO_ERROR,
+                (&raw mut error).cast(),
+                &raw mut length,
+            )
+        };
+        if result == 0 {
+            anyhow::ensure!(
+                length as usize == size_of::<i32>(),
+                "vsock mux SO_ERROR returned a malformed length"
+            );
+            return Ok(error);
+        }
+        let error = std::io::Error::last_os_error();
+        if error.kind() != std::io::ErrorKind::Interrupted {
+            return Err(error).context("read nonblocking vsock mux connect result");
+        }
+    }
+}
+
+fn write_all_before(stream: &mut UnixStream, mut bytes: &[u8], deadline: Instant) -> Result<()> {
+    use std::io::Write as _;
+
+    while !bytes.is_empty() {
+        ensure_before(deadline)?;
+        match stream.write(bytes) {
+            Ok(0) => bail!("vsock handshake closed during write"),
+            Ok(written) => bytes = &bytes[written..],
+            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {}
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                poll_before(stream, libc::POLLOUT, deadline)?;
+            }
+            Err(error) => return Err(error).context("write nonblocking vsock handshake"),
+        }
+    }
+    Ok(())
+}
+
 /// Read exactly through the first LF, one byte at a time. A buffered reader
 /// can consume bytes from the following Guest frame and silently lose them
 /// when it is dropped after the handshake.
-fn read_hybrid_vsock_ack(stream: &mut UnixStream) -> Result<u32> {
-    use std::io::Read;
+fn read_hybrid_vsock_ack_before(stream: &mut UnixStream, deadline: Instant) -> Result<u32> {
+    use std::io::Read as _;
 
     let mut bytes = Vec::with_capacity(MAX_HYBRID_VSOCK_ACK_BYTES);
     loop {
+        ensure_before(deadline)?;
         anyhow::ensure!(
             bytes.len() < MAX_HYBRID_VSOCK_ACK_BYTES,
             "vsock handshake exceeds its byte bound"
         );
         let mut byte = [0_u8; 1];
-        stream
-            .read_exact(&mut byte)
-            .context("vsock handshake read")?;
-        bytes.push(byte[0]);
-        if byte[0] == b'\n' {
-            return parse_hybrid_vsock_ack(&bytes);
+        match stream.read(&mut byte) {
+            Ok(0) => bail!("vsock handshake closed before its ACK"),
+            Ok(_) => {
+                bytes.push(byte[0]);
+                if byte[0] == b'\n' {
+                    ensure_before(deadline)?;
+                    return parse_hybrid_vsock_ack(&bytes);
+                }
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {}
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                poll_before(stream, libc::POLLIN, deadline)?;
+            }
+            Err(error) => return Err(error).context("read nonblocking vsock handshake"),
         }
     }
+}
+
+fn poll_before(stream: &UnixStream, events: libc::c_short, deadline: Instant) -> Result<()> {
+    use std::os::fd::AsRawFd as _;
+
+    loop {
+        let timeout = poll_timeout_before(deadline)?;
+        let mut descriptor = libc::pollfd {
+            fd: stream.as_raw_fd(),
+            events,
+            revents: 0,
+        };
+        // SAFETY: descriptor points to one initialized pollfd for this call.
+        let result = unsafe { libc::poll(&raw mut descriptor, 1, timeout) };
+        if result > 0 {
+            anyhow::ensure!(
+                descriptor.revents & libc::POLLNVAL == 0,
+                "vsock mux descriptor became invalid"
+            );
+            return Ok(());
+        }
+        if result == 0 {
+            ensure_before(deadline)?;
+            continue;
+        }
+        let error = std::io::Error::last_os_error();
+        if error.kind() != std::io::ErrorKind::Interrupted {
+            return Err(error).context("poll nonblocking vsock mux socket");
+        }
+    }
+}
+
+fn wait_before_retry(deadline: Instant) -> Result<()> {
+    loop {
+        let remaining = deadline
+            .checked_duration_since(Instant::now())
+            .filter(|remaining| !remaining.is_zero())
+            .context("vsock handshake deadline expired")?;
+        let timeout = duration_to_poll_timeout(remaining.min(Duration::from_millis(5)));
+        // SAFETY: a null descriptor array with zero entries is the portable
+        // poll form of a signal-interruptible bounded wait.
+        let result = unsafe { libc::poll(std::ptr::null_mut(), 0, timeout) };
+        if result == 0 {
+            return ensure_before(deadline);
+        }
+        if result < 0 && std::io::Error::last_os_error().kind() == std::io::ErrorKind::Interrupted {
+            ensure_before(deadline)?;
+            continue;
+        }
+        anyhow::bail!("poll retry wait returned an invalid result");
+    }
+}
+
+fn poll_timeout_before(deadline: Instant) -> Result<libc::c_int> {
+    let remaining = deadline
+        .checked_duration_since(Instant::now())
+        .filter(|remaining| !remaining.is_zero())
+        .context("vsock handshake deadline expired")?;
+    Ok(duration_to_poll_timeout(remaining))
+}
+
+fn duration_to_poll_timeout(duration: Duration) -> libc::c_int {
+    let milliseconds = duration.as_millis();
+    let rounded = milliseconds.saturating_add(u128::from(
+        !duration.subsec_nanos().is_multiple_of(1_000_000),
+    ));
+    i32::try_from(rounded.min(i32::MAX as u128)).unwrap_or(i32::MAX)
+}
+
+fn ensure_before(deadline: Instant) -> Result<()> {
+    anyhow::ensure!(
+        Instant::now() < deadline,
+        "vsock handshake deadline expired"
+    );
+    Ok(())
 }
 
 fn parse_hybrid_vsock_ack(bytes: &[u8]) -> Result<u32> {
@@ -367,8 +649,12 @@ fn parse_hybrid_vsock_ack(bytes: &[u8]) -> Result<u32> {
 
 #[cfg(test)]
 mod tests {
+    use std::os::fd::AsRawFd as _;
     use std::os::unix::net::UnixListener;
     use std::thread;
+    use std::time::Duration;
+    #[cfg(target_os = "linux")]
+    use std::time::Instant;
 
     use cats_api::guest::{
         read_frame, read_guest_request_frame, write_frame, write_runtime_ready_response_frame,
@@ -377,6 +663,8 @@ mod tests {
     };
     use cats_api::runtime_reconciliation::{GuestBootId, RandomId128};
 
+    #[cfg(target_os = "linux")]
+    use super::connect_unix_before;
     use super::{parse_hybrid_vsock_ack, GuestClient};
 
     #[test]
@@ -430,14 +718,90 @@ mod tests {
                 },
             )
             .unwrap();
+            let request: GuestRequest = read_frame(&mut server).unwrap();
+            assert_eq!(request.id, 1);
+            assert!(matches!(request.body, GuestRequestBody::Health));
         });
 
-        let mut client = GuestClient::connect_hybrid_vsock(&path, 5_000).unwrap();
+        let timeout = Duration::from_secs(2);
+        let mut client = GuestClient::connect_hybrid_vsock_bounded(&path, 5_000, timeout).unwrap();
         assert_eq!(client.hybrid_assigned_port(), Some(1_073_741_824));
+        // SAFETY: the client owns a live descriptor and F_GETFL only reads its
+        // integer status flags.
+        let status = unsafe { libc::fcntl(client.stream.as_raw_fd(), libc::F_GETFL) };
+        assert!(status >= 0);
+        assert_eq!(status & libc::O_NONBLOCK, 0);
+        assert_eq!(client.stream.read_timeout().unwrap(), Some(timeout));
+        assert_eq!(client.stream.write_timeout().unwrap(), Some(timeout));
         assert_eq!(
             client.health().unwrap(),
             ("11111111111111111111111111111111".into(), Vec::new())
         );
+        peer.join().unwrap();
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn bounded_hybrid_connect_expires_while_listener_backlog_is_saturated() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("full.sock");
+        let listener = UnixListener::bind(&path).unwrap();
+        // Linux permits updating the backlog of an existing listener. Keep it
+        // tiny so saturation does not depend on the host's `somaxconn`.
+        // SAFETY: listener owns a live AF_UNIX listening descriptor.
+        assert_eq!(unsafe { libc::listen(listener.as_raw_fd(), 1) }, 0);
+        let (accepted_tx, accepted_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let peer = thread::spawn(move || {
+            let accepted = listener.accept().unwrap().0;
+            accepted_tx.send(()).unwrap();
+            release_rx.recv().unwrap();
+            drop(accepted);
+            drop(listener);
+        });
+
+        let first = connect_unix_before(&path, Instant::now() + Duration::from_secs(1)).unwrap();
+        accepted_rx.recv().unwrap();
+        let mut fillers = vec![first];
+        let mut saturated = false;
+        // Never accepting eventually fills the platform listener queue. Every
+        // filler uses the same bounded nonblocking primitive, so the first
+        // deadline is a positive proof that the queue is saturated without a
+        // setup thread that can itself hang.
+        for _ in 0..16 {
+            let deadline = Instant::now() + Duration::from_millis(100);
+            match connect_unix_before(&path, deadline) {
+                Ok(stream) => fillers.push(stream),
+                Err(error) if format!("{error:#}").contains("vsock handshake deadline expired") => {
+                    saturated = true;
+                    break;
+                }
+                Err(error) => panic!("unexpected backlog filler error: {error:#}"),
+            }
+        }
+        assert!(saturated, "listener backlog did not saturate");
+        assert!(!fillers.is_empty());
+
+        let timeout = Duration::from_millis(50);
+        let started = Instant::now();
+        let error = match GuestClient::connect_hybrid_vsock_bounded(&path, 5_000, timeout) {
+            Ok(_) => panic!("a full listener backlog must not connect"),
+            Err(error) => error,
+        };
+        let elapsed = started.elapsed();
+        let error = format!("{error:#}");
+        assert!(error.contains("connect vsock mux"), "{error}");
+        assert!(
+            error.contains("vsock handshake deadline expired"),
+            "{error}"
+        );
+        assert!(
+            elapsed >= timeout && elapsed < Duration::from_secs(1),
+            "bounded connect returned after {elapsed:?}"
+        );
+
+        drop(fillers);
+        release_tx.send(()).unwrap();
         peer.join().unwrap();
     }
 
