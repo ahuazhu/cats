@@ -556,6 +556,7 @@ pub(crate) struct RetainedManagedVmmLaunchResidue {
     quarantine_name: CString,
     directory: File,
     directory_identity: LaunchDirectoryIdentity,
+    leaf_identities: std::collections::BTreeMap<String, LaunchLeafIdentity>,
     marker_bytes: Vec<u8>,
     location: LaunchResidueLocation,
 }
@@ -585,11 +586,13 @@ impl RetainedManagedVmmLaunchResidue {
         if names.contains(VMM_LAUNCH_OWNER_BASENAME) {
             verify_launch_owner_marker(&directory, &marker_bytes)?;
         }
+        let leaf_identities = launch_attempt_leaf_identities(&directory, &names)?;
         Ok(Self {
             root,
             public_name,
             quarantine_name,
             directory_identity: LaunchDirectoryIdentity::from_metadata(&directory.metadata()?),
+            leaf_identities,
             directory,
             marker_bytes,
             location,
@@ -670,15 +673,17 @@ impl RetainedManagedVmmLaunchResidue {
             (VMM_LOG_BASENAME, LaunchCleanupBoundary::BeforeVmmLog),
         ] {
             before_boundary(boundary)?;
-            if open_launch_leaf(&self.directory, leaf)?.is_none() {
+            self.assert_cleanup_leaf(leaf)?;
+            let Some(_) = self.leaf_identities.get(leaf) else {
                 continue;
-            }
+            };
             unlink_isolated_launch_leaf(&self.directory, leaf)?;
             self.directory.sync_all()?;
             authority.assert_for(&self.root, checkpoint)?;
         }
         before_boundary(LaunchCleanupBoundary::BeforeMarker)?;
-        if open_launch_leaf(&self.directory, VMM_LAUNCH_OWNER_BASENAME)?.is_some() {
+        self.assert_cleanup_leaf(VMM_LAUNCH_OWNER_BASENAME)?;
+        if self.leaf_identities.contains_key(VMM_LAUNCH_OWNER_BASENAME) {
             verify_launch_owner_marker(&self.directory, &self.marker_bytes)?;
             unlink_isolated_launch_leaf(&self.directory, VMM_LAUNCH_OWNER_BASENAME)?;
             self.directory.sync_all()?;
@@ -698,6 +703,18 @@ impl RetainedManagedVmmLaunchResidue {
         remove_isolated_launch_directory(&self.root.descriptor, &self.quarantine_name)?;
         self.root.descriptor.sync_all()?;
         authority.assert_for(&self.root, checkpoint)
+    }
+
+    fn assert_cleanup_leaf(&self, name: &str) -> Result<()> {
+        let current = match open_launch_leaf(&self.directory, name)? {
+            Some(leaf) => Some(LaunchLeafIdentity::from_metadata(&leaf.metadata()?)),
+            None => None,
+        };
+        anyhow::ensure!(
+            current.as_ref() == self.leaf_identities.get(name),
+            "quarantined VMM launch leaf {name} changed before cleanup"
+        );
+        Ok(())
     }
 
     fn assert_current(&self) -> Result<()> {
@@ -725,6 +742,10 @@ impl RetainedManagedVmmLaunchResidue {
         );
         let names = launch_attempt_names(&self.directory)?;
         validate_launch_attempt_entries(&self.directory, &names)?;
+        anyhow::ensure!(
+            launch_attempt_leaf_identities(&self.directory, &names)? == self.leaf_identities,
+            "retained VMM launch residue leaf identity changed"
+        );
         if names.contains(VMM_LAUNCH_OWNER_BASENAME) {
             verify_launch_owner_marker(&self.directory, &self.marker_bytes)?;
         } else {
@@ -1023,6 +1044,24 @@ fn validate_launch_attempt_entries(
         );
     }
     Ok(())
+}
+
+#[cfg(target_os = "linux")]
+fn launch_attempt_leaf_identities(
+    directory: &File,
+    names: &std::collections::BTreeSet<String>,
+) -> Result<std::collections::BTreeMap<String, LaunchLeafIdentity>> {
+    names
+        .iter()
+        .map(|name| {
+            let leaf = open_launch_leaf(directory, name)?
+                .with_context(|| format!("VMM launch leaf {name} disappeared"))?;
+            Ok((
+                name.clone(),
+                LaunchLeafIdentity::from_metadata(&leaf.metadata()?),
+            ))
+        })
+        .collect()
 }
 
 #[cfg(target_os = "linux")]
@@ -2692,6 +2731,111 @@ mod tests {
             ]
         );
         assert!(!Path::new(paths.directory().as_str()).exists());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn quarantined_leaf_replacement_is_preserved_at_every_cleanup_boundary() {
+        for boundary in [
+            LaunchCleanupBoundary::AfterQuarantine,
+            LaunchCleanupBoundary::BeforeMemory,
+            LaunchCleanupBoundary::BeforeSerialLog,
+            LaunchCleanupBoundary::BeforeVmmLog,
+            LaunchCleanupBoundary::BeforeMarker,
+            LaunchCleanupBoundary::BeforeDirectory,
+        ] {
+            let fixture = LaunchFixture::new();
+            fixture.receipt_store.publish(&fixture.receipt).unwrap();
+            let _ready = match fixture.prepare() {
+                ManagedVmmLaunchPreparation::Ready(ready) => ready,
+                _ => panic!("fresh launch attempt was not ready"),
+            };
+            let paths = ManagedVmmLaunchFilePaths::paths_from_checkpoint(
+                fixture.launch_root.state_directory(),
+                &fixture.checkpoint,
+            )
+            .unwrap();
+            for path in [
+                paths.memory_file_path(),
+                paths.serial_log_path(),
+                paths.vmm_log_path(),
+            ] {
+                std::fs::OpenOptions::new()
+                    .write(true)
+                    .create_new(true)
+                    .mode(0o600)
+                    .open(path.as_str())
+                    .unwrap();
+            }
+            let residue = match fixture.prepare() {
+                ManagedVmmLaunchPreparation::Residue(residue) => *residue,
+                _ => panic!("launch residue was not retained"),
+            };
+            let guard = fixture
+                .launch_root
+                .try_lock_effect_namespace()
+                .unwrap()
+                .unwrap();
+            let authority = guard
+                .bind_fresh_absence(fixture.absence(), &fixture.checkpoint)
+                .unwrap();
+            let public = PathBuf::from(paths.directory().as_str());
+            let quarantine_name = quarantine_attempt_name(&launch_attempt_name(&paths).unwrap())
+                .unwrap()
+                .into_string()
+                .unwrap();
+            let quarantine = public.parent().unwrap().join(quarantine_name);
+            let leaf = match boundary {
+                LaunchCleanupBoundary::AfterQuarantine
+                | LaunchCleanupBoundary::BeforeMemory
+                | LaunchCleanupBoundary::BeforeDirectory => VMM_MEMORY_BASENAME,
+                LaunchCleanupBoundary::BeforeSerialLog => VMM_SERIAL_LOG_BASENAME,
+                LaunchCleanupBoundary::BeforeVmmLog => VMM_LOG_BASENAME,
+                LaunchCleanupBoundary::BeforeMarker => VMM_LAUNCH_OWNER_BASENAME,
+                LaunchCleanupBoundary::BeforeQuarantine => unreachable!(),
+            };
+            let replacement = quarantine.join(leaf);
+            let saved = fixture
+                ._temporary
+                .path()
+                .join(format!("saved-{}", leaf.replace('.', "-")));
+            let replacement_bytes = if leaf == VMM_LAUNCH_OWNER_BASENAME {
+                fixture.receipt.encoded_bytes().unwrap()
+            } else {
+                b"foreign replacement".to_vec()
+            };
+            let mut replaced_existing = false;
+            let error = residue
+                .recover_with_boundaries(&authority, &fixture.checkpoint, |current| {
+                    if current == boundary {
+                        if replacement.exists() {
+                            std::fs::rename(&replacement, &saved)?;
+                            replaced_existing = true;
+                        }
+                        let mut file = std::fs::OpenOptions::new()
+                            .write(true)
+                            .create_new(true)
+                            .mode(0o600)
+                            .open(&replacement)?;
+                        file.write_all(&replacement_bytes)?;
+                        file.sync_all()?;
+                    }
+                    Ok(())
+                })
+                .expect_err("a quarantined leaf replacement reached unlink");
+            assert!(
+                error.to_string().contains("changed before cleanup")
+                    || error
+                        .to_string()
+                        .contains("remove empty VMM launch quarantine"),
+                "{boundary:?}: {error:#}"
+            );
+            assert_eq!(std::fs::read(&replacement).unwrap(), replacement_bytes);
+            if boundary != LaunchCleanupBoundary::BeforeDirectory {
+                assert!(replaced_existing, "{boundary:?}");
+                assert!(saved.is_file(), "{boundary:?}");
+            }
+        }
     }
 
     #[cfg(target_os = "linux")]
