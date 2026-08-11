@@ -420,6 +420,37 @@ impl VmmSocketOwnershipReceiptV1 {
         &self.vsock_socket_path
     }
 
+    pub(crate) fn validate_launch_paths(
+        &self,
+        checkpoint: &RuntimeCheckpoint,
+        state_directory: &StateDirectory,
+        paths: &ManagedVmmLaunchFilePaths,
+    ) -> anyhow::Result<()> {
+        let ReconcileStep::StartRuntime {
+            runtime_incarnation,
+            ..
+        } = &checkpoint.step
+        else {
+            anyhow::bail!("VMM launch receipt requires StartRuntime")
+        };
+        anyhow::ensure!(
+            self.node_id == checkpoint.node_id
+                && self.cat_id == checkpoint.cat_id
+                && self.desired_revision == checkpoint.desired_revision
+                && self.spec_digest == checkpoint.spec_digest
+                && self.placement_epoch == checkpoint.placement_epoch
+                && self.checkpoint_content_digest == checkpoint_content_digest(checkpoint)?
+                && &self.runtime_incarnation == runtime_incarnation
+                && &self.memory_file_path == paths.memory_file_path()
+                && &self.serial_log_path == paths.serial_log_path()
+                && &self.vmm_log_path == paths.vmm_log_path()
+                && ManagedVmmLaunchFilePaths::paths_from_checkpoint(state_directory, checkpoint)?
+                    == *paths,
+            "VMM launch receipt is not checkpoint-exact"
+        );
+        Ok(())
+    }
+
     pub(crate) fn encoded_bytes(&self) -> anyhow::Result<Vec<u8>> {
         encode_receipt(self)
     }
@@ -617,6 +648,26 @@ fn scan_managed_vmm_socket_root_linux(
     expected_checkpoints: &[&RuntimeCheckpoint],
     context: &dyn crate::runtime_spine::RuntimePhysicalReadContext,
 ) -> anyhow::Result<ManagedVmmSocketRootScan> {
+    scan_managed_vmm_socket_root_linux_inner(root, receipts, expected_checkpoints, context, |_| {
+        Ok(())
+    })
+}
+
+#[cfg(target_os = "linux")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ReceiptScanPoint {
+    FirstSnapshotCaptured,
+    AttemptsScanned,
+}
+
+#[cfg(target_os = "linux")]
+fn scan_managed_vmm_socket_root_linux_inner(
+    root: &RetainedManagedVmmSocketRoot,
+    receipts: &VmmSocketReceiptStore,
+    expected_checkpoints: &[&RuntimeCheckpoint],
+    context: &dyn crate::runtime_spine::RuntimePhysicalReadContext,
+    mut hook: impl FnMut(ReceiptScanPoint) -> anyhow::Result<()>,
+) -> anyhow::Result<ManagedVmmSocketRootScan> {
     context.check_active()?;
     if root.assert_current().is_err()
         || receipts.assert_current().is_err()
@@ -633,6 +684,7 @@ fn scan_managed_vmm_socket_root_linux(
                 return Ok(ManagedVmmSocketRootScan::Unavailable)
             }
         };
+    hook(ReceiptScanPoint::FirstSnapshotCaptured)?;
 
     let mut expected_names = std::collections::BTreeMap::new();
     for checkpoint in expected_checkpoints {
@@ -683,15 +735,21 @@ fn scan_managed_vmm_socket_root_linux(
         if !seen_incarnations.insert(expected.incarnation.clone()) {
             return Ok(ManagedVmmSocketRootScan::Residue);
         }
-        let receipt = match &expected.checkpoint.step {
+        let receipt_name = match &expected.checkpoint.step {
             ReconcileStep::StartRuntime {
                 runtime_incarnation,
                 ..
-            } => match receipts.load(runtime_incarnation) {
-                Ok(Some(receipt)) => receipt,
-                Ok(None) | Err(_) => return Ok(ManagedVmmSocketRootScan::Residue),
-            },
+            } => receipt_file_name(runtime_incarnation)?
+                .into_string()
+                .map_err(|_| anyhow::anyhow!("VMM receipt filename is not UTF-8"))?,
             _ => unreachable!("expected map accepted only StartRuntime"),
+        };
+        let Some(scanned_receipt) = first_receipts.get(&receipt_name) else {
+            return Ok(ManagedVmmSocketRootScan::Residue);
+        };
+        let receipt = match decode_receipt(&scanned_receipt.bytes) {
+            Ok(receipt) => receipt,
+            Err(_) => return Ok(ManagedVmmSocketRootScan::Residue),
         };
         if receipt
             .validate_against(expected.checkpoint, receipts.state_directory(), root)
@@ -808,6 +866,7 @@ fn scan_managed_vmm_socket_root_linux(
             return Ok(ManagedVmmSocketRootScan::Residue);
         }
     }
+    hook(ReceiptScanPoint::AttemptsScanned)?;
     let second_receipts =
         match scan_receipt_namespace_snapshot(root, receipts, expected_checkpoints, context)? {
             ReceiptNamespaceSnapshot::Exact(snapshot) => snapshot,
@@ -2518,6 +2577,23 @@ mod tests {
     }
 
     #[cfg(target_os = "linux")]
+    fn replace_receipt_contents(
+        store: &VmmSocketReceiptStore,
+        incarnation: &RandomId128,
+        bytes: &[u8],
+    ) {
+        let name = receipt_file_name(incarnation).unwrap();
+        let path = format!(
+            "/proc/self/fd/{}/{}",
+            store.directory.as_raw_fd(),
+            name.to_string_lossy()
+        );
+        std::fs::remove_file(&path).unwrap();
+        write_foreign(Path::new(&path), bytes);
+        store.directory.sync_all().unwrap();
+    }
+
+    #[cfg(target_os = "linux")]
     fn replace_receipt_namespace(
         temporary: &tempfile::TempDir,
         replacement_target: Option<(&CStr, &[u8])>,
@@ -3209,6 +3285,54 @@ mod tests {
         assert!(new
             .join(std::ffi::OsStr::from_bytes(name.to_bytes()))
             .is_file());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn attempt_marker_uses_only_the_first_same_fd_receipt_snapshot() {
+        let (_temporary, root, checkpoint, store, receipt_a) = receipt_fixture();
+        let mut receipt_b = receipt_a.clone();
+        receipt_b.creation_nonce = RandomId128::new("cccccccccccccccccccccccccccccccc").unwrap();
+        receipt_b
+            .validate_against(&checkpoint, store.state_directory(), &root)
+            .unwrap();
+        store.publish(&receipt_b).unwrap();
+        drop(expect_prepared(
+            root.prepare_existing_receipt(&checkpoint, &store).unwrap(),
+        ));
+        let bytes_a = receipt_a.encoded_bytes().unwrap();
+        let bytes_b = receipt_b.encoded_bytes().unwrap();
+        replace_receipt_contents(&store, receipt_a.runtime_incarnation(), &bytes_a);
+
+        let mut restored = false;
+        let result = scan_managed_vmm_socket_root_linux_inner(
+            &root,
+            &store,
+            &[&checkpoint],
+            &scan_context(),
+            |point| {
+                match point {
+                    ReceiptScanPoint::FirstSnapshotCaptured => {
+                        replace_receipt_contents(&store, receipt_a.runtime_incarnation(), &bytes_b)
+                    }
+                    ReceiptScanPoint::AttemptsScanned => {
+                        replace_receipt_contents(&store, receipt_a.runtime_incarnation(), &bytes_a);
+                        restored = true;
+                    }
+                }
+                Ok(())
+            },
+        )
+        .unwrap();
+        if !restored {
+            replace_receipt_contents(&store, receipt_a.runtime_incarnation(), &bytes_a);
+        }
+        assert_eq!(result, ManagedVmmSocketRootScan::Residue);
+        assert_eq!(
+            store.load(receipt_a.runtime_incarnation()).unwrap(),
+            Some(receipt_a)
+        );
+        assert!(Path::new(receipt_b.api_socket_path.as_str()).exists());
     }
 
     #[cfg(target_os = "linux")]
