@@ -24,10 +24,13 @@ use cats_api::runtime_reconciliation::{
 };
 use cats_storage::authority::{VolumeDataAuthority, VolumeRecord};
 
+use crate::state_directory::StateDirectory;
+
 use crate::runtime_spine::{
     RuntimeDesiredEffectContext, RuntimeDesiredEffectOutcome, RuntimeDesiredEffectStopReason,
 };
 
+use super::blockd_socket_namespace::ManagedBlockdSocketOwnerRetirement;
 use super::clean_slate_probes::CHECKPOINT_NAMESPACE;
 use super::root_provision_process::{
     RootProvisionProcessGlobalPort, RootProvisionProcessInspection, RootProvisionProcessPort,
@@ -50,11 +53,15 @@ impl PrepareDeviceTargetRetirementEffect {
         authority: Arc<dyn VolumeDataAuthority>,
         global_process: Arc<dyn RootProvisionProcessGlobalPort>,
         systemd: RootProvisionSystemdConfig,
+        state_directory: StateDirectory,
     ) -> Self {
         Self {
             authority,
             global_process,
-            process: Arc::new(PlatformSystemdRootProvisionProcessPort::platform(systemd)),
+            process: Arc::new(PlatformSystemdRootProvisionProcessPort::platform(
+                systemd,
+                state_directory,
+            )),
         }
     }
 
@@ -221,7 +228,25 @@ impl PrepareDeviceTargetRetirementEffect {
             (
                 AcceptedProcess::None | AcceptedProcess::Serving,
                 RootProvisionProcessInspection::Absent,
-            ) => return Ok(None),
+            ) => {
+                let retirement = self
+                    .global_process
+                    .retire_absent_socket_owner(&expectation, context)
+                    .context("retire absent PrepareDevice Root socket owner")?;
+                context.check_active()?;
+                let current_authority = self
+                    .authority
+                    .load_volume(&desired_volume.volume_id)
+                    .context("reread PrepareDevice authority after socket-owner retirement")?;
+                ready.assert_current(stored.checkpoint(), desired, &current_authority)?;
+                store.revalidate_current(&stored, &checkpoint_guard)?;
+                return Ok(match retirement {
+                    ManagedBlockdSocketOwnerRetirement::Retired => {
+                        Some(RuntimeDesiredEffectOutcome::RefreshInventory)
+                    }
+                    ManagedBlockdSocketOwnerRetirement::AlreadyAbsent => None,
+                });
+            }
             (AcceptedProcess::Root(_), RootProvisionProcessInspection::Absent)
             | (_, RootProvisionProcessInspection::Unavailable) => {
                 return Ok(Some(RuntimeDesiredEffectOutcome::RefreshInventory))

@@ -32,6 +32,7 @@ use super::authorized_blockd::{
     authorized_blockd_status_is_bound_to_head, retained_authorized_blockd_command,
     validate_running_physical_desired_successor, AuthorizedBlockFrontend, RetainedAuthorizedBlockd,
 };
+use super::blockd_socket_namespace::ExactManagedBlockdSocketOwnerStartAbsence;
 use super::checkpoint::CurrentCheckpointGuard;
 use super::clean_slate_probes::CHECKPOINT_NAMESPACE;
 use super::inventory::AuthorizedBlockdInventoryEvidence;
@@ -84,6 +85,14 @@ pub(crate) trait ServingBlockdProcessPort: process_sealed::Sealed + Send + Sync 
 pub(crate) trait ServingBlockdProcessGlobalPort:
     global_sealed::Sealed + ServingBlockdProcessPort
 {
+    fn retain_start_socket_absence(
+        &self,
+        _expected: &ServingBlockdExpectation,
+        _context: &RuntimeDesiredEffectContext,
+    ) -> anyhow::Result<Option<ExactManagedBlockdSocketOwnerStartAbsence>> {
+        anyhow::bail!("Serving start socket absence requires the production Node-global scanner")
+    }
+
     fn inspect_serving_exact_or_absent_after_node_global_sweep(
         &self,
         expected: &ServingBlockdExpectation,
@@ -507,6 +516,134 @@ impl ServingBlockdExpectation {
         &self.frontend
     }
 
+    pub(super) fn prepared_device(&self) -> &PreparedDeviceInput {
+        &self.prepared_device
+    }
+
+    /// Project only the provider-owned socket mapping into an isolated test
+    /// namespace.  The input must first be an exact installed expectation;
+    /// reversing the projection must reproduce every byte of the original
+    /// process, attachment and device authority.
+    #[cfg(test)]
+    pub(crate) fn shadow_socket_root_for_test(
+        &self,
+        socket_root: &cats_blockd::runtime_socket_namespace::ManagedBlockdSocketRoot,
+    ) -> anyhow::Result<Self> {
+        let installed = cats_blockd::runtime_socket_namespace::ManagedBlockdSocketRoot::installed()
+            .serving_paths(&self.device_ownership_token)?;
+        let projected = socket_root.serving_paths(&self.device_ownership_token)?;
+        anyhow::ensure!(
+            &self.control_socket_path == installed.control_socket()
+                && self.listener_path() == installed.io_socket()
+                && &self.prepared_device.serving_process.control_socket_path
+                    == installed.control_socket()
+                && match &self.prepared_device.frontend {
+                    PrepareDeviceFrontend::KernelNbd {
+                        listener_socket_path,
+                        ..
+                    } => listener_socket_path == installed.io_socket(),
+                    PrepareDeviceFrontend::VhostUserBlk { socket_path, .. } => {
+                        socket_path == installed.io_socket()
+                    }
+                },
+            "Serving test shadow source is outside the installed managed mapping"
+        );
+
+        fn replace_frontend_socket(
+            frontend: &mut PrepareDeviceFrontend,
+            expected: &HostPath,
+            replacement: &HostPath,
+        ) -> anyhow::Result<()> {
+            let socket = match frontend {
+                PrepareDeviceFrontend::KernelNbd {
+                    listener_socket_path,
+                    ..
+                } => listener_socket_path,
+                PrepareDeviceFrontend::VhostUserBlk { socket_path, .. } => socket_path,
+            };
+            anyhow::ensure!(
+                socket == expected,
+                "Serving test shadow frontend changed before projection"
+            );
+            *socket = replacement.clone();
+            Ok(())
+        }
+
+        fn replace_command_socket(
+            command_line: &mut [OsString],
+            expected: &HostPath,
+            replacement: &HostPath,
+        ) -> anyhow::Result<()> {
+            let mut replacements = 0usize;
+            for argument in command_line {
+                if argument == expected.as_str() {
+                    *argument = OsString::from(replacement.as_str());
+                    replacements += 1;
+                }
+            }
+            anyhow::ensure!(
+                replacements == 1,
+                "Serving test shadow expected one exact socket argument, found {replacements}"
+            );
+            Ok(())
+        }
+
+        let mut shadow = self.clone();
+        replace_command_socket(
+            &mut shadow.command_line,
+            installed.control_socket(),
+            projected.control_socket(),
+        )?;
+        replace_command_socket(
+            &mut shadow.command_line,
+            installed.io_socket(),
+            projected.io_socket(),
+        )?;
+        shadow.control_socket_path = projected.control_socket().clone();
+        shadow.prepared_device.serving_process.control_socket_path =
+            projected.control_socket().clone();
+        replace_frontend_socket(
+            &mut shadow.frontend,
+            installed.io_socket(),
+            projected.io_socket(),
+        )?;
+        replace_frontend_socket(
+            &mut shadow.prepared_device.frontend,
+            installed.io_socket(),
+            projected.io_socket(),
+        )?;
+
+        let mut restored = shadow.clone();
+        replace_command_socket(
+            &mut restored.command_line,
+            projected.control_socket(),
+            installed.control_socket(),
+        )?;
+        replace_command_socket(
+            &mut restored.command_line,
+            projected.io_socket(),
+            installed.io_socket(),
+        )?;
+        restored.control_socket_path = installed.control_socket().clone();
+        restored.prepared_device.serving_process.control_socket_path =
+            installed.control_socket().clone();
+        replace_frontend_socket(
+            &mut restored.frontend,
+            projected.io_socket(),
+            installed.io_socket(),
+        )?;
+        replace_frontend_socket(
+            &mut restored.prepared_device.frontend,
+            projected.io_socket(),
+            installed.io_socket(),
+        )?;
+        anyhow::ensure!(
+            restored == *self,
+            "Serving test shadow changed non-socket process or device authority"
+        );
+        Ok(shadow)
+    }
+
     pub(super) fn listener_path(&self) -> &HostPath {
         match &self.frontend {
             PrepareDeviceFrontend::KernelNbd {
@@ -576,13 +713,16 @@ impl ServingBlockdExpectation {
             peer.cgroup_path =
                 HostPath::new("/sys/fs/cgroup/system.slice/cats-blockd-persistent.service")
                     .unwrap();
-            peer.control_socket_path =
-                HostPath::new("/run/cats/cat_01/persistent-control.sock").unwrap();
             peer.data_directory = HostPath::new("/var/lib/cats/cat_01/persistent").unwrap();
             peer.process_identity_token =
                 RandomId128::new("eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee").unwrap();
             peer.device_ownership_token =
                 RandomId128::new("ffffffffffffffffffffffffffffffff").unwrap();
+            let sockets =
+                cats_blockd::runtime_socket_namespace::ManagedBlockdSocketRoot::installed()
+                    .serving_paths(&peer.device_ownership_token)
+                    .unwrap();
+            peer.control_socket_path = sockets.control_socket().clone();
             peer.prepared_device.serving_process.scope_id = peer.unit_id.clone();
             peer.prepared_device.serving_process.control_socket_path =
                 peer.control_socket_path.clone();
@@ -593,7 +733,7 @@ impl ServingBlockdExpectation {
             let PrepareDeviceFrontend::VhostUserBlk { socket_path, .. } = &mut peer.frontend else {
                 panic!("test serving expectation is vhost-user")
             };
-            *socket_path = HostPath::new("/run/cats/cat_01/persistent-vhost.sock").unwrap();
+            *socket_path = sockets.io_socket().clone();
             peer.prepared_device.frontend = peer.frontend.clone();
         }
         peer
@@ -996,6 +1136,7 @@ pub(crate) struct CheckpointedServingBlockdProcess<'a> {
     authority: &'a VolumeRecord,
     store: &'a FileCheckpointStore,
     current_checkpoint: CurrentCheckpointGuard<'a>,
+    socket_absence: Option<ExactManagedBlockdSocketOwnerStartAbsence>,
 }
 
 impl CheckpointedServingBlockdProcess<'_> {
@@ -1012,6 +1153,14 @@ impl CheckpointedServingBlockdProcess<'_> {
             self.authority,
             self.expected,
         )
+    }
+}
+
+impl<'a> CheckpointedServingBlockdProcess<'a> {
+    pub(crate) fn take_socket_absence(
+        &mut self,
+    ) -> Option<ExactManagedBlockdSocketOwnerStartAbsence> {
+        self.socket_absence.take()
     }
 }
 
@@ -1486,6 +1635,13 @@ impl ServingBlockdStartEffect {
         let Some(selected) = selected_absent else {
             return Ok(None);
         };
+        let selected_entry = &serving[selected];
+        let Some(socket_absence) = self
+            .process
+            .retain_start_socket_absence(&selected_entry.expected, context)?
+        else {
+            return Ok(Some(RuntimeDesiredEffectOutcome::RefreshInventory));
+        };
 
         let observation_id = &accepted.observation().observation_id;
         let mut submitted = self
@@ -1497,7 +1653,6 @@ impl ServingBlockdStartEffect {
         }
         *submitted = Some(observation_id.clone());
         drop(submitted);
-        let selected_entry = &serving[selected];
         let checkpointed = CheckpointedServingBlockdProcess {
             expected: &selected_entry.expected,
             retained_authority: &selected_entry.retained,
@@ -1506,6 +1661,7 @@ impl ServingBlockdStartEffect {
             authority: &current_authorities[selected],
             store: &store,
             current_checkpoint: guard,
+            socket_absence: Some(socket_absence),
         };
         checkpointed.assert_current()?;
         let _submission = self.process.start_checkpointed(checkpointed, context)?;

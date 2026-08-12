@@ -56,7 +56,13 @@ use super::authorized_blockd::{
     LAUNCH_CHECKPOINT_FILE, LAUNCH_CHECKPOINT_TEMP, MAX_AUTHORIZED_SERVING_BYTES,
     MAX_IDENTITY_BYTES, MAX_LAUNCH_CHECKPOINT_BYTES, ROOT_PROVISION_STOP_RECEIPT_FILE,
     ROOT_PROVISION_STOP_RECEIPT_MAX_BYTES, ROOT_PROVISION_STOP_RECEIPT_TEMP,
-    ROOT_PROVISION_STOP_SOCKET_QUARANTINE,
+};
+#[cfg(target_os = "linux")]
+use super::blockd_socket_namespace::ManagedBlockdSocketWholeRootSnapshot;
+use super::blockd_socket_namespace::{
+    serving_socket_owner_authority_digest, BlockdSocketIntentStore, BlockdSocketOwnershipIntentV1,
+    CurrentBlockdSocketBoot, ExactManagedBlockdSocketOwnerStartAbsence,
+    RetainedManagedBlockdSocketRoot,
 };
 use super::checkpoint::{
     decode_definite_release_rejection, validate_definite_release_rejection,
@@ -75,6 +81,7 @@ use super::network::{
 };
 use super::root_provision_process::inspect_exact_root_provision_process;
 use super::root_provision_process::ManagedServingKey;
+use super::root_provision_process::RootProvisionManagedStopInspection;
 use super::root_provision_process::StopReceiptSocketAdmission;
 use super::serving_blockd_process::{
     global_sealed as serving_global_sealed, process_sealed as serving_process_sealed,
@@ -87,10 +94,8 @@ use super::serving_handoff::{
     SERVING_HANDOFF_RECORD_MAX_BYTES, SERVING_HANDOFF_RETIREMENT_FILE,
     SERVING_HANDOFF_RETIREMENT_MAX_BYTES,
 };
-use super::serving_handoff_effect::{
-    SERVING_CONTROL_SOCKET_BASENAME, SERVING_NBD_SOCKET_BASENAME, SERVING_VHOST_SOCKET_BASENAME,
-};
 use super::signed_running::request_matches_volume;
+use super::systemd_root_provision::platform_managed_blockd_listeners_absent;
 use super::vmm_cid::{
     inventory_port_sealed as vmm_cid_inventory_sealed, ExactLiveVmmCid, VmmCidInventoryPort,
     VmmCidInventorySnapshot, VmmCidOwner,
@@ -1019,6 +1024,8 @@ struct ProbeConfig {
     root_provision_systemd: Option<RootProvisionSystemdConfig>,
     network_allocation_port: Option<NetworkAllocationPort>,
     kernel_nbd_inventory_port: Option<KernelNbdInventoryPort>,
+    managed_blockd_socket_root: Option<Arc<RetainedManagedBlockdSocketRoot>>,
+    blockd_socket_intents: Option<Arc<BlockdSocketIntentStore>>,
     managed_vmm_socket_root: Option<Arc<RetainedManagedVmmSocketRoot>>,
     #[cfg(target_os = "linux")]
     managed_vmm_launch_root: Option<Arc<RetainedManagedVmmLaunchRoot>>,
@@ -1042,6 +1049,11 @@ impl ProbeConfig {
             );
         }
         let checkpoint_directory = config.state_directory.path().join(CHECKPOINT_NAMESPACE);
+        let managed_blockd_socket_root =
+            Arc::new(RetainedManagedBlockdSocketRoot::open_installed()?);
+        let blockd_socket_intents = Arc::new(BlockdSocketIntentStore::open_existing(
+            config.state_directory.clone(),
+        )?);
         if let Some(kernel_nbd) = &config.kernel_nbd_inventory {
             anyhow::ensure!(
                 kernel_nbd.state_directory().path() == config.state_directory.path(),
@@ -1084,9 +1096,13 @@ impl ProbeConfig {
             limits: ProbeLimits::default(),
             root_process_port: Some(Arc::new(PlatformSystemdRootProvisionProcessPort::platform(
                 config.root_provision_systemd.clone(),
+                config.state_directory.clone(),
             ))),
             serving_process_port: Some(Arc::new(
-                PlatformSystemdServingBlockdProcessPort::platform(config.state_directory.clone()),
+                PlatformSystemdServingBlockdProcessPort::platform(
+                    config.state_directory.clone(),
+                    Arc::clone(&managed_blockd_socket_root),
+                ),
             )),
             root_provision_systemd: Some(config.root_provision_systemd),
             network_allocation_port: Some(NetworkAllocationPort::new(
@@ -1094,6 +1110,8 @@ impl ProbeConfig {
                 config.ip_binary,
             )?),
             kernel_nbd_inventory_port: config.kernel_nbd_inventory.map(KernelNbdInventoryPort::new),
+            managed_blockd_socket_root: Some(managed_blockd_socket_root),
+            blockd_socket_intents: Some(blockd_socket_intents),
             managed_vmm_socket_root,
             #[cfg(target_os = "linux")]
             managed_vmm_launch_root,
@@ -1265,6 +1283,8 @@ fn clean_slate_scanner_with_metadata_for_test(
             root_provision_systemd: None,
             network_allocation_port: None,
             kernel_nbd_inventory_port: None,
+            managed_blockd_socket_root: None,
+            blockd_socket_intents: None,
             managed_vmm_socket_root: None,
             #[cfg(target_os = "linux")]
             managed_vmm_launch_root: None,
@@ -1453,6 +1473,8 @@ fn platform_root_process_inventory_bridge(
         metering_root: config.metering_cgroup_root.clone(),
         legacy_socket_root: config.legacy_socket_root.clone(),
         limits: config.limits,
+        managed_blockd_socket_root: config.managed_blockd_socket_root.clone(),
+        blockd_socket_intents: config.blockd_socket_intents.clone(),
         managed_vmm_socket_root: config.managed_vmm_socket_root.clone(),
         #[cfg(target_os = "linux")]
         managed_vmm_launch_root: config.managed_vmm_launch_root.clone(),
@@ -2764,11 +2786,6 @@ fn scan_authorized_blockd_data(
                 LAUNCH_CHECKPOINT_TEMP,
                 ROOT_PROVISION_STOP_RECEIPT_FILE,
                 ROOT_PROVISION_STOP_RECEIPT_TEMP,
-                ROOT_PROVISION_STOP_SOCKET_QUARANTINE,
-                "root-provision.sock",
-                SERVING_CONTROL_SOCKET_BASENAME,
-                SERVING_NBD_SOCKET_BASENAME,
-                SERVING_VHOST_SOCKET_BASENAME,
                 "cache.data",
                 ".cache.data.init",
                 "dirty.bitmap",
@@ -2831,27 +2848,6 @@ fn scan_authorized_blockd_data(
                 }
                 continue;
             }
-            let root_metadata = root.metadata().context("inspect retained state root")?;
-            for socket_name in [
-                "root-provision.sock",
-                ROOT_PROVISION_STOP_SOCKET_QUARANTINE,
-                SERVING_CONTROL_SOCKET_BASENAME,
-                SERVING_NBD_SOCKET_BASENAME,
-                SERVING_VHOST_SOCKET_BASENAME,
-            ] {
-                let Some(socket) = by_name.get(socket_name) else {
-                    continue;
-                };
-                anyhow::ensure!(
-                    socket.metadata.st_mode & libc::S_IFMT == libc::S_IFSOCK
-                        && socket.metadata.st_nlink == 1
-                        && socket.metadata.st_uid == root_metadata.uid()
-                        && socket.metadata.st_gid == root_metadata.gid()
-                        && socket.metadata.st_mode & 0o7777 == 0o700,
-                    "root-provision control socket has unsafe type or identity"
-                );
-            }
-
             let Some(identity_bytes) = read_strict_regular_at(
                 &epoch_directory,
                 &by_name[IDENTITY_FILE],
@@ -2949,55 +2945,15 @@ fn scan_authorized_blockd_data(
                 "root-provision stop receipt conflicts with its checkpoint, launch grant, or handoff"
             );
                 receipt.binds_authorized_checkpoint(&checkpoint)?;
-                let receipt_path = receipt.process().control_socket_path.clone();
-                let mut physical_paths = BTreeSet::new();
-                for (name, path) in [
-                    ("root-provision.sock", receipt_path.clone()),
-                    (
-                        ROOT_PROVISION_STOP_SOCKET_QUARANTINE,
-                        HostPath::new(
-                            Path::new(receipt_path.as_str())
-                                .parent()
-                                .context("root-provision stop receipt socket has no parent")?
-                                .join(ROOT_PROVISION_STOP_SOCKET_QUARANTINE)
-                                .to_string_lossy()
-                                .into_owned(),
-                        )
-                        .context("root-provision quarantine path is not canonical")?,
-                    ),
-                ] {
-                    if let Some(entry) = by_name.get(name) {
-                        anyhow::ensure!(
-                            receipt.socket_matches_scanned_stat(&entry.metadata),
-                            "root-provision stop socket changed from its durable receipt"
-                        );
-                        physical_paths.insert(path);
-                    }
-                }
-                anyhow::ensure!(
-                    physical_paths.len() <= 1,
-                    "root-provision stop socket retains both public and quarantine names"
-                );
-                stop_receipt_socket = Some(StopReceiptSocketAdmission::new(
-                    receipt_path,
-                    physical_paths,
-                )?);
+                stop_receipt_socket = Some(StopReceiptSocketAdmission::from_managed(
+                    receipt.socket_owner().clone(),
+                ));
                 if stop_temp.is_some() {
                     scan.recoverable_stop_receipts.push(desired.cat_id.clone());
                     scan.complete = false;
                 } else {
                     scan.stable_stop_receipts.push(desired.cat_id.clone());
                 }
-            }
-            if by_name.contains_key(ROOT_PROVISION_STOP_SOCKET_QUARANTINE) {
-                anyhow::ensure!(
-                    stop_target.is_some() || stop_temp.is_some(),
-                    "root-provision socket quarantine lacks its durable stop receipt"
-                );
-                anyhow::ensure!(
-                    stop_target.is_some() && stop_temp.is_none(),
-                    "root-provision socket quarantine lacks one stable stop receipt"
-                );
             }
             let control_files = ["cache.data", "dirty.bitmap", "pending-packs"];
             let present_control_files = control_files
@@ -3496,6 +3452,8 @@ struct PlatformRootProcessInventoryBridge {
     metering_root: Option<PathBuf>,
     legacy_socket_root: PathBuf,
     limits: ProbeLimits,
+    managed_blockd_socket_root: Option<Arc<RetainedManagedBlockdSocketRoot>>,
+    blockd_socket_intents: Option<Arc<BlockdSocketIntentStore>>,
     managed_vmm_socket_root: Option<Arc<RetainedManagedVmmSocketRoot>>,
     #[cfg(target_os = "linux")]
     managed_vmm_launch_root: Option<Arc<RetainedManagedVmmLaunchRoot>>,
@@ -3523,6 +3481,25 @@ enum AdmittedRootTargetPurpose {
     StopReceipt,
 }
 
+enum ManagedBlockdStartTarget<'a> {
+    Root(&'a RootProvisionProcessExpectation),
+    Serving(&'a ServingBlockdExpectation),
+}
+
+fn insert_exact_blockd_intent(
+    intents: &mut BTreeMap<String, BlockdSocketOwnershipIntentV1>,
+    intent: BlockdSocketOwnershipIntentV1,
+) -> anyhow::Result<()> {
+    let key = intent.control_socket_path().as_str().to_owned();
+    if let Some(existing) = intents.insert(key, intent.clone()) {
+        anyhow::ensure!(
+            existing == intent,
+            "managed blockd admission aliases one socket to different owner authority"
+        );
+    }
+    Ok(())
+}
+
 #[cfg(target_os = "linux")]
 struct StaleBootRecoveryManagedSet {
     root_expected: BTreeMap<Id, RootProvisionProcessExpectation>,
@@ -3531,6 +3508,11 @@ struct StaleBootRecoveryManagedSet {
     stale_vmm: BTreeSet<Id>,
     receipt_snapshot: ReceiptNamespaceSnapshot,
     stop_receipt_sockets: BTreeMap<Id, StopReceiptSocketAdmission>,
+    blockd_boot: CurrentBlockdSocketBoot,
+    blockd_root: Arc<RetainedManagedBlockdSocketRoot>,
+    blockd_intents: Arc<BlockdSocketIntentStore>,
+    blockd_expected: Vec<BlockdSocketOwnershipIntentV1>,
+    blockd_snapshot: ManagedBlockdSocketWholeRootSnapshot,
 }
 
 #[cfg(target_os = "linux")]
@@ -3546,6 +3528,146 @@ enum StaleBootRecoveryManagedInspection {
 }
 
 impl PlatformRootProcessInventoryBridge {
+    fn managed_blockd_intents(
+        &self,
+        root_expected: &BTreeMap<Id, RootProvisionProcessExpectation>,
+        serving_expected: &BTreeMap<ManagedServingKey, ServingBlockdExpectation>,
+        root: &RetainedManagedBlockdSocketRoot,
+        current_boot: &CurrentBlockdSocketBoot,
+    ) -> anyhow::Result<Vec<BlockdSocketOwnershipIntentV1>> {
+        let mut intents = BTreeMap::<String, BlockdSocketOwnershipIntentV1>::new();
+        for expected in root_expected.values() {
+            insert_exact_blockd_intent(
+                &mut intents,
+                BlockdSocketOwnershipIntentV1::root(
+                    root,
+                    current_boot,
+                    expected.provision_transition_id.clone(),
+                    expected.socket_owner_authority_digest.clone(),
+                )?,
+            )?;
+        }
+        for expected in serving_expected.values() {
+            insert_exact_blockd_intent(
+                &mut intents,
+                BlockdSocketOwnershipIntentV1::serving(
+                    root,
+                    current_boot,
+                    expected.device_ownership_token().clone(),
+                    serving_socket_owner_authority_digest(expected.prepared_device())?,
+                )?,
+            )?;
+        }
+        Ok(intents.into_values().collect())
+    }
+
+    fn managed_blockd_intents_for_admission(
+        &self,
+        admission: &super::root_provision_process::NodeGlobalManagedProcessAdmission,
+        root: &RetainedManagedBlockdSocketRoot,
+        current_boot: &CurrentBlockdSocketBoot,
+        extra: BlockdSocketOwnershipIntentV1,
+    ) -> anyhow::Result<Vec<BlockdSocketOwnershipIntentV1>> {
+        let (root_expected, _) = admission.root_control_state();
+        let (serving_expected, _) = admission.serving_blockd_state();
+        let mut intents = self
+            .managed_blockd_intents(&root_expected, &serving_expected, root, current_boot)?
+            .into_iter()
+            .map(|intent| (intent.control_socket_path().as_str().to_owned(), intent))
+            .collect::<BTreeMap<_, _>>();
+        insert_exact_blockd_intent(&mut intents, extra)?;
+        Ok(intents.into_values().collect())
+    }
+
+    fn retain_managed_blockd_start_absence(
+        &self,
+        expected_intent: BlockdSocketOwnershipIntentV1,
+        target: ManagedBlockdStartTarget<'_>,
+        context: &crate::runtime_spine::RuntimeDesiredEffectContext,
+    ) -> anyhow::Result<Option<ExactManagedBlockdSocketOwnerStartAbsence>> {
+        let node_global_effect = context.lock_node_global_effect()?;
+        let admission = context.node_global_process()?;
+        let current_boot = CurrentBlockdSocketBoot::read()?;
+        anyhow::ensure!(
+            admission.node_boot_id() == current_boot.node_boot_id(),
+            "accepted Node-global scan names another kernel boot"
+        );
+        let admitted_absent = match target {
+            ManagedBlockdStartTarget::Root(expected) => admission
+                .root_control(&expected.cat_id)
+                .is_some_and(|(admitted, exact)| admitted == expected && exact.is_none()),
+            ManagedBlockdStartTarget::Serving(expected) => admission
+                .serving_blockd(expected.cat_id(), expected.volume_id())
+                .is_some_and(|(admitted, exact)| admitted == expected && exact.is_none()),
+        };
+        anyhow::ensure!(
+            admitted_absent,
+            "managed blockd start target is not the exact absent accepted expectation"
+        );
+        let root = Arc::new(RetainedManagedBlockdSocketRoot::open_installed()?);
+        let intents = Arc::new(BlockdSocketIntentStore::open_existing(
+            self.state_directory.clone(),
+        )?);
+        let all_intents = self.managed_blockd_intents_for_admission(
+            admission,
+            &root,
+            &current_boot,
+            expected_intent.clone(),
+        )?;
+        let capture = root.capture_start_absence(&intents, &expected_intent, &current_boot)?;
+        let before = root.capture_closed_whole_root(&intents, &all_intents)?;
+        let target_paths = std::iter::once(expected_intent.control_socket_path())
+            .chain(expected_intent.io_socket_path());
+        if !platform_managed_blockd_listeners_absent(target_paths, context)? {
+            return Ok(None);
+        }
+        let inspected = self.inspect_admitted_managed_processes(admission, context)?;
+        let absent = match (target, inspected) {
+            (
+                ManagedBlockdStartTarget::Root(expected),
+                AdmittedManagedProcessInspection::Exact { root, .. },
+            ) => match root.get(&expected.cat_id) {
+                Some(RootProvisionProcessInspection::Absent) => true,
+                None => admission.root_control(&expected.cat_id).is_none(),
+                Some(_) => false,
+            },
+            (
+                ManagedBlockdStartTarget::Serving(expected),
+                AdmittedManagedProcessInspection::Exact { serving, .. },
+            ) => matches!(
+                serving.get(&ManagedServingKey::new(
+                    expected.cat_id().clone(),
+                    expected.volume_id().clone(),
+                )),
+                Some(ServingBlockdProcessInspection::Absent)
+            ),
+            (_, AdmittedManagedProcessInspection::Unavailable) => return Ok(None),
+            (_, AdmittedManagedProcessInspection::IdentityMismatch)
+            | (_, AdmittedManagedProcessInspection::DuplicateIdentity) => {
+                anyhow::bail!("Node-global managed process set changed during start absence")
+            }
+        };
+        if !absent
+            || !platform_managed_blockd_listeners_absent(
+                std::iter::once(expected_intent.control_socket_path())
+                    .chain(expected_intent.io_socket_path()),
+                context,
+            )?
+        {
+            return Ok(None);
+        }
+        let after = root.capture_closed_whole_root(&intents, &all_intents)?;
+        Ok(Some(
+            ExactManagedBlockdSocketOwnerStartAbsence::seal_after_node_global_sweep(
+                capture,
+                before,
+                after,
+                &current_boot,
+                node_global_effect,
+            )?,
+        ))
+    }
+
     #[cfg(target_os = "linux")]
     fn stale_boot_recovery_managed_set(
         &self,
@@ -3670,7 +3792,7 @@ impl PlatformRootProcessInventoryBridge {
                     }
                     Ok::<_, anyhow::Error>(stale)
                 })?;
-        let stop_receipt_sockets = blockd_by_cat.iter().try_fold(
+        let mut stop_receipt_sockets = blockd_by_cat.iter().try_fold(
             BTreeMap::new(),
             |mut sockets, (cat_id, by_volume)| {
                 for evidence in by_volume.values() {
@@ -3684,6 +3806,28 @@ impl PlatformRootProcessInventoryBridge {
                 Ok::<_, anyhow::Error>(sockets)
             },
         )?;
+        let blockd_boot = CurrentBlockdSocketBoot::read()?;
+        let blockd_root = Arc::clone(
+            self.managed_blockd_socket_root
+                .as_ref()
+                .context("stale-boot recovery lacks the managed blockd socket root")?,
+        );
+        let blockd_intents = Arc::clone(
+            self.blockd_socket_intents
+                .as_ref()
+                .context("stale-boot recovery lacks the managed blockd intent store")?,
+        );
+        let blockd_expected = self.managed_blockd_intents(
+            &root_expected,
+            &serving_expected,
+            &blockd_root,
+            &blockd_boot,
+        )?;
+        let blockd_snapshot =
+            blockd_root.capture_closed_whole_root(&blockd_intents, &blockd_expected)?;
+        for socket in stop_receipt_sockets.values_mut() {
+            socket.bind_managed_snapshot(&blockd_snapshot)?;
+        }
         Ok(Some(StaleBootRecoveryManagedSet {
             root_expected,
             serving_expected,
@@ -3691,6 +3835,11 @@ impl PlatformRootProcessInventoryBridge {
             stale_vmm,
             receipt_snapshot,
             stop_receipt_sockets,
+            blockd_boot,
+            blockd_root,
+            blockd_intents,
+            blockd_expected,
+            blockd_snapshot,
         }))
     }
 
@@ -3893,6 +4042,11 @@ impl PlatformRootProcessInventoryBridge {
         {
             return Ok(ProbeFact::Present);
         }
+        if CurrentBlockdSocketBoot::read()? != expected.blockd_boot
+            || expected.blockd_snapshot.assert_current().is_err()
+        {
+            return Ok(ProbeFact::Present);
+        }
         let mut budget = self.limits.os_entries;
         let mut allowed_units = BTreeSet::new();
         let mut allowed_pids = BTreeSet::new();
@@ -3949,6 +4103,25 @@ impl PlatformRootProcessInventoryBridge {
                             == &BTreeSet::from([socket.receipt_socket().clone()]) => {}
                 _ => return Ok(ProbeFact::Present),
             }
+        }
+        let managed_blockd_paths = expected
+            .blockd_snapshot
+            .socket_paths()
+            .into_iter()
+            .map(|path| PathBuf::from(path.as_str()))
+            .collect::<BTreeSet<_>>();
+        if !allowed_sockets.is_subset(&managed_blockd_paths) {
+            return Ok(ProbeFact::Present);
+        }
+        let stale_blockd_paths = managed_blockd_paths
+            .difference(&allowed_sockets)
+            .map(|path| {
+                HostPath::new(path.to_string_lossy().into_owned())
+                    .context("managed blockd socket path is not canonical")
+            })
+            .collect::<anyhow::Result<Vec<_>>>()?;
+        if !platform_managed_blockd_listeners_absent(stale_blockd_paths.iter(), &physical)? {
+            return Ok(ProbeFact::Present);
         }
         let systemd = scan_cgroup_tree_allowing(
             &self.systemd_root,
@@ -4029,6 +4202,16 @@ impl PlatformRootProcessInventoryBridge {
         } else {
             ProbeFact::Present
         };
+        let blockd_still_exact = if CurrentBlockdSocketBoot::read()? == expected.blockd_boot
+            && expected
+                .blockd_root
+                .capture_closed_whole_root(&expected.blockd_intents, &expected.blockd_expected)
+                .is_ok_and(|after| expected.blockd_snapshot.same_coordinates(&after))
+        {
+            ProbeFact::Empty
+        } else {
+            ProbeFact::Present
+        };
         Ok(
             if [
                 systemd,
@@ -4038,6 +4221,7 @@ impl PlatformRootProcessInventoryBridge {
                 managed_vmm_sockets,
                 managed_vmm_launch_files,
                 receipts_still_exact,
+                blockd_still_exact,
             ]
             .contains(&ProbeFact::Present)
             {
@@ -4050,6 +4234,7 @@ impl PlatformRootProcessInventoryBridge {
                 managed_vmm_sockets,
                 managed_vmm_launch_files,
                 receipts_still_exact,
+                blockd_still_exact,
             ]
             .contains(&ProbeFact::Unavailable)
             {
@@ -4094,6 +4279,34 @@ impl PlatformRootProcessInventoryBridge {
             }
             vmm_expected.insert(successor.cat_id().clone(), successor.clone());
         }
+        let managed_blockd = match (
+            self.managed_blockd_socket_root.as_ref(),
+            self.blockd_socket_intents.as_ref(),
+        ) {
+            (Some(root), Some(intents)) => {
+                let current_boot = CurrentBlockdSocketBoot::read()?;
+                anyhow::ensure!(
+                    admission.node_boot_id() == current_boot.node_boot_id(),
+                    "accepted managed-process admission names another kernel boot"
+                );
+                let expected = self.managed_blockd_intents(
+                    &root_expected,
+                    &serving_expected,
+                    root,
+                    &current_boot,
+                )?;
+                let before = root.capture_closed_whole_root(intents, &expected)?;
+                Some((Arc::clone(root), Arc::clone(intents), expected, before))
+            }
+            (None, None) if !self.process_paths.supported => {
+                return Ok(AdmittedManagedProcessInspection::Unavailable)
+            }
+            #[cfg(test)]
+            (None, None) => None,
+            #[cfg(not(test))]
+            (None, None) => anyhow::bail!("installed scanner lacks managed blockd namespace"),
+            _ => anyhow::bail!("managed blockd root and intent store are not one composition"),
+        };
         let Some(root_first) =
             inspect_root_process_set(self.port.as_ref(), &root_expected, context)?
         else {
@@ -4156,6 +4369,26 @@ impl PlatformRootProcessInventoryBridge {
                 .iter()
                 .map(|socket| PathBuf::from(socket.as_str())),
         );
+        if let Some((_, _, _, before)) = managed_blockd.as_ref() {
+            let managed_paths = before
+                .socket_paths()
+                .into_iter()
+                .map(|path| PathBuf::from(path.as_str()))
+                .collect::<BTreeSet<_>>();
+            if !allowed_sockets.is_subset(&managed_paths) {
+                return Ok(AdmittedManagedProcessInspection::DuplicateIdentity);
+            }
+            let stale_paths = managed_paths
+                .difference(&allowed_sockets)
+                .map(|path| {
+                    HostPath::new(path.to_string_lossy().into_owned())
+                        .context("managed blockd socket path is not canonical")
+                })
+                .collect::<anyhow::Result<Vec<_>>>()?;
+            if !platform_managed_blockd_listeners_absent(stale_paths.iter(), context)? {
+                return Ok(AdmittedManagedProcessInspection::DuplicateIdentity);
+            }
+        }
         let sweep = match self.sweep_node_global_inventory(
             &allowed_units,
             &allowed_pids,
@@ -4177,6 +4410,13 @@ impl PlatformRootProcessInventoryBridge {
                 return Ok(AdmittedManagedProcessInspection::Unavailable);
             }
             ProbeFact::Empty => {}
+        }
+
+        if let Some((root, intents, expected, before)) = managed_blockd.as_ref() {
+            let after = root.capture_closed_whole_root(intents, expected)?;
+            if !before.same_coordinates(&after) {
+                return Ok(AdmittedManagedProcessInspection::IdentityMismatch);
+            }
         }
 
         let Some(root_second) =
@@ -4292,9 +4532,38 @@ impl RootProcessInventoryBridge for PlatformRootProcessInventoryBridge {
         root_expected: BTreeMap<Id, RootProvisionProcessExpectation>,
         serving_expected: BTreeMap<ManagedServingKey, ServingBlockdExpectation>,
         vmm_expected: BTreeMap<Id, VmmProcessExpectation>,
-        stop_receipt_sockets: BTreeMap<Id, StopReceiptSocketAdmission>,
+        mut stop_receipt_sockets: BTreeMap<Id, StopReceiptSocketAdmission>,
         context: &RuntimeInventoryScanContext,
     ) -> anyhow::Result<RootProcessInventoryBridgeOutcome> {
+        let managed_blockd = match (
+            self.managed_blockd_socket_root.as_ref(),
+            self.blockd_socket_intents.as_ref(),
+        ) {
+            (Some(root), Some(intents)) => {
+                let current_boot = CurrentBlockdSocketBoot::read()?;
+                let expected = self.managed_blockd_intents(
+                    &root_expected,
+                    &serving_expected,
+                    root,
+                    &current_boot,
+                )?;
+                let before = root.capture_closed_whole_root(intents, &expected)?;
+                Some((Arc::clone(root), Arc::clone(intents), expected, before))
+            }
+            (None, None) if !self.process_paths.supported => {
+                return Ok(RootProcessInventoryBridgeOutcome::Unavailable)
+            }
+            #[cfg(test)]
+            (None, None) => None,
+            #[cfg(not(test))]
+            (None, None) => anyhow::bail!("installed scanner lacks managed blockd namespace"),
+            _ => anyhow::bail!("managed blockd root and intent store are not one composition"),
+        };
+        if let Some((_, _, _, before)) = managed_blockd.as_ref() {
+            for socket in stop_receipt_sockets.values_mut() {
+                socket.bind_managed_snapshot(before)?;
+            }
+        }
         let Some(root_first) =
             inspect_root_process_set(self.port.as_ref(), &root_expected, context)?
         else {
@@ -4391,6 +4660,29 @@ impl RootProcessInventoryBridge for PlatformRootProcessInventoryBridge {
             "managed-process inventory contains duplicate unit or PID identity"
         );
 
+        if let Some((_, _, _, before)) = managed_blockd.as_ref() {
+            let managed_paths = before
+                .socket_paths()
+                .into_iter()
+                .map(|path| PathBuf::from(path.as_str()))
+                .collect::<BTreeSet<_>>();
+            anyhow::ensure!(
+                allowed_sockets.is_subset(&managed_paths),
+                "live or receipted blockd socket is outside the exact managed-root snapshot"
+            );
+            let stale_paths = managed_paths
+                .difference(&allowed_sockets)
+                .map(|path| {
+                    HostPath::new(path.to_string_lossy().into_owned())
+                        .context("managed blockd socket path is not canonical")
+                })
+                .collect::<anyhow::Result<Vec<_>>>()?;
+            anyhow::ensure!(
+                platform_managed_blockd_listeners_absent(stale_paths.iter(), context)?,
+                "absent managed blockd owner retains a live Unix listener"
+            );
+        }
+
         match self.sweep_node_global_inventory(
             &allowed_units,
             &allowed_pids,
@@ -4403,6 +4695,14 @@ impl RootProcessInventoryBridge for PlatformRootProcessInventoryBridge {
             }
             ProbeFact::Unavailable => return Ok(RootProcessInventoryBridgeOutcome::Unavailable),
             ProbeFact::Empty => {}
+        }
+
+        if let Some((root, intents, expected, before)) = managed_blockd.as_ref() {
+            let after = root.capture_closed_whole_root(intents, expected)?;
+            anyhow::ensure!(
+                before.same_coordinates(&after),
+                "managed blockd namespace changed across full Node-global inventory"
+            );
         }
 
         let Some(root_second) =
@@ -4506,6 +4806,26 @@ impl ServingBlockdProcessPort for PlatformRootProcessInventoryBridge {
 impl serving_global_sealed::Sealed for PlatformRootProcessInventoryBridge {}
 
 impl ServingBlockdProcessGlobalPort for PlatformRootProcessInventoryBridge {
+    fn retain_start_socket_absence(
+        &self,
+        expected: &ServingBlockdExpectation,
+        context: &crate::runtime_spine::RuntimeDesiredEffectContext,
+    ) -> anyhow::Result<Option<ExactManagedBlockdSocketOwnerStartAbsence>> {
+        let current_boot = CurrentBlockdSocketBoot::read()?;
+        let root = RetainedManagedBlockdSocketRoot::open_installed()?;
+        let intent = BlockdSocketOwnershipIntentV1::serving(
+            &root,
+            &current_boot,
+            expected.device_ownership_token().clone(),
+            serving_socket_owner_authority_digest(expected.prepared_device())?,
+        )?;
+        self.retain_managed_blockd_start_absence(
+            intent,
+            ManagedBlockdStartTarget::Serving(expected),
+            context,
+        )
+    }
+
     fn inspect_serving_exact_or_absent_after_node_global_sweep(
         &self,
         expected: &ServingBlockdExpectation,
@@ -4881,6 +5201,110 @@ impl VmmCidInventoryPort for PlatformRootProcessInventoryBridge {
 }
 
 impl RootProvisionProcessRetirementPort for PlatformRootProcessInventoryBridge {
+    fn inspect_exact_stop_owner_after_node_global_sweep(
+        &self,
+        expected: &RootProvisionProcessExpectation,
+        context: &crate::runtime_spine::RuntimeDesiredEffectContext,
+    ) -> anyhow::Result<RootProvisionManagedStopInspection> {
+        let current_boot = CurrentBlockdSocketBoot::read()?;
+        let root = RetainedManagedBlockdSocketRoot::open_installed()?;
+        let intents = BlockdSocketIntentStore::open_existing(self.state_directory.clone())?;
+        let intent = BlockdSocketOwnershipIntentV1::root(
+            &root,
+            &current_boot,
+            expected.provision_transition_id.clone(),
+            expected.socket_owner_authority_digest.clone(),
+        )?;
+        let retain_owner = || -> anyhow::Result<_> {
+            match root.retain_existing_intent(&intents, &intent, &current_boot)? {
+                super::blockd_socket_namespace::ManagedBlockdSocketOwnerInspection::Current(
+                    retained,
+                ) => retained.retain_root_stop_owner_evidence(&current_boot).map(Some),
+                super::blockd_socket_namespace::ManagedBlockdSocketOwnerInspection::Absent
+                | super::blockd_socket_namespace::ManagedBlockdSocketOwnerInspection::StaleBootAbsent
+                | super::blockd_socket_namespace::ManagedBlockdSocketOwnerInspection::RecoverableAbsent => {
+                    Ok(None)
+                }
+            }
+        };
+        let Some(before) = retain_owner()? else {
+            return Ok(RootProvisionManagedStopInspection::Absent);
+        };
+        let inspection = self.inspect_admitted_root_target(
+            expected,
+            AdmittedRootTargetPurpose::Ordinary,
+            context,
+        )?;
+        match inspection {
+            RootProvisionProcessInspection::Exact(process) => {
+                let Some(after) = retain_owner()? else {
+                    return Ok(RootProvisionManagedStopInspection::Conflict(
+                        RootProvisionProcessConflict::IdentityMismatch,
+                    ));
+                };
+                if before != after || !after.matches_expectation(expected) {
+                    return Ok(RootProvisionManagedStopInspection::Conflict(
+                        RootProvisionProcessConflict::IdentityMismatch,
+                    ));
+                }
+                Ok(RootProvisionManagedStopInspection::Exact {
+                    process,
+                    owner: Box::new(after),
+                })
+            }
+            RootProvisionProcessInspection::Absent => {
+                Ok(RootProvisionManagedStopInspection::Absent)
+            }
+            RootProvisionProcessInspection::Conflict(problem) => {
+                Ok(RootProvisionManagedStopInspection::Conflict(problem))
+            }
+            RootProvisionProcessInspection::Unavailable => {
+                Ok(RootProvisionManagedStopInspection::Unavailable)
+            }
+        }
+    }
+
+    fn retire_absent_socket_owner(
+        &self,
+        expected: &RootProvisionProcessExpectation,
+        context: &crate::runtime_spine::RuntimeDesiredEffectContext,
+    ) -> anyhow::Result<super::blockd_socket_namespace::ManagedBlockdSocketOwnerRetirement> {
+        let absence = RootProvisionProcessRetirementPort::retain_start_socket_absence(
+            self, expected, context,
+        )?
+        .context("Root socket-owner retirement lacks exact Node-global absence")?;
+        let current_boot = CurrentBlockdSocketBoot::read()?;
+        let root = RetainedManagedBlockdSocketRoot::open_installed()?;
+        let intents = BlockdSocketIntentStore::open_existing(self.state_directory.clone())?;
+        let intent = BlockdSocketOwnershipIntentV1::root(
+            &root,
+            &current_boot,
+            expected.provision_transition_id.clone(),
+            expected.socket_owner_authority_digest.clone(),
+        )?;
+        root.retire_absent_owner(&intents, &intent, &current_boot, absence)
+    }
+
+    fn retain_start_socket_absence(
+        &self,
+        expected: &RootProvisionProcessExpectation,
+        context: &crate::runtime_spine::RuntimeDesiredEffectContext,
+    ) -> anyhow::Result<Option<ExactManagedBlockdSocketOwnerStartAbsence>> {
+        let current_boot = CurrentBlockdSocketBoot::read()?;
+        let root = RetainedManagedBlockdSocketRoot::open_installed()?;
+        let intent = BlockdSocketOwnershipIntentV1::root(
+            &root,
+            &current_boot,
+            expected.provision_transition_id.clone(),
+            expected.socket_owner_authority_digest.clone(),
+        )?;
+        self.retain_managed_blockd_start_absence(
+            intent,
+            ManagedBlockdStartTarget::Root(expected),
+            context,
+        )
+    }
+
     fn inspect_exact_after_node_global_sweep(
         &self,
         expected: &RootProvisionProcessExpectation,
@@ -7062,7 +7486,7 @@ fn socket_candidate(name: &OsStr) -> bool {
 fn scan_root_process_sockets(
     state_directory: &StateDirectory,
     legacy_socket_root: &Path,
-    allowed: &BTreeSet<PathBuf>,
+    _managed_socket_paths: &BTreeSet<PathBuf>,
     limits: ProbeLimits,
     context: &dyn RuntimePhysicalReadContext,
 ) -> anyhow::Result<ProbeFact> {
@@ -7099,7 +7523,11 @@ fn scan_root_process_sockets(
         ProbeFact::Unavailable => return Ok(ProbeFact::Unavailable),
         ProbeFact::Empty | ProbeFact::Present => {}
     }
-    Ok(if discovered == *allowed {
+    // V1 lockstep cutover: every blockd socket is owned by the independent
+    // `/run/cats/blockd-v1` scanner. Any socket below durable Cat data is an
+    // old-layout or foreign residue, even if its lexical path appears in a
+    // checkpoint or stop receipt.
+    Ok(if discovered.is_empty() {
         ProbeFact::Empty
     } else {
         ProbeFact::Present
@@ -7156,18 +7584,6 @@ fn collect_managed_sockets(
                 return Ok(ProbeFact::Unavailable);
             }
         } else if file_type.is_socket() {
-            anyhow::ensure!(
-                [
-                    "root-provision.sock",
-                    ROOT_PROVISION_STOP_SOCKET_QUARANTINE,
-                    SERVING_CONTROL_SOCKET_BASENAME,
-                    SERVING_NBD_SOCKET_BASENAME,
-                    SERVING_VHOST_SOCKET_BASENAME,
-                ]
-                .into_iter()
-                .any(|name| entry.file_name() == OsStr::new(name)),
-                "authorized blockd data contains a foreign socket"
-            );
             anyhow::ensure!(
                 sockets.insert(entry.path()),
                 "root-provision socket inventory duplicated one path"
@@ -7243,7 +7659,9 @@ fn errno() -> libc::c_int {
 mod tests {
     use std::collections::VecDeque;
     use std::os::unix::ffi::OsStrExt as _;
-    use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
+    #[cfg(target_os = "linux")]
+    use std::os::unix::fs::DirBuilderExt as _;
+    use std::os::unix::fs::{FileTypeExt as _, MetadataExt as _, PermissionsExt as _};
     use std::os::unix::io::AsRawFd as _;
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::sync::Mutex;
@@ -7304,6 +7722,21 @@ mod tests {
     use super::*;
 
     const SNAPSHOT: &[u8] = br#"{"desired_specs":[],"expires_at_unix_ms":1720000030000,"issued_at_unix_ms":1720000000000,"read_position":12,"request_sequence":1,"session":{"agent_instance_id":"44444444444444444444444444444444","agent_session_epoch":2,"node_boot_id":"33333333333333333333333333333333","node_id":"node_a"},"version":1}"#;
+
+    fn managed_root_control_socket(provision_transition_id: &RandomId128) -> HostPath {
+        cats_blockd::runtime_socket_namespace::ManagedBlockdSocketRoot::installed()
+            .root_paths(provision_transition_id)
+            .unwrap()
+            .control_socket()
+            .clone()
+    }
+
+    fn managed_serving_sockets(device_ownership_token: &RandomId128) -> (HostPath, HostPath) {
+        let paths = cats_blockd::runtime_socket_namespace::ManagedBlockdSocketRoot::installed()
+            .serving_paths(device_ownership_token)
+            .unwrap();
+        (paths.control_socket().clone(), paths.io_socket().clone())
+    }
 
     #[test]
     fn start_runtime_is_never_projected_without_an_exact_live_vmm() {
@@ -7537,6 +7970,23 @@ mod tests {
             &recovery_context.inventory_context(),
         )
         .unwrap();
+        let blockd_root = Arc::new(
+            RetainedManagedBlockdSocketRoot::provision_for_test(
+                &environment._root.path().join("blockd-sockets"),
+            )
+            .unwrap(),
+        );
+        let blockd_intents = Arc::new(
+            BlockdSocketIntentStore::provision_for_test(StateDirectory::unanchored(
+                environment.state.clone(),
+            ))
+            .unwrap(),
+        );
+        let blockd_boot = CurrentBlockdSocketBoot::read().unwrap();
+        let blockd_expected = Vec::new();
+        let blockd_snapshot = blockd_root
+            .capture_closed_whole_root(&blockd_intents, &blockd_expected)
+            .unwrap();
         let managed = StaleBootRecoveryManagedSet {
             root_expected: BTreeMap::new(),
             serving_expected: BTreeMap::new(),
@@ -7544,6 +7994,11 @@ mod tests {
             stale_vmm: BTreeSet::from([stale.cat_id.clone()]),
             receipt_snapshot,
             stop_receipt_sockets: BTreeMap::new(),
+            blockd_boot,
+            blockd_root: Arc::clone(&blockd_root),
+            blockd_intents: Arc::clone(&blockd_intents),
+            blockd_expected,
+            blockd_snapshot,
         };
         let process_id = 4_242;
         let inspected = StaleBootRecoveryManagedInspection::Exact {
@@ -7597,6 +8052,8 @@ mod tests {
         bridge.managed_vmm_socket_root = Some(Arc::clone(&managed_socket_root));
         bridge.managed_vmm_launch_root = Some(launch_root);
         bridge.vmm_socket_receipts = Some(Arc::clone(&receipts));
+        bridge.managed_blockd_socket_root = Some(blockd_root);
+        bridge.blockd_socket_intents = Some(blockd_intents);
 
         assert_eq!(
             bridge
@@ -7817,8 +8274,10 @@ mod tests {
         ));
     }
 
+    #[cfg(target_os = "linux")]
     struct TestUnavailableBlobStore;
 
+    #[cfg(target_os = "linux")]
     impl BlobStore for TestUnavailableBlobStore {
         fn put_immutable(&self, key: &str, _data: &[u8]) -> Result<(), BlobError> {
             Err(test_blob_error(key))
@@ -7879,6 +8338,7 @@ mod tests {
         }
     }
 
+    #[cfg(target_os = "linux")]
     fn test_blob_error(key: &str) -> BlobError {
         BlobError::Backend {
             key: key.to_owned(),
@@ -8049,8 +8509,10 @@ mod tests {
         }
     }
 
+    #[cfg(target_os = "linux")]
     struct TestUnavailableRuntimeVolumeInventoryAuthority;
 
+    #[cfg(target_os = "linux")]
     impl RuntimeVolumeInventoryAuthority for TestUnavailableRuntimeVolumeInventoryAuthority {
         fn load_node_volume_inventory(
             &self,
@@ -8288,13 +8750,15 @@ mod tests {
         ch_binary: PathBuf,
         blockd_binary: PathBuf,
         guest_binary: PathBuf,
+        managed_blockd_socket_root: Arc<RetainedManagedBlockdSocketRoot>,
     }
 
     impl TestEnvironment {
         fn new() -> Self {
-            // Root-provision control sockets are deliberately nested below
-            // the exact attachment lineage. Keep this fixture under /tmp so
-            // the real Unix-domain pathname remains below SUN_LEN on macOS.
+            // Several unrelated process/socket probes still bind temporary
+            // Unix listeners. Keep the fixture under /tmp so those synthetic
+            // paths remain below SUN_LEN on macOS; production blockd paths are
+            // always derived from the installation-owned namespace.
             let root = tempfile::Builder::new()
                 .prefix("c")
                 .tempdir_in("/tmp")
@@ -8315,6 +8779,12 @@ mod tests {
             ] {
                 std::fs::create_dir(directory).unwrap();
             }
+            let managed_blockd_socket_root = Arc::new(
+                RetainedManagedBlockdSocketRoot::provision_for_test(
+                    &root.path().join("default-managed-blockd-sockets"),
+                )
+                .unwrap(),
+            );
             Self {
                 ch_binary: root.path().join("bin/cloud-hypervisor"),
                 blockd_binary: root.path().join("bin/cats-blockd"),
@@ -8326,6 +8796,7 @@ mod tests {
                 block_root,
                 network_root,
                 socket_root,
+                managed_blockd_socket_root,
             }
         }
 
@@ -8349,6 +8820,8 @@ mod tests {
                 root_provision_systemd: None,
                 network_allocation_port: None,
                 kernel_nbd_inventory_port: None,
+                managed_blockd_socket_root: None,
+                blockd_socket_intents: None,
                 managed_vmm_socket_root: None,
                 #[cfg(target_os = "linux")]
                 managed_vmm_launch_root: None,
@@ -8592,6 +9065,8 @@ mod tests {
         let authorization_bytes = std::fs::read(&authorization_path).unwrap();
         let authorization_metadata = std::fs::metadata(&authorization_path).unwrap();
         let suffix = volume.volume_id.as_str();
+        let ownership_token = RandomId128::new(format!("{:032x}", index + 1)).unwrap();
+        let (control_socket_path, io_socket_path) = managed_serving_sockets(&ownership_token);
         PreparedDeviceInput {
             volume_intent_id: volume.volume_intent_id.clone(),
             disk_id: volume.disk_id.clone(),
@@ -8604,7 +9079,7 @@ mod tests {
             size_bytes: attachment.size_bytes,
             durability: attachment.durability,
             guest_device: volume.guest_device.clone(),
-            ownership_token: RandomId128::new(format!("{:032x}", index + 1)).unwrap(),
+            ownership_token,
             serving_authority: Box::new(ServingAuthorityProvenance::DirectAuthorizedAttachment {
                 authorization: DirectAuthorizedAttachmentIdentity {
                     path: HostPath::new(authorization_path.to_string_lossy().into_owned()).unwrap(),
@@ -8634,13 +9109,7 @@ mod tests {
             }),
             serving_process: ServingBlockdIdentity {
                 scope_id: Id::new(format!("cats-blockd-{suffix}.service")).unwrap(),
-                control_socket_path: HostPath::new(
-                    data_directory
-                        .join("serving-control.sock")
-                        .to_string_lossy()
-                        .into_owned(),
-                )
-                .unwrap(),
+                control_socket_path,
                 data_directory: HostPath::new(data_directory.to_string_lossy().into_owned())
                     .unwrap(),
                 executable_path: HostPath::new(
@@ -8650,13 +9119,7 @@ mod tests {
                 process_identity_token: RandomId128::new(format!("{:032x}", index + 101)).unwrap(),
             },
             frontend: PrepareDeviceFrontend::VhostUserBlk {
-                socket_path: HostPath::new(
-                    data_directory
-                        .join("serving-vhost.sock")
-                        .to_string_lossy()
-                        .into_owned(),
-                )
-                .unwrap(),
+                socket_path: io_socket_path,
                 queues: 1,
                 queue_size: 256,
             },
@@ -9518,21 +9981,16 @@ mod tests {
             cats_api::runtime_reconciliation::UnixMillis::new(9_000).unwrap(),
         );
         let token = RandomId128::new("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa").unwrap();
+        let provision_transition_id = RandomId128::new("bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb").unwrap();
         let scope_id = Id::new("cats-root-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa.service").unwrap();
         let data = HostPath::new(data_directory.to_string_lossy().into_owned()).unwrap();
         checkpoint.step = ReconcileStep::ProvisionRootImage {
-            provision_transition_id: RandomId128::new("bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb").unwrap(),
+            provision_transition_id: provision_transition_id.clone(),
             volume_id: attachment.identity.volume_id.clone(),
             attachment_id: attachment.identity.attachment_id.clone(),
             attachment_epoch: attachment.identity.attachment_epoch,
             scope_id,
-            control_socket_path: HostPath::new(
-                data_directory
-                    .join("root-provision.sock")
-                    .to_string_lossy()
-                    .into_owned(),
-            )
-            .unwrap(),
+            control_socket_path: managed_root_control_socket(&provision_transition_id),
             data_directory: data,
             process_identity_token: token,
             size_bytes: attachment.size_bytes,
@@ -9606,13 +10064,9 @@ mod tests {
         std::fs::create_dir_all(&data_directory).unwrap();
         second.data_directory =
             HostPath::new(data_directory.to_string_lossy().into_owned()).unwrap();
-        second.control_socket_path = HostPath::new(
-            data_directory
-                .join("root-provision.sock")
-                .to_string_lossy()
-                .into_owned(),
-        )
-        .unwrap();
+        second.provision_transition_id =
+            RandomId128::new("cccccccccccccccccccccccccccccccc").unwrap();
+        second.control_socket_path = managed_root_control_socket(&second.provision_transition_id);
         second.process_identity_token =
             RandomId128::new("bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb").unwrap();
         second
@@ -9639,6 +10093,7 @@ mod tests {
             port,
             Arc::new(PlatformSystemdServingBlockdProcessPort::platform(
                 StateDirectory::unanchored(environment.state.clone()),
+                Arc::clone(&environment.managed_blockd_socket_root),
             )),
         )
     }
@@ -9682,6 +10137,8 @@ mod tests {
             metering_root: None,
             legacy_socket_root: environment.socket_root.clone(),
             limits: ProbeLimits::default(),
+            managed_blockd_socket_root: None,
+            blockd_socket_intents: None,
             managed_vmm_socket_root: None,
             #[cfg(target_os = "linux")]
             managed_vmm_launch_root: None,
@@ -9921,23 +10378,13 @@ mod tests {
     }
 
     #[test]
-    fn authorized_data_probe_accepts_exact_control_only_engine_files_and_socket() {
-        use std::os::unix::fs::PermissionsExt as _;
-
+    fn authorized_data_probe_accepts_exact_control_only_engine_files_without_a_legacy_socket() {
         let environment = TestEnvironment::new();
         let scan_context = assigned_context(true);
         let desired = &scan_context.coordinates().desired.desired_specs[0];
         let (_record, attachment) = exact_owned_record_and_attachment(desired);
         let data_directory = prepare_exact_lineage(&environment, desired, &attachment);
         install_exact_control_only_files(&data_directory, attachment.size_bytes);
-        let _socket =
-            std::os::unix::net::UnixListener::bind(data_directory.join("root-provision.sock"))
-                .unwrap();
-        std::fs::set_permissions(
-            data_directory.join("root-provision.sock"),
-            std::fs::Permissions::from_mode(0o700),
-        )
-        .unwrap();
 
         assert!(matches!(
             authorized_data_probe(&environment)
@@ -9952,6 +10399,30 @@ mod tests {
                     Some(AuthorizedBlockdControlState::ExactControlOnlyEmpty)
                 )
         ));
+    }
+
+    #[test]
+    fn authorized_data_probe_rejects_and_preserves_a_legacy_data_directory_socket() {
+        let environment = TestEnvironment::new();
+        let scan_context = assigned_context(true);
+        let desired = &scan_context.coordinates().desired.desired_specs[0];
+        let (_record, attachment) = exact_owned_record_and_attachment(desired);
+        let data_directory = prepare_exact_lineage(&environment, desired, &attachment);
+        install_exact_control_only_files(&data_directory, attachment.size_bytes);
+        let legacy_socket = data_directory.join("root-provision.sock");
+        let listener = std::os::unix::net::UnixListener::bind(&legacy_socket).unwrap();
+
+        let error = authorized_data_probe(&environment)
+            .prove_absent(&scan_context)
+            .expect_err("the old data-directory socket is foreign residue");
+
+        assert!(format!("{error:#}").contains("foreign entry root-provision.sock"));
+        assert!(legacy_socket
+            .symlink_metadata()
+            .unwrap()
+            .file_type()
+            .is_socket());
+        drop(listener);
     }
 
     #[test]
@@ -11866,6 +12337,7 @@ mod tests {
         assert!(scan_nbd(&environment.block_root, 16, None, &context()).is_err());
     }
 
+    #[cfg(target_os = "linux")]
     #[test]
     fn installed_factory_derives_checkpoint_evidence_from_the_scanned_dirfd_child() {
         let environment = TestEnvironment::new();
@@ -11884,6 +12356,25 @@ mod tests {
                 std::fs::create_dir(installed).unwrap();
             }
             std::fs::set_permissions(installed, std::fs::Permissions::from_mode(0o700)).unwrap();
+            let blockd_socket_root =
+                cats_blockd::runtime_socket_namespace::ManagedBlockdSocketRoot::installed();
+            let blockd_installed = Path::new(blockd_socket_root.path().as_str());
+            std::fs::create_dir_all(blockd_installed.parent().unwrap()).unwrap();
+            let mut builder = std::fs::DirBuilder::new();
+            builder.mode(0o700);
+            match builder.create(blockd_installed) {
+                Ok(()) => {}
+                Err(source) if source.kind() == io::ErrorKind::AlreadyExists => {}
+                Err(source) => panic!(
+                    "create installed managed blockd socket root {}: {source}",
+                    blockd_installed.display()
+                ),
+            }
+            // `mkdir` is the only publication step. Whether this test or a
+            // concurrent installed-composition test won the race, retain and
+            // validate the exact installation-owned inode before proceeding.
+            RetainedManagedBlockdSocketRoot::open_installed().unwrap();
+            BlockdSocketIntentStore::provision_for_test(state.clone()).unwrap();
             VmmSocketReceiptStore::provision_for_test(state.clone()).unwrap();
             let launch_root = state.path().join(VMM_LAUNCH_FILE_NAMESPACE);
             std::fs::create_dir(&launch_root).unwrap();
@@ -11923,6 +12414,8 @@ mod tests {
             config.checkpoint_directory,
             state.path().join(CHECKPOINT_NAMESPACE)
         );
+        assert!(config.managed_blockd_socket_root.is_some());
+        assert!(config.blockd_socket_intents.is_some());
     }
 
     #[cfg(target_os = "linux")]
@@ -11999,11 +12492,13 @@ mod tests {
         assert_eq!(std::fs::read(foreign).unwrap(), b"foreign");
     }
 
+    struct SyntheticManagedListener;
+
     fn install_exact_process_fixture(
         environment: &TestEnvironment,
         expected: &RootProvisionProcessExpectation,
         process_id: u32,
-    ) -> std::os::unix::net::UnixListener {
+    ) -> SyntheticManagedListener {
         std::fs::create_dir(environment.systemd_root.join(expected.scope_id.as_str())).unwrap();
         let proc = environment.proc_root.join(process_id.to_string());
         std::fs::create_dir(&proc).unwrap();
@@ -12013,14 +12508,11 @@ mod tests {
             [expected.executable_path.as_str().as_bytes(), b"\0"].concat(),
         )
         .unwrap();
-        let socket =
-            std::os::unix::net::UnixListener::bind(expected.control_socket_path.as_str()).unwrap();
-        std::fs::set_permissions(
-            expected.control_socket_path.as_str(),
-            <std::fs::Permissions as std::os::unix::fs::PermissionsExt>::from_mode(0o700),
-        )
-        .unwrap();
-        socket
+        // The fake process port below supplies the exact socket-peer proof.
+        // Do not bind the production `/run/cats/blockd-v1` pathname from a
+        // non-privileged unit test; whole-root listener coverage provisions a
+        // retained temporary namespace in blockd_socket_namespace tests.
+        SyntheticManagedListener
     }
 
     #[test]
@@ -12102,21 +12594,16 @@ mod tests {
             cats_api::runtime_reconciliation::UnixMillis::new(9_000).unwrap(),
         );
         let token = RandomId128::new("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa").unwrap();
+        let provision_transition_id = RandomId128::new("bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb").unwrap();
         let scope_id = Id::new("cats-root-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa.service").unwrap();
         let data = HostPath::new(data_directory.to_string_lossy().into_owned()).unwrap();
         checkpoint.step = ReconcileStep::ProvisionRootImage {
-            provision_transition_id: RandomId128::new("bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb").unwrap(),
+            provision_transition_id: provision_transition_id.clone(),
             volume_id: attachment.identity.volume_id.clone(),
             attachment_id: attachment.identity.attachment_id.clone(),
             attachment_epoch: attachment.identity.attachment_epoch,
             scope_id,
-            control_socket_path: HostPath::new(
-                data_directory
-                    .join("root-provision.sock")
-                    .to_string_lossy()
-                    .into_owned(),
-            )
-            .unwrap(),
+            control_socket_path: managed_root_control_socket(&provision_transition_id),
             data_directory: data.clone(),
             process_identity_token: token,
             size_bytes: attachment.size_bytes,
@@ -12182,29 +12669,25 @@ mod tests {
         process_id: u32,
         leave_temp: bool,
     ) {
-        let listener =
-            std::os::unix::net::UnixListener::bind(expected.control_socket_path.as_str()).unwrap();
-        std::fs::set_permissions(
-            expected.control_socket_path.as_str(),
-            std::fs::Permissions::from_mode(0o700),
-        )
-        .unwrap();
         let mut retained =
             AuthorizedBlockdStore::new(StateDirectory::unanchored(environment.state.clone()))
                 .retain_exact_runtime_checkpoint(stored.checkpoint())
                 .unwrap();
-        let socket = retained
-            .retain_exact_control_socket()
-            .unwrap()
-            .expect("test listener is an exact retained control socket");
+        let node_boot_id = NodeBootId::new("33333333333333333333333333333333").unwrap();
+        let socket_owner =
+            super::super::blockd_socket_namespace::ManagedBlockdRootStopOwnerEvidence::for_test(
+                expected,
+                node_boot_id.clone(),
+            )
+            .unwrap();
         let receipt = super::super::authorized_blockd::RootProvisionStopReceipt::new(
             stored.checkpoint(),
             acquired,
             record.clone(),
             exact_process_evidence(expected, process_id),
-            socket,
+            socket_owner,
             super::super::root_provision_process::RootProvisionRetirementAdmission {
-                node_boot_id: NodeBootId::new("33333333333333333333333333333333").unwrap(),
+                node_boot_id,
                 agent_instance_id: RandomId128::new("44444444444444444444444444444444").unwrap(),
                 agent_session_epoch: Epoch::new(2).unwrap(),
                 inventory_epoch: Epoch::new(4).unwrap(),
@@ -12217,7 +12700,6 @@ mod tests {
             retained.persist_or_reopen_stop_receipt(&receipt).unwrap(),
             super::super::authorized_blockd::StopReceiptPublication::Published(_)
         ));
-        drop(listener);
         if leave_temp {
             std::fs::rename(
                 retained
@@ -12232,7 +12714,7 @@ mod tests {
     }
 
     #[test]
-    fn stable_receipt_cannot_starve_another_cats_temp_publication() {
+    fn stable_managed_owner_receipt_cannot_starve_another_cats_temp_publication() {
         let environment = TestEnvironment::new();
         let first = full_root_scanner_fixture(&environment);
         let mut scan_context = first.scan_context.clone();
@@ -12274,20 +12756,15 @@ mod tests {
             UnixMillis::new(9_001).unwrap(),
         );
         let second_data_host = HostPath::new(second_data.to_str().unwrap().to_owned()).unwrap();
+        let second_provision_transition_id =
+            RandomId128::new("cccccccccccccccccccccccccccccccc").unwrap();
         second_checkpoint.step = ReconcileStep::ProvisionRootImage {
-            provision_transition_id: RandomId128::new("cccccccccccccccccccccccccccccccc").unwrap(),
+            provision_transition_id: second_provision_transition_id.clone(),
             volume_id: second_attachment.identity.volume_id.clone(),
             attachment_id: second_attachment.identity.attachment_id.clone(),
             attachment_epoch: second_attachment.identity.attachment_epoch,
             scope_id: Id::new("cats-root-dddddddddddddddddddddddddddddddd.service").unwrap(),
-            control_socket_path: HostPath::new(
-                second_data
-                    .join("root-provision.sock")
-                    .to_str()
-                    .unwrap()
-                    .to_owned(),
-            )
-            .unwrap(),
+            control_socket_path: managed_root_control_socket(&second_provision_transition_id),
             data_directory: second_data_host.clone(),
             process_identity_token: RandomId128::new("dddddddddddddddddddddddddddddddd").unwrap(),
             size_bytes: second_attachment.size_bytes,
@@ -12488,6 +12965,8 @@ mod tests {
         let volume = &fixture.acquired.volume;
         let data_directory =
             HostPath::new(fixture.data_directory.to_string_lossy().into_owned()).unwrap();
+        let ownership_token = RandomId128::new("cccccccccccccccccccccccccccccccc").unwrap();
+        let (control_socket_path, io_socket_path) = managed_serving_sockets(&ownership_token);
         checkpoint.step = ReconcileStep::PrepareDevice {
             devices: vec![PreparedDeviceInput {
                 volume_intent_id: volume.volume_intent_id.clone(),
@@ -12501,35 +12980,21 @@ mod tests {
                 size_bytes: attachment.size_bytes,
                 durability: attachment.durability,
                 guest_device: volume.guest_device.clone(),
-                ownership_token: RandomId128::new("cccccccccccccccccccccccccccccccc").unwrap(),
+                ownership_token,
                 serving_authority: Box::new(ServingAuthorityProvenance::AfterRootProvision {
                     handoff,
                 }),
                 serving_process: ServingBlockdIdentity {
                     scope_id: Id::new("cats-serving-dddddddddddddddddddddddddddddddd.service")
                         .unwrap(),
-                    control_socket_path: HostPath::new(
-                        fixture
-                            .data_directory
-                            .join("serving-control.sock")
-                            .to_string_lossy()
-                            .into_owned(),
-                    )
-                    .unwrap(),
+                    control_socket_path,
                     data_directory,
                     executable_path: fixture.expected.executable_path.clone(),
                     process_identity_token: RandomId128::new("dddddddddddddddddddddddddddddddd")
                         .unwrap(),
                 },
                 frontend: PrepareDeviceFrontend::VhostUserBlk {
-                    socket_path: HostPath::new(
-                        fixture
-                            .data_directory
-                            .join("serving-vhost.sock")
-                            .to_string_lossy()
-                            .into_owned(),
-                    )
-                    .unwrap(),
+                    socket_path: io_socket_path,
                     queues: 2,
                     queue_size: 256,
                 },
@@ -12560,7 +13025,11 @@ mod tests {
     struct LivePreparedScannerFixture {
         stored: StoredCheckpoint,
         old_process: super::super::root_provision_process::RootProvisionProcessEvidence,
-        _listeners: Vec<std::os::unix::net::UnixListener>,
+        #[cfg(target_os = "linux")]
+        retained_root_expected: RootProvisionProcessExpectation,
+        #[cfg(target_os = "linux")]
+        serving_expected: ServingBlockdExpectation,
+        _listeners: Vec<SyntheticManagedListener>,
     }
 
     fn install_live_prepare_device_fixture(
@@ -12625,6 +13094,13 @@ mod tests {
             &fixture.record,
         )
         .unwrap();
+        #[cfg(target_os = "linux")]
+        let retained_root_expected = RootProvisionProcessExpectation::from_retained_prepare_device(
+            stored.checkpoint(),
+            &fixture.acquired.desired,
+            serving_ready.attempt(),
+        )
+        .unwrap();
         drop(serving_ready);
         std::fs::create_dir(
             environment
@@ -12652,23 +13128,792 @@ mod tests {
             })
             .collect::<Vec<_>>();
         std::fs::write(serving_proc.join("cmdline"), serving_cmdline).unwrap();
-        let serving_control =
-            std::os::unix::net::UnixListener::bind(serving_expected.control_socket_path().as_str())
-                .unwrap();
-        let serving_frontend =
-            std::os::unix::net::UnixListener::bind(serving_expected.listener_path().as_str())
-                .unwrap();
-        for path in [
-            serving_expected.control_socket_path().as_str(),
-            serving_expected.listener_path().as_str(),
-        ] {
-            std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700)).unwrap();
-        }
         LivePreparedScannerFixture {
             stored,
             old_process,
-            _listeners: vec![old_socket, serving_control, serving_frontend],
+            #[cfg(target_os = "linux")]
+            retained_root_expected,
+            #[cfg(target_os = "linux")]
+            serving_expected,
+            _listeners: vec![
+                old_socket,
+                SyntheticManagedListener,
+                SyntheticManagedListener,
+            ],
         }
+    }
+
+    #[cfg(target_os = "linux")]
+    struct ManagedInspectAllFixture {
+        root: Arc<RetainedManagedBlockdSocketRoot>,
+        intents: Arc<BlockdSocketIntentStore>,
+        boot: CurrentBlockdSocketBoot,
+        root_expected: RootProvisionProcessExpectation,
+        serving_expected: ServingBlockdExpectation,
+        root_intent: BlockdSocketOwnershipIntentV1,
+        serving_intent: BlockdSocketOwnershipIntentV1,
+    }
+
+    #[cfg(target_os = "linux")]
+    fn managed_inspect_all_fixture(environment: &TestEnvironment) -> ManagedInspectAllFixture {
+        let fixture = full_root_scanner_fixture(environment);
+        let mut live = install_live_prepare_device_fixture(environment, &fixture);
+        let root = Arc::new(
+            RetainedManagedBlockdSocketRoot::provision_for_test(
+                &environment._root.path().join("managed-blockd-sockets"),
+            )
+            .unwrap(),
+        );
+        let intents = Arc::new(
+            BlockdSocketIntentStore::provision_for_test(StateDirectory::unanchored(
+                environment.state.clone(),
+            ))
+            .unwrap(),
+        );
+        let boot = CurrentBlockdSocketBoot::read().unwrap();
+
+        let root_scope = live.retained_root_expected.scope_id.clone();
+        let serving_scope = live.serving_expected.unit_id().clone();
+        let serving_process_id = 81;
+        live._listeners.clear();
+        for path in [
+            environment
+                .proc_root
+                .join(live.old_process.process_id.to_string()),
+            environment.proc_root.join(serving_process_id.to_string()),
+            environment.systemd_root.join(root_scope.as_str()),
+            environment.systemd_root.join(serving_scope.as_str()),
+        ] {
+            std::fs::remove_dir_all(path).unwrap();
+        }
+        let mut root_expected = live.retained_root_expected;
+        let installed_root_expected = root_expected.clone();
+        root_expected.control_socket_path = root
+            .planner()
+            .root_paths(&root_expected.provision_transition_id)
+            .unwrap()
+            .control_socket()
+            .clone();
+        let mut restored_root_expected = root_expected.clone();
+        restored_root_expected.control_socket_path =
+            installed_root_expected.control_socket_path.clone();
+        assert_eq!(restored_root_expected, installed_root_expected);
+
+        let serving_expected = live
+            .serving_expected
+            .shadow_socket_root_for_test(root.planner())
+            .unwrap();
+        let root_intent = BlockdSocketOwnershipIntentV1::root(
+            &root,
+            &boot,
+            root_expected.provision_transition_id.clone(),
+            root_expected.socket_owner_authority_digest.clone(),
+        )
+        .unwrap();
+        let serving_intent = BlockdSocketOwnershipIntentV1::serving(
+            &root,
+            &boot,
+            serving_expected.device_ownership_token().clone(),
+            serving_socket_owner_authority_digest(serving_expected.prepared_device()).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            root_expected.control_socket_path,
+            *root_intent.control_socket_path()
+        );
+        assert_eq!(
+            serving_expected.control_socket_path(),
+            serving_intent.control_socket_path()
+        );
+        assert_eq!(
+            Some(serving_expected.listener_path()),
+            serving_intent.io_socket_path()
+        );
+        ManagedInspectAllFixture {
+            root,
+            intents,
+            boot,
+            root_expected,
+            serving_expected,
+            root_intent,
+            serving_intent,
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    fn managed_inspect_all_bridge(
+        environment: &TestEnvironment,
+        managed: &ManagedInspectAllFixture,
+        root_port: Arc<dyn RootProvisionProcessPort>,
+        serving_port: Arc<dyn ServingBlockdProcessPort>,
+    ) -> PlatformRootProcessInventoryBridge {
+        let mut bridge = root_process_bridge_with_all_ports(
+            environment,
+            root_port,
+            serving_port,
+            Arc::new(FakeVmmProcessPort {
+                process_ids: Mutex::new(VecDeque::new()),
+            }),
+        );
+        bridge.managed_blockd_socket_root = Some(Arc::clone(&managed.root));
+        bridge.blockd_socket_intents = Some(Arc::clone(&managed.intents));
+        bridge
+    }
+
+    #[cfg(target_os = "linux")]
+    fn managed_inspect_all(
+        bridge: &PlatformRootProcessInventoryBridge,
+        managed: &ManagedInspectAllFixture,
+        stop_receipts: BTreeMap<Id, StopReceiptSocketAdmission>,
+    ) -> anyhow::Result<RootProcessInventoryBridgeOutcome> {
+        bridge.inspect_all(
+            BTreeMap::from([(
+                managed.root_expected.cat_id.clone(),
+                managed.root_expected.clone(),
+            )]),
+            BTreeMap::from([(
+                ManagedServingKey::new(
+                    managed.serving_expected.cat_id().clone(),
+                    managed.serving_expected.volume_id().clone(),
+                ),
+                managed.serving_expected.clone(),
+            )]),
+            BTreeMap::new(),
+            stop_receipts,
+            &assigned_context(true),
+        )
+    }
+
+    #[cfg(target_os = "linux")]
+    fn install_managed_process_fixture(
+        environment: &TestEnvironment,
+        scope_id: &Id,
+        executable_path: &HostPath,
+        command_line: impl IntoIterator<Item = OsString>,
+        process_id: u32,
+    ) {
+        std::fs::create_dir(environment.systemd_root.join(scope_id.as_str())).unwrap();
+        let proc = environment.proc_root.join(process_id.to_string());
+        std::fs::create_dir(&proc).unwrap();
+        std::os::unix::fs::symlink(executable_path.as_str(), proc.join("exe")).unwrap();
+        let command_line = command_line
+            .into_iter()
+            .flat_map(|argument| {
+                argument
+                    .as_os_str()
+                    .as_bytes()
+                    .iter()
+                    .copied()
+                    .chain(std::iter::once(0))
+                    .collect::<Vec<_>>()
+            })
+            .collect::<Vec<_>>();
+        std::fs::write(proc.join("cmdline"), command_line).unwrap();
+    }
+
+    #[cfg(target_os = "linux")]
+    fn file_bytes_and_inode(path: &Path) -> (Vec<u8>, u64) {
+        let metadata = std::fs::symlink_metadata(path).unwrap();
+        (std::fs::read(path).unwrap(), metadata.ino())
+    }
+
+    #[cfg(target_os = "linux")]
+    fn intent_receipt_path(
+        environment: &TestEnvironment,
+        intent: &BlockdSocketOwnershipIntentV1,
+    ) -> PathBuf {
+        let owner = match intent.owner() {
+            super::super::blockd_socket_namespace::BlockdSocketOwnerV1::Root {
+                provision_transition_id,
+            } => format!("r-{provision_transition_id}.intent.v1.json"),
+            super::super::blockd_socket_namespace::BlockdSocketOwnerV1::Serving {
+                device_ownership_token,
+            } => format!("d-{device_ownership_token}.intent.v1.json"),
+        };
+        environment
+            .state
+            .join(super::super::BLOCKD_SOCKET_INTENT_NAMESPACE)
+            .join(owner)
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn normal_full_managed_root_composes_absent_then_exact_root_and_serving_owners() {
+        let environment = TestEnvironment::new();
+        let managed = managed_inspect_all_fixture(&environment);
+        for intent in [&managed.root_intent, &managed.serving_intent] {
+            managed
+                .intents
+                .publish(intent, &managed.root, &managed.boot)
+                .unwrap();
+            drop(
+                managed
+                    .root
+                    .prepare_existing_intent(&managed.intents, intent, &managed.boot)
+                    .unwrap(),
+            );
+        }
+
+        let absent = managed_inspect_all_bridge(
+            &environment,
+            &managed,
+            Arc::new(FakeRootProcessPort {
+                inspections: Mutex::new(VecDeque::from([
+                    RootProvisionProcessInspection::Absent,
+                    RootProvisionProcessInspection::Absent,
+                ])),
+            }),
+            Arc::new(FakeServingProcessPort {
+                process_ids: Mutex::new(VecDeque::from([None, None])),
+            }),
+        );
+        let RootProcessInventoryBridgeOutcome::Complete(absent) =
+            managed_inspect_all(&absent, &managed, BTreeMap::new()).unwrap()
+        else {
+            panic!("closed marker-only managed owners must be an available normal full scan")
+        };
+        assert!(absent.root_control_proofs().is_empty());
+        assert!(absent.serving_blockd_proofs().is_empty());
+
+        let prepared_root = managed
+            .root
+            .prepare_existing_intent(&managed.intents, &managed.root_intent, &managed.boot)
+            .unwrap();
+        let root_listener =
+            std::os::unix::net::UnixListener::bind(prepared_root.control_socket_path().as_str())
+                .unwrap();
+        prepared_root
+            .assert_post_submit_owner_current(
+                &managed.boot,
+                super::super::blockd_socket_namespace::BlockdSocketPostSubmitOutcome::HandshakeVerified,
+            )
+            .unwrap();
+        drop(prepared_root);
+
+        let prepared_serving = managed
+            .root
+            .prepare_existing_intent(&managed.intents, &managed.serving_intent, &managed.boot)
+            .unwrap();
+        let serving_control_listener =
+            std::os::unix::net::UnixListener::bind(prepared_serving.control_socket_path().as_str())
+                .unwrap();
+        let serving_io_listener = std::os::unix::net::UnixListener::bind(
+            prepared_serving.io_socket_path().unwrap().as_str(),
+        )
+        .unwrap();
+        prepared_serving
+            .assert_post_submit_owner_current(
+                &managed.boot,
+                super::super::blockd_socket_namespace::BlockdSocketPostSubmitOutcome::HandshakeVerified,
+            )
+            .unwrap();
+        drop(prepared_serving);
+
+        let root_process = exact_process_evidence(&managed.root_expected, 79);
+        install_managed_process_fixture(
+            &environment,
+            &managed.root_expected.scope_id,
+            &managed.root_expected.executable_path,
+            [OsString::from(
+                managed.root_expected.executable_path.as_str(),
+            )],
+            root_process.process_id,
+        );
+        install_managed_process_fixture(
+            &environment,
+            managed.serving_expected.unit_id(),
+            managed.serving_expected.executable_path(),
+            managed.serving_expected.command_line().iter().cloned(),
+            81,
+        );
+        let exact = managed_inspect_all_bridge(
+            &environment,
+            &managed,
+            Arc::new(FakeRootProcessPort {
+                inspections: Mutex::new(VecDeque::from([
+                    RootProvisionProcessInspection::Exact(Box::new(root_process.clone())),
+                    RootProvisionProcessInspection::Exact(Box::new(root_process)),
+                ])),
+            }),
+            Arc::new(FakeServingProcessPort {
+                process_ids: Mutex::new(VecDeque::from([Some(81), Some(81)])),
+            }),
+        );
+        let RootProcessInventoryBridgeOutcome::Complete(exact) =
+            managed_inspect_all(&exact, &managed, BTreeMap::new()).unwrap()
+        else {
+            panic!("one exact Root and Serving owner must complete the normal full scan")
+        };
+        assert_eq!(
+            exact.root_control_proofs().keys().collect::<Vec<_>>(),
+            [&managed.root_expected.cat_id]
+        );
+        assert_eq!(exact.serving_blockd_proofs().len(), 1);
+        assert_eq!(exact.exact_process_count(&managed.root_expected.cat_id), 2);
+        drop((root_listener, serving_control_listener, serving_io_listener));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn normal_full_managed_root_rejects_live_listeners_for_processes_reported_absent() {
+        let environment = TestEnvironment::new();
+        let managed = managed_inspect_all_fixture(&environment);
+        for intent in [&managed.root_intent, &managed.serving_intent] {
+            managed
+                .intents
+                .publish(intent, &managed.root, &managed.boot)
+                .unwrap();
+        }
+        let prepared_root = managed
+            .root
+            .prepare_existing_intent(&managed.intents, &managed.root_intent, &managed.boot)
+            .unwrap();
+        let root_listener =
+            std::os::unix::net::UnixListener::bind(prepared_root.control_socket_path().as_str())
+                .unwrap();
+        prepared_root
+            .assert_post_submit_owner_current(
+                &managed.boot,
+                super::super::blockd_socket_namespace::BlockdSocketPostSubmitOutcome::HandshakeVerified,
+            )
+            .unwrap();
+        drop(prepared_root);
+        let prepared_serving = managed
+            .root
+            .prepare_existing_intent(&managed.intents, &managed.serving_intent, &managed.boot)
+            .unwrap();
+        let serving_control_listener =
+            std::os::unix::net::UnixListener::bind(prepared_serving.control_socket_path().as_str())
+                .unwrap();
+        let serving_io_listener = std::os::unix::net::UnixListener::bind(
+            prepared_serving.io_socket_path().unwrap().as_str(),
+        )
+        .unwrap();
+        prepared_serving
+            .assert_post_submit_owner_current(
+                &managed.boot,
+                super::super::blockd_socket_namespace::BlockdSocketPostSubmitOutcome::HandshakeVerified,
+            )
+            .unwrap();
+        drop(prepared_serving);
+
+        for path in [
+            managed.root_intent.control_socket_path(),
+            managed.serving_intent.control_socket_path(),
+            managed.serving_intent.io_socket_path().unwrap(),
+        ] {
+            std::os::unix::net::UnixStream::connect(path.as_str())
+                .expect("known-positive managed listener must accept a connection");
+        }
+        let root_paths = managed
+            .root
+            .planner()
+            .root_paths(&managed.root_expected.provision_transition_id)
+            .unwrap();
+        let serving_paths = managed
+            .root
+            .planner()
+            .serving_paths(managed.serving_expected.device_ownership_token())
+            .unwrap();
+        let before = [
+            file_bytes_and_inode(Path::new(root_paths.owner_marker().as_str())),
+            file_bytes_and_inode(Path::new(serving_paths.owner_marker().as_str())),
+            file_bytes_and_inode(&intent_receipt_path(&environment, &managed.root_intent)),
+            file_bytes_and_inode(&intent_receipt_path(&environment, &managed.serving_intent)),
+        ];
+        let bridge = managed_inspect_all_bridge(
+            &environment,
+            &managed,
+            Arc::new(FakeRootProcessPort {
+                inspections: Mutex::new(VecDeque::from([
+                    RootProvisionProcessInspection::Absent,
+                    RootProvisionProcessInspection::Absent,
+                ])),
+            }),
+            Arc::new(FakeServingProcessPort {
+                process_ids: Mutex::new(VecDeque::from([None, None])),
+            }),
+        );
+        let error = managed_inspect_all(&bridge, &managed, BTreeMap::new())
+            .expect_err("live managed listeners were projected as absent");
+        assert!(
+            format!("{error:#}").contains("retains a live Unix listener"),
+            "{error:#}"
+        );
+        assert_eq!(
+            before,
+            [
+                file_bytes_and_inode(Path::new(root_paths.owner_marker().as_str())),
+                file_bytes_and_inode(Path::new(serving_paths.owner_marker().as_str())),
+                file_bytes_and_inode(&intent_receipt_path(&environment, &managed.root_intent)),
+                file_bytes_and_inode(&intent_receipt_path(&environment, &managed.serving_intent)),
+            ]
+        );
+        drop((root_listener, serving_control_listener, serving_io_listener));
+    }
+
+    #[cfg(target_os = "linux")]
+    struct MutatingManagedRootProcessPort {
+        mutation_path: PathBuf,
+        calls: AtomicUsize,
+    }
+
+    #[cfg(target_os = "linux")]
+    impl super::super::root_provision_process::sealed::Sealed for MutatingManagedRootProcessPort {}
+
+    #[cfg(target_os = "linux")]
+    impl RootProvisionProcessPort for MutatingManagedRootProcessPort {
+        fn inspect(
+            &self,
+            _expected: &RootProvisionProcessExpectation,
+            _context: &dyn RuntimePhysicalReadContext,
+        ) -> anyhow::Result<RootProvisionProcessInspection> {
+            let call = self.calls.fetch_add(1, Ordering::SeqCst);
+            if call == 0 {
+                std::fs::write(&self.mutation_path, b"foreign").unwrap();
+            }
+            Ok(RootProvisionProcessInspection::Absent)
+        }
+
+        fn start_checkpointed(
+            &self,
+            _checkpointed: super::super::root_provision_process::CheckpointedRootProvisionProcess<
+                '_,
+            >,
+            _context: &RuntimeDesiredEffectContext,
+        ) -> anyhow::Result<super::super::root_provision_process::RootProvisionProcessStart>
+        {
+            unreachable!("inventory mutation regression is read-only")
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    struct ReplacingManagedMarkerPort {
+        marker_path: PathBuf,
+        replacement_path: PathBuf,
+        calls: AtomicUsize,
+    }
+
+    #[cfg(target_os = "linux")]
+    impl super::super::root_provision_process::sealed::Sealed for ReplacingManagedMarkerPort {}
+
+    #[cfg(target_os = "linux")]
+    impl RootProvisionProcessPort for ReplacingManagedMarkerPort {
+        fn inspect(
+            &self,
+            _expected: &RootProvisionProcessExpectation,
+            _context: &dyn RuntimePhysicalReadContext,
+        ) -> anyhow::Result<RootProvisionProcessInspection> {
+            let call = self.calls.fetch_add(1, Ordering::SeqCst);
+            if call == 0 {
+                let bytes = std::fs::read(&self.marker_path).unwrap();
+                std::fs::write(&self.replacement_path, bytes).unwrap();
+                std::fs::set_permissions(
+                    &self.replacement_path,
+                    std::fs::Permissions::from_mode(0o600),
+                )
+                .unwrap();
+                std::fs::rename(&self.replacement_path, &self.marker_path).unwrap();
+            }
+            Ok(RootProvisionProcessInspection::Absent)
+        }
+
+        fn start_checkpointed(
+            &self,
+            _checkpointed: super::super::root_provision_process::CheckpointedRootProvisionProcess<
+                '_,
+            >,
+            _context: &RuntimeDesiredEffectContext,
+        ) -> anyhow::Result<super::super::root_provision_process::RootProvisionProcessStart>
+        {
+            unreachable!("inventory marker-ABA regression is read-only")
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn normal_full_managed_root_rejects_a_mid_scan_unknown_owner_without_cleanup() {
+        let environment = TestEnvironment::new();
+        let managed = managed_inspect_all_fixture(&environment);
+        for intent in [&managed.root_intent, &managed.serving_intent] {
+            managed
+                .intents
+                .publish(intent, &managed.root, &managed.boot)
+                .unwrap();
+            drop(
+                managed
+                    .root
+                    .prepare_existing_intent(&managed.intents, intent, &managed.boot)
+                    .unwrap(),
+            );
+        }
+        let foreign = Path::new(managed.root.planner().path().as_str()).join("foreign");
+        let root_port = Arc::new(MutatingManagedRootProcessPort {
+            mutation_path: foreign.clone(),
+            calls: AtomicUsize::new(0),
+        });
+        let bridge = managed_inspect_all_bridge(
+            &environment,
+            &managed,
+            root_port.clone(),
+            Arc::new(FakeServingProcessPort {
+                process_ids: Mutex::new(VecDeque::from([None, None])),
+            }),
+        );
+        let error = managed_inspect_all(&bridge, &managed, BTreeMap::new())
+            .expect_err("mid-scan foreign managed owner entered a complete full inventory");
+        assert!(
+            format!("{error:#}").contains("unknown owner or recovery alias"),
+            "{error:#}"
+        );
+        assert_eq!(root_port.calls.load(Ordering::SeqCst), 1);
+        assert_eq!(std::fs::read(&foreign).unwrap(), b"foreign");
+        assert!(Path::new(
+            managed
+                .root
+                .planner()
+                .root_paths(&managed.root_expected.provision_transition_id)
+                .unwrap()
+                .public_directory()
+                .as_str()
+        )
+        .exists());
+        assert!(Path::new(
+            managed
+                .root
+                .planner()
+                .serving_paths(managed.serving_expected.device_ownership_token())
+                .unwrap()
+                .public_directory()
+                .as_str()
+        )
+        .exists());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn normal_full_managed_root_rejects_same_name_marker_inode_aba_without_cleanup() {
+        let environment = TestEnvironment::new();
+        let managed = managed_inspect_all_fixture(&environment);
+        for intent in [&managed.root_intent, &managed.serving_intent] {
+            managed
+                .intents
+                .publish(intent, &managed.root, &managed.boot)
+                .unwrap();
+            drop(
+                managed
+                    .root
+                    .prepare_existing_intent(&managed.intents, intent, &managed.boot)
+                    .unwrap(),
+            );
+        }
+        let root_paths = managed
+            .root
+            .planner()
+            .root_paths(&managed.root_expected.provision_transition_id)
+            .unwrap();
+        let serving_paths = managed
+            .root
+            .planner()
+            .serving_paths(managed.serving_expected.device_ownership_token())
+            .unwrap();
+        let marker = Path::new(root_paths.owner_marker().as_str()).to_path_buf();
+        let replacement = environment._root.path().join("replacement-owner-marker");
+        let marker_before = file_bytes_and_inode(&marker);
+        let stable_before = [
+            file_bytes_and_inode(Path::new(serving_paths.owner_marker().as_str())),
+            file_bytes_and_inode(&intent_receipt_path(&environment, &managed.root_intent)),
+            file_bytes_and_inode(&intent_receipt_path(&environment, &managed.serving_intent)),
+        ];
+        let root_port = Arc::new(ReplacingManagedMarkerPort {
+            marker_path: marker.clone(),
+            replacement_path: replacement,
+            calls: AtomicUsize::new(0),
+        });
+        let bridge = managed_inspect_all_bridge(
+            &environment,
+            &managed,
+            root_port.clone(),
+            Arc::new(FakeServingProcessPort {
+                process_ids: Mutex::new(VecDeque::from([None, None])),
+            }),
+        );
+        let error = managed_inspect_all(&bridge, &managed, BTreeMap::new())
+            .expect_err("same-name managed marker inode ABA entered a complete full inventory");
+        assert!(
+            format!("{error:#}").contains("changed across full Node-global inventory"),
+            "{error:#}"
+        );
+        assert_eq!(root_port.calls.load(Ordering::SeqCst), 1);
+        let marker_after = file_bytes_and_inode(&marker);
+        assert_eq!(marker_after.0, marker_before.0);
+        assert_ne!(marker_after.1, marker_before.1);
+        assert_eq!(
+            stable_before,
+            [
+                file_bytes_and_inode(Path::new(serving_paths.owner_marker().as_str())),
+                file_bytes_and_inode(&intent_receipt_path(&environment, &managed.root_intent)),
+                file_bytes_and_inode(&intent_receipt_path(&environment, &managed.serving_intent)),
+            ]
+        );
+        assert!(Path::new(root_paths.public_directory().as_str()).exists());
+        assert!(Path::new(serving_paths.public_directory().as_str()).exists());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn normal_full_stop_journal_tracks_physical_socket_then_retired_empty_owner() {
+        let environment = TestEnvironment::new();
+        let managed = managed_inspect_all_fixture(&environment);
+        managed
+            .intents
+            .publish(&managed.root_intent, &managed.root, &managed.boot)
+            .unwrap();
+        let prepared = managed
+            .root
+            .prepare_existing_intent(&managed.intents, &managed.root_intent, &managed.boot)
+            .unwrap();
+        let listener =
+            std::os::unix::net::UnixListener::bind(prepared.control_socket_path().as_str())
+                .unwrap();
+        prepared
+            .assert_post_submit_owner_current(
+                &managed.boot,
+                super::super::blockd_socket_namespace::BlockdSocketPostSubmitOutcome::HandshakeVerified,
+            )
+            .unwrap();
+        let stop_owner = prepared
+            .retain_root_stop_owner_evidence(&managed.boot)
+            .unwrap();
+        drop((prepared, listener));
+
+        let first_bridge = managed_inspect_all_bridge(
+            &environment,
+            &managed,
+            Arc::new(FakeRootProcessPort {
+                inspections: Mutex::new(VecDeque::from([
+                    RootProvisionProcessInspection::Absent,
+                    RootProvisionProcessInspection::Absent,
+                ])),
+            }),
+            Arc::new(FakeServingProcessPort {
+                process_ids: Mutex::new(VecDeque::from([None, None])),
+            }),
+        );
+        let RootProcessInventoryBridgeOutcome::Complete(first) = managed_inspect_all(
+            &first_bridge,
+            &managed,
+            BTreeMap::from([(
+                managed.root_expected.cat_id.clone(),
+                StopReceiptSocketAdmission::from_managed(stop_owner.clone()),
+            )]),
+        )
+        .unwrap() else {
+            panic!("stopped Root owner must retain its exact journaled socket")
+        };
+        let first = first.into_admission_for_test();
+        assert_eq!(
+            first
+                .stop_receipt_socket(&managed.root_expected.cat_id)
+                .unwrap()
+                .receipt_socket(),
+            stop_owner.control_socket_path()
+        );
+        assert_eq!(
+            first.stop_receipt_physical_paths(),
+            BTreeSet::from([managed.root_intent.control_socket_path().clone()])
+        );
+
+        let effect_context = RuntimeDesiredEffectContext::for_test(
+            StateDirectory::unanchored(environment.state.clone()),
+            Instant::now() + Duration::from_secs(5),
+        );
+        let node_global = effect_context.lock_node_global_effect().unwrap();
+        let capture = managed
+            .root
+            .capture_start_absence(&managed.intents, &managed.root_intent, &managed.boot)
+            .unwrap();
+        let expected = [managed.root_intent.clone(), managed.serving_intent.clone()];
+        let before = managed
+            .root
+            .capture_closed_whole_root(&managed.intents, &expected)
+            .unwrap();
+        let after = managed
+            .root
+            .capture_closed_whole_root(&managed.intents, &expected)
+            .unwrap();
+        let absence = ExactManagedBlockdSocketOwnerStartAbsence::seal_after_node_global_sweep(
+            capture,
+            before,
+            after,
+            &managed.boot,
+            node_global,
+        )
+        .unwrap();
+        assert_eq!(
+            managed
+                .root
+                .retire_absent_owner(
+                    &managed.intents,
+                    &managed.root_intent,
+                    &managed.boot,
+                    absence,
+                )
+                .unwrap(),
+            super::super::blockd_socket_namespace::ManagedBlockdSocketOwnerRetirement::Retired
+        );
+
+        let second_bridge = managed_inspect_all_bridge(
+            &environment,
+            &managed,
+            Arc::new(FakeRootProcessPort {
+                inspections: Mutex::new(VecDeque::from([
+                    RootProvisionProcessInspection::Absent,
+                    RootProvisionProcessInspection::Absent,
+                ])),
+            }),
+            Arc::new(FakeServingProcessPort {
+                process_ids: Mutex::new(VecDeque::from([None, None])),
+            }),
+        );
+        let expected_receipt_socket = stop_owner.control_socket_path().clone();
+        let RootProcessInventoryBridgeOutcome::Complete(second) = managed_inspect_all(
+            &second_bridge,
+            &managed,
+            BTreeMap::from([(
+                managed.root_expected.cat_id.clone(),
+                StopReceiptSocketAdmission::from_managed(stop_owner),
+            )]),
+        )
+        .unwrap() else {
+            panic!("retired owner with a surviving semantic journal must scan complete")
+        };
+        let second = second.into_admission_for_test();
+        let retained_semantic_receipt = second
+            .stop_receipt_socket(&managed.root_expected.cat_id)
+            .expect("owner retirement must not erase the semantic stop receipt admission");
+        assert_eq!(
+            retained_semantic_receipt.receipt_socket(),
+            &expected_receipt_socket
+        );
+        assert!(second.stop_receipt_physical_paths().is_empty());
+        assert!(
+            !Path::new(
+                managed
+                    .root
+                    .planner()
+                    .root_paths(&managed.root_expected.provision_transition_id)
+                    .unwrap()
+                    .public_directory()
+                    .as_str()
+            )
+            .exists()
+                && managed
+                    .intents
+                    .load(managed.root_intent.owner())
+                    .unwrap()
+                    .is_none()
+        );
     }
 
     fn retire_old_process_fixture(
@@ -12676,9 +13921,7 @@ mod tests {
         fixture: &FullRootScannerFixture,
         live: &mut LivePreparedScannerFixture,
     ) {
-        let old_listener = live._listeners.remove(0);
-        drop(old_listener);
-        std::fs::remove_file(fixture.expected.control_socket_path.as_str()).unwrap();
+        let _ = live._listeners.remove(0);
         std::fs::remove_dir_all(
             environment
                 .proc_root
@@ -13309,19 +14552,13 @@ mod tests {
             let mut device =
                 direct_vhost_prepared_device(&environment, &desired, index, &attachment, &data);
             if matches!(frontend_fixture, RunningFrontendFixture::KernelNbd) {
+                let (_, listener_socket_path) = managed_serving_sockets(&device.ownership_token);
                 device.frontend = PrepareDeviceFrontend::KernelNbd {
-                    listener_socket_path: HostPath::new(
-                        data.join("serving-nbd.sock").to_string_lossy().into_owned(),
-                    )
-                    .unwrap(),
+                    listener_socket_path,
                     device_path: HostPath::new(format!("/dev/nbd{index}")).unwrap(),
                     direct: false,
                 };
             }
-            let control = std::os::unix::net::UnixListener::bind(
-                device.serving_process.control_socket_path.as_str(),
-            )
-            .unwrap();
             let frontend_path = match &device.frontend {
                 PrepareDeviceFrontend::VhostUserBlk { socket_path, .. } => socket_path,
                 PrepareDeviceFrontend::KernelNbd {
@@ -13329,13 +14566,13 @@ mod tests {
                     ..
                 } => listener_socket_path,
             };
-            let frontend = std::os::unix::net::UnixListener::bind(frontend_path.as_str()).unwrap();
-            for path in [
-                device.serving_process.control_socket_path.as_str(),
-                frontend_path.as_str(),
-            ] {
-                std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700)).unwrap();
-            }
+            let (expected_control_socket, expected_io_socket) =
+                managed_serving_sockets(&device.ownership_token);
+            assert_eq!(
+                device.serving_process.control_socket_path,
+                expected_control_socket
+            );
+            assert_eq!(frontend_path, &expected_io_socket);
             if let (RunningFrontendFixture::KernelNbd, Some(client)) =
                 (frontend_fixture, kernel_nbd_client.as_ref())
             {
@@ -13389,7 +14626,7 @@ mod tests {
             records.insert(record.volume_id.clone(), record);
             attachments.push(attachment);
             devices.push(device);
-            listeners.extend([control, frontend]);
+            listeners.extend([SyntheticManagedListener, SyntheticManagedListener]);
         }
 
         let planned = crate::ch::plan_network(&desired.runtime.network_config).unwrap();
@@ -14325,18 +15562,8 @@ mod tests {
             })
             .collect::<Vec<_>>();
         std::fs::write(serving_proc.join("cmdline"), serving_cmdline).unwrap();
-        let _serving_control =
-            std::os::unix::net::UnixListener::bind(serving_expected.control_socket_path().as_str())
-                .unwrap();
-        let _serving_frontend =
-            std::os::unix::net::UnixListener::bind(serving_expected.listener_path().as_str())
-                .unwrap();
-        for path in [
-            serving_expected.control_socket_path().as_str(),
-            serving_expected.listener_path().as_str(),
-        ] {
-            std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700)).unwrap();
-        }
+        let _serving_control = SyntheticManagedListener;
+        let _serving_frontend = SyntheticManagedListener;
         let scanner = full_root_scanner_with_serving(
             &fixture,
             [
@@ -14411,25 +15638,10 @@ mod tests {
             RootProvisionProcessInspection::Exact(Box::new(second_process))
         );
 
-        drop(second_socket);
-        std::fs::remove_file(second_root.control_socket_path.as_str()).unwrap();
+        let _ = second_socket;
         std::fs::remove_dir_all(environment.systemd_root.join(second_root.scope_id.as_str()))
             .unwrap();
         std::fs::remove_dir_all(environment.proc_root.join("82")).unwrap();
-        let claimed_socket =
-            std::os::unix::net::UnixListener::bind(second_root.control_socket_path.as_str())
-                .unwrap();
-        std::fs::set_permissions(
-            second_root.control_socket_path.as_str(),
-            std::fs::Permissions::from_mode(0o700),
-        )
-        .unwrap();
-        drop(claimed_socket);
-        let second_quarantine = Path::new(second_root.control_socket_path.as_str())
-            .with_file_name(ROOT_PROVISION_STOP_SOCKET_QUARANTINE);
-        std::fs::rename(second_root.control_socket_path.as_str(), &second_quarantine).unwrap();
-        let second_quarantine =
-            HostPath::new(second_quarantine.to_string_lossy().into_owned()).unwrap();
         let absent_context = effect_context_with_managed_processes(
             &environment,
             [
@@ -14450,7 +15662,7 @@ mod tests {
                     second_root.cat_id.clone(),
                     StopReceiptSocketAdmission::new(
                         second_root.control_socket_path.clone(),
-                        BTreeSet::from([second_quarantine.clone()]),
+                        BTreeSet::from([second_root.control_socket_path.clone()]),
                     )
                     .unwrap(),
                 ),
@@ -14503,7 +15715,6 @@ mod tests {
                 .unwrap(),
             RootProvisionProcessInspection::Absent
         );
-        std::fs::remove_file(second_quarantine.as_str()).unwrap();
 
         let foreign_unit = environment.systemd_root.join("cats-foreign.service");
         std::fs::create_dir(&foreign_unit).unwrap();
@@ -14532,10 +15743,7 @@ mod tests {
         ));
         std::fs::remove_dir(foreign_unit).unwrap();
         std::fs::remove_dir_all(second_root.data_directory.as_str()).unwrap();
-        drop(_serving_control);
-        drop(_serving_frontend);
-        std::fs::remove_file(serving_expected.control_socket_path().as_str()).unwrap();
-        std::fs::remove_file(serving_expected.listener_path().as_str()).unwrap();
+        let _ = (_serving_control, _serving_frontend);
         std::fs::remove_dir_all(
             environment
                 .systemd_root
@@ -14581,9 +15789,14 @@ mod tests {
                 environment.proc_root.join("79").exists(),
                 "conflict classification must not delete the retained process"
             );
+            assert_eq!(
+                fixture.expected.control_socket_path,
+                managed_root_control_socket(&fixture.expected.provision_transition_id),
+                "conflict classification must not rewrite the retained managed socket identity"
+            );
             assert!(
-                Path::new(fixture.expected.control_socket_path.as_str()).exists(),
-                "conflict classification must not delete the retained socket"
+                !fixture.data_directory.join("root-provision.sock").exists(),
+                "a managed Root socket must never reappear in durable Cat data"
             );
         }
 
@@ -14822,13 +16035,7 @@ mod tests {
                 attachment_id: attachment.identity.attachment_id.clone(),
                 attachment_epoch: attachment.identity.attachment_epoch,
                 scope_id,
-                control_socket_path: HostPath::new(
-                    data_directory
-                        .join("root-provision.sock")
-                        .to_string_lossy()
-                        .into_owned(),
-                )
-                .unwrap(),
+                control_socket_path: managed_root_control_socket(&provision_transition_id),
                 data_directory: data.clone(),
                 process_identity_token,
                 size_bytes: attachment.size_bytes,
@@ -15234,7 +16441,7 @@ mod tests {
     }
 
     #[test]
-    fn root_process_bridge_fails_closed_on_conflict_foreign_and_partial_socket() {
+    fn root_process_bridge_fails_closed_on_conflict_foreign_and_legacy_socket() {
         let environment = TestEnvironment::new();
         let (expected, _) = root_process_expectation(&environment);
         let bridge = root_process_bridge(
@@ -15275,10 +16482,10 @@ mod tests {
 
         let environment = TestEnvironment::new();
         let (expected, _) = root_process_expectation(&environment);
-        let _partial =
-            std::os::unix::net::UnixListener::bind(expected.control_socket_path.as_str()).unwrap();
+        let legacy_socket = environment.socket_root.join("legacy-root-provision.sock");
+        let _partial = std::os::unix::net::UnixListener::bind(&legacy_socket).unwrap();
         std::fs::set_permissions(
-            expected.control_socket_path.as_str(),
+            legacy_socket,
             <std::fs::Permissions as std::os::unix::fs::PermissionsExt>::from_mode(0o700),
         )
         .unwrap();

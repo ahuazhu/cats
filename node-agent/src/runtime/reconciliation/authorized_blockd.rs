@@ -13,7 +13,7 @@ use std::fs::File;
 use std::io::{self, Read as _, Write as _};
 use std::os::fd::{AsRawFd as _, FromRawFd as _};
 use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
-use std::path::{Component, Path, PathBuf};
+use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use anyhow::{Context as _, Result};
@@ -26,6 +26,8 @@ use cats_api::runtime_reconciliation::{
     encode_desired_runtime_spec, ContractVersion, DiskKind, Durability, Id, RandomId128,
     RuntimeTarget, VolumeAccess, VolumeAcquire, VolumeDisposition, VolumeIntent,
 };
+#[cfg(test)]
+use cats_blockd::target_control::provision_root_authorization_context_digest;
 use cats_storage::authority::{
     validate_authorized_serving_attachment, validate_volume_record, AttachmentLineageIdentity,
     AuthorizedServingAttachment, VolumeRecord,
@@ -36,6 +38,7 @@ use sha2::{Digest as _, Sha256};
 
 use crate::state_directory::StateDirectory;
 
+use super::blockd_socket_namespace::ManagedBlockdRootStopOwnerEvidence;
 use super::network::prepared_device_input;
 use super::root_provision_process::{
     RootProvisionAuthoritySnapshot, RootProvisionProcessEvidence, RootProvisionProcessExpectation,
@@ -55,11 +58,6 @@ pub(crate) const MAX_AUTHORIZED_SERVING_BYTES: usize = 32 * 1024;
 pub(crate) const MAX_LAUNCH_CHECKPOINT_BYTES: usize = 512 * 1024;
 pub(crate) const ROOT_PROVISION_STOP_RECEIPT_FILE: &str = "root-provision-stop.json";
 pub(crate) const ROOT_PROVISION_STOP_RECEIPT_TEMP: &str = ".root-provision-stop.json.tmp";
-// Shorter than `root-provision.sock` so every admitted control path remains
-// connect-probeable after an atomic claim on platforms with a small sun_path.
-pub(crate) const ROOT_PROVISION_STOP_SOCKET_QUARANTINE: &str = ".rp-stop.sock";
-const STAT_FILE_TYPE_MASK: u32 = 0o170000;
-const STAT_SOCKET_FILE_TYPE: u32 = 0o140000;
 // The receipt stores fixed-size digests plus the bounded physical/authority
 // identity only; it deliberately does not duplicate either the (up to 4 MiB)
 // Runtime checkpoint or the (up to 512 KiB) launch checkpoint. Four HostPath
@@ -97,7 +95,7 @@ pub(crate) struct RootProvisionStopReceipt {
     authorized_checkpoint_content_digest: Sha256Digest,
     authority: VolumeRecord,
     process: RootProvisionProcessEvidence,
-    socket: StableFsIdentity,
+    socket_owner: ManagedBlockdRootStopOwnerEvidence,
     admission: RootProvisionRetirementAdmission,
 }
 
@@ -108,7 +106,7 @@ impl RootProvisionStopReceipt {
         authorized: &AuthorizedBlockdCheckpoint,
         authority: VolumeRecord,
         process: RootProvisionProcessEvidence,
-        socket: RetainedExactControlSocket,
+        socket_owner: ManagedBlockdRootStopOwnerEvidence,
         admission: RootProvisionRetirementAdmission,
     ) -> Result<Self> {
         let expectation = RootProvisionProcessExpectation::from_checkpoint(
@@ -119,9 +117,92 @@ impl RootProvisionStopReceipt {
             },
             process.executable_path.clone(),
         )?;
+        Self::new_validated(
+            checkpoint,
+            authorized,
+            authority,
+            &expectation,
+            process,
+            socket_owner,
+            admission,
+        )
+    }
+
+    /// Test-only constructor for an isolated managed socket root. Production
+    /// always derives its expectation from the installed mapper in `new`;
+    /// namespace integration tests instead provide the already-validated
+    /// expectation whose checkpoint path was derived from
+    /// `RetainedManagedBlockdSocketRoot::provision_for_test`.
+    #[cfg(test)]
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn new_for_isolated_socket_root_test(
+        checkpoint: &RuntimeCheckpoint,
+        authorized: &AuthorizedBlockdCheckpoint,
+        authority: VolumeRecord,
+        expectation: &RootProvisionProcessExpectation,
+        process: RootProvisionProcessEvidence,
+        socket_owner: ManagedBlockdRootStopOwnerEvidence,
+        admission: RootProvisionRetirementAdmission,
+    ) -> Result<Self> {
+        let mut installed_checkpoint = checkpoint.clone();
+        let ReconcileStep::ProvisionRootImage {
+            provision_transition_id,
+            control_socket_path,
+            ..
+        } = &mut installed_checkpoint.step
+        else {
+            anyhow::bail!("isolated Root stop test requires provision_root_image")
+        };
+        *control_socket_path =
+            cats_blockd::runtime_socket_namespace::ManagedBlockdSocketRoot::installed()
+                .root_paths(provision_transition_id)?
+                .control_socket()
+                .clone();
+        let mut installed_expectation = RootProvisionProcessExpectation::from_checkpoint(
+            &installed_checkpoint,
+            RootProvisionAuthoritySnapshot {
+                attachment: authorized.attachment.clone(),
+                volume: &authority,
+            },
+            process.executable_path.clone(),
+        )?;
+        installed_expectation.control_socket_path = expectation.control_socket_path.clone();
+        installed_expectation.socket_owner_authority_digest =
+            provision_root_authorization_context_digest(checkpoint)?
+                .as_sha256_digest()
+                .clone();
         anyhow::ensure!(
-            process.exactly_matches(&expectation),
+            installed_expectation == *expectation,
+            "isolated Root stop expectation changed fields beyond its managed socket mapping"
+        );
+        Self::new_validated(
+            checkpoint,
+            authorized,
+            authority,
+            expectation,
+            process,
+            socket_owner,
+            admission,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn new_validated(
+        checkpoint: &RuntimeCheckpoint,
+        authorized: &AuthorizedBlockdCheckpoint,
+        authority: VolumeRecord,
+        expectation: &RootProvisionProcessExpectation,
+        process: RootProvisionProcessEvidence,
+        socket_owner: ManagedBlockdRootStopOwnerEvidence,
+        admission: RootProvisionRetirementAdmission,
+    ) -> Result<Self> {
+        anyhow::ensure!(
+            process.exactly_matches(expectation),
             "root-provision stop process is not its exact old expectation"
+        );
+        anyhow::ensure!(
+            socket_owner.matches_expectation(expectation),
+            "root-provision stop socket owner is not its exact managed generation"
         );
         anyhow::ensure!(
             matches!(
@@ -139,7 +220,7 @@ impl RootProvisionStopReceipt {
             )?,
             authority,
             process,
-            socket: socket.identity,
+            socket_owner,
             admission,
         };
         validate_root_provision_stop_receipt(&receipt)?;
@@ -159,34 +240,8 @@ impl RootProvisionStopReceipt {
         &self.process
     }
 
-    pub(crate) fn socket(&self) -> RetainedExactControlSocket {
-        RetainedExactControlSocket {
-            identity: self.socket,
-        }
-    }
-
-    pub(crate) fn socket_matches_scanned_stat(&self, metadata: &libc::stat) -> bool {
-        let (Some(device), Some(links), Some(length)) = (
-            raw_stat_u64(metadata.st_dev),
-            raw_stat_u64(metadata.st_nlink),
-            raw_stat_u64(metadata.st_size),
-        ) else {
-            return false;
-        };
-        let scanned = StableFsIdentity {
-            device,
-            inode: metadata.st_ino,
-            mode: raw_mode_to_u32(metadata.st_mode),
-            links,
-            uid: metadata.st_uid,
-            gid: metadata.st_gid,
-            length,
-            modified_seconds: metadata.st_mtime,
-            modified_nanoseconds: metadata.st_mtime_nsec,
-            changed_seconds: metadata.st_ctime,
-            changed_nanoseconds: metadata.st_ctime_nsec,
-        };
-        same_socket_after_rename(&self.socket, &scanned)
+    pub(crate) fn socket_owner(&self) -> &ManagedBlockdRootStopOwnerEvidence {
+        &self.socket_owner
     }
 
     pub(crate) fn admission(&self) -> &RootProvisionRetirementAdmission {
@@ -255,7 +310,7 @@ impl RootProvisionStopReceipt {
                 == candidate.authorized_checkpoint_content_digest
             && same_retirement_authority(&self.authority, &candidate.authority)
             && self.process == candidate.process
-            && self.socket == candidate.socket
+            && self.socket_owner == candidate.socket_owner
     }
 }
 
@@ -315,8 +370,7 @@ pub(crate) fn decode_root_provision_stop_receipt(bytes: &[u8]) -> Result<RootPro
 fn validate_root_provision_stop_receipt(receipt: &RootProvisionStopReceipt) -> Result<()> {
     anyhow::ensure!(
         receipt.version == ContractVersion::V1
-            && Path::new(receipt.process.control_socket_path.as_str())
-                == Path::new(receipt.process.data_directory.as_str()).join("root-provision.sock"),
+            && receipt.socket_owner.matches_process(&receipt.process),
         "root-provision stop receipt does not bind one old checkpoint attempt"
     );
     validate_volume_record(&receipt.authority)
@@ -338,16 +392,6 @@ fn validate_root_provision_stop_receipt(receipt: &RootProvisionStopReceipt) -> R
             && receipt.process.handshake.control_only
             && !receipt.process.handshake.guest_io_enabled,
         "root-provision stop receipt process and authority are not one exact control attempt"
-    );
-    anyhow::ensure!(
-        receipt.socket.device > 0 && receipt.socket.inode > 0,
-        "root-provision stop receipt socket lacks a stable filesystem identity"
-    );
-    anyhow::ensure!(
-        receipt.socket.mode & STAT_FILE_TYPE_MASK == STAT_SOCKET_FILE_TYPE
-            && receipt.socket.links == 1
-            && receipt.socket.mode & 0o7777 == 0o700,
-        "root-provision stop receipt socket has an unsafe type, link count, or mode"
     );
     anyhow::ensure!(
         receipt.admission.agent_session_epoch.get() > 0
@@ -905,13 +949,6 @@ struct RetainedExactFile {
     bytes: Vec<u8>,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum ExactControlSocketCleanup {
-    Removed,
-    AlreadyAbsent,
-    LiveOrChanged,
-}
-
 pub(crate) enum StopReceiptSettlement {
     Absent,
     Stable(RootProvisionStopReceipt),
@@ -928,11 +965,6 @@ pub(crate) enum StopReceiptPublication {
 enum NoReplaceReceiptPublication {
     Published,
     ExactReplay,
-}
-
-#[derive(Debug, Clone, Copy)]
-pub(crate) struct RetainedExactControlSocket {
-    identity: StableFsIdentity,
 }
 
 impl RetainedAuthorizedBlockd {
@@ -1285,218 +1317,6 @@ impl RetainedAuthorizedBlockd {
             ROOT_PROVISION_STOP_RECEIPT_MAX_BYTES,
         )
     }
-
-    /// Capture the exact managed socket identity before process-absence
-    /// inspection. An absent pathname is synced before returning `None`, which
-    /// closes a prior unlink/acknowledgement-loss window.
-    pub(crate) fn retain_exact_control_socket(&self) -> Result<Option<RetainedExactControlSocket>> {
-        self.assert_current()?;
-        let socket = c_string("root-provision.sock", &self.data_directory)?;
-        let Some(identity) = stat_at_optional(&self.directory, &socket)? else {
-            self.directory
-                .sync_all()
-                .context("sync absent exact root-provision socket")?;
-            return Ok(None);
-        };
-        verify_retained_socket_identity(&identity, &self.root_identity)?;
-        Ok(Some(RetainedExactControlSocket { identity }))
-    }
-
-    /// Remove only the exact socket captured before the sealed absence sweep.
-    /// A connectable peer, pathname replacement, unsafe metadata, or any
-    /// uncertain connect result is preserved for the next full scan.
-    pub(crate) fn remove_exact_stale_control_socket(
-        &self,
-        retained: RetainedExactControlSocket,
-    ) -> Result<ExactControlSocketCleanup> {
-        self.remove_exact_stale_control_socket_before_claim(retained, || {})
-    }
-
-    #[cfg(test)]
-    pub(crate) fn remove_exact_stale_control_socket_with_hook(
-        &self,
-        retained: RetainedExactControlSocket,
-        before_claim: impl FnOnce(),
-    ) -> Result<ExactControlSocketCleanup> {
-        self.remove_exact_stale_control_socket_before_claim(retained, before_claim)
-    }
-
-    fn remove_exact_stale_control_socket_before_claim(
-        &self,
-        retained: RetainedExactControlSocket,
-        before_claim: impl FnOnce(),
-    ) -> Result<ExactControlSocketCleanup> {
-        self.assert_current()?;
-        let socket_name = "root-provision.sock";
-        let socket_path = self.data_directory.join(socket_name);
-        let socket = c_string(socket_name, &socket_path)?;
-        let quarantine_path = self
-            .data_directory
-            .join(ROOT_PROVISION_STOP_SOCKET_QUARANTINE);
-        let quarantine = c_string(ROOT_PROVISION_STOP_SOCKET_QUARANTINE, &quarantine_path)?;
-
-        if stat_at_optional(&self.directory, &quarantine)?.is_some() {
-            return self.finish_claimed_control_socket(retained, &socket, &quarantine);
-        }
-        match nonblocking_unix_socket_state(&socket_path)? {
-            UnixSocketState::ConnectableOrUnknown => {
-                return Ok(ExactControlSocketCleanup::LiveOrChanged)
-            }
-            UnixSocketState::Absent => {
-                self.directory
-                    .sync_all()
-                    .context("sync already-absent root-provision socket")?;
-                return Ok(ExactControlSocketCleanup::AlreadyAbsent);
-            }
-            UnixSocketState::Refused => {}
-        }
-        let Some(current) = stat_at_optional(&self.directory, &socket)? else {
-            self.directory
-                .sync_all()
-                .context("sync concurrently absent root-provision socket")?;
-            return Ok(ExactControlSocketCleanup::AlreadyAbsent);
-        };
-        if current != retained.identity
-            || verify_retained_socket_identity(&current, &self.root_identity).is_err()
-        {
-            return Ok(ExactControlSocketCleanup::LiveOrChanged);
-        }
-        before_claim();
-        match rename_no_replace(&self.directory, &socket, &self.directory, &quarantine) {
-            Ok(()) => {}
-            Err(source)
-                if source.kind() == io::ErrorKind::AlreadyExists
-                    || source.raw_os_error() == Some(libc::EEXIST) =>
-            {
-                return Ok(ExactControlSocketCleanup::LiveOrChanged)
-            }
-            Err(source)
-                if source.kind() == io::ErrorKind::NotFound
-                    || source.raw_os_error() == Some(libc::ENOENT) =>
-            {
-                if stat_at_optional(&self.directory, &socket)?.is_some()
-                    || stat_at_optional(&self.directory, &quarantine)?.is_some()
-                {
-                    return Ok(ExactControlSocketCleanup::LiveOrChanged);
-                }
-                self.directory
-                    .sync_all()
-                    .context("sync concurrently absent root-provision socket")?;
-                return Ok(ExactControlSocketCleanup::AlreadyAbsent);
-            }
-            Err(source) => {
-                return Err(source).context("atomically claim exact stale root-provision socket")
-            }
-        }
-        self.directory
-            .sync_all()
-            .context("sync exact stale root-provision socket claim")?;
-        self.finish_claimed_control_socket(retained, &socket, &quarantine)
-    }
-
-    fn finish_claimed_control_socket(
-        &self,
-        retained: RetainedExactControlSocket,
-        socket: &CStr,
-        quarantine: &CStr,
-    ) -> Result<ExactControlSocketCleanup> {
-        let Some(claimed) = stat_at_optional(&self.directory, quarantine)? else {
-            if stat_at_optional(&self.directory, socket)?.is_none() {
-                self.directory
-                    .sync_all()
-                    .context("sync absent claimed root-provision socket")?;
-                return Ok(ExactControlSocketCleanup::AlreadyAbsent);
-            }
-            return Ok(ExactControlSocketCleanup::LiveOrChanged);
-        };
-        if verify_retained_socket_identity(&claimed, &self.root_identity).is_err()
-            || !same_socket_after_rename(&retained.identity, &claimed)
-        {
-            self.restore_changed_socket_claim(socket, quarantine)?;
-            return Ok(ExactControlSocketCleanup::LiveOrChanged);
-        }
-        if stat_at_optional(&self.directory, socket)?.is_some() {
-            return Ok(ExactControlSocketCleanup::LiveOrChanged);
-        }
-        let quarantine_path = self
-            .data_directory
-            .join(ROOT_PROVISION_STOP_SOCKET_QUARANTINE);
-        match nonblocking_unix_socket_state(&quarantine_path)? {
-            UnixSocketState::ConnectableOrUnknown => {
-                return Ok(ExactControlSocketCleanup::LiveOrChanged)
-            }
-            UnixSocketState::Absent => {
-                if stat_at_optional(&self.directory, quarantine)?.is_some()
-                    || stat_at_optional(&self.directory, socket)?.is_some()
-                {
-                    return Ok(ExactControlSocketCleanup::LiveOrChanged);
-                }
-                self.directory
-                    .sync_all()
-                    .context("sync concurrently absent claimed root-provision socket")?;
-                return Ok(ExactControlSocketCleanup::AlreadyAbsent);
-            }
-            UnixSocketState::Refused => {}
-        }
-        let Some(final_claimed) = stat_at_optional(&self.directory, quarantine)? else {
-            self.directory
-                .sync_all()
-                .context("sync concurrently absent claimed root-provision socket")?;
-            return Ok(ExactControlSocketCleanup::AlreadyAbsent);
-        };
-        if verify_retained_socket_identity(&final_claimed, &self.root_identity).is_err()
-            || !same_socket_after_rename(&retained.identity, &final_claimed)
-        {
-            self.restore_changed_socket_claim(socket, quarantine)?;
-            return Ok(ExactControlSocketCleanup::LiveOrChanged);
-        }
-        unlink_at(&self.directory, quarantine)
-            .context("unlink atomically claimed stale root-provision socket")?;
-        self.directory
-            .sync_all()
-            .context("sync exact stale root-provision socket removal")?;
-        anyhow::ensure!(
-            stat_at_optional(&self.directory, quarantine)?.is_none(),
-            "root-provision socket quarantine reappeared during exact cleanup"
-        );
-        Ok(ExactControlSocketCleanup::Removed)
-    }
-
-    /// A changed inode may have been atomically captured by the claim race.
-    /// Never unlink it: restore it to the public basename only when that name
-    /// is still empty, otherwise preserve both names as an inventory conflict.
-    fn restore_changed_socket_claim(&self, socket: &CStr, quarantine: &CStr) -> Result<()> {
-        match rename_no_replace(&self.directory, quarantine, &self.directory, socket) {
-            Ok(()) => self
-                .directory
-                .sync_all()
-                .context("sync restored changed root-provision socket"),
-            Err(source)
-                if source.kind() == io::ErrorKind::AlreadyExists
-                    || source.raw_os_error() == Some(libc::EEXIST)
-                    || source.kind() == io::ErrorKind::NotFound
-                    || source.raw_os_error() == Some(libc::ENOENT) =>
-            {
-                Ok(())
-            }
-            Err(source) => Err(source).context("restore changed root-provision socket claim"),
-        }
-    }
-}
-
-fn same_socket_after_rename(before: &StableFsIdentity, after: &StableFsIdentity) -> bool {
-    // rename may advance ctime, so object identity and every other socket
-    // attribute remain exact while the mutable ctime fields are deliberately
-    // excluded after the atomic claim.
-    before.device == after.device
-        && before.inode == after.inode
-        && before.mode == after.mode
-        && before.links == after.links
-        && before.uid == after.uid
-        && before.gid == after.gid
-        && before.length == after.length
-        && before.modified_seconds == after.modified_seconds
-        && before.modified_nanoseconds == after.modified_nanoseconds
 }
 
 impl RetainedExactFile {
@@ -1678,7 +1498,6 @@ pub fn authorized_blockd_command(
     build_authorized_blockd_command(
         config,
         prepared.checkpoint(),
-        &prepared.state_directory,
         prepared.data_directory(),
         prepared.authorized_serving_path(),
         scope_id,
@@ -1715,7 +1534,6 @@ pub(crate) fn retained_authorized_blockd_command(
     build_authorized_blockd_command(
         config,
         checkpoint,
-        retained.state_directory_path(),
         retained.data_directory(),
         &retained.data_directory().join(AUTHORIZED_SERVING_FILE),
         &prepared.serving_process.scope_id,
@@ -1733,7 +1551,6 @@ pub(crate) fn retained_authorized_blockd_command(
 fn build_authorized_blockd_command(
     config: &AuthorizedBlockdLaunchConfig,
     checkpoint: &AuthorizedBlockdCheckpoint,
-    state_directory: &Path,
     data_directory: &Path,
     authorized_serving_path: &Path,
     scope_id: &Id,
@@ -1754,12 +1571,19 @@ fn build_authorized_blockd_command(
         config.max_staged_bytes > 0 && config.max_staged_packs > 0 && config.max_local_bytes > 0,
         "authorized blockd resource limits must be positive"
     );
-    validate_descendant(state_directory, control_socket, "control socket")?;
     let frontend_socket = match frontend {
         AuthorizedBlockFrontend::NbdUnix { socket }
         | AuthorizedBlockFrontend::VhostUser { socket, .. } => socket,
     };
-    validate_descendant(state_directory, frontend_socket, "block frontend socket")?;
+    let managed_sockets =
+        cats_blockd::runtime_socket_namespace::ManagedBlockdSocketRoot::installed()
+            .serving_paths(device_ownership_token)
+            .context("derive authorized serving socket namespace")?;
+    anyhow::ensure!(
+        control_socket == Path::new(managed_sockets.control_socket().as_str())
+            && frontend_socket == Path::new(managed_sockets.io_socket().as_str()),
+        "authorized serving sockets are not the exact device-token managed mapping"
+    );
     anyhow::ensure!(
         control_socket != frontend_socket,
         "authorized blockd control and frontend sockets must differ"
@@ -2595,162 +2419,6 @@ fn mutable_directory_identity_matches(
         && current.links > 0
 }
 
-fn stat_at_optional(directory: &File, name: &CStr) -> Result<Option<StableFsIdentity>> {
-    // SAFETY: all-zero is a valid initial stat buffer and fstatat writes it
-    // only for this call. `directory` and `name` remain live throughout.
-    let mut metadata: libc::stat = unsafe { std::mem::zeroed() };
-    // SAFETY: `directory`, `name`, and the writable stat buffer remain live
-    // for this call; fstatat retains none of them.
-    let result = unsafe {
-        libc::fstatat(
-            directory.as_raw_fd(),
-            name.as_ptr(),
-            &raw mut metadata,
-            libc::AT_SYMLINK_NOFOLLOW,
-        )
-    };
-    if result != 0 {
-        let source = io::Error::last_os_error();
-        if source.kind() == io::ErrorKind::NotFound {
-            return Ok(None);
-        }
-        return Err(source).context("inspect exact root-provision socket basename");
-    }
-    Ok(Some(StableFsIdentity {
-        device: raw_stat_u64(metadata.st_dev)
-            .context("root-provision socket has invalid device identity")?,
-        inode: metadata.st_ino,
-        mode: raw_mode_to_u32(metadata.st_mode),
-        links: raw_stat_u64(metadata.st_nlink)
-            .context("root-provision socket has invalid link count")?,
-        uid: metadata.st_uid,
-        gid: metadata.st_gid,
-        length: raw_stat_u64(metadata.st_size)
-            .context("root-provision socket has negative length")?,
-        modified_seconds: metadata.st_mtime,
-        modified_nanoseconds: metadata.st_mtime_nsec,
-        changed_seconds: metadata.st_ctime,
-        changed_nanoseconds: metadata.st_ctime_nsec,
-    }))
-}
-
-fn verify_retained_socket_identity(
-    identity: &StableFsIdentity,
-    root_identity: &StableFsIdentity,
-) -> Result<()> {
-    anyhow::ensure!(
-        identity.mode & STAT_FILE_TYPE_MASK == STAT_SOCKET_FILE_TYPE
-            && identity.links == 1
-            && identity.uid == root_identity.uid
-            && identity.gid == root_identity.gid
-            && identity.mode & 0o7777 == 0o700,
-        "root-provision socket has unsafe type, identity, owner, or mode"
-    );
-    Ok(())
-}
-
-#[cfg(target_os = "linux")]
-fn raw_mode_to_u32(mode: libc::mode_t) -> u32 {
-    mode
-}
-
-#[cfg(not(target_os = "linux"))]
-fn raw_mode_to_u32(mode: libc::mode_t) -> u32 {
-    u32::from(mode)
-}
-
-fn raw_stat_u64<T>(value: T) -> Option<u64>
-where
-    u64: TryFrom<T>,
-{
-    u64::try_from(value).ok()
-}
-
-enum UnixSocketState {
-    Refused,
-    Absent,
-    ConnectableOrUnknown,
-}
-
-fn nonblocking_unix_socket_state(path: &Path) -> Result<UnixSocketState> {
-    use std::mem::offset_of;
-    use std::os::unix::ffi::OsStrExt as _;
-
-    let bytes = path.as_os_str().as_bytes();
-    // SAFETY: zero is a valid initial sockaddr_un representation; all used
-    // fields and bytes are initialized below before connect.
-    let mut address: libc::sockaddr_un = unsafe { std::mem::zeroed() };
-    anyhow::ensure!(
-        !bytes.is_empty() && bytes.len() < address.sun_path.len() && !bytes.contains(&0),
-        "root-provision socket path is not connectable"
-    );
-    let address_length = offset_of!(libc::sockaddr_un, sun_path) + bytes.len() + 1;
-    let socket_type = libc::SOCK_STREAM;
-    #[cfg(target_os = "linux")]
-    let socket_type = socket_type | libc::SOCK_CLOEXEC | libc::SOCK_NONBLOCK;
-    // SAFETY: socket returns a fresh descriptor and retains no Rust memory.
-    let descriptor = unsafe { libc::socket(libc::AF_UNIX, socket_type, 0) };
-    if descriptor < 0 {
-        return Ok(UnixSocketState::ConnectableOrUnknown);
-    }
-    #[cfg(not(target_os = "linux"))]
-    {
-        // SAFETY: descriptor is live; fcntl consumes and returns only integer
-        // descriptor/status flags.
-        let status = unsafe { libc::fcntl(descriptor, libc::F_GETFL) };
-        // SAFETY: descriptor is still owned and fcntl retains no Rust memory.
-        let set_nonblocking =
-            unsafe { libc::fcntl(descriptor, libc::F_SETFL, status | libc::O_NONBLOCK) } == 0;
-        // SAFETY: descriptor is still owned and fcntl retains no Rust memory.
-        let set_close_on_exec =
-            unsafe { libc::fcntl(descriptor, libc::F_SETFD, libc::FD_CLOEXEC) } == 0;
-        let nonblocking = status >= 0 && set_nonblocking && set_close_on_exec;
-        if !nonblocking {
-            // SAFETY: this function still owns descriptor.
-            unsafe { libc::close(descriptor) };
-            return Ok(UnixSocketState::ConnectableOrUnknown);
-        }
-    }
-    address.sun_family = libc::AF_UNIX as libc::sa_family_t;
-    #[cfg(any(
-        target_os = "macos",
-        target_os = "ios",
-        target_os = "freebsd",
-        target_os = "netbsd",
-        target_os = "openbsd",
-        target_os = "dragonfly"
-    ))]
-    {
-        let Ok(length) = u8::try_from(address_length) else {
-            // SAFETY: this function still owns descriptor.
-            unsafe { libc::close(descriptor) };
-            return Ok(UnixSocketState::ConnectableOrUnknown);
-        };
-        address.sun_len = length;
-    }
-    for (target, source) in address.sun_path.iter_mut().zip(bytes.iter().copied()) {
-        *target = source as libc::c_char;
-    }
-    // SAFETY: descriptor and address are initialized for this call and retain
-    // no borrowed Rust memory.
-    let connected = unsafe {
-        libc::connect(
-            descriptor,
-            (&raw const address).cast::<libc::sockaddr>(),
-            address_length as libc::socklen_t,
-        )
-    };
-    let error = (connected != 0).then(io::Error::last_os_error);
-    // SAFETY: this function owns descriptor exactly once.
-    unsafe { libc::close(descriptor) };
-    Ok(match error.and_then(|error| error.raw_os_error()) {
-        None => UnixSocketState::ConnectableOrUnknown,
-        Some(libc::ECONNREFUSED) => UnixSocketState::Refused,
-        Some(libc::ENOENT) => UnixSocketState::Absent,
-        Some(_) => UnixSocketState::ConnectableOrUnknown,
-    })
-}
-
 fn verify_regular_file(file: &File, path: &Path, expected_len: Option<u64>) -> Result<()> {
     let metadata = file
         .metadata()
@@ -2918,21 +2586,6 @@ fn unlink_at(directory: &File, name: &CStr) -> io::Result<()> {
     }
 }
 
-fn validate_descendant(root: &Path, candidate: &Path, label: &str) -> Result<()> {
-    anyhow::ensure!(candidate.is_absolute(), "{label} must be absolute");
-    let relative = candidate
-        .strip_prefix(root)
-        .with_context(|| format!("{label} must be under the retained Node state directory"))?;
-    anyhow::ensure!(
-        relative.components().next().is_some()
-            && relative
-                .components()
-                .all(|component| matches!(component, Component::Normal(_))),
-        "{label} must be a strict descriptor-derived descendant"
-    );
-    Ok(())
-}
-
 #[cfg(test)]
 mod tests {
     use std::ffi::OsString;
@@ -2940,15 +2593,13 @@ mod tests {
 
     use cats_api::runtime_reconciliation::{
         spec_digest, AcquireOrigin, AsciiText, AssignedKind, AssignedPlacement, Epoch, FenceEpoch,
-        Generation, GuestDeviceIdentity, HostPath, Id, Ipv4Address, IsolatedIpv4Kind, MacAddress,
-        NetworkConfig, NodeBootId, NormalAcquireRequest, NormalAcquireResult, RandomId128,
-        RemoteHead, Revision, RuntimeConfig, RuntimeTransition, Sequence, Sha256Digest, UnixMillis,
-        VolumeAdminState, WireU64,
+        Generation, GuestDeviceIdentity, Id, Ipv4Address, IsolatedIpv4Kind, MacAddress,
+        NetworkConfig, NormalAcquireRequest, NormalAcquireResult, RandomId128, RemoteHead,
+        Revision, RuntimeConfig, RuntimeTransition, Sha256Digest, UnixMillis,
     };
     use cats_storage::authority::AttachmentLineageIdentity;
     use cats_storage::AdapterConfig;
 
-    use super::super::root_provision_process::RootProvisionBlockdHandshake;
     use super::*;
 
     fn id(value: &str) -> Id {
@@ -3154,110 +2805,6 @@ mod tests {
             max_staged_packs: 102,
             max_local_bytes: 103,
         }
-    }
-
-    fn maximally_escaped_host_path(length: usize) -> HostPath {
-        assert!(length >= 2);
-        let mut path = String::from("/");
-        while path.len() < length {
-            path.push(if path.len() % 2 == 0 { '\\' } else { '"' });
-        }
-        HostPath::new(path).unwrap()
-    }
-
-    #[test]
-    fn maximum_physical_identity_receipt_stays_within_the_closed_scan_budget() {
-        let (_, _, attachment) = fixture();
-        let authority = VolumeRecord {
-            volume_id: attachment.identity.volume_id.clone(),
-            size_bytes: attachment.size_bytes,
-            durability: attachment.durability,
-            admin_state: VolumeAdminState::Active,
-            head: attachment.head.clone(),
-            lease_owner: Some(attachment.identity.attachment_id.clone()),
-            lease_epoch: attachment.identity.attachment_epoch,
-            lease_expires_at: Some(attachment.lease_expires_at),
-            last_transition: Some(attachment.expected_last_transition()),
-        };
-        let executable_path = maximally_escaped_host_path(4096);
-        let cgroup_path = maximally_escaped_host_path(4096);
-        let suffix = "/root-provision.sock";
-        let data_directory = maximally_escaped_host_path(4096 - suffix.len());
-        let control_socket_path =
-            HostPath::new(format!("{}{suffix}", data_directory.as_str())).unwrap();
-        let process_id = 4242;
-        let process_identity_token = random(4);
-        let process = RootProvisionProcessEvidence {
-            process_id,
-            unit_main_process_id: process_id,
-            process_start_time_ticks: WireU64::new(u64::MAX / 2).unwrap(),
-            executable_path,
-            scope_id: id(&"s".repeat(128)),
-            cgroup_path,
-            cgroup_process_ids: vec![process_id],
-            control_socket_path,
-            data_directory,
-            ownership_token: process_identity_token.clone(),
-            handshake: RootProvisionBlockdHandshake {
-                peer_process_id: process_id,
-                identity: attachment.identity,
-                size_bytes: attachment.size_bytes,
-                durability: attachment.durability,
-                remote_head: attachment.head,
-                process_identity_token,
-                control_only: true,
-                guest_io_enabled: false,
-            },
-        };
-        // SAFETY CONTRACT TEST: these are the exact fields serialized by the
-        // private constructor after it has descriptor-retained the socket.
-        let receipt = RootProvisionStopReceipt {
-            version: ContractVersion::V1,
-            checkpoint_content_digest: Sha256Digest::from_bytes([7; 32]),
-            authorized_checkpoint_content_digest: Sha256Digest::from_bytes([8; 32]),
-            authority,
-            process,
-            socket: StableFsIdentity {
-                device: u64::MAX,
-                inode: u64::MAX,
-                mode: STAT_SOCKET_FILE_TYPE | 0o700,
-                links: 1,
-                // Metadata ownership is checked against the retained state
-                // root before these values are admitted to a real receipt;
-                // the codec bound itself is independent of these scalars.
-                uid: 0,
-                gid: 0,
-                length: 0,
-                modified_seconds: i64::MAX,
-                modified_nanoseconds: 999_999_999,
-                changed_seconds: i64::MAX,
-                changed_nanoseconds: 999_999_999,
-            },
-            admission: RootProvisionRetirementAdmission {
-                node_boot_id: NodeBootId::new("11111111111111111111111111111111").unwrap(),
-                agent_instance_id: random(5),
-                agent_session_epoch: Epoch::new(i64::MAX as u64).unwrap(),
-                inventory_epoch: Epoch::new(i64::MAX as u64).unwrap(),
-                inventory_digest: Sha256Digest::from_bytes([9; 32]),
-                inventory_read_position: Sequence::new(i64::MAX as u64).unwrap(),
-            },
-        };
-        let encoded = encode_root_provision_stop_receipt(&receipt).unwrap();
-        assert!(
-            encoded.len() > 32 * 1024,
-            "max-path probe was not calibrated: {} bytes",
-            encoded.len()
-        );
-        assert!(encoded.len() <= ROOT_PROVISION_STOP_RECEIPT_MAX_BYTES);
-        assert!(
-            encoded.len() * 1024 <= 48 * 1024 * 1024,
-            "1,024 maximum-path receipts exceed the closed scan budget: {} bytes each",
-            encoded.len()
-        );
-        assert_eq!(
-            decode_root_provision_stop_receipt(&encoded).unwrap(),
-            receipt
-        );
     }
 
     fn argv(command: &Command) -> Vec<OsString> {

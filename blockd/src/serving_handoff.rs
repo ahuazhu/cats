@@ -18,6 +18,8 @@ use serde_json::Value;
 use sha2::{Digest as _, Sha256};
 use thiserror::Error;
 
+use crate::runtime_socket_namespace::ManagedBlockdSocketRoot;
+
 use crate::target_control::{
     encode_target_control_authorization, target_control_authorization_file_name,
     validate_target_control_authorization, TargetControlAuthorizationArtifact,
@@ -224,7 +226,12 @@ pub fn validate_serving_handoff_record(
         .join(format!("volume-{}", record.volume_id.as_str()))
         .join(format!("attachment-{}", record.attachment_id.as_str()))
         .join(format!("epoch-{}", record.attachment_epoch.get()));
-    let expected_control_socket = process_directory.join("root-provision.sock");
+    let expected_root_socket_paths = ManagedBlockdSocketRoot::installed()
+        .root_paths(&record.provision_transition_id)
+        .map_err(|_| ServingHandoffCodecError::Invalid {
+            artifact: ARTIFACT,
+            reason: "root control socket mapping cannot be derived",
+        })?;
     let expected_artifact_name =
         target_control_authorization_file_name(&record.provision_transition_id);
     if record.version != ContractVersion::V1
@@ -253,7 +260,7 @@ pub fn validate_serving_handoff_record(
         || process.cgroup_process_ids != [process.process_id]
         || process.cgroup_path.as_str() != expected_cgroup
         || !process_directory.ends_with(&expected_directory_suffix)
-        || Path::new(process.control_socket_path.as_str()) != expected_control_socket
+        || &process.control_socket_path != expected_root_socket_paths.control_socket()
         || process.ownership_token != handshake.process_identity_token
         || process.process_id != handshake.peer_process_id
         || handshake.identity != *identity

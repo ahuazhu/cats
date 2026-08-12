@@ -26,6 +26,7 @@ pub mod format;
 pub mod frontend_contract;
 pub mod image;
 pub mod nbd;
+pub mod runtime_socket_namespace;
 pub mod serving_handoff;
 pub mod target_control;
 #[cfg(target_os = "linux")]

@@ -1330,7 +1330,22 @@ mod tests {
 
     #[test]
     fn exact_start_runtime_builds_the_frozen_cloud_hypervisor_argv() {
-        let plan = VmmLauncherPlan::from_checkpoint(start_runtime()).unwrap();
+        let checkpoint = start_runtime();
+        let ReconcileStep::StartRuntime { devices, .. } = &checkpoint.step else {
+            unreachable!()
+        };
+        let [device] = devices.as_slice() else {
+            panic!("test checkpoint must contain exactly one device")
+        };
+        let PrepareDeviceFrontend::VhostUserBlk { socket_path, .. } = &device.frontend else {
+            panic!("test checkpoint must contain one vhost-user-blk device")
+        };
+        let expected_disk = format!(
+            "vhost_user=on,socket={},num_queues=2,queue_size=256,serial=cats-root",
+            socket_path.as_str()
+        );
+
+        let plan = VmmLauncherPlan::from_checkpoint(checkpoint).unwrap();
         let arguments = plan
             .cloud_hypervisor_arguments()
             .iter()
@@ -1357,11 +1372,9 @@ mod tests {
         assert!(arguments
             .windows(2)
             .any(|pair| pair == ["--net", "tap=cats0001,mac=02:ca:0a:f0:00:06"]));
-        assert!(arguments.windows(2).any(|pair| pair
-            == [
-                "--disk",
-                "vhost_user=on,socket=/run/cats/cat_01/root-vhost.sock,num_queues=2,queue_size=256,serial=cats-root"
-            ]));
+        assert!(arguments
+            .windows(2)
+            .any(|pair| pair == ["--disk", expected_disk.as_str()]));
         assert_eq!(
             &arguments[arguments.len() - 4..],
             ["--serial", "file=/proc/self/fd/69", "--console", "off"]

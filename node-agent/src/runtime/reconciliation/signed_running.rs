@@ -62,8 +62,6 @@ use super::{
 };
 
 const MAX_LEASE_DURATION_MS: u64 = i64::MAX as u64;
-const ROOT_PROVISION_SOCKET: &str = "root-provision.sock";
-
 #[cfg(test)]
 type AfterPrepareHook = Arc<dyn Fn(&RuntimeDesiredEffectContext) + Send + Sync>;
 
@@ -2185,23 +2183,25 @@ impl SignedRunningAcquireEffect {
                 "multi-volume Root blockd data directory",
             )?;
             let process_identity_token = random_id();
+            let provision_transition_id = random_id();
+            let control_socket_path =
+                cats_blockd::runtime_socket_namespace::ManagedBlockdSocketRoot::installed()
+                    .root_paths(&provision_transition_id)
+                    .context("derive managed multi-volume Root control socket")?
+                    .control_socket()
+                    .clone();
             let scope_id = Id::new(format!(
                 "cats-root-{}.service",
                 process_identity_token.as_str()
             ))
             .context("Root provision process token does not form a service ID")?;
             successor.step = ReconcileStep::ProvisionRootImage {
-                provision_transition_id: random_id(),
+                provision_transition_id,
                 volume_id: root.volume_id.clone(),
                 attachment_id: root_attachment.identity.attachment_id.clone(),
                 attachment_epoch: root_attachment.identity.attachment_epoch,
                 scope_id,
-                control_socket_path: HostPath::new(format!(
-                    "{}/{}",
-                    root_data_directory.as_str(),
-                    ROOT_PROVISION_SOCKET
-                ))
-                .context("Root provision control socket is not canonical")?,
+                control_socket_path,
                 data_directory: root_data_directory,
                 process_identity_token,
                 size_bytes: root.size_bytes,
@@ -2253,10 +2253,13 @@ impl SignedRunningAcquireEffect {
             prepared.data_directory(),
             "authorized blockd data directory",
         )?;
-        let control_socket_path = host_path(
-            &prepared.data_directory().join(ROOT_PROVISION_SOCKET),
-            "root-provision control socket",
-        )?;
+        let provision_transition_id = random_id();
+        let control_socket_path =
+            cats_blockd::runtime_socket_namespace::ManagedBlockdSocketRoot::installed()
+                .root_paths(&provision_transition_id)
+                .context("derive managed Root provision control socket")?
+                .control_socket()
+                .clone();
         let process_identity_token = random_id();
         let scope_id = Id::new(format!(
             "cats-root-{}.service",
@@ -2274,7 +2277,7 @@ impl SignedRunningAcquireEffect {
             runtime_launch: RuntimeLaunch::Absent,
             stable_state: None,
             step: ReconcileStep::ProvisionRootImage {
-                provision_transition_id: random_id(),
+                provision_transition_id,
                 volume_id: volume.volume_id.clone(),
                 attachment_id: attachment.identity.attachment_id.clone(),
                 attachment_epoch: attachment.identity.attachment_epoch,
@@ -3776,12 +3779,13 @@ fn rebound_provision_checkpoint(
     updated_at_unix_ms: UnixMillis,
 ) -> anyhow::Result<RuntimeCheckpoint> {
     let data_directory = host_path(data_directory, "adopted blockd data directory")?;
-    let control_socket_path = HostPath::new(format!(
-        "{}/{}",
-        data_directory.as_str(),
-        ROOT_PROVISION_SOCKET
-    ))
-    .context("adopted root-provision control socket is not canonical")?;
+    let provision_transition_id = random_id();
+    let control_socket_path =
+        cats_blockd::runtime_socket_namespace::ManagedBlockdSocketRoot::installed()
+            .root_paths(&provision_transition_id)
+            .context("derive managed adopted Root control socket")?
+            .control_socket()
+            .clone();
     let process_identity_token = random_id();
     let scope_id = Id::new(format!(
         "cats-root-{}.service",
@@ -3794,7 +3798,7 @@ fn rebound_provision_checkpoint(
     Ok(closed_checkpoint(
         desired,
         ReconcileStep::ProvisionRootImage {
-            provision_transition_id: random_id(),
+            provision_transition_id,
             volume_id: volume.volume_id.clone(),
             attachment_id: attachment.identity.attachment_id.clone(),
             attachment_epoch: attachment.identity.attachment_epoch,
@@ -4389,6 +4393,7 @@ pub(super) fn provision_checkpoint_is_bound(
     expected_provisioned_head: &RemoteHead,
 ) -> bool {
     let ReconcileStep::ProvisionRootImage {
+        provision_transition_id,
         volume_id,
         attachment_id,
         attachment_epoch,
@@ -4472,8 +4477,9 @@ pub(super) fn provision_checkpoint_is_bound(
         // retry unreadable by a fresh scanner.
         && root_provision_scope_id_is_canonical(scope_id)
         && !process_identity_token.as_str().is_empty()
-        && control_socket_path.as_str()
-            == format!("{}/{}", data_directory.as_str(), ROOT_PROVISION_SOCKET)
+        && cats_blockd::runtime_socket_namespace::ManagedBlockdSocketRoot::installed()
+            .root_paths(provision_transition_id)
+            .is_ok_and(|paths| control_socket_path == paths.control_socket())
 }
 
 fn prepared_observed_volume_is_exact(
@@ -5214,8 +5220,22 @@ mod tests {
             format!("cats-root-{}.service", process_identity_token.as_str())
         );
         assert_eq!(
-            control_socket_path.as_str(),
-            format!("{}/{}", data_directory.as_str(), ROOT_PROVISION_SOCKET)
+            control_socket_path,
+            cats_blockd::runtime_socket_namespace::ManagedBlockdSocketRoot::installed()
+                .root_paths(match &checkpoint.step {
+                    ReconcileStep::ProvisionRootImage {
+                        provision_transition_id,
+                        ..
+                    } => provision_transition_id,
+                    _ => unreachable!(),
+                })
+                .unwrap()
+                .control_socket()
+        );
+        assert_ne!(
+            std::path::Path::new(control_socket_path.as_str()).parent(),
+            Some(std::path::Path::new(data_directory.as_str())),
+            "durable blockd data and boot-local managed sockets must remain disjoint"
         );
         assert!(!std::path::Path::new(control_socket_path.as_str()).exists());
         assert!(checkpoint.processes.is_empty());
@@ -10632,13 +10652,13 @@ mod tests {
             let data_directory =
                 authorized_blockd_data_directory(self.state.path(), &desired, &attachment.identity);
             let data_path = HostPath::new(data_directory.to_string_lossy().into_owned()).unwrap();
-            let control_socket_path = HostPath::new(
-                data_directory
-                    .join(ROOT_PROVISION_SOCKET)
-                    .to_string_lossy()
-                    .into_owned(),
-            )
-            .unwrap();
+            let provision_transition_id = random('c');
+            let control_socket_path =
+                cats_blockd::runtime_socket_namespace::ManagedBlockdSocketRoot::installed()
+                    .root_paths(&provision_transition_id)
+                    .unwrap()
+                    .control_socket()
+                    .clone();
             let expected_target = RemoteHead {
                 generation: Generation::new(1).unwrap(),
                 root_hash: Some(Sha256Digest::from_bytes([7; 32])),
@@ -10646,7 +10666,7 @@ mod tests {
             };
             let mut checkpoint = acquire_checkpoint_from_attachment(&desired, &attachment);
             checkpoint.step = ReconcileStep::ProvisionRootImage {
-                provision_transition_id: random('c'),
+                provision_transition_id,
                 volume_id: attachment.identity.volume_id.clone(),
                 attachment_id: attachment.identity.attachment_id.clone(),
                 attachment_epoch: attachment.identity.attachment_epoch,
@@ -10694,20 +10714,9 @@ mod tests {
                     executable,
                 )
                 .unwrap();
-            let listener =
-                std::os::unix::net::UnixListener::bind(control_socket_path.as_str()).unwrap();
-            std::fs::set_permissions(
-                control_socket_path.as_str(),
-                std::fs::Permissions::from_mode(0o700),
-            )
-            .unwrap();
             let mut retained = AuthorizedBlockdStore::new(self.state.clone())
                 .retain_exact_runtime_checkpoint(stored.checkpoint())
                 .unwrap();
-            let socket = retained
-                .retain_exact_control_socket()
-                .unwrap()
-                .expect("stable-stop fixture has an exact socket");
             let process = super::super::root_provision_process::RootProvisionProcessEvidence {
                 process_id: 91,
                 unit_main_process_id: 91,
@@ -10730,12 +10739,17 @@ mod tests {
                     guest_io_enabled: false,
                 },
             };
+            let socket_owner = super::super::blockd_socket_namespace::ManagedBlockdRootStopOwnerEvidence::for_test(
+                &expected,
+                NodeBootId::new("33333333333333333333333333333333").unwrap(),
+            )
+            .unwrap();
             let receipt = super::super::authorized_blockd::RootProvisionStopReceipt::new(
                 stored.checkpoint(),
                 &authorized,
                 record,
                 process,
-                socket,
+                socket_owner,
                 super::super::root_provision_process::RootProvisionRetirementAdmission {
                     node_boot_id: NodeBootId::new("33333333333333333333333333333333").unwrap(),
                     agent_instance_id: random('4'),
@@ -10750,7 +10764,6 @@ mod tests {
                 retained.persist_or_reopen_stop_receipt(&receipt).unwrap(),
                 super::super::authorized_blockd::StopReceiptPublication::Published(_)
             ));
-            drop(listener);
             let receipt_path = data_directory
                 .join(super::super::authorized_blockd::ROOT_PROVISION_STOP_RECEIPT_FILE);
             let identity = std::fs::metadata(&receipt_path).unwrap();
@@ -10822,15 +10835,22 @@ mod tests {
                     root_hash: Some(Sha256Digest::from_bytes([0x51; 32])),
                     root_object_id: Some(AsciiText::new("roots/stale-boot-multi-target").unwrap()),
                 };
+                let provision_transition_id = random('6');
+                let control_socket_path =
+                    cats_blockd::runtime_socket_namespace::ManagedBlockdSocketRoot::installed()
+                        .root_paths(&provision_transition_id)
+                        .unwrap()
+                        .control_socket()
+                        .clone();
                 closed_checkpoint(
                     &desired,
                     ReconcileStep::ProvisionRootImage {
-                        provision_transition_id: random('6'),
+                        provision_transition_id,
                         volume_id: desired.volumes[0].volume_id.clone(),
                         attachment_id: root_attachment.identity.attachment_id.clone(),
                         attachment_epoch: root_attachment.identity.attachment_epoch,
                         scope_id: id(&format!("cats-root-{}.service", "7".repeat(32))),
-                        control_socket_path: host(root_data_directory.join(ROOT_PROVISION_SOCKET)),
+                        control_socket_path,
                         data_directory: host(root_data_directory.clone()),
                         process_identity_token: random('8'),
                         size_bytes: desired.volumes[0].size_bytes,

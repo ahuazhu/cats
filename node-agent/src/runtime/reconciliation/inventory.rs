@@ -1147,7 +1147,7 @@ pub(super) fn root_process_expectations(
         checkpoints_by_cat,
         blockd_by_cat,
         volumes_by_cat,
-        false,
+        true,
     )
 }
 
