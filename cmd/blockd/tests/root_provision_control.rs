@@ -1,10 +1,13 @@
 //! A13/A14 acceptance against the real blockd composition root.
 
+#![cfg(target_os = "linux")]
+
 use std::io::{BufRead, BufReader, Read, Write};
-use std::os::unix::fs::PermissionsExt;
+use std::os::unix::fs::{DirBuilderExt as _, FileTypeExt as _, MetadataExt as _, PermissionsExt};
 use std::os::unix::net::UnixStream;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -17,6 +20,7 @@ use cats_api::runtime_reconciliation::{
     PROVISION_ROOT_IMAGE_REQUEST_MAX_WIRE_BYTES,
 };
 use cats_blockd::format::{self, LeafRef};
+use cats_blockd::runtime_socket_namespace::ManagedBlockdSocketRoot;
 use cats_control_plane::store::Store;
 use cats_metadata_store_postgres::PostgresVolumeDataAuthority;
 use cats_object_store_file::FileBlobStore;
@@ -32,7 +36,6 @@ const VOLUME_ID: &str = "vol_root_provision";
 const ATTACHMENT_ID: &str = "att_root_provision";
 const NODE_ID: &str = "node-root-provision";
 const VOLUME_SIZE: u64 = 2 * CHUNK_SIZE as u64;
-const TRANSITION: &str = "13579bdf2468ace013579bdf2468ace0";
 const ACQUIRE_TRANSITION: &str = "2468ace013579bdf2468ace013579bdf";
 const PROCESS_TOKEN: &str = "3579bdf2468ace013579bdf2468ace01";
 const SCOPE_ID: &str = "cats-root-provision.scope";
@@ -40,6 +43,8 @@ const SCOPE_ID: &str = "cats-root-provision.scope";
 struct Env {
     dir: tempfile::TempDir,
     canonical_root: PathBuf,
+    owner_directory: PathBuf,
+    owner_directory_identity: (u64, u64),
     postgres_url: String,
     epoch: i64,
     request: ProvisionRootImageRequest,
@@ -71,7 +76,17 @@ impl Env {
         let manifest = cats_blockd::image::publish(blob.as_ref(), &image)
             .unwrap()
             .manifest;
-        let request = request_from_manifest(&manifest, epoch);
+        let transition = unique_transition(&canonical_root);
+        let request = request_from_manifest(&manifest, epoch, transition);
+        let socket_paths = ManagedBlockdSocketRoot::installed()
+            .root_paths(&request.provision_transition_id)
+            .unwrap();
+        provision_installed_directory(Path::new("/run/cats"), 0o755);
+        provision_installed_directory(Path::new(socket_paths.root().as_str()), 0o700);
+        let owner_directory = PathBuf::from(socket_paths.public_directory().as_str());
+        provision_installed_directory(&owner_directory, 0o700);
+        let owner_metadata = std::fs::symlink_metadata(&owner_directory).unwrap();
+        let owner_directory_identity = (owner_metadata.dev(), owner_metadata.ino());
         let attachment = authorized_attachment(epoch);
         let data_dir = canonical_root.join("control-data");
         std::fs::create_dir_all(&data_dir).unwrap();
@@ -92,6 +107,8 @@ impl Env {
         Self {
             dir,
             canonical_root,
+            owner_directory,
+            owner_directory_identity,
             postgres_url,
             epoch,
             request,
@@ -107,7 +124,10 @@ impl Env {
     }
 
     fn control_socket(&self) -> PathBuf {
-        self.canonical_root.join("provision.sock")
+        let paths = ManagedBlockdSocketRoot::installed()
+            .root_paths(&self.request.provision_transition_id)
+            .unwrap();
+        PathBuf::from(paths.control_socket().as_str())
     }
 
     fn authorized_control_spec(&self) -> PathBuf {
@@ -135,6 +155,8 @@ impl Env {
             .arg("--control-only")
             .arg("--authorized-control-spec")
             .arg(self.authorized_control_spec())
+            .arg("--provision-transition-id")
+            .arg(self.request.provision_transition_id.as_str())
             .arg("--runtime-scope-id")
             .arg(SCOPE_ID)
             .arg("--process-identity-token")
@@ -171,6 +193,63 @@ impl Env {
             std::fs::remove_file(self.control_socket()).unwrap();
         }
     }
+}
+
+impl Drop for Env {
+    fn drop(&mut self) {
+        let Ok(owner) = std::fs::symlink_metadata(&self.owner_directory) else {
+            return;
+        };
+        if !owner.file_type().is_dir()
+            || (owner.dev(), owner.ino()) != self.owner_directory_identity
+        {
+            return;
+        }
+        let control = self.control_socket();
+        match std::fs::symlink_metadata(&control) {
+            Ok(metadata) if metadata.file_type().is_socket() => {
+                let _ = std::fs::remove_file(control);
+            }
+            Ok(_) => return,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(_) => return,
+        }
+        let _ = std::fs::remove_dir(&self.owner_directory);
+    }
+}
+
+fn unique_transition(canonical_root: &Path) -> RandomId128 {
+    static NEXT: AtomicU64 = AtomicU64::new(1);
+    let inode = std::fs::symlink_metadata(canonical_root).unwrap().ino();
+    let sequence = NEXT.fetch_add(1, Ordering::Relaxed);
+    RandomId128::new(format!(
+        "{:08x}{:016x}{:08x}",
+        std::process::id(),
+        inode,
+        u32::try_from(sequence).unwrap()
+    ))
+    .unwrap()
+}
+
+fn provision_installed_directory(path: &Path, mode: u32) {
+    match std::fs::DirBuilder::new().mode(mode).create(path) {
+        Ok(()) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
+        Err(error) => panic!(
+            "create installed test directory {}: {error}",
+            path.display()
+        ),
+    }
+    let metadata = std::fs::symlink_metadata(path).unwrap();
+    assert!(metadata.file_type().is_dir() && !metadata.file_type().is_symlink());
+    assert_eq!(metadata.uid(), 0, "{} is not root-owned", path.display());
+    assert_eq!(metadata.gid(), 0, "{} is not root-grouped", path.display());
+    assert_eq!(
+        metadata.mode() & 0o7777,
+        mode,
+        "{} has the wrong mode",
+        path.display()
+    );
 }
 
 fn owned_volume(epoch: i64) -> VolumeRecord {
@@ -369,6 +448,7 @@ impl Drop for Server {
 fn request_from_manifest(
     manifest: &format::ImageManifest,
     epoch: i64,
+    provision_transition_id: RandomId128,
 ) -> ProvisionRootImageRequest {
     let map = format::image_base_map(manifest, VOLUME_SIZE).unwrap();
     let mut leaves = Vec::new();
@@ -387,7 +467,7 @@ fn request_from_manifest(
     let root = format::encode_root(VOLUME_SIZE, &leaves);
     let root_hash = format::sha256(&root);
     ProvisionRootImageRequest {
-        provision_transition_id: RandomId128::new(TRANSITION).unwrap(),
+        provision_transition_id,
         volume_id: Id::new(VOLUME_ID).unwrap(),
         attachment_id: Id::new(ATTACHMENT_ID).unwrap(),
         attachment_epoch: FenceEpoch::new(epoch as u64).unwrap(),
@@ -460,6 +540,8 @@ fn control_only_rejects_frontends_and_serves_only_the_typed_effect() {
         .arg(env.epoch.to_string())
         .arg("--authorized-control-spec")
         .arg(env.authorized_control_spec())
+        .arg("--provision-transition-id")
+        .arg(env.request.provision_transition_id.as_str())
         .arg("--runtime-scope-id")
         .arg(SCOPE_ID)
         .arg("--process-identity-token")
@@ -483,6 +565,8 @@ fn control_only_rejects_frontends_and_serves_only_the_typed_effect() {
         .arg(env.epoch.to_string())
         .arg("--authorized-control-spec")
         .arg(env.authorized_control_spec())
+        .arg("--provision-transition-id")
+        .arg(env.request.provision_transition_id.as_str())
         .arg("--runtime-scope-id")
         .arg(SCOPE_ID)
         .arg("--process-identity-token")
@@ -701,6 +785,9 @@ fn every_provision_publication_crash_window_recovers_by_authority_or_exact_repla
         let blob = FileBlobStore::open(env.blob_root()).unwrap();
         let commits = blob.list(&format!("volumes/{VOLUME_ID}/commits/")).unwrap();
         assert_eq!(commits.len(), 1, "{point}: replay made a second commit key");
-        assert!(commits[0].ends_with(&format!("1-{TRANSITION}.json")));
+        assert!(commits[0].ends_with(&format!(
+            "1-{}.json",
+            env.request.provision_transition_id.as_str()
+        )));
     }
 }
