@@ -702,6 +702,8 @@ fn linux_quality_gate_pins_one_private_systemd_e2e_to_an_immutable_image() {
     for required in [
         "LINUX_SYSTEMD_IIDFILE=\"$LINUX_CAPTURE_DIR/systemd-image.iid\"",
         "--iidfile \"$LINUX_SYSTEMD_IIDFILE\"",
+        "cmp -s \"$LINUX_SYSTEMD_IIDFILE\" \"$iidfile_expected\"",
+        "cmp -s \"$LINUX_SYSTEMD_IIDFILE\" \"$iidfile_expected_lf\"",
         "CATS_SOURCE_PROVENANCE_FINGERPRINT=$CATS_SOURCE_PROVENANCE_FINGERPRINT",
         "^sha256:[0-9a-f]{64}$",
         "image inspect",
@@ -735,6 +737,10 @@ fn linux_quality_gate_pins_one_private_systemd_e2e_to_an_immutable_image() {
     assert!(
         !systemd_gate.contains("--tag"),
         "the focused systemd container must not be created through a mutable tag"
+    );
+    assert!(
+        !systemd_gate.contains("wc -l <\"$LINUX_SYSTEMD_IIDFILE\""),
+        "BuildKit may write its exact iidfile receipt without a terminal newline"
     );
     assert!(
         !linux_gate.contains("image rm"),
@@ -894,7 +900,14 @@ case "${1:-} ${2:-}" in
     provenance="$(argument_after --build-arg "$@")"
     provenance="${provenance#CATS_SOURCE_PROVENANCE_FINGERPRINT=}"
     image_id="sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"
-    printf '%s\n' "$image_id" >"$iidfile"
+    case "$mode" in
+      iidfile-one-lf) printf '%s\n' "$image_id" >"$iidfile" ;;
+      iidfile-two-lf) printf '%s\n\n' "$image_id" >"$iidfile" ;;
+      iidfile-nul) printf '%s\0' "$image_id" >"$iidfile" ;;
+      iidfile-second-line) printf '%s\n%s\n' "$image_id" "$image_id" >"$iidfile" ;;
+      iidfile-garbage) printf '%s!' "$image_id" >"$iidfile" ;;
+      *) printf '%s' "$image_id" >"$iidfile" ;;
+    esac
     printf '%s|%s\n' "$image_id" "$provenance" >"$state/systemd-image"
     ;;
   "image inspect")
@@ -1434,6 +1447,92 @@ fn linux_quality_gate_rejects_an_empty_focused_systemd_test_filter() {
             && trace.contains(&format!("rm -f {systemd_id}")),
         "empty test-inventory failure did not clean the focused container exactly:\n{trace}"
     );
+}
+
+#[cfg(unix)]
+#[test]
+fn linux_quality_gate_accepts_exact_iidfile_frames_and_rejects_trailing_data() {
+    for mode in ["iidfile-no-lf", "iidfile-one-lf"] {
+        let fixture = tempfile::tempdir().expect("Linux gate valid iidfile fixture");
+        let fake_bin = fixture.path().join("bin");
+        let state = fixture.path().join("state");
+        std::fs::create_dir_all(&state).expect("create fake Docker state");
+        install_linux_gate_fake_cli(&fake_bin);
+
+        let output = linux_gate_command(&fake_bin, &state, mode)
+            .output()
+            .unwrap_or_else(|error| panic!("run Linux gate {mode} regression: {error}"));
+        assert!(
+            output.status.success(),
+            "valid iidfile mode {mode} was not accepted:\nstdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(
+            state.join("focused-systemd-test-ran").exists(),
+            "valid iidfile mode {mode} did not reach the exact focused systemd test"
+        );
+        assert!(
+            state.join("systemd-removed").exists(),
+            "valid iidfile mode {mode} did not converge through exact systemd cleanup"
+        );
+    }
+
+    for mode in [
+        "iidfile-two-lf",
+        "iidfile-nul",
+        "iidfile-second-line",
+        "iidfile-garbage",
+    ] {
+        let fixture = tempfile::tempdir().expect("Linux gate malformed iidfile fixture");
+        let fake_bin = fixture.path().join("bin");
+        let state = fixture.path().join("state");
+        std::fs::create_dir_all(&state).expect("create fake Docker state");
+        install_linux_gate_fake_cli(&fake_bin);
+
+        let output = linux_gate_command(&fake_bin, &state, mode)
+            .output()
+            .unwrap_or_else(|error| panic!("run Linux gate {mode} regression: {error}"));
+        assert!(
+            !output.status.success(),
+            "malformed iidfile mode {mode} incorrectly passed"
+        );
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            stderr.contains("focused Linux Runtime E2E received an invalid Docker image receipt"),
+            "malformed iidfile mode {mode} was not diagnosed:\n{stderr}"
+        );
+        let trace = std::fs::read_to_string(state.join("trace")).expect("fake Docker trace");
+        assert!(
+            trace
+                .lines()
+                .any(|line| line.starts_with("build --platform ")),
+            "malformed iidfile mode {mode} did not reach the image receipt boundary:\n{trace}"
+        );
+        assert!(
+            !trace.lines().any(|line| line.starts_with("image inspect ")),
+            "malformed iidfile mode {mode} reached image inspection:\n{trace}"
+        );
+        assert!(
+            !trace.lines().any(|line| {
+                line.starts_with(&format!(
+                    "create --name cats-linux-systemd-gate-{LINUX_GATE_TEST_TOKEN} "
+                ))
+            }),
+            "malformed iidfile mode {mode} created the privileged systemd container:\n{trace}"
+        );
+        for resource in [
+            format!("network.cats-linux-net-{LINUX_GATE_TEST_TOKEN}"),
+            format!("container.cats-linux-pg-{LINUX_GATE_TEST_TOKEN}"),
+            format!("container.cats-linux-workspace-gate-{LINUX_GATE_TEST_TOKEN}"),
+            format!("container.cats-linux-systemd-gate-{LINUX_GATE_TEST_TOKEN}"),
+        ] {
+            assert!(
+                !state.join(&resource).exists(),
+                "malformed iidfile mode {mode} left owned resource {resource}:\n{trace}"
+            );
+        }
+    }
 }
 
 #[cfg(unix)]
