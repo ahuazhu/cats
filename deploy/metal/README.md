@@ -103,6 +103,10 @@ evidence endpoint is recorded in
 sudo systemctl restart cats-noded
 ```
 
+For every later controlled stop or restart, proceed only when the authoritative
+operator view reports `state=cordoned cats=0 orphans=0` and the physical-residue
+audit is empty.
+
 The retired `cats admin node drain` path is not a fallback for an existing
 Node. For any later install, first apply a reviewed A23 cordon and prove that
 the Node has no assigned Desired runtimes or physical residue. The current
