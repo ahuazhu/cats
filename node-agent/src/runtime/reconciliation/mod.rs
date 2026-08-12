@@ -28,7 +28,8 @@ mod authorized_blockd;
 mod blockd_socket_namespace;
 #[cfg(all(test, target_os = "linux"))]
 pub(crate) use blockd_socket_namespace::{
-    BlockdSocketIntentStore, RetainedManagedBlockdSocketRoot, BLOCKD_SOCKET_INTENT_NAMESPACE,
+    BlockdSocketIntentStore, ManagedBlockdSocketOwnerRetirement, RetainedManagedBlockdSocketRoot,
+    BLOCKD_SOCKET_INTENT_NAMESPACE,
 };
 mod checkpoint;
 mod clean_slate_probes;

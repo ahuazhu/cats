@@ -47,6 +47,7 @@ tempfile = { workspace = true }
 hex = { workspace = true }
 
 [target.'cfg(target_os = "linux")'.dev-dependencies]
+cats-metadata-store-postgres = { workspace = true }
 vhost = { workspace = true, features = ["vhost-user-frontend"] }
 
 [lints]
