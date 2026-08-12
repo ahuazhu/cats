@@ -623,20 +623,26 @@ async fn observation_renews_while_the_ordinary_store_connection_is_saturated() {
 async fn pending_bodies_hit_the_absolute_deadline_release_admission_and_never_touch_store() {
     let context = Context::new().await;
     let before = context.fingerprint().await;
-    let mut openers = tokio::task::JoinSet::new();
-    for _ in 0..65 {
-        openers.spawn(pending_chunked_request(context.server.addr, DESIRED_PATH));
-    }
-    let mut pending = tokio::task::JoinSet::new();
-    while let Some(stream) = openers.join_next().await {
-        pending.spawn(raw_status(stream.unwrap()));
-    }
+    let saturation_deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+    let (mut pending, first_rejection) = tokio::time::timeout_at(saturation_deadline, async {
+        let mut openers = tokio::task::JoinSet::new();
+        for _ in 0..65 {
+            openers.spawn(pending_chunked_request(context.server.addr, DESIRED_PATH));
+        }
+        let mut pending = tokio::task::JoinSet::new();
+        while let Some(stream) = openers.join_next().await {
+            pending.spawn(raw_status(stream.unwrap()));
+        }
 
-    let first_rejection = tokio::time::timeout(Duration::from_secs(2), pending.join_next())
-        .await
-        .expect("runtime spine saturation was never observed")
-        .expect("the pending response set ended before saturation")
-        .unwrap();
+        let first_rejection = pending
+            .join_next()
+            .await
+            .expect("the pending response set ended before saturation")
+            .unwrap();
+        (pending, first_rejection)
+    })
+    .await
+    .expect("runtime spine saturation was never observed");
     assert_eq!(first_rejection, StatusCode::SERVICE_UNAVAILABLE);
 
     let desired = DesiredReadRequest {
