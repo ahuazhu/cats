@@ -583,9 +583,14 @@ fn linux_quality_gate_installs_the_postgres_probe_runtime() {
         );
     }
     assert!(linux_gate.contains("--ulimit nofile=65536:65536"));
-    assert!(linux_gate.contains(
-        "printf '%s\\0' \"$CATS_SOURCE_PROVENANCE_ROOT\" | source_git hash-object --stdin"
-    ));
+    assert!(linux_gate.contains("env -u GIT_DIR -u GIT_WORK_TREE -u GIT_COMMON_DIR"));
+    assert!(linux_gate.contains("GIT_CEILING_DIRECTORIES=\"$(dirname \"$LINUX_CAPTURE_DIR\")\""));
+    assert!(linux_gate.contains("git -C \"$LINUX_CAPTURE_DIR\" hash-object --stdin --no-filters"));
+    assert!(linux_gate.contains("[[ \"$LINUX_TARGET_NAMESPACE\" =~ ^[0-9a-f]{40}$"));
+    assert!(
+        !linux_gate.contains("git -C \"$REPO_ROOT\" hash-object --stdin"),
+        "target isolation must not reopen host-only worktree Git metadata inside Linux"
+    );
     assert!(
         linux_gate.contains("LINUX_TARGET_DIRECTORY=\"/target/worktrees/$LINUX_TARGET_NAMESPACE\"")
     );
@@ -1079,7 +1084,33 @@ esac
 
 #[cfg(unix)]
 fn linux_gate_command(fake_bin: &Path, state: &Path, mode: &str) -> Command {
-    let mut command = Command::new(workspace_root().join("scripts/quality.sh"));
+    let linked_worktree = state
+        .parent()
+        .expect("Linux gate fixture parent")
+        .join("linked-worktree");
+    let scripts = linked_worktree.join("scripts");
+    std::fs::create_dir_all(&scripts).expect("create linked-worktree scripts fixture");
+    for name in ["quality.sh", "linux-gate.sh"] {
+        let destination = scripts.join(name);
+        std::fs::copy(workspace_root().join("scripts").join(name), &destination)
+            .unwrap_or_else(|error| panic!("copy {name} into linked-worktree fixture: {error}"));
+        let mut permissions = std::fs::metadata(&destination)
+            .unwrap_or_else(|error| panic!("read {name} fixture metadata: {error}"))
+            .permissions();
+        permissions.set_mode(0o755);
+        std::fs::set_permissions(&destination, permissions)
+            .unwrap_or_else(|error| panic!("make {name} fixture executable: {error}"));
+    }
+    std::fs::write(
+        linked_worktree.join(".git"),
+        format!(
+            "gitdir: {}\n",
+            linked_worktree.join("unmounted-host-gitdir").display()
+        ),
+    )
+    .expect("write broken linked-worktree Git indirection");
+
+    let mut command = Command::new(scripts.join("quality.sh"));
     command
         .arg("linux")
         // Exercise the macOS-supported system Bash (3.2) instead of allowing
@@ -1091,7 +1122,7 @@ fn linux_gate_command(fake_bin: &Path, state: &Path, mode: &str) -> Command {
         )
         .env("CATS_FAKE_DOCKER_STATE", state)
         .env("CATS_FAKE_DOCKER_MODE", mode)
-        .env("CATS_SOURCE_PROVENANCE_ROOT", workspace_root())
+        .env("CATS_SOURCE_PROVENANCE_ROOT", &linked_worktree)
         .env("CATS_SOURCE_PROVENANCE_HEAD", "a".repeat(40))
         .env("CATS_SOURCE_PROVENANCE_DIRTY", "false")
         .env("CATS_SOURCE_PROVENANCE_FINGERPRINT", "b".repeat(40));

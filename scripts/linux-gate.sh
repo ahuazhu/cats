@@ -56,18 +56,22 @@ LINUX_PROBE_PRESENT=false
 LINUX_PROBE_ID=""
 LINUX_CLEANUP_DEADLINE=0
 
-source_git() {
-  GIT_OPTIONAL_LOCKS=0 git \
-    -c safe.directory="$REPO_ROOT" \
-    -c core.hooksPath=/dev/null \
-    -c core.fsmonitor=false \
-    -C "$REPO_ROOT" \
-    "$@"
-}
-
+# The bind-mounted worktree may carry a .git file whose host-only gitdir is not
+# mounted into a nested Linux quality container. Hash only the inherited,
+# validated provenance root from a fresh non-repository directory so target
+# isolation never depends on reopening repository metadata.
 LINUX_TARGET_NAMESPACE="$(
-  printf '%s\0' "$CATS_SOURCE_PROVENANCE_ROOT" | source_git hash-object --stdin
+  printf '%s\0' "$CATS_SOURCE_PROVENANCE_ROOT" \
+    | env -u GIT_DIR -u GIT_WORK_TREE -u GIT_COMMON_DIR \
+      GIT_OPTIONAL_LOCKS=0 \
+      GIT_CEILING_DIRECTORIES="$(dirname "$LINUX_CAPTURE_DIR")" \
+      git -C "$LINUX_CAPTURE_DIR" hash-object --stdin --no-filters
 )"
+[[ "$LINUX_TARGET_NAMESPACE" =~ ^[0-9a-f]{40}$ \
+  || "$LINUX_TARGET_NAMESPACE" =~ ^[0-9a-f]{64}$ ]] || {
+  echo "cannot derive the Linux target namespace from source provenance" >&2
+  exit 1
+}
 LINUX_TARGET_DIRECTORY="/target/worktrees/$LINUX_TARGET_NAMESPACE"
 
 terminate_active_docker() {
