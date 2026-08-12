@@ -764,6 +764,12 @@ fn linux_quality_gate_pins_one_private_systemd_e2e_to_an_immutable_image() {
         .join(" ");
     assert!(
         focused_command.contains(
+            "docker_cli capture 12600 exec \"$LINUX_SYSTEMD_GATE\" timeout --signal=TERM --kill-after=30s 20m cargo test -p cats-node-agent --lib --locked --target-dir \"$LINUX_TARGET_DIRECTORY\" runtime_cutover::cross_component_e2e::postgres_control_and_production_cutover_reconcile_one_created_cat_across_restart -- --ignored --exact --list"
+        ),
+        "the focused test inventory must bound both Docker and its in-container Cargo process"
+    );
+    assert!(
+        focused_command.contains(
             "exec \"$LINUX_SYSTEMD_GATE\" timeout --signal=TERM --kill-after=30s 20m cargo test -p cats-node-agent --lib --locked --target-dir \"$LINUX_TARGET_DIRECTORY\" runtime_cutover::cross_component_e2e::postgres_control_and_production_cutover_reconcile_one_created_cat_across_restart -- --ignored --exact --nocapture"
         ),
         "the privileged gate must run only the exact ignored Node E2E"
@@ -1071,7 +1077,11 @@ case "${1:-} ${2:-}" in
       *" cat /proc/1/cgroup") printf '0::/init.scope\n' ;;
       *" systemctl is-system-running --quiet") ;;
       *" sh -ceu "*) : >"$state/blockd-installed" ;;
-      *" cargo test "*" -- --ignored --exact --list")
+      *" timeout --signal=TERM --kill-after=30s 20m cargo test "*" -- --ignored --exact --list")
+        : >"$state/focused-systemd-test-list-ran"
+        if [[ "$mode" == timeout-systemd-test-list ]]; then
+          exit 124
+        fi
         if [[ "$mode" != zero-systemd-test ]]; then
           printf '%s\n' \
             'runtime_cutover::cross_component_e2e::postgres_control_and_production_cutover_reconcile_one_created_cat_across_restart: test'
@@ -1423,6 +1433,10 @@ fn linux_quality_gate_rejects_an_empty_focused_systemd_test_filter() {
         !state.join("focused-systemd-test-ran").exists(),
         "the real focused command ran after its known-positive probe returned zero tests"
     );
+    assert!(
+        state.join("focused-systemd-test-list-ran").exists(),
+        "the zero-test regression did not exercise the bounded inventory probe"
+    );
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(
         stderr
@@ -1446,6 +1460,57 @@ fn linux_quality_gate_rejects_an_empty_focused_systemd_test_filter() {
         trace.contains(&format!("stop --time 20 {systemd_id}"))
             && trace.contains(&format!("rm -f {systemd_id}")),
         "empty test-inventory failure did not clean the focused container exactly:\n{trace}"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn linux_quality_gate_cleans_exact_resources_when_focused_test_inventory_times_out() {
+    let fixture = tempfile::tempdir().expect("Linux gate focused-test timeout fixture");
+    let fake_bin = fixture.path().join("bin");
+    let state = fixture.path().join("state");
+    std::fs::create_dir_all(&state).expect("create fake Docker state");
+    install_linux_gate_fake_cli(&fake_bin);
+
+    let output = linux_gate_command(&fake_bin, &state, "timeout-systemd-test-list")
+        .output()
+        .expect("run Linux gate focused-test timeout regression");
+    assert!(
+        !output.status.success(),
+        "a timed-out exact Rust test inventory incorrectly passed the Linux gate"
+    );
+    assert!(
+        state.join("focused-systemd-test-list-ran").exists(),
+        "the timeout regression did not exercise the bounded inventory probe"
+    );
+    assert!(
+        !state.join("focused-systemd-test-ran").exists(),
+        "the real focused command ran after its inventory probe timed out"
+    );
+    for resource in [
+        format!("network.cats-linux-net-{LINUX_GATE_TEST_TOKEN}"),
+        format!("container.cats-linux-pg-{LINUX_GATE_TEST_TOKEN}"),
+        format!("container.cats-linux-workspace-gate-{LINUX_GATE_TEST_TOKEN}"),
+        format!("container.cats-linux-systemd-gate-{LINUX_GATE_TEST_TOKEN}"),
+    ] {
+        assert!(
+            !state.join(&resource).exists(),
+            "intended resource remained after focused test-inventory timeout: {resource}"
+        );
+    }
+    let trace = std::fs::read_to_string(state.join("trace")).expect("fake Docker trace");
+    let bounded_list = format!(
+        "exec cats-linux-systemd-gate-{LINUX_GATE_TEST_TOKEN} timeout --signal=TERM --kill-after=30s 20m cargo test -p cats-node-agent --lib --locked"
+    );
+    assert!(
+        trace.contains(&bounded_list) && trace.contains("-- --ignored --exact --list"),
+        "the timeout regression did not preserve the in-container Cargo deadline:\n{trace}"
+    );
+    let systemd_id = format!("owned-cats-linux-systemd-gate-{LINUX_GATE_TEST_TOKEN}-id");
+    assert!(
+        trace.contains(&format!("stop --time 20 {systemd_id}"))
+            && trace.contains(&format!("rm -f {systemd_id}")),
+        "test-inventory timeout did not clean the focused container exactly:\n{trace}"
     );
 }
 
