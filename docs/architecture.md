@@ -1,7 +1,7 @@
 # Cats 技术架构
 
-- 状态：目标架构；ADR-0040/0041/0042 已接受，Rust 实现尚未完成切换
-- 更新：2026-08-08
+- 状态：目标架构 + 当前实现边界；A19/A20 signed spine与current-Desired Running路径已组成，完整lifecycle切换尚未完成
+- 更新：2026-08-12
 - 适用范围：产品资源、控制面、Node、网络入口、microVM 与块存储
 
 ## 1. 大目标
@@ -52,9 +52,9 @@ PostgreSQL DesiredRuntimeSpec(revision)
 
 ## 3. 结构性问题
 
-现有故障不是一串互不相关的 bug，而是六个系统边界没有闭合：
+触发clean-slate切换的V1故障不是一串互不相关的 bug，而是六个系统边界没有闭合：
 
-| 结构性问题 | 当前表现 | 终态规则 |
+| 结构性问题 | 被替换的V1表现 | 终态规则 |
 |---|---|---|
 | 生命周期权威分裂 | Cat 行、Controller transitional state、NodeJob、heartbeat 和内存结果都能影响状态 | PostgreSQL只写完整desired；Node只执行并报告observation |
 | 物理所有权不可恢复 | Agent重启会杀子进程，副作用后才写ledger，资源按hash猜名字 | Host lock、per-Cat scope、effect前checkpoint和完整物理inventory |
@@ -68,19 +68,23 @@ PostgreSQL DesiredRuntimeSpec(revision)
 
 ### 3.1 当前实现事实
 
-仓库当前是完整的 V1 开发实现，不是上述目标协议：
+仓库当前已组成clean-slate signed Runtime production spine与current-Desired Running路径；这不等于完整
+lifecycle cutover或release qualification。下表把已实现边界与仍开放的边界分开：
 
 | 范围 | 当前事实 | 目标差距 |
 |---|---|---|
 | ChunkStore | Rust engine、delta pack、golden root、NBD/vhost-user-blk、fencing 与 crash tests 已存在 | 保持格式和语义；补齐组合故障验收 |
-| 控制面 | PostgreSQL 同时保存 desired、observed、generation；Controller 派生 `NodeJob` | 切到完整 DesiredSpec 和纯 observation read model |
-| Node | 动作结果只在内存 journal；动作结束后才写完整 JSON ledger | 副作用前写一个有界 checkpoint，并以物理枚举重建 |
-| heartbeat | 只有 Node/Cat generation/state，会直接覆盖 Cat observed | 加 agent instance、sequence、完整 inventory；只写 observation |
-| route | 已签名并在 Node 验证，Gateway另有DynamoDB mirror，但没有独立的本地 installed/retired gate | 精确绑定incarnation/per-Endpoint route epoch并原子guard；删除shared mirror |
-| Node restart | 测试能重新打开部分子进程，但生产 unit 仍会随 Agent cgroup 杀进程，且无 Host 排他锁 | per-Cat scope、union enumeration、Host lock 后才宣称可接管 |
-| HA | 多副本/RDS/RDS Proxy结构已存在；双节点Cold迁移有真机证据；当前Store会同步串行慢DB调用 | 异步有界DB执行；真实control-plane takeover、RDS failover和自动Host fence验收 |
-| PersistentDisk | 当前只把raw virtio设备和`mount_path`送到Node，没有filesystem identity或Guest mount结果 | ext4 UUID、一次性format authority和mounted observation |
-| Placement/Guest network | legacy `nodes` capacity与Node本地CIDR/FNV仍存在；per-Cat tap和dev E2E已存在 | A23 policy/planner/exact Desired network尚未实现；真实CH资格证据与跨Node overlay仍缺失 |
+| 控制面 | PostgreSQL A19 session、A20 Desired/observation、A22 volume transition、A23 policy/planner与Cat-create v2均已组成；legacy Controller仅test harness | 真实RDS failover与外部Host-fence qualification仍独立 |
+| Node | production `noded`只启动signed cutover；完整scanner、bounded checkpoint、per-Cat effects和observation-only回报已组成 | exact release仍须过Linux/metal物理资格门；无legacy runtime fallback |
+| heartbeat | A20 new-sequence observation是唯一AgentSession续期点；旧register/heartbeat/work-status/work routes在production为404 | timeout只产生suspicion，不得替代HostFenceEvent |
+| route | v2 Grant、Node AdmissionCell/guard、退役/重启恢复及mTLS machine tunnel已实现 | ring/mTLS artifacts未安装时listener保持Closed；跨Node overlay仍deferred |
+| Node restart | Host lock、per-Cat scopes、union inventory、current-authority checkpoint/receipt恢复与stale-boot清理已实现 | superseded pre-acquire publication与其他lifecycle恢复不在已完成声明内；systemd 255 + KVM/Cloud Hypervisor exact-SHA证据仍是release gate |
+| HA | bounded PostgreSQL执行、多副本锁序与Operation读取已实现；PG跨组件测试到达signed runner的recording effect dispatch seam | [当前跨组件证据边界](architecture-cross-review.md#当前跨组件证据边界)之后的真实installed effect、control-plane takeover、RDS failover和自动Host fence仍需证据 |
+| PersistentDisk | current-Desired Running路径的多卷Normal/Takeover、NBD/vhost、ext4 UUID、一次性Format、Drain/Commit及private mounted-set gate已实现 | superseded publication、完整lifecycle、Snapshot/GC、跨Host rejoin和delete crash矩阵仍按独立合同验收 |
+| Placement/Guest network | A23 provisioner policy、同snapshot planner、exact Desired `/30`和per-Cat tap已实现 | 跨Node Guest overlay仍deferred |
+
+除本节明确标成“当前事实”的内容外，后文描述的是accepted终态合同及其上线门，不能从规范中的
+四态流程或验收oracle反推当前release已经完成对应实现或物理qualification。
 
 ### 3.2 组件职责
 
@@ -389,19 +393,23 @@ Route正确性只依赖签名Grant、当前Node gate和原子guard。详见
 
 ## 10. 高可用故障合同
 
+下表是accepted终态故障合同，不是当前release完成清单；已实现与仍开放的边界只以§3.1和
+[当前跨组件证据边界](architecture-cross-review.md#当前跨组件证据边界)为准。
+
 | 故障 | 保证 | 明确不保证 |
 |---|---|---|
 | 单个 API/Controller 退出 | 其他副本继续；新 leader 从 PG desired 扫描 | 内存队列不恢复，也不需要恢复 |
 | 控制面全断 | 已Running的VMM/blockd和现有流继续；预热该entry的Gateway replica可在Grant过期前接新流 | 新mutation、唤醒、Grant续期和冷Gateway cache |
 | PostgreSQL/MetadataStore 暂时不可用 | Running 计算继续；Relaxed 可在本地配额内推进 `L` | Strict FLUSH、远端 publish 和 lifecycle drain 必须成功 |
 | Object Store 暂时不可用 | cache hit 读和 Relaxed 本地提交可有界继续 | cache miss、Strict commit、Warm/Cold 转换 |
-| Node Agent 退出 | 目标形态下VMM/blockd scopes继续；systemd重启Agent，取Host lock后重建 | 代理中的连接可中断、新admission短暂不可用；当前V1尚未满足 |
+| Node Agent 退出 | current-Desired Running实现使用独立per-Cat units、Host lock、checkpoint与完整inventory重建；exact release仍须物理qualification | 代理中的连接可中断、新admission短暂不可用；superseded及其他lifecycle恢复不在当前完成声明内 |
 | Node 网络分区 | 保留源，不在另一 Node 自动启动 writer | heartbeat timeout 不等于失效转移 |
 | Host 永久丢失 | HostFenceEvent、新Desired和逐卷CAS后从remote `R` Cold恢复；旧epoch永久失败 | Relaxed `R < L` 的tail可能丢失，报告`DataLossPossible` |
 | Warm/Suspended 局部损坏 | 保留卷安全后 Cold fallback | Host-bound 快路径本身不是 HA 副本 |
 | Gateway 退出 | 其他 Gateway 可从控制面取新 route | 无共享镜像时，冷 Gateway 不在 CP 全断期间接新流量 |
 
-AWS自动Node failover使用一个窄、可审计的EC2/BMC Host-fence adapter。provider receipt只建立
+目标AWS自动Node failover使用一个窄、可审计的EC2/BMC Host-fence adapter；该adapter及其物理故障矩阵
+尚未进入当前完成声明。provider receipt只建立
 绑定不可变Host/boot、旧session和fence attempt的Active HostFenceEvent，不直接创建placement或
 writer。Control Plane以一个事务失败旧Operation并创建新完整Desired/Operation/placement及全部
 逐卷授权；每卷CAS后才恢复。旧Host网络持续隔离，rejoin把旧`R < L`lineage quarantine并核对全部
@@ -420,7 +428,8 @@ HostRejoinProof把event持久转为Rejoined后才恢复网络，此后未消费�
 - Guest 不持有 S3、MetadataStore、WorkOS 或 Node 管理凭据。
 - 用户身份、机器身份和 fleet break-glass 身份分离；所有资源按 Workspace 授权。
 - Route Grant 私钥只在控制面 signer；Node 持有 key ring，Gateway 不解读或重签。
-- blockd/VMM/Guest 最终应运行在 per-Cat systemd scope；Node Agent 本身另有 Host lock。
+- production Running路径在独立per-Cat systemd units/scopes运行blockd/VMM，Node Agent另持Host lock；
+  当前clean SHA仍需systemd 255 + KVM/Cloud Hypervisor资格证据。
 - privilege separation 与跨 Node overlay 尚未实现，继续保持为后续工作。
 - 审计事件可以追加、轮转和外送，但删除审计历史不影响恢复。
 
@@ -448,17 +457,18 @@ Host恢复必须同时调用AgentSession、逐卷takeover和route close，不能
 3. **不阻塞本轮的能力**：跨Host Warm/live migration、hotplug、Disk clone、Golden Image自动GC、
    overlay、privilege separation和新billing形态。
 
-### 12.1 开发与验证顺序
+### 12.1 已完成边界与剩余验证顺序
 
-1. 先把每个已知失败写成外部行为oracle：ABA、响应丢失、逐步kill、双Agent、过期owner、
-   `R < L`、错误UUID、旧Grant、active WebSocket和慢数据库。
-2. 在同一开发分支实现A-C并删除旧NodeJob、lease接管和本地ledger路径；测试与部署artifact只
-   包含终态接口。
-3. 接入D并删除DynamoDB route mirror、旧claims/parser、旧IAM和Terraform输入。
-4. 接入E，完成两种block path、真实Cloud Hypervisor、控制面/RDS/Gateway/Agent/Host故障矩阵。
-5. 独立native x86_64 Linux测试机运行exact clean commit的`quality.sh full`并保存不可变receipt；
-   满足隔离、空闲和exact-artifact前置的metal Host再运行同一`runtime-cutover-e2e.sh` oracle的
-   kernel-NBD和vhost-user两次结果。没有合格Host时真实KVM上线门保持Blocked。
+1. 支撑current-Desired Running路径的A-D production slices和外部行为oracle已经落地；旧NodeJob、heartbeat、
+   shared route mirror及旧work入口不在production composition，只保留显式retired test harness。
+2. 这不覆盖superseded pre-acquire publication、完整四态、Snapshot/GC、外部Host fence/rejoin或RDS failover；
+   这些边界只能在实现和各自故障矩阵都闭合后升级状态。
+3. 先增加从production public spawn与真实PostgreSQL开始、穿过installed scanner和
+   `SignedRunningEffect`的组合E2E。当前PG测试只到recording `RefreshInventory` seam，不能替代该门。
+4. 独立native x86_64 Linux测试机对同一exact clean commit运行`quality.sh full`并保存不可变receipt。
+5. 满足隔离、空闲、systemd 255和exact-artifact前置的metal Host再对两种适用block path运行新的
+   clean-slate KVM oracle并保留同一SHA证据。没有合格Host或新oracle尚未绿色时，真实物理上线门保持Blocked；
+   历史`deploy/metal/e2e.sh`四态结果不能替代它。
 
 ### 12.2 Clean-slate 部署
 

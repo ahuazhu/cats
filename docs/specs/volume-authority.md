@@ -1,6 +1,6 @@
 # Volume Authority 与磁盘生命周期
 
-- 状态：目标合同；尚未实现
+- 状态：current-Desired Running attachment/ext4路径已实现；superseded publication、Snapshot/GC/Host-fence qualification仍显式开放
 - 决策：[ADR-0042](../decisions/0042-volume-authority-and-disk-lifecycle.md)
 - 协调协议：[Runtime Reconciliation v1](runtime-reconciliation-v1.md)
 - Runtime transition transport：[Runtime Volume Transitions v1](runtime-volume-transitions-v1.md)

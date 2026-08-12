@@ -1,8 +1,8 @@
 # Architecture cross-review closure
 
-- 性质：冻结的设计复核记录，不是运行状态或实施进度表
+- 性质：accepted设计复核记录 + 当前证据边界；设计结论冻结，§“当前跨组件证据边界”随可复现实证更新
 - 总体设计：[Cats 技术架构](architecture.md)
-- 日期：2026-08-08
+- 初次复核：2026-08-08；证据边界更新：2026-08-12
 
 Runtime/Control、Volume/Disk、Route/HA分别完成首轮设计，并由另外两个边界的reviewer做只读
 交叉复核。复核顺序以数据损坏、双写、故障恢复、admission和可实施性为先；格式与代码风格不在
@@ -62,15 +62,28 @@ Operations/HA；依赖和实现顺序见[技术架构 §12](architecture.md#12-�
 | Fence adapter | Recovery | receipt -> HostFenceEvent -> per-volume CAS -> Rejoined | timeout只suspicion；未闭环保持Blocked |
 | blockd/Guest | Lifecycle | `R/L`、filesystem UUID、mount observation | `R<L`不越过Cold；Initialized前`R==L` |
 
+## 当前跨组件证据边界
+
+`node-agent/src/runtime_cutover/cross_component_e2e.rs`中的PostgreSQL测试从production Control/A23开始，
+经过真实A19、A20、Cat-create v2与runner restart，校准旧五入口404，并证明exact accepted Desired只dispatch
+给一个per-Cat effect。它有意注入受控`CompleteAssignedScanner`与`RecordingRefreshEffect`，终点是recording
+`RefreshInventory` seam；它不执行installed clean-slate scanner、production `SignedRunningEffect`或物理
+Guest/VMM。production composition有独立组件测试，但这些测试不能替代public-spawn组合证据；当前新的
+production-public-spawn PostgreSQL/Linux E2E尚未绿色，也没有把两段合成PG-backed physical E2E，更没有
+可归属于当前clean SHA的Linux/metal exact-SHA receipt。后续combined production PG/Linux E2E落地时，只在
+本节按实际终点升级证据边界，其他文档继续引用这里。
+
 ## 尚需实现和证明
 
-这些是实现/证据缺口，不再是未决架构分支：
+这些是剩余外部组合或qualification缺口，不再是未决架构分支：
 
-- 当前Rust仍是V1协调路径；ADR-0040/0041/0042均未实现。
-- `deploy/metal/runtime-cutover-e2e.sh`尚未实现；它应成为两种block path共用的确定性oracle，不创建
-  新测试环境。
-- 外部Host fence adapter、真实RDS failover、两卷takeover/rejoin和disposable delete crash矩阵尚未
-  产生终态evidence。
+- A19/A20/A22/A23、完整scanner、per-Cat checkpoint/effect、AdmissionCell及current-Desired Running的
+  Persistent ext4链已组成；旧NodeJob/heartbeat不属于production composition。完成声明到Running-only
+  current-authority路径为止，不宣称superseded pre-acquire publication或完整lifecycle cutover已经闭合。
+- 上述PG测试只证明[当前跨组件证据边界](#当前跨组件证据边界)。具体release还必须在两种block path
+  适用的Linux/metal环境保留exact-SHA物理证据，不能用受控scanner或recording effect替代KVM/Guest。
+- 外部Host fence adapter、真实RDS failover、disposable delete crash矩阵和跨Node Guest overlay尚未
+  产生终态evidence；timeout仍只表示suspicion。
 - 独立native Linux build host必须验证exact clean commit并保留immutable receipt；本地或错误
   worktree的绿色结果不能替代它。
 - 现有实验只证明各自记录的环境和样本，不构成生产SLA。

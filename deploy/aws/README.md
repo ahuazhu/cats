@@ -10,7 +10,9 @@ them. See
 Production-shaped split:
 
 - EKS Pods: `cats-controld` (portal, user console, admin console and API).
-  Public Endpoint ingress remains undeployed until Route Grant v2 is composed.
+  Route Grant v2 and the machine tunnel exist in code, but public Endpoint
+  ingress remains undeployed because this stack does not install the reviewed
+  signing ring, Gateway/Node mTLS artifacts or public proxy.
 - EC2 bare metal: only `cats-noded`, `cats-blockd`, Cloud Hypervisor and guest
   assets. It is not an EKS node.
 - RDS PostgreSQL: authoritative ChunkStore roots, leases and fencing epochs.
@@ -55,11 +57,13 @@ is `AVAILABLE`, set the `RDS_PROXY_ENDPOINT` GitHub repository variable to the
 the storage/control DSN and enables server-verified session defaults. The usage
 DSN remains direct. For workers, set `CATS_POSTGRES_HOST` to the same endpoint
 and `CATS_POSTGRES_SESSION_SETUP=server-verified` in
-`worker_managed_environment`, then use the existing one-worker cordon/drain
-release sequence. Removing those two settings restores the direct endpoint and
-`client` mode without changing credentials.
+`worker_managed_environment`. The former V1 one-worker cordon/drain sequence is
+not a clean-slate rollout authority: until the current exact release passes its
+physical qualification, apply this change only to a cordoned, empty,
+residue-free worker. Removing those two settings restores the direct endpoint
+and `client` mode without changing credentials.
 
-Production worker releases use the Terraform-managed artifact bucket,
+The existing worker release machinery uses the Terraform-managed artifact bucket,
 Secrets Manager secret and SSM State Manager association. The bundle digest is
 verified before installing `cats-noded`, `cats-blockd`, `cats-guest-agent`,
 `render-postgres-url` and the worker systemd units. The same bundle carries the Guest Agent and standalone
@@ -72,7 +76,9 @@ must be repaired in already-built seeds, including a world-readable
 required, not cosmetic:
 `ensure_image_published` caches the golden root's image id for the life of the
 node process, so an updated image is otherwise ignored. Existing Cats keep
-their current root until they are recreated.
+their current root until they are recreated. This installer behavior predates
+the clean-slate exact-SHA qualification; the association must not be enabled as
+a rolling current-runtime upgrade until the gate below is green.
 
 The bundle carries the one CI-built, manifest-bound Guest kernel, optional
 initramfs and runtime receipt; a Host-local rebuild is not release input and
@@ -92,7 +98,7 @@ host-wide binary used by another workload. The S3 adapter uses the EC2
 instance role and refreshes its temporary credentials; no long-lived AWS key is
 stored in `worker.env`.
 
-The release pipeline implements the frozen target
+The release pipeline implements the frozen
 [Agent Registration and Internal Transport v1](../../docs/specs/agent-registration-transport-v1.md) plus
 [Runtime Composition Artifacts v1](../../docs/specs/runtime-composition-artifacts-v1.md).
 One release build puts the same exact
@@ -122,8 +128,8 @@ The same central provisioner must put the reviewed private-DNS Node listener int
 not from worker registration, observation, IMDS, the listener source address, or legacy `nodes.agent_url`.
 Changing it uses an A23 policy revision while the Node is cordoned and has no assigned Desired runtimes; credential
 rotation preserves it, and retirement makes it unavailable to the Route Grant v2 signer.
-This contract moves the exact clean-slate Control Store schema to version 13. An existing version-12 schema is not
-altered in place and refuses startup; provision or recreate an empty version-13 schema before starting any new
+This contract uses the exact clean-slate Control Store authority schema version 14. An existing earlier schema is
+not altered in place and refuses startup; provision or recreate an empty version-14 schema before starting any new
 Control replica, with no mixed-version rolling window.
 
 Every Host-side worker mutation runs under the single
@@ -142,13 +148,19 @@ signed session/observation state, and `/v1/nodes/heartbeat` is absent from the
 production route map (a service or admin bearer request receives plain 404 and
 writes nothing).
 
-This is still not a standalone deployable release. The production Node is
-deliberately composed with an unavailable clean-slate scanner until all eleven
-physical inventory probes and the Runtime §7 typed planner/effect adapter are
-wired. Its local readiness stays closed with HTTP 503 and it executes zero runtime effects; the
-deployment transaction must roll back instead of committing an empty inventory
-as complete. Restoring the shared-bearer heartbeat or the legacy NodeJob
-listener is not a rollout or compatibility option.
+This is still not a standalone deployable release: the former zero runtime effect
+placeholder is gone, but the combined production-PG-to-physical and Linux/metal
+qualification is still open. The production Node composes the installed
+eleven-source clean-slate scanner, the signed per-Cat reconciler and one shared
+route-admission registry. Local readiness stays closed with HTTP 503 until a
+complete inventory has been accepted for the current AgentSession; incomplete
+or conflicting evidence is never promoted to a complete observation. The
+shared-bearer heartbeat and
+legacy NodeJob listener are not rollout or compatibility options. Route v2
+machine ingress remains independently closed unless the
+provisioner installs its reviewed signing ring, mTLS artifacts and listener
+configuration. The exact current evidence endpoint is recorded in
+[`architecture-cross-review.md`](../../docs/architecture-cross-review.md#当前跨组件证据边界).
 
 The worker builds an optimized Ubuntu 24.04 Guest: direct kernel, a minimal
 BusyBox initramfs used only for `switch_root`, and an Ubuntu minbase golden root
@@ -160,8 +172,9 @@ unused serial getty are not on the Cold-to-Agent readiness path. Each Cat gets
 an isolated tap `/30` with outbound host NAT; host, VPC-private and cloud
 metadata destinations are blocked before the general egress allow rule.
 Every Cat still has the stable Endpoint identity in control truth, but public
-Endpoint traffic intentionally remains unavailable until the v2 signer,
-bounded per-replica Gateway cache and Node admission gate are composed.
+Endpoint traffic intentionally remains unavailable in this deployment until
+the reviewed signing ring, Gateway/Node mTLS artifacts, listener configuration
+and public proxy are installed and qualified together.
 
 `cats-noded` detects the host's logical CPU and memory totals when it starts;
 the administrator console reports those schedulable totals plus sampled host
@@ -169,103 +182,50 @@ CPU, memory and state-filesystem disk utilization. `CATS_NODE_CPUS` and
 `CATS_NODE_MEMORY_MIB` are optional lower scheduling ceilings for hosts that
 reserve resources for other workloads.
 
-Each Cloud Hypervisor Cat uses a private, sparse, file-backed memory zone under
-its host-local runtime directory. Suspended first pauses the VM and then uses
-`process_madvise(MADV_PAGEOUT)` to reclaim Guest pages into that backing file;
-it does not require host swap. The worker service therefore needs
-`CAP_SYS_NICE` (the default root systemd unit has it), and the state filesystem
-must have enough local capacity for the active working sets. A page-out failure
-is not reported as Suspended: the VM is resumed and the control plane applies
-the lifecycle Cold fallback.
+#### Historical V1 lifecycle evidence
 
-Automatic deeper sleep is enabled for Cats that opt into `auto_suspend`.
-Running moves to Suspended when the explicit work-lease and Guest quiesce
-checks pass; a stable Suspended Cat moves to Warm after 10 minutes, and a
-stable Warm Cat moves to Cold after 24 hours. The latter thresholds are
-persisted-state timers configured by `CATS_AUTO_WARM_AFTER_SECONDS` and
-`CATS_AUTO_COLD_AFTER_SECONDS`; `0` disables the corresponding boundary. A Cat's
-timer runs from the last persisted observed-state change, so a control-plane
-restart does not reset it and does not demote a long-lived but recently
-suspended Cat.
+The repository still contains the pre-cutover V1 lifecycle implementation and
+its recorded experiments: a private file-backed memory zone, Suspended
+page-out with `process_madvise(MADV_PAGEOUT)`, persisted auto-tier timers, and
+the Running/Suspended/Warm/Cold test path. Those facts belong to the exact
+revisions that produced the retained evidence. The production clean-slate
+router does not mount the legacy NodeJob listener, and the current completion
+claim is limited to the current-Desired Running path. Do not use the old
+auto-tier path as evidence that the signed full lifecycle is composed.
 
-The elected reconciler applies automatic Node-loss fencing only after its
-startup grace. The daemon handles Kubernetes `SIGTERM` explicitly, releases
-its PostgreSQL leadership session, and stops singleton work before another
-replica takes over.
+The old controller's startup grace only delayed marking an expired-heartbeat
+Node Lost; it never made timeout an isolation proof. In the signed production
+composition, an absent or expired AgentSession closes admission and emits a
+liveness warning without rewriting Cat placement or fencing storage. A new
+writer still requires an externally established `HostFenceEvent` and the
+per-volume authorization/CAS path, which remain separate qualification work.
 
 The control resource database lives in managed PostgreSQL. `cats-controld`
 runs at least two API replicas on distinct Kubernetes nodes with a rolling
 strategy and a disruption budget. Required hostname anti-affinity makes a
 second replica stay Pending until EKS Auto Mode supplies another eligible node;
-the scheduler cannot silently co-locate both replicas on one node. Reconciler,
-billing enforcer and usage projector roles elect independently through
-dedicated PostgreSQL session advisory locks; losing that session cancels the
-role before failover. A terminating control-plane Pod stays alive in `preStop`
-for 15 seconds while Kubernetes removes it from EndpointSlices and the EKS Auto
-Mode ALB drains the target; SIGTERM then stops its singleton roles and HTTP
-server within the 30-second termination grace period. This ordering prevents
-the edge from routing to an already-exited process during target propagation.
+the scheduler cannot silently co-locate both replicas on one node. A
+terminating control-plane Pod stays alive in `preStop` for 15 seconds while
+Kubernetes removes it from EndpointSlices and the EKS Auto Mode ALB drains the
+target; SIGTERM then closes its admissions and HTTP server within the
+30-second termination grace period. The production clean-slate composition
+does not start the retired NodeJob reconciler or billing-enforcer singleton.
+Existing API-replica and advisory-lock tests do not by themselves prove a
+current public-spawn PostgreSQL-to-physical runtime takeover.
 
-The database carries a schema version. `cats-controld` migrates only stamped
-versions inside the build's supported range and fails closed on incompatible
-versions. The pre-cutover `cats-control-data` PVC is no longer part of the
-runtime; its final snapshot remains only as an archive.
+The authority database carries exact clean-slate schema version 14.
+`cats-controld` does not migrate an earlier authority schema in place and fails
+closed on any other stamp or catalog shape. The pre-cutover
+`cats-control-data` PVC is no longer part of the runtime; its final snapshot
+remains only as an archive.
 
-Inspect the production singleton locks and control-plane network addresses from
-`main` without disrupting a Pod:
-
-```sh
-gh workflow run verify-control-plane-ha.yml \
-  --ref main \
-  -f mode=diagnose \
-  -f confirmation=READ_ONLY_CONTROL_PLANE_LEADER_DIAGNOSTIC
-```
-
-Run the reproducible production HA disruption after a multi-replica rollout:
-
-```sh
-gh workflow run verify-control-plane-ha.yml \
-  --ref main \
-  -f mode=disrupt \
-  -f confirmation=DELETE_ONE_CATS_CONTROLD_LEADER
-```
-
-The workflow refuses a confirmation that does not match the selected mode and
-checks out the dispatched `main` revision. Diagnose mode verifies two ready
-Pods on different nodes, then reports the singleton locks and each Pod's Pod,
-Host and node addresses without deleting anything. Disrupt mode additionally
-requires an allowed PDB disruption, locates the reconciler owner through its
-PostgreSQL advisory lock, and maps that database source to exactly one strictly
-Ready, Running, non-terminating Pod through either its Pod IP or its EKS
-node/host IP. Candidate uniqueness is checked before readiness, so a
-terminating owner and a same-node replacement fail closed. Zero, duplicate, or
-ambiguous owner mappings fail before disruption. The owner is resolved again
-at the disruption boundary. A policy/v1 Eviction makes the Kubernetes API
-atomically enforce both the PDB and selected Pod UID. All 240 public `/healthz`
-probes start on a fixed 250 ms schedule with bounded concurrency, so a slow
-request cannot hide the following observations. Every attempt retains its
-sub-second start/end time, edge address, HTTP status, DNS/connect/TLS/TTFB/total
-timings and scheduling lag. Header evidence follows an explicit safe policy:
-`server` and `via` may be retained with value and size caps, while selected
-edge trace headers are retained only as SHA-256 digests; all other response
-headers and the transient raw curl headers are excluded. The first attempt and
-its safe-header artifact must be complete and healthy before the Pod UID check
-and Eviction. A signal-aware common finalizer reaps every curl child and writes
-a terminal manifest for all configured attempts, distinguishing scheduled,
-started, completed and missing work; interrupted or otherwise incomplete runs
-exit nonzero.
-
-The Pod and EndpointSlice collectors preserve one Kubernetes LIST-to-watch
-stream each, but retain only a projected operational schema in a bounded
-first-and-latest window (2,000 records and 1 MiB per stream). Original Pod logs
-are converted online to timestamp, severity, diagnostic category, byte count
-and SHA-256 records before the same bounded retention; application log text is
-never uploaded. Every background pipeline is terminated recursively from its
-recorded root PID with a fixed TERM/KILL deadline, so cancellation cannot leave
-an orphaned `kubectl`, `jq` or summarizer. Snapshots and explicit Eviction,
-deletion, rollout and takeover markers are uploaded for 30 days even if a later
-gate fails. The workflow finally proves that two node-spread replicas and a new
-reconciler owner are present. It never force-deletes or scales the Deployment.
+The existing `verify-control-plane-ha.yml` workflow and its bounded probes,
+safe-header collection, Pod-UID recheck and PDB-governed eviction are retained
+as historical V1 control-plane HA evidence. Its reconciler-owner oracle targets
+the retired singleton and therefore must not be run from `main` or cited as a
+clean-slate runtime qualification. A replacement must use the production
+public spawn, schema 14 and the signed Runtime composition, preserve the exact
+tested SHA, and pass before this boundary is promoted.
 
 The usage ledger has the same rule for the same reason. ADR-0018 replaced the V1
 `project` ownership column with `workspace_id` on usage rows and `account_id` on

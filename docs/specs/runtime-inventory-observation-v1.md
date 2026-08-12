@@ -1,6 +1,6 @@
 # Runtime Inventory and Observation Spine v1
 
-- 状态：Frozen target contract；尚未实现
+- 状态：Implemented frozen v1；clean-slate rollout only
 - 上位决策：[ADR-0040](../decisions/0040-level-triggered-runtime-reconciliation.md)
 - 共享类型与状态机：[Runtime Reconciliation v1](runtime-reconciliation-v1.md)
 - Node 请求认证：[Agent Registration Transport v1 §4](agent-registration-transport-v1.md#4-per-node-request-proof-adapter)

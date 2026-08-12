@@ -1,6 +1,6 @@
 # Immutable Image Manifest Read v1
 
-- 状态：Frozen target contract；reader、provider adapters 与 production composition 已实现；Cat-create route 接线由 F2d 收口
+- 状态：Implemented frozen v1；reader、provider adapters、production composition与Cat-create v2已接线
 - 上位决策：[ADR-0017](../decisions/0017-golden-root-shared-base-images.md)
 - Object port：[ADR-0005](../decisions/0005-provider-neutral-storage-ports-and-adapters.md)
 - 数据面消费者：[blockd protocol §6.3.1](blockd-protocol.md#631-root-provision-control-effect)

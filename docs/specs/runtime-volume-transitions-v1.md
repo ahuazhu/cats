@@ -1,6 +1,7 @@
 # Runtime Volume Transitions v1
 
-- 状态：Frozen target contract；尚未实现
+- 状态：frozen transport已实现；current-Desired Running路径已组成，完整lifecycle与superseded
+  publication qualification沿用[Runtime Reconciliation v1](runtime-reconciliation-v1.md)边界
 - 上位决策：[ADR-0040](../decisions/0040-level-triggered-runtime-reconciliation.md)、[ADR-0042](../decisions/0042-volume-authority-and-disk-lifecycle.md)
 - 共享runtime类型：[Runtime Reconciliation v1](runtime-reconciliation-v1.md)
 - session/authentication：[Agent Registration and Internal Transport v1](agent-registration-transport-v1.md)

@@ -95,10 +95,13 @@ stack creates a TLS-only RDS Proxy and exports `database_proxy_endpoint`, but
 the production workflow retains the direct storage URL until the optional
 `RDS_PROXY_ENDPOINT` repository variable is set. Wait for the proxy target to
 be `AVAILABLE` and verify its initialization timeouts before setting the
-variable. Usage clients remain direct. Metal workers switch separately, one
-drained node at a time, by setting `CATS_POSTGRES_HOST` to that output and
-`CATS_POSTGRES_SESSION_SETUP=server-verified`. See ADR-0034 for the complete
-cutover, rollback and metric acceptance contract.
+variable. Usage clients remain direct. Metal workers switch separately by
+setting `CATS_POSTGRES_HOST` to that output and
+`CATS_POSTGRES_SESSION_SETUP=server-verified`, but the old one-node-at-a-time
+drain is not current cutover authority: use the empty, cordoned, residue-free
+worker boundary below until a lifecycle migration procedure is separately
+qualified. See ADR-0034 for the database cutover, rollback and metric
+acceptance contract.
 
 **Production dependencies span availability zones by default.** The RDS
 instance keeps a synchronous Multi-AZ standby, and each private subnet routes
@@ -223,16 +226,18 @@ control as production credentials.
 
 ### Route admission
 
-The deployed V1 contract uses one Ed25519 key pair. Every control-plane replica
-receives the same private key from application state; CI derives the public key
-from that exact input and startup verifies the pair. Metal workers receive only
-the public key. Because the current module accepts the private PEM as a Terraform
-variable, the saved plan and state contain it and must be protected as credentials.
-Keep it out of workers, Gateway configuration, Guest images and logs. Generate it with
+The retained V1 Terraform inputs use one Ed25519 key pair. They describe the
+pre-cutover deployment shape, not a current clean-slate ingress path. Every
+control-plane replica received the same private key from application state; CI
+derived the public key from that exact input and workers received only the
+public half. Because the module still accepts the private PEM as a Terraform
+variable, a saved plan and state containing it remain credentials even though
+the current application stack does not deploy public Endpoint ingress. Keep it
+out of workers, Gateway configuration, Guest images and logs. Generate it with
 `openssl genpkey -algorithm ED25519` and derive the public half with
-`openssl pkey -pubout`.
+`openssl pkey -pubout` only when reproducing or retiring that historical shape.
 
-The target route module removes the private-key Terraform variable. Terraform manages
+The clean-slate route design removes the private-key Terraform variable. Terraform manages
 only a secret reference, workload access policy and public verifier ring; a separate
 secret channel writes key bytes. The clean-slate deployment rotates the key so every
 private value retained in historical Terraform state is cryptographically obsolete. The
@@ -241,10 +246,13 @@ as product data and is not deleted by the cutover.
 
 The old regional Route Grant cache and Gateway-only Pod Identity have been
 removed. The production stack does not deploy `cats-gatewayd`, publish Endpoint
-wildcard DNS or route wildcard ingress until the ADR-0041 implementation and
-its qualification matrix land. Workers remain gate-closed during this gap.
+wildcard DNS or route wildcard ingress. ADR-0041, the Node admission core and
+Gateway-to-Node machine tunnel exist in code, but this Terraform stack still
+does not install their signing ring, Gateway/Node mTLS artifacts or public
+proxy; workers remain gate-closed until those artifacts and the qualification
+matrix land together.
 
-The first ADR-0040/0041 deployment follows the single ordered runbook in
+The first qualified ADR-0040/0041 clean-slate deployment follows the single ordered runbook in
 [Operations and HA §8](../../../docs/operations-ha.md#8-首次终态部署). The Terraform plan used there
 must already have removed the V1 route-cache/parser inputs and private-key value, retain only the
 new secret reference/public ring policy, and rotate the affected service and per-Node credentials.
@@ -279,6 +287,11 @@ creates a saved application plan, applies that exact plan and waits for both
 Deployments to report the same immutable image reference. A failed build,
 plan, apply or rollout records a failed GitHub deployment.
 
+That workflow updates the Terraform-managed control-plane application; its
+green result is not the missing production-public-spawn PostgreSQL/Linux
+runtime E2E and does not qualify a nonempty worker, public Route v2 ingress or
+the signed full lifecycle.
+
 Configure these non-secret repository variables:
 
 - `AWS_REGION`, `AWS_ROLE_ARN` and `ECR_REPOSITORY`;
@@ -302,7 +315,8 @@ HA drill uses the same runner when it maps the PostgreSQL advisory-lock owner to
 a control-plane Pod. This avoids `kubectl` attach fallback replaying a fast
 command's output in either safety gate. A missing version table is the reviewed
 fresh-schema case; cluster, scheduling, authentication and query failures all
-fail closed. `cats-controld` only opens stamped versions inside the same range.
+fail closed. `cats-controld` opens only exact clean-slate authority schema 14;
+it does not migrate an earlier stamp or partial catalog in place.
 The disruptive drill separately uploads fixed-rate public-probe results and
 Pod/EndpointSlice transition evidence; those artifacts contain no Secret
 values or response bodies and are retained for 30 days for failure correlation.
@@ -310,62 +324,56 @@ values or response bodies and are retained for 30 days for failure correlation.
 Terraform deliberately creates no Gateway Secret, ServiceAccount, Deployment,
 Service, Pod Identity or DynamoDB Route mirror in this release.
 
-## Metal worker deployment
+## Metal worker deployment boundary
 
 The infrastructure stack also owns the worker release path. CI builds one
 reviewed `linux/amd64` bundle, supplies its absolute path and SHA-256, and
 Terraform uploads it under a content-addressed S3 key. The EC2 role may read
 only worker artifacts and the dedicated Secrets Manager runtime secret.
-An SSM State Manager association downloads the bundle, verifies the digest,
-installs the host binaries/unit, atomically updates the Cloud Hypervisor guest
-seed with the matching Guest Agent and systemd units, creates the delegated
-metering cgroup root and restarts `cats-worker`. The previous guest seed stays
-at `rootfs.ext4.previous` for recovery.
+An SSM State Manager association can download the bundle, verify the digest,
+install the host binaries/unit, atomically update the Cloud Hypervisor guest
+seed with the matching Guest Agent and systemd units, create the delegated
+metering cgroup root and restart `cats-worker`. The previous guest seed stays
+at `rootfs.ext4.previous` for recovery. This machinery predates the current
+clean-slate exact-SHA qualification and is not authorization for a rolling
+upgrade of a nonempty worker.
 
-A worker release is a drain boundary. Before applying a new bundle:
-
-1. run `cats admin node drain <node-id>`;
-2. wait until `cats admin node get <node-id>` reports
-   `state=cordoned cats=0 orphans=0`;
-3. apply the reviewed infrastructure plan and wait for the SSM association to
-   succeed;
-4. run `cats admin node uncordon <node-id>`.
-
-A drain acts on both the control plane's assignments and the agent's own
-reported inventory: a Cat the agent runs that the control plane never assigned
-there (an *orphan runtime*) gets a Cold stop by its reported identity, and the
-node does not reach `cordoned` while any orphan remains. So `state=cordoned`
-genuinely means the node runs nothing.
+The retired `cats admin node drain`/uncordon sequence and its orphan Cold-stop
+behavior are historical V1 paths, not a compatibility fallback. Before applying
+a current bundle, use a reviewed A23 policy revision to cordon the worker and
+prove both that its assigned Desired set is empty and that a complete physical
+inventory has no runtime or residue. The current Running-only completion claim
+does not provide an in-place lifecycle drain. If the worker is not already
+empty, the association must stay blocked pending a separately qualified
+migration or replacement procedure.
 
 The association independently refuses to change installed files while any Cat
 PID remains in the worker's metering cgroups **or** any `cats-blockd` /
 `cloud-hypervisor` process is alive on the host. The process-table check
 exists because a blockd is not metered: with the Guests gone the cgroup walk
-reads clean, yet `systemctl stop cats-worker` (default
-`KillMode=control-group`) would kill a surviving blockd together with any
-unpublished journal it holds — on a relaxed volume that journal is the only
-authoritative copy. This is a fail-closed guard against bypassing the drain
-runbook; it does not cordon the node itself and therefore is not a substitute
-for step 1. Do not copy production binaries, patch the seed, or edit
-`worker.env` manually; update the bundle digest or secret input and apply
-Terraform.
+reads clean while a surviving blockd may still hold the only authoritative copy
+of an unpublished Relaxed journal. This process-table check remains a
+fail-closed empty-Host guard; it does not prove the signed scanner, per-Cat
+adoption or A23 cordon. Do not copy production binaries, patch the seed, or
+edit `worker.env` manually; update the bundle digest or secret input and apply
+Terraform only after the empty-Host precondition is independently closed.
 
-Do not stop or restart a worker that still has Cats. Current V1 runtime-ledger
-adoption does not make an Agent restart safe; ADR-0040 requires the Host lock,
-per-Cat scopes, bounded checkpoint and union inventory to land together before
-that contract can change. A controlled release must first reach
-`cats=0 orphans=0`.
+Do not stop or restart a worker that still has Cats. ADR-0040 Host lock,
+per-Cat units, bounded checkpoint and union inventory have landed for the
+current-Desired Running path, but no current exact SHA has passed the combined
+public-spawn PostgreSQL/Linux/systemd/KVM qualification. A controlled release
+therefore still requires an independently proven empty, residue-free Host.
 
-### When the drain cannot converge
+### When the empty-Host precondition cannot be proved
 
-An orphan whose Cold stop is refused by storage fencing
-(`root CAS conflict: expected generation N`) cannot be discarded through a
-Node HTTP fallback. Signed workers receive no `CATS_AUTH_TOKEN`, production
-does not expose `/v1/jobs`, and the deployment must remain fail closed with the
-Host untouched. Escalate the Host for the typed fenced-cleanup workflow once
-that authority is composed; do not recreate the retired shared-bearer request
-by hand. For transient metadata-store or usage-spool failures, leave the Host
-drained and let the durable transition retry after the dependency recovers.
+An orphan or assigned runtime cannot be discarded through a Node HTTP fallback.
+Signed workers receive no `CATS_AUTH_TOKEN`, production does not expose
+`/v1/jobs`, and the deployment must remain fail closed with the Host untouched.
+Use a separately qualified lifecycle/fenced-cleanup procedure when it exists;
+do not recreate the retired shared-bearer request by hand or treat an empty
+legacy row as physical absence. For transient metadata-store failures, leave
+the Host cordoned and unchanged until a complete current-authority scan can
+close the precondition.
 
 ## PostgreSQL split runbook
 

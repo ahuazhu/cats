@@ -64,7 +64,7 @@ snapshot内闭合hostname-derived Workspace、Route/Desired/ring ACK、Gateway s
 认证/resolve拥有独立bounded RAII owner，shutdown关闭两类admission并join Store closure与listener task。
 
 本实现仍不包含public proxy、Route signer rotation writer或Node public-ring全量ACK rollout；Gateway到Node
-machine tunnel由ADR-0046独立组成。Gateway与signer表仍共同属于尚未合流部署的clean-slate schema 13最终形态；中间
+machine tunnel由ADR-0046独立组成。Gateway与signer表共同属于clean-slate authority schema 14最终形态；中间
 提交不构成可单独部署migration。
 
 ## 后果
