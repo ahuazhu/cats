@@ -1967,6 +1967,7 @@ mod tests {
         for path in [
             "/v1/jobs",
             "/v1/nodes/heartbeat",
+            "/v1/nodes/inventory",
             "/v1/nodes/register",
             "/v1/nodes/work-status",
             "/v1/internal/work/acquire",

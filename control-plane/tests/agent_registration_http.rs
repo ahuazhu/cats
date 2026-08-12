@@ -417,6 +417,9 @@ async fn admission_order_and_proof_mutations_are_closed() {
     for path in [
         "/v1/nodes/register",
         "/v1/nodes/heartbeat",
+        // Inventory is carried by the signed A20 heartbeat/full-observation
+        // spine; there is no standalone compatibility mutation endpoint.
+        "/v1/nodes/inventory",
         "/v1/nodes/work-status",
         "/v1/internal/work/acquire",
         "/v1/internal/work/release",

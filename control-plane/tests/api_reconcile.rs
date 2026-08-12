@@ -3174,6 +3174,7 @@ async fn every_composition_closes_old_node_ingress_and_accepts_the_signed_spine(
     for path in [
         "/v1/nodes/register",
         "/v1/nodes/heartbeat",
+        "/v1/nodes/inventory",
         "/v1/nodes/work-status",
     ] {
         let response = ctx
@@ -3757,6 +3758,7 @@ async fn production_signed_cutover_never_runs_or_enters_the_legacy_node_runtime(
     for path in [
         "/v1/nodes/register",
         "/v1/nodes/heartbeat",
+        "/v1/nodes/inventory",
         "/v1/nodes/work-status",
         "/v1/internal/work/acquire",
         "/v1/internal/work/release",
