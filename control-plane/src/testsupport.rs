@@ -263,8 +263,39 @@ pub fn isolated_control_store_url() -> String {
             .batch_execute(&format!("CREATE SCHEMA \"{schema}\""))
             .expect("create test schema");
     });
+    isolated_schema_url(&base, &schema)
+}
+
+fn isolated_schema_url(base: &str, schema: &str) -> String {
+    // Preserve the supplied DSN byte-for-byte. In particular, postgres treats
+    // a raw `+` in a query value literally rather than as an HTML-form space.
+    // A final `options` parameter matches the helper's historical last-value
+    // behavior while adding the exact marker to the existing search path.
     let separator = if base.contains('?') { '&' } else { '?' };
-    format!("{base}{separator}options=-csearch_path%3D{schema}")
+    format!("{base}{separator}options=-csearch_path%3D{schema}%20-ccats.test_schema_bootstrap%3Don")
+}
+
+#[cfg(test)]
+mod isolated_schema_url_tests {
+    use super::isolated_schema_url;
+
+    #[test]
+    fn preserves_raw_query_and_appends_postgres_encoded_options() {
+        let dsn = isolated_schema_url(
+            "postgres://user:password@db.invalid/control?application_name=cats+test&options=-cfoo.bar%3Da+b",
+            "t_fixed",
+        );
+        assert!(dsn.starts_with(
+            "postgres://user:password@db.invalid/control?application_name=cats+test&options=-cfoo.bar%3Da+b&"
+        ));
+
+        let config = dsn.parse::<postgres::Config>().unwrap();
+        assert_eq!(config.get_application_name(), Some("cats+test"));
+        assert_eq!(
+            config.get_options(),
+            Some("-csearch_path=t_fixed -ccats.test_schema_bootstrap=on")
+        );
+    }
 }
 
 /// Provision one runtime identity through the production Store transaction.
