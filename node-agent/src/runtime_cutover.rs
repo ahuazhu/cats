@@ -70,6 +70,47 @@ pub struct SignedRuntimeCutoverConfig {
     pub blob_store: Arc<dyn BlobStore>,
     pub volume_lease_duration_ms: u64,
     pub deadline_policy: RuntimeSpineDeadlinePolicy,
+    /// Test-only scheduler barrier after one accepted physical observation
+    /// and before the next Desired/effect iteration. It does not replace or
+    /// wrap the installed scanner/effect composition.
+    #[cfg(test)]
+    pub(crate) observation_barrier_for_test: Option<RuntimeObservationBarrierForTest>,
+}
+
+#[cfg(test)]
+pub(crate) struct RuntimeObservationBarrierForTest {
+    reached: tokio::sync::mpsc::UnboundedSender<()>,
+    resume: tokio::sync::mpsc::UnboundedReceiver<()>,
+}
+
+#[cfg(test)]
+impl RuntimeObservationBarrierForTest {
+    pub(crate) fn channel() -> (
+        Self,
+        tokio::sync::mpsc::UnboundedReceiver<()>,
+        tokio::sync::mpsc::UnboundedSender<()>,
+    ) {
+        let (reached, reached_rx) = tokio::sync::mpsc::unbounded_channel();
+        let (resume, resume_rx) = tokio::sync::mpsc::unbounded_channel();
+        (
+            Self {
+                reached,
+                resume: resume_rx,
+            },
+            reached_rx,
+            resume,
+        )
+    }
+
+    async fn wait_after_observation(&mut self) -> anyhow::Result<()> {
+        self.reached
+            .send(())
+            .map_err(|_| anyhow::anyhow!("test observation-barrier receiver dropped"))?;
+        self.resume
+            .recv()
+            .await
+            .context("test observation-barrier resume sender dropped")
+    }
 }
 
 pub struct SignedRuntimeCutoverHandle {
@@ -561,10 +602,18 @@ async fn spawn_signed_runtime_cutover_with_overrides(
     // can only request (not await) that shutdown sequence.
     let registration_lease = config.agent_registration;
     let deadline_policy = config.deadline_policy;
+    #[cfg(test)]
+    let observation_barrier_for_test = config.observation_barrier_for_test;
     let runner_task = tokio::spawn(async move {
         let mut runner = runner;
         let run_result = tokio::select! {
-            result = run_signed_spine(&mut runner, &runner_readiness, deadline_policy) => result,
+            result = run_signed_spine(
+                &mut runner,
+                &runner_readiness,
+                deadline_policy,
+                #[cfg(test)]
+                observation_barrier_for_test,
+            ) => result,
             _ = &mut runner_shutdown => Ok(()),
         };
         runner_readiness.set(false);
@@ -600,6 +649,7 @@ async fn run_signed_spine(
     runner: &mut RuntimeSpineRunner,
     readiness: &Readiness,
     deadline_policy: RuntimeSpineDeadlinePolicy,
+    #[cfg(test)] mut observation_barrier_for_test: Option<RuntimeObservationBarrierForTest>,
 ) -> anyhow::Result<()> {
     loop {
         // Both absolute deadlines start before dispatch into the runner. Time
@@ -607,8 +657,21 @@ async fn run_signed_spine(
         // a later blocking boundary.
         let deadlines = deadline_policy.deadlines_from(Instant::now())?;
         let step = runner.run_once_with_deadlines(deadlines).await?;
+        #[cfg(test)]
+        let observation_accepted = matches!(&step, RuntimeSpineRunStep::ObservationAccepted { .. });
         match apply_readiness_policy(step, readiness)? {
-            RuntimeLoopAction::Continue => {}
+            RuntimeLoopAction::Continue => {
+                #[cfg(test)]
+                if observation_accepted {
+                    if let Some(barrier) = observation_barrier_for_test.as_mut() {
+                        // `run_once_with_deadlines` returned only after the
+                        // observation acceptance was durably resolved. Holding
+                        // this loop boundary prevents the next Desired/effect
+                        // dispatch without replacing either installed port.
+                        barrier.wait_after_observation().await?;
+                    }
+                }
+            }
             RuntimeLoopAction::RetryAfterDelay => tokio::time::sleep(RETRY_DELAY).await,
             RuntimeLoopAction::WaitForIdentityRepair => {
                 // Credential/identity repair is external to the Agent session
@@ -1670,6 +1733,7 @@ mod tests {
                 Duration::from_secs(5),
             )
             .unwrap(),
+            observation_barrier_for_test: None,
         }
     }
 
@@ -1956,6 +2020,46 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn observation_barrier_releases_and_cancels_without_a_detached_waiter() {
+        let (mut barrier, mut reached, resume) = RuntimeObservationBarrierForTest::channel();
+        let effect_dispatched = Arc::new(AtomicBool::new(false));
+        let waiter_effect_dispatched = Arc::clone(&effect_dispatched);
+        let waiter = tokio::spawn(async move {
+            barrier.wait_after_observation().await?;
+            waiter_effect_dispatched.store(true, Ordering::Release);
+            anyhow::Ok(())
+        });
+
+        tokio::time::timeout(Duration::from_secs(1), reached.recv())
+            .await
+            .expect("observation barrier was not reached")
+            .expect("observation barrier sender dropped before reaching the test");
+        assert!(!effect_dispatched.load(Ordering::Acquire));
+        assert!(!waiter.is_finished());
+        resume.send(()).expect("release observation barrier waiter");
+        tokio::time::timeout(Duration::from_secs(1), waiter)
+            .await
+            .expect("released observation barrier waiter did not join")
+            .expect("join released observation barrier waiter")
+            .expect("released observation barrier failed");
+        assert!(effect_dispatched.load(Ordering::Acquire));
+
+        let (mut barrier, mut reached, resume) = RuntimeObservationBarrierForTest::channel();
+        let waiter = tokio::spawn(async move { barrier.wait_after_observation().await });
+        tokio::time::timeout(Duration::from_secs(1), reached.recv())
+            .await
+            .expect("cancellation barrier was not reached")
+            .expect("cancellation barrier sender dropped before reaching the test");
+        waiter.abort();
+        let cancellation = tokio::time::timeout(Duration::from_secs(1), waiter)
+            .await
+            .expect("cancelled observation barrier waiter did not join")
+            .expect_err("cancelled observation barrier waiter unexpectedly succeeded");
+        assert!(cancellation.is_cancelled());
+        assert!(resume.send(()).is_err());
+    }
+
+    #[tokio::test]
     async fn cutover_listener_exposes_no_legacy_mutation_surface() {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
@@ -2024,6 +2128,7 @@ mod tests {
                     Duration::from_secs(30),
                 )
                 .unwrap(),
+                observation_barrier_for_test: None,
             },
             Some(scanner),
             Some(TestDesiredEffectComposition::AcquireOnly),
@@ -2109,6 +2214,7 @@ mod tests {
                     Duration::from_secs(30),
                 )
                 .unwrap(),
+                observation_barrier_for_test: None,
             },
             Some(scanner),
             Some(owner_port),
@@ -2188,6 +2294,7 @@ mod tests {
             volume_lease_duration_ms: 60_000,
             deadline_policy: RuntimeSpineDeadlinePolicy::new(Duration::MAX, Duration::from_secs(1))
                 .unwrap(),
+            observation_barrier_for_test: None,
         })
         .await;
         let Err(error) = result else {
@@ -2238,6 +2345,7 @@ mod tests {
                 Duration::from_secs(30),
             )
             .unwrap(),
+            observation_barrier_for_test: None,
         })
         .await;
         let Err(error) = result else {
