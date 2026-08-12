@@ -306,60 +306,11 @@ run_full() {
 }
 
 run_linux() {
-  command -v docker >/dev/null 2>&1 || {
-    echo "docker is required for the Linux quality gate" >&2
-    return 1
-  }
-  local platform="${CATS_LINUX_PLATFORM:-linux/arm64}"
-  local target_volume="${CATS_LINUX_TARGET_VOLUME:-cats-target-linux}"
-  local jobs="${CATS_LINUX_JOBS:-2}"
-  local target_namespace
-  local target_directory
-
-  # Every host worktree is mounted at /work inside the container. Reusing one
-  # target root across those otherwise different source trees can therefore
-  # make Cargo accept stale dependency metadata when checkout mtimes overlap.
-  # Keep the shared Docker volume, but give each worktree its own target root.
-  target_namespace="$(printf '%s\0' "$SOURCE_PROVENANCE_ROOT" | source_git hash-object --stdin)"
-  target_directory="/target/worktrees/$target_namespace"
-
-  # The tests need PostgreSQL and the build container cannot run docker
-  # itself, so the server rides alongside on a private network.
-  local network="cats-linux-net-$$"
-  local pg="cats-linux-pg-$$"
-  docker network create "$network" >/dev/null
-  docker run --rm -d --name "$pg" --network "$network" \
-    -e POSTGRES_PASSWORD=cats postgres:16 >/dev/null
-
-  local status=0
-  docker run --rm --platform "$platform" \
-    --ulimit nofile=65536:65536 \
-    -e CARGO_BUILD_JOBS="$jobs" \
-    -e CATS_TEST_POSTGRES_URL="postgres://postgres:cats@${pg}:5432/postgres" \
-    -e CATS_SOURCE_PROVENANCE_ROOT="$SOURCE_PROVENANCE_ROOT" \
-    -e CATS_SOURCE_PROVENANCE_HEAD="$SOURCE_PROVENANCE_HEAD" \
-    -e CATS_SOURCE_PROVENANCE_DIRTY="$SOURCE_PROVENANCE_DIRTY" \
-    -e CATS_SOURCE_PROVENANCE_FINGERPRINT="$SOURCE_PROVENANCE_FINGERPRINT" \
-    -e CATS_LINUX_TARGET_DIRECTORY="$target_directory" \
-    --network "$network" \
-    -v "$REPO_ROOT:/work" -w /work \
-    -v cats-cargo-registry:/usr/local/cargo/registry \
-    -v "$target_volume:/target" \
-    rust:1.97.1-bookworm \
-    sh -c 'apt-get update -qq &&
-           apt-get install -qy --no-install-recommends e2fsprogs jq &&
-           rustup component add clippy rustfmt &&
-           ./scripts/quality.sh skills &&
-           cargo fmt --all -- --check &&
-           cargo check --workspace --all-targets --locked --target-dir "$CATS_LINUX_TARGET_DIRECTORY" &&
-           cargo build --workspace --locked --target-dir "$CATS_LINUX_TARGET_DIRECTORY" &&
-           cargo clippy --workspace --all-targets --locked --target-dir "$CATS_LINUX_TARGET_DIRECTORY" -- -D warnings &&
-           cargo test --workspace --locked --target-dir "$CATS_LINUX_TARGET_DIRECTORY" -- --test-threads=4 &&
-           RUSTDOCFLAGS="-D warnings" cargo doc --workspace --no-deps --locked --target-dir "$CATS_LINUX_TARGET_DIRECTORY"' || status=$?
-
-  docker rm -f "$pg" >/dev/null 2>&1 || true
-  docker network rm "$network" >/dev/null 2>&1 || true
-  return "$status"
+  export CATS_SOURCE_PROVENANCE_ROOT="$SOURCE_PROVENANCE_ROOT"
+  export CATS_SOURCE_PROVENANCE_HEAD="$SOURCE_PROVENANCE_HEAD"
+  export CATS_SOURCE_PROVENANCE_DIRTY="$SOURCE_PROVENANCE_DIRTY"
+  export CATS_SOURCE_PROVENANCE_FINGERPRINT="$SOURCE_PROVENANCE_FINGERPRINT"
+  exec "$REPO_ROOT/scripts/linux-gate.sh"
 }
 
 load_source_provenance

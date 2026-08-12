@@ -2,10 +2,15 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
 #[cfg(unix)]
+use std::time::{Duration, Instant};
+
+#[cfg(unix)]
 use std::io::Write;
 
 #[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
+#[cfg(unix)]
+use std::os::unix::process::CommandExt as _;
 
 const SCHEMA_PATH: &str = "storage/src/authority.rs";
 const SCHEMA_VERSION_PATTERN: &str = r"s/^pub[[:space:]]+const[[:space:]]+AUTHORITY_RELEASE_SCHEMA_VERSION:[[:space:]]+i64[[:space:]]+=[[:space:]]+([0-9]+);$/\1/p";
@@ -562,31 +567,30 @@ fn production_schema_probe_fails_closed() {
 #[test]
 fn linux_quality_gate_installs_the_postgres_probe_runtime() {
     let quality = read_workspace_file("scripts/quality.sh");
-    let linux_gate = quality
-        .split("run_linux() {")
-        .nth(1)
-        .and_then(|rest| rest.split("case \"${1:-full}\"").next())
-        .expect("Linux quality-gate function");
+    let linux_gate = read_workspace_file("scripts/linux-gate.sh");
 
+    assert!(quality.contains("exec \"$REPO_ROOT/scripts/linux-gate.sh\""));
     assert!(
         linux_gate.contains("apt-get install -qy --no-install-recommends e2fsprogs jq"),
         "the Linux gate must install jq before deployment probe fixtures execute"
     );
     for field in ["ROOT", "HEAD", "DIRTY", "FINGERPRINT"] {
         assert!(
-            linux_gate.contains(&format!(
-                "-e CATS_SOURCE_PROVENANCE_{field}=\"$SOURCE_PROVENANCE_{field}\""
+            quality.contains(&format!(
+                "export CATS_SOURCE_PROVENANCE_{field}=\"$SOURCE_PROVENANCE_{field}\""
             )),
-            "the Linux gate must inherit the host's complete source provenance"
+            "the Linux gate must export the host's complete source provenance"
         );
     }
     assert!(linux_gate.contains("--ulimit nofile=65536:65536"));
     assert!(linux_gate.contains(
-        "target_namespace=\"$(printf '%s\\0' \"$SOURCE_PROVENANCE_ROOT\" | source_git hash-object --stdin)\""
+        "printf '%s\\0' \"$CATS_SOURCE_PROVENANCE_ROOT\" | source_git hash-object --stdin"
     ));
-    assert!(linux_gate.contains("target_directory=\"/target/worktrees/$target_namespace\""));
     assert!(
-        linux_gate.contains("-e CATS_LINUX_TARGET_DIRECTORY=\"$target_directory\""),
+        linux_gate.contains("LINUX_TARGET_DIRECTORY=\"/target/worktrees/$LINUX_TARGET_NAMESPACE\"")
+    );
+    assert!(
+        linux_gate.contains("-e CATS_LINUX_TARGET_DIRECTORY=\"$LINUX_TARGET_DIRECTORY\""),
         "the Linux gate must pass its worktree-isolated target root into the container"
     );
     assert_eq!(
@@ -597,6 +601,697 @@ fn linux_quality_gate_installs_the_postgres_probe_runtime() {
         "check, build, Clippy, tests and rustdoc must share the isolated target root"
     );
     assert!(!linux_gate.contains("--target-dir /target"));
+}
+
+#[test]
+fn linux_quality_gate_uses_capability_owned_cancellation_safe_cleanup() {
+    let quality = read_workspace_file("scripts/quality.sh");
+    let linux_gate = read_workspace_file("scripts/linux-gate.sh");
+
+    assert!(quality.contains("run_linux() {"));
+    assert!(quality.contains("exec \"$REPO_ROOT/scripts/linux-gate.sh\""));
+    assert!(!quality.contains("run_linux() ("));
+    assert!(
+        !linux_gate.lines().any(|line| {
+            let line = line.trim_start();
+            !line.starts_with('#') && line.contains("--privileged")
+        }),
+        "the workspace-wide Linux gate must stay unprivileged"
+    );
+    assert!(linux_gate.contains("create --name \"$LINUX_WORKSPACE_GATE\""));
+    assert!(linux_gate.contains("start --attach \"$LINUX_WORKSPACE_GATE\""));
+    for (intent, command) in [
+        (
+            "LINUX_NETWORK_INTENDED=true",
+            "network create --label \"$LINUX_OWNER_LABEL\" \"$LINUX_NETWORK\"",
+        ),
+        ("LINUX_PG_INTENDED=true", "create --name \"$LINUX_PG\""),
+        (
+            "LINUX_WORKSPACE_INTENDED=true",
+            "create --name \"$LINUX_WORKSPACE_GATE\"",
+        ),
+    ] {
+        let intent_position = linux_gate
+            .find(intent)
+            .unwrap_or_else(|| panic!("Linux cleanup lost intent {intent:?}"));
+        let command_position = linux_gate
+            .find(command)
+            .unwrap_or_else(|| panic!("Linux gate lost Docker call {command:?}"));
+        assert!(
+            intent_position < command_position,
+            "cleanup intent {intent:?} must precede response-loss-prone Docker call {command:?}"
+        );
+    }
+    for required in [
+        "LINUX_RUN_TOKEN=\"$(LC_ALL=C od -An -N16 -tx1 /dev/urandom",
+        "LINUX_OWNER_KEY=\"io.cats.quality.linux.owner\"",
+        "--label \"$LINUX_OWNER_LABEL\"",
+        "LINUX_ACTIVE_DOCKER_PID=$!",
+        "LINUX_ACTIVE_DOCKER_KIND=\"$kind\"",
+        "docker_create_cli",
+        "settle_active_create",
+        "reconcile_pending_create",
+        "LINUX_CREATE_PENDING=true",
+        "LINUX_CREATE_ARGUMENTS=(\"$@\")",
+        "trap '' INT TERM",
+        "set -m",
+        "LINUX_CREATE_SETTLEMENT_UNKNOWN=true",
+        "Container create\n  # and start are separate",
+        "probe_owned_container",
+        "probe_owned_network",
+        "remove_owned_container \"$LINUX_WORKSPACE_INTENDED\" \"$LINUX_WORKSPACE_GATE\" false",
+        "remove_owned_container \"$LINUX_PG_INTENDED\" \"$LINUX_PG\" false",
+        "remove_owned_network \"$LINUX_NETWORK_INTENDED\" \"$LINUX_NETWORK\"",
+        "all_intended_resources_absent",
+        "LINUX_CLEANUP_DEADLINE=$((SECONDS + LINUX_CLEANUP_BUDGET_SECONDS))",
+        "trap linux_gate_on_exit EXIT",
+        "trap 'linux_gate_signal 130' INT",
+        "trap 'linux_gate_signal 143' TERM",
+    ] {
+        assert!(
+            linux_gate.contains(required),
+            "the capability-owned cancellation-safe Linux cleanup lost {required:?}"
+        );
+    }
+    assert!(
+        !linux_gate.contains("absent_rounds"),
+        "elapsed absence is not proof that an interrupted create request settled"
+    );
+}
+
+#[cfg(unix)]
+const LINUX_GATE_TEST_TOKEN: &str = "0123456789abcdef0123456789abcdef";
+
+#[cfg(unix)]
+fn write_executable(path: &Path, source: &str) {
+    std::fs::write(path, source)
+        .unwrap_or_else(|error| panic!("write executable {}: {error}", path.display()));
+    let mut permissions = std::fs::metadata(path)
+        .unwrap_or_else(|error| panic!("read executable metadata {}: {error}", path.display()))
+        .permissions();
+    permissions.set_mode(0o755);
+    std::fs::set_permissions(path, permissions)
+        .unwrap_or_else(|error| panic!("make {} executable: {error}", path.display()));
+}
+
+#[cfg(unix)]
+fn install_linux_gate_fake_cli(bin: &Path) {
+    std::fs::create_dir_all(bin).expect("create Linux gate fake bin");
+    write_executable(
+        &bin.join("od"),
+        &format!("#!/bin/sh\nprintf ' {LINUX_GATE_TEST_TOKEN}\\n'\n"),
+    );
+    write_executable(
+        &bin.join("docker"),
+        r#"#!/usr/bin/env bash
+set -euo pipefail
+
+state=${CATS_FAKE_DOCKER_STATE:?}
+mode=${CATS_FAKE_DOCKER_MODE:?}
+trace="$state/trace"
+mkdir -p "$state"
+printf '%s\n' "$*" >>"$trace"
+
+object_path() {
+  printf '%s/%s.%s\n' "$state" "$1" "$2"
+}
+
+object_by_id() {
+  local kind="$1"
+  local wanted="$2"
+  local candidate
+  local id
+  shopt -s nullglob
+  for candidate in "$state/$kind."*; do
+    IFS='|' read -r id _ <"$candidate"
+    if [[ "$id" == "$wanted" ]]; then
+      printf '%s\n' "$candidate"
+      return 0
+    fi
+  done
+  return 1
+}
+
+label_value() {
+  local previous=""
+  local argument
+  for argument in "$@"; do
+    if [[ "$previous" == --label ]]; then
+      printf '%s\n' "${argument#*=}"
+      return 0
+    fi
+    previous="$argument"
+  done
+  return 1
+}
+
+named_value() {
+  local previous=""
+  local argument
+  for argument in "$@"; do
+    if [[ "$previous" == --name ]]; then
+      printf '%s\n' "$argument"
+      return 0
+    fi
+    previous="$argument"
+  done
+  return 1
+}
+
+case "${1:-} ${2:-}" in
+  "network create")
+    name="${!#}"
+    owner="$(label_value "$@")"
+    path="$(object_path network "$name")"
+    [[ ! -e "$path" ]] || exit 125
+    printf 'owned-network-id|%s\n' "$owner" >"$path"
+    printf 'owned-network-id\n'
+    ;;
+  "network ls")
+    name=""
+    for argument in "$@"; do
+      if [[ "$argument" == name=^*'$' ]]; then
+        name="${argument#name=^}"
+        name="${name%\$}"
+      fi
+    done
+    path="$(object_path network "$name")"
+    if [[ -e "$path" ]]; then
+      IFS='|' read -r id _ <"$path"
+      printf '%s\n' "$id"
+    fi
+    ;;
+  "network inspect")
+    id="${!#}"
+    path="$(object_by_id network "$id")"
+    name="${path#"$state/network."}"
+    IFS='|' read -r stored_id owner <"$path"
+    printf '%s|%s|%s\n' "$stored_id" "$name" "$owner"
+    ;;
+  "network rm")
+    id="${!#}"
+    if [[ -e "$state/workspace-network-active" && ! -e "$state/late-workspace-removed" ]]; then
+      printf 'network has active endpoints\n' >&2
+      exit 1
+    fi
+    path="$(object_by_id network "$id")"
+    rm -f -- "$path"
+    ;;
+  "container ls")
+    if [[ "$mode" == cleanup-hang && -e "$state/workspace-network-active" ]]; then
+      : >"$state/cleanup-hang-entered"
+      trap '' TERM
+      while :; do sleep 0.2; done
+    fi
+    name=""
+    for argument in "$@"; do
+      if [[ "$argument" == name=^/*'$' ]]; then
+        name="${argument#name=^/}"
+        name="${name%\$}"
+      fi
+    done
+    path="$(object_path container "$name")"
+    if [[ -e "$path" ]]; then
+      IFS='|' read -r id _ <"$path"
+      printf '%s\n' "$id"
+    fi
+    ;;
+  "container inspect")
+    id="${!#}"
+    path="$(object_by_id container "$id")"
+    name="${path#"$state/container."}"
+    IFS='|' read -r stored_id owner <"$path"
+    printf '%s|/%s|%s\n' "$stored_id" "$name" "$owner"
+    ;;
+  "stop "*)
+    ;;
+  "rm -f")
+    id="${!#}"
+    path="$(object_by_id container "$id")"
+    rm -f -- "$path"
+    if [[ "$id" == late-workspace-id \
+      || "$id" == response-loss-workspace-id \
+      || "$id" == owned-cats-linux-workspace-gate-*-id ]]; then
+      : >"$state/late-workspace-removed"
+    fi
+    ;;
+  "create "*)
+    name="$(named_value "$@")"
+    owner="$(label_value "$@")"
+    path="$(object_path container "$name")"
+    [[ ! -e "$path" ]] || exit 125
+    if [[ "$mode" == cleanup-hang && "$name" == cats-linux-workspace-gate-* ]]; then
+      printf 'owned-workspace-id|%s\n' "$owner" >"$path"
+      : >"$state/workspace-network-active"
+      : >"$state/create-settlement-hang-entered"
+      trap '' TERM
+      while :; do sleep 0.2; done
+    fi
+    if [[ "$mode" == term-delayed-create && "$name" == cats-linux-workspace-gate-* ]]; then
+      : >"$state/workspace-network-active"
+      nohup /bin/bash -c '
+        sleep 5.2
+        state=$1
+        name=$2
+        owner=$3
+        temporary="$state/container.$name.pending"
+        printf "late-workspace-id|%s\\n" "$owner" >"$temporary"
+        mv -- "$temporary" "$state/container.$name"
+        : >"$state/late-marker"
+        : >"$state/create-response"
+        printf "LATE_CREATE late-workspace-id\\n" >>"$state/trace"
+      ' fake-daemon "$state" "$name" "$owner" >/dev/null 2>&1 &
+      while [[ ! -e "$state/create-response" ]]; do sleep 0.1; done
+      printf 'late-workspace-id\n'
+      exit 0
+    fi
+    if [[ "$mode" == response-loss-late-create && "$name" == cats-linux-workspace-gate-* ]]; then
+      count_path="$state/response-loss-create-count"
+      count=0
+      [[ ! -e "$count_path" ]] || IFS= read -r count <"$count_path"
+      count=$((count + 1))
+      printf '%s\n' "$count" >"$count_path"
+      if [[ "$count" -eq 1 ]]; then
+        : >"$state/workspace-network-active"
+        nohup /bin/bash -c '
+          trap "" INT TERM
+          sleep 5.2
+          state=$1
+          name=$2
+          owner=$3
+          temporary="$state/container.$name.pending"
+          printf "response-loss-workspace-id|%s\\n" "$owner" >"$temporary"
+          mv -- "$temporary" "$state/container.$name"
+          : >"$state/response-loss-late-marker"
+          printf "RESPONSE_LOSS_LATE_CREATE response-loss-workspace-id\\n" >>"$state/trace"
+        ' fake-daemon "$state" "$name" "$owner" >/dev/null 2>&1 &
+        : >"$state/first-response-lost"
+        exit 125
+      fi
+      : >"$state/idempotent-retry-entered"
+      while [[ ! -e "$path" ]]; do sleep 0.1; done
+      : >"$state/idempotent-name-reserved"
+      exit 125
+    fi
+    printf 'owned-%s-id|%s\n' "$name" "$owner" >"$path"
+    printf 'owned-%s-id\n' "$name"
+    ;;
+  "start "*)
+    name="${!#}"
+    if [[ "$mode" == term-start && "$name" == cats-linux-workspace-gate-* ]]; then
+      : >"$state/workspace-network-active"
+      : >"$state/start-entered"
+      trap '' TERM
+      while :; do sleep 0.2; done
+    fi
+    ;;
+  *)
+    printf 'unexpected fake Docker command: %s\n' "$*" >&2
+    exit 64
+    ;;
+esac
+"#,
+    );
+}
+
+#[cfg(unix)]
+fn linux_gate_command(fake_bin: &Path, state: &Path, mode: &str) -> Command {
+    let mut command = Command::new(workspace_root().join("scripts/quality.sh"));
+    command
+        .arg("linux")
+        // Exercise the macOS-supported system Bash (3.2) instead of allowing
+        // a Homebrew Bash earlier in the developer's inherited PATH to mask
+        // an incompatible gate construct.
+        .env(
+            "PATH",
+            format!("{}:/usr/bin:/bin:/usr/sbin:/sbin", fake_bin.display()),
+        )
+        .env("CATS_FAKE_DOCKER_STATE", state)
+        .env("CATS_FAKE_DOCKER_MODE", mode)
+        .env("CATS_SOURCE_PROVENANCE_ROOT", workspace_root())
+        .env("CATS_SOURCE_PROVENANCE_HEAD", "a".repeat(40))
+        .env("CATS_SOURCE_PROVENANCE_DIRTY", "false")
+        .env("CATS_SOURCE_PROVENANCE_FINGERPRINT", "b".repeat(40));
+    command
+}
+
+#[cfg(unix)]
+#[test]
+fn linux_quality_gate_preserves_same_name_foreign_resources_after_create_collision() {
+    for (kind, name, id) in [
+        (
+            "network",
+            format!("cats-linux-net-{LINUX_GATE_TEST_TOKEN}"),
+            "foreign-network-id",
+        ),
+        (
+            "container",
+            format!("cats-linux-pg-{LINUX_GATE_TEST_TOKEN}"),
+            "foreign-container-id",
+        ),
+    ] {
+        let fixture = tempfile::tempdir().expect("Linux gate collision fixture");
+        let fake_bin = fixture.path().join("bin");
+        let state = fixture.path().join("state");
+        std::fs::create_dir_all(&state).expect("create fake Docker state");
+        install_linux_gate_fake_cli(&fake_bin);
+        let foreign = state.join(format!("{kind}.{name}"));
+        let original = format!("{id}|foreign-owner\n");
+        std::fs::write(&foreign, &original).expect("preseed foreign Docker resource");
+
+        let output = linux_gate_command(&fake_bin, &state, "collision")
+            .output()
+            .expect("run Linux gate collision regression");
+        assert!(!output.status.success(), "foreign {kind} collision passed");
+        assert_eq!(
+            std::fs::read_to_string(&foreign).expect("foreign resource survived"),
+            original,
+            "the Linux gate mutated a same-name foreign {kind}"
+        );
+        let trace = std::fs::read_to_string(state.join("trace")).expect("fake Docker trace");
+        assert!(
+            !trace.lines().any(|line| {
+                line == format!("stop --time 20 {id}")
+                    || line == format!("rm -f {id}")
+                    || line == format!("network rm {id}")
+            }),
+            "the Linux gate attempted to remove foreign immutable ID {id}:\n{trace}"
+        );
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            stderr.contains("refusing to remove foreign Linux gate"),
+            "foreign owner mismatch was not diagnosed:\n{stderr}"
+        );
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn linux_quality_gate_process_group_term_preserves_create_receipt_before_exact_cleanup() {
+    let fixture = tempfile::tempdir().expect("Linux gate TERM fixture");
+    let fake_bin = fixture.path().join("bin");
+    let state = fixture.path().join("state");
+    std::fs::create_dir_all(&state).expect("create fake Docker state");
+    install_linux_gate_fake_cli(&fake_bin);
+    let stdout_path = fixture.path().join("stdout");
+    let stderr_path = fixture.path().join("stderr");
+    let stdout = std::fs::File::create(&stdout_path).expect("create stdout capture");
+    let stderr = std::fs::File::create(&stderr_path).expect("create stderr capture");
+    let mut command = linux_gate_command(&fake_bin, &state, "term-delayed-create");
+    command
+        .process_group(0)
+        .stdout(Stdio::from(stdout))
+        .stderr(Stdio::from(stderr));
+    let mut child = command
+        .spawn()
+        .expect("start isolated Linux quality-gate process group");
+
+    let workspace_started = Instant::now();
+    while !state.join("workspace-network-active").exists() {
+        assert!(
+            workspace_started.elapsed() < Duration::from_secs(8),
+            "fake Docker never entered the foreground workspace run"
+        );
+        std::thread::sleep(Duration::from_millis(25));
+    }
+    let signal_at = Instant::now();
+    let signal = Command::new("kill")
+        .args(["-TERM", "--", &format!("-{}", child.id())])
+        .status()
+        .expect("signal Linux quality-gate process group");
+    assert!(
+        signal.success(),
+        "could not TERM Linux quality-gate process group"
+    );
+
+    let deadline = Instant::now() + Duration::from_secs(15);
+    let mut removed_at = None;
+    let status = loop {
+        if removed_at.is_none() && state.join("late-workspace-removed").exists() {
+            removed_at = Some(Instant::now());
+        }
+        if let Some(status) = child.try_wait().expect("poll Linux quality gate") {
+            break status;
+        }
+        if Instant::now() >= deadline {
+            child.kill().expect("kill timed-out Linux quality gate");
+            child.wait().expect("reap timed-out Linux quality gate");
+            panic!("TERM cleanup exceeded its 15-second bound");
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    };
+    assert_eq!(status.code(), Some(143));
+    let removed_at = removed_at.expect("late workspace immutable-ID removal marker");
+    assert!(
+        removed_at.duration_since(signal_at) >= Duration::from_millis(4_800),
+        "cleanup acted before the daemon returned the deliberately delayed create receipt"
+    );
+    assert!(
+        state.join("late-marker").exists(),
+        "test never observed the daemon-side create after the signal"
+    );
+
+    for resource in [
+        format!("network.cats-linux-net-{LINUX_GATE_TEST_TOKEN}"),
+        format!("container.cats-linux-pg-{LINUX_GATE_TEST_TOKEN}"),
+        format!("container.cats-linux-workspace-gate-{LINUX_GATE_TEST_TOKEN}"),
+    ] {
+        assert!(
+            !state.join(&resource).exists(),
+            "intended resource remained after TERM cleanup: {resource}"
+        );
+    }
+    let trace = std::fs::read_to_string(state.join("trace")).expect("fake Docker trace");
+    let late_create = trace
+        .find("LATE_CREATE late-workspace-id")
+        .expect("late daemon-side create trace");
+    let immutable_remove = trace
+        .find("rm -f late-workspace-id")
+        .expect("immutable-ID cleanup trace");
+    assert!(
+        late_create < immutable_remove,
+        "settled late resource was not removed by immutable ID:\n{trace}"
+    );
+    assert!(
+        trace.contains("network rm owned-network-id"),
+        "the previously active network did not converge to removal:\n{trace}"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn linux_quality_gate_retries_response_loss_until_exact_owned_create_is_observable() {
+    let fixture = tempfile::tempdir().expect("Linux gate response-loss fixture");
+    let fake_bin = fixture.path().join("bin");
+    let state = fixture.path().join("state");
+    std::fs::create_dir_all(&state).expect("create fake Docker state");
+    install_linux_gate_fake_cli(&fake_bin);
+
+    let started_at = Instant::now();
+    let output = linux_gate_command(&fake_bin, &state, "response-loss-late-create")
+        .output()
+        .expect("run Linux quality gate response-loss regression");
+    assert!(
+        output.status.success(),
+        "response-loss reconciliation failed:\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        started_at.elapsed() >= Duration::from_millis(4_800),
+        "response loss was blessed before the delayed daemon create became observable"
+    );
+    for marker in [
+        "first-response-lost",
+        "idempotent-retry-entered",
+        "idempotent-name-reserved",
+        "response-loss-late-marker",
+        "late-workspace-removed",
+    ] {
+        assert!(
+            state.join(marker).exists(),
+            "response-loss regression did not exercise {marker}"
+        );
+    }
+    for resource in [
+        format!("network.cats-linux-net-{LINUX_GATE_TEST_TOKEN}"),
+        format!("container.cats-linux-pg-{LINUX_GATE_TEST_TOKEN}"),
+        format!("container.cats-linux-workspace-gate-{LINUX_GATE_TEST_TOKEN}"),
+    ] {
+        assert!(
+            !state.join(&resource).exists(),
+            "intended resource remained after response-loss settlement: {resource}"
+        );
+    }
+
+    let trace = std::fs::read_to_string(state.join("trace")).expect("fake Docker trace");
+    let create_call = format!("create --name cats-linux-workspace-gate-{LINUX_GATE_TEST_TOKEN}");
+    assert_eq!(
+        trace.matches(&create_call).count(),
+        2,
+        "the ambiguous first response was not closed by one same-name retry:\n{trace}"
+    );
+    let late_create = trace
+        .find("RESPONSE_LOSS_LATE_CREATE response-loss-workspace-id")
+        .expect("late daemon create trace");
+    let immutable_remove = trace
+        .find("rm -f response-loss-workspace-id")
+        .expect("response-loss immutable-ID removal trace");
+    assert!(
+        late_create < immutable_remove,
+        "cleanup raced the response-loss daemon create:\n{trace}"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn linux_quality_gate_term_interrupts_start_after_create_receipt_and_cleans_exact_id() {
+    let fixture = tempfile::tempdir().expect("Linux gate start TERM fixture");
+    let fake_bin = fixture.path().join("bin");
+    let state = fixture.path().join("state");
+    std::fs::create_dir_all(&state).expect("create fake Docker state");
+    install_linux_gate_fake_cli(&fake_bin);
+    let mut child = linux_gate_command(&fake_bin, &state, "term-start")
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("start top-level Linux quality gate");
+
+    let start_deadline = Instant::now() + Duration::from_secs(8);
+    while !state.join("start-entered").exists() {
+        if Instant::now() >= start_deadline {
+            child.kill().expect("kill Linux gate missing start marker");
+            child.wait().expect("reap Linux gate missing start marker");
+            panic!("fake Docker never entered workspace start --attach");
+        }
+        std::thread::sleep(Duration::from_millis(25));
+    }
+    let signal_at = Instant::now();
+    assert!(
+        Command::new("kill")
+            .args(["-TERM", &child.id().to_string()])
+            .status()
+            .expect("signal top-level quality gate")
+            .success(),
+        "could not TERM top-level quality gate"
+    );
+    let status = loop {
+        if let Some(status) = child.try_wait().expect("poll Linux quality gate") {
+            break status;
+        }
+        if signal_at.elapsed() >= Duration::from_secs(8) {
+            child.kill().expect("kill timed-out Linux quality gate");
+            child.wait().expect("reap timed-out Linux quality gate");
+            panic!("start cancellation and exact cleanup exceeded eight seconds");
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    };
+    assert_eq!(status.code(), Some(143));
+    assert!(
+        signal_at.elapsed() < Duration::from_secs(6),
+        "settled create incorrectly made start wait for create-style settlement"
+    );
+    for resource in [
+        format!("network.cats-linux-net-{LINUX_GATE_TEST_TOKEN}"),
+        format!("container.cats-linux-pg-{LINUX_GATE_TEST_TOKEN}"),
+        format!("container.cats-linux-workspace-gate-{LINUX_GATE_TEST_TOKEN}"),
+    ] {
+        assert!(
+            !state.join(&resource).exists(),
+            "intended resource remained after start cancellation: {resource}"
+        );
+    }
+    let trace = std::fs::read_to_string(state.join("trace")).expect("fake Docker trace");
+    let create = trace
+        .find(&format!(
+            "create --name cats-linux-workspace-gate-{LINUX_GATE_TEST_TOKEN}"
+        ))
+        .expect("workspace create trace");
+    let start = trace
+        .find(&format!(
+            "start --attach cats-linux-workspace-gate-{LINUX_GATE_TEST_TOKEN}"
+        ))
+        .expect("workspace start trace");
+    let remove = trace
+        .find(&format!(
+            "rm -f owned-cats-linux-workspace-gate-{LINUX_GATE_TEST_TOKEN}-id"
+        ))
+        .expect("workspace immutable-ID removal trace");
+    assert!(
+        create < start && start < remove,
+        "workspace create/start/immutable-ID cleanup order was not causal:\n{trace}"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn linux_quality_gate_cleanup_has_one_hard_deadline_when_docker_cli_hangs() {
+    let fixture = tempfile::tempdir().expect("Linux gate cleanup deadline fixture");
+    let fake_bin = fixture.path().join("bin");
+    let state = fixture.path().join("state");
+    std::fs::create_dir_all(&state).expect("create fake Docker state");
+    install_linux_gate_fake_cli(&fake_bin);
+    let stdout_path = fixture.path().join("stdout");
+    let stderr_path = fixture.path().join("stderr");
+    let stdout = std::fs::File::create(&stdout_path).expect("create stdout capture");
+    let stderr = std::fs::File::create(&stderr_path).expect("create stderr capture");
+    let mut child = linux_gate_command(&fake_bin, &state, "cleanup-hang")
+        .env("CATS_LINUX_CLEANUP_BUDGET_SECONDS", "5")
+        .stdout(Stdio::from(stdout))
+        .stderr(Stdio::from(stderr))
+        .spawn()
+        .expect("start top-level Linux quality gate");
+
+    let workspace_started = Instant::now();
+    while !state.join("workspace-network-active").exists() {
+        assert!(
+            workspace_started.elapsed() < Duration::from_secs(8),
+            "fake Docker never entered the foreground workspace run"
+        );
+        std::thread::sleep(Duration::from_millis(25));
+    }
+    let signal_at = Instant::now();
+    let signal = Command::new("kill")
+        .args(["-TERM", &child.id().to_string()])
+        .status()
+        .expect("signal top-level quality gate");
+    assert!(signal.success(), "could not TERM top-level quality gate");
+
+    let deadline = signal_at + Duration::from_secs(9);
+    let status = loop {
+        if let Some(status) = child.try_wait().expect("poll Linux quality gate") {
+            break status;
+        }
+        if Instant::now() >= deadline {
+            child.kill().expect("kill timed-out Linux quality gate");
+            child.wait().expect("reap timed-out Linux quality gate");
+            panic!("hung cleanup exceeded its nine-second test deadline");
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    };
+    let elapsed = signal_at.elapsed();
+    assert_eq!(status.code(), Some(143));
+    assert!(
+        elapsed < Duration::from_secs(8),
+        "five-second shared cleanup budget took {elapsed:?} after TERM"
+    );
+    assert!(
+        state.join("create-settlement-hang-entered").exists(),
+        "test never exercised a create receipt that remained unknown at the shared deadline"
+    );
+    let stderr = std::fs::read_to_string(&stderr_path).expect("read cleanup stderr");
+    assert!(
+        stderr.contains("Docker create request did not settle before the Linux cleanup deadline"),
+        "hung daemon create did not hit the shared settlement deadline:\n{stderr}"
+    );
+    assert!(
+        stderr.contains("Linux gate has an unsettled Docker create result"),
+        "an unknown daemon create result was incorrectly treated as absence:\n{stderr}"
+    );
+    assert!(
+        stderr.contains("Linux gate resources did not converge to exact absence"),
+        "cleanup timeout was not reported as non-convergence:\n{stderr}"
+    );
 }
 
 #[cfg(unix)]
