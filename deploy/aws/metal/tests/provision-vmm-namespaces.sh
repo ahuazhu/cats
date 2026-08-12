@@ -23,6 +23,7 @@ assert_exact_tree() {
   [[ $(stat -c '%u:%g:%a' "$fixture/node/node-test") == 0:0:700 ]]
   [[ $(stat -c '%u:%g:%a' "$fixture/node/node-test/vmm-socket-receipts") == 0:0:700 ]]
   [[ $(stat -c '%u:%g:%a' "$fixture/node/node-test/vmm-launch-v1") == 0:0:700 ]]
+  [[ $(stat -c '%u:%g:%a' "$fixture/node/node-test/blockd-socket-intents-v1") == 0:0:700 ]]
 }
 
 # Fresh install and an exact replay both converge to the same closed roots.
@@ -38,7 +39,8 @@ assert_exact_tree "$fresh"
 for point in \
   after-state-directory-mkdir \
   after-vmm-socket-receipts-mkdir \
-  after-vmm-launch-v1-mkdir; do
+  after-vmm-launch-v1-mkdir \
+  after-blockd-socket-intents-v1-mkdir; do
   crash=$temporary/crash-$point
   new_fixture "$crash"
   if (
@@ -97,6 +99,20 @@ if provision_identity_state_namespaces \
   exit 1
 fi
 [[ -L $namespace_alias/node/node-test/vmm-socket-receipts ]]
+
+blockd_namespace_alias=$temporary/blockd-namespace-alias
+new_fixture "$blockd_namespace_alias"
+mkdir -m 0700 \
+  "$blockd_namespace_alias/node/node-test" \
+  "$blockd_namespace_alias/foreign"
+ln -s "$blockd_namespace_alias/foreign" \
+  "$blockd_namespace_alias/node/node-test/blockd-socket-intents-v1"
+if provision_identity_state_namespaces \
+  "$blockd_namespace_alias/identity.json" "$blockd_namespace_alias/node"; then
+  echo "symlinked blockd intent namespace was accepted" >&2
+  exit 1
+fi
+[[ -L $blockd_namespace_alias/node/node-test/blockd-socket-intents-v1 ]]
 
 # The static tmpfiles transaction owns both public runtime roots. The helper
 # must accept only a real root:root/0700 directory; an alias or widened inode
