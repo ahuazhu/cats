@@ -3164,7 +3164,7 @@ fn owned_socket_leaf_identity(
         device: stat_device_number(metadata.st_dev)?,
         inode: metadata.st_ino,
         mode: stat_mode_bits(metadata.st_mode),
-        links: u64::from(metadata.st_nlink),
+        links: stat_link_count(metadata.st_nlink),
         user: metadata.st_uid,
         group: metadata.st_gid,
     })
@@ -3178,6 +3178,16 @@ fn stat_device_number(device: libc::dev_t) -> anyhow::Result<u64> {
 #[cfg(not(target_os = "linux"))]
 fn stat_device_number(device: libc::dev_t) -> anyhow::Result<u64> {
     u64::try_from(device).context("socket device number is negative")
+}
+
+#[cfg(target_os = "linux")]
+fn stat_link_count(links: libc::nlink_t) -> u64 {
+    links
+}
+
+#[cfg(not(target_os = "linux"))]
+fn stat_link_count(links: libc::nlink_t) -> u64 {
+    u64::from(links)
 }
 
 #[cfg(target_os = "linux")]

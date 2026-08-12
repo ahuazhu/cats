@@ -2291,7 +2291,7 @@ impl StrictFilesystemCoordinate {
             inode: metadata.st_ino,
             mode: u32::try_from(u64::from(metadata.st_mode))
                 .context("checkpoint namespace entry has an invalid mode")?,
-            links: u64::from(metadata.st_nlink),
+            links: raw_link_count_to_u64(metadata.st_nlink),
             user: metadata.st_uid,
             group: metadata.st_gid,
             length: u64::try_from(metadata.st_size)
@@ -3329,6 +3329,16 @@ fn raw_device_to_u64(device: libc::dev_t) -> Option<u64> {
 #[cfg(not(target_os = "linux"))]
 fn raw_device_to_u64(device: libc::dev_t) -> Option<u64> {
     u64::try_from(device).ok()
+}
+
+#[cfg(target_os = "linux")]
+fn raw_link_count_to_u64(links: libc::nlink_t) -> u64 {
+    links
+}
+
+#[cfg(not(target_os = "linux"))]
+fn raw_link_count_to_u64(links: libc::nlink_t) -> u64 {
+    u64::from(links)
 }
 
 fn read_scanned_handoff_artifact(
