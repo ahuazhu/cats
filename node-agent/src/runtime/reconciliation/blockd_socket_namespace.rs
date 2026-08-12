@@ -223,6 +223,17 @@ impl RetainedManagedBlockdSocketRoot {
         )
     }
 
+    /// Clones the retained root descriptor only after a fresh no-follow
+    /// traversal proves the installed pathname still names this capability.
+    /// Callers may traverse children relative to the clone, but cannot forge
+    /// or replace the root authority itself.
+    pub(crate) fn try_clone_descriptor(&self) -> anyhow::Result<File> {
+        self.assert_current()?;
+        self.descriptor
+            .try_clone()
+            .context("clone retained managed blockd socket root")
+    }
+
     pub(crate) fn assert_current(&self) -> anyhow::Result<()> {
         let retained = self.descriptor.metadata()?;
         ensure_owned_directory(&retained, self.identity.user, self.identity.group, 0o700)?;
@@ -2561,7 +2572,7 @@ impl ManagedBlockdRootStopOwnerEvidence {
             managed_root_identity: DirectoryIdentity {
                 device: 41,
                 inode: 42,
-                mode: u32::from(libc::S_IFDIR) | 0o700,
+                mode: stat_mode_bits(libc::S_IFDIR) | 0o700,
                 user: 0,
                 group: 0,
             },
@@ -2577,7 +2588,7 @@ impl ManagedBlockdRootStopOwnerEvidence {
             public_directory: DirectoryIdentity {
                 device: 41,
                 inode: 43,
-                mode: u32::from(libc::S_IFDIR) | 0o700,
+                mode: stat_mode_bits(libc::S_IFDIR) | 0o700,
                 user: 0,
                 group: 0,
             },
@@ -2593,7 +2604,7 @@ impl ManagedBlockdRootStopOwnerEvidence {
             control_socket: SocketLeafIdentity {
                 device: 41,
                 inode: 45,
-                mode: u32::from(libc::S_IFSOCK) | 0o700,
+                mode: stat_mode_bits(libc::S_IFSOCK) | 0o700,
                 links: 1,
                 user: 0,
                 group: 0,
@@ -3131,13 +3142,33 @@ fn owned_socket_leaf_identity(
         "blockd socket leaf has unsafe type, links or owner"
     );
     Ok(SocketLeafIdentity {
-        device: u64::try_from(metadata.st_dev).context("socket device number is negative")?,
+        device: stat_device_number(metadata.st_dev)?,
         inode: metadata.st_ino,
-        mode: u32::from(metadata.st_mode),
+        mode: stat_mode_bits(metadata.st_mode),
         links: u64::from(metadata.st_nlink),
         user: metadata.st_uid,
         group: metadata.st_gid,
     })
+}
+
+#[cfg(target_os = "linux")]
+fn stat_device_number(device: libc::dev_t) -> anyhow::Result<u64> {
+    Ok(device)
+}
+
+#[cfg(not(target_os = "linux"))]
+fn stat_device_number(device: libc::dev_t) -> anyhow::Result<u64> {
+    u64::try_from(device).context("socket device number is negative")
+}
+
+#[cfg(target_os = "linux")]
+fn stat_mode_bits(mode: libc::mode_t) -> u32 {
+    mode
+}
+
+#[cfg(not(target_os = "linux"))]
+fn stat_mode_bits(mode: libc::mode_t) -> u32 {
+    u32::from(mode)
 }
 
 fn remove_captured_socket_leaf(

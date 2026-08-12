@@ -13,7 +13,6 @@ use std::ffi::OsString;
 use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitStatus, Stdio};
-#[cfg(target_os = "linux")]
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -22,6 +21,8 @@ use anyhow::Context as _;
 use cats_api::blockd::BlockdControlResponse;
 use cats_api::blockd::DurabilityStatus;
 use cats_api::runtime_reconciliation::{Durability, HostPath, Id, RandomId128, WireU64};
+#[cfg(target_os = "linux")]
+use cats_blockd::runtime_socket_namespace::BLOCKD_IO_SOCKET_BASENAME;
 
 #[cfg(all(test, target_os = "linux"))]
 use crate::proc::ProcHandle;
@@ -782,14 +783,19 @@ pub(crate) struct PlatformSystemdServingBlockdProcessPort {
     systemd: PlatformSystemdTransientService,
     handshake: UnixBlockdHandshake,
     state_directory: StateDirectory,
+    managed_socket_root: Arc<RetainedManagedBlockdSocketRoot>,
 }
 
 impl PlatformSystemdServingBlockdProcessPort {
-    pub(crate) fn platform(state_directory: StateDirectory) -> Self {
+    pub(crate) fn platform(
+        state_directory: StateDirectory,
+        managed_socket_root: Arc<RetainedManagedBlockdSocketRoot>,
+    ) -> Self {
         Self {
             systemd: PlatformSystemdTransientService,
             handshake: UnixBlockdHandshake,
             state_directory,
+            managed_socket_root,
         }
     }
 
@@ -850,7 +856,7 @@ impl PlatformSystemdServingBlockdProcessPort {
             }
         };
         let listener_identity = match platform_listener_peer(
-            &self.state_directory,
+            &self.managed_socket_root,
             expected.frontend(),
             first.process_id,
             context,
@@ -920,10 +926,9 @@ impl ServingBlockdProcessPort for PlatformSystemdServingBlockdProcessPort {
     ) -> anyhow::Result<ServingBlockdProcessInspection> {
         let launch = self.launch(expected)?;
         let current_boot = CurrentBlockdSocketBoot::read()?;
-        let root = RetainedManagedBlockdSocketRoot::open_installed()?;
         let intents = BlockdSocketIntentStore::open_existing(self.state_directory.clone())?;
         let intent = BlockdSocketOwnershipIntentV1::serving(
-            &root,
+            &self.managed_socket_root,
             &current_boot,
             expected.device_ownership_token().clone(),
             serving_socket_owner_authority_digest(expected.prepared_device())?,
@@ -933,7 +938,10 @@ impl ServingBlockdProcessPort for PlatformSystemdServingBlockdProcessPort {
                 && intent.io_socket_path() == Some(expected.listener_path()),
             "Serving process expectation changed its managed socket mapping"
         );
-        match root.retain_existing_intent(&intents, &intent, &current_boot)? {
+        match self
+            .managed_socket_root
+            .retain_existing_intent(&intents, &intent, &current_boot)?
+        {
             ManagedBlockdSocketOwnerInspection::Current(retained) => {
                 retained.assert_current(&current_boot)?;
                 let inspection = self.inspect_exact(expected, &launch, context)?;
@@ -969,11 +977,10 @@ impl ServingBlockdProcessPort for PlatformSystemdServingBlockdProcessPort {
         context.check_active()?;
         checkpointed.assert_current()?;
         let current_boot = CurrentBlockdSocketBoot::read()?;
-        let root = RetainedManagedBlockdSocketRoot::open_installed()?;
         let intents = BlockdSocketIntentStore::open_existing(self.state_directory.clone())?;
         let expected = checkpointed.expected();
         let intent = BlockdSocketOwnershipIntentV1::serving(
-            &root,
+            &self.managed_socket_root,
             &current_boot,
             expected.device_ownership_token().clone(),
             serving_socket_owner_authority_digest(expected.prepared_device())?,
@@ -986,8 +993,12 @@ impl ServingBlockdProcessPort for PlatformSystemdServingBlockdProcessPort {
         let absence = checkpointed
             .take_socket_absence()
             .context("Serving start lacks sealed Node-global socket absence")?;
-        let prepared =
-            root.prepare_absent_owner_for_start(&intents, &intent, &current_boot, absence)?;
+        let prepared = self.managed_socket_root.prepare_absent_owner_for_start(
+            &intents,
+            &intent,
+            &current_boot,
+            absence,
+        )?;
         checkpointed.assert_current()?;
         let launch = self.launch(checkpointed.expected())?;
         checkpointed.assert_current()?;
@@ -2150,10 +2161,9 @@ struct ListenerPathIdentity {
 #[cfg(target_os = "linux")]
 #[derive(Clone)]
 struct RetainedListenerPath {
-    state_directory: StateDirectory,
-    root: Arc<std::fs::File>,
+    managed_root: Arc<RetainedManagedBlockdSocketRoot>,
     root_identity: ListenerPathIdentity,
-    directories: Vec<RetainedListenerDirectory>,
+    owner: RetainedListenerDirectory,
     leaf: Arc<std::fs::File>,
     leaf_name: OsString,
     identity: ListenerPathIdentity,
@@ -2194,7 +2204,7 @@ impl std::fmt::Debug for RetainedListenerPath {
         formatter
             .debug_struct("RetainedListenerPath")
             .field("root_identity", &self.root_identity)
-            .field("directories", &self.directories)
+            .field("owner", &self.owner)
             .field("leaf_name", &self.leaf_name)
             .field("identity", &self.identity)
             .finish_non_exhaustive()
@@ -2205,7 +2215,7 @@ impl std::fmt::Debug for RetainedListenerPath {
 impl PartialEq for RetainedListenerPath {
     fn eq(&self, other: &Self) -> bool {
         self.root_identity == other.root_identity
-            && self.directories == other.directories
+            && self.owner == other.owner
             && self.leaf_name == other.leaf_name
             && self.identity == other.identity
     }
@@ -2224,12 +2234,15 @@ enum RetainedListenerPathInspection {
 #[cfg(target_os = "linux")]
 impl RetainedListenerPath {
     fn open(
-        state_directory: &StateDirectory,
+        managed_root: &Arc<RetainedManagedBlockdSocketRoot>,
         socket: &HostPath,
     ) -> anyhow::Result<RetainedListenerPathInspection> {
+        use std::os::unix::fs::MetadataExt as _;
         use std::path::Component;
 
-        let relative = match Path::new(socket.as_str()).strip_prefix(state_directory.path()) {
+        let relative = match Path::new(socket.as_str())
+            .strip_prefix(Path::new(managed_root.planner().path().as_str()))
+        {
             Ok(relative) => relative,
             Err(_) => return Ok(RetainedListenerPathInspection::Conflict),
         };
@@ -2243,23 +2256,69 @@ impl RetainedListenerPath {
                 | Component::ParentDir => return Ok(RetainedListenerPathInspection::Conflict),
             }
         }
-        if components.is_empty() {
+        let [owner_name, leaf_name] = components.as_slice() else {
+            return Ok(RetainedListenerPathInspection::Conflict);
+        };
+        let Some(owner_token) = owner_name
+            .to_str()
+            .and_then(|owner| owner.strip_prefix("d-"))
+            .and_then(|token| RandomId128::new(token).ok())
+        else {
+            return Ok(RetainedListenerPathInspection::Conflict);
+        };
+        let mapped = managed_root.planner().serving_paths(&owner_token)?;
+        if leaf_name != std::ffi::OsStr::new(BLOCKD_IO_SOCKET_BASENAME)
+            || mapped.io_socket() != socket
+        {
             return Ok(RetainedListenerPathInspection::Conflict);
         }
-        let root = match state_directory.try_clone_directory() {
-            Ok(root) => Arc::new(root),
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                return Ok(RetainedListenerPathInspection::Unavailable)
-            }
-            Err(error) => return Err(error).context("retain serving listener state root"),
+        let root = match managed_root.try_clone_descriptor() {
+            Ok(root) => root,
+            Err(_) => return Ok(RetainedListenerPathInspection::Conflict),
         };
-        let root_identity = match root.metadata() {
+        let root_metadata = match root.metadata() {
             Ok(metadata) if metadata.is_dir() => listener_path_identity(&metadata),
             Ok(_) => return Ok(RetainedListenerPathInspection::Conflict),
             Err(_) => return Ok(RetainedListenerPathInspection::Unavailable),
         };
-        let (directories, leaf) = match retain_listener_relative(&root, &components) {
-            Ok(retained) => retained,
+        let root_identity = root_metadata;
+        let owner = match open_path_component(
+            &root,
+            owner_name,
+            libc::O_PATH | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+        ) {
+            Ok(owner) => owner,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                return Ok(RetainedListenerPathInspection::Unavailable)
+            }
+            Err(error)
+                if matches!(
+                    error.raw_os_error(),
+                    Some(libc::ELOOP) | Some(libc::ENOTDIR) | Some(libc::EINVAL)
+                ) =>
+            {
+                return Ok(RetainedListenerPathInspection::Conflict)
+            }
+            Err(_) => return Ok(RetainedListenerPathInspection::Unavailable),
+        };
+        let owner_metadata = match owner.metadata() {
+            Ok(metadata) => metadata,
+            Err(_) => return Ok(RetainedListenerPathInspection::Unavailable),
+        };
+        if !owner_metadata.is_dir()
+            || owner_metadata.nlink() == 0
+            || owner_metadata.mode() & 0o7777 != 0o700
+            || (owner_metadata.uid(), owner_metadata.gid()) != managed_root.owner()
+        {
+            return Ok(RetainedListenerPathInspection::Conflict);
+        }
+        let owner_identity = listener_path_identity(&owner_metadata);
+        let leaf = match open_path_component(
+            &owner,
+            leaf_name,
+            libc::O_PATH | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+        ) {
+            Ok(leaf) => leaf,
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
                 return Ok(RetainedListenerPathInspection::Unavailable)
             }
@@ -2284,68 +2343,54 @@ impl RetainedListenerPath {
         }
         let identity = listener_path_identity(&metadata);
         Ok(RetainedListenerPathInspection::Exact(Self {
-            state_directory: state_directory.clone(),
-            root,
+            managed_root: Arc::clone(managed_root),
             root_identity,
-            directories,
+            owner: RetainedListenerDirectory {
+                name: owner_name.clone(),
+                descriptor: Arc::new(owner),
+                identity: owner_identity,
+            },
             leaf,
-            leaf_name: components
-                .last()
-                .expect("nonempty lexical listener components")
-                .clone(),
+            leaf_name: leaf_name.clone(),
             identity,
         }))
     }
 
     fn assert_current(&self) -> anyhow::Result<()> {
-        anyhow::ensure!(
-            listener_path_identity(
-                &self
-                    .root
-                    .metadata()
-                    .context("reinspect retained serving listener state root")?
-            ) == self.root_identity,
-            "retained serving listener state root identity changed"
-        );
-        let lexical_root = self
-            .state_directory
-            .try_reopen_directory()
-            .context("reopen lexical serving listener state root")?;
+        self.managed_root.assert_current()?;
+        let lexical_root = self.managed_root.try_clone_descriptor()?;
         anyhow::ensure!(
             listener_path_identity(
                 &lexical_root
                     .metadata()
-                    .context("reinspect lexical serving listener state root")?
+                    .context("reinspect managed serving listener root")?
             ) == self.root_identity,
-            "serving listener lexical state root no longer names the retained directory"
+            "serving listener managed root changed identity"
         );
-        let mut current = self.root.try_clone()?;
-        for directory in &self.directories {
-            anyhow::ensure!(
-                listener_path_identity(
-                    &directory
-                        .descriptor
-                        .metadata()
-                        .context("reinspect retained serving listener parent")?
-                ) == directory.identity,
-                "retained serving listener parent identity changed"
-            );
-            let reopened = open_path_component(
-                &current,
-                &directory.name,
-                libc::O_PATH | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
-            )
-            .context("reopen serving listener parent from retained state root")?;
-            anyhow::ensure!(
-                listener_path_identity(
-                    &reopened
-                        .metadata()
-                        .context("reinspect reopened serving listener parent")?
-                ) == directory.identity,
-                "serving listener parent chain no longer names the retained directory"
-            );
-            current = reopened;
-        }
+        anyhow::ensure!(
+            listener_path_identity(
+                &self
+                    .owner
+                    .descriptor
+                    .metadata()
+                    .context("reinspect retained serving listener owner")?
+            ) == self.owner.identity,
+            "retained serving listener owner identity changed"
+        );
+        let current_owner = open_path_component(
+            &lexical_root,
+            &self.owner.name,
+            libc::O_PATH | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+        )
+        .context("reopen serving listener owner from retained managed root")?;
+        anyhow::ensure!(
+            listener_path_identity(
+                &current_owner
+                    .metadata()
+                    .context("reinspect reopened serving listener owner")?
+            ) == self.owner.identity,
+            "serving listener owner path no longer names the retained directory"
+        );
         let retained = self
             .leaf
             .metadata()
@@ -2355,7 +2400,7 @@ impl RetainedListenerPath {
             "retained serving listener descriptor identity changed"
         );
         let reopened = open_path_component(
-            &current,
+            &current_owner,
             &self.leaf_name,
             libc::O_PATH | libc::O_NOFOLLOW | libc::O_CLOEXEC,
         )
@@ -2383,35 +2428,6 @@ fn listener_path_identity(metadata: &std::fs::Metadata) -> ListenerPathIdentity 
         user: metadata.uid(),
         group: metadata.gid(),
     }
-}
-
-#[cfg(target_os = "linux")]
-fn retain_listener_relative(
-    root: &std::fs::File,
-    components: &[OsString],
-) -> std::io::Result<(Vec<RetainedListenerDirectory>, std::fs::File)> {
-    let mut current = root.try_clone()?;
-    let mut directories = Vec::with_capacity(components.len().saturating_sub(1));
-    for component in &components[..components.len() - 1] {
-        let descriptor = open_path_component(
-            &current,
-            component,
-            libc::O_PATH | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
-        )?;
-        let identity = listener_path_identity(&descriptor.metadata()?);
-        current = descriptor.try_clone()?;
-        directories.push(RetainedListenerDirectory {
-            name: component.clone(),
-            descriptor: Arc::new(descriptor),
-            identity,
-        });
-    }
-    let leaf = open_path_component(
-        &current,
-        components.last().expect("nonempty listener path"),
-        libc::O_PATH | libc::O_NOFOLLOW | libc::O_CLOEXEC,
-    )?;
-    Ok((directories, leaf))
 }
 
 #[cfg(target_os = "linux")]
@@ -2558,7 +2574,7 @@ enum ListenerHolderInspection {
 
 #[cfg(target_os = "linux")]
 pub(super) fn platform_listener_peer(
-    state_directory: &StateDirectory,
+    managed_root: &Arc<RetainedManagedBlockdSocketRoot>,
     frontend: &cats_api::runtime_reconciliation::PrepareDeviceFrontend,
     expected_process_id: u32,
     context: &dyn RuntimePhysicalReadContext,
@@ -2576,7 +2592,7 @@ pub(super) fn platform_listener_peer(
         } => socket_path,
     };
     context.check_active()?;
-    let retained_path = match RetainedListenerPath::open(state_directory, socket)? {
+    let retained_path = match RetainedListenerPath::open(managed_root, socket)? {
         RetainedListenerPathInspection::Exact(retained) => Arc::new(retained),
         RetainedListenerPathInspection::Unavailable => {
             return Ok(ListenerPeerInspection::Unavailable)
@@ -2879,7 +2895,7 @@ fn parse_proc_net_unix_line(line: &str) -> Option<ProcNetUnixLine<'_>> {
 
 #[cfg(not(target_os = "linux"))]
 pub(super) fn platform_listener_peer(
-    _state_directory: &StateDirectory,
+    _managed_root: &Arc<RetainedManagedBlockdSocketRoot>,
     _frontend: &cats_api::runtime_reconciliation::PrepareDeviceFrontend,
     _expected_process_id: u32,
     _context: &dyn RuntimePhysicalReadContext,
@@ -3694,7 +3710,21 @@ mod tests {
         let data_metadata =
             std::fs::metadata(&data_directory).expect("inspect exact systemd serving directory");
         let control_socket = data_directory.join("control.sock");
-        let listener_socket = data_directory.join("listener.sock");
+        let managed_root = Arc::new(
+            RetainedManagedBlockdSocketRoot::provision_for_test(
+                &state.path().join("managed-blockd-sockets"),
+            )
+            .expect("provision isolated managed blockd socket root"),
+        );
+        let listener_paths = managed_root
+            .planner()
+            .serving_paths(&random('8'))
+            .expect("derive isolated managed serving sockets");
+        let listener_parent = Path::new(listener_paths.public_directory().as_str());
+        std::fs::create_dir(listener_parent).expect("create managed serving owner directory");
+        std::fs::set_permissions(listener_parent, std::fs::Permissions::from_mode(0o700))
+            .expect("make managed serving owner directory private");
+        let listener_socket = PathBuf::from(listener_paths.io_socket().as_str());
         let ready_path = data_directory.join("ready");
 
         let python = std::fs::canonicalize("/usr/bin/python3")
@@ -3836,7 +3866,7 @@ while True:
             direct: false,
         };
         let listener = match platform_listener_peer(
-            &state,
+            &managed_root,
             &frontend,
             proof.process_id,
             &context_for(Duration::from_secs(5)),
@@ -3890,9 +3920,18 @@ while True:
             metadata,
         )
         .unwrap();
-        let listener_parent = directory.path().join("listener-parent");
+        let managed_root_path = directory.path().join("managed-blockd-sockets");
+        let managed_root = Arc::new(
+            RetainedManagedBlockdSocketRoot::provision_for_test(&managed_root_path).unwrap(),
+        );
+        let listener_paths = managed_root.planner().serving_paths(&random('8')).unwrap();
+        let listener_parent = PathBuf::from(listener_paths.public_directory().as_str());
         std::fs::create_dir(&listener_parent).unwrap();
-        let socket = listener_parent.join("vhost.sock");
+        std::fs::set_permissions(&listener_parent, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let control_socket = PathBuf::from(listener_paths.control_socket().as_str());
+        let _control_listener = std::os::unix::net::UnixListener::bind(&control_socket).unwrap();
+        std::fs::set_permissions(&control_socket, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let socket = PathBuf::from(listener_paths.io_socket().as_str());
         let options = VhostUserOptions::default();
         let mut listener = vhost_user::bind_new(&socket, options).unwrap();
         std::fs::set_permissions(&socket, std::fs::Permissions::from_mode(0o700)).unwrap();
@@ -3935,10 +3974,20 @@ while True:
             queue_size: 256,
         };
         let process_id = std::process::id();
-        let listener_state = StateDirectory::unanchored(directory.path().to_path_buf());
+        let wrong_root = Arc::new(
+            RetainedManagedBlockdSocketRoot::provision_for_test(
+                &directory.path().join("wrong-managed-blockd-sockets"),
+            )
+            .unwrap(),
+        );
+        assert_eq!(
+            platform_listener_peer(&wrong_root, &frontend, process_id, &context()).unwrap(),
+            ListenerPeerInspection::Conflict,
+            "a listener outside the retained managed root must fail closed"
+        );
 
         assert_eq!(
-            platform_listener_peer(&listener_state, &frontend, process_id, &context()).unwrap(),
+            platform_listener_peer(&managed_root, &frontend, process_id, &context()).unwrap(),
             ListenerPeerInspection::Conflict,
             "a foreign process sharing the listener fd must fail the closed holder proof"
         );
@@ -3952,7 +4001,7 @@ while True:
         let mut exact_identity = None;
         for _ in 0..100 {
             if let ListenerPeerInspection::Exact(identity) =
-                platform_listener_peer(&listener_state, &frontend, process_id, &context()).unwrap()
+                platform_listener_peer(&managed_root, &frontend, process_id, &context()).unwrap()
             {
                 exact_identity = Some(identity);
                 break;
@@ -3962,15 +4011,40 @@ while True:
         let exact_identity = exact_identity.expect("listener must become uniquely owned");
         assert_eq!(exact_identity.process_id, process_id);
 
+        let owner_name = listener_parent.file_name().unwrap();
+        let displaced_root = directory.path().join("managed-blockd-root-displaced");
+        std::fs::rename(&managed_root_path, &displaced_root).unwrap();
+        std::fs::create_dir(&managed_root_path).unwrap();
+        std::fs::set_permissions(&managed_root_path, std::fs::Permissions::from_mode(0o700))
+            .unwrap();
+        let replacement_owner = managed_root_path.join(owner_name);
+        std::fs::create_dir(&replacement_owner).unwrap();
+        std::fs::set_permissions(&replacement_owner, std::fs::Permissions::from_mode(0o700))
+            .unwrap();
+        let displaced_root_socket = displaced_root.join(owner_name).join("io.sock");
+        std::fs::rename(&displaced_root_socket, &socket).unwrap();
+        assert!(
+            exact_identity.assert_current(&frontend, &context()).is_err(),
+            "retained listener proof must reject managed-root ABA even when the exact owner and leaf path are reconstructed"
+        );
+        std::fs::rename(&socket, &displaced_root_socket).unwrap();
+        std::fs::remove_dir(&replacement_owner).unwrap();
+        std::fs::remove_dir(&managed_root_path).unwrap();
+        std::fs::rename(&displaced_root, &managed_root_path).unwrap();
+        exact_identity
+            .assert_current(&frontend, &context())
+            .unwrap();
+
         let displaced_parent = directory.path().join("listener-parent-displaced");
         std::fs::rename(&listener_parent, &displaced_parent).unwrap();
         std::fs::create_dir(&listener_parent).unwrap();
-        std::fs::rename(displaced_parent.join("vhost.sock"), &socket).unwrap();
+        std::fs::set_permissions(&listener_parent, std::fs::Permissions::from_mode(0o700)).unwrap();
+        std::fs::rename(displaced_parent.join("io.sock"), &socket).unwrap();
         assert!(
             exact_identity.assert_current(&frontend, &context()).is_err(),
             "retained listener proof must reject intermediate-parent ABA even when the exact leaf inode is moved back"
         );
-        std::fs::rename(&socket, displaced_parent.join("vhost.sock")).unwrap();
+        std::fs::rename(&socket, displaced_parent.join("io.sock")).unwrap();
         std::fs::remove_dir(&listener_parent).unwrap();
         std::fs::rename(&displaced_parent, &listener_parent).unwrap();
         exact_identity
@@ -3994,7 +4068,7 @@ while True:
             .assert_current(&frontend, &context())
             .unwrap();
         assert_eq!(
-            platform_listener_peer(&listener_state, &frontend, process_id, &context()).unwrap(),
+            platform_listener_peer(&managed_root, &frontend, process_id, &context()).unwrap(),
             ListenerPeerInspection::Exact(exact_identity),
             "repeated inventory must remain a read-only listener observation"
         );

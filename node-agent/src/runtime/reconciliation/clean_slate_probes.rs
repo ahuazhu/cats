@@ -1099,7 +1099,10 @@ impl ProbeConfig {
                 config.state_directory.clone(),
             ))),
             serving_process_port: Some(Arc::new(
-                PlatformSystemdServingBlockdProcessPort::platform(config.state_directory.clone()),
+                PlatformSystemdServingBlockdProcessPort::platform(
+                    config.state_directory.clone(),
+                    Arc::clone(&managed_blockd_socket_root),
+                ),
             )),
             root_provision_systemd: Some(config.root_provision_systemd),
             network_allocation_port: Some(NetworkAllocationPort::new(
@@ -8747,6 +8750,7 @@ mod tests {
         ch_binary: PathBuf,
         blockd_binary: PathBuf,
         guest_binary: PathBuf,
+        managed_blockd_socket_root: Arc<RetainedManagedBlockdSocketRoot>,
     }
 
     impl TestEnvironment {
@@ -8775,6 +8779,12 @@ mod tests {
             ] {
                 std::fs::create_dir(directory).unwrap();
             }
+            let managed_blockd_socket_root = Arc::new(
+                RetainedManagedBlockdSocketRoot::provision_for_test(
+                    &root.path().join("default-managed-blockd-sockets"),
+                )
+                .unwrap(),
+            );
             Self {
                 ch_binary: root.path().join("bin/cloud-hypervisor"),
                 blockd_binary: root.path().join("bin/cats-blockd"),
@@ -8786,6 +8796,7 @@ mod tests {
                 block_root,
                 network_root,
                 socket_root,
+                managed_blockd_socket_root,
             }
         }
 
@@ -10082,6 +10093,7 @@ mod tests {
             port,
             Arc::new(PlatformSystemdServingBlockdProcessPort::platform(
                 StateDirectory::unanchored(environment.state.clone()),
+                Arc::clone(&environment.managed_blockd_socket_root),
             )),
         )
     }

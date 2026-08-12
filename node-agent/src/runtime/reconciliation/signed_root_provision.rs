@@ -911,22 +911,28 @@ impl SignedRootProvisionEffect {
             Ok(retained) => retained,
             Err(_) => return Ok(Some(stop_local())),
         };
+        // A missing semantic stop journal says nothing about the boot-local
+        // managed socket owner. The old checkpoint remains the owner
+        // authority until a fresh accepted full and sealed physical sweep
+        // prove that owner absent and the namespace automaton retires it.
         let receipt = match retained
             .settle_stop_receipt()
             .context("settle superseded root-provision stop receipt")?
         {
-            StopReceiptSettlement::Absent => return Ok(None),
+            StopReceiptSettlement::Absent => None,
             StopReceiptSettlement::Recovered(_) => {
                 return Ok(Some(RuntimeDesiredEffectOutcome::RefreshInventory))
             }
-            StopReceiptSettlement::Stable(receipt) => receipt,
+            StopReceiptSettlement::Stable(receipt) => Some(receipt),
         };
-        if receipt.checkpoint_content_digest() != stored.content_digest()
-            || receipt
-                .binds_retained_values(stored.checkpoint(), retained.checkpoint())
-                .is_err()
-        {
-            return Ok(Some(stop_local()));
+        if let Some(receipt) = receipt.as_ref() {
+            if receipt.checkpoint_content_digest() != stored.content_digest()
+                || receipt
+                    .binds_retained_values(stored.checkpoint(), retained.checkpoint())
+                    .is_err()
+            {
+                return Ok(Some(stop_local()));
+            }
         }
         let old_volume = &retained.checkpoint().volume;
         let Some((identity, observed_head)) = observed_lineage(runtime, old_volume, data_directory)
@@ -941,15 +947,18 @@ impl SignedRootProvisionEffect {
             Ok(record) => record,
             Err(_) => return Ok(Some(RuntimeDesiredEffectOutcome::RefreshInventory)),
         };
-        if current.head != observed_head
-            || receipt
+        if current.head != observed_head {
+            return Ok(Some(stop_local()));
+        }
+        if receipt.as_ref().is_some_and(|receipt| {
+            receipt
                 .expectation_for_current_authority(
                     stored.checkpoint(),
                     retained.checkpoint(),
                     &current,
                 )
                 .is_err()
-        {
+        }) {
             return Ok(Some(stop_local()));
         }
         let target_authorization = match self
@@ -961,6 +970,11 @@ impl SignedRootProvisionEffect {
         let target_control_launch = target_authorization
             .as_ref()
             .map(|target| target_control_process_launch_identity(target.identity()));
+        let absence_purpose = if receipt.is_some() {
+            RootProvisionAbsencePurpose::AdmittedStopReceipt(target_control_launch)
+        } else {
+            RootProvisionAbsencePurpose::Ordinary(target_control_launch)
+        };
         let _node_global_effect = context.lock_node_global_effect()?;
         let absence = match prove_exact_root_provision_process_absence(
             store,
@@ -970,29 +984,31 @@ impl SignedRootProvisionEffect {
                 volume: &current,
             },
             self.executable_path.clone(),
-            RootProvisionAbsencePurpose::AdmittedStopReceipt(target_control_launch),
+            absence_purpose,
             self.retirement.as_ref(),
             context,
         ) {
             Ok(absence) => absence,
             Err(_) => return Ok(Some(RuntimeDesiredEffectOutcome::RefreshInventory)),
         };
-        if !retirement_admission_strictly_succeeds(receipt.admission(), absence.admission()) {
-            return Ok(Some(RuntimeDesiredEffectOutcome::RefreshInventory));
+        if let Some(receipt) = receipt.as_ref() {
+            if !retirement_admission_strictly_succeeds(receipt.admission(), absence.admission()) {
+                return Ok(Some(RuntimeDesiredEffectOutcome::RefreshInventory));
+            }
         }
-        let expectation = receipt.expectation_for_current_authority(
-            stored.checkpoint(),
-            retained.checkpoint(),
-            &current,
-        )?;
         let retirement = self
             .retirement
-            .retire_absent_socket_owner(&expectation, context)?;
+            .retire_absent_socket_owner(absence.expectation(), context)?;
         if retirement == ManagedBlockdSocketOwnerRetirement::Retired {
             return Ok(Some(RuntimeDesiredEffectOutcome::RefreshInventory));
         }
+        let Some(receipt) = receipt.as_ref() else {
+            // Only this fresh AlreadyAbsent result may hand the still-current
+            // old checkpoint to the stale planner.
+            return Ok(None);
+        };
         retained
-            .remove_stop_receipt(&receipt)
+            .remove_stop_receipt(receipt)
             .context("remove exact settled root-provision stop receipt")?;
         Ok(Some(RuntimeDesiredEffectOutcome::RefreshInventory))
     }
@@ -2674,20 +2690,6 @@ mod tests {
             )
         }
 
-        fn dispatcher(
-            &self,
-            process: Arc<FakeProcessPort>,
-            request: Arc<FakeRequestPort>,
-            mutations: Arc<NoSignedMutationPort>,
-        ) -> SignedRunningEffect {
-            self.dispatcher_with_retirement(
-                process,
-                Arc::new(FakeRetirementPort::unavailable()),
-                request,
-                mutations,
-            )
-        }
-
         fn dispatcher_with_retirement(
             &self,
             process: Arc<FakeProcessPort>,
@@ -4345,12 +4347,205 @@ mod tests {
     }
 
     #[test]
-    fn superseded_provision_falls_through_to_existing_stale_planner() {
+    fn superseded_without_stop_receipt_retires_owner_before_stale_planner() {
+        for changed_image in [false, true] {
+            let mut fixture = Fixture::new();
+            if changed_image {
+                let ReconcileStep::ProvisionRootImage {
+                    expected_provisioned_head,
+                    ..
+                } = &fixture.checkpoint.step
+                else {
+                    unreachable!()
+                };
+                fixture
+                    .authority
+                    .set_head(expected_provisioned_head.clone());
+            }
+            fixture.desired.desired_revision = Revision::new(2).unwrap();
+            if changed_image {
+                fixture.desired.runtime.boot_image_digest = Sha256Digest::from_bytes([3; 32]);
+            } else {
+                fixture.desired.runtime.memory_bytes += 4096;
+            }
+            fixture.desired.spec_digest = spec_digest(&fixture.desired).unwrap();
+            fixture.blob = if changed_image {
+                Arc::new(ExactBlob::with_chunk(&fixture.desired, '4'))
+            } else {
+                Arc::new(ExactBlob::new(&fixture.desired))
+            };
+
+            let checkpoint_store = FileCheckpointStore::open(
+                &fixture.state.path().join(CHECKPOINT_NAMESPACE),
+                &fixture.desired.cat_id,
+            )
+            .unwrap();
+            let checkpoint_path = checkpoint_store.path().to_path_buf();
+            drop(checkpoint_store);
+            let checkpoint_before = std::fs::read(&checkpoint_path).unwrap();
+            let transition_before = match &fixture.checkpoint.step {
+                ReconcileStep::ProvisionRootImage {
+                    provision_transition_id,
+                    ..
+                } => provision_transition_id.clone(),
+                _ => unreachable!(),
+            };
+            let expectation = fixture.root_process_expectation();
+            let managed = Arc::new(IsolatedManagedRootOwner::from_installed_expectation(
+                &expectation,
+            ));
+            let prepared = managed.prepare();
+            let public_directory = PathBuf::from(prepared.public_directory().as_str());
+            drop(prepared);
+            assert!(!fixture.stop_receipt_path().exists());
+
+            let process = Arc::new(FakeProcessPort::default());
+            let retirement = Arc::new(AutomatonRetirementPort {
+                managed: Arc::clone(&managed),
+                start_absences: AtomicUsize::new(0),
+                inspections: AtomicUsize::new(0),
+                retirements: AtomicUsize::new(0),
+            });
+            let request = Arc::new(FakeRequestPort {
+                authority: Arc::clone(&fixture.authority),
+                calls: AtomicUsize::new(0),
+                conflict: false,
+                mutate_owner: false,
+                connect_failure: false,
+                identity_mismatch: false,
+            });
+            let effect = fixture.effect_with_ports(
+                Arc::clone(&process) as Arc<dyn RootProvisionProcessPort>,
+                Arc::clone(&retirement) as Arc<dyn RootProvisionProcessRetirementPort>,
+                Arc::clone(&request) as Arc<dyn RootProvisionRequestPort>,
+            );
+
+            assert_eq!(
+                effect
+                    .try_apply(
+                        &fixture.context_at_with_absent_root(expectation.clone(), 5, 13),
+                        &fixture.desired,
+                    )
+                    .unwrap(),
+                Some(RuntimeDesiredEffectOutcome::RefreshInventory)
+            );
+            assert_eq!(retirement.inspections.load(Ordering::SeqCst), 1);
+            assert_eq!(retirement.retirements.load(Ordering::SeqCst), 1);
+            assert!(!public_directory.exists());
+            assert_eq!(managed.intents.load(managed.intent.owner()).unwrap(), None);
+            assert!(!fixture.stop_receipt_path().exists());
+            assert_eq!(std::fs::read(&checkpoint_path).unwrap(), checkpoint_before);
+            let persisted = FileCheckpointStore::open(
+                &fixture.state.path().join(CHECKPOINT_NAMESPACE),
+                &fixture.desired.cat_id,
+            )
+            .unwrap()
+            .load()
+            .unwrap()
+            .unwrap();
+            assert_eq!(
+                match &persisted.checkpoint().step {
+                    ReconcileStep::ProvisionRootImage {
+                        provision_transition_id,
+                        ..
+                    } => provision_transition_id,
+                    _ => unreachable!(),
+                },
+                &transition_before
+            );
+
+            assert_eq!(
+                effect
+                    .try_apply(
+                        &fixture.context_at_with_absent_root(expectation.clone(), 6, 14),
+                        &fixture.desired,
+                    )
+                    .unwrap(),
+                None,
+                "only a fresh full after physical retirement may reach the stale planner"
+            );
+            assert_eq!(retirement.inspections.load(Ordering::SeqCst), 2);
+            assert_eq!(retirement.retirements.load(Ordering::SeqCst), 2);
+            assert_eq!(std::fs::read(&checkpoint_path).unwrap(), checkpoint_before);
+            assert_eq!(process.inspections.load(Ordering::SeqCst), 0);
+            assert_eq!(request.calls.load(Ordering::SeqCst), 0);
+
+            let mutations = Arc::new(NoSignedMutationPort::default());
+            let stale = fixture.dispatcher_with_retirement(
+                Arc::clone(&process),
+                Arc::new(FakeRetirementPort::absent()),
+                Arc::clone(&request),
+                Arc::clone(&mutations),
+            );
+            assert_eq!(
+                stale
+                    .apply(
+                        fixture.context_at_with_absent_root(expectation, 7, 15),
+                        &fixture.desired,
+                    )
+                    .unwrap(),
+                RuntimeDesiredEffectOutcome::RefreshInventory
+            );
+            let successor_store = FileCheckpointStore::open(
+                &fixture.state.path().join(CHECKPOINT_NAMESPACE),
+                &fixture.desired.cat_id,
+            )
+            .unwrap();
+            let successor = successor_store.load().unwrap().unwrap();
+            if changed_image {
+                assert!(matches!(
+                    successor.checkpoint().step,
+                    ReconcileStep::CleanupRelease { .. }
+                ));
+            } else {
+                assert_eq!(
+                    successor.checkpoint().desired_revision,
+                    fixture.desired.desired_revision
+                );
+                assert_eq!(
+                    successor.checkpoint().spec_digest,
+                    fixture.desired.spec_digest
+                );
+                assert!(matches!(
+                    successor.checkpoint().step,
+                    ReconcileStep::ProvisionRootImage { .. }
+                ));
+            }
+            assert_eq!(request.calls.load(Ordering::SeqCst), 0);
+            assert_eq!(mutations.calls.load(Ordering::SeqCst), 0);
+        }
+    }
+
+    #[test]
+    fn superseded_without_stop_receipt_rejects_unbound_absence_without_mutation() {
         let mut fixture = Fixture::new();
         fixture.desired.desired_revision = Revision::new(2).unwrap();
         fixture.desired.runtime.memory_bytes += 4096;
         fixture.desired.spec_digest = spec_digest(&fixture.desired).unwrap();
 
+        let expectation = fixture.root_process_expectation();
+        let managed = Arc::new(IsolatedManagedRootOwner::from_installed_expectation(
+            &expectation,
+        ));
+        let prepared = managed.prepare();
+        let public_directory = PathBuf::from(prepared.public_directory().as_str());
+        let public_inode = std::fs::symlink_metadata(&public_directory).unwrap().ino();
+        drop(prepared);
+        let checkpoint_store = FileCheckpointStore::open(
+            &fixture.state.path().join(CHECKPOINT_NAMESPACE),
+            &fixture.desired.cat_id,
+        )
+        .unwrap();
+        let checkpoint_path = checkpoint_store.path().to_path_buf();
+        drop(checkpoint_store);
+        let checkpoint_before = std::fs::read(&checkpoint_path).unwrap();
+
+        let retirement = Arc::new(AutomatonRetirementPort {
+            managed: Arc::clone(&managed),
+            start_absences: AtomicUsize::new(0),
+            inspections: AtomicUsize::new(0),
+            retirements: AtomicUsize::new(0),
+        });
         let process = Arc::new(FakeProcessPort::default());
         let request = Arc::new(FakeRequestPort {
             authority: Arc::clone(&fixture.authority),
@@ -4360,16 +4555,42 @@ mod tests {
             connect_failure: false,
             identity_mismatch: false,
         });
-        let effect = fixture.effect(Arc::clone(&process), Arc::clone(&request));
+        let effect = fixture.effect_with_ports(
+            process,
+            Arc::clone(&retirement) as Arc<dyn RootProvisionProcessRetirementPort>,
+            Arc::clone(&request) as Arc<dyn RootProvisionRequestPort>,
+        );
+
+        let missing_admission = fixture.context_at(Vec::new(), 5, 13);
         assert_eq!(
             effect
-                .try_apply(&fixture.context(Vec::new()), &fixture.desired)
+                .try_apply(&missing_admission, &fixture.desired)
                 .unwrap(),
-            None,
-            "the SignedRunningAcquireEffect stale planner must own this checkpoint"
+            Some(RuntimeDesiredEffectOutcome::RefreshInventory)
         );
-        assert_eq!(process.inspections.load(Ordering::SeqCst), 0);
+        let mut wrong_expectation = expectation;
+        wrong_expectation.process_identity_token = random('a');
+        let mismatched_admission = fixture.context_at_with_absent_root(wrong_expectation, 6, 14);
+        assert_eq!(
+            effect
+                .try_apply(&mismatched_admission, &fixture.desired)
+                .unwrap(),
+            Some(RuntimeDesiredEffectOutcome::RefreshInventory)
+        );
+
+        assert_eq!(retirement.inspections.load(Ordering::SeqCst), 0);
+        assert_eq!(retirement.retirements.load(Ordering::SeqCst), 0);
         assert_eq!(request.calls.load(Ordering::SeqCst), 0);
+        assert_eq!(std::fs::read(&checkpoint_path).unwrap(), checkpoint_before);
+        assert_eq!(
+            std::fs::symlink_metadata(&public_directory).unwrap().ino(),
+            public_inode
+        );
+        assert_eq!(
+            managed.intents.load(managed.intent.owner()).unwrap(),
+            Some(managed.intent.clone())
+        );
+        assert!(!fixture.stop_receipt_path().exists());
     }
 
     #[test]
@@ -4528,7 +4749,14 @@ mod tests {
             );
             assert_eq!(
                 stale
-                    .apply(fixture.context_at(Vec::new(), 7, 15), &fixture.desired)
+                    .apply(
+                        fixture.context_at_with_absent_root(
+                            fixture.root_process_expectation(),
+                            7,
+                            15,
+                        ),
+                        &fixture.desired,
+                    )
                     .unwrap(),
                 RuntimeDesiredEffectOutcome::RefreshInventory
             );
@@ -5230,14 +5458,19 @@ mod tests {
             identity_mismatch: false,
         });
         let mutations = Arc::new(NoSignedMutationPort::default());
-        let dispatcher = fixture.dispatcher(
+        let retirement = Arc::new(FakeRetirementPort::absent());
+        let dispatcher = fixture.dispatcher_with_retirement(
             Arc::clone(&process),
+            Arc::clone(&retirement),
             Arc::clone(&request),
             Arc::clone(&mutations),
         );
         assert_eq!(
             dispatcher
-                .apply(fixture.context(Vec::new()), &fixture.desired)
+                .apply(
+                    fixture.context_at_with_absent_root(fixture.root_process_expectation(), 4, 12,),
+                    &fixture.desired,
+                )
                 .unwrap(),
             RuntimeDesiredEffectOutcome::RefreshInventory
         );
@@ -5260,6 +5493,7 @@ mod tests {
             ReconcileStep::ProvisionRootImage { .. }
         ));
         assert_eq!(process.inspections.load(Ordering::SeqCst), 0);
+        assert_eq!(retirement.calls.load(Ordering::SeqCst), 1);
         assert_eq!(request.calls.load(Ordering::SeqCst), 0);
         assert_eq!(mutations.calls.load(Ordering::SeqCst), 0);
     }
@@ -5289,14 +5523,19 @@ mod tests {
             identity_mismatch: false,
         });
         let mutations = Arc::new(NoSignedMutationPort::default());
-        let dispatcher = fixture.dispatcher(
+        let retirement = Arc::new(FakeRetirementPort::absent());
+        let dispatcher = fixture.dispatcher_with_retirement(
             Arc::clone(&process),
+            Arc::clone(&retirement),
             Arc::clone(&request),
             Arc::clone(&mutations),
         );
         assert_eq!(
             dispatcher
-                .apply(fixture.context(Vec::new()), &fixture.desired)
+                .apply(
+                    fixture.context_at_with_absent_root(fixture.root_process_expectation(), 4, 12,),
+                    &fixture.desired,
+                )
                 .unwrap(),
             RuntimeDesiredEffectOutcome::RefreshInventory
         );
@@ -5315,6 +5554,7 @@ mod tests {
             cleanup.checkpoint().step
         );
         assert_eq!(process.inspections.load(Ordering::SeqCst), 0);
+        assert_eq!(retirement.calls.load(Ordering::SeqCst), 1);
         assert_eq!(request.calls.load(Ordering::SeqCst), 0);
         assert_eq!(mutations.calls.load(Ordering::SeqCst), 0);
     }
