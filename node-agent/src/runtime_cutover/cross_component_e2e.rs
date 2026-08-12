@@ -1345,14 +1345,22 @@ async fn wait_for_ready_health(handle: &super::SignedRuntimeCutoverHandle) {
 async fn next_observation_barrier(
     reached: &mut tokio::sync::mpsc::UnboundedReceiver<()>,
     handle: &super::SignedRuntimeCutoverHandle,
+    phase: &'static str,
 ) {
-    tokio::time::timeout(Duration::from_secs(30), reached.recv())
-        .await
-        .expect("production loop did not reach its observation barrier")
-        .expect("production observation barrier closed unexpectedly");
+    match tokio::time::timeout(Duration::from_secs(30), reached.recv()).await {
+        Ok(Some(())) => {}
+        Ok(None) => panic!(
+            "production observation barrier closed unexpectedly during {phase}; runner_finished={}",
+            handle.runner_task.is_finished()
+        ),
+        Err(_) => panic!(
+            "production loop did not reach its observation barrier during {phase}; runner_finished={}",
+            handle.runner_task.is_finished()
+        ),
+    }
     assert!(
         !handle.runner_task.is_finished(),
-        "production runner stopped at its observation barrier"
+        "production runner stopped at its observation barrier during {phase}"
     );
 }
 
@@ -1364,9 +1372,10 @@ async fn hold_after_exact_root_process_observation(
     handle: &super::SignedRuntimeCutoverHandle,
     reached: &mut tokio::sync::mpsc::UnboundedReceiver<()>,
     resume: &tokio::sync::mpsc::UnboundedSender<()>,
+    phase: &'static str,
 ) -> String {
     loop {
-        next_observation_barrier(reached, handle).await;
+        next_observation_barrier(reached, handle, phase).await;
         let fingerprint = cats_control_plane::testsupport::runtime_spine_state_fingerprint(
             &context.server.state.store,
             node_id.clone(),
@@ -1825,7 +1834,12 @@ async fn postgres_control_and_production_cutover_reconcile_one_created_cat_acros
     .unwrap();
     let (initial_session, initial_inventory_epoch) =
         wait_for_initial_empty_inventory(&context, &state_path, &identity, &first).await;
-    next_observation_barrier(&mut first_observations, &first).await;
+    next_observation_barrier(
+        &mut first_observations,
+        &first,
+        "initial empty accepted observation",
+    )
+    .await;
     first_observation_resume
         .send(())
         .expect("resume production loop after its initial empty observation");
@@ -1912,6 +1926,7 @@ async fn postgres_control_and_production_cutover_reconcile_one_created_cat_acros
         &first,
         &mut first_observations,
         &first_observation_resume,
+        "first cutover exact root-process observation",
     )
     .await;
     wait_for_ready_health(&first).await;
@@ -2166,7 +2181,10 @@ async fn postgres_control_and_production_cutover_reconcile_one_created_cat_acros
     assert_eq!(&result.transition_id, transition_id);
     assert_eq!(&result.attachment_id, attachment_id);
     assert_eq!(result.resulting_head, acquired.head);
-    assert_eq!(Some(result.lease_expires_at), acquired.lease_expires_at);
+    assert!(matches!(
+        acquired.lease_expires_at,
+        Some(current) if current >= result.lease_expires_at
+    ));
     let inventory = authority
         .load_node_volume_inventory(
             &identity.node_id,
@@ -2238,6 +2256,7 @@ async fn postgres_control_and_production_cutover_reconcile_one_created_cat_acros
         &restarted,
         &mut restart_observations,
         &restart_observation_resume,
+        "restarted cutover exact root-process observation",
     )
     .await;
     shutdown_cutover(

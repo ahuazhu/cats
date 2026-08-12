@@ -24,6 +24,7 @@ use std::sync::{mpsc, Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use anyhow::{bail, Context as _};
+use cats_api::blockd::PENDING_PACK_DIR;
 use cats_api::chunk;
 use cats_api::runtime_reconciliation::{
     checkpoint_content_digest, decode_runtime_checkpoint, encode_desired_runtime_spec,
@@ -2790,7 +2791,7 @@ fn scan_authorized_blockd_data(
                 ".cache.data.init",
                 "dirty.bitmap",
                 ".dirty.bitmap.init",
-                "pending-packs",
+                PENDING_PACK_DIR,
             ];
             if let Some(foreign) = by_name.keys().find(|name| {
                 !allowed.contains(&name.as_str()) && !is_serving_handoff_artifact_name(name)
@@ -2955,7 +2956,7 @@ fn scan_authorized_blockd_data(
                     scan.stable_stop_receipts.push(desired.cat_id.clone());
                 }
             }
-            let control_files = ["cache.data", "dirty.bitmap", "pending-packs"];
+            let control_files = ["cache.data", "dirty.bitmap", PENDING_PACK_DIR];
             let present_control_files = control_files
                 .into_iter()
                 .filter(|name| by_name.contains_key(*name))
@@ -2985,8 +2986,11 @@ fn scan_authorized_blockd_data(
                     scan.complete = false;
                     continue;
                 }
-                let Some(pending) =
-                    open_strict_child_directory(&epoch_directory, &by_name["pending-packs"], root)?
+                let Some(pending) = open_strict_child_directory(
+                    &epoch_directory,
+                    &by_name[PENDING_PACK_DIR],
+                    root,
+                )?
                 else {
                     scan.complete = false;
                     continue;
@@ -10372,9 +10376,9 @@ mod tests {
         )
         .unwrap();
         write_empty_dirty_bitmap(&data_directory.join("dirty.bitmap"), size_bytes);
-        std::fs::create_dir(data_directory.join("pending-packs")).unwrap();
+        std::fs::create_dir(data_directory.join(PENDING_PACK_DIR)).unwrap();
         std::fs::set_permissions(
-            data_directory.join("pending-packs"),
+            data_directory.join(PENDING_PACK_DIR),
             std::fs::Permissions::from_mode(0o700),
         )
         .unwrap();
@@ -10722,9 +10726,9 @@ mod tests {
             }
             std::fs::write(&bitmap_path, &before).unwrap();
             std::fs::set_permissions(&bitmap_path, std::fs::Permissions::from_mode(0o600)).unwrap();
-            std::fs::create_dir(data_directory.join("pending-packs")).unwrap();
+            std::fs::create_dir(data_directory.join(PENDING_PACK_DIR)).unwrap();
             std::fs::set_permissions(
-                data_directory.join("pending-packs"),
+                data_directory.join(PENDING_PACK_DIR),
                 std::fs::Permissions::from_mode(0o700),
             )
             .unwrap();
@@ -16272,7 +16276,7 @@ mod tests {
             RuntimeInventoryScanOutcome::Incomplete { unavailable_sources }
                 if unavailable_sources.contains(&InventorySource::DataDirectory)
         ));
-        for name in ["cache.data", "dirty.bitmap", "pending-packs"] {
+        for name in ["cache.data", "dirty.bitmap", PENDING_PACK_DIR] {
             assert!(!fixture.data_directory.join(name).exists(), "{name}");
         }
     }
@@ -16310,7 +16314,7 @@ mod tests {
             panic!("absent process and not-started engine state must be complete")
         };
         assert!(inventory.runtimes()[0].processes.is_empty());
-        for name in ["cache.data", "dirty.bitmap", "pending-packs"] {
+        for name in ["cache.data", "dirty.bitmap", PENDING_PACK_DIR] {
             assert!(!fixture.data_directory.join(name).exists(), "{name}");
         }
     }
