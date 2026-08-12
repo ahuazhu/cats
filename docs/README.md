@@ -18,26 +18,29 @@ artifact与单一Guest release payload见
 
 ## 当前实现与目标
 
-决策状态和实现状态是两回事。2026-08-09 的准确边界：
+决策状态和实现状态是两回事。2026-08-12 的 clean-slate cutover 边界：
 
 | 范围 | 当前 Rust/部署 | 已接受目标 |
 |---|---|---|
-| 存储 | ChunkStore、delta pack、golden root、NBD/vhost-user、S3/PostgreSQL adapters 已实现并测试 | ADR-0042条件lease、attachment lineage、Cold-only磁盘生命周期、Snapshot/GC |
-| 生命周期协调 | V1 `desired/observed/generation -> NodeJob`，heartbeat直接回写状态 | ADR-0040完整 DesiredSpec +有界checkpoint + observation-only |
-| Route | v1 Ed25519 Grant和DynamoDB mirror已实现，Node没有独立 installed/retired gate | ADR-0041 v2 incarnation/per-Endpoint serving epoch + AdmissionCell；删除shared mirror |
-| Agent restart | full JSON ledger/adoption局部存在；无 Host lock，生产 unit仍可能连带终止 runtime | per-Cat scopes、union inventory、crash-safe checkpoint后才具备接管 |
-| 控制面 HA | PostgreSQL、多副本、RDS Proxy/leadership已实现；当前Store同步串行慢DB调用 | AgentSession、异步有界DB执行、真实Pod takeover、RDS failover和Host fence |
-| PersistentDisk | raw virtio attach和`mount_path`存在，没有fs UUID/format/mounted result | ext4-only mount readiness闭环 |
-| placement/网络 | legacy Node capacity与本地CIDR/FNV仍存在；per-Cat tap与owning-node dev路径 | ADR-0043 provisioner policy、同snapshot planner与exact Desired network；跨Node overlay仍deferred |
+| 存储 | ChunkStore、delta pack、golden root、NBD/vhost-user、S3/PostgreSQL adapters及ADR-0042 attachment/lease转换已实现并测试 | Snapshot/GC与外部Host-fence qualification仍是独立边界 |
+| 生命周期协调 | A19 session、A20 Desired/observation、A23 placement、完整物理inventory、checkpoint-first per-Cat reconciler与真实Cat-create v2已组成 | 完整lifecycle cutover与clean exact release仍开放，且须通过本页所列Linux/metal qualification；不提供legacy fallback |
+| Route | Route Grant v2、Node AdmissionCell/guard、Gateway-to-Node mTLS tunnel及退役/重启恢复已实现 | installer默认不安装ring/mTLS listener artifacts，未组成时machine ingress保持Closed；跨Node overlay仍deferred |
+| Agent restart | Host lock、per-Cat systemd scopes、union inventory、current-authority receipt/checkpoint恢复与旧boot清理已实现 | superseded pre-acquire publication不在已完成声明内；具体release仍须在systemd 255 + KVM/Cloud Hypervisor上保留exact-SHA证据 |
+| 控制面 HA | PostgreSQL A19/A20/A22/A23、bounded executor、Operation查询与多副本锁序已实现 | 真实RDS failover与外部Host fence仍需独立qualification，不从timeout推断隔离 |
+| PersistentDisk | current-Desired Running路径的多卷Normal/Takeover、NBD/vhost、ext4 UUID、一次性Format、Drain/Commit及private mounted-set gate已实现 | superseded publication、完整lifecycle、Snapshot/GC和跨Host rejoin仍按各自合同/故障矩阵验收 |
+| placement/网络 | A23 provisioner policy、同snapshot planner、exact Desired `/30`与per-Cat tap已实现 | 跨Node Guest overlay仍deferred |
 | privilege | 进程权限仍较集中 | privilege separation尚未实现 |
 
 协调面按 [Operations and HA §8](operations-ha.md#8-首次终态部署)一次 clean-slate 切换：离线验证
-exact release，维护窗口内退出旧组件并清空产品状态，轮换 credentials，再启动唯一的空目标 schema
-和协议。当前代码仍是 V1。
+exact release，维护窗口内退出旧组件并清空产品状态，轮换 credentials，再启动唯一的空 authority
+schema 14和冻结协议。生产`cats-noded`只启动signed Runtime composition；legacy注册、heartbeat、
+work-status和work acquire/release不在生产route map，显式retired harness仅用于历史行为测试。
 
-当前协调面的上线阻断风险已写入ADR-0040和目标规格：attach模糊响应、revision ABA、
-conditional lease takeover、AgentSession、checkpoint crash窗口、ext4 mount readiness和
-AdmissionCell。它们由同一个vertical cutover合同和故障矩阵收敛。
+生产composition及current-Desired Running路径的attach、conditional takeover、checkpoint、ext4 readiness与
+AdmissionCell已有typed recovery和故障回归；这不宣称superseded pre-acquire publication或完整lifecycle已经
+闭合。PG测试的精确终点见[当前跨组件证据边界](architecture-cross-review.md#当前跨组件证据边界)；新的
+production-public-spawn PG/Linux E2E尚未绿色。任何具体部署仍必须以exact clean SHA通过Mac full、Linux full及
+适用的systemd/KVM资格测试；文档状态不是release准入。
 
 ## Active architecture
 
@@ -47,7 +50,7 @@ AdmissionCell。它们由同一个vertical cutover合同和故障矩阵收敛。
 | [runtime-lifecycle.md](runtime-lifecycle.md) | Product contract | 四态、work/admission、数据屏障、Host loss |
 | [storage.md](storage.md) | Implemented core + explicit gaps | ChunkStore格式、FLUSH、L/R、lease/fencing、GC |
 | [operations-ha.md](operations-ha.md) | Target operations contract | failure domain、有界DB、Host fence/rejoin、分层qualification |
-| [architecture-cross-review.md](architecture-cross-review.md) | Frozen review evidence | 三边界交叉复核、阻断项关闭与接口oracle |
+| [architecture-cross-review.md](architecture-cross-review.md) | Accepted review + current evidence boundary | 三边界交叉复核、阻断项关闭与可复现证据终点 |
 | [实验总报告](experiments-2026-07-21-storage-lifecycle.md) | Evidence | 2026-07-21方法、样本、结果和失败尝试 |
 
 ## Active specs
@@ -57,16 +60,16 @@ AdmissionCell。它们由同一个vertical cutover合同和故障矩阵收敛。
 | [blockd protocol](specs/blockd-protocol.md) | Implemented data plane + target Volume Authority | Chunk/Map/FLUSH已实现；pack v2/grant adoption未实现 |
 | [Guest Runtime API](specs/guest-runtime-api.md) | Frozen v1 | `/run/cats/runtime.sock`、work lease |
 | [Interactive Shell](specs/interactive-shell-protocol.md) | Implemented v1 | WorkOS鉴权 WebSocket PTY |
-| [Runtime Reconciliation v1](specs/runtime-reconciliation-v1.md) | Target，未实现 | ADR-0040切换合同 |
-| [Agent Registration and Internal Transport v1](specs/agent-registration-transport-v1.md) | Frozen target，未实现 | per-Node签名、注册wire、lease与Guest receipt部署路径 |
-| [Runtime Inventory and Observation Spine v1](specs/runtime-inventory-observation-v1.md) | Frozen target，未实现 | Desired read-position、inventory/observation接受与freshness |
-| [Runtime Composition Artifacts v1](specs/runtime-composition-artifacts-v1.md) | Frozen target，未实现 | local NodeIdentity artifact与单一Guest release payload |
-| [Runtime Placement Policy v1](specs/runtime-placement-policy-v1.md) | Frozen target，未实现 | provisioner-owned capacity/capability/CIDR、keyset planner与exact `/30` allocation |
-| [Immutable Image Manifest Read v1](specs/immutable-image-manifest-read-v1.md) | Frozen target，未实现 | golden manifest唯一DTO、canonical bytes、有界读取与Control只读组合 |
-| [Runtime Volume Transitions v1](specs/runtime-volume-transitions-v1.md) | Frozen target，未实现 | Node签名mutation、Control单事务卷转换与authorization evidence read |
-| [Route Grant v2](specs/route-grant-v2.md) | Target，未实现 | ADR-0041切换合同；固定向量待实现时重建 |
+| [Runtime Reconciliation v1](specs/runtime-reconciliation-v1.md) | Production spine + current-Desired Running path implemented | checkpoint/inventory/per-Cat effects及current-authority route/volume barriers；superseded publication、完整lifecycle和外部fence仍开放 |
+| [Agent Registration and Internal Transport v1](specs/agent-registration-transport-v1.md) | Implemented frozen v1 | per-Node签名、注册wire、lease与Guest receipt部署路径 |
+| [Runtime Inventory and Observation Spine v1](specs/runtime-inventory-observation-v1.md) | Implemented frozen v1 | Desired read-position、inventory/observation接受与freshness |
+| [Runtime Composition Artifacts v1](specs/runtime-composition-artifacts-v1.md) | Implemented frozen v1 | local NodeIdentity artifact与单一Guest release payload |
+| [Runtime Placement Policy v1](specs/runtime-placement-policy-v1.md) | Implemented frozen v1 | provisioner-owned capacity/capability/CIDR、keyset planner与exact `/30` allocation |
+| [Immutable Image Manifest Read v1](specs/immutable-image-manifest-read-v1.md) | Implemented frozen v1 | golden manifest唯一DTO、canonical bytes、有界读取、Control只读组合与Cat-create v2 |
+| [Runtime Volume Transitions v1](specs/runtime-volume-transitions-v1.md) | Implemented frozen v1 | Node签名mutation、Control单事务卷转换与authorization evidence read |
+| [Route Grant v2](specs/route-grant-v2.md) | Core与machine tunnel implemented；public proxy closed | ADR-0041 AdmissionCell、Grant及machine tunnel；未安装ring/mTLS时不监听 |
 | [Route v2 Signing Authority v1](specs/route-signing-authority-v1.md) | Frozen target，部分实现 | 独立signer reference/public ring artifact；持久rotation/ACK composition未实现 |
-| [Volume Authority](specs/volume-authority.md) | Target，未实现 | ADR-0042卷、attachment、ext4、snapshot和delete合同 |
+| [Volume Authority](specs/volume-authority.md) | Current-Desired Running attachment/ext4 path implemented | superseded publication及ADR-0042 Snapshot/GC/Host-fence边界仍按明确qualification矩阵推进 |
 
 协议状态必须明确写 `Implemented/Frozen` 或 `Target, not implemented`。不存在“文档写了就算
 代码存在”。

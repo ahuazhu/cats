@@ -1,6 +1,6 @@
 # Agent Registration and Internal Transport v1
 
-- 状态：Frozen target contract；尚未实现
+- 状态：Implemented frozen v1；clean-slate rollout only
 - Authority：[ADR-0040](../decisions/0040-level-triggered-runtime-reconciliation.md)
 - 共享runtime类型：[Runtime Reconciliation v1](runtime-reconciliation-v1.md)
 - Session-bound delivery/acceptance：[Runtime Inventory and Observation Spine v1](runtime-inventory-observation-v1.md)

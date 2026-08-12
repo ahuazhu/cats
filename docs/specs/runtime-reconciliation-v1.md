@@ -1,6 +1,6 @@
 # Runtime Reconciliation v1
 
-- 状态：Target contract；尚未实现
+- 状态：production spine与current-Desired Running/route/Persistent路径已实现；superseded pre-acquire publication、完整lifecycle与外部fence仍按显式边界推进
 - Authority：[ADR-0040](../decisions/0040-level-triggered-runtime-reconciliation.md)
 - 生命周期：[runtime-lifecycle.md](../runtime-lifecycle.md)
 - Internal delivery/acceptance：[Runtime Inventory and Observation Spine v1](runtime-inventory-observation-v1.md)

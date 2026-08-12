@@ -1,6 +1,6 @@
 # Runtime Composition Artifacts v1
 
-- 状态：Frozen target contract；尚未实现
+- 状态：Implemented frozen v1；clean-slate rollout only
 - Runtime authority：[Runtime Reconciliation v1](runtime-reconciliation-v1.md)
 - Internal transport：[Agent Registration and Internal Transport v1](agent-registration-transport-v1.md)
 

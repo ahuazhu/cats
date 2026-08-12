@@ -1,7 +1,7 @@
 # Gateway Workload Identity Authority v1
 
-- 状态：Frozen target contract；canonical authority codec、PG current/CAS writer、fixed reader与
-  Control TLS 1.3/HTTP/1.1 machine listener已实现；Gateway到Node transport仍未实现
+- 状态：Implemented frozen v1（Gateway→Control authority与可选machine listener）；Gateway→Node
+  mTLS tunnel由ADR-0046实现，public proxy及默认部署的ring/mTLS artifacts仍Closed
 - 决策：[ADR-0045](../decisions/0045-independent-gateway-workload-identity.md)
 - Resolve与Grant：[Route Grant v2](route-grant-v2.md)
 - Signer：[Route v2 Signing Authority v1](route-signing-authority-v1.md)
@@ -83,9 +83,10 @@ PostgreSQL是唯一运行时current authority。schema至少保存：
 - 每个SPKI digest的first-seen credential ID/revision与永久tombstone；
 - current credential projection，仅作为exact revision bytes的校验后索引，不能独立更新或成为第二authority。
 
-这些表与Route v2 signer current/revision/key-lineage表共同属于尚未合流部署的exact clean-slate authority
-schema 13最终形态；中间的Gateway-only schema提交不构成可独立部署版本。version 12不做in-place migration或repair，任何新Control
-replica都必须在空的version-13 schema上启动，不存在mixed-version rolling window。
+这些表与Route v2 signer current/revision/key-lineage表共同属于exact clean-slate authority schema 14
+最终形态；中间的Gateway-only schema提交不构成可独立部署版本。任何早期版本都不做in-place
+migration或repair，任何新Control replica都必须在空的version-14 schema上启动，不存在mixed-version
+rolling window。
 
 writer取schema-scoped exclusive advisory transaction lock并锁current pointer：
 
