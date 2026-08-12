@@ -4151,6 +4151,9 @@ mod tests {
         #[cfg(target_os = "linux")]
         fn listener_accepts_connect(socket_path: &Path) -> anyhow::Result<bool> {
             let encoded = CString::new(socket_path.as_os_str().as_bytes())?;
+            // SAFETY: `sockaddr_un` is a plain C socket-address value; a
+            // zeroed instance is a valid starting state before setting its
+            // family and bounded path bytes below.
             let mut address = unsafe { std::mem::zeroed::<libc::sockaddr_un>() };
             anyhow::ensure!(
                 encoded.as_bytes_with_nul().len() <= address.sun_path.len(),
@@ -4169,6 +4172,8 @@ mod tests {
             // Use a nonblocking client so a listener inherited by a parallel
             // raw-fork test cannot fill its unaccepted backlog and block this
             // fixture's bounded convergence check.
+            // SAFETY: the call takes no Rust pointers, and the returned owned
+            // descriptor is checked before being transferred to `File`.
             let descriptor = unsafe {
                 libc::socket(
                     libc::AF_UNIX,
@@ -4185,6 +4190,9 @@ mod tests {
             let address_len = (std::mem::size_of::<libc::sa_family_t>()
                 + encoded.as_bytes_with_nul().len())
                 as libc::socklen_t;
+            // SAFETY: `socket` owns a live AF_UNIX descriptor, `address` is
+            // initialized through `address_len`, and both remain live for the
+            // duration of the non-owning call.
             let result = unsafe {
                 libc::connect(
                     socket.as_raw_fd(),
