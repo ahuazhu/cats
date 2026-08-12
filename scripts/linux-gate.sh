@@ -573,7 +573,8 @@ main() {
   local attempt
   local expected_focused_test="runtime_cutover::cross_component_e2e::postgres_control_and_production_cutover_reconcile_one_created_cat_across_restart: test"
   local image_inspection=""
-  local iidfile_lines=""
+  local iidfile_expected=""
+  local iidfile_expected_lf=""
   local listed_test=""
   local listed_test_count=0
   local listed_test_mismatch=false
@@ -648,10 +649,14 @@ main() {
         "CATS_SOURCE_PROVENANCE_FINGERPRINT=$CATS_SOURCE_PROVENANCE_FINGERPRINT" \
       --file "$REPO_ROOT/scripts/linux-systemd.Dockerfile" \
       "$REPO_ROOT/scripts"; then
-      iidfile_lines="$(LC_ALL=C wc -l <"$LINUX_SYSTEMD_IIDFILE" | tr -d '[:space:]')"
-      IFS= read -r LINUX_SYSTEMD_IMAGE_ID <"$LINUX_SYSTEMD_IIDFILE" || true
-      if [[ "$iidfile_lines" != 1 \
-        || ! "$LINUX_SYSTEMD_IMAGE_ID" =~ ^sha256:[0-9a-f]{64}$ ]]; then
+      LINUX_SYSTEMD_IMAGE_ID="$(LC_ALL=C cat "$LINUX_SYSTEMD_IIDFILE")"
+      iidfile_expected="$LINUX_CAPTURE_DIR/systemd-image.expected"
+      iidfile_expected_lf="$LINUX_CAPTURE_DIR/systemd-image.expected-lf"
+      printf '%s' "$LINUX_SYSTEMD_IMAGE_ID" >"$iidfile_expected"
+      printf '%s\n' "$LINUX_SYSTEMD_IMAGE_ID" >"$iidfile_expected_lf"
+      if [[ ! "$LINUX_SYSTEMD_IMAGE_ID" =~ ^sha256:[0-9a-f]{64}$ \
+        ]] || { ! cmp -s "$LINUX_SYSTEMD_IIDFILE" "$iidfile_expected" \
+        && ! cmp -s "$LINUX_SYSTEMD_IIDFILE" "$iidfile_expected_lf"; }; then
         echo "focused Linux Runtime E2E received an invalid Docker image receipt" >&2
         status=1
       fi
