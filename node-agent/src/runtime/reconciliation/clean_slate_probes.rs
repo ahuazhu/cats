@@ -150,7 +150,7 @@ const DATA_NAMESPACE: &str = "data";
 const PENDING_PACK_NAMESPACE: &str = "pending-packs";
 const WARM_SNAPSHOT_NAMESPACE: &str = "warm-snapshots";
 const GUEST_MOUNT_NAMESPACE: &str = "guest-mounts";
-const RUNTIME_V1_MAX_ASSIGNED_CATS: usize = 1_024;
+pub(super) const RUNTIME_V1_MAX_ASSIGNED_CATS: usize = 1_024;
 const RUNTIME_STATE_ENTRIES_PER_ASSIGNED_CAT: usize = 32;
 pub(crate) const RUNTIME_CHECKPOINT_NAMESPACE_ENTRY_LIMIT: usize =
     RUNTIME_V1_MAX_ASSIGNED_CATS * RUNTIME_STATE_ENTRIES_PER_ASSIGNED_CAT;

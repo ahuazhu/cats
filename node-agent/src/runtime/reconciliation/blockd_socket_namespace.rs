@@ -17,6 +17,7 @@ use std::path::{Component, Path};
 use std::sync::{Arc, Mutex, MutexGuard};
 
 use anyhow::Context as _;
+use cats_api::guest::RUNTIME_READY_MAX_DEVICES_V1;
 use cats_api::runtime_reconciliation::{
     HostPath, NodeBootId, PreparedDeviceInput, RandomId128, Sha256Digest,
 };
@@ -31,12 +32,27 @@ use sha2::{Digest as _, Sha256};
 use crate::runtime_spine::RuntimeNodeGlobalEffectPermit;
 use crate::state_directory::StateDirectory;
 
+use super::clean_slate_probes::RUNTIME_V1_MAX_ASSIGNED_CATS;
+
 pub(crate) const BLOCKD_SOCKET_INTENT_NAMESPACE: &str = "blockd-socket-intents-v1";
 
 const BLOCKD_SOCKET_INTENT_VERSION: u32 = 1;
 const BLOCKD_SOCKET_INTENT_MAX_BYTES: usize = 8 * 1024;
-const BLOCKD_SOCKET_WHOLE_ROOT_MAX_ENTRIES: usize = 8_192;
+const BLOCKD_SOCKET_EXPECTED_OWNER_LIMIT: usize =
+    RUNTIME_V1_MAX_ASSIGNED_CATS * (RUNTIME_READY_MAX_DEVICES_V1 + 1);
+// Enumerate one entry beyond the maximum legal owner set so that the first
+// foreign name is classified as residue rather than mistaken for truncation.
+// Further entries still fail closed at the same descriptor-relative boundary.
+const BLOCKD_SOCKET_WHOLE_ROOT_SCAN_ENTRY_LIMIT: usize = BLOCKD_SOCKET_EXPECTED_OWNER_LIMIT + 1;
 const SERVING_OWNER_AUTHORITY_DOMAIN: &[u8] = b"cats.blockd.socket-serving-owner.v1";
+
+fn validate_whole_root_expected_owner_count(owner_count: usize) -> anyhow::Result<()> {
+    anyhow::ensure!(
+        owner_count <= BLOCKD_SOCKET_EXPECTED_OWNER_LIMIT,
+        "managed blockd whole-root expectation exceeds the assigned owner contract"
+    );
+    Ok(())
+}
 
 /// Sealed sample of the running kernel boot. Raw observation/session values
 /// are not namespace deletion authority.
@@ -602,6 +618,7 @@ impl RetainedManagedBlockdSocketRoot {
     ) -> anyhow::Result<ManagedBlockdSocketWholeRootSnapshot> {
         self.assert_current()?;
         intents.assert_current()?;
+        validate_whole_root_expected_owner_count(expected.len())?;
         let mut allowed_directories = BTreeSet::new();
         let mut allowed_receipts = BTreeSet::new();
         let mut owner_snapshots = BTreeMap::new();
@@ -720,15 +737,17 @@ impl RetainedManagedBlockdSocketRoot {
                 "managed blockd whole-root expectation repeats an owner"
             );
         }
-        let directory_names =
-            strict_directory_names_bounded(&self.descriptor, BLOCKD_SOCKET_WHOLE_ROOT_MAX_ENTRIES)?;
+        let directory_names = strict_directory_names_bounded(
+            &self.descriptor,
+            BLOCKD_SOCKET_WHOLE_ROOT_SCAN_ENTRY_LIMIT,
+        )?;
         anyhow::ensure!(
             directory_names.is_subset(&allowed_directories),
             "managed blockd socket root contains an unknown owner or recovery alias"
         );
         let receipt_names = strict_directory_names_bounded(
             &intents.directory,
-            BLOCKD_SOCKET_WHOLE_ROOT_MAX_ENTRIES,
+            BLOCKD_SOCKET_WHOLE_ROOT_SCAN_ENTRY_LIMIT,
         )?;
         anyhow::ensure!(
             receipt_names.is_subset(&allowed_receipts),
@@ -3578,6 +3597,39 @@ mod tests {
             .unwrap()
         }
 
+        fn indexed_root_intent(&self, owner: usize) -> BlockdSocketOwnershipIntentV1 {
+            BlockdSocketOwnershipIntentV1::root(
+                &self.root,
+                &self.current_boot(),
+                RandomId128::new(format!("{owner:032x}")).unwrap(),
+                digest('b'),
+            )
+            .unwrap()
+        }
+
+        /// Install canonical current bytes without one fsync per owner. The
+        /// capacity regression exercises closed enumeration, decoding and
+        /// owner snapshots rather than publication crash durability, which is
+        /// covered by the ordinary prepare/replay tests above.
+        fn install_current_owner_for_capacity_test(&self, intent: &BlockdSocketOwnershipIntentV1) {
+            let mut receipt = open_at(
+                &self.intents.directory,
+                &intent_file_name(intent.owner()).unwrap(),
+                libc::O_WRONLY | libc::O_CREAT | libc::O_EXCL | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+                0o600,
+            )
+            .unwrap();
+            let bytes = intent.encoded_bytes().unwrap();
+            receipt.write_all(&bytes).unwrap();
+
+            let public = Path::new(intent.public_directory.as_str());
+            std::fs::create_dir(public).unwrap();
+            std::fs::set_permissions(public, std::fs::Permissions::from_mode(0o700)).unwrap();
+            let marker = Path::new(intent.owner_marker_path.as_str());
+            std::fs::write(marker, bytes).unwrap();
+            std::fs::set_permissions(marker, std::fs::Permissions::from_mode(0o600)).unwrap();
+        }
+
         fn create_owner_staging_without_marker(&self, intent: &BlockdSocketOwnershipIntentV1) {
             let path = Path::new(intent.staging_directory.as_str());
             std::fs::create_dir(path).unwrap();
@@ -4611,6 +4663,60 @@ mod tests {
             )
             .is_err());
         drop((marker_control, prepared_marker));
+    }
+
+    #[test]
+    fn whole_root_capacity_covers_more_than_legacy_bound_and_rejects_first_foreign_owner() {
+        const LEGACY_BROKEN_ENTRY_BOUND: usize = 8_192;
+        const OWNER_COUNT: usize = LEGACY_BROKEN_ENTRY_BOUND + 1;
+
+        assert_eq!(
+            BLOCKD_SOCKET_EXPECTED_OWNER_LIMIT,
+            RUNTIME_V1_MAX_ASSIGNED_CATS * (RUNTIME_READY_MAX_DEVICES_V1 + 1)
+        );
+        assert_eq!(
+            BLOCKD_SOCKET_WHOLE_ROOT_SCAN_ENTRY_LIMIT,
+            BLOCKD_SOCKET_EXPECTED_OWNER_LIMIT + 1
+        );
+        assert!(OWNER_COUNT < BLOCKD_SOCKET_EXPECTED_OWNER_LIMIT);
+        validate_whole_root_expected_owner_count(BLOCKD_SOCKET_EXPECTED_OWNER_LIMIT).unwrap();
+        assert!(
+            validate_whole_root_expected_owner_count(BLOCKD_SOCKET_EXPECTED_OWNER_LIMIT + 1)
+                .is_err()
+        );
+
+        let fixture = Fixture::new();
+        let expected = (1..=OWNER_COUNT)
+            .map(|owner| fixture.indexed_root_intent(owner))
+            .collect::<Vec<_>>();
+        for intent in &expected {
+            fixture.install_current_owner_for_capacity_test(intent);
+        }
+        fixture.intents.directory.sync_all().unwrap();
+        fixture.root.descriptor.sync_all().unwrap();
+
+        let snapshot = fixture
+            .root
+            .capture_closed_whole_root(&fixture.intents, &expected)
+            .unwrap();
+        assert_eq!(snapshot.directory_names.len(), OWNER_COUNT);
+        assert_eq!(snapshot.receipt_names.len(), OWNER_COUNT);
+        assert_eq!(snapshot.owner_snapshots.len(), OWNER_COUNT);
+
+        let foreign = fixture.socket_path.join("foreign-owner");
+        std::fs::create_dir(&foreign).unwrap();
+        std::fs::set_permissions(&foreign, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let error = fixture
+            .root
+            .capture_closed_whole_root(&fixture.intents, &expected)
+            .unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("contains an unknown owner or recovery alias"));
+        assert!(
+            foreign.is_dir(),
+            "failed scan must not clean foreign residue"
+        );
     }
 
     fn random_id(value: char) -> RandomId128 {
