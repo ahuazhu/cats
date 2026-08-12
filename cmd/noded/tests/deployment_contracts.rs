@@ -101,11 +101,16 @@ fn node_agent_restart_requires_a_drained_idle_node() {
     let restart = metal_readme
         .find("systemctl restart cats-noded")
         .expect("metal installation documents its required configuration restart");
-    let later_restart_guard = metal_readme
-        .find("state=cordoned cats=0 orphans=0")
-        .expect("metal restart instructions require an idle drained node");
+    let later_cordon_guard = metal_readme
+        .find("first apply a reviewed A23 cordon")
+        .expect("metal restart instructions require a reviewed A23 cordon");
+    let later_empty_guard = metal_readme
+        .find("no assigned Desired runtimes or physical residue")
+        .expect("metal restart instructions require an empty, residue-free node");
     assert!(
-        first_install < restart && restart < later_restart_guard,
+        first_install < restart
+            && restart < later_cordon_guard
+            && later_cordon_guard < later_empty_guard,
         "metal restart instructions must limit the direct command to first install and then document the drain/idle guard"
     );
 }
