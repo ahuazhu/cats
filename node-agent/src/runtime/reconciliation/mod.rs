@@ -55,6 +55,8 @@ mod serving_handoff;
 mod serving_handoff_effect;
 mod signed_root_provision;
 mod signed_running;
+#[cfg(test)]
+mod socket_path_characterization;
 // This focused foundation intentionally lands before the production systemd
 // adapter and signed launch orchestrator that consume it. Keep the exception
 // on this one private module; the follow-up composition removes it.
