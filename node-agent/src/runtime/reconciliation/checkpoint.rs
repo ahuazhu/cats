@@ -118,6 +118,27 @@ pub struct FileCheckpointStore {
     faults: Mutex<TestFaults>,
 }
 
+impl Drop for FileCheckpointStore {
+    fn drop(&mut self) {
+        // Closing our descriptor is not sufficient when another thread has
+        // forked: the pre-exec child temporarily retains the same open-file
+        // description despite O_CLOEXEC. Explicitly removing the flock from
+        // that shared description prevents a completed writer from remaining
+        // spuriously active until the child reaches exec.
+        loop {
+            // SAFETY: `_writer_lock` remains a live descriptor throughout
+            // Drop. `flock` neither takes ownership nor retains a pointer.
+            let result = unsafe { libc::flock(self._writer_lock.as_raw_fd(), libc::LOCK_UN) };
+            if result == 0 {
+                break;
+            }
+            if io::Error::last_os_error().kind() != io::ErrorKind::Interrupted {
+                break;
+            }
+        }
+    }
+}
+
 /// In-process serialization proof that one previously loaded checkpoint is
 /// still the exact target protected by this store's held per-Cat `flock`.
 ///
@@ -1864,11 +1885,55 @@ fn io_error(operation: &'static str, path: &Path, source: io::Error) -> Checkpoi
 
 #[cfg(test)]
 mod retained_checkpoint_tests {
+    use std::os::fd::FromRawFd as _;
     use std::os::unix::fs::PermissionsExt as _;
+    use std::process::{Child, Command, Stdio};
 
     use cats_api::runtime_reconciliation::decode_runtime_checkpoint;
 
     use super::*;
+
+    struct InheritedWriterLockChild {
+        child: Option<Child>,
+    }
+
+    impl InheritedWriterLockChild {
+        fn spawn(store: &FileCheckpointStore) -> Self {
+            // `dup` shares the exact open-file description carrying the
+            // writer flock. Mapping it to stdin deliberately keeps it open
+            // across exec, making the shorter production fork-to-exec
+            // inheritance window deterministic.
+            // SAFETY: the store owns a live descriptor and a successful dup
+            // returns one fresh descriptor owned by this test.
+            let descriptor = unsafe { libc::dup(store._writer_lock.as_raw_fd()) };
+            assert!(descriptor >= 0, "{}", io::Error::last_os_error());
+            // SAFETY: successful `dup` transferred this fresh descriptor to
+            // the returned File exactly once.
+            let inherited = unsafe { File::from_raw_fd(descriptor) };
+            let child = Command::new("/bin/sleep")
+                .env_clear()
+                .stdin(Stdio::from(inherited))
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .arg("30")
+                .spawn()
+                .unwrap();
+            Self { child: Some(child) }
+        }
+
+        fn assert_running(&mut self) {
+            assert!(self.child.as_mut().unwrap().try_wait().unwrap().is_none());
+        }
+    }
+
+    impl Drop for InheritedWriterLockChild {
+        fn drop(&mut self) {
+            if let Some(mut child) = self.child.take() {
+                let _ = child.kill();
+                child.wait().unwrap();
+            }
+        }
+    }
 
     #[test]
     fn newly_created_checkpoint_namespace_uses_an_explicit_private_mode() {
@@ -1886,6 +1951,25 @@ mod retained_checkpoint_tests {
             std::fs::metadata(namespace).unwrap().permissions().mode() & 0o777,
             0o700
         );
+    }
+
+    #[test]
+    fn checkpoint_store_drop_unlocks_an_open_file_description_inherited_across_exec() {
+        let checkpoint = decode_runtime_checkpoint(include_bytes!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../testdata/runtime-reconciliation-v1-start-runtime-checkpoint.json"
+        )))
+        .unwrap();
+        let root = tempfile::tempdir().unwrap();
+        let store = FileCheckpointStore::open(root.path(), &checkpoint.cat_id).unwrap();
+        let mut inherited = InheritedWriterLockChild::spawn(&store);
+        inherited.assert_running();
+
+        drop(store);
+
+        let reopened = FileCheckpointStore::open(root.path(), &checkpoint.cat_id).unwrap();
+        inherited.assert_running();
+        drop(reopened);
     }
 
     #[test]
