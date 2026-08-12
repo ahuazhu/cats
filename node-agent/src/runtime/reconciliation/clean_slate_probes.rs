@@ -8757,11 +8757,14 @@ mod tests {
         fn new() -> Self {
             // Several unrelated process/socket probes still bind temporary
             // Unix listeners. Keep the fixture under /tmp so those synthetic
-            // paths remain below SUN_LEN on macOS; production blockd paths are
-            // always derived from the installation-owned namespace.
+            // paths remain compact on macOS; the one deliberately deep legacy
+            // socket fixture binds a short name before moving the inode.
+            // Production blockd paths always come from the installation-owned
+            // namespace.
+            let canonical_temp = std::fs::canonicalize("/tmp").unwrap();
             let root = tempfile::Builder::new()
                 .prefix("c")
-                .tempdir_in("/tmp")
+                .tempdir_in(canonical_temp)
                 .unwrap();
             let state = root.path().join("state");
             let proc_root = root.path().join("proc");
@@ -10410,7 +10413,14 @@ mod tests {
         let data_directory = prepare_exact_lineage(&environment, desired, &attachment);
         install_exact_control_only_files(&data_directory, attachment.size_bytes);
         let legacy_socket = data_directory.join("root-provision.sock");
-        let listener = std::os::unix::net::UnixListener::bind(&legacy_socket).unwrap();
+        // Bind below SUN_LEN through a short pathname, then move the socket
+        // inode into the deliberately long legacy data-directory location.
+        // The probe only trusts the final descriptor-relative entry; keeping
+        // the listener open preserves the socket inode without making
+        // this fixture depend on the host's temporary-directory prefix.
+        let short_socket = environment._root.path().join("legacy.sock");
+        let listener = std::os::unix::net::UnixListener::bind(&short_socket).unwrap();
+        std::fs::rename(&short_socket, &legacy_socket).unwrap();
 
         let error = authorized_data_probe(&environment)
             .prove_absent(&scan_context)

@@ -2807,6 +2807,16 @@ mod tests {
         }
     }
 
+    fn managed_serving_sockets(device_ownership_token: &RandomId128) -> (PathBuf, PathBuf) {
+        let paths = cats_blockd::runtime_socket_namespace::ManagedBlockdSocketRoot::installed()
+            .serving_paths(device_ownership_token)
+            .unwrap();
+        (
+            PathBuf::from(paths.control_socket().as_str()),
+            PathBuf::from(paths.io_socket().as_str()),
+        )
+    }
+
     fn argv(command: &Command) -> Vec<OsString> {
         command.get_args().map(ToOwned::to_owned).collect()
     }
@@ -2887,14 +2897,14 @@ mod tests {
         );
         assert_eq!(stored, *prepared.checkpoint());
 
-        let control = temp.path().join("control-sockets/cat-1-blockd.sock");
-        let frontend = temp.path().join("vhost-user/cat-1-root.sock");
+        let device_ownership_token = random(3);
+        let (control, frontend) = managed_serving_sockets(&device_ownership_token);
         let command = authorized_blockd_command(
             &launch_config(),
             &prepared,
             &id("cats-cat-1-root.scope"),
             &random(2),
-            &random(3),
+            &device_ownership_token,
             &control,
             &AuthorizedBlockFrontend::VhostUser {
                 socket: frontend.clone(),
@@ -2950,15 +2960,15 @@ mod tests {
             AuthorizedBlockdStore::new(StateDirectory::unanchored(temp.path().to_path_buf()))
                 .prepare(&desired, &volume, &attachment)
                 .unwrap();
-        let control = temp.path().join("control.sock");
-        let frontend = temp.path().join("vhost.sock");
+        let device_ownership_token = random(3);
+        let (control, frontend) = managed_serving_sockets(&device_ownership_token);
         for (queues, queue_size) in [(0, 256), (65, 256), (1, 0), (1, 1), (1, 3), (1, 32_769)] {
             let result = authorized_blockd_command(
                 &launch_config(),
                 &prepared,
                 &id("cats-cat-1-root.scope"),
                 &random(2),
-                &random(3),
+                &device_ownership_token,
                 &control,
                 &AuthorizedBlockFrontend::VhostUser {
                     socket: frontend.clone(),
@@ -2977,7 +2987,7 @@ mod tests {
                 &prepared,
                 &id("cats-cat-1-root.scope"),
                 &random(2),
-                &random(3),
+                &device_ownership_token,
                 &control,
                 &AuthorizedBlockFrontend::VhostUser {
                     socket: frontend.clone(),
@@ -2997,13 +3007,14 @@ mod tests {
             AuthorizedBlockdStore::new(StateDirectory::unanchored(temp.path().to_path_buf()))
                 .prepare(&desired, &volume, &attachment)
                 .unwrap();
-        let control = temp.path().join("control.sock");
+        let device_ownership_token = random(3);
+        let (control, frontend) = managed_serving_sockets(&device_ownership_token);
         let frontends = [
             AuthorizedBlockFrontend::NbdUnix {
-                socket: temp.path().join("nbd.sock"),
+                socket: frontend.clone(),
             },
             AuthorizedBlockFrontend::VhostUser {
-                socket: temp.path().join("vhost.sock"),
+                socket: frontend,
                 queues: 2,
                 queue_size: 256,
             },
@@ -3015,7 +3026,7 @@ mod tests {
                     &prepared,
                     &id("cats-cat-1-root.scope"),
                     &random(2),
-                    &random(3),
+                    &device_ownership_token,
                     &control,
                     frontend,
                 )

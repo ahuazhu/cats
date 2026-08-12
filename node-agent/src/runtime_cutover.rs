@@ -239,14 +239,42 @@ fn health_router(readiness: Readiness) -> Router {
 pub async fn spawn_signed_runtime_cutover(
     config: SignedRuntimeCutoverConfig,
 ) -> anyhow::Result<SignedRuntimeCutoverHandle> {
-    spawn_signed_runtime_cutover_with_scanner(config, None).await
+    #[cfg(not(test))]
+    {
+        spawn_signed_runtime_cutover_with_scanner(config, None).await
+    }
+    #[cfg(test)]
+    {
+        spawn_signed_runtime_cutover_with_scanner(config, None, None).await
+    }
+}
+
+#[cfg(test)]
+#[derive(Clone, Copy)]
+enum TestDesiredEffectComposition {
+    AcquireOnly,
 }
 
 async fn spawn_signed_runtime_cutover_with_scanner(
     config: SignedRuntimeCutoverConfig,
     scanner_override: Option<Arc<dyn RuntimeInventoryScanner>>,
+    #[cfg(test)] desired_effect_override: Option<TestDesiredEffectComposition>,
 ) -> anyhow::Result<SignedRuntimeCutoverHandle> {
-    spawn_signed_runtime_cutover_with_overrides(config, scanner_override, None, None).await
+    #[cfg(not(test))]
+    {
+        spawn_signed_runtime_cutover_with_overrides(config, scanner_override, None, None).await
+    }
+    #[cfg(test)]
+    {
+        spawn_signed_runtime_cutover_with_overrides(
+            config,
+            scanner_override,
+            None,
+            None,
+            desired_effect_override,
+        )
+        .await
+    }
 }
 
 async fn spawn_signed_runtime_cutover_with_overrides(
@@ -254,6 +282,7 @@ async fn spawn_signed_runtime_cutover_with_overrides(
     scanner_override: Option<Arc<dyn RuntimeInventoryScanner>>,
     resource_owner_override: Option<Arc<dyn RuntimeEffectResourceOwner>>,
     recovery_override: Option<SignedRunningPublicationRecovery>,
+    #[cfg(test)] desired_effect_override: Option<TestDesiredEffectComposition>,
 ) -> anyhow::Result<SignedRuntimeCutoverHandle> {
     let route_v2_machine_config = config.route_v2_machine;
     let route_v2_verifier = route_v2_machine_config
@@ -305,9 +334,18 @@ async fn spawn_signed_runtime_cutover_with_overrides(
         blob_store: Arc::clone(&config.blob_store),
         root_provision_systemd,
     };
+    #[cfg(not(test))]
     let effect_root_process_ports =
         installed_root_process_effect_ports(installed_probe_config.clone())
             .context("compose sealed root-process effect inventory")?;
+    #[cfg(test)]
+    let effect_root_process_ports = match desired_effect_override {
+        Some(TestDesiredEffectComposition::AcquireOnly) => None,
+        None => Some(
+            installed_root_process_effect_ports(installed_probe_config.clone())
+                .context("compose sealed root-process effect inventory")?,
+        ),
+    };
     let effect_prepare_frontend = match config.ch_config.block_path {
         BlockPath::KernelNbd => {
             #[cfg(target_os = "linux")]
@@ -413,38 +451,68 @@ async fn spawn_signed_runtime_cutover_with_overrides(
         )
         .context("compose one-step signed Running acquire")?
         .with_volume_evidence(Arc::clone(&volume_evidence));
-        let effect = SignedRunningEffect::platform(
-            acquire,
-            Arc::clone(&effect_volume_authority),
-            effect_blob_store,
-            SignedRunningHostConfig::new(
-                effect_root_provision_systemd,
-                effect_state_directory.clone(),
-                effect_network_ip_binary,
-                effect_kernel_nbd_inventory,
-                Arc::clone(&effect_kernel_nbd_cleanup_owner),
-                effect_vmm_launch_artifacts,
-            ),
-            SignedRunningProcessPorts::new(
-                Arc::clone(&effect_root_process_ports.retirement),
-                Arc::clone(&effect_root_process_ports.global),
-                Arc::clone(&effect_root_process_ports.serving),
-                Arc::clone(&effect_root_process_ports.vmm),
-                Arc::clone(&effect_root_process_ports.vmm_cid),
-            ),
-            effect_prepare_frontend,
-            Arc::clone(&effect_admission_registry),
-        )
-        .context("compose signed Running root provision prefix")?;
+        macro_rules! compose_platform_effect {
+            ($process_ports:expr) => {{
+                let process_ports = $process_ports;
+                SignedRunningEffect::platform(
+                    acquire,
+                    Arc::clone(&effect_volume_authority),
+                    effect_blob_store,
+                    SignedRunningHostConfig::new(
+                        effect_root_provision_systemd,
+                        effect_state_directory.clone(),
+                        effect_network_ip_binary,
+                        effect_kernel_nbd_inventory,
+                        Arc::clone(&effect_kernel_nbd_cleanup_owner),
+                        effect_vmm_launch_artifacts,
+                    ),
+                    SignedRunningProcessPorts::new(
+                        Arc::clone(&process_ports.retirement),
+                        Arc::clone(&process_ports.global),
+                        Arc::clone(&process_ports.serving),
+                        Arc::clone(&process_ports.vmm),
+                        Arc::clone(&process_ports.vmm_cid),
+                    ),
+                    effect_prepare_frontend,
+                    Arc::clone(&effect_admission_registry),
+                )
+                .context("compose signed Running root provision prefix")
+            }};
+        }
+        #[cfg(not(test))]
+        let effect: Arc<dyn crate::runtime_spine::RuntimeDesiredEffect> =
+            Arc::new(compose_platform_effect!(&effect_root_process_ports)?);
+        #[cfg(test)]
+        let effect: Arc<dyn crate::runtime_spine::RuntimeDesiredEffect> =
+            match desired_effect_override {
+                Some(TestDesiredEffectComposition::AcquireOnly) => Arc::new(acquire),
+                None => Arc::new(compose_platform_effect!(effect_root_process_ports
+                    .as_ref()
+                    .context("test platform composition lacks installed process ports")?)?),
+            };
         let recovery = match recovery_override {
             Some(recovery) => recovery,
             None => {
-                #[cfg(target_os = "linux")]
+                #[cfg(all(target_os = "linux", not(test)))]
                 {
                     SignedRunningPublicationRecovery::with_stale_boot_vmm_recovery(
                         Arc::clone(&effect_volume_authority),
                         effect_root_process_ports.stale_boot_vmm.clone(),
                     )
+                }
+                #[cfg(all(target_os = "linux", test))]
+                {
+                    match effect_root_process_ports.as_ref() {
+                        Some(ports) => {
+                            SignedRunningPublicationRecovery::with_stale_boot_vmm_recovery(
+                                Arc::clone(&effect_volume_authority),
+                                ports.stale_boot_vmm.clone(),
+                            )
+                        }
+                        None => SignedRunningPublicationRecovery::new(Arc::clone(
+                            &effect_volume_authority,
+                        )),
+                    }
                 }
                 #[cfg(not(target_os = "linux"))]
                 {
@@ -460,7 +528,7 @@ async fn spawn_signed_runtime_cutover_with_overrides(
             scanner,
             Arc::new(RunningAdmissionPreScan::new(effect_admission_registry)),
             Arc::new(recovery),
-            Arc::new(effect),
+            effect,
             runner_effect_resource_owner,
         )
         .map_err(anyhow::Error::from)
@@ -677,8 +745,8 @@ mod tests {
     use std::os::unix::fs::PermissionsExt as _;
 
     use crate::runtime::reconciliation::{
-        clean_slate_scanner_with_volume_authority_and_blob_for_test, runtime_checkpoint_path,
-        TestCleanSlateProbeConfig,
+        clean_slate_scanner_for_test, clean_slate_scanner_with_volume_authority_and_blob_for_test,
+        runtime_checkpoint_path, TestCleanSlateProbeConfig,
     };
     #[cfg(target_os = "linux")]
     use crate::runtime::reconciliation::{
@@ -1516,12 +1584,10 @@ mod tests {
         }
     }
 
-    fn composition_scanner(
+    fn isolated_probe_config(
         root: &std::path::Path,
         state_path: &std::path::Path,
-        authority: Arc<CompositionAuthority>,
-        blob: Arc<CompositionBlobStore>,
-    ) -> Arc<dyn RuntimeInventoryScanner> {
+    ) -> TestCleanSlateProbeConfig {
         let proc_root = root.join("probe-proc");
         let systemd_root = root.join("probe-systemd");
         let block_root = root.join("probe-block");
@@ -1536,24 +1602,40 @@ mod tests {
         ] {
             std::fs::create_dir_all(directory).unwrap();
         }
+        TestCleanSlateProbeConfig {
+            state_directory: crate::state_directory::StateDirectory::unanchored(
+                std::fs::canonicalize(state_path.parent().unwrap())
+                    .unwrap()
+                    .join(state_path.file_name().unwrap()),
+            ),
+            proc_root,
+            systemd_cgroup_root: systemd_root,
+            block_class_root: block_root,
+            network_class_root: network_root,
+            legacy_socket_root: socket_root,
+            cloud_hypervisor_binary: root.join("bin/cloud-hypervisor"),
+            blockd_binary: root.join("bin/cats-blockd"),
+            guest_agent_binary: root.join("bin/cats-guest-agent"),
+        }
+    }
+
+    fn isolated_empty_scanner(
+        root: &std::path::Path,
+        state_path: &std::path::Path,
+    ) -> Arc<dyn RuntimeInventoryScanner> {
+        clean_slate_scanner_for_test(isolated_probe_config(root, state_path)).unwrap()
+    }
+
+    fn composition_scanner(
+        root: &std::path::Path,
+        state_path: &std::path::Path,
+        authority: Arc<CompositionAuthority>,
+        blob: Arc<CompositionBlobStore>,
+    ) -> Arc<dyn RuntimeInventoryScanner> {
         let data_authority: Arc<dyn VolumeDataAuthority> = authority;
         let blob_store: Arc<dyn BlobStore> = blob;
         clean_slate_scanner_with_volume_authority_and_blob_for_test(
-            TestCleanSlateProbeConfig {
-                state_directory: crate::state_directory::StateDirectory::unanchored(
-                    std::fs::canonicalize(state_path.parent().unwrap())
-                        .unwrap()
-                        .join(state_path.file_name().unwrap()),
-                ),
-                proc_root,
-                systemd_cgroup_root: systemd_root,
-                block_class_root: block_root,
-                network_class_root: network_root,
-                legacy_socket_root: socket_root,
-                cloud_hypervisor_binary: root.join("bin/cloud-hypervisor"),
-                blockd_binary: root.join("bin/cats-blockd"),
-                guest_agent_binary: root.join("bin/cats-guest-agent"),
-            },
+            isolated_probe_config(root, state_path),
             data_authority,
             blob_store,
         )
@@ -1692,6 +1774,7 @@ mod tests {
             Some(scanner),
             None,
             Some(recovery),
+            None,
         )
         .await
         .unwrap();
@@ -1726,7 +1809,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn loopback_production_composition_restarts_from_a22_files_and_checkpoint() {
+    async fn loopback_acquire_runner_composition_restarts_from_a22_files_and_checkpoint() {
         let root = tempfile::tempdir().unwrap();
         let state_path = root.path().join("state");
         let desired = composition_desired_spec();
@@ -1771,6 +1854,7 @@ mod tests {
                 Arc::clone(&blob),
             ),
             Some(scanner),
+            Some(TestDesiredEffectComposition::AcquireOnly),
         )
         .await
         .unwrap();
@@ -1832,6 +1916,7 @@ mod tests {
         let mut restart = spawn_signed_runtime_cutover_with_scanner(
             composition_config(state_path.clone(), origin, Arc::clone(&authority), blob),
             Some(restart_scanner),
+            Some(TestDesiredEffectComposition::AcquireOnly),
         )
         .await
         .unwrap();
@@ -1918,25 +2003,30 @@ mod tests {
         });
         let origin = format!("http://{control_address}");
         let registration = registration_config(state_path.clone()).unwrap();
-        let mut handle = spawn_signed_runtime_cutover(SignedRuntimeCutoverConfig {
-            listen: "127.0.0.1:0".into(),
-            route_v2_machine: None,
-            control_plane_url: origin.clone(),
-            agent_registration: registration,
-            ch_config: test_ch_config(),
-            authorized_blockd_launch: test_authorized_blockd_launch(),
-            guest_agent_binary: "/opt/cats/bin/cats-guest-agent".into(),
-            metering_cgroup_root: None,
-            volume_data_authority: Arc::new(TestUnavailableVolumeDataAuthority),
-            volume_inventory_authority: Arc::new(TestUnavailableVolumeDataAuthority),
-            blob_store: Arc::new(TestUnavailableBlobStore),
-            volume_lease_duration_ms: 60_000,
-            deadline_policy: RuntimeSpineDeadlinePolicy::new(
-                Duration::from_secs(5),
-                Duration::from_secs(30),
-            )
-            .unwrap(),
-        })
+        let scanner = isolated_empty_scanner(state_root.path(), &state_path);
+        let mut handle = spawn_signed_runtime_cutover_with_scanner(
+            SignedRuntimeCutoverConfig {
+                listen: "127.0.0.1:0".into(),
+                route_v2_machine: None,
+                control_plane_url: origin.clone(),
+                agent_registration: registration,
+                ch_config: test_ch_config(),
+                authorized_blockd_launch: test_authorized_blockd_launch(),
+                guest_agent_binary: "/opt/cats/bin/cats-guest-agent".into(),
+                metering_cgroup_root: None,
+                volume_data_authority: Arc::new(TestUnavailableVolumeDataAuthority),
+                volume_inventory_authority: Arc::new(TestUnavailableVolumeDataAuthority),
+                blob_store: Arc::new(TestUnavailableBlobStore),
+                volume_lease_duration_ms: 60_000,
+                deadline_policy: RuntimeSpineDeadlinePolicy::new(
+                    Duration::from_secs(5),
+                    Duration::from_secs(30),
+                )
+                .unwrap(),
+            },
+            Some(scanner),
+            Some(TestDesiredEffectComposition::AcquireOnly),
+        )
         .await
         .unwrap();
         assert_eq!(calls.load(Ordering::SeqCst), 1);
@@ -1998,6 +2088,7 @@ mod tests {
             shutdowns: std::sync::atomic::AtomicUsize::new(0),
         });
         let owner_port: Arc<dyn RuntimeEffectResourceOwner> = owner.clone();
+        let scanner = isolated_empty_scanner(state_root.path(), &state_path);
         let mut handle = spawn_signed_runtime_cutover_with_overrides(
             SignedRuntimeCutoverConfig {
                 listen: "127.0.0.1:0".into(),
@@ -2018,9 +2109,10 @@ mod tests {
                 )
                 .unwrap(),
             },
-            None,
+            Some(scanner),
             Some(owner_port),
             None,
+            Some(TestDesiredEffectComposition::AcquireOnly),
         )
         .await
         .unwrap();

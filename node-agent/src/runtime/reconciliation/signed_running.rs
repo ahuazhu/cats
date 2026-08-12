@@ -5124,7 +5124,7 @@ mod tests {
                 .unwrap();
         assert_eq!(
             checkpoint_content_digest(&checkpoint).unwrap().as_str(),
-            "sha256:f1df3e1cfe83fdd0b4a4a5ead32f1ba71533cddbb38e2dc354e0a277a92addcb"
+            "sha256:ab2d78e9db6bfdebf30566f5cfba5b12e5dc0400e0607db10f29e85ada81aef0"
         );
         let (expected_blank_head, expected_provisioned_head) = match &checkpoint.step {
             ReconcileStep::ProvisionRootImage {
