@@ -1690,7 +1690,13 @@ fn worker_installation_owns_all_runtime_socket_roots() {
         );
     }
 
+    let provisioned_state_namespaces = "vmm-socket-receipts vmm-launch-v1 blockd-socket-intents-v1";
+
     let provisioner = read_workspace_file("deploy/aws/metal/provision-vmm-socket-namespaces.sh");
+    assert!(
+        provisioner.contains(provisioned_state_namespaces),
+        "identity-selected state provisioning lost the durable blockd intent namespace"
+    );
     let create = provisioner
         .find("systemd-tmpfiles --create /usr/lib/tmpfiles.d/cats-vmm.conf")
         .expect("runtime tmpfiles creation");

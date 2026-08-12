@@ -76,12 +76,12 @@ provision_identity_state_namespaces() {
   sync -f "$state_directory"
   sync -f "$node_parent"
 
-  for namespace in vmm-socket-receipts vmm-launch-v1; do
+  for namespace in vmm-socket-receipts vmm-launch-v1 blockd-socket-intents-v1; do
     local directory=$state_directory/$namespace
     if [[ -e $directory || -L $directory ]]; then
       [[ -d $directory && ! -L $directory ]] \
         && [[ $(stat -c '%u:%g:%a' "$directory") == 0:0:700 ]] || {
-        echo "VMM $namespace namespace violates root:root/0700" >&2
+        echo "runtime $namespace namespace violates root:root/0700" >&2
         return 1
       }
     else
