@@ -1677,6 +1677,77 @@ fn noninteractive_worker_bootstrap_defines_root_home_before_toolchain_use() {
     }
 }
 
+#[test]
+fn worker_installation_owns_all_runtime_socket_roots() {
+    let tmpfiles = read_workspace_file("deploy/metal/tmpfiles/cats-vmm.conf");
+    for declaration in [
+        "d /run/cats/vmm-v1 0700 root root -",
+        "d /run/cats/blockd-v1 0700 root root -",
+    ] {
+        assert!(
+            tmpfiles.lines().any(|line| line == declaration),
+            "runtime tmpfiles contract lost {declaration:?}"
+        );
+    }
+
+    let provisioner = read_workspace_file("deploy/aws/metal/provision-vmm-socket-namespaces.sh");
+    let create = provisioner
+        .find("systemd-tmpfiles --create /usr/lib/tmpfiles.d/cats-vmm.conf")
+        .expect("runtime tmpfiles creation");
+    for preflight in [
+        "validate_or_absent_installed_runtime_socket_root /run/cats/vmm-v1 VMM",
+        "validate_or_absent_installed_runtime_socket_root /run/cats/blockd-v1 blockd",
+    ] {
+        let validate = provisioner
+            .find(preflight)
+            .unwrap_or_else(|| panic!("runtime provisioner lost {preflight:?}"));
+        assert!(
+            validate < create,
+            "tmpfiles may not repair a foreign runtime root"
+        );
+    }
+    for validation in [
+        "validate_installed_runtime_socket_root /run/cats/vmm-v1 VMM",
+        "validate_installed_runtime_socket_root /run/cats/blockd-v1 blockd",
+    ] {
+        let validate = provisioner
+            .find(validation)
+            .unwrap_or_else(|| panic!("runtime provisioner lost {validation:?}"));
+        assert!(
+            create < validate,
+            "runtime root was validated before creation"
+        );
+    }
+    for invariant in [
+        "[[ -d $directory && ! -L $directory ]]",
+        "stat -c '%u:%g:%a' \"$directory\"",
+        "== 0:0:700",
+    ] {
+        assert!(
+            provisioner.contains(invariant),
+            "runtime root validation lost {invariant:?}"
+        );
+    }
+
+    for bootstrap in [
+        "deploy/aws/metal/install-worker.sh",
+        "deploy/metal/install.sh",
+    ] {
+        let source = read_workspace_file(bootstrap);
+        let install = source
+            .find("/usr/lib/tmpfiles.d/cats-vmm.conf")
+            .unwrap_or_else(|| panic!("{bootstrap} does not install runtime tmpfiles"));
+        let provision = source
+            .find("\"$PREFIX/bin/provision-vmm-socket-namespaces\"")
+            .or_else(|| source.find("\"$CATS_PREFIX/bin/provision-vmm-socket-namespaces\""))
+            .unwrap_or_else(|| panic!("{bootstrap} does not run the runtime provisioner"));
+        assert!(
+            install < provision,
+            "{bootstrap} must install tmpfiles before provisioning runtime roots"
+        );
+    }
+}
+
 #[cfg(unix)]
 #[test]
 fn worker_bootstrap_validates_and_installs_its_route_grant_key_before_mutation() {

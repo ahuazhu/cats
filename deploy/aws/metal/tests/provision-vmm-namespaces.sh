@@ -98,4 +98,41 @@ if provision_identity_state_namespaces \
 fi
 [[ -L $namespace_alias/node/node-test/vmm-socket-receipts ]]
 
-echo "VMM namespace provisioning regressions passed"
+# The static tmpfiles transaction owns both public runtime roots. The helper
+# must accept only a real root:root/0700 directory; an alias or widened inode
+# stays untouched and fails closed.
+runtime_roots=$temporary/runtime-roots
+mkdir -m 0700 "$runtime_roots"
+validate_installed_runtime_socket_root "$runtime_roots" test
+validate_or_absent_installed_runtime_socket_root "$runtime_roots" test
+validate_or_absent_installed_runtime_socket_root "$temporary/absent-runtime-root" test
+
+widened_runtime_root=$temporary/widened-runtime-root
+mkdir -m 0755 "$widened_runtime_root"
+if validate_installed_runtime_socket_root "$widened_runtime_root" test; then
+  echo "widened runtime socket root was accepted" >&2
+  exit 1
+fi
+[[ $(stat -c '%a' "$widened_runtime_root") == 755 ]]
+if validate_or_absent_installed_runtime_socket_root "$widened_runtime_root" test; then
+  echo "widened pre-existing runtime socket root was accepted" >&2
+  exit 1
+fi
+[[ $(stat -c '%a' "$widened_runtime_root") == 755 ]]
+
+runtime_root_target=$temporary/runtime-root-target
+mkdir -m 0700 "$runtime_root_target"
+runtime_root_alias=$temporary/runtime-root-alias
+ln -s "$runtime_root_target" "$runtime_root_alias"
+if validate_installed_runtime_socket_root "$runtime_root_alias" test; then
+  echo "aliased runtime socket root was accepted" >&2
+  exit 1
+fi
+[[ -L $runtime_root_alias ]]
+if validate_or_absent_installed_runtime_socket_root "$runtime_root_alias" test; then
+  echo "aliased pre-existing runtime socket root was accepted" >&2
+  exit 1
+fi
+[[ -L $runtime_root_alias ]]
+
+echo "runtime namespace provisioning regressions passed"
