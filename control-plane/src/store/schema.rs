@@ -118,22 +118,33 @@ fn ensure_schema(client: &mut Client) -> Result<()> {
     client
         .batch_execute("SET statement_timeout = '5s'; SET lock_timeout = '2s'")
         .map_err(internal)?;
+    let isolated_test_bootstrap: bool = client
+        .query_one(
+            "SELECT COALESCE(
+                current_setting('cats.test_schema_bootstrap', TRUE) = 'on',
+                FALSE
+             )",
+            &[],
+        )
+        .map_err(internal)?
+        .get(0);
     // The clean-slate cutover has one schema shape. DDL and its stamp commit in
     // the same transaction; a current stamp is verified but never repaired.
     // The xact-scoped lock lets two first replicas converge without leaving a
     // session lock behind after any error.
     let mut transaction = client.transaction().map_err(internal)?;
-    // Unit tests intentionally create many isolated schemas in parallel on
-    // one small disposable PostgreSQL. Give both the per-schema convergence
-    // lock and the initial DDL a separate bounded test budget. SET LOCAL
-    // restores the production 5s/2s session limits when the transaction ends.
-    #[cfg(test)]
-    transaction
-        .batch_execute(
-            "SET LOCAL statement_timeout = '30s'; \
-             SET LOCAL lock_timeout = '30s'",
-        )
-        .map_err(internal)?;
+    // Integration tests link the ordinary library, so the isolated-schema
+    // helper carries an exact custom GUC instead of relying on cfg(test).
+    // SET LOCAL restores the production 5s/2s session limits at transaction
+    // end, and no other marker value changes production behavior.
+    if isolated_test_bootstrap {
+        transaction
+            .batch_execute(
+                "SET LOCAL statement_timeout = '30s'; \
+                 SET LOCAL lock_timeout = '30s'",
+            )
+            .map_err(internal)?;
+    }
     transaction
         .query_one(
             "SELECT pg_advisory_xact_lock(hashtext(current_schema()), 420103)",
@@ -168,12 +179,13 @@ fn ensure_schema(client: &mut Client) -> Result<()> {
                 "control-plane schema is nonempty but unstamped; recreate it",
             ));
         }
-        // Different test schemas do not share the production per-schema lock,
-        // so serialize only their catalog-heavy initial DDL.
-        #[cfg(test)]
-        transaction
-            .query_one("SELECT pg_advisory_xact_lock(420111, 1)", &[])
-            .map_err(internal)?;
+        // Different isolated test schemas do not share the production
+        // per-schema lock, so serialize only their catalog-heavy initial DDL.
+        if isolated_test_bootstrap {
+            transaction
+                .query_one("SELECT pg_advisory_xact_lock(420111, 1)", &[])
+                .map_err(internal)?;
+        }
         transaction.batch_execute(SCHEMA).map_err(internal)?;
         transaction
             .execute(
