@@ -2395,6 +2395,9 @@ where
     P: RootProvisionProcessPort + ?Sized,
 {
     context.check_active()?;
+    let current = store
+        .assert_current(persisted)
+        .context("retain current checkpoint across root-provision inspection")?;
     let inspection = inspect_exact_root_provision_process(port, &expected, context)
         .context("inspect exact root-provision process identity")?;
     let outcome = match inspection {
@@ -2412,9 +2415,6 @@ where
         }
         RootProvisionProcessInspection::Absent => {
             context.check_active()?;
-            let current = store
-                .assert_current(persisted)
-                .context("retain current checkpoint across root-provision start")?;
             let checkpointed = CheckpointedRootProvisionProcess {
                 expected: &expected,
                 authority: RootCheckpointAuthority::Current {
